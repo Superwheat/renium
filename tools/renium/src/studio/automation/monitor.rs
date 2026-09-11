@@ -1,4 +1,5 @@
 use super::*;
+use anyhow::ensure;
 use clap::Args;
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +58,8 @@ struct Parameters {
     player: Option<String>,
     #[serde(default)]
     server: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_path: Option<PathBuf>,
 }
 
 impl Parameters {
@@ -99,6 +102,12 @@ impl Parameters {
                 .is_some_and(|p| p.trim().is_empty() || p == "0")
         {
             bail!("Select either a play client (--player) or --server");
+        }
+        if let Some(path) = &self.output_path {
+            ensure!(
+                matches!(self.action.as_str(), "micro" | "micro-stop") && path.is_absolute(),
+                "Only MicroProfiler capture accepts an absolute output path"
+            );
         }
         Ok(())
     }
@@ -156,6 +165,11 @@ pub(crate) fn command(args: MonitorArgs) -> Result<()> {
         page: if export { Some(1) } else { args.page },
         player: args.player,
         server: args.server,
+        output_path: if micro {
+            Some(std::path::absolute(args.out.as_ref().unwrap())?)
+        } else {
+            None
+        },
     };
     parameters.validate()?;
     let call = |parameters: &Parameters| {
@@ -169,13 +183,7 @@ pub(crate) fn command(args: MonitorArgs) -> Result<()> {
     };
     let mut result = call(&parameters)?;
     if micro {
-        return print_json_output(
-            &super::microprofiler::save_capture(
-                &args.out.context("micro requires --out")?,
-                &result,
-            )?,
-            false,
-        );
+        return print_json_output(&result, false);
     }
     if let Some(path) = args.out {
         if result["state"] != "complete" {
@@ -232,10 +240,21 @@ pub(crate) fn command(args: MonitorArgs) -> Result<()> {
     print_json_output(&result, false)
 }
 
+// Edit diagnostics use an explicit bound runtime and never change place data or
+// global routing. Play selectors still use the serialized selection path.
+pub(crate) fn is_edit_request(parameters: &Value) -> bool {
+    parameters.is_object()
+        && parameters.get("player").is_none_or(Value::is_null)
+        && parameters
+            .get("server")
+            .is_none_or(|value| value.as_bool() == Some(false))
+}
+
 pub(crate) fn result(
     parameters: &Value,
     bridge: &BridgeServer,
     wait_seconds: f64,
+    edit_runtime: Option<&str>,
 ) -> Result<Value> {
     let mut parameters = parameters.clone();
     let object = parameters
@@ -243,8 +262,11 @@ pub(crate) fn result(
         .context("Expected performance options")?;
     object.remove("bridgeWaitSeconds");
     object.remove("bridgePorts");
-    let parameters: Parameters = serde_json::from_value(parameters)?;
+    let mut parameters: Parameters = serde_json::from_value(parameters)?;
     parameters.validate()?;
+    // Save in the local daemon, so large captures never enter the bounded CLI
+    // response line. A host path is not part of the Studio request.
+    let output_path = parameters.output_path.take();
     let target = if parameters.player.is_some() {
         BridgeTarget::Client
     } else if parameters.server {
@@ -252,41 +274,140 @@ pub(crate) fn result(
     } else {
         BridgeTarget::Edit
     };
-    if let Some(player) = &parameters.player {
+    if edit_runtime.is_some() {
+        ensure!(
+            target == BridgeTarget::Edit,
+            "Expected an Edit performance target"
+        );
+    } else if let Some(player) = &parameters.player {
         wait_for_player_bridge(bridge, player, wait_seconds)?;
     } else {
         bridge.wait_for_target(wait_seconds, target)?;
     }
-    let pin = bridge.runtime_pin_for_selector(target, parameters.player.as_deref())?;
+    let runtime_id = match edit_runtime {
+        Some(runtime) => runtime.to_owned(),
+        None => {
+            bridge
+                .runtime_pin_for_selector(target, parameters.player.as_deref())?
+                .runtime_id
+        }
+    };
     if parameters.server
         && !bridge.list_bridge_clients().iter().any(|client| {
-            client["runtimeId"].as_str() == Some(&pin.runtime_id)
+            client["runtimeId"].as_str() == Some(&runtime_id)
                 && client["role"].as_str() == Some(BRIDGE_ROLE_PLAY_SERVER)
         })
     {
         bail!("No play server is connected; omit --server to sample Edit mode");
     }
     let mut request = serde_json::to_value(&parameters)?;
-    request["runtimeId"] = json!(pin.runtime_id);
-    let mut result = bridge.call_for_selector_runtime_with_timeout(
-        "performance",
-        request,
-        target,
-        parameters.player.as_deref(),
-        Some(&pin.runtime_id),
-        Some(Duration::from_secs(3)),
-    )?;
-    ensure_plugin_api_ok(&result)?;
-    if result["runtimeId"].as_str() != Some(&pin.runtime_id) {
-        bail!("Performance response came from a different runtime");
+    request["runtimeId"] = json!(runtime_id);
+    let micro = matches!(parameters.action.as_str(), "micro" | "micro-stop");
+    if micro {
+        request["chunked"] = json!(true);
     }
-    result["pid"] = json!(bridge.studio_pid_for_runtime(target, &pin.runtime_id)?);
-    Ok(result)
+    let call = |request| -> Result<Value> {
+        let result = bridge.call_for_selector_runtime_with_timeout(
+            "performance",
+            request,
+            target,
+            parameters.player.as_deref(),
+            Some(&runtime_id),
+            Some(Duration::from_secs(3)),
+        )?;
+        ensure_plugin_api_ok(&result)?;
+        ensure!(
+            result["runtimeId"].as_str() == Some(&runtime_id),
+            "Performance response came from a different runtime"
+        );
+        Ok(result)
+    };
+    let mut result = call(request)?;
+    if micro && result["captureId"].is_string() {
+        const CHUNK: u64 = 3 * 1024 * 1024;
+        let total = result["bytes"]
+            .as_u64()
+            .context("Capture omitted its size")?;
+        ensure!(
+            (1..=128 * 1024 * 1024).contains(&total),
+            "Capture size is invalid"
+        );
+        let id = result["captureId"].clone();
+        let pages = total.div_ceil(CHUNK);
+        let mut encoded = String::with_capacity(total.div_ceil(3) as usize * 4);
+        for page in 1..=pages {
+            let more;
+            let chunk = if page == 1 {
+                &result
+            } else {
+                more = call(
+                    json!({"action":"micro-read", "runtimeId":runtime_id, "captureId":id, "page":page}),
+                )?;
+                &more
+            };
+            ensure!(
+                chunk["captureId"] == id
+                    && chunk["bytes"].as_u64() == Some(total)
+                    && chunk["page"].as_u64() == Some(page)
+                    && if page < pages {
+                        chunk["nextPage"].as_u64() == Some(page + 1)
+                    } else {
+                        chunk["nextPage"].is_null()
+                    },
+                "MicroProfiler snapshot changed or omitted a page; no file was written"
+            );
+            let data = chunk["data"]
+                .as_str()
+                .context("MicroProfiler page omitted bytes")?;
+            let expected = (total - (page - 1) * CHUNK).min(CHUNK).div_ceil(3) * 4;
+            ensure!(
+                data.len() as u64 == expected,
+                "MicroProfiler snapshot page is incomplete"
+            );
+            encoded.push_str(data);
+        }
+        result["data"] = json!(encoded);
+        result.as_object_mut().unwrap().remove("page");
+        result.as_object_mut().unwrap().remove("nextPage");
+    }
+    result["pid"] = json!(bridge.studio_pid_for_runtime(target, &runtime_id)?);
+    match output_path {
+        Some(path) => super::microprofiler::save_capture(&path, &result),
+        None => Ok(result),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_explicit_edit_diagnostics_bypass_the_mutation_gate() {
+        for parameters in [
+            json!({"action":"micro"}),
+            json!({"action":"snapshot", "player":null, "server":false}),
+        ] {
+            assert!(is_edit_request(&parameters));
+        }
+        for parameters in [
+            Value::Null,
+            json!({"server":true}),
+            json!({"server":"false"}),
+            json!({"server":null}),
+            json!({"player":"1"}),
+            json!({"player":false}),
+        ] {
+            assert!(!is_edit_request(&parameters));
+        }
+        for parameters in [
+            json!({"action":"executeLuau"}),
+            json!({"action":"micro", "code":"return 1"}),
+            json!({"action":"micro-start", "frames":257}),
+        ] {
+            let decoded = serde_json::from_value::<Parameters>(parameters);
+            assert!(decoded.is_err() || decoded.unwrap().validate().is_err());
+        }
+    }
 
     #[test]
     fn monitor_rejects_invalid_or_ambiguous_requests_before_studio() {
@@ -310,7 +431,8 @@ mod tests {
                     seconds,
                     page,
                     player: player.map(str::to_owned),
-                    server
+                    server,
+                    output_path: None,
                 }
                 .validate()
                 .is_ok(),

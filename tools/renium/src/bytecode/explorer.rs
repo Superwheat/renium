@@ -23,7 +23,7 @@ use crate::cli::{
     BytecodeExplorerBatchOp, BytecodeExplorerBatchRequest, ExplorerDaemonArgs,
 };
 use crate::daemon::transport::{BoundedLineRead, MAX_DAEMON_LINE_BYTES, read_bounded_line};
-use crate::editor::document::is_protected_starter_player_container;
+use crate::editor::document::is_protected_engine_container;
 use crate::editor::paths::{
     build_editor_instance_path_parts, build_editor_instance_paths,
     build_editor_source_paths_by_index, document_instance_index_by_path,
@@ -32,9 +32,7 @@ use crate::project::commands::load_structural_project;
 use crate::project::config;
 use crate::project::layout::apply_configured_project_layout;
 use crate::rbx::encode::rbx_serialized_property_name_for_logical;
-use crate::roblox::services::{
-    DEFAULT_SYNC_SERVICES, EXTRA_EXPLORER_SERVICES, explorer_service_order,
-};
+use crate::roblox::services::{DEFAULT_SYNC_SERVICES, explorer_service_order};
 use crate::settings::bytecode::{
     SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance,
 };
@@ -629,9 +627,10 @@ pub(crate) fn bytecode_explorer_batch_result(mut args: BytecodeExplorerBatchArgs
         |stage| service_settings_path(&stage.root().join(&service)),
     );
     let mut service_source_paths_by_index = if needs_field("sourcePath")? {
-        staged_settings_file.parent().map_or_else(
-            || vec![None; document.instances.len()],
-            |service_dir| build_editor_source_paths_by_index(&document, &service, service_dir),
+        build_editor_source_paths_by_index(
+            &document,
+            &service,
+            &crate::project::storage::source_directory(&staged_settings_file),
         )
     } else {
         Vec::new()
@@ -2347,7 +2346,7 @@ impl ExplorerDaemonState {
         let has_package_link =
             has_direct_package_link_child(document, &state.children_by_parent, index);
         let is_package_link = instance.class_name == "PackageLink";
-        let protected = is_protected_starter_player_container(document, index);
+        let protected = is_protected_engine_container(document, index);
         let link_path_key = state
             .path_segments_by_index
             .get(index)
@@ -2509,14 +2508,13 @@ pub(crate) fn explorer_daemon_services(src_root: &Path, raw: &str) -> Result<Vec
     for service in requested {
         push_explorer_service(&mut services, &service);
     }
-    if src_root.exists() {
-        for entry in fs::read_dir(src_root)? {
-            let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                let service = entry.file_name().to_string_lossy().into_owned();
-                push_explorer_service(&mut services, &service);
-            }
-        }
+    for entry in crate::project::storage::service_directories(src_root)? {
+        let service = entry
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        push_explorer_service(&mut services, &service);
     }
     for service in &services {
         validate_filesystem_instance_name(service, "service")?;
@@ -2529,7 +2527,6 @@ pub(crate) fn explorer_daemon_services(src_root: &Path, raw: &str) -> Result<Vec
 fn canonical_explorer_service_name(service: &str) -> String {
     DEFAULT_SYNC_SERVICES
         .iter()
-        .chain(EXTRA_EXPLORER_SERVICES.iter())
         .find(|candidate| candidate.eq_ignore_ascii_case(service))
         .copied()
         .unwrap_or(service)

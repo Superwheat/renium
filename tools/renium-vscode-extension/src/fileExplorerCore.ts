@@ -480,7 +480,9 @@ export function canonicalExplorerServices(config: ExplorerConfig, services: read
 }
 
 export function settingsFileForService(config: ExplorerConfig, service: string): string {
-  return path.join(srcRoot(config), service, SETTINGS_FILE_NAME);
+  const current = path.join(config.projectRoot, "instances", `${service}.renium`);
+  const legacy = path.join(srcRoot(config), service, SETTINGS_FILE_NAME);
+  return fs.existsSync(current) || !fs.existsSync(legacy) ? current : legacy;
 }
 
 export function editorHistoryRoot(config: ExplorerConfig): string {
@@ -564,6 +566,12 @@ export function cloneHistoryValue(value: unknown): unknown {
 export function serviceFromSettingsFile(config: ExplorerConfig, filePath: string): string | undefined {
   if (!isReniumSettingsFileName(path.basename(filePath))) {
     return undefined;
+  }
+  const storeRoot = path.join(config.projectRoot, "instances");
+  const storeRelative = path.relative(storeRoot, filePath);
+  if (storeRelative && !storeRelative.startsWith("..") && !path.isAbsolute(storeRelative)) {
+    const component = storeRelative.split(path.sep)[0];
+    return explorerServiceForPath(config, component.replace(/\.renium$/i, ""));
   }
   const relativePath = path.relative(srcRoot(config), filePath);
   if (!relativePath || relativePath.startsWith("..") || path.isAbsolute(relativePath)) {

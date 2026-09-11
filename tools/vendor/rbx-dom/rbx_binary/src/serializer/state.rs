@@ -32,7 +32,7 @@ use crate::{
 };
 
 use super::error::InnerError;
-use super::CompressionType;
+use super::{CompressionType, InstanceBindingMode, SerializedInstanceBinding};
 
 static FILE_FOOTER: &[u8] = b"</roblox>";
 
@@ -51,6 +51,8 @@ pub(super) struct SerializerState<'dom, 'db, W> {
     /// All of the instances, in a deterministic order, that we're going to be
     /// serializing.
     relevant_instances: Vec<Ref>,
+    bindings: Option<&'dom std::collections::HashMap<Ref, InstanceBindingMode>>,
+    preserved_parent_count: usize,
 
     /// A map from rbx-dom's unique instance ID (Ref) to the ID space used in
     /// the binary model format, signed integers.
@@ -227,7 +229,7 @@ struct TypeInfos<'dom, 'db> {
     ///
     /// These are stored sorted so that we naturally iterate over them in order
     /// and improve our chances of being deterministic.
-    values: BTreeMap<Ustr, TypeInfo<'dom, 'db>>,
+    values: BTreeMap<(Ustr, bool), TypeInfo<'dom, 'db>>,
 
     /// The next type ID that should be assigned if a type is discovered and
     /// added to the serializer.
@@ -245,8 +247,8 @@ impl<'dom, 'db> TypeInfos<'dom, 'db> {
 
     /// Finds the type info from the given ClassName if it exists, or creates
     /// one and returns a reference to it if not.
-    fn get_or_create(&mut self, class: Ustr) -> &mut TypeInfo<'dom, 'db> {
-        if let btree_map::Entry::Vacant(entry) = self.values.entry(class) {
+    fn get_or_create(&mut self, class: Ustr, reference_only: bool) -> &mut TypeInfo<'dom, 'db> {
+        if let btree_map::Entry::Vacant(entry) = self.values.entry((class, reference_only)) {
             let type_id = self.next_type_id;
             self.next_type_id += 1;
 
@@ -272,7 +274,7 @@ impl<'dom, 'db> TypeInfos<'dom, 'db> {
 
         // This unwrap will not panic because we always insert this key into
         // type_infos in this function.
-        self.values.get_mut(&class).unwrap()
+        self.values.get_mut(&(class, reference_only)).unwrap()
     }
 }
 
@@ -524,12 +526,19 @@ impl<'dom, 'db: 'dom> TypeInfo<'dom, 'db> {
 }
 
 impl<'dom, 'db: 'dom, W: Write> SerializerState<'dom, 'db, W> {
-    pub fn new(serializer: &'db Serializer<'db>, dom: &'dom WeakDom, output: W) -> Self {
+    pub fn new(
+        serializer: &'db Serializer<'db>,
+        dom: &'dom WeakDom,
+        output: W,
+        bindings: Option<&'dom std::collections::HashMap<Ref, InstanceBindingMode>>,
+    ) -> Self {
         SerializerState {
             serializer,
             dom,
             output,
             relevant_instances: Vec::new(),
+            bindings,
+            preserved_parent_count: 0,
             id_to_referent: HashMap::new(),
             type_infos: TypeInfos::new(serializer.database),
             shared_strings: Vec::new(),
@@ -589,6 +598,64 @@ impl<'dom, 'db: 'dom, W: Write> SerializerState<'dom, 'db, W> {
             }
         }
 
+        self.finish_discovery();
+        Ok(())
+    }
+
+    pub fn add_selection(
+        &mut self,
+        postorder: &[Ref],
+        schema: &std::collections::HashMap<Ustr, std::collections::HashMap<Ustr, &Variant>>,
+    ) -> Result<(), InnerError> {
+        let mut seeded = std::collections::HashSet::new();
+        for referent in postorder {
+            let instance = self
+                .dom
+                .get_by_ref(*referent)
+                .ok_or(InnerError::InvalidInstanceId {
+                    referent: *referent,
+                })?;
+            self.relevant_instances.push(*referent);
+            if self.bindings.and_then(|bindings| bindings.get(referent))
+                != Some(&InstanceBindingMode::ReferenceOnly)
+                && seeded.insert(instance.class)
+            {
+                let type_info = self.type_infos.get_or_create(instance.class, false);
+                let shared_string_ids = &mut self.shared_string_ids;
+                let shared_strings = &mut self.shared_strings;
+                let database = self.serializer.database;
+                let mut push_sstr = |variant: &Variant| {
+                    let shared = match variant {
+                        Variant::SharedString(value) => Some(value),
+                        Variant::NetAssetRef(value) => Some(value.as_ref()),
+                        _ => None,
+                    };
+                    if let Some(value) = shared {
+                        if !shared_string_ids.contains_key(value) {
+                            shared_string_ids.insert(value.clone(), 0);
+                            shared_strings.push(value.clone());
+                        }
+                    }
+                };
+                if let Some(properties) = schema.get(&instance.class) {
+                    for (name, sample) in properties {
+                        type_info.resolve_visited_property(
+                            &mut push_sstr,
+                            database,
+                            instance.class,
+                            *name,
+                            sample,
+                        )?;
+                    }
+                }
+            }
+            self.collect_type_info(instance)?;
+        }
+        self.finish_discovery();
+        Ok(())
+    }
+
+    fn finish_discovery(&mut self) {
         // Sort shared_strings by their hash, to ensure they are deterministically added
         // into the SSTR chunk, then assign them corresponding ids
         self.shared_strings.sort_by_key(SharedString::hash);
@@ -600,8 +667,6 @@ impl<'dom, 'db: 'dom, W: Write> SerializerState<'dom, 'db, W> {
             "Discovered {} unique TypeInfos",
             self.type_infos.values.len()
         );
-
-        Ok(())
     }
 
     /// Collect information about all the different types of instance and their
@@ -613,10 +678,20 @@ impl<'dom, 'db: 'dom, W: Write> SerializerState<'dom, 'db, W> {
             type_infos,
             shared_strings,
             shared_string_ids,
+            bindings,
+            preserved_parent_count,
             ..
         } = self;
 
-        let type_info = type_infos.get_or_create(instance.class);
+        let binding = bindings.and_then(|bindings| bindings.get(&instance.referent()));
+        let reference_only = binding == Some(&InstanceBindingMode::ReferenceOnly);
+        if matches!(
+            binding,
+            Some(InstanceBindingMode::Properties | InstanceBindingMode::ReferenceOnly)
+        ) {
+            *preserved_parent_count += 1;
+        }
+        let type_info = type_infos.get_or_create(instance.class, reference_only);
         // The desired length of all PropInfo.values in this TypeInfo.
         // Some instances may have missing properties, meaning the
         // corresponding PropInfo is never visited and no value is inserted.
@@ -624,6 +699,9 @@ impl<'dom, 'db: 'dom, W: Write> SerializerState<'dom, 'db, W> {
         // Used in the loop below (push_value_for_instance)
         let desired_len = type_info.instances.len();
         type_info.instances.push(instance);
+        if reference_only {
+            return Ok(());
+        }
 
         // Helper to track a SharedString Variant
         let mut push_sstr = |variant: &Variant| {
@@ -711,6 +789,43 @@ impl<'dom, 'db: 'dom, W: Write> SerializerState<'dom, 'db, W> {
         log::debug!("Collected {} referents", self.id_to_referent.len());
     }
 
+    pub fn instance_bindings(&self) -> Result<Vec<SerializedInstanceBinding>, InnerError> {
+        let Some(bindings) = self.bindings.filter(|bindings| !bindings.is_empty()) else {
+            return Ok(Vec::new());
+        };
+        for referent in bindings.keys() {
+            if !self.id_to_referent.contains_key(referent) {
+                return Err(InnerError::InvalidInstanceId {
+                    referent: *referent,
+                });
+            }
+        }
+        let mut counts = UstrMap::<u32>::new();
+        for ((class, _), info) in &self.type_infos.values {
+            *counts.entry(*class).or_default() += info.instances.len() as u32;
+        }
+        let mut ordinals = UstrMap::<u32>::new();
+        let mut result = Vec::with_capacity(bindings.len());
+        // This is the actual INST emission order, not an independently inferred
+        // traversal order. A reference-only class can have its own INST chunk.
+        for ((class, _), info) in &self.type_infos.values {
+            let base = ordinals.entry(*class).or_default();
+            for (index, instance) in info.instances.iter().enumerate() {
+                if bindings.contains_key(&instance.referent()) {
+                    result.push(SerializedInstanceBinding {
+                        referent: instance.referent(),
+                        binary_referent: self.id_to_referent[&instance.referent()],
+                        class_name: class.to_string(),
+                        ordinal: *base + index as u32,
+                        class_count: counts[class],
+                    });
+                }
+            }
+            *base += info.instances.len() as u32;
+        }
+        Ok(result)
+    }
+
     pub fn write_header(&mut self) -> Result<(), InnerError> {
         log::trace!("Writing header");
 
@@ -766,7 +881,7 @@ impl<'dom, 'db: 'dom, W: Write> SerializerState<'dom, 'db, W> {
     pub fn serialize_instances(&mut self) -> Result<(), InnerError> {
         log::trace!("Writing instance chunks");
 
-        for (type_name, type_info) in &self.type_infos.values {
+        for ((type_name, _), type_info) in &self.type_infos.values {
             log::trace!(
                 "Writing chunk for {} ({} instances)",
                 type_name,
@@ -822,7 +937,10 @@ impl<'dom, 'db: 'dom, W: Write> SerializerState<'dom, 'db, W> {
         log::trace!("Writing properties");
 
         let name_ustr = rbx_dom_weak::ustr("Name");
-        for (type_name, type_info) in &mut self.type_infos.values {
+        for ((type_name, reference_only), type_info) in &mut self.type_infos.values {
+            if *reference_only {
+                continue;
+            }
             // Sort logical properties by canonical name
             type_info
                 .properties
@@ -1627,15 +1745,32 @@ impl<'dom, 'db: 'dom, W: Write> SerializerState<'dom, 'db, W> {
 
         let mut chunk = ChunkBuilder::new(b"PRNT", self.serializer.compression);
 
+        let hierarchy: Cow<'_, [Ref]> = if self.preserved_parent_count == 0 {
+            Cow::Borrowed(&self.relevant_instances)
+        } else {
+            Cow::Owned(
+                self.relevant_instances
+                    .iter()
+                    .copied()
+                    .filter(|id| {
+                        !matches!(
+                            self.bindings.unwrap().get(id),
+                            Some(
+                                InstanceBindingMode::Properties
+                                    | InstanceBindingMode::ReferenceOnly
+                            )
+                        )
+                    })
+                    .collect(),
+            )
+        };
+
         chunk.write_u8(0)?; // PRNT version 0
-        chunk.write_le_u32(self.relevant_instances.len() as u32)?;
+        chunk.write_le_u32(hierarchy.len() as u32)?;
 
-        let object_referents = self
-            .relevant_instances
-            .iter()
-            .map(|id| self.id_to_referent[id]);
+        let object_referents = hierarchy.iter().map(|id| self.id_to_referent[id]);
 
-        let parent_referents = self.relevant_instances.iter().map(|id| {
+        let parent_referents = hierarchy.iter().map(|id| {
             let instance = self.dom.get_by_ref(*id).unwrap();
 
             // If there's no parent set OR our parent is not one of the

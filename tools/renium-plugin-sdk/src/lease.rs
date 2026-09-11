@@ -127,7 +127,9 @@ impl Registry {
         }
         match self.read(resource)? {
             Some(lease) if Some(&lease.claim) != claim => bail!(
-                "Resource {resource} belongs to another session; use its owner's sandbox binding"
+                "Resource {resource} is owned by task {} through plugin {}; only that task may use it",
+                lease.session,
+                lease.plugin
             ),
             None if claim.is_some_and(|claim| claim.resource == resource) => {
                 bail!("Resource lease expired or was released")

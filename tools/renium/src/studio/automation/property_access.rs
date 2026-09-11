@@ -315,6 +315,10 @@ fn perform(
             }
         }
     };
+    let result = result.and_then(|value| {
+        sample_completed_write(bridge, scope, &path, &intent)?;
+        Ok(value)
+    });
     match result {
         Ok(value) => Ok(
             json!({"status":"applied","path":intent.path,"property":intent.property,
@@ -327,6 +331,33 @@ fn perform(
         ))),
         Err(error) => Err(error),
     }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn sample_completed_write(
+    bridge: &BridgeServer,
+    scope: &Scope,
+    path: &[String],
+    intent: &Intent,
+) -> Result<()> {
+    if intent.class_name != "MeshPart"
+        || intent.property != "CollisionFidelity"
+        || !matches!(intent.operation, Operation::Write { .. })
+    {
+        return Ok(());
+    }
+    // Cooking may finish after both the original and deferred engine signals.
+    // Sample after verified completion, before another transaction captures its guard.
+    // This is a user edit: record it normally rather than suppressing or acknowledging it.
+    let result = bridge.call_for_runtime_with_timeout(
+        "sampleStudioProperty",
+        json!({ "pathSegments": path, "pathOrdinals": intent.ordinals,
+            "className": intent.class_name, "property": intent.property }),
+        BridgeTarget::Edit,
+        &scope.runtime,
+        Some(Duration::from_secs(2)),
+    )?;
+    crate::app::output::ensure_plugin_api_ok(&result)
 }
 
 #[cfg(any(windows, target_os = "macos"))]

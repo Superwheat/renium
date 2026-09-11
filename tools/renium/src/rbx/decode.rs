@@ -340,6 +340,54 @@ mod tests {
     use crate::roblox::schema::{PropertySchemaEntry, TYPE_ID_CFRAME, TYPE_ID_REF};
 
     #[test]
+    fn gui_input_sink_uses_its_serialized_alias() {
+        let database = rbx_reflection_database::get().unwrap();
+        let property = rbx_property_descriptor(database, "Frame", "InputSink");
+        assert_eq!(
+            crate::rbx::encode::rbx_logical_property_name(database, "Frame", "Sink"),
+            Some("InputSink"),
+            "GuiObject descriptor: {property:?}",
+        );
+        assert_eq!(
+            crate::rbx::encode::rbx_serialized_property_name_for_logical(
+                database,
+                "Frame",
+                "InputSink"
+            ),
+            Some("Sink"),
+        );
+        let filter = native_property_filter(database, "Frame");
+        assert_eq!(
+            filter.renamed.get("Sink").map(String::as_str),
+            Some("InputSink")
+        );
+        assert_eq!(
+            crate::rbx::encode::rbx_logical_property_name(database, "InputContext", "Sink"),
+            Some("Sink"),
+            "the unrelated boolean InputContext.Sink must not be renamed",
+        );
+        for number in [0, 1, 100] {
+            let dom = rbx_dom_weak::WeakDom::new(
+                rbx_dom_weak::InstanceBuilder::new("Frame").with_property(
+                    "InputSink",
+                    RbxVariant::Enum(rbx_dom_weak::types::Enum::from_u32(number)),
+                ),
+            );
+            let mut bytes = Vec::new();
+            rbx_binary::to_writer(&mut bytes, &dom, &[dom.root_ref()]).unwrap();
+            let decoded = rbx_binary::from_reader(bytes.as_slice()).unwrap();
+            let frame = decoded.get_by_ref(decoded.root().children()[0]).unwrap();
+            assert_eq!(
+                frame.properties.get(&"InputSink".into()),
+                Some(&RbxVariant::Enum(rbx_dom_weak::types::Enum::from_u32(
+                    number
+                )))
+            );
+            assert!(!frame.properties.contains_key(&"Sink".into()));
+        }
+    }
+
+    #[test]
     fn model_world_pivot_uses_the_live_overlay() {
         let database = rbx_reflection_database::get().unwrap();
         let schemas = PropertySchemaMap::from([(
@@ -668,7 +716,7 @@ pub(crate) fn rbx_instance_to_settings_records(
     elide_defaults: bool,
     native_filter: Option<&NativePropertyFilter>,
 ) -> (Map<String, Value>, Map<String, Value>, Option<String>) {
-    let mut records = rbx_properties_to_settings_records(
+    rbx_properties_to_settings_records(
         instance.class.as_str(),
         instance.properties.iter(),
         database,
@@ -679,27 +727,7 @@ pub(crate) fn rbx_instance_to_settings_records(
             native_properties_pre_filtered: false,
             native_filter,
         },
-    );
-    if rbx_model_primary_part_is_set(
-        database,
-        instance.class.as_str(),
-        instance.properties.iter(),
-    ) {
-        records.0.remove("WorldPivot");
-    }
-    records
-}
-
-pub(crate) fn rbx_model_primary_part_is_set<'a>(
-    database: &ReflectionDatabase<'_>,
-    class_name: &str,
-    properties: impl IntoIterator<Item = (&'a rbx_dom_weak::Ustr, &'a RbxVariant)>,
-) -> bool {
-    rbx_reflection_class_is_a(database, class_name, "Model")
-        && properties.into_iter().any(|(name, value)| {
-            name.as_str() == "PrimaryPart"
-                && rbx_variant_referent(value).is_some_and(|referent| !referent.is_none())
-        })
+    )
 }
 
 fn native_settings_enum_name(
@@ -1324,7 +1352,7 @@ fn rbx_enum_to_settings_json(
     Value::Object(out)
 }
 
-fn rbx_font_to_settings_json(value: &RbxFont) -> Value {
+pub(crate) fn rbx_font_to_settings_json(value: &RbxFont) -> Value {
     let mut out = Map::new();
     out.insert("_type".to_string(), Value::String("Font".to_string()));
     out.insert("family".to_string(), Value::String(value.family.clone()));

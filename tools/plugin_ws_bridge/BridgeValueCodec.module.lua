@@ -132,6 +132,8 @@ local function decodeColor3(raw: any): (boolean, any)
 	return true, Color3.new(values[1], values[2], values[3])
 end
 
+local enumItemsByValue = {}
+
 local function decodeEnumItem(raw: { [string]: any }, enumHint: string?): (boolean, any)
 	local rawEnumType = tostring(raw.enumType or "")
 	local enumType = if rawEnumType ~= ""
@@ -143,7 +145,20 @@ local function decodeEnumItem(raw: { [string]: any }, enumHint: string?): (boole
 	local enumName = string.gsub(enumType, "^Enum%.", "")
 	local itemName = tostring(raw.name or "")
 	local ok, item = pcall(function()
-		return (Enum :: any)[enumName][itemName]
+		local enum = (Enum :: any)[enumName]
+		local number = tonumber(itemName)
+		if number ~= nil then
+			local items = enumItemsByValue[enum]
+			if items == nil then
+				items = {}
+				for _, candidate in ipairs(enum:GetEnumItems()) do
+					items[candidate.Value] = candidate
+				end
+				enumItemsByValue[enum] = items
+			end
+			return items[number]
+		end
+		return enum[itemName]
 	end)
 	if ok and item ~= nil then
 		return true, item
@@ -218,6 +233,26 @@ function BridgeValueCodec.decode(raw: any, enumHint: string?, decodeRef, context
 			return false, decoded
 		end
 		return true, buffer.tostring(decoded)
+	elseif typeName == "MaterialColors" then
+		if type(raw.colors) ~= "table" then
+			return false, "MaterialColors requires decoded material colors"
+		end
+		local colors = {}
+		for name, rgb in pairs(raw.colors) do
+			local okMaterial, material = pcall(function()
+				return (Enum.Material :: any)[name]
+			end)
+			if not okMaterial or material == nil or type(rgb) ~= "table" or #rgb ~= 3 then
+				return false, "Invalid terrain material color"
+			end
+			for _, component in ipairs(rgb) do
+				if type(component) ~= "number" or component < 0 or component > 255 or component % 1 ~= 0 then
+					return false, "MaterialColors requires RGB bytes"
+				end
+			end
+			colors[material] = Color3.fromRGB(rgb[1], rgb[2], rgb[3])
+		end
+		return true, colors
 	elseif typeName == "PhysicalProperties" then
 		if raw.customPhysics == false or not raw.density then
 			return true, nil
@@ -316,6 +351,30 @@ function BridgeValueCodec.decode(raw: any, enumHint: string?, decodeRef, context
 		end
 		return true, Rect.new(values[1], values[2], values[3], values[4])
 	elseif typeName == "Font" then
+		if raw._nativeFont ~= nil then
+			if type(raw._nativeFont) ~= "string" or #raw._nativeFont > 16384 then
+				return false, "Invalid native Font payload"
+			end
+			local ok, roots = pcall(function()
+				return game:GetService("SerializationService"):DeserializeInstancesAsync(
+					EncodingService:Base64Decode(buffer.fromstring(raw._nativeFont))
+				)
+			end)
+			if not ok then
+				return false, roots
+			end
+			local carrier = roots[1]
+			local font = if #roots == 1 and carrier.ClassName == "TextLabel"
+				and carrier.Parent == nil and #carrier:GetChildren() == 0 then carrier.FontFace else nil
+			for _, root in ipairs(roots) do
+				root:Destroy()
+			end
+			if font == nil or font.Family ~= raw.family or font.Weight.Name ~= raw.weight
+				or font.Style.Name ~= raw.style then
+				return false, "Native Font payload does not match its property"
+			end
+			return true, font
+		end
 		local ok, font = pcall(function()
 			return Font.new(
 				tostring(raw.family or ""),

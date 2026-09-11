@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
+use ahash::AHashMap;
 use anyhow::{Context, Result, bail};
 use rbx_dom_weak::types::{
     Attributes as RbxAttributes, Axes as RbxAxes, BinaryString as RbxBinaryString,
@@ -58,16 +59,16 @@ pub(crate) struct BytecodeRbxBuildOptions<'a> {
 pub(crate) struct BytecodeRbxEncoder<'a, 'db> {
     document: &'a SettingsBytecode,
     database: &'db ReflectionDatabase<'db>,
-    metadata: &'a mut BytecodeExportMetadata<'db>,
-    refs: &'a BytecodeModelExportRefs,
+    metadata: &'a mut BytecodeExportMetadata<'a, 'db>,
+    refs: &'a BytecodeModelExportRefs<'a>,
 }
 
 impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
     pub fn new(
         document: &'a SettingsBytecode,
         database: &'db ReflectionDatabase<'db>,
-        metadata: &'a mut BytecodeExportMetadata<'db>,
-        refs: &'a BytecodeModelExportRefs,
+        metadata: &'a mut BytecodeExportMetadata<'a, 'db>,
+        refs: &'a BytecodeModelExportRefs<'a>,
     ) -> Self {
         Self {
             document,
@@ -82,18 +83,21 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
         index: usize,
         mut options: BytecodeRbxBuildOptions<'_>,
     ) -> Result<RbxInstanceBuilder> {
-        let instance = &self.document.instances[index];
+        let instance: &'a SettingsBytecodeInstance = &self.document.instances[index];
         let referent = *self
             .refs
             .by_index
             .get(&index)
             .ok_or_else(|| anyhow::anyhow!("Missing export referent"))?;
-        let mut builder = RbxInstanceBuilder::new(instance.class_name.as_str())
-            .with_name(instance.name.clone())
-            .with_referent(referent);
+        let mut builder = RbxInstanceBuilder::with_referent_and_property_capacity(
+            instance.class_name.as_str(),
+            referent,
+            instance.properties.len() + usize::from(!instance.attributes.is_empty()),
+        )
+        .with_name(instance.name.clone());
         let class_metadata = self
             .metadata
-            .entry(instance.class_name.clone())
+            .entry(instance.class_name.as_str())
             .or_insert_with(|| BytecodeExportClassMetadata {
                 triangle_mesh_part: rbx_reflection_class_is_a(
                     self.database,
@@ -102,7 +106,7 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
                 ),
                 model: rbx_reflection_class_is_a(self.database, &instance.class_name, "Model"),
                 decal: rbx_reflection_class_is_a(self.database, &instance.class_name, "Decal"),
-                properties: HashMap::new(),
+                properties: AHashMap::new(),
             });
         let synthesized_initial_size = synthesized_mesh_initial_size_for_rbx_export_class(
             self.document,
@@ -112,15 +116,9 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
         let decal = class_metadata.decal;
 
         for (name, value) in &instance.properties {
-            if class_metadata.model
-                && name == "WorldPivot"
-                && instance.properties.contains_key("PrimaryPart")
-            {
-                continue;
-            }
             let property_metadata = class_metadata
                 .properties
-                .entry(name.clone())
+                .entry(name.as_str())
                 .or_insert_with(|| {
                     let serialized_name =
                         if class_metadata.triangle_mesh_part && name == "FluidFidelity" {
@@ -230,6 +228,16 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
                 continue;
             };
             builder.add_property(serialized_name, variant);
+        }
+
+        // Studio treats an omitted Workspace flag as a legacy place and
+        // migrates pivots throughout the DataModel, including ServerStorage.
+        // Renium's captured pivots are already in the current representation.
+        if (instance.class_name == "Workspace"
+            || class_metadata.model && builder.has_property("WorldPivotData"))
+            && !builder.has_property("NeedsPivotMigration")
+        {
+            builder.add_property("NeedsPivotMigration", RbxVariant::Bool(false));
         }
 
         if let Some(initial_size) = synthesized_initial_size
@@ -395,7 +403,6 @@ pub(crate) fn model_property_name_is_skipped(name: &str) -> bool {
         "parent",
         "attributes",
         "attributesserialize",
-        "clocktime",
     ]
     .iter()
     .any(|candidate| name.eq_ignore_ascii_case(candidate))
@@ -1190,20 +1197,20 @@ fn json_to_rbx_physical_properties(value: &Value) -> Option<RbxPhysicalPropertie
     ))
 }
 
-fn json_to_rbx_font(value: &Value) -> Option<RbxFont> {
+pub(crate) fn json_to_rbx_font(value: &Value) -> Option<RbxFont> {
     let obj = json_object(value)?;
-    let family = obj
-        .get("family")
-        .and_then(Value::as_str)
-        .unwrap_or("rbxasset://fonts/families/SourceSansPro.json");
-    let weight = obj
-        .get("weight")
-        .and_then(font_weight_from_json)
-        .unwrap_or_default();
-    let style = obj
-        .get("style")
-        .and_then(font_style_from_json)
-        .unwrap_or_default();
+    let family = match obj.get("family") {
+        Some(value) => value.as_str()?,
+        None => "rbxasset://fonts/families/SourceSansPro.json",
+    };
+    let weight = match obj.get("weight") {
+        Some(value) => font_weight_from_json(value)?,
+        None => RbxFontWeight::default(),
+    };
+    let style = match obj.get("style") {
+        Some(value) => font_style_from_json(value)?,
+        None => RbxFontStyle::default(),
+    };
     let mut font = RbxFont::new(family, weight, style);
     font.cached_face_id = obj
         .get("cachedFaceId")
@@ -1400,7 +1407,9 @@ fn validate_model_export_reference_value(
         Value::Array(values) => {
             let mut unresolved = false;
             for value in values {
-                unresolved = validate_model_export_reference_value(value, refs)? || unresolved;
+                if matches!(value, Value::Array(_) | Value::Object(_)) {
+                    unresolved = validate_model_export_reference_value(value, refs)? || unresolved;
+                }
             }
             Ok(unresolved)
         }
@@ -1415,7 +1424,7 @@ fn validate_model_export_reference_value(
             }
             let mut unresolved = false;
             for (name, value) in object {
-                if name != "Ref" {
+                if name != "Ref" && matches!(value, Value::Array(_) | Value::Object(_)) {
                     unresolved = validate_model_export_reference_value(value, refs)? || unresolved;
                 }
             }
@@ -1423,6 +1432,28 @@ fn validate_model_export_reference_value(
         }
         _ => Ok(false),
     }
+}
+
+#[test]
+fn model_reference_validation_preserves_nested_targets_and_errors() {
+    let mut refs = BytecodeModelExportRefs::default();
+    refs.by_settings_id.insert("kept", RbxRef::new());
+    let resolved = serde_json::json!({
+        "components": [1, null, "scalar", {"_type": "Content", "Object": {
+            "Ref": {"settingsId": "kept"}
+        }}]
+    });
+    assert!(!validate_model_export_reference_value(&resolved, &refs).unwrap());
+    let unresolved = serde_json::json!([
+        {"_type": "Vector3", "x": 1, "y": 2, "z": 3},
+        {"nested": [{"_type": "Ref", "settingsId": "missing"}]}
+    ]);
+    assert!(validate_model_export_reference_value(&unresolved, &refs).unwrap());
+    let invalid_after_unresolved = serde_json::json!([
+        unresolved,
+        {"nested": {"_type": "Ref", "instanceIndex": 0}}
+    ]);
+    assert!(validate_model_export_reference_value(&invalid_after_unresolved, &refs).is_err());
 }
 
 fn json_to_rbx_ref(value: &Value, refs: &BytecodeModelExportRefs) -> RbxRef {

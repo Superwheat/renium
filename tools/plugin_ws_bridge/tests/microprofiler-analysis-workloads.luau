@@ -49,10 +49,17 @@ assert(result.frameCount == 3 and result.measuredFrameCount == 2 and result.stat
 assert(result.cpuMs.mean == 10 and result.cpuMs.max == 10, "Old stitched captures must not inflate current statistics")
 assert(#result.frames == 2 and result.frames[1].scopes[1].inclusiveMs == 7, "Only the portions inside this frame count")
 assert(result.frames[1].scopes[1].spans == 2)
+assert(result.frames[1].scopes[1].wallMs == 7, "Disjoint calls retain their full covered duration")
 assert(result.counterCount == 2 and #result.counters == 1)
 assert(disposed == 1 and iterDisposed == 2)
 local filtered = analyze(lib, buffer.create(1), 2, 5, "Work", "Main", "**/heap")
 assert(#filtered.frames == 1 and filtered.frames[1].frameId == 2 and filtered.frames[1].absoluteId == 100)
 assert(filtered.counters[1].path == "memory/heap")
 assert(disposed == 2 and iterDisposed == 3)
+element.EnterTimestampFrameLocal = function()
+	return currentFrame * 100
+end
+local recursive = analyze(lib, buffer.create(1), 2, 5)
+assert(recursive.frames[1].scopes[1].inclusiveMs == 15, "Inclusive call duration remains available")
+assert(recursive.frames[1].scopes[1].wallMs == 10, "Recursive instances of one timer must not inflate occupied frame time")
 print("Renium MicroProfiler analysis workloads passed")

@@ -30,9 +30,51 @@ struct StoredFile {
 }
 
 impl StoredSnapshot {
+    pub(super) fn migrate_store_paths(&mut self, root: &Path) -> Result<bool> {
+        let moves = self
+            .entries
+            .keys()
+            .filter_map(|old| {
+                crate::project::storage::relocated_legacy_path(root, old)
+                    .map(|new| (old.clone(), new))
+            })
+            .collect::<Vec<_>>();
+        for (old, new) in &moves {
+            if let Some(existing) = self.entries.get(new) {
+                let same = match (&self.entries[old], existing) {
+                    (StoredEntry::File(left), StoredEntry::File(right)) => {
+                        left.length == right.length && left.digest == right.digest
+                    }
+                    (left, right) => left == right,
+                };
+                if !same {
+                    bail!(
+                        "Reconciliation baseline contains conflicting old and new stores: {}",
+                        new.display()
+                    );
+                }
+            }
+        }
+        for (old, new) in &moves {
+            let value = self
+                .entries
+                .remove(old)
+                .context("Migrated baseline entry disappeared")?;
+            self.entries.insert(new.clone(), value);
+        }
+        Ok(!moves.is_empty())
+    }
+
     pub(super) fn write(root: &Path, key: &str, snapshot: &ProjectSnapshot) -> Result<Self> {
+        Self::write_at(&pack_directory(root, key), snapshot.entries.iter())
+    }
+
+    pub(super) fn write_at<'a>(
+        directory: &Path,
+        entries: impl Iterator<Item = (&'a PathBuf, &'a SnapshotEntry)>,
+    ) -> Result<Self> {
         Ok(Self {
-            entries: store_entries(root, key, &snapshot.entries)?,
+            entries: store_entries(directory, entries)?,
         })
     }
 
@@ -70,8 +112,10 @@ impl StoredSnapshot {
     ) -> Result<()> {
         self.entries
             .retain(|path, _| !scopes.iter().any(|scope| path.starts_with(scope)));
-        self.entries
-            .extend(store_entries(root, key, &current.entries)?);
+        self.entries.extend(store_entries(
+            &pack_directory(root, key),
+            current.entries.iter(),
+        )?);
         Ok(())
     }
 
@@ -129,6 +173,14 @@ impl StoredSnapshot {
         key: &str,
         selected: impl Fn(&Path) -> bool,
     ) -> Result<ProjectSnapshot> {
+        self.load_at(&pack_directory(root, key), selected)
+    }
+
+    pub(super) fn load_at(
+        &self,
+        directory: &Path,
+        selected: impl Fn(&Path) -> bool,
+    ) -> Result<ProjectSnapshot> {
         let selected = self
             .entries
             .iter()
@@ -143,7 +195,10 @@ impl StoredSnapshot {
             .collect::<HashSet<_>>()
             .into_iter()
             .map(|name| {
-                let path = pack_directory(root, key).join(format!("{name}.bin"));
+                if name.len() != 64 || !name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    bail!("Invalid snapshot pack name");
+                }
+                let path = directory.join(format!("{name}.bin"));
                 let bytes = fs::read(&path).with_context(|| {
                     format!("Failed to read reconciliation pack {}", path.display())
                 })?;
@@ -213,14 +268,14 @@ impl StoredEntry {
     }
 }
 
-fn store_entries(
-    root: &Path,
-    key: &str,
-    entries: &BTreeMap<PathBuf, SnapshotEntry>,
+fn store_entries<'a>(
+    directory: &Path,
+    entries: impl Iterator<Item = (&'a PathBuf, &'a SnapshotEntry)>,
 ) -> Result<BTreeMap<PathBuf, StoredEntry>> {
+    let entries = entries.collect::<Vec<_>>();
     let size = entries
-        .values()
-        .filter_map(|entry| match entry {
+        .iter()
+        .filter_map(|(_, entry)| match entry {
             SnapshotEntry::File(bytes) => Some(bytes.len()),
             _ => None,
         })
@@ -255,7 +310,6 @@ fn store_entries(
     }
     if !files.is_empty() {
         let name = sha256_hex(&pack);
-        let directory = pack_directory(root, key);
         let path = directory.join(format!("{name}.bin"));
         let pack_len = u64::try_from(pack.len()).context("Reconciliation pack is too large")?;
         if fs::metadata(&path).map_or(true, |metadata| metadata.len() != pack_len) {
@@ -287,6 +341,35 @@ fn pack_directory(root: &Path, key: &str) -> PathBuf {
 mod tests {
     use super::*;
     use crate::tests::support::temp_dir;
+
+    #[test]
+    fn migrated_baseline_preserves_original_bytes_for_three_way_reconciliation() -> Result<()> {
+        let root = temp_dir("baseline-store-migration");
+        let _cleanup = crate::system::files::OnDrop::new(|| {
+            crate::project::storage::forget(&root);
+            let _ = fs::remove_dir_all(&root);
+        });
+        fs::write(
+            root.join("renium.project.jsonc"),
+            br#"{"schemaVersion":1,"sourceRoot":"code/scripts"}"#,
+        )?;
+        crate::project::config::load_project(Some(&root.join("renium.project.jsonc")), None)?;
+        let old = PathBuf::from("code/scripts/Workspace/__roblox_sync_settings.renium");
+        let new = PathBuf::from("instances/Workspace.renium");
+        let mut stored = StoredSnapshot::write(
+            &root,
+            "pair",
+            &ProjectSnapshot {
+                entries: BTreeMap::from([(old.clone(), SnapshotEntry::File(b"baseline".to_vec()))]),
+            },
+        )?;
+        assert!(stored.migrate_store_paths(&root)?);
+        assert!(!stored.migrate_store_paths(&root)?);
+        let loaded = stored.load(&root, "pair")?;
+        assert!(!loaded.entries.contains_key(&old));
+        assert!(loaded.entries.get(&new) == Some(&SnapshotEntry::File(b"baseline".to_vec())));
+        Ok(())
+    }
 
     #[test]
     fn stored_snapshot_round_trips_and_replaces_only_selected_scopes() {

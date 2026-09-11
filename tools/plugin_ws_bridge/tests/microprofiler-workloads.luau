@@ -29,7 +29,13 @@ end, ProcessCommand = function(_, source, _, length, response)
 	buffer.writeu8(response, 32, if reject then 0 else 1)
 	return 33
 end }
-local api = MicroProfiler.create(function() return service end)
+local afterPause = nil
+local completedFrames = 0
+local api = MicroProfiler.create(function() return service end, function()
+	assert(calls[#calls][1] == 20 and calls[#calls][2] == 0, "Finish the current frame only after pausing collection")
+	completedFrames += 1
+	if afterPause then afterPause() end
+end)
 for _, value in { 0, 257, -1, 1.5, math.huge, 0 / 0, "256" } do
 	assert(not pcall(api.start, value) and #calls == 0)
 end
@@ -45,8 +51,15 @@ failAck = true
 assert(not pcall(api.start, 128) and #calls == 6, "Rejected limit must not continue enabling the capture")
 failAck = false
 api.start(64)
+local readResult = api.read(function()
+	assert(calls[#calls][1] == 20 and calls[#calls][2] == 0, "Read must freeze the owned capture")
+	return "snapshot"
+end)
+assert(readResult == "snapshot" and calls[#calls][1] == 20 and calls[#calls][2] == 1, "Read must resume the owned capture")
+local readOk = pcall(api.read, function() error("copy failed") end)
+assert(not readOk and calls[#calls][1] == 20 and calls[#calls][2] == 1, "A failed read must resume the owned capture")
 local fresh = api.stop(function()
-	assert(calls[#calls][1] == 20 and calls[#calls][2] == 1, "Snapshot must refresh before capture is paused")
+	assert(calls[#calls][1] == 20 and calls[#calls][2] == 0, "Snapshot bytes must be copied only after capture is paused")
 	return { bytes = 123 }
 end)
 assert(fresh.bytes == 123 and calls[#calls][2] == 0)
@@ -72,4 +85,17 @@ api.cleanup()
 local afterCleanup = #calls
 api.cleanup()
 assert(#calls == afterCleanup, "Cleanup must not touch another capture when this runtime is inactive")
+assert(api.read(function() return "unowned" end) == "unowned" and #calls == afterCleanup, "An unowned read must not change collection")
+api.start(64)
+afterPause = function()
+	assert(not pcall(api.read, function() return "overlap" end), "Concurrent copying must be rejected")
+	api.cleanup()
+	assert(not pcall(api.start, 64), "Do not start a new capture while an old copy is completing")
+end
+local cancelled = pcall(api.read, function() error("Must not copy after cleanup") end)
+assert(not cancelled and calls[#calls][1] == 10 and calls[#calls][2] == 0, "Cleanup during the frame wait must not resume collection")
+afterPause = nil
+api.start(64)
+api.stop()
+assert(completedFrames >= 5, "Snapshot copies must finish the paused frame")
 print("Renium MicroProfiler protocol workloads passed")

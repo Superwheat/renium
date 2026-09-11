@@ -11,9 +11,41 @@ use std::sync::{
 const PACKAGE_CHANGES_MESSAGE: &str =
     "Modifying packages disables auto-update until you publish or revert the changes";
 
+#[cfg(any(windows, target_os = "macos", test))]
+fn startup_dialog_button(title: &str) -> Option<&'static str> {
+    match title {
+        "Auto-Recovery" => Some("Ignore"),
+        "Lighting Technology Migration" => Some("Continue"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn startup_dialogs_only_acknowledge_known_notices() {
+    assert_eq!(startup_dialog_button("Auto-Recovery"), Some("Ignore"));
+    assert_eq!(
+        startup_dialog_button("Lighting Technology Migration"),
+        Some("Continue")
+    );
+    for title in [
+        "Roblox Studio",
+        "Save Changes",
+        "Publish",
+        "Delete",
+        "Lighting Technology Migration - Confirm",
+    ] {
+        assert_eq!(startup_dialog_button(title), None);
+    }
+}
+
 #[cfg(windows)]
 #[path = "input/windows_shield.rs"]
 mod windows_shield;
+
+#[cfg(windows)]
+#[path = "input/background_dialog.rs"]
+mod background_dialog;
 
 #[cfg(target_os = "macos")]
 #[path = "input/macos_shield.rs"]
@@ -422,7 +454,11 @@ fn write_png(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) -> Re
 
 #[cfg(windows)]
 mod platform {
-    use super::{PACKAGE_CHANGES_MESSAGE, StudioWindow, ThreadDpiAwareness, windows_shield};
+    use super::background_dialog::BackgroundDialogGuard;
+    use super::{
+        PACKAGE_CHANGES_MESSAGE, StudioWindow, ThreadDpiAwareness, startup_dialog_button,
+        windows_shield,
+    };
     use anyhow::{Context, Result, bail};
 
     use windows::Win32::Foundation::{HWND as AutomationHwnd, RPC_E_CHANGED_MODE};
@@ -443,14 +479,15 @@ mod platform {
     };
     use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MAPVK_VK_TO_VSC, MapVirtualKeyW};
+    #[cfg(test)]
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CHILDID_SELF, EVENT_OBJECT_SHOW, EnumChildWindows, EnumWindows, GA_ROOT, GW_OWNER,
-        GetAncestor, GetClassNameW, GetClientRect, GetForegroundWindow, GetMessageW, GetWindow,
-        GetWindowTextW, GetWindowThreadProcessId, IsChild, IsIconic, IsWindow, IsWindowVisible,
-        MSG, OBJID_WINDOW, SMTO_ABORTIFHUNG, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
-        SWP_NOSIZE, SendMessageTimeoutW, SetForegroundWindow, SetWindowPos, ShowWindow,
-        WINEVENT_OUTOFCONTEXT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-        WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
+        CHILDID_SELF, EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_SHOW, EnumChildWindows, EnumWindows,
+        GA_ROOT, GW_OWNER, GetAncestor, GetClassNameW, GetClientRect, GetMessageW, GetWindow,
+        GetWindowTextW, GetWindowThreadProcessId, IsChild, IsIconic, IsWindowVisible, MSG,
+        OBJID_WINDOW, SMTO_ABORTIFHUNG, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SendMessageTimeoutW, SetWindowPos, ShowWindow, WINEVENT_OUTOFCONTEXT, WM_KEYDOWN, WM_KEYUP,
+        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
     };
 
     #[link(name = "user32")]
@@ -531,7 +568,7 @@ mod platform {
 
     unsafe extern "system" fn enum_recovery_proc(hwnd: HWND, lparam: LPARAM) -> i32 {
         let state = unsafe { &mut *(lparam as *mut EnumRecoveryState) };
-        if auto_recovery_pid(hwnd).is_some() {
+        if startup_notice(hwnd).is_some() {
             state.dialogs.push(hwnd as isize);
         }
         1
@@ -576,33 +613,53 @@ mod platform {
         state.pids
     }
 
-    fn auto_recovery_pid(hwnd: HWND) -> Option<u32> {
+    fn startup_notice(hwnd: HWND) -> Option<(u32, &'static str)> {
         if unsafe { IsWindowVisible(hwnd) } == 0 {
             return None;
         }
         let mut title = [0u16; 256];
         let len = unsafe { GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32) };
-        if len <= 0 || String::from_utf16_lossy(&title[..len as usize]) != "Auto-Recovery" {
+        if len <= 0 {
             return None;
         }
-        studio_window_pid(hwnd)
-    }
-
-    fn dismiss_auto_recovery_dialog(hwnd: HWND) -> bool {
-        if auto_recovery_pid(hwnd).is_none() {
-            return false;
-        }
-        invoke_auto_recovery_ignore(hwnd).unwrap_or(false)
+        let button = startup_dialog_button(&String::from_utf16_lossy(&title[..len as usize]))?;
+        Some((studio_window_pid(hwnd)?, button))
     }
 
     fn dismiss_auto_recovery_until_closed(hwnd: HWND) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        while std::time::Instant::now() < deadline && unsafe { IsWindow(hwnd) } != 0 {
-            if dismiss_auto_recovery_dialog(hwnd) {
+        static DISMISSING: std::sync::Mutex<Vec<isize>> = std::sync::Mutex::new(Vec::new());
+        let window = hwnd as isize;
+        {
+            let mut active = DISMISSING
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if active.contains(&window) {
                 return;
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            active.push(window);
         }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            let Some((pid, button)) = startup_notice(hwnd) else {
+                break;
+            };
+            match invoke_startup_notice(hwnd, pid, button) {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(error) => {
+                    crate::app::output::log_global(
+                        2,
+                        format_args!("[renium] Studio startup notice: {error:#}"),
+                    );
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        DISMISSING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|active| *active != window);
     }
 
     unsafe extern "system" fn recovery_event_proc(
@@ -614,13 +671,12 @@ mod platform {
         _thread: u32,
         _time: u32,
     ) {
-        if event == EVENT_OBJECT_SHOW && object == OBJID_WINDOW && child == CHILDID_SELF as i32 {
-            if dismiss_auto_recovery_dialog(hwnd)
-                || unsafe { GetAncestor(hwnd, GA_ROOT) } != hwnd
-                || studio_window_pid(hwnd).is_none()
-            {
-                return;
-            }
+        if matches!(event, EVENT_OBJECT_SHOW | EVENT_OBJECT_NAMECHANGE)
+            && object == OBJID_WINDOW
+            && child == CHILDID_SELF as i32
+            && unsafe { GetAncestor(hwnd, GA_ROOT) } == hwnd
+            && startup_notice(hwnd).is_some()
+        {
             let window = hwnd as isize;
             std::thread::spawn(move || dismiss_auto_recovery_until_closed(window as HWND));
         }
@@ -656,12 +712,11 @@ mod platform {
     }
 
     pub fn watch_auto_recovery_dialogs() {
-        dismiss_auto_recovery_dialogs();
         std::thread::spawn(|| {
             let hook = unsafe {
                 SetWinEventHook(
                     EVENT_OBJECT_SHOW,
-                    EVENT_OBJECT_SHOW,
+                    EVENT_OBJECT_NAMECHANGE,
                     std::ptr::null_mut(),
                     Some(recovery_event_proc),
                     0,
@@ -672,6 +727,7 @@ mod platform {
             if hook.is_null() {
                 return;
             }
+            dismiss_auto_recovery_dialogs();
             let mut message = unsafe { std::mem::zeroed::<MSG>() };
             while unsafe { GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) } > 0 {}
             unsafe {
@@ -689,7 +745,10 @@ mod platform {
             return Ok(());
         }
         let dialogs = modal_dialogs(top as isize);
-        if let Some((dialog, _)) = dialogs.iter().find(|(_, title)| title == "Auto-Recovery") {
+        if let Some((dialog, _)) = dialogs
+            .iter()
+            .find(|(_, title)| startup_dialog_button(title).is_some())
+        {
             dismiss_auto_recovery_until_closed(*dialog as HWND);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
             while unsafe { IsWindowEnabled(top) } == 0 && std::time::Instant::now() < deadline {
@@ -1123,32 +1182,134 @@ mod platform {
         }
     }
 
-    fn invoke_auto_recovery_ignore(hwnd: HWND) -> Result<bool> {
+    fn invoke_startup_notice(hwnd: HWND, pid: u32, button_name: &str) -> Result<bool> {
         let _com = ComGuard::initialize()?;
         let automation: IUIAutomation =
             unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
                 .context("Could not start Windows UI Automation")?;
         let root = unsafe { automation.ElementFromHandle(AutomationHwnd(hwnd)) }
-            .context("Could not inspect the Auto-Recovery dialog")?;
+            .context("Could not inspect the Studio startup notice")?;
         let condition = unsafe {
-            automation.CreatePropertyCondition(UIA_NamePropertyId, &VARIANT::from("Ignore"))
+            automation.CreatePropertyCondition(UIA_NamePropertyId, &VARIANT::from(button_name))
         }
-        .context("Could not create the Auto-Recovery button query")?;
+        .context("Could not create the startup notice button query")?;
         let Ok(button) = (unsafe { root.FindFirst(TreeScope_Descendants, &condition) }) else {
             return Ok(false);
         };
         let invoke: IUIAutomationInvokePattern =
             unsafe { button.GetCurrentPatternAs(UIA_InvokePatternId) }
-                .context("The Auto-Recovery Ignore button is not invokable")?;
-        unsafe { invoke.Invoke() }.context("Could not ignore the Auto-Recovery file")?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+                .context("The startup notice button is not invokable")?;
+        let _background = BackgroundDialogGuard::new(hwnd, pid)?;
+        unsafe { invoke.Invoke() }.context("Could not acknowledge the Studio startup notice")?;
+        // Qt's accessible press uses a 100ms animated click. Invoke once: retrying
+        // on that same deadline can restart its timer indefinitely on a busy UI.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
         while std::time::Instant::now() < deadline {
-            if auto_recovery_pid(hwnd).is_none() {
+            if startup_notice(hwnd).is_none() {
                 return Ok(true);
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        Ok(false)
+        bail!("Studio did not close the startup notice after {button_name}; not invoking it again")
+    }
+
+    #[cfg(test)]
+    #[test]
+    #[ignore = "requires RENIUM_DIALOG_TEST_PID for an owned Studio fixture with an open notice"]
+    fn live_startup_notice_preserves_background_focus() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            EVENT_SYSTEM_FOREGROUND, GWL_EXSTYLE, GetWindowLongPtrW, PostThreadMessageW, WM_QUIT,
+        };
+        static TARGET: AtomicUsize = AtomicUsize::new(0);
+        static ACTIVATIONS: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "system" fn foreground_event(
+            _: *mut core::ffi::c_void,
+            _: u32,
+            window: HWND,
+            _: i32,
+            _: i32,
+            _: u32,
+            _: u32,
+        ) {
+            if window_process_id(window) as usize == TARGET.load(Ordering::Acquire) {
+                ACTIVATIONS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let pid = std::env::var("RENIUM_DIALOG_TEST_PID")
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        let (top, _, _) = main_studio_window(pid).unwrap();
+        let before_style = unsafe { GetWindowLongPtrW(top as HWND, GWL_EXSTYLE) };
+        assert_ne!(
+            window_process_id(unsafe { GetForegroundWindow() }),
+            pid,
+            "leave the fixture in the background"
+        );
+        let mut state = EnumRecoveryState {
+            dialogs: Vec::new(),
+        };
+        unsafe { EnumWindows(Some(enum_recovery_proc), &mut state as *mut _ as LPARAM) };
+        let window = state
+            .dialogs
+            .into_iter()
+            .find(|window| window_process_id(*window as HWND) == pid)
+            .expect("fixture must have an actual open startup notice");
+        TARGET.store(pid as usize, Ordering::Release);
+        ACTIVATIONS.store(0, Ordering::Release);
+        let (ready, started) = std::sync::mpsc::channel();
+        let observer = std::thread::spawn(move || {
+            let hook = unsafe {
+                SetWinEventHook(
+                    EVENT_SYSTEM_FOREGROUND,
+                    EVENT_SYSTEM_FOREGROUND,
+                    std::ptr::null_mut(),
+                    Some(foreground_event),
+                    0,
+                    0,
+                    WINEVENT_OUTOFCONTEXT,
+                )
+            };
+            assert!(!hook.is_null());
+            let mut message = unsafe { std::mem::zeroed::<MSG>() };
+            // Creating the message queue precedes publishing its thread ID.
+            unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::PeekMessageW(
+                    &mut message,
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    0,
+                )
+            };
+            ready.send(unsafe { GetCurrentThreadId() }).unwrap();
+            while unsafe { GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) } > 0 {}
+            unsafe { UnhookWinEvent(hook) };
+        });
+        let thread = started.recv().unwrap();
+        let began = std::time::Instant::now();
+        let (_, button) = startup_notice(window as HWND).unwrap();
+        let result = invoke_startup_notice(window as HWND, pid, button);
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        unsafe { PostThreadMessageW(thread, WM_QUIT, 0, 0) };
+        observer.join().unwrap();
+        assert!(result.unwrap(), "notice was not dismissed");
+        assert_eq!(
+            ACTIVATIONS.load(Ordering::Acquire),
+            0,
+            "Studio stole foreground during dismissal"
+        );
+        assert_eq!(
+            unsafe { GetWindowLongPtrW(top as HWND, GWL_EXSTYLE) },
+            before_style,
+            "owner window style must be restored"
+        );
+        println!(
+            "startup notice dismissed in {}ms; zero Studio foreground events; owner style restored",
+            began.elapsed().as_millis()
+        );
     }
 
     fn device_emulator_close_button(
@@ -1190,7 +1351,7 @@ mod platform {
     fn package_changes_ok_button(
         automation: &IUIAutomation,
         top: isize,
-    ) -> Result<Option<IUIAutomationElement>> {
+    ) -> Result<Option<(isize, IUIAutomationElement)>> {
         let message_condition = unsafe {
             automation
                 .CreatePropertyCondition(UIA_AutomationIdPropertyId, &VARIANT::from("Message"))
@@ -1222,7 +1383,7 @@ mod platform {
             else {
                 continue;
             };
-            return Ok(Some(button));
+            return Ok(Some((dialog, button)));
         }
         Ok(None)
     }
@@ -1271,21 +1432,11 @@ mod platform {
         Ok(false)
     }
 
+    #[cfg(test)]
     fn window_process_id(hwnd: HWND) -> u32 {
         let mut pid = 0;
         unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
         pid
-    }
-
-    fn return_studio_to_background(top: isize, pid: u32, foreground: HWND) {
-        if foreground.is_null()
-            || unsafe { IsWindow(foreground) } == 0
-            || window_process_id(foreground) == pid
-        {
-            return;
-        }
-        let _ = send_window_to_bottom(top);
-        unsafe { SetForegroundWindow(foreground) };
     }
 
     pub fn watch_package_changes_dialog(
@@ -1294,6 +1445,7 @@ mod platform {
         ready: std::sync::mpsc::SyncSender<std::result::Result<(), String>>,
     ) -> Result<bool> {
         let setup = (|| -> Result<_> {
+            crate::project::workflows::windows_launch::protect_process(pid)?;
             let (top, _, _) = main_studio_window(pid)?;
             let com = ComGuard::initialize()?;
             let automation: IUIAutomation =
@@ -1312,27 +1464,17 @@ mod platform {
                 return Err(error);
             }
         };
-        let mut last_non_studio_foreground = unsafe { GetForegroundWindow() };
-        if window_process_id(last_non_studio_foreground) == pid {
-            last_non_studio_foreground = std::ptr::null_mut();
-        }
         let mut finish_deadline = None;
         loop {
-            let foreground = unsafe { GetForegroundWindow() };
-            if !foreground.is_null() && window_process_id(foreground) != pid {
-                last_non_studio_foreground = foreground;
-            }
-            if let Some(button) = package_changes_ok_button(&automation, top)? {
-                return_studio_to_background(top, pid, last_non_studio_foreground);
+            if let Some((dialog, button)) = package_changes_ok_button(&automation, top)? {
+                let _background = BackgroundDialogGuard::new(dialog as HWND, pid)?;
                 let invoke: IUIAutomationInvokePattern =
                     unsafe { button.GetCurrentPatternAs(UIA_InvokePatternId) }
                         .context("The package changes OK button is not invokable")?;
                 unsafe { invoke.Invoke() }.context("Could not accept package changes")?;
-                return_studio_to_background(top, pid, last_non_studio_foreground);
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
                 while std::time::Instant::now() < deadline {
                     if package_changes_ok_button(&automation, top)?.is_none() {
-                        return_studio_to_background(top, pid, last_non_studio_foreground);
                         return Ok(true);
                     }
                     std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1689,6 +1831,8 @@ mod platform {
     use std::os::unix::ffi::OsStringExt;
     use std::path::PathBuf;
 
+    const PLUGIN_ASSET_DETAILS_ERROR: &str = "HttpRequest \"BulkPluginAssetDetailsFetcher::sendRequest()\": got network error status: 500";
+
     type CFTypeRef = *const c_void;
     type CFArrayRef = *const c_void;
     type CFDictionaryRef = *const c_void;
@@ -1793,6 +1937,7 @@ mod platform {
         fn CFNumberGetValue(number: CFNumberRef, number_type: isize, value: *mut c_void) -> bool;
         fn CFRetain(value: CFTypeRef) -> CFTypeRef;
         fn CFRelease(value: CFTypeRef);
+        fn CFEqual(first: CFTypeRef, second: CFTypeRef) -> bool;
     }
 
     #[link(name = "ApplicationServices", kind = "framework")]
@@ -2280,8 +2425,18 @@ mod platform {
         for index in 0..count {
             // SAFETY: index is within the CFArray count read above.
             let window = unsafe { CFArrayGetValueAtIndex(windows, index) };
-            if ax_string_attribute(window, "AXTitle").as_deref() == Some("Auto-Recovery") {
-                button = find_ax_button(window, "Ignore", 16);
+            let title = ax_string_attribute(window, "AXTitle").unwrap_or_default();
+            if let Some(name) = super::startup_dialog_button(&title) {
+                button = find_ax_button(window, name, 16);
+            } else if title.is_empty()
+                && let Some(message) = find_ax_text(window, PLUGIN_ASSET_DETAILS_ERROR, 2)
+            {
+                // This Qt alert has no window title. Match its complete message;
+                // a generic HTTP error or an unrelated OK dialog needs attention.
+                unsafe { CFRelease(message) };
+                button = find_ax_button(window, "OK", 2);
+            }
+            if button.is_some() {
                 break;
             }
         }
@@ -2297,18 +2452,48 @@ mod platform {
         let Some(button) = auto_recovery_ignore_button(pid)? else {
             return Ok(false);
         };
-        let action = cf_string("AXPress");
-        // SAFETY: button and action are valid retained accessibility objects.
-        let result = unsafe { AXUIElementPerformAction(button, action) };
-        // SAFETY: these Core Foundation objects are owned by this function.
-        unsafe {
-            CFRelease(action);
-            CFRelease(button);
-        }
-        if result != 0 {
-            bail!("Could not ignore the Auto-Recovery file (AXError {result})");
-        }
-        Ok(true)
+        let outcome = (|| {
+            let action = cf_string("AXPress");
+            // SAFETY: button and action are valid retained accessibility objects.
+            let result = unsafe { AXUIElementPerformAction(button, action) };
+            unsafe { CFRelease(action) };
+            if result != 0 {
+                bail!("Could not acknowledge the Studio startup notice (AXError {result})");
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while std::time::Instant::now() < deadline {
+                let same_button = auto_recovery_ignore_button(pid)?.is_some_and(|current| {
+                    // SAFETY: both elements are retained; the fresh query is released here.
+                    let same = unsafe { CFEqual(button, current) };
+                    unsafe { CFRelease(current) };
+                    same
+                });
+                if !same_button {
+                    return Ok(true);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            bail!("Studio did not close the startup notice; not invoking it again")
+        })();
+        unsafe { CFRelease(button) };
+        outcome
+    }
+
+    #[cfg(test)]
+    #[test]
+    #[ignore = "requires RENIUM_DIALOG_TEST_PID for an owned Studio fixture with the plugin asset HTTP 500 alert"]
+    fn live_plugin_asset_notice_dismissal() {
+        let pid = std::env::var("RENIUM_DIALOG_TEST_PID")
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        let began = std::time::Instant::now();
+        assert!(dismiss_auto_recovery_dialog(pid).unwrap());
+        assert!(!dismiss_auto_recovery_dialog(pid).unwrap());
+        println!(
+            "plugin asset notice dismissed once in {}ms",
+            began.elapsed().as_millis()
+        );
     }
 
     pub fn watch_auto_recovery_dialog_for_pid(pid: u32) {
@@ -2330,11 +2515,10 @@ mod platform {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             while std::time::Instant::now() < deadline {
                 match dismiss_auto_recovery_dialog(platform_pid) {
-                    Ok(true) => break,
-                    Ok(false) => {}
+                    Ok(_) => {}
                     Err(error) => {
                         eprintln!(
-                            "[renium] Could not dismiss Studio {pid}'s Auto-Recovery dialog: {error:#}"
+                            "[renium] Could not dismiss Studio {pid}'s startup notice: {error:#}"
                         );
                         break;
                     }

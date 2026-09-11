@@ -45,6 +45,7 @@ pub use projection::{
     project_requires_temporary_stage, project_structural_store, project_structural_store_path,
     project_target_is_declarative, stage_project, stage_project_cached,
 };
+pub(crate) use syncback::projected_settings_writes;
 use syncback::{
     build_adapters, is_nested_project_path, plan_adapter_syncback, projection_instance_paths,
     stage_adapter_syncback_projection, watch_adapters,
@@ -953,6 +954,7 @@ fn project_watch_inputs_into(
     let source_root = absolute_path(&loaded.root.join(&loaded.project.source_root));
     inputs.directories.insert(source_root.clone());
     inputs.full_push.insert(source_root);
+    inputs.directories.insert(loaded.root.join("instances"));
 
     let tree_sources = project_tree_nodes(&loaded.project.tree)
         .into_iter()
@@ -1057,6 +1059,7 @@ fn project_source_roots_into(
         bail!("Nested project cycle includes {}", project_path.display());
     }
     roots.insert(loaded.root.join(&loaded.project.source_root));
+    roots.insert(loaded.root.join("instances"));
     let tree_sources = project_tree_nodes(&loaded.project.tree)
         .into_iter()
         .filter_map(|(_, node)| node.path);
@@ -1335,10 +1338,18 @@ pub fn project_source_to_staged_paths(
     stage_root: &Path,
 ) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
+    let deleted_script = !source.exists()
+        && source
+            .file_name()
+            .and_then(OsStr::to_str)
+            .and_then(|name| infer_source_script(name, &project_script_naming(&loaded.project)))
+            .is_some();
     for relative in project_source_to_staged_relatives(loaded, source)? {
         let mapped = stage_root.join(&relative);
         if mapped.is_file() {
             paths.push(mapped);
+        } else if deleted_script {
+            paths.push(file_target_destination(loaded, source, &mapped));
         } else if source.is_file() {
             let copied = file_target_destination(loaded, source, &mapped);
             if copied.is_file() {
@@ -1417,6 +1428,13 @@ pub fn project_source_to_staged_relatives(
     source: &Path,
 ) -> Result<Vec<PathBuf>> {
     let source = absolute_path(source);
+    if let Some(service) =
+        super::storage::service_for_store(&loaded.root.join(&loaded.project.source_root), &source)
+    {
+        return Ok(vec![
+            PathBuf::from(service).join(crate::system::files::SERVICE_SETTINGS_FILE_NAME),
+        ]);
+    }
     let matches = project_target_source_mappings(loaded)?
         .into_iter()
         .filter_map(|mapping| {
@@ -1717,13 +1735,9 @@ fn explain_staged_filter_candidates(
 ) -> Result<(Vec<Value>, Vec<Value>)> {
     let mut candidates = Vec::new();
     let mut matching_filters = Vec::new();
-    for service in fs::read_dir(projection.root())? {
-        let service = service?;
-        if !service.file_type()?.is_dir() {
-            continue;
-        }
-        let service_name = service.file_name().to_string_lossy().into_owned();
-        let settings = service_settings_path(&service.path());
+    for service in super::storage::service_directories(projection.root())? {
+        let service_name = service.file_name().unwrap().to_string_lossy().into_owned();
+        let settings = service_settings_path(&service);
         if !settings.is_file() {
             continue;
         }
@@ -1731,7 +1745,7 @@ fn explain_staged_filter_candidates(
         let source_paths = crate::editor::paths::build_editor_source_paths_by_index(
             &document,
             &service_name,
-            &service.path(),
+            &service,
         );
         let paths = projection_instance_paths(&document);
         for (index, source_path) in source_paths.into_iter().enumerate() {
@@ -2248,11 +2262,13 @@ pub fn try_load_project(
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf();
-    Ok(Some(LoadedProject {
+    let loaded = LoadedProject {
         path,
         root,
         project,
-    }))
+    };
+    super::storage::prepare(&loaded)?;
+    Ok(Some(loaded))
 }
 
 fn load_nested_project(path: &Path) -> Result<LoadedProject> {
@@ -2261,11 +2277,13 @@ fn load_nested_project(path: &Path) -> Result<LoadedProject> {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf();
-    Ok(LoadedProject {
+    let loaded = LoadedProject {
         path: path.to_path_buf(),
         root,
         project,
-    })
+    };
+    super::storage::prepare(&loaded)?;
+    Ok(loaded)
 }
 
 fn load_project_schema(path: &Path) -> Result<ReniumProject> {
@@ -2306,6 +2324,7 @@ pub fn cache_script_naming(root: &Path, project: &ReniumProject) {
 }
 
 pub(crate) fn remove_cached_script_naming(root: &Path) {
+    super::storage::forget(root);
     if let Some(cache) = SCRIPT_NAMING_CACHE.get() {
         let root = absolute_path(root);
         cache
@@ -3388,6 +3407,9 @@ pub fn validate_relative_portable_path(path: &Path, field: &str) -> Result<()> {
         }
     }
     for segment in path.iter().filter_map(OsStr::to_str) {
+        if segment == "." {
+            continue;
+        }
         if segment.chars().any(|character| {
             character.is_control() || matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*')
         }) {
@@ -3444,7 +3466,7 @@ fn validate_filesystem_target(target: &ProjectTarget, field: &str) -> Result<()>
 }
 
 fn validate_direct_owner_source(source: &Path, field: &str) -> Result<()> {
-    if source.is_dir() {
+    if super::storage::source_directory_exists(source) {
         return Ok(());
     }
     let name = source
@@ -3611,5 +3633,28 @@ mod tests {
             }
         }
         validate_merged_config(&values).unwrap();
+    }
+
+    #[test]
+    fn portable_relative_paths_allow_current_directory_but_not_escape_or_bad_names() {
+        for path in [".", "./src", "src/server", "src/./client"] {
+            assert!(
+                validate_relative_portable_path(Path::new(path), "srcDir").is_ok(),
+                "{path}"
+            );
+        }
+        for path in [
+            "",
+            "..",
+            "src/../outside",
+            "src/trailing.",
+            "src/CON",
+            "src/file?",
+        ] {
+            assert!(
+                validate_relative_portable_path(Path::new(path), "srcDir").is_err(),
+                "{path}"
+            );
+        }
     }
 }

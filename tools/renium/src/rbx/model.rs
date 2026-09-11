@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufReader, Write};
@@ -5,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use ahash::AHashMap;
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 use rbx_dom_weak::types::{Ref as RbxRef, Variant as RbxVariant};
@@ -225,11 +227,21 @@ impl RbxPlaceFormat {
     }
 
     pub(crate) fn read(self, path: &Path) -> Result<RbxWeakDom> {
+        self.read_with_defaults(path, false)
+    }
+
+    pub(crate) fn read_for_comparison(self, path: &Path) -> Result<RbxWeakDom> {
+        self.read_with_defaults(path, true)
+    }
+
+    fn read_with_defaults(self, path: &Path, elide_defaults: bool) -> Result<RbxWeakDom> {
         let input =
             File::open(path).with_context(|| format!("Failed to read {}", path.display()))?;
         let reader = BufReader::new(input);
         match self {
-            Self::Binary => rbx_binary::from_reader(reader)
+            Self::Binary => rbx_binary::Deserializer::new()
+                .elide_defaults(elide_defaults)
+                .deserialize(reader)
                 .with_context(|| format!("Failed to read {}", path.display())),
             Self::Xml => rbx_xml::from_reader(
                 reader,
@@ -265,10 +277,10 @@ impl RbxPlaceFormat {
 }
 
 #[derive(Default)]
-pub(crate) struct BytecodeModelExportRefs {
-    pub(crate) by_index: HashMap<usize, RbxRef>,
-    pub(crate) by_settings_id: HashMap<String, RbxRef>,
-    pub(crate) global_by_settings_id: Option<Arc<HashMap<String, RbxRef>>>,
+pub(crate) struct BytecodeModelExportRefs<'a> {
+    pub(crate) by_index: AHashMap<usize, RbxRef>,
+    pub(crate) by_settings_id: AHashMap<&'a str, RbxRef>,
+    pub(crate) global_by_settings_id: Option<Arc<AHashMap<&'a str, RbxRef>>>,
     pub(crate) by_path_key: HashMap<String, RbxRef>,
     pub(crate) global_by_path_key: Option<Arc<HashMap<String, RbxRef>>>,
     pub(crate) by_path_segments_key: HashMap<String, Option<RbxRef>>,
@@ -283,14 +295,17 @@ pub(crate) struct BytecodeExportPropertyMetadata<'db> {
     pub(crate) skipped: bool,
 }
 
-pub(crate) struct BytecodeExportClassMetadata<'db> {
+pub(crate) struct BytecodeExportClassMetadata<'doc, 'db> {
     pub(crate) triangle_mesh_part: bool,
     pub(crate) model: bool,
     pub(crate) decal: bool,
-    pub(crate) properties: HashMap<String, BytecodeExportPropertyMetadata<'db>>,
+    pub(crate) properties: AHashMap<&'doc str, BytecodeExportPropertyMetadata<'db>>,
 }
 
-pub(crate) type BytecodeExportMetadata<'db> = HashMap<String, BytecodeExportClassMetadata<'db>>;
+// An encoder only reads its document. Borrow its names instead of allocating
+// a new String on every lookup for every instance/property in a full push.
+pub(crate) type BytecodeExportMetadata<'doc, 'db> =
+    AHashMap<&'doc str, BytecodeExportClassMetadata<'doc, 'db>>;
 
 #[derive(Default)]
 pub(crate) struct BytecodeModelImportRefs {
@@ -1006,8 +1021,8 @@ pub(crate) fn bytecode_export_model(args: BytecodeExportModelArgs) -> Result<()>
     collect_settings_subtree_preorder(&children_by_parent, root_index, &mut subtree);
 
     let mut export_refs = BytecodeModelExportRefs {
-        by_index: HashMap::with_capacity(subtree.len()),
-        by_settings_id: HashMap::with_capacity(subtree.len()),
+        by_index: AHashMap::with_capacity(subtree.len()),
+        by_settings_id: AHashMap::with_capacity(subtree.len()),
         by_path_key: HashMap::with_capacity(subtree.len()),
         by_path_segments_key: HashMap::with_capacity(subtree.len()),
         ..Default::default()
@@ -1018,7 +1033,7 @@ pub(crate) fn bytecode_export_model(args: BytecodeExportModelArgs) -> Result<()>
         if let Some(instance) = document.instances.get(index) {
             export_refs
                 .by_settings_id
-                .insert(instance.settings_id.clone(), referent);
+                .insert(instance.settings_id.as_str(), referent);
         }
         if let Some(Some(path)) = instance_paths_by_index.get(index) {
             insert_unique_rbx_path(
@@ -1093,8 +1108,8 @@ pub(crate) fn encode_settings_model(document: &SettingsBytecode, binary: bool) -
     let service = document.instances[root_indices[0]].name.as_str();
     let paths = build_editor_instance_paths(document, service);
     let mut refs = BytecodeModelExportRefs {
-        by_index: HashMap::with_capacity(document.instances.len()),
-        by_settings_id: HashMap::with_capacity(document.instances.len()),
+        by_index: AHashMap::with_capacity(document.instances.len()),
+        by_settings_id: AHashMap::with_capacity(document.instances.len()),
         by_path_key: HashMap::with_capacity(document.instances.len()),
         by_path_segments_key: HashMap::with_capacity(document.instances.len()),
         ..Default::default()
@@ -1107,7 +1122,7 @@ pub(crate) fn encode_settings_model(document: &SettingsBytecode, binary: bool) -
         let referent = RbxRef::some(value);
         refs.by_index.insert(index, referent);
         refs.by_settings_id
-            .insert(instance.settings_id.clone(), referent);
+            .insert(instance.settings_id.as_str(), referent);
         if let Some(Some(path)) = paths.get(index) {
             insert_unique_rbx_path(
                 &mut refs.by_path_segments_key,
@@ -1146,6 +1161,45 @@ pub(crate) fn encode_settings_model(document: &SettingsBytecode, binary: bool) -
     Ok(output)
 }
 
+fn export_value_needs_path_refs(
+    value: &Value,
+    local_ids: &AHashMap<&str, RbxRef>,
+    global_ids: &AHashMap<&str, RbxRef>,
+) -> bool {
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .filter(|value| matches!(value, Value::Array(_) | Value::Object(_)))
+            .any(|value| export_value_needs_path_refs(value, local_ids, global_ids)),
+        Value::Object(object) => {
+            let typed = object.get("_type").and_then(Value::as_str) == Some("Ref");
+            let reference = if typed {
+                Some(object)
+            } else {
+                object.get("Ref").and_then(Value::as_object)
+            };
+            if let Some(reference) = reference {
+                let resolved_id = reference
+                    .get("settingsId")
+                    .or_else(|| reference.get("instanceId"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| local_ids.contains_key(id) || global_ids.contains_key(id));
+                if !resolved_id && reference.contains_key("pathSegments") {
+                    return true;
+                }
+                if typed {
+                    return false;
+                }
+            }
+            object
+                .values()
+                .filter(|value| matches!(value, Value::Array(_) | Value::Object(_)))
+                .any(|value| export_value_needs_path_refs(value, local_ids, global_ids))
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn build_rbx_place(
     src_root: &Path,
     services: Vec<String>,
@@ -1154,33 +1208,40 @@ pub(crate) fn build_rbx_place(
     capture_logical_properties: bool,
     merge_source_files: bool,
 ) -> Result<RbxPlaceBuild> {
+    let trace_context = crate::app::timing::trace_context();
     let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
     let phase_started = Instant::now();
     let export_inputs = services
         .into_par_iter()
         .map(|service| {
+            let _trace_context =
+                trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
             let service_dir = src_root.join(&service);
             let settings_file = service_settings_path(&service_dir);
             if !settings_file.exists() && !service_dir.is_dir() {
                 return Ok(None);
             }
-            let mut document = if let Some(document) = document_overrides
-                .and_then(|documents| documents.get(&service))
-                .map(|document| (*document).clone())
+            let mut document = if let Some(document) =
+                document_overrides.and_then(|documents| documents.get(&service))
             {
-                document
+                // Native push already owns the exact prepared document. Only
+                // source-structure merging needs a mutable copy of that tree.
+                Cow::Borrowed(*document)
             } else if !settings_file.exists() {
-                source_only_settings_document(&service_dir, &service)?
+                Cow::Owned(source_only_settings_document(&service_dir, &service)?)
             } else {
-                SettingsBytecode::read_file(&settings_file)
-                    .with_context(|| format!("Failed to read {}", settings_file.display()))?
+                Cow::Owned(
+                    SettingsBytecode::read_file(&settings_file)
+                        .with_context(|| format!("Failed to read {}", settings_file.display()))?,
+                )
             };
-            let (source_structure_changed, actual_source_paths) =
-                if merge_source_files && settings_file.exists() {
-                    merge_editor_source_files_into_document(&mut document, &service, &service_dir)?
-                } else {
-                    (false, HashMap::new())
-                };
+            let (source_structure_changed, actual_source_paths) = if merge_source_files
+                && settings_file.exists()
+            {
+                merge_editor_source_files_into_document(document.to_mut(), &service, &service_dir)?
+            } else {
+                (false, HashMap::new())
+            };
             let service_name = bytecode_service_name(&document, &settings_file, &service);
             let root_index = editor_service_root_index(&document, &service_name)
                 .or_else(|| settings_root_indices(&document).into_iter().next())
@@ -1199,18 +1260,13 @@ pub(crate) fn build_rbx_place(
                     source_paths[index] = Some(path.clone());
                 }
             }
-            let instance_paths = build_editor_instance_paths_with_children(
-                &document,
-                &service_name,
-                &children_by_parent,
-            );
             Ok(Some((
                 service_name,
                 settings_file,
                 service_dir,
                 document,
                 source_paths,
-                instance_paths,
+                children_by_parent,
                 root_index,
                 subtree,
                 source_structure_changed,
@@ -1230,61 +1286,86 @@ pub(crate) fn build_rbx_place(
     log_timing("native editor place input read", phase_started);
 
     let phase_started = Instant::now();
-    let mut unique_settings_id_counts = HashMap::<&str, usize>::new();
-    let mut global_path_refs = HashMap::<String, RbxRef>::new();
-    let mut global_path_segment_refs = HashMap::<String, Option<RbxRef>>::new();
-    let mut per_service_index_refs =
-        Vec::<HashMap<usize, RbxRef>>::with_capacity(export_inputs.len());
-    let mut per_service_settings_refs =
-        Vec::<HashMap<String, RbxRef>>::with_capacity(export_inputs.len());
-    let mut total_instances = 0usize;
-
-    for (_, _, _, document, _, _, _, subtree, _) in &export_inputs {
-        let mut by_index = HashMap::with_capacity(subtree.len());
-        let mut by_settings_id = HashMap::with_capacity(subtree.len());
-        total_instances += subtree.len();
-        for index in subtree.iter().copied() {
-            let referent = RbxRef::new();
-            by_index.insert(index, referent);
-            if let Some(instance) = document.instances.get(index) {
-                by_settings_id.insert(instance.settings_id.clone(), referent);
-                *unique_settings_id_counts
-                    .entry(instance.settings_id.as_str())
-                    .or_insert(0) += 1;
+    let total_instances = export_inputs
+        .iter()
+        .map(|(_, _, _, _, _, _, _, subtree, _)| subtree.len())
+        .sum();
+    // IDs borrow immutable prepared documents. The previous indexes cloned
+    // every ID twice and generated every referent on the calling thread.
+    let per_service_refs = export_inputs
+        .par_iter()
+        .map(|(_, _, _, document, _, _, _, subtree, _)| {
+            let referents = subtree
+                .par_iter()
+                .with_min_len(4096)
+                .map(|&index| (index, RbxRef::new()))
+                .collect::<Vec<_>>();
+            let mut by_index = AHashMap::with_capacity(subtree.len());
+            let mut by_settings_id = AHashMap::with_capacity(subtree.len());
+            for (index, referent) in referents {
+                by_index.insert(index, referent);
+                by_settings_id.insert(document.instances[index].settings_id.as_str(), referent);
             }
-        }
-        per_service_index_refs.push(by_index);
-        per_service_settings_refs.push(by_settings_id);
-    }
-
-    let mut global_unique_settings_refs = HashMap::<String, RbxRef>::new();
-    for (service_index, (_, _, _, document, _, instance_paths_by_index, _, subtree, _)) in
-        export_inputs.iter().enumerate()
+            (by_index, by_settings_id)
+        })
+        .collect::<Vec<_>>();
+    let mut global_settings_refs = AHashMap::with_capacity(total_instances);
+    for ((_, _, _, document, _, _, _, subtree, _), (by_index, _)) in
+        export_inputs.iter().zip(&per_service_refs)
     {
-        let by_index = &per_service_index_refs[service_index];
-        for index in subtree.iter().copied() {
-            let Some(referent) = by_index.get(&index).copied() else {
-                continue;
-            };
-            if let Some(instance) = document.instances.get(index)
-                && unique_settings_id_counts
-                    .get(instance.settings_id.as_str())
-                    .copied()
-                    .unwrap_or(0)
-                    == 1
-            {
-                global_unique_settings_refs.insert(instance.settings_id.clone(), referent);
-            }
-            if let Some(Some(path)) = instance_paths_by_index.get(index) {
-                insert_unique_rbx_path(
-                    &mut global_path_segment_refs,
-                    instance_path_key(&path.path_segments),
-                    referent,
-                );
-                global_path_refs.insert(
-                    instance_path_parts_key(&path.path_segments, &path.path_ordinals),
-                    referent,
-                );
+        for &index in subtree {
+            global_settings_refs
+                .entry(document.instances[index].settings_id.as_str())
+                .and_modify(|referent| *referent = None)
+                .or_insert(Some(by_index[&index]));
+        }
+    }
+    // Duplicates within one service also remain ambiguous globally.
+    let global_unique_settings_refs = global_settings_refs
+        .into_iter()
+        .filter_map(|(id, referent)| referent.map(|referent| (id, referent)))
+        .collect::<AHashMap<_, _>>();
+    // Stable IDs are the normal reference route. Build the more expensive full
+    // path indexes only when a value can actually fall through to that route.
+    // Unknown IDs still need paths before their instance-index fallback.
+    let needs_paths = export_inputs.par_iter().enumerate().any(
+        |(service_index, (_, _, _, document, _, _, _, subtree, _))| {
+            subtree.par_chunks(4096).any(|chunk| {
+                chunk.iter().any(|&index| {
+                    document.instances[index].properties.values().any(|value| {
+                        export_value_needs_path_refs(
+                            value,
+                            &per_service_refs[service_index].1,
+                            &global_unique_settings_refs,
+                        )
+                    })
+                })
+            })
+        },
+    );
+    let mut global_path_refs = HashMap::new();
+    let mut global_path_segment_refs = HashMap::new();
+    if needs_paths {
+        global_path_refs.reserve(total_instances);
+        global_path_segment_refs.reserve(total_instances);
+        for (service_index, (service, _, _, document, _, children, _, subtree, _)) in
+            export_inputs.iter().enumerate()
+        {
+            let paths = build_editor_instance_paths_with_children(document, service, children);
+            let by_index = &per_service_refs[service_index].0;
+            for &index in subtree {
+                let referent = by_index[&index];
+                if let Some(Some(path)) = paths.get(index) {
+                    insert_unique_rbx_path(
+                        &mut global_path_segment_refs,
+                        instance_path_key(&path.path_segments),
+                        referent,
+                    );
+                    global_path_refs.insert(
+                        instance_path_parts_key(&path.path_segments, &path.path_ordinals),
+                        referent,
+                    );
+                }
             }
         }
     }
@@ -1295,7 +1376,7 @@ pub(crate) fn build_rbx_place(
     log_timing("native editor place reference indexes", phase_started);
     struct ServiceBuild {
         root_ref: RbxRef,
-        instances: Vec<(Option<RbxRef>, RbxInstanceBuilder)>,
+        instances: Vec<(Option<RbxRef>, rbx_dom_weak::Instance)>,
         omitted_properties_by_class: HashMap<String, HashSet<String>>,
         logical_properties_by_ref: HashMap<RbxRef, HashMap<rbx_dom_weak::Ustr, RbxVariant>>,
         unresolved_reference_properties_by_ref: HashMap<RbxRef, HashSet<rbx_dom_weak::Ustr>>,
@@ -1303,16 +1384,14 @@ pub(crate) fn build_rbx_place(
     let phase_started = Instant::now();
     let built_services = export_inputs
         .par_iter()
-        .zip(
-            per_service_index_refs
-                .into_par_iter()
-                .zip(per_service_settings_refs.into_par_iter()),
-        )
+        .zip(per_service_refs.into_par_iter())
         .map(
             |(
-                (_, _, _, document, source_paths, _, root_index, subtree, _),
+                (_, _, _, document, source_paths, children, root_index, subtree, _),
                 (by_index, by_settings_id),
             )| {
+                let _trace_context = trace_context
+                    .map(|context| crate::app::timing::enter_trace_context(Some(context)));
                 let refs = BytecodeModelExportRefs {
                     by_index,
                     by_settings_id,
@@ -1321,93 +1400,109 @@ pub(crate) fn build_rbx_place(
                     global_by_path_segments_key: Some(Arc::clone(&global_path_segment_refs)),
                     ..Default::default()
                 };
-                let mut instances = Vec::with_capacity(subtree.len());
-                let mut omitted_properties_by_class = HashMap::new();
-                let mut logical_properties_by_ref = HashMap::new();
-                let mut unresolved_reference_properties_by_ref = HashMap::new();
-                let mut metadata = BytecodeExportMetadata::new();
-                let mut encoder = BytecodeRbxEncoder::new(document, database, &mut metadata, &refs);
-                for index in subtree.iter().copied() {
-                    let parent_ref = if index == *root_index {
-                        None
-                    } else {
-                        let parent_index =
-                            document.instances[index].parent_index.ok_or_else(|| {
-                                anyhow::anyhow!("Export subtree contains a detached child")
-                            })?;
-                        Some(*refs.by_index.get(&parent_index).ok_or_else(|| {
-                            anyhow::anyhow!("Export subtree is missing parent referent")
-                        })?)
-                    };
-                    let mut logical_properties = HashMap::new();
-                    let mut unresolved_reference_properties = HashSet::new();
-                    let builder = encoder.build(
-                        index,
-                        BytecodeRbxBuildOptions {
-                            source_path: source_paths.get(index).and_then(Option::as_deref),
-                            omitted_properties_by_class: allow_unrepresentable_properties
-                                .then_some(&mut omitted_properties_by_class),
-                            logical_omitted_properties: capture_logical_properties
-                                .then_some(&mut logical_properties),
-                            unresolved_reference_properties: capture_logical_properties
-                                .then_some(&mut unresolved_reference_properties),
-                        },
-                    )?;
-                    if !logical_properties.is_empty() {
-                        logical_properties_by_ref.insert(
-                            *refs
+                // One very large service must not serialize all conversion work
+                // onto one worker. Indexed chunks preserve the original order;
+                // each encoder owns its metadata and only reads shared refs.
+                subtree
+                    .par_chunks(4096)
+                    .map(|chunk| {
+                        let mut instances = Vec::with_capacity(chunk.len());
+                        let mut omitted_properties_by_class = HashMap::new();
+                        let mut logical_properties_by_ref = HashMap::new();
+                        let mut unresolved_reference_properties_by_ref = HashMap::new();
+                        let mut metadata = BytecodeExportMetadata::new();
+                        let mut encoder =
+                            BytecodeRbxEncoder::new(document, database, &mut metadata, &refs);
+                        for index in chunk.iter().copied() {
+                            let parent_ref = if index == *root_index {
+                                None
+                            } else {
+                                let parent_index =
+                                    document.instances[index].parent_index.ok_or_else(|| {
+                                        anyhow::anyhow!("Export subtree contains a detached child")
+                                    })?;
+                                Some(*refs.by_index.get(&parent_index).ok_or_else(|| {
+                                    anyhow::anyhow!("Export subtree is missing parent referent")
+                                })?)
+                            };
+                            let mut logical_properties = HashMap::new();
+                            let mut unresolved_reference_properties = HashSet::new();
+                            let builder = encoder.build(
+                                index,
+                                BytecodeRbxBuildOptions {
+                                    source_path: source_paths.get(index).and_then(Option::as_deref),
+                                    omitted_properties_by_class: allow_unrepresentable_properties
+                                        .then_some(&mut omitted_properties_by_class),
+                                    logical_omitted_properties: capture_logical_properties
+                                        .then_some(&mut logical_properties),
+                                    unresolved_reference_properties: capture_logical_properties
+                                        .then_some(&mut unresolved_reference_properties),
+                                },
+                            )?;
+                            if !logical_properties.is_empty() {
+                                logical_properties_by_ref.insert(
+                                    *refs
+                                        .by_index
+                                        .get(&index)
+                                        .context("Export instance referent is missing")?,
+                                    logical_properties,
+                                );
+                            }
+                            if !unresolved_reference_properties.is_empty() {
+                                unresolved_reference_properties_by_ref.insert(
+                                    *refs
+                                        .by_index
+                                        .get(&index)
+                                        .context("Export instance referent is missing")?,
+                                    unresolved_reference_properties,
+                                );
+                            }
+                            instances.push((parent_ref, builder.build_leaf(children[index].len())));
+                        }
+                        Ok(ServiceBuild {
+                            root_ref: *refs
                                 .by_index
-                                .get(&index)
-                                .context("Export instance referent is missing")?,
-                            logical_properties,
-                        );
-                    }
-                    if !unresolved_reference_properties.is_empty() {
-                        unresolved_reference_properties_by_ref.insert(
-                            *refs
-                                .by_index
-                                .get(&index)
-                                .context("Export instance referent is missing")?,
-                            unresolved_reference_properties,
-                        );
-                    }
-                    instances.push((parent_ref, builder));
-                }
-                Ok(ServiceBuild {
-                    root_ref: *refs
-                        .by_index
-                        .get(root_index)
-                        .ok_or_else(|| anyhow::anyhow!("Export root referent missing"))?,
-                    instances,
-                    omitted_properties_by_class,
-                    logical_properties_by_ref,
-                    unresolved_reference_properties_by_ref,
-                })
+                                .get(root_index)
+                                .ok_or_else(|| anyhow::anyhow!("Export root referent missing"))?,
+                            instances,
+                            omitted_properties_by_class,
+                            logical_properties_by_ref,
+                            unresolved_reference_properties_by_ref,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()
             },
         )
         .collect::<Result<Vec<_>>>()?;
     log_timing("native editor place service conversion", phase_started);
     let phase_started = Instant::now();
     let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+    dom.reserve(total_instances);
     let mut omitted_properties_by_class = HashMap::new();
     let mut logical_properties_by_ref = HashMap::new();
     let mut unresolved_reference_properties_by_ref = HashMap::new();
     let mut top_level_refs = Vec::with_capacity(export_inputs.len());
-    for service in built_services {
-        for (class_name, names) in service.omitted_properties_by_class {
-            omitted_properties_by_class
-                .entry(class_name)
-                .or_insert_with(HashSet::new)
-                .extend(names);
+    for service_chunks in built_services {
+        let root_ref = service_chunks
+            .first()
+            .context("Export service has no root")?
+            .root_ref;
+        for service in service_chunks {
+            for (class_name, names) in service.omitted_properties_by_class {
+                omitted_properties_by_class
+                    .entry(class_name)
+                    .or_insert_with(HashSet::new)
+                    .extend(names);
+            }
+            logical_properties_by_ref.extend(service.logical_properties_by_ref);
+            unresolved_reference_properties_by_ref
+                .extend(service.unresolved_reference_properties_by_ref);
+            for (parent_ref, builder) in service.instances {
+                let parent_ref = parent_ref.unwrap_or_else(|| dom.root_ref());
+                dom.insert_leaf(parent_ref, builder);
+            }
         }
-        logical_properties_by_ref.extend(service.logical_properties_by_ref);
-        unresolved_reference_properties_by_ref
-            .extend(service.unresolved_reference_properties_by_ref);
-        for (parent_ref, builder) in service.instances {
-            let parent_ref = parent_ref.unwrap_or_else(|| dom.root_ref());
-            dom.insert(parent_ref, builder);
-        }
-        top_level_refs.push(service.root_ref);
+        top_level_refs.push(root_ref);
     }
 
     let service_roots = export_inputs
@@ -1796,7 +1891,11 @@ fn bytecode_repack_settings_files(args: &BytecodeRepackArgs) -> Result<Vec<PathB
     let mut settings_files = Vec::new();
     if args.paths.is_empty() {
         let src_root = absolutize_under(&project_root, &args.project.src_root);
-        for entry in WalkDir::new(&src_root) {
+        for entry in std::iter::once(src_root.clone())
+            .chain(crate::project::storage::instances_root(&src_root))
+            .filter(|root| root.is_dir())
+            .flat_map(|root| WalkDir::new(root).into_iter())
+        {
             let entry = entry?;
             if entry.file_type().is_file()
                 && entry

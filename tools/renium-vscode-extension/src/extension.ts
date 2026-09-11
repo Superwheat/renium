@@ -2425,7 +2425,7 @@ class RobloxSyncController {
     await this.enqueue(direction === "editor" ? "Push to Studio" : "Pull from Studio", async () => {
       if (direction === "editor") {
         const cfg = this.getConfig();
-        const changedPaths = await this.collectInitialEditorLiveSyncPathsAsync(this.sourceRoot(cfg));
+        const changedPaths = await this.collectInitialEditorLiveSyncPathsAsync(cfg);
         if (changedPaths.length === 0) {
           throw new Error(`No project source files exist under ${this.sourceRoot(cfg)}`);
         }
@@ -3460,14 +3460,18 @@ class RobloxSyncController {
     }
   }
 
-  private async collectInitialEditorLiveSyncPathsAsync(srcRoot: string): Promise<string[]> {
+  private async collectInitialEditorLiveSyncPathsAsync(cfg: SyncConfig): Promise<string[]> {
     const settingsPathsByDirectory = new Map<string, string>();
     const otherPaths: string[] = [];
-    for (const filePath of await collectFilesRecursively(srcRoot)) {
+    const graph = loadProjectSourceGraph(cfg.projectRoot);
+    const files = new Set(graph.files);
+    for (const root of graph.directories) {
+      for (const filePath of await collectFilesRecursively(root)) files.add(filePath);
+    }
+    for (const filePath of files) {
       const fileName = path.basename(filePath);
       if (isReniumSettingsFileName(fileName)) {
-        const directory = path.resolve(path.dirname(filePath));
-        settingsPathsByDirectory.set(directory, filePath);
+        settingsPathsByDirectory.set(filesystemPathKey(filePath), filePath);
       } else {
         otherPaths.push(filePath);
       }
@@ -4605,7 +4609,8 @@ class RobloxSyncController {
         continue;
       }
       const relative = path.relative(owner.location, filePath);
-      const first = relative.split(path.sep)[0];
+      const component = relative.split(path.sep)[0];
+      const first = owner.storeFiles ? component.replace(/\.renium$/i, "") : component;
       const service = first && first !== "." ? byLower.get(first.toLowerCase()) : undefined;
       if (service) {
         services.add(service);

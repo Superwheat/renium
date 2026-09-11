@@ -32,6 +32,16 @@ pub(crate) fn send_request(request: &super::Request) -> Result<super::Response> 
 }
 
 pub(crate) fn try_send_request(request: &super::Request) -> Result<Option<super::Response>> {
+    let _trace_context = crate::app::output::global_log_enabled(5).then(|| {
+        crate::app::timing::enter_trace_context(Some(crate::app::timing::TraceContext {
+            request_id: request.id,
+            context_id: request.cx,
+        }))
+    });
+    let _trace = crate::app::timing::trace_scope(
+        "daemon.rpc",
+        super::opcode_by_id(request.op).map_or("unknown operation", |operation| operation.name),
+    );
     let Some(stream) = connect_daemon() else {
         return Ok(None);
     };
@@ -39,6 +49,8 @@ pub(crate) fn try_send_request(request: &super::Request) -> Result<Option<super:
 }
 
 fn connect_daemon() -> Option<TcpStream> {
+    let _trace =
+        crate::app::timing::trace_scope("daemon.connect", "endpoint discovery and connect");
     daemon_control_endpoints().into_iter().find_map(|address| {
         TcpStream::connect_timeout(&address, DAEMON_CONTROL_CONNECT_TIMEOUT).ok()
     })
@@ -46,6 +58,11 @@ fn connect_daemon() -> Option<TcpStream> {
 
 fn send_on_stream(stream: &TcpStream, request: &super::Request) -> Result<super::Response> {
     let timeout = match request.op {
+        op::PERFORMANCE_MONITOR
+            if matches!(request.p["action"].as_str(), Some("micro" | "micro-stop")) =>
+        {
+            Duration::from_secs(30)
+        }
         op::CAP
         | op::BIND
         | op::STUDIOS
@@ -82,13 +99,15 @@ fn send_on_stream_with_timeout(
     timeout: Duration,
 ) -> Result<super::Response> {
     let deadline = Instant::now() + timeout;
+    let encode = crate::app::timing::trace_scope("daemon.encode", "encode and authorize request");
+    let encoded = super::authorization::encode_request(request, stream.peer_addr()?.port())?;
+    drop(encode);
+    let send = crate::app::timing::trace_scope("daemon.send", "write request");
     stream.set_write_timeout(Some(timeout.min(DAEMON_CONTROL_IDLE_TIMEOUT)))?;
-    writeln!(
-        stream,
-        "{}",
-        super::authorization::encode_request(request, stream.peer_addr()?.port())?
-    )?;
+    writeln!(stream, "{}", encoded)?;
     stream.flush()?;
+    drop(send);
+    let wait = crate::app::timing::trace_scope("daemon.wait", "read response");
     let mut reader = BufReader::new(DeadlineReader { stream, deadline });
     let mut line = String::new();
     match read_bounded_line(&mut reader, &mut line, MAX_DAEMON_LINE_BYTES).with_context(|| {
@@ -102,6 +121,8 @@ fn send_on_stream_with_timeout(
         BoundedLineRead::Eof => bail!("Renium daemon closed the connection before responding"),
         BoundedLineRead::TooLong => bail!("Renium daemon response exceeded the protocol limit"),
     }
+    drop(wait);
+    let _decode = crate::app::timing::trace_scope("daemon.decode", "decode response");
     let response = serde_json::from_str(line.trim()).context("Invalid Renium daemon response")?;
     print_update_notice(&response);
     Ok(response)

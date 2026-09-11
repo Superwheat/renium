@@ -8,6 +8,129 @@ use rbx_dom_weak::{
 
 use crate::{text_deserializer::DecodedModel, to_writer, Deserializer, Serializer};
 
+#[test]
+fn native_bindings_preserve_only_the_selected_identity() {
+    use crate::{
+        text_deserializer::{DecodedChunk, DecodedValues},
+        InstanceBindingMode as Mode,
+    };
+    use std::collections::HashMap;
+    let mut tree = WeakDom::new(InstanceBuilder::new("DataModel"));
+    let workspace = tree.insert(tree.root_ref(), InstanceBuilder::new("Workspace"));
+    let camera = tree.insert(
+        workspace,
+        InstanceBuilder::new("Camera")
+            .with_name("Camera")
+            .with_property("FieldOfView", 42.0f32),
+    );
+    let child = tree.insert(
+        camera,
+        InstanceBuilder::new("Folder").with_name("CameraChild"),
+    );
+    let other = tree.insert(
+        workspace,
+        InstanceBuilder::new("Camera")
+            .with_name("Camera")
+            .with_property("FieldOfView", 81.0f32),
+    );
+    tree.insert(
+        workspace,
+        InstanceBuilder::new("ObjectValue").with_property("Value", camera),
+    );
+    let refs = &[workspace];
+    let mut normal = Vec::new();
+    Serializer::new()
+        .serialize(&mut normal, &tree, refs)
+        .unwrap();
+    let mut replace = Vec::new();
+    Serializer::new()
+        .serialize_with_bindings(
+            &mut replace,
+            &tree,
+            refs,
+            &HashMap::from([(camera, Mode::Replace), (other, Mode::Replace)]),
+        )
+        .unwrap();
+    assert_eq!(
+        normal, replace,
+        "Identity binding must not alter ordinary bytes"
+    );
+
+    let mut payload = Vec::new();
+    let bindings = Serializer::new()
+        .serialize_with_bindings(
+            &mut payload,
+            &tree,
+            refs,
+            &HashMap::from([
+                (camera, Mode::ReferenceOnly),
+                (other, Mode::Replace),
+                (child, Mode::Replace),
+            ]),
+        )
+        .unwrap();
+    let find = |id| {
+        bindings
+            .iter()
+            .find(|binding| binding.referent == id)
+            .unwrap()
+    };
+    assert_eq!((find(camera).ordinal, find(other).ordinal), (1, 0));
+    assert_eq!(find(camera).class_count, 2);
+    let camera_id = find(camera).binary_referent;
+    let child_id = find(child).binary_referent;
+    let decoded = DecodedModel::from_reader(payload.as_slice());
+    assert_eq!(decoded.num_instances, 5);
+    let camera_type = decoded
+        .chunks
+        .iter()
+        .find_map(|chunk| match chunk {
+            DecodedChunk::Inst {
+                type_id, referents, ..
+            } if referents.contains(&camera_id) => Some(*type_id),
+            _ => None,
+        })
+        .unwrap();
+    assert!(!decoded.chunks.iter().any(|chunk| matches!(chunk,
+        DecodedChunk::Prop { type_id, .. } if *type_id == camera_type)));
+    assert!(decoded.chunks.iter().any(|chunk| matches!(chunk,
+        DecodedChunk::Prop { prop_name, values: Some(DecodedValues::Float32(values)), .. }
+            if prop_name == "FieldOfView" && values == &[81.0])));
+    assert!(decoded.chunks.iter().any(|chunk| matches!(chunk,
+        DecodedChunk::Prop { prop_name, values: Some(DecodedValues::Ref(values)), .. }
+            if prop_name == "Value" && values == &[camera_id])));
+    let links = decoded
+        .chunks
+        .iter()
+        .find_map(|chunk| match chunk {
+            DecodedChunk::Prnt { links, .. } => Some(links),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(links.len(), 4);
+    assert!(!links.iter().any(|(id, _)| *id == camera_id));
+    assert!(links.contains(&(child_id, camera_id)));
+
+    let mut after = Vec::new();
+    Serializer::new()
+        .serialize(&mut after, &tree, refs)
+        .unwrap();
+    assert_eq!(normal, after, "Insertion must not mutate the source DOM");
+    let mut invalid = Vec::new();
+    assert!(Serializer::new()
+        .serialize_with_bindings(
+            &mut invalid,
+            &tree,
+            refs,
+            &HashMap::from([(Ref::new(), Mode::Replace)])
+        )
+        .is_err());
+    assert!(
+        invalid.is_empty(),
+        "Invalid bindings must fail before writing output"
+    );
+}
+
 /// A basic test to make sure we can serialize the simplest instance: a Folder.
 #[test]
 fn just_folder() {

@@ -34,7 +34,7 @@ use crate::cli::{
     TreeArgs,
 };
 use crate::daemon::is_process_alive;
-use crate::editor::document::is_protected_starter_player_container;
+use crate::editor::document::is_protected_engine_container;
 use crate::editor::paths::{
     build_editor_instance_path_parts, build_editor_instance_paths,
     build_editor_instance_paths_for_indices, build_editor_source_paths_by_index,
@@ -139,6 +139,10 @@ fn parse_cli_value(
         bail!("Provide exactly one value: --value-json/--json, --str, --num, --bool, or --null");
     }
     if let Some(value_json) = value_json {
+        if value_json == "-" {
+            return serde_json::from_reader(io::stdin().lock())
+                .context("Invalid --value-json on stdin");
+        }
         return serde_json::from_str(value_json)
             .with_context(|| format!("Invalid --value-json: {value_json}"));
     }
@@ -649,13 +653,19 @@ pub(super) fn resolve_bytecode_settings_file(
         if service_or_file.is_some() {
             bail!("Provide either SERVICE_OR_FILE or --file, not both");
         }
-        return Ok((settings_file.to_path_buf(), explicit_service));
+        return Ok((
+            crate::project::storage::resolve_explicit_file(settings_file)?,
+            explicit_service,
+        ));
     }
 
     if let Some(service_or_file) = service_or_file {
         if bytecode_input_looks_like_settings_file(service_or_file) {
             return Ok((
-                absolutize_under(project_root, Path::new(service_or_file)),
+                crate::project::storage::resolve_explicit_file(&absolutize_under(
+                    project_root,
+                    Path::new(service_or_file),
+                ))?,
                 explicit_service,
             ));
         }
@@ -1264,7 +1274,8 @@ pub(super) fn bytecode_get_property(args: BytecodeGetPropertyArgs) -> Result<()>
         let source_paths = if let Some(source_paths) = source_paths.as_ref() {
             source_paths
         } else {
-            let service_dir = settings_file.parent().unwrap_or_else(|| Path::new("."));
+            let service_directory = crate::project::storage::source_directory(&settings_file);
+            let service_dir = service_directory.as_path();
             direct_source_paths =
                 build_editor_source_paths_by_index(&document, &service, service_dir);
             &direct_source_paths
@@ -1360,15 +1371,12 @@ pub(super) fn bytecode_set_property(args: BytecodeSetPropertyArgs) -> Result<()>
     let qualify_references = !unqualified_settings_ids.is_empty();
     let mut settings_files_to_lock = BTreeSet::from([settings_file.clone()]);
     if (structural_reference_update || qualify_references)
-        && let Some(src_root) = settings_file.parent().and_then(Path::parent)
+        && let Some(src_root) = crate::project::storage::source_directory(&settings_file).parent()
     {
-        for entry in fs::read_dir(src_root)? {
-            let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                let path = service_settings_path(&entry.path());
-                if path.is_file() {
-                    settings_files_to_lock.insert(path);
-                }
+        for service_dir in crate::project::storage::service_directories(src_root)? {
+            let path = service_settings_path(&service_dir);
+            if path.is_file() {
+                settings_files_to_lock.insert(path);
             }
         }
     }
@@ -1381,11 +1389,8 @@ pub(super) fn bytecode_set_property(args: BytecodeSetPropertyArgs) -> Result<()>
     if qualify_references {
         let mut documents = BTreeMap::new();
         for path in &settings_files_to_lock {
-            let service_name = path
-                .parent()
-                .and_then(Path::file_name)
-                .map(|name| name.to_string_lossy().into_owned())
-                .context("Service settings path has no service directory")?;
+            let service_name = crate::project::storage::store_service_name(path)
+                .context("Service settings path has no service name")?;
             let candidate = if *path == settings_file {
                 document.clone()
             } else {
@@ -1438,11 +1443,12 @@ pub(super) fn bytecode_set_property(args: BytecodeSetPropertyArgs) -> Result<()>
     });
     if matches!(scope, PropertyScope::Auto | PropertyScope::Metadata)
         && matches!(args.property.as_str(), "ClassName" | "Parent")
-        && is_protected_starter_player_container(&document, index)
+        && is_protected_engine_container(&document, index)
     {
         bail!("{} metadata is read-only", document.instances[index].name);
     }
-    let service_dir = settings_file.parent().unwrap_or_else(|| Path::new("."));
+    let service_directory = crate::project::storage::source_directory(&settings_file);
+    let service_dir = service_directory.as_path();
     if args.property.eq_ignore_ascii_case("source")
         && matches!(scope, PropertyScope::Auto | PropertyScope::Property)
     {
@@ -1490,11 +1496,8 @@ pub(super) fn bytecode_set_property(args: BytecodeSetPropertyArgs) -> Result<()>
         let mut reference_documents = BTreeMap::new();
         let mut reference_files = BTreeMap::new();
         for path in &settings_files_to_lock {
-            let service_name = path
-                .parent()
-                .and_then(Path::file_name)
-                .map(|name| name.to_string_lossy().into_owned())
-                .context("Service settings path has no service directory")?;
+            let service_name = crate::project::storage::store_service_name(path)
+                .context("Service settings path has no service name")?;
             let value = if *path == settings_file {
                 document.clone()
             } else {
@@ -1691,7 +1694,7 @@ fn resolve_property_batch_entries(
         }
         if matches!(scope, PropertyScope::Auto | PropertyScope::Metadata)
             && matches!(entry.property.as_str(), "ClassName" | "Parent")
-            && is_protected_starter_player_container(&state.document, instance_index)
+            && is_protected_engine_container(&state.document, instance_index)
         {
             bail!("{} metadata is read-only", instance.name);
         }
@@ -1971,10 +1974,8 @@ fn apply_property_batch_entries(
         if property_affects_source_path(entry.scope, &entry.property)
             && state.source_paths_before.is_none()
         {
-            let service_dir = state
-                .settings_file
-                .parent()
-                .context("Settings file has no parent directory")?;
+            let service_directory = crate::project::storage::source_directory(&state.settings_file);
+            let service_dir = service_directory.as_path();
             state.source_paths_before = Some(build_editor_source_paths_by_index(
                 &state.document,
                 &entry.service,
@@ -2064,10 +2065,8 @@ fn property_batch_file_mutations(
             .filter(|entry| entry.service == *service && entry.property == "Source")
             .collect::<Vec<_>>();
         if state.source_paths_before.is_some() || !source_entries.is_empty() {
-            let service_dir = state
-                .settings_file
-                .parent()
-                .context("Settings file has no parent directory")?;
+            let service_directory = crate::project::storage::source_directory(&state.settings_file);
+            let service_dir = service_directory.as_path();
             let mut source_paths_after =
                 build_editor_source_paths_by_index(&state.document, service, service_dir);
             if let Some(source_paths_before) = state.source_paths_before.as_ref() {
@@ -2118,10 +2117,9 @@ fn apply_property_batch_to_root(
     });
     let mut loaded_services = services.clone();
     if structural_reference_update {
-        for entry in fs::read_dir(root)? {
-            let entry = entry?;
-            if entry.file_type()?.is_dir() && service_settings_path(&entry.path()).is_file() {
-                loaded_services.insert(entry.file_name().to_string_lossy().into_owned());
+        for service in crate::project::storage::service_directories(root)? {
+            if service_settings_path(&service).is_file() {
+                loaded_services.insert(service.file_name().unwrap().to_string_lossy().into_owned());
             }
         }
     }
@@ -2317,10 +2315,8 @@ fn write_bytecode_source_file(
     if script_file_names(&instance.class_name).is_none() {
         bail!("{} is not a Lua source container", instance.class_name);
     }
-    let service_dir = settings_file
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Settings file has no parent directory"))?;
-    let source_path = build_editor_source_paths_by_index(document, service, service_dir)
+    let service_dir = crate::project::storage::source_directory(settings_file);
+    let source_path = build_editor_source_paths_by_index(document, service, &service_dir)
         .get(index)
         .and_then(Clone::clone)
         .ok_or_else(|| {
@@ -2715,11 +2711,8 @@ impl Drop for SettingsFileLock {
 }
 
 pub(super) fn missing_service_store_error(settings_file: &Path) -> anyhow::Error {
-    let service = settings_file
-        .parent()
-        .and_then(Path::file_name)
-        .map(|name| name.to_string_lossy().into_owned())
-        .filter(|name| !name.is_empty());
+    let service =
+        crate::project::storage::store_service_name(settings_file).filter(|name| !name.is_empty());
     match service {
         Some(service) => anyhow::anyhow!(
             "No synced Renium store for service '{service}' at {}.\n       \

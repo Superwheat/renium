@@ -446,10 +446,11 @@ pub(crate) fn settings_doc_to_json_tree(document: &SettingsBytecode, file: &Path
         .iter()
         .map(|instance| Some(instance.settings_id.clone()))
         .collect::<Vec<_>>();
-    let source_paths = match file.parent() {
-        Some(dir) => build_editor_source_paths_by_index(document, &service, dir),
-        None => vec![None; document.instances.len()],
-    };
+    let source_paths = build_editor_source_paths_by_index(
+        document,
+        &service,
+        &super::storage::source_directory(file),
+    );
     let tree = ViewTree {
         document,
         children_by_parent: &children_by_parent,
@@ -515,7 +516,7 @@ pub(crate) fn view_command(args: ViewArgs) -> Result<()> {
 }
 
 pub(crate) struct VcMergeConflict {
-    path: String,
+    pub(crate) path: String,
     pub(crate) detail: String,
 }
 

@@ -40,6 +40,27 @@ pub struct InstanceBuilder {
 }
 
 impl InstanceBuilder {
+    /// Prepare a childless instance before inserting it into a DOM. Property
+    /// storage can then be allocated on a worker; `child_capacity` reserves room
+    /// for children that will be inserted later, in their original order.
+    ///
+    /// # Panics
+    /// Panics if the builder contains child builders.
+    pub fn build_leaf(self, child_capacity: usize) -> Instance {
+        assert!(
+            self.children.is_empty(),
+            "build_leaf cannot discard child builders"
+        );
+        Instance {
+            referent: self.referent,
+            parent: Ref::none(),
+            children: Vec::with_capacity(child_capacity),
+            class: self.class,
+            name: self.name,
+            properties: self.properties.into_iter().collect(),
+        }
+    }
+
     /// Create a new `InstanceBuilder` with the given ClassName. This is also
     /// used as the instance's Name, unless overwritten later.
     pub fn new<S: Into<Ustr>>(class: S) -> Self {

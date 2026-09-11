@@ -4,6 +4,14 @@ local SESSION_TTL_SECONDS = 120
 local MAX_SESSIONS = 4
 local MAX_CHUNKS = 4096
 local MAX_ROWS = 1000000
+BridgeTransactionUpload.MAX_ROWS = MAX_ROWS
+local ROW_FIELDS = {
+	source = "sourceChanges",
+	property = "propertyChanges",
+	postCommitProperty = "postCommitPropertyChanges",
+	mutationRoot = "mutationRoots",
+	mutationPackageTarget = "mutationPackageTargets",
+}
 
 local function denseArrayLength(value: any): number?
 	if type(value) ~= "table" then
@@ -138,7 +146,7 @@ function BridgeTransactionUpload.create(beginTransaction, transactionBegan, exac
 				if
 					type(row) ~= "table"
 					or type(row.change) ~= "table"
-					or (row.kind ~= "source" and row.kind ~= "property" and row.kind ~= "postCommitProperty")
+					or ROW_FIELDS[row.kind] == nil
 				then
 					error("Invalid editor transaction upload row")
 				end
@@ -170,9 +178,9 @@ function BridgeTransactionUpload.create(beginTransaction, transactionBegan, exac
 			destructiveServices = session.destructiveServices,
 			nativeImport = session.nativeImport,
 			nativeImportServices = session.nativeImportServices,
-			mutationRoots = session.mutationRoots,
+			mutationRoots = session.mutationRoots or {},
 			packageRoots = session.packageRoots,
-			mutationPackageTargets = session.mutationPackageTargets,
+			mutationPackageTargets = session.mutationPackageTargets or {},
 			expectedRuntimeId = session.expectedRuntimeId,
 			expectedStudioGenerations = session.expectedStudioGenerations,
 			sourceChanges = {},
@@ -181,13 +189,8 @@ function BridgeTransactionUpload.create(beginTransaction, transactionBegan, exac
 		}
 		for index = 1, session.totalChunks do
 			for _, row in ipairs(session.chunks[index]) do
-				if row.kind == "source" then
-					transaction.sourceChanges[#transaction.sourceChanges + 1] = row.change
-				elseif row.kind == "property" then
-					transaction.propertyChanges[#transaction.propertyChanges + 1] = row.change
-				else
-					transaction.postCommitPropertyChanges[#transaction.postCommitPropertyChanges + 1] = row.change
-				end
+				local changes = transaction[ROW_FIELDS[row.kind]]
+				changes[#changes + 1] = row.change
 			end
 		end
 		local result = beginTransaction(transaction)

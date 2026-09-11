@@ -3,6 +3,47 @@
 use super::*;
 use std::collections::HashSet;
 use std::io::{Seek, SeekFrom};
+use std::sync::Arc;
+
+#[path = "macos_history.rs"]
+mod history;
+
+#[path = "macos_terrain.rs"]
+mod terrain;
+pub(crate) use terrain::prepare_terrain;
+#[path = "macos_terrain_observation.rs"]
+mod terrain_observation;
+pub(crate) use terrain_observation::observe_terrain;
+
+pub(crate) fn register_history(pid: u32, title: &str, token: &str) -> Result<()> {
+    anyhow::ensure!(
+        !token.is_empty() && token.len() <= 256,
+        "Invalid Studio recording token"
+    );
+    let mut prepared = prepare_property(
+        pid,
+        title,
+        &["ChangeHistoryService".into()],
+        &[],
+        "Name",
+        Duration::from_secs(3),
+    )?;
+    let mut binding = prepared.invoke(6)?[16..].to_vec();
+    if binding.iter().all(|byte| *byte == 0) {
+        binding = history::binding(&prepared)?;
+    }
+    binding.extend_from_slice(token.as_bytes());
+    put32(&mut prepared.parameters, 136, binding.len() as u32);
+    prepared.parameters[680..680 + binding.len()].copy_from_slice(&binding);
+    prepared.invoke(6)?;
+    Ok(())
+}
+
+#[cfg(target_arch = "aarch64")]
+#[path = "macos_identity.rs"]
+mod identity;
+#[cfg(target_arch = "aarch64")]
+pub(crate) use identity::capture_identities;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Argument {
@@ -12,7 +53,8 @@ enum Argument {
     Output,
     Input,
     Parsed,
-    Scratch,
+    Scratch(i64),
+    TextBytes(i64, usize),
     Binding(usize),
     Vtable(usize),
     Function(usize, usize),
@@ -50,22 +92,130 @@ fn indirect_binding(
     };
     (registers[0] == Some(Binding(field))
         && registers[1] == Some(Instance)
-        && (kind != CallKind::Setter || registers[2] == Some(Scratch)))
+        && (kind != CallKind::Setter || matches!(registers[2], Some(Scratch(_)))))
     .then_some((field, slot))
 }
 
 fn parses_input(registers: &[Option<Argument>; 32]) -> bool {
     use Argument::*;
-    registers[..2] == [Some(Input), Some(Scratch)]
-        || registers[..3] == [Some(DescriptorField), Some(Input), Some(Scratch)]
+    registers[0] == Some(Input) && matches!(registers[1], Some(Scratch(_)))
+        || registers[..2] == [Some(DescriptorField), Some(Input)]
+            && matches!(registers[2], Some(Scratch(_)))
+}
+
+fn copy_returned_text(
+    bytes: &mut [Option<i64>; 24],
+    offset: usize,
+    source: Option<Argument>,
+    temporary: Option<i64>,
+) -> bool {
+    let Some(Argument::TextBytes(source, length)) = source else {
+        return false;
+    };
+    let Some(output) = bytes.get_mut(offset..offset + length) else {
+        return false;
+    };
+    for (index, byte) in output.iter_mut().enumerate() {
+        *byte = Some(source + index as i64);
+    }
+    bytes[0].is_some_and(|first| {
+        // A returned string or the payload after ContentId's eight-byte header.
+        temporary.is_some_and(|start| first == start || first == start + 8)
+            && bytes
+                .iter()
+                .enumerate()
+                .all(|(index, byte)| *byte == Some(first + index as i64))
+    })
+}
+
+fn adjusted_argument(base: Option<Argument>, word: u32) -> Option<Argument> {
+    let offset = (((word >> 10) & 4095) as i64) << if word & (1 << 22) != 0 { 12 } else { 0 };
+    match base {
+        Some(Argument::Scratch(address)) => {
+            Some(Argument::Scratch(if word & 0xff000000 == 0xd1000000 {
+                address - offset
+            } else {
+                address + offset
+            }))
+        }
+        Some(Argument::Instance) => Some(Argument::Instance),
+        _ => None,
+    }
 }
 
 // ARM64 instructions are fixed-width. Track arguments through register moves
 // and field loads; relocated fields, vtable slots and scratch registers are not
 // signatures. A call also needs its expected result/argument use to validate.
+fn data_instruction(
+    word: u32,
+    offsets: &[usize],
+    registers: &mut [Option<Argument>; 32],
+    vectors: &mut [Option<Argument>; 32],
+    copied_text: &mut [Option<i64>; 24],
+    temporary_result: Option<i64>,
+) -> Option<bool> {
+    use Argument::*;
+    let dst = (word & 31) as usize;
+    let base = ((word >> 5) & 31) as usize;
+    let mut copied = false;
+    if word & 0xffe0ffe0 == 0xaa0003e0 {
+        // mov Xd, Xn
+        registers[dst] = registers[((word >> 16) & 31) as usize];
+    } else if word & 0xffc00000 == 0xf9400000 {
+        // ldr Xd, [Xn,#unsigned]
+        let offset = ((word >> 10) & 4095) as usize * 8;
+        registers[dst] = returned_text_bytes(registers[base], offset as i64, 8, temporary_result)
+            .or_else(|| loaded_argument(registers[base], offset, offsets));
+    } else if word & 0xffe00c00 == 0xf8400000 {
+        // ldur Xd,[Xn,#signed]
+        let offset = ((word << 11) as i32 >> 23) as i64;
+        registers[dst] = returned_text_bytes(registers[base], offset, 8, temporary_result);
+    } else if word & 0xffe00c00 == 0x3cc00000 {
+        // ldur Qd,[Xn,#signed]: libc++ can inline its short-string copy.
+        let offset = ((word << 11) as i32 >> 23) as i64;
+        vectors[dst] = returned_text_bytes(registers[base], offset, 16, temporary_result);
+    } else if word & 0xffc00000 == 0x3dc00000 {
+        vectors[dst] = returned_text_bytes(
+            registers[base],
+            ((word >> 10) & 4095) as i64 * 16,
+            16,
+            temporary_result,
+        );
+    } else if word & 0xffc00000 == 0xf9000000 || word & 0xffc00000 == 0x3d800000 {
+        let vector = word & 0xffc00000 == 0x3d800000;
+        let offset = ((word >> 10) & 4095) as usize * if vector { 16 } else { 8 };
+        if registers[base] == Some(Output) {
+            copied |= copy_returned_text(
+                copied_text,
+                offset,
+                if vector { vectors[dst] } else { registers[dst] },
+                temporary_result,
+            );
+        }
+    } else if word & 0xffc00000 == 0xb9000000 {
+        // str Wt,[Xn,#unsigned] writes memory, not Wt or SP. Vector parsers
+        // initialize their stack result with STR WZR before receiving input.
+    } else if word & 0xffe00c00 == 0x9a800000 {
+        // csel: the short/long string arms must both denote input text.
+        let other = ((word >> 16) & 31) as usize;
+        registers[dst] = if registers[base] == registers[other] {
+            registers[base]
+        } else {
+            None
+        };
+    } else if matches!(word & 0xff000000, 0x91000000 | 0xd1000000) {
+        // add immediate (including SP)
+        registers[dst] = adjusted_argument(registers[base], word);
+    } else {
+        return None;
+    }
+    Some(copied)
+}
+
 fn binding_call(code: &[u8], offsets: &[usize], kind: CallKind) -> Option<(usize, usize)> {
     use Argument::*;
     let mut registers = [None; 32];
+    registers[31] = Some(Scratch(0));
     registers[0] = Some(Descriptor);
     registers[1] = Some(Instance);
     if kind == CallKind::Text {
@@ -75,39 +225,32 @@ fn binding_call(code: &[u8], offsets: &[usize], kind: CallKind) -> Option<(usize
     }
     let mut found = None;
     let mut result_verified = false;
+    let mut temporary_result = None;
+    let mut vectors = [None; 32];
+    let mut copied_text = [None; 24];
     for bytes in code.as_chunks::<4>().0 {
         let word = read_u32(bytes, 0)?;
         let dst = (word & 31) as usize;
         let base = ((word >> 5) & 31) as usize;
+        if word & 0x3f00001f == 0x3100001f {
+            // ADDS/SUBS immediate with Rd=31 (CMN/CMP) update flags only.
+            // This encoding denotes the zero register, not the stack pointer.
+            continue;
+        }
         if word == 0xd65f03c0 {
             // ret
             return (result_verified || kind == CallKind::Setter && registers[0] == Some(Parsed))
                 .then_some(found)
                 .flatten();
-        } else if word & 0xffe0ffe0 == 0xaa0003e0 {
-            // mov Xd, Xn
-            registers[dst] = registers[((word >> 16) & 31) as usize];
-        } else if word & 0xffc00000 == 0xf9400000 {
-            // ldr Xd, [Xn,#unsigned]
-            let offset = ((word >> 10) & 4095) as usize * 8;
-            registers[dst] = loaded_argument(registers[base], offset, offsets);
-        } else if word & 0xffe00c00 == 0x9a800000 {
-            // csel: the short/long string arms must both denote input text.
-            let other = ((word >> 16) & 31) as usize;
-            registers[dst] = if registers[base] == registers[other] {
-                registers[base]
-            } else {
-                None
-            };
-        } else if matches!(word & 0xff000000, 0x91000000 | 0xd1000000) {
-            // add immediate (including SP)
-            registers[dst] = if base == 31 || base == 29 {
-                Some(Scratch)
-            } else if registers[base] == Some(Instance) {
-                Some(Instance)
-            } else {
-                None
-            };
+        } else if let Some(copied) = data_instruction(
+            word,
+            offsets,
+            &mut registers,
+            &mut vectors,
+            &mut copied_text,
+            temporary_result,
+        ) {
+            result_verified |= copied;
         } else if word & 0xfffffc1f == 0xd63f0000 {
             // blr Xn
             let call = indirect_binding(&registers, base, kind);
@@ -116,6 +259,12 @@ fn binding_call(code: &[u8], offsets: &[usize], kind: CallKind) -> Option<(usize
                 return None;
             }
             found = call.or(found);
+            if kind == CallKind::Text && call.is_some() {
+                temporary_result = match registers[8] {
+                    Some(Scratch(address)) => Some(address),
+                    _ => None,
+                };
+            }
             registers[..19].fill(None);
             if kind == CallKind::Identity && call.is_some() {
                 registers[0] = Some(Low);
@@ -132,6 +281,11 @@ fn binding_call(code: &[u8], offsets: &[usize], kind: CallKind) -> Option<(usize
             }
         } else if word & 0xfc000000 == 0x14000000 {
             // tail call
+            if kind == CallKind::Text && result_verified {
+                // A complete copied return value needs no conversion tail call.
+                // Continue through the common cleanup/return epilogue.
+                continue;
+            }
             return (kind == CallKind::Text && found.is_some() && registers[8] == Some(Output))
                 .then_some(found)
                 .flatten();
@@ -163,6 +317,21 @@ fn binding_call(code: &[u8], offsets: &[usize], kind: CallKind) -> Option<(usize
     None
 }
 
+fn returned_text_bytes(
+    base: Option<Argument>,
+    offset: i64,
+    length: usize,
+    temporary: Option<i64>,
+) -> Option<Argument> {
+    let Argument::Scratch(base) = base? else {
+        return None;
+    };
+    let source = base + offset;
+    let relative = source.checked_sub(temporary?)?;
+    (relative >= 0 && relative + length as i64 <= 256)
+        .then_some(Argument::TextBytes(source, length))
+}
+
 struct Memory {
     pid: u32,
     trace: PackageActionTrace,
@@ -173,7 +342,7 @@ struct Memory {
 
 #[derive(Clone)]
 struct MemberEntry {
-    header: Vec<u8>,
+    header: Arc<[u8]>,
     descriptor: u64,
 }
 type MemberKey = (u32, [u8; 16], u64, String);
@@ -217,7 +386,101 @@ fn name_text(bytes: Vec<u8>) -> Result<String> {
     Ok(text)
 }
 
+fn member_descriptors(
+    class: &[u8],
+    mut read: impl FnMut(&[(u64, usize)]) -> Result<Vec<Option<Vec<u8>>>>,
+) -> Result<HashMap<String, HashSet<u64>>> {
+    anyhow::ensure!(class.len() == 0x218, "Invalid reflection class header");
+    let vectors = (0..=0x200)
+        .step_by(8)
+        .filter_map(|offset| {
+            let entries = read_u64(class, offset)?;
+            let count = read_u64(class, offset + 8)?;
+            let capacity = read_u64(class, offset + 16)?;
+            (entries >= 0x10000
+                && count > 0
+                && count <= 512
+                && capacity >= count
+                && capacity <= 1024
+                && entries.checked_add(count * 16).is_some())
+            .then(|| (entries, count as usize * 16))
+        })
+        .collect::<Vec<_>>();
+    let mut descriptors = HashSet::new();
+    for bytes in read(&vectors)?.into_iter().flatten() {
+        descriptors.extend(bytes.as_chunks::<16>().0.iter().filter_map(|row| {
+            read_u64(row, 0).filter(|p| *p >= 0x10000 && p.checked_add(16).is_some())
+        }));
+    }
+    let descriptors = descriptors.into_iter().collect::<Vec<_>>();
+    let pointers = read(&descriptors.iter().map(|p| (p + 8, 8)).collect::<Vec<_>>())?;
+    let named = descriptors
+        .into_iter()
+        .zip(pointers)
+        .filter_map(|(descriptor, bytes)| {
+            let pointer = read_u64(bytes.as_deref()?, 0)?;
+            (pointer >= 0x10000 && pointer.checked_add(32).is_some())
+                .then_some((descriptor, pointer))
+        })
+        .collect::<Vec<_>>();
+    // Name objects occur at offsets 0 or 8. Read each string header separately:
+    // a valid first header must survive an unreadable alternate layout.
+    let headers = read(
+        &named
+            .iter()
+            .flat_map(|(_, p)| [(*p, 24), (p + 8, 24)])
+            .collect::<Vec<_>>(),
+    )?;
+    let mut pending = Vec::new();
+    let candidates = headers
+        .chunks_exact(2)
+        .map(|headers| {
+            headers
+                .iter()
+                .filter_map(|bytes| string_source(bytes.as_deref()?))
+                .filter_map(|source| match source {
+                    StringSource::Inline(bytes) => Some(Ok(bytes)),
+                    StringSource::Indirect(address, size)
+                        if address.checked_add(size as u64).is_some() =>
+                    {
+                        pending.push((address, size));
+                        Some(Err(pending.len() - 1))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let bodies = read(&pending)?;
+    let mut members: HashMap<String, HashSet<u64>> = HashMap::new();
+    for ((descriptor, _), choices) in named.into_iter().zip(candidates) {
+        let name = choices.into_iter().find_map(|choice| {
+            let bytes = match choice {
+                Ok(bytes) => bytes,
+                Err(index) => bodies[index].clone()?,
+            };
+            name_text(bytes).ok().filter(|name| !name.is_empty())
+        });
+        if let Some(name) = name {
+            members.entry(name).or_default().insert(descriptor);
+        }
+    }
+    Ok(members)
+}
+
 impl Memory {
+    fn for_process(pid: u32, timeout: Duration) -> Result<Self> {
+        let deadline = Instant::now() + timeout;
+        let executable = process_executable_path(pid)?;
+        Ok(Self {
+            pid,
+            trace: trace_package_action(&executable)?,
+            deadline,
+            base: 0,
+            executable,
+        })
+    }
+
     fn abi_key(&self, table: u64, kind: CallKind) -> Result<AbiKey> {
         Ok((
             self.trace.image_uuid,
@@ -346,6 +609,7 @@ impl Memory {
         Ok(result)
     }
     fn request(&self, operation: u32, payload: &[u8], title: &str) -> Result<Vec<u8>> {
+        let started = Instant::now();
         let remaining = self
             .deadline
             .checked_duration_since(Instant::now())
@@ -367,14 +631,51 @@ impl Memory {
         ] {
             request.extend_from_slice(&value.to_le_bytes());
         }
-        request.extend_from_slice(&(remaining.as_millis() as u64).to_le_bytes());
+        // The helper's command-3 factory field carries the budget, not an RVA.
+        // Old helpers ignore the opt-in high bit; untraced calls pay no
+        // per-candidate timing cost during cold discovery.
+        let phase_timing = if crate::app::output::global_log_enabled(5) {
+            1_u64 << 63
+        } else {
+            0
+        };
+        request.extend_from_slice(&((remaining.as_millis() as u64) | phase_timing).to_le_bytes());
         request.extend_from_slice(&self.trace.submit_rva.to_le_bytes());
         request.extend_from_slice(&self.trace.image_uuid);
         request.extend_from_slice(payload);
         request.extend_from_slice(title.as_bytes());
         stream.write_all(&request)?;
         let mut response = [0; RESPONSE_SIZE];
-        stream.read_exact(&mut response)?;
+        stream.read_exact(&mut response).with_context(|| {
+            let recovery = if operation == 2 && matches!(read_u32(payload, 132), Some(2 | 5)) {
+                "; a requested write may still finish, so read the property before retrying"
+            } else {
+                ""
+            };
+            format!(
+                "Studio reflection operation {operation} (PID {}, {} ms remaining) did not return a response before the connection ended or timed out{recovery}",
+                self.pid,
+                remaining.as_millis(),
+            )
+        })?;
+        if matches!(operation, 0 | 2 | 4) {
+            let details = &response[24..];
+            let end = details
+                .iter()
+                .position(|b| *b == 0)
+                .unwrap_or(details.len());
+            crate::app::output::log_global(
+                5,
+                format_args!(
+                    "[renium] native property transport: pid={} op={operation} title={title:?} wall_us={} helper_us={} status={:?} details={:?}",
+                    self.pid,
+                    started.elapsed().as_micros(),
+                    read_u64(&response, 16).unwrap_or(0),
+                    read_u32(&response, 4),
+                    String::from_utf8_lossy(&details[..end]),
+                ),
+            );
+        }
         if read_u32(&response, 0) != Some(REQUEST_MAGIC) || read_u32(&response, 4) != Some(0) {
             let error = &response[24..];
             let end = error.iter().position(|b| *b == 0).unwrap_or(error.len());
@@ -383,11 +684,18 @@ impl Memory {
                 String::from_utf8_lossy(&error[..end])
             );
         }
+        let limit = if operation == 2 && read_u32(payload, 132) == Some(4) {
+            64 * 1024 * 1024
+        } else {
+            1024 * 1024
+        };
         let length = read_u64(&response, 8)
-            .filter(|length| *length <= 1024 * 1024)
+            .filter(|length| *length <= limit)
             .context("Invalid reflection response length")? as usize;
         let mut data = vec![0; length];
-        stream.read_exact(&mut data)?;
+        stream
+            .read_exact(&mut data)
+            .context("Studio reflection response was interrupted")?;
         Ok(data)
     }
 
@@ -476,6 +784,23 @@ impl Memory {
             }
         }
         bail!("Reflection name is unavailable")
+    }
+
+    fn instance_classes(&self, instances: &[(u64, u64)], offset: u64) -> Result<Vec<String>> {
+        let descriptors = self.read_many(
+            &instances
+                .iter()
+                .map(|(p, _)| (p + offset, 8))
+                .collect::<Vec<_>>(),
+        )?;
+        let descriptors = descriptors
+            .into_iter()
+            .map(|bytes| {
+                let bytes = bytes.context("Studio hierarchy changed while reading classes")?;
+                Ok((read_u64(&bytes, 0).unwrap(), 0))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.instance_names(&descriptors, 8)
     }
 
     fn instance_names(&self, instances: &[(u64, u64)], offset: u64) -> Result<Vec<String>> {
@@ -578,7 +903,7 @@ impl Memory {
                 .cloned()
         });
         if let Some(entry) = cached
-            && entry.header == class
+            && entry.header.as_ref() == class
             && self
                 .pointer(entry.descriptor + 8)
                 .and_then(|p| self.name(p))
@@ -588,46 +913,35 @@ impl Memory {
         {
             return Ok(entry.descriptor);
         }
-        let mut matches = HashSet::new();
-        for offset in (0..=0x200).step_by(8) {
-            let entries = read_u64(&class, offset).unwrap();
-            let count = read_u64(&class, offset + 8).unwrap();
-            let capacity = read_u64(&class, offset + 16).unwrap();
-            if entries < 0x10000 || count == 0 || count > 512 || capacity < count || capacity > 1024
-            {
-                continue;
-            }
-            let Ok(bytes) = self.read(entries, count as usize * 16) else {
-                continue;
-            };
-            for row in bytes.as_chunks::<16>().0 {
-                let descriptor = read_u64(row, 0).unwrap();
-                let name = self.pointer(descriptor + 8).and_then(|p| self.name(p));
-                if name.as_deref().ok() == Some(wanted) {
-                    matches.insert(descriptor);
-                }
-            }
-        }
+        let members = member_descriptors(&class, |requests| self.read_many(requests))?;
+        let matches = members.get(wanted);
         anyhow::ensure!(
-            matches.len() == 1,
+            matches.is_some_and(|values| values.len() == 1),
             "Reflection member {wanted} resolved {} candidates",
-            matches.len()
+            matches.map_or(0, HashSet::len)
         );
-        let descriptor = *matches.iter().next().unwrap();
+        let descriptor = *matches.unwrap().iter().next().unwrap();
         let mut cache = MEMBERS
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if cache.len() >= 1024 {
+        if cache.len() + members.len() > 1024 {
             cache.clear();
         }
-        cache.insert(
-            key,
-            MemberEntry {
-                header: class,
-                descriptor,
-            },
-        );
+        let header: Arc<[u8]> = Arc::from(class);
+        // The scan already resolved every name. Share its class header across
+        // unique members instead of rescanning it for the next property/ID.
+        for (name, matches) in members.into_iter().take(1024 - cache.len()) {
+            if matches.len() == 1 {
+                cache.insert(
+                    (self.pid, self.trace.image_uuid, class_descriptor, name),
+                    MemberEntry {
+                        header: header.clone(),
+                        descriptor: *matches.iter().next().unwrap(),
+                    },
+                );
+            }
+        }
         Ok(descriptor)
     }
 }
@@ -646,7 +960,9 @@ impl NativeProperty {
     pub(crate) fn ensure_writable(&self) -> Result<()> {
         anyhow::ensure!(
             self.writable,
-            "This engine property has no supported setter"
+            "{}.{} has no supported native setter",
+            self.class_name,
+            self.property
         );
         Ok(())
     }
@@ -657,10 +973,40 @@ impl NativeProperty {
             .context("Protected property operation exceeded its deadline")
     }
     fn invoke(&mut self, operation: u32) -> Result<Vec<u8>> {
+        let started = Instant::now();
+        crate::app::output::log_global(
+            5,
+            format_args!(
+                "[renium] native property invoke: pid={} operation={operation} {}.{} title={:?}",
+                self.memory.pid, self.class_name, self.property, self.title,
+            ),
+        );
         let timeout = self.remaining()?.as_millis().clamp(1, 3000) as u32;
         put32(&mut self.parameters, 132, operation);
         put32(&mut self.parameters, 140, timeout);
-        let output = self.memory.request(2, &self.parameters, &self.title)?;
+        let output = self
+            .memory
+            .request(2, &self.parameters, &self.title)
+            .with_context(|| {
+                let action = match operation {
+                    0 => "identify",
+                    1 | 3 | 4 => "read",
+                    _ => "write",
+                };
+                format!(
+                    "Could not {action} {}.{} in {}",
+                    self.class_name, self.property, self.title
+                )
+            })?;
+        crate::app::output::log_global(
+            5,
+            format_args!(
+                "[renium] native property invoke completed: {}.{} operation={operation} {:.1}ms",
+                self.class_name,
+                self.property,
+                started.elapsed().as_secs_f64() * 1000.0,
+            ),
+        );
         anyhow::ensure!(output.len() >= 16, "Incomplete property identity response");
         Ok(output)
     }
@@ -723,7 +1069,18 @@ fn resolve_path(
     let mut ancestors = Vec::new();
     for (index, name) in segments.iter().enumerate() {
         let children = memory.children(parent, children_offset)?;
-        let names = memory.instance_names(&children, name_offset)?;
+        // Service paths use class identity throughout the bridge. Their mutable
+        // display names must not break native access or select a namesake folder.
+        let service_root = index == 0
+            && rbx_reflection_database::get()?
+                .classes
+                .get(name.as_str())
+                .is_some_and(|class| class.tags.contains(&rbx_reflection::ClassTag::Service));
+        let names = if service_root {
+            memory.instance_classes(&children, read_u64(context, 40).unwrap())?
+        } else {
+            memory.instance_names(&children, name_offset)?
+        };
         let matches = children
             .into_iter()
             .zip(names)
@@ -826,6 +1183,23 @@ fn identity_function(
     Ok((binding, getter, abi.getter_slot))
 }
 
+pub(crate) fn prepare_context(pid: u32, title: &str) -> Result<()> {
+    let memory = Memory::for_process(pid, Duration::from_secs(2))?;
+    let context = memory.request(0, &[0], title)?;
+    anyhow::ensure!(context.len() == 64, "Unsupported Studio reflection context");
+    let mut request = Vec::with_capacity(20);
+    request.extend_from_slice(&context[56..64]);
+    request.extend_from_slice(&context[8..16]);
+    let remaining = memory.deadline.saturating_duration_since(Instant::now());
+    request.extend_from_slice(&(remaining.as_millis().clamp(1, 3000) as u32).to_le_bytes());
+    let response = memory.request(4, &request, title)?;
+    anyhow::ensure!(
+        response.is_empty(),
+        "Unexpected Studio preparation response"
+    );
+    Ok(())
+}
+
 pub(crate) fn prepare_property(
     pid: u32,
     title: &str,
@@ -834,27 +1208,111 @@ pub(crate) fn prepare_property(
     property: &str,
     timeout: Duration,
 ) -> Result<NativeProperty> {
-    let deadline = Instant::now() + timeout;
-    let executable = process_executable_path(pid)?;
-    let mut memory = Memory {
+    prepare(pid, title, segments, ordinals, property, timeout, None).map(|(prepared, _)| prepared)
+}
+
+/// A trusted snapshot read captures identity and value on the same engine task.
+/// It does not create a write grant or change the ordinary approval flow.
+pub(crate) fn read_property(
+    pid: u32,
+    title: &str,
+    segments: &[String],
+    ordinals: &[usize],
+    class: &str,
+    property: &str,
+    timeout: Duration,
+) -> Result<String> {
+    prepare(
         pid,
-        trace: trace_package_action(&executable)?,
-        deadline,
-        base: 0,
-        executable,
-    };
+        title,
+        segments,
+        ordinals,
+        property,
+        timeout,
+        Some(class),
+    )
+    .map(|(_, value)| value)
+}
+
+fn prepare(
+    pid: u32,
+    title: &str,
+    segments: &[String],
+    ordinals: &[usize],
+    property: &str,
+    timeout: Duration,
+    read_class: Option<&str>,
+) -> Result<(NativeProperty, String)> {
+    let _trace = crate::app::timing::trace_scope("native.property", "prepare reflected property");
+    let mut prepared = discover_property(
+        pid, title, segments, ordinals, property, timeout, read_class,
+    )?;
+    let phase = crate::app::timing::trace_scope(
+        "native.property",
+        "invoke identity-checked property operation",
+    );
+    let response = prepared.invoke(if read_class.is_some() { 3 } else { 0 })?;
+    drop(phase);
+    let identity = response
+        .get(..16)
+        .context("Studio returned no instance identity")?;
+    anyhow::ensure!(identity != [0; 16], "Studio target has no stable identity");
+    prepared.instance_id = identity.iter().map(|b| format!("{b:02x}")).collect();
+    prepared.parameters[664..680].copy_from_slice(identity);
+    Ok((prepared, String::from_utf8(response[16..].to_vec())?))
+}
+
+fn discover_property(
+    pid: u32,
+    title: &str,
+    segments: &[String],
+    ordinals: &[usize],
+    property: &str,
+    timeout: Duration,
+    read_class: Option<&str>,
+) -> Result<NativeProperty> {
+    let _trace = crate::app::timing::trace_scope("native.property", "discover reflected property");
+    crate::app::output::log_global(
+        5,
+        format_args!(
+            "[renium] native property prepare: pid={pid} path={segments:?} property={property} title={title:?}",
+        ),
+    );
+    let started = Instant::now();
+    let phase = crate::app::timing::trace_scope("native.property", "open process");
+    let mut memory = Memory::for_process(pid, timeout)?;
+    drop(phase);
+    let traced = Instant::now();
+    let phase = crate::app::timing::trace_scope("native.property", "locate DataModel context");
     let context = memory.request(0, &[0], title)?;
     anyhow::ensure!(
         context.len() == 64,
         "Unsupported reflection context; install the matching helper"
     );
     memory.base = read_u64(&context, 0).unwrap();
+    drop(phase);
+    let located = Instant::now();
+    let phase =
+        crate::app::timing::trace_scope("native.property", "resolve instance path and class");
     let ancestors = resolve_path(&memory, &context, segments, ordinals)?;
     let (instance, owner) = *ancestors.last().unwrap();
     let class_offset = read_u64(&context, 40).unwrap();
     let class_descriptor = memory.pointer(instance + class_offset)?;
     let class_name = memory.name(memory.pointer(class_descriptor + 8)?)?;
+    anyhow::ensure!(
+        read_class.is_none_or(|expected| class_name == expected),
+        "Native snapshot target changed class"
+    );
+    let resolved = Instant::now();
+    drop(phase);
+    let phase = crate::app::timing::trace_scope("native.property", "resolve property descriptor");
     let descriptor = memory.member(instance, class_offset, property)?;
+    drop(phase);
+    let member = Instant::now();
+    let phase = crate::app::timing::trace_scope(
+        "native.property",
+        "resolve property codec and identity getter",
+    );
     let descriptor_kind = memory.rtti(descriptor)?;
     anyhow::ensure!(
         descriptor_kind.contains("PropDescriptor"),
@@ -870,6 +1328,9 @@ pub(crate) fn prepare_property(
     };
     let (identity_binding, identity_getter, identity_slot) =
         identity_function(&memory, instance, class_offset)?;
+    let codecs = Instant::now();
+    drop(phase);
+    let phase = crate::app::timing::trace_scope("native.property", "prepare ABI parameters");
     let mut parameters = vec![0; 66216];
     for (offset, value) in [
         (0, read_u64(&context, 56).unwrap()),
@@ -900,7 +1361,7 @@ pub(crate) fn prepare_property(
         144 + ancestors.len() * 8,
         read_u64(&context, 8).unwrap(),
     );
-    let mut prepared = NativeProperty {
+    let prepared = NativeProperty {
         class_name,
         instance_id: String::new(),
         property: property.into(),
@@ -909,13 +1370,21 @@ pub(crate) fn prepare_property(
         parameters,
         writable: setter != 0,
     };
-    let identity = prepared.invoke(0)?;
-    anyhow::ensure!(
-        identity.len() == 16 && identity != [0; 16],
-        "Studio target has no stable identity"
+    drop(phase);
+    crate::app::output::log_global(
+        5,
+        format_args!(
+            "[renium] native property discovery phases: {}.{} trace_ms={:.3} context_ms={:.3} path_ms={:.3} member_ms={:.3} codec_ms={:.3} params_ms={:.3}",
+            prepared.class_name,
+            property,
+            traced.duration_since(started).as_secs_f64() * 1000.0,
+            located.duration_since(traced).as_secs_f64() * 1000.0,
+            resolved.duration_since(located).as_secs_f64() * 1000.0,
+            member.duration_since(resolved).as_secs_f64() * 1000.0,
+            codecs.duration_since(member).as_secs_f64() * 1000.0,
+            codecs.elapsed().as_secs_f64() * 1000.0,
+        ),
     );
-    prepared.instance_id = identity.iter().map(|b| format!("{b:02x}")).collect();
-    prepared.parameters[664..680].copy_from_slice(&identity);
     Ok(prepared)
 }
 
@@ -981,6 +1450,510 @@ fn protected_property_live_fixture() -> Result<()> {
     )?;
     assert_eq!(text.read()?, "fidelity-".repeat(1024));
     Ok(())
+}
+
+#[test]
+#[ignore = "Read-only descriptor/code inspection in the owned Terrain regression fixture"]
+fn terrain_descriptor_live_fixture() -> Result<()> {
+    let pid = std::env::var("RENIUM_INSPECT_FIXTURE_PID")?.parse()?;
+    let mut memory = Memory::for_process(pid, Duration::from_secs(10))?;
+    let context = memory.request(0, &[0], "ReniumPropertyPackageTest.rbxl")?;
+    anyhow::ensure!(context.len() == 64, "Unexpected reflection context");
+    memory.base = read_u64(&context, 0).unwrap();
+    let path =
+        std::env::var("RENIUM_INSPECT_FIXTURE_PATH").unwrap_or_else(|_| "Workspace.Terrain".into());
+    let ancestors = resolve_path(
+        &memory,
+        &context,
+        &path.split('.').map(str::to_owned).collect::<Vec<_>>(),
+        &[],
+    )?;
+    let instance = ancestors.last().context("Missing Terrain")?.0;
+    let class_offset = read_u64(&context, 40).unwrap();
+    let mut rows = Vec::new();
+    let names = std::env::var("RENIUM_INSPECT_FIXTURE_PROPERTIES")
+        .unwrap_or_else(|_| "SmoothGrid,PhysicsGrid,CopyRegion,PasteRegion".into());
+    if names == "*" {
+        let class = memory.read(memory.pointer(instance + class_offset)?, 0x218)?;
+        let mut members = member_descriptors(&class, |requests| memory.read_many(requests))?
+            .into_keys()
+            .collect::<Vec<_>>();
+        members.sort();
+        fs::write(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../audit/release-readiness/terrain-member-names.json"),
+            serde_json::to_vec_pretty(&members)?,
+        )?;
+        return Ok(());
+    }
+    for name in names.split(',') {
+        let descriptor = memory.member(instance, class_offset, name)?;
+        let table = memory.pointer(descriptor)?;
+        let slots = memory.read(table, 32 * 8)?;
+        let mut functions = Vec::new();
+        for slot in 0..32 {
+            let function = read_u64(&slots, slot * 8).unwrap();
+            if let Ok(code) = memory.code(function, 256) {
+                functions.push(serde_json::json!({"slot":slot*8,"rva":function-memory.base,"code":base64::encode(code)}));
+            }
+        }
+        let mut bindings = Vec::new();
+        for offset in memory.bindings(descriptor)? {
+            let binding = memory.pointer(descriptor + offset as u64)?;
+            let vtable = memory.pointer(binding)?;
+            let slots = memory.read(vtable, 8 * 8)?;
+            let mut methods = Vec::new();
+            for slot in 0..8 {
+                let function = read_u64(&slots, slot * 8).unwrap();
+                if let Ok(code) = memory.code(function, 512) {
+                    methods.push(serde_json::json!({"slot":slot*8,"rva":function-memory.base,"code":base64::encode(code)}));
+                }
+            }
+            let fields = memory.read(binding, 48)?;
+            let mut targets = Vec::new();
+            for offset in [8, 24] {
+                let function = read_u64(&fields, offset).unwrap();
+                if let Ok(code) = memory.code(function, 2048) {
+                    targets.push(serde_json::json!({"offset":offset,"rva":function-memory.base,"code":base64::encode(code)}));
+                }
+            }
+            bindings.push(
+                serde_json::json!({"offset":offset,"kind":memory.rtti(binding)?,"methods":methods,"fields":base64::encode(fields),"targets":targets}),
+            );
+        }
+        let text_abi = memory
+            .text_functions(descriptor)
+            .map_err(|error| error.to_string());
+        rows.push(serde_json::json!({"name":name,"base":memory.base,"kind":memory.rtti(descriptor)?,"textAbi":text_abi,"fields":base64::encode(memory.read(descriptor,256)?),"functions":functions,"bindings":bindings}));
+    }
+    let output = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../audit/release-readiness/terrain-descriptors.json");
+    fs::write(output, serde_json::to_vec_pretty(&rows)?)?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn terrain_fixture_binary_property(pid: u32, name: &str) -> Result<NativeProperty> {
+    let mut prepared = prepare_property(
+        pid,
+        "ReniumPropertyPackageTest.rbxl",
+        &["Workspace".into(), "Terrain".into()],
+        &[],
+        "Name",
+        Duration::from_secs(3),
+    )?;
+    anyhow::ensure!(
+        prepared.class_name == "Terrain",
+        "Not the owned Terrain target"
+    );
+    let instance = read_u64(&prepared.parameters, 8).unwrap();
+    let class_offset = read_u64(&prepared.parameters, 80).unwrap();
+    let descriptor = prepared.memory.member(instance, class_offset, name)?;
+    anyhow::ensure!(
+        prepared.memory.rtti(descriptor)?
+            == "N3RBX10Reflection14PropDescriptorINS_19MegaClusterInstanceENS_12BinaryStringEEE",
+        "Not a Terrain BinaryString descriptor"
+    );
+    // Read-only probe of the inspected 0.738 ARM64 ABI, not a production resolver.
+    // Its copy method loads this binding, returns 24-byte string storage via x8,
+    // passes that storage to the setter, and disposes it as libc++ std::string.
+    let binding = prepared.memory.pointer(descriptor + 144)?;
+    anyhow::ensure!(
+        prepared.memory.rtti(binding)?
+            == "N3RBX10Reflection14PropDescriptorINS_19MegaClusterInstanceENS_12BinaryStringEE10GetSetImplIMNS_11TerrainPropEKFS3_vEMS6_FvS3_EEE",
+        "Not the inspected Terrain getter binding"
+    );
+    let table = prepared.memory.pointer(binding)?;
+    let getter = prepared.memory.pointer(table + 32)?;
+    let code = prepared.memory.code(getter, 36)?;
+    anyhow::ensure!(
+        read_u32(&code, 0) == Some(0x91070029) && read_u32(&code, 32) == Some(0xd61f0020),
+        "The inspected Terrain getter changed"
+    );
+    for (offset, value) in [
+        (24, binding),
+        (32, table),
+        (48, getter),
+        (56, 0),
+        (104, 32),
+        (112, 0),
+    ] {
+        put64(&mut prepared.parameters, offset, value);
+    }
+    prepared.property = name.into();
+    prepared.writable = false;
+    Ok(prepared)
+}
+
+#[test]
+#[ignore = "Opt-in history hook qualification in the owned Mac Terrain fixture"]
+fn terrain_history_hook_live_fixture() -> Result<()> {
+    anyhow::ensure!(
+        std::env::var("RENIUM_TERRAIN_WRITE_PROBE").as_deref() == Ok("1"),
+        "Explicit write probe opt-in required"
+    );
+    let pid = std::env::var("RENIUM_INSPECT_FIXTURE_PID")?.parse()?;
+    let token = std::env::var("RENIUM_HISTORY_PROBE_TOKEN")?;
+    register_history(pid, "ReniumPropertyPackageTest.rbxl", &token)
+}
+
+#[test]
+#[ignore = "Read-only native Terrain listener interface discovery in the owned Mac fixture"]
+fn terrain_native_listener_live_fixture() -> Result<()> {
+    fn describe(memory: &Memory, info: u64, depth: usize) -> Result<serde_json::Value> {
+        anyhow::ensure!(depth < 20, "Unexpected native inheritance depth");
+        let name = memory.cstring(memory.pointer(info + 8)?)?;
+        let kind = memory.rtti(info)?;
+        let mut bases = Vec::new();
+        if kind.contains("__si_class_type_info") {
+            bases.push(serde_json::json!({"offsetFlags":0,"type":describe(memory, memory.pointer(info + 16)?, depth + 1)?}));
+        } else if kind.contains("__vmi_class_type_info") {
+            let header = memory.read(info + 16, 8)?;
+            let count = read_u32(&header, 4).unwrap() as usize;
+            anyhow::ensure!(count <= 32, "Unexpected native base count");
+            let entries = memory.read(info + 24, count * 16)?;
+            for entry in entries.chunks_exact(16) {
+                bases.push(serde_json::json!({"offsetFlags":read_u64(entry,8).unwrap() as i64,"type":describe(memory,read_u64(entry,0).unwrap(),depth+1)?}));
+            }
+        }
+        Ok(serde_json::json!({"name":name,"kind":kind,"bases":bases}))
+    }
+    let pid = std::env::var("RENIUM_INSPECT_FIXTURE_PID")?.parse()?;
+    let property = terrain_fixture_binary_property(pid, "SmoothGrid")?;
+    let instance = read_u64(&property.parameters, 8).unwrap();
+    let vtable = property.memory.pointer(instance)?;
+    let hierarchy = describe(&property.memory, property.memory.pointer(vtable - 8)?, 0)?;
+    fs::write(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../audit/release-readiness/terrain-native-inheritance.json"),
+        serde_json::to_vec_pretty(&hierarchy)?,
+    )?;
+    // The observed non-virtual GridListener base is at +512 in this fixture's
+    // build. This is diagnostic data, not a production offset or hook.
+    let listener_table = property.memory.pointer(instance + 512)?;
+    anyhow::ensure!(
+        property.memory.pointer(listener_table - 16)? as i64 == -512,
+        "The inspected Terrain GridListener adjustment changed"
+    );
+    let mut methods = Vec::new();
+    for slot in (0..128).step_by(8) {
+        let method = property.memory.pointer(listener_table + slot)?;
+        let Ok(code) = property.memory.code(method, 1024) else {
+            break;
+        };
+        let mut targets = Vec::new();
+        for at in [0, 4] {
+            let word = read_u32(&code, at).unwrap();
+            if word & 0xfc000000 == 0x14000000 {
+                let target = (method as i64 + at as i64 + ((word << 6) as i32 >> 4) as i64) as u64;
+                targets.push(serde_json::json!({"rva":target-property.memory.base,"code":base64::encode(property.memory.code(target,4096)?)}));
+            }
+        }
+        methods.push(serde_json::json!({"slot":slot,"rva":method-property.memory.base,"code":base64::encode(code),"targets":targets}));
+    }
+    fs::write(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../audit/release-readiness/terrain-native-listener-methods.json"),
+        serde_json::to_vec_pretty(&methods)?,
+    )?;
+    // The fully captured SmoothGrid getter in this fixture loads +0x240 and
+    // dispatches serialization through +0xf0. Read its actual target only;
+    // these offsets are diagnostic evidence, never a production resolver.
+    let grid = property.memory.pointer(instance + 0x240)?;
+    let grid_table = property.memory.pointer(grid)?;
+    let serialize = property.memory.pointer(grid_table + 0xf0)?;
+    fs::write(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../audit/release-readiness/terrain-grid-serialize-target.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "kind": property.memory.rtti(grid)?,
+            "rva": serialize - property.memory.base,
+            "code": base64::encode(property.memory.code(serialize, 256)?),
+        }))?,
+    )?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "Explicit opt-in conditional Terrain binary write in the owned Mac fixture"]
+fn terrain_binary_setter_live_fixture() -> Result<()> {
+    anyhow::ensure!(
+        std::env::var("RENIUM_TERRAIN_WRITE_PROBE").as_deref() == Ok("1"),
+        "Explicit Terrain write probe opt-in required"
+    );
+    let pid = std::env::var("RENIUM_INSPECT_FIXTURE_PID")?.parse()?;
+    let mut property = terrain_fixture_binary_property(pid, "SmoothGrid")?;
+    let table = read_u64(&property.parameters, 32).unwrap();
+    let setter = property.memory.pointer(table + 40)?;
+    let code = property.memory.code(setter, 132)?;
+    anyhow::ensure!(
+        read_u32(&code, 0) == Some(0xd10103ff)
+            && read_u32(&code, 96) == Some(0xd63f0280)
+            && read_u32(&code, 128) == Some(0xd65f03c0),
+        "The inspected Terrain BinaryString setter changed"
+    );
+    put64(&mut property.parameters, 56, setter);
+    put64(&mut property.parameters, 112, 40);
+    let before = property.invoke(1)?[16..].to_vec();
+    let audit = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../audit/release-readiness");
+    let source: serde_json::Value =
+        serde_json::from_slice(&fs::read(audit.join("terrain-native-rock-values.json"))?)?;
+    let desired = base64::decode(
+        source["SmoothGrid"]["base64"]
+            .as_str()
+            .context("Missing owned Rock grid")?,
+    )?;
+    anyhow::ensure!(
+        before != desired && !before.is_empty(),
+        "Terrain probe needs a distinct initial grid"
+    );
+    let input_size = 4 + before.len() + desired.len();
+    anyhow::ensure!(
+        input_size <= 65536,
+        "Terrain diagnostic payload exceeds its fixed transport"
+    );
+    put32(&mut property.parameters, 136, input_size as u32);
+    put32(&mut property.parameters, 680, before.len() as u32);
+    property.parameters[684..684 + before.len()].copy_from_slice(&before);
+    property.parameters[684 + before.len()..680 + input_size].copy_from_slice(&desired);
+    property.parameters[684] ^= 1;
+    let error = property
+        .invoke(5)
+        .expect_err("Changed Terrain must reject the stale write");
+    anyhow::ensure!(
+        format!("{error:#}").contains("changed before the conditional write"),
+        "Unexpected rejection: {error:#}"
+    );
+    assert_eq!(&property.invoke(1)?[16..], before);
+    property.parameters[684] ^= 1;
+    let after = property.invoke(5)?;
+    assert_eq!(&after[16..], desired);
+    fs::write(
+        audit.join("terrain-conditional-setter.json"),
+        serde_json::to_vec_pretty(
+            &serde_json::json!({"staleRejected":true,"before":base64::encode(before),"after":base64::encode(&after[16..])}),
+        )?,
+    )?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "Read-only native BinaryString ABI probe in the owned Mac Terrain fixture"]
+fn terrain_binary_getter_live_fixture() -> Result<()> {
+    let pid = std::env::var("RENIUM_INSPECT_FIXTURE_PID")?.parse()?;
+    let mut values = serde_json::Map::new();
+    for name in ["SmoothGrid", "PhysicsGrid", "MaterialColors"] {
+        let mut prepared = terrain_fixture_binary_property(pid, name)?;
+        let bytes = prepared.invoke(1)?;
+        let payload = &bytes[16..];
+        values.insert(
+            name.into(),
+            serde_json::json!({"bytes":payload.len(),"base64":base64::encode(payload)}),
+        );
+    }
+    let output = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../audit/release-readiness/terrain-native-binary-values.json");
+    fs::write(output, serde_json::to_vec_pretty(&values)?)?;
+    println!("Terrain BinaryString getter probe completed");
+    Ok(())
+}
+
+#[test]
+fn arm_vector_setter_preserves_stack_identity_across_zero_initialization() {
+    // Actual Vector3 text setter: parse into a zero-initialized stack value,
+    // pass that value to the binding, then return the parser's success flag.
+    let words: [u32; 26] = [
+        0xd10103ff, 0xa90157f6, 0xa9024ff4, 0xa9037bfd, 0x9100c3fd, 0xaa0103f3, 0xaa0003f5,
+        0xf90003ff, 0xb9000bff, 0x910003e1, 0xaa0203e0, 0x95234daa, 0xaa0003f4, 0x340000e0,
+        0xf9404aa0, 0xf9400008, 0xf9401508, 0x910003e2, 0xaa1303e1, 0xd63f0100, 0xaa1403e0,
+        0xa9437bfd, 0xa9424ff4, 0xa94157f6, 0x910103ff, 0xd65f03c0,
+    ];
+    let decode = |words: &[u32], field| {
+        binding_call(
+            &words
+                .iter()
+                .flat_map(|word| word.to_le_bytes())
+                .collect::<Vec<_>>(),
+            &[field],
+            CallKind::Setter,
+        )
+    };
+    for field in [128, 144, 256] {
+        let mut relocated = words;
+        relocated[14] = 0xf94002a0 | ((field as u32 / 8) << 10);
+        assert_eq!(decode(&relocated, field), Some((field, 40)));
+    }
+    for (index, replacement) in [
+        (8, 0x110023ff),  // ADD WSP actually writes the stack pointer.
+        (10, 0xaa0303e0), // Parser receives a different input.
+        (17, 0xaa1403e2), // Setter receives the status, not parsed storage.
+        (20, 0xaa1603e0), // Function does not return the parse result.
+    ] {
+        let mut invalid = words;
+        invalid[index] = replacement;
+        assert_eq!(decode(&invalid, 144), None, "invalid setter at {index}");
+    }
+}
+
+#[test]
+fn arm_enum_setter_preserves_stack_identity_across_flag_only_compares() {
+    // Verified LightingStyle text-setter instructions. The enum parser writes
+    // stack storage before the binding setter consumes it.
+    let words: [u32; 30] = [
+        0xd10103ff, 0xa90157f6, 0xa9024ff4, 0xa9037bfd, 0x9100c3fd, 0xaa0103f3, 0xaa0003f4,
+        0xf9405400, 0x39c05c48, 0xf9400049, 0x7100011f, // cmp w8,#0 (Rd=31 means WZR, not SP)
+        0x9a82b121, 0x910023e2, 0x94a8cd4d, 0xaa0003f5, 0x34000120, 0xb9400be8, 0xb9000fe8,
+        0xf9404e80, 0xf9400008, 0xf9401508, 0x910033e2, 0xaa1303e1, 0xd63f0100, 0xaa1503e0,
+        0xa9437bfd, 0xa9424ff4, 0xa94157f6, 0x910103ff, 0xd65f03c0,
+    ];
+    let decode = |words: &[u32], field| {
+        binding_call(
+            &words
+                .iter()
+                .flat_map(|word| word.to_le_bytes())
+                .collect::<Vec<_>>(),
+            &[field],
+            CallKind::Setter,
+        )
+    };
+    for field in [128, 152, 256] {
+        let mut relocated = words;
+        relocated[18] = 0xf9400280 | ((field as u32 / 8) << 10);
+        assert_eq!(decode(&relocated, field), Some((field, 40)));
+    }
+    for (index, replacement) in [
+        (10, 0x110003ff), // untracked add to WSP must still invalidate SP
+        (11, 0x9a80b121), // one string arm no longer carries the input
+        (24, 0xaa1703e0), // returned value is not the parse result
+    ] {
+        let mut invalid = words;
+        invalid[index] = replacement;
+        assert_eq!(decode(&invalid, 152), None);
+    }
+}
+
+#[test]
+fn arm_text_getter_accepts_only_a_complete_returned_string_copy() {
+    let words: [u32; 15] = [
+        0xd10103ff, // sub sp,sp,#64
+        0xaa0803f3, // mov x19,x8 (original result)
+        0xf9404800, // ldr x0,[x0,#144] (descriptor binding)
+        0xf9400008, // ldr x8,[x0]
+        0xf9401109, // ldr x9,[x8,#32]
+        0x910003f4, // mov x20,sp
+        0x910003e8, // mov x8,sp (temporary aggregate result)
+        0xd63f0120, // blr x9
+        0x3cc08280, // ldur q0,[x20,#8] (ContentId string)
+        0x3d800260, // str q0,[x19]
+        0xf8418288, // ldur x8,[x20,#24]
+        0xf9000a68, // str x8,[x19,#16]
+        0x14000002, // b common epilogue
+        0x910103ff, // add sp,sp,#64
+        0xd65f03c0,
+    ];
+    let decode = |words: &[u32]| {
+        binding_call(
+            &words
+                .iter()
+                .flat_map(|word| word.to_le_bytes())
+                .collect::<Vec<_>>(),
+            &[144],
+            CallKind::Text,
+        )
+    };
+    assert_eq!(decode(&words), Some((144, 32)));
+    for (index, replacement) in [
+        (1, 0xaa0703f3),  // wrong output
+        (5, 0x910023f4),  // copy from a different stack address
+        (9, 0x3d800280),  // write into the temporary, not caller output
+        (10, 0xf8420288), // noncontiguous source bytes
+        (11, 0xf9000e68), // incomplete caller output
+    ] {
+        let mut invalid = words;
+        invalid[index] = replacement;
+        assert_eq!(decode(&invalid), None, "invalid copy at {index}");
+    }
+}
+
+#[test]
+fn batched_members_preserve_name_layouts_unreadable_entries_and_ambiguity() {
+    for vector_offset in [0x40, 0x120, 0x200] {
+        let mut class = vec![0; 0x218];
+        put64(&mut class, 0x10, 0x90000);
+        put64(&mut class, 0x18, u64::MAX);
+        put64(&mut class, 0x20, u64::MAX);
+        let mut memory: HashMap<(u64, usize), Vec<u8>> = HashMap::new();
+        let mut entries = Vec::new();
+        for index in 0..200_u64 {
+            let descriptor = 0x20000 + index * 0x100;
+            let pointer = 0x40000 + index * 0x100;
+            entries.extend_from_slice(&descriptor.to_le_bytes());
+            entries.extend_from_slice(&0_u64.to_le_bytes());
+            if index == 198 {
+                continue;
+            } // Removed/unreadable descriptor.
+            let pointer = if index == 199 { u64::MAX } else { pointer };
+            memory.insert((descriptor + 8, 8), pointer.to_le_bytes().to_vec());
+            if index == 199 {
+                continue;
+            } // Invalid address cannot poison the batch.
+            let name = if index < 2 {
+                "Ambiguous".to_owned()
+            } else if index == 197 {
+                "Invalid\0Name".to_owned()
+            } else {
+                format!("Property{index}")
+            };
+            let mut header = vec![0; 24];
+            if index.is_multiple_of(3) {
+                let body = 0x80000 + index * 0x100;
+                header[..8].copy_from_slice(&body.to_le_bytes());
+                header[8..16].copy_from_slice(&(name.len() as u64).to_le_bytes());
+                header[23] = 0x80;
+                memory.insert((body, name.len()), name.into_bytes());
+            } else {
+                header[..name.len()].copy_from_slice(name.as_bytes());
+                header[23] = name.len() as u8;
+            }
+            if index.is_multiple_of(2) {
+                // A valid 24-byte first layout with no readable second layout.
+                memory.insert((pointer, 24), header);
+            } else {
+                memory.insert((pointer, 24), vec![0xff; 24]);
+                memory.insert((pointer + 8, 24), header);
+            }
+        }
+        // Duplicate occurrences of the same descriptor are not ambiguity.
+        entries.extend_from_slice(&0x20200_u64.to_le_bytes());
+        entries.extend_from_slice(&0_u64.to_le_bytes());
+        put64(&mut class, vector_offset, 0x10000);
+        put64(&mut class, vector_offset + 8, 201);
+        put64(&mut class, vector_offset + 16, 201);
+        memory.insert((0x10000, entries.len()), entries);
+        let mut batches = 0;
+        let members = member_descriptors(&class, |requests| {
+            batches += 1;
+            assert!(
+                requests
+                    .iter()
+                    .all(|(p, len)| *p >= 0x10000 && p.checked_add(*len as u64).is_some())
+            );
+            Ok(requests
+                .iter()
+                .map(|request| memory.get(request).cloned())
+                .collect())
+        })
+        .unwrap();
+        assert_eq!(
+            batches, 4,
+            "Discovery must batch by stage, not by property count"
+        );
+        assert_eq!(members.len(), 196);
+        assert_eq!(members["Ambiguous"].len(), 2);
+        assert_eq!(members["Property2"], HashSet::from([0x20200]));
+        assert!(!members.contains_key("Property198"));
+        assert!(!members.contains_key("Invalid\0Name"));
+    }
 }
 
 #[test]

@@ -32,6 +32,7 @@ run(['lon']);
 for(let cycle=0;cycle<3;cycle++){
   run(['access','write',target,'CollisionFidelity','Box']);
   const pulled=run(['lst','--wait','10']);
+  assert.equal(pulled.daemon.settled,true,JSON.stringify(pulled));
   assert.equal(pulled.pendingChanges,0,JSON.stringify(pulled));
   const mesh=run(['bb','Workspace','-J','-'],JSON.stringify({ops:[{type:'instance',path:['Workspace','ReniumSerializerProbe','Mesh'],fields:'lookup,prop:CollisionFidelity'}]})).rs[0];
   // The exporter elides the new-MeshPart default (Box). Prove that the saved
@@ -44,6 +45,7 @@ for(let cycle=0;cycle<3;cycle++){
   run(['lon']);
   run(['bs','Workspace','-i',mesh.id,'-p','CollisionFidelity','-j',JSON.stringify(saved[0].props.CollisionFidelity)]);
   const pushed=run(['lst','--wait','10']);
+  assert.equal(pushed.daemon.settled,true,JSON.stringify(pushed));
   assert.equal(pushed.pendingChanges,0,JSON.stringify(pushed));
   assert.equal(pushed.daemon.pendingCount,0,JSON.stringify(pushed));
   assert.equal(run(['access','read',target,'CollisionFidelity']).value,'Hull');

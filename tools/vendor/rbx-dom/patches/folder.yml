@@ -1,0 +1,13 @@
+# Studio's serializer includes this field even though it is not scriptable.
+# A fresh Folder saves black; older places omit the field. Preserve non-default
+# colors while treating an omitted value as the same constructor default.
+Add:
+  Folder:
+    IconTint:
+      DataType:
+        Value: Color3
+      Scriptability: None
+      Serialization:
+        Type: Serializes
+      DefaultValue:
+        Color3: [0.0, 0.0, 0.0]

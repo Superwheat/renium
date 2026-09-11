@@ -52,11 +52,12 @@ pub(crate) fn current_unix_ts() -> i64 {
 }
 
 pub(crate) fn service_settings_path(service_dir: &Path) -> PathBuf {
-    service_dir.join(SERVICE_SETTINGS_FILE_NAME)
+    crate::project::storage::settings_path(service_dir)
+        .unwrap_or_else(|| service_dir.join(SERVICE_SETTINGS_FILE_NAME))
 }
 
 pub(crate) fn is_service_settings_file_name(name: &str) -> bool {
-    name.eq_ignore_ascii_case(SERVICE_SETTINGS_FILE_NAME)
+    ends_with_ignore_ascii_case(name, ".renium")
 }
 
 pub(crate) fn path_extension_is(path: &Path, extensions: &[&str]) -> bool {

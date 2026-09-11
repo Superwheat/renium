@@ -1,14 +1,17 @@
 //! Offline comparison, using the same identity matcher as reconciliation but
 //! comparing every decoded value (not reconciliation's ignored-field policy).
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
+use rayon::prelude::*;
 use rbx_dom_weak::{
     WeakDom,
     types::{ContentType, Ref, Variant},
 };
 use serde_json::{Map, Value, json};
 
+use crate::app::output::log_global;
 use crate::cli::ComparePlaceArgs;
 use crate::rbx::encode::{
     rbx_logical_property_name, rbx_model_property_descriptor, rbx_property_descriptor,
@@ -97,105 +100,154 @@ pub(super) fn document(
                 .insert(node.referent(), ordinals);
         }
     }
-    let mut instances = Vec::with_capacity(refs.len());
-    for (index, id) in refs.into_iter().enumerate() {
-        let node = dom.get_by_ref(id).unwrap();
-        let mut record = SettingsBytecodeInstance::new(
-            format!("{prefix}:{index}"),
-            node.name.clone(),
-            node.class.to_string(),
-            indices.get(&node.parent()).copied(),
-        );
-        for (key, value) in &node.properties {
-            let key = key.as_str();
-            // Serialized identity/history are not editable content. File-local
-            // referents are resolved below, never compared by their raw numbers.
-            if elide_defaults && matches!(key, "UniqueId" | "HistoryId") {
-                continue;
-            }
-            if let Variant::Attributes(attributes) = value {
-                for (name, value) in attributes {
-                    // Attribute strings share one byte encoding on disk.
-                    let value = match value {
-                        Variant::BinaryString(bytes) if elide_defaults => {
-                            match std::str::from_utf8(bytes.as_ref()) {
-                                Ok(text) => json!(text),
-                                Err(_) => variant_value(value, None, database, &import_refs)?,
-                            }
+    // Indexed collection keeps file traversal order while independent records
+    // convert in parallel. Each worker reuses its reflection/default metadata.
+    let instances = refs
+        .par_iter()
+        .enumerate()
+        .map_init(
+            HashMap::new,
+            |property_metadata, (index, id)| -> Result<_> {
+                let node = dom.get_by_ref(*id).unwrap();
+                let mut record = SettingsBytecodeInstance::new(
+                    format!("{prefix}:{index}"),
+                    node.name.clone(),
+                    node.class.to_string(),
+                    indices.get(&node.parent()).copied(),
+                );
+                for (key, value) in &node.properties {
+                    let metadata_key = (node.class, *key);
+                    let key = key.as_str();
+                    // Serialized identity/history are not editable content. File-local
+                    // referents are resolved below, never compared by their raw numbers.
+                    if elide_defaults && matches!(key, "UniqueId" | "HistoryId") {
+                        continue;
+                    }
+                    if let Variant::Attributes(attributes) = value {
+                        for (name, value) in attributes {
+                            // Attribute strings share one byte encoding on disk.
+                            let value = match value {
+                                Variant::BinaryString(bytes) if elide_defaults => {
+                                    match std::str::from_utf8(bytes.as_ref()) {
+                                        Ok(text) => json!(text),
+                                        Err(_) => {
+                                            variant_value(value, None, database, &import_refs)?
+                                        }
+                                    }
+                                }
+                                _ => variant_value(value, None, database, &import_refs)?,
+                            };
+                            record.attributes.insert(name.clone(), value);
                         }
-                        _ => variant_value(value, None, database, &import_refs)?,
+                        continue;
+                    }
+                    let (canonical, descriptor, raw_default, default) = match property_metadata
+                        .entry(metadata_key)
+                    {
+                        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            let canonical =
+                                rbx_logical_property_name(database, node.class.as_str(), key)
+                                    .unwrap_or(key);
+                            let descriptor =
+                                rbx_model_property_descriptor(database, node.class.as_str(), key)
+                                    .or_else(|| {
+                                        rbx_property_descriptor(
+                                            database,
+                                            node.class.as_str(),
+                                            canonical,
+                                        )
+                                    });
+                            let raw_default = if elide_defaults {
+                                database.classes.get(node.class.as_str()).and_then(|class| {
+                                    database
+                                        .find_default_property(class, canonical)
+                                        .or_else(|| database.find_default_property(class, key))
+                                })
+                            } else {
+                                None
+                            };
+                            let default = raw_default
+                                .map(|value| {
+                                    variant_value(value, descriptor, database, &import_refs)
+                                })
+                                .transpose()?;
+                            entry.insert((canonical.to_string(), descriptor, raw_default, default))
+                        }
                     };
-                    record.attributes.insert(name.clone(), value);
+                    let descriptor = *descriptor;
+                    // Most decoded properties are defaults. Avoid allocating their JSON
+                    // only when both sides take the identical conversion path; source,
+                    // tags and unknown-type normalization retain their full comparison.
+                    if descriptor.is_some()
+                        && key != "Source"
+                        && !matches!(value, Variant::Tags(_))
+                        && *raw_default == Some(value)
+                    {
+                        continue;
+                    }
+                    if elide_defaults
+                        && descriptor.is_some()
+                        && matches!(value, Variant::Ref(target) if *target == Ref::none())
+                    {
+                        continue;
+                    }
+                    let value = if key == "Source" {
+                        match value {
+                            Variant::String(source) if elide_defaults => json!(String::from_utf8(
+                                normalized_source_bytes(source.as_bytes()).collect()
+                            )?),
+                            Variant::String(source) => json!(source),
+                            _ => variant_value(value, descriptor, database, &import_refs)?,
+                        }
+                    } else if elide_defaults && let Variant::Tags(tags) = value {
+                        json!(tags.iter().collect::<BTreeSet<_>>())
+                    } else if elide_defaults
+                        && descriptor.is_none()
+                        && let Variant::BinaryString(bytes) = value
+                        && let Ok(text) = std::str::from_utf8(bytes.as_ref())
+                    {
+                        // An unknown RBXL string has no text/binary type metadata.
+                        json!(text)
+                    } else if elide_defaults
+                        && descriptor.is_none()
+                        && let Variant::EnumItem(item) = value
+                    {
+                        // Unknown property enums carry only their number in both file formats.
+                        variant_value(
+                            &Variant::Enum(rbx_dom_weak::types::Enum::from_u32(item.value)),
+                            None,
+                            database,
+                            &import_refs,
+                        )?
+                    } else {
+                        variant_value(value, descriptor, database, &import_refs)?
+                    };
+                    if default.as_ref() == Some(&value) {
+                        continue;
+                    }
+                    let output_name = if elide_defaults {
+                        canonical.as_str()
+                    } else {
+                        key
+                    };
+                    match record.properties.entry(output_name.to_string()) {
+                        serde_json::map::Entry::Vacant(entry) => {
+                            entry.insert(value);
+                        }
+                        serde_json::map::Entry::Occupied(entry) if entry.get() != &value => {
+                            bail!(
+                                "{} contains conflicting aliases for property {output_name}",
+                                node.name
+                            );
+                        }
+                        _ => {}
+                    }
                 }
-                continue;
-            }
-            let canonical =
-                rbx_logical_property_name(database, node.class.as_str(), key).unwrap_or(key);
-            let descriptor = rbx_model_property_descriptor(database, node.class.as_str(), key)
-                .or_else(|| rbx_property_descriptor(database, node.class.as_str(), canonical));
-            if elide_defaults
-                && descriptor.is_some()
-                && matches!(value, Variant::Ref(target) if *target == Ref::none())
-            {
-                continue;
-            }
-            let value = if key == "Source" {
-                match value {
-                    Variant::String(source) if elide_defaults => json!(String::from_utf8(
-                        normalized_source_bytes(source.as_bytes()).collect()
-                    )?),
-                    Variant::String(source) => json!(source),
-                    _ => variant_value(value, descriptor, database, &import_refs)?,
-                }
-            } else if elide_defaults && let Variant::Tags(tags) = value {
-                json!(tags.iter().collect::<BTreeSet<_>>())
-            } else if elide_defaults
-                && descriptor.is_none()
-                && let Variant::BinaryString(bytes) = value
-                && let Ok(text) = std::str::from_utf8(bytes.as_ref())
-            {
-                // An unknown RBXL string has no text/binary type metadata.
-                json!(text)
-            } else if elide_defaults
-                && descriptor.is_none()
-                && let Variant::EnumItem(item) = value
-            {
-                // Unknown property enums carry only their number in both file formats.
-                variant_value(
-                    &Variant::Enum(rbx_dom_weak::types::Enum::from_u32(item.value)),
-                    None,
-                    database,
-                    &import_refs,
-                )?
-            } else {
-                variant_value(value, descriptor, database, &import_refs)?
-            };
-            if elide_defaults
-                && let Some(default) = database.classes.get(node.class.as_str()).and_then(|class| {
-                    database
-                        .find_default_property(class, canonical)
-                        .or_else(|| database.find_default_property(class, key))
-                })
-                && variant_value(default, descriptor, database, &import_refs)? == value
-            {
-                continue;
-            }
-            let output_name = if elide_defaults { canonical } else { key };
-            match record.properties.entry(output_name.to_string()) {
-                serde_json::map::Entry::Vacant(entry) => {
-                    entry.insert(value);
-                }
-                serde_json::map::Entry::Occupied(entry) if entry.get() != &value => {
-                    bail!(
-                        "{} contains conflicting aliases for property {output_name}",
-                        node.name
-                    );
-                }
-                _ => {}
-            }
-        }
-        instances.push(record);
-    }
+                Ok(record)
+            },
+        )
+        .collect::<Result<Vec<_>>>()?;
     let mut document = SettingsBytecode {
         version: SETTINGS_BINARY_VERSION,
         instances,
@@ -251,7 +303,16 @@ fn changed_fields(
     after: &Map<String, Value>,
     values: bool,
 ) -> Vec<Value> {
-    before.keys().chain(after.keys()).collect::<BTreeSet<_>>().into_iter().filter(|name| before.get(*name) != after.get(*name)).map(|name| {
+    if before == after {
+        return Vec::new();
+    }
+    let mut names = before
+        .iter()
+        .filter_map(|(name, value)| (after.get(name) != Some(value)).then_some(name))
+        .collect::<Vec<_>>();
+    names.extend(after.keys().filter(|name| !before.contains_key(*name)));
+    names.sort_unstable();
+    names.into_iter().map(|name| {
         if values {
             json!({"name":name,"before":before.get(name),"after":after.get(name),"beforePresent":before.contains_key(name),"afterPresent":after.contains_key(name)})
         } else {
@@ -266,13 +327,34 @@ pub(super) fn compare(
     services: &BTreeSet<String>,
     args: &ComparePlaceArgs,
 ) -> Result<Value> {
-    let before = document(before, "before", Some(services), true)?;
-    let mut after = document(after, "after", Some(services), true)?;
+    let started = Instant::now();
+    let (before, after) = rayon::join(
+        || document(before, "before", Some(services), true),
+        || document(after, "after", Some(services), true),
+    );
+    let before = before?;
+    let mut after = after?;
+    log_global(
+        4,
+        format_args!(
+            "[renium] place comparison documents: {:.1}ms",
+            started.elapsed().as_secs_f64() * 1000.0
+        ),
+    );
+    let started = Instant::now();
     if !align_settings_ids_to_reference(&before, &mut after) {
         bail!(
             "Cannot match duplicate instance identities safely; inspect the ambiguous subtrees with `rbx v FILE --json`"
         );
     }
+    log_global(
+        4,
+        format_args!(
+            "[renium] place comparison identity: {:.1}ms",
+            started.elapsed().as_secs_f64() * 1000.0
+        ),
+    );
+    let started = Instant::now();
     let before_ids = before
         .instances
         .iter()
@@ -287,8 +369,35 @@ pub(super) fn compare(
     } else {
         args.limit.get()
     };
-    for (index, instance) in after.instances.iter().enumerate() {
-        let Some(&previous) = before_ids.get(instance.settings_id.as_str()) else {
+    // Compare records independently; emit in file order so limits and reports
+    // remain deterministic, including duplicate sibling identities.
+    let compare_record = |instance: &SettingsBytecodeInstance| {
+        before_ids
+            .get(instance.settings_id.as_str())
+            .map(|&previous| {
+                let old = &before.instances[previous];
+                (
+                    previous,
+                    changed_fields(&old.properties, &instance.properties, args.values),
+                    changed_fields(&old.attributes, &instance.attributes, args.values),
+                )
+            })
+    };
+    let records = if after.instances.len() >= 2_048 {
+        after
+            .instances
+            .par_iter()
+            .map(compare_record)
+            .collect::<Vec<_>>()
+    } else {
+        after
+            .instances
+            .iter()
+            .map(compare_record)
+            .collect::<Vec<_>>()
+    };
+    for (index, (instance, record)) in after.instances.iter().zip(records).enumerate() {
+        let Some((previous, properties, attributes)) = record else {
             added += 1;
             if differences.len() < limit {
                 let mut entry = json!({"kind":"added","after":location(&after, index)});
@@ -301,9 +410,6 @@ pub(super) fn compare(
             continue;
         };
         matched[previous] = true;
-        let old = &before.instances[previous];
-        let properties = changed_fields(&old.properties, &instance.properties, args.values);
-        let attributes = changed_fields(&old.attributes, &instance.attributes, args.values);
         if properties.is_empty() && attributes.is_empty() {
             unchanged += 1;
         } else {
@@ -326,7 +432,27 @@ pub(super) fn compare(
             }
         }
     }
-    Ok(
-        json!({"ok":true,"scope":"full","direction":"input -> target","services":services,"matches":added+removed+changed == 0,"beforeInstances":before.instances.len(),"afterInstances":after.instances.len(),"added":added,"removed":removed,"changed":changed,"unchanged":unchanged,"differenceCount":added+removed+changed,"truncated":added+removed+changed > differences.len(),"differences":differences}),
-    )
+    log_global(
+        4,
+        format_args!(
+            "[renium] place comparison differences: {:.1}ms",
+            started.elapsed().as_secs_f64() * 1000.0
+        ),
+    );
+    let result = json!({"ok":true,"scope":"full","direction":"input -> target","services":services,"matches":added+removed+changed == 0,"beforeInstances":before.instances.len(),"afterInstances":after.instances.len(),"added":added,"removed":removed,"changed":changed,"unchanged":unchanged,"differenceCount":added+removed+changed,"truncated":added+removed+changed > differences.len(),"differences":differences});
+    drop(before_ids);
+    let started = Instant::now();
+    before
+        .instances
+        .into_par_iter()
+        .chain(after.instances)
+        .for_each(drop);
+    log_global(
+        4,
+        format_args!(
+            "[renium] place comparison document release: {:.1}ms",
+            started.elapsed().as_secs_f64() * 1000.0
+        ),
+    );
+    Ok(result)
 }

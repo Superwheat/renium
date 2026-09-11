@@ -35,17 +35,79 @@ fn build_windows(out_dir: &Path) {
     command.arg(&source);
     command.arg(format!("/Fo{}\\", out_dir.display()));
     command.arg(format!("/Fe{}", output.display()));
-    command.args(["/link", "/INCREMENTAL:NO", "/Brepro"]);
+    command.args(["/link", "/INCREMENTAL:NO", "/Brepro", "user32.lib"]);
     command.arg(format!(
         "/IMPLIB:{}",
         out_dir.join("renium-studio-helper.lib").display()
     ));
     run(&mut command, "Windows Studio helper build");
+    let launch_source = PathBuf::from("native").join("renium_launch_windows.cpp");
+    let mut launch_command = compiler.to_command();
+    launch_command.args([
+        "/nologo",
+        "/LD",
+        "/O2",
+        "/EHsc",
+        "/std:c++20",
+        "/MT",
+        "/DUNICODE",
+        "/D_UNICODE",
+    ]);
+    launch_command.arg(&launch_source);
+    launch_command.arg(format!("/Fo{}\\", out_dir.display()));
+    launch_command.arg(format!(
+        "/Fe{}",
+        out_dir.join("renium-launch.dll").display()
+    ));
+    launch_command.args([
+        "/link",
+        "/INCREMENTAL:NO",
+        "/Brepro",
+        "user32.lib",
+        "comctl32.lib",
+    ]);
+    launch_command.arg(format!(
+        "/IMPLIB:{}",
+        out_dir.join("renium-launch.lib").display()
+    ));
+    run(&mut launch_command, "Windows background launch guard build");
+    let launch_test = PathBuf::from("native/tests/launch_policy_windows.cpp");
+    let mut test_command = compiler.to_command();
+    test_command.args([
+        "/nologo",
+        "/O2",
+        "/EHsc",
+        "/std:c++20",
+        "/MT",
+        "/DUNICODE",
+        "/D_UNICODE",
+    ]);
+    test_command.arg(&launch_test);
+    test_command.arg(format!("/Fo{}\\", out_dir.display()));
+    test_command.arg(format!(
+        "/Fe{}",
+        out_dir.join("renium-launch-policy-test.exe").display()
+    ));
+    test_command.args(["/link", "/INCREMENTAL:NO", "user32.lib", "comctl32.lib"]);
+    run(
+        &mut test_command,
+        "Windows background launch regression build",
+    );
+    println!("cargo:rerun-if-changed={}", launch_test.display());
+    println!("cargo:rerun-if-changed={}", launch_source.display());
+    println!("cargo:rerun-if-changed=native/renium_launch_windows_process.h");
     println!("cargo:rerun-if-changed={}", source.display());
+    println!("cargo:rerun-if-changed=native/renium_studio_reader.h");
+    println!("cargo:rerun-if-changed=native/renium_studio_observation.h");
+    println!("cargo:rerun-if-changed=native/renium_studio_history.h");
+    println!("cargo:rerun-if-changed=native/renium_studio_terrain.h");
+    println!("cargo:rerun-if-changed=native/renium_terrain_observation.h");
+    println!("cargo:rerun-if-changed=native/renium_terrain_grid.h");
 }
 
 fn build_macos(out_dir: &Path) {
     let helper_source = PathBuf::from("native").join("renium_studio_helper_macos.cpp");
+    let launch_guard_source = PathBuf::from("native").join("renium_launch_macos.mm");
     let launcher_source = PathBuf::from("native").join("renium_studio_launcher_macos.c");
     let shield_source = PathBuf::from("native").join("renium_input_shield_macos.m");
     let helper = out_dir.join("renium-studio-helper.dylib");
@@ -63,10 +125,15 @@ fn build_macos(out_dir: &Path) {
         "-pthread",
         "-framework",
         "CoreFoundation",
+        "-framework",
+        "AppKit",
         "-Wl,-dead_strip",
         "-o",
     ]);
-    helper_command.arg(&helper).arg(&helper_source);
+    helper_command
+        .arg(&helper)
+        .arg(&helper_source)
+        .arg(&launch_guard_source);
     run(&mut helper_command, "macOS Studio helper build");
     let mut launcher_command = Command::new("clang");
     launcher_command.args([
@@ -95,8 +162,14 @@ fn build_macos(out_dir: &Path) {
     shield_command.arg(&shield).arg(&shield_source);
     run(&mut shield_command, "macOS input shield build");
     println!("cargo:rerun-if-changed={}", helper_source.display());
+    println!("cargo:rerun-if-changed={}", launch_guard_source.display());
     println!("cargo:rerun-if-changed={}", launcher_source.display());
     println!("cargo:rerun-if-changed={}", shield_source.display());
+    println!("cargo:rerun-if-changed=native/renium_studio_history.h");
+    println!("cargo:rerun-if-changed=native/renium_studio_terrain.h");
+    println!("cargo:rerun-if-changed=native/renium_terrain_observation.h");
+    println!("cargo:rerun-if-changed=native/renium_terrain_grid.h");
+    println!("cargo:rerun-if-changed=native/renium_signed_code_macos.h");
 }
 
 fn build_linux(out_dir: &Path) {

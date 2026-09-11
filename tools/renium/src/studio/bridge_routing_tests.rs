@@ -2,6 +2,8 @@ use super::*;
 
 fn fixture() -> BridgeServer {
     BridgeServer {
+        #[cfg(any(windows, target_os = "macos"))]
+        verified_full_pushes: Default::default(),
         channels: (0..2)
             .map(|port| {
                 Arc::new(BridgeChannel {
@@ -22,6 +24,38 @@ fn fixture() -> BridgeServer {
         desired_device_request: Default::default(),
         performance_manager: None,
     }
+}
+
+#[test]
+fn parallel_transfer_workers_keep_parent_lease_ownership_and_cancellation() {
+    let bridge = fixture();
+    let lease = Arc::new(BridgeRequestLease::new("native-transfer".into()));
+    let parent = bridge.activate_request_lease(Arc::clone(&lease)).unwrap();
+    thread::scope(|scope| {
+        for _ in 0..4 {
+            let bridge = &bridge;
+            let lease = Arc::clone(&lease);
+            scope.spawn(move || {
+                for _ in 0..20 {
+                    let inherited = bridge.inherit_request_lease(Arc::clone(&lease)).unwrap();
+                    assert!(Arc::ptr_eq(&bridge.active_request_lease().unwrap(), &lease));
+                    assert!(bridge.inherit_request_lease(Arc::clone(&lease)).is_err());
+                    drop(inherited);
+                    assert!(bridge.active_request_lease().is_none());
+                }
+            });
+        }
+    });
+    assert_eq!(bridge.active_request_leases.lock().unwrap().len(), 1);
+    assert!(
+        lease.cancel(),
+        "worker cleanup must not disarm the parent lease"
+    );
+    thread::scope(|scope| {
+        scope.spawn(|| assert!(bridge.inherit_request_lease(Arc::clone(&lease)).is_err()));
+    });
+    drop(parent);
+    assert!(bridge.active_request_leases.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -387,6 +421,17 @@ fn an_expired_send_budget_writes_no_request() {
 }
 
 fn listening_fixture() -> BridgeServer {
+    listening_fixture_with_preparation(
+        #[cfg(any(windows, target_os = "macos"))]
+        None,
+    )
+}
+
+fn listening_fixture_with_preparation(
+    #[cfg(any(windows, target_os = "macos"))] native_preparation: Option<
+        Arc<NativeConnectionPreparation>,
+    >,
+) -> BridgeServer {
     let mut bridge = fixture();
     let mut listeners = Vec::new();
     bridge.channels = (0..2)
@@ -417,6 +462,8 @@ fn listening_fixture() -> BridgeServer {
         update_checked_runtimes: Default::default(),
         #[cfg(any(windows, target_os = "macos"))]
         check_updates_on_connect: false,
+        #[cfg(any(windows, target_os = "macos"))]
+        native_preparation,
     };
     for (channel, listener) in bridge.channels.iter().zip(listeners) {
         BridgeServer::spawn_accept_loop(
@@ -486,6 +533,86 @@ fn respond(mut peer: WebSocket<TcpStream>, result: Value) -> thread::JoinHandle<
     })
 }
 
+#[cfg(windows)]
+#[test]
+fn native_connection_preparation_does_not_block_registration_or_other_places() {
+    let (entered, entries) = std::sync::mpsc::channel();
+    let (resume, resumed) = std::sync::mpsc::channel();
+    let resumed = Mutex::new(resumed);
+    let first = AtomicBool::new(true);
+    let preparation = Arc::new(NativeConnectionPreparation {
+        pending: Default::default(),
+        prepare: Box::new(move |pid, title| {
+            assert_eq!(pid, std::process::id());
+            entered.send(title.to_owned()).unwrap();
+            if title == "place-1" && first.swap(false, Ordering::SeqCst) {
+                resumed
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap();
+                bail!("fixture discovery failure");
+            }
+            Ok(())
+        }),
+    });
+    let bridge = listening_fixture_with_preparation(Some(Arc::clone(&preparation)));
+    let _first_peer = handshake(&bridge, 0, &edit_info("native-one", 1)).unwrap();
+    assert_eq!(
+        entries.recv_timeout(Duration::from_secs(1)).unwrap(),
+        "place-1"
+    );
+    // A second channel joins the same runtime while its native scan is blocked.
+    let _same = handshake(&bridge, 1, &edit_info("native-one", 1)).unwrap();
+    let other = handshake(&bridge, 0, &edit_info("native-two", 2)).unwrap();
+    assert_eq!(
+        entries.recv_timeout(Duration::from_secs(1)).unwrap(),
+        "place-2"
+    );
+    let responder = respond(other, json!({"working": true}));
+    assert_eq!(
+        bridge
+            .call_for_runtime_with_timeout(
+                "getStudioState",
+                json!({}),
+                BridgeTarget::Edit,
+                "native-two",
+                Some(Duration::from_secs(1))
+            )
+            .unwrap(),
+        json!({"working": true})
+    );
+    let _play = handshake(&bridge, 1, &client_info("native-play", "manual")).unwrap();
+    assert!(
+        entries.try_recv().is_err(),
+        "play or duplicate channel started native discovery"
+    );
+    resume.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while preparation.pending.lock().unwrap().contains("native-one") {
+        assert!(Instant::now() < deadline);
+        thread::yield_now();
+    }
+    let _reconnect = handshake(&bridge, 0, &edit_info("native-one", 1)).unwrap();
+    assert_eq!(
+        entries.recv_timeout(Duration::from_secs(1)).unwrap(),
+        "place-1",
+        "failed preparation prevented reconnect discovery"
+    );
+    bridge.alive.store(false, Ordering::SeqCst);
+    for channel in &bridge.channels {
+        for connection in channel.sockets.lock().unwrap().values() {
+            preparation.run(connection, &bridge.alive);
+            connection.close();
+        }
+    }
+    assert!(
+        entries.try_recv().is_err(),
+        "stopped bridge started native discovery"
+    );
+    responder.join().unwrap();
+}
+
 fn edit_info(runtime: &str, place: i64) -> BridgeInfoPayload {
     BridgeInfoPayload {
         runtime_id: runtime.into(),
@@ -499,6 +626,85 @@ fn edit_info(runtime: &str, place: i64) -> BridgeInfoPayload {
         compact_value_protocol_version: "compact-v5-schema-4".into(),
         ..Default::default()
     }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+#[test]
+fn cached_runtime_metadata_is_exact_and_available_during_commands() {
+    let bridge = fixture();
+    let _first = connect(&bridge, 0, edit_info("metadata-one", 1));
+    let _second = connect(&bridge, 1, edit_info("metadata-two", 2));
+    let channel = &bridge.channels[0];
+    let connection = channel
+        .sockets
+        .lock()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    let busy = connection.io.lock().unwrap();
+    for (runtime, name) in [("metadata-one", "place-1"), ("metadata-two", "place-2")] {
+        assert_eq!(
+            bridge
+                .cached_bridge_info_for_runtime(BridgeTarget::Edit, runtime)
+                .unwrap()
+                .place_name,
+            name
+        );
+    }
+    assert!(
+        bridge
+            .cached_bridge_info_for_runtime(BridgeTarget::Edit, "missing")
+            .is_err()
+    );
+    assert!(
+        bridge
+            .cached_bridge_info_for_runtime(BridgeTarget::Client, "metadata-one")
+            .is_err()
+    );
+    drop(busy);
+    let registry = channel.sockets.lock().unwrap();
+    std::thread::scope(|scope| {
+        let (send, receive) = std::sync::mpsc::channel();
+        let bridge = &bridge;
+        scope.spawn(move || {
+            send.send(bridge.cached_bridge_info_for_runtime(BridgeTarget::Edit, "metadata-one"))
+                .unwrap();
+        });
+        assert!(
+            receive.recv_timeout(Duration::from_millis(20)).is_err(),
+            "A short registry update must not report a missing Studio runtime"
+        );
+        drop(registry);
+        assert_eq!(
+            receive
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap()
+                .place_name,
+            "place-1"
+        );
+    });
+    bridge.retire_runtime("metadata-one");
+    assert!(
+        bridge
+            .cached_bridge_info_for_runtime(BridgeTarget::Edit, "metadata-one")
+            .is_err()
+    );
+    assert!(
+        bridge
+            .cached_bridge_info_for_runtime(BridgeTarget::Edit, "metadata-two")
+            .is_ok()
+    );
+    for socket in bridge.channels[1].sockets.lock().unwrap().values() {
+        socket.close();
+    }
+    assert!(
+        bridge
+            .cached_bridge_info_for_runtime(BridgeTarget::Edit, "metadata-two")
+            .is_err()
+    );
 }
 
 #[test]
@@ -741,6 +947,119 @@ fn busy_places_do_not_block_other_places_registration_readiness_or_requests() {
 }
 
 #[test]
+fn cancelled_observers_release_occupied_channels_without_a_spare_socket() {
+    let bridge = Arc::new(fixture());
+    let (received, wait_received) = std::sync::mpsc::channel();
+    let mut responders = Vec::new();
+    for channel in 0..2 {
+        let stream = connect(&bridge, channel, edit_info("observer", 1));
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut peer =
+            WebSocket::from_raw_socket(stream, tungstenite::protocol::Role::Client, None);
+        let received = received.clone();
+        responders.push(thread::spawn(move || {
+            for cycle in 0..30 {
+                let request: Value =
+                    serde_json::from_str(peer.read().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(request["method"], "getStudioChangeState");
+                received.send(()).unwrap();
+                let cancel: Value =
+                    serde_json::from_str(peer.read().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(cancel["method"], "cancelRequestLease");
+                assert_eq!(cancel["params"]["leaseId"], request["lease_id"]);
+                let original =
+                    json!({"id":request["id"],"ok":true,"result":{"waitCancelled":true}});
+                let ack = json!({"id":cancel["id"],"ok":true,"result":{"ok":true}});
+                let responses = if cycle % 2 == 0 {
+                    [original, ack]
+                } else {
+                    [ack, original]
+                };
+                for response in responses {
+                    peer.send(Message::Text(response.to_string().into()))
+                        .unwrap();
+                }
+            }
+        }));
+    }
+    for cycle in 0..30 {
+        let mut callers = Vec::new();
+        for index in 0..2 {
+            let lease = Arc::new(BridgeRequestLease::new(format!("observer-{cycle}-{index}")));
+            let active = Arc::clone(&lease);
+            let bridge = Arc::clone(&bridge);
+            let caller = thread::spawn(move || {
+                let _lease = bridge.activate_request_lease(active)?;
+                bridge.call_for_runtime_with_timeout(
+                    "getStudioChangeState",
+                    json!({"start":false,"waitSeconds":25}),
+                    BridgeTarget::Edit,
+                    "observer",
+                    Some(Duration::from_secs(2)),
+                )
+            });
+            callers.push((lease, caller));
+        }
+        for _ in 0..2 {
+            wait_received.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        // Stop a third observer before it can acquire either occupied channel.
+        let queued_lease = Arc::new(BridgeRequestLease::new(format!("queued-{cycle}")));
+        let queued_active = Arc::clone(&queued_lease);
+        let queued_bridge = Arc::clone(&bridge);
+        let (armed, wait_armed) = std::sync::mpsc::channel();
+        let queued = thread::spawn(move || {
+            let _lease = queued_bridge.activate_request_lease(queued_active)?;
+            armed.send(()).unwrap();
+            queued_bridge.call_for_runtime_with_timeout(
+                "getStudioChangeState",
+                json!({"start":false,"waitSeconds":25}),
+                BridgeTarget::Edit,
+                "observer",
+                Some(Duration::from_secs(2)),
+            )
+        });
+        wait_armed.recv_timeout(Duration::from_secs(2)).unwrap();
+        queued_lease.cancel();
+        assert!(
+            queued
+                .join()
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
+        );
+        let started = Instant::now();
+        for (lease, _) in &callers {
+            lease.cancel();
+        }
+        for (lease, caller) in callers {
+            assert_eq!(caller.join().unwrap().unwrap()["waitCancelled"], true);
+            assert!(
+                bridge.activate_request_lease(lease).is_err(),
+                "cancelled observer dispatched again"
+            );
+        }
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(bridge.active_request_leases.lock().unwrap().is_empty());
+        for channel in &bridge.channels {
+            let sockets = channel.sockets.lock().unwrap();
+            for connection in sockets.values() {
+                assert!(
+                    connection.io.try_lock().is_ok(),
+                    "cancel returned before channel release"
+                );
+            }
+        }
+    }
+    for responder in responders {
+        responder.join().unwrap();
+    }
+}
+
+#[test]
 fn busy_runtime_keeps_its_connected_channel_count() {
     let bridge = Arc::new(listening_fixture());
     let a = hold_request(
@@ -883,7 +1202,7 @@ fn retiring_an_in_flight_connection_does_not_wait_for_the_reconnect_timeout() {
 }
 
 #[test]
-fn parallel_status_requests_keep_their_place_and_leave_foreground_pins_untouched() {
+fn parallel_status_and_edit_profiling_leave_foreground_routing_untouched() {
     use crate::automation::authorization::signed_fixture_request;
     use crate::automation::{State, runtime::automation_parse_response_with_lease};
     struct Project(std::path::PathBuf);
@@ -915,7 +1234,7 @@ fn parallel_status_requests_keep_their_place_and_leave_foreground_pins_untouched
         for port in 0..2 {
             responders.push(respond(
                 handshake(&bridge, port, &edit_info(&runtime, place)).unwrap(),
-                json!({"placeId": place, "playRunning": false, "playStarting": false}),
+                json!({"runtimeId":runtime, "placeId": place, "playRunning": false, "playStarting": false}),
             ));
         }
         let response = automation_parse_response_with_lease(
@@ -940,10 +1259,13 @@ fn parallel_status_requests_keep_their_place_and_leave_foreground_pins_untouched
         contexts.push((place, response.r.unwrap()["id"].as_u64().unwrap()));
     }
     bridge.pin_runtime(BridgeTarget::Edit, "foreground-operation");
+    let gate = bridge.acquire_request_gate();
+    let (completed, completions) = std::sync::mpsc::channel();
     thread::scope(|scope| {
         for (place, context) in contexts {
             let bridge = &bridge;
             let state = &state;
+            let completed = completed.clone();
             scope.spawn(move || {
                 for id in 10..110 {
                     let response = automation_parse_response_with_lease(
@@ -968,9 +1290,80 @@ fn parallel_status_requests_keep_their_place_and_leave_foreground_pins_untouched
                     assert_eq!(result["selected"], format!("status-{place}"));
                     assert_eq!(result["studioState"]["placeId"], place, "{result}");
                     assert_eq!(result["playState"], "stopped");
+                    let response = automation_parse_response_with_lease(
+                        &signed_fixture_request(
+                            state,
+                            json!({
+                                "v":1, "id":id+400, "op":14, "cx":context,
+                                "p":{"manageFiles":false,"compact":true,"eventWaitSeconds":0.01}
+                            }),
+                        ),
+                        state,
+                        bridge,
+                        0.1,
+                        None,
+                    );
+                    assert_eq!(
+                        response.ok,
+                        1,
+                        "{}",
+                        serde_json::to_string(&response).unwrap()
+                    );
+                    assert_eq!(response.r.unwrap()["runtimeId"], format!("status-{place}"));
                 }
+                for (id, action) in ["snapshot", "micro-start", "micro", "micro-stop"]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let response = automation_parse_response_with_lease(
+                        &signed_fixture_request(
+                            state,
+                            json!({
+                                "v":1, "id":id+200, "op":101, "cx":context,
+                                "p":{"action":action}
+                            }),
+                        ),
+                        state,
+                        bridge,
+                        0.1,
+                        None,
+                    );
+                    assert_eq!(
+                        response.ok,
+                        1,
+                        "{}",
+                        serde_json::to_string(&response).unwrap()
+                    );
+                    assert_eq!(response.r.unwrap()["runtimeId"], format!("status-{place}"));
+                }
+                // Both fail before HTTP: invalid scope, then a mock Studio
+                // without a creator ID. Neither may change another request's target.
+                for (scope_name, code) in [("invalid", "bad_req"), ("user", "unsupported")] {
+                    let response = automation_parse_response_with_lease(
+                        &signed_fixture_request(
+                            state,
+                            json!({
+                                "v":1, "id":900, "op":91, "cx":context,
+                                "p":{"scope":scope_name}
+                            }),
+                        ),
+                        state,
+                        bridge,
+                        0.1,
+                        None,
+                    );
+                    assert_eq!(response.ok, 0);
+                    assert_eq!(response.e.unwrap().c, code);
+                }
+                completed.send(()).unwrap();
             });
         }
+        // Release before joining even on regression: the test fails instead of
+        // deadlocking forever behind the intentionally held mutation gate.
+        let all_completed =
+            (0..3).all(|_| completions.recv_timeout(Duration::from_secs(3)).is_ok());
+        drop(gate);
+        assert!(all_completed, "diagnostics waited for the active mutation");
     });
     assert_eq!(
         bridge.runtime_pins.lock().unwrap()
@@ -978,6 +1371,45 @@ fn parallel_status_requests_keep_their_place_and_leave_foreground_pins_untouched
             .runtime_id,
         "foreground-operation"
     );
+    drop(bridge);
+    for responder in responders {
+        responder.join().unwrap();
+    }
+}
+
+#[test]
+fn live_pull_acknowledgments_stay_on_origin_runtime() {
+    let bridge = listening_fixture();
+    let mut responders = Vec::new();
+    for place in 1..=2 {
+        let runtime = format!("ack-{place}");
+        responders.push(respond(
+            handshake(&bridge, 0, &edit_info(&runtime, place)).unwrap(),
+            json!({"runtimeId":runtime}),
+        ));
+    }
+    for cycle in 0..100 {
+        // File publication releases the mutation gate before acknowledging.
+        // Another place can own the foreground selection by this point.
+        let foreground = format!("ack-{}", cycle % 2 + 1);
+        let origin = format!("ack-{}", (cycle + 1) % 2 + 1);
+        bridge.pin_runtime(BridgeTarget::Edit, &foreground);
+        let result = crate::automation::runtime::acknowledge_pulled_changes(
+            &bridge,
+            &["ServerStorage".into()],
+            cycle,
+            &origin,
+        )
+        .unwrap();
+        assert_eq!(result["runtimeId"], origin);
+        assert_eq!(
+            bridge
+                .runtime_pin_for_selector(BridgeTarget::Edit, None)
+                .unwrap()
+                .runtime_id,
+            foreground
+        );
+    }
     drop(bridge);
     for responder in responders {
         responder.join().unwrap();

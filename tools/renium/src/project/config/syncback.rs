@@ -99,6 +99,10 @@ fn create_adapter_stage(loaded: &LoadedProject, name: &str) -> Result<Projection
         &loaded.root.join(".renium").join("build-staging"),
         &format!("adapter-{name}-"),
     )?;
+    crate::project::storage::copy_stores_to_stage(
+        &loaded.root.join(&loaded.project.source_root),
+        &root,
+    )?;
     if let Some(source_root) = loaded
         .root
         .join(&loaded.project.source_root)
@@ -636,6 +640,26 @@ pub fn syncback_project_projection(
         apply_file_mutations(&planned_writes, &removals)?;
     }
     Ok(changed)
+}
+
+pub(crate) fn projected_settings_writes(
+    loaded: &LoadedProject,
+    projection_root: &Path,
+) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
+    let mut writes = BTreeMap::new();
+    syncback_project_projection_into(
+        loaded,
+        projection_root,
+        false,
+        &mut writes,
+        &mut BTreeSet::new(),
+    )?;
+    writes.retain(|path, _| {
+        path.file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(is_service_settings_file_name)
+    });
+    Ok(writes)
 }
 
 fn syncback_project_projection_into(
@@ -1289,7 +1313,10 @@ fn reverse_owners(loaded: &LoadedProject) -> Result<Vec<ReverseOwner>> {
     for mount in &loaded.project.mounts {
         let target = target_segments(&mount.target)?;
         let source = loaded.root.join(&mount.source);
-        if mount.optional && !source.exists() {
+        if mount.optional
+            && !source.exists()
+            && !crate::project::storage::source_directory_exists(&source)
+        {
             continue;
         }
         let ignore_unknown_instances = if is_nested_project_path(&source) && source.is_file() {
@@ -2133,7 +2160,7 @@ fn restore_project_owned_fields(
     destination: &Path,
     output: &mut SettingsBytecode,
 ) -> Result<()> {
-    let mut canonical = if destination.is_dir() {
+    let mut canonical = if crate::project::storage::source_directory_exists(destination) {
         let settings = service_settings_path(destination);
         settings
             .is_file()

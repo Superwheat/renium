@@ -24,10 +24,6 @@ export const DEFAULT_SYNC_SERVICES = [
   "Teams",
   "SoundService",
   "VoiceChatService",
-] as const;
-
-const EXPLORER_SERVICE_ORDER = [
-  ...DEFAULT_SYNC_SERVICES,
   "TextChatService",
   "TestService",
   "LocalizationService",
@@ -43,11 +39,11 @@ const EXPLORER_CLASS_RANK = [
 ] as const;
 
 const explorerServiceOrder = new Map<string, number>(
-  EXPLORER_SERVICE_ORDER.map((className, index) => [className, index] as const),
+  DEFAULT_SYNC_SERVICES.map((className, index) => [className, index] as const),
 );
 
 const explorerServiceNames = new Map<string, string>(
-  EXPLORER_SERVICE_ORDER.map((className) => [className.toLowerCase(), className] as const),
+  DEFAULT_SYNC_SERVICES.map((className) => [className.toLowerCase(), className] as const),
 );
 
 const explorerClassRank = new Map<string, number>(

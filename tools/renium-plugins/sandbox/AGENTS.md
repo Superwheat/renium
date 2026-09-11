@@ -1,10 +1,10 @@
-# Sandbox workflow
+# Sandbox
 
-Use this only when the task needs an isolated Studio runtime. For source, constants, syntax and saved data, use offline checks. Acquiring a slot does not justify starting Play.
+Use a sandbox only when the task needs an isolated Studio runtime for the current worktree. Saved code and data still use offline checks; owning a slot is not a reason to start Play.
 
-The user must first configure `pool.json` and a dedicated API key; see README.md. Never borrow a production experience or broaden key permissions yourself.
+The user configures `pool.json` and an API key first (see README.md). Never borrow a production experience or widen key permissions yourself.
 
-From the associated project/worktree:
+From the worktree, with one stable task ID (`--session`, `RENIUM_SESSION_ID` or `CODEX_THREAD_ID`):
 
 ```powershell
 rbx sandbox --session TASK_ID acquire
@@ -12,9 +12,11 @@ rbx sandbox --session TASK_ID prepare --slot slot-1
 rbx sandbox --session TASK_ID run --slot slot-1 --args '["status"]'
 ```
 
-Reuse one stable task ID. `RENIUM_SESSION_ID` or the host's `CODEX_THREAD_ID` can supply it. Continue `prepare` as its result directs; while Studio is connecting, don't busy-poll. Do not send runtime commands until `ready: true`.
+`prepare` publishes a blank place, clears old test data, opens Studio, waits for it to connect and pushes a snapshot of the worktree. Each call makes bounded progress; repeat it until `ready` is true. Do not send runtime commands before that.
 
-Edit the original worktree. After a batch of changes, run `refresh --slot slot-1` before the next runtime test. This replaces the disposable Studio's contents with the current projection. Stop your sandbox Play session first. It does not change the original project's sync binding; Studio edits in the disposable copy do not flow back automatically.
+Edit the original worktree. After a batch of edits, `refresh --slot slot-1` replaces the sandbox contents with the current projection; stop the sandbox Play session first. Studio edits made inside the sandbox do not flow back.
+
+`run --args` takes a JSON array of Renium command tokens with canonical short names (`play`, `l`, `co`, `sc`, `clk`, `perf`, ...). The owned place is bound for you; do not pass `--place` or `--project`. Starting Play or `tst` needs `--reason` naming the runtime question. Read the normal guide for each command and inspect returned captures before claiming a visual result.
 
 ```powershell
 rbx sandbox --session TASK_ID refresh --slot slot-1
@@ -23,8 +25,4 @@ rbx sandbox --session TASK_ID run --slot slot-1 --args '["play","-x"]'
 rbx sandbox --session TASK_ID release --slot slot-1
 ```
 
-`run --args` takes a JSON argument array, not a shell command. It binds the owned target for you. Read the normal Renium guide for each test/capture command. Inspect returned screenshots/recording frames before claiming a visual result. Never enable `LoadStringEnabled` or run `loadstring` for validation.
-
-When done, continue `release` until `released: true`. It stops/closes only the owned sandbox, resets its blank published place and removes test data. A failed command or timeout leaves it reserved. Read the error; don't clear leases, delete journals, take another task's slot or turn an uncertain result into success. A lost launch receipt may require manual recovery before cleanup can safely continue.
-
-This source-only plugin has not been built or live-tested. Do not describe its runtime behavior as verified until the separate acceptance checks in README.md pass.
+When done, repeat `release` until `released` is true. It stops and closes only the owned Studio, republishes the blank place and deletes the run's DataStore, ordered store and MemoryStore data. An error leaves the slot reserved: read the message, fix the cause and run the same command again. Never clear leases, delete journals, pass `--confirm-closed` or take another task's slot; those are the user's decisions.

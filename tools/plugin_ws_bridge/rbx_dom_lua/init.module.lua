@@ -5,6 +5,35 @@ local PropertyDescriptor = require(script.PropertyDescriptor)
 local referencePropertiesByClass = {}
 local objectContentPropertiesByClass = {}
 local writablePropertiesByClass = {}
+local contentPropertyAliasesByClass = {}
+
+local function getContentPropertyAliases(className)
+	local cached = contentPropertyAliasesByClass[className]
+	if cached ~= nil then
+		return cached
+	end
+	local aliases, seen = {}, {}
+	local currentClassName = className
+	repeat
+		local currentClass = database.Classes[currentClassName]
+		if currentClass == nil then
+			break
+		end
+		for name, data in pairs(currentClass.Properties) do
+			if not seen[name] then
+				seen[name] = true
+				local serialization = data.Kind.Canonical and data.Kind.Canonical.Serialization
+				local migration = if type(serialization) == "table" then serialization.Migrate else nil
+				if migration and migration.Migration == "ContentIdToContent" then
+					aliases[string.lower(name)] = migration.To
+				end
+			end
+		end
+		currentClassName = currentClass.Superclass
+	until currentClassName == nil
+	contentPropertyAliasesByClass[className] = aliases
+	return aliases
+end
 
 local function getPropertyNames(className, cache, dataType, skipParent)
 	local cached = cache[className]
@@ -146,6 +175,7 @@ return {
 	findCanonicalPropertyDescriptor = findCanonicalPropertyDescriptor,
 	getReferencePropertyNames = getReferencePropertyNames,
 	getObjectContentPropertyNames = getObjectContentPropertyNames,
+	getContentPropertyAliases = getContentPropertyAliases,
 	getWritablePropertyNames = getWritablePropertyNames,
 	Error = Error,
 	EncodedValue = require(script.EncodedValue),

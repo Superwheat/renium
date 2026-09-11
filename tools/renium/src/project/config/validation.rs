@@ -407,7 +407,7 @@ fn validate_explicit_source_owners(
             continue;
         };
         let service_dir = source_root.join(service);
-        if !service_dir.is_dir() {
+        if !crate::project::storage::source_directory_exists(&service_dir) {
             continue;
         }
         if !source_documents.contains_key(service) {

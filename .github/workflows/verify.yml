@@ -6,6 +6,11 @@ on:
     branches:
       - "**"
   workflow_dispatch:
+    inputs:
+      test_sandbox:
+        description: Run the sandbox plugin test suite
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -27,10 +32,14 @@ jobs:
           components: clippy,rustfmt
 
       - name: Check formatting
-        run: cargo fmt --manifest-path tools/renium/Cargo.toml -- --check
+        run: |
+          cargo fmt --manifest-path tools/renium/Cargo.toml -- --check
+          cargo fmt --manifest-path tools/renium-plugins/sandbox/Cargo.toml -- --check
 
       - name: Run Clippy
-        run: cargo clippy --locked --manifest-path tools/renium/Cargo.toml --all-targets -- -D warnings -D clippy::cognitive_complexity -D clippy::too_many_arguments
+        run: |
+          cargo clippy --locked --manifest-path tools/renium/Cargo.toml --all-targets -- -D warnings -D clippy::cognitive_complexity -D clippy::too_many_arguments
+          cargo clippy --locked --manifest-path tools/renium-plugins/sandbox/Cargo.toml --all-targets -- -D warnings -D clippy::cognitive_complexity -D clippy::too_many_arguments
 
   rust-cross-platform:
     name: Rust tests (${{ matrix.os }})
@@ -46,11 +55,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.95.0
 
       - name: Run CLI tests
-        run: |
-          cargo test --locked --manifest-path tools/renium/Cargo.toml
-          cargo test --locked --manifest-path tools/renium-plugin-sdk/Cargo.toml
-          node tools/renium/tests/launcher-smoke.mjs
-          node tools/renium/tests/package-subobject.mjs
+        run: cargo test --locked --manifest-path tools/renium/Cargo.toml
+
+      - name: Run plugin SDK tests
+        run: cargo test --locked --manifest-path tools/renium-plugin-sdk/Cargo.toml
+
+      - name: Run sandbox plugin tests
+        if: github.event_name == 'workflow_dispatch' && inputs.test_sandbox
+        run: cargo test --locked --manifest-path tools/renium-plugins/sandbox/Cargo.toml
+
+      - name: Test launchers
+        run: node tools/renium/tests/launcher-smoke.mjs
+
+      - name: Test package subobjects
+        run: node tools/renium/tests/package-subobject.mjs
 
   rust-msrv:
     name: Rust 1.89 compatibility
@@ -62,7 +80,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.89.0
 
       - name: Check the minimum Rust version
-        run: cargo check --locked --manifest-path tools/renium/Cargo.toml
+        run: |
+          cargo check --locked --manifest-path tools/renium/Cargo.toml
+          cargo check --locked --manifest-path tools/renium-plugins/sandbox/Cargo.toml
 
   build-and-test:
     name: Windows release build and extension
@@ -88,6 +108,7 @@ jobs:
 
       - name: Build and test the CLI
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
           cargo build --locked --release --manifest-path tools/renium/Cargo.toml
           cargo test --locked --release --manifest-path tools/renium/Cargo.toml
           node tools/renium/tests/automation-replay.mjs tools/renium/target/release/renium.exe
@@ -96,6 +117,7 @@ jobs:
 
       - name: Build both Studio plugin formats
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
           $pluginXml = Join-Path $env:RUNNER_TEMP "Renium.rbxmx"
           $pluginBinary = Join-Path $env:RUNNER_TEMP "Renium.rbxm"
           rojo build tools/plugin_ws_bridge/Renium.project.json --output $pluginXml
@@ -107,11 +129,13 @@ jobs:
 
       - name: Test Studio plugin modules
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
           & tools/plugin_ws_bridge/tests/parse-all.ps1
           lune run tools/plugin_ws_bridge/tests/run
 
       - name: Install, test, and package the extension
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
           npm.cmd ci --prefix tools/renium-vscode-extension
           npm.cmd --prefix tools/renium-vscode-extension run verify
           $vsix = Join-Path $env:RUNNER_TEMP "renium-ci.vsix"

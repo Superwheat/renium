@@ -73,6 +73,9 @@ export const AUTOMATION_OP = {
   imageStore: 96,
   updateStudios: 97,
   performanceProfile: 98,
+  networkSimulation: 99,
+  propertyAccess: 100,
+  performanceMonitor: 101,
 } as const;
 
 export const AUTOMATION_RUNTIME_OPS = new Set<number>([
@@ -108,4 +111,7 @@ export const AUTOMATION_RUNTIME_OPS = new Set<number>([
   93,
   94,
   97,
+  99,
+  100,
+  101,
 ]);

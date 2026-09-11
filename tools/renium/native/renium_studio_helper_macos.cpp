@@ -24,6 +24,7 @@
 #include <mach/mach_vm.h>
 #include <mach/vm_region.h>
 #include <mach/vm_statistics.h>
+#include <mach/vm_param.h>
 #include <memory>
 #include <mutex>
 #include <pthread.h>
@@ -35,9 +36,15 @@
 #include <sys/un.h>
 #include <thread>
 #include <unistd.h>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include "renium_studio_history.h"
+#include "renium_studio_terrain.h"
+
+extern "C" bool ReniumArmLaunchGuard();
+extern "C" void ReniumInitializeLaunchGuard();
 
 #if defined(_WIN32)
 extern "C" int unsetenv(const char*);
@@ -102,11 +109,15 @@ struct DataModelScanStats
     std::size_t instanceRtti = 0;
     std::size_t childVectors = 0;
     std::size_t requiredRoots = 0;
+    std::uint64_t collectUs = 0, rttiNanos = 0, rttiReads = 0;
     std::string vectorDetails;
 };
 
 static constexpr std::uint32_t Magic = 0x4d4e4552;
 static constexpr std::uint32_t Version = 6;
+// Command 3 does not use factoryRva as a function address. Its top bit opts in
+// to per-candidate clocks; older helpers ignore it and keep the same payloads.
+static constexpr std::uint64_t PropertyPhaseTimingFlag = std::uint64_t{1} << 63;
 static constexpr std::size_t DataModelInstanceOffsetMin = 0x100;
 static constexpr std::size_t DataModelInstanceOffsetMax = 0x400;
 static constexpr std::size_t InstanceClassDescriptorOffset = 0x18;
@@ -115,12 +126,48 @@ static constexpr std::size_t InstanceChildrenOffsetMax = 0xc0;
 static constexpr std::size_t InstanceNameOffsetMin = 0x20;
 static constexpr std::size_t InstanceNameOffsetMax = 0x400;
 static std::mutex SerializeMutex;
+// Never hold this cache lock across an engine call or completion wait. In
+// particular, cold property lookup takes it on Studio's UI thread.
+static std::mutex DataModelCacheMutex;
+struct DataModelLayout
+{
+    std::size_t instanceOffset = 0;
+    std::size_t childrenOffset = 0;
+};
 static char SocketPath[sizeof(((sockaddr_un*)nullptr)->sun_path)]{};
 static void* CachedDataModel = nullptr;
 static std::size_t CachedDataModelInstanceOffset = 0;
 static std::size_t CachedDataModelChildrenOffset = 0;
-static std::size_t CachedInstanceNameOffset = 0;
+static std::atomic<std::size_t> CachedInstanceNameOffset{0};
 static std::string CachedDataModelTitle;
+
+// Optional bounded diagnostics: offsets are microseconds from RPC handling,
+// zero means not reached. Atomics allow a timeout receipt while a late callback
+// still owns the timing record. No engine pointers or property values escape.
+struct PropertyTiming
+{
+    const bool detailed;
+    explicit PropertyTiming(bool measure = false) : detailed(measure) {}
+    const std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+    std::atomic<std::uint64_t> lockUs{0}, scanUs{0}, cache{0}, modelCache{0};
+    std::atomic<std::uint64_t> collectUs{0}, rttiUs{0}, rttiReads{0}, pointers{0};
+    std::atomic<std::uint64_t> uiQueued{0}, uiBegin{0}, uiEnd{0}, submit{0}, runBegin{0}, runEnd{0};
+    std::uint64_t now() const
+    {
+        return 1 + std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - started).count();
+    }
+    void finish(Response& response) const
+    {
+        response.elapsedMicros = now() - 1;
+        const auto length = strnlen(response.error, sizeof(response.error));
+        std::snprintf(response.error + length, sizeof(response.error) - length,
+            "%spt1 lock=%llu scan=%llu cache=%llu model=%llu ui=%llu/%llu/%llu submit=%llu run=%llu/%llu collect=%llu rtti=%llu/%llu/%u ptrs=%llu",
+            length ? " | " : "", lockUs.load(), scanUs.load(), cache.load(), modelCache.load(),
+            uiQueued.load(), uiBegin.load(), uiEnd.load(), submit.load(), runBegin.load(), runEnd.load(),
+            collectUs.load(), rttiUs.load(), rttiReads.load(), static_cast<unsigned>(detailed), pointers.load());
+    }
+};
 
 static void SetError(Response& response, const std::string& error);
 static void ReleaseQString(StudioQString& value);
@@ -133,6 +180,11 @@ static_assert(sizeof(Response) == 536);
 
 static bool ReadMemory(std::uintptr_t address, void* output, std::size_t size)
 {
+    // Use the platform's exported user-VM limit, not a Studio address heuristic.
+    // Scanned image words often contain code/string bits rather than pointers;
+    // their guaranteed-invalid Mach reads otherwise dominate cold discovery.
+    if (size && (address >= MACH_VM_MAX_ADDRESS || size > MACH_VM_MAX_ADDRESS - address))
+        return false;
     mach_vm_size_t read = 0;
     return mach_vm_read_overwrite(
                mach_task_self(),
@@ -265,15 +317,15 @@ static bool ReadExpectedInstanceName(
         }
         return false;
     };
-    if (CachedInstanceNameOffset)
-        return readAt(CachedInstanceNameOffset);
+    if (const auto cached = CachedInstanceNameOffset.load(std::memory_order_relaxed))
+        return readAt(cached);
     for (std::size_t offset = InstanceNameOffsetMin;
          offset <= InstanceNameOffsetMax;
          offset += sizeof(void*))
     {
         if (readAt(offset))
         {
-            CachedInstanceNameOffset = offset;
+            CachedInstanceNameOffset.store(offset, std::memory_order_relaxed);
             return true;
         }
     }
@@ -281,15 +333,20 @@ static bool ReadExpectedInstanceName(
     return false;
 }
 
-static bool ReadRttiType(std::uintptr_t object, std::string& name)
+static bool ReadVtableRttiType(std::uintptr_t vtable, std::string& name)
 {
-    std::uintptr_t vtable = 0;
     std::uintptr_t typeInfo = 0;
     std::uintptr_t typeName = 0;
-    return ReadValue(object, vtable) && vtable &&
+    return vtable >= sizeof(void*) &&
         ReadValue(vtable - sizeof(void*), typeInfo) && typeInfo &&
         ReadValue(typeInfo + sizeof(void*), typeName) && typeName &&
         ReadCString(typeName, name, 256);
+}
+
+static bool ReadRttiType(std::uintptr_t object, std::string& name)
+{
+    std::uintptr_t vtable = 0;
+    return ReadValue(object, vtable) && ReadVtableRttiType(vtable, name);
 }
 
 static bool IsRttiType(std::uintptr_t object, const char* expected)
@@ -438,15 +495,46 @@ static bool FindDataModelInstanceOffset(
     return false;
 }
 
+// Global sections contain many pointers into the same heap pages. Copy each
+// bounded span once instead of making a Mach RPC for every first word. Failed
+// spans fall back to the original individual reads (including readable objects
+// next to inaccessible memory). Matching objects are always revalidated live.
+template <typename Visit>
+static void ReadCandidateVtables(std::vector<std::uintptr_t>& pointers, Visit visit)
+{
+    std::sort(pointers.begin(), pointers.end());
+    pointers.erase(std::unique(pointers.begin(), pointers.end()), pointers.end());
+    for (std::size_t begin = 0; begin < pointers.size();)
+    {
+        const auto first = pointers[begin];
+        std::size_t end = begin + 1;
+        while (end < pointers.size() && (pointers[end] >> 12) == (first >> 12)) ++end;
+        unsigned char bytes[4096];
+        const auto size = pointers[end - 1] - first + sizeof(std::uintptr_t);
+        const auto copied = size <= sizeof(bytes) && ReadMemory(first, bytes, size);
+        for (auto index = begin; index < end; ++index)
+        {
+            std::uintptr_t vtable = 0;
+            if (copied) std::memcpy(&vtable, bytes + (pointers[index] - first), sizeof(vtable));
+            else if (!ReadValue(pointers[index], vtable)) continue;
+            visit(pointers[index], vtable);
+        }
+        begin = end;
+    }
+}
+
 static void AddCandidates(
     const mach_header_64* header,
     std::intptr_t slide,
     const std::vector<std::string>& expectedNames,
     std::vector<DataModelCandidate>& candidates,
-    DataModelScanStats& stats)
+    DataModelScanStats& stats,
+    bool measureRtti = false)
 {
+    const auto collectStart = std::chrono::steady_clock::now();
     auto command = reinterpret_cast<const unsigned char*>(header) + sizeof(*header);
-    std::unordered_set<std::uintptr_t> seen;
+    std::vector<std::uintptr_t> objects;
+    std::unordered_map<std::uintptr_t, bool> dataModelTypes;
     for (std::uint32_t index = 0; index < header->ncmds; ++index)
     {
         const auto load = reinterpret_cast<const load_command*>(command);
@@ -473,30 +561,7 @@ static void AddCandidates(
                         continue;
                     for (const auto outer : pointers)
                     {
-                        std::size_t instanceOffset = 0;
-                        std::size_t childrenOffset = 0;
-                        std::uint32_t rootMask = 0;
-                        std::size_t rootCount = 0;
-                        if (outer < 0x10000 || !seen.insert(outer).second)
-                            continue;
-                        ++stats.pointers;
-                        if (!FindDataModelInstanceOffset(
-                                outer,
-                                instanceOffset,
-                                childrenOffset,
-                                rootMask,
-                                rootCount,
-                                stats))
-                            continue;
-                        std::string name;
-                        ReadExpectedInstanceName(outer + instanceOffset, expectedNames, name);
-                        candidates.push_back(
-                            {reinterpret_cast<void*>(outer),
-                             instanceOffset,
-                             childrenOffset,
-                             rootMask,
-                             rootCount,
-                             std::move(name)});
+                        if (outer >= 0x10000) objects.push_back(outer);
                     }
                 }
             }
@@ -505,6 +570,34 @@ static void AddCandidates(
             break;
         command += load->cmdsize;
     }
+    stats.collectUs = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - collectStart).count();
+    ReadCandidateVtables(objects, [&](std::uintptr_t outer, std::uintptr_t vtable) {
+        auto type = dataModelTypes.find(vtable);
+        if (type == dataModelTypes.end())
+        {
+            std::string name;
+            const auto rttiStart = measureRtti ? std::chrono::steady_clock::now()
+                : std::chrono::steady_clock::time_point{};
+            const auto readable = ReadVtableRttiType(vtable, name);
+            if (measureRtti) stats.rttiNanos += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - rttiStart).count();
+            ++stats.rttiReads;
+            if (!readable) return;
+            // Scan-local only; unreadable metadata is never cached.
+            type = dataModelTypes.emplace(vtable, name == "N3RBX9DataModelE").first;
+        }
+        if (!type->second) return;
+        std::size_t instanceOffset = 0, childrenOffset = 0, rootCount = 0;
+        std::uint32_t rootMask = 0;
+        if (!FindDataModelInstanceOffset(outer, instanceOffset, childrenOffset, rootMask, rootCount, stats))
+            return;
+        std::string name;
+        ReadExpectedInstanceName(outer + instanceOffset, expectedNames, name);
+        candidates.push_back({reinterpret_cast<void*>(outer), instanceOffset, childrenOffset,
+            rootMask, rootCount, std::move(name)});
+    });
+    stats.pointers = objects.size();
 }
 
 static bool FindDataModel(
@@ -512,8 +605,14 @@ static bool FindDataModel(
     std::intptr_t slide,
     const std::string& title,
     void*& output,
-    std::string& error)
+    DataModelLayout& layout,
+    std::string& error,
+    PropertyTiming* timing = nullptr)
 {
+    const auto lockStart = std::chrono::steady_clock::now();
+    std::lock_guard lock(DataModelCacheMutex);
+    if (timing) timing->lockUs = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - lockStart).count();
     if (CachedDataModel)
     {
         const auto cached = reinterpret_cast<std::uintptr_t>(CachedDataModel);
@@ -526,9 +625,12 @@ static bool FindDataModel(
             ReadChildren(instance, CachedDataModelChildrenOffset, children) &&
             (RequiredRootMask(children, readableClasses) & 15) == 15)
         {
+            if (timing) timing->cache = 1;
             output = CachedDataModel;
+            layout = {CachedDataModelInstanceOffset, CachedDataModelChildrenOffset};
             return true;
         }
+        if (timing) timing->cache = CachedDataModelTitle == title ? 3 : 2;
         CachedDataModel = nullptr;
         CachedDataModelInstanceOffset = 0;
         CachedDataModelChildrenOffset = 0;
@@ -541,7 +643,17 @@ static bool FindDataModel(
     }
     std::vector<DataModelCandidate> candidates;
     DataModelScanStats stats;
-    AddCandidates(header, slide, ExpectedDataModelNames(title), candidates, stats);
+    const auto scanStart = std::chrono::steady_clock::now();
+    AddCandidates(header, slide, ExpectedDataModelNames(title), candidates, stats, timing && timing->detailed);
+    if (timing)
+    {
+        timing->scanUs = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - scanStart).count();
+        timing->collectUs = stats.collectUs;
+        timing->rttiUs = stats.rttiNanos / 1000;
+        timing->rttiReads = stats.rttiReads;
+        timing->pointers = stats.pointers;
+    }
     if (candidates.size() > 1 && std::any_of(
             candidates.begin(),
             candidates.end(),
@@ -621,6 +733,7 @@ static bool FindDataModel(
     CachedDataModelInstanceOffset = candidates[0].instanceOffset;
     CachedDataModelChildrenOffset = candidates[0].childrenOffset;
     CachedDataModelTitle = title;
+    layout = {CachedDataModelInstanceOffset, CachedDataModelChildrenOffset};
     return true;
 }
 
@@ -723,19 +836,20 @@ static bool InstanceMatchesClass(std::uintptr_t instance, const std::string& exp
 
 static bool ResolvePackage(
     void* dataModel,
+    const DataModelLayout& layout,
     const std::vector<PackagePathSegment>& segments,
     ResolvedPackage& package,
     std::string& error)
 {
-    if (!CachedDataModelInstanceOffset || !CachedDataModelChildrenOffset)
+    if (!layout.instanceOffset || !layout.childrenOffset)
     {
         error = "Studio DataModel layout is unavailable";
         return false;
     }
     std::vector<SharedInstance> children;
     const auto dataModelInstance =
-        reinterpret_cast<std::uintptr_t>(dataModel) + CachedDataModelInstanceOffset;
-    if (!ReadChildren(dataModelInstance, CachedDataModelChildrenOffset, children))
+        reinterpret_cast<std::uintptr_t>(dataModel) + layout.instanceOffset;
+    if (!ReadChildren(dataModelInstance, layout.childrenOffset, children))
     {
         error = "Studio DataModel roots changed while resolving the package";
         return false;
@@ -803,7 +917,7 @@ static bool ResolvePackage(
         if (depth + 1 < segments.size() &&
             !ReadChildren(
                 reinterpret_cast<std::uintptr_t>(current.instance),
-                CachedDataModelChildrenOffset,
+                layout.childrenOffset,
                 children))
         {
             error = "package children changed while resolving its path";
@@ -818,7 +932,7 @@ static bool ResolvePackage(
     }
     if (!ReadChildren(
             reinterpret_cast<std::uintptr_t>(current.instance),
-            CachedDataModelChildrenOffset,
+            layout.childrenOffset,
             children))
     {
         error = "package root children changed while locating PackageLink";
@@ -926,6 +1040,7 @@ static bool FindClassMember(
 
 static bool ResolvePackageUiBinding(
     void* dataModel,
+    const DataModelLayout& layout,
     const mach_header_64* header,
     const char* memberName,
     const char* signatureToken,
@@ -934,9 +1049,9 @@ static bool ResolvePackageUiBinding(
     std::string& error)
 {
     const auto dataModelInstance = reinterpret_cast<std::uintptr_t>(dataModel) +
-        CachedDataModelInstanceOffset;
+        layout.instanceOffset;
     std::vector<SharedInstance> roots;
-    if (!ReadChildren(dataModelInstance, CachedDataModelChildrenOffset, roots))
+    if (!ReadChildren(dataModelInstance, layout.childrenOffset, roots))
     {
         error = "Studio DataModel roots changed while resolving PackageUIService";
         return false;
@@ -1789,13 +1904,14 @@ static bool ResolveImageFunction(
 
 static bool ResolveDataModelTaskContext(
     void* dataModel,
+    const DataModelLayout& layout,
     const mach_header_64* header,
     std::uintptr_t submitter,
     void*& taskContext,
     std::string& error)
 {
     const auto dataModelInstance = reinterpret_cast<std::uintptr_t>(dataModel) +
-        CachedDataModelInstanceOffset;
+        layout.instanceOffset;
     std::uintptr_t context = 0;
     std::uintptr_t vtable = 0;
     if (!ReadValue(dataModelInstance + 0x58, context))
@@ -1856,7 +1972,8 @@ static Response PackageAction(
     const auto header = MainStudioImage(slide);
     std::string error;
     void* dataModel = nullptr;
-    if (!FindDataModel(header, slide, title, dataModel, error))
+    DataModelLayout layout;
+    if (!FindDataModel(header, slide, title, dataModel, layout, error))
     {
         response.status = 11;
         SetError(response, error);
@@ -1875,7 +1992,7 @@ static Response PackageAction(
         return response;
     }
     ResolvedPackage package{};
-    if (!ResolvePackage(dataModel, segments, package, error))
+    if (!ResolvePackage(dataModel, layout, segments, package, error))
     {
         response.status = 13;
         SetError(response, error);
@@ -1933,6 +2050,7 @@ static Response PackageAction(
                  error) ||
              !ResolveDataModelTaskContext(
                  dataModel,
+                 layout,
                  header,
                  task->submitTask,
                  task->taskContext,
@@ -1958,6 +2076,7 @@ static Response PackageAction(
         {
             if (!ResolvePackageUiBinding(
                     dataModel,
+                    layout,
                     header,
                     "PublishPackage",
                     "EFvNSt3__110shared_ptrINS_8InstanceEEEb",
@@ -2013,6 +2132,7 @@ static Response PackageAction(
             {
                 if (!ResolvePackageUiBinding(
                         dataModel,
+                        layout,
                         header,
                         "SetPackageVersion",
                         "EFNSt3__110shared_ptrINS_8InstanceEEES6_x",
@@ -2029,7 +2149,7 @@ static Response PackageAction(
                 while (true)
                 {
                     ResolvedPackage updated{};
-                    if (ResolvePackage(dataModel, segments, updated, error) &&
+                    if (ResolvePackage(dataModel, layout, segments, updated, error) &&
                         ReadPackageState(
                             task,
                             reinterpret_cast<std::uintptr_t>(updated.link.instance),
@@ -2259,7 +2379,8 @@ static Response Serialize(
         return response;
     }
     void* dataModel = nullptr;
-    if (!FindDataModel(header, slide, title, dataModel, error))
+    DataModelLayout layout;
+    if (!FindDataModel(header, slide, title, dataModel, layout, error))
     {
         response.status = 3;
         SetError(response, error);
@@ -2352,10 +2473,37 @@ struct PropertyCallParams
 };
 static_assert(sizeof(PropertyCallParams) == 66216);
 struct PropertyIdentity { std::uint64_t low, high; };
+static std::atomic<unsigned> PendingPropertyTasks{0};
+struct PropertyPermit
+{
+    bool acquired = false;
+    PropertyPermit()
+    {
+        auto count = PendingPropertyTasks.load(std::memory_order_relaxed);
+        while (count < 8)
+            if (PendingPropertyTasks.compare_exchange_weak(count, count + 1, std::memory_order_relaxed))
+            {
+                acquired = true;
+                break;
+            }
+    }
+    PropertyPermit(const PropertyPermit&) = delete;
+    PropertyPermit& operator=(const PropertyPermit&) = delete;
+    ~PropertyPermit()
+    {
+        if (acquired) PendingPropertyTasks.fetch_sub(1, std::memory_order_relaxed);
+    }
+};
 struct PropertyModelContext;
 struct PropertyCallTask
 {
+    // Released last, after both the waiter and every queued callback dispose
+    // their task references. A timed-out client must not reopen queue capacity.
+    std::shared_ptr<PropertyPermit> permit;
+    std::shared_ptr<PropertyTiming> timing;
     PropertyCallParams params{};
+    std::string extraInput;
+    bool prepareOnly = false;
     std::shared_ptr<PropertyModelContext> modelContext;
     std::chrono::steady_clock::time_point deadline;
     std::mutex mutex;
@@ -2379,10 +2527,36 @@ struct PropertyModelContext
 static std::mutex PropertyModelMutex;
 static std::shared_ptr<PropertyModelContext> CachedPropertyModel;
 
-static std::shared_ptr<void> AdoptModelOwner(void* owner)
+struct ModelOwnerRelease
 {
-    return std::shared_ptr<void>(owner, [](void* retained) {
-        dispatch_async_f(dispatch_get_main_queue(), retained, ReleaseOwner);
+    std::shared_ptr<PropertyPermit> permit;
+    void* owner;
+};
+
+static std::shared_ptr<void> RetainModelOwner(void* owner, const std::shared_ptr<PropertyPermit>& permit)
+{
+    // Allocate the release receipt before retaining. The shared_ptr constructor
+    // invokes its deleter on allocation failure, so no acquired owner is lost.
+    auto release = std::make_unique<ModelOwnerRelease>(ModelOwnerRelease{permit, owner});
+    if (!RetainOwner(owner)) return {};
+    return std::shared_ptr<void>(release.release(), [](void* retained) {
+        auto receipt = std::unique_ptr<ModelOwnerRelease>(static_cast<ModelOwnerRelease*>(retained));
+        auto strong = reinterpret_cast<std::atomic<std::int64_t>*>(
+            reinterpret_cast<unsigned char*>(receipt->owner) + 8);
+        auto count = strong->load(std::memory_order_acquire);
+        // libc++ stores strong references minus one. A successful decrement
+        // above zero cannot destroy the model; do not queue inert cleanup and
+        // exhaust all eight permits during a completed-call burst. CAS is
+        // required: another owner may release between the load and decrement.
+        while (count > 0)
+            if (strong->compare_exchange_weak(count, count - 1,
+                    std::memory_order_acq_rel, std::memory_order_acquire))
+                return; // Do not access the owner after dropping our reference.
+        // Keep the last strong reference AND permit until UI-thread disposal.
+        dispatch_async_f(dispatch_get_main_queue(), receipt.release(), [](void* raw) {
+            const auto release = std::unique_ptr<ModelOwnerRelease>(static_cast<ModelOwnerRelease*>(raw));
+            ReleaseOwner(release->owner);
+        });
     });
 }
 
@@ -2392,8 +2566,92 @@ static void FinishPropertyError(const std::shared_ptr<PropertyCallTask>& task, c
     task->completed.notify_all();
 }
 
+static void CapturePropertyIdentities(const std::shared_ptr<PropertyCallTask>& task,
+    std::vector<unsigned char>& output)
+{
+    const auto& p = task->params;
+    std::uint64_t fields[8]{};
+    if (p.inputSize < sizeof(fields))
+        throw std::runtime_error("Native identity request is truncated");
+    std::memcpy(fields, p.input, sizeof(fields));
+    const auto descriptor = fields[0], table = fields[1], slot = fields[2], invoker = fields[3];
+    const auto memberOffset = fields[4], function = fields[5], childrenOffset = fields[6], count = fields[7];
+    const auto equal = [](std::uintptr_t at, std::uintptr_t expected) {
+        std::uintptr_t value = 0;
+        return ReadValue(at, value) && value == expected;
+    };
+    if (count < 1 || count > 64 || p.inputSize != sizeof(fields) + count * sizeof(SharedInstance) ||
+        slot >= 32 || slot % 8 || memberOffset < 64 || memberOffset >= 256 ||
+        childrenOffset > 2048 || childrenOffset % 8 ||
+        !equal(descriptor, table) || !equal(table + slot, invoker) ||
+        !equal(descriptor + memberOffset, function) || !equal(descriptor + memberOffset + 8, 0))
+        throw std::runtime_error("Native identity binding changed");
+    struct Entry { SharedInstance value; std::uintptr_t parent; };
+    std::vector<Entry> pending;
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        SharedInstance root{};
+        std::memcpy(&root, p.input + sizeof(fields) + i * sizeof(root), sizeof(root));
+        SharedInstance self{};
+        const auto instance = reinterpret_cast<std::uintptr_t>(root.instance);
+        if (!instance || !root.owner || !ReadMemory(instance + p.selfOffset, &self, sizeof(self)) ||
+            self.instance != root.instance || self.owner != root.owner ||
+            !equal(instance + p.parentOffset, task->modelContext->instance))
+            throw std::runtime_error("Native identity service ownership changed");
+        pending.push_back({root, task->modelContext->instance});
+    }
+    std::unordered_set<void*> seen;
+    const auto initialSize = output.size();
+    while (!pending.empty())
+    {
+        if (seen.size() % 256 == 0 && std::chrono::steady_clock::now() >= task->deadline)
+            throw std::runtime_error("Native identity capture exceeded its deadline");
+        const auto entry = pending.back();
+        pending.pop_back();
+        const auto instance = reinterpret_cast<std::uintptr_t>(entry.value.instance);
+        SharedInstance self{};
+        if (!instance || !entry.value.owner || !seen.insert(entry.value.instance).second || seen.size() > 1000000)
+            throw std::runtime_error("Native identity graph ownership changed");
+        // Discovery and service ownership above need fault-tolerant Mach reads.
+        // Descendants now come exclusively from that retained, locked engine
+        // graph. Reading each word through the kernel adds hundreds of thousands
+        // of syscalls; use the same direct traversal as native Windows capture.
+        std::memcpy(&self, reinterpret_cast<const void*>(instance + p.selfOffset), sizeof(self));
+        const auto parent = *reinterpret_cast<const std::uintptr_t*>(instance + p.parentOffset);
+        if (self.instance != entry.value.instance || self.owner != entry.value.owner || parent != entry.parent)
+            throw std::runtime_error("Native identity graph ownership changed");
+        // This task holds the DataModel on its write queue; these non-yielding
+        // inherited getters cannot release the live hierarchy or run Lua.
+        const auto identity = reinterpret_cast<PropertyIdentity (*)(void*, void*)>(p.identityGetter)(
+            reinterpret_cast<void*>(p.identityBinding), entry.value.instance);
+        const auto debug = reinterpret_cast<std::string (*)(void*, int)>(function)(entry.value.instance, 32);
+        if (debug.empty() || debug.size() >= 48 || debug.find('\0') != std::string::npos)
+            throw std::runtime_error("Native debug identity is invalid");
+        const auto offset = output.size();
+        output.resize(offset + 64, 0);
+        std::memcpy(output.data() + offset, &identity, 16);
+        std::memcpy(output.data() + offset + 16, debug.data(), debug.size());
+        const auto children = *reinterpret_cast<const std::uintptr_t*>(instance + childrenOffset);
+        if (!children) continue;
+        std::uintptr_t bounds[3]{};
+        std::memcpy(bounds, reinterpret_cast<const void*>(children), sizeof(bounds));
+        if ((!bounds[0] && (bounds[1] || bounds[2])) || bounds[1] < bounds[0] ||
+            bounds[2] < bounds[1] || (bounds[1] - bounds[0]) % sizeof(SharedInstance))
+            throw std::runtime_error("Native identity children vector changed");
+        const auto childCount = (bounds[1] - bounds[0]) / sizeof(SharedInstance);
+        if (childCount > 1000000 - seen.size() || pending.size() + childCount > 1000000)
+            throw std::runtime_error("Native identity graph exceeds its limit");
+        if (!childCount) continue;
+        const auto values = reinterpret_cast<const SharedInstance*>(bounds[0]);
+        for (std::size_t i = 0; i < childCount; ++i) pending.push_back({values[i], instance});
+    }
+    if (output.size() == initialSize)
+        throw std::runtime_error("Native identity capture is empty");
+}
+
 static void ExecutePropertyCall(const std::shared_ptr<PropertyCallTask>& task)
 {
+    if (task->timing) task->timing->runBegin = task->timing->now();
     std::vector<unsigned char> output;
     std::string error;
     try
@@ -2402,9 +2660,13 @@ static void ExecutePropertyCall(const std::shared_ptr<PropertyCallTask>& task)
         if (std::chrono::steady_clock::now() >= task->deadline)
             throw std::runtime_error("Protected property call expired before execution");
         const auto model = task->modelContext;
-        if (!model || !RetainOwner(model->owner))
+        const auto modelOwner = model ? RetainModelOwner(model->owner, task->permit) : std::shared_ptr<void>{};
+        if (!modelOwner)
             throw std::runtime_error("Protected property DataModel expired");
-        const auto modelOwner = AdoptModelOwner(model->owner);
+        // Connection preparation validates the queue and its live owner, but
+        // does not resolve, read, or write any reflected property.
+        if (!task->prepareOnly)
+        {
         const auto equal = [](std::uintptr_t at, std::uintptr_t expected) {
             std::uintptr_t actual = 0;
             return ReadValue(at, actual) && actual == expected;
@@ -2432,21 +2694,86 @@ static void ExecutePropertyCall(const std::shared_ptr<PropertyCallTask>& task)
         std::memcpy(output.data(), &identity, sizeof(identity));
         if (p.operation != 0)
         {
-            if (std::memcmp(&identity, p.expectedIdentity, sizeof(identity)) != 0)
+            // Operations 3 and 4 atomically identify and read, never write.
+            if (p.operation != 3 && p.operation != 4 &&
+                std::memcmp(&identity, p.expectedIdentity, sizeof(identity)) != 0)
                 throw std::runtime_error("Protected property instance identity changed");
-            if (p.operation == 2)
+            if (p.operation == 6)
             {
-                if (!p.setter) throw std::runtime_error("This property has no supported setter");
-                const std::string input(p.input, p.inputSize);
-                if (!reinterpret_cast<bool (*)(void*, void*, const std::string*)>(p.setter)(
-                        reinterpret_cast<void*>(p.descriptor), reinterpret_cast<void*>(p.instance), &input))
-                    throw std::runtime_error("Studio rejected the property value");
+                renium_history::Binding binding{};
+                if (p.inputSize) {
+                    if (p.inputSize <= sizeof(binding)) throw std::runtime_error("Missing history registration token");
+                    std::memcpy(&binding, p.input, sizeof(binding));
+                    renium_history::Register(binding, reinterpret_cast<void*>(p.instance), p.ancestors[p.ancestorCount - 1],
+                        task->modelContext->owner,
+                        std::string(p.input + sizeof(binding), p.inputSize - sizeof(binding)), ReadMemory);
+                }
+                binding = renium_history::GetBinding();
+                output.resize(sizeof(identity) + sizeof(binding));
+                std::memcpy(output.data() + sizeof(identity), &binding, sizeof(binding));
             }
-            const auto value = reinterpret_cast<std::string (*)(void*, void*)>(p.getter)(
-                reinterpret_cast<void*>(p.descriptor), reinterpret_cast<void*>(p.instance));
-            if (value.size() > 65536)
-                throw std::runtime_error("Protected property value exceeds 64 KiB");
-            output.insert(output.end(), value.begin(), value.end());
+            else if (p.operation == 8)
+            {
+                if (p.inputSize) {
+                    if (p.inputSize != sizeof(renium_terrain_observation::Request)) throw std::runtime_error("Invalid Terrain notification request");
+                    renium_terrain_observation::Request request{};
+                    std::memcpy(&request, p.input, sizeof(request));
+                    renium_terrain_observation::Install(reinterpret_cast<void*>(p.instance), reinterpret_cast<void*>(p.owner), request,
+                        p.classOffset, p.selfOffset, p.parentOffset, ReadMemory, RetainOwner, ReleaseOwner);
+                }
+                const auto binding = renium_terrain_observation::GetBinding(reinterpret_cast<void*>(p.instance));
+                const auto data = reinterpret_cast<const unsigned char*>(&binding);
+                output.insert(output.end(), data, data + sizeof(binding));
+            }
+            else if (p.operation == 7)
+            {
+                const auto changed = renium_terrain::Apply(reinterpret_cast<void*>(p.instance), owner,
+                    p.ancestors[p.ancestorCount - 1], task->extraInput, ReadMemory);
+                output.push_back(changed.changed ? 1 : 0);
+                output.insert(output.end(), changed.fingerprint.begin(), changed.fingerprint.end());
+            }
+            else if (p.operation == 4)
+            {
+                CapturePropertyIdentities(task, output);
+            }
+            else
+            {
+                if (p.operation == 5)
+                {
+                    // BinaryString bindings return void when setting. Compare on
+                    // the same DataModel task before writing any serialized bytes.
+                    std::uint32_t expectedSize = 0;
+                    if (!p.setter || p.inputSize < sizeof(expectedSize))
+                        throw std::runtime_error("Invalid conditional binary property write");
+                    std::memcpy(&expectedSize, p.input, sizeof(expectedSize));
+                    if (expectedSize > p.inputSize - sizeof(expectedSize))
+                        throw std::runtime_error("Invalid expected binary property length");
+                    const auto current = reinterpret_cast<std::string (*)(void*, void*)>(p.getter)(
+                        reinterpret_cast<void*>(p.descriptor), reinterpret_cast<void*>(p.instance));
+                    const std::string expected(p.input + sizeof(expectedSize), expectedSize);
+                    if (current != expected)
+                        throw std::runtime_error("Binary property changed before the conditional write");
+                    const std::string input(p.input + sizeof(expectedSize) + expectedSize,
+                        p.inputSize - sizeof(expectedSize) - expectedSize);
+                    if (input != current)
+                        reinterpret_cast<void (*)(void*, void*, const std::string*)>(p.setter)(
+                            reinterpret_cast<void*>(p.descriptor), reinterpret_cast<void*>(p.instance), &input);
+                }
+                else if (p.operation == 2)
+                {
+                    if (!p.setter) throw std::runtime_error("This property has no supported setter");
+                    const std::string input(p.input, p.inputSize);
+                    if (!reinterpret_cast<bool (*)(void*, void*, const std::string*)>(p.setter)(
+                            reinterpret_cast<void*>(p.descriptor), reinterpret_cast<void*>(p.instance), &input))
+                        throw std::runtime_error("Studio rejected the property value");
+                }
+                const auto value = reinterpret_cast<std::string (*)(void*, void*)>(p.getter)(
+                    reinterpret_cast<void*>(p.descriptor), reinterpret_cast<void*>(p.instance));
+                if (value.size() > 65536)
+                    throw std::runtime_error("Protected property value exceeds 64 KiB");
+                output.insert(output.end(), value.begin(), value.end());
+            }
+        }
         }
     }
     catch (const std::exception& exception) { error = exception.what(); }
@@ -2456,6 +2783,7 @@ static void ExecutePropertyCall(const std::shared_ptr<PropertyCallTask>& task)
         task->error = std::move(error);
         task->output = std::move(output);
         task->done = true;
+        if (task->timing) task->timing->runEnd = task->timing->now();
     }
     task->completed.notify_all();
 }
@@ -2465,20 +2793,42 @@ static void SubmitPropertyCall(void* context, std::uintptr_t submit, const std::
     if (std::chrono::steady_clock::now() >= task->deadline)
         throw std::runtime_error("Protected property expired before submission");
     std::function<void()> callback{[task]() { ExecutePropertyCall(task); }};
+    if (task->timing) task->timing->submit = task->timing->now();
     if (!reinterpret_cast<bool (*)(void*, std::function<void()>*, std::uint32_t)>(submit)(context, &callback, 1))
         throw std::runtime_error("Studio rejected the protected-property task");
 }
 
 static bool RunPropertyCall(const std::string& payload, const std::string& title,
     const mach_header_64* header, std::intptr_t slide, std::uintptr_t submit,
-    std::vector<unsigned char>& output, std::string& error)
+    std::vector<unsigned char>& output, std::string& error, bool prepareOnly,
+    const std::shared_ptr<PropertyPermit>& permit,
+    const std::shared_ptr<PropertyTiming>& timing)
 {
-    if (payload.size() != sizeof(PropertyCallParams))
+    if (prepareOnly ? payload.size() != 20 : payload.size() < sizeof(PropertyCallParams) || payload.size() > sizeof(PropertyCallParams) + 128 * 1024 * 1024)
         throw std::runtime_error("Invalid protected-property request size");
     auto task = std::make_shared<PropertyCallTask>();
-    std::memcpy(&task->params, payload.data(), payload.size());
+    task->permit = permit;
+    task->timing = timing;
+    task->prepareOnly = prepareOnly;
+    if (prepareOnly)
+    {
+        // A fixed context-only request has no descriptor or getter/setter.
+        auto& p = task->params;
+        std::memcpy(&p.model, payload.data(), 8);
+        std::memcpy(&p.instance, payload.data() + 8, 8);
+        std::memcpy(&p.timeoutMs, payload.data() + 16, 4);
+        p.ancestors[0] = p.ancestors[1] = p.instance;
+        p.ancestorCount = 2;
+        if (!LikelyPointer(p.model) || !LikelyPointer(p.instance))
+            throw std::runtime_error("Invalid connection preparation target");
+    }
+    else {
+        std::memcpy(&task->params, payload.data(), sizeof(PropertyCallParams));
+        task->extraInput.assign(payload.data() + sizeof(PropertyCallParams), payload.size() - sizeof(PropertyCallParams));
+    }
     const auto& p = task->params;
-    if (p.operation > 2 || p.inputSize > sizeof(p.input) || p.ancestorCount < 2 || p.ancestorCount > 65 ||
+    if (p.operation > 8 || p.inputSize > sizeof(p.input) || p.ancestorCount < 2 || p.ancestorCount > 65 ||
+        (p.operation == 7 ? task->extraInput.empty() : !task->extraInput.empty()) ||
         p.timeoutMs < 1 || p.timeoutMs > 3000 || p.ancestors[0] != p.instance)
         throw std::runtime_error("Invalid protected-property request");
     task->deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(p.timeoutMs);
@@ -2498,9 +2848,11 @@ static bool RunPropertyCall(const std::string& payload, const std::string& title
         cached = CachedPropertyModel;
     }
     if (cached && cached->model == p.model && cached->instance == p.ancestors[p.ancestorCount - 1] &&
-        cached->title == title && RetainOwner(cached->owner))
+        cached->title == title)
+        submission->modelOwner = RetainModelOwner(cached->owner, permit);
+    if (submission->modelOwner)
     {
-        submission->modelOwner = AdoptModelOwner(cached->owner);
+        if (timing) timing->modelCache = 1;
         task->modelContext = cached;
         try { SubmitPropertyCall(cached->context, submit, task); }
         catch (const std::exception& exception) { FinishPropertyError(task, exception.what()); }
@@ -2508,6 +2860,11 @@ static bool RunPropertyCall(const std::string& payload, const std::string& title
     }
     else
     {
+    if (timing)
+    {
+        timing->modelCache = cached ? (cached->title == title ? 3 : 2) : 0;
+        timing->uiQueued = timing->now();
+    }
     // Cold lookup retains on the UI thread, where place closure is serialized.
     // The queued DataModel callback does NOT own Submission/modelOwner: a
     // timed-out or closing DataModel must not be kept alive by its own queue.
@@ -2515,6 +2872,7 @@ static bool RunPropertyCall(const std::string& payload, const std::string& title
         const auto boxed = std::unique_ptr<std::shared_ptr<Submission>>(static_cast<std::shared_ptr<Submission>*>(raw));
         const auto state = *boxed;
         const auto current = state->task;
+        if (current->timing) current->timing->uiBegin = current->timing->now();
         try
         {
             if (std::chrono::steady_clock::now() >= current->deadline)
@@ -2523,16 +2881,17 @@ static bool RunPropertyCall(const std::string& payload, const std::string& title
             void* context = nullptr;
             std::string problem;
             std::uintptr_t owner = 0;
-            std::unique_lock lookupLock(SerializeMutex);
+            DataModelLayout layout;
             const auto& params = current->params;
-            if (!FindDataModel(state->header, state->slide, state->title, model, problem) ||
+            if (!FindDataModel(state->header, state->slide, state->title, model, layout, problem, current->timing.get()) ||
                 reinterpret_cast<std::uintptr_t>(model) != params.model ||
-                params.ancestors[params.ancestorCount - 1] != params.model + CachedDataModelInstanceOffset ||
-                !ResolveDataModelTaskContext(model, state->header, state->submit, context, problem) ||
-                !ReadValue(params.model + CachedDataModelInstanceOffset + 16, owner) ||
-                !RetainOwner(reinterpret_cast<void*>(owner)))
+                params.ancestors[params.ancestorCount - 1] != params.model + layout.instanceOffset ||
+                !ResolveDataModelTaskContext(model, layout, state->header, state->submit, context, problem) ||
+                !ReadValue(params.model + layout.instanceOffset + 16, owner))
                 throw std::runtime_error(problem.empty() ? "Protected property DataModel was replaced" : problem);
-            state->modelOwner = AdoptModelOwner(reinterpret_cast<void*>(owner));
+            state->modelOwner = RetainModelOwner(reinterpret_cast<void*>(owner), current->permit);
+            if (!state->modelOwner)
+                throw std::runtime_error("Protected property DataModel expired");
             auto next = std::make_shared<PropertyModelContext>();
             next->model = params.model;
             next->instance = params.ancestors[params.ancestorCount - 1];
@@ -2542,7 +2901,7 @@ static bool RunPropertyCall(const std::string& payload, const std::string& title
             next->owner = reinterpret_cast<void*>(owner);
             current->modelContext = next;
             { std::lock_guard lock(PropertyModelMutex); CachedPropertyModel = std::move(next); }
-            lookupLock.unlock();
+            if (current->timing) current->timing->uiEnd = current->timing->now();
             SubmitPropertyCall(context, state->submit, current);
         }
         catch (const std::exception& exception)
@@ -2567,7 +2926,9 @@ static Response PropertyTransport(
     const Request& request,
     const std::string& payload,
     const std::string& title,
-    std::vector<unsigned char>& output)
+    std::vector<unsigned char>& output,
+    const std::shared_ptr<PropertyPermit>& permit,
+    const std::shared_ptr<PropertyTiming>& timing)
 {
     Response response{Magic, 20, 0, 0, {}};
     std::intptr_t slide = 0;
@@ -2582,14 +2943,14 @@ static Response PropertyTransport(
     }
     if (request.reserved == 0)
     {
-        std::lock_guard lock(SerializeMutex);
         void* model = nullptr;
-        if (!FindDataModel(header, slide, title, model, error))
+        DataModelLayout layout;
+        if (!FindDataModel(header, slide, title, model, layout, error, timing.get()))
         {
             SetError(response, error);
             return response;
         }
-        const auto instance = reinterpret_cast<std::uintptr_t>(model) + CachedDataModelInstanceOffset;
+        const auto instance = reinterpret_cast<std::uintptr_t>(model) + layout.instanceOffset;
         std::string name;
         const auto names = ExpectedDataModelNames(title);
         std::uintptr_t owner = 0;
@@ -2602,7 +2963,7 @@ static Response PropertyTransport(
         }
         const std::uint64_t context[] = {
             reinterpret_cast<std::uintptr_t>(header), instance, owner,
-            CachedDataModelChildrenOffset, CachedInstanceNameOffset,
+            layout.childrenOffset, CachedInstanceNameOffset.load(std::memory_order_relaxed),
             InstanceClassDescriptorOffset, 8, reinterpret_cast<std::uintptr_t>(model)};
         output.resize(sizeof(context));
         std::memcpy(output.data(), context, sizeof(context));
@@ -2628,7 +2989,15 @@ static Response PropertyTransport(
     }
     else if (request.reserved == 2)
     {
-        if (!RunPropertyCall(payload, title, header, slide, submit, output, error))
+        if (!RunPropertyCall(payload, title, header, slide, submit, output, error, false, permit, timing))
+        {
+            SetError(response, error);
+            return response;
+        }
+    }
+    else if (request.reserved == 4)
+    {
+        if (!RunPropertyCall(payload, title, header, slide, submit, output, error, true, permit, timing))
         {
             SetError(response, error);
             return response;
@@ -2675,44 +3044,18 @@ static Response PropertyTransport(
     return response;
 }
 
-static void HandleClient(int client)
+static void RespondToClient(int client, const Request& request, const std::string& path,
+    const std::string& title, const std::shared_ptr<PropertyPermit>& permit = {})
 {
-    Request request{};
     Response response{Magic, 7, 0, 0, {}};
-    if (!ReadExact(client, &request, sizeof(request)) || request.magic != Magic ||
-        request.version != Version ||
-        (request.command != 1 && request.command != 2 && request.command != 3) || request.pathLength == 0 ||
-        request.pathLength >= (request.command == 3 ? 131072u : PATH_MAX) || request.titleLength >= PATH_MAX)
-    {
-        SetError(response, "invalid serializer request");
-        WriteExact(client, &response, sizeof(response));
-        return;
-    }
-    std::string path(request.pathLength, '\0');
-    if (!ReadExact(client, path.data(), path.size()))
-    {
-        SetError(response, "incomplete serializer request payload");
-        WriteExact(client, &response, sizeof(response));
-        return;
-    }
-    if (request.command == 1 && path.front() != '/')
-    {
-        SetError(response, "serializer output path must be absolute");
-        WriteExact(client, &response, sizeof(response));
-        return;
-    }
-    std::string title(request.titleLength, '\0');
-    if (!title.empty() && !ReadExact(client, title.data(), title.size()))
-    {
-        SetError(response, "invalid Studio title");
-        WriteExact(client, &response, sizeof(response));
-        return;
-    }
     std::vector<unsigned char> propertyOutput;
+    std::shared_ptr<PropertyTiming> timing;
     try
     {
+        if (request.command == 3 && (request.reserved == 0 || request.reserved == 2 || request.reserved == 4))
+            timing = std::make_shared<PropertyTiming>((request.factoryRva & PropertyPhaseTimingFlag) != 0);
         if (request.command == 3)
-            response = PropertyTransport(request, path, title, propertyOutput);
+            response = PropertyTransport(request, path, title, propertyOutput, permit, timing);
         else
             response = request.command == 1
                 ? Serialize(request, path, title)
@@ -2728,9 +3071,151 @@ static void HandleClient(int client)
         response.status = 9;
         SetError(response, "Studio serializer raised an unknown exception");
     }
+    if (timing) timing->finish(response);
     WriteExact(client, &response, sizeof(response));
     if (request.command == 3 && response.status == 0 && !propertyOutput.empty())
         WriteExact(client, propertyOutput.data(), propertyOutput.size());
+}
+
+struct ClientSocket
+{
+    int fd;
+    explicit ClientSocket(int value) : fd(value) {}
+    ClientSocket(const ClientSocket&) = delete;
+    ClientSocket& operator=(const ClientSocket&) = delete;
+    int release() noexcept { return std::exchange(fd, -1); }
+    ~ClientSocket() { if (fd >= 0) close(fd); }
+};
+
+struct PropertyClient
+{
+    std::shared_ptr<PropertyPermit> permit;
+    int client;
+    Request request;
+    std::string path, title;
+};
+
+static void* RunPropertyClient(void* raw) noexcept
+{
+    const auto state = std::unique_ptr<PropertyClient>(static_cast<PropertyClient*>(raw));
+    const ClientSocket socket(state->client);
+    try
+    {
+        RespondToClient(socket.fd, state->request, state->path, state->title, state->permit);
+    }
+    catch (...)
+    {
+        // Also cover exceptions while packaging an error. Cleanup never
+        // depends on the peer accepting the response or still being connected.
+        Response response{Magic, 9, 0, 0, {}};
+        std::snprintf(response.error, sizeof(response.error), "Native property response failed");
+        WriteExact(socket.fd, &response, sizeof(response));
+    }
+    return nullptr;
+}
+
+static bool StartPropertyClient(std::unique_ptr<PropertyClient>& state, std::string& error)
+{
+    pthread_attr_t attributes;
+    auto status = pthread_attr_init(&attributes);
+    if (status == 0)
+    {
+        status = pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
+        if (status == 0)
+        {
+            pthread_t thread;
+            status = pthread_create(&thread, &attributes, RunPropertyClient, state.get());
+        }
+        pthread_attr_destroy(&attributes);
+    }
+    if (status != 0)
+    {
+        error = std::string("Could not start native property worker: ") + std::strerror(status);
+        return false;
+    }
+    // Creation transfers the socket and state together. No fallible detach
+    // follows it, and releasing the pointer does not access the running state.
+    state.release();
+    return true;
+}
+
+// True transfers this socket to a bounded task; the accept loop retains all
+// other sockets. Waiting for the UI/DataModel queue must not block raw reads.
+static bool HandleClient(int client)
+{
+    Request request{};
+    Response response{Magic, 7, 0, 0, {}};
+    if (!ReadExact(client, &request, sizeof(request)) || request.magic != Magic ||
+        request.version != Version ||
+        (request.command != 1 && request.command != 2 && request.command != 3 && request.command != 4) ||
+        (request.command != 4 && request.pathLength == 0) ||
+        request.pathLength >= (request.command == 3 ? 128u * 1024 * 1024 + 66216u : PATH_MAX) || request.titleLength >= PATH_MAX)
+    {
+        SetError(response, "invalid serializer request");
+        WriteExact(client, &response, sizeof(response));
+        return false;
+    }
+    if (request.command == 4)
+    {
+        // No Studio engine calls or global application changes: arm this
+        // process's AppKit guard before it starts its own test processes.
+        if (request.pathLength != 0 || request.titleLength != 0 || request.reserved != 0)
+            SetError(response, "invalid background launch request");
+        else if (ReniumArmLaunchGuard())
+            response.status = 0;
+        else
+            SetError(response, "could not arm background launch");
+        WriteExact(client, &response, sizeof(response));
+        return false;
+    }
+    std::string path(request.pathLength, '\0');
+    if (!ReadExact(client, path.data(), path.size()))
+    {
+        SetError(response, "incomplete serializer request payload");
+        WriteExact(client, &response, sizeof(response));
+        return false;
+    }
+    if (request.command == 1 && path.front() != '/')
+    {
+        SetError(response, "serializer output path must be absolute");
+        WriteExact(client, &response, sizeof(response));
+        return false;
+    }
+    std::string title(request.titleLength, '\0');
+    if (!title.empty() && !ReadExact(client, title.data(), title.size()))
+    {
+        SetError(response, "invalid Studio title");
+        WriteExact(client, &response, sizeof(response));
+        return false;
+    }
+    if (request.command == 3 && (request.reserved == 2 || request.reserved == 4))
+    {
+        try
+        {
+            auto permit = std::make_shared<PropertyPermit>();
+            if (!permit->acquired)
+            {
+                SetError(response, "Native property task limit reached; wait for pending operations");
+                WriteExact(client, &response, sizeof(response));
+                return false;
+            }
+            auto state = std::make_unique<PropertyClient>(PropertyClient{
+                std::move(permit), client, request, std::move(path), std::move(title)});
+            std::string error;
+            if (StartPropertyClient(state, error))
+                return true;
+            SetError(response, error);
+        }
+        catch (const std::exception& exception)
+        {
+            SetError(response, exception.what());
+        }
+        catch (...) { SetError(response, "Could not prepare native property worker"); }
+        WriteExact(client, &response, sizeof(response));
+        return false;
+    }
+    RespondToClient(client, request, path, title);
+    return false;
 }
 
 static void* RunServer(void*)
@@ -2763,22 +3248,34 @@ static void* RunServer(void*)
                 continue;
             break;
         }
+        ClientSocket socket(client);
         const int noSignal = 1;
-        setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, sizeof(noSignal));
         const timeval timeout{3, 0};
-        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-        setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-        HandleClient(client);
-        close(client);
+        if (setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, sizeof(noSignal)) != 0 ||
+            setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
+            setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0)
+            continue;
+        try
+        {
+            if (HandleClient(client)) socket.release();
+        }
+        catch (...)
+        {
+            Response response{Magic, 9, 0, 0, {}};
+            std::snprintf(response.error, sizeof(response.error), "Native request handling failed");
+            WriteExact(client, &response, sizeof(response));
+        }
     }
     close(server);
     unlink(SocketPath);
     return nullptr;
 }
 
+#ifndef RENIUM_NATIVE_HELPER_TEST
 __attribute__((constructor)) static void StartReniumHelper()
 {
     unsetenv("DYLD_INSERT_LIBRARIES");
+    ReniumInitializeLaunchGuard();
     pthread_t thread;
     if (pthread_create(&thread, nullptr, RunServer, nullptr) == 0)
         pthread_detach(thread);
@@ -2789,3 +3286,4 @@ __attribute__((destructor)) static void StopReniumHelper()
     if (SocketPath[0])
         unlink(SocketPath);
 }
+#endif

@@ -4,17 +4,16 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use walkdir::WalkDir;
 
 use crate::app::output::{log_global, print_json_output};
 use crate::app::timing::current_millis;
 use crate::cli::{EditorRevertArgs, ProjectSourceArgs, PushEditorChangesArgs};
-use crate::editor::sync::push_editor_changes_with_warm_bridge;
+use crate::editor::sync::push_editor_changes_result;
 use crate::editor::types::{EditorChangeSet, EditorHistoryEntry, EditorRevertManifest};
 use crate::project::layout::apply_configured_project_layout;
 use crate::project::sourcemap::path_to_sourcemap_relative;
-use crate::snapshot::export::parse_bridge_ports;
 use crate::studio::bridge::BridgeServer;
 use crate::system::files::{
     absolutize_under, create_unique_directory, path_key, read_json_file,
@@ -307,12 +306,34 @@ pub(crate) fn editor_revert(mut args: EditorRevertArgs) -> Result<()> {
     apply_configured_project_layout(&mut args.project_root, &mut args.src_dir)?;
     let project_root = resolve_project_root_if_present(&args.project_root)?;
     let src_root = absolutize_under(&project_root, &args.src_dir);
+    if let Some(id) = &args.sync {
+        let restored =
+            crate::automation::reconcile::history::revert_sync(&project_root, &src_root, id)?;
+        let mut output = json!({
+            "ok": true,
+            "historyId": restored.id,
+            "changedPathCount": restored.paths.len(),
+        });
+        if args.details {
+            output["changedPaths"] = json!(
+                restored
+                    .paths
+                    .iter()
+                    .map(|path| path_to_sourcemap_relative(&project_root, path))
+                    .collect::<Vec<_>>()
+            );
+        }
+        if let Some(studio) = apply_reverted_paths(args, project_root, restored.paths)? {
+            output["studio"] = studio;
+        }
+        return print_json_output(&output, false);
+    }
     let requested_path = args
         .path
         .as_ref()
         .map(|path| path_key(&absolutize_under(&project_root, path)));
     if requested_path.is_none() && args.settings_id.is_none() {
-        bail!("Provide --path or --settings-id");
+        bail!("Provide --path, --settings-id, or --sync ID|latest");
     }
 
     let history_root = project_root.join(".renium").join("editor-history");
@@ -387,44 +408,43 @@ pub(crate) fn editor_revert(mut args: EditorRevertArgs) -> Result<()> {
         changed_paths.push(to);
     }
 
-    println!(
-        "[renium] editor revert restored: service={}, settings_id={}, path={}",
-        manifest.service,
-        manifest.settings_id.as_deref().unwrap_or(""),
-        manifest.source_path.as_deref().unwrap_or("")
-    );
-    print_json_output(
-        &json!({
-            "ok": true,
-            "service": manifest.service,
-            "settingsId": manifest.settings_id,
-            "sourcePath": manifest.source_path,
-            "changedPaths": changed_paths.iter().map(|path| path_to_sourcemap_relative(&project_root, path)).collect::<Vec<_>>(),
-        }),
-        false,
-    )?;
+    let mut output = json!({
+        "ok": true,
+        "service": manifest.service,
+        "settingsId": manifest.settings_id,
+        "sourcePath": manifest.source_path,
+        "changedPaths": changed_paths.iter().map(|path| path_to_sourcemap_relative(&project_root, path)).collect::<Vec<_>>(),
+    });
+    if let Some(studio) = apply_reverted_paths(args, project_root, changed_paths)? {
+        output["studio"] = studio;
+    }
+    print_json_output(&output, false)
+}
 
+fn apply_reverted_paths(
+    args: EditorRevertArgs,
+    project_root: PathBuf,
+    changed_paths: Vec<PathBuf>,
+) -> Result<Option<Value>> {
     if args.apply_studio && !changed_paths.is_empty() {
-        let ports = parse_bridge_ports(&args.bridge.ports)?;
-        let (bridge, _) =
-            BridgeServer::listen(&args.bridge.host, &ports, args.bridge.wait_seconds)?;
-        push_editor_changes_with_warm_bridge(
-            PushEditorChangesArgs {
-                changed_paths,
-                verify_sources: true,
-                ..PushEditorChangesArgs::new(
-                    ProjectSourceArgs {
-                        project_root,
-                        src_root: args.src_dir,
-                    },
-                    args.bridge,
-                )
-            },
-            &bridge,
-        )?;
+        return push_editor_changes_result(PushEditorChangesArgs {
+            changed_paths,
+            verify_sources: true,
+            ..PushEditorChangesArgs::new(
+                ProjectSourceArgs {
+                    project_root,
+                    src_root: args.src_dir,
+                },
+                args.bridge,
+            )
+        })
+        .map(Some)
+        .context(
+            "Files were restored locally, but Studio sync failed; retry syncing the restored paths",
+        );
     }
 
-    Ok(())
+    Ok(None)
 }
 
 fn sanitize_history_component(value: &str) -> String {

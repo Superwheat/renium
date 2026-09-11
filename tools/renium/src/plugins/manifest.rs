@@ -69,8 +69,8 @@ pub(super) fn validate(manifest: &Manifest) -> Result<()> {
         if !valid_name(name) || name == "help" || command.description.trim().is_empty() {
             bail!("Invalid plugin command {name}");
         }
-        if !(1..=300).contains(&command.timeout_seconds) {
-            bail!("Command timeoutSeconds must be 1–300");
+        if !(1..=3600).contains(&command.timeout_seconds) {
+            bail!("Command timeoutSeconds must be 1–3600");
         }
         if command.arguments.len() > 100 {
             bail!("Too many arguments for {name}");

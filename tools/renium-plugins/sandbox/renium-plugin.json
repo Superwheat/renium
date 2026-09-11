@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "name": "sandbox",
   "version": "0.1.0",
-  "description": "Reserve a disposable published Studio place for one task",
+  "description": "Exclusive disposable Studio places for isolated testing of a worktree",
   "executable": {
     "windows": ["target/release/renium-sandbox.exe"],
     "macos": ["target/release/renium-sandbox"]
@@ -11,37 +11,43 @@
   "guide": "AGENTS.md",
   "commands": {
     "acquire": {
-      "description": "Reserve a configured slot and begin preparing an isolated project",
+      "description": "Reserve a free slot for this task and worktree; nothing opens yet",
+      "timeoutSeconds": 60,
       "arguments": [
-        {"name": "slot", "type": "string", "description": "Optional configured slot name"}
+        {"name": "slot", "type": "string", "description": "Configured slot name; default: any free slot"}
       ]
     },
     "prepare": {
-      "description": "Continue preparation; return when ready or when another bounded step is needed",
+      "description": "Continue toward a clean, loaded Studio; repeat until ready is true",
+      "timeoutSeconds": 900,
       "arguments": [
         {"name": "slot", "type": "string", "description": "Owned slot", "required": true}
       ]
     },
     "refresh": {
-      "description": "Load the worktree's current projection into the owned stopped sandbox",
+      "description": "Replace the stopped sandbox contents with the worktree's current projection",
+      "timeoutSeconds": 900,
       "arguments": [
         {"name": "slot", "type": "string", "description": "Owned slot", "required": true}
       ]
     },
     "run": {
-      "description": "Run a targeted Renium test/capture command in the owned sandbox",
+      "description": "Run a Renium runtime, input or capture command against the owned sandbox",
+      "timeoutSeconds": 300,
       "arguments": [
         {"name": "slot", "type": "string", "description": "Owned slot", "required": true},
-        {"name": "args", "type": "string", "description": "JSON argument array, e.g. [\"status\"]", "required": true},
-        {"name": "reason", "type": "string", "description": "Specific runtime question; required when starting Play"}
+        {"name": "args", "type": "string", "description": "JSON array of command tokens, e.g. [\"status\"]", "required": true},
+        {"name": "reason", "type": "string", "description": "Runtime question being answered; required to start Play or tst"}
       ]
     },
     "release": {
-      "description": "Close the owned Studio, erase test data and reset the slot; resumable on interruption",
+      "description": "Close the owned Studio, erase its test data and return the slot; repeat until released is true",
+      "timeoutSeconds": 600,
       "arguments": [
-        {"name": "slot", "type": "string", "description": "Owned slot", "required": true}
+        {"name": "slot", "type": "string", "description": "Owned slot", "required": true},
+        {"name": "confirm-closed", "type": "boolean", "description": "You closed the test place yourself; only for a lost launch receipt"}
       ]
     },
-    "status": {"description": "Read local slot ownership and progress without opening Studio"}
+    "status": {"description": "Show slot ownership and progress without touching Studio"}
   }
 }

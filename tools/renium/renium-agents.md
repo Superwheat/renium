@@ -31,7 +31,7 @@ When Play is needed, reuse a suitable session. Test related changes together, wi
 | Models, places, packages, links, Git | `RENIUM/projects.md` |
 | Open Cloud and creator assets | `RENIUM/opencloud.md` |
 | Studio lifecycle and place management | `RENIUM/advanced.md` |
-| Workflow plugins and isolated testing | `RENIUM/plugins.md` |
+| Installed plugins and their commands | `RENIUM/plugins.md` |
 
 Read only guides needed for the task, before using their commands. Use command help for options not covered here.
 

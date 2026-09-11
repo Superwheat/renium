@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -43,21 +42,16 @@ pub(crate) struct EditorServiceDocument {
 }
 
 pub(crate) fn read_editor_service_documents(src_root: &Path) -> Result<Vec<EditorServiceDocument>> {
-    if !src_root.is_dir() {
-        return Ok(Vec::new());
-    }
     let mut documents = Vec::new();
-    for entry in
-        fs::read_dir(src_root).with_context(|| format!("Failed to read {}", src_root.display()))?
-    {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let settings_file = service_settings_path(&entry.path());
+    for service_dir in crate::project::storage::service_directories(src_root)? {
+        let settings_file = service_settings_path(&service_dir);
         if settings_file.is_file() {
             documents.push(EditorServiceDocument {
-                service: entry.file_name().to_string_lossy().into_owned(),
+                service: service_dir
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
                 document: SettingsBytecode::read_file(&settings_file)?,
             });
         }
@@ -259,17 +253,11 @@ fn editor_container_class_for_component(
     "Folder"
 }
 
-pub(crate) fn is_protected_starter_player_container(
-    document: &SettingsBytecode,
-    index: usize,
-) -> bool {
+pub(crate) fn is_protected_engine_container(document: &SettingsBytecode, index: usize) -> bool {
     let Some(instance) = document.instances.get(index) else {
         return false;
     };
-    if !matches!(
-        instance.name.as_str(),
-        "StarterCharacterScripts" | "StarterPlayerScripts"
-    ) {
+    if instance.name != instance.class_name {
         return false;
     }
     let Some(parent_index) = instance.parent_index else {
@@ -277,8 +265,11 @@ pub(crate) fn is_protected_starter_player_container(
     };
     document.instances.get(parent_index).is_some_and(|parent| {
         parent.parent_index.is_none()
-            && parent.name == "StarterPlayer"
-            && parent.class_name == "StarterPlayer"
+            && parent.name == parent.class_name
+            && crate::roblox::services::is_engine_managed_container(
+                &parent.class_name,
+                &instance.class_name,
+            )
     })
 }
 

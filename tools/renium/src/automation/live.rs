@@ -22,13 +22,13 @@ use super::runtime::{
 };
 use super::{BoundContext, StudioReopenTarget};
 use crate::app::output::{ensure_plugin_api_ok, log_global};
-use crate::app::timing::elapsed_ms;
+use crate::app::timing::{current_millis, elapsed_ms};
 use crate::editor::sync::{StudioChangeGuard, StudioChangedBeforePush};
 use crate::project::config;
 use crate::snapshot::export::{
     PublishEntryState, PublishedProjectChanges, export_snapshots_with_warm_bridge,
 };
-use crate::studio::bridge::{BridgeServer, BridgeTarget};
+use crate::studio::bridge::{BridgeRequestLease, BridgeServer, BridgeTarget};
 use crate::system::files::{OnDrop, atomic_write_file, fnv1a};
 use crate::system::watch::FileWatcher;
 
@@ -48,6 +48,7 @@ struct EnabledMarker {
 }
 
 pub(super) fn log_live_timing(label: &str, started: Instant) {
+    crate::app::timing::trace_timing("live-sync", label, started);
     log_global(
         4,
         format_args!("[renium] live {label}: {:.1}ms", elapsed_ms(started)),
@@ -146,6 +147,8 @@ fn record_successful_push(status: &mut Status, auto_desynced_packages: Vec<Strin
 
 struct Control {
     stop: AtomicBool,
+    observer_lease: Mutex<Option<Arc<BridgeRequestLease>>>,
+    observer_thread: Mutex<Option<thread::JoinHandle<()>>>,
     retry: AtomicBool,
     retry_pull: AtomicBool,
     reset: AtomicBool,
@@ -209,6 +212,8 @@ impl Control {
     ) -> Self {
         Self {
             stop: AtomicBool::new(false),
+            observer_lease: Mutex::new(None),
+            observer_thread: Mutex::new(None),
             retry: AtomicBool::new(false),
             retry_pull: AtomicBool::new(false),
             reset: AtomicBool::new(false),
@@ -514,10 +519,7 @@ impl Control {
                 .plugin_state
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            let plugin_pending = plugin["pendingChanges"].as_u64().unwrap_or(0) > 0
-                || plugin["dirtyServices"]
-                    .as_array()
-                    .is_some_and(|services| !services.is_empty());
+            let plugin_pending = studio_has_pending_changes(&plugin);
             let settled =
                 !*active && !status.paused && status.pending_paths.is_empty() && !plugin_pending;
             let cannot_progress = !status.running
@@ -541,6 +543,15 @@ impl Control {
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                log_global(
+                    5,
+                    format_args!(
+                        "[renium] live settle deadline: active={} daemon={} plugin={}",
+                        *active,
+                        self.snapshot(),
+                        self.plugin_snapshot()
+                    ),
+                );
                 return false;
             }
             let wait_for = if settled {
@@ -576,11 +587,38 @@ impl Control {
     }
 
     fn set_plugin_state(&self, state: Value) {
-        *self
+        let mut current = self
             .plugin_state
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = state;
-        self.notify_sync_state();
+            .unwrap_or_else(PoisonError::into_inner);
+        if state["runtimeId"].as_str() == current["runtimeId"].as_str()
+            && state["snapshotSeq"]
+                .as_u64()
+                .zip(current["snapshotSeq"].as_u64())
+                .is_some_and(|(incoming, retained)| incoming < retained)
+        {
+            log_global(
+                5,
+                format_args!(
+                    "[renium] live ignored stale Studio snapshot: {} < {}",
+                    state["snapshotSeq"], current["snapshotSeq"]
+                ),
+            );
+            return;
+        }
+        let changed = studio_sync_activity(&state) != studio_sync_activity(&current);
+        log_global(
+            5,
+            format_args!(
+                "[renium] live cached Studio state: snapshot={} seq={} pending={} dirty={}",
+                state["snapshotSeq"], state["seq"], state["pendingChanges"], state["dirtyServices"]
+            ),
+        );
+        *current = state;
+        drop(current);
+        if changed {
+            self.notify_sync_state();
+        }
     }
 
     fn plugin_snapshot(&self) -> Value {
@@ -646,6 +684,16 @@ impl Control {
     }
 
     fn finish(&self) {
+        self.request_stop();
+        if let Some(observer) = self
+            .observer_thread
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+            && observer.join().is_err()
+        {
+            self.fail("Live sync Studio observer panicked".to_string());
+        }
         self.status
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -666,24 +714,66 @@ impl Control {
         }
     }
 
-    fn stop_and_wait(&self, bridge: &BridgeServer, runtime_id: Option<&str>) {
+    fn request_stop(&self) {
         self.stop.store(true, Ordering::Release);
-        if let Some(runtime_id) = runtime_id
-            && let Err(error) = bridge.call_for_runtime_with_timeout(
-                "cancelStudioChangeWait",
-                json!({}),
-                BridgeTarget::Edit,
-                runtime_id,
-                Some(Duration::from_secs(1)),
-            )
+        if let Some(lease) = self
+            .observer_lease
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
         {
-            log_global(
-                5,
-                format_args!("[renium] cancel live change wait: {error:#}"),
-            );
+            lease.cancel();
         }
+    }
+
+    fn begin_studio_wait(&self) -> Result<Arc<BridgeRequestLease>> {
+        static NEXT_OBSERVER: AtomicU64 = AtomicU64::new(0);
+        let mut current = self
+            .observer_lease
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if self.stop.load(Ordering::Acquire) {
+            bail!("Live sync Studio observer stopped");
+        }
+        // A disconnected socket cancels its last lease in Studio. A subsequent
+        // wait must not reuse that lease, even when the same observer survives.
+        let lease = Arc::new(BridgeRequestLease::new(format!(
+            "live-{:x}-{:x}-{:x}",
+            std::process::id(),
+            current_millis(),
+            NEXT_OBSERVER.fetch_add(1, Ordering::Relaxed),
+        )));
+        *current = Some(Arc::clone(&lease));
+        Ok(lease)
+    }
+
+    fn stop_and_wait(&self) {
+        self.request_stop();
         self.wait_finished();
     }
+}
+
+fn studio_has_pending_changes(state: &Value) -> bool {
+    [
+        "pendingChanges",
+        "changeCount",
+        "propertyChangeCount",
+        "editorActionCount",
+        "runtimeSettingChangeCount",
+    ]
+    .iter()
+    .any(|field| state[field].as_u64().unwrap_or(0) > 0)
+        || state["dirtyServices"]
+            .as_array()
+            .is_some_and(|services| !services.is_empty())
+}
+
+fn studio_sync_activity(state: &Value) -> (Option<&str>, Option<u64>, bool) {
+    (
+        state["runtimeId"].as_str(),
+        state["seq"].as_u64(),
+        studio_has_pending_changes(state),
+    )
 }
 
 struct SyncActivity<'a> {
@@ -725,7 +815,6 @@ struct SessionAlias {
 struct Session {
     id: u64,
     control: Arc<Control>,
-    bridge: Arc<BridgeServer>,
     runtime_id: Option<String>,
 }
 
@@ -926,7 +1015,7 @@ impl Manager {
                 });
             }
             drop(sessions);
-            control.stop_and_wait(&bridge, runtime_id.as_deref());
+            control.stop_and_wait();
             sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
             if sessions.get(&setup.key).is_some_and(|current| {
                 current.id == session_id && Arc::ptr_eq(&current.control, &control)
@@ -947,6 +1036,27 @@ impl Manager {
             );
         }
         let phase = Instant::now();
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            let runtime_id = context
+                .runtime_id
+                .as_deref()
+                .context("Live Sync has no Studio runtime")?;
+            let info = bridge.cached_bridge_info_for_runtime(BridgeTarget::Edit, runtime_id)?;
+            let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, runtime_id)?;
+            let state = bridge.call_for_runtime_with_timeout(
+                "getStudioChangeState",
+                json!({"nativeTerrainRelay":true}),
+                BridgeTarget::Edit,
+                runtime_id,
+                Some(Duration::from_secs(3)),
+            )?;
+            ensure_plugin_api_ok(&state)?;
+            let path: Vec<String> = serde_json::from_value(state["nativeTerrainRelay"].clone())
+                .context("Studio plugin does not support Terrain observation; update the plugin")?;
+            crate::studio::native::serializer::observe_terrain(pid, &info.place_name, &path)
+                .context("Could not observe Terrain changes for Live Sync")?;
+        }
         self.coordinator.reconcile(&context, &bridge, &mut setup)?;
         log_live_timing("startup reconcile", phase);
         let phase = Instant::now();
@@ -971,13 +1081,12 @@ impl Manager {
         let session_id = self.next_session.fetch_add(1, Ordering::Relaxed) + 1;
         let context_id = context.id;
         let runtime_id = context.runtime_id.clone();
-        let session_bridge = Arc::clone(&bridge);
         let pair_key = setup.key.clone();
         let worker_control = Arc::clone(&control);
         let coordinator = Arc::clone(&self.coordinator);
         let owner_coordinator = Arc::clone(&coordinator);
         let owner_key = pair_key.clone();
-        let report_bridge = Arc::clone(&session_bridge);
+        let report_bridge = Arc::clone(&bridge);
         let report_runtime = runtime_id.clone();
         let (start_sender, start_receiver) = mpsc::sync_channel(0);
         thread::Builder::new()
@@ -1014,6 +1123,7 @@ impl Manager {
                         worker_control.fail(format!("Live sync watcher panicked: {message}"));
                     }
                 }
+                worker_control.request_stop();
                 worker_control
                     .status
                     .lock()
@@ -1043,7 +1153,6 @@ impl Manager {
                 Session {
                     id: session_id,
                     control: Arc::clone(&control),
-                    bridge: session_bridge,
                     runtime_id,
                 },
             );
@@ -1406,16 +1515,10 @@ impl Manager {
                 .unwrap_or_else(PoisonError::into_inner)
                 .get(&alias.key)
                 .filter(|session| session.id == alias.session_id)
-                .map(|session| {
-                    (
-                        Arc::clone(&session.control),
-                        Arc::clone(&session.bridge),
-                        session.runtime_id.clone(),
-                    )
-                })
+                .map(|session| Arc::clone(&session.control))
         };
-        if let Some((control, bridge, runtime_id)) = session {
-            control.stop_and_wait(&bridge, runtime_id.as_deref());
+        if let Some(control) = session {
+            control.stop_and_wait();
             let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
             if sessions.get(&alias.key).is_some_and(|current| {
                 current.id == alias.session_id && Arc::ptr_eq(&current.control, &control)
@@ -1935,7 +2038,12 @@ enum StudioEvent {
     Error(anyhow::Error),
 }
 
-fn wait_for_studio_event(context: &BoundContext, bridge: &BridgeServer) -> Result<Value> {
+fn wait_for_studio_event(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+    control: &Control,
+) -> Result<Value> {
+    let _lease = bridge.activate_request_lease(control.begin_studio_wait()?)?;
     let runtime_id = context
         .runtime_id
         .as_deref()
@@ -1943,7 +2051,7 @@ fn wait_for_studio_event(context: &BoundContext, bridge: &BridgeServer) -> Resul
     let state = bridge.call_for_runtime_with_timeout(
         "getStudioChangeState",
         json!({
-            "start": true,
+            "start": false,
             "waitSeconds": 25,
             "compact": true,
         }),
@@ -1962,11 +2070,13 @@ fn start_studio_event_waiter(
 ) -> Result<(Receiver<StudioEvent>, SyncSender<()>)> {
     let (event_sender, events) = mpsc::channel();
     let (resume, resume_receiver) = mpsc::sync_channel(1);
-    thread::Builder::new()
+    let observer_control = Arc::clone(&control);
+    let observer = thread::Builder::new()
         .name(format!("renium-studio-events-{}", context.id))
         .spawn(move || {
+            let control = observer_control;
             while !control.stop.load(Ordering::Acquire) && bridge.alive.load(Ordering::Acquire) {
-                let event = match wait_for_studio_event(&context, &bridge) {
+                let event = match wait_for_studio_event(&context, &bridge, &control) {
                     Ok(state) => StudioEvent::State(state),
                     Err(error) => StudioEvent::Error(error),
                 };
@@ -1987,6 +2097,10 @@ fn start_studio_event_waiter(
             }
         })
         .context("Failed to start Studio event waiter")?;
+    *control
+        .observer_thread
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(observer);
     Ok((events, resume))
 }
 
@@ -3213,6 +3327,37 @@ mod tests {
     }
 
     #[test]
+    fn stopping_live_sync_cancels_and_joins_its_observer_before_finishing() {
+        let control = test_control();
+        let previous = control.begin_studio_wait().unwrap();
+        previous.cancel();
+        let lease = control.begin_studio_wait().unwrap();
+        assert_ne!(previous.id(), lease.id());
+        assert!(lease.ensure_active().is_ok());
+        let (cancelled, wait_cancelled) = mpsc::channel();
+        let (release, wait_release) = mpsc::channel();
+        *control.observer_thread.lock().unwrap() = Some(thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !lease.is_cancelled() {
+                assert!(Instant::now() < deadline);
+                thread::yield_now();
+            }
+            cancelled.send(()).unwrap();
+            wait_release.recv_timeout(Duration::from_secs(2)).unwrap();
+        }));
+        let worker_control = Arc::clone(&control);
+        let worker = thread::spawn(move || worker_control.finish());
+        wait_cancelled.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(!*control.finished.lock().unwrap());
+        assert!(control.stop.load(Ordering::Acquire));
+        release.send(()).unwrap();
+        control.stop_and_wait();
+        worker.join().unwrap();
+        assert!(control.observer_thread.lock().unwrap().is_none());
+        assert!(control.begin_studio_wait().is_err());
+    }
+
+    #[test]
     fn plugin_status_reports_failure_recovery_and_stop_without_per_edit_updates() {
         let control = test_control();
         let healthy = control.plugin_live_status();
@@ -3370,6 +3515,70 @@ mod tests {
             );
             assert!(pending.is_empty());
         }
+    }
+
+    #[test]
+    fn settled_wait_rejects_status_delivered_after_its_acknowledgment() {
+        let control = test_control();
+        let stale = crate::studio::automation::compact_live_status(json!({
+            "runtimeId": "studio", "seq": 11, "snapshotSeq": 30,
+            "dirtyServices": ["ReplicatedStorage"], "changeCount": 1,
+            "propertyChangeCount": 1,
+        }));
+        control.set_plugin_state(stale.clone());
+        let acknowledged = json!({
+            "runtimeId": "studio", "seq": 11, "snapshotSeq": 31,
+            "dirtyServices": [], "changeCount": 0, "propertyChangeCount": 0,
+        });
+        control.set_plugin_state(acknowledged.clone());
+        control.set_plugin_state(stale);
+        assert_eq!(control.plugin_snapshot(), acknowledged);
+        assert!(control.wait_settled(Duration::from_secs(1)));
+
+        let edited = json!({
+            "runtimeId": "studio", "seq": 12, "snapshotSeq": 32,
+            "dirtyServices": ["Workspace"], "changeCount": 1,
+        });
+        control.set_plugin_state(edited.clone());
+        control.set_plugin_state(acknowledged);
+        assert_eq!(control.plugin_snapshot(), edited);
+        assert!(!control.wait_settled(Duration::ZERO));
+    }
+
+    #[test]
+    fn unchanged_status_reads_do_not_restart_the_settle_quiet_period() {
+        let control = test_control();
+        control.set_plugin_state(json!({
+            "runtimeId": "studio", "seq": 11, "snapshotSeq": 31,
+            "dirtyServices": [], "changeCount": 0, "propertyChangeCount": 0,
+        }));
+        let activity = control.settle_activity.load(Ordering::Acquire);
+        for snapshot in 32..100 {
+            control.set_plugin_state(json!({
+                "runtimeId": "studio", "seq": 11, "snapshotSeq": snapshot,
+                "dirtyServices": [], "pendingChanges": 0,
+            }));
+        }
+        assert_eq!(control.settle_activity.load(Ordering::Acquire), activity);
+        control.set_plugin_state(json!({
+            "runtimeId": "studio", "seq": 12, "snapshotSeq": 100,
+            "dirtyServices": [], "pendingChanges": 0,
+        }));
+        assert!(control.settle_activity.load(Ordering::Acquire) > activity);
+    }
+
+    #[test]
+    fn studio_snapshot_order_is_scoped_to_its_runtime_and_supports_older_plugins() {
+        let control = test_control();
+        control.set_plugin_state(json!({ "runtimeId": "old", "snapshotSeq": 100 }));
+        let restarted = json!({ "runtimeId": "new", "snapshotSeq": 1 });
+        control.set_plugin_state(restarted.clone());
+        assert_eq!(control.plugin_snapshot(), restarted);
+        let legacy = json!({ "runtimeId": "legacy", "pendingChanges": 1 });
+        control.set_plugin_state(legacy.clone());
+        assert_eq!(control.plugin_snapshot(), legacy);
+        control.set_plugin_state(json!({ "runtimeId": "legacy", "pendingChanges": 0 }));
+        assert!(!studio_has_pending_changes(&control.plugin_snapshot()));
     }
 
     #[test]

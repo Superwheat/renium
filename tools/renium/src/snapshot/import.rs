@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -26,8 +26,7 @@ use crate::project::config;
 use crate::project::layout::apply_configured_project_layout;
 use crate::project::sourcemap::{
     SourcemapNode, build_service_sourcemap_from_state, finalize_project_sourcemap_temp,
-    load_existing_sourcemap_root, path_to_sourcemap_relative, sourcemap_root_is_current,
-    write_project_sourcemap_with_updates,
+    load_existing_sourcemap_root, sourcemap_root_is_current, write_project_sourcemap_with_updates,
 };
 use crate::rbx::encode::settings_root_indices;
 use crate::roblox::schema::{MATERIAL_SERVICE_CLASS, USE_2022_MATERIALS_PROPERTY};
@@ -174,17 +173,11 @@ struct DirectImportSubtreeItem {
     index: usize,
     parent_dir: PathBuf,
     fs_stem: String,
-    output_slot: usize,
     parent_assembly: Arc<SplitNodeAssembly>,
 }
 
 struct SplitNodeAssembly {
-    name: String,
-    class_name: String,
-    file_paths: Vec<String>,
-    child_slots: Vec<usize>,
     remaining_children: AtomicUsize,
-    output_slot: Option<usize>,
     parent: Option<Arc<SplitNodeAssembly>>,
 }
 
@@ -199,7 +192,6 @@ struct SplitDirectImportState {
     expected_paths: Arc<ImportPathSets>,
     settings_write: Mutex<Option<thread::JoinHandle<Result<()>>>>,
     visited: Vec<AtomicBool>,
-    slots: Mutex<Vec<Option<SourcemapNode>>>,
     queued_tasks: AtomicUsize,
     completed_tasks: AtomicUsize,
     total_task_tenths_ms: AtomicU64,
@@ -208,16 +200,27 @@ struct SplitDirectImportState {
     started: Instant,
 }
 
+impl Drop for SplitDirectImportState {
+    fn drop(&mut self) {
+        // Failed planning/emission never reaches root completion. Drain its
+        // writer before the dispatcher can release the surrounding stage. The
+        // writer owns only ServiceState/path references, never this split state.
+        if let Some(handle) = self
+            .settings_write
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            // Normal completion takes the handle and propagates its result;
+            // cleanup must preserve the primary import error or panic.
+            let _ = handle.join();
+        }
+    }
+}
+
 enum SplitImportDecision {
     Queued(Arc<SplitDirectImportState>),
     Inline(ServiceState),
-}
-
-struct SplitNodeShell {
-    name: String,
-    class_name: String,
-    file_paths: Vec<String>,
-    dir_path: PathBuf,
 }
 
 pub(crate) enum SourcemapWriterMessage {
@@ -245,7 +248,10 @@ fn update_sourcemap_service_node(
 impl SourcemapWriter {
     pub(crate) fn start(project_root: PathBuf, durable: bool) -> Self {
         let (sender, receiver) = mpsc::channel::<SourcemapWriterMessage>();
+        let trace_context = crate::app::timing::trace_context();
         let handle = thread::spawn(move || -> Result<()> {
+            let _trace_context =
+                trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
             let existing_root = load_existing_sourcemap_root(&project_root)?;
             let mut wrote_update = existing_root
                 .as_ref()
@@ -525,9 +531,14 @@ impl DirectImportDispatcher {
             run_started,
         };
         let mut workers = Vec::with_capacity(worker_count);
+        let trace_context = crate::app::timing::trace_context();
         for worker_index in 0..worker_count {
             let worker = worker.clone();
-            workers.push(thread::spawn(move || worker.run(worker_index)));
+            workers.push(thread::spawn(move || {
+                let _trace_context = trace_context
+                    .map(|context| crate::app::timing::enter_trace_context(Some(context)));
+                worker.run(worker_index)
+            }));
         }
 
         Ok(Self {
@@ -1864,10 +1875,20 @@ fn maybe_enqueue_split_import_tasks(
     let split_state_setup_started = Instant::now();
     let shared_state = Arc::new(state);
     let settings_state = Arc::clone(&shared_state);
-    let settings_dir = service_dir.clone();
+    // Relocated stores are siblings of src, so renaming the temporary script
+    // directory cannot publish them. Resolve their real service name here;
+    // legacy stores still travel inside the temporary directory.
+    let settings_dir = if crate::project::storage::settings_path(&final_service_dir).is_some() {
+        final_service_dir.clone()
+    } else {
+        service_dir.clone()
+    };
     let settings_expected_paths = Arc::clone(&expected_paths);
     let settings_service = service.to_string();
+    let trace_context = crate::app::timing::trace_context();
     let settings_write = thread::spawn(move || {
+        let _trace_context =
+            trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
         write_service_settings_file(
             &settings_service,
             &settings_state,
@@ -1893,7 +1914,6 @@ fn maybe_enqueue_split_import_tasks(
         expected_paths,
         settings_write: Mutex::new(Some(settings_write)),
         visited,
-        slots: Mutex::new(Vec::new()),
         queued_tasks: AtomicUsize::new(0),
         completed_tasks: AtomicUsize::new(0),
         total_task_tenths_ms: AtomicU64::new(0),
@@ -1906,14 +1926,8 @@ fn maybe_enqueue_split_import_tasks(
         split_state_setup_started,
     );
 
-    let root_child_slots = allocate_split_slots(&shared, named_children.len());
     let root_assembly = Arc::new(SplitNodeAssembly {
-        name: service.to_string(),
-        class_name: service.to_string(),
-        file_paths: Vec::new(),
-        child_slots: root_child_slots.clone(),
-        remaining_children: AtomicUsize::new(root_child_slots.len()),
-        output_slot: None,
+        remaining_children: AtomicUsize::new(named_children.len()),
         parent: None,
     });
 
@@ -1923,12 +1937,7 @@ fn maybe_enqueue_split_import_tasks(
         sender,
         pending_tasks,
     }
-    .plan_children(
-        &service_dir,
-        named_children,
-        root_child_slots,
-        &root_assembly,
-    )?;
+    .plan_children(&service_dir, named_children, &root_assembly)?;
     log_timing(
         &format!("{service}: split task planning"),
         split_task_planning_started,
@@ -1939,14 +1948,6 @@ fn maybe_enqueue_split_import_tasks(
     );
 
     Ok(SplitImportDecision::Queued(shared))
-}
-
-fn allocate_split_slots(shared: &SplitDirectImportState, count: usize) -> Vec<usize> {
-    let mut slots = shared.slots.lock().unwrap_or_else(PoisonError::into_inner);
-    let start = slots.len();
-    slots.resize(start + count, None);
-    drop(slots);
-    (start..start + count).collect()
 }
 
 struct SplitImportPlanner<'a> {
@@ -1999,7 +2000,6 @@ impl SplitImportPlanner<'_> {
         &self,
         parent_dir: &Path,
         named_children: Vec<(usize, String)>,
-        child_slots: Vec<usize>,
         parent_assembly: &Arc<SplitNodeAssembly>,
     ) -> Result<()> {
         let tuning = self.tuning();
@@ -2020,7 +2020,7 @@ impl SplitImportPlanner<'_> {
             Ok(())
         };
 
-        for ((child_index, child_stem), child_slot) in named_children.into_iter().zip(child_slots) {
+        for (child_index, child_stem) in named_children {
             let child_indices = child_indices_for_instance(&self.shared.state, child_index);
             let subtree_size = self
                 .shared
@@ -2050,7 +2050,6 @@ impl SplitImportPlanner<'_> {
                     parent_dir,
                     child_index,
                     child_stem,
-                    child_slot,
                     Arc::clone(parent_assembly),
                 )?;
                 continue;
@@ -2075,7 +2074,6 @@ impl SplitImportPlanner<'_> {
                 index: child_index,
                 parent_dir: parent_dir.to_path_buf(),
                 fs_stem: child_stem,
-                output_slot: child_slot,
                 parent_assembly: Arc::clone(parent_assembly),
             });
         }
@@ -2092,7 +2090,6 @@ impl SplitImportPlanner<'_> {
         parent_dir: &Path,
         index: usize,
         fs_stem: String,
-        output_slot: usize,
         parent_assembly: Arc<SplitNodeAssembly>,
     ) -> Result<()> {
         let tuning = self.tuning();
@@ -2127,29 +2124,22 @@ impl SplitImportPlanner<'_> {
                 index,
                 parent_dir: parent_dir.to_path_buf(),
                 fs_stem,
-                output_slot,
                 parent_assembly,
             }])?;
             return Ok(());
         }
 
-        let Some(shell) = self.emit_node_shell(index, parent_dir, &fs_stem)? else {
+        let Some(dir_path) = self.emit_node_shell(index, parent_dir, &fs_stem)? else {
             bail!("Failed to create split shell for {}", self.shared.service);
         };
 
         let named_children = name_child_indices(&self.shared.state, child_indices);
-        let child_slots = allocate_split_slots(self.shared, named_children.len());
         let assembly = Arc::new(SplitNodeAssembly {
-            name: shell.name,
-            class_name: shell.class_name,
-            file_paths: shell.file_paths,
-            child_slots: child_slots.clone(),
-            remaining_children: AtomicUsize::new(child_slots.len()),
-            output_slot: Some(output_slot),
+            remaining_children: AtomicUsize::new(named_children.len()),
             parent: Some(parent_assembly),
         });
 
-        self.plan_children(&shell.dir_path, named_children, child_slots, &assembly)
+        self.plan_children(&dir_path, named_children, &assembly)
     }
 }
 
@@ -2180,7 +2170,7 @@ impl SplitImportPlanner<'_> {
         index: usize,
         parent_dir: &Path,
         fs_stem: &str,
-    ) -> Result<Option<SplitNodeShell>> {
+    ) -> Result<Option<PathBuf>> {
         if !mark_visited(&self.shared.visited, index) {
             return Ok(None);
         }
@@ -2205,15 +2195,7 @@ impl SplitImportPlanner<'_> {
             write_import_source_file(&source_path, source.as_bytes(), self.shared.fresh_stage)?;
             track_expected_file(&self.shared.expected_paths, &source_path);
 
-            return Ok(Some(SplitNodeShell {
-                name: fs_stem.to_string(),
-                class_name: class_name.to_string(),
-                file_paths: vec![path_to_sourcemap_relative(
-                    &self.shared.project_root,
-                    &source_path,
-                )],
-                dir_path,
-            }));
+            return Ok(Some(dir_path));
         }
 
         if !self
@@ -2232,30 +2214,16 @@ impl SplitImportPlanner<'_> {
             .with_context(|| format!("Failed to create {}", dir_path.display()))?;
         track_expected_dir(&self.shared.expected_paths, &dir_path);
 
-        Ok(Some(SplitNodeShell {
-            name: fs_stem.to_string(),
-            class_name: "Folder".to_string(),
-            file_paths: Vec::new(),
-            dir_path,
-        }))
+        Ok(Some(dir_path))
     }
 }
 
 fn complete_split_slot(
     shared: &SplitDirectImportState,
-    output_slot: usize,
-    node: Option<SourcemapNode>,
     parent_assembly: &Arc<SplitNodeAssembly>,
     service_nodes: &Mutex<HashMap<String, SourcemapNode>>,
     sourcemap_sender: Option<&mpsc::Sender<SourcemapWriterMessage>>,
 ) -> Result<()> {
-    {
-        let mut slots = shared.slots.lock().unwrap_or_else(PoisonError::into_inner);
-        if output_slot < slots.len() {
-            slots[output_slot] = node;
-        }
-    }
-
     if parent_assembly
         .remaining_children
         .fetch_sub(1, Ordering::AcqRel)
@@ -2277,33 +2245,8 @@ fn complete_split_assembly(
         return Ok(());
     }
 
-    let children = {
-        let slots = shared.slots.lock().unwrap_or_else(PoisonError::into_inner);
-        assembly
-            .child_slots
-            .iter()
-            .filter_map(|slot| slots.get(*slot).and_then(std::clone::Clone::clone))
-            .collect::<Vec<_>>()
-    };
-
-    let node = SourcemapNode {
-        name: assembly.name.clone(),
-        class_name: assembly.class_name.clone(),
-        file_paths: assembly.file_paths.clone(),
-        children,
-    };
-
-    if let Some(output_slot) = assembly.output_slot {
-        if let Some(parent) = assembly.parent.as_ref() {
-            complete_split_slot(
-                shared,
-                output_slot,
-                Some(node),
-                parent,
-                service_nodes,
-                sourcemap_sender,
-            )?;
-        }
+    if let Some(parent) = assembly.parent.as_ref() {
+        complete_split_slot(shared, parent, service_nodes, sourcemap_sender)?;
     } else {
         let settings_write = {
             let mut guard = shared
@@ -2388,20 +2331,21 @@ fn process_split_subtree_task(
     let mut completed_slots = Vec::with_capacity(task.items.len());
     let mut local_expected = ExpectedPathBatch::default();
     for item in task.items {
-        let node = emit_node_index(
+        let emitted = emit_node_index(
             &shared.state,
             item.index,
-            &shared.project_root,
             &item.parent_dir,
             &item.fs_stem,
-            shared.fresh_stage,
+            &SourceOutput::Files {
+                fresh: shared.fresh_stage,
+            },
             &shared.visited,
         );
 
-        match node {
-            Ok((node, expected)) => {
+        match emitted {
+            Ok(expected) => {
                 local_expected.extend(expected);
-                completed_slots.push((item.output_slot, node, item.parent_assembly));
+                completed_slots.push(item.parent_assembly);
             }
             Err(err) => {
                 record_split_task_timing(&shared, started);
@@ -2413,15 +2357,8 @@ fn process_split_subtree_task(
 
     record_split_task_timing(&shared, started);
     local_expected.merge_into(&shared.expected_paths);
-    for (output_slot, node, parent_assembly) in completed_slots {
-        complete_split_slot(
-            &shared,
-            output_slot,
-            node,
-            &parent_assembly,
-            service_nodes,
-            sourcemap_sender,
-        )?;
+    for parent_assembly in completed_slots {
+        complete_split_slot(&shared, &parent_assembly, service_nodes, sourcemap_sender)?;
     }
     Ok(())
 }
@@ -2437,8 +2374,11 @@ fn import_service_tree(
     let fresh_service_dir = !cleanup_required;
     let expected_paths = Arc::new(ImportPathSets::default());
     track_expected_dir(&expected_paths, &service_dir);
+    let trace_context = crate::app::timing::trace_context();
     thread::scope(|scope| -> Result<SourcemapNode> {
         let settings_task = scope.spawn(|| {
+            let _trace_context =
+                trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
             write_service_settings_file(
                 service,
                 state,
@@ -2454,12 +2394,13 @@ fn import_service_tree(
         mark_visited(&visited, state.service_root_index);
 
         let root_children = child_indices_for_instance(state, state.service_root_index);
-        let (_, expected_batch) = emit_children_indices(
+        let expected_batch = emit_children_indices(
             state,
             root_children,
-            project_root,
             &service_dir,
-            fresh_service_dir,
+            &SourceOutput::Files {
+                fresh: fresh_service_dir,
+            },
             &visited,
         )?;
         expected_batch.merge_into(&expected_paths);
@@ -2646,6 +2587,12 @@ fn write_service_settings_file(
     fresh_stage: bool,
 ) -> Result<()> {
     let settings_path = service_settings_path(service_dir);
+    // A cloned project can retain its store without an empty script folder.
+    // Fresh scripts do not imply a fresh store or disposable instance IDs.
+    let fresh_stage = fresh_stage && !settings_path.exists();
+    if let Some(parent) = settings_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     track_expected_file(expected_paths, &settings_path);
     if !fresh_stage {
         track_expected_file(
@@ -2747,7 +2694,10 @@ fn spawn_cleanup_service_dir(
     service_dir: PathBuf,
     expected_paths: Arc<ImportPathSets>,
 ) -> thread::JoinHandle<Result<()>> {
+    let trace_context = crate::app::timing::trace_context();
     thread::spawn(move || -> Result<()> {
+        let _trace_context =
+            trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
         let cleanup_started = Instant::now();
         cleanup_service_dir(&service_dir, &expected_paths)?;
         log_timing(
@@ -2900,17 +2850,100 @@ fn collect_stale_paths(
     Ok(())
 }
 
+enum SourceOutput {
+    Files { fresh: bool },
+    Memory(Mutex<BTreeMap<PathBuf, Option<Vec<u8>>>>),
+}
+
+impl SourceOutput {
+    fn directory(&self, path: &Path) -> Result<()> {
+        match self {
+            Self::Files { .. } => fs::create_dir_all(path)
+                .with_context(|| format!("Failed to create {}", path.display())),
+            Self::Memory(entries) => {
+                let mut entries = entries.lock().unwrap_or_else(PoisonError::into_inner);
+                let entry = entries.entry(path.to_owned()).or_insert(None);
+                anyhow::ensure!(
+                    entry.is_none(),
+                    "Projected directory collides with a file: {}",
+                    path.display()
+                );
+                Ok(())
+            }
+        }
+    }
+
+    fn source(&self, path: &Path, source: &str) -> Result<()> {
+        match self {
+            Self::Files { fresh } => write_script_source_file(path, source, *fresh),
+            Self::Memory(entries) => {
+                // Verification cannot manufacture an empty script for missing Source.
+                anyhow::ensure!(
+                    source != EXTERNAL_SOURCE_MARKER,
+                    "Missing fetched Source for {}",
+                    path.display()
+                );
+                let previous = entries
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(path.to_owned(), Some(source.as_bytes().to_vec()));
+                anyhow::ensure!(
+                    previous.is_none(),
+                    "Projected source path already exists: {}",
+                    path.display()
+                );
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Project the same settings, script names and directories as a fresh import,
+/// without touching disk or constructing the full editor sourcemap.
+pub(crate) fn service_projection_in_memory(
+    state: &ServiceState,
+    src_root: &Path,
+    service: &str,
+) -> Result<BTreeMap<PathBuf, Option<Vec<u8>>>> {
+    let service_dir = src_root.join(sanitize_name(service));
+    let settings_path = service_settings_path(&service_dir);
+    let output = SourceOutput::Memory(Mutex::new(BTreeMap::new()));
+    output.directory(&service_dir)?;
+    let (settings, sources) = rayon::join(
+        || encode_service_settings_binary(&settings_path, state),
+        || {
+            let visited = (0..state.instances.len())
+                .map(|_| AtomicBool::new(false))
+                .collect::<Vec<_>>();
+            mark_visited(&visited, state.service_root_index);
+            emit_children_indices(
+                state,
+                child_indices_for_instance(state, state.service_root_index),
+                &service_dir,
+                &output,
+                &visited,
+            )
+        },
+    );
+    sources?;
+    let SourceOutput::Memory(entries) = output else {
+        unreachable!()
+    };
+    let mut entries = entries.into_inner().unwrap_or_else(PoisonError::into_inner);
+    entries.insert(settings_path, Some(settings?));
+    Ok(entries)
+}
+
 fn emit_node_index(
     state: &ServiceState,
     index: usize,
-    project_root: &Path,
     parent_dir: &Path,
     fs_stem: &str,
-    fresh_stage: bool,
+    output: &SourceOutput,
     visited: &[AtomicBool],
-) -> Result<(Option<SourcemapNode>, ExpectedPathBatch)> {
+) -> Result<ExpectedPathBatch> {
     if !mark_visited(visited, index) {
-        return Ok((None, ExpectedPathBatch::default()));
+        return Ok(ExpectedPathBatch::default());
     }
 
     let instance = &state.instances[index];
@@ -2934,90 +2967,46 @@ fn emit_node_index(
 
         if has_children {
             let dir_path = parent_dir.join(fs_stem);
-            fs::create_dir_all(&dir_path)
-                .with_context(|| format!("Failed to create {}", dir_path.display()))?;
+            output.directory(&dir_path)?;
             expected.track_dir(&dir_path);
             let source_path = dir_path.join(source_file_name);
-            write_script_source_file(&source_path, source, fresh_stage)?;
+            output.source(&source_path, source)?;
             expected.track_file(&source_path);
 
-            let (children, child_expected) = emit_children_indices(
-                state,
-                child_indices,
-                project_root,
-                &dir_path,
-                fresh_stage,
-                visited,
-            )?;
+            let child_expected =
+                emit_children_indices(state, child_indices, &dir_path, output, visited)?;
             expected.extend(child_expected);
-            return Ok((
-                Some(SourcemapNode {
-                    name: fs_stem.to_string(),
-                    class_name: class_name.to_string(),
-                    file_paths: vec![path_to_sourcemap_relative(project_root, &source_path)],
-                    children,
-                }),
-                expected,
-            ));
+            return Ok(expected);
         }
 
         let script_path = parent_dir.join(format!("{fs_stem}{leaf_suffix}"));
-        write_script_source_file(&script_path, source, fresh_stage)?;
+        output.source(&script_path, source)?;
         expected.track_file(&script_path);
 
-        return Ok((
-            Some(SourcemapNode {
-                name: fs_stem.to_string(),
-                class_name: class_name.to_string(),
-                file_paths: vec![path_to_sourcemap_relative(project_root, &script_path)],
-                children: Vec::new(),
-            }),
-            expected,
-        ));
+        return Ok(expected);
     }
 
     if !state.source_in_subtree.get(index).copied().unwrap_or(false) {
-        return Ok((None, expected));
+        return Ok(expected);
     }
 
     let dir_path = parent_dir.join(fs_stem);
-    fs::create_dir_all(&dir_path)
-        .with_context(|| format!("Failed to create {}", dir_path.display()))?;
+    output.directory(&dir_path)?;
     expected.track_dir(&dir_path);
 
-    let (children, child_expected) = emit_children_indices(
-        state,
-        child_indices,
-        project_root,
-        &dir_path,
-        fresh_stage,
-        visited,
-    )?;
+    let child_expected = emit_children_indices(state, child_indices, &dir_path, output, visited)?;
     expected.extend(child_expected);
 
-    if children.is_empty() {
-        return Ok((None, expected));
-    }
-
-    Ok((
-        Some(SourcemapNode {
-            name: fs_stem.to_string(),
-            class_name: "Folder".to_string(),
-            file_paths: Vec::new(),
-            children,
-        }),
-        expected,
-    ))
+    Ok(expected)
 }
 
 fn emit_children_indices(
     state: &ServiceState,
     child_indices: &[usize],
-    project_root: &Path,
     dir_path: &Path,
-    fresh_stage: bool,
+    output: &SourceOutput,
     visited: &[AtomicBool],
-) -> Result<(Vec<SourcemapNode>, ExpectedPathBatch)> {
+) -> Result<ExpectedPathBatch> {
     let named_children = name_child_indices(state, child_indices);
 
     const PARALLEL_CHILD_THRESHOLD: usize = 8;
@@ -3025,45 +3014,22 @@ fn emit_children_indices(
         let built = named_children
             .par_iter()
             .map(|(child_index, child_stem)| {
-                emit_node_index(
-                    state,
-                    *child_index,
-                    project_root,
-                    dir_path,
-                    child_stem,
-                    fresh_stage,
-                    visited,
-                )
+                emit_node_index(state, *child_index, dir_path, child_stem, output, visited)
             })
             .collect::<Result<Vec<_>>>()?;
-        let mut nodes = Vec::with_capacity(named_children.len());
         let mut expected = ExpectedPathBatch::default();
-        for (node, child_expected) in built {
-            if let Some(node) = node {
-                nodes.push(node);
-            }
+        for child_expected in built {
             expected.extend(child_expected);
         }
-        Ok((nodes, expected))
+        Ok(expected)
     } else {
-        let mut built = Vec::with_capacity(named_children.len());
         let mut expected = ExpectedPathBatch::default();
         for (child_index, child_stem) in named_children {
-            let (node, child_expected) = emit_node_index(
-                state,
-                child_index,
-                project_root,
-                dir_path,
-                &child_stem,
-                fresh_stage,
-                visited,
-            )?;
+            let child_expected =
+                emit_node_index(state, child_index, dir_path, &child_stem, output, visited)?;
             expected.extend(child_expected);
-            if let Some(node) = node {
-                built.push(node);
-            }
         }
-        Ok((built, expected))
+        Ok(expected)
     }
 }
 
@@ -3103,4 +3069,649 @@ fn write_script_source_file(source_path: &Path, source: &str, fresh_stage: bool)
         return write_import_source_file(source_path, b"", fresh_stage);
     }
     write_import_source_file(source_path, source.as_bytes(), fresh_stage)
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn test_root() -> Result<PathBuf> {
+        let parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/projection-tests");
+        fs::create_dir_all(&parent)?;
+        crate::system::files::create_unique_directory(&parent, "split-")
+    }
+
+    fn recursive_state() -> Result<ServiceState> {
+        let mut instances = vec![SnapshotInstance {
+            name: "ReplicatedStorage".into(),
+            class_name: "ReplicatedStorage".into(),
+            instance_index: Some(1),
+            ..Default::default()
+        }];
+        for (name, class) in [("Branch?", "ModuleScript"), ("Branch*", "Part")] {
+            let parent = instances.len() + 1;
+            instances.push(SnapshotInstance {
+                name: name.into(),
+                class_name: class.into(),
+                instance_index: Some(parent),
+                parent_index: Some(1),
+                properties: if class == "ModuleScript" {
+                    Map::from_iter([("Source".into(), json!("return {}"))])
+                } else {
+                    Map::new()
+                },
+                ..Default::default()
+            });
+            // Above both script-based split thresholds, with colliding stems,
+            // script containers, non-script descendants and native references.
+            for index in 0..70 {
+                let id = instances.len() + 1;
+                instances.push(SnapshotInstance {
+                    name: if index % 2 == 0 { "Code?" } else { "Code*" }.into(),
+                    class_name: ["ModuleScript", "Script", "LocalScript"][index % 3].into(),
+                    instance_index: Some(id),
+                    parent_index: Some(parent),
+                    properties: Map::from_iter([
+                        (
+                            "Source".into(),
+                            json!(format!("-- {index}\r\nreturn {index}\r\n")),
+                        ),
+                        (
+                            "RunContext".into(),
+                            json!(["Legacy", "Client", "Plugin"][index % 3]),
+                        ),
+                    ]),
+                    attributes: Map::from_iter([("enabled".into(), json!(false))]),
+                    ..Default::default()
+                });
+                if index % 5 == 0 {
+                    instances.push(SnapshotInstance {
+                        name: "Data".into(),
+                        class_name: "ObjectValue".into(),
+                        instance_index: Some(id + 1),
+                        parent_index: Some(id),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        let mut state = build_service_state_from_instances(
+            "ReplicatedStorage",
+            None,
+            instances,
+            HashMap::new(),
+            true,
+        )?;
+        let target = state
+            .instances
+            .iter()
+            .position(|instance| instance.name == "Branch*")
+            .unwrap();
+        let mut native = vec![Vec::new(); state.instances.len()];
+        for (index, instance) in state.instances.iter().enumerate() {
+            if instance.class_name == "ObjectValue" {
+                native[index].push(crate::snapshot::types::NativeSettingsProperty {
+                    name: "Value".into(),
+                    value: crate::snapshot::types::NativeSettingsValue::Ref(target),
+                });
+            }
+        }
+        state.native_properties_by_instance = Some(native);
+        Ok(state)
+    }
+
+    fn files_under(root: &Path) -> Result<BTreeMap<PathBuf, Option<Vec<u8>>>> {
+        walkdir::WalkDir::new(root)
+            .into_iter()
+            .map(|entry| {
+                let entry = entry?;
+                let bytes = if entry.file_type().is_dir() {
+                    None
+                } else {
+                    Some(fs::read(entry.path())?)
+                };
+                Ok((entry.path().strip_prefix(root)?.to_owned(), bytes))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn split_import_matches_inline_files_settings_and_sourcemap() -> Result<()> {
+        let root = test_root()?;
+        let _cleanup = OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&root);
+        });
+        let state = recursive_state()?;
+        for (workers, existing, relocated, store_only) in [
+            (1, false, false, false),
+            (4, true, false, false),
+            (1, false, true, false),
+            (4, true, true, false),
+            (4, true, true, true),
+        ] {
+            let inline = root.join(format!("inline-{workers}-{relocated}-{store_only}"));
+            let split = root.join(format!("split-{workers}-{relocated}-{store_only}"));
+            if relocated {
+                for project in [&inline, &split] {
+                    fs::create_dir_all(project)?;
+                    let path = project.join("renium.project.jsonc");
+                    fs::write(&path, br#"{"schemaVersion":1,"sourceRoot":"src"}"#)?;
+                    config::load_project(Some(&path), None)?;
+                }
+            }
+            if existing {
+                let mut old = state.clone();
+                for instance in &mut old.instances {
+                    if instance.properties.contains_key("Source") {
+                        instance
+                            .properties
+                            .insert("Source".into(), json!("-- previous source"));
+                    }
+                }
+                for project in [&inline, &split] {
+                    import_service_tree(&old, project, &project.join("src"), "ReplicatedStorage")?;
+                    let stale = project.join("src/ReplicatedStorage/stale");
+                    fs::create_dir_all(&stale)?;
+                    fs::write(stale.join("removed.luau"), b"return false")?;
+                    if store_only {
+                        fs::remove_dir_all(project.join("src"))?;
+                    }
+                }
+            }
+            let expected =
+                import_service_tree(&state, &inline, &inline.join("src"), "ReplicatedStorage")?;
+            let (sender, receiver) = mpsc::channel();
+            let dispatcher = DirectImportDispatcher::start(
+                split.clone(),
+                PathBuf::from("src"),
+                workers,
+                workers,
+                Some(sender),
+                Instant::now(),
+            )?;
+            let decision = maybe_enqueue_split_import_tasks(
+                dispatcher.queue.as_ref().unwrap(),
+                &dispatcher.pending_tasks,
+                &split,
+                &split.join("src"),
+                "ReplicatedStorage",
+                state.clone(),
+            )?;
+            let SplitImportDecision::Queued(shared) = decision else {
+                panic!("Fixture must exercise recursive split emission");
+            };
+            assert!(shared.queued_tasks.load(Ordering::Acquire) > 2);
+            let observed = dispatcher.finish()?;
+            assert!(shared.settings_write.lock().unwrap().is_none());
+            assert_eq!(
+                serde_json::to_value(&observed["ReplicatedStorage"])?,
+                serde_json::to_value(&expected)?
+            );
+            assert_eq!(
+                files_under(&inline.join("src"))?,
+                files_under(&split.join("src"))?
+            );
+            if relocated {
+                assert_eq!(
+                    files_under(&inline.join("instances"))?,
+                    files_under(&split.join("instances"))?
+                );
+                assert!(split.join("instances/ReplicatedStorage.renium").is_file());
+                assert!(
+                    !split
+                        .join("src/ReplicatedStorage/__roblox_sync_settings.renium")
+                        .exists()
+                );
+            }
+            assert!(!split.join("src/ReplicatedStorage/stale").exists());
+            let SourcemapWriterMessage::Service(service, published) = receiver.try_recv()? else {
+                panic!("Expected one service completion");
+            };
+            assert_eq!(service, "ReplicatedStorage");
+            assert_eq!(
+                serde_json::to_value(published)?,
+                serde_json::to_value(expected)?
+            );
+            assert!(receiver.try_recv().is_err());
+        }
+        Ok(())
+    }
+
+    #[derive(Clone, Copy)]
+    enum SettingsOutcome {
+        Success,
+        Error,
+        Panic,
+    }
+
+    fn held_settings_writer(
+        directory: PathBuf,
+        outcome: SettingsOutcome,
+        finished: Arc<AtomicBool>,
+    ) -> (thread::JoinHandle<Result<()>>, mpsc::Sender<()>) {
+        let (resume, paused) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            paused.recv_timeout(Duration::from_secs(5))?;
+            fs::write(service_settings_path(&directory), b"settings fixture")?;
+            finished.store(true, Ordering::Release);
+            match outcome {
+                SettingsOutcome::Success => Ok(()),
+                SettingsOutcome::Error => bail!("settings fixture failure"),
+                SettingsOutcome::Panic => panic!("settings fixture panic"),
+            }
+        });
+        (writer, resume)
+    }
+
+    fn held_split_state(
+        project: &Path,
+        state: ServiceState,
+        writer: thread::JoinHandle<Result<()>>,
+    ) -> SplitDirectImportState {
+        let visited = (0..state.instances.len())
+            .map(|_| AtomicBool::new(false))
+            .collect();
+        SplitDirectImportState {
+            service: "ReplicatedStorage".into(),
+            service_dir: project.join("stage"),
+            final_service_dir: project.join("src/ReplicatedStorage"),
+            fresh_stage: true,
+            cleanup_required: false,
+            project_root: project.to_owned(),
+            state: Arc::new(state),
+            expected_paths: Default::default(),
+            settings_write: Mutex::new(Some(writer)),
+            visited,
+            queued_tasks: AtomicUsize::new(0),
+            completed_tasks: AtomicUsize::new(0),
+            total_task_tenths_ms: AtomicU64::new(0),
+            max_task_tenths_ms: AtomicU64::new(0),
+            failed: AtomicBool::new(false),
+            started: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn split_error_drop_joins_settings_and_preserves_primary_error() -> Result<()> {
+        for outcome in [SettingsOutcome::Error, SettingsOutcome::Panic] {
+            for failure in ["emission", "planning", "unwind"] {
+                let root = test_root()?;
+                let _cleanup = OnDrop::new(|| {
+                    let _ = fs::remove_dir_all(&root);
+                });
+                let stage = root.join("stage");
+                fs::create_dir_all(stage.join("Collision.luau"))?;
+                let state = recursive_state()?;
+                let index = state
+                    .instances
+                    .iter()
+                    .enumerate()
+                    .find(|(index, instance)| {
+                        instance.class_name == "ModuleScript"
+                            && child_indices_for_instance(&state, *index).is_empty()
+                    })
+                    .unwrap()
+                    .0;
+                let writer_finished = Arc::new(AtomicBool::new(false));
+                let (writer, resume) =
+                    held_settings_writer(stage.clone(), outcome, Arc::clone(&writer_finished));
+                let shared = Arc::new(held_split_state(&root, state, writer));
+                let nodes = Mutex::new(HashMap::new());
+                let (sender, receiver) = mpsc::channel();
+                thread::scope(|scope| -> Result<()> {
+                    let _release_on_error = OnDrop::new(|| {
+                        let _ = resume.send(());
+                    });
+                    let (entered, entry) = mpsc::channel();
+                    let (completed, completion) = mpsc::channel();
+                    let nodes = &nodes;
+                    let worker = scope.spawn(move || -> Result<String> {
+                        entered.send(())?;
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                            || -> Result<()> {
+                                let assembly = Arc::new(SplitNodeAssembly {
+                                    remaining_children: AtomicUsize::new(1),
+                                    parent: None,
+                                });
+                                let item = DirectImportSubtreeItem {
+                                    index,
+                                    parent_dir: shared.service_dir.clone(),
+                                    fs_stem: "Collision".into(),
+                                    parent_assembly: assembly,
+                                };
+                                match failure {
+                                    "emission" => process_split_subtree_task(
+                                        DirectImportSubtreeTask {
+                                            shared,
+                                            items: vec![item],
+                                        },
+                                        nodes,
+                                        Some(&sender),
+                                        Instant::now(),
+                                    ),
+                                    "planning" => {
+                                        let queue = DirectImportTaskQueue::new(1);
+                                        queue.close();
+                                        SplitImportPlanner {
+                                            shared: &shared,
+                                            sender: &queue,
+                                            pending_tasks: &AtomicUsize::new(0),
+                                        }
+                                        .queue_subtrees(vec![item])
+                                    }
+                                    _ => {
+                                        let _shared = shared;
+                                        panic!("primary import panic");
+                                    }
+                                }
+                            },
+                        ));
+                        // The writer's error/panic must not replace this result,
+                        // and stage cleanup cannot run until the writer stopped.
+                        let primary = match result {
+                            Ok(result) => format!("{:#}", result.unwrap_err()),
+                            Err(payload) => payload.downcast_ref::<&str>().unwrap().to_string(),
+                        };
+                        assert!(writer_finished.load(Ordering::Acquire));
+                        fs::remove_dir_all(stage)?;
+                        completed.send(())?;
+                        Ok(primary)
+                    });
+                    entry.recv_timeout(Duration::from_secs(5))?;
+                    assert!(matches!(
+                        completion.recv_timeout(Duration::from_millis(50)),
+                        Err(mpsc::RecvTimeoutError::Timeout)
+                    ));
+                    resume.send(())?;
+                    let error = worker.join().unwrap()?;
+                    assert!(
+                        error.contains(match failure {
+                            "emission" => "Collision.luau",
+                            "planning" => "dispatcher is closed",
+                            _ => "primary import panic",
+                        }),
+                        "{error}"
+                    );
+                    assert!(!error.contains("settings fixture"));
+                    Ok(())
+                })?;
+                assert!(!root.join("stage").exists());
+                assert!(!root.join("src/ReplicatedStorage").exists());
+                assert!(nodes.lock().unwrap().is_empty());
+                assert!(receiver.try_recv().is_err());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn split_completion_waits_for_settings_and_propagates_failures() -> Result<()> {
+        for outcome in [
+            SettingsOutcome::Success,
+            SettingsOutcome::Error,
+            SettingsOutcome::Panic,
+        ] {
+            let root = test_root()?;
+            let _cleanup = OnDrop::new(|| {
+                let _ = fs::remove_dir_all(&root);
+            });
+            fs::create_dir_all(root.join("stage"))?;
+            fs::create_dir_all(root.join("src"))?;
+            let finished = Arc::new(AtomicBool::new(false));
+            let (writer, resume) =
+                held_settings_writer(root.join("stage"), outcome, Arc::clone(&finished));
+            let shared = held_split_state(&root, recursive_state()?, writer);
+            let assembly = Arc::new(SplitNodeAssembly {
+                remaining_children: AtomicUsize::new(2),
+                parent: None,
+            });
+            let nodes = Mutex::new(HashMap::new());
+            let (sender, receiver) = mpsc::channel();
+            complete_split_slot(&shared, &assembly, &nodes, Some(&sender))?;
+            thread::scope(|scope| -> Result<()> {
+                let _release_on_error = OnDrop::new(|| {
+                    let _ = resume.send(());
+                });
+                let (entered, entry) = mpsc::channel();
+                let (completed, completion) = mpsc::channel();
+                let (shared, assembly, nodes, sender) = (&shared, &assembly, &nodes, &sender);
+                let worker = scope.spawn(move || {
+                    entered.send(()).unwrap();
+                    let result = complete_split_slot(shared, assembly, nodes, Some(sender));
+                    completed.send(()).unwrap();
+                    result
+                });
+                entry.recv_timeout(Duration::from_secs(5))?;
+                assert!(matches!(
+                    completion.recv_timeout(Duration::from_millis(50)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ));
+                assert!(!shared.final_service_dir.exists());
+                assert!(nodes.lock().unwrap().is_empty());
+                assert!(receiver.try_recv().is_err());
+                resume.send(())?;
+                let result = worker.join().unwrap();
+                assert!(finished.load(Ordering::Acquire));
+                match outcome {
+                    SettingsOutcome::Success => {
+                        result?;
+                        assert!(shared.final_service_dir.exists());
+                        assert!(matches!(
+                            receiver.try_recv()?,
+                            SourcemapWriterMessage::Service(_, _)
+                        ));
+                    }
+                    SettingsOutcome::Error => assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("settings fixture failure")
+                    ),
+                    SettingsOutcome::Panic => assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("settings write worker panicked")
+                    ),
+                }
+                Ok(())
+            })?;
+            assert!(shared.settings_write.lock().unwrap().is_none());
+            if !matches!(outcome, SettingsOutcome::Success) {
+                assert!(!shared.final_service_dir.exists());
+                assert!(nodes.lock().unwrap().is_empty());
+                assert!(receiver.try_recv().is_err());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn split_completion_publishes_full_sourcemap_only_after_all_children() -> Result<()> {
+        let project = PathBuf::from("projection-completion");
+        let directory = project.join("src/ReplicatedStorage");
+        let state = build_service_state_from_instances(
+            "ReplicatedStorage",
+            None,
+            vec![
+                SnapshotInstance {
+                    name: "ReplicatedStorage".into(),
+                    class_name: "ReplicatedStorage".into(),
+                    instance_index: Some(1),
+                    ..Default::default()
+                },
+                SnapshotInstance {
+                    name: "Code".into(),
+                    class_name: "ModuleScript".into(),
+                    instance_index: Some(2),
+                    parent_index: Some(1),
+                    properties: Map::from_iter([("Source".into(), json!("return true"))]),
+                    ..Default::default()
+                },
+                SnapshotInstance {
+                    name: "Data".into(),
+                    class_name: "ObjectValue".into(),
+                    instance_index: Some(3),
+                    parent_index: Some(2),
+                    ..Default::default()
+                },
+            ],
+            HashMap::new(),
+            true,
+        )?;
+        let expected = build_service_sourcemap_from_state(&state, &project, &directory);
+        for fail in [false, true] {
+            let shared = SplitDirectImportState {
+                service: "ReplicatedStorage".into(),
+                service_dir: directory.clone(),
+                final_service_dir: directory.clone(),
+                fresh_stage: false,
+                cleanup_required: false,
+                project_root: project.clone(),
+                state: Arc::new(state.clone()),
+                expected_paths: Default::default(),
+                settings_write: Mutex::new(None),
+                visited: vec![],
+                queued_tasks: AtomicUsize::new(0),
+                completed_tasks: AtomicUsize::new(0),
+                total_task_tenths_ms: AtomicU64::new(0),
+                max_task_tenths_ms: AtomicU64::new(0),
+                failed: AtomicBool::new(false),
+                started: Instant::now(),
+            };
+            let root = Arc::new(SplitNodeAssembly {
+                remaining_children: AtomicUsize::new(2),
+                parent: None,
+            });
+            let nested = Arc::new(SplitNodeAssembly {
+                remaining_children: AtomicUsize::new(2),
+                parent: Some(Arc::clone(&root)),
+            });
+            let nodes = Mutex::new(HashMap::new());
+            let (sender, receiver) = mpsc::channel();
+            complete_split_slot(&shared, &nested, &nodes, Some(&sender))?;
+            complete_split_slot(&shared, &root, &nodes, Some(&sender))?;
+            assert!(nodes.lock().unwrap().is_empty());
+            assert!(receiver.try_recv().is_err());
+            shared.failed.store(fail, Ordering::Release);
+            complete_split_slot(&shared, &nested, &nodes, Some(&sender))?;
+            if fail {
+                assert!(nodes.lock().unwrap().is_empty());
+                assert!(receiver.try_recv().is_err());
+            } else {
+                let observed = nodes.lock().unwrap();
+                assert_eq!(
+                    serde_json::to_value(&observed["ReplicatedStorage"])?,
+                    serde_json::to_value(&expected)?
+                );
+                assert!(matches!(
+                    receiver.try_recv()?,
+                    SourcemapWriterMessage::Service(_, _)
+                ));
+                assert!(
+                    receiver.try_recv().is_err(),
+                    "Sourcemap must be published once"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn memory_projection_matches_fresh_import_bytes_and_paths() -> Result<()> {
+        let parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/projection-tests");
+        fs::create_dir_all(&parent)?;
+        let root = crate::system::files::create_unique_directory(&parent, "projection-")?;
+        let _cleanup = OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&root);
+        });
+        let source = root.join("src");
+        let mut instances = vec![SnapshotInstance {
+            name: "ReplicatedStorage".into(),
+            class_name: "ReplicatedStorage".into(),
+            instance_index: Some(1),
+            ..Default::default()
+        }];
+        // Duplicate sanitized names, all script classes and RunContext variants,
+        // child-bearing scripts, no-source subtrees, references and native values.
+        for index in 0..24 {
+            let id = instances.len() + 1;
+            instances.push(SnapshotInstance {
+                name: if index % 2 == 0 { "same?" } else { "same*" }.into(),
+                class_name: ["ModuleScript", "Script", "LocalScript"][index % 3].into(),
+                instance_index: Some(id),
+                parent_index: Some(1),
+                properties: Map::from_iter([
+                    (
+                        "Source".into(),
+                        json!(format!("-- {index}\r\nreturn {index}\r\n")),
+                    ),
+                    (
+                        "RunContext".into(),
+                        json!(["Legacy", "Client", "Plugin"][index % 3]),
+                    ),
+                ]),
+                attributes: Map::from_iter([("enabled".into(), json!(false))]),
+                ..Default::default()
+            });
+            if index % 2 == 0 {
+                instances.push(SnapshotInstance {
+                    name: "Not a script".into(),
+                    class_name: "ObjectValue".into(),
+                    instance_index: Some(id + 1),
+                    parent_index: Some(id),
+                    ..Default::default()
+                });
+            }
+        }
+        let mut state = build_service_state_from_instances(
+            "ReplicatedStorage",
+            None,
+            instances,
+            HashMap::new(),
+            true,
+        )?;
+        let mut native = vec![Vec::new(); state.instances.len()];
+        for (index, instance) in state.instances.iter().enumerate() {
+            if instance.class_name == "ObjectValue" {
+                native[index].push(crate::snapshot::types::NativeSettingsProperty {
+                    name: "Value".into(),
+                    value: crate::snapshot::types::NativeSettingsValue::Ref(1),
+                });
+            }
+        }
+        state.native_properties_by_instance = Some(native);
+        let projected = service_projection_in_memory(&state, &source, "ReplicatedStorage")?;
+        assert!(!source.exists(), "Memory projection wrote to disk");
+        import_service_tree(&state, &root, &source, "ReplicatedStorage")?;
+        let observed = walkdir::WalkDir::new(source.join("ReplicatedStorage"))
+            .into_iter()
+            .map(|entry| {
+                let entry = entry?;
+                let value = if entry.file_type().is_dir() {
+                    None
+                } else {
+                    Some(fs::read(entry.path())?)
+                };
+                Ok((entry.into_path(), value))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        assert_eq!(projected, observed);
+        let collision = SourceOutput::Memory(Mutex::new(BTreeMap::new()));
+        let file = source.join("collision.luau");
+        collision.source(&file, "return true")?;
+        assert!(collision.directory(&file).is_err());
+        assert!(collision.source(&file, "return false").is_err());
+        state.instances[1]
+            .properties
+            .insert("Source".into(), json!(EXTERNAL_SOURCE_MARKER));
+        assert!(
+            service_projection_in_memory(&state, &source, "ReplicatedStorage")
+                .unwrap_err()
+                .to_string()
+                .contains("Missing fetched Source")
+        );
+        Ok(())
+    }
 }

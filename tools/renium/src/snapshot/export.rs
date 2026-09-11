@@ -227,10 +227,11 @@ fn prepare_bridge_for_next_run(bridge: &BridgeServer) {
     }
 }
 
-fn record_bridge_sync_completion(bridge: &BridgeServer) {
-    if let Err(err) = bridge.call("recordSyncCompletion", json!({})) {
-        println!("[renium] warning: failed to update the Studio sync timestamp: {err:#}");
-    }
+fn record_bridge_sync_completion(bridge: &BridgeServer) -> Result<()> {
+    bridge
+        .call("recordSyncCompletion", json!({}))
+        .context("Failed to record Studio sync completion after export publication")?;
+    Ok(())
 }
 
 pub(crate) fn is_transient_bridge_error(err: &anyhow::Error) -> bool {
@@ -489,83 +490,22 @@ impl ExportProjectStage {
         let staged_root = container.join(project_name);
         fs::create_dir_all(&staged_root)
             .with_context(|| format!("Failed to create {}", staged_root.display()))?;
-        let loaded = config::try_load_project(None, Some(project_root))?
+        let mut loaded = config::try_load_project(None, Some(project_root))?
             .filter(|loaded| loaded.root == project_root);
+        if let Some(loaded) = loaded.as_mut() {
+            scope_export_project(loaded, services);
+        }
         let mut publish_paths = Vec::new();
         let mut clone_paths = Vec::new();
         if let Some(loaded) = loaded.as_ref() {
-            let project_file = loaded.path.strip_prefix(project_root)?.to_path_buf();
-            clone_paths.push(project_file);
-            let adapter_baseline = PathBuf::from(".renium").join("adapter-baseline.json");
-            if clone_project_data {
-                clone_paths.push(adapter_baseline.clone());
-            }
-            publish_paths.push(adapter_baseline);
-            let source_root = loaded.project.source_root.clone();
-            for service in services {
-                let path = source_root.join(sanitize_name(service));
-                if clone_project_data {
-                    clone_paths.push(path.clone());
-                }
-                publish_paths.push(path);
-            }
-            let mut nested_projects = HashSet::new();
-            for (_, node) in config::project_tree_nodes(&loaded.project.tree) {
-                if let Some(path) = node.path {
-                    if clone_project_data {
-                        clone_paths.push(path.clone());
-                    }
-                    publish_paths.push(path.clone());
-                    let source = loaded.root.join(&path);
-                    if clone_project_data && project_path_is_nested(&source) && source.is_file() {
-                        collect_nested_project_paths(
-                            project_root,
-                            &source,
-                            &mut clone_paths,
-                            &mut publish_paths,
-                            &mut nested_projects,
-                            true,
-                        )?;
-                    }
-                }
-            }
-            for mount in &loaded.project.mounts {
-                clone_paths.push(mount.source.clone());
-                if mount.ownership != config::MountOwnership::ReadOnly {
-                    publish_paths.push(mount.source.clone());
-                }
-                let source = loaded.root.join(&mount.source);
-                if project_path_is_nested(&source) && source.is_file() {
-                    collect_nested_project_paths(
-                        project_root,
-                        &source,
-                        &mut clone_paths,
-                        &mut publish_paths,
-                        &mut nested_projects,
-                        mount.ownership != config::MountOwnership::ReadOnly,
-                    )?;
-                }
-            }
-            for adapter in &loaded.project.adapters {
-                clone_paths.push(adapter.source.clone());
-                if adapter.direction != config::AdapterDirection::ToProject {
-                    publish_paths.push(adapter.source.clone());
-                }
-                let source = loaded.root.join(&adapter.source);
-                if project_path_is_nested(&source) && source.is_file() {
-                    collect_nested_project_paths(
-                        project_root,
-                        &source,
-                        &mut clone_paths,
-                        &mut publish_paths,
-                        &mut nested_projects,
-                        adapter.direction != config::AdapterDirection::ToProject,
-                    )?;
-                }
-                if let Some(output) = config::project_adapter_output_path(loaded, adapter)? {
-                    clone_paths.push(output.strip_prefix(project_root)?.to_path_buf());
-                }
-            }
+            collect_configured_export_paths(
+                loaded,
+                project_root,
+                services,
+                clone_project_data,
+                &mut clone_paths,
+                &mut publish_paths,
+            )?;
         } else {
             for service in services {
                 let path = src_dir.join(sanitize_name(service));
@@ -594,6 +534,12 @@ impl ExportProjectStage {
         }
         let staged_loaded = if let Some(original) = loaded.as_ref() {
             let relative = original.path.strip_prefix(project_root)?;
+            // Only the private copy is scoped; the user's configuration is
+            // neither rewritten nor included in publication.
+            fs::write(
+                staged_root.join(relative),
+                serde_json::to_vec(&original.project)?,
+            )?;
             Some(config::load_project(
                 Some(&staged_root.join(relative)),
                 None,
@@ -731,11 +677,15 @@ impl ExportProjectStage {
         Ok(operations)
     }
 
-    fn source_roots(&self) -> Result<Vec<PathBuf>> {
-        if let Some(loaded) = &self.loaded {
-            return config::project_source_roots(loaded);
+    fn source_roots(&self, project_root: &Path) -> Result<Vec<PathBuf>> {
+        if self.loaded.is_some() {
+            // Optional cross-service reference repair still needs the original
+            // owners, not just this export's scoped private projection.
+            let loaded = config::try_load_project(None, Some(project_root))?
+                .context("Project configuration disappeared during Studio export")?;
+            return config::project_source_roots(&loaded);
         }
-        Ok(vec![self.project_root.join(&self.import_src_dir)])
+        Ok(vec![project_root.join(&self.import_src_dir)])
     }
 
     fn stage_moved_reference_updates(
@@ -744,12 +694,10 @@ impl ExportProjectStage {
         settings_candidates: &[PathBuf],
     ) -> Result<Vec<PathBuf>> {
         let mut updated = BTreeSet::new();
-        for staged_source_root in self.source_roots()? {
-            let Ok(relative_source_root) = staged_source_root.strip_prefix(&self.project_root)
-            else {
+        for current_source_root in self.source_roots(project_root)? {
+            let Ok(relative_source_root) = current_source_root.strip_prefix(project_root) else {
                 continue;
             };
-            let current_source_root = project_root.join(relative_source_root);
             let mut before = BTreeMap::new();
             let mut after = BTreeMap::new();
             let document_pairs = settings_candidates
@@ -758,10 +706,7 @@ impl ExportProjectStage {
                 .map(|relative| -> Result<Option<_>> {
                     let current_path = project_root.join(relative);
                     let staged_path = self.project_root.join(relative);
-                    let Some(service) = relative
-                        .parent()
-                        .and_then(Path::file_name)
-                        .map(|name| name.to_string_lossy().into_owned())
+                    let Some(service) = crate::project::storage::store_service_name(relative)
                     else {
                         return Ok(None);
                     };
@@ -922,7 +867,28 @@ impl ExportProjectStage {
         refreshed.extend(repaired);
         refresh_publish_hashes(&self.project_root, &mut staged, &refreshed)?;
         let operation_paths = publish_operation_paths(&current, &staged);
-        let concurrency_paths = operation_paths
+        let directory_swaps = publish_directory_swaps(
+            project_root,
+            &self.project_root,
+            &self.publish_paths,
+            &current,
+            &staged,
+            &operation_paths,
+        )?;
+        let mut write_paths = operation_paths
+            .iter()
+            .map(|path| {
+                directory_swaps
+                    .iter()
+                    .find(|directory| path.starts_with(directory))
+                    .unwrap_or(path)
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        normalize_owned_paths(&mut write_paths);
+        // A directory swap also replaces its directory entries. Recheck that
+        // entire footprint, including files added since the original snapshot.
+        let concurrency_paths = write_paths
             .iter()
             .filter(|path| path.as_path() != Path::new("sourcemap.json"))
             .cloned()
@@ -958,7 +924,7 @@ impl ExportProjectStage {
         let mut published = Vec::<(PathBuf, Option<PathBuf>)>::new();
         let phase = Instant::now();
         let publish_result = (|| -> Result<()> {
-            for relative in operation_paths {
+            for relative in write_paths {
                 let staged = self.project_root.join(&relative);
                 let destination = project_root.join(&relative);
                 if let Some(parent) = destination.parent() {
@@ -978,7 +944,14 @@ impl ExportProjectStage {
                 };
                 published.push((destination.clone(), backup));
                 if fs::symlink_metadata(&staged).is_ok() {
-                    copy_isolated_path(&staged, &destination).with_context(|| {
+                    let result = if directory_swaps.contains(&relative) {
+                        // This isolated subtree is consumed exactly once. Moving
+                        // it avoids both recursive copying and deleting that copy.
+                        fs::rename(&staged, &destination).map_err(anyhow::Error::from)
+                    } else {
+                        copy_isolated_path(&staged, &destination)
+                    };
+                    result.with_context(|| {
                         format!("Failed to publish staged path {}", relative.display())
                     })?;
                 }
@@ -1061,6 +1034,8 @@ impl ExportProjectStage {
 
 impl Drop for ExportProjectStage {
     fn drop(&mut self) {
+        let _trace =
+            crate::app::timing::trace_scope("snapshot.cleanup", "release private snapshot stage");
         config::remove_cached_script_naming(&self.project_root);
         if self.active {
             let _ = fs::remove_dir_all(&self.container);
@@ -1114,8 +1089,10 @@ fn collect_nested_project_paths(
     clone_paths.push(relative(&loaded.path)?);
     let source_root = loaded.root.join(&loaded.project.source_root);
     clone_paths.push(relative(&source_root)?);
+    clone_paths.push(relative(&loaded.root.join("instances"))?);
     if writable {
         publish_paths.push(relative(&source_root)?);
+        publish_paths.push(relative(&loaded.root.join("instances"))?);
     }
     for (_, node) in config::project_tree_nodes(&loaded.project.tree) {
         if let Some(path) = node.path {
@@ -1327,6 +1304,103 @@ pub(crate) fn publish_operation_paths(
         operations.push(path);
     }
     operations
+}
+
+fn publish_directory_swaps(
+    project_root: &Path,
+    staged_root: &Path,
+    owned_paths: &[PathBuf],
+    current: &BTreeMap<PathBuf, PublishEntryState>,
+    staged: &BTreeMap<PathBuf, PublishEntryState>,
+    operations: &[PathBuf],
+) -> Result<Vec<PathBuf>> {
+    let mut directories = Vec::new();
+    for candidate in owned_paths.iter().chain(operations) {
+        if staged.get(candidate) != Some(&PublishEntryState::Directory)
+            || current
+                .get(candidate)
+                .is_some_and(|state| *state != PublishEntryState::Directory)
+            || !owned_paths.iter().any(|owner| candidate.starts_with(owner))
+            || !operations.iter().any(|path| path.starts_with(candidate))
+            || directories
+                .iter()
+                .any(|parent| candidate.starts_with(parent))
+        {
+            continue;
+        }
+        // Do not turn a partial update into replacement of unchanged files,
+        // links or unrelated empty directories. Ancestor directories alone may
+        // be coalesced; configured owners remain bounded by their exact scopes.
+        if current.iter().any(|(path, state)| {
+            path.starts_with(candidate)
+                && !operations
+                    .iter()
+                    .any(|operation| path.starts_with(operation))
+                && (*state != PublishEntryState::Directory
+                    || !operations
+                        .iter()
+                        .any(|operation| operation.starts_with(path)))
+        }) {
+            continue;
+        }
+        if publish_directory_can_move(project_root, staged_root, candidate)? {
+            directories.push(candidate.clone());
+        }
+    }
+    normalize_owned_paths(&mut directories);
+    Ok(directories)
+}
+
+fn publish_directory_can_move(
+    project_root: &Path,
+    staged_root: &Path,
+    relative: &Path,
+) -> Result<bool> {
+    // The private project is a sibling of the destination. Links, mount points
+    // or parent traversal can invalidate that same-filesystem guarantee; leave
+    // those paths on the existing copy path instead of retrying a failed move.
+    if relative
+        .components()
+        .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    let device = {
+        use std::os::unix::fs::MetadataExt;
+        fs::symlink_metadata(staged_root)?.dev()
+    };
+    for root in [project_root, staged_root] {
+        for ancestor in relative.ancestors() {
+            let path = root.join(ancestor);
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("Failed to inspect {}", path.display()));
+                }
+            };
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Ok(false);
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                if metadata.file_attributes() & 0x400 != 0 {
+                    return Ok(false); // FILE_ATTRIBUTE_REPARSE_POINT, including junctions.
+                }
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if metadata.dev() != device {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    Ok(true)
 }
 
 fn normalize_owned_paths(paths: &mut Vec<PathBuf>) {
@@ -1607,6 +1681,7 @@ pub(crate) fn export_snapshots_with_warm_bridge(
     prepare_next_run: bool,
     repair_reference_paths: bool,
 ) -> Result<PublishedProjectChanges> {
+    let _trace = crate::app::timing::trace_scope("sync", "export snapshots");
     let prelude = export_snapshots_prelude(&args)?;
     println!(
         "[renium] persistent warm bridge: channels={}/{}, cached_bridge_info={}, per_export_handshake_ms={:.1}",
@@ -1630,6 +1705,66 @@ pub(crate) fn export_snapshots_with_warm_bridge(
             repair_reference_paths,
         },
     )
+}
+
+/// Capture the ordinary native export, including source and property overlays,
+/// without publishing a filesystem projection or reporting sync completion.
+pub(crate) fn capture_exported_services<T: Send>(
+    args: &ExportSnapshotsArgs,
+    bridge: &BridgeServer,
+    bridge_info: &BridgeInfoPayload,
+    project_service: impl Fn(&str, ServiceState) -> Result<T> + Sync,
+) -> Result<Vec<T>> {
+    let prelude = export_snapshots_prelude(args)?;
+    validate_bridge_info(bridge_info)?;
+    prepare_export_bridge(
+        args,
+        bridge,
+        bridge_info,
+        &prelude.project_root,
+        prelude.performance_mode,
+        prelude.modified_default_bypass,
+        prelude.total_started,
+    )?;
+    let outputs = Mutex::new(Vec::with_capacity(prelude.services.len()));
+    let trace_context = crate::app::timing::trace_context();
+    // Consume each exported service immediately. Waiting for the last export
+    // before projecting the first would serialize two otherwise parallel stages.
+    let mut guard = rayon::scope(|scope| {
+        let _trace_context =
+            trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
+        editor_binary_export_parts(
+            bridge,
+            &prelude.services,
+            prelude.total_started,
+            &mut |output| {
+                let outputs = &outputs;
+                let project_service = &project_service;
+                scope.spawn(move |_| {
+                    let _trace_context = trace_context
+                        .map(|context| crate::app::timing::enter_trace_context(Some(context)));
+                    let _trace =
+                        crate::app::timing::trace_scope("sync", "project captured service");
+                    let service = output.span.service;
+                    let result = exported_parts_to_service_state(&service, output.parts)
+                        .and_then(|state| project_service(&service, state));
+                    outputs
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push(result);
+                });
+                Ok(())
+            },
+            &mut || Ok(()),
+        )
+    })?;
+    let projected = outputs
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner)
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+    finish_native_export(&mut guard)?;
+    Ok(projected)
 }
 
 fn log_export_bridge_connection(
@@ -1916,7 +2051,10 @@ fn prepare_export_execution(
 ) -> Result<ExportExecutionSetup> {
     let run_import = !args.no_run_import;
     let direct_import_mode = run_import && matches!(args.import_mode.as_str(), "direct" | "staged");
-    let project_stage = if run_import && args.import_mode != "direct" {
+    // Even direct import workers must write privately until the native guard
+    // validates the complete capture and overlays. Publication retains the
+    // stage's original-file concurrency checks in every import mode.
+    let project_stage = if run_import {
         Some(ExportProjectStage::create(
             project_root,
             &args.src_dir,
@@ -2001,22 +2139,55 @@ fn prepare_export_execution(
     })
 }
 
-fn finish_sync_completion(
-    bridge: &BridgeServer,
-    native_finish_guard: Option<EditorBinaryExportFinishGuard<'_>>,
-) -> f64 {
-    let started = Instant::now();
-    let recorded = native_finish_guard.is_some_and(|mut guard| match guard.finish(true) {
-        Ok(recorded) => recorded,
-        Err(err) => {
-            println!("[renium] warning: failed to finish the native export session: {err:#}");
-            false
-        }
-    });
-    if !recorded {
-        record_bridge_sync_completion(bridge);
+fn finish_native_export(guard: &mut EditorBinaryExportFinishGuard<'_>) -> Result<()> {
+    let result = guard.finish(false);
+    // A reported mutation already expires the plugin session. Do not let Drop
+    // retry finalization (or mask its first error); an undelivered request still
+    // has the existing plugin lease/expiry cleanup.
+    guard.export_id = None;
+    result.map(|_| ())
+}
+
+fn finish_export_publication(
+    mut stage: Option<ExportProjectStage>,
+    project_root: &Path,
+    repair_reference_paths: bool,
+    finalize_native: impl FnOnce() -> Result<()>,
+    record_completion: impl FnOnce() -> Result<()>,
+) -> Result<(PublishedProjectChanges, f64)> {
+    if let Some(stage) = stage.as_mut() {
+        stage.mark_settings_aligned();
+        let started = Instant::now();
+        stage.finish_projection(false)?;
+        log_global(
+            5,
+            format_args!(
+                "[renium] export project stage projection: {:.1}ms",
+                elapsed_ms(started)
+            ),
+        );
     }
-    elapsed_ms(started)
+    let started = Instant::now();
+    finalize_native()?;
+    let mut sync_completion_ms = elapsed_ms(started);
+    let published = if let Some(stage) = stage {
+        let started = Instant::now();
+        let published = stage.publish(project_root, repair_reference_paths)?;
+        log_global(
+            5,
+            format_args!(
+                "[renium] export project stage publish: {:.1}ms",
+                elapsed_ms(started)
+            ),
+        );
+        published
+    } else {
+        PublishedProjectChanges::default()
+    };
+    let started = Instant::now();
+    record_completion()?;
+    sync_completion_ms += elapsed_ms(started);
+    Ok((published, sync_completion_ms))
 }
 
 fn export_snapshots_core(
@@ -2028,6 +2199,11 @@ fn export_snapshots_core(
     all_channels_connected_to_bridge_info_ms: f64,
     mode: ExportBridgeMode,
 ) -> Result<PublishedProjectChanges> {
+    let _trace = crate::app::timing::trace_scope("sync", "export core");
+    let mut stages = crate::app::timing::trace_stages(
+        "export.core",
+        "initialize export metrics and service selection",
+    );
     let ExportPrelude {
         total_started,
         performance_mode,
@@ -2044,6 +2220,7 @@ fn export_snapshots_core(
             all_channels_connected_to_bridge_info_ms,
             bridge_info,
         );
+    stages.next("prepare export bridge and property schema");
     let ExportBridgeSetup {
         property_schema_by_class,
         property_schema_ready_ms,
@@ -2057,6 +2234,7 @@ fn export_snapshots_core(
         modified_default_bypass,
         total_started,
     )?;
+    stages.next("prepare project output workers and export service order");
     let ExportExecutionSetup {
         mut project_stage,
         import_project_root,
@@ -2089,6 +2267,7 @@ fn export_snapshots_core(
         property_schema_by_class: &property_schema_by_class,
         run_started: total_started,
     };
+    stages.next("capture services and stream snapshots into output workers");
     let ServiceExportRun {
         spans: service_export_spans,
         cumulative_latency_ms: cumulative_service_latency_ms,
@@ -2102,6 +2281,7 @@ fn export_snapshots_core(
         direct_import_mode,
         &snapshot_dir,
     )?;
+    stages.next("merge service batch tuning and export timing boundaries");
     let tune_updated = !tune_updates.is_empty();
     for (service, tune) in tune_updates {
         adaptive_tune_cache.services.insert(service, tune);
@@ -2132,6 +2312,7 @@ fn export_snapshots_core(
         "last service export to dispatcher drain start",
         last_service_export_to_dispatcher_drain_start_ms,
     );
+    stages.next("join output workers and finalize sourcemap");
     let ImportFinishMetrics {
         dispatcher_drain_ms,
         sourcemap_finalize_ms,
@@ -2147,35 +2328,25 @@ fn export_snapshots_core(
         &mut direct_import_dispatcher,
         sourcemap_writer,
     )?;
-    let published = if let Some(mut stage) = project_stage.take() {
-        stage.mark_settings_aligned();
-        let projection_started = Instant::now();
-        stage.finish_projection(false)?;
-        log_global(
-            5,
-            format_args!(
-                "[renium] export project stage projection: {:.1}ms",
-                elapsed_ms(projection_started)
-            ),
-        );
-        let publish_started = Instant::now();
-        let published = stage.publish(&project_root, mode.repair_reference_paths())?;
-        log_global(
-            5,
-            format_args!(
-                "[renium] export project stage publish: {:.1}ms",
-                elapsed_ms(publish_started)
-            ),
-        );
-        published
-    } else {
-        PublishedProjectChanges::default()
-    };
+    stages.next("publish exported files and acknowledge Studio snapshot");
+    let (published, sync_completion_ms) = finish_export_publication(
+        project_stage.take(),
+        &project_root,
+        mode.repair_reference_paths(),
+        move || {
+            if let Some(mut guard) = native_finish_guard.take() {
+                finish_native_export(&mut guard)?;
+            }
+            Ok(())
+        },
+        || record_bridge_sync_completion(bridge),
+    )?;
+    stages.next("save updated batch tuning");
     if tune_updated {
         write_adaptive_tune_cache(&project_root, &adaptive_tune_cache);
     }
 
-    let sync_completion_ms = finish_sync_completion(bridge, native_finish_guard.take());
+    stages.next("format export timing summaries");
     let total_run_ms = elapsed_ms(total_started);
     let handshake_ms =
         bridge_listen_to_all_channels_connected_ms + all_channels_connected_to_bridge_info_ms;
@@ -2210,6 +2381,7 @@ fn export_snapshots_core(
         "[renium] run timing summary: total_ms={total_run_ms:.1}, core_export_ms={core_export_ms:.1}, bridge_startup_ms={cli_start_to_bridge_listen_ms:.1}, handshake_ms={handshake_ms:.1}, cumulative_service_latency_ms={cumulative_service_latency_ms:.1}, import_critical_tail_ms={import_critical_tail_ms:.1}, unmeasured_or_scheduler_gap_ms={unmeasured_or_scheduler_gap_ms:.1}"
     );
     log_timing_ms("full export-snapshots run", total_run_ms);
+    stages.next("prepare connection for following export");
     if matches!(
         mode,
         ExportBridgeMode::Warm {
@@ -2220,6 +2392,7 @@ fn export_snapshots_core(
         prepare_bridge_for_next_run(bridge);
     }
     println!("[renium] export done");
+    stages.next("release completed export buffers and configuration");
     Ok(published)
 }
 
@@ -3681,10 +3854,10 @@ pub(crate) fn merge_chunk_fetch_metrics(
 }
 
 pub(crate) fn log_chunk_fetch_metrics(label: &str, metrics: ChunkFetchMetrics) {
-    if metrics.chunks == 0 || quiet_timings() {
+    if metrics.chunks == 0 || (quiet_timings() && !crate::app::output::global_log_enabled(5)) {
         return;
     }
-    println!(
+    let message = format!(
         "[renium] timing: {label} chunk metrics -> chunks={}, bytes={}, max_chunk_bytes={}, plugin_server_ms={:.1}, plugin_encode_ms={:.1}, reassembly_ms={:.1}, json_parse_ms={:.1}",
         metrics.chunks,
         metrics.bytes,
@@ -3694,6 +3867,11 @@ pub(crate) fn log_chunk_fetch_metrics(label: &str, metrics: ChunkFetchMetrics) {
         metrics.reassembly_ms,
         metrics.json_parse_ms
     );
+    if quiet_timings() {
+        log_global(5, format_args!("{message}"));
+    } else {
+        println!("{message}");
+    }
 }
 
 pub(crate) fn fetch_text_chunks<F>(
@@ -3820,25 +3998,14 @@ fn bridge_text_payload_cache() -> &'static Mutex<BridgeTextPayloadCache> {
     CACHE.get_or_init(|| Mutex::new(BridgeTextPayloadCache::default()))
 }
 
-fn bridge_text_payload_known_hash(slot: &str) -> Option<String> {
+fn bridge_text_payload_known(slot: &str) -> Option<(String, Arc<str>)> {
     let cache = bridge_text_payload_cache()
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     let hash = cache.last_hash_by_slot.get(slot)?;
-    cache
-        .entries
-        .iter()
-        .any(|(entry_hash, _)| entry_hash == hash)
-        .then(|| hash.clone())
-}
-
-fn bridge_text_payload_get(hash: &str) -> Option<String> {
-    bridge_text_payload_cache()
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .entries
-        .iter()
-        .find_map(|(entry_hash, text)| (entry_hash == hash).then(|| text.to_string()))
+    cache.entries.iter().find_map(|(entry_hash, text)| {
+        (entry_hash == hash).then(|| (hash.clone(), Arc::clone(text)))
+    })
 }
 
 fn bridge_text_payload_insert(slot: &str, hash: String, text: &str) {
@@ -3879,15 +4046,14 @@ pub(crate) fn fetch_text_chunks_with_cache<F>(
 where
     F: FnMut(usize, usize, Option<&str>) -> Result<BridgeChunk>,
 {
-    let known_hash = bridge_text_payload_known_hash(cache_slot);
+    // Keep advertised bytes alive across the request. Other service exports can
+    // evict the cache entry before Studio returns its hash-only response.
+    let known_payload = bridge_text_payload_known(cache_slot);
+    let known_hash = known_payload.as_ref().map(|(hash, _)| hash.as_str());
     let mut first = true;
     let mut payload_hash = None;
     let (text, metrics) = fetch_text_chunks(chunk_size, |start, max_len| {
-        let chunk = fetcher(
-            start,
-            max_len,
-            first.then_some(known_hash.as_deref()).flatten(),
-        )?;
+        let chunk = fetcher(start, max_len, first.then_some(known_hash).flatten())?;
         if first {
             first = false;
             payload_hash.clone_from(&chunk.payload_hash);
@@ -3896,11 +4062,12 @@ where
                     .payload_hash
                     .as_deref()
                     .context("Bridge text cache hit omitted its payload hash")?;
-                if known_hash.as_deref() != Some(hash) {
+                let Some((known_hash, text)) = &known_payload else {
+                    bail!("Bridge returned an unexpected text payload cache hit");
+                };
+                if known_hash != hash {
                     bail!("Bridge returned an unexpected text payload cache hit");
                 }
-                let text = bridge_text_payload_get(hash)
-                    .context("Bridge text payload cache entry is missing")?;
                 if text.len() != chunk.total {
                     bail!("Bridge text payload cache entry has the wrong size");
                 }
@@ -3908,7 +4075,7 @@ where
                     start: 1,
                     next_start: text.len() + 1,
                     total: text.len(),
-                    chunk: text,
+                    chunk: text.to_string(),
                     plugin_server_ms: chunk.plugin_server_ms,
                     plugin_encode_ms: chunk.plugin_encode_ms,
                     serialization_complete: chunk.serialization_complete,
@@ -3992,4 +4159,718 @@ where
     let value = serde_json::from_slice(text.as_bytes()).context("Invalid chunked JSON payload")?;
     metrics.json_parse_ms = elapsed_ms(parse_started);
     Ok((value, metrics))
+}
+
+fn collect_configured_export_paths(
+    loaded: &config::LoadedProject,
+    project_root: &Path,
+    services: &[String],
+    clone_project_data: bool,
+    clone_paths: &mut Vec<PathBuf>,
+    publish_paths: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let project_file = loaded.path.strip_prefix(project_root)?.to_path_buf();
+    clone_paths.push(project_file);
+    let adapter_baseline = PathBuf::from(".renium").join("adapter-baseline.json");
+    if clone_project_data {
+        clone_paths.push(adapter_baseline.clone());
+    }
+    publish_paths.push(adapter_baseline);
+    let source_root = loaded.project.source_root.clone();
+    for service in services {
+        let path = source_root.join(sanitize_name(service));
+        let store = PathBuf::from("instances").join(format!("{}.renium", sanitize_name(service)));
+        let mapped_stores = PathBuf::from("instances").join(sanitize_name(service));
+        if clone_project_data {
+            clone_paths.push(path.clone());
+            clone_paths.push(store.clone());
+            clone_paths.push(mapped_stores.clone());
+        }
+        publish_paths.push(path);
+        publish_paths.push(store);
+        publish_paths.push(mapped_stores);
+    }
+    let mut nested_projects = HashSet::new();
+    for (_, node) in config::project_tree_nodes(&loaded.project.tree) {
+        if let Some(path) = node.path {
+            if clone_project_data {
+                clone_paths.push(path.clone());
+            }
+            publish_paths.push(path.clone());
+            let source = loaded.root.join(&path);
+            if clone_project_data && project_path_is_nested(&source) && source.is_file() {
+                collect_nested_project_paths(
+                    project_root,
+                    &source,
+                    clone_paths,
+                    publish_paths,
+                    &mut nested_projects,
+                    true,
+                )?;
+            }
+        }
+    }
+    for mount in &loaded.project.mounts {
+        clone_paths.push(mount.source.clone());
+        if mount.ownership != config::MountOwnership::ReadOnly {
+            publish_paths.push(mount.source.clone());
+        }
+        let source = loaded.root.join(&mount.source);
+        if project_path_is_nested(&source) && source.is_file() {
+            collect_nested_project_paths(
+                project_root,
+                &source,
+                clone_paths,
+                publish_paths,
+                &mut nested_projects,
+                mount.ownership != config::MountOwnership::ReadOnly,
+            )?;
+        }
+    }
+    for adapter in &loaded.project.adapters {
+        clone_paths.push(adapter.source.clone());
+        if adapter.direction != config::AdapterDirection::ToProject {
+            publish_paths.push(adapter.source.clone());
+        }
+        let source = loaded.root.join(&adapter.source);
+        if project_path_is_nested(&source) && source.is_file() {
+            collect_nested_project_paths(
+                project_root,
+                &source,
+                clone_paths,
+                publish_paths,
+                &mut nested_projects,
+                adapter.direction != config::AdapterDirection::ToProject,
+            )?;
+        }
+        if let Some(output) = config::project_adapter_output_path(loaded, adapter)? {
+            clone_paths.push(output.strip_prefix(project_root)?.to_path_buf());
+        }
+    }
+    Ok(())
+}
+
+fn scope_export_project(loaded: &mut config::LoadedProject, services: &[String]) {
+    // The private projection must have the same service scope as the
+    // capture, including configured owners outside the ordinary src tree.
+    loaded
+        .project
+        .tree
+        .retain(|service, _| services.contains(service));
+    loaded.project.mounts.retain(|mount| {
+        mount
+            .target
+            .segments()
+            .first()
+            .is_none_or(|service| services.contains(service))
+    });
+    loaded.project.adapters.retain(|adapter| {
+        adapter
+            .target
+            .segments()
+            .first()
+            .is_none_or(|service| services.contains(service))
+    });
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    use clap::Parser;
+    use std::cell::Cell;
+
+    const SOURCE: &str = "src/ReplicatedStorage/Mod.luau";
+    const ORIGINAL_MAP: &str = r#"{"name":"Fixture","className":"DataModel","children":[]}"#;
+
+    struct Fixture {
+        container: PathBuf,
+        root: PathBuf,
+        stage: Option<ExportProjectStage>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let container = create_unique_directory(
+                &Path::new(env!("CARGO_MANIFEST_DIR")).join("target"),
+                "export-publication-test-",
+            )
+            .unwrap();
+            let root = container.join("project");
+            fs::create_dir_all(root.join("src/ReplicatedStorage")).unwrap();
+            fs::write(
+                root.join("renium.project.jsonc"),
+                serde_json::to_vec(&config::ReniumProject::default()).unwrap(),
+            )
+            .unwrap();
+            fs::write(root.join(SOURCE), "return 'original'\n").unwrap();
+            fs::write(root.join("sourcemap.json"), ORIGINAL_MAP).unwrap();
+            let stage =
+                ExportProjectStage::create(&root, Path::new("src"), &["ReplicatedStorage".into()])
+                    .unwrap();
+            fs::write(stage.project_root.join(SOURCE), "return 'captured'\n").unwrap();
+            fs::write(
+                stage.project_root.join("sourcemap.json"),
+                "{\"name\":\"Captured\"}",
+            )
+            .unwrap();
+            Self {
+                container,
+                root,
+                stage: Some(stage),
+            }
+        }
+
+        fn planned_directory_swaps(&self, stage: &ExportProjectStage) -> Vec<PathBuf> {
+            let current = collect_publish_hashes(&self.root, &stage.publish_paths).unwrap();
+            let staged = collect_publish_hashes(&stage.project_root, &stage.publish_paths).unwrap();
+            publish_directory_swaps(
+                &self.root,
+                &stage.project_root,
+                &stage.publish_paths,
+                &current,
+                &staged,
+                &publish_operation_paths(&current, &staged),
+            )
+            .unwrap()
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            drop(self.stage.take());
+            let _ = fs::remove_dir_all(&self.container);
+        }
+    }
+
+    #[test]
+    fn export_publication_moves_new_service_directories_without_copying() {
+        for initially_present in [false, true] {
+            let mut fixture = Fixture::new();
+            drop(fixture.stage.take());
+            fs::remove_file(fixture.root.join(SOURCE)).unwrap();
+            let service = PathBuf::from("src/ReplicatedStorage");
+            if !initially_present {
+                fs::remove_dir(fixture.root.join(&service)).unwrap();
+            }
+            let stage = ExportProjectStage::create(
+                &fixture.root,
+                Path::new("src"),
+                &["ReplicatedStorage".into()],
+            )
+            .unwrap();
+            fs::create_dir_all(stage.project_root.join(&service).join("Nested/Empty")).unwrap();
+            fs::write(stage.project_root.join(SOURCE), "return 'captured'\n").unwrap();
+            fs::write(
+                stage.project_root.join(&service).join("Nested/Child.luau"),
+                "return 'child'\n",
+            )
+            .unwrap();
+            assert_eq!(fixture.planned_directory_swaps(&stage), [service]);
+            let current = collect_publish_hashes(&fixture.root, &stage.publish_paths).unwrap();
+            let staged = collect_publish_hashes(&stage.project_root, &stage.publish_paths).unwrap();
+            let logical_paths = publish_operation_paths(&current, &staged);
+            let expected = current
+                .keys()
+                .chain(staged.keys())
+                .filter(|path| logical_paths.iter().any(|root| path.starts_with(root)))
+                .map(|path| (path.clone(), staged.get(path).cloned()))
+                .collect::<BTreeMap<_, _>>();
+            // An independent link proves the staged file itself was moved,
+            // rather than merely verifying equivalent copied bytes.
+            let staged_file_link = fixture.container.join("staged-file-link");
+            fs::hard_link(stage.project_root.join(SOURCE), &staged_file_link).unwrap();
+            let stage_container = stage.container.clone();
+            let published = stage.publish(&fixture.root, false).unwrap();
+            assert_eq!(published.changed_roots, logical_paths);
+            assert!(published.expected == expected);
+            assert!(
+                fixture
+                    .root
+                    .join("src/ReplicatedStorage/Nested/Empty")
+                    .is_dir()
+            );
+            assert_eq!(
+                fs::read_to_string(fixture.root.join(SOURCE)).unwrap(),
+                "return 'captured'\n"
+            );
+            assert!(!stage_container.exists());
+            fs::write(staged_file_link, "same file, not a copy").unwrap();
+            assert_eq!(
+                fs::read_to_string(fixture.root.join(SOURCE)).unwrap(),
+                "same file, not a copy"
+            );
+        }
+    }
+
+    #[test]
+    fn export_publication_swaps_complete_replacements_without_broadening_changed_paths() {
+        let mut fixture = Fixture::new();
+        drop(fixture.stage.take());
+        let deleted = PathBuf::from("src/ReplicatedStorage/Deleted.luau");
+        fs::write(fixture.root.join(&deleted), "old").unwrap();
+        fs::write(fixture.root.join("outside.txt"), "unrelated").unwrap();
+        let stage = ExportProjectStage::create(
+            &fixture.root,
+            Path::new("src"),
+            &["ReplicatedStorage".into()],
+        )
+        .unwrap();
+        fs::remove_file(stage.project_root.join(&deleted)).unwrap();
+        fs::write(stage.project_root.join(SOURCE), "new").unwrap();
+        assert_eq!(
+            fixture.planned_directory_swaps(&stage),
+            [PathBuf::from("src/ReplicatedStorage")]
+        );
+        let current = collect_publish_hashes(&fixture.root, &stage.publish_paths).unwrap();
+        let staged = collect_publish_hashes(&stage.project_root, &stage.publish_paths).unwrap();
+        let logical_paths = publish_operation_paths(&current, &staged);
+        let published = stage.publish(&fixture.root, false).unwrap();
+        assert_eq!(published.changed_roots, logical_paths);
+        assert!(
+            !published
+                .expected
+                .contains_key(Path::new("src/ReplicatedStorage"))
+        );
+        assert!(published.expected.get(&deleted) == Some(&None));
+        assert!(!fixture.root.join(&deleted).exists());
+        assert_eq!(
+            fs::read_to_string(fixture.root.join(SOURCE)).unwrap(),
+            "new"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("outside.txt")).unwrap(),
+            "unrelated"
+        );
+    }
+
+    #[test]
+    fn export_publication_keeps_unchanged_files_and_empty_directories_out_of_swaps() {
+        for keep_file in [false, true] {
+            let mut fixture = Fixture::new();
+            drop(fixture.stage.take());
+            let keep = fixture.root.join("src/ReplicatedStorage/Keep");
+            let original_file_link = fixture.container.join("original-file-link");
+            if keep_file {
+                fs::write(&keep, "unchanged").unwrap();
+                fs::hard_link(&keep, &original_file_link).unwrap();
+            } else {
+                fs::create_dir(&keep).unwrap();
+            }
+            let stage = ExportProjectStage::create(
+                &fixture.root,
+                Path::new("src"),
+                &["ReplicatedStorage".into()],
+            )
+            .unwrap();
+            fs::write(stage.project_root.join(SOURCE), "changed").unwrap();
+            let new_subtree = PathBuf::from("src/ReplicatedStorage/New");
+            fs::create_dir(stage.project_root.join(&new_subtree)).unwrap();
+            fs::write(
+                stage.project_root.join(&new_subtree).join("Child.luau"),
+                "new",
+            )
+            .unwrap();
+            assert_eq!(fixture.planned_directory_swaps(&stage), [new_subtree]);
+            let published = stage.publish(&fixture.root, false).unwrap();
+            assert!(
+                !published
+                    .expected
+                    .contains_key(Path::new("src/ReplicatedStorage/Keep"))
+            );
+            if keep_file {
+                fs::write(original_file_link, "outside edit after publication").unwrap();
+                assert_eq!(
+                    fs::read_to_string(keep).unwrap(),
+                    "outside edit after publication"
+                );
+            } else {
+                assert!(keep.is_dir());
+            }
+        }
+    }
+
+    #[test]
+    fn export_publication_directory_swaps_stay_inside_exact_owner_scopes() {
+        // These are publication scopes after projection/adapter syncback, not
+        // permission to replace their parents or unrelated source-root content.
+        for owner in ["configured/Partial", "mount/source", "adapter/records.csv"] {
+            let mut fixture = Fixture::new();
+            let mut stage = fixture.stage.take().unwrap();
+            let scope = PathBuf::from(owner);
+            let is_file = scope.extension().is_some();
+            let file = if is_file {
+                scope.clone()
+            } else {
+                scope.join("Mod.luau")
+            };
+            for root in [&fixture.root, &stage.project_root] {
+                fs::create_dir_all(root.join(file.parent().unwrap())).unwrap();
+            }
+            fs::write(fixture.root.join(&file), "original").unwrap();
+            fs::write(stage.project_root.join(&file), "captured").unwrap();
+            let neighbor = fixture
+                .root
+                .join(scope.parent().unwrap())
+                .join("unrelated.txt");
+            fs::write(&neighbor, "outside owner").unwrap();
+            stage.publish_paths = vec![scope.clone()];
+            stage.capture_publish_baseline(&fixture.root).unwrap();
+            let swaps = fixture.planned_directory_swaps(&stage);
+            if is_file {
+                assert!(swaps.is_empty());
+            } else {
+                assert_eq!(swaps, [scope]);
+            }
+            let published = stage.publish(&fixture.root, false).unwrap();
+            assert_eq!(published.changed_roots, std::slice::from_ref(&file));
+            assert_eq!(
+                fs::read_to_string(fixture.root.join(file)).unwrap(),
+                "captured"
+            );
+            assert_eq!(fs::read_to_string(neighbor).unwrap(), "outside owner");
+            assert_eq!(
+                fs::read_to_string(fixture.root.join(SOURCE)).unwrap(),
+                "return 'original'\n"
+            );
+        }
+    }
+
+    #[test]
+    fn export_publication_directory_swap_rechecks_new_entries_in_its_full_footprint() {
+        let mut fixture = Fixture::new();
+        let stage = fixture.stage.take().unwrap();
+        let current = collect_publish_hashes(&fixture.root, &stage.publish_paths).unwrap();
+        let staged = collect_publish_hashes(&stage.project_root, &stage.publish_paths).unwrap();
+        let operations = publish_operation_paths(&current, &staged);
+        let swaps = fixture.planned_directory_swaps(&stage);
+        assert_eq!(swaps, [PathBuf::from("src/ReplicatedStorage")]);
+        let outside = PathBuf::from("src/ReplicatedStorage/Outside.luau");
+        assert!(
+            !operations
+                .iter()
+                .any(|operation| outside.starts_with(operation))
+        );
+        fs::write(fixture.root.join(&outside), "concurrent new file").unwrap();
+        let narrow = collect_publish_hashes(&fixture.root, &operations).unwrap();
+        ensure_publish_entries_unchanged(&current, &narrow, &operations).unwrap();
+        let entire_swap = collect_publish_hashes(&fixture.root, &swaps).unwrap();
+        let error = ensure_publish_entries_unchanged(&current, &entire_swap, &swaps).unwrap_err();
+        assert!(error.to_string().contains("Outside.luau"));
+        let error = stage.publish(&fixture.root, false).err().unwrap();
+        assert!(error.to_string().contains("Project files changed"));
+        assert_eq!(
+            fs::read_to_string(fixture.root.join(outside)).unwrap(),
+            "concurrent new file"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.root.join(SOURCE)).unwrap(),
+            "return 'original'\n"
+        );
+    }
+
+    #[test]
+    fn export_publication_rolls_back_directory_swaps_when_a_later_swap_fails() {
+        let mut fixture = Fixture::new();
+        drop(fixture.stage.take());
+        let second = "src/ServerStorage/Other.luau";
+        fs::create_dir_all(fixture.root.join("src/ServerStorage")).unwrap();
+        fs::write(fixture.root.join(second), "second original").unwrap();
+        let stage = ExportProjectStage::create(
+            &fixture.root,
+            Path::new("src"),
+            &["ReplicatedStorage".into(), "ServerStorage".into()],
+        )
+        .unwrap();
+        fs::write(stage.project_root.join(SOURCE), "first captured").unwrap();
+        fs::write(stage.project_root.join(second), "second captured").unwrap();
+        assert_eq!(
+            fixture.planned_directory_swaps(&stage),
+            [
+                PathBuf::from("src/ReplicatedStorage"),
+                PathBuf::from("src/ServerStorage")
+            ]
+        );
+        // The first service is installed, then the second backup rename must
+        // fail on both Windows and Unix (onto a nonempty directory).
+        let blocked_backup = stage.container.join("previous/src/ServerStorage");
+        fs::create_dir_all(&blocked_backup).unwrap();
+        fs::write(blocked_backup.join("blocker"), "block second backup").unwrap();
+        let stage_container = stage.container.clone();
+        let error = stage.publish(&fixture.root, false).err().unwrap();
+        assert!(error.to_string().contains("Failed to preserve"));
+        assert!(!error.to_string().contains("rollback was incomplete"));
+        assert_eq!(
+            fs::read_to_string(fixture.root.join(SOURCE)).unwrap(),
+            "return 'original'\n"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.root.join(second)).unwrap(),
+            "second original"
+        );
+        assert!(!stage_container.exists());
+    }
+
+    #[test]
+    fn export_publication_validates_before_writes_and_records_afterward() {
+        let mut fixture = Fixture::new();
+        let stage = fixture.stage.take().unwrap();
+        let stage_container = stage.container.clone();
+        let calls = Cell::new(0);
+        let (published, _) = finish_export_publication(
+            Some(stage),
+            &fixture.root,
+            false,
+            || {
+                assert_eq!(calls.replace(1), 0);
+                assert_eq!(
+                    fs::read_to_string(fixture.root.join(SOURCE))?,
+                    "return 'original'\n"
+                );
+                assert_eq!(
+                    fs::read_to_string(fixture.root.join("sourcemap.json"))?,
+                    ORIGINAL_MAP
+                );
+                fs::write(fixture.root.join("outside.txt"), "outside edit")?;
+                Ok(())
+            },
+            || {
+                assert_eq!(calls.replace(2), 1);
+                assert_eq!(
+                    fs::read_to_string(fixture.root.join(SOURCE))?,
+                    "return 'captured'\n"
+                );
+                assert_eq!(
+                    fs::read_to_string(fixture.root.join("sourcemap.json"))?,
+                    "{\"name\":\"Captured\"}"
+                );
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 2);
+        assert!(!published.changed_roots.is_empty());
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("outside.txt")).unwrap(),
+            "outside edit"
+        );
+        assert!(!stage_container.exists());
+    }
+
+    #[test]
+    fn export_publication_guard_failure_preserves_outside_edits_and_discards_stage() {
+        let mut fixture = Fixture::new();
+        let stage = fixture.stage.take().unwrap();
+        let stage_container = stage.container.clone();
+        let calls = Cell::new(0);
+        let error = finish_export_publication(
+            Some(stage),
+            &fixture.root,
+            false,
+            || {
+                calls.set(calls.get() + 1);
+                fs::write(fixture.root.join(SOURCE), "return 'outside'\n")?;
+                bail!("Studio changed ReplicatedStorage during native export")
+            },
+            || panic!("failed capture must not record completion"),
+        )
+        .err()
+        .expect("a failed guard must abort publication");
+        assert_eq!(
+            error.to_string(),
+            "Studio changed ReplicatedStorage during native export"
+        );
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            fs::read_to_string(fixture.root.join(SOURCE)).unwrap(),
+            "return 'outside'\n"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("sourcemap.json")).unwrap(),
+            ORIGINAL_MAP
+        );
+        assert!(!stage_container.exists());
+    }
+
+    #[test]
+    fn export_publication_retains_original_file_baseline_after_native_validation() {
+        let mut fixture = Fixture::new();
+        let stage = fixture.stage.take().unwrap();
+        let stage_container = stage.container.clone();
+        let calls = Cell::new(0);
+        let error = finish_export_publication(
+            Some(stage),
+            &fixture.root,
+            false,
+            || {
+                calls.set(calls.get() + 1);
+                fs::write(fixture.root.join(SOURCE), "return 'outside'\n")?;
+                Ok(())
+            },
+            || panic!("publication conflict must not record completion"),
+        )
+        .err()
+        .expect("a concurrent file edit must abort publication");
+        assert!(error.to_string().contains("Project files changed"));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            fs::read_to_string(fixture.root.join(SOURCE)).unwrap(),
+            "return 'outside'\n"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("sourcemap.json")).unwrap(),
+            ORIGINAL_MAP
+        );
+        assert!(!stage_container.exists());
+    }
+
+    #[test]
+    fn export_publication_completion_failure_is_not_retried_or_rolled_back() {
+        let mut fixture = Fixture::new();
+        let stage = fixture.stage.take().unwrap();
+        let stage_container = stage.container.clone();
+        let calls = Cell::new(0);
+        let error = finish_export_publication(
+            Some(stage),
+            &fixture.root,
+            false,
+            || {
+                assert_eq!(calls.replace(1), 0);
+                Ok(())
+            },
+            || {
+                assert_eq!(calls.replace(2), 1);
+                assert_eq!(
+                    fs::read_to_string(fixture.root.join(SOURCE))?,
+                    "return 'captured'\n"
+                );
+                fs::write(
+                    fixture.root.join(SOURCE),
+                    "return 'outside after publish'\n",
+                )?;
+                bail!("completion transport failed")
+            },
+        )
+        .err()
+        .expect("completion errors must propagate");
+        assert_eq!(error.to_string(), "completion transport failed");
+        assert_eq!(calls.get(), 2);
+        assert_eq!(
+            fs::read_to_string(fixture.root.join(SOURCE)).unwrap(),
+            "return 'outside after publish'\n"
+        );
+        assert!(!stage_container.exists());
+    }
+
+    #[test]
+    fn export_publication_direct_and_staged_workers_write_only_to_stage() {
+        let mut fixture = Fixture::new();
+        drop(fixture.stage.take());
+        for mode in ["direct", "staged"] {
+            let args = ExportSnapshotsArgs::try_parse_from([
+                "export-snapshots",
+                "--import-mode",
+                mode,
+                "--import-workers",
+                "1",
+            ])
+            .unwrap();
+            let mut setup = prepare_export_execution(
+                &args,
+                &fixture.root,
+                &["ReplicatedStorage".into()],
+                &BridgeInfoPayload::default(),
+                PerformanceMode::Throughput,
+                false,
+                Instant::now(),
+            )
+            .unwrap();
+            let stage = setup
+                .project_stage
+                .as_ref()
+                .expect("all imports need a stage");
+            let stage_container = stage.container.clone();
+            assert!(setup.direct_import_mode);
+            assert!(setup.import_project_root.starts_with(&stage_container));
+            assert_ne!(setup.import_project_root, fixture.root);
+            fs::write(
+                setup
+                    .import_project_root
+                    .join(&setup.import_src_dir)
+                    .join("ReplicatedStorage/Mod.luau"),
+                "return 'private'\n",
+            )
+            .unwrap();
+            // Match production's worker-before-stage teardown ordering.
+            drop(setup.direct_import_dispatcher.take());
+            drop(setup.sourcemap_writer.take());
+            drop(setup);
+            assert!(!stage_container.exists());
+            assert_eq!(
+                fs::read_to_string(fixture.root.join(SOURCE)).unwrap(),
+                "return 'original'\n"
+            );
+            assert_eq!(
+                fs::read_to_string(fixture.root.join("sourcemap.json")).unwrap(),
+                ORIGINAL_MAP
+            );
+        }
+    }
+
+    #[test]
+    fn export_publication_scopes_configured_owners_to_selected_services() {
+        let mut fixture = Fixture::new();
+        drop(fixture.stage.take());
+        fs::create_dir_all(fixture.root.join("src/ServerStorage")).unwrap();
+        fs::write(
+            fixture.root.join("src/ServerStorage/Untouched.luau"),
+            "return 'unrelated'\n",
+        )
+        .unwrap();
+        let mut project = serde_json::to_value(config::ReniumProject::default()).unwrap();
+        // Explicit tree owners must not also be implicit sourceRoot owners.
+        project["sourceRoot"] = json!("implicit-src");
+        project["tree"] = json!({
+            "ReplicatedStorage": { "$path": "src/ReplicatedStorage" },
+            "ServerStorage": { "$path": "src/ServerStorage" },
+        });
+        // Required, absent owners would make an unscoped projection fail.
+        project["mounts"] = json!([{
+            "source": "unrelated-mount", "target": "Workspace.Mount",
+        }]);
+        project["adapters"] = json!([{
+            "source": "unrelated.csv", "target": "LocalizationService.Table",
+        }]);
+        let project_bytes = serde_json::to_vec(&project).unwrap();
+        fs::write(fixture.root.join("renium.project.jsonc"), &project_bytes).unwrap();
+        let stage = ExportProjectStage::create(
+            &fixture.root,
+            Path::new("src"),
+            &["ReplicatedStorage".into()],
+        )
+        .unwrap();
+        assert!(stage.project_root.join(SOURCE).is_file());
+        assert!(!stage.project_root.join("src/ServerStorage").exists());
+        assert!(!stage.project_root.join("unrelated-mount").exists());
+        let scoped = stage.loaded.as_ref().unwrap();
+        assert_eq!(scoped.project.tree.len(), 1);
+        assert!(scoped.project.tree.contains_key("ReplicatedStorage"));
+        assert!(scoped.project.mounts.is_empty());
+        assert!(scoped.project.adapters.is_empty());
+        assert!(
+            !stage
+                .publish_paths
+                .iter()
+                .any(|path| path.starts_with("src/ServerStorage"))
+        );
+        stage.finish_projection(false).unwrap();
+        assert_eq!(
+            fs::read(fixture.root.join("renium.project.jsonc")).unwrap(),
+            project_bytes
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("src/ServerStorage/Untouched.luau")).unwrap(),
+            "return 'unrelated'\n"
+        );
+        drop(stage);
+    }
 }

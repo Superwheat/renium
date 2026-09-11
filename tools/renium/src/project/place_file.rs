@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::path::Path;
 
 use anyhow::{Result, bail};
@@ -150,10 +149,8 @@ pub(crate) fn query_place(args: QueryPlaceArgs) -> Result<()> {
 
 fn projected_services(root: &Path) -> Result<Vec<String>> {
     let mut services = Vec::new();
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir()
-            && let Some(name) = entry.file_name().to_str()
+    for entry in super::storage::service_directories(root)? {
+        if let Some(name) = entry.file_name().and_then(|name| name.to_str())
             && !name.starts_with('.')
         {
             services.push(name.to_string());
@@ -232,27 +229,47 @@ fn difference_value(
 }
 
 pub(crate) fn compare_place(args: ComparePlaceArgs, project: Option<&Path>) -> Result<()> {
-    let place_dom = place_dom(&args.input)?;
-    let (mut project_dom, project_path, service_set) = if let Some(against) = &args.against {
-        let target = self::place_dom(against)?;
-        let services = [&place_dom, &target]
-            .into_iter()
-            .flat_map(|dom| {
-                dom.root()
-                    .children()
-                    .iter()
-                    .filter_map(|id| dom.get_by_ref(*id).map(|node| node.name.clone()))
-            })
-            .collect::<BTreeSet<_>>();
-        (target, against.clone(), services)
-    } else {
-        let loaded = config::load_project(project, None)?;
-        let projection = config::stage_project(&loaded)?;
-        let services = projected_services(projection.root())?;
-        let service_set = services.iter().cloned().collect::<BTreeSet<_>>();
-        let dom = build_rbx_place(projection.root(), services, None, false, false, false)?.dom;
-        (dom, loaded.path, service_set)
+    let started = std::time::Instant::now();
+    let read = |path: &Path| {
+        if args.full {
+            // Full comparison already normalizes exact reflection defaults away.
+            // Omit them during decoding instead of allocating then dropping them.
+            RbxPlaceFormat::from_path(path)?.read_for_comparison(path)
+        } else {
+            place_dom(path)
+        }
     };
+    let (place_dom, mut project_dom, project_path, service_set) =
+        if let Some(against) = &args.against {
+            let (before, target) = rayon::join(|| read(&args.input), || read(against));
+            let before = before?;
+            let target = target?;
+            let services = [&before, &target]
+                .into_iter()
+                .flat_map(|dom| {
+                    dom.root()
+                        .children()
+                        .iter()
+                        .filter_map(|id| dom.get_by_ref(*id).map(|node| node.name.clone()))
+                })
+                .collect::<BTreeSet<_>>();
+            (before, target, against.clone(), services)
+        } else {
+            let before = read(&args.input)?;
+            let loaded = config::load_project(project, None)?;
+            let projection = config::stage_project(&loaded)?;
+            let services = projected_services(projection.root())?;
+            let service_set = services.iter().cloned().collect::<BTreeSet<_>>();
+            let dom = build_rbx_place(projection.root(), services, None, false, false, false)?.dom;
+            (before, dom, loaded.path, service_set)
+        };
+    crate::app::output::log_global(
+        4,
+        format_args!(
+            "[renium] place comparison input decoding: {:.1}ms",
+            started.elapsed().as_secs_f64() * 1000.0
+        ),
+    );
     if args.full {
         let not_serialized = if args.against.is_none() {
             super::place_diff::omit_unsaved_project_properties(&mut project_dom)?
@@ -270,6 +287,15 @@ pub(crate) fn compare_place(args: ComparePlaceArgs, project: Option<&Path>) -> R
         } else {
             "project"
         });
+        let started = std::time::Instant::now();
+        rayon::join(|| drop(place_dom), || drop(project_dom));
+        crate::app::output::log_global(
+            4,
+            format_args!(
+                "[renium] place comparison input release: {:.1}ms",
+                started.elapsed().as_secs_f64() * 1000.0
+            ),
+        );
         return print_json_output(&result, args.pretty);
     }
     let project_scripts = script_groups(&project_dom, &service_set);

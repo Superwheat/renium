@@ -147,7 +147,7 @@ pub(super) struct ComparePlaceArgs {
 pub(super) enum Commands {
     #[command(
         name = "plugin",
-        about = "Create, install and inspect workflow plugins"
+        about = "Create, install and inspect plugins that add commands to Renium"
     )]
     Plugin(crate::plugins::PluginArgs),
     #[command(external_subcommand)]
@@ -1495,6 +1495,12 @@ pub(super) struct EditorRevertArgs {
     pub(super) settings_id: Option<String>,
     #[arg(long)]
     pub(super) service: Option<String>,
+    /// Restore file-backed sync history (an ID returned by push, or latest).
+    #[arg(long, value_name = "ID|latest", conflicts_with_all = ["path", "settings_id", "service"])]
+    pub(super) sync: Option<String>,
+    /// Include every restored path in sync undo output.
+    #[arg(long, requires = "sync")]
+    pub(super) details: bool,
     #[arg(long)]
     pub(super) apply_studio: bool,
     #[command(flatten)]
@@ -1582,7 +1588,13 @@ pub(super) struct BytecodeSetPropertyArgs {
     pub(super) selector: BytecodeInstanceSelectorArgs,
     #[arg(short, long, alias = "prop")]
     pub(super) property: String,
-    #[arg(short = 'j', long, alias = "value", alias = "json")]
+    #[arg(
+        short = 'j',
+        long,
+        alias = "value",
+        alias = "json",
+        help = "JSON value, or - to read it from stdin"
+    )]
     pub(super) value_json: Option<String>,
     #[arg(long = "str", alias = "value-str", allow_hyphen_values = true)]
     pub(super) value_str: Option<String>,
@@ -1618,7 +1630,13 @@ pub(super) struct BytecodeSetSourceArgs {
     pub(super) service: Option<String>,
     #[command(flatten)]
     pub(super) selector: BytecodeInstanceSelectorArgs,
-    #[arg(short = 'j', long, alias = "value", alias = "json")]
+    #[arg(
+        short = 'j',
+        long,
+        alias = "value",
+        alias = "json",
+        help = "JSON value, or - to read it from stdin"
+    )]
     pub(super) value_json: Option<String>,
     #[arg(
         long = "str",

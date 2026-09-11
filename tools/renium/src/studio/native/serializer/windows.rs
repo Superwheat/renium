@@ -1,8 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, c_void};
 use std::fs;
+use std::io::Read;
 use std::mem::{size_of, transmute, zeroed};
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::sync::{Mutex, OnceLock};
@@ -10,14 +12,27 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use memchr::memmem;
+#[path = "windows_import.rs"]
+mod import;
+#[path = "windows_loader.rs"]
+mod loader;
+#[path = "windows_observation.rs"]
+mod observation;
 #[path = "windows_properties.rs"]
 mod properties;
+pub(crate) use import::{CREATED_ROW, read_service_payload};
+pub(crate) use observation::{AttributeGuard, begin_attribute_guard, begin_attribute_relay};
+#[cfg(test)]
+#[path = "windows_sampler_tests.rs"]
+mod sampler_tests;
 #[cfg(test)]
 #[path = "windows_tests.rs"]
 mod tests;
-pub(crate) use properties::prepare_property;
+pub(crate) use properties::{
+    observe_terrain, prepare_property, prepare_terrain, read_property, register_history,
+};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -29,9 +44,12 @@ use windows_sys::Win32::System::Memory::{
     MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAllocEx, VirtualFreeEx,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateRemoteThread, GetExitCodeThread, OpenProcess, PROCESS_CREATE_THREAD,
+    CreateRemoteThread, GetExitCodeThread, OpenProcess, PROCESS_CREATE_THREAD, PROCESS_DUP_HANDLE,
     PROCESS_QUERY_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_VM_OPERATION, PROCESS_VM_READ,
     PROCESS_VM_WRITE, WaitForSingleObject,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GetClassNameW, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
 };
 
 use crate::studio::native::snapshot::{
@@ -40,7 +58,7 @@ use crate::studio::native::snapshot::{
 use crate::system::files::{atomic_write_file, fnv1a};
 
 const HELPER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-studio-helper.dll"));
-const PARAM_SIZE: usize = 5792;
+const PARAM_SIZE: usize = 5904;
 const PARAM_STATUS: usize = 68;
 const PARAM_OUTPUT_SIZE: usize = 72;
 const PARAM_CONTEXT_MICROS: usize = 80;
@@ -49,9 +67,27 @@ const PARAM_SERIALIZE_MICROS: usize = 96;
 const PARAM_WRITE_MICROS: usize = 104;
 const PARAM_REQUESTED_MXCSR: usize = 128;
 const PARAM_PLACE_MODE: usize = 136;
+const PARAM_DATA_MODEL_INSTANCE_OFFSET: usize = 140;
 const PARAM_ROOTS: usize = 144;
 const PARAM_OUTPUT_PATH: usize = 4240;
 const PARAM_ERROR: usize = 5280;
+const PARAM_TASK_CONTEXT: usize = 5792;
+const PARAM_SUBMIT_TASK: usize = 5800;
+const PARAM_TIMEOUT: usize = 5808;
+const PARAM_CHILDREN_OFFSET: usize = 5812;
+const PARAM_SELF_OFFSET: usize = 5816;
+const PARAM_IDENTITY_BINDING: usize = 5840;
+const PARAM_IDENTITY_GETTER: usize = 5848;
+const PARAM_DEBUG_ID_GETTER: usize = 5856;
+const CAPTURE_HEADER_SIZE: usize = 320;
+const CAPTURE_HEADER_MAGIC: u32 = 0x50414352; // RCAP, version 1.
+const PARAM_CAPTURE_MODE: usize = 5880;
+const PARAM_PARENT_OFFSET: usize = 5884;
+const PARAM_WINDOW: usize = 5888;
+const PARAM_PROCESS_ID: usize = 5896;
+const CAPTURE_MAX_BYTES: usize = 512 * 1024 * 1024;
+const CAPTURE_MAX_ROWS: usize = 2_000_000;
+const CAPTURE_ROW_SIZE: usize = 72;
 const MAX_ROOTS: usize = 256;
 const REMOTE_TIMEOUT: u32 = 20_000;
 const PACKAGE_UNMODIFIED_STATE: i64 = u32::MAX as i64;
@@ -131,7 +167,12 @@ struct ProcessMemory {
 
 impl ProcessMemory {
     fn open(pid: u32) -> Result<Self> {
+        Self::open_with_access(pid, 0)
+    }
+
+    fn open_with_access(pid: u32, additional: u32) -> Result<Self> {
         let access = PROCESS_CREATE_THREAD
+            | additional
             | PROCESS_QUERY_INFORMATION
             | PROCESS_SYNCHRONIZE
             | PROCESS_VM_OPERATION
@@ -230,6 +271,21 @@ impl ProcessMemory {
 
 impl RemoteAllocation<'_> {
     fn run(&mut self, address: usize, timeout: u32) -> Result<u32> {
+        self.run_with_input_ownership(address, timeout, false)
+    }
+
+    // Only helper exports with an input-freeing finally accept ownership. Failure to create the thread
+    // leaves this allocation host-owned; once started, its __finally frees it.
+    fn run_owned(mut self, address: usize, timeout: u32) -> Result<u32> {
+        self.run_with_input_ownership(address, timeout, true)
+    }
+
+    fn run_with_input_ownership(
+        &mut self,
+        address: usize,
+        timeout: u32,
+        helper_owned: bool,
+    ) -> Result<u32> {
         let start = Some(unsafe {
             transmute::<usize, unsafe extern "system" fn(*mut c_void) -> u32>(address)
         });
@@ -250,21 +306,22 @@ impl RemoteAllocation<'_> {
                 std::io::Error::last_os_error()
             );
         }
+        if helper_owned {
+            self.address = 0;
+        }
         let waited = unsafe { WaitForSingleObject(thread, timeout) };
         if waited != WAIT_OBJECT_0 {
+            let error = std::io::Error::last_os_error();
             unsafe {
                 CloseHandle(thread);
             }
-            // The helper may still reference this allocation. Studio reclaims this small buffer
-            // on exit; freeing it here would create a remote use-after-free.
+            // Legacy callers retain their original timeout behavior. Capture
+            // has already transferred ownership and needs no host reclaimer.
             self.address = 0;
             if waited == WAIT_TIMEOUT {
                 bail!("Studio helper exceeded its {timeout}ms deadline");
             }
-            bail!(
-                "Could not wait for the Studio helper: {}",
-                std::io::Error::last_os_error()
-            );
+            bail!("Could not wait for the Studio helper: {error}");
         }
         let mut exit_code = 0;
         let ok = unsafe { GetExitCodeThread(thread, &mut exit_code) };
@@ -462,6 +519,10 @@ impl<'a> PeImage<'a> {
     }
 
     fn function_end(&self, offset: usize) -> Result<usize> {
+        self.function_bounds(offset).map(|(_, end)| end)
+    }
+
+    fn function_bounds(&self, offset: usize) -> Result<(usize, usize)> {
         let target = self.offset_to_rva(offset)?;
         let table = self.section(b".pdata")?;
         let (mut low, mut high) = (0, table.raw_size / 12);
@@ -475,7 +536,7 @@ impl<'a> PeImage<'a> {
             } else if target >= end {
                 low = middle + 1;
             } else {
-                return Ok(self.rva_to_offset(end - 1)? + 1);
+                return Ok((self.rva_to_offset(begin)?, self.rva_to_offset(end - 1)? + 1));
             }
         }
         bail!("Studio call site has no x64 unwind function boundary")
@@ -1344,6 +1405,57 @@ fn refresh_active_data_model(
     })
 }
 
+pub(crate) fn prepare_context(pid: u32, title: &str) -> Result<()> {
+    let current_modules = modules(pid)?;
+    let studio = current_modules
+        .iter()
+        .find(|module| module.name.eq_ignore_ascii_case("RobloxStudioBeta.exe"))
+        .context("Roblox Studio module was not found")?;
+    let layout = package_layout(&studio.path)?;
+    let memory = ProcessMemory::open(pid)?;
+    verify_loaded_image(&memory, studio, layout.image_stamp)?;
+    let model = active_data_model(pid, &memory, studio, layout.data, title)?;
+    if let Err(error) = observation::prepare(&memory, studio, &model) {
+        crate::app::output::log_global(
+            5,
+            format_args!("[renium] native attribute observation unavailable: {error:#}"),
+        );
+    }
+    if let Err(error) = studio_layout(&studio.path) {
+        crate::app::output::log_global(
+            5,
+            format_args!("[renium] native capture unavailable: {error:#}"),
+        );
+    }
+    // Connection preparation runs in its existing background worker. Cache an
+    // unsupported loader too, without disabling independent property/package APIs.
+    if let Err(error) = loader::prepare(&studio.path).and_then(|trace| {
+        anyhow::ensure!(
+            trace.instance_offset == model.layout.data_model_instance,
+            "Native loader disagrees with Studio's DataModel layout"
+        );
+        Ok(())
+    }) {
+        crate::app::output::log_global(
+            5,
+            format_args!("[renium] native loader unavailable: {error:#}"),
+        );
+    }
+    Ok(())
+}
+
+// Select the ordinary transport before staging mutations when this executable
+// has no supported reader contract. Invocation still revalidates live code,
+// target identities and DataModel ownership under the transaction's guard.
+pub(crate) fn prepare_service_reader(pid: u32) -> Result<()> {
+    let current_modules = modules(pid)?;
+    let studio = current_modules
+        .iter()
+        .find(|module| module.name.eq_ignore_ascii_case("RobloxStudioBeta.exe"))
+        .context("Roblox Studio module was not found")?;
+    loader::prepare(&studio.path).map(|_| ())
+}
+
 fn active_data_model(
     pid: u32,
     memory: &ProcessMemory,
@@ -1351,6 +1463,9 @@ fn active_data_model(
     data: PeSection,
     title: &str,
 ) -> Result<ActiveDataModel> {
+    // Bridge selectors use a file name; native property calls may use the full
+    // window caption. Cache the uniquely resolved window, not either spelling.
+    let (_, title) = capture_window(pid, title)?;
     let cache = DATA_MODELS.get_or_init(|| Mutex::new(HashMap::new()));
     let cached = cache
         .lock()
@@ -1359,18 +1474,19 @@ fn active_data_model(
         .cloned();
     if let Some(data_model) = cached
         .as_ref()
-        .and_then(|cached| refresh_active_data_model(memory, module, title, cached))
+        .and_then(|cached| refresh_active_data_model(memory, module, &title, cached))
     {
         return Ok(data_model);
     }
-    let data_model = find_active_data_model(memory, module, data, title)?;
+    let _discovery = crate::app::timing::trace_scope("native.context", "discover DataModel");
+    let data_model = find_active_data_model(memory, module, data, &title)?;
     cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(
             pid,
             CachedDataModel {
-                title: title.to_string(),
+                title,
                 outer: data_model.outer,
                 owner: data_model.owner,
                 layout: data_model.layout,
@@ -2183,6 +2299,10 @@ fn build_parameters(
     output: &Path,
     place_mode: bool,
 ) -> Result<Vec<u8>> {
+    anyhow::ensure!(
+        !data_model.roots.is_empty() && data_model.roots.len() <= MAX_ROOTS,
+        "Native snapshot requires 1..={MAX_ROOTS} roots"
+    );
     let mut bytes = vec![0; PARAM_SIZE];
     put_u64(&mut bytes, 0, module_base);
     put_u64(&mut bytes, 8, trace.serializer);
@@ -2199,6 +2319,24 @@ fn build_parameters(
     );
     put_u32(&mut bytes, PARAM_REQUESTED_MXCSR, 0x9fc0);
     put_u32(&mut bytes, PARAM_PLACE_MODE, u32::from(place_mode));
+    put_u32(
+        &mut bytes,
+        PARAM_DATA_MODEL_INSTANCE_OFFSET,
+        u32::try_from(data_model.layout.data_model_instance)
+            .context("Studio DataModel instance offset overflowed")?,
+    );
+    put_u32(&mut bytes, PARAM_TIMEOUT, 15_000);
+    put_u32(
+        &mut bytes,
+        PARAM_CHILDREN_OFFSET,
+        u32::try_from(data_model.layout.children).context("Studio children offset overflowed")?,
+    );
+    put_u32(
+        &mut bytes,
+        PARAM_SELF_OFFSET,
+        u32::try_from(data_model.layout.self_pointer)
+            .context("Studio identity offset overflowed")?,
+    );
     for (index, root) in data_model.roots.iter().enumerate() {
         let offset = PARAM_ROOTS + index * 16;
         put_u64(&mut bytes, offset, root.instance);
@@ -2222,6 +2360,354 @@ fn error_text(bytes: &[u8]) -> String {
         .position(|byte| *byte == 0)
         .unwrap_or(value.len());
     String::from_utf8_lossy(&value[..end]).into_owned()
+}
+
+/// One task's flag-64 RBXL plus exact live identities. No native allocation is
+/// transferred to the caller. The decoder must check the serialized UID/parent
+/// bijection before using this capture (flag 64 excludes non-Archivable trees).
+pub(crate) struct NativeCapture {
+    pub bytes: Vec<u8>,
+    /// Headerless 72-byte rows: native UniqueId[16], NUL/zero-padded debug ID[48],
+    /// LE parent row u32, reserved zero u32. Selected roots come first in request
+    /// order with parent=u32::MAX; remaining rows are breadth-first, in engine
+    /// child order, and every parent precedes its children. These are identities,
+    /// not creation/ownership receipts. Includes services themselves, not Game.
+    pub identities: Vec<u8>,
+}
+
+fn capture_remaining_ms(started: Instant, timeout: Duration) -> Result<u32> {
+    let remaining = timeout.saturating_sub(started.elapsed());
+    anyhow::ensure!(
+        remaining.as_millis() > 0,
+        "Native capture exceeded its deadline"
+    );
+    Ok(remaining.as_millis().min(u128::from(u32::MAX - 1)) as u32)
+}
+
+struct CaptureWindowSearch<'a> {
+    pid: u32,
+    title: &'a str,
+    matches: Vec<(usize, String)>,
+}
+
+fn capture_title_matches(title: &str, selector: &str) -> bool {
+    if selector.trim().is_empty() || !title.ends_with(" - Roblox Studio") {
+        return false;
+    }
+    // Same full-path/basename normalization used by native DataModel discovery.
+    let requested = expected_data_model_names(selector);
+    expected_data_model_names(title).iter().any(|actual| {
+        requested
+            .iter()
+            .any(|expected| actual.eq_ignore_ascii_case(expected))
+    })
+}
+
+unsafe extern "system" fn capture_window_callback(window: HWND, parameter: LPARAM) -> i32 {
+    let search = unsafe { &mut *(parameter as *mut CaptureWindowSearch<'_>) };
+    let mut pid = 0;
+    if unsafe { GetWindowThreadProcessId(window, &mut pid) } == 0 || pid != search.pid {
+        return 1;
+    }
+    let mut class = [0u16; 128];
+    let class_length = unsafe { GetClassNameW(window, class.as_mut_ptr(), class.len() as i32) };
+    if class_length < 2 || class[..2] != [u16::from(b'Q'), u16::from(b't')] {
+        return 1;
+    }
+    let title_length = unsafe { GetWindowTextLengthW(window) };
+    if !(1..=32767).contains(&title_length) {
+        return 1;
+    }
+    let mut title = vec![0u16; title_length as usize + 1];
+    let length = unsafe { GetWindowTextW(window, title.as_mut_ptr(), title.len() as i32) };
+    if length != title_length {
+        return 1;
+    }
+    let Ok(title) = String::from_utf16(&title[..length as usize]) else {
+        return 1;
+    };
+    if capture_title_matches(&title, search.title) {
+        search.matches.push((window as usize, title));
+    }
+    1
+}
+
+fn capture_window(pid: u32, title: &str) -> Result<(usize, String)> {
+    anyhow::ensure!(
+        !title.is_empty(),
+        "Native capture needs an exact Studio title"
+    );
+    let mut search = CaptureWindowSearch {
+        pid,
+        title,
+        matches: Vec::new(),
+    };
+    let ok = unsafe {
+        EnumWindows(
+            Some(capture_window_callback),
+            &mut search as *mut _ as LPARAM,
+        )
+    };
+    anyhow::ensure!(
+        ok != 0,
+        "Could not enumerate Studio windows: {}",
+        std::io::Error::last_os_error()
+    );
+    anyhow::ensure!(
+        search.matches.len() == 1,
+        "Studio process {pid} has {} windows matching the requested title",
+        search.matches.len()
+    );
+    Ok(search.matches.remove(0))
+}
+
+fn select_capture_roots(
+    roots: &[(SharedEntry, String)],
+    services: &[String],
+) -> Result<Vec<SharedEntry>> {
+    anyhow::ensure!(
+        !services.is_empty() && services.len() <= MAX_ROOTS,
+        "Native capture requires 1..={MAX_ROOTS} services"
+    );
+    let mut names = HashSet::new();
+    let mut instances = HashSet::new();
+    services
+        .iter()
+        .map(|service| {
+            anyhow::ensure!(
+                !service.is_empty() && names.insert(service),
+                "Duplicate or empty capture service"
+            );
+            // Class identity only. A same-named Folder is never a service fallback.
+            let matches = roots
+                .iter()
+                .filter(|(_, class)| class == service)
+                .collect::<Vec<_>>();
+            anyhow::ensure!(
+                matches.len() == 1,
+                "Studio has {} exact service roots for {service}",
+                matches.len()
+            );
+            let entry = matches[0].0;
+            anyhow::ensure!(
+                entry.instance != 0 && entry.owner != 0 && instances.insert(entry.instance),
+                "Native capture service ownership is invalid or duplicated"
+            );
+            Ok(entry)
+        })
+        .collect()
+}
+
+fn capture_lengths(header: &[u8], root_count: usize, file_size: u64) -> Result<(usize, usize)> {
+    anyhow::ensure!(
+        header.len() == CAPTURE_HEADER_SIZE
+            && read_u32(header, 0)? == CAPTURE_HEADER_MAGIC
+            && read_u32(header, 4)? == 1,
+        "Invalid native capture response header"
+    );
+    let status = read_u32(header, 8)?;
+    let exit = read_u32(header, 12)?;
+    anyhow::ensure!(
+        status == 4 && exit == 0,
+        "Studio native capture failed with status 0x{status:X}, exit 0x{exit:X}: {}",
+        error_text_at(header, 64)
+    );
+    let bytes = usize::try_from(read_u64(header, 16)?)?;
+    let identities = usize::try_from(read_u64(header, 24)?)?;
+    anyhow::ensure!(
+        (32..=CAPTURE_MAX_BYTES).contains(&bytes)
+            && identities.is_multiple_of(CAPTURE_ROW_SIZE)
+            && (root_count..=CAPTURE_MAX_ROWS).contains(&(identities / CAPTURE_ROW_SIZE))
+            && bytes
+                .checked_add(identities)
+                .and_then(|size| size.checked_add(CAPTURE_HEADER_SIZE))
+                .map(|total| total as u64)
+                == Some(file_size),
+        "Native capture transport sizes are invalid"
+    );
+    Ok((bytes, identities))
+}
+
+/// Read-only engine operation using the ordinary production DataModel queue.
+/// `timeout` covers host discovery, helper loading, native work and transport;
+/// the queued engine phase also has the existing 15-second ceiling. A timeout
+/// never terminates engine code or unloads the helper. No retry is implicit.
+pub(crate) fn capture_live_services(
+    pid: u32,
+    studio_title: &str,
+    services: &[String],
+    timeout: Duration,
+) -> Result<NativeCapture> {
+    use crate::app::timing::{trace_profile, trace_scope};
+    let started = Instant::now();
+    let _total = trace_scope("native.capture", "capture selected services");
+    capture_remaining_ms(started, timeout)?;
+    anyhow::ensure!(
+        !services.is_empty() && services.len() <= MAX_ROOTS,
+        "Native capture requires 1..={MAX_ROOTS} services"
+    );
+    let discovery = trace_scope("native.capture", "host discovery");
+    let memory = ProcessMemory::open(pid)?; // Retains the process across PID reuse.
+    let current_modules = modules(pid)?;
+    let studio = current_modules
+        .first()
+        .context("Studio process has no main module")?;
+    anyhow::ensure!(
+        studio.name.eq_ignore_ascii_case("RobloxStudioBeta.exe"),
+        "Native capture target is not Roblox Studio"
+    );
+    let window = capture_window(pid, studio_title)?;
+    let layout_trace = trace_scope("native.capture", "resolve serializer layout");
+    let (data, trace, image_stamp) = studio_layout(&studio.path)?;
+    drop(layout_trace);
+    verify_loaded_image(&memory, studio, image_stamp)?;
+    let model_trace = trace_scope("native.capture", "resolve live DataModel");
+    let mut model = active_data_model(pid, &memory, studio, data, studio_title)?;
+    drop(model_trace);
+    let layout = package_layout(&studio.path)?;
+    let task_context = data_model_task_context(&memory, studio, &layout, &model)?;
+    for rva in [trace.serializer, trace.deallocator, layout.submit_task] {
+        let address = studio
+            .base
+            .checked_add(rva)
+            .context("Capture entry address overflowed")?;
+        properties::verified_code(&memory, studio, &layout, address, 64)?;
+    }
+    let instance = model
+        .outer
+        .checked_add(model.layout.data_model_instance)
+        .context("DataModel instance address overflowed")?;
+    let identity_trace = trace_scope("native.capture", "resolve identity getters");
+    let parent_offset = properties::parent_offset(&memory, &model)?;
+    let (identity_binding, identity_getter) =
+        properties::identity_binding(&memory, studio, &layout, &model, instance)?;
+    let debug_id = properties::debug_id_function(&memory, studio, &layout, &model, instance)?;
+    drop(identity_trace);
+    let roots = model
+        .roots
+        .iter()
+        .map(|entry| {
+            Ok((
+                *entry,
+                read_instance_class(&memory, entry.instance, model.layout)
+                    .context("Studio service class changed during capture discovery")?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    model.roots = select_capture_roots(&roots, services)?;
+    let helper_trace = trace_scope("native.capture", "load helper");
+    let helper = ensure_helper_loaded_with_timeout(
+        pid,
+        &memory,
+        &current_modules,
+        capture_remaining_ms(started, timeout)?,
+    )?;
+    drop(helper_trace);
+    let entry = helper
+        .checked_add(helper_export_rva("ReniumCaptureRun")?)
+        .context("Studio capture helper address overflowed")?;
+    drop(discovery);
+
+    let prepare = trace_scope("native.capture", "prepare transport");
+    let mut nonce = [0u8; 16];
+    getrandom::fill(&mut nonce)
+        .map_err(|error| anyhow::anyhow!("Cannot create capture nonce: {error}"))?;
+    let nonce = u128::from_le_bytes(nonce);
+    let directory = std::env::temp_dir().join("renium-native");
+    fs::create_dir_all(&directory)?;
+    let path = directory.join(format!("capture-{pid}-{nonce:032x}.tmp"));
+    // Win32 FILE_FLAG_DELETE_ON_CLOSE and FILE_SHARE_READ|WRITE|DELETE. The
+    // host retains this handle until both blobs have been read. The helper uses
+    // OPEN_EXISTING: a late task cannot recreate output after host cancellation.
+    let mut transport = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .share_mode(0x7)
+        .custom_flags(0x04000000)
+        .open(&path)
+        .context("Could not create native capture transport")?;
+    let mut parameters = build_parameters(studio.base, trace, &model, &path, true)?;
+    // Match the proven queued capture: preserve Studio's native FP environment.
+    // The older file-snapshot path's deliberate 0x9fc0 override is unchanged.
+    put_u32(&mut parameters, PARAM_REQUESTED_MXCSR, 0);
+    for (offset, value) in [
+        (PARAM_TASK_CONTEXT, task_context),
+        (
+            PARAM_SUBMIT_TASK,
+            studio
+                .base
+                .checked_add(layout.submit_task)
+                .context("Submitter address overflowed")?,
+        ),
+        (PARAM_IDENTITY_BINDING, identity_binding),
+        (PARAM_IDENTITY_GETTER, identity_getter),
+        (PARAM_DEBUG_ID_GETTER, debug_id),
+        (PARAM_WINDOW, window.0),
+    ] {
+        put_u64(&mut parameters, offset, value);
+    }
+    put_u32(&mut parameters, PARAM_CAPTURE_MODE, 1);
+    put_u32(
+        &mut parameters,
+        PARAM_PARENT_OFFSET,
+        u32::try_from(parent_offset)?,
+    );
+    put_u32(&mut parameters, PARAM_PROCESS_ID, pid);
+    // Recheck title before queueing and after reading. Never dispatch WM_GETTEXT
+    // from inside Studio's locked task. Helper rechecks PID/window, owner, roots,
+    // task context and hierarchy inside the same task as serialization.
+    anyhow::ensure!(
+        capture_window(pid, studio_title)? == window,
+        "Studio window changed during capture discovery"
+    );
+    let remaining = capture_remaining_ms(started, timeout)?;
+    put_u32(&mut parameters, PARAM_TIMEOUT, remaining.min(15_000));
+    let remote = memory.allocate(parameters.len())?;
+    memory.write(remote.address, &parameters)?;
+    drop(prepare);
+    let native = trace_scope("native.capture", "queued native task");
+    let exit = remote.run_owned(entry, capture_remaining_ms(started, timeout)?)?;
+    drop(native);
+    let _transport = trace_scope("native.capture", "read transport");
+    // The helper has freed its input. Response is exclusively file-backed.
+    let mut header = [0; CAPTURE_HEADER_SIZE];
+    transport
+        .read_exact(&mut header)
+        .context("Incomplete native capture response header")?;
+    capture_remaining_ms(started, timeout)
+        .context("Native capture expired after its helper returned")?;
+    let (byte_count, identity_count) =
+        capture_lengths(&header, services.len(), transport.metadata()?.len())?;
+    anyhow::ensure!(
+        exit == read_u32(&header, 12)?,
+        "Native capture response exit disagrees with helper exit"
+    );
+    let mut bytes = vec![0; byte_count];
+    let mut identities = vec![0; identity_count];
+    transport
+        .read_exact(&mut bytes)
+        .context("Incomplete native capture RBXL transport")?;
+    capture_remaining_ms(started, timeout)?;
+    transport
+        .read_exact(&mut identities)
+        .context("Incomplete native capture identity transport")?;
+    capture_remaining_ms(started, timeout)?;
+    anyhow::ensure!(
+        capture_window(pid, studio_title)? == window,
+        "Studio window changed during native capture"
+    );
+    trace_profile(
+        "native.capture",
+        &serde_json::json!({
+            "queueMs": read_u64(&header, 32)? as f64 / 1000.0,
+            "serializeMs": read_u64(&header, 40)? as f64 / 1000.0,
+            "identityMs": read_u64(&header, 48)? as f64 / 1000.0,
+            "writeMs": read_u64(&header, 56)? as f64 / 1000.0,
+            "bytes": byte_count, "identityRows": identity_count / CAPTURE_ROW_SIZE,
+        }),
+    );
+    Ok(NativeCapture { bytes, identities })
 }
 
 fn write_live_snapshot(
@@ -2248,6 +2734,8 @@ fn write_live_snapshot(
     verify_loaded_image(&memory, studio, image_stamp)?;
     let discover_started = Instant::now();
     let mut data_model = active_data_model(pid, &memory, studio, data, studio_title)?;
+    let task_layout = package_layout(&studio.path)?;
+    let task_context = data_model_task_context(&memory, studio, &task_layout, &data_model)?;
     if let Some(service) = service {
         select_service_root(&memory, &mut data_model, service)?;
     }
@@ -2267,6 +2755,15 @@ fn write_live_snapshot(
             &temporary,
             service.is_none(),
         )?;
+        put_u64(&mut parameters, PARAM_TASK_CONTEXT, task_context);
+        put_u64(
+            &mut parameters,
+            PARAM_SUBMIT_TASK,
+            studio
+                .base
+                .checked_add(task_layout.submit_task)
+                .context("Studio snapshot submitter address overflowed")?,
+        );
         let mut remote = memory.allocate(parameters.len())?;
         memory.write(remote.address, &parameters)?;
         let invoke_started = Instant::now();
@@ -2319,4 +2816,114 @@ pub fn write_live_service(
     output: &Path,
 ) -> Result<NativeSnapshot> {
     write_live_snapshot(pid, studio_title, output, Some(service))
+}
+
+#[cfg(test)]
+mod capture_contract_tests {
+    use super::*;
+
+    #[test]
+    fn capture_titles_accept_bridge_basenames_and_pin_full_paths() {
+        let actual = r"E:\places\ReniumFoo.rbxl - Roblox Studio";
+        for selector in [
+            "ReniumFoo.rbxl",
+            "reniumfoo.rbxl",
+            r"E:\places\ReniumFoo.rbxl",
+            actual,
+        ] {
+            assert!(capture_title_matches(actual, selector), "{selector}");
+        }
+        assert!(!capture_title_matches(actual, "ReniumOther.rbxl"));
+        assert!(!capture_title_matches(actual, ""));
+        assert!(!capture_title_matches("ReniumFoo.rbxl", "ReniumFoo.rbxl"));
+        assert!(capture_title_matches(
+            "Untitled - Roblox Studio",
+            "Untitled"
+        ));
+        // Normalization selects candidates, never the identity used for rechecks.
+        assert_ne!(
+            (1usize, actual),
+            (1usize, r"F:\places\ReniumFoo.rbxl - Roblox Studio")
+        );
+    }
+
+    #[test]
+    fn capture_selection_preserves_requested_class_order_and_rejects_ambiguity() {
+        let roots = vec![
+            (
+                SharedEntry {
+                    instance: 10,
+                    owner: 20,
+                },
+                "Workspace".into(),
+            ),
+            (
+                SharedEntry {
+                    instance: 30,
+                    owner: 40,
+                },
+                "Lighting".into(),
+            ),
+        ];
+        let requested = ["Lighting".into(), "Workspace".into()];
+        let selected = select_capture_roots(&roots, &requested).unwrap();
+        assert_eq!(
+            selected.iter().map(|r| r.instance).collect::<Vec<_>>(),
+            [30, 10]
+        );
+        for names in [
+            vec![],
+            vec!["Missing".into()],
+            vec!["Workspace".into(), "Workspace".into()],
+        ] {
+            assert!(select_capture_roots(&roots, &names).is_err());
+        }
+        let mut ambiguous = roots.clone();
+        ambiguous.push((
+            SharedEntry {
+                instance: 50,
+                owner: 60,
+            },
+            "Workspace".into(),
+        ));
+        assert!(select_capture_roots(&ambiguous, &requested).is_err());
+        ambiguous[2].1 = "Folder".into();
+        assert!(select_capture_roots(&ambiguous, &requested).is_ok());
+        ambiguous[1].0.instance = 10;
+        assert!(select_capture_roots(&ambiguous, &requested).is_err());
+    }
+
+    #[test]
+    fn capture_transport_rejects_truncation_oversize_and_partial_identity_rows() {
+        let mut params = vec![0; CAPTURE_HEADER_SIZE];
+        put_u32(&mut params, 0, CAPTURE_HEADER_MAGIC);
+        put_u32(&mut params, 4, 1);
+        put_u32(&mut params, 8, 4);
+        put_u64(&mut params, 16, 128);
+        put_u64(&mut params, 24, 3 * CAPTURE_ROW_SIZE);
+        let total = (CAPTURE_HEADER_SIZE + 128 + 3 * CAPTURE_ROW_SIZE) as u64;
+        assert_eq!(capture_lengths(&params, 2, total).unwrap(), (128, 216));
+        assert!(capture_lengths(&params, 4, total).is_err());
+        assert!(capture_lengths(&params, 2, total - 1).is_err());
+        assert!(capture_lengths(&params, 2, total + 1).is_err());
+        assert!(capture_lengths(&params[..CAPTURE_HEADER_SIZE - 1], 2, total).is_err());
+        put_u32(&mut params, 4, 2);
+        assert!(capture_lengths(&params, 2, total).is_err());
+        put_u32(&mut params, 4, 1);
+        put_u32(&mut params, 8, 0xE00A);
+        params[64..71].copy_from_slice(b"expired");
+        assert!(
+            capture_lengths(&params, 2, total)
+                .unwrap_err()
+                .to_string()
+                .contains("expired")
+        );
+        put_u32(&mut params, 8, 4);
+        put_u64(&mut params, 24, 215);
+        assert!(capture_lengths(&params, 2, total - 1).is_err());
+        put_u64(&mut params, 24, 216);
+        put_u64(&mut params, 16, CAPTURE_MAX_BYTES + 1);
+        assert!(capture_lengths(&params, 2, total).is_err());
+        assert!(capture_remaining_ms(Instant::now(), Duration::ZERO).is_err());
+    }
 }

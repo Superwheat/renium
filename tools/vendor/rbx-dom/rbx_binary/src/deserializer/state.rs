@@ -622,7 +622,12 @@ This may cause unexpected or broken behavior in your final results if you rely o
         {
             return Ok(());
         }
-        if self.deserializer.elide_defaults {
+        if self.deserializer.elide_defaults
+            && !self
+                .deserializer
+                .retain_defaults_for_classes
+                .contains(type_name.as_str())
+        {
             populate_canonical_property_defaults(
                 self.deserializer.database,
                 class_descriptor,

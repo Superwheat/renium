@@ -17,7 +17,7 @@ use crate::cli::{
     BytecodeAddInstanceArgs, BytecodeCloneInstanceArgs, BytecodeDesyncPackageLinkArgs,
     BytecodeRemoveInstanceArgs,
 };
-use crate::editor::document::is_protected_starter_player_container;
+use crate::editor::document::is_protected_engine_container;
 use crate::editor::paths::{
     build_editor_instance_path_parts, build_editor_instance_paths,
     build_editor_source_paths_by_index, script_file_names,
@@ -43,7 +43,8 @@ pub(crate) fn bytecode_add_instance(args: BytecodeAddInstanceArgs) -> Result<()>
     let mut document = SettingsBytecode::read_file(&settings_file)?;
     let before_document = document.clone();
     let service = bytecode_service_name(&document, &settings_file, &service_hint);
-    let service_dir = settings_file.parent().unwrap_or_else(|| Path::new("."));
+    let service_directory = crate::project::storage::source_directory(&settings_file);
+    let service_dir = service_directory.as_path();
     let source_paths_before = build_editor_source_paths_by_index(&document, &service, service_dir);
     let parent_index = bytecode_parent_index(
         &document,
@@ -370,12 +371,7 @@ pub(crate) fn bytecode_service_name(
         .iter()
         .find(|instance| instance.parent_index.is_none())
         .map(|instance| instance.name.clone())
-        .or_else(|| {
-            settings_file
-                .parent()
-                .and_then(Path::file_name)
-                .map(|name| name.to_string_lossy().into_owned())
-        })
+        .or_else(|| crate::project::storage::store_service_name(settings_file))
         .unwrap_or_default()
 }
 
@@ -857,9 +853,10 @@ pub(crate) fn bytecode_remove_instance(args: BytecodeRemoveInstanceArgs) -> Resu
     let mut document = SettingsBytecode::read_file(&settings_file)?;
     let before_document = document.clone();
     let service = bytecode_service_name(&document, &settings_file, &service_hint);
-    let source_paths_by_index = settings_file.parent().map_or_else(
-        || vec![None; document.instances.len()],
-        |service_dir| build_editor_source_paths_by_index(&document, &service, service_dir),
+    let source_paths_by_index = build_editor_source_paths_by_index(
+        &document,
+        &service,
+        &crate::project::storage::source_directory(&settings_file),
     );
     let index =
         resolve_bytecode_selector(&document, &service, &args.selector, "No matching instance")?
@@ -868,7 +865,7 @@ pub(crate) fn bytecode_remove_instance(args: BytecodeRemoveInstanceArgs) -> Resu
     let mut subtree = Vec::new();
     collect_settings_subtree_preorder(&children_by_parent, index, &mut subtree);
     reject_package_link_subtree_mutation(&document, &subtree, "removed")?;
-    if is_protected_starter_player_container(&document, index) {
+    if is_protected_engine_container(&document, index) {
         bail!("{} cannot be removed", document.instances[index].name);
     }
     let removed =
@@ -884,7 +881,8 @@ pub(crate) fn bytecode_remove_instance(args: BytecodeRemoveInstanceArgs) -> Resu
         .filter(|path| path.is_file())
         .cloned()
         .collect::<Vec<_>>();
-    let service_dir = settings_file.parent().unwrap_or_else(|| Path::new("."));
+    let service_directory = crate::project::storage::source_directory(&settings_file);
+    let service_dir = service_directory.as_path();
     let mut writes = BTreeMap::new();
     let mut removals = Vec::new();
     collect_source_path_updates(
@@ -914,8 +912,11 @@ pub(crate) fn bytecode_remove_instance(args: BytecodeRemoveInstanceArgs) -> Resu
         .iter()
         .map(|path| path.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
-    if let Some(service_dir) = settings_file.parent() {
-        prune_removed_source_dirs(service_dir, &removed_source_paths);
+    {
+        prune_removed_source_dirs(
+            &crate::project::storage::source_directory(&settings_file),
+            &removed_source_paths,
+        );
         if removed_settings_file && let Some(source_root) = service_dir.parent() {
             prune_empty_source_dirs(source_root, service_dir)?;
         }
@@ -942,7 +943,11 @@ pub(crate) fn bytecode_desync_package_link(args: BytecodeDesyncPackageLinkArgs) 
     )?;
     let _lock = lock_existing_service_store(&settings_file)?;
     let mut document = SettingsBytecode::read_file(&settings_file)?;
+    let before_document = document.clone();
     let service = bytecode_service_name(&document, &settings_file, &service_hint);
+    let service_directory = crate::project::storage::source_directory(&settings_file);
+    let service_dir = service_directory.as_path();
+    let source_paths_before = build_editor_source_paths_by_index(&document, &service, service_dir);
     let target_index =
         resolve_bytecode_selector(&document, &service, &args.selector, "No matching instance")?
             .index;
@@ -971,7 +976,21 @@ pub(crate) fn bytecode_desync_package_link(args: BytecodeDesyncPackageLinkArgs) 
         .and_then(std::clone::Clone::clone);
     let removed =
         instance_api::remove_instances_at_indices(&mut document, &package_link_indices, true)?;
-    document.write_file(&settings_file)?;
+    let mut writes = BTreeMap::new();
+    let mut removals = Vec::new();
+    collect_source_path_updates(
+        &before_document,
+        &source_paths_before,
+        &document,
+        &service,
+        service_dir,
+        &mut writes,
+        &mut removals,
+    )?;
+    writes.insert(settings_file.clone(), encode_settings_bytecode(&document)?);
+    let changed_paths = file_mutation_paths(&writes, &removals);
+    apply_file_mutations(&writes, &removals)?;
+    prune_removed_source_dirs(service_dir, &removals);
     print_json_output(
         &json!({
             "ok": true,
@@ -981,6 +1000,7 @@ pub(crate) fn bytecode_desync_package_link(args: BytecodeDesyncPackageLinkArgs) 
             "targetPathSegments": target_path,
             "removedIndexes": removed,
             "removedPackageLinks": removed_package_links,
+            "changedPaths": changed_paths,
         }),
         args.pretty,
     )

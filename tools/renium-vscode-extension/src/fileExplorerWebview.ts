@@ -1415,7 +1415,19 @@ search.addEventListener('input',function(){
   if(nextFilter!==filter){searchRevision++;if(nextFilter)searchRevealId=null;prefetchPending=false;if(prefetchTimer){clearTimeout(prefetchTimer);prefetchTimer=null}searchInitialLoading=false;searchRequested=false;resetRowCache(nextFilter?'search':'normal');rowWindowStart=0;totalRows=0;flatRows=[];lastRequestedStart=-1;lastRequestMode=nextFilter?'search':'normal'}
   filter=nextFilter;allMatchesSelected=false;
   hideSearchSuggestions();
-  if(filter)startSearchLoad(false);else{if(searchDebounce)clearTimeout(searchDebounce);var hadFocus=document.activeElement===search;if(hadFocus)searchRetainFocusUntil=Date.now()+1500;searchLoading=false;searchInitialLoading=false;searchRequested=false;searchLoaded=0;searchTotal=0;searchMatchCount=0;rowWindowStart=0;totalRows=0;flatRows=[];tree.scrollTop=0;lastRequestedStart=-1;lastRequestMode='normal';resetRowCache('normal');currentEmptyHtml='<div id="treeEmpty">Loading...</div>';renderFlatRows();vscode.postMessage({type:'clearSearch',start:0,count:visibleCount(),mode:'normal',revealId:searchRevealId});searchRevealId=null;if(hadFocus)setTimeout(function(){if(document.activeElement!==search)searchRestoringFocus=true;search.focus()},0)}
+  if(filter)startSearchLoad(false);else{
+    if(searchDebounce)clearTimeout(searchDebounce);
+    var hadFocus=document.activeElement===search;
+    if(hadFocus)searchRetainFocusUntil=Date.now()+1500;
+    searchLoading=false;searchInitialLoading=false;searchRequested=false;
+    searchLoaded=0;searchTotal=0;searchMatchCount=0;
+    rowWindowStart=0;totalRows=0;flatRows=[];tree.scrollTop=0;
+    lastRequestedStart=-1;lastRequestMode='normal';resetRowCache('normal');
+    currentEmptyHtml='<div id="treeEmpty">Loading...</div>';renderFlatRows();
+    vscode.postMessage({type:'clearSearch',start:0,count:visibleCount(),mode:'normal',revealId:searchRevealId||undefined});
+    searchRevealId=null;
+    if(hadFocus)setTimeout(function(){if(document.activeElement!==search)searchRestoringFocus=true;search.focus()},0);
+  }
   updateSearchMeta();
 });
 tree.addEventListener('scroll',scheduleVisibleRows);

@@ -1,5 +1,34 @@
 # Configuration and adapters
 
+## Project layout
+
+Scripts live in `src/` by default. Instance data lives in project-level
+`instances/<Service>.renium`; commit both. Renium automatically migrates old
+stores from source folders, preserving their bytes and refusing conflicting
+copies. Each place owns its stores independently of its configured `sourceRoot`.
+
+Optional client/server mappings in `renium.project.jsonc`:
+
+```jsonc
+{
+  "schemaVersion": 1,
+  "tree": {
+    "ServerScriptService": { "$path": "src/server" },
+    "StarterPlayer": {
+      "StarterPlayerScripts": {
+        "$className": "StarterPlayerScripts",
+        "$path": "src/client"
+      }
+    },
+    "ReplicatedStorage": { "$path": "src/shared" }
+  }
+}
+```
+
+Mappings choose parents; `.server.luau`, `.client.luau` and `.luau` choose script
+types. Mapped stores remain under `instances/` at their Roblox target path.
+These folders are opt-in; the default service-based script layout still works.
+
 ## Settings and validation
 
 ```powershell

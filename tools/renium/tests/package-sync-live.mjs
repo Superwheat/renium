@@ -29,11 +29,16 @@ assert.equal(before.value,'-1','Fixture must start Up To Date');
 run(['pl','-r',root]);
 run(['ps','--verify']);
 assert.deepEqual(packageState(),before,'No-op full push must leave PackageLink untouched');
+// An explicit service push takes the native package-preflight snapshot path,
+// including the out-of-band identity carriers in its serialized root layout.
+run(['ps','instances/ReplicatedStorage.renium','--verify','--yes']);
+assert.deepEqual(packageState(),before,'Native service push must retain a clean PackageLink');
 run(['lon']);
 const source=path.join(root,'src/ReplicatedStorage/ReniumAccessPackage/Types.luau');
 assert(fs.existsSync(source));
 fs.appendFileSync(source,'\n-- Renium 0.3.5 disposable sync verification\n');
 const settled=run(['lst','--wait','10']);
+assert.equal(settled.daemon.settled,true,JSON.stringify(settled));
 assert.equal(settled.pendingChanges,0,JSON.stringify(settled));
 assert.equal(settled.daemon.pendingCount,0,JSON.stringify(settled));
 assert(settled.daemon.autoDesyncedPackages.includes('ReplicatedStorage.ReniumAccessPackage'),JSON.stringify(settled));
@@ -42,4 +47,4 @@ assert.equal(after.id,before.id);
 assert.equal(after.value,'1');
 assert.equal(run(['l','return string.find(game.ReplicatedStorage.ReniumAccessPackage.Types.Source,"Renium 0.3.5 disposable sync verification",1,true)~=nil']).results[0],true);
 run(['lof']);
-console.log(JSON.stringify({passed:true,platform:process.platform,packageLinkPreserved:true,noOpClean:true,normalSourceEditAutoDesynced:true}));
+console.log(JSON.stringify({passed:true,platform:process.platform,packageLinkPreserved:true,noOpClean:true,nativePackagePreflight:true,normalSourceEditAutoDesynced:true}));

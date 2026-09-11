@@ -328,6 +328,8 @@ mod request_cancellation_tests {
                 update_checked_runtimes: Default::default(),
                 #[cfg(any(windows, target_os = "macos"))]
                 check_updates_on_connect: false,
+                #[cfg(any(windows, target_os = "macos"))]
+                native_preparation: None,
             },
         );
         let stalled = TcpStream::connect(address).unwrap();
@@ -434,6 +436,8 @@ mod request_cancellation_tests {
             request_gate: Mutex::new(()),
             active_request_leases: Mutex::new(HashMap::new()),
             runtime_pins: Mutex::new(HashMap::new()),
+            #[cfg(any(windows, target_os = "macos"))]
+            verified_full_pushes: Default::default(),
             final_console_snapshots: Mutex::new(HashMap::new()),
             desired_device_request: Arc::new(Mutex::new(Value::Null)),
             routing: Default::default(),
@@ -733,6 +737,55 @@ pub(crate) struct BridgeChannel {
     snapshots: Mutex<HashMap<String, BridgeSocketSnapshot>>,
 }
 
+#[cfg(any(windows, target_os = "macos"))]
+type NativeContextPrepare = dyn Fn(u32, &str) -> Result<()> + Send + Sync;
+
+#[cfg(any(windows, target_os = "macos"))]
+struct NativeConnectionPreparation {
+    pending: Mutex<HashSet<String>>,
+    prepare: Box<NativeContextPrepare>,
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+impl NativeConnectionPreparation {
+    fn run(&self, connection: &BridgeConnection, alive: &AtomicBool) {
+        let Some(pid) = connection.studio_pid else {
+            return;
+        };
+        let runtime = &connection.bridge_info.runtime_id;
+        if connection.role != BRIDGE_ROLE_EDIT
+            || runtime.is_empty()
+            || !alive.load(Ordering::Relaxed)
+            || !self
+                .pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(runtime.clone())
+        {
+            return;
+        }
+        // No bridge registry or socket lock is held. The native path only
+        // discovers/validates addresses; it does not read or write properties.
+        let started = Instant::now();
+        let result = (self.prepare)(pid, &connection.bridge_info.place_name);
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(runtime);
+        crate::app::output::log_global(
+            4,
+            format_args!(
+                "[renium] native connection context: pid={pid} runtime={runtime} elapsed_ms={:.1} result={}",
+                elapsed_ms(started),
+                match result {
+                    Ok(()) => "ready".to_string(),
+                    Err(error) => format!("{error:#}"),
+                }
+            ),
+        );
+    }
+}
+
 #[derive(Clone)]
 struct BridgeAcceptState {
     alive: Arc<AtomicBool>,
@@ -749,9 +802,13 @@ struct BridgeAcceptState {
     update_checked_runtimes: Arc<Mutex<HashSet<String>>>,
     #[cfg(any(windows, target_os = "macos"))]
     check_updates_on_connect: bool,
+    #[cfg(any(windows, target_os = "macos"))]
+    native_preparation: Option<Arc<NativeConnectionPreparation>>,
 }
 
 pub(crate) struct BridgeServer {
+    #[cfg(any(windows, target_os = "macos"))]
+    pub(crate) verified_full_pushes: crate::automation::reconcile::VerifiedFullPushCache,
     pub(crate) channels: Vec<Arc<BridgeChannel>>,
     pub(crate) alive: Arc<AtomicBool>,
     pub(crate) next_id: Arc<std::sync::atomic::AtomicU64>,
@@ -874,6 +931,7 @@ pub(crate) struct BridgeRequestLeaseGuard<'a> {
     bridge: &'a BridgeServer,
     lease: Arc<BridgeRequestLease>,
     thread_id: thread::ThreadId,
+    owns_activation: bool,
 }
 
 impl Drop for BridgeRequestLeaseGuard<'_> {
@@ -889,7 +947,9 @@ impl Drop for BridgeRequestLeaseGuard<'_> {
         {
             active.remove(&self.thread_id);
         }
-        self.lease.disarm();
+        if self.owns_activation {
+            self.lease.disarm();
+        }
     }
 }
 
@@ -1012,10 +1072,35 @@ impl BridgeServer {
             bridge: self,
             lease,
             thread_id,
+            owns_activation: true,
         })
     }
 
-    fn active_request_lease(&self) -> Option<Arc<BridgeRequestLease>> {
+    /// Scoped transfer workers share cancellation and ownership with their caller;
+    /// they must not arm or disarm the parent request's lease.
+    pub(crate) fn inherit_request_lease(
+        &self,
+        lease: Arc<BridgeRequestLease>,
+    ) -> Result<BridgeRequestLeaseGuard<'_>> {
+        lease.ensure_active()?;
+        let thread_id = thread::current().id();
+        let mut active = self
+            .active_request_leases
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if active.contains_key(&thread_id) {
+            bail!("Another Renium request lease is already active");
+        }
+        active.insert(thread_id, Arc::clone(&lease));
+        Ok(BridgeRequestLeaseGuard {
+            bridge: self,
+            lease,
+            thread_id,
+            owns_activation: false,
+        })
+    }
+
+    pub(crate) fn active_request_lease(&self) -> Option<Arc<BridgeRequestLease>> {
         self.active_request_leases
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -1067,6 +1152,8 @@ impl BridgeServer {
             check_updates_on_connect.then(crate::studio::performance::Manager::load);
         let all_channels = Arc::new(Mutex::new(Vec::with_capacity(ports.len())));
         #[cfg(any(windows, target_os = "macos"))]
+        let verified_full_pushes = Default::default();
+        #[cfg(any(windows, target_os = "macos"))]
         let update_checked_runtimes = Arc::new(Mutex::new(HashSet::new()));
         let mut channels: Vec<Arc<BridgeChannel>> = Vec::with_capacity(ports.len());
         let request_session_id = format!(
@@ -1091,6 +1178,11 @@ impl BridgeServer {
             update_checked_runtimes,
             #[cfg(any(windows, target_os = "macos"))]
             check_updates_on_connect,
+            #[cfg(any(windows, target_os = "macos"))]
+            native_preparation: Some(Arc::new(NativeConnectionPreparation {
+                pending: Default::default(),
+                prepare: Box::new(crate::studio::native::serializer::prepare_context),
+            })),
         };
 
         for port in ports {
@@ -1127,7 +1219,11 @@ impl BridgeServer {
         }
 
         #[cfg(any(windows, target_os = "macos"))]
-        Self::spawn_focus_watcher(channels.clone(), Arc::clone(&alive));
+        Self::spawn_focus_watcher(
+            channels.clone(),
+            Arc::clone(&alive),
+            Arc::clone(&verified_full_pushes),
+        );
 
         let bind_ms = elapsed_ms(bind_started);
         let wait_started = Instant::now();
@@ -1139,6 +1235,8 @@ impl BridgeServer {
             request_gate: Mutex::new(()),
             active_request_leases: Mutex::new(HashMap::new()),
             runtime_pins: Mutex::new(HashMap::new()),
+            #[cfg(any(windows, target_os = "macos"))]
+            verified_full_pushes,
             routing: Arc::clone(&accept_state.routing),
             final_console_snapshots: Mutex::new(HashMap::new()),
             desired_device_request,
@@ -1242,6 +1340,8 @@ impl BridgeServer {
                                 update_checked_runtimes,
                                 #[cfg(any(windows, target_os = "macos"))]
                                 check_updates_on_connect,
+                                #[cfg(any(windows, target_os = "macos"))]
+                                native_preparation,
                             } = state;
                             match Self::accept_ready_socket(
                                 &bind_host,
@@ -1337,6 +1437,12 @@ impl BridgeServer {
                                         }
                                     }
                                     drop(socket);
+                                    // Registration is visible and acknowledged; warm the exact
+                                    // connection before housekeeping, without holding bridge locks.
+                                    #[cfg(any(windows, target_os = "macos"))]
+                                    if let Some(preparation) = native_preparation {
+                                        preparation.run(&connection, &alive);
+                                    }
                                     if let (Some(manager), Some(peer)) =
                                         (&performance_manager, performance_peer)
                                         && let Ok(pid) = Self::studio_pid_for_peer(&peer)
@@ -1641,7 +1747,11 @@ impl BridgeServer {
     }
 
     #[cfg(any(windows, target_os = "macos"))]
-    pub(crate) fn spawn_focus_watcher(channels: Vec<Arc<BridgeChannel>>, alive: Arc<AtomicBool>) {
+    pub(crate) fn spawn_focus_watcher(
+        channels: Vec<Arc<BridgeChannel>>,
+        alive: Arc<AtomicBool>,
+        verified: crate::automation::reconcile::VerifiedFullPushCache,
+    ) {
         #[cfg(windows)]
         use windows_sys::Win32::UI::WindowsAndMessaging::{
             GetForegroundWindow, GetWindowThreadProcessId,
@@ -1651,6 +1761,31 @@ impl BridgeServer {
             let mut last_pid: u32 = 0;
             while alive.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_millis(300));
+
+                if !verified
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_empty()
+                {
+                    // Reuse lifecycle polling; don't retain a closed DataModel
+                    // or its native subscription until another push arrives.
+                    let signatures = Self::connection_signatures(&channels);
+                    let evicted = {
+                        let mut entries = verified.lock().unwrap_or_else(PoisonError::into_inner);
+                        let keys = entries
+                            .iter()
+                            .filter(|(runtime, entry)| {
+                                entry.expired()
+                                    || signatures.get(runtime.as_str()) != Some(&entry.connections)
+                            })
+                            .map(|(runtime, _)| runtime.clone())
+                            .collect::<Vec<_>>();
+                        keys.into_iter()
+                            .filter_map(|key| entries.remove(&key))
+                            .collect::<Vec<_>>()
+                    };
+                    drop(evicted);
+                }
 
                 let multiple_plugins = channels.iter().any(|channel| {
                     let guard = channel
@@ -2018,7 +2153,51 @@ impl BridgeServer {
             .clear();
     }
 
+    #[cfg(any(windows, target_os = "macos"))]
+    fn connection_signatures(channels: &[Arc<BridgeChannel>]) -> HashMap<String, Vec<usize>> {
+        let mut signatures: HashMap<String, Vec<usize>> = HashMap::new();
+        for channel in channels {
+            let connections = channel
+                .sockets
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .values()
+                .filter(|connection| connection.role == BRIDGE_ROLE_EDIT)
+                .cloned()
+                .collect::<Vec<_>>();
+            for connection in connections
+                .iter()
+                .filter(|connection| connection.is_alive())
+            {
+                signatures
+                    .entry(connection.bridge_info.runtime_id.clone())
+                    .or_default()
+                    .push(Arc::as_ptr(&connection.io) as usize);
+            }
+        }
+        for signature in signatures.values_mut() {
+            signature.sort_unstable();
+        }
+        signatures
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    pub(crate) fn runtime_connection_signature(&self, runtime: &str) -> Vec<usize> {
+        Self::connection_signatures(&self.channels)
+            .remove(runtime)
+            .unwrap_or_default()
+    }
+
     pub(crate) fn retire_runtime(&self, runtime_id: &str) {
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            let cached = self
+                .verified_full_pushes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(runtime_id);
+            drop(cached);
+        }
         // Retire before best-effort cleanup: neither a busy channel nor an
         // in-flight handshake may resurrect this runtime.
         self.routing
@@ -2415,21 +2594,50 @@ impl BridgeServer {
         target: BridgeTarget,
     ) -> Result<BridgeInfoPayload> {
         let runtime_pin = self.runtime_pin_for_selector(target, None)?;
+        self.cached_bridge_info_with_pin(target, &runtime_pin)
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    pub(crate) fn cached_bridge_info_for_runtime(
+        &self,
+        target: BridgeTarget,
+        runtime_id: &str,
+    ) -> Result<BridgeInfoPayload> {
+        self.cached_bridge_info_with_pin(
+            target,
+            &RuntimePin {
+                runtime_id: runtime_id.into(),
+                exact: true,
+            },
+        )
+    }
+
+    fn cached_bridge_info_with_pin(
+        &self,
+        target: BridgeTarget,
+        runtime_pin: &RuntimePin,
+    ) -> Result<BridgeInfoPayload> {
         for channel in &self.channels {
-            let guard = match channel.sockets.try_lock() {
-                Ok(guard) => guard,
-                Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-                Err(TryLockError::WouldBlock) => continue,
+            // Registry updates are short metadata operations. Skipping a held
+            // registry invents a disconnection during ordinary lifecycle polling.
+            // Release it before probing I/O; a busy command still counts as alive.
+            let connection = {
+                let guard = channel
+                    .sockets
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                self.select_role_for_selector_with_pin(&guard, target, None, runtime_pin)
+                    .and_then(|role| guard.get(&role).cloned())
             };
-            if let Some(role) =
-                self.select_role_for_selector_with_pin(&guard, target, None, &runtime_pin)
-                && let Some(socket) = guard.get(&role)
+            if let Some(socket) = connection
+                && self.runtime_is_routable(&socket.bridge_info)
+                && socket.is_alive()
             {
                 return Ok(socket.bridge_info.clone());
             }
         }
         bail!(
-            "No cached {} plugin bridge info is available; no ready bridge channels",
+            "No cached {} plugin bridge info is available for the selected runtime",
             Self::target_label(target)
         );
     }
@@ -2689,6 +2897,7 @@ impl BridgeServer {
         call: BridgeSocketCall<T>,
         label: &str,
     ) -> Result<T> {
+        let _trace = crate::app::timing::trace_scope("bridge.call", context.method);
         let mut last_error = None;
         let mut connected = false;
         let mut lock_deadline = Instant::now() + bridge_channel_lock_timeout(context.method);
@@ -3579,6 +3788,7 @@ impl BridgeServer {
         timeout: Option<Duration>,
         lease_id: Option<&str>,
     ) -> Result<BridgeResponse> {
+        let _trace = crate::app::timing::trace_scope("bridge.request", method);
         let started = Instant::now();
         let timeout = timeout.unwrap_or_else(|| bridge_response_timeout(method));
         if timeout.is_zero() {
@@ -3634,6 +3844,7 @@ impl BridgeServer {
         params: &Value,
         lease_id: Option<&str>,
     ) -> Result<String> {
+        let _trace = crate::app::timing::trace_scope("bridge.encode", method);
         #[derive(Serialize)]
         struct BridgeRequest<'a> {
             id: u64,
@@ -3666,6 +3877,7 @@ impl BridgeServer {
         method: &str,
         payload: String,
     ) -> Result<()> {
+        let _trace = crate::app::timing::trace_scope("bridge.send", method);
         bridge_socket
             .socket
             .send(Message::Text(payload.into()))
@@ -3684,6 +3896,7 @@ impl BridgeServer {
         method: &str,
         timeout: Duration,
     ) -> Result<BridgeResponse> {
+        let _trace = crate::app::timing::trace_scope("bridge.wait", method);
         let deadline = Instant::now() + timeout;
         let mut unrelated_messages = 0usize;
         let mut cancel_sent = false;
@@ -3804,6 +4017,14 @@ impl BridgeServer {
                         }
                         continue;
                     }
+                    if crate::app::output::global_log_enabled(5)
+                        && let Some(timings) = parsed.get("timings")
+                    {
+                        crate::app::timing::trace_profile(
+                            &format!("bridge.response.{method}"),
+                            timings,
+                        );
+                    }
                     let ok = parsed.get("ok").and_then(Value::as_bool).unwrap_or(false);
                     let response = if ok {
                         let result = parsed
@@ -3842,6 +4063,16 @@ impl BridgeServer {
 impl Drop for BridgeServer {
     fn drop(&mut self) {
         self.alive.store(false, Ordering::Relaxed);
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            let cached = std::mem::take(
+                &mut *self
+                    .verified_full_pushes
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner),
+            );
+            drop(cached);
+        }
         for channel in &self.channels {
             let mut guard = channel
                 .sockets

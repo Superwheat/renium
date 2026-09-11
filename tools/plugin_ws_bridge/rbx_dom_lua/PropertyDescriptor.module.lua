@@ -21,6 +21,7 @@ function PropertyDescriptor.fromRaw(data, className, propertyName)
 		enumType = key == "Enum" and ("Enum." .. value) or nil,
 
 		scriptability = data.Scriptability,
+		serialization = data.Kind.Canonical and data.Kind.Canonical.Serialization,
 		className = className,
 		name = propertyName,
 	}, PropertyDescriptor)

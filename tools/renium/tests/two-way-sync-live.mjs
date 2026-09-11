@@ -35,6 +35,7 @@ const saved = (service, segments, fields) => run(['bb', service, '-J', '-'], JSO
 })).rs[0];
 function settled() {
   const result = run(['lst', '--wait', '10']);
+  assert.equal(result.daemon?.settled, true, JSON.stringify(result));
   assert.equal(result.pendingChanges, 0, JSON.stringify(result));
   assert.equal(result.daemon?.pendingCount, 0, JSON.stringify(result));
   assert.equal(result.daemon?.resolutionRequired, false, JSON.stringify(result));
@@ -46,7 +47,7 @@ assert.equal(initial.playState, 'stopped');
 assert.equal(initial.clients.length, 1);
 assert.equal(initial.clients[0].placeId, 0);
 assert.equal(initial.clients[0].placeName, place);
-assert.equal(initial.clients[0].bridgeBuildUnix, 1788765703, 'Expected installed 0.3.5 plugin');
+assert.equal(initial.clients[0].bridgeBuildUnix, 1788778300, 'Expected installed 0.3.5 plugin');
 const editRuntime = initial.selected;
 run(['lof']);
 if (live('return workspace:FindFirstChild("ReniumFinalSync") == nil')) {

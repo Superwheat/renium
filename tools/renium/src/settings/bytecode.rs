@@ -733,6 +733,57 @@ fn decode_property_group_body(
 ) -> Result<Vec<DecodedGroupEntry>> {
     let mut reader = BytecodeReader::new(body);
     let cframe_group_decoder = decode_cframe_group_header(kind, &mut reader)?;
+    // Large numeric columns otherwise occupy one Rayon worker while the other
+    // property groups finish. Locate values without allocating their JSON trees,
+    // then construct those independent values in bounded parallel chunks.
+    let numeric_bytes = match kind {
+        11 | 13 => Some(8),
+        12 | 15 => Some(12),
+        14 | 18 => Some(16),
+        16 => Some(match &cframe_group_decoder {
+            CFrameGroupDecoder::Inline => 48,
+            CFrameGroupDecoder::RotationTable(_) => 12,
+        }),
+        _ => None,
+    };
+    if let Some(numeric_bytes) = numeric_bytes
+        && value_count >= SETTINGS_BINARY_PARALLEL_CHUNK_SIZE
+        && rayon::current_num_threads() > 1
+    {
+        let mut values = Vec::with_capacity(value_count);
+        let mut instance_index = 0_usize;
+        for _ in 0..value_count {
+            instance_index = instance_index
+                .checked_add(reader.read_len("property instance index")?)
+                .context("Property instance index delta overflow")?;
+            if instance_index >= instance_count {
+                bail!("Invalid property instance index {instance_index}");
+            }
+            let start = reader.position();
+            reader.read_bytes(numeric_bytes)?;
+            if matches!(cframe_group_decoder, CFrameGroupDecoder::RotationTable(_)) {
+                reader.read_len("CFrame rotation index")?;
+            }
+            values.push((instance_index, &body[start..reader.position()]));
+        }
+        reader.finish()?;
+        return values
+            .into_par_iter()
+            .with_min_len(SETTINGS_BINARY_PARALLEL_CHUNK_SIZE)
+            .map(|(index, bytes)| {
+                let mut reader = BytecodeReader::new(bytes);
+                let value = match &cframe_group_decoder {
+                    CFrameGroupDecoder::Inline => {
+                        decode_raw_value_payload(&mut reader, kind, strings, instance_count, 0)?
+                    }
+                    CFrameGroupDecoder::RotationTable(rotations) => {
+                        decode_cframe_rotation_table_payload(&mut reader, rotations)?
+                    }
+                };
+                Ok(DecodedGroupEntry::Property(index, value))
+            })
+            .collect();
+    }
     let mut previous_instance_index = 0_usize;
     let mut previous_ref_target_index = 0_usize;
     let mut entries = Vec::with_capacity(value_count);
@@ -3935,6 +3986,78 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn large_numeric_columns_preserve_values_order_and_validation() {
+        let serial = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let parallel = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let count = SETTINGS_BINARY_PARALLEL_CHUNK_SIZE * 2 + 7;
+        for (kind, fields, table) in [
+            (11, 2, false),
+            (12, 3, false),
+            (13, 2, false),
+            (14, 4, false),
+            (15, 3, false),
+            (18, 4, false),
+            (16, 12, false),
+            (16, 3, true),
+        ] {
+            let mut body = Vec::new();
+            if kind == 16 {
+                body.push(u8::from(table));
+                if table {
+                    write_var_u64(&mut body, 1).unwrap();
+                    for value in [1_f32, 0., 0., 0., 1., 0., 0., 0., 1.] {
+                        body.extend(value.to_le_bytes());
+                    }
+                }
+            }
+            for index in 0..count {
+                // Include duplicate and non-unit index deltas at chunk boundaries.
+                write_var_u64(&mut body, (index % 3) as u64).unwrap();
+                for field in 0..fields {
+                    body.extend(((index as f32 - field as f32) / 4.).to_le_bytes());
+                }
+                if table {
+                    write_var_u64(&mut body, 0).unwrap();
+                }
+            }
+            let decode = |bytes: &[u8], pool: &rayon::ThreadPool| {
+                pool.install(|| {
+                    decode_property_group_body(bytes, "Numeric", kind, count, &[], count * 2)
+                })
+            };
+            let expected = decode(&body, &serial).unwrap();
+            let actual = decode(&body, &parallel).unwrap();
+            assert_eq!(expected.len(), actual.len());
+            for (expected, actual) in expected.into_iter().zip(actual) {
+                match (expected, actual) {
+                    (
+                        DecodedGroupEntry::Property(i, left),
+                        DecodedGroupEntry::Property(j, right),
+                    ) => {
+                        assert_eq!(i, j);
+                        assert_eq!(left, right);
+                    }
+                    _ => panic!("Numeric group produced attributes"),
+                }
+            }
+            assert!(decode(&body[..body.len() - 1], &parallel).is_err());
+            body.push(0);
+            assert!(decode(&body, &parallel).is_err());
+            if table {
+                body.pop();
+                *body.last_mut().unwrap() = 1;
+                assert!(decode(&body, &parallel).is_err());
+            }
+        }
+    }
 
     #[test]
     fn transported_settings_id_precedes_live_debug_id() {

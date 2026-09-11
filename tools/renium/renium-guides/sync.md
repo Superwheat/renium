@@ -46,3 +46,12 @@ For store edits, use returned changed paths and settings IDs to keep the push sc
 An unfiltered push reconciles the entire place and can remove Studio-only content.
 
 `ps --verify` checks selected script sources. Don't substitute reads of `Instance.Source`: an open ScriptDocument can differ.
+
+Player capacity (`Players.MaxPlayers` and `PreferredPlayers`) is managed through Roblox Game Settings, not push. Saved exports and file comparisons still preserve/report these values.
+
+## File-backed undo
+
+Reconciled syncs save their pre-sync state in `.renium/editor-history/sync`.
+`rbx rev --sync latest` restores the last sync's affected files; use a returned `historyId` instead of `latest` to select one. It refuses to overwrite newer edits or restore an unconfirmed transaction.
+
+Live Sync transfers restored files normally. Without Live Sync, add `--apply-studio`. Use `--details` only when you need every restored path. Don't delete history you still need.

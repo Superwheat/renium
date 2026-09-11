@@ -83,9 +83,14 @@ fn main() -> std::process::ExitCode {
 
 fn load_pool(ctx: &PluginContext) -> Result<Pool> {
     let path = ctx.directory.join("pool.json");
-    let pool: Pool = serde_json::from_reader(File::open(path).context(
-        "Copy pool.example.json to pool.json and configure dedicated private test universes first",
-    )?)?;
+    let file = File::open(&path).with_context(|| {
+        format!(
+            "Missing {}. Copy pool.example.json next to it and configure dedicated private test universes first",
+            path.display()
+        )
+    })?;
+    let pool: Pool =
+        serde_json::from_reader(file).with_context(|| format!("Invalid {}", path.display()))?;
     if pool.schema_version != 1
         || pool.group_id == 0
         || pool.slots.is_empty()
@@ -138,6 +143,7 @@ fn load_pool(ctx: &PluginContext) -> Result<Pool> {
 }
 
 fn dispatch(request: Invocation) -> Result<Value> {
+    let budget = workflow::Budget::new(std::time::Duration::from_secs(request.timeout_seconds));
     let ctx = request.context;
     let pool = load_pool(&ctx)?;
     let registry = Registry::user()?;
@@ -194,6 +200,7 @@ fn dispatch(request: Invocation) -> Result<Value> {
         &mut session,
         &request.command,
         &request.arguments,
+        &budget,
     )
 }
 

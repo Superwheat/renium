@@ -147,12 +147,35 @@ pub(crate) fn build_editor_source_path_map(
     map
 }
 
+#[cfg(test)]
 pub(crate) fn editor_source_target_with_children(
     document: &SettingsBytecode,
     service: &str,
     service_dir: &Path,
     source_path: &Path,
     children_by_parent: &[Vec<usize>],
+) -> Option<EditorSourceTarget> {
+    editor_source_target_with_cache(
+        document,
+        service,
+        service_dir,
+        source_path,
+        children_by_parent,
+        &mut EditorChildStemCache::new(),
+    )
+}
+
+/// Only cache parents visited by source paths. The caller clears a service's
+/// cache when its document structure changes, together with its child index.
+pub(crate) type EditorChildStemCache = HashMap<usize, HashMap<String, (usize, usize)>>;
+
+pub(crate) fn editor_source_target_with_cache(
+    document: &SettingsBytecode,
+    service: &str,
+    service_dir: &Path,
+    source_path: &Path,
+    children_by_parent: &[Vec<usize>],
+    stems: &mut EditorChildStemCache,
 ) -> Option<EditorSourceTarget> {
     let spec = infer_editor_source_path_spec_in_service(service_dir, service, source_path)?;
     let root_index = editor_service_root_index(document, service)?;
@@ -161,27 +184,41 @@ pub(crate) fn editor_source_target_with_children(
     let mut path_ordinals = vec![1];
 
     for component in &spec.parent_components {
-        let (index, _, ordinal) = editor_child_stems(
-            document,
-            children_by_parent
-                .get(parent_index)
-                .map_or(&[], Vec::as_slice),
-        )
-        .into_iter()
-        .find(|(_, stem, _)| stem == component)?;
+        let (index, ordinal) = stems
+            .entry(parent_index)
+            .or_insert_with(|| {
+                editor_child_stems(
+                    document,
+                    children_by_parent
+                        .get(parent_index)
+                        .map_or(&[], Vec::as_slice),
+                )
+                .into_iter()
+                .map(|(index, stem, ordinal)| (stem, (index, ordinal)))
+                .collect()
+            })
+            .get(component)
+            .copied()?;
         parent_index = index;
         path_segments.push(document.instances[index].name.clone());
         path_ordinals.push(ordinal);
     }
 
-    let (index, _, ordinal) = editor_child_stems(
-        document,
-        children_by_parent
-            .get(parent_index)
-            .map_or(&[], Vec::as_slice),
-    )
-    .into_iter()
-    .find(|(_, stem, _)| stem == &spec.instance_stem)?;
+    let (index, ordinal) = stems
+        .entry(parent_index)
+        .or_insert_with(|| {
+            editor_child_stems(
+                document,
+                children_by_parent
+                    .get(parent_index)
+                    .map_or(&[], Vec::as_slice),
+            )
+            .into_iter()
+            .map(|(index, stem, ordinal)| (stem, (index, ordinal)))
+            .collect()
+        })
+        .get(&spec.instance_stem)
+        .copied()?;
     let instance = &document.instances[index];
     if instance.class_name != spec.class_name || !is_lua_source_class(&instance.class_name) {
         return None;
@@ -192,7 +229,8 @@ pub(crate) fn editor_source_target_with_children(
             .get("RunContext")
             .and_then(run_context_name);
         if !(actual.is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
-            || expected.eq_ignore_ascii_case("Legacy") && actual.is_none())
+            || expected.eq_ignore_ascii_case("Legacy")
+                && actual.is_none_or(|actual| actual.eq_ignore_ascii_case("Server")))
         {
             return None;
         }
@@ -762,6 +800,9 @@ pub(crate) fn infer_source_script(
 }
 
 pub(crate) fn service_from_changed_path(src_root: &Path, changed_path: &Path) -> Option<String> {
+    if let Some(service) = crate::project::storage::service_for_store(src_root, changed_path) {
+        return Some(service);
+    }
     let src_norm = strip_extended_prefix(src_root.to_path_buf());
     let changed_norm = strip_extended_prefix(changed_path.to_path_buf());
     if let Ok(relative) = changed_norm.strip_prefix(&src_norm) {
@@ -837,5 +878,45 @@ mod tests {
         assert_eq!(target.settings_id.as_deref(), Some("module"));
         assert_eq!(target.path_segments, ["ServerStorage", "Folder", "Module"]);
         assert_eq!(target.path_ordinals, [1, 2, 1]);
+    }
+
+    #[test]
+    fn server_filename_preserves_explicit_server_run_context() {
+        let mut document = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                SettingsBytecodeInstance::new(
+                    "root".into(),
+                    "ServerStorage".into(),
+                    "ServerStorage".into(),
+                    None,
+                ),
+                SettingsBytecodeInstance::new(
+                    "script".into(),
+                    "Handler".into(),
+                    "Script".into(),
+                    Some(0),
+                ),
+            ],
+        };
+        let children = settings_children_by_parent(&document);
+        let service_dir = Path::new("/tmp/src/ServerStorage");
+        for context in ["Legacy", "Server", "Client", "Plugin"] {
+            document.instances[1]
+                .properties
+                .insert("RunContext".into(), editor_run_context_value(context));
+            let target = editor_source_target_with_children(
+                &document,
+                "ServerStorage",
+                service_dir,
+                &service_dir.join("Handler.server.luau"),
+                &children,
+            );
+            assert_eq!(
+                target.is_some(),
+                matches!(context, "Legacy" | "Server"),
+                "{context}"
+            );
+        }
     }
 }
