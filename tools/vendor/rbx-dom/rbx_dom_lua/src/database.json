@@ -32786,7 +32786,22 @@
           "Tags": [],
           "Kind": {
             "Canonical": {
-              "Serialization": "Serializes"
+              "Serialization": {
+                "SerializesAs": "Sink"
+              }
+            }
+          }
+        },
+        "Sink": {
+          "Name": "Sink",
+          "Scriptability": "None",
+          "DataType": {
+            "Enum": "InputSink"
+          },
+          "Tags": [],
+          "Kind": {
+            "Alias": {
+              "AliasFor": "InputSink"
             }
           }
         },

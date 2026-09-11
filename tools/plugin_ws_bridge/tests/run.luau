@@ -21,9 +21,21 @@ local TransactionUpload = require("../BridgeTransactionUpload.module")
 local Update = require("../BridgeUpdate.module")
 local ValueEquality = require("../BridgeValueEquality.module")
 require("./identity-workloads")
+require("./camera-policy-workloads")
+require("./transaction-source-workloads")
+require("./service-scope-workloads")
+require("./font-transport-workloads")
+require("./mesh-content-workloads")
+require("./viewport-native-workloads")
 require("./connection-workloads")
 require("./play-status-workloads")
 require("./corner-change-workloads")
+require("./expectation-lifetime-workloads")
+require("./material-color-workloads")
+require("./model-pivot-workloads")
+require("./native-order-workloads")
+require("./payload-receipt-workloads")
+require("./collision-group-workloads")
 require("./session-lock-workloads")
 require("./network-workloads")
 require("./performance-workloads")
@@ -72,6 +84,24 @@ do
 end
 local editorSyncSource = fs.readFile("tools/plugin_ws_bridge/BridgeEditorSync.module.lua")
 do
+	local first = assert(editorSyncSource:find("local function validateChangeList(", 1, true))
+	local last = assert(editorSyncSource:find("local function addSnapshotMetadataTarget(", first, true))
+	local checks = 0
+	local validate = luau.load(editorSyncSource:sub(first, last - 1) .. "\nreturn validateMutationRequest", { environment = {
+		BridgeTransactionUpload = TransactionUpload,
+		denseArrayLength = function(values) return true, #values end,
+		validateMutationPath = function() end,
+		validatePropertyChange = function() checks += 1 end,
+	} })()
+	local ctx = { maxChangesPerRequest = 5000, allowedServices = { Workspace = true } }
+	local changes = table.create(5001, { service = "Workspace" })
+	equal(pcall(validate, { propertyChanges = changes }, ctx), false, "direct mutation still enforces batch limit")
+	equal(validate({ propertyChanges = changes }, ctx, false)[1], "Workspace", "transaction accepts aggregate metadata")
+	equal(checks, 5001, "aggregate metadata validates every row")
+	changes[5001] = { service = "OutsideScope" }
+	equal(pcall(validate, { propertyChanges = changes }, ctx, false), false, "aggregate metadata preserves service boundary")
+end
+do
 	local first = assert(editorSyncSource:find("local function writePropertyForSync(", 1, true))
 	local last = assert(editorSyncSource:find("local function setAttributeForSync(", first, true))
 	local source = editorSyncSource:sub(first, last - 1) .. "\nreturn writePropertyForSync"
@@ -82,7 +112,7 @@ do
 		{ property = "Transparency", class = "MeshPart", delay = 3, ok = false },
 		{ property = "CollisionFidelity", class = "Part", delay = 3, ok = false },
 	} do
-		local waits, elapsed, cancelled = 0, 0, 0
+		local waits, elapsed, cancelled, sampled = 0, 0, 0, 0
 		local current = "Box"
 		local instance = { IsA = function(_, class) return class == case.class end }
 		local write = luau.load(source, { environment = {
@@ -103,10 +133,17 @@ do
 		} })()
 		local ok = write(instance, case.property, "Hull", {
 			expectPropertyEvent = function() return "expected" end,
+			samplePropertyChange = function(target, property)
+				equal(target, instance, "sample verified instance")
+				equal(property, "CollisionFidelity", "sample asynchronous geometry only")
+				equal(current, "Hull", "sample after cooking completes")
+				sampled += 1
+			end,
 			assertSessionOwnership = function() end,
 		})
 		equal(ok, case.ok, "asynchronous collision write outcome")
 		equal(cancelled, if case.ok then 0 else 1, "expected event retained until confirmed")
+		equal(sampled, if case.ok then 1 else 0, "only completed writes update tracking")
 		equal(waits, if case.property == "CollisionFidelity" and case.class == "MeshPart" then math.min(case.delay, 3) else 0, "only asynchronous geometry waits, bounded")
 	end
 end
@@ -149,6 +186,93 @@ if not editorSyncCompiled then
 end
 
 do
+	-- Run the shipped export negotiation/lifecycle with serializer boundaries
+	-- mocked. Native capture must not also create jobs or identity carriers.
+	local first = assert(editorSyncSource:find("function api.beginBinaryExport(", 1, true))
+	local last = assert(editorSyncSource:find("function api.getBinaryExportState(", first, true))
+	for _, nativeRequested in { false, true } do
+		for _, nonArchivable in { false, true } do
+			local api, exports = {}, {}
+			local starts, carriers, jobs, finished, destroyed = 0, 0, 0, 0, 0
+			local ignore, capturedDocuments
+			local attributesWatched = false
+			local child = {}
+			local service = { GetChildren = function() return {child} end }
+			local state = {
+				instances = {service, child}, classNames = {"Workspace", "Part"},
+				scriptObjects = {}, nativeStructureGeneration = 7,
+				nonArchivableInstances = if nonArchivable then {child} else {},
+				nativeNonArchivableIndices = if nonArchivable then {2} else {},
+			}
+			local ctx = {
+				allowedServices = {Workspace = true},
+				includeExportInstance = function() return true end,
+				prepareNativeState = function(_, sources)
+					capturedDocuments = sources
+					return state
+				end,
+				readRootProperties = function() return {Gravity = 196.2} end,
+				getPropertySchema = function() return {} end,
+			}
+			local native = {
+				snapshotMarker = function() return {} end,
+				startWorkers = function() starts += 1 end,
+				appendIdentityCarriers = function(group)
+					carriers += 1
+					group.identityCarrierCount = 1
+				end,
+				nonArchivableInstances = function() return state.nonArchivableInstances end,
+				appendJob = function()
+					equal(attributesWatched, true, "attributes guarded before serialization")
+					jobs += 1
+				end,
+				finishSchedule = function(session, _, _, startIndex)
+					if startIndex == 1 then jobs += 1 end
+					session.serializationScheduleReady = true
+				end,
+			}
+			luau.load(editorSyncSource:sub(first, last - 1), { environment = {
+				api = api, ctx = ctx, binaryExports = exports, NativeSerialization = native,
+				pruneExpiredSessions = function() end, armSessionExpiry = function() end,
+				captureOperationCancellation = function() return {} end,
+				assertSessionOwnership = function() end, currentRequestLeaseId = function() return "lease" end,
+				ScriptDocumentState = {capture = function() return {{instance = child, source = "unsaved buffer"}} end},
+				ReferenceOverlay = {
+					beginNativeGuard = function(_, allProperties, ignored)
+						equal(allProperties, true, "capture guards properties")
+						ignore = ignored
+						return {}
+					end,
+					assertNativeGuard = function() end,
+					watchNativeDescendantAttributes = function(_, serviceName, instances)
+						equal(serviceName, "Workspace", "guard service")
+						equal(instances, state.instances, "guard reuses prepared instances")
+						attributesWatched = true
+					end,
+					finishNativeGuard = function() finished += 1 end,
+				},
+				game = {GetService = function() return service end},
+				Instance = {new = function() return {Fire = function() end, Destroy = function() destroyed += 1 end} end},
+			} })()
+			local result = api.beginBinaryExport({exportId = "test", partitioned = true, nativeCapture = nativeRequested})
+			local selected = nativeRequested and not nonArchivable
+			equal(result.nativeCapture, selected, "native mode negotiation")
+			equal(starts, if selected then 0 else 1, "one serializer backend")
+			equal(carriers, if selected then 0 else 1, "native identities need no carriers")
+			equal(jobs, if selected then 0 else 1, "native capture creates no plugin job")
+			equal(capturedDocuments[child], "unsaved buffer", "ScriptDocument overlay retained")
+			equal(ignore.archivable, not selected, "native capture observes outside Archivable changes")
+			equal(exports.test.leaseId, "lease", "capture lease retained")
+			equal(result.groups[1].nonArchivableIndices[1], if nonArchivable then 2 else nil, "Archivable metadata retained")
+			exports.test.onExpire()
+			exports.test.onExpire()
+			equal(finished, 1, "guard closed once")
+			equal(destroyed, 1, "export signal closed once")
+		end
+	end
+end
+
+do
 	-- Exercise the production cache proof functions without a Studio serializer.
 	local first = assert(editorSyncSource:find("local NativeSerialization = {}", 1, true))
 	local last = assert(editorSyncSource:find("function NativeSerialization.appendIdentityCarriers", first, true))
@@ -169,21 +293,75 @@ do
 		payloadReadyEvent = { Fire = function() end },
 	}
 	for _ = 1, 100 do
-		local proof = { generations = native.captureGenerations(session, { "Workspace" }), payloadHash = "hash", totalBytes = 42 }
-		proofs.Workspace = proof
-		native.appendJob(session, "Workspace", { "Workspace" }, {}, {})
-		equal(session.cachedPayloadProofs.Workspace.proof, proof, "unchanged export reuses bytes")
-		session.cachedPayloadProofs.Workspace = nil
+		local proof = { generations = native.captureGenerations(session, { "StarterGui" }), payloadHash = "hash", totalBytes = 42 }
+		proofs.StarterGui = proof
+		native.appendJob(session, "StarterGui", { "StarterGui" }, {}, {})
+		equal(session.cachedPayloadProofs.StarterGui.proof, proof, "unchanged export reuses bytes")
+		session.cachedPayloadProofs.StarterGui = nil
 		revision += 1 -- Camera structure/content changes, without a Live Sync edit.
 		equal(native.proofMatches(session, proof), false, "ignored live edit still invalidates export")
 		local jobs = #session.serializationJobs
-		native.appendJob(session, "Workspace", { "Workspace" }, {}, {})
+		native.appendJob(session, "StarterGui", { "StarterGui" }, {}, {})
 		equal(#session.serializationJobs, jobs + 1, "changed export serializes fresh bytes")
-		equal(session.cachedPayloadProofs.Workspace, nil, "stale bytes are not offered")
+		equal(session.cachedPayloadProofs.StarterGui, nil, "stale bytes are not offered")
 	end
 	tracking = false
+	assert(native.captureGenerations(session, { "StarterGui" }) == nil)
+	assert(not native.proofMatches(session, proofs.StarterGui))
+	tracking = true
+	local jobs = #session.serializationJobs
 	assert(native.captureGenerations(session, { "Workspace" }) == nil)
-	assert(not native.proofMatches(session, proofs.Workspace))
+	assert(native.captureGenerations(session, { "ServerStorage", "Workspace" }) == nil)
+	native.appendJob(session, "Workspace", { "Workspace" }, {}, {})
+	equal(#session.serializationJobs, jobs + 1, "Terrain voxels require fresh export without property events")
+	assert(session.cachedPayloadProofs.Workspace == nil)
+
+end
+
+do
+	local first = assert(editorSyncSource:find("function NativeSerialization.appendIdentityCarriers(", 1, true))
+	local last = assert(editorSyncSource:find("function NativeSerialization.snapshotMarker(", first, true))
+	local native, pools = {}, { Workspace = { carriers = {} } }
+	local reads, writes = 0, 0
+	local values = {}
+	local slots = { "HeadBase", "Root" }
+	luau.load(editorSyncSource:sub(first, last - 1), { environment = {
+		NativeSerialization = native, nativeSnapshotPools = pools,
+		NATIVE_IDENTITY_CARRIER_CLASS = "HumanoidRigDescription", NATIVE_IDENTITY_CARRIER_SLOTS = slots,
+		Instance = { new = function()
+			local stored = {}
+			local carrier = setmetatable({}, {
+				__index = function(_, property) reads += 1; return stored[property] end,
+				__newindex = function(_, property, value)
+					if property ~= "Name" then writes += 1 end
+					stored[property] = value
+				end,
+			})
+			values[carrier] = stored
+			return carrier
+		end },
+	} })()
+	local root, a, b, c, d = {}, {}, {}, {}, {}
+	local function append(instances, generation)
+		local group, roots = { service = "Workspace" }, {}
+		native.appendIdentityCarriers(group, roots, instances, generation)
+		equal(#roots, math.ceil((#instances - 1) / #slots), "only active identity carriers exported")
+		for carrierIndex, carrier in roots do
+			for slotIndex, property in slots do
+				equal(values[carrier][property], instances[(carrierIndex - 1) * #slots + slotIndex + 1], "identity reference retained")
+			end
+		end
+	end
+	append({ root, a, b, c }, 1)
+	equal(reads, 0, "new carriers need no property reads")
+	equal(writes, 4, "new carriers initialized")
+	append({ root, a, b, c }, 1)
+	equal(writes, 4, "matching generation does not rewrite identities")
+	append({ root, a, b, c, d }, 2)
+	append({ root, a }, 3)
+	append({ root, d, b, a }, 4)
+	append({ root }, 5)
+	append({ root, c }, 6)
 end
 
 do
@@ -252,6 +430,36 @@ equal(conflictingRetryOk, false, "transaction upload rejects conflicting chunk r
 uploads.finish({ transactionId = "integrity-upload" }, "lease-a")
 equal(#uploadedTransactions, 1, "matching transaction chunk retry stays idempotent")
 equal(uploadedTransactions[1].sourceChanges[1].source, "original", "conflicting retry keeps original chunk")
+
+uploads.begin({
+	transactionId = "target-upload", totalChunks = 2, rowCount = 5,
+	expectedRuntimeId = "edit-runtime", expectedStudioGenerations = { Workspace = 42 },
+}, "lease-a")
+local invalidKindOk = pcall(uploads.append, {
+	transactionId = "target-upload", index = 1,
+	rows = { { kind = "expectedRuntimeId", change = {} } },
+}, "lease-a")
+equal(invalidKindOk, false, "uploaded rows cannot replace transaction guards")
+uploads.append({ transactionId = "target-upload", index = 2, rows = {
+	{ kind = "mutationPackageTarget", change = { pathSegments = { "Workspace", "Package" }, includeSelf = true } },
+	{ kind = "postCommitProperty", change = { properties = { WorldPivot = "pivot" } } },
+} }, "lease-a")
+local incompleteOk = pcall(uploads.finish, { transactionId = "target-upload" }, "lease-a")
+equal(incompleteOk, false, "package target upload cannot commit incomplete chunks")
+uploads.append({ transactionId = "target-upload", index = 1, rows = {
+	{ kind = "source", change = { source = "return 1" } },
+	{ kind = "property", change = { properties = { Transparency = 0.5 } } },
+	{ kind = "mutationRoot", change = { pathSegments = { "Workspace", "Root" } } },
+} }, "lease-a")
+uploads.finish({ transactionId = "target-upload" }, "lease-a")
+local targetTransaction = uploadedTransactions[2]
+equal(targetTransaction.expectedRuntimeId, "edit-runtime", "upload preserves runtime guard")
+equal(targetTransaction.expectedStudioGenerations.Workspace, 42, "upload preserves generation guard")
+equal(targetTransaction.sourceChanges[1].source, "return 1", "upload retains source rows")
+equal(targetTransaction.propertyChanges[1].properties.Transparency, 0.5, "upload retains property rows")
+equal(targetTransaction.mutationRoots[1].pathSegments[2], "Root", "upload retains mutation roots")
+equal(targetTransaction.mutationPackageTargets[1].includeSelf, true, "upload retains package check scope")
+equal(targetTransaction.postCommitPropertyChanges[1].properties.WorldPivot, "pivot", "upload retains post-commit rows")
 
 local queuedRequests = {
 	{ id = 1, leaseId = "lease-a" },
@@ -652,6 +860,128 @@ equal(rollbackOld.Parent, nil, "rollback outgoing parent")
 equal(removed[1].instance, rollbackOld, "rollback outgoing record")
 
 local nativeGroups = {}
+do
+	local function signal()
+		local event = {}
+		function event:Connect(callback)
+			self.callback = callback
+			return { Disconnect = function() self.callback = nil end }
+		end
+		return event
+	end
+	local changed = signal()
+	local service = { ClassName = "StarterGui", DescendantAdded = signal(), DescendantRemoving = signal(), AttributeChanged = signal() }
+	function service:GetFullName() return "StarterGui" end
+	local gui = { ClassName = "ScreenGui", AttributeChanged = signal() }
+	function gui:GetFullName() return "StarterGui.ReniumFinalGui" end
+	function gui:IsDescendantOf(parent) return parent == service end
+	local database = require("@lune/serde").decode("json", fs.readFile("tools/plugin_ws_bridge/rbx_dom_lua/database.json"))
+	local descriptorSource = fs.readFile("tools/plugin_ws_bridge/rbx_dom_lua/PropertyDescriptor.module.lua")
+	local descriptorStart = assert(descriptorSource:find("function PropertyDescriptor.fromRaw(", 1, true))
+	local descriptorEnd = assert(descriptorSource:find("function PropertyDescriptor:read(", descriptorStart, true))
+	local descriptor = luau.load("local PropertyDescriptor = {}\n" .. descriptorSource:sub(descriptorStart, descriptorEnd - 1)
+		.. "\nreturn PropertyDescriptor.fromRaw")()
+	local overlay = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeReferenceOverlay.module.lua"), {
+		environment = {
+			game = { ItemChanged = changed },
+			typeof = function(value) return if value == gui or value == service then "Instance" else typeof(value) end,
+		},
+	})().create({ RbxDomModule = { findCanonicalPropertyDescriptor = function(className, name)
+		if className == "AudioPlayer" and name == "IsReady" then
+			return descriptor(database.Classes.AudioPlayer.Properties.IsReady, className, name)
+		elseif name == "SavedReadOnly" then
+			return { scriptability = "Read", serialization = "Serializes" }
+		elseif name == "WritableAlias" then
+			return { scriptability = "ReadWrite", serialization = "DoesNotSerialize" }
+		end
+		return nil
+	end } })
+	local groups = { { serviceName = "StarterGui", service = service } }
+	for _, instance in { service, gui } do
+		local attributeGuard = overlay.beginNativeGuard(groups, true)
+		overlay.watchNativeDescendantAttributes(attributeGuard, "StarterGui", {service, gui})
+		overlay.assertNativeGuard(attributeGuard)
+		instance.AttributeChanged.callback("ReniumGuardProbe")
+		local ok, detail = pcall(overlay.assertNativeGuard, attributeGuard)
+		equal(ok, false, "attribute-only event invalidates native export")
+		equal(string.find(detail, instance:GetFullName() .. " (attribute ReniumGuardProbe)", 1, true) ~= nil, true, "attribute diagnostic identifies target")
+		overlay.finishNativeGuard(attributeGuard)
+		overlay.finishNativeGuard(attributeGuard)
+		equal(service.AttributeChanged.callback, nil, "root attribute listener cleaned once")
+		equal(gui.AttributeChanged.callback, nil, "descendant attribute listener cleaned once")
+	end
+	local guard = overlay.beginNativeGuard(groups, true, { archivable = true })
+	for _, property in { "AbsoluteSize", "AbsolutePosition", "AbsoluteRotation", "AbsoluteCanvasSize", "AbsoluteWindowSize", "AbsoluteContentSize", "ContentText", "TextBounds", "TextFits", "OpenTypeFeaturesError", "ViewportSize", "Archivable" } do
+		changed.callback(gui, property)
+	end
+	overlay.assertNativeGuard(guard)
+	gui.ClassName = "AudioPlayer"
+	changed.callback(gui, "IsReady")
+	changed.callback(gui, "IsReady")
+	overlay.assertNativeGuard(guard)
+	gui.ClassName = "ScreenGui"
+	for _, property in { "Size", "Name", "Parent", "AttributesSerialize", "Source", "OpenTypeFeatures", "CollisionFidelity", "FutureSerializedProperty", "SavedReadOnly", "WritableAlias", "IsReady" } do
+		changed.callback(gui, property)
+		local ok, detail = pcall(overlay.assertNativeGuard, guard)
+		equal(ok, false, `native guard retains {property}`)
+		equal(string.find(detail, `StarterGui.ReniumFinalGui (property {property})`, 1, true) ~= nil, true, "first change diagnostic")
+		overlay.finishNativeGuard(guard)
+		guard = overlay.beginNativeGuard(groups, true)
+	end
+	service.DescendantRemoving.callback(gui)
+	equal(pcall(overlay.assertNativeGuard, guard), false, "native guard retains removals")
+	overlay.finishNativeGuard(guard)
+	equal(changed.callback, nil, "native guard disconnects")
+	for _, mode in { "unchanged", "attribute", "disconnect", "uncovered" } do
+		local observation = { active = true, generation = 7, connections = if mode == "uncovered" then {} else { [gui] = "StarterGui" } }
+		local shared = overlay.beginNativeGuard(groups, true, nil, function(serviceName)
+			equal(serviceName, "StarterGui", "attribute observation is service scoped")
+			return observation
+		end)
+		overlay.watchNativeDescendantAttributes(shared, "StarterGui", {service, gui})
+		equal(gui.AttributeChanged.callback ~= nil, mode == "uncovered", "only unobserved instances need another listener")
+		if mode == "attribute" then
+			observation.generation += 1
+			observation.instance, observation.attribute = gui, "GuardAttribute"
+		elseif mode == "disconnect" then
+			observation.active = false
+		elseif mode == "uncovered" then
+			gui.AttributeChanged.callback("GuardAttribute")
+		end
+		equal(pcall(overlay.assertNativeGuard, shared), mode == "unchanged", "shared attribute guard keeps every failure")
+		overlay.finishNativeGuard(shared)
+		overlay.finishNativeGuard(shared)
+		equal(next(shared.attributeCheckpoints), nil, "shared observation released with export")
+	end
+	local observation = { active = true, generation = 0, connections = { [gui] = "StarterGui" } }
+	local finalGuard = overlay.beginNativeGuard(groups, true, nil, function() return observation end)
+	overlay.watchNativeDescendantAttributes(finalGuard, "StarterGui", {service, gui})
+	overlay.assertNativeGuard(finalGuard)
+	observation.generation, observation.instance, observation.attribute = 1, gui, "LateAttribute"
+	local exports = { test = { nativeGuard = finalGuard, payloadReadyEvent = { Fire = function() end } } }
+	local api, invalidated = {}, nil
+	local first = assert(editorSyncSource:find("function api.finishBinaryExport(", 1, true))
+	local last = assert(editorSyncSource:find("\n\tlocal function validatedBinaryImportSize(", first, true))
+	luau.load(editorSyncSource:sub(first, last - 1), { environment = {
+		api = api, binaryExports = exports, ReferenceOverlay = overlay,
+		expireSession = function(_, id, session)
+			overlay.finishNativeGuard(session.nativeGuard)
+			exports[id] = nil
+		end,
+		NativeSerialization = { invalidateProofs = function(name) invalidated = name end },
+	} })()
+	equal(pcall(api.finishBinaryExport, { exportId = "test" }), false, "late raw attribute event rejects final publication")
+	equal(exports.test, nil, "failed finalization still releases session")
+	equal(invalidated, "StarterGui", "failed finalization invalidates payload proof")
+	local nativeGuard = overlay.beginNativeGuard(groups, true, nil, nil, true)
+	overlay.watchNativeDescendantAttributes(nativeGuard, "StarterGui", {service, gui})
+	equal(gui.AttributeChanged.callback, nil, "armed native guard replaces temporary Lua attribute subscriptions")
+	exports.native = { groups = { { service = "StarterGui" } }, nativeGuard = nativeGuard, payloadReadyEvent = { Fire = function() end } }
+	invalidated = nil
+	api.finishBinaryExport({ exportId = "native", nativeAttributeGuardFailed = true })
+	equal(invalidated, "StarterGui", "native observation rejection invalidates cached serialization")
+	equal(exports.native, nil, "native rejection releases export session")
+end
 for _, serviceName in ipairs({ "Workspace", "ReplicatedStorage" }) do
 	local target = roblox.Instance.new("Folder")
 	local outgoing = roblox.Instance.new("Folder")
@@ -668,6 +998,7 @@ for _, serviceName in ipairs({ "Workspace", "ReplicatedStorage" }) do
 end
 local allIncomingAttachedBeforeRemoval = true
 local nativeOverlay = ReferenceOverlay.create({
+	isProtectedWorkspaceCameraInstance = function() return false end,
 	BridgeIdentity = {},
 	BridgeReferenceRetarget = ReferenceRetarget,
 	RbxDomModule = {},
@@ -692,7 +1023,7 @@ local nativeOverlay = ReferenceOverlay.create({
 })
 nativeOverlay.commitNative({
 	generationsByService = {},
-	guard = { connections = {} },
+	guard = { connections = {}, attributeCheckpoints = {} },
 	prepared = nativeGroups,
 	referenceUpdates = 0,
 	replacements = {},
@@ -726,6 +1057,7 @@ equal(#packageMerges[1].outgoing, 0, "package link excluded from outgoing conten
 equal(packageLink.Parent, packageRoot, "missing package link preserved")
 
 local packageStateOverlay = ReferenceOverlay.create({
+	isProtectedWorkspaceCameraInstance = function() return false end,
 	BridgeIdentity = {},
 	BridgeReferenceRetarget = ReferenceRetarget,
 	CollectionService = tagService,
@@ -791,4 +1123,23 @@ equal(string.find(objectError, "without losing data", 1, true) ~= nil, true, "ob
 local opaqueOk = pcall(Content.serializeSource, "Opaque", nil)
 equal(opaqueOk, false, "opaque content rejection")
 
+do
+	local schema = require("../BridgePropertySchema.module")
+	local database = require("@lune/serde").decode("json", fs.readFile("tools/plugin_ws_bridge/rbx_dom_lua/database.json"))
+	local candidates = schema.buildCandidatesFromSchemas(schema.buildSchemasFromRbxDom(database, { Vector3 = 1 }))
+	local relevant = schema.makeExportPropertyFilter(database, candidates)
+	for _ = 1, 2 do
+		for _, entry in { { "Sound", "TimeLength" }, { "Sound", "IsLoaded" },
+			{ "TextLabel", "AbsoluteSize" }, { "TextLabel", "TextBounds" } } do
+			assert(not relevant(entry[1], entry[2]), "computed readback invalidated export: " .. entry[2])
+		end
+		for _, entry in { { "Sound", "SoundId" }, { "Part", "Position" }, { "Part", "CFrame" },
+			{ "MeshPart", "MeshSize" }, { "Terrain", "SmoothGrid" }, { "Camera", "FieldOfView" },
+			{ "Part", "Archivable" }, { "Part", "AttributesSerialize" }, { "Part", "Tags" },
+			{ "NewEngineClass", "UnknownProperty" }, { "Part", "UnknownProperty" } } do
+			assert(relevant(entry[1], entry[2]), "authored or unknown field escaped export guard: " .. entry[2])
+		end
+	end
+end
+require("./native-root-workloads")
 print("Renium plugin behavior tests passed")

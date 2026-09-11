@@ -42,7 +42,9 @@ for (let sample=0;sample<3;sample++) {
   assert.equal(settled.daemon.settled,true,JSON.stringify(settled));
   assert.equal(run(['l','return game.ReplicatedStorage.ReniumFinalSource.Source']).results[0],`return { revision = ${revision} }\n`);
   run(['l',`game.ReplicatedStorage.ReniumFinalSource.Source="return { revision = ${revision+10} }\\n"; return true`]);
-  assert.equal(run(['lst','--wait','10']).pendingChanges,0);
+  const pulled=run(['lst','--wait','10']);
+  assert.equal(pulled.daemon.settled,true,JSON.stringify(pulled));
+  assert.equal(pulled.pendingChanges,0,JSON.stringify(pulled));
   assert.equal(fs.readFileSync(source,'utf8'),`return { revision = ${revision+10} }\n`);
   run(['lof']);
 }

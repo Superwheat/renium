@@ -43,6 +43,9 @@
       "BridgeMaterialService": {
         "$path": "BridgeMaterialService.module.lua"
       },
+      "BridgeCollisionGroups": {
+        "$path": "BridgeCollisionGroups.module.lua"
+      },
       "BridgeCandidateMatch": {
         "$path": "BridgeCandidateMatch.module.lua"
       },

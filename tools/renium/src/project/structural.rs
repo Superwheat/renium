@@ -18,7 +18,7 @@ use crate::bytecode::{
     apply_file_mutations, collect_source_path_updates, file_mutation_paths,
     lock_existing_service_store, preserve_source_path_extension,
 };
-use crate::editor::document::is_protected_starter_player_container;
+use crate::editor::document::is_protected_engine_container;
 use crate::editor::paths::{
     build_editor_instance_paths, build_editor_source_paths_by_index, script_file_names,
 };
@@ -47,18 +47,18 @@ struct PackageLinkState {
 }
 
 pub(crate) fn service_store_paths(src_root: &Path) -> Result<BTreeMap<String, PathBuf>> {
+    let source = super::storage::source_for_instances(src_root);
+    let src_root = source.as_deref().unwrap_or(src_root);
     let mut files = BTreeMap::new();
-    for entry in
-        fs::read_dir(src_root).with_context(|| format!("Failed to read {}", src_root.display()))?
-    {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let settings_file = service_settings_path(&entry.path());
+    for service_dir in super::storage::service_directories(src_root)? {
+        let settings_file = service_settings_path(&service_dir);
         if settings_file.is_file() {
             files.insert(
-                entry.file_name().to_string_lossy().into_owned(),
+                service_dir
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
                 settings_file,
             );
         }
@@ -210,13 +210,13 @@ pub(crate) fn moved_references_between_documents(
 }
 
 fn source_root_for_stores(source_file: &Path, target_file: &Path) -> Result<PathBuf> {
-    let source_root = source_file
+    let source_directory = super::storage::source_directory(source_file);
+    let target_directory = super::storage::source_directory(target_file);
+    let source_root = source_directory
         .parent()
-        .and_then(Path::parent)
         .context("Source settings file is not inside a service directory")?;
-    let target_root = target_file
+    let target_root = target_directory
         .parent()
-        .and_then(Path::parent)
         .context("Target settings file is not inside a service directory")?;
     if exact_path_key(source_root) != exact_path_key(target_root) {
         bail!("Cross-service moves require both services to use the same source root");
@@ -331,7 +331,7 @@ pub(crate) fn move_instance_between_service_stores(
     if source_before.instances[source_index].parent_index.is_none() {
         bail!("Service roots cannot be moved");
     }
-    if is_protected_starter_player_container(&source_before, source_index) {
+    if is_protected_engine_container(&source_before, source_index) {
         bail!(
             "{} cannot be moved",
             source_before.instances[source_index].name
@@ -385,9 +385,7 @@ pub(crate) fn move_instance_between_service_stores(
     let source_paths_before = build_editor_source_paths_by_index(
         &source_before,
         source_service,
-        source_file
-            .parent()
-            .context("Source settings file has no parent")?,
+        &super::storage::source_directory(source_file),
     );
     let mut target_ids = target
         .instances
@@ -468,18 +466,14 @@ pub(crate) fn move_instance_between_service_stores(
         &source_paths_before,
         source_after,
         source_service,
-        source_file
-            .parent()
-            .context("Source settings file has no parent")?,
+        &super::storage::source_directory(source_file),
         &mut writes,
         &mut removals,
     )?;
     let mut target_source_paths = build_editor_source_paths_by_index(
         target_after,
         target_service,
-        target_file
-            .parent()
-            .context("Target settings file has no parent")?,
+        &super::storage::source_directory(target_file),
     );
     for old_index in subtree.iter().copied() {
         if script_file_names(&source_before.instances[old_index].class_name).is_none() {
@@ -523,9 +517,7 @@ pub(crate) fn move_instance_between_service_stores(
     removals.dedup_by(|left, right| exact_path_key(left) == exact_path_key(right));
     let changed_paths = file_mutation_paths(&writes, &removals);
     apply_file_mutations(&writes, &removals)?;
-    if let Some(source_dir) = source_file.parent() {
-        prune_removed_source_dirs(source_dir, &removals);
-    }
+    prune_removed_source_dirs(&super::storage::source_directory(source_file), &removals);
 
     let root_new_index = new_index_by_old[&source_index];
     let root = &target_after.instances[root_new_index];

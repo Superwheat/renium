@@ -252,6 +252,35 @@ impl WeakDom {
         root_referent
     }
 
+    /// Insert an instance prepared with [`InstanceBuilder::build_leaf`]. This
+    /// retains `insert`'s child order and UniqueId collision handling, while
+    /// allowing property-map allocation to happen before the serial tree join.
+    ///
+    /// # Panics
+    /// Panics if the instance has children or a non-none parent, or if the
+    /// requested parent is non-none and does not exist in this DOM.
+    pub fn insert_leaf(&mut self, parent: Ref, mut instance: Instance) -> Ref {
+        assert!(
+            instance.parent.is_none() && instance.children.is_empty(),
+            "insert_leaf requires a detached childless instance"
+        );
+        assert!(
+            parent.is_none() || self.instances.contains_key(&parent),
+            "cannot insert into parent that does not exist"
+        );
+        let referent = instance.referent;
+        instance.parent = parent;
+        self.inner_insert(referent, instance);
+        if parent.is_some() {
+            self.instances
+                .get_mut(&parent)
+                .unwrap()
+                .children
+                .push(referent);
+        }
+        referent
+    }
+
     /// Destroy the instance with the given referent.
     ///
     /// ## Panics

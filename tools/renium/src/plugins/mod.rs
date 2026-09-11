@@ -1,4 +1,5 @@
-//! Explicitly installed, process-isolated workflow plugins. Ordinary commands do no discovery.
+//! Explicitly installed, process-isolated plugins that add commands to Renium.
+//! Ordinary commands do no discovery.
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -198,7 +199,7 @@ pub(crate) fn manage(args: PluginArgs) -> Result<()> {
             )?;
             if capabilities["pluginResourceLeases"].as_u64() != Some(1) {
                 bail!(
-                    "The running daemon does not support plugin resource leases. Restart Renium's daemon with this build before using a managed Studio workflow"
+                    "The running daemon does not support plugin resource leases. Restart Renium's daemon with this build before using a plugin that leases Studio places"
                 );
             }
             json!({"pluginResourceLeases":1,"ready":true})
@@ -216,7 +217,13 @@ pub(crate) fn manage(args: PluginArgs) -> Result<()> {
             let path = registration_path(&plugin_home()?, &manifest.name)?;
             fs::create_dir_all(path.parent().context("Missing registration parent")?)?;
             crate::system::files::atomic_write_file(&path, &serde_json::to_vec(&registration)?)?;
-            json!({"installed":manifest.name,"dev":dev,"permissions":manifest.permissions,"trust":"Native plugins run with your user privileges. Install only trusted code."})
+            json!({
+                "installed":manifest.name,
+                "dev":dev,
+                "permissions":manifest.permissions,
+                "next":[format!("rbx plugin info {}", manifest.name), format!("rbx {} --help", manifest.name)],
+                "trust":"Native plugins run with your user privileges. Install only trusted code."
+            })
         }
         PluginCommand::List => {
             let home = plugin_home()?;
@@ -257,7 +264,11 @@ pub(crate) fn manage(args: PluginArgs) -> Result<()> {
             json!({"manifest":manifest,"guide":guide,"directory":registration.directory,"dev":registration.dev})
         }
         PluginCommand::Remove { name } => {
-            fs::remove_file(registration_path(&plugin_home()?, &name)?)?;
+            let path = registration_path(&plugin_home()?, &name)?;
+            if !path.try_exists()? {
+                bail!("Plugin '{name}' is not installed; see rbx plugin list");
+            }
+            fs::remove_file(path)?;
             json!({"removed":name,"statePreserved":true})
         }
     };
@@ -308,6 +319,7 @@ pub(crate) fn run(args: Vec<OsString>, project: Option<&Path>) -> Result<()> {
         protocol: PROTOCOL,
         command: name.into(),
         arguments,
+        timeout_seconds: definition.timeout_seconds,
         context: PluginContext {
             plugin: manifest.name,
             directory: registration.directory.clone(),
@@ -333,18 +345,21 @@ pub(crate) fn run(args: Vec<OsString>, project: Option<&Path>) -> Result<()> {
         &input,
         Duration::from_secs(definition.timeout_seconds),
     )?;
-    if !output.stderr.is_empty() {
+    let diagnostics = String::from_utf8_lossy(&output.stderr);
+    let diagnostics = diagnostics.trim();
+    if !diagnostics.is_empty() {
         crate::log_global(
             4,
-            format_args!(
-                "plugin {}: {}",
-                invocation.context.plugin,
-                String::from_utf8_lossy(&output.stderr)
-            ),
+            format_args!("plugin {}: {}", invocation.context.plugin, diagnostics),
         );
     }
-    let response: Value = serde_json::from_slice(&output.stdout)
-        .context("Plugin returned invalid JSON; stdout is reserved for its protocol")?;
+    let response: Value = serde_json::from_slice(&output.stdout).with_context(|| {
+        format!(
+            "Plugin returned no JSON response (exit status {}); stdout is reserved for its protocol{}",
+            output.status,
+            diagnostics_note(diagnostics)
+        )
+    })?;
     if response["protocol"].as_u64() != Some(u64::from(PROTOCOL)) {
         bail!("Unsupported plugin response protocol");
     }
@@ -357,13 +372,28 @@ pub(crate) fn run(args: Vec<OsString>, project: Option<&Path>) -> Result<()> {
         );
     }
     if !output.status.success() {
-        bail!("Plugin reported success but exited with {}", output.status);
+        bail!(
+            "Plugin reported success but exited with {}{}",
+            output.status,
+            diagnostics_note(diagnostics)
+        );
     }
     let result = response
         .get("result")
         .context("Plugin response omitted result")?;
     crate::app::output::print_json_output(result, true)?;
     Ok(())
+}
+
+fn diagnostics_note(diagnostics: &str) -> String {
+    if diagnostics.is_empty() {
+        return String::new();
+    }
+    let mut start = diagnostics.len().saturating_sub(2000);
+    while !diagnostics.is_char_boundary(start) {
+        start += 1;
+    }
+    format!(". Plugin diagnostics: {}", &diagnostics[start..])
 }
 
 pub(crate) fn environment_claim() -> Result<Option<lease::Claim>> {

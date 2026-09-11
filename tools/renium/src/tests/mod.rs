@@ -5,7 +5,6 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
-use std::thread;
 
 use crate::bytecode::edit::{
     bytecode_clone_instance, bytecode_desync_package_link, bytecode_remove_instance,
@@ -294,15 +293,8 @@ fn studio_bridge_modules_parse_as_luau() {
         .collect::<Vec<_>>();
     paths.sort();
     for path in paths {
-        let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let source = fs::read_to_string(&path).unwrap();
-        let result = thread::Builder::new()
-            .name(format!("parse-{name}"))
-            .stack_size(64 * 1024 * 1024)
-            .spawn(move || validate_luau_syntax(&source))
-            .unwrap()
-            .join()
-            .unwrap();
+        let result = validate_luau_syntax(&source);
         result.unwrap_or_else(|error| panic!("{}: {error:#}", path.display()));
     }
 }
@@ -680,6 +672,27 @@ fn fetch_text_chunks_reuses_verified_payload_cache_hits() {
     let (second, _) = fetch_text_chunks_with_cache(256, slot, |start, _, known| {
         assert_eq!(start, 1);
         assert_eq!(known, Some(hash));
+        // Other service replies can fill the shared cache while this request
+        // is in flight. Its advertised payload must survive that eviction.
+        for index in 0..65 {
+            let pressure_hash = format!("test-cache-pressure-{index}");
+            fetch_text_chunks_with_cache(256, &pressure_hash, |_, _, _| {
+                Ok(crate::studio::bridge::BridgeChunk {
+                    start: 1,
+                    next_start: 2,
+                    total: 1,
+                    chunk: "x".into(),
+                    plugin_server_ms: None,
+                    plugin_encode_ms: None,
+                    serialization_complete: true,
+                    payload_hash: Some(pressure_hash.clone()),
+                    payload_cache_hit: false,
+                    compression: None,
+                    uncompressed_bytes: None,
+                })
+            })
+            .unwrap();
+        }
         Ok(crate::studio::bridge::BridgeChunk {
             start: 1,
             next_start: 1,
@@ -839,9 +852,101 @@ fn json_to_rbx_color_sequence_reads_legacy_color_arrays() {
 }
 
 #[test]
-fn rbxlx_export_skips_lighting_clock_time_but_keeps_time_of_day() {
-    assert!(model_property_name_is_skipped("ClockTime"));
+fn place_export_borrows_prepared_documents_without_changing_source_merge_semantics() {
+    use crate::settings::bytecode::encode_settings_bytecode;
+
+    let root = temp_dir("place-prepared-document");
+    let service_dir = root.join("ReplicatedFirst");
+    fs::create_dir_all(service_dir.join("Prepared")).unwrap();
+    fs::write(
+        service_dir.join("Prepared/init.client.luau"),
+        "return true\n",
+    )
+    .unwrap();
+    let disk = settings_document(vec![
+        settings_instance("root", "ReplicatedFirst", "ReplicatedFirst", None),
+        settings_instance("child", "Disk", "Folder", Some(0)),
+    ]);
+    let settings_path = service_settings_path(&service_dir);
+    disk.write_file(&settings_path).unwrap();
+    let disk_before = fs::read(&settings_path).unwrap();
+    let mut prepared = disk.clone();
+    prepared.instances[1].name = "Prepared".into();
+    let prepared_before = encode_settings_bytecode(&prepared).unwrap();
+    let overrides = HashMap::from([("ReplicatedFirst".into(), &prepared)]);
+
+    for merge_sources in [false, true] {
+        let build = crate::rbx::model::build_rbx_place(
+            &root,
+            vec!["ReplicatedFirst".into()],
+            Some(&overrides),
+            false,
+            false,
+            merge_sources,
+        )
+        .unwrap();
+        let service = build.dom.get_by_ref(build.service_roots[0].1).unwrap();
+        assert_eq!(service.children().len(), 1);
+        let child = build.dom.get_by_ref(service.children()[0]).unwrap();
+        assert_eq!(child.name, "Prepared");
+        assert_eq!(
+            child.class.as_str(),
+            if merge_sources {
+                "LocalScript"
+            } else {
+                "Folder"
+            }
+        );
+        if merge_sources {
+            assert_eq!(
+                child.properties.get(&"Source".into()),
+                Some(&RbxVariant::String("return true\n".into()))
+            );
+        }
+        assert_eq!(
+            encode_settings_bytecode(&prepared).unwrap(),
+            prepared_before
+        );
+        assert_eq!(fs::read(&settings_path).unwrap(), disk_before);
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn place_export_preserves_lighting_clock_time() {
+    assert!(!model_property_name_is_skipped("ClockTime"));
     assert!(!model_property_name_is_skipped("TimeOfDay"));
+    let root = temp_dir("lighting-clock-time");
+    fs::create_dir_all(root.join("Lighting")).unwrap();
+    let mut lighting = settings_instance("root", "Lighting", "Lighting", None);
+    lighting.properties.insert("ClockTime".into(), json!(17.5));
+    settings_document(vec![lighting])
+        .write_file(&service_settings_path(&root.join("Lighting")))
+        .unwrap();
+    let build = crate::rbx::model::build_rbx_place(
+        &root,
+        vec!["Lighting".into()],
+        None,
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    for extension in ["rbxl", "rbxlx"] {
+        let path = root.join(format!("Lighting.{extension}"));
+        let format = crate::rbx::model::RbxPlaceFormat::from_path(&path).unwrap();
+        format
+            .write(&path, &build.dom, &[build.service_roots[0].1])
+            .unwrap();
+        let decoded = format.read(&path).unwrap();
+        let lighting = decoded.get_by_ref(decoded.root().children()[0]).unwrap();
+        assert_eq!(
+            lighting.properties.get(&"ClockTime".into()),
+            Some(&RbxVariant::Float32(17.5)),
+            "{extension}"
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1037,7 +1142,24 @@ fn service_settings_preserve_package_link_instances_and_package_id() {
 
 #[test]
 fn cross_service_move_preserves_package_link_sources_and_references() {
+    check_cross_service_move(false);
+    check_cross_service_move(true);
+}
+
+fn check_cross_service_move(separate_stores: bool) {
     let project_root = temp_dir("cross-service-move");
+    if separate_stores {
+        fs::write(
+            project_root.join("renium.project.jsonc"),
+            br#"{"schemaVersion":1}"#,
+        )
+        .unwrap();
+        crate::project::config::load_project(
+            Some(&project_root.join("renium.project.jsonc")),
+            None,
+        )
+        .unwrap();
+    }
     let src_root = project_root.join("src");
     let source_dir = src_root.join("StarterGui");
     let target_dir = src_root.join("ReplicatedStorage");
@@ -1199,6 +1321,7 @@ fn cross_service_move_preserves_package_link_sources_and_references() {
             .any(|instance| instance.class_name == "PackageLink")
     );
 
+    crate::project::storage::forget(&project_root);
     let _ = fs::remove_dir_all(project_root);
 }
 
@@ -1359,6 +1482,74 @@ fn bytecode_desync_package_link_removes_direct_package_link_child() {
     assert_eq!(door.parent_index, Some(1));
 
     let _ = fs::remove_dir_all(project_root);
+}
+
+#[test]
+fn unlink_package_preserves_script_source_when_last_child_is_removed() {
+    for class in ["ModuleScript", "Script", "LocalScript"] {
+        for retain_child in [false, true] {
+            let root = temp_dir("unlink-script-source");
+            let service_dir = root.join("src").join("ReplicatedStorage");
+            fs::create_dir_all(&service_dir).unwrap();
+            let settings_path = service_settings_path(&service_dir);
+            let mut instances = vec![
+                settings_instance("root", "ReplicatedStorage", "ReplicatedStorage", None),
+                settings_instance("script", "Controller", class, Some(0)),
+                settings_instance("link", "PackageLink", "PackageLink", Some(1)),
+            ];
+            instances[1].properties.insert(
+                "Source".into(),
+                json!(crate::settings::EXTERNAL_SOURCE_MARKER),
+            );
+            if retain_child {
+                instances.push(settings_instance("child", "Config", "Folder", Some(1)));
+            }
+            let document = settings_document(instances);
+            document.write_file(&settings_path).unwrap();
+            let paths = crate::editor::paths::build_editor_source_paths_by_index(
+                &document,
+                "ReplicatedStorage",
+                &service_dir,
+            );
+            let before_path = paths[1].as_ref().unwrap();
+            fs::create_dir_all(before_path.parent().unwrap()).unwrap();
+            let source = b"-- preserved bytes\r\nreturn 123\r\n";
+            fs::write(before_path, source).unwrap();
+            bytecode_desync_package_link(BytecodeDesyncPackageLinkArgs {
+                input: BytecodeFileArgs::settings_file(settings_path.clone()),
+                service: "ReplicatedStorage".into(),
+                selector: BytecodeInstanceSelectorArgs::by_settings_id(Some(
+                    if retain_child { "script" } else { "link" }.into(),
+                )),
+                pretty: false,
+            })
+            .unwrap();
+            let after = SettingsBytecode::read_file(&settings_path).unwrap();
+            assert_eq!(after.instances.len(), document.instances.len() - 1);
+            assert!(
+                after
+                    .instances
+                    .iter()
+                    .all(|node| node.class_name != "PackageLink")
+            );
+            assert_eq!(
+                after.instances[1].properties,
+                document.instances[1].properties
+            );
+            let paths = crate::editor::paths::build_editor_source_paths_by_index(
+                &after,
+                "ReplicatedStorage",
+                &service_dir,
+            );
+            let after_path = paths[1].as_ref().unwrap();
+            assert_eq!(fs::read(after_path).unwrap(), source);
+            assert_eq!(before_path == after_path, retain_child);
+            if !retain_child {
+                assert!(!before_path.exists());
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
 }
 
 #[test]
@@ -1821,7 +2012,7 @@ fn bytecode_export_uses_transport_mesh_size_in_all_formats() {
 }
 
 #[test]
-fn append_editor_property_changes_skips_mesh_size_transport_property() {
+fn append_editor_property_changes_preserves_native_mesh_size() {
     let mut mesh_properties = Map::new();
     mesh_properties.insert("meshSize".to_string(), vector3_json(7.0, 8.0, 9.0));
     mesh_properties.insert("Size".to_string(), vector3_json(1.0, 2.0, 3.0));
@@ -1851,12 +2042,53 @@ fn append_editor_property_changes_skips_mesh_size_transport_property() {
     assert_eq!(changes.property_changes.len(), 1);
     let properties = &changes.property_changes[0].properties;
     assert!(properties.contains_key("Size"));
-    assert!(
-        properties
-            .keys()
-            .all(|name| !name.eq_ignore_ascii_case(MESH_SIZE_TRANSPORT_PROPERTY)),
-        "editor property pushes should skip MeshSize"
+    assert_eq!(
+        properties.get("MeshSize"),
+        Some(&vector3_json(7.0, 8.0, 9.0))
     );
+}
+
+#[test]
+fn hidden_serialized_content_is_not_discarded_from_editor_changes() {
+    let database = rbx_reflection_database::get().unwrap();
+    for (class, name) in [
+        ("SurfaceAppearance", "ColorMapContent"),
+        ("SurfaceAppearance", "MetalnessMapContent"),
+        ("SurfaceAppearance", "NormalMapContent"),
+        ("SurfaceAppearance", "RoughnessMapContent"),
+        ("Sound", "AudioContent"),
+    ] {
+        let mut instance = settings_instance("target", "Target", class, Some(0));
+        instance
+            .properties
+            .insert(name.into(), json!("rbxassetid://12345"));
+        let document = settings_document(vec![
+            settings_instance("root", "Workspace", "Workspace", None),
+            instance,
+        ]);
+        let mut changes = EditorChangeSet::default();
+        append_editor_property_changes(
+            &mut changes,
+            &document,
+            "Workspace",
+            &HashMap::new(),
+            &EditorPropertyFilter::default(),
+            database,
+        );
+        assert_eq!(changes.property_changes.len(), 1, "{class}.{name}");
+        assert_eq!(
+            changes.property_changes[0].properties[name],
+            json!("rbxassetid://12345")
+        );
+    }
+    assert!(is_engine_managed_editor_property(
+        "Workspace",
+        "CurrentCamera",
+        database
+    ));
+    assert!(is_engine_managed_editor_property(
+        "Instance", "UniqueId", database
+    ));
 }
 
 #[test]
@@ -1998,6 +2230,52 @@ fn targeted_instance_upserts_include_duplicate_identity_group() {
 }
 
 #[test]
+fn targeted_instance_upserts_share_deep_ancestors_without_losing_targets() {
+    let mut instances = vec![settings_instance("root", "Workspace", "Workspace", None)];
+    for depth in 1..=32 {
+        instances.push(settings_instance(
+            format!("parent:{depth}"),
+            "Parent",
+            "Folder",
+            Some(depth - 1),
+        ));
+    }
+    for child in 0..2400 {
+        instances.push(settings_instance(
+            format!("child:{child}"),
+            "Duplicate",
+            "Part",
+            Some(32),
+        ));
+    }
+    let document = settings_document(instances);
+    let filter = EditorPropertyFilter {
+        settings_ids: std::iter::once("parent:16".to_string())
+            .chain((0..2400).step_by(4).map(|child| format!("child:{child}")))
+            .collect(),
+        property_names: HashSet::new(),
+    };
+    let mut changes = EditorChangeSet::default();
+    append_editor_target_instance_upserts(&mut changes, &document, "Workspace", &filter);
+    let selected = &changes.instance_changes[0].instances;
+    assert_eq!(selected.len(), 2432);
+    assert_eq!(selected.iter().filter(|row| !row.anchor_only).count(), 601);
+    for row in selected {
+        assert_eq!(
+            row.anchor_only,
+            !filter.settings_ids.contains(&row.settings_id)
+        );
+        if let Some(child) = row.settings_id.strip_prefix("child:") {
+            assert_eq!(row.path_segments.len(), 34);
+            assert_eq!(
+                row.path_ordinals.last(),
+                Some(&(child.parse::<usize>().unwrap() + 1))
+            );
+        }
+    }
+}
+
+#[test]
 fn targeted_inline_source_changes_include_selected_package_scripts() {
     let document = settings_document(vec![
         settings_instance("editor:0", "Workspace", "Workspace", None),
@@ -2039,11 +2317,12 @@ fn targeted_inline_source_changes_include_selected_package_scripts() {
 
 #[test]
 fn direct_editor_delete_change_does_not_require_existing_bytecode_match() {
+    let root = temp_dir("direct-delete-missing-bytecode");
     let changes = collect_direct_editor_delete_change(ApplyEditorDeleteArgs {
         target: EditorMutationArgs {
             project: ProjectSourceArgs {
-                project_root: PathBuf::from("."),
-                src_root: PathBuf::from("src"),
+                project_root: root.clone(),
+                src_root: root.join("src"),
             },
             bridge: BridgeConnectionArgs::local(1.0),
             service: "Workspace".to_string(),
@@ -2343,23 +2622,295 @@ fn editor_ref_transport_preserves_duplicate_path_ordinals() {
             path_ordinals: vec![1, 1, 2],
         }),
     ];
-    let normalized = normalize_editor_bridge_value(
-        &json!({
+    for reference in [
+        json!({
             "_type": "Ref",
             "instanceIndex": 4,
             "pathSegments": ["Workspace", "Wrong"],
         }),
-        None,
-        &paths,
-        &["root", "ads", "first-ad", "second-ad"],
-    );
+        json!({"_type":"Ref", "settingsId":"second-ad"}),
+        json!({"_type":"Ref", "instanceId":"second-ad", "instanceIndex":1}),
+    ] {
+        let normalized = normalize_editor_bridge_value(
+            &reference,
+            None,
+            &paths,
+            &crate::editor::review::EditorReferenceIds::new([
+                "root",
+                "ads",
+                "first-ad",
+                "second-ad",
+            ]),
+        );
 
-    assert_eq!(
-        normalized.get("pathSegments"),
-        Some(&json!(["Workspace", "Ads", "Ad"]))
+        assert_eq!(
+            normalized.get("pathSegments"),
+            Some(&json!(["Workspace", "Ads", "Ad"]))
+        );
+        assert_eq!(normalized.get("pathOrdinals"), Some(&json!([1, 1, 2])));
+        assert_eq!(normalized.get("settingsId"), Some(&json!("second-ad")));
+    }
+}
+
+#[test]
+fn editor_material_colors_transport_decodes_the_saved_binary_palette() {
+    let mut colors = rbx_dom_weak::types::MaterialColors::new();
+    colors.set_color(
+        rbx_dom_weak::types::TerrainMaterials::Grass,
+        rbx_dom_weak::types::Color3uint8::new(12, 34, 56),
     );
-    assert_eq!(normalized.get("pathOrdinals"), Some(&json!([1, 1, 2])));
-    assert_eq!(normalized.get("settingsId"), Some(&json!("second-ad")));
+    let value = crate::rbx::encode::binary_payload_json("MaterialColors", &colors.encode());
+    let normalized = normalize_editor_bridge_value(&value, None, &[], &Default::default());
+    assert_eq!(normalized["colors"]["Grass"], json!([12, 34, 56]));
+    assert_eq!(normalized["colors"].as_object().unwrap().len(), 21);
+    assert!(normalized.get("base64").is_none());
+    let invalid = json!({"_type":"MaterialColors","base64":"AA=="});
+    assert_eq!(
+        normalize_editor_bridge_value(&invalid, None, &[], &Default::default()),
+        invalid
+    );
+}
+
+#[test]
+fn primary_part_models_preserve_their_separate_serialized_pivot() {
+    use rbx_dom_weak::types::{CFrame, Matrix3, Vector3};
+    let database = rbx_reflection_database::get().unwrap();
+    let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("Model"));
+    let part = dom.insert(dom.root_ref(), RbxInstanceBuilder::new("Part"));
+    let pivot = RbxVariant::OptionalCFrame(Some(CFrame::new(
+        Vector3::new(1.0, 2.0, 3.0),
+        Matrix3::identity(),
+    )));
+    dom.root_mut()
+        .properties
+        .insert("PrimaryPart".into(), RbxVariant::Ref(part));
+    dom.root_mut()
+        .properties
+        .insert("WorldPivotData".into(), pivot.clone());
+    let refs = crate::rbx::model::rbx_dom_path_import_refs(&dom, true);
+    let filter = crate::rbx::decode::native_property_filter(database, "Model");
+    let (properties, _, _) = crate::rbx::decode::rbx_instance_to_settings_records(
+        dom.root(),
+        database,
+        &refs,
+        false,
+        Some(&filter),
+    );
+    assert!(!properties.contains_key("WorldPivotData"));
+    assert_eq!(
+        properties["WorldPivot"],
+        crate::rbx::decode::rbx_variant_to_settings_json(&pivot, None, database, &refs).unwrap()
+    );
+}
+
+#[test]
+fn place_export_parallel_chunks_preserve_order_references_and_source() {
+    let root = temp_dir("place-parallel-conversion");
+    let count = 8195;
+    let mut documents = HashMap::new();
+    for (service, other) in [
+        ("Workspace", "ServerStorage"),
+        ("ServerStorage", "Workspace"),
+    ] {
+        fs::create_dir_all(root.join(service)).unwrap();
+        let mut rows = vec![settings_instance("root", service, service, None)];
+        for index in 1..=count {
+            let id = if index == count {
+                format!("{service}:last")
+            } else {
+                format!("item{index}")
+            };
+            let mut instance = settings_instance(id, "Same", "ObjectValue", Some(0));
+            let reference = if index == 1 {
+                // A valid global ID wins even when its path and index are stale.
+                json!({"_type":"Ref", "settingsId":format!("{other}:last"),
+                    "pathSegments":[other,"Missing"], "instanceIndex":2})
+            } else if index % 2 == 0 {
+                json!({"Ref":{"settingsId":"missing", "pathSegments":[other,"Same"],
+                    "pathOrdinals":[1,count+1-index], "instanceIndex":2}})
+            } else {
+                json!({"_type":"Ref", "settingsId":"missing", "pathSegments":[other,"Same"],
+                    "pathOrdinals":[1,count+1-index], "instanceIndex":2})
+            };
+            instance.properties.insert("Value".into(), reference);
+            instance.attributes.insert("Ordinal".into(), json!(index));
+            rows.push(instance);
+        }
+        rows.push(settings_instance(
+            "script",
+            "Controller",
+            "ModuleScript",
+            Some(0),
+        ));
+        fs::write(root.join(service).join("Controller.luau"), "return 42\n").unwrap();
+        documents.insert(service.to_string(), settings_document(rows));
+    }
+    let overrides = documents
+        .iter()
+        .map(|(name, doc)| (name.clone(), doc))
+        .collect();
+    let mut expected = None;
+    for workers in [1, 4] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .build()
+            .unwrap();
+        let build = pool
+            .install(|| {
+                crate::rbx::model::build_rbx_place(
+                    &root,
+                    vec!["Workspace".into(), "ServerStorage".into()],
+                    Some(&overrides),
+                    true,
+                    true,
+                    false,
+                )
+            })
+            .unwrap();
+        assert_eq!(build.total_instances, (count + 2) * 2);
+        let roots = build
+            .service_roots
+            .iter()
+            .map(|(_, root)| *root)
+            .collect::<Vec<_>>();
+        for (root_index, root_ref) in roots.iter().enumerate() {
+            let children = build.dom.get_by_ref(*root_ref).unwrap().children();
+            let other = build
+                .dom
+                .get_by_ref(roots[1 - root_index])
+                .unwrap()
+                .children();
+            assert_eq!(children.len(), count + 1);
+            for index in 0..count {
+                let instance = build.dom.get_by_ref(children[index]).unwrap();
+                assert_eq!(
+                    instance.properties.get(&"Value".into()),
+                    Some(&RbxVariant::Ref(other[count - 1 - index]))
+                );
+            }
+            assert_eq!(
+                build.dom.get_by_ref(children[count]).unwrap().properties[&"Source".into()],
+                RbxVariant::String("return 42\n".into())
+            );
+        }
+        let mut bytes = Vec::new();
+        rbx_binary::to_writer(&mut bytes, &build.dom, &roots).unwrap();
+        if let Some(expected) = &expected {
+            assert!(
+                &bytes == expected,
+                "Worker count changed the serialized place"
+            );
+        } else {
+            expected = Some(bytes);
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn prepared_dom_leaves_preserve_values_order_references_and_unique_ids() {
+    use rbx_dom_weak::types::{Ref, UniqueId};
+    let root_id = Ref::new();
+    let first = Ref::new();
+    let second = Ref::new();
+    let unique = UniqueId::now().unwrap();
+    let mut dom = RbxWeakDom::new(
+        RbxInstanceBuilder::new("Folder")
+            .with_referent(root_id)
+            .with_property("UniqueId", unique),
+    );
+    for (id, target) in [(first, second), (second, first)] {
+        let prepared = RbxInstanceBuilder::new("ObjectValue")
+            .with_referent(id)
+            .with_name("Duplicate")
+            .with_property("Value", target)
+            .with_property("UniqueId", unique)
+            .with_property("Archivable", true)
+            .with_property("Archivable", false)
+            .build_leaf(0);
+        dom.insert_leaf(root_id, prepared);
+    }
+    assert_eq!(dom.root().children(), &[first, second]);
+    let ids = [root_id, first, second].map(|id| dom.get_unique_id(id).unwrap());
+    assert_eq!(ids[0], unique);
+    assert_ne!(ids[0], ids[1]);
+    assert_ne!(ids[1], ids[2]);
+    for (id, target) in [(first, second), (second, first)] {
+        let node = dom.get_by_ref(id).unwrap();
+        assert_eq!(node.parent(), root_id);
+        assert_eq!(node.properties[&"Value".into()], RbxVariant::Ref(target));
+        assert_eq!(
+            node.properties[&"Archivable".into()],
+            RbxVariant::Bool(false)
+        );
+    }
+}
+
+#[test]
+fn place_export_prevents_legacy_pivot_migration_without_dropping_primary_part_pivots() {
+    let root = temp_dir("place-pivot-migration");
+    fs::create_dir_all(root.join("Workspace")).unwrap();
+    for explicit_migration in [None, Some(false), Some(true)] {
+        let mut workspace = settings_instance("root", "Workspace", "Workspace", None);
+        if let Some(value) = explicit_migration {
+            workspace
+                .properties
+                .insert("NeedsPivotMigration".into(), json!(value));
+        }
+        let mut model = settings_instance("model", "Car", "Model", Some(0));
+        model.properties.insert(
+            "PrimaryPart".into(),
+            json!({"_type":"Ref","settingsId":"part"}),
+        );
+        model.properties.insert(
+            "WorldPivot".into(),
+            json!({"_type":"CFrame","components":[1,2,3,1,0,0,0,1,0,0,0,1]}),
+        );
+        let part = settings_instance("part", "Primary", "Part", Some(1));
+        settings_document(vec![workspace, model, part])
+            .write_file(&service_settings_path(&root.join("Workspace")))
+            .unwrap();
+        let build = crate::rbx::model::build_rbx_place(
+            &root,
+            vec!["Workspace".into()],
+            None,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        for extension in ["rbxl", "rbxlx"] {
+            let path = root.join(format!("Pivots.{extension}"));
+            let format = crate::rbx::model::RbxPlaceFormat::from_path(&path).unwrap();
+            format
+                .write(&path, &build.dom, &[build.service_roots[0].1])
+                .unwrap();
+            let decoded = format.read(&path).unwrap();
+            let workspace = decoded.get_by_ref(decoded.root().children()[0]).unwrap();
+            assert_eq!(
+                workspace.properties.get(&"NeedsPivotMigration".into()),
+                Some(&RbxVariant::Bool(explicit_migration.unwrap_or(false))),
+                "{extension}"
+            );
+            let model = decoded.get_by_ref(workspace.children()[0]).unwrap();
+            assert_eq!(
+                model.properties.get(&"NeedsPivotMigration".into()),
+                Some(&RbxVariant::Bool(false)),
+                "{extension} must not migrate an already-captured model pivot"
+            );
+            assert!(matches!(
+                model.properties.get(&"PrimaryPart".into()),
+                Some(RbxVariant::Ref(_))
+            ));
+            let Some(RbxVariant::OptionalCFrame(Some(pivot))) =
+                model.properties.get(&"WorldPivotData".into())
+            else {
+                panic!("{extension} dropped the saved model pivot");
+            };
+            assert_eq!(pivot.position, RbxVector3::new(1.0, 2.0, 3.0));
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -3300,6 +3851,46 @@ fn missing_store_lock_error_is_actionable() {
 }
 
 #[test]
+fn targeted_service_root_properties_survive_descendant_only_upsert_selection() {
+    let mut document = settings_document(vec![
+        settings_instance("root", "Lighting", "Lighting", None),
+        settings_instance("child", "Atmosphere", "Atmosphere", Some(0)),
+    ]);
+    document.instances[0]
+        .properties
+        .insert("Brightness".into(), json!(3));
+    document.instances[0]
+        .attributes
+        .insert("Environment".into(), json!("night"));
+    let mut changes = EditorChangeSet::default();
+    crate::editor::diff::append_editor_target_changes(
+        &mut changes,
+        &document,
+        "Lighting",
+        &EditorPropertyFilter {
+            settings_ids: HashSet::from(["root".into()]),
+            property_names: HashSet::new(),
+        },
+        crate::editor::diff::EditorTargetChangeOptions {
+            upsert_instances: true,
+            properties: true,
+            property_scope: crate::editor::diff::EditorPropertyScope::All,
+            property_schema_by_class: &HashMap::new(),
+            database: rbx_reflection_database::get().unwrap(),
+        },
+    );
+    assert!(
+        changes.instance_changes.is_empty(),
+        "engine service must not be recreated"
+    );
+    assert_eq!(changes.property_changes.len(), 1);
+    let root = &changes.property_changes[0];
+    assert_eq!(root.path_segments, ["Lighting"]);
+    assert_eq!(root.properties["Brightness"], 3);
+    assert_eq!(root.attributes["Environment"], "night");
+}
+
+#[test]
 fn bytecode_remove_instance_removes_source_files_and_keeps_service_store() {
     let dir = temp_dir("remove-source-files");
     let service_dir = dir.join("src").join("ReplicatedStorage");
@@ -3393,7 +3984,7 @@ fn empty_full_reconcile_is_not_discarded() {
 }
 
 #[test]
-fn serialized_texture_pack_properties_are_routed_to_offline_writes() {
+fn texture_pack_routing_keeps_verified_setters_in_the_live_transaction() {
     let classes = [
         "Decal",
         "MaterialVariant",
@@ -3424,9 +4015,14 @@ fn serialized_texture_pack_properties_are_routed_to_offline_writes() {
         ..EditorChangeSet::default()
     };
 
-    let rows = take_pre_routed_protected_writes(&mut changes);
+    let original = changes.property_changes.clone();
+    let rows = take_pre_routed_protected_writes(&mut changes, None);
 
-    assert_eq!(rows.len(), classes.len());
+    assert_eq!(rows.len(), classes.len() - 1);
+    assert!(
+        rows.iter()
+            .all(|row| row["className"] != "SurfaceAppearance")
+    );
     assert!(
         rows.iter()
             .all(|row| row.get("name") == Some(&json!("TexturePack")))
@@ -3436,7 +4032,64 @@ fn serialized_texture_pack_properties_are_routed_to_offline_writes() {
         changes
             .property_changes
             .iter()
-            .all(|change| change.properties.len() == 1 && change.properties.contains_key("Marker"))
+            .all(|change| change.properties.contains_key("Marker")
+                && change.properties.contains_key("TexturePack")
+                    == (change.class_name == "SurfaceAppearance"))
+    );
+
+    use crate::editor::types::{EditorBinaryImport, EditorBinaryImportGroup};
+    let mut import = EditorBinaryImport {
+        bytes: Vec::new(),
+        native_replacement: None,
+        instance_count: 0,
+        external_references_post_applied: true,
+        viewport_references_post_applied: false,
+        post_apply_properties_by_class: HashMap::new(),
+        post_apply_properties_by_path: HashMap::new(),
+        groups: vec![EditorBinaryImportGroup {
+            additive: false,
+            service: "Workspace".into(),
+            target_path: vec!["Workspace".into()],
+            count: 0,
+            payload_root_name: "payload".into(),
+            expected_structure: None,
+            root_paths: Vec::new(),
+            viewport_camera: None,
+            retained_roots: Vec::new(),
+            package_roots: Vec::new(),
+            mutation_package_roots: Vec::new(),
+            change_generation: None,
+        }],
+    };
+    changes.property_changes = original.clone();
+    assert!(take_pre_routed_protected_writes(&mut changes, Some(&import)).is_empty());
+    assert!(
+        changes
+            .property_changes
+            .iter()
+            .all(|change| change.properties.contains_key("TexturePack"))
+    );
+    import.post_apply_properties_by_class.insert(
+        "MaterialVariant".into(),
+        HashSet::from(["TexturePack".into()]),
+    );
+    import.post_apply_properties_by_path.insert(
+        crate::bytecode::edit::instance_path_parts_key(
+            &original[0].path_segments,
+            &original[0].path_ordinals,
+        ),
+        HashSet::from(["TexturePack".into()]),
+    );
+    changes.property_changes = original.clone();
+    assert_eq!(
+        take_pre_routed_protected_writes(&mut changes, Some(&import)).len(),
+        2
+    );
+    import.groups[0].service = "ReplicatedStorage".into();
+    changes.property_changes = original;
+    assert_eq!(
+        take_pre_routed_protected_writes(&mut changes, Some(&import)).len(),
+        classes.len() - 1
     );
 }
 
@@ -3490,6 +4143,52 @@ fn protected_place_writes_patch_binary_properties_and_attributes() {
         Some(&RbxVariant::Float64(4.0))
     );
     let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn material_mode_uses_native_transaction_instead_of_place_reopen() {
+    let mut changes = EditorChangeSet {
+        property_changes: vec![EditorPropertyChange {
+            service: "MaterialService".into(),
+            settings_id: None,
+            path_segments: vec!["MaterialService".into()],
+            path_ordinals: vec![1],
+            class_name: "MaterialService".into(),
+            properties: Map::from_iter([("Use2022Materials".into(), json!(true))]),
+            reset_properties: Vec::new(),
+            attributes: Map::new(),
+            deleted_attributes: Vec::new(),
+        }],
+        ..EditorChangeSet::default()
+    };
+    assert!(take_pre_routed_protected_writes(&mut changes, None).is_empty());
+    assert_eq!(
+        changes.property_changes[0].properties["Use2022Materials"],
+        true
+    );
+    changes.property_changes[0].properties.clear();
+    changes.property_changes[0]
+        .reset_properties
+        .push("Use2022Materials".into());
+    crate::editor::native_roots::normalize_resets(&mut changes).unwrap();
+    assert_eq!(
+        changes.property_changes[0].properties["Use2022Materials"],
+        false
+    );
+    assert!(changes.property_changes[0].reset_properties.is_empty());
+    for class in ["Workspace", "StarterPlayer"] {
+        for name in crate::editor::native_roots::capture_properties(class) {
+            let row = &mut changes.property_changes[0];
+            row.service = class.into();
+            row.class_name = class.into();
+            row.path_segments = vec![class.into()];
+            row.properties.clear();
+            row.reset_properties = vec![(*name).into()];
+            crate::editor::native_roots::normalize_resets(&mut changes).unwrap();
+            assert!(take_pre_routed_protected_writes(&mut changes, None).is_empty());
+            assert!(changes.property_changes[0].properties.contains_key(*name));
+        }
+    }
 }
 
 #[test]
@@ -3704,6 +4403,11 @@ fn game_settings_properties_are_not_sent_or_patched() {
 #[test]
 fn protected_review_only_keeps_user_facing_properties() {
     let database = rbx_reflection_database::get().unwrap();
+    assert!(!is_engine_managed_editor_property(
+        "Terrain",
+        "MaterialColors",
+        database
+    ));
     assert!(!is_engine_managed_editor_property(
         "MaterialVariant",
         "TexturePack",

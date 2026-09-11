@@ -7,7 +7,6 @@ import { type GitViewActions } from "./gitView";
 import { ROBLOX_CLASS_NAMES } from "./robloxClasses";
 import { invalidateProjectSourceGraph, loadProjectSourceGraph } from "./sharedConfig";
 import {
-  SETTINGS_FILE_NAME,
   ensureModelFileExtension,
   isReniumSettingsFileName,
   isScriptClass,
@@ -271,7 +270,7 @@ export class FileExplorerController implements vscode.Disposable {
     const graph = loadProjectSourceGraph(config.projectRoot);
     const directories = Array.from(new Set(graph.directories.map(path.normalize)));
     const watcherPatterns = directories.flatMap((root) =>
-      [SETTINGS_FILE_NAME, `**/${SETTINGS_FILE_NAME}`].map((pattern) => ({ root, pattern })));
+      ["*.renium", "**/*.renium"].map((pattern) => ({ root, pattern })));
     for (const filePath of graph.files) {
       if (isReniumSettingsFileName(path.basename(filePath))) {
         watcherPatterns.push({ root: path.dirname(filePath), pattern: path.basename(filePath) });

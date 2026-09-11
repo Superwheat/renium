@@ -131,11 +131,19 @@ pub(crate) fn log_global(level: u8, message: std::fmt::Arguments<'_>) {
 }
 
 pub(crate) fn write_stdout(message: fmt::Arguments<'_>) {
-    let _ = writeln!(io::stdout().lock(), "{message}");
+    let _ = write_output_line(io::stdout().lock(), message);
 }
 
 pub(crate) fn write_stderr(message: fmt::Arguments<'_>) {
-    let _ = writeln!(io::stderr().lock(), "{message}");
+    let _ = write_output_line(io::stderr().lock(), message);
+}
+
+fn write_output_line(mut writer: impl Write, message: fmt::Arguments<'_>) -> io::Result<()> {
+    // Display implementations such as serde_json::Value emit many fragments.
+    // Buffer the complete line so unbuffered stderr does not write each one.
+    let mut line = fmt::format(message);
+    line.push('\n');
+    writer.write_all(line.as_bytes())
 }
 
 pub(crate) fn global_yes() -> bool {
@@ -239,4 +247,39 @@ pub(crate) fn automation_token(prefix: &str) -> String {
         current_millis(),
         sequence
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_log_line_is_one_write_and_preserves_output() {
+        #[derive(Default)]
+        struct Writer {
+            bytes: Vec<u8>,
+            writes: usize,
+        }
+        impl Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.writes += 1;
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let value = serde_json::json!({"groups": (0..100).map(|index| {
+            serde_json::json!({"name": format!("service {index}"), "ms": 0.25})
+        }).collect::<Vec<_>>()});
+        let mut writer = Writer::default();
+        write_output_line(&mut writer, format_args!("[renium] profile {value}")).unwrap();
+        assert_eq!(writer.writes, 1);
+        assert_eq!(
+            writer.bytes,
+            format!("[renium] profile {value}\n").as_bytes()
+        );
+    }
 }

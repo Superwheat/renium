@@ -6,7 +6,7 @@ use std::path::Path;
 
 pub(super) fn create(name: &str, path: Option<&Path>) -> Result<Value> {
     let manifest = json!({
-        "schemaVersion":1,"name":name,"version":"0.1.0","description":"A Renium workflow plugin",
+        "schemaVersion":1,"name":name,"version":"0.1.0","description":"A Renium plugin",
         "executable":{"windows":[format!("target/release/{name}.exe")],"macos":[format!("target/release/{name}")],"linux":[format!("target/release/{name}")]},
         "permissions":[],"guide":"AGENTS.md",
         "commands":{"hello":{"description":"Say hello without opening Studio","arguments":[{"name":"name","type":"string","description":"Who to greet","default":"World"}]}}
@@ -22,7 +22,7 @@ pub(super) fn create(name: &str, path: Option<&Path>) -> Result<Value> {
         ("Cargo.toml", format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\nrust-version = \"1.89\"\n\n[workspace]\n\n[dependencies]\nrenium-plugin-sdk = {{ path = \"sdk\" }}\n")),
         ("src/main.rs", "use renium_plugin_sdk::{json, serve};\n\nfn main() -> std::process::ExitCode {\n    serve(|request| {\n        Ok(json!({\"message\": format!(\"Hello, {}!\", request.arguments[\"name\"].as_str().unwrap_or(\"World\"))}))\n    })\n}\n".into()),
         ("AGENTS.md", format!("# {name}\n\nUse `rbx {name} hello --name World` to greet someone. This command is offline and does not need Studio or Play. Read `rbx {name} --help` for commands.\n")),
-        ("README.md", format!("# {name}\n\n1. Edit `renium-plugin.json` to define commands, arguments and permissions.\n2. Implement the handler in `src/main.rs`; use the included SDK to call Renium.\n3. Run `cargo build --release`.\n4. Run `rbx plugin install . --dev` while developing; omit `--dev` for a pinned install.\n5. Run `rbx {name} hello --name World`.\n\nNo Renium source edits or global SDK installation are needed. Keep stdout for the JSON protocol and diagnostics on stderr. Plugins are trusted native programs, not security sandboxes. The `studio` permission is disclosure, not permission to interrupt a user's session.\n")),
+        ("README.md", format!("# {name}\n\n1. Edit `renium-plugin.json` to define commands, arguments, permissions and per-command `timeoutSeconds`.\n2. Implement the handler in `src/main.rs`; use the included SDK to call Renium.\n3. Run `cargo build --release`.\n4. Run `rbx plugin install . --dev` while developing; omit `--dev` for a pinned install.\n5. Run `rbx {name} hello --name World`.\n\nNo Renium source edits or global SDK installation are needed. Keep stdout for the JSON protocol and diagnostics on stderr. Plugins are trusted native programs, not security sandboxes. The `studio` permission is disclosure, not permission to interrupt a user's session.\n")),
         (".gitignore", "/target/\n/sdk/target/\n".into()),
         ("sdk/Cargo.toml", include_str!("../../../renium-plugin-sdk/Cargo.toml").replace("../../LICENSE", "LICENSE")),
         ("sdk/LICENSE", include_str!("../../../../LICENSE").into()),

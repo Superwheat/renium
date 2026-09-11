@@ -470,7 +470,11 @@
             "StarterPlayer",
             "Teams",
             "SoundService",
-            "VoiceChatService"
+            "VoiceChatService",
+            "TextChatService",
+            "TestService",
+            "LocalizationService",
+            "VRService"
           ],
           "description": "Services included when pulling from Studio"
         },

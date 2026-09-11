@@ -119,7 +119,7 @@ export function pickWorkspaceRoot(): string | undefined {
 }
 
 export function isReniumSettingsFileName(fileName: string): boolean {
-  return fileName.toLowerCase() === SETTINGS_FILE_NAME;
+  return fileName.toLowerCase().endsWith(".renium");
 }
 
 export function safeFileComponent(value: unknown): string {

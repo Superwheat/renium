@@ -74,6 +74,7 @@ pub struct FlatDom {
 pub struct Deserializer<'db> {
     database: &'db ReflectionDatabase<'db>,
     elide_defaults: bool,
+    retain_defaults_for_classes: HashSet<String>,
     flat_property_filter: Option<Arc<HashMap<String, HashSet<String>>>>,
 }
 
@@ -83,6 +84,7 @@ impl<'db> Deserializer<'db> {
         Self {
             database: rbx_reflection_database::get().unwrap(),
             elide_defaults: false,
+            retain_defaults_for_classes: HashSet::new(),
             flat_property_filter: None,
         }
     }
@@ -98,6 +100,14 @@ impl<'db> Deserializer<'db> {
     #[allow(missing_docs)]
     pub fn elide_defaults(mut self, enabled: bool) -> Self {
         self.elide_defaults = enabled;
+        self
+    }
+
+    /// Keep explicitly serialized values for these classes, even when they
+    /// equal reflection defaults. This preserves evidence of field presence
+    /// without expanding defaults for the rest of a large snapshot.
+    pub fn retain_defaults_for_classes(mut self, classes: HashSet<String>) -> Self {
+        self.retain_defaults_for_classes = classes;
         self
     }
 

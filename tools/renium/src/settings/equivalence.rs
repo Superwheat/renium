@@ -17,6 +17,7 @@ use super::bytecode::{
     encode_settings_bytecode_with_dense_references, is_known_default_property_value,
     is_reference_object,
 };
+use crate::app::output::log_global;
 use crate::app::timing::{log_timing, verbose_timing_logs};
 use crate::rbx::decode::rbx_variant_to_settings_json;
 use crate::rbx::encode::{rbx_logical_property_name, rbx_model_property_descriptor};
@@ -123,7 +124,8 @@ pub(crate) fn align_settings_bytes_to_reference(
     let mut observed = observed?;
     log_timing("settings alignment decode", decode_started);
     let positional_started = Instant::now();
-    let positionally_equivalent = settings_documents_positionally_equivalent(&reference, &observed);
+    let positionally_equivalent = settings_topology_matches(&reference, &observed)
+        && positional_values_equivalent(&reference, &observed, None, false);
     log_timing(
         "settings alignment positional comparison",
         positional_started,
@@ -168,7 +170,7 @@ pub(crate) fn align_settings_bytes_to_reference(
     canonicalize_settings_property_names(&mut observed)?;
     log_timing("settings alignment canonicalize", canonicalize_started);
     let compare_started = Instant::now();
-    let result = if settings_documents_equivalent(&reference, &observed) {
+    let result = if settings_documents_match(&reference, &observed, false) {
         if let Some(key) = cache_key {
             cache_settings_alignment(key);
         }
@@ -280,23 +282,21 @@ fn build_reference_graph(document: &SettingsBytecode) -> ReferenceGraph {
         .enumerate()
         .map(|(index, instance)| (instance.settings_id.as_str(), index))
         .collect::<HashMap<_, _>>();
-    let mut outgoing = (0..document.instances.len())
-        .map(|_| Vec::new())
-        .collect::<Vec<_>>();
-    for (source, instance) in document.instances.iter().enumerate() {
-        collect_map_references(
-            &instance.properties,
-            "properties",
-            &by_id,
-            &mut outgoing[source],
-        );
-        collect_map_references(
-            &instance.attributes,
-            "attributes",
-            &by_id,
-            &mut outgoing[source],
-        );
-    }
+    let collect = |instance: &SettingsBytecodeInstance| {
+        let mut edges = Vec::new();
+        collect_map_references(&instance.properties, "properties", &by_id, &mut edges);
+        collect_map_references(&instance.attributes, "attributes", &by_id, &mut edges);
+        edges
+    };
+    let outgoing = if document.instances.len() >= 2_048 {
+        document
+            .instances
+            .par_iter()
+            .map(collect)
+            .collect::<Vec<_>>()
+    } else {
+        document.instances.iter().map(collect).collect::<Vec<_>>()
+    };
     let mut incoming = (0..document.instances.len())
         .map(|_| Vec::new())
         .collect::<Vec<_>>();
@@ -512,29 +512,87 @@ struct IdentitySubtreeKey<'a> {
     children: Vec<usize>,
 }
 
+#[derive(Hash, PartialEq, Eq)]
+struct IdentityCandidateKey<'a> {
+    properties: Vec<(&'a String, &'a Value)>,
+    attributes: Vec<(&'a String, &'a Value)>,
+    subtree: usize,
+    reference_identity: Option<usize>,
+}
+
+// Collapse only candidates that receive exactly the same identity_score for every
+// observed instance. Multiplicity still makes a winning bucket ambiguous; this
+// does not choose an identity by content hash or skip reference evidence.
+fn identity_candidate_representatives(
+    document: &SettingsBytecode,
+    graph: &ReferenceGraph,
+    subtree_keys: Option<&[usize]>,
+    candidates: &[usize],
+) -> (Vec<usize>, AHashMap<usize, usize>) {
+    let mut groups = AHashMap::new();
+    let mut representatives = Vec::new();
+    let mut multiplicities = AHashMap::new();
+    for &candidate in candidates {
+        let instance = &document.instances[candidate];
+        let key = IdentityCandidateKey {
+            properties: instance.properties.iter().collect(),
+            attributes: instance.attributes.iter().collect(),
+            subtree: subtree_keys.map_or(0, |keys| keys[candidate]),
+            reference_identity: (!graph.outgoing[candidate].is_empty()
+                || !graph.incoming[candidate].is_empty())
+            .then_some(candidate),
+        };
+        let representative = *groups.entry(key).or_insert_with(|| {
+            representatives.push(candidate);
+            candidate
+        });
+        *multiplicities.entry(representative).or_default() += 1;
+    }
+    (representatives, multiplicities)
+}
+
 // Intern exact content, not hashes used as identity. Children are an unordered multiset;
 // references remain separate, stronger evidence in identity_score. A non-match here
 // never excludes a candidate (float rounding or an actual edit may change its key).
 fn identity_subtree_keys<'a>(
     document: &'a SettingsBytecode,
     keys: &mut AHashMap<IdentitySubtreeKey<'a>, usize>,
+    mut required: Vec<bool>,
 ) -> Vec<usize> {
-    let mut remaining = vec![0; document.instances.len()];
-    for instance in &document.instances {
+    let mut children = vec![Vec::new(); document.instances.len()];
+    for (index, instance) in document.instances.iter().enumerate() {
         if let Some(parent) = instance.parent_index {
-            remaining[parent] += 1;
+            children[parent].push(index);
         }
     }
+    // Already-assigned instances cannot be candidates. Only hash unresolved
+    // subtrees, including every descendant needed to distinguish their roots.
+    let mut pending = required
+        .iter()
+        .enumerate()
+        .filter_map(|(index, needed)| needed.then_some(index))
+        .collect::<Vec<_>>();
+    while let Some(index) = pending.pop() {
+        for &child in &children[index] {
+            if !required[child] {
+                required[child] = true;
+                pending.push(child);
+            }
+        }
+    }
+    let mut remaining = children.iter().map(Vec::len).collect::<Vec<_>>();
     let mut ready = remaining
         .iter()
         .enumerate()
-        .filter_map(|(index, count)| (*count == 0).then_some(index))
+        .filter_map(|(index, count)| (*count == 0 && required[index]).then_some(index))
         .collect::<Vec<_>>();
-    let mut children = vec![Vec::new(); document.instances.len()];
     let mut result = vec![0; document.instances.len()];
     while let Some(index) = ready.pop() {
         let instance = &document.instances[index];
         let mut child_keys = std::mem::take(&mut children[index]);
+        for child in &mut child_keys {
+            *child = result[*child];
+        }
         child_keys.sort_unstable();
         let stable = |values: &'a Map<String, Value>, properties| {
             values
@@ -553,8 +611,7 @@ fn identity_subtree_keys<'a>(
         let next = keys.len() + 1;
         let id = *keys.entry(key).or_insert(next);
         result[index] = id;
-        if let Some(parent) = instance.parent_index {
-            children[parent].push(id);
+        if let Some(parent) = instance.parent_index.filter(|parent| required[*parent]) {
             remaining[parent] -= 1;
             if remaining[parent] == 0 {
                 ready.push(parent);
@@ -616,7 +673,10 @@ pub(crate) fn align_settings_ids_to_reference(
     reference: &SettingsBytecode,
     observed: &mut SettingsBytecode,
 ) -> bool {
-    align_settings_ids_to_reference_impl(reference, observed)
+    let started = Instant::now();
+    let aligned = align_settings_ids_to_reference_impl(reference, observed);
+    log_timing("settings identity alignment", started);
+    aligned
 }
 
 fn settings_topology_matches(reference: &SettingsBytecode, observed: &SettingsBytecode) -> bool {
@@ -632,10 +692,57 @@ fn settings_topology_matches(reference: &SettingsBytecode, observed: &SettingsBy
             })
 }
 
+fn persistent_identity(instance: &SettingsBytecodeInstance) -> Option<&str> {
+    let value = instance.properties.get("UniqueId")?.as_object()?;
+    if value.get("_type")?.as_str()? != "UniqueId" {
+        return None;
+    }
+    let id = value.get("value")?.as_str()?;
+    (id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()) && id.bytes().any(|b| b != b'0'))
+        .then_some(id)
+}
+
+fn persistent_identity_index(document: &SettingsBytecode) -> AHashMap<&str, Option<usize>> {
+    let mut result = AHashMap::new();
+    for (index, instance) in document.instances.iter().enumerate() {
+        if let Some(id) = persistent_identity(instance) {
+            result
+                .entry(id)
+                .and_modify(|value| *value = None)
+                .or_insert(Some(index));
+        }
+    }
+    result
+}
+
+fn persistent_identities_follow_mapping(
+    reference: &SettingsBytecode,
+    observed: &SettingsBytecode,
+    reference_position: impl Fn(usize) -> Option<usize>,
+) -> bool {
+    let reference_ids = persistent_identity_index(reference);
+    if reference_ids.is_empty() {
+        return true;
+    }
+    let observed_ids = persistent_identity_index(observed);
+    observed_ids.iter().all(|(id, observed_index)| {
+        let (Some(reference_index), Some(observed_index)) =
+            (reference_ids.get(id).copied().flatten(), *observed_index)
+        else {
+            return true;
+        };
+        reference_position(observed_index) == Some(reference_index)
+            || is_reconciliation_protected_workspace_camera(reference, reference_index)
+                && is_reconciliation_protected_workspace_camera(observed, observed_index)
+    })
+}
+
 struct ExactIdentityPass<'a> {
     reference: &'a SettingsBytecode,
     observed: &'a SettingsBytecode,
     reference_by_id: &'a HashMap<&'a str, usize>,
+    reference_by_unique_id: &'a AHashMap<&'a str, Option<usize>>,
+    observed_by_unique_id: &'a AHashMap<&'a str, Option<usize>>,
     assigned_ids: &'a mut [Option<String>],
     assigned_reference: &'a mut [Option<usize>],
     assigned_observed: &'a mut [Option<usize>],
@@ -651,13 +758,24 @@ impl ExactIdentityPass<'_> {
             if self.assigned_ids[index].is_some() {
                 continue;
             }
-            let Some(candidate) = self
-                .reference_by_id
-                .get(instance.settings_id.as_str())
-                .copied()
+            let persistent = persistent_identity(instance)
+                .filter(|id| self.observed_by_unique_id.get(id) == Some(&Some(index)))
+                .and_then(|id| self.reference_by_unique_id.get(id).copied().flatten())
                 .filter(|candidate| {
-                    !instance.settings_id.starts_with("debug:")
-                        && !self.used_reference[*candidate]
+                    self.reference.instances[*candidate].class_name == instance.class_name
+                });
+            let Some(candidate) = persistent
+                .or_else(|| {
+                    (!instance.settings_id.starts_with("debug:"))
+                        .then(|| {
+                            self.reference_by_id
+                                .get(instance.settings_id.as_str())
+                                .copied()
+                        })
+                        .flatten()
+                })
+                .filter(|candidate| {
+                    !self.used_reference[*candidate]
                         && !self
                             .used_ids
                             .contains(&self.reference.instances[*candidate].settings_id)
@@ -675,6 +793,60 @@ impl ExactIdentityPass<'_> {
             progressed = true;
         }
         progressed
+    }
+
+    fn run_unique(&mut self, reference_groups: &HashMap<(Option<usize>, &str, &str), Vec<usize>>) {
+        let mut observed_counts = AHashMap::with_capacity(self.observed.instances.len());
+        for instance in &self.observed.instances {
+            *observed_counts
+                .entry((
+                    instance.parent_index,
+                    instance.name.as_str(),
+                    instance.class_name.as_str(),
+                ))
+                .or_insert(0usize) += 1;
+        }
+        // Resolve parent-before-child singleton groups in one pass. The scored
+        // path makes the same decision, but builds a Vec for every unique child
+        // and revisits the entire document at each depth after a reorder.
+        for (index, instance) in self.observed.instances.iter().enumerate() {
+            if self.assigned_ids[index].is_some()
+                || observed_counts[&(
+                    instance.parent_index,
+                    instance.name.as_str(),
+                    instance.class_name.as_str(),
+                )] != 1
+            {
+                continue;
+            }
+            let parent = match instance.parent_index {
+                Some(parent) => match self.assigned_reference.get(parent).copied().flatten() {
+                    Some(parent) => Some(parent),
+                    None => continue,
+                },
+                None => None,
+            };
+            let Some(candidates) = reference_groups.get(&(
+                parent,
+                instance.name.as_str(),
+                instance.class_name.as_str(),
+            )) else {
+                continue;
+            };
+            let [candidate] = candidates.as_slice() else {
+                continue;
+            };
+            if self.used_reference[*candidate] {
+                continue;
+            }
+            let id = self.reference.instances[*candidate].settings_id.clone();
+            self.used_reference[*candidate] = true;
+            self.used_ids.insert(id.clone());
+            self.assigned_reference[index] = Some(*candidate);
+            self.assigned_observed[*candidate] = Some(index);
+            self.assigned_ids[index] = Some(id);
+            *self.remaining -= 1;
+        }
     }
 }
 
@@ -730,6 +902,7 @@ struct ScoredIdentityPass<'a> {
     used_ids: &'a mut HashSet<String>,
     generated: &'a mut usize,
     remaining: &'a mut usize,
+    unchanged_content_groups: &'a mut HashMap<usize, (Vec<usize>, Vec<usize>)>,
 }
 
 struct IdentityNumberField {
@@ -897,6 +1070,8 @@ impl ScoredIdentityPass<'_> {
 
         let mut progressed = false;
         for (key, observed_group) in observed_groups {
+            let group_started = Instant::now();
+            let observed_count = observed_group.len();
             let candidates = self
                 .reference_groups
                 .get(&key)
@@ -925,6 +1100,15 @@ impl ScoredIdentityPass<'_> {
                 continue;
             }
 
+            let group_index = observed_group[0];
+            if self.unchanged_content_groups.get(&group_index).is_some_and(
+                |(previous_observed, previous_candidates)| {
+                    previous_observed == &observed_group && previous_candidates == &candidates
+                },
+            ) {
+                continue;
+            }
+
             let score_context = IdentityScoreContext {
                 reference: self.reference,
                 observed: self.observed,
@@ -936,38 +1120,22 @@ impl ScoredIdentityPass<'_> {
             };
             let mut proposals = Vec::with_capacity(observed_group.len());
             let mut proposal_counts = HashMap::<usize, usize>::new();
-            // Identical unreferenced candidates all receive the same score. Preserve the
-            // existing tie/fallback decision without evaluating every identical pair.
-            let representative = &self.reference.instances[candidates[0]];
-            let uniform = candidates.iter().all(|candidate| {
-                self.reference_graph.outgoing[*candidate].is_empty()
-                    && self.reference_graph.incoming[*candidate].is_empty()
-                    && self.reference.instances[*candidate].properties == representative.properties
-                    && self.reference.instances[*candidate].attributes == representative.attributes
-            });
-            let mut uniform_subtrees = AHashMap::<usize, Vec<usize>>::new();
-            if uniform && let Some((reference, _)) = self.subtree_keys {
-                for candidate in &candidates {
-                    uniform_subtrees
-                        .entry(reference[*candidate])
-                        .or_default()
-                        .push(*candidate);
-                }
-            }
-            let content_index = if !uniform
+            let (representatives, multiplicities) = identity_candidate_representatives(
+                self.reference,
+                self.reference_graph,
+                self.subtree_keys.map(|(reference, _)| reference.as_slice()),
+                &candidates,
+            );
+            let content_index = if representatives.len() > 1
                 && observed_group.iter().any(|index| {
                     self.observed_graph.outgoing[*index].is_empty()
                         && self.observed_graph.incoming[*index].is_empty()
                 }) {
-                IdentityCandidateIndex::build(self.reference, &candidates)
+                IdentityCandidateIndex::build(self.reference, &representatives)
             } else {
                 None
             };
-            for index in observed_group {
-                let candidates = self
-                    .subtree_keys
-                    .and_then(|(_, observed)| uniform_subtrees.get(&observed[index]))
-                    .map_or(candidates.as_slice(), Vec::as_slice);
+            for &index in &observed_group {
                 let mut best = None;
                 let mut best_candidate = None;
                 let mut tied = false;
@@ -978,14 +1146,10 @@ impl ScoredIdentityPass<'_> {
                             && self.observed_graph.incoming[index].is_empty()
                     })
                     .and_then(|lookup| lookup.matching(&self.observed.instances[index]));
-                let count = if uniform {
-                    1
-                } else {
-                    narrowed.map_or(candidates.len(), <[_]>::len)
-                };
+                let count = narrowed.map_or(representatives.len(), <[_]>::len);
                 for offset in 0..count {
                     let candidate =
-                        narrowed.map_or_else(|| candidates[offset], |values| values[offset].1);
+                        narrowed.map_or_else(|| representatives[offset], |values| values[offset].1);
                     let Some(score) = identity_score(&score_context, candidate, index) else {
                         continue;
                     };
@@ -993,29 +1157,59 @@ impl ScoredIdentityPass<'_> {
                         None => {
                             best = Some(score);
                             best_candidate = Some(candidate);
-                            tied = false;
+                            tied = multiplicities[&candidate] > 1;
                         }
                         Some(current) if score > current => {
                             best = Some(score);
                             best_candidate = Some(candidate);
-                            tied = false;
+                            tied = multiplicities[&candidate] > 1;
                         }
                         Some(current) if score == current => tied = true,
                         _ => {}
                     }
                 }
-                tied |= uniform && candidates.len() > 1;
                 if !tied && let Some(candidate) = best_candidate {
                     proposals.push((index, candidate));
                     *proposal_counts.entry(candidate).or_default() += 1;
                 }
             }
+            let mut assigned = false;
             for (index, candidate) in proposals {
                 if proposal_counts.get(&candidate) != Some(&1) || self.used_reference[candidate] {
                     continue;
                 }
                 self.assign_reference(index, candidate);
                 progressed = true;
+                assigned = true;
+            }
+            if group_started.elapsed().as_millis() >= 10 {
+                log_global(
+                    4,
+                    format_args!(
+                        "[renium] identity candidate group: parent={:?} name={:?} class={} observed={observed_count} candidates={} elapsed_ms={:.1}",
+                        key.0,
+                        key.1,
+                        key.2,
+                        candidates.len(),
+                        group_started.elapsed().as_secs_f64() * 1000.0,
+                    ),
+                );
+            }
+            // No score can change without different group membership when
+            // neither side has reference edges. Leave ties for the existing
+            // fallback pass instead of rescoring them at every hierarchy depth.
+            if !assigned
+                && observed_group.iter().all(|index| {
+                    self.observed_graph.outgoing[*index].is_empty()
+                        && self.observed_graph.incoming[*index].is_empty()
+                })
+                && candidates.iter().all(|index| {
+                    self.reference_graph.outgoing[*index].is_empty()
+                        && self.reference_graph.incoming[*index].is_empty()
+                })
+            {
+                self.unchanged_content_groups
+                    .insert(group_index, (observed_group, candidates));
             }
         }
         progressed
@@ -1105,20 +1299,57 @@ fn align_settings_ids_to_reference_impl(
     reference: &SettingsBytecode,
     observed: &mut SettingsBytecode,
 ) -> bool {
-    let positional_topology_matches = settings_topology_matches(reference, observed);
+    let preparation_started = Instant::now();
+    let cameras = (
+        workspace_current_camera_index(reference),
+        workspace_current_camera_index(observed),
+    );
+    let camera_positions_match = match cameras {
+        (Some(reference), Some(observed)) => reference == observed,
+        _ => true,
+    };
+    let positional_topology_matches =
+        camera_positions_match && settings_topology_matches(reference, observed);
     if positional_topology_matches && positional_identity_preserved(reference, observed) {
         remap_positional_ids(reference, observed);
         return true;
     }
 
+    // A fresh destination has only its retained containers. Index candidates
+    // it can actually match rather than allocating a group for every incoming
+    // descendant. Full comparisons keep the direct index construction.
+    let candidate_filters = (observed.instances.len() < reference.instances.len() / 4).then(|| {
+        (
+            observed
+                .instances
+                .iter()
+                .map(|instance| instance.settings_id.as_str())
+                .collect::<HashSet<_>>(),
+            observed
+                .instances
+                .iter()
+                .map(|instance| (instance.name.as_str(), instance.class_name.as_str()))
+                .collect::<HashSet<_>>(),
+        )
+    });
     let reference_by_id = reference
         .instances
         .iter()
         .enumerate()
+        .filter(|(_, instance)| {
+            candidate_filters
+                .as_ref()
+                .is_none_or(|(ids, _)| ids.contains(instance.settings_id.as_str()))
+        })
         .map(|(index, instance)| (instance.settings_id.as_str(), index))
         .collect::<HashMap<_, _>>();
     let mut reference_groups = HashMap::<(Option<usize>, &str, &str), Vec<usize>>::new();
     for (index, instance) in reference.instances.iter().enumerate() {
+        if candidate_filters.as_ref().is_some_and(|(_, names)| {
+            !names.contains(&(instance.name.as_str(), instance.class_name.as_str()))
+        }) {
+            continue;
+        }
         reference_groups
             .entry((
                 instance.parent_index,
@@ -1133,17 +1364,6 @@ fn align_settings_ids_to_reference_impl(
         .iter()
         .map(|instance| instance.settings_id.clone())
         .collect::<Vec<_>>();
-    let mut blocked_ids = observed
-        .instances
-        .iter()
-        .map(|instance| instance.settings_id.clone())
-        .collect::<HashSet<_>>();
-    let reserved_reference_ids = reference
-        .instances
-        .iter()
-        .map(|instance| instance.settings_id.clone())
-        .collect::<HashSet<_>>();
-    blocked_ids.extend(reserved_reference_ids.iter().cloned());
     let mut assigned_ids = vec![None; observed.instances.len()];
     let mut assigned_reference = vec![None; observed.instances.len()];
     let mut assigned_observed = vec![None; reference.instances.len()];
@@ -1151,81 +1371,166 @@ fn align_settings_ids_to_reference_impl(
     let mut used_ids = HashSet::new();
     let mut generated = 0usize;
 
-    let reference_graph = build_reference_graph(reference);
-    let observed_graph = build_reference_graph(observed);
-    let parents = reference
-        .instances
-        .iter()
-        .filter_map(|instance| instance.parent_index)
-        .collect::<AHashSet<_>>();
-    let subtree_keys = reference_groups
-        .values()
-        .any(|group| group.len() > 1 && group.iter().any(|index| parents.contains(index)))
-        .then(|| {
-            let mut keys = AHashMap::new();
-            (
-                identity_subtree_keys(reference, &mut keys),
-                identity_subtree_keys(observed, &mut keys),
-            )
-        });
     let mut remaining = assigned_ids.len();
-    while remaining > 0 {
-        let mut progressed = ExactIdentityPass {
-            reference,
-            observed,
-            reference_by_id: &reference_by_id,
-            assigned_ids: &mut assigned_ids,
-            assigned_reference: &mut assigned_reference,
-            assigned_observed: &mut assigned_observed,
-            used_reference: &mut used_reference,
-            used_ids: &mut used_ids,
-            remaining: &mut remaining,
-        }
-        .run();
-
-        progressed |= ScoredIdentityPass {
-            reference,
-            observed,
-            reference_groups: &reference_groups,
-            reference_graph: &reference_graph,
-            observed_graph: &observed_graph,
-            subtree_keys: subtree_keys.as_ref(),
-            old_ids: &old_ids,
-            reserved_reference_ids: &reserved_reference_ids,
-            blocked_ids: &mut blocked_ids,
-            assigned_ids: &mut assigned_ids,
-            assigned_reference: &mut assigned_reference,
-            assigned_observed: &mut assigned_observed,
-            used_reference: &mut used_reference,
-            used_ids: &mut used_ids,
-            generated: &mut generated,
-            remaining: &mut remaining,
-        }
-        .run();
-        if progressed {
-            continue;
-        }
-        progressed = FallbackIdentityPass {
-            reference,
-            observed,
-            reference_groups: &reference_groups,
-            old_ids: &old_ids,
-            reserved_reference_ids: &reserved_reference_ids,
-            blocked_ids: &mut blocked_ids,
-            assigned_ids: &mut assigned_ids,
-            assigned_reference: &mut assigned_reference,
-            assigned_observed: &mut assigned_observed,
-            used_reference: &mut used_reference,
-            used_ids: &mut used_ids,
-            generated: &mut generated,
-            remaining: &mut remaining,
-        }
-        .run();
-        if progressed {
-            continue;
-        }
-        return false;
+    let reference_by_unique_id = persistent_identity_index(reference);
+    let observed_by_unique_id = persistent_identity_index(observed);
+    if let (Some(reference_index), Some(observed_index)) = cameras {
+        let id = reference.instances[reference_index].settings_id.clone();
+        used_reference[reference_index] = true;
+        used_ids.insert(id.clone());
+        assigned_reference[observed_index] = Some(reference_index);
+        assigned_observed[reference_index] = Some(observed_index);
+        assigned_ids[observed_index] = Some(id);
+        remaining -= 1;
     }
+    let mut exact = ExactIdentityPass {
+        reference,
+        observed,
+        reference_by_id: &reference_by_id,
+        reference_by_unique_id: &reference_by_unique_id,
+        observed_by_unique_id: &observed_by_unique_id,
+        assigned_ids: &mut assigned_ids,
+        assigned_reference: &mut assigned_reference,
+        assigned_observed: &mut assigned_observed,
+        used_reference: &mut used_reference,
+        used_ids: &mut used_ids,
+        remaining: &mut remaining,
+    };
+    exact.run();
+    exact.run_unique(&reference_groups);
+    log_global(
+        4,
+        format_args!(
+            "[renium] identity preparation: {:.1}ms remaining={remaining}",
+            preparation_started.elapsed().as_secs_f64() * 1000.0
+        ),
+    );
+
+    if remaining > 0 {
+        // Collision sets are needed only when matching must synthesize IDs.
+        // An empty destination normally resolves all retained roots directly;
+        // don't clone every incoming ID twice for that completed mapping.
+        let reserved_reference_ids = reference
+            .instances
+            .iter()
+            .map(|instance| instance.settings_id.clone())
+            .collect::<HashSet<_>>();
+        let mut blocked_ids = reserved_reference_ids.clone();
+        blocked_ids.extend(old_ids.iter().cloned());
+        let phase = Instant::now();
+        let (reference_graph, observed_graph) = rayon::join(
+            || build_reference_graph(reference),
+            || build_reference_graph(observed),
+        );
+        log_global(
+            4,
+            format_args!(
+                "[renium] identity reference graphs: {:.1}ms",
+                phase.elapsed().as_secs_f64() * 1000.0
+            ),
+        );
+        let phase = Instant::now();
+        let parents = reference
+            .instances
+            .iter()
+            .filter_map(|instance| instance.parent_index)
+            .collect::<AHashSet<_>>();
+        let subtree_keys = reference_groups
+            .values()
+            .any(|group| group.len() > 1 && group.iter().any(|index| parents.contains(index)))
+            .then(|| {
+                let mut keys = AHashMap::new();
+                (
+                    identity_subtree_keys(
+                        reference,
+                        &mut keys,
+                        used_reference.iter().map(|used| !used).collect(),
+                    ),
+                    identity_subtree_keys(
+                        observed,
+                        &mut keys,
+                        assigned_ids.iter().map(Option::is_none).collect(),
+                    ),
+                )
+            });
+        log_global(
+            4,
+            format_args!(
+                "[renium] identity subtree keys: {:.1}ms",
+                phase.elapsed().as_secs_f64() * 1000.0
+            ),
+        );
+        let phase = Instant::now();
+        let mut unchanged_content_groups = HashMap::new();
+        while remaining > 0 {
+            let mut progressed = ExactIdentityPass {
+                reference,
+                observed,
+                reference_by_id: &reference_by_id,
+                reference_by_unique_id: &reference_by_unique_id,
+                observed_by_unique_id: &observed_by_unique_id,
+                assigned_ids: &mut assigned_ids,
+                assigned_reference: &mut assigned_reference,
+                assigned_observed: &mut assigned_observed,
+                used_reference: &mut used_reference,
+                used_ids: &mut used_ids,
+                remaining: &mut remaining,
+            }
+            .run();
+
+            progressed |= ScoredIdentityPass {
+                reference,
+                observed,
+                reference_groups: &reference_groups,
+                reference_graph: &reference_graph,
+                observed_graph: &observed_graph,
+                subtree_keys: subtree_keys.as_ref(),
+                old_ids: &old_ids,
+                reserved_reference_ids: &reserved_reference_ids,
+                blocked_ids: &mut blocked_ids,
+                assigned_ids: &mut assigned_ids,
+                assigned_reference: &mut assigned_reference,
+                assigned_observed: &mut assigned_observed,
+                used_reference: &mut used_reference,
+                used_ids: &mut used_ids,
+                generated: &mut generated,
+                remaining: &mut remaining,
+                unchanged_content_groups: &mut unchanged_content_groups,
+            }
+            .run();
+            if progressed {
+                continue;
+            }
+            progressed = FallbackIdentityPass {
+                reference,
+                observed,
+                reference_groups: &reference_groups,
+                old_ids: &old_ids,
+                reserved_reference_ids: &reserved_reference_ids,
+                blocked_ids: &mut blocked_ids,
+                assigned_ids: &mut assigned_ids,
+                assigned_reference: &mut assigned_reference,
+                assigned_observed: &mut assigned_observed,
+                used_reference: &mut used_reference,
+                used_ids: &mut used_ids,
+                generated: &mut generated,
+                remaining: &mut remaining,
+            }
+            .run();
+            if progressed {
+                continue;
+            }
+            return false;
+        }
+        log_global(
+            4,
+            format_args!(
+                "[renium] identity matching passes: {:.1}ms",
+                phase.elapsed().as_secs_f64() * 1000.0
+            ),
+        );
+    }
+    let phase = Instant::now();
     let assigned = assigned_ids
         .into_iter()
         .map(Option::unwrap)
@@ -1240,6 +1545,13 @@ fn align_settings_ids_to_reference_impl(
         remap_record_reference_ids(&mut instance.properties, &remap);
         remap_record_reference_ids(&mut instance.attributes, &remap);
     }
+    log_global(
+        4,
+        format_args!(
+            "[renium] identity reference remap: {:.1}ms",
+            phase.elapsed().as_secs_f64() * 1000.0
+        ),
+    );
     true
 }
 
@@ -1279,13 +1591,16 @@ fn positional_documents_equivalent(
     reference: &SettingsBytecode,
     observed: &SettingsBytecode,
 ) -> bool {
-    positional_values_equivalent(reference, observed, None)
+    positional_values_equivalent(reference, observed, None, true)
 }
 
 fn positional_identity_preserved(
     reference: &SettingsBytecode,
     observed: &SettingsBytecode,
 ) -> bool {
+    if !persistent_identities_follow_mapping(reference, observed, Some) {
+        return false;
+    }
     let mut first_by_key = AHashMap::with_capacity(reference.instances.len());
     let mut ambiguous = vec![false; reference.instances.len()];
     for (index, instance) in reference.instances.iter().enumerate() {
@@ -1313,14 +1628,18 @@ fn positional_identity_preserved(
             ambiguous[index] |= ambiguous[parent];
         }
     }
-    positional_values_equivalent(reference, observed, Some(&ambiguous))
+    positional_values_equivalent(reference, observed, Some(&ambiguous), true)
 }
 
 fn positional_values_equivalent(
     reference: &SettingsBytecode,
     observed: &SettingsBytecode,
     identity_checks: Option<&[bool]>,
+    preserve_viewport: bool,
 ) -> bool {
+    if workspace_current_camera_index(reference) != workspace_current_camera_index(observed) {
+        return false;
+    }
     let ids_started = Instant::now();
     let reference_ids = reference
         .instances
@@ -1339,6 +1658,12 @@ fn positional_values_equivalent(
         usize,
         (&SettingsBytecodeInstance, &SettingsBytecodeInstance),
     )| {
+        if !preserve_viewport
+            && reference_instance.properties.get("UniqueId")
+                != observed_instance.properties.get("UniqueId")
+        {
+            return false;
+        }
         if identity_checks.is_some_and(|checks| !checks[index])
             && !reference_instance
                 .properties
@@ -1351,7 +1676,9 @@ fn positional_values_equivalent(
             return true;
         }
         reference_instance.class_name == "PackageLink"
-            || is_reconciliation_protected_workspace_camera(reference, index)
+            || preserve_viewport
+                && is_reconciliation_protected_workspace_camera(reference, index)
+                && is_reconciliation_protected_workspace_camera(observed, index)
             || reconciliation_maps_equal_with_ids(
                 &reference_instance.class_name,
                 &reference_instance.properties,
@@ -1512,6 +1839,13 @@ fn align_settings_ids_for_contiguous_structural_change(
         changed_len,
         added_to_observed,
     };
+    if let (Some(reference_camera), Some(observed_camera)) = (
+        workspace_current_camera_index(reference),
+        workspace_current_camera_index(observed),
+    ) && index_map.observed_to_reference(observed_camera) != Some(reference_camera)
+    {
+        return ContiguousStructuralAlignment::NotApplicable;
+    }
     let topology_started = Instant::now();
     let topology_matches = (changed_at..common_len).all(|position| {
         let (reference_index, observed_index) = index_map.pair_at(position);
@@ -1534,6 +1868,11 @@ fn align_settings_ids_for_contiguous_structural_change(
                 "[renium] contiguous settings alignment rejected: topology differs at or after index {changed_at}"
             );
         }
+        return ContiguousStructuralAlignment::NotApplicable;
+    }
+    if !persistent_identities_follow_mapping(reference, observed, |index| {
+        index_map.observed_to_reference(index)
+    }) {
         return ContiguousStructuralAlignment::NotApplicable;
     }
 
@@ -1685,46 +2024,62 @@ fn settings_parent_id(document: &SettingsBytecode, index: usize) -> Option<&str>
 
 pub(crate) fn canonicalize_settings_property_names(document: &mut SettingsBytecode) -> Result<()> {
     let database = rbx_reflection_database::get()?;
-    let mut names_by_class = AHashMap::<&str, AHashMap<String, Option<&str>>>::new();
-    for instance in &mut document.instances {
-        let names = names_by_class.entry(&instance.class_name).or_default();
-        let mut renamed_property = |name: &str| {
-            if let Some(renamed) = names.get(name) {
-                return *renamed;
+    // A dominant service must not serialize canonicalization after decoding.
+    // Bounded chunks retain a small class/name cache without a shared lock.
+    document
+        .instances
+        .par_chunks_mut(4096)
+        .try_for_each(|instances| {
+            let mut names_by_class = AHashMap::<&str, AHashMap<String, Option<&str>>>::new();
+            for instance in instances {
+                let names = names_by_class.entry(&instance.class_name).or_default();
+                let mut renamed_property = |name: &str| {
+                    if let Some(renamed) = names.get(name) {
+                        return *renamed;
+                    }
+                    let renamed = rbx_logical_property_name(database, &instance.class_name, name)
+                        .filter(|canonical| *canonical != name);
+                    names.insert(name.to_string(), renamed);
+                    renamed
+                };
+                if !instance
+                    .properties
+                    .keys()
+                    .any(|name| renamed_property(name).is_some())
+                {
+                    continue;
+                }
+                let mut canonical = Map::new();
+                for (name, value) in std::mem::take(&mut instance.properties) {
+                    let name = renamed_property(&name).map_or(name, str::to_string);
+                    if let Some(existing) = canonical.get(&name)
+                        && !reconciliation_values_equal(existing, &value, false)
+                    {
+                        bail!(
+                            "{} contains conflicting values for property {name}",
+                            instance.name
+                        );
+                    }
+                    canonical.insert(name, value);
+                }
+                instance.properties = canonical;
             }
-            let renamed = rbx_logical_property_name(database, &instance.class_name, name)
-                .filter(|canonical| *canonical != name);
-            names.insert(name.to_string(), renamed);
-            renamed
-        };
-        if !instance
-            .properties
-            .keys()
-            .any(|name| renamed_property(name).is_some())
-        {
-            continue;
-        }
-        let mut canonical = Map::new();
-        for (name, value) in std::mem::take(&mut instance.properties) {
-            let name = renamed_property(&name).map_or(name, str::to_string);
-            if let Some(existing) = canonical.get(&name)
-                && !reconciliation_values_equal(existing, &value, false)
-            {
-                bail!(
-                    "{} contains conflicting values for property {name}",
-                    instance.name
-                );
-            }
-            canonical.insert(name, value);
-        }
-        instance.properties = canonical;
-    }
-    Ok(())
+            Ok(())
+        })
 }
 
 pub(crate) fn settings_documents_equivalent(
     left: &SettingsBytecode,
     right: &SettingsBytecode,
+) -> bool {
+    settings_documents_match(left, right, true)
+}
+
+// Push protects the user's viewport; a pull must persist its observed values.
+fn settings_documents_match(
+    left: &SettingsBytecode,
+    right: &SettingsBytecode,
+    preserve_viewport: bool,
 ) -> bool {
     if left.instances.len() != right.instances.len() {
         return false;
@@ -1753,10 +2108,17 @@ pub(crate) fn settings_documents_equivalent(
             };
             let right_instance = &right.instances[right_index];
             left_instance.name == right_instance.name
+                && (preserve_viewport
+                    || left_instance.properties.get("UniqueId")
+                        == right_instance.properties.get("UniqueId"))
                 && left_instance.class_name == right_instance.class_name
                 && settings_parent_id(left, left_index) == settings_parent_id(right, right_index)
+                && is_reconciliation_protected_workspace_camera(left, left_index)
+                    == is_reconciliation_protected_workspace_camera(right, right_index)
                 && (left_instance.class_name == "PackageLink"
-                    || is_reconciliation_protected_workspace_camera(left, left_index)
+                    || preserve_viewport
+                        && is_reconciliation_protected_workspace_camera(left, left_index)
+                        && is_reconciliation_protected_workspace_camera(right, right_index)
                     || reconciliation_maps_equal(
                         &left_instance.class_name,
                         &left_instance.properties,
@@ -1773,48 +2135,96 @@ pub(crate) fn is_reconciliation_protected_workspace_camera(
     index: usize,
 ) -> bool {
     let instance = &document.instances[index];
-    if instance.class_name != "Camera"
-        || !matches!(instance.name.as_str(), "Camera" | "CurrentCamera")
-    {
+    if instance.class_name != "Camera" {
         return false;
     }
-    let Some(parent) = instance
-        .parent_index
-        .and_then(|index| document.instances.get(index))
+    let mut root = instance;
+    while let Some(parent) = root.parent_index {
+        root = &document.instances[parent];
+    }
+    if root.class_name != "Workspace" {
+        return false;
+    }
+    let Some(reference) = root
+        .properties
+        .get("CurrentCamera")
+        .and_then(Value::as_object)
     else {
         return false;
     };
-    parent.class_name == "Workspace" && parent.parent_index.is_none()
+    if !is_reference_object(reference) {
+        return false;
+    }
+    if let Some(id) = reference.get("settingsId").and_then(Value::as_str) {
+        return id == instance.settings_id;
+    }
+    reference.get("instanceIndex").and_then(Value::as_u64) == Some(index as u64 + 1)
+}
+
+fn workspace_current_camera_index(document: &SettingsBytecode) -> Option<usize> {
+    document
+        .instances
+        .iter()
+        .enumerate()
+        .find_map(|(index, _)| {
+            is_reconciliation_protected_workspace_camera(document, index).then_some(index)
+        })
 }
 
 pub(crate) fn align_reconciliation_protected_workspace_cameras(
     reference: &SettingsBytecode,
     observed: &mut SettingsBytecode,
 ) {
-    let observed_by_id = observed
-        .instances
-        .iter()
-        .enumerate()
-        .map(|(index, instance)| (instance.settings_id.clone(), index))
-        .collect::<HashMap<_, _>>();
-    for (reference_index, reference_instance) in reference.instances.iter().enumerate() {
-        if !is_reconciliation_protected_workspace_camera(reference, reference_index) {
-            continue;
-        }
-        let Some(observed_index) = observed_by_id.get(&reference_instance.settings_id).copied()
-        else {
-            continue;
-        };
-        if !is_reconciliation_protected_workspace_camera(observed, observed_index) {
-            continue;
-        }
-        let observed_instance = &mut observed.instances[observed_index];
+    let (Some(reference_index), Some(observed_index)) = (
+        workspace_current_camera_index(reference),
+        workspace_current_camera_index(observed),
+    ) else {
+        return;
+    };
+    let reference_instance = &reference.instances[reference_index];
+    let observed_instance = &mut observed.instances[observed_index];
+    if observed_instance.settings_id == reference_instance.settings_id {
         observed_instance
             .properties
             .clone_from(&reference_instance.properties);
         observed_instance
             .attributes
             .clone_from(&reference_instance.attributes);
+    }
+}
+
+/// Upgrade old stores only after identity alignment has matched the live
+/// viewport to an existing saved camera. Never infer the role from its name.
+pub(crate) fn inherit_workspace_viewport_reference(
+    desired: &mut SettingsBytecode,
+    observed: &SettingsBytecode,
+) {
+    let Some(root) = desired
+        .instances
+        .iter()
+        .position(|instance| instance.parent_index.is_none() && instance.class_name == "Workspace")
+    else {
+        return;
+    };
+    if desired.instances[root]
+        .properties
+        .contains_key("CurrentCamera")
+    {
+        return;
+    }
+    let Some(viewport) = workspace_current_camera_index(observed) else {
+        return;
+    };
+    let id = &observed.instances[viewport].settings_id;
+    if desired
+        .instances
+        .iter()
+        .any(|instance| instance.settings_id == *id && instance.class_name == "Camera")
+    {
+        desired.instances[root].properties.insert(
+            "CurrentCamera".into(),
+            serde_json::json!({"_type": "Ref", "settingsId": id}),
+        );
     }
 }
 
@@ -1945,6 +2355,9 @@ fn reconciliation_values_equal_with_ids(
     right_ids: Option<&AHashMap<&str, usize>>,
 ) -> bool {
     match (left, right) {
+        (Value::Number(left), Value::Number(right)) if !approximate => {
+            exact_json_numbers_equal(left, right)
+        }
         (Value::Number(left), Value::Number(right)) if approximate => {
             let (Some(left), Some(right)) = (left.as_f64(), right.as_f64()) else {
                 return left == right;
@@ -2058,6 +2471,26 @@ fn reconciliation_values_equal_with_ids(
     }
 }
 
+fn exact_json_numbers_equal(left: &serde_json::Number, right: &serde_json::Number) -> bool {
+    if left == right {
+        return true;
+    }
+    let (float, integer) = if left.is_f64() && !right.is_f64() {
+        (left, right)
+    } else if right.is_f64() && !left.is_f64() {
+        (right, left)
+    } else {
+        return false;
+    };
+    let integer = integer
+        .as_i64()
+        .map(i128::from)
+        .or_else(|| integer.as_u64().map(i128::from));
+    float.as_f64().is_some_and(|value| {
+        value.is_finite() && value.fract() == 0.0 && integer == Some(value as i128)
+    })
+}
+
 fn reconciliation_value_uses_f32(type_name: &str) -> bool {
     matches!(
         type_name,
@@ -2085,7 +2518,11 @@ pub(crate) fn reconciliation_property_is_derived(name: &str) -> bool {
 }
 
 pub(crate) fn reconciliation_property_is_metadata(name: &str, value: &Value) -> bool {
-    name == "Source" && value.as_str() == Some(EXTERNAL_SOURCE_MARKER)
+    // Copies receive engine-owned identities/history; these are not write targets.
+    // Keep the captured fields on disk. Structural IDs and Ref targets are compared
+    // separately, so excluding these values does not hide lost instance references.
+    matches!(name, "CurrentCamera" | "UniqueId" | "HistoryId")
+        || name == "Source" && value.as_str() == Some(EXTERNAL_SOURCE_MARKER)
 }
 
 pub(crate) fn reconciliation_property_value<'a>(
@@ -2250,6 +2687,198 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn exact_numeric_reconciliation_accepts_integer_float_encoding_without_rounding() {
+        for (integer, float) in [
+            (json!(102), json!(102.0)),
+            (json!(-102), json!(-102.0)),
+            (json!(0), json!(-0.0)),
+            (json!(1u64 << 60), json!((1u64 << 60) as f64)),
+            (json!(i64::MIN), json!(i64::MIN as f64)),
+        ] {
+            assert!(reconciliation_property_values_equal(
+                "NumberValue",
+                "Value",
+                Some(&integer),
+                Some(&float)
+            ));
+            assert!(reconciliation_values_equal(&integer, &float, false));
+            assert!(reconciliation_values_equal(&float, &integer, false));
+        }
+        for (left, right) in [
+            (json!(102), json!(102.0000000001)),
+            (
+                json!(9_007_199_254_740_993u64),
+                json!(9_007_199_254_740_992.0),
+            ),
+            (json!(u64::MAX), json!(u64::MAX as f64)),
+            (json!(i64::MAX), json!(i64::MAX as f64)),
+            (json!(-1), json!(u64::MAX)),
+        ] {
+            assert!(!reconciliation_values_equal(&left, &right, false));
+            assert!(!reconciliation_values_equal(&right, &left, false));
+        }
+    }
+
+    fn identity_fixture() -> SettingsBytecode {
+        SettingsBytecode {
+            version: super::super::bytecode::SETTINGS_BINARY_VERSION,
+            instances: [
+                ("Workspace", "Workspace", None),
+                ("Left", "Folder", Some(0)),
+                ("Value", "NumberValue", Some(1)),
+                ("Right", "Folder", Some(0)),
+                ("Reference", "ObjectValue", Some(0)),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (name, class, parent))| {
+                let mut instance = SettingsBytecodeInstance::new(
+                    format!("debug:old:{index}"),
+                    name.into(),
+                    class.into(),
+                    parent,
+                );
+                instance.properties.insert(
+                    "UniqueId".into(),
+                    json!({
+                        "_type": "UniqueId", "value": format!("{:032x}", index + 1)
+                    }),
+                );
+                if index == 4 {
+                    instance.properties.insert(
+                        "Value".into(),
+                        json!({"_type":"Ref","settingsId":"debug:old:2"}),
+                    );
+                }
+                instance
+            })
+            .collect(),
+        }
+    }
+
+    #[test]
+    fn native_identity_preserves_renamed_and_moved_objects_with_recycled_debug_ids() {
+        let reference = identity_fixture();
+        let mut observed = reference.clone();
+        for (index, instance) in observed.instances.iter_mut().enumerate() {
+            instance.settings_id = format!("debug:fresh:{index}");
+        }
+        observed.instances[4].properties.insert(
+            "Value".into(),
+            json!({"_type":"Ref","settingsId":"debug:fresh:2"}),
+        );
+        observed.instances[2].name = "Renamed".into();
+        observed.instances[2].parent_index = Some(3);
+        observed.instances[2]
+            .attributes
+            .insert("Changed".into(), json!(true));
+        assert!(align_settings_ids_to_reference(&reference, &mut observed));
+        assert_eq!(observed.instances[2].settings_id, "debug:old:2");
+        assert_eq!(observed.instances[2].parent_index, Some(3));
+        assert_eq!(
+            observed.instances[4].properties["Value"]["settingsId"],
+            "debug:old:2"
+        );
+        assert_eq!(observed.instances[2].attributes["Changed"], true);
+    }
+
+    #[test]
+    fn native_identity_prevents_positional_and_contiguous_duplicate_swaps() {
+        let mut reference = identity_fixture();
+        reference.instances.truncate(3);
+        reference.instances[1].name = "Duplicate".into();
+        reference.instances[2].name = "Duplicate".into();
+        reference.instances[2].class_name = "Folder".into();
+        reference.instances[2].parent_index = Some(0);
+        for inserted in [false, true] {
+            let mut observed = reference.clone();
+            observed.instances.swap(1, 2);
+            for (index, instance) in observed.instances.iter_mut().enumerate() {
+                instance.settings_id = format!("debug:fresh:{index}");
+            }
+            if inserted {
+                observed.instances.push(SettingsBytecodeInstance::new(
+                    "added".into(),
+                    "New".into(),
+                    "Folder".into(),
+                    Some(0),
+                ));
+            }
+            let SettingsAlignment::Changed(bytes) = align_settings_bytes_to_reference(
+                &encode_settings_bytecode(&reference).unwrap(),
+                &encode_settings_bytecode(&observed).unwrap(),
+            )
+            .unwrap() else {
+                // Identical duplicates with preserved identities are equivalent
+                // regardless of sibling enumeration when there is no addition.
+                assert!(!inserted);
+                assert!(align_settings_ids_to_reference(&reference, &mut observed));
+                assert_eq!(observed.instances[1].settings_id, "debug:old:2");
+                continue;
+            };
+            let aligned = decode_settings_bytecode(&bytes).unwrap();
+            assert_eq!(aligned.instances[1].settings_id, "debug:old:2");
+            assert_eq!(aligned.instances[2].settings_id, "debug:old:1");
+        }
+    }
+
+    #[test]
+    fn pull_refreshes_native_identity_metadata_without_making_it_a_push_target() {
+        let reference = identity_fixture();
+        let mut observed = reference.clone();
+        observed.instances[2].properties.insert(
+            "UniqueId".into(),
+            json!({"_type":"UniqueId","value":"00000000000000000000000000000042"}),
+        );
+        assert!(settings_documents_equivalent(&reference, &observed));
+        let SettingsAlignment::Changed(bytes) = align_settings_bytes_to_reference(
+            &encode_settings_bytecode(&reference).unwrap(),
+            &encode_settings_bytecode(&observed).unwrap(),
+        )
+        .unwrap() else {
+            panic!("pull discarded identity");
+        };
+        assert_eq!(
+            decode_settings_bytecode(&bytes).unwrap().instances[2].properties["UniqueId"],
+            observed.instances[2].properties["UniqueId"]
+        );
+    }
+
+    #[test]
+    fn selective_subtree_keys_preserve_descendant_evidence_and_skip_assigned_branches() {
+        let document = SettingsBytecode {
+            version: super::super::bytecode::SETTINGS_BINARY_VERSION,
+            instances: [
+                ("Workspace", "Workspace", None),
+                ("Leaf", "Part", Some(2)),
+                ("Duplicate", "Folder", Some(0)),
+                ("Duplicate", "Folder", Some(0)),
+                ("Leaf", "Part", Some(3)),
+                ("Unrelated", "Part", Some(0)),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (name, class, parent))| {
+                SettingsBytecodeInstance::new(index.to_string(), name.into(), class.into(), parent)
+            })
+            .collect(),
+        };
+        let mut interned = AHashMap::new();
+        let all = identity_subtree_keys(&document, &mut interned, vec![true; 6]);
+        assert_eq!(all[2], all[3]);
+        let subset = identity_subtree_keys(
+            &document,
+            &mut interned,
+            vec![false, false, true, false, false, false],
+        );
+        assert_eq!(subset, vec![0, all[1], all[2], 0, 0, 0]);
+        assert_eq!(
+            identity_subtree_keys(&document, &mut interned, vec![false; 6]),
+            vec![0; 6]
+        );
+    }
+
     fn duplicate_geometry(count: usize) -> SettingsBytecode {
         let mut instances = vec![SettingsBytecodeInstance::new(
             "root".into(),
@@ -2279,6 +2908,35 @@ mod tests {
     }
 
     #[test]
+    fn reordered_unique_children_keep_identity_with_changed_values_and_references() {
+        let mut reference = duplicate_geometry(8_000);
+        for instance in &mut reference.instances[1..] {
+            instance.name.clone_from(&instance.settings_id);
+        }
+        let mut observed = reference.clone();
+        observed.instances[1..].reverse();
+        for (index, instance) in observed.instances.iter_mut().enumerate() {
+            instance.settings_id = format!("debug:new:{index}");
+        }
+        observed.instances[0].properties.insert(
+            "Target".into(),
+            json!({"_type":"Ref", "settingsId":"debug:new:1"}),
+        );
+        observed.instances[1]
+            .attributes
+            .insert("Edited".into(), json!(true));
+        assert!(align_settings_ids_to_reference(&reference, &mut observed));
+        for instance in &observed.instances[1..] {
+            assert_eq!(instance.settings_id, instance.name);
+        }
+        assert_eq!(
+            observed.instances[0].properties["Target"]["settingsId"],
+            "editor:7999"
+        );
+        assert_eq!(observed.instances[1].attributes["Edited"], true);
+    }
+
+    #[test]
     fn duplicate_geometry_index_preserves_reordered_ids_and_edits() {
         let reference = duplicate_geometry(6_178);
         let mut observed = reference.clone();
@@ -2300,6 +2958,96 @@ mod tests {
             assert_eq!(instance.settings_id, format!("editor:{position}"));
         }
         assert_eq!(observed.instances[0].attributes["Edited"], true);
+    }
+
+    #[test]
+    fn candidate_buckets_preserve_exhaustive_scores_and_ambiguity() {
+        for with_references in [false, true] {
+            let mut reference = duplicate_geometry(24);
+            for (index, instance) in reference.instances.iter_mut().enumerate().skip(1) {
+                instance.properties.clear();
+                instance
+                    .properties
+                    .insert("Texture".into(), json!(format!("asset{}", index % 3)));
+                instance.properties.insert(
+                    "Face".into(),
+                    json!({"_type":"EnumItem", "enumType":"NormalId", "value":index % 6}),
+                );
+            }
+            if with_references {
+                let target_id = reference.instances[2].settings_id.clone();
+                reference.instances[1].properties.insert(
+                    "Target".into(),
+                    json!({"_type":"Ref", "settingsId":target_id}),
+                );
+            }
+            let mut observed = reference.clone();
+            observed.instances[3]
+                .properties
+                .insert("Texture".into(), json!("changed"));
+            let reference_graph = build_reference_graph(&reference);
+            let observed_graph = build_reference_graph(&observed);
+            let candidates = (1..reference.instances.len()).collect::<Vec<_>>();
+            for with_subtrees in [false, true] {
+                let keys = (0..reference.instances.len())
+                    .map(|index| index % 4 + 1)
+                    .collect::<Vec<_>>();
+                let subtree_keys = with_subtrees.then(|| (keys.clone(), keys));
+                let (representatives, multiplicities) = identity_candidate_representatives(
+                    &reference,
+                    &reference_graph,
+                    subtree_keys.as_ref().map(|(keys, _)| keys.as_slice()),
+                    &candidates,
+                );
+                assert!(representatives.len() < candidates.len());
+                assert_eq!(multiplicities.values().sum::<usize>(), candidates.len());
+                for assigned in [false, true] {
+                    let assignment = (0..reference.instances.len())
+                        .map(|index| assigned.then_some(index))
+                        .collect::<Vec<_>>();
+                    let context = IdentityScoreContext {
+                        reference: &reference,
+                        observed: &observed,
+                        reference_graph: &reference_graph,
+                        observed_graph: &observed_graph,
+                        assigned_reference: &assignment,
+                        assigned_observed: &assignment,
+                        subtree_keys: subtree_keys.as_ref(),
+                    };
+                    for index in &candidates {
+                        let winner = |indices: &[usize], grouped: bool| {
+                            let mut best = None;
+                            let mut winner = None;
+                            let mut tied = false;
+                            for &candidate in indices {
+                                if let Some(score) = identity_score(&context, candidate, *index) {
+                                    if best.is_none_or(|previous| score > previous) {
+                                        best = Some(score);
+                                        winner = Some(candidate);
+                                        tied = grouped && multiplicities[&candidate] > 1;
+                                    } else if best == Some(score) {
+                                        tied = true;
+                                    }
+                                }
+                            }
+                            (best, tied, if tied { None } else { winner })
+                        };
+                        assert!(winner(&candidates, false) == winner(&representatives, true));
+                    }
+                }
+            }
+        }
+        let mut reference = duplicate_geometry(2400);
+        for (index, instance) in reference.instances.iter_mut().enumerate().skip(1) {
+            instance.properties.clear();
+            instance.properties.insert("Face".into(), json!(index % 6));
+        }
+        let graph = build_reference_graph(&reference);
+        let candidates = (1..reference.instances.len()).collect::<Vec<_>>();
+        let (representatives, multiplicities) =
+            identity_candidate_representatives(&reference, &graph, None, &candidates);
+        assert_eq!(representatives.len(), 6);
+        assert!(multiplicities.values().all(|count| *count == 400));
     }
 
     #[test]
@@ -2410,6 +3158,83 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_duplicate_scores_survive_deep_identity_passes() {
+        for referenced in [false, true] {
+            let mut reference = duplicate_geometry(64);
+            for instance in &mut reference.instances[1..] {
+                instance.properties.clear();
+            }
+            let mut parents = [0, 0];
+            for depth in 0..8 {
+                for (side, parent) in parents.iter_mut().enumerate() {
+                    let mut child = SettingsBytecodeInstance::new(
+                        format!("branch:{depth}:{side}"),
+                        "Branch".into(),
+                        "Folder".into(),
+                        Some(*parent),
+                    );
+                    child.attributes.insert("Side".into(), json!(side));
+                    *parent = reference.instances.len();
+                    reference.instances.push(child);
+                }
+            }
+            if referenced {
+                let mut holder = SettingsBytecodeInstance::new(
+                    "holder".into(),
+                    "Holder".into(),
+                    "ObjectValue".into(),
+                    Some(parents[0]),
+                );
+                holder.properties.insert(
+                    "Value".into(),
+                    json!({"_type":"Ref","settingsId":"editor:0"}),
+                );
+                reference.instances.push(holder);
+            }
+            let mut observed = reference.clone();
+            let mut remap = HashMap::new();
+            for (index, instance) in observed.instances.iter_mut().enumerate() {
+                let next_id = format!("observed:{index}");
+                remap.insert(instance.settings_id.clone(), next_id.clone());
+                instance.settings_id = next_id;
+            }
+            for instance in &mut observed.instances {
+                remap_record_reference_ids(&mut instance.properties, &remap);
+            }
+            if referenced {
+                observed.instances.swap(1, 2);
+            }
+            observed.instances.push(SettingsBytecodeInstance::new(
+                "added".into(),
+                "New".into(),
+                "Folder".into(),
+                Some(0),
+            ));
+            assert!(align_settings_ids_to_reference(&reference, &mut observed));
+            for index in 0..reference.instances.len() {
+                let expected = if referenced && index == 1 {
+                    2
+                } else if referenced && index == 2 {
+                    1
+                } else {
+                    index
+                };
+                assert_eq!(
+                    observed.instances[index].settings_id,
+                    reference.instances[expected].settings_id,
+                    "referenced={referenced}, index={index}"
+                );
+            }
+            if referenced {
+                assert_eq!(
+                    observed.instances[reference.instances.len() - 1].properties["Value"]["settingsId"],
+                    "editor:0"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn indexed_duplicates_still_prioritize_reference_evidence_over_content() {
         let mut reference = duplicate_geometry(40);
         let mut holder = SettingsBytecodeInstance::new(
@@ -2465,6 +3290,39 @@ mod tests {
             document.instances[0].properties,
             Map::from_iter([("Archivable".to_string(), json!(false))])
         );
+    }
+
+    #[test]
+    fn parallel_canonicalization_preserves_aliases_across_chunk_boundaries() {
+        let seed = string_value_with_properties(Map::from_iter([
+            ("archivable".into(), json!(false)),
+            ("Value".into(), json!("saved")),
+        ]));
+        let mut document = seed.clone();
+        document.instances = vec![seed.instances[0].clone(); 8193];
+        let expected = Map::from_iter([
+            ("Archivable".into(), json!(false)),
+            ("Value".into(), json!("saved")),
+        ]);
+        for workers in [1, 4] {
+            let mut current = document.clone();
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .unwrap()
+                .install(|| canonicalize_settings_property_names(&mut current))
+                .unwrap();
+            assert!(
+                current
+                    .instances
+                    .iter()
+                    .all(|instance| instance.properties == expected)
+            );
+            current.instances[8192]
+                .properties
+                .insert("archivable".into(), json!(true));
+            assert!(canonicalize_settings_property_names(&mut current).is_err());
+        }
     }
 
     #[test]
@@ -3391,12 +4249,83 @@ mod tests {
     }
 
     #[test]
+    fn pull_refreshes_viewport_values_without_making_them_push_targets() {
+        let mut root = SettingsBytecodeInstance::new(
+            "root".into(),
+            "Workspace".into(),
+            "Workspace".into(),
+            None,
+        );
+        root.properties.insert(
+            "CurrentCamera".into(),
+            json!({"_type":"Ref","settingsId":"camera"}),
+        );
+        let mut camera = SettingsBytecodeInstance::new(
+            "camera".into(),
+            "Camera".into(),
+            "Camera".into(),
+            Some(0),
+        );
+        camera.properties.insert("FieldOfView".into(), json!(70));
+        camera.attributes.insert("Revision".into(), json!(1));
+        let reference = SettingsBytecode {
+            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
+            instances: vec![
+                root,
+                camera,
+                SettingsBytecodeInstance::new(
+                    "other".into(),
+                    "Other".into(),
+                    "Folder".into(),
+                    Some(0),
+                ),
+            ],
+        };
+        let original = encode_settings_bytecode(&reference).unwrap();
+        for reorder in [false, true] {
+            let mut observed = reference.clone();
+            observed.instances[1]
+                .properties
+                .insert("FieldOfView".into(), json!(85));
+            observed.instances[1]
+                .attributes
+                .insert("Revision".into(), json!(2));
+            if reorder {
+                observed.instances.swap(1, 2);
+            }
+            assert!(settings_documents_equivalent(&reference, &observed));
+            let bytes = encode_settings_bytecode(&observed).unwrap();
+            let SettingsAlignment::Changed(aligned) =
+                align_settings_bytes_to_reference(&original, &bytes).unwrap()
+            else {
+                panic!("Pull discarded the changed viewport state");
+            };
+            let aligned = decode_settings_bytecode(&aligned).unwrap();
+            let camera = aligned
+                .instances
+                .iter()
+                .find(|instance| instance.class_name == "Camera")
+                .unwrap();
+            assert_eq!(camera.properties["FieldOfView"], json!(85));
+            assert_eq!(camera.attributes["Revision"], json!(2));
+            assert!(matches!(
+                align_settings_bytes_to_reference(&bytes, &bytes).unwrap(),
+                SettingsAlignment::Equivalent
+            ));
+        }
+    }
+
+    #[test]
     fn workspace_camera_viewport_values_do_not_affect_reconciliation() {
-        let root = SettingsBytecodeInstance::new(
+        let mut root = SettingsBytecodeInstance::new(
             "root".to_string(),
             "Workspace".to_string(),
             "Workspace".to_string(),
             None,
+        );
+        root.properties.insert(
+            "CurrentCamera".into(),
+            json!({"_type": "Ref", "settingsId": "camera"}),
         );
         let mut camera = SettingsBytecodeInstance::new(
             "camera".to_string(),
@@ -3444,10 +4373,120 @@ mod tests {
             "CFrame".to_string(),
             json!({"_type": "CFrame", "components": [9.0]}),
         );
+        assert!(settings_documents_equivalent(
+            &nested_reference,
+            &nested_observed
+        ));
+        nested_observed.instances[0]
+            .properties
+            .remove("CurrentCamera");
         assert!(!settings_documents_equivalent(
             &nested_reference,
             &nested_observed
         ));
+    }
+
+    #[test]
+    fn legacy_viewport_metadata_requires_a_matched_saved_identity() {
+        let mut root = SettingsBytecodeInstance::new(
+            "root".into(),
+            "Workspace".into(),
+            "Workspace".into(),
+            None,
+        );
+        root.properties.insert(
+            "CurrentCamera".into(),
+            json!({"_type": "Ref", "settingsId": "active"}),
+        );
+        let active = SettingsBytecodeInstance::new(
+            "active".into(),
+            "Camera".into(),
+            "Camera".into(),
+            Some(0),
+        );
+        let reference = SettingsBytecode {
+            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
+            instances: vec![root, active],
+        };
+        let mut legacy = reference.clone();
+        legacy.instances[0].properties.remove("CurrentCamera");
+        assert!(!settings_documents_positionally_equivalent(
+            &legacy, &reference
+        ));
+        assert!(!settings_documents_equivalent(&legacy, &reference));
+        let SettingsAlignment::Changed(upgraded) = align_settings_bytes_to_reference(
+            &encode_settings_bytecode(&legacy).unwrap(),
+            &encode_settings_bytecode(&reference).unwrap(),
+        )
+        .unwrap() else {
+            panic!("A metadata-only pull must persist the viewport role");
+        };
+        let upgraded = decode_settings_bytecode(&upgraded).unwrap();
+        assert!(is_reconciliation_protected_workspace_camera(&upgraded, 1));
+        inherit_workspace_viewport_reference(&mut legacy, &reference);
+        assert_eq!(
+            legacy.instances[0].properties,
+            reference.instances[0].properties
+        );
+        legacy.instances[0].properties.remove("CurrentCamera");
+        legacy.instances[1].settings_id = "different-camera-with-the-same-name".into();
+        inherit_workspace_viewport_reference(&mut legacy, &reference);
+        assert!(!legacy.instances[0].properties.contains_key("CurrentCamera"));
+    }
+
+    #[test]
+    fn viewport_role_precedes_duplicate_names_ordinals_and_recycled_ids() {
+        for name in ["Camera", "CurrentCamera", "Viewport"] {
+            let mut root = SettingsBytecodeInstance::new(
+                "root".into(),
+                "Workspace".into(),
+                "Workspace".into(),
+                None,
+            );
+            root.properties.insert(
+                "CurrentCamera".into(),
+                json!({"_type": "Ref", "settingsId": "active"}),
+            );
+            let active = SettingsBytecodeInstance::new(
+                "active".into(),
+                name.into(),
+                "Camera".into(),
+                Some(0),
+            );
+            let mut extra = active.clone();
+            extra.settings_id = "extra".into();
+            let reference = SettingsBytecode {
+                version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
+                instances: vec![root, active, extra],
+            };
+            let mut observed = reference.clone();
+            // A fresh runtime enumerates the viewport second and recycles the
+            // old ID for the other identically named camera.
+            observed.instances[0].properties.insert(
+                "CurrentCamera".into(),
+                json!({"_type": "Ref", "settingsId": "extra"}),
+            );
+            observed.instances[2]
+                .properties
+                .insert("FieldOfView".into(), json!(85));
+            assert!(!settings_documents_positionally_equivalent(
+                &reference, &observed
+            ));
+            assert!(align_settings_ids_to_reference(&reference, &mut observed));
+            assert_eq!(observed.instances[2].settings_id, "active");
+            assert_eq!(observed.instances[1].settings_id, "extra");
+            assert!(is_reconciliation_protected_workspace_camera(&observed, 2));
+            assert!(!is_reconciliation_protected_workspace_camera(&observed, 1));
+            assert!(settings_documents_equivalent(&reference, &observed));
+            observed.instances[1]
+                .properties
+                .insert("FieldOfView".into(), json!(40));
+            assert!(!settings_documents_equivalent(&reference, &observed));
+            let bytes = encode_settings_bytecode_with_dense_references(&observed).unwrap();
+            let decoded = decode_settings_bytecode(&bytes).unwrap();
+            assert!(is_reconciliation_protected_workspace_camera(&decoded, 2));
+            assert!(!is_reconciliation_protected_workspace_camera(&decoded, 1));
+        }
     }
 
     #[test]

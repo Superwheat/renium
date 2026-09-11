@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -450,9 +451,17 @@ fn build_service_sourcemap_node_from_paths(
 }
 
 pub(crate) fn generate_project_sourcemap(project_root: &Path) -> Result<()> {
+    generate_project_sourcemap_at(project_root, &project_root.join("src"))
+}
+
+pub(crate) fn generate_project_sourcemap_at(project_root: &Path, source: &Path) -> Result<()> {
     let loaded = config::try_load_project(None, Some(project_root))?
         .filter(|loaded| loaded.root == project_root);
-    let root = build_project_sourcemap_with_loaded(project_root, loaded.as_ref())?;
+    let root = if loaded.is_some() {
+        build_project_sourcemap_with_loaded(project_root, loaded.as_ref())?
+    } else {
+        build_project_sourcemap_from_source(project_root, source, None)?
+    };
     write_sourcemap_root(project_root, root)
 }
 
@@ -493,7 +502,9 @@ fn build_project_sourcemap_from_source(
     } else {
         project_root
     };
-    if !src_root.is_dir() {
+    if !src_root.is_dir()
+        && !super::storage::instances_root(src_root).is_some_and(|path| path.is_dir())
+    {
         bail!(
             "Cannot generate sourcemap: missing source directory {}",
             src_root.display()
@@ -515,29 +526,18 @@ fn build_project_sourcemap_from_source(
         children: Vec::new(),
     };
 
-    let mut service_entries: Vec<_> = fs::read_dir(src_root)
-        .with_context(|| format!("Failed to read {}", src_root.display()))?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .with_context(|| format!("Failed to iterate {}", src_root.display()))?;
-    service_entries.sort_by(|a, b| {
-        a.file_name()
-            .to_string_lossy()
-            .cmp(&b.file_name().to_string_lossy())
-    });
+    let service_entries = super::storage::service_directories(src_root)?;
 
     let built_children = service_entries
         .par_iter()
         .enumerate()
         .map(|(index, entry)| -> Result<Option<(usize, SourcemapNode)>> {
-            let file_type = entry
-                .file_type()
-                .with_context(|| format!("Failed to stat {}", entry.path().display()))?;
-            if !file_type.is_dir() {
-                return Ok(None);
-            }
-
-            let service_name = entry.file_name().to_string_lossy().into_owned();
-            let service_path = entry.path();
+            let service_name = entry
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let service_path = entry.clone();
             let settings_path = service_settings_path(&service_path);
             let node = if settings_path.is_file() {
                 let document = SettingsBytecode::read_file(&settings_path)?;

@@ -14,12 +14,15 @@ local DRAW_FIELDS = {
 }
 local MAX_FRAMES = 60000
 local PAGE_SIZE = 1000
+local MICRO_CHUNK_BYTES = 3 * 1024 * 1024
 
 function BridgePerformance.create(context)
 	local stats = context.stats
 	local runService = context.runService
 	local clock = context.clock or os.clock
 	local capture = nil
+	local microCapture = nil
+	local microTimer = nil
 	local api = {}
 	local function metadata()
 		return { studioVersion = context.studioVersion, bridgeVersion = context.bridgeVersion,
@@ -46,7 +49,7 @@ function BridgePerformance.create(context)
 		local unavailable = {}
 		local frames = table.clone(FRAME_FIELDS)
 		local counters = table.clone(COUNTER_FIELDS)
-		if context.client then
+		if context.client or context.edit then
 			for _, name in RENDER_FIELDS do
 				frames[#frames + 1] = name
 			end
@@ -55,10 +58,10 @@ function BridgePerformance.create(context)
 			end
 		else
 			for _, name in RENDER_FIELDS do
-				unavailable[name] = "client measurement; select a play client"
+				unavailable[name] = "render measurement; select Edit or a play client"
 			end
 			for _, name in DRAW_FIELDS do
-				unavailable[name] = "client measurement; select a play client"
+				unavailable[name] = "render measurement; select Edit or a play client"
 			end
 		end
 		return selectFields(frames, unavailable), selectFields(counters, unavailable), unavailable
@@ -94,7 +97,30 @@ function BridgePerformance.create(context)
 		}
 	end
 
-	function api.micro()
+	local function clearMicro()
+		microCapture = nil
+		if microTimer then
+			context.cancel(microTimer)
+			microTimer = nil
+		end
+	end
+
+	function api.microRead(params)
+		local current = microCapture
+		assert(current and current.id == params.captureId, "MicroProfiler snapshot expired or changed")
+		local page = params.page
+		local pages = math.ceil(current.bytes / MICRO_CHUNK_BYTES)
+		assert(type(page) == "number" and page % 1 == 0 and page >= 1 and page <= pages, "Invalid MicroProfiler snapshot page")
+		local start = (page - 1) * MICRO_CHUNK_BYTES
+		local length = math.min(MICRO_CHUNK_BYTES, current.bytes - start)
+		local part = buffer.create(length)
+		buffer.copy(part, 0, current.data, start, length)
+		return { ok = true, runtimeId = context.runtimeId, captureId = current.id, bytes = current.bytes,
+			data = context.encodeBuffer(part), page = page, nextPage = if page < pages then page + 1 else nil,
+			format = "gprx", metadata = current.metadata }
+	end
+
+	function api.micro(params)
 		-- Take one immutable snapshot without yielding between the size and copy.
 		-- Parsing and aggregation belong in the host, never the Studio frame loop.
 		local service = context.microProfiler()
@@ -103,6 +129,15 @@ function BridgePerformance.create(context)
 		local data = buffer.create(size)
 		local copied = service:GetDataInRange(0, 0, size, data, 0)
 		assert(copied == size, "MicroProfiler snapshot was incomplete; no capture was returned")
+		if params and params.chunked then
+			clearMicro()
+			microCapture = { id = context.newId(), data = data, bytes = size, metadata = metadata() }
+			microTimer = context.delay(60, function()
+				microTimer = nil
+				microCapture = nil
+			end)
+			return api.microRead({ captureId = microCapture.id, page = 1 })
+		end
 		return { ok = true, runtimeId = context.runtimeId, bytes = size, data = context.encodeBuffer(data), format = "gprx", metadata = metadata() }
 	end
 
@@ -245,6 +280,7 @@ function BridgePerformance.create(context)
 	end
 
 	function api.cleanup()
+		clearMicro()
 		if capture then
 			stop(capture, "runtime-ended")
 		end

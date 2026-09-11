@@ -74,4 +74,44 @@ delays[2]()
 assert(api.read({ captureId = nextCapture.captureId }).state == "complete", "deadline must stop a paused recording")
 api.cleanup()
 assert(next(callbacks) == nil and not pcall(api.read, { captureId = nextCapture.captureId }))
+
+-- A dump larger than the bridge's response limit travels as one immutable snapshot.
+local dump = buffer.create(13 * 1024 * 1024 + 7)
+for offset = 0, buffer.len(dump) - 1, 1024 do
+	buffer.writeu8(dump, offset, offset / 1024 % 251)
+end
+local copies = 0
+local expire
+local micro = Performance.create({
+	runtimeId = "edit", newId = function() id += 1 return tostring(id) end,
+	timestamp = function() return "test-time" end,
+	delay = function(_, callback) expire = callback return callback end,
+	cancel = function() end,
+	encodeBuffer = buffer.tostring,
+	microProfiler = function() return {
+		GetDataSize = function() return buffer.len(dump) end,
+		GetDataInRange = function(_, _, start, size, destination, offset)
+			copies += 1
+			buffer.copy(destination, offset, dump, start, size)
+			return size
+		end,
+	} end,
+})
+local first = micro.micro({ chunked = true })
+local chunks = { first.data }
+local page = first.nextPage
+local original = buffer.tostring(dump)
+buffer.fill(dump, 0, 255)
+while page do
+	local part = micro.microRead({ captureId = first.captureId, page = page })
+	assert(#part.data <= 3 * 1024 * 1024 and part.bytes == first.bytes)
+	chunks[#chunks + 1] = part.data
+	page = part.nextPage
+end
+assert(table.concat(chunks) == original and copies == 1, "Pages must not refresh or truncate the snapshot")
+local replacement = micro.micro({ chunked = true })
+assert(not pcall(micro.microRead, { captureId = first.captureId, page = 1 }))
+expire()
+assert(not pcall(micro.microRead, { captureId = replacement.captureId, page = 1 }))
+micro.cleanup()
 print("Renium performance capture workloads passed")

@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use full_moon::ast;
-use full_moon::tokenizer::TokenReference;
-use full_moon::visitors::VisitorMut;
+use full_moon::node::Node;
+use full_moon::visitors::Visitor;
 use serde_json::{Map, Value, json};
 
 use crate::app::output::{ensure_luau_api_ok, ensure_plugin_api_ok, log_global, print_json_output};
@@ -34,6 +34,8 @@ mod input;
 mod microprofiler;
 pub(crate) mod monitor;
 pub(crate) mod network;
+#[cfg(any(windows, target_os = "macos"))]
+mod process_exit;
 pub(crate) mod property_access;
 mod recording;
 mod recording_review;
@@ -75,7 +77,40 @@ pub(crate) fn execute_luau_command(mut args: ExecuteLuauArgs) -> Result<()> {
     print_json_output(&result, false)
 }
 
-fn parse_luau(code: &str) -> Result<ast::Ast> {
+pub(crate) fn validate_luau_syntax(code: &str) -> Result<()> {
+    // Use Studio's actual language compiler, without loading or executing code.
+    // Its recursion limit also rejects excessive nesting before AST traversal.
+    mlua::Compiler::new()
+        .compile(code)
+        .context("Invalid Luau syntax")?;
+    Ok(())
+}
+
+#[derive(Default)]
+struct LuauLoopCheckpoints {
+    offsets: Vec<usize>,
+}
+
+impl Visitor for LuauLoopCheckpoints {
+    fn visit_generic_for(&mut self, node: &ast::GenericFor) {
+        self.offsets
+            .push(node.do_token().token().end_position().bytes());
+    }
+    fn visit_numeric_for(&mut self, node: &ast::NumericFor) {
+        self.offsets
+            .push(node.do_token().token().end_position().bytes());
+    }
+    fn visit_repeat(&mut self, node: &ast::Repeat) {
+        self.offsets
+            .push(node.repeat_token().token().end_position().bytes());
+    }
+    fn visit_while(&mut self, node: &ast::While) {
+        self.offsets
+            .push(node.do_token().token().end_position().bytes());
+    }
+}
+
+fn instrument_luau(code: &str) -> Result<String> {
     let parsed = full_moon::parse_fallible(code, full_moon::LuaVersion::luau());
     if let Some(error) = parsed.errors().first() {
         let (start, _) = error.range();
@@ -86,79 +121,69 @@ fn parse_luau(code: &str) -> Result<ast::Ast> {
             error.error_message()
         );
     }
-    Ok(parsed.into_ast())
-}
-
-pub(crate) fn validate_luau_syntax(code: &str) -> Result<()> {
-    parse_luau(code)?;
-    Ok(())
-}
-
-struct LuauLoopCheckpoints {
-    checkpoint: (ast::Stmt, Option<TokenReference>),
-    inserted: usize,
-}
-
-impl LuauLoopCheckpoints {
-    fn add_to(&mut self, block: &ast::Block) -> ast::Block {
-        let mut statements = Vec::with_capacity(block.stmts().count() + 1);
-        statements.push(self.checkpoint.clone());
-        statements.extend(block.stmts_with_semicolon().cloned());
-        self.inserted += 1;
-        block.clone().with_stmts(statements)
+    let parsed = parsed.into_ast();
+    let mut checkpoints = LuauLoopCheckpoints::default();
+    checkpoints.visit_ast(&parsed);
+    if checkpoints.offsets.is_empty() {
+        return Ok(code.to_string());
     }
-}
-
-impl VisitorMut for LuauLoopCheckpoints {
-    fn visit_generic_for_end(&mut self, node: ast::GenericFor) -> ast::GenericFor {
-        let block = self.add_to(node.block());
-        node.with_block(block)
+    let mut name = "__reniumCooperate".to_string();
+    while code.contains(&name) {
+        name.push('_');
     }
-
-    fn visit_numeric_for_end(&mut self, node: ast::NumericFor) -> ast::NumericFor {
-        let block = self.add_to(node.block());
-        node.with_block(block)
+    let count = format!("{name}Count");
+    let started = format!("{name}Started");
+    let preamble = format!(
+        "local {count}=64;local {started}=os.clock();local function {name}(){count}-=1;if {count}>0 then return end;{count}=64;local now=os.clock();if now-{started}>=0.004166666666666667 then task.wait();{started}=os.clock() end end;"
+    );
+    // Keep comments, directives and the user's formatting intact.
+    // Collect byte offsets instead of repeatedly cloning each nested loop AST.
+    let first = parsed
+        .tokens()
+        .next()
+        .context("Missing Luau statement")?
+        .token()
+        .start_position()
+        .bytes();
+    let mut output = String::with_capacity(
+        code.len() + preamble.len() + checkpoints.offsets.len() * (name.len() + 4),
+    );
+    output.push_str(&code[..first]);
+    output.push_str(&preamble);
+    let mut previous = first;
+    checkpoints.offsets.sort_unstable();
+    for offset in checkpoints.offsets {
+        output.push_str(&code[previous..offset]);
+        output.push(' ');
+        output.push_str(&name);
+        output.push_str("();");
+        previous = offset;
     }
-
-    fn visit_repeat_end(&mut self, node: ast::Repeat) -> ast::Repeat {
-        let block = self.add_to(node.block());
-        node.with_block(block)
-    }
-
-    fn visit_while_end(&mut self, node: ast::While) -> ast::While {
-        let block = self.add_to(node.block());
-        node.with_block(block)
-    }
+    output.push_str(&code[previous..]);
+    validate_luau_syntax(&output)?;
+    Ok(output)
 }
 
 pub(crate) fn cooperative_luau(code: &str) -> Result<String> {
-    let parsed = parse_luau(code)?;
-    let mut checkpoint_name = "__reniumCooperate".to_string();
-    while code.contains(&checkpoint_name) {
-        checkpoint_name.push('_');
-    }
-    let checkpoint_ast = full_moon::parse(&format!("{checkpoint_name}();"))
-        .expect("Renium's loop checkpoint must be valid Luau");
-    let checkpoint = checkpoint_ast
-        .nodes()
-        .stmts_with_semicolon()
-        .next()
-        .cloned()
-        .expect("Renium's loop checkpoint must contain one statement");
-    let mut checkpoints = LuauLoopCheckpoints {
-        checkpoint,
-        inserted: 0,
-    };
-    let instrumented = checkpoints.visit_ast(parsed);
-    if checkpoints.inserted == 0 {
+    validate_luau_syntax(code)?;
+    if !["for", "while", "repeat"]
+        .iter()
+        .any(|word| code.contains(word))
+    {
         return Ok(code.to_string());
     }
-
-    let count_name = format!("{checkpoint_name}Count");
-    let started_name = format!("{checkpoint_name}Started");
-    Ok(format!(
-        "local {count_name}=64;local {started_name}=os.clock();local function {checkpoint_name}(){count_name}-=1;if {count_name}>0 then return end;{count_name}=64;local now=os.clock();if now-{started_name}>=0.004166666666666667 then task.wait();{started_name}=os.clock() end end;{instrumented}"
-    ))
+    // full_moon's recursive parser can exhaust an ordinary daemon request
+    // thread even with a few nested loops in a debug build. Keep parsing,
+    // traversal and AST destruction on one joined worker with its own stack.
+    thread::scope(|scope| {
+        thread::Builder::new()
+            .name("renium-luau-instrument".into())
+            .stack_size(64 * 1024 * 1024)
+            .spawn_scoped(scope, || instrument_luau(code))
+            .context("Could not start Luau instrumentation")?
+            .join()
+            .map_err(|_| anyhow::anyhow!("Luau instrumentation failed"))?
+    })
 }
 
 fn call_execute_luau(
@@ -479,6 +504,7 @@ fn finish_studio_change_state_command(
 pub(crate) fn studio_change_state_result(
     args: StudioChangeStateArgs,
     bridge: &BridgeServer,
+    runtime_id: &str,
 ) -> Result<Value> {
     let details = args.details;
     let services = parse_services(&args.services)?;
@@ -487,7 +513,7 @@ pub(crate) fn studio_change_state_result(
     if !action_results.is_object() {
         bail!("--ack-action-results must be a JSON object");
     }
-    let result = bridge.call_for_target(
+    let result = bridge.call_for_runtime_with_timeout(
         "getStudioChangeState",
         json!({
             "services": services,
@@ -507,6 +533,8 @@ pub(crate) fn studio_change_state_result(
             "compact": !details,
         }),
         BridgeTarget::Edit,
+        runtime_id,
+        None,
     )?;
     ensure_plugin_api_ok(&result)?;
     Ok(if details {
@@ -531,6 +559,7 @@ pub(crate) fn compact_live_status(value: Value) -> Value {
         "connectedInstances",
         "onlyCodeMode",
         "seq",
+        "snapshotSeq",
         "runtimeSettingsSeq",
         "conflictResolution",
         "dirtyServices",
@@ -667,6 +696,14 @@ pub(crate) fn start_stop_play_result(
 fn new_play_launch(bridge: &BridgeServer, label: &str) -> Result<TestLaunch> {
     let edit_pin = bridge.runtime_pin_for_selector(BridgeTarget::Edit, None)?;
     let edit_runtime_id = edit_pin.runtime_id;
+    #[cfg(windows)]
+    crate::project::workflows::windows_launch::protect_process(
+        bridge.studio_pid_for_runtime(BridgeTarget::Edit, &edit_runtime_id)?,
+    )?;
+    #[cfg(target_os = "macos")]
+    crate::studio::native::serializer::protect_studio_launch(
+        bridge.studio_pid_for_runtime(BridgeTarget::Edit, &edit_runtime_id)?,
+    )?;
     let sequence = bridge
         .next_id
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2235,12 +2272,63 @@ pub(crate) fn active_studio_play_clients(
     active
 }
 
+#[cfg(any(windows, target_os = "macos"))]
+fn separate_play_processes(bridge: &BridgeServer, edit_runtime: &str) -> Vec<u32> {
+    let Ok(edit_pid) = bridge.studio_pid_for_runtime(BridgeTarget::Edit, edit_runtime) else {
+        return Vec::new();
+    };
+    studio_play_clients(bridge, edit_runtime)
+        .iter()
+        .filter_map(|client| {
+            let target = if client["role"] == BRIDGE_ROLE_PLAY_CLIENT {
+                BridgeTarget::Client
+            } else {
+                BridgeTarget::Main
+            };
+            let pid = bridge
+                .studio_pid_for_runtime(target, client["runtimeId"].as_str()?)
+                .ok()?;
+            (pid != edit_pid).then_some(pid)
+        })
+        .collect()
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn watch_play_processes(
+    bridge: &BridgeServer,
+    edit_runtime: &str,
+) -> Result<Vec<process_exit::ProcessExit>> {
+    separate_play_processes(bridge, edit_runtime)
+        .into_iter()
+        .map(process_exit::ProcessExit::watch)
+        .filter_map(Result::transpose)
+        .collect()
+}
+
 fn stop_studio_play_with_bridge_result(bridge: &BridgeServer) -> Result<Value> {
     let edit_pin = bridge.runtime_pin_for_selector(BridgeTarget::Edit, None)?;
     let edit_runtime_id = edit_pin.runtime_id;
+    #[cfg(windows)]
+    crate::project::workflows::windows_launch::protect_process(
+        bridge.studio_pid_for_runtime(BridgeTarget::Edit, &edit_runtime_id)?,
+    )?;
+    #[cfg(target_os = "macos")]
+    crate::studio::native::serializer::protect_studio_launch(
+        bridge.studio_pid_for_runtime(BridgeTarget::Edit, &edit_runtime_id)?,
+    )?;
+    // Closing a test DataModel precedes process exit on Windows and macOS. Its later exit
+    // notification can end the next multiplayer launch if stop returns early.
+    #[cfg(any(windows, target_os = "macos"))]
+    let processes = watch_play_processes(bridge, &edit_runtime_id)?;
+    #[cfg(any(windows, target_os = "macos"))]
+    let shutdown_deadline = Instant::now() + process_exit::STOP_TIMEOUT;
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let shutdown_deadline = Instant::now() + Duration::from_secs(40);
     let initial = studio_play_status_for_runtime(bridge, &edit_runtime_id)?;
     let mut active_clients = active_studio_play_clients(bridge, &edit_runtime_id);
     if play_status_is_stopped(&initial) && active_clients.is_empty() {
+        #[cfg(any(windows, target_os = "macos"))]
+        process_exit::wait(&processes, shutdown_deadline)?;
         bridge.clear_runtime_pins();
         return Ok(initial);
     }
@@ -2277,9 +2365,8 @@ fn stop_studio_play_with_bridge_result(bridge: &BridgeServer) -> Result<Value> {
             }
         };
         ensure_plugin_api_ok(&stop_result)?;
-        let deadline = Instant::now() + Duration::from_secs(3);
         let mut stopped = false;
-        while Instant::now() < deadline {
+        while Instant::now() < shutdown_deadline {
             let status_stopped = match studio_play_status_for_runtime(bridge, &edit_runtime_id) {
                 Ok(status) => {
                     last_status = status.clone();
@@ -2298,6 +2385,8 @@ fn stop_studio_play_with_bridge_result(bridge: &BridgeServer) -> Result<Value> {
             thread::sleep(Duration::from_millis(100));
         }
         if stopped {
+            #[cfg(any(windows, target_os = "macos"))]
+            process_exit::wait(&processes, shutdown_deadline)?;
             retire_play_clients(bridge, &studio_play_clients(bridge, &edit_runtime_id));
             bridge.clear_runtime_pins();
             return Ok(json!({
@@ -2307,6 +2396,9 @@ fn stop_studio_play_with_bridge_result(bridge: &BridgeServer) -> Result<Value> {
                 "attempts": attempt,
                 "status": last_status,
             }));
+        }
+        if Instant::now() >= shutdown_deadline {
+            break;
         }
     }
     bail!(

@@ -5,15 +5,15 @@ local BridgeConnection = require(script.Parent.BridgeConnection)
 local BridgeIdentity = require(script.Parent.BridgeIdentity)
 local BridgeInstanceSwap = require(script.Parent.BridgeInstanceSwap)
 local BridgeMaterialService = require(script.Parent.BridgeMaterialService)
+local BridgeCollisionGroups = require(script.Parent.BridgeCollisionGroups)
 local BridgeReferenceOverlay = require(script.Parent.BridgeReferenceOverlay)
 local BridgeReferenceRetarget = require(script.Parent.BridgeReferenceRetarget)
 local BridgeScriptDocuments = require(script.Parent.BridgeScriptDocuments)
+local BridgeTransactionUpload = require(script.Parent.BridgeTransactionUpload)
 local BridgeValueEquality = require(script.Parent.BridgeValueEquality)
 local BridgeValueCodec = require(script.Parent.BridgeValueCodec)
-local AssetService = game:GetService("AssetService")
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
 local CollectionService = game:GetService("CollectionService")
-local ContentProvider = game:GetService("ContentProvider")
 local EncodingService = game:GetService("EncodingService")
 local RunService = game:GetService("RunService")
 local Selection = game:GetService("Selection")
@@ -92,7 +92,6 @@ local NATIVE_IDENTITY_CARRIER_SLOTS = {
 	"Spine",
 	"Waist",
 }
-local MESH_PART_APPLY_YIELD_INTERVAL = 4
 
 local function binaryReadRange(params: { [string]: any }, totalBytes: number, label: string): (number, number)
 	local offset = tonumber(params.offset)
@@ -336,18 +335,42 @@ local function markLiveMutation(ctx: { [string]: any }?, instance: Instance?)
 	end
 end
 
-local function setParentForSync(instance: Instance, parent: Instance?, ctx: { [string]: any }?)
+local function setParentForSync(instance: Instance, parent: Instance?, ctx: { [string]: any }?, profile: { [string]: number }?, serializedInsertion: boolean?)
 	if instance.Parent == parent then
 		return
 	end
 	if instance:IsA("PackageLink") then
 		error("PackageLink instances cannot be reparented")
 	end
+	local viewport = Workspace.CurrentCamera
+	if viewport ~= nil and viewport.Parent ~= Workspace and viewport ~= instance
+		and viewport:IsDescendantOf(instance)
+		and (parent == nil or parent ~= Workspace and not parent:IsDescendantOf(Workspace))
+	then
+		-- Detaching its ancestor makes Studio allocate a replacement camera.
+		-- Keep the existing viewport live before changing that ancestor.
+		setParentForSync(viewport, Workspace, ctx)
+	end
 	local wasLive = instance:IsDescendantOf(game)
-	local token = if ctx ~= nil then ctx.expectParentChange(instance, parent) else nil
+	local started = if profile then os.clock() else 0
+	local token = if ctx ~= nil then ctx.expectParentChange(instance, parent, profile, serializedInsertion) else nil
+	local expected = if profile then os.clock() else 0
+	local scope = if profile and ctx then ctx.syncProfile else nil
+	local previousProfile = if scope then scope.attachment else nil
+	if scope then
+		scope.attachment = profile
+	end
 	local ok, result = pcall(function()
 		instance.Parent = parent
 	end)
+	if scope then
+		scope.attachment = previousProfile
+	end
+	if profile then
+		profile.expectMs = (profile.expectMs or 0) + (expected - started) * 1000
+		profile.parentMs = (profile.parentMs or 0) + (os.clock() - expected) * 1000
+		profile.roots = (profile.roots or 0) + 1
+	end
 	if not ok then
 		cancelExpectedEvent(ctx, token)
 		error(result, 0)
@@ -359,6 +382,9 @@ local function setParentForSync(instance: Instance, parent: Instance?, ctx: { [s
 		cancelExpectedEvent(ctx, token)
 		local target = if parent == nil then "nil" else parent:GetFullName()
 		error(`Roblox rejected parenting {instance:GetFullName()} to {target}`, 0)
+	end
+	if token ~= nil and token.complete then
+		token.complete()
 	end
 end
 
@@ -403,11 +429,11 @@ local function setCurrentCameraForSync(camera: Camera?, ctx: { [string]: any }?)
 	end
 end
 
-local function removeInstanceForUndo(instance: Instance, ctx: { [string]: any }?)
+local function removeInstanceForUndo(instance: Instance, ctx: { [string]: any }?, retainedParent: Instance?)
 	if instance:IsA("PackageLink") then
 		error(`PackageLink instances cannot be removed directly: {instance:GetFullName()}`)
 	end
-	setParentForSync(instance, nil, ctx)
+	setParentForSync(instance, retainedParent, ctx)
 end
 
 local pathKey = BridgeIdentity.pathKey
@@ -955,23 +981,17 @@ local function assertInstanceInService(instance: Instance, service: Instance)
 	end
 end
 
-local function isProtectedWorkspaceCameraPath(pathSegments: any): boolean
-	if type(pathSegments) ~= "table" or #pathSegments ~= 2 then
-		return false
+local function assertChangeInstanceInService(instance, service, change, ctx)
+	local staged = if ctx.resolveStagedPath ~= nil
+		then ctx.resolveStagedPath(change.pathSegments, change.pathOrdinals)
+		else nil
+	if staged ~= instance then
+		assertInstanceInService(instance, service)
 	end
-	local rootName = tostring(pathSegments[1])
-	local cameraName = tostring(pathSegments[2])
-	return rootName == "Workspace" and (cameraName == "Camera" or cameraName == "CurrentCamera")
 end
 
 local function isProtectedWorkspaceCameraInstance(instance: Instance?): boolean
-	if instance == nil or not instance:IsA("Camera") then
-		return false
-	end
-	if instance.Parent ~= Workspace then
-		return false
-	end
-	return instance.Name == "Camera" or instance.Name == "CurrentCamera"
+	return instance ~= nil and instance == Workspace.CurrentCamera
 end
 
 local function decodeRefValue(raw: { [string]: any }, ctx: { [string]: any }?, serviceName: string?): any
@@ -1038,6 +1058,8 @@ local function enumHintForProperty(instance: Instance, propertyName: string): st
 	return propertyName
 end
 
+local runtimePropertiesByClass = {}
+
 local function classHasProperty(instance: Instance, propertyName: string): boolean
 	if instance:IsA("Model") or instance:IsA("WorldModel") then
 		if
@@ -1049,7 +1071,34 @@ local function classHasProperty(instance: Instance, propertyName: string): boole
 			return true
 		end
 	end
-	return RbxDomModule.findCanonicalPropertyDescriptor(instance.ClassName, propertyName) ~= nil
+	local className = instance.ClassName
+	if RbxDomModule.findCanonicalPropertyDescriptor(className, propertyName) ~= nil then
+		return true
+	end
+	local known = runtimePropertiesByClass[className]
+	if known ~= nil and known[propertyName] then
+		return true
+	end
+	local ok, value = pcall(function()
+		return (instance :: any)[propertyName]
+	end)
+	if not ok then
+		return false
+	end
+	local kind = typeof(value)
+	if kind == "function" or kind == "RBXScriptSignal" then
+		return false
+	end
+	-- Instance-valued lookup can also find a named child, so do not cache it
+	-- as a class property. The actual setter still validates every mutation.
+	if kind ~= "Instance" then
+		if known == nil then
+			known = {}
+			runtimePropertiesByClass[className] = known
+		end
+		known[propertyName] = true
+	end
+	return true
 end
 
 local function decodePropertyValue(
@@ -1114,10 +1163,15 @@ local function startEventProbe(stats: { [string]: any }): () -> ()
 end
 
 local function readProperty(instance: Instance, propertyName: string): (boolean, any)
+	if instance == Workspace and propertyName == "CollisionGroupData" then
+		return true, BridgeCollisionGroups.read()
+	end
 	if instance:IsA("Model") or instance:IsA("WorldModel") then
 		if propertyName == "Scale" then
 			return true, (instance :: any):GetScale()
-		elseif propertyName == "WorldPivot" or propertyName == "WorldPivotData" or propertyName == "Origin" then
+		elseif propertyName == "WorldPivot" or propertyName == "WorldPivotData" then
+			return true, (instance :: any).WorldPivot
+		elseif propertyName == "Origin" then
 			return true, (instance :: any):GetPivot()
 		end
 	end
@@ -1289,6 +1343,9 @@ local function resolveEntryInstance(
 end
 
 local function writeProperty(instance: Instance, propertyName: string, value: any): (boolean, any)
+	if instance == Workspace and propertyName == "CollisionGroupData" then
+		return pcall(BridgeCollisionGroups.write, value)
+	end
 	local writableInstance = instance :: any
 	if instance:IsA("Model") or instance:IsA("WorldModel") then
 		if propertyName == "Scale" then
@@ -1339,6 +1396,19 @@ local function writePropertyForSync(
 	if instance:IsA("PackageLink") then
 		return false, "PackageLink properties are read-only"
 	end
+	if typeof(value) == "Font" then
+		local okRead, current = readProperty(instance, propertyName)
+		if okRead and valuesEqual(current, value) then
+			-- Studio compares only the public Font fields, so an equal-looking
+			-- assignment cannot replace a different serialized cached face.
+			local intermediate = Font.new(value.Family, value.Weight,
+				if value.Style == Enum.FontStyle.Normal then Enum.FontStyle.Italic else Enum.FontStyle.Normal)
+			local ok, err = writePropertyForSync(instance, propertyName, intermediate, ctx)
+			if not ok then
+				return false, err
+			end
+		end
+	end
 	local token = if ctx ~= nil then ctx.expectPropertyEvent(instance, propertyName, value) else nil
 	local ok, result = writeProperty(instance, propertyName, value)
 	if not ok then
@@ -1362,6 +1432,11 @@ local function writePropertyForSync(
 	if not okRead or not valuesEqual(current, value) then
 		cancelExpectedEvent(ctx, token)
 		return false, `Roblox did not retain {propertyName}`
+	end
+	if propertyName == "CollisionFidelity" and instance:IsA("MeshPart") and ctx ~= nil then
+		-- Cooking may finish after the deferred pre-write signal, with no final
+		-- signal. Consume our exact expectation before its settle window expires.
+		ctx.samplePropertyChange(instance, propertyName)
 	end
 	return true, result
 end
@@ -1389,193 +1464,28 @@ local function setAttributeForSync(
 	return true, result
 end
 
-local function meshPartSourceKey(meshId: string, meshPart: MeshPart): string
-	return meshId
-		.. PATH_SEPARATOR
-		.. tostring(meshPart.CollisionFidelity.Value)
-		.. PATH_SEPARATOR
-		.. tostring(meshPart.RenderFidelity.Value)
-		.. PATH_SEPARATOR
-		.. tostring(meshPart.FluidFidelity.Value)
-end
-
-local function loadedMeshPartSources(ctx: { [string]: any }): { [string]: MeshPart }
-	if ctx.loadedMeshPartSources == nil then
-		local sources = {}
-		for _, candidate in game:GetDescendants() do
-			if candidate:IsA("MeshPart") and candidate.MeshId ~= "" then
-				sources[meshPartSourceKey(candidate.MeshId, candidate)] = candidate
-			end
-		end
-		ctx.loadedMeshPartSources = sources
-	end
-	return ctx.loadedMeshPartSources
-end
-
-local function findLoadedMeshPartSource(target: MeshPart, meshId: string, ctx: { [string]: any }): MeshPart?
-	local sources = loadedMeshPartSources(ctx)
-	local key = meshPartSourceKey(meshId, target)
-	local source = sources[key]
-	if
-		source == nil
-		or source == target
-		or source.Parent == nil
-		or source.MeshId ~= meshId
-		or source.CollisionFidelity ~= target.CollisionFidelity
-		or source.RenderFidelity ~= target.RenderFidelity
-		or source.FluidFidelity ~= target.FluidFidelity
-	then
-		sources[key] = nil
-		return nil
-	end
-	return source
-end
-
-local function rememberLoadedMeshPartSource(meshPart: MeshPart, ctx: { [string]: any })
-	if ctx.loadedMeshPartSources ~= nil and meshPart.MeshId ~= "" then
-		ctx.loadedMeshPartSources[meshPartSourceKey(meshPart.MeshId, meshPart)] = meshPart
-	end
-end
-
-local function preloadPropertyMeshPartSources(changes: { any }, ctx: { [string]: any }): (number, number)
-	local readySources = {}
-	local sources = {}
-
-	for _, change in ipairs(changes) do
-		local properties = if type(change) == "table" then change.properties else nil
-		local rawMeshId = if type(properties) == "table" then properties.MeshId else nil
-		if rawMeshId == nil then
-			continue
-		end
-
-		local instance = resolveInstance(change, ctx)
-		if instance == nil or not instance:IsA("MeshPart") then
-			continue
-		end
-
-		local serviceName = tostring(change.service or "")
-		local okDecode, decoded = decodePropertyValue(instance, "MeshId", rawMeshId, ctx, serviceName)
-		local meshId = if okDecode then tostring(decoded or "") else ""
-		local source = if meshId ~= "" then findLoadedMeshPartSource(instance, meshId, ctx) else nil
-		if source ~= nil and not readySources[source] then
-			readySources[source] = true
-			sources[#sources + 1] = source
-		end
-	end
-
-	ctx.readyMeshPartSources = readySources
-	if #sources == 0 then
-		return 0, 0
-	end
-
-	local started = os.clock()
-	ContentProvider:PreloadAsync(sources)
-	return #sources, (os.clock() - started) * 1000
-end
-
-local function applyMeshPartMeshId(
-	instance: Instance,
-	meshId: any,
-	ctx: { [string]: any },
-	suppliedSource: MeshPart?
-): (boolean, any)
-	if not instance:IsA("MeshPart") then
-		return false, "MeshId can only be applied to MeshPart"
-	end
-
-	local targetMeshPart = instance :: MeshPart
-	local meshIdText = tostring(meshId or "")
-	local sourceMeshPart = suppliedSource
-	local destroySource = false
-	local sourceReady = false
-	if suppliedSource ~= nil then
-		sourceReady = true
-	elseif meshIdText == "" then
-		sourceMeshPart = Instance.new("MeshPart")
-		destroySource = true
-		sourceReady = true
-	else
-		sourceMeshPart = findLoadedMeshPartSource(targetMeshPart, meshIdText, ctx)
-		if sourceMeshPart == nil then
-			local okContent, meshContent = pcall((Content :: any).fromUri, meshIdText)
-			if not okContent then
-				return false, meshContent
-			end
-			local okCreate, meshPartOrErr = pcall(AssetService.CreateMeshPartAsync, AssetService, meshContent, {
-				CollisionFidelity = targetMeshPart.CollisionFidelity,
-				RenderFidelity = targetMeshPart.RenderFidelity,
-				FluidFidelity = targetMeshPart.FluidFidelity,
-			})
-			if not okCreate or meshPartOrErr == nil then
-				return false, meshPartOrErr
-			end
-			sourceMeshPart = meshPartOrErr
-			destroySource = true
-			sourceReady = true
-		elseif ctx.readyMeshPartSources ~= nil then
-			sourceReady = ctx.readyMeshPartSources[sourceMeshPart]
-		end
-	end
-
-	local targetTextureContent = targetMeshPart.TextureContent
-	local targetSize = targetMeshPart.Size
-	local applyTokens = {}
-	if targetMeshPart:IsDescendantOf(game) then
-		for _, propertyName in ipairs({
-			"MeshId",
-			"MeshContent",
-			"TextureID",
-			"TextureContent",
-			"Size",
-			"CollisionFidelity",
-			"RenderFidelity",
-			"FluidFidelity",
+-- Undo uses an already serialized donor; ordinary mesh writes use protected setters.
+local function restoreMeshGeometry(instance: MeshPart, source: MeshPart, ctx): (boolean, any)
+	local size, texture = instance.Size, instance.TextureContent
+	local tokens = {}
+	if instance:IsDescendantOf(game) then
+		for _, name in ipairs({
+			"MeshId", "MeshContent", "MeshSize", "TextureID", "TextureContent", "Size",
+			"CollisionFidelity", "RenderFidelity", "FluidFidelity",
 		}) do
-			local okValue, value = pcall(function()
-				return (sourceMeshPart :: any)[propertyName]
-			end)
-			if okValue then
-				applyTokens[#applyTokens + 1] = ctx.expectPropertyEvent(targetMeshPart, propertyName, value)
-			end
+			tokens[#tokens + 1] = ctx.expectPropertyEvent(instance, name, (source :: any)[name])
 		end
 	end
-	local okApply, applyErr = pcall(targetMeshPart.ApplyMesh, targetMeshPart, sourceMeshPart)
-	if destroySource then
-		sourceMeshPart:Destroy()
-	end
-	if not okApply then
-		for _, token in ipairs(applyTokens) do
+	local ok, err = pcall(instance.ApplyMesh, instance, source)
+	if not ok then
+		for _, token in ipairs(tokens) do
 			cancelExpectedEvent(ctx, token)
 		end
-		return false, applyErr
+		return false, err
 	end
-	local restoreTokens = {}
-	local okRestore, restoreErr = pcall(function()
-		if targetMeshPart:IsDescendantOf(game) then
-			restoreTokens[#restoreTokens + 1] = ctx.expectPropertyEvent(targetMeshPart, "Size", targetSize)
-			restoreTokens[#restoreTokens + 1] =
-				ctx.expectPropertyEvent(targetMeshPart, "TextureContent", targetTextureContent)
-		end
-		targetMeshPart.Size = targetSize
-		targetMeshPart.TextureContent = targetTextureContent
-	end)
-	if not okRestore then
-		for _, token in ipairs(restoreTokens) do
-			cancelExpectedEvent(ctx, token)
-		end
-		return false, restoreErr
-	end
-	rememberLoadedMeshPartSource(targetMeshPart, ctx)
-	if ctx.readyMeshPartSources ~= nil then
-		ctx.readyMeshPartSources[targetMeshPart] = true
-	end
-	if not sourceReady then
-		ctx.meshPartApplyCount += 1
-		if ctx.meshPartApplyCount % MESH_PART_APPLY_YIELD_INTERVAL == 0 then
-			RunService.Heartbeat:Wait()
-		end
-	end
-	return true, nil
+	local okSize, sizeError = writePropertyForSync(instance, "Size", size, ctx)
+	if not okSize then return false, sizeError end
+	return writePropertyForSync(instance, "TextureContent", texture, ctx)
 end
 
 local function setTagForSync(instance: Instance, tag: string, added: boolean, ctx: { [string]: any })
@@ -1701,6 +1611,7 @@ local setSource = BridgeScriptDocuments.setSource
 local ScriptDocumentState = BridgeScriptDocuments
 
 local ReferenceOverlay = BridgeReferenceOverlay.create({
+	isProtectedWorkspaceCameraInstance = isProtectedWorkspaceCameraInstance,
 	BridgeIdentity = BridgeIdentity,
 	BridgeReferenceRetarget = BridgeReferenceRetarget,
 	CollectionService = CollectionService,
@@ -1732,6 +1643,8 @@ end
 local function keepUnknownsEnabled(ctx: { [string]: any }): boolean
 	return syncOptions(ctx).keepUnknowns == true
 end
+
+local isEngineManagedContainerInstance: (string, Instance) -> boolean
 
 local function includeManagedInstance(ctx: { [string]: any }, serviceName: string, instance: Instance): boolean
 	return ctx.includeExportInstance(serviceName, instance)
@@ -1838,7 +1751,7 @@ local function applySourceChange(
 
 	local instance = resolveInstance(change, ctx, true)
 	if instance ~= nil then
-		assertInstanceInService(instance, service)
+		assertChangeInstanceInService(instance, service, change, ctx)
 	end
 	if change.deleted == true then
 		if instance == nil then
@@ -1964,18 +1877,14 @@ local function syncDesiredEntry(
 	claimedInstances: { [Instance]: boolean },
 	createMissing: boolean
 ): Instance?
-	if isProtectedWorkspaceCameraPath(entry.pathSegments) then
-		stats.noops += 1
-		return nil
-	end
-
 	local instance = liveInstance(resolvedEntries[entry.key])
 	if instance == nil then
 		instance = resolveEntryInstance(entry, serviceName, ctx, resolvedEntries, claimedInstances)
 	end
 	if entry.anchorOnly and instance == nil then
 		error("Filtered ancestor was not found: " .. entry.key)
-	elseif entry.anchorOnly then
+	end
+	if entry.anchorOnly or isProtectedWorkspaceCameraInstance(instance) then
 		stats.noops += 1
 	elseif instance == nil and not createMissing then
 		stats.noops += 1
@@ -2044,6 +1953,7 @@ local function removeUnknownInstances(
 				desiredStableKeys
 			)
 			and not isProtectedWorkspaceCameraInstance(instance)
+			and not isEngineManagedContainerInstance(serviceName, instance)
 		then
 			unknown[instance] = true
 			removedCount += 1
@@ -2269,6 +2179,7 @@ local function applyInstanceUpserts(
 	local resolvedEntries = {}
 	local claimedInstances = {}
 	local createMissing = liveHydrateEnabled(ctx)
+	local verified = 0
 	for _, entry in ipairs(entries) do
 		if #entry.previousPathSegments > 0 then
 			local instance = resolveEntryInstance(entry, service.Name, ctx, resolvedEntries, claimedInstances)
@@ -2280,8 +2191,15 @@ local function applyInstanceUpserts(
 		end
 	end
 	for _, entry in ipairs(entries) do
-		syncDesiredEntry(entry, service.Name, ctx, stats, resolvedEntries, claimedInstances, createMissing)
+		local instance = syncDesiredEntry(entry, service.Name, ctx, stats, resolvedEntries, claimedInstances, createMissing)
+		if instance ~= nil and instance.ClassName == entry.className
+			and instance.Name == entry.pathSegments[#entry.pathSegments]
+			and instance.Parent == resolveEntryParent(entry, resolvedEntries) then
+			verified += 1
+		end
 	end
+	stats.instancesVerified = stats.instancesVerified or {}
+	stats.instancesVerified[serviceName] = (stats.instancesVerified[serviceName] or 0) + verified
 
 	if
 		stats.instanceCreated == beforeCreated
@@ -2303,6 +2221,7 @@ local function applyInstanceDeletes(
 
 	local beforeDeleted = stats.instanceDeleted
 	local targets = {}
+	local verified = 0
 	local seenTargets = {}
 	local resolvedEntries = {}
 	local claimedInstances = {}
@@ -2313,9 +2232,13 @@ local function applyInstanceDeletes(
 		local instance = resolveEntryInstance(entry, service.Name, ctx, resolvedEntries, claimedInstances)
 		if instance == nil then
 			stats.noops += 1
+			verified += 1
 			continue
 		end
-		if isProtectedWorkspaceCameraInstance(instance) or seenTargets[instance] then
+		if isProtectedWorkspaceCameraInstance(instance)
+			or isEngineManagedContainerInstance(serviceName, instance)
+			or seenTargets[instance]
+		then
 			stats.noops += 1
 		elseif instance:IsA("PackageLink") then
 			error(`PackageLink instances cannot be removed directly: {instance:GetFullName()}`)
@@ -2331,7 +2254,10 @@ local function applyInstanceDeletes(
 			error(`Studio did not remove {instance:GetFullName()}`)
 		end
 		stats.instanceDeleted += 1
+		verified += 1
 	end
+	stats.instancesVerified = stats.instancesVerified or {}
+	stats.instancesVerified[serviceName] = (stats.instancesVerified[serviceName] or 0) + verified
 
 	if stats.instanceDeleted == beforeDeleted then
 		stats.noops += 1
@@ -2405,50 +2331,32 @@ local function changedPropertyNames(properties)
 	if properties.MeshId ~= nil then
 		names[1] = "MeshId"
 	end
+	if properties.MeshContent ~= nil then
+		names[#names + 1] = "MeshContent"
+	end
+	if properties.MeshSize ~= nil then
+		names[#names + 1] = "MeshSize"
+	end
 	for propertyName in pairs(properties) do
 		propertyName = tostring(propertyName)
-		if propertyName ~= "MeshId" then
+		if propertyName ~= "MeshId" and propertyName ~= "MeshContent" and propertyName ~= "MeshSize" then
 			names[#names + 1] = propertyName
 		end
 	end
 	return names
 end
 
-local function writeDecodedProperty(instance, propertyName, decoded, ctx, stats)
+local function writeDecodedProperty(instance, propertyName, decoded, ctx, stats, nativeFont)
 	local okRead, current = readProperty(instance, propertyName)
-	if okRead and valuesEqual(current, decoded) then
+	if not nativeFont and okRead and valuesEqual(current, decoded) then
 		stats.noops += 1
 		return true, nil
 	end
 	local okWrite, err = writePropertyForSync(instance, propertyName, decoded, ctx)
-	if not okWrite and propertyName == "MeshId" and instance:IsA("MeshPart") then
-		local okApplyMesh, applyMeshErr = applyMeshPartMeshId(instance, decoded, ctx)
-		if not okApplyMesh then
-			error(`Failed to apply MeshId on {instance:GetFullName()}: {applyMeshErr}`)
-		end
-		okWrite = true
-	end
 	if not okWrite then
 		return false, err
 	end
-	if propertyName == "MeshId" and instance:IsA("MeshPart") then
-		local okRetained, retained = readProperty(instance, propertyName)
-		if not okRetained or not valuesEqual(retained, decoded) then
-			error(`Roblox did not retain {propertyName} on {instance:GetFullName()}`)
-		end
-	end
 	stats.propertyUpdated += 1
-	if
-		instance:IsA("MeshPart")
-		and (
-			propertyName == "MeshId"
-			or propertyName == "CollisionFidelity"
-			or propertyName == "RenderFidelity"
-			or propertyName == "FluidFidelity"
-		)
-	then
-		rememberLoadedMeshPartSource(instance, ctx)
-	end
 	return true, nil
 end
 
@@ -2457,8 +2365,62 @@ local function isMeshGeometryProperty(propertyName: string): boolean
 		or propertyName == "UnscaledVolInertiaOffDiags" or propertyName == "UnscaledVolume"
 end
 
+local function isNativeRootProperty(instance: Instance, propertyName: string): boolean
+	return instance.ClassName == "MeshPart" and (
+		propertyName == "MeshId" or propertyName == "MeshContent" or propertyName == "MeshSize"
+		or propertyName == "CollisionFidelity" or propertyName == "RenderFidelity" or propertyName == "FluidFidelity"
+	) or (propertyName == "LightingStyle" or propertyName == "PrioritizeLightingQuality")
+		and instance == game:GetService("Lighting")
+		or propertyName == "TexturePack" and instance.ClassName == "SurfaceAppearance"
+		or propertyName == "ChatVersion" and instance == game:GetService("TextChatService")
+		or propertyName == "Use2022Materials" and instance == game:GetService("MaterialService")
+		or (propertyName == "ModelStreamingBehavior" or propertyName == "StreamOutBehavior"
+			or propertyName == "StreamingIntegrityMode" or propertyName == "StreamingTargetRadius"
+			or propertyName == "UseNewLuauTypeSolver") and instance == Workspace
+		or propertyName == "GameSettingsAvatar" and instance == game:GetService("StarterPlayer")
+		or (propertyName == "Decoration" or propertyName == "AcquisitionMethod" or propertyName == "SmoothGrid" or propertyName == "PhysicsGrid") and instance.ClassName == "Terrain" and instance.Parent == Workspace
+end
+
+local function queueNativeRootWrite(instance, propertyName, rawValue, change, ctx, stats)
+	local session = ctx.editorTransaction
+	if session == nil or session.historyRecording == nil then
+		error("Native root sync requires an active undo recording")
+	end
+	local isTerrain = instance.ClassName == "Terrain" and (propertyName == "SmoothGrid" or propertyName == "PhysicsGrid")
+	local value = rawValue
+	if isTerrain then
+		if rawValue._type == "BinaryString" then
+			rawValue = { [propertyName] = rawValue }
+		end
+		propertyName = "SmoothGrid"
+		value = rawValue
+	else
+		local okDecode, decoded = decodePropertyValue(instance, propertyName, rawValue, ctx, change.service)
+		if not okDecode then
+			error(`Failed to decode {propertyName}: {decoded}`)
+		end
+		value = decoded
+	end
+	local okRead, current = readProperty(instance, propertyName)
+	if okRead and valuesEqual(current, value) then
+		stats.noops += 1
+		return
+	end
+	local writes = session.nativeRootWrites or {}
+	session.nativeRootWrites = writes
+	local index = #writes + 1
+	writes[index] = { instance = instance, name = propertyName, value = value, change = change }
+	stats.nativeRootWrites = stats.nativeRootWrites or {}
+	table.insert(stats.nativeRootWrites, {
+		index = index, className = instance.ClassName, pathSegments = change.pathSegments,
+		pathOrdinals = change.pathOrdinals, name = propertyName, value = rawValue,
+	})
+	markLiveMutation(ctx, instance)
+	stats.propertyUpdated += 1
+end
+
 local function applyChangedProperty(instance, propertyName, rawValue, change, ctx, stats, unreadableNames, serviceName)
-	if propertyName == "Source" then
+	if propertyName == "Source" or instance == Workspace and propertyName == "CurrentCamera" then
 		stats.noops += 1
 		return
 	end
@@ -2481,6 +2443,11 @@ local function applyChangedProperty(instance, propertyName, rawValue, change, ct
 	end
 	if propertyName == "Tags" then
 		applyTags(instance, rawValue, stats, ctx)
+		return
+	end
+	if isNativeRootProperty(instance, propertyName)
+		and (propertyName ~= "MeshContent" or type(rawValue) == "string") then
+		queueNativeRootWrite(instance, propertyName, rawValue, change, ctx, stats)
 		return
 	end
 	if not classHasProperty(instance, propertyName) then
@@ -2507,11 +2474,23 @@ local function applyChangedProperty(instance, propertyName, rawValue, change, ct
 		stats.noops += 1
 		return
 	end
+	local nativeFont = type(rawValue) == "table" and rawValue._nativeFont ~= nil
+	local assertActive = if nativeFont then ctx.assertEditorMutationActive else nil
+	local parentBefore = if nativeFont then instance.Parent else nil
+	local nameBefore = if nativeFont then instance.Name else nil
 	local okDecode, decoded = decodePropertyValue(instance, propertyName, rawValue, ctx, serviceName)
 	if not okDecode then
 		error(`Failed to decode {propertyName}: {decoded}`)
 	end
-	local okWrite, err = writeDecodedProperty(instance, propertyName, decoded, ctx, stats)
+	if nativeFont then
+		-- Native deserialization may yield. Recheck the captured operation and
+		-- target before entering the synchronous setter, not after the write.
+		assertActive()
+		if instance.Parent ~= parentBefore or instance.Name ~= nameBefore then
+			error("Font target moved while its native value was decoding; retry the sync")
+		end
+	end
+	local okWrite, err = writeDecodedProperty(instance, propertyName, decoded, ctx, stats, nativeFont)
 	if okWrite then
 		return
 	end
@@ -2523,12 +2502,14 @@ local function applyChangedProperty(instance, propertyName, rawValue, change, ct
 	error(`Failed to write {propertyName} on {instance:GetFullName()}: {err}`)
 end
 
-local function resetProperty(instance, propertyName, ctx, stats, unreadableNames)
+local function resetProperty(instance, propertyName, change, ctx, stats, unreadableNames)
 	if propertyName == "Tags" then
 		applyTags(instance, {}, stats, ctx)
 		return
 	end
-	if propertyName == "Source" or propertyName == "ClassName" or propertyName == "Name" then
+	if propertyName == "Source" or propertyName == "ClassName" or propertyName == "Name"
+		or instance == Workspace and propertyName == "CurrentCamera"
+	then
 		error(`Property {propertyName} cannot be reset`)
 	end
 	if not classHasProperty(instance, propertyName) then
@@ -2545,6 +2526,10 @@ local function resetProperty(instance, propertyName, ctx, stats, unreadableNames
 	defaultInstance:Destroy()
 	if not okDefault then
 		error(`Cannot read the default value of {propertyName} on {instance.ClassName}`)
+	end
+	if isNativeRootProperty(instance, propertyName) then
+		queueNativeRootWrite(instance, propertyName, ctx.serializeValue(defaultValue), change, ctx, stats)
+		return
 	end
 	local okRead, current = readProperty(instance, propertyName)
 	if okRead and valuesEqual(current, defaultValue) then
@@ -2598,6 +2583,143 @@ local function applyChangedAttribute(instance, attributeName, rawValue, change, 
 	error(`Failed to write attribute {attributeName} on {instance:GetFullName()}: {err}`)
 end
 
+local function recordVerifyMismatch(stats, change, name: string, detail: string)
+	stats.verifyMismatches[#stats.verifyMismatches + 1] =
+		`{table.concat(change.pathSegments, ".")}.{name}{detail}`
+end
+
+local function verifyChangedProperty(instance, propertyName, rawValue, change, ctx, stats, unreadableNames, serviceName)
+	if propertyName == "Source" or instance == Workspace and propertyName == "CurrentCamera" then
+		return
+	end
+	if propertyName == "ClassName" or propertyName == "Name" then
+		if instance[propertyName] ~= tostring(rawValue) then
+			recordVerifyMismatch(stats, change, propertyName, "")
+		else
+			stats.verified += 1
+		end
+		return
+	end
+	if propertyName == "Tags" then
+		local desired = {}
+		for _, tag in pairs(if type(rawValue) == "table" then rawValue else {}) do
+			if type(tag) == "string" and tag ~= "" then
+				desired[tag] = true
+			end
+		end
+		for _, tag in ipairs(CollectionService:GetTags(instance)) do
+			if not desired[tag] then
+				recordVerifyMismatch(stats, change, propertyName, ` has unexpected tag {tag}`)
+				return
+			end
+			desired[tag] = nil
+		end
+		if next(desired) ~= nil then
+			recordVerifyMismatch(stats, change, propertyName, ` is missing tag {next(desired)}`)
+		else
+			stats.verified += 1
+		end
+		return
+	end
+	-- These fields retain their existing verified native setter path.
+	if isNativeRootProperty(instance, propertyName)
+		or instance:IsA("MeshPart") and isMeshGeometryProperty(propertyName)
+		or type(unreadableNames) == "table" and unreadableNames[propertyName] then
+		return
+	end
+	if not classHasProperty(instance, propertyName) then
+		recordVerifyMismatch(stats, change, propertyName, " is not a property")
+		return
+	end
+	local okDecode, decoded = decodePropertyValue(instance, propertyName, rawValue, ctx, serviceName)
+	if not okDecode then
+		error(`Failed to decode {propertyName}: {decoded}`)
+	end
+	local okRead, current = readProperty(instance, propertyName)
+	if not okRead then
+		recordVerifyMismatch(stats, change, propertyName, " is unreadable")
+	elseif valuesEqual(current, decoded) then
+		stats.verified += 1
+	else
+		recordVerifyMismatch(stats, change, propertyName, "")
+	end
+end
+
+local function verifyPropertyChange(instance, change, ctx, stats, unreadableNames, serviceName)
+	for _, propertyName in ipairs(changedPropertyNames(change.properties or {})) do
+		verifyChangedProperty(instance, propertyName, change.properties[propertyName], change, ctx, stats, unreadableNames, serviceName)
+	end
+	for attributeName, rawValue in pairs(change.attributes or {}) do
+		attributeName = tostring(attributeName)
+		local okDecode, decoded = decodeValue(rawValue, nil)
+		if not okDecode then
+			error(`Failed to decode attribute {attributeName}: {decoded}`)
+		end
+		if valuesEqual(instance:GetAttribute(attributeName), decoded) then
+			stats.verified += 1
+		else
+			recordVerifyMismatch(stats, change, attributeName, " (attribute)")
+		end
+	end
+	for _, attributeName in ipairs(change.deletedAttributes or {}) do
+		if instance:GetAttribute(attributeName) == nil then
+			stats.verified += 1
+		else
+			recordVerifyMismatch(stats, change, attributeName, " (attribute not removed)")
+		end
+	end
+end
+
+local function expectContainerSettings(rows: { any }, ctx: { [string]: any }, tokens: { any })
+	for _, change in ipairs(rows) do
+		local serviceName = validatedChangeService(change, ctx)
+		local instance = resolveInstance(change, ctx)
+		if instance == nil then
+			error(`Native container was not found: {table.concat(change.pathSegments, ".")}`)
+		end
+		for propertyName, rawValue in pairs(change.properties or {}) do
+			if propertyName == "Tags" then
+				local desired = {}
+				for _, tag in pairs(if type(rawValue) == "table" then rawValue else {}) do
+					if type(tag) == "string" and tag ~= "" then
+						desired[tag] = true
+					end
+				end
+				for _, tag in ipairs(CollectionService:GetTags(instance)) do
+					if not desired[tag] then
+						tokens[#tokens + 1] = ctx.expectTagChange(instance, tag, false)
+					end
+					desired[tag] = nil
+				end
+				for tag in pairs(desired) do
+					tokens[#tokens + 1] = ctx.expectTagChange(instance, tag, true)
+				end
+			elseif propertyName ~= "Source" and propertyName ~= "ClassName"
+				and not (instance == Workspace and propertyName == "CurrentCamera")
+				and not isNativeRootProperty(instance, propertyName)
+				and classHasProperty(instance, propertyName) then
+				local okDecode, decoded = decodePropertyValue(instance, propertyName, rawValue, ctx, serviceName)
+				if okDecode then
+					tokens[#tokens + 1] = ctx.expectPropertyEvent(instance, propertyName, decoded)
+				end
+			end
+		end
+		local desiredAttributes = change.attributes or {}
+		for attributeName in pairs(instance:GetAttributes()) do
+			if desiredAttributes[attributeName] == nil then
+				tokens[#tokens + 1] = ctx.expectAttributeEvent(instance, attributeName, nil)
+			end
+		end
+		for attributeName, rawValue in pairs(desiredAttributes) do
+			local okDecode, decoded = decodeValue(rawValue, nil)
+			if not okDecode then
+				error(`Failed to decode attribute {attributeName}: {decoded}`)
+			end
+			tokens[#tokens + 1] = ctx.expectAttributeEvent(instance, attributeName, decoded)
+		end
+	end
+end
+
 local function applyPropertyChange(
 	change: { [string]: any },
 	ctx: { [string]: any },
@@ -2605,7 +2727,9 @@ local function applyPropertyChange(
 	touchedServices: { [string]: boolean }
 )
 	local serviceName, service = validatedChangeService(change, ctx)
-	touchedServices[serviceName] = true
+	if not stats.verifyOnly then
+		touchedServices[serviceName] = true
+	end
 	if tostring(change.className or "") == "PackageLink" then
 		error("PackageLink instances are read-only")
 	end
@@ -2616,22 +2740,29 @@ local function applyPropertyChange(
 			`Target instance was not found: {table.concat(cloneArray(change.pathSegments), ".")} [{change.className or ""}]`
 		)
 	end
-	local staged = if ctx.resolveStagedPath ~= nil
-		then ctx.resolveStagedPath(change.pathSegments, change.pathOrdinals)
-		else nil
-	if staged ~= instance then
-		assertInstanceInService(instance, service)
-	end
-	if isProtectedWorkspaceCameraPath(change.pathSegments) or isProtectedWorkspaceCameraInstance(instance) then
+	assertChangeInstanceInService(instance, service, change, ctx)
+	if isProtectedWorkspaceCameraInstance(instance) then
 		stats.noops += 1
 		return
 	end
 	local unreadableNames = if type(ctx.unreadablePropertyNames) == "table"
 		then ctx.unreadablePropertyNames[instance]
 		else nil
+	if stats.verifyOnly then
+		verifyPropertyChange(instance, change, ctx, stats, unreadableNames, serviceName)
+		return
+	end
 	local properties = change.properties
 	if type(properties) == "table" then
+		if instance:IsA("Terrain") and (properties.SmoothGrid ~= nil or properties.PhysicsGrid ~= nil) then
+			queueNativeRootWrite(instance, "SmoothGrid", {
+				SmoothGrid = properties.SmoothGrid, PhysicsGrid = properties.PhysicsGrid,
+			}, change, ctx, stats)
+		end
 		for _, propertyName in ipairs(changedPropertyNames(properties)) do
+			if instance:IsA("Terrain") and (propertyName == "SmoothGrid" or propertyName == "PhysicsGrid") then
+				continue
+			end
 			applyChangedProperty(
 				instance,
 				propertyName,
@@ -2648,7 +2779,7 @@ local function applyPropertyChange(
 	local resetProperties = change.resetProperties
 	if type(resetProperties) == "table" then
 		for _, propertyName in ipairs(resetProperties) do
-			resetProperty(instance, propertyName, ctx, stats, unreadableNames)
+			resetProperty(instance, propertyName, change, ctx, stats, unreadableNames)
 		end
 	end
 
@@ -2777,12 +2908,28 @@ local function validateCreatableClass(className: any, cache: { [string]: boolean
 	return className
 end
 
+local ENGINE_MANAGED_CONTAINERS = {
+	Workspace = { "Terrain" },
+	StarterPlayer = { "StarterPlayerScripts", "StarterCharacterScripts" },
+	TextChatService = {
+		"ChatWindowConfiguration", "ChatInputBarConfiguration", "BubbleChatConfiguration", "ChannelTabsConfiguration",
+	},
+}
+
+isEngineManagedContainerInstance = function(serviceName: string, instance: Instance): boolean
+	local classes = ENGINE_MANAGED_CONTAINERS[serviceName]
+	return classes ~= nil
+		and instance.Parent == game:GetService(serviceName)
+		and table.find(classes, instance.ClassName) ~= nil
+end
+
 local function isEngineManagedContainerEntry(serviceName: string, entry: { [string]: any }): boolean
-	if serviceName ~= "StarterPlayer" or type(entry.pathSegments) ~= "table" or #entry.pathSegments ~= 2 then
+	local classes = ENGINE_MANAGED_CONTAINERS[serviceName]
+	if classes == nil or type(entry.pathSegments) ~= "table" or #entry.pathSegments ~= 2 then
 		return false
 	end
 	local className = entry.className
-	return (className == "StarterPlayerScripts" or className == "StarterCharacterScripts")
+	return table.find(classes, className) ~= nil
 		and entry.pathSegments[2] == className
 end
 
@@ -3002,10 +3149,17 @@ local function validateMutationRequest(
 	if params.probeEvents ~= nil and type(params.probeEvents) ~= "boolean" then
 		error("Editor mutation probeEvents must be a boolean")
 	end
+	if params.verifyOnly ~= nil and type(params.verifyOnly) ~= "boolean" then
+		error("Editor mutation verifyOnly must be a boolean")
+	end
 	local serviceSet = {}
 	local classCache = {}
-	local maxChanges = tonumber(ctx.maxChangesPerRequest) or 5000
 	local sourcePayloadRequired = requireSourcePayload ~= false
+	-- Transaction metadata aggregates many bounded mutation batches. The wire
+	-- batch limit still applies when validating an actual mutation payload.
+	local maxChanges = if sourcePayloadRequired
+		then tonumber(ctx.maxChangesPerRequest) or 5000
+		else BridgeTransactionUpload.MAX_ROWS
 	validateChangeList(params.instanceChanges, "instance", ctx, serviceSet, classCache, maxChanges, sourcePayloadRequired)
 	validateChangeList(params.sourceChanges, "source", ctx, serviceSet, classCache, maxChanges, sourcePayloadRequired)
 	validateChangeList(params.propertyChanges, "property", ctx, serviceSet, classCache, maxChanges, sourcePayloadRequired)
@@ -3042,19 +3196,27 @@ local function mutationSnapshotLayout(
 		local restricted = restrictedMutationServices ~= nil and restrictedMutationServices[serviceName] == true
 		addSnapshotMetadataTarget(metadataTargets, metadataSeen, service)
 		if service == Workspace then
-			local terrain = Workspace:FindFirstChildOfClass("Terrain")
-			if terrain ~= nil then
-				preserved[terrain] = true
-				addSnapshotMetadataTarget(metadataTargets, metadataSeen, terrain)
-			end
 			local currentCamera = Workspace.CurrentCamera
 			if currentCamera ~= nil then
 				preserved[currentCamera] = true
 				addSnapshotMetadataTarget(metadataTargets, metadataSeen, currentCamera)
+				if currentCamera.Parent == Workspace and (not restricted or mutationRoots and mutationRoots[currentCamera]) then
+					local children = {}
+					for _, child in ipairs(currentCamera:GetChildren()) do
+						if includeManagedInstance(ctx, serviceName, child) then
+							children[#children + 1] = child
+							roots[#roots + 1] = child
+						end
+					end
+					groups[#groups + 1] = {
+						serviceName = serviceName, target = currentCamera, count = #children, preserved = {},
+					}
+				end
 			end
 		end
-		if serviceName == "StarterPlayer" then
-			for _, className in ipairs({ "StarterPlayerScripts", "StarterCharacterScripts" }) do
+		local managedClasses = ENGINE_MANAGED_CONTAINERS[serviceName]
+		if managedClasses ~= nil then
+			for _, className in ipairs(managedClasses) do
 				local container = service:FindFirstChildOfClass(className)
 				if container ~= nil then
 					preserved[container] = true
@@ -3339,7 +3501,7 @@ function TransactionState.captureProperty(
 	-- ApplyMesh preserves the engine's serialized mass/inertia fields even though
 	-- plugins cannot read them. Store bytes, not retained temporary instances.
 	if instance:IsA("MeshPart") and not seenNames.__meshGeometry and (
-		isMeshGeometryProperty(propertyName) or propertyName == "MeshId"
+		isMeshGeometryProperty(propertyName) or propertyName == "MeshId" or propertyName == "MeshContent" or propertyName == "MeshSize"
 		or propertyName == "CollisionFidelity" or propertyName == "RenderFidelity" or propertyName == "FluidFidelity"
 	) then
 		seenNames.__meshGeometry = true
@@ -3467,8 +3629,9 @@ function TransactionState.captureSnapshot(serviceNames: { string }, params: { [s
 		originalRoots = originalRoots,
 		instanceCount = instanceCount,
 		currentCamera = Workspace.CurrentCamera,
+		currentCameraParent = if Workspace.CurrentCamera then Workspace.CurrentCamera.Parent else nil,
 		scriptDocuments = ScriptDocumentState.capture(
-			serviceNames,
+			params.scriptDocumentServices or serviceNames,
 			if hasStructuralChanges or params.captureAllScriptDocuments == true then nil else sourceKeys
 		),
 		referenceOverlay = ReferenceOverlay.capture(groups),
@@ -3522,7 +3685,7 @@ function TransactionState.restoreMetadata(
 			if #meshes ~= 1 or not meshes[1]:IsA("MeshPart") then
 				error("Invalid mesh geometry rollback snapshot")
 			end
-			local ok, result = applyMeshPartMeshId(instance, nil, ctx, meshes[1])
+			local ok, result = restoreMeshGeometry(instance, meshes[1], ctx)
 			meshes[1]:Destroy()
 			if not ok then
 				error(`Could not restore mesh geometry for {instance:GetFullName()}: {result}`)
@@ -3533,7 +3696,7 @@ function TransactionState.restoreMetadata(
 			then replacements[entry.value] or entry.value
 			else entry.value
 		local okRead, current = readProperty(instance, entry.name)
-		if not okRead or not valuesEqual(current, value) then
+		if typeof(value) == "Font" or not okRead or not valuesEqual(current, value) then
 			local okWrite, writeError = writePropertyForSync(instance, entry.name, value, ctx)
 			if not okWrite then
 				error(`Could not restore {instance:GetFullName()}.{entry.name}: {writeError}`)
@@ -3567,10 +3730,30 @@ function TransactionState.restoreSnapshotState(
 )
 	TransactionState.restoreMetadata(snapshot, replacements, ctx)
 	if snapshot.currentCamera ~= nil then
+		local parent = replacements[snapshot.currentCameraParent] or snapshot.currentCameraParent
+		if parent ~= nil then
+			setParentForSync(snapshot.currentCamera, parent, ctx)
+		end
 		setCurrentCameraForSync(replacements[snapshot.currentCamera] or snapshot.currentCamera, ctx)
 	end
 	ScriptDocumentState.apply(snapshot.scriptDocuments or {}, nil, nil, replacements)
 	ReferenceOverlay.apply(snapshot.referenceOverlay or {}, replacements, ctx)
+end
+
+function TransactionState.destroyOwned(instance: Instance, ctx: { [string]: any })
+	local tokens = {}
+	-- Destroy also unparents every child. Those inverse writes belong to the
+	-- transaction; they must not be replayed onto the restored originals.
+	for _, child in ipairs(instance:GetDescendants()) do
+		tokens[#tokens + 1] = ctx.expectPropertyEvent(child, "Parent", nil)
+	end
+	local ok, result = pcall(instance.Destroy, instance)
+	for _, token in ipairs(tokens) do
+		cancelExpectedEvent(ctx, token)
+	end
+	if not ok then
+		error(result, 0)
+	end
 end
 
 function TransactionState.restoreSnapshot(
@@ -3639,6 +3822,24 @@ function TransactionState.restoreSnapshot(
 			end
 		end
 	end
+	-- A nested viewport is present in the serialized ancestor, but the live
+	-- object must survive rollback. Retarget its snapshot copy back to it.
+	local viewport = snapshot.currentCamera
+	local viewportCopy = if viewport then replacements[viewport] else nil
+	if viewportCopy ~= nil and viewportCopy ~= viewport then
+		replacements[viewport] = viewport
+		replacements[viewportCopy] = viewport
+		setParentForSync(viewport, viewportCopy.Parent, ctx)
+		for _, child in ipairs(viewport:GetChildren()) do
+			setParentForSync(child, nil, ctx)
+			removed[#removed + 1] = { instance = child }
+		end
+		for _, child in ipairs(viewportCopy:GetChildren()) do
+			setParentForSync(child, viewport, ctx)
+		end
+		setParentForSync(viewportCopy, nil, ctx)
+		removed[#removed + 1] = { instance = viewportCopy }
+	end
 	if next(replacements) then
 		local scanRoots = {}
 		for serviceName, allowed in pairs(ctx.allowedServices) do
@@ -3667,11 +3868,11 @@ function TransactionState.restoreSnapshot(
 	local destroyed = {}
 	for _, root in ipairs(removed) do
 		destroyed[root.instance] = true
-		root.instance:Destroy()
+		TransactionState.destroyOwned(root.instance, ctx)
 	end
 	for _, root in ipairs(snapshot.originalRoots) do
 		if root.Parent == nil and not destroyed[root] then
-			root:Destroy()
+			TransactionState.destroyOwned(root, ctx)
 		end
 	end
 	return replacements
@@ -3939,6 +4140,16 @@ function TransactionState.replayJournalValues(
 			)
 		end
 	end
+	if record.attributesSnapshot ~= nil then
+		local snapshot = {}
+		for name in pairs(instance:GetAttributes()) do
+			snapshot[name] = { captured = true }
+		end
+		for name, value in pairs(record.attributesSnapshot) do
+			snapshot[name] = { captured = true, value = value }
+		end
+		TransactionState.replayJournalAttributes(instance, snapshot, ctx)
+	end
 	TransactionState.replayJournalAttributes(instance, record.attributes, ctx)
 	if record.tags ~= nil then
 		TransactionState.replayJournalTags(instance, record.tags, ctx)
@@ -3996,32 +4207,91 @@ function TransactionState.rollback(
 	end
 	for _, instance in ipairs(incoming) do
 		if not session.preservedJournalRoots or not session.preservedJournalRoots[instance] then
-			instance:Destroy()
+			TransactionState.destroyOwned(instance, ctx)
 		end
 	end
 	return replacements
 end
 
-function TransactionState.rollbackSession(session: { [string]: any }, ctx: { [string]: any }): { [Instance]: Instance }
-	finishHistoryRecording(session.historyRecording, Enum.FinishRecordingOperation.Cancel)
-	session.historyRecording = nil
-	if session.mutated ~= true then
-		TransactionState.finishJournal(session, ctx)
-		session.changeJournal = nil
-		if session.nativeUndo ~= nil then
-			local incoming = ReferenceOverlay.rollbackNative(session.nativeUndo, ctx)
-			session.nativeUndo = nil
-			for _, instance in ipairs(incoming) do
-				if instance.Parent == nil then
-					instance:Destroy()
-				end
+function TransactionState.expectSnapshotUndo(snapshot: { [string]: any }, ctx: { [string]: any }): { any }
+	local tokens = {}
+	for _, entry in ipairs(snapshot.metadata or {}) do
+		local current = entry.instance:GetAttributes()
+		for name, value in pairs(current) do
+			if not valuesEqual(value, entry.attributes[name]) then
+				tokens[#tokens + 1] = ctx.expectAttributeEvent(entry.instance, name, entry.attributes[name])
 			end
 		end
-		return {}
+		for name, value in pairs(entry.attributes) do
+			if current[name] == nil then
+				tokens[#tokens + 1] = ctx.expectAttributeEvent(entry.instance, name, value)
+			end
+		end
 	end
+	for _, entry in ipairs(snapshot.properties or {}) do
+		if entry.name ~= "__meshGeometry" then
+			local okRead, current = readProperty(entry.instance, entry.name)
+			if okRead and not valuesEqual(current, entry.value) then
+				tokens[#tokens + 1] = ctx.expectPropertyEvent(entry.instance, entry.name, entry.value)
+			end
+		end
+	end
+	return tokens
+end
+
+function TransactionState.rollbackSession(session: { [string]: any }, ctx: { [string]: any }): { [Instance]: Instance }
+	if session.nativeServiceImport ~= nil and not session.nativeServiceImport.readerFinished then
+		error("Studio has not returned the native insertion result; old contents are still retained")
+	end
+	if session.pendingNativeRootWrite ~= nil then
+		error("A native root setter is still in flight; rollback remains pending")
+	end
+	for _, write in ipairs(session.nativeRootWrites or {}) do
+		cancelExpectedEvent(ctx, write.token)
+	end
+	for _, token in ipairs(session.nativeSettingTokens or {}) do
+		cancelExpectedEvent(ctx, token)
+	end
+	session.nativeSettingTokens = nil
+	local undoTokens = {}
+	local engineUndo = session.mutated == true and (
+		(session.nativeUndo ~= nil and session.nativeUndo.explicitRollback ~= true)
+		or next(session.snapshot.groups or {}) ~= nil
+		or next(session.nativeRootWrites or {}) ~= nil
+	)
 	local ok, result = xpcall(function()
-		local initialRecords = TransactionState.drainJournal(session, ctx)
-		TransactionState.prepareJournalRollback(session, initialRecords, ctx)
+		-- Cancel emits inverse events. Freeze outside edits first and identify
+		-- those inverse writes so they cannot replace the change journal.
+		TransactionState.drainJournal(session, ctx)
+		-- Commit validation may already have drained the conflicting edits into
+		-- the session. Preserve those objects before native rollback removes them.
+		TransactionState.prepareJournalRollback(session, session.changeJournal or {}, ctx)
+		-- Before our first write, every recorded change belongs to Studio.
+		-- Cancel would undo those edits too, including voxels with no property
+		-- event for the journal to replay.
+		if engineUndo then
+			undoTokens = TransactionState.expectSnapshotUndo(session.snapshot, ctx)
+			finishHistoryRecording(session.historyRecording, Enum.FinishRecordingOperation.Cancel)
+			session.historyRecording = nil
+		elseif session.mutated ~= true then
+			finishHistoryRecording(session.historyRecording)
+			session.historyRecording = nil
+		end
+		if session.mutated ~= true then
+			local records = TransactionState.finishJournal(session, ctx)
+			TransactionState.replayJournal(records, {}, ctx)
+			session.changeJournal = nil
+			if session.nativeUndo ~= nil then
+				local incoming = ReferenceOverlay.rollbackNative(session.nativeUndo, ctx)
+				session.nativeUndo = nil
+				for _, instance in ipairs(incoming) do
+					if instance.Parent == nil then
+						TransactionState.destroyOwned(instance, ctx)
+					end
+				end
+			end
+			return {}
+		end
 		local function preservePendingJournalChanges()
 			local records = TransactionState.drainJournal(session, ctx)
 			TransactionState.prepareJournalRollback(session, records, ctx)
@@ -4029,6 +4299,15 @@ function TransactionState.rollbackSession(session: { [string]: any }, ctx: { [st
 		local replacements = TransactionState.rollback(session, ctx, preservePendingJournalChanges)
 		local records = TransactionState.finishJournal(session, ctx)
 		TransactionState.replayJournal(records, replacements, ctx)
+		if session.nativeUndo and session.nativeUndo.retainedParent then
+			session.nativeUndo.retainedParent:Destroy()
+			session.nativeUndo.retainedParent = nil
+		end
+		-- Restore explicit snapshots and retained roots before committing so
+		-- Undo/Redo cannot revive failed own writes. Engine Cancel would also
+		-- undo outside voxels that ordinary property journals cannot observe.
+		finishHistoryRecording(session.historyRecording)
+		session.historyRecording = nil
 		if session.nativeUndo ~= nil then
 			local stableFrames = 0
 			local firstError
@@ -4077,6 +4356,9 @@ function TransactionState.rollbackSession(session: { [string]: any }, ctx: { [st
 		session.changeJournal = nil
 		return replacements
 	end, debug.traceback)
+	for _, token in ipairs(undoTokens) do
+		cancelExpectedEvent(ctx, token)
+	end
 	if not ok then
 		if session.journalActive then
 			pcall(ctx.finishStudioChangeJournal, session.transactionId)
@@ -4186,6 +4468,12 @@ function NativeSerialization.captureGenerations(
 ): { [string]: number }?
 	local generations = {}
 	for _, serviceName in ipairs(services) do
+		-- Voxel edits do not emit the property events behind this generation.
+		-- A Workspace export must serialize fresh Terrain bytes. Other services
+		-- can still reuse their completely observed payloads.
+		if serviceName == "Workspace" then
+			return nil
+		end
 		if not session.ctx.isStudioChangeTracking(serviceName) then
 			return nil
 		end
@@ -4338,7 +4626,8 @@ function NativeSerialization.appendIdentityCarriers(
 		local instanceIndex = (firstCarrierIndex - 1) * #NATIVE_IDENTITY_CARRIER_SLOTS + 2
 		for carrierIndex = firstCarrierIndex, carrierCount do
 			local carrier = pool.carriers[carrierIndex]
-			if carrier == nil then
+			local fresh = carrier == nil
+			if fresh then
 				carrier = Instance.new(NATIVE_IDENTITY_CARRIER_CLASS)
 				carrier.Name = prefix .. tostring(carrierIndex)
 				pool.carriers[carrierIndex] = carrier
@@ -4346,7 +4635,7 @@ function NativeSerialization.appendIdentityCarriers(
 			local writableCarrier = carrier :: any
 			for _, propertyName in ipairs(NATIVE_IDENTITY_CARRIER_SLOTS) do
 				local target = instances[instanceIndex]
-				if writableCarrier[propertyName] ~= target then
+				if fresh or writableCarrier[propertyName] ~= target then
 					writableCarrier[propertyName] = target
 				end
 				if target == nil then
@@ -4657,6 +4946,61 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local session = editorTransactions[transactionId]
 		if type(session) == "table" then
 			local state = if session.rollbackFailed ~= nil then "rollbackFailed" else tostring(session.state or "open")
+			if params.nativeTerrainBaseline ~= nil then
+				assertTransactionLease(session)
+				if type(params.nativeTerrainBaseline) ~= "string" or #params.nativeTerrainBaseline ~= 88
+					or (params.nativeRootWrite == nil and (session.terrainBaseline ~= nil or session.mutated))
+					or (params.nativeRootWrite ~= nil and params.finishNativeRootWrite ~= true) then
+					error("Invalid Terrain transaction baseline")
+				end
+			end
+			if params.nativeRootWrite ~= nil then
+				assertTransactionLease(session)
+				if state ~= "open" and state ~= "prepared" or session.historyRecording == nil then
+					error("Native root sync requires an active undo recording")
+				end
+				local write = if session.nativeRootWrites then session.nativeRootWrites[params.nativeRootWrite] else nil
+				if write == nil or not isNativeRootProperty(write.instance, write.name)
+					or resolvePathSegments(write.change.pathSegments, nil, write.change.pathOrdinals) ~= write.instance then
+					error("Native root write target is no longer valid")
+				end
+				if params.nativeTerrainBaseline ~= nil and (write.instance ~= game:GetService("Workspace").Terrain or write.name ~= "SmoothGrid") then
+					error("Terrain baseline does not match the native root write")
+				end
+				if params.finishNativeRootWrite == true then
+					if session.pendingNativeRootWrite ~= write then
+						error("Native root write is no longer in flight")
+					end
+					session.pendingNativeRootWrite = nil
+					if params.nativeRootChanged ~= true then
+						cancelExpectedEvent(ctx, write.token)
+					else
+						-- Some setters finish after their only pre-write signal.
+						ctx.samplePropertyChange(write.instance, write.name)
+					end
+					write.finished = true
+					endSessionOperation(editorTransactions, transactionId, session)
+				else
+					if session.pendingNativeRootWrite ~= nil or write.finished then
+						error("Native root write was already started")
+					end
+					write.token = ctx.expectPropertyEvent(write.instance, write.name, write.value)
+					session.pendingNativeRootWrite = write
+					beginSessionOperation(session)
+					-- The native call has a two-second budget. Keep rollback fenced
+					-- across that call, including a disconnected/killed daemon.
+					task.delay(5, function()
+						if session.pendingNativeRootWrite ~= write then return end
+						session.pendingNativeRootWrite = nil
+						cancelExpectedEvent(ctx, write.token)
+						session.expireRequested = true
+						endSessionOperation(editorTransactions, transactionId, session)
+					end)
+				end
+			end
+			if params.nativeTerrainBaseline ~= nil then
+				session.terrainBaseline = params.nativeTerrainBaseline
+			end
 			local geometry = nil
 			if params.meshGeometry ~= nil then
 				assertTransactionLease(session)
@@ -4684,6 +5028,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				rolledBack = false,
 				rollbackError = session.rollbackFailed,
 				meshGeometry = geometry,
+				nativeRootWrite = params.nativeRootWrite,
+				historyRecording = session.historyRecording,
+				terrainBaseline = session.terrainBaseline,
 			}
 		end
 		local outcome = transactionOutcomes.get(transactionId)
@@ -4808,6 +5155,13 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 	end
 
 	function api.getLiveSourceBatch(params: { [string]: any }): { [string]: any }
+		local transaction = if params.transactionId ~= nil then editorTransactions[params.transactionId] else nil
+		if params.transactionId ~= nil then
+			if transaction == nil or (transaction.state ~= "open" and transaction.state ~= "prepared") then
+				error("Source verification requires an active editor transaction")
+			end
+			assertTransactionLease(transaction)
+		end
 		local selectors = params.selectors
 		local dense, count = denseArrayLength(selectors)
 		if not dense or count > ctx.maxChangesPerRequest then
@@ -4816,7 +5170,20 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local rows = table.create(count)
 		for position, selector in ipairs(selectors) do
 			local index = tonumber(selector.index) or position
-			local instance = resolvePathSegments(selector.pathSegments, nil, selector.pathOrdinals)
+			local serviceName = if type(selector.pathSegments) == "table" then tostring(selector.pathSegments[1]) else ""
+			if transaction ~= nil then
+				validateChangePath(selector, serviceName, ctx)
+				if transaction.studioGenerations[serviceName] == nil then
+					error("Source verification target is outside the editor transaction")
+				end
+			end
+			local stagedService = transaction ~= nil and transaction.nativeImportServices[serviceName]
+			local instance = if transaction ~= nil and transaction.resolveStagedPath ~= nil
+				then transaction.resolveStagedPath(selector.pathSegments, selector.pathOrdinals)
+				else nil
+			if instance == nil and not stagedService then
+				instance = resolvePathSegments(selector.pathSegments, nil, selector.pathOrdinals)
+			end
 			if instance == nil or not ctx.luaSourceClass[instance.ClassName] then
 				rows[position] = { index = index, error = "Script was not found" }
 			else
@@ -4893,6 +5260,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		end
 		local generations = {}
 		local hasPackageLinks = {}
+		local absentRoots = {}
 		for _, rawServiceName in ipairs(params.services) do
 			local serviceName = tostring(rawServiceName)
 			if not ctx.allowedServices[serviceName] or generations[serviceName] ~= nil then
@@ -4902,7 +5270,29 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			hasPackageLinks[serviceName] = game:GetService(serviceName):FindFirstChildWhichIsA("PackageLink", true)
 				~= nil
 		end
-		return { generations = generations, hasPackageLinks = hasPackageLinks }
+		if params.rootNames ~= nil then
+			if type(params.rootNames) ~= "table" then
+				error("Invalid native root existence request")
+			end
+			for serviceName, names in pairs(params.rootNames) do
+				local namesAreArray = denseArrayLength(names)
+				if generations[serviceName] == nil or not namesAreArray then
+					error("Invalid native root existence request")
+				end
+				local service = game:GetService(serviceName)
+				local absent = {}
+				for _, name in ipairs(names) do
+					if type(name) ~= "string" then
+						error("Invalid native root name")
+					end
+					if service:FindFirstChild(name) == nil then
+						absent[#absent + 1] = name
+					end
+				end
+				absentRoots[serviceName] = absent
+			end
+		end
+		return { generations = generations, hasPackageLinks = hasPackageLinks, absentRoots = absentRoots }
 	end
 
 	local function hasDirectPackageLink(instance: Instance): boolean
@@ -4942,11 +5332,14 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		if instance == nil then
 			return true
 		end
-		if isProtectedWorkspaceCameraPath(change.pathSegments) or isProtectedWorkspaceCameraInstance(instance) then
+		if isProtectedWorkspaceCameraInstance(instance) then
 			return false
 		end
 		local serviceName = tostring(change.service or "")
 		for _, propertyName in ipairs(changedPropertyNames(change.properties or {})) do
+			if instance == Workspace and propertyName == "CurrentCamera" then
+				continue
+			end
 			local rawValue = change.properties[propertyName]
 			if propertyName == "Name" then
 				if instance.Name ~= tostring(rawValue) then
@@ -4959,7 +5352,8 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			elseif propertyName ~= "Source" then
 				local okDecode, decoded = decodePropertyValue(instance, propertyName, rawValue, ctx, serviceName)
 				local okRead, current = readProperty(instance, propertyName)
-				if not okDecode or not okRead or not valuesEqual(current, decoded) then
+				if type(rawValue) == "table" and rawValue._nativeFont ~= nil
+					or not okDecode or not okRead or not valuesEqual(current, decoded) then
 					return true
 				end
 			end
@@ -5013,7 +5407,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local targetsAreArray, targetCount = denseArrayLength(rawTargets)
 		if
 			not targetsAreArray
-			or targetCount > math.min(maxTargets, tonumber(ctx.maxChangesPerRequest) or 5000)
+			or targetCount > maxTargets
 		then
 			error("Invalid editor mutation package request")
 		end
@@ -5313,11 +5707,17 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 
 	local function changesWithoutNativeImport(
 		changes: { any },
-		nativeImportServices: { [string]: boolean }
+		nativeImportServices: { [string]: boolean },
+		keepContainerSettings: boolean?
 	): { any }
 		local filtered = {}
 		for _, change in ipairs(changes) do
-			if not nativeImportServices[tostring(change.service or "")] then
+			local serviceName = tostring(change.service or "")
+			local path = change.pathSegments or {}
+			local containers = ENGINE_MANAGED_CONTAINERS[serviceName]
+			if not nativeImportServices[serviceName] or keepContainerSettings and (
+				#path == 1 or #path == 2 and containers and table.find(containers, change.className)
+			) then
 				filtered[#filtered + 1] = change
 			end
 		end
@@ -5365,7 +5765,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local nativeImportServices = includedNativeImportServices(params.nativeImportServices, includedServices)
 		local mutationPackageRoots = mutationPackages(
 			activeMutationPackageTargets(params),
-			tonumber(ctx.maxChangesPerRequest) or 5000
+			BridgeTransactionUpload.MAX_ROWS
 		)
 		local transactionParams = table.clone(params)
 		transactionParams.packageRoots = table.clone(params.packageRoots or {})
@@ -5376,11 +5776,12 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			transactionMutationRoots(transactionParams, includedServices)
 		local snapshotServices = servicesWithoutNativeImport(serviceNames, nativeImportServices)
 		local snapshotSourceChanges = changesWithoutNativeImport(params.sourceChanges or {}, nativeImportServices)
-		local snapshotPropertyChanges = changesWithoutNativeImport(params.propertyChanges or {}, nativeImportServices)
+		local snapshotPropertyChanges = changesWithoutNativeImport(params.propertyChanges or {}, nativeImportServices, true)
 		local studioGenerations = captureStudioGenerations(serviceNames)
 		local snapshot = TransactionState.captureSnapshot(snapshotServices, {
-			forceStructural = not nativeImport and params.hasInstanceChanges == true or next(packageSnapshotRoots) ~= nil,
+			forceStructural = params.hasInstanceChanges == true or next(packageSnapshotRoots) ~= nil,
 			captureAllScriptDocuments = nativeImport,
+			scriptDocumentServices = serviceNames,
 			instanceChanges = {},
 			sourceChanges = snapshotSourceChanges,
 			propertyChanges = snapshotPropertyChanges,
@@ -5415,7 +5816,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		}
 		local okJournal, journalError = pcall(ctx.beginStudioChangeJournal, transactionId, serviceNames)
 		if not okJournal then
-			finishHistoryRecording(session.historyRecording, Enum.FinishRecordingOperation.Cancel)
+			finishHistoryRecording(session.historyRecording)
 			error(journalError, 0)
 		end
 		session.journalActive = true
@@ -5439,6 +5840,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			state = "open",
 			packageMutation = next(packageSnapshotRoots) ~= nil,
 			mutationPackages = mutationPackageRoots,
+			historyRecording = session.historyRecording,
 		}
 	end
 
@@ -5457,6 +5859,18 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			error("Editor transaction was not found")
 		end
 		assertTransactionLease(session)
+		session.commitProfile = if profile then timings else nil
+		if session.pendingNativeRootWrite ~= nil then
+			error("A native root setter is still in flight")
+		end
+		if session.nativeServiceImport ~= nil and not session.nativeServiceImport.readerFinished then
+			error("Native insertion has not finished")
+		end
+		for _, write in ipairs(session.nativeRootWrites or {}) do
+			if not write.finished then
+				error("A native root write was not completed")
+			end
+		end
 		local operationCancellation = captureOperationCancellation()
 		local function assertCommitActive()
 			assertSessionOwnership(operationCancellation)
@@ -5465,40 +5879,58 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			end
 		end
 		assertCommitActive()
-		for serviceName, generation in pairs(session.studioGenerations or {}) do
-			local currentGeneration = ctx.studioChangeGeneration(serviceName)
-			if currentGeneration ~= generation then
-				local records = TransactionState.drainJournal(session, ctx)
-				local record = records[1]
-				local detail = "no tracked event"
-				if record ~= nil then
-					local kinds = {}
-					for propertyName in pairs(record.properties or {}) do
-						kinds[#kinds + 1] = "property " .. propertyName
+		local function assertStudioUnchanged()
+			for serviceName, generation in pairs(session.studioGenerations or {}) do
+				local currentGeneration = ctx.studioChangeGeneration(serviceName)
+				if currentGeneration ~= generation then
+					local records = TransactionState.drainJournal(session, ctx)
+					local record = records[1]
+					local detail = "no tracked event"
+					if record ~= nil then
+						local kinds = {}
+						for propertyName in pairs(record.properties or {}) do
+							kinds[#kinds + 1] = "property " .. propertyName
+						end
+						for attributeName in pairs(record.attributes or {}) do
+							kinds[#kinds + 1] = "attribute " .. attributeName
+						end
+						if record.attributesSnapshot ~= nil then
+							kinds[#kinds + 1] = "attributes"
+						end
+						if record.structural then
+							kinds[#kinds + 1] = "structure"
+						end
+						if record.tagsChanged then
+							kinds[#kinds + 1] = "tags"
+						end
+						local path = table.concat(record.pathSegments or {}, ".")
+						if path == "" and record.instance ~= nil then
+							path = `{record.instance.Name} [{record.instance.ClassName}]`
+						end
+						detail = `{path} ({table.concat(kinds, ", ")})`
 					end
-					for attributeName in pairs(record.attributes or {}) do
-						kinds[#kinds + 1] = "attribute " .. attributeName
-					end
-					if record.structural then
-						kinds[#kinds + 1] = "structure"
-					end
-					if record.tagsChanged then
-						kinds[#kinds + 1] = "tags"
-					end
-					detail = `{table.concat(record.pathSegments or {}, ".")} ({table.concat(kinds, ", ")})`
+					error(
+						`Studio changed {serviceName} while the filesystem transaction was staged ({generation} -> {currentGeneration}; {detail}); retry the sync`
+					)
 				end
-				error(
-					`Studio changed {serviceName} while the filesystem transaction was staged ({generation} -> {currentGeneration}; {detail}); retry the sync`
-				)
 			end
 		end
-		if session.nativeUndo ~= nil then
+		assertStudioUnchanged()
+		if session.nativeUndo ~= nil and not session.commitPrepared then
 			setTrackedOperationPhase(operation, "nativeCommit")
 			ReferenceOverlay.chainReplacements(session.instanceReplacements, session.nativeUndo.replacements)
 			TransactionState.drainJournal(session, ctx)
 			-- Native commit can replace live roots before reporting an error.
 			session.mutated = true
-			ReferenceOverlay.commitNative(session.nativeUndo, ctx)
+			local nativeProfile = if profile then {} else nil
+			timings.native = nativeProfile
+			-- Serialized roots remain available for explicit restoration. Other
+			-- destructive/native writes still require the engine recording.
+			session.nativeUndo.explicitRollback = not session.nativeUndo.nativeInserted
+				and session.nativeServiceImport == nil
+				and next(session.snapshot.groups or {}) == nil
+				and next(session.nativeRootWrites or {}) == nil
+			ReferenceOverlay.commitNative(session.nativeUndo, ctx, nativeProfile)
 			assertCommitActive()
 			for original, replacement in pairs(session.nativeUndo.replacements) do
 				session.instanceReplacements[original] = replacement
@@ -5507,19 +5939,21 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		timings.nativeCommitMs = (os.clock() - phaseStarted) * 1000
 		phaseStarted = os.clock()
 		setTrackedOperationPhase(operation, "scriptDocuments")
-		ScriptDocumentState.apply(
-			session.snapshot.scriptDocuments or {},
-			session.changedSourceInstances,
-			session.changedSourceKeys,
-			session.instanceReplacements,
-			session.resolveStagedPath,
-			session.nativeImport
-		)
+		if not session.commitPrepared then
+			ScriptDocumentState.apply(
+				session.snapshot.scriptDocuments or {},
+				session.changedSourceInstances,
+				session.changedSourceKeys,
+				session.instanceReplacements,
+				session.resolveStagedPath,
+				session.nativeImport
+			)
+		end
 		assertCommitActive()
 		timings.scriptDocumentsMs = (os.clock() - phaseStarted) * 1000
 		phaseStarted = os.clock()
 		local postCommitPropertyChanges = session.postCommitPropertyChanges
-		if #postCommitPropertyChanges > 0 then
+		if #postCommitPropertyChanges > 0 and not session.commitPrepared then
 			local updated = 0
 			RunService.Heartbeat:Wait()
 			assertCommitActive()
@@ -5531,6 +5965,21 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					error(`WorldPivot target was not found: {pathKey(change.pathSegments)}`)
 				end
 				assertInstanceInService(instance, service)
+				local okRead, current = readProperty(instance, "WorldPivot")
+				local rawValue = change.properties.WorldPivot
+				-- Compare serialized components before constructing another CFrame:
+				-- Studio's constructor can flush an already-correct subnormal to zero.
+				if
+					okRead
+					and type(rawValue) == "table"
+					and rawValue._type == "CFrame"
+					and BridgeValueEquality.exactValuesEqual(
+						BridgeValueCodec.encodeComponents(current:GetComponents()),
+						rawValue.components
+					)
+				then
+					continue
+				end
 				local okDecode, value = decodePropertyValue(
 					instance,
 					"WorldPivot",
@@ -5541,7 +5990,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				if not okDecode then
 					error(`Failed to decode WorldPivot: {value}`)
 				end
-				local okRead, current = readProperty(instance, "WorldPivot")
 				if not okRead or current ~= value then
 					local okWrite, writeError = writePropertyForSync(instance, "WorldPivot", value, ctx)
 					if not okWrite then
@@ -5555,15 +6003,55 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			timings.postCommitPropertyUpdated = updated
 		end
 		timings.postCommitPropertiesMs = (os.clock() - phaseStarted) * 1000
+		session.commitPrepared = true
+		if params.prepareOnly == true then
+			-- Make staged native contents visible to the full-place serializer,
+			-- but retain undo and the outside-edit journal until publication.
+			return { ok = true, transactionId = transactionId, state = "prepared", committed = false }
+		end
+		-- Bind the equality cache to the verified transaction state. A callback
+		-- during FinishRecording can edit Studio after commit; capturing afterward
+		-- would mistake those newer values for the files that were just pushed.
+		local verifiedPushProof = nil
+		if ctx.capturePushProof then
+			verifiedPushProof, timings.pushProofUnavailable = ctx.capturePushProof()
+		end
+		assertCommitActive()
+		TransactionState.drainJournal(session, ctx)
+		assertStudioUnchanged()
 		phaseStarted = os.clock()
 		setTrackedOperationPhase(operation, "journal")
 		local records = TransactionState.finishJournal(session, ctx)
+		if profile then
+			timings.journalRecords = #records
+			timings.journalSample = {}
+			for index = 1, math.min(4, #records) do
+				local record = records[index]
+				local properties = {}
+				for name in pairs(record.properties or {}) do
+					properties[#properties + 1] = name
+				end
+				table.sort(properties)
+				timings.journalSample[index] = {
+					path = table.concat(record.pathSegments or {}, "."),
+					structural = record.structural == true,
+					properties = properties,
+				}
+			end
+		end
 		TransactionState.replayJournal(records, session.instanceReplacements, ctx)
 		assertCommitActive()
 		timings.journalMs = (os.clock() - phaseStarted) * 1000
 		phaseStarted = os.clock()
 		setTrackedOperationPhase(operation, "history")
 		assertCommitActive()
+		for _, token in ipairs(session.nativeSettingTokens or {}) do
+			cancelExpectedEvent(ctx, token)
+		end
+		session.nativeSettingTokens = nil
+		for _, write in ipairs(session.nativeRootWrites or {}) do
+			cancelExpectedEvent(ctx, write.token)
+		end
 		finishHistoryRecording(session.historyRecording)
 		session.commitFence = true
 		timings.historyMs = (os.clock() - phaseStarted) * 1000
@@ -5600,6 +6088,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 						end
 					end
 				end
+				if nativeUndo.retainedParent then
+					nativeUndo.retainedParent:Destroy()
+				end
 				for _, instance in ipairs(nativeUndo.retainedDuplicates or {}) do
 					instance:Destroy()
 				end
@@ -5616,6 +6107,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		editorTransactions[transactionId] = nil
 		return recordTransactionOutcome(transactionId, "committed", {
 			undoRecorded = undoRecorded,
+			verifiedPushProof = verifiedPushProof,
 			profile = if profile then timings else nil,
 		})
 	end
@@ -5652,6 +6144,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				editorTransactions[transactionId] = nil
 				recordTransactionOutcome(transactionId, "rolledBack", {
 					replacements = countEntries(rollbackResult),
+					profile = session.commitProfile,
 				})
 				for _, serviceName in ipairs(session.serviceNames) do
 					invalidateEditorService(serviceName)
@@ -5714,6 +6207,10 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local exportId = tostring(params.exportId or "")
 		local partitioned = params.partitioned == true
 		local metadataOnly = params.metadataOnly == true
+		local nativeCapture = params.nativeCapture == true
+		if nativeCapture and (not partitioned or metadataOnly) then
+			error("Native capture requires a partitioned full export")
+		end
 		if exportId == "" then
 			error("Invalid native export id")
 		end
@@ -5838,6 +6335,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			updatedAt = os.clock(),
 			ctx = ctx,
 		}
+		local captureIgnoredProperties = { archivable = not nativeCapture }
 		if not metadataOnly then
 			local guardedServices = table.create(#serviceNames)
 			for index, serviceName in ipairs(serviceNames) do
@@ -5846,9 +6344,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					service = game:GetService(serviceName),
 				}
 			end
-			session.nativeGuard = ReferenceOverlay.beginNativeGuard(guardedServices, true, {
-				archivable = true,
-			})
+			session.nativeGuard = ReferenceOverlay.beginNativeGuard(
+				guardedServices, true, captureIgnoredProperties, ctx.attributeObservation,
+				nativeCapture and params.nativeAttributeGuard == true)
 		end
 		if profile then
 			profileTimings.nativeGuardMs = (os.clock() - phaseStarted) * 1000
@@ -5889,15 +6387,16 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					profileTimings.scriptDocumentsMs = (os.clock() - phaseStarted) * 1000
 				end
 				assertSessionOwnership(operationCancellation)
-				local serializerWorkerCount = if partitioned
+				local serializerWorkerCount = if partitioned and not nativeCapture
 					then math.clamp(math.floor(tonumber(params.serializationWorkers) or #groups), 1, #groups)
 					else 0
-				if partitioned then
+				if partitioned and not nativeCapture then
 					session.firstUnscheduledSerializationGroup = serializerWorkerCount + 1
 					session.serializerWorkerCount = serializerWorkerCount
 					NativeSerialization.startWorkers(session, serializerWorkerCount)
 				end
 				local prepareNativeStateMs = 0
+				local attributeGuardMs = 0
 				local identityCarriersMs = 0
 				local rootPropertiesMs = 0
 				local nativePreparationByService = {}
@@ -5910,15 +6409,24 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 						nativePreparationByService[serviceName] = state.nativePreparationProfile
 						phaseStarted = os.clock()
 					end
+					-- ItemChanged does not cover every attribute edit. Subscribe to
+					-- the already enumerated graph before its serializer can start.
+					ReferenceOverlay.watchNativeDescendantAttributes(session.nativeGuard, serviceName, state.instances)
+					if profile then
+						attributeGuardMs += (os.clock() - phaseStarted) * 1000
+						phaseStarted = os.clock()
+					end
 					session.nativeStates[serviceName] = state
 					session.nonArchivableByService[serviceName] = state.nonArchivableInstances
 					local group = groupByService[serviceName]
-					NativeSerialization.appendIdentityCarriers(
-						group,
-						rootsByService[serviceName],
-						state.instances,
-						state.nativeStructureGeneration
-					)
+					if not nativeCapture then
+						NativeSerialization.appendIdentityCarriers(
+							group,
+							rootsByService[serviceName],
+							state.instances,
+							state.nativeStructureGeneration
+						)
+					end
 					if profile then
 						identityCarriersMs += (os.clock() - phaseStarted) * 1000
 						phaseStarted = os.clock()
@@ -5940,8 +6448,35 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 						)
 					end
 				end
+				if nativeCapture then
+					-- Place-mode capture includes real service roots. Until its
+					-- include-non-Archivable mode is validated across engine builds,
+					-- retain the existing serializer/overlay path for those graphs.
+					for _, serviceName in ipairs(serviceNames) do
+						if #session.nonArchivableByService[serviceName] > 0 then
+							nativeCapture = false
+							break
+						end
+					end
+					if not nativeCapture then
+						ReferenceOverlay.assertNativeGuard(session.nativeGuard)
+						captureIgnoredProperties.archivable = true
+						for _, serviceName in ipairs(serviceNames) do
+							local state = session.nativeStates[serviceName]
+							NativeSerialization.appendIdentityCarriers(groupByService[serviceName],
+								rootsByService[serviceName], state.instances, state.nativeStructureGeneration)
+						end
+						session.firstUnscheduledSerializationGroup = 1
+						session.serializerWorkerCount = math.clamp(math.floor(tonumber(params.serializationWorkers) or #groups), 1, #groups)
+						NativeSerialization.startWorkers(session, session.serializerWorkerCount)
+					else
+						session.serializationScheduleReady = true
+						session.status = "ready"
+					end
+				end
 				if profile then
 					profileTimings.prepareNativeStateMs = prepareNativeStateMs
+					profileTimings.attributeGuardMs = attributeGuardMs
 					profileTimings.nativePreparationByService = nativePreparationByService
 					profileTimings.identityCarriersMs = identityCarriersMs
 					profileTimings.rootPropertiesMs = rootPropertiesMs
@@ -6011,7 +6546,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					end
 				end
 			end
-			if partitioned then
+			if partitioned and not nativeCapture then
 				NativeSerialization.finishSchedule(
 					session,
 					groups,
@@ -6031,6 +6566,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				propertySchemaByClass = propertySchemaByClass,
 				enumValueNamesByType = enumValueNamesByType,
 				pending = session.status == "pending",
+				nativeCapture = nativeCapture,
 				profile = if profile then profileTimings else nil,
 				supported = true,
 			}
@@ -6439,7 +6975,12 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			if session.leaseId ~= nil and session.leaseId ~= currentRequestLeaseId() then
 				error("Native export belongs to another request lease")
 			end
-			local changedService = if session.nativeGuard then session.nativeGuard.changedService else nil
+			local changedService = if session.nativeGuard then ReferenceOverlay.changedNativeService(session.nativeGuard) else nil
+			if params.nativeAttributeGuardFailed == true then
+				for _, group in ipairs(session.groups) do
+					NativeSerialization.invalidateProofs(group.service)
+				end
+			end
 			session.cancelled = true
 			session.payloadReadyEvent:Fire()
 			expireSession(binaryExports, exportId, session)
@@ -6635,7 +7176,8 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 
 	local function validatedNativeImportGroup(
 		rawGroup: { [string]: any },
-		payloadRootNames: { [string]: boolean }
+		payloadRootNames: { [string]: boolean },
+		wholeServices: boolean?
 	): { [string]: any }
 		validateObjectTable(rawGroup, "Native import group")
 		local serviceName, service, target, targetPath, targetPathLength = validatedNativeImportTarget(rawGroup)
@@ -6644,11 +7186,25 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			error("Invalid native import service count")
 		end
 		local rootPaths = validatedNativeImportRootPaths(rawGroup, serviceName, targetPath, targetPathLength, count)
+		local additive = rawGroup.additive
+		if additive ~= nil and type(additive) ~= "boolean" then
+			error("Native import additive flag must be a boolean")
+		end
+		local viewportCamera = rawGroup.viewportCamera
+		if viewportCamera ~= nil then
+			validateObjectTable(viewportCamera, "Native import viewport")
+			validateMutationPath(viewportCamera, serviceName, "Native import viewport", ctx)
+			if serviceName ~= "Workspace" or targetPathLength ~= 1
+				or #viewportCamera.pathSegments < 2
+			then
+				error("Native import viewport must be inside Workspace")
+			end
+		end
 		local payloadRootName = rawGroup.payloadRootName
-		if type(payloadRootName) ~= "string" or payloadRootName == "" then
+		if type(payloadRootName) ~= "string" or (not wholeServices and payloadRootName == "") then
 			error("Invalid native import payload root")
 		end
-		if payloadRootNames[payloadRootName] then
+		if not wholeServices and payloadRootNames[payloadRootName] then
 			error("Duplicate native import payload root")
 		end
 		payloadRootNames[payloadRootName] = true
@@ -6663,27 +7219,56 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			ctx
 		)
 		local changeGeneration = tonumber(rawGroup.changeGeneration)
+		local expectedStructure = rawGroup.expectedStructure
+		if expectedStructure ~= nil then
+			validateObjectTable(expectedStructure, "Native payload structure")
+			local isArray, stringCount = denseArrayLength(expectedStructure.strings)
+			if not isArray or stringCount > MAX_RECONCILE_ENTRIES * 2 + 2
+				or type(expectedStructure.nodes) ~= "string"
+				or #expectedStructure.nodes > (MAX_RECONCILE_ENTRIES + 1) * 16
+			then
+				error("Native payload structure is invalid or oversized")
+			end
+			for _, value in ipairs(expectedStructure.strings) do
+				if type(value) ~= "string" then
+					error("Native payload structure names must be strings")
+				end
+			end
+			local nodes = EncodingService:Base64Decode(buffer.fromstring(expectedStructure.nodes))
+			if buffer.len(nodes) == 0 or buffer.len(nodes) % 12 ~= 0 then
+				error("Native payload structure is truncated")
+			end
+			expectedStructure = { strings = expectedStructure.strings, nodes = nodes }
+		end
+		if additive and (targetPathLength ~= 1 or count == 0 or viewportCamera ~= nil
+			or #retainedRoots > 0 or #packageRoots > 0)
+		then
+			error("Additive native import requires new service children without replacement roots")
+		end
 		if
-			(#retainedRoots > 0 or #packageRoots > 0)
+			(additive or #retainedRoots > 0 or #packageRoots > 0)
 			and (not changeGeneration or changeGeneration < 0 or changeGeneration % 1 ~= 0)
 		then
 			error("Native import retained roots require a Studio change generation")
 		end
 		return {
 			serviceName = serviceName,
+			additive = additive,
 			service = service,
 			target = target,
 			targetPath = table.clone(targetPath),
 			count = count,
 			payloadRootName = payloadRootName,
 			rootPaths = rootPaths,
+			viewportCamera = viewportCamera,
 			retainedRoots = retainedRoots,
 			packageRoots = packageRoots,
 			changeGeneration = changeGeneration,
+			expectedStructure = expectedStructure,
 		}
 	end
 
-	local function validatedNativeImportGroups(rawGroups: any): { any }
+	local function validatedNativeImportGroups(rawGroups: any, wholeServices: boolean?): { any }
 		local groupsAreArray, groupCount = denseArrayLength(rawGroups)
 		if not groupsAreArray or groupCount == 0 then
 			error("Native import groups must be an array")
@@ -6691,9 +7276,209 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local groups = table.create(groupCount)
 		local payloadRootNames = {}
 		for index, rawGroup in ipairs(rawGroups) do
-			groups[index] = validatedNativeImportGroup(rawGroup, payloadRootNames)
+			groups[index] = validatedNativeImportGroup(rawGroup, payloadRootNames, wholeServices)
 		end
 		return groups
+	end
+
+	local function prepareNativeServiceTargets(raw: any, groups: { any }, transaction, instanceCount: number): ({ [string]: any }, { [string]: any })
+		validateObjectTable(raw, "Native service replacement")
+		local bindingsAreArray, bindingCount = denseArrayLength(raw.bindings)
+		if not bindingsAreArray or bindingCount > instanceCount then
+			error("Invalid native service bindings")
+		end
+		local classesAreArray, classTotal = denseArrayLength(raw.classes)
+		if not classesAreArray or classTotal > 4096 then
+			error("Invalid native service classes")
+		end
+		local classes, classesByName, factoryCount = {}, {}, 0
+		local untaggedClasses = {}
+		for index, class in ipairs(raw.classes) do
+			validateObjectTable(class, "Native service class")
+			if type(class.name) ~= "string" or #class.name == 0 or #class.name > 255
+				or classesByName[class.name] ~= nil or type(class.count) ~= "number"
+				or class.count < 1 or class.count % 1 ~= 0
+			then
+				error("Invalid native service class count")
+			end
+			factoryCount += class.count
+			if factoryCount > instanceCount then
+				error("Native service classes exceed the payload size")
+			end
+			local entry = { name = class.name, count = class.count, used = buffer.create(math.ceil(class.count / 8)) }
+			classes[index] = entry
+			classesByName[class.name] = entry
+			untaggedClasses[class.name] = class.tagsAbsent == true
+		end
+		local aliasesAreArray, aliasCount = denseArrayLength(raw.aliases or {})
+		if not aliasesAreArray or aliasCount + bindingCount > factoryCount then
+			error("Invalid native batch anchors")
+		end
+		local containers, outgoing, bound, boundPaths, additiveTargets = {}, {}, {}, {}, {}
+		local targets = { containers = {}, outgoing = {}, bindings = {} }
+		local paths = BridgeIdentity.newPathSnapshot()
+		local function describe(instance: Instance)
+			local segments, ordinals = BridgeIdentity.getRefPathParts(instance, paths)
+			if segments == nil then
+				error("Native service target left the place")
+			end
+			return {
+				pathSegments = segments, pathOrdinals = ordinals,
+				className = instance.ClassName, debugId = BridgeIdentity.getDebugId(instance),
+			}
+		end
+		for _, group in ipairs(groups) do
+			if #group.retainedRoots > 0 or #group.packageRoots > 0
+				or not table.find(transaction.serviceNames, group.serviceName)
+				or not group.additive and not transaction.nativeImportServices[group.serviceName]
+			then
+				error("Native service replacement does not match the editor transaction")
+			end
+			if containers[group.target] then
+				error("Duplicate native service replacement target")
+			end
+			if ctx.studioChangeGeneration(group.serviceName) ~= group.changeGeneration then
+				error(`Studio changed {group.serviceName} after native import planning; retry the sync`)
+			end
+			containers[group.target] = group.serviceName
+			additiveTargets[group.target] = group.additive
+			if group.additive then
+				for _, descriptor in ipairs(group.rootPaths) do
+					if descriptor.pathOrdinals[2] ~= 1 or group.target:FindFirstChild(descriptor.pathSegments[2]) ~= nil then
+						error("Native insertion target is no longer empty")
+					end
+				end
+			end
+			targets.containers[#targets.containers + 1] = describe(group.target)
+		end
+		local ordinalsByClass, binaryIds = {}, {}
+		for _, binding in ipairs(raw.bindings) do
+			validateObjectTable(binding, "Native service binding")
+			local serviceName = binding.pathSegments and binding.pathSegments[1]
+			if type(serviceName) ~= "string" or not table.find(transaction.serviceNames, serviceName) then
+				error("Native service binding is outside the editor transaction")
+			end
+			validateMutationPath(binding, serviceName, "Native service binding", ctx)
+			local ordinal, classCount, binaryId = binding.ordinal, binding.classCount, binding.binaryReferent
+			local class = classesByName[binding.className]
+			if type(binding.className) ~= "string" or type(binding.referenceOnly) ~= "boolean"
+				or type(ordinal) ~= "number" or ordinal < 0 or ordinal % 1 ~= 0
+				or type(classCount) ~= "number" or classCount <= ordinal or classCount % 1 ~= 0
+				or type(binaryId) ~= "number" or binaryId < 0 or binaryId % 1 ~= 0 or binaryIds[binaryId]
+				or class == nil or class.count ~= classCount
+			then
+				error("Invalid native service binding ordinal")
+			end
+			local viewport = binding.referenceOnly and binding.className == "Camera"
+			local target = if viewport then Workspace.CurrentCamera
+				else resolvePathSegments(binding.pathSegments, nil, binding.pathOrdinals)
+			if target == nil or target.ClassName ~= binding.className or bound[target]
+				or (viewport and serviceName ~= "Workspace")
+				or (not viewport and not containers[target])
+			then
+				error("Native service binding does not match a retained object")
+			end
+			if viewport and target.Parent ~= Workspace then
+				error("A nested active viewport requires the existing camera-rehoming pipeline")
+			end
+			local classOrdinals = ordinalsByClass[binding.className]
+			if classOrdinals == nil then
+				classOrdinals = { count = classCount }
+				ordinalsByClass[binding.className] = classOrdinals
+			end
+			if classOrdinals.count ~= classCount or classOrdinals[ordinal] then
+				error("Conflicting native service class bindings")
+			end
+			classOrdinals[ordinal] = true
+			local byteIndex, bit = math.floor(ordinal / 8), bit32.lshift(1, ordinal % 8)
+			buffer.writeu8(class.used, byteIndex, bit32.bor(buffer.readu8(class.used, byteIndex), bit))
+			binaryIds[binaryId] = true
+			bound[target] = true
+			boundPaths[pathCacheKey(binding.pathSegments, binding.pathOrdinals)] = target
+			if viewport and not binding.referenceOnly then
+				error("The active viewport must retain its live settings")
+			end
+			if not containers[target] then
+				containers[target] = serviceName
+				targets.containers[#targets.containers + 1] = describe(target)
+			end
+			local descriptor = describe(target)
+			descriptor.ordinal = ordinal
+			descriptor.classCount = classCount
+			descriptor.binaryReferent = binaryId
+			descriptor.referenceOnly = binding.referenceOnly
+			targets.bindings[#targets.bindings + 1] = descriptor
+		end
+		local aliasSources = {}
+		for _, alias in ipairs(raw.aliases or {}) do
+			validateObjectTable(alias, "Native batch anchor")
+			local index, ordinal, source = alias.classIndex, alias.ordinal, alias.sourceOrdinal
+			if type(index) ~= "number" or index % 1 ~= 0 or index < 0 or index >= classTotal
+				or type(ordinal) ~= "number" or ordinal % 1 ~= 0
+				or type(source) ~= "number" or source % 1 ~= 0 or source < 0 or source >= ordinal
+			then
+				error("Invalid native batch anchor ordinal")
+			end
+			local class = classes[index + 1]
+			if ordinal >= class.count then
+				error("Native batch anchor exceeds its class count")
+			end
+			local byteIndex, bit = math.floor(ordinal / 8), bit32.lshift(1, ordinal % 8)
+			local used = buffer.readu8(class.used, byteIndex)
+			if bit32.btest(used, bit) then
+				error("Duplicate native batch anchor")
+			end
+			buffer.writeu8(class.used, byteIndex, bit32.bor(used, bit))
+			aliasSources[`{index}:{ordinal}`] = true
+		end
+		for _, alias in ipairs(raw.aliases or {}) do
+			if aliasSources[`{alias.classIndex}:{alias.sourceOrdinal}`] then
+				error("Native batch anchors cannot form alias chains")
+			end
+		end
+		for container, serviceName in pairs(containers) do
+			if additiveTargets[container] then continue end
+			for _, instance in ipairs(container:GetChildren()) do
+				if isEngineManagedContainerInstance(serviceName, instance) and not containers[instance] then
+					error("Native service payload is missing an existing engine container")
+				end
+				if not containers[instance] and not bound[instance]
+					and instance ~= Workspace.CurrentCamera
+					and includeManagedInstance(ctx, serviceName, instance)
+				then
+					outgoing[instance] = container
+					targets.outgoing[#targets.outgoing + 1] = describe(instance)
+				end
+			end
+		end
+		-- Strong references belong to the same lease/expiry lifecycle as the
+		-- existing import. Resolving paths later is not ownership of these objects.
+		local retainedReferences = {}
+		for instance in pairs(containers) do
+			retainedReferences[instance] = true
+		end
+		return targets, {
+			containers = containers, outgoing = outgoing, bound = bound, boundPaths = boundPaths,
+			referenceOverlay = ReferenceOverlay.capture({}, retainedReferences, true),
+			classes = classes, createdById = {}, expectedCreated = factoryCount - bindingCount - aliasCount,
+			receivedCreated = 0, untaggedClasses = untaggedClasses,
+		}
+	end
+
+	local function validatedContainerSettings(raw: any, transaction): { any }
+		if raw == nil then return {} end
+		local services = validateMutationRequest({ propertyChanges = raw }, ctx, false)
+		for _, serviceName in ipairs(services) do
+			if not transaction.nativeImportServices[serviceName] then
+				error("Native container settings are outside the native import")
+			end
+		end
+		for _, change in ipairs(raw) do
+			if #change.pathSegments ~= 1 and not isEngineManagedContainerEntry(change.service, change) then
+				error("Native container settings must target a service or engine container")
+			end
+		end
+		return raw
 	end
 
 	function api.beginBinaryImport(params: { [string]: any }): { [string]: any }
@@ -6712,25 +7497,48 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		if type(params.externalReferencesPostApplied) ~= "boolean" then
 			error("Native import external reference policy is invalid")
 		end
+		if params.viewportReferencesPostApplied ~= nil and type(params.viewportReferencesPostApplied) ~= "boolean" then
+			error("Native import viewport reference policy is invalid")
+		end
 		local instanceCount = validatedBinaryImportInstanceCount(params)
 		assertBinaryImportCapacity(importId, totalBytes)
-		local groups = validatedNativeImportGroups(params.groups)
+		local wholeServices = params.nativeReplacement ~= nil
+		if wholeServices and params.nativeReceiptFormat ~= 2 then
+			error("Update the Renium CLI to use compact native creation receipts")
+		end
+		local groups = validatedNativeImportGroups(params.groups, wholeServices)
+		local nativeTargets, nativeHeld
+		if wholeServices then
+			nativeTargets, nativeHeld = prepareNativeServiceTargets(params.nativeReplacement, groups, transaction, instanceCount)
+			nativeHeld.containerSettings = validatedContainerSettings(params.containerSettings, transaction)
+		end
 		binaryImports[importId] = {
 			leaseId = transaction.leaseId,
 			transactionId = transactionId,
 			totalBytes = totalBytes,
 			totalChunks = totalChunks,
-			payload = buffer.create(totalBytes),
+			payload = if wholeServices then nil else buffer.create(totalBytes),
 			received = table.create(totalChunks),
 			receivedBytes = 0,
 			receivedChunks = 0,
 			instanceCount = instanceCount,
 			groups = groups,
 			externalReferencesPostApplied = params.externalReferencesPostApplied,
+			viewportReferencesPostApplied = params.viewportReferencesPostApplied,
 			updatedAt = os.clock(),
+			nativeHeld = nativeHeld,
 		}
 		armSessionExpiry(binaryImports, importId, binaryImports[importId])
-		return { ok = true, importId = importId }
+		if nativeHeld ~= nil then
+			binaryImports[importId].onExpire = function()
+				if nativeHeld.readerArmed and not nativeHeld.readerFinished then
+					error("Native insertion result is pending; retain its original contents")
+				end
+			end
+		end
+		return { ok = true, importId = importId, nativeTargets = nativeTargets,
+			nativeReceiptFormat = if wholeServices then 2 else nil,
+			nativeInlineReceipt = if wholeServices then true else nil }
 	end
 
 	function api.appendBinaryImport(params: { [string]: any }): { [string]: any }
@@ -6749,6 +7557,64 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		armSessionExpiry(editorTransactions, session.transactionId, transaction)
 		armSessionExpiry(binaryImports, importId, session)
 		local index = tonumber(params.index)
+		local native = session.nativeHeld
+		if native ~= nil then
+			if not native.readerArmed then
+				error("Native import is not accepting a creation receipt")
+			end
+			if params.nativeReceipt ~= true then
+				error("Native service payloads use the native reader transport")
+			end
+			if not index or index < 1 or index % 1 ~= 0 or type(params.data) ~= "string" then
+				error("Invalid native creation receipt chunk")
+			end
+			if session.received[index] ~= nil then
+				if session.received[index] ~= params.data then
+					error("Native creation receipt changed during upload")
+				end
+				return { ok = true, duplicate = true }
+			end
+			if index ~= session.receivedChunks + 1 or #params.data > math.ceil(BINARY_IMPORT_CHUNK_BYTES / 3) * 4 then
+				error("Native creation receipt is out of order or oversized")
+			end
+			local decoded = EncodingService:Base64Decode(buffer.fromstring(params.data))
+			local bytes = buffer.len(decoded)
+			if bytes == 0 or bytes > BINARY_IMPORT_CHUNK_BYTES then
+				error("Native creation receipt has an invalid size")
+			end
+			local offset, rows = 0, 0
+			while offset < bytes do
+				if bytes - offset < 8 or native.receivedCreated + rows >= native.expectedCreated then
+					error("Native creation receipt is truncated or contains excess rows")
+				end
+				local classIndex, ordinal = buffer.readu16(decoded, offset), buffer.readu32(decoded, offset + 2)
+				local length = buffer.readu8(decoded, offset + 6)
+				local class = native.classes[classIndex + 1]
+				if class == nil or ordinal >= class.count then
+					error("Native creation receipt contains an unplanned class or ordinal")
+				end
+				if length == 0 or length >= 48 or offset + 7 + length > bytes then
+					error("Native creation receipt contains an invalid identity")
+				end
+				local id = buffer.readstring(decoded, offset + 7, length)
+				if string.find(id, "\0", 1, true) then
+					error("Native creation receipt identity contains a terminator")
+				end
+				local byteIndex, bit = math.floor(ordinal / 8), bit32.lshift(1, ordinal % 8)
+				local used = buffer.readu8(class.used, byteIndex)
+				if native.createdById[id] ~= nil or bit32.btest(used, bit) then
+					error("Native creation receipt contains a duplicate or retained identity")
+				end
+				buffer.writeu8(class.used, byteIndex, bit32.bor(used, bit))
+				native.createdById[id] = class.name
+				offset += 7 + length
+				rows += 1
+			end
+			native.receivedCreated += rows
+			session.received[index] = params.data
+			session.receivedChunks += 1
+			return { ok = true, receivedCreated = native.receivedCreated }
+		end
 		if not index or index < 1 or index > session.totalChunks or index % 1 ~= 0 then
 			error("Invalid native import chunk index")
 		end
@@ -6770,6 +7636,160 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		return { ok = true, receivedBytes = decodedBytes }
 	end
 
+	local function finishNativeServiceImport(session, transaction, params)
+		local native = session.nativeHeld
+		if params.nativePhase == "prepare" then
+			if native.readerArmed then
+				error("Native insertion is already armed; do not run it twice")
+			end
+			if transaction.nativeUndo ~= nil then
+				error("This transaction already has a prepared import")
+			end
+			-- Native insertion owns its old roots explicitly. Studio's Cancel
+			-- cannot undo engine-created services (their Parent is locked).
+			-- Keep only the subsequent protected setters in a Studio recording.
+			finishHistoryRecording(transaction.historyRecording)
+			transaction.historyRecording = nil
+			local prepared, byTarget = {}, {}
+			local paths = BridgeIdentity.newPathSnapshot()
+			for _, group in ipairs(session.groups) do
+				if ctx.studioChangeGeneration(group.serviceName) ~= group.changeGeneration then
+					error(`Studio changed {group.serviceName} before native insertion; retry the sync`)
+				end
+				local entry = table.clone(group)
+				entry.incoming, entry.incomingByPayloadIndex, entry.incomingRootsByPath = {}, {}, {}
+				entry.outgoing, entry.outgoingRootSet, entry.outgoingRootPaths = {}, {}, {}
+				entry.retainedLiveRoots = {}
+				prepared[#prepared + 1] = entry
+				byTarget[group.target] = entry
+			end
+			for instance, parent in pairs(native.outgoing) do
+				local group = byTarget[parent]
+				if group == nil or instance.Parent ~= parent then
+					error("Native insertion's old contents changed before replacement")
+				end
+				local segments, ordinals = BridgeIdentity.getRefPathParts(instance, paths)
+				group.outgoing[#group.outgoing + 1] = instance
+				group.outgoingRootSet[instance] = true
+				group.outgoingRootPaths[instance] = { pathSegments = segments, pathOrdinals = ordinals }
+			end
+			local function resolveStagedPath(segments, ordinals)
+				local bound = native.boundPaths[pathCacheKey(segments, ordinals)]
+				if bound ~= nil then return bound end
+				for _, group in ipairs(prepared) do
+					if pathKey(segments) == pathKey(group.targetPath) then return group.target end
+				end
+				return ReferenceOverlay.resolvePreparedPath(prepared, segments, ordinals, {})
+			end
+			local replacements = ReferenceOverlay.lazyReplacements(prepared, resolveStagedPath)
+			for instance in pairs(native.containers) do
+				replacements[instance] = instance
+			end
+			transaction.nativeUndo = {
+				prepared = prepared, replacements = replacements, resolveStagedPath = resolveStagedPath,
+				currentCamera = Workspace.CurrentCamera,
+				currentCameraParent = if Workspace.CurrentCamera then Workspace.CurrentCamera.Parent else nil,
+				generationsByService = table.clone(transaction.studioGenerations),
+				referenceUpdates = 0, nativeInserted = true,
+				needsReferenceRetarget = next(native.outgoing) ~= nil,
+			}
+			transaction.resolveStagedPath = resolveStagedPath
+			transaction.mutated = true
+			-- Keep the original trees themselves. No per-descendant undo copy.
+			runWithStudioChangeSuppression(ctx, function()
+				for _, group in ipairs(prepared) do
+					for _, instance in ipairs(group.outgoing) do
+						removeInstanceForUndo(instance, ctx)
+					end
+				end
+			end)
+			for serviceName, generation in pairs(transaction.studioGenerations) do
+				if ctx.studioChangeGeneration(serviceName) ~= generation then
+					error(`Studio changed {serviceName} while preparing native insertion; retry the sync`)
+				end
+			end
+			transaction.nativeSettingTokens = {}
+			expectContainerSettings(native.containerSettings, ctx, transaction.nativeSettingTokens)
+			native.profile = if params.profile then {} else nil
+			ctx.beginNativeImportObservations(transaction.transactionId, native.profile, native.untaggedClasses)
+			native.started = os.clock()
+			native.readerArmed = true
+			transaction.nativeServiceImport = native
+			return { ok = true, nativeReaderReady = true }
+		end
+		if params.nativePhase ~= "complete" or not native.readerArmed or native.readerFinished then
+			error("Native insertion is not waiting for this completion")
+		end
+		if type(params.nativeStatus) ~= "number" or type(params.nativeState) ~= "number"
+			or params.nativeState < 0 or params.nativeState > 15 or params.nativeState % 1 ~= 0
+			or params.nativeCreated ~= native.receivedCreated
+			or not bit32.btest(params.nativeState, 8) then
+			error("Native insertion did not return a complete creation receipt")
+		end
+		local additions = ctx.finishNativeImportObservations(transaction.transactionId, native.createdById)
+		native.readerFinished = true
+		local undo = transaction.nativeUndo
+		local byTarget = {}
+		for _, group in ipairs(undo.prepared) do
+			byTarget[group.target] = group
+		end
+		for _, instances in pairs(additions) do
+			for instance, parent in pairs(instances) do
+				local group = byTarget[parent]
+				if group ~= nil then
+					group.incoming[#group.incoming + 1] = instance
+				end
+			end
+		end
+		if params.nativeStatus ~= 4 or params.nativeState ~= 14 or native.receivedCreated ~= native.expectedCreated then
+			error(`Native insertion failed: {tostring(params.nativeError or params.nativeStatus)}`)
+		end
+		transaction.historyRecording = beginHistoryRecording("Sync properties from filesystem")
+		for _, group in ipairs(undo.prepared) do
+			local byName, indices, ordered = {}, {}, {}
+			local incomingSet = {}
+			for _, instance in ipairs(group.incoming) do
+				incomingSet[instance] = true
+			end
+			for _, instance in ipairs(group.target:GetChildren()) do
+				if incomingSet[instance] then
+					local list = byName[instance.Name] or {}
+					byName[instance.Name] = list
+					list[#list + 1] = instance
+				end
+			end
+			for index, descriptor in ipairs(group.rootPaths) do
+				local key = pathCacheKey(descriptor.pathSegments, descriptor.pathOrdinals)
+				local instance = native.boundPaths[key]
+				if instance == nil then
+					local name = descriptor.pathSegments[#descriptor.pathSegments]
+					local nextIndex = (indices[name] or 0) + 1
+					indices[name] = nextIndex
+					instance = byName[name] and byName[name][nextIndex]
+					if instance == nil then
+						error("Native insertion is missing an expected root")
+					end
+					ordered[#ordered + 1] = instance
+				end
+				group.incomingByPayloadIndex[index] = instance
+				group.incomingRootsByPath[key] = instance
+			end
+			if #ordered ~= #group.incoming then
+				error("Native insertion returned unexpected roots")
+			end
+			group.incoming = ordered
+		end
+		runWithStudioChangeSuppression(ctx, function()
+			ReferenceOverlay.apply(native.referenceOverlay, undo.replacements, ctx)
+		end)
+		transaction.state = "prepared"
+		transaction.nativeStats = {
+			requests = 1, instanceCreated = native.receivedCreated, lastMs = (os.clock() - native.started) * 1000,
+		}
+		return { ok = true, requests = 1, instanceCreated = native.receivedCreated,
+			binaryBytes = session.totalBytes, nativeInserted = true, profile = native.profile }
+	end
+
 	function api.finishBinaryImport(params: { [string]: any }): { [string]: any }
 		pruneExpiredSessions(binaryImports)
 		pruneCompletedBinaryImports()
@@ -6785,7 +7805,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		if type(session) ~= "table" then
 			error("Native import session was not found")
 		end
-		if session.receivedChunks ~= session.totalChunks or session.receivedBytes ~= session.totalBytes then
+		if session.nativeHeld == nil and (session.receivedChunks ~= session.totalChunks or session.receivedBytes ~= session.totalBytes) then
 			error("Native import is incomplete")
 		end
 		local transactionId = tostring(session.transactionId or "")
@@ -6799,6 +7819,31 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		assertSessionOwnership(operationGeneration)
 		armSessionExpiry(binaryImports, importId, session)
 		armSessionExpiry(editorTransactions, transactionId, transaction)
+		if session.nativeHeld ~= nil then
+			if params.nativeReceiptChunk ~= nil then
+				if params.nativePhase ~= "complete" or type(params.nativeReceiptChunk) ~= "table" then
+					error("Native creation receipts can only accompany completion")
+				end
+				api.appendBinaryImport({ importId = importId, nativeReceipt = true,
+					index = params.nativeReceiptChunk.index, data = params.nativeReceiptChunk.data })
+			end
+			beginSessionOperation(session)
+			beginSessionOperation(transaction)
+			local ok, response = pcall(finishNativeServiceImport, session, transaction, params)
+			endSessionOperation(binaryImports, importId, session)
+			endSessionOperation(editorTransactions, transactionId, transaction)
+			if not ok then
+				error(response, 0)
+			end
+			if params.nativePhase == "complete" then
+				binaryImports[importId] = nil
+				completedBinaryImports[importId] = {
+					leaseId = session.leaseId, response = response, completedAt = os.clock(),
+					expiresAt = os.clock() + COMPLETED_BINARY_IMPORT_TTL_SECONDS,
+				}
+			end
+			return response
+		end
 		beginSessionOperation(session)
 		beginSessionOperation(transaction)
 		local operation = beginTrackedOperation("binaryImport")
@@ -6813,27 +7858,39 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			end
 			local started = os.clock()
 			setTrackedOperationPhase(operation, "scanOutgoing")
+			local profile = if params.profile == true then {} else nil
+			local phaseStarted = started
+			local function finishPhase(name: string)
+				if profile then
+					local now = os.clock()
+					profile[name] = (now - phaseStarted) * 1000
+					phaseStarted = now
+				end
+			end
 			local previousCamera = Workspace.CurrentCamera
 			local outgoingByGroup = {}
 			local generationsByService = {}
 			for groupIndex, group in ipairs(session.groups) do
 				if
-					(#group.retainedRoots > 0 or #group.packageRoots > 0)
+					(group.additive or #group.retainedRoots > 0 or #group.packageRoots > 0)
 					and ctx.studioChangeGeneration(group.serviceName) ~= group.changeGeneration
 				then
 					error(`Studio changed {group.serviceName} after package preflight; retry the sync`)
 				end
 				local outgoing = {}
-				for _, instance in ipairs(group.target:GetChildren()) do
-					local lockedStarterContainer = group.serviceName == "StarterPlayer"
-						and group.target == group.service
-						and (instance:IsA("StarterPlayerScripts") or instance:IsA("StarterCharacterScripts"))
-					local protectedCamera = group.target == Workspace
-						and (instance == previousCamera or isProtectedWorkspaceCameraInstance(instance))
+				local managedClasses = if group.target == group.service then ENGINE_MANAGED_CONTAINERS[group.serviceName] else nil
+				if group.additive then
+					for _, descriptor in ipairs(group.rootPaths) do
+						if descriptor.pathOrdinals[2] ~= 1 or group.target:FindFirstChild(descriptor.pathSegments[2]) ~= nil then
+							error(`New native root {table.concat(descriptor.pathSegments, ".")} already exists or is ambiguous`)
+						end
+					end
+				end
+				for _, instance in ipairs(if group.additive then {} else group.target:GetChildren()) do
+					local lockedContainer = managedClasses ~= nil and table.find(managedClasses, instance.ClassName) ~= nil
 					if
 						not instance:IsA("Terrain")
-						and not lockedStarterContainer
-						and not protectedCamera
+						and not lockedContainer
 						and includeManagedInstance(ctx, group.serviceName, instance)
 					then
 						outgoing[#outgoing + 1] = instance
@@ -6847,8 +7904,10 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				end
 			end
 			transaction.nativeGuard = ReferenceOverlay.beginNativeGuard(session.groups)
+			finishPhase("outgoingAndGuardMs")
 			setTrackedOperationPhase(operation, "deserialize")
 			roots = SerializationService:DeserializeInstancesAsync(session.payload)
+			finishPhase("deserializeMs")
 			setTrackedOperationPhase(operation, "validatePayload")
 			assertImportActive()
 			ReferenceOverlay.assertNativeGuard(transaction.nativeGuard)
@@ -6868,12 +7927,21 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				wrappedRootsByName[root.Name] = root
 			end
 			local prepared = {}
+			local payloadVerifiedServices = {}
+			finishPhase("validatePayloadMs")
 			setTrackedOperationPhase(operation, "prepareGroups")
-			local skippedIncomingInstanceCount = 0
 			for groupIndex, group in ipairs(session.groups) do
 				local groupPayloadRoot = wrappedRootsByName[group.payloadRootName]
 				if groupPayloadRoot == nil then
 					error("Native import payload group was not found")
+				end
+				if group.expectedStructure ~= nil
+					and not group.additive and #group.targetPath == 1
+					and group.viewportCamera == nil
+					and #group.retainedRoots == 0 and #group.packageRoots == 0
+					and BridgeReferenceOverlay.matchesPayloadStructure(groupPayloadRoot, group.expectedStructure)
+				then
+					payloadVerifiedServices[#payloadVerifiedServices + 1] = group.serviceName
 				end
 				local groupRoots = groupPayloadRoot:GetChildren()
 				if #groupRoots ~= group.count then
@@ -6910,29 +7978,18 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					end
 					instance.Name = originalName
 					setParentForSync(instance, nil, ctx)
-					local protectedCamera = group.target == Workspace
-						and instance:IsA("Camera")
-						and (
-							instance.Name == "Camera"
-							or instance.Name == "CurrentCamera"
-							or previousCamera ~= nil and instance.Name == previousCamera.Name
-						)
-					if protectedCamera then
-						skippedIncomingInstanceCount += 1 + #instance:GetDescendants()
-						instance:Destroy()
-						incomingByPayloadIndex[index] = nil
-					else
-						incoming[#incoming + 1] = instance
-						detachedRoots[#detachedRoots + 1] = instance
-					end
+					incoming[#incoming + 1] = instance
+					detachedRoots[#detachedRoots + 1] = instance
 				end
 				groupPayloadRoot:Destroy()
 				prepared[#prepared + 1] = {
 					serviceName = group.serviceName,
+					additive = group.additive,
 					service = group.service,
 					target = group.target,
 					targetPath = group.targetPath,
 					rootPaths = group.rootPaths,
+					viewportCamera = group.viewportCamera,
 					incoming = incoming,
 					incomingByPayloadIndex = incomingByPayloadIndex,
 					outgoing = outgoingByGroup[groupIndex],
@@ -6940,14 +7997,21 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					packageRoots = group.packageRoots,
 				}
 			end
+			finishPhase("unpackGroupsMs")
 			setTrackedOperationPhase(operation, "prepareRetention")
-			local retention = ReferenceOverlay.prepareRetained(prepared, ctx, session.externalReferencesPostApplied)
+			local retention = ReferenceOverlay.prepareRetained(
+				prepared, ctx, session.externalReferencesPostApplied, session.viewportReferencesPostApplied
+			)
+			finishPhase("prepareRetentionMs")
 			transaction.nativeUndo = {
 				prepared = prepared,
 				replacements = retention.replacements,
 				currentCamera = previousCamera,
+				currentCameraParent = if previousCamera then previousCamera.Parent else nil,
+				viewport = retention.viewport,
 				resolveStagedPath = retention.resolveStagedPath,
 				referenceUpdates = retention.referenceUpdates,
+				needsReferenceRetarget = not session.externalReferencesPostApplied and retention.needsReferenceRetarget,
 				retainedDuplicates = retention.retainedDuplicates,
 				packageAliases = retention.packageAliases,
 				packageMerges = retention.packageMerges,
@@ -6961,10 +8025,11 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			setTrackedOperationPhase(operation, "applyOverlay")
 			ReferenceOverlay.apply(retention.referenceOverlay, retention.replacements, nil)
 			assertImportActive()
+			finishPhase("referenceOverlayMs")
 			local elapsed = (os.clock() - started) * 1000
 			local createdInstanceCount = math.max(
 				0,
-				session.instanceCount - skippedIncomingInstanceCount - retention.retainedDuplicateInstanceCount
+				session.instanceCount - retention.retainedDuplicateInstanceCount
 			)
 			transaction.nativeStats = {
 				requests = 1,
@@ -6979,7 +8044,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				propertyUpdated = retention.referenceUpdates,
 				binaryBytes = session.totalBytes,
 				binaryMs = elapsed,
+				payloadVerifiedServices = payloadVerifiedServices,
 				undoRecorded = transaction.historyRecording ~= nil,
+				profile = profile,
 			}
 			transaction.state = "prepared"
 			binaryImports[importId] = nil
@@ -7141,10 +8208,25 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 	end
 
 	function api.applyChanges(params: { [string]: any }): { [string]: any }
+		local profile = if params.profile == true then {} else nil
+		local profileStarted = if profile then os.clock() else 0
+		local phaseStarted = profileStarted
+		local function checkpoint(name: string)
+			if profile then
+				local now = os.clock()
+				profile[name] = (now - phaseStarted) * 1000
+				phaseStarted = now
+			end
+		end
 		local operationGeneration = captureOperationCancellation()
 		assertSessionOwnership(operationGeneration)
 		local serviceNames = validateMutationRequest(params, ctx)
 		local requestedTransactionId = tostring(params.transactionId or "")
+		local verifyOnly = params.verifyOnly == true
+		if verifyOnly and (requestedTransactionId == "" or #(params.instanceChanges or {}) > 0
+			or #(params.sourceChanges or {}) > 0) then
+			error("Verification only compares property changes inside a transaction")
+		end
 		local outerTransaction = nil
 		if requestedTransactionId ~= "" then
 			pruneExpiredSessions(editorTransactions)
@@ -7153,6 +8235,13 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				error("Editor transaction was not found")
 			end
 			assertTransactionLease(outerTransaction)
+			if not verifyOnly and outerTransaction.nativeUndo ~= nil then
+				-- Mixed imports can also edit retained live objects (for example,
+				-- children of the viewport). Check the staging fence before those
+				-- writes; the transaction journal then distinguishes our expected
+				-- events from outside edits through commit and rollback.
+				ReferenceOverlay.finishNativeStaging(outerTransaction.nativeUndo, ctx)
+			end
 			armSessionExpiry(editorTransactions, requestedTransactionId, outerTransaction)
 		end
 		local chunkChange = nil
@@ -7223,23 +8312,29 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local previousSettingsIdLookupByService = ctx.settingsIdLookupByService
 		local previousMatchCandidateBuckets = ctx.matchCandidateBuckets
 		local previousSelectionReplacements = ctx.selectionReplacements
-		local previousLoadedMeshPartSources = ctx.loadedMeshPartSources
-		local previousReadyMeshPartSources = ctx.readyMeshPartSources
-		local previousMeshPartApplyCount = ctx.meshPartApplyCount
 		local previousUnreadablePropertyNames = ctx.unreadablePropertyNames
 		local previousResolveStagedPath = ctx.resolveStagedPath
 		local previousEditorTransaction = ctx.editorTransaction
+		local previousAssertEditorMutationActive = ctx.assertEditorMutationActive
 		local explorerSelection = captureExplorerSelection()
 		local selectionReplacements = {}
 		ctx.resolveCache = {}
 		ctx.settingsIdLookupByService = {}
 		ctx.matchCandidateBuckets = {}
 		ctx.selectionReplacements = selectionReplacements
-		ctx.loadedMeshPartSources = nil
-		ctx.readyMeshPartSources = nil
-		ctx.meshPartApplyCount = 0
 		ctx.resolveStagedPath = if outerTransaction ~= nil then outerTransaction.resolveStagedPath else nil
 		ctx.editorTransaction = outerTransaction
+		ctx.assertEditorMutationActive = function()
+			assertSessionOwnership(operationGeneration)
+			assertReconcileActive()
+			if outerTransaction ~= nil then
+				assertTransactionLease(outerTransaction)
+				if editorTransactions[requestedTransactionId] ~= outerTransaction or outerTransaction.cancelRequested
+					or outerTransaction.state ~= "open" and outerTransaction.state ~= "prepared" then
+					error("Editor transaction is no longer active")
+				end
+			end
+		end
 		local activeSnapshot = if outerTransaction ~= nil then outerTransaction.snapshot else transactionSnapshot
 		ctx.unreadablePropertyNames = if activeSnapshot ~= nil then activeSnapshot.unreadablePropertyNames else nil
 		local historyRecording = if outerTransaction ~= nil
@@ -7262,9 +8357,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			errors = 0,
 			protectedSkipped = 0,
 			protectedWrites = {},
-			meshPartPreloadCount = 0,
-			meshPartPreloadErrors = 0,
-			meshPartPreloadMs = 0,
 			probeItemChanged = 0,
 			probeDescendantAdded = 0,
 			probeDescendantRemoving = 0,
@@ -7272,6 +8364,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			probeDescendantAddedAvailable = 0,
 			probeDescendantRemovingAvailable = 0,
 			undoRecorded = not not historyRecording,
+			verifyOnly = verifyOnly,
+			verifyMismatches = if verifyOnly then {} else nil,
+			verified = 0,
 		}
 		local touchedServices = {}
 		local stopEventProbe
@@ -7280,6 +8375,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		end
 
 		local instanceChanges = params.instanceChanges
+		checkpoint("setupMs")
 		local aborted = false
 		if type(instanceChanges) == "table" then
 			for _, change in ipairs(instanceChanges) do
@@ -7319,6 +8415,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			end
 		end
 
+		checkpoint("instanceChangesMs")
 		local sourceChanges = params.sourceChanges
 		if not aborted and type(sourceChanges) == "table" then
 			for _, change in ipairs(sourceChanges) do
@@ -7341,6 +8438,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				end
 			end
 		end
+		checkpoint("sourceChangesMs")
 		if not aborted then
 			local ok, err = pcall(
 				runWithSessionOwnership,
@@ -7365,29 +8463,8 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		end
 
 		local propertyChanges = params.propertyChanges
+		checkpoint("retargetMs")
 		if not aborted and type(propertyChanges) == "table" then
-			local okPreload, preloadCountOrError, preloadMs = pcall(
-				runWithSessionOwnership,
-				operationGeneration,
-				assertReconcileActive,
-				preloadPropertyMeshPartSources,
-				propertyChanges,
-				ctx
-			)
-			if okPreload then
-				stats.meshPartPreloadCount = preloadCountOrError
-				stats.meshPartPreloadMs = preloadMs
-			else
-				ctx.readyMeshPartSources = nil
-				local ownsSession = pcall(assertSessionOwnership, operationGeneration)
-				if ownsSession then
-					stats.meshPartPreloadErrors += 1
-				else
-					stats.ok = false
-					stats.errors += 1
-					aborted = true
-				end
-			end
 			if not aborted then
 				local sliceStarted = os.clock()
 				for _, change in ipairs(propertyChanges) do
@@ -7409,7 +8486,12 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 						break
 					end
 					if os.clock() - sliceStarted >= 0.008 then
+						local yieldStarted = if profile then os.clock() else 0
 						task.wait()
+						if profile then
+							profile.propertyYieldMs = (profile.propertyYieldMs or 0) + (os.clock() - yieldStarted) * 1000
+							profile.propertyYields = (profile.propertyYields or 0) + 1
+						end
 						assertSessionOwnership(operationGeneration)
 						assertReconcileActive()
 						sliceStarted = os.clock()
@@ -7418,6 +8500,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			end
 		end
 
+		checkpoint("propertyChangesMs")
 		if not aborted and chunkChange ~= nil and chunkChange.mode == "beginReconcileService" then
 			local okSession = pcall(function()
 				assertSessionOwnership(operationGeneration)
@@ -7507,12 +8590,10 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		ctx.settingsIdLookupByService = previousSettingsIdLookupByService
 		ctx.matchCandidateBuckets = previousMatchCandidateBuckets
 		ctx.selectionReplacements = previousSelectionReplacements
-		ctx.loadedMeshPartSources = previousLoadedMeshPartSources
-		ctx.readyMeshPartSources = previousReadyMeshPartSources
-		ctx.meshPartApplyCount = previousMeshPartApplyCount
 		ctx.unreadablePropertyNames = previousUnreadablePropertyNames
 		ctx.resolveStagedPath = previousResolveStagedPath
 		ctx.editorTransaction = previousEditorTransaction
+		ctx.assertEditorMutationActive = previousAssertEditorMutationActive
 		ctx.stats.requests += 1
 		ctx.stats.lastMs = stats.lastMs
 		ctx.stats.lastAtUnix = os.time()
@@ -7533,6 +8614,14 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			outerTransaction.state = "prepared"
 		end
 		ctx.updateStatus()
+		checkpoint("finalizationMs")
+		if profile then
+			profile.applyMs = (os.clock() - profileStarted) * 1000
+			profile.instanceGroups = #(instanceChanges or {})
+			profile.sourceItems = #(sourceChanges or {})
+			profile.propertyItems = #(propertyChanges or {})
+			stats.profile = profile
+		end
 		return stats
 	end
 

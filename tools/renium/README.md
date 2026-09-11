@@ -72,6 +72,14 @@ After a failure, inspect `rbx lst --details`, fix the cause, then `rbx rp` to
 retry. `rbx dp` discards pending work. When the next operation needs completed
 sync, `rbx lst --wait 10` waits up to ten seconds.
 
+### Undo a sync
+
+`rbx rev --sync latest` restores the last reconciled sync's affected files from
+`.renium/editor-history/sync`. A push's `historyId` selects a specific sync.
+Newer edits are protected: restore stops if the affected files have changed.
+Live Sync transfers the restored files; otherwise add `--apply-studio`.
+Add `--details` only when you need every restored path.
+
 ## Project files
 
 ```text
@@ -79,16 +87,47 @@ renium.project.jsonc
 src/
   ServerScriptService/
     Main.server.luau
-    __roblox_sync_settings.renium
   ReplicatedStorage/
     Config.luau
-    __roblox_sync_settings.renium
+instances/
+  ServerScriptService.renium
+  ReplicatedStorage.renium
 sourcemap.json
 ```
 
 Scripts are normal files. Service stores hold instances, properties, attributes,
 and references; edit them through Renium's Explorer or CLI. Sourcemaps are generated.
 The project config supports custom source roots, mounts, adapters, and filters.
+
+Keep `instances/` in version control with your scripts. Renium automatically moves
+older stores out of the source folders without changing their bytes. If both
+locations contain different data, migration stops and preserves both copies.
+Each place has its own `instances/`, even with a custom `sourceRoot`.
+The separate `.renium/` directory contains local cache and undo data.
+
+The default script layout remains unchanged. To opt into client/server folders,
+add these mappings to `renium.project.jsonc`:
+
+```jsonc
+{
+  "schemaVersion": 1,
+  "tree": {
+    "ServerScriptService": { "$path": "src/server" },
+    "StarterPlayer": {
+      "StarterPlayerScripts": {
+        "$className": "StarterPlayerScripts",
+        "$path": "src/client"
+      }
+    },
+    "ReplicatedStorage": { "$path": "src/shared" }
+  }
+}
+```
+
+Use `Main.server.luau` in `src/server`, `Main.client.luau` in `src/client`,
+and module scripts such as `Config.luau` in `src/shared`. Mappings choose the
+Roblox parent; file suffixes choose script types. Mapped instance stores also
+live under `instances/`, following their Roblox target path.
 
 ```powershell
 rbx init my-place --with git,wally,selene,docs
@@ -283,22 +322,26 @@ are unsupported. Content supports URI/None; Object/Opaque sources stop export
 instead of silently losing data. Infinity/NaN use tagged values. Script comparison
 ignores line-ending-only differences.
 
-## Workflow plugins
+## Plugins
+
+Plugins add commands to Renium, from small helpers to whole workflows, without
+changing its source.
 
 ```powershell
-rbx plugin new my-workflow
-# In my-workflow: cargo build --release
-rbx plugin install ./my-workflow --dev
-rbx my-workflow hello --name World
+rbx plugin new my-plugin
+# In my-plugin: cargo build --release
+rbx plugin install ./my-plugin --dev
+rbx my-plugin hello --name World
 ```
 
-One manifest defines commands, arguments and help; one Rust handler implements
-them using the included SDK. No Renium source changes or separate SDK install.
-`plugin list` discovers installed workflows; `plugin info NAME` shows their guide.
-Installation never builds or executes a plugin. Install only trusted native code.
+One manifest defines commands, arguments, help and time budgets; one Rust handler
+implements them using the included SDK. No Renium source changes or separate SDK
+install. `plugin list` shows installed plugins; `plugin info NAME` shows a plugin's
+guide. Installation never builds or executes a plugin. Install only trusted native code.
 
-[Authoring guide](renium-guides/plugins.md). The [sandbox workflow source](../renium-plugins/sandbox/README.md)
-is separate and is not included in Renium builds.
+[Authoring guide](renium-guides/plugins.md). The first plugin, [sandbox](../renium-plugins/sandbox/README.md),
+gives a task an exclusive disposable Studio place; its source is separate and is not
+included in Renium builds.
 
 ## Build
 

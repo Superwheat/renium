@@ -127,7 +127,7 @@ return {
 		},
 		WorldPivotData = {
 			read = function(instance)
-				return true, instance:GetPivot()
+				return true, instance.WorldPivot
 			end,
 			write = function(instance, _, value)
 				if value == nil then
@@ -140,7 +140,7 @@ return {
 		},
 		WorldPivot = {
 			read = function(instance)
-				return true, instance:GetPivot()
+				return true, instance.WorldPivot
 			end,
 			write = function(instance, _, value)
 				instance.WorldPivot = value

@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import Module from "node:module";
 import { test } from "node:test";
+import * as vm from "node:vm";
+import ts from "typescript";
 import { parseExplorerMessage } from "../src/explorerMessages";
+import { fileExplorerWebviewHtml } from "../src/fileExplorerWebview";
 import { isImportStageName } from "../src/serviceDefaults";
 
 test("only reserved import staging roots are excluded, not similarly named user data", () => {
@@ -19,6 +22,50 @@ loader._load = (request, parent, isMain) => request === "vscode" ? {} : original
 const { FileExplorerViewProvider } = require("../src/fileExplorerView");
 const { FilePropertiesViewProvider } = require("../src/filePropertiesView");
 loader._load = original;
+
+test("clearing Explorer search delivers a valid request and reloads normal rows with or without a selected match", async () => {
+  const html = fileExplorerWebviewHtml({ assetBase: "", classNames: [], availableIconNames: new Set(), initialRows: "[]", maxStoreDroppedBytes: 1024 });
+  const source = html.split("<script>")[1].split("</script>")[0];
+  const tree = ts.createSourceFile("explorer.js", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+  let input: ts.ExpressionStatement | undefined;
+  function visit(node: ts.Node): void {
+    if (ts.isExpressionStatement(node) && ts.isCallExpression(node.expression)
+      && node.expression.expression.getText(tree) === "search.addEventListener"
+      && node.expression.arguments[0]?.getText(tree) === "'input'") { input = node; }
+    ts.forEachChild(node, visit);
+  }
+  visit(tree);
+  assert.ok(input, "Production Explorer search input handler is missing");
+  for (const revealId of [null, "Workspace/Match"]) {
+    let handler!: () => void;
+    const messages: unknown[] = [];
+    const context = vm.createContext({
+      search: { value: "", addEventListener: (_type: string, callback: () => void) => { handler = callback; } },
+      filter: "mesh", searchRevision: 1, searchRevealId: revealId, prefetchTimer: null, searchDebounce: 1,
+      document: { activeElement: null }, tree: { scrollTop: 88 },
+      clearTimeout() {}, resetRowCache() {}, hideSearchSuggestions() {}, renderFlatRows() {}, updateSearchMeta() {},
+      visibleCount: () => 120,
+      vscode: { postMessage: (message: unknown) => messages.push(JSON.parse(JSON.stringify(message))) },
+    });
+    vm.runInContext(input.getText(tree), context);
+    handler();
+    assert.equal(messages.length, 1);
+    const message = parseExplorerMessage(messages[0]);
+    assert.ok(message, "The host must accept the message replacing Loading with normal rows");
+    assert.equal(message.type, "clearSearch");
+    const rows: unknown[][] = [];
+    let cleared = false;
+    const view = Object.assign(Object.create(FileExplorerViewProvider.prototype), {
+      searchGeneration: 0, currentMode: "search",
+      backend: { clearSearch: async () => { cleared = true; }, revealNode: async () => ({ rowIndex: 100 }) },
+      requestRows: async (...args: unknown[]) => { rows.push(args); },
+    });
+    await view.onMessage(message);
+    assert.equal(cleared, true);
+    assert.equal(context.filter, "");
+    assert.deepEqual(rows, [[revealId ? 40 : 0, 120, "normal", !!revealId]]);
+  }
+});
 
 test("Explorer message boundary rejects malformed payloads while retaining optional defaults", () => {
   for (const input of [null, [], {}, { type: "constructor" }, { type: "getRows", start: "0" },

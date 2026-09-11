@@ -46,7 +46,7 @@ return function(lib, bytes, selectedFrame, top, scopeMask, threadMask, counterMa
 		iter:Configure({ SkipEvents = true, EmitThreadFrameEnd = true, TimerIds = timerIds, ThreadIds = threadIds })
 		iter:RewindTo(frame.frameId, frame.frameId)
 		local state = iter:GetState()
-		local scopes, threads = {}, {}
+		local scopes, threads, intervals = {}, {}, {}
 		local function add(timerId, threadId, beginTick, endTick)
 			local thread = threads[threadId]
 			if not thread then
@@ -68,9 +68,12 @@ return function(lib, bytes, selectedFrame, top, scopeMask, threadMask, counterMa
 				item = { timerId = timerId, name = timer.TimerName, group = group.GroupName,
 					threadId = threadId, thread = thread.ThreadName, gpu = thread.IsGpu, inclusiveMs = 0, spans = 0 }
 				scopes[key] = item
+				intervals[key] = {}
 			end
 			item.inclusiveMs += elapsed
 			item.spans += 1
+			local ranges = intervals[key]
+			ranges[#ranges + 1] = { math.max(beginTick, start), math.min(endTick, finish) }
 		end
 		local overflow = false
 		while iter:Step() do
@@ -92,11 +95,25 @@ return function(lib, bytes, selectedFrame, top, scopeMask, threadMask, counterMa
 		end
 		iter:Dispose()
 		local ordered, idle = {}, {}
-		for _, item in scopes do
+		for key, item in scopes do
+			-- Recursive scopes can repeat the same timer on the same thread.
+			-- Keep inclusive call time, but rank the occupied wall interval once.
+			local ranges = intervals[key]
+			table.sort(ranges, function(a, b)
+				return a[1] < b[1]
+			end)
+			local covered, finish = 0, -math.huge
+			for _, range in ranges do
+				covered += math.max(0, range[2] - math.max(finish, range[1]))
+				finish = math.max(finish, range[2])
+			end
+			item.wallMs = covered * (if item.gpu then scale.TickToMsGpu else scale.TickToMsCpu)
 			local target = if item.name == "Sleep" and not scopeMask then idle else ordered
 			target[#target + 1] = item
 		end
-		table.sort(ordered, function(a, b) return a.inclusiveMs > b.inclusiveMs end)
+		table.sort(ordered, function(a, b)
+			return a.wallMs > b.wallMs
+		end)
 		local count = #ordered
 		while #ordered > top do table.remove(ordered) end
 		details[#details + 1] = { frameId = frame.frameId, absoluteId = frame.absoluteId,
@@ -132,7 +149,7 @@ return function(lib, bytes, selectedFrame, top, scopeMask, threadMask, counterMa
 		cpuMs = if #durations > 0 then { mean = total / #durations, p50 = durations[math.ceil(#durations * 0.5)],
 			p95 = durations[math.ceil(#durations * 0.95)], max = durations[#durations] } else nil,
 		frames = details, counterCount = count, counters = counters,
-		units = { scopes = "inclusive work ms per thread; overlapping scopes are not additive", counters = "engine-native units" },
+		units = { scopes = "wallMs: interval union per thread/timer; inclusiveMs: sum of calls including recursion; different scopes still overlap", counters = "engine-native units" },
 		limitations = "Scope instance labels and event metadata are not exposed by LibMP; frame GPU bounds alone do not establish GPU-bound work.",
 	}
 end

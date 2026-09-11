@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 license-file = "../../../LICENSE"
-description = "Exclusive disposable Studio workflows for Renium"
+description = "Exclusive disposable Studio places for Renium tasks"
 
-# Deliberately not a member of Renium's build. This plugin is source-only until explicitly built.
+# Deliberately not a member of Renium's build; build and qualify this plugin separately.
 [workspace]
 
 [dependencies]

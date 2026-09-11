@@ -2,6 +2,32 @@ use super::*;
 use clap::Parser;
 use rbx_dom_weak::{InstanceBuilder, types::Attributes};
 
+#[test]
+fn changed_field_scan_preserves_names_values_and_presence() {
+    let before = serde_json::from_value::<Map<String, Value>>(
+        json!({"same": 1,"removed": null,"edited": 1}),
+    )
+    .unwrap();
+    let after =
+        serde_json::from_value::<Map<String, Value>>(json!({"same": 1,"added": null,"edited": 2}))
+            .unwrap();
+    assert!(changed_fields(&before, &before, true).is_empty());
+    assert_eq!(
+        changed_fields(&before, &after, false),
+        json!([{"name":"added"},{"name":"edited"},{"name":"removed"}])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+    let values = changed_fields(&before, &after, true);
+    assert_eq!(values[0]["beforePresent"], false);
+    assert_eq!(values[0]["afterPresent"], true);
+    assert_eq!(values[1]["before"], 1);
+    assert_eq!(values[1]["after"], 2);
+    assert_eq!(values[2]["beforePresent"], true);
+    assert_eq!(values[2]["afterPresent"], false);
+}
+
 fn fixture(reverse: bool, revision: f64) -> WeakDom {
     let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
     let root = dom.insert(dom.root_ref(), InstanceBuilder::new("Workspace"));
@@ -60,6 +86,76 @@ fn full_diff_matches_reordered_duplicate_subtrees_and_references() {
     let result = diff(&fixture(false, 1.0), &fixture(true, 1.0), &[]);
     assert_eq!(result["matches"], true, "{result}");
     assert_eq!(result["unchanged"], 7);
+}
+
+#[test]
+fn comparison_decode_elision_preserves_normalized_values() {
+    let mut source = fixture(false, 2.0);
+    let root = source.root().children()[0];
+    let database = rbx_reflection_database::get().unwrap();
+    for class in [
+        "Part",
+        "MeshPart",
+        "Attachment",
+        "Model",
+        "UICorner",
+        "Frame",
+        "ModuleScript",
+        "Texture",
+        "WeldConstraint",
+    ] {
+        let defaults = &database.classes[class].default_properties;
+        source.insert(
+            root,
+            InstanceBuilder::new(class).with_properties(
+                defaults
+                    .iter()
+                    .map(|(name, value)| (name.to_string(), value.clone())),
+            ),
+        );
+    }
+    source.insert(
+        root,
+        InstanceBuilder::new("Part")
+            .with_property("Anchored", true)
+            .with_property("Size", rbx_dom_weak::types::Vector3::new(7.0, 8.0, 9.0))
+            .with_property("FutureSavedProperty", "retained"),
+    );
+    let root_dir = crate::system::files::create_unique_directory(
+        &std::env::temp_dir(),
+        "renium-comparison-decode-",
+    )
+    .unwrap();
+    let _cleanup = crate::system::files::OnDrop::new(|| {
+        let _ = std::fs::remove_dir_all(&root_dir);
+    });
+    for extension in ["rbxl", "rbxlx"] {
+        let path = root_dir.join(format!("comparison.{extension}"));
+        let format = crate::rbx::model::RbxPlaceFormat::from_path(&path).unwrap();
+        format
+            .write(&path, &source, source.root().children())
+            .unwrap();
+        let original = format.read(&path).unwrap();
+        let elided = format.read_for_comparison(&path).unwrap();
+        assert_eq!(
+            document(&original, "same", None, true).unwrap(),
+            document(&elided, "same", None, true).unwrap(),
+            "{extension}"
+        );
+        assert_eq!(diff(&original, &elided, &["--values"])["matches"], true);
+        if extension == "rbxl" {
+            assert!(
+                original
+                    .descendants()
+                    .map(|node| node.properties.len())
+                    .sum::<usize>()
+                    > elided
+                        .descendants()
+                        .map(|node| node.properties.len())
+                        .sum::<usize>()
+            );
+        }
+    }
 }
 
 #[test]

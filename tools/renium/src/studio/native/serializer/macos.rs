@@ -19,7 +19,12 @@ use crate::system::files::{atomic_write_file, sha256_hex};
 
 #[path = "macos_properties.rs"]
 mod properties;
-pub(crate) use properties::prepare_property;
+#[cfg(target_arch = "aarch64")]
+pub(crate) use properties::capture_identities;
+pub(crate) use properties::{
+    observe_terrain, prepare_context, prepare_property, prepare_terrain, read_property,
+    register_history,
+};
 
 const HELPER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-studio-helper.dylib"));
 const LAUNCHER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-studio-launcher"));
@@ -697,6 +702,26 @@ fn process_executable_path(pid: u32) -> Result<PathBuf> {
     Ok(PathBuf::from(
         String::from_utf8(bytes).context("Studio executable path is not valid UTF-8")?,
     ))
+}
+
+/// Protect an existing Edit process before it starts or closes Play children.
+pub(crate) fn protect_studio_launch(pid: u32) -> Result<()> {
+    let mut socket = UnixStream::connect(format!("/tmp/renium-studio-{pid}.sock")).context(
+        "Studio needs the current Renium native helper; update Renium and restart Studio",
+    )?;
+    socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+    socket.set_write_timeout(Some(Duration::from_secs(2)))?;
+    let mut request = [0u8; 56];
+    request[..4].copy_from_slice(&REQUEST_MAGIC.to_le_bytes());
+    request[4..8].copy_from_slice(&REQUEST_VERSION.to_le_bytes());
+    request[8..12].copy_from_slice(&4u32.to_le_bytes());
+    socket.write_all(&request)?;
+    let mut response = [0u8; RESPONSE_SIZE];
+    socket.read_exact(&mut response)?;
+    if read_u32(&response, 0) != Some(REQUEST_MAGIC) || read_u32(&response, 4) != Some(0) {
+        bail!("Studio could not protect background launching; update Renium and restart Studio");
+    }
+    Ok(())
 }
 
 fn invoke_helper(

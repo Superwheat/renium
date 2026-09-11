@@ -60,6 +60,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rejects_native_luau_statement_ambiguity_without_execution() {
+        let invalid = "error('must not execute')\n(target :: any).Value = 1";
+        let result = check(&["-".into()], &mut invalid.as_bytes()).unwrap();
+        assert_eq!(result["ok"], false);
+        assert!(
+            result["files"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("Ambiguous syntax")
+        );
+        let valid = "error('must not execute');\n(target :: any).Value = 1";
+        assert_eq!(
+            check(&["-".into()], &mut valid.as_bytes()).unwrap()["ok"],
+            true
+        );
+        assert!(crate::studio::automation::cooperative_luau(invalid).is_err());
+        assert_eq!(
+            crate::studio::automation::cooperative_luau(valid).unwrap(),
+            valid
+        );
+    }
+
+    #[test]
+    fn nested_loop_instrumentation_does_not_overflow_a_request_thread() {
+        let source = format!(
+            "--!strict\nlocal function f() {}return 1 {} end; return f()",
+            "for i = 1, 2 do ".repeat(12),
+            "end ".repeat(12)
+        );
+        let result = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let output = crate::studio::automation::cooperative_luau(&source).unwrap();
+                assert!(output.starts_with("--!strict\n"));
+                assert_eq!(output.matches("__reniumCooperate();").count(), 12);
+                validate_luau_syntax(&output).unwrap();
+                let excessive = format!("{}return 1{}", "do ".repeat(2000), " end".repeat(2000));
+                assert!(crate::studio::automation::cooperative_luau(&excessive).is_err());
+            })
+            .unwrap();
+        result.join().unwrap();
+    }
+
+    #[test]
+    fn instrumentation_preserves_loop_trivia_and_directives() {
+        let source = "--!strict\nwhile false do-- preserve this comment\n break end\nrepeat-- repeat comment\n break until true";
+        let output = crate::studio::automation::cooperative_luau(source).unwrap();
+        assert!(output.starts_with("--!strict\n"));
+        assert!(output.contains("__reniumCooperate();-- preserve this comment"));
+        assert!(output.contains("__reniumCooperate();-- repeat comment"));
+        validate_luau_syntax(&output).unwrap();
+    }
+
+    #[test]
     fn checks_luau_without_execution_and_reports_all_files() {
         let root = crate::tests::support::temp_dir("offline-syntax");
         let valid = root.join("valid.luau");
@@ -82,7 +136,7 @@ mod tests {
             result["files"][1]["error"]
                 .as_str()
                 .unwrap()
-                .contains("Invalid Luau syntax at")
+                .contains("Invalid Luau syntax")
         );
         assert_eq!(result["files"][2]["ok"], false);
         assert_eq!(result["files"][3]["ok"], true);

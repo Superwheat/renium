@@ -157,6 +157,31 @@ local function propertyDataForClass(classes, className, propertyName)
 	return nil
 end
 
+-- Native export includes hidden and protected saved fields. Only discard an
+-- engine readback when reflection explicitly proves it cannot be authored or
+-- serialized; an unknown field must continue invalidating the snapshot.
+function BridgePropertySchema.makeExportPropertyFilter(database, transportCandidates)
+	local classes = database.Classes
+	local byClass = {}
+	return function(className: string, propertyName: string): boolean
+		local cached = byClass[className]
+		if cached == nil then
+			cached = {}
+			byClass[className] = cached
+		end
+		if cached[propertyName] ~= nil then return cached[propertyName] end
+		local property = propertyDataForClass(classes, className, propertyName)
+		local canonical = property and property.Kind and property.Kind.Canonical
+		local transient = canonical ~= nil and canonical.Serialization == "DoesNotSerialize"
+			and table.find(property.Tags or {}, "ReadOnly") ~= nil
+			-- Supplemental fields such as MeshSize carry saved native data
+			-- through a differently named, read-only engine property.
+			and table.find(transportCandidates[className] or {}, propertyName) == nil
+		cached[propertyName] = not transient
+		return not transient
+	end
+end
+
 local function addSupplementalReadableTransportProperties(classes, className, names, seen, compactTypeIds)
 	if not classIsA(classes, className, TRIANGLE_MESH_PART_CLASS) then
 		return

@@ -184,7 +184,7 @@ function BridgePluginRuntime.start(context)
 	local PARALLEL_SOURCE_BATCH_MIN_ITEMS = 24
 	local BRIDGE_VERSION = "0.3.5"
 	local BRIDGE_PROTOCOL_VERSION = "compact-v5"
-	local BRIDGE_BUILD_UNIX = 1788765703
+	local BRIDGE_BUILD_UNIX = 1788778300
 	local CHUNK_FRAME_PROTOCOL_VERSION = "rbs2"
 	local COMPACT_VALUE_PROTOCOL_VERSION = "compact-v5-schema-4"
 	local CLEAN_DEMAND_SERIALIZER_MAX_FRAME_MS = 33.0
@@ -275,6 +275,7 @@ function BridgePluginRuntime.start(context)
 	local SessionLockModule = requireChildModule("BridgeSessionLock")
 	local IdentityModule = requireChildModule("BridgeIdentity")
 	local MaterialServiceModule = requireChildModule("BridgeMaterialService")
+	local CollisionGroupsModule = requireChildModule("BridgeCollisionGroups")
 	local UiModule = requireChildModule("BridgeUi")
 	local PropertySchemaModule = requireChildModule("BridgePropertySchema")
 	local StudioApiSchemaModule = requireChildModule("BridgeStudioApiSchema")
@@ -320,8 +321,14 @@ function BridgePluginRuntime.start(context)
 		Teams = true,
 		SoundService = true,
 		VoiceChatService = true,
+		TextChatService = true,
+		TestService = true,
+		LocalizationService = true,
+		VRService = true,
 	}
 	Config.shouldIgnoreInstance = sessionLock.isLockInstance
+	-- Active only during traced attachment or native import operations.
+	Config.syncProfile = {}
 	local pendingStudioChangesSettingPrefix = SETTINGS_PREFIX .. "pendingStudioChanges:"
 	local function pendingStudioChangesTarget(): { [string]: any }?
 		-- Plugin settings are shared by every Studio DataModel. Published places have
@@ -435,12 +442,13 @@ function BridgePluginRuntime.start(context)
 		microProfiler = function() return game:GetService("MicroProfilerService") end,
 		encodeBuffer = function(data) return buffer.tostring(EncodingService:Base64Encode(data)) end,
 		runtimeId = Config.bridgeRuntimeId, client = Config.bridgeRole == "play-client",
+		edit = Config.bridgeRole == "edit",
 		newId = function() return HttpService:GenerateGUID(false) end,
 		delay = task.delay, cancel = task.cancel,
 	})
 	local microProfiler = requireChildModule("BridgeMicroProfiler").create(function()
 		return game:GetService("MicroProfilerService")
-	end)
+	end, task.wait)
 	function Config.applyBridgeRuntimeSettings(runtimeSettings: { [string]: any })
 		Config.studioChanges.setOptions({
 			syncbackProperties = runtimeSettings.syncbackProperties,
@@ -738,35 +746,80 @@ function BridgePluginRuntime.start(context)
 	Config.includeExportInstance = includeExportInstance
 	local nativeStructureGenerationByService: { [string]: number } = {}
 	local nativeContentGenerationByService: { [string]: number } = {}
+	local nativeArchivableGenerationByService: { [string]: number } = {}
+	local nativeLastChangeByService: { [string]: string } = {}
 	local nativeServiceNames: { [Instance]: string } = {}
+	local exportPropertyRelevant = PropertySchemaModule.makeExportPropertyFilter(RbxDomDatabase, EXTERNAL_PROPERTY_CANDIDATES_BY_CLASS)
 	for serviceName in pairs(ALLOWED_SERVICES) do
 		nativeStructureGenerationByService[serviceName] = 0
 		nativeContentGenerationByService[serviceName] = 0
 		local service = game:GetService(serviceName)
 		nativeServiceNames[service] = serviceName
-		local function markStructureChanged(instance: Instance)
-			if includeExportInstance(serviceName, instance) then
-				nativeStructureGenerationByService[serviceName] += 1
-				nativeContentGenerationByService[serviceName] += 1
-			end
+	end
+	Config.exportProofGeneration = function(serviceName: string): (number, string?)
+		return nativeContentGenerationByService[serviceName] + (nativeArchivableGenerationByService[serviceName] or 0), nativeLastChangeByService[serviceName]
+	end
+	Config.invalidateTerrainExport = function()
+		nativeContentGenerationByService.Workspace += 1
+		nativeLastChangeByService.Workspace = "SmoothGrid"
+	end
+	Config.captureTerrainProof = function(): string
+		local payload = game:GetService("SerializationService"):SerializeInstancesAsync({ game:GetService("Workspace").Terrain })
+		return buffer.tostring(EncodingService:ComputeBufferHash(payload, Enum.HashAlgorithm.Blake3))
+	end
+	Config.observeProofDocuments = function(changed): { RBXScriptConnection }
+		local editor = game:GetService("ScriptEditorService")
+		return { editor.TextDocumentDidChange:Connect(changed), editor.TextDocumentDidOpen:Connect(changed),
+			editor.TextDocumentDidClose:Connect(changed) }
+	end
+	local function markStructureChanged(serviceName: string, instance: Instance)
+		local profile = Config.syncProfile.attachment or Config.syncProfile.nativeImport
+		local started = if profile then os.clock() else 0
+		local included = includeExportInstance(serviceName, instance)
+		if included then
+			nativeStructureGenerationByService[serviceName] += 1
+			nativeContentGenerationByService[serviceName] += 1
+			nativeLastChangeByService[serviceName] = "hierarchy"
 		end
-		lifetimeConnections[#lifetimeConnections + 1] = service.DescendantAdded:Connect(markStructureChanged)
-		lifetimeConnections[#lifetimeConnections + 1] = service.DescendantRemoving:Connect(markStructureChanged)
+		if profile then
+			profile.nativeStructureCallbacksMs = (profile.nativeStructureCallbacksMs or 0) + (os.clock() - started) * 1000
+			profile.nativeStructureCallbacks = (profile.nativeStructureCallbacks or 0) + 1
+		end
+		return included
 	end
 	-- Export includes camera objects even though Live Sync deliberately ignores
 	-- their edits. Its bytes therefore need a separate invalidation generation.
-	lifetimeConnections[#lifetimeConnections + 1] = (game :: any).ItemChanged:Connect(function(instance, propertyName)
+	Config.studioChanges.observeExports(markStructureChanged, function(instance, propertyName)
+		local profile = Config.syncProfile.attachment or Config.syncProfile.nativeImport
+		local started = if profile then os.clock() else 0
 		-- Archivable is restored from the overlay; serialization temporarily sets it.
-		if typeof(instance) ~= "Instance" or string.lower(tostring(propertyName)) == "archivable" then
-			return
+		if typeof(instance) == "Instance" and exportPropertyRelevant(instance.ClassName, tostring(propertyName)) then
+			local root = Config.studioChanges.trackedServiceRoot(instance)
+			if root == nil then
+				root = instance
+				while root.Parent ~= nil and root.Parent ~= game do
+					root = root.Parent
+				end
+			end
+			local serviceName = nativeServiceNames[root]
+			if serviceName ~= nil and includeExportInstance(serviceName, instance) then
+				nativeLastChangeByService[serviceName] = tostring(propertyName)
+				if string.lower(tostring(propertyName)) == "archivable" then
+					nativeArchivableGenerationByService[serviceName] = (nativeArchivableGenerationByService[serviceName] or 0) + 1
+				else
+					nativeContentGenerationByService[serviceName] += 1
+					if propertyName == "Parent" then
+						-- Reparenting within a service changes serializer order without
+						-- firing that service's DescendantAdded/Removing signals.
+						nativeStructureGenerationByService[serviceName] += 1
+						Config.studioChanges.invalidateExportCache(serviceName)
+					end
+				end
+			end
 		end
-		local root = instance
-		while root.Parent ~= nil and root.Parent ~= game do
-			root = root.Parent
-		end
-		local serviceName = nativeServiceNames[root]
-		if serviceName ~= nil and includeExportInstance(serviceName, instance) then
-			nativeContentGenerationByService[serviceName] += 1
+		if profile then
+			profile.nativeContentCallbacksMs = (profile.nativeContentCallbacksMs or 0) + (os.clock() - started) * 1000
+			profile.nativeContentCallbacks = (profile.nativeContentCallbacks or 0) + 1
 		end
 	end)
 
@@ -801,9 +854,13 @@ function BridgePluginRuntime.start(context)
 		-- ItemChanged covers ignored camera edits, but does not cover every
 		-- attribute event. The tracker covers those without another listener set.
 		return nativeContentGenerationByService[serviceName] + Config.studioChanges.serviceGeneration(serviceName)
+			+ Config.studioChanges.tagGeneration()
 	end
 	editorSync = EditorSyncModule.create({
 		stats = editorSyncStats,
+		serializeValue = function(value)
+			return Config.serializeEditorValue(value, nil)
+		end,
 		runtimeId = Config.bridgeRuntimeId,
 		allowedServices = ALLOWED_SERVICES,
 		maxChangesPerRequest = 5000,
@@ -869,6 +926,7 @@ function BridgePluginRuntime.start(context)
 		end,
 		includeExportInstance = includeExportInstance,
 		nativeExportGeneration = nativeExportGeneration,
+		capturePushProof = Config.studioChanges.capturePushProof,
 		getPropertySchema = function(className: string)
 			return getClassPropertySchema(className) or {}
 		end,
@@ -896,6 +954,8 @@ function BridgePluginRuntime.start(context)
 		end,
 		expectParentChange = Config.studioChanges.expectParentChange,
 		expectPropertyEvent = Config.studioChanges.expectPropertyEvent,
+		samplePropertyChange = Config.studioChanges.samplePropertyChange,
+		syncProfile = Config.syncProfile,
 		expectAttributeEvent = Config.studioChanges.expectAttributeEvent,
 		expectTagChange = Config.studioChanges.expectTagChange,
 		cancelExpectedEvent = Config.studioChanges.cancelExpectedEvent,
@@ -904,11 +964,14 @@ function BridgePluginRuntime.start(context)
 		beginStudioChangeJournal = Config.studioChanges.beginChangeJournal,
 		drainStudioChangeJournal = Config.studioChanges.drainChangeJournal,
 		finishStudioChangeJournal = Config.studioChanges.finishChangeJournal,
+		beginNativeImportObservations = Config.studioChanges.beginNativeImportObservations,
+		finishNativeImportObservations = Config.studioChanges.finishNativeImportObservations,
 		finishEditorTransactionExpectation = finishEditorTransactionExpectation,
 		studioChangeGeneration = Config.studioChanges.serviceGeneration,
 		isStudioChangeTracking = Config.studioChanges.isTracking,
 		hasNonArchivable = Config.studioChanges.hasNonArchivable,
 		trackedExportInstances = Config.studioChanges.exportInstances,
+		attributeObservation = Config.studioChanges.attributeObservation,
 	})
 
 	refreshMatchedSettingsIds = function(state: ServiceState)
@@ -966,7 +1029,9 @@ function BridgePluginRuntime.start(context)
 		end
 		if propertyName == "Scale" then
 			return true, (instance :: any):GetScale()
-		elseif propertyName == "WorldPivotData" or propertyName == "WorldPivot" or propertyName == "Origin" then
+		elseif propertyName == "WorldPivotData" or propertyName == "WorldPivot" then
+			return true, (instance :: any).WorldPivot
+		elseif propertyName == "Origin" then
 			return true, (instance :: any):GetPivot()
 		end
 		return false, nil
@@ -1374,6 +1439,8 @@ function BridgePluginRuntime.start(context)
 
 	local deepEqual = ValueEqualityModule.exactValuesEqual
 
+	Config.serializeEditorValue = serializeValue
+
 	local function normalizePropertyName(name: string): string
 		return string.match(name, "^%s*(.-)%s*$")
 	end
@@ -1660,6 +1727,7 @@ function BridgePluginRuntime.start(context)
 			PropertySchemaModule.mergeSchemas(BUNDLED_PROPERTY_SCHEMAS_BY_CLASS, configuredSchemas)
 		EXTERNAL_PROPERTY_CANDIDATES_BY_CLASS =
 			PropertySchemaModule.buildCandidatesFromSchemas(EXTERNAL_PROPERTY_SCHEMAS_BY_CLASS)
+		exportPropertyRelevant = PropertySchemaModule.makeExportPropertyFilter(RbxDomDatabase, EXTERNAL_PROPERTY_CANDIDATES_BY_CLASS)
 		DEFAULT_PROPERTY_CACHE = {}
 		DEFAULT_TRANSPORT_PROPERTY_CACHE = {}
 		DEFAULT_TRANSPORT_FAST_COMPARE_CACHE = {}
@@ -1883,6 +1951,9 @@ function BridgePluginRuntime.start(context)
 				properties[propertyName] = value
 			end
 		end
+		if serviceName == "Workspace" then
+			properties.CollisionGroupData = CollisionGroupsModule.read()
+		end
 		return properties
 	end
 
@@ -1900,6 +1971,9 @@ function BridgePluginRuntime.start(context)
 			return properties
 		end
 		for _, propertyName in ipairs(candidates) do
+			if serviceName == "Workspace" and propertyName == "CollisionGroupData" then
+				continue
+			end
 			local okRead, value
 			if state.nativeRootPropertyValues ~= nil then
 				value = state.nativeRootPropertyValues[propertyName]
@@ -1913,6 +1987,18 @@ function BridgePluginRuntime.start(context)
 					properties[propertyName] = serialized
 				end
 			end
+		end
+		if serviceName == "Workspace" then
+			local collisionGroups = if state.nativeRootPropertyValues ~= nil
+				then state.nativeRootPropertyValues.CollisionGroupData
+				else CollisionGroupsModule.read()
+			properties.CollisionGroupData = {
+				_type = "BinaryString",
+				base64 = buffer.tostring(EncodingService:Base64Encode(buffer.fromstring(collisionGroups))),
+			}
+			-- Persist the viewport role as a reference, never as an editable setting.
+			-- Names and sibling ordinals cannot identify it after Studio reopens.
+			properties.CurrentCamera = serializeValue(service.CurrentCamera, state)
 		end
 		if state.nativeSnapshotRoot then
 			state.nativeRootProperties = properties
@@ -4762,6 +4848,7 @@ function BridgePluginRuntime.start(context)
 		return Config.getBridgeInfo()
 	end
 	local function cancelRequestLeaseResources(leaseId: string)
+		Config.studioChanges.cancelWait(leaseId)
 		local editorResult = editorSync.cancelRequestLease(leaseId)
 		local cancelledUploads = Config.editorTransactionUploads.cancelLease(leaseId)
 		local creatorResult = Config.creatorApi.cancelRequestLease(leaseId)
@@ -5037,7 +5124,15 @@ function BridgePluginRuntime.start(context)
 		return BridgePluginRuntime.withSuppression(Config.studioChanges, editorSync.applyChanges, p, p)
 	end
 
-	Config.bridgeMethodHandlers.getStudioChangeState = function(p)
+	Config.bridgeMethodHandlers.sampleStudioProperty = function(p)
+		assert(type(p.property) == "string" and p.property ~= "", "Invalid property sample")
+		local instance = IdentityModule.resolvePathSegments(p.pathSegments, nil, p.pathOrdinals)
+		assert(instance ~= nil and instance.ClassName == p.className, "Property sample target changed")
+		Config.studioChanges.samplePropertyChange(instance, p.property)
+		return { ok = true }
+	end
+
+	Config.bridgeMethodHandlers.getStudioChangeState = function(p, _sessionGeneration, leaseId)
 		if type(p.liveSyncStatus) == "table" then
 			editorSyncStats.liveSync = p.liveSyncStatus
 			Config.updateStatusText()
@@ -5060,7 +5155,7 @@ function BridgePluginRuntime.start(context)
 				internalParams.start = false
 			end
 			internalParams.compact = true
-			local guardState = Config.studioChanges.getState(internalParams)
+			local guardState = Config.studioChanges.getState(internalParams, leaseId)
 			return {
 				ok = true,
 				tracking = false,
@@ -5077,6 +5172,7 @@ function BridgePluginRuntime.start(context)
 				runtimeSettingsSeq = runtimeSettingsSeq,
 				runtimeId = Config.bridgeRuntimeId,
 				seq = guardState.seq,
+				snapshotSeq = guardState.snapshotSeq,
 				serviceGenerations = guardState.serviceGenerations,
 				pendingEpoch = guardState.pendingEpoch,
 				restoredPendingEpoch = guardState.restoredPendingEpoch,
@@ -5085,7 +5181,7 @@ function BridgePluginRuntime.start(context)
 				operation = editorSync.operationState(),
 			}
 		end
-		local changeState = Config.studioChanges.getState(p)
+		local changeState = Config.studioChanges.getState(p, leaseId)
 		changeState.twoWaySyncEnabled = true
 		changeState.runtimeSettingChanges = runtimeSettingChanges
 		changeState.runtimeSettingChangeCount = runtimeSettingChangeCount
@@ -5136,9 +5232,17 @@ function BridgePluginRuntime.start(context)
 			microProfiler.start(p.frames or 256)
 			return { ok = true, runtimeId = Config.bridgeRuntimeId, state = "collecting", frameLimit = p.frames or 256, scope = "studio-process" }
 		elseif p.action == "micro-stop" then
-			return microProfiler.stop(performance.micro)
+			return microProfiler.stop(function()
+				return performance.micro(p)
+			end)
+		elseif p.action == "micro-read" then
+			return performance.microRead(p)
+		elseif p.action == "micro" then
+			return microProfiler.read(function()
+				return performance.micro(p)
+			end)
 		end
-		assert(p.action == "snapshot" or p.action == "start" or p.action == "stop" or p.action == "read" or p.action == "micro", "Unknown performance action")
+		assert(p.action == "snapshot" or p.action == "start" or p.action == "stop" or p.action == "read", "Unknown performance action")
 		return performance[p.action](p)
 	end
 	Config.bridgeMethodHandlers.captureViewportProbe = RuntimeApi.captureViewportProbe
@@ -5341,7 +5445,6 @@ function BridgePluginRuntime.start(context)
 		setConflictResolution = true,
 		deviceSimulator = true,
 		networkSimulation = true,
-		performance = true,
 		captureViewportProbe = true,
 		sendVirtualInput = true,
 		executeLuau = true,
@@ -5356,6 +5459,9 @@ function BridgePluginRuntime.start(context)
 		release = true,
 	}
 	Config.bridgeSessionOwnedMethods = {
+		-- Profiling is synchronous and independent of place mutations. Keep its
+		-- ownership/replay fences, but allow captures during a yielding commit.
+		performance = true,
 		cancelEditorBinaryImport = true,
 		cancelEditorReconcile = true,
 		cancelLuauExecution = true,
@@ -5394,6 +5500,7 @@ function BridgePluginRuntime.start(context)
 		beginEditorBinaryExport = true,
 		finishEditorBinaryExport = true,
 		getStudioChangeState = true,
+		sampleStudioProperty = true,
 		setConflictResolution = true,
 		getConsoleOutput = true,
 		getGuiBounds = true,

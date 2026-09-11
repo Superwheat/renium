@@ -84,6 +84,7 @@ function cloneProjectSourceGraph(graph: ProjectSourceGraph): ProjectSourceGraph 
     manifests: [...graph.manifests],
     ignored: [...graph.ignored],
     owners: graph.owners.map((owner) => ({
+      ...owner,
       location: owner.location,
       target: [...owner.target],
     })),
@@ -93,6 +94,7 @@ function cloneProjectSourceGraph(graph: ProjectSourceGraph): ProjectSourceGraph 
 export type ProjectSourceOwner = {
   location: string;
   target: string[];
+  storeFiles?: boolean;
 };
 
 type ProjectScriptNaming = {
@@ -294,10 +296,10 @@ export function loadProjectSourceGraph(projectRoot: string): ProjectSourceGraph 
     }
     return [...segments] as string[];
   };
-  const addOwner = (location: string, target: string[]): void => {
+  const addOwner = (location: string, target: string[], storeFiles = false): void => {
     const normalized = path.resolve(location);
     const ownerKey = `${normalized}\0${JSON.stringify(target)}`;
-    owners.set(ownerKey, { location: normalized, target: [...target] });
+    owners.set(ownerKey, { location: normalized, target: [...target], ...(storeFiles ? { storeFiles: true } : {}) });
   };
   const watchRoot = (location: string): string | undefined => {
     let candidate = location;
@@ -333,6 +335,7 @@ export function loadProjectSourceGraph(projectRoot: string): ProjectSourceGraph 
       target: string[],
       recurse: boolean,
       generated = false,
+      storeFiles = false,
     ): void => {
       if (typeof value !== "string" || !isPortableRelativePath(value)) {
         return;
@@ -342,7 +345,7 @@ export function loadProjectSourceGraph(projectRoot: string): ProjectSourceGraph 
         ignored.add(resolved);
         return;
       }
-      addOwner(resolved, target);
+      addOwner(resolved, target, storeFiles);
       locations.add(resolved);
       try {
         if (fs.statSync(resolved).isFile()) {
@@ -376,6 +379,7 @@ export function loadProjectSourceGraph(projectRoot: string): ProjectSourceGraph 
       targetPrefix,
       false,
     );
+    add("instances", targetPrefix, false, false, true);
     const visitNode = (value: unknown, target: string[]): void => {
       if (!value || typeof value !== "object" || Array.isArray(value)) {
         return;

@@ -67,17 +67,21 @@ pub enum ArgumentType {
     Boolean,
 }
 
+/// Newer hosts may add fields; plugins built with an older SDK ignore them.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct Invocation {
     pub protocol: u32,
     pub command: String,
     pub arguments: Value,
     pub context: PluginContext,
+    /// The command's manifest budget; the host stops the process tree when it ends.
+    #[serde(default = "default_timeout")]
+    pub timeout_seconds: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct PluginContext {
     pub plugin: String,
     pub directory: PathBuf,
@@ -94,8 +98,15 @@ pub struct PluginContext {
 
 impl PluginContext {
     /// Calls Renium without a shell. Uses the host's exact binary and project binding.
+    /// The 20-second deadline suits queries; long operations need `renium_timeout`.
     pub fn renium(&self, args: &[&str]) -> Result<Value> {
         self.renium_with_input(args, None, Duration::from_secs(20))
+    }
+
+    /// Keep this below the command's manifest `timeoutSeconds`, so the plugin can
+    /// still record progress and return an error before the host stops it.
+    pub fn renium_timeout(&self, args: &[&str], timeout: Duration) -> Result<Value> {
+        self.renium_with_input(args, None, timeout)
     }
 
     pub fn renium_with_input(
@@ -145,17 +156,25 @@ impl PluginContext {
 
     pub fn session(&self) -> Result<&str> {
         self.session.as_deref().context(
-            "This workflow needs a session identity: use --session ID or RENIUM_SESSION_ID",
+            "This command needs a task identity: pass --session ID or set RENIUM_SESSION_ID",
         )
     }
 
     /// A fresh, flattened projection with separate sync metadata. No Studio or cloud writes.
+    /// Uses the default 20-second deadline; large places need `snapshot_timeout`.
     pub fn snapshot(&self, destination: &Path) -> Result<Value> {
-        self.renium(&[
-            "plugin",
-            "snapshot",
-            destination.to_str().context("Snapshot path is not UTF-8")?,
-        ])
+        self.snapshot_timeout(destination, Duration::from_secs(20))
+    }
+
+    pub fn snapshot_timeout(&self, destination: &Path, timeout: Duration) -> Result<Value> {
+        self.renium_timeout(
+            &[
+                "plugin",
+                "snapshot",
+                destination.to_str().context("Snapshot path is not UTF-8")?,
+            ],
+            timeout,
+        )
     }
 }
 

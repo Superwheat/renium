@@ -1,6 +1,8 @@
 # Saved data
 
-These commands read project files, not Studio. Use the service folder that owns the target.
+These commands read project files, not Studio. Select the Roblox service that owns
+the target. Scripts live under the configured source folders; instance stores live
+in `instances/` beside `src`.
 
 ## Find and read
 
@@ -38,7 +40,7 @@ rbx br Workspace -i editor:id
 Select with `-i`, `-x`, `-n`, `-c`, or `--path` plus `--ords` for duplicates.
 Use a service name or `-f STORE`, not both.
 
-Values: `--str`, `--num`, `--bool`, `--null`, or `-j JSON`.
+Values: `--str`, `--num`, `--bool`, `--null`, or `-j JSON`. Use `-j -` to read JSON from stdin, including values too large for the OS command line.
 `--null` removes an override; writing the default stores one.
 Unknown properties are rejected. `--scope property` explicitly selects a real property absent from the schema; `--scope attribute` selects an attribute.
 

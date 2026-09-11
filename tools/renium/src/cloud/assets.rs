@@ -150,7 +150,11 @@ fn append_query(url: &mut url::Url, name: &str, value: &Value) -> Result<(), Fai
     Ok(())
 }
 
-fn studio_user_id(bridge: Option<&BridgeServer>, next: &str) -> Result<u64, Failure> {
+fn studio_user_id(
+    bridge: Option<&BridgeServer>,
+    runtime: Option<&str>,
+    next: &str,
+) -> Result<u64, Failure> {
     let bridge = bridge.ok_or_else(|| {
         failure(
             "no_studio",
@@ -159,9 +163,17 @@ fn studio_user_id(bridge: Option<&BridgeServer>, next: &str) -> Result<u64, Fail
             "studios",
         )
     })?;
-    let result = bridge
-        .call_for_target("getCreatorContext", json!({}), BridgeTarget::Edit)
-        .map_err(|error| failure("no_studio", format!("{error:#}"), false, "studios"))?;
+    let result = match runtime {
+        Some(runtime) => bridge.call_for_runtime_with_timeout(
+            "getCreatorContext",
+            json!({}),
+            BridgeTarget::Edit,
+            runtime,
+            None,
+        ),
+        None => bridge.call_for_target("getCreatorContext", json!({}), BridgeTarget::Edit),
+    }
+    .map_err(|error| failure("no_studio", format!("{error:#}"), false, "studios"))?;
     ensure_plugin_api_ok(&result)
         .map_err(|error| failure("unsupported", format!("{error:#}"), false, next))?;
     result
@@ -178,7 +190,10 @@ fn studio_user_id(bridge: Option<&BridgeServer>, next: &str) -> Result<u64, Fail
         })
 }
 
-pub(crate) fn search(parameters: &Value, bridge: Option<&BridgeServer>) -> Result<Value, Failure> {
+pub(crate) fn search(
+    parameters: &Value,
+    studio: Option<(&BridgeServer, &str)>,
+) -> Result<Value, Failure> {
     let request: AssetSearch = serde_json::from_value(parameters.clone()).map_err(|error| {
         failure(
             "bad_req",
@@ -247,7 +262,11 @@ pub(crate) fn search(parameters: &Value, bridge: Option<&BridgeServer>) -> Resul
         "user" | "inventory" => {
             let user_id = match request.user_id {
                 Some(id) if id > 0 => id,
-                _ => studio_user_id(bridge, "asset-search")?,
+                _ => studio_user_id(
+                    studio.map(|(bridge, _)| bridge),
+                    studio.map(|(_, runtime)| runtime),
+                    "asset-search",
+                )?,
             };
             let auth = CloudAuth::from_env(
                 false,
@@ -541,7 +560,7 @@ pub(crate) fn upload(
     } else {
         let user_id = match request.user_id.filter(|id| *id > 0) {
             Some(id) => id,
-            None => studio_user_id(bridge, "image-upload")?,
+            None => studio_user_id(bridge, None, "image-upload")?,
         };
         json!({ "userId": user_id.to_string() })
     };

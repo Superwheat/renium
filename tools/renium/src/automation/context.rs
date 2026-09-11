@@ -210,9 +210,10 @@ fn studio_candidates(
     #[cfg(any(windows, target_os = "macos"))]
     {
         let mut titles = std::collections::HashMap::new();
-        let mut lookup_failure = None;
-        let candidates = studio_candidates_with_titles(&clients, selector, |runtime| {
-            let title = (|| -> Result<Option<String>> {
+        studio_candidates_with_current_titles(
+            &clients,
+            selector,
+            |runtime| {
                 let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, runtime)?;
                 // A just-closed runtime can remain in the socket inventory until
                 // its reader observes EOF. It no longer has a window to inspect.
@@ -223,32 +224,66 @@ fn studio_candidates(
                     return Ok(Some(String::clone(title)));
                 }
                 let title = crate::studio::input::studio_window_title(pid)
-                    .with_context(|| format!("Could not read Studio {pid}'s window name"))?;
+                    .with_context(|| format!("Could not read Studio {pid}'s window name"));
+                // The process can exit during the accessibility query too.
+                if title.is_err() && !crate::daemon::is_process_alive(pid) {
+                    return Ok(None);
+                }
+                let title = title?;
                 titles.insert(pid, title.clone());
                 Ok(Some(title))
-            })();
-            match title {
-                Ok(title) => title,
-                Err(error) => {
-                    lookup_failure.get_or_insert(error);
-                    None
-                }
-            }
-        });
-        match lookup_failure {
-            Some(error) => Err(Failure::new(
-                "studio_name_unavailable",
-                format!(
-                    "{error:#}. Use a place ID or configured alias if window-name access is unavailable"
-                ),
-                false,
-                "studios",
-            )),
-            None => Ok(candidates),
-        }
+            },
+            || bridge.list_bridge_clients(),
+        )
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     Ok(studio_candidates_from(&clients, selector))
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn studio_candidates_with_current_titles(
+    clients: &[Value],
+    selector: &str,
+    mut window_title: impl FnMut(&str) -> Result<Option<String>>,
+    current_clients: impl FnOnce() -> Vec<Value>,
+) -> std::result::Result<Vec<Value>, Failure> {
+    let mut failures = Vec::new();
+    let mut inspected = false;
+    let mut candidates = studio_candidates_with_titles(clients, selector, |runtime| {
+        inspected = true;
+        match window_title(runtime) {
+            Ok(title) => title,
+            Err(error) => {
+                failures.push((runtime.to_string(), error));
+                None
+            }
+        }
+    });
+    if !inspected {
+        return Ok(candidates);
+    }
+    // A different place can close while its title is being inspected. Only
+    // current runtimes can contribute either a match or a lookup failure.
+    let current = studio_candidates_from(&current_clients(), "")
+        .into_iter()
+        .filter_map(|entry| entry["runtimeId"].as_str().map(str::to_owned))
+        .collect::<HashSet<_>>();
+    candidates.retain(|entry| {
+        entry["runtimeId"]
+            .as_str()
+            .is_some_and(|id| current.contains(id))
+    });
+    if let Some((_, error)) = failures.into_iter().find(|(id, _)| current.contains(id)) {
+        return Err(Failure::new(
+            "studio_name_unavailable",
+            format!(
+                "{error:#}. Use a place ID or configured alias if window-name access is unavailable"
+            ),
+            false,
+            "studios",
+        ));
+    }
+    Ok(candidates)
 }
 
 #[cfg(any(windows, target_os = "macos", test))]
@@ -492,7 +527,11 @@ pub(super) fn bind(
         identity.as_ref(),
         saved_target.as_ref(),
     );
-    let mut candidates = studio_candidates(bridge, &selector)?;
+    let mut candidates = if object.get("projectOnly").and_then(Value::as_bool) == Some(true) {
+        Vec::new()
+    } else {
+        studio_candidates(bridge, &selector)?
+    };
     if let Some(runtime) = requested_runtime.as_deref() {
         candidates.retain(|entry| entry.get("runtimeId").and_then(Value::as_str) == Some(runtime));
     } else if requested_place.is_none()
@@ -750,6 +789,66 @@ mod tests {
             studio_candidates_with_titles(&clients, "DTE", |_| Some("DTE - Roblox Studio".into()));
         assert_eq!(candidates.len(), 2);
         assert_eq!(ambiguous_studios(&candidates).0.c, "ambiguous_place");
+    }
+
+    #[test]
+    fn studio_window_lookup_excludes_runtimes_closed_during_the_query() {
+        let clients = vec![
+            json!({"runtimeId":"closing", "role":"edit", "placeId":0}),
+            json!({"runtimeId":"wanted", "role":"edit", "placeId":0}),
+        ];
+        for closing_title in [
+            Ok(Some("Fixture - Roblox Studio".into())),
+            Err(anyhow::anyhow!("no accessibility windows")),
+        ] {
+            let mut closing_title = Some(closing_title);
+            let candidates = studio_candidates_with_current_titles(
+                &clients,
+                "Fixture",
+                |id| {
+                    if id == "closing" {
+                        closing_title.take().unwrap()
+                    } else {
+                        Ok(Some("Fixture - Roblox Studio".into()))
+                    }
+                },
+                || vec![clients[1].clone()],
+            )
+            .unwrap_or_else(|error| panic!("{}", error.0.m));
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0]["runtimeId"], "wanted");
+        }
+        // A live but inaccessible document still makes name targeting unsafe.
+        let failure = studio_candidates_with_current_titles(
+            &clients,
+            "Fixture",
+            |id| {
+                if id == "closing" {
+                    Err(anyhow::anyhow!("accessibility permission denied"))
+                } else {
+                    Ok(Some("Fixture - Roblox Studio".into()))
+                }
+            },
+            || clients.clone(),
+        )
+        .unwrap_err();
+        assert_eq!(failure.0.c, "studio_name_unavailable");
+        let candidates = studio_candidates_with_current_titles(
+            &clients,
+            "Fixture",
+            |_| Ok(Some("Fixture - Roblox Studio".into())),
+            || clients.clone(),
+        )
+        .unwrap_or_else(|error| panic!("{}", error.0.m));
+        assert_eq!(candidates.len(), 2);
+        for selector in ["", "20", "10:20"] {
+            let _ = studio_candidates_with_current_titles(
+                &clients,
+                selector,
+                |_| panic!("ID targeting must not inspect titles"),
+                || panic!("ID targeting needs only the original inventory"),
+            );
+        }
     }
 
     #[test]

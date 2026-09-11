@@ -206,7 +206,7 @@ pub fn stage_project(loaded: &LoadedProject) -> Result<ProjectionStage> {
     let result = (|| {
         cache_script_naming(&root, &loaded.project);
         let source_root = loaded.root.join(&loaded.project.source_root);
-        if source_root.is_dir() {
+        if source_root.is_dir() || loaded.root.join("instances").is_dir() {
             stage_source_directory(loaded, &root, &source_root, &root, false, None)?;
         }
         for mount in &loaded.project.mounts {
@@ -555,7 +555,7 @@ fn rebuild_cached_projection_services(
     let result = (|| {
         for service in services {
             let source = loaded.root.join(&loaded.project.source_root).join(service);
-            if source.is_dir() {
+            if source.is_dir() || service_settings_path(&source).is_file() {
                 stage_source_directory(
                     loaded,
                     root,
@@ -643,7 +643,7 @@ fn stage_tree_node(
     let target_path = target_fs_path(stage, target);
     if let Some(source) = node.path.as_deref() {
         let source = loaded.root.join(source);
-        if source.is_dir() {
+        if crate::project::storage::source_directory_exists(&source) {
             stage_source_directory(loaded, stage, &source, &target_path, true, None)?;
             let settings = service_settings_path(&source);
             if settings.is_file() {
@@ -738,10 +738,11 @@ fn stage_mount_target(
     target: &[String],
 ) -> Result<()> {
     let source = loaded.root.join(&mount.source);
-    if !source.exists() && mount.optional {
+    let directory = crate::project::storage::source_directory_exists(&source);
+    if !source.exists() && !directory && mount.optional {
         return Ok(());
     }
-    if source.is_dir() {
+    if directory {
         let destination = target_fs_path(stage, target);
         fs::create_dir_all(&destination)?;
         stage_source_directory(loaded, stage, &source, &destination, true, None)?;
@@ -1982,6 +1983,10 @@ fn stage_source_directory(
     owns_source: bool,
     rule_prefix: Option<&Path>,
 ) -> Result<()> {
+    crate::project::storage::copy_stores_to_stage(source, destination)?;
+    if !source.is_dir() && destination.is_dir() {
+        return Ok(());
+    }
     if !source.is_dir() {
         bail!(
             "Projection source directory does not exist: {}",

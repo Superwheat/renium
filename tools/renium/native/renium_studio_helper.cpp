@@ -1,5 +1,6 @@
 #include <Windows.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -9,7 +10,12 @@
 #include <new>
 #include <ostream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
+#include <string_view>
+#include <vector>
+#include "renium_studio_history.h"
+#include "renium_studio_terrain.h"
 
 #if defined(_M_IX86) || defined(_M_X64)
 #include <immintrin.h>
@@ -43,18 +49,72 @@ struct ReniumSerializerParams
     std::uint32_t requestedMxcsr;
     std::uint32_t initialMxcsr;
     std::uint32_t placeMode;
-    std::uint32_t reserved;
+    std::uint32_t dataModelInstanceOffset;
     SharedInstance roots[256];
     wchar_t outputPath[520];
     char error[512];
+    std::uint64_t taskContext;
+    std::uint64_t submitTask;
+    std::uint32_t timeoutMs;
+    std::uint32_t childrenOffset;
+    std::uint32_t selfOffset;
+    std::uint32_t reserved;
+    std::uint64_t deadlineTick;
+    std::uint64_t queueMicros;
+    std::uint64_t identityBinding;
+    std::uint64_t identityGetter;
+    std::uint64_t debugIdGetter;
+    std::uint64_t identitySize;
+    std::uint64_t identityMicros;
+    std::uint32_t captureMode;
+    std::uint32_t parentOffset;
+    std::uint64_t window;
+    std::uint32_t processId;
+    std::uint32_t captureReserved;
 };
 
-static_assert(sizeof(ReniumSerializerParams) == 5792);
+static_assert(sizeof(ReniumSerializerParams) == 5904);
 static_assert(offsetof(ReniumSerializerParams, status) == 68);
 static_assert(offsetof(ReniumSerializerParams, placeMode) == 136);
+static_assert(offsetof(ReniumSerializerParams, dataModelInstanceOffset) == 140);
 static_assert(offsetof(ReniumSerializerParams, roots) == 144);
 static_assert(offsetof(ReniumSerializerParams, outputPath) == 4240);
 static_assert(offsetof(ReniumSerializerParams, error) == 5280);
+static_assert(offsetof(ReniumSerializerParams, taskContext) == 5792);
+static_assert(offsetof(ReniumSerializerParams, queueMicros) == 5832);
+static_assert(offsetof(ReniumSerializerParams, identityBinding) == 5840);
+static_assert(offsetof(ReniumSerializerParams, captureMode) == 5880);
+static_assert(offsetof(ReniumSerializerParams, processId) == 5896);
+
+// RCAP v1. Transport contains this header, RBXL, then headerless identity rows.
+struct CaptureResponse
+{
+    std::uint32_t magic, version, status, exitCode;
+    std::uint64_t bytes, identities, queueMicros, serializeMicros, identityMicros, writeMicros;
+    char error[256];
+};
+static_assert(sizeof(CaptureResponse) == 320);
+
+struct CaptureIdentityRow
+{
+    unsigned char id[16]; // Native UniqueId getter's four LE words, unchanged.
+    char debugId[48];     // GetDebugId(32), NUL terminated and zero padded.
+    std::uint32_t parent; // Earlier row index; UINT32_MAX for selected roots.
+    std::uint32_t reserved;
+};
+static_assert(sizeof(CaptureIdentityRow) == 72);
+static constexpr std::size_t CaptureMaxRows = 2000000;
+static constexpr std::size_t CaptureMaxBytes = 512ull * 1024 * 1024;
+
+// MSVC release basic_string returned by the engine. Never destroy its heap
+// storage using this /MT helper's allocator.
+struct EngineString
+{
+    union { char inlineBytes[16]; char* heap; } storage;
+    std::size_t size;
+    std::size_t capacity;
+};
+static_assert(sizeof(EngineString) == 32);
 
 using ContextBuilder = void*(__fastcall*)(void*, void*);
 using ContextDestroy = void(__fastcall*)(void*);
@@ -88,6 +148,13 @@ struct RunState
     bool rootsCollected;
     bool streamBuilt;
     bool bytesBuilt;
+    bool fileCreated;
+    HANDLE file;
+    const std::atomic<bool>* cancelled;
+    std::vector<void*>* pending;
+    std::vector<CaptureIdentityRow>* identities;
+    EngineString debugString;
+    bool debugStringBuilt;
 };
 
 struct SharedVector
@@ -159,9 +226,144 @@ static std::uint64_t ElapsedMicros(
         (finish.QuadPart - start.QuadPart) * 1000000 / frequency.QuadPart);
 }
 
+static void CheckSerializerDeadline(const RunState* state)
+{
+    if (state->cancelled->load(std::memory_order_acquire) ||
+        GetTickCount64() >= state->params->deadlineTick)
+        throw std::runtime_error("Native snapshot cancelled or exceeded its deadline");
+}
+
+static void CheckCaptureWindow(const ReniumSerializerParams* params)
+{
+    DWORD pid = 0;
+    const auto window = reinterpret_cast<HWND>(params->window);
+    // Title is checked from the host before and after capture. GetWindowTextW
+    // inside the owning process can dispatch WM_GETTEXT; never do that while
+    // holding the DataModel lock.
+    if (params->processId != GetCurrentProcessId() ||
+        !GetWindowThreadProcessId(window, &pid) || pid != params->processId)
+        throw std::runtime_error("Studio process or window identity changed before capture");
+}
+
+static std::size_t CaptureChildCount(const SharedVector* children)
+{
+    if (!children) return 0;
+    const auto begin = reinterpret_cast<std::uintptr_t>(children->begin);
+    const auto end = reinterpret_cast<std::uintptr_t>(children->end);
+    const auto capacity = reinterpret_cast<std::uintptr_t>(children->capacity);
+    if ((!begin && (end || capacity)) || begin % alignof(SharedInstance) ||
+        end < begin || capacity < end || (end - begin) % sizeof(SharedInstance) ||
+        (capacity - begin) % sizeof(SharedInstance) ||
+        (capacity - begin) / sizeof(SharedInstance) > CaptureMaxRows)
+        throw std::runtime_error("Invalid native capture children vector");
+    return (end - begin) / sizeof(SharedInstance);
+}
+
+static void DestroyDebugString(RunState* state)
+{
+    if (!state->debugStringBuilt) return;
+    state->debugStringBuilt = false; // Never retry if the engine free itself faults.
+    auto& text = state->debugString;
+    if (text.capacity >= 16)
+    {
+        auto allocation = static_cast<void*>(text.storage.heap);
+        auto size = text.capacity + 1;
+        if (size >= 0x1000)
+        {
+            allocation = reinterpret_cast<void**>(allocation)[-1];
+            size += 0x27;
+        }
+        state->deallocate(allocation, size);
+    }
+}
+
+static void CaptureIdentities(RunState* state)
+{
+    const auto params = state->params;
+    state->pending = new std::vector<void*>;
+    state->identities = new std::vector<CaptureIdentityRow>;
+    auto& pending = *state->pending;
+    auto& rows = *state->identities;
+    pending.reserve(params->count);
+    rows.reserve(params->count);
+    for (std::uint32_t index = 0; index < params->count; ++index)
+    {
+        auto root = params->roots[index].instance;
+        const auto self = reinterpret_cast<const SharedInstance*>(
+            static_cast<unsigned char*>(root) + params->selfOffset);
+        if (self->instance != root || self->owner != params->roots[index].owner)
+            throw std::runtime_error("Selected service self identity changed before capture");
+        if (*reinterpret_cast<void**>(static_cast<unsigned char*>(root) + params->parentOffset) !=
+            reinterpret_cast<void*>(params->dataModel + params->dataModelInstanceOffset))
+            throw std::runtime_error("Selected service parent changed before capture");
+        pending.push_back(root);
+        rows.push_back({{}, {}, UINT32_MAX, 0});
+    }
+    for (std::size_t index = 0; index < pending.size(); ++index)
+    {
+        CheckSerializerDeadline(state);
+        auto instance = static_cast<unsigned char*>(pending[index]);
+        using IdentityGetter = void*(__fastcall*)(void*, void*, void*);
+        const auto identity = reinterpret_cast<IdentityGetter>(params->identityGetter)(
+            reinterpret_cast<void*>(params->identityBinding), rows[index].id, instance);
+        if (identity != rows[index].id)
+            throw std::runtime_error("Native UniqueId return-buffer ABI changed");
+        using DebugIdGetter = void*(__fastcall*)(void*, void*, std::int32_t);
+        const auto textResult = reinterpret_cast<DebugIdGetter>(params->debugIdGetter)(
+            instance, &state->debugString, 32);
+        state->debugStringBuilt = true;
+        const auto& text = state->debugString;
+        if (textResult != &text || !text.size || text.size >= sizeof(rows[index].debugId) ||
+            text.size > text.capacity)
+            throw std::runtime_error("Native GetDebugId returned an invalid string");
+        const auto data = text.capacity < 16 ? text.storage.inlineBytes : text.storage.heap;
+        if (memchr(data, '\0', text.size) || data[text.size] != '\0')
+            throw std::runtime_error("Native GetDebugId returned invalid text");
+        memcpy(rows[index].debugId, data, text.size);
+        DestroyDebugString(state);
+
+        const auto children = *reinterpret_cast<const SharedVector* const*>(instance + params->childrenOffset);
+        const auto count = CaptureChildCount(children);
+        if (count > CaptureMaxRows - pending.size())
+            throw std::runtime_error("Native capture exceeds its instance bound");
+        for (std::size_t childIndex = 0; childIndex < count; ++childIndex)
+        {
+            const auto& child = children->begin[childIndex];
+            if (!child.instance || !child.owner)
+                throw std::runtime_error("Native capture child has no ownership");
+            auto childBytes = static_cast<unsigned char*>(child.instance);
+            const auto self = reinterpret_cast<const SharedInstance*>(childBytes + params->selfOffset);
+            if (self->instance != child.instance || self->owner != child.owner ||
+                *reinterpret_cast<void* const*>(childBytes + params->parentOffset) != instance)
+                throw std::runtime_error("Native capture child identity or parent changed");
+            pending.push_back(child.instance);
+            rows.push_back({{}, {}, static_cast<std::uint32_t>(index), 0});
+        }
+    }
+    params->identitySize = rows.size() * sizeof(CaptureIdentityRow);
+}
+
+static bool WriteSnapshotBytes(RunState* state, const void* bytes, std::size_t size)
+{
+    auto data = static_cast<const unsigned char*>(bytes);
+    while (size)
+    {
+        CheckSerializerDeadline(state);
+        const auto chunk = static_cast<DWORD>(size > 1024 * 1024 ? 1024 * 1024 : size);
+        DWORD written = 0;
+        if (!WriteFile(state->file, data, chunk, &written, nullptr) || written != chunk)
+            return false;
+        data += written;
+        size -= written;
+    }
+    return true;
+}
+
 static DWORD RunCore(RunState* state)
 {
     auto params = state->params;
+    CheckSerializerDeadline(state);
+    if (params->captureMode) CheckCaptureWindow(params);
     auto builder = reinterpret_cast<ContextBuilder>(
         params->moduleBase + params->contextBuilderRva);
     auto collectRoots = reinterpret_cast<RootCollector>(
@@ -172,6 +374,33 @@ static DWORD RunCore(RunState* state)
         params->moduleBase + params->contextDestroyRva);
     state->deallocate = reinterpret_cast<Deallocator>(
         params->moduleBase + params->deallocatorRva);
+
+    // Recheck captured roots under the DataModel lock before touching their
+    // owners. A service may have been removed after the host's discovery.
+    const auto model = params->dataModel + params->dataModelInstanceOffset;
+    const auto identity = reinterpret_cast<const SharedInstance*>(model + params->selfOffset);
+    if (identity->instance != reinterpret_cast<void*>(model) ||
+        identity->owner != reinterpret_cast<void*>(params->dataModelOwner))
+        throw std::runtime_error("DataModel identity changed before native snapshot");
+    if (params->captureMode &&
+        (*reinterpret_cast<const std::uintptr_t*>(model + 0x58) & ~std::uintptr_t(7)) != params->taskContext)
+        throw std::runtime_error("DataModel task context changed before capture");
+    const auto children = *reinterpret_cast<const SharedVector* const*>(model + params->childrenOffset);
+    if (!children || !children->begin || children->end < children->begin ||
+        children->end - children->begin > 256)
+        throw std::runtime_error("DataModel root layout changed before native snapshot");
+    for (std::uint32_t index = 0; index < params->count; ++index)
+    {
+        const auto& expected = params->roots[index];
+        bool present = false;
+        for (auto child = children->begin; child != children->end; ++child)
+            if (child->instance == expected.instance && child->owner == expected.owner)
+            {
+                present = true;
+                break;
+            }
+        if (!present) throw std::runtime_error("Service identity changed before native snapshot");
+    }
 
     if (params->dataModelOwner)
     {
@@ -206,7 +435,11 @@ static DWORD RunCore(RunState* state)
     LARGE_INTEGER finished{};
     QueryPerformanceFrequency(&frequency);
 
-    SharedVector roots{};
+    SharedVector roots{
+        params->roots,
+        params->roots + params->count,
+        params->roots + params->count,
+    };
     if (!params->placeMode)
     {
         QueryPerformanceCounter(&started);
@@ -215,11 +448,6 @@ static DWORD RunCore(RunState* state)
         QueryPerformanceCounter(&finished);
         params->contextMicros = ElapsedMicros(started, finished, frequency);
 
-        roots = {
-            params->roots,
-            params->roots + params->count,
-            params->roots + params->count,
-        };
         QueryPerformanceCounter(&started);
         collectRoots(state->collectedRoots, &roots);
         state->rootsCollected = true;
@@ -242,13 +470,13 @@ static DWORD RunCore(RunState* state)
     QueryPerformanceCounter(&started);
     if (params->placeMode)
     {
-        auto instance = reinterpret_cast<unsigned char*>(params->dataModel) + 0x1c8;
-        auto roots = *reinterpret_cast<void**>(instance + 0x70);
-        SharedVector emptyRoots{};
+        // Rust already validated this build's layout and captured these roots.
+        auto instance = reinterpret_cast<unsigned char*>(params->dataModel) +
+            params->dataModelInstanceOffset;
         serializer(
             static_cast<std::ostream*>(state->stream),
             instance,
-            roots ? roots : &emptyRoots,
+            &roots,
             nullptr,
             0x40,
             nullptr,
@@ -275,64 +503,85 @@ static DWORD RunCore(RunState* state)
     }
     QueryPerformanceCounter(&finished);
     params->serializeMicros = ElapsedMicros(started, finished, frequency);
+    CheckSerializerDeadline(state);
+    if (params->captureMode)
+    {
+        const auto size = state->stream->view().size();
+        if (size < 32 || size > CaptureMaxBytes)
+            throw std::runtime_error("Native capture exceeds its byte bound");
+        QueryPerformanceCounter(&started);
+        CaptureIdentities(state);
+        QueryPerformanceCounter(&finished);
+        params->identityMicros = ElapsedMicros(started, finished, frequency);
+        CheckCaptureWindow(params);
+    }
     params->status = 3;
 
-    state->bytes = new std::string(state->stream->str());
-    state->bytesBuilt = true;
-    params->outputSize = state->bytes->size();
-    HANDLE file = CreateFileW(
+    if (!params->captureMode)
+    {
+        state->bytes = new std::string(state->stream->str());
+        state->bytesBuilt = true;
+    }
+    const auto payload = params->captureMode ? state->stream->view() : std::string_view(*state->bytes);
+    params->outputSize = payload.size();
+    CheckSerializerDeadline(state);
+    state->file = CreateFileW(
         params->outputPath,
         GENERIC_WRITE,
-        0,
+        params->captureMode ? FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE : 0,
         nullptr,
-        CREATE_ALWAYS,
+        params->captureMode ? OPEN_EXISTING : CREATE_NEW,
         FILE_ATTRIBUTE_NORMAL,
         nullptr);
-    if (file == INVALID_HANDLE_VALUE)
+    if (state->file == INVALID_HANDLE_VALUE)
     {
+        state->file = nullptr;
         params->status = 0xE002;
         SetError(params, "CreateFileW failed");
         return params->status;
     }
+    state->fileCreated = !params->captureMode;
+    if (params->captureMode)
+    {
+        LARGE_INTEGER start{};
+        start.QuadPart = sizeof(CaptureResponse);
+        if (!SetFilePointerEx(state->file, start, nullptr, FILE_BEGIN))
+            throw std::runtime_error("Cannot position native capture transport");
+    }
 
     QueryPerformanceCounter(&started);
-    std::size_t position = 0;
-    BOOL wrote = TRUE;
-    while (position < state->bytes->size())
-    {
-        const auto remaining = state->bytes->size() - position;
-        const auto chunk = static_cast<DWORD>(
-            remaining > MAXDWORD ? MAXDWORD : remaining);
-        DWORD written = 0;
-        wrote = WriteFile(
-            file,
-            state->bytes->data() + position,
-            chunk,
-            &written,
-            nullptr);
-        if (!wrote || written != chunk)
-            break;
-        position += written;
-    }
-    if (wrote)
-        wrote = FlushFileBuffers(file);
-    CloseHandle(file);
+    bool wrote = WriteSnapshotBytes(state, payload.data(), payload.size());
+    if (wrote && params->captureMode)
+        wrote = WriteSnapshotBytes(state, state->identities->data(), params->identitySize);
+    if (wrote && !params->captureMode)
+        wrote = FlushFileBuffers(state->file) != FALSE;
+    CloseHandle(state->file);
+    state->file = nullptr;
     QueryPerformanceCounter(&finished);
     params->writeMicros = ElapsedMicros(started, finished, frequency);
-    if (!wrote || position != state->bytes->size())
+    if (!wrote)
     {
-        DeleteFileW(params->outputPath);
+        if (state->fileCreated) DeleteFileW(params->outputPath);
         params->status = 0xE003;
         SetError(params, "WriteFile failed");
         return params->status;
     }
 
+    CheckSerializerDeadline(state);
     params->status = 4;
     return 0;
 }
 
+static void DestroyDebugStringCaught(RunState* state);
+
 static void CleanupCore(RunState* state)
 {
+    if (state->file) { CloseHandle(state->file); state->file = nullptr; }
+    DestroyDebugStringCaught(state);
+    delete state->identities;
+    state->identities = nullptr;
+    delete state->pending;
+    state->pending = nullptr;
     if (state->bytesBuilt)
     {
         delete state->bytes;
@@ -388,6 +637,15 @@ static int RecordException(
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
+static void DestroyDebugStringCaught(RunState* state)
+{
+    __try { DestroyDebugString(state); }
+    __except (RecordException(state->params, GetExceptionInformation()))
+    {
+        state->debugStringBuilt = false; // Do not retry a faulting engine free.
+    }
+}
+
 static DWORD RunCaught(RunState* state)
 {
     DWORD result = 0;
@@ -433,8 +691,7 @@ static void CleanupCaught(RunState* state)
     }
 }
 
-extern "C" __declspec(dllexport) DWORD WINAPI ReniumRun(
-    ReniumSerializerParams* params)
+static DWORD RunSerializer(ReniumSerializerParams* params, const std::atomic<bool>* cancelled)
 {
     if (!params)
         return 0xE000;
@@ -446,6 +703,8 @@ extern "C" __declspec(dllexport) DWORD WINAPI ReniumRun(
     params->writeMicros = 0;
     params->collectedCount = 0;
     params->collectedCapacityBytes = 0;
+    params->identitySize = 0;
+    params->identityMicros = 0;
     params->initialMxcsr = GetMxcsr();
     params->error[0] = '\0';
     if (!params->moduleBase ||
@@ -455,9 +714,17 @@ extern "C" __declspec(dllexport) DWORD WINAPI ReniumRun(
         !params->rootCollectorRva ||
         !params->deallocatorRva ||
         !params->dataModel ||
+        params->dataModelInstanceOffset > 0x800 ||
+        params->dataModelInstanceOffset % 8 != 0 ||
+        params->childrenOffset > 0x200 || params->childrenOffset % 8 != 0 ||
+        params->selfOffset > 0x80 || params->selfOffset % 8 != 0 ||
         !params->count ||
         params->count > 256 ||
-        !params->outputPath[0])
+        !params->outputPath[0] || params->outputPath[519] || params->captureMode > 1 ||
+        (params->captureMode && (!params->placeMode || !params->identityBinding ||
+            !params->identityGetter || !params->debugIdGetter || !params->window ||
+            !params->processId || params->captureReserved ||
+            params->parentOffset > 0x200 || params->parentOffset % 8)))
     {
         params->status = 0xE001;
         SetError(params, "invalid parameters");
@@ -466,10 +733,12 @@ extern "C" __declspec(dllexport) DWORD WINAPI ReniumRun(
 
     RunState state{};
     state.params = params;
+    state.cancelled = cancelled;
     const auto result = RunCppCaught(&state);
     CleanupCaught(&state);
     SetMxcsr(params->initialMxcsr);
-    return result;
+    if ((result || params->status != 4) && state.fileCreated) DeleteFileW(params->outputPath);
+    return result ? result : (params->status == 4 ? 0 : params->status);
 }
 
 struct PackageActionParams
@@ -535,6 +804,128 @@ static DWORD RemainingMilliseconds(std::uint64_t deadline)
     const auto remaining = deadline - now;
     return remaining > MAXDWORD ? MAXDWORD : static_cast<DWORD>(remaining);
 }
+
+struct SerializerTask
+{
+    ReniumSerializerParams result{};
+    HANDLE completed = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    bool delivered = false;
+    std::atomic<bool> cancelled{false};
+    ~SerializerTask()
+    {
+        if (!delivered && result.status == 4 && !result.captureMode) DeleteFileW(result.outputPath);
+        if (completed) CloseHandle(completed);
+    }
+};
+
+static DWORD QueueSerializer(ReniumSerializerParams* params)
+{
+    if (!params || !params->taskContext || !params->submitTask || !params->dataModelOwner ||
+        !params->timeoutMs || params->timeoutMs > 15000)
+        return 0xE008;
+    auto owner = reinterpret_cast<void*>(params->dataModelOwner);
+    if (!AddOwnerReference(owner)) throw std::runtime_error("DataModel owner expired");
+    // Hold through submission/wait, not in the DataModel's own queue.
+    auto modelHold = std::shared_ptr<void>(owner, ReleaseOwnerReference);
+    auto task = std::make_shared<SerializerTask>();
+    task->result = *params;
+    task->result.status = 1;
+    task->result.deadlineTick = GetTickCount64() + params->timeoutMs;
+    if (!task->completed) throw std::runtime_error("Cannot create native snapshot completion event");
+    LARGE_INTEGER queued{}, frequency{};
+    QueryPerformanceCounter(&queued);
+    QueryPerformanceFrequency(&frequency);
+    std::function<void()> work{[task, queued, frequency]() {
+        LARGE_INTEGER started{};
+        QueryPerformanceCounter(&started);
+        task->result.queueMicros = ElapsedMicros(queued, started, frequency);
+        if (!RemainingMilliseconds(task->result.deadlineTick))
+        {
+            task->result.status = 0xE009;
+            SetError(&task->result, "Native snapshot expired before Studio could run it");
+        }
+        else RunSerializer(&task->result, &task->cancelled);
+        SetEvent(task->completed);
+    }};
+    auto submit = reinterpret_cast<SubmitDataModelTask>(params->submitTask);
+    if (!submit(reinterpret_cast<void*>(params->taskContext), &work, 1))
+        throw std::runtime_error("Studio rejected the native snapshot task");
+    const auto remaining = RemainingMilliseconds(task->result.deadlineTick);
+    if (!remaining || WaitForSingleObject(task->completed, remaining) != WAIT_OBJECT_0)
+    {
+        task->cancelled.store(true, std::memory_order_release);
+        throw std::runtime_error("Native snapshot exceeded its response deadline");
+    }
+    *params = task->result;
+    task->delivered = params->status == 4;
+    return task->delivered ? 0 : params->status;
+}
+
+static DWORD SerializerBoundary(ReniumSerializerParams* params)
+{
+    try { return QueueSerializer(params); }
+    catch (const std::exception& error)
+    {
+        params->status = 0xE00A;
+        SetError(params, error.what());
+        return params->status;
+    }
+    catch (...)
+    {
+        params->status = 0xE00B;
+        SetError(params, "Unknown native snapshot queue failure");
+        return params->status;
+    }
+}
+
+extern "C" __declspec(dllexport) DWORD WINAPI ReniumRun(ReniumSerializerParams* params)
+{
+    if (!params) return 0xE000;
+    __try { return SerializerBoundary(params); }
+    __except (RecordException(params, GetExceptionInformation())) { return params->status; }
+}
+
+static DWORD PublishCaptureResponse(ReniumSerializerParams* params, DWORD result)
+{
+    CaptureResponse response{0x50414352, 1, params->status, result,
+        params->outputSize, params->identitySize, params->queueMicros,
+        params->serializeMicros, params->identityMicros, params->writeMicros, {}};
+    strncpy_s(response.error, params->error, _TRUNCATE);
+    // Also publish errors, but never recreate the host's cancelled transport.
+    const auto file = CreateFileW(params->outputPath, GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return 0xE00C;
+    DWORD written = 0;
+    BOOL ok = FALSE;
+    __try { ok = WriteFile(file, &response, sizeof(response), &written, nullptr); }
+    __finally { CloseHandle(file); }
+    return ok && written == sizeof(response) ? result : 0xE00D;
+}
+
+extern "C" __declspec(dllexport) DWORD WINAPI ReniumCaptureRun(ReniumSerializerParams* params)
+{
+    if (!params) return 0xE000;
+    DWORD result = 0xE001;
+    __try
+    {
+        __try
+        {
+            if (params->captureMode == 1)
+                result = PublishCaptureResponse(params, ReniumRun(params));
+        }
+        __except (RecordException(params, GetExceptionInformation())) { result = params->status; }
+    }
+    __finally
+    {
+        // QueueSerializer copied the request before submitting; queued work
+        // never borrows this input, even when its response deadline expires.
+        VirtualFree(params, 0, MEM_RELEASE);
+    }
+    return result;
+}
+
+#include "renium_studio_observation.h"
 
 struct PackageModifiedStateTask
 {
@@ -988,12 +1379,15 @@ struct PropertyReadParams
     std::uint32_t reserved;
     std::uint64_t ancestors[65]; // target first; selected DataModel last
     std::uint64_t selfOffset;
+    std::uint64_t extraInput;
+    std::uint64_t extraInputSize;
 };
-static_assert(sizeof(PropertyReadParams) == 132032);
+static_assert(sizeof(PropertyReadParams) == 132048);
 
 struct PropertyReadTask
 {
     PropertyReadParams result{};
+    std::string extraInput;
     HANDLE completed = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     std::uint64_t deadline = 0;
     ~PropertyReadTask() { if (completed) CloseHandle(completed); }
@@ -1038,8 +1432,62 @@ static void ReadPropertyCore(PropertyReadTask* task)
             p.status = 4;
             return;
         }
-        if (memcmp(p.identity, p.expectedIdentity, sizeof(p.identity)))
+        // Operation 3 captures the first identity and read together. It cannot
+        // write; subsequent ordinary reads/writes still require that identity.
+        if (p.operation != 3 && memcmp(p.identity, p.expectedIdentity, sizeof(p.identity)))
             throw std::runtime_error("property target was replaced; request access again");
+        if (p.operation == 6)
+        {
+            renium_history::Binding binding{};
+            if (p.inputSize) {
+                if (p.inputSize <= sizeof(binding)) throw std::runtime_error("Missing history registration token");
+                std::memcpy(&binding, p.input, sizeof(binding));
+                renium_history::Register(binding, reinterpret_cast<void*>(p.target), p.ancestors[p.ancestorCount - 1],
+                    reinterpret_cast<void*>(p.dataModelOwner),
+                    std::string(p.input + sizeof(binding), p.inputSize - sizeof(binding)),
+                    [](std::uintptr_t address, void* output, std::size_t size) {
+                        SIZE_T copied = 0;
+                        return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), output, size, &copied) && copied == size;
+                    });
+            }
+            binding = renium_history::GetBinding();
+            std::memcpy(p.output, &binding, sizeof(binding));
+            p.outputSize = sizeof(binding);
+            p.status = 4;
+            return;
+        }
+        if (p.operation == 8)
+        {
+            if (p.inputSize) {
+                if (p.inputSize != sizeof(renium_terrain_observation::Request)) throw std::runtime_error("Invalid Terrain notification request");
+                renium_terrain_observation::Request request{};
+                std::memcpy(&request, p.input, sizeof(request));
+                renium_terrain_observation::Install(reinterpret_cast<void*>(p.target), reinterpret_cast<void*>(p.owner), request,
+                    p.classOffset, p.selfOffset, p.parentOffset,
+                    [](std::uintptr_t address, void* output, std::size_t size) {
+                        SIZE_T copied = 0;
+                        return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), output, size, &copied) && copied == size;
+                    }, AddOwnerReference, ReleaseOwnerReference);
+            }
+            const auto binding = renium_terrain_observation::GetBinding(reinterpret_cast<void*>(p.target));
+            std::memcpy(p.output, &binding, sizeof(binding));
+            p.outputSize = sizeof(binding);
+            p.status = 4;
+            return;
+        }
+        if (p.operation == 7)
+        {
+            const auto changed = renium_terrain::Apply(reinterpret_cast<void*>(p.target), targetHold,
+                p.ancestors[p.ancestorCount - 1], task->extraInput,
+                [](std::uintptr_t address, void* output, std::size_t size) {
+                    SIZE_T copied = 0;
+                    return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), output, size, &copied) && copied == size;
+                });
+            p.output[0] = changed.changed ? 1 : 0;
+            std::memcpy(p.output + 1, changed.fingerprint.data(), changed.fingerprint.size());
+            p.outputSize = 65; p.status = 4;
+            return;
+        }
         if (p.operation == 2)
         {
             const std::string input(p.input, p.inputSize);
@@ -1091,8 +1539,10 @@ static DWORD RunPropertyRead(PropertyReadParams* params)
     if (!params || !params->taskContext || !params->submitTask || !params->target ||
         !params->owner || !params->dataModelOwner || !params->descriptor || !params->getter ||
         !params->classDescriptor || !params->descriptorVtable || params->classOffset > 0x100 ||
-        !params->identityBinding || !params->identityGetter || params->operation > 2 ||
+        !params->identityBinding || !params->identityGetter || (params->operation > 3 && params->operation != 6 && params->operation != 7 && params->operation != 8) ||
         (params->operation == 2 && !params->setter) || params->inputSize > sizeof(params->input) ||
+        params->extraInputSize > 128 * 1024 * 1024 ||
+        (params->operation == 7 ? (!params->extraInput || !params->extraInputSize) : params->extraInputSize != 0) ||
         params->parentOffset > 0x200 || params->selfOffset > 0x80 || params->ancestorCount < 2 || params->ancestorCount > 65 ||
         params->ancestors[0] != params->target ||
         !params->timeoutMs || params->timeoutMs > 3000)
@@ -1102,6 +1552,7 @@ static DWORD RunPropertyRead(PropertyReadParams* params)
     auto modelHold = std::shared_ptr<void>(modelOwner, ReleaseOwnerReference);
     auto task = std::make_shared<PropertyReadTask>();
     task->result = *params;
+    if (params->operation == 7) task->extraInput.assign(reinterpret_cast<const char*>(params->extraInput), static_cast<std::size_t>(params->extraInputSize));
     task->deadline = GetTickCount64() + params->timeoutMs;
     if (!task->completed) return 0xE406;
     // Keep the DataModel alive through submission/wait, but do not put a strong
@@ -1140,3 +1591,5 @@ extern "C" __declspec(dllexport) DWORD WINAPI ReniumReadProperty(PropertyReadPar
         return 0xE40A;
     }
 }
+
+#include "renium_studio_reader.h"

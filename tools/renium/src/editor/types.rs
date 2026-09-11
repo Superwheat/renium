@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -43,7 +44,10 @@ pub(crate) struct EditorPropertyChange {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) path_ordinals: Vec<usize>,
     pub(crate) class_name: String,
-    #[serde(skip_serializing_if = "Map::is_empty")]
+    #[serde(
+        skip_serializing_if = "Map::is_empty",
+        serialize_with = "serialize_bridge_properties"
+    )]
     pub(crate) properties: Map<String, Value>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) reset_properties: Vec<String>,
@@ -53,7 +57,100 @@ pub(crate) struct EditorPropertyChange {
     pub(crate) deleted_attributes: Vec<String>,
 }
 
-#[derive(Serialize, Default)]
+// Font.new cannot carry the serializer's cached face, and even a missing cache
+// must replace a previous cached value. Keep native values transport-only: the
+// change plan and saved settings remain ordinary, readable property JSON.
+fn serialize_bridge_properties<S: serde::Serializer>(
+    properties: &Map<String, Value>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    use rbx_dom_weak::{InstanceBuilder, WeakDom};
+    use serde::ser::{Error, SerializeMap};
+    let mut map = serializer.serialize_map(Some(properties.len()))?;
+    for (name, value) in properties {
+        if value.get("_type").and_then(Value::as_str) == Some("Font")
+            || name == "FontFace" && value.get("family").is_some()
+        {
+            let Some(font) = crate::rbx::encode::json_to_rbx_font(value) else {
+                // Leave invalid input for the ordinary property validator,
+                // rather than converting an invalid enum to a default Font.
+                map.serialize_entry(name, value)?;
+                continue;
+            };
+            let mut native = crate::rbx::decode::rbx_font_to_settings_json(&font);
+            let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+            let carrier = dom.insert(
+                dom.root_ref(),
+                InstanceBuilder::new("TextLabel").with_property("FontFace", font),
+            );
+            let mut bytes = Vec::new();
+            rbx_binary::to_writer(&mut bytes, &dom, &[carrier]).map_err(S::Error::custom)?;
+            native["_nativeFont"] = Value::String(base64::encode(bytes));
+            map.serialize_entry(name, &native)?;
+        } else {
+            map.serialize_entry(name, value)?;
+        }
+    }
+    map.end()
+}
+
+#[cfg(test)]
+mod font_transport_tests {
+    use super::*;
+
+    #[test]
+    fn font_transport_preserves_native_cache_without_changing_saved_values() {
+        #[derive(Serialize)]
+        struct Wire<'a>(
+            #[serde(serialize_with = "serialize_bridge_properties")] &'a Map<String, Value>,
+        );
+        for font in [
+            json!({"family":"rbxasset://fonts/families/BuilderSans.json", "weight":"Medium", "style":"Normal", "cachedFaceId":"rbxasset://fonts/BuilderSans-Medium.otf"}),
+            json!({"_type":"Font", "family":"rbxasset://fonts/families/Arial.json", "weight":700, "style":1}),
+            json!({"family":"rbxasset://fonts/families/SourceSansPro.json"}),
+        ] {
+            let properties = Map::from_iter([
+                ("FontFace".to_string(), font.clone()),
+                ("TextSize".to_string(), json!(12)),
+            ]);
+            let wire = serde_json::to_value(Wire(&properties)).unwrap();
+            assert_eq!(properties["FontFace"], font);
+            assert_eq!(wire["TextSize"], 12);
+            let bytes = base64::decode(wire["FontFace"]["_nativeFont"].as_str().unwrap()).unwrap();
+            assert!(bytes.len() < 1024);
+            let dom = rbx_binary::from_reader(std::io::Cursor::new(bytes)).unwrap();
+            assert_eq!(dom.root().children().len(), 1);
+            let carrier = dom.get_by_ref(dom.root().children()[0]).unwrap();
+            assert_eq!(carrier.class.as_str(), "TextLabel");
+            assert!(carrier.children().is_empty());
+            let rbx_dom_weak::types::Variant::Font(native) =
+                &carrier.properties[&"FontFace".into()]
+            else {
+                panic!("Font missing")
+            };
+            assert_eq!(
+                *native,
+                crate::rbx::encode::json_to_rbx_font(&font).unwrap()
+            );
+            let mut transported = wire["FontFace"].clone();
+            transported.as_object_mut().unwrap().remove("_nativeFont");
+            assert_eq!(
+                transported,
+                crate::rbx::decode::rbx_font_to_settings_json(native)
+            );
+        }
+        let invalid = Map::from_iter([(
+            "FontFace".to_string(),
+            json!({"family":"family", "weight":"invalid"}),
+        )]);
+        assert_eq!(
+            serde_json::to_value(Wire(&invalid)).unwrap(),
+            Value::Object(invalid)
+        );
+    }
+}
+
+#[derive(Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct EditorInstanceDescriptor {
     pub(crate) settings_id: String,
@@ -85,7 +182,7 @@ pub(crate) struct EditorPreserveDescriptor {
     pub(crate) path_ordinals: Vec<usize>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct EditorInstanceChange {
     pub(crate) mode: String,
@@ -201,6 +298,12 @@ pub(crate) struct EditorSourcePathSpec {
 }
 
 #[derive(Default)]
+pub(crate) struct PreparedEditorDocuments {
+    pub(crate) documents: HashMap<String, Arc<SettingsBytecode>>,
+    pub(crate) native_services: HashSet<String>,
+}
+
+#[derive(Default)]
 pub(crate) struct EditorChangeSet {
     pub(crate) instance_changes: Vec<EditorInstanceChange>,
     pub(crate) source_changes: Vec<EditorSourceChange>,
@@ -209,6 +312,9 @@ pub(crate) struct EditorChangeSet {
     pub(crate) settings_writes: Vec<EditorSettingsWrite>,
     pub(crate) geometry_readbacks: Vec<super::native_geometry::GeometryReadback>,
     pub(crate) files_to_studio_filters_active: bool,
+    // Full native replacements need only serializer omissions as property
+    // edits. Keep the accepted document until the binary plan identifies them.
+    pub(crate) native_property_documents: HashMap<String, Arc<SettingsBytecode>>,
 }
 
 impl EditorChangeSet {
@@ -229,7 +335,10 @@ impl EditorChangeSet {
     }
 }
 
-pub(crate) fn take_pre_routed_protected_writes(changes: &mut EditorChangeSet) -> Vec<Value> {
+pub(crate) fn take_pre_routed_protected_writes(
+    changes: &mut EditorChangeSet,
+    binary_import: Option<&EditorBinaryImport>,
+) -> Vec<Value> {
     let mut rows = Vec::new();
     for change in &mut changes.property_changes {
         let property_name = if change.service == MATERIAL_SERVICE_CLASS
@@ -243,6 +352,35 @@ pub(crate) fn take_pre_routed_protected_writes(changes: &mut EditorChangeSet) ->
         } else {
             continue;
         };
+        if super::native_roots::is_property(&change.class_name, property_name) {
+            // Verified transactional setters must reach the plugin's native
+            // queue instead of forcing a whole-place snapshot and reopen.
+            continue;
+        }
+        if property_name == TEXTURE_PACK_PROPERTY
+            && binary_import.is_some_and(|import| {
+                import.imports_path(
+                    &change.service,
+                    &change.path_segments,
+                    &change.path_ordinals,
+                ) && !import
+                    .post_apply_properties_by_class
+                    .get(&change.class_name)
+                    .is_some_and(|names| names.contains(property_name))
+                    && !import
+                        .post_apply_properties_by_path
+                        .get(&crate::bytecode::edit::instance_path_parts_key(
+                            &change.path_segments,
+                            &change.path_ordinals,
+                        ))
+                        .is_some_and(|names| names.contains(property_name))
+            })
+        {
+            // The staged binary already carries this saved texture pack. Keep
+            // the normal native post-apply filter; an offline rewrite would
+            // target the old live hierarchy and discard the staged import.
+            continue;
+        }
         let Some(value) = change.properties.remove(property_name) else {
             continue;
         };
@@ -266,7 +404,7 @@ pub(crate) fn take_pre_routed_protected_writes(changes: &mut EditorChangeSet) ->
     rows
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct EditorBinaryExportGroup {
     pub(crate) service: String,
@@ -294,10 +432,16 @@ pub(crate) struct EditorBinaryExportGroup {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct EditorBinaryImportGroup {
     pub(crate) service: String,
+    #[serde(skip_serializing_if = "is_false")]
+    pub(crate) additive: bool,
     pub(crate) target_path: Vec<String>,
     pub(crate) count: usize,
     pub(crate) payload_root_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) expected_structure: Option<EditorBinaryStructure>,
     pub(crate) root_paths: Vec<EditorBinaryRootPath>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) viewport_camera: Option<EditorBinaryRootPath>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) retained_roots: Vec<EditorBinaryRetainedRoot>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -309,6 +453,12 @@ pub(crate) struct EditorBinaryImportGroup {
 }
 
 #[derive(Serialize)]
+pub(crate) struct EditorBinaryStructure {
+    pub(crate) strings: Vec<String>,
+    pub(crate) nodes: String,
+}
+
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct EditorBinaryRootPath {
     pub(crate) path_segments: Vec<String>,
@@ -354,8 +504,11 @@ pub(crate) struct EditorBinarySerializationBatch {
 }
 
 pub(crate) struct EditorBinaryExport {
+    #[cfg(windows)]
+    pub(crate) attribute_guard: Option<crate::studio::native::serializer::AttributeGuard>,
     #[cfg(any(windows, target_os = "macos"))]
     pub(crate) bytes: Vec<u8>,
+    pub(crate) native_capture: bool,
     pub(crate) groups: Vec<EditorBinaryExportGroup>,
     pub(crate) serialization_batches: Vec<EditorBinarySerializationBatch>,
     pub(crate) export_id: Option<String>,
@@ -366,15 +519,93 @@ pub(crate) struct EditorBinaryExport {
 pub(crate) struct EditorBinaryImport {
     pub(crate) bytes: Vec<u8>,
     pub(crate) groups: Vec<EditorBinaryImportGroup>,
+    pub(crate) native_replacement: Option<EditorNativeReplacement>,
     pub(crate) instance_count: usize,
     pub(crate) post_apply_properties_by_class: HashMap<String, HashSet<String>>,
     pub(crate) post_apply_properties_by_path: HashMap<String, HashSet<String>>,
     pub(crate) external_references_post_applied: bool,
+    pub(crate) viewport_references_post_applied: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EditorNativeReplacement {
+    #[serde(flatten)]
+    pub(crate) plan: EditorNativePlan,
+    #[serde(skip)]
+    pub(crate) batches: Vec<EditorNativeBatch>,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) struct EditorNativeBatch {
+    pub(crate) bytes: std::ops::Range<usize>,
+    pub(crate) services: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EditorNativePlan {
+    pub(crate) bindings: Vec<EditorNativeBinding>,
+    pub(crate) classes: Vec<EditorNativeClass>,
+    pub(crate) aliases: Vec<EditorNativeAlias>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EditorNativeAlias {
+    pub(crate) class_index: u32,
+    pub(crate) ordinal: u32,
+    pub(crate) source_ordinal: u32,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EditorNativeClass {
+    pub(crate) name: String,
+    pub(crate) count: u32,
+    pub(crate) tags_absent: bool,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EditorNativeBinding {
+    pub(crate) path_segments: Vec<String>,
+    pub(crate) path_ordinals: Vec<usize>,
+    pub(crate) class_name: String,
+    pub(crate) binary_referent: i32,
+    pub(crate) ordinal: u32,
+    pub(crate) class_count: u32,
+    pub(crate) reference_only: bool,
 }
 
 impl EditorBinaryImport {
+    pub(crate) fn carries_container_settings(&self, service: &str, segments: &[String]) -> bool {
+        self.native_replacement.is_some()
+            && self.groups.iter().any(|group| {
+                !group.additive && group.service == service && group.target_path == segments
+            })
+    }
+
     pub(crate) fn imports_service(&self, service: &str) -> bool {
-        self.groups.iter().any(|group| group.service == service)
+        self.groups
+            .iter()
+            .any(|group| group.service == service && !group.additive)
+    }
+
+    pub(crate) fn imports_path(
+        &self,
+        service: &str,
+        segments: &[String],
+        ordinals: &[usize],
+    ) -> bool {
+        self.groups.iter().any(|group| {
+            group.service == service
+                && (!group.additive
+                    || group.root_paths.iter().any(|root| {
+                        segments.starts_with(&root.path_segments)
+                            && ordinals.starts_with(&root.path_ordinals)
+                    }))
+        })
     }
 
     pub(crate) fn retains_path(

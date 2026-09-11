@@ -17,7 +17,7 @@ rbx po <PLACE_ID> <OTHER_PLACE_ID>
 
 `--place DTE` matches the Studio window name, not `game.Name` (often `Place1`). Use a place ID or configured alias if the window title is unavailable. Duplicate window names require an unambiguous target.
 
-On macOS, window-name targeting and automatic Auto-Recovery dismissal require Accessibility permission for the app launching Renium (for SSH, `sshd-keygen-wrapper`/Remote Login). Renium presses **Ignore**, preserving recovery files.
+Renium dismisses Auto-Recovery with **Ignore** (preserving recovery files) and Lighting Technology Migration with **Continue**. On macOS, it also dismisses the known `BulkPluginAssetDetailsFetcher::sendRequest()` HTTP 500 startup alert with **OK**. Other dialogs still require their normal decision. On macOS, this and window-name targeting require Accessibility permission for the app launching Renium (for SSH, `sshd-keygen-wrapper`/Remote Login).
 
 `sx` closes the target. Local files require `--save` or `--terminate`; termination discards unsaved work.
 

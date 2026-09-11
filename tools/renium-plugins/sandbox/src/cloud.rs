@@ -57,7 +57,7 @@ impl<'a> Client<'a> {
         }
         Ok(Self {
             agent: ureq::AgentBuilder::new()
-                .timeout(Duration::from_secs(3))
+                .timeout(Duration::from_secs(10))
                 .redirects(0)
                 .build(),
             key,
@@ -147,6 +147,7 @@ impl<'a> Client<'a> {
                 "Sandbox must be the root place of a PRIVATE experience owned by the configured throwaway group"
             );
         }
+        Ok(())
     }
 
     pub(super) fn publish_blank(&self, file: &Path) -> Result<()> {
@@ -157,6 +158,7 @@ impl<'a> Client<'a> {
         let response = self
             .agent
             .post(&url)
+            .timeout(Duration::from_secs(60))
             .set("x-api-key", &self.key)
             .set("Content-Type", "application/octet-stream")
             .send(File::open(file)?)
@@ -390,3 +392,7 @@ fn check_operation(response: &Value) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "cloud_tests.rs"]
+mod tests;

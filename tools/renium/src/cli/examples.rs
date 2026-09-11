@@ -247,7 +247,7 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ),
     ("sm", "Examples:\n  rbx sm -o sourcemap.json"),
     ("vci", "Examples:\n  rbx vci"),
-    ("vct", "Examples:\n  rbx vct src/Workspace.renium"),
+    ("vct", "Examples:\n  rbx vct instances/Workspace.renium"),
     ("v", "Examples:\n  rbx v model.rbxm --json"),
     (
         "vcm",

@@ -9,7 +9,7 @@ use rbx_reflection::{ReflectionDatabase, Scriptability as RbxScriptability};
 use serde_json::{Map, Value, json};
 
 use crate::app::timing::{log_timing, verbose_timing_logs};
-use crate::bytecode::edit::instance_path_parts_key;
+use crate::bytecode::edit::{collect_settings_subtree_preorder, instance_path_parts_key};
 use crate::cli::PushEditorChangesArgs;
 use crate::editor::types::{
     EditorBinaryExport, EditorBinaryImport, EditorBinaryImportGroup, EditorBinaryPackageRoot,
@@ -18,7 +18,7 @@ use crate::editor::types::{
 use crate::rbx::decode::{
     NativeOverlayRequest, NativePropertyFilter, RbxSettingsConversionOptions,
     fetch_native_overlay_batches, native_property_filter, overlay_property_names_value,
-    rbx_model_primary_part_is_set, rbx_properties_to_settings_records,
+    rbx_properties_to_settings_records,
 };
 use crate::rbx::encode::{collect_rbx_subtree_preorder, rbx_property_descriptor};
 use crate::rbx::model::{
@@ -26,25 +26,34 @@ use crate::rbx::model::{
     rbx_dom_instance_path_parts, rbx_dom_path_import_refs,
 };
 use crate::roblox::schema::PropertySchemaMap;
-use crate::roblox::services::explorer_service_order;
+use crate::roblox::services::{explorer_service_order, is_engine_managed_container};
 use crate::settings::bytecode::{
     SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance,
 };
 use crate::settings::equivalence::{
-    align_settings_ids_to_reference, settings_documents_equivalent,
+    align_settings_ids_to_reference, drop_settings_document, settings_documents_equivalent,
     stabilize_settings_reference_ids,
 };
+use crate::settings::tree::{editor_service_root_index, settings_children_by_parent};
 use crate::studio::bridge::BridgeServer;
 use crate::studio::native::editor::{
     EditorBinaryExportFinishGuard, begin_editor_binary_export, rbx_variant_referent,
-    receive_editor_binary_export_bytes,
+    receive_editor_binary_export_bytes, serialized_service_roots,
 };
-use crate::system::files::{absolutize_under, resolve_project_root_if_present};
+use crate::system::files::{
+    absolutize_under, resolve_project_root_if_present, service_settings_path,
+};
 
+#[path = "import_payload.rs"]
+mod payload;
+
+#[derive(Clone)]
 struct PendingEditorBinaryGroup {
     service: String,
+    additive: bool,
     target_path: Vec<String>,
     roots: Vec<RbxRef>,
+    viewport_camera: Option<EditorBinaryRootPath>,
 }
 
 struct EditorPackageGroupPlan {
@@ -52,6 +61,52 @@ struct EditorPackageGroupPlan {
     package_roots: Vec<EditorBinaryPackageRoot>,
     mutation_package_roots: Vec<EditorBinaryPackageRoot>,
     change_generation: Option<u64>,
+}
+
+fn externalize_imported_references(
+    dom: &mut RbxWeakDom,
+    imported_refs: &HashSet<RbxRef>,
+    unresolved: &HashMap<RbxRef, HashSet<rbx_dom_weak::Ustr>>,
+    viewport_ref: Option<RbxRef>,
+) -> HashMap<String, HashSet<String>> {
+    let mut removed = Vec::new();
+    let mut properties_by_path = HashMap::<String, HashSet<String>>::new();
+    for referent in imported_refs.iter().copied() {
+        let Some(instance) = dom.get_by_ref(referent) else {
+            continue;
+        };
+        let external_names = instance
+            .properties
+            .iter()
+            .filter_map(|(name, value)| {
+                let target = rbx_variant_referent(value)?;
+                (!target.is_none()
+                    && (!imported_refs.contains(&target) || Some(target) == viewport_ref))
+                    .then(|| name.as_str().to_string())
+            })
+            .collect::<Vec<_>>();
+        let unresolved_names = unresolved.get(&referent);
+        if external_names.is_empty() && unresolved_names.is_none() {
+            continue;
+        }
+        let (segments, ordinals) = rbx_dom_instance_path_parts(dom, referent);
+        let names = properties_by_path
+            .entry(instance_path_parts_key(&segments, &ordinals))
+            .or_default();
+        names.extend(external_names.iter().cloned());
+        if let Some(unresolved) = unresolved_names {
+            names.extend(unresolved.iter().map(|name| name.as_str().to_string()));
+        }
+        removed.extend(external_names.into_iter().map(|name| (referent, name)));
+    }
+    for (referent, name) in removed {
+        if let Some(instance) = dom.get_by_ref_mut(referent) {
+            instance
+                .properties
+                .remove(&rbx_dom_weak::Ustr::from(name.as_str()));
+        }
+    }
+    properties_by_path
 }
 
 fn pending_editor_binary_groups(
@@ -63,22 +118,20 @@ fn pending_editor_binary_groups(
         let root = dom
             .get_by_ref(*root_ref)
             .context("Export service root is missing")?;
+        let viewport = (service == "Workspace")
+            .then(|| {
+                root.properties
+                    .get(&rbx_dom_weak::Ustr::from("CurrentCamera"))
+                    .and_then(rbx_variant_referent)
+            })
+            .flatten();
         let mut children = Vec::new();
         let mut nested_groups = Vec::new();
         for referent in root.children().iter().copied() {
             let Some(instance) = dom.get_by_ref(referent) else {
                 continue;
             };
-            if instance.class.as_str() == "Terrain"
-                || (service == "StarterPlayer"
-                    && matches!(
-                        instance.class.as_str(),
-                        "StarterPlayerScripts" | "StarterCharacterScripts"
-                    ))
-                || (service == "Workspace"
-                    && instance.class.as_str() == "Camera"
-                    && matches!(instance.name.as_str(), "Camera" | "CurrentCamera"))
-            {
+            if is_engine_managed_container(service, instance.class.as_str()) {
                 nested_groups.push((instance.name.clone(), instance.children().to_vec()));
             } else {
                 children.push(referent);
@@ -86,14 +139,26 @@ fn pending_editor_binary_groups(
         }
         groups.push(PendingEditorBinaryGroup {
             service: service.clone(),
+            additive: false,
             target_path: vec![service.clone()],
             roots: children,
+            viewport_camera: viewport
+                .filter(|referent| !referent.is_none())
+                .map(|referent| {
+                    let (path_segments, path_ordinals) = rbx_dom_instance_path_parts(dom, referent);
+                    EditorBinaryRootPath {
+                        path_segments,
+                        path_ordinals,
+                    }
+                }),
         });
         for (target_name, nested_children) in nested_groups {
             groups.push(PendingEditorBinaryGroup {
                 service: service.clone(),
+                additive: false,
                 target_path: vec![service.clone(), target_name],
                 roots: nested_children,
+                viewport_camera: None,
             });
         }
     }
@@ -381,13 +446,6 @@ fn canonical_rbx_instance_record(
     {
         properties.extend(logical.clone());
     }
-    if rbx_model_primary_part_is_set(
-        database,
-        instance.class.as_str(),
-        instance.properties.iter(),
-    ) {
-        properties.remove("WorldPivot");
-    }
     Ok(CanonicalRbxInstanceRecord {
         properties,
         attributes,
@@ -487,6 +545,238 @@ fn canonical_rbx_subtree_document(
 #[cfg(test)]
 mod canonical_tests {
     use super::*;
+
+    #[test]
+    fn native_import_externalizes_only_the_retained_viewport_and_external_refs() {
+        for move_viewport in [false, true] {
+            let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+            let workspace = dom.insert(dom.root_ref(), RbxInstanceBuilder::new("Workspace"));
+            let viewport = dom.insert(workspace, RbxInstanceBuilder::new("Camera"));
+            let extra = dom.insert(workspace, RbxInstanceBuilder::new("Camera"));
+            let pointer = dom.insert(
+                workspace,
+                RbxInstanceBuilder::new("ObjectValue")
+                    .with_name("Same")
+                    .with_property("Value", RbxVariant::Ref(viewport)),
+            );
+            let ordinary = dom.insert(
+                workspace,
+                RbxInstanceBuilder::new("ObjectValue")
+                    .with_name("Same")
+                    .with_property("Value", RbxVariant::Ref(extra)),
+            );
+            let content = dom.insert(
+                workspace,
+                RbxInstanceBuilder::new("MeshPart").with_property(
+                    "MeshContent",
+                    RbxVariant::Content(rbx_dom_weak::types::Content::from_referent(viewport)),
+                ),
+            );
+            let outside = dom.insert(
+                workspace,
+                RbxInstanceBuilder::new("ObjectValue")
+                    .with_name("Outside")
+                    .with_property("Value", RbxVariant::Ref(workspace)),
+            );
+            let nil = dom.insert(
+                workspace,
+                RbxInstanceBuilder::new("ObjectValue")
+                    .with_name("Nil")
+                    .with_property("Value", RbxVariant::Ref(RbxRef::none())),
+            );
+            let package = dom.insert(
+                workspace,
+                RbxInstanceBuilder::new("Model").with_name("Package"),
+            );
+            let link = dom.insert(package, RbxInstanceBuilder::new("PackageLink"));
+            for referent in [pointer, ordinary, content, outside, nil] {
+                dom.transfer_within(referent, package);
+            }
+            let imported = HashSet::from([
+                viewport, extra, package, link, pointer, ordinary, content, outside, nil,
+            ]);
+            let unresolved = HashMap::from([(ordinary, HashSet::from(["Unresolved".into()]))]);
+            let path_key = |dom: &RbxWeakDom, target| {
+                let (segments, ordinals) = rbx_dom_instance_path_parts(dom, target);
+                instance_path_parts_key(&segments, &ordinals)
+            };
+            let pointer_key = path_key(&dom, pointer);
+            let ordinary_key = path_key(&dom, ordinary);
+            let content_key = path_key(&dom, content);
+            let outside_key = path_key(&dom, outside);
+            let plan = externalize_imported_references(
+                &mut dom,
+                &imported,
+                &unresolved,
+                move_viewport.then_some(viewport),
+            );
+            assert_eq!(
+                plan.get(&pointer_key).is_some_and(|p| p.contains("Value")),
+                move_viewport
+            );
+            assert_eq!(
+                plan.get(&content_key)
+                    .is_some_and(|p| p.contains("MeshContent")),
+                move_viewport
+            );
+            assert_eq!(
+                dom.get_by_ref(pointer)
+                    .unwrap()
+                    .properties
+                    .contains_key(&"Value".into()),
+                !move_viewport
+            );
+            assert_eq!(
+                dom.get_by_ref(content)
+                    .unwrap()
+                    .properties
+                    .contains_key(&"MeshContent".into()),
+                !move_viewport
+            );
+            assert_eq!(
+                dom.get_by_ref(ordinary)
+                    .unwrap()
+                    .properties
+                    .get(&"Value".into()),
+                Some(&RbxVariant::Ref(extra))
+            );
+            assert_eq!(
+                dom.get_by_ref(nil).unwrap().properties.get(&"Value".into()),
+                Some(&RbxVariant::Ref(RbxRef::none()))
+            );
+            assert!(
+                plan[&ordinary_key].contains("Unresolved") && plan[&outside_key].contains("Value")
+            );
+            assert!(
+                !dom.get_by_ref(outside)
+                    .unwrap()
+                    .properties
+                    .contains_key(&"Value".into())
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_service_batches_select_only_full_native_replacements() {
+        let mut changes = EditorChangeSet::default();
+        for (service, mode, allow_deletes) in [
+            ("Workspace", "reconcileService", true),
+            ("TestService", "upsertInstances", false),
+            ("TestService", "deleteInstances", false),
+        ] {
+            changes
+                .instance_changes
+                .push(crate::editor::types::EditorInstanceChange {
+                    service: service.into(),
+                    mode: mode.into(),
+                    allow_deletes,
+                    instances: Vec::new(),
+                    preserve_instances: Vec::new(),
+                });
+        }
+        assert_eq!(
+            native_import_services(&changes),
+            HashSet::from(["Workspace".to_string()])
+        );
+        changes.files_to_studio_filters_active = true;
+        assert!(native_import_services(&changes).is_empty());
+        changes.files_to_studio_filters_active = false;
+        changes.instance_changes[0].allow_deletes = false;
+        assert!(native_import_services(&changes).is_empty());
+    }
+
+    #[test]
+    fn native_chat_import_retains_engine_containers_but_replaces_their_contents() {
+        let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+        let root = dom.insert(dom.root_ref(), RbxInstanceBuilder::new("TextChatService"));
+        let classes = [
+            "ChatWindowConfiguration",
+            "ChatInputBarConfiguration",
+            "BubbleChatConfiguration",
+            "ChannelTabsConfiguration",
+        ];
+        let mut children = Vec::new();
+        for class in classes {
+            let container = dom.insert(root, RbxInstanceBuilder::new(class));
+            children.push(dom.insert(container, RbxInstanceBuilder::new("ObjectValue")));
+            assert!(!editor_binary_group_includes_root(
+                "TextChatService",
+                &["TextChatService".into()],
+                dom.get_by_ref(container).unwrap()
+            ));
+        }
+        let ordinary = dom.insert(
+            root,
+            RbxInstanceBuilder::new("Folder").with_name(classes[0]),
+        );
+        let groups =
+            pending_editor_binary_groups(&dom, &[("TextChatService".into(), root)]).unwrap();
+        assert_eq!(groups.len(), 5);
+        assert_eq!(groups[0].roots, [ordinary]);
+        for ((group, class), child) in groups[1..].iter().zip(classes).zip(children) {
+            assert_eq!(group.target_path, ["TextChatService", class]);
+            assert_eq!(group.roots, [child]);
+        }
+    }
+
+    #[test]
+    fn native_import_marks_the_viewport_without_dropping_its_children() {
+        for (name, nested) in [
+            ("Camera", false),
+            ("CurrentCamera", false),
+            ("Viewport", true),
+        ] {
+            let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+            let root = dom.insert(dom.root_ref(), RbxInstanceBuilder::new("Workspace"));
+            let parent = if nested {
+                dom.insert(root, RbxInstanceBuilder::new("Folder").with_name("Holder"))
+            } else {
+                root
+            };
+            let viewport = dom.insert(parent, RbxInstanceBuilder::new("Camera").with_name(name));
+            let child = dom.insert(
+                viewport,
+                RbxInstanceBuilder::new("StringValue").with_name("Child"),
+            );
+            let extra = dom.insert(root, RbxInstanceBuilder::new("Camera").with_name(name));
+            dom.get_by_ref_mut(root)
+                .unwrap()
+                .properties
+                .insert("CurrentCamera".into(), RbxVariant::Ref(viewport));
+            let groups = pending_editor_binary_groups(&dom, &[("Workspace".into(), root)]).unwrap();
+            assert_eq!(groups.len(), 1);
+            assert_eq!(
+                groups[0].roots,
+                [if nested { parent } else { viewport }, extra]
+            );
+            let descriptor = groups[0].viewport_camera.as_ref().unwrap();
+            assert_eq!(
+                descriptor.path_segments,
+                if nested {
+                    vec!["Workspace", "Holder", name]
+                } else {
+                    vec!["Workspace", name]
+                }
+            );
+            assert_eq!(
+                descriptor.path_ordinals,
+                vec![1; descriptor.path_segments.len()]
+            );
+            let mut subtree = Vec::new();
+            collect_rbx_subtree_preorder(&dom, groups[0].roots[0], &mut subtree);
+            assert!(subtree.contains(&child));
+            assert!(editor_binary_group_includes_root(
+                "Workspace",
+                &["Workspace".into()],
+                dom.get_by_ref(viewport).unwrap()
+            ));
+            assert!(editor_binary_group_includes_root(
+                "Workspace",
+                &["Workspace".into()],
+                dom.get_by_ref(extra).unwrap()
+            ));
+        }
+    }
 
     fn package_dom(root_name: &str, root_archivable: bool, value: &str) -> (RbxWeakDom, RbxRef) {
         let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
@@ -905,15 +1195,7 @@ fn editor_binary_group_includes_root(
     if target_path.len() != 1 {
         return true;
     }
-    instance.class.as_str() != "Terrain"
-        && !(service == "StarterPlayer"
-            && matches!(
-                instance.class.as_str(),
-                "StarterPlayerScripts" | "StarterCharacterScripts"
-            ))
-        && !(service == "Workspace"
-            && instance.class.as_str() == "Camera"
-            && matches!(instance.name.as_str(), "Camera" | "CurrentCamera"))
+    !is_engine_managed_container(service, instance.class.as_str())
 }
 
 fn package_preflight_overlay_property_requests(
@@ -1145,15 +1427,17 @@ fn fetch_package_preflight_overlay_properties(
 struct EditorServiceChangeGenerations {
     generations: HashMap<String, u64>,
     has_package_links: Option<HashMap<String, bool>>,
+    absent_roots: HashMap<String, HashSet<String>>,
 }
 
 fn editor_service_change_generations(
     bridge: &BridgeServer,
     services: &[String],
+    root_names: Option<&HashMap<String, HashSet<String>>>,
 ) -> Result<EditorServiceChangeGenerations> {
     let result = bridge.call(
         "getEditorServiceChangeGenerations",
-        json!({ "services": services }),
+        json!({ "services": services, "rootNames": root_names }),
     )?;
     let values = result
         .get("generations")
@@ -1188,7 +1472,41 @@ fn editor_service_change_generations(
     Ok(EditorServiceChangeGenerations {
         generations,
         has_package_links,
+        absent_roots: confirmed_absent_roots(&result, root_names)?,
     })
+}
+
+fn confirmed_absent_roots(
+    response: &Value,
+    requested: Option<&HashMap<String, HashSet<String>>>,
+) -> Result<HashMap<String, HashSet<String>>> {
+    let mut absent = HashMap::new();
+    let (Some(requested), Some(reported)) = (
+        requested,
+        response.get("absentRoots").and_then(Value::as_object),
+    ) else {
+        // Older plugins cannot prove absence; ordinary upserts remain available.
+        return Ok(absent);
+    };
+    for (service, candidates) in requested {
+        let names = reported
+            .get(service)
+            .and_then(Value::as_array)
+            .with_context(|| format!("Studio omitted native root existence for {service}"))?;
+        let mut found = HashSet::new();
+        for name in names {
+            let name = name
+                .as_str()
+                .filter(|name| candidates.contains(*name))
+                .context("Studio returned an unrequested native root name")?;
+            anyhow::ensure!(
+                found.insert(name.to_string()),
+                "Studio repeated a native root name"
+            );
+        }
+        absent.insert(service.clone(), found);
+    }
+    Ok(absent)
 }
 
 struct EditorPackagePreflightLive<'a> {
@@ -1197,6 +1515,7 @@ struct EditorPackagePreflightLive<'a> {
     captured_services: HashSet<String>,
     export: Option<EditorBinaryExport>,
     finish_guard: Option<EditorBinaryExportFinishGuard<'a>>,
+    absent_roots: HashMap<String, HashSet<String>>,
 }
 
 fn capture_editor_package_preflight_live<'a>(
@@ -1204,12 +1523,14 @@ fn capture_editor_package_preflight_live<'a>(
     service_names: &[String],
     required_reference_services: Option<&HashSet<String>>,
     force_full_snapshot: bool,
+    root_names: Option<&HashMap<String, HashSet<String>>>,
 ) -> Result<EditorPackagePreflightLive<'a>> {
     capture_editor_package_preflight_live_attempt(
         bridge,
         service_names,
         required_reference_services,
         force_full_snapshot,
+        root_names,
         0,
     )
 }
@@ -1219,17 +1540,19 @@ fn capture_editor_package_preflight_live_attempt<'a>(
     service_names: &[String],
     required_reference_services: Option<&HashSet<String>>,
     force_full_snapshot: bool,
+    root_names: Option<&HashMap<String, HashSet<String>>>,
     attempt: u8,
 ) -> Result<EditorPackagePreflightLive<'a>> {
     let started = Instant::now();
-    let first = editor_service_change_generations(bridge, service_names)?;
+    let first = editor_service_change_generations(bridge, service_names, root_names)?;
     log_timing("package preflight generation read", started);
     if first
         .has_package_links
         .as_ref()
         .is_some_and(|states| !states.values().any(|has_package_link| *has_package_link))
     {
-        let generations = editor_service_change_generations(bridge, service_names)?.generations;
+        let generations =
+            editor_service_change_generations(bridge, service_names, None)?.generations;
         if generations != first.generations {
             bail!("Studio changed while Renium checked package state; retry the sync");
         }
@@ -1239,6 +1562,7 @@ fn capture_editor_package_preflight_live_attempt<'a>(
             captured_services: HashSet::new(),
             export: None,
             finish_guard: None,
+            absent_roots: first.absent_roots,
         });
     }
     let service_filter = (!force_full_snapshot)
@@ -1261,6 +1585,8 @@ fn capture_editor_package_preflight_live_attempt<'a>(
     let mut finish_guard = EditorBinaryExportFinishGuard {
         bridge,
         export_id: export.export_id.clone(),
+        #[cfg(windows)]
+        attribute_guard: None,
     };
     let bytes = receive_editor_binary_export_bytes(
         bridge,
@@ -1273,21 +1599,10 @@ fn capture_editor_package_preflight_live_attempt<'a>(
     )?;
     let mut dom = rbx_binary::from_reader(std::io::Cursor::new(bytes))
         .context("Studio returned an invalid package snapshot")?;
-    let roots = dom.root().children().to_vec();
-    let expected_roots = export
-        .groups
-        .iter()
-        .map(|group| group.count + 1)
-        .sum::<usize>();
-    if roots.len() != expected_roots {
-        bail!("Studio package snapshot has the wrong root count");
-    }
-    let mut cursor = 0;
-    for group in &export.groups {
-        let marker_ref = roots[cursor];
-        cursor += 1;
-        let child_refs = roots[cursor..cursor + group.count].to_vec();
-        cursor += group.count;
+    // Package preflight receives the same identity carriers as ordinary export.
+    // Decode that layout once, retaining authored roots even if they resemble carriers.
+    let roots = serialized_service_roots(&mut dom, &export.groups)?;
+    for (group, (marker_ref, child_refs)) in export.groups.iter().zip(roots) {
         let marker = dom
             .get_by_ref_mut(marker_ref)
             .context("Studio package snapshot lost a service marker")?;
@@ -1320,6 +1635,7 @@ fn capture_editor_package_preflight_live_attempt<'a>(
                 service_names,
                 required_reference_services,
                 force_full_snapshot,
+                root_names,
                 attempt + 1,
             );
         }
@@ -1337,6 +1653,7 @@ fn capture_editor_package_preflight_live_attempt<'a>(
         captured_services,
         export: Some(export),
         finish_guard: Some(finish_guard),
+        absent_roots: first.absent_roots,
     })
 }
 
@@ -1393,6 +1710,7 @@ fn plan_editor_package_root_retention(
         captured_services,
         export: live_export,
         mut finish_guard,
+        ..
     } = live;
     let Some(live_dom) = live_dom else {
         return groups
@@ -1645,7 +1963,7 @@ fn plan_editor_package_root_retention(
         guard.finish(false)?;
     }
     let services = live_generations.keys().cloned().collect::<Vec<_>>();
-    let generations = editor_service_change_generations(bridge, &services)?.generations;
+    let generations = editor_service_change_generations(bridge, &services, None)?.generations;
     if generations != live_generations {
         bail!("Studio changed while Renium captured the package snapshot; retry the sync");
     }
@@ -1908,11 +2226,7 @@ fn plan_editor_package_root_retention(
     Ok(plans)
 }
 
-pub(crate) fn build_editor_binary_import(
-    args: &PushEditorChangesArgs,
-    changes: &EditorChangeSet,
-    bridge: &BridgeServer,
-) -> Result<Option<EditorBinaryImport>> {
+fn native_import_services(changes: &EditorChangeSet) -> HashSet<String> {
     if changes.files_to_studio_filters_active
         || changes.instance_changes.is_empty()
         || changes
@@ -1920,39 +2234,265 @@ pub(crate) fn build_editor_binary_import(
             .iter()
             .any(|change| !change.preserve_instances.is_empty())
     {
-        return Ok(None);
+        return HashSet::new();
     }
-    let services = changes
+    changes
         .instance_changes
         .iter()
         .filter(|change| change.mode == "reconcileService" && change.allow_deletes)
         .map(|change| change.service.clone())
-        .collect::<HashSet<_>>();
-    if services.is_empty()
-        || changes
-            .instance_changes
-            .iter()
-            .any(|change| !services.contains(&change.service))
-    {
+        .collect()
+}
+
+pub(crate) fn build_editor_binary_import(
+    args: &PushEditorChangesArgs,
+    changes: &EditorChangeSet,
+    bridge: &BridgeServer,
+) -> Result<Option<EditorBinaryImport>> {
+    let _trace = crate::app::timing::trace_scope("native.import", "prepare binary import");
+    let mut services = native_import_services(changes);
+    let additive_roots = additive_native_roots(changes, &services);
+    services.extend(additive_roots.keys().cloned());
+    if services.is_empty() {
         return Ok(None);
     }
+    #[cfg(windows)]
+    let allow_service_replacement = if !changes.files_to_studio_filters_active
+        && std::env::var_os("RENIUM_NATIVE_SERVICE_IMPORT").is_none_or(|value| value != "0")
+    {
+        let pid = crate::editor::review::studio_pid_for_bridge(bridge)?;
+        match crate::studio::native::serializer::prepare_service_reader(pid) {
+            Ok(()) => true,
+            Err(error) => {
+                crate::app::output::log_global(
+                    5,
+                    format_args!("[renium] using binary import transport: {error:#}"),
+                );
+                false
+            }
+        }
+    } else {
+        false
+    };
+    #[cfg(not(windows))]
+    let allow_service_replacement = false;
     let document_overrides = changes
-        .settings_writes
+        .native_property_documents
         .iter()
-        .filter_map(|write| {
-            let service = write.path.parent()?.file_name()?.to_str()?.to_string();
+        .map(|(service, document)| (service.clone(), document.as_ref()))
+        .chain(changes.settings_writes.iter().filter_map(|write| {
+            let service = crate::editor::paths::service_from_changed_path(
+                &args.project.project_root.join(&args.project.src_root),
+                &write.path,
+            )?;
             Some((service, &write.document))
-        })
+        }))
         .collect::<HashMap<_, _>>();
-    build_editor_binary_import_for_services(args, services, Some(&document_overrides), bridge)
+    build_editor_binary_import_for_services(
+        args,
+        services,
+        Some(&document_overrides),
+        &additive_roots,
+        bridge,
+        allow_service_replacement,
+    )
+}
+
+fn additive_native_roots(
+    changes: &EditorChangeSet,
+    replaced: &HashSet<String>,
+) -> HashMap<String, HashSet<String>> {
+    let mut roots = HashMap::<String, HashSet<String>>::new();
+    if changes.files_to_studio_filters_active {
+        return roots;
+    }
+    for change in &changes.instance_changes {
+        if change.mode != "upsertInstances" || replaced.contains(&change.service) {
+            continue;
+        }
+        for instance in &change.instances {
+            if instance.path_segments.len() == 2
+                && instance.path_ordinals.len() == 2
+                && instance.previous_path_segments.is_empty()
+                && instance.previous_class_name.is_none()
+                && instance.path_ordinals[1] == 1
+                && !instance.anchor_only
+                && !instance.ambiguous_siblings
+                && !is_engine_managed_container(&change.service, &instance.class_name)
+            {
+                roots
+                    .entry(change.service.clone())
+                    .or_default()
+                    .insert(instance.path_segments[1].clone());
+            }
+        }
+    }
+    roots
+}
+
+#[cfg(test)]
+mod additive_import_tests {
+    use super::*;
+    use crate::editor::types::{EditorInstanceChange, EditorInstanceDescriptor};
+
+    #[test]
+    fn additive_roots_require_explicit_live_absence_not_upsert_metadata() -> Result<()> {
+        let requested = HashMap::from([(
+            "TestService".into(),
+            HashSet::from(["LuauLSP_Settings".into(), "NewModel".into()]),
+        )]);
+        let actual = confirmed_absent_roots(
+            &json!({"absentRoots": {"TestService": ["NewModel"]}}),
+            Some(&requested),
+        )?;
+        assert_eq!(actual["TestService"], HashSet::from(["NewModel".into()]));
+        assert!(confirmed_absent_roots(&json!({}), Some(&requested))?.is_empty());
+        for invalid in [
+            json!({"absentRoots": {}}),
+            json!({"absentRoots": {"TestService": ["Unrequested"]}}),
+            json!({"absentRoots": {"TestService": ["NewModel", "NewModel"]}}),
+            json!({"absentRoots": {"TestService": [false]}}),
+        ] {
+            assert!(confirmed_absent_roots(&invalid, Some(&requested)).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn additive_import_only_selects_new_unambiguous_ordinary_roots() {
+        let root = EditorInstanceDescriptor {
+            path_segments: vec!["TestService".into(), "NewCar".into()],
+            path_ordinals: vec![1, 1],
+            class_name: "Model".into(),
+            ..Default::default()
+        };
+        let mut changes = EditorChangeSet {
+            instance_changes: vec![EditorInstanceChange {
+                service: "TestService".into(),
+                mode: "upsertInstances".into(),
+                allow_deletes: false,
+                instances: vec![root.clone()],
+                preserve_instances: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            additive_native_roots(&changes, &HashSet::new())["TestService"].len(),
+            1
+        );
+        for invalid in [
+            EditorInstanceDescriptor {
+                previous_path_segments: root.path_segments.clone(),
+                ..root.clone()
+            },
+            EditorInstanceDescriptor {
+                previous_class_name: Some("Folder".into()),
+                ..root.clone()
+            },
+            EditorInstanceDescriptor {
+                ambiguous_siblings: true,
+                ..root.clone()
+            },
+            EditorInstanceDescriptor {
+                anchor_only: true,
+                ..root.clone()
+            },
+            EditorInstanceDescriptor {
+                path_ordinals: vec![1, 2],
+                ..root.clone()
+            },
+            EditorInstanceDescriptor {
+                path_segments: vec!["TestService".into(), "Existing".into(), "Nested".into()],
+                path_ordinals: vec![1, 1, 1],
+                ..root.clone()
+            },
+        ] {
+            changes.instance_changes[0].instances = vec![invalid];
+            assert!(additive_native_roots(&changes, &HashSet::new()).is_empty());
+        }
+        changes.instance_changes[0].instances = vec![root];
+        assert!(additive_native_roots(&changes, &HashSet::from(["TestService".into()])).is_empty());
+        changes.files_to_studio_filters_active = true;
+        assert!(additive_native_roots(&changes, &HashSet::new()).is_empty());
+    }
+}
+
+fn independent_additive_document(
+    document: &SettingsBytecode,
+    service: &str,
+    roots: &HashSet<String>,
+) -> Option<SettingsBytecode> {
+    fn contains_reference(value: &Value) -> bool {
+        match value {
+            Value::Object(object) => {
+                object.get("_type").and_then(Value::as_str) == Some("Ref")
+                    || object.values().any(contains_reference)
+            }
+            Value::Array(values) => values.iter().any(contains_reference),
+            _ => false,
+        }
+    }
+    let root = editor_service_root_index(document, service)?;
+    let children = settings_children_by_parent(document);
+    let incoming = children
+        .get(root)?
+        .iter()
+        .copied()
+        .filter(|&index| roots.contains(&document.instances[index].name))
+        .collect::<Vec<_>>();
+    if incoming.len() != roots.len() {
+        return None;
+    }
+    let mut selected = vec![root];
+    for index in incoming {
+        collect_settings_subtree_preorder(&children, index, &mut selected);
+    }
+    if selected.len() == document.instances.len()
+        || selected.iter().any(|&index| {
+            let instance = &document.instances[index];
+            instance
+                .properties
+                .values()
+                .chain(instance.attributes.values())
+                .any(contains_reference)
+        })
+    {
+        return None;
+    }
+    // Reference-bearing additions retain the complete index used by native
+    // external-reference repair. Independent trees need only their own data.
+    let remap = selected
+        .iter()
+        .enumerate()
+        .map(|(next, &old)| (old, next))
+        .collect::<HashMap<_, _>>();
+    Some(SettingsBytecode {
+        version: document.version,
+        instances: selected
+            .into_iter()
+            .map(|index| {
+                let mut instance = document.instances[index].clone();
+                instance.parent_index = if index == root {
+                    None
+                } else {
+                    instance.parent_index.map(|parent| remap[&parent])
+                };
+                instance
+            })
+            .collect(),
+    })
 }
 
 fn build_editor_binary_import_for_services(
     args: &PushEditorChangesArgs,
     services: HashSet<String>,
     document_overrides: Option<&HashMap<String, &SettingsBytecode>>,
+    additive_roots: &HashMap<String, HashSet<String>>,
     bridge: &BridgeServer,
+    allow_service_replacement: bool,
 ) -> Result<Option<EditorBinaryImport>> {
+    let mut stages =
+        crate::app::timing::trace_stages("native.payload", "resolve project and order services");
     let project_root = resolve_project_root_if_present(&args.project.project_root)?;
     let src_root = absolutize_under(&project_root, &args.project.src_root);
     let service_count = services.len();
@@ -1964,61 +2504,168 @@ fn build_editor_binary_import_for_services(
             .then_with(|| a.cmp(b))
     });
     let build_services = ordered_services.clone();
+    let trace_context = crate::app::timing::trace_context();
+    stages.next("join parallel place build and live package preflight");
     let (build, live_preflight) = rayon::join(
         || {
+            let _trace_context =
+                trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
+            let _trace =
+                crate::app::timing::trace_scope("native.import", "build and partition import");
             let started = Instant::now();
+            let mut narrowed = HashMap::new();
+            for (service, roots) in additive_roots {
+                let selected = if let Some(document) =
+                    document_overrides.and_then(|documents| documents.get(service))
+                {
+                    independent_additive_document(document, service, roots)
+                } else {
+                    let path = service_settings_path(&src_root.join(service));
+                    if !path.is_file() {
+                        continue;
+                    }
+                    let document = SettingsBytecode::read_file(&path)?;
+                    let selected = independent_additive_document(&document, service, roots);
+                    if selected.is_none() {
+                        // Keep the decoded document for the ordinary reference
+                        // path too, rather than reading and decoding it again.
+                        narrowed.insert(service.clone(), document);
+                        continue;
+                    }
+                    drop_settings_document(document);
+                    selected
+                };
+                if let Some(document) = selected {
+                    narrowed.insert(service.clone(), document);
+                }
+            }
+            let mut overrides = document_overrides.cloned().unwrap_or_default();
+            overrides.extend(
+                narrowed
+                    .iter()
+                    .map(|(service, document)| (service.clone(), document)),
+            );
             let result = build_rbx_place(
                 &src_root,
                 build_services,
-                document_overrides,
+                Some(&overrides),
                 true,
                 true,
                 false,
             );
+            drop(overrides);
+            for document in narrowed.into_values() {
+                drop_settings_document(document);
+            }
             log_timing("native editor import place build", started);
-            result.and_then(|build| {
-                let pending_groups =
+            result.and_then(|mut build| {
+                // CurrentCamera is role metadata, not a property to apply.
+                // Preserve its logical reference for payload partitioning even
+                // when Roblox's binary serializer omits the property.
+                for (service, root) in &build.service_roots {
+                    if service == "Workspace"
+                        && let Some(camera) =
+                            build
+                                .logical_properties_by_ref
+                                .get(root)
+                                .and_then(|properties| {
+                                    properties.get(&rbx_dom_weak::Ustr::from("CurrentCamera"))
+                                })
+                    {
+                        build
+                            .dom
+                            .get_by_ref_mut(*root)
+                            .context("Export Workspace root is missing")?
+                            .properties
+                            .insert("CurrentCamera".into(), camera.clone());
+                    }
+                }
+                let mut pending_groups =
                     pending_editor_binary_groups(&build.dom, &build.service_roots)?;
-                let desired_package_roots = package_roots_for_groups(&build.dom, &pending_groups);
-                let desired_refs = if build.has_package_links {
-                    let started = Instant::now();
-                    let refs = canonical_rbx_import_refs(&build.dom);
-                    log_timing("package preflight desired canonical paths", started);
-                    Some(refs)
-                } else {
-                    None
-                };
-                let desired_reference_services = desired_refs.as_ref().and_then(|refs| {
-                    desired_package_reference_services(
-                        &build.dom,
-                        &desired_package_roots,
-                        &build.logical_properties_by_ref,
-                        refs,
-                    )
-                });
-                Ok((
-                    build,
-                    desired_refs,
-                    pending_groups,
-                    desired_package_roots,
-                    desired_reference_services,
-                ))
+                for group in &mut pending_groups {
+                    if let Some(roots) = additive_roots.get(&group.service) {
+                        group.additive = true;
+                        group.viewport_camera = None;
+                        group.roots.retain(|root| {
+                            let (segments, _) = rbx_dom_instance_path_parts(&build.dom, *root);
+                            roots.contains(&segments[1])
+                        });
+                    }
+                }
+                pending_groups.retain(|group| !group.additive || !group.roots.is_empty());
+                for (service, roots) in additive_roots {
+                    let found: usize = pending_groups
+                        .iter()
+                        .filter(|group| group.service == *service)
+                        .map(|group| group.roots.len())
+                        .sum();
+                    anyhow::ensure!(
+                        found == roots.len(),
+                        "New native roots were not found in {service}"
+                    );
+                }
+                Ok((build, pending_groups))
             })
         },
-        || capture_editor_package_preflight_live(bridge, &ordered_services, None, false),
+        || {
+            let _trace_context =
+                trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
+            let _trace = crate::app::timing::trace_scope("native.import", "live package preflight");
+            capture_editor_package_preflight_live(
+                bridge,
+                &ordered_services,
+                None,
+                false,
+                Some(additive_roots),
+            )
+        },
     );
-    let (
-        mut build,
-        desired_refs,
-        pending_groups,
-        desired_package_roots,
-        desired_reference_services,
-    ) = build?;
+    stages.next("validate additive-root preflight and service coverage");
+    let (mut build, mut pending_groups) = build?;
     let mut live_preflight = live_preflight?;
+    for group in &mut pending_groups {
+        if group.additive {
+            group.roots.retain(|root| {
+                live_preflight
+                    .absent_roots
+                    .get(&group.service)
+                    .is_some_and(|absent| {
+                        build
+                            .dom
+                            .get_by_ref(*root)
+                            .is_some_and(|instance| absent.contains(&instance.name))
+                    })
+            });
+        }
+    }
+    pending_groups.retain(|group| !group.additive || !group.roots.is_empty());
+    if pending_groups.is_empty() {
+        return Ok(None);
+    }
     if build.service_roots.len() != service_count {
         return Ok(None);
     }
     let phase_started = Instant::now();
+    stages.next("expand package reference preflight if needed");
+    // Canonical reference paths are only used when retaining existing packages.
+    // A source containing packages does not imply that the target has any:
+    // empty targets need neither this whole-place index nor a reference scan.
+    let desired_refs = if build.has_package_links && live_preflight.dom.is_some() {
+        let started = Instant::now();
+        let refs = canonical_rbx_import_refs(&build.dom);
+        log_timing("package preflight desired canonical paths", started);
+        Some(refs)
+    } else {
+        None
+    };
+    let desired_reference_services = desired_refs.as_ref().and_then(|refs| {
+        desired_package_reference_services(
+            &build.dom,
+            &package_roots_for_groups(&build.dom, &pending_groups),
+            &build.logical_properties_by_ref,
+            refs,
+        )
+    });
     let unresolved_desired_references =
         desired_refs.is_some() && desired_reference_services.is_none();
     let missing_reference_service = desired_reference_services
@@ -2039,8 +2686,28 @@ fn build_editor_binary_import_for_services(
             &ordered_services,
             desired_reference_services.as_ref(),
             force_full_snapshot,
+            None,
         )?;
     }
+    // Without live packages, the viewport is the only imported object replaced
+    // by a retained identity. Newly imported packages do not introduce aliases.
+    // Repair viewport references through the exact post-apply plan.
+    stages.next("collect imported identities and externalize cross-boundary references");
+    let viewport_references_post_applied = live_preflight.dom.is_none();
+    let viewport_ref = viewport_references_post_applied
+        .then(|| {
+            build
+                .service_roots
+                .iter()
+                .find(|(service, _)| service == "Workspace")
+        })
+        .flatten()
+        .and_then(|(_, root)| build.dom.get_by_ref(*root))
+        .and_then(|root| {
+            root.properties
+                .get(&rbx_dom_weak::Ustr::from("CurrentCamera"))
+        })
+        .and_then(rbx_variant_referent);
     let mut imported_refs = HashSet::new();
     for group in &pending_groups {
         for root in &group.roots {
@@ -2049,57 +2716,62 @@ fn build_editor_binary_import_for_services(
             imported_refs.extend(subtree);
         }
     }
-    let mut external_reference_properties = Vec::new();
-    let mut post_apply_properties_by_path = HashMap::<String, HashSet<String>>::new();
-    for referent in imported_refs.iter().copied() {
-        let Some(instance) = build.dom.get_by_ref(referent) else {
-            continue;
-        };
-        let external_names = instance
-            .properties
-            .iter()
-            .filter_map(|(name, value)| {
-                let target = rbx_variant_referent(value)?;
-                (!target.is_none() && !imported_refs.contains(&target))
-                    .then(|| name.as_str().to_string())
-            })
-            .collect::<Vec<_>>();
-        let unresolved_names = build.unresolved_reference_properties_by_ref.get(&referent);
-        if external_names.is_empty() && unresolved_names.is_none() {
-            continue;
-        }
-        let (segments, ordinals) = rbx_dom_instance_path_parts(&build.dom, referent);
-        let path_key = instance_path_parts_key(&segments, &ordinals);
-        let post_apply_names = post_apply_properties_by_path.entry(path_key).or_default();
-        post_apply_names.extend(external_names.iter().cloned());
-        if let Some(names) = unresolved_names {
-            post_apply_names.extend(names.iter().map(|name| name.as_str().to_string()));
-        }
-        external_reference_properties
-            .extend(external_names.into_iter().map(|name| (referent, name)));
-    }
-    for (referent, name) in external_reference_properties {
-        if let Some(instance) = build.dom.get_by_ref_mut(referent) {
-            instance
-                .properties
-                .remove(&rbx_dom_weak::Ustr::from(name.as_str()));
-        }
-    }
+    let mut post_apply_properties_by_path = externalize_imported_references(
+        &mut build.dom,
+        &imported_refs,
+        &build.unresolved_reference_properties_by_ref,
+        viewport_ref,
+    );
     build
         .omitted_properties_by_class
         .entry("Model".to_string())
         .or_default()
         .insert("WorldPivot".to_string());
     log_timing("native editor import group preparation", phase_started);
-    let package_plans = plan_editor_package_root_retention(
+    stages.next("plan package retention and bind generation guards");
+    let replacement_groups = pending_groups
+        .iter()
+        .filter(|group| !group.additive)
+        .cloned()
+        .collect::<Vec<_>>();
+    let live_generations = live_preflight.generations.clone();
+    let replacement_package_roots = if build.has_package_links && live_preflight.dom.is_some() {
+        package_roots_for_groups(&build.dom, &replacement_groups)
+    } else {
+        HashSet::new()
+    };
+    let mut replacement_plans = plan_editor_package_root_retention(
         bridge,
         &build.dom,
-        &pending_groups,
-        &desired_package_roots,
+        &replacement_groups,
+        &replacement_package_roots,
         &build.logical_properties_by_ref,
         live_preflight,
         desired_refs,
-    )?;
+    )?
+    .into_iter();
+    let package_plans = pending_groups
+        .iter()
+        .map(|group| {
+            if group.additive {
+                Ok(EditorPackageGroupPlan {
+                    retained_roots: Vec::new(),
+                    package_roots: Vec::new(),
+                    mutation_package_roots: Vec::new(),
+                    change_generation: Some(
+                        *live_generations
+                            .get(&group.service)
+                            .context("New-root import is missing its Studio generation")?,
+                    ),
+                })
+            } else {
+                replacement_plans
+                    .next()
+                    .context("Native replacement plan is missing")
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    stages.next("repair retained-package reference plan");
     let retained_refs = pending_groups
         .iter()
         .zip(&package_plans)
@@ -2178,6 +2850,47 @@ fn build_editor_binary_import_for_services(
         }
     }
     let phase_started = Instant::now();
+    stages.next("partition and encode native service payloads");
+    // Temporary A/B selection while the transaction adapter is integrated.
+    // Existing package and partial-service workflows retain their current path.
+    if allow_service_replacement
+        && package_plans.iter().all(|plan| {
+            plan.retained_roots.is_empty()
+                && plan.package_roots.is_empty()
+                && plan.mutation_package_roots.is_empty()
+        })
+    {
+        let (bytes, groups, native_replacement) = payload::encode_services(
+            &mut build.dom,
+            &build.service_roots,
+            pending_groups,
+            package_plans,
+            &mut post_apply_properties_by_path,
+        )?;
+        let instance_count = native_replacement
+            .batches
+            .iter()
+            .map(|batch| {
+                u32::from_le_bytes(
+                    bytes[batch.bytes.start + 20..batch.bytes.start + 24]
+                        .try_into()
+                        .unwrap(),
+                ) as usize
+            })
+            .sum();
+        log_timing("native editor import service encode", phase_started);
+        return Ok(Some(EditorBinaryImport {
+            bytes,
+            groups,
+            native_replacement: Some(native_replacement),
+            instance_count,
+            post_apply_properties_by_class: build.omitted_properties_by_class,
+            post_apply_properties_by_path,
+            external_references_post_applied: true,
+            viewport_references_post_applied,
+        }));
+    }
+    stages.next("assemble ordinary import wrapper groups");
     let mut groups = Vec::with_capacity(pending_groups.len());
     let mut top_level_refs = Vec::with_capacity(pending_groups.len());
     let mut instance_count = 0usize;
@@ -2232,12 +2945,26 @@ fn build_editor_binary_import_for_services(
             }
         }
         top_level_refs.push(payload_root_ref);
+        let expected_structure = if !pending.additive
+            && pending.target_path.len() == 1
+            && pending.viewport_camera.is_none()
+            && package_plan.retained_roots.is_empty()
+            && package_plan.package_roots.is_empty()
+            && package_plan.mutation_package_roots.is_empty()
+        {
+            payload::expected_structure(&build.dom, payload_root_ref)?
+        } else {
+            None
+        };
         groups.push(EditorBinaryImportGroup {
             service: pending.service,
+            additive: pending.additive,
             target_path: pending.target_path,
             count: pending.roots.len(),
             payload_root_name,
+            expected_structure,
             root_paths,
+            viewport_camera: pending.viewport_camera,
             retained_roots: package_plan.retained_roots,
             package_roots: package_plan.package_roots,
             mutation_package_roots: package_plan.mutation_package_roots,
@@ -2245,6 +2972,7 @@ fn build_editor_binary_import_for_services(
         });
     }
     log_timing("native editor import payload grouping", phase_started);
+    stages.next("encode ordinary binary import");
     let phase_started = Instant::now();
     let mut bytes = Vec::new();
     rbx_binary::to_writer(&mut bytes, &build.dom, &top_level_refs)
@@ -2253,9 +2981,70 @@ fn build_editor_binary_import_for_services(
     Ok(Some(EditorBinaryImport {
         bytes,
         groups,
+        native_replacement: None,
         instance_count,
         post_apply_properties_by_class: build.omitted_properties_by_class,
         post_apply_properties_by_path,
         external_references_post_applied: true,
+        viewport_references_post_applied,
     }))
+}
+#[test]
+fn independent_additions_keep_complete_subtrees_and_reference_additions_keep_the_full_index() {
+    let mut document = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: vec![
+            SettingsBytecodeInstance::new(
+                "root".into(),
+                "ServerStorage".into(),
+                "ServerStorage".into(),
+                None,
+            ),
+            SettingsBytecodeInstance::new(
+                "old".into(),
+                "Existing".into(),
+                "Folder".into(),
+                Some(0),
+            ),
+            SettingsBytecodeInstance::new("new".into(), "Incoming".into(), "Model".into(), Some(0)),
+            SettingsBytecodeInstance::new("child".into(), "Part".into(), "Part".into(), Some(2)),
+        ],
+    };
+    document.instances[3]
+        .properties
+        .insert("Transparency".into(), json!(0.375));
+    document.instances[3]
+        .attributes
+        .insert("Keep".into(), json!(false));
+    let roots = HashSet::from(["Incoming".into()]);
+    let selected = independent_additive_document(&document, "ServerStorage", &roots).unwrap();
+    assert_eq!(selected.instances.len(), 3);
+    assert_eq!(selected.instances[1].settings_id, "new");
+    assert_eq!(selected.instances[2].parent_index, Some(1));
+    assert_eq!(
+        selected.instances[2].properties,
+        document.instances[3].properties
+    );
+    assert_eq!(
+        selected.instances[2].attributes,
+        document.instances[3].attributes
+    );
+    document.instances[2].properties.insert(
+        "PrimaryPart".into(),
+        json!({"_type":"Ref", "settingsId":"child"}),
+    );
+    assert!(independent_additive_document(&document, "ServerStorage", &roots).is_none());
+    document.instances[2].properties.clear();
+    document.instances[0]
+        .properties
+        .insert("Target".into(), json!({"_type":"Ref", "settingsId":"old"}));
+    assert!(independent_additive_document(&document, "ServerStorage", &roots).is_none());
+    assert!(
+        independent_additive_document(
+            &document,
+            "ServerStorage",
+            &HashSet::from(["Missing".into()])
+        )
+        .is_none()
+    );
 }

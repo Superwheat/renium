@@ -156,7 +156,7 @@ pub(crate) fn pid_for_local_tcp_port(port: u16) -> Result<u32> {
 
 #[cfg(target_os = "macos")]
 pub(crate) fn pid_for_local_tcp_port(port: u16) -> Result<u32> {
-    let output = Command::new("lsof")
+    let output = Command::new("/usr/sbin/lsof")
         .args([
             "-nP",
             "-a",
@@ -274,7 +274,7 @@ pub(crate) fn local_tcp_ports_owned_by_pid(pid: u32) -> Vec<u16> {
 
 #[cfg(target_os = "macos")]
 pub(crate) fn local_tcp_ports_owned_by_pid(pid: u32) -> Vec<u16> {
-    let Ok(output) = Command::new("lsof")
+    let Ok(output) = Command::new("/usr/sbin/lsof")
         .args(["-nP", "-a", "-p"])
         .arg(pid.to_string())
         .args(["-iTCP", "-F", "n"])

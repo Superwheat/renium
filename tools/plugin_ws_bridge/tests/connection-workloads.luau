@@ -177,6 +177,56 @@ assert(not returned and resume ~= nil)
 scheduler.spawn(resume)
 assert(returned and destroyedSignals == 3, "yielded cleanup must wake and dispose its signal")
 
+-- Use the shipped method classifications: a profiler read must run during a
+-- yielding commit without admitting another mutation or losing its fences.
+local runtimeSource = fs.readFile("tools/plugin_ws_bridge/BridgePluginRuntime.module.lua")
+local exclusiveMethods = luau.load("return " .. assert(runtimeSource:match("Config.bridgeExclusiveMethods = (%b{})")))()
+local ownedMethods = luau.load("return " .. assert(runtimeSource:match("Config.bridgeSessionOwnedMethods = (%b{})")))()
+local replayMethods = luau.load("return " .. assert(runtimeSource:match("Config.bridgeReplayProtectedMethods = (%b{})")))()
+context.isExclusiveMethod = function(method) return exclusiveMethods[method] == true end
+context.isSessionOwnedMethod = function(method) return ownedMethods[method] == true end
+context.isReplayProtectedMethod = function(method) return replayMethods[method] == true end
+context.setExclusiveSessionGeneration = noop
+local sessionOwned = true
+context.captureSessionLock = function() return if sessionOwned then 1 else nil end
+context.validateSessionLock = function() return sessionOwned end
+local commits, captures = 0, 0
+local suspendedCommit
+context.handleMethod = function(method)
+	if method == "commitEditorTransaction" then
+		commits += 1
+		if commits == 1 then
+			suspendedCommit = coroutine.running()
+			coroutine.yield()
+		end
+	elseif method == "performance" then
+		captures += 1
+	end
+	return { ok = true }
+end
+local socket = sockets[#sockets]
+local function request(id, method, leaseId)
+	socket.MessageReceived:Fire(serde.encode("json", {
+		id = id, session_id = "profile-test", lease_id = leaseId, method = method, params = {},
+	}))
+end
+request(300, "commitEditorTransaction", "commit")
+request(301, "commitEditorTransaction", "next-commit")
+assert(commits == 1 and suspendedCommit ~= nil)
+request(302, "performance", "capture")
+assert(captures == 1 and commits == 1, "profiling must not wait behind or release the mutation queue")
+request(302, "performance", "capture")
+assert(captures == 1, "profiling must remain replay protected")
+config.cancelBridgeRequestLease("revoked-capture")
+request(303, "performance", "revoked-capture")
+assert(captures == 1, "cancelled profiler leases must not execute")
+sessionOwned = false
+request(304, "performance", "lost-owner")
+assert(captures == 1, "profiling must keep its Studio session ownership check")
+sessionOwned = true
+scheduler.spawn(suspendedCommit)
+assert(commits == 2, "the next mutation must resume only after the first completes")
+
 table.clear(timers)
 config.disconnectAll("Disconnected")
 assert(not config.hasOpenChannel() and not config.bridgeConnectRequested)

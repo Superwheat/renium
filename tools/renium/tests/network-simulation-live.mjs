@@ -32,8 +32,12 @@ function set(player, args) {
   return result;
 }
 function rtt(player) {
-  const code = 'local f=game.ReplicatedStorage:FindFirstChild("ReniumNetworkEcho"); assert(f); local start=os.clock(); for i=1,8 do assert(f:InvokeServer()) end; return (os.clock()-start)*1000/8';
-  return run(['lc', code, String(player)]).results[0];
+  // Compare typical round trips; isolated startup stalls can dominate a mean
+  // even when the simulated delay correctly applies to every later request.
+  const code = 'local f=game.ReplicatedStorage:FindFirstChild("ReniumNetworkEcho"); assert(f); local samples={}; for i=1,9 do local start=os.clock(); assert(f:InvokeServer()); samples[i]=(os.clock()-start)*1000 end; table.sort(samples); return {samples[5],samples}';
+  const [medianMs, samplesMs] = run(['lc', code, String(player)]).results[0];
+  console.log(JSON.stringify({phase:'rtt', player, medianMs, samplesMs}));
+  return medianMs;
 }
 try {
   for (const player of [1, 2]) run(['net', 'reset', '-p', String(player)]);

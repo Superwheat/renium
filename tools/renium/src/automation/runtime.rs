@@ -13,7 +13,8 @@ use crate::automation::context as bound_context;
 use crate::automation::local;
 use crate::automation::places;
 use crate::automation::reconcile::{
-    BaselineSide, push_project_delta, selected_push_delta_services, sync_services,
+    BaselineSide, push_project_delta, push_project_replacement, selected_push_delta_services,
+    sync_services,
 };
 use crate::automation::studio_args;
 use crate::automation::{self, op};
@@ -131,6 +132,13 @@ pub(super) fn automation_failure_ref(error: &anyhow::Error) -> automation::Failu
         .collect::<Vec<_>>()
         .join("\n");
     let lower = message.to_ascii_lowercase();
+    if lower.contains("rollback also failed")
+        || lower.contains("did not roll the transaction back")
+        || lower.contains("rollback remains pending")
+        || lower.contains("do not retry the mutation")
+    {
+        return automation::Failure::new("recovery_required", message, false, "context");
+    }
     if lower.contains("timed out") || lower.contains("timeout") {
         let waiting_for_connection = (lower.contains("waiting for")
             && lower.contains("bridge channel"))
@@ -448,13 +456,13 @@ fn pending_change_ack(bridge: &BridgeServer, services: &[String]) -> Result<Opti
     Ok(Some((seq, runtime_id)))
 }
 
-pub(super) fn acknowledge_pulled_changes(
+pub(crate) fn acknowledge_pulled_changes(
     bridge: &BridgeServer,
     services: &[String],
     seq: u64,
     runtime_id: &str,
 ) -> Result<Value> {
-    let result = bridge.call_for_target(
+    let result = bridge.call_for_runtime_with_timeout(
         "getStudioChangeState",
         json!({
             "services": services,
@@ -465,6 +473,8 @@ pub(super) fn acknowledge_pulled_changes(
             "includeAllState": true,
         }),
         BridgeTarget::Edit,
+        runtime_id,
+        None,
     )?;
     ensure_plugin_api_ok(&result)?;
     Ok(result)
@@ -477,6 +487,7 @@ fn compact_push_summary(summary: &Map<String, Value>, parameters: &Value) -> Map
         summary.get("ok").cloned().unwrap_or(Value::Bool(true)),
     );
     for key in [
+        "historyId",
         "skippedByReview",
         "sourceVerified",
         "sourceVerifyFailed",
@@ -535,7 +546,9 @@ fn automation_pull_operation(
     bridge: &BridgeServer,
     bridge_wait_seconds: f64,
 ) -> Result<(Value, PublishedProjectChanges)> {
+    let _trace = crate::app::timing::trace_scope("sync", "pull attempt");
     let target = BridgeTarget::Main;
+    let prepare = crate::app::timing::trace_scope("sync", "pull target and pending changes");
     bridge.wait_for_all_target(bridge_wait_seconds, target)?;
     let info = bridge.cached_bridge_info_for_target(target)?;
     let args = automation_pull_args(context, parameters, true)?;
@@ -543,8 +556,10 @@ fn automation_pull_operation(
     let parsed_services = parse_services(&services)?;
     let pending_ack = pending_change_ack(bridge, &parsed_services)?;
     let acknowledged_pending = pending_ack.is_some();
+    drop(prepare);
     let published = export_snapshots_with_warm_bridge(args, bridge, &info, 0.0, false, false)?;
     if let Some((seq, runtime_id)) = pending_ack {
+        let _trace = crate::app::timing::trace_scope("sync", "acknowledge pulled changes");
         acknowledge_pulled_changes(bridge, &parsed_services, seq, &runtime_id)?;
     }
     Ok((
@@ -971,7 +986,10 @@ fn studio_status_result(
         available.push("Client");
     }
     result["availableDataModels"] = json!(available);
-    result["playState"] = json!(if controller_play_starting == Some(true) {
+    // The Edit DataModel remains stopped during a separate server test. Once its
+    // current server connects, the launch is running even if the controller still reports starting.
+    let has_server = clients.iter().any(|client| client["role"] == "play-server");
+    result["playState"] = json!(if controller_play_starting == Some(true) && !has_server {
         "starting"
     } else if controller_play_running == Some(true) {
         "running"
@@ -1050,6 +1068,34 @@ fn automation_dispatch_operation(
     if operation == op::STUDIO_STATUS {
         return Ok(studio_status_result(context, parameters, bridge));
     }
+    if matches!(
+        operation,
+        op::LIVE_START | op::LIVE_STOP | op::LIVE_STATUS | op::RETRY_PENDING | op::DISCARD_PENDING
+    ) {
+        return studio_change_state_result(
+            studio_args::live(operation, parameters)?,
+            bridge,
+            context
+                .runtime_id
+                .as_deref()
+                .context("No bound Edit runtime")?,
+        );
+    }
+    if operation == op::PERFORMANCE_MONITOR
+        && crate::studio::automation::monitor::is_edit_request(parameters)
+    {
+        return crate::studio::automation::monitor::result(
+            parameters,
+            bridge,
+            bridge_wait_seconds,
+            Some(
+                context
+                    .runtime_id
+                    .as_deref()
+                    .context("No bound Edit runtime")?,
+            ),
+        );
+    }
     let _selection = select_bridge_context(context, bridge);
     match operation {
         op::PULL => automation_pull_operation(context, parameters, bridge, bridge_wait_seconds)
@@ -1065,27 +1111,17 @@ fn automation_dispatch_operation(
         op::PUSH => {
             bridge.wait_for_all_target(bridge_wait_seconds, BridgeTarget::Main)?;
             let args = automation_push_args(context, parameters, reviewed)?;
-            let delta_services = if push_is_filtered(parameters) {
-                selected_push_delta_services(context, &args)?
-            } else {
-                Some(sync_services())
-            };
+            if !push_is_filtered(parameters) {
+                let summary = push_project_replacement(context, bridge, &sync_services(), args)?;
+                return Ok(Value::Object(compact_push_summary(&summary, parameters)));
+            }
+            let delta_services = selected_push_delta_services(context, &args)?;
             if let Some(services) = delta_services {
                 let summary = push_project_delta(context, bridge, &services, args, None)?;
                 return Ok(Value::Object(compact_push_summary(&summary, parameters)));
             }
             let summary = push_editor_changes_with_warm_bridge(args, bridge)?;
             Ok(Value::Object(compact_push_summary(&summary, parameters)))
-        }
-        op::LIVE_START
-        | op::LIVE_STOP
-        | op::LIVE_STATUS
-        | op::RETRY_PENDING
-        | op::DISCARD_PENDING => {
-            if operation != op::LIVE_STATUS {
-                bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Edit)?;
-            }
-            studio_change_state_result(studio_args::live(operation, parameters)?, bridge)
         }
         op::SET_PROPERTY if parameters.get("editor").and_then(Value::as_bool) == Some(true) => {
             bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Main)?;
@@ -1169,9 +1205,12 @@ fn automation_dispatch_operation(
         op::NETWORK_SIMULATION => {
             crate::studio::automation::network::result(parameters, bridge, bridge_wait_seconds)
         }
-        op::PERFORMANCE_MONITOR => {
-            crate::studio::automation::monitor::result(parameters, bridge, bridge_wait_seconds)
-        }
+        op::PERFORMANCE_MONITOR => crate::studio::automation::monitor::result(
+            parameters,
+            bridge,
+            bridge_wait_seconds,
+            None,
+        ),
         #[cfg(any(windows, target_os = "macos"))]
         op::PACKAGE_DESYNC | op::PACKAGE_PUBLISH | op::PACKAGE_UPDATE => {
             package_action_result(operation, parameters, bridge, bridge_wait_seconds)
@@ -1268,7 +1307,7 @@ fn automation_retry_is_safe(
     failure.0.rt == 1
         && (operation != op::CONSOLE
             || parameters.get("clear").and_then(Value::as_bool) != Some(true))
-        && (matches!(
+        && matches!(
             operation,
             op::FIND
                 | op::TREE
@@ -1281,7 +1320,17 @@ fn automation_retry_is_safe(
                 | op::CONSOLE
                 | op::UI
                 | op::JOB_STATUS
-        ) || failure.0.c == "conflict" && operation == op::PUSH)
+        )
+}
+
+fn operation_failure(operation: u16, error: anyhow::Error) -> automation::Failure {
+    let mut failure = automation_failure(error);
+    if operation == op::PUSH && failure.0.c == "conflict" {
+        // Successful rollback preserves the outside edit. Replaying a full
+        // replacement against that new baseline would overwrite it again.
+        failure.0.rt = 0;
+    }
+    failure
 }
 
 fn automation_dispatch_with_retry(
@@ -1316,10 +1365,17 @@ fn automation_dispatch_with_retry(
         bridge_wait_seconds,
         reviewed,
     )
-    .map_err(automation_failure)
+    .map_err(|error| operation_failure(operation, error))
     .and_then(check_result);
     match first {
         Err(failure) if automation_retry_is_safe(operation, parameters, &failure) => {
+            log_global(
+                4,
+                format_args!(
+                    "[renium] retrying automation op={operation}: {}: {}",
+                    failure.0.c, failure.0.m,
+                ),
+            );
             automation_dispatch_operation(
                 operation,
                 context,
@@ -1328,7 +1384,7 @@ fn automation_dispatch_with_retry(
                 bridge_wait_seconds,
                 reviewed,
             )
-            .map_err(automation_failure)
+            .map_err(|error| operation_failure(operation, error))
             .and_then(check_result)
         }
         result => result,
@@ -1425,6 +1481,13 @@ fn automation_dispatch_managed(
             .map_err(automation_failure);
         let pulled = match first {
             Err(failure) if failure.0.rt == 1 => {
+                log_global(
+                    4,
+                    format_args!(
+                        "[renium] retrying pull after {}: {}",
+                        failure.0.c, failure.0.m
+                    ),
+                );
                 automation_pull_operation(context, parameters, bridge, bridge_wait_seconds)
                     .map_err(automation_failure)
             }
@@ -1474,6 +1537,8 @@ fn automation_dispatch_managed(
             .collect::<Vec<_>>();
         if writes_project {
             if operation == op::PULL {
+                let _trace =
+                    crate::app::timing::trace_scope("sync", "pull reconcile and resume watcher");
                 let published = published
                     .context("Pull did not return published project changes")
                     .map_err(automation_failure)?;
@@ -1909,6 +1974,7 @@ fn automation_live_operation(
         return Ok(compact_live_status(json!({
             "ok": true,
             "busy": true,
+            "runtimeId": context.runtime_id,
             "daemon": daemon,
         })));
     }
@@ -2513,12 +2579,19 @@ fn automation_execute_request(
                     bridge_wait_seconds,
                 );
             }
-            if matches!(operation.id, op::ASSET_SEARCH | op::IMAGE_UPLOAD) {
+            if operation.id == op::ASSET_SEARCH {
+                return crate::cloud::assets::search(
+                    &request.p,
+                    context
+                        .runtime_id
+                        .as_deref()
+                        .map(|runtime| (bridge.as_ref(), runtime)),
+                );
+            }
+            if operation.id == op::IMAGE_UPLOAD {
                 let _selection = bound_context::select(&context);
                 bridge.clear_runtime_pins();
-                return if operation.id == op::ASSET_SEARCH {
-                    crate::cloud::assets::search(&request.p, Some(bridge))
-                } else if crate::cloud::assets::studio_upload(&request.p) {
+                return if crate::cloud::assets::studio_upload(&request.p) {
                     bridge
                         .wait_for_target(bridge_wait_seconds, BridgeTarget::Edit)
                         .map_err(automation_failure)?;
@@ -2678,7 +2751,24 @@ fn automation_response(
     request_lease: Option<Arc<BridgeRequestLease>>,
 ) -> automation::Response {
     let started = Instant::now();
-    let queued = automation::opcode_by_id(request.op).is_ok_and(|operation| operation.queued);
+    let operation = automation::opcode_by_id(request.op).ok();
+    let _trace_context = crate::app::output::global_log_enabled(5).then(|| {
+        crate::app::timing::enter_trace_context(Some(crate::app::timing::TraceContext {
+            request_id: request.id,
+            context_id: request.cx,
+        }))
+    });
+    let _trace = crate::app::timing::trace_scope(
+        "daemon",
+        operation.map_or("invalid request", |operation| operation.name),
+    );
+    let mut stages = crate::app::timing::trace_stages(
+        "daemon.stage",
+        "authenticate operation and select scheduling policy",
+    );
+    let queued = operation.is_some_and(|operation| operation.queued)
+        && !(request.op == op::PERFORMANCE_MONITOR
+            && crate::studio::automation::monitor::is_edit_request(&request.p));
     let cancelled = |error: anyhow::Error| {
         automation::Failure::new("cancelled", error.to_string(), false, "retry")
     };
@@ -2698,7 +2788,13 @@ fn automation_response(
                     )
                 })?;
         }
-        restore_persisted_live_sync_for_request(&request, state, bridge, bridge_wait_seconds)?;
+        {
+            stages.next("restore persisted Live Sync for selected project");
+            let _trace = crate::app::timing::trace_scope("daemon", "restore live sync");
+            restore_persisted_live_sync_for_request(&request, state, bridge, bridge_wait_seconds)?;
+        }
+        stages.next("wait for selected runtime mutation gate");
+        let gate_wait = crate::app::timing::trace_scope("wait", "daemon request gate");
         let _request_guard = if queued {
             Some(match request_lease.as_deref() {
                 Some(lease) => bridge
@@ -2709,6 +2805,8 @@ fn automation_response(
         } else {
             None
         };
+        drop(gate_wait);
+        stages.next("activate request lease");
         let _lease_guard = match request_lease.as_ref() {
             Some(lease) => Some(
                 bridge
@@ -2717,7 +2815,9 @@ fn automation_response(
             ),
             None => None,
         };
+        stages.next("resolve context and execute operation");
         let result = automation_execute_request(&request, state, bridge, bridge_wait_seconds);
+        stages.next("verify lease and release runtime mutation gate");
         if result.is_ok()
             && let Some(lease) = request_lease.as_deref()
         {
@@ -2725,6 +2825,7 @@ fn automation_response(
         }
         result
     })();
+    stages.next("build daemon response and attach update status");
     let response = match result {
         Ok(result) => automation::Response::success(request.id, started, result),
         Err(failure) => {
@@ -2831,7 +2932,11 @@ mod tests {
         let rolled_back = automation_failure(anyhow::anyhow!(
             "Studio changed ReplicatedStorage while the filesystem transaction was staged; retry the sync"
         ));
-        assert!(automation_retry_is_safe(op::PUSH, &json!({}), &rolled_back));
+        assert!(!automation_retry_is_safe(
+            op::PUSH,
+            &json!({}),
+            &rolled_back
+        ));
         assert!(!automation_retry_is_safe(
             op::LUAU,
             &json!({}),
@@ -2852,6 +2957,16 @@ mod tests {
         ));
         assert_eq!(project.0.c, "conflict");
         assert_eq!(project.0.rt, 0);
+
+        let push = operation_failure(
+            op::PUSH,
+            anyhow::anyhow!(
+                "Studio rolled the transaction back before its commit response was received: Studio changed ReplicatedStorage while the filesystem transaction was staged; retry the sync"
+            ),
+        );
+        assert_eq!(push.0.c, "conflict");
+        assert_eq!(push.0.rt, 0);
+        assert!(!automation_retry_is_safe(op::PUSH, &json!({}), &push));
     }
 
     #[test]

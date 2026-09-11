@@ -5,6 +5,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use ahash::AHashMap;
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -19,16 +20,18 @@ use crate::app::output::{ensure_plugin_api_ok, global_log_enabled, log_global};
 use crate::app::timing::elapsed_ms;
 use crate::cli::PushEditorChangesArgs;
 use crate::editor::diff::editor_instance_descriptor_for_known_path;
+use crate::editor::document::is_protected_engine_container;
 use crate::editor::paths::{
     build_editor_instance_paths_for_indices, build_editor_source_paths_by_index,
 };
-use crate::editor::review::local_place_path_for_runtime;
+use crate::editor::review::{is_externally_managed_editor_property, local_place_path_for_runtime};
 use crate::editor::sync::{
     StudioChangeGuard, expand_editor_changed_paths, is_lua_source_class,
     push_reconciled_editor_changes_with_warm_bridge, settings_file_hash,
 };
 use crate::editor::types::{
     EditorChangeSet, EditorInstanceChange, EditorInstancePath, EditorPropertyChange,
+    PreparedEditorDocuments,
 };
 use crate::project::version_control::{VcMergeConflict, merge_aligned_settings_documents};
 use crate::project::{config, config::project_watch_inputs};
@@ -48,8 +51,10 @@ use crate::settings::equivalence::{
     stabilize_settings_reference_ids,
 };
 use crate::snapshot::export::{
-    ExportProjectStage, PublishEntryState, export_snapshots_with_warm_bridge,
+    ExportProjectStage, PublishEntryState, capture_exported_services,
+    export_snapshots_with_warm_bridge,
 };
+use crate::snapshot::import::service_projection_in_memory;
 use crate::snapshot::refs::remap_record_reference_ids;
 use crate::studio::bridge::{BridgeServer, BridgeTarget};
 use crate::system::files::{
@@ -57,6 +62,7 @@ use crate::system::files::{
     is_service_settings_file_name, service_settings_path,
 };
 
+pub(crate) mod history;
 mod store;
 
 use store::StoredSnapshot;
@@ -65,6 +71,7 @@ const RECORD_VERSION: u8 = 2;
 const RECORD_DIR: &str = "reconcile";
 
 fn log_reconcile_timing(label: &str, started: Instant) {
+    crate::app::timing::trace_timing("reconcile", label, started);
     log_global(
         4,
         format_args!("[renium] reconcile {label}: {:.1}ms", elapsed_ms(started)),
@@ -295,8 +302,162 @@ struct ProjectSnapshot {
     entries: BTreeMap<PathBuf, SnapshotEntry>,
 }
 
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) struct VerifiedFullPush {
+    pub(crate) connections: Vec<usize>,
+    input: Value,
+    project: ProjectSnapshot,
+    paths: Vec<PathBuf>,
+    proof: Value,
+    created: Instant,
+    #[cfg(windows)]
+    _attributes: crate::studio::native::serializer::AttributeGuard,
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+impl VerifiedFullPush {
+    pub(crate) fn expired(&self) -> bool {
+        self.created.elapsed() >= Duration::from_secs(60)
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) type VerifiedFullPushCache = Arc<Mutex<HashMap<String, VerifiedFullPush>>>;
+
+#[cfg(any(windows, target_os = "macos"))]
+fn full_push_cache_input(args: &PushEditorChangesArgs, services: &[String]) -> Result<Value> {
+    let loaded = config::try_load_project(None, Some(&args.project.project_root))?;
+    Ok(json!({
+        "root": args.project.project_root, "source": args.project.src_root, "services": services,
+        "paths": args.paths, "changedPaths": args.changed_paths, "changedPathFiles": args.changed_paths_files,
+        "ids": args.target_settings_ids, "idFiles": args.target_settings_id_files, "properties": args.target_properties,
+        "upsert": args.upsert_instances_only, "probe": args.probe_events, "verify": args.verify_sources,
+        "linkCache": args.link_cache_dir, "overridePackages": args.override_packages,
+        "configuration": loaded.as_ref().map(|loaded| &loaded.project),
+    }))
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn try_verified_full_push(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+    services: &[String],
+    args: &PushEditorChangesArgs,
+) -> Result<bool> {
+    let Some(runtime) = context.runtime_id.as_deref() else {
+        return Ok(false);
+    };
+    // Take ownership before any RPC or native cleanup: another place must not
+    // wait behind this place's verification or an expired observer's teardown.
+    let cached = bridge
+        .verified_full_pushes
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(runtime);
+    let Some(cached) = cached else {
+        return Ok(false);
+    };
+    let invalidated_by = if cached.expired() {
+        Some("proof expired")
+    } else if cached.connections != bridge.runtime_connection_signature(runtime) {
+        Some("Studio connection changed")
+    } else if cached.input != full_push_cache_input(args, services)? {
+        Some("push configuration changed")
+    } else if cached.project != capture_snapshot(&args.project.project_root, &cached.paths)? {
+        Some("source files changed")
+    } else {
+        None
+    };
+    if let Some(reason) = invalidated_by {
+        log_global(5, format_args!("[renium] full push cache miss: {reason}"));
+        return Ok(false);
+    }
+    pin_edit_runtime(context, bridge)?;
+    let state = bridge.call_for_runtime_with_timeout(
+        "getStudioChangeState",
+        json!({"start": false, "verifyPushProof": cached.proof}),
+        BridgeTarget::Edit,
+        runtime,
+        Some(Duration::from_secs(10)),
+    )?;
+    ensure_plugin_api_ok(&state)?;
+    if state["pushProofMatches"] != true {
+        log_global(
+            5,
+            format_args!(
+                "[renium] full push cache miss: {}",
+                state["pushProofMismatch"]
+                    .as_str()
+                    .unwrap_or("Studio proof unavailable")
+            ),
+        );
+        return Ok(false);
+    }
+    bridge
+        .verified_full_pushes
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(runtime.to_string(), cached);
+    Ok(true)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn retain_verified_full_push(
+    bridge: &BridgeServer,
+    input: Option<&Value>,
+    paths: &[PathBuf],
+    project: ProjectSnapshot,
+    release: &StudioTrackingGuardRelease<'_>,
+    #[cfg(windows)] attributes: &mut Option<crate::studio::native::serializer::AttributeGuard>,
+) {
+    let (Some(input), Some(proof)) = (input, release.retained_proof.as_ref()) else {
+        return;
+    };
+    #[cfg(windows)]
+    let Some(attributes) = attributes.take() else {
+        return;
+    };
+    let cached = VerifiedFullPush {
+        connections: bridge.runtime_connection_signature(&release.runtime_id),
+        input: input.clone(),
+        project,
+        paths: paths.to_vec(),
+        proof: proof.clone(),
+        created: Instant::now(),
+        #[cfg(windows)]
+        _attributes: attributes,
+    };
+    let evicted = {
+        let mut entries = bridge
+            .verified_full_pushes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let expired = entries
+            .iter()
+            .filter(|(_, value)| value.created.elapsed() >= Duration::from_secs(60))
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        let mut evicted = expired
+            .into_iter()
+            .filter_map(|key| entries.remove(&key))
+            .collect::<Vec<_>>();
+        if entries.len() >= 8
+            && let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, value)| value.created)
+                .map(|(key, _)| key.clone())
+        {
+            evicted.extend(entries.remove(&oldest));
+        }
+        evicted.extend(entries.insert(release.runtime_id.clone(), cached));
+        evicted
+    };
+    drop(evicted);
+}
+
 #[derive(Default)]
 struct ReconcilePushPlan {
+    initial_native_services: HashSet<String>,
     changed_paths: Vec<PathBuf>,
     target_settings_ids: Vec<String>,
     recreated_settings_ids: HashSet<String>,
@@ -305,11 +466,18 @@ struct ReconcilePushPlan {
     instance_deletes: Vec<EditorInstanceChange>,
     property_removals: Vec<EditorPropertyChange>,
     geometry_properties: HashMap<(String, String), Vec<String>>,
+    attribute_only_instances: HashSet<(String, String)>,
+    in_place_instances: HashSet<(String, String)>,
 }
 
 struct PreparedEditorSettingsChange {
     previous: SettingsBytecode,
     current: SettingsBytecode,
+}
+
+struct PreparedPushVerification {
+    previous: SettingsBytecode,
+    desired: Arc<SettingsBytecode>,
 }
 
 #[derive(Default)]
@@ -792,7 +960,8 @@ impl Coordinator {
         let mut record = load_record(context, &setup.key)?
             .context("Reconciliation state disappeared while starting Live Sync")?;
         let _selection = bound_context::select(context);
-        let (studio_guard, studio_state) = current_studio_change_guard_with_state(context, bridge)?;
+        let (studio_guard, studio_state) =
+            current_studio_change_guard_with_state(context, bridge, None, |_| Ok(()))?;
         if setup.runtime_replacement_unproven && setup.resolution_preference.is_none() {
             setup.mode = PairMode::Verify;
             setup.error = Some(
@@ -1033,6 +1202,7 @@ impl Coordinator {
             return Ok(());
         }
 
+        let mut sync_history = None;
         let _readback = if changes.studio.is_empty() {
             if !changes.editor.is_empty() {
                 publish_captured_studio(context, bridge, stage, &studio_guard)?;
@@ -1049,6 +1219,12 @@ impl Coordinator {
                 studio
             } else {
                 let phase = Instant::now();
+                sync_history = Some(history::SyncHistory::begin(
+                    Path::new(&context.root),
+                    &bound_context::source_dir(context)?,
+                    &studio,
+                    &changes.studio,
+                )?);
                 apply_snapshot_paths(&stage.project_root, &changes.studio, &merged)?;
                 log_reconcile_timing("staged project write", phase);
                 let phase = Instant::now();
@@ -1133,6 +1309,11 @@ impl Coordinator {
 
         let phase = Instant::now();
         let baseline = capture_snapshot(Path::new(&context.root), &publish_paths)?;
+        if let Some(history) = sync_history {
+            // Readback publication can normalize generated settings. Guard undo
+            // against those accepted file bytes, not the earlier staged bytes.
+            history.commit(&baseline, &ProjectSnapshot::default())?;
+        }
         record.baseline = Some(StoredSnapshot::write(
             Path::new(&context.root),
             &setup.key,
@@ -1384,6 +1565,8 @@ impl Coordinator {
             &current,
             &changed,
             &prepared_settings,
+            false,
+            false,
         )?;
         log_reconcile_timing("incremental push plan", phase);
         let phase = Instant::now();
@@ -1392,7 +1575,7 @@ impl Coordinator {
         for (path, change) in prepared_settings {
             let service = settings_service_name(&path, &change.current, &change.previous)?;
             previous_documents.push(change.previous);
-            prepared_documents.insert(service, change.current);
+            prepared_documents.insert(service, Arc::new(change.current));
         }
         for document in previous_documents {
             drop_settings_document(document);
@@ -1411,7 +1594,11 @@ impl Coordinator {
             .transpose()?
             .unwrap_or(false);
         let stage = if requires_stage {
-            ExportProjectStage::create(root, &source, &[])?
+            ExportProjectStage::create(
+                root,
+                &source,
+                &services_for_snapshot_paths(context, &changed),
+            )?
         } else {
             ExportProjectStage::create_for_comparison(root, &source, &[])?
         };
@@ -1421,7 +1608,11 @@ impl Coordinator {
         apply_snapshot_paths(&stage.project_root, &changed, &current)?;
         log_reconcile_timing("incremental staged write", phase);
         let phase = Instant::now();
-        let StagedPushResult { generated, summary } = push_staged_project(
+        let history = history::SyncHistory::begin(root, &source, &previous, &changed)?;
+        let StagedPushResult {
+            generated,
+            mut summary,
+        } = push_staged_project(
             context,
             &stage,
             bridge,
@@ -1433,6 +1624,10 @@ impl Coordinator {
                 expected_project: None,
             },
         )?;
+        summary.insert(
+            "historyId".into(),
+            Value::String(history.commit(&current, &generated)?),
+        );
         log_reconcile_timing("incremental Studio push", phase);
         let phase = Instant::now();
         drop(stage);
@@ -1538,13 +1733,16 @@ fn supporting_settings_scopes(
     paths: &HashSet<PathBuf>,
 ) -> Result<Vec<PathBuf>> {
     let root = Path::new(&context.root);
-    let source = Path::new(&context.source)
-        .strip_prefix(root)
-        .context("Project source is outside its root")?;
-    Ok(services_for_snapshot_paths(context, paths)
+    let source = Path::new(&context.source);
+    services_for_snapshot_paths(context, paths)
         .into_iter()
-        .map(|service| service_settings_path(&source.join(service)))
-        .collect())
+        .map(|service| {
+            service_settings_path(&source.join(service))
+                .strip_prefix(root)
+                .map(Path::to_path_buf)
+                .context("Supporting store is outside its project root")
+        })
+        .collect()
 }
 
 fn baseline_scopes(context: &BoundContext, paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
@@ -1653,10 +1851,14 @@ fn prepare_editor_settings_changes(
                 || editor_settings_document(previous.entries.get(&path)),
                 || editor_settings_document(current.entries.get(&path)),
             );
-            let change = PreparedEditorSettingsChange {
+            let mut change = PreparedEditorSettingsChange {
                 previous: previous_document?,
                 current: current_document?,
             };
+            crate::settings::equivalence::inherit_workspace_viewport_reference(
+                &mut change.current,
+                &change.previous,
+            );
             log_reconcile_timing("incremental settings decode", phase);
             let phase = Instant::now();
             validate_package_link_documents(&path, &change.previous, &change.current)?;
@@ -2008,6 +2210,8 @@ struct StudioTrackingGuardRelease<'a> {
     bridge: &'a BridgeServer,
     runtime_id: String,
     guard_id: Option<String>,
+    proof: Option<Value>,
+    retained_proof: Option<Value>,
 }
 
 impl StudioTrackingGuardRelease<'_> {
@@ -2041,6 +2245,7 @@ fn acknowledge_verified_push(
     bridge: &BridgeServer,
     services: &[String],
     guard: &StudioChangeGuard,
+    tracking_release: &mut StudioTrackingGuardRelease<'_>,
 ) -> Result<()> {
     let result = bridge.call_for_runtime_with_timeout(
         "getStudioChangeState",
@@ -2049,48 +2254,87 @@ fn acknowledge_verified_push(
             "start": false,
             "ackSeq": guard.change_seq,
             "runtimeId": guard.runtime_id,
+            "releaseTrackingGuardId": tracking_release.guard_id,
+            "retainPushProof": tracking_release.proof,
         }),
         BridgeTarget::Edit,
         &guard.runtime_id,
         Some(Duration::from_secs(10)),
     )?;
-    ensure_plugin_api_ok(&result)
+    ensure_plugin_api_ok(&result)?;
+    tracking_release.guard_id = None;
+    tracking_release.retained_proof = result
+        .get("retainedPushProof")
+        .filter(|value| !value.is_null())
+        .cloned();
+    Ok(())
 }
 
 fn current_studio_change_guard_with_state(
     context: &BoundContext,
     bridge: &BridgeServer,
+    native_attribute_services: Option<&[String]>,
+    arm_native: impl FnOnce(&Value) -> Result<()>,
 ) -> Result<(StudioChangeGuard, Value)> {
     let runtime_id = context
         .runtime_id
         .as_deref()
         .context("Studio context has no edit-mode runtime")?;
-    let initial = read_studio_change_state(context, bridge)?;
-    if initial["tracking"].as_bool() == Some(true) {
-        let guard = studio_change_guard_from_state(context, &initial)?;
-        return Ok((guard, initial));
-    }
+    // Acquire the lease and return its initial state atomically. A separate
+    // read-then-start costs a round trip and races another tracking client.
+    pin_edit_runtime(context, bridge)?;
     let guard_id = format!(
         "push-{}-{}-{}",
         std::process::id(),
         runtime_id,
         crate::app::timing::current_millis()
     );
-    let state = bridge.call_for_runtime_with_timeout(
+    let mut state = bridge.call_for_runtime_with_timeout(
         "getStudioChangeState",
         json!({
             "start": true,
             "trackingGuardId": guard_id,
             "includeGenerations": true,
+            "nativeAttributeRelay": cfg!(windows) && native_attribute_services.is_some(),
+            "deferNativeTracking": cfg!(windows) && native_attribute_services.is_some(),
+            "captureLocalPushProof": cfg!(target_os = "macos") && native_attribute_services.is_some(),
+            "services": native_attribute_services,
+            "capturePushProof": true,
         }),
         BridgeTarget::Edit,
         runtime_id,
         Some(Duration::from_secs(10)),
     )?;
+    let mut release = StudioTrackingGuardRelease {
+        bridge,
+        runtime_id: runtime_id.to_string(),
+        guard_id: Some(guard_id.clone()),
+        proof: None,
+        retained_proof: None,
+    };
     ensure_plugin_api_ok(&state)?;
+    let tracking_started = state["trackingStarted"].as_bool() != Some(false);
+    arm_native(&state)?;
+    if state["nativeTrackingDeferred"] == true {
+        // The native handshake starts tracking with attribute observation already
+        // armed. If discovery failed, this call starts ordinary local listeners.
+        // In either case this is the initial, fully observed generation fence.
+        state = bridge.call_for_runtime_with_timeout(
+            "getStudioChangeState",
+            json!({"start": true, "trackingGuardId": guard_id, "includeGenerations": true, "capturePushProof": true}),
+            BridgeTarget::Edit,
+            runtime_id,
+            Some(Duration::from_secs(10)),
+        )?;
+        ensure_plugin_api_ok(&state)?;
+    }
     let mut guard = studio_change_guard_from_state(context, &state)?;
     guard.tracking_guard_id = Some(guard_id);
-    guard.runtime_bootstrap_safe = false;
+    if tracking_started || state["trackingStarted"].as_bool() != Some(false) {
+        // Older plugins do not distinguish pre-existing tracking from startup.
+        guard.runtime_bootstrap_safe = false;
+    }
+    release.guard_id = None;
     Ok((guard, state))
 }
 
@@ -2098,7 +2342,8 @@ fn current_studio_change_guard(
     context: &BoundContext,
     bridge: &BridgeServer,
 ) -> Result<StudioChangeGuard> {
-    current_studio_change_guard_with_state(context, bridge).map(|(guard, _)| guard)
+    current_studio_change_guard_with_state(context, bridge, None, |_| Ok(()))
+        .map(|(guard, _)| guard)
 }
 
 fn studio_guard_matches_state(
@@ -2234,10 +2479,16 @@ fn capture_changed_studio_services(
     let source = Path::new(&context.source)
         .strip_prefix(root)
         .context("Project source is outside its root")?;
-    let scopes = services
-        .iter()
-        .map(|service| source.join(service))
-        .collect::<Vec<_>>();
+    let mut scopes = Vec::new();
+    for service in services {
+        scopes.push(source.join(service));
+        scopes.push(
+            service_settings_path(&Path::new(&context.source).join(service))
+                .strip_prefix(root)
+                .context("Selective capture store is outside its project root")?
+                .to_path_buf(),
+        );
+    }
     let all_services = sync_services();
     let src_dir = bound_context::source_dir(context)?;
     let stage = ExportProjectStage::create(root, &src_dir, &all_services)?;
@@ -2289,16 +2540,94 @@ pub(crate) fn push_project_delta(
     push_args: PushEditorChangesArgs,
     guard: Option<&StudioChangeGuard>,
 ) -> Result<Map<String, Value>> {
+    push_project(context, bridge, services, push_args, guard, false)
+}
+
+pub(crate) fn push_project_replacement(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+    services: &[String],
+    push_args: PushEditorChangesArgs,
+) -> Result<Map<String, Value>> {
+    let replace = crate::editor::sync::native_editor_full_push_eligible(&push_args)?;
+    push_project(context, bridge, services, push_args, None, replace)
+}
+
+fn push_project(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+    services: &[String],
+    push_args: PushEditorChangesArgs,
+    guard: Option<&StudioChangeGuard>,
+    replace: bool,
+) -> Result<Map<String, Value>> {
+    let _trace = crate::app::timing::trace_scope("sync", "full push");
+    #[cfg(any(windows, target_os = "macos"))]
+    if replace && guard.is_none() && try_verified_full_push(context, bridge, services, &push_args)?
+    {
+        return Ok(Map::from_iter([
+            ("ok".into(), json!(true)),
+            ("unchanged".into(), json!(true)),
+        ]));
+    }
+    #[cfg(any(windows, target_os = "macos"))]
+    let cache_input = if replace && guard.is_none() {
+        Some(full_push_cache_input(&push_args, services)?)
+    } else {
+        None
+    };
+    #[cfg(windows)]
+    let mut _native_attributes = None;
+    let mut stages = crate::app::timing::trace_stages("push.stage", "acquire Studio change guard");
     let phase = Instant::now();
-    let guard = guard
-        .cloned()
-        .map_or_else(|| current_studio_change_guard(context, bridge), Ok)?;
+    let (mut guard, initial_state) = if let Some(guard) = guard {
+        (guard.clone(), Value::Null)
+    } else {
+        current_studio_change_guard_with_state(
+            context,
+            bridge,
+            (cfg!(any(windows, target_os = "macos")) && replace).then_some(services),
+            |state| {
+                #[cfg(windows)]
+                if let Some(path) = state
+                    .get("nativeAttributeRelay")
+                    .filter(|value| !value.is_null())
+                {
+                    let path = serde_json::from_value::<Vec<String>>(path.clone())?;
+                    let pid = crate::editor::review::studio_pid_for_bridge(bridge)?;
+                    let title = crate::editor::review::studio_title_for_bridge(bridge, pid)?;
+                    match crate::studio::native::serializer::begin_attribute_relay(
+                        pid,
+                        &title,
+                        services,
+                        Duration::from_secs(120),
+                        &path,
+                    ) {
+                        Ok(observation) => _native_attributes = Some(observation),
+                        Err(error) => log_global(
+                            5,
+                            format_args!("[renium] native attribute relay unavailable: {error:#}"),
+                        ),
+                    }
+                }
+                #[cfg(not(windows))]
+                let _ = state;
+                Ok(())
+            },
+        )?
+    };
     log_reconcile_timing("full push guard", phase);
+    stages.next("prepare snapshot stage and read project configuration");
     let phase = Instant::now();
+    // Declared before the tracking lease so unwinding releases Lua tracking
+    // before native observation. On cancellation the native guard can promote
+    // surviving listeners before disconnecting its shared signal.
     let mut tracking_release = StudioTrackingGuardRelease {
         bridge,
         runtime_id: guard.runtime_id.clone(),
         guard_id: guard.tracking_guard_id.clone(),
+        proof: None,
+        retained_proof: None,
     };
     let src_dir = push_args.project.src_root.clone();
     let root = push_args.project.project_root.clone();
@@ -2312,43 +2641,177 @@ pub(crate) fn push_project_delta(
     } else {
         ExportProjectStage::create_for_comparison(&root, &src_dir, services)?
     };
-    let (stage, studio) =
-        capture_studio_services_with_stage(context, bridge, services, false, stage)?;
-    let project = capture_snapshot(&root, stage.publish_paths())?;
+    stages.next("capture current Studio services and source files");
+    let source_paths = stage.publish_paths().to_vec();
+    let trace_context = crate::app::timing::trace_context();
+    // Source capture is read-only and independent of the private Studio stage.
+    // Keep Studio calls on this thread, with its selected runtime and lease.
+    let (captured, project) = std::thread::scope(|scope| {
+        let project = scope.spawn(|| {
+            let _context = crate::app::timing::enter_trace_context(trace_context);
+            let _trace = crate::app::timing::trace_scope(
+                "push.source",
+                "read and hash source project files",
+            );
+            capture_snapshot(&root, &source_paths)
+        });
+        let captured = if !requires_stage
+            && stage
+                .loaded
+                .as_ref()
+                .is_none_or(|loaded| loaded.project.adapters.is_empty())
+        {
+            capture_studio_services_in_memory(context, bridge, services, &stage)
+                .map(|studio| (stage, studio))
+        } else {
+            capture_studio_services_with_stage(context, bridge, services, false, stage)
+        };
+        (
+            captured,
+            project.join().expect("Source capture worker panicked"),
+        )
+    });
+    let (stage, studio) = captured?;
+    let project = project?;
     log_reconcile_timing("full push capture", phase);
     let phase = Instant::now();
+    stages.next("decode source settings and prepare replacement");
     let mut prepared_settings = HashMap::new();
-    let differences =
-        snapshot_differences_prepared(&project, &studio, Some(&mut prepared_settings))?;
-    log_reconcile_timing("full push comparison", phase);
+    let differences = if replace {
+        let paths = project_replacement_paths(&project, &studio);
+        let trace_context = crate::app::timing::trace_context();
+        // Replacement writes the complete captured snapshot. Its private staging
+        // files do not depend on decoding or matching retained Studio objects.
+        let (prepared, staged) = rayon::join(
+            || {
+                let _context = crate::app::timing::enter_trace_context(trace_context);
+                prepare_project_replacement(&project, &studio, &paths, &mut prepared_settings)
+            },
+            || {
+                let _context = crate::app::timing::enter_trace_context(trace_context);
+                let _trace = crate::app::timing::trace_scope(
+                    "push.prepare",
+                    "write source snapshot into staging area",
+                );
+                stage_snapshot_paths(&stage.project_root, &paths, &project)
+            },
+        );
+        let unchanged_settings = prepared?;
+        staged?;
+        // A full push covers every service, but only replaces services whose
+        // authored contents cannot be reused. Unchanged script files still
+        // accompany native replacements so their external Source markers resolve.
+        let native_services = prepared_settings
+            .iter()
+            .filter(|(_, change)| {
+                !change.current.instances.is_empty()
+                    && service_has_only_native_containers(&change.previous)
+                    && !settings_documents_equivalent(&change.current, &change.previous)
+            })
+            .map(|(path, change)| settings_service_name(path, &change.current, &change.previous))
+            .collect::<Result<HashSet<_>>>()?;
+        let paths = paths
+            .into_iter()
+            .filter(|path| {
+                if unchanged_settings.contains(path) {
+                    return false;
+                }
+                if let Some(change) = prepared_settings.get(path) {
+                    return !settings_documents_equivalent(&change.current, &change.previous);
+                }
+                let native = services_for_snapshot_paths(context, &HashSet::from([path.clone()]))
+                    .iter()
+                    .any(|service| native_services.contains(service));
+                native
+                    || !entries_equivalent(
+                        path,
+                        studio.entries.get(path),
+                        project.entries.get(path),
+                    )
+            })
+            .collect::<HashSet<_>>();
+        prepared_settings.retain(|path, _| paths.contains(path));
+        paths
+    } else {
+        snapshot_differences_prepared(&project, &studio, Some(&mut prepared_settings))?
+    };
+    log_reconcile_timing(
+        if replace {
+            "full replacement preparation"
+        } else {
+            "full push comparison"
+        },
+        phase,
+    );
     if differences.is_empty() {
-        acknowledge_verified_push(bridge, services, &guard)?;
-        tracking_release.finish()?;
+        tracking_release.proof = initial_state.get("verifiedPushProof").cloned();
+        acknowledge_verified_push(bridge, services, &guard, &mut tracking_release)?;
+        #[cfg(any(windows, target_os = "macos"))]
+        retain_verified_full_push(
+            bridge,
+            cache_input.as_ref(),
+            &source_paths,
+            project,
+            &tracking_release,
+            #[cfg(windows)]
+            &mut _native_attributes,
+        );
         return Ok(Map::from_iter([("ok".to_string(), Value::Bool(true))]));
     }
     let phase = Instant::now();
+    stages.next("build replacement and retained-setting plan");
     let plan = reconciliation_push_plan_for_paths_with_prepared_settings(
         &studio,
         &project,
         &differences,
         &prepared_settings,
+        true,
+        false,
     )?;
     log_reconcile_timing("full push plan", phase);
     if plan.is_empty() {
-        acknowledge_verified_push(bridge, services, &guard)?;
-        tracking_release.finish()?;
+        tracking_release.proof = initial_state.get("verifiedPushProof").cloned();
+        acknowledge_verified_push(bridge, services, &guard, &mut tracking_release)?;
+        #[cfg(any(windows, target_os = "macos"))]
+        retain_verified_full_push(
+            bridge,
+            cache_input.as_ref(),
+            &source_paths,
+            project,
+            &tracking_release,
+            #[cfg(windows)]
+            &mut _native_attributes,
+        );
         return Ok(Map::from_iter([("ok".to_string(), Value::Bool(true))]));
     }
     let mutation_paths = differences.clone();
     let phase = Instant::now();
-    apply_snapshot_paths(&stage.project_root, &mutation_paths, &project)?;
+    stages.next("prepare filesystem undo snapshot");
+    let history = history::SyncHistory::begin(&root, &src_dir, &studio, &mutation_paths)?;
+    if !replace {
+        stages.next("write source snapshot into staging area");
+        apply_snapshot_paths(&stage.project_root, &mutation_paths, &project)?;
+    }
+    stages.next("assemble prepared document ownership");
     let mut prepared_documents = HashMap::with_capacity(prepared_settings.len());
+    let mut prepared_verification = HashMap::with_capacity(prepared_settings.len());
     for (path, change) in prepared_settings {
         let service = settings_service_name(&path, &change.current, &change.previous)?;
-        drop_settings_document(change.previous);
-        prepared_documents.insert(service, change.current);
+        let desired = Arc::new(change.current);
+        let native = plan.initial_native_services.contains(&service);
+        prepared_documents.insert(service, Arc::clone(&desired));
+        if !native {
+            prepared_verification.insert(
+                path,
+                PreparedPushVerification {
+                    previous: change.previous,
+                    desired,
+                },
+            );
+        }
     }
-    let pushed = push_staged_project(
+    stages.next("apply staged project to Studio");
+    let mut pushed = push_staged_project(
         context,
         &stage,
         bridge,
@@ -2360,27 +2823,155 @@ pub(crate) fn push_project_delta(
             expected_project: Some(&project),
         },
     )?;
+    stages.next("commit filesystem undo snapshot");
+    pushed.summary.insert(
+        "historyId".into(),
+        Value::String(history.commit(&project, &pushed.generated)?),
+    );
     log_reconcile_timing("full push mutation", phase);
 
+    stages.next("resolve post-push runtime");
+    let replacement = reopened_push_context(context, &pushed.summary)?;
+    let _replacement_selection = replacement.as_ref().map(bound_context::select);
+    let context = replacement.as_ref().unwrap_or(context);
+    if replacement.is_some() {
+        // The old process and its observation epoch ended intentionally. Never
+        // route readback or acknowledge its sequence on the replacement runtime.
+        tracking_release.guard_id = None;
+        pin_edit_runtime(context, bridge)?;
+        guard = current_studio_change_guard(context, bridge)?;
+        tracking_release.runtime_id.clone_from(&guard.runtime_id);
+        tracking_release
+            .guard_id
+            .clone_from(&guard.tracking_guard_id);
+    }
+
+    stages.next("recheck source files for concurrent edits");
     let current = capture_snapshot(&root, stage.publish_paths())?;
+    stages.next("select required readback from verification receipts");
     let mut verification_paths = differences;
     verification_paths.extend(mutation_paths);
     verification_paths.extend(pushed.generated.entries.keys().cloned());
-    if pushed.generated.entries.is_empty()
-        && exact_source_push_verified(&pushed.summary, &verification_paths)
+    let verified_services = ["nativeVerifiedServices", "fieldVerifiedServices"]
+        .into_iter()
+        .filter_map(|name| pushed.summary.get(name).and_then(Value::as_array))
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<HashSet<_>>();
+    // Native replacement validates the loader receipt, retained settings,
+    // supplemental writes and script buffers before committing. Re-export only
+    // services outside that contract, transformed outputs or newer file edits.
+    if !requires_stage
+        && replacement.is_none()
+        && stage
+            .loaded
+            .as_ref()
+            .is_none_or(|loaded| loaded.project.adapters.is_empty())
+        && pushed
+            .summary
+            .get("sourceVerifyFailed")
+            .and_then(Value::as_u64)
+            == Some(0)
+        && !verified_services.is_empty()
     {
-        acknowledge_verified_push(bridge, services, &guard)?;
-        tracking_release.finish()?;
+        verification_paths.retain(|path| {
+            let service = crate::editor::paths::service_from_changed_path(
+                Path::new(&context.source),
+                &Path::new(&context.root).join(path),
+            );
+            !service.is_some_and(|service| {
+                verified_services
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(&service))
+            }) || pushed.generated.entries.contains_key(path)
+                || !entries_equivalent(path, project.entries.get(path), current.entries.get(path))
+        });
+    }
+    if verification_paths.is_empty()
+        || (pushed.generated.entries.is_empty()
+            && exact_source_push_verified(&pushed.summary, &verification_paths))
+    {
+        stages.next("acknowledge verified push and release comparison data");
+        if project == current && !requires_stage && replacement.is_none() {
+            tracking_release.proof = pushed.summary.remove("verifiedPushProof");
+        }
+        let trace_context = crate::app::timing::trace_context();
+        std::thread::scope(|scope| {
+            // No remaining readback consumes these trees. Release their large
+            // allocations on the existing parallel path while Studio closes the
+            // observation lease; join cleanup before returning to the caller.
+            scope.spawn(move || {
+                let _context = crate::app::timing::enter_trace_context(trace_context);
+                let _trace = crate::app::timing::trace_scope(
+                    "push.cleanup",
+                    "release verified comparison documents",
+                );
+                prepared_verification
+                    .into_par_iter()
+                    .for_each(|(_, verified)| {
+                        if let Some(desired) = Arc::into_inner(verified.desired) {
+                            drop_settings_documents(verified.previous, desired);
+                        } else {
+                            drop_settings_document(verified.previous);
+                        }
+                    });
+                drop(stage);
+            });
+            acknowledge_verified_push(bridge, services, &guard, &mut tracking_release)
+        })?;
+        #[cfg(any(windows, target_os = "macos"))]
+        retain_verified_full_push(
+            bridge,
+            cache_input.as_ref(),
+            &source_paths,
+            project,
+            &tracking_release,
+            #[cfg(windows)]
+            &mut _native_attributes,
+        );
         return Ok(pushed.summary);
     }
     let verification_services = services_for_snapshot_paths(context, &verification_paths);
+    stages.next("capture required post-push service readback");
     let phase = Instant::now();
-    let (_readback_stage, readback) =
-        capture_studio_services(context, bridge, &verification_services, false)?;
+    let readback_stage = if requires_stage {
+        ExportProjectStage::create(&root, &src_dir, &verification_services)?
+    } else {
+        ExportProjectStage::create_for_comparison(&root, &src_dir, &verification_services)?
+    };
+    let readback = if !requires_stage
+        && readback_stage
+            .loaded
+            .as_ref()
+            .is_none_or(|loaded| loaded.project.adapters.is_empty())
+    {
+        capture_studio_services_in_memory(context, bridge, &verification_services, &readback_stage)?
+    } else {
+        capture_studio_services_with_stage(
+            context,
+            bridge,
+            &verification_services,
+            false,
+            readback_stage,
+        )?
+        .1
+    };
     log_reconcile_timing("full push readback", phase);
+    stages.next("verify intended values against readback");
     let phase = Instant::now();
-    let (mismatches, details) =
-        snapshot_intended_delta_mismatches(&studio, &current, &readback, &verification_paths)?;
+    // These documents were already aligned to the exact requested file bytes.
+    // Generated values or a later file edit invalidate that proof, not merely
+    // the observed Studio snapshot (which is always read and aligned anew).
+    prepared_verification.retain(|path, _| {
+        entries_equivalent(path, project.entries.get(path), current.entries.get(path))
+    });
+    let (mismatches, details) = snapshot_intended_delta_mismatches(
+        &studio,
+        &current,
+        &readback,
+        &verification_paths,
+        &mut prepared_verification,
+    )?;
     log_reconcile_timing("full push verification", phase);
     if !mismatches.is_empty() {
         bail!(
@@ -2396,9 +2987,53 @@ pub(crate) fn push_project_delta(
                 .unwrap_or_default()
         );
     }
-    acknowledge_verified_push(bridge, services, &guard)?;
-    tracking_release.finish()?;
+    stages.next("acknowledge verified push and release Studio tracking guard");
+    let mut expected_after_push = project;
+    expected_after_push.entries.extend(pushed.generated.entries);
+    if expected_after_push == current && !requires_stage && replacement.is_none() {
+        // Readback verified the remaining fields. The commit proof predates
+        // that readback, so retaining it still requires Studio to have remained
+        // unchanged throughout verification (including its asynchronous reads).
+        // Accepted generated settings are also verified by readback; only file
+        // changes outside that exact result invalidate the source snapshot.
+        tracking_release.proof = pushed.summary.remove("verifiedPushProof");
+    }
+    acknowledge_verified_push(bridge, services, &guard, &mut tracking_release)?;
+    #[cfg(any(windows, target_os = "macos"))]
+    retain_verified_full_push(
+        bridge,
+        cache_input.as_ref(),
+        &source_paths,
+        current,
+        &tracking_release,
+        #[cfg(windows)]
+        &mut _native_attributes,
+    );
     Ok(pushed.summary)
+}
+
+fn reopened_push_context(
+    context: &BoundContext,
+    summary: &Map<String, Value>,
+) -> Result<Option<BoundContext>> {
+    let Some(reopened) = summary.get("protectedOfflineApply") else {
+        return Ok(None);
+    };
+    let previous = reopened["previousRuntimeId"].as_str();
+    let runtime = reopened["reopenedRuntimeId"]
+        .as_str()
+        .filter(|value| !value.is_empty());
+    anyhow::ensure!(
+        reopened["ok"] == true
+            && previous.is_some()
+            && previous == context.runtime_id.as_deref()
+            && runtime.is_some()
+            && runtime != previous,
+        "Protected snapshot did not identify its replacement Studio runtime"
+    );
+    let mut replacement = context.clone();
+    replacement.runtime_id = runtime.map(str::to_string);
+    Ok(Some(replacement))
 }
 
 fn exact_source_push_verified(
@@ -2410,6 +3045,27 @@ fn exact_source_push_verified(
         && summary.get("sourceVerifyFailed").and_then(Value::as_u64) == Some(0)
         && summary.get("sourceVerified").and_then(Value::as_u64)
             == u64::try_from(verification_paths.len()).ok()
+}
+
+fn service_has_only_native_containers(document: &SettingsBytecode) -> bool {
+    document
+        .instances
+        .iter()
+        .enumerate()
+        .all(|(index, instance)| {
+            let Some(parent) = instance.parent_index else {
+                return true;
+            };
+            if is_reconciliation_protected_workspace_camera(document, index) {
+                return true;
+            }
+            let root = &document.instances[parent];
+            root.parent_index.is_none()
+                && crate::roblox::services::is_engine_managed_container(
+                    &root.class_name,
+                    &instance.class_name,
+                )
+        })
 }
 
 fn capture_studio_services(
@@ -2466,6 +3122,37 @@ fn import_studio_services_into_stage(
     Ok(stage)
 }
 
+fn capture_studio_services_in_memory(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+    services: &[String],
+    stage: &ExportProjectStage,
+) -> Result<ProjectSnapshot> {
+    pin_edit_runtime(context, bridge)?;
+    let mut args = automation_pull_args(context, &json!({"services": services}), true)?;
+    args.project_root.clone_from(&stage.import_project_root);
+    args.src_dir.clone_from(&stage.import_src_dir);
+    let info = bridge.cached_bridge_info_for_target(BridgeTarget::Main)?;
+    let src_root = stage.import_project_root.join(&stage.import_src_dir);
+    let projections = capture_exported_services(&args, bridge, &info, |service, state| {
+        service_projection_in_memory(&state, &src_root, service)
+    })?;
+    let mut entries = BTreeMap::new();
+    for projection in projections {
+        for (path, bytes) in projection {
+            let relative = path.strip_prefix(&stage.project_root)?.to_path_buf();
+            if !derived_project_path(&relative) {
+                let entry = bytes.map_or(SnapshotEntry::Directory, SnapshotEntry::File);
+                anyhow::ensure!(
+                    entries.insert(relative, entry).is_none(),
+                    "Native verification projected overlapping paths"
+                );
+            }
+        }
+    }
+    Ok(ProjectSnapshot { entries })
+}
+
 fn services_for_snapshot_paths(context: &BoundContext, paths: &HashSet<PathBuf>) -> Vec<String> {
     let root = Path::new(&context.root);
     let source = Path::new(&context.source);
@@ -2473,7 +3160,14 @@ fn services_for_snapshot_paths(context: &BoundContext, paths: &HashSet<PathBuf>)
         return sync_services();
     };
     let mut services = HashSet::new();
+    let loaded = std::cell::OnceCell::new();
     for path in paths {
+        if let Some(service) =
+            crate::project::storage::service_for_store(Path::new(&context.source), &root.join(path))
+        {
+            services.insert(service);
+            continue;
+        }
         let Some(service) = path
             .strip_prefix(source)
             .ok()
@@ -2488,7 +3182,34 @@ fn services_for_snapshot_paths(context: &BoundContext, paths: &HashSet<PathBuf>)
                     .find(|service| service.eq_ignore_ascii_case(name))
             })
         else {
-            return sync_services();
+            let Some(project) = loaded
+                .get_or_init(|| config::load_project(Some(Path::new(&context.project)), None).ok())
+            else {
+                return sync_services();
+            };
+            let Ok(mapped) = config::project_source_to_staged_relatives(project, &root.join(path))
+            else {
+                return sync_services();
+            };
+            if mapped.is_empty() {
+                return sync_services();
+            }
+            for mapped in mapped {
+                let Some(service) = mapped
+                    .components()
+                    .next()
+                    .and_then(|component| component.as_os_str().to_str())
+                    .and_then(|name| {
+                        DEFAULT_SYNC_SERVICES
+                            .iter()
+                            .find(|service| service.eq_ignore_ascii_case(name))
+                    })
+                else {
+                    return sync_services();
+                };
+                services.insert((*service).to_string());
+            }
+            continue;
         };
         services.insert((*service).to_string());
     }
@@ -2601,7 +3322,7 @@ fn editor_acknowledgment_uses_captured_and_generated_bytes_including_deletions()
 
 struct StagedPushRequest<'a> {
     plan: ReconcilePushPlan,
-    prepared_documents: HashMap<String, SettingsBytecode>,
+    prepared_documents: HashMap<String, Arc<SettingsBytecode>>,
     guard: Option<&'a StudioChangeGuard>,
     args: PushEditorChangesArgs,
     expected_project: Option<&'a ProjectSnapshot>,
@@ -2613,6 +3334,8 @@ fn push_staged_project(
     bridge: &BridgeServer,
     request: StagedPushRequest<'_>,
 ) -> Result<StagedPushResult> {
+    let mut stages =
+        crate::app::timing::trace_stages("push.staged", "check supporting source files");
     let StagedPushRequest {
         plan,
         prepared_documents,
@@ -2673,9 +3396,11 @@ fn push_staged_project(
         }
         Ok(())
     };
+    stages.next("bind staged project to intended runtime");
     let staged = staged_context(context, stage, &push_args.project.src_root)?;
     let _selection = bound_context::select(&staged);
     pin_edit_runtime(&staged, bridge)?;
+    stages.next("prepare scoped editor arguments and native documents");
     let source_relative =
         project_relative_source_root(&push_args.project.project_root, &push_args.project.src_root)?;
     push_args
@@ -2693,13 +3418,26 @@ fn push_staged_project(
     push_args.target_properties.clear();
     push_args.verify_sources = true;
     push_args.upsert_instances_only = false;
+    let initial_documents = prepared_documents
+        .iter()
+        .filter(|(service, _)| plan.initial_native_services.contains(*service))
+        .map(|(service, document)| (service.clone(), Arc::clone(document)))
+        .collect::<HashMap<_, _>>();
     let mut generated = ProjectSnapshot::default();
+    stages.next("collect and apply editor changes");
     let summary = push_reconciled_editor_changes_with_warm_bridge(
         push_args,
         bridge,
         guard,
-        prepared_documents,
-        |changes| amend_reconciled_changes(changes, plan),
+        PreparedEditorDocuments {
+            documents: prepared_documents,
+            native_services: plan.initial_native_services.clone(),
+        },
+        |changes| {
+            amend_reconciled_changes(changes, plan)?;
+            stage_native_bootstrap_services(changes, &initial_documents);
+            Ok(())
+        },
         |changes| {
             generated = redirect_staged_settings_writes(
                 changes,
@@ -2711,10 +3449,40 @@ fn push_staged_project(
         },
         validate_project,
     )?;
+    stages.next("validate staged push result");
     if summary.get("skippedByReview").and_then(Value::as_bool) == Some(true) {
         bail!("Reconciled changes require review before Studio can be updated");
     }
+    stages.next("release prepared native service documents");
+    for document in initial_documents.into_values() {
+        if let Some(document) = Arc::into_inner(document) {
+            drop_settings_document(document);
+        }
+    }
+    stages.next("restore caller project selection and release staged arguments");
     Ok(StagedPushResult { generated, summary })
+}
+
+fn stage_native_bootstrap_services(
+    changes: &mut EditorChangeSet,
+    documents: &HashMap<String, Arc<SettingsBytecode>>,
+) {
+    changes
+        .instance_changes
+        .retain(|change| !documents.contains_key(&change.service));
+    for (service, document) in documents {
+        if changes.native_property_documents.contains_key(service) {
+            changes.instance_changes.push(EditorInstanceChange {
+                service: service.clone(),
+                mode: "reconcileService".into(),
+                allow_deletes: true,
+                instances: Vec::new(),
+                preserve_instances: Vec::new(),
+            });
+        } else {
+            crate::editor::diff::append_editor_instance_reconcile(changes, document, service);
+        }
+    }
 }
 
 fn redirect_staged_settings_writes(
@@ -2778,6 +3546,14 @@ fn amend_reconciled_changes(
     changes.instance_changes = plan.instance_deletes;
     for change in &mut changes.instance_changes {
         for instance in &mut change.instances {
+            if plan
+                .in_place_instances
+                .contains(&(change.service.clone(), instance.settings_id.clone()))
+            {
+                // This identity, class, name and parent already matched the
+                // captured target. Keep its lookup anchor without an upsert.
+                instance.anchor_only = true;
+            }
             if let Some(previous) = plan.previous_class_names.get(&instance.settings_id) {
                 instance.previous_class_name = Some(previous.clone());
             }
@@ -2805,6 +3581,17 @@ fn amend_reconciled_changes(
             change.deleted_attributes.dedup();
         } else {
             changes.property_changes.push(removal);
+        }
+    }
+    for change in &mut changes.property_changes {
+        if change.settings_id.as_ref().is_some_and(|id| {
+            plan.attribute_only_instances
+                .contains(&(change.service.clone(), id.clone()))
+        }) {
+            // These values already matched the captured Studio instance. An
+            // attribute edit must not replay every property setter on that object.
+            change.properties.clear();
+            change.reset_properties.clear();
         }
     }
     for change in &changes.property_changes {
@@ -2855,6 +3642,8 @@ fn reconciliation_push_plan_for_paths(
         merged,
         paths,
         &HashMap::new(),
+        false,
+        false,
     )
 }
 
@@ -2863,11 +3652,31 @@ fn reconciliation_push_plan_for_paths_with_prepared_settings(
     merged: &ProjectSnapshot,
     paths: &HashSet<PathBuf>,
     prepared_settings: &HashMap<PathBuf, PreparedEditorSettingsChange>,
+    bootstrap: bool,
+    replace: bool,
 ) -> Result<ReconcilePushPlan> {
     let mut paths = paths.iter().cloned().collect::<Vec<_>>();
     paths.sort();
 
-    let mut plan = ReconcilePushPlan::default();
+    // Select full-service imports before constructing individual insertion and
+    // recreated-reference records that the import would immediately discard.
+    let mut plan = ReconcilePushPlan {
+        initial_native_services: if bootstrap {
+            prepared_settings
+                .iter()
+                .filter(|(_, change)| {
+                    !change.current.instances.is_empty()
+                        && (replace || service_has_only_native_containers(&change.previous))
+                })
+                .map(|(path, change)| {
+                    settings_service_name(path, &change.current, &change.previous)
+                })
+                .collect::<Result<_>>()?
+        } else {
+            HashSet::new()
+        },
+        ..Default::default()
+    };
     for path in paths {
         let studio_entry = studio.entries.get(&path);
         let merged_entry = merged.entries.get(&path);
@@ -2902,12 +3711,14 @@ fn reconciliation_push_plan_for_paths_with_prepared_settings(
                 plan.changed_paths.push(path);
             }
         } else if !matches!(merged_entry, Some(SnapshotEntry::Directory))
-            && !entries_equivalent(&path, studio_entry, merged_entry)
+            && (replace || !entries_equivalent(&path, studio_entry, merged_entry))
         {
             plan.changed_paths.push(path);
         }
     }
-    append_recreated_reference_pushes(merged, &mut plan)?;
+    let phase = Instant::now();
+    append_recreated_reference_pushes(merged, prepared_settings, &mut plan)?;
+    log_reconcile_timing("settings recreated reference repair", phase);
     plan.changed_paths.sort();
     plan.changed_paths.dedup();
     plan.target_settings_ids.sort();
@@ -2917,6 +3728,7 @@ fn reconciliation_push_plan_for_paths_with_prepared_settings(
 
 fn append_recreated_reference_pushes(
     desired: &ProjectSnapshot,
+    prepared_settings: &HashMap<PathBuf, PreparedEditorSettingsChange>,
     plan: &mut ReconcilePushPlan,
 ) -> Result<()> {
     let targeted = plan
@@ -2946,7 +3758,22 @@ fn append_recreated_reference_pushes(
         {
             continue;
         }
-        let document = settings_document(Some(entry))?;
+        let decoded;
+        let document = if let Some(prepared) = prepared_settings.get(path) {
+            &prepared.current
+        } else {
+            decoded = settings_document(Some(entry))?;
+            &decoded
+        };
+        // Full-service payloads already carry every outgoing reference, including
+        // the serializer's post-apply exceptions. Only incremental services need
+        // additional referrer selections when an identity is recreated elsewhere.
+        if plan
+            .initial_native_services
+            .contains(&settings_service_name(path, document, document)?)
+        {
+            continue;
+        }
         for instance in &document.instances {
             if instance.class_name == "PackageLink"
                 || !instance
@@ -2959,6 +3786,10 @@ fn append_recreated_reference_pushes(
             }
             plan.changed_paths.push(path.clone());
             plan.target_settings_ids.push(instance.settings_id.clone());
+            plan.attribute_only_instances.remove(&(
+                settings_service_name(path, document, document)?,
+                instance.settings_id.clone(),
+            ));
         }
     }
     Ok(())
@@ -3021,6 +3852,17 @@ fn append_aligned_settings_push_plan(
     plan: &mut ReconcilePushPlan,
 ) -> Result<()> {
     let service = settings_service_name(path, desired, observed)?;
+    let bootstrap = plan.initial_native_services.contains(&service);
+    if bootstrap
+        && let Some(root) = desired
+            .instances
+            .iter()
+            .find(|instance| instance.parent_index.is_none())
+    {
+        // Keep collection explicitly targeted even when no retained field differs.
+        // Newly inserted descendants are already covered by the binary import.
+        plan.target_settings_ids.push(root.settings_id.clone());
+    }
     let database = rbx_reflection_database::get()?;
     let phase = Instant::now();
     let (desired_by_id, observed_by_id) = rayon::join(
@@ -3064,11 +3906,15 @@ fn append_aligned_settings_push_plan(
             }
             let observed_index = observed_by_id.get(instance.settings_id.as_str()).copied();
             if observed_index.is_some_and(|observed_index| {
-                settings_instances_equal(desired, desired_index, observed, observed_index)
+                is_reconciliation_protected_workspace_camera(observed, observed_index)
+                    || settings_instances_equal(desired, desired_index, observed, observed_index)
             }) {
                 return None;
             }
             let Some(observed_index) = observed_index else {
+                if bootstrap {
+                    return None;
+                }
                 return Some(InstanceDelta {
                     desired_index,
                     observed_index: None,
@@ -3129,6 +3975,27 @@ fn append_aligned_settings_push_plan(
             continue;
         };
         let observed_instance = &observed.instances[observed_index];
+        if !bootstrap
+            && instance.name == observed_instance.name
+            && instance.class_name == observed_instance.class_name
+            && settings_parent_id(desired, delta.desired_index)
+                == settings_parent_id(observed, observed_index)
+        {
+            plan.in_place_instances
+                .insert((service.clone(), instance.settings_id.clone()));
+        }
+        if plan
+            .in_place_instances
+            .contains(&(service.clone(), instance.settings_id.clone()))
+            && reconciliation_maps_equal(
+                &instance.class_name,
+                &instance.properties,
+                &observed_instance.properties,
+            )
+        {
+            plan.attribute_only_instances
+                .insert((service.clone(), instance.settings_id.clone()));
+        }
         let geometry =
             crate::editor::native_geometry::generated_properties(observed_instance, instance);
         if !geometry.is_empty() {
@@ -3209,9 +4076,11 @@ fn append_aligned_settings_push_plan(
         .instances
         .iter()
         .enumerate()
-        .filter(|(_, instance)| {
+        .filter(|(index, instance)| {
             instance.parent_index.is_some()
                 && !desired_by_id.contains_key(instance.settings_id.as_str())
+                && !is_reconciliation_protected_workspace_camera(observed, *index)
+                && !is_protected_engine_container(observed, *index)
         })
         .map(|(index, _)| index)
         .collect::<HashSet<_>>();
@@ -3430,18 +4299,53 @@ fn source_paths_by_settings_index(
     document: &SettingsBytecode,
     settings_path: &Path,
 ) -> Result<Vec<Option<PathBuf>>> {
-    let service_dir = settings_path
-        .parent()
-        .context("A service settings path has no parent")?;
-    let service = service_dir
+    if !document
+        .instances
+        .iter()
+        .any(|instance| is_lua_source_class(&instance.class_name))
+    {
+        return Ok(vec![None; document.instances.len()]);
+    }
+    let (service_dir, project_root) = if settings_path
         .file_name()
-        .and_then(|name| name.to_str())
-        .context("A service settings path has no service name")?;
-    Ok(build_editor_source_paths_by_index(
-        document,
-        service,
-        service_dir,
-    ))
+        .is_some_and(|name| name == crate::system::files::SERVICE_SETTINGS_FILE_NAME)
+    {
+        (
+            settings_path
+                .parent()
+                .context("A service settings path has no parent")?
+                .to_path_buf(),
+            None,
+        )
+    } else {
+        let project = crate::app::context::project_override()
+            .context("Script reconciliation requires the selected project")?;
+        let root = project.parent().context("Selected project has no root")?;
+        (
+            crate::project::storage::source_directory(&root.join(settings_path)),
+            Some(root.to_path_buf()),
+        )
+    };
+    let service = document
+        .instances
+        .iter()
+        .find(|instance| instance.parent_index.is_none())
+        .context("A service settings document has no root")?;
+    let paths = build_editor_source_paths_by_index(document, &service.name, &service_dir);
+    let Some(root) = project_root else {
+        return Ok(paths);
+    };
+    paths
+        .into_iter()
+        .map(|path| {
+            path.map(|path| {
+                path.strip_prefix(&root)
+                    .map(Path::to_path_buf)
+                    .context("Script source is outside its project")
+            })
+            .transpose()
+        })
+        .collect()
 }
 
 fn changed_script_source_ids(
@@ -3782,6 +4686,10 @@ fn merge_settings_entry(
             preference,
             conflicts,
         );
+        crate::settings::equivalence::inherit_workspace_viewport_reference(
+            &mut editor_doc,
+            &studio_doc,
+        );
         align_reconciliation_protected_workspace_cameras(&editor_doc, &mut studio_doc);
         if conflicts.len() > previous_conflicts {
             let studio_equivalent = settings_documents_equivalent(&studio_doc, &editor_doc);
@@ -3800,11 +4708,9 @@ fn merge_settings_entry(
                 &no_source_changes,
                 &no_source_changes,
             );
-            conflicts.extend(
-                merge_conflicts
-                    .into_iter()
-                    .map(|conflict| format!("{}: {}", path.display(), conflict.detail)),
-            );
+            conflicts.extend(merge_conflicts.into_iter().map(|conflict| {
+                format!("{}: {}: {}", path.display(), conflict.path, conflict.detail)
+            }));
             let editor_equivalent = settings_documents_equivalent(&editor_doc, &merged);
             let studio_equivalent = settings_documents_equivalent(&studio_doc, &merged);
             (merged, editor_equivalent, studio_equivalent)
@@ -3815,6 +4721,10 @@ fn merge_settings_entry(
         align_observation_ids_to_baseline(&base_doc, &mut editor_doc);
         align_observation_ids_to_baseline(&base_doc, &mut studio_doc);
         align_new_instance_ids(&base_doc, &editor_doc, &mut studio_doc)?;
+        crate::settings::equivalence::inherit_workspace_viewport_reference(
+            &mut editor_doc,
+            &studio_doc,
+        );
         align_reconciliation_protected_workspace_cameras(&editor_doc, &mut studio_doc);
         align_equivalent_values(&base_doc, &mut editor_doc);
         align_equivalent_values(&base_doc, &mut studio_doc);
@@ -3875,11 +4785,9 @@ fn merge_settings_entry(
                 &editor_source_changes,
                 &studio_source_changes,
             );
-            conflicts.extend(
-                merge_conflicts
-                    .into_iter()
-                    .map(|conflict| format!("{}: {}", path.display(), conflict.detail)),
-            );
+            conflicts.extend(merge_conflicts.into_iter().map(|conflict| {
+                format!("{}: {}: {}", path.display(), conflict.path, conflict.detail)
+            }));
             let editor_equivalent = settings_documents_equivalent(&editor_doc, &merged);
             let studio_equivalent = settings_documents_equivalent(&studio_doc, &merged);
             (merged, editor_equivalent, studio_equivalent)
@@ -4601,43 +5509,55 @@ fn snapshot_intended_delta_mismatches(
     desired: &ProjectSnapshot,
     observed: &ProjectSnapshot,
     paths: &HashSet<PathBuf>,
+    prepared: &mut HashMap<PathBuf, PreparedPushVerification>,
 ) -> Result<(Vec<PathBuf>, Option<String>)> {
-    let mut differences = Vec::new();
-    let mut detail = None;
-    for path in paths {
-        let before_entry = before.entries.get(path);
-        let desired_entry = desired.entries.get(path);
-        if entries_equivalent(path, before_entry, desired_entry) {
-            continue;
-        }
-        let mismatch = if path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(is_service_settings_file_name)
-        {
-            settings_delta_mismatch(
-                path,
-                before_entry,
-                desired_entry,
-                observed.entries.get(path),
-            )?
-        } else if entries_equivalent(path, observed.entries.get(path), desired_entry) {
-            None
-        } else {
-            Some(format!(
-                "{} differs from the requested value",
-                path.display()
-            ))
-        };
-        if let Some(mismatch) = mismatch {
-            differences.push(path.clone());
-            if detail.is_none() {
-                detail = Some(mismatch);
-            }
-        }
-    }
-    differences.sort();
-    Ok((differences, detail))
+    let jobs = paths
+        .iter()
+        .filter(|path| {
+            !entries_equivalent(path, before.entries.get(*path), desired.entries.get(*path))
+        })
+        .map(|path| (path, prepared.remove(path)))
+        .collect::<Vec<_>>();
+    let trace_context = crate::app::timing::trace_context();
+    // Services have independent identity graphs. Share the captured snapshots,
+    // but give each worker ownership of its already-prepared documents.
+    let results = jobs
+        .into_par_iter()
+        .map(|(path, prepared)| {
+            let _trace_context =
+                trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
+            let desired_entry = desired.entries.get(path);
+            let mismatch = if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_service_settings_file_name)
+            {
+                let _trace = crate::app::timing::trace_scope("reconcile", "verify pushed service");
+                settings_delta_mismatch(
+                    path,
+                    before.entries.get(path),
+                    desired_entry,
+                    observed.entries.get(path),
+                    prepared,
+                )?
+            } else if entries_equivalent(path, observed.entries.get(path), desired_entry) {
+                None
+            } else {
+                Some(format!(
+                    "{} differs from the requested value",
+                    path.display()
+                ))
+            };
+            Ok(mismatch.map(|detail| (path.clone(), detail)))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut differences = results.into_iter().flatten().collect::<Vec<_>>();
+    differences.sort_by(|left, right| left.0.cmp(&right.0));
+    let detail = differences.first().map(|(_, detail)| detail.clone());
+    Ok((
+        differences.into_iter().map(|(path, _)| path).collect(),
+        detail,
+    ))
 }
 
 fn settings_delta_mismatch(
@@ -4645,9 +5565,16 @@ fn settings_delta_mismatch(
     before: Option<&SnapshotEntry>,
     desired: Option<&SnapshotEntry>,
     observed: Option<&SnapshotEntry>,
+    prepared: Option<PreparedPushVerification>,
 ) -> Result<Option<String>> {
-    let mut before = settings_document(before)?;
-    let desired = settings_document(desired)?;
+    let before_aligned = prepared.is_some();
+    let (mut before, desired) = match prepared {
+        Some(prepared) => (prepared.previous, prepared.desired),
+        None => (
+            settings_document(before)?,
+            Arc::new(settings_document(desired)?),
+        ),
+    };
     let mut observed = settings_document(observed)?;
     if desired.instances.is_empty()
         && !before.instances.is_empty()
@@ -4660,7 +5587,10 @@ fn settings_delta_mismatch(
         );
     }
     if !desired.instances.is_empty() {
-        if !before.instances.is_empty() && !align_settings_ids_to_reference(&desired, &mut before) {
+        if !before_aligned
+            && !before.instances.is_empty()
+            && !align_settings_ids_to_reference(&desired, &mut before)
+        {
             bail!(
                 "Could not align the previous identities in {}",
                 path.display()
@@ -4675,40 +5605,55 @@ fn settings_delta_mismatch(
             );
         }
     }
+    let index_started = Instant::now();
     let before_by_id = before
         .instances
         .iter()
         .enumerate()
         .map(|(index, instance)| (instance.settings_id.as_str(), index))
-        .collect::<HashMap<_, _>>();
+        .collect::<AHashMap<_, _>>();
     let desired_by_id = desired
         .instances
         .iter()
         .enumerate()
         .map(|(index, instance)| (instance.settings_id.as_str(), index))
-        .collect::<HashMap<_, _>>();
+        .collect::<AHashMap<_, _>>();
     let observed_by_id = observed
         .instances
         .iter()
         .enumerate()
         .map(|(index, instance)| (instance.settings_id.as_str(), index))
-        .collect::<HashMap<_, _>>();
-    let mut settings_ids = before_by_id
-        .keys()
-        .chain(desired_by_id.keys())
-        .copied()
+        .collect::<AHashMap<_, _>>();
+    let settings_ids = before
+        .instances
+        .iter()
+        .map(|instance| instance.settings_id.as_str())
+        .chain(
+            desired
+                .instances
+                .iter()
+                .map(|instance| instance.settings_id.as_str())
+                .filter(|id| !before_by_id.contains_key(id)),
+        )
         .collect::<Vec<_>>();
-    settings_ids.sort_unstable();
-    settings_ids.dedup();
-    for settings_id in settings_ids {
+    log_reconcile_timing("push verification identity indices", index_started);
+    let compare_started = Instant::now();
+    let compare = |settings_id: &str| {
         let before_index = before_by_id.get(settings_id).copied();
         let desired_index = desired_by_id.get(settings_id).copied();
         let observed_index = observed_by_id.get(settings_id).copied();
+        if observed_index
+            .is_some_and(|index| is_reconciliation_protected_workspace_camera(&observed, index))
+        {
+            // The active viewport is retained, even if its saved row was
+            // removed or edited. Other cameras still receive full verification.
+            return None;
+        }
         if before_index.is_some_and(|index| before.instances[index].class_name == "PackageLink")
             && desired_index
                 .is_some_and(|index| desired.instances[index].class_name == "PackageLink")
         {
-            continue;
+            return None;
         }
         let name = desired_index
             .map(|index| desired.instances[index].name.as_str())
@@ -4725,39 +5670,58 @@ fn settings_delta_mismatch(
                     && previous.class_name == actual.class_name
                     && previous.name == actual.name
                 {
-                    continue;
+                    return None;
                 }
-                return Ok(Some(format!("{name} was not deleted from Studio")));
-            }
-            (None, Some(_), None) => {
-                return Ok(Some(format!("{name} was not created in Studio")));
-            }
-            (_, None, _) => continue,
-            (None, Some(desired_index), Some(observed_index)) => {
-                if let Some(detail) =
-                    added_instance_mismatch(&desired, desired_index, &observed, observed_index)
+                // The container is engine-owned; omission removes its contents,
+                // not the container. Authored containers still verify normally.
+                if is_protected_engine_container(&before, before_index)
+                    && is_protected_engine_container(&observed, observed_index)
+                    && previous.class_name == actual.class_name
                 {
-                    return Ok(Some(format!("{name}.{detail}")));
+                    return None;
                 }
+                Some(format!("{name} was not deleted from Studio"))
+            }
+            (None, Some(_), None) => Some(format!("{name} was not created in Studio")),
+            (_, None, _) => None,
+            (None, Some(desired_index), Some(observed_index)) => {
+                added_instance_mismatch(&desired, desired_index, &observed, observed_index)
+                    .map(|detail| format!("{name}.{detail}"))
             }
             (Some(before_index), Some(desired_index), Some(observed_index)) => {
-                if let Some(detail) = changed_instance_mismatch(
+                changed_instance_mismatch(
                     &before,
                     before_index,
                     &desired,
                     desired_index,
                     &observed,
                     observed_index,
-                ) {
-                    return Ok(Some(format!("{name}.{detail}")));
-                }
+                )
+                .map(|detail| format!("{name}.{detail}"))
             }
-            (Some(_), Some(_), None) => {
-                return Ok(Some(format!("{name} disappeared from Studio")));
-            }
+            (Some(_), Some(_), None) => Some(format!("{name} disappeared from Studio")),
         }
-    }
-    Ok(None)
+    };
+    // Read-only comparisons are independent once all three identity maps exist.
+    // Keep the same first error regardless of which worker finishes first.
+    let mismatch = if settings_ids.len() >= 1_024 {
+        settings_ids.par_iter().find_map_first(|id| compare(id))
+    } else {
+        settings_ids.iter().find_map(|id| compare(id))
+    };
+    log_reconcile_timing("push verification delta checks", compare_started);
+    drop(before_by_id);
+    drop(desired_by_id);
+    drop(observed_by_id);
+    rayon::join(
+        || drop_settings_documents(before, observed),
+        || {
+            if let Some(desired) = Arc::into_inner(desired) {
+                drop_settings_document(desired);
+            }
+        },
+    );
+    Ok(mismatch)
 }
 
 fn added_instance_mismatch(
@@ -4781,14 +5745,14 @@ fn added_instance_mismatch(
         &desired_instance.properties,
         &observed_instance.properties,
         true,
-        &desired_instance.class_name,
+        desired_instance,
     )
     .or_else(|| {
         expected_map_mismatch(
             &desired_instance.attributes,
             &observed_instance.attributes,
             false,
-            &desired_instance.class_name,
+            desired_instance,
         )
     })
 }
@@ -4834,7 +5798,7 @@ fn changed_instance_mismatch(
         &desired_instance.properties,
         &observed_instance.properties,
         true,
-        &desired_instance.class_name,
+        desired_instance,
     )
     .or_else(|| {
         changed_map_mismatch(
@@ -4842,22 +5806,51 @@ fn changed_instance_mismatch(
             &desired_instance.attributes,
             &observed_instance.attributes,
             false,
-            &desired_instance.class_name,
+            desired_instance,
         )
     })
+}
+
+fn verification_values_equal(
+    properties: bool,
+    class_name: &str,
+    name: &str,
+    left: Option<&Value>,
+    right: Option<&Value>,
+) -> bool {
+    if properties {
+        reconciliation_property_values_equal(class_name, name, left, right)
+    } else {
+        match (left, right) {
+            (Some(left), Some(right)) => reconciliation_values_equal(left, right, false),
+            (None, None) => true,
+            _ => false,
+        }
+    }
 }
 
 fn expected_map_mismatch(
     expected: &Map<String, Value>,
     actual: &Map<String, Value>,
     properties: bool,
-    class_name: &str,
+    instance: &SettingsBytecodeInstance,
 ) -> Option<String> {
+    let class_name = &instance.class_name;
     expected.iter().find_map(|(name, expected)| {
         if properties
             && (name == "ScriptGuid"
                 || (name == "Source" && is_lua_source_class(class_name))
-                || reconciliation_property_is_derived(name))
+                || (instance.parent_index.is_none()
+                    && is_externally_managed_editor_property(
+                        &instance.name,
+                        class_name,
+                        std::slice::from_ref(&instance.name),
+                        name,
+                    ))
+                || reconciliation_property_is_derived(name)
+                || crate::settings::equivalence::reconciliation_property_is_metadata(
+                    name, expected,
+                ))
         {
             return None;
         }
@@ -4866,7 +5859,7 @@ fn expected_map_mismatch(
         } else {
             actual.get(name)
         };
-        (!reconciliation_property_values_equal(class_name, name, Some(expected), actual))
+        (!verification_values_equal(properties, class_name, name, Some(expected), actual))
             .then(|| format!("{name} was not retained"))
     })
 }
@@ -4876,15 +5869,26 @@ fn changed_map_mismatch(
     desired: &Map<String, Value>,
     observed: &Map<String, Value>,
     properties: bool,
-    class_name: &str,
+    instance: &SettingsBytecodeInstance,
 ) -> Option<String> {
+    if before == desired {
+        return None;
+    }
     let mut names = before.keys().chain(desired.keys()).collect::<Vec<_>>();
     names.sort();
     names.dedup();
+    let class_name = &instance.class_name;
     names.into_iter().find_map(|name| {
         if properties
             && (name == "ScriptGuid"
                 || (name == "Source" && is_lua_source_class(class_name))
+                || (instance.parent_index.is_none()
+                    && is_externally_managed_editor_property(
+                        &instance.name,
+                        class_name,
+                        std::slice::from_ref(&instance.name),
+                        name,
+                    ))
                 || reconciliation_property_is_derived(name))
         {
             return None;
@@ -4899,7 +5903,7 @@ fn changed_map_mismatch(
         } else {
             desired.get(name)
         };
-        if reconciliation_property_values_equal(class_name, name, previous, expected) {
+        if verification_values_equal(properties, class_name, name, previous, expected) {
             return None;
         }
         let actual = if properties {
@@ -4907,7 +5911,7 @@ fn changed_map_mismatch(
         } else {
             observed.get(name)
         };
-        (!reconciliation_property_values_equal(class_name, name, expected, actual))
+        (!verification_values_equal(properties, class_name, name, expected, actual))
             .then(|| format!("{name} was not retained"))
     })
 }
@@ -4929,11 +5933,20 @@ fn snapshot_entry_equivalent(
         .and_then(|name| name.to_str())
         .is_some_and(is_service_settings_file_name)
     {
+        let trace_context = crate::app::timing::trace_context();
         let (left, right) = rayon::join(
-            || settings_document(Some(left)),
-            || settings_document(Some(right)),
+            || {
+                let _trace_context = trace_context
+                    .map(|context| crate::app::timing::enter_trace_context(Some(context)));
+                settings_document(Some(left))
+            },
+            || {
+                let _trace_context = trace_context
+                    .map(|context| crate::app::timing::enter_trace_context(Some(context)));
+                settings_document(Some(right))
+            },
         );
-        let left = left?;
+        let mut left = left?;
         let mut right = right?;
         let phase = Instant::now();
         let positional = settings_documents_positionally_equivalent(&left, &right);
@@ -4976,6 +5989,7 @@ fn snapshot_entry_equivalent(
         {
             // Comparison already resolved duplicate identities. Reuse that exact
             // mapping and the decoded documents when planning the push.
+            crate::settings::equivalence::inherit_workspace_viewport_reference(&mut left, &right);
             align_equivalent_values(&left, &mut right);
             *prepared = Some(PreparedEditorSettingsChange {
                 previous: right,
@@ -5159,6 +6173,186 @@ fn snapshot_differences(
     snapshot_differences_prepared(left, right, None)
 }
 
+fn retained_settings_document(document: &SettingsBytecode) -> SettingsBytecode {
+    let mut retained = BTreeSet::new();
+    for (index, instance) in document.instances.iter().enumerate() {
+        if instance.parent_index.is_none()
+            || is_protected_engine_container(document, index)
+            || is_reconciliation_protected_workspace_camera(document, index)
+        {
+            let mut ancestor = Some(index);
+            while let Some(index) = ancestor {
+                if !retained.insert(index) {
+                    break;
+                }
+                ancestor = document.instances[index].parent_index;
+            }
+        }
+    }
+    let remap = retained
+        .iter()
+        .enumerate()
+        .map(|(new, old)| (*old, new))
+        .collect::<HashMap<_, _>>();
+    SettingsBytecode {
+        version: document.version,
+        instances: retained
+            .into_iter()
+            .map(|index| {
+                let mut instance = document.instances[index].clone();
+                instance.parent_index = instance.parent_index.map(|parent| remap[&parent]);
+                instance
+            })
+            .collect(),
+    }
+}
+
+fn project_replacement_paths(
+    desired: &ProjectSnapshot,
+    observed: &ProjectSnapshot,
+) -> HashSet<PathBuf> {
+    desired
+        .entries
+        .keys()
+        .chain(observed.entries.keys())
+        .filter(|path| !derived_project_path(path))
+        .cloned()
+        .collect()
+}
+
+fn prepare_project_replacement(
+    desired: &ProjectSnapshot,
+    observed: &ProjectSnapshot,
+    paths: &HashSet<PathBuf>,
+    prepared: &mut HashMap<PathBuf, PreparedEditorSettingsChange>,
+) -> Result<HashSet<PathBuf>> {
+    let trace_context = crate::app::timing::trace_context();
+    let mut stages = crate::app::timing::trace_stages(
+        "push.prepare",
+        "join parallel source decode and retained-container preparation",
+    );
+    let documents = paths
+        .par_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_service_settings_file_name)
+        })
+        .map(|path| {
+            let _trace_context =
+                trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
+            let mut worker = crate::app::timing::trace_stages(
+                "push.prepare.worker",
+                "join desired and observed settings decode",
+            );
+            let (current, previous) = rayon::join(
+                || {
+                    let _context = trace_context
+                        .map(|context| crate::app::timing::enter_trace_context(Some(context)));
+                    let _trace =
+                        crate::app::timing::trace_scope("push.decode", "decode desired settings");
+                    settings_document(desired.entries.get(path))
+                },
+                || {
+                    let _context = trace_context
+                        .map(|context| crate::app::timing::enter_trace_context(Some(context)));
+                    let _trace =
+                        crate::app::timing::trace_scope("push.decode", "decode observed settings");
+                    settings_document(observed.entries.get(path))
+                },
+            );
+            worker.next("align retained-container identities and viewport references");
+            let mut current = current?;
+            let previous = previous?;
+            if settings_documents_positionally_equivalent(&current, &previous) {
+                drop_settings_documents(current, previous);
+                return Ok((path.clone(), None));
+            }
+            let previous = if current.instances.is_empty() {
+                // An omitted store clears authored contents through the existing
+                // removal policy; engine service objects themselves remain.
+                previous
+            } else if service_has_only_native_containers(&previous) {
+                // Only identities that survive replacement need matching.
+                // Incoming descendants are not compared with outgoing content.
+                let mut retained = retained_settings_document(&previous);
+                drop_settings_document(previous);
+                if !align_settings_ids_to_reference(&current, &mut retained) {
+                    bail!(
+                        "Could not align retained Studio objects in {}",
+                        path.display()
+                    );
+                }
+                crate::settings::equivalence::inherit_workspace_viewport_reference(
+                    &mut current,
+                    &retained,
+                );
+                retained
+            } else {
+                let mut previous = previous;
+                if !align_settings_ids_to_reference(&current, &mut previous) {
+                    bail!(
+                        "Could not align existing Studio objects in {}",
+                        path.display()
+                    );
+                }
+                crate::settings::equivalence::inherit_workspace_viewport_reference(
+                    &mut current,
+                    &previous,
+                );
+                if settings_documents_equivalent(&current, &previous) {
+                    drop_settings_documents(current, previous);
+                    return Ok((path.clone(), None));
+                }
+                let current_by_id = current
+                    .instances
+                    .iter()
+                    .enumerate()
+                    .map(|(index, instance)| (instance.settings_id.as_str(), index))
+                    .collect::<HashMap<_, _>>();
+                let reusable = previous
+                    .instances
+                    .iter()
+                    .enumerate()
+                    .any(|(index, instance)| {
+                        instance.parent_index.is_some()
+                            && !is_protected_engine_container(&previous, index)
+                            && !is_reconciliation_protected_workspace_camera(&previous, index)
+                            && current_by_id
+                                .get(instance.settings_id.as_str())
+                                .is_some_and(|&other| {
+                                    settings_instances_equal(&current, other, &previous, index)
+                                })
+                    });
+                // With no incoming authored objects there is no native payload
+                // to replace this service. Keep outgoing identities so the delta
+                // planner can remove them, including children of locked containers.
+                if reusable || service_has_only_native_containers(&current) {
+                    previous
+                } else {
+                    let retained = retained_settings_document(&previous);
+                    drop_settings_document(previous);
+                    retained
+                }
+            };
+            Ok((
+                path.clone(),
+                Some(PreparedEditorSettingsChange { previous, current }),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    stages.next("index prepared service documents");
+    let mut unchanged = HashSet::new();
+    for (path, change) in documents {
+        if let Some(change) = change {
+            prepared.insert(path, change);
+        } else {
+            unchanged.insert(path);
+        }
+    }
+    Ok(unchanged)
+}
+
 fn snapshot_differences_prepared(
     left: &ProjectSnapshot,
     right: &ProjectSnapshot,
@@ -5173,9 +6367,12 @@ fn snapshot_differences_prepared(
     paths.sort();
     paths.dedup();
     let prepare = prepared.is_some();
+    let trace_context = crate::app::timing::trace_context();
     let compared = paths
         .into_par_iter()
         .map(|path| {
+            let _trace_context =
+                trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
             let mut settings = None;
             let equivalent = snapshot_entry_equivalent(
                 &path,
@@ -5196,6 +6393,54 @@ fn snapshot_differences_prepared(
         differences.insert(path);
     }
     Ok(differences)
+}
+
+// Copy immutable source bytes into the private push stage. Complete removals
+// and directory creation first, then write independent files concurrently.
+// Linked paths retain the ordered copy path because they can alias one another.
+fn stage_snapshot_paths(
+    root: &Path,
+    paths: &HashSet<PathBuf>,
+    snapshot: &ProjectSnapshot,
+) -> Result<()> {
+    if snapshot
+        .entries
+        .values()
+        .any(|entry| matches!(entry, SnapshotEntry::Symlink { .. }))
+    {
+        return apply_snapshot_paths(root, paths, snapshot);
+    }
+    let mut ordered = paths
+        .iter()
+        .filter(|path| !derived_project_path(path))
+        .collect::<Vec<_>>();
+    ordered.sort();
+    let mut files = Vec::new();
+    let mut directories = BTreeSet::new();
+    for relative in ordered {
+        let path = root.join(relative);
+        match snapshot.entries.get(relative) {
+            Some(SnapshotEntry::File(bytes)) => {
+                remove_path(&path)?;
+                if let Some(parent) = path.parent() {
+                    directories.insert(parent.to_path_buf());
+                }
+                files.push((path, bytes));
+            }
+            Some(SnapshotEntry::Directory) => {
+                directories.insert(path);
+            }
+            None => remove_path(&path)?,
+            Some(SnapshotEntry::Symlink { .. }) => unreachable!(),
+        }
+    }
+    for directory in directories {
+        fs::create_dir_all(&directory)
+            .with_context(|| format!("Failed to create {}", directory.display()))?;
+    }
+    files.par_iter().try_for_each(|(path, bytes)| {
+        fs::write(path, bytes).with_context(|| format!("Failed to write {}", path.display()))
+    })
 }
 
 fn apply_snapshot_paths(
@@ -5292,9 +6537,17 @@ fn load_record(context: &BoundContext, key: &str) -> Result<Option<PairRecord>> 
     let path = record_path(context, key);
     match fs::read(&path) {
         Ok(bytes) => {
-            return Ok(Some(rmp_serde::from_slice(&bytes).with_context(|| {
-                format!("Failed to decode {}", path.display())
-            })?));
+            let mut record: PairRecord = rmp_serde::from_slice(&bytes)
+                .with_context(|| format!("Failed to decode {}", path.display()))?;
+            if let Some(baseline) = record.baseline.as_mut()
+                && baseline.migrate_store_paths(Path::new(&context.root))?
+            {
+                record.studio_checkpoint = None;
+                record.local_file_stamp = None;
+                record.local_file_digest = None;
+                write_record(context, key, &record)?;
+            }
+            return Ok(Some(record));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
@@ -5365,6 +6618,529 @@ fn read_compressed<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relocated_supporting_stores_use_relative_snapshot_keys() -> Result<()> {
+        let root = crate::tests::support::temp_dir("supporting-store-scope");
+        let _cleanup = crate::system::files::OnDrop::new(|| {
+            crate::project::storage::forget(&root);
+            let _ = fs::remove_dir_all(&root);
+        });
+        let project = root.join("renium.project.jsonc");
+        fs::write(
+            &project,
+            br#"{"schemaVersion":1,"sourceRoot":"code/scripts"}"#,
+        )?;
+        config::load_project(Some(&project), None)?;
+        let context = BoundContext {
+            id: 1,
+            initialized: true,
+            project: project.to_string_lossy().into_owned(),
+            root: root.to_string_lossy().into_owned(),
+            experience: String::new(),
+            source: root.join("code/scripts").to_string_lossy().into_owned(),
+            resource_lease: None,
+            place_id: None,
+            game_id: None,
+            selector: String::new(),
+            runtime_id: None,
+            plugin_build: None,
+            fingerprint: String::new(),
+        };
+        let store = PathBuf::from("instances/ServerStorage.renium");
+        fs::create_dir_all(root.join("instances"))?;
+        fs::write(root.join(&store), b"unchanged store")?;
+        for path in [
+            PathBuf::from("code/scripts/ServerStorage/Module.luau"),
+            store.clone(),
+        ] {
+            let changed = HashSet::from([path]);
+            assert_eq!(
+                services_for_snapshot_paths(&context, &changed),
+                ["ServerStorage"]
+            );
+            let scopes = supporting_settings_scopes(&context, &changed)?;
+            assert_eq!(scopes, std::slice::from_ref(&store));
+            let expected = capture_snapshot(&root, std::slice::from_ref(&store))?;
+            let current = capture_snapshot(&root, &scopes)?;
+            assert_eq!(
+                expected.entries.keys().collect::<Vec<_>>(),
+                current.entries.keys().collect::<Vec<_>>()
+            );
+            assert!(
+                snapshot_path_differences(&expected, &current, &scopes.into_iter().collect())?
+                    .is_empty()
+            );
+        }
+        fs::write(
+            &project,
+            br#"{"schemaVersion":1,"sourceRoot":"code/scripts","tree":{"StarterPlayer":{"StarterPlayerScripts":{"$className":"StarterPlayerScripts","$path":"code/scripts/client"}}}}"#,
+        )?;
+        fs::create_dir_all(root.join("code/scripts/client"))?;
+        fs::write(
+            root.join("code/scripts/client/Main.client.luau"),
+            b"-- client\n",
+        )?;
+        let changed = HashSet::from([PathBuf::from("code/scripts/client/Main.client.luau")]);
+        let services = services_for_snapshot_paths(&context, &changed);
+        assert_eq!(services, ["StarterPlayer"]);
+        let stage = ExportProjectStage::create(&root, Path::new("code/scripts"), &services)?;
+        assert!(
+            stage
+                .loaded
+                .as_ref()
+                .unwrap()
+                .project
+                .tree
+                .contains_key("StarterPlayer")
+        );
+        assert!(
+            stage
+                .import_project_root
+                .join("StarterPlayer/StarterPlayerScripts/Main.client.luau")
+                .is_file()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn native_bootstrap_does_not_replace_nonempty_service_deltas() {
+        let document = Arc::new(SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                SettingsBytecodeInstance::new(
+                    "root".into(),
+                    "Workspace".into(),
+                    "Workspace".into(),
+                    None,
+                ),
+                SettingsBytecodeInstance::new(
+                    "mesh".into(),
+                    "Mesh".into(),
+                    "MeshPart".into(),
+                    Some(0),
+                ),
+            ],
+        });
+        let mut changes = EditorChangeSet::default();
+        for (service, mode) in [
+            ("TestService", "deleteInstances"),
+            ("Workspace", "upsertInstances"),
+            ("TestService", "upsertInstances"),
+            ("Workspace", "deleteInstances"),
+        ] {
+            changes.instance_changes.push(EditorInstanceChange {
+                service: service.into(),
+                mode: mode.into(),
+                allow_deletes: false,
+                instances: Vec::new(),
+                preserve_instances: Vec::new(),
+            });
+        }
+        let empty = HashMap::new();
+        let before = serde_json::to_value(&changes.instance_changes).unwrap();
+        stage_native_bootstrap_services(&mut changes, &empty);
+        assert_eq!(
+            serde_json::to_value(&changes.instance_changes).unwrap(),
+            before
+        );
+        stage_native_bootstrap_services(
+            &mut changes,
+            &HashMap::from([("Workspace".into(), Arc::clone(&document))]),
+        );
+        assert_eq!(changes.instance_changes.len(), 3);
+        assert_eq!(changes.instance_changes[0].service, "TestService");
+        assert_eq!(changes.instance_changes[0].mode, "deleteInstances");
+        assert_eq!(changes.instance_changes[1].service, "TestService");
+        assert_eq!(changes.instance_changes[1].mode, "upsertInstances");
+        let native = &changes.instance_changes[2];
+        assert_eq!(native.service, "Workspace");
+        assert_eq!(native.mode, "reconcileService");
+        assert!(native.allow_deletes);
+        assert_eq!(native.instances.len(), 1);
+        assert_eq!(native.instances[0].settings_id, "mesh");
+    }
+
+    #[test]
+    fn native_bootstrap_preserves_retained_root_edits_and_source_paths() {
+        let document = Arc::new(SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                SettingsBytecodeInstance::new(
+                    "root".into(),
+                    "Workspace".into(),
+                    "Workspace".into(),
+                    None,
+                ),
+                SettingsBytecodeInstance::new(
+                    "mesh".into(),
+                    "Mesh".into(),
+                    "MeshPart".into(),
+                    Some(0),
+                ),
+            ],
+        });
+        let mut desired = document.as_ref().clone();
+        desired.instances[0]
+            .properties
+            .insert("Gravity".into(), json!(150));
+        for index in 0..4096 {
+            desired.instances.push(SettingsBytecodeInstance::new(
+                format!("new-{index}"),
+                format!("Part{index}"),
+                "Part".into(),
+                Some(0),
+            ));
+        }
+        let mut previous = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![document.instances[0].clone()],
+        };
+        previous.instances[0]
+            .attributes
+            .insert("Removed".into(), json!(true));
+        let path = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
+        let prepared = HashMap::from([(
+            path.clone(),
+            PreparedEditorSettingsChange {
+                previous,
+                current: desired,
+            },
+        )]);
+        let paths = HashSet::from([path.clone()]);
+        let snapshot = ProjectSnapshot::default();
+        let full = reconciliation_push_plan_for_paths_with_prepared_settings(
+            &snapshot, &snapshot, &paths, &prepared, true, false,
+        )
+        .unwrap();
+        assert_eq!(full.changed_paths, vec![path.clone()]);
+        assert_eq!(full.target_settings_ids, vec!["root"]);
+        assert!(full.recreated_settings_ids.is_empty());
+        assert_eq!(
+            full.property_removals[0].deleted_attributes,
+            vec!["Removed"]
+        );
+        assert!(full.initial_native_services.contains("Workspace"));
+        let incremental = reconciliation_push_plan_for_paths_with_prepared_settings(
+            &snapshot, &snapshot, &paths, &prepared, false, false,
+        )
+        .unwrap();
+        assert_eq!(incremental.recreated_settings_ids.len(), 4097);
+        assert_eq!(incremental.target_settings_ids.len(), 4098);
+        assert_eq!(
+            incremental.property_removals[0].deleted_attributes,
+            vec!["Removed"]
+        );
+
+        let mut outgoing = prepared[&path].previous.clone();
+        outgoing.instances.push(SettingsBytecodeInstance::new(
+            "outgoing".into(),
+            "OnlyInStudio".into(),
+            "Folder".into(),
+            Some(0),
+        ));
+        let mut before = ProjectSnapshot {
+            entries: BTreeMap::from([(
+                path.clone(),
+                SnapshotEntry::File(encode_settings_bytecode(&outgoing).unwrap()),
+            )]),
+        };
+        let mut requested = ProjectSnapshot {
+            entries: BTreeMap::from([(
+                path.clone(),
+                SnapshotEntry::File(encode_settings_bytecode(&prepared[&path].current).unwrap()),
+            )]),
+        };
+        let source_path = PathBuf::from("src/Workspace/Unchanged.server.luau");
+        let source = SnapshotEntry::File(b"return 1".to_vec());
+        before.entries.insert(source_path.clone(), source.clone());
+        requested.entries.insert(source_path.clone(), source);
+        let mut replacement = HashMap::new();
+        let paths = project_replacement_paths(&requested, &before);
+        prepare_project_replacement(&requested, &before, &paths, &mut replacement).unwrap();
+        assert_eq!(replacement[&path].previous.instances.len(), 1);
+        assert_eq!(replacement[&path].current.instances.len(), 4098);
+        let replaced = reconciliation_push_plan_for_paths_with_prepared_settings(
+            &before,
+            &requested,
+            &paths,
+            &replacement,
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(replaced.target_settings_ids, vec!["root"]);
+        assert!(replaced.initial_native_services.contains("Workspace"));
+        assert!(replaced.recreated_settings_ids.is_empty());
+        assert!(replaced.instance_deletes.is_empty());
+        assert!(replaced.changed_paths.contains(&source_path));
+        assert_eq!(
+            replaced.property_removals[0].deleted_attributes,
+            vec!["Removed"]
+        );
+    }
+
+    #[test]
+    fn full_push_clears_authored_contents_when_only_engine_containers_remain() {
+        for (service, container) in [
+            ("ReplicatedStorage", None),
+            ("StarterPlayer", Some("StarterPlayerScripts")),
+        ] {
+            let mut current = SettingsBytecode {
+                version: SETTINGS_BINARY_VERSION,
+                instances: vec![SettingsBytecodeInstance::new(
+                    "root".into(),
+                    service.into(),
+                    service.into(),
+                    None,
+                )],
+            };
+            if let Some(container) = container {
+                current.instances.push(SettingsBytecodeInstance::new(
+                    "container".into(),
+                    container.into(),
+                    container.into(),
+                    Some(0),
+                ));
+            }
+            let mut previous = current.clone();
+            previous.instances.push(SettingsBytecodeInstance::new(
+                "removed".into(),
+                "OnlyInStudio".into(),
+                "ModuleScript".into(),
+                Some(current.instances.len() - 1),
+            ));
+            let path = PathBuf::from(format!("instances/{service}.renium"));
+            let snapshot = |document: &SettingsBytecode| ProjectSnapshot {
+                entries: BTreeMap::from([(
+                    path.clone(),
+                    SnapshotEntry::File(encode_settings_bytecode(document).unwrap()),
+                )]),
+            };
+            let desired = snapshot(&current);
+            let observed = snapshot(&previous);
+            let paths = project_replacement_paths(&desired, &observed);
+            let mut prepared = HashMap::new();
+            let unchanged =
+                prepare_project_replacement(&desired, &observed, &paths, &mut prepared).unwrap();
+            assert!(!unchanged.contains(&path));
+            assert!(!settings_documents_equivalent(
+                &prepared[&path].current,
+                &prepared[&path].previous,
+            ));
+            let plan = reconciliation_push_plan_for_paths_with_prepared_settings(
+                &observed, &desired, &paths, &prepared, true, false,
+            )
+            .unwrap();
+            assert!(plan.initial_native_services.is_empty());
+            assert_eq!(plan.instance_deletes.len(), 1);
+            assert_eq!(plan.instance_deletes[0].instances.len(), 1);
+            assert_eq!(plan.instance_deletes[0].instances[0].settings_id, "removed");
+        }
+    }
+
+    #[test]
+    fn full_push_reuses_populated_instances_and_plans_only_the_delta() {
+        let root = SettingsBytecodeInstance::new(
+            "root".into(),
+            "ServerStorage".into(),
+            "ServerStorage".into(),
+            None,
+        );
+        let mut current = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![root],
+        };
+        for index in 0..4096 {
+            let mut part = SettingsBytecodeInstance::new(
+                format!("part-{index}"),
+                format!("Part{index}"),
+                "Part".into(),
+                Some(0),
+            );
+            part.attributes.insert("Keep".into(), json!(true));
+            current.instances.push(part);
+        }
+        let mut previous = current.clone();
+        current.instances[43]
+            .attributes
+            .insert("Keep".into(), json!(false));
+        previous.instances.push(SettingsBytecodeInstance::new(
+            "outgoing".into(),
+            "OnlyInStudio".into(),
+            "Folder".into(),
+            Some(0),
+        ));
+        let path = PathBuf::from("src/ServerStorage/__roblox_sync_settings.renium");
+        let snapshot = |document: &SettingsBytecode| ProjectSnapshot {
+            entries: BTreeMap::from([(
+                path.clone(),
+                SnapshotEntry::File(encode_settings_bytecode(document).unwrap()),
+            )]),
+        };
+        let desired = snapshot(&current);
+        let observed = snapshot(&previous);
+        let paths = project_replacement_paths(&desired, &observed);
+        let mut prepared = HashMap::new();
+        prepare_project_replacement(&desired, &observed, &paths, &mut prepared).unwrap();
+        assert_eq!(prepared[&path].previous.instances.len(), 4098);
+        let plan = reconciliation_push_plan_for_paths_with_prepared_settings(
+            &observed, &desired, &paths, &prepared, true, false,
+        )
+        .unwrap();
+        assert!(plan.initial_native_services.is_empty());
+        assert!(plan.recreated_settings_ids.is_empty());
+        assert_eq!(plan.target_settings_ids, vec!["part-42"]);
+        assert!(
+            plan.attribute_only_instances
+                .contains(&("ServerStorage".into(), "part-42".into()))
+        );
+        assert_eq!(plan.instance_deletes.len(), 1);
+        assert_eq!(plan.instance_deletes[0].instances.len(), 1);
+        assert_eq!(
+            plan.instance_deletes[0].instances[0]
+                .path_segments
+                .last()
+                .unwrap(),
+            "OnlyInStudio"
+        );
+        let mut changes = EditorChangeSet::default();
+        changes.instance_changes.push(EditorInstanceChange {
+            mode: "upsertInstances".into(),
+            service: "ServerStorage".into(),
+            allow_deletes: false,
+            instances: vec![crate::editor::types::EditorInstanceDescriptor {
+                settings_id: "part-42".into(),
+                class_name: "Part".into(),
+                ..Default::default()
+            }],
+            preserve_instances: Vec::new(),
+        });
+        changes.property_changes.push(EditorPropertyChange {
+            service: "ServerStorage".into(),
+            settings_id: Some("part-42".into()),
+            class_name: "Part".into(),
+            path_segments: Vec::new(),
+            path_ordinals: Vec::new(),
+            properties: Map::from_iter([("Anchored".into(), json!(true))]),
+            reset_properties: Vec::new(),
+            attributes: Map::from_iter([("Keep".into(), json!(false))]),
+            deleted_attributes: vec!["Removed".into()],
+        });
+        amend_reconciled_changes(&mut changes, plan).unwrap();
+        assert_eq!(changes.instance_changes[0].mode, "deleteInstances");
+        assert!(!changes.instance_changes[0].instances[0].anchor_only);
+        assert!(changes.instance_changes[1].instances[0].anchor_only);
+        assert!(changes.property_changes[0].properties.is_empty());
+        assert_eq!(changes.property_changes[0].attributes["Keep"], false);
+        assert_eq!(changes.property_changes[0].deleted_attributes, ["Removed"]);
+    }
+
+    #[test]
+    fn folder_icon_tint_default_does_not_invent_full_push_changes() {
+        let black = json!({"_type": "Color3", "r": 0.0, "g": 0.0, "b": 0.0});
+        let red = json!({"_type": "Color3", "r": 1.0, "g": 0.0, "b": 0.0});
+        assert!(reconciliation_property_values_equal(
+            "Folder",
+            "IconTint",
+            None,
+            Some(&black)
+        ));
+        assert!(!reconciliation_property_values_equal(
+            "Folder",
+            "IconTint",
+            None,
+            Some(&red)
+        ));
+        assert!(!reconciliation_values_map_equal(
+            &Map::new(),
+            &Map::from_iter([("IconTint".into(), black)])
+        ));
+    }
+
+    #[test]
+    fn initial_native_import_requires_no_ordinary_instances() {
+        let mut root = SettingsBytecodeInstance::new(
+            "root".into(),
+            "Workspace".into(),
+            "Workspace".into(),
+            None,
+        );
+        root.properties.insert(
+            "CurrentCamera".into(),
+            json!({"_type":"Ref", "settingsId":"viewport"}),
+        );
+        let mut document = SettingsBytecode {
+            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
+            instances: vec![
+                root,
+                SettingsBytecodeInstance::new(
+                    "viewport".into(),
+                    "Renamed".into(),
+                    "Camera".into(),
+                    Some(0),
+                ),
+                SettingsBytecodeInstance::new(
+                    "terrain".into(),
+                    "Terrain".into(),
+                    "Terrain".into(),
+                    Some(0),
+                ),
+            ],
+        };
+        assert!(service_has_only_native_containers(&document));
+        for (class, parent) in [
+            ("Camera", 0),
+            ("Part", 0),
+            ("Folder", 2),
+            ("StringValue", 1),
+        ] {
+            document.instances.push(SettingsBytecodeInstance::new(
+                "ordinary".into(),
+                "Camera".into(),
+                class.into(),
+                Some(parent),
+            ));
+            assert!(!service_has_only_native_containers(&document));
+            document.instances.pop();
+        }
+        document.instances[0].properties.clear();
+        assert!(!service_has_only_native_containers(&document));
+
+        let mut chat = SettingsBytecode {
+            version: document.version,
+            instances: vec![SettingsBytecodeInstance::new(
+                "chat".into(),
+                "TextChatService".into(),
+                "TextChatService".into(),
+                None,
+            )],
+        };
+        for class in [
+            "ChatWindowConfiguration",
+            "ChatInputBarConfiguration",
+            "BubbleChatConfiguration",
+            "ChannelTabsConfiguration",
+        ] {
+            chat.instances.push(SettingsBytecodeInstance::new(
+                class.into(),
+                class.into(),
+                class.into(),
+                Some(0),
+            ));
+        }
+        assert!(service_has_only_native_containers(&chat));
+        chat.instances.push(SettingsBytecodeInstance::new(
+            "content".into(),
+            "Content".into(),
+            "Folder".into(),
+            Some(3),
+        ));
+        assert!(
+            !service_has_only_native_containers(&chat),
+            "User contents must not qualify as an empty destination"
+        );
+    }
     use crate::editor::types::EditorSettingsWrite;
     use crate::settings::bytecode::SettingsBytecodeInstance;
 
@@ -5576,6 +7352,49 @@ mod tests {
     }
 
     #[test]
+    fn protected_snapshot_handoff_replaces_only_its_originating_runtime() {
+        let context = BoundContext {
+            id: 1,
+            initialized: true,
+            project: "project".into(),
+            root: "root".into(),
+            experience: String::new(),
+            source: "src".into(),
+            resource_lease: None,
+            place_id: Some(0),
+            game_id: Some(0),
+            selector: "Fixture".into(),
+            runtime_id: Some("old".into()),
+            plugin_build: None,
+            fingerprint: "same".into(),
+        };
+        assert!(
+            reopened_push_context(&context, &Map::new())
+                .unwrap()
+                .is_none()
+        );
+        let mut summary = Map::from_iter([(
+            "protectedOfflineApply".into(),
+            json!({
+                "ok": true, "previousRuntimeId": "old", "reopenedRuntimeId": "new"
+            }),
+        )]);
+        let replacement = reopened_push_context(&context, &summary).unwrap().unwrap();
+        assert_eq!(replacement.runtime_id.as_deref(), Some("new"));
+        assert_eq!(replacement.project, context.project);
+        assert_eq!(replacement.fingerprint, context.fingerprint);
+        for invalid in [
+            json!({"ok":true,"previousRuntimeId":"foreign","reopenedRuntimeId":"new"}),
+            json!({"ok":true,"previousRuntimeId":"old","reopenedRuntimeId":"old"}),
+            json!({"ok":true,"previousRuntimeId":"old","reopenedRuntimeId":""}),
+            json!({"ok":false,"previousRuntimeId":"old","reopenedRuntimeId":"new"}),
+        ] {
+            summary.insert("protectedOfflineApply".into(), invalid);
+            assert!(reopened_push_context(&context, &summary).is_err());
+        }
+    }
+
+    #[test]
     fn studio_checkpoint_requires_uninterrupted_clean_tracking() {
         let context = BoundContext {
             id: 1,
@@ -5671,6 +7490,219 @@ mod tests {
     }
 
     #[test]
+    fn push_verification_distinguishes_engine_identity_from_authored_data() {
+        let mut instance =
+            SettingsBytecodeInstance::new("part".into(), "Part".into(), "Part".into(), None);
+        for name in ["UniqueId", "HistoryId"] {
+            let identity = |value| {
+                Map::from_iter([(
+                    name.to_string(),
+                    json!({"_type": "UniqueId", "value": value}),
+                )])
+            };
+            let before = identity("00000001000000000000000000000001");
+            let desired = identity("00000002000000000000000000000002");
+            let observed = identity("00000003000000000000000000000003");
+            assert_eq!(
+                expected_map_mismatch(&desired, &observed, true, &instance),
+                None
+            );
+            assert_eq!(
+                changed_map_mismatch(&before, &desired, &observed, true, &instance),
+                None
+            );
+            assert!(expected_map_mismatch(&desired, &observed, false, &instance).is_some());
+            assert!(changed_map_mismatch(&before, &desired, &observed, false, &instance).is_some());
+            instance.properties = desired.clone();
+            let document = SettingsBytecode {
+                version: SETTINGS_BINARY_VERSION,
+                instances: vec![instance.clone()],
+            };
+            let decoded =
+                decode_settings_bytecode(&encode_settings_bytecode(&document).unwrap()).unwrap();
+            assert_eq!(decoded.instances[0].properties[name], desired[name]);
+        }
+        for name in ["MeshSize", "CollisionFidelity", "TexturePack", "Part0"] {
+            let before = Map::from_iter([(name.to_string(), json!("before"))]);
+            let desired = Map::from_iter([(name.to_string(), json!("source"))]);
+            let observed = Map::from_iter([(name.to_string(), json!("destination"))]);
+            assert!(expected_map_mismatch(&desired, &observed, true, &instance).is_some());
+            assert!(changed_map_mismatch(&before, &desired, &observed, true, &instance).is_some());
+        }
+    }
+
+    #[test]
+    fn push_verification_follows_game_settings_policy_without_hiding_saved_values() {
+        let path = PathBuf::from("src/Players/__roblox_sync_settings.renium");
+        let document = |name: &str, capacity: Option<i64>, auto_loads: bool| SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![SettingsBytecodeInstance {
+                settings_id: "players".to_string(),
+                name: "Players".to_string(),
+                class_name: "Players".to_string(),
+                parent_index: None,
+                properties: std::iter::once(("CharacterAutoLoads".to_string(), json!(auto_loads)))
+                    .chain(capacity.map(|value| (name.to_string(), json!(value))))
+                    .collect(),
+                attributes: Map::new(),
+            }],
+        };
+        let entry = |document: &SettingsBytecode| {
+            SnapshotEntry::File(encode_settings_bytecode(document).unwrap())
+        };
+        for name in [
+            "MaxPlayers",
+            "PreferredPlayers",
+            "MaxPlayersInternal",
+            "PreferredPlayersInternal",
+        ] {
+            let before = entry(&document(name, Some(12), true));
+            let desired_document = document(name, Some(60), false);
+            let desired = entry(&desired_document);
+            let observed = entry(&document(name, None, false));
+            let failed_ordinary_write = entry(&document(name, None, true));
+            for previous in [None, Some(&before)] {
+                assert_eq!(
+                    settings_delta_mismatch(&path, previous, Some(&desired), Some(&observed), None)
+                        .unwrap(),
+                    None,
+                    "{name} is not a push target"
+                );
+                assert!(
+                    settings_delta_mismatch(
+                        &path,
+                        previous,
+                        Some(&desired),
+                        Some(&failed_ordinary_write),
+                        None
+                    )
+                    .unwrap()
+                    .is_some_and(|detail| detail.contains("CharacterAutoLoads"))
+                );
+            }
+            let decoded = settings_document(Some(&desired)).unwrap();
+            let logical_name = name.strip_suffix("Internal").unwrap_or(name);
+            assert_eq!(decoded.instances[0].properties[logical_name], json!(60));
+            assert!(!settings_documents_equivalent(
+                &decoded,
+                &settings_document(Some(&observed)).unwrap()
+            ));
+
+            // This policy applies to properties of the actual service root,
+            // not attributes, a same-named Folder, or a nested instance.
+            let missing = Map::new();
+            let mut instance = desired_document.instances[0].clone();
+            let requested = Map::from_iter([(name.to_string(), json!(60))]);
+            for (class, parent, properties) in [
+                ("Players", None, false),
+                ("Folder", None, true),
+                ("Players", Some(0), true),
+            ] {
+                instance.class_name = class.to_string();
+                instance.parent_index = parent;
+                assert!(
+                    expected_map_mismatch(&requested, &missing, properties, &instance).is_some()
+                );
+                assert!(
+                    changed_map_mismatch(&missing, &requested, &missing, properties, &instance)
+                        .is_some()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn push_verification_batch_preserves_all_failures_and_decode_errors() {
+        let before = ProjectSnapshot::default();
+        let mut desired = ProjectSnapshot::default();
+        let mut observed = ProjectSnapshot::default();
+        for service in ["ReplicatedStorage", "ServerStorage", "Workspace"] {
+            let path = PathBuf::from(format!("src/{service}/__roblox_sync_settings.renium"));
+            let mut document = SettingsBytecode {
+                version: SETTINGS_BINARY_VERSION,
+                instances: vec![SettingsBytecodeInstance::new(
+                    "root".to_string(),
+                    service.to_string(),
+                    service.to_string(),
+                    None,
+                )],
+            };
+            for index in 1..=2_048 {
+                let mut part = SettingsBytecodeInstance::new(
+                    format!("part{index}"),
+                    format!("Part{index:04}"),
+                    "Part".to_string(),
+                    Some(0),
+                );
+                part.properties.insert("Anchored".to_string(), json!(true));
+                document.instances.push(part);
+            }
+            desired.entries.insert(
+                path.clone(),
+                SnapshotEntry::File(encode_settings_bytecode(&document).unwrap()),
+            );
+            if service != "ServerStorage" {
+                for index in [17, 1_537] {
+                    document.instances[index]
+                        .properties
+                        .insert("Anchored".to_string(), json!(false));
+                }
+            }
+            observed.entries.insert(
+                path,
+                SnapshotEntry::File(encode_settings_bytecode(&document).unwrap()),
+            );
+        }
+        let script = PathBuf::from("src/ServerScriptService/Script.server.luau");
+        desired
+            .entries
+            .insert(script.clone(), SnapshotEntry::File(b"print(1)\n".to_vec()));
+        observed
+            .entries
+            .insert(script, SnapshotEntry::File(b"print(1)\r\n".to_vec()));
+        let paths = desired.entries.keys().cloned().collect();
+        let expected_paths = vec![
+            PathBuf::from("src/ReplicatedStorage/__roblox_sync_settings.renium"),
+            PathBuf::from("src/Workspace/__roblox_sync_settings.renium"),
+        ];
+        for workers in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let (mismatches, detail) = snapshot_intended_delta_mismatches(
+                    &before,
+                    &desired,
+                    &observed,
+                    &paths,
+                    &mut HashMap::new(),
+                )
+                .unwrap();
+                assert_eq!(mismatches, expected_paths);
+                assert_eq!(
+                    detail.as_deref(),
+                    Some("Part0017.Anchored was not retained")
+                );
+                let mut malformed = observed.clone();
+                malformed
+                    .entries
+                    .insert(expected_paths[0].clone(), SnapshotEntry::File(vec![0]));
+                assert!(
+                    snapshot_intended_delta_mismatches(
+                        &before,
+                        &desired,
+                        &malformed,
+                        &paths,
+                        &mut HashMap::new()
+                    )
+                    .is_err()
+                );
+            });
+        }
+    }
+
+    #[test]
     fn targeted_push_verification_ignores_unrelated_studio_edits() {
         let path = PathBuf::from("src/ReplicatedStorage/__roblox_sync_settings.renium");
         let snapshot = |anchored: bool, concurrent: Option<&str>| {
@@ -5715,15 +7747,43 @@ mod tests {
         let desired = snapshot(false, None);
         let observed = snapshot(false, Some("kept"));
         let paths = HashSet::from([path.clone()]);
-        let (mismatches, _) =
-            snapshot_intended_delta_mismatches(&before, &desired, &observed, &paths).unwrap();
-        assert!(mismatches.is_empty());
-
         let overwritten = snapshot(true, Some("kept"));
-        let (mismatches, detail) =
-            snapshot_intended_delta_mismatches(&before, &desired, &overwritten, &paths).unwrap();
-        assert_eq!(mismatches, vec![path]);
-        assert!(detail.is_some_and(|detail| detail.contains("Anchored")));
+        for reuse in [false, true] {
+            let prepared = || {
+                if reuse {
+                    HashMap::from([(
+                        path.clone(),
+                        PreparedPushVerification {
+                            previous: settings_document(before.entries.get(&path)).unwrap(),
+                            desired: Arc::new(
+                                settings_document(desired.entries.get(&path)).unwrap(),
+                            ),
+                        },
+                    )])
+                } else {
+                    HashMap::new()
+                }
+            };
+            let (mismatches, _) = snapshot_intended_delta_mismatches(
+                &before,
+                &desired,
+                &observed,
+                &paths,
+                &mut prepared(),
+            )
+            .unwrap();
+            assert!(mismatches.is_empty());
+            let (mismatches, detail) = snapshot_intended_delta_mismatches(
+                &before,
+                &desired,
+                &overwritten,
+                &paths,
+                &mut prepared(),
+            )
+            .unwrap();
+            assert_eq!(mismatches, vec![path.clone()]);
+            assert!(detail.is_some_and(|detail| detail.contains("Anchored")));
+        }
     }
 
     #[test]
@@ -5784,13 +7844,25 @@ mod tests {
         let desired = snapshot(-1, Some(true));
         let observed = snapshot(1, None);
         let paths = HashSet::from([path.clone()]);
-        let (mismatches, _) =
-            snapshot_intended_delta_mismatches(&before, &desired, &observed, &paths).unwrap();
+        let (mismatches, _) = snapshot_intended_delta_mismatches(
+            &before,
+            &desired,
+            &observed,
+            &paths,
+            &mut HashMap::new(),
+        )
+        .unwrap();
         assert!(mismatches.is_empty());
 
         let observed = snapshot(1, Some(false));
-        let (mismatches, detail) =
-            snapshot_intended_delta_mismatches(&before, &desired, &observed, &paths).unwrap();
+        let (mismatches, detail) = snapshot_intended_delta_mismatches(
+            &before,
+            &desired,
+            &observed,
+            &paths,
+            &mut HashMap::new(),
+        )
+        .unwrap();
         assert_eq!(mismatches, vec![path]);
         assert!(detail.is_some_and(|detail| detail.contains("Archivable")));
     }
@@ -5843,13 +7915,25 @@ mod tests {
         let desired = snapshot("return 'desired'", "return 'desired'\n");
         let observed = snapshot("external", "return 'desired'\n");
         let paths = HashSet::from([settings_path.clone(), source_path.clone()]);
-        let (mismatches, _) =
-            snapshot_intended_delta_mismatches(&before, &desired, &observed, &paths).unwrap();
+        let (mismatches, _) = snapshot_intended_delta_mismatches(
+            &before,
+            &desired,
+            &observed,
+            &paths,
+            &mut HashMap::new(),
+        )
+        .unwrap();
         assert!(mismatches.is_empty());
 
         let observed = snapshot("return 'desired'", "return 'wrong'\n");
-        let (mismatches, _) =
-            snapshot_intended_delta_mismatches(&before, &desired, &observed, &paths).unwrap();
+        let (mismatches, _) = snapshot_intended_delta_mismatches(
+            &before,
+            &desired,
+            &observed,
+            &paths,
+            &mut HashMap::new(),
+        )
+        .unwrap();
         assert_eq!(mismatches, vec![source_path]);
     }
 
@@ -6878,7 +8962,7 @@ mod tests {
         );
         let expected = reconciliation_push_plan_for_paths(&studio, &project, &paths).unwrap();
         let actual = reconciliation_push_plan_for_paths_with_prepared_settings(
-            &studio, &project, &paths, &prepared,
+            &studio, &project, &paths, &prepared, false, false,
         )
         .unwrap();
         assert_eq!(actual.changed_paths, expected.changed_paths);
@@ -6895,6 +8979,200 @@ mod tests {
             serde_json::to_value(&actual.property_removals).unwrap(),
             serde_json::to_value(&expected.property_removals).unwrap()
         );
+    }
+
+    #[test]
+    fn viewport_retention_does_not_skip_other_camera_mutations_or_verification() {
+        let path = Path::new("src/Workspace/__roblox_sync_settings.renium");
+        let mut root = SettingsBytecodeInstance::new(
+            "root".into(),
+            "Workspace".into(),
+            "Workspace".into(),
+            None,
+        );
+        root.properties.insert(
+            "CurrentCamera".into(),
+            json!({"_type": "Ref", "settingsId": "viewport"}),
+        );
+        let mut camera = SettingsBytecodeInstance::new(
+            "viewport".into(),
+            "Camera".into(),
+            "Camera".into(),
+            Some(0),
+        );
+        camera.properties.insert("FieldOfView".into(), json!(70));
+        let mut other = camera.clone();
+        other.settings_id = "other".into();
+        let before = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![root, camera, other],
+        };
+        let entry = |document: &SettingsBytecode| {
+            SnapshotEntry::File(encode_settings_bytecode(document).unwrap())
+        };
+        let before_entry = entry(&before);
+        let mut desired = before.clone();
+        for instance in &mut desired.instances[1..] {
+            instance.properties.insert("FieldOfView".into(), json!(85));
+        }
+        let mut plan = ReconcilePushPlan::default();
+        append_aligned_settings_push_plan(path, &desired, &before, &mut plan).unwrap();
+        assert_eq!(plan.target_settings_ids, ["other"]);
+        let desired_entry = entry(&desired);
+        assert!(
+            settings_delta_mismatch(
+                path,
+                Some(&before_entry),
+                Some(&desired_entry),
+                Some(&before_entry),
+                None
+            )
+            .unwrap()
+            .is_some()
+        );
+        let mut observed = before.clone();
+        observed.instances[2]
+            .properties
+            .insert("FieldOfView".into(), json!(85));
+        assert!(
+            settings_delta_mismatch(
+                path,
+                Some(&before_entry),
+                Some(&desired_entry),
+                Some(&entry(&observed)),
+                None
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        desired.instances.truncate(1);
+        desired.instances[0].properties.remove("CurrentCamera");
+        let mut plan = ReconcilePushPlan::default();
+        append_aligned_settings_push_plan(path, &desired, &before, &mut plan).unwrap();
+        assert_eq!(plan.instance_deletes.len(), 1);
+        assert_eq!(plan.instance_deletes[0].instances.len(), 1);
+        let desired_entry = entry(&desired);
+        assert!(
+            settings_delta_mismatch(
+                path,
+                Some(&before_entry),
+                Some(&desired_entry),
+                Some(&before_entry),
+                None
+            )
+            .unwrap()
+            .is_some()
+        );
+        observed.instances.truncate(2);
+        assert!(
+            settings_delta_mismatch(
+                path,
+                Some(&before_entry),
+                Some(&desired_entry),
+                Some(&entry(&observed)),
+                None
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn omitted_engine_container_keeps_anchor_but_removes_ordinary_contents() {
+        for (service, class_name) in [
+            ("Workspace", "Terrain"),
+            ("StarterPlayer", "StarterPlayerScripts"),
+            ("StarterPlayer", "StarterCharacterScripts"),
+            ("TextChatService", "ChatWindowConfiguration"),
+            ("TextChatService", "ChatInputBarConfiguration"),
+            ("TextChatService", "BubbleChatConfiguration"),
+            ("TextChatService", "ChannelTabsConfiguration"),
+        ] {
+            let instance =
+                |id: &str, name: &str, class: &str, parent_index| SettingsBytecodeInstance {
+                    settings_id: id.into(),
+                    name: name.into(),
+                    class_name: class.into(),
+                    parent_index,
+                    properties: Map::new(),
+                    attributes: Map::new(),
+                };
+            let root = instance("root", service, service, None);
+            let container = instance("anchor", class_name, class_name, Some(0));
+            let child = instance("child", "RemovedContent", "Folder", Some(1));
+            let namesake = instance("namesake", class_name, "Folder", Some(0));
+            let document = |instances| SettingsBytecode {
+                version: SETTINGS_BINARY_VERSION,
+                instances,
+            };
+            let before = document(vec![root.clone(), container.clone(), child, namesake]);
+            let desired = document(vec![root.clone()]);
+            let actual = document(vec![root, container]);
+            let path = PathBuf::from(format!("src/{service}/__roblox_sync_settings.renium"));
+            let mut plan = ReconcilePushPlan::default();
+            append_aligned_settings_push_plan(&path, &desired, &before, &mut plan).unwrap();
+            let deleted: HashSet<_> = plan
+                .instance_deletes
+                .iter()
+                .flat_map(|change| {
+                    change
+                        .instances
+                        .iter()
+                        .map(|entry| entry.settings_id.as_str())
+                })
+                .collect();
+            assert_eq!(
+                deleted,
+                HashSet::from(["child", "namesake"]),
+                "{class_name}"
+            );
+            let entry = |doc: &SettingsBytecode| {
+                SnapshotEntry::File(encode_settings_bytecode(doc).unwrap())
+            };
+            for desired in [Some(entry(&desired)), None] {
+                assert_eq!(
+                    settings_delta_mismatch(
+                        &path,
+                        Some(&entry(&before)),
+                        desired.as_ref(),
+                        Some(&entry(&actual)),
+                        None
+                    )
+                    .unwrap(),
+                    None,
+                    "{class_name}"
+                );
+                assert!(
+                    settings_delta_mismatch(
+                        &path,
+                        Some(&entry(&before)),
+                        desired.as_ref(),
+                        Some(&entry(&before)),
+                        None
+                    )
+                    .unwrap()
+                    .is_some(),
+                    "Contents must be removed"
+                );
+            }
+            let mut authored = actual.clone();
+            authored.instances[1]
+                .attributes
+                .insert("Authored".into(), json!(true));
+            assert!(
+                settings_delta_mismatch(
+                    &path,
+                    Some(&entry(&actual)),
+                    Some(&entry(&authored)),
+                    Some(&entry(&actual)),
+                    None
+                )
+                .unwrap()
+                .is_some(),
+                "Authored anchor edits must verify"
+            );
+        }
     }
 
     #[test]
@@ -6932,7 +9210,8 @@ mod tests {
         assert!(plan.property_removals.is_empty());
         let remaining = entry(&document(vec![root.clone()]));
         assert_eq!(
-            settings_delta_mismatch(path, Some(&before_entry), None, Some(&remaining)).unwrap(),
+            settings_delta_mismatch(path, Some(&before_entry), None, Some(&remaining), None)
+                .unwrap(),
             None
         );
         for changed_id in [false, true] {
@@ -6942,9 +9221,15 @@ mod tests {
                 retained.instances[1].settings_id = "export-child".into();
             }
             assert!(
-                settings_delta_mismatch(path, Some(&before_entry), None, Some(&entry(&retained)))
-                    .unwrap()
-                    .is_some_and(|message| message.contains("MovedPointer was not deleted"))
+                settings_delta_mismatch(
+                    path,
+                    Some(&before_entry),
+                    None,
+                    Some(&entry(&retained)),
+                    None
+                )
+                .unwrap()
+                .is_some_and(|message| message.contains("MovedPointer was not deleted"))
             );
         }
     }
@@ -7405,6 +9690,8 @@ mod tests {
             &current,
             &HashSet::from_iter([path.clone()]),
             &prepared,
+            false,
+            false,
         )
         .unwrap();
 
@@ -7503,6 +9790,36 @@ mod tests {
 
         assert!(plan.target_settings_ids.iter().any(|id| id == "target"));
         assert!(plan.target_settings_ids.iter().any(|id| id == "holder"));
+
+        let paths = desired.entries.keys().cloned().collect::<HashSet<_>>();
+        for mask in 0..4 {
+            let prepared = prepare_editor_settings_changes(
+                &studio,
+                &desired,
+                &paths.iter().cloned().collect::<Vec<_>>(),
+            )
+            .unwrap()
+            .into_iter()
+            .filter(|(path, _)| {
+                let bit = if path.starts_with("src/Workspace") {
+                    1
+                } else {
+                    2
+                };
+                mask & bit != 0
+            })
+            .collect();
+            let cached = reconciliation_push_plan_for_paths_with_prepared_settings(
+                &studio, &desired, &paths, &prepared, false, false,
+            )
+            .unwrap();
+            assert_eq!(cached.changed_paths, plan.changed_paths);
+            assert_eq!(cached.target_settings_ids, plan.target_settings_ids);
+            assert_eq!(
+                serde_json::to_value(&cached.instance_deletes).unwrap(),
+                serde_json::to_value(&plan.instance_deletes).unwrap()
+            );
+        }
     }
 
     #[test]
@@ -7592,6 +9909,8 @@ mod tests {
             &current,
             &scopes.into_iter().collect(),
             &prepared,
+            false,
+            false,
         )
         .unwrap();
 
@@ -7659,6 +9978,8 @@ mod tests {
             &current,
             &HashSet::from([path]),
             &prepared,
+            false,
+            false,
         )
         .unwrap();
 

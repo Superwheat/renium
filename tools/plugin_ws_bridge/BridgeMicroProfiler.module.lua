@@ -2,9 +2,10 @@
 -- Validate the engine protocol and every acknowledgement before accepting it.
 local BridgeMicroProfiler = {}
 
-function BridgeMicroProfiler.create(getService)
+function BridgeMicroProfiler.create(getService, finishFrame)
 	local serial = 0
 	local active = false
+	local copying = false
 	local function control(command, value)
 		local service = getService()
 		local response = buffer.create(4096)
@@ -37,19 +38,53 @@ function BridgeMicroProfiler.create(getService)
 			and buffer.readu8(response, 32) == 1, "Studio rejected MicroProfiler control")
 	end
 
-	local function disable()
+	local function disable(capturePaused)
 		-- Either control can fail independently; still attempt the other one.
-		local stopped, stopError = pcall(control, 20, 0)
+		local stopped, stopError = true, nil
+		if not capturePaused then
+			stopped, stopError = pcall(control, 20, 0)
+		end
 		local disabled, disableError = pcall(control, 10, 0)
 		active = not (stopped and disabled)
 		assert(stopped, stopError)
 		assert(disabled, disableError)
 	end
 
+	local function capture(snapshot, finish)
+		assert(not copying, "A MicroProfiler snapshot is already being copied")
+		copying = true
+		local paused = false
+		local ok, result = pcall(function()
+			if snapshot then
+				-- Both size and range reads synchronize the native dump. Refresh
+				-- while collecting, then freeze it before measuring/copying bytes.
+				getService():GetDataSize(0)
+				control(20, 0)
+				paused = true
+				-- The acknowledgement changes collection state, but the current
+				-- profiler frame still has to finish publishing its descriptors.
+				finishFrame()
+				assert(active, "MicroProfiler capture ended while copying")
+				return snapshot()
+			end
+			return nil
+		end)
+		local cleaned, cleanupError = true, nil
+		if active and finish then
+			cleaned, cleanupError = pcall(disable, paused)
+		elseif active and paused then
+			cleaned, cleanupError = pcall(control, 20, 1)
+		end
+		copying = false
+		assert(cleaned, if ok then cleanupError else `{result}; cleanup failed: {cleanupError}`)
+		assert(ok, result)
+		return result
+	end
+
 	return {
 		start = function(frames)
 			assert(type(frames) == "number" and frames % 1 == 0 and frames >= 1 and frames <= 256, "MicroProfiler frame limit must be 1–256")
-			assert(not active, "This runtime already has a MicroProfiler capture; stop it first")
+			assert(not active and not copying, "This runtime already has an active or completing MicroProfiler capture")
 			control(40, frames)
 			active = true
 			local ok, result = pcall(function()
@@ -65,16 +100,11 @@ function BridgeMicroProfiler.create(getService)
 		end,
 		stop = function(snapshot)
 			assert(active, "This runtime has no active Renium MicroProfiler capture")
-			-- GetDataSize refreshes the dump while capture is enabled. Disabling
-			-- first freezes the previous cached dump, even when new frames exist.
-			local ok, result = true, nil
-			if snapshot then
-				ok, result = pcall(snapshot)
-			end
-			local cleaned, cleanupError = pcall(disable)
-			assert(cleaned, if ok then cleanupError else `{result}; cleanup failed: {cleanupError}`)
-			assert(ok, result)
-			return result
+			return capture(snapshot, true)
+		end,
+		read = function(snapshot)
+			-- Do not pause or resume a capture this runtime did not start.
+			return if active then capture(snapshot, false) else snapshot()
 		end,
 		cleanup = function()
 			if active then

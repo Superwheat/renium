@@ -45,6 +45,7 @@ try {
     run(['play', '-x']);
     mayBePlaying = false;
     const settled = run(['lst', '--wait', '10']);
+    assert.equal(settled.daemon.settled, true, JSON.stringify(settled));
     assert.equal(settled.pendingChanges, 0);
     assert(!settled.daemon?.error, JSON.stringify(settled));
     const saved = run(['bb', 'Workspace', '-J', '-'], JSON.stringify({ops: [
@@ -59,6 +60,7 @@ try {
   if (mayBePlaying) run(['play', '-x']);
   run(['l', 'local p=workspace:FindFirstChild("ReniumRoutingProbe"); if p then p:Destroy() end; return true']);
   const settled = run(['lst', '--wait', '10']);
+  assert.equal(settled.daemon.settled, true, JSON.stringify(settled));
   assert.equal(settled.pendingChanges, 0);
 }
 console.log(JSON.stringify({passed:true, cycles:3, timings}));

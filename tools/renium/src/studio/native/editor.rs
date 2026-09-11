@@ -12,7 +12,6 @@ use std::time::{Duration, Instant};
 use ahash::{AHashMap, AHashSet};
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
-#[cfg(any(windows, target_os = "macos", test))]
 use rbx_dom_weak::WeakDom as RbxWeakDom;
 use rbx_dom_weak::types::{ContentType as RbxContentType, Ref as RbxRef, Variant as RbxVariant};
 #[cfg(any(windows, target_os = "macos", test))]
@@ -38,8 +37,7 @@ use crate::rbx::decode::rbx_variant_to_settings_json;
 use crate::rbx::decode::{
     NativeOverlayRequest, conditional_ref_overlay_request, fetch_native_overlay_batches,
     merge_native_overlay_items, native_overlay_property_schemas, native_property_filter,
-    overlay_property_names_value, rbx_model_primary_part_is_set,
-    rbx_properties_to_native_settings_records,
+    overlay_property_names_value, rbx_properties_to_native_settings_records,
 };
 #[cfg(any(windows, target_os = "macos"))]
 use crate::rbx::encode::collect_rbx_subtree_preorder;
@@ -68,7 +66,7 @@ use crate::snapshot::import::{
 };
 use crate::snapshot::types::{
     ExportedSnapshotParts, NativeConditionalOverlayFetch, NativeConditionalOverlayRequest,
-    NativeOverlayItem, NativeServiceFetch, NativeServiceFinishDependencies,
+    NativeOverlayFetch, NativeOverlayItem, NativeServiceFetch, NativeServiceFinishDependencies,
     NativeServiceFinishInput, NativeSettingsProperty, NativeSettingsValue, ServiceExecutionSpan,
     ServiceExportOutput, SnapshotInstance,
 };
@@ -96,12 +94,10 @@ const NATIVE_SERIALIZATION_BATCH_LIMIT: usize = 8_192;
 pub(crate) fn property_change_needs_post_native_apply(change: &EditorPropertyChange) -> bool {
     change.path_segments.as_slice() == [change.service.as_str()]
         || change.path_segments.len() == 2
-            && (change.service == "Workspace" && change.class_name == "Terrain"
-                || change.service == "StarterPlayer"
-                    && matches!(
-                        change.class_name.as_str(),
-                        "StarterPlayerScripts" | "StarterCharacterScripts"
-                    ))
+            && crate::roblox::services::is_engine_managed_container(
+                &change.service,
+                &change.class_name,
+            )
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -132,6 +128,7 @@ pub(crate) fn begin_editor_binary_export(
         service_filter,
         metadata_only,
         None,
+        true,
     )
 }
 
@@ -142,8 +139,40 @@ fn begin_editor_binary_export_for_runtime(
     service_filter: Option<&[String]>,
     metadata_only: bool,
     runtime_id: Option<&str>,
+    capture_root_properties: bool,
 ) -> Result<EditorBinaryExport> {
     let export_id = format!("{}-{}", current_millis(), std::process::id());
+    let request_native_capture =
+        cfg!(windows) && partitioned && !metadata_only && !capture_root_properties;
+    #[cfg(windows)]
+    let mut attribute_guard = if request_native_capture && runtime_id.is_none() {
+        let prepared = (|| {
+            let pid = studio_pid_for_bridge(bridge)?;
+            let title = studio_title_for_bridge(bridge, pid)?;
+            serializer::begin_attribute_guard(
+                pid,
+                &title,
+                service_filter.context("Native export service filter missing")?,
+                Duration::from_secs(120),
+            )
+        })();
+        match prepared {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                crate::app::output::log_global(
+                    5,
+                    format_args!("[renium] using plugin attribute observation: {error:#}"),
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(windows)]
+    let native_attribute_guard = attribute_guard.is_some();
+    #[cfg(not(windows))]
+    let native_attribute_guard = false;
     let parameters = json!({
         "exportId": &export_id,
         "partitioned": partitioned,
@@ -151,6 +180,8 @@ fn begin_editor_binary_export_for_runtime(
         "serviceFilter": service_filter,
         "serializationWorkers": partitioned.then_some(4),
         "metadataOnly": metadata_only,
+        "nativeCapture": request_native_capture,
+        "nativeAttributeGuard": native_attribute_guard,
         "profile": verbose_timing_logs(),
     });
     let begin = if let Some(runtime_id) = runtime_id {
@@ -168,7 +199,9 @@ fn begin_editor_binary_export_for_runtime(
         && let Some(profile) = begin.get("profile")
     {
         println!("[renium] native editor begin profile: {profile}");
+        crate::app::timing::trace_profile("Studio binary export begin", profile);
     }
+    let _metadata_trace = crate::app::timing::trace_scope("native.export", "parse export metadata");
     let result = (|| -> Result<EditorBinaryExport> {
         if begin.get("supported").and_then(Value::as_bool) == Some(false) {
             let reason = begin
@@ -194,7 +227,15 @@ fn begin_editor_binary_export_for_runtime(
         {
             bail!("Studio returned invalid native export groups");
         }
-        if !metadata_only {
+        let native_capture = begin
+            .get("nativeCapture")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        anyhow::ensure!(
+            !native_capture || request_native_capture,
+            "Studio returned an unrequested native capture"
+        );
+        if !metadata_only && !native_capture {
             for group in &groups {
                 native_identity_carrier_count(group)?;
             }
@@ -206,6 +247,10 @@ fn begin_editor_binary_export_for_runtime(
                 .unwrap_or_else(|| Value::Array(Vec::new())),
         )
         .context("Studio returned invalid native serialization batches")?;
+        anyhow::ensure!(
+            !native_capture || serialization_batches.is_empty(),
+            "Native capture cannot include plugin serialization jobs"
+        );
         {
             let group_by_service = groups
                 .iter()
@@ -255,7 +300,18 @@ fn begin_editor_binary_export_for_runtime(
         if property_schema_by_class.is_empty() {
             bail!("Studio native export omitted its property schema");
         }
+        #[cfg(any(windows, target_os = "macos"))]
+        let groups = {
+            let mut groups = groups;
+            if capture_root_properties {
+                capture_native_service_root_properties(bridge, runtime_id, &mut groups)?;
+            }
+            groups
+        };
         Ok(EditorBinaryExport {
+            #[cfg(windows)]
+            attribute_guard: attribute_guard.take(),
+            native_capture,
             #[cfg(any(windows, target_os = "macos"))]
             bytes: Vec::new(),
             groups,
@@ -269,6 +325,52 @@ fn begin_editor_binary_export_for_runtime(
         let _ = bridge.call("finishEditorBinaryExport", json!({ "exportId": export_id }));
     }
     result
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn capture_native_service_root_properties(
+    bridge: &BridgeServer,
+    runtime_id: Option<&str>,
+    groups: &mut [EditorBinaryExportGroup],
+) -> Result<()> {
+    let _trace = crate::app::timing::trace_scope("native.property", "capture service roots");
+    use crate::editor::native_roots::{capture_properties, decode_service_property};
+    use crate::studio::bridge::BridgeTarget;
+
+    if !groups
+        .iter()
+        .any(|group| !capture_properties(&group.service).is_empty())
+    {
+        return Ok(());
+    }
+    let started = Instant::now();
+    let info = if let Some(runtime_id) = runtime_id {
+        bridge.cached_bridge_info_for_runtime(BridgeTarget::Edit, runtime_id)?
+    } else {
+        bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?
+    };
+    let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, &info.runtime_id)?;
+    // Service roots cannot enter SerializeInstancesAsync. Capture these blocked
+    // saved settings through existing identity-checked reads, not a second
+    // whole-place export. The active export guard still fences outside edits.
+    for group in groups {
+        for &name in capture_properties(&group.service) {
+            let _trace = crate::app::timing::trace_scope("native.property", name);
+            let text = serializer::read_property(
+                pid,
+                &info.place_name,
+                &group.target_path,
+                &[1],
+                &group.service,
+                name,
+                Duration::from_secs(2),
+            )?;
+            let value = decode_service_property(&group.service, name, &text)?;
+            group.root_properties.insert(name.into(), value);
+        }
+    }
+    log_timing("native service root capture", started);
+    Ok(())
 }
 
 pub(crate) fn decode_bridge_buffer(
@@ -326,7 +428,7 @@ const NATIVE_PAYLOAD_CACHE_MAX_ENTRIES: usize = 32;
 
 #[derive(Default)]
 struct NativePayloadCache {
-    entries: VecDeque<(String, Vec<u8>)>,
+    entries: VecDeque<(String, Arc<[u8]>)>,
     last_hash_by_slot: AHashMap<String, String>,
     total_bytes: usize,
 }
@@ -336,7 +438,7 @@ fn native_payload_cache() -> &'static Mutex<NativePayloadCache> {
     CACHE.get_or_init(|| Mutex::new(NativePayloadCache::default()))
 }
 
-fn native_payload_cache_known_hash(slot: &str) -> Option<String> {
+fn native_payload_cache_for_slot(slot: &str) -> Option<(String, Arc<[u8]>)> {
     let cache = native_payload_cache()
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
@@ -344,17 +446,7 @@ fn native_payload_cache_known_hash(slot: &str) -> Option<String> {
     cache
         .entries
         .iter()
-        .any(|(entry_hash, _)| entry_hash == hash)
-        .then(|| hash.clone())
-}
-
-fn native_payload_cache_get(hash: &str) -> Option<Vec<u8>> {
-    native_payload_cache()
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .entries
-        .iter()
-        .find_map(|(entry_hash, bytes)| (entry_hash == hash).then(|| bytes.clone()))
+        .find_map(|(entry_hash, bytes)| (entry_hash == hash).then(|| (hash.clone(), bytes.clone())))
 }
 
 fn native_payload_cache_insert(slot: String, hash: String, bytes: &[u8]) {
@@ -381,7 +473,7 @@ fn native_payload_cache_insert(slot: String, hash: String, bytes: &[u8]) {
         cache.total_bytes = cache.total_bytes.saturating_sub(removed.len());
     }
     cache.total_bytes = cache.total_bytes.saturating_add(bytes.len());
-    cache.entries.push_back((hash, bytes.to_vec()));
+    cache.entries.push_back((hash, Arc::from(bytes)));
 }
 
 fn observe_native_serialization_complete(
@@ -417,14 +509,44 @@ fn receive_editor_binary_export_bytes_for_runtime(
     serialization_complete: Option<&AtomicBool>,
     runtime_id: Option<&str>,
 ) -> Result<Vec<u8>> {
-    const MAX_EXPORT_BYTES: usize = 512 * 1024 * 1024;
-    let service_label = service.map_or(String::new(), |value| format!("{value} "));
     let cache_slot = format!(
         "{}:{}",
         runtime_id.unwrap_or("current"),
         service.unwrap_or("full")
     );
-    let known_payload_hash = native_payload_cache_known_hash(&cache_slot);
+    receive_editor_binary_export_bytes_with_cache(
+        export_id,
+        service,
+        serialization_complete,
+        &cache_slot,
+        |parameters| {
+            if let Some(runtime_id) = runtime_id {
+                bridge.call_chunk_for_runtime(
+                    "readEditorBinaryExport",
+                    parameters,
+                    crate::studio::bridge::BridgeTarget::Edit,
+                    runtime_id,
+                )
+            } else {
+                bridge.call_chunk("readEditorBinaryExport", parameters)
+            }
+        },
+    )
+}
+
+fn receive_editor_binary_export_bytes_with_cache(
+    export_id: &str,
+    service: Option<&str>,
+    serialization_complete: Option<&AtomicBool>,
+    cache_slot: &str,
+    read: impl Fn(Value) -> Result<BridgeChunk> + Sync,
+) -> Result<Vec<u8>> {
+    const MAX_EXPORT_BYTES: usize = 512 * 1024 * 1024;
+    let service_label = service.map_or(String::new(), |value| format!("{value} "));
+    // Retain the advertised allocation until Studio replies. Parallel service
+    // exports may evict it from the bounded shared cache during this request.
+    let known_payload = native_payload_cache_for_slot(cache_slot);
+    let known_payload_hash = known_payload.as_ref().map(|(hash, _)| hash.as_str());
     let raw_chunk_bytes = native_binary_chunk_bytes();
     let read_started = Instant::now();
     let first_parameters = json!({
@@ -437,18 +559,9 @@ fn receive_editor_binary_export_bytes_for_runtime(
         "timeoutSeconds": 80,
         "rawBase64": true,
         "supportsPayloadCache": true,
-        "knownPayloadHash": known_payload_hash.as_deref(),
+        "knownPayloadHash": known_payload_hash,
     });
-    let first = if let Some(runtime_id) = runtime_id {
-        bridge.call_chunk_for_runtime(
-            "readEditorBinaryExport",
-            first_parameters,
-            crate::studio::bridge::BridgeTarget::Edit,
-            runtime_id,
-        )?
-    } else {
-        bridge.call_chunk("readEditorBinaryExport", first_parameters)?
-    };
+    let first = read(first_parameters)?;
     observe_native_serialization_complete(&first, serialization_complete);
     let total_bytes = first.total;
     if total_bytes == 0 || total_bytes > MAX_EXPORT_BYTES {
@@ -459,11 +572,11 @@ fn receive_editor_binary_export_bytes_for_runtime(
             .payload_hash
             .as_deref()
             .context("Studio native export cache hit omitted its payload hash")?;
-        if known_payload_hash.as_deref() != Some(payload_hash) {
+        if known_payload_hash != Some(payload_hash) {
             bail!("Studio native export returned an unexpected payload cache hit");
         }
-        let bytes = native_payload_cache_get(payload_hash)
-            .context("Studio native export payload cache entry is missing")?;
+        let (_, bytes) =
+            known_payload.context("Studio native export payload cache entry is missing")?;
         if bytes.len() != total_bytes {
             bail!("Studio native export payload cache entry has the wrong size");
         }
@@ -471,7 +584,7 @@ fn receive_editor_binary_export_bytes_for_runtime(
             &format!("native editor {service_label}binary cache hit"),
             read_started,
         );
-        return Ok(bytes);
+        return Ok(bytes.to_vec());
     }
     let first_length = raw_chunk_bytes.min(total_bytes);
     if first.start != 1 || first.next_start != first_length + 1 {
@@ -507,16 +620,7 @@ fn receive_editor_binary_export_bytes_for_runtime(
                 "length": length,
                 "rawBase64": true,
             });
-            let response = if let Some(runtime_id) = runtime_id {
-                bridge.call_chunk_for_runtime(
-                    "readEditorBinaryExport",
-                    parameters,
-                    crate::studio::bridge::BridgeTarget::Edit,
-                    runtime_id,
-                )?
-            } else {
-                bridge.call_chunk("readEditorBinaryExport", parameters)?
-            };
+            let response = read(parameters)?;
             observe_native_serialization_complete(&response, serialization_complete);
             if response.start != offset + 1
                 || response.next_start != offset + length + 1
@@ -534,7 +638,7 @@ fn receive_editor_binary_export_bytes_for_runtime(
         })
         .collect::<Result<()>>()?;
     if let Some(payload_hash) = first.payload_hash {
-        native_payload_cache_insert(cache_slot, payload_hash, &bytes);
+        native_payload_cache_insert(cache_slot.to_owned(), payload_hash, &bytes);
     }
     log_timing(
         &format!("native editor {service_label}binary transfer"),
@@ -707,6 +811,16 @@ fn receive_editor_binary_export_batches(
 pub(crate) struct EditorBinaryExportFinishGuard<'a> {
     pub(crate) bridge: &'a BridgeServer,
     pub(crate) export_id: Option<String>,
+    #[cfg(windows)]
+    pub(crate) attribute_guard: Option<serializer::AttributeGuard>,
+}
+
+fn validate_native_export_finished(result: &Value) -> Result<()> {
+    anyhow::ensure!(
+        result.get("found").and_then(Value::as_bool) == Some(true),
+        "Studio native export expired before its snapshot could be validated; retry the sync"
+    );
+    Ok(())
 }
 
 impl EditorBinaryExportFinishGuard<'_> {
@@ -714,6 +828,17 @@ impl EditorBinaryExportFinishGuard<'_> {
         let Some(export_id) = self.export_id.as_deref() else {
             return Ok(false);
         };
+        #[cfg(windows)]
+        if let Some(mut guard) = self.attribute_guard.take()
+            && let Err(error) = guard.finish()
+        {
+            let _ = self.bridge.call(
+                "finishEditorBinaryExport",
+                json!({"exportId":export_id, "nativeAttributeGuardFailed":true}),
+            );
+            self.export_id = None;
+            return Err(error);
+        }
         let result = self.bridge.call(
             "finishEditorBinaryExport",
             json!({
@@ -722,6 +847,7 @@ impl EditorBinaryExportFinishGuard<'_> {
             }),
         )?;
         self.export_id = None;
+        validate_native_export_finished(&result)?;
         Ok(result
             .get("syncCompletionRecorded")
             .and_then(Value::as_bool)
@@ -738,9 +864,11 @@ impl Drop for EditorBinaryExportFinishGuard<'_> {
 #[cfg(any(windows, target_os = "macos"))]
 fn receive_editor_binary_export(bridge: &BridgeServer) -> Result<EditorBinaryExport> {
     let mut export = begin_editor_binary_export(bridge, false, None, None, false)?;
-    let _finish_guard = EditorBinaryExportFinishGuard {
+    let mut finish_guard = EditorBinaryExportFinishGuard {
         bridge,
         export_id: export.export_id.clone(),
+        #[cfg(windows)]
+        attribute_guard: export.attribute_guard.take(),
     };
     export.bytes = receive_editor_binary_export_bytes(
         bridge,
@@ -751,6 +879,7 @@ fn receive_editor_binary_export(bridge: &BridgeServer) -> Result<EditorBinaryExp
         None,
         None,
     )?;
+    finish_guard.finish(false)?;
     Ok(export)
 }
 
@@ -759,8 +888,15 @@ fn receive_editor_binary_export_for_runtime(
     bridge: &BridgeServer,
     runtime_id: &str,
 ) -> Result<EditorBinaryExport> {
-    let mut export =
-        begin_editor_binary_export_for_runtime(bridge, false, None, None, false, Some(runtime_id))?;
+    let mut export = begin_editor_binary_export_for_runtime(
+        bridge,
+        false,
+        None,
+        None,
+        false,
+        Some(runtime_id),
+        true,
+    )?;
     let result = receive_editor_binary_export_bytes_for_runtime(
         bridge,
         export
@@ -782,7 +918,7 @@ fn receive_editor_binary_export_for_runtime(
         None,
     );
     export.bytes = result?;
-    finish?;
+    validate_native_export_finished(&finish?)?;
     Ok(export)
 }
 
@@ -801,6 +937,8 @@ pub(crate) struct NativeServiceDom {
     instances: Vec<rbx_binary::FlatInstance>,
     new_index_by_dense_ref: Option<Vec<usize>>,
     native_index_by_overlay_index: Vec<usize>,
+    captured_debug_ids: Option<Vec<String>>,
+    captured_root_properties: Map<String, Value>,
     path_segments_by_ref: Arc<HashMap<RbxRef, Vec<String>>>,
     path_ordinals_by_ref: Arc<HashMap<RbxRef, Vec<usize>>>,
 }
@@ -809,6 +947,98 @@ struct NativeIdentityOutput {
     instances: Vec<rbx_binary::FlatInstance>,
     native_index_by_overlay_index: Vec<usize>,
     new_index_by_dense_ref: Vec<usize>,
+}
+
+// Native capture joins by engine identity, never by names or sibling order.
+fn native_capture_debug_ids(
+    instances: &[rbx_binary::FlatInstance],
+    rows: &[u8],
+) -> Result<Vec<String>> {
+    use rbx_dom_weak::types::UniqueId;
+    anyhow::ensure!(
+        rows.len().is_multiple_of(72) && rows.len() / 72 == instances.len(),
+        "Native identity capture has the wrong row count"
+    );
+    let mut row_by_id = AHashMap::with_capacity(instances.len());
+    let mut seen_debug_ids = AHashSet::with_capacity(instances.len());
+    let mut captured = Vec::with_capacity(instances.len());
+    for (index, row) in rows.chunks_exact(72).enumerate() {
+        let word = |offset| u32::from_le_bytes(row[offset..offset + 4].try_into().unwrap());
+        // The getter's native struct stores four LE words in display order,
+        // not a little-endian u64 followed by time/index.
+        let id = UniqueId::new(
+            word(12),
+            word(8),
+            ((u64::from(word(0)) << 32) | u64::from(word(4))) as i64,
+        );
+        anyhow::ensure!(
+            !id.is_nil() && row_by_id.insert(id, index).is_none(),
+            "Native identity capture contains a nil or duplicate UniqueId"
+        );
+        let text = &row[16..64];
+        let length = text
+            .iter()
+            .position(|byte| *byte == 0)
+            .context("Native debug identity is unterminated")?;
+        let debug_id =
+            std::str::from_utf8(&text[..length]).context("Native debug identity is not UTF-8")?;
+        anyhow::ensure!(
+            length > 0
+                && seen_debug_ids.insert(debug_id)
+                && text[length..].iter().all(|byte| *byte == 0),
+            "Native debug identity is empty, duplicated, or has invalid padding"
+        );
+        let parent = word(64);
+        anyhow::ensure!(
+            word(68) == 0 && (parent == u32::MAX || (parent as usize) < index),
+            "Native identity capture has an invalid parent or reserved field"
+        );
+        captured.push((debug_id, (parent != u32::MAX).then_some(parent as usize)));
+    }
+    let mut row_by_native_index = Vec::with_capacity(instances.len());
+    let mut seen_rows = vec![false; instances.len()];
+    for instance in instances {
+        let id = instance
+            .properties
+            .iter()
+            .find_map(|(name, value)| {
+                if name.as_str() == "UniqueId"
+                    && let RbxVariant::UniqueId(id) = value
+                {
+                    return Some(id);
+                }
+                None
+            })
+            .context("Native serialized instance omitted UniqueId")?;
+        let row = *row_by_id
+            .get(id)
+            .context("Serialized identity is absent from native capture")?;
+        anyhow::ensure!(
+            !std::mem::replace(&mut seen_rows[row], true),
+            "Serialized snapshot repeats a captured identity"
+        );
+        row_by_native_index.push(row);
+    }
+    instances
+        .iter()
+        .zip(&row_by_native_index)
+        .map(|(instance, row)| {
+            let parent = instance
+                .parent_index
+                .map(|parent| {
+                    row_by_native_index
+                        .get(parent)
+                        .copied()
+                        .context("Native serialized parent is out of range")
+                })
+                .transpose()?;
+            anyhow::ensure!(
+                parent == captured[*row].1,
+                "Native serialized parent disagrees with identity capture"
+            );
+            Ok(captured[*row].0.to_string())
+        })
+        .collect()
 }
 
 fn native_identity_carrier_count(group: &EditorBinaryExportGroup) -> Result<usize> {
@@ -853,8 +1083,7 @@ fn native_serialized_root_count(group: &EditorBinaryExportGroup) -> Result<usize
         .context("Native serialized root count overflowed")
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
-fn plugin_place_service_roots(
+pub(super) fn serialized_service_roots(
     dom: &mut RbxWeakDom,
     groups: &[EditorBinaryExportGroup],
 ) -> Result<Vec<(RbxRef, Vec<RbxRef>)>> {
@@ -1074,7 +1303,245 @@ fn decode_native_identity(
 #[cfg(test)]
 mod native_identity_tests {
     use super::*;
+
+    #[test]
+    fn native_export_finalization_requires_a_live_guard() {
+        assert!(validate_native_export_finished(&json!({"found": true})).is_ok());
+        for result in [json!({"found": false}), json!({}), json!({"found": "true"})] {
+            assert!(validate_native_export_finished(&result).is_err());
+        }
+    }
     use rbx_dom_weak::InstanceBuilder;
+
+    fn capture_row(serial: u32, parent: u32, debug_id: &str) -> [u8; 72] {
+        let mut row = [0; 72];
+        row[..4].copy_from_slice(&0x12345678u32.to_le_bytes());
+        row[4..8].copy_from_slice(&0x90abcdefu32.to_le_bytes());
+        row[8..12].copy_from_slice(&0x10203040u32.to_le_bytes());
+        row[12..16].copy_from_slice(&serial.to_le_bytes());
+        row[16..16 + debug_id.len()].copy_from_slice(debug_id.as_bytes());
+        row[64..68].copy_from_slice(&parent.to_le_bytes());
+        row
+    }
+
+    #[test]
+    fn native_capture_joins_by_identity_not_same_named_sibling_order() {
+        let make = |serial, parent| {
+            flat_instance(
+                u128::from(serial),
+                parent,
+                "Same",
+                "Folder",
+                vec![(
+                    "UniqueId".into(),
+                    RbxVariant::UniqueId(rbx_dom_weak::types::UniqueId::new(
+                        serial,
+                        0x10203040,
+                        0x1234567890abcdef,
+                    )),
+                )],
+            )
+        };
+        let instances = vec![make(1, None), make(3, Some(0)), make(2, Some(0))];
+        let rows = [
+            capture_row(1, u32::MAX, "0_001"),
+            capture_row(2, 0, "0_002"),
+            capture_row(3, 0, "0_003"),
+        ]
+        .concat();
+        assert_eq!(
+            native_capture_debug_ids(&instances, &rows).unwrap(),
+            ["0_001", "0_003", "0_002"]
+        );
+        for (offset, bytes) in [
+            (72 + 12, 1u32.to_le_bytes()),  // duplicate UniqueId
+            (72 + 64, 1u32.to_le_bytes()),  // cyclic parent
+            (144 + 64, 1u32.to_le_bytes()), // valid but wrong parent
+            (144 + 68, 1u32.to_le_bytes()), // unknown row layout
+        ] {
+            let mut changed = rows.clone();
+            changed[offset..offset + 4].copy_from_slice(&bytes);
+            assert!(native_capture_debug_ids(&instances, &changed).is_err());
+        }
+        let mut duplicate_debug_id = rows.clone();
+        duplicate_debug_id[72 + 16..72 + 64].copy_from_slice(&rows[16..64]);
+        assert!(native_capture_debug_ids(&instances, &duplicate_debug_id).is_err());
+        let mut unterminated = rows.clone();
+        unterminated[16..64].fill(b'a');
+        assert!(native_capture_debug_ids(&instances, &unterminated).is_err());
+        assert!(native_capture_debug_ids(&instances, &rows[..rows.len() - 1]).is_err());
+        let missing = vec![make(1, None), make(4, Some(0)), make(2, Some(0))];
+        assert!(native_capture_debug_ids(&missing, &rows).is_err());
+        let duplicated = vec![make(1, None), make(2, Some(0)), make(2, Some(0))];
+        assert!(native_capture_debug_ids(&duplicated, &rows).is_err());
+    }
+
+    #[test]
+    #[ignore = "Requires explicit files from an owned native-capture fixture; no Studio calls"]
+    fn native_capture_identity_saved_fixture() -> Result<()> {
+        let input = std::env::var("RENIUM_CAPTURE_IDENTITY_RBXL")?;
+        let identities = std::env::var("RENIUM_CAPTURE_IDENTITY_ROWS")?;
+        let decode_started = Instant::now();
+        let bytes = std::fs::read(input)?;
+        let flat = rbx_binary::Deserializer::new()
+            .elide_defaults(true)
+            .deserialize_flat(bytes.as_slice())?;
+        let decode_ms = elapsed_ms(decode_started);
+        let rows = std::fs::read(identities)?;
+        let map_started = Instant::now();
+        let debug_ids = native_capture_debug_ids(&flat.instances, &rows)?;
+        println!(
+            "{}",
+            json!({"identities":debug_ids.len(),"decodeMs":decode_ms,"identityMapMs":elapsed_ms(map_started)})
+        );
+        let (groups, batch) = captured_test_groups(&flat);
+        let partition_started = Instant::now();
+        let doms = decode_native_serialization_batch(
+            &bytes,
+            &batch,
+            &groups,
+            Arc::default(),
+            Some(&rows),
+        )?;
+        assert_eq!(
+            doms.values().map(|dom| dom.instances.len()).sum::<usize>(),
+            flat.instances.len()
+        );
+        println!(
+            "{}",
+            json!({"nativeServicePartitions": doms.len(), "partitionWithDecodeMs": elapsed_ms(partition_started)})
+        );
+        Ok(())
+    }
+
+    fn captured_test_groups(
+        flat: &rbx_binary::FlatDom,
+    ) -> (Vec<EditorBinaryExportGroup>, EditorBinarySerializationBatch) {
+        let groups = flat.root_indices.iter().enumerate().map(|(index, start)| {
+            let root = &flat.instances[*start];
+            let end = flat.root_indices.get(index + 1).copied().unwrap_or(flat.instances.len());
+            serde_json::from_value(json!({"service": root.class.as_str(), "targetPath": [root.class.as_str()],
+                "count": flat.instances[*start..end].iter().filter(|item| item.parent_index == Some(*start)).count(),
+                "instanceCount": end - start, "classNames": []})).unwrap()
+        }).collect::<Vec<EditorBinaryExportGroup>>();
+        let batch = EditorBinarySerializationBatch {
+            id: "capture".into(),
+            services: groups.iter().map(|group| group.service.clone()).collect(),
+        };
+        (groups, batch)
+    }
+
+    #[test]
+    fn native_capture_partitions_preserve_cross_service_and_duplicate_identity() {
+        let mut dom = RbxWeakDom::new(InstanceBuilder::new("DataModel"));
+        let root = dom.root_ref();
+        let make = |class: &str, name: &str, serial| {
+            InstanceBuilder::new(class).with_name(name).with_property(
+                "UniqueId",
+                rbx_dom_weak::types::UniqueId::new(serial, 0x10203040, 0x1234567890abcdef),
+            )
+        };
+        let workspace = dom.insert(
+            root,
+            make("Workspace", "Renamed workspace", 1)
+                .with_property(
+                    "ModelStreamingBehavior",
+                    rbx_dom_weak::types::Enum::from_u32(0),
+                )
+                .with_property("StreamOutBehavior", rbx_dom_weak::types::Enum::from_u32(0))
+                .with_property(
+                    "StreamingIntegrityMode",
+                    rbx_dom_weak::types::Enum::from_u32(0),
+                )
+                .with_property("StreamingTargetRadius", 1024i32)
+                .with_property(
+                    "UseNewLuauTypeSolver",
+                    rbx_dom_weak::types::Enum::from_u32(0),
+                ),
+        );
+        let storage = dom.insert(root, make("ReplicatedStorage", "ReplicatedStorage", 2));
+        let first = dom.insert(workspace, make("Folder", "Same", 3));
+        let second = dom.insert(workspace, make("Folder", "Same", 4));
+        dom.insert(
+            first,
+            make("Part", "Payload", 5).with_property("Transparency", 0.0f32),
+        );
+        let target = dom.insert(
+            second,
+            make("Part", "Payload", 6).with_property("Transparency", 0.0f32),
+        );
+        dom.insert(
+            storage,
+            make("ObjectValue", "Target", 7).with_property("Value", target),
+        );
+        let mut bytes = Vec::new();
+        rbx_binary::to_writer(&mut bytes, &dom, &[workspace, storage]).unwrap();
+        let flat = rbx_binary::Deserializer::new()
+            .elide_defaults(true)
+            .deserialize_flat(bytes.as_slice())
+            .unwrap();
+        let (groups, batch) = captured_test_groups(&flat);
+        let rows = [u32::MAX, u32::MAX, 0, 0, 2, 3, 1]
+            .iter()
+            .enumerate()
+            .flat_map(|(index, parent)| {
+                capture_row(index as u32 + 1, *parent, &format!("id{index}"))
+            })
+            .collect::<Vec<_>>();
+        let decode = || {
+            decode_native_serialization_batch(&bytes, &batch, &groups, Arc::default(), Some(&rows))
+                .unwrap()
+        };
+        let mut services = decode();
+        assert_eq!(services["Workspace"].captured_root_properties.len(), 5);
+        for instance in &services["Workspace"].instances {
+            if instance.class.as_str() == "Part" {
+                assert!(
+                    !instance
+                        .properties
+                        .iter()
+                        .any(|(name, _)| name.as_str() == "Transparency"),
+                    "Keeping service defaults must not expand ordinary instance defaults"
+                );
+            }
+        }
+        let storage = &services["ReplicatedStorage"];
+        let target = storage.instances[1]
+            .properties
+            .iter()
+            .find(|(name, _)| name.as_str() == "Value")
+            .unwrap()
+            .1
+            .clone();
+        let target = rbx_variant_referent(&target).unwrap();
+        assert_eq!(
+            storage.path_segments_by_ref[&target],
+            ["Workspace", "Same", "Payload"]
+        );
+        assert_eq!(storage.path_ordinals_by_ref[&target], [1, 2, 1]);
+        let workspace = services.get_mut("Workspace").unwrap();
+        assert_eq!(workspace.instances[0].class.as_str(), "Workspace");
+        let captured = workspace.captured_debug_ids.clone().unwrap();
+        let order = [0, 4, 3, 2, 1];
+        let overlay = order
+            .iter()
+            .map(|index| Some(captured[*index].clone()))
+            .collect::<Vec<_>>();
+        match_native_capture_overlay(workspace, &overlay).unwrap();
+        assert_eq!(workspace.native_index_by_overlay_index, order);
+        for broken in [
+            vec![None; 5],
+            vec![Some("unknown".into()); 5],
+            vec![overlay[0].clone(); 5],
+            overlay[..4].to_vec(),
+        ] {
+            let mut services = decode();
+            assert!(
+                match_native_capture_overlay(services.get_mut("Workspace").unwrap(), &broken)
+                    .is_err()
+            );
+        }
+    }
 
     fn flat_instance(
         referent: u128,
@@ -1153,6 +1620,31 @@ mod native_identity_tests {
         assert_eq!(sources.by_index.get(&3).map(String::as_str), Some("first"));
     }
 
+    #[test]
+    fn root_camera_reference_uses_native_order_like_other_overlay_references() {
+        let mut root = Map::from_iter([
+            (
+                "CurrentCamera".into(),
+                json!({"_type": "Ref", "debugId": "viewport", "pathSegments": ["Workspace", "Camera"]}),
+            ),
+            (
+                "External".into(),
+                json!({"_type": "Ref", "debugId": "other-service"}),
+            ),
+        ]);
+        // Debug IDs have already been reordered from the plugin's traversal.
+        normalize_native_overlay_internal_references(
+            &mut [],
+            Some(&mut root),
+            [Some("root"), Some("extra"), Some("viewport")],
+        );
+        assert_eq!(
+            root["CurrentCamera"],
+            json!({"_type": "Ref", "instanceIndex": 3})
+        );
+        assert_eq!(root["External"]["debugId"], "other-service");
+    }
+
     fn plugin_place_group(
         count: usize,
         instance_count: usize,
@@ -1223,8 +1715,7 @@ mod native_identity_tests {
         assert_eq!(reconstructed.root().children().len(), 20);
 
         let groups =
-            plugin_place_service_roots(&mut reconstructed, &[plugin_place_group(17, 24, 2)])
-                .unwrap();
+            serialized_service_roots(&mut reconstructed, &[plugin_place_group(17, 24, 2)]).unwrap();
         let (marker_ref, child_refs) = &groups[0];
         for child_ref in child_refs {
             reconstructed.transfer_within(*child_ref, *marker_ref);
@@ -1350,6 +1841,8 @@ fn decode_native_service_dom(
         instances: identity.instances,
         new_index_by_dense_ref: Some(identity.new_index_by_dense_ref),
         native_index_by_overlay_index: identity.native_index_by_overlay_index,
+        captured_debug_ids: None,
+        captured_root_properties: Map::new(),
         path_segments_by_ref: Arc::new(HashMap::new()),
         path_ordinals_by_ref: Arc::new(HashMap::new()),
     })
@@ -1360,6 +1853,7 @@ fn decode_native_serialization_batch(
     batch: &EditorBinarySerializationBatch,
     service_groups: &[EditorBinaryExportGroup],
     property_filter: Arc<HashMap<String, HashSet<String>>>,
+    identity_rows: Option<&[u8]>,
 ) -> Result<HashMap<String, NativeServiceDom>> {
     let groups = batch
         .services
@@ -1378,17 +1872,30 @@ fn decode_native_serialization_batch(
         .collect::<Result<Vec<_>>>()?;
     let expected_roots = groups.iter().try_fold(0_usize, |total, group| {
         total
-            .checked_add(native_serialized_root_count(group)?)
+            .checked_add(if identity_rows.is_some() {
+                1
+            } else {
+                native_serialized_root_count(group)?
+            })
             .context("Native serialization batch root count overflowed")
     })?;
     let expected_instances = groups.iter().try_fold(0_usize, |total, group| {
         total
-            .checked_add(native_serialized_instance_count(group)?)
+            .checked_add(if identity_rows.is_some() {
+                group.instance_count
+            } else {
+                native_serialized_instance_count(group)?
+            })
             .context("Native serialization batch instance count overflowed")
     })?;
     let decode_started = Instant::now();
-    let flat = match rbx_binary::Deserializer::new()
+    let mut flat = match rbx_binary::Deserializer::new()
         .elide_defaults(true)
+        .retain_defaults_for_classes(if identity_rows.is_some() {
+            groups.iter().map(|group| group.service.clone()).collect()
+        } else {
+            HashSet::new()
+        })
         .flat_property_filter(property_filter)
         .deserialize_flat(std::io::Cursor::new(bytes))
     {
@@ -1403,6 +1910,9 @@ fn decode_native_serialization_batch(
         &format!("{}: native binary decode", batch.id),
         decode_started,
     );
+    let captured_debug_ids = identity_rows
+        .map(|rows| native_capture_debug_ids(&flat.instances, rows))
+        .transpose()?;
     if flat.root_indices.len() != expected_roots {
         bail!(
             "Studio native serialization batch {} contains {} roots; expected {}",
@@ -1423,7 +1933,12 @@ fn decode_native_serialization_batch(
     let mut root_offset = 0;
     let mut expected_start = 0;
     for group in &groups {
-        let root_end = root_offset + native_serialized_root_count(group)?;
+        let root_end = root_offset
+            + if identity_rows.is_some() {
+                1
+            } else {
+                native_serialized_root_count(group)?
+            };
         let start = flat.root_indices[root_offset];
         let end = flat
             .root_indices
@@ -1441,7 +1956,11 @@ fn decode_native_serialization_batch(
                 group.service
             );
         }
-        let serialized_instance_count = native_serialized_instance_count(group)?;
+        let serialized_instance_count = if identity_rows.is_some() {
+            group.instance_count
+        } else {
+            native_serialized_instance_count(group)?
+        };
         if end - start != serialized_instance_count {
             bail!(
                 "Studio native {} batch partition contains {} instances; expected {}",
@@ -1452,10 +1971,18 @@ fn decode_native_serialization_batch(
         }
         let marker = &flat.instances[start];
         if marker.parent_index.is_some()
-            || marker.class.as_str() != "Folder"
-            || marker.name != group.service
+            || marker.class.as_str()
+                != if identity_rows.is_some() {
+                    group.service.as_str()
+                } else {
+                    "Folder"
+                }
+            || identity_rows.is_none() && marker.name != group.service
         {
             bail!("Studio native {} batch marker is invalid", group.service);
+        }
+        if identity_rows.is_some() {
+            flat.instances[start].name.clone_from(&group.service);
         }
         spans.push((start, end, root_offset, root_end));
         root_offset = root_end;
@@ -1569,7 +2096,66 @@ fn decode_native_serialization_batch(
                 instance.parent_index = Some(0);
             }
         }
-        let identity = decode_native_identity(instances, group, total_instances)?;
+        let (identity, captured_debug_ids) = if let Some(ids) = &captured_debug_ids {
+            anyhow::ensure!(
+                instances.len() == group.instance_count,
+                "Native captured {} instance count changed",
+                group.service
+            );
+            let mut new_index_by_dense_ref = vec![usize::MAX; total_instances];
+            for (index, instance) in instances.iter().enumerate() {
+                // The complete dense map was validated before partitioning.
+                new_index_by_dense_ref[instance.referent.as_u128().unwrap() as usize - 1] = index;
+            }
+            (
+                NativeIdentityOutput {
+                    instances,
+                    native_index_by_overlay_index: Vec::new(),
+                    new_index_by_dense_ref,
+                },
+                Some(ids[start..end].to_vec()),
+            )
+        } else {
+            (
+                decode_native_identity(instances, group, total_instances)?,
+                None,
+            )
+        };
+        let mut captured_root_properties = Map::new();
+        if identity_rows.is_some() {
+            let database = rbx_reflection_database::get()?;
+            for &name in crate::editor::native_roots::capture_properties(&group.service) {
+                let saved_name = crate::rbx::encode::rbx_serialized_property_name_for_logical(
+                    database,
+                    &group.service,
+                    name,
+                )
+                .unwrap_or(name);
+                let value = identity.instances[0]
+                    .properties
+                    .iter()
+                    .find(|(property, _)| property.as_str() == saved_name)
+                    .with_context(|| format!("Native capture omitted {}.{name}", group.service))?;
+                let descriptor = crate::rbx::encode::rbx_model_property_descriptor(
+                    database,
+                    &group.service,
+                    name,
+                )
+                .with_context(|| {
+                    format!("Native capture has no schema for {}.{name}", group.service)
+                })?;
+                let value = crate::rbx::decode::rbx_variant_to_settings_json(
+                    &value.1,
+                    Some(descriptor),
+                    database,
+                    &BytecodeModelImportRefs::default(),
+                )
+                .with_context(|| {
+                    format!("Native capture cannot decode {}.{name}", group.service)
+                })?;
+                captured_root_properties.insert(name.into(), value);
+            }
+        }
         if doms
             .insert(
                 group.service.clone(),
@@ -1577,6 +2163,8 @@ fn decode_native_serialization_batch(
                     instances: identity.instances,
                     new_index_by_dense_ref: Some(identity.new_index_by_dense_ref),
                     native_index_by_overlay_index: identity.native_index_by_overlay_index,
+                    captured_debug_ids,
+                    captured_root_properties,
                     path_segments_by_ref: Arc::clone(&path_segments_by_ref),
                     path_ordinals_by_ref: Arc::clone(&path_ordinals_by_ref),
                 },
@@ -1592,6 +2180,38 @@ fn decode_native_serialization_batch(
     Ok(doms)
 }
 
+fn match_native_capture_overlay(
+    native: &mut NativeServiceDom,
+    debug_ids: &[Option<String>],
+) -> Result<()> {
+    let Some(captured) = native.captured_debug_ids.take() else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        debug_ids.len() == captured.len(),
+        "Native capture overlay identity count changed"
+    );
+    let mut by_id = captured
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (id.as_str(), index))
+        .collect::<AHashMap<_, _>>();
+    let indices = debug_ids
+        .iter()
+        .map(|id| {
+            let id = id
+                .as_deref()
+                .context("Native capture overlay omitted an identity")?;
+            by_id
+                .remove(id)
+                .context("Native capture overlay contains an unknown or duplicate identity")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    anyhow::ensure!(by_id.is_empty(), "Native capture overlay omitted instances");
+    native.native_index_by_overlay_index = indices;
+    Ok(())
+}
+
 fn native_overlay_reference_debug_id(value: &Value) -> Option<&str> {
     let object = value.as_object()?;
     (object.get("_type").and_then(Value::as_str) == Some("Ref"))
@@ -1601,11 +2221,13 @@ fn native_overlay_reference_debug_id(value: &Value) -> Option<&str> {
 
 fn normalize_native_overlay_internal_references<'a>(
     overlays: &mut [NativeOverlayItem],
+    root_properties: Option<&mut Map<String, Value>>,
     debug_ids: impl IntoIterator<Item = Option<&'a str>>,
 ) {
     let requested = overlays
         .iter()
         .flat_map(|overlay| overlay.properties.values())
+        .chain(root_properties.as_deref().into_iter().flat_map(Map::values))
         .filter_map(native_overlay_reference_debug_id)
         .collect::<HashSet<_>>();
     if requested.is_empty() {
@@ -1625,19 +2247,21 @@ fn normalize_native_overlay_internal_references<'a>(
     if internal_indices.is_empty() {
         return;
     }
-    for overlay in overlays {
-        for value in overlay.properties.values_mut() {
-            let Some(instance_index) = native_overlay_reference_debug_id(value)
-                .and_then(|debug_id| internal_indices.get(debug_id))
-                .copied()
-            else {
-                continue;
-            };
-            *value = json!({
-                "_type": "Ref",
-                "instanceIndex": instance_index,
-            });
-        }
+    for value in overlays
+        .iter_mut()
+        .flat_map(|overlay| overlay.properties.values_mut())
+        .chain(root_properties.into_iter().flat_map(Map::values_mut))
+    {
+        let Some(instance_index) = native_overlay_reference_debug_id(value)
+            .and_then(|debug_id| internal_indices.get(debug_id))
+            .copied()
+        else {
+            continue;
+        };
+        *value = json!({
+            "_type": "Ref",
+            "instanceIndex": instance_index,
+        });
     }
 }
 
@@ -1719,6 +2343,8 @@ fn convert_native_service_output(
         native_index_by_overlay_index,
         path_segments_by_ref,
         path_ordinals_by_ref,
+        captured_debug_ids: _,
+        captured_root_properties,
     } = native;
     if debug_ids.len() != native_instances.len() {
         bail!(
@@ -1729,8 +2355,11 @@ fn convert_native_service_output(
         );
     }
     let debug_ids = reorder_overlay_items(debug_ids, &native_index_by_overlay_index, "debug id")?;
+    let mut root_properties = group.root_properties.clone();
+    root_properties.extend(captured_root_properties);
     normalize_native_overlay_internal_references(
         &mut overlay_instances,
+        Some(&mut root_properties),
         debug_ids.iter().map(|debug_id| debug_id.as_deref()),
     );
     let new_index_by_dense_ref =
@@ -1800,14 +2429,6 @@ fn convert_native_service_output(
             |(index, (((rbx_instance, overlay), debug_id), transported_settings_id))| -> Result<_> {
                 let parent_index = rbx_instance.parent_index.map(|parent| parent + 1);
                 let native_filter = dependencies.native_filters.get(rbx_instance.class.as_str());
-                let primary_part_is_set = rbx_model_primary_part_is_set(
-                    dependencies.database,
-                    rbx_instance.class.as_str(),
-                    rbx_instance
-                        .properties
-                        .iter()
-                        .map(|(name, value)| (name, value)),
-                );
                 let (mut native_properties, mut properties, mut attributes, source) =
                     rbx_properties_to_native_settings_records(
                         rbx_instance.class.as_str(),
@@ -1841,8 +2462,11 @@ fn convert_native_service_output(
                 }
                 if index == 0 {
                     native_properties.clear();
+                    // Native place capture includes engine migration metadata.
+                    // Match the existing service snapshot marker's attribute policy.
+                    attributes.retain(|name, _| !name.starts_with("RBX"));
                     let tags = properties.remove("Tags");
-                    properties.clone_from(&group.root_properties);
+                    properties.clone_from(&root_properties);
                     if let Some(tags) = tags {
                         properties.insert("Tags".to_string(), tags);
                     }
@@ -1885,10 +2509,6 @@ fn convert_native_service_output(
                 if non_archivable_by_index[index] {
                     native_properties.retain(|property| property.name != "Archivable");
                     properties.insert("Archivable".to_string(), Value::Bool(false));
-                }
-                if primary_part_is_set {
-                    native_properties.retain(|property| property.name != "WorldPivot");
-                    properties.remove("WorldPivot");
                 }
                 Ok((
                     SnapshotInstance {
@@ -1943,10 +2563,20 @@ pub(crate) fn editor_binary_export_parts<'a>(
 ) -> Result<EditorBinaryExportFinishGuard<'a>> {
     let export_started_ms = elapsed_ms(run_started);
     let begin_started = Instant::now();
-    let export = begin_editor_binary_export(bridge, true, Some(requested_services), None, false)?;
+    let export = begin_editor_binary_export_for_runtime(
+        bridge,
+        true,
+        Some(requested_services),
+        Some(requested_services),
+        false,
+        None,
+        false,
+    )?;
     let finish_guard = EditorBinaryExportFinishGuard {
         bridge,
         export_id: export.export_id.clone(),
+        #[cfg(windows)]
+        attribute_guard: export.attribute_guard,
     };
     log_timing("native editor export begin", begin_started);
 
@@ -2032,6 +2662,55 @@ pub(crate) fn editor_binary_export_parts<'a>(
             )
         })
         .collect::<HashMap<_, _>>();
+    #[cfg(windows)]
+    let captured_native_services =
+        OnceLock::<Result<Mutex<HashMap<String, NativeServiceDom>>, String>>::new();
+    let native_capture = export.native_capture;
+    let fetch_overlay = |group: &EditorBinaryExportGroup| {
+        let selective_refs = group.instance_count >= NATIVE_SERIALIZATION_SERVICE_LIMIT
+            && group
+                .class_names
+                .iter()
+                .any(|class_name| conditional_ref_schema.contains_key(class_name));
+        let _trace = crate::app::timing::trace_scope("native.export", "fetch overlay");
+        fetch_native_overlay_batches(
+            bridge,
+            NativeOverlayRequest {
+                service: &group.service,
+                start_index: 1,
+                take_count: group.instance_count,
+                instance_count: group.instance_count,
+                overlay_id: export_id,
+                overlay_variant: if selective_refs { "direct" } else { "combined" },
+                include_debug_ids: true,
+                overlay_names: if selective_refs {
+                    &direct_overlay_names
+                } else {
+                    &overlay_names
+                },
+                overlay_schema: if selective_refs {
+                    &direct_overlay_schema
+                } else {
+                    &overlay_schema
+                },
+                enum_value_names_by_type: &export.enum_value_names_by_type,
+                class_names: &group.class_names,
+            },
+        )
+    };
+    // The whole capture has no per-service transport to overlap. Keep the
+    // existing bounded overlay workers busy instead of waiting for that capture
+    // after each service. Receivers retain errors and the export guard's lifetime.
+    let mut overlay_queue = VecDeque::new();
+    let mut overlay_receivers = HashMap::new();
+    if native_capture {
+        for group in &requested_groups {
+            let (sender, receiver) = mpsc::sync_channel::<Result<NativeOverlayFetch>>(1);
+            overlay_queue.push_back((*group, sender));
+            overlay_receivers.insert(group.service.as_str(), Mutex::new(receiver));
+        }
+    }
+    let overlay_queue = Mutex::new(overlay_queue);
     let mut batched_groups = requested_groups
         .iter()
         .filter(|group| {
@@ -2040,7 +2719,7 @@ pub(crate) fn editor_binary_export_parts<'a>(
         })
         .copied()
         .collect::<Vec<_>>();
-    if batched_groups.len() < 2 {
+    if native_capture || batched_groups.len() < 2 {
         batched_groups.clear();
     }
     let batched_service_names = batched_groups
@@ -2066,7 +2745,8 @@ pub(crate) fn editor_binary_export_parts<'a>(
     let mut compact_expand_ms = 0.0;
     let serialization_complete_signal = AtomicBool::new(false);
     let mut serialization_complete = false;
-    let priority_worker_count = if worker_count == 4
+    let priority_worker_count = if !native_capture
+        && worker_count == 4
         && requested_groups
             .first()
             .is_some_and(|group| group.instance_count >= 25_000)
@@ -2087,29 +2767,66 @@ pub(crate) fn editor_binary_export_parts<'a>(
             .collect::<VecDeque<_>>(),
     );
     let priority_gate = NativePriorityWorkerGate::new(priority_worker_count == worker_count);
-    rayon::scope_fifo(|scope| -> Result<()> {
-        for worker_index in 0..worker_count {
-            let sender = sender.clone();
-            let overlay_names = &overlay_names;
-            let overlay_schema = &overlay_schema;
-            let direct_overlay_names = &direct_overlay_names;
-            let direct_overlay_schema = &direct_overlay_schema;
-            let conditional_ref_schema = &conditional_ref_schema;
-            let enum_value_names_by_type = &export.enum_value_names_by_type;
-            let native_decode_filter = &native_decode_filter;
-            let priority_groups = &priority_groups;
-            let service_queue = &service_queue;
-            let priority_gate = &priority_gate;
-            let batched_service_names = &batched_service_names;
-            let batched_service_set = &batched_service_set;
-            let native_binary_batches = &native_binary_batches;
-            let serialization_batch_by_service = &serialization_batch_by_service;
-            let native_serialization_batches = &native_serialization_batches;
-            let serialization_complete_signal = &serialization_complete_signal;
-            let service_groups = &export.groups;
-            let finish_dependencies = &finish_dependencies;
-            scope.spawn_fifo(move |_| {
+    let trace_context = crate::app::timing::trace_context();
+    thread::scope(|overlay_scope| {
+        // Identity and binary reads share the existing export fence. Start both
+        // before waiting so a queued native identity read does not idle all the
+        // binary/overlay workers. No output is published until identity succeeds.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let identity_worker = overlay_scope.spawn(move || {
+            let _trace_context =
+                trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
+            let _trace =
+                crate::app::timing::trace_scope("native.export", "capture persistent identities");
+            let pid = studio_pid_for_bridge(bridge)?;
+            let title = studio_title_for_bridge(bridge, pid)?;
+            serializer::capture_identities(pid, &title, requested_services, Duration::from_secs(3))
+        });
+        if native_capture {
+            for _ in 0..worker_count {
+                let overlay_queue = &overlay_queue;
+                let fetch_overlay = &fetch_overlay;
+                overlay_scope.spawn(move || {
+                    let _trace_context = trace_context
+                        .map(|context| crate::app::timing::enter_trace_context(Some(context)));
+                    loop {
+                        let next = overlay_queue
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .pop_front();
+                        let Some((group, sender)) = next else {
+                            break;
+                        };
+                        let _ = sender.send(fetch_overlay(group));
+                    }
+                });
+            }
+        }
+        rayon::scope_fifo(|scope| -> Result<()> {
+            for worker_index in 0..worker_count {
+                let sender = sender.clone();
+                let fetch_overlay = &fetch_overlay;
+                let overlay_receivers = &overlay_receivers;
+                let conditional_ref_schema = &conditional_ref_schema;
+                let enum_value_names_by_type = &export.enum_value_names_by_type;
+                let native_decode_filter = &native_decode_filter;
+                let priority_groups = &priority_groups;
+                let service_queue = &service_queue;
+                let priority_gate = &priority_gate;
+                let batched_service_names = &batched_service_names;
+                let batched_service_set = &batched_service_set;
+                let native_binary_batches = &native_binary_batches;
+                let serialization_batch_by_service = &serialization_batch_by_service;
+                let native_serialization_batches = &native_serialization_batches;
+                #[cfg(windows)]
+                let captured_native_services = &captured_native_services;
+                let serialization_complete_signal = &serialization_complete_signal;
+                let service_groups = &export.groups;
+                let finish_dependencies = &finish_dependencies;
+                scope.spawn_fifo(move |_| {
+                    let _trace_context = trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
                     if worker_index >= priority_worker_count {
+                        let _wait = crate::app::timing::trace_scope("wait", "native export priority gate");
                         priority_gate.wait();
                     }
                     let mut priority_release = OnDrop::new(|| {
@@ -2128,26 +2845,52 @@ pub(crate) fn editor_binary_export_parts<'a>(
                         let Some(group) = service else {
                             break;
                         };
+                        let _service_trace = crate::app::timing::trace_scope("native.export", &group.service);
                         let result = thread::scope(|reference_scope| -> Result<NativeServiceExportResult> {
+                        // Root reads use the same active export guard, but must
+                        // not hold up unrelated binary decoding and file writes.
+                        #[cfg(any(windows, target_os = "macos"))]
+                        let root_capture = (!native_capture && !crate::editor::native_roots::capture_properties(&group.service).is_empty())
+                            .then(|| reference_scope.spawn(move || -> Result<EditorBinaryExportGroup> {
+                                let _trace_context = trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
+                                let mut captured = group.clone();
+                                capture_native_service_root_properties(bridge, None, std::slice::from_mut(&mut captured))?;
+                                Ok(captured)
+                            }));
                         let selective_refs =
                             group.instance_count >= NATIVE_SERIALIZATION_SERVICE_LIMIT
                             && group.class_names.iter().any(|class_name| {
                                 conditional_ref_schema.contains_key(class_name)
                             });
-                        let first_overlay_names = if selective_refs {
-                            direct_overlay_names
-                        } else {
-                            overlay_names
-                        };
-                        let first_overlay_schema = if selective_refs {
-                            direct_overlay_schema
-                        } else {
-                            overlay_schema
-                        };
                         let (reference_sender, reference_receiver) = mpsc::sync_channel(1);
                         let (native, overlay) = rayon::join(
                             || -> Result<NativeServiceFetch> {
-                                let (native, one_chunk) = if let Some(batch) =
+                                let _trace_context = trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
+                                let _trace = crate::app::timing::trace_scope("native.export", "fetch and decode binary");
+                                let (native, one_chunk) = if native_capture {
+                                    #[cfg(windows)]
+                                    {
+                                        let captured = captured_native_services.get_or_init(|| {
+                                            (|| -> Result<_> {
+                                                let info = bridge.cached_bridge_info_for_target(crate::studio::bridge::BridgeTarget::Edit)?;
+                                                let pid = bridge.studio_pid_for_runtime(crate::studio::bridge::BridgeTarget::Edit, &info.runtime_id)?;
+                                                let services = service_groups.iter().map(|group| group.service.clone()).collect::<Vec<_>>();
+                                                let captured = serializer::capture_live_services(pid,
+                                                    &info.place_name, &services, Duration::from_secs(15))?;
+                                                serialization_complete_signal.store(true, Ordering::Release);
+                                                let batch = EditorBinarySerializationBatch { id: "native-capture".into(), services };
+                                                decode_native_serialization_batch(&captured.bytes, &batch, service_groups,
+                                                    Arc::clone(native_decode_filter), Some(&captured.identities)).map(Mutex::new)
+                                            })().map_err(|error| format!("{error:#}"))
+                                        });
+                                        let captured = match captured { Ok(captured) => captured, Err(error) => bail!("{error}") };
+                                        let native = captured.lock().unwrap_or_else(PoisonError::into_inner).remove(&group.service)
+                                            .with_context(|| format!("Native capture omitted {}", group.service))?;
+                                        (native, false)
+                                    }
+                                    #[cfg(not(windows))]
+                                    { bail!("Native service capture is unavailable on this platform"); }
+                                } else if let Some(batch) =
                                     serialization_batch_by_service.get(group.service.as_str())
                                 {
                                     let batch_doms = native_serialization_batches
@@ -2166,6 +2909,7 @@ pub(crate) fn editor_binary_export_parts<'a>(
                                                     batch,
                                                     service_groups,
                                                     Arc::clone(native_decode_filter),
+                                                    None,
                                                 )
                                                 .map(Mutex::new)
                                             })()
@@ -2234,7 +2978,7 @@ pub(crate) fn editor_binary_export_parts<'a>(
                                         one_chunk,
                                     )
                                 };
-                                let reference_request = selective_refs
+                                let reference_request = (selective_refs && !native_capture)
                                     .then(|| {
                                         conditional_ref_overlay_request(
                                             &native.instances,
@@ -2250,6 +2994,8 @@ pub(crate) fn editor_binary_export_parts<'a>(
                                         .clone()
                                         .context("Native conditional-reference request is missing")?;
                                     reference_scope.spawn(move || {
+                                        let _trace_context = trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
+                                        let _trace = crate::app::timing::trace_scope("native.export", "conditional references");
                                         let result = fetch_native_conditional_overlay(
                                             bridge,
                                             export_id,
@@ -2269,26 +3015,14 @@ pub(crate) fn editor_binary_export_parts<'a>(
                                 ))
                             },
                             || {
-                                fetch_native_overlay_batches(
-                                    bridge,
-                                    NativeOverlayRequest {
-                                        service: &group.service,
-                                        start_index: 1,
-                                        take_count: group.instance_count,
-                                        instance_count: group.instance_count,
-                                        overlay_id: export_id,
-                                        overlay_variant: if selective_refs {
-                                            "direct"
-                                        } else {
-                                            "combined"
-                                        },
-                                        include_debug_ids: true,
-                                        overlay_names: first_overlay_names,
-                                        overlay_schema: first_overlay_schema,
-                                        enum_value_names_by_type,
-                                        class_names: &group.class_names,
-                                    },
-                                )
+                                let _trace_context = trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
+                                if let Some(receiver) = overlay_receivers.get(group.service.as_str()) {
+                                    let _wait = crate::app::timing::trace_scope("wait", "prefetched native overlay");
+                                    receiver.lock().unwrap_or_else(PoisonError::into_inner).recv()
+                                        .context("Native overlay worker ended without a result")?
+                                } else {
+                                    fetch_overlay(group)
+                                }
                             },
                         );
                         if let Ok(overlay) = &overlay && verbose_timing_logs() {
@@ -2302,10 +3036,20 @@ pub(crate) fn editor_binary_export_parts<'a>(
                                 overlay.compact_expand_ms
                             );
                         }
-                        let (native, reference_prefetched, reference_request) = native?;
+                        let (mut native, reference_prefetched, mut reference_request) = native?;
                         let mut overlay = overlay?;
                         let debug_ids = std::mem::take(&mut overlay.debug_ids);
+                        if native_capture {
+                            match_native_capture_overlay(&mut native, &debug_ids)?;
+                            reference_request = selective_refs.then(|| conditional_ref_overlay_request(
+                                &native.instances, conditional_ref_schema, &native.native_index_by_overlay_index))
+                                .filter(|request| request.2 > 0);
+                        }
                         let settings_ids = std::mem::take(&mut overlay.settings_ids);
+                        #[cfg(any(windows, target_os = "macos"))]
+                        let captured_group = root_capture.map(|task| task.join().expect("native root capture panicked")).transpose()?;
+                        #[cfg(any(windows, target_os = "macos"))]
+                        let group = captured_group.as_ref().unwrap_or(group);
                         let mut result = finish_native_service_export(
                             finish_dependencies,
                             group,
@@ -2349,29 +3093,53 @@ pub(crate) fn editor_binary_export_parts<'a>(
                         }
                     }
                 });
-        }
-        drop(sender);
-        for _ in 0..requested_services.len() {
-            let result = receiver
-                .lock()
-                .map_err(|_| anyhow::anyhow!("Native service export receiver was poisoned"))?
-                .recv()
-                .context("Native service export worker closed")??;
-            merge_chunk_fetch_metrics(&mut metrics, result.metrics);
-            compact_expand_ms += result.compact_expand_ms;
-            on_output(result.output)?;
-            if !serialization_complete && serialization_complete_signal.load(Ordering::Acquire) {
-                serialization_complete = true;
-                on_serialization_complete()?;
-                if verbose_timing_logs() {
-                    println!(
-                        "[renium] native editor serialization complete at {:.1}ms",
-                        elapsed_ms(run_started)
-                    );
+            }
+            drop(sender);
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let persistent_identities = identity_worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("Native identity capture worker panicked"))??;
+            for _ in 0..requested_services.len() {
+                let result = receiver
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Native service export receiver was poisoned"))?
+                    .recv()
+                    .context("Native service export worker closed")??;
+                merge_chunk_fetch_metrics(&mut metrics, result.metrics);
+                compact_expand_ms += result.compact_expand_ms;
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                let result = {
+                    let mut result = result;
+                    for instance in &mut result.output.parts.instances {
+                        let id = instance
+                            .debug_id
+                            .as_deref()
+                            .and_then(|id| persistent_identities.get(id))
+                            .context("Exported instance is missing from native identity capture")?;
+                        // Use the existing metadata codec. The final export guard
+                        // covers the whole interval from identity read to publication.
+                        instance.properties.insert(
+                            "UniqueId".into(),
+                            json!({"_type": "UniqueId", "value": id.to_string()}),
+                        );
+                    }
+                    result
+                };
+                on_output(result.output)?;
+                if !serialization_complete && serialization_complete_signal.load(Ordering::Acquire)
+                {
+                    serialization_complete = true;
+                    on_serialization_complete()?;
+                    if verbose_timing_logs() {
+                        println!(
+                            "[renium] native editor serialization complete at {:.1}ms",
+                            elapsed_ms(run_started)
+                        );
+                    }
                 }
             }
-        }
-        Ok(())
+            Ok(())
+        })
     })?;
     log_chunk_fetch_metrics("native editor overlay payloads", metrics);
     log_timing_ms("native editor overlay compact expansion", compact_expand_ms);
@@ -2380,7 +3148,7 @@ pub(crate) fn editor_binary_export_parts<'a>(
 }
 
 #[cfg(any(windows, target_os = "macos"))]
-fn rbx_dom_path_export_refs(dom: &RbxWeakDom) -> BytecodeModelExportRefs {
+fn rbx_dom_path_export_refs(dom: &RbxWeakDom) -> BytecodeModelExportRefs<'static> {
     let mut refs_preorder = Vec::new();
     for referent in rbx_model_top_level_refs(dom) {
         collect_rbx_subtree_preorder(dom, referent, &mut refs_preorder);
@@ -2477,7 +3245,7 @@ fn finish_native_service_export(
     input: NativeServiceFinishInput,
 ) -> Result<NativeServiceExportResult> {
     let NativeServiceFinishInput {
-        native,
+        mut native,
         debug_ids,
         settings_ids,
         overlay,
@@ -2485,10 +3253,15 @@ fn finish_native_service_export(
         reference_request,
         export_started_ms,
     } = input;
+    match_native_capture_overlay(&mut native, &debug_ids)?;
     let mut service_metrics = overlay.metrics;
     let mut service_compact_expand_ms = overlay.compact_expand_ms;
     let has_reference_work = reference_prefetch.is_some() || reference_request.is_some();
+    let trace_context = crate::app::timing::trace_context();
     let convert = move || {
+        let _trace_context =
+            trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
+        let _trace = crate::app::timing::trace_scope("native.export", "convert service");
         convert_native_service_output(
             dependencies,
             group,
@@ -2501,6 +3274,10 @@ fn finish_native_service_export(
     };
     let (output, native_index_by_overlay_index) = if has_reference_work {
         let (output, reference_overlay) = rayon::join(convert, || {
+            let _trace_context =
+                trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
+            let _trace =
+                crate::app::timing::trace_scope("native.export", "complete conditional references");
             if let Some(receiver) = reference_prefetch {
                 return receiver
                     .recv()
@@ -2531,6 +3308,7 @@ fn finish_native_service_export(
             remap_native_overlay_items(&mut items, &native_index_by_overlay_index)?;
             normalize_native_overlay_internal_references(
                 &mut items,
+                None,
                 output
                     .parts
                     .instances
@@ -2717,7 +3495,7 @@ fn write_editor_place_snapshot(
     };
     let mut dom = rbx_binary::from_reader(std::io::Cursor::new(&export.bytes))
         .context("Studio returned an invalid native place snapshot")?;
-    let plugin_service_roots = plugin_place_service_roots(&mut dom, &export.groups)?;
+    let plugin_service_roots = serialized_service_roots(&mut dom, &export.groups)?;
     let service_names = export
         .groups
         .iter()
@@ -2868,7 +3646,18 @@ fn send_editor_binary_import(
     bridge: &BridgeServer,
     binary_import: &EditorBinaryImport,
     transaction_id: &str,
+    container_settings: &[EditorPropertyChange],
 ) -> Result<Value> {
+    #[cfg(windows)]
+    if binary_import.native_replacement.is_some() {
+        return send_editor_service_replacement(
+            bridge,
+            binary_import,
+            transaction_id,
+            container_settings,
+        );
+    }
+    let _ = container_settings;
     const RAW_CHUNK_BYTES: usize = 2 * 1024 * 1024;
     let import_id = format!("{}-{}", current_millis(), fnv1a_hex(&binary_import.bytes));
     let total_chunks = binary_import.bytes.len().div_ceil(RAW_CHUNK_BYTES);
@@ -2882,13 +3671,16 @@ fn send_editor_binary_import(
             "instanceCount": binary_import.instance_count,
             "groups": &binary_import.groups,
             "externalReferencesPostApplied": binary_import.external_references_post_applied,
+            "viewportReferencesPostApplied": binary_import.viewport_references_post_applied,
             "transactionId": transaction_id,
         }),
     )?;
     log_timing("native editor import begin", started);
     let import_result = (|| -> Result<Value> {
         let started = Instant::now();
+        let request_lease = bridge.active_request_lease();
         let transfer_threads = bridge.channel_count().max(1).min(total_chunks.max(1));
+        let trace_context = crate::app::timing::trace_context();
         rayon::ThreadPoolBuilder::new()
             .num_threads(transfer_threads)
             .build()
@@ -2899,6 +3691,12 @@ fn send_editor_binary_import(
                     .par_chunks(RAW_CHUNK_BYTES)
                     .enumerate()
                     .try_for_each(|(index, chunk)| -> Result<()> {
+                        let _trace_context = trace_context
+                            .map(|context| crate::app::timing::enter_trace_context(Some(context)));
+                        let _lease = request_lease
+                            .as_ref()
+                            .map(|lease| bridge.inherit_request_lease(Arc::clone(lease)))
+                            .transpose()?;
                         let data = base64::encode(chunk);
                         bridge.call(
                             "appendEditorBinaryImport",
@@ -2915,9 +3713,14 @@ fn send_editor_binary_import(
         let started = Instant::now();
         let result = bridge.call(
             "finishEditorBinaryImport",
-            json!({ "importId": &import_id }),
+            json!({ "importId": &import_id, "profile": verbose_timing_logs() }),
         );
         log_timing("native editor import finish", started);
+        if let Ok(response) = &result
+            && let Some(profile) = response.get("profile")
+        {
+            crate::app::timing::trace_profile("Studio binary import finish", profile);
+        }
         result
     })();
     if import_result.is_err() {
@@ -2927,6 +3730,197 @@ fn send_editor_binary_import(
         );
     }
     import_result
+}
+
+#[cfg(windows)]
+fn send_editor_service_replacement(
+    bridge: &BridgeServer,
+    import: &EditorBinaryImport,
+    transaction_id: &str,
+    container_settings: &[EditorPropertyChange],
+) -> Result<Value> {
+    let plan = import
+        .native_replacement
+        .as_ref()
+        .context("Native replacement plan is missing")?;
+    let import_id = format!("{}-{}", current_millis(), fnv1a_hex(&import.bytes));
+    let pid = studio_pid_for_bridge(bridge)?;
+    let title = studio_title_for_bridge(bridge, pid)?;
+    let begin = bridge.call("beginEditorBinaryImport", json!({
+        "importId": &import_id, "transactionId": transaction_id,
+        "totalBytes": import.bytes.len(), "totalChunks": import.bytes.len().div_ceil(2 * 1024 * 1024),
+        "instanceCount": import.instance_count, "groups": &import.groups,
+        "externalReferencesPostApplied": import.external_references_post_applied,
+        "viewportReferencesPostApplied": import.viewport_references_post_applied,
+        "nativeReplacement": plan, "containerSettings": container_settings,
+        "nativeReceiptFormat": 2,
+    }))?;
+    let mut invoked = false;
+    let result = (|| {
+        anyhow::ensure!(
+            begin.get("nativeReceiptFormat").and_then(Value::as_u64) == Some(2),
+            "Studio's Renium plugin needs updating for compact native receipts"
+        );
+        let held = begin
+            .get("nativeTargets")
+            .context("Studio did not return native transaction targets")?;
+        let ready = bridge.call(
+            "finishEditorBinaryImport",
+            json!({
+                "importId": &import_id, "nativePhase": "prepare", "profile": verbose_timing_logs(),
+            }),
+        )?;
+        // Native code must not run merely because a target lookup succeeded.
+        // The plugin first arms rollback, owns the mutation and its observation.
+        anyhow::ensure!(
+            ready.get("nativeReaderReady").and_then(Value::as_bool) == Some(true),
+            "Studio has not armed the native replacement transaction"
+        );
+        // Keep the binary batches, but share one native task and factory scope.
+        // Its creation ordinals already match the transaction-wide identity plan.
+        let (created, outcome) = match serializer::read_service_payload(
+            pid,
+            &title,
+            &import.bytes,
+            plan,
+            held,
+            Duration::from_secs(20),
+            &mut invoked,
+        ) {
+            Ok(receipt) => (
+                receipt.created,
+                (receipt.status, receipt.state, receipt.error),
+            ),
+            // Nothing ran: disarm the native phase so ordinary rollback can run.
+            Err(error) if !invoked => (Vec::new(), (1, 8, error.to_string())),
+            // An unknown native outcome must not be retried or blindly cancelled.
+            Err(error) => return Err(error),
+        };
+        // The helper's fixed-width ABI is not the bridge's wire format. Keep
+        // exact identities/ordinals, without transporting 48-byte padded strings.
+        let mut chunks = vec![Vec::new()];
+        for row in created.chunks_exact(serializer::CREATED_ROW) {
+            let class = u32::from_le_bytes(row[..4].try_into()?);
+            let class =
+                u16::try_from(class).context("Native receipt class exceeds its wire limit")?;
+            let length = row[8..]
+                .iter()
+                .position(|byte| *byte == 0)
+                .context("Native receipt identity is unterminated")?;
+            anyhow::ensure!(
+                length > 0 && length < 48,
+                "Native receipt identity is empty or oversized"
+            );
+            if chunks.last().unwrap().len() + 7 + length > 2 * 1024 * 1024 {
+                chunks.push(Vec::new());
+            }
+            let chunk = chunks.last_mut().unwrap();
+            chunk.extend_from_slice(&class.to_le_bytes());
+            chunk.extend_from_slice(&row[4..8]);
+            chunk.push(length as u8);
+            chunk.extend_from_slice(&row[8..8 + length]);
+        }
+        // The last receipt and its completion are one ordered operation. Older
+        // plugins keep the explicit upload request; the begin reply negotiates it.
+        let inline_receipt =
+            begin.get("nativeInlineReceipt").and_then(Value::as_bool) == Some(true);
+        let mut final_receipt = None;
+        let chunks = chunks
+            .iter()
+            .filter(|chunk| !chunk.is_empty())
+            .collect::<Vec<_>>();
+        for (index, chunk) in chunks.iter().enumerate() {
+            let receipt = json!({ "index": index + 1, "data": base64::encode(chunk) });
+            if inline_receipt && index + 1 == chunks.len() {
+                final_receipt = Some(receipt);
+                break;
+            }
+            bridge.call(
+                "appendEditorBinaryImport",
+                json!({
+                    "importId": &import_id, "nativeReceipt": true, "index": index + 1,
+                    "data": receipt["data"],
+                }),
+            )?;
+        }
+        let response = bridge.call(
+            "finishEditorBinaryImport",
+            json!({
+                "importId": &import_id, "nativePhase": "complete", "profile": verbose_timing_logs(),
+                "nativeStatus": outcome.0, "nativeState": outcome.1, "nativeError": outcome.2,
+                "nativeCreated": created.len() / serializer::CREATED_ROW,
+                "nativeReceiptChunk": final_receipt,
+            }),
+        )?;
+        if let Some(profile) = response.get("profile") {
+            crate::app::timing::trace_profile("Studio native import tracking", profile);
+        }
+        anyhow::ensure!(
+            response["ok"] == true
+                && response["nativeInserted"] == true
+                && response["instanceCreated"].as_u64()
+                    == Some((created.len() / serializer::CREATED_ROW) as u64),
+            "Studio did not confirm the native replacement: {response}"
+        );
+        Ok(response)
+    })();
+    if result.is_err() && !invoked {
+        let _ = bridge.call(
+            "cancelEditorBinaryImport",
+            json!({ "importId": &import_id }),
+        );
+    }
+    result
+}
+
+const INSTANCE_BATCH_SIZE: usize = 5000;
+const SOURCE_BATCH_SIZE: usize = 16;
+const PROPERTY_BATCH_MAX_ITEMS: usize = 512;
+
+fn combined_editor_change_batch(
+    changes: &EditorChangeSet,
+    probe_events: bool,
+    transaction_id: Option<&str>,
+) -> Result<Option<Value>> {
+    let categories = usize::from(!changes.instance_changes.is_empty())
+        + usize::from(!changes.source_changes.is_empty())
+        + usize::from(!changes.property_changes.is_empty());
+    if categories < 2
+        || changes.instance_changes.len() > INSTANCE_BATCH_SIZE
+        || changes.source_changes.len() > SOURCE_BATCH_SIZE
+        || changes.property_changes.len() > PROPERTY_BATCH_MAX_ITEMS
+        || changes.instance_changes.iter().any(|change| {
+            change.instances.len() > INSTANCE_BATCH_SIZE
+                || change.preserve_instances.len() > INSTANCE_BATCH_SIZE
+                || matches!(
+                    change.mode.as_str(),
+                    "beginReconcileService" | "reconcileServiceChunk" | "finishReconcileService"
+                )
+        })
+    {
+        return Ok(None);
+    }
+    let mut sources = changes.source_changes.iter().collect::<Vec<_>>();
+    sources.sort_by(|left, right| source_change_apply_order(left, right));
+    // applyEditorChanges already applies instances, then ordered sources, then
+    // properties. Keep oversized and streaming operations on their chunked path.
+    let request = json!({
+        "profile": verbose_timing_logs(),
+        "probeEvents": probe_events,
+        "instanceChanges": &changes.instance_changes,
+        "sourceChanges": sources,
+        "propertyChanges": &changes.property_changes,
+        "transactionId": transaction_id,
+    });
+    Ok((serde_json::to_vec(&request)?.len() <= MAX_BRIDGE_CHUNK_BYTES).then_some(request))
+}
+
+fn material_mode_value(change: &EditorPropertyChange) -> Option<&Value> {
+    (change.service == "MaterialService"
+        && change.class_name == "MaterialService"
+        && change.path_segments == ["MaterialService"])
+    .then(|| change.properties.get("Use2022Materials"))
+    .flatten()
 }
 
 pub(crate) fn send_editor_change_batches(
@@ -2968,6 +3962,7 @@ pub(crate) fn send_editor_change_batches(
             let result = bridge.call(
                 "applyEditorChanges",
                 json!({
+                    "profile": verbose_timing_logs(),
                     "probeEvents": true,
                     "instanceChanges": [],
                     "sourceChanges": [],
@@ -2993,10 +3988,43 @@ pub(crate) fn send_editor_change_batches(
         return Ok(summary);
     }
 
+    // Material mode changes Terrain's default colors. Complete that engine
+    // setter before ordinary properties restore the explicitly saved palette.
+    let material_changes = changes
+        .property_changes
+        .iter()
+        .filter_map(|change| {
+            let value = material_mode_value(change)?;
+            let mut first = change.clone();
+            first.properties = Map::from_iter([("Use2022Materials".into(), value.clone())]);
+            first.reset_properties.clear();
+            first.attributes.clear();
+            first.deleted_attributes.clear();
+            Some(first)
+        })
+        .collect::<Vec<_>>();
+    if !material_changes.is_empty() {
+        let result = bridge.call(
+            "applyEditorChanges",
+            json!({
+                "profile": verbose_timing_logs(),
+                "probeEvents": probe_events,
+                "instanceChanges": [], "sourceChanges": [],
+                "propertyChanges": material_changes, "transactionId": transaction_id,
+            }),
+        )?;
+        merge_editor_summary_checked(&mut summary, &result)?;
+        crate::editor::native_roots::apply(bridge, &mut summary, transaction_id)?;
+    }
+
+    let mut payload_verified_services = std::collections::BTreeSet::new();
     if let Some(binary_import) = binary_import {
         let transaction_id =
             transaction_id.context("Native editor import requires an active transaction")?;
-        let result = send_editor_binary_import(bridge, binary_import, transaction_id)?;
+        let container_settings = container_setting_rows(changes, binary_import);
+        let result =
+            send_editor_binary_import(bridge, binary_import, transaction_id, &container_settings)?;
+        payload_verified_services = verified_payload_services(binary_import, &result);
         merge_editor_summary_checked(&mut summary, &result)?;
         summary.insert(
             "binaryBytes".to_string(),
@@ -3010,15 +4038,62 @@ pub(crate) fn send_editor_change_batches(
         );
     }
 
-    const INSTANCE_BATCH_SIZE: usize = 5000;
-    const SOURCE_BATCH_SIZE: usize = 16;
-    const PROPERTY_BATCH_MAX_ITEMS: usize = 512;
-
-    for instance_change in changes
-        .instance_changes
-        .iter()
-        .filter(|_| binary_import.is_none())
+    if binary_import.is_none()
+        && material_changes.is_empty()
+        && let Some(request) = combined_editor_change_batch(changes, probe_events, transaction_id)?
     {
+        let result = bridge.call("applyEditorChanges", request)?;
+        merge_editor_summary_checked(&mut summary, &result)?;
+        summary.insert(
+            "sourceSent".to_string(),
+            json!(changes.source_changes.len()),
+        );
+        summary.insert(
+            "propertySent".to_string(),
+            json!(changes.property_changes.len()),
+        );
+        let native_root_verification =
+            crate::editor::native_roots::apply(bridge, &mut summary, transaction_id)?;
+        crate::editor::native_geometry::apply(bridge, &mut summary, transaction_id)?;
+        verify_in_place_editor_fields(
+            bridge,
+            changes,
+            binary_import,
+            transaction_id,
+            &native_root_verification,
+            &mut summary,
+        )?;
+        return Ok(summary);
+    }
+
+    for instance_change in changes.instance_changes.iter().filter_map(|change| {
+        let Some(import) = binary_import else {
+            return Some(std::borrow::Cow::Borrowed(change));
+        };
+        if import.imports_service(&change.service) {
+            return None;
+        }
+        if change.mode != "upsertInstances"
+            || !change.instances.iter().any(|instance| {
+                import.imports_path(
+                    &change.service,
+                    &instance.path_segments,
+                    &instance.path_ordinals,
+                )
+            })
+        {
+            return Some(std::borrow::Cow::Borrowed(change));
+        }
+        let mut remaining = change.clone();
+        remaining.instances.retain(|instance| {
+            !import.imports_path(
+                &change.service,
+                &instance.path_segments,
+                &instance.path_ordinals,
+            )
+        });
+        (!remaining.instances.is_empty()).then_some(std::borrow::Cow::Owned(remaining))
+    }) {
         if instance_change.mode == "reconcileService"
             && (instance_change.instances.len() > INSTANCE_BATCH_SIZE
                 || instance_change.preserve_instances.len() > INSTANCE_BATCH_SIZE)
@@ -3068,6 +4143,7 @@ pub(crate) fn send_editor_change_batches(
                 let result = match bridge.call(
                     "applyEditorChanges",
                     json!({
+                        "profile": verbose_timing_logs(),
                         "probeEvents": probe_events,
                         "instanceChanges": [{
                             "mode": mode,
@@ -3101,6 +4177,7 @@ pub(crate) fn send_editor_change_batches(
                 let result = bridge.call(
                     "applyEditorChanges",
                     json!({
+                    "profile": verbose_timing_logs(),
                     "probeEvents": probe_events,
                     "instanceChanges": [{
                         "mode": &instance_change.mode,
@@ -3119,6 +4196,7 @@ pub(crate) fn send_editor_change_batches(
             let result = bridge.call(
                 "applyEditorChanges",
                 json!({
+                    "profile": verbose_timing_logs(),
                     "probeEvents": probe_events,
                     "instanceChanges": [instance_change],
                     "sourceChanges": [],
@@ -3134,7 +4212,13 @@ pub(crate) fn send_editor_change_batches(
         .source_changes
         .iter()
         .filter(|change| {
-            !binary_import.is_some_and(|import| import.imports_service(&change.service))
+            !binary_import.is_some_and(|import| {
+                import.imports_path(
+                    &change.service,
+                    &change.path_segments,
+                    &change.path_ordinals,
+                )
+            })
         })
         .collect::<Vec<_>>();
     source_changes.sort_by(|left, right| source_change_apply_order(left, right));
@@ -3146,6 +4230,7 @@ pub(crate) fn send_editor_change_batches(
         let result = bridge.call(
             "applyEditorChanges",
             json!({
+                "profile": verbose_timing_logs(),
                 "probeEvents": probe_events,
                 "instanceChanges": [],
                 "sourceChanges": source_batch,
@@ -3158,7 +4243,13 @@ pub(crate) fn send_editor_change_batches(
 
     let mut property_changes = Vec::new();
     for change in &changes.property_changes {
-        let imported = binary_import.is_some_and(|import| import.imports_service(&change.service));
+        let imported = binary_import.is_some_and(|import| {
+            import.imports_path(
+                &change.service,
+                &change.path_segments,
+                &change.path_ordinals,
+            )
+        });
         if imported
             && binary_import.is_some_and(|import| {
                 import.retains_path(
@@ -3170,9 +4261,24 @@ pub(crate) fn send_editor_change_batches(
         {
             continue;
         }
-        let send_all = !imported || property_change_needs_post_native_apply(change);
+        let payload_container = imported
+            && binary_import.is_some_and(|import| {
+                import.carries_container_settings(&change.service, &change.path_segments)
+            });
+        let send_all =
+            !imported || property_change_needs_post_native_apply(change) && !payload_container;
         if send_all {
-            property_changes.push(change.clone());
+            let mut remaining = change.clone();
+            if material_mode_value(change).is_some() {
+                remaining.properties.remove("Use2022Materials");
+            }
+            if !remaining.properties.is_empty()
+                || !remaining.reset_properties.is_empty()
+                || !remaining.attributes.is_empty()
+                || !remaining.deleted_attributes.is_empty()
+            {
+                property_changes.push(remaining);
+            }
             continue;
         }
         let class_names = binary_import.and_then(|import| {
@@ -3188,6 +4294,28 @@ pub(crate) fn send_editor_change_batches(
                     &change.path_ordinals,
                 ))
         });
+        let retained_name = |name: &str| {
+            class_names.is_some_and(|names| names.contains(name))
+                || path_names.is_some_and(|names| names.contains(name))
+        };
+        if payload_container {
+            let mut remaining = change.clone();
+            remaining.attributes.clear();
+            remaining.properties.retain(|name, _| {
+                crate::editor::native_roots::is_property(&change.class_name, name)
+                    || retained_name(name)
+            });
+            if material_mode_value(change).is_some() {
+                remaining.properties.remove("Use2022Materials");
+            }
+            if !remaining.properties.is_empty()
+                || !remaining.reset_properties.is_empty()
+                || !remaining.deleted_attributes.is_empty()
+            {
+                property_changes.push(remaining);
+            }
+            continue;
+        }
         if class_names.is_none() && path_names.is_none() {
             continue;
         }
@@ -3196,8 +4324,7 @@ pub(crate) fn send_editor_change_batches(
             .iter()
             .filter(|(name, _)| {
                 !(change.class_name == "Model" && name.as_str() == "WorldPivot")
-                    && (class_names.is_some_and(|names| names.contains(*name))
-                        || path_names.is_some_and(|names| names.contains(*name)))
+                    && retained_name(name)
             })
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect::<Map<_, _>>();
@@ -3212,41 +4339,310 @@ pub(crate) fn send_editor_change_batches(
     }
     summary.insert(
         "propertySent".to_string(),
-        Value::Number(serde_json::Number::from(property_changes.len() as u64)),
+        Value::Number(serde_json::Number::from(
+            (property_changes.len() + material_changes.len()) as u64,
+        )),
     );
-    let mut property_start = 0;
-    while property_start < property_changes.len() {
-        let mut property_end = property_start;
-        let mut estimated_bytes = 256usize;
-        while property_end < property_changes.len()
-            && property_end - property_start < PROPERTY_BATCH_MAX_ITEMS
-        {
-            let change_bytes = serde_json::to_vec(&property_changes[property_end])?.len() + 1;
-            if property_end > property_start
-                && estimated_bytes.saturating_add(change_bytes) > MAX_BRIDGE_CHUNK_BYTES
-            {
-                break;
-            }
-            estimated_bytes = estimated_bytes.saturating_add(change_bytes);
-            property_end += 1;
+    send_property_batches(
+        bridge,
+        &property_changes,
+        probe_events,
+        transaction_id,
+        &mut summary,
+    )?;
+
+    let native_root_verification =
+        crate::editor::native_roots::apply(bridge, &mut summary, transaction_id)?;
+    crate::editor::native_geometry::apply(bridge, &mut summary, transaction_id)?;
+    if let Some(import) = binary_import.filter(|import| {
+        import.native_replacement.is_some() || !payload_verified_services.is_empty()
+    }) {
+        let started = Instant::now();
+        let mut rows = container_setting_rows(changes, import);
+        rows.extend(property_changes);
+        if import.native_replacement.is_none() {
+            rows.extend(material_changes);
+            rows.retain(|row| payload_verified_services.contains(&row.service));
         }
-        let property_batch = &property_changes[property_start..property_end];
+        verify_native_property_rows(
+            bridge,
+            &rows,
+            transaction_id.context("Native verification requires a transaction")?,
+            &native_root_verification,
+            &mut summary,
+        )?;
+        // The native factory or detached tree checked its complete receipt. Verify the
+        // retained containers and every value applied outside that reader here,
+        // rather than exporting all newly loaded instances a second time.
+        // Additive groups and property resets retain ordinary readback.
+        let services = import
+            .groups
+            .iter()
+            .filter(|group| {
+                (import.native_replacement.is_some()
+                    || payload_verified_services.contains(&group.service))
+                    && !import
+                        .groups
+                        .iter()
+                        .any(|other| other.service == group.service && other.additive)
+                    && !rows
+                        .iter()
+                        .any(|row| row.service == group.service && !row.reset_properties.is_empty())
+            })
+            .map(|group| group.service.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        summary.insert("nativeVerifiedServices".into(), json!(services));
+        log_timing("native editor supplemental verification", started);
+    }
+    verify_in_place_editor_fields(
+        bridge,
+        changes,
+        binary_import,
+        transaction_id,
+        &native_root_verification,
+        &mut summary,
+    )?;
+    Ok(summary)
+}
+
+fn verify_in_place_editor_fields(
+    bridge: &BridgeServer,
+    changes: &EditorChangeSet,
+    binary_import: Option<&EditorBinaryImport>,
+    transaction_id: Option<&str>,
+    native_roots: &crate::editor::native_roots::NativeRootVerification,
+    summary: &mut Map<String, Value>,
+) -> Result<()> {
+    // Filtered plans can intentionally omit requested fields. Their remaining
+    // writes cannot prove the complete desired service snapshot.
+    if changes.files_to_studio_filters_active {
+        return Ok(());
+    }
+    let Some(transaction_id) = transaction_id else {
+        return Ok(());
+    };
+    let field_services = changes
+        .property_changes
+        .iter()
+        .filter(|row| {
+            !row.properties.is_empty()
+                || !row.attributes.is_empty()
+                || !row.deleted_attributes.is_empty()
+        })
+        .map(|row| row.service.as_str())
+        .chain(
+            changes
+                .instance_changes
+                .iter()
+                .map(|row| row.service.as_str()),
+        )
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter(|service| {
+            changes
+                .property_changes
+                .iter()
+                .filter(|row| row.service == *service)
+                .all(|row| row.reset_properties.is_empty())
+                && !changes.instance_changes.iter().any(|change| {
+                    change.service == *service
+                        && !matches!(change.mode.as_str(), "upsertInstances" | "deleteInstances")
+                })
+                && !changes
+                    .source_changes
+                    .iter()
+                    .any(|change| change.service == *service && change.deleted)
+                && binary_import.is_none_or(|import| {
+                    !import.groups.iter().any(|group| group.service == *service)
+                        || (import.native_replacement.is_some()
+                            && import
+                                .groups
+                                .iter()
+                                .filter(|group| group.service == *service)
+                                .all(|group| group.additive))
+                })
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut verified_services = Vec::new();
+    for service in field_services {
+        let structural = changes
+            .instance_changes
+            .iter()
+            .filter(|change| change.service == service)
+            .any(|change| {
+                change.mode == "deleteInstances"
+                    || change
+                        .instances
+                        .iter()
+                        .any(|instance| !instance.anchor_only)
+            });
+        if structural {
+            let expected_instances = changes
+                .instance_changes
+                .iter()
+                .filter(|change| change.service == service)
+                .map(|change| {
+                    change
+                        .instances
+                        .iter()
+                        .filter(|instance| {
+                            change.mode == "deleteInstances"
+                                || binary_import.is_none_or(|import| {
+                                    !import.imports_path(
+                                        service,
+                                        &instance.path_segments,
+                                        &instance.path_ordinals,
+                                    )
+                                })
+                        })
+                        .count()
+                })
+                .sum::<usize>();
+            if summary
+                .get("instancesVerified")
+                .and_then(|counts| counts.get(service))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                != expected_instances as u64
+            {
+                continue;
+            }
+        }
+        let rows = changes
+            .property_changes
+            .iter()
+            .filter(|row| row.service == service)
+            // Additive native roots already have the reader's identity/class
+            // receipt and supplemental-field verification above. Verify the
+            // existing objects changed alongside those roots here.
+            .filter(|row| {
+                binary_import.is_none_or(|import| {
+                    !import.imports_path(service, &row.path_segments, &row.path_ordinals)
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let expected = rows
+            .iter()
+            .map(|row| row.properties.len() + row.attributes.len() + row.deleted_attributes.len())
+            .sum::<usize>();
+        let verified =
+            verify_native_property_rows(bridge, &rows, transaction_id, native_roots, summary)?;
+        crate::app::timing::trace_profile(
+            "editor.verification.coverage",
+            &json!({
+                "service": service, "expected": expected, "verified": verified,
+            }),
+        );
+        // Skipped native-only fields are not a proof. Keep that service's full
+        // readback without discarding complete proofs for other services.
+        if verified == expected as u64 {
+            verified_services.push(service);
+        }
+    }
+    if !verified_services.is_empty() {
+        summary.insert("fieldVerifiedServices".into(), json!(verified_services));
+    }
+
+    Ok(())
+}
+
+fn verified_payload_services(
+    import: &EditorBinaryImport,
+    result: &Value,
+) -> std::collections::BTreeSet<String> {
+    let reported = result
+        .get("payloadVerifiedServices")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    import
+        .groups
+        .iter()
+        .filter(|group| {
+            reported.contains(group.service.as_str())
+                && import
+                    .groups
+                    .iter()
+                    .filter(|other| other.service == group.service)
+                    .all(|other| other.expected_structure.is_some() && !other.additive)
+        })
+        .map(|group| group.service.clone())
+        .collect()
+}
+
+fn container_setting_rows(
+    changes: &EditorChangeSet,
+    binary_import: &EditorBinaryImport,
+) -> Vec<EditorPropertyChange> {
+    changes
+        .property_changes
+        .iter()
+        .filter(|change| {
+            binary_import.carries_container_settings(&change.service, &change.path_segments)
+        })
+        .map(|change| {
+            let mut row = change.clone();
+            row.reset_properties.clear();
+            row.deleted_attributes.clear();
+            row
+        })
+        .collect()
+}
+
+fn verify_native_property_rows(
+    bridge: &BridgeServer,
+    rows: &[EditorPropertyChange],
+    transaction_id: &str,
+    native_roots: &crate::editor::native_roots::NativeRootVerification,
+    summary: &mut Map<String, Value>,
+) -> Result<u64> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let mut verified = rows
+        .iter()
+        .map(|row| native_roots.verified_fields(row))
+        .sum::<u64>();
+    let mut mismatches = Vec::new();
+    for batch in rows.chunks(PROPERTY_BATCH_MAX_ITEMS) {
         let result = bridge.call(
             "applyEditorChanges",
             json!({
-                "probeEvents": probe_events,
-                "instanceChanges": [],
-                "sourceChanges": [],
-                "propertyChanges": property_batch,
-                "transactionId": transaction_id,
+                "verifyOnly": true, "instanceChanges": [], "sourceChanges": [],
+                "propertyChanges": batch, "transactionId": transaction_id,
             }),
         )?;
-        merge_editor_summary_checked(&mut summary, &result)?;
-        property_start = property_end;
+        anyhow::ensure!(
+            result["ok"] == true
+                && result["verifyOnly"] == true
+                && result["errors"].as_f64() == Some(0.0),
+            "Studio did not complete read-only native property verification: {result}"
+        );
+        verified += result["verified"]
+            .as_u64()
+            .context("Studio omitted the verified property count")?;
+        for mismatch in result["verifyMismatches"]
+            .as_array()
+            .context("Studio omitted container verification results")?
+        {
+            mismatches.push(
+                mismatch
+                    .as_str()
+                    .context("Invalid container verification result")?
+                    .to_string(),
+            );
+        }
     }
-
-    crate::editor::native_geometry::apply(bridge, &mut summary, transaction_id)?;
-    Ok(summary)
+    anyhow::ensure!(
+        mismatches.is_empty(),
+        "Studio did not retain native supplemental properties: {}",
+        mismatches.join(", ")
+    );
+    summary.insert("nativePropertiesVerified".to_string(), json!(verified));
+    Ok(verified)
 }
 
 fn source_change_apply_order(
@@ -3271,7 +4667,22 @@ fn merge_editor_summary(summary: &mut Map<String, Value>, result: &Value) {
         if key == "ok" {
             continue;
         }
-        if key == "protectedWrites" || key == "nativeGeometryWrites" {
+        if key == "instancesVerified" {
+            if let Some(counts) = value.as_object() {
+                let target = summary.entry(key.clone()).or_insert_with(|| json!({}));
+                if let Some(target) = target.as_object_mut() {
+                    for (service, count) in counts {
+                        if let Some(count) = count.as_u64() {
+                            let previous = target.get(service).and_then(Value::as_u64).unwrap_or(0);
+                            target.insert(service.clone(), json!(previous + count));
+                        }
+                    }
+                }
+            }
+        } else if key == "protectedWrites"
+            || key == "nativeGeometryWrites"
+            || key == "nativeRootWrites"
+        {
             let target = summary
                 .entry(key.clone())
                 .or_insert_with(|| Value::Array(Vec::new()));
@@ -3290,6 +4701,11 @@ fn merge_editor_summary(summary: &mut Map<String, Value>, result: &Value) {
 }
 
 fn merge_editor_summary_checked(summary: &mut Map<String, Value>, result: &Value) -> Result<()> {
+    if let Some(profile) = result.get("profile")
+        && profile.get("applyMs").is_some()
+    {
+        crate::app::timing::trace_profile("Studio editor apply", profile);
+    }
     merge_editor_summary(summary, result);
     let errors = result.get("errors").and_then(Value::as_f64).unwrap_or(0.0);
     if result.get("ok").and_then(Value::as_bool) == Some(false) || errors > 0.0 {
@@ -3304,6 +4720,64 @@ fn merge_editor_summary_checked(summary: &mut Map<String, Value>, result: &Value
 #[cfg(test)]
 mod source_change_tests {
     use super::*;
+
+    #[test]
+    fn structural_receipts_accumulate_per_service_across_batches() {
+        let mut summary = Map::new();
+        for result in [
+            json!({"instancesVerified": {"Workspace": 3, "ServerStorage": 1}}),
+            json!({"instancesVerified": {"Workspace": 2}}),
+            json!({"ok": true}),
+            json!({"instancesVerified": {"Workspace": "unsupported"}}),
+        ] {
+            merge_editor_summary(&mut summary, &result);
+        }
+        assert_eq!(
+            summary["instancesVerified"],
+            json!({"Workspace": 5, "ServerStorage": 1})
+        );
+    }
+
+    #[test]
+    fn native_payload_cache_hit_survives_in_flight_eviction() {
+        let slot = "native-in-flight-cache-test";
+        let expected = b"native binary payload";
+        let hash = "native-in-flight-cache-hash";
+        native_payload_cache_insert(slot.into(), hash.into(), expected);
+        let complete = AtomicBool::new(false);
+        let result = receive_editor_binary_export_bytes_with_cache(
+            "export",
+            Some("Workspace"),
+            Some(&complete),
+            slot,
+            |request| {
+                assert_eq!(request["knownPayloadHash"], hash);
+                assert_eq!(request["offset"], 0);
+                // Concurrent services evict the entry after this export has
+                // advertised it, before Studio replies with a cache hit.
+                for index in 0..=NATIVE_PAYLOAD_CACHE_MAX_ENTRIES {
+                    let key = format!("native-cache-pressure-{index}");
+                    native_payload_cache_insert(key.clone(), key, &[index as u8]);
+                }
+                Ok(BridgeChunk {
+                    start: 1,
+                    next_start: 1,
+                    total: expected.len(),
+                    chunk: String::new(),
+                    plugin_server_ms: None,
+                    plugin_encode_ms: None,
+                    serialization_complete: true,
+                    payload_hash: Some(hash.into()),
+                    payload_cache_hit: true,
+                    compression: None,
+                    uncompressed_bytes: None,
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(result, expected);
+        assert!(complete.load(Ordering::Acquire));
+    }
 
     fn source_change(path: &[&str]) -> EditorSourceChange {
         EditorSourceChange {
@@ -3328,4 +4802,106 @@ mod source_change_tests {
         assert_eq!(changes[0].path_segments, parent.path_segments);
         assert_eq!(changes[1].path_segments, child.path_segments);
     }
+
+    #[test]
+    fn combined_batches_preserve_order_scope_and_chunk_limits() {
+        use crate::editor::types::{EditorInstanceChange, EditorInstanceDescriptor};
+
+        let parent = source_change(&["ReplicatedStorage", "Controller"]);
+        let child = source_change(&["ReplicatedStorage", "Controller", "Maid"]);
+        let mut changes = EditorChangeSet {
+            source_changes: vec![child.clone(), parent.clone()],
+            instance_changes: vec![EditorInstanceChange {
+                mode: "upsert".into(),
+                service: "ReplicatedStorage".into(),
+                allow_deletes: false,
+                instances: vec![EditorInstanceDescriptor::default()],
+                preserve_instances: vec![],
+            }],
+            ..Default::default()
+        };
+        let request = combined_editor_change_batch(&changes, true, Some("tx"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            request["sourceChanges"][0]["pathSegments"],
+            json!(parent.path_segments)
+        );
+        assert_eq!(
+            request["sourceChanges"][1]["pathSegments"],
+            json!(child.path_segments)
+        );
+        assert_eq!(request["transactionId"], "tx");
+        assert_eq!(request["probeEvents"], true);
+        changes.source_changes[0].source = Some("x".repeat(MAX_BRIDGE_CHUNK_BYTES));
+        assert!(
+            combined_editor_change_batch(&changes, false, None)
+                .unwrap()
+                .is_none()
+        );
+        changes.source_changes = vec![parent.clone(); SOURCE_BATCH_SIZE + 1];
+        assert!(
+            combined_editor_change_batch(&changes, false, None)
+                .unwrap()
+                .is_none()
+        );
+        changes.source_changes = vec![parent];
+        changes.instance_changes[0].mode = "beginReconcileService".into();
+        assert!(
+            combined_editor_change_batch(&changes, false, None)
+                .unwrap()
+                .is_none()
+        );
+        changes.instance_changes[0].mode = "upsert".into();
+        changes.instance_changes[0].instances = (0..=INSTANCE_BATCH_SIZE)
+            .map(|_| EditorInstanceDescriptor::default())
+            .collect();
+        assert!(
+            combined_editor_change_batch(&changes, false, None)
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+fn send_property_batches(
+    bridge: &BridgeServer,
+    property_changes: &[EditorPropertyChange],
+    probe_events: bool,
+    transaction_id: Option<&str>,
+    summary: &mut Map<String, Value>,
+) -> Result<()> {
+    let mut property_start = 0;
+    while property_start < property_changes.len() {
+        let mut property_end = property_start;
+        let mut estimated_bytes = 256usize;
+        while property_end < property_changes.len()
+            && property_end - property_start < PROPERTY_BATCH_MAX_ITEMS
+        {
+            let change_bytes = serde_json::to_vec(&property_changes[property_end])?.len() + 1;
+            if property_end > property_start
+                && estimated_bytes.saturating_add(change_bytes) > MAX_BRIDGE_CHUNK_BYTES
+            {
+                break;
+            }
+            estimated_bytes = estimated_bytes.saturating_add(change_bytes);
+            property_end += 1;
+        }
+        let property_batch = &property_changes[property_start..property_end];
+        let result = bridge.call(
+            "applyEditorChanges",
+            json!({
+                "profile": verbose_timing_logs(),
+                "probeEvents": probe_events,
+                "instanceChanges": [],
+                "sourceChanges": [],
+                "propertyChanges": property_batch,
+                "transactionId": transaction_id,
+            }),
+        )?;
+        merge_editor_summary_checked(summary, &result)?;
+        property_start = property_end;
+    }
+
+    Ok(())
 }

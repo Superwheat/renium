@@ -1,9 +1,59 @@
 local BridgeReferenceOverlay = {}
 
+-- The binary reader supplies values; this receipt checks the complete returned
+-- tree before it is exposed. A differing order or shape keeps ordinary readback.
+function BridgeReferenceOverlay.matchesPayloadStructure(root: Instance, structure): boolean
+	local pending = { root }
+	local seen = {}
+	local offset = 0
+	local nodes, strings = structure.nodes, structure.strings
+	local bytes = buffer.len(nodes)
+	while #pending > 0 do
+		local instance = table.remove(pending)
+		if offset + 12 > bytes or seen[instance] then
+			return false
+		end
+		seen[instance] = true
+		local children = instance:GetChildren()
+		if instance.ClassName ~= strings[buffer.readu32(nodes, offset) + 1]
+			or instance.Name ~= strings[buffer.readu32(nodes, offset + 4) + 1]
+			or #children ~= buffer.readu32(nodes, offset + 8)
+		then
+			return false
+		end
+		for index = #children, 1, -1 do
+			local child = children[index]
+			if child.Parent ~= instance then
+				return false
+			end
+			pending[#pending + 1] = child
+		end
+		offset += 12
+	end
+	return offset == bytes
+end
+
+-- Computed layout and diagnostic readbacks can change during startup/viewport
+-- layout without an edit. This guard filter does not omit them from export.
+local COMPUTED_LAYOUT_PROPERTIES = {
+	absoluteposition = true,
+	absoluterotation = true,
+	absolutesize = true,
+	absolutecanvassize = true,
+	absolutecontentsize = true,
+	absolutewindowsize = true,
+	contenttext = true,
+	textbounds = true,
+	textfits = true,
+	opentypefeatureserror = true,
+	viewportsize = true,
+}
+
 function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 	local BridgeIdentity = dependencies.BridgeIdentity
 	local BridgeReferenceRetarget = dependencies.BridgeReferenceRetarget
 	local CollectionService = dependencies.CollectionService
+	local isProtectedWorkspaceCameraInstance = dependencies.isProtectedWorkspaceCameraInstance
 	local RbxDomModule = dependencies.RbxDomModule
 	local captureExplorerSelection = dependencies.captureExplorerSelection
 	local containsPackageLink = dependencies.containsPackageLink
@@ -19,53 +69,137 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 	local setTagForSync = dependencies.setTagForSync
 	local valuesEqual = dependencies.valuesEqual
 	local writePropertyForSync = dependencies.writePropertyForSync
+	local computedPropertiesByClass = {}
+
+	local function isComputedReadback(instance: Instance, propertyName: string): boolean
+		local className = instance.ClassName
+		local properties = computedPropertiesByClass[className]
+		if properties == nil then
+			properties = {}
+			computedPropertiesByClass[className] = properties
+		end
+		local computed = properties[propertyName]
+		if computed == nil then
+			local descriptor = RbxDomModule.findCanonicalPropertyDescriptor(className, propertyName)
+			computed = descriptor ~= nil
+				and descriptor.scriptability == "Read"
+				and descriptor.serialization == "DoesNotSerialize"
+			properties[propertyName] = computed
+		end
+		return computed
+	end
 
 	local ReferenceOverlay = {}
+
+	local function watchNativeAttributes(guard, serviceName: string, instance: Instance)
+		guard.connections[#guard.connections + 1] = instance.AttributeChanged:Connect(function(attributeName)
+			if guard.changedService == nil then
+				guard.changedService = serviceName
+				guard.changedDetail = `{instance:GetFullName()} (attribute {attributeName})`
+			end
+		end)
+	end
+
+	function ReferenceOverlay.watchNativeDescendantAttributes(guard, serviceName: string, instances: { Instance })
+		if guard.nativeAttributes then
+			return
+		end
+		local service = guard.services[serviceName]
+		local checkpoint = guard.attributeCheckpoints[serviceName]
+		for _, instance in ipairs(instances) do
+			if instance ~= service and (checkpoint == nil or checkpoint.observation.connections[instance] ~= serviceName) then
+				watchNativeAttributes(guard, serviceName, instance)
+			end
+		end
+	end
 
 	function ReferenceOverlay.beginNativeGuard(
 		prepared: { any },
 		allProperties: boolean?,
-		ignoredProperties: { [string]: boolean }?
+		ignoredProperties: { [string]: boolean }?,
+		attributeObservation: ((string) -> any)?,
+		nativeAttributes: boolean?
 	): { [string]: any }
 		local guard = {
 			services = {},
 			connections = {},
+			attributeCheckpoints = {},
 			changedService = nil,
+			nativeAttributes = nativeAttributes == true,
 		}
 		for _, group in ipairs(prepared) do
 			guard.services[group.serviceName] = group.service
+			if allProperties and not guard.nativeAttributes and attributeObservation then
+				local observation = attributeObservation(group.serviceName)
+				if observation then
+					guard.attributeCheckpoints[group.serviceName] = {
+						observation = observation, generation = observation.generation,
+					}
+				end
+			end
 		end
 		guard.connections[#guard.connections + 1] = (game :: any).ItemChanged:Connect(function(instance, propertyName)
+			if guard.changedService ~= nil then
+				return
+			end
 			local normalizedProperty = string.lower(tostring(propertyName))
 			if
 				typeof(instance) ~= "Instance"
 				or ignoredProperties ~= nil and ignoredProperties[normalizedProperty]
+				or COMPUTED_LAYOUT_PROPERTIES[normalizedProperty]
 				or not allProperties and normalizedProperty ~= "name"
+				or isComputedReadback(instance, tostring(propertyName))
 			then
 				return
 			end
 			for serviceName, service in pairs(guard.services) do
 				if instance == service or instance:IsDescendantOf(service) then
 					guard.changedService = serviceName
+					guard.changedDetail = `{instance:GetFullName()} (property {tostring(propertyName)})`
 					return
 				end
 			end
 		end)
 		for serviceName, service in pairs(guard.services) do
 			local guardedServiceName = serviceName
-			guard.connections[#guard.connections + 1] = service.DescendantAdded:Connect(function()
-				guard.changedService = guardedServiceName
+			if allProperties and not guard.nativeAttributes then
+				watchNativeAttributes(guard, serviceName, service)
+			end
+			guard.connections[#guard.connections + 1] = service.DescendantAdded:Connect(function(instance)
+				if guard.changedService == nil then
+					guard.changedService = guardedServiceName
+					guard.changedDetail = `{instance:GetFullName()} (added)`
+				end
 			end)
-			guard.connections[#guard.connections + 1] = service.DescendantRemoving:Connect(function()
-				guard.changedService = guardedServiceName
+			guard.connections[#guard.connections + 1] = service.DescendantRemoving:Connect(function(instance)
+				if guard.changedService == nil then
+					guard.changedService = guardedServiceName
+					guard.changedDetail = `{instance:GetFullName()} (removed)`
+				end
 			end)
 		end
 		return guard
 	end
 
+	function ReferenceOverlay.changedNativeService(guard: { [string]: any }): string?
+		if guard.changedService == nil then
+			for serviceName, checkpoint in pairs(guard.attributeCheckpoints) do
+				local observation = checkpoint.observation
+				if not observation.active or observation.generation ~= checkpoint.generation then
+					guard.changedService = serviceName
+					guard.changedDetail = if observation.active
+						then `{observation.instance:GetFullName()} (attribute {observation.attribute})`
+						else "attribute observation changed during export"
+					break
+				end
+			end
+		end
+		return guard.changedService
+	end
+
 	function ReferenceOverlay.assertNativeGuard(guard: { [string]: any })
-		if guard.changedService ~= nil then
-			error(`Studio changed {guard.changedService} while native import was staged; retry the sync`)
+		if ReferenceOverlay.changedNativeService(guard) ~= nil then
+			error(`Studio changed {guard.changedService} while native sync was staged: {guard.changedDetail}; retry the sync`)
 		end
 	end
 
@@ -77,9 +211,10 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 			connection:Disconnect()
 		end
 		table.clear(guard.connections)
+		table.clear(guard.attributeCheckpoints)
 	end
 
-	function ReferenceOverlay.capture(prepared: { any }, replacedInstances: { [Instance]: boolean }?): { any }
+	function ReferenceOverlay.capture(prepared: { any }, replacedInstances: { [Instance]: boolean }?, strict: boolean?): { any }
 		local replaced = replacedInstances or {}
 		if replacedInstances == nil then
 			for _, group in ipairs(prepared) do
@@ -104,6 +239,9 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 		for instance in pairs(replaced) do
 			for _, propertyName in ipairs(RbxDomModule.getReferencePropertyNames(instance.ClassName)) do
 				local okRead, target = readProperty(instance, propertyName)
+				if strict and not okRead then
+					error(`Could not checkpoint retained reference {instance:GetFullName()}.{propertyName}: {target}`)
+				end
 				if okRead and typeof(target) == "Instance" and not replaced[target] then
 					entries[#entries + 1] = {
 						instance = instance,
@@ -115,6 +253,9 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 			end
 			for _, propertyName in ipairs(RbxDomModule.getObjectContentPropertyNames(instance.ClassName)) do
 				local okRead, value = readProperty(instance, propertyName)
+				if strict and not okRead then
+					error(`Could not checkpoint retained content {instance:GetFullName()}.{propertyName}: {value}`)
+				end
 				if
 					okRead
 					and typeof(value) == "Content"
@@ -193,24 +334,30 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 		pathOrdinals: { number }?,
 		aliases: { [Instance]: Instance }
 	): Instance?
+		local selectedGroup = nil
+		local targetLength = 0
 		for _, group in ipairs(prepared) do
-			if not pathExtendsTarget(pathSegments, group.targetPath) then
-				continue
+			if #group.targetPath > targetLength and pathExtendsTarget(pathSegments, group.targetPath) then
+				selectedGroup = group
+				targetLength = #group.targetPath
 			end
-			local targetLength = #group.targetPath
-			local current = group.incomingRootsByPath[incomingRootKey(targetLength, pathSegments, pathOrdinals)]
+		end
+		if selectedGroup == nil then
+			return nil
+		end
+		-- Engine-owned containers have their own import groups; a broader
+		-- service group must not shadow them or supply stale fallback children.
+		local current = selectedGroup.incomingRootsByPath[incomingRootKey(targetLength, pathSegments, pathOrdinals)]
+		if current == nil then
+			return if selectedGroup.additive then resolvePathSegments(pathSegments, nil, pathOrdinals) else nil
+		end
+		for index = targetLength + 2, #pathSegments do
+			current = resolveOrdinalChild(current, pathSegments[index], pathOrdinal(pathOrdinals, index))
 			if current == nil then
 				return nil
 			end
-			for index = targetLength + 2, #pathSegments do
-				current = resolveOrdinalChild(current, pathSegments[index], pathOrdinal(pathOrdinals, index))
-				if current == nil then
-					return nil
-				end
-			end
-			return aliases[current] or current
 		end
-		return nil
+		return aliases[current] or current
 	end
 
 	function ReferenceOverlay.lazyReplacements(
@@ -235,6 +382,28 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 					end
 					if group.outgoingRootSet[root] then
 						local pathSegments, pathOrdinals = BridgeIdentity.getRefPathParts(original)
+						local savedRoot = group.outgoingRootPaths and group.outgoingRootPaths[root]
+						if savedRoot ~= nil then
+							pathSegments, pathOrdinals = table.clone(savedRoot.pathSegments), table.clone(savedRoot.pathOrdinals)
+							local suffix, current = {}, original
+							while current ~= root do
+								local parent = current.Parent
+								if parent == nil then return nil end
+								local ordinal = 0
+								for _, sibling in ipairs(parent:GetChildren()) do
+									if sibling.Name == current.Name then
+										ordinal += 1
+									end
+									if sibling == current then break end
+								end
+								suffix[#suffix + 1] = { current.Name, ordinal }
+								current = parent
+							end
+							for index = #suffix, 1, -1 do
+								pathSegments[#pathSegments + 1] = suffix[index][1]
+								pathOrdinals[#pathOrdinals + 1] = suffix[index][2]
+							end
+						end
 						if pathSegments ~= nil then
 							local replacement = resolveStagedPath(pathSegments, pathOrdinals)
 							if replacement ~= nil then
@@ -316,14 +485,17 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 		statePairs: { any },
 		packagePresence: { [Instance]: boolean }
 	): number
-		if liveRoot.ClassName ~= duplicateRoot.ClassName or liveRoot.Name ~= duplicateRoot.Name then
+		local viewport = isProtectedWorkspaceCameraInstance(liveRoot)
+		if liveRoot.ClassName ~= duplicateRoot.ClassName or not viewport and liveRoot.Name ~= duplicateRoot.Name then
 			error(`Package root {table.concat(pathSegments, ".")} changed during import`)
 		end
 		aliases[duplicateRoot] = liveRoot
-		statePairs[#statePairs + 1] = {
-			live = liveRoot,
-			duplicate = duplicateRoot,
-		}
+		if not viewport then
+			statePairs[#statePairs + 1] = {
+				live = liveRoot,
+				duplicate = duplicateRoot,
+			}
+		end
 		local liveRows = childRows(liveRoot)
 		local matchedLive = {}
 		local incoming = {}
@@ -573,15 +745,30 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 	end
 
 	function ReferenceOverlay.assertNativeImportState(undo: { [string]: any }, ctx: { [string]: any })
-		ReferenceOverlay.assertNativeGuard(undo.guard)
+		if undo.currentCamera ~= nil and not isProtectedWorkspaceCameraInstance(undo.currentCamera) then
+			error("Studio changed the active viewport while native import was staged; retry the sync")
+		end
+		-- The direct reader is already fenced by the transaction's change
+		-- journal. The detached-loader path also has a separate staging guard.
+		if not undo.nativeInserted then
+			if undo.guard ~= nil then
+				ReferenceOverlay.assertNativeGuard(undo.guard)
+			end
+			for _, group in ipairs(undo.prepared) do
+				ReferenceOverlay.assertPackageRoots(group)
+			end
+		end
 		for serviceName, generation in pairs(undo.generationsByService) do
 			if ctx.studioChangeGeneration(serviceName) ~= generation then
 				error(`Studio changed {serviceName} while native import was staged; retry the sync`)
 			end
 		end
-		for _, group in ipairs(undo.prepared) do
-			ReferenceOverlay.assertPackageRoots(group)
-		end
+	end
+
+	function ReferenceOverlay.finishNativeStaging(undo: { [string]: any }, ctx: { [string]: any })
+		ReferenceOverlay.assertNativeImportState(undo, ctx)
+		ReferenceOverlay.finishNativeGuard(undo.guard)
+		undo.guard = nil
 	end
 
 	function ReferenceOverlay.apply(entries: { any }, replacements: { [Instance]: Instance }, ctx: { [string]: any }?)
@@ -623,23 +810,27 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 		return updated, failed
 	end
 
-	local function indexPackagePresence(root: Instance, packagePresence: { [Instance]: boolean }): boolean
-		local hasPackage = root:IsA("PackageLink")
-		for _, child in ipairs(root:GetChildren()) do
-			if indexPackagePresence(child, packagePresence) then
-				hasPackage = true
+	local function indexPackagePresence(root: Instance, packagePresence: { [Instance]: boolean })
+		local descendants = root:GetDescendants()
+		descendants[#descendants + 1] = root
+		for _, instance in ipairs(descendants) do
+			if not instance:IsA("PackageLink") then
+				continue
+			end
+			-- Only ancestors of actual links need entries. Shared ancestors are
+			-- visited once; never include parents outside this import root.
+			local ancestor = instance
+			while ancestor ~= nil and packagePresence[ancestor] ~= true do
+				packagePresence[ancestor] = true
+				if ancestor == root then
+					break
+				end
+				ancestor = ancestor.Parent
 			end
 		end
-		packagePresence[root] = hasPackage
-		return hasPackage
 	end
 
-	local function initializePreparedGroup(group: { [string]: any }, packagePresence: { [Instance]: boolean })
-		for _, roots in ipairs({ group.outgoing, group.incoming }) do
-			for _, root in ipairs(roots) do
-				indexPackagePresence(root, packagePresence)
-			end
-		end
+	local function initializePreparedGroup(group: { [string]: any })
 		group.packageScanRoots = table.clone(group.outgoing)
 		group.incomingRootsByPath = {}
 		group.retainedLiveRoots = {}
@@ -675,9 +866,12 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 			or duplicate.ClassName ~= descriptor.className
 			or live.Name ~= descriptor.pathSegments[#descriptor.pathSegments]
 			or duplicate.Name ~= live.Name
-			or state.packagePresence[live] ~= true
 			or descriptor.payloadOmitted and #duplicate:GetChildren() ~= 0
 		then
+			retainedRootChanged(descriptor.pathSegments)
+		end
+		indexPackagePresence(live, state.packagePresence)
+		if state.packagePresence[live] ~= true then
 			retainedRootChanged(descriptor.pathSegments)
 		end
 
@@ -685,6 +879,7 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 		if descriptor.payloadOmitted or duplicate:IsA("PackageLink") then
 			retainedInstanceCount = descriptor.instanceCount
 		else
+			indexPackagePresence(duplicate, state.packagePresence)
 			retainedInstanceCount = ReferenceOverlay.preparePackageMerge(
 				live,
 				duplicate,
@@ -769,9 +964,18 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 	local function retargetIncomingAliases(
 		incomingScanRoots: { Instance },
 		incomingAliases: { [Instance]: Instance },
-		ctx: { [string]: any }
+		ctx: { [string]: any },
+		viewportReferencesPostApplied: boolean?
 	): (number, number)
 		if next(incomingAliases) == nil then
+			return 0, 0
+		end
+		if viewportReferencesPostApplied then
+			for duplicate, live in pairs(incomingAliases) do
+				if not duplicate:IsA("Camera") or not isProtectedWorkspaceCameraInstance(live) then
+					error("Native viewport reference plan does not cover retained package identities")
+				end
+			end
 			return 0, 0
 		end
 		local aliasUpdated, aliasFailed, aliasFailures = BridgeReferenceRetarget.apply(
@@ -826,10 +1030,42 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 		return count
 	end
 
+	local function prepareViewport(group: { [string]: any }, state: { [string]: any })
+		if group.serviceName ~= "Workspace" or group.additive then
+			return
+		end
+		local live = group.service.CurrentCamera
+		state.currentCamera = live
+		if live ~= nil then
+			state.excludedOutgoing[live] = true
+		end
+		local descriptor = group.viewportCamera
+		if descriptor == nil then
+			return
+		end
+		local duplicate = ReferenceOverlay.resolvePreparedPath(
+			{ group }, descriptor.pathSegments, descriptor.pathOrdinals, {}
+		)
+		if live == nil or duplicate == nil or not duplicate:IsA("Camera") then
+			error("Native import viewport reference did not resolve to a camera")
+		end
+		if state.incomingAliases[duplicate] ~= live then
+			indexPackagePresence(live, state.packagePresence)
+			indexPackagePresence(duplicate, state.packagePresence)
+			state.retainedDuplicateInstanceCount += ReferenceOverlay.preparePackageMerge(
+				live, duplicate, descriptor.pathSegments, descriptor.pathOrdinals,
+				state.incomingAliases, state.packageMerges, state.packageStatePairs, state.packagePresence
+			)
+			state.retainedDuplicates[#state.retainedDuplicates + 1] = duplicate
+		end
+		state.viewport = { live = live, duplicate = duplicate }
+	end
+
 	function ReferenceOverlay.prepareRetained(
 		prepared: { any },
 		ctx: { [string]: any },
-		externalReferencesPostApplied: boolean
+		externalReferencesPostApplied: boolean,
+		viewportReferencesPostApplied: boolean?
 	): { [string]: any }
 		local state = {
 			excludedIncoming = {},
@@ -842,20 +1078,26 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 			packagePresence = {},
 		}
 		for _, group in ipairs(prepared) do
-			initializePreparedGroup(group, state.packagePresence)
+			initializePreparedGroup(group)
 			for _, descriptor in ipairs(group.retainedRoots) do
 				prepareRetainedRoot(group, descriptor, state)
 			end
+			prepareViewport(group, state)
 		end
 		local incomingScanRoots, outgoingScanRoots = collectScanRoots(prepared, state)
-		local aliasUpdated, aliasContentUpdated = retargetIncomingAliases(incomingScanRoots, state.incomingAliases, ctx)
+		local aliasUpdated, aliasContentUpdated =
+			retargetIncomingAliases(incomingScanRoots, state.incomingAliases, ctx, viewportReferencesPostApplied)
 		local referenceOverlay =
 			captureOutgoingReferences(prepared, outgoingScanRoots, externalReferencesPostApplied)
 		local function resolveStagedPath(pathSegments, pathOrdinals)
 			return ReferenceOverlay.resolvePreparedPath(prepared, pathSegments, pathOrdinals, state.incomingAliases)
 		end
 		local replacements = ReferenceOverlay.lazyReplacements(prepared, resolveStagedPath)
+		if state.currentCamera ~= nil then
+			replacements[state.currentCamera] = state.currentCamera
+		end
 		return {
+			viewport = state.viewport,
 			referenceOverlay = referenceOverlay,
 			replacements = replacements,
 			needsReferenceRetarget = #incomingScanRoots > 0 and #outgoingScanRoots > 0,
@@ -870,10 +1112,16 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 		}
 	end
 
-	function ReferenceOverlay.commitNative(undo: { [string]: any }, ctx: { [string]: any }): (number, number)
-		ReferenceOverlay.assertNativeImportState(undo, ctx)
-		ReferenceOverlay.finishNativeGuard(undo.guard)
-		undo.guard = nil
+	function ReferenceOverlay.commitNative(undo: { [string]: any }, ctx: { [string]: any }, profile: { [string]: any }?): (number, number)
+		local phaseStarted = os.clock()
+		local function finishPhase(name: string)
+			local now = os.clock()
+			if profile ~= nil then
+				profile[name] = (now - phaseStarted) * 1000
+			end
+			phaseStarted = now
+		end
+		ReferenceOverlay.finishNativeStaging(undo, ctx)
 		local selected = captureExplorerSelection()
 		local selectionPaths = {}
 		for _, instance in ipairs(selected) do
@@ -907,6 +1155,7 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 		end
 		local updated = 0
 		local contentUpdated = 0
+		finishPhase("guardMs")
 		if undo.needsReferenceRetarget then
 			local scanRoots = {}
 			for serviceName, allowed in pairs(ctx.allowedServices) do
@@ -938,38 +1187,75 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 				error(`Could not retarget {contentFailed} native import content references`)
 			end
 		end
+		finishPhase("retargetMs")
 		for _, pair in ipairs(undo.packageStatePairs or {}) do
 			ReferenceOverlay.copyPackageRootState(pair, undo.packageAliases, ctx, false)
 		end
+		if undo.viewport ~= nil then
+			setParentForSync(undo.viewport.duplicate, nil, ctx)
+		end
+		finishPhase("retainedStateMs")
 		for _, group in ipairs(undo.prepared) do
-			for _, instance in ipairs(group.incoming) do
-				setParentForSync(instance, group.target, ctx)
+			local attachment = if profile then {} else nil
+			if not undo.nativeInserted then
+				for _, instance in ipairs(group.incoming) do
+					setParentForSync(instance, group.target, ctx, attachment, true)
+				end
+			end
+			if profile ~= nil then
+				profile[`attachment:{table.concat(group.targetPath, ".")}`] = attachment
+				finishPhase(`attach:{table.concat(group.targetPath, ".")}`)
 			end
 		end
 		for _, merge in ipairs(undo.packageMerges or {}) do
 			for _, instance in ipairs(merge.incoming) do
-				setParentForSync(instance, merge.target, ctx)
+				setParentForSync(instance, merge.target, ctx, nil, true)
 			end
 		end
 		for _, pair in ipairs(undo.packageStatePairs or {}) do
 			ReferenceOverlay.copyPackageRootState(pair, undo.packageAliases, ctx, true)
 		end
+		if undo.currentCameraParent ~= nil then
+			local parent = undo.replacements[undo.currentCameraParent]
+			if parent ~= nil then
+				setParentForSync(undo.currentCamera, parent, ctx)
+			end
+		end
+		local function retainOutgoing(instance: Instance)
+			if undo.explicitRollback and undo.retainedParent == nil then
+				-- A nil Parent becomes a deletion in Studio history; reattaching
+				-- before Commit still lets Undo remove the original. Keep roots
+				-- in the DataModel, outside saved/synchronized services, instead.
+				local folder = Instance.new("Folder")
+				folder.Name = "Renium Transaction"
+				folder.Archivable = false
+				undo.retainedParent = folder
+				folder.Parent = game:GetService("CoreGui")
+			end
+			removeInstanceForUndo(instance, ctx, undo.retainedParent)
+		end
 		local removedRootCount = 0
+		finishPhase("retainedAttachMs")
 		for _, merge in ipairs(undo.packageMerges or {}) do
 			for _, instance in ipairs(merge.outgoing) do
-				removeInstanceForUndo(instance, ctx)
+				retainOutgoing(instance)
 				removedRootCount += 1
 			end
 		end
 		for _, group in ipairs(undo.prepared) do
 			for _, instance in ipairs(group.outgoing) do
-				removeInstanceForUndo(instance, ctx)
+				if not undo.nativeInserted then
+					retainOutgoing(instance)
+				end
 				removedRootCount += 1
 			end
 		end
+		finishPhase("detachMs")
 		local selectionReplacements = {}
 		for instance, path in pairs(selectionPaths) do
-			if instance.Parent == nil then
+			if instance.Parent == nil
+				or undo.retainedParent and instance:IsDescendantOf(undo.retainedParent)
+			then
 				local replacement = undo.resolveStagedPath(path.pathSegments, path.pathOrdinals)
 				if replacement ~= nil then
 					selectionReplacements[instance] = replacement
@@ -980,6 +1266,7 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 		for _, group in ipairs(undo.prepared) do
 			ctx.invalidateService(group.serviceName)
 		end
+		finishPhase("invalidateMs")
 		return removedRootCount, updated + contentUpdated + undo.referenceUpdates
 	end
 
@@ -988,6 +1275,7 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 		outgoingRoots: { Instance },
 		target: Instance,
 		incoming: { Instance },
+		retainedParent: Instance?,
 		restoreParent: (Instance, Instance?) -> ()
 	)
 		for _, instance in ipairs(incomingRoots) do
@@ -997,7 +1285,7 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 			end
 		end
 		for _, instance in ipairs(outgoingRoots) do
-			if instance.Parent == nil then
+			if instance.Parent == nil or instance.Parent == retainedParent then
 				restoreParent(instance, target)
 			end
 		end
@@ -1088,10 +1376,13 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 			end
 		end
 		for _, merge in ipairs(undo.packageMerges or {}) do
-			restoreRollbackRoots(merge.incoming, merge.outgoing, merge.target, incoming, restoreParent)
+			restoreRollbackRoots(merge.incoming, merge.outgoing, merge.target, incoming, undo.retainedParent, restoreParent)
 		end
 		for _, group in ipairs(undo.prepared) do
-			restoreRollbackRoots(group.incoming, group.outgoing, group.target, incoming, restoreParent)
+			restoreRollbackRoots(group.incoming, group.outgoing, group.target, incoming, undo.retainedParent, restoreParent)
+		end
+		if undo.currentCamera ~= nil and undo.currentCameraParent ~= nil then
+			restoreParent(undo.currentCamera, undo.currentCameraParent)
 		end
 		for _, instance in ipairs(undo.retainedDuplicates or {}) do
 			incoming[#incoming + 1] = instance

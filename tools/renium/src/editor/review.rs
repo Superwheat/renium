@@ -5,7 +5,6 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 #[cfg(any(windows, target_os = "macos"))]
-use std::process::Command;
 #[cfg(any(windows, target_os = "macos"))]
 use std::time::{Duration, Instant};
 
@@ -70,22 +69,6 @@ fn json_usize_array(value: Option<&Value>) -> Vec<usize> {
         .collect()
 }
 
-pub(crate) fn is_workspace_camera_sync_target(
-    service: &str,
-    class_name: &str,
-    path_segments: &[String],
-) -> bool {
-    class_name == "Camera"
-        && service == "Workspace"
-        && path_segments.len() == 2
-        && path_segments
-            .first()
-            .is_some_and(|segment| segment == "Workspace")
-        && path_segments
-            .get(1)
-            .is_some_and(|segment| segment == "Camera" || segment == "CurrentCamera")
-}
-
 pub(crate) fn is_externally_managed_editor_property(
     service: &str,
     class_name: &str,
@@ -111,8 +94,18 @@ pub(crate) fn is_engine_managed_editor_property(
     property_name: &str,
     database: &ReflectionDatabase<'_>,
 ) -> bool {
+    if class_name == "Workspace" && property_name == "CurrentCamera" {
+        return true;
+    }
     if property_name == "Tags"
+        || class_name == "Workspace" && property_name == "CollisionGroupData"
+        || class_name == "Terrain"
+            && matches!(
+                property_name,
+                "MaterialColors" | "SmoothGrid" | "PhysicsGrid"
+            )
         || super::native_geometry::is_mesh_geometry_property(class_name, property_name)
+        || super::native_roots::is_property(class_name, property_name)
         || class_name == MATERIAL_SERVICE_CLASS && property_name == USE_2022_MATERIALS_PROPERTY
         || has_protected_texture_pack(class_name) && property_name == TEXTURE_PACK_PROPERTY
     {
@@ -121,6 +114,18 @@ pub(crate) fn is_engine_managed_editor_property(
     let Some(descriptor) = rbx_property_descriptor(database, class_name, property_name) else {
         return false;
     };
+    // Modern Content fields replace visible legacy ContentId properties, but
+    // Roblox marks them Hidden. They remain saved, editable data, not computed
+    // engine state (for example SurfaceAppearance maps and Sound.AudioContent).
+    if matches!(
+        descriptor.data_type,
+        RbxDataType::Value(RbxVariantType::Content)
+    ) && matches!(descriptor.scriptability, RbxScriptability::ReadWrite)
+        && matches!(descriptor.kind, RbxPropertyKind::Canonical { ref serialization }
+            if !matches!(serialization, RbxPropertySerialization::DoesNotSerialize))
+    {
+        return false;
+    }
     if matches!(
         &descriptor.data_type,
         RbxDataType::Value(RbxVariantType::UniqueId | RbxVariantType::SecurityCapabilities)
@@ -203,11 +208,47 @@ pub(crate) fn property_schema_entry<'a>(
         .find(|entry| entry.name.eq_ignore_ascii_case(property_name))
 }
 
+#[derive(Default)]
+pub(crate) struct EditorReferenceIds<'a> {
+    by_index: Vec<&'a str>,
+    by_id: HashMap<&'a str, usize>,
+}
+
+impl<'a> EditorReferenceIds<'a> {
+    pub(crate) fn new(ids: impl IntoIterator<Item = &'a str>) -> Self {
+        let by_index = ids.into_iter().collect::<Vec<_>>();
+        let by_id = by_index
+            .iter()
+            .enumerate()
+            .map(|(index, id)| (*id, index))
+            .collect();
+        Self { by_index, by_id }
+    }
+
+    pub(crate) fn resolve(&self, object: &Map<String, Value>) -> Option<usize> {
+        // Reconciled documents use stable IDs; serialized documents may instead
+        // use positions. Never reinterpret a stale position when an ID is given.
+        if let Some(id) = object
+            .get("settingsId")
+            .or_else(|| object.get("instanceId"))
+            .and_then(Value::as_str)
+        {
+            return self.by_id.get(id).copied();
+        }
+        object
+            .get("instanceIndex")
+            .and_then(Value::as_u64)
+            .and_then(|index| index.checked_sub(1))
+            .and_then(|index| usize::try_from(index).ok())
+            .filter(|index| *index < self.by_index.len())
+    }
+}
+
 pub(crate) fn normalize_editor_bridge_value(
     value: &Value,
     schema_entry: Option<&PropertySchemaEntry>,
     paths_by_index: &[Option<EditorInstancePath>],
-    settings_ids_by_index: &[&str],
+    settings_ids_by_index: &EditorReferenceIds<'_>,
 ) -> Value {
     match value {
         Value::Array(items) => Value::Array(
@@ -232,8 +273,15 @@ fn normalize_editor_bridge_object(
     object: &Map<String, Value>,
     schema_entry: Option<&PropertySchemaEntry>,
     paths_by_index: &[Option<EditorInstancePath>],
-    settings_ids_by_index: &[&str],
+    settings_ids_by_index: &EditorReferenceIds<'_>,
 ) -> Value {
+    if object.get("_type").and_then(Value::as_str) == Some("MaterialColors")
+        && let Some(encoded) = object.get("base64").and_then(Value::as_str)
+        && let Ok(bytes) = base64::decode(encoded)
+        && let Ok(colors) = rbx_dom_weak::types::MaterialColors::decode(&bytes)
+    {
+        return json!({"_type": "MaterialColors", "colors": colors});
+    }
     if object.get("_type").and_then(Value::as_str) == Some("Ref") {
         return normalize_editor_ref_value(object, paths_by_index, settings_ids_by_index);
     }
@@ -278,7 +326,7 @@ fn normalize_editor_bridge_object(
 fn normalize_editor_ref_value(
     object: &Map<String, Value>,
     paths_by_index: &[Option<EditorInstancePath>],
-    settings_ids_by_index: &[&str],
+    settings_ids_by_index: &EditorReferenceIds<'_>,
 ) -> Value {
     let mut out = Map::with_capacity(object.len() + 3);
     for (key, nested) in object {
@@ -288,10 +336,8 @@ fn normalize_editor_ref_value(
         );
     }
     out.insert("_type".to_string(), Value::String("Ref".to_string()));
-    if let Some(instance_index) = object.get("instanceIndex").and_then(Value::as_u64)
-        && let Some(zero_index) = instance_index.checked_sub(1).map(|value| value as usize)
-    {
-        if let Some(settings_id) = settings_ids_by_index.get(zero_index) {
+    if let Some(zero_index) = settings_ids_by_index.resolve(object) {
+        if let Some(settings_id) = settings_ids_by_index.by_index.get(zero_index) {
             out.insert(
                 "settingsId".to_string(),
                 Value::String((*settings_id).to_string()),
@@ -859,13 +905,51 @@ pub(crate) fn protected_write_rows_with_previous_values(
     Ok(out)
 }
 
+#[cfg(any(windows, target_os = "macos", test))]
+fn is_material_service_root_write(row: &Value) -> bool {
+    row["service"] == MATERIAL_SERVICE_CLASS
+        && row["className"] == MATERIAL_SERVICE_CLASS
+        && row["pathSegments"]
+            .as_array()
+            .is_some_and(|path| path.len() == 1 && path[0] == MATERIAL_SERVICE_CLASS)
+        && row.get("pathOrdinals").is_none_or(|ordinals| {
+            ordinals
+                .as_array()
+                .is_some_and(|items| items.is_empty() || items.len() == 1 && items[0] == 1)
+        })
+        && row.get("kind").is_none_or(|kind| kind == "property")
+        && row["name"].is_string()
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn enrich_material_service_root_writes(rows: &mut [Value], values: &Map<String, Value>) {
+    for row in rows
+        .iter_mut()
+        .filter(|row| is_material_service_root_write(row))
+    {
+        let object = row.as_object_mut().expect("root write was validated");
+        let previous = values.get(object["name"].as_str().expect("name was validated"));
+        object.remove("oldValue");
+        object.remove("oldValueMissing");
+        object.insert("oldValueKnown".to_string(), Value::Bool(true));
+        if let Some(value) = previous {
+            object.insert("oldValue".to_string(), value.clone());
+        } else {
+            object.insert("oldValueMissing".to_string(), Value::Bool(true));
+        }
+    }
+}
+
 #[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn protected_root_write_rows_with_live_values(
     bridge: &BridgeServer,
-    rows: Vec<Value>,
+    mut rows: Vec<Value>,
 ) -> std::result::Result<Vec<Value>, Vec<Value>> {
     if rows.is_empty() {
         return Ok(rows);
+    }
+    if !rows.iter().any(is_material_service_root_write) {
+        return Err(rows);
     }
     let Ok(database) = rbx_reflection_database::get() else {
         return Err(rows);
@@ -887,25 +971,8 @@ pub(crate) fn protected_root_write_rows_with_live_values(
         &serialized_values,
         database,
     );
-    let mut enriched = Vec::with_capacity(rows.len());
-    for mut row in rows {
-        let Some(object) = row.as_object_mut() else {
-            enriched.push(row);
-            continue;
-        };
-        let name = object
-            .get("name")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        object.insert("oldValueKnown".to_string(), Value::Bool(true));
-        if let Some(value) = name.as_deref().and_then(|name| values.get(name)) {
-            object.insert("oldValue".to_string(), value.clone());
-        } else {
-            object.insert("oldValueMissing".to_string(), Value::Bool(true));
-        }
-        enriched.push(row);
-    }
-    Ok(enriched)
+    enrich_material_service_root_writes(&mut rows, &values);
+    Ok(rows)
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
@@ -1106,9 +1173,7 @@ fn protected_write_studio_target(_pid: u32) -> Result<PathBuf> {
 
 #[cfg(any(windows, target_os = "macos"))]
 fn reopen_protected_write_studio(target: &Path, place: &Path) -> Result<()> {
-    let mut command = Command::new(target);
-    command.arg(place);
-    crate::project::workflows::spawn_studio(command, target)
+    crate::project::workflows::spawn_studio(target, &[place.as_os_str()])
         .with_context(|| format!("Failed to reopen Studio with {}", place.display()))?;
     Ok(())
 }
@@ -1185,6 +1250,7 @@ pub(crate) fn apply_protected_writes_offline(
     bridge: &BridgeServer,
     args: &PushEditorChangesArgs,
     rows: &[Value],
+    finish_transaction: impl FnOnce() -> Result<()>,
 ) -> Result<Value> {
     let previous_runtime_id = bridge
         .cached_bridge_info_for_target(BridgeTarget::Edit)?
@@ -1225,6 +1291,11 @@ pub(crate) fn apply_protected_writes_offline(
             return Err(error);
         }
     };
+    if let Err(error) = finish_transaction() {
+        let _ = fs::remove_file(&snapshot);
+        return Err(error)
+            .context("Studio changed before its protected snapshot could be published");
+    }
     input_inject::terminate_studio_process(pid)?;
     let file_name = original_path
         .file_name()
@@ -1304,6 +1375,7 @@ pub(crate) fn apply_protected_writes_offline(
         "exportedInstances": exported_instances,
         "reopenedPath": reopen_path,
         "reopenedRuntimeId": reopened_runtime_id,
+        "previousRuntimeId": previous_runtime_id,
         "localFile": true,
         "cloudSaved": false,
         "nativeSnapshot": true,
@@ -1315,6 +1387,53 @@ pub(crate) fn apply_protected_writes_offline(
     _bridge: &BridgeServer,
     _args: &PushEditorChangesArgs,
     _rows: &[Value],
+    _finish_transaction: impl FnOnce() -> Result<()>,
 ) -> Result<Value> {
     bail!("Protected offline place writes currently require Windows")
+}
+
+#[cfg(test)]
+mod root_write_evidence_tests {
+    use super::*;
+
+    #[test]
+    fn terrain_voxels_are_authored_data_despite_hidden_property_tags() {
+        let database = rbx_reflection_database::get().unwrap();
+        for property in ["SmoothGrid", "PhysicsGrid", "MaterialColors"] {
+            assert!(!is_engine_managed_editor_property(
+                "Terrain", property, database
+            ));
+        }
+    }
+
+    #[test]
+    fn root_snapshot_does_not_fabricate_evidence_for_other_targets() {
+        let root = json!({"service":"MaterialService","className":"MaterialService","pathSegments":["MaterialService"],"pathOrdinals":[1],"name":"Use2022Materials","oldValue":false,"oldValueMissing":true});
+        let mut rows = vec![
+            root.clone(),
+            json!({"service":"Workspace","className":"SurfaceAppearance","pathSegments":["Workspace","Mesh","SurfaceAppearance"],"name":"TexturePack","oldValueKnown":false}),
+        ];
+        for (key, value) in [
+            ("service", json!("Workspace")),
+            ("className", json!("Folder")),
+            ("pathSegments", json!(["MaterialService", "Child"])),
+            ("pathOrdinals", json!([2])),
+            ("kind", json!("attribute")),
+        ] {
+            let mut other = root.clone();
+            other[key] = value;
+            rows.push(other);
+        }
+        let others = rows[1..].to_vec();
+        let values = Map::from_iter([("Use2022Materials".into(), json!(true))]);
+        enrich_material_service_root_writes(&mut rows, &values);
+        assert_eq!(rows[0]["oldValue"], true);
+        assert_eq!(rows[0]["oldValueKnown"], true);
+        assert!(rows[0].get("oldValueMissing").is_none());
+        assert_eq!(&rows[1..], others);
+        enrich_material_service_root_writes(&mut rows, &Map::new());
+        assert!(rows[0].get("oldValue").is_none());
+        assert_eq!(rows[0]["oldValueMissing"], true);
+        assert_eq!(&rows[1..], others);
+    }
 }

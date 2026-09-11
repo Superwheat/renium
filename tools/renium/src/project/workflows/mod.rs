@@ -24,6 +24,8 @@ use crate::system::files::{
 };
 
 mod build_watch;
+#[cfg(windows)]
+pub(crate) mod windows_launch;
 
 use build_watch::{package_uses_roblox_ts, roblox_ts_command, should_run_tool, watch_build};
 
@@ -809,9 +811,7 @@ pub fn launch_studio(file: Option<&Path>, project: Option<&Path>) -> Result<Valu
     let executable = studio_executable()?;
     let file = resolve_studio_file(file, project, true)?
         .context("No Studio file exists and one could not be built")?;
-    let mut command = Command::new(&executable);
-    command.arg(&file);
-    let pid = spawn_studio(command, &executable)?;
+    let pid = spawn_studio(&executable, &[file.as_os_str()])?;
     Ok(json!({
         "ok": true,
         "pid": pid,
@@ -826,16 +826,15 @@ pub fn launch_published_studio(game_id: i64, place_id: i64) -> Result<Value> {
         bail!("Published Studio places require positive universe and place IDs");
     }
     let executable = studio_executable()?;
-    let mut command = Command::new(&executable);
-    command.args([
+    let arguments = [
         "--task",
         "EditPlace",
         "--placeId",
         &place_id.to_string(),
         "--universeId",
         &game_id.to_string(),
-    ]);
-    let pid = spawn_studio(command, &executable)?;
+    ];
+    let pid = spawn_studio(&executable, &arguments.map(OsStr::new))?;
     Ok(json!({
         "ok": true,
         "pid": pid,
@@ -859,7 +858,11 @@ pub fn launch_exact_studio(
     }
 }
 
-pub(crate) fn spawn_studio(command: Command, executable: &Path) -> Result<u32> {
+pub(crate) fn spawn_studio(executable: &Path, arguments: &[&OsStr]) -> Result<u32> {
+    #[cfg(windows)]
+    {
+        windows_launch::spawn(executable, arguments)
+    }
     #[cfg(target_os = "macos")]
     {
         let existing = crate::studio::input::studio_process_ids()
@@ -874,15 +877,14 @@ pub(crate) fn spawn_studio(command: Command, executable: &Path) -> Result<u32> {
                     executable.display()
                 )
             })?;
-        let forwarded = command
-            .get_args()
-            .map(OsStr::to_os_string)
-            .collect::<Vec<_>>();
         let status = Command::new("/usr/bin/open")
             .args(["-g", "-n", "-a"])
             .arg(bundle)
+            // Qt otherwise explicitly activates new Play processes after
+            // Launch Services has already opened the Edit app in background.
+            .args(["--env", "RENIUM_BACKGROUND_LAUNCH=1"])
             .arg("--args")
-            .args(forwarded)
+            .args(arguments)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -907,19 +909,14 @@ pub(crate) fn spawn_studio(command: Command, executable: &Path) -> Result<u32> {
             bundle.display()
         );
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
-        let mut command = command;
+        let mut command = Command::new(executable);
+        command.args(arguments);
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-            command.creation_flags(CREATE_NEW_PROCESS_GROUP);
         }
         let child = command
             .stdin(Stdio::null())
@@ -1475,10 +1472,8 @@ fn build_project_file(
         vec![segments[0].clone()]
     } else {
         let mut services = Vec::new();
-        for entry in fs::read_dir(src_root)? {
-            let entry = entry?;
-            if entry.file_type()?.is_dir()
-                && let Some(name) = entry.file_name().to_str()
+        for entry in crate::project::storage::service_directories(src_root)? {
+            if let Some(name) = entry.file_name().and_then(|name| name.to_str())
                 && !name.starts_with('.')
             {
                 services.push(name.to_string());
@@ -1936,24 +1931,12 @@ fn resolve_studio_file(
 
 fn studio_executable() -> Result<PathBuf> {
     if cfg!(windows) {
-        let local = env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is not set")?;
-        let versions = PathBuf::from(local).join("Roblox/Versions");
-        let entries = fs::read_dir(&versions)
-            .with_context(|| format!("Failed to inspect {}", versions.display()))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let mut candidates = entries
-            .into_iter()
-            .map(|entry| entry.path().join("RobloxStudioBeta.exe"))
-            .filter(|path| path.is_file())
-            .collect::<Vec<_>>();
-        candidates.sort_by_key(|path| {
-            fs::metadata(path)
-                .and_then(|metadata| metadata.modified())
-                .ok()
-        });
-        return candidates
-            .pop()
-            .context("Roblox Studio is not installed in the local Versions directory");
+        return newest_studio_executable(
+            ["LOCALAPPDATA", "ProgramFiles", "ProgramFiles(x86)"]
+                .into_iter()
+                .filter_map(env::var_os)
+                .map(|root| PathBuf::from(root).join("Roblox/Versions")),
+        );
     }
     if cfg!(target_os = "macos") {
         #[cfg(target_os = "macos")]
@@ -1963,6 +1946,32 @@ fn studio_executable() -> Result<PathBuf> {
         }
     }
     bail!("Roblox Studio is only available on Windows and macOS")
+}
+
+fn newest_studio_executable(versions: impl IntoIterator<Item = PathBuf>) -> Result<PathBuf> {
+    let mut newest = None;
+    for root in versions {
+        let entries = match fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("Failed to inspect {}", root.display()));
+            }
+        };
+        for entry in entries {
+            let path = entry?.path().join("RobloxStudioBeta.exe");
+            if !path.is_file() {
+                continue;
+            }
+            let modified = fs::metadata(&path)?.modified()?;
+            if newest.as_ref().is_none_or(|(time, _)| modified > *time) {
+                newest = Some((modified, path));
+            }
+        }
+    }
+    newest
+        .map(|(_, path)| path)
+        .context("Roblox Studio is not installed in the local or system Versions directories")
 }
 
 fn validate_experience_upload(root: &Path, universe_id: u64, place_id: u64) -> Result<()> {
@@ -2146,6 +2155,37 @@ fn replace_file(source: &Path, target: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::tests::support::temp_dir;
+
+    #[test]
+    fn studio_discovery_includes_newer_system_installations() {
+        let root = temp_dir("studio-discovery");
+        let local = root.join("local/Roblox/Versions");
+        let system = root.join("system/Roblox/Versions");
+        let missing = root.join("missing");
+        let old = local.join("version-old/RobloxStudioBeta.exe");
+        let current = system.join("version-current/RobloxStudioBeta.exe");
+        for (path, seconds) in [(&old, 10), (&current, 20)] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let file = fs::File::create(path).unwrap();
+            file.set_times(
+                fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)),
+            )
+            .unwrap();
+        }
+        // Player-only versions and absent per-user installs are normal.
+        fs::create_dir_all(system.join("version-player")).unwrap();
+        assert_eq!(
+            newest_studio_executable([local.clone(), missing.clone(), system.clone()]).unwrap(),
+            current
+        );
+        assert_eq!(
+            newest_studio_executable([missing.clone(), system]).unwrap(),
+            current
+        );
+        assert_eq!(newest_studio_executable([local]).unwrap(), old);
+        assert!(newest_studio_executable([missing]).is_err());
+    }
 
     #[test]
     fn init_keeps_one_pointer_to_the_renium_guide() {
