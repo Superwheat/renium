@@ -194,7 +194,11 @@ public:
             CONTEXT context{};
             context.ContextFlags = CONTEXT_CONTROL;
             if (!GetThreadContext(threads[i], &context)) return false;
+#if defined(_M_ARM64)
+            pc = context.Pc;
+#else
             pc = context.Rip;
+#endif
 #elif defined(__aarch64__)
             if (threads[i] == current) continue;
             arm_thread_state64_t context{};

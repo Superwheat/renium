@@ -73,6 +73,7 @@ jobs:
       - name: Test and build
         shell: pwsh
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
           $env:SOURCE_DATE_EPOCH = git log -1 --format=%ct
           cargo test --locked --release --manifest-path tools/renium/Cargo.toml
           cargo build --locked --release --manifest-path tools/renium/Cargo.toml
