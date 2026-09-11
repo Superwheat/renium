@@ -1310,6 +1310,7 @@ fn parallel_status_and_edit_profiling_leave_foreground_routing_untouched() {
                         serde_json::to_string(&response).unwrap()
                     );
                     assert_eq!(response.r.unwrap()["runtimeId"], format!("status-{place}"));
+                    completed.send(false).unwrap();
                 }
                 for (id, action) in ["snapshot", "micro-start", "micro", "micro-stop"]
                     .into_iter()
@@ -1335,6 +1336,7 @@ fn parallel_status_and_edit_profiling_leave_foreground_routing_untouched() {
                         serde_json::to_string(&response).unwrap()
                     );
                     assert_eq!(response.r.unwrap()["runtimeId"], format!("status-{place}"));
+                    completed.send(false).unwrap();
                 }
                 // Both fail before HTTP: invalid scope, then a mock Studio
                 // without a creator ID. Neither may change another request's target.
@@ -1354,16 +1356,25 @@ fn parallel_status_and_edit_profiling_leave_foreground_routing_untouched() {
                     );
                     assert_eq!(response.ok, 0);
                     assert_eq!(response.e.unwrap().c, code);
+                    completed.send(false).unwrap();
                 }
-                completed.send(()).unwrap();
+                completed.send(true).unwrap();
             });
         }
         // Release before joining even on regression: the test fails instead of
         // deadlocking forever behind the intentionally held mutation gate.
-        let all_completed =
-            (0..3).all(|_| completions.recv_timeout(Duration::from_secs(3)).is_ok());
+        // This proves that requests progress while the gate is held, not that
+        // hundreds of debug-build requests finish within one throughput budget.
+        let mut remaining = 3;
+        while remaining > 0 {
+            match completions.recv_timeout(Duration::from_secs(3)) {
+                Ok(true) => remaining -= 1,
+                Ok(false) => {}
+                Err(_) => break,
+            }
+        }
         drop(gate);
-        assert!(all_completed, "diagnostics waited for the active mutation");
+        assert_eq!(remaining, 0, "diagnostics waited for the active mutation");
     });
     assert_eq!(
         bridge.runtime_pins.lock().unwrap()
