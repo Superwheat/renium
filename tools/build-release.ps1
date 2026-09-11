@@ -420,6 +420,7 @@ if (-not $SkipTests) {
     Invoke-Checked -File "lune" -Arguments @("run", "tools/plugin_ws_bridge/tests/run") -WorkingDirectory $repositoryRoot
     if ($env:OS -eq "Windows_NT") {
         Invoke-Checked -File "node" -Arguments @("tools/renium/tests/automation-replay.mjs", $cliBinary) -WorkingDirectory $repositoryRoot
+        Invoke-Checked -File "node" -Arguments @("tools/renium-vscode-extension/scripts/sync-assets.mjs", "--docs-only") -WorkingDirectory $repositoryRoot
         Invoke-Checked -File "node" -Arguments @("tools/renium/tests/agent-docs-smoke.mjs", $cliBinary) -WorkingDirectory $repositoryRoot
         Invoke-Checked -File "node" -Arguments @("tools/renium/tests/launcher-smoke.mjs") -WorkingDirectory $repositoryRoot
     }
