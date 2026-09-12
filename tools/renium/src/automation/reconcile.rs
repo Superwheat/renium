@@ -6139,6 +6139,26 @@ fn reconcile_value_label(value: &Value) -> String {
         Value::Number(value) => value.to_string(),
         Value::String(value) => format!("{value:?}"),
         Value::Array(value) => format!("an array of {} values", value.len()),
+        Value::Object(value) if value.get("_type").and_then(Value::as_str) == Some("CFrame") => {
+            let components = value.get("components").and_then(Value::as_array);
+            format!(
+                "CFrame({})",
+                components
+                    .map(|values| values
+                        .iter()
+                        .map(reconcile_value_label)
+                        .collect::<Vec<_>>()
+                        .join(", "))
+                    .unwrap_or_else(|| "missing components".into())
+            )
+        }
+        Value::Object(value) if value.get("_type").and_then(Value::as_str) == Some("Float") => {
+            value
+                .get("value")
+                .and_then(Value::as_str)
+                .unwrap_or("invalid Float")
+                .to_string()
+        }
         Value::Object(value) if value.get("_type").and_then(Value::as_str) == Some("Ref") => {
             let id = value
                 .get("settingsId")
@@ -8290,6 +8310,72 @@ mod tests {
             .unwrap();
         assert!(detail.contains("Holder.Value property"), "{detail}");
         assert!(!detail.contains("different structure"), "{detail}");
+    }
+
+    #[test]
+    fn live_sync_readback_retains_nonfinite_cframes_and_describes_real_differences() {
+        let path = PathBuf::from("instances/ReplicatedStorage.renium");
+        let mut root = SettingsBytecodeInstance::new(
+            "root".into(),
+            "ReplicatedStorage".into(),
+            "ReplicatedStorage".into(),
+            None,
+        );
+        root.attributes.insert("Revision".into(), json!(1));
+        let mut model = SettingsBytecodeInstance::new(
+            "car".into(),
+            "Cat Mobile 5000".into(),
+            "Model".into(),
+            Some(0),
+        );
+        model.properties.insert(
+            "ModelMeshCFrame".into(),
+            json!({"_type":"CFrame",
+            "components": vec![json!({"_type":"Float","value":"nan"});12]}),
+        );
+        let document = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![root, model],
+        };
+        let snapshot = |document: &SettingsBytecode| ProjectSnapshot {
+            entries: [(
+                path.clone(),
+                SnapshotEntry::File(encode_settings_bytecode(document).unwrap()),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let expected = snapshot(&document);
+        let mut reordered = document.clone();
+        reordered.instances[1].settings_id = "fresh-runtime".into();
+        let observed = snapshot(&reordered);
+        assert!(
+            snapshot_differences(&observed, &expected)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            snapshot_mismatch_details(&observed, &expected, std::slice::from_ref(&path))
+                .unwrap()
+                .is_none()
+        );
+
+        reordered.instances[1].properties["ModelMeshCFrame"]["components"][0] = json!(42);
+        let observed = snapshot(&reordered);
+        assert_eq!(
+            snapshot_differences(&observed, &expected).unwrap(),
+            HashSet::from([path.clone()])
+        );
+        let detail = snapshot_mismatch_details(&observed, &expected, &[path])
+            .unwrap()
+            .unwrap();
+        assert!(
+            detail.contains("Cat Mobile 5000.ModelMeshCFrame property"),
+            "{detail}"
+        );
+        assert!(detail.contains("42") && detail.contains("nan"), "{detail}");
+        assert!(detail.contains("CFrame(42.0, nan"), "{detail}");
+        assert!(!detail.contains("is CFrame; expected CFrame"), "{detail}");
     }
 
     #[test]
