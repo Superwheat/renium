@@ -59,7 +59,7 @@ try {
   assert.ok(!fs.existsSync(path.join(target, '.renium', 'live-sync-enabled.json')));
   run(['--project', path.join(source, 'renium.project.jsonc'), 'plugin', 'snapshot', target], false);
   complete = true;
-  console.log('Plugin host smoke passed: starter build, install, execution, help, defaults, invalid arguments, changed manifest, dev mode, removal and isolated snapshot. No Studio or sandbox plugin was started.');
+  console.log('Plugin host smoke passed: starter build, install, execution, help, defaults, invalid arguments, changed manifest, dev mode, removal and isolated snapshot. No Studio was started.');
 } finally {
   // This test created this exact directory; never follow a replacement/junction.
   if (complete && fs.realpathSync(root) === root && path.dirname(root) === path.join(repository, 'audit')) fs.rmSync(root, { recursive: true });

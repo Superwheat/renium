@@ -339,9 +339,7 @@ implements them using the included SDK. No Renium source changes or separate SDK
 install. `plugin list` shows installed plugins; `plugin info NAME` shows a plugin's
 guide. Installation never builds or executes a plugin. Install only trusted native code.
 
-[Authoring guide](renium-guides/plugins.md). The first plugin, [sandbox](../renium-plugins/sandbox/README.md),
-gives a task an exclusive disposable Studio place; its source is separate and is not
-included in Renium builds.
+[Authoring guide](renium-guides/plugins.md).
 
 ## Build
 
