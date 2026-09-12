@@ -2,91 +2,29 @@
 
 ## 0.3.5 - 2026-09-12
 
-### Project layout
+### Sync and Studio
 
-- Instance stores now live in project-level `instances/`, keeping them out of script folders. Existing projects migrate automatically without changing saved data; conflicting copies are preserved for resolution.
-- Optional client/server/shared folders map to Roblox services through project configuration. The default service-based layout remains supported, including custom source roots and multiple places.
-- Migration preserves cross-service references, script moves, mounted data and undo history, including services with no scripts.
-- Large imports and repeated pulls preserve instance stores when script folders are absent.
+- Faster pushes for large places, small changes, and projects that haven't changed.
+- Terrain sync preserves materials, water and collision data on Windows and Apple Silicon Macs, including Live Sync and Undo/Redo.
+- More reliable Live Sync through rapid edits, reconnects and playtests, including with several places open.
+- Interrupted pushes preserve newer Studio edits.
+- Studio opens behind your active app. Starting and stopping multiplayer tests keeps your keyboard focus.
 
-### Sync and Studio connections
+### New tools
 
-- Terrain transfers on Windows and Apple Silicon Macs preserve solid materials, partial occupancy, water, collision data, and saved metadata. Painting, clearing, and Undo/Redo flow through Live Sync.
-- Failed Terrain pushes preserve concurrent painting, including edits during rollback. macOS native history patches no longer crash Studio.
-- Live Luau commands with nested loops no longer overflow the daemon's parser stack.
-- More reliable two-way Live Sync through rapid edits, reconnects, and Play transitions, including when several places are open.
-- Resolving a conflict releases the previous sync connection promptly. Stopping Live Sync succeeds even when unresolved changes still need review.
-- Live Sync status, pull acknowledgments, and asset searches keep their own Studio target when another place is syncing, preventing intermittent failures and replies from the wrong place.
-- Deleted temporary instances no longer leave phantom changes waiting to sync. Create, rename, move, and delete bursts preserve the final state and instance references.
-- Sync handles Studio's linked corner-radius properties without reporting false conflicts or overwriting genuine edits.
-- Automatic GUI layout updates no longer interrupt sync during Studio startup. Actual edits still invalidate an outdated snapshot.
-- Duplicate-named instances and cross-service references reconcile correctly without rebuilding unrelated place content. Cross-service moves still recreate the moved Studio object; its saved data and references are preserved.
-- Cached exports stay current when properties outside normal Live Sync tracking change.
-- Push on Apple Silicon Macs preserves existing instances and references through renames and moves within a service. Moving objects no longer mixes up their identities in cached exports.
-- Mesh collision-fidelity changes preserve cooked geometry, mass, and inertia in both sync directions, including non-Archivable meshes. Back-to-back changes no longer report false conflicts when Studio finishes applying them without a final notification.
-- Live Sync completion no longer waits out its timeout after a successful reconciliation has already cleared the queue.
-- Faster full sync in large places, including after hierarchy changes and playtests. Small edits avoid unnecessary preparation and repeated comparisons while retaining full-fidelity verification.
-- Large first pushes on Windows finish sooner, with less preparation work and insertion paced by Studio's actual frame progress.
-- Full pushes into populated places reuse existing instances and apply only the differences. Small additions avoid rebuilding unrelated content, and verified edits avoid a second full service export while preserving concurrent-edit protection.
-- Repeated unchanged full pushes on Windows and macOS reuse a recent verified comparison while checking source files and Studio edits. The shortcut expires safely on changes, reconnects, and stopped sessions. Audio loading and computed layout readbacks no longer discard an otherwise valid comparison.
-- Pull records changes to the active camera's saved properties and attributes while push continues to preserve the live viewport.
-- Interrupted pushes preserve concurrent Studio edits, including edits to newly arriving instances, without automatically overwriting them on retry.
-- Aborted syncs that have not changed Studio preserve outside edits. Rolling back script and ordinary property edits also preserves concurrent Terrain painting, including edits made by callbacks during rollback.
-- Canceled subtree replacements restore original objects, scripts, and references without leaving stale change observers. Cleanup no longer turns its own child removals into conflicting edits.
-- Serialized subtree replacements correctly retarget references held elsewhere in the place. Deleting script-containing value objects no longer invents Value edits.
-- Change tracking catches renames, moves, and property edits to value objects while push temporarily detaches them.
-- Restarting Renium reconnects Studio windows opened by an earlier daemon instead of leaving stale connections alive.
-- Closing and immediately reopening a local place no longer targets its retired Studio connection. Opening an explicit file works even when other places are connected.
-- Studio opens behind the active application on Windows and macOS. Starting and stopping multiplayer tests preserves keyboard focus.
-- Stopping a test waits for its shutdown callbacks and process exit instead of reporting failure while Studio is still closing normally.
-- Closing one place no longer interrupts name-targeted commands in another place while Studio removes the closed window.
-- Place-name targeting uses the Studio window name instead of the unreliable DataModel name. Commands stay attached to the selected place and reject ambiguous targets.
-- Busy connections remain distinguishable from disconnected ones; one slow place no longer holds up unrelated places.
-- Commands apply one timeout budget while waiting for busy Studio connections, including their initial retries.
-- Play clients and servers follow the correct session through starts, stops, reconnects, and delayed replies.
-- Separate multiplayer tests report Running once their server connects. On macOS, stopping waits for the old test processes to close so immediate restarts retain the correct session.
-- Auto-Recovery and Lighting Technology Migration notices are dismissed automatically without deleting recovery files. Background Windows dismissal preserves focus; macOS explains missing Accessibility permission instead of silently failing.
-- The known plugin asset-details HTTP 500 startup alert on macOS is dismissed automatically without taking focus.
+- Capture frame timing, memory and MicroProfiler data with `rbx perf`.
+- Simulate lag and packet loss per client with `rbx net`.
+- Read and edit supported protected properties with `rbx access` on Windows and macOS. Ask mode is the default.
+- Compare complete RBXL/RBXLX files with another file or your project.
+- Recordings include a frame overview; inspect individual frames with `rbx rf`.
+- Check Luau syntax without running code using `rbx ck`.
+- Add custom commands with `rbx plugin new`.
 
-### Performance monitoring
+### Projects and editor
 
-- New `rbx perf` commands capture frame timing, memory, network traffic, and object counters for Edit mode, servers, or individual clients.
-- Inspect slow frames, timing percentiles, and memory categories; export complete recordings when detailed analysis is needed. Unavailable measurements are clearly identified.
-- Capture and analyze MicroProfiler data without opening its UI or asking users to save a dump manually. Reports highlight slow frames and relevant scopes, with filters for deeper investigation.
-- Built-in profiling is a trusted, authenticated workflow and does not require enabling unrestricted property access or starting a new Play session.
-
-### Network simulation
-
-- New `rbx net` commands change latency, jitter, and packet loss during an existing playtest, including different settings for separate clients.
-- Start with `normal`, `mid`, `high`, or `poor` connection presets, or set each direction separately.
-- Restore previous settings after testing. Renium rejects configurations that cannot be isolated to the requested client.
-
-### Protected Studio properties
-
-- New `rbx access` commands read and edit supported engine-protected properties directly on Windows and macOS, without restarting Studio.
-- Ask mode is the default. Individual approvals apply only to the exact instance and operation; read-only and explicitly enabled read-write modes are also available.
-- CollisionFidelity is available by default with validated values. Package edits still mark the containing package Changed and preserve its PackageLink.
-- Native entry points are rediscovered and validated after Studio updates. Unsupported layouts return a bounded, actionable error instead of using stale addresses.
-- Package auto-desync on macOS no longer mistakes adjacent memory for a second package layout and rejects a valid package.
-
-### Recording and saved-place inspection
-
-- Recording completion includes a timestamped frame overview. Review every captured frame through paginated contact sheets or open an individual full-resolution frame with `rbx rf`.
-- Full comparisons now support RBXL and RBXLX files against another file or the local project, covering saved instances, scripts, properties, attributes, references, packages, and Terrain data.
-- Comparison output stays compact by default, with optional complete differences and before/after values.
-- Temporary import folders no longer appear as game instances in the extension's Explorer.
-- Clearing an Explorer search restores the normal tree instead of leaving it stuck on Loading.
-
-### Plugins
-
-- Add custom commands without modifying Renium. `rbx plugin new` creates a small starter with a command manifest, Rust handler, SDK, and guide.
-- Plugin commands reuse Renium's project targeting and APIs. Persistent exclusive leases protect shared testing resources across tasks and interruptions.
-
-### Agent workflow and editor reliability
-
-- Rewritten documentation teaches shorter, offline-first workflows. Agents use Play only for a specific runtime question, not after every small edit.
-- `rbx ck` checks Luau syntax without executing code or enabling `loadstring` in Studio.
-- More reliable extension startup, message handling, selection updates, and rapid property edits. Installation and update checks keep the CLI, plugin, and bundled guides aligned.
+- Instance stores move to project-level `instances/`, keeping script folders clean. Existing projects migrate automatically.
+- Optional `src/client`, `src/server` and `src/shared` mappings support different project layouts.
+- Clearing Explorer search restores the tree instead of getting stuck on Loading.
 
 ## 0.3.4 - 2026-09-03
 
