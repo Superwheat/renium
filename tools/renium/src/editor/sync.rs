@@ -683,7 +683,8 @@ impl<'a> EditorTransaction<'a> {
                 .context("Studio plugin needs updating for safe Terrain history")?;
             let info = bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?;
             let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, &info.runtime_id)?;
-            crate::studio::native::serializer::register_history(pid, &info.place_name, token)?;
+            let title = crate::studio::native::serializer::target_name(pid, &info.place_name)?;
+            crate::studio::native::serializer::register_history(pid, &title, token)?;
             for change in &changes.property_changes {
                 if change.class_name == "Terrain"
                     && change
@@ -694,7 +695,7 @@ impl<'a> EditorTransaction<'a> {
                 {
                     let mut terrain = crate::studio::native::serializer::prepare_terrain(
                         pid,
-                        &info.place_name,
+                        &title,
                         &change.path_segments,
                         &change.path_ordinals,
                         Duration::from_secs(3),

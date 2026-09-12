@@ -1254,14 +1254,9 @@ fn prepare(
     let phase = crate::app::timing::trace_scope("native.property", "locate DataModel context");
     let model = active_data_model(pid, &memory, studio, layout.data, title)?;
     let model_instance = model.outer + model.layout.data_model_instance;
-    let name = read_instance_name(&memory, model_instance, model.layout)
-        .context("Studio DataModel name is unavailable")?;
-    if !expected_data_model_names(title)
-        .iter()
-        .any(|expected| expected == &name)
-    {
-        bail!("Native property target did not match the selected Studio place");
-    }
+    // active_data_model binds the selected PID and document window. game.Name
+    // can differ from that caption; the native invocation validates the model
+    // owner, target identity and ancestry instead of equating those two names.
     drop(phase);
     let phase =
         crate::app::timing::trace_scope("native.property", "resolve instance path and class");

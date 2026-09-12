@@ -992,12 +992,8 @@ pub(crate) fn studio_pid_for_bridge(bridge: &BridgeServer) -> Result<u32> {
 }
 
 #[cfg(windows)]
-pub(crate) fn studio_title_for_bridge(bridge: &BridgeServer, pid: u32) -> Result<String> {
-    input_inject::studio_window_title(pid).or_else(|_| {
-        Ok(bridge
-            .cached_bridge_info_for_target(BridgeTarget::Edit)?
-            .place_name)
-    })
+pub(crate) fn studio_title_for_bridge(_bridge: &BridgeServer, pid: u32) -> Result<String> {
+    input_inject::studio_window_title(pid)
 }
 
 #[cfg(target_os = "macos")]

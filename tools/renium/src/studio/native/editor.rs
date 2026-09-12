@@ -350,6 +350,7 @@ fn capture_native_service_root_properties(
         bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?
     };
     let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, &info.runtime_id)?;
+    let title = serializer::target_name(pid, &info.place_name)?;
     // Service roots cannot enter SerializeInstancesAsync. Capture these blocked
     // saved settings through existing identity-checked reads, not a second
     // whole-place export. The active export guard still fences outside edits.
@@ -358,7 +359,7 @@ fn capture_native_service_root_properties(
             let _trace = crate::app::timing::trace_scope("native.property", name);
             let text = serializer::read_property(
                 pid,
-                &info.place_name,
+                &title,
                 &group.target_path,
                 &[1],
                 &group.service,
@@ -950,14 +951,19 @@ struct NativeIdentityOutput {
 }
 
 // Native capture joins by engine identity, never by names or sibling order.
+// Its raw traversal can include engine-only descendants omitted by serialization.
+// The caller checks the serialized graph against the plugin's managed graph;
+// every serialized instance still needs one exact identity and matching parent.
 fn native_capture_debug_ids(
     instances: &[rbx_binary::FlatInstance],
     rows: &[u8],
 ) -> Result<Vec<String>> {
     use rbx_dom_weak::types::UniqueId;
     anyhow::ensure!(
-        rows.len().is_multiple_of(72) && rows.len() / 72 == instances.len(),
-        "Native identity capture has the wrong row count"
+        rows.len().is_multiple_of(72) && rows.len() / 72 >= instances.len(),
+        "Native identity capture has {} bytes for {} serialized instances",
+        rows.len(),
+        instances.len()
     );
     let mut row_by_id = AHashMap::with_capacity(instances.len());
     let mut seen_debug_ids = AHashSet::with_capacity(instances.len());
@@ -996,7 +1002,7 @@ fn native_capture_debug_ids(
         captured.push((debug_id, (parent != u32::MAX).then_some(parent as usize)));
     }
     let mut row_by_native_index = Vec::with_capacity(instances.len());
-    let mut seen_rows = vec![false; instances.len()];
+    let mut seen_rows = vec![false; captured.len()];
     for instance in instances {
         let id = instance
             .properties
@@ -1353,6 +1359,19 @@ mod native_identity_tests {
             native_capture_debug_ids(&instances, &rows).unwrap(),
             ["0_001", "0_003", "0_002"]
         );
+        // Native traversal includes an omitted subtree before serialized rows.
+        let extra_rows = [
+            capture_row(1, u32::MAX, "0_001"),
+            capture_row(4, 0, "engine-only"),
+            capture_row(2, 0, "0_002"),
+            capture_row(3, 0, "0_003"),
+            capture_row(5, 1, "engine-only-child"),
+        ]
+        .concat();
+        assert_eq!(
+            native_capture_debug_ids(&instances, &extra_rows).unwrap(),
+            ["0_001", "0_003", "0_002"]
+        );
         for (offset, bytes) in [
             (72 + 12, 1u32.to_le_bytes()),  // duplicate UniqueId
             (72 + 64, 1u32.to_le_bytes()),  // cyclic parent
@@ -1492,6 +1511,23 @@ mod native_identity_tests {
             decode_native_serialization_batch(&bytes, &batch, &groups, Arc::default(), Some(&rows))
                 .unwrap()
         };
+        let mut missing_managed_instance = groups.clone();
+        missing_managed_instance[0].instance_count += 1;
+        let extra_rows = [rows.clone(), capture_row(8, 0, "engine-only").to_vec()].concat();
+        let error = decode_native_serialization_batch(
+            &bytes,
+            &batch,
+            &missing_managed_instance,
+            Arc::default(),
+            Some(&extra_rows),
+        )
+        .err()
+        .expect("An extra native identity cannot replace a missing managed instance");
+        assert!(
+            error
+                .to_string()
+                .contains("contains 7 instances; expected 8")
+        );
         let mut services = decode();
         assert_eq!(services["Workspace"].captured_root_properties.len(), 5);
         for instance in &services["Workspace"].instances {
@@ -1910,9 +1946,6 @@ fn decode_native_serialization_batch(
         &format!("{}: native binary decode", batch.id),
         decode_started,
     );
-    let captured_debug_ids = identity_rows
-        .map(|rows| native_capture_debug_ids(&flat.instances, rows))
-        .transpose()?;
     if flat.root_indices.len() != expected_roots {
         bail!(
             "Studio native serialization batch {} contains {} roots; expected {}",
@@ -1929,6 +1962,9 @@ fn decode_native_serialization_batch(
             expected_instances
         );
     }
+    let captured_debug_ids = identity_rows
+        .map(|rows| native_capture_debug_ids(&flat.instances, rows))
+        .transpose()?;
     let mut spans = Vec::with_capacity(groups.len());
     let mut root_offset = 0;
     let mut expected_start = 0;
@@ -2874,9 +2910,10 @@ pub(crate) fn editor_binary_export_parts<'a>(
                                             (|| -> Result<_> {
                                                 let info = bridge.cached_bridge_info_for_target(crate::studio::bridge::BridgeTarget::Edit)?;
                                                 let pid = bridge.studio_pid_for_runtime(crate::studio::bridge::BridgeTarget::Edit, &info.runtime_id)?;
+                                                let title = serializer::target_name(pid, &info.place_name)?;
                                                 let services = service_groups.iter().map(|group| group.service.clone()).collect::<Vec<_>>();
                                                 let captured = serializer::capture_live_services(pid,
-                                                    &info.place_name, &services, Duration::from_secs(15))?;
+                                                    &title, &services, Duration::from_secs(15))?;
                                                 serialization_complete_signal.store(true, Ordering::Release);
                                                 let batch = EditorBinarySerializationBatch { id: "native-capture".into(), services };
                                                 decode_native_serialization_batch(&captured.bytes, &batch, service_groups,

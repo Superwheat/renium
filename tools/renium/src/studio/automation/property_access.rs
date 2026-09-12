@@ -245,14 +245,14 @@ fn perform(
         bail!("Property name must contain 1–256 bytes");
     }
     let path = target_parts(&target, &ordinals)?;
-    // The authenticated bridge already supplies the DataModel name. Reading a
-    // window title would add an unrelated Accessibility permission on macOS.
+    // Native targeting needs the document caption on Windows and the bridge's
+    // DataModel name on macOS, without adding macOS Accessibility permissions.
     let info = bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?;
     anyhow::ensure!(
         info.runtime_id == scope.runtime,
         "Protected property runtime was replaced"
     );
-    let title = info.place_name;
+    let title = crate::studio::native::serializer::target_name(scope.pid, &info.place_name)?;
     let mut native = crate::studio::native::serializer::prepare_property(
         scope.pid,
         &title,
