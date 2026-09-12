@@ -81,7 +81,6 @@
 
 - Add custom commands without modifying Renium. `rbx plugin new` creates a small starter with a command manifest, Rust handler, SDK, and guide.
 - Plugin commands reuse Renium's project targeting and APIs. Persistent exclusive leases protect shared testing resources across tasks and interruptions.
-- A configurable sandbox workflow is included as source only; it is not built or installed automatically, and `rbx sandbox` is unavailable until that plugin is installed.
 
 ### Agent workflow and editor reliability
 

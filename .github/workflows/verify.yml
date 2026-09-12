@@ -6,11 +6,6 @@ on:
     branches:
       - "**"
   workflow_dispatch:
-    inputs:
-      test_sandbox:
-        description: Run the sandbox plugin test suite
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -34,12 +29,10 @@ jobs:
       - name: Check formatting
         run: |
           cargo fmt --manifest-path tools/renium/Cargo.toml -- --check
-          cargo fmt --manifest-path tools/renium-plugins/sandbox/Cargo.toml -- --check
 
       - name: Run Clippy
         run: |
           cargo clippy --locked --manifest-path tools/renium/Cargo.toml --all-targets -- -D warnings -D clippy::cognitive_complexity -D clippy::too_many_arguments
-          cargo clippy --locked --manifest-path tools/renium-plugins/sandbox/Cargo.toml --all-targets -- -D warnings -D clippy::cognitive_complexity -D clippy::too_many_arguments
 
   rust-cross-platform:
     name: Rust tests (${{ matrix.os }})
@@ -60,10 +53,6 @@ jobs:
       - name: Run plugin SDK tests
         run: cargo test --locked --manifest-path tools/renium-plugin-sdk/Cargo.toml
 
-      - name: Run sandbox plugin tests
-        if: github.event_name == 'workflow_dispatch' && inputs.test_sandbox
-        run: cargo test --locked --manifest-path tools/renium-plugins/sandbox/Cargo.toml
-
       - name: Test launchers
         run: node tools/renium/tests/launcher-smoke.mjs
 
@@ -82,7 +71,6 @@ jobs:
       - name: Check the minimum Rust version
         run: |
           cargo check --locked --manifest-path tools/renium/Cargo.toml
-          cargo check --locked --manifest-path tools/renium-plugins/sandbox/Cargo.toml
 
   build-and-test:
     name: Windows release build and extension
