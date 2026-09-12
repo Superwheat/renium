@@ -34,6 +34,10 @@ pub(crate) enum SettingsAlignment {
 const SETTINGS_ALIGNMENT_CACHE_CAPACITY: usize = 64;
 const SETTINGS_ALIGNMENT_CACHE_MIN_BYTES: usize = 64 * 1024;
 const SETTINGS_PARALLEL_DECODE_MIN_BYTES: usize = 64 * 1024;
+// Studio's native CFrame roundtrip can accumulate several f32 operations in
+// the rotation basis (observed drift: 1.67e-6). Keep this absolute allowance
+// confined to rotation; positions and other numbers retain their usual precision.
+const CFRAME_ROTATION_EPSILON: f64 = 16.0 * f32::EPSILON as f64;
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 struct SettingsAlignmentCacheKey {
@@ -1026,7 +1030,8 @@ impl IdentityCandidateIndex {
         // A conservative superset of the existing f32 comparison, including its relative
         // tolerance and rounding at either boundary. identity_score remains authoritative.
         let epsilon = 4.0 * f64::from(f32::EPSILON);
-        let radius = (epsilon + 4.0 * f64::EPSILON) / (1.0 - epsilon) * value.abs().max(1.0);
+        let radius = ((epsilon + 4.0 * f64::EPSILON) / (1.0 - epsilon) * value.abs().max(1.0))
+            .max(CFRAME_ROTATION_EPSILON + 4.0 * f64::EPSILON);
         let start = self
             .values
             .partition_point(|(candidate, _)| *candidate < value - radius);
@@ -2438,6 +2443,29 @@ fn reconciliation_values_equal_with_ids(
                     let Some(other) = right.get(name) else {
                         return false;
                     };
+                    if type_name == Some("CFrame") && name == "components" {
+                        let (Some(left), Some(right)) = (value.as_array(), other.as_array()) else {
+                            return false;
+                        };
+                        return left.len() == 12
+                            && right.len() == 12
+                            && left
+                                .iter()
+                                .zip(right)
+                                .enumerate()
+                                .all(|(index, (left, right))| {
+                                    let (Some(a), Some(b)) = (left.as_f64(), right.as_f64()) else {
+                                        return false;
+                                    };
+                                    a.is_finite()
+                                        && b.is_finite()
+                                        && if index < 3 {
+                                            reconciliation_values_equal(left, right, true)
+                                        } else {
+                                            (a - b).abs() <= CFRAME_ROTATION_EPSILON
+                                        }
+                                });
+                    }
                     if type_name == Some("Ref")
                         && matches!(name.as_str(), "settingsId" | "instanceId")
                     {
@@ -4486,6 +4514,81 @@ mod tests {
             let decoded = decode_settings_bytecode(&bytes).unwrap();
             assert!(is_reconciliation_protected_workspace_camera(&decoded, 2));
             assert!(!is_reconciliation_protected_workspace_camera(&decoded, 1));
+        }
+    }
+
+    #[test]
+    fn cframe_rotation_roundtrip_preserves_position_and_real_edit_detection() {
+        let expected = json!({"_type": "CFrame", "components":
+            [0, 10, 500, 1, 0, 0, 0, 1, 0, 0, 0, 1]});
+        for drift in [1.1920928955078125e-6, 1.6689300537109375e-6] {
+            let mut observed = expected.clone();
+            observed["components"][3] = json!(1.0 + drift);
+            observed["components"][11] = json!(1.0 + drift);
+            assert!(reconciliation_property_values_equal(
+                "Part",
+                "CFrame",
+                Some(&expected),
+                Some(&observed),
+            ));
+            assert!(reconciliation_values_equal(&observed, &expected, false));
+            observed["components"][0] = json!(drift);
+            assert!(!reconciliation_values_equal(&expected, &observed, false));
+            assert!(!reconciliation_values_equal(
+                &json!(1.0),
+                &json!(1.0 + drift),
+                true
+            ));
+        }
+        for (index, value) in [(3, 1.00001), (4, 0.00001), (0, 0.001), (2, 500.001)] {
+            let mut edited = expected.clone();
+            edited["components"][index] = json!(value);
+            assert!(!reconciliation_values_equal(&expected, &edited, false));
+        }
+        let mut malformed = expected.clone();
+        malformed["components"][3] = Value::Null;
+        assert!(!reconciliation_values_equal(&expected, &malformed, false));
+        malformed["components"] = json!([0, 10, 500]);
+        assert!(!reconciliation_values_equal(&expected, &malformed, false));
+    }
+
+    #[test]
+    fn numeric_candidate_filter_includes_cframe_rotation_roundtrip() {
+        let mut reference = duplicate_geometry(80);
+        for (index, instance) in reference.instances[1..].iter_mut().enumerate() {
+            instance.properties.clear();
+            instance.properties.insert(
+                "CFrame".into(),
+                json!({"_type": "CFrame",
+                "components": [0, 0, 0, 1.0 - index as f64 * 0.0001, 0, 0, 0, 1, 0, 0, 0, 1]}),
+            );
+        }
+        let candidates = (1..reference.instances.len()).collect::<Vec<_>>();
+        let index = IdentityCandidateIndex::build(&reference, &candidates).unwrap();
+        assert_eq!(index.field.pointer, "/components/3");
+        for candidate in candidates {
+            let original = &reference.instances[candidate];
+            for drift in [-CFRAME_ROTATION_EPSILON, CFRAME_ROTATION_EPSILON] {
+                let mut observed = original.clone();
+                observed.properties["CFrame"]["components"][3] = json!(
+                    original.properties["CFrame"]["components"][3]
+                        .as_f64()
+                        .unwrap()
+                        + drift
+                );
+                assert!(reconciliation_identity_maps_equal(
+                    &original.properties,
+                    &observed.properties,
+                    true
+                ));
+                assert!(
+                    index
+                        .matching(&observed)
+                        .unwrap()
+                        .iter()
+                        .any(|(_, actual)| *actual == candidate)
+                );
+            }
         }
     }
 
