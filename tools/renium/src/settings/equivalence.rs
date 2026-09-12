@@ -19,7 +19,7 @@ use super::bytecode::{
 };
 use crate::app::output::log_global;
 use crate::app::timing::{log_timing, verbose_timing_logs};
-use crate::rbx::decode::rbx_variant_to_settings_json;
+use crate::rbx::decode::{nonfinite_float_from_json, rbx_variant_to_settings_json};
 use crate::rbx::encode::{rbx_logical_property_name, rbx_model_property_descriptor};
 use crate::rbx::model::BytecodeModelImportRefs;
 use crate::snapshot::refs::{
@@ -2455,7 +2455,10 @@ fn reconciliation_values_equal_with_ids(
                                 .enumerate()
                                 .all(|(index, (left, right))| {
                                     let (Some(a), Some(b)) = (left.as_f64(), right.as_f64()) else {
-                                        return false;
+                                        // Saved engine fields can contain NaN/inf sentinels.
+                                        // Preserve identical encodings, not numeric NaN equality.
+                                        return left == right
+                                            && nonfinite_float_from_json(left).is_some();
                                     };
                                     a.is_finite()
                                         && b.is_finite()
@@ -4550,6 +4553,41 @@ mod tests {
         assert!(!reconciliation_values_equal(&expected, &malformed, false));
         malformed["components"] = json!([0, 10, 500]);
         assert!(!reconciliation_values_equal(&expected, &malformed, false));
+    }
+
+    #[test]
+    fn cframe_preserves_encoded_nonfinite_components_without_hiding_edits() {
+        for token in ["nan", "inf", "-inf"] {
+            let value = json!({"_type": "CFrame", "components":
+                vec![json!({"_type": "Float", "value": token}); 12]});
+            assert!(reconciliation_property_values_equal(
+                "Model",
+                "ModelMeshCFrame",
+                Some(&value),
+                Some(&value),
+            ));
+            for index in 0..12 {
+                for replacement in [
+                    json!(0),
+                    json!(null),
+                    json!({"_type":"Float", "value":"invalid"}),
+                    json!({"_type":"Float", "value":if token == "nan" {"inf"} else {"nan"}}),
+                ] {
+                    let mut changed = value.clone();
+                    changed["components"][index] = replacement;
+                    assert!(!reconciliation_values_equal(&value, &changed, false));
+                    assert!(!reconciliation_values_equal(&changed, &value, false));
+                }
+            }
+            let mut mixed = value.clone();
+            mixed["components"][0] = json!(10);
+            mixed["components"][3] = json!(1);
+            let mut rounded = mixed.clone();
+            rounded["components"][3] = json!(1.0000016689300537);
+            assert!(reconciliation_values_equal(&mixed, &rounded, false));
+            rounded["components"][0] = json!(10.001);
+            assert!(!reconciliation_values_equal(&mixed, &rounded, false));
+        }
     }
 
     #[test]
