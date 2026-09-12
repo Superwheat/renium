@@ -8,6 +8,18 @@ use std::time::Duration;
 use anyhow::Result;
 use serde::Serialize;
 
+// Windows binds native work to a document window; macOS discovers the DataModel
+// by its internal name. Never substitute game.Name for a Windows window title.
+#[cfg(windows)]
+pub(crate) fn target_name(pid: u32, _place_name: &str) -> Result<String> {
+    crate::studio::input::studio_window_title(pid)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn target_name(_pid: u32, place_name: &str) -> Result<String> {
+    Ok(place_name.to_owned())
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum PackageAction {
     Desync,

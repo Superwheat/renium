@@ -386,6 +386,7 @@ fn apply_write(
     let started = std::time::Instant::now();
     let info = bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?;
     let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, &info.runtime_id)?;
+    let title = crate::studio::native::serializer::target_name(pid, &info.place_name)?;
     let property_name = match (write.class_name.as_str(), write.name.as_str()) {
         ("MeshPart", "MeshContent") => "MeshId",
         ("MeshPart", "MeshSize") => "InitialSize",
@@ -427,7 +428,7 @@ fn apply_write(
     let mut terrain = if is_terrain {
         Some(crate::studio::native::serializer::prepare_terrain(
             pid,
-            &info.place_name,
+            &title,
             &write.path_segments,
             &write.path_ordinals,
             std::time::Duration::from_secs(3),
@@ -441,7 +442,7 @@ fn apply_write(
         Some(
             crate::studio::native::serializer::prepare_property(
                 pid,
-                &info.place_name,
+                &title,
                 &write.path_segments,
                 &write.path_ordinals,
                 property_name,
@@ -483,7 +484,7 @@ fn apply_write(
             .as_str()
             .context("Studio omitted the native write recording")?;
         // A native import can start a new recording after its insertion phase.
-        crate::studio::native::serializer::register_history(pid, &info.place_name, token)?;
+        crate::studio::native::serializer::register_history(pid, &title, token)?;
         if let Some(terrain) = &mut terrain {
             terrain.expect(
                 begin["terrainBaseline"]

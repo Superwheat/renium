@@ -267,9 +267,10 @@ fn apply_write(bridge: &BridgeServer, write: &GeometryWrite, text: &str) -> Resu
     use crate::studio::bridge::BridgeTarget;
     let info = bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?;
     let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, &info.runtime_id)?;
+    let title = crate::studio::native::serializer::target_name(pid, &info.place_name)?;
     let mut property = crate::studio::native::serializer::prepare_property(
         pid,
-        &info.place_name,
+        &title,
         &write.path_segments,
         &write.path_ordinals,
         &write.name,

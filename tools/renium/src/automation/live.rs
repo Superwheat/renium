@@ -1044,6 +1044,7 @@ impl Manager {
                 .context("Live Sync has no Studio runtime")?;
             let info = bridge.cached_bridge_info_for_runtime(BridgeTarget::Edit, runtime_id)?;
             let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, runtime_id)?;
+            let title = crate::studio::native::serializer::target_name(pid, &info.place_name)?;
             let state = bridge.call_for_runtime_with_timeout(
                 "getStudioChangeState",
                 json!({"nativeTerrainRelay":true}),
@@ -1054,7 +1055,7 @@ impl Manager {
             ensure_plugin_api_ok(&state)?;
             let path: Vec<String> = serde_json::from_value(state["nativeTerrainRelay"].clone())
                 .context("Studio plugin does not support Terrain observation; update the plugin")?;
-            crate::studio::native::serializer::observe_terrain(pid, &info.place_name, &path)
+            crate::studio::native::serializer::observe_terrain(pid, &title, &path)
                 .context("Could not observe Terrain changes for Live Sync")?;
         }
         self.coordinator.reconcile(&context, &bridge, &mut setup)?;

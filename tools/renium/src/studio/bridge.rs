@@ -1181,7 +1181,10 @@ impl BridgeServer {
             #[cfg(any(windows, target_os = "macos"))]
             native_preparation: Some(Arc::new(NativeConnectionPreparation {
                 pending: Default::default(),
-                prepare: Box::new(crate::studio::native::serializer::prepare_context),
+                prepare: Box::new(|pid, place_name| {
+                    let title = crate::studio::native::serializer::target_name(pid, place_name)?;
+                    crate::studio::native::serializer::prepare_context(pid, &title)
+                }),
             })),
         };
 
