@@ -65,6 +65,7 @@ Request the needed fields once and analyze locally; don't make Studio scan saved
 ```
 
 Results are flat in `rs`. Scope `search`/`counts` by `id`, `path`, `index`, `name`, or `className`.
+`path` accepts `"Workspace.Lobby.Barrier"` or `["Workspace","Lobby","Barrier"]`; use an array when a name contains dots or slashes. A search without `q` lists the selected subtree up to `limit` (default 20; 0 means unlimited).
 Field presets: `lookup=id,n,c,path`, `tree=id,n,c,cc,ch`, `brief=id,n,c,path,cc`.
 Use `prop:Name`/`attr:Tags` for fields; `src` is a source path, `prop:Source` is exact text.
 Missing requested properties use class defaults.

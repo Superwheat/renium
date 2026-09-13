@@ -696,7 +696,7 @@ fn settings_topology_matches(reference: &SettingsBytecode, observed: &SettingsBy
             })
 }
 
-fn persistent_identity(instance: &SettingsBytecodeInstance) -> Option<&str> {
+pub(crate) fn persistent_identity(instance: &SettingsBytecodeInstance) -> Option<&str> {
     let value = instance.properties.get("UniqueId")?.as_object()?;
     if value.get("_type")?.as_str()? != "UniqueId" {
         return None;
@@ -706,7 +706,9 @@ fn persistent_identity(instance: &SettingsBytecodeInstance) -> Option<&str> {
         .then_some(id)
 }
 
-fn persistent_identity_index(document: &SettingsBytecode) -> AHashMap<&str, Option<usize>> {
+pub(crate) fn persistent_identity_index(
+    document: &SettingsBytecode,
+) -> AHashMap<&str, Option<usize>> {
     let mut result = AHashMap::new();
     for (index, instance) in document.instances.iter().enumerate() {
         if let Some(id) = persistent_identity(instance) {

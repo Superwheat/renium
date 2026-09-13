@@ -54,6 +54,19 @@ local binaryExports = {}
 local nativeSnapshotPools = {}
 local nativePayloadProofs = {}
 local editorTransactions = {}
+local cleanupFailures = {}
+
+local function recordCleanupFailure(operation: string, detail: any)
+	-- Agent diagnostics travel over the bridge, never Studio's game console.
+	if #cleanupFailures == 16 then
+		table.remove(cleanupFailures, 1)
+	end
+	cleanupFailures[#cleanupFailures + 1] = {
+		operation = operation,
+		error = tostring(detail),
+		atUnix = os.time(),
+	}
+end
 local SESSION_TTL_SECONDS = 120
 local TRANSACTION_OUTCOME_TTL_SECONDS = 300
 local MAX_TRANSACTION_OUTCOMES = 64
@@ -168,7 +181,7 @@ local function expireSession(values: { [any]: any }, key: any, session: { [any]:
 		if not okExpire then
 			session.rollbackFailed = tostring(expireError)
 			session.updatedAt = os.clock()
-			warn("[Renium] session expiry cleanup failed: " .. tostring(expireError))
+			recordCleanupFailure("session expiry", expireError)
 			return false
 		end
 	end
@@ -1121,6 +1134,17 @@ local function decodePropertyValue(
 end
 
 local valuesEqual = BridgeValueEquality.valuesEqual
+local exactValuesEqual = BridgeValueEquality.exactValuesEqual
+
+local function propertyValuesEqual(instance: Instance, name: string, current: any, expected: any): boolean
+	if type(current) == "number" and type(expected) == "number" then
+		local descriptor = RbxDomModule.findCanonicalPropertyDescriptor(instance.ClassName, name)
+		if descriptor == nil or descriptor.dataType ~= "Float32" then
+			return exactValuesEqual(current, expected)
+		end
+	end
+	return valuesEqual(current, expected)
+end
 
 BridgeEditorSync.decodeValue = decodeValue
 BridgeEditorSync.valuesEqual = valuesEqual
@@ -1241,15 +1265,15 @@ local function resolveEntryInstance(
 		return candidate.ClassName == entry.className
 			or (previousClassName ~= "" and candidate.ClassName == previousClassName)
 	end
-	local pathInstance = resolvePathSegments(entry.pathSegments, nil, entry.pathOrdinals)
-	if entry.anchorOnly and not entry.ambiguousSiblings then
-		if pathInstance ~= nil and not claimedInstances[pathInstance] and classCompatible(pathInstance) then
-			return pathInstance
-		end
-		return nil
-	end
+	local parent = resolveEntryParent(entry, resolvedEntries)
+	-- A matched duplicate ancestor can have a different live ordinal. Resolve
+	-- its child inside that actual parent, not the old absolute ancestor path.
+	local pathInstance = if parent ~= nil and #entry.pathSegments > 1
+		then resolveOrdinalChild(parent, entry.pathSegments[#entry.pathSegments], entry.pathOrdinals[#entry.pathSegments] or 1)
+		else resolvePathSegments(entry.pathSegments, nil, entry.pathOrdinals)
 	local persistent = matchedSettingsInstance(serviceName, entry.settingsId, ctx)
-	if not entry.anchorOnly and persistent ~= nil and not claimedInstances[persistent] then
+	if persistent ~= nil and not claimedInstances[persistent]
+		and (not entry.anchorOnly or classCompatible(persistent)) then
 		return persistent
 	end
 
@@ -1262,6 +1286,14 @@ local function resolveEntryInstance(
 		and classCompatible(previousPathInstance)
 	then
 		return previousPathInstance
+	end
+	-- Lookup-only ancestors still carry the reconciler's established identity.
+	-- Check it before falling back to a desired path that may have moved.
+	if entry.anchorOnly and not entry.ambiguousSiblings then
+		if pathInstance ~= nil and not claimedInstances[pathInstance] and classCompatible(pathInstance) then
+			return pathInstance
+		end
+		return nil
 	end
 	if
 		entry.exactPathIdentity
@@ -1278,7 +1310,6 @@ local function resolveEntryInstance(
 		return nil
 	end
 
-	local parent = resolveEntryParent(entry, resolvedEntries)
 	local expectedName = tostring(entry.pathSegments[#entry.pathSegments] or "")
 	local candidates = {}
 	local included = {}
@@ -1321,11 +1352,11 @@ local function resolveEntryInstance(
 			end
 			local okRead, current = readProperty(candidate, propertyName)
 			local okDecode, decoded = decodePropertyValue(candidate, propertyName, rawValue, ctx, serviceName)
-			return okRead and okDecode and valuesEqual(current, decoded)
+			return okRead and okDecode and propertyValuesEqual(candidate, propertyName, current, decoded)
 		end,
 		function(candidate, attributeName, rawValue)
 			local okDecode, decoded = decodeValue(rawValue, nil, ctx, serviceName)
-			return okDecode and valuesEqual(candidate:GetAttribute(attributeName), decoded)
+			return okDecode and exactValuesEqual(candidate:GetAttribute(attributeName), decoded)
 		end
 	)
 	if chosen == nil and pathInstance ~= nil and included[pathInstance] then
@@ -1333,8 +1364,13 @@ local function resolveEntryInstance(
 		-- pulled ordinal is the only stable local identity and is safe as a tie-break.
 		chosen = pathInstance
 	end
+	if chosen == nil and #candidates == 1 then
+		-- Earlier duplicate matches may consume this entry's original ordinal.
+		-- The sole unclaimed sibling is unambiguous even when its values differ.
+		chosen = candidates[1]
+	end
 	if chosen == nil and #candidates > 0 then
-		error(`Could not uniquely identify {entry.key}; Studio was not changed`)
+		error(`Could not uniquely identify {table.concat(entry.pathSegments, ".")} ({#candidates} unmatched siblings); reconcile before retrying`)
 	end
 	if chosen == nil and pathInstance ~= nil and not classCompatible(pathInstance) then
 		error(`Ambiguous class replacement at {entry.key}; reconcile before replacing it`)
@@ -1429,7 +1465,7 @@ local function writePropertyForSync(
 			okRead, current = readProperty(instance, propertyName)
 		end
 	end
-	if not okRead or not valuesEqual(current, value) then
+	if not okRead or not propertyValuesEqual(instance, propertyName, current, value) then
 		cancelExpectedEvent(ctx, token)
 		return false, `Roblox did not retain {propertyName}`
 	end
@@ -1457,7 +1493,7 @@ local function setAttributeForSync(
 		return false, result
 	end
 	markLiveMutation(ctx, instance)
-	if not valuesEqual(instance:GetAttribute(attributeName), value) then
+	if not exactValuesEqual(instance:GetAttribute(attributeName), value) then
 		cancelExpectedEvent(ctx, token)
 		return false, `Roblox did not retain attribute {attributeName}`
 	end
@@ -1882,7 +1918,8 @@ local function syncDesiredEntry(
 		instance = resolveEntryInstance(entry, serviceName, ctx, resolvedEntries, claimedInstances)
 	end
 	if entry.anchorOnly and instance == nil then
-		error("Filtered ancestor was not found: " .. entry.key)
+		local origin = if #entry.previousPathSegments > 0 then table.concat(entry.previousPathSegments, ".") else "no captured origin"
+		error(`Could not find ancestor {table.concat(entry.pathSegments, ".")} ({entry.className}, {entry.settingsId or "no identity"}, ordinals {table.concat(entry.pathOrdinals, ",")}; {origin})`)
 	end
 	if entry.anchorOnly or isProtectedWorkspaceCameraInstance(instance) then
 		stats.noops += 1
@@ -1899,6 +1936,9 @@ local function syncDesiredEntry(
 			error(`Cannot create {entry.className} at {pathKey(entry.pathSegments)}: {created}`)
 		end
 		created.Name = tostring(entry.pathSegments[#entry.pathSegments])
+		if ctx.editorTransaction then
+			ctx.editorTransaction.createdInstances[created] = true
+		end
 		setParentForSync(created, parent, ctx)
 		instance = created
 		stats.instanceCreated += 1
@@ -1911,6 +1951,9 @@ local function syncDesiredEntry(
 		if instance.ClassName ~= entry.className then
 			local oldInstance = instance
 			instance = replaceInstanceClass(instance, entry.className, stats, ctx.selectionReplacements, ctx)
+			if ctx.editorTransaction then
+				ctx.editorTransaction.createdInstances[instance] = true
+			end
 			rememberReplacementIdentity(serviceName, entry.settingsId, oldInstance, instance, ctx)
 		end
 	end
@@ -2348,7 +2391,7 @@ end
 
 local function writeDecodedProperty(instance, propertyName, decoded, ctx, stats, nativeFont)
 	local okRead, current = readProperty(instance, propertyName)
-	if not nativeFont and okRead and valuesEqual(current, decoded) then
+	if not nativeFont and okRead and exactValuesEqual(current, decoded) then
 		stats.noops += 1
 		return true, nil
 	end
@@ -2366,7 +2409,9 @@ local function isMeshGeometryProperty(propertyName: string): boolean
 end
 
 local function isNativeRootProperty(instance: Instance, propertyName: string): boolean
-	return instance.ClassName == "MeshPart" and (
+	return propertyName == "SourceAssetId"
+		or propertyName == "Scale" and (instance.ClassName == "Model" or instance.ClassName == "WorldModel")
+		or instance.ClassName == "MeshPart" and (
 		propertyName == "MeshId" or propertyName == "MeshContent" or propertyName == "MeshSize"
 		or propertyName == "CollisionFidelity" or propertyName == "RenderFidelity" or propertyName == "FluidFidelity"
 	) or (propertyName == "LightingStyle" or propertyName == "PrioritizeLightingQuality")
@@ -2386,6 +2431,9 @@ local function queueNativeRootWrite(instance, propertyName, rawValue, change, ct
 	if session == nil or session.historyRecording == nil then
 		error("Native root sync requires an active undo recording")
 	end
+	if propertyName == "Scale" and not (session.createdInstances and session.createdInstances[instance]) then
+		error("Native initialization requires an instance created by this transaction")
+	end
 	local isTerrain = instance.ClassName == "Terrain" and (propertyName == "SmoothGrid" or propertyName == "PhysicsGrid")
 	local value = rawValue
 	if isTerrain then
@@ -2402,7 +2450,7 @@ local function queueNativeRootWrite(instance, propertyName, rawValue, change, ct
 		value = decoded
 	end
 	local okRead, current = readProperty(instance, propertyName)
-	if okRead and valuesEqual(current, value) then
+	if okRead and exactValuesEqual(current, value) then
 		stats.noops += 1
 		return
 	end
@@ -2446,6 +2494,7 @@ local function applyChangedProperty(instance, propertyName, rawValue, change, ct
 		return
 	end
 	if isNativeRootProperty(instance, propertyName)
+		and (propertyName ~= "Scale" or ctx.editorTransaction and ctx.editorTransaction.createdInstances[instance])
 		and (propertyName ~= "MeshContent" or type(rawValue) == "string") then
 		queueNativeRootWrite(instance, propertyName, rawValue, change, ctx, stats)
 		return
@@ -2532,7 +2581,7 @@ local function resetProperty(instance, propertyName, change, ctx, stats, unreada
 		return
 	end
 	local okRead, current = readProperty(instance, propertyName)
-	if okRead and valuesEqual(current, defaultValue) then
+	if okRead and exactValuesEqual(current, defaultValue) then
 		stats.noops += 1
 		return
 	end
@@ -2566,7 +2615,7 @@ local function applyChangedAttribute(instance, attributeName, rawValue, change, 
 	if not okDecode then
 		error(`Failed to decode attribute {attributeName}: {decoded}`)
 	end
-	if valuesEqual(instance:GetAttribute(attributeName), decoded) then
+	if exactValuesEqual(instance:GetAttribute(attributeName), decoded) then
 		stats.noops += 1
 		return
 	end
@@ -2637,8 +2686,10 @@ local function verifyChangedProperty(instance, propertyName, rawValue, change, c
 	end
 	local okRead, current = readProperty(instance, propertyName)
 	if not okRead then
-		recordVerifyMismatch(stats, change, propertyName, " is unreadable")
-	elseif valuesEqual(current, decoded) then
+		-- Serialized-only fields need native snapshot readback. An unreadable
+		-- field contributes no verification credit; it is not a failed write.
+		return
+	elseif propertyValuesEqual(instance, propertyName, current, decoded) then
 		stats.verified += 1
 	else
 		recordVerifyMismatch(stats, change, propertyName, "")
@@ -2655,7 +2706,7 @@ local function verifyPropertyChange(instance, change, ctx, stats, unreadableName
 		if not okDecode then
 			error(`Failed to decode attribute {attributeName}: {decoded}`)
 		end
-		if valuesEqual(instance:GetAttribute(attributeName), decoded) then
+		if exactValuesEqual(instance:GetAttribute(attributeName), decoded) then
 			stats.verified += 1
 		else
 			recordVerifyMismatch(stats, change, attributeName, " (attribute)")
@@ -3656,7 +3707,7 @@ function TransactionState.restoreMetadata(
 			end
 		end
 		for name, value in pairs(desiredAttributes) do
-			if not valuesEqual(instance:GetAttribute(name), value) then
+			if not exactValuesEqual(instance:GetAttribute(name), value) then
 				local okWrite, writeError = setAttributeForSync(instance, name, value, ctx)
 				if not okWrite then
 					error(`Could not restore {instance:GetFullName()}.{name}: {writeError}`)
@@ -3696,7 +3747,7 @@ function TransactionState.restoreMetadata(
 			then replacements[entry.value] or entry.value
 			else entry.value
 		local okRead, current = readProperty(instance, entry.name)
-		if typeof(value) == "Font" or not okRead or not valuesEqual(current, value) then
+		if typeof(value) == "Font" or not okRead or not exactValuesEqual(current, value) then
 			local okWrite, writeError = writePropertyForSync(instance, entry.name, value, ctx)
 			if not okWrite then
 				error(`Could not restore {instance:GetFullName()}.{entry.name}: {writeError}`)
@@ -3741,17 +3792,17 @@ function TransactionState.restoreSnapshotState(
 end
 
 function TransactionState.destroyOwned(instance: Instance, ctx: { [string]: any })
-	local tokens = {}
+	local tokens = { ctx.expectParentChange(instance, nil) }
 	-- Destroy also unparents every child. Those inverse writes belong to the
 	-- transaction; they must not be replayed onto the restored originals.
 	for _, child in ipairs(instance:GetDescendants()) do
 		tokens[#tokens + 1] = ctx.expectPropertyEvent(child, "Parent", nil)
 	end
 	local ok, result = pcall(instance.Destroy, instance)
-	for _, token in ipairs(tokens) do
-		cancelExpectedEvent(ctx, token)
-	end
 	if not ok then
+		for _, token in ipairs(tokens) do
+			cancelExpectedEvent(ctx, token)
+		end
 		error(result, 0)
 	end
 end
@@ -4002,28 +4053,31 @@ function TransactionState.prepareJournalRollback(session: { [string]: any }, rec
 end
 
 function TransactionState.resolveJournalParent(record: { [string]: any }, replacements: { [Instance]: Instance }): Instance?
+	-- A recorded removal must stay a removal, even if an older path is retained.
+	if record.parent == nil then
+		return nil
+	end
 	local parent = resolveReplacement(record.parent, replacements)
 	if parent ~= nil and (parent.Parent ~= nil or parent == game:GetService(record.service)) then
 		return parent
 	end
 	local pathSegments = record.parentPathSegments
 	local pathOrdinals = record.parentPathOrdinals
-	if type(pathSegments) ~= "table" then
-		return nil
-	end
-	for count = #pathSegments, 1, -1 do
-		local segments = table.create(count)
-		local ordinals = table.create(count)
-		for index = 1, count do
-			segments[index] = pathSegments[index]
-			ordinals[index] = if type(pathOrdinals) == "table" then pathOrdinals[index] or 1 else 1
-		end
-		local resolved = resolvePathSegments(segments, nil, ordinals)
+	if type(pathSegments) == "table" and #pathSegments > 0 then
+		local resolved = resolvePathSegments(pathSegments, nil, pathOrdinals)
 		if resolved ~= nil then
 			return resolved
 		end
 	end
-	return nil
+	-- Substituting a surviving ancestor flattens orphaned descendants into the
+	-- service root. Keep recovery pending instead of silently changing hierarchy.
+	local path = if type(pathSegments) == "table" then table.concat(pathSegments, ".") else record.parent.Name
+	local properties = {}
+	for name in pairs(record.properties or {}) do
+		properties[#properties + 1] = name
+	end
+	table.sort(properties)
+	error(`Could not preserve concurrent Studio edit: original parent {path} is missing during rollback (properties: {table.concat(properties, ", ")}; structural: {tostring(record.structural)})`)
 end
 
 function TransactionState.markJournalServices(record: { [string]: any }, changedServices: { [string]: boolean })
@@ -4074,7 +4128,7 @@ function TransactionState.replayJournalProperty(
 	else
 		okCurrent, current = readProperty(instance, propertyName)
 	end
-	if okCurrent and valuesEqual(current, value) then
+	if okCurrent and exactValuesEqual(current, value) then
 		return
 	end
 	local okWrite, writeError
@@ -4094,7 +4148,7 @@ function TransactionState.replayJournalAttributes(
 	ctx: { [string]: any }
 )
 	for attributeName, entry in pairs(attributes) do
-		if entry.captured and not valuesEqual(instance:GetAttribute(attributeName), entry.value) then
+		if entry.captured and not exactValuesEqual(instance:GetAttribute(attributeName), entry.value) then
 			local okWrite, writeError = setAttributeForSync(instance, attributeName, entry.value, ctx)
 			if not okWrite then
 				error(
@@ -4218,7 +4272,7 @@ function TransactionState.expectSnapshotUndo(snapshot: { [string]: any }, ctx: {
 	for _, entry in ipairs(snapshot.metadata or {}) do
 		local current = entry.instance:GetAttributes()
 		for name, value in pairs(current) do
-			if not valuesEqual(value, entry.attributes[name]) then
+			if not exactValuesEqual(value, entry.attributes[name]) then
 				tokens[#tokens + 1] = ctx.expectAttributeEvent(entry.instance, name, entry.attributes[name])
 			end
 		end
@@ -4231,7 +4285,7 @@ function TransactionState.expectSnapshotUndo(snapshot: { [string]: any }, ctx: {
 	for _, entry in ipairs(snapshot.properties or {}) do
 		if entry.name ~= "__meshGeometry" then
 			local okRead, current = readProperty(entry.instance, entry.name)
-			if okRead and not valuesEqual(current, entry.value) then
+			if okRead and not exactValuesEqual(current, entry.value) then
 				tokens[#tokens + 1] = ctx.expectPropertyEvent(entry.instance, entry.name, entry.value)
 			end
 		end
@@ -4818,6 +4872,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		end
 	end
 	api.stats = ctx.stats
+	ctx.stats.cleanupFailures = cleanupFailures
 
 	local function beginTrackedOperation(kind: string)
 		local now = os.clock()
@@ -5130,8 +5185,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					rolledBack += 1
 					transactionIds[#transactionIds + 1] = transactionId
 				else
+					session.rollbackFailed = tostring(replacements)
 					armSessionExpiry(editorTransactions, transactionId, session)
-					warn("[Renium] request lease rollback failed: " .. tostring(replacements))
+					recordCleanupFailure("request lease rollback", replacements)
 				end
 			end
 		end
@@ -5353,7 +5409,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				local okDecode, decoded = decodePropertyValue(instance, propertyName, rawValue, ctx, serviceName)
 				local okRead, current = readProperty(instance, propertyName)
 				if type(rawValue) == "table" and rawValue._nativeFont ~= nil
-					or not okDecode or not okRead or not valuesEqual(current, decoded) then
+					or not okDecode or not okRead or not exactValuesEqual(current, decoded) then
 					return true
 				end
 			end
@@ -5366,7 +5422,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			local okDefault, defaultValue = readProperty(defaultInstance, propertyName)
 			defaultInstance:Destroy()
 			local okRead, current = readProperty(instance, propertyName)
-			if not okDefault or not okRead or not valuesEqual(current, defaultValue) then
+			if not okDefault or not okRead or not exactValuesEqual(current, defaultValue) then
 				return true
 			end
 		end
@@ -5377,7 +5433,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		end
 		for attributeName, rawValue in pairs(change.attributes or {}) do
 			local okDecode, decoded = decodeValue(rawValue, nil, ctx, serviceName)
-			if not okDecode or not valuesEqual(instance:GetAttribute(attributeName), decoded) then
+			if not okDecode or not exactValuesEqual(instance:GetAttribute(attributeName), decoded) then
 				return true
 			end
 		end
@@ -5804,6 +5860,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			changedSourceKeys = changedSourceKeys,
 			changedSourceInstances = changedSourceInstances,
 			instanceReplacements = {},
+			createdInstances = {},
 			snapshot = snapshot,
 			mutated = false,
 			nativeImport = nativeImport,
@@ -6096,7 +6153,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				end
 			end)
 			if not cleanupOk then
-				warn("[Renium] committed transaction cleanup failed: " .. tostring(cleanupError))
+				recordCleanupFailure("committed transaction cleanup", cleanupError)
 			end
 		end
 		timings.cleanupMs = (os.clock() - phaseStarted) * 1000
@@ -6219,7 +6276,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			if type(previous) == "table" and type(previous.onExpire) == "function" then
 				local okExpire, expireError = pcall(previous.onExpire)
 				if not okExpire then
-					warn("[Renium] native export cleanup failed: " .. tostring(expireError))
+					recordCleanupFailure("native export cleanup", expireError)
 				end
 			end
 		end
@@ -8572,7 +8629,8 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				stats.attributeUpdated = 0
 			else
 				stats.errors += 1
-				warn("[Renium] editor rollback failed: " .. tostring(replacements))
+				stats.rollbackError = tostring(replacements)
+				recordCleanupFailure("editor rollback", replacements)
 			end
 		end
 		if outerTransaction == nil and historyRecording ~= nil then
@@ -8647,7 +8705,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			if not okRollback then
 				session.rollbackFailed = tostring(rollbackError)
 				session.updatedAt = os.clock()
-				warn("[Renium] transaction cleanup failed: " .. tostring(rollbackError))
+				recordCleanupFailure("transaction cleanup", rollbackError)
 			else
 				session.onExpire = nil
 				editorTransactions[entry.transactionId] = nil
@@ -8668,7 +8726,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				return rollbackReconcileSnapshot(session.rollbackSnapshot, session.serviceName)
 			end)
 			if not okRollback then
-				warn("[Renium] reconcile cleanup failed: " .. tostring(rollbackError))
+				recordCleanupFailure("reconcile cleanup", rollbackError)
 			end
 		end
 		table.clear(binaryImports)

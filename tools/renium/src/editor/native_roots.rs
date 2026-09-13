@@ -62,10 +62,12 @@ pub(crate) fn decode_service_property(class: &str, name: &str, text: &str) -> Re
 // their saved setters, avoiding asset downloads and ApplyMesh's coupled writes.
 // Player limits are managed through Roblox Game Settings, not Studio sync.
 pub(crate) fn is_property(class: &str, name: &str) -> bool {
-    capture_properties(class).contains(&name)
+    name == "SourceAssetId"
+        || capture_properties(class).contains(&name)
         || matches!(
             (class, name),
             ("Lighting", "LightingStyle" | "PrioritizeLightingQuality")
+                | ("Model" | "WorldModel", "Scale")
                 | ("Terrain", "Decoration" | "SmoothGrid" | "PhysicsGrid")
                 | ("TextChatService", "ChatVersion")
                 | ("SurfaceAppearance", "TexturePack")
@@ -107,6 +109,10 @@ pub(crate) fn normalize_resets(changes: &mut super::types::EditorChangeSet) -> R
 }
 
 fn default_value(class: &str, name: &str) -> Result<Value> {
+    // Scale is a virtual plugin property; reflection does not carry its default.
+    if matches!(class, "Model" | "WorldModel") && name == "Scale" {
+        return Ok(serde_json::json!(1.0));
+    }
     let database = rbx_reflection_database::get()?;
     let saved_name =
         crate::rbx::encode::rbx_serialized_property_name_for_logical(database, class, name)
@@ -138,20 +144,25 @@ struct RootWrite {
 
 impl RootWrite {
     fn text(&self) -> Result<String> {
-        let valid_path = match self.class_name.as_str() {
-            "Lighting" | "TextChatService" | "MaterialService" | "Workspace" | "StarterPlayer" => {
-                self.path_segments == [self.class_name.as_str()]
+        let valid_path = if self.name == "SourceAssetId" {
+            !self.path_segments.is_empty()
+                && self.path_segments.iter().all(|part| !part.is_empty())
+                && (self.path_segments.len() > 1 || self.path_segments[0] == self.class_name)
+        } else {
+            match self.class_name.as_str() {
+                "Lighting" | "TextChatService" | "MaterialService" | "Workspace"
+                | "StarterPlayer" => self.path_segments == [self.class_name.as_str()],
+                "Terrain" => {
+                    self.path_segments.len() == 2
+                        && self.path_segments[0] == "Workspace"
+                        && !self.path_segments[1].is_empty()
+                }
+                "MeshPart" | "SurfaceAppearance" | "Model" | "WorldModel" => {
+                    self.path_segments.len() > 1
+                        && self.path_segments.iter().all(|part| !part.is_empty())
+                }
+                _ => false,
             }
-            "Terrain" => {
-                self.path_segments.len() == 2
-                    && self.path_segments[0] == "Workspace"
-                    && !self.path_segments[1].is_empty()
-            }
-            "MeshPart" | "SurfaceAppearance" => {
-                self.path_segments.len() > 1
-                    && self.path_segments.iter().all(|part| !part.is_empty())
-            }
-            _ => false,
         };
         ensure!(
             self.index > 0
@@ -162,6 +173,33 @@ impl RootWrite {
                 && is_property(&self.class_name, &self.name),
             "Unsupported native root property or target"
         );
+        if self.name == "SourceAssetId" {
+            let value = self
+                .value
+                .as_i64()
+                .context("SourceAssetId requires an integer")?;
+            // The plugin transports numbers as doubles; reject values it cannot
+            // represent exactly rather than silently assigning another asset.
+            ensure!(
+                (-1..=9_007_199_254_740_991).contains(&value),
+                "SourceAssetId is outside the exact transport range"
+            );
+            return Ok(value.to_string());
+        }
+        if matches!(self.class_name.as_str(), "Model" | "WorldModel") && self.name == "Scale" {
+            let value = self
+                .value
+                .as_f64()
+                .context("Model scale requires a number")?;
+            ensure!(
+                value.is_finite()
+                    && value > 0.0
+                    && (value as f32).is_finite()
+                    && (value as f32) > 0.0,
+                "Model scale must be finite and positive"
+            );
+            return Ok(value.to_string());
+        }
         if self.class_name == "Terrain" && self.name == "SmoothGrid" {
             ensure!(
                 self.value.is_object(),
@@ -390,6 +428,7 @@ fn apply_write(
     let property_name = match (write.class_name.as_str(), write.name.as_str()) {
         ("MeshPart", "MeshContent") => "MeshId",
         ("MeshPart", "MeshSize") => "InitialSize",
+        ("Model" | "WorldModel", "Scale") => "ScaleFactor",
         _ => &write.name,
     };
     let is_terrain = write.class_name == "Terrain" && write.name == "SmoothGrid";
@@ -556,6 +595,66 @@ fn apply_write(_: &BridgeServer, _: &str, _: &RootWrite, _: &str) -> Result<()> 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn model_scale_uses_validated_native_metadata() {
+        for class in ["Model", "WorldModel"] {
+            let mut write = RootWrite {
+                index: 1,
+                class_name: class.into(),
+                path_segments: vec!["ServerStorage".into(), "Car".into()],
+                path_ordinals: vec![1, 1],
+                name: "Scale".into(),
+                value: json!(0.95),
+            };
+            assert_eq!(write.text().unwrap(), "0.95");
+            assert_eq!(default_value(class, "Scale").unwrap(), json!(1.0));
+            for invalid in [
+                json!(0),
+                json!(-1),
+                json!("0.95"),
+                json!(1e100),
+                json!(1e-100),
+            ] {
+                write.value = invalid;
+                assert!(write.text().is_err());
+            }
+        }
+        assert!(!is_property("Part", "Scale"));
+    }
+
+    #[test]
+    fn source_asset_ids_preserve_inherited_metadata_and_validate_transport() {
+        let mut write = RootWrite {
+            index: 1,
+            class_name: "Sky".into(),
+            path_segments: vec!["Lighting".into(), "Sky".into()],
+            path_ordinals: vec![1, 1],
+            name: "SourceAssetId".into(),
+            value: json!(9562541253_i64),
+        };
+        assert_eq!(write.text().unwrap(), "9562541253");
+        write.value = default_value("Sky", "SourceAssetId").unwrap();
+        assert_eq!(write.text().unwrap(), "-1");
+        for invalid in [
+            json!(-2),
+            json!(1.5),
+            json!("123"),
+            json!(9_007_199_254_740_992_i64),
+        ] {
+            write.value = invalid;
+            assert!(write.text().is_err());
+        }
+        let database = rbx_reflection_database::get().unwrap();
+        for class in ["Sky", "Model", "Part", "Lighting"] {
+            assert!(is_property(class, "SourceAssetId"));
+            assert!(!super::super::review::is_engine_managed_editor_property(
+                class,
+                "SourceAssetId",
+                database
+            ));
+        }
+    }
 
     #[test]
     fn terrain_receipt_only_verifies_the_written_target_and_bytes() {

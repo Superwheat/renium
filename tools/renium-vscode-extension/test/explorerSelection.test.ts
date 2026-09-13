@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import Module from "node:module";
+import * as path from "node:path";
 import { test } from "node:test";
 import * as vm from "node:vm";
 import ts from "typescript";
@@ -22,6 +23,33 @@ loader._load = (request, parent, isMain) => request === "vscode" ? {} : original
 const { FileExplorerViewProvider } = require("../src/fileExplorerView");
 const { FilePropertiesViewProvider } = require("../src/filePropertiesView");
 loader._load = original;
+
+test("history group failures retain completed paths and stop before later entries", async () => {
+  const projectRoot = path.resolve("history-test");
+  const calls: string[] = [];
+  const view = Object.assign(Object.create(FileExplorerViewProvider.prototype), {
+    readHistoryManifest: (id: string) => ({
+      manifest: { service: "Workspace", settingsId: id },
+      entryDir: path.join(projectRoot, ".renium", "editor-history", id),
+    }),
+    revertHistoryEntry: async (_config: unknown, manifest: string) => {
+      const id = path.basename(path.dirname(manifest));
+      calls.push(id);
+      if (id === "bad") { throw new Error("Source destination is occupied"); }
+      return { ok: true, changedPaths: ["instances/Workspace.renium"] };
+    },
+  });
+  const result = await view.applyHistoryRestores({ projectRoot }, ["good", "bad", "later"]);
+  assert.deepEqual(calls, ["good", "bad"]);
+  assert.equal(result.restored, 1);
+  assert.deepEqual(result.changedPaths, [path.join(projectRoot, "instances/Workspace.renium")]);
+  assert.equal(result.failure.id, "bad");
+  assert.match(result.failure.message, /occupied/);
+  view.readHistoryManifest = () => undefined;
+  const missing = await view.applyHistoryRestores({ projectRoot }, ["missing"]);
+  assert.equal(missing.restored, 0);
+  assert.match(missing.failure.message, /not found/);
+});
 
 test("clearing Explorer search delivers a valid request and reloads normal rows with or without a selected match", async () => {
   const html = fileExplorerWebviewHtml({ assetBase: "", classNames: [], availableIconNames: new Set(), initialRows: "[]", maxStoreDroppedBytes: 1024 });

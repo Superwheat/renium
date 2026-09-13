@@ -26,6 +26,10 @@ for _, params in {
 	{ action = "set", values = { inDelay = 0 / 0 } },
 	{ action = "set", values = { inDelay = math.huge } },
 	{ action = "set", values = { inDelay = -1 } },
+	{ action = "set", values = { inDelay = 1000.01 } },
+	{ action = "set", values = { outDelay = 1000.01 } },
+	{ action = "set", values = { inJitter = 1000.01 } },
+	{ action = "set", values = { outJitter = 1000.01 } },
 	{ action = "set", values = { inDelay = "10" } },
 	{ action = "show", values = { inDelay = 10 } },
 	{ action = "set", values = { unknown = 10 } },
@@ -34,11 +38,13 @@ for _, params in {
 	assert(writes == 0, "invalid input must not partially change settings")
 end
 for index = 1, 1000 do
-	local delay = index % 101
+	local delay = index
 	local result = api.handle({ action = "set", client = true, values = { inDelay = delay, outLoss = 0.25 } })
 	assert(result.settings.inDelay == delay and result.settings.outLoss == 0.25)
 	assert(result.settings.outDelay == 0 and values.IncomingReplicationLag == 0.125)
 end
+local maximum = api.handle({ action = "set", client = true, values = { outDelay = 1000, inJitter = 1000, outJitter = 1000 } })
+assert(maximum.settings.outDelay == 1000 and maximum.settings.inJitter == 1000 and maximum.settings.outJitter == 1000)
 api.restore()
 assert(values.InboundNetworkMinDelayMs == 0 and values.OutboundNetworkLossPercent == 0)
 local count = writes

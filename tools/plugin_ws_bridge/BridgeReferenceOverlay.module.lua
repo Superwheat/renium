@@ -760,7 +760,8 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 		end
 		for serviceName, generation in pairs(undo.generationsByService) do
 			if ctx.studioChangeGeneration(serviceName) ~= generation then
-				error(`Studio changed {serviceName} while native import was staged; retry the sync`)
+				local detail = if ctx.describeJournalChange then ctx.describeJournalChange(serviceName) else "no retained event"
+				error(`Studio changed {serviceName} while native import was staged: {detail}; retry the sync`)
 			end
 		end
 	end

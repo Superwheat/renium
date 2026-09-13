@@ -59,7 +59,7 @@ rbx net reset --player 2                     # Zero all six simulation values
 | `high` | 100 ms | 15 ms | 0.1% | High latency |
 | `poor` | 100 ms | 100 ms | 0.5% | Highly variable, lossy connection |
 
-These are test templates, not measured device/network profiles. Minimum added round-trip delay is twice the listed delay; actual ping also includes jitter, real network latency and processing. Studio supports 0–100 ms delay/jitter per direction and at most 0.5% loss. `poor` uses those limits; it does not simulate arbitrary outages or bandwidth caps. A loss value of `0.5` means **0.5%**, not 50%.
+These are test templates, not measured device/network profiles. Minimum added round-trip delay is twice the listed delay; actual ping also includes jitter, real network latency and processing. Current Studio supports 0–1000 ms delay/jitter per direction and at most 0.5% loss. Older builds that clamp values fail readback verification and restore the previous settings. `poor` is a preset, not the maximum; it does not simulate arbitrary outages or bandwidth caps. A loss value of `0.5` means **0.5%**, not 50%.
 
 For custom asymmetric conditions, use `--in-delay`, `--out-delay`, `--in-jitter`, `--out-jitter`, `--in-loss` and `--out-loss`. Inbound means server→client; outbound means client→server. A preset fills all six values; explicit flags override it. Without a preset, omitted settings stay unchanged.
 

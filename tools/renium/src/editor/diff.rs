@@ -13,7 +13,9 @@ use crate::editor::types::{
     EditorBinaryImport, EditorChangeSet, EditorInstanceChange, EditorInstanceDescriptor,
     EditorInstancePath, EditorPropertyChange, EditorPropertyFilter, EditorSourceChange,
 };
-use crate::rbx::encode::rbx_logical_property_name;
+use crate::rbx::decode::rbx_variant_to_settings_json;
+use crate::rbx::encode::{rbx_logical_property_name, rbx_model_property_descriptor};
+use crate::rbx::model::BytecodeModelImportRefs;
 use crate::roblox::schema::PropertySchemaMap;
 use crate::settings::EXTERNAL_SOURCE_MARKER;
 use crate::settings::bytecode::{SettingsBytecode, SettingsBytecodeInstance};
@@ -25,19 +27,20 @@ const MAX_EDITOR_MATCH_VALUE_BYTES: usize = 256;
 const MAX_EDITOR_MATCH_TOTAL_BYTES: usize = 512;
 const MAX_EDITOR_MATCH_CANDIDATES_TO_SCORE: usize = 32;
 
-pub(crate) type EditorSiblingGroupCounts<'a> = HashMap<(usize, &'a str), usize>;
+pub(crate) type EditorSiblingGroupCounts<'a> = HashMap<(usize, &'a str), Vec<usize>>;
 
 pub(crate) fn editor_sibling_group_counts(
     document: &SettingsBytecode,
 ) -> EditorSiblingGroupCounts<'_> {
-    let mut counts = HashMap::new();
-    for instance in &document.instances {
+    let mut counts = HashMap::<_, Vec<usize>>::new();
+    for (index, instance) in document.instances.iter().enumerate() {
         let Some(parent_index) = instance.parent_index else {
             continue;
         };
-        *counts
+        counts
             .entry((parent_index, instance.name.as_str()))
-            .or_insert(0) += 1;
+            .or_default()
+            .push(index);
     }
     counts
 }
@@ -105,14 +108,61 @@ fn collect_editor_reference_indices(
 
 fn editor_match_records(
     instance: &SettingsBytecodeInstance,
+    document: &SettingsBytecode,
+    siblings: &[usize],
 ) -> (Map<String, Value>, Map<String, Value>) {
+    // A missing saved override still has a value. Include defaults for fields
+    // used by these siblings so e.g. Front competes fairly with explicit faces.
+    // Restrict this to the already bounded sibling group, not the whole schema.
+    let mut defaults = Map::new();
+    if let Ok(database) = rbx_reflection_database::get() {
+        let names = siblings
+            .iter()
+            .map(|index| &document.instances[*index])
+            .filter(|sibling| sibling.class_name == instance.class_name)
+            .flat_map(|sibling| sibling.properties.keys())
+            .filter(|name| !instance.properties.contains_key(*name))
+            .collect::<HashSet<_>>();
+        for name in names {
+            let descriptor = rbx_model_property_descriptor(database, &instance.class_name, name);
+            let serialized_name = descriptor.map_or(name.as_str(), |value| value.name);
+            if let Some(value) = database
+                .classes
+                .get(instance.class_name.as_str())
+                .and_then(|class| database.find_default_property(class, serialized_name))
+                .and_then(|value| {
+                    rbx_variant_to_settings_json(
+                        value,
+                        descriptor,
+                        database,
+                        &BytecodeModelImportRefs::default(),
+                    )
+                })
+            {
+                defaults.insert(name.clone(), value);
+            }
+        }
+    }
     let mut candidates = Vec::new();
-    for (attribute, records) in [(false, &instance.properties), (true, &instance.attributes)] {
+    for (attribute, records) in [
+        (false, &instance.properties),
+        (false, &defaults),
+        (true, &instance.attributes),
+    ] {
         for (name, value) in records {
             if !attribute
-                && ["source", "classname", "name", "parent", "tags", "meshsize"]
-                    .iter()
-                    .any(|candidate| name.eq_ignore_ascii_case(candidate))
+                && [
+                    "source",
+                    "classname",
+                    "name",
+                    "parent",
+                    "tags",
+                    "meshsize",
+                    "uniqueid",
+                    "historyid",
+                ]
+                .iter()
+                .any(|candidate| name.eq_ignore_ascii_case(candidate))
             {
                 continue;
             }
@@ -171,16 +221,16 @@ pub(crate) fn editor_instance_descriptor_from_path(
     sibling_counts: &EditorSiblingGroupCounts<'_>,
 ) -> Option<EditorInstanceDescriptor> {
     let instance = document.instances.get(index)?;
-    let name_sibling_count = instance.parent_index.map_or(0, |parent_index| {
-        sibling_counts
-            .get(&(parent_index, instance.name.as_str()))
-            .copied()
-            .unwrap_or(0)
-    });
+    let siblings = instance
+        .parent_index
+        .and_then(|parent_index| sibling_counts.get(&(parent_index, instance.name.as_str())))
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let name_sibling_count = siblings.len();
     let ambiguous_siblings = name_sibling_count > 1;
     let (match_properties, match_attributes) =
         if ambiguous_siblings && name_sibling_count <= MAX_EDITOR_MATCH_CANDIDATES_TO_SCORE {
-            editor_match_records(instance)
+            editor_match_records(instance, document, siblings)
         } else {
             (Map::new(), Map::new())
         };
@@ -350,7 +400,7 @@ fn append_editor_target_instance_upserts_with_paths(
     );
 }
 
-fn editor_target_indices(
+pub(crate) fn editor_target_indices(
     document: &SettingsBytecode,
     filter: &EditorPropertyFilter,
 ) -> (HashSet<usize>, HashSet<usize>) {
@@ -382,7 +432,7 @@ fn editor_target_indices(
     (target_indices, selected_indices)
 }
 
-fn expand_ambiguous_editor_siblings<'a>(
+pub(crate) fn expand_ambiguous_editor_siblings<'a>(
     document: &'a SettingsBytecode,
     selected_indices: &mut HashSet<usize>,
 ) -> EditorSiblingGroupCounts<'a> {
@@ -409,7 +459,7 @@ fn expand_ambiguous_editor_siblings<'a>(
     sibling_groups
         .into_iter()
         .filter_map(|((parent_index, name), siblings)| {
-            parent_index.map(|parent_index| ((parent_index, name), siblings.len()))
+            parent_index.map(|parent_index| ((parent_index, name), siblings))
         })
         .collect()
 }

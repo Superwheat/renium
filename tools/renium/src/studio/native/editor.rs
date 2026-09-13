@@ -4401,13 +4401,17 @@ pub(crate) fn send_editor_change_batches(
             rows.extend(material_changes);
             rows.retain(|row| payload_verified_services.contains(&row.service));
         }
-        verify_native_property_rows(
+        let verified_fields = verify_native_property_rows(
             bridge,
             &rows,
             transaction_id.context("Native verification requires a transaction")?,
             &native_root_verification,
             &mut summary,
         )?;
+        let expected_fields = rows
+            .iter()
+            .map(|row| row.properties.len() + row.attributes.len() + row.deleted_attributes.len())
+            .sum::<usize>();
         // The native factory or detached tree checked its complete receipt. Verify the
         // retained containers and every value applied outside that reader here,
         // rather than exporting all newly loaded instances a second time.
@@ -4416,8 +4420,9 @@ pub(crate) fn send_editor_change_batches(
             .groups
             .iter()
             .filter(|group| {
-                (import.native_replacement.is_some()
-                    || payload_verified_services.contains(&group.service))
+                verified_fields == expected_fields as u64
+                    && (import.native_replacement.is_some()
+                        || payload_verified_services.contains(&group.service))
                     && !import
                         .groups
                         .iter()

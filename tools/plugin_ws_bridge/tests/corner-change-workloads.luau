@@ -125,7 +125,9 @@ local codec = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeValueCodec.mod
 local dependencies = { BridgeScriptDocuments = { readSource = function(instance) return true, instance.Source end }, BridgeValueCodec = codec, BridgeValueEquality = require("../BridgeValueEquality.module"),
 	BridgeIdentity = require("../BridgeIdentity.module"),
 	BridgeContent = require("../BridgeContent.module"),
-	RbxDom = { getContentPropertyAliases = contentAliases, findCanonicalPropertyDescriptor = function() return { dataType = "UDim" } end } }
+	RbxDom = { getContentPropertyAliases = contentAliases,
+		getReferencePropertyNames = function(className) return if className == "SpringConstraint" then { "Attachment0", "Attachment1" } else {} end,
+		findCanonicalPropertyDescriptor = function() return { dataType = "UDim" } end } }
 local deferred = nil
 local capturedDelays = nil
 local function flushDeferred()
@@ -1592,6 +1594,118 @@ do
 	testGame.ItemChanged = savedItemChanged
 end
 print("Push completion: combined acknowledgment/release retains newer edits and persistent tracking; repeated completion is safe")
+
+do
+	local savedItemChanged = testGame.ItemChanged
+	testGame.ItemChanged = signal()
+	local observer = trackerModule.create(trackerConfig, { ReplicatedStorage = true })
+	observer.configurePropertyCandidates({ Part = { "Transparency" } })
+	observer.getState({ services = { "ReplicatedStorage" }, trackingGuardId = "preflight" })
+	observer.beginChangeJournal("import", { "ReplicatedStorage" })
+	local generation = observer.serviceGeneration("ReplicatedStorage")
+	observer.getState({ start = false, releaseTrackingGuardId = "preflight" })
+	assert(observer.serviceGeneration("ReplicatedStorage") == generation,
+		"Export guard release invalidated the active import fence")
+	assert(observer.getState({ start = false }).tracking, "Transaction lost its listeners")
+	moving.Transparency = 0.731
+	testGame.ItemChanged:Fire(moving, "Transparency")
+	local records = observer.finishChangeJournal("import")
+	assert(#records == 1 and records[1].instance == moving
+		and records[1].properties.Transparency.value == 0.731,
+		"Concurrent edits after export guard release must survive rollback")
+	assert(not observer.getState({ start = false }).tracking, "Completed transaction leaked transient tracking")
+	observer.stop()
+	testGame.ItemChanged = savedItemChanged
+end
+print("Import journal retains tracking after export guard release and releases it at completion")
+
+do
+	local savedItemChanged = testGame.ItemChanged
+	for _, shared in { false, true } do
+		for _, native in { false, true } do
+			testGame.ItemChanged = if shared then signal() else nil
+			local observer = trackerModule.create(trackerConfig, { ReplicatedStorage = true })
+			observer.configurePropertyCandidates({ SpringConstraint = { "Attachment0", "Attachment1", "Thickness", "Radius", "FreeLength" } })
+			observer.getState({ services = { "ReplicatedStorage" }, trackingGuardId = "references" })
+			observer.beginChangeJournal("references", { "ReplicatedStorage" })
+			observer.beginSuppress()
+			local fresh = instance("SpringConstraint", "IncomingConstraint")
+			function fresh:IsA(class) return class == "SpringConstraint" or class == "Constraint" or class == "Instance" end
+			function fresh:GetDebugId() return "incoming-constraint" end
+			fresh.Attachment0 = moving
+			fresh.Thickness, fresh.Radius, fresh.FreeLength = 0.13, 0.7, 3.7
+			local token
+			if native then
+				observer.beginNativeImportObservations("references")
+			else
+				token = observer.expectParentChange(fresh, storage, nil, true)
+			end
+			fresh.Parent = storage
+			table.insert(storage.children, fresh)
+			storage.DescendantAdded:Fire(fresh)
+			if token and token.complete then token.complete() end
+			local generation = observer.serviceGeneration("ReplicatedStorage")
+			local function changed(name)
+				if shared then testGame.ItemChanged:Fire(fresh, name) else fresh.Changed:Fire(name) end
+			end
+			changed("Attachment0")
+			changed("Attachment1")
+			changed("Thickness")
+			changed("Radius")
+			changed("FreeLength")
+			assert(observer.serviceGeneration("ReplicatedStorage") == generation,
+				"Loaded reference notifications must not invent an outside edit")
+			fresh.Attachment0 = sibling
+			changed("Attachment0")
+			fresh.Attachment1 = moving
+			changed("Attachment1")
+			fresh.FreeLength = 5
+			changed("FreeLength")
+			if native then observer.finishNativeImportObservations("references", { ["incoming-constraint"] = "SpringConstraint" }) end
+			local records = observer.drainChangeJournal("references")
+			assert(#records == 1 and records[1].properties.Attachment0.value == sibling
+				and records[1].properties.Attachment1.value == moving,
+				"Actual edits of loaded and null references must survive rollback")
+			assert(records[1].properties.FreeLength.value == 5 and records[1].properties.Radius == nil
+				and records[1].properties.Thickness == nil, "Keep real scalar edits without journaling unchanged initialization")
+			fresh.Attachment0 = nil
+			changed("Attachment0")
+			records = observer.finishChangeJournal("references")
+			assert(#records == 1 and records[1].properties.Attachment0.captured
+				and records[1].properties.Attachment0.value == nil)
+			observer.endSuppress(0)
+			observer.stop()
+			assert(fresh.Changed:Count() == 0, "Imported reference listener leaked")
+			table.remove(storage.children, table.find(storage.children, fresh))
+		end
+	end
+	testGame.ItemChanged = savedItemChanged
+end
+print("Imported references: repeated notifications are no-ops; changed targets and cleared references remain journaled")
+do
+	local fresh = instance("SpringConstraint", "ExistingConstraint")
+	function fresh:IsA(class) return class == "SpringConstraint" or class == "Constraint" or class == "Instance" end
+	fresh.Radius, fresh.Thickness, fresh.FreeLength = 0.7, 0.13, 3.7
+	fresh.Parent = storage
+	table.insert(storage.children, fresh)
+	local observer = trackerModule.create(trackerConfig, { ReplicatedStorage = true })
+	observer.configurePropertyCandidates({ SpringConstraint = { "Radius", "Thickness", "FreeLength" } })
+	observer.getState({ services = { "ReplicatedStorage" } })
+	observer.beginChangeJournal("existing-constraint", { "ReplicatedStorage" })
+	local function changed(name)
+		if testGame.ItemChanged then testGame.ItemChanged:Fire(fresh, name) else fresh.Changed:Fire(name) end
+	end
+	changed("Radius")
+	changed("Thickness")
+	changed("FreeLength")
+	assert(#observer.drainChangeJournal("existing-constraint") == 0, "Existing package constraints need their loaded scalar baseline too")
+	fresh.FreeLength = 7
+	changed("FreeLength")
+	local records = observer.finishChangeJournal("existing-constraint")
+	assert(#records == 1 and records[1].properties.FreeLength.value == 7)
+	observer.stop()
+	table.remove(storage.children, table.find(storage.children, fresh))
+end
 
 do
 	local savedItemChanged = testGame.ItemChanged

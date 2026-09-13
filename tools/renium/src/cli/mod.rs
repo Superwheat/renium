@@ -1699,6 +1699,7 @@ pub(super) struct BytecodeExplorerBatchArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct BytecodeExplorerBatchRequest {
     pub(super) ops: Vec<BytecodeExplorerBatchOp>,
 }
@@ -1711,7 +1712,7 @@ pub(super) enum BytecodeBatchFields {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct BytecodeExplorerBatchOp {
     #[serde(rename = "type", alias = "op", alias = "kind")]
     pub(super) op: String,
@@ -1739,7 +1740,12 @@ pub(super) struct BytecodeExplorerBatchOp {
         alias = "parent_id"
     )]
     pub(super) parent_settings_id: Option<String>,
-    #[serde(alias = "path", alias = "path_segments")]
+    #[serde(
+        default,
+        alias = "path",
+        alias = "path_segments",
+        deserialize_with = "deserialize_batch_path"
+    )]
     pub(super) path_segments: Option<Vec<String>>,
     #[serde(default, alias = "ords", alias = "path_ordinals")]
     pub(super) path_ordinals: Vec<usize>,
@@ -1748,6 +1754,26 @@ pub(super) struct BytecodeExplorerBatchOp {
     #[serde(default, alias = "attrs")]
     pub(super) attributes: Vec<String>,
     pub(super) tag: Option<String>,
+}
+
+fn deserialize_batch_path<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<serde_json::Value>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(serde_json::Value::String(path)) => crate::bytecode::parse_path_segments(&path)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        Some(value @ serde_json::Value::Array(_)) => {
+            serde_json::from_value(value).map(Some).map_err(|error| {
+                serde::de::Error::custom(format!("path must contain only string segments: {error}"))
+            })
+        }
+        Some(_) => Err(serde::de::Error::custom(
+            "path must be a string or an array of string segments",
+        )),
+    }
 }
 
 #[derive(Parser)]

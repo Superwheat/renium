@@ -18,10 +18,13 @@ mod import;
 mod loader;
 #[path = "windows_observation.rs"]
 mod observation;
+#[path = "windows_package_notice.rs"]
+mod package_notice;
 #[path = "windows_properties.rs"]
 mod properties;
 pub(crate) use import::{CREATED_ROW, read_service_payload};
 pub(crate) use observation::{AttributeGuard, begin_attribute_guard, begin_attribute_relay};
+pub(crate) use package_notice::suppress_package_notices;
 #[cfg(test)]
 #[path = "windows_sampler_tests.rs"]
 mod sampler_tests;

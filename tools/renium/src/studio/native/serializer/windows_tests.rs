@@ -1216,3 +1216,69 @@ fn protected_property_rejects_replaced_live_targets() -> Result<()> {
     run("workspace.ReniumAccessReplacement:Destroy()")?;
     Ok(())
 }
+
+#[test]
+#[ignore = "Requires an owned ReniumRollback fixture and RENIUM_SCALE_TEST_PID"]
+fn native_model_scale_preserves_descendant_geometry() -> Result<()> {
+    let pid = std::env::var("RENIUM_SCALE_TEST_PID")?.parse()?;
+    let title = "ReniumRollback.rbxl";
+    let executable =
+        std::env::var_os("RENIUM_LIVE_TEST_RBX").context("Set RENIUM_LIVE_TEST_RBX")?;
+    let run = |code: &str| -> Result<serde_json::Value> {
+        let output = std::process::Command::new(&executable)
+            .current_dir("../../audit/racing-import-recovery-20260913/rollback-fixture")
+            .args(["--place", title, "l", code])
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        anyhow::ensure!(response["ok"] == true, "{response}");
+        Ok(response)
+    };
+    let setup = run(r#"
+assert(game.PlaceId == 0)
+local storage = game:GetService("ServerStorage")
+assert(not storage:FindFirstChild("ReniumScaleMetadataProbe"))
+shared.ReniumScaleRecording = assert(game:GetService("ChangeHistoryService"):TryBeginRecording("Renium scale test"))
+local model = Instance.new("Model")
+model.Name = "ReniumScaleMetadataProbe"
+local part = Instance.new("Part")
+part.Size, part.Parent = Vector3.new(3, 4, 5), model
+model.Parent = storage
+return shared.ReniumScaleRecording
+"#)?;
+    let token = setup["results"][0].as_str().context("Missing recording")?;
+    register_history(pid, title, token)?;
+    let path = ["ServerStorage".into(), "ReniumScaleMetadataProbe".into()];
+    let mut property = prepare_property(
+        pid,
+        title,
+        &path,
+        &[],
+        "ScaleFactor",
+        Duration::from_secs(3),
+    )?;
+    assert_eq!(property.read()?, "1");
+    property.ensure_writable()?;
+    property.write("0.95")?;
+    run(r#"
+local model = game:GetService("ServerStorage").ReniumScaleMetadataProbe
+assert(math.abs(model:GetScale() - 0.95) < 0.000001)
+assert(model.Part.Size == Vector3.new(3, 4, 5), "Scale metadata resized saved geometry")
+local history = game:GetService("ChangeHistoryService")
+history:FinishRecording(shared.ReniumScaleRecording, Enum.FinishRecordingOperation.Commit)
+history:Undo()
+assert(model.Parent == nil, "Undo retained the imported model")
+history:Redo()
+assert(model.Parent == game:GetService("ServerStorage"), "Redo lost the imported model")
+assert(math.abs(model:GetScale() - 0.95) < 0.000001)
+assert(model.Part.Size == Vector3.new(3, 4, 5), "Redo changed imported geometry")
+shared.ReniumScaleRecording = nil
+return true
+"#)?;
+    run("game:GetService(\"ServerStorage\").ReniumScaleMetadataProbe:Destroy(); return true")?;
+    Ok(())
+}

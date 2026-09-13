@@ -56,6 +56,19 @@ import {
 } from "./fileExplorerCore";
 
 const MAX_STORE_DROPPED_BASE64_CHARS = 4 * Math.ceil(MAX_STORE_DROPPED_BYTES / 3);
+
+type HistoryRevertResult = {
+  ok?: boolean;
+  store?: string;
+  changedPaths?: string[];
+};
+
+export type HistoryRestoreOutcome = {
+  changedPaths: string[];
+  changedServices: string[];
+  restored: number;
+  failure?: { id: string; label: string; message: string };
+};
 const MUTATION_MESSAGE_TYPES = new Set([
   "restoreHistory", "restoreHistoryGroup", "addInstance", "createInstance", "renameInstance", "moveInstance",
   "deleteInstance", "desyncPackageLink", "pasteInstance", "duplicateInstance", "importModel", "createLink",
@@ -1677,12 +1690,14 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
     return startUnixMs === endUnixMs ? `${date} ${endTime}` : `${date} ${startTime}-${endTime}`;
   }
 
-  private readHistoryManifest(id: string | undefined): { manifest: EditorHistoryManifest; entryDir: string } | undefined {
+  private readHistoryManifest(
+    id: string | undefined,
+    config: ExplorerConfig = getExplorerConfig(),
+  ): { manifest: EditorHistoryManifest; entryDir: string } | undefined {
     const safeId = String(id ?? "").trim();
     if (!safeId || safeId.includes("/") || safeId.includes("\\")) {
       return undefined;
     }
-    const config = getExplorerConfig();
     const historyRoot = editorHistoryRoot(config);
     const entryDir = path.join(historyRoot, safeId);
     const manifestPath = path.join(entryDir, "manifest.json");
@@ -1811,84 +1826,64 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
     await this.restoreHistoryIds(restoreIds, groupId, true);
   }
 
-  private restoreHistoryFile(
-    config: ExplorerConfig,
-    historyRoot: string,
-    entryDir: string,
-    backupPath: string,
-    destination: string,
-  ): string | undefined {
-    const source = path.join(entryDir, backupPath);
-    if (!pathInsideRoot(historyRoot, source) || !fs.existsSync(source)) {
-      return undefined;
+  private revertHistoryEntry(config: ExplorerConfig, manifestPath: string): Promise<HistoryRevertResult> {
+    return runJsonCli<HistoryRevertResult>(config, ["editor-revert", "--project-root", config.projectRoot, "--path", manifestPath]);
+  }
+
+  public async applyHistoryRestores(config: ExplorerConfig, ids: string[]): Promise<HistoryRestoreOutcome> {
+    const historyRoot = editorHistoryRoot(config);
+    const outcome: HistoryRestoreOutcome = { changedPaths: [], changedServices: [], restored: 0 };
+    const services = new Set<string>();
+    for (const id of ids) {
+      const data = this.readHistoryManifest(id, config);
+      if (!data) {
+        outcome.failure = { id, label: id, message: "History entry was not found." };
+        break;
+      }
+      const manifest = data.manifest;
+      const service = String(manifest.service ?? "").trim();
+      const sourcePath = typeof manifest.sourcePath === "string" ? manifest.sourcePath : undefined;
+      const settingsId = typeof manifest.settingsId === "string" ? manifest.settingsId : undefined;
+      if (!service || (!sourcePath && !settingsId)) {
+        outcome.failure = { id, label: id, message: "History entry has no file or instance target." };
+        break;
+      }
+      const manifestPath = path.join(data.entryDir, "manifest.json");
+      if (!pathInsideRoot(historyRoot, manifestPath)) {
+        continue;
+      }
+      const label = sourcePath || (Array.isArray(manifest.pathSegments) ? manifest.pathSegments.join(".") : settingsId) || service;
+      let result: HistoryRevertResult;
+      try {
+        result = await this.revertHistoryEntry(config, manifestPath);
+      } catch (error) {
+        outcome.failure = { id, label, message: error instanceof Error ? error.message : String(error) };
+        break;
+      }
+      services.add(service);
+      outcome.restored += 1;
+      for (const changed of Array.isArray(result.changedPaths) ? result.changedPaths : []) {
+        if (typeof changed !== "string" || changed.length === 0) {
+          continue;
+        }
+        const absolute = path.isAbsolute(changed) ? path.normalize(changed) : path.normalize(path.join(config.projectRoot, changed));
+        if (!outcome.changedPaths.includes(absolute)) {
+          outcome.changedPaths.push(absolute);
+        }
+      }
     }
-    if (!projectGraphOwnsPath(config, destination)) {
-      throw new Error(`Refusing to restore history outside project sources: ${destination}`);
-    }
-    fs.mkdirSync(path.dirname(destination), { recursive: true });
-    fs.copyFileSync(source, destination);
-    return destination;
+    outcome.changedServices = Array.from(services);
+    return outcome;
   }
 
   private async restoreHistoryIds(ids: string[], completionId?: string, isGroup = false): Promise<void> {
     const config = getExplorerConfig();
-    const historyRoot = editorHistoryRoot(config);
-    const changedPaths: string[] = [];
-    const changedServices = new Set<string>();
     await withPausedFileWrites(
       (request) => vscode.commands.executeCommand("renium.noteProgrammaticEditorWrite", request),
       async () => {
-        for (const id of ids) {
-          const data = this.readHistoryManifest(id);
-          if (!data) {
-            continue;
-          }
-          const manifest = data.manifest;
-          const service = String(manifest.service ?? "").trim();
-          const sourcePath = typeof manifest.sourcePath === "string" ? manifest.sourcePath : undefined;
-          const settingsId = typeof manifest.settingsId === "string" ? manifest.settingsId : undefined;
-          if (!service || (!sourcePath && !settingsId)) {
-            continue;
-          }
-          changedServices.add(service);
-
-          if (typeof manifest.settingsBackup === "string") {
-            const configuredSettingsFile = typeof manifest.settingsFile === "string"
-              ? manifest.settingsFile
-              : settingsFileForService(config, service);
-            const destination = path.isAbsolute(configuredSettingsFile)
-              ? path.normalize(configuredSettingsFile)
-              : path.normalize(path.join(config.projectRoot, configuredSettingsFile));
-            const restored = this.restoreHistoryFile(
-              config,
-              historyRoot,
-              data.entryDir,
-              manifest.settingsBackup,
-              destination,
-            );
-            if (restored) {
-              changedPaths.push(restored);
-            }
-          }
-
-          if (typeof manifest.sourceBackup === "string" && sourcePath) {
-            const destination = path.isAbsolute(sourcePath)
-              ? path.normalize(sourcePath)
-              : path.normalize(path.join(config.projectRoot, sourcePath));
-            const restored = this.restoreHistoryFile(
-              config,
-              historyRoot,
-              data.entryDir,
-              manifest.sourceBackup,
-              destination,
-            );
-            if (restored) {
-              changedPaths.push(restored);
-            }
-          }
-        }
-
-        for (const service of this.model.servicesFromSettingsFiles(changedPaths)) {
+        const outcome = await this.applyHistoryRestores(config, ids);
+        const changedServices = new Set(outcome.changedServices);
+        for (const service of this.model.servicesFromSettingsFiles(outcome.changedPaths)) {
           changedServices.add(service);
         }
         const services = Array.from(changedServices);
@@ -1898,18 +1893,23 @@ export class FileExplorerViewProvider implements vscode.WebviewViewProvider {
           await this.requestRows(this.rowWindow.start, this.rowWindow.count, this.currentMode);
         }
         this.webviewView?.webview.postMessage({ type: "historyRestoreComplete", id: completionId, groupId: isGroup ? completionId : undefined });
-        vscode.window.showInformationMessage(isGroup ? "History session restored locally." : "History entry restored locally.");
+        if (!outcome.failure) {
+          vscode.window.showInformationMessage(isGroup ? "History session restored locally." : "History entry restored locally.");
+        }
 
-        if (changedPaths.length > 0) {
-          const uniqueChangedPaths = Array.from(new Set(changedPaths));
+        if (outcome.changedPaths.length > 0) {
           try {
-            await vscode.commands.executeCommand("renium.pushEditorPathsNow", uniqueChangedPaths, {
+            await vscode.commands.executeCommand("renium.pushEditorPathsNow", outcome.changedPaths, {
               projectRoot: config.projectRoot,
               taskName: "History restore -> Studio sync",
             });
           } catch (error) {
             vscode.window.showErrorMessage(`Failed to push restored history. ${error instanceof Error ? error.message : String(error)}`);
           }
+        }
+        if (outcome.failure) {
+          const progress = isGroup ? ` ${outcome.restored} of ${ids.length} items were restored before this one.` : "";
+          throw new Error(`${outcome.failure.label}: ${outcome.failure.message}${progress}`);
         }
       },
       async () => [],

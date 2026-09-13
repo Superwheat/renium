@@ -1,10 +1,10 @@
 local NetworkSimulation = {}
 
 local properties = {
-	{ "inDelay", "InboundNetworkMinDelayMs", 100 },
-	{ "outDelay", "OutboundNetworkMinDelayMs", 100 },
-	{ "inJitter", "InboundNetworkJitterMs", 100 },
-	{ "outJitter", "OutboundNetworkJitterMs", 100 },
+	{ "inDelay", "InboundNetworkMinDelayMs", 1000 },
+	{ "outDelay", "OutboundNetworkMinDelayMs", 1000 },
+	{ "inJitter", "InboundNetworkJitterMs", 1000 },
+	{ "outJitter", "OutboundNetworkJitterMs", 1000 },
 	{ "inLoss", "InboundNetworkLossPercent", 0.5 },
 	{ "outLoss", "OutboundNetworkLossPercent", 0.5 },
 }

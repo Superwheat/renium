@@ -1312,36 +1312,46 @@ pub(super) fn bytecode_get_property(args: BytecodeGetPropertyArgs) -> Result<()>
         return print_json_output(&value, args.pretty);
     }
     if matches!(scope, PropertyScope::Auto | PropertyScope::Property)
-        && !args.property.eq_ignore_ascii_case("source")
+        && let Some((_, value)) =
+            reflected_property_default(&document.instances[index].class_name, &args.property)
     {
-        let database =
-            rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
-        let class_name = document.instances[index].class_name.as_str();
-        let descriptor = rbx_model_property_descriptor(database, class_name, &args.property)
-            .or_else(|| rbx_property_descriptor(database, class_name, &args.property));
-        if let Some(default) = database
-            .classes
-            .get(class_name)
-            .and_then(|class| database.find_default_property(class, &args.property))
-            && let Some(value) = rbx_variant_to_settings_json(
+        return print_json_output(&value, args.pretty);
+    }
+    bail!("Property not found: {}", args.property)
+}
+
+fn reflected_property_default(class_name: &str, name: &str) -> Option<(String, Value)> {
+    if ["Source", "Name", "ClassName", "Parent"]
+        .iter()
+        .any(|key| name.eq_ignore_ascii_case(key))
+    {
+        return None;
+    }
+    let database = rbx_reflection_database::get().ok()?;
+    let class = database.classes.get(class_name)?;
+    let logical_name = rbx_logical_property_name(database, class_name, name)?;
+    let property = rbx_property_descriptor(database, class_name, logical_name)?;
+    let descriptor =
+        rbx_model_property_descriptor(database, class_name, property.name).unwrap_or(property);
+    let value = database
+        .find_default_property(class, descriptor.name)
+        .or_else(|| database.find_default_property(class, property.name))
+        .and_then(|default| {
+            rbx_variant_to_settings_json(
                 default,
-                descriptor,
+                Some(descriptor),
                 database,
                 &BytecodeModelImportRefs::default(),
             )
-        {
-            return print_json_output(&value, args.pretty);
-        }
-        if descriptor.is_some_and(|descriptor| {
+        })
+        .or_else(|| {
             matches!(
                 descriptor.data_type,
                 RbxDataType::Value(RbxVariantType::Ref)
             )
-        }) {
-            return print_json_output(&Value::Null, args.pretty);
-        }
-    }
-    bail!("Property not found: {}", args.property)
+            .then_some(Value::Null)
+        })?;
+    Some((logical_name.to_string(), value))
 }
 
 pub(super) fn bytecode_set_property(args: BytecodeSetPropertyArgs) -> Result<()> {

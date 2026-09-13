@@ -343,13 +343,19 @@ guide. Installation never builds or executes a plugin. Install only trusted nati
 
 ## Build
 
-From the repository root:
+Run Cargo from `tools/renium` so it uses the pinned Rust toolchain:
 
 ```powershell
-cargo build --locked --release --manifest-path tools/renium/Cargo.toml
-cargo test --locked --manifest-path tools/renium/Cargo.toml
+cd tools/renium
+cargo build --locked --release
+cargo test --locked
+cd ../..
 ./tools/build-release.ps1 -LocalBuild
 ```
+
+Release builds retain optimized code between edits. Keep `target/` to benefit from
+the cache; the first build takes longer. ThinLTO and full release optimization
+remain enabled.
 
 The last command bundles the CLI, extension, and plugin. Before replacing a locked
 installed executable, stop Renium with `rbx dm stop --all`, not unrelated Studio processes.

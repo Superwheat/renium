@@ -540,7 +540,14 @@ fn native_connection_preparation_does_not_block_registration_or_other_places() {
     let (resume, resumed) = std::sync::mpsc::channel();
     let resumed = Mutex::new(resumed);
     let first = AtomicBool::new(true);
+    let patched = Arc::new(AtomicUsize::new(0));
+    let patch_count = Arc::clone(&patched);
     let preparation = Arc::new(NativeConnectionPreparation {
+        patch_notices: Box::new(move |pid| {
+            assert_eq!(pid, std::process::id());
+            patch_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }),
         pending: Default::default(),
         prepare: Box::new(move |pid, title| {
             assert_eq!(pid, std::process::id());
@@ -558,6 +565,11 @@ fn native_connection_preparation_does_not_block_registration_or_other_places() {
     });
     let bridge = listening_fixture_with_preparation(Some(Arc::clone(&preparation)));
     let _first_peer = handshake(&bridge, 0, &edit_info("native-one", 1)).unwrap();
+    assert_eq!(
+        patched.load(Ordering::SeqCst),
+        1,
+        "patch must precede registration acknowledgment"
+    );
     assert_eq!(
         entries.recv_timeout(Duration::from_secs(1)).unwrap(),
         "place-1"
@@ -583,6 +595,11 @@ fn native_connection_preparation_does_not_block_registration_or_other_places() {
         json!({"working": true})
     );
     let _play = handshake(&bridge, 1, &client_info("native-play", "manual")).unwrap();
+    assert_eq!(
+        patched.load(Ordering::SeqCst),
+        3,
+        "Edit channels must be patched; Play is excluded"
+    );
     assert!(
         entries.try_recv().is_err(),
         "play or duplicate channel started native discovery"
@@ -1593,4 +1610,18 @@ fn edit_status_response_filters_a_reconnected_daemons_previously_captured_invent
     assert_eq!(bridge.player_runtime_ids(), ["f2-current"]);
     drop(bridge);
     reply.join().unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn failed_package_notice_patch_does_not_admit_unprotected_editor_commands() {
+    let preparation = Arc::new(NativeConnectionPreparation {
+        patch_notices: Box::new(|_| bail!("fixture unsupported package notice layout")),
+        pending: Default::default(),
+        prepare: Box::new(|_, _| panic!("unprotected connection must not reach warmup")),
+    });
+    let bridge = listening_fixture_with_preparation(Some(preparation));
+    assert!(handshake(&bridge, 0, &edit_info("unpatched", 1)).is_none());
+    assert!(bridge.channels[0].sockets.lock().unwrap().is_empty());
+    bridge.alive.store(false, Ordering::Relaxed);
 }

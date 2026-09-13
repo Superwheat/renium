@@ -556,6 +556,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	local rebuildExportInstances
 	local prepareParentObservers
 	local releaseJournalObservers
+	local stopTracking
 	local changeIdentityByInstance = setmetatable({}, { __mode = "k" })
 	local nextChangeIdentity = 0
 	local pendingView = nil
@@ -950,6 +951,41 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		return state.mutationSeqByService[serviceName] or 0
 	end
 
+	function api.describeJournalChange(serviceName: string): string
+		local journal = state.changeJournal
+		for _, record in ipairs(if journal then journal.records else {}) do
+			if record.services[serviceName] then
+				local fields = {}
+				for name, entry in pairs(record.properties) do
+					fields[#fields + 1] = if entry.captured and entry.value == nil then name .. "=nil" else name
+				end
+				for name in pairs(record.attributes) do
+					fields[#fields + 1] = "attribute " .. name
+				end
+				if record.structural then
+					fields[#fields + 1] = "hierarchy"
+				end
+				if record.tagsChanged then
+					fields[#fields + 1] = "tags"
+				end
+				if record.attributesSnapshot then
+					fields[#fields + 1] = "attributes"
+				end
+				local path = table.concat(record.pathSegments or { record.instance.Name }, ".")
+				local origin = if journal.detachedInstances[record.instance] then "detached original"
+					else if nativeInitialParent(record.instance) then "native incoming" else "live"
+				return `{path} ({table.concat(fields, ", ")}; {origin})`
+			end
+		end
+		local latest
+		for _, change in pairs(state.changeLogByKey) do
+			if change.service == serviceName and (latest == nil or change.seq > latest.seq) then
+				latest = change
+			end
+		end
+		return if latest then `{latest.path or serviceName}: {latest.reason or latest.action}` else "no retained event"
+	end
+
 	function api.checkpointGeneration(serviceName: string): number
 		return state.checkpointSeqByService[serviceName] or 0
 	end
@@ -1041,6 +1077,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		state.changeJournal = nil
 		if journal ~= nil then
 			releaseJournalObservers(journal)
+		end
+		if not state.persistentTracking and next(state.trackingGuards) == nil then
+			stopTracking()
 		end
 		return records
 	end
@@ -2878,6 +2917,19 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			and nativeAttributeRelay.services[serviceName] == true
 		state.connectionServiceByInstance[instance] = serviceName
 		local journal = state.changeJournal
+		-- Existing constraints can notify as well when package contents are
+		-- staged. Their first unchanged notification needs a baseline too.
+		if instance:IsA("Constraint") then
+			primeCurrentProperties(instance)
+		end
+		if nativeInsertion or serializedInsertion then
+			-- Constraint references can notify again when the loaded hierarchy
+			-- becomes live. Compare against their loaded identities so those
+			-- notifications stay no-ops while real reference edits are journaled.
+			for _, propertyName in ipairs(RbxDomModule.getReferencePropertyNames(instance.ClassName)) do
+				primeExpectedProperty(instance, propertyName)
+			end
+		end
 		if nativeInsertion and nativeAttributes and state.itemChangedAvailable then
 			-- Shared property/attribute signals are already armed. No tag scan or
 			-- duplicate parent maps are needed for a proved untagged native class.
@@ -3347,6 +3399,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	end
 
 	local function unwatchService(serviceName: string, preservePending: boolean?)
+		if state.changeJournal and state.changeJournal.services[serviceName] then
+			return
+		end
 		local service = state.serviceRoots[serviceName]
 		if service == nil then
 			return
@@ -3384,7 +3439,13 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 	end
 
-	local function stopTracking()
+	stopTracking = function(force: boolean?)
+		-- A transaction owns observation independently of temporary export guards.
+		-- Releasing the last export must not invalidate its generation fence or
+		-- disconnect the listeners needed to preserve concurrent edits on rollback.
+		if state.changeJournal ~= nil and not force then
+			return
+		end
 		if nativeTerrainRelay then
 			nativeTerrainRelay.connection:Disconnect()
 			nativeTerrainRelay.notify:Destroy()
@@ -4072,7 +4133,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 		exportStructureObserver = nil
 		exportPropertyObserver = nil
-		stopTracking()
+		stopTracking(true)
 		for serviceName in pairs(serviceSignals) do
 			releaseServiceSignals(serviceName)
 		end

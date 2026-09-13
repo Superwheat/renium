@@ -662,6 +662,23 @@ impl<'a> EditorTransaction<'a> {
             auto_desync_confirmed: false,
         };
 
+        // A newly imported package has no live root for native desync preflight.
+        // Its first edits can still open Studio's package notice on Windows/macOS.
+        if package_mutation
+            || binary_import.is_some_and(|import| {
+                import
+                    .groups
+                    .iter()
+                    .any(|group| !group.package_roots.is_empty())
+            })
+        {
+            transaction.package_dialog = Some(
+                studio_pid_for_bridge(bridge)
+                    .and_then(crate::studio::input::watch_package_changes_dialog)
+                    .context("Package changes cannot be applied without a dialog watcher")?,
+            );
+        }
+
         #[cfg(any(windows, target_os = "macos"))]
         if binary_import.is_some()
             || package_mutation
@@ -778,11 +795,6 @@ impl<'a> EditorTransaction<'a> {
                 .iter()
                 .map(|package| package.path_segments.join("."))
                 .collect();
-            transaction.package_dialog = Some(
-                studio_pid_for_bridge(bridge)
-                    .and_then(crate::studio::input::watch_package_changes_dialog)
-                    .context("Package changes cannot be applied without a dialog watcher")?,
-            );
         }
         Ok(Some(transaction))
     }
@@ -825,9 +837,13 @@ impl<'a> EditorTransaction<'a> {
     }
 
     fn finish_rollback(&mut self) -> Result<()> {
-        self.package_dialog.take();
         self.restore_auto_desynced_packages()?;
         self.active = false;
+        if let Some(watcher) = self.package_dialog.take() {
+            watcher
+                .finish()
+                .context("Studio did not finish accepting rollback package changes")?;
+        }
         Ok(())
     }
 
@@ -943,21 +959,20 @@ impl<'a> EditorTransaction<'a> {
         if !self.active {
             return Ok(());
         }
-        self.package_dialog.take();
         self.restore_auto_desynced_packages()?;
         let rollback_result = self.bridge.call(
             "rollbackEditorTransaction",
             json!({ "transactionId": &self.id }),
         );
-        let result = match rollback_result {
-            Ok(result) => result,
+        let (result, rollback_error) = match rollback_result {
+            Ok(result) => (result, None),
             Err(rollback_error) => {
                 let state_result = self.bridge.call(
                     "getEditorTransactionState",
                     json!({ "transactionId": &self.id }),
                 );
                 match state_result {
-                    Ok(result) => result,
+                    Ok(result) => (result, Some(rollback_error)),
                     Err(state_error) => {
                         return Err(rollback_error.context(format!(
                             "Studio rollback outcome could not be queried: {state_error:#}"
@@ -967,10 +982,7 @@ impl<'a> EditorTransaction<'a> {
             }
         };
         match editor_transaction_state(&result) {
-            Some("rolledBack") | None => {
-                self.active = false;
-                Ok(())
-            }
+            Some("rolledBack") | None => self.finish_rollback(),
             Some("committed") => {
                 self.active = false;
                 bail!("Studio had already committed the transaction; rollback was not performed")
@@ -979,9 +991,12 @@ impl<'a> EditorTransaction<'a> {
                 self.active = false;
                 bail!("Studio did not retain this transaction outcome; rollback is unconfirmed")
             }
-            Some("open" | "prepared") => bail!("Studio did not roll the transaction back"),
-            Some("rollbackFailed") => {
-                bail!("Studio retained the transaction because its rollback failed")
+            Some("open" | "prepared" | "rollbackFailed") => {
+                if let Some(error) = rollback_error {
+                    return Err(error
+                        .context("Studio retained the transaction because its rollback failed"));
+                }
+                bail!("Studio did not roll the transaction back: {result}")
             }
             Some(state) => bail!("Studio returned an invalid transaction state: {state}"),
         }
@@ -1096,6 +1111,7 @@ pub(crate) fn push_editor_changes(args: PushEditorChangesArgs) -> Result<()> {
 
 pub(crate) fn push_editor_changes_result(mut args: PushEditorChangesArgs) -> Result<Value> {
     args.changed_paths.append(&mut args.paths);
+    resolve_cli_push_paths(&mut args, &std::env::current_dir()?)?;
     apply_configured_project_layout(&mut args.project.project_root, &mut args.project.src_root)?;
     let incremental = !args.changed_paths.is_empty()
         || !args.changed_paths_files.is_empty()
@@ -1128,6 +1144,44 @@ pub(crate) fn push_editor_changes_result(mut args: PushEditorChangesArgs) -> Res
     )
 }
 
+fn resolve_cli_push_paths(args: &mut PushEditorChangesArgs, invocation_root: &Path) -> Result<()> {
+    // --place can rebind the project to places/<alias>. User-supplied paths still
+    // belong to the invoking directory, including paths read from a selection list.
+    for list_path in &args.changed_paths_files {
+        let list_path = absolutize_under(invocation_root, list_path);
+        let contents = fs::read_to_string(&list_path).with_context(|| {
+            format!("Failed to read changed paths file {}", list_path.display())
+        })?;
+        args.changed_paths.extend(
+            contents
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .map(PathBuf::from),
+        );
+    }
+    if !args.changed_paths_files.is_empty()
+        && args.changed_paths.is_empty()
+        && args.target_settings_ids.is_empty()
+        && args.target_settings_id_files.is_empty()
+        && args.target_properties.is_empty()
+    {
+        bail!("The changed paths files contain no paths; no push was performed");
+    }
+    args.changed_paths_files.clear();
+    for path in args
+        .changed_paths
+        .iter_mut()
+        .chain(&mut args.target_settings_id_files)
+    {
+        *path = absolutize_under(invocation_root, path);
+    }
+    if let Some(path) = &mut args.link_cache_dir {
+        *path = absolutize_under(invocation_root, path);
+    }
+    Ok(())
+}
+
 pub(crate) fn push_editor_changes_with_warm_bridge(
     args: PushEditorChangesArgs,
     bridge: &BridgeServer,
@@ -1145,6 +1199,7 @@ pub(crate) fn push_editor_changes_with_warm_bridge_guarded(
         bail!("A full push must use the managed replacement path; Studio was not changed");
     }
     let (changes, projection) = collect_project_editor_changes(&args)?;
+    validate_source_verification_selection(&args, &changes)?;
     push_editor_changes_with_collected(
         args,
         bridge,
@@ -1158,6 +1213,31 @@ pub(crate) fn push_editor_changes_with_warm_bridge_guarded(
             finalize_settings: None,
         },
     )
+}
+
+fn validate_source_verification_selection(
+    args: &PushEditorChangesArgs,
+    changes: &EditorChangeSet,
+) -> Result<()> {
+    if !args.verify_sources || !changes.source_changes.is_empty() {
+        return Ok(());
+    }
+    let selected_paths = expand_editor_changed_paths(args)?;
+    let selected_scripts = selected_paths.iter().any(|path| {
+        matches!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("lua" | "luau")
+        )
+    });
+    let empty_selection = !selected_paths.is_empty()
+        && changes.instance_changes.is_empty()
+        && changes.property_changes.is_empty();
+    if selected_scripts || empty_selection {
+        bail!(
+            "None of the requested scripts matched the selected project; no sources were pushed or verified. Check the paths and --place target"
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn push_reconciled_editor_changes_with_warm_bridge<F, G, H>(
@@ -3020,7 +3100,7 @@ fn verify_editor_source_changes(
         .filter_map(|index| failures.remove(index))
         .collect();
     Ok(EditorSourceVerification {
-        verified,
+        verified: verified - failed_indexes.len(),
         failed_indexes,
         failed,
     })
@@ -4194,6 +4274,89 @@ mod sync_tests {
         sort_post_commit_model_pivots(&mut changes);
         assert_eq!(changes[0].path_segments, ["Workspace", "Parent"]);
         assert_eq!(changes[1].path_segments, ["Workspace", "Parent", "Child"]);
+    }
+
+    #[test]
+    fn cli_push_keeps_invocation_paths_when_place_selection_rebinds_the_project() {
+        use crate::cli::ProjectSourceArgs;
+        let root = crate::tests::support::temp_dir("push-experience-paths");
+        let place = root.join("places/lobby");
+        let first = place.join("src/ServerScriptService/Main.server.luau");
+        let second = place.join("src/ReplicatedStorage/Config.luau");
+        fs::create_dir_all(first.parent().unwrap()).unwrap();
+        fs::create_dir_all(second.parent().unwrap()).unwrap();
+        fs::write(&first, "local updated = true").unwrap();
+        fs::write(&second, "return 42").unwrap();
+        fs::write(
+            root.join("paths.txt"),
+            "# selection\nplaces/lobby/src/ReplicatedStorage/Config.luau\n",
+        )
+        .unwrap();
+        let mut args = PushEditorChangesArgs::new(
+            ProjectSourceArgs {
+                project_root: root.clone(),
+                src_root: "src".into(),
+            },
+            BridgeConnectionArgs::local(0.1),
+        );
+        args.changed_paths
+            .push("places/lobby/src/ServerScriptService/Main.server.luau".into());
+        args.changed_paths_files.push("paths.txt".into());
+        args.verify_sources = true;
+        resolve_cli_push_paths(&mut args, &root).unwrap();
+        args.project.project_root = place;
+        let (changes, _) = collect_project_editor_changes(&args).unwrap();
+        validate_source_verification_selection(&args, &changes).unwrap();
+        assert_eq!(changes.source_changes.len(), 2);
+        assert_eq!(args.changed_paths, [first, second]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_verification_rejects_a_selection_that_matched_nothing() {
+        use crate::cli::ProjectSourceArgs;
+        let root = crate::tests::support::temp_dir("push-unmatched-source");
+        let source = root.join("outside.luau");
+        fs::write(&source, "return 1").unwrap();
+        let mut args = PushEditorChangesArgs::new(
+            ProjectSourceArgs {
+                project_root: root.clone(),
+                src_root: "src".into(),
+            },
+            BridgeConnectionArgs::local(0.1),
+        );
+        args.changed_paths.push(source.clone());
+        args.verify_sources = true;
+        assert!(
+            validate_source_verification_selection(&args, &EditorChangeSet::default()).is_err()
+        );
+        args.changed_paths = vec![root.clone()];
+        assert!(
+            validate_source_verification_selection(&args, &EditorChangeSet::default()).is_err()
+        );
+        fs::remove_file(&source).unwrap();
+        args.changed_paths = vec![source];
+        assert!(
+            validate_source_verification_selection(&args, &EditorChangeSet::default()).is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn empty_cli_path_list_cannot_become_a_full_push() {
+        use crate::cli::ProjectSourceArgs;
+        let root = crate::tests::support::temp_dir("push-empty-selection-list");
+        fs::write(root.join("paths.txt"), "# no changed files\n").unwrap();
+        let mut args = PushEditorChangesArgs::new(
+            ProjectSourceArgs {
+                project_root: root.clone(),
+                src_root: "src".into(),
+            },
+            BridgeConnectionArgs::local(0.1),
+        );
+        args.changed_paths_files.push("paths.txt".into());
+        assert!(resolve_cli_push_paths(&mut args, &root).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

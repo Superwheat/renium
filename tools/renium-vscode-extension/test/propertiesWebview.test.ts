@@ -47,13 +47,33 @@ function webview() {
     setTimeout: schedule, setInterval: schedule,
     clearTimeout: (id: number) => timers.delete(id), clearInterval: (id: number) => timers.delete(id),
   });
-  for (const name of ["createAudioPreviewRow", "makeNumberStepperButton", "render"]) {
+  for (const name of ["createAudioPreviewRow", "makeNumberStepperButton", "render", "createSubRows", "createSubRowsForSubProperty"]) {
     const fn = tree.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === name);
     assert.ok(fn, `Missing production function ${name}`);
     vm.runInContext(fn.getText(tree), context);
   }
   return { context, document, window, timers, seeks, run: (code: string) => vm.runInContext(code, context) };
 }
+
+test("CFrame webview orientation edits carry the other axes and position", () => {
+  const view = webview();
+  view.run(`
+    var editors = {};
+    createExpandableSubProperty = (parent, sub, name, update) => {
+      createSubRowsForSubProperty(parent, sub, name, update);
+      return document.createElement("div");
+    };
+    createSubSubRow = (parent, name, axis, value, update) => {
+      editors[name + "." + axis] = update;
+      return document.createElement("div");
+    };
+    createSubRows({ name: "CFrame", type: "CFrame", value: {
+      Position: {X:1,Y:2,Z:3}, Rotation: {X:30,Y:45,Z:60}
+    }});
+  `);
+  const result = JSON.parse(view.run('JSON.stringify(editors["Orientation.Y"](90))'));
+  assert.deepEqual(result, { Position: { X: 1, Y: 2, Z: 3 }, Rotation: { X: 30, Y: 90, Z: 60 } });
+});
 
 test("Sound rows do not retain document listeners; drag handlers end on release, blur and rerender", () => {
   const view = webview();

@@ -2568,6 +2568,43 @@ fn reconcile_instance_changes_describe_ambiguous_siblings() {
 }
 
 #[test]
+fn reconcile_duplicate_matching_includes_implicit_sibling_defaults() {
+    let mut front = settings_instance("front", "Texture", "Texture", Some(0));
+    front.properties.insert(
+        "UniqueId".into(),
+        json!({"_type":"UniqueId", "value":"00000000000000000000000000000000"}),
+    );
+    let mut right = settings_instance("right", "Texture", "Texture", Some(0));
+    right
+        .properties
+        .insert("Face".into(), json!({"_type":"EnumItem", "name":"Right"}));
+    let document = settings_document(vec![
+        settings_instance("root", "Workspace", "Workspace", None),
+        front,
+        right,
+    ]);
+    let mut changes = EditorChangeSet::default();
+    append_editor_instance_reconcile(&mut changes, &document, "Workspace");
+    let front = changes.instance_changes[0]
+        .instances
+        .iter()
+        .find(|entry| entry.settings_id == "front")
+        .unwrap();
+    assert_eq!(front.match_properties["Face"]["name"], "Front");
+    assert!(!front.match_properties.contains_key("UniqueId"));
+    assert!(
+        !front.match_properties.contains_key("Transparency"),
+        "Do not inflate matching with unrelated defaults"
+    );
+    let right = changes.instance_changes[0]
+        .instances
+        .iter()
+        .find(|entry| entry.settings_id == "right")
+        .unwrap();
+    assert_eq!(right.match_properties["Face"]["name"], "Right");
+}
+
+#[test]
 fn editor_review_payload_keeps_every_instance_row() {
     let instances = (0..5001)
         .map(|index| EditorInstanceDescriptor {
@@ -2844,6 +2881,105 @@ fn prepared_dom_leaves_preserve_values_order_references_and_unique_ids() {
             RbxVariant::Bool(false)
         );
     }
+}
+
+#[test]
+fn place_export_preserves_modern_lighting_without_remigrating_it() {
+    let root = temp_dir("place-lighting-migration");
+    fs::create_dir_all(root.join("Lighting")).unwrap();
+    for modern in [false, true] {
+        for explicit_technology in [None, Some(4)] {
+            for explicit_migration in [None, Some(false), Some(true)] {
+                let mut lighting = settings_instance("root", "Lighting", "Lighting", None);
+                lighting.properties.insert("Brightness".into(), json!(3));
+                lighting.attributes.insert("Authored".into(), json!("keep"));
+                if let Some(value) = explicit_technology {
+                    lighting.properties.insert(
+                        "Technology".into(),
+                        json!({"_type":"EnumItem","enumType":"Enum.Technology","name":"Future","value":value}),
+                    );
+                }
+                if modern {
+                    lighting.properties.insert(
+                        "LightingStyle".into(),
+                        json!({"_type":"EnumItem","name":"Realistic"}),
+                    );
+                    lighting
+                        .properties
+                        .insert("PrioritizeLightingQuality".into(), json!(true));
+                }
+                let markers = ["RBX_LightingTechnologyUnifiedMigration"];
+                if let Some(value) = explicit_migration {
+                    for name in markers {
+                        lighting.attributes.insert(name.into(), json!(value));
+                    }
+                }
+                settings_document(vec![lighting])
+                    .write_file(&service_settings_path(&root.join("Lighting")))
+                    .unwrap();
+                let build = crate::rbx::model::build_rbx_place(
+                    &root,
+                    vec!["Lighting".into()],
+                    None,
+                    false,
+                    false,
+                    false,
+                )
+                .unwrap();
+                for extension in ["rbxl", "rbxlx"] {
+                    let path = root.join(format!("Lighting.{extension}"));
+                    let format = crate::rbx::model::RbxPlaceFormat::from_path(&path).unwrap();
+                    format
+                        .write(&path, &build.dom, &[build.service_roots[0].1])
+                        .unwrap();
+                    let decoded = format.read(&path).unwrap();
+                    let lighting = decoded.get_by_ref(decoded.root().children()[0]).unwrap();
+                    assert_eq!(
+                        lighting.properties.get(&"Brightness".into()),
+                        Some(&RbxVariant::Float32(3.0))
+                    );
+                    let Some(RbxVariant::Attributes(attributes)) =
+                        lighting.properties.get(&"Attributes".into())
+                    else {
+                        panic!("{extension} lost attributes");
+                    };
+                    assert_eq!(
+                        attributes.get("Authored"),
+                        Some(&RbxVariant::BinaryString(b"keep".to_vec().into()))
+                    );
+                    for name in markers {
+                        let expected = explicit_migration
+                            .or(modern.then_some(true))
+                            .map(RbxVariant::Bool);
+                        assert_eq!(
+                            attributes.get(name),
+                            expected.as_ref(),
+                            "{extension}: {name}"
+                        );
+                    }
+                    let technology = explicit_technology
+                        .or(modern.then_some(5))
+                        .map(|value| RbxVariant::Enum(rbx_dom_weak::types::Enum::from_u32(value)));
+                    assert_eq!(
+                        lighting.properties.get(&"Technology".into()),
+                        technology.as_ref()
+                    );
+                    if modern {
+                        assert_eq!(
+                            lighting.properties.get(&"LightingStyle".into()),
+                            Some(&RbxVariant::Enum(rbx_dom_weak::types::Enum::from_u32(0)))
+                        );
+                        assert_eq!(
+                            lighting.properties.get(&"PrioritizeLightingQuality".into()),
+                            Some(&RbxVariant::Bool(true))
+                        );
+                    }
+                    assert!(lighting.children().is_empty());
+                }
+            }
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

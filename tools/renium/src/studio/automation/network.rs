@@ -55,16 +55,16 @@ impl Preset {
 #[derive(Args, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct NetworkValues {
-    #[arg(long, help = "Server-to-client minimum delay, 0–100 ms")]
+    #[arg(long, help = "Server-to-client minimum delay, 0–1000 ms")]
     #[serde(skip_serializing_if = "Option::is_none")]
     in_delay: Option<f64>,
-    #[arg(long, help = "Client-to-server minimum delay, 0–100 ms")]
+    #[arg(long, help = "Client-to-server minimum delay, 0–1000 ms")]
     #[serde(skip_serializing_if = "Option::is_none")]
     out_delay: Option<f64>,
-    #[arg(long, help = "Server-to-client jitter, 0–100 ms")]
+    #[arg(long, help = "Server-to-client jitter, 0–1000 ms")]
     #[serde(skip_serializing_if = "Option::is_none")]
     in_jitter: Option<f64>,
-    #[arg(long, help = "Client-to-server jitter, 0–100 ms")]
+    #[arg(long, help = "Client-to-server jitter, 0–1000 ms")]
     #[serde(skip_serializing_if = "Option::is_none")]
     out_jitter: Option<f64>,
     #[arg(
@@ -98,10 +98,10 @@ impl NetworkRequest {
         }
         let mut count = 0;
         for (name, value, max) in [
-            ("in-delay", self.values.in_delay, 100.0),
-            ("out-delay", self.values.out_delay, 100.0),
-            ("in-jitter", self.values.in_jitter, 100.0),
-            ("out-jitter", self.values.out_jitter, 100.0),
+            ("in-delay", self.values.in_delay, 1000.0),
+            ("out-delay", self.values.out_delay, 1000.0),
+            ("in-jitter", self.values.in_jitter, 1000.0),
+            ("out-jitter", self.values.out_jitter, 1000.0),
             ("in-loss", self.values.in_loss, 0.5),
             ("out-loss", self.values.out_loss, 0.5),
         ] {
@@ -304,7 +304,7 @@ mod tests {
 
     #[test]
     fn network_validation_rejects_partial_invalid_requests_before_mutation() {
-        for value in [f64::NAN, f64::INFINITY, -1.0, 100.01] {
+        for value in [f64::NAN, f64::INFINITY, -1.0, 1000.01] {
             let request = NetworkRequest {
                 action: "set".into(),
                 player: Some("1".into()),
@@ -320,7 +320,14 @@ mod tests {
             ("set", json!({}), false),
             ("show", json!({"inDelay":1}), false),
             ("set", json!({"outLoss":0.51}), false),
-            ("set", json!({"outLoss":0.5,"inDelay":100}), true),
+            (
+                "set",
+                json!({"outLoss":0.5,"inDelay":1000,"outDelay":250,"inJitter":500,"outJitter":1000}),
+                true,
+            ),
+            ("set", json!({"outDelay":1000.01}), false),
+            ("set", json!({"inJitter":1000.01}), false),
+            ("set", json!({"outJitter":1000.01}), false),
             ("reset", json!({}), true),
         ] {
             let request: NetworkRequest =

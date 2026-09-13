@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.6 - 2026-09-13
+
+- Windows package warnings no longer interrupt Renium; package links remain intact.
+- Studio opens without stealing focus and can still be brought forward manually.
+- More reliable screenshots, place targeting and Explorer property editing.
+- Improved sync and import fidelity for Lighting, models, constraints, attributes and references.
+- Rollback no longer moves objects with missing parents to service roots. Internal recovery errors stay out of Studio Output.
+- Per-client network delay and jitter support up to 1000ms on compatible Studio builds.
+
 ## 0.3.5 - 2026-09-12
 
 ### Sync and Studio

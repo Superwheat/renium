@@ -742,6 +742,8 @@ type NativeContextPrepare = dyn Fn(u32, &str) -> Result<()> + Send + Sync;
 
 #[cfg(any(windows, target_os = "macos"))]
 struct NativeConnectionPreparation {
+    #[cfg(windows)]
+    patch_notices: Box<dyn Fn(u32) -> Result<()> + Send + Sync>,
     pending: Mutex<HashSet<String>>,
     prepare: Box<NativeContextPrepare>,
 }
@@ -1180,6 +1182,10 @@ impl BridgeServer {
             check_updates_on_connect,
             #[cfg(any(windows, target_os = "macos"))]
             native_preparation: Some(Arc::new(NativeConnectionPreparation {
+                #[cfg(windows)]
+                patch_notices: Box::new(
+                    crate::studio::native::serializer::suppress_package_notices,
+                ),
                 pending: Default::default(),
                 prepare: Box::new(|pid, place_name| {
                     let title = crate::studio::native::serializer::target_name(pid, place_name)?;
@@ -1369,6 +1375,26 @@ impl BridgeServer {
                                     let update_target = (check_updates_on_connect
                                         && socket.role == BRIDGE_ROLE_EDIT)
                                         .then(|| socket.bridge_info.runtime_id.clone());
+                                    // Patch before exposing the Edit connection to commands.
+                                    // The flag stays enabled through deferred engine work and
+                                    // reconnects, including operations outside editor sync.
+                                    #[cfg(windows)]
+                                    if socket.role == BRIDGE_ROLE_EDIT
+                                        && let Some(preparation) = native_preparation.as_ref()
+                                    {
+                                        let patch = socket.studio_pid
+                                            .context("Could not identify Studio for its package notice patch")
+                                            .and_then(|pid| (preparation.patch_notices)(pid));
+                                        if let Err(error) = patch {
+                                            crate::app::output::log_global(
+                                                2,
+                                                format_args!(
+                                                    "[renium] Studio package notice patch failed: {error:#}"
+                                                ),
+                                            );
+                                            return;
+                                        }
+                                    }
                                     let mut guard = channel
                                         .sockets
                                         .lock()
