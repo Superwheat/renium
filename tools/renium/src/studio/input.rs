@@ -187,19 +187,22 @@ pub fn watch_package_changes_dialog(pid: u32) -> Result<PackageChangesDialogWatc
         let result = platform::watch_package_changes_dialog(pid, worker_finished, ready_tx);
         let _ = result_tx.send(result);
     });
-    match ready_rx
-        .recv_timeout(std::time::Duration::from_secs(2))
-        .context("Package dialog watcher did not become ready")?
-    {
-        Ok(()) => Ok(PackageChangesDialogWatcher {
+    let setup = ready_rx.recv_timeout(std::time::Duration::from_secs(2));
+    match setup {
+        Ok(Ok(())) => Ok(PackageChangesDialogWatcher {
             finished,
             result: result_rx,
             worker: Some(worker),
         }),
-        Err(error) => {
+        Ok(Err(error)) => {
             finished.store(true, Ordering::Release);
             drop(worker);
             bail!(error)
+        }
+        Err(error) => {
+            finished.store(true, Ordering::Release);
+            drop(worker);
+            Err(error).context("Package dialog watcher did not become ready")
         }
     }
 }
@@ -501,7 +504,6 @@ mod platform {
         viewport: isize,
         capture: isize,
         capture_verified: bool,
-        verified_frame: Option<(u32, u32, Vec<u8>)>,
         offset_x: i32,
         offset_y: i32,
         scale_x: f64,
@@ -851,7 +853,6 @@ mod platform {
             viewport: state.render,
             capture: state.render,
             capture_verified: false,
-            verified_frame: None,
             offset_x: 0,
             offset_y: 0,
             scale_x: render_width as f64 / viewport_width as f64,
@@ -908,6 +909,157 @@ mod platform {
             );
         }
         state.candidates
+    }
+
+    // Qt gives every native child the same Win32 class. Its accessibility provider
+    // exposes the actual C++ widget class, including the engine's rendering widget.
+    // Resolve that identity on each capture: HWNDs and layouts can change after Play.
+    fn native_viewport_candidate(top: isize, pid: u32) -> Result<Option<CaptureCandidate>> {
+        let _dpi = ThreadDpiAwareness::per_monitor_v2();
+        let Ok(_com) = ComGuard::initialize() else {
+            return Ok(None);
+        };
+        let Ok(automation): windows::core::Result<IUIAutomation> =
+            (unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) })
+        else {
+            return Ok(None);
+        };
+        let mut matches = Vec::new();
+        for candidate in capture_candidates(top) {
+            if candidate.hwnd == top {
+                continue;
+            }
+            let hwnd = candidate.hwnd as HWND;
+            let mut owner_pid = 0;
+            unsafe { GetWindowThreadProcessId(hwnd, &mut owner_pid) };
+            if owner_pid != pid || unsafe { IsChild(top as HWND, hwnd) } == 0 {
+                continue;
+            }
+            let metadata = (|| -> windows::core::Result<_> {
+                let element = unsafe { automation.ElementFromHandle(AutomationHwnd(hwnd)) }?;
+                Ok(unsafe {
+                    (
+                        element.CurrentClassName()?.to_string(),
+                        element.CurrentAutomationId()?.to_string(),
+                        element.CurrentNativeWindowHandle()?.0 as isize,
+                        element.CurrentProcessId()? as u32,
+                    )
+                })
+            })();
+            let Ok((class, automation_id, native_hwnd, native_pid)) = metadata else {
+                continue;
+            };
+            if is_engine_viewport(
+                &class,
+                &automation_id,
+                native_hwnd,
+                native_pid,
+                candidate.hwnd,
+                pid,
+            ) && visible_client_size(hwnd) == Some((candidate.width, candidate.height))
+            {
+                matches.push(candidate);
+            }
+        }
+        match matches.as_slice() {
+            [] => Ok(None), // Older providers can omit the widget metadata; use the probe.
+            [candidate] => Ok(Some(*candidate)),
+            _ => bail!(
+                "Studio exposed multiple native engine viewports; refusing to choose a different document"
+            ),
+        }
+    }
+
+    fn is_engine_viewport(
+        class: &str,
+        automation_id: &str,
+        native_hwnd: isize,
+        native_pid: u32,
+        hwnd: isize,
+        pid: u32,
+    ) -> bool {
+        // The ribbon, Explorer and plugin docks also use QEngineWidget. Only the
+        // document renderer has this object identity; dock IDs include their plugin path.
+        class == "RBX::Studio::QEngineWidget"
+            && automation_id == "QEngineWidget"
+            && native_hwnd == hwnd
+            && native_pid == pid
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn viewport_identity_rejects_generic_qt_widgets_and_other_sessions() {
+        assert!(is_engine_viewport(
+            "RBX::Studio::QEngineWidget",
+            "QEngineWidget",
+            42,
+            100,
+            42,
+            100
+        ));
+        for class in [
+            "Qt5159QWindowIcon",
+            "QWidget",
+            "",
+            "RBX::Studio::QEngineWidgetPreview",
+        ] {
+            assert!(!is_engine_viewport(
+                class,
+                "QEngineWidget",
+                42,
+                100,
+                42,
+                100
+            ));
+        }
+        assert!(!is_engine_viewport(
+            "RBX::Studio::QEngineWidget",
+            "QEngineWidget",
+            0,
+            100,
+            42,
+            100
+        ));
+        assert!(!is_engine_viewport(
+            "RBX::Studio::QEngineWidget",
+            "QEngineWidget",
+            42,
+            200,
+            42,
+            100
+        ));
+        for id in [
+            "",
+            "RibbonMainWindow.studioTopBar.Ribbon",
+            "RootWidget.ExplorerPlugin",
+            "RootWidget.ReniumStatus",
+        ] {
+            assert!(!is_engine_viewport(
+                "RBX::Studio::QEngineWidget",
+                id,
+                42,
+                100,
+                42,
+                100
+            ));
+        }
+    }
+
+    #[cfg(test)]
+    #[test]
+    #[ignore = "requires RENIUM_CAPTURE_TEST_PID for an open Studio viewport"]
+    fn live_native_viewport_capture_without_probe() {
+        let pid = std::env::var("RENIUM_CAPTURE_TEST_PID")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let window = verified_studio_window_for_pid(pid, &mut |_, _| {
+            bail!("Native viewport discovery fell back to the visual probe")
+        })
+        .unwrap();
+        let (width, height, pixels) = capture_window_rgba(&window.handle).unwrap();
+        assert_eq!(pixels.len(), width as usize * height as usize * 4);
+        println!("{}: {}x{}", window.label, width, height);
     }
 
     fn capture_hwnd_pixels(hwnd: isize, allow_fallback: bool) -> Result<(u32, u32, Vec<u8>)> {
@@ -1004,6 +1156,155 @@ mod platform {
     struct ProbeFrame {
         candidate: CaptureCandidate,
         pixels: Vec<u8>,
+    }
+
+    struct CaptureProbe<'a, F: FnMut(u8, &[u32]) -> Result<()>> {
+        callback: &'a mut F,
+        armed: bool,
+    }
+
+    impl<F: FnMut(u8, &[u32]) -> Result<()>> Drop for CaptureProbe<'_, F> {
+        fn drop(&mut self) {
+            if self.armed {
+                let _ = (self.callback)(2, &[]);
+            }
+        }
+    }
+
+    fn with_capture_probe<T, F: FnMut(u8, &[u32]) -> Result<()>>(
+        callback: &mut F,
+        capture: impl FnOnce(&mut F) -> Result<T>,
+    ) -> Result<T> {
+        // Arm before start: a lost response does not imply the GUI wasn't created.
+        let mut probe = CaptureProbe {
+            callback,
+            armed: true,
+        };
+        let result = capture(probe.callback);
+        let cleanup = (probe.callback)(2, &[]);
+        probe.armed = false;
+        if let Err(error) = cleanup {
+            return Err(error).context(match result {
+                Err(error) => {
+                    format!("Capture failed ({error:#}); also failed to remove its viewport probe")
+                }
+                Ok(_) => "Failed to remove the Studio viewport capture probe".to_string(),
+            });
+        }
+        result
+    }
+
+    fn matching_probe_frames(
+        before: &[ProbeFrame],
+        after: Vec<ProbeFrame>,
+        first: &[u32; 16],
+        second: &[u32; 16],
+    ) -> Vec<ProbeFrame> {
+        after
+            .into_iter()
+            .filter(|after| {
+                before.iter().any(|before| {
+                    before.candidate.hwnd == after.candidate.hwnd
+                        && before.candidate.width == after.candidate.width
+                        && before.candidate.height == after.candidate.height
+                        && probe_transition_matches(before, after, first, second)
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    mod viewport_probe_tests {
+        use super::*;
+
+        #[test]
+        fn probe_cleanup_runs_after_failed_start_capture_and_unwind() {
+            for fail_start in [true, false] {
+                let mut phases = Vec::new();
+                let result: Result<()> = with_capture_probe(
+                    &mut |phase, _| {
+                        phases.push(phase);
+                        if fail_start && phase == 0 {
+                            bail!("response lost");
+                        }
+                        Ok(())
+                    },
+                    |set| {
+                        set(0, &[])?;
+                        bail!("capture cancelled");
+                    },
+                );
+                assert!(result.is_err());
+                assert_eq!(phases, [0, 2]);
+            }
+            let mut phases = Vec::new();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _: Result<()> = with_capture_probe(
+                    &mut |phase, _| {
+                        phases.push(phase);
+                        Ok(())
+                    },
+                    |set| {
+                        set(0, &[])?;
+                        panic!("capture panicked");
+                    },
+                );
+            }));
+            assert_eq!(phases, [0, 2]);
+        }
+
+        #[test]
+        fn probe_cleanup_failure_preserves_the_capture_failure() {
+            let result: Result<()> = with_capture_probe(&mut |_, _| bail!("stop failed"), |_| {
+                bail!("capture timed out");
+            });
+            let message = format!("{:#}", result.unwrap_err());
+            assert!(message.contains("capture timed out"));
+            assert!(message.contains("stop failed"));
+        }
+
+        #[test]
+        fn delayed_probe_frames_must_show_the_transition_in_the_same_window() {
+            let first = probe_palette(0x12345678);
+            let second = first.map(|color| 0x00ff_ffff ^ color);
+            let frame = |hwnd, rendered: bool| {
+                let mut pixels = vec![100; 96 * 96 * 4];
+                if rendered {
+                    for y in 0..96 {
+                        for x in 0..96 {
+                            let tile = y / 24 * 4 + x / 24;
+                            for channel in 0..3 {
+                                let shift = 16 - channel * 8;
+                                let delta = ((second[tile] >> shift) & 255) as i16
+                                    - ((first[tile] >> shift) & 255) as i16;
+                                pixels[(y * 96 + x) * 4 + channel] =
+                                    (100 + delta.signum() * 4) as u8;
+                            }
+                        }
+                    }
+                }
+                ProbeFrame {
+                    candidate: CaptureCandidate {
+                        hwnd,
+                        width: 96,
+                        height: 96,
+                    },
+                    pixels,
+                }
+            };
+            let before = [frame(42, false)];
+            // Old frames remain pending; another session's matching colors never qualify.
+            assert!(
+                matching_probe_frames(&before, vec![frame(42, false)], &first, &second).is_empty()
+            );
+            assert!(
+                matching_probe_frames(&before, vec![frame(43, true)], &first, &second).is_empty()
+            );
+            assert_eq!(
+                matching_probe_frames(&before, vec![frame(42, true)], &first, &second).len(),
+                1
+            );
+        }
     }
 
     fn capture_probe_frames(candidates: &[CaptureCandidate]) -> Vec<ProbeFrame> {
@@ -1353,8 +1654,10 @@ mod platform {
         top: isize,
     ) -> Result<Option<(isize, IUIAutomationElement)>> {
         let message_condition = unsafe {
-            automation
-                .CreatePropertyCondition(UIA_AutomationIdPropertyId, &VARIANT::from("Message"))
+            automation.CreatePropertyCondition(
+                UIA_NamePropertyId,
+                &VARIANT::from(PACKAGE_CHANGES_MESSAGE),
+            )
         }
         .context("Could not create the package dialog message query")?;
         let ok_condition =
@@ -1447,6 +1750,7 @@ mod platform {
         let setup = (|| -> Result<_> {
             crate::project::workflows::windows_launch::protect_process(pid)?;
             let (top, _, _) = main_studio_window(pid)?;
+            crate::studio::native::serializer::suppress_package_notices(pid)?;
             let com = ComGuard::initialize()?;
             let automation: IUIAutomation =
                 unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
@@ -1464,6 +1768,7 @@ mod platform {
                 return Err(error);
             }
         };
+        let mut accepted = false;
         let mut finish_deadline = None;
         loop {
             if let Some((dialog, button)) = package_changes_ok_button(&automation, top)? {
@@ -1473,24 +1778,55 @@ mod platform {
                         .context("The package changes OK button is not invokable")?;
                 unsafe { invoke.Invoke() }.context("Could not accept package changes")?;
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+                let mut closed = false;
                 while std::time::Instant::now() < deadline {
                     if package_changes_ok_button(&automation, top)?.is_none() {
-                        return Ok(true);
+                        closed = true;
+                        break;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
-                bail!("Studio did not close the package changes dialog")
+                if !closed {
+                    bail!("Studio did not close the package changes dialog");
+                }
+                accepted = true;
             }
             if finished.load(std::sync::atomic::Ordering::Acquire) {
                 let deadline = finish_deadline.get_or_insert_with(|| {
                     std::time::Instant::now() + std::time::Duration::from_secs(1)
                 });
                 if std::time::Instant::now() >= *deadline {
-                    return Ok(false);
+                    return Ok(accepted);
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+
+    #[cfg(test)]
+    #[test]
+    #[ignore = "requires RENIUM_PACKAGE_DIALOG_TEST_PID for an owned Studio fixture with a package notice"]
+    fn live_package_notice_uses_automatic_background_dismissal() {
+        let pid = std::env::var("RENIUM_PACKAGE_DIALOG_TEST_PID")
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        let foreground = unsafe { GetForegroundWindow() };
+        let (top, _, title) = main_studio_window(pid).unwrap();
+        println!(
+            "Package fixture: {pid}, {top:x}, {title}; dialogs: {:?}",
+            modal_dialogs(top)
+        );
+        let watcher = super::watch_package_changes_dialog(pid).unwrap();
+        assert!(
+            watcher.finish().unwrap(),
+            "The package notice was not acknowledged"
+        );
+        assert_eq!(
+            unsafe { GetForegroundWindow() },
+            foreground,
+            "Package notice dismissal took focus"
+        );
     }
 
     fn send_window_to_bottom(hwnd: isize) -> Result<()> {
@@ -1583,56 +1919,65 @@ mod platform {
             restore_window_at_bottom(hwnd)?;
             std::thread::sleep(std::time::Duration::from_millis(400));
         }
-        let mut probe_started = false;
+        if let Some(candidate) = native_viewport_candidate(hwnd, pid)? {
+            return Ok(StudioWindow {
+                label: format!("native engine viewport for pid {pid}: {title}"),
+                handle: WindowHandle {
+                    viewport: candidate.hwnd,
+                    capture: candidate.hwnd,
+                    capture_verified: true,
+                    offset_x: 0,
+                    offset_y: 0,
+                    scale_x: 1.0,
+                    scale_y: 1.0,
+                },
+            });
+        }
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64
             ^ ((pid as u64) << 32)
             ^ hwnd as u64;
-        let first_colors = probe_palette(seed ^ 0x4f1b_7ca3_8d25_e691);
-        let second_colors = first_colors.map(|color| 0x00ff_ffff ^ color);
-        let selection = (|| {
+        let mut first_colors = probe_palette(seed ^ 0x4f1b_7ca3_8d25_e691);
+        let mut second_colors = first_colors.map(|color| 0x00ff_ffff ^ color);
+        let contenders = with_capture_probe(set_probe_phase, |set_probe_phase| {
             set_probe_phase(0, &first_colors)?;
-            probe_started = true;
-            std::thread::sleep(std::time::Duration::from_millis(60));
             let candidates = capture_candidates(hwnd);
             if candidates.is_empty() {
                 bail!("Studio exposed no capturable windows for viewport verification");
             }
-            let first = capture_probe_frames(&candidates);
-            set_probe_phase(1, &second_colors)?;
             std::thread::sleep(std::time::Duration::from_millis(60));
-            let second = capture_probe_frames(&candidates);
-
-            let mut contenders = Vec::new();
-            for after in second {
-                let Some(before) = first.iter().find(|entry| {
-                    entry.candidate.hwnd == after.candidate.hwnd
-                        && entry.candidate.width == after.candidate.width
-                        && entry.candidate.height == after.candidate.height
-                }) else {
-                    continue;
-                };
-                if probe_transition_matches(before, &after, &first_colors, &second_colors) {
-                    contenders.push(after);
+            let mut first = capture_probe_frames(&candidates);
+            // Background rendering can lag the bridge response. Observe a transition
+            // until its deadline, rather than requiring the very first frame to match.
+            // Reverse once if the initial palette itself had not rendered yet.
+            for _ in 0..2 {
+                set_probe_phase(1, &second_colors)?;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(750);
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                    let contenders = matching_probe_frames(
+                        &first,
+                        capture_probe_frames(&candidates),
+                        &first_colors,
+                        &second_colors,
+                    );
+                    if !contenders.is_empty() {
+                        return Ok(contenders);
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
                 }
+                first = capture_probe_frames(&candidates);
+                std::mem::swap(&mut first_colors, &mut second_colors);
             }
-            if contenders.is_empty() {
-                bail!(
-                    "Could not prove which Studio child is the rendered viewport; no window reproduced both capture identity patterns"
-                );
-            }
-            Ok(contenders)
-        })();
-        let stop_result = if probe_started {
-            set_probe_phase(2, &[])
-        } else {
-            Ok(())
-        };
+            bail!(
+                "Could not identify Studio's document viewport from native metadata or rendered probe frames"
+            )
+        })?;
         std::thread::sleep(std::time::Duration::from_millis(80));
-        let contenders = selection?;
-        stop_result.context("Failed to remove the Studio viewport capture probe")?;
         let baseline = capture_probe_frames(
             &contenders
                 .iter()
@@ -1659,11 +2004,6 @@ mod platform {
             viewport: candidate.hwnd,
             capture: candidate.hwnd,
             capture_verified: true,
-            verified_frame: Some((
-                candidate.width as u32,
-                candidate.height as u32,
-                root.pixels.clone(),
-            )),
             offset_x: 0,
             offset_y: 0,
             scale_x: 1.0,
@@ -1807,10 +2147,6 @@ mod platform {
     }
 
     pub fn capture_window_png(handle: &WindowHandle, path: &std::path::Path) -> Result<(u32, u32)> {
-        if let Some((width, height, pixels)) = &handle.verified_frame {
-            super::write_png(path, *width, *height, pixels)?;
-            return Ok((*width, *height));
-        }
         let (width, height, pixels) =
             capture_hwnd_pixels(handle.capture, !handle.capture_verified)?;
         super::write_png(path, width, height, &pixels)?;
@@ -2584,6 +2920,7 @@ mod platform {
         // SAFETY: AXUIElementCreateApplication returned an owned accessibility element.
         unsafe { CFRelease(application) };
         let _ = ready.send(Ok(()));
+        let mut accepted = false;
         let mut finish_deadline = None;
         loop {
             if let Some(button) = package_changes_ok_button(pid)? {
@@ -2599,22 +2936,27 @@ mod platform {
                     bail!("Could not accept package changes (AXError {result})");
                 }
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+                let mut closed = false;
                 while std::time::Instant::now() < deadline {
                     let Some(button) = package_changes_ok_button(pid)? else {
-                        return Ok(true);
+                        closed = true;
+                        break;
                     };
                     // SAFETY: package_changes_ok_button returned a retained accessibility element.
                     unsafe { CFRelease(button) };
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
-                bail!("Studio did not close the package changes dialog")
+                if !closed {
+                    bail!("Studio did not close the package changes dialog");
+                }
+                accepted = true;
             }
             if finished.load(std::sync::atomic::Ordering::Acquire) {
                 let deadline = finish_deadline.get_or_insert_with(|| {
                     std::time::Instant::now() + std::time::Duration::from_secs(1)
                 });
                 if std::time::Instant::now() >= *deadline {
-                    return Ok(false);
+                    return Ok(accepted);
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(10));

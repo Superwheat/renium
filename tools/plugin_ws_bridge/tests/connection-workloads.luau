@@ -252,4 +252,10 @@ assert(status.mode == "connected" and status.subtitle == "42 Studio edits are wa
 assert(status.syncText == "Last synced at 12:00")
 state.pendingEditCount = 0
 assert(Status.view(state).syncText == "Synced at 12:00")
+state.editorSyncStats.liveSync = { running = true, resolutionRequired = true, error = "Conflicting Size" }
+assert(Status.view(state).title == "Sync needs a decision")
+assert(not Status.view(state).syncFailed, "a conflict must not be presented as a failed transfer")
+state.editorSyncStats.liveSync = { running = true, error = "Export failed" }
+assert(Status.view(state).title == "Sync failed")
+assert(Status.view(state).syncFailed)
 print("Renium connection lifecycle tests passed")

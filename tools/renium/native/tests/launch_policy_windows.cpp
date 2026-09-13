@@ -13,6 +13,10 @@ static LONG_PTR windowStyle = 0;
 static LONG_PTR windowFlags = 0;
 static UINT positionFlags = 0;
 static HWND positionAfter = HWND_TOP;
+static UINT callbackPositionFlags = 0;
+static HWND callbackPositionAfter = HWND_TOP;
+static LRESULT callbackActivation = -1;
+static void nativeWindowChange();
 static HANDLE pendingShow = nullptr;
 static int showCommand = -1, postedMessages = 0;
 static HWND fakeForeground() { return observedForegroundPid ? reinterpret_cast<HWND>(1) : nullptr; }
@@ -31,6 +35,7 @@ static LONG_PTR WINAPI fakeGetStyle(HWND, int index) { return index == GWL_STYLE
 static LONG_PTR WINAPI fakeSetStyle(HWND, int, LONG_PTR style) { const auto previous = windowStyle; windowStyle = style; return previous; }
 static BOOL WINAPI fakeShow(HWND, int command) {
     ++showCalls; showCommand = command;
+    nativeWindowChange();
     if (command == SW_HIDE) windowFlags &= ~WS_VISIBLE;
     else windowFlags |= WS_VISIBLE;
     if (command != SW_HIDE && command != SW_SHOWNA && command != SW_SHOWNOACTIVATE && command != SW_SHOWMINNOACTIVE) ++foregroundCalls;
@@ -44,6 +49,14 @@ static BOOL WINAPI fakePostMessage(HWND, UINT, WPARAM, LPARAM) { ++postedMessage
 static BOOL WINAPI fakePosition(HWND, HWND after, int, int, int, int, UINT flags) {
     ++positionCalls; positionFlags = flags; positionAfter = after; return TRUE;
 }
+static WINDOWPLACEMENT appliedPlacement{};
+static BOOL WINAPI fakePlacement(HWND, const WINDOWPLACEMENT* placement) {
+    if (!placement) return FALSE;
+    appliedPlacement = *placement;
+    nativeWindowChange();
+    return TRUE;
+}
+static BOOL WINAPI fakeDestroy(HWND) { nativeWindowChange(); return TRUE; }
 static int parentCalls = 0;
 static HWND appliedParent = nullptr;
 static HWND WINAPI fakeParent(HWND, HWND parent) {
@@ -65,6 +78,8 @@ static HWND WINAPI fakeParent(HWND, HWND parent) {
 #define SetWindowLongPtrW fakeSetStyle
 #define ShowWindow fakeShow
 #define SetWindowPos fakePosition
+#define SetWindowPlacement fakePlacement
+#define DestroyWindow fakeDestroy
 #define SetParent fakeParent
 #define SetPropW fakeSetProp
 #define GetPropW fakeGetProp
@@ -74,18 +89,36 @@ static HWND WINAPI fakeParent(HWND, HWND parent) {
 #include "../renium_launch_windows.cpp"
 #define REQUIRE(condition) do { if (!(condition)) { std::fprintf(stderr, "FAILED: %s\n", #condition); return 1; } } while (false)
 
+// Windows raises/activates a selected window before GetForegroundWindow has
+// necessarily changed. Taskbar and Alt-Tab requests may have no local input
+// source. Exercise the same callbacks both inside Qt's ShowWindow and outside
+// any Studio API call, as an OS-driven selection would arrive.
+static void nativeWindowChange() {
+    WINDOWPOS position{};
+    position.hwndInsertAfter = HWND_TOP;
+    position.flags = SWP_NOMOVE;
+    launchWindowProc(nullptr, WM_WINDOWPOSCHANGING, 0, reinterpret_cast<LPARAM>(&position), 1, 0);
+    callbackPositionFlags = position.flags;
+    callbackPositionAfter = position.hwndInsertAfter;
+    CBTACTIVATESTRUCT activation{};
+    callbackActivation = ReniumLaunchHook(HCBT_ACTIVATE, 0, reinterpret_cast<LPARAM>(&activation));
+}
+
 int main() {
     REQUIRE(ReniumConfigureLaunch(GetCurrentProcessId()));
     CBTACTIVATESTRUCT activation{};
     const auto invoke = [&] { return ReniumLaunchHook(HCBT_ACTIVATE, 0, reinterpret_cast<LPARAM>(&activation)); };
     observedForegroundPid = 0;
-    REQUIRE(invoke() == 1);
+    REQUIRE(invoke() == 0);
     WINDOWPOS position{}; position.hwndInsertAfter = HWND_TOP; position.flags = SWP_NOMOVE;
     launchWindowProc(nullptr, WM_WINDOWPOSCHANGING, 0, reinterpret_cast<LPARAM>(&position), 1, 0);
-    REQUIRE(position.flags & SWP_NOACTIVATE);
-    REQUIRE(position.hwndInsertAfter == HWND_BOTTOM);
+    REQUIRE(!(position.flags & SWP_NOACTIVATE));
+    REQUIRE(position.hwndInsertAfter == HWND_TOP);
     observedForegroundPid = GetCurrentProcessId() + 1;
-    REQUIRE(invoke() == 1);
+    REQUIRE(invoke() == 0);
+    nativeWindowChange();
+    REQUIRE(callbackActivation == 0 && callbackPositionAfter == HWND_TOP);
+    REQUIRE(!(callbackPositionFlags & SWP_NOACTIVATE));
     observedForegroundPid = GetCurrentProcessId();
     REQUIRE(invoke() == 0);
     observedForegroundPid = 0;
@@ -105,15 +138,37 @@ int main() {
     REQUIRE(launchShowWindow(reinterpret_cast<HWND>(3), SW_SHOWMAXIMIZED));
     REQUIRE(showCalls == 1 && foregroundCalls == 0 && windowStyle == 0);
     REQUIRE(showCommand == SW_SHOWNA && pendingShow);
+    REQUIRE(callbackActivation == 1 && callbackPositionAfter == HWND_BOTTOM);
+    REQUIRE(callbackPositionFlags & SWP_NOACTIVATE);
+    // The protection ends with the native call, even before any user click.
+    nativeWindowChange();
+    REQUIRE(callbackActivation == 0 && callbackPositionAfter == HWND_TOP);
+    REQUIRE(!(callbackPositionFlags & SWP_NOACTIVATE));
+    observedForegroundPid = 0;
+    REQUIRE(launchShowWindow(reinterpret_cast<HWND>(3), SW_SHOWMAXIMIZED));
+    REQUIRE(callbackActivation == 1 && callbackPositionAfter == HWND_BOTTOM);
+    REQUIRE(callbackPositionFlags & SWP_NOACTIVATE);
+    observedForegroundPid = GetCurrentProcessId() + 1;
     launchWindowProc(reinterpret_cast<HWND>(3), WM_ACTIVATE, WA_ACTIVE, 0, 1, 0);
     REQUIRE(postedMessages == 1);
     launchWindowProc(reinterpret_cast<HWND>(3), deferredShowMessage(), 0, 0, 1, 0);
-    REQUIRE(showCalls == 1 && pendingShow); // The user switched away before delivery.
+    REQUIRE(showCalls == 2 && pendingShow); // The user switched away before delivery.
     observedForegroundPid = GetCurrentProcessId();
     launchWindowProc(reinterpret_cast<HWND>(3), deferredShowMessage(), 0, 0, 1, 0);
-    REQUIRE(showCalls == 2 && showCommand == SW_SHOWMAXIMIZED && !pendingShow);
+    REQUIRE(showCalls == 3 && showCommand == SW_SHOWMAXIMIZED && !pendingShow);
     foregroundCalls = 0;
     observedForegroundPid = GetCurrentProcessId() + 1;
+    WINDOWPLACEMENT placement{sizeof(placement)};
+    placement.showCmd = SW_RESTORE;
+    placement.rcNormalPosition = {10, 20, 500, 600};
+    REQUIRE(launchSetWindowPlacement(reinterpret_cast<HWND>(3), &placement));
+    REQUIRE(appliedPlacement.showCmd == SW_SHOWNA && placement.showCmd == SW_RESTORE);
+    REQUIRE(appliedPlacement.rcNormalPosition.left == 10 && appliedPlacement.rcNormalPosition.bottom == 600);
+    REQUIRE(callbackActivation == 1 && callbackPositionAfter == HWND_BOTTOM);
+    REQUIRE(launchDestroyWindow(reinterpret_cast<HWND>(3)));
+    REQUIRE(callbackActivation == 1);
+    nativeWindowChange();
+    REQUIRE(callbackActivation == 0 && callbackPositionAfter == HWND_TOP);
     REQUIRE(launchSetWindowPos(reinterpret_cast<HWND>(3), HWND_TOP, 0, 0, 100, 100, 0));
     REQUIRE(positionCalls == 1 && (positionFlags & SWP_NOACTIVATE) && positionAfter == HWND_BOTTOM);
     windowFlags = WS_CHILD;
@@ -158,7 +213,7 @@ int main() {
     REQUIRE(!launchSetForegroundWindow(reinterpret_cast<HWND>(3)));
     REQUIRE(launchSetFocus(reinterpret_cast<HWND>(3)) == reinterpret_cast<HWND>(2));
     REQUIRE(!launchAttachThreadInput(1, 2, TRUE));
-    REQUIRE(invoke() == 1);
+    REQUIRE(invoke() == 0); // External selection remains available indefinitely.
     REQUIRE(foregroundCalls == 0 && focusCalls == 0 && attachCalls == 0);
     // Genuine user activation and cleanup still reach their original APIs.
     observedUserInput = true;
@@ -169,5 +224,5 @@ int main() {
     observedUserInput = false;
     REQUIRE(launchAttachThreadInput(1, 2, FALSE));
     REQUIRE(attachCalls == 2);
-    puts("PASS: activation transitions, keyboard focus, input queues, show/raise, import binding and user input");
+    puts("PASS: external window selection, scoped background show/raise, activation transitions, keyboard focus, input queues and import binding");
 }

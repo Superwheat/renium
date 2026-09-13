@@ -681,7 +681,7 @@ impl Memory {
             let end = error.iter().position(|b| *b == 0).unwrap_or(error.len());
             bail!(
                 "Studio reflection transport: {}",
-                String::from_utf8_lossy(&error[..end])
+                native_helper_error(&String::from_utf8_lossy(&error[..end]))
             );
         }
         let limit = if operation == 2 && read_u32(payload, 132) == Some(4) {

@@ -1,6 +1,6 @@
 [package]
 name = "renium"
-version = "0.3.5"
+version = "0.3.6"
 edition = "2024"
 rust-version = "1.89"
 license-file = "../../LICENSE"
@@ -62,3 +62,9 @@ sha2 = "0.10.9"
 [profile.release]
 lto = "thin"
 codegen-units = 16
+
+# Reuse optimized code between local edits and keep Renium's large crate parallel.
+# Dependencies retain their existing profile and cached artifacts.
+[profile.release.package.renium]
+codegen-units = 64
+incremental = true

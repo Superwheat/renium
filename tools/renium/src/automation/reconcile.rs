@@ -43,12 +43,12 @@ use crate::settings::bytecode::{
 use crate::settings::equivalence::{
     align_equivalent_values, align_reconciliation_protected_workspace_cameras,
     align_settings_ids_to_reference, canonicalize_settings_property_names, drop_settings_document,
-    drop_settings_documents, is_reconciliation_protected_workspace_camera,
-    reconciliation_maps_equal, reconciliation_property_is_derived, reconciliation_property_value,
-    reconciliation_property_values_equal, reconciliation_values_equal,
-    reconciliation_values_map_equal, remove_reconciliation_derived_properties,
-    settings_documents_equivalent, settings_documents_positionally_equivalent,
-    stabilize_settings_reference_ids,
+    drop_settings_documents, is_reconciliation_protected_workspace_camera, persistent_identity,
+    persistent_identity_index, reconciliation_maps_equal, reconciliation_property_is_derived,
+    reconciliation_property_value, reconciliation_property_values_equal,
+    reconciliation_values_equal, reconciliation_values_map_equal,
+    remove_reconciliation_derived_properties, settings_documents_equivalent,
+    settings_documents_positionally_equivalent, stabilize_settings_reference_ids,
 };
 use crate::snapshot::export::{
     ExportProjectStage, PublishEntryState, capture_exported_services,
@@ -3885,13 +3885,11 @@ fn append_aligned_settings_push_plan(
     );
     log_reconcile_timing("settings delta identity maps", phase);
     let phase = Instant::now();
-    let mut previous_path_settings_ids = Vec::new();
     let mut pending_property_removals = Vec::new();
 
     struct InstanceDelta {
         desired_index: usize,
         observed_index: Option<usize>,
-        requires_previous_path: bool,
         reset_properties: Vec<String>,
         deleted_attributes: Vec<String>,
     }
@@ -3918,7 +3916,6 @@ fn append_aligned_settings_push_plan(
                 return Some(InstanceDelta {
                     desired_index,
                     observed_index: None,
-                    requires_previous_path: false,
                     reset_properties: Vec::new(),
                     deleted_attributes: Vec::new(),
                 });
@@ -3957,15 +3954,35 @@ fn append_aligned_settings_push_plan(
             Some(InstanceDelta {
                 desired_index,
                 observed_index: Some(observed_index),
-                requires_previous_path: observed_instance.name != instance.name
-                    || observed_instance.class_name != instance.class_name
-                    || settings_parent_id(observed, observed_index)
-                        != settings_parent_id(desired, desired_index),
                 reset_properties,
                 deleted_attributes,
             })
         })
         .collect::<Vec<_>>();
+    // The aligned identity can have a different ordinal, even when its own
+    // name and parent identity are unchanged. Preserve the observed paths for
+    // exactly the upsert selection, including lookup-only ancestors/siblings.
+    let previous_indices = if instance_deltas.is_empty() {
+        Vec::new()
+    } else {
+        let filter = crate::editor::types::EditorPropertyFilter {
+            settings_ids: instance_deltas
+                .iter()
+                .map(|delta| desired.instances[delta.desired_index].settings_id.clone())
+                .collect(),
+            ..Default::default()
+        };
+        let (_, mut selected) = crate::editor::diff::editor_target_indices(desired, &filter);
+        crate::editor::diff::expand_ambiguous_editor_siblings(desired, &mut selected);
+        selected
+            .iter()
+            .filter_map(|index| {
+                observed_by_id
+                    .get(desired.instances[*index].settings_id.as_str())
+                    .copied()
+            })
+            .collect()
+    };
     for delta in instance_deltas {
         let instance = &desired.instances[delta.desired_index];
         plan.target_settings_ids.push(instance.settings_id.clone());
@@ -4002,9 +4019,6 @@ fn append_aligned_settings_push_plan(
             plan.geometry_properties
                 .insert((service.clone(), instance.settings_id.clone()), geometry);
         }
-        if delta.requires_previous_path {
-            previous_path_settings_ids.push(instance.settings_id.as_str());
-        }
         if observed_instance.class_name != instance.class_name {
             plan.previous_class_names.insert(
                 instance.settings_id.clone(),
@@ -4021,10 +4035,6 @@ fn append_aligned_settings_push_plan(
     log_reconcile_timing("settings delta changed instances", phase);
 
     let phase = Instant::now();
-    let previous_indices = previous_path_settings_ids
-        .iter()
-        .filter_map(|settings_id| observed_by_id.get(*settings_id).copied())
-        .collect::<Vec<_>>();
     if !previous_indices.is_empty() {
         let previous_paths =
             build_editor_instance_paths_for_indices(observed, &service, &previous_indices);
@@ -4834,12 +4844,27 @@ fn merge_reconciliation_settings_documents(
         .zip(editor_paths)
         .map(|(instance, path)| (instance.settings_id.as_str(), path))
         .collect::<HashMap<_, _>>();
+    let editor_persistent = persistent_identity_index(editor);
+    let studio_persistent = persistent_identity_index(studio);
     let aligned_additions = studio
         .instances
         .iter()
         .zip(studio_paths)
-        .filter(|(instance, path)| editor_by_id.get(instance.settings_id.as_str()) == Some(path))
-        .map(|(instance, _)| instance.settings_id.clone())
+        .enumerate()
+        .filter(|(index, (instance, path))| {
+            editor_by_id.get(instance.settings_id.as_str()) == Some(path)
+                || persistent_identity(instance).is_some_and(|id| {
+                    studio_persistent.get(id) == Some(&Some(*index))
+                        && editor_persistent.get(id).copied().flatten().is_some_and(
+                            |editor_index| {
+                                let matched = &editor.instances[editor_index];
+                                matched.settings_id == instance.settings_id
+                                    && matched.class_name == instance.class_name
+                            },
+                        )
+                })
+        })
+        .map(|(_, (instance, _))| instance.settings_id.clone())
         .collect();
     merge_aligned_settings_documents(
         base,
@@ -5037,23 +5062,45 @@ fn align_new_instance_ids(
         .enumerate()
         .map(|(index, key)| (key, index))
         .collect::<HashMap<_, _>>();
+    let editor_persistent = persistent_identity_index(editor);
+    let studio_persistent = persistent_identity_index(studio);
+    let persistent_pairs = studio
+        .instances
+        .iter()
+        .enumerate()
+        .filter_map(|(index, instance)| {
+            let id = persistent_identity(instance)?;
+            if studio_persistent.get(id) != Some(&Some(index)) {
+                return None;
+            }
+            let target = editor_persistent.get(id).copied().flatten()?;
+            (editor.instances[target].class_name == instance.class_name).then_some((index, target))
+        })
+        .collect::<HashMap<_, _>>();
+    let persistent_targets = persistent_pairs.values().copied().collect::<HashSet<_>>();
     let candidates = studio_keys
         .iter()
         .copied()
         .enumerate()
         .filter_map(|(studio_index, key)| {
-            let editor_index = editor_by_key.get(&key).copied()?;
+            let persistent = persistent_pairs.get(&studio_index).copied();
+            let editor_index = persistent.or_else(|| {
+                editor_by_key
+                    .get(&key)
+                    .copied()
+                    .filter(|index| !persistent_targets.contains(index))
+            })?;
             let editor_id = editor.instances[editor_index].settings_id.as_str();
             let studio_id = studio.instances[studio_index].settings_id.as_str();
             (!baseline_ids.contains(editor_id)
                 && !baseline_ids.contains(studio_id)
                 && editor_id != studio_id)
-                .then_some((studio_index, editor_index))
+                .then_some((studio_index, editor_index, persistent.is_some()))
         })
         .collect::<Vec<_>>();
     let mut remap = candidates
         .iter()
-        .map(|(studio_index, editor_index)| {
+        .map(|(studio_index, editor_index, _)| {
             (
                 studio.instances[*studio_index].settings_id.clone(),
                 editor.instances[*editor_index].settings_id.clone(),
@@ -5080,7 +5127,12 @@ fn align_new_instance_ids(
     // New identities are paired by their unique structural location, not by value.
     // Requiring equal values turns a legitimate property difference into two instances.
     // Duplicate-name slots still require equivalent data: their ordinal alone is not identity.
-    for (studio_index, editor_index) in candidates {
+    for (studio_index, editor_index, persistent) in candidates {
+        // A unique engine identity remains valid across source edits and sibling
+        // reordering. Only structural fallback candidates need value evidence.
+        if persistent {
+            continue;
+        }
         let key = studio_keys[studio_index];
         let node = interner.node(key);
         let mut second = node.part.clone();
@@ -5124,9 +5176,37 @@ fn align_first_pairing(
     preference: ConflictPreference,
     conflicts: &mut Vec<String>,
 ) {
+    align_settings_ids_to_reference(editor, studio);
     let mut structural_interner = PathInterner::new();
     let editor_keys = structural_path_ids(editor, &mut structural_interner);
-    let studio_keys = structural_path_ids(studio, &mut structural_interner);
+    let mut studio_keys = structural_path_ids(studio, &mut structural_interner);
+    // Sibling order is not identity. A proven engine identity can match a
+    // reordered duplicate even when its authored values have changed.
+    let editor_persistent = persistent_identity_index(editor);
+    let studio_persistent = persistent_identity_index(studio);
+    let mut identity_keys = studio_keys.clone();
+    for (index, instance) in studio.instances.iter().enumerate() {
+        let Some(id) = persistent_identity(instance) else {
+            continue;
+        };
+        if studio_persistent.get(id) != Some(&Some(index)) {
+            continue;
+        }
+        let Some(editor_index) = editor_persistent.get(id).copied().flatten() else {
+            continue;
+        };
+        let desired = structural_interner.node(editor_keys[editor_index]);
+        let observed = structural_interner.node(studio_keys[index]);
+        if desired.parent == observed.parent
+            && desired.part.name == observed.part.name
+            && desired.part.class_name == observed.part.class_name
+        {
+            identity_keys[index] = editor_keys[editor_index];
+        }
+    }
+    if identity_keys.iter().copied().collect::<HashSet<_>>().len() == identity_keys.len() {
+        studio_keys = identity_keys;
+    }
     let mut pairing_interner = PathInterner::new();
     let editor_pairing_keys = pairing_path_ids(editor, &mut pairing_interner);
     let studio_pairing_keys = pairing_path_ids(studio, &mut pairing_interner);
@@ -5206,6 +5286,8 @@ fn align_first_pairing(
         remap_record_reference_ids(&mut instance.properties, &id_remap);
         remap_record_reference_ids(&mut instance.attributes, &id_remap);
     }
+    crate::settings::equivalence::inherit_workspace_viewport_reference(editor, studio);
+    align_reconciliation_protected_workspace_cameras(editor, studio);
     align_equivalent_values(editor, studio);
     protect_package_links(path, None, editor, studio, conflicts);
 
@@ -5819,6 +5901,11 @@ fn verification_values_equal(
     right: Option<&Value>,
 ) -> bool {
     if properties {
+        // Studio recalculates this state when inserting a package or changing
+        // its contents. Verify the package identity/content, not that readback.
+        if class_name == "PackageLink" && name == "ModifiedState" {
+            return true;
+        }
         reconciliation_property_values_equal(class_name, name, left, right)
     } else {
         match (left, right) {
@@ -7057,6 +7144,52 @@ mod tests {
     }
 
     #[test]
+    fn in_place_edits_preserve_observed_paths_through_reordered_duplicate_ancestors() {
+        let node = |id: &str, name: &str, class: &str, parent| {
+            SettingsBytecodeInstance::new(id.into(), name.into(), class.into(), parent)
+        };
+        let mut desired = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                node("root", "Workspace", "Workspace", None),
+                node("a", "Lampost", "Model", Some(0)),
+                node("b", "Lampost", "Model", Some(0)),
+                node("light-a", "Light", "Model", Some(1)),
+                node("light-b", "Light", "Model", Some(2)),
+                node("we", "we", "Part", Some(3)),
+            ],
+        };
+        let mut observed = desired.clone();
+        observed.instances.swap(1, 2);
+        observed.instances[3].parent_index = Some(2);
+        observed.instances[4].parent_index = Some(1);
+        desired.instances[5]
+            .attributes
+            .insert("Changed".into(), json!(true));
+        let mut plan = ReconcilePushPlan::default();
+        append_aligned_settings_push_plan(
+            Path::new("instances/Workspace.renium"),
+            &desired,
+            &observed,
+            &mut plan,
+        )
+        .unwrap();
+        assert_eq!(plan.target_settings_ids, ["we"]);
+        let key = |id: &str| ("Workspace".to_string(), id.to_string());
+        assert!(plan.in_place_instances.contains(&key("we")));
+        assert_eq!(plan.previous_paths[&key("we")].path_ordinals, [1, 2, 1, 1]);
+        assert_eq!(plan.previous_paths[&key("a")].path_ordinals, [1, 2]);
+        assert_eq!(
+            plan.previous_paths[&key("light-a")].path_ordinals,
+            [1, 2, 1]
+        );
+        assert!(
+            !plan.previous_paths.contains_key(&key("light-b")),
+            "Do not traverse unrelated subtrees for a small edit"
+        );
+    }
+
+    #[test]
     fn folder_icon_tint_default_does_not_invent_full_push_changes() {
         let black = json!({"_type": "Color3", "r": 0.0, "g": 0.0, "b": 0.0});
         let red = json!({"_type": "Color3", "r": 1.0, "g": 0.0, "b": 0.0});
@@ -7864,6 +7997,18 @@ mod tests {
         let desired = snapshot(-1, Some(true));
         let observed = snapshot(1, None);
         let paths = HashSet::from([path.clone()]);
+        let empty = ProjectSnapshot {
+            entries: BTreeMap::new(),
+        };
+        let (added_mismatches, added_detail) = snapshot_intended_delta_mismatches(
+            &empty,
+            &desired,
+            &observed,
+            &paths,
+            &mut HashMap::new(),
+        )
+        .unwrap();
+        assert!(added_mismatches.is_empty(), "{added_detail:?}");
         let (mismatches, _) = snapshot_intended_delta_mismatches(
             &before,
             &desired,
@@ -8982,6 +9127,138 @@ mod tests {
                 .contains("Ambiguous new duplicate instances")
         );
         assert_eq!(encode_settings_bytecode(&studio).unwrap(), before);
+    }
+
+    #[test]
+    fn new_duplicates_keep_persistent_identity_after_edits_and_reordering() {
+        let root = SettingsBytecodeInstance::new(
+            "root".into(),
+            "Workspace".into(),
+            "Workspace".into(),
+            None,
+        );
+        let base = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![root],
+        };
+        let mut editor = base.clone();
+        for i in 1..=2 {
+            let mut part = SettingsBytecodeInstance::new(
+                format!("debug:old-{i}"),
+                "Part".into(),
+                "Part".into(),
+                Some(0),
+            );
+            part.properties.insert(
+                "UniqueId".into(),
+                json!({"_type":"UniqueId","value":format!("{i:032x}")}),
+            );
+            part.properties
+                .insert("Transparency".into(), json!(i as f64 / 10.0));
+            editor.instances.push(part);
+        }
+        let mut studio = editor.clone();
+        studio.instances[1].settings_id = "debug:new-1".into();
+        studio.instances[2].settings_id = "debug:new-2".into();
+        studio.instances[1]
+            .properties
+            .insert("Transparency".into(), json!(0.7));
+        studio.instances[2]
+            .properties
+            .insert("Transparency".into(), json!(0.8));
+        studio.instances[0].properties.insert(
+            "PrimaryPart".into(),
+            json!({"_type":"Ref","settingsId":"debug:new-1"}),
+        );
+        studio.instances.swap(1, 2);
+        let mut first_pair = studio.clone();
+        let mut first_pair_conflicts = Vec::new();
+        align_first_pairing(
+            Path::new("instances/Workspace.renium"),
+            &mut editor.clone(),
+            &mut first_pair,
+            ConflictPreference::None,
+            &mut first_pair_conflicts,
+        );
+        assert!(!first_pair_conflicts.is_empty());
+        assert!(
+            first_pair_conflicts
+                .iter()
+                .all(|conflict| !conflict.contains("ambiguous")
+                    && !conflict.contains("different paths")),
+            "{first_pair_conflicts:?}"
+        );
+        align_new_instance_ids(&base, &editor, &mut studio).unwrap();
+        assert_eq!(studio.instances[1].settings_id, "debug:old-2");
+        assert_eq!(studio.instances[2].settings_id, "debug:old-1");
+        assert_eq!(
+            studio.instances[0].properties["PrimaryPart"]["settingsId"],
+            "debug:old-1"
+        );
+        assert_eq!(studio.instances[2].properties["Transparency"], 0.7);
+        let (merged, conflicts) = merge_reconciliation_settings_documents(
+            &base,
+            &editor,
+            &studio,
+            ConflictPreference::None,
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(
+            merged.instances.len(),
+            3,
+            "matched parts must not be duplicated"
+        );
+        assert!(
+            !conflicts.is_empty(),
+            "identity matching must retain the real value conflict"
+        );
+    }
+
+    #[test]
+    fn first_pairing_ignores_only_the_identified_viewport_camera() {
+        let mut root = SettingsBytecodeInstance::new(
+            "root".into(),
+            "Workspace".into(),
+            "Workspace".into(),
+            None,
+        );
+        root.properties.insert(
+            "CurrentCamera".into(),
+            json!({"_type":"Ref","settingsId":"viewport"}),
+        );
+        let mut camera = SettingsBytecodeInstance::new(
+            "viewport".into(),
+            "View".into(),
+            "Camera".into(),
+            Some(0),
+        );
+        camera.properties.insert("FieldOfView".into(), json!(70));
+        let mut authored = camera.clone();
+        authored.settings_id = "authored".into();
+        authored.name = "AuthoredCamera".into();
+        let editor = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![root, camera, authored],
+        };
+        let mut studio = editor.clone();
+        studio.instances[1]
+            .properties
+            .insert("FieldOfView".into(), json!(90));
+        studio.instances[2]
+            .properties
+            .insert("FieldOfView".into(), json!(100));
+        let mut conflicts = Vec::new();
+        align_first_pairing(
+            Path::new("instances/Workspace.renium"),
+            &mut editor.clone(),
+            &mut studio,
+            ConflictPreference::None,
+            &mut conflicts,
+        );
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+        assert!(conflicts[0].contains("AuthoredCamera"));
+        assert_eq!(studio.instances[1].properties["FieldOfView"], 70);
     }
 
     #[test]

@@ -275,6 +275,7 @@ export type EditorHistoryManifest = {
   pathSegments?: string[];
   className?: string;
   propertyName?: string;
+  propertyScope?: "property" | "metadata";
   propertyLabel?: string;
   settingsFile?: string;
   settingsBackup?: string;

@@ -67,6 +67,11 @@ function BridgePluginRuntime.withSuppression(studioChanges, callback, params, sc
 end
 
 function BridgePluginRuntime.start(context)
+	-- Published places can still be streaming when plugins start. Local files
+	-- are deserialized before plugins run and do not set DataModel.IsLoaded.
+	if game.PlaceId > 0 and not game:IsLoaded() then
+		game.Loaded:Wait()
+	end
 	local plugin = context.plugin
 	local rootScript = context.rootScript
 
@@ -182,9 +187,9 @@ function BridgePluginRuntime.start(context)
 	local BALANCED_DEMAND_SERIALIZATION_BURST_BUDGET_SECONDS = 1 / 240
 	local BALANCED_DEMAND_SERIALIZATION_BURST_CHECK_INTERVAL = 256
 	local PARALLEL_SOURCE_BATCH_MIN_ITEMS = 24
-	local BRIDGE_VERSION = "0.3.5"
+	local BRIDGE_VERSION = "0.3.6"
 	local BRIDGE_PROTOCOL_VERSION = "compact-v5"
-	local BRIDGE_BUILD_UNIX = 1788778300
+	local BRIDGE_BUILD_UNIX = 1789311798
 	local CHUNK_FRAME_PROTOCOL_VERSION = "rbs2"
 	local COMPACT_VALUE_PROTOCOL_VERSION = "compact-v5-schema-4"
 	local CLEAN_DEMAND_SERIALIZER_MAX_FRAME_MS = 33.0
@@ -419,6 +424,7 @@ function BridgePluginRuntime.start(context)
 		expectTagChange = Config.studioChanges.expectTagChange,
 		cancelExpectedEvent = Config.studioChanges.cancelExpectedEvent,
 		studioChangeGeneration = Config.studioChanges.serviceGeneration,
+		describeJournalChange = Config.studioChanges.describeJournalChange,
 		assertRequestLeaseActive = function()
 			editorSync.assertCurrentRequestLeaseActive()
 		end,
@@ -968,6 +974,7 @@ function BridgePluginRuntime.start(context)
 		finishNativeImportObservations = Config.studioChanges.finishNativeImportObservations,
 		finishEditorTransactionExpectation = finishEditorTransactionExpectation,
 		studioChangeGeneration = Config.studioChanges.serviceGeneration,
+		describeJournalChange = Config.studioChanges.describeJournalChange,
 		isStudioChangeTracking = Config.studioChanges.isTracking,
 		hasNonArchivable = Config.studioChanges.hasNonArchivable,
 		trackedExportInstances = Config.studioChanges.exportInstances,

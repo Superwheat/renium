@@ -30,7 +30,7 @@ local last = assert(source:find("local function isMeshGeometryProperty(", first,
 local retained, assigned = "old", 0
 local functions = luau.load(source:sub(first, last - 1) .. "\nreturn { changedPropertyNames, writeDecodedProperty }", { environment = {
 	readProperty = function() return true, retained end,
-	valuesEqual = function(a, b) return a == b end,
+	exactValuesEqual = function(a, b) return a == b end,
 	writePropertyForSync = function(_, _, value) assigned += 1; retained = value; return true end,
 } })()
 local names, write = functions[1], functions[2]
@@ -44,7 +44,7 @@ do
 	local writes = {}
 	local apply = luau.load(source:sub(first, last - 1) .. "\nreturn writeDecodedProperty", { environment = {
 		readProperty = function(instance, name) return true, instance[name] end,
-		valuesEqual = function(a, b) return a == b end,
+		exactValuesEqual = function(a, b) return a == b end,
 		writePropertyForSync = function(instance, name, value)
 			writes[#writes + 1] = name
 			instance[name] = value

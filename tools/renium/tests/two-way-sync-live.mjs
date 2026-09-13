@@ -47,7 +47,7 @@ assert.equal(initial.playState, 'stopped');
 assert.equal(initial.clients.length, 1);
 assert.equal(initial.clients[0].placeId, 0);
 assert.equal(initial.clients[0].placeName, place);
-assert.equal(initial.clients[0].bridgeBuildUnix, 1788778300, 'Expected installed 0.3.5 plugin');
+assert.equal(initial.clients[0].bridgeBuildUnix, 1789311798, 'Expected installed 0.3.6 plugin');
 const editRuntime = initial.selected;
 run(['lof']);
 if (live('return workspace:FindFirstChild("ReniumFinalSync") == nil')) {

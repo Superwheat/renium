@@ -25,6 +25,7 @@ local write = extract("local function writePropertyForSync(", "local function se
 	Enum = { FontStyle = { Normal = normal, Italic = italic } },
 	readProperty = function() return true, current end,
 	valuesEqual = equal,
+	propertyValuesEqual = function(_, _, a, b) return equal(a, b) end,
 	writeProperty = function(_, _, value)
 		writes += 1
 		if not equal(current, value) then current = value end

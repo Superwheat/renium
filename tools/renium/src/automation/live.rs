@@ -106,18 +106,41 @@ impl Control {
 }
 
 fn report_plugin_live_status(bridge: &BridgeServer, runtime_id: &str, status: &PluginLiveStatus) {
-    if let Err(error) = bridge.call_for_runtime_with_timeout(
-        "getStudioChangeState",
-        json!({ "compact": true, "liveSyncStatus": status }),
-        BridgeTarget::Edit,
-        runtime_id,
-        Some(Duration::from_secs(1)),
-    ) {
+    if let Err(error) = send_plugin_live_status(bridge, runtime_id, status) {
         log_global(
             5,
             format_args!("[renium] live status display update failed: {error:#}"),
         );
     }
+}
+
+fn send_plugin_live_status(
+    bridge: &BridgeServer,
+    runtime_id: &str,
+    status: &PluginLiveStatus,
+) -> Result<()> {
+    let result = bridge.call_for_runtime_with_timeout(
+        "getStudioChangeState",
+        json!({ "compact": true, "start": false, "liveSyncStatus": status }),
+        BridgeTarget::Edit,
+        runtime_id,
+        Some(Duration::from_secs(1)),
+    )?;
+    ensure_plugin_api_ok(&result)
+}
+
+pub(super) fn report_plugin_stopped(bridge: &BridgeServer, runtime_id: &str) -> Result<()> {
+    send_plugin_live_status(
+        bridge,
+        runtime_id,
+        &PluginLiveStatus {
+            running: false,
+            paused: false,
+            read_only: false,
+            resolution_required: false,
+            error: None,
+        },
+    )
 }
 
 #[derive(Default)]
@@ -529,6 +552,9 @@ impl Control {
                 || (plugin_pending && !self.pull_changes.load(Ordering::Acquire));
             drop(plugin);
             drop(status);
+            if cannot_progress {
+                return false;
+            }
             if settled {
                 let current_activity = self.settle_activity.load(Ordering::Acquire);
                 if current_activity != activity {
@@ -537,9 +563,6 @@ impl Control {
                 } else if quiet_since.elapsed() >= SETTLE_QUIET_PERIOD {
                     return true;
                 }
-            }
-            if cannot_progress {
-                return false;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {

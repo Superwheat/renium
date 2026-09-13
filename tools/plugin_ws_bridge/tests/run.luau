@@ -122,6 +122,7 @@ do
 			end,
 			readProperty = function() return true, current end,
 			valuesEqual = function(a, b) return a == b end,
+			propertyValuesEqual = function(_, _, a, b) return a == b end,
 			markLiveMutation = function() end,
 			cancelExpectedEvent = function(_, token) equal(token, "expected", "write token"); cancelled += 1 end,
 			os = { clock = function() return elapsed end },
@@ -547,28 +548,29 @@ local reference = Identity.serializeRefValue(state, child)
 equal(reference._type, "Ref", "reference type")
 equal(reference.instanceId, "2a", "reference id")
 
-equal(ValueEquality.valuesEqual(1, 1.00005), true, "number epsilon")
+equal(ValueEquality.valuesEqual(1, 1.00005), false, "small numeric edits remain changes")
+equal(ValueEquality.valuesEqual(1, 1.0000001), true, "f32 readback rounding")
 equal(ValueEquality.valuesEqual(1, 1.001), false, "number difference")
 equal(ValueEquality.valuesEqual(0 / 0, 0 / 0), true, "NaN equality")
 equal(
 	ValueEquality.valuesEqual(roblox.Vector3.new(1, 2, 3), roblox.Vector3.new(1.00005, 2, 3)),
-	true,
+	false,
 	"Vector3 epsilon"
 )
-equal(ValueEquality.valuesEqual(roblox.CFrame.new(1, 2, 3), roblox.CFrame.new(1.00005, 2, 3)), true, "CFrame epsilon")
+equal(ValueEquality.valuesEqual(roblox.CFrame.new(1, 2, 3), roblox.CFrame.new(1.00005, 2, 3)), false, "CFrame position changes")
 equal(
 	ValueEquality.valuesEqual(roblox.Color3.new(0.5, 0.25, 0.75), roblox.Color3.new(0.50001, 0.25, 0.75)),
-	true,
-	"Color3 quantization"
+	false,
+	"Color3 preserves sub-byte edits"
 )
 equal(
 	ValueEquality.valuesEqual(roblox.UDim2.new(0.5, 2, 0.25, 4), roblox.UDim2.new(0.50005, 2, 0.25, 4)),
-	true,
+	false,
 	"UDim2 epsilon"
 )
 equal(
 	ValueEquality.valuesEqual(roblox.NumberRange.new(1, 2), roblox.NumberRange.new(1.00005, 2)),
-	true,
+	false,
 	"NumberRange epsilon"
 )
 equal(
@@ -576,8 +578,8 @@ equal(
 		roblox.PhysicalProperties.new(0.7, 0.3, 0.5, 1, 1),
 		roblox.PhysicalProperties.new(0.70005, 0.3, 0.5, 1, 1)
 	),
-	true,
-	"PhysicalProperties epsilon"
+	false,
+	"PhysicalProperties small changes"
 )
 equal(
 	ValueEquality.valuesEqual(
@@ -590,10 +592,10 @@ equal(
 			roblox.NumberSequenceKeypoint.new(1, 1, 0),
 		})
 	),
-	true,
-	"NumberSequence epsilon"
+	false,
+	"NumberSequence small changes"
 )
-equal(ValueEquality.valuesEqual({ value = 1 }, { value = 1.00005 }), true, "table epsilon")
+equal(ValueEquality.valuesEqual({ value = 1 }, { value = 1.00005 }), false, "table small changes")
 
 local matchCandidates = {
 	{ Value = "first", Marker = "one" },
@@ -1089,6 +1091,7 @@ local packageStateOverlay = ReferenceOverlay.create({
 	valuesEqual = function(left, right)
 		return left == right
 	end,
+	exactValuesEqual = ValueEquality.exactValuesEqual,
 	writePropertyForSync = function(instance, propertyName, value)
 		instance[propertyName] = value
 		return true

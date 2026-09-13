@@ -1,6 +1,7 @@
 local BridgeValueEquality = {}
 
-local EPSILON = 0.0001
+-- Match the host's f32 readback bounds; never quantize float colors to bytes.
+local FLOAT32_EPSILON = 2 ^ -23
 local VECTOR2_FIELDS = { "X", "Y" }
 local VECTOR3_FIELDS = { "X", "Y", "Z" }
 local PHYSICAL_PROPERTIES_FIELDS = {
@@ -18,13 +19,12 @@ local function numbersEqual(a: number, b: number): boolean
 	if a ~= a and b ~= b then
 		return true
 	end
-	return math.abs(a - b) < EPSILON
+	return math.abs(a) < math.huge and math.abs(b) < math.huge
+		and math.abs(a - b) <= 4 * FLOAT32_EPSILON * math.max(1, math.abs(a), math.abs(b))
 end
 
 local function colorsEqual(a: Color3, b: Color3): boolean
-	return math.floor(a.R * 255) == math.floor(b.R * 255)
-		and math.floor(a.G * 255) == math.floor(b.G * 255)
-		and math.floor(a.B * 255) == math.floor(b.B * 255)
+	return numbersEqual(a.R, b.R) and numbersEqual(a.G, b.G) and numbersEqual(a.B, b.B)
 end
 
 local function vectorsEqual(a: any, b: any, fields: { string }): boolean
@@ -138,7 +138,12 @@ valuesEqual = function(a: any, b: any, seen: { [any]: any }?): boolean
 		local left = { a:GetComponents() }
 		local right = { b:GetComponents() }
 		for index, value in ipairs(left) do
-			if not numbersEqual(value, right[index]) then
+			local other = right[index]
+			local equal = if index <= 3 then numbersEqual(value, other)
+				else value == other or value ~= value and other ~= other
+					or math.abs(value) < math.huge and math.abs(other) < math.huge
+						and math.abs(value - other) <= 16 * FLOAT32_EPSILON
+			if not equal then
 				return false
 			end
 		end
@@ -182,6 +187,12 @@ end
 exactValuesEqual = function(a: any, b: any, seen: { [any]: any }?): boolean
 	if a == b then
 		return true
+	end
+	if typeof(a) == "number" and typeof(b) == "number" then
+		return a ~= a and b ~= b
+	end
+	if typeof(a) == "CFrame" and typeof(b) == "CFrame" then
+		return exactTablesEqual({ a:GetComponents() }, { b:GetComponents() }, {})
 	end
 	if type(a) ~= "table" or type(b) ~= "table" then
 		return false

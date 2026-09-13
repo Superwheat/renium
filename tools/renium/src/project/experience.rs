@@ -50,7 +50,7 @@ struct ExperienceLayout {
     places: Vec<ExperiencePlace>,
 }
 
-fn find_experience_root(start: &Path) -> Result<Option<PathBuf>> {
+pub(crate) fn find_experience_root(start: &Path) -> Result<Option<PathBuf>> {
     let mut current =
         canonical_path(start).with_context(|| format!("Failed to resolve {}", start.display()))?;
     if current.is_file() {

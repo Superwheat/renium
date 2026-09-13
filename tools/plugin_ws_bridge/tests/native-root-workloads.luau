@@ -7,6 +7,26 @@ local function extract(first, after, environment, returned)
 	return luau.load(source:sub(start, finish - 1) .. "\nreturn " .. returned, { environment = environment })()
 end
 do
+	local failures = {}
+	local diagnostic = extract("local function recordCleanupFailure(", "local SESSION_TTL_SECONDS", {
+		cleanupFailures = failures,
+		warn = function() error("Internal errors must not reach Studio Output") end,
+	}, "recordCleanupFailure")
+	local expire = extract("local function expireSession(", "local armSessionExpiry", {
+		recordCleanupFailure = diagnostic,
+		warn = function() error("Internal errors must not reach Studio Output") end,
+	}, "expireSession")
+	local session = { onExpire = function() error("missing original parent", 0) end }
+	local sessions = { owned = session }
+	assert(not expire(sessions, "owned", session))
+	assert(sessions.owned == session and session.rollbackFailed == "missing original parent")
+	assert(failures[1].operation == "session expiry" and failures[1].error == session.rollbackFailed)
+	for index = 1, 20 do diagnostic("retry", index) end
+	assert(#failures == 16 and failures[1].error == "5" and failures[16].error == "20")
+	session.onExpire = function() end
+	assert(expire(sessions, "owned", session) and sessions.owned == nil and session.rollbackFailed == nil)
+end
+do
 	local generationApi = {}
 	local lookups = 0
 	local service = {
@@ -72,14 +92,31 @@ assert(not predicate({ ClassName = "MeshPart" }, "TextureContent"))
 assert(predicate({ ClassName = "SurfaceAppearance" }, "TexturePack"))
 assert(not predicate({ ClassName = "MaterialVariant" }, "TexturePack"))
 assert(not predicate({ ClassName = "SurfaceAppearance" }, "ColorMap"))
+assert(predicate({ ClassName = "Sky" }, "SourceAssetId"))
+assert(predicate({ ClassName = "Model" }, "SourceAssetId"))
+assert(not predicate({ ClassName = "Sky" }, "UniqueId"))
+assert(predicate({ ClassName = "Model" }, "Scale"))
+assert(predicate({ ClassName = "WorldModel" }, "Scale"))
+assert(not predicate({ ClassName = "Part" }, "Scale"))
 
 local queue = extract("local function queueNativeRootWrite(", "local function applyChangedProperty(", {
 	decodePropertyValue = function(_, _, value) return true, value end,
 	readProperty = function(instance, name) return instance[name] ~= nil, instance[name] end,
-	valuesEqual = function(a, b) return a == b end,
+	exactValuesEqual = function(a, b) return a == b end,
 	markLiveMutation = function(ctx) ctx.editorTransaction.mutated = true end,
 }, "queueNativeRootWrite")
 local ctx = { editorTransaction = { historyRecording = "owned-recording" } }
+do
+	local model = { ClassName = "Model", Scale = 1 }
+	local owned = { editorTransaction = { historyRecording = "owned-recording", createdInstances = {} } }
+	local result = { noops = 0, propertyUpdated = 0 }
+	local target = { service = "ServerStorage", pathSegments = { "ServerStorage", "Car" }, pathOrdinals = { 1, 1 } }
+	assert(not pcall(queue, model, "Scale", 0.95, target, owned, result), "Existing models need their ordinary undo-aware setter")
+	owned.editorTransaction.createdInstances[model] = true
+	queue(model, "Scale", 0.95, target, owned, result)
+	assert(model.Scale == 1 and result.nativeRootWrites[1].value == 0.95,
+		"Initial scale must be queued as metadata without resizing newly built descendants")
+end
 local stats = { noops = 0, propertyUpdated = 0 }
 local change = { service = "Lighting", pathSegments = { "Lighting" }, pathOrdinals = { 1 } }
 lighting.PrioritizeLightingQuality = false
@@ -202,7 +239,7 @@ local snapshot = {
 local transactionState = {}
 transactionState.expectSnapshotUndo = extract("function TransactionState.expectSnapshotUndo(", "function TransactionState.rollbackSession(", {
 	TransactionState = transactionState,
-	valuesEqual = function(a, b) return a == b end,
+	exactValuesEqual = function(a, b) return a == b end,
 	readProperty = function(object, name) return true, object[name] end,
 }, "TransactionState.expectSnapshotUndo")
 local drained = false
@@ -273,6 +310,130 @@ for _, retained in { false, true } do
 	if retained then pending.nativeUndo = { explicitRollback = true, prepared = {} } end
 	simpleRollback(pending, {})
 	assert(committed and pending.historyRecording == nil)
+end
+do
+	local state = {}
+	local service = {}
+	local missing = { Name = "AntiRoll" }
+	local exact = { Parent = service }
+	local record = { service = "ServerStorage", parent = missing,
+		parentPathSegments = { "ServerStorage", "Public", "Cars", "Car", "AntiRoll" },
+		parentPathOrdinals = { 1, 1, 1, 2, 1 } }
+	local calls = 0
+	local available = false
+	local resolve = extract("function TransactionState.resolveJournalParent(", "function TransactionState.markJournalServices(", {
+		TransactionState = state,
+		resolveReplacement = function(value, replacements) return replacements[value] or value end,
+		game = { GetService = function() return service end },
+		resolvePathSegments = function(segments, _, ordinals)
+			calls += 1
+			if #segments < #record.parentPathSegments then return service end
+			assert(ordinals == record.parentPathOrdinals, "Duplicate-parent ordinals must survive rollback")
+			return if available then exact else nil
+		end,
+	}, "TransactionState.resolveJournalParent")
+	local ok, err = pcall(resolve, record, {})
+	assert(not ok and tostring(err):find("original parent ServerStorage.Public.Cars.Car.AntiRoll is missing", 1, true),
+		"A missing nested parent must not flatten AntiRollBarFL into ServerStorage")
+	assert(calls == 1, "Rollback must never search shorter ancestor paths")
+	available = true
+	assert(resolve(record, {}) == exact)
+	local moved = { Parent = exact }
+	assert(resolve(record, { [missing] = moved }) == moved, "Mapped identity must win over old paths")
+	record.parent = service
+	assert(resolve(record, {}) == service, "Real service-root children must remain valid")
+	record.parent = nil
+	assert(resolve(record, {}) == nil, "A recorded deletion must not reuse its stale parent path")
+end
+do
+	local readable, current = false, "saved"
+	local verify = extract("local function verifyChangedProperty(", "local function verifyPropertyChange(", {
+		Workspace = {},
+		isNativeRootProperty = function() return false end,
+		classHasProperty = function() return true end,
+		decodePropertyValue = function(_, _, value) return true, value end,
+		readProperty = function() return readable, current end,
+		propertyValuesEqual = function(_, _, a, b) return a == b end,
+		recordVerifyMismatch = function(stats) stats.mismatches += 1 end,
+	}, "verifyChangedProperty")
+	local instance = { IsA = function() return false end }
+	local stats = { verified = 0, mismatches = 0 }
+	verify(instance, "DistanceAttenuation", "saved", {}, {}, stats, nil, "ServerStorage")
+	assert(stats.verified == 0 and stats.mismatches == 0, "Unreadable native fields require snapshot proof, not a false mismatch or verification credit")
+	readable = true
+	verify(instance, "DistanceAttenuation", "saved", {}, {}, stats, nil, "ServerStorage")
+	assert(stats.verified == 1)
+	current = "different"
+	verify(instance, "DistanceAttenuation", "saved", {}, {}, stats, nil, "ServerStorage")
+	assert(stats.verified == 1 and stats.mismatches == 1, "Readable mismatches must still reject the push")
+end
+do
+	local originalParent, matchedParent = {}, {}
+	local wrong = { ClassName = "Texture", Parent = originalParent }
+	local first = { ClassName = "Texture", Parent = matchedParent }
+	local second = { ClassName = "Texture", Parent = matchedParent }
+	local resolve = extract("local function resolveEntryInstance(", "local function writeProperty(", {
+		resolveEntryParent = function(_, resolved) return resolved.parent end,
+		resolvePathSegments = function() return wrong end,
+		resolveOrdinalChild = function(parent, name, ordinal)
+			assert(parent == matchedParent and name == "Texture")
+			return if ordinal == 1 then first else if ordinal == 2 then second else nil
+		end,
+		matchedSettingsInstance = function() end,
+		candidateBucketsForParent = function(parent)
+			assert(parent == matchedParent)
+			return { Texture = { Texture = { first, second } } }
+		end,
+		BridgeCandidateMatch = require("../BridgeCandidateMatch.module"),
+	}, "resolveEntryInstance")
+	local entry = { className = "Texture", pathSegments = { "Workspace", "Part", "Texture" },
+		pathOrdinals = { 1, 109, 2 }, previousPathSegments = {}, ambiguousSiblings = true,
+		matchProperties = {}, matchAttributes = {}, key = "second Texture" }
+	assert(resolve(entry, "Workspace", {}, { parent = matchedParent }, {}) == second,
+		"Duplicate children must follow the already matched parent identity")
+	entry.anchorOnly = true
+	assert(resolve(entry, "Workspace", {}, { parent = matchedParent }, {}) == second)
+	assert(resolve(entry, "Workspace", {}, { parent = matchedParent }, { [second] = true }) == first,
+		"An earlier duplicate match must not make the sole remaining sibling ambiguous")
+	entry.pathOrdinals[3] = 1
+	assert(resolve(entry, "Workspace", {}, { parent = matchedParent }, { [second] = true }) == first)
+	entry.pathOrdinals[3] = 3
+	assert(not pcall(resolve, entry, "Workspace", {}, { parent = matchedParent }, {}),
+		"Missing duplicate ordinal must remain ambiguous, never borrow another parent's child")
+	entry.ambiguousSiblings = false
+	entry.previousPathSegments = { "Workspace", "PreviousParent", "Texture" }
+	entry.previousPathOrdinals = { 1, 1, 1 }
+	assert(resolve(entry, "Workspace", {}, { parent = matchedParent }, {}) == wrong,
+		"A lookup-only ancestor must honor its established previous identity before its desired path")
+end
+do
+	local tokens = {}
+	local root, child = {}, {}
+	root.GetDescendants = function() return { child } end
+	local failed = false
+	root.Destroy = function()
+		assert(#tokens == 2 and tokens[1].active and tokens[2].active)
+		if failed then error("destroy failed") end
+	end
+	local destroy = extract("function TransactionState.destroyOwned(", "function TransactionState.restoreSnapshot(", {
+		TransactionState = {},
+		cancelExpectedEvent = function(_, token) token.active = false end,
+	}, "TransactionState.destroyOwned")
+	local ctx = {
+		expectParentChange = function(instance, parent)
+			assert(instance == root and parent == nil)
+			local token = { active = true }; tokens[#tokens + 1] = token; return token
+		end,
+		expectPropertyEvent = function(instance, property, value)
+			assert(instance == child and property == "Parent" and value == nil)
+			local token = { active = true }; tokens[#tokens + 1] = token; return token
+		end,
+	}
+	destroy(root, ctx)
+	assert(tokens[1].active and tokens[2].active, "Deferred destruction signals still require their own expectations")
+	tokens = {}; failed = true
+	assert(not pcall(destroy, root, ctx))
+	assert(not tokens[1].active and not tokens[2].active, "Failed destruction must cancel expectations")
 end
 
 -- Exercise the production commit, not a second model of its phase ordering.

@@ -1203,13 +1203,14 @@ fn package_preflight_overlay_property_requests(
     live_dom: &RbxWeakDom,
     package_pairs: &[CanonicalRbxSubtreePair],
     logical_properties_by_ref: &HashMap<RbxRef, HashMap<rbx_dom_weak::Ustr, RbxVariant>>,
-    desired_refs: &BytecodeModelImportRefs,
+    desired_refs: Option<&BytecodeModelImportRefs>,
     database: &ReflectionDatabase<'_>,
     property_filters: &HashMap<String, NativePropertyFilter>,
 ) -> Result<HashMap<String, HashSet<String>>> {
     package_pairs
         .par_iter()
         .map(|pair| {
+            let desired_refs = desired_refs.context("Desired package paths were not prepared")?;
             pair.entries
                 .par_iter()
                 .try_fold(
@@ -1304,6 +1305,22 @@ fn package_preflight_overlay_property_requests(
             }
             Ok(requested)
         })
+}
+
+#[test]
+fn package_preflight_without_pairs_does_not_require_reference_paths() {
+    let dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+    let requests = package_preflight_overlay_property_requests(
+        &dom,
+        &dom,
+        &[],
+        &HashMap::new(),
+        None,
+        rbx_reflection_database::get().unwrap(),
+        &HashMap::new(),
+    )
+    .unwrap();
+    assert!(requests.is_empty());
 }
 
 fn package_preflight_overlay_schema(
@@ -1901,9 +1918,7 @@ fn plan_editor_package_root_retention(
         &live_dom,
         &comparison_pairs,
         logical_properties_by_ref,
-        desired_refs
-            .as_ref()
-            .context("Desired package paths were not prepared")?,
+        desired_refs.as_ref(),
         database,
         &package_property_filters,
     )?;
@@ -2236,12 +2251,58 @@ fn native_import_services(changes: &EditorChangeSet) -> HashSet<String> {
     {
         return HashSet::new();
     }
-    changes
+    let mut services: HashSet<String> = changes
         .instance_changes
         .iter()
         .filter(|change| change.mode == "reconcileService" && change.allow_deletes)
         .map(|change| change.service.clone())
-        .collect()
+        .collect();
+    // Instance.new plus plugin setters cannot initialize saved, read-only
+    // fields (notably WeldConstraint.CFrame0). Use the binary reader for those
+    // additions instead of discovering lost data only after publication.
+    let Ok(database) = rbx_reflection_database::get() else {
+        return services;
+    };
+    let additive = additive_native_roots(changes, &services);
+    for change in &changes.instance_changes {
+        if change.mode != "upsertInstances" {
+            continue;
+        }
+        let Some(document) = changes.native_property_documents.get(&change.service) else {
+            continue;
+        };
+        let additions = change
+            .instances
+            .iter()
+            .filter(|instance| {
+                !instance.anchor_only
+                    && instance.previous_path_segments.is_empty()
+                    && instance.previous_class_name.is_none()
+            })
+            .filter(|instance| {
+                !additive.get(&change.service).is_some_and(|roots| {
+                    instance
+                        .path_segments
+                        .get(1)
+                        .is_some_and(|name| roots.contains(name))
+                        && instance.path_ordinals.get(1) == Some(&1)
+                })
+            })
+            .map(|instance| instance.settings_id.as_str())
+            .collect::<HashSet<_>>();
+        if document.instances.iter().any(|instance| additions.contains(instance.settings_id.as_str())
+            && instance.properties.keys().any(|name| {
+                if crate::editor::native_roots::is_property(&instance.class_name, name) { return false; }
+                let Some(property) = rbx_property_descriptor(database, &instance.class_name, name) else { return false; };
+                !matches!(property.data_type, rbx_reflection::DataType::Value(rbx_dom_weak::types::VariantType::UniqueId))
+                    && matches!(property.scriptability, RbxScriptability::Read | RbxScriptability::None)
+                    && matches!(&property.kind, rbx_reflection::PropertyKind::Canonical { serialization }
+                        if !matches!(serialization, rbx_reflection::PropertySerialization::DoesNotSerialize))
+            })) {
+            services.insert(change.service.clone());
+        }
+    }
+    services
 }
 
 pub(crate) fn build_editor_binary_import(
@@ -2415,6 +2476,72 @@ mod additive_import_tests {
         changes.files_to_studio_filters_active = true;
         assert!(additive_native_roots(&changes, &HashSet::new()).is_empty());
     }
+
+    #[test]
+    fn saved_read_only_fields_use_native_construction_for_nested_additions() {
+        let service = "ServerStorage";
+        let joint = EditorInstanceDescriptor {
+            settings_id: "joint".into(),
+            class_name: "WeldConstraint".into(),
+            path_segments: vec![service.into(), "Car".into(), "Weld".into()],
+            path_ordinals: vec![1, 1, 1],
+            ..Default::default()
+        };
+        let mut saved = SettingsBytecodeInstance::new(
+            "joint".into(),
+            "Weld".into(),
+            "WeldConstraint".into(),
+            None,
+        );
+        saved.properties.insert(
+            "CFrame0".into(),
+            json!({"_type":"CFrame","components":[1,2,3,1,0,0,0,1,0,0,0,1]}),
+        );
+        let mut changes = EditorChangeSet {
+            instance_changes: vec![EditorInstanceChange {
+                service: service.into(),
+                mode: "upsertInstances".into(),
+                allow_deletes: false,
+                instances: vec![joint.clone()],
+                preserve_instances: vec![],
+            }],
+            native_property_documents: HashMap::from([(
+                service.into(),
+                std::sync::Arc::new(SettingsBytecode {
+                    version: SETTINGS_BINARY_VERSION,
+                    instances: vec![saved],
+                }),
+            )]),
+            ..Default::default()
+        };
+        assert!(native_import_services(&changes).contains(service));
+        changes.instance_changes[0].instances[0].previous_path_segments =
+            joint.path_segments.clone();
+        assert!(
+            native_import_services(&changes).is_empty(),
+            "Ordinary existing-instance edits stay incremental"
+        );
+        changes.instance_changes[0].instances[0] = joint;
+        changes.instance_changes[0]
+            .instances
+            .push(EditorInstanceDescriptor {
+                settings_id: "new-car".into(),
+                class_name: "Model".into(),
+                path_segments: vec![service.into(), "Car".into()],
+                path_ordinals: vec![1, 1],
+                ..Default::default()
+            });
+        assert!(
+            native_import_services(&changes).is_empty(),
+            "A supported additive payload must not rebuild existing siblings"
+        );
+        changes.instance_changes[0].instances.pop();
+        changes.files_to_studio_filters_active = true;
+        assert!(
+            native_import_services(&changes).is_empty(),
+            "Filtered pushes must not widen their scope"
+        );
+    }
 }
 
 fn independent_additive_document(
@@ -2481,6 +2608,73 @@ fn independent_additive_document(
             })
             .collect(),
     })
+}
+
+fn clear_import_engine_identities(dom: &mut RbxWeakDom) {
+    let mut pending = vec![dom.root_ref()];
+    while let Some(referent) = pending.pop() {
+        let instance = dom.get_by_ref_mut(referent).unwrap();
+        pending.extend_from_slice(instance.children());
+        // Saved identities are reconciliation evidence, not assignments for new
+        // objects. The destination can still own them (including detached undo
+        // roots). Let Studio allocate identities for both native import paths.
+        instance
+            .properties
+            .retain(|_, value| !matches!(value, RbxVariant::UniqueId(_)));
+    }
+}
+
+#[test]
+fn import_allocates_new_engine_identities_without_losing_saved_content() {
+    let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+    let service = dom.insert(dom.root_ref(), RbxInstanceBuilder::new("ServerStorage"));
+    let identity = rbx_dom_weak::types::UniqueId::new(9, 8, 7);
+    let root = dom.insert(
+        service,
+        RbxInstanceBuilder::new("Model")
+            .with_name("RetainedElsewhere")
+            .with_property("UniqueId", identity),
+    );
+    let part = dom.insert(
+        root,
+        RbxInstanceBuilder::new("Part")
+            .with_property("UniqueId", identity)
+            .with_property("HistoryId", identity)
+            .with_property("Transparency", 0.375f32),
+    );
+    dom.get_by_ref_mut(root)
+        .unwrap()
+        .properties
+        .insert("PrimaryPart".into(), RbxVariant::Ref(part));
+    clear_import_engine_identities(&mut dom);
+    let mut bytes = Vec::new();
+    rbx_binary::to_writer(&mut bytes, &dom, &[service]).unwrap();
+    let decoded = rbx_binary::from_reader(bytes.as_slice()).unwrap();
+    for instance in decoded.descendants() {
+        assert!(
+            !instance
+                .properties
+                .values()
+                .any(|value| matches!(value, RbxVariant::UniqueId(id) if *id == identity))
+        );
+    }
+    let model = decoded
+        .descendants()
+        .find(|node| node.class.as_str() == "Model")
+        .unwrap();
+    let target = decoded
+        .descendants()
+        .find(|node| node.class.as_str() == "Part")
+        .unwrap();
+    assert_eq!(model.name, "RetainedElsewhere");
+    assert_eq!(
+        model.properties[&"PrimaryPart".into()],
+        RbxVariant::Ref(target.referent())
+    );
+    assert_eq!(
+        target.properties[&"Transparency".into()],
+        RbxVariant::Float32(0.375)
+    );
 }
 
 fn build_editor_binary_import_for_services(
@@ -2851,6 +3045,7 @@ fn build_editor_binary_import_for_services(
     }
     let phase_started = Instant::now();
     stages.next("partition and encode native service payloads");
+    clear_import_engine_identities(&mut build.dom);
     // Temporary A/B selection while the transaction adapter is integrated.
     // Existing package and partial-service workflows retain their current path.
     if allow_service_replacement

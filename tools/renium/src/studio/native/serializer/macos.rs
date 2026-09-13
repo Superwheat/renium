@@ -29,7 +29,20 @@ pub(crate) use properties::{
 const HELPER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-studio-helper.dylib"));
 const LAUNCHER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-studio-launcher"));
 const REQUEST_MAGIC: u32 = 0x4d4e4552;
-const REQUEST_VERSION: u32 = 6;
+// Fence property-operation additions as well as the outer serializer header.
+// An already-open Studio can still have an older helper mapped after an update.
+const REQUEST_VERSION: u32 = 7;
+
+fn native_helper_error(error: &str) -> String {
+    if error.contains("invalid serializer request")
+        || error.contains("Invalid protected-property request")
+        || error.contains("incompatible native helper protocol")
+    {
+        format!("{error}. Restart this Studio window to load the installed Renium native helper")
+    } else {
+        error.to_string()
+    }
+}
 const RESPONSE_SIZE: usize = 536;
 const MACH_HEADER_64_SIZE: usize = 32;
 const SEGMENT_COMMAND_64_SIZE: usize = 72;
@@ -782,7 +795,10 @@ fn invoke_helper(
             .position(|byte| *byte == 0)
             .unwrap_or(error_bytes.len());
         let error = String::from_utf8_lossy(&error_bytes[..end]);
-        bail!("Studio native serializer failed with status {status}: {error}");
+        bail!(
+            "Studio native serializer failed with status {status}: {}",
+            native_helper_error(&error)
+        );
     }
     Ok((output_size, elapsed_ms))
 }
@@ -887,7 +903,10 @@ fn invoke_package_helper(
         .unwrap_or(text_bytes.len());
     let text = String::from_utf8_lossy(&text_bytes[..end]).into_owned();
     if status != 0 {
-        bail!("Studio native package action failed with status {status}: {text}");
+        bail!(
+            "Studio native package action failed with status {status}: {}",
+            native_helper_error(&text)
+        );
     }
     Ok((changed, version, text))
 }

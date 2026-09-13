@@ -204,11 +204,16 @@ fn read_bytecode_explorer_batch_ops(
 }
 
 fn parse_bytecode_explorer_batch_ops(raw: &str) -> Result<Vec<BytecodeExplorerBatchOp>> {
-    if let Ok(request) = serde_json::from_str::<BytecodeExplorerBatchRequest>(raw) {
-        return Ok(request.ops);
+    let raw = raw.trim_start_matches('\u{feff}');
+    // Select the envelope before decoding. Retrying a malformed object as an
+    // array discards the actual field error and reports a misleading type error.
+    match raw.trim_start().chars().next() {
+        Some('{') => {
+            serde_json::from_str::<BytecodeExplorerBatchRequest>(raw).map(|request| request.ops)
+        }
+        _ => serde_json::from_str::<Vec<BytecodeExplorerBatchOp>>(raw),
     }
-    serde_json::from_str::<Vec<BytecodeExplorerBatchOp>>(raw)
-        .context("Invalid batch ops JSON; expected {\"ops\":[...]} or [...]")
+    .context("Invalid batch ops JSON; expected {\"ops\":[...]} or [...]")
 }
 
 fn parse_batch_requested_fields(
@@ -452,22 +457,20 @@ fn filtered_record(
     attribute_record: bool,
     class_name: Option<&str>,
 ) -> Option<Value> {
-    if include_all {
-        return Some(Value::Object(record.clone()));
-    }
-    let fields = fields?;
+    let Some(fields) = fields else {
+        return include_all.then(|| Value::Object(record.clone()));
+    };
     let include_all_key = if attribute_record {
         requested_field(Some(fields), "attributes", node_field_aliases("attributes"))
     } else {
         requested_field(Some(fields), "properties", node_field_aliases("properties"))
     };
-    if include_all_key {
-        return Some(Value::Object(record.clone()));
-    }
-    let filtered = record
+    let mut filtered = record
         .iter()
         .filter(|(name, _)| {
-            if attribute_record {
+            if include_all || include_all_key {
+                true
+            } else if attribute_record {
                 requested_attribute_field(Some(fields), name)
             } else {
                 class_name.is_some_and(|class_name| {
@@ -477,7 +480,27 @@ fn filtered_record(
         })
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect::<Map<String, Value>>();
-    (!filtered.is_empty()).then_some(Value::Object(filtered))
+    if !attribute_record && let Some(class_name) = class_name {
+        for field in fields {
+            let requested = ["p:", "prop:", "property:"]
+                .iter()
+                .find_map(|prefix| field.strip_prefix(prefix))
+                .unwrap_or(field);
+            let serialized_name = rbx_reflection_database::get().ok().and_then(|database| {
+                rbx_serialized_property_name_for_logical(database, class_name, requested)
+            });
+            if !record.keys().any(|name| {
+                name.eq_ignore_ascii_case(requested)
+                    || serialized_name
+                        .is_some_and(|serialized| name.eq_ignore_ascii_case(serialized))
+            }) && let Some((name, value)) =
+                super::reflected_property_default(class_name, requested)
+            {
+                filtered.entry(name).or_insert(value);
+            }
+        }
+    }
+    (include_all || include_all_key || !filtered.is_empty()).then_some(Value::Object(filtered))
 }
 
 pub(crate) fn bytecode_explorer_batch(args: BytecodeExplorerBatchArgs) -> Result<()> {
@@ -872,8 +895,9 @@ fn bytecode_explorer_batch_op_json(
             };
             let groups = explorer_search_groups(query);
             let mut match_indices = Vec::new();
+            let mut truncated = false;
             let mut visible_indices = HashSet::new();
-            if !groups.is_empty() {
+            {
                 let mut candidates = vec![root_index];
                 let mut cursor = 0usize;
                 while cursor < candidates.len() {
@@ -883,13 +907,16 @@ fn bytecode_explorer_batch_op_json(
                     cursor += 1;
                 }
                 for index in candidates {
-                    if explorer_search_instance_matches(
-                        ctx.document,
-                        ctx.service_path_segments_by_index,
-                        index,
-                        &groups,
-                    ) {
+                    if query.trim().is_empty()
+                        || explorer_search_instance_matches(
+                            ctx.document,
+                            ctx.service_path_segments_by_index,
+                            index,
+                            &groups,
+                        )
+                    {
                         if limit > 0 && match_indices.len() >= limit {
+                            truncated = true;
                             break;
                         }
                         match_indices.push(index);
@@ -935,6 +962,7 @@ fn bytecode_explorer_batch_op_json(
                 .collect::<Vec<_>>();
             insert_top_field(&mut response, mode, "rootIds", Value::Array(root_ids));
             insert_top_field(&mut response, mode, "matchIds", Value::Array(match_ids));
+            insert_top_field(&mut response, mode, "truncated", Value::Bool(truncated));
             insert_top_field(&mut response, mode, "visibleIds", Value::Array(visible_ids));
             insert_top_field(&mut response, mode, "nodes", Value::Array(nodes));
         }
@@ -960,6 +988,7 @@ fn bytecode_explorer_batch_op_json(
             };
             let limit = op.limit.unwrap_or(20);
             let mut match_indices = instance_api::find_instances(ctx.document, &query);
+            let truncated = limit > 0 && match_indices.len() > limit;
             if limit > 0 {
                 match_indices.truncate(limit);
             }
@@ -969,6 +998,7 @@ fn bytecode_explorer_batch_op_json(
                 .map(|index| projection.node(index, false))
                 .collect::<Vec<_>>();
             insert_top_field(&mut response, mode, "matches", Value::Array(matches));
+            insert_top_field(&mut response, mode, "truncated", Value::Bool(truncated));
         }
         _ => unreachable!("normalized batch op is exhaustive"),
     }
@@ -1458,6 +1488,10 @@ fn explorer_search_property_value(
         .iter()
         .chain(instance.attributes.iter())
         .find_map(|(name, value)| (explorer_search_compact(name) == wanted).then(|| value.clone()))
+        .or_else(|| {
+            super::reflected_property_default(&instance.class_name, property_name)
+                .map(|(_, value)| value)
+        })
 }
 
 fn explorer_search_tags(instance: &SettingsBytecodeInstance) -> Vec<String> {
@@ -1673,14 +1707,8 @@ impl ExplorerDaemonState {
                 reload_list.push(canonical);
             }
         }
+        let mut loaded_states = Vec::with_capacity(reload_list.len());
         for service in &reload_list {
-            if !self
-                .services
-                .iter()
-                .any(|existing| existing.eq_ignore_ascii_case(service))
-            {
-                self.services.push(service.clone());
-            }
             match ExplorerServiceState::load(active_root, service) {
                 Ok(mut state) => {
                     if let (Some(loaded), Some(projection)) = (loaded.as_ref(), projection.as_ref())
@@ -1721,14 +1749,26 @@ impl ExplorerDaemonState {
                             }
                         }
                     }
-                    self.service_states.insert(service.clone(), state);
+                    loaded_states.push((service.clone(), state));
                 }
                 Err(error) => {
-                    eprintln!("[renium] explorer-daemon: failed to load {service}: {error:?}");
-                    self.service_states
-                        .insert(service.clone(), ExplorerServiceState::empty(service));
+                    bail!(
+                        "Could not load {service}: {error:#}. Repair the store and refresh Explorer."
+                    );
                 }
             }
+        }
+        // Publish a complete reload only. A damaged store must not look empty
+        // or leave rows built from a mixture of old and partially loaded data.
+        for (service, state) in loaded_states {
+            if !self
+                .services
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(&service))
+            {
+                self.services.push(service.clone());
+            }
+            self.service_states.insert(service, state);
         }
         self.sort_services();
         self.snapshot_version += 1;

@@ -29,7 +29,8 @@ function BridgeStatus.view(state)
 	local connectRequested = state.connectRequested
 	local pendingEditCount = state.pendingEditCount
 	local liveSync = editor.liveSync
-	local syncFailed = liveSync ~= nil and type(liveSync.error) == "string" and liveSync.error ~= ""
+	local syncFailed = liveSync ~= nil and not liveSync.resolutionRequired
+		and type(liveSync.error) == "string" and liveSync.error ~= ""
 
 	local mode = if readyChannels > 0
 		then "connected"
@@ -53,12 +54,12 @@ function BridgeStatus.view(state)
 		elseif connectionStatus == "Disconnected" or connectionStatus == "Another Renium session is active" then ""
 		else connectionStatus
 	if mode == "connected" and liveSync ~= nil then
-		if syncFailed then
-			title = "Sync failed"
-			subtitle = "Changes are still pending. See the editor or rbx lst for details."
-		elseif liveSync.resolutionRequired then
+		if liveSync.resolutionRequired then
 			title = "Sync needs a decision"
 			subtitle = "Resolve the conflict in the editor or CLI."
+		elseif syncFailed then
+			title = "Sync failed"
+			subtitle = "Changes are still pending. See the editor or rbx lst for details."
 		elseif not liveSync.running then
 			subtitle = "Live Sync is off."
 		elseif liveSync.paused then

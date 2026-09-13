@@ -1943,6 +1943,11 @@ fn automation_live_operation(
         let persisted = state.live_sync().set_enabled(context, bridge, false);
         let daemon = state.live_sync().stop(context.id);
         persisted.map_err(automation_failure)?;
+        // The worker's final report can contain its historical error. Publish the
+        // explicit stopped state after it has joined, even if no worker survived.
+        if let Some(runtime_id) = context.runtime_id.as_deref() {
+            super::live::report_plugin_stopped(bridge, runtime_id).map_err(automation_failure)?;
+        }
         return Ok(merge_live_status(plugin, daemon, options.compact));
     }
 
@@ -2230,7 +2235,7 @@ fn merge_live_status(plugin: Value, daemon: Value, compact: bool) -> Value {
     if compact {
         compact_live_status(result)
     } else {
-        result
+        crate::studio::automation::normalize_live_status(result)
     }
 }
 
@@ -2496,6 +2501,35 @@ fn automation_execute_request(
                 .expect("validated requests after bind require cx");
             if operation.id == op::UNBIND {
                 return Ok(json!({ "removed": state.remove_context(context_id) }));
+            }
+            // Place registration/order edits belong to the experience manifest,
+            // including when no place is selected or Studio is connected.
+            if matches!(
+                operation.id,
+                op::PLACE_ADD | op::PLACE_RENAME | op::PLACE_REORDER
+            ) {
+                let project_context = bound_context::resolve_project(state, context_id)?;
+                return automation_dispatch_managed(
+                    operation.id,
+                    &project_context,
+                    &request.p,
+                    state,
+                    bridge,
+                    bridge_wait_seconds,
+                    false,
+                );
+            }
+            if state.context(context_id).is_some_and(|context| {
+                Path::new(&context.project)
+                    .file_name()
+                    .is_some_and(|name| name == "renium.experience.json")
+            }) {
+                return Err(automation::Failure::new(
+                    "no_project",
+                    "Select a place for this operation with --place <alias|placeId>",
+                    false,
+                    "bind",
+                ));
             }
             let requires_review = operation.review
                 && (matches!(operation.id, op::STUDIO_OPEN | op::STUDIO_CLOSE)
@@ -3114,6 +3148,29 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn detailed_and_compact_live_status_agree_on_failures_and_wait_timeouts() {
+        for daemon in [
+            json!({"running":true,"error":"Export failed"}),
+            json!({"running":true,"resolutionRequired":true,"error":"Size differs"}),
+            json!({"running":true,"settled":false}),
+        ] {
+            let detailed =
+                merge_live_status(json!({"ok":true,"changes":[]}), daemon.clone(), false);
+            let compact = merge_live_status(json!({"ok":true,"changes":[]}), daemon, true);
+            assert_eq!(detailed["ok"], false);
+            assert_eq!(compact["ok"], detailed["ok"]);
+            assert_eq!(compact["error"], detailed["error"]);
+        }
+        let healthy = merge_live_status(
+            json!({"ok":true}),
+            json!({"running":true,"settled":true}),
+            false,
+        );
+        assert_eq!(healthy["ok"], true);
+        assert!(healthy.get("error").is_none());
     }
 
     #[test]

@@ -259,13 +259,30 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
             );
         }
 
-        let attributes = json_attributes_to_rbx(&instance.attributes, self.database, self.refs)
+        let mut attributes = json_attributes_to_rbx(&instance.attributes, self.database, self.refs)
             .with_context(|| {
                 format!(
                     "{} ({}) attributes cannot be represented in a Roblox model",
                     instance.name, instance.class_name
                 )
             })?;
+        // Service snapshots omit engine-owned migration attributes and may
+        // omit Technology. Studio defaults the latter to Compatibility and
+        // rewrites brightness/adds color grading; without the unified marker
+        // it also replaces the saved style/quality. Preserve explicitly modern
+        // lighting on reopen without changing legacy files or explicit choices.
+        if instance.class_name == "Lighting"
+            && (builder.has_property("LightingStyle")
+                || builder.has_property("PrioritizeLightingQuality"))
+        {
+            if !builder.has_property("Technology") {
+                builder.add_property("Technology", RbxVariant::Enum(RbxEnum::from_u32(5)));
+            }
+            let marker = "RBX_LightingTechnologyUnifiedMigration";
+            if attributes.get(marker).is_none() {
+                attributes.insert(marker.to_string(), RbxVariant::Bool(true));
+            }
+        }
         if !attributes.is_empty() {
             builder.add_property("Attributes", RbxVariant::Attributes(attributes));
         }

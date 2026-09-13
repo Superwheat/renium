@@ -114,7 +114,7 @@ struct DataModelScanStats
 };
 
 static constexpr std::uint32_t Magic = 0x4d4e4552;
-static constexpr std::uint32_t Version = 6;
+static constexpr std::uint32_t Version = 7;
 // Command 3 does not use factoryRva as a function address. Its top bit opts in
 // to per-candidate clocks; older helpers ignore it and keep the same payloads.
 static constexpr std::uint64_t PropertyPhaseTimingFlag = std::uint64_t{1} << 63;
@@ -3146,12 +3146,17 @@ static bool HandleClient(int client)
     Request request{};
     Response response{Magic, 7, 0, 0, {}};
     if (!ReadExact(client, &request, sizeof(request)) || request.magic != Magic ||
-        request.version != Version ||
         (request.command != 1 && request.command != 2 && request.command != 3 && request.command != 4) ||
         (request.command != 4 && request.pathLength == 0) ||
         request.pathLength >= (request.command == 3 ? 128u * 1024 * 1024 + 66216u : PATH_MAX) || request.titleLength >= PATH_MAX)
     {
         SetError(response, "invalid serializer request");
+        WriteExact(client, &response, sizeof(response));
+        return false;
+    }
+    if (request.version != Version)
+    {
+        SetError(response, "incompatible native helper protocol; restart Studio with the matching Renium build");
         WriteExact(client, &response, sizeof(response));
         return false;
     }

@@ -581,9 +581,12 @@ fn push_daemon_endpoint(
 fn try_bind_daemon_context(
     project_root: Option<&Path>,
     project_only: bool,
+    experience_only: bool,
 ) -> Result<Option<Value>> {
     let resource_lease = crate::plugins::environment_claim()?;
+    let project = crate::app::context::project_override().map(|path| absolutize_for_daemon(&path));
     let root = project_root
+        .or_else(|| daemon_project_root(project.as_deref()))
         .map_or_else(
             || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             absolutize_for_daemon,
@@ -595,7 +598,7 @@ fn try_bind_daemon_context(
         id: current_millis().min(u128::from(u64::MAX)) as u64,
         op: automation::op::BIND,
         cx: None,
-        p: json!({ "root": root, "place": place_filter(), "resourceLease": resource_lease, "projectOnly": project_only }),
+        p: json!({ "root": root, "project": project, "place": place_filter(), "resourceLease": resource_lease, "projectOnly": project_only, "experienceOnly": experience_only }),
     })?
     else {
         return Ok(None);
@@ -734,7 +737,7 @@ fn ensure_shared_daemon_on(ports: &str, wait_seconds: f64, control_port: u16) ->
 }
 
 pub(crate) fn try_daemon_project_root(project_root: &Path) -> Result<Option<PathBuf>> {
-    try_bind_daemon_context(Some(project_root), false)?
+    try_bind_daemon_context(Some(project_root), false, false)?
         .map(|context| {
             context
                 .get("root")
@@ -832,9 +835,14 @@ fn daemon_control_request_inner(
         ) && object.get("editor").and_then(Value::as_bool) == Some(true);
     // An explicit file is already the open target. Binding it must not first
     // select some unrelated, already-connected runtime from this workspace.
-    let project_only = operation == automation::op::STUDIO_OPEN
-        && object.get("file").and_then(Value::as_str).is_some();
-    let mut context = try_bind_daemon_context(project_root, project_only)?;
+    let experience_only = matches!(
+        operation,
+        automation::op::PLACE_ADD | automation::op::PLACE_RENAME | automation::op::PLACE_REORDER
+    );
+    let project_only = experience_only
+        || operation == automation::op::STUDIO_OPEN
+            && object.get("file").and_then(Value::as_str).is_some();
+    let mut context = try_bind_daemon_context(project_root, project_only, experience_only)?;
     let ready = |context: &Option<Value>| {
         context.as_ref().is_some_and(|context| {
             !needs_runtime || context.get("runtimeId").and_then(Value::as_str).is_some()
@@ -843,7 +851,7 @@ fn daemon_control_request_inner(
     let daemon_started = context.is_none() && (required || needs_runtime);
     if daemon_started {
         ensure_shared_daemon(&bridge_ports, bridge_wait_seconds)?;
-        context = try_bind_daemon_context(project_root, project_only)?;
+        context = try_bind_daemon_context(project_root, project_only, experience_only)?;
     }
     if needs_runtime && !ready(&context) && shared_daemon_available() {
         let reconnect_grace = if daemon_started {
@@ -855,7 +863,7 @@ fn daemon_control_request_inner(
         let deadline = Instant::now() + wait;
         let mut bind_error = None;
         while !ready(&context) && Instant::now() < deadline {
-            match try_bind_daemon_context(project_root, project_only) {
+            match try_bind_daemon_context(project_root, project_only, experience_only) {
                 Ok(bound) => context = bound,
                 Err(error) => bind_error = Some(error),
             }

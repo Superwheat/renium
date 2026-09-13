@@ -11,7 +11,7 @@ pub(crate) use crate::app::context::Selection;
 #[cfg(any(windows, target_os = "macos"))]
 use crate::editor::review::local_place_path_for_pid;
 use crate::project::experience::{
-    AmbiguousExperiencePlace, ExperiencePlace, resolve_experience_place,
+    AmbiguousExperiencePlace, ExperiencePlace, find_experience_root, resolve_experience_place,
 };
 use crate::project::{config, workflows};
 #[cfg(any(windows, target_os = "macos"))]
@@ -410,6 +410,29 @@ pub(super) fn bind(
         .transpose()
         .map_err(|error| Failure::new("bad_req", error.to_string(), false, "bind"))?;
     let requested_runtime = string(object, "runtime");
+    if object.get("experienceOnly").and_then(Value::as_bool) == Some(true)
+        && let Some(experience) = find_experience_root(&root).map_err(bind_project_failure)?
+    {
+        let project = experience.join("renium.experience.json");
+        let fingerprint = fingerprint(&project, &experience).map_err(bind_project_failure)?;
+        let context = state.insert_context(BoundContext {
+            id: 0,
+            initialized: false,
+            project: project.display().to_string(),
+            root: experience.display().to_string(),
+            experience: experience.display().to_string(),
+            source: String::new(),
+            place_id: None,
+            game_id: None,
+            resource_lease,
+            selector: String::new(),
+            runtime_id: None,
+            plugin_build: None,
+            fingerprint,
+        });
+        return serde_json::to_value(context)
+            .map_err(|error| Failure::new("internal", error.to_string(), false, "bind"));
+    }
     let selected_root = if explicit_project.is_none() {
         let selected = match resolve_experience_place(&root, requested_place.as_deref()) {
             Ok(place) => place,
@@ -732,6 +755,62 @@ pub(super) fn path(context: &BoundContext, path: PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn experience_place_registration_does_not_select_or_initialize_a_place() {
+        let root = crate::tests::support::temp_dir("experience-registration");
+        fs::create_dir_all(root.join("places/baseplate")).unwrap();
+        fs::create_dir_all(root.join("places/lobby")).unwrap();
+        fs::write(
+            root.join("renium.experience.json"),
+            json!({
+                "gameId": 10, "placeOrder": [20, 30], "places": {
+                    "baseplate": { "placeId": 20, "root": "places/baseplate" },
+                    "lobby": { "placeId": 30, "root": "places/lobby" }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let state = State::default();
+        let (bridge, _) =
+            BridgeServer::listen_with_initial_wait("127.0.0.1", &[0], 0.0, false).unwrap();
+        let result = bind(
+            &state,
+            &bridge,
+            &json!({
+                "root": root, "experienceOnly": true, "place": "not-registered-yet"
+            }),
+        )
+        .unwrap_or_else(|error| panic!("{}", error.0.m));
+        let context = resolve_project(&state, result["id"].as_u64().unwrap())
+            .unwrap_or_else(|error| panic!("{}", error.0.m));
+        assert!(context.runtime_id.is_none());
+        assert!(context.place_id.is_none());
+        assert!(!root.join(config::PROJECT_FILE_NAME).exists());
+        assert!(!root.join("src").exists());
+        super::super::places::add(
+            &context,
+            &json!({
+                "placeId": 40, "name": "Racing", "gameId": 10, "alias": "racing"
+            }),
+        )
+        .unwrap();
+        assert!(
+            root.join("places/racing")
+                .join(config::PROJECT_FILE_NAME)
+                .is_file()
+        );
+        assert!(
+            resolve_project(&state, context.id).is_err(),
+            "manifest edits invalidate bindings"
+        );
+        let place = resolve_experience_place(&root, Some("racing"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(place.place_id, Some(40));
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn studio_window_names_resolve_place1_without_guessing_or_changing_model_names() {

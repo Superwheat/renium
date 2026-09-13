@@ -8,6 +8,29 @@ loader._load = (request, parent, isMain) => request === "vscode" ? {} : original
 const { AutomationClient } = require("../src/automationClient") as typeof import("../src/automationClient");
 loader._load = original;
 
+test("unmatched connected Studios cannot cause a bind loop; a newly ready target can bind", async () => {
+  for (const ready of [false, true]) {
+    const client = new AutomationClient({ appendLine() {} } as never, () => "") as any;
+    let binds = 0;
+    let statuses = 0;
+    client.send = async (_config: unknown, label: string) => {
+      if (label === "bind") {
+        binds++;
+        assert.ok(binds <= 2, "must not spin on unrelated windows");
+        return { code: 0, result: { id: 1, runtimeId: ready && binds === 2 ? "target" : null } };
+      }
+      assert.equal(label, "studios");
+      statuses++;
+      return { code: 0, result: { clients: [{ runtimeId: "connected" }] } };
+    };
+    const result = client.ensureContext({ projectRoot: process.cwd(), bridgeWaitSeconds: 1 }, true);
+    if (ready) { assert.equal(await result, 1); }
+    else { await assert.rejects(result, /do not match this project's target/); }
+    assert.equal(binds, 2);
+    assert.equal(statuses, 1);
+  }
+});
+
 function reader(): { feed(data: Buffer | string): void; lines: string[]; errors: Error[] } {
   const lines: string[] = [];
   const errors: Error[] = [];

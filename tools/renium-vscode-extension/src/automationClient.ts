@@ -281,6 +281,7 @@ export class AutomationClient {
       return this.context.id;
     }
     const deadline = Date.now() + editorBridgeWaitSeconds(config) * 1_000 + 2_000;
+    let observedConnection = false;
     while (true) {
       const bound = await this.send(
         config,
@@ -305,6 +306,9 @@ export class AutomationClient {
       if (!requireRuntime) {
         return id;
       }
+      if (observedConnection) {
+        throw new Error("Connected Studio windows do not match this project's target. Open the paired place or select the intended place, then retry.");
+      }
       let runtimeConnected = false;
       while (Date.now() < deadline) {
         const status = await this.send(
@@ -321,6 +325,7 @@ export class AutomationClient {
         const clients = (status.result as Record<string, unknown> | undefined)?.clients;
         if (Array.isArray(clients) && clients.length > 0) {
           runtimeConnected = true;
+          observedConnection = true;
           break;
         }
         await delay(50);

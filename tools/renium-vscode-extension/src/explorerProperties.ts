@@ -1433,7 +1433,7 @@ function arrayMember(record: Record<string, unknown> | undefined, name: string, 
   return Array.isArray(alternateValue) ? alternateValue : undefined;
 }
 
-function structuredCframeComponents(record: Record<string, unknown>): number[] | undefined {
+function structuredCframeComponents(record: Record<string, unknown>): unknown[] | undefined {
   const position = arrayMember(record, "position", "Position");
   const orientation = arrayMember(record, "orientation", "Orientation");
   if (!position && !orientation) {
@@ -1456,7 +1456,7 @@ function structuredCframeComponents(record: Record<string, unknown>): number[] |
     row2?.[1],
     row2?.[2],
   ];
-  return values.map((item, index) => typeof item === "number" ? item : DEFAULT_CFRAME_COMPONENTS[index]);
+  return values.map((item, index) => item ?? DEFAULT_CFRAME_COMPONENTS[index]);
 }
 
 function normalizedCframeComponents(components: unknown[]): number[] {
@@ -1467,7 +1467,7 @@ function normalizedCframeComponents(components: unknown[]): number[] {
   return out.slice(0, DEFAULT_CFRAME_COMPONENTS.length);
 }
 
-function cframeComponents(value: unknown): number[] {
+function rawCframeComponents(value: unknown): unknown[] {
   const record = recordValue(value);
   const components = arrayMember(record, "components", "Components") ?? [];
   if (components.length === 0 && record) {
@@ -1476,14 +1476,24 @@ function cframeComponents(value: unknown): number[] {
       return structured;
     }
   }
-  return normalizedCframeComponents(components);
+  return Array.from({ length: 12 }, (_, index) => components[index] ?? DEFAULT_CFRAME_COMPONENTS[index]);
+}
+
+function cframeComponents(value: unknown): number[] {
+  return normalizedCframeComponents(rawCframeComponents(value));
 }
 
 function cframeToVerde(value: unknown): { Position: { X: number; Y: number; Z: number }; Rotation: { X: number; Y: number; Z: number } } {
   const components = cframeComponents(value);
+  // Roblox ToOrientation uses YXZ: Ry * Rx * Rz, in row-major storage.
+  const x = Math.asin(Math.max(-1, Math.min(1, -components[8])));
+  const singular = Math.abs(Math.cos(x)) < 1e-7;
+  const y = singular ? Math.atan2(-components[9], components[3]) : Math.atan2(components[5], components[11]);
+  const z = singular ? 0 : Math.atan2(components[6], components[7]);
+  const degrees = 180 / Math.PI;
   return {
     Position: { X: components[0] ?? 0, Y: components[1] ?? 0, Z: components[2] ?? 0 },
-    Rotation: { X: 0, Y: 0, Z: 0 },
+    Rotation: { X: x * degrees, Y: y * degrees, Z: z * degrees },
   };
 }
 
@@ -1682,12 +1692,29 @@ function bytecodeUdim2(value: Record<string, unknown> | undefined): unknown {
 }
 
 function bytecodeCFrame(value: Record<string, unknown> | undefined, currentValue: unknown): unknown {
-  const components = cframeComponents(currentValue);
+  const components = rawCframeComponents(currentValue);
   const position = recordValue(value?.Position);
   if (position) {
     components[0] = numberMember(position, "X");
     components[1] = numberMember(position, "Y");
     components[2] = numberMember(position, "Z");
+  }
+  const rotation = recordValue(value?.Rotation);
+  const currentRotation = cframeToVerde(currentValue).Rotation;
+  // Position editors send the displayed angles too. Preserve the original basis
+  // unless orientation actually changed, avoiding an Euler roundtrip on a move.
+  if (rotation && ["X", "Y", "Z"].some(axis => numberMember(rotation, axis) !== currentRotation[axis as keyof typeof currentRotation])) {
+    const radians = Math.PI / 180;
+    const x = numberMember(rotation, "X") * radians;
+    const y = numberMember(rotation, "Y") * radians;
+    const z = numberMember(rotation, "Z") * radians;
+    const sx = Math.sin(x), cx = Math.cos(x);
+    const sy = Math.sin(y), cy = Math.cos(y);
+    const sz = Math.sin(z), cz = Math.cos(z);
+    components.splice(3, 9,
+      cy * cz + sy * sx * sz, -cy * sz + sy * sx * cz, sy * cx,
+      cx * sz, cx * cz, -sx,
+      -sy * cz + cy * sx * sz, sy * sz + cy * sx * cz, cy * cx);
   }
   return { _type: "CFrame", components };
 }

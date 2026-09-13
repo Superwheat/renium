@@ -491,11 +491,11 @@ fn finish_studio_change_state_command(
         }
         bail!("{error}\nResolve with one:\nrbx lon --prefer studio\nrbx lon --prefer editor");
     }
-    if operation == op::LIVE_START && failed {
+    if failed {
         let error = result
             .get("error")
             .and_then(Value::as_str)
-            .unwrap_or("Live sync could not start");
+            .unwrap_or("Live Sync could not complete the requested operation");
         bail!(error.to_string());
     }
     print_json_output(&result, false)
@@ -544,7 +544,29 @@ pub(crate) fn studio_change_state_result(
     })
 }
 
+pub(crate) fn normalize_live_status(mut value: Value) -> Value {
+    let error = value
+        .pointer("/daemon/error")
+        .and_then(Value::as_str)
+        .filter(|error| !error.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            (value.pointer("/daemon/settled").and_then(Value::as_bool) == Some(false)).then(|| {
+                "Live Sync did not finish before the wait ended; inspect rbx lst --details"
+                    .to_string()
+            })
+        });
+    if let Some(error) = error
+        && let Some(result) = value.as_object_mut()
+    {
+        result.insert("ok".into(), Value::Bool(false));
+        result.insert("error".into(), Value::String(error));
+    }
+    value
+}
+
 pub(crate) fn compact_live_status(value: Value) -> Value {
+    let value = normalize_live_status(value);
     let Some(source) = value.as_object() else {
         return value;
     };
@@ -596,17 +618,8 @@ pub(crate) fn compact_live_status(value: Value) -> Value {
     result.insert("pendingChanges".to_string(), json!(pending_changes));
 
     let daemon = source.get("daemon").map(compact_live_daemon_status);
-    let daemon_error = daemon
-        .as_ref()
-        .and_then(Value::as_object)
-        .and_then(|daemon| daemon.get("error"))
-        .and_then(Value::as_str)
-        .filter(|error| !error.is_empty());
     let mut ok = source.get("ok").and_then(Value::as_bool).unwrap_or(true);
-    if let Some(error) = daemon_error {
-        ok = false;
-        result.insert("error".to_string(), Value::String(error.to_string()));
-    } else if let Some(error) = source.get("error") {
+    if let Some(error) = source.get("error") {
         ok = false;
         result.insert("error".to_string(), error.clone());
     }
@@ -1840,7 +1853,23 @@ pub(crate) fn shot_result(args: &ShotArgs, bridge: &BridgeServer) -> Result<Valu
     } else {
         None
     };
-    let capture = input_inject::capture_window_png(&window, &output);
+    let capture = (|| {
+        if token.is_some() {
+            // The camera setter acknowledges the property change before rendering.
+            // Cross two real frame boundaries while the camera lease is still held.
+            let result = call_execute_luau(
+                bridge,
+                bridge_target,
+                player,
+                "local runService = game:GetService(\"RunService\")\nrunService.Heartbeat:Wait()\nrunService.Heartbeat:Wait()",
+                "ReniumCaptureFrame",
+                3.0,
+                1.0,
+            )?;
+            ensure_luau_api_ok(&result)?;
+        }
+        input_inject::capture_window_png(&window, &output)
+    })();
     let restore = token.map(|token| {
         bridge.call_for_selector(
             "cameraCapture",
