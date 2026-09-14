@@ -38,10 +38,6 @@ function BridgeChunking.getCompactInstanceBatchCacheKey(startIndex, maxCount)
 	return "compact:" .. tostring(startIndex or 1) .. ":" .. tostring(maxCount or 300)
 end
 
-function BridgeChunking.getSourceBatchCacheKey(instancePaths: { string })
-	return "paths:" .. table.concat(instancePaths, "\\0")
-end
-
 function BridgeChunking.getSourceRangeBatchCacheKey(startIndex, maxCount)
 	return "range:" .. tostring(math.max(1, startIndex or 1)) .. ":" .. tostring(math.max(1, maxCount or 64))
 end
