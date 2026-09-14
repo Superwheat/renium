@@ -192,14 +192,14 @@ mod tests {
             &super::super::Request {
                 v: super::super::PROTOCOL_VERSION,
                 id: 1,
-                op: op::STUDIO_STATUS,
+                op: op::CAP,
                 cx: None,
                 p: json!({}),
             },
             Duration::from_millis(20),
         )
         .err()
-        .expect("an unanswered status must time out");
-        assert!(format!("{error:#}").contains("Waiting for daemon response to operation 51"));
+        .expect("an unanswered capability request must time out");
+        assert!(format!("{error:#}").contains("Waiting for daemon response to operation 0"));
     }
 }

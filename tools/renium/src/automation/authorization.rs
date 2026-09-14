@@ -70,23 +70,8 @@ pub(crate) fn encode_request(request: &Request, port: u16) -> Result<String> {
     if request.p.get(PROOF_FIELD).is_some() {
         bail!("Authorization is supplied by the local Renium CLI, not request parameters");
     }
-    let stored = match fs::read(key_path(port)?) {
-        Ok(stored) => stored,
-        // Preserve communication with older daemons for existing operations.
-        // An updated daemon rejects unsigned requests; protected access NEVER
-        // downgrades to this legacy transport.
-        Err(error)
-            if error.kind() == std::io::ErrorKind::NotFound
-                && request.op != op::PROPERTY_ACCESS =>
-        {
-            return Ok(serde_json::to_string(request)?);
-        }
-        Err(error) => {
-            return Err(error).context(
-                "Privileged authentication unavailable; restart the updated Renium daemon",
-            );
-        }
-    };
+    let stored = fs::read(key_path(port)?)
+        .context("Privileged authentication unavailable; restart the Renium daemon")?;
     let seed: [u8; 32] = unprotect(&stored)?
         .try_into()
         .map_err(|_| anyhow::anyhow!("Invalid private Renium credential"))?;
