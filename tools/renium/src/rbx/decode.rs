@@ -88,6 +88,24 @@ fn native_property_data_type_supported(data_type: &RbxDataType<'_>) -> bool {
     }
 }
 
+/// Whether Studio saves this property as a field of its own. Properties
+/// without a serialized form only exist through live reads.
+pub(crate) fn property_has_serialized_form(
+    database: &ReflectionDatabase<'_>,
+    class_name: &str,
+    property_name: &str,
+) -> bool {
+    match crate::rbx::encode::rbx_property_descriptor(database, class_name, property_name) {
+        Some(descriptor) => !matches!(
+            descriptor.kind,
+            RbxPropertyKind::Canonical {
+                serialization: RbxPropertySerialization::DoesNotSerialize
+            }
+        ),
+        None => true,
+    }
+}
+
 fn native_property_descriptor_supported(descriptor: &RbxPropertyDescriptor<'_>) -> bool {
     let RbxPropertyKind::Canonical { serialization } = &descriptor.kind else {
         return false;

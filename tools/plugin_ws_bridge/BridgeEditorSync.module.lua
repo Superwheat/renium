@@ -2450,6 +2450,11 @@ local function applyChangedProperty(instance, propertyName, rawValue, change, ct
 		return
 	end
 	if not classHasProperty(instance, propertyName) then
+		if instance.Parent == game then
+			-- Saved places carry service fields Studio never exposes to plugins.
+			stats.noops += 1
+			return
+		end
 		error(`{propertyName} is not a property of {instance.ClassName}`)
 	end
 	if instance:IsA("MeshPart") and isMeshGeometryProperty(propertyName) then
