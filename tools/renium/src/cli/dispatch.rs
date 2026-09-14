@@ -73,6 +73,7 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::OpenCloud(args) => crate::cloud::command::run(args, project),
         Commands::UpdateHelper(args) => update::run_update_helper(args),
         Commands::ImportPath(args) => import_path_command(args, project),
+        Commands::ImportPlace(args) => crate::snapshot::place_import::import_place_file(args),
         Commands::Create(args) => create_instance_command(args, project),
         Commands::Clone(args) => clone_instance_command(args, project),
         Commands::Move(args) => move_instance_command(args, project),

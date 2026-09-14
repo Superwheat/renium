@@ -1345,12 +1345,12 @@ fn run_service_exports<'a>(
 }
 
 #[derive(Default)]
-struct ImportFinishMetrics {
+pub(crate) struct ImportFinishMetrics {
     dispatcher_drain_ms: f64,
     sourcemap_finalize_ms: f64,
 }
 
-fn finish_export_import(
+pub(crate) fn finish_export_import(
     dispatcher: DirectImportDispatcher,
     sourcemap_writer: SourcemapWriter,
 ) -> Result<ImportFinishMetrics> {
@@ -1370,20 +1370,20 @@ fn finish_export_import(
     Ok(metrics)
 }
 
-struct ExportExecutionSetup {
-    project_stage: ExportProjectStage,
-    sourcemap_writer: SourcemapWriter,
-    direct_import_dispatcher: DirectImportDispatcher,
-    export_services: Vec<String>,
+pub(crate) struct ExportExecutionSetup {
+    pub(crate) project_stage: ExportProjectStage,
+    pub(crate) sourcemap_writer: SourcemapWriter,
+    pub(crate) direct_import_dispatcher: DirectImportDispatcher,
+    pub(crate) export_services: Vec<String>,
 }
 
-fn prepare_export_execution(
-    args: &PullArgs,
+pub(crate) fn prepare_export_execution(
+    src_dir: &Path,
     project_root: &Path,
     services: &[String],
     total_started: Instant,
 ) -> Result<ExportExecutionSetup> {
-    let project_stage = ExportProjectStage::create(project_root, &args.src_dir, services)?;
+    let project_stage = ExportProjectStage::create(project_root, src_dir, services)?;
     let import_project_root = project_stage.import_project_root.clone();
     let import_src_dir = project_stage.import_src_dir.clone();
     log_global(
@@ -1431,7 +1431,7 @@ fn finish_native_export(guard: &mut EditorBinaryExportFinishGuard<'_>) -> Result
     result.map(|_| ())
 }
 
-fn finish_export_publication(
+pub(crate) fn finish_export_publication(
     mut stage: Option<ExportProjectStage>,
     project_root: &Path,
     repair_reference_paths: bool,
@@ -1501,7 +1501,7 @@ fn export_snapshots_core(
         sourcemap_writer,
         direct_import_dispatcher,
         export_services,
-    } = prepare_export_execution(args, &project_root, &services, total_started)?;
+    } = prepare_export_execution(&args.src_dir, &project_root, &services, total_started)?;
     let ServiceExportRun {
         spans: service_export_spans,
         cumulative_latency_ms: cumulative_service_latency_ms,
@@ -2661,7 +2661,7 @@ mod publication_tests {
         drop(fixture.stage.take());
         let args = PullArgs::try_parse_from(["pull"]).unwrap();
         let setup = prepare_export_execution(
-            &args,
+            &args.src_dir,
             &fixture.root,
             &["ReplicatedStorage".into()],
             Instant::now(),
