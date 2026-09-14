@@ -10,6 +10,7 @@ rbx lst
 rbx lof
 ```
 
+`ps` pushes files or directories. For instance-store edits pass the store file, and add `-i ID` per instance (an id covers only that instance, not its descendants) or `-u` to create or update without deleting. Deletions need the store file pushed without `-i`.
 Work in the place folder, or put `--place <alias|placeId>` before the command.
 Renium manages the connection; no daemon setup is needed.
 
