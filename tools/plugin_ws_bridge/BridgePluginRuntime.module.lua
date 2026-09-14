@@ -635,6 +635,69 @@ function BridgePluginRuntime.start(context)
 
 	lifetimeConnections[#lifetimeConnections + 1] = ui.actions.reveal.Triggered:Connect(selectedScriptAction)
 
+	-- Studio selects every object that undoing or redoing a waypoint restores.
+	-- A Renium sync can restore hundreds, so the selection the user had is put
+	-- back after Studio reacts to one of Renium's own waypoints.
+	do
+		local ChangeHistoryService = game:GetService("ChangeHistoryService")
+		local previousSelection: { Instance } = Selection:Get()
+		local currentSelection: { Instance } = previousSelection
+		local selectionChangedAt = -math.huge
+		local keepSelection: { Instance }? = nil
+		local keepUntil = 0
+		local restoring = false
+		local function sameSelection(left: { Instance }, right: { Instance }): boolean
+			if #left ~= #right then
+				return false
+			end
+			for index, instance in ipairs(left) do
+				if right[index] ~= instance then
+					return false
+				end
+			end
+			return true
+		end
+		local function restoreSelection(selection: { Instance })
+			local kept = {}
+			for _, instance in ipairs(selection) do
+				if instance:IsDescendantOf(game) then
+					kept[#kept + 1] = instance
+				end
+			end
+			restoring = true
+			Selection:Set(kept)
+			restoring = false
+			currentSelection = kept
+		end
+		lifetimeConnections[#lifetimeConnections + 1] = Selection.SelectionChanged:Connect(function()
+			if restoring then
+				return
+			end
+			previousSelection = currentSelection
+			currentSelection = Selection:Get()
+			selectionChangedAt = os.clock()
+			local keep = keepSelection
+			if keep ~= nil and os.clock() < keepUntil and not sameSelection(currentSelection, keep) then
+				keepSelection = nil
+				restoreSelection(keep)
+			end
+		end)
+		local function onReniumWaypoint(name: string)
+			if type(name) ~= "string" or string.sub(name, 1, 7) ~= "Renium:" then
+				return
+			end
+			local keep = if os.clock() - selectionChangedAt < 0.25 then previousSelection else currentSelection
+			keepSelection = keep
+			keepUntil = os.clock() + 1
+			if not sameSelection(currentSelection, keep) then
+				keepSelection = nil
+				restoreSelection(keep)
+			end
+		end
+		lifetimeConnections[#lifetimeConnections + 1] = ChangeHistoryService.OnUndo:Connect(onReniumWaypoint)
+		lifetimeConnections[#lifetimeConnections + 1] = ChangeHistoryService.OnRedo:Connect(onReniumWaypoint)
+	end
+
 	Config.bridgeConnectRequested = false
 	Config.bridgeConnectedOnce = false
 	Config.bridgeConnectSession = 0
