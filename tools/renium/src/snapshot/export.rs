@@ -469,28 +469,22 @@ impl ExportProjectStage {
         repair_reference_paths: bool,
     ) -> Result<PublishedProjectChanges> {
         let started = Instant::now();
+        let log_phase = |name: &str, phase: Instant| {
+            log_global(
+                5,
+                format_args!("[renium] export publish {name}: {:.1}ms", elapsed_ms(phase)),
+            );
+        };
         let phase = Instant::now();
         let mut current = collect_publish_hashes(project_root, &self.publish_paths)?;
-        log_global(
-            5,
-            format_args!(
-                "[renium] export publish current hashes: {:.1}ms",
-                elapsed_ms(phase)
-            ),
-        );
+        log_phase("current hashes", phase);
         ensure_publish_entries_unchanged(&self.publish_baseline, &current, &self.publish_paths)?;
         let backup_root = self.container.join("previous");
         fs::create_dir_all(&backup_root)
             .with_context(|| format!("Failed to create {}", backup_root.display()))?;
         let phase = Instant::now();
         let mut staged = collect_publish_hashes(&self.project_root, &self.publish_paths)?;
-        log_global(
-            5,
-            format_args!(
-                "[renium] export publish staged hashes: {:.1}ms",
-                elapsed_ms(phase)
-            ),
-        );
+        log_phase("staged hashes", phase);
         let settings_candidates = current
             .keys()
             .filter(|path| {
@@ -503,10 +497,12 @@ impl ExportProjectStage {
             .cloned()
             .collect::<Vec<_>>();
         let phase = Instant::now();
-        for relative in &settings_candidates {
-            if self.settings_already_aligned {
-                continue;
-            }
+        let alignments = if self.settings_already_aligned {
+            &[][..]
+        } else {
+            settings_candidates.as_slice()
+        };
+        for relative in alignments {
             let current_path = project_root.join(relative);
             let staged_path = self.project_root.join(relative);
             let current_bytes = fs::read(&current_path)
@@ -526,13 +522,7 @@ impl ExportProjectStage {
                 }
             }
         }
-        log_global(
-            5,
-            format_args!(
-                "[renium] export publish settings alignment: {:.1}ms",
-                elapsed_ms(phase)
-            ),
-        );
+        log_phase("settings alignment", phase);
         let phase = Instant::now();
         let repaired = if repair_reference_paths {
             self.stage_moved_reference_updates(project_root, &settings_candidates)?
@@ -540,13 +530,7 @@ impl ExportProjectStage {
             Vec::new()
         };
         refresh_publish_hashes(project_root, &mut current, &repaired)?;
-        log_global(
-            5,
-            format_args!(
-                "[renium] export publish reference repair: {:.1}ms",
-                elapsed_ms(phase)
-            ),
-        );
+        log_phase("reference repair", phase);
         let phase = Instant::now();
         let mut refreshed = settings_candidates;
         refreshed.extend(repaired);
@@ -580,13 +564,7 @@ impl ExportProjectStage {
             .collect::<Vec<_>>();
         let latest = collect_publish_hashes(project_root, &concurrency_paths)?;
         ensure_publish_entries_unchanged(&current, &latest, &concurrency_paths)?;
-        log_global(
-            5,
-            format_args!(
-                "[renium] export publish concurrency check: {:.1}ms",
-                elapsed_ms(phase)
-            ),
-        );
+        log_phase("concurrency check", phase);
         let phase = Instant::now();
         let expected = current
             .keys()
@@ -599,13 +577,7 @@ impl ExportProjectStage {
             .map(|path| (path.clone(), staged.get(path).cloned()))
             .collect();
         let changed_roots = operation_paths.clone();
-        log_global(
-            5,
-            format_args!(
-                "[renium] export publish final staging plan: {:.1}ms",
-                elapsed_ms(phase)
-            ),
-        );
+        log_phase("final staging plan", phase);
         let mut published = Vec::<(PathBuf, Option<PathBuf>)>::new();
         let phase = Instant::now();
         let publish_result = (|| -> Result<()> {
@@ -680,13 +652,7 @@ impl ExportProjectStage {
             }
             return Err(error);
         }
-        log_global(
-            5,
-            format_args!(
-                "[renium] export publish file swaps: {:.1}ms",
-                elapsed_ms(phase)
-            ),
-        );
+        log_phase("file swaps", phase);
         self.active = false;
         let phase = Instant::now();
         published
@@ -702,13 +668,7 @@ impl ExportProjectStage {
                 Err(_) => {}
             });
         let _ = fs::remove_dir_all(&self.container);
-        log_global(
-            5,
-            format_args!(
-                "[renium] export publish cleanup: {:.1}ms",
-                elapsed_ms(phase)
-            ),
-        );
+        log_phase("cleanup", phase);
         log_timing_ms("export project stage publish", elapsed_ms(started));
         Ok(PublishedProjectChanges {
             changed_roots,
