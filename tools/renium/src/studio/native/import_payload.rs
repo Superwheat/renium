@@ -441,6 +441,7 @@ pub(super) fn encode_services(
                 payload_root_name: String::new(),
                 expected_structure: None,
                 root_paths,
+                root_settings_ids: group.root_settings_ids,
                 viewport_camera: group.viewport_camera,
                 retained_roots: plan.retained_roots,
                 package_roots: plan.package_roots,

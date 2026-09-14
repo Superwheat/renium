@@ -7155,6 +7155,18 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			error("Invalid native import service count")
 		end
 		local rootPaths = validatedNativeImportRootPaths(rawGroup, serviceName, targetPath, targetPathLength, count)
+		local rootSettingsIds = rawGroup.rootSettingsIds
+		if rootSettingsIds ~= nil then
+			local isArray, idCount = denseArrayLength(rootSettingsIds)
+			if not isArray or idCount ~= #rootPaths then
+				error("Native import root settings ids must match the root paths")
+			end
+			for _, settingsId in ipairs(rootSettingsIds) do
+				if type(settingsId) ~= "string" then
+					error("Native import root settings ids must be strings")
+				end
+			end
+		end
 		local additive = rawGroup.additive
 		if additive ~= nil and type(additive) ~= "boolean" then
 			error("Native import additive flag must be a boolean")
@@ -7229,6 +7241,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			count = count,
 			payloadRootName = payloadRootName,
 			rootPaths = rootPaths,
+			rootSettingsIds = rootSettingsIds,
 			viewportCamera = viewportCamera,
 			retainedRoots = retainedRoots,
 			packageRoots = packageRoots,
@@ -7741,6 +7754,11 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				end
 				group.incomingByPayloadIndex[index] = instance
 				group.incomingRootsByPath[key] = instance
+				-- Natively inserted roots keep their project identity so a later
+				-- rename or move by settings id finds them.
+				if group.rootSettingsIds ~= nil and group.rootSettingsIds[index] ~= "" then
+					rememberMatchedSettingsInstance(group.serviceName, group.rootSettingsIds[index], instance, ctx)
+				end
 			end
 			if #ordered ~= #group.incoming then
 				error("Native insertion returned unexpected roots")

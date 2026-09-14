@@ -3830,6 +3830,7 @@ fn texture_pack_routing_keeps_verified_setters_in_the_live_transaction() {
             payload_root_name: "payload".into(),
             expected_structure: None,
             root_paths: Vec::new(),
+            root_settings_ids: Vec::new(),
             viewport_camera: None,
             retained_roots: Vec::new(),
             package_roots: Vec::new(),

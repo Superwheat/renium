@@ -53,6 +53,7 @@ struct PendingEditorBinaryGroup {
     additive: bool,
     target_path: Vec<String>,
     roots: Vec<RbxRef>,
+    root_settings_ids: Vec<String>,
     viewport_camera: Option<EditorBinaryRootPath>,
 }
 
@@ -142,6 +143,8 @@ fn pending_editor_binary_groups(
             additive: false,
             target_path: vec![service.clone()],
             roots: children,
+
+            root_settings_ids: Vec::new(),
             viewport_camera: viewport
                 .filter(|referent| !referent.is_none())
                 .map(|referent| {
@@ -158,6 +161,8 @@ fn pending_editor_binary_groups(
                 additive: false,
                 target_path: vec![service.clone(), target_name],
                 roots: nested_children,
+
+                root_settings_ids: Vec::new(),
                 viewport_camera: None,
             });
         }
@@ -2838,6 +2843,26 @@ fn build_editor_binary_import_for_services(
                             let (segments, _) = rbx_dom_instance_path_parts(&build.dom, *root);
                             roots.contains(&segments[1])
                         });
+                        let mut next_by_name: HashMap<&str, usize> = HashMap::new();
+                        group.root_settings_ids = group
+                            .roots
+                            .iter()
+                            .map(|root| {
+                                let name = build
+                                    .dom
+                                    .get_by_ref(*root)
+                                    .map_or("", |instance| instance.name.as_str());
+                                let slot = next_by_name.entry(name).or_insert(0);
+                                let id = additive_root_ids
+                                    .get(&group.service)
+                                    .and_then(|ids| ids.get(name))
+                                    .and_then(|ids| ids.get(*slot))
+                                    .cloned()
+                                    .unwrap_or_default();
+                                *slot += 1;
+                                id
+                            })
+                            .collect();
                     }
                 }
                 pending_groups.retain(|group| !group.additive || !group.roots.is_empty());
@@ -2872,8 +2897,11 @@ fn build_editor_binary_import_for_services(
     let mut live_preflight = live_preflight?;
     for group in &mut pending_groups {
         if group.additive {
+            let mut kept_ids = Vec::new();
+            let ids = std::mem::take(&mut group.root_settings_ids);
+            let mut index = 0;
             group.roots.retain(|root| {
-                live_preflight
+                let keep = live_preflight
                     .absent_roots
                     .get(&group.service)
                     .is_some_and(|absent| {
@@ -2881,8 +2909,18 @@ fn build_editor_binary_import_for_services(
                             .dom
                             .get_by_ref(*root)
                             .is_some_and(|instance| absent.contains(&instance.name))
-                    })
+                    });
+                if keep && let Some(id) = ids.get(index) {
+                    kept_ids.push(id.clone());
+                }
+                index += 1;
+                keep
             });
+            group.root_settings_ids = if kept_ids.len() == group.roots.len() {
+                kept_ids
+            } else {
+                Vec::new()
+            };
         }
     }
     pending_groups.retain(|group| !group.additive || !group.roots.is_empty());
@@ -3207,6 +3245,7 @@ fn build_editor_binary_import_for_services(
             payload_root_name,
             expected_structure,
             root_paths,
+            root_settings_ids: pending.root_settings_ids,
             viewport_camera: pending.viewport_camera,
             retained_roots: package_plan.retained_roots,
             package_roots: package_plan.package_roots,

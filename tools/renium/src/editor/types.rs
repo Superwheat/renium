@@ -440,6 +440,8 @@ pub(crate) struct EditorBinaryImportGroup {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) expected_structure: Option<EditorBinaryStructure>,
     pub(crate) root_paths: Vec<EditorBinaryRootPath>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) root_settings_ids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) viewport_camera: Option<EditorBinaryRootPath>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
