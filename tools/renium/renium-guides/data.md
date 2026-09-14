@@ -86,11 +86,9 @@ The default `ask` mode returns an exact `approval-required` request for unlisted
 
 `read-only` allows protected reads and rejects protected writes. `read-write` allows both, but requires the user's explicit request, a warning about unknown scripts/plugins, and `--accept-risk`. Modes apply only to the selected runtime; they do not restrict ordinary edits or Live Sync. Built-in performance diagnostics remain trusted operations.
 
-Values use Studio's text representation, up to 64 KiB. Writes verify the resulting value and mark affected packages Changed before editing; report `autoDesyncedPackages`. If an asynchronous write times out, read its current value before retrying—it may still finish. Unsupported codecs or setters return an error, not a guessed memory edit. Native property calls support Windows and macOS Edit mode, not play clients.
+Values use Studio's text representation, up to 64 KiB. Writes verify the result and mark affected packages Changed; report `autoDesyncedPackages`. If a write times out, read the value before retrying—it may still finish. Windows and macOS Edit mode only, not play clients.
 
-After a Studio update, Renium automatically rediscovers and validates the native entry points, then caches them for that executable. An update alone does not disable access. If the new layout cannot be validated, the error identifies the detector that needs updating; do not force an old address or repeatedly retry the same failure.
-
-These commands are authenticated and do not expose a privileged Luau function or weaken global Studio permissions. Arbitrary code already running as the same OS user can invoke the CLI; do not claim protection against a compromised user account.
+After a Studio update, Renium rediscovers the native entry points itself. If validation fails, the error names the detector that needs updating; don't force an old address or retry the same failure.
 
 ## Inspect files without importing
 

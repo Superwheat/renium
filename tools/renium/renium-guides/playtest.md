@@ -59,12 +59,12 @@ rbx net reset --player 2                     # Zero all six simulation values
 | `high` | 100 ms | 15 ms | 0.1% | High latency |
 | `poor` | 100 ms | 100 ms | 0.5% | Highly variable, lossy connection |
 
-These are test templates, not measured device/network profiles. Minimum added round-trip delay is twice the listed delay; actual ping also includes jitter, real network latency and processing. Current Studio supports 0–1000 ms delay/jitter per direction and at most 0.5% loss. Older builds that clamp values fail readback verification and restore the previous settings. `poor` is a preset, not the maximum; it does not simulate arbitrary outages or bandwidth caps. A loss value of `0.5` means **0.5%**, not 50%.
+These are test templates, not measured device profiles. Added round-trip delay is at least twice the listed delay. Studio supports 0–1000 ms delay/jitter per direction and at most 0.5% loss; a loss value of `0.5` means **0.5%**, not 50%. Presets do not simulate outages or bandwidth caps.
 
 For custom asymmetric conditions, use `--in-delay`, `--out-delay`, `--in-jitter`, `--out-jitter`, `--in-loss` and `--out-loss`. Inbound means server→client; outbound means client→server. A preset fills all six values; explicit flags override it. Without a preset, omitted settings stay unchanged.
 
-Commands return the selected runtime/PID, applied settings and changed fields. Trust a successful result instead of rereading after every change. Use a live test only when measuring networking behavior; a configuration readback alone does not prove gameplay works under those conditions. Large latency jumps can trigger congestion control—step changes gradually when measuring steady-state behavior.
+Commands return the selected runtime/PID, applied settings and changed fields; trust a successful result instead of rereading. A readback does not prove gameplay works under those conditions. Large latency jumps trigger congestion control—step changes gradually when measuring steady state.
 
 Without `--player`, `net show/set/reset` targets the selected Studio's settings in Edit. During Play, use `--player` to avoid changing the server/defaults. These settings are process-local; Renium refuses a shared-process layout that cannot isolate the requested client. Client overrides are restored when its plugin unloads, without undoing later manual changes. Explicit `restore` is useful before ending a test. An abrupt process crash cannot run cleanup.
 
-This uses Studio's plugin API, not injected game code or global OS network throttling. It does not edit place files or change `IncomingReplicationLag`; that older setting remains additive if already enabled. Updated CLI and Studio plugin are required. See [Roblox's network simulation reference](https://create.roblox.com/docs/studio/testing-modes#network-simulation).
+This uses Studio's plugin API, not injected game code or OS-level throttling, and does not touch `IncomingReplicationLag`, which stays additive if enabled. See [Roblox's network simulation reference](https://create.roblox.com/docs/studio/testing-modes#network-simulation).
