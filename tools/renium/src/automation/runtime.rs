@@ -259,7 +259,6 @@ pub(super) fn automation_push_args(
         .map(|path| bound_context::path(context, path))
         .collect();
     args.target_properties = automation_strings(object, "targetProperties");
-    args.probe_events = automation_bool(object, "probeEvents", false)?;
     args.verify_sources = automation_bool(object, "verifySources", false)?;
     args.upsert_instances_only = automation_bool(object, "upsertInstancesOnly", false)?;
     args.override_packages = automation_bool(object, "overridePackages", false)?;

@@ -1154,7 +1154,6 @@ pub(crate) fn push_editor_changes_result(mut args: PushEditorChangesArgs) -> Res
         "targetSettingsIdFiles": args.target_settings_id_files,
         "targetProperties": args.target_properties,
         "upsertInstancesOnly": args.upsert_instances_only,
-        "probeEvents": args.probe_events,
         "verifySources": args.verify_sources,
         "overridePackages": args.override_packages,
         "allowProtectedWrites": !args.no_review,
@@ -1323,7 +1322,6 @@ pub(crate) fn native_editor_full_push_eligible(args: &PushEditorChangesArgs) -> 
         || !args.target_settings_id_files.is_empty()
         || !args.target_properties.is_empty()
         || args.upsert_instances_only
-        || args.probe_events
         || (!args.no_review && !args.yes && !global_yes())
     {
         return Ok(false);
@@ -2203,7 +2201,7 @@ fn verify_pushed_sources(
                 .collect(),
             ..EditorChangeSet::default()
         };
-        send_editor_change_batches(bridge, &retry_changes, false, None, transaction_id)?;
+        send_editor_change_batches(bridge, &retry_changes, None, transaction_id)?;
         verification = verify_editor_source_changes(bridge, changes, transaction_id)?;
     }
     summary.insert(
@@ -2446,7 +2444,6 @@ fn push_editor_changes_with_collected(
             let result = send_editor_change_batches(
                 bridge,
                 &changes,
-                args.probe_events,
                 binary_import.as_ref(),
                 transaction_id,
             );
@@ -2604,8 +2601,7 @@ fn apply_editor_change_with_warm_bridge(
     let mut transaction = EditorTransaction::begin(bridge, &changes, None, None)?;
     let result = (|| {
         let transaction_id = transaction.as_ref().map(|value| value.id.as_str());
-        let mut summary =
-            send_editor_change_batches(bridge, &changes, false, None, transaction_id)?;
+        let mut summary = send_editor_change_batches(bridge, &changes, None, transaction_id)?;
         let errors = summary.get("errors").and_then(Value::as_f64).unwrap_or(0.0);
         if summary.get("ok").and_then(Value::as_bool) == Some(false) || errors > 0.0 {
             bail!("Studio rejected or failed editor {label} apply");

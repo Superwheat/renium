@@ -316,7 +316,7 @@ fn full_push_cache_input(args: &PushEditorChangesArgs, services: &[String]) -> R
         "root": args.project.project_root, "source": args.project.src_root, "services": services,
         "paths": args.paths, "changedPaths": args.changed_paths, "changedPathFiles": args.changed_paths_files,
         "ids": args.target_settings_ids, "idFiles": args.target_settings_id_files, "properties": args.target_properties,
-        "upsert": args.upsert_instances_only, "probe": args.probe_events, "verify": args.verify_sources,
+        "upsert": args.upsert_instances_only, "verify": args.verify_sources,
         "linkCache": args.link_cache_dir, "overridePackages": args.override_packages,
         "configuration": loaded.as_ref().map(|loaded| &loaded.project),
     }))

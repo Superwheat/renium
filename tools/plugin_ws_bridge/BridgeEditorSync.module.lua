@@ -1134,43 +1134,6 @@ end
 BridgeEditorSync.decodeValue = decodeValue
 BridgeEditorSync.valuesEqual = valuesEqual
 
-local function connectProbeSignal(
-	stats: { [string]: any },
-	eventName: string,
-	countField: string,
-	availableField: string,
-	connections: { RBXScriptConnection }
-)
-	local signal = (game :: any)[eventName]
-	if not signal then
-		return
-	end
-	local connection = signal:Connect(function()
-		stats[countField] += 1
-	end)
-	stats[availableField] = 1
-	table.insert(connections, connection)
-end
-
-local function startEventProbe(stats: { [string]: any }): () -> ()
-	local connections = {}
-	connectProbeSignal(stats, "ItemChanged", "probeItemChanged", "probeItemChangedAvailable", connections)
-	connectProbeSignal(stats, "DescendantAdded", "probeDescendantAdded", "probeDescendantAddedAvailable", connections)
-	connectProbeSignal(
-		stats,
-		"DescendantRemoving",
-		"probeDescendantRemoving",
-		"probeDescendantRemovingAvailable",
-		connections
-	)
-
-	return function()
-		for _, connection in ipairs(connections) do
-			connection:Disconnect()
-		end
-	end
-end
-
 local function readProperty(instance: Instance, propertyName: string): (boolean, any)
 	if instance == Workspace and propertyName == "CollisionGroupData" then
 		return true, BridgeCollisionGroups.read()
@@ -3190,9 +3153,6 @@ local function validateMutationRequest(
 ): { string }
 	if type(params) ~= "table" then
 		error("Editor mutation request must be an object")
-	end
-	if params.probeEvents ~= nil and type(params.probeEvents) ~= "boolean" then
-		error("Editor mutation probeEvents must be a boolean")
 	end
 	if params.verifyOnly ~= nil and type(params.verifyOnly) ~= "boolean" then
 		error("Editor mutation verifyOnly must be a boolean")
@@ -8333,22 +8293,12 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			errors = 0,
 			protectedSkipped = 0,
 			protectedWrites = {},
-			probeItemChanged = 0,
-			probeDescendantAdded = 0,
-			probeDescendantRemoving = 0,
-			probeItemChangedAvailable = 0,
-			probeDescendantAddedAvailable = 0,
-			probeDescendantRemovingAvailable = 0,
 			undoRecorded = not not historyRecording,
 			verifyOnly = verifyOnly,
 			verifyMismatches = if verifyOnly then {} else nil,
 			verified = 0,
 		}
 		local touchedServices = {}
-		local stopEventProbe
-		if params.probeEvents == true then
-			stopEventProbe = startEventProbe(stats)
-		end
 
 		local instanceChanges = params.instanceChanges
 		local aborted = false
@@ -8493,21 +8443,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			end
 		end
 
-		if stopEventProbe ~= nil then
-			task.wait()
-			stopEventProbe()
-			if
-				not aborted
-				and not pcall(function()
-					assertSessionOwnership(operationGeneration)
-					assertReconcileActive()
-				end)
-			then
-				stats.ok = false
-				stats.errors += 1
-				aborted = true
-			end
-		end
 		local restoredSelectionReplacements = selectionReplacements
 		if aborted and outerTransaction == nil then
 			finishHistoryRecording(historyRecording, Enum.FinishRecordingOperation.Cancel)
