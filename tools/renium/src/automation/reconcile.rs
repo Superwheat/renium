@@ -8465,11 +8465,11 @@ mod tests {
         let mut model = SettingsBytecodeInstance::new(
             "car".into(),
             "Cat Mobile 5000".into(),
-            "Model".into(),
+            "Part".into(),
             Some(0),
         );
         model.properties.insert(
-            "ModelMeshCFrame".into(),
+            "CFrame".into(),
             json!({"_type":"CFrame",
             "components": vec![json!({"_type":"Float","value":"nan"});12]}),
         );
@@ -8500,7 +8500,7 @@ mod tests {
                 .is_none()
         );
 
-        reordered.instances[1].properties["ModelMeshCFrame"]["components"][0] = json!(42);
+        reordered.instances[1].properties["CFrame"]["components"][0] = json!(42);
         let observed = snapshot(&reordered);
         assert_eq!(
             snapshot_differences(&observed, &expected).unwrap(),
@@ -8510,7 +8510,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            detail.contains("Cat Mobile 5000.ModelMeshCFrame property"),
+            detail.contains("Cat Mobile 5000.CFrame property"),
             "{detail}"
         );
         assert!(detail.contains("42") && detail.contains("nan"), "{detail}");

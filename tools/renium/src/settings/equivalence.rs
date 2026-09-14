@@ -2642,9 +2642,10 @@ fn reconciliation_value_uses_f32(type_name: &str) -> bool {
 }
 
 pub(crate) fn reconciliation_property_is_derived(name: &str) -> bool {
-    // Studio recomputes the World* fields from the local ones and flips the
-    // migration flags itself while loading a tree, so none of them can be
-    // authored or retained through a sync.
+    // Studio recomputes the World* fields from the local ones, flips the
+    // migration flags itself while loading a tree and caches a model's mesh
+    // bounds after insertion, so none of them can be authored or retained
+    // through a sync.
     matches!(
         name,
         "WorldCFrame"
@@ -2654,6 +2655,9 @@ pub(crate) fn reconciliation_property_is_derived(name: &str) -> bool {
             | "WorldSecondaryAxis"
             | "InertiaMigrated"
             | "NeedsPivotMigration"
+            | "ModelMeshCFrame"
+            | "ModelMeshSize"
+            | "ModelMeshData"
     )
 }
 
