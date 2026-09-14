@@ -1,13 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use walkdir::WalkDir;
@@ -51,8 +49,6 @@ use crate::system::files::{
 
 pub(crate) const BRIDGE_PROTOCOL_VERSION: &str = "compact-v5";
 pub(crate) const LARGE_SERVICE_DETERMINISTIC_FETCH_MIN_INSTANCES: usize = 20_000;
-const BRIDGE_CHUNK_FRAME_PROTOCOL_VERSION: &str = "rbs2";
-const BRIDGE_COMPACT_VALUE_PROTOCOL_VERSION: &str = "compact-v5-schema-4";
 const BRIDGE_CODEC_VERSION_SCHEMA9: &str = "compact-v5-schema-9";
 const BRIDGE_CODEC_VERSION_SCHEMA8: &str = "compact-v5-schema-8";
 const BRIDGE_CODEC_VERSION: &str = BRIDGE_CODEC_VERSION_SCHEMA9;
@@ -86,74 +82,7 @@ pub(crate) fn is_transient_bridge_error(err: &anyhow::Error) -> bool {
     .any(|needle| message.contains(needle))
 }
 
-#[derive(Deserialize, Default)]
-#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct PlaceGuardConfig {
-    pub(crate) allowed_place_ids: Vec<i64>,
-    allowed_game_ids: Vec<i64>,
-}
-
-pub(crate) fn parse_place_guard_config(text: &str, path: &Path) -> Result<PlaceGuardConfig> {
-    let config: PlaceGuardConfig = serde_json::from_str(text)
-        .with_context(|| format!("Invalid place guard JSON in {}", path.display()))?;
-    if config.allowed_place_ids.is_empty() && config.allowed_game_ids.is_empty() {
-        bail!(
-            "Place guard {} must contain at least one allowedPlaceIds or allowedGameIds entry; remove the file to disable the guard",
-            path.display()
-        );
-    }
-    Ok(config)
-}
-
-fn place_guard_config_path() -> PathBuf {
-    std::env::var_os("RENIUM_CONFIG")
-        .filter(|value| !value.is_empty())
-        .map_or_else(|| PathBuf::from("renium.config.json"), PathBuf::from)
-}
-
-fn active_place_guard() -> Result<Option<PlaceGuardConfig>> {
-    if std::env::var("RENIUM_ALLOW_ANY_PLACE").is_ok_and(|value| value == "1") {
-        return Ok(None);
-    }
-    let path = place_guard_config_path();
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("Failed to read place guard {}", path.display()));
-        }
-    };
-    Ok(Some(parse_place_guard_config(&text, &path)?))
-}
-
-fn ensure_place_allowed(info: &BridgeInfoPayload) -> Result<()> {
-    let Some(guard) = active_place_guard()? else {
-        return Ok(());
-    };
-    let place_allowed = info
-        .place_id
-        .is_some_and(|id| guard.allowed_place_ids.contains(&id));
-    let game_allowed = info
-        .game_id
-        .is_some_and(|id| guard.allowed_game_ids.contains(&id));
-    if place_allowed || game_allowed {
-        return Ok(());
-    }
-    let config_path = place_guard_config_path();
-    bail!(
-        "Refusing bridge connection from place '{}' (placeId {}, gameId {}): not listed in {} allowedPlaceIds/allowedGameIds. Unsaved local places report placeId 0; add 0 to the allowlist or set RENIUM_ALLOW_ANY_PLACE=1 to override.",
-        info.place_name,
-        info.place_id
-            .map_or_else(|| "none".to_string(), |id| id.to_string()),
-        info.game_id
-            .map_or_else(|| "none".to_string(), |id| id.to_string()),
-        config_path.display()
-    )
-}
-
 pub(crate) fn validate_bridge_info(info: &BridgeInfoPayload) -> Result<()> {
-    ensure_place_allowed(info)?;
     if info.protocol_version != BRIDGE_PROTOCOL_VERSION {
         bail!(
             "Unsupported plugin protocol {} (expected {})",
@@ -166,20 +95,6 @@ pub(crate) fn validate_bridge_info(info: &BridgeInfoPayload) -> Result<()> {
             "Unsupported plugin codec {} (expected one of {})",
             info.codec_version,
             SUPPORTED_BRIDGE_CODEC_VERSIONS.join(", ")
-        );
-    }
-    if info.chunk_frame_protocol_version != BRIDGE_CHUNK_FRAME_PROTOCOL_VERSION {
-        bail!(
-            "Unsupported plugin chunk frame protocol {} (expected {})",
-            info.chunk_frame_protocol_version,
-            BRIDGE_CHUNK_FRAME_PROTOCOL_VERSION
-        );
-    }
-    if info.compact_value_protocol_version != BRIDGE_COMPACT_VALUE_PROTOCOL_VERSION {
-        bail!(
-            "Unsupported plugin compact value protocol {} (expected {})",
-            info.compact_value_protocol_version,
-            BRIDGE_COMPACT_VALUE_PROTOCOL_VERSION
         );
     }
     Ok(())
@@ -1389,13 +1304,11 @@ fn log_export_bridge_connection(
     log_timing_ms("cli start to bridge listen", cli_to_listen_ms);
     log_timing_ms("all channels connected to bridge info", bridge_info_ms);
     println!(
-        "[renium] bridge info: version={}, build_unix={}, protocol={}, codec={}, chunk_frame={}, compact_value={}",
+        "[renium] bridge info: version={}, build_unix={}, protocol={}, codec={}",
         bridge_info.bridge_version,
         bridge_info.bridge_build_unix,
         bridge_info.protocol_version,
-        bridge_info.codec_version,
-        bridge_info.chunk_frame_protocol_version,
-        bridge_info.compact_value_protocol_version
+        bridge_info.codec_version
     );
     cli_to_listen_ms
 }

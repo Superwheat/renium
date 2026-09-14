@@ -2467,26 +2467,18 @@ mod play_state_tests {
     use super::*;
 
     #[test]
-    fn ready_controller_is_stopped() {
-        let status = json!({ "running": false, "starting": false, "readyForStart": true });
-
-        assert!(play_status_is_stopped(&status));
+    fn only_a_ready_controller_counts_as_stopped() {
+        assert!(play_status_is_stopped(&json!({
+            "running": false, "starting": false, "readyForStart": true
+        })));
+        assert!(!play_status_is_stopped(&json!({
+            "running": false, "starting": false, "readyForStart": false
+        })));
     }
 
     #[test]
-    fn transitioning_controller_is_not_stopped() {
-        let status = json!({ "running": false, "starting": false, "readyForStart": false });
-
-        assert!(!play_status_is_stopped(&status));
-    }
-
-    #[test]
-    fn running_play_runtime_overrides_stale_stopped_editor() {
+    fn play_runtime_activity_prefers_the_runtime_over_a_stale_editor_state() {
         assert!(play_runtime_is_active(Some(true), Some(false)));
-    }
-
-    #[test]
-    fn unresponsive_play_runtime_follows_editor_state() {
         assert!(!play_runtime_is_active(Some(true), None));
         assert!(play_runtime_is_active(Some(false), None));
         assert!(play_runtime_is_active(None, None));

@@ -171,8 +171,6 @@ function BridgePluginRuntime.start(context)
 	local BRIDGE_VERSION = "0.3.6"
 	local BRIDGE_PROTOCOL_VERSION = "compact-v5"
 	local BRIDGE_BUILD_UNIX = 1789311798
-	local CHUNK_FRAME_PROTOCOL_VERSION = "rbs2"
-	local COMPACT_VALUE_PROTOCOL_VERSION = "compact-v5-schema-4"
 	local MAX_ACTIVE_DEMAND_SERIALIZERS = 4
 	local MAX_SOURCE_BATCH_PATHS = 1024
 	local COMPACT_TYPE_IDS = {
@@ -3138,8 +3136,6 @@ function BridgePluginRuntime.start(context)
 			bridgeBuildUnix = BRIDGE_BUILD_UNIX,
 			protocolVersion = BRIDGE_PROTOCOL_VERSION,
 			codecVersion = CODEC_VERSION,
-			chunkFrameProtocolVersion = CHUNK_FRAME_PROTOCOL_VERSION,
-			compactValueProtocolVersion = COMPACT_VALUE_PROTOCOL_VERSION,
 			bridgeRole = Config.bridgeRole,
 			exportAllProperties = EXPORT_ALL_PROPERTIES,
 		}

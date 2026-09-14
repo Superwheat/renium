@@ -12,6 +12,8 @@ use crate::rbx::encode::rbx_logical_property_name;
 use ahash::{AHashMap, AHashSet};
 use rbx_binary::InstanceBindingMode;
 
+const NATIVE_IMPORT_BATCH_INSTANCES: usize = 512;
+
 pub(super) fn expected_structure(
     dom: &RbxWeakDom,
     root: RbxRef,
@@ -150,14 +152,7 @@ pub(super) fn encode_services(
     remove_excluded_children(dom, &requested, &included)?;
     let database = rbx_reflection_database::get()?;
     filter_retained_properties(dom, &requested, post_apply, database)?;
-    // Bound actual instance trees, not only transport bytes or service count.
-    // Zero is an internal whole-payload A/B control.
-    let limit = std::env::var("RENIUM_NATIVE_IMPORT_BATCH_INSTANCES")
-        .ok()
-        .map(|value| value.parse::<usize>())
-        .transpose()?
-        .unwrap_or(512);
-    anyhow::ensure!(limit <= 1_000_000, "Native import batch limit is oversized");
+    let limit = NATIVE_IMPORT_BATCH_INSTANCES;
     let mut preorder = Vec::new();
     let mut subtree_sizes = AHashMap::<RbxRef, usize>::new();
     let mut postorder = AHashMap::<RbxRef, usize>::new();
