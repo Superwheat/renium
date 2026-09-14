@@ -1,27 +1,7 @@
 local BridgeParallel = {}
 
-local SERIALIZATION_BURST_BUDGET_SECONDS = 1 / 240
-local SERIALIZATION_BURST_CHECK_INTERVAL = 64
 local MAX_PARALLEL_CHUNK_WORKERS = 4
 local PARALLEL_TARGET_ITEMS_PER_WORKER = 256
-
-function BridgeParallel.makeBurstYielder(checkInterval, budgetSeconds)
-	local interval = math.max(1, checkInterval or SERIALIZATION_BURST_CHECK_INTERVAL)
-	local budget = budgetSeconds or SERIALIZATION_BURST_BUDGET_SECONDS
-	local untilCheck = interval
-	local burstStarted = os.clock()
-	return function()
-		untilCheck -= 1
-		if untilCheck > 0 then
-			return
-		end
-		untilCheck = interval
-		if os.clock() - burstStarted >= budget then
-			task.wait()
-			burstStarted = os.clock()
-		end
-	end
-end
 
 function BridgeParallel.getParallelChunkWorkerCount(totalItems, minItems)
 	if totalItems < minItems then
