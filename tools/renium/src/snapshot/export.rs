@@ -1149,6 +1149,7 @@ fn export_snapshots_prelude(args: &PullArgs) -> Result<ExportPrelude> {
 }
 
 pub(crate) fn pull_from_studio(mut args: PullArgs) -> Result<()> {
+    crate::project::layout::ensure_explicit_project_root(&args.project_root)?;
     apply_configured_project_layout(&mut args.project_root, &mut args.src_dir)?;
     let parameters = json!({
         "srcDir": args.src_dir,
