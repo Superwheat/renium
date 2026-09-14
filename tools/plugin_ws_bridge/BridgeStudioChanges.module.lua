@@ -3977,7 +3977,6 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 
 		local waitSeconds = tonumber(params.waitSeconds)
 		local waitedForChange = false
-		local waitTimedOut = false
 		local waitCancelled = false
 		if
 			waitSeconds
@@ -3987,9 +3986,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			and params.ackSeq == nil
 		then
 			waitedForChange = true
-			local changed
-			changed, waitCancelled = waitForDirtyServices(services, waitSeconds, leaseId)
-			waitTimedOut = not changed and not waitCancelled
+			_, waitCancelled = waitForDirtyServices(services, waitSeconds, leaseId)
 		end
 
 		local responseServices = if params.includeAllState == true
@@ -4018,9 +4015,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			response.checkpointGenerations = checkpointGenerations
 		end
 		if waitedForChange then
-			response.eventDriven = true
 			response.waitSeconds = math.min(waitSeconds or 0, 25)
-			response.waitTimedOut = waitTimedOut
 			response.waitCancelled = waitCancelled
 		end
 		reportedSeq = state.seq
