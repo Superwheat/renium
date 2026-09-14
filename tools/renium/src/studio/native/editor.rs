@@ -412,13 +412,7 @@ pub(crate) fn decode_bridge_buffer(
     Ok(bytes)
 }
 
-fn native_binary_chunk_bytes() -> usize {
-    std::env::var("RENIUM_NATIVE_CHUNK_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(4 * 1024 * 1024)
-        .clamp(256 * 1024, 8 * 1024 * 1024)
-}
+const NATIVE_BINARY_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
 const NATIVE_PAYLOAD_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
 const NATIVE_PAYLOAD_CACHE_MAX_ENTRIES: usize = 32;
@@ -544,7 +538,7 @@ fn receive_editor_binary_export_bytes_with_cache(
     // exports may evict it from the bounded shared cache during this request.
     let known_payload = native_payload_cache_for_slot(cache_slot);
     let known_payload_hash = known_payload.as_ref().map(|(hash, _)| hash.as_str());
-    let raw_chunk_bytes = native_binary_chunk_bytes();
+    let raw_chunk_bytes = NATIVE_BINARY_CHUNK_BYTES;
     let read_started = Instant::now();
     let first_parameters = json!({
         "exportId": export_id,
@@ -661,7 +655,7 @@ fn receive_editor_binary_export_batch_payload(
     serialization_complete: Option<&AtomicBool>,
 ) -> Result<Vec<u8>> {
     const MAX_BATCH_BYTES: usize = 512 * 1024 * 1024 + 1024;
-    let raw_chunk_bytes = native_binary_chunk_bytes();
+    let raw_chunk_bytes = NATIVE_BINARY_CHUNK_BYTES;
     let first = bridge.call_chunk(
         "readEditorBinaryExportBatch",
         json!({
@@ -2628,12 +2622,9 @@ pub(crate) fn editor_binary_export_parts<'a>(
                 .with_context(|| format!("Native export omitted {service}"))
         })
         .collect::<Result<Vec<_>>>()?;
-    let worker_count = std::env::var("RENIUM_NATIVE_SERVICE_WORKERS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or_else(|| bridge.channel_count())
+    let worker_count = bridge
+        .channel_count()
         .max(1)
-        .min(bridge.channel_count().max(1))
         .min(requested_groups.len().max(1));
     let serialization_batch_by_service = export
         .serialization_batches
@@ -2948,7 +2939,7 @@ pub(crate) fn editor_binary_export_parts<'a>(
                                         Some(&group.service),
                                         Some(serialization_complete_signal),
                                     )?;
-                                    let one_chunk = bytes.len() <= native_binary_chunk_bytes();
+                                    let one_chunk = bytes.len() <= NATIVE_BINARY_CHUNK_BYTES;
                                     (
                                         decode_native_service_dom(
                                             &bytes,

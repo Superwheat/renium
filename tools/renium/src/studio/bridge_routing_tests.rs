@@ -488,15 +488,19 @@ fn handshake(
         .unwrap();
     let (mut peer, _) = tungstenite::client(format!("ws://{address}"), stream).unwrap();
     let request: Value = serde_json::from_str(&peer.read().unwrap().into_text().unwrap()).unwrap();
-    peer.send(Message::Text(json!({"id": request["id"], "ok": true, "result": {
-        "runtimeId": info.runtime_id, "bridgeRole": info.bridge_role,
-        "launchNonce": info.launch_nonce, "launchEditRuntimeId": info.launch_edit_runtime_id,
-        "playerName": info.player_name, "playerUserId": info.player_user_id,
-        "gameId": info.game_id, "placeId": info.place_id, "placeName": info.place_name,
-        "protocolVersion": "compact-v5", "codecVersion": "compact-v5-schema-9",
-        "chunkFrameProtocolVersion": "rbs2", "compactValueProtocolVersion": "compact-v5-schema-4",
-        "registrationAck": true
-    }}).to_string().into())).unwrap();
+    peer.send(Message::Text(
+        json!({"id": request["id"], "ok": true, "result": {
+            "runtimeId": info.runtime_id, "bridgeRole": info.bridge_role,
+            "launchNonce": info.launch_nonce, "launchEditRuntimeId": info.launch_edit_runtime_id,
+            "playerName": info.player_name, "playerUserId": info.player_user_id,
+            "gameId": info.game_id, "placeId": info.place_id, "placeName": info.place_name,
+            "protocolVersion": "compact-v5", "codecVersion": "compact-v5-schema-9",
+            "registrationAck": true
+        }})
+        .to_string()
+        .into(),
+    ))
+    .unwrap();
     let ack = peer.read().ok()?;
     let ack: Value = serde_json::from_str(&ack.into_text().ok()?).ok()?;
     assert_eq!(ack["method"], "bridgeRegistered");
@@ -637,8 +641,6 @@ fn edit_info(runtime: &str, place: i64) -> BridgeInfoPayload {
         place_name: format!("place-{place}"),
         protocol_version: "compact-v5".into(),
         codec_version: "compact-v5-schema-9".into(),
-        chunk_frame_protocol_version: "rbs2".into(),
-        compact_value_protocol_version: "compact-v5-schema-4".into(),
         ..Default::default()
     }
 }

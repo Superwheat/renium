@@ -11,6 +11,7 @@ const CLASS: usize = 264;
 const TARGET: usize = 80;
 const RESPONSE: usize = 312;
 const READER_TIMING: usize = 136;
+const NATIVE_BATCH_PAUSE_MS: u32 = 1;
 pub(crate) const CREATED_ROW: usize = 56;
 
 pub(crate) struct NativeReadReceipt {
@@ -284,13 +285,7 @@ pub(crate) fn read_service_payload(
         "Native batch anchors cannot form alias chains"
     );
     put_u32(&mut parameters, 1472, u32::try_from(plan.aliases.len())?);
-    let pause = std::env::var("RENIUM_NATIVE_IMPORT_BATCH_PAUSE_MS")
-        .ok()
-        .map(|value| value.parse::<u32>())
-        .transpose()?
-        .unwrap_or(1);
-    anyhow::ensure!(pause <= 16, "Native batch pause exceeds 16 ms");
-    put_u32(&mut parameters, 1476, pause);
+    put_u32(&mut parameters, 1476, NATIVE_BATCH_PAUSE_MS);
     for batch in &replacement.batches {
         parameters.extend_from_slice(&(batch.bytes.len() as u64).to_le_bytes());
     }

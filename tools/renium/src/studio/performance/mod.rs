@@ -1167,12 +1167,8 @@ mod tests {
     }
 
     #[test]
-    fn commit_projection_replaces_current_studio_usage() {
+    fn commit_projection_replaces_current_studio_usage_without_underflow() {
         assert_eq!(projected_commit(10_000, 3_000, 5_000, 1_000), 13_000);
-    }
-
-    #[test]
-    fn commit_projection_cannot_underflow() {
         assert_eq!(projected_commit(1_000, 2_000, 500, 250), 750);
     }
 

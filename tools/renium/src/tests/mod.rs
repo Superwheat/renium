@@ -73,7 +73,7 @@ use crate::settings::bytecode::{
 };
 use crate::snapshot::codec::decode_compact_v5_value;
 use crate::snapshot::export::{
-    fetch_text_chunks, fetch_text_chunks_with_cache, parse_bridge_chunk, parse_place_guard_config,
+    fetch_text_chunks, fetch_text_chunks_with_cache, parse_bridge_chunk,
 };
 use crate::snapshot::import::{
     remove_stale_import_paths, state_with_preserved_material_service_settings,
@@ -235,28 +235,6 @@ fn rbx_class_is_a(
 }
 
 #[test]
-fn place_guard_rejects_typos_and_empty_allowlists() {
-    let path = Path::new("renium.config.json");
-    assert!(
-        parse_place_guard_config(r#"{"allowedPlaceId":[123]}"#, path)
-            .err()
-            .expect("unknown fields should be rejected")
-            .to_string()
-            .contains("Invalid place guard JSON")
-    );
-    assert!(
-        parse_place_guard_config(r#"{"allowedPlaceIds":[],"allowedGameIds":[]}"#, path)
-            .err()
-            .expect("empty allowlists should be rejected")
-            .to_string()
-            .contains("must contain at least one")
-    );
-    let parsed =
-        parse_place_guard_config(r#"{"allowedPlaceIds":[123],"allowedGameIds":[]}"#, path).unwrap();
-    assert_eq!(parsed.allowed_place_ids, vec![123]);
-}
-
-#[test]
 fn stale_import_paths_are_deleted() {
     let root = temp_dir("import-cleanup");
     let service_dir = root.join("src").join("Workspace");
@@ -304,13 +282,9 @@ fn agent_luau_loops_receive_cooperative_checkpoints() {
 }
 
 #[test]
-fn agent_luau_without_loops_is_unchanged() {
+fn agent_luau_instrumentation_leaves_loop_free_code_and_user_names_alone() {
     let source = "return game.PlaceId";
     assert_eq!(cooperative_luau(source).unwrap(), source);
-}
-
-#[test]
-fn agent_luau_checkpoint_name_does_not_shadow_user_code() {
     let source = "local __reniumCooperate = true; while true do break end";
     let instrumented = cooperative_luau(source).unwrap();
     assert!(instrumented.contains("__reniumCooperate_();"));

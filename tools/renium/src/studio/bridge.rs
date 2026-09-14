@@ -337,7 +337,6 @@ mod request_cancellation_tests {
             "id": request["id"], "ok": true, "result": {
                 "runtimeId": "handshake-test", "bridgeRole": "play-server", "registrationAck": true,
                 "protocolVersion": "compact-v5", "codecVersion": "compact-v5-schema-9",
-                "chunkFrameProtocolVersion": "rbs2", "compactValueProtocolVersion": "compact-v5-schema-4",
             },
         }).to_string().into())).unwrap();
         let ack: Value = serde_json::from_str(&ready.read().unwrap().into_text().unwrap()).unwrap();
@@ -578,8 +577,6 @@ pub(crate) struct BridgeInfoPayload {
     pub(crate) place_name: String,
     pub(crate) protocol_version: String,
     pub(crate) codec_version: String,
-    pub(crate) chunk_frame_protocol_version: String,
-    pub(crate) compact_value_protocol_version: String,
     pub(crate) export_all_properties: bool,
     pub(crate) registration_ack: bool,
 }
