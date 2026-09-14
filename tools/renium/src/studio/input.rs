@@ -1644,7 +1644,7 @@ mod platform {
             }
         };
         let mut accepted = false;
-        let mut finish_deadline = None;
+        let mut final_pass = false;
         loop {
             if let Some((dialog, button)) = package_changes_ok_button(&automation, top)? {
                 let _background = BackgroundDialogGuard::new(dialog as HWND, pid)?;
@@ -1666,13 +1666,14 @@ mod platform {
                 }
                 accepted = true;
             }
+            // Studio raises the notice synchronously while the package mutates,
+            // so one more pass after the transaction settles is sufficient.
             if finished.load(std::sync::atomic::Ordering::Acquire) {
-                let deadline = finish_deadline.get_or_insert_with(|| {
-                    std::time::Instant::now() + std::time::Duration::from_secs(1)
-                });
-                if std::time::Instant::now() >= *deadline {
+                if final_pass {
                     return Ok(accepted);
                 }
+                final_pass = true;
+                continue;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -2582,18 +2583,40 @@ mod platform {
         let windows = ax_attribute(application, "AXWindows")? as CFArrayRef;
         // SAFETY: AXWindows is an owned CFArray whose entries remain valid while it is retained.
         let count = unsafe { CFArrayGetCount(windows) };
+        let mut message = None;
         for index in 0..count {
             // SAFETY: index is within the CFArray count read above.
             let window = unsafe { CFArrayGetValueAtIndex(windows, index) };
-            if let Some(message) = find_ax_text(window, PACKAGE_CHANGES_MESSAGE, 16) {
-                // SAFETY: AXUIElementCopyAttributeValue returned an owned CFArray.
-                unsafe { CFRelease(windows) };
-                return Some(message);
+            // The document window is a deep Qt tree that takes seconds to walk.
+            // The notice is either a separate shallow alert or a sheet on it.
+            let document = ax_string_attribute(window, "AXTitle")
+                .is_some_and(|title| title.ends_with(" - Roblox Studio"));
+            if document {
+                if let Some(sheets) = ax_attribute(window, "AXSheets") {
+                    let sheets = sheets as CFArrayRef;
+                    // SAFETY: AXSheets is an owned CFArray whose entries remain valid while it is retained.
+                    let sheet_count = unsafe { CFArrayGetCount(sheets) };
+                    for sheet_index in 0..sheet_count {
+                        // SAFETY: sheet_index is within the CFArray count read above.
+                        let sheet = unsafe { CFArrayGetValueAtIndex(sheets, sheet_index) };
+                        message = find_ax_text(sheet, PACKAGE_CHANGES_MESSAGE, 6);
+                        if message.is_some() {
+                            break;
+                        }
+                    }
+                    // SAFETY: AXUIElementCopyAttributeValue returned an owned CFArray.
+                    unsafe { CFRelease(sheets) };
+                }
+            } else {
+                message = find_ax_text(window, PACKAGE_CHANGES_MESSAGE, 8);
+            }
+            if message.is_some() {
+                break;
             }
         }
         // SAFETY: AXUIElementCopyAttributeValue returned an owned CFArray.
         unsafe { CFRelease(windows) };
-        None
+        message
     }
 
     fn auto_recovery_ignore_button(pid: i32) -> Result<Option<AXUIElementRef>> {

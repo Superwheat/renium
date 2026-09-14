@@ -672,10 +672,15 @@ impl<'a> EditorTransaction<'a> {
                     .any(|group| !group.package_roots.is_empty())
             })
         {
+            let watcher_started = Instant::now();
             transaction.package_dialog = Some(
                 studio_pid_for_bridge(bridge)
                     .and_then(crate::studio::input::watch_package_changes_dialog)
                     .context("Package changes cannot be applied without a dialog watcher")?,
+            );
+            log_timing(
+                "native editor package dialog watcher start",
+                watcher_started,
             );
         }
 
@@ -752,9 +757,16 @@ impl<'a> EditorTransaction<'a> {
             let started = Instant::now();
             let timeout = Duration::from_secs(20);
             let pid = studio_pid_for_bridge(bridge)?;
-            let title = crate::studio::input::studio_window_title(pid)?;
+            let title = crate::studio::native::serializer::target_name(
+                pid,
+                &bridge
+                    .cached_bridge_info_for_target(BridgeTarget::Edit)?
+                    .place_name,
+            )?;
+            log_timing("native editor package title lookup", started);
             transaction.package_runtime = Some((pid, title.clone()));
             for root in &packages.packages {
+                let action_started = Instant::now();
                 let result = (|| {
                     let remaining = timeout
                         .checked_sub(started.elapsed())
@@ -771,6 +783,7 @@ impl<'a> EditorTransaction<'a> {
                         remaining,
                     )
                 })();
+                log_timing("native editor package desync action", action_started);
                 match result {
                     Ok(result) if result.changed => {
                         transaction.auto_desynced_packages.push(result.path);
@@ -920,14 +933,25 @@ impl<'a> EditorTransaction<'a> {
         self.active = false;
         self.auto_desynced_package_targets.clear();
         self.package_runtime = None;
+        let watcher_started = Instant::now();
         let package_dialog_accepted = self
             .package_dialog
             .take()
             .map(|watcher| watcher.finish())
             .transpose();
+        log_timing(
+            "native editor package dialog watcher finish",
+            watcher_started,
+        );
         let package_dialog_accepted = package_dialog_accepted
             .context("Studio did not finish accepting package changes")?
             .unwrap_or(false);
+        if let Some(reason) = result.get("pushProofUnavailable").and_then(Value::as_str) {
+            log_global(
+                5,
+                format_args!("[renium] commit push proof unavailable: {reason}"),
+            );
+        }
         Ok(EditorCommitStatus {
             verified_push_proof: result
                 .get("verifiedPushProof")
@@ -2336,6 +2360,13 @@ fn push_editor_changes_with_collected(
     let phase_started = Instant::now();
     apply_files_to_studio_filters(&args, bridge, &mut changes, projection)?;
     log_timing("native editor push filters", phase_started);
+    let phase_started = Instant::now();
+    let unchanged_sources = if prepared_binary_import.is_none() {
+        drop_unchanged_source_changes(bridge, &mut changes)?
+    } else {
+        0
+    };
+    log_timing("native editor unchanged source filter", phase_started);
     let review_skipped = !args.no_review
         && !args.yes
         && !global_yes()
@@ -2425,6 +2456,19 @@ fn push_editor_changes_with_collected(
                 transaction.as_ref().map(|value| value.id.as_str()),
                 &mut summary,
             )?;
+        }
+        if unchanged_sources > 0 {
+            summary.insert("sourceUnchanged".to_string(), json!(unchanged_sources));
+            if args.verify_sources && !review_skipped {
+                let verified = summary
+                    .get("sourceVerified")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                summary.insert(
+                    "sourceVerified".to_string(),
+                    json!(verified + unchanged_sources as u64),
+                );
+            }
         }
         let phase_started = Instant::now();
         let protected =
@@ -2936,6 +2980,13 @@ struct LiveSourceRow {
     index: usize,
     source: Option<String>,
     error: Option<String>,
+    #[serde(default, rename = "className")]
+    class_name: Option<String>,
+}
+
+struct LiveSource {
+    source: String,
+    class_name: Option<String>,
 }
 
 fn fetch_live_editor_sources(
@@ -2943,9 +2994,9 @@ fn fetch_live_editor_sources(
     changes: &EditorChangeSet,
     indexes: &[usize],
     transaction_id: Option<&str>,
-) -> Result<HashMap<usize, std::result::Result<String, String>>> {
+) -> Result<HashMap<usize, std::result::Result<LiveSource, String>>> {
     let mut sources = HashMap::with_capacity(indexes.len());
-    for batch in indexes.chunks(16) {
+    for batch in indexes.chunks(64) {
         let selectors = batch
             .iter()
             .map(|index| {
@@ -2972,7 +3023,10 @@ fn fetch_live_editor_sources(
                 continue;
             }
             let value = match (row.source, row.error) {
-                (Some(source), _) => Ok(source),
+                (Some(source), _) => Ok(LiveSource {
+                    source,
+                    class_name: row.class_name,
+                }),
                 (None, Some(error)) => Err(error),
                 (None, None) => Err("Studio did not return the script Source".to_string()),
             };
@@ -2985,6 +3039,50 @@ fn fetch_live_editor_sources(
         }
     }
     Ok(sources)
+}
+
+// A script whose Studio Source and class already equal the file is not a
+// change. Dropping it before the transaction keeps rollback capture, package
+// preflight and history recording scoped to real edits.
+fn drop_unchanged_source_changes(
+    bridge: &BridgeServer,
+    changes: &mut EditorChangeSet,
+) -> Result<usize> {
+    let indexes = changes
+        .source_changes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, change)| (!change.deleted && change.source.is_some()).then_some(index))
+        .collect::<Vec<_>>();
+    if indexes.is_empty() {
+        return Ok(0);
+    }
+    let sources = fetch_live_editor_sources(bridge, changes, &indexes, None)?;
+    let unchanged = indexes
+        .into_iter()
+        .filter(|index| {
+            let change = &changes.source_changes[*index];
+            matches!(
+                sources.get(index),
+                Some(Ok(live))
+                    if live.class_name.as_deref() == Some(change.class_name.as_str())
+                        && editor_sources_match(
+                            change.source.as_deref().unwrap_or_default(),
+                            &live.source
+                        )
+            )
+        })
+        .collect::<HashSet<_>>();
+    if unchanged.is_empty() {
+        return Ok(0);
+    }
+    let mut index = 0;
+    changes.source_changes.retain(|_| {
+        let keep = !unchanged.contains(&index);
+        index += 1;
+        keep
+    });
+    Ok(unchanged.len())
 }
 
 fn verify_editor_source_changes(
@@ -3026,14 +3124,14 @@ fn verify_editor_source_changes(
             let expected = change.source.as_deref().unwrap_or_default();
             let source_key = editor_source_key(change);
             let failure = match sources.get(index) {
-                Some(Ok(actual)) if editor_sources_match(expected, actual) => None,
-                Some(Ok(actual)) => Some(format!(
+                Some(Ok(live)) if editor_sources_match(expected, &live.source) => None,
+                Some(Ok(live)) => Some(format!(
                     "{} source mismatch: editor_len={} studio_len={} editor_hash={} studio_hash={} key={}",
                     change.path_segments.join("."),
                     expected.len(),
-                    actual.len(),
+                    live.source.len(),
                     fnv1a_hex(expected.as_bytes()),
-                    fnv1a_hex(actual.as_bytes()),
+                    fnv1a_hex(live.source.as_bytes()),
                     source_key,
                 )),
                 Some(Err(error)) => Some(format!(

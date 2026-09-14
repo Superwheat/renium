@@ -323,14 +323,24 @@ fn full_push_cache_input(args: &PushEditorChangesArgs, services: &[String]) -> R
 }
 
 #[cfg(any(windows, target_os = "macos"))]
-fn try_verified_full_push(
+struct VerifiedFullPushCandidate {
+    cached: VerifiedFullPush,
+    files_unchanged: bool,
+}
+
+// The retained proof says Studio still equals the files of the last verified
+// push. Those files are then a complete baseline: an unchanged tree needs no
+// push at all, and a changed tree needs only a file diff instead of a fresh
+// Studio capture.
+#[cfg(any(windows, target_os = "macos"))]
+fn take_verified_full_push(
     context: &BoundContext,
     bridge: &BridgeServer,
     services: &[String],
     args: &PushEditorChangesArgs,
-) -> Result<bool> {
+) -> Result<Option<VerifiedFullPushCandidate>> {
     let Some(runtime) = context.runtime_id.as_deref() else {
-        return Ok(false);
+        return Ok(None);
     };
     // Take ownership before any RPC or native cleanup: another place must not
     // wait behind this place's verification or an expired observer's teardown.
@@ -340,7 +350,7 @@ fn try_verified_full_push(
         .unwrap_or_else(PoisonError::into_inner)
         .remove(runtime);
     let Some(cached) = cached else {
-        return Ok(false);
+        return Ok(None);
     };
     let invalidated_by = if cached.expired() {
         Some("proof expired")
@@ -348,42 +358,68 @@ fn try_verified_full_push(
         Some("Studio connection changed")
     } else if cached.input != full_push_cache_input(args, services)? {
         Some("push configuration changed")
-    } else if cached.project != capture_snapshot(&args.project.project_root, &cached.paths)? {
-        Some("source files changed")
     } else {
         None
     };
     if let Some(reason) = invalidated_by {
         log_global(5, format_args!("[renium] full push cache miss: {reason}"));
-        return Ok(false);
+        return Ok(None);
     }
+    let files_unchanged =
+        cached.project == capture_snapshot(&args.project.project_root, &cached.paths)?;
+    Ok(Some(VerifiedFullPushCandidate {
+        cached,
+        files_unchanged,
+    }))
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn verified_full_push_proof_matches(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+    proof: &Value,
+) -> Result<bool> {
+    let runtime = context
+        .runtime_id
+        .as_deref()
+        .context("Studio context has no edit-mode runtime")?;
     pin_edit_runtime(context, bridge)?;
     let state = bridge.call_for_runtime_with_timeout(
         "getStudioChangeState",
-        json!({"start": false, "verifyPushProof": cached.proof}),
+        json!({"start": false, "verifyPushProof": proof}),
         BridgeTarget::Edit,
         runtime,
         Some(Duration::from_secs(10)),
     )?;
     ensure_plugin_api_ok(&state)?;
-    if state["pushProofMatches"] != true {
-        log_global(
-            5,
-            format_args!(
-                "[renium] full push cache miss: {}",
-                state["pushProofMismatch"]
-                    .as_str()
-                    .unwrap_or("Studio proof unavailable")
-            ),
-        );
-        return Ok(false);
+    if state["pushProofMatches"] == true {
+        return Ok(true);
     }
-    bridge
-        .verified_full_pushes
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .insert(runtime.to_string(), cached);
-    Ok(true)
+    log_global(
+        5,
+        format_args!(
+            "[renium] full push cache miss: {}",
+            state["pushProofMismatch"]
+                .as_str()
+                .unwrap_or("Studio proof unavailable")
+        ),
+    );
+    Ok(false)
+}
+
+fn capture_push_proof(bridge: &BridgeServer, guard: &StudioChangeGuard) -> Result<Option<Value>> {
+    let state = bridge.call_for_runtime_with_timeout(
+        "getStudioChangeState",
+        json!({ "start": false, "capturePushProof": true }),
+        BridgeTarget::Edit,
+        &guard.runtime_id,
+        Some(Duration::from_secs(10)),
+    )?;
+    ensure_plugin_api_ok(&state)?;
+    Ok(state
+        .get("verifiedPushProof")
+        .filter(|value| !value.is_null())
+        .cloned())
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -396,10 +432,22 @@ fn retain_verified_full_push(
     #[cfg(windows)] attributes: &mut Option<crate::studio::native::serializer::AttributeGuard>,
 ) {
     let (Some(input), Some(proof)) = (input, release.retained_proof.as_ref()) else {
+        log_global(
+            5,
+            format_args!(
+                "[renium] full push proof not retained: input={} proof={}",
+                input.is_some(),
+                release.retained_proof.is_some()
+            ),
+        );
         return;
     };
     #[cfg(windows)]
     let Some(attributes) = attributes.take() else {
+        log_global(
+            5,
+            format_args!("[renium] full push proof not retained: no native attribute guard"),
+        );
         return;
     };
     let cached = VerifiedFullPush {
@@ -2234,6 +2282,22 @@ fn current_studio_change_guard_with_state(
     native_attribute_services: Option<&[String]>,
     arm_native: impl FnOnce(&Value) -> Result<()>,
 ) -> Result<(StudioChangeGuard, Value)> {
+    current_studio_change_guard_verifying(
+        context,
+        bridge,
+        native_attribute_services,
+        None,
+        arm_native,
+    )
+}
+
+fn current_studio_change_guard_verifying(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+    native_attribute_services: Option<&[String]>,
+    verify_push_proof: Option<&Value>,
+    arm_native: impl FnOnce(&Value) -> Result<()>,
+) -> Result<(StudioChangeGuard, Value)> {
     let runtime_id = context
         .runtime_id
         .as_deref()
@@ -2257,7 +2321,7 @@ fn current_studio_change_guard_with_state(
             "deferNativeTracking": cfg!(windows) && native_attribute_services.is_some(),
             "captureLocalPushProof": cfg!(target_os = "macos") && native_attribute_services.is_some(),
             "services": native_attribute_services,
-            "capturePushProof": true,
+            "verifyPushProof": verify_push_proof,
         }),
         BridgeTarget::Edit,
         runtime_id,
@@ -2273,18 +2337,38 @@ fn current_studio_change_guard_with_state(
     ensure_plugin_api_ok(&state)?;
     let tracking_started = state["trackingStarted"].as_bool() != Some(false);
     arm_native(&state)?;
+    log_global(
+        5,
+        format_args!(
+            "[renium] tracking lease: deferred={} proofMatches={} mismatch={} verifying={} continued={} started={}",
+            state["nativeTrackingDeferred"],
+            state["pushProofMatches"],
+            state["pushProofMismatch"],
+            verify_push_proof.is_some(),
+            state["nativeRelayContinued"],
+            state["trackingStarted"]
+        ),
+    );
     if state["nativeTrackingDeferred"] == true {
         // The native handshake starts tracking with attribute observation already
         // armed. If discovery failed, this call starts ordinary local listeners.
         // In either case this is the initial, fully observed generation fence.
+        let proof_matches = state.get("pushProofMatches").cloned();
+        let proof_mismatch = state.get("pushProofMismatch").cloned();
         state = bridge.call_for_runtime_with_timeout(
             "getStudioChangeState",
-            json!({"start": true, "trackingGuardId": guard_id, "includeGenerations": true, "capturePushProof": true}),
+            json!({"start": true, "trackingGuardId": guard_id, "includeGenerations": true}),
             BridgeTarget::Edit,
             runtime_id,
             Some(Duration::from_secs(10)),
         )?;
         ensure_plugin_api_ok(&state)?;
+        if let Some(matches) = proof_matches {
+            state["pushProofMatches"] = matches;
+        }
+        if let Some(mismatch) = proof_mismatch {
+            state["pushProofMismatch"] = mismatch;
+        }
     }
     let mut guard = studio_change_guard_from_state(context, &state)?;
     guard.tracking_guard_id = Some(guard_id);
@@ -2520,12 +2604,26 @@ fn push_project(
     replace: bool,
 ) -> Result<Map<String, Value>> {
     #[cfg(any(windows, target_os = "macos"))]
-    if replace && guard.is_none() && try_verified_full_push(context, bridge, services, &push_args)?
-    {
-        return Ok(Map::from_iter([
-            ("ok".into(), json!(true)),
-            ("unchanged".into(), json!(true)),
-        ]));
+    let mut verified_candidate = if replace && guard.is_none() {
+        take_verified_full_push(context, bridge, services, &push_args)?
+    } else {
+        None
+    };
+    #[cfg(any(windows, target_os = "macos"))]
+    if let Some(candidate) = verified_candidate.take_if(|candidate| candidate.files_unchanged) {
+        if verified_full_push_proof_matches(context, bridge, &candidate.cached.proof)? {
+            if let Some(runtime) = context.runtime_id.as_deref() {
+                bridge
+                    .verified_full_pushes
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(runtime.to_string(), candidate.cached);
+            }
+            return Ok(Map::from_iter([
+                ("ok".into(), json!(true)),
+                ("unchanged".into(), json!(true)),
+            ]));
+        }
     }
     #[cfg(any(windows, target_os = "macos"))]
     let cache_input = if replace && guard.is_none() {
@@ -2536,14 +2634,47 @@ fn push_project(
     #[cfg(windows)]
     let mut _native_attributes = None;
     let phase = Instant::now();
+    // The previous push's native attribute observer must outlive the proof
+    // check inside the lease request, yet stop before the new lease arms its
+    // own observer: stopping it earlier retires the proof, stopping it later
+    // disarms the fresh observer.
+    #[cfg(any(windows, target_os = "macos"))]
+    let (candidate_parts, mut previous_attributes) = match verified_candidate {
+        Some(candidate) => {
+            let VerifiedFullPushCandidate { cached, .. } = candidate;
+            #[cfg(windows)]
+            let previous = Some(cached._attributes);
+            #[cfg(not(windows))]
+            let previous = ();
+            (Some((cached.proof.clone(), cached.project)), previous)
+        }
+        None => {
+            #[cfg(windows)]
+            let previous = None;
+            #[cfg(not(windows))]
+            let previous = ();
+            (None, previous)
+        }
+    };
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let (candidate_parts, mut previous_attributes): (Option<(Value, ProjectSnapshot)>, ()) =
+        (None, ());
+    let candidate_proof = candidate_parts.as_ref().map(|(proof, _)| proof.clone());
     let (mut guard, initial_state) = if let Some(guard) = guard {
         (guard.clone(), Value::Null)
     } else {
-        current_studio_change_guard_with_state(
+        current_studio_change_guard_verifying(
             context,
             bridge,
             (cfg!(any(windows, target_os = "macos")) && replace).then_some(services),
+            candidate_proof.as_ref(),
             |state| {
+                #[cfg(windows)]
+                if state["nativeRelayContinued"] == true {
+                    return Ok(());
+                }
+                #[cfg(windows)]
+                drop(previous_attributes.take());
                 #[cfg(windows)]
                 if let Some(path) = state
                     .get("nativeAttributeRelay")
@@ -2573,6 +2704,33 @@ fn push_project(
         )?
     };
     log_reconcile_timing("full push guard", phase);
+    #[cfg(windows)]
+    if initial_state["nativeRelayContinued"] == true {
+        _native_attributes = previous_attributes.take();
+    } else {
+        drop(previous_attributes.take());
+    }
+    #[cfg(not(windows))]
+    let _ = &mut previous_attributes;
+    // The proof was checked inside the request that armed tracking, so a match
+    // means every later Studio edit is caught by the transaction's generation
+    // checks and the last verified files are a complete baseline.
+    let verified_baseline = match candidate_parts {
+        Some((_, project)) if initial_state["pushProofMatches"] == true => Some(project),
+        Some(_) => {
+            log_global(
+                5,
+                format_args!(
+                    "[renium] full push cache miss: {}",
+                    initial_state["pushProofMismatch"]
+                        .as_str()
+                        .unwrap_or("Studio proof unavailable")
+                ),
+            );
+            None
+        }
+        None => None,
+    };
     let phase = Instant::now();
     // Declared before the tracking lease so unwinding releases Lua tracking
     // before native observation. On cancellation the native guard can promote
@@ -2601,7 +2759,9 @@ fn push_project(
     // Keep Studio calls on this thread, with its selected runtime and lease.
     let (captured, project) = std::thread::scope(|scope| {
         let project = scope.spawn(|| capture_snapshot(&root, &source_paths));
-        let captured = if !requires_stage
+        let captured = if let Some(baseline) = verified_baseline {
+            Ok((stage, baseline))
+        } else if !requires_stage
             && stage
                 .loaded
                 .as_ref()
@@ -2678,7 +2838,7 @@ fn push_project(
         phase,
     );
     if differences.is_empty() {
-        tracking_release.proof = initial_state.get("verifiedPushProof").cloned();
+        tracking_release.proof = capture_push_proof(bridge, &guard)?;
         acknowledge_verified_push(bridge, services, &guard, &mut tracking_release)?;
         #[cfg(any(windows, target_os = "macos"))]
         retain_verified_full_push(
@@ -2703,7 +2863,7 @@ fn push_project(
     )?;
     log_reconcile_timing("full push plan", phase);
     if plan.is_empty() {
-        tracking_release.proof = initial_state.get("verifiedPushProof").cloned();
+        tracking_release.proof = capture_push_proof(bridge, &guard)?;
         acknowledge_verified_push(bridge, services, &guard, &mut tracking_release)?;
         #[cfg(any(windows, target_os = "macos"))]
         retain_verified_full_push(
@@ -6231,6 +6391,10 @@ fn prepare_project_replacement(
                 .is_some_and(is_service_settings_file_name)
         })
         .map(|path| {
+            // Byte-identical settings files decode to identical documents.
+            if desired.entries.get(path) == observed.entries.get(path) {
+                return Ok((path.clone(), None));
+            }
             let (current, previous) = rayon::join(
                 || settings_document(desired.entries.get(path)),
                 || settings_document(observed.entries.get(path)),

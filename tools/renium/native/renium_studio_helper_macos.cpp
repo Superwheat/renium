@@ -2223,7 +2223,7 @@ static Response PackageAction(
                         SetError(response, "Package did not finish updating before the deadline");
                         return response;
                     }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 }
             }
         }
@@ -2299,7 +2299,7 @@ static Response PackageAction(
                     SetError(response, "Package did not finish publishing before the deadline");
                     return response;
                 }
-                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
         }
         response.outputSize = version > 0 ? static_cast<std::uint64_t>(version) : 0;
