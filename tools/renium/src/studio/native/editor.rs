@@ -3808,7 +3808,6 @@ const PROPERTY_BATCH_MAX_ITEMS: usize = 512;
 
 fn combined_editor_change_batch(
     changes: &EditorChangeSet,
-    probe_events: bool,
     transaction_id: Option<&str>,
 ) -> Result<Option<Value>> {
     let categories = usize::from(!changes.instance_changes.is_empty())
@@ -3834,7 +3833,6 @@ fn combined_editor_change_batch(
     // applyEditorChanges already applies instances, then ordered sources, then
     // properties. Keep oversized and streaming operations on their chunked path.
     let request = json!({
-        "probeEvents": probe_events,
         "instanceChanges": &changes.instance_changes,
         "sourceChanges": sources,
         "propertyChanges": &changes.property_changes,
@@ -3854,7 +3852,6 @@ fn material_mode_value(change: &EditorPropertyChange) -> Option<&Value> {
 pub(crate) fn send_editor_change_batches(
     bridge: &BridgeServer,
     changes: &EditorChangeSet,
-    probe_events: bool,
     binary_import: Option<&EditorBinaryImport>,
     transaction_id: Option<&str>,
 ) -> Result<Map<String, Value>> {
@@ -3884,19 +3881,6 @@ pub(crate) fn send_editor_change_batches(
         && changes.source_changes.is_empty()
         && changes.property_changes.is_empty()
     {
-        if probe_events {
-            let result = bridge.call(
-                "applyEditorChanges",
-                json!({
-                    "probeEvents": true,
-                    "instanceChanges": [],
-                    "sourceChanges": [],
-                    "propertyChanges": [],
-                    "transactionId": transaction_id,
-                }),
-            )?;
-            merge_editor_summary_checked(&mut summary, &result)?;
-        }
         summary.insert(
             "noops".to_string(),
             Value::Number(serde_json::Number::from(0)),
@@ -3923,7 +3907,6 @@ pub(crate) fn send_editor_change_batches(
         let result = bridge.call(
             "applyEditorChanges",
             json!({
-                "probeEvents": probe_events,
                 "instanceChanges": [], "sourceChanges": [],
                 "propertyChanges": material_changes, "transactionId": transaction_id,
             }),
@@ -3955,7 +3938,7 @@ pub(crate) fn send_editor_change_batches(
 
     if binary_import.is_none()
         && material_changes.is_empty()
-        && let Some(request) = combined_editor_change_batch(changes, probe_events, transaction_id)?
+        && let Some(request) = combined_editor_change_batch(changes, transaction_id)?
     {
         let result = bridge.call("applyEditorChanges", request)?;
         merge_editor_summary_checked(&mut summary, &result)?;
@@ -4058,7 +4041,6 @@ pub(crate) fn send_editor_change_batches(
                 let result = match bridge.call(
                     "applyEditorChanges",
                     json!({
-                        "probeEvents": probe_events,
                         "instanceChanges": [{
                             "mode": mode,
                             "service": &instance_change.service,
@@ -4091,7 +4073,6 @@ pub(crate) fn send_editor_change_batches(
                 let result = bridge.call(
                     "applyEditorChanges",
                     json!({
-                    "probeEvents": probe_events,
                     "instanceChanges": [{
                         "mode": &instance_change.mode,
                         "service": &instance_change.service,
@@ -4109,7 +4090,6 @@ pub(crate) fn send_editor_change_batches(
             let result = bridge.call(
                 "applyEditorChanges",
                 json!({
-                    "probeEvents": probe_events,
                     "instanceChanges": [instance_change],
                     "sourceChanges": [],
                     "propertyChanges": [],
@@ -4142,7 +4122,6 @@ pub(crate) fn send_editor_change_batches(
         let result = bridge.call(
             "applyEditorChanges",
             json!({
-                "probeEvents": probe_events,
                 "instanceChanges": [],
                 "sourceChanges": source_batch,
                 "propertyChanges": [],
@@ -4255,13 +4234,7 @@ pub(crate) fn send_editor_change_batches(
         )),
     );
     let started = Instant::now();
-    send_property_batches(
-        bridge,
-        &property_changes,
-        probe_events,
-        transaction_id,
-        &mut summary,
-    )?;
+    send_property_batches(bridge, &property_changes, transaction_id, &mut summary)?;
     log_timing("native editor property batches", started);
 
     let started = Instant::now();
@@ -4312,13 +4285,7 @@ pub(crate) fn send_editor_change_batches(
                 .then_some(row)
             })
             .collect::<Vec<_>>();
-        send_property_batches(
-            bridge,
-            &ordinary_rows,
-            probe_events,
-            transaction_id,
-            &mut summary,
-        )?;
+        send_property_batches(bridge, &ordinary_rows, transaction_id, &mut summary)?;
         log_timing("native editor property batches after mesh writes", started);
     }
     if let Some(import) = binary_import.filter(|import| {
@@ -4781,7 +4748,7 @@ mod source_change_tests {
             }],
             ..Default::default()
         };
-        let request = combined_editor_change_batch(&changes, true, Some("tx"))
+        let request = combined_editor_change_batch(&changes, Some("tx"))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -4793,23 +4760,22 @@ mod source_change_tests {
             json!(child.path_segments)
         );
         assert_eq!(request["transactionId"], "tx");
-        assert_eq!(request["probeEvents"], true);
         changes.source_changes[0].source = Some("x".repeat(MAX_BRIDGE_CHUNK_BYTES));
         assert!(
-            combined_editor_change_batch(&changes, false, None)
+            combined_editor_change_batch(&changes, None)
                 .unwrap()
                 .is_none()
         );
         changes.source_changes = vec![parent.clone(); SOURCE_BATCH_SIZE + 1];
         assert!(
-            combined_editor_change_batch(&changes, false, None)
+            combined_editor_change_batch(&changes, None)
                 .unwrap()
                 .is_none()
         );
         changes.source_changes = vec![parent];
         changes.instance_changes[0].mode = "beginReconcileService".into();
         assert!(
-            combined_editor_change_batch(&changes, false, None)
+            combined_editor_change_batch(&changes, None)
                 .unwrap()
                 .is_none()
         );
@@ -4818,7 +4784,7 @@ mod source_change_tests {
             .map(|_| EditorInstanceDescriptor::default())
             .collect();
         assert!(
-            combined_editor_change_batch(&changes, false, None)
+            combined_editor_change_batch(&changes, None)
                 .unwrap()
                 .is_none()
         );
@@ -4828,7 +4794,6 @@ mod source_change_tests {
 fn send_property_batches(
     bridge: &BridgeServer,
     property_changes: &[EditorPropertyChange],
-    probe_events: bool,
     transaction_id: Option<&str>,
     summary: &mut Map<String, Value>,
 ) -> Result<()> {
@@ -4852,7 +4817,6 @@ fn send_property_batches(
         let result = bridge.call(
             "applyEditorChanges",
             json!({
-                "probeEvents": probe_events,
                 "instanceChanges": [],
                 "sourceChanges": [],
                 "propertyChanges": property_batch,

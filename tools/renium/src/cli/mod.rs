@@ -1280,8 +1280,6 @@ pub(super) struct PushEditorChangesArgs {
     pub(super) target_properties: Vec<String>,
     #[arg(short, long, alias = "upsert")]
     pub(super) upsert_instances_only: bool,
-    #[arg(short = 'e', long, alias = "probe")]
-    pub(super) probe_events: bool,
     #[arg(long, alias = "verify")]
     pub(super) verify_sources: bool,
     #[arg(long)]
@@ -1313,7 +1311,6 @@ impl PushEditorChangesArgs {
             target_settings_id_files: Vec::new(),
             target_properties: Vec::new(),
             upsert_instances_only: false,
-            probe_events: false,
             verify_sources: false,
             no_review: false,
             yes: false,
