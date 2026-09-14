@@ -2027,11 +2027,16 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		if nativeAttributeRelay and nativeAttributeRelay.cached then return end
 		local fingerprint = tagFingerprint(instance)
 		local previous = state.tagFingerprintByInstance[instance]
-		-- While a native import is staged, the inserted tree announces its
-		-- memberships as the loader populates it, before or after its receipts
-		-- connect each object. Those announcements are its initial tags, not edits.
+		-- While a transaction holds a natively inserted tree, CollectionService
+		-- announces that tree's memberships before or after the tree's receipts
+		-- connect each object, and on later frames. Those announcements are the
+		-- initial tags of objects this tracker has never seen, not edits; a
+		-- user insertion in that window still reaches the structural journal.
 		local journal = state.changeJournal
-		if journal ~= nil and journal.nativeAdditions ~= nil and nativeIncomingTree(instance) then
+		if journal ~= nil and (nativeIncomingTree(instance)
+			or journal.nativeAdditions ~= nil and previous == nil
+			and state.connectionServiceByInstance[instance] == nil
+			and journal.nativeAdditions[serviceNameForTrackedInstance(instance) or ""] ~= nil) then
 			state.tagFingerprintByInstance[instance] = if fingerprint == "" then nil else fingerprint
 			return
 		end
