@@ -525,6 +525,14 @@ struct SnapshotSides<'a> {
     studio: &'a ProjectSnapshot,
 }
 
+impl PairRecord {
+    fn note_setup(&mut self, setup: &PairSetup) {
+        self.last_runtime_id.clone_from(&setup.runtime_id);
+        self.local_file_stamp.clone_from(&setup.local_file_stamp);
+        self.local_file_digest.clone_from(&setup.local_file_digest);
+    }
+}
+
 impl ReconcilePushPlan {
     fn is_empty(&self) -> bool {
         self.changed_paths.is_empty()
@@ -1008,9 +1016,7 @@ impl Coordinator {
             };
             let confirmed = read_studio_change_state(context, bridge)?;
             if checkpoint.matches_state(context, &confirmed) && differences.is_empty() {
-                record.last_runtime_id = setup.runtime_id.clone();
-                record.local_file_stamp = setup.local_file_stamp.clone();
-                record.local_file_digest = setup.local_file_digest.clone();
+                record.note_setup(setup);
                 write_record(context, &setup.key, &record)?;
                 setup.resolution_required = false;
                 return Ok(());
@@ -1018,9 +1024,7 @@ impl Coordinator {
             if checkpoint.matches_state(context, &confirmed) && setup.mode.writes() {
                 let mut paths = differences.into_iter().collect::<Vec<_>>();
                 paths.sort();
-                record.last_runtime_id = setup.runtime_id.clone();
-                record.local_file_stamp = setup.local_file_stamp.clone();
-                record.local_file_digest = setup.local_file_digest.clone();
+                record.note_setup(setup);
                 self.push_editor_changes_locked(
                     context,
                     &setup.key,
@@ -1091,9 +1095,7 @@ impl Coordinator {
                 record.resolution_required = false;
                 log_reconcile_timing("baseline write", phase);
             }
-            record.last_runtime_id = setup.runtime_id.clone();
-            record.local_file_stamp = setup.local_file_stamp.clone();
-            record.local_file_digest = setup.local_file_digest.clone();
+            record.note_setup(setup);
             record.studio_checkpoint =
                 reconciled_studio_checkpoint(context, bridge, &studio_state, &studio_guard);
             write_record(context, &setup.key, &record)?;
@@ -1179,9 +1181,7 @@ impl Coordinator {
             record.conflicts = conflicts;
             record.resolution_required = setup.resolution_preference.is_none()
                 && record.conflict_preference == ConflictPreference::None;
-            record.last_runtime_id = setup.runtime_id.clone();
-            record.local_file_stamp = setup.local_file_stamp.clone();
-            record.local_file_digest = setup.local_file_digest.clone();
+            record.note_setup(setup);
             write_record(context, &setup.key, &record)?;
             setup.mode = PairMode::Verify;
             setup.resolution_required = record.resolution_required;
@@ -1193,117 +1193,104 @@ impl Coordinator {
             record.conflicts = vec!["Studio and project files differ".to_string()];
             record.resolution_required = false;
             setup.error = Some(conflict_message(&record.conflicts));
-            record.last_runtime_id = setup.runtime_id.clone();
-            record.local_file_stamp = setup.local_file_stamp.clone();
-            record.local_file_digest = setup.local_file_digest.clone();
+            record.note_setup(setup);
             write_record(context, &setup.key, &record)?;
             setup.resolution_required = false;
             return Ok(());
         }
 
         let mut sync_history = None;
-        let _readback = if changes.studio.is_empty() {
+        let phase = Instant::now();
+        let push_plan = if changes.studio.is_empty() {
+            ReconcilePushPlan::default()
+        } else {
+            reconciliation_push_plan_for_paths(&studio, &merged, &changes.studio)?
+        };
+        log_reconcile_timing("push plan", phase);
+        let _readback = if push_plan.is_empty() {
             if !changes.editor.is_empty() {
                 publish_captured_studio(context, bridge, stage, &studio_guard)?;
             }
             studio
         } else {
             let phase = Instant::now();
-            let push_plan = reconciliation_push_plan_for_paths(&studio, &merged, &changes.studio)?;
-            log_reconcile_timing("push plan", phase);
-            if push_plan.is_empty() {
-                if !changes.editor.is_empty() {
-                    publish_captured_studio(context, bridge, stage, &studio_guard)?;
+            sync_history = Some(history::SyncHistory::begin(
+                Path::new(&context.root),
+                &bound_context::source_dir(context)?,
+                &studio,
+                &changes.studio,
+            )?);
+            apply_snapshot_paths(&stage.project_root, &changes.studio, &merged)?;
+            log_reconcile_timing("staged project write", phase);
+            let phase = Instant::now();
+            let generated = push_staged_project(
+                context,
+                &stage,
+                bridge,
+                StagedPushRequest {
+                    plan: push_plan,
+                    prepared_documents: HashMap::new(),
+                    guard: Some(&studio_guard),
+                    args: automation_push_args(context, &json!({}), false)?,
+                    expected_project: Some(&editor),
+                },
+            )?
+            .generated;
+            let generated_paths = generated.entries.keys().cloned().collect::<HashSet<_>>();
+            if !generated_paths.is_empty() {
+                apply_snapshot_paths(&stage.project_root, &generated_paths, &generated)?;
+                for (path, entry) in generated.entries {
+                    merged.entries.insert(path.clone(), entry);
+                    changes.studio.insert(path);
                 }
-                studio
-            } else {
-                let phase = Instant::now();
-                sync_history = Some(history::SyncHistory::begin(
-                    Path::new(&context.root),
-                    &bound_context::source_dir(context)?,
-                    &studio,
-                    &changes.studio,
-                )?);
-                apply_snapshot_paths(&stage.project_root, &changes.studio, &merged)?;
-                log_reconcile_timing("staged project write", phase);
-                let phase = Instant::now();
-                let generated = push_staged_project(
-                    context,
-                    &stage,
-                    bridge,
-                    StagedPushRequest {
-                        plan: push_plan,
-                        prepared_documents: HashMap::new(),
-                        guard: Some(&studio_guard),
-                        args: automation_push_args(context, &json!({}), false)?,
-                        expected_project: Some(&editor),
-                    },
-                )?
-                .generated;
-                let generated_paths = generated.entries.keys().cloned().collect::<HashSet<_>>();
-                if !generated_paths.is_empty() {
-                    apply_snapshot_paths(&stage.project_root, &generated_paths, &generated)?;
-                    for (path, entry) in generated.entries {
-                        merged.entries.insert(path.clone(), entry);
-                        changes.studio.insert(path);
-                    }
+            }
+            log_reconcile_timing("Studio push", phase);
+            let phase = Instant::now();
+            let (readback_stage, readback) = if changes.editor.is_empty() {
+                let services = services_for_snapshot_paths(context, &changes.studio);
+                let (readback_stage, captured) =
+                    capture_studio_services(context, bridge, &services, false)?;
+                let mismatches = snapshot_path_differences(&captured, &merged, &changes.studio)?;
+                if !mismatches.is_empty() {
+                    let details = snapshot_mismatch_details(&captured, &merged, &mismatches)?;
+                    return Err(retention_failure(
+                        "reconciled paths",
+                        &mismatches,
+                        details.as_deref(),
+                    ));
                 }
-                log_reconcile_timing("Studio push", phase);
-                let phase = Instant::now();
-                let (readback_stage, readback) = if changes.editor.is_empty() {
-                    let services = services_for_snapshot_paths(context, &changes.studio);
-                    let (readback_stage, captured) =
-                        capture_studio_services(context, bridge, &services, false)?;
-                    let mismatches =
-                        snapshot_path_differences(&captured, &merged, &changes.studio)?;
-                    if !mismatches.is_empty() {
-                        let details = snapshot_mismatch_details(&captured, &merged, &mismatches)?;
-                        bail!(
-                            "Studio did not retain reconciled paths: {}{}",
-                            mismatches
-                                .iter()
-                                .map(|path| path.to_string_lossy())
-                                .collect::<Vec<_>>()
-                                .join(", "),
-                            details
-                                .as_deref()
-                                .map(|details| format!(" ({details})"))
-                                .unwrap_or_default()
-                        );
-                    }
-                    let mut readback = studio;
-                    for path in &changes.studio {
-                        match captured.entries.get(path) {
-                            Some(entry) => {
-                                readback.entries.insert(path.clone(), entry.clone());
-                            }
-                            None => {
-                                readback.entries.remove(path);
-                            }
+                let mut readback = studio;
+                for path in &changes.studio {
+                    match captured.entries.get(path) {
+                        Some(entry) => {
+                            readback.entries.insert(path.clone(), entry.clone());
+                        }
+                        None => {
+                            readback.entries.remove(path);
                         }
                     }
-                    (readback_stage, readback)
-                } else {
-                    capture_studio_project(context, bridge)?
-                };
-                log_reconcile_timing("readback capture", phase);
-                let phase = Instant::now();
-                if !changes.editor.is_empty() {
-                    let mismatches = snapshot_differences(&readback, &merged)?;
-                    if !mismatches.is_empty() {
-                        let mut paths = mismatches.into_iter().collect::<Vec<_>>();
-                        paths.sort();
-                        let detail = snapshot_mismatch_details(&readback, &merged, &paths)?
-                            .unwrap_or_else(|| paths[0].display().to_string());
-                        bail!("Studio did not retain the reconciled project state: {detail}");
-                    }
                 }
-                if !changes.editor.is_empty() {
-                    readback_stage.publish(Path::new(&context.root), false)?;
+                (readback_stage, readback)
+            } else {
+                capture_studio_project(context, bridge)?
+            };
+            log_reconcile_timing("readback capture", phase);
+            let phase = Instant::now();
+            if !changes.editor.is_empty() {
+                let mismatches = snapshot_differences(&readback, &merged)?;
+                if !mismatches.is_empty() {
+                    let mut paths = mismatches.into_iter().collect::<Vec<_>>();
+                    paths.sort();
+                    let detail = snapshot_mismatch_details(&readback, &merged, &paths)?
+                        .unwrap_or_else(|| paths[0].display().to_string());
+                    bail!("Studio did not retain the reconciled project state: {detail}");
                 }
-                log_reconcile_timing("readback verification", phase);
-                readback
             }
+            if !changes.editor.is_empty() {
+                readback_stage.publish(Path::new(&context.root), false)?;
+            }
+            log_reconcile_timing("readback verification", phase);
+            readback
         };
 
         let phase = Instant::now();
@@ -1320,9 +1307,7 @@ impl Coordinator {
         )?);
         record.conflicts.clear();
         record.resolution_required = false;
-        record.last_runtime_id = setup.runtime_id.clone();
-        record.local_file_stamp = setup.local_file_stamp.clone();
-        record.local_file_digest = setup.local_file_digest.clone();
+        record.note_setup(setup);
         record.studio_checkpoint =
             reconciled_studio_checkpoint(context, bridge, &studio_state, &studio_guard);
         setup.resolution_required = false;
@@ -3030,18 +3015,11 @@ fn push_project(
     )?;
     log_reconcile_timing("full push verification", phase);
     if !mismatches.is_empty() {
-        bail!(
-            "Studio did not retain pushed project changes: {}{}",
-            mismatches
-                .iter()
-                .map(|path| path.to_string_lossy())
-                .collect::<Vec<_>>()
-                .join(", "),
-            details
-                .as_deref()
-                .map(|details| format!(" ({details})"))
-                .unwrap_or_default()
-        );
+        return Err(retention_failure(
+            "pushed project changes",
+            &mismatches,
+            details.as_deref(),
+        ));
     }
     let mut expected_after_push = project;
     expected_after_push.entries.extend(pushed.generated.entries);
@@ -4496,40 +4474,29 @@ fn merge_entry(
     first_pairing: bool,
     conflicts: &mut Vec<String>,
 ) -> MergedEntry {
+    let unchanged = |side: Option<&SnapshotEntry>| {
+        if first_pairing {
+            side.is_none()
+        } else {
+            entries_equivalent(path, side, base)
+        }
+    };
     let value = if entries_equivalent(path, editor, studio) {
         editor.cloned()
+    } else if unchanged(editor) {
+        studio.cloned()
+    } else if unchanged(studio) {
+        editor.cloned()
     } else {
-        if !first_pairing {
-            if entries_equivalent(path, editor, base) {
-                studio.cloned()
-            } else if entries_equivalent(path, studio, base) {
-                editor.cloned()
-            } else {
-                merge_conflicting_entry(
-                    path,
-                    base,
-                    editor,
-                    studio,
-                    preference,
-                    first_pairing,
-                    conflicts,
-                )
-            }
-        } else if editor.is_none() {
-            studio.cloned()
-        } else if studio.is_none() {
-            editor.cloned()
-        } else {
-            merge_conflicting_entry(
-                path,
-                base,
-                editor,
-                studio,
-                preference,
-                first_pairing,
-                conflicts,
-            )
-        }
+        merge_conflicting_entry(
+            path,
+            base,
+            editor,
+            studio,
+            preference,
+            first_pairing,
+            conflicts,
+        )
     };
     MergedEntry {
         editor_changed: !entries_equivalent(path, editor, value.as_ref()),
@@ -5931,6 +5898,37 @@ fn verification_values_equal(
     }
 }
 
+fn verification_skips_property(
+    instance: &SettingsBytecodeInstance,
+    name: &str,
+    forced: &Map<String, Value>,
+) -> bool {
+    let class_name = &instance.class_name;
+    name == "ScriptGuid"
+        || (name == "Source" && is_lua_source_class(class_name))
+        || (instance.parent_index.is_none()
+            && is_externally_managed_editor_property(
+                &instance.name,
+                class_name,
+                std::slice::from_ref(&instance.name),
+                name,
+            ))
+        || reconciliation_property_is_derived(name)
+        || crate::settings::equivalence::reconciliation_property_is_forced(name, forced)
+}
+
+fn verification_value<'a>(
+    values: &'a Map<String, Value>,
+    name: &str,
+    properties: bool,
+) -> Option<&'a Value> {
+    if properties {
+        reconciliation_property_value(values, name)
+    } else {
+        values.get(name)
+    }
+}
+
 fn expected_map_mismatch(
     expected: &Map<String, Value>,
     actual: &Map<String, Value>,
@@ -5938,36 +5936,16 @@ fn expected_map_mismatch(
     instance: &SettingsBytecodeInstance,
 ) -> Option<String> {
     let class_name = &instance.class_name;
-    let expected_map = expected;
-    expected.iter().find_map(|(name, expected)| {
+    expected.iter().find_map(|(name, value)| {
         if properties
-            && (name == "ScriptGuid"
-                || (name == "Source" && is_lua_source_class(class_name))
-                || (instance.parent_index.is_none()
-                    && is_externally_managed_editor_property(
-                        &instance.name,
-                        class_name,
-                        std::slice::from_ref(&instance.name),
-                        name,
-                    ))
-                || reconciliation_property_is_derived(name)
-                || crate::settings::equivalence::reconciliation_property_is_forced(
-                    name,
-                    expected_map,
-                )
-                || crate::settings::equivalence::reconciliation_property_is_metadata(
-                    name, expected,
-                ))
+            && (verification_skips_property(instance, name, expected)
+                || crate::settings::equivalence::reconciliation_property_is_metadata(name, value))
         {
             return None;
         }
-        let actual = if properties {
-            reconciliation_property_value(actual, name)
-        } else {
-            actual.get(name)
-        };
-        (!verification_values_equal(properties, class_name, name, Some(expected), actual))
-            .then(|| retention_mismatch(name, Some(expected), actual))
+        let actual = verification_value(actual, name, properties);
+        (!verification_values_equal(properties, class_name, name, Some(value), actual))
+            .then(|| retention_mismatch(name, Some(value), actual))
     })
 }
 
@@ -5994,39 +5972,15 @@ fn changed_map_mismatch(
     names.dedup();
     let class_name = &instance.class_name;
     names.into_iter().find_map(|name| {
-        if properties
-            && (name == "ScriptGuid"
-                || (name == "Source" && is_lua_source_class(class_name))
-                || (instance.parent_index.is_none()
-                    && is_externally_managed_editor_property(
-                        &instance.name,
-                        class_name,
-                        std::slice::from_ref(&instance.name),
-                        name,
-                    ))
-                || reconciliation_property_is_derived(name)
-                || crate::settings::equivalence::reconciliation_property_is_forced(name, desired))
-        {
+        if properties && verification_skips_property(instance, name, desired) {
             return None;
         }
-        let previous = if properties {
-            reconciliation_property_value(before, name)
-        } else {
-            before.get(name)
-        };
-        let expected = if properties {
-            reconciliation_property_value(desired, name)
-        } else {
-            desired.get(name)
-        };
+        let previous = verification_value(before, name, properties);
+        let expected = verification_value(desired, name, properties);
         if verification_values_equal(properties, class_name, name, previous, expected) {
             return None;
         }
-        let actual = if properties {
-            reconciliation_property_value(observed, name)
-        } else {
-            observed.get(name)
-        };
+        let actual = verification_value(observed, name, properties);
         (!verification_values_equal(properties, class_name, name, expected, actual))
             .then(|| retention_mismatch(name, expected, actual))
     })
@@ -6125,6 +6079,20 @@ fn snapshot_entry_equivalent(
         }
     }
     Ok(false)
+}
+
+fn retention_failure(what: &str, mismatches: &[PathBuf], details: Option<&str>) -> anyhow::Error {
+    anyhow::anyhow!(
+        "Studio did not retain {what}: {}{}",
+        mismatches
+            .iter()
+            .map(|path| path.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(", "),
+        details
+            .map(|details| format!(" ({details})"))
+            .unwrap_or_default()
+    )
 }
 
 fn snapshot_mismatch_details(
