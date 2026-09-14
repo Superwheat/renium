@@ -20,8 +20,11 @@ use super::bytecode::{
 use crate::app::output::log_global;
 use crate::app::timing::{log_timing, verbose_timing_logs};
 use crate::rbx::decode::{nonfinite_float_from_json, rbx_variant_to_settings_json};
-use crate::rbx::encode::{rbx_logical_property_name, rbx_model_property_descriptor};
-use crate::rbx::model::BytecodeModelImportRefs;
+use crate::rbx::encode::{
+    json_to_rbx_property_variant, rbx_logical_property_name, rbx_model_property_descriptor,
+    rbx_property_descriptor,
+};
+use crate::rbx::model::{BytecodeModelExportRefs, BytecodeModelImportRefs};
 use crate::snapshot::refs::{
     remap_and_stabilize_record_references, remap_record_reference_ids, stabilize_record_references,
 };
@@ -2038,6 +2041,7 @@ pub(crate) fn canonicalize_settings_property_names(document: &mut SettingsByteco
         .par_chunks_mut(4096)
         .try_for_each(|instances| {
             let mut names_by_class = AHashMap::<&str, AHashMap<String, Option<&str>>>::new();
+            let mut migrations_by_class = AHashMap::<&str, AHashMap<String, bool>>::new();
             for instance in instances {
                 let names = names_by_class.entry(&instance.class_name).or_default();
                 let mut renamed_property = |name: &str| {
@@ -2049,10 +2053,20 @@ pub(crate) fn canonicalize_settings_property_names(document: &mut SettingsByteco
                     names.insert(name.to_string(), renamed);
                     renamed
                 };
+                let migrations = migrations_by_class.entry(&instance.class_name).or_default();
+                let mut migrated_property = |name: &str| {
+                    if let Some(migrated) = migrations.get(name) {
+                        return *migrated;
+                    }
+                    let migrated =
+                        legacy_property_migration(database, &instance.class_name, name).is_some();
+                    migrations.insert(name.to_string(), migrated);
+                    migrated
+                };
                 if !instance
                     .properties
                     .keys()
-                    .any(|name| renamed_property(name).is_some())
+                    .any(|name| renamed_property(name).is_some() || migrated_property(name))
                 {
                     continue;
                 }
@@ -2069,10 +2083,94 @@ pub(crate) fn canonicalize_settings_property_names(document: &mut SettingsByteco
                     }
                     canonical.insert(name, value);
                 }
+                let legacy = canonical
+                    .keys()
+                    .filter(|name| migrated_property(name))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for name in legacy {
+                    migrate_legacy_property(database, &instance.class_name, &name, &mut canonical);
+                }
                 instance.properties = canonical;
             }
             Ok(())
         })
+}
+
+fn legacy_property_migration<'db>(
+    database: &'db rbx_reflection::ReflectionDatabase<'db>,
+    class_name: &str,
+    name: &str,
+) -> Option<(
+    &'db rbx_reflection::PropertyDescriptor<'db>,
+    &'db rbx_reflection::PropertyMigration<'db>,
+)> {
+    let descriptor = rbx_property_descriptor(database, class_name, name)?;
+    match &descriptor.kind {
+        rbx_reflection::PropertyKind::Canonical {
+            serialization: rbx_reflection::PropertySerialization::Migrate(migration),
+        } if descriptor.name == name => Some((descriptor, migration)),
+        _ => None,
+    }
+}
+
+// Studio serializes a migrated property under its replacement names only, so
+// a document keeps the replacements it has and derives the missing ones from
+// the legacy value; the legacy field itself never survives a round trip.
+fn migrate_legacy_property(
+    database: &rbx_reflection::ReflectionDatabase<'_>,
+    class_name: &str,
+    name: &str,
+    properties: &mut Map<String, Value>,
+) {
+    let Some((descriptor, migration)) = legacy_property_migration(database, class_name, name)
+    else {
+        return;
+    };
+    let targets = migration.new_property_names();
+    if targets.iter().any(|target| properties.contains_key(*target)) {
+        properties.remove(name);
+        return;
+    }
+    let Some(value) = properties.get(name) else {
+        return;
+    };
+    let Some(variant) = json_to_rbx_property_variant(
+        value,
+        Some(descriptor),
+        database,
+        &BytecodeModelExportRefs::default(),
+    ) else {
+        return;
+    };
+    let variant = match variant {
+        rbx_dom_weak::types::Variant::EnumItem(item) => {
+            rbx_dom_weak::types::Variant::Enum(rbx_dom_weak::types::Enum::from_u32(item.value))
+        }
+        other => other,
+    };
+    let Ok(migrated) = migration.perform(&variant) else {
+        return;
+    };
+    let mut replacements = Vec::with_capacity(targets.len());
+    for target in targets {
+        let replacement = if migrated.ty() == variant.ty() {
+            value.clone()
+        } else {
+            let Some(json) = rbx_variant_to_settings_json(
+                &migrated,
+                rbx_property_descriptor(database, class_name, target),
+                database,
+                &BytecodeModelImportRefs::default(),
+            ) else {
+                return;
+            };
+            json
+        };
+        replacements.push(((*target).to_string(), replacement));
+    }
+    properties.remove(name);
+    properties.extend(replacements);
 }
 
 pub(crate) fn settings_documents_equivalent(
@@ -3308,6 +3406,54 @@ mod tests {
                 attributes: Map::new(),
             }],
         }
+    }
+
+    #[test]
+    fn legacy_migrated_properties_canonicalize_to_their_replacements() {
+        let corner = |properties: Map<String, Value>| SettingsBytecode {
+            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
+            instances: vec![crate::settings::bytecode::SettingsBytecodeInstance {
+                settings_id: "corner".to_string(),
+                name: "Circle".to_string(),
+                class_name: "UICorner".to_string(),
+                parent_index: None,
+                properties,
+                attributes: Map::new(),
+            }],
+        };
+        let radius = |scale: f64| json!({"_type": "UDim", "scale": scale, "offset": 0});
+        let corners = ["TopLeftRadius", "TopRightRadius", "BottomLeftRadius", "BottomRightRadius"];
+
+        let mut mixed = corner(Map::from_iter(
+            [("CornerRadius", radius(1.0))]
+                .into_iter()
+                .chain(corners.iter().map(|name| (*name, radius(0.5))))
+                .map(|(name, value)| (name.to_string(), value)),
+        ));
+        canonicalize_settings_property_names(&mut mixed).unwrap();
+        assert_eq!(
+            mixed.instances[0].properties,
+            Map::from_iter(corners.iter().map(|name| (name.to_string(), radius(0.5))))
+        );
+
+        let mut legacy = corner(Map::from_iter([("CornerRadius".to_string(), radius(1.0))]));
+        canonicalize_settings_property_names(&mut legacy).unwrap();
+        assert_eq!(
+            legacy.instances[0].properties,
+            Map::from_iter(corners.iter().map(|name| (name.to_string(), radius(1.0))))
+        );
+
+        let mut font = string_value_with_properties(Map::new());
+        font.instances[0].class_name = "TextLabel".to_string();
+        font.instances[0]
+            .properties
+            .insert("Font".to_string(), json!({"_type": "Enum", "value": 3}));
+        canonicalize_settings_property_names(&mut font).unwrap();
+        assert!(!font.instances[0].properties.contains_key("Font"));
+        assert_eq!(
+            font.instances[0].properties["FontFace"]["family"],
+            json!("rbxasset://fonts/families/SourceSansPro.json")
+        );
     }
 
     #[test]
