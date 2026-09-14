@@ -13,9 +13,7 @@ use crate::editor::types::{
     EditorBinaryImport, EditorChangeSet, EditorInstanceChange, EditorInstanceDescriptor,
     EditorInstancePath, EditorPropertyChange, EditorPropertyFilter, EditorSourceChange,
 };
-use crate::rbx::decode::rbx_variant_to_settings_json;
-use crate::rbx::encode::{rbx_logical_property_name, rbx_model_property_descriptor};
-use crate::rbx::model::BytecodeModelImportRefs;
+use crate::rbx::encode::rbx_logical_property_name;
 use crate::roblox::schema::PropertySchemaMap;
 use crate::settings::EXTERNAL_SOURCE_MARKER;
 use crate::settings::bytecode::{SettingsBytecode, SettingsBytecodeInstance};
@@ -124,21 +122,11 @@ fn editor_match_records(
             .filter(|name| !instance.properties.contains_key(*name))
             .collect::<HashSet<_>>();
         for name in names {
-            let descriptor = rbx_model_property_descriptor(database, &instance.class_name, name);
-            let serialized_name = descriptor.map_or(name.as_str(), |value| value.name);
-            if let Some(value) = database
-                .classes
-                .get(instance.class_name.as_str())
-                .and_then(|class| database.find_default_property(class, serialized_name))
-                .and_then(|value| {
-                    rbx_variant_to_settings_json(
-                        value,
-                        descriptor,
-                        database,
-                        &BytecodeModelImportRefs::default(),
-                    )
-                })
-            {
+            if let Some(value) = crate::settings::equivalence::reflection_default_settings_value(
+                database,
+                &instance.class_name,
+                name,
+            ) {
                 defaults.insert(name.clone(), value);
             }
         }

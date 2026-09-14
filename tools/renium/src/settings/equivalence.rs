@@ -2642,9 +2642,47 @@ fn reconciliation_value_uses_f32(type_name: &str) -> bool {
 }
 
 pub(crate) fn reconciliation_property_is_derived(name: &str) -> bool {
+    // Studio recomputes the World* fields from the local ones and flips the
+    // migration flags itself while loading a tree, so none of them can be
+    // authored or retained through a sync.
     matches!(
         name,
-        "WorldCFrame" | "WorldPosition" | "WorldOrientation" | "WorldAxis" | "WorldSecondaryAxis"
+        "WorldCFrame"
+            | "WorldPosition"
+            | "WorldOrientation"
+            | "WorldAxis"
+            | "WorldSecondaryAxis"
+            | "InertiaMigrated"
+            | "NeedsPivotMigration"
+    )
+}
+
+// Studio's TextScaled setter turns TextWrapped on and keeps it on, so a saved
+// TextWrapped=false next to TextScaled=true cannot survive a Studio write.
+pub(crate) fn reconciliation_property_is_forced(name: &str, properties: &Map<String, Value>) -> bool {
+    name == "TextWrapped" && properties.get("TextScaled") == Some(&Value::Bool(true))
+}
+
+// Reflection defaults are keyed by the logical name; a serialized alias such as
+// GuiObject.Sink only reaches its default through the logical InputSink.
+pub(crate) fn reflection_default_settings_value(
+    database: &rbx_reflection::ReflectionDatabase<'_>,
+    class_name: &str,
+    name: &str,
+) -> Option<Value> {
+    let class = database.classes.get(class_name)?;
+    let descriptor = rbx_model_property_descriptor(database, class_name, name);
+    let default = database.find_default_property(class, name).or_else(|| {
+        let serialized_name = descriptor.map(|descriptor| descriptor.name)?;
+        (serialized_name != name)
+            .then(|| database.find_default_property(class, serialized_name))
+            .flatten()
+    })?;
+    rbx_variant_to_settings_json(
+        default,
+        descriptor,
+        database,
+        &BytecodeModelImportRefs::default(),
     )
 }
 
@@ -2672,21 +2710,7 @@ fn reconciliation_property_value_is_default(class_name: &str, name: &str, value:
     let Ok(database) = rbx_reflection_database::get() else {
         return false;
     };
-    let descriptor = rbx_model_property_descriptor(database, class_name, name);
-    let serialized_name = descriptor.map_or(name, |descriptor| descriptor.name);
-    let Some(default) = database
-        .classes
-        .get(class_name)
-        .and_then(|class| database.find_default_property(class, serialized_name))
-        .and_then(|default| {
-            rbx_variant_to_settings_json(
-                default,
-                descriptor,
-                database,
-                &BytecodeModelImportRefs::default(),
-            )
-        })
-    else {
+    let Some(default) = reflection_default_settings_value(database, class_name, name) else {
         return false;
     };
     reconciliation_values_equal(
@@ -3406,6 +3430,36 @@ mod tests {
                 attributes: Map::new(),
             }],
         }
+    }
+
+    #[test]
+    fn serialized_aliases_resolve_their_reflection_defaults() {
+        let database = rbx_reflection_database::get().unwrap();
+        for class_name in ["Frame", "TextButton", "TextLabel"] {
+            let default = reflection_default_settings_value(database, class_name, "InputSink")
+                .expect("InputSink default");
+            assert!(reconciliation_property_value_is_default(class_name, "InputSink", &default));
+            assert!(!reconciliation_property_value_is_default(
+                class_name,
+                "InputSink",
+                &json!({"_type": "Enum", "value": 1})
+            ));
+        }
+        assert!(reconciliation_property_value_is_default(
+            "InputContext",
+            "Sink",
+            &json!(false)
+        ));
+        assert!(reflection_default_settings_value(database, "Frame", "NoSuchProperty").is_none());
+        assert!(reconciliation_property_is_derived("InertiaMigrated"));
+        assert!(reconciliation_property_is_forced(
+            "TextWrapped",
+            &Map::from_iter([("TextScaled".to_string(), json!(true))])
+        ));
+        assert!(!reconciliation_property_is_forced(
+            "TextWrapped",
+            &Map::from_iter([("TextScaled".to_string(), json!(false))])
+        ));
     }
 
     #[test]

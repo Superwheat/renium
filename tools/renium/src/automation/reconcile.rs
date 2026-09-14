@@ -5982,6 +5982,7 @@ fn expected_map_mismatch(
     instance: &SettingsBytecodeInstance,
 ) -> Option<String> {
     let class_name = &instance.class_name;
+    let expected_map = expected;
     expected.iter().find_map(|(name, expected)| {
         if properties
             && (name == "ScriptGuid"
@@ -5994,6 +5995,9 @@ fn expected_map_mismatch(
                         name,
                     ))
                 || reconciliation_property_is_derived(name)
+                || crate::settings::equivalence::reconciliation_property_is_forced(
+                    name, expected_map,
+                )
                 || crate::settings::equivalence::reconciliation_property_is_metadata(
                     name, expected,
                 ))
@@ -6006,8 +6010,16 @@ fn expected_map_mismatch(
             actual.get(name)
         };
         (!verification_values_equal(properties, class_name, name, Some(expected), actual))
-            .then(|| format!("{name} was not retained"))
+            .then(|| retention_mismatch(name, Some(expected), actual))
     })
+}
+
+fn retention_mismatch(name: &str, expected: Option<&Value>, actual: Option<&Value>) -> String {
+    format!(
+        "{name} was not retained (expected {}, Studio has {})",
+        short_reconciliation_value(expected),
+        short_reconciliation_value(actual)
+    )
 }
 
 fn changed_map_mismatch(
@@ -6035,7 +6047,8 @@ fn changed_map_mismatch(
                         std::slice::from_ref(&instance.name),
                         name,
                     ))
-                || reconciliation_property_is_derived(name))
+                || reconciliation_property_is_derived(name)
+                || crate::settings::equivalence::reconciliation_property_is_forced(name, desired))
         {
             return None;
         }
@@ -6058,7 +6071,7 @@ fn changed_map_mismatch(
             observed.get(name)
         };
         (!verification_values_equal(properties, class_name, name, expected, actual))
-            .then(|| format!("{name} was not retained"))
+            .then(|| retention_mismatch(name, expected, actual))
     })
 }
 
@@ -7656,6 +7669,46 @@ mod tests {
     }
 
     #[test]
+    fn push_verification_accepts_engine_migrations_and_forced_text_wrapping() {
+        let part = SettingsBytecodeInstance::new("part".into(), "Part".into(), "Part".into(), None);
+        let before = Map::new();
+        let desired = Map::from_iter([("InertiaMigrated".to_string(), json!(false))]);
+        let observed = Map::from_iter([("InertiaMigrated".to_string(), json!(true))]);
+        assert_eq!(expected_map_mismatch(&desired, &observed, true, &part), None);
+        assert_eq!(changed_map_mismatch(&before, &desired, &observed, true, &part), None);
+
+        let label = SettingsBytecodeInstance::new(
+            "label".into(),
+            "Title".into(),
+            "TextLabel".into(),
+            None,
+        );
+        let desired = Map::from_iter([
+            ("TextScaled".to_string(), json!(true)),
+            ("TextWrapped".to_string(), json!(false)),
+        ]);
+        let observed = Map::from_iter([
+            ("TextScaled".to_string(), json!(true)),
+            ("TextWrapped".to_string(), json!(true)),
+        ]);
+        assert_eq!(expected_map_mismatch(&desired, &observed, true, &label), None);
+        assert_eq!(changed_map_mismatch(&before, &desired, &observed, true, &label), None);
+        let unscaled = Map::from_iter([
+            ("TextScaled".to_string(), json!(false)),
+            ("TextWrapped".to_string(), json!(false)),
+        ]);
+        assert_eq!(
+            expected_map_mismatch(&unscaled, &observed, true, &label).as_deref(),
+            Some("TextScaled was not retained (expected false, Studio has true)")
+        );
+        let wrapped_only = Map::from_iter([("TextWrapped".to_string(), json!(false))]);
+        assert_eq!(
+            expected_map_mismatch(&wrapped_only, &observed, true, &label).as_deref(),
+            Some("TextWrapped was not retained (expected false, Studio has true)")
+        );
+    }
+
+    #[test]
     fn push_verification_follows_game_settings_policy_without_hiding_saved_values() {
         let path = PathBuf::from("src/Players/__roblox_sync_settings.renium");
         let document = |name: &str, capacity: Option<i64>, auto_loads: bool| SettingsBytecode {
@@ -7804,9 +7857,11 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(mismatches, expected_paths);
-                assert_eq!(
-                    detail.as_deref(),
-                    Some("Part0017.Anchored was not retained")
+                assert!(
+                    detail
+                        .as_deref()
+                        .is_some_and(|detail| detail.starts_with("Part0017.Anchored was not retained (")),
+                    "{detail:?}"
                 );
                 let mut malformed = observed.clone();
                 malformed
