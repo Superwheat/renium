@@ -139,6 +139,40 @@ static void* CachedDataModel = nullptr;
 static std::size_t CachedDataModelInstanceOffset = 0;
 static std::size_t CachedDataModelChildrenOffset = 0;
 static std::atomic<std::size_t> CachedInstanceNameOffset{0};
+static std::atomic<std::uint64_t> CachedInstanceNameLayout{0};
+
+struct InstanceNameLayout
+{
+    std::size_t offset = 0;
+    std::size_t nested = 0;
+    bool doubleIndirect = false;
+    bool cString = false;
+};
+
+static std::uint64_t PackInstanceNameLayout(const InstanceNameLayout& layout)
+{
+    return (static_cast<std::uint64_t>(layout.offset) << 16) |
+        (static_cast<std::uint64_t>(layout.nested) << 4) | (layout.doubleIndirect ? 4 : 0) |
+        (layout.cString ? 2 : 0) | 1;
+}
+
+static bool LoadInstanceNameLayout(InstanceNameLayout& layout)
+{
+    const auto packed = CachedInstanceNameLayout.load(std::memory_order_relaxed);
+    if (!(packed & 1))
+        return false;
+    layout.offset = static_cast<std::size_t>(packed >> 16);
+    layout.nested = static_cast<std::size_t>((packed >> 4) & 0xFFF);
+    layout.doubleIndirect = (packed & 4) != 0;
+    layout.cString = (packed & 2) != 0;
+    return true;
+}
+
+static void ResetInstanceNameLayout()
+{
+    CachedInstanceNameLayout.store(0, std::memory_order_relaxed);
+    CachedInstanceNameOffset.store(0, std::memory_order_relaxed);
+}
 static std::string CachedDataModelTitle;
 
 // Optional bounded diagnostics: offsets are microseconds from RPC handling,
@@ -285,6 +319,29 @@ static std::vector<std::string> ExpectedDataModelNames(const std::string& title)
     return names;
 }
 
+static bool ReadInstanceNameAt(
+    std::uintptr_t instance,
+    const InstanceNameLayout& layout,
+    std::string& value)
+{
+    std::uintptr_t indirect = 0;
+    if (!ReadValue(instance + layout.offset, indirect) || indirect < 0x10000)
+        return false;
+    auto address = indirect + layout.nested;
+    if (layout.doubleIndirect)
+    {
+        std::uintptr_t nested = 0;
+        if (!ReadValue(address, nested) || nested < 0x10000)
+            return false;
+        address = nested;
+    }
+    return layout.cString ? ReadCString(address, value, 256) : ReadLibcppName(address, value);
+}
+
+// The Name field is discovered once against a known name and then read at
+// exactly that layout. Scanning every candidate offset per instance can
+// reach a sibling's name through unrelated pointers and match the wrong
+// instance, so a mismatch at the cached layout is a real mismatch.
 static bool ReadExpectedInstanceName(
     std::uintptr_t instance,
     const std::vector<std::string>& expectedNames,
@@ -295,38 +352,29 @@ static bool ReadExpectedInstanceName(
         return std::find(expectedNames.begin(), expectedNames.end(), candidate) !=
             expectedNames.end();
     };
-    const auto readAt = [&](std::size_t offset)
-    {
-        std::uintptr_t indirect = 0;
-        if (!ReadValue(instance + offset, indirect) || indirect < 0x10000)
-            return false;
-        for (std::size_t nestedOffset = 0; nestedOffset <= 64; nestedOffset += 8)
-        {
-            const auto nestedAddress = indirect + nestedOffset;
-            if (ReadLibcppName(nestedAddress, value) && matches(value))
-                return true;
-            if (ReadCString(nestedAddress, value, 256) && matches(value))
-                return true;
-            std::uintptr_t nested = 0;
-            if (!ReadValue(nestedAddress, nested) || nested < 0x10000)
-                continue;
-            if (ReadLibcppName(nested, value) && matches(value))
-                return true;
-            if (ReadCString(nested, value, 256) && matches(value))
-                return true;
-        }
-        return false;
-    };
-    if (const auto cached = CachedInstanceNameOffset.load(std::memory_order_relaxed))
-        return readAt(cached);
+    InstanceNameLayout cached;
+    if (LoadInstanceNameLayout(cached) && ReadInstanceNameAt(instance, cached, value))
+        return matches(value);
     for (std::size_t offset = InstanceNameOffsetMin;
          offset <= InstanceNameOffsetMax;
          offset += sizeof(void*))
     {
-        if (readAt(offset))
+        for (std::size_t nestedOffset = 0; nestedOffset <= 64; nestedOffset += 8)
         {
-            CachedInstanceNameOffset.store(offset, std::memory_order_relaxed);
-            return true;
+            for (const bool doubleIndirect : {false, true})
+            {
+                for (const bool cString : {false, true})
+                {
+                    const InstanceNameLayout layout{offset, nestedOffset, doubleIndirect, cString};
+                    if (ReadInstanceNameAt(instance, layout, value) && matches(value))
+                    {
+                        CachedInstanceNameLayout.store(
+                            PackInstanceNameLayout(layout), std::memory_order_relaxed);
+                        CachedInstanceNameOffset.store(offset, std::memory_order_relaxed);
+                        return true;
+                    }
+                }
+            }
         }
     }
     value.clear();
@@ -870,11 +918,15 @@ static bool ResolvePackage(
                            reinterpret_cast<std::uintptr_t>(child.instance), segment.name)))
                 matches.push_back(child);
         }
-        if (segment.ordinal)
+        if (segment.ordinal && depth > 0)
         {
             if (segment.ordinal > matches.size())
             {
-                error = "package path ordinal does not match Studio";
+                error = "package path segment '" + segment.name + "' at depth " +
+                    std::to_string(depth + 1) + " has " +
+                    std::to_string(matches.size()) + " matches among " +
+                    std::to_string(children.size()) + " children, not ordinal " +
+                    std::to_string(segment.ordinal);
                 return false;
             }
             current = matches[segment.ordinal - 1];
@@ -911,8 +963,13 @@ static bool ResolvePackage(
             !InstanceMatchesName(
                 reinterpret_cast<std::uintptr_t>(current.instance), segment.name))
         {
-            error = "could not locate Studio's Instance name field";
-            return false;
+            ResetInstanceNameLayout();
+            if (!InstanceMatchesName(
+                    reinterpret_cast<std::uintptr_t>(current.instance), segment.name))
+            {
+                error = "could not locate Studio's Instance name field";
+                return false;
+            }
         }
         if (depth + 1 < segments.size() &&
             !ReadChildren(
