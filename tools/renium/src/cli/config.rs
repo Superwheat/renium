@@ -106,18 +106,6 @@ fn command_value_uses_default(matches: &clap::ArgMatches, id: &str) -> bool {
     }
 }
 
-fn configured_usize(object: &Map<String, Value>, key: &str) -> Result<Option<usize>> {
-    let Some(value) = object.get(key) else {
-        return Ok(None);
-    };
-    let number = value
-        .as_u64()
-        .with_context(|| format!("Configuration key '{key}' must be a non-negative integer"))?;
-    Ok(Some(usize::try_from(number).with_context(|| {
-        format!("Configuration key '{key}' is too large")
-    })?))
-}
-
 fn configured_services(object: &Map<String, Value>) -> Option<String> {
     object
         .get("services")
@@ -139,21 +127,6 @@ fn apply_default<T>(matches: &clap::ArgMatches, id: &str, target: &mut T, value:
     }
 }
 
-fn apply_default_usize(
-    matches: &clap::ArgMatches,
-    id: &str,
-    target: &mut usize,
-    object: &Map<String, Value>,
-    key: &str,
-) -> Result<()> {
-    if command_value_uses_default(matches, id)
-        && let Some(value) = configured_usize(object, key)?
-    {
-        *target = value;
-    }
-    Ok(())
-}
-
 fn apply_default_path(
     matches: &clap::ArgMatches,
     id: &str,
@@ -171,21 +144,6 @@ fn apply_default_services(
     object: &Map<String, Value>,
 ) {
     apply_default(matches, "services", target, configured_services(object));
-}
-
-fn apply_default_pair(
-    matches: &clap::ArgMatches,
-    ids: (&str, &str),
-    targets: (&mut bool, &mut bool),
-    value: Option<bool>,
-) {
-    if command_value_uses_default(matches, ids.0)
-        && command_value_uses_default(matches, ids.1)
-        && let Some(value) = value
-    {
-        *targets.0 = value;
-        *targets.1 = !value;
-    }
 }
 
 fn apply_bridge(
@@ -232,68 +190,11 @@ fn apply_command(
                 "snapshotDir",
             );
             apply_default_services(matches, &mut args.services, object);
-            apply_default_usize(
-                matches,
-                "chunk_size",
-                &mut args.chunk_size,
-                object,
-                "chunkSize",
-            )?;
-            apply_default_usize(
-                matches,
-                "source_workers",
-                &mut args.source_workers,
-                object,
-                "sourceWorkers",
-            )?;
-            apply_default_usize(
-                matches,
-                "instance_workers",
-                &mut args.instance_workers,
-                object,
-                "instanceWorkers",
-            )?;
-            apply_default_usize(
-                matches,
-                "import_workers",
-                &mut args.import_workers,
-                object,
-                "importWorkers",
-            )?;
-            for (id, key, target) in [
-                ("import_mode", "importMode", &mut args.import_mode),
-                (
-                    "performance_mode",
-                    "performanceMode",
-                    &mut args.performance_mode,
-                ),
-            ] {
-                apply_default(
-                    matches,
-                    id,
-                    target,
-                    object.get(key).and_then(Value::as_str).map(str::to_owned),
-                );
-            }
             if command_value_uses_default(matches, "run_import")
                 && object.get("runImport").and_then(Value::as_bool) == Some(true)
             {
                 args.run_import = true;
                 args.no_run_import = false;
-            }
-            apply_default_pair(
-                matches,
-                ("modified_default_bypass", "no_modified_default_bypass"),
-                (
-                    &mut args.modified_default_bypass,
-                    &mut args.no_modified_default_bypass,
-                ),
-                object.get("modifiedDefaultBypass").and_then(Value::as_bool),
-            );
-            if command_value_uses_default(matches, "no_adaptive_throttle")
-                && let Some(enabled) = object.get("adaptiveThrottle").and_then(Value::as_bool)
-            {
-                args.no_adaptive_throttle = !enabled;
             }
             apply_bridge(matches, object, &mut args.bridge);
         }

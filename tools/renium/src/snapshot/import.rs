@@ -41,13 +41,11 @@ use crate::settings::tree::editor_service_root_index;
 use crate::snapshot::codec::parse_source_range_batch;
 use crate::snapshot::export::{
     BRIDGE_PROTOCOL_VERSION, ExportProjectStage, LARGE_SERVICE_DETERMINISTIC_FETCH_MIN_INSTANCES,
-    adaptive_tune_estimated_total_ms, collect_publish_hashes, exported_parts_to_service_state,
-    fetch_json_payload, log_chunk_fetch_metrics, merge_chunk_fetch_metrics,
-    publish_operation_paths,
+    collect_publish_hashes, exported_parts_to_service_state, fetch_json_payload,
+    log_chunk_fetch_metrics, merge_chunk_fetch_metrics, publish_operation_paths,
 };
 use crate::snapshot::types::{
-    AdaptiveTuneCache, AdaptiveTuneEntry, ExportedSnapshotParts, ServiceState, SnapshotInstance,
-    SnapshotManifest,
+    ExportedSnapshotParts, ServiceState, SnapshotInstance, SnapshotManifest,
 };
 use crate::studio::bridge::{BridgeServer, ChunkFetchMetrics, SourceBatchMap};
 use crate::system::files::{
@@ -655,21 +653,10 @@ pub(crate) fn import_service_state_with_sourcemap(
 }
 
 pub(crate) fn import_snapshots(args: ImportSnapshotsArgs) -> Result<()> {
-    import_snapshots_with_project_stage(args, true)
-}
-
-pub(crate) fn import_snapshots_into_stage(args: ImportSnapshotsArgs) -> Result<()> {
-    import_snapshots_with_project_stage(args, false)
-}
-
-fn import_snapshots_with_project_stage(
-    args: ImportSnapshotsArgs,
-    allow_project_stage: bool,
-) -> Result<()> {
     set_quiet_timings(true);
     let snapshot_dir = args.snapshot_dir.clone();
     let services = args.services.clone();
-    let changed_paths = import_snapshots_inner(args, allow_project_stage)?;
+    let changed_paths = import_snapshots_inner(args, true)?;
     emit_global_output(
         &json!({
             "ok": true,
@@ -931,22 +918,6 @@ pub(crate) fn parse_services(raw: &str) -> Result<Vec<String>> {
     Ok(out)
 }
 
-fn adaptive_tune_service_score(tune: Option<&AdaptiveTuneEntry>) -> f64 {
-    let Some(tune) = tune else {
-        return 0.0;
-    };
-
-    let estimated_total_ms = adaptive_tune_estimated_total_ms(tune)
-        .or(tune.wave_ms)
-        .unwrap_or(0.0)
-        .max(0.0);
-    let payload_mb = tune.payload_bytes as f64 / (1024.0 * 1024.0);
-    estimated_total_ms
-        + payload_mb * 2.0
-        + tune.instance_count as f64 / 10_000.0
-        + tune.items_fetched as f64 / 20_000.0
-}
-
 fn cold_service_export_score(service: &str) -> f64 {
     match service {
         "ServerStorage" => 1_000.0,
@@ -964,22 +935,11 @@ fn cold_service_export_score(service: &str) -> f64 {
     }
 }
 
-pub(crate) fn direct_import_export_order(
-    services: &[String],
-    adaptive_tune_cache: &AdaptiveTuneCache,
-) -> Vec<String> {
+pub(crate) fn direct_import_export_order(services: &[String]) -> Vec<String> {
     let mut ranked: Vec<(usize, String, f64)> = services
         .iter()
         .enumerate()
-        .map(|(index, service)| {
-            let tune_score = adaptive_tune_service_score(adaptive_tune_cache.services.get(service));
-            let score = if tune_score > 0.0 {
-                tune_score
-            } else {
-                cold_service_export_score(service)
-            };
-            (index, service.clone(), score)
-        })
+        .map(|(index, service)| (index, service.clone(), cold_service_export_score(service)))
         .collect();
 
     ranked.sort_by(|left, right| {
@@ -1012,7 +972,6 @@ fn resolve_thread_count(requested: usize, service_count: usize) -> usize {
 }
 
 pub(crate) fn resolve_source_worker_count(
-    requested: usize,
     channel_count: usize,
     script_count: usize,
     instance_count: usize,
@@ -1035,11 +994,6 @@ pub(crate) fn resolve_source_worker_count(
         .map_or(8, |v| v.get().saturating_mul(2))
         .max(4);
     let effective_cap = hard_cap.min(cpu_cap).min(script_count);
-
-    if requested > 0 {
-        return requested.min(effective_cap);
-    }
-
     soft_target.min(effective_cap)
 }
 
@@ -1201,12 +1155,8 @@ fn direct_import_cpu_cap() -> usize {
         .clamp(2, 16)
 }
 
-pub(crate) fn resolve_direct_import_workers(requested: usize) -> usize {
-    let cpu_cap = direct_import_cpu_cap();
-    if requested > 0 {
-        return requested.min(cpu_cap);
-    }
-    4.min(cpu_cap)
+pub(crate) fn resolve_direct_import_workers() -> usize {
+    4.min(direct_import_cpu_cap())
 }
 
 pub(crate) fn load_service_state(snapshot_dir: &Path, service: &str) -> Result<ServiceState> {

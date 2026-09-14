@@ -67,16 +67,15 @@ use crate::rbx::model::{
 };
 use crate::roblox::schema::{
     EnumValueNameMap, MATERIAL_SERVICE_CLASS, MESH_INITIAL_SIZE_PROPERTY,
-    MESH_SIZE_TRANSPORT_PROPERTY, PropertySchemaEntry, TRIANGLE_MESH_PART_CLASS, TYPE_ID_AXES,
-    TYPE_ID_CONTENT_ID, TYPE_ID_ENUM_ITEM, TYPE_ID_FACES, TYPE_ID_NUMBER, TYPE_ID_NUMBER_RANGE,
-    TYPE_ID_PHYSICAL_PROPERTIES, TYPE_ID_RAY, TYPE_ID_VECTOR3, USE_2022_MATERIALS_PROPERTY,
+    MESH_SIZE_TRANSPORT_PROPERTY, TRIANGLE_MESH_PART_CLASS, TYPE_ID_AXES, TYPE_ID_CONTENT_ID,
+    TYPE_ID_FACES, TYPE_ID_RAY, TYPE_ID_VECTOR3, USE_2022_MATERIALS_PROPERTY,
     collect_rbx_dom_properties_for_class,
 };
 use crate::settings::bytecode::{
     SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance, is_default_property_value,
     write_service_settings_binary_file, write_var_u64,
 };
-use crate::snapshot::codec::{decode_compact_v5_value, parse_compact_v5_instance_items};
+use crate::snapshot::codec::decode_compact_v5_value;
 use crate::snapshot::export::{
     fetch_text_chunks, fetch_text_chunks_with_cache, parse_bridge_chunk, parse_place_guard_config,
 };
@@ -3412,34 +3411,6 @@ fn restored_init_source_reclasses_folder_back_to_script() {
 }
 
 #[test]
-fn parse_compact_v5_instance_items_accept_rows_without_properties() {
-    let property_schema_by_class = HashMap::new();
-    let class_names = vec!["Part".to_string()];
-    let strings = vec![
-        "PartA".to_string(),
-        "PartB".to_string(),
-        "Speed".to_string(),
-    ];
-
-    let parsed = parse_compact_v5_instance_items(
-        json!([[1, 0, false], [2, 0, false, [3, TYPE_ID_NUMBER, 42]]]),
-        &strings,
-        1,
-        &property_schema_by_class,
-        &HashMap::new(),
-        &class_names,
-    )
-    .unwrap();
-
-    assert_eq!(parsed.len(), 2);
-    assert_eq!(parsed[0].name, "PartA");
-    assert!(parsed[0].properties.is_empty());
-    assert!(parsed[0].attributes.is_empty());
-    assert_eq!(parsed[1].name, "PartB");
-    assert_eq!(parsed[1].attributes.get("Speed"), Some(&json!(42)));
-}
-
-#[test]
 fn compact_v5_axes_faces_ray_round_trip() {
     let strings: Vec<String> = Vec::new();
     let enum_names = EnumValueNameMap::new();
@@ -3476,232 +3447,6 @@ fn compact_v5_axes_faces_ray_round_trip() {
     let rbx_ray = json_to_rbx_ray(&ray).unwrap();
     assert_eq!(rbx_ray.origin, RbxVector3::new(1.0, 2.0, 3.0));
     assert_eq!(rbx_ray.direction, RbxVector3::new(4.0, 5.0, 6.0));
-}
-
-#[test]
-fn parse_compact_v5_instance_items_expand_schema_driven_values() {
-    let mut property_schema_by_class = HashMap::new();
-    property_schema_by_class.insert(
-        "Part".to_string(),
-        vec![
-            PropertySchemaEntry {
-                name: "Position".to_string(),
-                type_id: TYPE_ID_VECTOR3,
-                enum_type: None,
-            },
-            PropertySchemaEntry {
-                name: "Material".to_string(),
-                type_id: TYPE_ID_ENUM_ITEM,
-                enum_type: Some("Enum.Material".to_string()),
-            },
-        ],
-    );
-    let class_names = vec!["Part".to_string()];
-    let strings = vec![
-        "PartA".to_string(),
-        "Speed".to_string(),
-        "Plastic".to_string(),
-        "gamepadEnterKeyCode".to_string(),
-        "Enum.KeyCode".to_string(),
-        "ButtonL2".to_string(),
-    ];
-
-    let enum_value_names_by_type = HashMap::from([(
-        "Enum.Material".to_string(),
-        HashMap::from([(256, "Plastic".to_string())]),
-    )]);
-    let parsed = parse_compact_v5_instance_items(
-        json!([[
-            1,
-            0,
-            false,
-            [2, TYPE_ID_NUMBER, 42, 4, TYPE_ID_ENUM_ITEM, [5, 6]],
-            [3],
-            [[1.0, 2.0, 3.0], 256]
-        ]]),
-        &strings,
-        1,
-        &property_schema_by_class,
-        &enum_value_names_by_type,
-        &class_names,
-    )
-    .unwrap();
-
-    assert_eq!(parsed.len(), 1);
-    assert_eq!(parsed[0].name, "PartA");
-    assert_eq!(parsed[0].attributes.get("Speed"), Some(&json!(42)));
-    assert_eq!(
-        parsed[0].attributes.get("gamepadEnterKeyCode"),
-        Some(&json!({
-            "_type": "EnumItem",
-            "enumType": "Enum.KeyCode",
-            "name": "ButtonL2",
-        }))
-    );
-    assert_eq!(
-        parsed[0].properties.get("Position"),
-        Some(&json!({
-            "_type": "Vector3",
-            "x": 1.0,
-            "y": 2.0,
-            "z": 3.0,
-        }))
-    );
-    assert_eq!(
-        parsed[0].properties.get("Material"),
-        Some(&json!({
-            "_type": "EnumItem",
-            "enumType": "Enum.Material",
-            "name": "Plastic",
-        }))
-    );
-}
-
-#[test]
-fn parse_compact_v5_instance_items_expand_numeric_enum_values() {
-    let mut property_schema_by_class = HashMap::new();
-    property_schema_by_class.insert(
-        "Part".to_string(),
-        vec![PropertySchemaEntry {
-            name: "Material".to_string(),
-            type_id: TYPE_ID_ENUM_ITEM,
-            enum_type: Some("Enum.Material".to_string()),
-        }],
-    );
-    let mut enum_value_names_by_type = EnumValueNameMap::new();
-    enum_value_names_by_type.insert(
-        "Enum.Material".to_string(),
-        HashMap::from([(256, "Plastic".to_string())]),
-    );
-    let class_names = vec!["Part".to_string()];
-    let strings = vec!["PartA".to_string()];
-
-    let parsed = parse_compact_v5_instance_items(
-        json!([[1, 0, false, 1, [256]]]),
-        &strings,
-        1,
-        &property_schema_by_class,
-        &enum_value_names_by_type,
-        &class_names,
-    )
-    .unwrap();
-
-    assert_eq!(
-        parsed[0].properties.get("Material"),
-        Some(&json!({
-            "_type": "EnumItem",
-            "enumType": "Enum.Material",
-            "name": "Plastic",
-        }))
-    );
-}
-
-#[test]
-fn parse_compact_v5_instance_items_accept_single_mask_word_number() {
-    let mut property_schema_by_class = HashMap::new();
-    property_schema_by_class.insert(
-        "Part".to_string(),
-        vec![PropertySchemaEntry {
-            name: "Position".to_string(),
-            type_id: TYPE_ID_VECTOR3,
-            enum_type: None,
-        }],
-    );
-    let class_names = vec!["Part".to_string()];
-    let strings = vec!["PartA".to_string()];
-
-    let parsed = parse_compact_v5_instance_items(
-        json!([[1, 0, false, 1, [[1.0, 2.0, 3.0]]]]),
-        &strings,
-        1,
-        &property_schema_by_class,
-        &HashMap::new(),
-        &class_names,
-    )
-    .unwrap();
-
-    assert_eq!(parsed.len(), 1);
-    assert_eq!(
-        parsed[0].properties.get("Position"),
-        Some(&json!({
-            "_type": "Vector3",
-            "x": 1.0,
-            "y": 2.0,
-            "z": 3.0,
-        }))
-    );
-}
-
-#[test]
-fn parse_compact_v5_instance_items_expand_number_range_and_physical_properties() {
-    let mut property_schema_by_class = HashMap::new();
-    property_schema_by_class.insert(
-        "Part".to_string(),
-        vec![
-            PropertySchemaEntry {
-                name: "Lifetime".to_string(),
-                type_id: TYPE_ID_NUMBER_RANGE,
-                enum_type: None,
-            },
-            PropertySchemaEntry {
-                name: "DefaultPhysicalProperties".to_string(),
-                type_id: TYPE_ID_PHYSICAL_PROPERTIES,
-                enum_type: None,
-            },
-            PropertySchemaEntry {
-                name: "CustomPhysicalProperties".to_string(),
-                type_id: TYPE_ID_PHYSICAL_PROPERTIES,
-                enum_type: None,
-            },
-        ],
-    );
-    let class_names = vec!["Part".to_string()];
-    let strings = vec!["PartA".to_string()];
-
-    let parsed = parse_compact_v5_instance_items(
-        json!([[
-            1,
-            0,
-            false,
-            7,
-            [[0.5, 1.5], false, [1.0, 0.3, 0.5, 1.0, 1.0, 0.25]]
-        ]]),
-        &strings,
-        1,
-        &property_schema_by_class,
-        &HashMap::new(),
-        &class_names,
-    )
-    .unwrap();
-
-    assert_eq!(
-        parsed[0].properties.get("Lifetime"),
-        Some(&json!({
-            "_type": "NumberRange",
-            "min": 0.5,
-            "max": 1.5,
-        }))
-    );
-    assert_eq!(
-        parsed[0].properties.get("DefaultPhysicalProperties"),
-        Some(&json!({
-            "_type": "PhysicalProperties",
-            "customPhysics": false,
-        }))
-    );
-    assert_eq!(
-        parsed[0].properties.get("CustomPhysicalProperties"),
-        Some(&json!({
-            "_type": "PhysicalProperties",
-            "customPhysics": true,
-            "density": 1.0,
-            "friction": 0.3,
-            "elasticity": 0.5,
-            "frictionWeight": 1.0,
-            "elasticityWeight": 1.0,
-            "acousticAbsorption": 0.25,
-        }))
-    );
 }
 
 fn vc_test_instance(

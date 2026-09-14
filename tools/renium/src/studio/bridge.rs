@@ -161,8 +161,7 @@ fn default_method_target(method: &str) -> BridgeTarget {
 
 fn bridge_response_timeout(method: &str) -> Duration {
     match method {
-        "prepare"
-        | "applyEditorChanges"
+        "applyEditorChanges"
         | "beginEditorTransaction"
         | "beginEditorTransactionUpload"
         | "appendEditorTransactionUpload"
@@ -173,9 +172,7 @@ fn bridge_response_timeout(method: &str) -> Duration {
         | "appendEditorPushReview"
         | "finishEditorBinaryImport"
         | "awaitEditorBinaryExport"
-        | "getInstanceBatchCompactChunk"
         | "getEditorBinaryOverlayChunk"
-        | "getSourceBatchChunk"
         | "getSourceRangeBatchCompactChunk" => BRIDGE_SLOW_RESPONSE_TIMEOUT,
         _ => BRIDGE_DEFAULT_RESPONSE_TIMEOUT,
     }
@@ -590,30 +587,8 @@ pub(crate) struct BridgeInfoPayload {
     pub(crate) codec_version: String,
     pub(crate) chunk_frame_protocol_version: String,
     pub(crate) compact_value_protocol_version: String,
-    pub(crate) performance_mode: String,
     pub(crate) export_all_properties: bool,
-    pub(crate) modified_default_bypass: bool,
     pub(crate) registration_ack: bool,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct BridgePerformanceStats {
-    pub(crate) frame_ms: Option<f64>,
-    pub(crate) last_frame_ms: Option<f64>,
-    pub(crate) max_frame_ms: Option<f64>,
-    pub(crate) stall_count_over_33_ms: Option<u64>,
-    pub(crate) stall_count_over_50_ms: Option<u64>,
-    pub(crate) stall_count_over_100_ms: Option<u64>,
-    pub(crate) modified_default_checks: Option<u64>,
-    pub(crate) modified_default_elided: Option<u64>,
-    pub(crate) modified_default_validation_reads: Option<u64>,
-    pub(crate) modified_default_runtime_denylist_count: Option<u64>,
-    pub(crate) properties_read: Option<u64>,
-    pub(crate) properties_encoded: Option<u64>,
-    pub(crate) properties_default_skipped: Option<u64>,
-    pub(crate) safe_read_class_fallback_count: Option<u64>,
-    pub(crate) safe_read_property_fallback_count: Option<u64>,
 }
 
 #[derive(Default)]
@@ -2674,8 +2649,6 @@ impl BridgeServer {
     pub(crate) fn cache_export_options_for_target(
         &self,
         target: BridgeTarget,
-        performance_mode: &str,
-        modified_default_bypass: bool,
         export_all_properties: bool,
     ) {
         let Ok(runtime_pin) = self.runtime_pin_for_selector(target, None) else {
@@ -2691,8 +2664,6 @@ impl BridgeServer {
                 if self.socket_matches_selector(role_key, socket, target, None)
                     && Self::socket_matches_runtime_pin(socket, &runtime_pin)
                 {
-                    socket.bridge_info.performance_mode = performance_mode.to_string();
-                    socket.bridge_info.modified_default_bypass = modified_default_bypass;
                     socket.bridge_info.export_all_properties = export_all_properties;
                 }
             }

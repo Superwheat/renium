@@ -18,11 +18,10 @@ use crate::app::build::{
 };
 use crate::app::output::{log_global, print_json_output};
 use crate::app::timing::{
-    elapsed_ms, log_timing, log_timing_ms, quiet_timings, set_quiet_timings, verbose_timing_logs,
+    elapsed_ms, log_timing_ms, quiet_timings, set_quiet_timings, verbose_timing_logs,
 };
 use crate::automation::op;
 use crate::cli::ExportSnapshotsArgs;
-use crate::cli::args::ImportSnapshotsArgs;
 use crate::daemon::try_daemon_control_request;
 use crate::project::config;
 use crate::project::layout::apply_configured_project_layout;
@@ -32,39 +31,28 @@ use crate::project::sourcemap::{
 use crate::project::structural::{
     moved_references_between_documents, rewrite_moved_references, service_store_paths,
 };
-use crate::roblox::schema::{
-    EnumValueNameMap, PropertySchemaMap, configure_bridge_property_candidates,
-    load_rbx_dom_property_schema, parse_enum_value_name_map, parse_property_schema_map,
-    parse_string_list,
-};
+use crate::rbx::decode::json_number_f64;
+use crate::roblox::schema::{configure_bridge_property_candidates, load_rbx_dom_property_schema};
 use crate::settings::bytecode::{SettingsBytecode, encode_settings_bytecode};
 use crate::settings::equivalence::{SettingsAlignment, align_settings_bytes_to_reference};
-use crate::snapshot::codec::{
-    apply_batch_settings_ids, apply_compact_batch_debug_ids, decode_batch_settings_ids,
-    decode_compact_batch_debug_ids, parse_compact_v5_instance_items,
-    parse_compact_v5_shape_instance_items,
-};
 use crate::snapshot::import::{
     DirectImportDispatcher, SourcemapWriter, build_service_state_from_instances,
-    direct_import_export_order, fetch_script_sources, import_snapshots_into_stage,
-    merge_script_sources, normalize_class_defaults, parse_services, resolve_direct_import_workers,
-    resolve_source_worker_count,
+    direct_import_export_order, normalize_class_defaults, parse_services,
+    resolve_direct_import_workers,
 };
 use crate::snapshot::types::{
-    AdaptiveTuneCache, AdaptiveTuneEntry, CompactBatchPayload, ExportedSnapshotParts,
-    InstanceBatchFetch, InstanceFetchResult, ServiceExecutionSpan, ServiceExportOutput,
-    ServiceState, SnapshotInstance,
+    ExportedSnapshotParts, NativeSettingsValue, ServiceExecutionSpan, ServiceExportOutput,
+    ServiceState,
 };
 use crate::studio::bridge::{
-    BridgeChunk, BridgeInfoPayload, BridgeListenMetrics, BridgePerformanceStats, BridgeServer,
-    BridgeTarget, ChunkFetchMetrics, MAX_BRIDGE_CHUNK_BYTES, MAX_BRIDGE_REASSEMBLY_BYTES,
-    SourceBatchMap, clamp_bridge_chunk_size,
+    BridgeChunk, BridgeInfoPayload, BridgeListenMetrics, BridgeServer, BridgeTarget,
+    ChunkFetchMetrics, MAX_BRIDGE_CHUNK_BYTES, MAX_BRIDGE_REASSEMBLY_BYTES,
 };
 use crate::studio::native::editor::{EditorBinaryExportFinishGuard, editor_binary_export_parts};
 use crate::system::files::{
-    OnDrop, create_unique_directory, current_unix_ts, fnv1a, is_service_settings_file_name,
-    read_json_file, resolve_existing_project_root, sanitize_name, sha256_hex,
-    write_bytes_if_changed, write_json_file,
+    OnDrop, create_unique_directory, fnv1a, is_service_settings_file_name,
+    resolve_existing_project_root, sanitize_name, sha256_hex, write_bytes_if_changed,
+    write_json_file,
 };
 
 pub(crate) const BRIDGE_PROTOCOL_VERSION: &str = "compact-v5";
@@ -76,156 +64,6 @@ const BRIDGE_CODEC_VERSION_SCHEMA8: &str = "compact-v5-schema-8";
 const BRIDGE_CODEC_VERSION: &str = BRIDGE_CODEC_VERSION_SCHEMA9;
 const SUPPORTED_BRIDGE_CODEC_VERSIONS: [&str; 2] =
     [BRIDGE_CODEC_VERSION, BRIDGE_CODEC_VERSION_SCHEMA8];
-const ADAPTIVE_TUNE_CACHE_VERSION: u32 = 3;
-const SAFE_CACHED_TUNE_FRAME_MS: f64 = 20.0;
-const STALE_CACHED_TUNE_MAX_AGE_SECS: i64 = 24 * 60 * 60;
-const LARGE_SERVICE_SINGLE_WAVE_MIN_INSTANCES: usize = 5_000;
-const ADAPTIVE_LAG_FRAME_MS: f64 = 33.3;
-const INITIAL_SEED_CHUNKS_PER_BRIDGE_MIN: usize = 4;
-const INITIAL_SEED_CHUNKS_PER_BRIDGE_MAX: usize = 5;
-const ADAPTIVE_BATCH_GROWTH_DIVISOR: usize = 8;
-const ADAPTIVE_WORKER_GROWTH_WAVE_INTERVAL: usize = 2;
-const DYNAMIC_RANGES_PER_WORKER: usize = 2;
-const DYNAMIC_RANGE_MIN_INSTANCES: usize = 512;
-
-#[derive(Clone, Copy, PartialEq)]
-enum PerformanceMode {
-    Throughput,
-    Balanced,
-    Smooth,
-}
-
-impl PerformanceMode {
-    fn parse(raw: &str) -> Self {
-        match raw {
-            "smooth" => Self::Smooth,
-            "balanced" => Self::Balanced,
-            _ => Self::Throughput,
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Throughput => "throughput",
-            Self::Balanced => "balanced",
-            Self::Smooth => "smooth",
-        }
-    }
-
-    fn min_large_service_batch_size(
-        self,
-        instance_count: usize,
-        bridge_concurrency: usize,
-    ) -> usize {
-        match self {
-            Self::Throughput => {
-                if instance_count < LARGE_SERVICE_DETERMINISTIC_FETCH_MIN_INSTANCES {
-                    return instance_count.max(1);
-                }
-                let target_ranges = bridge_concurrency.max(1).min(instance_count);
-                instance_count.div_ceil(target_ranges)
-            }
-            Self::Balanced => {
-                if instance_count < LARGE_SERVICE_SINGLE_WAVE_MIN_INSTANCES {
-                    return 0;
-                }
-                instance_count.div_ceil(8)
-            }
-            Self::Smooth => 0,
-        }
-    }
-
-    fn large_service_worker_floor(self, instance_count: usize, bridge_concurrency: usize) -> usize {
-        if instance_count < LARGE_SERVICE_SINGLE_WAVE_MIN_INSTANCES {
-            return 0;
-        }
-        match self {
-            Self::Throughput | Self::Balanced => bridge_concurrency.max(1),
-            Self::Smooth => 0,
-        }
-    }
-}
-
-fn adaptive_tune_cache_path(project_root: &Path) -> PathBuf {
-    project_root
-        .join(".renium")
-        .join("cache")
-        .join("adaptive.json")
-}
-
-fn adaptive_tune_cache_key(
-    bridge_info: &BridgeInfoPayload,
-    chunk_size: usize,
-    performance_mode: PerformanceMode,
-    modified_default_bypass: bool,
-) -> String {
-    format!(
-        "bridge={}:{};protocol={};codec={};chunk_frame={};compact_value={};chunk_size={};performance={};modified_default_bypass={}",
-        bridge_info.bridge_version,
-        bridge_info.bridge_build_unix,
-        bridge_info.protocol_version,
-        bridge_info.codec_version,
-        bridge_info.chunk_frame_protocol_version,
-        bridge_info.compact_value_protocol_version,
-        chunk_size,
-        performance_mode.as_str(),
-        modified_default_bypass
-    )
-}
-
-fn empty_adaptive_tune_cache(cache_key: &str) -> AdaptiveTuneCache {
-    AdaptiveTuneCache {
-        version: ADAPTIVE_TUNE_CACHE_VERSION,
-        cache_key: cache_key.to_string(),
-        ..AdaptiveTuneCache::default()
-    }
-}
-
-fn load_adaptive_tune_cache(project_root: &Path, expected_cache_key: &str) -> AdaptiveTuneCache {
-    let path = adaptive_tune_cache_path(project_root);
-    let Ok(cache) = read_json_file::<AdaptiveTuneCache>(&path) else {
-        return empty_adaptive_tune_cache(expected_cache_key);
-    };
-    if cache.version != ADAPTIVE_TUNE_CACHE_VERSION {
-        println!(
-            "[renium] adaptive tune cache version mismatch at {} (found {}, expected {}); ignoring cached tunes",
-            path.display(),
-            cache.version,
-            ADAPTIVE_TUNE_CACHE_VERSION
-        );
-        let _ = fs::remove_file(&path);
-        return empty_adaptive_tune_cache(expected_cache_key);
-    }
-    if cache.cache_key != expected_cache_key {
-        println!(
-            "[renium] adaptive tune cache key mismatch at {}; ignoring cached tunes",
-            path.display()
-        );
-        let _ = fs::remove_file(&path);
-        return empty_adaptive_tune_cache(expected_cache_key);
-    }
-    cache
-}
-
-fn write_adaptive_tune_cache(project_root: &Path, cache: &AdaptiveTuneCache) {
-    let path = adaptive_tune_cache_path(project_root);
-    if let Err(err) = write_json_file(&path, cache, true) {
-        println!(
-            "[renium] warning: failed to write adaptive tuning cache {}: {err:#}",
-            path.display()
-        );
-    }
-}
-
-fn prepare_bridge_for_next_run(bridge: &BridgeServer) {
-    let started = Instant::now();
-    match bridge.call("prepareForNextRun", json!({})) {
-        Ok(_) => log_timing_ms("bridge prepare next run", elapsed_ms(started)),
-        Err(err) => {
-            println!("[renium] warning: failed to prepare bridge for next run: {err:#}");
-        }
-    }
-}
 
 fn record_bridge_sync_completion(bridge: &BridgeServer) -> Result<()> {
     bridge
@@ -357,70 +195,42 @@ pub(crate) fn is_supported_bridge_codec(value: &str) -> bool {
     SUPPORTED_BRIDGE_CODEC_VERSIONS.contains(&value)
 }
 
-struct ServiceExportContext<'a> {
-    bridge: &'a BridgeServer,
-    chunk_size: usize,
-    adaptive_instance_batches: bool,
-    performance_mode: PerformanceMode,
-    fetch_class_defaults: bool,
-    source_workers: usize,
-    instance_workers: usize,
-    adaptive_seed_batch: usize,
-    property_schema_by_class: &'a PropertySchemaMap,
-    run_started: Instant,
-}
-
-impl ServiceExportContext<'_> {
-    fn export_with_span(
-        &self,
-        service: &str,
-        cached_tune: Option<&AdaptiveTuneEntry>,
-    ) -> Result<ServiceExportOutput> {
-        if verbose_timing_logs() {
-            println!("[renium] exporting {service}");
-        }
-        let service_export_started_ms = elapsed_ms(self.run_started);
-        let (parts, tune) = self.export_parts(service, cached_tune)?;
-        let service_export_end_ms = elapsed_ms(self.run_started);
-        Ok(ServiceExportOutput {
-            parts,
-            span: ServiceExecutionSpan {
-                service: service.to_string(),
-                export_start_ms: service_export_started_ms,
-                export_end_ms: service_export_end_ms,
-            },
-            tune,
-        })
-    }
-}
-
 fn finish_service_export_output(
     output: ServiceExportOutput,
     direct_import_dispatcher: Option<&DirectImportDispatcher>,
-    direct_import_mode: bool,
     snapshot_dir: &Path,
-    tune_updates: &mut Vec<(String, AdaptiveTuneEntry)>,
     service_export_spans: &mut Vec<ServiceExecutionSpan>,
     cumulative_service_latency_ms: &mut f64,
 ) -> Result<()> {
     let service = output.span.service.clone();
     *cumulative_service_latency_ms += output.span.export_end_ms - output.span.export_start_ms;
-    if let Some(tune) = output.tune {
-        tune_updates.push((service.clone(), tune));
-    }
-    if direct_import_mode {
-        let dispatcher = direct_import_dispatcher
-            .with_context(|| "Direct import dispatcher is not available")?;
+    if let Some(dispatcher) = direct_import_dispatcher {
         dispatcher.check_error()?;
         dispatcher.enqueue_parts(&service, output.parts)?;
     } else {
+        let ExportedSnapshotParts {
+            class_defaults,
+            mut instances,
+            native_properties_by_instance,
+        } = output.parts;
+        for (instance, properties) in instances
+            .iter_mut()
+            .zip(native_properties_by_instance.into_iter().flatten())
+        {
+            for property in properties {
+                if property.name == "RunContext" && instance.class_name != "Script" {
+                    continue;
+                }
+                instance
+                    .properties
+                    .entry(property.name)
+                    .or_insert_with(|| native_property_json(&property.value));
+            }
+        }
         let path = snapshot_dir.join(format!("{service}.json"));
         write_json_file(
             &path,
-            &json!({
-                "classDefaults": output.parts.class_defaults,
-                "instances": output.parts.instances,
-            }),
+            &json!({ "classDefaults": class_defaults, "instances": instances }),
             true,
         )?;
         println!("[renium] wrote {}", path.display());
@@ -429,10 +239,42 @@ fn finish_service_export_output(
     Ok(())
 }
 
+fn native_property_json(value: &NativeSettingsValue) -> Value {
+    let components = |type_name: &str, fields: &[&str], values: &[f32]| {
+        let mut out = Map::with_capacity(fields.len() + 1);
+        out.insert("_type".to_string(), Value::String(type_name.to_string()));
+        for (field, value) in fields.iter().zip(values) {
+            out.insert((*field).to_string(), json_number_f64(f64::from(*value)));
+        }
+        Value::Object(out)
+    };
+    match value {
+        NativeSettingsValue::Bool(value) => Value::Bool(*value),
+        NativeSettingsValue::Int(value) => json!(value),
+        NativeSettingsValue::Float32(value) => json_number_f64(f64::from(*value)),
+        NativeSettingsValue::Float64(value) => json_number_f64(*value),
+        NativeSettingsValue::String(value) => Value::String(value.clone()),
+        NativeSettingsValue::Ref(index) => json!({ "_type": "Ref", "instanceIndex": index + 1 }),
+        NativeSettingsValue::Vector2(value) => components("Vector2", &["x", "y"], value),
+        NativeSettingsValue::Vector3(value) => components("Vector3", &["x", "y", "z"], value),
+        NativeSettingsValue::UDim(value) => components("UDim", &["scale", "offset"], value),
+        NativeSettingsValue::UDim2(value) => {
+            components("UDim2", &["xScale", "xOffset", "yScale", "yOffset"], value)
+        }
+        NativeSettingsValue::Color3(value) => components("Color3", &["r", "g", "b"], value),
+        NativeSettingsValue::CFrame(value) => json!({
+            "_type": "CFrame",
+            "components": value.iter().map(|component| json_number_f64(f64::from(*component))).collect::<Vec<_>>(),
+        }),
+        NativeSettingsValue::Rect(value) => {
+            components("Rect", &["minX", "minY", "maxX", "maxY"], value)
+        }
+        NativeSettingsValue::Enum(name) => json!({ "_type": "EnumItem", "name": name }),
+    }
+}
+
 struct ExportPrelude {
     total_started: Instant,
-    performance_mode: PerformanceMode,
-    modified_default_bypass: bool,
     project_root: PathBuf,
     services: Vec<String>,
     snapshot_dir: PathBuf,
@@ -1501,38 +1343,10 @@ fn copy_symbolic_link(source: &Path, destination: &Path) -> Result<()> {
     .with_context(|| format!("Failed to stage symbolic link {}", source.display()))
 }
 
-#[derive(Clone, Copy)]
-enum ExportBridgeMode {
-    Cold,
-    Warm {
-        prepare_next_run: bool,
-        repair_reference_paths: bool,
-    },
-}
-
-impl ExportBridgeMode {
-    fn repair_reference_paths(self) -> bool {
-        matches!(
-            self,
-            Self::Warm {
-                repair_reference_paths: true,
-                ..
-            }
-        )
-    }
-}
-
 fn export_snapshots_prelude(args: &ExportSnapshotsArgs) -> Result<ExportPrelude> {
     set_quiet_timings(args.quiet_timings);
 
     let total_started = Instant::now();
-    let performance_mode = PerformanceMode::parse(&args.performance_mode);
-    let modified_default_bypass = if args.no_modified_default_bypass {
-        false
-    } else {
-        args.modified_default_bypass
-    };
-
     let project_root = resolve_existing_project_root(&args.project_root)?;
     config::validate_relative_portable_path(&args.src_dir, "srcDir")?;
     let services = parse_services(&args.services)?;
@@ -1544,23 +1358,15 @@ fn export_snapshots_prelude(args: &ExportSnapshotsArgs) -> Result<ExportPrelude>
 
     let ports = parse_bridge_ports(&args.bridge.ports)?;
     println!(
-        "[renium] export start: version={}, git={}, build_ts={}, protocol={}, services={}, chunk_size={}, import_mode={}, performance_mode={}, modified_default_bypass={}",
+        "[renium] export start: version={}, git={}, build_ts={}, protocol={}, services={}",
         BUILD_VERSION,
         BUILD_GIT_HASH,
         BUILD_TIMESTAMP_UNIX,
         BRIDGE_PROTOCOL_VERSION,
-        services.len(),
-        args.chunk_size,
-        args.import_mode,
-        performance_mode.as_str(),
-        modified_default_bypass
+        services.len()
     );
-    println!("[renium] effective chunk size: {} bytes", args.chunk_size);
-    println!("[renium] modified default bypass: {modified_default_bypass}");
     Ok(ExportPrelude {
         total_started,
-        performance_mode,
-        modified_default_bypass,
         project_root,
         services,
         snapshot_dir,
@@ -1579,18 +1385,8 @@ pub(crate) fn export_snapshots(mut args: ExportSnapshotsArgs) -> Result<()> {
         "srcDir": args.src_dir,
         "snapshotDir": args.snapshot_dir,
         "services": args.services,
-        "chunkSize": args.chunk_size,
-        "adaptiveSeedBatch": args.adaptive_seed_batch,
         "bridgeWaitSeconds": args.bridge.wait_seconds,
         "bridgePorts": args.bridge.ports,
-        "importMode": args.import_mode,
-        "sourceWorkers": args.source_workers,
-        "instanceWorkers": args.instance_workers,
-        "importWorkers": args.import_workers,
-        "performanceMode": args.performance_mode,
-        "modifiedDefaultBypass": args.modified_default_bypass,
-        "noModifiedDefaultBypass": args.no_modified_default_bypass,
-        "adaptiveThrottle": !args.no_adaptive_throttle,
         "exportAllProperties": args.export_all_properties,
         "noExportAllProperties": args.no_export_all_properties,
     });
@@ -1659,7 +1455,7 @@ pub(crate) fn export_snapshots(mut args: ExportSnapshotsArgs) -> Result<()> {
         &bridge_info,
         bridge_listen_metrics,
         all_channels_connected_to_bridge_info_ms,
-        ExportBridgeMode::Cold,
+        false,
     )
     .map(|_| ())
 }
@@ -1678,7 +1474,6 @@ pub(crate) fn export_snapshots_with_warm_bridge(
     bridge: &BridgeServer,
     bridge_info: &BridgeInfoPayload,
     bridge_info_refresh_ms: f64,
-    prepare_next_run: bool,
     repair_reference_paths: bool,
 ) -> Result<PublishedProjectChanges> {
     let _trace = crate::app::timing::trace_scope("sync", "export snapshots");
@@ -1700,10 +1495,7 @@ pub(crate) fn export_snapshots_with_warm_bridge(
             wait_for_channels_ms: 0.0,
         },
         bridge_info_refresh_ms,
-        ExportBridgeMode::Warm {
-            prepare_next_run,
-            repair_reference_paths,
-        },
+        repair_reference_paths,
     )
 }
 
@@ -1722,8 +1514,6 @@ pub(crate) fn capture_exported_services<T: Send>(
         bridge,
         bridge_info,
         &prelude.project_root,
-        prelude.performance_mode,
-        prelude.modified_default_bypass,
         prelude.total_started,
     )?;
     let outputs = Mutex::new(Vec::with_capacity(prelude.services.len()));
@@ -1792,7 +1582,6 @@ fn log_export_bridge_connection(
 }
 
 struct ExportBridgeSetup {
-    property_schema_by_class: PropertySchemaMap,
     property_schema_ready_ms: f64,
     bridge_info_to_property_schema_ready_ms: f64,
 }
@@ -1802,36 +1591,20 @@ fn prepare_export_bridge(
     bridge: &BridgeServer,
     bridge_info: &BridgeInfoPayload,
     project_root: &Path,
-    performance_mode: PerformanceMode,
-    modified_default_bypass: bool,
     total_started: Instant,
 ) -> Result<ExportBridgeSetup> {
     let export_all_properties = args.export_all_properties && !args.no_export_all_properties;
     if export_all_properties {
         println!("[renium] full property export requested; default-value elision disabled");
     }
-    let bridge_options_match = bridge_info.performance_mode == performance_mode.as_str()
-        && bridge_info.modified_default_bypass == modified_default_bypass
-        && bridge_info.export_all_properties == export_all_properties;
-    if bridge_options_match {
-        println!("[renium] plugin export options already match requested configuration");
-    } else {
+    if bridge_info.export_all_properties != export_all_properties {
         bridge
             .call(
                 "setExportOptions",
-                json!({
-                    "exportAllProperties": export_all_properties,
-                    "performanceMode": performance_mode.as_str(),
-                    "modifiedDefaultBypass": modified_default_bypass,
-                }),
+                json!({ "exportAllProperties": export_all_properties }),
             )
             .context("Failed to apply plugin export options")?;
-        bridge.cache_export_options_for_target(
-            BridgeTarget::Main,
-            performance_mode.as_str(),
-            modified_default_bypass,
-            export_all_properties,
-        );
+        bridge.cache_export_options_for_target(BridgeTarget::Main, export_all_properties);
     }
     let bridge_info_done_ms = elapsed_ms(total_started);
     let property_schema_by_class = load_rbx_dom_property_schema(project_root)?.unwrap_or_default();
@@ -1848,7 +1621,6 @@ fn prepare_export_bridge(
         bridge_info_to_property_schema_ready_ms,
     );
     Ok(ExportBridgeSetup {
-        property_schema_by_class,
         property_schema_ready_ms,
         bridge_info_to_property_schema_ready_ms,
     })
@@ -1857,70 +1629,46 @@ fn prepare_export_bridge(
 struct ServiceExportRun<'a> {
     spans: Vec<ServiceExecutionSpan>,
     cumulative_latency_ms: f64,
-    tune_updates: Vec<(String, AdaptiveTuneEntry)>,
     native_finish_guard: Option<EditorBinaryExportFinishGuard<'a>>,
 }
 
-impl ServiceExportRun<'_> {
-    fn finish_output(
-        &mut self,
-        output: ServiceExportOutput,
-        dispatcher: Option<&DirectImportDispatcher>,
-        direct_import_mode: bool,
-        snapshot_dir: &Path,
-    ) -> Result<()> {
-        finish_service_export_output(
-            output,
-            dispatcher,
-            direct_import_mode,
-            snapshot_dir,
-            &mut self.tune_updates,
-            &mut self.spans,
-            &mut self.cumulative_latency_ms,
-        )
-    }
-}
-
 fn run_service_exports<'a>(
-    context: &ServiceExportContext<'a>,
+    bridge: &'a BridgeServer,
+    run_started: Instant,
     services: &[String],
-    tune_cache: &AdaptiveTuneCache,
     dispatcher: Option<&DirectImportDispatcher>,
-    direct_import_mode: bool,
     snapshot_dir: &Path,
 ) -> Result<ServiceExportRun<'a>> {
     let mut run = ServiceExportRun {
         spans: Vec::with_capacity(services.len()),
         cumulative_latency_ms: 0.0,
-        tune_updates: Vec::new(),
         native_finish_guard: None,
     };
-    if direct_import_mode {
-        println!("[renium] native full export enabled");
-        let guard = {
-            let mut finish_output =
-                |output| run.finish_output(output, dispatcher, true, snapshot_dir);
-            let mut release_import = || {
-                if let Some(dispatcher) = dispatcher {
-                    dispatcher.activate_workers(1);
-                }
-                Ok(())
-            };
-            editor_binary_export_parts(
-                context.bridge,
-                services,
-                context.run_started,
-                &mut finish_output,
-                &mut release_import,
-            )?
+    let guard = {
+        let mut finish_output = |output| {
+            finish_service_export_output(
+                output,
+                dispatcher,
+                snapshot_dir,
+                &mut run.spans,
+                &mut run.cumulative_latency_ms,
+            )
         };
-        run.native_finish_guard = Some(guard);
-    } else {
-        for service in services {
-            let output = context.export_with_span(service, tune_cache.services.get(service))?;
-            run.finish_output(output, None, false, snapshot_dir)?;
-        }
-    }
+        let mut release_import = || {
+            if let Some(dispatcher) = dispatcher {
+                dispatcher.activate_workers(1);
+            }
+            Ok(())
+        };
+        editor_binary_export_parts(
+            bridge,
+            services,
+            run_started,
+            &mut finish_output,
+            &mut release_import,
+        )?
+    };
+    run.native_finish_guard = Some(guard);
     run.spans.sort_by(|a, b| {
         a.export_start_ms
             .partial_cmp(&b.export_start_ms)
@@ -1935,125 +1683,51 @@ struct ImportFinishMetrics {
     sourcemap_finalize_ms: f64,
 }
 
-struct ImportFinishRequest<'a> {
-    args: &'a ExportSnapshotsArgs,
-    services: &'a [String],
-    snapshot_dir: &'a Path,
-    project_root: &'a Path,
-    src_dir: &'a Path,
-    direct: bool,
-}
-
 fn finish_export_import(
-    request: ImportFinishRequest<'_>,
-    dispatcher: &mut Option<DirectImportDispatcher>,
+    project_root: &Path,
+    dispatcher: Option<DirectImportDispatcher>,
     sourcemap_writer: Option<SourcemapWriter>,
 ) -> Result<ImportFinishMetrics> {
-    if request.args.no_run_import {
+    let Some(dispatcher) = dispatcher else {
         return Ok(ImportFinishMetrics::default());
-    }
+    };
     let mut metrics = ImportFinishMetrics::default();
-    if request.direct {
-        let mut sourcemap_nodes = HashMap::new();
-        if let Some(dispatcher) = dispatcher.take() {
-            let drain_started = Instant::now();
-            sourcemap_nodes = dispatcher.finish()?;
-            metrics.dispatcher_drain_ms = elapsed_ms(drain_started);
-            log_timing_ms(
-                "direct import dispatcher drain",
-                metrics.dispatcher_drain_ms,
-            );
-        }
-        if let Some(writer) = sourcemap_writer.as_ref() {
-            writer.request_finish();
-        }
-        let sourcemap_started = Instant::now();
-        if let Some(writer) = sourcemap_writer {
-            writer.join()?;
-        } else {
-            write_project_sourcemap_from_service_nodes(request.project_root, &sourcemap_nodes)?;
-        }
-        metrics.sourcemap_finalize_ms = elapsed_ms(sourcemap_started);
-        log_timing_ms("sourcemap finalize", metrics.sourcemap_finalize_ms);
-    } else {
-        import_snapshots_into_stage(ImportSnapshotsArgs {
-            snapshot_dir: request.snapshot_dir.to_path_buf(),
-            project_root: request.project_root.to_path_buf(),
-            src_dir: request.src_dir.to_path_buf(),
-            services: request.services.join(","),
-            no_project_write: false,
-            threads: 0,
-        })?;
+    let drain_started = Instant::now();
+    let sourcemap_nodes = dispatcher.finish()?;
+    metrics.dispatcher_drain_ms = elapsed_ms(drain_started);
+    log_timing_ms(
+        "direct import dispatcher drain",
+        metrics.dispatcher_drain_ms,
+    );
+    if let Some(writer) = sourcemap_writer.as_ref() {
+        writer.request_finish();
     }
+    let sourcemap_started = Instant::now();
+    if let Some(writer) = sourcemap_writer {
+        writer.join()?;
+    } else {
+        write_project_sourcemap_from_service_nodes(project_root, &sourcemap_nodes)?;
+    }
+    metrics.sourcemap_finalize_ms = elapsed_ms(sourcemap_started);
+    log_timing_ms("sourcemap finalize", metrics.sourcemap_finalize_ms);
     Ok(metrics)
 }
 
 struct ExportExecutionSetup {
     project_stage: Option<ExportProjectStage>,
     import_project_root: PathBuf,
-    import_src_dir: PathBuf,
-    adaptive_instance_batches: bool,
-    direct_import_mode: bool,
-    effective_chunk: usize,
-    adaptive_tune_cache: AdaptiveTuneCache,
     sourcemap_writer: Option<SourcemapWriter>,
     direct_import_dispatcher: Option<DirectImportDispatcher>,
     export_services: Vec<String>,
-}
-
-fn start_direct_import(
-    enabled: bool,
-    args: &ExportSnapshotsArgs,
-    project_root: &Path,
-    src_dir: &Path,
-    sourcemap_writer: Option<&SourcemapWriter>,
-    total_started: Instant,
-) -> Result<Option<DirectImportDispatcher>> {
-    if !enabled {
-        return Ok(None);
-    }
-    let default_workers = resolve_direct_import_workers(args.import_workers);
-    println!("[renium] direct import workers during export: {default_workers}");
-    DirectImportDispatcher::start(
-        project_root.to_path_buf(),
-        src_dir.to_path_buf(),
-        default_workers,
-        default_workers,
-        sourcemap_writer.map(SourcemapWriter::sender),
-        total_started,
-    )
-    .map(Some)
-}
-
-fn ordered_export_services(
-    direct_import_mode: bool,
-    services: &[String],
-    adaptive_tune_cache: &AdaptiveTuneCache,
-) -> Vec<String> {
-    if !direct_import_mode {
-        return services.to_vec();
-    }
-    let ordered = direct_import_export_order(services, adaptive_tune_cache);
-    if ordered != services {
-        println!("[renium] direct import export order: {}", ordered.join(","));
-    }
-    ordered
 }
 
 fn prepare_export_execution(
     args: &ExportSnapshotsArgs,
     project_root: &Path,
     services: &[String],
-    bridge_info: &BridgeInfoPayload,
-    performance_mode: PerformanceMode,
-    modified_default_bypass: bool,
     total_started: Instant,
 ) -> Result<ExportExecutionSetup> {
     let run_import = !args.no_run_import;
-    let direct_import_mode = run_import && matches!(args.import_mode.as_str(), "direct" | "staged");
-    // Even direct import workers must write privately until the native guard
-    // validates the complete capture and overlays. Publication retains the
-    // stage's original-file concurrency checks in every import mode.
     let project_stage = if run_import {
         Some(ExportProjectStage::create(
             project_root,
@@ -2083,56 +1757,32 @@ fn prepare_export_execution(
             ),
         );
     }
-    let adaptive_instance_batches = !args.no_adaptive_throttle;
-    println!(
-        "[renium] adaptive instance batching: {}",
-        if adaptive_instance_batches {
-            "enabled"
-        } else {
-            "disabled"
-        }
-    );
-    println!("[renium] performance mode: {}", performance_mode.as_str());
-    if args.adaptive_seed_batch > 0 {
+    let sourcemap_writer =
+        run_import.then(|| SourcemapWriter::start(import_project_root.clone(), false));
+    let direct_import_dispatcher = if run_import {
+        let workers = resolve_direct_import_workers();
+        println!("[renium] direct import workers during export: {workers}");
+        Some(DirectImportDispatcher::start(
+            import_project_root.clone(),
+            import_src_dir,
+            workers,
+            workers,
+            sourcemap_writer.as_ref().map(SourcemapWriter::sender),
+            total_started,
+        )?)
+    } else {
+        None
+    };
+    let export_services = direct_import_export_order(services);
+    if export_services != services {
         println!(
-            "[renium] adaptive seed batch override: {}",
-            args.adaptive_seed_batch
+            "[renium] direct import export order: {}",
+            export_services.join(",")
         );
     }
-    let effective_chunk = clamp_bridge_chunk_size(args.chunk_size);
-    if effective_chunk != args.chunk_size {
-        println!(
-            "[renium] warning: clamped requested chunk size {} to {} bytes",
-            args.chunk_size, effective_chunk
-        );
-    }
-    let cache_key = adaptive_tune_cache_key(
-        bridge_info,
-        effective_chunk,
-        performance_mode,
-        modified_default_bypass,
-    );
-    let adaptive_tune_cache = load_adaptive_tune_cache(project_root, &cache_key);
-    let sourcemap_writer = direct_import_mode
-        .then(|| SourcemapWriter::start(import_project_root.clone(), project_stage.is_none()));
-    let direct_import_dispatcher = start_direct_import(
-        direct_import_mode,
-        args,
-        &import_project_root,
-        &import_src_dir,
-        sourcemap_writer.as_ref(),
-        total_started,
-    )?;
-    let export_services =
-        ordered_export_services(direct_import_mode, services, &adaptive_tune_cache);
     Ok(ExportExecutionSetup {
         project_stage,
         import_project_root,
-        import_src_dir,
-        adaptive_instance_batches,
-        direct_import_mode,
-        effective_chunk,
-        adaptive_tune_cache,
         sourcemap_writer,
         direct_import_dispatcher,
         export_services,
@@ -2197,7 +1847,7 @@ fn export_snapshots_core(
     bridge_info: &BridgeInfoPayload,
     bridge_listen_metrics: BridgeListenMetrics,
     all_channels_connected_to_bridge_info_ms: f64,
-    mode: ExportBridgeMode,
+    repair_reference_paths: bool,
 ) -> Result<PublishedProjectChanges> {
     let _trace = crate::app::timing::trace_scope("sync", "export core");
     let mut stages = crate::app::timing::trace_stages(
@@ -2206,8 +1856,6 @@ fn export_snapshots_core(
     );
     let ExportPrelude {
         total_started,
-        performance_mode,
-        modified_default_bypass,
         project_root,
         services,
         snapshot_dir,
@@ -2222,70 +1870,30 @@ fn export_snapshots_core(
         );
     stages.next("prepare export bridge and property schema");
     let ExportBridgeSetup {
-        property_schema_by_class,
         property_schema_ready_ms,
         bridge_info_to_property_schema_ready_ms,
-    } = prepare_export_bridge(
-        args,
-        bridge,
-        bridge_info,
-        &project_root,
-        performance_mode,
-        modified_default_bypass,
-        total_started,
-    )?;
+    } = prepare_export_bridge(args, bridge, bridge_info, &project_root, total_started)?;
     stages.next("prepare project output workers and export service order");
     let ExportExecutionSetup {
         mut project_stage,
         import_project_root,
-        import_src_dir,
-        adaptive_instance_batches,
-        direct_import_mode,
-        effective_chunk,
-        mut adaptive_tune_cache,
         sourcemap_writer,
-        mut direct_import_dispatcher,
+        direct_import_dispatcher,
         export_services,
-    } = prepare_export_execution(
-        args,
-        &project_root,
-        &services,
-        bridge_info,
-        performance_mode,
-        modified_default_bypass,
-        total_started,
-    )?;
-    let export_context = ServiceExportContext {
-        bridge,
-        chunk_size: effective_chunk,
-        adaptive_instance_batches,
-        performance_mode,
-        fetch_class_defaults: true,
-        source_workers: args.source_workers,
-        instance_workers: args.instance_workers,
-        adaptive_seed_batch: args.adaptive_seed_batch,
-        property_schema_by_class: &property_schema_by_class,
-        run_started: total_started,
-    };
+    } = prepare_export_execution(args, &project_root, &services, total_started)?;
     stages.next("capture services and stream snapshots into output workers");
     let ServiceExportRun {
         spans: service_export_spans,
         cumulative_latency_ms: cumulative_service_latency_ms,
-        tune_updates,
         mut native_finish_guard,
     } = run_service_exports(
-        &export_context,
+        bridge,
+        total_started,
         &export_services,
-        &adaptive_tune_cache,
         direct_import_dispatcher.as_ref(),
-        direct_import_mode,
         &snapshot_dir,
     )?;
-    stages.next("merge service batch tuning and export timing boundaries");
-    let tune_updated = !tune_updates.is_empty();
-    for (service, tune) in tune_updates {
-        adaptive_tune_cache.services.insert(service, tune);
-    }
+    stages.next("export timing boundaries");
     let first_service_export_ms = service_export_spans
         .first()
         .map_or(property_schema_ready_ms, |span| span.export_start_ms);
@@ -2317,22 +1925,15 @@ fn export_snapshots_core(
         dispatcher_drain_ms,
         sourcemap_finalize_ms,
     } = finish_export_import(
-        ImportFinishRequest {
-            args,
-            services: &services,
-            snapshot_dir: &snapshot_dir,
-            project_root: &import_project_root,
-            src_dir: &import_src_dir,
-            direct: direct_import_mode,
-        },
-        &mut direct_import_dispatcher,
+        &import_project_root,
+        direct_import_dispatcher,
         sourcemap_writer,
     )?;
     stages.next("publish exported files and acknowledge Studio snapshot");
     let (published, sync_completion_ms) = finish_export_publication(
         project_stage.take(),
         &project_root,
-        mode.repair_reference_paths(),
+        repair_reference_paths,
         move || {
             if let Some(mut guard) = native_finish_guard.take() {
                 finish_native_export(&mut guard)?;
@@ -2341,10 +1942,6 @@ fn export_snapshots_core(
         },
         || record_bridge_sync_completion(bridge),
     )?;
-    stages.next("save updated batch tuning");
-    if tune_updated {
-        write_adaptive_tune_cache(&project_root, &adaptive_tune_cache);
-    }
 
     stages.next("format export timing summaries");
     let total_run_ms = elapsed_ms(total_started);
@@ -2381,16 +1978,6 @@ fn export_snapshots_core(
         "[renium] run timing summary: total_ms={total_run_ms:.1}, core_export_ms={core_export_ms:.1}, bridge_startup_ms={cli_start_to_bridge_listen_ms:.1}, handshake_ms={handshake_ms:.1}, cumulative_service_latency_ms={cumulative_service_latency_ms:.1}, import_critical_tail_ms={import_critical_tail_ms:.1}, unmeasured_or_scheduler_gap_ms={unmeasured_or_scheduler_gap_ms:.1}"
     );
     log_timing_ms("full export-snapshots run", total_run_ms);
-    stages.next("prepare connection for following export");
-    if matches!(
-        mode,
-        ExportBridgeMode::Warm {
-            prepare_next_run: true,
-            ..
-        }
-    ) {
-        prepare_bridge_for_next_run(bridge);
-    }
     println!("[renium] export done");
     stages.next("release completed export buffers and configuration");
     Ok(published)
@@ -2426,230 +2013,6 @@ pub(crate) fn parse_bridge_ports(raw: &str) -> Result<Vec<u16>> {
         );
     }
     Ok(out)
-}
-
-impl ServiceExportContext<'_> {
-    fn export_parts(
-        &self,
-        service: &str,
-        cached_tune: Option<&AdaptiveTuneEntry>,
-    ) -> Result<(ExportedSnapshotParts, Option<AdaptiveTuneEntry>)> {
-        let bridge = self.bridge;
-        let chunk_size = self.chunk_size;
-        let adaptive_instance_batches = self.adaptive_instance_batches;
-        let performance_mode = self.performance_mode;
-        let fetch_class_defaults = self.fetch_class_defaults;
-        let source_workers = self.source_workers;
-        let instance_workers = self.instance_workers;
-        let adaptive_seed_batch = self.adaptive_seed_batch;
-        let default_property_schema_by_class = self.property_schema_by_class;
-        let service_started = Instant::now();
-        let prepare_started = Instant::now();
-        let mut prepare = bridge.call("prepare", json!({ "service": service }))?;
-        let release = || {
-            OnDrop::new(|| {
-                let _ = bridge.call("release", json!({ "service": service }));
-            })
-        };
-        let mut prepared_service = release();
-        log_timing(&format!("{service}: prepare"), prepare_started);
-        let mut service_property_schema_by_class =
-            parse_property_schema_map(prepare.get("propertySchemaByClass"))?;
-        if service_property_schema_by_class.is_empty()
-            && !default_property_schema_by_class.is_empty()
-        {
-            println!(
-                "[renium] {service}: plugin property schema cache is empty; configuring rbx-dom candidates and retrying prepare"
-            );
-            prepared_service.run();
-            configure_bridge_property_candidates(bridge, default_property_schema_by_class)
-                .context("Failed to configure plugin property candidates")?;
-            let retry_prepare_started = Instant::now();
-            prepare = bridge.call("prepare", json!({ "service": service }))?;
-            prepared_service = release();
-            log_timing(
-                &format!("{service}: prepare after schema configure"),
-                retry_prepare_started,
-            );
-            service_property_schema_by_class =
-                parse_property_schema_map(prepare.get("propertySchemaByClass"))?;
-        }
-        // A schema recovery releases and prepares the service again. Counts and
-        // class indexes must describe that final snapshot, not the discarded one.
-        let instance_count = prepare
-            .get("instanceCount")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as usize;
-        let script_count = prepare
-            .get("scriptCount")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as usize;
-        let prepare_class_names = parse_string_list(prepare.get("classNames"))
-            .context("prepare.classNames must be an array of strings")?;
-        if verbose_timing_logs() {
-            println!(
-                "[renium] {service}: prepared instances={instance_count}, scripts={script_count}"
-            );
-        }
-        let enum_value_names_by_type =
-            parse_enum_value_name_map(prepare.get("enumValueNamesByType"))?;
-        let effective_property_schema_by_class = if service_property_schema_by_class.is_empty() {
-            default_property_schema_by_class
-        } else {
-            &service_property_schema_by_class
-        };
-        let instance_batches = InstanceBatchContext {
-            bridge,
-            service,
-            chunk_size,
-            instance_count,
-            property_schema_by_class: effective_property_schema_by_class,
-            enum_value_names_by_type: &enum_value_names_by_type,
-            class_names: &prepare_class_names,
-        };
-        let source_worker_count = resolve_source_worker_count(
-            source_workers,
-            bridge.channel_count(),
-            script_count,
-            instance_count,
-        );
-
-        if verbose_timing_logs() {
-            println!(
-                "[renium] {service}: script sources={script_count}, workers={source_worker_count}"
-            );
-        }
-
-        let fetch_class_defaults_for_service = || -> Result<Value> {
-            if !fetch_class_defaults {
-                return Ok(Value::Object(Map::new()));
-            }
-            let started = Instant::now();
-            let (value, metrics) = fetch_json_payload(chunk_size, |chunk_start, max_len| {
-                bridge.call_chunk(
-                    "getClassDefaultsChunk",
-                    json!({
-                        "service": service,
-                        "startIndex": chunk_start,
-                        "maxLen": max_len,
-                    }),
-                )
-            })?;
-            log_chunk_fetch_metrics(&format!("{service}: class defaults"), metrics);
-            log_timing(&format!("{service}: class defaults fetch"), started);
-            Ok(value)
-        };
-        let fetch_source_map_for_service = || -> Result<SourceBatchMap> {
-            let started = Instant::now();
-            let value = fetch_script_sources(
-                bridge,
-                service,
-                chunk_size,
-                script_count,
-                source_worker_count,
-                None,
-            )?;
-            log_timing(&format!("{service}: script source fetch"), started);
-            Ok(value)
-        };
-        let fetch_instance_payload_for_service = || -> Result<InstanceFetchResult> {
-            let instance_fetch_started = Instant::now();
-            let instance_fetch = if adaptive_instance_batches {
-                instance_batches.fetch_adaptive(
-                    instance_workers,
-                    adaptive_seed_batch,
-                    performance_mode,
-                    cached_tune,
-                )?
-            } else {
-                let fixed_batch_floor = performance_mode
-                    .min_large_service_batch_size(instance_count, bridge.channel_count());
-                let base_batch_size = instance_batch_defaults(instance_count)
-                    .fixed
-                    .max(fixed_batch_floor);
-                let instance_worker_count = resolve_instance_worker_count(
-                    instance_workers,
-                    bridge.channel_count(),
-                    instance_count,
-                    base_batch_size,
-                );
-                let instance_batch_size = if instance_workers > 0 {
-                    instance_count.div_ceil(instance_worker_count).max(1)
-                } else {
-                    base_batch_size
-                };
-                if verbose_timing_logs() {
-                    println!(
-                        "[renium] {service}: instance batch size {instance_batch_size} (fixed, workers={instance_worker_count}, min_batch_floor={fixed_batch_floor})"
-                    );
-                }
-                InstanceFetchResult {
-                    instances: instance_batches
-                        .fetch_fixed(instance_batch_size, instance_worker_count)?,
-                    tune: None,
-                }
-            };
-            log_timing(
-                &format!("{service}: instance fetch"),
-                instance_fetch_started,
-            );
-            Ok(instance_fetch)
-        };
-        let deterministic_large_service =
-            instance_count >= LARGE_SERVICE_DETERMINISTIC_FETCH_MIN_INSTANCES;
-        let (class_defaults, mut instance_fetch, source_by_key) = if deterministic_large_service {
-            if verbose_timing_logs() {
-                println!("[renium] {service}: coordinated large-service fetch mode enabled");
-            }
-            thread::scope(|scope| -> Result<_> {
-                let class_defaults_task = scope.spawn(fetch_class_defaults_for_service);
-                let instance_fetch = fetch_instance_payload_for_service()?;
-                let class_defaults = match class_defaults_task.join() {
-                    Ok(value) => value?,
-                    Err(_) => bail!("Class defaults worker panicked for {service}"),
-                };
-                let source_by_key = fetch_source_map_for_service()?;
-                Ok((class_defaults, instance_fetch, source_by_key))
-            })?
-        } else {
-            thread::scope(|scope| -> Result<_> {
-                let class_defaults_task = scope.spawn(fetch_class_defaults_for_service);
-                let source_fetch_task = scope.spawn(fetch_source_map_for_service);
-                let instance_fetch = fetch_instance_payload_for_service()?;
-
-                let class_defaults = match class_defaults_task.join() {
-                    Ok(value) => value?,
-                    Err(_) => bail!("Class defaults worker panicked for {service}"),
-                };
-                let source_by_key = match source_fetch_task.join() {
-                    Ok(value) => value?,
-                    Err(_) => bail!("Script source worker panicked for {service}"),
-                };
-
-                Ok((class_defaults, instance_fetch, source_by_key))
-            })?
-        };
-
-        let merge_started = Instant::now();
-        merge_script_sources(&mut instance_fetch.instances, &source_by_key);
-        log_timing(&format!("{service}: merge script sources"), merge_started);
-
-        let release_started = Instant::now();
-        prepared_service.run();
-        log_timing(&format!("{service}: release"), release_started);
-        log_timing(
-            &format!("{service}: export assembly total"),
-            service_started,
-        );
-        Ok((
-            ExportedSnapshotParts {
-                class_defaults,
-                instances: instance_fetch.instances,
-                native_properties_by_instance: None,
-            },
-            instance_fetch.tune,
-        ))
-    }
 }
 
 pub(crate) fn exported_parts_to_service_state(
@@ -2764,1080 +2127,6 @@ pub(crate) fn validate_bridge_chunk(chunk: &BridgeChunk) -> Result<()> {
         );
     }
     Ok(())
-}
-
-struct InstanceBatchDefaults {
-    fixed: usize,
-    adaptive: usize,
-}
-
-fn instance_batch_defaults(instance_count: usize) -> InstanceBatchDefaults {
-    let (fixed, adaptive) = if instance_count >= 150_000 {
-        (1800, 1800)
-    } else if instance_count >= 100_000 {
-        (1400, 1600)
-    } else if instance_count >= 50_000 {
-        (1000, 1400)
-    } else if instance_count >= 20_000 {
-        (800, 1100)
-    } else {
-        (500, 800)
-    };
-    InstanceBatchDefaults { fixed, adaptive }
-}
-
-fn auto_instance_worker_target(instance_count: usize, concurrency_cap: usize) -> usize {
-    let concurrency_cap = concurrency_cap.max(1);
-    let desired = if instance_count >= 20_000 {
-        4
-    } else if instance_count >= 5_000 {
-        3
-    } else if instance_count >= 250 {
-        2
-    } else {
-        1
-    };
-    desired.min(concurrency_cap)
-}
-
-fn resolve_instance_worker_count(
-    requested_instance_workers: usize,
-    channel_count: usize,
-    instance_count: usize,
-    batch_size: usize,
-) -> usize {
-    let batch_size = batch_size.max(1);
-    let batch_count = instance_count.div_ceil(batch_size).max(1);
-    if batch_count <= 1 {
-        return 1;
-    }
-
-    let channel_count = channel_count.max(1);
-    let mut soft_target = auto_instance_worker_target(instance_count, channel_count);
-    if instance_count >= LARGE_SERVICE_SINGLE_WAVE_MIN_INSTANCES {
-        soft_target = soft_target.max(channel_count.min(4));
-    }
-    let hard_cap = channel_count.saturating_mul(2).min(64);
-    let cpu_cap = std::thread::available_parallelism()
-        .map_or(8, |v| v.get().saturating_mul(2))
-        .max(4);
-    let effective_cap = hard_cap.min(cpu_cap);
-
-    if requested_instance_workers > 0 {
-        return requested_instance_workers
-            .min(effective_cap)
-            .min(batch_count);
-    }
-
-    soft_target.min(effective_cap).min(batch_count)
-}
-
-pub(crate) fn adaptive_tune_estimated_total_ms(tune: &AdaptiveTuneEntry) -> Option<f64> {
-    let items_fetched = if tune.items_fetched > 0 {
-        tune.items_fetched
-    } else {
-        tune.batch_size
-            .saturating_mul(tune.request_count.max(1))
-            .min(tune.instance_count.max(1))
-    };
-    let wave_ms = tune.wave_ms?;
-    if items_fetched == 0 || wave_ms <= 0.0 || tune.instance_count == 0 {
-        return None;
-    }
-    let instances_per_ms = items_fetched as f64 / wave_ms;
-    if instances_per_ms <= 0.0 {
-        return None;
-    }
-    Some(tune.instance_count as f64 / instances_per_ms)
-}
-
-fn adaptive_tune_is_better(
-    candidate: &AdaptiveTuneEntry,
-    current: &AdaptiveTuneEntry,
-    performance_mode: PerformanceMode,
-) -> bool {
-    let candidate_safe = adaptive_tune_is_safe(candidate, performance_mode);
-    let current_safe = adaptive_tune_is_safe(current, performance_mode);
-    if candidate_safe != current_safe {
-        return candidate_safe;
-    }
-
-    match (
-        adaptive_tune_estimated_total_ms(candidate),
-        adaptive_tune_estimated_total_ms(current),
-    ) {
-        (Some(candidate_total_ms), Some(current_total_ms)) => {
-            if (candidate_total_ms - current_total_ms).abs() > f64::EPSILON {
-                return candidate_total_ms < current_total_ms;
-            }
-        }
-        (Some(_), None) => return true,
-        (None, Some(_)) => return false,
-        (None, None) => {}
-    }
-
-    match (candidate.wave_ms, current.wave_ms) {
-        (Some(candidate_wave_ms), Some(current_wave_ms)) => {
-            if (candidate_wave_ms - current_wave_ms).abs() > f64::EPSILON {
-                return candidate_wave_ms < current_wave_ms;
-            }
-        }
-        (Some(_), None) => return true,
-        (None, Some(_)) => return false,
-        (None, None) => {}
-    }
-
-    if candidate.request_count != current.request_count {
-        return candidate.request_count > current.request_count;
-    }
-
-    candidate.batch_size < current.batch_size
-}
-
-fn adaptive_tune_is_safe(tune: &AdaptiveTuneEntry, performance_mode: PerformanceMode) -> bool {
-    let (max_frame_ms, max_stall_count) = match performance_mode {
-        PerformanceMode::Throughput => (100.0, 1),
-        PerformanceMode::Balanced => (50.0, 0),
-        PerformanceMode::Smooth => (33.0, 0),
-    };
-    tune.frame_ms
-        .is_some_and(|value| value < SAFE_CACHED_TUNE_FRAME_MS)
-        && tune.max_frame_ms.unwrap_or(SAFE_CACHED_TUNE_FRAME_MS - 0.1) < max_frame_ms
-        && tune.stall_count_over_50_ms <= max_stall_count
-}
-
-#[derive(Clone, Copy)]
-struct AdaptiveFetchConfig<'a> {
-    service: &'a str,
-    instance_count: usize,
-    requested_workers: usize,
-    requested_batch: usize,
-    performance_mode: PerformanceMode,
-    cached_tune: Option<&'a AdaptiveTuneEntry>,
-    bridge_concurrency: usize,
-}
-
-struct AdaptiveSeed {
-    manual_batch: bool,
-    bridge_concurrency: usize,
-    min_batch_size: usize,
-    batch_size: usize,
-    workers: usize,
-    reason: &'static str,
-    trusted_cache: bool,
-}
-
-fn adaptive_default_workers(config: AdaptiveFetchConfig<'_>) -> usize {
-    let mut workers = auto_instance_worker_target(config.instance_count, config.bridge_concurrency);
-    if config.requested_workers == 0 {
-        workers = workers.max(
-            config
-                .performance_mode
-                .large_service_worker_floor(config.instance_count, config.bridge_concurrency),
-        );
-    }
-    workers
-}
-
-fn adaptive_cached_seed_is_trusted(
-    config: AdaptiveFetchConfig<'_>,
-    min_batch_size: usize,
-    now_unix: i64,
-) -> bool {
-    config.requested_batch == 0
-        && config.cached_tune.is_some_and(|tune| {
-            tune.batch_size > 0
-                && tune.batch_size >= min_batch_size
-                && adaptive_tune_is_safe(tune, config.performance_mode)
-                && now_unix.saturating_sub(tune.updated_at_unix) <= STALE_CACHED_TUNE_MAX_AGE_SECS
-        })
-}
-
-fn log_adaptive_seed(config: AdaptiveFetchConfig<'_>, seed: &AdaptiveSeed) {
-    if !verbose_timing_logs() {
-        return;
-    }
-    let default_batch_size = instance_batch_defaults(config.instance_count).adaptive;
-    let cached_batch_size = config
-        .cached_tune
-        .map(|tune| tune.batch_size)
-        .filter(|value| *value > 0);
-    let cached_or_default_batch_size = cached_batch_size.unwrap_or(default_batch_size);
-    let cached_workers = config
-        .cached_tune
-        .map(|tune| tune.workers)
-        .filter(|value| *value > 0);
-    if seed.batch_size < cached_or_default_batch_size {
-        println!(
-            "[renium] {}: clamped adaptive seed batch from {} to {} using {} bridge channels",
-            config.service, cached_or_default_batch_size, seed.batch_size, seed.bridge_concurrency
-        );
-    } else if seed.batch_size > cached_or_default_batch_size {
-        println!(
-            "[renium] {}: raised adaptive seed batch from {} to {} using {} bridge channels",
-            config.service, cached_or_default_batch_size, seed.batch_size, seed.bridge_concurrency
-        );
-    }
-    let source = if seed.manual_batch {
-        "manual-batch"
-    } else if config.requested_workers > 0 {
-        "manual"
-    } else if config.cached_tune.is_some() {
-        "cached"
-    } else {
-        "default"
-    };
-    println!(
-        "[renium] {}: adaptive seed source={} cached_batch={} cached_workers={} default_batch={} auto_workers={} final_batch={} final_workers={} min_batch_floor={} reason={} lag_frame_ms={:.1}",
-        config.service,
-        source,
-        cached_batch_size.map_or_else(|| "n/a".to_string(), |value| value.to_string()),
-        cached_workers.map_or_else(|| "n/a".to_string(), |value| value.to_string()),
-        default_batch_size,
-        adaptive_default_workers(config),
-        seed.batch_size,
-        seed.workers,
-        seed.min_batch_size,
-        seed.reason,
-        ADAPTIVE_LAG_FRAME_MS
-    );
-    if let Some(tune) = config.cached_tune {
-        println!(
-            "[renium] {}: cached adaptive tune frame_ms={} max_frame_ms={} stalls50={} age_s={} trusted={}",
-            config.service,
-            format_frame_ms(tune.frame_ms),
-            format_frame_ms(tune.max_frame_ms),
-            tune.stall_count_over_50_ms,
-            current_unix_ts()
-                .saturating_sub(tune.updated_at_unix)
-                .to_string(),
-            seed.trusted_cache
-        );
-    }
-}
-
-fn adaptive_fetch_seed(config: AdaptiveFetchConfig<'_>) -> AdaptiveSeed {
-    let AdaptiveFetchConfig {
-        instance_count,
-        requested_workers,
-        requested_batch,
-        performance_mode,
-        cached_tune,
-        bridge_concurrency,
-        ..
-    } = config;
-    let now_unix = current_unix_ts();
-    let manual_batch = requested_batch > 0;
-    let default_batch_size = instance_batch_defaults(instance_count).adaptive;
-    let cached_batch_size = cached_tune
-        .map(|tune| tune.batch_size)
-        .filter(|value| *value > 0);
-    let cached_or_default_batch_size = cached_batch_size.unwrap_or(default_batch_size);
-    let min_batch_size =
-        performance_mode.min_large_service_batch_size(instance_count, bridge_concurrency);
-    let default_workers = adaptive_default_workers(config);
-    let cached_workers = cached_tune
-        .map(|tune| tune.workers)
-        .filter(|value| *value > 0);
-    let workers = if requested_workers > 0 {
-        requested_workers
-    } else if let Some(workers) = cached_workers {
-        workers.max(default_workers)
-    } else {
-        default_workers
-    }
-    .min(bridge_concurrency);
-    let mut batch_size = if manual_batch {
-        requested_batch
-    } else {
-        cached_or_default_batch_size
-    }
-    .min(instance_count.max(1));
-    let trust_cached_seed = adaptive_cached_seed_is_trusted(config, min_batch_size, now_unix);
-    let mut seed_reason = if manual_batch {
-        "manual seed override"
-    } else if requested_workers > 0 {
-        "manual workers"
-    } else if cached_tune.is_some() {
-        "cached tune"
-    } else {
-        "default sizing"
-    };
-    if !manual_batch
-        && instance_count >= LARGE_SERVICE_SINGLE_WAVE_MIN_INSTANCES
-        && !trust_cached_seed
-    {
-        let max_total_chunks = bridge_concurrency
-            .saturating_mul(INITIAL_SEED_CHUNKS_PER_BRIDGE_MAX)
-            .min(16);
-        let min_total_chunks = bridge_concurrency
-            .saturating_mul(INITIAL_SEED_CHUNKS_PER_BRIDGE_MIN)
-            .min(12);
-        let min_seed_batch = instance_count.div_ceil(max_total_chunks);
-        let max_seed_batch = instance_count.div_ceil(min_total_chunks);
-        batch_size = batch_size.clamp(min_seed_batch, max_seed_batch);
-        if batch_size != cached_or_default_batch_size {
-            seed_reason = "bridge seed window";
-        }
-    } else if trust_cached_seed {
-        seed_reason = "healthy cached tune";
-    }
-    if min_batch_size > 0 && batch_size < min_batch_size {
-        batch_size = min_batch_size;
-        seed_reason = match performance_mode {
-            PerformanceMode::Throughput => "throughput floor",
-            PerformanceMode::Balanced => "balanced floor",
-            PerformanceMode::Smooth => seed_reason,
-        };
-    }
-    let seed = AdaptiveSeed {
-        manual_batch,
-        bridge_concurrency,
-        min_batch_size,
-        batch_size,
-        workers,
-        reason: seed_reason,
-        trusted_cache: trust_cached_seed,
-    };
-    log_adaptive_seed(config, &seed);
-    seed
-}
-
-struct AdaptiveWavePlan {
-    remaining: usize,
-    logical_batch_size: usize,
-    batch_size: usize,
-    workers: usize,
-    ranges: Vec<(usize, usize, usize)>,
-}
-
-fn plan_adaptive_wave(
-    config: AdaptiveFetchConfig<'_>,
-    seed: &AdaptiveSeed,
-    total_hint: usize,
-    next_start: &mut usize,
-    batch_size: usize,
-    worker_target: usize,
-) -> AdaptiveWavePlan {
-    let remaining = total_hint - *next_start + 1;
-    let enforce_full_channel_use = !seed.manual_batch
-        && config.requested_workers == 0
-        && config.instance_count >= LARGE_SERVICE_SINGLE_WAVE_MIN_INSTANCES
-        && remaining >= seed.bridge_concurrency;
-    let mut wave_batch_size = batch_size.min(remaining);
-    if enforce_full_channel_use {
-        let target_ranges = remaining.min(seed.bridge_concurrency);
-        wave_batch_size = wave_batch_size.min(remaining.div_ceil(target_ranges));
-    }
-    let logical_batch_size = wave_batch_size;
-    let max_wave_workers = remaining.div_ceil(wave_batch_size);
-    let mut workers = worker_target.min(max_wave_workers);
-    if enforce_full_channel_use {
-        workers = workers.max(seed.bridge_concurrency.min(max_wave_workers));
-    }
-    let dynamic_ranges = config.instance_count >= LARGE_SERVICE_SINGLE_WAVE_MIN_INSTANCES
-        && workers > 1
-        && remaining > wave_batch_size;
-    let mut item_budget = remaining.min(wave_batch_size.saturating_mul(workers));
-    if remaining > item_budget {
-        let leftover = remaining - item_budget;
-        let fold_tail_threshold = (wave_batch_size / 2).max(256).min(wave_batch_size);
-        if leftover <= fold_tail_threshold {
-            item_budget = remaining;
-        }
-    }
-    if dynamic_ranges {
-        let target_ranges = workers
-            .saturating_mul(DYNAMIC_RANGES_PER_WORKER)
-            .clamp(workers, item_budget);
-        wave_batch_size = item_budget
-            .div_ceil(target_ranges)
-            .max(DYNAMIC_RANGE_MIN_INSTANCES.min(item_budget));
-    }
-    let range_count = item_budget.div_ceil(wave_batch_size);
-    workers = workers.min(range_count);
-    let mut ranges = Vec::with_capacity(range_count);
-    let mut scheduled_items = 0;
-    while scheduled_items < item_budget && *next_start <= total_hint {
-        let remaining_budget = item_budget - scheduled_items;
-        let take = (total_hint - *next_start + 1)
-            .min(wave_batch_size)
-            .min(remaining_budget);
-        ranges.push((ranges.len(), *next_start, take));
-        *next_start += take;
-        scheduled_items += take;
-    }
-    AdaptiveWavePlan {
-        remaining,
-        logical_batch_size,
-        batch_size: wave_batch_size,
-        workers,
-        ranges,
-    }
-}
-
-struct AdaptiveWaveMetrics {
-    bytes: usize,
-    requests: usize,
-    avg_request_ms: f64,
-    max_request_ms: f64,
-    avg_request_bytes: f64,
-    max_request_bytes: usize,
-    chunks: ChunkFetchMetrics,
-    expand_ms: f64,
-    items_fetched: usize,
-}
-
-fn merge_adaptive_wave(
-    fetched: Vec<(usize, InstanceBatchFetch)>,
-    total_hint: &mut usize,
-    instances: &mut Vec<SnapshotInstance>,
-) -> AdaptiveWaveMetrics {
-    debug_assert!(
-        fetched.windows(2).all(|items| items[0].0 <= items[1].0),
-        "parallel adaptive instance batches must preserve range order"
-    );
-    let bytes = fetched.iter().map(|(_, batch)| batch.metrics.bytes).sum();
-    let requests = fetched.len();
-    let total_request_ms = fetched
-        .iter()
-        .map(|(_, batch)| batch.request_ms)
-        .sum::<f64>();
-    let max_request_ms = fetched
-        .iter()
-        .map(|(_, batch)| batch.request_ms)
-        .fold(0.0, f64::max);
-    let avg_request_ms = if requests > 0 {
-        total_request_ms / requests as f64
-    } else {
-        0.0
-    };
-    let max_request_bytes = fetched
-        .iter()
-        .map(|(_, batch)| batch.metrics.bytes)
-        .max()
-        .unwrap_or(0);
-    let avg_request_bytes = if requests > 0 {
-        bytes as f64 / requests as f64
-    } else {
-        0.0
-    };
-    let mut chunks = ChunkFetchMetrics::default();
-    let mut expand_ms = 0.0;
-    let mut items_fetched = 0usize;
-    for (_, batch) in fetched {
-        *total_hint = (*total_hint).max(batch.total_hint);
-        merge_chunk_fetch_metrics(&mut chunks, batch.metrics);
-        expand_ms += batch.compact_expand_ms;
-        let mut items = batch.items;
-        items_fetched = items_fetched.saturating_add(items.len());
-        instances.append(&mut items);
-    }
-    AdaptiveWaveMetrics {
-        bytes,
-        requests,
-        avg_request_ms,
-        max_request_ms,
-        avg_request_bytes,
-        max_request_bytes,
-        chunks,
-        expand_ms,
-        items_fetched,
-    }
-}
-
-impl AdaptiveWaveMetrics {
-    fn log(
-        &self,
-        config: AdaptiveFetchConfig<'_>,
-        wave_index: usize,
-        progress: (usize, usize),
-        plan: &AdaptiveWavePlan,
-        wave_ms: f64,
-        perf_stats: Option<&BridgePerformanceStats>,
-    ) {
-        let service = config.service;
-        if verbose_timing_logs() {
-            let frame_ms = perf_stats.and_then(|stats| stats.frame_ms);
-            println!(
-                "[renium] {service}: adaptive wave {} -> instances {}/{} (batch={}, workers={}, wave_ms={:.0}, bytes={:.1}MB, frame_ms={})",
-                wave_index,
-                progress.0,
-                progress.1,
-                plan.batch_size,
-                plan.workers,
-                wave_ms,
-                self.bytes as f64 / (1024.0 * 1024.0),
-                format_frame_ms(frame_ms)
-            );
-            println!(
-                "[renium] {service}: adaptive wave {} perf stats -> last_frame_ms={}, max_frame_ms={}, stalls33={}, stalls50={}, stalls100={}",
-                wave_index,
-                format_frame_ms(perf_stats.and_then(|stats| stats.last_frame_ms)),
-                format_frame_ms(perf_stats.and_then(|stats| stats.max_frame_ms)),
-                format_stall_count(perf_stats.and_then(|stats| stats.stall_count_over_33_ms)),
-                format_stall_count(perf_stats.and_then(|stats| stats.stall_count_over_50_ms)),
-                format_stall_count(perf_stats.and_then(|stats| stats.stall_count_over_100_ms))
-            );
-            println!(
-                "[renium] {service}: adaptive wave {} export metrics -> modified_checks={}, modified_elided={}, modified_validation_reads={}, modified_denylist={}, properties_read={}, properties_encoded={}, properties_default_skipped={}, pcall_class_fallbacks={}, pcall_property_fallbacks={}",
-                wave_index,
-                perf_stats
-                    .and_then(|stats| stats.modified_default_checks)
-                    .unwrap_or(0),
-                perf_stats
-                    .and_then(|stats| stats.modified_default_elided)
-                    .unwrap_or(0),
-                perf_stats
-                    .and_then(|stats| stats.modified_default_validation_reads)
-                    .unwrap_or(0),
-                perf_stats
-                    .and_then(|stats| stats.modified_default_runtime_denylist_count)
-                    .unwrap_or(0),
-                perf_stats
-                    .and_then(|stats| stats.properties_read)
-                    .unwrap_or(0),
-                perf_stats
-                    .and_then(|stats| stats.properties_encoded)
-                    .unwrap_or(0),
-                perf_stats
-                    .and_then(|stats| stats.properties_default_skipped)
-                    .unwrap_or(0),
-                perf_stats
-                    .and_then(|stats| stats.safe_read_class_fallback_count)
-                    .unwrap_or(0),
-                perf_stats
-                    .and_then(|stats| stats.safe_read_property_fallback_count)
-                    .unwrap_or(0),
-            );
-            println!(
-                "[renium] {service}: adaptive wave {} request stats -> requests={}, avg_req_ms={:.1}, max_req_ms={:.1}, avg_req_mb={:.1}, max_req_mb={:.1}",
-                wave_index,
-                self.requests,
-                self.avg_request_ms,
-                self.max_request_ms,
-                self.avg_request_bytes / (1024.0 * 1024.0),
-                self.max_request_bytes as f64 / (1024.0 * 1024.0)
-            );
-        }
-        log_chunk_fetch_metrics(
-            &format!("{service}: adaptive wave {wave_index} payloads"),
-            self.chunks,
-        );
-        log_timing_ms(
-            &format!("{service}: adaptive wave {wave_index} compact expansion"),
-            self.expand_ms,
-        );
-    }
-}
-
-fn log_adaptive_batch_reduction(
-    service: &str,
-    wave_index: usize,
-    underused_bridge: bool,
-    imbalanced_requests: bool,
-    slow_requests: bool,
-) {
-    if verbose_timing_logs() {
-        println!(
-            "[renium] {service}: adaptive wave {} reducing next batch due to{}{}{}",
-            wave_index,
-            if underused_bridge {
-                " underused bridge"
-            } else {
-                ""
-            },
-            if imbalanced_requests {
-                " oversized request skew"
-            } else {
-                ""
-            },
-            if slow_requests {
-                " slow max request"
-            } else {
-                ""
-            }
-        );
-    }
-}
-
-struct InstanceBatchContext<'a> {
-    bridge: &'a BridgeServer,
-    service: &'a str,
-    chunk_size: usize,
-    instance_count: usize,
-    property_schema_by_class: &'a PropertySchemaMap,
-    enum_value_names_by_type: &'a EnumValueNameMap,
-    class_names: &'a [String],
-}
-
-impl InstanceBatchContext<'_> {
-    fn fetch_fixed(
-        &self,
-        instance_batch_size: usize,
-        instance_worker_count: usize,
-    ) -> Result<Vec<SnapshotInstance>> {
-        let service = self.service;
-        let instance_count = self.instance_count;
-        let mut ranges: Vec<(usize, usize, usize)> = Vec::new();
-        let mut range_index = 0usize;
-        let mut start = 1usize;
-        while start <= instance_count {
-            let take = (instance_count - start + 1).min(instance_batch_size);
-            ranges.push((range_index, start, take));
-            range_index += 1;
-            start += take;
-        }
-
-        let mut instances: Vec<SnapshotInstance> = Vec::with_capacity(instance_count);
-        if ranges.is_empty() {
-            if verbose_timing_logs() {
-                println!("[renium] {service}: instances 0/0");
-            }
-            return Ok(instances);
-        }
-
-        let mut total_hint = instance_count;
-        let mut chunk_metrics = ChunkFetchMetrics::default();
-        let mut compact_expand_ms = 0.0;
-        if instance_worker_count <= 1 || ranges.len() <= 1 {
-            for (range_idx, start_index, take_count) in ranges {
-                let batch = self.fetch(start_index, take_count)?;
-                total_hint = total_hint.max(batch.total_hint);
-                compact_expand_ms += batch.compact_expand_ms;
-                merge_chunk_fetch_metrics(&mut chunk_metrics, batch.metrics);
-                let mut items = batch.items;
-                instances.append(&mut items);
-
-                if (range_idx + 1) % 4 == 0
-                    && range_idx + 1 < total_hint.div_ceil(instance_batch_size)
-                    && verbose_timing_logs()
-                {
-                    println!(
-                        "[renium] {service}: instances {}/{}",
-                        instances.len(),
-                        total_hint
-                    );
-                }
-            }
-        } else {
-            let total_ranges = ranges.len();
-            let progress_batches = std::sync::atomic::AtomicUsize::new(0);
-            let progress_instances = std::sync::atomic::AtomicUsize::new(0);
-            let progress_stride = (total_ranges / 12).max(1);
-
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(instance_worker_count)
-                .build()
-                .context("Failed to create instance batch worker pool")?;
-            let fetched = pool.install(|| {
-            ranges
-                .par_iter()
-                .map(
-                    |(range_index, start_index, take_count)| -> Result<(usize, InstanceBatchFetch)> {
-                        let batch = self.fetch(*start_index, *take_count)?;
-
-                        let done_batches =
-                            progress_batches.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                        let done_instances = progress_instances
-                            .fetch_add(batch.items.len(), std::sync::atomic::Ordering::Relaxed)
-                            + batch.items.len();
-                        if verbose_timing_logs()
-                            && (done_batches.is_multiple_of(progress_stride) || done_batches == total_ranges)
-                        {
-                            println!(
-                                "[renium] {service}: instances {}/{} (batches {}/{})",
-                                done_instances,
-                                batch.total_hint.max(instance_count),
-                                done_batches,
-                                total_ranges
-                            );
-                        }
-
-                        Ok((*range_index, batch))
-                    },
-                )
-                .collect::<Result<Vec<_>>>()
-        })?;
-
-            debug_assert!(
-                fetched.windows(2).all(|items| items[0].0 <= items[1].0),
-                "parallel fixed instance batches must preserve range order"
-            );
-            for (_, batch) in fetched {
-                total_hint = total_hint.max(batch.total_hint);
-                compact_expand_ms += batch.compact_expand_ms;
-                merge_chunk_fetch_metrics(&mut chunk_metrics, batch.metrics);
-                let mut items = batch.items;
-                instances.append(&mut items);
-            }
-        }
-
-        if verbose_timing_logs() {
-            println!(
-                "[renium] {service}: instances {}/{}",
-                instances.len(),
-                total_hint
-            );
-        }
-        log_chunk_fetch_metrics(&format!("{service}: instance payloads"), chunk_metrics);
-        log_timing_ms(
-            &format!("{service}: compact instance expansion"),
-            compact_expand_ms,
-        );
-
-        Ok(instances)
-    }
-}
-
-impl InstanceBatchContext<'_> {
-    fn fetch_adaptive_wave(
-        &self,
-        ranges: &[(usize, usize, usize)],
-        workers: usize,
-        pool: Option<&rayon::ThreadPool>,
-    ) -> Result<Vec<(usize, InstanceBatchFetch)>> {
-        if ranges.len() <= 1 || workers <= 1 {
-            return ranges
-                .iter()
-                .map(|(range_index, start_index, take_count)| {
-                    Ok((*range_index, self.fetch(*start_index, *take_count)?))
-                })
-                .collect();
-        }
-        let pool = pool.context("Adaptive instance batch worker pool was not initialized")?;
-        pool.install(|| {
-            ranges
-                .par_iter()
-                .map(|(range_index, start_index, take_count)| {
-                    Ok((*range_index, self.fetch(*start_index, *take_count)?))
-                })
-                .collect()
-        })
-    }
-
-    fn fetch_adaptive(
-        &self,
-        requested_instance_workers: usize,
-        adaptive_seed_batch: usize,
-        performance_mode: PerformanceMode,
-        cached_tune: Option<&AdaptiveTuneEntry>,
-    ) -> Result<InstanceFetchResult> {
-        let bridge = self.bridge;
-        let service = self.service;
-        let instance_count = self.instance_count;
-        if instance_count == 0 {
-            if verbose_timing_logs() {
-                println!("[renium] {service}: instances 0/0");
-            }
-            return Ok(InstanceFetchResult {
-                instances: Vec::new(),
-                tune: None,
-            });
-        }
-
-        let fetch_config = AdaptiveFetchConfig {
-            service,
-            instance_count,
-            requested_workers: requested_instance_workers,
-            requested_batch: adaptive_seed_batch,
-            performance_mode,
-            cached_tune,
-            bridge_concurrency: bridge.channel_count().max(1),
-        };
-        let seed = adaptive_fetch_seed(fetch_config);
-        let manual_seed_batch = seed.manual_batch;
-        let bridge_concurrency = seed.bridge_concurrency;
-        let min_large_service_batch_size = seed.min_batch_size;
-        let mut batch_size = seed.batch_size;
-        let mut worker_target = seed.workers;
-        let mut next_start = 1usize;
-        let mut total_hint = instance_count;
-        let mut wave_index = 0usize;
-        let mut instances = Vec::with_capacity(instance_count);
-        let mut last_perf_stats: Option<BridgePerformanceStats> = None;
-        let mut best_measured_tune: Option<AdaptiveTuneEntry> = None;
-        let skip_tune_cache = manual_seed_batch || requested_instance_workers > 0;
-        let collect_wave_perf_stats = performance_mode != PerformanceMode::Throughput;
-        let adaptive_pool = if bridge_concurrency > 1 {
-            Some(
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(bridge_concurrency)
-                    .build()
-                    .context("Failed to create adaptive instance batch worker pool")?,
-            )
-        } else {
-            None
-        };
-
-        while next_start <= total_hint {
-            let plan = plan_adaptive_wave(
-                fetch_config,
-                &seed,
-                total_hint,
-                &mut next_start,
-                batch_size,
-                worker_target,
-            );
-            if collect_wave_perf_stats {
-                let _ = read_bridge_performance_stats(bridge);
-            }
-            let wave_started = Instant::now();
-            let fetched =
-                self.fetch_adaptive_wave(&plan.ranges, plan.workers, adaptive_pool.as_ref())?;
-
-            let wave_metrics = merge_adaptive_wave(fetched, &mut total_hint, &mut instances);
-
-            wave_index += 1;
-            let wave_ms = wave_started.elapsed().as_secs_f64() * 1000.0;
-            let perf_stats = if collect_wave_perf_stats {
-                read_bridge_performance_stats(bridge)
-            } else {
-                None
-            };
-            let frame_ms = perf_stats.as_ref().and_then(|stats| stats.frame_ms);
-            let max_frame_ms = perf_stats.as_ref().and_then(|stats| stats.max_frame_ms);
-            let stall_count_over_50_ms = perf_stats
-                .as_ref()
-                .and_then(|stats| stats.stall_count_over_50_ms);
-            let lagging = perf_stats.as_ref().is_some_and(|stats| {
-                stats
-                    .max_frame_ms
-                    .or(stats.frame_ms)
-                    .is_some_and(|ms| ms >= ADAPTIVE_LAG_FRAME_MS)
-                    || stats.stall_count_over_50_ms.unwrap_or(0) > 0
-            });
-            wave_metrics.log(
-                fetch_config,
-                wave_index,
-                (instances.len(), total_hint),
-                &plan,
-                wave_ms,
-                perf_stats.as_ref(),
-            );
-            let measured_tune = AdaptiveTuneEntry {
-                batch_size: plan.logical_batch_size,
-                workers: plan.workers,
-                instance_count: total_hint,
-                frame_ms,
-                max_frame_ms,
-                wave_ms: Some(wave_ms),
-                payload_bytes: wave_metrics.chunks.bytes,
-                request_count: wave_metrics.requests,
-                items_fetched: wave_metrics.items_fetched,
-                stall_count_over_50_ms: stall_count_over_50_ms.unwrap_or(0),
-                updated_at_unix: current_unix_ts(),
-            };
-            if best_measured_tune.as_ref().is_none_or(|current| {
-                adaptive_tune_is_better(&measured_tune, current, performance_mode)
-            }) {
-                best_measured_tune = Some(measured_tune);
-            }
-
-            let underused_bridge = !manual_seed_batch
-                && requested_instance_workers == 0
-                && instance_count >= LARGE_SERVICE_SINGLE_WAVE_MIN_INSTANCES
-                && wave_metrics.requests < bridge_concurrency
-                && plan.remaining >= bridge_concurrency;
-            let imbalanced_requests = wave_metrics.requests > 1
-                && wave_metrics.max_request_bytes as f64 > wave_metrics.avg_request_bytes * 1.35;
-            let slow_requests = !lagging && wave_metrics.max_request_ms >= 1000.0;
-            if lagging {
-                batch_size = plan.batch_size.saturating_mul(3).div_ceil(4);
-                worker_target = worker_target.saturating_mul(3).div_ceil(4);
-            } else if underused_bridge || imbalanced_requests || slow_requests {
-                batch_size = plan.batch_size.saturating_mul(3).div_ceil(4);
-                if requested_instance_workers == 0 {
-                    worker_target = worker_target.max(bridge_concurrency);
-                }
-                log_adaptive_batch_reduction(
-                    service,
-                    wave_index,
-                    underused_bridge,
-                    imbalanced_requests,
-                    slow_requests,
-                );
-            } else {
-                let batch_step = (plan.batch_size / ADAPTIVE_BATCH_GROWTH_DIVISOR).max(1);
-                batch_size = plan.batch_size.saturating_add(batch_step).min(total_hint);
-                if wave_index.is_multiple_of(ADAPTIVE_WORKER_GROWTH_WAVE_INTERVAL) {
-                    worker_target = worker_target.saturating_add(1);
-                }
-            }
-            if min_large_service_batch_size > 0 {
-                batch_size = batch_size.max(min_large_service_batch_size);
-            }
-            worker_target = worker_target.min(bridge_concurrency);
-            last_perf_stats = perf_stats;
-        }
-
-        if verbose_timing_logs() {
-            println!(
-                "[renium] {service}: instances {}/{}",
-                instances.len(),
-                total_hint
-            );
-        }
-        Ok(InstanceFetchResult {
-            instances,
-            tune: if skip_tune_cache {
-                None
-            } else {
-                best_measured_tune.map(|mut tune| {
-                    tune.instance_count = total_hint;
-                    if let Some(perf_stats) = last_perf_stats.as_ref() {
-                        tune.frame_ms = perf_stats.frame_ms.or(tune.frame_ms);
-                        tune.max_frame_ms = perf_stats.max_frame_ms.or(tune.max_frame_ms);
-                        tune.stall_count_over_50_ms = perf_stats
-                            .stall_count_over_50_ms
-                            .unwrap_or(tune.stall_count_over_50_ms);
-                    }
-                    tune.updated_at_unix = current_unix_ts();
-                    tune
-                })
-            },
-        })
-    }
-}
-
-impl InstanceBatchContext<'_> {
-    fn fetch(&self, start_index: usize, take_count: usize) -> Result<InstanceBatchFetch> {
-        let mut fetch = self.fetch_once(start_index, take_count)?;
-        loop {
-            let fetched = fetch.items.len();
-            if fetched == 0 || fetched >= take_count {
-                break;
-            }
-            let next_start = start_index + fetched;
-            let range_end = (start_index + take_count - 1).min(fetch.total_hint);
-            if next_start > range_end {
-                break;
-            }
-            let remainder = self.fetch_once(next_start, range_end - next_start + 1)?;
-            if remainder.items.is_empty() {
-                break;
-            }
-            fetch.total_hint = fetch.total_hint.max(remainder.total_hint);
-            merge_chunk_fetch_metrics(&mut fetch.metrics, remainder.metrics);
-            fetch.compact_expand_ms += remainder.compact_expand_ms;
-            fetch.request_ms += remainder.request_ms;
-            let mut items = remainder.items;
-            fetch.items.append(&mut items);
-        }
-        Ok(fetch)
-    }
-}
-
-impl InstanceBatchContext<'_> {
-    fn fetch_once(&self, start_index: usize, take_count: usize) -> Result<InstanceBatchFetch> {
-        let bridge = self.bridge;
-        let service = self.service;
-        let started = Instant::now();
-        let (mut batch, metrics) = fetch_typed_payload_with_size::<CompactBatchPayload, _>(
-            self.chunk_size,
-            |chunk_start, max_len| {
-                bridge.call_chunk(
-                    "getInstanceBatchCompactChunk",
-                    json!({
-                        "service": service,
-                        "startIndex": start_index,
-                        "maxCount": take_count,
-                        "chunkStart": chunk_start,
-                        "maxLen": max_len,
-                    }),
-                )
-            },
-        )?;
-
-        let shape_batch = batch.format == "compact-v5-shape";
-        let item_count = batch.items.len();
-        let debug_ids =
-            decode_compact_batch_debug_ids(std::mem::take(&mut batch.debug_ids), &batch.strings)
-                .with_context(|| {
-                    format!("Invalid compact debug id batch item schema for {service}")
-                })?;
-        let settings_ids = decode_batch_settings_ids(
-            std::mem::take(&mut batch.settings_ids),
-            item_count,
-            "Compact settings id",
-        )
-        .with_context(|| format!("Invalid compact settings ids for {service}"))?;
-        let raw_items = Value::Array(batch.items);
-        if !shape_batch && batch.format != BRIDGE_PROTOCOL_VERSION {
-            bail!(
-                "Invalid instance batch format {} for {service}",
-                batch.format
-            );
-        }
-        if !is_supported_bridge_codec(&batch.codec_version) {
-            bail!(
-                "Invalid {} codec {} for {} (expected {} or {})",
-                batch.format,
-                if batch.codec_version.is_empty() {
-                    "missing"
-                } else {
-                    batch.codec_version.as_str()
-                },
-                service,
-                BRIDGE_CODEC_VERSION,
-                BRIDGE_CODEC_VERSION_SCHEMA8
-            );
-        }
-        let compact_expand_started = Instant::now();
-        let mut out = if shape_batch {
-            parse_compact_v5_shape_instance_items(
-                raw_items,
-                &batch.strings,
-                batch.shapes,
-                start_index,
-                self.property_schema_by_class,
-                self.enum_value_names_by_type,
-                self.class_names,
-            )
-            .with_context(|| {
-                format!("Invalid compact-v5 shape instance batch item schema for {service}")
-            })?
-        } else {
-            parse_compact_v5_instance_items(
-                raw_items,
-                &batch.strings,
-                start_index,
-                self.property_schema_by_class,
-                self.enum_value_names_by_type,
-                self.class_names,
-            )
-            .with_context(|| {
-                format!("Invalid compact-v5 instance batch item schema for {service}")
-            })?
-        };
-        apply_compact_batch_debug_ids(&mut out, debug_ids);
-        apply_batch_settings_ids(&mut out, settings_ids)?;
-
-        let total_hint = batch.total.max(self.instance_count);
-
-        Ok(InstanceBatchFetch {
-            total_hint,
-            metrics,
-            compact_expand_ms: elapsed_ms(compact_expand_started),
-            request_ms: elapsed_ms(started),
-            items: out,
-        })
-    }
-}
-
-fn read_bridge_performance_stats(bridge: &BridgeServer) -> Option<BridgePerformanceStats> {
-    bridge
-        .call("getPerformanceStats", json!({}))
-        .ok()
-        .and_then(|value| serde_json::from_value(value).ok())
-}
-
-fn format_frame_ms(frame_ms: Option<f64>) -> String {
-    frame_ms.map_or_else(|| "n/a".to_string(), |value| format!("{value:.1}"))
-}
-
-fn format_stall_count(stall_count: Option<u64>) -> String {
-    stall_count.map_or_else(|| "n/a".to_string(), |value| value.to_string())
 }
 
 pub(crate) fn merge_chunk_fetch_metrics(
@@ -4762,58 +3051,46 @@ mod publication_tests {
     }
 
     #[test]
-    fn export_publication_direct_and_staged_workers_write_only_to_stage() {
+    fn export_publication_import_workers_write_only_to_stage() {
         let mut fixture = Fixture::new();
         drop(fixture.stage.take());
-        for mode in ["direct", "staged"] {
-            let args = ExportSnapshotsArgs::try_parse_from([
-                "export-snapshots",
-                "--import-mode",
-                mode,
-                "--import-workers",
-                "1",
-            ])
-            .unwrap();
-            let mut setup = prepare_export_execution(
-                &args,
-                &fixture.root,
-                &["ReplicatedStorage".into()],
-                &BridgeInfoPayload::default(),
-                PerformanceMode::Throughput,
-                false,
-                Instant::now(),
-            )
-            .unwrap();
-            let stage = setup
-                .project_stage
-                .as_ref()
-                .expect("all imports need a stage");
-            let stage_container = stage.container.clone();
-            assert!(setup.direct_import_mode);
-            assert!(setup.import_project_root.starts_with(&stage_container));
-            assert_ne!(setup.import_project_root, fixture.root);
-            fs::write(
-                setup
-                    .import_project_root
-                    .join(&setup.import_src_dir)
-                    .join("ReplicatedStorage/Mod.luau"),
-                "return 'private'\n",
-            )
-            .unwrap();
-            // Match production's worker-before-stage teardown ordering.
-            drop(setup.direct_import_dispatcher.take());
-            drop(setup.sourcemap_writer.take());
-            drop(setup);
-            assert!(!stage_container.exists());
-            assert_eq!(
-                fs::read_to_string(fixture.root.join(SOURCE)).unwrap(),
-                "return 'original'\n"
-            );
-            assert_eq!(
-                fs::read_to_string(fixture.root.join("sourcemap.json")).unwrap(),
-                ORIGINAL_MAP
-            );
-        }
+        let args = ExportSnapshotsArgs::try_parse_from(["export-snapshots"]).unwrap();
+        let mut setup = prepare_export_execution(
+            &args,
+            &fixture.root,
+            &["ReplicatedStorage".into()],
+            Instant::now(),
+        )
+        .unwrap();
+        let stage = setup
+            .project_stage
+            .as_ref()
+            .expect("all imports need a stage");
+        let stage_container = stage.container.clone();
+        let import_src_dir = stage.import_src_dir.clone();
+        assert!(setup.direct_import_dispatcher.is_some());
+        assert!(setup.import_project_root.starts_with(&stage_container));
+        assert_ne!(setup.import_project_root, fixture.root);
+        fs::write(
+            setup
+                .import_project_root
+                .join(import_src_dir)
+                .join("ReplicatedStorage/Mod.luau"),
+            "return 'private'\n",
+        )
+        .unwrap();
+        drop(setup.direct_import_dispatcher.take());
+        drop(setup.sourcemap_writer.take());
+        drop(setup);
+        assert!(!stage_container.exists());
+        assert_eq!(
+            fs::read_to_string(fixture.root.join(SOURCE)).unwrap(),
+            "return 'original'\n"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("sourcemap.json")).unwrap(),
+            ORIGINAL_MAP
+        );
     }
 
     #[test]

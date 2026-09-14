@@ -96,44 +96,6 @@ pub(crate) struct ServiceExecutionSpan {
 pub(crate) struct ServiceExportOutput {
     pub(crate) parts: ExportedSnapshotParts,
     pub(crate) span: ServiceExecutionSpan,
-    pub(crate) tune: Option<AdaptiveTuneEntry>,
-}
-
-#[derive(Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct AdaptiveTuneCache {
-    pub(crate) version: u32,
-    pub(crate) cache_key: String,
-    pub(crate) services: HashMap<String, AdaptiveTuneEntry>,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct AdaptiveTuneEntry {
-    pub(crate) batch_size: usize,
-    pub(crate) workers: usize,
-    pub(crate) instance_count: usize,
-    pub(crate) frame_ms: Option<f64>,
-    pub(crate) max_frame_ms: Option<f64>,
-    pub(crate) wave_ms: Option<f64>,
-    pub(crate) payload_bytes: usize,
-    pub(crate) request_count: usize,
-    pub(crate) items_fetched: usize,
-    pub(crate) stall_count_over_50_ms: u64,
-    pub(crate) updated_at_unix: i64,
-}
-
-pub(crate) struct InstanceFetchResult {
-    pub(crate) instances: Vec<SnapshotInstance>,
-    pub(crate) tune: Option<AdaptiveTuneEntry>,
-}
-
-pub(crate) struct InstanceBatchFetch {
-    pub(crate) total_hint: usize,
-    pub(crate) metrics: ChunkFetchMetrics,
-    pub(crate) compact_expand_ms: f64,
-    pub(crate) request_ms: f64,
-    pub(crate) items: Vec<SnapshotInstance>,
 }
 
 pub(crate) struct NativeOverlayFetch {
@@ -183,22 +145,6 @@ pub(crate) struct NativeOverlayItem {
     pub(crate) class_index: usize,
     pub(crate) properties: Map<String, Value>,
     pub(crate) attributes: Map<String, Value>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct CompactBatchPayload {
-    pub(crate) format: String,
-    pub(crate) codec_version: String,
-    pub(crate) total: usize,
-    pub(crate) strings: Vec<String>,
-    #[serde(default)]
-    pub(crate) shapes: Vec<Value>,
-    #[serde(default)]
-    pub(crate) debug_ids: Vec<Value>,
-    #[serde(default)]
-    pub(crate) settings_ids: Vec<Value>,
-    pub(crate) items: Vec<Value>,
 }
 
 #[derive(Deserialize)]

@@ -478,31 +478,6 @@
           ],
           "description": "Services included when pulling from Studio"
         },
-        "renium.sourceWorkers": {
-          "type": "number",
-          "default": 0,
-          "minimum": 0,
-          "description": "0 = auto; otherwise manual worker count"
-        },
-        "renium.instanceWorkers": {
-          "type": "number",
-          "default": 0,
-          "minimum": 0,
-          "description": "0 = auto; otherwise manual instance batch worker count"
-        },
-        "renium.importWorkers": {
-          "type": "number",
-          "default": 0,
-          "minimum": 0,
-          "description": "0 = auto; otherwise manual direct-import worker count"
-        },
-        "renium.chunkSize": {
-          "type": "number",
-          "default": 4194304,
-          "minimum": 512,
-          "maximum": 8388608,
-          "description": "Chunk size used for exporter RPC payload paging. Default is 4 MiB to reduce round trips on large service exports; maximum is 8 MiB."
-        },
         "renium.bridgeWaitSeconds": {
           "type": "number",
           "default": 8,
@@ -518,11 +493,6 @@
           "type": "boolean",
           "default": false,
           "description": "Verify pushed Lua source by reading it back from Studio after editor -> Studio sync. Slower; useful for debugging sync mismatches."
-        },
-        "renium.adaptiveThrottle": {
-          "type": "boolean",
-          "default": true,
-          "description": "Adaptive Studio FPS throttle for export RPCs."
         },
         "renium.autoSyncOnSave": {
           "type": "boolean",
@@ -605,21 +575,6 @@
           "enum": ["off", "error", "warn", "info", "debug", "trace"],
           "default": "info",
           "description": "Minimum Renium output level to show in the Output panel. Errors still surface in VS Code notifications."
-        },
-        "renium.performanceMode": {
-          "type": "string",
-          "enum": [
-            "throughput",
-            "balanced",
-            "smooth"
-          ],
-          "default": "throughput",
-          "description": "Export scheduling mode. Throughput favors wall time, balanced limits visible stalls, smooth prioritizes Studio responsiveness over speed."
-        },
-        "renium.modifiedDefaultBypass": {
-          "type": "boolean",
-          "default": false,
-          "description": "Compact-v5 fast path that adaptively uses IsPropertyModified to avoid reading defaulted properties after guarded validation. Disabled by default."
         },
         "renium.progressHeartbeatSeconds": {
           "type": "number",

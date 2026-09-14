@@ -1,8 +1,6 @@
 use anyhow::{Context, Result, bail};
-use rbx_dom_weak::Ustr as RbxUstr;
 use serde_json::{Map, Value, json};
 
-use crate::editor::paths::script_file_names;
 use crate::rbx::decode::canonicalize_nonfinite_float_json;
 use crate::roblox::schema::{
     AXIS_NAMES, EnumValueNameMap, FACE_NAMES, PropertySchemaEntry, PropertySchemaMap, TYPE_ID_AXES,
@@ -12,44 +10,9 @@ use crate::roblox::schema::{
     TYPE_ID_PHYSICAL_PROPERTIES, TYPE_ID_RAY, TYPE_ID_RECT, TYPE_ID_REF, TYPE_ID_STRING,
     TYPE_ID_UDIM, TYPE_ID_UDIM2, TYPE_ID_VECTOR2, TYPE_ID_VECTOR3,
 };
-use crate::settings::EXTERNAL_SOURCE_MARKER;
-use crate::snapshot::types::{NativeOverlayItem, SnapshotInstance};
+use crate::snapshot::types::NativeOverlayItem;
 use crate::studio::bridge::SourceBatchMap;
 use crate::studio::native::editor::decode_bridge_buffer;
-
-pub(crate) fn decode_compact_batch_debug_ids(
-    raw_debug_ids: Vec<Value>,
-    strings: &[String],
-) -> Result<Vec<Option<String>>> {
-    if raw_debug_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut out = Vec::with_capacity(raw_debug_ids.len());
-    for raw in raw_debug_ids {
-        match raw {
-            Value::Null | Value::Bool(false) => out.push(None),
-            Value::String(text) if text.is_empty() => out.push(None),
-            Value::String(text) => out.push(Some(text)),
-            Value::Number(number) => {
-                let numeric = number
-                    .as_f64()
-                    .with_context(|| format!("Compact debug id is not numeric: {number}"))?;
-                if numeric.fract() != 0.0 || numeric.abs() > 9_007_199_254_740_991.0 {
-                    bail!("Compact debug id is not an exact integer: {number}");
-                }
-                if numeric < 0.0 {
-                    let numeric_id = (-numeric - 1.0) as u64;
-                    out.push(Some(format!("0_{numeric_id}")));
-                    continue;
-                }
-                let string_id = numeric as usize;
-                out.push(Some(string_from_table(strings, string_id, "debug id")?));
-            }
-            _ => bail!("Compact debug id must be a string, string id, numeric id, or false"),
-        }
-    }
-    Ok(out)
-}
 
 pub(crate) fn decode_native_overlay_debug_ids(
     encoded: &Value,
@@ -95,20 +58,6 @@ pub(crate) fn decode_native_overlay_debug_ids(
     Ok(out)
 }
 
-pub(crate) fn apply_compact_batch_debug_ids(
-    instances: &mut [SnapshotInstance],
-    debug_ids: Vec<Option<String>>,
-) {
-    if debug_ids.is_empty() {
-        return;
-    }
-    for (instance, debug_id) in instances.iter_mut().zip(debug_ids) {
-        if let Some(debug_id) = debug_id.filter(|value| !value.is_empty()) {
-            instance.debug_id = Some(debug_id);
-        }
-    }
-}
-
 pub(crate) fn decode_batch_settings_ids(
     raw_settings_ids: Vec<Value>,
     count: usize,
@@ -141,19 +90,6 @@ pub(crate) fn decode_batch_settings_ids(
     Ok(out)
 }
 
-pub(crate) fn apply_batch_settings_ids(
-    instances: &mut [SnapshotInstance],
-    settings_ids: Vec<(usize, String)>,
-) -> Result<()> {
-    for (index, settings_id) in settings_ids {
-        let instance = instances
-            .get_mut(index)
-            .context("Settings id index is out of range")?;
-        instance.transported_settings_id = Some(settings_id);
-    }
-    Ok(())
-}
-
 fn string_from_table(strings: &[String], string_id: usize, label: &str) -> Result<String> {
     let index = string_id
         .checked_sub(1)
@@ -162,23 +98,6 @@ fn string_from_table(strings: &[String], string_id: usize, label: &str) -> Resul
         .get(index)
         .cloned()
         .with_context(|| format!("Unknown {label} string id {string_id}"))
-}
-
-fn compact_class_name_from_value(value: Value, class_names: &[String]) -> Result<RbxUstr> {
-    match value {
-        Value::String(class_name) if !class_name.is_empty() => Ok(class_name.into()),
-        Value::Number(number) => {
-            let class_id = number
-                .as_u64()
-                .with_context(|| "Compact class id must be a non-negative integer")?
-                as usize;
-            class_names
-                .get(class_id)
-                .map(|class_name| RbxUstr::from(class_name.as_str()))
-                .with_context(|| format!("Unknown compact class id {class_id}"))
-        }
-        _ => bail!("Compact class entry must be a string or class id"),
-    }
 }
 
 fn compact_class_index_from_value(value: Value, class_names: &[String]) -> Result<usize> {
@@ -203,25 +122,6 @@ fn compact_class_index_from_value(value: Value, class_names: &[String]) -> Resul
 
 fn parse_hex_instance_index(text: &str) -> Option<usize> {
     usize::from_str_radix(text, 16).ok()
-}
-
-fn compact_parent_index(value: Value) -> Result<Option<usize>> {
-    match value {
-        Value::Null | Value::Bool(false) => Ok(None),
-        Value::String(text) if text.is_empty() => Ok(None),
-        Value::String(text) => parse_hex_instance_index(&text)
-            .map(Some)
-            .with_context(|| format!("Compact parent id '{text}' is not hexadecimal")),
-        Value::Number(number) => {
-            let index = number
-                .as_u64()
-                .with_context(|| "Compact parent id must be a non-negative integer")?;
-            let index =
-                usize::try_from(index).context("Compact parent id does not fit this platform")?;
-            Ok(Some(index))
-        }
-        _ => bail!("Compact parent id must be a string or non-negative integer"),
-    }
 }
 
 fn decode_compact_v5_string(raw: Value, strings: &[String], label: &str) -> Result<String> {
@@ -704,149 +604,6 @@ fn compact_properties_mask_take_v5_with_schema(
     Ok(out)
 }
 
-struct CompactV5InstanceShape {
-    class_name: RbxUstr,
-    mask: Value,
-}
-
-fn parse_compact_v5_instance_shapes(
-    raw_shapes: Vec<Value>,
-    class_names: &[String],
-) -> Result<Vec<CompactV5InstanceShape>> {
-    let mut out = Vec::with_capacity(raw_shapes.len());
-    for (shape_offset, raw_shape) in raw_shapes.into_iter().enumerate() {
-        let mut fields = match raw_shape {
-            Value::Array(fields) => fields.into_iter(),
-            _ => bail!("Compact-v5 shape entry must be an array"),
-        };
-        let class_name =
-            compact_class_name_from_value(fields.next().unwrap_or(Value::Null), class_names)
-                .with_context(|| {
-                    format!(
-                        "Invalid class value in compact-v5 shape {}",
-                        shape_offset + 1
-                    )
-                })?;
-        let mask = fields.next().unwrap_or(Value::Bool(false));
-        if fields.next().is_some() {
-            bail!("Compact-v5 shape entry has unsupported field count greater than 2");
-        }
-        out.push(CompactV5InstanceShape { class_name, mask });
-    }
-    Ok(out)
-}
-
-fn compact_v5_mask_has_properties(mask: &Value) -> bool {
-    match mask {
-        Value::Null | Value::Bool(false) => false,
-        Value::Number(number) => number.as_u64().is_some_and(|value| value != 0),
-        Value::Array(words) => words
-            .iter()
-            .any(|word| word.as_u64().is_some_and(|value| value != 0)),
-        _ => true,
-    }
-}
-
-fn compact_v5_shape_id(raw: Value) -> Result<usize> {
-    let shape_id =
-        raw.as_u64()
-            .with_context(|| "Compact-v5 shape id must be a positive integer")? as usize;
-    shape_id
-        .checked_sub(1)
-        .with_context(|| "Compact-v5 shape id must be >= 1")
-}
-
-pub(crate) fn parse_compact_v5_shape_instance_items(
-    raw_items: Value,
-    strings: &[String],
-    raw_shapes: Vec<Value>,
-    batch_start: usize,
-    property_schema_by_class: &PropertySchemaMap,
-    enum_value_names_by_type: &EnumValueNameMap,
-    class_names: &[String],
-) -> Result<Vec<SnapshotInstance>> {
-    let Value::Array(values) = raw_items else {
-        bail!("Compact-v5 shape instance items must be an array");
-    };
-    let shapes = parse_compact_v5_instance_shapes(raw_shapes, class_names)?;
-    let mut out = Vec::with_capacity(values.len());
-
-    for (row_offset, value) in values.into_iter().enumerate() {
-        let mut fields = match value {
-            Value::Array(fields) => fields.into_iter(),
-            _ => bail!("Compact-v5 shape instance item must be an array"),
-        };
-        let name = decode_compact_v5_string(
-            fields.next().unwrap_or(Value::Null),
-            strings,
-            "instance name",
-        )?;
-        let parent_index = compact_parent_index(fields.next().unwrap_or(Value::Null))?;
-        let shape_index = compact_v5_shape_id(fields.next().unwrap_or(Value::Null))?;
-        let shape = shapes
-            .get(shape_index)
-            .with_context(|| format!("Unknown compact-v5 shape id {}", shape_index + 1))?;
-        let field4 = fields.next();
-        let field5 = fields.next();
-        if fields.next().is_some() {
-            bail!("Compact-v5 shape instance row has unsupported field count greater than 5");
-        }
-
-        let shape_has_properties = compact_v5_mask_has_properties(&shape.mask);
-        let (attributes_raw, values_raw) = if shape_has_properties {
-            match (field4, field5) {
-                (None, None) => (Value::Bool(false), Value::Bool(false)),
-                (Some(values_raw), None) => (Value::Bool(false), values_raw),
-                (Some(attributes_raw), Some(values_raw)) => (attributes_raw, values_raw),
-                (None, Some(_)) => {
-                    bail!("Compact-v5 shape row cannot have property values without field 4")
-                }
-            }
-        } else {
-            match (field4, field5) {
-                (None, None) => (Value::Bool(false), Value::Bool(false)),
-                (Some(attributes_raw), None) => (attributes_raw, Value::Bool(false)),
-                (Some(_), Some(_)) => {
-                    bail!("Compact-v5 shape row without a property mask cannot contain values")
-                }
-                (None, Some(_)) => {
-                    bail!("Compact-v5 shape row cannot have field 5 without field 4")
-                }
-            }
-        };
-
-        let attributes = decode_compact_v5_attributes(attributes_raw, strings)?;
-        let property_schema = property_schema_by_class.get(shape.class_name.as_str());
-        let mut properties = compact_properties_mask_take_v5_with_schema(
-            &shape.mask,
-            values_raw,
-            shape.class_name.as_str(),
-            property_schema.map(Vec::as_slice),
-            strings,
-            enum_value_names_by_type,
-        )?;
-        let instance_index = batch_start + row_offset;
-        if script_file_names(&shape.class_name).is_some() {
-            properties.insert(
-                "Source".to_string(),
-                Value::String(EXTERNAL_SOURCE_MARKER.to_string()),
-            );
-        }
-
-        out.push(SnapshotInstance {
-            name,
-            class_name: shape.class_name,
-            properties,
-            attributes,
-            instance_index: Some(instance_index),
-            parent_index,
-            ..Default::default()
-        });
-    }
-
-    Ok(out)
-}
-
 pub(crate) fn parse_native_overlay_class_groups(
     raw_groups: Value,
     strings: &[String],
@@ -922,85 +679,6 @@ pub(crate) fn parse_native_overlay_class_groups(
     Ok(out)
 }
 
-pub(crate) fn parse_compact_v5_instance_items(
-    raw_items: Value,
-    strings: &[String],
-    batch_start: usize,
-    property_schema_by_class: &PropertySchemaMap,
-    enum_value_names_by_type: &EnumValueNameMap,
-    class_names: &[String],
-) -> Result<Vec<SnapshotInstance>> {
-    let Value::Array(values) = raw_items else {
-        bail!("Compact-v5 instance items must be an array");
-    };
-    let mut out = Vec::with_capacity(values.len());
-    for (row_offset, value) in values.into_iter().enumerate() {
-        let mut fields = match value {
-            Value::Array(fields) => fields.into_iter(),
-            _ => bail!("Compact-v5 instance item must be an array"),
-        };
-        let name = match fields.next().unwrap_or(Value::Null) {
-            Value::String(text) => text,
-            Value::Number(number) => {
-                let name_id = number
-                    .as_u64()
-                    .with_context(|| "Compact-v5 instance name id must be a non-negative integer")?
-                    as usize;
-                string_from_table(strings, name_id, "instance name")?
-            }
-            _ => bail!("Compact-v5 instance name must be a string or string id"),
-        };
-        let class_name =
-            compact_class_name_from_value(fields.next().unwrap_or(Value::Null), class_names)?;
-        let property_schema = property_schema_by_class.get(class_name.as_str());
-        let parent_index = compact_parent_index(fields.next().unwrap_or(Value::Null))?;
-        let field4 = fields.next();
-        let field5 = fields.next();
-        let field6 = fields.next();
-        if fields.next().is_some() {
-            bail!("Compact-v5 instance row cannot contain more than 6 fields");
-        }
-        let (attributes_raw, mask_raw, values_raw) = match (field4, field5, field6) {
-            (None, None, None) => (Value::Bool(false), Value::Bool(false), Value::Bool(false)),
-            (Some(attributes_raw), None, None) => {
-                (attributes_raw, Value::Bool(false), Value::Bool(false))
-            }
-            (Some(mask_raw), Some(values_raw), None) => (Value::Bool(false), mask_raw, values_raw),
-            (Some(attributes_raw), Some(mask_raw), Some(values_raw)) => {
-                (attributes_raw, mask_raw, values_raw)
-            }
-            _ => bail!("Compact-v5 instance row has missing intermediate fields"),
-        };
-        let attributes = decode_compact_v5_attributes(attributes_raw, strings)?;
-        let properties = compact_properties_mask_take_v5_with_schema(
-            &mask_raw,
-            values_raw,
-            class_name.as_str(),
-            property_schema.map(Vec::as_slice),
-            strings,
-            enum_value_names_by_type,
-        )?;
-        let instance_index = batch_start + row_offset;
-        let mut properties = properties;
-        if script_file_names(&class_name).is_some() {
-            properties.insert(
-                "Source".to_string(),
-                Value::String(EXTERNAL_SOURCE_MARKER.to_string()),
-            );
-        }
-        out.push(SnapshotInstance {
-            name,
-            class_name,
-            properties,
-            attributes,
-            instance_index: Some(instance_index),
-            parent_index,
-            ..Default::default()
-        });
-    }
-    Ok(out)
-}
-
 pub(crate) fn parse_source_range_batch(raw: Value) -> Result<SourceBatchMap> {
     let items = raw
         .get("items")
@@ -1045,17 +723,12 @@ mod tests {
             "Test settings id",
         )
         .unwrap();
-        let mut instances = vec![SnapshotInstance::default(); 4];
-
-        apply_batch_settings_ids(&mut instances, decoded).unwrap();
-
         assert_eq!(
-            instances[1].transported_settings_id.as_deref(),
-            Some("editor:stable")
-        );
-        assert_eq!(
-            instances[3].transported_settings_id.as_deref(),
-            Some("editor:moved")
+            decoded,
+            vec![
+                (1, "editor:stable".to_string()),
+                (3, "editor:moved".to_string())
+            ]
         );
     }
 

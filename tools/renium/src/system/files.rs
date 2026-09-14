@@ -3,7 +3,6 @@ use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -43,12 +42,6 @@ impl<F: FnOnce()> Drop for OnDrop<F> {
     fn drop(&mut self) {
         self.run();
     }
-}
-
-pub(crate) fn current_unix_ts() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |value| value.as_secs() as i64)
 }
 
 pub(crate) fn service_settings_path(service_dir: &Path) -> PathBuf {

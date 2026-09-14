@@ -2584,7 +2584,6 @@ fn convert_native_service_output(
                 export_start_ms: export_started_ms,
                 export_end_ms,
             },
-            tune: None,
         },
         native_index_by_overlay_index,
     ))
@@ -3103,7 +3102,6 @@ pub(crate) fn editor_binary_export_parts<'a>(
                         )?;
                         if group.script_count > 0 {
                             let worker_count = resolve_source_worker_count(
-                                0,
                                 bridge.channel_count(),
                                 group.script_count,
                                 group.instance_count,

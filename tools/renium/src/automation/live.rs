@@ -1969,10 +1969,7 @@ fn pull_studio_changes(
         .as_str()
         .context("Studio change state did not include runtimeId")?
         .to_string();
-    let parameters = json!({
-        "services": &services,
-        "importMode": "staged",
-    });
+    let parameters = json!({ "services": &services });
     let _gate = bridge.acquire_request_gate();
     let _selection = bound_context::select(context);
     bridge.clear_runtime_pins();
@@ -1984,7 +1981,6 @@ fn pull_studio_changes(
         bridge,
         &info,
         0.0,
-        false,
         state["referencePathsMayChange"].as_bool().unwrap_or(false),
     )?;
     Ok(Some(PulledStudioChanges {
