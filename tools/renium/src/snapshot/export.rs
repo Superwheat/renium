@@ -777,30 +777,9 @@ fn collect_nested_project_paths(
         publish_paths.push(relative(&source_root)?);
         publish_paths.push(relative(&loaded.root.join("instances"))?);
     }
-    for (_, node) in config::project_tree_nodes(&loaded.project.tree) {
-        if let Some(path) = node.path {
-            let path = loaded.root.join(path);
-            clone_paths.push(relative(&path)?);
-            if writable {
-                publish_paths.push(relative(&path)?);
-            }
-            if project_path_is_nested(&path) && path.is_file() {
-                collect_nested_project_paths(
-                    project_root,
-                    &path,
-                    clone_paths,
-                    publish_paths,
-                    visited,
-                    writable,
-                )?;
-            }
-        }
-    }
-    for mount in &loaded.project.mounts {
-        let path = loaded.root.join(&mount.source);
+    let mut visit = |path: PathBuf, writable: bool| -> Result<()> {
         clone_paths.push(relative(&path)?);
-        let mount_writable = writable && mount.ownership != config::MountOwnership::ReadOnly;
-        if mount_writable {
+        if writable {
             publish_paths.push(relative(&path)?);
         }
         if project_path_is_nested(&path) && path.is_file() {
@@ -810,26 +789,29 @@ fn collect_nested_project_paths(
                 clone_paths,
                 publish_paths,
                 visited,
-                mount_writable,
+                writable,
             )?;
+        }
+        Ok(())
+    };
+    for (_, node) in config::project_tree_nodes(&loaded.project.tree) {
+        if let Some(path) = node.path {
+            visit(loaded.root.join(path), writable)?;
         }
     }
+    for mount in &loaded.project.mounts {
+        visit(
+            loaded.root.join(&mount.source),
+            writable && mount.ownership != config::MountOwnership::ReadOnly,
+        )?;
+    }
     for adapter in &loaded.project.adapters {
-        let source = loaded.root.join(&adapter.source);
-        clone_paths.push(relative(&source)?);
-        if writable && adapter.direction != config::AdapterDirection::ToProject {
-            publish_paths.push(relative(&source)?);
-        }
-        if project_path_is_nested(&source) && source.is_file() {
-            collect_nested_project_paths(
-                project_root,
-                &source,
-                clone_paths,
-                publish_paths,
-                visited,
-                writable && adapter.direction != config::AdapterDirection::ToProject,
-            )?;
-        }
+        visit(
+            loaded.root.join(&adapter.source),
+            writable && adapter.direction != config::AdapterDirection::ToProject,
+        )?;
+    }
+    for adapter in &loaded.project.adapters {
         if let Some(output) = config::project_adapter_output_path(&loaded, adapter)? {
             clone_paths.push(relative(&output)?);
         }
