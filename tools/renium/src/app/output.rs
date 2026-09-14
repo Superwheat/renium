@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::fmt;
 use std::io::{self, Write};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use anyhow::{Result, bail};
@@ -222,12 +223,109 @@ pub(crate) fn print_json_output(value: &Value, pretty: bool) -> Result<()> {
     if captured {
         return Ok(());
     }
+    let relative;
+    let value = if MODE.load(Ordering::Relaxed) == 0 {
+        relative = relativize_project_paths(value.clone());
+        &relative
+    } else {
+        value
+    };
     if global_pretty_output(pretty) && !STREAM.load(Ordering::Relaxed) {
         println!("{}", serde_json::to_string_pretty(value)?);
     } else {
         println!("{}", serde_json::to_string(value)?);
     }
     Ok(())
+}
+
+static PROJECT_PREFIXES: OnceLock<Vec<String>> = OnceLock::new();
+
+fn project_prefixes() -> &'static [String] {
+    PROJECT_PREFIXES.get_or_init(|| {
+        let Ok(dir) = std::env::current_dir() else {
+            return Vec::new();
+        };
+        let text = dir
+            .to_string_lossy()
+            .trim_end_matches(['\\', '/'])
+            .to_string();
+        let mut prefixes = vec![format!("{text}\\"), format!("{text}/")];
+        let forward = text.replace('\\', "/");
+        if forward != text {
+            prefixes.push(format!("{forward}/"));
+        }
+        prefixes
+    })
+}
+
+/// Text-mode output prints paths inside the working directory relative to it.
+fn relativize_project_paths(mut value: Value) -> Value {
+    fn visit(value: &mut Value) {
+        match value {
+            Value::String(text) => {
+                for prefix in project_prefixes() {
+                    if text.len() > prefix.len()
+                        && text.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+                    {
+                        text.drain(..prefix.len());
+                        if text.contains('\\') {
+                            *text = text.replace('\\', "/");
+                        }
+                        break;
+                    }
+                }
+            }
+            Value::Array(items) => items.iter_mut().for_each(visit),
+            Value::Object(map) => map.values_mut().for_each(visit),
+            _ => {}
+        }
+    }
+    visit(&mut value);
+    value
+}
+
+/// Removes null, empty-string, empty-array and empty-object members.
+pub(crate) fn strip_empty(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.values_mut().for_each(strip_empty);
+            map.retain(|_, entry| match entry {
+                Value::Null => false,
+                Value::String(text) => !text.is_empty(),
+                Value::Array(items) => !items.is_empty(),
+                Value::Object(members) => !members.is_empty(),
+                _ => true,
+            });
+        }
+        Value::Array(items) => items.iter_mut().for_each(strip_empty),
+        _ => {}
+    }
+}
+
+/// Removes the named members when they are empty arrays.
+pub(crate) fn drop_empty(value: &mut Value, keys: &[&str]) {
+    if let Some(map) = value.as_object_mut() {
+        for key in keys {
+            if map
+                .get(*key)
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
+            {
+                map.remove(*key);
+            }
+        }
+    }
+}
+
+/// Removes the named members when they are `false`.
+pub(crate) fn drop_false(value: &mut Value, keys: &[&str]) {
+    if let Some(map) = value.as_object_mut() {
+        for key in keys {
+            if map.get(*key) == Some(&Value::Bool(false)) {
+                map.remove(*key);
+            }
+        }
+    }
 }
 
 pub(crate) fn capture_json_output(run: impl FnOnce() -> Result<()>) -> Result<Value> {

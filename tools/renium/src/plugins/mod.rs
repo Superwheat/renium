@@ -272,7 +272,7 @@ pub(crate) fn manage(args: PluginArgs) -> Result<()> {
             json!({"removed":name,"statePreserved":true})
         }
     };
-    crate::app::output::print_json_output(&result, true)?;
+    crate::app::output::print_json_output(&result, false)?;
     Ok(())
 }
 
@@ -381,7 +381,7 @@ pub(crate) fn run(args: Vec<OsString>, project: Option<&Path>) -> Result<()> {
     let result = response
         .get("result")
         .context("Plugin response omitted result")?;
-    crate::app::output::print_json_output(result, true)?;
+    crate::app::output::print_json_output(result, false)?;
     Ok(())
 }
 

@@ -254,7 +254,7 @@ pub(crate) fn create_instance_command(
             },
             properties: args.properties,
             attributes: args.attributes,
-            pretty: true,
+            pretty: false,
         });
     } else {
         let src_root =
@@ -280,7 +280,7 @@ pub(crate) fn create_instance_command(
         },
         properties: args.properties,
         attributes: args.attributes,
-        pretty: true,
+        pretty: false,
     })
 }
 
@@ -322,7 +322,7 @@ pub(crate) fn clone_instance_command(
         parent_settings_id: parent_id,
         parent_name: None,
         parent_class_name: None,
-        pretty: true,
+        pretty: false,
     })
 }
 
@@ -459,7 +459,7 @@ pub(crate) fn remove_instance_command(
         input: BytecodeFileArgs::settings_file(settings_file),
         selector: BytecodeInstanceSelectorArgs::by_settings_id(settings_id),
         no_recursive: args.no_recursive,
-        pretty: true,
+        pretty: false,
     })
 }
 
@@ -474,7 +474,7 @@ pub(crate) fn desync_package_link_command(
         input: BytecodeFileArgs::settings_file(settings_file),
         service: target.service,
         selector: BytecodeInstanceSelectorArgs::by_settings_id(settings_id),
-        pretty: true,
+        pretty: false,
     })
 }
 
@@ -500,7 +500,7 @@ pub(crate) fn import_model_command(
             parent_settings_id,
             ..Default::default()
         },
-        pretty: true,
+        pretty: false,
     })
 }
 
@@ -521,7 +521,7 @@ pub(crate) fn export_model_command(
         selector: BytecodeInstanceSelectorArgs::by_settings_id(Some(target.settings_id)),
         output: args.output,
         format: args.format,
-        pretty: true,
+        pretty: false,
     })
 }
 

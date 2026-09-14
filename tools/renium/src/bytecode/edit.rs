@@ -111,19 +111,18 @@ pub(crate) fn bytecode_add_instance(args: BytecodeAddInstanceArgs) -> Result<()>
     apply_file_mutations(&writes, &removals)?;
     let (path_segments_by_index, path_ordinals_by_index) =
         build_editor_instance_path_parts(&document, &service);
-    print_json_output(
-        &json!({
-            "ok": true,
-            "settingsFile": settings_file,
-            "index": added.index,
-            "settingsId": added.settings_id,
-            "pathSegments": path_segments_by_index.get(added.index).and_then(std::clone::Clone::clone),
-            "pathOrdinals": path_ordinals_by_index.get(added.index).and_then(std::clone::Clone::clone),
-            "changedPaths": changed_paths,
-            "sourceWrites": source_writes,
-        }),
-        args.pretty,
-    )
+    let mut result = json!({
+        "ok": true,
+        "settingsFile": settings_file,
+        "index": added.index,
+        "settingsId": added.settings_id,
+        "pathSegments": path_segments_by_index.get(added.index).and_then(std::clone::Clone::clone),
+        "pathOrdinals": path_ordinals_by_index.get(added.index).and_then(std::clone::Clone::clone),
+        "changedPaths": changed_paths,
+        "sourceWrites": source_writes,
+    });
+    crate::app::output::drop_empty(&mut result, &["sourceWrites"]);
+    print_json_output(&result, args.pretty)
 }
 
 pub(crate) fn bytecode_clone_instance(args: BytecodeCloneInstanceArgs) -> Result<()> {
@@ -918,17 +917,16 @@ pub(crate) fn bytecode_remove_instance(args: BytecodeRemoveInstanceArgs) -> Resu
             prune_empty_source_dirs(source_root, service_dir)?;
         }
     }
-    print_json_output(
-        &json!({
-            "ok": true,
-            "settingsFile": settings_file,
-            "storeRemoved": removed_settings_file,
-            "removedSettingsIds": removed_settings_ids,
-            "removedSourcePaths": removed_source_paths_json,
-            "changedPaths": changed_paths,
-        }),
-        args.pretty,
-    )
+    let mut result = json!({
+        "ok": true,
+        "settingsFile": settings_file,
+        "storeRemoved": removed_settings_file,
+        "removedSettingsIds": removed_settings_ids,
+        "removedSourcePaths": removed_source_paths_json,
+        "changedPaths": changed_paths,
+    });
+    crate::app::output::drop_empty(&mut result, &["removedSourcePaths"]);
+    print_json_output(&result, args.pretty)
 }
 
 pub(crate) fn bytecode_desync_package_link(args: BytecodeDesyncPackageLinkArgs) -> Result<()> {

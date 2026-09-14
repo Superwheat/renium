@@ -75,5 +75,7 @@ pub(crate) fn run(args: PerformanceArgs) -> Result<()> {
         }
     };
     let result = daemon_result(op::PERFORMANCE_PROFILE, None, parameters, false, None)?;
+    let mut result = result;
+    app::output::strip_empty(&mut result);
     app::output::print_json_output(&result, false)
 }

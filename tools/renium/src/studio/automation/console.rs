@@ -17,13 +17,17 @@ pub(crate) fn get_console_output_command(args: PluginConsoleOutputArgs) -> Resul
     if args.follow {
         return follow_console_via_daemon(&args);
     }
-    let result = daemon_control_request(
+    let mut result = daemon_control_request(
         op::CONSOLE,
         None,
         console_daemon_parameters(&args, args.since_seq, args.clear, args.from_oldest),
         false,
     )?;
-    print_json_output(&result, true)
+    if let Some(map) = result.as_object_mut() {
+        map.remove("count");
+    }
+    crate::app::output::drop_false(&mut result, &["hasMore", "truncated"]);
+    print_json_output(&result, false)
 }
 
 fn console_daemon_parameters(

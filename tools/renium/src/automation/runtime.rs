@@ -532,14 +532,13 @@ fn automation_pull_operation(
     if let Some((seq, runtime_id)) = pending_ack {
         acknowledge_pulled_changes(bridge, &parsed_services, seq, &runtime_id)?;
     }
-    Ok((
-        json!({
-            "direction": "studio-to-files",
-            "services": parsed_services,
-            "pendingChangesAcknowledged": acknowledged_pending,
-        }),
-        published,
-    ))
+    let mut result = json!({
+        "ok": true,
+        "services": parsed_services.len(),
+        "pendingChangesAcknowledged": acknowledged_pending,
+    });
+    crate::app::output::drop_false(&mut result, &["pendingChangesAcknowledged"]);
+    Ok((result, published))
 }
 
 #[cfg(any(windows, target_os = "macos"))]

@@ -136,15 +136,14 @@ pub(crate) fn query_place(args: QueryPlaceArgs) -> Result<()> {
         matches.push(query_result(&dom, referent));
     }
 
-    print_json_output(
-        &json!({
-            "ok": true,
-            "input": args.input,
-            "matches": matches,
-            "truncated": truncated,
-        }),
-        args.pretty,
-    )
+    let mut result = json!({
+        "ok": true,
+        "input": args.input,
+        "matches": matches,
+        "truncated": truncated,
+    });
+    crate::app::output::drop_false(&mut result, &["truncated"]);
+    print_json_output(&result, args.pretty)
 }
 
 fn projected_services(root: &Path) -> Result<Vec<String>> {
@@ -219,11 +218,18 @@ fn difference_value(
         ("kind".to_string(), json!(kind)),
         ("path".to_string(), json!(path)),
     ]);
-    if let Some(project) = project {
-        value.insert("projectClass".to_string(), json!(project.class_name));
-    }
-    if let Some(place) = place {
-        value.insert("placeClass".to_string(), json!(place.class_name));
+    match (project, place) {
+        (Some(project), Some(place)) if project.class_name == place.class_name => {
+            value.insert("class".to_string(), json!(project.class_name));
+        }
+        _ => {
+            if let Some(project) = project {
+                value.insert("projectClass".to_string(), json!(project.class_name));
+            }
+            if let Some(place) = place {
+                value.insert("placeClass".to_string(), json!(place.class_name));
+            }
+        }
     }
     Value::Object(value)
 }
@@ -377,8 +383,7 @@ pub(crate) fn compare_place(args: ComparePlaceArgs, project: Option<&Path>) -> R
     }
 
     let difference_count = changed + missing_from_place + extra_in_place;
-    print_json_output(
-        &json!({
+    let mut result = json!({
             "ok": true,
             "matches": difference_count == 0,
             "input": args.input,
@@ -394,9 +399,9 @@ pub(crate) fn compare_place(args: ComparePlaceArgs, project: Option<&Path>) -> R
             "extraInPlace": extra_in_place,
             "differences": differences,
             "truncated": difference_count > differences.len(),
-        }),
-        args.pretty,
-    )
+    });
+    crate::app::output::drop_false(&mut result, &["truncated"]);
+    print_json_output(&result, args.pretty)
 }
 
 #[cfg(test)]

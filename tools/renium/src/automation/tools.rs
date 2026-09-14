@@ -221,14 +221,24 @@ pub(crate) fn script_read_command(
     project: Option<&Path>,
 ) -> anyhow::Result<()> {
     let (root, _) = script_roots(project)?;
-    print_script_result(script_read_at(
+    let value = script_read_at(
         &root,
         &json!({
             "path": args.path,
             "startLine": args.start_line,
             "endLine": args.end_line,
         }),
-    ))
+    )
+    .map_err(|failure| anyhow::anyhow!(failure.0.m))?;
+    let text = format!(
+        "{}:{}-{}/{}\n{}",
+        value["path"].as_str().unwrap_or_default(),
+        value["startLine"],
+        value["endLine"],
+        value["totalLines"],
+        value["source"].as_str().unwrap_or_default()
+    );
+    crate::app::output::emit_global_output(&value, &text)
 }
 
 fn failure(message: impl Into<String>, next: &str) -> Failure {
@@ -336,13 +346,12 @@ fn script_search_at(root: &Path, source: &Path, parameters: &Value) -> Result<Va
             }
         }
     }
-    let returned_matches = results.len();
-    Ok(json!({
-        "results": results,
-        "returnedFiles": returned_matches,
-        "totalFiles": total_matches,
-        "truncated": returned_matches < total_matches,
-    }))
+    let truncated = results.len() < total_matches;
+    let mut result = json!({ "results": results, "totalFiles": total_matches });
+    if truncated {
+        result["truncated"] = json!(true);
+    }
+    Ok(result)
 }
 
 pub(crate) fn script_search(context: &BoundContext, parameters: &Value) -> Result<Value, Failure> {
@@ -458,13 +467,12 @@ fn script_grep_at(root: &Path, source: &Path, parameters: &Value) -> Result<Valu
             }
         }
     }
-    let returned_matches = results.len();
-    Ok(json!({
-        "results": results,
-        "returnedMatches": returned_matches,
-        "totalMatches": total_matches,
-        "truncated": returned_matches < total_matches,
-    }))
+    let truncated = results.len() < total_matches;
+    let mut result = json!({ "results": results, "totalMatches": total_matches });
+    if truncated {
+        result["truncated"] = json!(true);
+    }
+    Ok(result)
 }
 
 pub(crate) fn script_grep(context: &BoundContext, parameters: &Value) -> Result<Value, Failure> {

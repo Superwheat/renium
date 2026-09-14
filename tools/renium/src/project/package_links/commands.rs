@@ -893,25 +893,22 @@ pub(crate) fn link_apply(mut args: LinkApplyArgs) -> Result<()> {
     }
 
     let strict_failure = args.strict && !changes.warnings.is_empty();
-    print_json_output(
-        &json!({
-            "ok": !strict_failure,
-            "check": args.check,
-            "manifest": manifest_path,
-            "processedTargets": changes.processed_targets,
-            "differenceCount": changes.differences,
-            "changedPaths": changes.changed_paths,
-            "changedSettingsIds": changes.target_settings_ids,
-            "links": changes.link_results,
-            "warnings": changes.warnings,
-        }),
-        args.pretty,
-    )?;
+    let warning_count = changes.warnings.len();
+    let mut result = json!({
+        "ok": !strict_failure,
+        "check": args.check,
+        "manifest": manifest_path,
+        "processedTargets": changes.processed_targets,
+        "differenceCount": changes.differences,
+        "changedPaths": changes.changed_paths,
+        "changedSettingsIds": changes.target_settings_ids,
+        "links": changes.link_results,
+        "warnings": changes.warnings,
+    });
+    crate::app::output::drop_empty(&mut result, &["warnings", "links", "changedSettingsIds"]);
+    print_json_output(&result, args.pretty)?;
     if strict_failure {
-        bail!(
-            "link-apply finished with {} warning(s) and --strict is set",
-            changes.warnings.len()
-        );
+        bail!("link-apply finished with {warning_count} warning(s) and --strict is set");
     }
     Ok(())
 }
@@ -1332,20 +1329,19 @@ pub(crate) fn link_status(mut args: LinkStatusArgs) -> Result<()> {
         })
         .collect();
 
-    print_json_output(
-        &json!({
-            "ok": true,
-            "manifest": manifest_path,
-            "manifestExists": manifest_path.exists(),
-            "lockExists": link_lock_path(&project_root).exists(),
-            "linkCount": manifest.links.len(),
-            "brokenTargets": broken,
-            "driftedTargets": drifted,
-            "links": links_out,
-            "targets": targets_out,
-        }),
-        args.pretty,
-    )
+    let mut result = json!({
+        "ok": true,
+        "manifest": manifest_path,
+        "manifestExists": manifest_path.exists(),
+        "lockExists": link_lock_path(&project_root).exists(),
+        "linkCount": manifest.links.len(),
+        "brokenTargets": broken,
+        "driftedTargets": drifted,
+        "links": links_out,
+        "targets": targets_out,
+    });
+    crate::app::output::strip_empty(&mut result);
+    print_json_output(&result, args.pretty)
 }
 
 pub(crate) fn link_add(args: LinkAddArgs) -> Result<()> {

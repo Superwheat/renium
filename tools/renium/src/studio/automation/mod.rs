@@ -71,7 +71,21 @@ pub(crate) fn execute_luau_command(mut args: ExecuteLuauArgs) -> Result<()> {
         "bridgeWaitSeconds": args.bridge.wait_seconds,
         "bridgePorts": args.bridge.ports,
     });
-    let result = daemon_result(op::LUAU, None, parameters, false, Some(&args.bridge))?;
+    let mut result = daemon_result(op::LUAU, None, parameters, false, Some(&args.bridge))?;
+    if let Some(map) = result.as_object_mut() {
+        if map.get("background") == Some(&Value::Bool(false)) {
+            map.remove("background");
+        }
+        for key in ["output", "results"] {
+            if map
+                .get(key)
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
+            {
+                map.remove(key);
+            }
+        }
+    }
     print_json_output(&result, false)
 }
 
@@ -437,6 +451,7 @@ pub(crate) fn studio_change_state_operation_command(
         args.replace_services = true;
     }
     let has_preference = args.prefer.is_some();
+    let details = args.details;
     let parameters = json!({
         "services": args.services,
         "reset": args.reset,
@@ -457,13 +472,14 @@ pub(crate) fn studio_change_state_operation_command(
         "bridgePorts": args.bridge.ports,
     });
     let result = daemon_result(operation, project, parameters, false, Some(&args.bridge))?;
-    finish_studio_change_state_command(operation, has_preference, result)
+    finish_studio_change_state_command(operation, has_preference, result, details)
 }
 
 fn finish_studio_change_state_command(
     operation: u16,
     has_preference: bool,
-    result: Value,
+    mut result: Value,
+    details: bool,
 ) -> Result<()> {
     let failed = result.get("ok").and_then(Value::as_bool) == Some(false);
     let resolution_required = result
@@ -486,6 +502,14 @@ fn finish_studio_change_state_command(
             .and_then(Value::as_str)
             .unwrap_or("Live Sync could not complete the requested operation");
         bail!(error.to_string());
+    }
+    if !details {
+        if let Some(map) = result.as_object_mut() {
+            for key in ["runtimeId", "seq", "snapshotSeq", "runtimeSettingsSeq"] {
+                map.remove(key);
+            }
+        }
+        crate::app::output::strip_empty(&mut result);
     }
     print_json_output(&result, false)
 }
