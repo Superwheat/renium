@@ -20,16 +20,15 @@ const STRING_CONFIG_KEYS = new Set([
   "link.manifest", "link.folder", "link.cacheDir", "link.gitPath",
 ]);
 const BOOLEAN_CONFIG_KEYS = new Set([
-  "yes", "backtrace", "verifyEditorPushSources", "adaptiveThrottle",
+  "yes", "backtrace", "verifyEditorPushSources",
   "autoSyncOnSave", "editorLiveSyncEnabled",
-  "studioLiveSyncEnabled", "liveSync.overridePackages", "modifiedDefaultBypass",
+  "studioLiveSyncEnabled", "liveSync.overridePackages",
   "gitSync.autoFetch", "gitSync.includeUntracked", "gitSync.confirmBeforePush",
   "gitSync.requireCleanWorktreeBeforePull", "wallySync.runInstall", "link.offline",
   "link.autoApplyOnManifestChange",
 ]);
 const INTEGER_CONFIG_KEYS = new Set([
-  "schemaVersion", "sourceWorkers", "instanceWorkers", "importWorkers", "chunkSize",
-  "autoSyncDebounceMs",
+  "schemaVersion", "autoSyncDebounceMs",
   "liveSync.changesThreshold", "liveSync.diffLinesLimit",
 ]);
 const NUMBER_CONFIG_KEYS = new Set([
@@ -38,8 +37,6 @@ const NUMBER_CONFIG_KEYS = new Set([
 ]);
 const STRING_ARRAY_CONFIG_KEYS = new Set(["services", "gitSync.stagePaths"]);
 const ENUM_CONFIG_KEYS = new Map<string, readonly string[]>([
-  ["importMode", ["direct", "snapshot"]],
-  ["performanceMode", ["throughput", "balanced", "smooth"]],
   ["logLevel", ["off", "error", "warn", "info", "debug", "trace"]],
   ["color", ["auto", "always", "never"]],
   ["outputMode", ["text", "json", "pretty"]],

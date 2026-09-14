@@ -21,8 +21,6 @@ import {
 import { pickWorkspaceRoot, resolveConfigPath } from "./utils";
 
 const DEFAULT_BRIDGE_PORTS = [8781, 8782];
-const DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024;
-const MAX_BRIDGE_CHUNK_SIZE = 8 * 1024 * 1024;
 
 export type ReniumLogLevel = "off" | "error" | "warn" | "info" | "debug" | "trace";
 
@@ -36,14 +34,9 @@ export type SyncConfig = {
   placeSelector?: string;
   snapshotDir: string;
   services: string[];
-  sourceWorkers: number;
-  instanceWorkers: number;
-  importWorkers: number;
-  chunkSize: number;
   bridgeWaitSeconds: number;
   bridgePorts: string;
   verifyEditorPushSources: boolean;
-  adaptiveThrottle: boolean;
   autoSyncOnSave: boolean;
   autoSyncDebounceMs: number;
   editorLiveSyncEnabled: boolean;
@@ -53,8 +46,6 @@ export type SyncConfig = {
   displayPrompts: "always" | "initial" | "never";
   logLevel: ReniumLogLevel;
   overridePackages: boolean;
-  performanceMode: "throughput" | "balanced" | "smooth";
-  modifiedDefaultBypass: boolean;
   progressHeartbeatSeconds: number;
   gitSync: GitSyncConfig;
   wallySync: WallySyncConfig;
@@ -81,7 +72,6 @@ function existingCliPath(
 export class SyncConfigResolver {
   private warnedMultiRootWorkspace = false;
   private warnedBridgePortLimit = false;
-  private warnedChunkSizeCap = false;
   private sharedConfig: SharedConfig = {};
 
   public constructor(
@@ -136,10 +126,6 @@ export class SyncConfigResolver {
     const gitStagePaths = (Array.isArray(gitStagePathsRaw) ? gitStagePathsRaw : [])
       .map((value) => String(value).trim())
       .filter(Boolean);
-    const performanceModeRaw = read<string>("performanceMode", "throughput");
-    const performanceMode = performanceModeRaw === "smooth" || performanceModeRaw === "balanced"
-      ? performanceModeRaw
-      : "throughput";
     const initialSyncPriorityRaw = read<string>("liveSync.initialSyncPriority", "reconcile");
     const initialSyncPriority = initialSyncPriorityRaw === "none" || initialSyncPriorityRaw === "verify"
       ? "verify"
@@ -172,14 +158,9 @@ export class SyncConfigResolver {
       placeSelector: activePlace?.selector,
       snapshotDir: read("snapshotDir", ".renium/snapshots"),
       services: services.length > 0 ? services : [...DEFAULT_SYNC_SERVICES],
-      sourceWorkers: number("sourceWorkers", 0, { min: 0, integer: true }),
-      instanceWorkers: number("instanceWorkers", 0, { min: 0, integer: true }),
-      importWorkers: number("importWorkers", 0, { min: 0, integer: true }),
-      chunkSize: this.normalizedChunkSize(read("chunkSize", DEFAULT_CHUNK_SIZE)),
       bridgeWaitSeconds: number("bridgeWaitSeconds", 8, { min: 1 }),
       bridgePorts: this.normalizedBridgePorts(String(read("bridgePorts", DEFAULT_BRIDGE_PORTS.join(",")))),
       verifyEditorPushSources: boolean("verifyEditorPushSources", false),
-      adaptiveThrottle: boolean("adaptiveThrottle", true),
       autoSyncOnSave: boolean("autoSyncOnSave", false),
       autoSyncDebounceMs: number("autoSyncDebounceMs", 800, { min: 100, integer: true }),
       editorLiveSyncEnabled: boolean("editorLiveSyncEnabled", false),
@@ -189,8 +170,6 @@ export class SyncConfigResolver {
       displayPrompts,
       logLevel: this.configuredLogLevel(studioRuntimeSettings),
       overridePackages: boolean("liveSync.overridePackages", false),
-      performanceMode,
-      modifiedDefaultBypass: boolean("modifiedDefaultBypass", false),
       progressHeartbeatSeconds: number("progressHeartbeatSeconds", 2, { min: 2 }),
       gitSync: {
         gitPath: read("gitSync.gitPath", "git"),
@@ -288,23 +267,9 @@ export class SyncConfigResolver {
     this.output.appendLine(`[renium] extension version=${extensionVersion}`);
     this.output.appendLine(`[renium] extension build_unix=${extensionBuildUnix}`);
     this.output.appendLine(`[renium] config: cliPath=${config.cliPath}`);
-    const values: Array<[string, unknown]> = [
-      ["chunkSize", config.chunkSize],
-      ["bridgePorts", config.bridgePorts],
-      ["sourceWorkers", config.sourceWorkers],
-      ["instanceWorkers", config.instanceWorkers],
-      ["importWorkers", config.importWorkers],
-      ["performanceMode", config.performanceMode],
-      ["modifiedDefaultBypass", config.modifiedDefaultBypass],
-    ];
-    for (const [key, value] of values) {
-      const raw = key === "chunkSize"
-        ? `, raw=${String(this.configuredValue(workspaceConfig, key))}`
-        : "";
-      this.output.appendLine(
-        `[renium] config: ${key}=${String(value)} (origin=${this.configOrigin(workspaceConfig, key)}${raw})`,
-      );
-    }
+    this.output.appendLine(
+      `[renium] config: bridgePorts=${config.bridgePorts} (origin=${this.configOrigin(workspaceConfig, "bridgePorts")})`,
+    );
   }
 
   private explicitValue<T>(config: vscode.WorkspaceConfiguration, key: string): T | undefined {
@@ -319,24 +284,6 @@ export class SyncConfigResolver {
     defaultValue: T,
   ): T {
     return this.explicitValue<T>(config, key) ?? sharedConfigValue<T>(shared, key) ?? defaultValue;
-  }
-
-  private normalizedChunkSize(value: unknown): number {
-    const raw = Number(value ?? DEFAULT_CHUNK_SIZE);
-    if (!Number.isFinite(raw) || raw < 512) {
-      return DEFAULT_CHUNK_SIZE;
-    }
-    const normalized = Math.floor(raw);
-    if (normalized <= MAX_BRIDGE_CHUNK_SIZE) {
-      return normalized;
-    }
-    if (!this.warnedChunkSizeCap) {
-      this.warnedChunkSizeCap = true;
-      this.output.appendLine(
-        `[renium] config: chunkSize ${normalized} exceeds the ${MAX_BRIDGE_CHUNK_SIZE}-byte bridge transport limit; using ${MAX_BRIDGE_CHUNK_SIZE} for this run.`,
-      );
-    }
-    return MAX_BRIDGE_CHUNK_SIZE;
   }
 
   private normalizedNumber(value: unknown, defaultValue: number, options: ConfigNumberOptions): number {
@@ -381,12 +328,4 @@ export class SyncConfigResolver {
     return inspected?.defaultValue !== undefined ? "default" : "unset";
   }
 
-  private configuredValue(config: vscode.WorkspaceConfiguration, key: string): unknown {
-    const inspected = config.inspect(key);
-    return inspected?.workspaceFolderValue
-      ?? inspected?.workspaceValue
-      ?? inspected?.globalValue
-      ?? sharedConfigValue(this.sharedConfig, key)
-      ?? inspected?.defaultValue;
-  }
 }

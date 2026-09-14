@@ -801,7 +801,7 @@ fn native_export_stays_in_edit_during_rapid_play_server_replacement() {
         // Edit binding must survive role-preference changes for those requests.
         assert_eq!(
             bridge
-                .call_chunk("getSourceBatchChunk", json!({}))
+                .call_chunk("getSourceRangeBatchCompactChunk", json!({}))
                 .unwrap()
                 .chunk,
             "edit"

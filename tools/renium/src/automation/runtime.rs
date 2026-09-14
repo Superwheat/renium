@@ -43,9 +43,7 @@ use crate::studio::automation::{
     studio_change_state_result, studio_device_result, timed_test_result, type_result, ui_result,
     wait_until_result,
 };
-use crate::studio::bridge::{
-    BridgeRequestLease, BridgeServer, BridgeTarget, DEFAULT_EXPORT_CHUNK_SIZE,
-};
+use crate::studio::bridge::{BridgeRequestLease, BridgeServer, BridgeTarget};
 #[cfg(any(windows, target_os = "macos"))]
 use crate::studio::input as input_inject;
 
@@ -232,21 +230,9 @@ pub(super) fn automation_pull_args(
             .get("services")
             .and_then(automation_string_list)
             .unwrap_or_default(),
-        chunk_size: automation_number(object, "chunkSize", DEFAULT_EXPORT_CHUNK_SIZE)?,
-        adaptive_seed_batch: automation_number(object, "adaptiveSeedBatch", 0)?,
         bridge: automation_bridge(object, 2.0)?,
         run_import: import,
         no_run_import: !import,
-        import_mode: automation_string(object, "importMode")
-            .unwrap_or_else(|| "direct".to_string()),
-        source_workers: automation_number(object, "sourceWorkers", 0)?,
-        instance_workers: automation_number(object, "instanceWorkers", 0)?,
-        import_workers: automation_number(object, "importWorkers", 0)?,
-        performance_mode: automation_string(object, "performanceMode")
-            .unwrap_or_else(|| "throughput".to_string()),
-        modified_default_bypass: automation_bool(object, "modifiedDefaultBypass", false)?,
-        no_modified_default_bypass: automation_bool(object, "noModifiedDefaultBypass", false)?,
-        no_adaptive_throttle: !automation_bool(object, "adaptiveThrottle", true)?,
         export_all_properties: automation_bool(object, "exportAllProperties", false)?,
         no_export_all_properties: automation_bool(object, "noExportAllProperties", false)?,
         quiet_timings: std::env::var_os("RENIUM_PROFILE_PULL").is_none(),
@@ -557,7 +543,7 @@ fn automation_pull_operation(
     let pending_ack = pending_change_ack(bridge, &parsed_services)?;
     let acknowledged_pending = pending_ack.is_some();
     drop(prepare);
-    let published = export_snapshots_with_warm_bridge(args, bridge, &info, 0.0, false, false)?;
+    let published = export_snapshots_with_warm_bridge(args, bridge, &info, 0.0, false)?;
     if let Some((seq, runtime_id)) = pending_ack {
         let _trace = crate::app::timing::trace_scope("sync", "acknowledge pulled changes");
         acknowledge_pulled_changes(bridge, &parsed_services, seq, &runtime_id)?;
@@ -1105,7 +1091,7 @@ fn automation_dispatch_operation(
             bridge.wait_for_all_target(bridge_wait_seconds, target)?;
             let info = bridge.cached_bridge_info_for_target(target)?;
             let args = automation_pull_args(context, parameters, false)?;
-            export_snapshots_with_warm_bridge(args, bridge, &info, 0.0, false, false)?;
+            export_snapshots_with_warm_bridge(args, bridge, &info, 0.0, false)?;
             Ok(json!({ "direction": "snapshots" }))
         }
         op::PUSH => {

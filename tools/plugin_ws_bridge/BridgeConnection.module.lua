@@ -111,7 +111,6 @@ function BridgeConnection.create(context)
 	local connectChannel
 	local releaseClient
 	local recoverClient
-	local prepareChannelsForNextRun
 	local handleSessionLockUnavailable
 	local pluginUnloading = false
 	local sessionTakeoverRequested = false
@@ -295,14 +294,6 @@ function BridgeConnection.create(context)
 				true
 			)
 		end
-	end
-
-	local function captureChannelClients()
-		local snapshot = table.create(#channels)
-		for i, channel in ipairs(channels) do
-			snapshot[i] = channel.client
-		end
-		return snapshot
 	end
 
 	local function sendRequestError(channelId, client, id, message)
@@ -526,14 +517,6 @@ function BridgeConnection.create(context)
 		end
 		if replayRequest then
 			replayRequest.recipients = {}
-		end
-		if okCall and method == "prepareForNextRun" then
-			local channelClients = captureChannelClients()
-			task.delay(context.nextRunCloseDelaySeconds, function()
-				if prepareChannelsForNextRun ~= nil then
-					prepareChannelsForNextRun(channelClients)
-				end
-			end)
 		end
 	end
 
@@ -1015,13 +998,6 @@ function BridgeConnection.create(context)
 		end
 	end
 
-	local function keepFastReconnectIfNextRunActive(channel)
-		local now = os.clock()
-		if channel.nextRunFastUntil > now then
-			channel.fastReconnectUntil = now + context.fastReconnectWindowSeconds
-		end
-	end
-
 	recoverClient = function(channel, client, closeClient, message)
 		if channel.client ~= client then
 			return
@@ -1040,8 +1016,6 @@ function BridgeConnection.create(context)
 		end
 		if wasOpen then
 			channel.fastReconnectUntil = os.clock() + context.fastReconnectWindowSeconds
-		else
-			keepFastReconnectIfNextRunActive(channel)
 		end
 		updateStatusText()
 		handleConnectionInterruption()
@@ -1092,7 +1066,6 @@ function BridgeConnection.create(context)
 			channel.open = false
 			recordReconnectFailure(channel)
 			markConnectionFailure(channel, client or "could not create WebSocket client")
-			keepFastReconnectIfNextRunActive(channel)
 			if not pluginUnloading then
 				updateStatusText()
 			end
@@ -1137,7 +1110,6 @@ function BridgeConnection.create(context)
 			resetReconnectFailures(channel)
 			channel.lastError = nil
 			debugBridgeConnection(("channel %d opened attempt=%d"):format(channel.id, attempt))
-			channel.nextRunFastUntil = 0
 			channel.fastReconnectUntil = os.clock() + context.fastReconnectWindowSeconds
 			Config.bridgeConnectedOnce = true
 			Config.bridgeConnectionStatus = "Registering Studio..."
@@ -1185,7 +1157,6 @@ function BridgeConnection.create(context)
 			releaseClient(channel, client, true)
 			recordReconnectFailure(channel)
 			markConnectionFailure(channel, "connection timed out")
-			keepFastReconnectIfNextRunActive(channel)
 			updateStatusText()
 			scheduleReconnect(channel)
 		end)
@@ -1268,27 +1239,6 @@ function BridgeConnection.create(context)
 		updateStatusText()
 	end
 
-	prepareChannelsForNextRun = function(channelClients)
-		if pluginUnloading or not Config.bridgeConnectRequested then
-			return
-		end
-		local now = os.clock()
-		local channelCount = math.max(#channels, 1)
-		for i, channel in ipairs(channels) do
-			channel.shouldReconnect = true
-			channel.nextRunFastUntil = now + context.nextRunFastWindowSeconds
-			channel.fastReconnectUntil = now + context.nextRunFastWindowSeconds
-			local phase = (i - 1) * (context.fastReconnectSeconds / channelCount)
-			channel.forcedReconnectAt = now + context.nextRunReconnectDelaySeconds + phase
-			if channel.client == channelClients[i] then
-				closeChannel(channel)
-				scheduleReconnect(channel)
-			elseif channel.client == nil and not channel.connecting and not channel.reconnectScheduled then
-				scheduleReconnect(channel)
-			end
-		end
-	end
-
 	function Config.resetChannels()
 		for _, channel in ipairs(channels) do
 			channel.shouldReconnect = false
@@ -1310,7 +1260,6 @@ function BridgeConnection.create(context)
 				reconnectFailureCount = 0,
 				fastReconnectUntil = 0,
 				forcedReconnectAt = 0,
-				nextRunFastUntil = 0,
 				openedAt = 0,
 			}
 		end

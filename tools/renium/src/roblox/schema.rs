@@ -454,20 +454,6 @@ pub(crate) fn parse_enum_value_name_map(value: Option<&Value>) -> Result<EnumVal
     Ok(out)
 }
 
-pub(crate) fn parse_string_list(value: Option<&Value>) -> Result<Vec<String>> {
-    let Some(value) = value else {
-        return Ok(Vec::new());
-    };
-    let Some(items) = value.as_array() else {
-        bail!("Expected string array");
-    };
-    Ok(items
-        .iter()
-        .filter_map(Value::as_str)
-        .map(ToString::to_string)
-        .collect())
-}
-
 pub(crate) fn collect_rbx_dom_properties_for_class(
     class_name: &str,
     classes: &Map<String, Value>,

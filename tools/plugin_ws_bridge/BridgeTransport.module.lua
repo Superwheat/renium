@@ -5,13 +5,9 @@ local MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 local MAX_RAW_CHUNK_BYTES = 8 * 1024 * 1024
 
 local RAW_CHUNK_METHODS = {
-	getInstanceBatchCompactChunk = true,
 	getEditorBinaryOverlayChunk = true,
 	readEditorBinaryExport = true,
 	readEditorBinaryExportBatch = true,
-	getClassDefaultsChunk = true,
-	getScriptPathsChunk = true,
-	getSourceBatchChunk = true,
 	getSourceRangeBatchCompactChunk = true,
 	getSourceChunk = true,
 }

@@ -4268,12 +4268,8 @@ class RobloxSyncController {
     reason: string;
     quietLog?: boolean;
     destructive?: boolean;
-    configOverrides?: Partial<Pick<SyncConfig, "modifiedDefaultBypass">>;
   }): Promise<CommandRunResult> {
-    const cfg = {
-      ...this.getConfig(),
-      ...(options.configOverrides ?? {}),
-    };
+    const cfg = this.getConfig();
     const selectedServices = normalizeServices(options.services, cfg.services);
     const command = cfg.cliPath;
     ensureFileExists(command);
@@ -4294,13 +4290,6 @@ class RobloxSyncController {
       snapshotDir: cfg.snapshotDir,
       bridgeWaitSeconds: editorBridgeWaitSeconds(cfg),
       bridgePorts: cfg.bridgePorts,
-      performanceMode: cfg.performanceMode,
-      modifiedDefaultBypass: cfg.modifiedDefaultBypass,
-      chunkSize: Math.max(512, cfg.chunkSize),
-      sourceWorkers: Math.max(0, cfg.sourceWorkers),
-      instanceWorkers: Math.max(0, cfg.instanceWorkers),
-      importWorkers: Math.max(0, cfg.importWorkers),
-      adaptiveThrottle: cfg.adaptiveThrottle,
       destructive: options.destructive === true,
     };
     const result = options.destructive === true

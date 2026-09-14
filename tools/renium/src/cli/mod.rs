@@ -1321,32 +1321,12 @@ pub(super) struct ExportSnapshotsArgs {
     pub(super) snapshot_dir: PathBuf,
     #[arg(short, long, default_value = "")]
     pub(super) services: String,
-    #[arg(short, long, default_value_t = DEFAULT_EXPORT_CHUNK_SIZE)]
-    pub(super) chunk_size: usize,
-    #[arg(short, long, alias = "seed", default_value_t = 0)]
-    pub(super) adaptive_seed_batch: usize,
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
     #[arg(short = 'i', long)]
     pub(super) run_import: bool,
     #[arg(long, alias = "no-import")]
     pub(super) no_run_import: bool,
-    #[arg(short = 'm', long, alias = "mode", default_value = "direct")]
-    pub(super) import_mode: String,
-    #[arg(long, alias = "sw", default_value_t = 0)]
-    pub(super) source_workers: usize,
-    #[arg(long, alias = "iw", default_value_t = 0)]
-    pub(super) instance_workers: usize,
-    #[arg(long, alias = "mw", default_value_t = 0)]
-    pub(super) import_workers: usize,
-    #[arg(long, alias = "perf", default_value = "throughput")]
-    pub(super) performance_mode: String,
-    #[arg(long, alias = "mdb")]
-    pub(super) modified_default_bypass: bool,
-    #[arg(long, alias = "no-mdb")]
-    pub(super) no_modified_default_bypass: bool,
-    #[arg(long)]
-    pub(super) no_adaptive_throttle: bool,
     #[arg(long, alias = "all-props")]
     pub(super) export_all_properties: bool,
     #[arg(long, alias = "no-props")]

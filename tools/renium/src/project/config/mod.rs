@@ -2544,11 +2544,7 @@ fn validate_merged_config(value: &Value) -> Result<()> {
                         .as_array()
                         .is_some_and(|values| values.iter().all(Value::is_string)),
                 )?,
-                "sourceWorkers"
-                | "instanceWorkers"
-                | "importWorkers"
-                | "chunkSize"
-                | "autoSyncDebounceMs"
+                "autoSyncDebounceMs"
                 | "studioLiveSyncPollMs"
                 | "liveSync.changesThreshold"
                 | "liveSync.diffLinesLimit" => require_kind(
@@ -2562,13 +2558,11 @@ fn validate_merged_config(value: &Value) -> Result<()> {
                 "yes"
                 | "backtrace"
                 | "verifyEditorPushSources"
-                | "adaptiveThrottle"
                 | "autoSyncOnSave"
                 | "editorLiveSyncEnabled"
                 | "studioLiveSyncEnabled"
                 | "liveSync.overridePackages"
                 | "runImport"
-                | "modifiedDefaultBypass"
                 | "gitSync.autoFetch"
                 | "gitSync.includeUntracked"
                 | "gitSync.confirmBeforePush"
@@ -2578,16 +2572,6 @@ fn validate_merged_config(value: &Value) -> Result<()> {
                 | "link.autoApplyOnManifestChange" => {
                     require_kind(&path, "a boolean", value.is_boolean())?
                 }
-                "importMode" => require_kind(
-                    &path,
-                    "'direct' or 'snapshot'",
-                    matches!(value.as_str(), Some("direct" | "snapshot")),
-                )?,
-                "performanceMode" => require_kind(
-                    &path,
-                    "'throughput', 'balanced', or 'smooth'",
-                    matches!(value.as_str(), Some("throughput" | "balanced" | "smooth")),
-                )?,
                 "logLevel" => require_kind(
                     &path,
                     "off, error, warn, info, debug, or trace",
