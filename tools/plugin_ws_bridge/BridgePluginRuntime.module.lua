@@ -710,8 +710,6 @@ function BridgePluginRuntime.start(context)
 		sourceCreated = 0,
 		sourceUpdated = 0,
 		sourceDeleted = 0,
-		sourceUpdateAsync = 0,
-		sourceDirect = 0,
 		instanceCreated = 0,
 		instanceReplaced = 0,
 		instanceDeleted = 0,

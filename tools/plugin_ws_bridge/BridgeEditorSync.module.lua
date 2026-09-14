@@ -1699,25 +1699,19 @@ local function writeSourceIfChanged(
 	instance: Instance,
 	nextSource: string,
 	action: string,
-	ctx: { [string]: any },
-	stats: { [string]: any }
+	ctx: { [string]: any }
 ): boolean
 	local okRead, currentSource = readScriptSource(instance)
 	if okRead and normalizedSource(currentSource) == normalizedSource(nextSource) then
 		return false
 	end
 
-	local okWrite, writeError, writeMethod = setSource(instance, nextSource, ctx)
+	local okWrite, writeError = setSource(instance, nextSource, ctx)
 	if not okWrite then
 		error(`Failed to {action} Source for {instance:GetFullName()}: {writeError}`)
 	end
 	markLiveMutation(ctx, instance)
 	verifySourceWrite(instance, nextSource)
-	if writeMethod == "UpdateSourceAsync" then
-		stats.sourceUpdateAsync += 1
-	else
-		stats.sourceDirect += 1
-	end
 	return true
 end
 
@@ -1743,7 +1737,7 @@ local function applySourceChange(
 			return
 		end
 		assertSourceContainer(instance, ctx)
-		if writeSourceIfChanged(instance, "", "clear", ctx, stats) then
+		if writeSourceIfChanged(instance, "", "clear", ctx) then
 			stats.sourceDeleted += 1
 		else
 			stats.noops += 1
@@ -1786,7 +1780,7 @@ local function applySourceChange(
 	assertSourceContainer(instance, ctx)
 
 	local nextSource = tostring(change.source or "")
-	if writeSourceIfChanged(instance, nextSource, "write", ctx, stats) then
+	if writeSourceIfChanged(instance, nextSource, "write", ctx) then
 		stats.sourceUpdated += 1
 	else
 		stats.noops += 1
@@ -2276,7 +2270,6 @@ local function applyInstanceChange(
 end
 
 local function recordProtectedWrite(stats, change, kind, name, value, deleted)
-	stats.protectedSkipped += 1
 	local row = {
 		kind = kind,
 		service = change.service,
@@ -4990,7 +4983,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 						error("Native root write is no longer in flight")
 					end
 					session.pendingNativeRootWrite = nil
-					if ctx.endNativeRootWindow then ctx.endNativeRootWindow() end
+					if ctx.endNativeRootWindow then
+						ctx.endNativeRootWindow()
+					end
 					if params.nativeRootChanged ~= true then
 						cancelExpectedEvent(ctx, write.token)
 					else
@@ -5014,7 +5009,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					task.delay(5, function()
 						if session.pendingNativeRootWrite ~= write then return end
 						session.pendingNativeRootWrite = nil
-						if ctx.endNativeRootWindow then ctx.endNativeRootWindow() end
+						if ctx.endNativeRootWindow then
+							ctx.endNativeRootWindow()
+						end
 						cancelExpectedEvent(ctx, write.token)
 						session.expireRequested = true
 						endSessionOperation(editorTransactions, transactionId, session)
@@ -6076,7 +6073,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		end
 		finishHistoryRecording(session.historyRecording)
 		session.commitFence = true
-		local undoRecorded = session.historyRecording ~= nil
 		session.historyRecording = nil
 		if session.nativeStats ~= nil then
 			ctx.stats.requests += session.nativeStats.requests
@@ -6124,7 +6120,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		end
 		editorTransactions[transactionId] = nil
 		return recordTransactionOutcome(transactionId, "committed", {
-			undoRecorded = undoRecorded,
 			verifiedPushProof = verifiedPushProof,
 			pushProofUnavailable = pushProofUnavailable,
 		})
@@ -7992,7 +7987,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				binaryBytes = session.totalBytes,
 				binaryMs = elapsed,
 				payloadVerifiedServices = payloadVerifiedServices,
-				undoRecorded = transaction.historyRecording ~= nil,
 			}
 			transaction.state = "prepared"
 			binaryImports[importId] = nil
@@ -8282,8 +8276,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			sourceCreated = 0,
 			sourceUpdated = 0,
 			sourceDeleted = 0,
-			sourceUpdateAsync = 0,
-			sourceDirect = 0,
 			instanceCreated = 0,
 			instanceReplaced = 0,
 			instanceDeleted = 0,
@@ -8291,9 +8283,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			attributeUpdated = 0,
 			noops = 0,
 			errors = 0,
-			protectedSkipped = 0,
 			protectedWrites = {},
-			undoRecorded = not not historyRecording,
 			verifyOnly = verifyOnly,
 			verifyMismatches = if verifyOnly then {} else nil,
 			verified = 0,
@@ -8464,8 +8454,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				stats.sourceCreated = 0
 				stats.sourceUpdated = 0
 				stats.sourceDeleted = 0
-				stats.sourceUpdateAsync = 0
-				stats.sourceDirect = 0
 				stats.instanceCreated = 0
 				stats.instanceReplaced = 0
 				stats.instanceDeleted = 0
@@ -8503,8 +8491,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		ctx.stats.sourceCreated += stats.sourceCreated
 		ctx.stats.sourceUpdated += stats.sourceUpdated
 		ctx.stats.sourceDeleted += stats.sourceDeleted
-		ctx.stats.sourceUpdateAsync += stats.sourceUpdateAsync
-		ctx.stats.sourceDirect += stats.sourceDirect
 		ctx.stats.instanceCreated += stats.instanceCreated
 		ctx.stats.instanceReplaced += stats.instanceReplaced
 		ctx.stats.instanceDeleted += stats.instanceDeleted
