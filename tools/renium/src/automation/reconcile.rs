@@ -3593,6 +3593,7 @@ fn amend_reconciled_changes(
             }
         }
     }
+    move_escaping_instances_before_deletes(&mut changes.instance_changes);
     for removal in plan.property_removals {
         if let Some(change) = changes.property_changes.iter_mut().find(|change| {
             change.service == removal.service
@@ -4165,6 +4166,78 @@ fn append_aligned_settings_push_plan(
         preserve_instances: Vec::new(),
     });
     Ok(())
+}
+
+/// A delete detaches the whole subtree, so an instance moving out of a
+/// deleted subtree must move first or Studio can no longer identify it.
+fn move_escaping_instances_before_deletes(instance_changes: &mut Vec<EditorInstanceChange>) {
+    let deleted = instance_changes
+        .iter()
+        .filter(|change| change.mode == "deleteInstances")
+        .flat_map(|change| {
+            change
+                .instances
+                .iter()
+                .map(move |instance| (change.service.as_str(), instance.path_segments.as_slice()))
+        })
+        .map(|(service, path)| (service.to_string(), path.to_vec()))
+        .collect::<Vec<_>>();
+    if deleted.is_empty() {
+        return;
+    }
+    let mut escapes = Vec::new();
+    for change in instance_changes.iter_mut() {
+        if change.mode != "upsertInstances" {
+            continue;
+        }
+        let leaving = change
+            .instances
+            .iter()
+            .filter(|instance| {
+                !instance.previous_path_segments.is_empty()
+                    && deleted.iter().any(|(service, path)| {
+                        *service == change.service
+                            && instance.previous_path_segments.len() > path.len()
+                            && instance.previous_path_segments.starts_with(path)
+                    })
+            })
+            .map(|instance| instance.settings_id.clone())
+            .collect::<HashSet<_>>();
+        if leaving.is_empty() {
+            continue;
+        }
+        let ancestors = change
+            .instances
+            .iter()
+            .filter(|instance| leaving.contains(&instance.settings_id))
+            .flat_map(|instance| {
+                change.instances.iter().filter(|candidate| {
+                    candidate.path_segments.len() < instance.path_segments.len()
+                        && instance.path_segments.starts_with(&candidate.path_segments)
+                })
+            })
+            .map(|ancestor| ancestor.settings_id.clone())
+            .collect::<HashSet<_>>();
+        let (escaping, staying): (Vec<_>, Vec<_>) =
+            change.instances.drain(..).partition(|instance| {
+                leaving.contains(&instance.settings_id) || ancestors.contains(&instance.settings_id)
+            });
+        change.instances = staying;
+        escapes.push(EditorInstanceChange {
+            mode: "upsertInstances".to_string(),
+            service: change.service.clone(),
+            allow_deletes: false,
+            instances: escaping,
+            preserve_instances: Vec::new(),
+        });
+    }
+    if escapes.is_empty() {
+        return;
+    }
+    instance_changes
+        .retain(|change| !change.instances.is_empty() || !change.preserve_instances.is_empty());
+    escapes.append(instance_changes);
+    *instance_changes = escapes;
 }
 
 fn capture_snapshot(root: &Path, roots: &[PathBuf]) -> Result<ProjectSnapshot> {
@@ -10599,5 +10672,71 @@ mod tests {
         assert_eq!(observed.instances[2].settings_id, "debug:0_reserved");
         assert_ne!(observed.instances[1].settings_id, "debug:0_reserved");
         encode_settings_bytecode(&observed).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod escape_tests {
+    use super::*;
+    use crate::editor::types::EditorInstanceDescriptor;
+
+    fn descriptor(id: &str, path: &[&str], previous: &[&str]) -> EditorInstanceDescriptor {
+        EditorInstanceDescriptor {
+            settings_id: id.into(),
+            class_name: "Folder".into(),
+            path_segments: path.iter().map(|segment| segment.to_string()).collect(),
+            previous_path_segments: previous.iter().map(|segment| segment.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn change(mode: &str, instances: Vec<EditorInstanceDescriptor>) -> EditorInstanceChange {
+        EditorInstanceChange {
+            mode: mode.into(),
+            service: "Workspace".into(),
+            allow_deletes: false,
+            instances,
+            preserve_instances: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn instances_leaving_a_deleted_subtree_move_before_the_delete() {
+        let mut changes = vec![
+            change(
+                "deleteInstances",
+                vec![descriptor("holder", &["Workspace", "Lobby", "Holder"], &[])],
+            ),
+            change(
+                "upsertInstances",
+                vec![
+                    descriptor("lobby", &["Workspace", "Lobby"], &[]),
+                    descriptor(
+                        "inside",
+                        &["Workspace", "Lobby", "Inside"],
+                        &["Workspace", "Lobby", "Holder", "Inside"],
+                    ),
+                    descriptor("other", &["Workspace", "Other"], &[]),
+                ],
+            ),
+        ];
+        move_escaping_instances_before_deletes(&mut changes);
+        let modes = changes
+            .iter()
+            .map(|change| change.mode.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            modes,
+            ["upsertInstances", "deleteInstances", "upsertInstances"]
+        );
+        let ids = |index: usize| {
+            changes[index]
+                .instances
+                .iter()
+                .map(|instance| instance.settings_id.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(0), ["lobby", "inside"]);
+        assert_eq!(ids(2), ["other"]);
     }
 }
