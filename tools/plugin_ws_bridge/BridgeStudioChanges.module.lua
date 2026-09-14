@@ -3964,11 +3964,12 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		if params.start ~= false and params.stop ~= true and params.releaseTrackingGuardId == nil then
 			localPushProofRequested = params.captureLocalPushProof == true
 		end
-		local retainedProof = nil
+		local retainedProof, retainedProofLocal = nil, false
 		if params.retainPushProof ~= nil and api.verifyPushProof(params.retainPushProof) then
 			if verifiedPushProof.localObservation ~= nil then
 				acquireTrackingGuard(localPushObservation.guardId, 60)
 				localPushObservation.cached = true
+				retainedProofLocal = true
 			else
 				nativeAttributeRelay.cached = true
 				nativeAttributeRelay.notify:SetAttribute("CachedPushProof", true)
@@ -4090,6 +4091,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			else services
 		local response = buildStateResponse(responseServices, params.compact == true)
 		response.retainedPushProof = retainedProof
+		response.retainedPushProofLocal = retainedProofLocal
 		response.pushProofMatches = pushProofMatches
 		response.pushProofMismatch = pushProofMismatch
 		response.nativeRelayContinued = continuedNativeRelay
