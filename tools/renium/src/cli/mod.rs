@@ -944,8 +944,7 @@ pub(super) struct ImportPathArgs {
     #[arg(
         help = "Project path for a directory import",
         long,
-        value_name = "PATH",
-        required_unless_present = "path_json"
+        value_name = "PATH"
     )]
     pub(super) destination: Option<PathBuf>,
     #[arg(

@@ -2,7 +2,7 @@
 
 ## Access and targeting
 
-Built-in performance diagnostics are a trusted Renium workflow. They do not require switching protected-property modes or asking for per-property approval. This applies only to Renium's authenticated profiling operations, not arbitrary scripts, engine methods or property writes.
+Performance diagnostics need no protected-property mode or per-property approval.
 
 Select the intended place and Edit/server/client runtime. Reuse existing sessions; profiling is not a reason to start Play when the data needed is already captured. Keep raw captures tied to their runtime, build and timestamps. Report measured frame times and supporting scopes, not guessed causes or sums of overlapping work.
 
@@ -45,7 +45,7 @@ Analysis runs offline, outside Studio. It returns the five slowest frames in the
 
 Scopes rank by `wallMs`: occupied time for one timer/thread, counting recursive overlap once. `inclusiveMs` sums calls and can exceed a frame through recursion. Different scopes and threads still overlap; neither is an additive frame breakdown or proof of the critical path. Inspect the relevant thread before naming a cause. Sleeping threads are separate; use `--scope Sleep` to inspect them. GPU frame bounds alone do not prove a GPU bottleneck. LibMP does not expose scope-instance labels or allocation/network event metadata; automatic `$Script` scopes cannot identify a script by name. User `debug.profilebegin` names remain visible.
 
-The first offline analysis downloads Roblox's hash-pinned LibMP parser; later runs use the verified local cache. Capture files are data, never executable scripts. Do not start Play, request protected-property access, paste dump contents into the chat, or build ad-hoc Studio scans to use this workflow.
+The first offline analysis downloads Roblox's hash-pinned LibMP parser; later runs use the local cache. Do not start Play, request protected-property access, paste dump contents into the chat, or build ad-hoc Studio scans for this workflow.
 
 ## Constrain resources
 
