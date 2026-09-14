@@ -4,7 +4,7 @@ use std::env;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -1932,6 +1932,8 @@ pub fn run_explain_path(args: ExplainPathArgs, global_project: Option<&Path>) ->
         "ignored": ignored_by_path,
         "owned": has_owner_match && !ignored_by_path,
     });
+    let mut result = result;
+    crate::app::output::strip_empty(&mut result);
     print_json(&result, args.pretty)
 }
 
@@ -3471,15 +3473,7 @@ fn compile_glob(pattern: &str) -> Result<GlobMatcher> {
 }
 
 fn print_json(value: &Value, pretty: bool) -> Result<()> {
-    let stdout = io::stdout();
-    let mut lock = stdout.lock();
-    if crate::app::output::global_pretty_output(pretty) {
-        serde_json::to_writer_pretty(&mut lock, value)?;
-    } else {
-        serde_json::to_writer(&mut lock, value)?;
-    }
-    writeln!(lock)?;
-    Ok(())
+    crate::app::output::print_json_output(value, pretty)
 }
 
 #[cfg(test)]

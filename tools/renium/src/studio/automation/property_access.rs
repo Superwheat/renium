@@ -97,13 +97,14 @@ pub(crate) fn command(args: PropertyAccessArgs) -> Result<()> {
     }
     let mut parameters = serde_json::to_value(args.action)?;
     parameters["player"] = json!(args.player);
-    let result = daemon_result(
+    let mut result = daemon_result(
         op::PROPERTY_ACCESS,
         None,
         parameters,
         false,
         Some(&args.bridge),
     )?;
+    crate::app::output::strip_empty(&mut result);
     print_json_output(&result, false)
 }
 

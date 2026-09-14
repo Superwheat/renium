@@ -32,7 +32,7 @@ pub(crate) fn command() -> clap::Command {
             .expect("command example must name an existing command");
         *subcommand = std::mem::take(subcommand).after_help(*examples);
     }
-    command.after_help(
+    command.term_width(0).after_help(
             "Examples:\n  rbx f Workspace -n Door\n  rbx pl\n  rbx ps src/StarterGui/Menu.client.luau\n  rbx l \"return game.PlaceId\"\n  rbx sc --studio -o studio.png",
         )
 }

@@ -147,7 +147,25 @@ pub(crate) fn studio_status(args: StudioStatusArgs, project: Option<&Path>) -> R
         false,
         Some(&args.bridge),
     ) {
-        Ok(result) => app::output::print_json_output(&result, false),
+        Ok(mut result) => {
+            if let Some(map) = result.as_object_mut() {
+                map.remove("studios");
+                map.remove("studioState");
+                for client in map
+                    .get_mut("clients")
+                    .and_then(Value::as_array_mut)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_object_mut)
+                {
+                    client.remove("bridgeBuildUnix");
+                    client.remove("channels");
+                    client.remove("ports");
+                }
+            }
+            app::output::strip_empty(&mut result);
+            app::output::print_json_output(&result, false)
+        }
         Err(error)
             if error
                 .to_string()
