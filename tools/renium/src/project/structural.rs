@@ -538,7 +538,7 @@ pub(crate) fn move_instance_between_service_stores(
             "sourceStoreRemoved": source_store_removed,
             "changedPaths": changed_paths,
         }),
-        true,
+        false,
     )?;
     log_timing("cross-service move total", move_started);
     Ok(())

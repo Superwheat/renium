@@ -703,14 +703,17 @@ fn import_path_json_destination(
         bail!("--path-json targets an adapter; edit or import its canonical source file instead");
     }
     let mut destination = resolution.path;
-    if source.is_file() && destination.extension().is_none() {
+    if source.is_file() {
         let naming = config::project_script_naming(&loaded.project);
-        let suffix = import_source_suffix(source, Some(&naming))?;
         let target_name = destination
             .file_name()
             .and_then(|value| value.to_str())
             .context("--path-json target name is not valid UTF-8")?;
-        destination.set_file_name(format!("{target_name}{suffix}"));
+        // The last segment is an instance name, which may contain dots.
+        if infer_source_script(target_name, &naming).is_none() {
+            let suffix = import_source_suffix(source, Some(&naming))?;
+            destination.set_file_name(format!("{target_name}{suffix}"));
+        }
     }
     Ok(destination)
 }

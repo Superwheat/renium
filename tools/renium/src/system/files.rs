@@ -563,7 +563,8 @@ pub(crate) fn unique_child_stem(
 ) -> String {
     let base = sanitize_name(raw_name);
     let base_key = normalized_child_stem_key(&base);
-    if used_stem_keys.insert(base_key.clone()) {
+    // `init.*` names the containing directory's own script.
+    if base_key != "init" && used_stem_keys.insert(base_key.clone()) {
         next_suffix_by_base.entry(base_key).or_insert(2);
         return base;
     }
