@@ -8,6 +8,7 @@ use clap::Parser;
 )]
 pub(crate) struct VcInitArgs {
     #[arg(
+        help = "Project root directory",
         short = 'r',
         long,
         alias = "root",
@@ -26,9 +27,14 @@ pub(crate) struct VcInitArgs {
         value_name = "URL"
     )]
     pub(crate) remote: Option<String>,
-    #[arg(long, value_name = "COMMAND", default_value = "git")]
+    #[arg(
+        help = "Git executable",
+        long,
+        value_name = "COMMAND",
+        default_value = "git"
+    )]
     pub(crate) git_path: String,
-    #[arg(long)]
+    #[arg(help = "Pretty-print the JSON result", long)]
     pub(crate) pretty: bool,
 }
 
@@ -53,7 +59,7 @@ pub(crate) struct ViewArgs {
         long
     )]
     pub(crate) json: bool,
-    #[arg(long)]
+    #[arg(help = "Pretty-print the JSON result", long)]
     pub(crate) pretty: bool,
 }
 
@@ -86,34 +92,43 @@ pub(crate) struct VcMergeArgs {
         value_name = "ours|theirs"
     )]
     pub(crate) prefer: Option<String>,
-    #[arg(long)]
+    #[arg(help = "Pretty-print the JSON result", long)]
     pub(crate) pretty: bool,
 }
 
 #[derive(Parser)]
 pub(crate) struct GenerateSourcemapArgs {
-    #[arg(long, value_name = "PATH", default_value = ".")]
+    #[arg(
+        help = "Project root directory",
+        long,
+        value_name = "PATH",
+        default_value = "."
+    )]
     pub(crate) project_root: PathBuf,
-    #[arg(long)]
+    #[arg(help = "Use this renium.project.jsonc", long)]
     pub(crate) project: Option<PathBuf>,
-    #[arg(short, long, value_name = "PATH")]
+    #[arg(help = "Sourcemap path to write", short, long, value_name = "PATH")]
     pub(crate) output: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(help = "Print instead of writing", long)]
     pub(crate) stdout: bool,
-    #[arg(long, requires = "stdout")]
+    #[arg(help = "Read the cached sourcemap", long, requires = "stdout")]
     pub(crate) cached: bool,
-    #[arg(long)]
+    #[arg(help = "Rebuild on file changes", long)]
     pub(crate) watch: bool,
-    #[arg(long, default_value_t = 250)]
+    #[arg(help = "Rebuild interval while watching", long, default_value_t = 250)]
     pub(crate) interval_ms: u64,
-    #[arg(long)]
+    #[arg(help = "Write absolute paths", long)]
     pub(crate) absolute_paths: bool,
-    #[arg(long = "filter", value_name = "GLOB")]
+    #[arg(
+        help = "Only entries matching GLOB (repeatable)",
+        long = "filter",
+        value_name = "GLOB"
+    )]
     pub(crate) filters: Vec<String>,
 }
 
 #[derive(Parser)]
 pub(crate) struct CursorPollArgs {
-    #[arg(long, default_value_t = 16)]
+    #[arg(help = "Poll interval", long, default_value_t = 16)]
     pub(crate) interval_ms: u64,
 }
