@@ -2254,6 +2254,22 @@ pub(crate) fn reconciliation_values_equal(left: &Value, right: &Value, approxima
     reconciliation_values_equal_with_ids(left, right, approximate, None, None)
 }
 
+/// Stores written by older model imports keep scalars typed, as
+/// `{"_type":"Float32","value":n}` or `{"_type":"Content","value":"..."}`;
+/// pulls store the plain number or string.
+fn typed_scalar(value: &Value) -> &Value {
+    let Some(object) = value.as_object() else {
+        return value;
+    };
+    let inner = object.get("value");
+    match object.get("_type").and_then(Value::as_str) {
+        Some("Int32" | "Int64" | "Float32" | "Float64") => inner.filter(|inner| inner.is_number()),
+        Some("Content" | "ContentId") => inner.filter(|inner| inner.is_string()),
+        _ => None,
+    }
+    .unwrap_or(value)
+}
+
 fn reconciliation_values_equal_with_ids(
     left: &Value,
     right: &Value,
@@ -2261,6 +2277,7 @@ fn reconciliation_values_equal_with_ids(
     left_ids: Option<&AHashMap<&str, usize>>,
     right_ids: Option<&AHashMap<&str, usize>>,
 ) -> bool {
+    let (left, right) = (typed_scalar(left), typed_scalar(right));
     match (left, right) {
         (Value::Number(left), Value::Number(right)) if !approximate => {
             exact_json_numbers_equal(left, right)

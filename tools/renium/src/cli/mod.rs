@@ -466,7 +466,8 @@ pub(super) enum Commands {
         name = "cs",
         alias = "clients",
         alias = "studios",
-        alias = "list-clients"
+        alias = "list-clients",
+        about = "List connected Studio instances"
     )]
     ListClients(ListClientsArgs),
     #[command(
