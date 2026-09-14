@@ -5230,7 +5230,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			else
 				local ok, source = readScriptSource(instance)
 				if ok and type(source) == "string" then
-					rows[position] = { index = index, source = source }
+					rows[position] = { index = index, source = source, className = instance.ClassName }
 				else
 					rows[position] = { index = index, error = tostring(source) }
 				end
@@ -5818,6 +5818,35 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local snapshotServices = servicesWithoutNativeImport(serviceNames, nativeImportServices)
 		local snapshotSourceChanges = changesWithoutNativeImport(params.sourceChanges or {}, nativeImportServices)
 		local snapshotPropertyChanges = changesWithoutNativeImport(params.propertyChanges or {}, nativeImportServices, true)
+		-- Sources and properties roll back from their own captures. When a package
+		-- root is the only reason for a structural snapshot, serialize just the
+		-- top-level branches that hold package roots instead of every edited branch.
+		local snapshotMutationRoots, snapshotRestricted = mutationRootsByService, restrictedMutationServices
+		if
+			params.hasInstanceChanges ~= true
+			and next(packageSnapshotRoots) ~= nil
+			and not mutationNeedsStructuralSnapshot({
+				sourceChanges = snapshotSourceChanges,
+				propertyChanges = snapshotPropertyChanges,
+			}, ctx)
+		then
+			snapshotMutationRoots, snapshotRestricted = {}, {}
+			for _, serviceName in ipairs(snapshotServices) do
+				snapshotRestricted[serviceName] = true
+			end
+			for root in pairs(packageSnapshotRoots) do
+				local branch = root
+				while branch.Parent ~= nil and branch.Parent.Parent ~= game do
+					branch = branch.Parent
+				end
+				local service = branch.Parent
+				if service ~= nil then
+					local serviceRoots = snapshotMutationRoots[service.ClassName] or {}
+					serviceRoots[branch] = true
+					snapshotMutationRoots[service.ClassName] = serviceRoots
+				end
+			end
+		end
 		local studioGenerations = captureStudioGenerations(serviceNames)
 		local snapshot = TransactionState.captureSnapshot(snapshotServices, {
 			forceStructural = params.hasInstanceChanges == true or next(packageSnapshotRoots) ~= nil,
@@ -5827,8 +5856,8 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			sourceChanges = snapshotSourceChanges,
 			propertyChanges = snapshotPropertyChanges,
 			packageSnapshotRoots = packageSnapshotRoots,
-			mutationRootsByService = mutationRootsByService,
-			restrictedMutationServices = restrictedMutationServices,
+			mutationRootsByService = snapshotMutationRoots,
+			restrictedMutationServices = snapshotRestricted,
 		}, ctx)
 		assertSessionOwnership(operationCancellation)
 		if
@@ -6042,9 +6071,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		-- Bind the equality cache to the verified transaction state. A callback
 		-- during FinishRecording can edit Studio after commit; capturing afterward
 		-- would mistake those newer values for the files that were just pushed.
-		local verifiedPushProof = nil
+		local verifiedPushProof, pushProofUnavailable = nil, nil
 		if ctx.capturePushProof then
-			verifiedPushProof = ctx.capturePushProof()
+			verifiedPushProof, pushProofUnavailable = ctx.capturePushProof()
 		end
 		assertCommitActive()
 		TransactionState.drainJournal(session, ctx)
@@ -6114,6 +6143,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		return recordTransactionOutcome(transactionId, "committed", {
 			undoRecorded = undoRecorded,
 			verifiedPushProof = verifiedPushProof,
+			pushProofUnavailable = pushProofUnavailable,
 		})
 	end
 

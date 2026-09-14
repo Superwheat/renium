@@ -459,7 +459,12 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		if attributes == nil then
 			-- macOS uses the existing local attribute subscriptions. Keep their
 			-- exact observation epochs, not the filtered Live Sync dirty counts.
-			if not localPushProofRequested or not state.started or state.onlyCodeMode or not state.syncbackProperties or not state.itemChangedAvailable then return nil, "full local observation unavailable" end
+			if not localPushProofRequested or not state.started or state.onlyCodeMode or not state.syncbackProperties or not state.itemChangedAvailable then
+				local nativeReason = if nativeAttributeRelay == nil then "native relay missing"
+					elseif not nativeAttributeRelay.nativeArmed then "native relay disarmed"
+					else "native proof unavailable"
+				return nil, `full local observation unavailable ({nativeReason}, started={state.started}, tracking={next(state.trackingGuards) ~= nil})`
+			end
 			if localPushObservation == nil then
 				localPushObservation = { services = table.clone(state.watchedServices), cameraGeneration = 0,
 					guardId = "push-proof-" .. tostring(nextPushProof + 1) }
@@ -2623,6 +2628,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				-- the native subscription is disconnected under the DataModel lock.
 				promoteNativeAttributeConnections()
 				if relay.cached then
+					local retainedGuardId = if verifiedPushProof ~= nil then "push-proof-" .. tostring(verifiedPushProof.id) else nil
 					verifiedPushProof = nil
 					releaseProofConnections(relay)
 					releaseTagConnections()
@@ -2630,6 +2636,12 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 					relay.frameConnection:Disconnect()
 					relay.notify:Destroy()
 					nativeAttributeRelay = nil
+					if retainedGuardId ~= nil and state.trackingGuards[retainedGuardId] ~= nil then
+						state.trackingGuards[retainedGuardId] = nil
+						if not state.persistentTracking and next(state.trackingGuards) == nil then
+							stopTracking()
+						end
+					end
 				end
 				return
 			end
@@ -3887,9 +3899,14 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	end
 
 	function api.getState(params: { [string]: any }, leaseId: string?): { [string]: any }
+		-- Verifying inside the request that starts tracking leaves no gap in
+		-- which an edit could slip between the proof check and the new lease.
+		local pushProofMatches, pushProofMismatch = nil, nil
 		if params.verifyPushProof ~= nil then
-			local matches, reason = api.verifyPushProof(params.verifyPushProof)
-			return { ok = true, pushProofMatches = matches, pushProofMismatch = reason }
+			pushProofMatches, pushProofMismatch = api.verifyPushProof(params.verifyPushProof)
+			if params.start ~= true then
+				return { ok = true, pushProofMatches = pushProofMatches, pushProofMismatch = pushProofMismatch }
+			end
 		end
 		if params.start ~= false and params.stop ~= true and params.releaseTrackingGuardId == nil then
 			localPushProofRequested = params.captureLocalPushProof == true
@@ -3902,6 +3919,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			else
 				nativeAttributeRelay.cached = true
 				nativeAttributeRelay.notify:SetAttribute("CachedPushProof", true)
+				-- Keep listeners armed while the proof lives so the next push
+				-- continues this lease instead of reconnecting every instance.
+				acquireTrackingGuard("push-proof-" .. tostring(params.retainPushProof), 60)
 			end
 			retainedProof = params.retainPushProof
 		end
@@ -3911,7 +3931,14 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			and localPushObservation ~= nil and localPushObservation.cached then
 			releaseLocalPushObservation()
 		end
+		local continuedNativeRelay = false
 		if params.start ~= false and params.stop ~= true and params.releaseTrackingGuardId == nil
+			and nativeAttributeRelay and nativeAttributeRelay.cached and pushProofMatches and wasTracking then
+			-- The daemon that retained this proof continues the same lease: the
+			-- relay, its native worker and every listener stay armed.
+			nativeAttributeRelay.cached = false
+			continuedNativeRelay = true
+		elseif params.start ~= false and params.stop ~= true and params.releaseTrackingGuardId == nil
 			and nativeAttributeRelay and nativeAttributeRelay.cached then
 			-- A new tracking lease can follow a daemon restart before the old
 			-- native worker retires. Give it a distinct relay; late old callbacks
@@ -3933,7 +3960,14 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			if path ~= nil then
 				acquireTrackingGuard(params.trackingGuardId)
 				nativeAttributeRelay.pendingTracking = { guardId = params.trackingGuardId, services = services }
-				return { ok = true, nativeTrackingDeferred = true, nativeAttributeRelay = path, trackingStarted = true }
+				return {
+					ok = true,
+					nativeTrackingDeferred = true,
+					nativeAttributeRelay = path,
+					trackingStarted = true,
+					pushProofMatches = pushProofMatches,
+					pushProofMismatch = pushProofMismatch,
+				}
 			end
 		end
 		if params.stop == true then
@@ -3994,6 +4028,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			else services
 		local response = buildStateResponse(responseServices, params.compact == true)
 		response.retainedPushProof = retainedProof
+		response.pushProofMatches = pushProofMatches
+		response.pushProofMismatch = pushProofMismatch
+		response.nativeRelayContinued = continuedNativeRelay
 		if params.capturePushProof == true then
 			response.verifiedPushProof = api.capturePushProof()
 		end
