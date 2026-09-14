@@ -2367,9 +2367,15 @@ local function changedPropertyNames(properties)
 	end
 	for propertyName in pairs(properties) do
 		propertyName = tostring(propertyName)
-		if propertyName ~= "MeshId" and propertyName ~= "MeshContent" and propertyName ~= "MeshSize" then
+		if propertyName ~= "MeshId" and propertyName ~= "MeshContent" and propertyName ~= "MeshSize"
+			and (propertyName ~= "TextScaled" or properties.TextWrapped == nil) then
 			names[#names + 1] = propertyName
 		end
+	end
+	-- TextScaled=true turns TextWrapped on and TextWrapped=false turns
+	-- TextScaled off, so the wrapping value is written first and scaling wins.
+	if properties.TextScaled ~= nil and properties.TextWrapped ~= nil then
+		names[#names + 1] = "TextScaled"
 	end
 	return names
 end
