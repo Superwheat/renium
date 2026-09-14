@@ -1481,7 +1481,6 @@ fn active_data_model(
     {
         return Ok(data_model);
     }
-    let _discovery = crate::app::timing::trace_scope("native.context", "discover DataModel");
     let data_model = find_active_data_model(memory, module, data, &title)?;
     cache
         .lock()
@@ -2541,15 +2540,12 @@ pub(crate) fn capture_live_services(
     services: &[String],
     timeout: Duration,
 ) -> Result<NativeCapture> {
-    use crate::app::timing::{trace_profile, trace_scope};
     let started = Instant::now();
-    let _total = trace_scope("native.capture", "capture selected services");
     capture_remaining_ms(started, timeout)?;
     anyhow::ensure!(
         !services.is_empty() && services.len() <= MAX_ROOTS,
         "Native capture requires 1..={MAX_ROOTS} services"
     );
-    let discovery = trace_scope("native.capture", "host discovery");
     let memory = ProcessMemory::open(pid)?; // Retains the process across PID reuse.
     let current_modules = modules(pid)?;
     let studio = current_modules
@@ -2560,13 +2556,9 @@ pub(crate) fn capture_live_services(
         "Native capture target is not Roblox Studio"
     );
     let window = capture_window(pid, studio_title)?;
-    let layout_trace = trace_scope("native.capture", "resolve serializer layout");
     let (data, trace, image_stamp) = studio_layout(&studio.path)?;
-    drop(layout_trace);
     verify_loaded_image(&memory, studio, image_stamp)?;
-    let model_trace = trace_scope("native.capture", "resolve live DataModel");
     let mut model = active_data_model(pid, &memory, studio, data, studio_title)?;
-    drop(model_trace);
     let layout = package_layout(&studio.path)?;
     let task_context = data_model_task_context(&memory, studio, &layout, &model)?;
     for rva in [trace.serializer, trace.deallocator, layout.submit_task] {
@@ -2580,12 +2572,10 @@ pub(crate) fn capture_live_services(
         .outer
         .checked_add(model.layout.data_model_instance)
         .context("DataModel instance address overflowed")?;
-    let identity_trace = trace_scope("native.capture", "resolve identity getters");
     let parent_offset = properties::parent_offset(&memory, &model)?;
     let (identity_binding, identity_getter) =
         properties::identity_binding(&memory, studio, &layout, &model, instance)?;
     let debug_id = properties::debug_id_function(&memory, studio, &layout, &model, instance)?;
-    drop(identity_trace);
     let roots = model
         .roots
         .iter()
@@ -2598,20 +2588,16 @@ pub(crate) fn capture_live_services(
         })
         .collect::<Result<Vec<_>>>()?;
     model.roots = select_capture_roots(&roots, services)?;
-    let helper_trace = trace_scope("native.capture", "load helper");
     let helper = ensure_helper_loaded_with_timeout(
         pid,
         &memory,
         &current_modules,
         capture_remaining_ms(started, timeout)?,
     )?;
-    drop(helper_trace);
     let entry = helper
         .checked_add(helper_export_rva("ReniumCaptureRun")?)
         .context("Studio capture helper address overflowed")?;
-    drop(discovery);
 
-    let prepare = trace_scope("native.capture", "prepare transport");
     let mut nonce = [0u8; 16];
     getrandom::fill(&mut nonce)
         .map_err(|error| anyhow::anyhow!("Cannot create capture nonce: {error}"))?;
@@ -2668,11 +2654,7 @@ pub(crate) fn capture_live_services(
     put_u32(&mut parameters, PARAM_TIMEOUT, remaining.min(15_000));
     let remote = memory.allocate(parameters.len())?;
     memory.write(remote.address, &parameters)?;
-    drop(prepare);
-    let native = trace_scope("native.capture", "queued native task");
     let exit = remote.run_owned(entry, capture_remaining_ms(started, timeout)?)?;
-    drop(native);
-    let _transport = trace_scope("native.capture", "read transport");
     // The helper has freed its input. Response is exclusively file-backed.
     let mut header = [0; CAPTURE_HEADER_SIZE];
     transport
@@ -2699,16 +2681,6 @@ pub(crate) fn capture_live_services(
     anyhow::ensure!(
         capture_window(pid, studio_title)? == window,
         "Studio window changed during native capture"
-    );
-    trace_profile(
-        "native.capture",
-        &serde_json::json!({
-            "queueMs": read_u64(&header, 32)? as f64 / 1000.0,
-            "serializeMs": read_u64(&header, 40)? as f64 / 1000.0,
-            "identityMs": read_u64(&header, 48)? as f64 / 1000.0,
-            "writeMs": read_u64(&header, 56)? as f64 / 1000.0,
-            "bytes": byte_count, "identityRows": identity_count / CAPTURE_ROW_SIZE,
-        }),
     );
     Ok(NativeCapture { bytes, identities })
 }

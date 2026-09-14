@@ -1243,16 +1243,10 @@ fn prepare(
     timeout: Duration,
     read_class: Option<&str>,
 ) -> Result<(NativeProperty, String)> {
-    let _trace = crate::app::timing::trace_scope("native.property", "prepare reflected property");
     let mut prepared = discover_property(
         pid, title, segments, ordinals, property, timeout, read_class,
     )?;
-    let phase = crate::app::timing::trace_scope(
-        "native.property",
-        "invoke identity-checked property operation",
-    );
     let response = prepared.invoke(if read_class.is_some() { 3 } else { 0 })?;
-    drop(phase);
     let identity = response
         .get(..16)
         .context("Studio returned no instance identity")?;
@@ -1271,7 +1265,6 @@ fn discover_property(
     timeout: Duration,
     read_class: Option<&str>,
 ) -> Result<NativeProperty> {
-    let _trace = crate::app::timing::trace_scope("native.property", "discover reflected property");
     crate::app::output::log_global(
         5,
         format_args!(
@@ -1279,21 +1272,15 @@ fn discover_property(
         ),
     );
     let started = Instant::now();
-    let phase = crate::app::timing::trace_scope("native.property", "open process");
     let mut memory = Memory::for_process(pid, timeout)?;
-    drop(phase);
     let traced = Instant::now();
-    let phase = crate::app::timing::trace_scope("native.property", "locate DataModel context");
     let context = memory.request(0, &[0], title)?;
     anyhow::ensure!(
         context.len() == 64,
         "Unsupported reflection context; install the matching helper"
     );
     memory.base = read_u64(&context, 0).unwrap();
-    drop(phase);
     let located = Instant::now();
-    let phase =
-        crate::app::timing::trace_scope("native.property", "resolve instance path and class");
     let ancestors = resolve_path(&memory, &context, segments, ordinals)?;
     let (instance, owner) = *ancestors.last().unwrap();
     let class_offset = read_u64(&context, 40).unwrap();
@@ -1304,15 +1291,8 @@ fn discover_property(
         "Native snapshot target changed class"
     );
     let resolved = Instant::now();
-    drop(phase);
-    let phase = crate::app::timing::trace_scope("native.property", "resolve property descriptor");
     let descriptor = memory.member(instance, class_offset, property)?;
-    drop(phase);
     let member = Instant::now();
-    let phase = crate::app::timing::trace_scope(
-        "native.property",
-        "resolve property codec and identity getter",
-    );
     let descriptor_kind = memory.rtti(descriptor)?;
     anyhow::ensure!(
         descriptor_kind.contains("PropDescriptor"),
@@ -1329,8 +1309,6 @@ fn discover_property(
     let (identity_binding, identity_getter, identity_slot) =
         identity_function(&memory, instance, class_offset)?;
     let codecs = Instant::now();
-    drop(phase);
-    let phase = crate::app::timing::trace_scope("native.property", "prepare ABI parameters");
     let mut parameters = vec![0; 66216];
     for (offset, value) in [
         (0, read_u64(&context, 56).unwrap()),
@@ -1370,7 +1348,6 @@ fn discover_property(
         parameters,
         writable: setter != 0,
     };
-    drop(phase);
     crate::app::output::log_global(
         5,
         format_args!(

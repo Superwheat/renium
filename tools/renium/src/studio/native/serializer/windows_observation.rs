@@ -321,7 +321,6 @@ fn begin_observation(
     lifetime: Duration,
     relay_path: Option<&[String]>,
 ) -> Result<AttributeGuard> {
-    let _trace = crate::app::timing::trace_scope("native.capture", "arm native attributes");
     let memory = ProcessMemory::open_with_access(pid, PROCESS_DUP_HANDLE)?;
     let modules = modules(pid)?;
     let studio = modules.first().context("No Studio module")?;

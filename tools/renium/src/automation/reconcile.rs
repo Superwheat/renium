@@ -71,7 +71,6 @@ const RECORD_VERSION: u8 = 2;
 const RECORD_DIR: &str = "reconcile";
 
 fn log_reconcile_timing(label: &str, started: Instant) {
-    crate::app::timing::trace_timing("reconcile", label, started);
     log_global(
         4,
         format_args!("[renium] reconcile {label}: {:.1}ms", elapsed_ms(started)),
@@ -2561,7 +2560,6 @@ fn push_project(
     guard: Option<&StudioChangeGuard>,
     replace: bool,
 ) -> Result<Map<String, Value>> {
-    let _trace = crate::app::timing::trace_scope("sync", "full push");
     #[cfg(any(windows, target_os = "macos"))]
     if replace && guard.is_none() && try_verified_full_push(context, bridge, services, &push_args)?
     {
@@ -2578,7 +2576,6 @@ fn push_project(
     };
     #[cfg(windows)]
     let mut _native_attributes = None;
-    let mut stages = crate::app::timing::trace_stages("push.stage", "acquire Studio change guard");
     let phase = Instant::now();
     let (mut guard, initial_state) = if let Some(guard) = guard {
         (guard.clone(), Value::Null)
@@ -2617,7 +2614,6 @@ fn push_project(
         )?
     };
     log_reconcile_timing("full push guard", phase);
-    stages.next("prepare snapshot stage and read project configuration");
     let phase = Instant::now();
     // Declared before the tracking lease so unwinding releases Lua tracking
     // before native observation. On cancellation the native guard can promote
@@ -2641,20 +2637,11 @@ fn push_project(
     } else {
         ExportProjectStage::create_for_comparison(&root, &src_dir, services)?
     };
-    stages.next("capture current Studio services and source files");
     let source_paths = stage.publish_paths().to_vec();
-    let trace_context = crate::app::timing::trace_context();
     // Source capture is read-only and independent of the private Studio stage.
     // Keep Studio calls on this thread, with its selected runtime and lease.
     let (captured, project) = std::thread::scope(|scope| {
-        let project = scope.spawn(|| {
-            let _context = crate::app::timing::enter_trace_context(trace_context);
-            let _trace = crate::app::timing::trace_scope(
-                "push.source",
-                "read and hash source project files",
-            );
-            capture_snapshot(&root, &source_paths)
-        });
+        let project = scope.spawn(|| capture_snapshot(&root, &source_paths));
         let captured = if !requires_stage
             && stage
                 .loaded
@@ -2675,26 +2662,14 @@ fn push_project(
     let project = project?;
     log_reconcile_timing("full push capture", phase);
     let phase = Instant::now();
-    stages.next("decode source settings and prepare replacement");
     let mut prepared_settings = HashMap::new();
     let differences = if replace {
         let paths = project_replacement_paths(&project, &studio);
-        let trace_context = crate::app::timing::trace_context();
         // Replacement writes the complete captured snapshot. Its private staging
         // files do not depend on decoding or matching retained Studio objects.
         let (prepared, staged) = rayon::join(
-            || {
-                let _context = crate::app::timing::enter_trace_context(trace_context);
-                prepare_project_replacement(&project, &studio, &paths, &mut prepared_settings)
-            },
-            || {
-                let _context = crate::app::timing::enter_trace_context(trace_context);
-                let _trace = crate::app::timing::trace_scope(
-                    "push.prepare",
-                    "write source snapshot into staging area",
-                );
-                stage_snapshot_paths(&stage.project_root, &paths, &project)
-            },
+            || prepare_project_replacement(&project, &studio, &paths, &mut prepared_settings),
+            || stage_snapshot_paths(&stage.project_root, &paths, &project),
         );
         let unchanged_settings = prepared?;
         staged?;
@@ -2759,7 +2734,6 @@ fn push_project(
         return Ok(Map::from_iter([("ok".to_string(), Value::Bool(true))]));
     }
     let phase = Instant::now();
-    stages.next("build replacement and retained-setting plan");
     let plan = reconciliation_push_plan_for_paths_with_prepared_settings(
         &studio,
         &project,
@@ -2786,13 +2760,10 @@ fn push_project(
     }
     let mutation_paths = differences.clone();
     let phase = Instant::now();
-    stages.next("prepare filesystem undo snapshot");
     let history = history::SyncHistory::begin(&root, &src_dir, &studio, &mutation_paths)?;
     if !replace {
-        stages.next("write source snapshot into staging area");
         apply_snapshot_paths(&stage.project_root, &mutation_paths, &project)?;
     }
-    stages.next("assemble prepared document ownership");
     let mut prepared_documents = HashMap::with_capacity(prepared_settings.len());
     let mut prepared_verification = HashMap::with_capacity(prepared_settings.len());
     for (path, change) in prepared_settings {
@@ -2810,7 +2781,6 @@ fn push_project(
             );
         }
     }
-    stages.next("apply staged project to Studio");
     let mut pushed = push_staged_project(
         context,
         &stage,
@@ -2823,14 +2793,12 @@ fn push_project(
             expected_project: Some(&project),
         },
     )?;
-    stages.next("commit filesystem undo snapshot");
     pushed.summary.insert(
         "historyId".into(),
         Value::String(history.commit(&project, &pushed.generated)?),
     );
     log_reconcile_timing("full push mutation", phase);
 
-    stages.next("resolve post-push runtime");
     let replacement = reopened_push_context(context, &pushed.summary)?;
     let _replacement_selection = replacement.as_ref().map(bound_context::select);
     let context = replacement.as_ref().unwrap_or(context);
@@ -2846,9 +2814,7 @@ fn push_project(
             .clone_from(&guard.tracking_guard_id);
     }
 
-    stages.next("recheck source files for concurrent edits");
     let current = capture_snapshot(&root, stage.publish_paths())?;
-    stages.next("select required readback from verification receipts");
     let mut verification_paths = differences;
     verification_paths.extend(mutation_paths);
     verification_paths.extend(pushed.generated.entries.keys().cloned());
@@ -2891,21 +2857,14 @@ fn push_project(
         || (pushed.generated.entries.is_empty()
             && exact_source_push_verified(&pushed.summary, &verification_paths))
     {
-        stages.next("acknowledge verified push and release comparison data");
         if project == current && !requires_stage && replacement.is_none() {
             tracking_release.proof = pushed.summary.remove("verifiedPushProof");
         }
-        let trace_context = crate::app::timing::trace_context();
         std::thread::scope(|scope| {
             // No remaining readback consumes these trees. Release their large
             // allocations on the existing parallel path while Studio closes the
             // observation lease; join cleanup before returning to the caller.
             scope.spawn(move || {
-                let _context = crate::app::timing::enter_trace_context(trace_context);
-                let _trace = crate::app::timing::trace_scope(
-                    "push.cleanup",
-                    "release verified comparison documents",
-                );
                 prepared_verification
                     .into_par_iter()
                     .for_each(|(_, verified)| {
@@ -2932,7 +2891,6 @@ fn push_project(
         return Ok(pushed.summary);
     }
     let verification_services = services_for_snapshot_paths(context, &verification_paths);
-    stages.next("capture required post-push service readback");
     let phase = Instant::now();
     let readback_stage = if requires_stage {
         ExportProjectStage::create(&root, &src_dir, &verification_services)?
@@ -2957,7 +2915,6 @@ fn push_project(
         .1
     };
     log_reconcile_timing("full push readback", phase);
-    stages.next("verify intended values against readback");
     let phase = Instant::now();
     // These documents were already aligned to the exact requested file bytes.
     // Generated values or a later file edit invalidate that proof, not merely
@@ -2987,7 +2944,6 @@ fn push_project(
                 .unwrap_or_default()
         );
     }
-    stages.next("acknowledge verified push and release Studio tracking guard");
     let mut expected_after_push = project;
     expected_after_push.entries.extend(pushed.generated.entries);
     if expected_after_push == current && !requires_stage && replacement.is_none() {
@@ -3330,8 +3286,6 @@ fn push_staged_project(
     bridge: &BridgeServer,
     request: StagedPushRequest<'_>,
 ) -> Result<StagedPushResult> {
-    let mut stages =
-        crate::app::timing::trace_stages("push.staged", "check supporting source files");
     let StagedPushRequest {
         plan,
         prepared_documents,
@@ -3392,11 +3346,9 @@ fn push_staged_project(
         }
         Ok(())
     };
-    stages.next("bind staged project to intended runtime");
     let staged = staged_context(context, stage, &push_args.project.src_root)?;
     let _selection = bound_context::select(&staged);
     pin_edit_runtime(&staged, bridge)?;
-    stages.next("prepare scoped editor arguments and native documents");
     let source_relative =
         project_relative_source_root(&push_args.project.project_root, &push_args.project.src_root)?;
     push_args
@@ -3420,7 +3372,6 @@ fn push_staged_project(
         .map(|(service, document)| (service.clone(), Arc::clone(document)))
         .collect::<HashMap<_, _>>();
     let mut generated = ProjectSnapshot::default();
-    stages.next("collect and apply editor changes");
     let summary = push_reconciled_editor_changes_with_warm_bridge(
         push_args,
         bridge,
@@ -3445,17 +3396,14 @@ fn push_staged_project(
         },
         validate_project,
     )?;
-    stages.next("validate staged push result");
     if summary.get("skippedByReview").and_then(Value::as_bool) == Some(true) {
         bail!("Reconciled changes require review before Studio can be updated");
     }
-    stages.next("release prepared native service documents");
     for document in initial_documents.into_values() {
         if let Some(document) = Arc::into_inner(document) {
             drop_settings_document(document);
         }
     }
-    stages.next("restore caller project selection and release staged arguments");
     Ok(StagedPushResult { generated, summary })
 }
 
@@ -5596,21 +5544,17 @@ fn snapshot_intended_delta_mismatches(
         })
         .map(|path| (path, prepared.remove(path)))
         .collect::<Vec<_>>();
-    let trace_context = crate::app::timing::trace_context();
     // Services have independent identity graphs. Share the captured snapshots,
     // but give each worker ownership of its already-prepared documents.
     let results = jobs
         .into_par_iter()
         .map(|(path, prepared)| {
-            let _trace_context =
-                trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
             let desired_entry = desired.entries.get(path);
             let mismatch = if path
                 .file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(is_service_settings_file_name)
             {
-                let _trace = crate::app::timing::trace_scope("reconcile", "verify pushed service");
                 settings_delta_mismatch(
                     path,
                     before.entries.get(path),
@@ -6016,18 +5960,9 @@ fn snapshot_entry_equivalent(
         .and_then(|name| name.to_str())
         .is_some_and(is_service_settings_file_name)
     {
-        let trace_context = crate::app::timing::trace_context();
         let (left, right) = rayon::join(
-            || {
-                let _trace_context = trace_context
-                    .map(|context| crate::app::timing::enter_trace_context(Some(context)));
-                settings_document(Some(left))
-            },
-            || {
-                let _trace_context = trace_context
-                    .map(|context| crate::app::timing::enter_trace_context(Some(context)));
-                settings_document(Some(right))
-            },
+            || settings_document(Some(left)),
+            || settings_document(Some(right)),
         );
         let mut left = left?;
         let mut right = right?;
@@ -6329,11 +6264,6 @@ fn prepare_project_replacement(
     paths: &HashSet<PathBuf>,
     prepared: &mut HashMap<PathBuf, PreparedEditorSettingsChange>,
 ) -> Result<HashSet<PathBuf>> {
-    let trace_context = crate::app::timing::trace_context();
-    let mut stages = crate::app::timing::trace_stages(
-        "push.prepare",
-        "join parallel source decode and retained-container preparation",
-    );
     let documents = paths
         .par_iter()
         .filter(|path| {
@@ -6342,29 +6272,10 @@ fn prepare_project_replacement(
                 .is_some_and(is_service_settings_file_name)
         })
         .map(|path| {
-            let _trace_context =
-                trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
-            let mut worker = crate::app::timing::trace_stages(
-                "push.prepare.worker",
-                "join desired and observed settings decode",
-            );
             let (current, previous) = rayon::join(
-                || {
-                    let _context = trace_context
-                        .map(|context| crate::app::timing::enter_trace_context(Some(context)));
-                    let _trace =
-                        crate::app::timing::trace_scope("push.decode", "decode desired settings");
-                    settings_document(desired.entries.get(path))
-                },
-                || {
-                    let _context = trace_context
-                        .map(|context| crate::app::timing::enter_trace_context(Some(context)));
-                    let _trace =
-                        crate::app::timing::trace_scope("push.decode", "decode observed settings");
-                    settings_document(observed.entries.get(path))
-                },
+                || settings_document(desired.entries.get(path)),
+                || settings_document(observed.entries.get(path)),
             );
-            worker.next("align retained-container identities and viewport references");
             let mut current = current?;
             let previous = previous?;
             if settings_documents_positionally_equivalent(&current, &previous) {
@@ -6444,7 +6355,6 @@ fn prepare_project_replacement(
             ))
         })
         .collect::<Result<Vec<_>>>()?;
-    stages.next("index prepared service documents");
     let mut unchanged = HashSet::new();
     for (path, change) in documents {
         if let Some(change) = change {
@@ -6470,12 +6380,9 @@ fn snapshot_differences_prepared(
     paths.sort();
     paths.dedup();
     let prepare = prepared.is_some();
-    let trace_context = crate::app::timing::trace_context();
     let compared = paths
         .into_par_iter()
         .map(|path| {
-            let _trace_context =
-                trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
             let mut settings = None;
             let equivalent = snapshot_entry_equivalent(
                 &path,

@@ -78,10 +78,7 @@ use cli::{Cli, Commands};
 use studio::target::set_place_filter;
 
 fn main() -> ExitCode {
-    let started = std::time::Instant::now();
-    let result = main_result();
-    app::timing::trace_timing("cli.process", "complete CLI execution", started);
-    result
+    main_result()
 }
 
 fn main_result() -> ExitCode {
@@ -112,7 +109,6 @@ fn main_result() -> ExitCode {
 }
 
 fn run_cli() -> Result<()> {
-    let startup = std::time::Instant::now();
     app::crash::install_hook();
     let matches = cli::command().get_matches();
     let mut cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
@@ -132,12 +128,6 @@ fn run_cli() -> Result<()> {
     }
     app::output::validate_options(&cli)?;
     app::output::configure(&cli);
-    app::timing::trace_timing(
-        "cli.startup",
-        "parse arguments and configure logging",
-        startup,
-    );
-    let mut stages = app::timing::trace_stages("cli.stage", "configure target and check updates");
     set_place_filter(
         cli.place
             .clone()
@@ -165,7 +155,6 @@ fn run_cli() -> Result<()> {
         );
     }
 
-    stages.next("dispatch command and render output");
     cli::dispatch::dispatch(cli.command, cli.project.as_deref())
 }
 

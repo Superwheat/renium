@@ -234,10 +234,7 @@ fn update_sourcemap_service_node(
 impl SourcemapWriter {
     pub(crate) fn start(project_root: PathBuf, durable: bool) -> Self {
         let (sender, receiver) = mpsc::channel::<SourcemapWriterMessage>();
-        let trace_context = crate::app::timing::trace_context();
         let handle = thread::spawn(move || -> Result<()> {
-            let _trace_context =
-                trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
             let existing_root = load_existing_sourcemap_root(&project_root)?;
             let mut wrote_update = existing_root
                 .as_ref()
@@ -517,14 +514,9 @@ impl DirectImportDispatcher {
             run_started,
         };
         let mut workers = Vec::with_capacity(worker_count);
-        let trace_context = crate::app::timing::trace_context();
         for worker_index in 0..worker_count {
             let worker = worker.clone();
-            workers.push(thread::spawn(move || {
-                let _trace_context = trace_context
-                    .map(|context| crate::app::timing::enter_trace_context(Some(context)));
-                worker.run(worker_index)
-            }));
+            workers.push(thread::spawn(move || worker.run(worker_index)));
         }
 
         Ok(Self {
@@ -1528,10 +1520,7 @@ fn maybe_enqueue_split_import_tasks(
     };
     let settings_expected_paths = Arc::clone(&expected_paths);
     let settings_service = service.to_string();
-    let trace_context = crate::app::timing::trace_context();
     let settings_write = thread::spawn(move || {
-        let _trace_context =
-            trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
         write_service_settings_file(
             &settings_service,
             &settings_state,
@@ -2017,11 +2006,8 @@ fn import_service_tree(
     let fresh_service_dir = !cleanup_required;
     let expected_paths = Arc::new(ImportPathSets::default());
     track_expected_dir(&expected_paths, &service_dir);
-    let trace_context = crate::app::timing::trace_context();
     thread::scope(|scope| -> Result<SourcemapNode> {
         let settings_task = scope.spawn(|| {
-            let _trace_context =
-                trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
             write_service_settings_file(
                 service,
                 state,
@@ -2337,10 +2323,7 @@ fn spawn_cleanup_service_dir(
     service_dir: PathBuf,
     expected_paths: Arc<ImportPathSets>,
 ) -> thread::JoinHandle<Result<()>> {
-    let trace_context = crate::app::timing::trace_context();
     thread::spawn(move || -> Result<()> {
-        let _trace_context =
-            trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
         let cleanup_started = Instant::now();
         cleanup_service_dir(&service_dir, &expected_paths)?;
         log_timing(
