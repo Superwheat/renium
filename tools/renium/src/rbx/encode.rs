@@ -132,11 +132,20 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
                         };
                     let property =
                         rbx_property_descriptor(self.database, &instance.class_name, name);
-                    let descriptor = rbx_model_property_descriptor(
-                        self.database,
-                        &instance.class_name,
-                        serialized_name.unwrap_or(name),
-                    );
+                    // Attribute maps (StyleRule.Properties) serialize under the
+                    // canonical name; their binary alias is not a JSON target.
+                    let descriptor = if matches!(
+                        property.map(|property| &property.data_type),
+                        Some(RbxDataType::Value(RbxVariantType::Attributes))
+                    ) {
+                        property
+                    } else {
+                        rbx_model_property_descriptor(
+                            self.database,
+                            &instance.class_name,
+                            serialized_name.unwrap_or(name),
+                        )
+                    };
                     BytecodeExportPropertyMetadata {
                         property,
                         descriptor,
@@ -531,7 +540,23 @@ pub(crate) fn rbx_logical_property_name<'db>(
                     .properties
                     .get(*alias_for)
                     .map(|property| property.name),
-                RbxPropertyKind::Canonical { .. } => Some(property.name),
+                // A serialized alias can also be listed as its own canonical
+                // property (Use2022MaterialsXml); the logical name is the one
+                // that serializes as it.
+                RbxPropertyKind::Canonical { .. } => Some(
+                    database
+                        .superclasses_iter(class_descriptor)
+                        .flat_map(|class| class.properties.values())
+                        .find(|candidate| {
+                            matches!(
+                                &candidate.kind,
+                                RbxPropertyKind::Canonical {
+                                    serialization: RbxPropertySerialization::SerializesAs(name)
+                                } if *name == property.name
+                            )
+                        })
+                        .map_or(property.name, |canonical| canonical.name),
+                ),
                 _ => None,
             };
         }
@@ -594,7 +619,11 @@ pub(crate) fn json_to_rbx_property_variant(
     refs: &BytecodeModelExportRefs,
 ) -> Option<RbxVariant> {
     if value.is_null() {
-        return None;
+        return matches!(
+            descriptor.map(|descriptor| &descriptor.data_type),
+            Some(RbxDataType::Value(RbxVariantType::OptionalCFrame))
+        )
+        .then_some(RbxVariant::OptionalCFrame(None));
     }
     match descriptor.map(|descriptor| &descriptor.data_type) {
         Some(RbxDataType::Enum(enum_name)) => {
@@ -627,6 +656,10 @@ fn json_to_rbx_variant_for_type(
             .map(|text| RbxVariant::ContentId(RbxContentId::from(text))),
         RbxVariantType::Content => json_to_rbx_content(value, refs).map(RbxVariant::Content),
         RbxVariantType::Tags => json_to_rbx_tags(value).map(RbxVariant::Tags),
+        RbxVariantType::Attributes => value
+            .as_object()
+            .and_then(|map| json_attributes_to_rbx(map, database, refs).ok())
+            .map(RbxVariant::Attributes),
         RbxVariantType::Ref => Some(RbxVariant::Ref(json_to_rbx_ref(value, refs))),
         RbxVariantType::Vector2 => json_to_rbx_vector2(value).map(RbxVariant::Vector2),
         RbxVariantType::Vector3 => json_to_rbx_vector3(value).map(RbxVariant::Vector3),
