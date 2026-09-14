@@ -1195,6 +1195,7 @@ mod native_property_tests {
                     path_segments: vec!["Workspace".into(), "Same".into()],
                     path_ordinals: vec![1, 2],
                 }],
+                root_settings_ids: Vec::new(),
                 viewport_camera: None,
                 retained_roots: vec![EditorBinaryRetainedRoot {
                     path_segments: vec!["Workspace".into(), "Retained".into()],
@@ -1506,6 +1507,7 @@ mod native_property_tests {
                 payload_root_name: "payload".into(),
                 expected_structure: None,
                 root_paths: Vec::new(),
+                root_settings_ids: Vec::new(),
                 viewport_camera: None,
                 retained_roots: Vec::new(),
                 package_roots: Vec::new(),

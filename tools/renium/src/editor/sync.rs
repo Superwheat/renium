@@ -4725,6 +4725,7 @@ mod sync_tests {
                 payload_root_name: "payload".to_string(),
                 expected_structure: None,
                 root_paths: Vec::new(),
+                root_settings_ids: Vec::new(),
                 viewport_camera: None,
                 retained_roots: Vec::new(),
                 package_roots: vec![EditorBinaryPackageRoot {
