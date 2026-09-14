@@ -5,7 +5,7 @@ use std::io::{Cursor, Read, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ahash::{AHashMap, AHashSet};
 use anyhow::{Context, Result, bail};
@@ -14,7 +14,6 @@ use rayon::prelude::*;
 use serde::Serialize;
 use serde_json::{Map, Number, Value};
 
-use crate::app::timing::log_timing;
 use crate::rbx::decode::{json_number_f64, nonfinite_float_from_json};
 use crate::roblox::schema::MESH_SIZE_TRANSPORT_PROPERTY;
 use crate::snapshot::types::{NativeSettingsValue, ServiceState, SnapshotInstance};
@@ -415,18 +414,14 @@ fn decode_settings_bytecode_container(bytes: &[u8]) -> Result<(u8, Vec<u8>)> {
     }
     let encoded = reader.read_bytes(encoded_len)?;
     reader.finish()?;
-    let decompress_started = Instant::now();
     let decoded = zstd::bulk::decompress(encoded, decoded_len)?;
-    log_timing("settings binary decompress", decompress_started);
     Ok((version, decoded))
 }
 
 fn decode_settings_bytecode_document(version: u8, decoded: &[u8]) -> Result<SettingsBytecode> {
-    let decode_started = Instant::now();
     let mut payload_reader = BytecodeReader::new(decoded);
     let document = decode_settings_bytecode_payload(version, &mut payload_reader)?;
     payload_reader.finish()?;
-    log_timing("settings binary payload decode", decode_started);
     Ok(document)
 }
 
@@ -457,7 +452,6 @@ struct SettingsPayloadHeader {
 fn decode_settings_payload_header(
     reader: &mut BytecodeReader<'_>,
 ) -> Result<SettingsPayloadHeader> {
-    let tables_started = Instant::now();
     let string_count = reader.read_collection_len("string count")?;
     let mut strings = Vec::with_capacity(string_count);
     for _ in 0..string_count {
@@ -484,13 +478,10 @@ fn decode_settings_payload_header(
                 .to_string(),
         );
     }
-    log_timing("settings binary tables decode", tables_started);
 
-    let instances_started = Instant::now();
     let instance_count = reader.read_collection_len("instance count")?;
     let instances = decode_settings_instances(reader, &strings, &classes, instance_count)?;
     validate_settings_hierarchy(&instances)?;
-    log_timing("settings binary instances decode", instances_started);
 
     Ok(SettingsPayloadHeader {
         strings,
@@ -511,7 +502,6 @@ fn decode_settings_bytecode_payload(
         instance_count,
     } = decode_settings_payload_header(reader)?;
 
-    let group_specs_started = Instant::now();
     let group_count = reader.read_collection_len("property group count")?;
     let mut specs = Vec::with_capacity(group_count);
     for _ in 0..group_count {
@@ -525,11 +515,6 @@ fn decode_settings_bytecode_payload(
         let body = reader.read_bytes(body_len)?;
         specs.push((property_name, kind, value_count, body));
     }
-    log_timing(
-        "settings binary property group headers",
-        group_specs_started,
-    );
-    let groups_started = Instant::now();
     let decoded_groups = specs
         .par_iter()
         .map(|(property_name, kind, value_count, body)| {
@@ -543,10 +528,7 @@ fn decode_settings_bytecode_payload(
             )
         })
         .collect::<Result<Vec<_>>>()?;
-    log_timing("settings binary property group decode", groups_started);
-    let apply_started = Instant::now();
     apply_decoded_property_groups(&mut instances, &specs, decoded_groups);
-    log_timing("settings binary property group apply", apply_started);
 
     Ok(SettingsBytecode { version, instances })
 }
@@ -839,18 +821,10 @@ fn encode_settings_bytecode_with_reference_lookup(
     document: &SettingsBytecode,
     build_reference_lookup: bool,
 ) -> Result<Vec<u8>> {
-    let validate_started = Instant::now();
     validate_settings_hierarchy(&document.instances)?;
-    log_timing("settings binary hierarchy validation", validate_started);
-
-    let payload_started = Instant::now();
     let payload =
         encode_settings_bytecode_payload_with_reference_lookup(document, build_reference_lookup)?;
-    log_timing("settings binary payload encode", payload_started);
-
-    let compress_started = Instant::now();
     let encoded = wrap_settings_bytecode_payload(&payload)?;
-    log_timing("settings binary payload compression", compress_started);
     Ok(encoded)
 }
 
@@ -1004,7 +978,6 @@ fn encode_settings_bytecode_payload_with_reference_lookup(
     document: &SettingsBytecode,
     build_reference_lookup: bool,
 ) -> Result<Vec<u8>> {
-    let lookup_started = Instant::now();
     let lookup = if build_reference_lookup {
         build_bytecode_instance_lookup(document)
     } else {
@@ -1014,12 +987,8 @@ fn encode_settings_bytecode_payload_with_reference_lookup(
             ..Default::default()
         }
     };
-    log_timing("settings binary encode lookup", lookup_started);
-    let collect_started = Instant::now();
     let collected = collect_settings_bytecode_data(document, &lookup)?;
-    log_timing("settings binary encode collect", collect_started);
 
-    let tables_started = Instant::now();
     let strings = sorted_counted_strings(collected.string_counts);
     let string_ids = build_id_map(&strings);
     let classes = sorted_counted_strings(collected.class_counts);
@@ -1028,7 +997,6 @@ fn encode_settings_bytecode_payload_with_reference_lookup(
     let property_ids = build_id_map(&properties);
     let property_group_entries =
         sorted_settings_property_groups(collected.property_groups, &property_ids);
-    log_timing("settings binary encode tables", tables_started);
 
     let estimated_capacity = document
         .instances
@@ -1044,7 +1012,6 @@ fn encode_settings_bytecode_payload_with_reference_lookup(
         &properties,
         document.instances.len(),
     )?;
-    let instances_started = Instant::now();
     if document.instances.len() >= SETTINGS_BINARY_PARALLEL_MIN_INSTANCES
         && rayon::current_num_threads() > 1
     {
@@ -1090,8 +1057,6 @@ fn encode_settings_bytecode_payload_with_reference_lookup(
             )?;
         }
     }
-    log_timing("settings binary encode instances", instances_started);
-    let properties_started = Instant::now();
     write_settings_binary_property_groups(
         &mut writer,
         &property_group_entries,
@@ -1099,7 +1064,6 @@ fn encode_settings_bytecode_payload_with_reference_lookup(
         &string_ids,
         &lookup,
     )?;
-    log_timing("settings binary encode properties", properties_started);
 
     Ok(writer)
 }
@@ -2002,8 +1966,7 @@ fn write_service_settings_binary_file_inner(
             .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
 
-    let writer = encode_service_settings_binary(path, state)?;
-    let write_started = Instant::now();
+    let writer = encode_service_settings_binary(state)?;
     if fresh {
         let mut file = OpenOptions::new()
             .write(true)
@@ -2015,24 +1978,14 @@ fn write_service_settings_binary_file_inner(
     } else {
         write_bytes_if_changed(path, &writer)?;
     }
-    log_timing(
-        &format!("settings binary write {}", path.display()),
-        write_started,
-    );
     Ok(())
 }
 
-pub(crate) fn encode_service_settings_binary(path: &Path, state: &ServiceState) -> Result<Vec<u8>> {
-    let collect_started = Instant::now();
+pub(crate) fn encode_service_settings_binary(state: &ServiceState) -> Result<Vec<u8>> {
     let instances = collect_service_settings_binary_instances(state);
     let lookup = build_settings_binary_instance_lookup(state, &instances);
     let collected = collect_settings_binary_data(state, &lookup, &instances)?;
-    log_timing(
-        &format!("settings binary collect {}", path.display()),
-        collect_started,
-    );
 
-    let encode_started = Instant::now();
     let strings = sorted_counted_strings(collected.string_counts);
     let string_ids = build_id_map(&strings);
     let classes = sorted_counted_strings(collected.class_counts);
@@ -2097,10 +2050,6 @@ pub(crate) fn encode_service_settings_binary(path: &Path, state: &ServiceState) 
     )?;
 
     let writer = wrap_settings_bytecode_payload(&payload)?;
-    log_timing(
-        &format!("settings binary encode {}", path.display()),
-        encode_started,
-    );
     Ok(writer)
 }
 

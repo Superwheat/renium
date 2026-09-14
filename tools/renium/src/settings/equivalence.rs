@@ -18,7 +18,7 @@ use super::bytecode::{
     is_reference_object,
 };
 use crate::app::output::log_global;
-use crate::app::timing::{log_timing, verbose_timing_logs};
+use crate::app::timing::verbose_timing_logs;
 use crate::rbx::decode::{nonfinite_float_from_json, rbx_variant_to_settings_json};
 use crate::rbx::encode::{
     json_to_rbx_property_variant, rbx_logical_property_name, rbx_model_property_descriptor,
@@ -107,13 +107,10 @@ pub(crate) fn align_settings_bytes_to_reference(
     if reference_bytes == observed_bytes {
         return Ok(SettingsAlignment::Equivalent);
     }
-    let cache_started = Instant::now();
     let cache_key = settings_alignment_cache_key(reference_bytes, observed_bytes);
     if cache_key.is_some_and(settings_alignment_is_cached) {
-        log_timing("settings alignment cache hit", cache_started);
         return Ok(SettingsAlignment::Equivalent);
     }
-    let decode_started = Instant::now();
     let (reference, observed) = if reference_bytes.len().saturating_add(observed_bytes.len())
         >= SETTINGS_PARALLEL_DECODE_MIN_BYTES
     {
@@ -129,14 +126,8 @@ pub(crate) fn align_settings_bytes_to_reference(
     };
     let mut reference = reference?;
     let mut observed = observed?;
-    log_timing("settings alignment decode", decode_started);
-    let positional_started = Instant::now();
     let positionally_equivalent = settings_topology_matches(&reference, &observed)
         && positional_values_equivalent(&reference, &observed, None, false);
-    log_timing(
-        "settings alignment positional comparison",
-        positional_started,
-    );
     if positionally_equivalent {
         if let Some(key) = cache_key {
             cache_settings_alignment(key);
@@ -144,39 +135,26 @@ pub(crate) fn align_settings_bytes_to_reference(
         drop_settings_documents(reference, observed);
         return Ok(SettingsAlignment::Equivalent);
     }
-    let structure_started = Instant::now();
     match align_settings_ids_for_contiguous_structural_change(&mut reference, &mut observed) {
         ContiguousStructuralAlignment::Aligned => {
-            log_timing("settings alignment contiguous structure", structure_started);
-            let encode_started = Instant::now();
             let aligned = encode_settings_bytecode_with_dense_references(&observed)?;
-            log_timing("settings alignment encode", encode_started);
             drop_settings_documents(reference, observed);
             return Ok(SettingsAlignment::Changed(aligned));
         }
         ContiguousStructuralAlignment::PreparedMismatch => {}
         ContiguousStructuralAlignment::NotApplicable => {
-            let stabilize_started = Instant::now();
             rayon::join(
                 || stabilize_settings_reference_ids(&mut reference),
                 || stabilize_settings_reference_ids(&mut observed),
             );
-            log_timing("settings alignment stabilize references", stabilize_started);
         }
     }
-    let identity_started = Instant::now();
     if !align_settings_ids_to_reference(&reference, &mut observed) {
         bail!("duplicate instance identity is ambiguous after comparing references");
     }
-    log_timing("settings alignment identity", identity_started);
-    let encode_started = Instant::now();
     let aligned = encode_settings_bytecode(&observed)?;
-    log_timing("settings alignment encode", encode_started);
-    let canonicalize_started = Instant::now();
     canonicalize_settings_property_names(&mut reference)?;
     canonicalize_settings_property_names(&mut observed)?;
-    log_timing("settings alignment canonicalize", canonicalize_started);
-    let compare_started = Instant::now();
     let result = if settings_documents_match(&reference, &observed, false) {
         if let Some(key) = cache_key {
             cache_settings_alignment(key);
@@ -185,24 +163,20 @@ pub(crate) fn align_settings_bytes_to_reference(
     } else {
         SettingsAlignment::Changed(aligned)
     };
-    log_timing("settings alignment compare", compare_started);
     drop_settings_documents(reference, observed);
     Ok(result)
 }
 
 pub(crate) fn drop_settings_document(document: SettingsBytecode) {
-    let started = Instant::now();
     let SettingsBytecode { instances, .. } = document;
     if instances.len() >= 8_192 && rayon::current_num_threads() > 1 {
         instances.into_par_iter().for_each(drop);
     } else {
         drop(instances);
     }
-    log_timing("settings document release", started);
 }
 
 pub(crate) fn drop_settings_documents(left: SettingsBytecode, right: SettingsBytecode) {
-    let started = Instant::now();
     if left.instances.len().saturating_add(right.instances.len()) >= 16_384
         && rayon::current_num_threads() > 1
     {
@@ -217,7 +191,6 @@ pub(crate) fn drop_settings_documents(left: SettingsBytecode, right: SettingsByt
         drop(left);
         drop(right);
     }
-    log_timing("settings document release", started);
 }
 
 pub(crate) fn stabilize_settings_reference_ids(document: &mut SettingsBytecode) {
@@ -680,9 +653,7 @@ pub(crate) fn align_settings_ids_to_reference(
     reference: &SettingsBytecode,
     observed: &mut SettingsBytecode,
 ) -> bool {
-    let started = Instant::now();
     let aligned = align_settings_ids_to_reference_impl(reference, observed);
-    log_timing("settings identity alignment", started);
     aligned
 }
 
@@ -1583,17 +1554,10 @@ pub(crate) fn settings_documents_positionally_equivalent(
     reference: &SettingsBytecode,
     observed: &SettingsBytecode,
 ) -> bool {
-    let structure_started = Instant::now();
     if !settings_topology_matches(reference, observed) {
         return false;
     }
-    log_timing(
-        "settings positional structure comparison",
-        structure_started,
-    );
-    let values_started = Instant::now();
     let equivalent = positional_documents_equivalent(reference, observed);
-    log_timing("settings positional value comparison", values_started);
     equivalent
 }
 
@@ -1650,7 +1614,6 @@ fn positional_values_equivalent(
     if workspace_current_camera_index(reference) != workspace_current_camera_index(observed) {
         return false;
     }
-    let ids_started = Instant::now();
     let reference_ids = reference
         .instances
         .iter()
@@ -1663,7 +1626,6 @@ fn positional_values_equivalent(
         .enumerate()
         .map(|(index, instance)| (instance.settings_id.as_str(), index))
         .collect::<AHashMap<_, _>>();
-    log_timing("settings positional identity maps", ids_started);
     let equivalent = |(index, (reference_instance, observed_instance)): (
         usize,
         (&SettingsBytecodeInstance, &SettingsBytecodeInstance),
@@ -1856,7 +1818,6 @@ fn align_settings_ids_for_contiguous_structural_change(
     {
         return ContiguousStructuralAlignment::NotApplicable;
     }
-    let topology_started = Instant::now();
     let topology_matches = (changed_at..common_len).all(|position| {
         let (reference_index, observed_index) = index_map.pair_at(position);
         let reference = &reference.instances[reference_index];
@@ -1871,7 +1832,6 @@ fn align_settings_ids_for_contiguous_structural_change(
             && reference.class_name == observed.class_name
             && parent_matches
     });
-    log_timing("settings alignment contiguous topology", topology_started);
     if !topology_matches {
         if verbose_timing_logs() {
             println!(
@@ -1886,7 +1846,6 @@ fn align_settings_ids_for_contiguous_structural_change(
         return ContiguousStructuralAlignment::NotApplicable;
     }
 
-    let reserved_started = Instant::now();
     let reserved_ids = reference
         .instances
         .iter()
@@ -1895,24 +1854,10 @@ fn align_settings_ids_for_contiguous_structural_change(
     if reserved_ids.len() != reference.instances.len() {
         return ContiguousStructuralAlignment::NotApplicable;
     }
-    log_timing(
-        "settings alignment contiguous reserved ids",
-        reserved_started,
-    );
-
-    let desired_started = Instant::now();
     let mut inserted_replacements =
         contiguous_inserted_id_replacements(observed, index_map, &reserved_ids);
-    log_timing("settings alignment contiguous desired ids", desired_started);
 
-    let reference_ids_started = Instant::now();
     let text_reference_ids = document_text_reference_ids(observed);
-    log_timing(
-        "settings alignment contiguous reference ids",
-        reference_ids_started,
-    );
-
-    let remap_started = Instant::now();
     let mut old_id_counts = AHashMap::<&str, usize>::with_capacity(text_reference_ids.len());
     for instance in &observed.instances {
         if text_reference_ids.contains(instance.settings_id.as_str()) {
@@ -1938,9 +1883,6 @@ fn align_settings_ids_for_contiguous_structural_change(
             remap.insert(current.to_string(), desired.to_string());
         }
     }
-    log_timing("settings alignment contiguous remap", remap_started);
-
-    let apply_started = Instant::now();
     for (index, instance) in observed.instances.iter_mut().enumerate() {
         if let Some(reference_index) = index_map.observed_to_reference(index) {
             instance
@@ -1950,15 +1892,10 @@ fn align_settings_ids_for_contiguous_structural_change(
             instance.settings_id = replacement;
         }
     }
-    log_timing("settings alignment contiguous apply ids", apply_started);
-    let stabilize_started = Instant::now();
     rayon::join(
         || stabilize_settings_reference_ids_with_remap(reference, None, true),
         || stabilize_settings_reference_ids_with_remap(observed, Some(&remap), true),
     );
-    log_timing("settings alignment stabilize references", stabilize_started);
-
-    let maps_started = Instant::now();
     let reference_ids = reference
         .instances
         .iter()
@@ -1978,7 +1915,6 @@ fn align_settings_ids_for_contiguous_structural_change(
             )
         })
         .collect::<AHashMap<_, _>>();
-    log_timing("settings alignment contiguous identity maps", maps_started);
     let equivalent = |position: usize| {
         let (reference_index, observed_index) = index_map.pair_at(position);
         let reference = &reference.instances[reference_index];
@@ -1997,16 +1933,11 @@ fn align_settings_ids_for_contiguous_structural_change(
                 &observed_ids,
             )
     };
-    let common_started = Instant::now();
     let common_matches = if common_len >= 2_048 && rayon::current_num_threads() > 1 {
         (0..common_len).into_par_iter().all(equivalent)
     } else {
         (0..common_len).all(equivalent)
     };
-    log_timing(
-        "settings alignment contiguous common content",
-        common_started,
-    );
     if !common_matches {
         if verbose_timing_logs()
             && let Some(position) = (0..common_len).find(|position| !equivalent(*position))

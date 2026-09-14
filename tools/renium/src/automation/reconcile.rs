@@ -1852,7 +1852,6 @@ fn prepare_editor_settings_changes(
         .into_iter()
         .filter(|path| previous.entries.get(path) != current.entries.get(path))
         .map(|path| {
-            let phase = Instant::now();
             let (previous_document, current_document) = rayon::join(
                 || editor_settings_document(previous.entries.get(&path)),
                 || editor_settings_document(current.entries.get(&path)),
@@ -1865,10 +1864,7 @@ fn prepare_editor_settings_changes(
                 &mut change.current,
                 &change.previous,
             );
-            log_reconcile_timing("incremental settings decode", phase);
-            let phase = Instant::now();
             validate_package_link_documents(&path, &change.previous, &change.current)?;
-            log_reconcile_timing("incremental PackageLink validation", phase);
             Ok((path, change))
         })
         .collect()
@@ -3779,9 +3775,7 @@ fn reconciliation_push_plan_for_paths_with_prepared_settings(
             plan.changed_paths.push(path);
         }
     }
-    let phase = Instant::now();
     append_recreated_reference_pushes(merged, prepared_settings, &mut plan)?;
-    log_reconcile_timing("settings recreated reference repair", phase);
     plan.changed_paths.sort();
     plan.changed_paths.dedup();
     plan.target_settings_ids.sort();
@@ -3927,7 +3921,6 @@ fn append_aligned_settings_push_plan(
         plan.target_settings_ids.push(root.settings_id.clone());
     }
     let database = rbx_reflection_database::get()?;
-    let phase = Instant::now();
     let (desired_by_id, observed_by_id) = rayon::join(
         || {
             desired
@@ -3946,8 +3939,6 @@ fn append_aligned_settings_push_plan(
                 .collect::<HashMap<_, _>>()
         },
     );
-    log_reconcile_timing("settings delta identity maps", phase);
-    let phase = Instant::now();
     let mut pending_property_removals = Vec::new();
 
     struct InstanceDelta {
@@ -4095,9 +4086,7 @@ fn append_aligned_settings_push_plan(
             ));
         }
     }
-    log_reconcile_timing("settings delta changed instances", phase);
 
-    let phase = Instant::now();
     if !previous_indices.is_empty() {
         let previous_paths =
             build_editor_instance_paths_for_indices(observed, &service, &previous_indices);
@@ -4113,9 +4102,7 @@ fn append_aligned_settings_push_plan(
             }
         }
     }
-    log_reconcile_timing("settings delta previous paths", phase);
 
-    let phase = Instant::now();
     if !pending_property_removals.is_empty() {
         let removal_indices = pending_property_removals
             .iter()
@@ -4142,9 +4129,7 @@ fn append_aligned_settings_push_plan(
             });
         }
     }
-    log_reconcile_timing("settings delta property removals", phase);
 
-    let phase = Instant::now();
     let removed = observed
         .instances
         .iter()
@@ -4158,7 +4143,6 @@ fn append_aligned_settings_push_plan(
         .map(|(index, _)| index)
         .collect::<HashSet<_>>();
     if removed.is_empty() {
-        log_reconcile_timing("settings delta instance removals", phase);
         return Ok(());
     }
     let root_removals = removed
@@ -4171,7 +4155,6 @@ fn append_aligned_settings_push_plan(
         })
         .collect::<Vec<_>>();
     if root_removals.is_empty() {
-        log_reconcile_timing("settings delta instance removals", phase);
         return Ok(());
     }
     let observed_paths =
@@ -4207,7 +4190,6 @@ fn append_aligned_settings_push_plan(
         instances: descriptors,
         preserve_instances: Vec::new(),
     });
-    log_reconcile_timing("settings delta instance removals", phase);
     Ok(())
 }
 
@@ -4623,7 +4605,6 @@ fn entries_equivalent(
 }
 
 fn decoded_settings_document(entry: Option<&SnapshotEntry>) -> Result<SettingsBytecode> {
-    let phase = Instant::now();
     let mut document = match entry {
         Some(SnapshotEntry::File(bytes)) => decode_settings_bytecode(bytes),
         None => Ok(SettingsBytecode {
@@ -4632,10 +4613,7 @@ fn decoded_settings_document(entry: Option<&SnapshotEntry>) -> Result<SettingsBy
         }),
         Some(_) => bail!("A Renium settings store is not a regular file"),
     }?;
-    log_reconcile_timing("settings document decode", phase);
-    let phase = Instant::now();
     stabilize_settings_reference_ids(&mut document);
-    log_reconcile_timing("settings document reference stabilization", phase);
     Ok(document)
 }
 
@@ -4645,9 +4623,7 @@ fn editor_settings_document(entry: Option<&SnapshotEntry>) -> Result<SettingsByt
 
 fn settings_document(entry: Option<&SnapshotEntry>) -> Result<SettingsBytecode> {
     let mut document = decoded_settings_document(entry)?;
-    let phase = Instant::now();
     canonicalize_settings_property_names(&mut document)?;
-    log_reconcile_timing("settings document property canonicalization", phase);
     Ok(document)
 }
 
@@ -5746,7 +5722,6 @@ fn settings_delta_mismatch(
             );
         }
     }
-    let index_started = Instant::now();
     let before_by_id = before
         .instances
         .iter()
@@ -5777,8 +5752,6 @@ fn settings_delta_mismatch(
                 .filter(|id| !before_by_id.contains_key(id)),
         )
         .collect::<Vec<_>>();
-    log_reconcile_timing("push verification identity indices", index_started);
-    let compare_started = Instant::now();
     let compare = |settings_id: &str| {
         let before_index = before_by_id.get(settings_id).copied();
         let desired_index = desired_by_id.get(settings_id).copied();
@@ -5850,7 +5823,6 @@ fn settings_delta_mismatch(
     } else {
         settings_ids.iter().find_map(|id| compare(id))
     };
-    log_reconcile_timing("push verification delta checks", compare_started);
     drop(before_by_id);
     drop(desired_by_id);
     drop(observed_by_id);
