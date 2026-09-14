@@ -55,26 +55,29 @@ pub(super) struct Cli {
     )]
     pub(super) project: Option<PathBuf>,
     #[arg(
+        help = "Log verbosity",
         long,
         global = true,
         value_name = "off|error|warn|info|debug|trace",
         default_value = "info"
     )]
     pub(super) log_level: String,
-    #[arg(short, long, global = true, action = ArgAction::Count)]
+    #[arg(help = "Increase log verbosity", short, long, global = true, action = ArgAction::Count)]
     pub(super) verbose: u8,
     #[arg(
+        help = "Color output",
         long,
         global = true,
         value_name = "auto|always|never",
         default_value = "auto"
     )]
     pub(super) color: String,
-    #[arg(long, global = true)]
+    #[arg(help = "Skip confirmation prompts", long, global = true)]
     pub(super) yes: bool,
-    #[arg(long, global = true)]
+    #[arg(help = "Include a backtrace in errors", long, global = true)]
     pub(super) backtrace: bool,
     #[arg(
+        help = "Output format",
         long,
         global = true,
         value_name = "text|json|pretty",
@@ -94,27 +97,35 @@ pub(super) struct Cli {
 
 #[derive(Parser)]
 pub(super) struct QueryPlaceArgs {
-    #[arg(value_name = "PLACE.rbxl|PLACE.rbxlx")]
+    #[arg(help = "Place file to search", value_name = "PLACE.rbxl|PLACE.rbxlx")]
     pub(super) input: PathBuf,
-    #[arg(value_name = "QUERY")]
+    #[arg(help = "Text to match in names", value_name = "QUERY")]
     pub(super) query: Option<String>,
-    #[arg(short, long)]
+    #[arg(help = "Match exact name", short, long)]
     pub(super) name: Option<String>,
-    #[arg(short, long, alias = "class")]
+    #[arg(help = "Match class name", short, long, alias = "class")]
     pub(super) class_name: Option<String>,
-    #[arg(short, long, value_name = "TEXT")]
+    #[arg(
+        help = "Text to match in script sources",
+        short,
+        long,
+        value_name = "TEXT"
+    )]
     pub(super) source: Option<String>,
-    #[arg(long, default_value = "20")]
+    #[arg(help = "Maximum matches", long, default_value = "20")]
     pub(super) limit: NonZeroUsize,
-    #[arg(short, long)]
+    #[arg(help = "Return every match", short, long)]
     pub(super) all: bool,
-    #[arg(long)]
+    #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }
 
 #[derive(Parser)]
 pub(super) struct ComparePlaceArgs {
-    #[arg(value_name = "PLACE.rbxl|PLACE.rbxlx")]
+    #[arg(
+        help = "Place file holding the before state",
+        value_name = "PLACE.rbxl|PLACE.rbxlx"
+    )]
     pub(super) input: PathBuf,
     #[arg(
         long,
@@ -133,11 +144,11 @@ pub(super) struct ComparePlaceArgs {
         help = "Include before/after values and source (may contain secrets)"
     )]
     pub(super) values: bool,
-    #[arg(long, default_value = "50")]
+    #[arg(help = "Maximum differences to return", long, default_value = "50")]
     pub(super) limit: NonZeroUsize,
-    #[arg(short, long)]
+    #[arg(help = "Return every difference", short, long)]
     pub(super) all: bool,
-    #[arg(long)]
+    #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }
 
@@ -472,9 +483,19 @@ mod tests {
 
 #[derive(Clone, clap::Args)]
 pub(super) struct BridgeConnectionArgs {
-    #[arg(short, long, default_value_t = 8.0)]
+    #[arg(
+        help = "Seconds to wait for a Studio connection",
+        short,
+        long,
+        default_value_t = 8.0
+    )]
     pub(super) wait_seconds: f64,
-    #[arg(short = 'P', long, default_value = "8781,8782")]
+    #[arg(
+        help = "Studio bridge ports to try",
+        short = 'P',
+        long,
+        default_value = "8781,8782"
+    )]
     pub(super) ports: String,
 }
 
@@ -489,15 +510,15 @@ impl BridgeConnectionArgs {
 
 #[derive(Parser)]
 pub(super) struct BridgeDaemonArgs {
-    #[arg(long)]
+    #[arg(help = "Daemon name", long)]
     pub(super) name: Option<String>,
     #[arg(long = "serve", alias = "keep-alive", hide = true)]
     pub(super) _serve: bool,
-    #[arg(short = 'H', long, default_value = "127.0.0.1")]
+    #[arg(help = "Bind address", short = 'H', long, default_value = "127.0.0.1")]
     pub(super) host: String,
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
-    #[arg(long, alias = "ctl-port", default_value_t = DEFAULT_DAEMON_CONTROL_PORT)]
+    #[arg(help = "Daemon control port", long, alias = "ctl-port", default_value_t = DEFAULT_DAEMON_CONTROL_PORT)]
     pub(super) control_port: u16,
     #[arg(
         long,
@@ -516,7 +537,12 @@ pub(super) struct BridgeDaemonArgs {
 pub(super) struct ExplorerDaemonArgs {
     #[command(flatten)]
     pub(super) project: ProjectSourceArgs,
-    #[arg(short, long, default_value = "")]
+    #[arg(
+        help = "Services to watch (comma-separated)",
+        short,
+        long,
+        default_value = ""
+    )]
     pub(super) services: String,
     #[arg(
         help = "Exit automatically when this process dies, even if stdin stays open (prevents orphaned explorer daemons when the editor crashes)",
@@ -529,6 +555,7 @@ pub(super) struct ExplorerDaemonArgs {
 #[derive(Args, Clone)]
 pub(super) struct ProjectSourceArgs {
     #[arg(
+        help = "Project root directory",
         short = 'r',
         long,
         alias = "root",
@@ -537,6 +564,7 @@ pub(super) struct ProjectSourceArgs {
     )]
     pub(super) project_root: PathBuf,
     #[arg(
+        help = "Script source directory",
         short = 'd',
         long = "src",
         alias = "src-dir",
@@ -548,58 +576,91 @@ pub(super) struct ProjectSourceArgs {
 
 #[derive(Parser)]
 pub(super) struct FindArgs {
+    #[arg(help = "Service to search, or text when --service is given")]
     pub(super) query_or_service: Option<String>,
+    #[arg(help = "Text to search for")]
     pub(super) query: Option<String>,
     #[command(flatten)]
     pub(super) project: ProjectSourceArgs,
-    #[arg(short, long)]
+    #[arg(help = "Service to search", short, long)]
     pub(super) service: Option<String>,
-    #[arg(short, long)]
+    #[arg(help = "Match exact name", short, long)]
     pub(super) name: Option<String>,
-    #[arg(short, long, alias = "class")]
+    #[arg(help = "Match class name", short, long, alias = "class")]
     pub(super) class_name: Option<String>,
-    #[arg(short = 'I', long, alias = "parent-id")]
+    #[arg(
+        help = "Search only this parent's subtree",
+        short = 'I',
+        long,
+        alias = "parent-id"
+    )]
     pub(super) parent_settings_id: Option<String>,
-    #[arg(short, long)]
+    #[arg(help = "Match instances with this tag", short, long)]
     pub(super) tag: Option<String>,
-    #[arg(short, long = "property")]
+    #[arg(
+        help = "Property filter NAME=JSON (repeatable)",
+        short,
+        long = "property"
+    )]
     pub(super) properties: Vec<String>,
-    #[arg(short, long = "attribute")]
+    #[arg(
+        help = "Attribute filter NAME=JSON (repeatable)",
+        short,
+        long = "attribute"
+    )]
     pub(super) attributes: Vec<String>,
-    #[arg(long)]
+    #[arg(help = "Return every match", long)]
     pub(super) all: bool,
-    #[arg(short, long, default_value_t = 20)]
+    #[arg(help = "Maximum matches", short, long, default_value_t = 20)]
     pub(super) limit: usize,
-    #[arg(short, long, default_value = "compact")]
+    #[arg(
+        help = "Detail level: compact, summary, detail or full",
+        short,
+        long,
+        default_value = "compact"
+    )]
     pub(super) output: String,
-    #[arg(short = 'F', long, default_value = "lookup,ords")]
+    #[arg(
+        help = "Fields or preset to return",
+        short = 'F',
+        long,
+        default_value = "lookup,ords"
+    )]
     pub(super) fields: String,
-    #[arg(long)]
+    #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }
 
 #[derive(Parser)]
 pub(super) struct HighLevelTargetArgs {
+    #[arg(help = "Service name, or the target when the service is given with --service")]
     pub(super) service_or_target: Option<String>,
+    #[arg(help = "Target name or dotted path")]
     pub(super) target: Option<String>,
-    #[arg(short, long)]
+    #[arg(help = "Service that owns the target", short, long)]
     pub(super) service: Option<String>,
-    #[arg(short = 'i', long, alias = "id")]
+    #[arg(help = "Select by settings ID", short = 'i', long, alias = "id")]
     pub(super) settings_id: Option<String>,
-    #[arg(short = 'x', long)]
+    #[arg(help = "Select by store index", short = 'x', long)]
     pub(super) index: Option<usize>,
-    #[arg(short, long)]
+    #[arg(help = "Select by exact name", short, long)]
     pub(super) name: Option<String>,
-    #[arg(short, long, alias = "class")]
+    #[arg(help = "Select by class name", short, long, alias = "class")]
     pub(super) class_name: Option<String>,
     #[arg(
+        help = "Target path, dotted or as a JSON string array",
         long,
         alias = "path-json",
         alias = "path-segments",
         alias = "path-segments-json"
     )]
     pub(super) path: Option<String>,
-    #[arg(long, alias = "path-ordinals", alias = "path-ordinals-json")]
+    #[arg(
+        help = "Sibling ordinals (JSON array) for duplicate names",
+        long,
+        alias = "path-ordinals",
+        alias = "path-ordinals-json"
+    )]
     pub(super) ords: Option<String>,
 }
 
@@ -609,15 +670,25 @@ pub(super) struct TreeArgs {
     pub(super) target: HighLevelTargetArgs,
     #[command(flatten)]
     pub(super) project: ProjectSourceArgs,
-    #[arg(long, default_value_t = 1)]
+    #[arg(help = "Levels of children to include", long, default_value_t = 1)]
     pub(super) depth: usize,
-    #[arg(short, long)]
+    #[arg(help = "Maximum nodes", short, long)]
     pub(super) limit: Option<usize>,
-    #[arg(short, long, default_value = "compact")]
+    #[arg(
+        help = "Detail level: compact, summary, detail or full",
+        short,
+        long,
+        default_value = "compact"
+    )]
     pub(super) output: String,
-    #[arg(short = 'F', long, default_value = "tree,ords")]
+    #[arg(
+        help = "Fields or preset to return",
+        short = 'F',
+        long,
+        default_value = "tree,ords"
+    )]
     pub(super) fields: String,
-    #[arg(long)]
+    #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }
 
@@ -627,11 +698,21 @@ pub(super) struct InspectArgs {
     pub(super) target: HighLevelTargetArgs,
     #[command(flatten)]
     pub(super) project: ProjectSourceArgs,
-    #[arg(short, long, default_value = "compact")]
+    #[arg(
+        help = "Detail level: compact, summary, detail or full",
+        short,
+        long,
+        default_value = "compact"
+    )]
     pub(super) output: String,
-    #[arg(short = 'F', long, default_value = "brief,ords")]
+    #[arg(
+        help = "Fields or preset to return",
+        short = 'F',
+        long,
+        default_value = "brief,ords"
+    )]
     pub(super) fields: String,
-    #[arg(long)]
+    #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }
 
@@ -639,27 +720,33 @@ pub(super) struct InspectArgs {
 pub(super) struct PluginConsoleOutputArgs {
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
-    #[arg(short = 'n', long, default_value_t = 200)]
+    #[arg(help = "Maximum entries", short = 'n', long, default_value_t = 200)]
     pub(super) limit: usize,
-    #[arg(short, long, alias = "since", default_value_t = 0)]
+    #[arg(
+        help = "Only entries after this sequence number",
+        short,
+        long,
+        alias = "since",
+        default_value_t = 0
+    )]
     pub(super) since_seq: u64,
     #[arg(long, hide = true)]
     pub(super) from_oldest: bool,
-    #[arg(short, long)]
+    #[arg(help = "Clear the buffer after reading", short, long)]
     pub(super) clear: bool,
-    #[arg(long)]
+    #[arg(help = "Read a play client console", long)]
     pub(super) client: bool,
-    #[arg(long, conflicts_with_all = ["client", "player"])]
+    #[arg(help = "Read the play server console", long, conflicts_with_all = ["client", "player"])]
     pub(super) server: bool,
-    #[arg(long, value_name = "NAME|N")]
+    #[arg(help = "Play client by name or index", long, value_name = "NAME|N")]
     pub(super) player: Option<String>,
-    #[arg(short, long)]
+    #[arg(help = "Keep streaming new entries", short, long)]
     pub(super) follow: bool,
-    #[arg(long, value_name = "TEXT")]
+    #[arg(help = "Only entries containing TEXT", long, value_name = "TEXT")]
     pub(super) grep: Option<String>,
-    #[arg(long, value_name = "TYPE")]
+    #[arg(help = "Only entries of this message type", long, value_name = "TYPE")]
     pub(super) level: Option<String>,
-    #[arg(long, default_value_t = 200)]
+    #[arg(help = "Poll interval while following", long, default_value_t = 200)]
     pub(super) interval_ms: u64,
 }
 
@@ -667,17 +754,22 @@ pub(super) struct PluginConsoleOutputArgs {
 pub(super) struct ExecuteLuauArgs {
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
-    #[arg(short = 'e', long)]
+    #[arg(help = "Luau code (- for stdin)", short = 'e', long)]
     pub(super) code: Option<String>,
-    #[arg(value_name = "LUAU", conflicts_with_all = ["code", "file"])]
+    #[arg(help = "Luau code (- for stdin)", value_name = "LUAU", conflicts_with_all = ["code", "file"])]
     pub(super) inline_code: Option<String>,
-    #[arg(short, long, value_name = "PATH")]
+    #[arg(help = "Luau file to run", short, long, value_name = "PATH")]
     pub(super) file: Option<PathBuf>,
-    #[arg(short, long)]
+    #[arg(help = "Run on a play client", short, long)]
     pub(super) client: bool,
-    #[arg(long, value_name = "NAME|N")]
+    #[arg(help = "Play client by name or index", long, value_name = "NAME|N")]
     pub(super) player: Option<String>,
-    #[arg(short, long, default_value_t = 10.0)]
+    #[arg(
+        help = "Seconds before the run is cancelled",
+        short,
+        long,
+        default_value_t = 10.0
+    )]
     pub(super) timeout: f64,
 }
 
@@ -685,15 +777,22 @@ pub(super) struct ExecuteLuauArgs {
 pub(super) struct ExecuteClientLuauArgs {
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
+    #[arg(help = "Luau code (- for stdin)")]
     pub(super) code: String,
+    #[arg(help = "Play client by name or index")]
     pub(super) player: Option<String>,
-    #[arg(short, long, default_value_t = 10.0)]
+    #[arg(
+        help = "Seconds before the run is cancelled",
+        short,
+        long,
+        default_value_t = 10.0
+    )]
     pub(super) timeout: f64,
 }
 
 #[derive(Parser)]
 pub(super) struct StudioDeviceArgs {
-    #[arg(default_value = "status",
+    #[arg(help = "list, set, status or stop", default_value = "status",
         value_parser = ["list", "status", "set", "stop"]
     )]
     pub(super) action: String,
@@ -732,25 +831,27 @@ pub(super) struct StudioDeviceArgs {
 
 #[derive(Parser)]
 pub(super) struct AssetSearchArgs {
+    #[arg(help = "Search text")]
     pub(super) query: String,
-    #[arg(short, long, default_value_t = 5)]
+    #[arg(help = "Maximum results", short, long, default_value_t = 5)]
     pub(super) limit: u32,
-    #[arg(long = "type", default_value = "Model")]
+    #[arg(help = "Asset type to search", long = "type", default_value = "Model")]
     pub(super) asset_type: String,
-    #[arg(long)]
+    #[arg(help = "Continue from a previous result cursor", long)]
     pub(super) cursor: Option<String>,
-    #[arg(long)]
+    #[arg(help = "Include creator, description and price", long)]
     pub(super) details: bool,
 }
 
 #[derive(Parser)]
 pub(super) struct AssetInsertArgs {
+    #[arg(help = "Creator Store asset ID")]
     pub(super) asset_id: NonZeroU64,
-    #[arg(long, default_value = "Workspace")]
+    #[arg(help = "Parent path in Studio", long, default_value = "Workspace")]
     pub(super) parent: String,
-    #[arg(long)]
+    #[arg(help = "Name for the inserted instance", long)]
     pub(super) name: Option<String>,
-    #[arg(long = "type")]
+    #[arg(help = "Asset type (Model, Decal, Audio, ...)", long = "type")]
     pub(super) asset_type: Option<String>,
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
@@ -758,24 +859,29 @@ pub(super) struct AssetInsertArgs {
 
 #[derive(Parser)]
 pub(super) struct GenerateModelArgs {
+    #[arg(help = "Description of the model to generate")]
     pub(super) prompt: Option<String>,
-    #[arg(long)]
+    #[arg(help = "Reference image asset ID", long)]
     pub(super) image_asset_id: Option<NonZeroU64>,
-    #[arg(long, default_value = "Workspace")]
+    #[arg(help = "Parent path in Studio", long, default_value = "Workspace")]
     pub(super) parent: String,
-    #[arg(long, default_value = "GeneratedModel")]
+    #[arg(
+        help = "Name of the generated model",
+        long,
+        default_value = "GeneratedModel"
+    )]
     pub(super) name: String,
-    #[arg(long, value_name = "X,Y,Z")]
+    #[arg(help = "Target size", long, value_name = "X,Y,Z")]
     pub(super) size: Option<String>,
-    #[arg(long)]
+    #[arg(help = "Triangle budget", long)]
     pub(super) max_triangles: Option<u32>,
-    #[arg(long)]
+    #[arg(help = "Generate textures", long)]
     pub(super) generate_textures: Option<bool>,
-    #[arg(long = "part")]
+    #[arg(help = "Part description (repeatable)", long = "part")]
     pub(super) parts: Vec<String>,
-    #[arg(long)]
+    #[arg(help = "Segmentation mode", long)]
     pub(super) segmentation: Option<String>,
-    #[arg(long)]
+    #[arg(help = "Leave parts unanchored", long)]
     pub(super) unanchored: bool,
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
@@ -783,34 +889,37 @@ pub(super) struct GenerateModelArgs {
 
 #[derive(Parser)]
 pub(super) struct JobStatusArgs {
+    #[arg(help = "Creator job ID")]
     pub(super) job_id: String,
-    #[arg(long, default_value_t = 0.0)]
+    #[arg(help = "Seconds to wait for completion", long, default_value_t = 0.0)]
     pub(super) wait_seconds: f64,
 }
 
 #[derive(Parser)]
 pub(super) struct ScriptSearchArgs {
-    #[arg(required = true, num_args = 1..)]
+    #[arg(help = "Keywords every script must contain", required = true, num_args = 1..)]
     pub(super) keywords: Vec<String>,
-    #[arg(short, long, default_value_t = 25)]
+    #[arg(help = "Maximum scripts", short, long, default_value_t = 25)]
     pub(super) limit: usize,
 }
 
 #[derive(Parser)]
 pub(super) struct ScriptGrepArgs {
+    #[arg(help = "Text to find")]
     pub(super) query: String,
-    #[arg(short = 'i', long)]
+    #[arg(help = "Ignore case", short = 'i', long)]
     pub(super) case_insensitive: bool,
-    #[arg(short, long, default_value_t = 100)]
+    #[arg(help = "Maximum matching lines", short, long, default_value_t = 100)]
     pub(super) limit: usize,
 }
 
 #[derive(Parser)]
 pub(super) struct ScriptReadArgs {
+    #[arg(help = "Script file path")]
     pub(super) path: PathBuf,
-    #[arg(long, default_value_t = 1)]
+    #[arg(help = "First line to read", long, default_value_t = 1)]
     pub(super) start_line: usize,
-    #[arg(long)]
+    #[arg(help = "Last line to read", long)]
     pub(super) end_line: Option<usize>,
 }
 
@@ -818,64 +927,97 @@ pub(super) struct ScriptReadArgs {
 pub(super) struct StartStopPlayArgs {
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
-    #[arg(short, long)]
+    #[arg(help = "Start a session", short, long)]
     pub(super) start: bool,
-    #[arg(short = 'x', long)]
+    #[arg(help = "Stop the session", short = 'x', long)]
     pub(super) stop: bool,
-    #[arg(short, long, value_name = "N")]
+    #[arg(help = "Launch a server and N clients", short, long, value_name = "N")]
     pub(super) players: Option<u32>,
-    #[arg(long, value_name = "play|run|server")]
+    #[arg(help = "Session kind", long, value_name = "play|run|server")]
     pub(super) mode: Option<String>,
 }
 
 #[derive(Parser)]
 pub(super) struct ImportPathArgs {
+    #[arg(help = "Script file or directory to import (not a place or model file)")]
     pub(super) source: PathBuf,
-    #[arg(long, value_name = "PATH", required_unless_present = "path_json")]
+    #[arg(
+        help = "Project path for a directory import",
+        long,
+        value_name = "PATH",
+        required_unless_present = "path_json"
+    )]
     pub(super) destination: Option<PathBuf>,
     #[arg(
+        help = "Roblox path for a script import (JSON string array)",
         long,
         value_name = "[\"Service\",\"Parent\",\"Name\"]",
         conflicts_with = "destination"
     )]
     pub(super) path_json: Option<String>,
-    #[arg(long)]
+    #[arg(help = "Use this renium.project.jsonc", long)]
     pub(super) project: Option<PathBuf>,
-    #[arg(short = 'r', long, default_value = ".")]
+    #[arg(
+        help = "Project root directory",
+        short = 'r',
+        long,
+        default_value = "."
+    )]
     pub(super) project_root: PathBuf,
-    #[arg(long)]
+    #[arg(help = "Preview without writing", long)]
     pub(super) dry_run: bool,
-    #[arg(long)]
+    #[arg(help = "Push the imported files to Studio", long)]
     pub(super) push: bool,
 }
 
 #[derive(Parser)]
 pub(super) struct CreateInstanceArgs {
+    #[arg(help = "Service that receives the instance")]
     pub(super) service: String,
-    #[arg(short, long, alias = "class")]
+    #[arg(help = "Class name of the new instance", short, long, alias = "class")]
     pub(super) class_name: String,
-    #[arg(short, long)]
+    #[arg(help = "Name of the new instance", short, long)]
     pub(super) name: String,
-    #[arg(short = 'I', long, alias = "parent-id")]
+    #[arg(
+        help = "Parent settings ID (default: service root)",
+        short = 'I',
+        long,
+        alias = "parent-id"
+    )]
     pub(super) parent_settings_id: Option<String>,
-    #[arg(short = 'r', long, default_value = ".")]
+    #[arg(
+        help = "Project root directory",
+        short = 'r',
+        long,
+        default_value = "."
+    )]
     pub(super) project_root: PathBuf,
-    #[arg(short = 'd', long)]
+    #[arg(help = "Script source directory", short = 'd', long)]
     pub(super) src_root: Option<PathBuf>,
-    #[arg(short, long = "property")]
+    #[arg(help = "Property as NAME=JSON (repeatable)", short, long = "property")]
     pub(super) properties: Vec<String>,
-    #[arg(short, long = "attribute")]
+    #[arg(
+        help = "Attribute as NAME=JSON (repeatable)",
+        short,
+        long = "attribute"
+    )]
     pub(super) attributes: Vec<String>,
-    #[arg(long)]
+    #[arg(help = "Allow edits inside linked packages", long)]
     pub(super) override_packages: bool,
 }
 
 #[derive(Args)]
 pub(super) struct ProjectInstanceArgs {
+    #[arg(help = "Service that owns the target")]
     pub(super) service: String,
-    #[arg(short = 'i', long, alias = "id")]
+    #[arg(help = "Target settings ID", short = 'i', long, alias = "id")]
     pub(super) settings_id: String,
-    #[arg(short = 'r', long, default_value = ".")]
+    #[arg(
+        help = "Project root directory",
+        short = 'r',
+        long,
+        default_value = "."
+    )]
     pub(super) project_root: PathBuf,
 }
 
@@ -883,9 +1025,14 @@ pub(super) struct ProjectInstanceArgs {
 pub(super) struct CloneInstanceCommandArgs {
     #[command(flatten)]
     pub(super) target: ProjectInstanceArgs,
-    #[arg(short = 'I', long, alias = "parent-id")]
+    #[arg(
+        help = "Destination parent settings ID",
+        short = 'I',
+        long,
+        alias = "parent-id"
+    )]
     pub(super) parent_settings_id: String,
-    #[arg(long)]
+    #[arg(help = "Allow edits inside linked packages", long)]
     pub(super) override_packages: bool,
 }
 
@@ -893,13 +1040,18 @@ pub(super) struct CloneInstanceCommandArgs {
 pub(super) struct MoveInstanceArgs {
     #[command(flatten)]
     pub(super) target: ProjectInstanceArgs,
-    #[arg(long = "to-service")]
+    #[arg(help = "Move into this service", long = "to-service")]
     pub(super) target_service: Option<String>,
-    #[arg(short = 'I', long, alias = "parent-id")]
+    #[arg(
+        help = "New parent settings ID",
+        short = 'I',
+        long,
+        alias = "parent-id"
+    )]
     pub(super) parent_settings_id: Option<String>,
-    #[arg(short = 'd', long)]
+    #[arg(help = "Script source directory", short = 'd', long)]
     pub(super) src_root: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(help = "Allow edits inside linked packages", long)]
     pub(super) override_packages: bool,
 }
 
@@ -907,10 +1059,11 @@ pub(super) struct MoveInstanceArgs {
 pub(super) struct RenameInstanceArgs {
     #[command(flatten)]
     pub(super) target: ProjectInstanceArgs,
+    #[arg(help = "New name")]
     pub(super) name: String,
-    #[arg(short = 'd', long)]
+    #[arg(help = "Script source directory", short = 'd', long)]
     pub(super) src_root: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(help = "Allow edits inside linked packages", long)]
     pub(super) override_packages: bool,
 }
 
@@ -918,9 +1071,9 @@ pub(super) struct RenameInstanceArgs {
 pub(super) struct RemoveInstanceCommandArgs {
     #[command(flatten)]
     pub(super) target: ProjectInstanceArgs,
-    #[arg(short = 'R', long)]
+    #[arg(help = "Keep descendants", short = 'R', long)]
     pub(super) no_recursive: bool,
-    #[arg(long)]
+    #[arg(help = "Allow edits inside linked packages", long)]
     pub(super) override_packages: bool,
 }
 
@@ -928,7 +1081,7 @@ pub(super) struct RemoveInstanceCommandArgs {
 pub(super) struct DesyncPackageLinkCommandArgs {
     #[command(flatten)]
     pub(super) target: ProjectInstanceArgs,
-    #[arg(long)]
+    #[arg(help = "Allow edits inside linked packages", long)]
     pub(super) override_packages: bool,
 }
 
@@ -944,7 +1097,11 @@ pub(super) struct PackageActionArgs {
     pub(super) ords: Vec<usize>,
     #[arg(long, help = "Target Studio process when more than one is connected")]
     pub(super) pid: Option<u32>,
-    #[arg(long, default_value_t = 20.0)]
+    #[arg(
+        help = "Seconds to wait for the package update",
+        long,
+        default_value_t = 20.0
+    )]
     pub(super) timeout: f64,
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
@@ -952,14 +1109,20 @@ pub(super) struct PackageActionArgs {
 
 #[derive(Parser)]
 pub(super) struct ImportModelCommandArgs {
+    #[arg(help = "Service that owns the parent")]
     pub(super) service: String,
-    #[arg(short = 'I', long, alias = "parent-id")]
+    #[arg(help = "Parent settings ID", short = 'I', long, alias = "parent-id")]
     pub(super) parent_settings_id: String,
-    #[arg(short, long, value_name = "PATH")]
+    #[arg(help = "Model file to import", short, long, value_name = "PATH")]
     pub(super) model: PathBuf,
-    #[arg(short = 'r', long, default_value = ".")]
+    #[arg(
+        help = "Project root directory",
+        short = 'r',
+        long,
+        default_value = "."
+    )]
     pub(super) project_root: PathBuf,
-    #[arg(long)]
+    #[arg(help = "Allow edits inside linked packages", long)]
     pub(super) override_packages: bool,
 }
 
@@ -967,9 +1130,9 @@ pub(super) struct ImportModelCommandArgs {
 pub(super) struct ExportModelCommandArgs {
     #[command(flatten)]
     pub(super) target: ProjectInstanceArgs,
-    #[arg(short, long, value_name = "PATH")]
+    #[arg(help = "Model file to write", short, long, value_name = "PATH")]
     pub(super) output: PathBuf,
-    #[arg(long, value_name = "rbxm|rbxmx")]
+    #[arg(help = "Output format", long, value_name = "rbxm|rbxmx")]
     pub(super) format: Option<String>,
 }
 
@@ -983,7 +1146,7 @@ pub(super) struct ListClientsArgs {
 pub(super) struct EditorReviewDecisionArgs {
     #[arg(default_value = "apply", value_parser = ["apply", "skip"])]
     pub(super) decision: String,
-    #[arg(short = 'i', long)]
+    #[arg(help = "Review to decide", short = 'i', long)]
     pub(super) review_id: Option<String>,
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
@@ -993,17 +1156,32 @@ pub(super) struct EditorReviewDecisionArgs {
 pub(super) struct PressArgs {
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
-    #[arg(value_name = "GUI_PATH", required_unless_present = "id")]
+    #[arg(
+        help = "GUI path from ui",
+        value_name = "GUI_PATH",
+        required_unless_present = "id"
+    )]
     pub(super) path: Option<String>,
-    #[arg(short, long)]
+    #[arg(help = "GUI element ID from ui", short, long)]
     pub(super) id: Option<String>,
-    #[arg(short, long, value_name = "NAME|N")]
+    #[arg(
+        help = "Play client by name or index",
+        short,
+        long,
+        value_name = "NAME|N"
+    )]
     pub(super) player: Option<String>,
-    #[arg(long)]
+    #[arg(help = "Right-click", long)]
     pub(super) right: bool,
-    #[arg(long)]
+    #[arg(help = "Click a world part path instead of a GUI element", long)]
     pub(super) world: bool,
-    #[arg(long, alias = "hold-ms", value_name = "MS", default_value_t = 30)]
+    #[arg(
+        help = "Milliseconds to hold the button",
+        long,
+        alias = "hold-ms",
+        value_name = "MS",
+        default_value_t = 30
+    )]
     pub(super) hold: u64,
 }
 
@@ -1011,13 +1189,26 @@ pub(super) struct PressArgs {
 pub(super) struct ClickArgs {
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
+    #[arg(help = "Viewport X coordinate")]
     pub(super) x: i32,
+    #[arg(help = "Viewport Y coordinate")]
     pub(super) y: i32,
-    #[arg(short, long, value_name = "NAME|N")]
+    #[arg(
+        help = "Play client by name or index",
+        short,
+        long,
+        value_name = "NAME|N"
+    )]
     pub(super) player: Option<String>,
-    #[arg(long)]
+    #[arg(help = "Right-click", long)]
     pub(super) right: bool,
-    #[arg(long, alias = "hold-ms", value_name = "MS", default_value_t = 30)]
+    #[arg(
+        help = "Milliseconds to hold the button",
+        long,
+        alias = "hold-ms",
+        value_name = "MS",
+        default_value_t = 30
+    )]
     pub(super) hold: u64,
 }
 
@@ -1025,10 +1216,21 @@ pub(super) struct ClickArgs {
 pub(super) struct KeyArgs {
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
+    #[arg(help = "Key code name, such as E or Space")]
     pub(super) key: String,
-    #[arg(short, long, value_name = "NAME|N")]
+    #[arg(
+        help = "Play client by name or index",
+        short,
+        long,
+        value_name = "NAME|N"
+    )]
     pub(super) player: Option<String>,
-    #[arg(long, value_name = "MS", default_value_t = 60)]
+    #[arg(
+        help = "Milliseconds to hold the key",
+        long,
+        value_name = "MS",
+        default_value_t = 60
+    )]
     pub(super) hold_ms: u64,
 }
 
@@ -1036,11 +1238,16 @@ pub(super) struct KeyArgs {
 pub(super) struct UiArgs {
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
-    #[arg(short, long, value_name = "NAME|N")]
+    #[arg(
+        help = "Play client by name or index",
+        short,
+        long,
+        value_name = "NAME|N"
+    )]
     pub(super) player: Option<String>,
-    #[arg(short = 'n', long, default_value_t = 200)]
+    #[arg(help = "Maximum elements", short = 'n', long, default_value_t = 200)]
     pub(super) limit: usize,
-    #[arg(long, alias = "all")]
+    #[arg(help = "Include off-screen elements", long, alias = "all")]
     pub(super) include_offscreen: bool,
 }
 
@@ -1062,11 +1269,11 @@ pub(super) struct SetupArgs {
         long
     )]
     pub(super) dry_run: bool,
-    #[arg(long)]
+    #[arg(help = "Report the installation state", long)]
     pub(super) status: bool,
-    #[arg(long)]
+    #[arg(help = "Reinstall the plugin and PATH entries", long)]
     pub(super) repair: bool,
-    #[arg(long)]
+    #[arg(help = "Remove the installation", long)]
     pub(super) uninstall: bool,
 }
 
@@ -1074,12 +1281,18 @@ pub(super) struct SetupArgs {
 pub(super) struct TypeArgs {
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
+    #[arg(help = "Text to type")]
     pub(super) text: String,
-    #[arg(long, value_name = "GUI_PATH")]
+    #[arg(help = "Text box path from ui", long, value_name = "GUI_PATH")]
     pub(super) path: Option<String>,
-    #[arg(short, long, value_name = "NAME|N")]
+    #[arg(
+        help = "Play client by name or index",
+        short,
+        long,
+        value_name = "NAME|N"
+    )]
     pub(super) player: Option<String>,
-    #[arg(long)]
+    #[arg(help = "Press Enter after typing", long)]
     pub(super) enter: bool,
 }
 
@@ -1087,15 +1300,23 @@ pub(super) struct TypeArgs {
 pub(super) struct WaitUntilArgs {
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
-    #[arg(value_name = "LUAU_CONDITION")]
+    #[arg(
+        help = "Luau expression that must become true",
+        value_name = "LUAU_CONDITION"
+    )]
     pub(super) condition: String,
-    #[arg(short, long, value_name = "NAME|N")]
+    #[arg(
+        help = "Play client by name or index",
+        short,
+        long,
+        value_name = "NAME|N"
+    )]
     pub(super) player: Option<String>,
-    #[arg(short, long)]
+    #[arg(help = "Evaluate on a play client", short, long)]
     pub(super) client: bool,
-    #[arg(short, long, default_value_t = 10.0)]
+    #[arg(help = "Seconds before giving up", short, long, default_value_t = 10.0)]
     pub(super) timeout: f64,
-    #[arg(long, default_value_t = 0.25)]
+    #[arg(help = "Seconds between checks", long, default_value_t = 0.25)]
     pub(super) interval: f64,
 }
 
@@ -1103,17 +1324,26 @@ pub(super) struct WaitUntilArgs {
 pub(super) struct GotoArgs {
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
-    #[arg(value_name = "PART_PATH", required_unless_present = "pos")]
+    #[arg(
+        help = "Part path to walk to",
+        value_name = "PART_PATH",
+        required_unless_present = "pos"
+    )]
     pub(super) target: Option<String>,
-    #[arg(long, value_name = "X,Y,Z")]
+    #[arg(help = "World position to walk to", long, value_name = "X,Y,Z")]
     pub(super) pos: Option<String>,
-    #[arg(short, long, value_name = "NAME|N")]
+    #[arg(
+        help = "Play client by name or index",
+        short,
+        long,
+        value_name = "NAME|N"
+    )]
     pub(super) player: Option<String>,
-    #[arg(long)]
+    #[arg(help = "Teleport instead of walking", long)]
     pub(super) tp: bool,
-    #[arg(short, long, default_value_t = 30.0)]
+    #[arg(help = "Seconds before giving up", short, long, default_value_t = 30.0)]
     pub(super) timeout: f64,
-    #[arg(long, default_value_t = 1.0)]
+    #[arg(help = "Walk speed multiplier", long, default_value_t = 1.0)]
     pub(super) speed_multiplier: f64,
 }
 
@@ -1121,57 +1351,89 @@ pub(super) struct GotoArgs {
 pub(super) struct ShotArgs {
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
-    #[arg(short, long, value_name = "PATH", default_value = "shot.png")]
+    #[arg(
+        help = "PNG path to write",
+        short,
+        long,
+        value_name = "PATH",
+        default_value = "shot.png"
+    )]
     pub(super) output: PathBuf,
-    #[arg(short, long, value_name = "NAME|N")]
+    #[arg(
+        help = "Play client by name or index",
+        short,
+        long,
+        value_name = "NAME|N"
+    )]
     pub(super) player: Option<String>,
-    #[arg(long, conflicts_with_all = ["client", "player"])]
+    #[arg(help = "Capture the Studio Edit window", long, conflicts_with_all = ["client", "player"])]
     pub(super) studio: bool,
-    #[arg(long, conflicts_with = "studio")]
+    #[arg(help = "Capture a play client", long, conflicts_with = "studio")]
     pub(super) client: bool,
-    #[arg(long, value_name = "X,Y,Z", requires = "look_at")]
+    #[arg(
+        help = "Move the camera here before capturing",
+        long,
+        value_name = "X,Y,Z",
+        requires = "look_at"
+    )]
     pub(super) camera_position: Option<String>,
-    #[arg(long, value_name = "X,Y,Z", requires = "camera_position")]
+    #[arg(
+        help = "Point the camera at this position",
+        long,
+        value_name = "X,Y,Z",
+        requires = "camera_position"
+    )]
     pub(super) look_at: Option<String>,
 }
 
 #[derive(Parser)]
 pub(super) struct RecordStartArgs {
-    #[arg(short, long, value_name = "PATH")]
+    #[arg(help = "MP4 path to write", short, long, value_name = "PATH")]
     pub(super) output: Option<PathBuf>,
-    #[arg(short, long, value_name = "NAME|N")]
+    #[arg(
+        help = "Play client by name or index",
+        short,
+        long,
+        value_name = "NAME|N"
+    )]
     pub(super) player: Option<String>,
-    #[arg(long, conflicts_with_all = ["client", "player"])]
+    #[arg(help = "Record the Studio Edit window", long, conflicts_with_all = ["client", "player"])]
     pub(super) studio: bool,
-    #[arg(long, conflicts_with = "studio")]
+    #[arg(help = "Record a play client", long, conflicts_with = "studio")]
     pub(super) client: bool,
-    #[arg(long, default_value_t = 12.0)]
+    #[arg(help = "Frames per second (1-30)", long, default_value_t = 12.0)]
     pub(super) fps: f64,
-    #[arg(long, default_value_t = 60.0)]
+    #[arg(
+        help = "Stop after this many seconds (1-300)",
+        long,
+        default_value_t = 60.0
+    )]
     pub(super) max_seconds: f64,
-    #[arg(long, default_value_t = 80.0)]
+    #[arg(help = "Video quality (0-100)", long, default_value_t = 80.0)]
     pub(super) quality: f32,
 }
 
 #[derive(Parser)]
 pub(super) struct RecordEndArgs {
+    #[arg(help = "Recording to stop")]
     pub(super) recording_id: Option<String>,
     /// Finish the video without generating its overview image.
-    #[arg(long)]
+    #[arg(help = "Skip the review image", long)]
     pub(super) no_review: bool,
 }
 
 #[derive(Parser)]
 pub(super) struct RecordReviewArgs {
+    #[arg(help = "Recording to review")]
     pub(super) file: PathBuf,
     /// Show 12 consecutive frames (pages start at 1). Default: sampled overview.
-    #[arg(long, conflicts_with = "frame", value_parser = clap::value_parser!(u32).range(1..))]
+    #[arg(help = "Render this page of 12 frames", long, conflicts_with = "frame", value_parser = clap::value_parser!(u32).range(1..))]
     pub(super) page: Option<u32>,
     /// Extract one full-resolution frame (frames start at 1).
-    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    #[arg(help = "Render one frame at full size", long, value_parser = clap::value_parser!(u32).range(1..))]
     pub(super) frame: Option<u32>,
     /// Write the PNG here instead of beside the recording in its .review folder.
-    #[arg(short, long)]
+    #[arg(help = "Image path to write", short, long)]
     pub(super) output: Option<PathBuf>,
 }
 
@@ -1179,31 +1441,62 @@ pub(super) struct RecordReviewArgs {
 pub(super) struct StudioChangeStateArgs {
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
-    #[arg(short, long, default_value = "")]
+    #[arg(
+        help = "Services to track (comma-separated)",
+        short,
+        long,
+        default_value = ""
+    )]
     pub(super) services: String,
-    #[arg(long)]
+    #[arg(help = "Reset tracking state", long)]
     pub(super) reset: bool,
-    #[arg(long)]
+    #[arg(help = "Replace the tracked service set", long)]
     pub(super) replace_services: bool,
-    #[arg(long)]
+    #[arg(help = "Discard pending changes", long)]
     pub(super) clear_pending: bool,
-    #[arg(long)]
+    #[arg(help = "Report without starting tracking", long)]
     pub(super) no_start: bool,
-    #[arg(long)]
+    #[arg(help = "Stop tracking", long)]
     pub(super) stop: bool,
-    #[arg(long, value_name = "SEQ")]
+    #[arg(
+        help = "Acknowledge changes through this sequence",
+        long,
+        value_name = "SEQ"
+    )]
     pub(super) ack_seq: Option<u64>,
-    #[arg(long, value_name = "SEQ")]
+    #[arg(
+        help = "Acknowledge runtime settings through this sequence",
+        long,
+        value_name = "SEQ"
+    )]
     pub(super) ack_runtime_settings_seq: Option<u64>,
-    #[arg(long, value_name = "IDS", value_delimiter = ',')]
+    #[arg(
+        help = "Editor action IDs to acknowledge",
+        long,
+        value_name = "IDS",
+        value_delimiter = ','
+    )]
     pub(super) ack_actions: Vec<String>,
-    #[arg(long, value_name = "JSON", default_value = "{}")]
+    #[arg(
+        help = "Editor action results to acknowledge (JSON)",
+        long,
+        value_name = "JSON",
+        default_value = "{}"
+    )]
     pub(super) ack_action_results: String,
-    #[arg(long)]
+    #[arg(help = "Target this Studio runtime", long)]
     pub(super) runtime_id: Option<String>,
-    #[arg(long, value_name = "SECONDS")]
+    #[arg(
+        help = "Ignore Studio changes for this many seconds",
+        long,
+        value_name = "SECONDS"
+    )]
     pub(super) suppress_seconds: Option<f64>,
-    #[arg(long = "event-wait-seconds", value_name = "SECONDS")]
+    #[arg(
+        help = "Wait up to this long for a change event",
+        long = "event-wait-seconds",
+        value_name = "SECONDS"
+    )]
     pub(super) event_wait_seconds: Option<f64>,
     #[arg(
         long = "wait",
@@ -1213,17 +1506,22 @@ pub(super) struct StudioChangeStateArgs {
         help = "Wait for watched file changes to finish syncing"
     )]
     pub(super) settle_wait_seconds: Option<f64>,
-    #[arg(long)]
+    #[arg(help = "Bind tracking to the current project context", long)]
     pub(super) context_bound: bool,
-    #[arg(long)]
+    #[arg(help = "Include full change details", long)]
     pub(super) details: bool,
-    #[arg(long, value_name = "studio|editor")]
+    #[arg(
+        help = "Resolve first-connection conflicts toward one side",
+        long,
+        value_name = "studio|editor"
+    )]
     pub(super) prefer: Option<String>,
 }
 
 #[derive(Parser)]
 pub(super) struct PullArgs {
     #[arg(
+        help = "Project root directory",
         short = 'r',
         long,
         alias = "root",
@@ -1231,15 +1529,30 @@ pub(super) struct PullArgs {
         default_value = "."
     )]
     pub(super) project_root: PathBuf,
-    #[arg(long, alias = "src", value_name = "PATH", default_value = "src")]
+    #[arg(
+        help = "Script source directory",
+        long,
+        alias = "src",
+        value_name = "PATH",
+        default_value = "src"
+    )]
     pub(super) src_dir: PathBuf,
-    #[arg(short, long, default_value = "")]
+    #[arg(
+        help = "Services to pull (comma-separated)",
+        short,
+        long,
+        default_value = ""
+    )]
     pub(super) services: String,
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
-    #[arg(long, alias = "all-props")]
+    #[arg(
+        help = "Store every property, including defaults",
+        long,
+        alias = "all-props"
+    )]
     pub(super) export_all_properties: bool,
-    #[arg(short, long)]
+    #[arg(help = "Hide timing output", short, long)]
     pub(super) quiet_timings: bool,
 }
 
@@ -1249,9 +1562,10 @@ pub(super) struct PushEditorChangesArgs {
     pub(super) project: ProjectSourceArgs,
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
-    #[arg(value_name = "PATH")]
+    #[arg(help = "Files or directories to push", value_name = "PATH")]
     pub(super) paths: Vec<PathBuf>,
     #[arg(
+        help = "Changed file path (repeatable)",
         short = 'p',
         long = "changed-path",
         alias = "path",
@@ -1259,30 +1573,47 @@ pub(super) struct PushEditorChangesArgs {
     )]
     pub(super) changed_paths: Vec<PathBuf>,
     #[arg(
+        help = "File listing changed paths",
         short = 'f',
         long = "changed-paths-file",
         alias = "paths-file",
         value_name = "PATH"
     )]
     pub(super) changed_paths_files: Vec<PathBuf>,
-    #[arg(short = 'i', long = "target-settings-id", alias = "id")]
+    #[arg(
+        help = "Only push these settings IDs",
+        short = 'i',
+        long = "target-settings-id",
+        alias = "id"
+    )]
     pub(super) target_settings_ids: Vec<String>,
     #[arg(
+        help = "File listing target settings IDs",
         short = 'I',
         long = "target-settings-ids-file",
         alias = "ids-file",
         value_name = "PATH"
     )]
     pub(super) target_settings_id_files: Vec<PathBuf>,
-    #[arg(short, long = "target-property", alias = "prop")]
+    #[arg(
+        help = "Only push these properties",
+        short,
+        long = "target-property",
+        alias = "prop"
+    )]
     pub(super) target_properties: Vec<String>,
-    #[arg(short, long, alias = "upsert")]
+    #[arg(
+        help = "Create or update instances without deleting",
+        short,
+        long,
+        alias = "upsert"
+    )]
     pub(super) upsert_instances_only: bool,
-    #[arg(long, alias = "verify")]
+    #[arg(help = "Verify pushed script sources", long, alias = "verify")]
     pub(super) verify_sources: bool,
-    #[arg(long)]
+    #[arg(help = "Skip the Studio review", long)]
     pub(super) no_review: bool,
-    #[arg(long, alias = "apply")]
+    #[arg(help = "Apply without confirmation", long, alias = "apply")]
     pub(super) yes: bool,
     #[arg(
         help = "Cache dir for renium-link git/wally sources, used when enforcing read-only link mirrors during a push. Overrides the manifest cacheDir",
@@ -1324,17 +1655,34 @@ pub(super) struct EditorMutationArgs {
     pub(super) project: ProjectSourceArgs,
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
-    #[arg(short, long)]
+    #[arg(help = "Service that owns the target", short, long)]
     pub(super) service: String,
-    #[arg(short = 'i', long, alias = "id")]
+    #[arg(help = "Target settings ID", short = 'i', long, alias = "id")]
     pub(super) settings_id: Option<String>,
-    #[arg(short, long, alias = "class", default_value = "")]
+    #[arg(
+        help = "Class name of the new instance",
+        short,
+        long,
+        alias = "class",
+        default_value = ""
+    )]
     pub(super) class_name: String,
-    #[arg(short, long, alias = "path")]
+    #[arg(
+        help = "Target path as a JSON string array",
+        short,
+        long,
+        alias = "path"
+    )]
     pub(super) path_segments_json: String,
-    #[arg(short = 'o', long, alias = "ords", default_value = "[]")]
+    #[arg(
+        help = "Sibling ordinals (JSON array) for duplicate names",
+        short = 'o',
+        long,
+        alias = "ords",
+        default_value = "[]"
+    )]
     pub(super) path_ordinals_json: String,
-    #[arg(long)]
+    #[arg(help = "Allow edits inside linked packages", long)]
     pub(super) override_packages: bool,
 }
 
@@ -1342,11 +1690,17 @@ pub(super) struct EditorMutationArgs {
 pub(super) struct ApplyEditorPropertyArgs {
     #[command(flatten)]
     pub(super) target: EditorMutationArgs,
-    #[arg(short = 'S', long, default_value = "property")]
+    #[arg(
+        help = "property or attribute",
+        short = 'S',
+        long,
+        default_value = "property"
+    )]
     pub(super) scope: String,
-    #[arg(short = 'n', long, alias = "prop")]
+    #[arg(help = "Property or attribute name", short = 'n', long, alias = "prop")]
     pub(super) property: String,
     #[arg(
+        help = "Value as JSON",
         short = 'j',
         long,
         alias = "value",
@@ -1354,11 +1708,11 @@ pub(super) struct ApplyEditorPropertyArgs {
         conflicts_with = "source_file"
     )]
     pub(super) value_json: Option<String>,
-    #[arg(long, value_name = "PATH")]
+    #[arg(help = "Read the value from this file", long, value_name = "PATH")]
     pub(super) source_file: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(help = "Skip the Studio review", long)]
     pub(super) no_review: bool,
-    #[arg(long, alias = "apply")]
+    #[arg(help = "Apply without confirmation", long, alias = "apply")]
     pub(super) yes: bool,
 }
 
@@ -1370,23 +1724,33 @@ pub(super) struct ApplyEditorDeleteArgs {
 
 #[derive(Parser)]
 pub(super) struct EditorRevertArgs {
-    #[arg(long, value_name = "PATH", default_value = ".")]
+    #[arg(
+        help = "Project root directory",
+        long,
+        value_name = "PATH",
+        default_value = "."
+    )]
     pub(super) project_root: PathBuf,
-    #[arg(long, value_name = "PATH", default_value = "src")]
+    #[arg(
+        help = "Script source directory",
+        long,
+        value_name = "PATH",
+        default_value = "src"
+    )]
     pub(super) src_dir: PathBuf,
-    #[arg(long)]
+    #[arg(help = "Restore this file", long)]
     pub(super) path: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(help = "Restore this instance", long)]
     pub(super) settings_id: Option<String>,
-    #[arg(long)]
+    #[arg(help = "Restore this service's store", long)]
     pub(super) service: Option<String>,
     /// Restore file-backed sync history (an ID returned by push, or latest).
-    #[arg(long, value_name = "ID|latest", conflicts_with_all = ["path", "settings_id", "service"])]
+    #[arg(help = "Restore a sync history entry: latest or a historyId", long, value_name = "ID|latest", conflicts_with_all = ["path", "settings_id", "service"])]
     pub(super) sync: Option<String>,
     /// Include every restored path in sync undo output.
-    #[arg(long, requires = "sync")]
+    #[arg(help = "List every restored path", long, requires = "sync")]
     pub(super) details: bool,
-    #[arg(long)]
+    #[arg(help = "Also push the restored files to Studio", long)]
     pub(super) apply_studio: bool,
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
@@ -1394,8 +1758,15 @@ pub(super) struct EditorRevertArgs {
 
 #[derive(Args, Default)]
 pub(super) struct BytecodeFileArgs {
+    #[arg(help = "Service name or store file")]
     pub(super) service_or_file: Option<String>,
-    #[arg(short = 'f', long, alias = "file", value_name = "PATH")]
+    #[arg(
+        help = "Store file instead of a service name",
+        short = 'f',
+        long,
+        alias = "file",
+        value_name = "PATH"
+    )]
     pub(super) settings_file: Option<PathBuf>,
 }
 
@@ -1410,17 +1781,23 @@ impl BytecodeFileArgs {
 
 #[derive(Args)]
 pub(super) struct BytecodeInstanceSelectorArgs {
-    #[arg(short = 'i', long, alias = "id")]
+    #[arg(help = "Select by settings ID", short = 'i', long, alias = "id")]
     pub(super) settings_id: Option<String>,
-    #[arg(short = 'x', long)]
+    #[arg(help = "Select by store index", short = 'x', long)]
     pub(super) index: Option<usize>,
-    #[arg(short, long)]
+    #[arg(help = "Select by exact name", short, long)]
     pub(super) name: Option<String>,
-    #[arg(short, long, alias = "class")]
+    #[arg(help = "Select by class name", short, long, alias = "class")]
     pub(super) class_name: Option<String>,
-    #[arg(long = "path", alias = "path-segments", alias = "path-segments-json")]
+    #[arg(
+        help = "Select by path (JSON string array); add --ords for duplicates",
+        long = "path",
+        alias = "path-segments",
+        alias = "path-segments-json"
+    )]
     pub(super) path_segments_json: Option<String>,
     #[arg(
+        help = "Sibling ordinals (JSON array) for duplicate names",
         long = "ords",
         alias = "path-ordinals",
         alias = "path-ordinals-json",
@@ -1457,11 +1834,16 @@ pub(super) struct BytecodeGetPropertyArgs {
     pub(super) input: BytecodeFileArgs,
     #[command(flatten)]
     pub(super) selector: BytecodeInstanceSelectorArgs,
-    #[arg(short, long, alias = "prop")]
+    #[arg(help = "Property or attribute name", short, long, alias = "prop")]
     pub(super) property: String,
-    #[arg(short = 'S', long, default_value = "auto")]
+    #[arg(
+        help = "auto, property or attribute",
+        short = 'S',
+        long,
+        default_value = "auto"
+    )]
     pub(super) scope: String,
-    #[arg(long)]
+    #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }
 
@@ -1471,7 +1853,7 @@ pub(super) struct BytecodeSetPropertyArgs {
     pub(super) input: BytecodeFileArgs,
     #[command(flatten)]
     pub(super) selector: BytecodeInstanceSelectorArgs,
-    #[arg(short, long, alias = "prop")]
+    #[arg(help = "Property or attribute name", short, long, alias = "prop")]
     pub(super) property: String,
     #[arg(
         short = 'j',
@@ -1481,29 +1863,48 @@ pub(super) struct BytecodeSetPropertyArgs {
         help = "JSON value, or - to read it from stdin"
     )]
     pub(super) value_json: Option<String>,
-    #[arg(long = "str", alias = "value-str", allow_hyphen_values = true)]
+    #[arg(
+        help = "String value",
+        long = "str",
+        alias = "value-str",
+        allow_hyphen_values = true
+    )]
     pub(super) value_str: Option<String>,
-    #[arg(long = "num", alias = "value-num")]
+    #[arg(help = "Number value", long = "num", alias = "value-num")]
     pub(super) value_num: Option<f64>,
-    #[arg(long = "bool", alias = "value-bool")]
+    #[arg(help = "Boolean value", long = "bool", alias = "value-bool")]
     pub(super) value_bool: Option<bool>,
-    #[arg(long = "null", alias = "value-null")]
+    #[arg(help = "Remove the stored value", long = "null", alias = "value-null")]
     pub(super) value_null: bool,
-    #[arg(short = 'S', long, default_value = "auto")]
+    #[arg(
+        help = "auto, property or attribute",
+        short = 'S',
+        long,
+        default_value = "auto"
+    )]
     pub(super) scope: String,
-    #[arg(long)]
+    #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }
 
 #[derive(Parser)]
 pub(super) struct BytecodeApplyPropertyBatchArgs {
-    #[arg(long, value_name = "PATH", default_value = ".")]
+    #[arg(
+        help = "Project root directory",
+        long,
+        value_name = "PATH",
+        default_value = "."
+    )]
     pub(super) project_root: PathBuf,
-    #[arg(long, value_name = "PATH")]
+    #[arg(help = "Property batch JSON file", long, value_name = "PATH")]
     pub(super) input: PathBuf,
-    #[arg(long, default_value = "studio-to-files")]
+    #[arg(
+        help = "Direction recorded for the batch",
+        long,
+        default_value = "studio-to-files"
+    )]
     pub(super) direction: String,
-    #[arg(long)]
+    #[arg(help = "Allow edits inside linked packages", long)]
     pub(super) override_packages: bool,
 }
 
@@ -1511,7 +1912,7 @@ pub(super) struct BytecodeApplyPropertyBatchArgs {
 pub(super) struct BytecodeSetSourceArgs {
     #[command(flatten)]
     pub(super) input: BytecodeFileArgs,
-    #[arg(short, long)]
+    #[arg(help = "Service that owns the script", short, long)]
     pub(super) service: Option<String>,
     #[command(flatten)]
     pub(super) selector: BytecodeInstanceSelectorArgs,
@@ -1524,6 +1925,7 @@ pub(super) struct BytecodeSetSourceArgs {
     )]
     pub(super) value_json: Option<String>,
     #[arg(
+        help = "Source text",
         long = "str",
         visible_alias = "source",
         alias = "value-str",
@@ -1537,7 +1939,7 @@ pub(super) struct BytecodeSetSourceArgs {
         value_name = "PATH"
     )]
     pub(super) source_file: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }
 
@@ -1545,11 +1947,12 @@ pub(super) struct BytecodeSetSourceArgs {
 pub(super) struct BytecodeExplorerBatchArgs {
     #[command(flatten)]
     pub(super) input: BytecodeFileArgs,
-    #[arg(short, long, default_value = "")]
+    #[arg(help = "Service that owns the store", short, long, default_value = "")]
     pub(super) service: String,
-    #[arg(long)]
+    #[arg(help = "Project root directory", long)]
     pub(super) project_root: Option<PathBuf>,
     #[arg(
+        help = "Operations JSON",
         short = 'j',
         long = "ops",
         alias = "ops-json",
@@ -1557,13 +1960,28 @@ pub(super) struct BytecodeExplorerBatchArgs {
         conflicts_with = "ops_file"
     )]
     pub(super) ops_json: Option<String>,
-    #[arg(short = 'J', long, value_name = "PATH")]
+    #[arg(
+        help = "Operations JSON file (- for stdin)",
+        short = 'J',
+        long,
+        value_name = "PATH"
+    )]
     pub(super) ops_file: Option<PathBuf>,
-    #[arg(short, long, alias = "mode")]
+    #[arg(
+        help = "Detail level: compact, summary, detail or full",
+        short,
+        long,
+        alias = "mode"
+    )]
     pub(super) output: Option<String>,
-    #[arg(short = 'F', long, alias = "fs")]
+    #[arg(
+        help = "Fields or preset for search results",
+        short = 'F',
+        long,
+        alias = "fs"
+    )]
     pub(super) fields: Option<String>,
-    #[arg(long)]
+    #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }
 
@@ -1651,33 +2069,37 @@ pub(super) struct BytecodeAddInstanceArgs {
     pub(super) input: BytecodeFileArgs,
     #[arg(skip)]
     pub(super) service_hint: Option<String>,
-    #[arg(short, long)]
+    #[arg(help = "Name of the new instance", short, long)]
     pub(super) name: String,
-    #[arg(short, long, alias = "class")]
+    #[arg(help = "Class name of the new instance", short, long, alias = "class")]
     pub(super) class_name: String,
-    #[arg(short = 'i', long, alias = "id")]
+    #[arg(help = "Settings ID to assign", short = 'i', long, alias = "id")]
     pub(super) settings_id: Option<String>,
     #[command(flatten)]
     pub(super) parent: BytecodeParentArgs,
-    #[arg(short, long = "property")]
+    #[arg(help = "Property as NAME=JSON (repeatable)", short, long = "property")]
     pub(super) properties: Vec<String>,
-    #[arg(short, long = "attribute")]
+    #[arg(
+        help = "Attribute as NAME=JSON (repeatable)",
+        short,
+        long = "attribute"
+    )]
     pub(super) attributes: Vec<String>,
-    #[arg(long)]
+    #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }
 
 #[derive(Args, Default)]
 pub(super) struct BytecodeParentArgs {
-    #[arg(short = 'x', long)]
+    #[arg(help = "Parent store index", short = 'x', long)]
     pub(super) parent_index: Option<usize>,
-    #[arg(short = 'I', long, alias = "parent-id")]
+    #[arg(help = "Parent settings ID", short = 'I', long, alias = "parent-id")]
     pub(super) parent_settings_id: Option<String>,
-    #[arg(short = 'N', long)]
+    #[arg(help = "Parent exact name", short = 'N', long)]
     pub(super) parent_name: Option<String>,
-    #[arg(short = 'C', long, alias = "parent-class")]
+    #[arg(help = "Parent class name", short = 'C', long, alias = "parent-class")]
     pub(super) parent_class_name: Option<String>,
-    #[arg(long, alias = "root")]
+    #[arg(help = "Place at the service root", long, alias = "root")]
     pub(super) no_parent: bool,
 }
 
@@ -1685,19 +2107,19 @@ pub(super) struct BytecodeParentArgs {
 pub(super) struct BytecodeCloneInstanceArgs {
     #[command(flatten)]
     pub(super) input: BytecodeFileArgs,
-    #[arg(short, long, default_value = "")]
+    #[arg(help = "Service that owns the source", short, long, default_value = "")]
     pub(super) service: String,
     #[command(flatten)]
     pub(super) selector: BytecodeInstanceSelectorArgs,
-    #[arg(short = 'X', long)]
+    #[arg(help = "Parent store index", short = 'X', long)]
     pub(super) parent_index: Option<usize>,
-    #[arg(short = 'I', long, alias = "parent-id")]
+    #[arg(help = "Parent settings ID", short = 'I', long, alias = "parent-id")]
     pub(super) parent_settings_id: Option<String>,
-    #[arg(short = 'N', long)]
+    #[arg(help = "Parent exact name", short = 'N', long)]
     pub(super) parent_name: Option<String>,
-    #[arg(short = 'C', long, alias = "parent-class")]
+    #[arg(help = "Parent class name", short = 'C', long, alias = "parent-class")]
     pub(super) parent_class_name: Option<String>,
-    #[arg(long)]
+    #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }
 
@@ -1707,9 +2129,9 @@ pub(super) struct BytecodeRemoveInstanceArgs {
     pub(super) input: BytecodeFileArgs,
     #[command(flatten)]
     pub(super) selector: BytecodeInstanceSelectorArgs,
-    #[arg(short = 'R', long)]
+    #[arg(help = "Keep descendants", short = 'R', long)]
     pub(super) no_recursive: bool,
-    #[arg(long)]
+    #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }
 
@@ -1717,11 +2139,11 @@ pub(super) struct BytecodeRemoveInstanceArgs {
 pub(super) struct BytecodeDesyncPackageLinkArgs {
     #[command(flatten)]
     pub(super) input: BytecodeFileArgs,
-    #[arg(short, long, default_value = "")]
+    #[arg(help = "Service that owns the target", short, long, default_value = "")]
     pub(super) service: String,
     #[command(flatten)]
     pub(super) selector: BytecodeInstanceSelectorArgs,
-    #[arg(long)]
+    #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }
 
@@ -1729,15 +2151,15 @@ pub(super) struct BytecodeDesyncPackageLinkArgs {
 pub(super) struct BytecodeExportModelArgs {
     #[command(flatten)]
     pub(super) input: BytecodeFileArgs,
-    #[arg(short, long, default_value = "")]
+    #[arg(help = "Service that owns the source", short, long, default_value = "")]
     pub(super) service: String,
     #[command(flatten)]
     pub(super) selector: BytecodeInstanceSelectorArgs,
-    #[arg(short, long, value_name = "PATH")]
+    #[arg(help = "Model file to write", short, long, value_name = "PATH")]
     pub(super) output: PathBuf,
-    #[arg(long, value_name = "rbxm|rbxmx")]
+    #[arg(help = "Output format", long, value_name = "rbxm|rbxmx")]
     pub(super) format: Option<String>,
-    #[arg(long)]
+    #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }
 
@@ -1745,13 +2167,18 @@ pub(super) struct BytecodeExportModelArgs {
 pub(super) struct BytecodeExportPlaceArgs {
     #[command(flatten)]
     pub(super) project: ProjectSourceArgs,
-    #[arg(short, long, default_value = "")]
+    #[arg(
+        help = "Services to include (comma-separated)",
+        short,
+        long,
+        default_value = ""
+    )]
     pub(super) services: String,
-    #[arg(short, long, value_name = "PATH")]
+    #[arg(help = "Place file to write", short, long, value_name = "PATH")]
     pub(super) output: PathBuf,
-    #[arg(long, value_name = "rbxl|rbxlx")]
+    #[arg(help = "Output format", long, value_name = "rbxl|rbxlx")]
     pub(super) format: Option<String>,
-    #[arg(long)]
+    #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }
 
@@ -1759,13 +2186,13 @@ pub(super) struct BytecodeExportPlaceArgs {
 pub(super) struct BytecodeImportModelArgs {
     #[command(flatten)]
     pub(super) input: BytecodeFileArgs,
-    #[arg(short, long, default_value = "")]
+    #[arg(help = "Service that owns the parent", short, long, default_value = "")]
     pub(super) service: String,
-    #[arg(short, long, value_name = "PATH")]
+    #[arg(help = "Model file to import", short, long, value_name = "PATH")]
     pub(super) model: PathBuf,
     #[command(flatten)]
     pub(super) parent: BytecodeParentArgs,
-    #[arg(long)]
+    #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }
 
@@ -1773,15 +2200,38 @@ pub(super) struct BytecodeImportModelArgs {
 pub(super) struct SyncWallyPackagesArgs {
     #[command(flatten)]
     pub(super) project: ProjectSourceArgs,
-    #[arg(long, value_name = "PATH", default_value = "wally.toml")]
+    #[arg(
+        help = "wally.toml path",
+        long,
+        value_name = "PATH",
+        default_value = "wally.toml"
+    )]
     pub(super) manifest: PathBuf,
-    #[arg(long, value_name = "COMMAND", default_value = "wally")]
+    #[arg(
+        help = "Wally executable",
+        long,
+        value_name = "COMMAND",
+        default_value = "wally"
+    )]
     pub(super) wally_path: String,
-    #[arg(long, value_name = "PATH", default_value = "Packages")]
+    #[arg(
+        help = "Packages directory",
+        long,
+        value_name = "PATH",
+        default_value = "Packages"
+    )]
     pub(super) packages_dir: PathBuf,
-    #[arg(long, default_value = "ReplicatedStorage")]
+    #[arg(
+        help = "Service for shared packages",
+        long,
+        default_value = "ReplicatedStorage"
+    )]
     pub(super) target_service: String,
-    #[arg(long, default_value = "Packages")]
+    #[arg(
+        help = "Instance name for shared packages",
+        long,
+        default_value = "Packages"
+    )]
     pub(super) target_name: String,
     #[arg(
         help = "Comma list of realms to import: shared, server, dev. Server/dev are imported only when their package directory exists",
@@ -1790,28 +2240,54 @@ pub(super) struct SyncWallyPackagesArgs {
         default_value = "shared,server,dev"
     )]
     pub(super) realms: String,
-    #[arg(long, value_name = "PATH", default_value = "ServerPackages")]
+    #[arg(
+        help = "ServerPackages directory",
+        long,
+        value_name = "PATH",
+        default_value = "ServerPackages"
+    )]
     pub(super) server_packages_dir: PathBuf,
-    #[arg(long, default_value = "ServerStorage")]
+    #[arg(
+        help = "Service for server packages",
+        long,
+        default_value = "ServerStorage"
+    )]
     pub(super) server_target_service: String,
-    #[arg(long, default_value = "ServerPackages")]
+    #[arg(
+        help = "Instance name for server packages",
+        long,
+        default_value = "ServerPackages"
+    )]
     pub(super) server_target_name: String,
-    #[arg(long, value_name = "PATH", default_value = "DevPackages")]
+    #[arg(
+        help = "DevPackages directory",
+        long,
+        value_name = "PATH",
+        default_value = "DevPackages"
+    )]
     pub(super) dev_packages_dir: PathBuf,
-    #[arg(long, default_value = "ReplicatedStorage")]
+    #[arg(
+        help = "Service for dev packages",
+        long,
+        default_value = "ReplicatedStorage"
+    )]
     pub(super) dev_target_service: String,
-    #[arg(long, default_value = "DevPackages")]
+    #[arg(
+        help = "Instance name for dev packages",
+        long,
+        default_value = "DevPackages"
+    )]
     pub(super) dev_target_name: String,
     #[arg(
         help = "Re-import even when wally.lock is unchanged since the last sync",
         long
     )]
     pub(super) force: bool,
-    #[arg(long)]
+    #[arg(help = "Link existing packages without installing", long)]
     pub(super) skip_install: bool,
-    #[arg(long)]
+    #[arg(help = "Include full paths and IDs", long)]
     pub(super) details: bool,
-    #[arg(long)]
+    #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }
 
@@ -1819,7 +2295,12 @@ pub(super) struct SyncWallyPackagesArgs {
 pub(super) struct LinkApplyArgs {
     #[command(flatten)]
     pub(super) project: ProjectSourceArgs,
-    #[arg(long, value_name = "PATH", default_value = "renium-link.json")]
+    #[arg(
+        help = "Link manifest path",
+        long,
+        value_name = "PATH",
+        default_value = "renium-link.json"
+    )]
     pub(super) manifest: PathBuf,
     #[arg(
         help = "Apply only the link with this id (default: all links)",
@@ -1853,9 +2334,19 @@ pub(super) struct LinkApplyArgs {
         long
     )]
     pub(super) strict: bool,
-    #[arg(long, value_name = "COMMAND", default_value = "git")]
+    #[arg(
+        help = "Git executable",
+        long,
+        value_name = "COMMAND",
+        default_value = "git"
+    )]
     pub(super) git_path: String,
-    #[arg(long, value_name = "COMMAND", default_value = "wally")]
+    #[arg(
+        help = "Wally executable",
+        long,
+        value_name = "COMMAND",
+        default_value = "wally"
+    )]
     pub(super) wally_path: String,
     #[arg(
         help = "Where cloned git/wally sources are cached. Overrides the manifest cacheDir",
@@ -1863,7 +2354,7 @@ pub(super) struct LinkApplyArgs {
         value_name = "PATH"
     )]
     pub(super) cache_dir: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }
 
@@ -1871,7 +2362,12 @@ pub(super) struct LinkApplyArgs {
 pub(super) struct LinkBreakArgs {
     #[command(flatten)]
     pub(super) project: ProjectSourceArgs,
-    #[arg(long, value_name = "PATH", default_value = "renium-link.json")]
+    #[arg(
+        help = "Link manifest path",
+        long,
+        value_name = "PATH",
+        default_value = "renium-link.json"
+    )]
     pub(super) manifest: PathBuf,
     #[arg(help = "Break every target of this link id", long, value_name = "ID")]
     pub(super) link: Option<String>,
@@ -1902,7 +2398,7 @@ pub(super) struct LinkBreakArgs {
         value_name = "PATH"
     )]
     pub(super) cache_dir: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }
 
@@ -1910,7 +2406,12 @@ pub(super) struct LinkBreakArgs {
 pub(super) struct LinkStatusArgs {
     #[command(flatten)]
     pub(super) project: ProjectSourceArgs,
-    #[arg(long, value_name = "PATH", default_value = "renium-link.json")]
+    #[arg(
+        help = "Link manifest path",
+        long,
+        value_name = "PATH",
+        default_value = "renium-link.json"
+    )]
     pub(super) manifest: PathBuf,
     #[arg(
         help = "Where cloned git/wally sources are cached. Overrides the manifest cacheDir",
@@ -1918,13 +2419,14 @@ pub(super) struct LinkStatusArgs {
         value_name = "PATH"
     )]
     pub(super) cache_dir: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }
 
 #[derive(Parser)]
 pub(super) struct LinkAddArgs {
     #[arg(
+        help = "Project root directory",
         short = 'r',
         long,
         alias = "root",
@@ -1932,7 +2434,12 @@ pub(super) struct LinkAddArgs {
         default_value = "."
     )]
     pub(super) project_root: PathBuf,
-    #[arg(long, value_name = "PATH", default_value = "renium-link.json")]
+    #[arg(
+        help = "Link manifest path",
+        long,
+        value_name = "PATH",
+        default_value = "renium-link.json"
+    )]
     pub(super) manifest: PathBuf,
     #[arg(
         help = "Stable link id; defaults to a slug of the first target name",
@@ -1966,7 +2473,7 @@ pub(super) struct LinkAddArgs {
     pub(super) source_subpath: Option<String>,
     #[command(flatten)]
     pub(super) target: LinkTargetArgs,
-    #[arg(long)]
+    #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }
 
@@ -1998,6 +2505,7 @@ pub(super) struct LinkTargetArgs {
 #[derive(Parser)]
 pub(super) struct LinkMoveTargetArgs {
     #[arg(
+        help = "Project root directory",
         short = 'r',
         long,
         alias = "root",
@@ -2005,21 +2513,44 @@ pub(super) struct LinkMoveTargetArgs {
         default_value = "."
     )]
     pub(super) project_root: PathBuf,
-    #[arg(long, value_name = "PATH", default_value = "renium-link.json")]
+    #[arg(
+        help = "Link manifest path",
+        long,
+        value_name = "PATH",
+        default_value = "renium-link.json"
+    )]
     pub(super) manifest: PathBuf,
-    #[arg(long, value_name = "SERVICE")]
+    #[arg(help = "Current service", long, value_name = "SERVICE")]
     pub(super) old_service: String,
-    #[arg(long = "old-path", value_name = "JSON")]
+    #[arg(
+        help = "Current target path (JSON string array)",
+        long = "old-path",
+        value_name = "JSON"
+    )]
     pub(super) old_path_segments_json: String,
-    #[arg(long = "old-ords", value_name = "JSON", default_value = "[]")]
+    #[arg(
+        help = "Current sibling ordinals (JSON array)",
+        long = "old-ords",
+        value_name = "JSON",
+        default_value = "[]"
+    )]
     pub(super) old_path_ordinals_json: String,
-    #[arg(long, value_name = "SERVICE")]
+    #[arg(help = "New service", long, value_name = "SERVICE")]
     pub(super) new_service: String,
-    #[arg(long = "new-path", value_name = "JSON")]
+    #[arg(
+        help = "New target path (JSON string array)",
+        long = "new-path",
+        value_name = "JSON"
+    )]
     pub(super) new_path_segments_json: String,
-    #[arg(long = "new-ords", value_name = "JSON", default_value = "[]")]
+    #[arg(
+        help = "New sibling ordinals (JSON array)",
+        long = "new-ords",
+        value_name = "JSON",
+        default_value = "[]"
+    )]
     pub(super) new_path_ordinals_json: String,
-    #[arg(long)]
+    #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }
 
@@ -2030,7 +2561,12 @@ pub(super) struct LinkMoveTargetArgs {
 pub(super) struct LinkPackArgs {
     #[command(flatten)]
     pub(super) project: ProjectSourceArgs,
-    #[arg(long, value_name = "PATH", default_value = "renium-link.json")]
+    #[arg(
+        help = "Link manifest path",
+        long,
+        value_name = "PATH",
+        default_value = "renium-link.json"
+    )]
     pub(super) manifest: PathBuf,
     #[arg(
         help = "Project folder where bytecode packages are stored (commit it to share packages with the repo). Omit to save into the per-user global library (Documents/Renium/Packages), usable from any project on this machine",
@@ -2045,7 +2581,7 @@ pub(super) struct LinkPackArgs {
     pub(super) id: Option<String>,
     #[command(flatten)]
     pub(super) target: LinkTargetArgs,
-    #[arg(long)]
+    #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }
 
@@ -2054,7 +2590,12 @@ pub(super) struct LinkPackArgs {
 pub(super) struct LinkDeletePackageArgs {
     #[command(flatten)]
     pub(super) project: ProjectSourceArgs,
-    #[arg(long, value_name = "PATH", default_value = "renium-link.json")]
+    #[arg(
+        help = "Link manifest path",
+        long,
+        value_name = "PATH",
+        default_value = "renium-link.json"
+    )]
     pub(super) manifest: PathBuf,
     #[arg(help = "Package / link id to delete", long)]
     pub(super) id: String,
@@ -2064,7 +2605,7 @@ pub(super) struct LinkDeletePackageArgs {
         default_value = "delete-unused"
     )]
     pub(super) action: String,
-    #[arg(long)]
+    #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }
 
@@ -2072,8 +2613,8 @@ pub(super) struct LinkDeletePackageArgs {
 pub(super) struct BytecodeRepackArgs {
     #[command(flatten)]
     pub(super) project: ProjectSourceArgs,
-    #[arg(value_name = "SERVICE_OR_FILE")]
+    #[arg(help = "Stores or services to upgrade", value_name = "SERVICE_OR_FILE")]
     pub(super) paths: Vec<PathBuf>,
-    #[arg(long)]
+    #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }
