@@ -6194,6 +6194,12 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		end
 		session.onExpire = nil
 		editorTransactions[transactionId] = nil
+		for importId, importSession in pairs(binaryImports) do
+			if type(importSession) == "table" and tostring(importSession.transactionId or "") == transactionId then
+				importSession.expireRequested = true
+				expireSession(binaryImports, importId, importSession)
+			end
+		end
 		for _, serviceName in ipairs(session.serviceNames) do
 			invalidateEditorService(serviceName)
 		end
