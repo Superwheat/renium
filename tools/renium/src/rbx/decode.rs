@@ -975,7 +975,7 @@ pub(crate) fn rbx_properties_to_settings_records<'a>(
                 rbx_attributes,
                 database,
                 refs,
-                true,
+                false,
             ));
             continue;
         }
@@ -1023,9 +1023,15 @@ pub(crate) fn rbx_properties_to_settings_records<'a>(
                 continue;
             }
         }
-        if let Some(value) =
-            rbx_variant_to_persisted_settings_json(variant, descriptor, database, refs)
-        {
+        let known = descriptor.is_some()
+            || rbx_model_property_descriptor(database, class_name, property_name).is_some()
+            || rbx_property_descriptor(database, class_name, property_name).is_some();
+        let value = if known {
+            rbx_variant_to_settings_json(variant, descriptor, database, refs)
+        } else {
+            rbx_variant_to_persisted_settings_json(variant, None, database, refs)
+        };
+        if let Some(value) = value {
             let output_name = options
                 .native_filter
                 .and_then(|filter| filter.renamed.get(property_name))
