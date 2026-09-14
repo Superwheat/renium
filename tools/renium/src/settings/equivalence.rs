@@ -648,13 +648,6 @@ fn identity_score(
     })
 }
 
-pub(crate) fn align_settings_ids_to_reference(
-    reference: &SettingsBytecode,
-    observed: &mut SettingsBytecode,
-) -> bool {
-    align_settings_ids_to_reference_impl(reference, observed)
-}
-
 fn settings_topology_matches(reference: &SettingsBytecode, observed: &SettingsBytecode) -> bool {
     reference.instances.len() == observed.instances.len()
         && reference
@@ -715,174 +708,35 @@ fn persistent_identities_follow_mapping(
     })
 }
 
-struct ExactIdentityPass<'a> {
+type IdentityGroupKey<'a> = (Option<usize>, &'a str, &'a str);
+
+struct IdentityLookup<'a> {
+    reference_by_id: HashMap<&'a str, usize>,
+    reference_by_unique_id: AHashMap<&'a str, Option<usize>>,
+    observed_by_unique_id: AHashMap<&'a str, Option<usize>>,
+}
+
+struct ScoreInputs<'a, 'b> {
+    reference_groups: &'b HashMap<IdentityGroupKey<'a>, Vec<usize>>,
+    reference_graph: &'b ReferenceGraph,
+    observed_graph: &'b ReferenceGraph,
+    subtree_keys: Option<&'b (Vec<usize>, Vec<usize>)>,
+}
+
+struct IdentityAssignment<'a> {
     reference: &'a SettingsBytecode,
     observed: &'a SettingsBytecode,
-    reference_by_id: &'a HashMap<&'a str, usize>,
-    reference_by_unique_id: &'a AHashMap<&'a str, Option<usize>>,
-    observed_by_unique_id: &'a AHashMap<&'a str, Option<usize>>,
-    assigned_ids: &'a mut [Option<String>],
-    assigned_reference: &'a mut [Option<usize>],
-    assigned_observed: &'a mut [Option<usize>],
-    used_reference: &'a mut [bool],
-    used_ids: &'a mut HashSet<String>,
-    remaining: &'a mut usize,
+    old_ids: Vec<String>,
+    reserved_reference_ids: HashSet<String>,
+    blocked_ids: HashSet<String>,
+    assigned_ids: Vec<Option<String>>,
+    assigned_reference: Vec<Option<usize>>,
+    assigned_observed: Vec<Option<usize>>,
+    used_reference: Vec<bool>,
+    used_ids: HashSet<String>,
+    generated: usize,
+    remaining: usize,
 }
-
-impl ExactIdentityPass<'_> {
-    fn run(&mut self) -> bool {
-        let mut progressed = false;
-        for (index, instance) in self.observed.instances.iter().enumerate() {
-            if self.assigned_ids[index].is_some() {
-                continue;
-            }
-            let persistent = persistent_identity(instance)
-                .filter(|id| self.observed_by_unique_id.get(id) == Some(&Some(index)))
-                .and_then(|id| self.reference_by_unique_id.get(id).copied().flatten())
-                .filter(|candidate| {
-                    self.reference.instances[*candidate].class_name == instance.class_name
-                });
-            let Some(candidate) = persistent
-                .or_else(|| {
-                    (!instance.settings_id.starts_with("debug:"))
-                        .then(|| {
-                            self.reference_by_id
-                                .get(instance.settings_id.as_str())
-                                .copied()
-                        })
-                        .flatten()
-                })
-                .filter(|candidate| {
-                    !self.used_reference[*candidate]
-                        && !self
-                            .used_ids
-                            .contains(&self.reference.instances[*candidate].settings_id)
-                })
-            else {
-                continue;
-            };
-            let id = self.reference.instances[candidate].settings_id.clone();
-            self.used_reference[candidate] = true;
-            self.used_ids.insert(id.clone());
-            self.assigned_reference[index] = Some(candidate);
-            self.assigned_observed[candidate] = Some(index);
-            self.assigned_ids[index] = Some(id);
-            *self.remaining -= 1;
-            progressed = true;
-        }
-        progressed
-    }
-
-    fn run_unique(&mut self, reference_groups: &HashMap<(Option<usize>, &str, &str), Vec<usize>>) {
-        let mut observed_counts = AHashMap::with_capacity(self.observed.instances.len());
-        for instance in &self.observed.instances {
-            *observed_counts
-                .entry((
-                    instance.parent_index,
-                    instance.name.as_str(),
-                    instance.class_name.as_str(),
-                ))
-                .or_insert(0usize) += 1;
-        }
-        // Resolve parent-before-child singleton groups in one pass. The scored
-        // path makes the same decision, but builds a Vec for every unique child
-        // and revisits the entire document at each depth after a reorder.
-        for (index, instance) in self.observed.instances.iter().enumerate() {
-            if self.assigned_ids[index].is_some()
-                || observed_counts[&(
-                    instance.parent_index,
-                    instance.name.as_str(),
-                    instance.class_name.as_str(),
-                )] != 1
-            {
-                continue;
-            }
-            let parent = match instance.parent_index {
-                Some(parent) => match self.assigned_reference.get(parent).copied().flatten() {
-                    Some(parent) => Some(parent),
-                    None => continue,
-                },
-                None => None,
-            };
-            let Some(candidates) = reference_groups.get(&(
-                parent,
-                instance.name.as_str(),
-                instance.class_name.as_str(),
-            )) else {
-                continue;
-            };
-            let [candidate] = candidates.as_slice() else {
-                continue;
-            };
-            if self.used_reference[*candidate] {
-                continue;
-            }
-            let id = self.reference.instances[*candidate].settings_id.clone();
-            self.used_reference[*candidate] = true;
-            self.used_ids.insert(id.clone());
-            self.assigned_reference[index] = Some(*candidate);
-            self.assigned_observed[*candidate] = Some(index);
-            self.assigned_ids[index] = Some(id);
-            *self.remaining -= 1;
-        }
-    }
-}
-
-fn next_alignment_id(
-    preferred: &str,
-    reserved_reference_ids: &HashSet<String>,
-    blocked_ids: &mut HashSet<String>,
-    used_ids: &mut HashSet<String>,
-    generated: &mut usize,
-) -> String {
-    if !reserved_reference_ids.contains(preferred) && used_ids.insert(preferred.to_string()) {
-        return preferred.to_string();
-    }
-    loop {
-        let candidate = format!("reconcile:{:x}", *generated);
-        *generated += 1;
-        if blocked_ids.insert(candidate.clone()) && used_ids.insert(candidate.clone()) {
-            return candidate;
-        }
-    }
-}
-
-struct FallbackIdentityPass<'a> {
-    reference: &'a SettingsBytecode,
-    observed: &'a SettingsBytecode,
-    reference_groups: &'a HashMap<(Option<usize>, &'a str, &'a str), Vec<usize>>,
-    old_ids: &'a [String],
-    reserved_reference_ids: &'a HashSet<String>,
-    blocked_ids: &'a mut HashSet<String>,
-    assigned_ids: &'a mut [Option<String>],
-    assigned_reference: &'a mut [Option<usize>],
-    assigned_observed: &'a mut [Option<usize>],
-    used_reference: &'a mut [bool],
-    used_ids: &'a mut HashSet<String>,
-    generated: &'a mut usize,
-    remaining: &'a mut usize,
-}
-
-struct ScoredIdentityPass<'a> {
-    reference: &'a SettingsBytecode,
-    observed: &'a SettingsBytecode,
-    reference_groups: &'a HashMap<(Option<usize>, &'a str, &'a str), Vec<usize>>,
-    reference_graph: &'a ReferenceGraph,
-    observed_graph: &'a ReferenceGraph,
-    subtree_keys: Option<&'a (Vec<usize>, Vec<usize>)>,
-    old_ids: &'a [String],
-    reserved_reference_ids: &'a HashSet<String>,
-    blocked_ids: &'a mut HashSet<String>,
-    assigned_ids: &'a mut [Option<String>],
-    assigned_reference: &'a mut [Option<usize>],
-    assigned_observed: &'a mut [Option<usize>],
-    used_reference: &'a mut [bool],
-    used_ids: &'a mut HashSet<String>,
-    generated: &'a mut usize,
-    remaining: &'a mut usize,
-    unchanged_content_groups: &'a mut HashMap<usize, (Vec<usize>, Vec<usize>)>,
-}
-
 struct IdentityNumberField {
     attribute: bool,
     property: String,
@@ -1016,9 +870,61 @@ impl IdentityCandidateIndex {
     }
 }
 
-impl ScoredIdentityPass<'_> {
-    fn run(&mut self) -> bool {
-        let mut observed_groups = HashMap::<(Option<usize>, &str, &str), Vec<usize>>::new();
+impl<'a> IdentityAssignment<'a> {
+    fn new(reference: &'a SettingsBytecode, observed: &'a SettingsBytecode) -> Self {
+        Self {
+            reference,
+            observed,
+            old_ids: observed
+                .instances
+                .iter()
+                .map(|instance| instance.settings_id.clone())
+                .collect(),
+            reserved_reference_ids: HashSet::new(),
+            blocked_ids: HashSet::new(),
+            assigned_ids: vec![None; observed.instances.len()],
+            assigned_reference: vec![None; observed.instances.len()],
+            assigned_observed: vec![None; reference.instances.len()],
+            used_reference: vec![false; reference.instances.len()],
+            used_ids: HashSet::new(),
+            generated: 0,
+            remaining: observed.instances.len(),
+        }
+    }
+
+    fn assign(&mut self, index: usize, candidate: usize) {
+        let id = self.reference.instances[candidate].settings_id.clone();
+        self.used_reference[candidate] = true;
+        self.used_ids.insert(id.clone());
+        self.assigned_reference[index] = Some(candidate);
+        self.assigned_observed[candidate] = Some(index);
+        self.assigned_ids[index] = Some(id);
+        self.remaining -= 1;
+    }
+
+    fn assign_fresh(&mut self, index: usize) {
+        let preferred = &self.old_ids[index];
+        let id = if !self.reserved_reference_ids.contains(preferred)
+            && self.used_ids.insert(preferred.clone())
+        {
+            preferred.clone()
+        } else {
+            loop {
+                let candidate = format!("reconcile:{:x}", self.generated);
+                self.generated += 1;
+                if self.blocked_ids.insert(candidate.clone())
+                    && self.used_ids.insert(candidate.clone())
+                {
+                    break candidate;
+                }
+            }
+        };
+        self.assigned_ids[index] = Some(id);
+        self.remaining -= 1;
+    }
+
+    fn unassigned_groups(&self) -> BTreeMap<IdentityGroupKey<'a>, Vec<usize>> {
+        let mut groups = BTreeMap::<IdentityGroupKey<'a>, Vec<usize>>::new();
         for (index, instance) in self.observed.instances.iter().enumerate() {
             if self.assigned_ids[index].is_some() {
                 continue;
@@ -1037,7 +943,7 @@ impl ScoredIdentityPass<'_> {
                 }
                 None => None,
             };
-            observed_groups
+            groups
                 .entry((
                     reference_parent,
                     instance.name.as_str(),
@@ -1046,12 +952,105 @@ impl ScoredIdentityPass<'_> {
                 .or_default()
                 .push(index);
         }
+        groups
+    }
 
+    fn run_exact(&mut self, lookup: &IdentityLookup<'_>) -> bool {
+        let reference = self.reference;
+        let observed = self.observed;
         let mut progressed = false;
-        for (key, observed_group) in observed_groups {
+        for (index, instance) in observed.instances.iter().enumerate() {
+            if self.assigned_ids[index].is_some() {
+                continue;
+            }
+            let persistent = persistent_identity(instance)
+                .filter(|id| lookup.observed_by_unique_id.get(id) == Some(&Some(index)))
+                .and_then(|id| lookup.reference_by_unique_id.get(id).copied().flatten())
+                .filter(|candidate| {
+                    reference.instances[*candidate].class_name == instance.class_name
+                });
+            let Some(candidate) = persistent
+                .or_else(|| {
+                    (!instance.settings_id.starts_with("debug:"))
+                        .then(|| {
+                            lookup
+                                .reference_by_id
+                                .get(instance.settings_id.as_str())
+                                .copied()
+                        })
+                        .flatten()
+                })
+                .filter(|candidate| {
+                    !self.used_reference[*candidate]
+                        && !self
+                            .used_ids
+                            .contains(&reference.instances[*candidate].settings_id)
+                })
+            else {
+                continue;
+            };
+            self.assign(index, candidate);
+            progressed = true;
+        }
+        progressed
+    }
+
+    fn run_unique(&mut self, reference_groups: &HashMap<IdentityGroupKey<'a>, Vec<usize>>) {
+        let observed = self.observed;
+        let mut observed_counts = AHashMap::with_capacity(observed.instances.len());
+        for instance in &observed.instances {
+            *observed_counts
+                .entry((
+                    instance.parent_index,
+                    instance.name.as_str(),
+                    instance.class_name.as_str(),
+                ))
+                .or_insert(0usize) += 1;
+        }
+        // Resolve parent-before-child singleton groups in one pass. The scored
+        // path makes the same decision, but builds a Vec for every unique child
+        // and revisits the entire document at each depth after a reorder.
+        for (index, instance) in observed.instances.iter().enumerate() {
+            if self.assigned_ids[index].is_some()
+                || observed_counts[&(
+                    instance.parent_index,
+                    instance.name.as_str(),
+                    instance.class_name.as_str(),
+                )] != 1
+            {
+                continue;
+            }
+            let parent = match instance.parent_index {
+                Some(parent) => match self.assigned_reference.get(parent).copied().flatten() {
+                    Some(parent) => Some(parent),
+                    None => continue,
+                },
+                None => None,
+            };
+            let Some([candidate]) = reference_groups
+                .get(&(parent, instance.name.as_str(), instance.class_name.as_str()))
+                .map(Vec::as_slice)
+            else {
+                continue;
+            };
+            if !self.used_reference[*candidate] {
+                self.assign(index, *candidate);
+            }
+        }
+    }
+
+    fn run_scored(
+        &mut self,
+        inputs: &ScoreInputs<'a, '_>,
+        unchanged_content_groups: &mut HashMap<usize, (Vec<usize>, Vec<usize>)>,
+    ) -> bool {
+        let reference = self.reference;
+        let observed = self.observed;
+        let mut progressed = false;
+        for (key, observed_group) in self.unassigned_groups() {
             let group_started = Instant::now();
             let observed_count = observed_group.len();
-            let candidates = self
+            let candidates = inputs
                 .reference_groups
                 .get(&key)
                 .into_iter()
@@ -1061,26 +1060,19 @@ impl ScoredIdentityPass<'_> {
                 .collect::<Vec<_>>();
             if candidates.is_empty() {
                 for index in observed_group {
-                    self.assigned_ids[index] = Some(next_alignment_id(
-                        &self.old_ids[index],
-                        self.reserved_reference_ids,
-                        self.blocked_ids,
-                        self.used_ids,
-                        self.generated,
-                    ));
-                    *self.remaining -= 1;
-                    progressed = true;
+                    self.assign_fresh(index);
                 }
+                progressed = true;
                 continue;
             }
             if observed_group.len() == 1 && candidates.len() == 1 {
-                self.assign_reference(observed_group[0], candidates[0]);
+                self.assign(observed_group[0], candidates[0]);
                 progressed = true;
                 continue;
             }
 
             let group_index = observed_group[0];
-            if self.unchanged_content_groups.get(&group_index).is_some_and(
+            if unchanged_content_groups.get(&group_index).is_some_and(
                 |(previous_observed, previous_candidates)| {
                     previous_observed == &observed_group && previous_candidates == &candidates
                 },
@@ -1089,28 +1081,32 @@ impl ScoredIdentityPass<'_> {
             }
 
             let score_context = IdentityScoreContext {
-                reference: self.reference,
-                observed: self.observed,
-                reference_graph: self.reference_graph,
-                observed_graph: self.observed_graph,
-                assigned_reference: self.assigned_reference,
-                assigned_observed: self.assigned_observed,
-                subtree_keys: self.subtree_keys,
+                reference,
+                observed,
+                reference_graph: inputs.reference_graph,
+                observed_graph: inputs.observed_graph,
+                assigned_reference: &self.assigned_reference,
+                assigned_observed: &self.assigned_observed,
+                subtree_keys: inputs.subtree_keys,
             };
             let mut proposals = Vec::with_capacity(observed_group.len());
             let mut proposal_counts = HashMap::<usize, usize>::new();
             let (representatives, multiplicities) = identity_candidate_representatives(
-                self.reference,
-                self.reference_graph,
-                self.subtree_keys.map(|(reference, _)| reference.as_slice()),
+                reference,
+                inputs.reference_graph,
+                inputs
+                    .subtree_keys
+                    .map(|(reference, _)| reference.as_slice()),
                 &candidates,
             );
+            let unreferenced = |index: usize| {
+                inputs.observed_graph.outgoing[index].is_empty()
+                    && inputs.observed_graph.incoming[index].is_empty()
+            };
             let content_index = if representatives.len() > 1
-                && observed_group.iter().any(|index| {
-                    self.observed_graph.outgoing[*index].is_empty()
-                        && self.observed_graph.incoming[*index].is_empty()
-                }) {
-                IdentityCandidateIndex::build(self.reference, &representatives)
+                && observed_group.iter().any(|index| unreferenced(*index))
+            {
+                IdentityCandidateIndex::build(reference, &representatives)
             } else {
                 None
             };
@@ -1120,11 +1116,8 @@ impl ScoredIdentityPass<'_> {
                 let mut tied = false;
                 let narrowed = content_index
                     .as_ref()
-                    .filter(|_| {
-                        self.observed_graph.outgoing[index].is_empty()
-                            && self.observed_graph.incoming[index].is_empty()
-                    })
-                    .and_then(|lookup| lookup.matching(&self.observed.instances[index]));
+                    .filter(|_| unreferenced(index))
+                    .and_then(|lookup| lookup.matching(&observed.instances[index]));
                 let count = narrowed.map_or(representatives.len(), <[_]>::len);
                 for offset in 0..count {
                     let candidate =
@@ -1157,7 +1150,7 @@ impl ScoredIdentityPass<'_> {
                 if proposal_counts.get(&candidate) != Some(&1) || self.used_reference[candidate] {
                     continue;
                 }
-                self.assign_reference(index, candidate);
+                self.assign(index, candidate);
                 progressed = true;
                 assigned = true;
             }
@@ -1178,67 +1171,25 @@ impl ScoredIdentityPass<'_> {
             // neither side has reference edges. Leave ties for the existing
             // fallback pass instead of rescoring them at every hierarchy depth.
             if !assigned
-                && observed_group.iter().all(|index| {
-                    self.observed_graph.outgoing[*index].is_empty()
-                        && self.observed_graph.incoming[*index].is_empty()
-                })
+                && observed_group.iter().all(|index| unreferenced(*index))
                 && candidates.iter().all(|index| {
-                    self.reference_graph.outgoing[*index].is_empty()
-                        && self.reference_graph.incoming[*index].is_empty()
+                    inputs.reference_graph.outgoing[*index].is_empty()
+                        && inputs.reference_graph.incoming[*index].is_empty()
                 })
             {
-                self.unchanged_content_groups
-                    .insert(group_index, (observed_group, candidates));
+                unchanged_content_groups.insert(group_index, (observed_group, candidates));
             }
         }
         progressed
     }
 
-    fn assign_reference(&mut self, index: usize, candidate: usize) {
-        let id = self.reference.instances[candidate].settings_id.clone();
-        self.used_reference[candidate] = true;
-        self.used_ids.insert(id.clone());
-        self.assigned_reference[index] = Some(candidate);
-        self.assigned_observed[candidate] = Some(index);
-        self.assigned_ids[index] = Some(id);
-        *self.remaining -= 1;
-    }
-}
-
-impl FallbackIdentityPass<'_> {
-    fn run(&mut self) -> bool {
-        let mut groups = BTreeMap::<(Option<usize>, &str, &str), Vec<usize>>::new();
-        for (index, instance) in self.observed.instances.iter().enumerate() {
-            if self.assigned_ids[index].is_some() {
-                continue;
-            }
-            let reference_parent = match instance.parent_index {
-                Some(parent) => {
-                    if self
-                        .assigned_ids
-                        .get(parent)
-                        .and_then(Option::as_ref)
-                        .is_none()
-                    {
-                        continue;
-                    }
-                    self.assigned_reference[parent]
-                }
-                None => None,
-            };
-            groups
-                .entry((
-                    reference_parent,
-                    instance.name.as_str(),
-                    instance.class_name.as_str(),
-                ))
-                .or_default()
-                .push(index);
-        }
+    fn run_fallback(
+        &mut self,
+        reference_groups: &HashMap<IdentityGroupKey<'a>, Vec<usize>>,
+    ) -> bool {
         let mut progressed = false;
-        for (key, observed_group) in groups {
-            let candidates = self
-                .reference_groups
+        for (key, observed_group) in self.unassigned_groups() {
+            let candidates = reference_groups
                 .get(&key)
                 .into_iter()
                 .flatten()
@@ -1246,27 +1197,12 @@ impl FallbackIdentityPass<'_> {
                 .filter(|candidate| !self.used_reference[*candidate])
                 .collect::<Vec<_>>();
             let paired = observed_group.len().min(candidates.len());
-            for offset in 0..paired {
-                let index = observed_group[offset];
-                let candidate = candidates[offset];
-                let id = self.reference.instances[candidate].settings_id.clone();
-                self.used_reference[candidate] = true;
-                self.used_ids.insert(id.clone());
-                self.assigned_reference[index] = Some(candidate);
-                self.assigned_observed[candidate] = Some(index);
-                self.assigned_ids[index] = Some(id);
-                *self.remaining -= 1;
+            for (index, candidate) in observed_group.iter().zip(&candidates) {
+                self.assign(*index, *candidate);
                 progressed = true;
             }
             for index in observed_group.into_iter().skip(paired) {
-                self.assigned_ids[index] = Some(next_alignment_id(
-                    &self.old_ids[index],
-                    self.reserved_reference_ids,
-                    self.blocked_ids,
-                    self.used_ids,
-                    self.generated,
-                ));
-                *self.remaining -= 1;
+                self.assign_fresh(index);
                 progressed = true;
             }
         }
@@ -1274,7 +1210,7 @@ impl FallbackIdentityPass<'_> {
     }
 }
 
-fn align_settings_ids_to_reference_impl(
+pub(crate) fn align_settings_ids_to_reference(
     reference: &SettingsBytecode,
     observed: &mut SettingsBytecode,
 ) -> bool {
@@ -1311,18 +1247,22 @@ fn align_settings_ids_to_reference_impl(
                 .collect::<HashSet<_>>(),
         )
     });
-    let reference_by_id = reference
-        .instances
-        .iter()
-        .enumerate()
-        .filter(|(_, instance)| {
-            candidate_filters
-                .as_ref()
-                .is_none_or(|(ids, _)| ids.contains(instance.settings_id.as_str()))
-        })
-        .map(|(index, instance)| (instance.settings_id.as_str(), index))
-        .collect::<HashMap<_, _>>();
-    let mut reference_groups = HashMap::<(Option<usize>, &str, &str), Vec<usize>>::new();
+    let lookup = IdentityLookup {
+        reference_by_id: reference
+            .instances
+            .iter()
+            .enumerate()
+            .filter(|(_, instance)| {
+                candidate_filters
+                    .as_ref()
+                    .is_none_or(|(ids, _)| ids.contains(instance.settings_id.as_str()))
+            })
+            .map(|(index, instance)| (instance.settings_id.as_str(), index))
+            .collect(),
+        reference_by_unique_id: persistent_identity_index(reference),
+        observed_by_unique_id: persistent_identity_index(observed),
+    };
+    let mut reference_groups = HashMap::<IdentityGroupKey, Vec<usize>>::new();
     for (index, instance) in reference.instances.iter().enumerate() {
         if candidate_filters.as_ref().is_some_and(|(_, names)| {
             !names.contains(&(instance.name.as_str(), instance.class_name.as_str()))
@@ -1338,64 +1278,36 @@ fn align_settings_ids_to_reference_impl(
             .or_default()
             .push(index);
     }
-    let old_ids = observed
-        .instances
-        .iter()
-        .map(|instance| instance.settings_id.clone())
-        .collect::<Vec<_>>();
-    let mut assigned_ids = vec![None; observed.instances.len()];
-    let mut assigned_reference = vec![None; observed.instances.len()];
-    let mut assigned_observed = vec![None; reference.instances.len()];
-    let mut used_reference = vec![false; reference.instances.len()];
-    let mut used_ids = HashSet::new();
-    let mut generated = 0usize;
-
-    let mut remaining = assigned_ids.len();
-    let reference_by_unique_id = persistent_identity_index(reference);
-    let observed_by_unique_id = persistent_identity_index(observed);
+    let mut state = IdentityAssignment::new(reference, observed);
     if let (Some(reference_index), Some(observed_index)) = cameras {
-        let id = reference.instances[reference_index].settings_id.clone();
-        used_reference[reference_index] = true;
-        used_ids.insert(id.clone());
-        assigned_reference[observed_index] = Some(reference_index);
-        assigned_observed[reference_index] = Some(observed_index);
-        assigned_ids[observed_index] = Some(id);
-        remaining -= 1;
+        state.assign(observed_index, reference_index);
     }
-    let mut exact = ExactIdentityPass {
-        reference,
-        observed,
-        reference_by_id: &reference_by_id,
-        reference_by_unique_id: &reference_by_unique_id,
-        observed_by_unique_id: &observed_by_unique_id,
-        assigned_ids: &mut assigned_ids,
-        assigned_reference: &mut assigned_reference,
-        assigned_observed: &mut assigned_observed,
-        used_reference: &mut used_reference,
-        used_ids: &mut used_ids,
-        remaining: &mut remaining,
-    };
-    exact.run();
-    exact.run_unique(&reference_groups);
+    state.run_exact(&lookup);
+    state.run_unique(&reference_groups);
     log_global(
         4,
         format_args!(
-            "[renium] identity preparation: {:.1}ms remaining={remaining}",
-            preparation_started.elapsed().as_secs_f64() * 1000.0
+            "[renium] identity preparation: {:.1}ms remaining={}",
+            preparation_started.elapsed().as_secs_f64() * 1000.0,
+            state.remaining
         ),
     );
 
-    if remaining > 0 {
+    if state.remaining > 0 {
         // Collision sets are needed only when matching must synthesize IDs.
         // An empty destination normally resolves all retained roots directly;
         // don't clone every incoming ID twice for that completed mapping.
-        let reserved_reference_ids = reference
+        state.reserved_reference_ids = reference
             .instances
             .iter()
             .map(|instance| instance.settings_id.clone())
-            .collect::<HashSet<_>>();
-        let mut blocked_ids = reserved_reference_ids.clone();
-        blocked_ids.extend(old_ids.iter().cloned());
+            .collect();
+        state.blocked_ids = state
+            .reserved_reference_ids
+            .iter()
+            .chain(&state.old_ids)
+            .cloned()
+            .collect();
         let phase = Instant::now();
         let (reference_graph, observed_graph) = rayon::join(
             || build_reference_graph(reference),
@@ -1423,12 +1335,12 @@ fn align_settings_ids_to_reference_impl(
                     identity_subtree_keys(
                         reference,
                         &mut keys,
-                        used_reference.iter().map(|used| !used).collect(),
+                        state.used_reference.iter().map(|used| !used).collect(),
                     ),
                     identity_subtree_keys(
                         observed,
                         &mut keys,
-                        assigned_ids.iter().map(Option::is_none).collect(),
+                        state.assigned_ids.iter().map(Option::is_none).collect(),
                     ),
                 )
             });
@@ -1440,63 +1352,17 @@ fn align_settings_ids_to_reference_impl(
             ),
         );
         let phase = Instant::now();
+        let inputs = ScoreInputs {
+            reference_groups: &reference_groups,
+            reference_graph: &reference_graph,
+            observed_graph: &observed_graph,
+            subtree_keys: subtree_keys.as_ref(),
+        };
         let mut unchanged_content_groups = HashMap::new();
-        while remaining > 0 {
-            let mut progressed = ExactIdentityPass {
-                reference,
-                observed,
-                reference_by_id: &reference_by_id,
-                reference_by_unique_id: &reference_by_unique_id,
-                observed_by_unique_id: &observed_by_unique_id,
-                assigned_ids: &mut assigned_ids,
-                assigned_reference: &mut assigned_reference,
-                assigned_observed: &mut assigned_observed,
-                used_reference: &mut used_reference,
-                used_ids: &mut used_ids,
-                remaining: &mut remaining,
-            }
-            .run();
-
-            progressed |= ScoredIdentityPass {
-                reference,
-                observed,
-                reference_groups: &reference_groups,
-                reference_graph: &reference_graph,
-                observed_graph: &observed_graph,
-                subtree_keys: subtree_keys.as_ref(),
-                old_ids: &old_ids,
-                reserved_reference_ids: &reserved_reference_ids,
-                blocked_ids: &mut blocked_ids,
-                assigned_ids: &mut assigned_ids,
-                assigned_reference: &mut assigned_reference,
-                assigned_observed: &mut assigned_observed,
-                used_reference: &mut used_reference,
-                used_ids: &mut used_ids,
-                generated: &mut generated,
-                remaining: &mut remaining,
-                unchanged_content_groups: &mut unchanged_content_groups,
-            }
-            .run();
-            if progressed {
-                continue;
-            }
-            progressed = FallbackIdentityPass {
-                reference,
-                observed,
-                reference_groups: &reference_groups,
-                old_ids: &old_ids,
-                reserved_reference_ids: &reserved_reference_ids,
-                blocked_ids: &mut blocked_ids,
-                assigned_ids: &mut assigned_ids,
-                assigned_reference: &mut assigned_reference,
-                assigned_observed: &mut assigned_observed,
-                used_reference: &mut used_reference,
-                used_ids: &mut used_ids,
-                generated: &mut generated,
-                remaining: &mut remaining,
-            }
-            .run();
-            if progressed {
+        while state.remaining > 0 {
+            let mut progressed = state.run_exact(&lookup);
+            progressed |= state.run_scored(&inputs, &mut unchanged_content_groups);
+            if progressed || state.run_fallback(&reference_groups) {
                 continue;
             }
             return false;
@@ -1510,13 +1376,17 @@ fn align_settings_ids_to_reference_impl(
         );
     }
     let phase = Instant::now();
+    let IdentityAssignment {
+        old_ids,
+        assigned_ids,
+        ..
+    } = state;
     let assigned = assigned_ids
         .into_iter()
         .map(Option::unwrap)
         .collect::<Vec<_>>();
     let remap = old_ids
-        .iter()
-        .cloned()
+        .into_iter()
         .zip(assigned.iter().cloned())
         .collect::<HashMap<_, _>>();
     for (instance, id) in observed.instances.iter_mut().zip(assigned) {
