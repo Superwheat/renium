@@ -32,7 +32,6 @@ export type SyncConfig = {
   activePlaceAlias?: string;
   activePlace?: ExperiencePlace;
   placeSelector?: string;
-  snapshotDir: string;
   services: string[];
   bridgeWaitSeconds: number;
   bridgePorts: string;
@@ -156,7 +155,6 @@ export class SyncConfigResolver {
       activePlaceAlias: activePlace?.alias,
       activePlace: activePlace?.place,
       placeSelector: activePlace?.selector,
-      snapshotDir: read("snapshotDir", ".renium/snapshots"),
       services: services.length > 0 ? services : [...DEFAULT_SYNC_SERVICES],
       bridgeWaitSeconds: number("bridgeWaitSeconds", 8, { min: 1 }),
       bridgePorts: this.normalizedBridgePorts(String(read("bridgePorts", DEFAULT_BRIDGE_PORTS.join(",")))),

@@ -117,15 +117,6 @@ pub(crate) fn load_existing_sourcemap_root(project_root: &Path) -> Result<Option
     Ok(Some(root))
 }
 
-pub(crate) fn write_project_sourcemap_from_service_nodes(
-    project_root: &Path,
-    service_nodes: &HashMap<String, SourcemapNode>,
-) -> Result<()> {
-    let mut root = make_sourcemap_root(project_root);
-    root.children = service_nodes.values().cloned().collect();
-    write_sourcemap_root(project_root, root)
-}
-
 pub(crate) fn finalize_project_sourcemap_temp(
     project_root: &Path,
     service_nodes: &HashMap<String, SourcemapNode>,
@@ -145,26 +136,6 @@ pub(crate) fn finalize_project_sourcemap_temp(
         println!("[renium] wrote {}", output_file.display());
     }
     Ok(())
-}
-
-pub(crate) fn write_project_sourcemap_with_updates(
-    project_root: &Path,
-    updated_nodes: HashMap<String, SourcemapNode>,
-) -> Result<()> {
-    let mut root = load_existing_sourcemap_root(project_root)?
-        .unwrap_or_else(|| make_sourcemap_root(project_root));
-    let mut children_by_name: HashMap<String, SourcemapNode> = root
-        .children
-        .into_iter()
-        .map(|child| (child.name.clone(), child))
-        .collect();
-
-    for (service_name, node) in updated_nodes {
-        children_by_name.insert(service_name, node);
-    }
-
-    root.children = children_by_name.into_values().collect();
-    write_sourcemap_root(project_root, root)
 }
 
 struct SourcemapBuildNode {

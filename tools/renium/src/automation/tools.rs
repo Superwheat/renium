@@ -8,8 +8,8 @@ use walkdir::WalkDir;
 use crate::app::output::print_json_output;
 use crate::automation::{BoundContext, Failure, op};
 use crate::cli::{
-    AssetInsertArgs, AssetSearchArgs, BridgeConnectionArgs, GenerateModelArgs, ImageStoreArgs,
-    JobStatusArgs, ScriptGrepArgs, ScriptReadArgs, ScriptSearchArgs,
+    AssetInsertArgs, AssetSearchArgs, BridgeConnectionArgs, GenerateModelArgs, JobStatusArgs,
+    ScriptGrepArgs, ScriptReadArgs, ScriptSearchArgs,
 };
 use crate::project::config;
 use crate::system::files::canonical_path;
@@ -175,16 +175,6 @@ pub(crate) fn job_status_command(
         }),
         None,
     )
-}
-
-pub(crate) fn image_store_command(
-    args: ImageStoreArgs,
-    project: Option<&Path>,
-) -> anyhow::Result<()> {
-    let (root, _) = script_roots(project)?;
-    let result = crate::cloud::assets::store_image_at(&root, &json!({ "path": args.path }))
-        .map_err(|failure| anyhow::anyhow!(failure.0.m))?;
-    print_json_output(&result, false)
 }
 
 fn script_roots(project: Option<&Path>) -> anyhow::Result<(PathBuf, PathBuf)> {

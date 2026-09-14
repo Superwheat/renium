@@ -29,7 +29,6 @@ type ServiceState = {
 	nativePreparationProfile: { [string]: number }?,
 	matchedSettingsIds: { { index: number, id: string } }?,
 	matchedSettingsIdVersion: number?,
-	scriptInstances: { [string]: LuaSourceContainer }?,
 	scriptInstancesByIndex: { [number]: LuaSourceContainer }?,
 	scriptKeyByInstance: { [Instance]: string },
 	batchCacheByKey: { [string]: string },
@@ -176,7 +175,6 @@ function BridgePluginRuntime.start(context)
 	local COMPACT_VALUE_PROTOCOL_VERSION = "compact-v5-schema-4"
 	local MAX_ACTIVE_DEMAND_SERIALIZERS = 4
 	local MAX_SOURCE_BATCH_PATHS = 1024
-	local MAX_SOURCE_KEY_BYTES = 4096
 	local COMPACT_TYPE_IDS = {
 		Absent = 0,
 		Bool = 1,
@@ -1627,15 +1625,6 @@ function BridgePluginRuntime.start(context)
 		return cached
 	end
 
-	local function getOrdinalPathSourceKey(state: ServiceState, instance: Instance): string
-		local _, pathOrdinals = IdentityModule.getCachedRefPathParts(state, instance)
-		local ordinals = table.create(#pathOrdinals)
-		for index, ordinal in ipairs(pathOrdinals) do
-			ordinals[index] = tostring(ordinal)
-		end
-		return "pathord:" .. table.concat(ordinals, ",") .. ":" .. IdentityModule.getCachedInstancePath(state, instance)
-	end
-
 	local function ensureScriptRangeIndex(state: ServiceState)
 		if state.scriptIndices and state.scriptInstancesByIndex then
 			return
@@ -1651,24 +1640,6 @@ function BridgePluginRuntime.start(context)
 		end
 		state.scriptIndices = scriptIndices
 		state.scriptInstancesByIndex = scriptInstancesByIndex
-	end
-
-	local function ensureScriptKeyIndex(state: ServiceState)
-		if state.scriptInstances then
-			return
-		end
-		local scriptInstances = {}
-		for _, inst in ipairs(state.scriptObjects) do
-			local sourceKey = IdentityModule.getCachedScriptSourceKey(state, inst)
-			local pathSourceKey = "path:" .. IdentityModule.getCachedInstancePath(state, inst)
-			local ordinalPathSourceKey = getOrdinalPathSourceKey(state, inst)
-			scriptInstances[sourceKey] = inst
-			if not scriptInstances[pathSourceKey] then
-				scriptInstances[pathSourceKey] = inst
-			end
-			scriptInstances[ordinalPathSourceKey] = inst
-		end
-		state.scriptInstances = scriptInstances
 	end
 
 	local function getServicePropertySchema(state: ServiceState): { [string]: { { any } } }
@@ -3100,7 +3071,6 @@ function BridgePluginRuntime.start(context)
 			nativePreparationProfile = nil,
 			matchedSettingsIds = nil,
 			matchedSettingsIdVersion = nil,
-			scriptInstances = nil,
 			scriptInstancesByIndex = nil,
 			scriptKeyByInstance = scriptKeyByInstance,
 			batchCacheByKey = {},
@@ -3685,18 +3655,6 @@ function BridgePluginRuntime.start(context)
 		return source
 	end
 
-	function Config.getSourceForKey(state: ServiceState, sourceKey: string): string
-		local src = state.scriptSources[sourceKey]
-		if src then
-			return src
-		end
-
-		local scriptInstance = state.scriptInstances and state.scriptInstances[sourceKey] or nil
-		src = Config.readScriptSource(scriptInstance, "script source " .. sourceKey)
-		state.scriptSources[sourceKey] = src
-		return src
-	end
-
 	function Config.getSourceForIndex(state: ServiceState, sourceIndex: number): string
 		local src = state.scriptSourcesByIndex[sourceIndex]
 		if src then
@@ -3707,20 +3665,6 @@ function BridgePluginRuntime.start(context)
 		src = Config.readScriptSource(scriptInstance, "script source index " .. tostring(sourceIndex))
 		state.scriptSourcesByIndex[sourceIndex] = src
 		return src
-	end
-
-	function Config.getSourceChunk(
-		serviceName: string,
-		instancePath: string,
-		startIndex: number?,
-		maxLen: number?
-	): { [string]: any }
-		local state = getState(serviceName)
-		ensureScriptKeyIndex(state)
-		if #instancePath > MAX_SOURCE_KEY_BYTES then
-			error("Source key exceeds safe size limit")
-		end
-		return ChunkingModule.chunkEncodedString(Config.getSourceForKey(state, instancePath), startIndex, maxLen, 0)
 	end
 
 	function Config.getSourceRangeBatchCompact(
@@ -4352,10 +4296,6 @@ function BridgePluginRuntime.start(context)
 		)
 	end
 
-	Config.bridgeMethodHandlers.getSourceChunk = function(p)
-		return Config.getSourceChunk(tostring(p.service), tostring(p.instancePath), p.startIndex, p.maxLen)
-	end
-
 	Config.bridgeMethodHandlers.getLiveSourceBatch = function(p)
 		return editorSync.getLiveSourceBatch(p)
 	end
@@ -4509,24 +4449,6 @@ function BridgePluginRuntime.start(context)
 		updateStatusText = Config.updateStatusText,
 		onRuntimeSettingsChanged = Config.applyBridgeRuntimeSettings,
 		onRequestLeaseDisconnected = cancelRequestLeaseResources,
-		getFinalConsoleSnapshot = function()
-			local info = Config.getBridgeInfo()
-			if
-				info.launchNonce == nil
-				or info.launchNonce == ""
-				or (info.bridgeRole ~= "play-server" and info.bridgeRole ~= "play-client")
-			then
-				return nil
-			end
-			return {
-				runtimeId = info.runtimeId,
-				launchNonce = info.launchNonce,
-				launchEditRuntimeId = info.launchEditRuntimeId,
-				role = info.bridgeRole,
-				playerName = info.playerName,
-				snapshot = RuntimeApi.finalConsoleSnapshot(),
-			}
-		end,
 		acquireSessionLock = sessionLock.acquire,
 		releaseSessionLock = sessionLock.release,
 		inspectSessionLock = sessionLock.inspect,

@@ -1644,14 +1644,6 @@ updateMouse()
 		}
 	end
 
-	function api.finalConsoleSnapshot()
-		return api.getConsoleOutput({
-			limit = CONSOLE_BUFFER_LIMIT,
-			fromOldest = true,
-			clear = false,
-		})
-	end
-
 	function api.captureViewportProbe(params)
 		local operationGeneration = cancellationGeneration
 		assertOperationOwnership(operationGeneration)

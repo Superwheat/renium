@@ -7,7 +7,7 @@ use super::op;
 use crate::cli::{
     BridgeConnectionArgs, ClickArgs, EditorReviewDecisionArgs, ExecuteLuauArgs, GotoArgs, KeyArgs,
     PluginConsoleOutputArgs, PressArgs, ShotArgs, StartStopPlayArgs, StudioChangeStateArgs,
-    StudioDeviceArgs, TestArgs, TypeArgs, UiArgs, WaitUntilArgs,
+    StudioDeviceArgs, TypeArgs, UiArgs, WaitUntilArgs,
 };
 
 fn object(parameters: &Value) -> Result<&Map<String, Value>> {
@@ -170,17 +170,6 @@ pub(super) fn play(operation: u16, parameters: &Value) -> Result<StartStopPlayAr
         stop: operation == op::PLAY_STOP,
         players: optional_number(object, "players")?,
         mode: string(object, "mode"),
-    })
-}
-
-pub(super) fn test(parameters: &Value) -> Result<TestArgs> {
-    let object = object(parameters)?;
-    Ok(TestArgs {
-        mode: string(object, "mode").unwrap_or_else(|| "play".to_string()),
-        players: optional_number(object, "players")?,
-        timeout: number(object, "timeout", 30.0)?,
-        fail_on_error: boolean(object, "failOnError")?,
-        player: string(object, "player"),
     })
 }
 

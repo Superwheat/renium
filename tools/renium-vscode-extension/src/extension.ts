@@ -403,7 +403,6 @@ class RobloxSyncController {
       pullFromStudio: async (config) => {
         await this.runExport({
           services: config.services,
-          runImport: true,
           notifyOnSuccess: false,
           reason: "",
           destructive: true,
@@ -1058,20 +1057,12 @@ class RobloxSyncController {
         description: "Write a standalone .rbxl or .rbxlx file from project files",
         action: "placeFile",
       },
-      {
-        label: "$(export) Export Studio Snapshots",
-        description: "Save Studio snapshots without changing project files",
-        action: "snapshots",
-      },
     ])) {
       case "build":
         await this.buildProject();
         return;
       case "placeFile":
         await this.exportGameFile();
-        return;
-      case "snapshots":
-        await this.exportSnapshotsOnly();
         return;
     }
   }
@@ -2438,21 +2429,9 @@ class RobloxSyncController {
       }
       await this.runExport({
         services: this.getConfig().services,
-        runImport: true,
         notifyOnSuccess: true,
         reason: "Pull from Studio completed",
         destructive: true,
-      });
-    });
-  }
-
-  public async exportSnapshotsOnly(): Promise<void> {
-    await this.enqueue("Export snapshots", async () => {
-      await this.runExport({
-        services: this.getConfig().services,
-        runImport: false,
-        notifyOnSuccess: true,
-        reason: "Snapshot export completed",
       });
     });
   }
@@ -4263,7 +4242,6 @@ class RobloxSyncController {
 
   private async runExport(options: {
     services: string[];
-    runImport: boolean;
     notifyOnSuccess: boolean;
     reason: string;
     quietLog?: boolean;
@@ -4281,13 +4259,11 @@ class RobloxSyncController {
       this.output.appendLine(
         `[renium] export daemon command: ${command} bd -w ${Math.max(1, cfg.bridgeWaitSeconds)} -P ${cfg.bridgePorts}`,
       );
-      this.output.appendLine(`[renium] automation operation: ${options.runImport ? "pull" : "export-snapshots"}`);
     }
 
-    const operation = options.runImport ? AUTOMATION_OP.pull : AUTOMATION_OP.exportSnapshots;
+    const operation = AUTOMATION_OP.pull;
     const parameters = {
       services: selectedServices,
-      snapshotDir: cfg.snapshotDir,
       bridgeWaitSeconds: editorBridgeWaitSeconds(cfg),
       bridgePorts: cfg.bridgePorts,
       destructive: options.destructive === true,
@@ -4313,7 +4289,7 @@ class RobloxSyncController {
       throw new Error(result.automationError?.m ?? `Export exited with code ${result.code}`);
     }
 
-    if (options.runImport && options.notifyOnSuccess) {
+    if (options.notifyOnSuccess) {
       await executeCommandBestEffort("renium.fileExplorer.refreshServices", selectedServices);
     }
 
@@ -4950,7 +4926,6 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("renium.gitSync.openRemote", () => controller.git.gitOpenRemote()),
     vscode.commands.registerCommand("renium.pullFromStudio", () => controller.pullFromStudio()),
     vscode.commands.registerCommand("renium.pushToStudio", () => controller.pushToStudio()),
-    vscode.commands.registerCommand("renium.exportSnapshots", () => controller.exportSnapshotsOnly()),
     vscode.commands.registerCommand("renium.exportGameFile", () => controller.exportGameFile()),
     vscode.commands.registerCommand("renium.syncWallyPackages", () => controller.packages.syncWallyPackages()),
     vscode.commands.registerCommand("renium.link.apply", () => controller.packages.linkApply()),

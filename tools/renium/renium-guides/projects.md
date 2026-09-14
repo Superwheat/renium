@@ -11,8 +11,6 @@ rbx q Place.rbxl --source "reward granted"
 rbx cmp Place.rbxl
 rbx cmp Before.rbxl --full --all
 rbx cmp Before.rbxl --against After.rbxlx --full --all
-rbx x -d snapshots --no-run-import
-rbx si --snapshot-dir snapshots --project-root .
 rbx sm
 rbx sm --stdout
 rbx sm --cached --stdout --filter "*Tutorial*"
@@ -24,7 +22,6 @@ rbx bpack
 `q` queries an RBXL/RBXLX without Studio or a project beside it. Filter by name, class, or source.
 `cmp` is script-only by default. Add `--full --all` for all instance/property/attribute changes; `--values` includes values and source. The input is the older/before state; the project (or `--against` file) is after. `.rbxl` and `.rbxlx` work on either side without opening Studio. See [comparison scope and output](data.md#inspect-files-without-importing).
 
-`x` exports Studio snapshots; `si` imports them. Snapshot export and pull use the same bridge; don't use snapshots for a simple closed-file query.
 `sm` generates the sourcemap; `--cached` queries it. `bpack` upgrades old stores.
 
 ## Roblox packages

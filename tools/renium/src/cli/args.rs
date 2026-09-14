@@ -3,36 +3,6 @@ use std::path::PathBuf;
 use clap::Parser;
 
 #[derive(Parser)]
-pub(crate) struct ImportSnapshotsArgs {
-    #[arg(long, value_name = "PATH")]
-    pub(crate) snapshot_dir: PathBuf,
-    #[arg(long, value_name = "PATH")]
-    pub(crate) project_root: PathBuf,
-    #[arg(long, alias = "src", value_name = "PATH", default_value = "src")]
-    pub(crate) src_dir: PathBuf,
-    #[arg(long, default_value = "")]
-    pub(crate) services: String,
-    #[arg(long)]
-    pub(crate) no_project_write: bool,
-    #[arg(long, default_value_t = 0)]
-    pub(crate) threads: usize,
-}
-
-#[derive(Parser)]
-pub(crate) struct ImportServiceArgs {
-    #[arg(long, value_name = "PATH")]
-    pub(crate) project_root: PathBuf,
-    #[arg(long, alias = "src", value_name = "PATH", default_value = "src")]
-    pub(crate) src_dir: PathBuf,
-    #[arg(long)]
-    pub(crate) service: String,
-    #[arg(long, value_name = "PATH")]
-    pub(crate) snapshot_file: Option<PathBuf>,
-    #[arg(long)]
-    pub(crate) no_project_write: bool,
-}
-
-#[derive(Parser)]
 #[command(
     about = "Provision a Renium project for git/GitHub: ignore + attributes policy files and a repo-local diff textconv / merge driver for the binary .renium stores"
 )]

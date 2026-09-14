@@ -9,7 +9,6 @@ local RAW_CHUNK_METHODS = {
 	readEditorBinaryExport = true,
 	readEditorBinaryExportBatch = true,
 	getSourceRangeBatchCompactChunk = true,
-	getSourceChunk = true,
 }
 
 function BridgeTransport.sendEnvelope(client, envelope)

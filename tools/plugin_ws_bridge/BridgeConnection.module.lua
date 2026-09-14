@@ -952,17 +952,6 @@ function BridgeConnection.create(context)
 	function Config.disconnectAll(reason, unloading)
 		local isUnloading = unloading == true
 		shutdownRequests(isUnloading)
-		if isUnloading then
-			local snapshot = context.getFinalConsoleSnapshot()
-			if snapshot ~= nil then
-				snapshot.event = "finalConsoleSnapshot"
-				for _, channel in ipairs(channels) do
-					if channel.open and channel.client ~= nil then
-						TransportModule.sendEnvelope(channel.client, snapshot)
-					end
-				end
-			end
-		end
 		Config.bridgeConnectRequested = false
 		Config.bridgeConnectedOnce = false
 		Config.bridgeConnectSession += 1

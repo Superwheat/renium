@@ -3108,11 +3108,7 @@ fn import_studio_services_into_stage(
         let _ = fs::remove_dir_all(cleanup_path);
     });
     pin_edit_runtime(context, bridge)?;
-    let parameters = json!({
-        "snapshotDir": capture_dir,
-        "services": services,
-    });
-    let mut args = automation_pull_args(context, &parameters, true)?;
+    let mut args = automation_pull_args(context, &json!({ "services": services }))?;
     args.project_root.clone_from(&stage.import_project_root);
     args.src_dir.clone_from(&stage.import_src_dir);
     let info = bridge.cached_bridge_info_for_target(BridgeTarget::Main)?;
@@ -3129,7 +3125,7 @@ fn capture_studio_services_in_memory(
     stage: &ExportProjectStage,
 ) -> Result<ProjectSnapshot> {
     pin_edit_runtime(context, bridge)?;
-    let mut args = automation_pull_args(context, &json!({"services": services}), true)?;
+    let mut args = automation_pull_args(context, &json!({"services": services}))?;
     args.project_root.clone_from(&stage.import_project_root);
     args.src_dir.clone_from(&stage.import_src_dir);
     let info = bridge.cached_bridge_info_for_target(BridgeTarget::Main)?;

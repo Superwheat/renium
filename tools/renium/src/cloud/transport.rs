@@ -1,12 +1,11 @@
 use std::env;
-use std::fs::{self, File};
+use std::fs::{self};
 use std::io::Read;
 use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result as AnyResult, bail};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -305,35 +304,6 @@ pub(crate) fn introspect_key(key_env: &str) -> Result<Value, Failure> {
             "cloud key",
         )
         .detail(json!({ "status": response.status, "body": response.body })));
-    }
-    Ok(response.body)
-}
-
-pub(crate) fn upload_file(
-    url: &str,
-    auth: &CloudAuth,
-    content_type: &str,
-    path: &Path,
-) -> AnyResult<Value> {
-    let file = File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
-    let size = file.metadata()?.len();
-    let result = auth
-        .apply(agent().post(url))
-        .set("Content-Type", content_type)
-        .set("Content-Length", &size.to_string())
-        .send(file);
-    let response = match result {
-        Ok(response) | Err(ureq::Error::Status(_, response)) => {
-            read_response(response).map_err(anyhow::Error::msg)?
-        }
-        Err(ureq::Error::Transport(error)) => bail!("Open Cloud upload failed: {error}"),
-    };
-    if !(200..300).contains(&response.status) {
-        bail!(
-            "Open Cloud upload returned HTTP {}: {}",
-            response.status,
-            response.body
-        );
     }
     Ok(response.body)
 }

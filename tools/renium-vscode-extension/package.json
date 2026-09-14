@@ -145,11 +145,6 @@
         "category": "Renium"
       },
       {
-        "command": "renium.exportSnapshots",
-        "title": "Export Snapshots Only",
-        "category": "Renium"
-      },
-      {
         "command": "renium.exportGameFile",
         "title": "Export Game File",
         "category": "Renium"
@@ -445,11 +440,6 @@
           "default": "${workspaceFolder}",
           "scope": "resource",
           "description": "Workspace-relative project root"
-        },
-        "renium.snapshotDir": {
-          "type": "string",
-          "default": ".renium/snapshots",
-          "description": "Snapshot directory (relative to projectRoot unless absolute)"
         },
         "renium.services": {
           "type": "array",

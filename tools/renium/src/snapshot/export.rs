@@ -3,14 +3,13 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use walkdir::WalkDir;
 
 use crate::app::build::{
@@ -21,17 +20,14 @@ use crate::app::timing::{
     elapsed_ms, log_timing_ms, quiet_timings, set_quiet_timings, verbose_timing_logs,
 };
 use crate::automation::op;
-use crate::cli::ExportSnapshotsArgs;
-use crate::daemon::try_daemon_control_request;
+use crate::cli::PullArgs;
+use crate::daemon::daemon_control_request;
 use crate::project::config;
 use crate::project::layout::apply_configured_project_layout;
-use crate::project::sourcemap::{
-    generate_project_sourcemap, write_project_sourcemap_from_service_nodes,
-};
+use crate::project::sourcemap::generate_project_sourcemap;
 use crate::project::structural::{
     moved_references_between_documents, rewrite_moved_references, service_store_paths,
 };
-use crate::rbx::decode::json_number_f64;
 use crate::roblox::schema::{configure_bridge_property_candidates, load_rbx_dom_property_schema};
 use crate::settings::bytecode::{SettingsBytecode, encode_settings_bytecode};
 use crate::settings::equivalence::{SettingsAlignment, align_settings_bytes_to_reference};
@@ -41,18 +37,16 @@ use crate::snapshot::import::{
     resolve_direct_import_workers,
 };
 use crate::snapshot::types::{
-    ExportedSnapshotParts, NativeSettingsValue, ServiceExecutionSpan, ServiceExportOutput,
-    ServiceState,
+    ExportedSnapshotParts, ServiceExecutionSpan, ServiceExportOutput, ServiceState,
 };
 use crate::studio::bridge::{
-    BridgeChunk, BridgeInfoPayload, BridgeListenMetrics, BridgeServer, BridgeTarget,
-    ChunkFetchMetrics, MAX_BRIDGE_CHUNK_BYTES, MAX_BRIDGE_REASSEMBLY_BYTES,
+    BridgeChunk, BridgeInfoPayload, BridgeServer, BridgeTarget, ChunkFetchMetrics,
+    MAX_BRIDGE_CHUNK_BYTES, MAX_BRIDGE_REASSEMBLY_BYTES,
 };
 use crate::studio::native::editor::{EditorBinaryExportFinishGuard, editor_binary_export_parts};
 use crate::system::files::{
     OnDrop, create_unique_directory, fnv1a, is_service_settings_file_name,
     resolve_existing_project_root, sanitize_name, sha256_hex, write_bytes_if_changed,
-    write_json_file,
 };
 
 pub(crate) const BRIDGE_PROTOCOL_VERSION: &str = "compact-v5";
@@ -197,88 +191,21 @@ pub(crate) fn is_supported_bridge_codec(value: &str) -> bool {
 
 fn finish_service_export_output(
     output: ServiceExportOutput,
-    direct_import_dispatcher: Option<&DirectImportDispatcher>,
-    snapshot_dir: &Path,
+    dispatcher: &DirectImportDispatcher,
     service_export_spans: &mut Vec<ServiceExecutionSpan>,
     cumulative_service_latency_ms: &mut f64,
 ) -> Result<()> {
-    let service = output.span.service.clone();
     *cumulative_service_latency_ms += output.span.export_end_ms - output.span.export_start_ms;
-    if let Some(dispatcher) = direct_import_dispatcher {
-        dispatcher.check_error()?;
-        dispatcher.enqueue_parts(&service, output.parts)?;
-    } else {
-        let ExportedSnapshotParts {
-            class_defaults,
-            mut instances,
-            native_properties_by_instance,
-        } = output.parts;
-        for (instance, properties) in instances
-            .iter_mut()
-            .zip(native_properties_by_instance.into_iter().flatten())
-        {
-            for property in properties {
-                if property.name == "RunContext" && instance.class_name != "Script" {
-                    continue;
-                }
-                instance
-                    .properties
-                    .entry(property.name)
-                    .or_insert_with(|| native_property_json(&property.value));
-            }
-        }
-        let path = snapshot_dir.join(format!("{service}.json"));
-        write_json_file(
-            &path,
-            &json!({ "classDefaults": class_defaults, "instances": instances }),
-            true,
-        )?;
-        println!("[renium] wrote {}", path.display());
-    }
+    dispatcher.check_error()?;
+    dispatcher.enqueue_parts(&output.span.service, output.parts)?;
     service_export_spans.push(output.span);
     Ok(())
-}
-
-fn native_property_json(value: &NativeSettingsValue) -> Value {
-    let components = |type_name: &str, fields: &[&str], values: &[f32]| {
-        let mut out = Map::with_capacity(fields.len() + 1);
-        out.insert("_type".to_string(), Value::String(type_name.to_string()));
-        for (field, value) in fields.iter().zip(values) {
-            out.insert((*field).to_string(), json_number_f64(f64::from(*value)));
-        }
-        Value::Object(out)
-    };
-    match value {
-        NativeSettingsValue::Bool(value) => Value::Bool(*value),
-        NativeSettingsValue::Int(value) => json!(value),
-        NativeSettingsValue::Float32(value) => json_number_f64(f64::from(*value)),
-        NativeSettingsValue::Float64(value) => json_number_f64(*value),
-        NativeSettingsValue::String(value) => Value::String(value.clone()),
-        NativeSettingsValue::Ref(index) => json!({ "_type": "Ref", "instanceIndex": index + 1 }),
-        NativeSettingsValue::Vector2(value) => components("Vector2", &["x", "y"], value),
-        NativeSettingsValue::Vector3(value) => components("Vector3", &["x", "y", "z"], value),
-        NativeSettingsValue::UDim(value) => components("UDim", &["scale", "offset"], value),
-        NativeSettingsValue::UDim2(value) => {
-            components("UDim2", &["xScale", "xOffset", "yScale", "yOffset"], value)
-        }
-        NativeSettingsValue::Color3(value) => components("Color3", &["r", "g", "b"], value),
-        NativeSettingsValue::CFrame(value) => json!({
-            "_type": "CFrame",
-            "components": value.iter().map(|component| json_number_f64(f64::from(*component))).collect::<Vec<_>>(),
-        }),
-        NativeSettingsValue::Rect(value) => {
-            components("Rect", &["minX", "minY", "maxX", "maxY"], value)
-        }
-        NativeSettingsValue::Enum(name) => json!({ "_type": "EnumItem", "name": name }),
-    }
 }
 
 struct ExportPrelude {
     total_started: Instant,
     project_root: PathBuf,
     services: Vec<String>,
-    snapshot_dir: PathBuf,
-    ports: Vec<u16>,
 }
 
 pub(crate) struct ExportProjectStage {
@@ -1343,20 +1270,13 @@ fn copy_symbolic_link(source: &Path, destination: &Path) -> Result<()> {
     .with_context(|| format!("Failed to stage symbolic link {}", source.display()))
 }
 
-fn export_snapshots_prelude(args: &ExportSnapshotsArgs) -> Result<ExportPrelude> {
+fn export_snapshots_prelude(args: &PullArgs) -> Result<ExportPrelude> {
     set_quiet_timings(args.quiet_timings);
 
     let total_started = Instant::now();
     let project_root = resolve_existing_project_root(&args.project_root)?;
     config::validate_relative_portable_path(&args.src_dir, "srcDir")?;
     let services = parse_services(&args.services)?;
-    let snapshot_dir = if args.snapshot_dir.is_absolute() {
-        args.snapshot_dir.clone()
-    } else {
-        project_root.join(&args.snapshot_dir)
-    };
-
-    let ports = parse_bridge_ports(&args.bridge.ports)?;
     println!(
         "[renium] export start: version={}, git={}, build_ts={}, protocol={}, services={}",
         BUILD_VERSION,
@@ -1369,108 +1289,25 @@ fn export_snapshots_prelude(args: &ExportSnapshotsArgs) -> Result<ExportPrelude>
         total_started,
         project_root,
         services,
-        snapshot_dir,
-        ports,
     })
 }
 
-pub(crate) fn export_snapshots(mut args: ExportSnapshotsArgs) -> Result<()> {
+pub(crate) fn pull_from_studio(mut args: PullArgs) -> Result<()> {
     apply_configured_project_layout(&mut args.project_root, &mut args.src_dir)?;
-    let operation = if args.run_import {
-        op::PULL
-    } else {
-        op::EXPORT_SNAPSHOTS
-    };
     let parameters = json!({
         "srcDir": args.src_dir,
-        "snapshotDir": args.snapshot_dir,
         "services": args.services,
         "bridgeWaitSeconds": args.bridge.wait_seconds,
         "bridgePorts": args.bridge.ports,
         "exportAllProperties": args.export_all_properties,
         "noExportAllProperties": args.no_export_all_properties,
     });
-    if let Some(result) =
-        try_daemon_control_request(operation, Some(&args.project_root), parameters, false)?
-    {
-        return print_json_output(&result, false);
-    }
-
-    let prelude = export_snapshots_prelude(&args)?;
-    let max_bridge_connect_attempts = 3usize;
-    let mut bridge_connect_attempt = 0usize;
-    let (bridge, bridge_listen_metrics, bridge_info, all_channels_connected_to_bridge_info_ms) = loop {
-        bridge_connect_attempt += 1;
-        let (candidate_bridge, candidate_listen_metrics) = match BridgeServer::listen(
-            &args.bridge.host,
-            &prelude.ports,
-            args.bridge.wait_seconds,
-        ) {
-            Ok(result) => result,
-            Err(err)
-                if bridge_connect_attempt < max_bridge_connect_attempts
-                    && is_transient_bridge_error(&err) =>
-            {
-                println!(
-                    "[renium] warning: bridge listen failed on attempt {bridge_connect_attempt}/{max_bridge_connect_attempts}; retrying: {err}"
-                );
-                thread::sleep(Duration::from_millis(83 * bridge_connect_attempt as u64));
-                continue;
-            }
-            Err(err) => return Err(err),
-        };
-
-        let bridge_info_started = Instant::now();
-        match candidate_bridge
-            .cached_bridge_info_for_target(BridgeTarget::Main)
-            .and_then(|info| {
-                validate_bridge_info(&info)?;
-                Ok(info)
-            }) {
-            Ok(info) => {
-                break (
-                    candidate_bridge,
-                    candidate_listen_metrics,
-                    info,
-                    elapsed_ms(bridge_info_started),
-                );
-            }
-            Err(err)
-                if bridge_connect_attempt < max_bridge_connect_attempts
-                    && is_transient_bridge_error(&err) =>
-            {
-                println!(
-                    "[renium] warning: bridge info handshake failed on attempt {bridge_connect_attempt}/{max_bridge_connect_attempts}; retrying: {err}"
-                );
-                drop(candidate_bridge);
-                thread::sleep(Duration::from_millis(83 * bridge_connect_attempt as u64));
-            }
-            Err(err) => return Err(err),
-        }
-    };
-    export_snapshots_core(
-        &args,
-        prelude,
-        &bridge,
-        &bridge_info,
-        bridge_listen_metrics,
-        all_channels_connected_to_bridge_info_ms,
-        false,
-    )
-    .map(|_| ())
-}
-
-pub(crate) fn pull_from_studio(mut args: ExportSnapshotsArgs) -> Result<()> {
-    args.run_import = true;
-    args.no_run_import = false;
-    if args.snapshot_dir == Path::new("snapshots") {
-        args.snapshot_dir = PathBuf::from(".renium/snapshots");
-    }
-    export_snapshots(args)
+    let result = daemon_control_request(op::PULL, Some(&args.project_root), parameters, false)?;
+    print_json_output(&result, false)
 }
 
 pub(crate) fn export_snapshots_with_warm_bridge(
-    args: ExportSnapshotsArgs,
+    args: PullArgs,
     bridge: &BridgeServer,
     bridge_info: &BridgeInfoPayload,
     bridge_info_refresh_ms: f64,
@@ -1490,10 +1327,6 @@ pub(crate) fn export_snapshots_with_warm_bridge(
         prelude,
         bridge,
         bridge_info,
-        BridgeListenMetrics {
-            bind_ms: 0.0,
-            wait_for_channels_ms: 0.0,
-        },
         bridge_info_refresh_ms,
         repair_reference_paths,
     )
@@ -1502,7 +1335,7 @@ pub(crate) fn export_snapshots_with_warm_bridge(
 /// Capture the ordinary native export, including source and property overlays,
 /// without publishing a filesystem projection or reporting sync completion.
 pub(crate) fn capture_exported_services<T: Send>(
-    args: &ExportSnapshotsArgs,
+    args: &PullArgs,
     bridge: &BridgeServer,
     bridge_info: &BridgeInfoPayload,
     project_service: impl Fn(&str, ServiceState) -> Result<T> + Sync,
@@ -1559,15 +1392,11 @@ pub(crate) fn capture_exported_services<T: Send>(
 
 fn log_export_bridge_connection(
     total_started: Instant,
-    metrics: BridgeListenMetrics,
     bridge_info_ms: f64,
     bridge_info: &BridgeInfoPayload,
-) -> (f64, f64) {
-    let cli_to_listen_ms = (elapsed_ms(total_started) - metrics.wait_for_channels_ms).max(0.0);
-    let channel_wait_ms = metrics.wait_for_channels_ms;
+) -> f64 {
+    let cli_to_listen_ms = elapsed_ms(total_started);
     log_timing_ms("cli start to bridge listen", cli_to_listen_ms);
-    log_timing_ms("bridge listen to all channels connected", channel_wait_ms);
-    log_timing_ms("bridge bind/listen setup", metrics.bind_ms);
     log_timing_ms("all channels connected to bridge info", bridge_info_ms);
     println!(
         "[renium] bridge info: version={}, build_unix={}, protocol={}, codec={}, chunk_frame={}, compact_value={}",
@@ -1578,7 +1407,7 @@ fn log_export_bridge_connection(
         bridge_info.chunk_frame_protocol_version,
         bridge_info.compact_value_protocol_version
     );
-    (cli_to_listen_ms, channel_wait_ms)
+    cli_to_listen_ms
 }
 
 struct ExportBridgeSetup {
@@ -1587,7 +1416,7 @@ struct ExportBridgeSetup {
 }
 
 fn prepare_export_bridge(
-    args: &ExportSnapshotsArgs,
+    args: &PullArgs,
     bridge: &BridgeServer,
     bridge_info: &BridgeInfoPayload,
     project_root: &Path,
@@ -1636,8 +1465,7 @@ fn run_service_exports<'a>(
     bridge: &'a BridgeServer,
     run_started: Instant,
     services: &[String],
-    dispatcher: Option<&DirectImportDispatcher>,
-    snapshot_dir: &Path,
+    dispatcher: &DirectImportDispatcher,
 ) -> Result<ServiceExportRun<'a>> {
     let mut run = ServiceExportRun {
         spans: Vec::with_capacity(services.len()),
@@ -1649,15 +1477,12 @@ fn run_service_exports<'a>(
             finish_service_export_output(
                 output,
                 dispatcher,
-                snapshot_dir,
                 &mut run.spans,
                 &mut run.cumulative_latency_ms,
             )
         };
         let mut release_import = || {
-            if let Some(dispatcher) = dispatcher {
-                dispatcher.activate_workers(1);
-            }
+            dispatcher.activate_workers(1);
             Ok(())
         };
         editor_binary_export_parts(
@@ -1684,95 +1509,62 @@ struct ImportFinishMetrics {
 }
 
 fn finish_export_import(
-    project_root: &Path,
-    dispatcher: Option<DirectImportDispatcher>,
-    sourcemap_writer: Option<SourcemapWriter>,
+    dispatcher: DirectImportDispatcher,
+    sourcemap_writer: SourcemapWriter,
 ) -> Result<ImportFinishMetrics> {
-    let Some(dispatcher) = dispatcher else {
-        return Ok(ImportFinishMetrics::default());
-    };
     let mut metrics = ImportFinishMetrics::default();
     let drain_started = Instant::now();
-    let sourcemap_nodes = dispatcher.finish()?;
+    dispatcher.finish()?;
     metrics.dispatcher_drain_ms = elapsed_ms(drain_started);
     log_timing_ms(
         "direct import dispatcher drain",
         metrics.dispatcher_drain_ms,
     );
-    if let Some(writer) = sourcemap_writer.as_ref() {
-        writer.request_finish();
-    }
+    sourcemap_writer.request_finish();
     let sourcemap_started = Instant::now();
-    if let Some(writer) = sourcemap_writer {
-        writer.join()?;
-    } else {
-        write_project_sourcemap_from_service_nodes(project_root, &sourcemap_nodes)?;
-    }
+    sourcemap_writer.join()?;
     metrics.sourcemap_finalize_ms = elapsed_ms(sourcemap_started);
     log_timing_ms("sourcemap finalize", metrics.sourcemap_finalize_ms);
     Ok(metrics)
 }
 
 struct ExportExecutionSetup {
-    project_stage: Option<ExportProjectStage>,
-    import_project_root: PathBuf,
-    sourcemap_writer: Option<SourcemapWriter>,
-    direct_import_dispatcher: Option<DirectImportDispatcher>,
+    project_stage: ExportProjectStage,
+    sourcemap_writer: SourcemapWriter,
+    direct_import_dispatcher: DirectImportDispatcher,
     export_services: Vec<String>,
 }
 
 fn prepare_export_execution(
-    args: &ExportSnapshotsArgs,
+    args: &PullArgs,
     project_root: &Path,
     services: &[String],
     total_started: Instant,
 ) -> Result<ExportExecutionSetup> {
-    let run_import = !args.no_run_import;
-    let project_stage = if run_import {
-        Some(ExportProjectStage::create(
-            project_root,
-            &args.src_dir,
-            services,
-        )?)
-    } else {
-        None
-    };
-    let import_project_root = project_stage.as_ref().map_or_else(
-        || project_root.to_path_buf(),
-        |stage| stage.import_project_root.clone(),
+    let project_stage = ExportProjectStage::create(project_root, &args.src_dir, services)?;
+    let import_project_root = project_stage.import_project_root.clone();
+    let import_src_dir = project_stage.import_src_dir.clone();
+    log_global(
+        5,
+        format_args!(
+            "[renium] export stage roots: project={} stage={} import={} src={}",
+            project_root.display(),
+            project_stage.project_root.display(),
+            import_project_root.display(),
+            import_src_dir.display()
+        ),
     );
-    let import_src_dir = project_stage.as_ref().map_or_else(
-        || args.src_dir.clone(),
-        |stage| stage.import_src_dir.clone(),
-    );
-    if let Some(stage) = project_stage.as_ref() {
-        log_global(
-            5,
-            format_args!(
-                "[renium] export stage roots: project={} stage={} import={} src={}",
-                project_root.display(),
-                stage.project_root.display(),
-                import_project_root.display(),
-                import_src_dir.display()
-            ),
-        );
-    }
-    let sourcemap_writer =
-        run_import.then(|| SourcemapWriter::start(import_project_root.clone(), false));
-    let direct_import_dispatcher = if run_import {
-        let workers = resolve_direct_import_workers();
-        println!("[renium] direct import workers during export: {workers}");
-        Some(DirectImportDispatcher::start(
-            import_project_root.clone(),
-            import_src_dir,
-            workers,
-            workers,
-            sourcemap_writer.as_ref().map(SourcemapWriter::sender),
-            total_started,
-        )?)
-    } else {
-        None
-    };
+    let sourcemap_writer = SourcemapWriter::start(import_project_root.clone(), false);
+    let workers = resolve_direct_import_workers();
+    println!("[renium] direct import workers during export: {workers}");
+    let direct_import_dispatcher = DirectImportDispatcher::start(
+        import_project_root.clone(),
+        import_src_dir,
+        workers,
+        workers,
+        Some(sourcemap_writer.sender()),
+        total_started,
+    )?;
     let export_services = direct_import_export_order(services);
     if export_services != services {
         println!(
@@ -1782,7 +1574,6 @@ fn prepare_export_execution(
     }
     Ok(ExportExecutionSetup {
         project_stage,
-        import_project_root,
         sourcemap_writer,
         direct_import_dispatcher,
         export_services,
@@ -1841,11 +1632,10 @@ fn finish_export_publication(
 }
 
 fn export_snapshots_core(
-    args: &ExportSnapshotsArgs,
+    args: &PullArgs,
     prelude: ExportPrelude,
     bridge: &BridgeServer,
     bridge_info: &BridgeInfoPayload,
-    bridge_listen_metrics: BridgeListenMetrics,
     all_channels_connected_to_bridge_info_ms: f64,
     repair_reference_paths: bool,
 ) -> Result<PublishedProjectChanges> {
@@ -1858,16 +1648,13 @@ fn export_snapshots_core(
         total_started,
         project_root,
         services,
-        snapshot_dir,
         ..
     } = prelude;
-    let (cli_start_to_bridge_listen_ms, bridge_listen_to_all_channels_connected_ms) =
-        log_export_bridge_connection(
-            total_started,
-            bridge_listen_metrics,
-            all_channels_connected_to_bridge_info_ms,
-            bridge_info,
-        );
+    let cli_start_to_bridge_listen_ms = log_export_bridge_connection(
+        total_started,
+        all_channels_connected_to_bridge_info_ms,
+        bridge_info,
+    );
     stages.next("prepare export bridge and property schema");
     let ExportBridgeSetup {
         property_schema_ready_ms,
@@ -1875,8 +1662,7 @@ fn export_snapshots_core(
     } = prepare_export_bridge(args, bridge, bridge_info, &project_root, total_started)?;
     stages.next("prepare project output workers and export service order");
     let ExportExecutionSetup {
-        mut project_stage,
-        import_project_root,
+        project_stage,
         sourcemap_writer,
         direct_import_dispatcher,
         export_services,
@@ -1890,8 +1676,7 @@ fn export_snapshots_core(
         bridge,
         total_started,
         &export_services,
-        direct_import_dispatcher.as_ref(),
-        &snapshot_dir,
+        &direct_import_dispatcher,
     )?;
     stages.next("export timing boundaries");
     let first_service_export_ms = service_export_spans
@@ -1924,14 +1709,10 @@ fn export_snapshots_core(
     let ImportFinishMetrics {
         dispatcher_drain_ms,
         sourcemap_finalize_ms,
-    } = finish_export_import(
-        &import_project_root,
-        direct_import_dispatcher,
-        sourcemap_writer,
-    )?;
+    } = finish_export_import(direct_import_dispatcher, sourcemap_writer)?;
     stages.next("publish exported files and acknowledge Studio snapshot");
     let (published, sync_completion_ms) = finish_export_publication(
-        project_stage.take(),
+        Some(project_stage),
         &project_root,
         repair_reference_paths,
         move || {
@@ -1945,8 +1726,7 @@ fn export_snapshots_core(
 
     stages.next("format export timing summaries");
     let total_run_ms = elapsed_ms(total_started);
-    let handshake_ms =
-        bridge_listen_to_all_channels_connected_ms + all_channels_connected_to_bridge_info_ms;
+    let handshake_ms = all_channels_connected_to_bridge_info_ms;
     let core_export_ms = property_schema_ready_to_first_service_export_ms
         + first_service_export_to_last_service_export_ms;
     let import_critical_tail_ms = last_service_export_to_dispatcher_drain_start_ms
@@ -1972,7 +1752,7 @@ fn export_snapshots_core(
         }
     }
     println!(
-        "[renium] run timing spans: cli_start_to_bridge_listen_ms={cli_start_to_bridge_listen_ms:.1}, bridge_listen_to_all_channels_connected_ms={bridge_listen_to_all_channels_connected_ms:.1}, all_channels_connected_to_bridge_info_ms={all_channels_connected_to_bridge_info_ms:.1}, bridge_info_to_property_schema_ready_ms={bridge_info_to_property_schema_ready_ms:.1}, property_schema_ready_to_first_service_export_ms={property_schema_ready_to_first_service_export_ms:.1}, first_service_export_to_last_service_export_ms={first_service_export_to_last_service_export_ms:.1}, cumulative_service_latency_ms={cumulative_service_latency_ms:.1}, last_service_export_to_dispatcher_drain_start_ms={last_service_export_to_dispatcher_drain_start_ms:.1}, dispatcher_drain_ms={dispatcher_drain_ms:.1}, sourcemap_finalize_ms={sourcemap_finalize_ms:.1}, sync_completion_ms={sync_completion_ms:.1}, total_run_ms={total_run_ms:.1}"
+        "[renium] run timing spans: cli_start_to_bridge_listen_ms={cli_start_to_bridge_listen_ms:.1}, all_channels_connected_to_bridge_info_ms={all_channels_connected_to_bridge_info_ms:.1}, bridge_info_to_property_schema_ready_ms={bridge_info_to_property_schema_ready_ms:.1}, property_schema_ready_to_first_service_export_ms={property_schema_ready_to_first_service_export_ms:.1}, first_service_export_to_last_service_export_ms={first_service_export_to_last_service_export_ms:.1}, cumulative_service_latency_ms={cumulative_service_latency_ms:.1}, last_service_export_to_dispatcher_drain_start_ms={last_service_export_to_dispatcher_drain_start_ms:.1}, dispatcher_drain_ms={dispatcher_drain_ms:.1}, sourcemap_finalize_ms={sourcemap_finalize_ms:.1}, sync_completion_ms={sync_completion_ms:.1}, total_run_ms={total_run_ms:.1}"
     );
     println!(
         "[renium] run timing summary: total_ms={total_run_ms:.1}, core_export_ms={core_export_ms:.1}, bridge_startup_ms={cli_start_to_bridge_listen_ms:.1}, handshake_ms={handshake_ms:.1}, cumulative_service_latency_ms={cumulative_service_latency_ms:.1}, import_critical_tail_ms={import_critical_tail_ms:.1}, unmeasured_or_scheduler_gap_ms={unmeasured_or_scheduler_gap_ms:.1}"
@@ -3054,34 +2834,35 @@ mod publication_tests {
     fn export_publication_import_workers_write_only_to_stage() {
         let mut fixture = Fixture::new();
         drop(fixture.stage.take());
-        let args = ExportSnapshotsArgs::try_parse_from(["export-snapshots"]).unwrap();
-        let mut setup = prepare_export_execution(
+        let args = PullArgs::try_parse_from(["pull"]).unwrap();
+        let setup = prepare_export_execution(
             &args,
             &fixture.root,
             &["ReplicatedStorage".into()],
             Instant::now(),
         )
         .unwrap();
-        let stage = setup
-            .project_stage
-            .as_ref()
-            .expect("all imports need a stage");
-        let stage_container = stage.container.clone();
-        let import_src_dir = stage.import_src_dir.clone();
-        assert!(setup.direct_import_dispatcher.is_some());
-        assert!(setup.import_project_root.starts_with(&stage_container));
-        assert_ne!(setup.import_project_root, fixture.root);
+        let stage_container = setup.project_stage.container.clone();
+        let import_project_root = setup.project_stage.import_project_root.clone();
+        let import_src_dir = setup.project_stage.import_src_dir.clone();
+        assert!(import_project_root.starts_with(&stage_container));
+        assert_ne!(import_project_root, fixture.root);
         fs::write(
-            setup
-                .import_project_root
+            import_project_root
                 .join(import_src_dir)
                 .join("ReplicatedStorage/Mod.luau"),
             "return 'private'\n",
         )
         .unwrap();
-        drop(setup.direct_import_dispatcher.take());
-        drop(setup.sourcemap_writer.take());
-        drop(setup);
+        let ExportExecutionSetup {
+            project_stage,
+            sourcemap_writer,
+            direct_import_dispatcher,
+            ..
+        } = setup;
+        drop(direct_import_dispatcher);
+        drop(sourcemap_writer);
+        drop(project_stage);
         assert!(!stage_container.exists());
         assert_eq!(
             fs::read_to_string(fixture.root.join(SOURCE)).unwrap(),

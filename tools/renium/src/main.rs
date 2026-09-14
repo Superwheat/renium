@@ -180,7 +180,6 @@ fn checks_agent_update(command: &Commands) -> bool {
             | Commands::RecordReview(_)
             | Commands::BridgeDaemon(_)
             | Commands::ExplorerDaemon(_)
-            | Commands::BridgeGetSource(_)
             | Commands::PerformanceWorker
             | Commands::PerformanceHolder(_)
             | Commands::CursorPoll(_)
@@ -217,7 +216,6 @@ fn checks_agent_instructions(command: &Commands) -> bool {
             | Commands::Daemon(_)
             | Commands::BridgeDaemon(_)
             | Commands::ExplorerDaemon(_)
-            | Commands::BridgeGetSource(_)
             | Commands::PerformanceProfile(_)
             | Commands::PerformanceWorker
             | Commands::PerformanceHolder(_)

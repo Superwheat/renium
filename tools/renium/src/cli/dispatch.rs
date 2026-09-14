@@ -7,31 +7,27 @@ use crate::app::update;
 use crate::automation::commands;
 use crate::automation::op;
 use crate::automation::tools::{
-    asset_insert_command, asset_search_command, generate_model_command, image_store_command,
-    job_status_command, script_grep_command, script_read_command, script_search_command,
+    asset_insert_command, asset_search_command, generate_model_command, job_status_command,
+    script_grep_command, script_read_command, script_search_command,
 };
 use crate::bytecode::edit::{
-    bytecode_add_instance, bytecode_clone_instance, bytecode_desync_package_link,
-    bytecode_remove_instance,
+    bytecode_add_instance, bytecode_clone_instance, bytecode_remove_instance,
 };
-use crate::bytecode::explorer::{
-    bytecode_editor_targets, bytecode_explorer_batch, explorer_daemon,
-};
+use crate::bytecode::explorer::{bytecode_explorer_batch, explorer_daemon};
 use crate::bytecode::{
     bytecode_apply_property_batch, bytecode_get_property, bytecode_set_property,
     bytecode_set_source, find_command, inspect_command, tree_command,
 };
 use crate::cli::{Commands, ExecuteLuauArgs};
-use crate::daemon::{bridge_daemon, bridge_get_source, cursor_poll};
+use crate::daemon::{bridge_daemon, cursor_poll};
 use crate::editor::history::editor_revert;
 use crate::editor::sync::{apply_editor_delete, apply_editor_property, push_editor_changes};
 use crate::project::commands::{
     clone_instance_command, create_instance_command, desync_package_link_command,
     export_model_command, import_model_command, import_path_command, move_instance_command,
-    remove_instance_command, rename_instance_command, syncback_command,
+    remove_instance_command, rename_instance_command,
 };
 use crate::project::config;
-use crate::project::package_links::place::place_desync_package_link;
 use crate::project::package_links::{
     link_add, link_apply, link_break, link_delete_package, link_move_target, link_pack,
     link_status, sync_wally_packages,
@@ -42,14 +38,13 @@ use crate::project::workflows;
 use crate::rbx::model::{
     bytecode_export_model, bytecode_export_place, bytecode_import_model, bytecode_repack,
 };
-use crate::snapshot::export::{export_snapshots, pull_from_studio};
-use crate::snapshot::import::{import_service, import_snapshots};
+use crate::snapshot::export::pull_from_studio;
 use crate::studio::automation::{
     click_command, editor_review_decision_command, execute_luau_command,
     get_console_output_command, goto_command, key_command, list_clients_command,
     package_action_command, press_command, record_end_command, record_start_command, shot_command,
     start_stop_play_command, studio_change_state_command, studio_change_state_operation_command,
-    studio_device_command, test_command, type_command, ui_command, wait_until_command,
+    studio_device_command, type_command, ui_command, wait_until_command,
 };
 
 pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> {
@@ -74,11 +69,9 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::StudioReopen(args) => commands::studio_reopen(args, project),
         Commands::StudioClose(args) => commands::studio_close(args, project),
         Commands::StudioStatus(args) => commands::studio_status(args, project),
-        Commands::Upload(args) => workflows::run_upload(args, project),
         Commands::Update(args) => update::run_update(args),
         Commands::OpenCloud(args) => crate::cloud::command::run(args, project),
         Commands::UpdateHelper(args) => update::run_update_helper(args),
-        Commands::Syncback(args) => syncback_command(args, project),
         Commands::ImportPath(args) => import_path_command(args, project),
         Commands::Create(args) => create_instance_command(args, project),
         Commands::Clone(args) => clone_instance_command(args, project),
@@ -93,12 +86,9 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::PackageUpdate(args) => package_action_command(args, project, op::PACKAGE_UPDATE),
         Commands::ImportModel(args) => import_model_command(args, project),
         Commands::ExportModel(args) => export_model_command(args, project),
-        Commands::Test(args) => test_command(args),
-        Commands::ExportSnapshots(args) => export_snapshots(args),
         Commands::Pull(args) => pull_from_studio(args),
         Commands::BridgeDaemon(args) => bridge_daemon(args),
         Commands::ExplorerDaemon(args) => explorer_daemon(args),
-        Commands::BridgeGetSource(args) => bridge_get_source(args),
         Commands::GetConsoleOutput(args) => get_console_output_command(args),
         Commands::ExecuteLuau(args) => execute_luau_command(args),
         Commands::ExecuteClientLuau(args) => execute_luau_command(ExecuteLuauArgs {
@@ -123,7 +113,6 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::AssetInsert(args) => asset_insert_command(args, project),
         Commands::GenerateModel(args) => generate_model_command(args, project),
         Commands::JobStatus(args) => job_status_command(args, project),
-        Commands::ImageStore(args) => image_store_command(args, project),
         Commands::ImageUpload(args) => commands::image_upload(args, project),
         Commands::ScriptSearch(args) => script_search_command(args, project),
         Commands::ScriptGrep(args) => script_grep_command(args, project),
@@ -173,14 +162,11 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::BytecodeApplyPropertyBatch(args) => bytecode_apply_property_batch(args),
         Commands::BytecodeSetSource(args) => bytecode_set_source(args),
         Commands::BytecodeExplorerBatch(args) => bytecode_explorer_batch(args),
-        Commands::BytecodeEditorTargets(args) => bytecode_editor_targets(args),
         Commands::BytecodeAddInstance(args) => bytecode_add_instance(args),
         Commands::BytecodeCloneInstance(args) => bytecode_clone_instance(args),
         Commands::BytecodeRemoveInstance(args) => bytecode_remove_instance(args),
-        Commands::BytecodeDesyncPackageLink(args) => bytecode_desync_package_link(args),
         Commands::BytecodeExportModel(args) => bytecode_export_model(args),
         Commands::BytecodeExportPlace(args) => bytecode_export_place(args),
-        Commands::PlaceDesyncPackageLink(args) => place_desync_package_link(args),
         Commands::BytecodeImportModel(args) => bytecode_import_model(args),
         Commands::SyncWallyPackages(args) => sync_wally_packages(args),
         Commands::LinkApply(args) => link_apply(args),
@@ -191,8 +177,6 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::LinkPack(args) => link_pack(args),
         Commands::LinkDeletePackage(args) => link_delete_package(args),
         Commands::BytecodeRepack(args) => bytecode_repack(args),
-        Commands::ImportSnapshots(args) => import_snapshots(args),
-        Commands::ImportService(args) => import_service(args),
         Commands::GenerateSourcemap(args) => generate_sourcemap_command(args, project),
         Commands::VcInit(args) => vc_init(args),
         Commands::VcTextconv(args) => vc_textconv(args),

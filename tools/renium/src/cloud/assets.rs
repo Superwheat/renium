@@ -8,11 +8,10 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::app::output::ensure_plugin_api_ok;
-use crate::automation::{BoundContext, Failure};
+use crate::automation::Failure;
 use crate::cloud::{API_ROOT, CloudAuth, agent, read_response};
 use crate::studio::bridge::{BridgeServer, BridgeTarget};
 
-const MAX_STORED_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_UPLOAD_BYTES: u64 = 20 * 1024 * 1024;
 
 #[derive(Deserialize)]
@@ -422,56 +421,6 @@ fn load_image(root: &Path, source: &str) -> Result<(Vec<u8>, String), Failure> {
         "image-upload",
     )?;
     Ok((bytes, path.display().to_string()))
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ImageStore {
-    #[serde(alias = "filePath")]
-    path: String,
-}
-
-pub(crate) fn store_image_at(root: &Path, parameters: &Value) -> Result<Value, Failure> {
-    let request: ImageStore = serde_json::from_value(parameters.clone()).map_err(|error| {
-        failure(
-            "bad_req",
-            format!("Invalid image-store payload: {error}"),
-            false,
-            "image-store",
-        )
-    })?;
-    let path = resolve_image_path(root, &request.path);
-    let file = fs::File::open(&path).map_err(|error| {
-        failure(
-            "bad_req",
-            format!("Failed to open {}: {error}", path.display()),
-            false,
-            "image-store",
-        )
-    })?;
-    let bytes = read_bounded(
-        file,
-        MAX_STORED_IMAGE_BYTES,
-        &path.display().to_string(),
-        "image-store",
-    )?;
-    let (mime, _) = image_type(&bytes, &path.display().to_string()).ok_or_else(|| {
-        failure(
-            "bad_req",
-            "image-store supports PNG, JPEG, BMP, and TGA images",
-            false,
-            "image-store",
-        )
-    })?;
-    Ok(json!({
-        "path": path,
-        "mimeType": mime,
-        "bytes": bytes.len(),
-    }))
-}
-
-pub(crate) fn store_image(context: &BoundContext, parameters: &Value) -> Result<Value, Failure> {
-    store_image_at(Path::new(&context.root), parameters)
 }
 
 fn multipart_body(metadata: &Value, name: &str, mime: &str, bytes: &[u8]) -> (String, Vec<u8>) {

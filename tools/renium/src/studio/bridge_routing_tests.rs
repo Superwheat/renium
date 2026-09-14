@@ -20,7 +20,6 @@ fn fixture() -> BridgeServer {
         active_request_leases: Mutex::new(HashMap::new()),
         runtime_pins: Mutex::new(HashMap::new()),
         routing: Default::default(),
-        final_console_snapshots: Mutex::new(HashMap::new()),
         desired_device_request: Default::default(),
         performance_manager: None,
     }
@@ -213,7 +212,6 @@ fn connect(bridge: &BridgeServer, channel_index: usize, info: BridgeInfoPayload)
             last_focused_at: Instant::now(),
             bridge_info: info,
             request_session_id: "routing-test".into(),
-            pending_final_console_snapshots: Vec::new(),
             pending_player_identity: None,
             active_request_lease: None,
             cancel_request_id: None,

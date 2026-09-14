@@ -41,7 +41,6 @@ pub(crate) const RENIUM_STORE_EXTENSION: &str = "renium";
 pub(crate) const RENIUM_DIR_GITIGNORE: &str = "# Renium local state. Configuration and link.lock.json remain tracked.\ncache/\ndiagnostics/\neditor-history/\neditor-property-batches/\nimport-backups/\nsnapshots/\nsync-base/\nconflicts/\nbuild/\nbuild-staging/\nnested-syncback/\nadapter-baseline.json\nlink-cache/\nlive-watch-state.*\n";
 
 mod commands;
-pub(crate) mod place;
 mod wally;
 #[cfg(test)]
 use commands::pack_subtree_to_bytecode;

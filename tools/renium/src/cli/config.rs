@@ -174,7 +174,7 @@ fn apply_command(
     object: &Map<String, Value>,
 ) -> Result<()> {
     match command {
-        Commands::ExportSnapshots(args) | Commands::Pull(args) => {
+        Commands::Pull(args) => {
             apply_default_path(
                 matches,
                 "project_root",
@@ -182,20 +182,7 @@ fn apply_command(
                 object,
                 "projectRoot",
             );
-            apply_default_path(
-                matches,
-                "snapshot_dir",
-                &mut args.snapshot_dir,
-                object,
-                "snapshotDir",
-            );
             apply_default_services(matches, &mut args.services, object);
-            if command_value_uses_default(matches, "run_import")
-                && object.get("runImport").and_then(Value::as_bool) == Some(true)
-            {
-                args.run_import = true;
-                args.no_run_import = false;
-            }
             apply_bridge(matches, object, &mut args.bridge);
         }
         Commands::BridgeDaemon(args) => apply_bridge(matches, object, &mut args.bridge),
@@ -235,10 +222,6 @@ fn apply_command(
                 object,
                 "projectRoot",
             );
-            apply_default_services(matches, &mut args.services, object);
-        }
-        Commands::Syncback(args) => {
-            apply_default_path(matches, "input", &mut args.input, object, "snapshotDir");
             apply_default_services(matches, &mut args.services, object);
         }
         _ => {}

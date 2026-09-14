@@ -10,7 +10,7 @@ const sourceRootCache = new Map<string, { fingerprint: string; value: string }>(
 const scriptNamingCache = new Map<string, { fingerprint: string; value: ProjectScriptNaming }>();
 const projectSourceGraphCache = new Map<string, ProjectSourceGraph>();
 const STRING_CONFIG_KEYS = new Set([
-  "projectRoot", "snapshotDir", "cliPath",
+  "projectRoot", "cliPath",
   "bridgePorts", "place", "daemon", "gitSync.gitPath", "gitSync.remote", "gitSync.branch",
   "gitSync.commitMessageTemplate", "wallySync.wallyPath",
   "wallySync.packagesDir", "wallySync.targetService", "wallySync.targetName",

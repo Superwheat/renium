@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -11,17 +11,15 @@ use full_moon::node::Node;
 use full_moon::visitors::Visitor;
 use serde_json::{Map, Value, json};
 
-use crate::app::output::{ensure_luau_api_ok, ensure_plugin_api_ok, log_global, print_json_output};
+use crate::app::output::{ensure_luau_api_ok, ensure_plugin_api_ok, print_json_output};
 use crate::app::timing::current_millis;
 use crate::automation::{commands::daemon_result, op};
 use crate::cli::{
     BridgeConnectionArgs, ClickArgs, EditorReviewDecisionArgs, ExecuteLuauArgs, GotoArgs, KeyArgs,
     ListClientsArgs, PackageActionArgs, PressArgs, RecordEndArgs, RecordStartArgs, ShotArgs,
-    StartStopPlayArgs, StudioChangeStateArgs, StudioDeviceArgs, TestArgs, TypeArgs, UiArgs,
-    WaitUntilArgs,
+    StartStopPlayArgs, StudioChangeStateArgs, StudioDeviceArgs, TypeArgs, UiArgs, WaitUntilArgs,
 };
-use crate::daemon::try_daemon_control_request;
-use crate::snapshot::export::parse_bridge_ports;
+use crate::daemon::{daemon_control_request, try_daemon_control_request};
 use crate::snapshot::import::parse_services;
 use crate::studio::bridge::{
     BRIDGE_DEFAULT_RESPONSE_TIMEOUT, BRIDGE_ROLE_PLAY_CLIENT, BRIDGE_ROLE_PLAY_SERVER,
@@ -406,16 +404,7 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
         "bridgeWaitSeconds": args.bridge.wait_seconds,
         "bridgePorts": args.bridge.ports,
     });
-    if let Some(result) = try_daemon_control_request(operation, None, parameters, false)? {
-        return print_json_output(&result, false);
-    }
-    if args.stop {
-        bail!("Stopping play mode requires an active Renium bridge daemon");
-    }
-    let ports = parse_bridge_ports(&args.bridge.ports)?;
-    let (bridge, _listen_metrics) =
-        BridgeServer::listen(&args.bridge.host, &ports, args.bridge.wait_seconds)?;
-    let result = start_stop_play_result(args, &bridge)?;
+    let result = daemon_control_request(operation, None, parameters, false)?;
     print_json_output(&result, false)
 }
 
@@ -1756,7 +1745,6 @@ pub(crate) fn goto_command(args: GotoArgs) -> Result<()> {
         }),
         &args.bridge,
         true,
-        |bridge| goto_result(&args, bridge),
     )
 }
 
@@ -1894,6 +1882,20 @@ pub(crate) fn shot_result(args: &ShotArgs, bridge: &BridgeServer) -> Result<Valu
     }))
 }
 
+fn test_launch_clients(bridge: &BridgeServer, launch: &TestLaunch) -> Vec<Value> {
+    bridge
+        .list_bridge_clients()
+        .into_iter()
+        .filter(|entry| {
+            entry.get("launchNonce").and_then(Value::as_str) == Some(launch.nonce.as_str())
+                && entry.get("launchEditRuntimeId").and_then(Value::as_str)
+                    == Some(launch.edit_runtime_id.as_str())
+                && (entry["role"] == BRIDGE_ROLE_PLAY_SERVER
+                    || entry["role"] == BRIDGE_ROLE_PLAY_CLIENT)
+        })
+        .collect()
+}
+
 fn parse_vector3(text: &str, label: &str) -> Result<[f64; 3]> {
     let values = text
         .split(',')
@@ -1921,7 +1923,6 @@ fn run_input_command(
     mut parameters: Value,
     bridge_args: &BridgeConnectionArgs,
     compact: bool,
-    direct: impl FnOnce(&BridgeServer) -> Result<Value>,
 ) -> Result<()> {
     let object = parameters
         .as_object_mut()
@@ -1931,15 +1932,7 @@ fn run_input_command(
         json!(bridge_args.wait_seconds),
     );
     object.insert("bridgePorts".to_string(), json!(bridge_args.ports));
-    let result =
-        if let Some(result) = try_daemon_control_request(operation, None, parameters, false)? {
-            result
-        } else {
-            let ports = parse_bridge_ports(&bridge_args.ports)?;
-            let (bridge, _listen_metrics) =
-                BridgeServer::listen(&bridge_args.host, &ports, bridge_args.wait_seconds)?;
-            direct(&bridge)?
-        };
+    let result = daemon_control_request(operation, None, parameters, false)?;
     let result = if compact {
         compact_json(result)
     } else {
@@ -1961,7 +1954,6 @@ pub(crate) fn press_command(args: PressArgs) -> Result<()> {
         }),
         &args.bridge,
         true,
-        |bridge| press_result(&args, bridge),
     )
 }
 
@@ -1977,7 +1969,6 @@ pub(crate) fn click_command(args: ClickArgs) -> Result<()> {
         }),
         &args.bridge,
         true,
-        |bridge| click_result(&args, bridge),
     )
 }
 
@@ -1987,7 +1978,6 @@ pub(crate) fn key_command(args: KeyArgs) -> Result<()> {
         json!({ "key": args.key, "player": args.player, "holdMs": args.hold_ms }),
         &args.bridge,
         true,
-        |bridge| key_result(&args, bridge),
     )
 }
 
@@ -2001,7 +1991,6 @@ pub(crate) fn ui_command(args: UiArgs) -> Result<()> {
         }),
         &args.bridge,
         false,
-        |bridge| ui_result(&args, bridge),
     )
 }
 
@@ -2016,7 +2005,6 @@ pub(crate) fn type_command(args: TypeArgs) -> Result<()> {
         }),
         &args.bridge,
         true,
-        |bridge| type_result(&args, bridge),
     )
 }
 
@@ -2032,7 +2020,6 @@ pub(crate) fn wait_until_command(args: WaitUntilArgs) -> Result<()> {
         }),
         &args.bridge,
         true,
-        |bridge| wait_until_result(&args, bridge),
     )
 }
 
@@ -2056,7 +2043,6 @@ pub(crate) fn shot_command(args: ShotArgs) -> Result<()> {
         }),
         &args.bridge,
         true,
-        |bridge| shot_result(&args, bridge),
     )
 }
 
@@ -2516,515 +2502,7 @@ mod play_state_tests {
     }
 }
 
-pub(crate) fn test_command(args: TestArgs) -> Result<()> {
-    if !matches!(args.mode.as_str(), "play" | "run" | "server") {
-        bail!(
-            "Invalid test mode '{}'; use play, run, or server",
-            args.mode
-        );
-    }
-    if args.players.is_some() && args.mode != "play" {
-        bail!("--players can only be used with --mode play");
-    }
-    let parameters = json!({
-        "test": true,
-        "mode": args.mode,
-        "players": args.players,
-        "timeout": args.timeout,
-        "failOnError": args.fail_on_error,
-        "player": args.player,
-    });
-    let result = daemon_result(op::PLAY_START, None, parameters, false, None)?;
-    print_json_output(&result, false)?;
-    if result.get("ok").and_then(Value::as_bool) == Some(false) {
-        let count = result
-            .get("errors")
-            .and_then(Value::as_array)
-            .map_or(0, Vec::len);
-        bail!("Test console reported {count} error(s)");
-    }
-    Ok(())
-}
-
-#[derive(Default)]
-struct TestConsoleCursor {
-    epoch: Option<String>,
-    seq: u64,
-}
-
-#[derive(Default)]
-struct TestConsoleCapture {
-    cursors: HashMap<String, TestConsoleCursor>,
-    errors: Vec<String>,
-    truncated: bool,
-}
-
 pub(crate) struct TestLaunch {
     pub(crate) nonce: String,
     pub(crate) edit_runtime_id: String,
-}
-
-fn ingest_test_console_payload(
-    runtime_id: &str,
-    label: &str,
-    capture: &mut TestConsoleCapture,
-    console: &Value,
-    restart_on_epoch_change: bool,
-) -> bool {
-    capture.truncated |= console.get("truncated").and_then(Value::as_bool) == Some(true);
-    let next_epoch = console
-        .get("epoch")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let previous_epoch = capture
-        .cursors
-        .get(runtime_id)
-        .and_then(|cursor| cursor.epoch.clone());
-    if previous_epoch.is_some() && previous_epoch != next_epoch {
-        let cursor = capture.cursors.entry(runtime_id.to_string()).or_default();
-        cursor.epoch.clone_from(&next_epoch);
-        cursor.seq = 0;
-        if restart_on_epoch_change {
-            return true;
-        }
-    }
-    let previous_seq = capture
-        .cursors
-        .get(runtime_id)
-        .map_or(0, |cursor| cursor.seq);
-    let mut highest_seq = previous_seq;
-    if let Some(entries) = console.get("entries").and_then(Value::as_array) {
-        for entry in entries {
-            let entry_seq = entry.get("seq").and_then(Value::as_u64);
-            if entry_seq.is_some_and(|seq| seq <= previous_seq) {
-                continue;
-            }
-            if let Some(seq) = entry_seq {
-                highest_seq = highest_seq.max(seq);
-            }
-            let level = console_entry_level(entry);
-            let message = entry
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            println!("[{label} {level}] {message}");
-            if level.eq_ignore_ascii_case("error") || level.eq_ignore_ascii_case("messageerror") {
-                capture.errors.push(format!("{label}: {message}"));
-            }
-        }
-    }
-    highest_seq = highest_seq.max(
-        console
-            .get("nextSeq")
-            .and_then(Value::as_u64)
-            .unwrap_or(highest_seq),
-    );
-    let cursor = capture.cursors.entry(runtime_id.to_string()).or_default();
-    cursor.epoch = next_epoch;
-    cursor.seq = highest_seq;
-    false
-}
-
-fn test_launch_clients(bridge: &BridgeServer, launch: &TestLaunch) -> Vec<Value> {
-    bridge
-        .list_bridge_clients()
-        .into_iter()
-        .filter(|entry| {
-            entry.get("launchNonce").and_then(Value::as_str) == Some(launch.nonce.as_str())
-                && entry.get("launchEditRuntimeId").and_then(Value::as_str)
-                    == Some(launch.edit_runtime_id.as_str())
-                && (entry["role"] == BRIDGE_ROLE_PLAY_SERVER
-                    || entry["role"] == BRIDGE_ROLE_PLAY_CLIENT)
-        })
-        .collect()
-}
-
-fn drain_test_console(
-    bridge: &BridgeServer,
-    target: BridgeTarget,
-    runtime_id: &str,
-    label: &str,
-    capture: &mut TestConsoleCapture,
-    deadline: Instant,
-) -> Result<()> {
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Ok(());
-        }
-        let cursor_seq = capture
-            .cursors
-            .get(runtime_id)
-            .map_or(0, |cursor| cursor.seq);
-        let console = bridge.call_for_runtime_with_timeout(
-            "getConsoleOutput",
-            json!({
-                "limit": 200,
-                "sinceSeq": cursor_seq,
-                "fromOldest": cursor_seq == 0,
-                "clear": false,
-            }),
-            target,
-            runtime_id,
-            Some(remaining.min(BRIDGE_DEFAULT_RESPONSE_TIMEOUT)),
-        )?;
-        ensure_plugin_api_ok(&console)?;
-        if ingest_test_console_payload(runtime_id, label, capture, &console, true) {
-            continue;
-        }
-        if console.get("hasMore").and_then(Value::as_bool) != Some(true) {
-            return Ok(());
-        }
-        let next_seq = capture
-            .cursors
-            .get(runtime_id)
-            .map_or(0, |cursor| cursor.seq);
-        if next_seq <= cursor_seq {
-            bail!("Studio console page cursor did not advance");
-        }
-    }
-}
-
-fn test_client_matches_selector(entry: &Value, selector: &str) -> bool {
-    if entry["role"] != BRIDGE_ROLE_PLAY_CLIENT {
-        return false;
-    }
-    let name = entry
-        .get("playerName")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if name.eq_ignore_ascii_case(selector) {
-        return true;
-    }
-    selector.parse::<i64>().ok().is_some_and(|index| {
-        name.eq_ignore_ascii_case(&format!("Player{index}"))
-            || entry.get("playerUserId").and_then(Value::as_i64) == Some(-index)
-    })
-}
-
-fn drain_test_consoles(
-    bridge: &BridgeServer,
-    launch: &TestLaunch,
-    capture: &mut TestConsoleCapture,
-    deadline: Instant,
-) -> Result<Vec<Value>> {
-    let clients = test_launch_clients(bridge, launch);
-    for entry in &clients {
-        let Some(runtime_id) = entry.get("runtimeId").and_then(Value::as_str) else {
-            bail!("A launched Studio bridge has no runtime identity");
-        };
-        let role = entry
-            .get("role")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let target = if role == BRIDGE_ROLE_PLAY_CLIENT {
-            BridgeTarget::Client
-        } else {
-            BridgeTarget::Main
-        };
-        let player = entry
-            .get("playerName")
-            .and_then(Value::as_str)
-            .filter(|name| !name.is_empty());
-        let label = player.map_or_else(|| role.to_string(), |name| format!("{role}:{name}"));
-        drain_test_console(bridge, target, runtime_id, &label, capture, deadline)?;
-    }
-    for final_snapshot in bridge.take_final_console_snapshots(launch) {
-        let runtime_id = final_snapshot
-            .get("runtimeId")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let role = final_snapshot
-            .get("role")
-            .and_then(Value::as_str)
-            .unwrap_or("play");
-        let player = final_snapshot
-            .get("playerName")
-            .and_then(Value::as_str)
-            .filter(|name| !name.is_empty());
-        let label = player.map_or_else(|| role.to_string(), |name| format!("{role}:{name}"));
-        if let Some(snapshot) = final_snapshot.get("snapshot") {
-            ingest_test_console_payload(runtime_id, &label, capture, snapshot, false);
-        }
-    }
-    Ok(clients)
-}
-
-fn start_test_session_with_deadline(
-    args: &TestArgs,
-    bridge: &BridgeServer,
-    launch: &TestLaunch,
-    deadline: Instant,
-    owned: &mut bool,
-) -> Result<Value> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        bail!("Timed test expired before Studio could start");
-    }
-    let mode = if matches!(args.mode.as_str(), "run" | "server") {
-        "run"
-    } else {
-        "play"
-    };
-    let start_result = bridge.call_for_runtime_with_timeout(
-        "startStopPlay",
-        json!({
-            "start": true,
-            "mode": mode,
-            "players": args.players,
-            "launchNonce": launch.nonce,
-        }),
-        BridgeTarget::Edit,
-        &launch.edit_runtime_id,
-        Some(remaining.min(BRIDGE_DEFAULT_RESPONSE_TIMEOUT)),
-    );
-    let start = match start_result {
-        Ok(start) => start,
-        Err(error) => {
-            let probe_timeout = deadline
-                .saturating_duration_since(Instant::now())
-                .min(Duration::from_secs(1));
-            if !probe_timeout.is_zero()
-                && let Ok(status) = bridge.call_for_runtime_with_timeout(
-                    "startStopPlay",
-                    json!({}),
-                    BridgeTarget::Edit,
-                    &launch.edit_runtime_id,
-                    Some(probe_timeout),
-                )
-                && status.get("launchNonce").and_then(Value::as_str) == Some(launch.nonce.as_str())
-            {
-                *owned = true;
-            }
-            return Err(error);
-        }
-    };
-    if start.get("launchNonce").and_then(Value::as_str) == Some(launch.nonce.as_str()) {
-        *owned = true;
-    }
-    ensure_plugin_api_ok(&start)?;
-    if start.get("launchNonce").and_then(Value::as_str) != Some(launch.nonce.as_str()) {
-        bail!("Studio started a different test session");
-    }
-    loop {
-        let clients = test_launch_clients(bridge, launch);
-        let server_ready = clients
-            .iter()
-            .any(|entry| entry["role"] == BRIDGE_ROLE_PLAY_SERVER);
-        let player_count_ready = args.players.is_none_or(|players| {
-            clients
-                .iter()
-                .filter(|entry| entry["role"] == BRIDGE_ROLE_PLAY_CLIENT)
-                .count()
-                >= players as usize
-        });
-        let selected_player_ready = args.player.as_deref().is_none_or(|selector| {
-            clients
-                .iter()
-                .any(|entry| test_client_matches_selector(entry, selector))
-        });
-        let ready = server_ready && player_count_ready && selected_player_ready;
-        if ready {
-            return Ok(json!({
-                "ok": true,
-                "mode": args.mode,
-                "players": args.players,
-                "launchNonce": launch.nonce,
-                "editRuntimeId": launch.edit_runtime_id,
-                "startResult": start,
-                "clients": clients,
-            }));
-        }
-        if Instant::now() >= deadline {
-            bail!("Timed test expired while waiting for Studio play mode");
-        }
-        thread::sleep(
-            Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
-        );
-    }
-}
-
-fn stop_test_session_with_deadline(
-    bridge: &BridgeServer,
-    launch: &TestLaunch,
-    capture: &mut TestConsoleCapture,
-    deadline: Instant,
-) -> Result<Value> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        bail!("Timed test exhausted its teardown deadline");
-    }
-    let initial_drain_deadline = Instant::now()
-        + deadline
-            .saturating_duration_since(Instant::now())
-            .min(Duration::from_secs(1));
-    let mut drain_error =
-        drain_test_consoles(bridge, launch, capture, initial_drain_deadline).err();
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        bail!("Timed test exhausted its teardown deadline before requesting stop");
-    }
-    let stop = bridge.call_for_runtime_with_timeout(
-        "startStopPlay",
-        json!({
-            "stop": true,
-            "launchNonce": launch.nonce,
-            "waitForStopped": false,
-        }),
-        BridgeTarget::Edit,
-        &launch.edit_runtime_id,
-        Some(remaining.min(BRIDGE_DEFAULT_RESPONSE_TIMEOUT)),
-    )?;
-    ensure_plugin_api_ok(&stop)?;
-    loop {
-        let drain_deadline = Instant::now()
-            + deadline
-                .saturating_duration_since(Instant::now())
-                .min(Duration::from_millis(750));
-        if let Err(error) = drain_test_consoles(bridge, launch, capture, drain_deadline)
-            && drain_error.is_none()
-        {
-            drain_error = Some(error);
-        }
-        if Instant::now() >= deadline {
-            bail!("Studio test bridges did not stop before the teardown deadline");
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let terminal = bridge.call_for_runtime_with_timeout(
-            "startStopPlay",
-            json!({}),
-            BridgeTarget::Edit,
-            &launch.edit_runtime_id,
-            Some(remaining.min(BRIDGE_DEFAULT_RESPONSE_TIMEOUT)),
-        )?;
-        ensure_plugin_api_ok(&terminal)?;
-        let clients = test_launch_clients(bridge, launch);
-        let stopped = terminal.get("running").and_then(Value::as_bool) == Some(false)
-            && terminal.get("starting").and_then(Value::as_bool) != Some(true);
-        if stopped && clients.is_empty() {
-            let final_drain_deadline = Instant::now()
-                + deadline
-                    .saturating_duration_since(Instant::now())
-                    .min(Duration::from_secs(1));
-            if let Err(error) = drain_test_consoles(bridge, launch, capture, final_drain_deadline)
-                && drain_error.is_none()
-            {
-                drain_error = Some(error);
-            }
-            if let Some(error) = drain_error {
-                return Err(error.context("Studio stopped, but final console collection failed"));
-            }
-            return Ok(json!({
-                "ok": true,
-                "action": "stop",
-                "launchNonce": launch.nonce,
-                "stopResult": stop,
-                "terminalResult": terminal,
-                "clients": clients,
-            }));
-        }
-        thread::sleep(
-            Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
-        );
-    }
-}
-
-pub(crate) fn timed_test_result(args: TestArgs, bridge: &BridgeServer) -> Result<Value> {
-    if !matches!(args.mode.as_str(), "play" | "run" | "server") {
-        bail!(
-            "Invalid test mode '{}'; use play, run, or server",
-            args.mode
-        );
-    }
-    if args.players.is_some() && args.mode != "play" {
-        bail!("--players can only be used with --mode play");
-    }
-    if !args.timeout.is_finite() || args.timeout <= 0.0 {
-        bail!("--timeout must be a finite number greater than zero");
-    }
-    let timeout = args.timeout.clamp(0.1, 60.0 * 60.0);
-    let started = Instant::now();
-    let run_deadline = started + Duration::from_secs_f64(timeout);
-    let launch = new_play_launch(bridge, "test")?;
-    let mut console = TestConsoleCapture::default();
-    let mut owns_test = false;
-    let start = match start_test_session_with_deadline(
-        &args,
-        bridge,
-        &launch,
-        run_deadline,
-        &mut owns_test,
-    ) {
-        Ok(start) => start,
-        Err(error) => {
-            cancel_test_launch_best_effort(bridge, &launch);
-            if !owns_test {
-                return Err(
-                    error.context("Timed test failed to start; exact launch cleanup was requested")
-                );
-            }
-            let teardown_deadline = Instant::now() + Duration::from_secs(10);
-            let cleanup =
-                stop_test_session_with_deadline(bridge, &launch, &mut console, teardown_deadline);
-            return match cleanup {
-                Ok(_) => Err(error.context("Timed test failed to start; cleanup completed")),
-                Err(cleanup_error) => Err(error.context(format!(
-                    "Timed test failed to start and cleanup also failed: {cleanup_error:#}"
-                ))),
-            };
-        }
-    };
-    let run_result = (|| -> Result<()> {
-        while Instant::now() < run_deadline {
-            drain_test_consoles(bridge, &launch, &mut console, run_deadline)?;
-            thread::sleep(
-                Duration::from_millis(250)
-                    .min(run_deadline.saturating_duration_since(Instant::now())),
-            );
-        }
-        Ok(())
-    })();
-    let teardown_deadline = Instant::now() + Duration::from_secs(10);
-    let stop_result =
-        stop_test_session_with_deadline(bridge, &launch, &mut console, teardown_deadline);
-    if let Err(run_error) = run_result {
-        return match stop_result {
-            Ok(_) => Err(run_error),
-            Err(stop_error) => Err(run_error.context(format!(
-                "Timed test execution failed and teardown also failed: {stop_error:#}"
-            ))),
-        };
-    }
-    let stop = stop_result?;
-    let terminal_error = stop
-        .pointer("/terminalResult/lastError")
-        .and_then(Value::as_str)
-        .filter(|message| !message.is_empty())
-        .map(str::to_string);
-    if let Some(message) = terminal_error.as_ref() {
-        console
-            .errors
-            .push(format!("Studio test service: {message}"));
-    }
-    if console.truncated {
-        let message = "Studio console history was truncated during the timed test".to_string();
-        if args.fail_on_error {
-            console.errors.push(message);
-        } else {
-            log_global(2, format_args!("{message}"));
-        }
-    }
-    Ok(json!({
-        "ok": terminal_error.is_none() && (!args.fail_on_error || console.errors.is_empty()),
-        "mode": args.mode,
-        "players": args.players,
-        "launchNonce": launch.nonce,
-        "editRuntimeId": launch.edit_runtime_id,
-        "elapsedSeconds": started.elapsed().as_secs_f64(),
-        "errors": console.errors,
-        "terminalError": terminal_error,
-        "consoleTruncated": console.truncated,
-        "start": start,
-        "stop": stop,
-    }))
 }

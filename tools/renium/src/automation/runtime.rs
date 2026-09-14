@@ -21,8 +21,8 @@ use crate::automation::{self, op};
 use crate::bytecode::explorer::bytecode_explorer_batch_result;
 use crate::cli::{
     ApplyEditorDeleteArgs, ApplyEditorPropertyArgs, BridgeConnectionArgs,
-    BytecodeExplorerBatchArgs, BytecodeFileArgs, EditorMutationArgs, ExportSnapshotsArgs,
-    ProjectSourceArgs, PushEditorChangesArgs,
+    BytecodeExplorerBatchArgs, BytecodeFileArgs, EditorMutationArgs, ProjectSourceArgs, PullArgs,
+    PushEditorChangesArgs,
 };
 use crate::daemon::transport::MAX_DAEMON_LINE_BYTES;
 #[cfg(any(windows, target_os = "macos"))]
@@ -40,8 +40,7 @@ use crate::studio::automation::{
     click_result, compact_live_status, editor_review_decision_result, execute_luau_result,
     get_console_output_result, goto_result, input_result, key_result, press_result,
     record_end_result, record_start_result, shot_result, start_stop_play_result,
-    studio_change_state_result, studio_device_result, timed_test_result, type_result, ui_result,
-    wait_until_result,
+    studio_change_state_result, studio_device_result, type_result, ui_result, wait_until_result,
 };
 use crate::studio::bridge::{BridgeRequestLease, BridgeServer, BridgeTarget};
 #[cfg(any(windows, target_os = "macos"))]
@@ -211,28 +210,18 @@ fn automation_string_list(value: &Value) -> Option<String> {
 pub(super) fn automation_pull_args(
     context: &automation::BoundContext,
     parameters: &Value,
-    import: bool,
-) -> Result<ExportSnapshotsArgs> {
+) -> Result<PullArgs> {
     let object = parameters.as_object().context("p must be an object")?;
-    Ok(ExportSnapshotsArgs {
+    Ok(PullArgs {
         project_root: PathBuf::from(&context.root),
         src_dir: automation_string(object, "srcDir")
             .map(PathBuf::from)
             .map_or_else(|| bound_context::source_dir(context), Ok)?,
-        snapshot_dir: bound_context::path(
-            context,
-            PathBuf::from(
-                automation_string(object, "snapshotDir")
-                    .unwrap_or_else(|| ".renium/snapshots".to_string()),
-            ),
-        ),
         services: object
             .get("services")
             .and_then(automation_string_list)
             .unwrap_or_default(),
         bridge: automation_bridge(object, 2.0)?,
-        run_import: import,
-        no_run_import: !import,
         export_all_properties: automation_bool(object, "exportAllProperties", false)?,
         no_export_all_properties: automation_bool(object, "noExportAllProperties", false)?,
         quiet_timings: std::env::var_os("RENIUM_PROFILE_PULL").is_none(),
@@ -537,7 +526,7 @@ fn automation_pull_operation(
     let prepare = crate::app::timing::trace_scope("sync", "pull target and pending changes");
     bridge.wait_for_all_target(bridge_wait_seconds, target)?;
     let info = bridge.cached_bridge_info_for_target(target)?;
-    let args = automation_pull_args(context, parameters, true)?;
+    let args = automation_pull_args(context, parameters)?;
     let services = args.services.clone();
     let parsed_services = parse_services(&services)?;
     let pending_ack = pending_change_ack(bridge, &parsed_services)?;
@@ -1086,14 +1075,6 @@ fn automation_dispatch_operation(
     match operation {
         op::PULL => automation_pull_operation(context, parameters, bridge, bridge_wait_seconds)
             .map(|(result, _)| result),
-        op::EXPORT_SNAPSHOTS => {
-            let target = BridgeTarget::Main;
-            bridge.wait_for_all_target(bridge_wait_seconds, target)?;
-            let info = bridge.cached_bridge_info_for_target(target)?;
-            let args = automation_pull_args(context, parameters, false)?;
-            export_snapshots_with_warm_bridge(args, bridge, &info, 0.0, false)?;
-            Ok(json!({ "direction": "snapshots" }))
-        }
         op::PUSH => {
             bridge.wait_for_all_target(bridge_wait_seconds, BridgeTarget::Main)?;
             let args = automation_push_args(context, parameters, reviewed)?;
@@ -1144,7 +1125,6 @@ fn automation_dispatch_operation(
         | op::IMPORT_MODEL
         | op::EXPORT_MODEL
         | op::EXPORT_PLACE
-        | op::IMPORT_SNAPSHOTS
         | op::SOURCEMAP
         | op::PROJECT_INIT
         | op::PROJECT_VALIDATE => local::execute(operation, context, parameters),
@@ -1164,10 +1144,6 @@ fn automation_dispatch_operation(
                 bridge.wait_for_target(bridge_wait_seconds, target)?;
             }
             get_console_output_result(&parsed, bridge)
-        }
-        op::PLAY_START if parameters.get("test").and_then(Value::as_bool) == Some(true) => {
-            bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Main)?;
-            timed_test_result(studio_args::test(parameters)?, bridge)
         }
         op::PLAY_START | op::PLAY_STOP => {
             start_stop_play_result(studio_args::play(operation, parameters)?, bridge)
@@ -1413,7 +1389,6 @@ fn automation_dispatch_managed(
             | op::MOVE
             | op::REVERT
             | op::IMPORT_MODEL
-            | op::IMPORT_SNAPSHOTS
             | op::PROJECT_INIT
             | op::PLACE_ADD
             | op::PLACE_RENAME
@@ -1532,22 +1507,6 @@ fn automation_dispatch_managed(
                     .live_sync()
                     .reconcile_then_resume(context, published)
                     .map_err(automation_failure)?;
-            } else if operation == op::IMPORT_SNAPSHOTS {
-                match state.live_sync().capture(context, Some(&paths)) {
-                    Ok(Some(captured)) => {
-                        state
-                            .live_sync()
-                            .rebase_then_resume(context.id, captured)
-                            .map_err(automation_failure)?;
-                    }
-                    Ok(None) => {
-                        state.live_sync().resume(context.id, std::iter::empty());
-                    }
-                    Err(error) => {
-                        state.live_sync().resume(context.id, std::iter::empty());
-                        return Err(automation_failure(error));
-                    }
-                }
             } else {
                 state.live_sync().resume(context.id, std::iter::empty());
             }
@@ -2568,9 +2527,6 @@ fn automation_execute_request(
                 return serde_json::to_value(context).map_err(|error| {
                     automation::Failure::new("internal", error.to_string(), false, "bind")
                 });
-            }
-            if operation.id == op::IMAGE_STORE {
-                return crate::cloud::assets::store_image(&context, &request.p);
             }
             if !context.initialized
                 && !matches!(operation.id, op::PROJECT_INIT | op::PROJECT_VALIDATE)

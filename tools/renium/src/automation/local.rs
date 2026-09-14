@@ -56,19 +56,6 @@ fn payload_args(parameters: &Value) -> Result<Vec<String>> {
     Ok(arguments)
 }
 
-fn string_list(value: &Value) -> Option<String> {
-    value
-        .as_array()
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join(",")
-        })
-        .or_else(|| value.as_str().map(str::to_string))
-}
-
 fn cli_args(operation: u16, context: &BoundContext, parameters: &Value) -> Result<Vec<String>> {
     let object = parameters.as_object().context("p must be an object")?;
     let mut flags = object.clone();
@@ -157,24 +144,6 @@ fn cli_args(operation: u16, context: &BoundContext, parameters: &Value) -> Resul
             }
         }
     }
-    if operation == op::IMPORT_SNAPSHOTS {
-        if let Some(snapshot_dir) = flags
-            .remove("snapshotDir")
-            .and_then(|value| value.as_str().map(str::to_string))
-        {
-            arguments.extend([
-                "--snapshot-dir".to_string(),
-                context::path(context, PathBuf::from(snapshot_dir))
-                    .display()
-                    .to_string(),
-            ]);
-        }
-        if let Some(services) = flags.remove("services") {
-            let services = string_list(&services)
-                .context("import-snapshots p.services must be a string or string array")?;
-            arguments.extend(["--services".to_string(), services]);
-        }
-    }
     arguments.extend(payload_args(&Value::Object(flags))?);
     Ok(arguments)
 }
@@ -200,7 +169,6 @@ pub(super) fn execute(operation: u16, context: &BoundContext, parameters: &Value
         op::IMPORT_MODEL => "import-model",
         op::EXPORT_MODEL => "export-model",
         op::EXPORT_PLACE => "bep",
-        op::IMPORT_SNAPSHOTS => "im",
         op::SOURCEMAP => "sm",
         op::PROJECT_INIT => "init",
         op::PROJECT_VALIDATE => "doctor",
@@ -233,7 +201,7 @@ pub(super) fn execute(operation: u16, context: &BoundContext, parameters: &Value
         arguments.push(context.root.clone());
     } else if operation == op::PROJECT_VALIDATE {
         arguments.extend(["--root".to_string(), context.root.clone()]);
-    } else if matches!(operation, op::REVERT | op::IMPORT_SNAPSHOTS) {
+    } else if operation == op::REVERT {
         arguments.extend([
             "--project-root".to_string(),
             context.root.clone(),

@@ -1977,7 +1977,7 @@ fn pull_studio_changes(
     bridge.pin_runtime(BridgeTarget::Edit, runtime_id);
     let info = bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?;
     let published = export_snapshots_with_warm_bridge(
-        automation_pull_args(context, &parameters, true)?,
+        automation_pull_args(context, &parameters)?,
         bridge,
         &info,
         0.0,
