@@ -2285,7 +2285,6 @@ fn native_import_services(changes: &EditorChangeSet) -> HashSet<String> {
                         .path_segments
                         .get(1)
                         .is_some_and(|name| roots.contains(name))
-                        && instance.path_ordinals.get(1) == Some(&1)
                 })
             })
             .map(|instance| instance.settings_id.as_str())
@@ -2366,25 +2365,32 @@ fn additive_native_roots(
     if changes.files_to_studio_filters_active {
         return roots;
     }
+    // Same-named siblings share one root name: the live preflight later proves
+    // the name absent from Studio, so every sibling is a fresh insertion.
     for change in &changes.instance_changes {
         if change.mode != "upsertInstances" || replaced.contains(&change.service) {
             continue;
         }
+        let mut rejected = HashSet::new();
+        let mut candidates = HashSet::new();
         for instance in &change.instances {
-            if instance.path_segments.len() == 2
-                && instance.path_ordinals.len() == 2
-                && instance.previous_path_segments.is_empty()
+            if instance.path_segments.len() != 2 || instance.path_ordinals.len() != 2 {
+                continue;
+            }
+            let name = &instance.path_segments[1];
+            if instance.previous_path_segments.is_empty()
                 && instance.previous_class_name.is_none()
-                && instance.path_ordinals[1] == 1
                 && !instance.anchor_only
-                && !instance.ambiguous_siblings
                 && !is_engine_managed_container(&change.service, &instance.class_name)
             {
-                roots
-                    .entry(change.service.clone())
-                    .or_default()
-                    .insert(instance.path_segments[1].clone());
+                candidates.insert(name.clone());
+            } else {
+                rejected.insert(name.clone());
             }
+        }
+        candidates.retain(|name| !rejected.contains(name));
+        if !candidates.is_empty() {
+            roots.insert(change.service.clone(), candidates);
         }
     }
     roots
@@ -2419,7 +2425,7 @@ mod additive_import_tests {
     }
 
     #[test]
-    fn additive_import_only_selects_new_unambiguous_ordinary_roots() {
+    fn additive_import_selects_new_ordinary_roots() {
         let root = EditorInstanceDescriptor {
             path_segments: vec!["TestService".into(), "NewCar".into()],
             path_ordinals: vec![1, 1],
@@ -2450,15 +2456,7 @@ mod additive_import_tests {
                 ..root.clone()
             },
             EditorInstanceDescriptor {
-                ambiguous_siblings: true,
-                ..root.clone()
-            },
-            EditorInstanceDescriptor {
                 anchor_only: true,
-                ..root.clone()
-            },
-            EditorInstanceDescriptor {
-                path_ordinals: vec![1, 2],
                 ..root.clone()
             },
             EditorInstanceDescriptor {
@@ -2470,6 +2468,31 @@ mod additive_import_tests {
             changes.instance_changes[0].instances = vec![invalid];
             assert!(additive_native_roots(&changes, &HashSet::new()).is_empty());
         }
+        let second = EditorInstanceDescriptor {
+            path_ordinals: vec![1, 2],
+            ambiguous_siblings: true,
+            ..root.clone()
+        };
+        changes.instance_changes[0].instances = vec![
+            EditorInstanceDescriptor {
+                ambiguous_siblings: true,
+                ..root.clone()
+            },
+            second.clone(),
+        ];
+        assert_eq!(
+            additive_native_roots(&changes, &HashSet::new())["TestService"],
+            HashSet::from(["NewCar".to_string()])
+        );
+        changes.instance_changes[0].instances = vec![
+            EditorInstanceDescriptor {
+                anchor_only: true,
+                ambiguous_siblings: true,
+                ..root.clone()
+            },
+            second,
+        ];
+        assert!(additive_native_roots(&changes, &HashSet::new()).is_empty());
         changes.instance_changes[0].instances = vec![root];
         assert!(additive_native_roots(&changes, &HashSet::from(["TestService".into()])).is_empty());
         changes.files_to_studio_filters_active = true;
@@ -2566,7 +2589,11 @@ fn independent_additive_document(
         .copied()
         .filter(|&index| roots.contains(&document.instances[index].name))
         .collect::<Vec<_>>();
-    if incoming.len() != roots.len() {
+    let incoming_names = incoming
+        .iter()
+        .map(|&index| document.instances[index].name.as_str())
+        .collect::<HashSet<_>>();
+    if incoming_names.len() != roots.len() {
         return None;
     }
     let mut selected = vec![root];
@@ -2779,13 +2806,15 @@ fn build_editor_binary_import_for_services(
                 }
                 pending_groups.retain(|group| !group.additive || !group.roots.is_empty());
                 for (service, roots) in additive_roots {
-                    let found: usize = pending_groups
+                    let found = pending_groups
                         .iter()
                         .filter(|group| group.service == *service)
-                        .map(|group| group.roots.len())
-                        .sum();
+                        .flat_map(|group| &group.roots)
+                        .filter_map(|root| build.dom.get_by_ref(*root))
+                        .map(|instance| instance.name.as_str())
+                        .collect::<HashSet<_>>();
                     anyhow::ensure!(
-                        found == roots.len(),
+                        found.len() == roots.len(),
                         "New native roots were not found in {service}"
                     );
                 }

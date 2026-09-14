@@ -2376,7 +2376,10 @@ end
 
 local function writeDecodedProperty(instance, propertyName, decoded, ctx, stats, nativeFont)
 	local okRead, current = readProperty(instance, propertyName)
-	if not nativeFont and okRead and exactValuesEqual(current, decoded) then
+	-- A CFrame that only differs by Float32 rounding is what readback would
+	-- accept anyway; rewriting it would re-solve joints and move neighbours.
+	if not nativeFont and okRead and (exactValuesEqual(current, decoded)
+		or propertyName == "CFrame" and propertyValuesEqual(instance, propertyName, current, decoded)) then
 		stats.noops += 1
 		return true, nil
 	end
@@ -3683,8 +3686,9 @@ function TransactionState.restoreMetadata(
 	for _, entry in ipairs(snapshot.metadata) do
 		local instance = replacements[entry.instance] or entry.instance
 		local desiredAttributes = entry.attributes
+		-- RBX_ attributes belong to the engine and cannot be written by plugins.
 		for name in pairs(instance:GetAttributes()) do
-			if desiredAttributes[name] == nil then
+			if desiredAttributes[name] == nil and not string.find(name, "^RBX_") then
 				local okWrite, writeError = setAttributeForSync(instance, name, nil, ctx)
 				if not okWrite then
 					error(`Could not restore {instance:GetFullName()}.{name}: {writeError}`)
@@ -3692,7 +3696,7 @@ function TransactionState.restoreMetadata(
 			end
 		end
 		for name, value in pairs(desiredAttributes) do
-			if not exactValuesEqual(instance:GetAttribute(name), value) then
+			if not string.find(name, "^RBX_") and not exactValuesEqual(instance:GetAttribute(name), value) then
 				local okWrite, writeError = setAttributeForSync(instance, name, value, ctx)
 				if not okWrite then
 					error(`Could not restore {instance:GetFullName()}.{name}: {writeError}`)
@@ -4080,7 +4084,15 @@ function TransactionState.replayJournalPlacement(
 	if instance == nil then
 		return false
 	end
-	local parent = TransactionState.resolveJournalParent(record, replacements)
+	local okParent, parent = pcall(TransactionState.resolveJournalParent, record, replacements)
+	if not okParent then
+		-- An edit recorded inside a tree that the rollback itself removed has
+		-- nothing left to preserve; only a surviving object keeps recovery pending.
+		if instance.Parent == nil and not instance:IsDescendantOf(game) then
+			return false
+		end
+		error(parent, 0)
+	end
 	if (record.structural or (instance.Parent == nil and parent ~= nil)) and instance.Parent ~= parent then
 		setParentForSync(instance, parent, ctx)
 	end
@@ -5012,6 +5024,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 						error("Native root write is no longer in flight")
 					end
 					session.pendingNativeRootWrite = nil
+					if ctx.endNativeRootWindow then ctx.endNativeRootWindow() end
 					if params.nativeRootChanged ~= true then
 						cancelExpectedEvent(ctx, write.token)
 					else
@@ -5026,12 +5039,16 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					end
 					write.token = ctx.expectPropertyEvent(write.instance, write.name, write.value)
 					session.pendingNativeRootWrite = write
+					if ctx.beginNativeRootWindow and write.instance:IsA("MeshPart") then
+						ctx.beginNativeRootWindow(write.change.service)
+					end
 					beginSessionOperation(session)
 					-- The native call has a two-second budget. Keep rollback fenced
 					-- across that call, including a disconnected/killed daemon.
 					task.delay(5, function()
 						if session.pendingNativeRootWrite ~= write then return end
 						session.pendingNativeRootWrite = nil
+						if ctx.endNativeRootWindow then ctx.endNativeRootWindow() end
 						cancelExpectedEvent(ctx, write.token)
 						session.expireRequested = true
 						endSessionOperation(editorTransactions, transactionId, session)
@@ -7324,7 +7341,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			additiveTargets[group.target] = group.additive
 			if group.additive then
 				for _, descriptor in ipairs(group.rootPaths) do
-					if descriptor.pathOrdinals[2] ~= 1 or group.target:FindFirstChild(descriptor.pathSegments[2]) ~= nil then
+					if group.target:FindFirstChild(descriptor.pathSegments[2]) ~= nil then
 						error("Native insertion target is no longer empty")
 					end
 				end
@@ -7851,8 +7868,8 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				local managedClasses = if group.target == group.service then ENGINE_MANAGED_CONTAINERS[group.serviceName] else nil
 				if group.additive then
 					for _, descriptor in ipairs(group.rootPaths) do
-						if descriptor.pathOrdinals[2] ~= 1 or group.target:FindFirstChild(descriptor.pathSegments[2]) ~= nil then
-							error(`New native root {table.concat(descriptor.pathSegments, ".")} already exists or is ambiguous`)
+						if group.target:FindFirstChild(descriptor.pathSegments[2]) ~= nil then
+							error(`New native root {table.concat(descriptor.pathSegments, ".")} already exists`)
 						end
 					end
 				end
