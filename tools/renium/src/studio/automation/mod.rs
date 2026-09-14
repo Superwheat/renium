@@ -2068,11 +2068,9 @@ pub(crate) fn record_start_command(args: RecordStartArgs) -> Result<()> {
 pub(crate) fn record_end_command(args: RecordEndArgs) -> Result<()> {
     let mut result = try_daemon_control_request(
         op::RECORD_END,
-        None,
         json!({
             "recordingId": args.recording_id,
         }),
-        false,
     )?
     .context("No Renium recording is active")?;
     if !args.no_review {
@@ -2120,7 +2118,7 @@ pub(crate) fn editor_review_decision_command(args: EditorReviewDecisionArgs) -> 
         "bridgeWaitSeconds": args.bridge.wait_seconds,
         "bridgePorts": args.bridge.ports,
     });
-    let result = try_daemon_control_request(op::REVIEW_APPLY, None, parameters, false)?
+    let result = try_daemon_control_request(op::REVIEW_APPLY, parameters)?
         .context("No Renium review is active")?;
     print_json_output(&result, false)
 }

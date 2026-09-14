@@ -1598,7 +1598,7 @@ fn capture_editor_package_preflight_live_attempt<'a>(
             (filtered.len() < service_names.len()).then_some(filtered)
         });
     let started = Instant::now();
-    let export = begin_editor_binary_export(bridge, false, None, service_filter.as_deref(), false)?;
+    let export = begin_editor_binary_export(bridge, service_filter.as_deref())?;
     let mut finish_guard = EditorBinaryExportFinishGuard {
         bridge,
         export_id: export.export_id.clone(),

@@ -289,7 +289,7 @@ impl ExportProjectStage {
         if let (Some(loaded), Some(projection)) = (&self.loaded, &self.projection)
             && projection.is_temporary()
         {
-            config::syncback_project_projection(loaded, projection.root(), false)?;
+            config::syncback_project_projection(loaded, projection.root())?;
         }
         if let Some(loaded) = &self.loaded {
             let adapter_root = self.projection.as_ref().map_or_else(

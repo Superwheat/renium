@@ -693,11 +693,9 @@ pub(crate) fn try_daemon_project_root(project_root: &Path) -> Result<Option<Path
 
 pub(super) fn try_daemon_control_request(
     operation: u16,
-    project_root: Option<&Path>,
     parameters: Value,
-    approved: bool,
 ) -> Result<Option<Value>> {
-    daemon_control_request_inner(operation, project_root, parameters, approved, false)
+    daemon_control_request_inner(operation, None, parameters, false, false)
 }
 
 pub(crate) fn daemon_control_request(

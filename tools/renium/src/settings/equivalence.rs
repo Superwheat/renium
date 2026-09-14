@@ -653,8 +653,7 @@ pub(crate) fn align_settings_ids_to_reference(
     reference: &SettingsBytecode,
     observed: &mut SettingsBytecode,
 ) -> bool {
-    let aligned = align_settings_ids_to_reference_impl(reference, observed);
-    aligned
+    align_settings_ids_to_reference_impl(reference, observed)
 }
 
 fn settings_topology_matches(reference: &SettingsBytecode, observed: &SettingsBytecode) -> bool {
@@ -1557,8 +1556,8 @@ pub(crate) fn settings_documents_positionally_equivalent(
     if !settings_topology_matches(reference, observed) {
         return false;
     }
-    let equivalent = positional_documents_equivalent(reference, observed);
-    equivalent
+
+    positional_documents_equivalent(reference, observed)
 }
 
 fn positional_documents_equivalent(
@@ -2059,7 +2058,10 @@ fn migrate_legacy_property(
         return;
     };
     let targets = migration.new_property_names();
-    if targets.iter().any(|target| properties.contains_key(*target)) {
+    if targets
+        .iter()
+        .any(|target| properties.contains_key(*target))
+    {
         properties.remove(name);
         return;
     }
@@ -2594,7 +2596,10 @@ pub(crate) fn reconciliation_property_is_derived(name: &str) -> bool {
 
 // Studio's TextScaled setter turns TextWrapped on and keeps it on, so a saved
 // TextWrapped=false next to TextScaled=true cannot survive a Studio write.
-pub(crate) fn reconciliation_property_is_forced(name: &str, properties: &Map<String, Value>) -> bool {
+pub(crate) fn reconciliation_property_is_forced(
+    name: &str,
+    properties: &Map<String, Value>,
+) -> bool {
     name == "TextWrapped" && properties.get("TextScaled") == Some(&Value::Bool(true))
 }
 
@@ -3373,7 +3378,11 @@ mod tests {
         for class_name in ["Frame", "TextButton", "TextLabel"] {
             let default = reflection_default_settings_value(database, class_name, "InputSink")
                 .expect("InputSink default");
-            assert!(reconciliation_property_value_is_default(class_name, "InputSink", &default));
+            assert!(reconciliation_property_value_is_default(
+                class_name,
+                "InputSink",
+                &default
+            ));
             assert!(!reconciliation_property_value_is_default(
                 class_name,
                 "InputSink",
@@ -3411,7 +3420,12 @@ mod tests {
             }],
         };
         let radius = |scale: f64| json!({"_type": "UDim", "scale": scale, "offset": 0});
-        let corners = ["TopLeftRadius", "TopRightRadius", "BottomLeftRadius", "BottomRightRadius"];
+        let corners = [
+            "TopLeftRadius",
+            "TopRightRadius",
+            "BottomLeftRadius",
+            "BottomRightRadius",
+        ];
 
         let mut mixed = corner(Map::from_iter(
             [("CornerRadius", radius(1.0))]

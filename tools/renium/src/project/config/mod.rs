@@ -2131,7 +2131,7 @@ pub fn run_adapters(args: AdaptersArgs, global_project: Option<&Path>) -> Result
         AdaptersCommand::Build(args) => {
             let loaded = load_project(args.project.as_deref().or(global_project), None)?;
             validate_project(&loaded)?;
-            build_adapters(&loaded, args.check, true)
+            build_adapters(&loaded, args.check)
         }
         AdaptersCommand::Syncback(args) => {
             let loaded = load_project(args.project.as_deref().or(global_project), None)?;

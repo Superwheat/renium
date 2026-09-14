@@ -545,7 +545,7 @@ mod tests {
         assert!(!old.exists());
         fs::remove_dir(root.join("src/shared"))?;
         let stage = config::stage_project(&loaded)?;
-        config::syncback_project_projection(&loaded, stage.root(), false)?;
+        config::syncback_project_projection(&loaded, stage.root())?;
         let next = config::stage_project(&loaded)?;
         let projected = SettingsBytecode::read_file(&crate::system::files::service_settings_path(
             &next.root().join("ReplicatedStorage"),
@@ -685,7 +685,7 @@ mod tests {
                 .join("StarterPlayer/StarterPlayerScripts/Main.client.luau")
                 .is_file()
         );
-        config::syncback_project_projection(&loaded, stage.root(), false)?;
+        config::syncback_project_projection(&loaded, stage.root())?;
         assert!(root.join("instances/ServerScriptService.renium").is_file());
         assert!(
             root.join("instances/StarterPlayer/StarterPlayerScripts.renium")

@@ -173,7 +173,8 @@ fn undo_selection_sites(image: &MachImage<'_>) -> Result<Vec<(u64, u32)>> {
             let offset = image
                 .text_offset_for_address(site)
                 .context("Studio undo restore site is outside __text")?;
-            let original = read_u32(image.bytes, offset).context("Studio undo restore site is truncated")?;
+            let original =
+                read_u32(image.bytes, offset).context("Studio undo restore site is truncated")?;
             Ok((
                 site.checked_sub(image.image_base)
                     .context("Studio undo restore site precedes __TEXT")?,

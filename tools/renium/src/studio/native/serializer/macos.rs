@@ -21,13 +21,13 @@ use crate::system::files::{atomic_write_file, sha256_hex};
 mod properties;
 #[path = "macos_undo_selection.rs"]
 mod undo_selection;
-pub(crate) use undo_selection::keep_selection_across_undo;
 #[cfg(target_arch = "aarch64")]
 pub(crate) use properties::capture_identities;
 pub(crate) use properties::{
     observe_terrain, prepare_context, prepare_property, prepare_terrain, read_property,
     register_history,
 };
+pub(crate) use undo_selection::keep_selection_across_undo;
 
 const HELPER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-studio-helper.dylib"));
 const LAUNCHER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-studio-launcher"));
