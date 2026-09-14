@@ -673,11 +673,30 @@ impl<'a> EditorTransaction<'a> {
             })
         {
             let watcher_started = Instant::now();
-            transaction.package_dialog = Some(
-                studio_pid_for_bridge(bridge)
-                    .and_then(crate::studio::input::watch_package_changes_dialog)
-                    .context("Package changes cannot be applied without a dialog watcher")?,
-            );
+            // With the popup disabled inside Studio no dialog can appear, so the
+            // accessibility watcher and its slow final pass are unnecessary.
+            #[cfg(target_os = "macos")]
+            let suppressed = match studio_pid_for_bridge(bridge)
+                .and_then(crate::studio::native::serializer::suppress_package_notices)
+            {
+                Ok(()) => true,
+                Err(error) => {
+                    log_global(
+                        4,
+                        format_args!("[renium] package notice suppression unavailable: {error:#}"),
+                    );
+                    false
+                }
+            };
+            #[cfg(not(target_os = "macos"))]
+            let suppressed = false;
+            if !suppressed {
+                transaction.package_dialog = Some(
+                    studio_pid_for_bridge(bridge)
+                        .and_then(crate::studio::input::watch_package_changes_dialog)
+                        .context("Package changes cannot be applied without a dialog watcher")?,
+                );
+            }
             log_timing(
                 "native editor package dialog watcher start",
                 watcher_started,

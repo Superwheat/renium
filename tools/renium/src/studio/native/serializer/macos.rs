@@ -97,8 +97,22 @@ struct MachImage<'a> {
     image_uuid: [u8; 16],
     text: MachSection,
     sections: Vec<MachSection>,
+    writable_segments: Vec<(u64, u64)>,
     function_starts: Vec<u64>,
 }
+
+const PACKAGE_NOTICE_FLAG: &[u8] = b"RemovePackageModificationPopupDialog\0";
+const PACKAGE_NOTICE_REQUEST: u32 = 5;
+
+struct CachedPackageNoticeFlag {
+    len: u64,
+    modified: Option<SystemTime>,
+    rva: u64,
+    image_uuid: [u8; 16],
+}
+
+static PACKAGE_NOTICE_FLAGS: OnceLock<Mutex<HashMap<PathBuf, CachedPackageNoticeFlag>>> =
+    OnceLock::new();
 
 fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
     Some(u32::from_le_bytes(
@@ -139,6 +153,7 @@ impl<'a> MachImage<'a> {
             read_u32(bytes, 16).context("Studio Mach-O load commands are truncated")? as usize;
         let mut cursor = MACH_HEADER_64_SIZE;
         let mut sections = Vec::new();
+        let mut writable_segments = Vec::new();
         let mut text = None;
         let mut image_base = None;
         let mut image_uuid = None;
@@ -165,6 +180,18 @@ impl<'a> MachImage<'a> {
                         read_u64(bytes, cursor + 24)
                             .context("Studio __TEXT address is truncated")?,
                     );
+                }
+                if read_u32(bytes, cursor + 60)
+                    .context("Studio Mach-O segment protection is truncated")?
+                    & 2
+                    != 0
+                {
+                    writable_segments.push((
+                        read_u64(bytes, cursor + 24)
+                            .context("Studio Mach-O segment address is truncated")?,
+                        read_u64(bytes, cursor + 32)
+                            .context("Studio Mach-O segment size is truncated")?,
+                    ));
                 }
                 let section_count = read_u32(bytes, cursor + 64)
                     .context("Studio Mach-O segment section count is truncated")?
@@ -279,8 +306,15 @@ impl<'a> MachImage<'a> {
             image_uuid,
             text,
             sections,
+            writable_segments,
             function_starts,
         })
+    }
+
+    fn is_writable_address(&self, address: u64) -> bool {
+        self.writable_segments
+            .iter()
+            .any(|(start, size)| address >= *start && address < start.saturating_add(*size))
     }
 
     fn address_for_offset(&self, offset: usize) -> Option<u64> {
@@ -645,6 +679,154 @@ fn trace_arm64_task_submitter(image: &MachImage<'_>) -> Result<u64> {
     matches[0]
         .checked_sub(image.image_base)
         .context("Studio DataModel task submitter precedes __TEXT")
+}
+
+// Studio registers the popup flag as `adrp/add x0, name; adrp/add x1, storage;
+// mov w2, #1; b registrar`. The storage is the only writable address the
+// registration materializes next to the name.
+fn arm64_adrp_add_target(text: &[u8], text_address: u64, offset: usize) -> Option<(u32, u64)> {
+    let adrp = read_u32(text, offset)?;
+    let add = read_u32(text, offset + 4)?;
+    if adrp & 0x9f00_0000 != 0x9000_0000 {
+        return None;
+    }
+    let register = adrp & 31;
+    if add & 0xff00_0000 != 0x9100_0000 || (add >> 5) & 31 != register || add & 31 != register {
+        return None;
+    }
+    let immediate_low = (adrp >> 29) & 3;
+    let immediate_high = (adrp >> 5) & 0x7ffff;
+    let mut immediate = ((immediate_high << 2) | immediate_low) as i64;
+    if immediate & 0x10_0000 != 0 {
+        immediate -= 0x20_0000;
+    }
+    let page = ((text_address + offset as u64) & !0xfff).wrapping_add_signed(immediate << 12);
+    let shift = if add & (1 << 22) == 0 { 0 } else { 12 };
+    Some((register, page + ((((add >> 10) & 0xfff) as u64) << shift)))
+}
+
+// Studio registers each flag as `adrp/add x0, name; adrp/add x1, storage;
+// mov w2, default; b registrar`, one registration after another, so only the
+// storage materialized right after this flag's name belongs to it.
+fn package_notice_flag_rva(image: &MachImage<'_>) -> Result<u64> {
+    if image.cpu != CPU_TYPE_ARM64 {
+        bail!("Package notice suppression requires Apple Silicon Roblox Studio");
+    }
+    let positions = memchr::memmem::find_iter(image.bytes, PACKAGE_NOTICE_FLAG).collect::<Vec<_>>();
+    anyhow::ensure!(
+        positions.len() == 1,
+        "Studio package popup flag name is not unique"
+    );
+    let name_address = image
+        .address_for_offset(positions[0])
+        .context("Studio package popup flag name is outside every section")?;
+    let text = image.text_bytes()?;
+    let mut registrations = Vec::new();
+    for site in arm64_address_xrefs(image, name_address)? {
+        let offset = usize::try_from(site - image.text.address)?;
+        let Some((0, name)) = arm64_adrp_add_target(text, image.text.address, offset) else {
+            continue;
+        };
+        let Some((1, storage)) = arm64_adrp_add_target(text, image.text.address, offset + 8) else {
+            continue;
+        };
+        let default = read_u32(text, offset + 16).unwrap_or(0);
+        let branch = read_u32(text, offset + 20).unwrap_or(0);
+        if name == name_address
+            && default & 0xffff_ffe0 == 0x5280_0020
+            && branch & 0xfc00_0000 == 0x1400_0000
+            && image.is_writable_address(storage)
+        {
+            registrations.push(storage);
+        }
+    }
+    registrations.sort_unstable();
+    registrations.dedup();
+    anyhow::ensure!(
+        registrations.len() == 1,
+        "Studio package popup flag storage resolved {} candidates",
+        registrations.len()
+    );
+    registrations[0]
+        .checked_sub(image.image_base)
+        .context("Studio package popup flag precedes __TEXT")
+}
+
+fn package_notice_flag(path: &Path) -> Result<(u64, [u8; 16])> {
+    let metadata =
+        fs::metadata(path).with_context(|| format!("Could not inspect {}", path.display()))?;
+    let modified = metadata.modified().ok();
+    let cache = PACKAGE_NOTICE_FLAGS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(cached) = cache
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(path)
+        .filter(|cached| cached.len == metadata.len() && cached.modified == modified)
+    {
+        return Ok((cached.rva, cached.image_uuid));
+    }
+    let bytes = fs::read(path).with_context(|| format!("Could not read {}", path.display()))?;
+    let image = MachImage::parse(&bytes)?;
+    let rva = package_notice_flag_rva(&image)?;
+    cache
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(
+            path.to_path_buf(),
+            CachedPackageNoticeFlag {
+                len: metadata.len(),
+                modified,
+                rva,
+                image_uuid: image.image_uuid,
+            },
+        );
+    Ok((rva, image.image_uuid))
+}
+
+// Disable Studio's package-modification popup for the connected process
+// lifetime, like the Windows serializer does. Links and contents are untouched.
+pub(crate) fn suppress_package_notices(pid: u32) -> Result<()> {
+    let (rva, image_uuid) = package_notice_flag(&process_executable_path(pid)?)?;
+    let socket_path = PathBuf::from(format!("/tmp/renium-studio-{pid}.sock"));
+    let mut socket = UnixStream::connect(&socket_path).with_context(|| {
+        format!(
+            "Studio process {pid} was not launched with Renium's native helper; restart Roblox Studio"
+        )
+    })?;
+    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+    socket.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let mut request = Vec::with_capacity(48);
+    request.extend_from_slice(&REQUEST_MAGIC.to_le_bytes());
+    request.extend_from_slice(&REQUEST_VERSION.to_le_bytes());
+    request.extend_from_slice(&PACKAGE_NOTICE_REQUEST.to_le_bytes());
+    request.extend_from_slice(&0u32.to_le_bytes());
+    request.extend_from_slice(&0u32.to_le_bytes());
+    request.extend_from_slice(&0u32.to_le_bytes());
+    request.extend_from_slice(&0u64.to_le_bytes());
+    request.extend_from_slice(&rva.to_le_bytes());
+    request.extend_from_slice(&image_uuid);
+    socket
+        .write_all(&request)
+        .context("Could not send the package notice request to Studio")?;
+    let mut response = [0u8; RESPONSE_SIZE];
+    socket
+        .read_exact(&mut response)
+        .context("Studio native helper closed without a package notice response")?;
+    if read_u32(&response, 0) != Some(REQUEST_MAGIC) {
+        bail!("Studio native helper returned an invalid package notice response");
+    }
+    if read_u32(&response, 4).unwrap_or(u32::MAX) != 0 {
+        let text_bytes = &response[24..];
+        let end = text_bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(text_bytes.len());
+        bail!(
+            "Studio package notice suppression failed: {}",
+            String::from_utf8_lossy(&text_bytes[..end])
+        );
+    }
+    Ok(())
 }
 
 fn trace_package_action(path: &Path) -> Result<PackageActionTrace> {

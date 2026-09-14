@@ -3196,6 +3196,57 @@ static bool StartPropertyClient(std::unique_ptr<PropertyClient>& state, std::str
     return true;
 }
 
+// Resolves a writable data address of the loaded Studio image by RVA, so the
+// host can only target storage inside a segment the image declares writable.
+static bool ResolveImageData(
+    const mach_header_64* header,
+    std::intptr_t slide,
+    const Request& request,
+    std::uint64_t rva,
+    std::uintptr_t& address,
+    std::string& error)
+{
+    const segment_command_64* text = nullptr;
+    const uuid_command* uuid = nullptr;
+    std::vector<const segment_command_64*> writable;
+    auto command = reinterpret_cast<const unsigned char*>(header) + sizeof(*header);
+    for (std::uint32_t index = 0; index < header->ncmds; ++index)
+    {
+        const auto load = reinterpret_cast<const load_command*>(command);
+        if (load->cmdsize < sizeof(load_command))
+        {
+            error = "Studio's loaded image commands are invalid";
+            return false;
+        }
+        if (load->cmd == LC_SEGMENT_64)
+        {
+            const auto segment = reinterpret_cast<const segment_command_64*>(load);
+            if (std::strcmp(segment->segname, "__TEXT") == 0)
+                text = segment;
+            if (segment->initprot & VM_PROT_WRITE)
+                writable.push_back(segment);
+        }
+        else if (load->cmd == LC_UUID)
+            uuid = reinterpret_cast<const uuid_command*>(load);
+        command += load->cmdsize;
+    }
+    if (!text || !uuid || !rva ||
+        std::memcmp(uuid->uuid, request.imageUuid, sizeof(request.imageUuid)) != 0)
+    {
+        error = "Studio's package notice flag does not match its loaded image";
+        return false;
+    }
+    address = static_cast<std::uintptr_t>(text->vmaddr + slide) + rva;
+    for (const auto segment : writable)
+    {
+        const auto start = static_cast<std::uintptr_t>(segment->vmaddr + slide);
+        if (address >= start && address < start + segment->vmsize)
+            return true;
+    }
+    error = "Studio's package notice flag is not writable data";
+    return false;
+}
+
 // True transfers this socket to a bounded task; the accept loop retains all
 // other sockets. Waiting for the UI/DataModel queue must not block raw reads.
 static bool HandleClient(int client)
@@ -3203,8 +3254,9 @@ static bool HandleClient(int client)
     Request request{};
     Response response{Magic, 7, 0, 0, {}};
     if (!ReadExact(client, &request, sizeof(request)) || request.magic != Magic ||
-        (request.command != 1 && request.command != 2 && request.command != 3 && request.command != 4) ||
-        (request.command != 4 && request.pathLength == 0) ||
+        (request.command != 1 && request.command != 2 && request.command != 3 &&
+            request.command != 4 && request.command != 5) ||
+        (request.command != 4 && request.command != 5 && request.pathLength == 0) ||
         request.pathLength >= (request.command == 3 ? 128u * 1024 * 1024 + 66216u : PATH_MAX) || request.titleLength >= PATH_MAX)
     {
         SetError(response, "invalid serializer request");
@@ -3227,6 +3279,32 @@ static bool HandleClient(int client)
             response.status = 0;
         else
             SetError(response, "could not arm background launch");
+        WriteExact(client, &response, sizeof(response));
+        return false;
+    }
+    if (request.command == 5)
+    {
+        std::intptr_t slide = 0;
+        const auto header = MainStudioImage(slide);
+        std::string error;
+        std::uintptr_t flag = 0;
+        if (request.pathLength != 0 || request.titleLength != 0 || request.reserved != 0)
+            SetError(response, "invalid package notice request");
+        else if (!header ||
+            !ResolveImageData(header, slide, request, request.executeRva, flag, error))
+            SetError(response, error);
+        else
+        {
+            const auto current = *reinterpret_cast<volatile unsigned char*>(flag);
+            if (current > 1)
+                SetError(response, "Studio package popup flag is not boolean");
+            else
+            {
+                *reinterpret_cast<volatile unsigned char*>(flag) = 1;
+                response.outputSize = current;
+                response.status = 0;
+            }
+        }
         WriteExact(client, &response, sizeof(response));
         return false;
     }
