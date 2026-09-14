@@ -172,7 +172,7 @@ function BridgeValueCodec.decode(raw: any, enumHint: string?, decodeRef, context
 	end
 
 	local typeName = raw._type
-	if typeName == nil and enumHint == "FontFace" and raw.family ~= nil then
+	if typeName == nil and raw.family ~= nil and (enumHint == "FontFace" or (raw.weight ~= nil and raw.style ~= nil)) then
 		typeName = "Font"
 	elseif typeName == nil and raw.BrickColor ~= nil then
 		typeName = "BrickColor"

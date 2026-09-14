@@ -823,6 +823,8 @@ fn encode_settings_bytecode_with_reference_lookup(
     build_reference_lookup: bool,
 ) -> Result<Vec<u8>> {
     validate_settings_hierarchy(&document.instances)?;
+    let canonical = canonical_attribute_document(document);
+    let document = canonical.as_ref().unwrap_or(document);
     let payload =
         encode_settings_bytecode_payload_with_reference_lookup(document, build_reference_lookup)?;
     let encoded = wrap_settings_bytecode_payload(&payload)?;
@@ -3583,9 +3585,11 @@ fn write_ref_fallback_payload<W: Write + ?Sized>(
     Ok(())
 }
 
+/// Decoded attributes carry the raw key form (`{"BrickColor":1004}`);
+/// the plugin and model imports carry `_type`. Both must re-encode.
 fn attribute_type_key(obj: &Map<String, Value>) -> Option<&'static str> {
-    let type_name = obj.get("_type").and_then(Value::as_str)?;
-    if type_name == "Float" {
+    let type_name = obj.get("_type").and_then(Value::as_str);
+    if type_name == Some("Float") {
         return matches!(
             obj.get("value").and_then(Value::as_str),
             Some("nan" | "inf" | "-inf")
@@ -3614,13 +3618,11 @@ fn attribute_type_key(obj: &Map<String, Value>) -> Option<&'static str> {
             return Some(key);
         }
     }
+    let type_name = type_name?;
     if type_name == "EnumItem" {
         return Some("EnumItem");
     }
-    supported
-        .into_iter()
-        .find(|&key| type_name == key)
-        .map(|v| v as _)
+    supported.into_iter().find(|&key| type_name == key)
 }
 
 fn attribute_payload_child<'a>(
@@ -3664,6 +3666,82 @@ fn typed_number_attribute(value: &Value) -> Option<&Value> {
         return None;
     }
     obj.get("value").filter(|inner| inner.is_number())
+}
+
+/// Decoding drops the outer attribute key, which leaves BrickColor, the
+/// sequences and Font without the `_type` marker the writers key on. Restore
+/// it so a decoded store re-encodes to the same bytes.
+pub(crate) fn canonical_attribute_value(value: &Value) -> Option<Value> {
+    let obj = value.as_object()?;
+    if obj.contains_key("_type") {
+        return None;
+    }
+    if obj.len() == 1 {
+        let (key, inner) = obj.iter().next()?;
+        match key.as_str() {
+            "BrickColor" if inner.is_number() => {
+                return Some(json!({"_type": "BrickColor", "number": inner}));
+            }
+            "NumberSequence" if inner.is_object() => {
+                let mut typed = inner.as_object()?.clone();
+                typed.insert("_type".to_string(), json!("NumberSequence"));
+                return Some(Value::Object(typed));
+            }
+            "ColorSequence" if inner.is_object() => {
+                let keypoints = inner
+                    .get("keypoints")
+                    .and_then(Value::as_array)
+                    .map_or(&[][..], Vec::as_slice)
+                    .iter()
+                    .map(|keypoint| {
+                        let Some(fields) = keypoint.as_object() else {
+                            return keypoint.clone();
+                        };
+                        match fields.get("color").and_then(Value::as_array) {
+                            Some(components) if components.len() == 3 => json!({
+                                "time": fields.get("time").cloned().unwrap_or(Value::Null),
+                                "value": {
+                                    "r": components[0],
+                                    "g": components[1],
+                                    "b": components[2],
+                                },
+                            }),
+                            _ => keypoint.clone(),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                return Some(json!({"_type": "ColorSequence", "keypoints": keypoints}));
+            }
+            _ => {}
+        }
+    }
+    if obj.contains_key("family") && obj.contains_key("weight") && obj.contains_key("style") {
+        let mut typed = obj.clone();
+        typed.insert("_type".to_string(), json!("Font"));
+        return Some(Value::Object(typed));
+    }
+    None
+}
+
+fn canonical_attribute_document(document: &SettingsBytecode) -> Option<SettingsBytecode> {
+    let needs_copy = document.instances.iter().any(|instance| {
+        instance
+            .attributes
+            .values()
+            .any(|value| canonical_attribute_value(value).is_some())
+    });
+    if !needs_copy {
+        return None;
+    }
+    let mut copy = document.clone();
+    for instance in &mut copy.instances {
+        for value in instance.attributes.values_mut() {
+            if let Some(canonical) = canonical_attribute_value(value) {
+                *value = canonical;
+            }
+        }
+    }
+    Some(copy)
 }
 
 fn collect_attribute_value_strings<'a>(
@@ -4118,6 +4196,72 @@ mod tests {
             f32::NEG_INFINITY
         );
         assert!(fixed_numeric_component_f32(f64::NAN).is_nan());
+    }
+
+    #[test]
+    fn decoded_attribute_shapes_reencode_identically() {
+        let mut attrs = SettingsBytecodeInstance::new(
+            "attrs".to_string(),
+            "Attrs".to_string(),
+            "Folder".to_string(),
+            Some(0),
+        );
+        attrs.attributes = Map::from_iter([
+            (
+                "bc".to_string(),
+                json!({"_type":"BrickColor","number":1004}),
+            ),
+            (
+                "font".to_string(),
+                json!({"_type":"Font","family":"rbxasset://fonts/families/GothamSSm.json","weight":"Regular","style":"Normal"}),
+            ),
+            (
+                "cs".to_string(),
+                json!({"_type":"ColorSequence","keypoints":[{"time":0,"value":{"r":1,"g":0,"b":0}},{"time":1,"value":{"r":0,"g":0,"b":1}}]}),
+            ),
+            (
+                "ns".to_string(),
+                json!({"_type":"NumberSequence","keypoints":[{"time":0,"value":0,"envelope":0},{"time":1,"value":1,"envelope":0.5}]}),
+            ),
+            ("v2".to_string(), json!({"_type":"Vector2","x":4,"y":5})),
+            (
+                "rect".to_string(),
+                json!({"_type":"Rect","minX":1,"minY":2,"maxX":3,"maxY":4}),
+            ),
+            (
+                "nr".to_string(),
+                json!({"_type":"NumberRange","min":1,"max":5}),
+            ),
+            (
+                "en".to_string(),
+                json!({"_type":"EnumItem","enumType":"Material","name":"Neon"}),
+            ),
+        ]);
+        let document = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                SettingsBytecodeInstance::new(
+                    "root".to_string(),
+                    "Workspace".to_string(),
+                    "Workspace".to_string(),
+                    None,
+                ),
+                attrs,
+            ],
+        };
+
+        let first = encode_settings_bytecode(&document).unwrap();
+        let decoded = decode_settings_bytecode(&first).unwrap();
+        let second = encode_settings_bytecode(&decoded).unwrap();
+        let redecoded = decode_settings_bytecode(&second).unwrap();
+        assert_eq!(
+            decoded.instances[1].attributes,
+            redecoded.instances[1].attributes
+        );
+        assert_eq!(
+            decoded.instances[1].attributes["bc"],
+            json!({"BrickColor": 1004})
+        );
     }
 
     #[test]
