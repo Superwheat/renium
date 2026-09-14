@@ -1541,13 +1541,57 @@ pub(crate) fn bytecode_export_place(mut args: BytecodeExportPlaceArgs) -> Result
         None => RbxPlaceFormat::from_path(&args.output)?,
     };
     let services = explorer_daemon_services(active_root, &args.services)?;
-    let build = build_rbx_place(active_root, services, None, false, false, false)?;
-    let top_level_refs = build
+    let mut build = build_rbx_place(active_root, services, None, false, false, false)?;
+    let mut top_level_refs = build
         .service_roots
         .iter()
         .map(|(_, referent)| *referent)
         .collect::<Vec<_>>();
-    format.write(&args.output, &build.dom, &top_level_refs)?;
+    let mut dom = std::mem::replace(
+        &mut build.dom,
+        RbxWeakDom::new(RbxInstanceBuilder::new("DataModel")),
+    );
+    if let Some(base) = args.base.as_deref() {
+        let mut base_dom = RbxPlaceFormat::from_path(base)?.read(base)?;
+        let base_root = base_dom.root_ref();
+        for (service, referent) in &build.service_roots {
+            let existing = base_dom.root().children().iter().copied().find(|child| {
+                base_dom
+                    .get_by_ref(*child)
+                    .is_some_and(|instance| instance.class.as_str() == service)
+            });
+            if let Some(existing) = existing {
+                let base_properties = base_dom
+                    .get_by_ref(existing)
+                    .map(|instance| instance.properties.clone())
+                    .unwrap_or_default();
+                if let Some(built) = dom.get_by_ref_mut(*referent) {
+                    for (name, value) in base_properties {
+                        match (name.as_str(), built.properties.get_mut(&name)) {
+                            ("Attributes", Some(RbxVariant::Attributes(attributes))) => {
+                                if let RbxVariant::Attributes(base_attributes) = value {
+                                    for (key, attribute) in base_attributes.iter() {
+                                        if attributes.get(key.as_str()).is_none() {
+                                            attributes.insert(key.clone(), attribute.clone());
+                                        }
+                                    }
+                                }
+                            }
+                            (_, Some(_)) => {}
+                            (_, None) => {
+                                built.properties.insert(name, value);
+                            }
+                        }
+                    }
+                }
+                base_dom.destroy(existing);
+            }
+            dom.transfer(*referent, &mut base_dom, base_root);
+        }
+        dom = base_dom;
+        top_level_refs = dom.root().children().to_vec();
+    }
+    format.write(&args.output, &dom, &top_level_refs)?;
     let exported_services = build
         .service_roots
         .iter()
@@ -1561,6 +1605,7 @@ pub(crate) fn bytecode_export_place(mut args: BytecodeExportPlaceArgs) -> Result
             "services": exported_services,
             "serviceCount": top_level_refs.len(),
             "instances": build.total_instances,
+            "base": args.base,
         }),
         args.pretty,
     )

@@ -1884,6 +1884,7 @@ fn assert_mesh_exports(project_root: &Path, settings_path: &Path, expected: (f32
             services: "Workspace".to_string(),
             output: output_path.clone(),
             format: Some(format.to_string()),
+            base: None,
             pretty: false,
         })
         .unwrap();
