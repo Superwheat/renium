@@ -3098,7 +3098,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	local function recordUntrackedNativeAddition(service: Instance, serviceName: string, instance: Instance, exportIncluded: boolean?)
 		local journal = state.changeJournal
 		local additions = if journal and journal.nativeAdditions then journal.nativeAdditions[serviceName] else nil
-		if additions == nil or additions[instance] ~= nil or state.onlyCodeMode then
+		if additions == nil or additions[instance] ~= nil then
 			return
 		end
 		if shouldIgnoreInstance(instance, serviceName, exportIncluded) then

@@ -5306,12 +5306,24 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					error("Invalid native root existence request")
 				end
 				local service = game:GetService(serviceName)
+				local rootIds = if type(params.rootIds) == "table" then params.rootIds[serviceName] else nil
+				local lookup = if type(rootIds) == "table" then settingsIdLookupForService(serviceName, ctx) else nil
 				local absent = {}
 				for _, name in ipairs(names) do
 					if type(name) ~= "string" then
 						error("Invalid native root name")
 					end
-					if service:FindFirstChild(name) == nil then
+					local present = service:FindFirstChild(name) ~= nil
+					-- A renamed root keeps its identity: it is present under its old name.
+					if not present and lookup ~= nil and type(rootIds[name]) == "table" then
+						for _, settingsId in ipairs(rootIds[name]) do
+							if liveInstance(lookup[tostring(settingsId)]) ~= nil then
+								present = true
+								break
+							end
+						end
+					end
+					if not present then
 						absent[#absent + 1] = name
 					end
 				end
@@ -6130,6 +6142,15 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		})
 	end
 
+	local function expireTransactionBinaryImports(transactionId: string)
+		for importId, importSession in pairs(binaryImports) do
+			if type(importSession) == "table" and tostring(importSession.transactionId or "") == transactionId then
+				importSession.expireRequested = true
+				expireSession(binaryImports, importId, importSession)
+			end
+		end
+	end
+
 	function api.commitTransaction(params: { [string]: any }): { [string]: any }
 		local transactionId = tostring(params.transactionId or "")
 		local activeSession = editorTransactions[transactionId]
@@ -6160,6 +6181,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			if rollbackOk then
 				session.onExpire = nil
 				editorTransactions[transactionId] = nil
+				expireTransactionBinaryImports(transactionId)
 				recordTransactionOutcome(transactionId, "rolledBack", {
 					replacements = countEntries(rollbackResult),
 				})
@@ -6194,12 +6216,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		end
 		session.onExpire = nil
 		editorTransactions[transactionId] = nil
-		for importId, importSession in pairs(binaryImports) do
-			if type(importSession) == "table" and tostring(importSession.transactionId or "") == transactionId then
-				importSession.expireRequested = true
-				expireSession(binaryImports, importId, importSession)
-			end
-		end
+		expireTransactionBinaryImports(transactionId)
 		for _, serviceName in ipairs(session.serviceNames) do
 			invalidateEditorService(serviceName)
 		end
@@ -8034,11 +8051,13 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local importId = tostring(params.importId or "")
 		local session = binaryImports[importId]
 		local found = session ~= nil
+		local released = false
 		if type(session) == "table" then
 			session.cancelRequested = true
-			expireSession(binaryImports, importId, session)
+			session.expireRequested = true
+			released = expireSession(binaryImports, importId, session)
 		end
-		return { ok = true, found = found }
+		return { ok = true, found = found, released = released }
 	end
 
 	function api.getFilterCandidates(params: { [string]: any }): { [string]: any }

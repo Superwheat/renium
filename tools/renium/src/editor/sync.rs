@@ -3796,6 +3796,7 @@ fn collect_settings_file_change(
     }
     if args.upsert_instances_only {
         changed_services.target_upsert.insert(service.to_string());
+        changed_services.settings.insert(service.to_string());
     } else {
         changed_services.settings.insert(service.to_string());
         if !property_filter.is_active() {

@@ -1441,6 +1441,10 @@ fn fetch_package_preflight_overlay_properties(
     Ok(properties_by_ref)
 }
 
+/// Settings ids per candidate root name, so Studio can recognise a renamed
+/// root that still exists under its old name.
+type AdditiveRootIds = HashMap<String, HashMap<String, Vec<String>>>;
+
 struct EditorServiceChangeGenerations {
     generations: HashMap<String, u64>,
     has_package_links: Option<HashMap<String, bool>>,
@@ -1451,10 +1455,11 @@ fn editor_service_change_generations(
     bridge: &BridgeServer,
     services: &[String],
     root_names: Option<&HashMap<String, HashSet<String>>>,
+    root_ids: Option<&AdditiveRootIds>,
 ) -> Result<EditorServiceChangeGenerations> {
     let result = bridge.call(
         "getEditorServiceChangeGenerations",
-        json!({ "services": services, "rootNames": root_names }),
+        json!({ "services": services, "rootNames": root_names, "rootIds": root_ids }),
     )?;
     let values = result
         .get("generations")
@@ -1541,6 +1546,7 @@ fn capture_editor_package_preflight_live<'a>(
     required_reference_services: Option<&HashSet<String>>,
     force_full_snapshot: bool,
     root_names: Option<&HashMap<String, HashSet<String>>>,
+    root_ids: Option<&AdditiveRootIds>,
 ) -> Result<EditorPackagePreflightLive<'a>> {
     capture_editor_package_preflight_live_attempt(
         bridge,
@@ -1548,6 +1554,7 @@ fn capture_editor_package_preflight_live<'a>(
         required_reference_services,
         force_full_snapshot,
         root_names,
+        root_ids,
         0,
     )
 }
@@ -1558,10 +1565,11 @@ fn capture_editor_package_preflight_live_attempt<'a>(
     required_reference_services: Option<&HashSet<String>>,
     force_full_snapshot: bool,
     root_names: Option<&HashMap<String, HashSet<String>>>,
+    root_ids: Option<&AdditiveRootIds>,
     attempt: u8,
 ) -> Result<EditorPackagePreflightLive<'a>> {
     let started = Instant::now();
-    let first = editor_service_change_generations(bridge, service_names, root_names)?;
+    let first = editor_service_change_generations(bridge, service_names, root_names, root_ids)?;
     log_timing("package preflight generation read", started);
     if first
         .has_package_links
@@ -1569,7 +1577,7 @@ fn capture_editor_package_preflight_live_attempt<'a>(
         .is_some_and(|states| !states.values().any(|has_package_link| *has_package_link))
     {
         let generations =
-            editor_service_change_generations(bridge, service_names, None)?.generations;
+            editor_service_change_generations(bridge, service_names, None, None)?.generations;
         if generations != first.generations {
             bail!("Studio changed while Renium checked package state; retry the sync");
         }
@@ -1653,6 +1661,7 @@ fn capture_editor_package_preflight_live_attempt<'a>(
                 required_reference_services,
                 force_full_snapshot,
                 root_names,
+                root_ids,
                 attempt + 1,
             );
         }
@@ -1978,7 +1987,7 @@ fn plan_editor_package_root_retention(
         guard.finish(false)?;
     }
     let services = live_generations.keys().cloned().collect::<Vec<_>>();
-    let generations = editor_service_change_generations(bridge, &services, None)?.generations;
+    let generations = editor_service_change_generations(bridge, &services, None, None)?.generations;
     if generations != live_generations {
         bail!("Studio changed while Renium captured the package snapshot; retry the sync");
     }
@@ -2347,14 +2356,40 @@ pub(crate) fn build_editor_binary_import(
             Some((service, &write.document))
         }))
         .collect::<HashMap<_, _>>();
+    let root_ids = additive_root_ids(changes, &additive_roots);
     build_editor_binary_import_for_services(
         args,
         services,
         Some(&document_overrides),
         &additive_roots,
+        &root_ids,
         bridge,
         allow_service_replacement,
     )
+}
+
+fn additive_root_ids(
+    changes: &EditorChangeSet,
+    roots: &HashMap<String, HashSet<String>>,
+) -> AdditiveRootIds {
+    let mut ids = AdditiveRootIds::new();
+    for change in &changes.instance_changes {
+        let Some(names) = roots.get(&change.service) else {
+            continue;
+        };
+        for instance in &change.instances {
+            if let [_, name] = instance.path_segments.as_slice()
+                && names.contains(name)
+            {
+                ids.entry(change.service.clone())
+                    .or_default()
+                    .entry(name.clone())
+                    .or_default()
+                    .push(instance.settings_id.clone());
+            }
+        }
+    }
+    ids
 }
 
 fn additive_native_roots(
@@ -2708,6 +2743,7 @@ fn build_editor_binary_import_for_services(
     services: HashSet<String>,
     document_overrides: Option<&HashMap<String, &SettingsBytecode>>,
     additive_roots: &HashMap<String, HashSet<String>>,
+    additive_root_ids: &AdditiveRootIds,
     bridge: &BridgeServer,
     allow_service_replacement: bool,
 ) -> Result<Option<EditorBinaryImport>> {
@@ -2828,6 +2864,7 @@ fn build_editor_binary_import_for_services(
                 None,
                 false,
                 Some(additive_roots),
+                Some(additive_root_ids),
             )
         },
     );
@@ -2895,6 +2932,7 @@ fn build_editor_binary_import_for_services(
             &ordered_services,
             desired_reference_services.as_ref(),
             force_full_snapshot,
+            None,
             None,
         )?;
     }
