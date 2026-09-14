@@ -352,6 +352,13 @@ pub(super) enum Commands {
     #[command(name = "pl", alias = "pull", about = "Pull Studio into project files")]
     Pull(PullArgs),
     #[command(
+        name = "pi",
+        alias = "place-import",
+        alias = "import-place",
+        about = "Import a saved place file into the project without Studio"
+    )]
+    ImportPlace(ImportPlaceArgs),
+    #[command(
         name = "bd",
         alias = "bridge-daemon",
         about = "Run the bridge daemon",
@@ -1808,6 +1815,36 @@ pub(super) struct StudioChangeStateArgs {
         value_name = "studio|editor"
     )]
     pub(super) prefer: Option<String>,
+}
+
+#[derive(Parser)]
+pub(super) struct ImportPlaceArgs {
+    #[arg(help = "Place file to import (.rbxl or .rbxlx)", value_name = "PLACE")]
+    pub(super) input: PathBuf,
+    #[arg(
+        help = "Project root directory",
+        short = 'r',
+        long,
+        alias = "root",
+        value_name = "PATH",
+        default_value = "."
+    )]
+    pub(super) project_root: PathBuf,
+    #[arg(
+        help = "Script source directory",
+        long,
+        alias = "src",
+        value_name = "PATH",
+        default_value = "src"
+    )]
+    pub(super) src_dir: PathBuf,
+    #[arg(
+        help = "Services to import (comma-separated)",
+        short,
+        long,
+        default_value = ""
+    )]
+    pub(super) services: String,
 }
 
 #[derive(Parser)]

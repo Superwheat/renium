@@ -557,7 +557,7 @@ pub(crate) fn import_path_command(
         let destination = args
             .destination
             .as_deref()
-            .context("ip imports a script file with --path-json or a directory with --destination; open places with so and import models with mip")?;
+            .context("ip imports a script file with --path-json or a directory with --destination; import places with pi and models with mip")?;
         config::validate_relative_portable_path(destination, "destination")?;
         (root.join(destination), configured_src_dir)
     };
