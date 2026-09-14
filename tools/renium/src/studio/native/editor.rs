@@ -4316,9 +4316,28 @@ pub(crate) fn send_editor_change_batches(
     );
     if mesh_writes && !property_changes.is_empty() {
         let started = Instant::now();
+        // The root writes above are already finished; a second pass must not
+        // register new ones, so only the ordinary setters are applied again.
+        let ordinary_rows = property_changes
+            .iter()
+            .filter_map(|row| {
+                let mut row = row.clone();
+                row.properties.retain(|name, _| {
+                    !crate::editor::native_roots::is_property(&row.class_name, name)
+                });
+                row.reset_properties.retain(|name| {
+                    !crate::editor::native_roots::is_property(&row.class_name, name)
+                });
+                (!row.properties.is_empty()
+                    || !row.reset_properties.is_empty()
+                    || !row.attributes.is_empty()
+                    || !row.deleted_attributes.is_empty())
+                .then_some(row)
+            })
+            .collect::<Vec<_>>();
         send_property_batches(
             bridge,
-            &property_changes,
+            &ordinary_rows,
             probe_events,
             transaction_id,
             &mut summary,
