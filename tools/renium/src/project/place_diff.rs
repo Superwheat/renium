@@ -439,7 +439,8 @@ pub(super) fn compare(
             started.elapsed().as_secs_f64() * 1000.0
         ),
     );
-    let result = json!({"ok":true,"scope":"full","direction":"input -> target","services":services,"matches":added+removed+changed == 0,"beforeInstances":before.instances.len(),"afterInstances":after.instances.len(),"added":added,"removed":removed,"changed":changed,"unchanged":unchanged,"differenceCount":added+removed+changed,"truncated":added+removed+changed > differences.len(),"differences":differences});
+    let mut result = json!({"ok":true,"scope":"full","direction":"input -> target","services":services,"matches":added+removed+changed == 0,"beforeInstances":before.instances.len(),"afterInstances":after.instances.len(),"added":added,"removed":removed,"changed":changed,"unchanged":unchanged,"differenceCount":added+removed+changed,"truncated":added+removed+changed > differences.len(),"differences":differences});
+    crate::app::output::drop_false(&mut result, &["truncated"]);
     drop(before_ids);
     let started = Instant::now();
     before

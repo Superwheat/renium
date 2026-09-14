@@ -3951,6 +3951,12 @@ fn append_aligned_settings_push_plan(
                             .keys()
                             .filter(|name| {
                                 name.as_str() != "ScriptGuid"
+                                    && instance.parent_index.is_some()
+                                    && crate::rbx::decode::property_has_serialized_form(
+                                        database,
+                                        &instance.class_name,
+                                        name,
+                                    )
                                     && !reconciliation_property_is_derived(name)
                                     // Resets obey the same capability rules as writes.
                                     // Engine-derived fields (for example cooked mesh

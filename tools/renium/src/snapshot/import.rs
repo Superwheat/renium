@@ -1845,8 +1845,6 @@ fn write_script_source_file(source_path: &Path, source: &str, fresh_stage: bool)
 #[cfg(test)]
 mod projection_tests {
     use super::*;
-    use crate::project::config;
-    use std::time::Duration;
 
     #[test]
     fn memory_projection_matches_fresh_import_bytes_and_paths() -> Result<()> {
