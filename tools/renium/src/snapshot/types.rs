@@ -66,8 +66,6 @@ pub(crate) struct ServiceState {
     pub(crate) native_properties_by_instance: Option<Vec<Vec<NativeSettingsProperty>>>,
     pub(crate) children_by_index: Vec<Vec<usize>>,
     pub(crate) source_in_subtree: Vec<bool>,
-    pub(crate) script_count_in_subtree: Vec<usize>,
-    pub(crate) subtree_sizes: Vec<usize>,
     pub(crate) service_root_index: usize,
     pub(crate) class_defaults_by_class: HashMap<String, Map<String, Value>>,
     pub(crate) properties_default_elided: bool,
