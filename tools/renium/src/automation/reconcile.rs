@@ -297,7 +297,7 @@ pub(crate) struct VerifiedFullPush {
     proof: Value,
     created: Instant,
     #[cfg(windows)]
-    _attributes: crate::studio::native::serializer::AttributeGuard,
+    _attributes: Option<crate::studio::native::serializer::AttributeGuard>,
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -440,13 +440,15 @@ fn retain_verified_full_push(
         return;
     };
     #[cfg(windows)]
-    let Some(attributes) = attributes.take() else {
+    let attributes = attributes.take();
+    #[cfg(windows)]
+    if attributes.is_none() && !release.retained_proof_local {
         log_global(
             5,
             format_args!("[renium] full push proof not retained: no native attribute guard"),
         );
         return;
-    };
+    }
     let cached = VerifiedFullPush {
         connections: bridge.runtime_connection_signature(&release.runtime_id),
         input: input.clone(),
@@ -2192,6 +2194,7 @@ struct StudioTrackingGuardRelease<'a> {
     guard_id: Option<String>,
     proof: Option<Value>,
     retained_proof: Option<Value>,
+    retained_proof_local: bool,
 }
 
 impl StudioTrackingGuardRelease<'_> {
@@ -2247,6 +2250,7 @@ fn acknowledge_verified_push(
         .get("retainedPushProof")
         .filter(|value| !value.is_null())
         .cloned();
+    tracking_release.retained_proof_local = result["retainedPushProofLocal"] == true;
     Ok(())
 }
 
@@ -2286,7 +2290,7 @@ fn current_studio_change_guard_verifying(
             "includeGenerations": true,
             "nativeAttributeRelay": cfg!(windows) && native_attribute_services.is_some(),
             "deferNativeTracking": cfg!(windows) && native_attribute_services.is_some(),
-            "captureLocalPushProof": cfg!(target_os = "macos") && native_attribute_services.is_some(),
+            "captureLocalPushProof": native_attribute_services.is_some(),
             "services": native_attribute_services,
             "verifyPushProof": verify_push_proof,
         }),
@@ -2300,6 +2304,7 @@ fn current_studio_change_guard_verifying(
         guard_id: Some(guard_id.clone()),
         proof: None,
         retained_proof: None,
+        retained_proof_local: false,
     };
     ensure_plugin_api_ok(&state)?;
     let tracking_started = state["trackingStarted"].as_bool() != Some(false);
@@ -2608,7 +2613,7 @@ fn push_project(
         Some(candidate) => {
             let VerifiedFullPushCandidate { cached, .. } = candidate;
             #[cfg(windows)]
-            let previous = Some(cached._attributes);
+            let previous = cached._attributes;
             #[cfg(not(windows))]
             let previous = ();
             (Some((cached.proof.clone(), cached.project)), previous)
@@ -2706,6 +2711,7 @@ fn push_project(
         guard_id: guard.tracking_guard_id.clone(),
         proof: None,
         retained_proof: None,
+        retained_proof_local: false,
     };
     let src_dir = push_args.project.src_root.clone();
     let root = push_args.project.project_root.clone();
