@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use ahash::{AHashMap, AHashSet};
@@ -28,6 +28,7 @@ use crate::rbx::model::{BytecodeModelExportRefs, BytecodeModelImportRefs};
 use crate::snapshot::refs::{
     remap_and_stabilize_record_references, remap_record_reference_ids, stabilize_record_references,
 };
+use crate::system::LockRecover;
 
 pub(crate) enum SettingsAlignment {
     Equivalent,
@@ -78,8 +79,7 @@ fn settings_alignment_cache_key(
 fn settings_alignment_is_cached(key: SettingsAlignmentCacheKey) -> bool {
     SETTINGS_ALIGNMENT_CACHE
         .get_or_init(|| Mutex::new(SettingsAlignmentCache::default()))
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
+        .lock_recover()
         .entries
         .contains(&key)
 }
@@ -87,8 +87,7 @@ fn settings_alignment_is_cached(key: SettingsAlignmentCacheKey) -> bool {
 fn cache_settings_alignment(key: SettingsAlignmentCacheKey) {
     let mut cache = SETTINGS_ALIGNMENT_CACHE
         .get_or_init(|| Mutex::new(SettingsAlignmentCache::default()))
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
+        .lock_recover();
     if !cache.entries.insert(key) {
         return;
     }

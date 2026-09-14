@@ -146,10 +146,7 @@ fn decode_compact_v5_ref(raw: Value, strings: &[String]) -> Result<Value> {
                 .with_context(|| "Compact-v5 internal ref must be a non-negative integer")?
                 as usize;
             let mut out = compact_v5_typed_object("Ref", 1);
-            out.insert(
-                "instanceIndex".to_string(),
-                Value::Number(serde_json::Number::from(instance_index as u64)),
-            );
+            out.insert("instanceIndex".to_string(), json!(instance_index as u64));
             Ok(Value::Object(out))
         }
         Value::Array(fields) => {

@@ -345,10 +345,8 @@ fn property_schema_map_to_value(by_class: &PropertySchemaMap) -> Value {
                 property_entries
                     .iter()
                     .map(|entry| {
-                        let mut fields = vec![
-                            Value::String(entry.name.clone()),
-                            Value::Number(serde_json::Number::from(entry.type_id)),
-                        ];
+                        let mut fields =
+                            vec![Value::String(entry.name.clone()), json!(entry.type_id)];
                         if let Some(enum_type) = &entry.enum_type {
                             fields.push(Value::String(enum_type.clone()));
                         }

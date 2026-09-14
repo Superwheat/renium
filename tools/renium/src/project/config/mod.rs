@@ -31,6 +31,7 @@ mod projection_references;
 mod syncback;
 mod validation;
 
+use crate::system::LockRecover;
 use adapter_format::{AdapterFormat, adapter_format, adapter_output_path};
 pub(crate) use jsonc::parse_jsonc_value;
 use jsonc::{format_jsonc, has_jsonc_comments};
@@ -2305,8 +2306,7 @@ pub fn cache_script_naming(root: &Path, project: &ReniumProject) {
     let naming = project_script_naming(project);
     SCRIPT_NAMING_CACHE
         .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .lock_recover()
         .insert(absolute_path(root), naming);
 }
 
@@ -2315,8 +2315,7 @@ pub(crate) fn remove_cached_script_naming(root: &Path) {
     if let Some(cache) = SCRIPT_NAMING_CACHE.get() {
         let root = absolute_path(root);
         cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_recover()
             .retain(|path, _| !path.starts_with(&root));
     }
 }
@@ -2325,9 +2324,7 @@ fn relocate_cached_script_naming(source: &Path, destination: &Path) {
     let source = absolute_path(source);
     let destination = absolute_path(destination);
     let cache = SCRIPT_NAMING_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut cache = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut cache = cache.lock_recover();
     let moved = cache
         .iter()
         .filter_map(|(path, naming)| {
@@ -2349,9 +2346,7 @@ pub fn cached_script_naming(root: &Path) -> ProjectScriptNaming {
     SCRIPT_NAMING_CACHE
         .get()
         .and_then(|cache| {
-            let cache = cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let cache = cache.lock_recover();
             root.ancestors().find_map(|path| cache.get(path).cloned())
         })
         .unwrap_or_default()
@@ -3462,11 +3457,7 @@ fn instance_target_overlaps(left: &ProjectTarget, right: &ProjectTarget) -> bool
 
 fn compile_glob(pattern: &str) -> Result<GlobMatcher> {
     let cache = GLOB_MATCHER_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let existing = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(pattern)
-        .cloned();
+    let existing = cache.lock_recover().get(pattern).cloned();
     if let Some(matcher) = existing {
         return Ok(matcher);
     }
@@ -3474,8 +3465,7 @@ fn compile_glob(pattern: &str) -> Result<GlobMatcher> {
         .with_context(|| format!("Invalid glob '{pattern}'"))?
         .compile_matcher();
     cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .lock_recover()
         .insert(pattern.to_string(), matcher.clone());
     Ok(matcher)
 }

@@ -358,7 +358,7 @@ fn normalize_editor_ref_value(
                 Value::Array(
                     path.path_ordinals
                         .iter()
-                        .map(|ordinal| Value::Number(serde_json::Number::from(*ordinal as u64)))
+                        .map(|ordinal| json!(*ordinal as u64))
                         .collect(),
                 ),
             );

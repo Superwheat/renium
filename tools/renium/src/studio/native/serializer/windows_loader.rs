@@ -1,6 +1,7 @@
 //! Native binary-loader discovery. Only bounded executable-file code is scanned;
 //! the boolean-to-flags adapter and its argument flow must agree with the known ABI.
 use super::*;
+use crate::system::LockRecover;
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Mnemonic, OpKind, Register};
 
 #[path = "windows_loader_factory.rs"]
@@ -77,8 +78,7 @@ fn prepared(path: &Path) -> Result<PreparedLoader> {
     let modified = metadata.modified().ok();
     let cache = LOADERS.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(cached) = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .lock_recover()
         .get(path)
         .filter(|entry| entry.len == metadata.len() && entry.modified == modified)
     {
@@ -128,17 +128,14 @@ fn prepared(path: &Path) -> Result<PreparedLoader> {
             })
         })
         .map_err(|error| format!("{error:#}"));
-    cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            path.to_owned(),
-            CachedLoader {
-                len: metadata.len(),
-                modified,
-                result: result.clone(),
-            },
-        );
+    cache.lock_recover().insert(
+        path.to_owned(),
+        CachedLoader {
+            len: metadata.len(),
+            modified,
+            result: result.clone(),
+        },
+    );
     result.map_err(anyhow::Error::msg)
 }
 

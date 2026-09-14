@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use std::collections::HashSet;
 
-use serde_json::{Map, Number, Value};
+use serde_json::{Map, Value, json};
 
 use crate::settings::bytecode::{
     SETTINGS_REFERENCE_SELECTOR_KEYS, SettingsBytecode, SettingsBytecodeInstance,
@@ -270,10 +270,7 @@ fn remap_ref_object_index(object: &mut Map<String, Value>, old_to_new: &[Option<
         if old_index == new_index {
             return;
         }
-        object.insert(
-            "instanceIndex".to_string(),
-            Value::Number(Number::from((new_index + 1) as u64)),
-        );
+        object.insert("instanceIndex".to_string(), json!((new_index + 1) as u64));
         return;
     }
     for selector in SETTINGS_REFERENCE_SELECTOR_KEYS {

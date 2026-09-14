@@ -1,6 +1,7 @@
 //! Disable Studio's package-modification popup for the connected process lifetime.
 //! The engine still marks packages Changed; links and package contents are untouched.
 use super::*;
+use crate::system::LockRecover;
 
 const FLAG: &[u8] = b"RemovePackageModificationPopupDialog\0";
 
@@ -88,8 +89,7 @@ fn layout(path: &Path) -> Result<Layout> {
     let modified = metadata.modified().ok();
     let cache = LAYOUTS.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(cached) = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .lock_recover()
         .get(path)
         .filter(|cached| cached.len == metadata.len() && cached.modified == modified)
     {
@@ -97,17 +97,14 @@ fn layout(path: &Path) -> Result<Layout> {
     }
     let bytes = fs::read(path)?;
     let layout = discover(&PeImage::parse(&bytes)?)?;
-    cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            path.to_owned(),
-            CachedNoticeLayout {
-                len: metadata.len(),
-                modified,
-                layout: layout.clone(),
-            },
-        );
+    cache.lock_recover().insert(
+        path.to_owned(),
+        CachedNoticeLayout {
+            len: metadata.len(),
+            modified,
+            layout: layout.clone(),
+        },
+    );
     Ok(layout)
 }
 

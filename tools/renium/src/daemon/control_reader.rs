@@ -7,6 +7,7 @@ use anyhow::Result;
 
 use super::transport::{BoundedLineRead, MAX_DAEMON_LINE_BYTES, read_bounded_line};
 use crate::studio::bridge::BridgeRequestLease;
+use crate::system::LockRecover;
 use crate::system::net::SharedTcpStream;
 
 struct WakeableReader {
@@ -27,12 +28,7 @@ impl Read for WakeableReader {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error)
                     if error.kind() == io::ErrorKind::TimedOut
-                        && self
-                            .state
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .active
-                            .is_some() =>
+                        && self.state.lock_recover().active.is_some() =>
                 {
                     continue;
                 }
@@ -126,9 +122,7 @@ impl ControlReader {
             .spawn(move || {
                 let _disconnect = crate::system::files::OnDrop::new(|| {
                     let active = {
-                        let mut state = reader_state
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let mut state = reader_state.lock_recover();
                         state.closed = true;
                         state.active.take()
                     };
@@ -174,10 +168,7 @@ impl ControlReader {
     }
 
     pub(super) fn activate(&self, lease: Arc<BridgeRequestLease>) -> bool {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.state.lock_recover();
         if state.closed {
             return false;
         }
@@ -186,13 +177,7 @@ impl ControlReader {
     }
 
     pub(super) fn finish(&self) {
-        if let Some(lease) = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .active
-            .take()
-        {
+        if let Some(lease) = self.state.lock_recover().active.take() {
             lease.finish();
         }
     }

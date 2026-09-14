@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use crate::system::LockRecover;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -274,21 +275,15 @@ impl Default for State {
 
 impl State {
     pub fn set_available_update(&self, version: Option<String>) {
-        *self
-            .available_update
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = version;
+        *self.available_update.lock_recover() = version;
     }
 
     pub fn available_update(&self) -> Option<String> {
-        self.available_update
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        self.available_update.lock_recover().clone()
     }
 
     pub fn insert_context(&self, mut context: BoundContext) -> BoundContext {
-        let mut contexts = self.contexts.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut contexts = self.contexts.lock_recover();
         if let Some((id, existing)) = contexts
             .iter_mut()
             .find(|(_, existing)| existing.same_project_binding(&context))
@@ -323,21 +318,12 @@ impl State {
     }
 
     pub fn context(&self, id: u64) -> Option<BoundContext> {
-        self.contexts
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&id)
-            .cloned()
+        self.contexts.lock_recover().get(&id).cloned()
     }
 
     #[cfg(any(windows, target_os = "macos"))]
     pub fn clear_context_runtime(&self, id: u64) {
-        if let Some(context) = self
-            .contexts
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get_mut(&id)
-        {
+        if let Some(context) = self.contexts.lock_recover().get_mut(&id) {
             context.runtime_id = None;
             context.plugin_build = None;
         }
@@ -349,7 +335,7 @@ impl State {
         runtime_id: String,
         plugin_build: Option<i64>,
     ) -> Option<BoundContext> {
-        let mut contexts = self.contexts.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut contexts = self.contexts.lock_recover();
         let context = contexts.get_mut(&id)?;
         context.runtime_id = Some(runtime_id);
         context.plugin_build = plugin_build;
@@ -359,15 +345,13 @@ impl State {
     #[cfg(any(windows, target_os = "macos"))]
     pub fn remember_studio_target(&self, context: &BoundContext, target: StudioReopenTarget) {
         self.studio_reopen_targets
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+            .lock_recover()
             .insert(context.project.clone(), target);
     }
 
     pub fn studio_target(&self, context: &BoundContext) -> Option<StudioReopenTarget> {
         self.studio_reopen_targets
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+            .lock_recover()
             .get(&context.project)
             .cloned()
     }
@@ -377,10 +361,7 @@ impl State {
         context: &BoundContext,
         target: &StudioReopenTarget,
     ) -> Option<Value> {
-        let mut launches = self
-            .studio_launches
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut launches = self.studio_launches.lock_recover();
         launches.retain(|_, launch| {
             launch.started.elapsed() < STUDIO_LAUNCH_TTL
                 && launch
@@ -401,10 +382,7 @@ impl State {
     }
 
     pub fn studio_launch_in_progress(&self, context: &BoundContext) -> bool {
-        let mut launches = self
-            .studio_launches
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut launches = self.studio_launches.lock_recover();
         launches.retain(|_, launch| {
             launch.started.elapsed() < STUDIO_LAUNCH_TTL
                 && launch
@@ -423,34 +401,23 @@ impl State {
         target: StudioReopenTarget,
         result: Value,
     ) {
-        self.studio_launches
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(
-                context.project.clone(),
-                StudioLaunch {
-                    target,
-                    started: Instant::now(),
-                    result,
-                },
-            );
+        self.studio_launches.lock_recover().insert(
+            context.project.clone(),
+            StudioLaunch {
+                target,
+                started: Instant::now(),
+                result,
+            },
+        );
     }
 
     #[cfg(any(windows, target_os = "macos"))]
     pub fn clear_studio_launch(&self, context: &BoundContext) {
-        self.studio_launches
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&context.project);
+        self.studio_launches.lock_recover().remove(&context.project);
     }
 
     pub fn remove_context(&self, id: u64) -> bool {
-        let removed = self
-            .contexts
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&id)
-            .is_some();
+        let removed = self.contexts.lock_recover().remove(&id).is_some();
         if removed {
             self.live_sync.cancel(id);
         }
@@ -475,36 +442,27 @@ impl State {
             parameters,
             created: Instant::now(),
         };
-        let mut reviews = self.reviews.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut reviews = self.reviews.lock_recover();
         reviews.retain(|_, review| review.created.elapsed() <= REVIEW_TTL);
         reviews.insert(id.clone(), review);
         id
     }
 
     pub fn take_review(&self, id: &str) -> Option<Review> {
-        let review = self
-            .reviews
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(id)?;
+        let review = self.reviews.lock_recover().remove(id)?;
         (review.created.elapsed() <= REVIEW_TTL).then_some(review)
     }
 
     pub fn review_operation(&self, id: &str) -> Option<u16> {
         self.reviews
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+            .lock_recover()
             .get(id)
             .filter(|review| review.created.elapsed() <= REVIEW_TTL)
             .map(|review| review.operation)
     }
 
     pub fn reject_review(&self, id: &str) -> bool {
-        self.reviews
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(id)
-            .is_some()
+        self.reviews.lock_recover().remove(id).is_some()
     }
 }
 

@@ -1,5 +1,6 @@
 //! Export-scoped attribute observation. One engine subscription, no Instance walk.
 use super::*;
+use crate::system::LockRecover;
 use std::io::{self, Seek, SeekFrom};
 use std::os::windows::io::AsRawHandle;
 use std::sync::Arc;
@@ -93,8 +94,7 @@ fn prepared(
     let modified = metadata.modified().ok();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(cached) = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .lock_recover()
         .get(&studio.path)
         .filter(|entry| entry.len == metadata.len() && entry.modified == modified)
     {
@@ -158,17 +158,14 @@ fn prepared(
         })
     })()
     .map_err(|error: anyhow::Error| format!("{error:#}"));
-    cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            studio.path.clone(),
-            Cached {
-                len: metadata.len(),
-                modified,
-                result: result.clone(),
-            },
-        );
+    cache.lock_recover().insert(
+        studio.path.clone(),
+        Cached {
+            len: metadata.len(),
+            modified,
+            result: result.clone(),
+        },
+    );
     result.map_err(anyhow::Error::msg)
 }
 pub(super) fn prepare(

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::hint::black_box;
 use std::io::Read;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -19,6 +19,7 @@ mod unsupported;
 #[cfg(windows)]
 mod windows;
 
+use crate::system::LockRecover;
 #[cfg(target_os = "macos")]
 use macos as platform;
 #[cfg(not(any(windows, target_os = "macos")))]
@@ -314,7 +315,7 @@ impl Manager {
                     .map(|identity| (pid, identity))
             })
             .collect::<Result<Vec<_>>>()?;
-        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut inner = self.inner.lock_recover();
         self.ensure_loaded(&inner)?;
         self.prune_exited(&mut inner.state)?;
         match action {
@@ -364,7 +365,7 @@ impl Manager {
                     .map(|identity| (pid, identity))
             })
             .collect::<Result<Vec<_>>>()?;
-        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut inner = self.inner.lock_recover();
         self.ensure_loaded(&inner)?;
         self.prune_exited(&mut inner.state)?;
         if matches!(inner.state.desired, DesiredProfile::Off) {
@@ -431,7 +432,7 @@ impl Manager {
     }
 
     fn reconcile_startup(&self) -> Result<()> {
-        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut inner = self.inner.lock_recover();
         if inner.load_error.is_some() || self.path.is_none() {
             return Ok(());
         }

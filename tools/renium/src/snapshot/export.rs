@@ -42,6 +42,7 @@ use crate::studio::bridge::{
     MAX_BRIDGE_CHUNK_BYTES, MAX_BRIDGE_REASSEMBLY_BYTES,
 };
 use crate::studio::native::editor::{EditorBinaryExportFinishGuard, editor_binary_export_parts};
+use crate::system::LockRecover;
 use crate::system::files::{
     OnDrop, create_unique_directory, fnv1a, is_service_settings_file_name,
     resolve_existing_project_root, sanitize_name, sha256_hex, write_bytes_if_changed,
@@ -1213,7 +1214,6 @@ pub(crate) fn pull_from_studio(mut args: PullArgs) -> Result<()> {
         "bridgeWaitSeconds": args.bridge.wait_seconds,
         "bridgePorts": args.bridge.ports,
         "exportAllProperties": args.export_all_properties,
-        "noExportAllProperties": args.no_export_all_properties,
     });
     let result = daemon_control_request(op::PULL, Some(&args.project_root), parameters, false)?;
     print_json_output(&result, false)
@@ -1276,10 +1276,7 @@ pub(crate) fn capture_exported_services<T: Send>(
                     let service = output.span.service;
                     let result = exported_parts_to_service_state(&service, output.parts)
                         .and_then(|state| project_service(&service, state));
-                    outputs
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .push(result);
+                    outputs.lock_recover().push(result);
                 });
                 Ok(())
             },
@@ -1325,7 +1322,7 @@ fn prepare_export_bridge(
     project_root: &Path,
     total_started: Instant,
 ) -> Result<ExportBridgeSetup> {
-    let export_all_properties = args.export_all_properties && !args.no_export_all_properties;
+    let export_all_properties = args.export_all_properties;
     if export_all_properties {
         println!("[renium] full property export requested; default-value elision disabled");
     }
@@ -1958,9 +1955,7 @@ fn bridge_text_payload_cache() -> &'static Mutex<BridgeTextPayloadCache> {
 }
 
 fn bridge_text_payload_known(slot: &str) -> Option<(String, Arc<str>)> {
-    let cache = bridge_text_payload_cache()
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
+    let cache = bridge_text_payload_cache().lock_recover();
     let hash = cache.last_hash_by_slot.get(slot)?;
     cache.entries.iter().find_map(|(entry_hash, text)| {
         (entry_hash == hash).then(|| (hash.clone(), Arc::clone(text)))
@@ -1971,9 +1966,7 @@ fn bridge_text_payload_insert(slot: &str, hash: String, text: &str) {
     if text.len() > BRIDGE_TEXT_CACHE_MAX_BYTES {
         return;
     }
-    let mut cache = bridge_text_payload_cache()
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
+    let mut cache = bridge_text_payload_cache().lock_recover();
     cache
         .last_hash_by_slot
         .insert(slot.to_string(), hash.clone());

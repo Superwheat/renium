@@ -1,6 +1,7 @@
 //! Protected reflection calls. Discovery and authorization stay in Rust; the
 //! helper only owns C++ objects and calls engine methods on the DataModel queue.
 use super::*;
+use crate::system::LockRecover;
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
 use iced_x86::{InstructionInfoFactory, OpAccess};
 use std::io::{Read, Seek, SeekFrom};
@@ -361,12 +362,7 @@ fn cached_abi(
     studio: &ModuleEntry,
     descriptor: usize,
 ) -> Option<AbiCacheEntry> {
-    let entry = cache
-        .get()?
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(key)?
-        .clone();
+    let entry = cache.get()?.lock_recover().get(key)?.clone();
     let object = match entry.descriptor_binding_offset {
         Some(offset) => memory.read_u64(descriptor + offset).ok()? as usize,
         None => descriptor,
@@ -378,11 +374,7 @@ fn cached_abi(
     }) {
         Some(entry)
     } else {
-        cache
-            .get()?
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(key);
+        cache.get()?.lock_recover().remove(key);
         None
     }
 }
@@ -631,8 +623,7 @@ fn reflection_functions(
     );
     TEXT_ABIS
         .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .lock_recover()
         .insert(key, entry);
     Ok(functions)
 }
@@ -1113,8 +1104,7 @@ pub(super) fn identity_binding(
     let getter = studio.base + function.1;
     IDENTITY_ABIS
         .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .lock_recover()
         .insert(
             key,
             AbiCacheEntry {

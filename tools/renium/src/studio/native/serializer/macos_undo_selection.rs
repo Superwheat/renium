@@ -4,6 +4,7 @@
 //! of them. The helper turns the two Selection::set branches inside that
 //! restore routine into no-ops for the connected process lifetime.
 use super::*;
+use crate::system::LockRecover;
 
 const KEEP_SELECTION_REQUEST: u32 = 6;
 const RESET_WAYPOINTS_NAME: &[u8] = b"\0ResetWaypoints\0";
@@ -190,8 +191,7 @@ fn cached_sites(path: &Path) -> Result<(Vec<(u64, u32)>, [u8; 16])> {
     let modified = metadata.modified().ok();
     let cache = SITES.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(cached) = cache
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
+        .lock_recover()
         .get(path)
         .filter(|cached| cached.len == metadata.len() && cached.modified == modified)
     {
@@ -200,18 +200,15 @@ fn cached_sites(path: &Path) -> Result<(Vec<(u64, u32)>, [u8; 16])> {
     let bytes = fs::read(path).with_context(|| format!("Could not read {}", path.display()))?;
     let image = MachImage::parse(&bytes)?;
     let sites = undo_selection_sites(&image)?;
-    cache
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .insert(
-            path.to_path_buf(),
-            CachedSites {
-                len: metadata.len(),
-                modified,
-                sites: sites.clone(),
-                image_uuid: image.image_uuid,
-            },
-        );
+    cache.lock_recover().insert(
+        path.to_path_buf(),
+        CachedSites {
+            len: metadata.len(),
+            modified,
+            sites: sites.clone(),
+            image_uuid: image.image_uuid,
+        },
+    );
     Ok((sites, image.image_uuid))
 }
 
