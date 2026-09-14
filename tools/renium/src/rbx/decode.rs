@@ -897,7 +897,9 @@ pub(crate) fn rbx_properties_to_native_settings_records<'a>(
 
     for (property_name, variant) in property_entries {
         let property_name = property_name.as_str();
-        if let RbxVariant::Attributes(rbx_attributes) = variant {
+        if let RbxVariant::Attributes(rbx_attributes) = variant
+            && property_name == "Attributes"
+        {
             attributes.extend(rbx_attributes_to_settings_map(
                 rbx_attributes,
                 database,
@@ -970,7 +972,9 @@ pub(crate) fn rbx_properties_to_settings_records<'a>(
 
     for (property_name, variant) in property_entries {
         let property_name = property_name.as_str();
-        if let RbxVariant::Attributes(rbx_attributes) = variant {
+        if let RbxVariant::Attributes(rbx_attributes) = variant
+            && property_name == "Attributes"
+        {
             attributes.extend(rbx_attributes_to_settings_map(
                 rbx_attributes,
                 database,
@@ -1070,9 +1074,10 @@ fn rbx_attributes_to_settings_map(
     let mut out = Map::new();
     for (name, value) in attributes {
         let value = match value {
-            RbxVariant::BinaryString(value) => Some(Value::String(
-                String::from_utf8_lossy(value.as_ref()).into_owned(),
-            )),
+            RbxVariant::BinaryString(value) => Some(match std::str::from_utf8(value.as_ref()) {
+                Ok(text) => Value::String(text.to_string()),
+                Err(_) => binary_payload_json("BinaryString", value.as_ref()),
+            }),
             RbxVariant::EnumItem(value) => {
                 let mut encoded = rbx_enum_to_settings_json(Some(&value.ty), value.value, database);
                 if let Some(enum_type) = encoded
@@ -1155,19 +1160,19 @@ fn rbx_variant_to_settings_json_inner(
             value.iter().map(|tag| Value::String(tag.to_string())).collect(),
         )),
         RbxVariant::Ref(value) => Some(rbx_ref_to_settings_json(*value, refs)),
-        RbxVariant::Vector2(value) => Some(json!({"_type":"Vector2","x":value.x,"y":value.y})),
-        RbxVariant::Vector3(value) => Some(json!({"_type":"Vector3","x":value.x,"y":value.y,"z":value.z})),
+        RbxVariant::Vector2(value) => Some(json!({"_type":"Vector2","x":fnum(value.x),"y":fnum(value.y)})),
+        RbxVariant::Vector3(value) => Some(json!({"_type":"Vector3","x":fnum(value.x),"y":fnum(value.y),"z":fnum(value.z)})),
         RbxVariant::Vector2int16(value) => Some(json!({"_type":"Vector2int16","x":value.x,"y":value.y})),
         RbxVariant::Vector3int16(value) => Some(json!({"_type":"Vector3int16","x":value.x,"y":value.y,"z":value.z})),
-        RbxVariant::UDim(value) => Some(json!({"_type":"UDim","scale":value.scale,"offset":value.offset})),
+        RbxVariant::UDim(value) => Some(json!({"_type":"UDim","scale":fnum(value.scale),"offset":value.offset})),
         RbxVariant::UDim2(value) => Some(json!({
             "_type":"UDim2",
-            "xScale": value.x.scale,
+            "xScale": fnum(value.x.scale),
             "xOffset": value.x.offset,
-            "yScale": value.y.scale,
+            "yScale": fnum(value.y.scale),
             "yOffset": value.y.offset,
         })),
-        RbxVariant::Color3(value) => Some(json!({"_type":"Color3","r":value.r,"g":value.g,"b":value.b})),
+        RbxVariant::Color3(value) => Some(json!({"_type":"Color3","r":fnum(value.r),"g":fnum(value.g),"b":fnum(value.b)})),
         RbxVariant::Color3uint8(value) => {
             let color = RbxColor3::from(*value);
             Some(json!({"_type":"Color3","r":color.r,"g":color.g,"b":color.b}))
@@ -1177,25 +1182,25 @@ fn rbx_variant_to_settings_json_inner(
         RbxVariant::OptionalCFrame(value) => value.map(rbx_cframe_to_settings_json).or(Some(Value::Null)),
         RbxVariant::Rect(value) => Some(json!({
             "_type":"Rect",
-            "minX": value.min.x,
-            "minY": value.min.y,
-            "maxX": value.max.x,
-            "maxY": value.max.y,
+            "minX": fnum(value.min.x),
+            "minY": fnum(value.min.y),
+            "maxX": fnum(value.max.x),
+            "maxY": fnum(value.max.y),
         })),
-        RbxVariant::NumberRange(value) => Some(json!({"_type":"NumberRange","min":value.min,"max":value.max})),
+        RbxVariant::NumberRange(value) => Some(json!({"_type":"NumberRange","min":fnum(value.min),"max":fnum(value.max)})),
         RbxVariant::NumberSequence(value) => Some(Value::Object(Map::from_iter([
             ("_type".to_string(), Value::String("NumberSequence".to_string())),
             ("keypoints".to_string(), Value::Array(value.keypoints.iter().map(|keypoint| json!({
-                "time": keypoint.time,
-                "value": keypoint.value,
-                "envelope": keypoint.envelope,
+                "time": fnum(keypoint.time),
+                "value": fnum(keypoint.value),
+                "envelope": fnum(keypoint.envelope),
             })).collect())),
         ]))),
         RbxVariant::ColorSequence(value) => Some(Value::Object(Map::from_iter([
             ("_type".to_string(), Value::String("ColorSequence".to_string())),
             ("keypoints".to_string(), Value::Array(value.keypoints.iter().map(|keypoint| json!({
-                "time": keypoint.time,
-                "value": {"r": keypoint.color.r, "g": keypoint.color.g, "b": keypoint.color.b},
+                "time": fnum(keypoint.time),
+                "value": {"r": fnum(keypoint.color.r), "g": fnum(keypoint.color.g), "b": fnum(keypoint.color.b)},
             })).collect())),
         ]))),
         RbxVariant::PhysicalProperties(value) => Some(rbx_physical_properties_to_settings_json(*value)),
@@ -1224,8 +1229,8 @@ fn rbx_variant_to_settings_json_inner(
         })),
         RbxVariant::Ray(value) => Some(json!({
             "_type": "Ray",
-            "origin": {"x": value.origin.x, "y": value.origin.y, "z": value.origin.z},
-            "direction": {"x": value.direction.x, "y": value.direction.y, "z": value.direction.z},
+            "origin": {"x": fnum(value.origin.x), "y": fnum(value.origin.y), "z": fnum(value.origin.z)},
+            "direction": {"x": fnum(value.direction.x), "y": fnum(value.direction.y), "z": fnum(value.direction.z)},
         })),
         RbxVariant::MaterialColors(value) => {
             Some(binary_payload_json("MaterialColors", &value.encode()))
@@ -1238,8 +1243,8 @@ fn rbx_variant_to_settings_json_inner(
         }
         RbxVariant::Region3(value) => Some(json!({
             "_type": "Region3",
-            "min": {"x": value.min.x, "y": value.min.y, "z": value.min.z},
-            "max": {"x": value.max.x, "y": value.max.y, "z": value.max.z},
+            "min": {"x": fnum(value.min.x), "y": fnum(value.min.y), "z": fnum(value.min.z)},
+            "max": {"x": fnum(value.max.x), "y": fnum(value.max.y), "z": fnum(value.max.z)},
         })),
         RbxVariant::Region3int16(value) => Some(json!({
             "_type": "Region3int16",
@@ -1300,8 +1305,14 @@ pub(crate) fn canonicalize_nonfinite_float_json(value: Value) -> Value {
 fn rbx_cframe_to_settings_json(value: RbxCFrame) -> Value {
     json!({
         "_type": "CFrame",
-        "components": rbx_cframe_components(value),
+        "components": rbx_cframe_components(value).iter().map(|component| fnum(*component)).collect::<Vec<_>>(),
     })
+}
+
+/// Composite components go through the same non-finite marker as scalars;
+/// `json!` would turn an infinite component into `null`.
+fn fnum(value: impl Into<f64>) -> Value {
+    json_number_f64(value.into())
 }
 
 fn rbx_content_to_settings_json(

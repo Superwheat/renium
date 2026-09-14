@@ -178,6 +178,7 @@ struct Control {
     pull_changes: AtomicBool,
     writes_enabled: AtomicBool,
     file_pause_count: AtomicU64,
+    replace_hold: AtomicBool,
     generation: AtomicU64,
     settle_activity: AtomicU64,
     file_changes: Mutex<FileChanges>,
@@ -243,6 +244,7 @@ impl Control {
             pull_changes: AtomicBool::new(pull_changes),
             writes_enabled: AtomicBool::new(mode.writes()),
             file_pause_count: AtomicU64::new(u64::from(files_paused)),
+            replace_hold: AtomicBool::new(files_paused),
             generation: AtomicU64::new(0),
             settle_activity: AtomicU64::new(0),
             file_changes: Mutex::new(FileChanges::default()),
@@ -419,8 +421,10 @@ impl Control {
         }
     }
 
+    /// Replaces only this session's own hold; holds taken by an in-flight
+    /// pull or acknowledgement stay counted.
     fn replace_pause(&self, paused: bool) {
-        self.file_pause_count.store(1, Ordering::Release);
+        self.file_pause_count.fetch_add(1, Ordering::AcqRel);
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.status.lock_recover().paused = true;
         self.notify_sync_state();
@@ -431,9 +435,15 @@ impl Control {
                 .wait(active)
                 .unwrap_or_else(PoisonError::into_inner);
         }
-        self.file_pause_count
-            .store(u64::from(paused), Ordering::Release);
-        self.status.lock_recover().paused = paused;
+        let previously_held = self.replace_hold.swap(paused, Ordering::AcqRel);
+        let release = 1 + u64::from(previously_held) - u64::from(paused);
+        let remaining = self
+            .file_pause_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                Some(count.saturating_sub(release))
+            })
+            .map_or(0, |count| count.saturating_sub(release));
+        self.status.lock_recover().paused = remaining > 0;
         self.notify_sync_state();
     }
 
@@ -2967,7 +2977,10 @@ impl LiveLoop {
             && self.control.writes_enabled.load(Ordering::Acquire)
             && self.control.pull_changes.load(Ordering::Acquire)
             && self.control.file_pause_count.load(Ordering::Acquire) == 0
-            && self.pending.is_empty()
+            && self
+                .pending
+                .iter()
+                .all(|path| self.blocked.contains_key(path))
             && self.last_pull_attempt.elapsed() >= self.studio.retry_delay
     }
 

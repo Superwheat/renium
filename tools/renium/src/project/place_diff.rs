@@ -120,10 +120,12 @@ pub(super) fn document(
                     let key = key.as_str();
                     // Serialized identity/history are not editable content. File-local
                     // referents are resolved below, never compared by their raw numbers.
-                    if elide_defaults && matches!(key, "UniqueId" | "HistoryId") {
+                    if elide_defaults && matches!(key, "UniqueId" | "HistoryId" | "ScriptGuid") {
                         continue;
                     }
-                    if let Variant::Attributes(attributes) = value {
+                    if let Variant::Attributes(attributes) = value
+                        && key == "Attributes"
+                    {
                         for (name, value) in attributes {
                             // Attribute strings share one byte encoding on disk.
                             let value = match value {

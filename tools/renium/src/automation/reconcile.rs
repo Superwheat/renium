@@ -490,7 +490,7 @@ struct ReconcilePushPlan {
     changed_paths: Vec<PathBuf>,
     target_settings_ids: Vec<String>,
     recreated_settings_ids: HashSet<String>,
-    previous_class_names: HashMap<String, String>,
+    previous_class_names: HashMap<(String, String), String>,
     previous_paths: HashMap<(String, String), EditorInstancePath>,
     instance_deletes: Vec<EditorInstanceChange>,
     property_removals: Vec<EditorPropertyChange>,
@@ -3581,7 +3581,10 @@ fn amend_reconciled_changes(
                 // captured target. Keep its lookup anchor without an upsert.
                 instance.anchor_only = true;
             }
-            if let Some(previous) = plan.previous_class_names.get(&instance.settings_id) {
+            if let Some(previous) = plan
+                .previous_class_names
+                .get(&(change.service.clone(), instance.settings_id.clone()))
+            {
                 instance.previous_class_name = Some(previous.clone());
             }
             if let Some(previous) = plan
@@ -3771,7 +3774,11 @@ fn append_recreated_reference_pushes(
             .filter(|settings_id| targeted.contains(settings_id))
             .map(str::to_string),
     );
-    recreated.extend(plan.previous_class_names.keys().cloned());
+    recreated.extend(
+        plan.previous_class_names
+            .keys()
+            .map(|(_, settings_id)| settings_id.clone()),
+    );
     if recreated.is_empty() {
         return Ok(());
     }
@@ -4050,7 +4057,7 @@ fn append_aligned_settings_push_plan(
         }
         if observed_instance.class_name != instance.class_name {
             plan.previous_class_names.insert(
-                instance.settings_id.clone(),
+                (service.clone(), instance.settings_id.clone()),
                 observed_instance.class_name.clone(),
             );
         } else if !delta.reset_properties.is_empty() || !delta.deleted_attributes.is_empty() {
@@ -4599,7 +4606,7 @@ fn merge_conflicting_entry(
     first_pairing: bool,
     conflicts: &mut Vec<String>,
 ) -> Option<SnapshotEntry> {
-    let ordinary_file_conflict = (first_pairing
+    let ordinary_file_conflict = ((first_pairing || base.is_none())
         && matches!(editor, Some(SnapshotEntry::File(_)))
         && matches!(studio, Some(SnapshotEntry::File(_))))
         || (matches!(base, Some(SnapshotEntry::File(_)))
@@ -4628,7 +4635,7 @@ fn entries_equivalent(
     right: Option<&SnapshotEntry>,
 ) -> bool {
     match (left, right) {
-        (None | Some(SnapshotEntry::Directory), None | Some(SnapshotEntry::Directory)) => true,
+        (None, None) | (Some(SnapshotEntry::Directory), Some(SnapshotEntry::Directory)) => true,
         (Some(SnapshotEntry::File(left)), Some(SnapshotEntry::File(right)))
             if is_source_path(path) =>
         {
@@ -9967,7 +9974,7 @@ mod tests {
         );
         assert_eq!(
             plan.previous_class_names
-                .get("replacement")
+                .get(&("ServerStorage".to_string(), "replacement".to_string()))
                 .map(String::as_str),
             Some("Folder")
         );
