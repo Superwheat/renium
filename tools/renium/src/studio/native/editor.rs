@@ -199,9 +199,7 @@ fn begin_editor_binary_export_for_runtime(
         && let Some(profile) = begin.get("profile")
     {
         println!("[renium] native editor begin profile: {profile}");
-        crate::app::timing::trace_profile("Studio binary export begin", profile);
     }
-    let _metadata_trace = crate::app::timing::trace_scope("native.export", "parse export metadata");
     let result = (|| -> Result<EditorBinaryExport> {
         if begin.get("supported").and_then(Value::as_bool) == Some(false) {
             let reason = begin
@@ -333,7 +331,6 @@ fn capture_native_service_root_properties(
     runtime_id: Option<&str>,
     groups: &mut [EditorBinaryExportGroup],
 ) -> Result<()> {
-    let _trace = crate::app::timing::trace_scope("native.property", "capture service roots");
     use crate::editor::native_roots::{capture_properties, decode_service_property};
     use crate::studio::bridge::BridgeTarget;
 
@@ -356,7 +353,6 @@ fn capture_native_service_root_properties(
     // whole-place export. The active export guard still fences outside edits.
     for group in groups {
         for &name in capture_properties(&group.service) {
-            let _trace = crate::app::timing::trace_scope("native.property", name);
             let text = serializer::read_property(
                 pid,
                 &title,
@@ -2707,7 +2703,6 @@ pub(crate) fn editor_binary_export_parts<'a>(
                 .class_names
                 .iter()
                 .any(|class_name| conditional_ref_schema.contains_key(class_name));
-        let _trace = crate::app::timing::trace_scope("native.export", "fetch overlay");
         fetch_native_overlay_batches(
             bridge,
             NativeOverlayRequest {
@@ -2802,17 +2797,12 @@ pub(crate) fn editor_binary_export_parts<'a>(
             .collect::<VecDeque<_>>(),
     );
     let priority_gate = NativePriorityWorkerGate::new(priority_worker_count == worker_count);
-    let trace_context = crate::app::timing::trace_context();
     thread::scope(|overlay_scope| {
         // Identity and binary reads share the existing export fence. Start both
         // before waiting so a queued native identity read does not idle all the
         // binary/overlay workers. No output is published until identity succeeds.
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         let identity_worker = overlay_scope.spawn(move || {
-            let _trace_context =
-                trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
-            let _trace =
-                crate::app::timing::trace_scope("native.export", "capture persistent identities");
             let pid = studio_pid_for_bridge(bridge)?;
             let title = studio_title_for_bridge(bridge, pid)?;
             serializer::capture_identities(pid, &title, requested_services, Duration::from_secs(3))
@@ -2822,8 +2812,6 @@ pub(crate) fn editor_binary_export_parts<'a>(
                 let overlay_queue = &overlay_queue;
                 let fetch_overlay = &fetch_overlay;
                 overlay_scope.spawn(move || {
-                    let _trace_context = trace_context
-                        .map(|context| crate::app::timing::enter_trace_context(Some(context)));
                     loop {
                         let next = overlay_queue
                             .lock()
@@ -2859,9 +2847,7 @@ pub(crate) fn editor_binary_export_parts<'a>(
                 let service_groups = &export.groups;
                 let finish_dependencies = &finish_dependencies;
                 scope.spawn_fifo(move |_| {
-                    let _trace_context = trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
                     if worker_index >= priority_worker_count {
-                        let _wait = crate::app::timing::trace_scope("wait", "native export priority gate");
                         priority_gate.wait();
                     }
                     let mut priority_release = OnDrop::new(|| {
@@ -2880,14 +2866,12 @@ pub(crate) fn editor_binary_export_parts<'a>(
                         let Some(group) = service else {
                             break;
                         };
-                        let _service_trace = crate::app::timing::trace_scope("native.export", &group.service);
                         let result = thread::scope(|reference_scope| -> Result<NativeServiceExportResult> {
                         // Root reads use the same active export guard, but must
                         // not hold up unrelated binary decoding and file writes.
                         #[cfg(any(windows, target_os = "macos"))]
                         let root_capture = (!native_capture && !crate::editor::native_roots::capture_properties(&group.service).is_empty())
                             .then(|| reference_scope.spawn(move || -> Result<EditorBinaryExportGroup> {
-                                let _trace_context = trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
                                 let mut captured = group.clone();
                                 capture_native_service_root_properties(bridge, None, std::slice::from_mut(&mut captured))?;
                                 Ok(captured)
@@ -2900,8 +2884,6 @@ pub(crate) fn editor_binary_export_parts<'a>(
                         let (reference_sender, reference_receiver) = mpsc::sync_channel(1);
                         let (native, overlay) = rayon::join(
                             || -> Result<NativeServiceFetch> {
-                                let _trace_context = trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
-                                let _trace = crate::app::timing::trace_scope("native.export", "fetch and decode binary");
                                 let (native, one_chunk) = if native_capture {
                                     #[cfg(windows)]
                                     {
@@ -3030,8 +3012,6 @@ pub(crate) fn editor_binary_export_parts<'a>(
                                         .clone()
                                         .context("Native conditional-reference request is missing")?;
                                     reference_scope.spawn(move || {
-                                        let _trace_context = trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
-                                        let _trace = crate::app::timing::trace_scope("native.export", "conditional references");
                                         let result = fetch_native_conditional_overlay(
                                             bridge,
                                             export_id,
@@ -3051,9 +3031,7 @@ pub(crate) fn editor_binary_export_parts<'a>(
                                 ))
                             },
                             || {
-                                let _trace_context = trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
                                 if let Some(receiver) = overlay_receivers.get(group.service.as_str()) {
-                                    let _wait = crate::app::timing::trace_scope("wait", "prefetched native overlay");
                                     receiver.lock().unwrap_or_else(PoisonError::into_inner).recv()
                                         .context("Native overlay worker ended without a result")?
                                 } else {
@@ -3292,11 +3270,7 @@ fn finish_native_service_export(
     let mut service_metrics = overlay.metrics;
     let mut service_compact_expand_ms = overlay.compact_expand_ms;
     let has_reference_work = reference_prefetch.is_some() || reference_request.is_some();
-    let trace_context = crate::app::timing::trace_context();
     let convert = move || {
-        let _trace_context =
-            trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
-        let _trace = crate::app::timing::trace_scope("native.export", "convert service");
         convert_native_service_output(
             dependencies,
             group,
@@ -3309,10 +3283,6 @@ fn finish_native_service_export(
     };
     let (output, native_index_by_overlay_index) = if has_reference_work {
         let (output, reference_overlay) = rayon::join(convert, || {
-            let _trace_context =
-                trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
-            let _trace =
-                crate::app::timing::trace_scope("native.export", "complete conditional references");
             if let Some(receiver) = reference_prefetch {
                 return receiver
                     .recv()
@@ -3715,7 +3685,6 @@ fn send_editor_binary_import(
         let started = Instant::now();
         let request_lease = bridge.active_request_lease();
         let transfer_threads = bridge.channel_count().max(1).min(total_chunks.max(1));
-        let trace_context = crate::app::timing::trace_context();
         rayon::ThreadPoolBuilder::new()
             .num_threads(transfer_threads)
             .build()
@@ -3726,8 +3695,6 @@ fn send_editor_binary_import(
                     .par_chunks(RAW_CHUNK_BYTES)
                     .enumerate()
                     .try_for_each(|(index, chunk)| -> Result<()> {
-                        let _trace_context = trace_context
-                            .map(|context| crate::app::timing::enter_trace_context(Some(context)));
                         let _lease = request_lease
                             .as_ref()
                             .map(|lease| bridge.inherit_request_lease(Arc::clone(lease)))
@@ -3751,11 +3718,6 @@ fn send_editor_binary_import(
             json!({ "importId": &import_id, "profile": verbose_timing_logs() }),
         );
         log_timing("native editor import finish", started);
-        if let Ok(response) = &result
-            && let Some(profile) = response.get("profile")
-        {
-            crate::app::timing::trace_profile("Studio binary import finish", profile);
-        }
         result
     })();
     if import_result.is_err() {
@@ -3887,9 +3849,6 @@ fn send_editor_service_replacement(
                 "nativeReceiptChunk": final_receipt,
             }),
         )?;
-        if let Some(profile) = response.get("profile") {
-            crate::app::timing::trace_profile("Studio native import tracking", profile);
-        }
         anyhow::ensure!(
             response["ok"] == true
                 && response["nativeInserted"] == true
@@ -4568,12 +4527,6 @@ fn verify_in_place_editor_fields(
             .sum::<usize>();
         let verified =
             verify_native_property_rows(bridge, &rows, transaction_id, native_roots, summary)?;
-        crate::app::timing::trace_profile(
-            "editor.verification.coverage",
-            &json!({
-                "service": service, "expected": expected, "verified": verified,
-            }),
-        );
         // Skipped native-only fields are not a proof. Keep that service's full
         // readback without discarding complete proofs for other services.
         if verified == expected as u64 {
@@ -4743,9 +4696,7 @@ fn merge_editor_summary(summary: &mut Map<String, Value>, result: &Value) {
 fn merge_editor_summary_checked(summary: &mut Map<String, Value>, result: &Value) -> Result<()> {
     if let Some(profile) = result.get("profile")
         && profile.get("applyMs").is_some()
-    {
-        crate::app::timing::trace_profile("Studio editor apply", profile);
-    }
+    {}
     merge_editor_summary(summary, result);
     let errors = result.get("errors").and_then(Value::as_f64).unwrap_or(0.0);
     if result.get("ok").and_then(Value::as_bool) == Some(false) || errors > 0.0 {

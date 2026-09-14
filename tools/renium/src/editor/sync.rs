@@ -941,7 +941,6 @@ impl<'a> EditorTransaction<'a> {
             && let Some(profile) = result.get("profile")
         {
             eprintln!("[renium] native editor commit profile: {profile}");
-            crate::app::timing::trace_profile("Studio transaction commit", profile);
         }
         Ok(EditorCommitStatus {
             verified_push_proof: result
@@ -1432,7 +1431,6 @@ fn collect_project_editor_changes_with_documents(
 }
 
 fn log_editor_collection_timing(label: &str, started: Instant) {
-    crate::app::timing::trace_timing("collection", label, started);
     log_global(
         5,
         format_args!(
@@ -2340,10 +2338,6 @@ fn push_editor_changes_with_collected(
     mut changes: EditorChangeSet,
     options: CollectedPushOptions<'_>,
 ) -> Result<serde_json::Map<String, Value>> {
-    let mut stages = crate::app::timing::trace_stages(
-        "push.editor",
-        "normalize retained-container resets and filters",
-    );
     let CollectedPushOptions {
         started,
         projection,
@@ -2356,7 +2350,6 @@ fn push_editor_changes_with_collected(
     let phase_started = Instant::now();
     apply_files_to_studio_filters(&args, bridge, &mut changes, projection)?;
     log_timing("native editor push filters", phase_started);
-    stages.next("obtain requested editor review");
     let review_skipped = !args.no_review
         && !args.yes
         && !global_yes()
@@ -2364,7 +2357,6 @@ fn push_editor_changes_with_collected(
             || !changes.source_changes.is_empty()
             || !changes.property_changes.is_empty())
         && !request_editor_push_review(bridge, &changes)?;
-    stages.next("build native binary payload");
     let binary_import = if review_skipped {
         None
     } else if prepared_binary_import.is_some() {
@@ -2377,7 +2369,6 @@ fn push_editor_changes_with_collected(
     } else {
         build_editor_binary_import(&args, &changes, bridge)?
     };
-    stages.next("materialize supplemental properties and select protected writes");
     materialize_native_property_changes(
         &mut changes,
         binary_import.as_ref(),
@@ -2400,14 +2391,12 @@ fn push_editor_changes_with_collected(
             unstaged_replacements.join(", ")
         );
     }
-    stages.next("save incremental editor history");
     let mut history_transaction = if review_skipped || binary_import.is_some() {
         None
     } else {
         save_editor_history_entries(bridge, &args.project.project_root, &changes)?
     };
     let phase_started = Instant::now();
-    stages.next("validate source files and begin Studio transaction");
     if !review_skipped && let Some(validate_project) = validate_project {
         validate_project()?;
     }
@@ -2418,7 +2407,6 @@ fn push_editor_changes_with_collected(
     };
     let result = (|| {
         log_timing("native editor transaction begin", phase_started);
-        stages.next("send changes and insert native payload");
         let mut summary = if review_skipped {
             skipped_editor_summary(&changes)
         } else {
@@ -2436,7 +2424,6 @@ fn push_editor_changes_with_collected(
             log_timing("native editor change batches", phase_started);
             result?
         };
-        stages.next("check apply response and verify script editor sources");
         if !review_skipped {
             let errors = summary.get("errors").and_then(Value::as_f64).unwrap_or(0.0);
             if summary.get("ok").and_then(Value::as_bool) == Some(false) || errors > 0.0 {
@@ -2454,12 +2441,10 @@ fn push_editor_changes_with_collected(
             )?;
         }
         let phase_started = Instant::now();
-        stages.next("prepare protected property writes");
         let protected =
             prepare_protected_writes(&args, bridge, &mut summary, pre_routed_protected_writes)?;
         log_timing("native editor protected write preparation", phase_started);
         let phase_started = Instant::now();
-        stages.next("validate files and capture engine-generated geometry");
         if !review_skipped && let Some(validate_project) = validate_project {
             validate_project()?;
         }
@@ -2476,7 +2461,6 @@ fn push_editor_changes_with_collected(
                 finalize_settings(&mut changes)?;
             }
         }
-        stages.next("write accepted settings and publish history");
         let settings_transaction = if review_skipped {
             None
         } else {
@@ -2487,7 +2471,6 @@ fn push_editor_changes_with_collected(
         }
         log_timing("native editor settings apply", phase_started);
         let phase_started = Instant::now();
-        stages.next("commit Studio transaction or apply offline protected settings");
         let mut commit_status = None;
         if protected.apply_offline {
             let transaction = transaction
@@ -2533,7 +2516,6 @@ fn push_editor_changes_with_collected(
             summary.remove("fieldVerifiedServices");
         }
         log_timing("native editor transaction commit", phase_started);
-        stages.next("commit file transactions and format diagnostic summary");
         if let Some(settings_transaction) = settings_transaction {
             settings_transaction.commit();
         }
@@ -2554,7 +2536,6 @@ fn push_editor_changes_with_collected(
         }
         Ok(summary)
     })();
-    stages.next("finalize or recover Studio transaction");
     EditorTransaction::finish(transaction.as_mut(), result)
 }
 
@@ -3656,7 +3637,6 @@ fn finish_editor_change_collection(
     log_editor_collection_timing("property schema", phase_started);
     let phase_started = Instant::now();
     for service in changed_services {
-        let _trace = crate::app::timing::trace_scope("collection.service", &service);
         if let Some(document) = documents.get(&service).and_then(Option::as_ref) {
             let deferred = changes.native_property_documents.contains_key(&service);
             if deferred {
@@ -3800,10 +3780,6 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
     link_enforcement: &LinkEnforcement,
     prepared_documents: &mut PreparedEditorDocuments,
 ) -> Result<EditorChangeSet> {
-    let mut stages = crate::app::timing::trace_stages(
-        "collection.prepare",
-        "prepare property filters and native document references",
-    );
     let mut property_filter = EditorPropertyFilter::from_args(args)?;
     let mut changes = EditorChangeSet {
         native_property_documents: prepared_documents
@@ -3824,7 +3800,6 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
     let mut changed_services = EditorChangedServices::default();
     let mut seen_paths = HashSet::new();
 
-    stages.next("expand selected source and settings paths");
     let mut changed_paths = expand_editor_changed_paths(args)?;
     let full_reconcile = changed_paths.is_empty();
     if full_reconcile {
@@ -3832,7 +3807,6 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
     }
     let enforced_changed_paths =
         apply_link_enforcement_to_changed_paths(project_root, link_enforcement, changed_paths)?;
-    stages.next("resolve source identities and read selected script files");
     for changed_path in enforced_changed_paths {
         let Some((absolute_path, service)) =
             unique_editor_changed_path(project_root, src_root, &changed_path, &mut seen_paths)
@@ -4145,7 +4119,6 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
         });
     }
 
-    stages.next("collect selected properties references and package changes");
     let changes = finish_editor_change_collection(
         changes,
         &documents,
@@ -4155,13 +4128,11 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
         src_root,
         link_enforcement,
     )?;
-    stages.next("release decoded source service documents");
     for document in documents.into_values().flatten() {
         if let Ok(document) = Arc::try_unwrap(document) {
             drop_settings_document(document);
         }
     }
-    stages.next("release source path and child indexes");
     Ok(changes)
 }
 

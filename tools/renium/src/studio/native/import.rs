@@ -2310,7 +2310,6 @@ pub(crate) fn build_editor_binary_import(
     changes: &EditorChangeSet,
     bridge: &BridgeServer,
 ) -> Result<Option<EditorBinaryImport>> {
-    let _trace = crate::app::timing::trace_scope("native.import", "prepare binary import");
     let mut services = native_import_services(changes);
     let additive_roots = additive_native_roots(changes, &services);
     services.extend(additive_roots.keys().cloned());
@@ -2685,8 +2684,6 @@ fn build_editor_binary_import_for_services(
     bridge: &BridgeServer,
     allow_service_replacement: bool,
 ) -> Result<Option<EditorBinaryImport>> {
-    let mut stages =
-        crate::app::timing::trace_stages("native.payload", "resolve project and order services");
     let project_root = resolve_project_root_if_present(&args.project.project_root)?;
     let src_root = absolutize_under(&project_root, &args.project.src_root);
     let service_count = services.len();
@@ -2698,14 +2695,8 @@ fn build_editor_binary_import_for_services(
             .then_with(|| a.cmp(b))
     });
     let build_services = ordered_services.clone();
-    let trace_context = crate::app::timing::trace_context();
-    stages.next("join parallel place build and live package preflight");
     let (build, live_preflight) = rayon::join(
         || {
-            let _trace_context =
-                trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
-            let _trace =
-                crate::app::timing::trace_scope("native.import", "build and partition import");
             let started = Instant::now();
             let mut narrowed = HashMap::new();
             for (service, roots) in additive_roots {
@@ -2802,9 +2793,6 @@ fn build_editor_binary_import_for_services(
             })
         },
         || {
-            let _trace_context =
-                trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
-            let _trace = crate::app::timing::trace_scope("native.import", "live package preflight");
             capture_editor_package_preflight_live(
                 bridge,
                 &ordered_services,
@@ -2814,7 +2802,6 @@ fn build_editor_binary_import_for_services(
             )
         },
     );
-    stages.next("validate additive-root preflight and service coverage");
     let (mut build, mut pending_groups) = build?;
     let mut live_preflight = live_preflight?;
     for group in &mut pending_groups {
@@ -2840,7 +2827,6 @@ fn build_editor_binary_import_for_services(
         return Ok(None);
     }
     let phase_started = Instant::now();
-    stages.next("expand package reference preflight if needed");
     // Canonical reference paths are only used when retaining existing packages.
     // A source containing packages does not imply that the target has any:
     // empty targets need neither this whole-place index nor a reference scan.
@@ -2886,7 +2872,6 @@ fn build_editor_binary_import_for_services(
     // Without live packages, the viewport is the only imported object replaced
     // by a retained identity. Newly imported packages do not introduce aliases.
     // Repair viewport references through the exact post-apply plan.
-    stages.next("collect imported identities and externalize cross-boundary references");
     let viewport_references_post_applied = live_preflight.dom.is_none();
     let viewport_ref = viewport_references_post_applied
         .then(|| {
@@ -2922,7 +2907,6 @@ fn build_editor_binary_import_for_services(
         .or_default()
         .insert("WorldPivot".to_string());
     log_timing("native editor import group preparation", phase_started);
-    stages.next("plan package retention and bind generation guards");
     let replacement_groups = pending_groups
         .iter()
         .filter(|group| !group.additive)
@@ -2965,7 +2949,6 @@ fn build_editor_binary_import_for_services(
             }
         })
         .collect::<Result<Vec<_>>>()?;
-    stages.next("repair retained-package reference plan");
     let retained_refs = pending_groups
         .iter()
         .zip(&package_plans)
@@ -3044,7 +3027,6 @@ fn build_editor_binary_import_for_services(
         }
     }
     let phase_started = Instant::now();
-    stages.next("partition and encode native service payloads");
     clear_import_engine_identities(&mut build.dom);
     // Temporary A/B selection while the transaction adapter is integrated.
     // Existing package and partial-service workflows retain their current path.
@@ -3085,7 +3067,6 @@ fn build_editor_binary_import_for_services(
             viewport_references_post_applied,
         }));
     }
-    stages.next("assemble ordinary import wrapper groups");
     let mut groups = Vec::with_capacity(pending_groups.len());
     let mut top_level_refs = Vec::with_capacity(pending_groups.len());
     let mut instance_count = 0usize;
@@ -3167,7 +3148,6 @@ fn build_editor_binary_import_for_services(
         });
     }
     log_timing("native editor import payload grouping", phase_started);
-    stages.next("encode ordinary binary import");
     let phase_started = Instant::now();
     let mut bytes = Vec::new();
     rbx_binary::to_writer(&mut bytes, &build.dom, &top_level_refs)

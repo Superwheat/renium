@@ -1208,14 +1208,11 @@ pub(crate) fn build_rbx_place(
     capture_logical_properties: bool,
     merge_source_files: bool,
 ) -> Result<RbxPlaceBuild> {
-    let trace_context = crate::app::timing::trace_context();
     let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
     let phase_started = Instant::now();
     let export_inputs = services
         .into_par_iter()
         .map(|service| {
-            let _trace_context =
-                trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
             let service_dir = src_root.join(&service);
             let settings_file = service_settings_path(&service_dir);
             if !settings_file.exists() && !service_dir.is_dir() {
@@ -1390,8 +1387,6 @@ pub(crate) fn build_rbx_place(
                 (_, _, _, document, source_paths, children, root_index, subtree, _),
                 (by_index, by_settings_id),
             )| {
-                let _trace_context = trace_context
-                    .map(|context| crate::app::timing::enter_trace_context(Some(context)));
                 let refs = BytecodeModelExportRefs {
                     by_index,
                     by_settings_id,

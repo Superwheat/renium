@@ -30,7 +30,6 @@ impl SyncHistory {
         before: &ProjectSnapshot,
         paths: &HashSet<PathBuf>,
     ) -> Result<Self> {
-        let _trace = crate::app::timing::trace_scope("sync", "history prepare");
         let source = absolutize_under(root, source)
             .strip_prefix(root)?
             .to_path_buf();
@@ -80,7 +79,6 @@ impl SyncHistory {
         after: &ProjectSnapshot,
         generated: &ProjectSnapshot,
     ) -> Result<String> {
-        let _trace = crate::app::timing::trace_scope("sync", "history commit");
         self.record.expected = Some(snapshot_digest(after, generated, &self.record.scopes));
         self.record.committed_at = u64::try_from(
             std::time::SystemTime::now()

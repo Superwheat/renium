@@ -521,9 +521,7 @@ fn automation_pull_operation(
     bridge: &BridgeServer,
     bridge_wait_seconds: f64,
 ) -> Result<(Value, PublishedProjectChanges)> {
-    let _trace = crate::app::timing::trace_scope("sync", "pull attempt");
     let target = BridgeTarget::Main;
-    let prepare = crate::app::timing::trace_scope("sync", "pull target and pending changes");
     bridge.wait_for_all_target(bridge_wait_seconds, target)?;
     let info = bridge.cached_bridge_info_for_target(target)?;
     let args = automation_pull_args(context, parameters)?;
@@ -531,10 +529,8 @@ fn automation_pull_operation(
     let parsed_services = parse_services(&services)?;
     let pending_ack = pending_change_ack(bridge, &parsed_services)?;
     let acknowledged_pending = pending_ack.is_some();
-    drop(prepare);
     let published = export_snapshots_with_warm_bridge(args, bridge, &info, 0.0, false)?;
     if let Some((seq, runtime_id)) = pending_ack {
-        let _trace = crate::app::timing::trace_scope("sync", "acknowledge pulled changes");
         acknowledge_pulled_changes(bridge, &parsed_services, seq, &runtime_id)?;
     }
     Ok((
@@ -1498,8 +1494,6 @@ fn automation_dispatch_managed(
             .collect::<Vec<_>>();
         if writes_project {
             if operation == op::PULL {
-                let _trace =
-                    crate::app::timing::trace_scope("sync", "pull reconcile and resume watcher");
                 let published = published
                     .context("Pull did not return published project changes")
                     .map_err(automation_failure)?;
@@ -2728,20 +2722,6 @@ fn automation_response(
 ) -> automation::Response {
     let started = Instant::now();
     let operation = automation::opcode_by_id(request.op).ok();
-    let _trace_context = crate::app::output::global_log_enabled(5).then(|| {
-        crate::app::timing::enter_trace_context(Some(crate::app::timing::TraceContext {
-            request_id: request.id,
-            context_id: request.cx,
-        }))
-    });
-    let _trace = crate::app::timing::trace_scope(
-        "daemon",
-        operation.map_or("invalid request", |operation| operation.name),
-    );
-    let mut stages = crate::app::timing::trace_stages(
-        "daemon.stage",
-        "authenticate operation and select scheduling policy",
-    );
     let queued = operation.is_some_and(|operation| operation.queued)
         && !(request.op == op::PERFORMANCE_MONITOR
             && crate::studio::automation::monitor::is_edit_request(&request.p));
@@ -2765,12 +2745,8 @@ fn automation_response(
                 })?;
         }
         {
-            stages.next("restore persisted Live Sync for selected project");
-            let _trace = crate::app::timing::trace_scope("daemon", "restore live sync");
             restore_persisted_live_sync_for_request(&request, state, bridge, bridge_wait_seconds)?;
         }
-        stages.next("wait for selected runtime mutation gate");
-        let gate_wait = crate::app::timing::trace_scope("wait", "daemon request gate");
         let _request_guard = if queued {
             Some(match request_lease.as_deref() {
                 Some(lease) => bridge
@@ -2781,8 +2757,6 @@ fn automation_response(
         } else {
             None
         };
-        drop(gate_wait);
-        stages.next("activate request lease");
         let _lease_guard = match request_lease.as_ref() {
             Some(lease) => Some(
                 bridge
@@ -2791,9 +2765,7 @@ fn automation_response(
             ),
             None => None,
         };
-        stages.next("resolve context and execute operation");
         let result = automation_execute_request(&request, state, bridge, bridge_wait_seconds);
-        stages.next("verify lease and release runtime mutation gate");
         if result.is_ok()
             && let Some(lease) = request_lease.as_deref()
         {
@@ -2801,7 +2773,6 @@ fn automation_response(
         }
         result
     })();
-    stages.next("build daemon response and attach update status");
     let response = match result {
         Ok(result) => automation::Response::success(request.id, started, result),
         Err(failure) => {

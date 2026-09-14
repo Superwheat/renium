@@ -184,7 +184,6 @@ pub(crate) fn capture_identities(
     }
     put32(&mut prepared.parameters, 136, input.len() as u32);
     prepared.parameters[680..680 + input.len()].copy_from_slice(&input);
-    let _trace = crate::app::timing::trace_scope("native.export", "capture native identity graph");
     decode_identities(&prepared.invoke(4)?[16..])
 }
 

@@ -1238,10 +1238,7 @@ fn prepare(
     timeout: Duration,
     read_class: Option<&str>,
 ) -> Result<(NativeProperty, String)> {
-    let _trace = crate::app::timing::trace_scope("native.property", "prepare reflected property");
     let deadline = Instant::now() + timeout;
-    let phase =
-        crate::app::timing::trace_scope("native.property", "open process and validate image");
     let current_modules = modules(pid)?;
     let studio = current_modules
         .iter()
@@ -1250,16 +1247,11 @@ fn prepare(
     let layout = package_layout(&studio.path)?;
     let memory = ProcessMemory::open(pid)?;
     verify_loaded_image(&memory, studio, layout.image_stamp)?;
-    drop(phase);
-    let phase = crate::app::timing::trace_scope("native.property", "locate DataModel context");
     let model = active_data_model(pid, &memory, studio, layout.data, title)?;
     let model_instance = model.outer + model.layout.data_model_instance;
     // active_data_model binds the selected PID and document window. game.Name
     // can differ from that caption; the native invocation validates the model
     // owner, target identity and ancestry instead of equating those two names.
-    drop(phase);
-    let phase =
-        crate::app::timing::trace_scope("native.property", "resolve instance path and class");
     let ancestors = resolve_path(&memory, &model, segments, ordinals)?;
     let entry = *ancestors.last().expect("path validated above");
     let class_name = read_instance_class(&memory, entry.instance, model.layout)
@@ -1268,19 +1260,10 @@ fn prepare(
         read_class.is_none_or(|expected| class_name == expected),
         "Native snapshot target changed class"
     );
-    drop(phase);
-    let phase = crate::app::timing::trace_scope("native.property", "resolve property descriptor");
     let descriptor = find_class_member_descriptor(&memory, entry.instance, model.layout, property)?;
-    drop(phase);
-    let phase = crate::app::timing::trace_scope(
-        "native.property",
-        "resolve property codec and identity getter",
-    );
     let (getter, setter) = reflection_functions(&memory, studio, &layout, descriptor)?;
     let (binding, identity_getter) =
         identity_binding(&memory, studio, &layout, &model, entry.instance)?;
-    drop(phase);
-    let phase = crate::app::timing::trace_scope("native.property", "prepare ABI parameters");
     let mut parameters = vec![0; SIZE];
     for (offset, value) in [
         (
@@ -1316,8 +1299,6 @@ fn prepare(
         131504 + ancestors.len() * 8,
         model_instance,
     );
-    drop(phase);
-    let phase = crate::app::timing::trace_scope("native.property", "ensure native helper");
     let remaining = deadline
         .checked_duration_since(Instant::now())
         .context("Protected property discovery exceeded its deadline")?;
@@ -1336,13 +1317,7 @@ fn prepare(
         entrypoint: helper + helper_export_rva("ReniumReadProperty")?,
         deadline,
     };
-    drop(phase);
-    let phase = crate::app::timing::trace_scope(
-        "native.property",
-        "invoke identity-checked property operation",
-    );
     prepared.invoke(if read_class.is_some() { 3 } else { 0 })?;
-    drop(phase);
     let identity: [u8; 16] = prepared.parameters[IDENTITY..IDENTITY + 16].try_into()?;
     if identity == [0; 16] {
         bail!("Studio target has no stable instance identity");

@@ -718,7 +718,6 @@ fn daemon_control_request_inner(
     required: bool,
 ) -> Result<Option<Value>> {
     let opcode = automation::opcode_by_id(operation)?;
-    let _trace = crate::app::timing::trace_scope("cli", opcode.name);
     let bridge_wait_seconds = parameters
         .get("bridgeWaitSeconds")
         .and_then(Value::as_f64)

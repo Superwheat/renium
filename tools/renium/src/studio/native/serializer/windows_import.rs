@@ -42,13 +42,7 @@ pub(crate) fn read_service_payload(
     timeout: Duration,
     invoked: &mut bool,
 ) -> Result<NativeReadReceipt> {
-    use crate::app::timing::{trace_profile, trace_scope};
     let started = Instant::now();
-    let preparation = trace_scope("native.import", "prepare native service reader");
-    let mut stages = crate::app::timing::trace_stages(
-        "native.host",
-        "validate payload boundaries and open Studio process",
-    );
     anyhow::ensure!(
         (32..=512 * 1024 * 1024).contains(&bytes.len()),
         "Invalid native import payload size"
@@ -79,7 +73,6 @@ pub(crate) fn read_service_payload(
         studio.name.eq_ignore_ascii_case("RobloxStudioBeta.exe"),
         "Native import target is not Studio"
     );
-    stages.next("resolve window DataModel and validate loaded engine code");
     let window = capture_window(pid, title)?;
     let layout = package_layout(&studio.path)?;
     verify_loaded_image(&memory, studio, layout.image_stamp)?;
@@ -95,7 +88,6 @@ pub(crate) fn read_service_payload(
     }
     let instance = model.outer + model.layout.data_model_instance;
     let debug_id = properties::debug_id_function(&memory, studio, &layout, &model, instance)?;
-    stages.next("encode and validate native classes targets and anchors");
     let class_index = plan
         .classes
         .iter()
@@ -339,7 +331,6 @@ pub(crate) fn read_service_payload(
     ] {
         put_u32(&mut parameters, offset, u32::try_from(value)?);
     }
-    stages.next("load or validate native helper module");
     let helper = ensure_helper_loaded_with_timeout(
         pid,
         &memory,
@@ -353,7 +344,6 @@ pub(crate) fn read_service_payload(
         capture_window(pid, title)? == window,
         "Studio target changed during native import preparation"
     );
-    stages.next("create private result transport");
     let mut nonce = [0; 16];
     getrandom::fill(&mut nonce)
         .map_err(|error| anyhow::anyhow!("Cannot create native import nonce: {error}"))?;
@@ -386,23 +376,17 @@ pub(crate) fn read_service_payload(
         1436,
         u32::from(crate::app::output::global_log_enabled(5)),
     );
-    stages.next("allocate and copy payload into Studio");
     let remote = memory.allocate(parameters.len())?;
     memory.write(remote.address, &parameters)?;
-    drop(preparation);
-    let operation = trace_scope("native.import", "native service reader");
-    stages.next("execute native helper and wait for completion");
     let helper_started = Instant::now();
     *invoked = true;
     let exit = remote.run_owned(entry, capture_remaining_ms(started, timeout)?)?;
     let helper_finished = Instant::now();
-    let helper_wall_ms = helper_finished.duration_since(helper_started).as_secs_f64() * 1000.0;
-    stages.next("read and validate native result header");
+    let _helper_wall_ms = helper_finished.duration_since(helper_started).as_secs_f64() * 1000.0;
     let mut response = [0; RESPONSE];
     transport
         .read_exact(&mut response)
         .context("Native import outcome is unavailable; do not retry the mutation")?;
-    drop(operation);
     anyhow::ensure!(
         read_u32(&response, 0)? == 0x52494E52 && read_u32(&response, 4)? == 6,
         "Native import receipt header is invalid"
@@ -430,7 +414,6 @@ pub(crate) fn read_service_payload(
         (status == 4 && exit == 0) || status == exit,
         "Native import response disagrees with helper outcome"
     );
-    stages.next("read creation receipts batch timings and native accounting");
     let mut created = vec![0; count * CREATED_ROW];
     transport
         .read_exact(&mut created)
@@ -474,35 +457,10 @@ pub(crate) fn read_service_payload(
         measured == total,
         "Native timing phases do not cover the helper timeline"
     );
-    let accounted_ms = total as f64 * 1000.0 / frequency as f64;
-    let factory_ms = read_u64(&accounting, 96)? as f64 * 1000.0 / frequency as f64;
-    let constructor_ms = read_u64(&accounting, 104)? as f64 * 1000.0 / frequency as f64;
-    trace_profile(
-        "native.import.accounting",
-        &serde_json::json!({
-            "wallMs": helper_wall_ms, "helperMeasuredMs": accounted_ms,
-            "invocationAndReturnMs": helper_wall_ms - accounted_ms,
-            "hostInterval": crate::app::timing::trace_range(helper_started, helper_finished),
-            "phasesMs": phases,
-            "factoryMs": factory_ms, "constructorMs": constructor_ms,
-            "framesDelivered": read_u64(&accounting, 112)?,
-            "frameWaits": read_u64(&accounting, 120)?,
-            "frameTimeouts": read_u64(&accounting, 128)?,
-            "basis": "Exclusive wall-clock phases; deserialization includes engine and synchronous callbacks. Invocation/return includes remote-thread startup, trailing accounting write and helper destruction.",
-        }),
-    );
-    stages.next("emit per-batch diagnostic records");
-    for (index, batch) in replacement.batches.iter().enumerate() {
-        trace_profile(
-            "native.import.batch",
-            &serde_json::json!({
-                "index": index + 1, "batches": replacement.batches.len(),
-                "services": batch.services, "bytes": batch.bytes.len(),
-                "readMs": read_u64(&batch_timings, index * 8)? as f64 / 1000.0,
-            }),
-        );
-    }
-    stages.next("validate creation receipt identities and ordinals");
+    let _accounted_ms = total as f64 * 1000.0 / frequency as f64;
+    let _factory_ms = read_u64(&accounting, 96)? as f64 * 1000.0 / frequency as f64;
+    let _constructor_ms = read_u64(&accounting, 104)? as f64 * 1000.0 / frequency as f64;
+    for (_index, _batch) in replacement.batches.iter().enumerate() {}
     let mut ordinals = HashSet::with_capacity(count);
     let mut identities = HashSet::with_capacity(count);
     for row in created.chunks_exact(CREATED_ROW) {
@@ -525,18 +483,6 @@ pub(crate) fn read_service_payload(
             "Native import creation identities are invalid or duplicated"
         );
     }
-    stages.next("emit reader summary and revalidate target window");
-    trace_profile(
-        "native.import.reader",
-        &serde_json::json!({
-            "queueMs": read_u64(&response, 16)? as f64 / 1000.0,
-            "readMs": read_u64(&response, 24)? as f64 / 1000.0,
-            "identityMs": read_u64(&response, 32)? as f64 / 1000.0,
-            "created": count,
-            "historySkipped": history_skipped,
-            "bytes": bytes.len(), "targets": targets.len(),
-        }),
-    );
     let error = &response[56..312];
     let error = String::from_utf8_lossy(
         &error[..error

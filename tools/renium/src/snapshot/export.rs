@@ -803,8 +803,6 @@ impl ExportProjectStage {
 
 impl Drop for ExportProjectStage {
     fn drop(&mut self) {
-        let _trace =
-            crate::app::timing::trace_scope("snapshot.cleanup", "release private snapshot stage");
         config::remove_cached_script_naming(&self.project_root);
         if self.active {
             let _ = fs::remove_dir_all(&self.container);
@@ -1313,7 +1311,6 @@ pub(crate) fn export_snapshots_with_warm_bridge(
     bridge_info_refresh_ms: f64,
     repair_reference_paths: bool,
 ) -> Result<PublishedProjectChanges> {
-    let _trace = crate::app::timing::trace_scope("sync", "export snapshots");
     let prelude = export_snapshots_prelude(&args)?;
     println!(
         "[renium] persistent warm bridge: channels={}/{}, cached_bridge_info={}, per_export_handshake_ms={:.1}",
@@ -1350,12 +1347,9 @@ pub(crate) fn capture_exported_services<T: Send>(
         prelude.total_started,
     )?;
     let outputs = Mutex::new(Vec::with_capacity(prelude.services.len()));
-    let trace_context = crate::app::timing::trace_context();
     // Consume each exported service immediately. Waiting for the last export
     // before projecting the first would serialize two otherwise parallel stages.
     let mut guard = rayon::scope(|scope| {
-        let _trace_context =
-            trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
         editor_binary_export_parts(
             bridge,
             &prelude.services,
@@ -1364,10 +1358,6 @@ pub(crate) fn capture_exported_services<T: Send>(
                 let outputs = &outputs;
                 let project_service = &project_service;
                 scope.spawn(move |_| {
-                    let _trace_context = trace_context
-                        .map(|context| crate::app::timing::enter_trace_context(Some(context)));
-                    let _trace =
-                        crate::app::timing::trace_scope("sync", "project captured service");
                     let service = output.span.service;
                     let result = exported_parts_to_service_state(&service, output.parts)
                         .and_then(|state| project_service(&service, state));
@@ -1639,11 +1629,6 @@ fn export_snapshots_core(
     all_channels_connected_to_bridge_info_ms: f64,
     repair_reference_paths: bool,
 ) -> Result<PublishedProjectChanges> {
-    let _trace = crate::app::timing::trace_scope("sync", "export core");
-    let mut stages = crate::app::timing::trace_stages(
-        "export.core",
-        "initialize export metrics and service selection",
-    );
     let ExportPrelude {
         total_started,
         project_root,
@@ -1655,19 +1640,16 @@ fn export_snapshots_core(
         all_channels_connected_to_bridge_info_ms,
         bridge_info,
     );
-    stages.next("prepare export bridge and property schema");
     let ExportBridgeSetup {
         property_schema_ready_ms,
         bridge_info_to_property_schema_ready_ms,
     } = prepare_export_bridge(args, bridge, bridge_info, &project_root, total_started)?;
-    stages.next("prepare project output workers and export service order");
     let ExportExecutionSetup {
         project_stage,
         sourcemap_writer,
         direct_import_dispatcher,
         export_services,
     } = prepare_export_execution(args, &project_root, &services, total_started)?;
-    stages.next("capture services and stream snapshots into output workers");
     let ServiceExportRun {
         spans: service_export_spans,
         cumulative_latency_ms: cumulative_service_latency_ms,
@@ -1678,7 +1660,6 @@ fn export_snapshots_core(
         &export_services,
         &direct_import_dispatcher,
     )?;
-    stages.next("export timing boundaries");
     let first_service_export_ms = service_export_spans
         .first()
         .map_or(property_schema_ready_ms, |span| span.export_start_ms);
@@ -1705,12 +1686,10 @@ fn export_snapshots_core(
         "last service export to dispatcher drain start",
         last_service_export_to_dispatcher_drain_start_ms,
     );
-    stages.next("join output workers and finalize sourcemap");
     let ImportFinishMetrics {
         dispatcher_drain_ms,
         sourcemap_finalize_ms,
     } = finish_export_import(direct_import_dispatcher, sourcemap_writer)?;
-    stages.next("publish exported files and acknowledge Studio snapshot");
     let (published, sync_completion_ms) = finish_export_publication(
         Some(project_stage),
         &project_root,
@@ -1724,7 +1703,6 @@ fn export_snapshots_core(
         || record_bridge_sync_completion(bridge),
     )?;
 
-    stages.next("format export timing summaries");
     let total_run_ms = elapsed_ms(total_started);
     let handshake_ms = all_channels_connected_to_bridge_info_ms;
     let core_export_ms = property_schema_ready_to_first_service_export_ms
@@ -1759,7 +1737,6 @@ fn export_snapshots_core(
     );
     log_timing_ms("full export-snapshots run", total_run_ms);
     println!("[renium] export done");
-    stages.next("release completed export buffers and configuration");
     Ok(published)
 }
 

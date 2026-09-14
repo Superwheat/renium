@@ -48,7 +48,6 @@ struct EnabledMarker {
 }
 
 pub(super) fn log_live_timing(label: &str, started: Instant) {
-    crate::app::timing::trace_timing("live-sync", label, started);
     log_global(
         4,
         format_args!("[renium] live {label}: {:.1}ms", elapsed_ms(started)),

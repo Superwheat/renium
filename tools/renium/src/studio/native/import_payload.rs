@@ -108,10 +108,6 @@ pub(super) fn encode_services(
     Vec<EditorBinaryImportGroup>,
     EditorNativeReplacement,
 )> {
-    let mut stages = crate::app::timing::trace_stages(
-        "native.encode",
-        "bind retained services containers and viewport",
-    );
     anyhow::ensure!(
         groups.len() == package_plans.len(),
         "Native import plans differ"
@@ -152,12 +148,10 @@ pub(super) fn encode_services(
         }
     }
     remove_excluded_children(dom, &requested, &included)?;
-    stages.next("filter non-writable retained properties and references");
     let database = rbx_reflection_database::get()?;
     filter_retained_properties(dom, &requested, post_apply, database)?;
     // Bound actual instance trees, not only transport bytes or service count.
     // Zero is an internal whole-payload A/B control.
-    stages.next("index subtree sizes and native insertion order");
     let limit = std::env::var("RENIUM_NATIVE_IMPORT_BATCH_INSTANCES")
         .ok()
         .map(|value| value.parse::<usize>())
@@ -188,7 +182,6 @@ pub(super) fn encode_services(
             }
         }
     }
-    stages.next("partition bounded subtrees");
     let mut partitions = Vec::<Vec<RbxRef>>::new();
     let mut members = Vec::new();
     let mut cursor = 0;
@@ -204,22 +197,15 @@ pub(super) fn encode_services(
     if !members.is_empty() {
         partitions.push(members);
     }
-    stages.next("resolve repeated ancestors and cross-batch references");
     let primary = partitions
         .iter()
         .enumerate()
         .flat_map(|(index, members)| members.iter().map(move |referent| (*referent, index)))
         .collect::<AHashMap<_, _>>();
-    let trace_context = crate::app::timing::trace_context();
     let batch_references = partitions
         .par_iter_mut()
         .enumerate()
         .map(|(index, members)| {
-            let _context = crate::app::timing::enter_trace_context(trace_context);
-            let _trace = crate::app::timing::trace_scope(
-                "native.encode.worker",
-                "resolve batch ancestors and references",
-            );
             let mut repeated = Vec::new();
             let mut selected = members.iter().copied().collect::<AHashSet<_>>();
             // A repeated ancestor is only an identity anchor. Its properties load
@@ -277,7 +263,6 @@ pub(super) fn encode_services(
     }
     // A property present in only one batch must still emit its default in the
     // others. Studio constructor defaults can differ from serialized defaults.
-    stages.next("collect shared binary property schema");
     // Merge class schemas, not all instance property maps, on the coordinator.
     // Workers retain references into the same immutable DOM.
     let schemas = preorder
@@ -307,18 +292,10 @@ pub(super) fn encode_services(
             }
         }
     }
-    stages.next("join parallel binary batch encoding");
-    let trace_context = crate::app::timing::trace_context();
     let encoded = partitions
         .par_iter()
         .enumerate()
         .map(|(index, members)| {
-            let _context =
-                trace_context.map(|context| crate::app::timing::enter_trace_context(Some(context)));
-            let mut batch = crate::app::timing::trace_stages(
-                "native.encode.worker",
-                "prepare batch binding modes",
-            );
             let bindings = members
                 .iter()
                 .filter_map(|referent| {
@@ -335,10 +312,8 @@ pub(super) fn encode_services(
                 })
                 .collect::<HashMap<_, _>>();
             let mut bytes = Vec::new();
-            batch.next("serialize and compress instance columns");
             let receipts = rbx_binary::Serializer::new()
                 .serialize_selection_with_bindings(&mut bytes, dom, members, &bindings, &schema)?;
-            batch.next("collect class counts and retained identity receipts");
             let receipts = receipts
                 .into_iter()
                 .filter(|receipt| {
@@ -366,17 +341,11 @@ pub(super) fn encode_services(
                     tags_absent: false,
                 })
                 .collect::<Vec<_>>();
-            let services = service_roots
-                .iter()
-                .filter(|(_, root)| members.contains(root))
-                .map(|(name, _)| name.clone())
-                .collect();
-            Ok((bytes, receipts, classes, services))
+            Ok((bytes, receipts, classes))
         })
         .collect::<Result<Vec<_>>>()?;
-    stages.next("merge batch class ordinals and concatenate payloads");
     let mut counts = std::collections::BTreeMap::<String, u32>::new();
-    for (_, _, classes, _) in &encoded {
+    for (_, _, classes) in &encoded {
         for class in classes {
             *counts.entry(class.name.clone()).or_default() += class.count;
         }
@@ -404,13 +373,13 @@ pub(super) fn encode_services(
         .map(|(index, class)| (class.name.as_str(), index))
         .collect::<HashMap<_, _>>();
     let mut offsets = vec![0u32; classes.len()];
-    let mut bytes = Vec::with_capacity(encoded.iter().map(|(bytes, _, _, _)| bytes.len()).sum());
+    let mut bytes = Vec::with_capacity(encoded.iter().map(|(bytes, _, _)| bytes.len()).sum());
     let mut batches = Vec::with_capacity(encoded.len());
     let mut bindings = Vec::new();
     let mut aliases = Vec::new();
     let mut first_ordinals = HashMap::new();
     let mut referent_offset = 0;
-    for (payload, receipts, batch_classes, services) in encoded {
+    for (payload, receipts, batch_classes) in encoded {
         let start = bytes.len();
         bytes.extend_from_slice(&payload);
         for receipt in receipts {
@@ -445,11 +414,9 @@ pub(super) fn encode_services(
         let instance_count = i32::try_from(u32::from_le_bytes(payload[20..24].try_into()?))?;
         batches.push(EditorNativeBatch {
             bytes: start..bytes.len(),
-            services,
         });
         referent_offset += instance_count;
     }
-    stages.next("assemble plugin target metadata and release encoding scratch data");
     let groups = groups
         .into_iter()
         .zip(package_plans)

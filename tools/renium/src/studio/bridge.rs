@@ -2874,7 +2874,6 @@ impl BridgeServer {
         call: BridgeSocketCall<T>,
         label: &str,
     ) -> Result<T> {
-        let _trace = crate::app::timing::trace_scope("bridge.call", context.method);
         let mut last_error = None;
         let mut connected = false;
         let mut lock_deadline = Instant::now() + bridge_channel_lock_timeout(context.method);
@@ -3697,7 +3696,6 @@ impl BridgeServer {
         timeout: Option<Duration>,
         lease_id: Option<&str>,
     ) -> Result<BridgeResponse> {
-        let _trace = crate::app::timing::trace_scope("bridge.request", method);
         let started = Instant::now();
         let timeout = timeout.unwrap_or_else(|| bridge_response_timeout(method));
         if timeout.is_zero() {
@@ -3753,7 +3751,6 @@ impl BridgeServer {
         params: &Value,
         lease_id: Option<&str>,
     ) -> Result<String> {
-        let _trace = crate::app::timing::trace_scope("bridge.encode", method);
         #[derive(Serialize)]
         struct BridgeRequest<'a> {
             id: u64,
@@ -3786,7 +3783,6 @@ impl BridgeServer {
         method: &str,
         payload: String,
     ) -> Result<()> {
-        let _trace = crate::app::timing::trace_scope("bridge.send", method);
         bridge_socket
             .socket
             .send(Message::Text(payload.into()))
@@ -3805,7 +3801,6 @@ impl BridgeServer {
         method: &str,
         timeout: Duration,
     ) -> Result<BridgeResponse> {
-        let _trace = crate::app::timing::trace_scope("bridge.wait", method);
         let deadline = Instant::now() + timeout;
         let mut unrelated_messages = 0usize;
         let mut cancel_sent = false;
@@ -3925,14 +3920,6 @@ impl BridgeServer {
                             );
                         }
                         continue;
-                    }
-                    if crate::app::output::global_log_enabled(5)
-                        && let Some(timings) = parsed.get("timings")
-                    {
-                        crate::app::timing::trace_profile(
-                            &format!("bridge.response.{method}"),
-                            timings,
-                        );
                     }
                     let ok = parsed.get("ok").and_then(Value::as_bool).unwrap_or(false);
                     let response = if ok {

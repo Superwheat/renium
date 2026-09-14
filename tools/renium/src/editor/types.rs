@@ -539,7 +539,6 @@ pub(crate) struct EditorNativeReplacement {
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) struct EditorNativeBatch {
     pub(crate) bytes: std::ops::Range<usize>,
-    pub(crate) services: Vec<String>,
 }
 
 #[derive(Serialize)]
