@@ -29,6 +29,7 @@ use crate::snapshot::export::{
     PublishEntryState, PublishedProjectChanges, export_snapshots_with_warm_bridge,
 };
 use crate::studio::bridge::{BridgeRequestLease, BridgeServer, BridgeTarget};
+use crate::system::LockRecover;
 use crate::system::files::{OnDrop, atomic_write_file, fnv1a};
 use crate::system::watch::FileWatcher;
 
@@ -93,7 +94,7 @@ struct PluginLiveStatus {
 
 impl Control {
     fn plugin_live_status(&self) -> PluginLiveStatus {
-        let status = self.status.lock().unwrap_or_else(PoisonError::into_inner);
+        let status = self.status.lock_recover();
         PluginLiveStatus {
             running: status.running,
             paused: status.paused,
@@ -271,10 +272,7 @@ impl Control {
             .into_iter()
             .map(|path| absolute(path, &self.root))
             .collect::<Vec<_>>();
-        let mut changes = self
-            .file_changes
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut changes = self.file_changes.lock_recover();
         for path in paths {
             changes.notified.remove(&path);
             changes.queued.remove(&path);
@@ -289,17 +287,14 @@ impl Control {
             .into_iter()
             .map(|path| absolute(path, &self.root))
             .collect::<Vec<_>>();
-        let mut changes = self
-            .file_changes
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut changes = self.file_changes.lock_recover();
         for path in &paths {
             changes.notified.remove(path);
             changes.settled.remove(path);
             changes.queued.insert(path.clone());
         }
         drop(changes);
-        let mut status = self.status.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut status = self.status.lock_recover();
         let mut pending = status
             .pending_paths
             .iter()
@@ -317,10 +312,7 @@ impl Control {
     }
 
     fn notify_files(&self, paths: impl IntoIterator<Item = PathBuf>) {
-        let mut changes = self
-            .file_changes
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut changes = self.file_changes.lock_recover();
         changes
             .notified
             .extend(paths.into_iter().map(|path| absolute(path, &self.root)));
@@ -337,19 +329,10 @@ impl Control {
     }
 
     fn rebase(&self, rebase: Rebase, resume: bool) -> Result<()> {
-        let _serial = self
-            .reset_serial
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        *self
-            .file_changes
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = FileChanges::default();
+        let _serial = self.reset_serial.lock_recover();
+        *self.file_changes.lock_recover() = FileChanges::default();
         let sequence = {
-            let mut state = self
-                .reset_state
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let mut state = self.reset_state.lock_recover();
             state.requested = state.requested.saturating_add(1);
             state.error = None;
             state.rebase = Some(RebaseRequest {
@@ -360,12 +343,9 @@ impl Control {
         };
         self.reset.store(true, Ordering::Release);
         self.generation.fetch_add(1, Ordering::AcqRel);
-        let mut state = self
-            .reset_state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.reset_state.lock_recover();
         while state.completed < sequence {
-            if *self.finished.lock().unwrap_or_else(PoisonError::into_inner) {
+            if *self.finished.lock_recover() {
                 self.release_pause();
                 anyhow::bail!("Live sync watcher stopped before refreshing its project state");
             }
@@ -381,19 +361,13 @@ impl Control {
     }
 
     fn take_rebase(&self) -> Option<(u64, RebaseRequest)> {
-        let mut state = self
-            .reset_state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.reset_state.lock_recover();
         let sequence = state.requested;
         state.rebase.take().map(|rebase| (sequence, rebase))
     }
 
     fn complete_reset(&self, sequence: u64, error: Option<String>) {
-        let mut state = self
-            .reset_state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.reset_state.lock_recover();
         state.completed = sequence;
         state.error = error;
         drop(state);
@@ -402,19 +376,13 @@ impl Control {
 
     fn retry(&self) {
         self.retry.store(true, Ordering::Release);
-        self.status
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .error = None;
+        self.status.lock_recover().error = None;
         self.notify_sync_state();
     }
 
     fn set_pull_changes(&self, pull_changes: bool) {
         let changed = self.pull_changes.swap(pull_changes, Ordering::AcqRel) != pull_changes;
-        self.status
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .pull_changes = pull_changes;
+        self.status.lock_recover().pull_changes = pull_changes;
         if changed && pull_changes {
             self.retry_pull.store(true, Ordering::Release);
         }
@@ -425,14 +393,11 @@ impl Control {
 
     fn set_mode(&self, mode: PairMode) {
         self.writes_enabled.store(mode.writes(), Ordering::Release);
-        self.status
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .mode = mode.name().to_string();
+        self.status.lock_recover().mode = mode.name().to_string();
     }
 
     fn set_resolution_required(&self, required: bool) {
-        let mut status = self.status.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut status = self.status.lock_recover();
         if status.resolution_required != required {
             status.resolution_required = required;
             drop(status);
@@ -443,15 +408,9 @@ impl Control {
     fn pause(&self) {
         self.file_pause_count.fetch_add(1, Ordering::AcqRel);
         self.generation.fetch_add(1, Ordering::AcqRel);
-        self.status
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .paused = true;
+        self.status.lock_recover().paused = true;
         self.notify_sync_state();
-        let mut active = self
-            .sync_active
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut active = self.sync_active.lock_recover();
         while *active {
             active = self
                 .sync_idle
@@ -463,15 +422,9 @@ impl Control {
     fn replace_pause(&self, paused: bool) {
         self.file_pause_count.store(1, Ordering::Release);
         self.generation.fetch_add(1, Ordering::AcqRel);
-        self.status
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .paused = true;
+        self.status.lock_recover().paused = true;
         self.notify_sync_state();
-        let mut active = self
-            .sync_active
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut active = self.sync_active.lock_recover();
         while *active {
             active = self
                 .sync_idle
@@ -480,10 +433,7 @@ impl Control {
         }
         self.file_pause_count
             .store(u64::from(paused), Ordering::Release);
-        self.status
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .paused = paused;
+        self.status.lock_recover().paused = paused;
         self.notify_sync_state();
     }
 
@@ -499,10 +449,7 @@ impl Control {
                 Some(count.saturating_sub(1))
             })
             .unwrap_or(0);
-        self.status
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .paused = previous > 1;
+        self.status.lock_recover().paused = previous > 1;
         self.notify_sync_state();
     }
 
@@ -510,20 +457,14 @@ impl Control {
         if self.file_pause_count.load(Ordering::Acquire) > 0 {
             return None;
         }
-        let mut active = self
-            .sync_active
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut active = self.sync_active.lock_recover();
         if self.file_pause_count.load(Ordering::Acquire) > 0
             || self.generation.load(Ordering::Acquire) != generation
         {
             return None;
         }
         *active = true;
-        self.status
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .syncing = true;
+        self.status.lock_recover().syncing = true;
         Some(SyncActivity { control: self })
     }
 
@@ -531,16 +472,10 @@ impl Control {
         let deadline = Instant::now() + timeout;
         let mut activity = self.settle_activity.load(Ordering::Acquire);
         let mut quiet_since = Instant::now();
-        let mut active = self
-            .sync_active
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut active = self.sync_active.lock_recover();
         loop {
-            let status = self.status.lock().unwrap_or_else(PoisonError::into_inner);
-            let plugin = self
-                .plugin_state
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let status = self.status.lock_recover();
+            let plugin = self.plugin_state.lock_recover();
             let plugin_pending = studio_has_pending_changes(&plugin);
             let settled =
                 !*active && !status.paused && status.pending_paths.is_empty() && !plugin_pending;
@@ -600,19 +535,11 @@ impl Control {
     }
 
     fn snapshot(&self) -> Value {
-        json!(
-            self.status
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone()
-        )
+        json!(self.status.lock_recover().clone())
     }
 
     fn set_plugin_state(&self, state: Value) {
-        let mut current = self
-            .plugin_state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut current = self.plugin_state.lock_recover();
         if state["runtimeId"].as_str() == current["runtimeId"].as_str()
             && state["snapshotSeq"]
                 .as_u64()
@@ -644,17 +571,11 @@ impl Control {
     }
 
     fn plugin_snapshot(&self) -> Value {
-        self.plugin_state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        self.plugin_state.lock_recover().clone()
     }
 
     fn update_pending(&self, pending: &BTreeSet<PathBuf>) {
-        self.status
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .pending_paths = pending
+        self.status.lock_recover().pending_paths = pending
             .iter()
             .map(|path| {
                 path.strip_prefix(&self.root)
@@ -667,36 +588,23 @@ impl Control {
     }
 
     fn fail(&self, error: String) {
-        self.status
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .error = Some(error);
+        self.status.lock_recover().error = Some(error);
         self.notify_sync_state();
     }
 
     fn clear_error(&self) {
-        self.status
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .error = None;
+        self.status.lock_recover().error = None;
         self.notify_sync_state();
     }
 
     fn fail_studio_wait(&self, message: String) {
-        *self
-            .studio_wait_error
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(message.clone());
+        *self.studio_wait_error.lock_recover() = Some(message.clone());
         self.fail(message);
     }
 
     fn clear_studio_wait_error(&self) {
-        let expected = self
-            .studio_wait_error
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        let mut status = self.status.lock().unwrap_or_else(PoisonError::into_inner);
+        let expected = self.studio_wait_error.lock_recover().take();
+        let mut status = self.status.lock_recover();
         if expected
             .as_ref()
             .is_some_and(|error| status.error.as_ref() == Some(error))
@@ -707,27 +615,20 @@ impl Control {
 
     fn finish(&self) {
         self.request_stop();
-        if let Some(observer) = self
-            .observer_thread
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
+        if let Some(observer) = self.observer_thread.lock_recover().take()
             && observer.join().is_err()
         {
             self.fail("Live sync Studio observer panicked".to_string());
         }
-        self.status
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .running = false;
+        self.status.lock_recover().running = false;
         self.notify_sync_state();
-        *self.finished.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        *self.finished.lock_recover() = true;
         self.finished_event.notify_all();
         self.reset_event.notify_all();
     }
 
     fn wait_finished(&self) {
-        let mut finished = self.finished.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut finished = self.finished.lock_recover();
         while !*finished {
             finished = self
                 .finished_event
@@ -738,22 +639,14 @@ impl Control {
 
     fn request_stop(&self) {
         self.stop.store(true, Ordering::Release);
-        if let Some(lease) = self
-            .observer_lease
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-        {
+        if let Some(lease) = self.observer_lease.lock_recover().as_ref() {
             lease.cancel();
         }
     }
 
     fn begin_studio_wait(&self) -> Result<Arc<BridgeRequestLease>> {
         static NEXT_OBSERVER: AtomicU64 = AtomicU64::new(0);
-        let mut current = self
-            .observer_lease
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut current = self.observer_lease.lock_recover();
         if self.stop.load(Ordering::Acquire) {
             bail!("Live sync Studio observer stopped");
         }
@@ -804,16 +697,8 @@ struct SyncActivity<'a> {
 
 impl Drop for SyncActivity<'_> {
     fn drop(&mut self) {
-        *self
-            .control
-            .sync_active
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = false;
-        self.control
-            .status
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .syncing = false;
+        *self.control.sync_active.lock_recover() = false;
+        self.control.status.lock_recover().syncing = false;
         self.control.notify_sync_state();
     }
 }
@@ -875,7 +760,7 @@ impl Manager {
     }
 
     fn start_lock(&self, key: &str) -> Arc<Mutex<()>> {
-        let mut starts = self.starts.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut starts = self.starts.lock_recover();
         Arc::clone(
             starts
                 .entry(key.to_string())
@@ -883,18 +768,13 @@ impl Manager {
         )
     }
     fn session_alias(&self, context_id: u64) -> Option<SessionAlias> {
-        self.aliases
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&context_id)
-            .cloned()
+        self.aliases.lock_recover().get(&context_id).cloned()
     }
 
     fn session_key(&self, context_id: u64) -> Option<String> {
         let alias = self.session_alias(context_id)?;
         self.sessions
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+            .lock_recover()
             .get(&alias.key)
             .filter(|session| session.id == alias.session_id)
             .map(|_| alias.key)
@@ -903,8 +783,7 @@ impl Manager {
     fn control(&self, context_id: u64) -> Option<Arc<Control>> {
         let alias = self.session_alias(context_id)?;
         self.sessions
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+            .lock_recover()
             .get(&alias.key)
             .filter(|session| session.id == alias.session_id)
             .map(|session| Arc::clone(&session.control))
@@ -913,31 +792,18 @@ impl Manager {
     pub(crate) fn attach(&self, context: &BoundContext, bridge: &BridgeServer) -> Result<bool> {
         crate::plugins::verify_place_lease(context.place_id, context.resource_lease.as_ref())?;
         let key = self.coordinator.pair_key(context, bridge)?;
-        let alias = self
-            .sessions
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&key)
-            .and_then(|session| {
-                let running = session
-                    .control
-                    .status
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .running;
-                (running
-                    && !session.control.stop.load(Ordering::Acquire)
-                    && session.runtime_id == context.runtime_id)
-                    .then(|| SessionAlias {
-                        key: key.clone(),
-                        session_id: session.id,
-                    })
-            });
+        let alias = self.sessions.lock_recover().get(&key).and_then(|session| {
+            let running = session.control.status.lock_recover().running;
+            (running
+                && !session.control.stop.load(Ordering::Acquire)
+                && session.runtime_id == context.runtime_id)
+                .then(|| SessionAlias {
+                    key: key.clone(),
+                    session_id: session.id,
+                })
+        });
         if let Some(alias) = alias {
-            self.aliases
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(context.id, alias);
+            self.aliases.lock_recover().insert(context.id, alias);
             return Ok(true);
         }
         Ok(false)
@@ -989,8 +855,8 @@ impl Manager {
             ),
         );
         let start_lock = self.start_lock(&setup.key);
-        let _start = start_lock.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+        let _start = start_lock.lock_recover();
+        let mut sessions = self.sessions.lock_recover();
         while let Some((session_id, control, runtime_id)) =
             sessions.get(&setup.key).map(|session| {
                 (
@@ -1000,11 +866,7 @@ impl Manager {
                 )
             })
         {
-            let running = control
-                .status
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .running;
+            let running = control.status.lock_recover().running;
             if running
                 && !control.stop.load(Ordering::Acquire)
                 && runtime_id == context.runtime_id
@@ -1021,16 +883,13 @@ impl Manager {
                     control.pause();
                 }
                 drop(sessions);
-                self.aliases
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .insert(
-                        context.id,
-                        SessionAlias {
-                            key: setup.key,
-                            session_id,
-                        },
-                    );
+                self.aliases.lock_recover().insert(
+                    context.id,
+                    SessionAlias {
+                        key: setup.key,
+                        session_id,
+                    },
+                );
                 return Ok(StartResult {
                     status: control.snapshot(),
                     created: None,
@@ -1038,7 +897,7 @@ impl Manager {
             }
             drop(sessions);
             control.stop_and_wait();
-            sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+            sessions = self.sessions.lock_recover();
             if sessions.get(&setup.key).is_some_and(|current| {
                 current.id == session_id && Arc::ptr_eq(&current.control, &control)
             }) {
@@ -1046,10 +905,9 @@ impl Manager {
             }
             drop(sessions);
             self.aliases
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
+                .lock_recover()
                 .retain(|_, alias| alias.key != setup.key || alias.session_id != session_id);
-            sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+            sessions = self.sessions.lock_recover();
         }
         drop(sessions);
         if let Some(owner) = self.coordinator.claim_setup_target(&setup) {
@@ -1147,11 +1005,7 @@ impl Manager {
                     }
                 }
                 worker_control.request_stop();
-                worker_control
-                    .status
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .running = false;
+                worker_control.status.lock_recover().running = false;
                 if let Some(runtime_id) = report_runtime.as_deref() {
                     report_plugin_live_status(
                         &report_bridge,
@@ -1168,20 +1022,16 @@ impl Manager {
             key: session_key.clone(),
             session_id,
         };
-        self.sessions
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(
-                session_key.clone(),
-                Session {
-                    id: session_id,
-                    control: Arc::clone(&control),
-                    runtime_id,
-                },
-            );
+        self.sessions.lock_recover().insert(
+            session_key.clone(),
+            Session {
+                id: session_id,
+                control: Arc::clone(&control),
+                runtime_id,
+            },
+        );
         self.aliases
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+            .lock_recover()
             .insert(context_id, session_alias.clone());
         if start_sender.send(()).is_err() {
             self.stop_session(&session_alias);
@@ -1534,15 +1384,14 @@ impl Manager {
     fn stop_session(&self, alias: &SessionAlias) -> Value {
         let session = {
             self.sessions
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
+                .lock_recover()
                 .get(&alias.key)
                 .filter(|session| session.id == alias.session_id)
                 .map(|session| Arc::clone(&session.control))
         };
         if let Some(control) = session {
             control.stop_and_wait();
-            let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut sessions = self.sessions.lock_recover();
             if sessions.get(&alias.key).is_some_and(|current| {
                 current.id == alias.session_id && Arc::ptr_eq(&current.control, &control)
             }) {
@@ -1550,8 +1399,7 @@ impl Manager {
             }
             drop(sessions);
             self.aliases
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
+                .lock_recover()
                 .retain(|_, current| current != alias);
             let mut stopped = control.snapshot();
             if let Some(object) = stopped.as_object_mut()
@@ -1562,15 +1410,14 @@ impl Manager {
             stopped
         } else {
             self.aliases
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
+                .lock_recover()
                 .retain(|_, current| current != alias);
             json!({ "running": false })
         }
     }
 
     pub(crate) fn cancel(&self, context_id: u64) {
-        let mut aliases = self.aliases.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut aliases = self.aliases.lock_recover();
         let Some(alias) = aliases.remove(&context_id) else {
             return;
         };
@@ -2116,10 +1963,7 @@ fn start_studio_event_waiter(
             }
         })
         .context("Failed to start Studio event waiter")?;
-    *control
-        .observer_thread
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner) = Some(observer);
+    *control.observer_thread.lock_recover() = Some(observer);
     Ok((events, resume))
 }
 
@@ -2548,10 +2392,7 @@ fn apply_file_control_changes(
     control: &Control,
 ) -> Result<FileControlOutcome> {
     let (notified, queued, settled) = {
-        let mut changes = control
-            .file_changes
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut changes = control.file_changes.lock_recover();
         (
             std::mem::take(&mut changes.notified),
             std::mem::take(&mut changes.queued),
@@ -2589,12 +2430,7 @@ fn apply_file_control_changes(
             continue;
         }
         if let Err(error) = record_current_stamp(&path, baseline, pending, blocked) {
-            control
-                .file_changes
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .settled
-                .insert(path);
+            control.file_changes.lock_recover().settled.insert(path);
             control.fail(format!(
                 "Live sync could not settle a written file: {error:#}"
             ));
@@ -3058,11 +2894,7 @@ impl LiveLoop {
         } else {
             self.record_incremental_push(push, accepted);
         }
-        let mut status = self
-            .control
-            .status
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut status = self.control.status.lock_recover();
         record_successful_push(&mut status, auto_desynced_packages);
         if self.blocked.is_empty() {
             status.error = None;
@@ -3227,11 +3059,7 @@ impl LiveLoop {
                 self.pending.len()
             ),
         );
-        let mut status = self
-            .control
-            .status
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut status = self.control.status.lock_recover();
         status.pulls = status.pulls.saturating_add(1);
         status.error = None;
         drop(status);

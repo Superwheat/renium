@@ -4,9 +4,10 @@ use std::io::{BufRead, BufReader, Write};
 use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::OsStrExt;
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, PoisonError, mpsc};
+use std::sync::{Mutex, mpsc};
 use std::time::Duration;
 
+use crate::system::LockRecover;
 use anyhow::{Context, Result, anyhow, bail};
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_FILE_NOT_FOUND, FILETIME, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
@@ -82,7 +83,7 @@ impl BackendState {
         locator: &str,
         run: impl FnOnce(&OwnedHandle) -> Result<T>,
     ) -> Result<Option<T>> {
-        let mut jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut jobs = self.jobs.lock_recover();
         if !jobs.contains_key(locator) {
             let Some(job) = open_job(locator)? else {
                 return Ok(None);
@@ -102,10 +103,7 @@ impl BackendState {
     }
 
     pub(super) fn release(&self, locator: &str) {
-        self.jobs
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(locator);
+        self.jobs.lock_recover().remove(locator);
     }
 }
 

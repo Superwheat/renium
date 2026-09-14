@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -26,6 +26,7 @@ use crate::system::net::SharedTcpStream;
 
 #[cfg(any(windows, target_os = "macos"))]
 use crate::studio::input as input_inject;
+use crate::system::LockRecover;
 
 pub(crate) const DEFAULT_EXPORT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 pub(crate) const MAX_BRIDGE_CHUNK_BYTES: usize = 8 * 1024 * 1024;
@@ -722,11 +723,7 @@ impl NativeConnectionPreparation {
         if connection.role != BRIDGE_ROLE_EDIT
             || runtime.is_empty()
             || !alive.load(Ordering::Relaxed)
-            || !self
-                .pending
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(runtime.clone())
+            || !self.pending.lock_recover().insert(runtime.clone())
         {
             return;
         }
@@ -734,10 +731,7 @@ impl NativeConnectionPreparation {
         // discovers/validates addresses; it does not read or write properties.
         let started = Instant::now();
         let result = (self.prepare)(pid, &connection.bridge_info.place_name);
-        self.pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(runtime);
+        self.pending.lock_recover().remove(runtime);
         crate::app::output::log_global(
             4,
             format_args!(
@@ -901,11 +895,7 @@ pub(crate) struct BridgeRequestLeaseGuard<'a> {
 
 impl Drop for BridgeRequestLeaseGuard<'_> {
     fn drop(&mut self) {
-        let mut active = self
-            .bridge
-            .active_request_leases
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut active = self.bridge.active_request_leases.lock_recover();
         if active
             .get(&self.thread_id)
             .is_some_and(|current| Arc::ptr_eq(current, &self.lease))
@@ -1019,10 +1009,7 @@ impl BridgeServer {
     ) -> Result<BridgeRequestLeaseGuard<'_>> {
         lease.arm()?;
         let thread_id = thread::current().id();
-        let mut active = self
-            .active_request_leases
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut active = self.active_request_leases.lock_recover();
         if active.contains_key(&thread_id) {
             lease.disarm();
             bail!("Another Renium request lease is already active");
@@ -1044,10 +1031,7 @@ impl BridgeServer {
     ) -> Result<BridgeRequestLeaseGuard<'_>> {
         lease.ensure_active()?;
         let thread_id = thread::current().id();
-        let mut active = self
-            .active_request_leases
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut active = self.active_request_leases.lock_recover();
         if active.contains_key(&thread_id) {
             bail!("Another Renium request lease is already active");
         }
@@ -1062,8 +1046,7 @@ impl BridgeServer {
 
     pub(crate) fn active_request_lease(&self) -> Option<Arc<BridgeRequestLease>> {
         self.active_request_leases
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+            .lock_recover()
             .get(&thread::current().id())
             .cloned()
     }
@@ -1166,10 +1149,7 @@ impl BridgeServer {
                 sockets: Mutex::new(HashMap::new()),
                 snapshots: Mutex::new(HashMap::new()),
             });
-            all_channels
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(Arc::clone(&channel));
+            all_channels.lock_recover().push(Arc::clone(&channel));
             Self::spawn_accept_loop(
                 bind_host.clone(),
                 *port,
@@ -1363,13 +1343,9 @@ impl BridgeServer {
                                             );
                                         }
                                     }
-                                    let mut guard = channel
-                                        .sockets
-                                        .lock()
-                                        .unwrap_or_else(PoisonError::into_inner);
+                                    let mut guard = channel.sockets.lock_recover();
                                     {
-                                        let mut routing =
-                                            routing.lock().unwrap_or_else(PoisonError::into_inner);
+                                        let mut routing = routing.lock_recover();
                                         if !routing.allows(&socket.bridge_info) {
                                             return;
                                         }
@@ -1408,10 +1384,7 @@ impl BridgeServer {
                                     }
                                     let connection = BridgeConnection::new(socket);
                                     // Register before acknowledging, but don't send under the registry lock.
-                                    let mut socket = connection
-                                        .io
-                                        .lock()
-                                        .unwrap_or_else(PoisonError::into_inner);
+                                    let mut socket = connection.io.lock_recover();
                                     guard.insert(socket_key.clone(), connection.clone());
                                     Self::refresh_channel_snapshots(&channel, &guard);
                                     drop(guard);
@@ -1460,29 +1433,22 @@ impl BridgeServer {
                                         input_inject::watch_auto_recovery_dialog_for_pid(pid);
                                     }
                                     if let Some(runtime_id) = device_runtime {
-                                        let channels = all_channels
-                                            .lock()
-                                            .unwrap_or_else(PoisonError::into_inner)
-                                            .clone();
+                                        let channels = all_channels.lock_recover().clone();
                                         let ready = channels
                                             .iter()
                                             .filter(|channel| {
-                                                channel
-                                                    .sockets
-                                                    .lock()
-                                                    .unwrap_or_else(PoisonError::into_inner)
-                                                    .values()
-                                                    .any(|socket| {
+                                                channel.sockets.lock_recover().values().any(
+                                                    |socket| {
                                                         socket.role == BRIDGE_ROLE_EDIT
                                                             && socket.bridge_info.runtime_id
                                                                 == runtime_id
-                                                    })
+                                                    },
+                                                )
                                             })
                                             .count();
                                         if ready >= expected_channels
                                             && device_reconciled_runtimes
-                                                .lock()
-                                                .unwrap_or_else(PoisonError::into_inner)
+                                                .lock_recover()
                                                 .insert(runtime_id.clone())
                                         {
                                             Self::apply_desired_device_state(
@@ -1537,10 +1503,7 @@ impl BridgeServer {
     ) {
         thread::spawn(move || {
             let call_device = |request: &Value| -> Result<(Value, String)> {
-                let sockets = channel
-                    .sockets
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
+                let sockets = channel.sockets.lock_recover();
                 let socket = sockets
                     .values()
                     .find(|socket| {
@@ -1550,7 +1513,7 @@ impl BridgeServer {
                     .cloned()
                     .context("Studio disconnected before device state could be restored")?;
                 drop(sockets);
-                let mut socket = socket.io.lock().unwrap_or_else(PoisonError::into_inner);
+                let mut socket = socket.io.lock_recover();
                 let peer = socket.peer.clone();
                 let id = next_id.fetch_add(1, Ordering::Relaxed);
                 let result = Self::call_on_socket_with_timeout(
@@ -1584,10 +1547,7 @@ impl BridgeServer {
                     thread::sleep(Duration::from_secs_f64(settle_seconds));
                 }
 
-                let request = desired_device_request
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .clone();
+                let request = desired_device_request.lock_recover().clone();
                 let apply = |request: &Value| -> Result<String> {
                     call_device(request).map(|(_, peer)| peer)
                 };
@@ -1623,25 +1583,18 @@ impl BridgeServer {
             }
             if applied.is_err() {
                 device_reconciled_runtimes
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
+                    .lock_recover()
                     .remove(&runtime_id);
             }
         });
     }
 
     pub(crate) fn set_desired_device_request(&self, request: Value) {
-        *self
-            .desired_device_request
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = request;
+        *self.desired_device_request.lock_recover() = request;
     }
 
     pub(crate) fn merge_desired_device_request(&self, request: Value) {
-        let mut desired = self
-            .desired_device_request
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut desired = self.desired_device_request.lock_recover();
         let (Some(current), Some(update)) = (desired.as_object_mut(), request.as_object()) else {
             *desired = request;
             return;
@@ -1686,9 +1639,7 @@ impl BridgeServer {
         checked_runtimes: Arc<Mutex<HashSet<String>>>,
     ) {
         {
-            let mut checked = checked_runtimes
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let mut checked = checked_runtimes.lock_recover();
             if !checked.insert(runtime_id.clone()) {
                 return;
             }
@@ -1698,18 +1649,12 @@ impl BridgeServer {
             let version = match update::latest_release_version() {
                 Ok(version) => version,
                 Err(error) => {
-                    checked_runtimes
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .remove(&runtime_id);
+                    checked_runtimes.lock_recover().remove(&runtime_id);
                     eprintln!("[renium] update check failed: {error:#}");
                     return;
                 }
             };
-            let sockets = channel
-                .sockets
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let sockets = channel.sockets.lock_recover();
             let Some(socket) = sockets
                 .values()
                 .find(|socket| {
@@ -1717,14 +1662,11 @@ impl BridgeServer {
                 })
                 .cloned()
             else {
-                checked_runtimes
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .remove(&runtime_id);
+                checked_runtimes.lock_recover().remove(&runtime_id);
                 return;
             };
             drop(sockets);
-            let mut socket = socket.io.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut socket = socket.io.lock_recover();
             let id = next_id.fetch_add(1, Ordering::Relaxed);
             if let Err(error) = Self::call_on_socket_with_timeout(
                 &mut socket,
@@ -1734,10 +1676,7 @@ impl BridgeServer {
                 None,
                 None,
             ) {
-                checked_runtimes
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .remove(&runtime_id);
+                checked_runtimes.lock_recover().remove(&runtime_id);
                 eprintln!("[renium] failed to send update status to Studio: {error:#}");
             }
         });
@@ -1759,16 +1698,12 @@ impl BridgeServer {
             while alive.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_millis(300));
 
-                if !verified
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .is_empty()
-                {
+                if !verified.lock_recover().is_empty() {
                     // Reuse lifecycle polling; don't retain a closed DataModel
                     // or its native subscription until another push arrives.
                     let signatures = Self::connection_signatures(&channels);
                     let evicted = {
-                        let mut entries = verified.lock().unwrap_or_else(PoisonError::into_inner);
+                        let mut entries = verified.lock_recover();
                         let keys = entries
                             .iter()
                             .filter(|(runtime, entry)| {
@@ -1785,10 +1720,7 @@ impl BridgeServer {
                 }
 
                 let multiple_plugins = channels.iter().any(|channel| {
-                    let guard = channel
-                        .sockets
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner);
+                    let guard = channel.sockets.lock_recover();
                     guard.len() > 1
                 });
                 if !multiple_plugins {
@@ -1828,10 +1760,7 @@ impl BridgeServer {
 
                 let now = Instant::now();
                 for channel in &channels {
-                    let mut guard = channel
-                        .sockets
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner);
+                    let mut guard = channel.sockets.lock_recover();
                     for socket in guard.values_mut() {
                         let peer_port = socket
                             .peer
@@ -2143,10 +2072,7 @@ impl BridgeServer {
     }
 
     pub(crate) fn clear_runtime_pins(&self) {
-        self.runtime_pins
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
+        self.runtime_pins.lock_recover().clear();
     }
 
     #[cfg(any(windows, target_os = "macos"))]
@@ -2155,8 +2081,7 @@ impl BridgeServer {
         for channel in channels {
             let connections = channel
                 .sockets
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
+                .lock_recover()
                 .values()
                 .filter(|connection| connection.role == BRIDGE_ROLE_EDIT)
                 .cloned()
@@ -2187,18 +2112,13 @@ impl BridgeServer {
     pub(crate) fn retire_runtime(&self, runtime_id: &str) {
         #[cfg(any(windows, target_os = "macos"))]
         {
-            let cached = self
-                .verified_full_pushes
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(runtime_id);
+            let cached = self.verified_full_pushes.lock_recover().remove(runtime_id);
             drop(cached);
         }
         // Retire before best-effort cleanup: neither a busy channel nor an
         // in-flight handshake may resurrect this runtime.
         self.routing
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+            .lock_recover()
             .retired
             .insert(runtime_id.to_string());
         for channel in &self.channels {
@@ -2225,22 +2145,18 @@ impl BridgeServer {
             }
         }
         self.runtime_pins
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+            .lock_recover()
             .retain(|_, pin| pin.runtime_id != runtime_id);
     }
 
     pub(crate) fn pin_runtime(&self, target: BridgeTarget, runtime_id: &str) {
-        self.runtime_pins
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
-                Self::runtime_pin_key(target, None),
-                RuntimePin {
-                    runtime_id: runtime_id.to_string(),
-                    exact: true,
-                },
-            );
+        self.runtime_pins.lock_recover().insert(
+            Self::runtime_pin_key(target, None),
+            RuntimePin {
+                runtime_id: runtime_id.to_string(),
+                exact: true,
+            },
+        );
     }
 
     pub(crate) fn choose_runtime_pin(
@@ -2385,18 +2301,10 @@ impl BridgeServer {
                 runtime_id,
                 exact: false,
             };
-            self.runtime_pins
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(key, pin.clone());
+            self.runtime_pins.lock_recover().insert(key, pin.clone());
             return Ok(pin);
         }
-        let existing = self
-            .runtime_pins
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&key)
-            .cloned();
+        let existing = self.runtime_pins.lock_recover().get(&key).cloned();
         if let Some(pin) = existing {
             if pin.exact {
                 return Ok(pin);
@@ -2426,15 +2334,9 @@ impl BridgeServer {
                 return Ok(pin);
             }
         }
-        self.runtime_pins
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&key);
+        self.runtime_pins.lock_recover().remove(&key);
         let pin = self.choose_runtime_pin(target, player)?;
-        let mut pins = self
-            .runtime_pins
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut pins = self.runtime_pins.lock_recover();
         Ok(pins.entry(key).or_insert(pin).clone())
     }
 
@@ -2618,10 +2520,7 @@ impl BridgeServer {
             // registry invents a disconnection during ordinary lifecycle polling.
             // Release it before probing I/O; a busy command still counts as alive.
             let connection = {
-                let guard = channel
-                    .sockets
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
+                let guard = channel.sockets.lock_recover();
                 self.select_role_for_selector_with_pin(&guard, target, None, runtime_pin)
                     .and_then(|role| guard.get(&role).cloned())
             };
@@ -2688,10 +2587,7 @@ impl BridgeServer {
     }
 
     fn remove_connection(channel: &BridgeChannel, key: &str, connection: &BridgeConnection) {
-        let mut sockets = channel
-            .sockets
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut sockets = channel.sockets.lock_recover();
         // A late failure belongs to the old connection, never its replacement.
         if sockets
             .get(key)
@@ -2723,21 +2619,12 @@ impl BridgeServer {
             })
             .collect::<HashMap<_, _>>();
         let values = snapshots.values().cloned().collect();
-        *channel
-            .snapshots
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = snapshots;
+        *channel.snapshots.lock_recover() = snapshots;
         values
     }
 
     fn cached_channel_snapshots(channel: &BridgeChannel) -> Vec<BridgeSocketSnapshot> {
-        channel
-            .snapshots
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .values()
-            .cloned()
-            .collect()
+        channel.snapshots.lock_recover().values().cloned().collect()
     }
 
     pub(crate) fn is_transport_error_text(text: &str) -> bool {
@@ -2780,8 +2667,7 @@ impl BridgeServer {
     ) -> Result<(Option<T>, bool)> {
         if self
             .routing
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+            .lock_recover()
             .retired
             .contains(&context.runtime_pin.runtime_id)
         {
@@ -3082,8 +2968,7 @@ impl BridgeServer {
             && let Some(nonce) = result.get("launchNonce").and_then(Value::as_str)
         {
             self.routing
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
+                .lock_recover()
                 .observe_launch(&runtime_pin.runtime_id, id, nonce);
         }
         Ok(result)
@@ -3279,14 +3164,11 @@ impl BridgeServer {
     }
 
     fn runtime_is_routable(&self, info: &BridgeInfoPayload) -> bool {
-        self.routing
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .allows(info)
+        self.routing.lock_recover().allows(info)
     }
 
     pub(crate) fn retain_current_clients(&self, clients: &mut Vec<Value>) {
-        let routing = self.routing.lock().unwrap_or_else(PoisonError::into_inner);
+        let routing = self.routing.lock_recover();
         clients.retain(|client| {
             routing.allows_identity(
                 client["runtimeId"].as_str().unwrap_or_default(),
@@ -3337,10 +3219,7 @@ impl BridgeServer {
                     let player_name = socket.bridge_info.player_name.clone();
                     let player_user_id = socket.bridge_info.player_user_id;
                     drop(socket);
-                    let mut sockets = channel
-                        .sockets
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner);
+                    let mut sockets = channel.sockets.lock_recover();
                     if let Some(current) = sockets.get_mut(&key)
                         && Arc::ptr_eq(&current.io, &connection.io)
                     {
@@ -3976,19 +3855,11 @@ impl Drop for BridgeServer {
         self.alive.store(false, Ordering::Relaxed);
         #[cfg(any(windows, target_os = "macos"))]
         {
-            let cached = std::mem::take(
-                &mut *self
-                    .verified_full_pushes
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner),
-            );
+            let cached = std::mem::take(&mut *self.verified_full_pushes.lock_recover());
             drop(cached);
         }
         for channel in &self.channels {
-            let mut guard = channel
-                .sockets
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let mut guard = channel.sockets.lock_recover();
             for (_, socket) in guard.drain() {
                 socket.close();
             }

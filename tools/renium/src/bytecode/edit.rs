@@ -539,10 +539,7 @@ fn remap_ref_object(object: &mut Map<String, Value>, refs: &BytecodeCloneRefMap)
     for selector in SETTINGS_REFERENCE_SELECTOR_KEYS {
         object.remove(selector);
     }
-    object.insert(
-        "instanceIndex".to_string(),
-        Value::Number(serde_json::Number::from((new_index + 1) as u64)),
-    );
+    object.insert("instanceIndex".to_string(), json!((new_index + 1) as u64));
     true
 }
 

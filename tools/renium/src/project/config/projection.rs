@@ -46,6 +46,7 @@ use super::{
     remove_cached_script_naming, remove_empty_stage_parents, resolve_project_write_path,
     validate_instance_target, with_project_target,
 };
+use crate::system::LockRecover;
 
 pub(super) fn compile_projection(loaded: &LoadedProject) -> CompiledProjection {
     let mut entries = Vec::new();
@@ -253,8 +254,7 @@ pub fn stage_project(loaded: &LoadedProject) -> Result<ProjectionStage> {
 fn projection_cache_entry(key: &Path) -> super::ProjectionCacheEntry {
     let cache = PROJECTION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .lock_recover()
         .entry(key.to_path_buf())
         .or_default()
         .clone()
@@ -267,9 +267,7 @@ pub fn stage_project_cached(
     let project_hash = sha256_hex(&serde_json::to_vec(&loaded.project)?);
     let key = fs::canonicalize(&loaded.path).unwrap_or_else(|_| absolute_path(&loaded.path));
     let entry_lock = projection_cache_entry(&key);
-    let mut cache = entry_lock
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut cache = entry_lock.lock_recover();
     let reusable = cache
         .as_ref()
         .is_some_and(|entry| entry.project_hash == project_hash && entry.root.is_dir());
@@ -1436,10 +1434,7 @@ impl MountedReferenceRemapper<'_> {
                             .and_then(|index| index.checked_sub(1))
                             && let Some(new) = self.indices.get(&old)
                         {
-                            object.insert(
-                                "instanceIndex".to_string(),
-                                Value::Number(serde_json::Number::from((new + 1) as u64)),
-                            );
+                            object.insert("instanceIndex".to_string(), json!((new + 1) as u64));
                         }
                         if let Some(paths) =
                             object.get_mut("pathSegments").and_then(Value::as_array_mut)
@@ -1460,20 +1455,14 @@ impl MountedReferenceRemapper<'_> {
                                 let tail = source_ordinals
                                     .into_iter()
                                     .skip(self.path_root_components)
-                                    .map(|ordinal| {
-                                        Value::Number(serde_json::Number::from(ordinal as u64))
-                                    })
+                                    .map(|ordinal| json!(ordinal as u64))
                                     .collect::<Vec<_>>();
                                 object.insert(
                                     "pathOrdinals".to_string(),
                                     Value::Array(
                                         self.target_ordinals
                                             .iter()
-                                            .map(|ordinal| {
-                                                Value::Number(serde_json::Number::from(
-                                                    *ordinal as u64,
-                                                ))
-                                            })
+                                            .map(|ordinal| json!(*ordinal as u64))
                                             .chain(tail)
                                             .collect(),
                                     ),

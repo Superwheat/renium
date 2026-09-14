@@ -1,5 +1,6 @@
 //! Keep a background dialog and its owners out of Windows' activation fallback
 //! while the dialog closes. Never activate another app or change window z-order.
+use crate::system::LockRecover;
 use anyhow::{Result, bail};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -50,9 +51,7 @@ impl BackgroundDialogGuard {
                 break;
             }
             {
-                let mut leases = leases()
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut leases = leases().lock_recover();
                 if let std::collections::hash_map::Entry::Vacant(entry) = leases.entry(key) {
                     let style = unsafe { GetWindowLongPtrW(window, GWL_EXSTYLE) };
                     let added = style & WS_EX_NOACTIVATE as isize == 0;
@@ -72,9 +71,7 @@ impl BackgroundDialogGuard {
 
 impl Drop for BackgroundDialogGuard {
     fn drop(&mut self) {
-        let mut leases = leases()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut leases = leases().lock_recover();
         for key in &self.0 {
             let Some(lease) = leases.get_mut(key) else {
                 continue;

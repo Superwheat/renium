@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use ahash::AHashMap;
@@ -65,6 +65,7 @@ use crate::system::files::{
 pub(crate) mod history;
 mod store;
 
+use crate::system::LockRecover;
 use store::StoredSnapshot;
 
 const RECORD_VERSION: u8 = 2;
@@ -344,11 +345,7 @@ fn take_verified_full_push(
     };
     // Take ownership before any RPC or native cleanup: another place must not
     // wait behind this place's verification or an expired observer's teardown.
-    let cached = bridge
-        .verified_full_pushes
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .remove(runtime);
+    let cached = bridge.verified_full_pushes.lock_recover().remove(runtime);
     let Some(cached) = cached else {
         return Ok(None);
     };
@@ -461,10 +458,7 @@ fn retain_verified_full_push(
         _attributes: attributes,
     };
     let evicted = {
-        let mut entries = bridge
-            .verified_full_pushes
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut entries = bridge.verified_full_pushes.lock_recover();
         let expired = entries
             .iter()
             .filter(|(_, value)| value.created.elapsed() >= Duration::from_secs(60))
@@ -797,8 +791,7 @@ impl Coordinator {
         let pair = identity.pair_key();
         Ok(self
             .owners
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+            .lock_recover()
             .by_target
             .get(&identity.target_key())
             .filter(|(owner_pair, _)| owner_pair != &pair)
@@ -806,7 +799,7 @@ impl Coordinator {
     }
 
     fn pair_lock(&self, key: &str) -> Arc<Mutex<()>> {
-        let mut pairs = self.pairs.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut pairs = self.pairs.lock_recover();
         Arc::clone(
             pairs
                 .entry(key.to_string())
@@ -831,7 +824,7 @@ impl Coordinator {
         let current_local_file_stamp = local_file_stamp(identity.local_file.as_deref())?;
         let pair_key = identity.pair_key();
         let pair_lock = self.pair_lock(&pair_key);
-        let _pair = pair_lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let _pair = pair_lock.lock_recover();
         let mut mode = requested_mode;
         let unresolved_local = identity.game_id.is_none()
             && identity.place_id.is_none()
@@ -962,7 +955,7 @@ impl Coordinator {
         // Every operation that needs both locks takes the bridge gate first.
         // LiveLoop::execute_push already follows this order.
         let pair_lock = self.pair_lock(&setup.key);
-        let _pair = pair_lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let _pair = pair_lock.lock_recover();
         let mut record = load_record(context, &setup.key)?
             .context("Reconciliation state disappeared while starting Live Sync")?;
         let _selection = bound_context::select(context);
@@ -1391,7 +1384,7 @@ impl Coordinator {
             return Ok(());
         }
         let pair_lock = self.pair_lock(key);
-        let _pair = pair_lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let _pair = pair_lock.lock_recover();
         let mut record = load_record(context, key)?.context("Reconciliation state is missing")?;
         if record.mode != PairMode::Reconcile {
             return Ok(());
@@ -1427,7 +1420,7 @@ impl Coordinator {
             return Ok(());
         };
         let pair_lock = self.pair_lock(key);
-        let _pair = pair_lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let _pair = pair_lock.lock_recover();
         let mut record = load_record(context, key)?.context("Reconciliation state is missing")?;
         if record.baseline.is_none() || !record.conflicts.is_empty() {
             return Ok(());
@@ -1443,7 +1436,7 @@ impl Coordinator {
         bridge: &BridgeServer,
     ) -> Result<()> {
         let pair_lock = self.pair_lock(key);
-        let _pair = pair_lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let _pair = pair_lock.lock_recover();
         let mut record = load_record(context, key)?.context("Reconciliation state is missing")?;
         if record.mode != PairMode::Reconcile {
             bail!("Live Sync is not allowed to write in verify mode");
@@ -1476,7 +1469,7 @@ impl Coordinator {
             return Ok(());
         }
         let pair_lock = self.pair_lock(key);
-        let _pair = pair_lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let _pair = pair_lock.lock_recover();
         let record = load_record(context, key)?.context("Reconciliation state is missing")?;
         if record.mode != PairMode::Reconcile {
             return Ok(());
@@ -1511,7 +1504,7 @@ impl Coordinator {
         }
         let pair_lock = self.pair_lock(key);
         let phase = Instant::now();
-        let _pair = pair_lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let _pair = pair_lock.lock_recover();
         log_reconcile_timing("incremental pair lock", phase);
         let phase = Instant::now();
         let mut record = load_record(context, key)?.context("Reconciliation state is missing")?;
@@ -1666,7 +1659,7 @@ impl Coordinator {
         paths: &[PathBuf],
     ) -> Result<BTreeMap<String, String>> {
         let pair_lock = self.pair_lock(key);
-        let _pair = pair_lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let _pair = pair_lock.lock_recover();
         let record = load_record(context, key)?.context("Reconciliation state is missing")?;
         let baseline = record
             .baseline
@@ -1703,7 +1696,7 @@ impl Coordinator {
     }
 
     fn claim_target(&self, identity: &PairIdentity) -> Option<String> {
-        let mut owners = self.owners.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut owners = self.owners.lock_recover();
         let target = identity.target_key();
         let pair = identity.pair_key();
         match owners.by_target.get(&target) {
@@ -1720,7 +1713,7 @@ impl Coordinator {
     }
 
     pub(crate) fn release_target(&self, pair: &str) {
-        let mut owners = self.owners.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut owners = self.owners.lock_recover();
         let Some(target) = owners.target_by_pair.remove(pair) else {
             return;
         };
@@ -2604,8 +2597,7 @@ fn push_project(
         if let Some(runtime) = context.runtime_id.as_deref() {
             bridge
                 .verified_full_pushes
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
+                .lock_recover()
                 .insert(runtime.to_string(), candidate.cached);
         }
         return Ok(Map::from_iter([

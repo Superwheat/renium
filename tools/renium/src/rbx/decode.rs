@@ -1101,11 +1101,11 @@ fn rbx_variant_to_settings_json_inner(
         RbxVariant::Int32(value) if preserve_type => {
             Some(json!({"_type":"Int32","value":value}))
         }
-        RbxVariant::Int32(value) => Some(Value::Number(Number::from(*value))),
+        RbxVariant::Int32(value) => Some(json!(*value)),
         RbxVariant::Int64(value) if preserve_type => {
             Some(json!({"_type":"Int64","value":value}))
         }
-        RbxVariant::Int64(value) => Some(Value::Number(Number::from(*value))),
+        RbxVariant::Int64(value) => Some(json!(*value)),
         RbxVariant::Float32(value) if preserve_type => {
             Some(json!({"_type":"Float32","value":json_number_f64(*value as f64)}))
         }
@@ -1296,10 +1296,7 @@ fn rbx_ref_to_settings_json(referent: RbxRef, refs: &BytecodeModelImportRefs) ->
     let mut out = Map::new();
     out.insert("_type".to_string(), Value::String("Ref".to_string()));
     if let Some(new_index) = imported_instance_index(refs, referent) {
-        out.insert(
-            "instanceIndex".to_string(),
-            Value::Number(Number::from((new_index + 1) as u64)),
-        );
+        out.insert("instanceIndex".to_string(), json!((new_index + 1) as u64));
         if let Some(settings_id) = refs.settings_id_by_ref.get(&referent) {
             out.insert("settingsId".to_string(), Value::String(settings_id.clone()));
         }
@@ -1321,7 +1318,7 @@ fn rbx_ref_to_settings_json(referent: RbxRef, refs: &BytecodeModelImportRefs) ->
             Value::Array(
                 path_ordinals
                     .iter()
-                    .map(|ordinal| Value::Number(Number::from(*ordinal as u64)))
+                    .map(|ordinal| json!(*ordinal as u64))
                     .collect(),
             ),
         );
@@ -1347,7 +1344,7 @@ fn rbx_enum_to_settings_json(
     }
     out.entry("name".to_string())
         .or_insert_with(|| Value::String(enum_value.to_string()));
-    out.insert("value".to_string(), Value::Number(Number::from(enum_value)));
+    out.insert("value".to_string(), json!(enum_value));
     Value::Object(out)
 }
 

@@ -12,7 +12,7 @@ use rayon::prelude::*;
 use rbx_dom_weak::types::{Ref as RbxRef, Variant as RbxVariant};
 use rbx_dom_weak::{InstanceBuilder as RbxInstanceBuilder, WeakDom as RbxWeakDom};
 use rbx_reflection::PropertyDescriptor as RbxPropertyDescriptor;
-use serde_json::{Map, Number, Value, json};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
@@ -631,7 +631,7 @@ fn canonicalize_settings_reference_documents_scoped(
             target
                 .path_ordinals
                 .iter()
-                .map(|ordinal| Value::Number(Number::from(*ordinal as u64)))
+                .map(|ordinal| json!(*ordinal as u64))
                 .collect(),
         );
         if object.get("pathOrdinals") != Some(&path_ordinals) {

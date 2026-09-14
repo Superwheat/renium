@@ -3,7 +3,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -12,11 +12,12 @@ use anyhow::{Context, Result, bail};
 use memchr::memmem;
 use rayon::prelude::*;
 use serde::Serialize;
-use serde_json::{Map, Number, Value};
+use serde_json::{Map, Value, json};
 
 use crate::rbx::decode::{json_number_f64, nonfinite_float_from_json};
 use crate::roblox::schema::MESH_SIZE_TRANSPORT_PROPERTY;
 use crate::snapshot::types::{NativeSettingsValue, ServiceState, SnapshotInstance};
+use crate::system::LockRecover;
 use crate::system::files::write_bytes_if_changed;
 
 const SETTINGS_BINARY_MAGIC: &[u8] = b"RBSSET\0";
@@ -129,7 +130,7 @@ fn cached_settings_document(bytes: &[u8]) -> Result<Arc<SettingsBytecode>> {
     let cache =
         SETTINGS_DOCUMENT_CACHE.get_or_init(|| Mutex::new(SettingsDocumentCache::default()));
     {
-        let mut cache = cache.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut cache = cache.lock_recover();
         if let Some(index) = cache
             .entries
             .iter()
@@ -147,7 +148,7 @@ fn cached_settings_document(bytes: &[u8]) -> Result<Arc<SettingsBytecode>> {
 
     let document = Arc::new(decode_settings_bytecode(bytes)?);
     let mut evicted = Vec::new();
-    let mut cache = cache.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut cache = cache.lock_recover();
     if let Some(index) = cache
         .entries
         .iter()
@@ -1338,10 +1339,8 @@ fn decode_raw_value_payload(
         0 => Ok(Value::Null),
         1 => Ok(Value::Bool(false)),
         2 => Ok(Value::Bool(true)),
-        3 => Ok(Value::Number(Number::from(unzigzag_i64(
-            reader.read_var_u64()?,
-        )))),
-        4 => Ok(Value::Number(Number::from(reader.read_var_u64()?))),
+        3 => Ok(json!(unzigzag_i64(reader.read_var_u64()?,))),
+        4 => Ok(json!(reader.read_var_u64()?)),
         5 => Ok(json_number_f64(read_f64(reader)?)),
         6 => Ok(Value::String(
             reader.read_string(strings, "value string id")?.to_string(),
@@ -1395,10 +1394,7 @@ fn decode_raw_value_payload(
             }
             Ok(typed_object(
                 "Ref",
-                [(
-                    "instanceIndex",
-                    Value::Number(Number::from(target_index + 1)),
-                )],
+                [("instanceIndex", json!(target_index + 1))],
             ))
         }
         18 => decode_fixed_numeric_payload(reader, "Rect", &["minX", "minY", "maxX", "maxY"]),
@@ -1539,9 +1535,9 @@ fn decode_ref_fallback_payload(
         let len = reader.read_collection_len("ref path ordinal count")?;
         let mut ordinals = Vec::with_capacity(len);
         for _ in 0..len {
-            ordinals.push(Value::Number(Number::from(
-                reader.read_var_u64().context("Missing ref path ordinal")?,
-            )));
+            ordinals.push(json!(
+                reader.read_var_u64().context("Missing ref path ordinal")?
+            ));
         }
         out.insert("pathOrdinals".to_string(), Value::Array(ordinals));
     }
@@ -1652,10 +1648,7 @@ fn decode_resolved_ref_group_payload(
     *previous_target_index = target_index;
     Ok(typed_object(
         "Ref",
-        [(
-            "instanceIndex",
-            Value::Number(Number::from(target_index + 1)),
-        )],
+        [("instanceIndex", json!(target_index + 1))],
     ))
 }
 

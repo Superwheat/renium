@@ -15,6 +15,7 @@ use crate::app::timing::current_millis;
 use crate::studio::native::snapshot::{
     NativeSnapshot, NativeSnapshotRoots, finalize_native_snapshot, temporary_output_path,
 };
+use crate::system::LockRecover;
 use crate::system::files::{atomic_write_file, sha256_hex};
 
 #[path = "macos_properties.rs"]
@@ -588,8 +589,7 @@ fn trace_studio(path: &Path) -> Result<SerializerTrace> {
     let modified = metadata.modified().ok();
     let cache = TRACES.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(trace) = cache
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
+        .lock_recover()
         .get(path)
         .filter(|cached| cached.len == metadata.len() && cached.modified == modified)
         .map(|cached| cached.trace)
@@ -616,17 +616,14 @@ fn trace_studio(path: &Path) -> Result<SerializerTrace> {
         CPU_TYPE_X86_64 => trace_x86(&image, x86_string_xref(&image, log_address)?)?,
         _ => unreachable!(),
     };
-    cache
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .insert(
-            path.to_path_buf(),
-            CachedTrace {
-                len: metadata.len(),
-                modified,
-                trace,
-            },
-        );
+    cache.lock_recover().insert(
+        path.to_path_buf(),
+        CachedTrace {
+            len: metadata.len(),
+            modified,
+            trace,
+        },
+    );
     Ok(trace)
 }
 
@@ -761,8 +758,7 @@ fn package_notice_flag(path: &Path) -> Result<(u64, [u8; 16])> {
     let modified = metadata.modified().ok();
     let cache = PACKAGE_NOTICE_FLAGS.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(cached) = cache
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
+        .lock_recover()
         .get(path)
         .filter(|cached| cached.len == metadata.len() && cached.modified == modified)
     {
@@ -771,18 +767,15 @@ fn package_notice_flag(path: &Path) -> Result<(u64, [u8; 16])> {
     let bytes = fs::read(path).with_context(|| format!("Could not read {}", path.display()))?;
     let image = MachImage::parse(&bytes)?;
     let rva = package_notice_flag_rva(&image)?;
-    cache
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .insert(
-            path.to_path_buf(),
-            CachedPackageNoticeFlag {
-                len: metadata.len(),
-                modified,
-                rva,
-                image_uuid: image.image_uuid,
-            },
-        );
+    cache.lock_recover().insert(
+        path.to_path_buf(),
+        CachedPackageNoticeFlag {
+            len: metadata.len(),
+            modified,
+            rva,
+            image_uuid: image.image_uuid,
+        },
+    );
     Ok((rva, image.image_uuid))
 }
 
@@ -838,8 +831,7 @@ fn trace_package_action(path: &Path) -> Result<PackageActionTrace> {
     let modified = metadata.modified().ok();
     let cache = PACKAGE_ACTION_TRACES.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(trace) = cache
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
+        .lock_recover()
         .get(path)
         .filter(|cached| cached.len == metadata.len() && cached.modified == modified)
         .map(|cached| cached.trace.clone())
@@ -860,7 +852,7 @@ fn trace_package_action(path: &Path) -> Result<PackageActionTrace> {
         CPU_TYPE_X86_64 => bail!("Package actions require Apple Silicon Roblox Studio"),
         _ => unreachable!(),
     };
-    let mut traces = cache.lock().unwrap_or_else(|error| error.into_inner());
+    let mut traces = cache.lock_recover();
     if let Some(cached) = traces
         .get_mut(path)
         .filter(|cached| cached.len == metadata.len() && cached.modified == modified)

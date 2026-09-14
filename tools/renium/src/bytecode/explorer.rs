@@ -1046,7 +1046,7 @@ impl BytecodeNodeProjection<'_> {
         if should_include_node_field(self.mode, self.fields, "index") {
             node.insert(
                 node_output_key(self.mode, "index").to_string(),
-                Value::Number(serde_json::Number::from(index as u64)),
+                json!(index as u64),
             );
         }
         if should_include_node_field(self.mode, self.fields, "name") {
@@ -1077,9 +1077,9 @@ impl BytecodeNodeProjection<'_> {
         if should_include_node_field(self.mode, self.fields, "parentIndex") {
             node.insert(
                 node_output_key(self.mode, "parentIndex").to_string(),
-                instance.parent_index.map_or(Value::Null, |parent_index| {
-                    Value::Number(serde_json::Number::from(parent_index as u64))
-                }),
+                instance
+                    .parent_index
+                    .map_or(Value::Null, |parent_index| json!(parent_index as u64)),
             );
         }
 
@@ -1090,7 +1090,7 @@ impl BytecodeNodeProjection<'_> {
         if should_include_node_field(self.mode, self.fields, "childCount") {
             node.insert(
                 node_output_key(self.mode, "childCount").to_string(),
-                Value::Number(serde_json::Number::from(children.len() as u64)),
+                json!(children.len() as u64),
             );
         }
         if should_include_node_field(self.mode, self.fields, "hasPackageLink") {
@@ -1143,7 +1143,7 @@ impl BytecodeNodeProjection<'_> {
                 Value::Array(
                     path_ordinals
                         .iter()
-                        .map(|ordinal| Value::Number(serde_json::Number::from(*ordinal as u64)))
+                        .map(|ordinal| json!(*ordinal as u64))
                         .collect(),
                 ),
             );

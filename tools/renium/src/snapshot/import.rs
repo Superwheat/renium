@@ -36,6 +36,7 @@ use crate::snapshot::export::{
 };
 use crate::snapshot::types::{ExportedSnapshotParts, ServiceState, SnapshotInstance};
 use crate::studio::bridge::{BridgeServer, ChunkFetchMetrics, SourceBatchMap};
+use crate::system::LockRecover;
 use crate::system::files::{
     OnDrop, path_key, sanitize_name, service_settings_path, unique_child_stem,
     write_bytes_if_changed_in_existing_dir,
@@ -77,7 +78,7 @@ impl DirectImportTaskQueue {
     }
 
     fn enqueue_service(&self, task: DirectImportTask) -> bool {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.state.lock_recover();
         if state.closed {
             return false;
         }
@@ -88,7 +89,7 @@ impl DirectImportTaskQueue {
     }
 
     fn enqueue_subtree(&self, task: DirectImportTask) -> bool {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.state.lock_recover();
         if state.closed {
             return false;
         }
@@ -99,7 +100,7 @@ impl DirectImportTaskQueue {
     }
 
     fn receive(&self, worker_index: usize) -> Option<DirectImportTask> {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.state.lock_recover();
         loop {
             if worker_index >= state.active_workers && !state.closed {
                 state = self
@@ -134,7 +135,7 @@ impl DirectImportTaskQueue {
     }
 
     fn activate_workers(&self, active_workers: usize) {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.state.lock_recover();
         state.active_workers = state.active_workers.max(active_workers);
         drop(state);
         self.worker_gate.notify_all();
@@ -142,7 +143,7 @@ impl DirectImportTaskQueue {
     }
 
     fn close(&self) {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.state.lock_recover();
         state.closed = true;
         drop(state);
         self.worker_gate.notify_all();
@@ -342,10 +343,7 @@ struct DirectImportWorker {
 
 impl DirectImportWorker {
     fn record_error(&self, error: String) {
-        let mut slot = self
-            .first_error
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut slot = self.first_error.lock_recover();
         if slot.is_none() {
             *slot = Some(error);
         }
@@ -423,8 +421,7 @@ impl DirectImportWorker {
                     ));
                 }
                 self.service_nodes
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .lock_recover()
                     .insert(service.clone(), node);
             }
             Ok(None) => {}
@@ -460,11 +457,7 @@ impl DirectImportWorker {
     fn run(self, worker_index: usize) {
         while let Some(task) = self.queue.receive(worker_index) {
             let _pending_guard = OnDrop::new(|| {
-                let _guard = self
-                    .pending_signal
-                    .0
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
+                let _guard = self.pending_signal.0.lock_recover();
                 self.pending_tasks.fetch_sub(1, Ordering::AcqRel);
                 self.pending_signal.1.notify_all();
             });
@@ -548,10 +541,7 @@ impl DirectImportDispatcher {
     }
 
     pub(crate) fn check_error(&self) -> Result<()> {
-        let slot = self
-            .first_error
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let slot = self.first_error.lock_recover();
         if let Some(message) = slot.as_ref() {
             bail!("Direct import failed: {message}");
         }
@@ -573,11 +563,7 @@ impl DirectImportDispatcher {
     pub(crate) fn finish(mut self) -> Result<HashMap<String, SourcemapNode>> {
         self.activate_all_workers();
         let pending_started = Instant::now();
-        let mut pending_guard = self
-            .pending_signal
-            .0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut pending_guard = self.pending_signal.0.lock_recover();
         while self.pending_tasks.load(Ordering::Acquire) > 0 {
             self.check_error()?;
             pending_guard = self
@@ -597,12 +583,7 @@ impl DirectImportDispatcher {
         }
         log_timing("direct import worker join", join_started);
         self.check_error()?;
-        let nodes = std::mem::take(
-            &mut *self
-                .service_nodes
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner),
-        );
+        let nodes = std::mem::take(&mut *self.service_nodes.lock_recover());
         Ok(nodes)
     }
 }
@@ -1881,10 +1862,7 @@ fn complete_split_assembly(
         complete_split_slot(shared, parent, service_nodes, sourcemap_sender)?;
     } else {
         let settings_write = {
-            let mut guard = shared
-                .settings_write
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let mut guard = shared.settings_write.lock_recover();
             guard.take()
         };
         if let Some(handle) = settings_write {
@@ -1929,7 +1907,7 @@ fn complete_split_assembly(
         }
 
         {
-            let mut nodes = service_nodes.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut nodes = service_nodes.lock_recover();
             nodes.insert(shared.service.clone(), node);
         }
         let completed_tasks = shared.completed_tasks.load(Ordering::Acquire);
@@ -2088,19 +2066,13 @@ impl ExpectedPathBatch {
     fn merge_into(self, expected_paths: &ImportPathSets) {
         let started = Instant::now();
         if !self.files.is_empty() {
-            let mut files = expected_paths
-                .files
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let mut files = expected_paths.files.lock_recover();
             for path in self.files {
                 files.insert(path);
             }
         }
         if !self.dirs.is_empty() {
-            let mut dirs = expected_paths
-                .dirs
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let mut dirs = expected_paths.dirs.lock_recover();
             for path in self.dirs {
                 dirs.insert(path);
             }
@@ -2347,17 +2319,11 @@ fn cleanup_service_dir(service_dir: &Path, expected_paths: &ImportPathSets) -> R
     }
 
     let expected_files = {
-        let guard = expected_paths
-            .files
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let guard = expected_paths.files.lock_recover();
         guard.clone()
     };
     let expected_dirs = {
-        let guard = expected_paths
-            .dirs
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let guard = expected_paths.dirs.lock_recover();
         guard.clone()
     };
 
@@ -2487,7 +2453,7 @@ impl SourceOutput {
             Self::Files { .. } => fs::create_dir_all(path)
                 .with_context(|| format!("Failed to create {}", path.display())),
             Self::Memory(entries) => {
-                let mut entries = entries.lock().unwrap_or_else(PoisonError::into_inner);
+                let mut entries = entries.lock_recover();
                 let entry = entries.entry(path.to_owned()).or_insert(None);
                 anyhow::ensure!(
                     entry.is_none(),
@@ -2510,8 +2476,7 @@ impl SourceOutput {
                     path.display()
                 );
                 let previous = entries
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
+                    .lock_recover()
                     .insert(path.to_owned(), Some(source.as_bytes().to_vec()));
                 anyhow::ensure!(
                     previous.is_none(),

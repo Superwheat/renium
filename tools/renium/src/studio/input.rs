@@ -462,6 +462,7 @@ mod platform {
         PACKAGE_CHANGES_MESSAGE, StudioWindow, ThreadDpiAwareness, startup_dialog_button,
         windows_shield,
     };
+    use crate::system::LockRecover;
     use anyhow::{Context, Result, bail};
 
     use windows::Win32::Foundation::{HWND as AutomationHwnd, RPC_E_CHANGED_MODE};
@@ -630,9 +631,7 @@ mod platform {
         static DISMISSING: std::sync::Mutex<Vec<isize>> = std::sync::Mutex::new(Vec::new());
         let window = hwnd as isize;
         {
-            let mut active = DISMISSING
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut active = DISMISSING.lock_recover();
             if active.contains(&window) {
                 return;
             }
@@ -656,10 +655,7 @@ mod platform {
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
-        DISMISSING
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|active| *active != window);
+        DISMISSING.lock_recover().retain(|active| *active != window);
     }
 
     unsafe extern "system" fn recovery_event_proc(
@@ -2011,6 +2007,7 @@ mod platform {
 #[cfg(target_os = "macos")]
 mod platform {
     use super::{PACKAGE_CHANGES_MESSAGE, StudioWindow};
+    use crate::system::LockRecover;
     use anyhow::{Context, Result, bail};
     use std::ffi::{OsString, c_void};
     use std::fs;
@@ -2695,11 +2692,7 @@ mod platform {
         };
         let watched =
             WATCHED_PIDS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-        if !watched
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(pid)
-        {
+        if !watched.lock_recover().insert(pid) {
             return;
         }
         std::thread::spawn(move || {
@@ -2716,10 +2709,7 @@ mod platform {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            watched
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&pid);
+            watched.lock_recover().remove(&pid);
         });
     }
 

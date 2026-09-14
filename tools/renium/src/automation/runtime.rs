@@ -2,7 +2,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Arc, PoisonError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -45,6 +45,7 @@ use crate::studio::automation::{
 use crate::studio::bridge::{BridgeRequestLease, BridgeServer, BridgeTarget};
 #[cfg(any(windows, target_os = "macos"))]
 use crate::studio::input as input_inject;
+use crate::system::LockRecover;
 
 const RECENT_STUDIO_LAUNCH_WAIT_SECONDS: f64 = 30.0;
 
@@ -223,7 +224,6 @@ pub(super) fn automation_pull_args(
             .unwrap_or_default(),
         bridge: automation_bridge(object, 2.0)?,
         export_all_properties: automation_bool(object, "exportAllProperties", false)?,
-        no_export_all_properties: automation_bool(object, "noExportAllProperties", false)?,
         quiet_timings: std::env::var_os("RENIUM_PROFILE_PULL").is_none(),
     })
 }
@@ -1866,7 +1866,7 @@ fn automation_live_operation(
 
     if options.manage_files && operation == op::LIVE_STOP {
         let transition = state.live_sync().transition_lock();
-        let _transition = transition.lock().unwrap_or_else(PoisonError::into_inner);
+        let _transition = transition.lock_recover();
         let plugin = {
             let _gate = bridge.acquire_request_gate();
             automation_dispatch_with_retry(
@@ -1892,7 +1892,7 @@ fn automation_live_operation(
     let settle_requested = options.settle_requested(operation);
     if options.manage_files && operation == op::LIVE_START {
         let transition = state.live_sync().transition_lock();
-        let _transition = transition.lock().unwrap_or_else(PoisonError::into_inner);
+        let _transition = transition.lock_recover();
         state
             .live_sync()
             .ensure_target_available(context, bridge)
@@ -1980,7 +1980,7 @@ fn automation_live_operation(
     let transition = restore_files.then(|| state.live_sync().transition_lock());
     let _transition = transition
         .as_ref()
-        .map(|transition| transition.lock().unwrap_or_else(PoisonError::into_inner));
+        .map(|transition| transition.lock_recover());
     if restore_files {
         state
             .live_sync()

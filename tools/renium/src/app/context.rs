@@ -1,6 +1,7 @@
+use crate::system::LockRecover;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Mutex, OnceLock};
 
 static CLI_PROJECT: OnceLock<Option<PathBuf>> = OnceLock::new();
 #[derive(Default)]
@@ -23,8 +24,7 @@ pub(crate) fn set_cli_project(project: Option<PathBuf>) {
 
 pub(crate) fn project_override() -> Option<PathBuf> {
     SELECTED
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
+        .lock_recover()
         .project
         .clone()
         .or_else(|| CLI_PROJECT.get().cloned().flatten())
@@ -35,7 +35,7 @@ pub(crate) struct Selection(SelectedContext);
 
 impl Drop for Selection {
     fn drop(&mut self) {
-        *SELECTED.lock().unwrap_or_else(PoisonError::into_inner) = std::mem::take(&mut self.0);
+        *SELECTED.lock_recover() = std::mem::take(&mut self.0);
     }
 }
 
@@ -47,7 +47,7 @@ pub(crate) fn select_automation(
     place: Option<String>,
 ) -> Selection {
     Selection(std::mem::replace(
-        &mut *SELECTED.lock().unwrap_or_else(PoisonError::into_inner),
+        &mut *SELECTED.lock_recover(),
         SelectedContext {
             runtime,
             project: Some(project),
@@ -57,26 +57,15 @@ pub(crate) fn select_automation(
 }
 
 pub(crate) fn automation_runtime() -> Option<String> {
-    SELECTED
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .runtime
-        .clone()
+    SELECTED.lock_recover().runtime.clone()
 }
 
 pub(crate) fn set_place_selector(value: Option<String>) {
-    SELECTED
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .place = value.filter(|text| !text.trim().is_empty());
+    SELECTED.lock_recover().place = value.filter(|text| !text.trim().is_empty());
 }
 
 pub(crate) fn place_selector() -> Option<String> {
-    SELECTED
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .place
-        .clone()
+    SELECTED.lock_recover().place.clone()
 }
 
 pub(crate) fn set_automation_stdio(enabled: bool) {

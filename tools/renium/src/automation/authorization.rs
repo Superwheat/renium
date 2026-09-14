@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Mutex, PoisonError};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -11,6 +11,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 use super::{Request, op};
+use crate::system::LockRecover;
 
 const PROOF_FIELD: &str = "_authorization";
 const PROOF_LIFETIME: Duration = Duration::from_secs(60);
@@ -146,7 +147,7 @@ impl Authority {
         self.key
             .verify_strict(&message(request, &proof)?, &signature)
             .map_err(|_| anyhow::anyhow!("Invalid Renium authorization"))?;
-        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut seen = self.seen.lock_recover();
         seen.retain(|_, time| time.elapsed() < PROOF_LIFETIME + Duration::from_secs(5));
         if seen.contains_key(&signature.to_bytes()) {
             bail!(

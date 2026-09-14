@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde_json::{Map, Number, Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::app::output::print_json_output;
 use crate::bytecode::edit::{
@@ -1582,10 +1582,7 @@ fn remap_package_ref_object(
     for selector in SETTINGS_REFERENCE_SELECTOR_KEYS {
         object.remove(selector);
     }
-    object.insert(
-        "instanceIndex".to_string(),
-        Value::Number(Number::from((new_index + 1) as u64)),
-    );
+    object.insert("instanceIndex".to_string(), json!((new_index + 1) as u64));
     Ok(())
 }
 

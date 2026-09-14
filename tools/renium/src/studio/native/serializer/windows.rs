@@ -58,6 +58,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::studio::native::snapshot::{
     NativeSnapshot, NativeSnapshotRoots, finalize_native_snapshot, temporary_output_path,
 };
+use crate::system::LockRecover;
 use crate::system::files::{atomic_write_file, fnv1a};
 
 const HELPER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-studio-helper.dll"));
@@ -612,8 +613,7 @@ fn trace_serializer(path: &Path, bytes: &[u8]) -> Result<SerializerTrace> {
     let modified = metadata.modified().ok();
     let cache = TRACES.get_or_init(|| Mutex::new(HashMap::new()));
     let cached = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .lock_recover()
         .get(path)
         .filter(|cached| cached.len == metadata.len() && cached.modified == modified)
         .map(|cached| cached.trace);
@@ -723,17 +723,14 @@ fn trace_serializer(path: &Path, bytes: &[u8]) -> Result<SerializerTrace> {
         root_collector,
         deallocator,
     };
-    cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            path.to_path_buf(),
-            CachedTrace {
-                len: metadata.len(),
-                modified,
-                trace,
-            },
-        );
+    cache.lock_recover().insert(
+        path.to_path_buf(),
+        CachedTrace {
+            len: metadata.len(),
+            modified,
+            trace,
+        },
+    );
     Ok(trace)
 }
 
@@ -757,8 +754,7 @@ fn studio_layout(path: &Path) -> Result<(PeSection, SerializerTrace, [u32; 3])> 
     let modified = metadata.modified().ok();
     let cache = LAYOUTS.get_or_init(|| Mutex::new(HashMap::new()));
     let cached = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .lock_recover()
         .get(path)
         .filter(|cached| cached.len == metadata.len() && cached.modified == modified)
         .map(|cached| (cached.data, cached.trace, cached.image_stamp));
@@ -770,19 +766,16 @@ fn studio_layout(path: &Path) -> Result<(PeSection, SerializerTrace, [u32; 3])> 
     let image = PeImage::parse(&executable)?;
     let data = image.section(b".data")?;
     let trace = trace_serializer(path, &executable)?;
-    cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            path.to_path_buf(),
-            CachedLayout {
-                len: metadata.len(),
-                modified,
-                data,
-                trace,
-                image_stamp: image.image_stamp,
-            },
-        );
+    cache.lock_recover().insert(
+        path.to_path_buf(),
+        CachedLayout {
+            len: metadata.len(),
+            modified,
+            data,
+            trace,
+            image_stamp: image.image_stamp,
+        },
+    );
     Ok((data, trace, image.image_stamp))
 }
 
@@ -888,8 +881,7 @@ fn package_layout(path: &Path) -> Result<PackageLayout> {
     let modified = metadata.modified().ok();
     let cache = PACKAGE_LAYOUTS.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(layout) = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .lock_recover()
         .get(path)
         .filter(|cached| cached.len == metadata.len() && cached.modified == modified)
         .map(|cached| cached.layout.clone())
@@ -904,17 +896,14 @@ fn package_layout(path: &Path) -> Result<PackageLayout> {
         submit_task: renderer_submit_task_rva(&bytes, &image)?,
         image_stamp: image.image_stamp,
     };
-    cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            path.to_path_buf(),
-            CachedPackageLayout {
-                len: metadata.len(),
-                modified,
-                layout: layout.clone(),
-            },
-        );
+    cache.lock_recover().insert(
+        path.to_path_buf(),
+        CachedPackageLayout {
+            len: metadata.len(),
+            modified,
+            layout: layout.clone(),
+        },
+    );
     Ok(layout)
 }
 
@@ -1470,11 +1459,7 @@ fn active_data_model(
     // window caption. Cache the uniquely resolved window, not either spelling.
     let (_, title) = capture_window(pid, title)?;
     let cache = DATA_MODELS.get_or_init(|| Mutex::new(HashMap::new()));
-    let cached = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&pid)
-        .cloned();
+    let cached = cache.lock_recover().get(&pid).cloned();
     if let Some(data_model) = cached
         .as_ref()
         .and_then(|cached| refresh_active_data_model(memory, module, &title, cached))
@@ -1482,18 +1467,15 @@ fn active_data_model(
         return Ok(data_model);
     }
     let data_model = find_active_data_model(memory, module, data, &title)?;
-    cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            pid,
-            CachedDataModel {
-                title,
-                outer: data_model.outer,
-                owner: data_model.owner,
-                layout: data_model.layout,
-            },
-        );
+    cache.lock_recover().insert(
+        pid,
+        CachedDataModel {
+            title,
+            outer: data_model.outer,
+            owner: data_model.owner,
+            layout: data_model.layout,
+        },
+    );
     Ok(data_model)
 }
 

@@ -1,6 +1,7 @@
 //! macOS reflection discovery lives in the Rust host. The in-process helper
 //! performs bounded memory copies and owns only the engine's C++ ABI calls.
 use super::*;
+use crate::system::LockRecover;
 use std::collections::HashSet;
 use std::io::{Seek, SeekFrom};
 use std::sync::Arc;
@@ -493,22 +494,14 @@ impl Memory {
 
     fn cached_abi(&self, table: u64, kind: CallKind) -> Option<ValidatedAbi> {
         let key = self.abi_key(table, kind).ok()?;
-        let entry = ABIS
-            .get()?
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&key)?
-            .clone();
+        let entry = ABIS.get()?.lock_recover().get(&key)?.clone();
         if entry.functions.iter().all(|(slot, rva, code)| {
             self.pointer(table + *slot as u64).ok() == Some(self.base + rva)
                 && self.read(self.base + rva, code.len()).ok().as_ref() == Some(code)
         }) {
             return Some(entry);
         }
-        ABIS.get()?
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&key);
+        ABIS.get()?.lock_recover().remove(&key);
         None
     }
 
@@ -516,8 +509,7 @@ impl Memory {
         let key = self.abi_key(table, kind)?;
         let mut cache = ABIS
             .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_recover();
         if cache.len() >= 1024 {
             cache.clear();
         }
@@ -895,13 +887,9 @@ impl Memory {
             class_descriptor,
             wanted.to_owned(),
         );
-        let cached = MEMBERS.get().and_then(|cache| {
-            cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(&key)
-                .cloned()
-        });
+        let cached = MEMBERS
+            .get()
+            .and_then(|cache| cache.lock_recover().get(&key).cloned());
         if let Some(entry) = cached
             && entry.header.as_ref() == class
             && self
@@ -923,8 +911,7 @@ impl Memory {
         let descriptor = *matches.unwrap().iter().next().unwrap();
         let mut cache = MEMBERS
             .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .lock_recover();
         if cache.len() + members.len() > 1024 {
             cache.clear();
         }

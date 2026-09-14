@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::net::Shutdown;
-use std::sync::{Arc, Mutex, PoisonError, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
 
 use anyhow::{Result, bail};
@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{Failure, Request, Response};
 use crate::daemon::transport::{BoundedLineRead, MAX_DAEMON_LINE_BYTES, read_bounded_line};
+use crate::system::LockRecover;
 use crate::system::net::SharedTcpStream;
 
 const WORKERS: usize = 8;
@@ -19,7 +20,7 @@ pub(super) struct RequestControl(Mutex<(bool, Option<SharedTcpStream>)>);
 
 impl RequestControl {
     pub(super) fn attach(&self, stream: &SharedTcpStream) -> Result<()> {
-        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.0.lock_recover();
         if state.0 {
             bail!("Request was cancelled before dispatch");
         }
@@ -28,7 +29,7 @@ impl RequestControl {
     }
 
     fn cancel(&self) {
-        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.0.lock_recover();
         state.0 = true;
         if let Some(stream) = state.1.take() {
             let _ = stream.shutdown(Shutdown::Both);
@@ -36,7 +37,7 @@ impl RequestControl {
     }
 
     fn cancelled(&self) -> bool {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner).0
+        self.0.lock_recover().0
     }
 }
 
@@ -55,7 +56,7 @@ struct ProxyResponse<'a> {
 }
 
 fn respond(output: &Mutex<impl Write>, response: &Response) -> Result<()> {
-    let mut output = output.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut output = output.lock_recover();
     serde_json::to_writer(
         &mut *output,
         &ProxyResponse {
@@ -82,19 +83,13 @@ pub(super) fn run(
         for _ in 0..WORKERS {
             scope.spawn(|| {
                 loop {
-                    let work = receiver
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .recv();
+                    let work = receiver.lock_recover().recv();
                     let Ok((request, control)) = work else { break };
                     if !control.cancelled() {
                         let response = forward(&request, &control);
                         let _ = respond(&output, &response);
                     }
-                    active
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .remove(&request.id);
+                    active.lock_recover().remove(&request.id);
                 }
             });
         }
@@ -116,11 +111,7 @@ pub(super) fn run(
                     continue;
                 }
                 if let Ok(cancel) = serde_json::from_str::<CancelRequest>(&line) {
-                    if let Some(control) = active
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .get(&cancel.cancel)
-                    {
+                    if let Some(control) = active.lock_recover().get(&cancel.cancel) {
                         control.cancel();
                     }
                     continue;
@@ -147,17 +138,14 @@ pub(super) fn run(
                 let id = request.id;
                 let control = Arc::new(RequestControl::default());
                 {
-                    let mut active = active.lock().unwrap_or_else(PoisonError::into_inner);
+                    let mut active = active.lock_recover();
                     if active.contains_key(&id) {
                         bail!("Duplicate active request ID {id}");
                     }
                     active.insert(id, Arc::clone(&control));
                 }
                 if sender.try_send((request, control)).is_err() {
-                    active
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .remove(&id);
+                    active.lock_recover().remove(&id);
                     respond(
                         &output,
                         &Response::failure(
@@ -175,11 +163,7 @@ pub(super) fn run(
             }
             Ok(())
         })();
-        for control in active
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .values()
-        {
+        for control in active.lock_recover().values() {
             control.cancel();
         }
         drop(sender);

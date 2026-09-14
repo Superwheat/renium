@@ -2,6 +2,7 @@ use super::*;
 #[cfg(any(windows, target_os = "macos"))]
 use crate::automation::property_access::{Decision, Operation};
 use crate::automation::property_access::{Intent, Mode, Scope, WRITE_WARNING};
+use crate::system::LockRecover;
 use clap::{Args, Subcommand};
 
 #[derive(Args)]
@@ -167,10 +168,7 @@ pub(crate) fn result(
         .iter()
         .filter_map(|entry| entry["runtimeId"].as_str().map(str::to_owned))
         .collect::<Vec<_>>();
-    let mut policy = state
-        .property_access
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut policy = state.property_access.lock_recover();
     policy.retain_runtimes(&active);
     match action {
         Action::Mode { mode, accept_risk } => {
@@ -274,11 +272,7 @@ fn perform(
             bail!("Property target changed since approval; request access again");
         }
     } else {
-        let decision = state
-            .property_access
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .check(scope, &intent)?;
+        let decision = state.property_access.lock_recover().check(scope, &intent)?;
         if matches!(decision, Decision::ApprovalRequired { .. }) {
             return Ok(serde_json::to_value(decision)?);
         }

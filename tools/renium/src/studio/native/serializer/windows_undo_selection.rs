@@ -4,6 +4,7 @@
 //! of them. The two Selection::set calls inside that restore routine become
 //! no-ops for the connected process lifetime; the restore itself is untouched.
 use super::*;
+use crate::system::LockRecover;
 
 const SELECTION_SET_DESCRIPTOR: &[u8] =
     b".?AV?$BoundFuncDesc@VSelection@RBX@@$$A6AXV?$shared_ptr@$$CBV?$vector@";
@@ -203,8 +204,7 @@ fn layout(path: &Path) -> Result<Layout> {
     let modified = metadata.modified().ok();
     let cache = LAYOUTS.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(cached) = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .lock_recover()
         .get(path)
         .filter(|cached| cached.len == metadata.len() && cached.modified == modified)
     {
@@ -212,17 +212,14 @@ fn layout(path: &Path) -> Result<Layout> {
     }
     let bytes = fs::read(path)?;
     let layout = discover(&PeImage::parse(&bytes)?)?;
-    cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            path.to_owned(),
-            CachedLayout {
-                len: metadata.len(),
-                modified,
-                layout: layout.clone(),
-            },
-        );
+    cache.lock_recover().insert(
+        path.to_owned(),
+        CachedLayout {
+            len: metadata.len(),
+            modified,
+            layout: layout.clone(),
+        },
+    );
     Ok(layout)
 }
 

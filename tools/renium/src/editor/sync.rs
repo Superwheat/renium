@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Number, Value, json};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
@@ -1078,23 +1078,23 @@ fn skipped_editor_summary(changes: &EditorChangeSet) -> Map<String, Value> {
     summary.insert("skippedByReview".to_string(), Value::Bool(true));
     summary.insert(
         "instanceQueued".to_string(),
-        Value::Number(Number::from(
+        json!(
             changes
                 .instance_changes
                 .iter()
                 .map(|change| change.instances.len())
-                .sum::<usize>() as u64,
-        )),
+                .sum::<usize>() as u64
+        ),
     );
     summary.insert(
         "sourceQueued".to_string(),
-        Value::Number(Number::from(changes.source_changes.len() as u64)),
+        json!(changes.source_changes.len() as u64),
     );
     summary.insert(
         "propertyQueued".to_string(),
-        Value::Number(Number::from(changes.property_changes.len() as u64)),
+        json!(changes.property_changes.len() as u64),
     );
-    summary.insert("noops".to_string(), Value::Number(Number::from(0)));
+    summary.insert("noops".to_string(), json!(0));
     summary
 }
 
@@ -2206,11 +2206,11 @@ fn verify_pushed_sources(
     }
     summary.insert(
         "sourceVerified".to_string(),
-        Value::Number(Number::from(verification.verified as u64)),
+        json!(verification.verified as u64),
     );
     summary.insert(
         "sourceVerifyFailed".to_string(),
-        Value::Number(Number::from(verification.failed.len() as u64)),
+        json!(verification.failed.len() as u64),
     );
     if verification.failed.is_empty() {
         return Ok(());
@@ -2261,7 +2261,7 @@ fn prepare_protected_writes(
     if pre_routed_count > 0 {
         summary.insert(
             "protectedPreRouted".to_string(),
-            Value::Number(Number::from(pre_routed_count as u64)),
+            json!(pre_routed_count as u64),
         );
     }
     let reported_count = reported.len();
@@ -2307,22 +2307,19 @@ fn prepare_protected_writes(
     }
     summary.remove("protectedWrites");
     if !writes.is_empty() {
-        summary.insert(
-            "protectedPending".to_string(),
-            Value::Number(Number::from(writes.len() as u64)),
-        );
+        summary.insert("protectedPending".to_string(), json!(writes.len() as u64));
     }
     if unavailable_count > 0 {
         summary.insert(
             "unavailableProtectedSkipped".to_string(),
-            Value::Number(Number::from(unavailable_count as u64)),
+            json!(unavailable_count as u64),
         );
     }
     let already_current = enriched.len() - writes.len();
     if already_current > 0 {
         summary.insert(
             "protectedAlreadyCurrent".to_string(),
-            Value::Number(Number::from(already_current as u64)),
+            json!(already_current as u64),
         );
     }
     let apply_offline = !args.no_review
@@ -2523,7 +2520,7 @@ fn push_editor_changes_with_collected(
             summary.insert("protectedOfflineApply".to_string(), result);
             summary.insert(
                 "protectedApplied".to_string(),
-                Value::Number(serde_json::Number::from(protected.writes.len() as u64)),
+                json!(protected.writes.len() as u64),
             );
             summary.remove("protectedPending");
         } else if let Some(transaction) = transaction.as_mut() {

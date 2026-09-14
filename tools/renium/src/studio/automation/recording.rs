@@ -3,7 +3,7 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -25,6 +25,7 @@ use super::{BridgeServer, BridgeTarget, studio_capture_status, wait_for_player_b
 use super::{client_viewport_size, recover_client_viewport};
 use crate::app::output::automation_token;
 use crate::studio::input as input_inject;
+use crate::system::LockRecover;
 use crate::system::files::{
     cleanup_stale_sibling_temps, replace_file_with_backup, sibling_temp_path,
 };
@@ -415,7 +416,7 @@ pub(crate) fn start(
     if !request.quality.is_finite() || !(0.0..=100.0).contains(&request.quality) {
         bail!("Invalid record-start quality; expected a number from 0 through 100");
     }
-    let mut active = ACTIVE.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut active = ACTIVE.lock_recover();
     if let Some(current) = active.as_ref() {
         bail!("Recording conflict: {} is still active", current.id);
     }
@@ -516,7 +517,7 @@ pub(crate) fn end(parameters: &Value) -> Result<Value> {
     let request: EndRequest =
         serde_json::from_value(parameters.clone()).context("Invalid record-end payload")?;
     let active = {
-        let mut slot = ACTIVE.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut slot = ACTIVE.lock_recover();
         let recording = slot
             .take()
             .context("Recording conflict: no recording is active")?;

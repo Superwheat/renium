@@ -1239,8 +1239,6 @@ pub(super) struct PullArgs {
     pub(super) bridge: BridgeConnectionArgs,
     #[arg(long, alias = "all-props")]
     pub(super) export_all_properties: bool,
-    #[arg(long, alias = "no-props")]
-    pub(super) no_export_all_properties: bool,
     #[arg(short, long)]
     pub(super) quiet_timings: bool,
 }

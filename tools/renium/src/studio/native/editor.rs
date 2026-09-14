@@ -86,6 +86,7 @@ use crate::app::timing::{
 };
 #[cfg(any(windows, target_os = "macos"))]
 use crate::studio::native::serializer;
+use crate::system::LockRecover;
 
 const NATIVE_SERIALIZATION_SERVICE_LIMIT: usize = 4_096;
 const NATIVE_SERIALIZATION_BATCH_LIMIT: usize = 8_192;
@@ -412,9 +413,7 @@ fn native_payload_cache() -> &'static Mutex<NativePayloadCache> {
 }
 
 fn native_payload_cache_for_slot(slot: &str) -> Option<(String, Arc<[u8]>)> {
-    let cache = native_payload_cache()
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
+    let cache = native_payload_cache().lock_recover();
     let hash = cache.last_hash_by_slot.get(slot)?;
     cache
         .entries
@@ -426,9 +425,7 @@ fn native_payload_cache_insert(slot: String, hash: String, bytes: &[u8]) {
     if bytes.len() > NATIVE_PAYLOAD_CACHE_MAX_BYTES {
         return;
     }
-    let mut cache = native_payload_cache()
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
+    let mut cache = native_payload_cache().lock_recover();
     cache.last_hash_by_slot.insert(slot, hash.clone());
     if cache
         .entries
@@ -1735,7 +1732,7 @@ impl NativePriorityWorkerGate {
     }
 
     fn wait(&self) {
-        let mut released = self.released.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut released = self.released.lock_recover();
         while !*released {
             released = self
                 .ready
@@ -1745,7 +1742,7 @@ impl NativePriorityWorkerGate {
     }
 
     fn release(&self) {
-        let mut released = self.released.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut released = self.released.lock_recover();
         if *released {
             return;
         }
@@ -2748,10 +2745,7 @@ pub(crate) fn editor_binary_export_parts<'a>(
                 let fetch_overlay = &fetch_overlay;
                 overlay_scope.spawn(move || {
                     loop {
-                        let next = overlay_queue
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .pop_front();
+                        let next = overlay_queue.lock_recover().pop_front();
                         let Some((group, sender)) = next else {
                             break;
                         };
@@ -2794,8 +2788,7 @@ pub(crate) fn editor_binary_export_parts<'a>(
                     loop {
                         let service = priority_service.take().or_else(|| {
                             service_queue
-                                .lock()
-                                .unwrap_or_else(PoisonError::into_inner)
+                                .lock_recover()
                                 .pop_front()
                         });
                         let Some(group) = service else {
@@ -2837,7 +2830,7 @@ pub(crate) fn editor_binary_export_parts<'a>(
                                             })().map_err(|error| format!("{error:#}"))
                                         });
                                         let captured = match captured { Ok(captured) => captured, Err(error) => bail!("{error}") };
-                                        let native = captured.lock().unwrap_or_else(PoisonError::into_inner).remove(&group.service)
+                                        let native = captured.lock_recover().remove(&group.service)
                                             .with_context(|| format!("Native capture omitted {}", group.service))?;
                                         (native, false)
                                     }
@@ -2873,8 +2866,7 @@ pub(crate) fn editor_binary_export_parts<'a>(
                                         Err(error) => bail!("{error}"),
                                     };
                                     let native = batch_doms
-                                        .lock()
-                                        .unwrap_or_else(PoisonError::into_inner)
+                                        .lock_recover()
                                         .remove(&group.service)
                                     .with_context(|| {
                                         format!(
@@ -2967,7 +2959,7 @@ pub(crate) fn editor_binary_export_parts<'a>(
                             },
                             || {
                                 if let Some(receiver) = overlay_receivers.get(group.service.as_str()) {
-                                    receiver.lock().unwrap_or_else(PoisonError::into_inner).recv()
+                                    receiver.lock_recover().recv()
                                         .context("Native overlay worker ended without a result")?
                                 } else {
                                     fetch_overlay(group)
@@ -3862,29 +3854,21 @@ pub(crate) fn send_editor_change_batches(
         .iter()
         .map(|change| change.instances.len())
         .sum::<usize>();
-    summary.insert(
-        "instanceQueued".to_string(),
-        Value::Number(serde_json::Number::from(instance_queued as u64)),
-    );
+    summary.insert("instanceQueued".to_string(), json!(instance_queued as u64));
     summary.insert(
         "sourceQueued".to_string(),
-        Value::Number(serde_json::Number::from(changes.source_changes.len() as u64)),
+        json!(changes.source_changes.len() as u64),
     );
     summary.insert(
         "propertyQueued".to_string(),
-        Value::Number(serde_json::Number::from(
-            changes.property_changes.len() as u64
-        )),
+        json!(changes.property_changes.len() as u64),
     );
 
     if changes.instance_changes.is_empty()
         && changes.source_changes.is_empty()
         && changes.property_changes.is_empty()
     {
-        summary.insert(
-            "noops".to_string(),
-            Value::Number(serde_json::Number::from(0)),
-        );
+        summary.insert("noops".to_string(), json!(0));
         return Ok(summary);
     }
 
@@ -3926,13 +3910,11 @@ pub(crate) fn send_editor_change_batches(
         merge_editor_summary_checked(&mut summary, &result)?;
         summary.insert(
             "binaryBytes".to_string(),
-            Value::Number(serde_json::Number::from(binary_import.bytes.len() as u64)),
+            json!(binary_import.bytes.len() as u64),
         );
         summary.insert(
             "binaryInstances".to_string(),
-            Value::Number(serde_json::Number::from(
-                binary_import.instance_count as u64,
-            )),
+            json!(binary_import.instance_count as u64),
         );
     }
 
@@ -4114,10 +4096,7 @@ pub(crate) fn send_editor_change_batches(
         })
         .collect::<Vec<_>>();
     source_changes.sort_by(|left, right| source_change_apply_order(left, right));
-    summary.insert(
-        "sourceSent".to_string(),
-        Value::Number(serde_json::Number::from(source_changes.len() as u64)),
-    );
+    summary.insert("sourceSent".to_string(), json!(source_changes.len() as u64));
     for source_batch in source_changes.chunks(SOURCE_BATCH_SIZE) {
         let result = bridge.call(
             "applyEditorChanges",
@@ -4229,9 +4208,7 @@ pub(crate) fn send_editor_change_batches(
     }
     summary.insert(
         "propertySent".to_string(),
-        Value::Number(serde_json::Number::from(
-            (property_changes.len() + material_changes.len()) as u64,
-        )),
+        json!((property_changes.len() + material_changes.len()) as u64),
     );
     let started = Instant::now();
     send_property_batches(bridge, &property_changes, transaction_id, &mut summary)?;

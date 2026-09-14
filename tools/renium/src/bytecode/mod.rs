@@ -869,12 +869,7 @@ fn high_level_print_ambiguity(
         "error",
         Value::String("ambiguous".to_string()),
     );
-    insert_top_field(
-        &mut response,
-        mode,
-        "count",
-        Value::Number(serde_json::Number::from(indices.len() as u64)),
-    );
+    insert_top_field(&mut response, mode, "count", json!(indices.len() as u64));
     if indices.len() > HIGH_LEVEL_AMBIGUITY_LIMIT {
         insert_top_field(&mut response, mode, "truncated", Value::Bool(true));
     }
