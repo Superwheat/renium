@@ -348,7 +348,7 @@ local function markLiveMutation(ctx: { [string]: any }?, instance: Instance?)
 	end
 end
 
-local function setParentForSync(instance: Instance, parent: Instance?, ctx: { [string]: any }?, profile: { [string]: number }?, serializedInsertion: boolean?)
+local function setParentForSync(instance: Instance, parent: Instance?, ctx: { [string]: any }?, serializedInsertion: boolean?)
 	if instance.Parent == parent then
 		return
 	end
@@ -365,25 +365,10 @@ local function setParentForSync(instance: Instance, parent: Instance?, ctx: { [s
 		setParentForSync(viewport, Workspace, ctx)
 	end
 	local wasLive = instance:IsDescendantOf(game)
-	local started = if profile then os.clock() else 0
-	local token = if ctx ~= nil then ctx.expectParentChange(instance, parent, profile, serializedInsertion) else nil
-	local expected = if profile then os.clock() else 0
-	local scope = if profile and ctx then ctx.syncProfile else nil
-	local previousProfile = if scope then scope.attachment else nil
-	if scope then
-		scope.attachment = profile
-	end
+	local token = if ctx ~= nil then ctx.expectParentChange(instance, parent, serializedInsertion) else nil
 	local ok, result = pcall(function()
 		instance.Parent = parent
 	end)
-	if scope then
-		scope.attachment = previousProfile
-	end
-	if profile then
-		profile.expectMs = (profile.expectMs or 0) + (expected - started) * 1000
-		profile.parentMs = (profile.parentMs or 0) + (os.clock() - expected) * 1000
-		profile.roots = (profile.roots or 0) + 1
-	end
 	if not ok then
 		cancelExpectedEvent(ctx, token)
 		error(result, 0)
@@ -5903,9 +5888,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 
 	local function commitTransactionUnsafe(params: { [string]: any }, operation): { [string]: any }
 		pruneExpiredSessions(editorTransactions)
-		local profile = params.profile == true
-		local timings = {}
-		local phaseStarted = os.clock()
 		local transactionId = tostring(params.transactionId or "")
 		local session = editorTransactions[transactionId]
 		if type(session) ~= "table" then
@@ -5916,7 +5898,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			error("Editor transaction was not found")
 		end
 		assertTransactionLease(session)
-		session.commitProfile = if profile then timings else nil
 		if session.pendingNativeRootWrite ~= nil then
 			error("A native root setter is still in flight")
 		end
@@ -5979,22 +5960,18 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			TransactionState.drainJournal(session, ctx)
 			-- Native commit can replace live roots before reporting an error.
 			session.mutated = true
-			local nativeProfile = if profile then {} else nil
-			timings.native = nativeProfile
 			-- Serialized roots remain available for explicit restoration. Other
 			-- destructive/native writes still require the engine recording.
 			session.nativeUndo.explicitRollback = not session.nativeUndo.nativeInserted
 				and session.nativeServiceImport == nil
 				and next(session.snapshot.groups or {}) == nil
 				and next(session.nativeRootWrites or {}) == nil
-			ReferenceOverlay.commitNative(session.nativeUndo, ctx, nativeProfile)
+			ReferenceOverlay.commitNative(session.nativeUndo, ctx)
 			assertCommitActive()
 			for original, replacement in pairs(session.nativeUndo.replacements) do
 				session.instanceReplacements[original] = replacement
 			end
 		end
-		timings.nativeCommitMs = (os.clock() - phaseStarted) * 1000
-		phaseStarted = os.clock()
 		setTrackedOperationPhase(operation, "scriptDocuments")
 		if not session.commitPrepared then
 			ScriptDocumentState.apply(
@@ -6007,8 +5984,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			)
 		end
 		assertCommitActive()
-		timings.scriptDocumentsMs = (os.clock() - phaseStarted) * 1000
-		phaseStarted = os.clock()
 		local postCommitPropertyChanges = session.postCommitPropertyChanges
 		if #postCommitPropertyChanges > 0 and not session.commitPrepared then
 			local updated = 0
@@ -6057,9 +6032,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					updated += 1
 				end
 			end
-			timings.postCommitPropertyUpdated = updated
 		end
-		timings.postCommitPropertiesMs = (os.clock() - phaseStarted) * 1000
 		session.commitPrepared = true
 		if params.prepareOnly == true then
 			-- Make staged native contents visible to the full-place serializer,
@@ -6071,35 +6044,15 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		-- would mistake those newer values for the files that were just pushed.
 		local verifiedPushProof = nil
 		if ctx.capturePushProof then
-			verifiedPushProof, timings.pushProofUnavailable = ctx.capturePushProof()
+			verifiedPushProof = ctx.capturePushProof()
 		end
 		assertCommitActive()
 		TransactionState.drainJournal(session, ctx)
 		assertStudioUnchanged()
-		phaseStarted = os.clock()
 		setTrackedOperationPhase(operation, "journal")
 		local records = TransactionState.finishJournal(session, ctx)
-		if profile then
-			timings.journalRecords = #records
-			timings.journalSample = {}
-			for index = 1, math.min(4, #records) do
-				local record = records[index]
-				local properties = {}
-				for name in pairs(record.properties or {}) do
-					properties[#properties + 1] = name
-				end
-				table.sort(properties)
-				timings.journalSample[index] = {
-					path = table.concat(record.pathSegments or {}, "."),
-					structural = record.structural == true,
-					properties = properties,
-				}
-			end
-		end
 		TransactionState.replayJournal(records, session.instanceReplacements, ctx)
 		assertCommitActive()
-		timings.journalMs = (os.clock() - phaseStarted) * 1000
-		phaseStarted = os.clock()
 		setTrackedOperationPhase(operation, "history")
 		assertCommitActive()
 		for _, token in ipairs(session.nativeSettingTokens or {}) do
@@ -6111,8 +6064,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		end
 		finishHistoryRecording(session.historyRecording)
 		session.commitFence = true
-		timings.historyMs = (os.clock() - phaseStarted) * 1000
-		phaseStarted = os.clock()
 		local undoRecorded = session.historyRecording ~= nil
 		session.historyRecording = nil
 		if session.nativeStats ~= nil then
@@ -6156,16 +6107,13 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				recordCleanupFailure("committed transaction cleanup", cleanupError)
 			end
 		end
-		timings.cleanupMs = (os.clock() - phaseStarted) * 1000
 		for _, serviceName in ipairs(session.serviceNames) do
 			invalidateEditorService(serviceName)
 		end
-		timings.invalidatedServices = #session.serviceNames
 		editorTransactions[transactionId] = nil
 		return recordTransactionOutcome(transactionId, "committed", {
 			undoRecorded = undoRecorded,
 			verifiedPushProof = verifiedPushProof,
-			profile = if profile then timings else nil,
 		})
 	end
 
@@ -6201,7 +6149,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				editorTransactions[transactionId] = nil
 				recordTransactionOutcome(transactionId, "rolledBack", {
 					replacements = countEntries(rollbackResult),
-					profile = session.commitProfile,
 				})
 				for _, serviceName in ipairs(session.serviceNames) do
 					invalidateEditorService(serviceName)
@@ -6254,10 +6201,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 	end
 
 	function api.beginBinaryExport(params: { [string]: any }): { [string]: any }
-		local profile = params.profile == true
-		local profileStarted = if profile then os.clock() else 0
-		local profileTimings = {}
-		local phaseStarted = profileStarted
 		pruneExpiredSessions(binaryExports)
 		local operationCancellation = captureOperationCancellation()
 		assertSessionOwnership(operationCancellation)
@@ -6361,10 +6304,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			groups[#groups + 1] = group
 			groupByService[serviceName] = group
 		end
-		if profile then
-			profileTimings.layoutMs = (os.clock() - phaseStarted) * 1000
-			phaseStarted = os.clock()
-		end
 		local session: { [string]: any } = {
 			leaseId = currentRequestLeaseId(),
 			groups = groups,
@@ -6405,9 +6344,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				guardedServices, true, captureIgnoredProperties, ctx.attributeObservation,
 				nativeCapture and params.nativeAttributeGuard == true)
 		end
-		if profile then
-			profileTimings.nativeGuardMs = (os.clock() - phaseStarted) * 1000
-		end
 		session.cleanupSnapshot = function()
 			if session.activeSerializations > 0 then
 				session.snapshotCleanupPending = true
@@ -6435,13 +6371,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		armSessionExpiry(binaryExports, exportId, session)
 		local beginOk, beginResult = xpcall(function()
 			if not metadataOnly then
-				phaseStarted = if profile then os.clock() else 0
 				local scriptSourcesByInstance = {}
 				for _, entry in ipairs(ScriptDocumentState.capture(serviceNames)) do
 					scriptSourcesByInstance[entry.instance] = entry.source
-				end
-				if profile then
-					profileTimings.scriptDocumentsMs = (os.clock() - phaseStarted) * 1000
 				end
 				assertSessionOwnership(operationCancellation)
 				local serializerWorkerCount = if partitioned and not nativeCapture
@@ -6452,27 +6384,12 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					session.serializerWorkerCount = serializerWorkerCount
 					NativeSerialization.startWorkers(session, serializerWorkerCount)
 				end
-				local prepareNativeStateMs = 0
-				local attributeGuardMs = 0
-				local identityCarriersMs = 0
-				local rootPropertiesMs = 0
-				local nativePreparationByService = {}
 				for serviceIndex, serviceName in ipairs(serviceNames) do
 					assertSessionOwnership(operationCancellation)
-					phaseStarted = if profile then os.clock() else 0
 					local state = ctx.prepareNativeState(serviceName, scriptSourcesByInstance)
-					if profile then
-						prepareNativeStateMs += (os.clock() - phaseStarted) * 1000
-						nativePreparationByService[serviceName] = state.nativePreparationProfile
-						phaseStarted = os.clock()
-					end
 					-- ItemChanged does not cover every attribute edit. Subscribe to
 					-- the already enumerated graph before its serializer can start.
 					ReferenceOverlay.watchNativeDescendantAttributes(session.nativeGuard, serviceName, state.instances)
-					if profile then
-						attributeGuardMs += (os.clock() - phaseStarted) * 1000
-						phaseStarted = os.clock()
-					end
 					session.nativeStates[serviceName] = state
 					session.nonArchivableByService[serviceName] = state.nonArchivableInstances
 					local group = groupByService[serviceName]
@@ -6484,16 +6401,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 							state.nativeStructureGeneration
 						)
 					end
-					if profile then
-						identityCarriersMs += (os.clock() - phaseStarted) * 1000
-						phaseStarted = os.clock()
-					end
 					local values = ctx.readRootProperties(serviceName, state)
 					if type(values) == "table" and next(values) then
 						group.rootProperties = values
-					end
-					if profile then
-						rootPropertiesMs += (os.clock() - phaseStarted) * 1000
 					end
 					if partitioned and serviceIndex <= serializerWorkerCount then
 						NativeSerialization.appendJob(
@@ -6531,18 +6441,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 						session.status = "ready"
 					end
 				end
-				if profile then
-					profileTimings.prepareNativeStateMs = prepareNativeStateMs
-					profileTimings.attributeGuardMs = attributeGuardMs
-					profileTimings.nativePreparationByService = nativePreparationByService
-					profileTimings.identityCarriersMs = identityCarriersMs
-					profileTimings.rootPropertiesMs = rootPropertiesMs
-					phaseStarted = os.clock()
-				end
 				ReferenceOverlay.assertNativeGuard(session.nativeGuard)
-				if profile then
-					profileTimings.referenceGuardMs = (os.clock() - phaseStarted) * 1000
-				end
 				if not partitioned then
 					table.clear(roots)
 					for _, serviceName in ipairs(serviceNames) do
@@ -6564,7 +6463,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				session.serializationScheduleReady = true
 				session.status = "ready"
 			end
-			phaseStarted = if profile then os.clock() else 0
 			local propertySchemaByClass = {}
 			local enumValueNamesByType = {}
 			for _, serviceName in ipairs(serviceNames) do
@@ -6611,10 +6509,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					session.firstUnscheduledSerializationGroup
 				)
 			end
-			if profile then
-				profileTimings.schemaMs = (os.clock() - phaseStarted) * 1000
-				profileTimings.totalMs = (os.clock() - profileStarted) * 1000
-			end
 			return {
 				ok = true,
 				exportId = exportId,
@@ -6624,7 +6518,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				enumValueNamesByType = enumValueNamesByType,
 				pending = session.status == "pending",
 				nativeCapture = nativeCapture,
-				profile = if profile then profileTimings else nil,
 				supported = true,
 			}
 		end, debug.traceback)
@@ -7767,8 +7660,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			end
 			transaction.nativeSettingTokens = {}
 			expectContainerSettings(native.containerSettings, ctx, transaction.nativeSettingTokens)
-			native.profile = if params.profile then {} else nil
-			ctx.beginNativeImportObservations(transaction.transactionId, native.profile, native.untaggedClasses)
+			ctx.beginNativeImportObservations(transaction.transactionId, native.untaggedClasses)
 			native.started = os.clock()
 			native.readerArmed = true
 			transaction.nativeServiceImport = native
@@ -7844,7 +7736,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			requests = 1, instanceCreated = native.receivedCreated, lastMs = (os.clock() - native.started) * 1000,
 		}
 		return { ok = true, requests = 1, instanceCreated = native.receivedCreated,
-			binaryBytes = session.totalBytes, nativeInserted = true, profile = native.profile }
+			binaryBytes = session.totalBytes, nativeInserted = true }
 	end
 
 	function api.finishBinaryImport(params: { [string]: any }): { [string]: any }
@@ -7915,15 +7807,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			end
 			local started = os.clock()
 			setTrackedOperationPhase(operation, "scanOutgoing")
-			local profile = if params.profile == true then {} else nil
-			local phaseStarted = started
-			local function finishPhase(name: string)
-				if profile then
-					local now = os.clock()
-					profile[name] = (now - phaseStarted) * 1000
-					phaseStarted = now
-				end
-			end
 			local previousCamera = Workspace.CurrentCamera
 			local outgoingByGroup = {}
 			local generationsByService = {}
@@ -7961,10 +7844,8 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				end
 			end
 			transaction.nativeGuard = ReferenceOverlay.beginNativeGuard(session.groups)
-			finishPhase("outgoingAndGuardMs")
 			setTrackedOperationPhase(operation, "deserialize")
 			roots = SerializationService:DeserializeInstancesAsync(session.payload)
-			finishPhase("deserializeMs")
 			setTrackedOperationPhase(operation, "validatePayload")
 			assertImportActive()
 			ReferenceOverlay.assertNativeGuard(transaction.nativeGuard)
@@ -7985,7 +7866,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			end
 			local prepared = {}
 			local payloadVerifiedServices = {}
-			finishPhase("validatePayloadMs")
 			setTrackedOperationPhase(operation, "prepareGroups")
 			for groupIndex, group in ipairs(session.groups) do
 				local groupPayloadRoot = wrappedRootsByName[group.payloadRootName]
@@ -8054,12 +7934,10 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					packageRoots = group.packageRoots,
 				}
 			end
-			finishPhase("unpackGroupsMs")
 			setTrackedOperationPhase(operation, "prepareRetention")
 			local retention = ReferenceOverlay.prepareRetained(
 				prepared, ctx, session.externalReferencesPostApplied, session.viewportReferencesPostApplied
 			)
-			finishPhase("prepareRetentionMs")
 			transaction.nativeUndo = {
 				prepared = prepared,
 				replacements = retention.replacements,
@@ -8082,7 +7960,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			setTrackedOperationPhase(operation, "applyOverlay")
 			ReferenceOverlay.apply(retention.referenceOverlay, retention.replacements, nil)
 			assertImportActive()
-			finishPhase("referenceOverlayMs")
 			local elapsed = (os.clock() - started) * 1000
 			local createdInstanceCount = math.max(
 				0,
@@ -8103,7 +7980,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				binaryMs = elapsed,
 				payloadVerifiedServices = payloadVerifiedServices,
 				undoRecorded = transaction.historyRecording ~= nil,
-				profile = profile,
 			}
 			transaction.state = "prepared"
 			binaryImports[importId] = nil
@@ -8265,16 +8141,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 	end
 
 	function api.applyChanges(params: { [string]: any }): { [string]: any }
-		local profile = if params.profile == true then {} else nil
-		local profileStarted = if profile then os.clock() else 0
-		local phaseStarted = profileStarted
-		local function checkpoint(name: string)
-			if profile then
-				local now = os.clock()
-				profile[name] = (now - phaseStarted) * 1000
-				phaseStarted = now
-			end
-		end
 		local operationGeneration = captureOperationCancellation()
 		assertSessionOwnership(operationGeneration)
 		local serviceNames = validateMutationRequest(params, ctx)
@@ -8432,7 +8298,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		end
 
 		local instanceChanges = params.instanceChanges
-		checkpoint("setupMs")
 		local aborted = false
 		if type(instanceChanges) == "table" then
 			for _, change in ipairs(instanceChanges) do
@@ -8472,7 +8337,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			end
 		end
 
-		checkpoint("instanceChangesMs")
 		local sourceChanges = params.sourceChanges
 		if not aborted and type(sourceChanges) == "table" then
 			for _, change in ipairs(sourceChanges) do
@@ -8495,7 +8359,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				end
 			end
 		end
-		checkpoint("sourceChangesMs")
 		if not aborted then
 			local ok, err = pcall(
 				runWithSessionOwnership,
@@ -8520,7 +8383,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		end
 
 		local propertyChanges = params.propertyChanges
-		checkpoint("retargetMs")
 		if not aborted and type(propertyChanges) == "table" then
 			if not aborted then
 				local sliceStarted = os.clock()
@@ -8543,12 +8405,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 						break
 					end
 					if os.clock() - sliceStarted >= 0.008 then
-						local yieldStarted = if profile then os.clock() else 0
 						task.wait()
-						if profile then
-							profile.propertyYieldMs = (profile.propertyYieldMs or 0) + (os.clock() - yieldStarted) * 1000
-							profile.propertyYields = (profile.propertyYields or 0) + 1
-						end
 						assertSessionOwnership(operationGeneration)
 						assertReconcileActive()
 						sliceStarted = os.clock()
@@ -8557,7 +8414,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			end
 		end
 
-		checkpoint("propertyChangesMs")
 		if not aborted and chunkChange ~= nil and chunkChange.mode == "beginReconcileService" then
 			local okSession = pcall(function()
 				assertSessionOwnership(operationGeneration)
@@ -8672,14 +8528,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			outerTransaction.state = "prepared"
 		end
 		ctx.updateStatus()
-		checkpoint("finalizationMs")
-		if profile then
-			profile.applyMs = (os.clock() - profileStarted) * 1000
-			profile.instanceGroups = #(instanceChanges or {})
-			profile.sourceItems = #(sourceChanges or {})
-			profile.propertyItems = #(propertyChanges or {})
-			stats.profile = profile
-		end
 		return stats
 	end
 

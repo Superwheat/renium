@@ -72,18 +72,16 @@ do
 	assert(not pcall(retarget, {}, { [duplicate] = instance("Camera", nil) }, {}, true), "Only the actual viewport can use this policy")
 end
 
--- Profiling scopes cannot leak after a failed setter or replace an outer scope.
+-- A failed setter cancels its expectation instead of leaving it armed.
 do
 	local setParent = luau.load(source:sub(first, last - 1) .. "\nreturn setParentForSync", {
 		environment = { game = {}, Workspace = {} },
 	})()
-	local outer, profile, token = {}, {}, {}
-	local scope = { attachment = outer }
+	local token = {}
 	local cancelled = 0
 	local completed = 0
 	token.complete = function() completed += 1 end
 	local ctx = {
-		syncProfile = scope,
 		expectParentChange = function() return token end,
 		cancelExpectedEvent = function(value) assert(value == token); cancelled += 1 end,
 	}
@@ -95,13 +93,12 @@ do
 		}, {
 			__index = function(_, key) return if key == "Parent" then parent else nil end,
 			__newindex = function(_, key, value)
-				assert(key == "Parent" and scope.attachment == profile)
+				assert(key == "Parent")
 				if fail then error("mock Parent setter failure") end
 				parent = value
 			end,
 		})
-		assert(pcall(setParent, target, {}, ctx, profile) == not fail)
-		assert(scope.attachment == outer, "parenting restores profiling scope before propagating an error")
+		assert(pcall(setParent, target, {}, ctx) == not fail)
 	end
 	assert(cancelled == 1 and completed == 1, "observer preparation must complete only after successful parenting")
 end

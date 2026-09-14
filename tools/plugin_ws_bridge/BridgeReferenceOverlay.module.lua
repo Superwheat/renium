@@ -1113,15 +1113,7 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 		}
 	end
 
-	function ReferenceOverlay.commitNative(undo: { [string]: any }, ctx: { [string]: any }, profile: { [string]: any }?): (number, number)
-		local phaseStarted = os.clock()
-		local function finishPhase(name: string)
-			local now = os.clock()
-			if profile ~= nil then
-				profile[name] = (now - phaseStarted) * 1000
-			end
-			phaseStarted = now
-		end
+	function ReferenceOverlay.commitNative(undo: { [string]: any }, ctx: { [string]: any }): (number, number)
 		ReferenceOverlay.finishNativeStaging(undo, ctx)
 		local selected = captureExplorerSelection()
 		local selectionPaths = {}
@@ -1156,7 +1148,6 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 		end
 		local updated = 0
 		local contentUpdated = 0
-		finishPhase("guardMs")
 		if undo.needsReferenceRetarget then
 			local scanRoots = {}
 			for serviceName, allowed in pairs(ctx.allowedServices) do
@@ -1188,29 +1179,22 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 				error(`Could not retarget {contentFailed} native import content references`)
 			end
 		end
-		finishPhase("retargetMs")
 		for _, pair in ipairs(undo.packageStatePairs or {}) do
 			ReferenceOverlay.copyPackageRootState(pair, undo.packageAliases, ctx, false)
 		end
 		if undo.viewport ~= nil then
 			setParentForSync(undo.viewport.duplicate, nil, ctx)
 		end
-		finishPhase("retainedStateMs")
 		for _, group in ipairs(undo.prepared) do
-			local attachment = if profile then {} else nil
 			if not undo.nativeInserted then
 				for _, instance in ipairs(group.incoming) do
-					setParentForSync(instance, group.target, ctx, attachment, true)
+					setParentForSync(instance, group.target, ctx, true)
 				end
-			end
-			if profile ~= nil then
-				profile[`attachment:{table.concat(group.targetPath, ".")}`] = attachment
-				finishPhase(`attach:{table.concat(group.targetPath, ".")}`)
 			end
 		end
 		for _, merge in ipairs(undo.packageMerges or {}) do
 			for _, instance in ipairs(merge.incoming) do
-				setParentForSync(instance, merge.target, ctx, nil, true)
+				setParentForSync(instance, merge.target, ctx, true)
 			end
 		end
 		for _, pair in ipairs(undo.packageStatePairs or {}) do
@@ -1236,7 +1220,6 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 			removeInstanceForUndo(instance, ctx, undo.retainedParent)
 		end
 		local removedRootCount = 0
-		finishPhase("retainedAttachMs")
 		for _, merge in ipairs(undo.packageMerges or {}) do
 			for _, instance in ipairs(merge.outgoing) do
 				retainOutgoing(instance)
@@ -1251,7 +1234,6 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 				removedRootCount += 1
 			end
 		end
-		finishPhase("detachMs")
 		local selectionReplacements = {}
 		for instance, path in pairs(selectionPaths) do
 			if instance.Parent == nil
@@ -1267,7 +1249,6 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 		for _, group in ipairs(undo.prepared) do
 			ctx.invalidateService(group.serviceName)
 		end
-		finishPhase("invalidateMs")
 		return removedRootCount, updated + contentUpdated + undo.referenceUpdates
 	end
 

@@ -182,7 +182,6 @@ fn begin_editor_binary_export_for_runtime(
         "metadataOnly": metadata_only,
         "nativeCapture": request_native_capture,
         "nativeAttributeGuard": native_attribute_guard,
-        "profile": verbose_timing_logs(),
     });
     let begin = if let Some(runtime_id) = runtime_id {
         bridge.call_for_runtime_with_timeout(
@@ -195,11 +194,6 @@ fn begin_editor_binary_export_for_runtime(
     } else {
         bridge.call("beginEditorBinaryExport", parameters)?
     };
-    if verbose_timing_logs()
-        && let Some(profile) = begin.get("profile")
-    {
-        println!("[renium] native editor begin profile: {profile}");
-    }
     let result = (|| -> Result<EditorBinaryExport> {
         if begin.get("supported").and_then(Value::as_bool) == Some(false) {
             let reason = begin
@@ -3668,7 +3662,7 @@ fn send_editor_binary_import(
         let started = Instant::now();
         let result = bridge.call(
             "finishEditorBinaryImport",
-            json!({ "importId": &import_id, "profile": verbose_timing_logs() }),
+            json!({ "importId": &import_id }),
         );
         log_timing("native editor import finish", started);
         result
@@ -3717,7 +3711,7 @@ fn send_editor_service_replacement(
         let ready = bridge.call(
             "finishEditorBinaryImport",
             json!({
-                "importId": &import_id, "nativePhase": "prepare", "profile": verbose_timing_logs(),
+                "importId": &import_id, "nativePhase": "prepare",
             }),
         )?;
         // Native code must not run merely because a target lookup succeeded.
@@ -3796,7 +3790,7 @@ fn send_editor_service_replacement(
         let response = bridge.call(
             "finishEditorBinaryImport",
             json!({
-                "importId": &import_id, "nativePhase": "complete", "profile": verbose_timing_logs(),
+                "importId": &import_id, "nativePhase": "complete",
                 "nativeStatus": outcome.0, "nativeState": outcome.1, "nativeError": outcome.2,
                 "nativeCreated": created.len() / serializer::CREATED_ROW,
                 "nativeReceiptChunk": final_receipt,
@@ -3852,7 +3846,6 @@ fn combined_editor_change_batch(
     // applyEditorChanges already applies instances, then ordered sources, then
     // properties. Keep oversized and streaming operations on their chunked path.
     let request = json!({
-        "profile": verbose_timing_logs(),
         "probeEvents": probe_events,
         "instanceChanges": &changes.instance_changes,
         "sourceChanges": sources,
@@ -3909,7 +3902,6 @@ pub(crate) fn send_editor_change_batches(
             let result = bridge.call(
                 "applyEditorChanges",
                 json!({
-                    "profile": verbose_timing_logs(),
                     "probeEvents": true,
                     "instanceChanges": [],
                     "sourceChanges": [],
@@ -3954,7 +3946,6 @@ pub(crate) fn send_editor_change_batches(
         let result = bridge.call(
             "applyEditorChanges",
             json!({
-                "profile": verbose_timing_logs(),
                 "probeEvents": probe_events,
                 "instanceChanges": [], "sourceChanges": [],
                 "propertyChanges": material_changes, "transactionId": transaction_id,
@@ -4090,7 +4081,6 @@ pub(crate) fn send_editor_change_batches(
                 let result = match bridge.call(
                     "applyEditorChanges",
                     json!({
-                        "profile": verbose_timing_logs(),
                         "probeEvents": probe_events,
                         "instanceChanges": [{
                             "mode": mode,
@@ -4124,7 +4114,6 @@ pub(crate) fn send_editor_change_batches(
                 let result = bridge.call(
                     "applyEditorChanges",
                     json!({
-                    "profile": verbose_timing_logs(),
                     "probeEvents": probe_events,
                     "instanceChanges": [{
                         "mode": &instance_change.mode,
@@ -4143,7 +4132,6 @@ pub(crate) fn send_editor_change_batches(
             let result = bridge.call(
                 "applyEditorChanges",
                 json!({
-                    "profile": verbose_timing_logs(),
                     "probeEvents": probe_events,
                     "instanceChanges": [instance_change],
                     "sourceChanges": [],
@@ -4177,7 +4165,6 @@ pub(crate) fn send_editor_change_batches(
         let result = bridge.call(
             "applyEditorChanges",
             json!({
-                "profile": verbose_timing_logs(),
                 "probeEvents": probe_events,
                 "instanceChanges": [],
                 "sourceChanges": source_batch,
@@ -4647,9 +4634,6 @@ fn merge_editor_summary(summary: &mut Map<String, Value>, result: &Value) {
 }
 
 fn merge_editor_summary_checked(summary: &mut Map<String, Value>, result: &Value) -> Result<()> {
-    if let Some(profile) = result.get("profile")
-        && profile.get("applyMs").is_some()
-    {}
     merge_editor_summary(summary, result);
     let errors = result.get("errors").and_then(Value::as_f64).unwrap_or(0.0);
     if result.get("ok").and_then(Value::as_bool) == Some(false) || errors > 0.0 {
@@ -4835,7 +4819,6 @@ fn send_property_batches(
         let result = bridge.call(
             "applyEditorChanges",
             json!({
-                "profile": verbose_timing_logs(),
                 "probeEvents": probe_events,
                 "instanceChanges": [],
                 "sourceChanges": [],
