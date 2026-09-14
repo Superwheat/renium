@@ -158,7 +158,7 @@ impl PackageChangesDialogWatcher {
         self.finished.store(true, Ordering::Release);
         let result = self
             .result
-            .recv_timeout(std::time::Duration::from_secs(2))
+            .recv_timeout(std::time::Duration::from_secs(10))
             .context("Package dialog watcher did not stop")?;
         if let Some(worker) = self.worker.take() {
             worker
@@ -2753,7 +2753,7 @@ mod platform {
         unsafe { CFRelease(application) };
         let _ = ready.send(Ok(()));
         let mut accepted = false;
-        let mut finish_deadline = None;
+        let mut final_pass = false;
         loop {
             if let Some(button) = package_changes_ok_button(pid)? {
                 let action = cf_string("AXPress");
@@ -2783,15 +2783,17 @@ mod platform {
                 }
                 accepted = true;
             }
+            // Walking Studio's accessibility tree takes long enough that the
+            // finish signal is honored after one final pass instead of a timed
+            // grace period.
             if finished.load(std::sync::atomic::Ordering::Acquire) {
-                let deadline = finish_deadline.get_or_insert_with(|| {
-                    std::time::Instant::now() + std::time::Duration::from_secs(1)
-                });
-                if std::time::Instant::now() >= *deadline {
+                if final_pass {
                     return Ok(accepted);
                 }
+                final_pass = true;
+                continue;
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
 
