@@ -1892,7 +1892,8 @@ do
 			local proof = assert(observer.capturePushProof())
 			assert(observer.verifyPushProof(proof) and not observer.verifyPushProof(proof + 1))
 			local released = observer.getState({ start = false, releaseTrackingGuardId = "proof", retainPushProof = proof })
-			assert(not released.tracking and released.retainedPushProof == proof and not relay.destroyed)
+			assert(released.tracking and released.retainedPushProof == proof and not relay.destroyed,
+				"a retained proof keeps the native lease armed for the next push")
 			assert(localScript.AttributeChanged:Count() == 0, "cached equality retained per-instance listeners")
 			assert(observer.getState({ start = false, verifyPushProof = proof }).pushProofMatches)
 			if mode == "attribute" then relay.Changed:Fire(localScript)

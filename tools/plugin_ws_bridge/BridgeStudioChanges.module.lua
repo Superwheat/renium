@@ -3942,7 +3942,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			and nativeAttributeRelay and nativeAttributeRelay.cached then
 			-- A new tracking lease can follow a daemon restart before the old
 			-- native worker retires. Give it a distinct relay; late old callbacks
-			-- must never disarm or bypass the new observer.
+			-- must never disarm or bypass the new observer. The listeners retained
+			-- for the retired proof end with it so the new lease starts cleanly.
+			local retainedGuardId = if verifiedPushProof ~= nil then "push-proof-" .. tostring(verifiedPushProof.id) else nil
 			verifiedPushProof = nil
 			releaseProofConnections(nativeAttributeRelay)
 			releaseTagConnections()
@@ -3950,6 +3952,13 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			nativeAttributeRelay.frameConnection:Disconnect()
 			nativeAttributeRelay.notify:Destroy()
 			nativeAttributeRelay = nil
+			if retainedGuardId ~= nil and state.trackingGuards[retainedGuardId] ~= nil then
+				state.trackingGuards[retainedGuardId] = nil
+				if not state.persistentTracking and next(state.trackingGuards) == nil then
+					stopTracking()
+				end
+			end
+			wasTracking = state.started
 		end
 		if params.deferNativeTracking == true and params.nativeAttributeRelay == true
 			and params.start ~= false and params.stop ~= true and params.releaseTrackingGuardId == nil
