@@ -3,7 +3,7 @@ mod macos;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub(crate) use windows::suppress_package_notices;
+pub(crate) use windows::{keep_selection_across_undo, suppress_package_notices};
 
 use std::time::Duration;
 

@@ -22,9 +22,12 @@ mod observation;
 mod package_notice;
 #[path = "windows_properties.rs"]
 mod properties;
+#[path = "windows_undo_selection.rs"]
+mod undo_selection;
 pub(crate) use import::{CREATED_ROW, read_service_payload};
 pub(crate) use observation::{AttributeGuard, begin_attribute_guard, begin_attribute_relay};
 pub(crate) use package_notice::suppress_package_notices;
+pub(crate) use undo_selection::keep_selection_across_undo;
 #[cfg(test)]
 #[path = "windows_tests.rs"]
 mod tests;
