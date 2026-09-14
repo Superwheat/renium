@@ -217,20 +217,6 @@ fn should_bootstrap_studio_from_editor(
         && previous_local_file_digest == current_local_file_digest
 }
 
-fn legacy_local_file_stamp_matches(
-    mode: PairMode,
-    runtime_replaced: bool,
-    previous_local_file_digest: Option<&str>,
-    previous_local_file_stamp: Option<&LocalFileStamp>,
-    current_local_file_stamp: Option<&LocalFileStamp>,
-) -> bool {
-    mode == PairMode::Reconcile
-        && runtime_replaced
-        && previous_local_file_digest.is_none()
-        && previous_local_file_stamp.is_some()
-        && previous_local_file_stamp == current_local_file_stamp
-}
-
 impl PairIdentity {
     fn from_context(context: &BoundContext, bridge: &BridgeServer) -> Result<Self> {
         let published = context.game_id.is_some_and(|value| value > 0)
@@ -631,23 +617,6 @@ struct PairRecord {
     studio_checkpoint: Option<StudioCheckpoint>,
 }
 
-#[derive(Deserialize)]
-struct LegacyPairRecord {
-    version: u8,
-    identity: PairIdentity,
-    mode: PairMode,
-    conflict_preference: ConflictPreference,
-    runtime_settings: Map<String, Value>,
-    #[serde(default)]
-    baseline: Option<ProjectSnapshot>,
-    #[serde(default, rename = "head")]
-    _head: Option<RecoveryHead>,
-    #[serde(default)]
-    conflicts: Vec<String>,
-    #[serde(default)]
-    resolution_required: bool,
-}
-
 fn saved_pair_identities(root: &Path, experience: &Path) -> Result<Vec<PairIdentity>> {
     let record_dir = root.join(".renium").join(RECORD_DIR);
     let entries = match fs::read_dir(&record_dir) {
@@ -859,25 +828,15 @@ impl Coordinator {
         } else {
             record.local_file_digest.clone()
         };
-        let legacy_stamp_matches = legacy_local_file_stamp_matches(
+        let runtime_replacement_unproven =
+            runtime_replaced && identity.local_file.is_some() && record.local_file_digest.is_none();
+        let bootstrap_studio_from_editor = should_bootstrap_studio_from_editor(
             mode,
-            runtime_replaced,
+            record.last_runtime_id.as_deref(),
+            current_runtime_id.as_deref(),
             record.local_file_digest.as_deref(),
-            record.local_file_stamp.as_ref(),
-            current_local_file_stamp.as_ref(),
+            current_local_file_digest.as_deref(),
         );
-        let runtime_replacement_unproven = runtime_replaced
-            && identity.local_file.is_some()
-            && record.local_file_digest.is_none()
-            && !legacy_stamp_matches;
-        let bootstrap_studio_from_editor = legacy_stamp_matches
-            || should_bootstrap_studio_from_editor(
-                mode,
-                record.last_runtime_id.as_deref(),
-                current_runtime_id.as_deref(),
-                record.local_file_digest.as_deref(),
-                current_local_file_digest.as_deref(),
-            );
         let configuration_changed = record.identity.fingerprint != identity.fingerprint;
         let obsolete_head = record.head.take().is_some();
         let record_changed = record_missing
@@ -6536,65 +6495,25 @@ fn record_path(context: &BoundContext, key: &str) -> PathBuf {
         .join(format!("{key}.rmp"))
 }
 
-fn legacy_record_path(context: &BoundContext, key: &str) -> PathBuf {
-    Path::new(&context.root)
-        .join(".renium")
-        .join(RECORD_DIR)
-        .join(format!("{key}.rmp.zst"))
-}
-
 fn load_record(context: &BoundContext, key: &str) -> Result<Option<PairRecord>> {
     let path = record_path(context, key);
-    match fs::read(&path) {
-        Ok(bytes) => {
-            let mut record: PairRecord = rmp_serde::from_slice(&bytes)
-                .with_context(|| format!("Failed to decode {}", path.display()))?;
-            if let Some(baseline) = record.baseline.as_mut()
-                && baseline.migrate_store_paths(Path::new(&context.root))?
-            {
-                record.studio_checkpoint = None;
-                record.local_file_stamp = None;
-                record.local_file_digest = None;
-                write_record(context, key, &record)?;
-            }
-            return Ok(Some(record));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(error).with_context(|| format!("Failed to read {}", path.display()));
         }
-    }
-
-    let legacy_path = legacy_record_path(context, key);
-    let Some(legacy) = read_compressed::<LegacyPairRecord>(&legacy_path)? else {
-        return Ok(None);
     };
-    if legacy.version != 1 {
-        return Ok(None);
+    let mut record: PairRecord = rmp_serde::from_slice(&bytes)
+        .with_context(|| format!("Failed to decode {}", path.display()))?;
+    if let Some(baseline) = record.baseline.as_mut()
+        && baseline.migrate_store_paths(Path::new(&context.root))?
+    {
+        record.studio_checkpoint = None;
+        record.local_file_stamp = None;
+        record.local_file_digest = None;
+        write_record(context, key, &record)?;
     }
-    let baseline = legacy
-        .baseline
-        .as_ref()
-        .map(|baseline| StoredSnapshot::write(Path::new(&context.root), key, baseline))
-        .transpose()?;
-    let record = PairRecord {
-        version: RECORD_VERSION,
-        identity: legacy.identity,
-        mode: legacy.mode,
-        conflict_preference: legacy.conflict_preference,
-        runtime_settings: legacy.runtime_settings,
-        baseline,
-        head: None,
-        conflicts: legacy.conflicts,
-        resolution_required: legacy.resolution_required,
-        last_runtime_id: None,
-        local_file_stamp: None,
-        local_file_digest: None,
-        studio_checkpoint: None,
-    };
-    write_record(context, key, &record)?;
-    fs::remove_file(&legacy_path)
-        .with_context(|| format!("Failed to remove {}", legacy_path.display()))?;
     Ok(Some(record))
 }
 
@@ -6608,21 +6527,6 @@ fn write_record(context: &BoundContext, key: &str, record: &PairRecord) -> Resul
         let _ = StoredSnapshot::clear(Path::new(&context.root), key);
     }
     Ok(())
-}
-
-fn read_compressed<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).with_context(|| format!("Failed to read {}", path.display()));
-        }
-    };
-    let decoded = zstd::stream::decode_all(bytes.as_slice())
-        .with_context(|| format!("Failed to decompress {}", path.display()))?;
-    Ok(Some(rmp_serde::from_slice(&decoded).with_context(
-        || format!("Failed to decode {}", path.display()),
-    )?))
 }
 
 #[cfg(test)]
@@ -8057,37 +7961,6 @@ mod tests {
             Some("new-runtime"),
             None,
             Some("digest"),
-        ));
-    }
-
-    #[test]
-    fn matching_legacy_stamp_migrates_once_to_content_identity() {
-        let stamp = LocalFileStamp {
-            length: 42,
-            modified_seconds: 123,
-            modified_nanos: 456,
-        };
-
-        assert!(legacy_local_file_stamp_matches(
-            PairMode::Reconcile,
-            true,
-            None,
-            Some(&stamp),
-            Some(&stamp),
-        ));
-        assert!(!legacy_local_file_stamp_matches(
-            PairMode::Verify,
-            true,
-            None,
-            Some(&stamp),
-            Some(&stamp),
-        ));
-        assert!(!legacy_local_file_stamp_matches(
-            PairMode::Reconcile,
-            true,
-            Some("already-migrated"),
-            Some(&stamp),
-            Some(&stamp),
         ));
     }
 

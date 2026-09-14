@@ -191,13 +191,6 @@ function BridgeSettings.loadRuntimeSettings(plugin, prefix)
 			end
 		end
 	end
-	local legacy = plugin:GetSetting(prefix .. "initialSyncPriority")
-	if legacy == "studio" or legacy == "editor" or legacy == "none" then
-		out.initialSyncPriority = if legacy == "none" then "verify" else "reconcile"
-		out.initialConflictPreference = if legacy == "editor" then "editor" else "none"
-		plugin:SetSetting(prefix .. "initialSyncPriority", out.initialSyncPriority)
-		plugin:SetSetting(prefix .. "initialConflictPreference", out.initialConflictPreference)
-	end
 	return out
 end
 
