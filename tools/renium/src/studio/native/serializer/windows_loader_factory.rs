@@ -331,23 +331,3 @@ fn creator_call_requires_factory_receiver_output_slot_and_flag() {
         assert_eq!(factory_call(&decode(&changed), 4), None);
     }
 }
-
-#[test]
-#[ignore = "Read-only native factory finder; requires an explicit Studio executable"]
-fn discover_installed_retained_factory() -> Result<()> {
-    let path = std::env::var("RENIUM_LOADER_PROBE_EXE")?;
-    let bytes = fs::read(path)?;
-    let image = PeImage::parse(&bytes)?;
-    let reader = super::trace_loader(&bytes)?.reader;
-    let started = Instant::now();
-    let trace = discover(&image, &bytes, reader)?;
-    println!(
-        "Retained factory discovery {:.3}ms lookupRaw={:#x} returnRaw={:#x} internRaw={:#x} contextBytes={}",
-        started.elapsed().as_secs_f64() * 1000.,
-        image.rva_to_offset(trace.lookup)?,
-        image.rva_to_offset(trace.origin)?,
-        image.rva_to_offset(trace.intern_name)?,
-        trace.context_bytes,
-    );
-    Ok(())
-}

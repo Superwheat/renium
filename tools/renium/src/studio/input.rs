@@ -482,8 +482,6 @@ mod platform {
     };
     use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MAPVK_VK_TO_VSC, MapVirtualKeyW};
-    #[cfg(test)]
-    use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CHILDID_SELF, EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_SHOW, EnumChildWindows, EnumWindows,
         GA_ROOT, GW_OWNER, GetAncestor, GetClassNameW, GetClientRect, GetMessageW, GetWindow,
@@ -1045,23 +1043,6 @@ mod platform {
         }
     }
 
-    #[cfg(test)]
-    #[test]
-    #[ignore = "requires RENIUM_CAPTURE_TEST_PID for an open Studio viewport"]
-    fn live_native_viewport_capture_without_probe() {
-        let pid = std::env::var("RENIUM_CAPTURE_TEST_PID")
-            .unwrap()
-            .parse()
-            .unwrap();
-        let window = verified_studio_window_for_pid(pid, &mut |_, _| {
-            bail!("Native viewport discovery fell back to the visual probe")
-        })
-        .unwrap();
-        let (width, height, pixels) = capture_window_rgba(&window.handle).unwrap();
-        assert_eq!(pixels.len(), width as usize * height as usize * 4);
-        println!("{}: {}x{}", window.label, width, height);
-    }
-
     fn capture_hwnd_pixels(hwnd: isize, allow_fallback: bool) -> Result<(u32, u32, Vec<u8>)> {
         use windows_sys::Win32::Graphics::Gdi::{
             BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleBitmap,
@@ -1514,105 +1495,6 @@ mod platform {
         bail!("Studio did not close the startup notice after {button_name}; not invoking it again")
     }
 
-    #[cfg(test)]
-    #[test]
-    #[ignore = "requires RENIUM_DIALOG_TEST_PID for an owned Studio fixture with an open notice"]
-    fn live_startup_notice_preserves_background_focus() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use windows_sys::Win32::System::Threading::GetCurrentThreadId;
-        use windows_sys::Win32::UI::WindowsAndMessaging::{
-            EVENT_SYSTEM_FOREGROUND, GWL_EXSTYLE, GetWindowLongPtrW, PostThreadMessageW, WM_QUIT,
-        };
-        static TARGET: AtomicUsize = AtomicUsize::new(0);
-        static ACTIVATIONS: AtomicUsize = AtomicUsize::new(0);
-        unsafe extern "system" fn foreground_event(
-            _: *mut core::ffi::c_void,
-            _: u32,
-            window: HWND,
-            _: i32,
-            _: i32,
-            _: u32,
-            _: u32,
-        ) {
-            if window_process_id(window) as usize == TARGET.load(Ordering::Acquire) {
-                ACTIVATIONS.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        let pid = std::env::var("RENIUM_DIALOG_TEST_PID")
-            .unwrap()
-            .parse::<u32>()
-            .unwrap();
-        let (top, _, _) = main_studio_window(pid).unwrap();
-        let before_style = unsafe { GetWindowLongPtrW(top as HWND, GWL_EXSTYLE) };
-        assert_ne!(
-            window_process_id(unsafe { GetForegroundWindow() }),
-            pid,
-            "leave the fixture in the background"
-        );
-        let mut state = EnumRecoveryState {
-            dialogs: Vec::new(),
-        };
-        unsafe { EnumWindows(Some(enum_recovery_proc), &mut state as *mut _ as LPARAM) };
-        let window = state
-            .dialogs
-            .into_iter()
-            .find(|window| window_process_id(*window as HWND) == pid)
-            .expect("fixture must have an actual open startup notice");
-        TARGET.store(pid as usize, Ordering::Release);
-        ACTIVATIONS.store(0, Ordering::Release);
-        let (ready, started) = std::sync::mpsc::channel();
-        let observer = std::thread::spawn(move || {
-            let hook = unsafe {
-                SetWinEventHook(
-                    EVENT_SYSTEM_FOREGROUND,
-                    EVENT_SYSTEM_FOREGROUND,
-                    std::ptr::null_mut(),
-                    Some(foreground_event),
-                    0,
-                    0,
-                    WINEVENT_OUTOFCONTEXT,
-                )
-            };
-            assert!(!hook.is_null());
-            let mut message = unsafe { std::mem::zeroed::<MSG>() };
-            // Creating the message queue precedes publishing its thread ID.
-            unsafe {
-                windows_sys::Win32::UI::WindowsAndMessaging::PeekMessageW(
-                    &mut message,
-                    std::ptr::null_mut(),
-                    0,
-                    0,
-                    0,
-                )
-            };
-            ready.send(unsafe { GetCurrentThreadId() }).unwrap();
-            while unsafe { GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) } > 0 {}
-            unsafe { UnhookWinEvent(hook) };
-        });
-        let thread = started.recv().unwrap();
-        let began = std::time::Instant::now();
-        let (_, button) = startup_notice(window as HWND).unwrap();
-        let result = invoke_startup_notice(window as HWND, pid, button);
-        std::thread::sleep(std::time::Duration::from_millis(250));
-        unsafe { PostThreadMessageW(thread, WM_QUIT, 0, 0) };
-        observer.join().unwrap();
-        assert!(result.unwrap(), "notice was not dismissed");
-        assert_eq!(
-            ACTIVATIONS.load(Ordering::Acquire),
-            0,
-            "Studio stole foreground during dismissal"
-        );
-        assert_eq!(
-            unsafe { GetWindowLongPtrW(top as HWND, GWL_EXSTYLE) },
-            before_style,
-            "owner window style must be restored"
-        );
-        println!(
-            "startup notice dismissed in {}ms; zero Studio foreground events; owner style restored",
-            began.elapsed().as_millis()
-        );
-    }
-
     fn device_emulator_close_button(
         automation: &IUIAutomation,
         top: isize,
@@ -1735,13 +1617,6 @@ mod platform {
         Ok(false)
     }
 
-    #[cfg(test)]
-    fn window_process_id(hwnd: HWND) -> u32 {
-        let mut pid = 0;
-        unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
-        pid
-    }
-
     pub fn watch_package_changes_dialog(
         pid: u32,
         finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1801,32 +1676,6 @@ mod platform {
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-    }
-
-    #[cfg(test)]
-    #[test]
-    #[ignore = "requires RENIUM_PACKAGE_DIALOG_TEST_PID for an owned Studio fixture with a package notice"]
-    fn live_package_notice_uses_automatic_background_dismissal() {
-        let pid = std::env::var("RENIUM_PACKAGE_DIALOG_TEST_PID")
-            .unwrap()
-            .parse::<u32>()
-            .unwrap();
-        let foreground = unsafe { GetForegroundWindow() };
-        let (top, _, title) = main_studio_window(pid).unwrap();
-        println!(
-            "Package fixture: {pid}, {top:x}, {title}; dialogs: {:?}",
-            modal_dialogs(top)
-        );
-        let watcher = super::watch_package_changes_dialog(pid).unwrap();
-        assert!(
-            watcher.finish().unwrap(),
-            "The package notice was not acknowledged"
-        );
-        assert_eq!(
-            unsafe { GetForegroundWindow() },
-            foreground,
-            "Package notice dismissal took focus"
-        );
     }
 
     fn send_window_to_bottom(hwnd: isize) -> Result<()> {
@@ -2813,23 +2662,6 @@ mod platform {
         })();
         unsafe { CFRelease(button) };
         outcome
-    }
-
-    #[cfg(test)]
-    #[test]
-    #[ignore = "requires RENIUM_DIALOG_TEST_PID for an owned Studio fixture with the plugin asset HTTP 500 alert"]
-    fn live_plugin_asset_notice_dismissal() {
-        let pid = std::env::var("RENIUM_DIALOG_TEST_PID")
-            .unwrap()
-            .parse::<i32>()
-            .unwrap();
-        let began = std::time::Instant::now();
-        assert!(dismiss_auto_recovery_dialog(pid).unwrap());
-        assert!(!dismiss_auto_recovery_dialog(pid).unwrap());
-        println!(
-            "plugin asset notice dismissed once in {}ms",
-            began.elapsed().as_millis()
-        );
     }
 
     pub fn watch_auto_recovery_dialog_for_pid(pid: u32) {

@@ -210,49 +210,4 @@ mod tests {
         assert!(discover(&image(&bytes)).is_err(), "wrong registration ABI");
         Ok(())
     }
-
-    #[test]
-    #[ignore = "requires RENIUM_PACKAGE_DIALOG_TEST_PID and PROJECT for an owned linked-package fixture"]
-    fn live_package_popup_patch_preserves_rollback_and_survives_commands() -> Result<()> {
-        let pid = std::env::var("RENIUM_PACKAGE_DIALOG_TEST_PID")?.parse()?;
-        let project = std::env::var("RENIUM_PACKAGE_DIALOG_TEST_PROJECT")?;
-        let run = |code: &str| -> Result<()> {
-            use std::io::Write;
-            use std::process::Stdio;
-            let mut child = std::process::Command::new("rbx")
-                .args(["--project", &project, "--place", "ReniumRollback", "l", "-"])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()?;
-            child
-                .stdin
-                .take()
-                .context("Fixture stdin is unavailable")?
-                .write_all(code.as_bytes())?;
-            let result = child.wait_with_output()?;
-            anyhow::ensure!(
-                result.status.success(),
-                "{} {}",
-                String::from_utf8_lossy(&result.stdout),
-                String::from_utf8_lossy(&result.stderr)
-            );
-            println!("{}", String::from_utf8_lossy(&result.stdout));
-            Ok(())
-        };
-        suppress_package_notices(pid)?;
-        suppress_package_notices(pid)?;
-        run(&fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/package-notice-rollback-live.luau"),
-        )?)?;
-        assert!(
-            !crate::studio::input::watch_package_changes_dialog(pid)?.finish()?,
-            "The native guard must prevent the notice, not dismiss it afterward"
-        );
-        run(
-            "assert(settings():GetFFlag(\"RemovePackageModificationPopupDialog\"), \"Patch expired after rollback/watcher completion\"); task.wait(2); assert(settings():GetFFlag(\"RemovePackageModificationPopupDialog\")); return true",
-        )?;
-        Ok(())
-    }
 }

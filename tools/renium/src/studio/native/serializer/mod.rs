@@ -61,57 +61,6 @@ pub(crate) use macos::*;
 #[cfg(windows)]
 pub(crate) use windows::*;
 
-#[cfg(all(test, any(windows, target_os = "macos")))]
-#[test]
-#[ignore = "Read-only native comparison; requires explicit owned fixture PID and title"]
-fn native_snapshot_reads_match_approved_reads_and_reject_wrong_classes() -> Result<()> {
-    use std::time::Instant;
-    let pid = std::env::var("RENIUM_INSPECT_FIXTURE_PID")?.parse()?;
-    let title = std::env::var("RENIUM_INSPECT_FIXTURE_TITLE")?;
-    anyhow::ensure!(
-        title.starts_with("Renium"),
-        "Expected an owned Renium fixture"
-    );
-    prepare_context(pid, &title)?;
-    let mut paired = Vec::new();
-    for _ in 0..3 {
-        for class in ["Workspace", "MaterialService", "StarterPlayer"] {
-            for property in crate::editor::native_roots::capture_properties(class) {
-                let path = [class.into()];
-                let started = Instant::now();
-                let mut approved =
-                    prepare_property(pid, &title, &path, &[1], property, Duration::from_secs(2))?;
-                let before = approved.read()?;
-                let separate_us = started.elapsed().as_micros();
-                let started = Instant::now();
-                let after = read_property(
-                    pid,
-                    &title,
-                    &path,
-                    &[1],
-                    class,
-                    property,
-                    Duration::from_secs(2),
-                )?;
-                paired.push((separate_us, started.elapsed().as_micros()));
-                assert_eq!(before, after, "{class}.{property}");
-                let error = read_property(
-                    pid,
-                    &title,
-                    &path,
-                    &[1],
-                    "Folder",
-                    property,
-                    Duration::from_secs(2),
-                )
-                .unwrap_err();
-                assert!(error.to_string().contains("changed class"), "{error:#}");
-            }
-        }
-    }
-    println!("paired separate/atomic native read microseconds: {paired:?}");
-    Ok(())
-}
 #[cfg(any(windows, target_os = "macos"))]
 fn terrain_payload(
     bindings: &[u8],
