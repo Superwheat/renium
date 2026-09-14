@@ -3092,6 +3092,25 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 	end
 
+	-- A native insertion can run without change tracking (a filtered push
+	-- outside Live Sync). Its creation receipts still need the parent of each
+	-- new object, so record additions from the shared export signal.
+	local function recordUntrackedNativeAddition(service: Instance, serviceName: string, instance: Instance, exportIncluded: boolean?)
+		local journal = state.changeJournal
+		local additions = if journal and journal.nativeAdditions then journal.nativeAdditions[serviceName] else nil
+		if additions == nil or additions[instance] ~= nil or state.onlyCodeMode then
+			return
+		end
+		if shouldIgnoreInstance(instance, serviceName, exportIncluded) then
+			return
+		end
+		local parent = instance.Parent
+		if parent ~= nil and instance:IsDescendantOf(service) then
+			additions[instance] = parent
+			invalidateSiblingOrdinals(parent)
+		end
+	end
+
 	local function ensureServiceSignals(serviceName: string)
 		local signals = serviceSignals[serviceName]
 		if signals ~= nil then return signals end
@@ -3102,6 +3121,8 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			local included = if exportStructureObserver then exportStructureObserver(serviceName, instance) else nil
 			if signals.added then
 				signals.added(instance, included)
+			else
+				recordUntrackedNativeAddition(service, serviceName, instance, included)
 			end
 		end)
 		signals.connections[2] = service.DescendantRemoving:Connect(function(instance)
