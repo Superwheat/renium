@@ -3655,10 +3655,22 @@ fn normalize_enum_attribute_value(value: Value) -> Value {
     Value::Object(obj)
 }
 
+/// Model imports keep numeric types (`{"_type":"Float64","value":1.0}`);
+/// attributes only store f64, so those wrappers reduce to their number.
+fn typed_number_attribute(value: &Value) -> Option<&Value> {
+    let obj = value.as_object()?;
+    let type_name = obj.get("_type").and_then(Value::as_str)?;
+    if !matches!(type_name, "Float64" | "Float32" | "Int32" | "Int64") {
+        return None;
+    }
+    obj.get("value").filter(|inner| inner.is_number())
+}
+
 fn collect_attribute_value_strings<'a>(
     value: &'a Value,
     out: &mut SettingsStringCounts<'a>,
 ) -> Result<()> {
+    let value = typed_number_attribute(value).unwrap_or(value);
     if let Some(obj) = value.as_object()
         && let Some(key) = attribute_type_key(obj)
     {
@@ -3710,6 +3722,7 @@ fn write_attribute_value<W: Write + ?Sized>(
     string_ids: &SettingsStringIdMap<'_>,
     writer: &mut W,
 ) -> Result<()> {
+    let value = typed_number_attribute(value).unwrap_or(value);
     let (key, child) = if let Some(obj) = value.as_object() {
         if let Some(key) = attribute_type_key(obj) {
             (key, attribute_payload_child(obj, key, value))
@@ -4144,6 +4157,10 @@ mod tests {
                     attributes: Map::from_iter([
                         ("Health".to_string(), json!(100)),
                         (
+                            "Division".to_string(),
+                            json!({"_type":"Float64","value":2.0}),
+                        ),
+                        (
                             "OriginalMaterial".to_string(),
                             json!({"_type":"BinaryString","base64":"UGxhc3RpYw=="}),
                         ),
@@ -4191,6 +4208,10 @@ mod tests {
         assert_eq!(
             decoded.instances[1].attributes.get("Health"),
             Some(&json!(100))
+        );
+        assert_eq!(
+            decoded.instances[1].attributes.get("Division"),
+            Some(&json!(2.0))
         );
         assert_eq!(
             decoded.instances[1].properties.get("CollisionGroupData"),

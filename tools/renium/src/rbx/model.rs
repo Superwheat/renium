@@ -1010,9 +1010,7 @@ pub(crate) fn bytecode_export_model(args: BytecodeExportModelArgs) -> Result<()>
         None => RbxModelFormat::from_path(&args.output)?,
     };
     let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
-    let service_dir = settings_file
-        .parent()
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    let service_dir = crate::project::storage::source_directory(&settings_file);
     let source_paths = build_editor_source_paths_by_index(&document, &service, &service_dir);
     let instance_paths_by_index = build_editor_instance_paths(&document, &service);
 
@@ -1622,9 +1620,7 @@ pub(crate) fn bytecode_import_model(args: BytecodeImportModelArgs) -> Result<()>
     let mut document = SettingsBytecode::read_file(&settings_file)?;
     let before_document = document.clone();
     let service = bytecode_service_name(&document, &settings_file, &service_hint);
-    let service_dir = settings_file
-        .parent()
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    let service_dir = crate::project::storage::source_directory(&settings_file);
     let source_paths_before = build_editor_source_paths_by_index(&document, &service, &service_dir);
     let target_parent_index = bytecode_parent_index(
         &document,
@@ -1817,9 +1813,7 @@ pub(crate) fn import_rbx_model_into_document(
         }
     }
 
-    let service_dir = settings_file
-        .parent()
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    let service_dir = crate::project::storage::source_directory(settings_file);
     let source_paths = build_editor_source_paths_by_index(document, service, &service_dir);
     let mut source_writes = Vec::new();
     let mut source_files = BTreeMap::new();
