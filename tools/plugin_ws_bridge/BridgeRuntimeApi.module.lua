@@ -2390,25 +2390,6 @@ updateMouse()
 		}
 	end
 
-	function api.cancelLuauExecution(params, sessionGeneration)
-		local operationGeneration = cancellationGeneration
-		assertOperationOwnership(operationGeneration, sessionGeneration)
-		local executionId = tostring(params.executionId or "")
-		if executionId == "" then
-			return { ok = false, error = "Missing execution id" }
-		end
-		local entry = retainedRunners[executionId]
-		if entry == nil then
-			return { ok = true, found = false, executionId = executionId }
-		end
-		if entry.generation ~= operationGeneration then
-			return { ok = false, error = "The execution belongs to an older Renium session" }
-		end
-		retainedRunners[executionId] = nil
-		entry.instance:Destroy()
-		return { ok = true, found = true, executionId = executionId }
-	end
-
 	function api.isPlayModeRunning()
 		if runtimeContext.bridgeRole == "play-server" or runtimeContext.bridgeRole == "play-client" then
 			return RunService:IsRunning() or RunService.RunState ~= Enum.RunState.Stopped
