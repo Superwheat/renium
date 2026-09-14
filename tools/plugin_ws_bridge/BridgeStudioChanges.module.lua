@@ -544,6 +544,21 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 		return nil
 	end
+	local function nativeIncomingTree(instance: Instance): boolean
+		if #nativeParentReceipts == 0 then return false end
+		local current: Instance? = instance
+		local depth = 0
+		while current ~= nil and current ~= game and depth < 256 do
+			for index = #nativeParentReceipts, 1, -1 do
+				for _, instances in pairs(nativeParentReceipts[index]) do
+					if instances[current] then return true end
+				end
+			end
+			current = current.Parent
+			depth += 1
+		end
+		return false
+	end
 	local promoteAttributeConnection: (Instance) -> ()
 	local ensureTracking: ({ string }) -> ()
 	local serviceSignals: { [string]: { connections: { RBXScriptConnection }, added: ((Instance, boolean?) -> ())?, removing: ((Instance) -> ())? } } = {}
@@ -2012,6 +2027,14 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		if nativeAttributeRelay and nativeAttributeRelay.cached then return end
 		local fingerprint = tagFingerprint(instance)
 		local previous = state.tagFingerprintByInstance[instance]
+		-- While a native import is staged, the inserted tree announces its
+		-- memberships as the loader populates it, before or after its receipts
+		-- connect each object. Those announcements are its initial tags, not edits.
+		local journal = state.changeJournal
+		if journal ~= nil and journal.nativeAdditions ~= nil and nativeIncomingTree(instance) then
+			state.tagFingerprintByInstance[instance] = if fingerprint == "" then nil else fingerprint
+			return
+		end
 		if previous == nil and (state.connectionServiceByInstance[instance] ~= nil or state.serviceNameByRoot[instance] ~= nil) then
 			previous = ""
 		end
@@ -2722,8 +2745,33 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		state.lastParentByInstance[instance] = parent
 	end
 
+	local nativeRootWindowService: string? = nil
+	local nativeRootSettleService: string? = nil
+	local nativeRootSettleUntil = 0
+	function api.beginNativeRootWindow(serviceName: string)
+		nativeRootWindowService = serviceName
+	end
+	function api.endNativeRootWindow()
+		-- Roblox delivers the rebuilt geometry's property signals on later frames.
+		nativeRootSettleService = nativeRootWindowService
+		nativeRootSettleUntil = os.clock() + 0.5
+		nativeRootWindowService = nil
+	end
+	local function insideNativeRootWindow(serviceName: string): boolean
+		return nativeRootWindowService == serviceName
+			or nativeRootSettleService == serviceName and os.clock() < nativeRootSettleUntil
+	end
+	local NATIVE_ROOT_SIDE_EFFECTS = { cframe = true, size = true, position = true, orientation = true, rotation = true }
 	local function recordInstancePropertyChange(instance: Instance, serviceName: string, property: string, sampleOnly: boolean?)
 		property = RbxDomModule.getContentPropertyAliases(instance.ClassName)[string.lower(property)] or property
+		-- A native geometry write rebuilds a MeshPart and moves its welded
+		-- neighbours. Inside that window the transaction owns those physical
+		-- side effects; the files are reapplied and verified afterwards.
+		if NATIVE_ROOT_SIDE_EFFECTS[string.lower(property)] and insideNativeRootWindow(serviceName)
+			and instance:IsA("BasePart") then
+			shouldRecordPropertyDirty(instance, property)
+			return
+		end
 		if string.lower(property) == "enabled" and instance:IsA("BaseScript") then
 			property = "Disabled"
 		end

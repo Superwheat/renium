@@ -4277,6 +4277,7 @@ pub(crate) fn send_editor_change_batches(
             (property_changes.len() + material_changes.len()) as u64,
         )),
     );
+    let started = Instant::now();
     send_property_batches(
         bridge,
         &property_changes,
@@ -4284,10 +4285,46 @@ pub(crate) fn send_editor_change_batches(
         transaction_id,
         &mut summary,
     )?;
+    log_timing("native editor property batches", started);
 
+    let started = Instant::now();
+    // Native mesh writes rebuild geometry, which moves welded neighbours and
+    // resizes the part, so the rows written before them are applied again.
+    let mesh_writes = summary
+        .get("nativeRootWrites")
+        .and_then(Value::as_array)
+        .is_some_and(|rows| rows.iter().any(|row| row["className"] == "MeshPart"));
+    let root_writes = summary
+        .get("nativeRootWrites")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let geometry_writes = summary
+        .get("nativeGeometryWrites")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
     let native_root_verification =
         crate::editor::native_roots::apply(bridge, &mut summary, transaction_id)?;
+    log_timing(
+        &format!("native editor root apply ({root_writes} writes)"),
+        started,
+    );
+    let started = Instant::now();
     crate::editor::native_geometry::apply(bridge, &mut summary, transaction_id)?;
+    log_timing(
+        &format!("native editor geometry apply ({geometry_writes} writes)"),
+        started,
+    );
+    if mesh_writes && !property_changes.is_empty() {
+        let started = Instant::now();
+        send_property_batches(
+            bridge,
+            &property_changes,
+            probe_events,
+            transaction_id,
+            &mut summary,
+        )?;
+        log_timing("native editor property batches after mesh writes", started);
+    }
     if let Some(import) = binary_import.filter(|import| {
         import.native_replacement.is_some() || !payload_verified_services.is_empty()
     }) {

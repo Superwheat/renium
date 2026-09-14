@@ -279,7 +279,7 @@ do
 	assert(not pcall(scan, session, ctx, overlay), "new-root collision must abort, not replace")
 	incoming.Parent = nil
 	group.rootPaths[1].pathOrdinals[2] = 2
-	assert(not pcall(scan, session, ctx, overlay), "ambiguous new roots must abort")
+	assert(pcall(scan, session, ctx, overlay), "same-named new roots are inserted together")
 	group.rootPaths[1].pathOrdinals[2] = 1
 	for _ = 1, 100 do
 		local undo = overlay.prepareRetained({ group }, ctx, true)

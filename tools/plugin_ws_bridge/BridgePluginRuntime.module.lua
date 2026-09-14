@@ -386,6 +386,8 @@ function BridgePluginRuntime.start(context)
 		end,
 		expectParentChange = Config.studioChanges.expectParentChange,
 		expectPropertyEvent = Config.studioChanges.expectPropertyEvent,
+		beginNativeRootWindow = Config.studioChanges.beginNativeRootWindow,
+		endNativeRootWindow = Config.studioChanges.endNativeRootWindow,
 		expectAttributeEvent = Config.studioChanges.expectAttributeEvent,
 		expectTagChange = Config.studioChanges.expectTagChange,
 		cancelExpectedEvent = Config.studioChanges.cancelExpectedEvent,
