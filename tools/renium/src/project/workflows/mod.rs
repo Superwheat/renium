@@ -139,22 +139,6 @@ pub struct StudioArgs {
     pub check: bool,
 }
 
-#[derive(Args)]
-pub struct UploadArgs {
-    #[arg(short, long, value_name = "PATH")]
-    pub input: Option<PathBuf>,
-    #[arg(long)]
-    pub place_id: Option<u64>,
-    #[arg(long)]
-    pub universe_id: Option<u64>,
-    #[arg(long, default_value = "ROBLOX_API_KEY")]
-    pub api_key_env: String,
-    #[arg(long, value_name = "ENV")]
-    pub oauth_env: Option<String>,
-    #[arg(long)]
-    pub project: Option<PathBuf>,
-}
-
 #[derive(Serialize)]
 struct InitPlan {
     root: PathBuf,
@@ -926,86 +910,6 @@ pub(crate) fn spawn_studio(executable: &Path, arguments: &[&OsStr]) -> Result<u3
             .with_context(|| format!("Failed to launch {}", executable.display()))?;
         Ok(child.id())
     }
-}
-
-pub fn run_upload(args: UploadArgs, global_project: Option<&Path>) -> Result<()> {
-    let loaded = config::load_project(args.project.as_deref().or(global_project), None)?;
-    let inferred = if args.place_id.is_none() || args.universe_id.is_none() {
-        resolve_experience_place(
-            &loaded.root,
-            crate::app::context::place_selector().as_deref(),
-        )?
-    } else {
-        None
-    };
-    let place_id = args
-        .place_id
-        .or_else(|| inferred.as_ref()?.place_id?.try_into().ok())
-        .context("No place ID is available; pass --place-id or publish this Renium place")?;
-    let universe_id = args
-        .universe_id
-        .or_else(|| inferred.as_ref()?.game_id?.try_into().ok())
-        .context("No universe ID is available; pass --universe-id or configure the experience")?;
-    let auth = crate::cloud::CloudAuth::from_env(
-        false,
-        &args.api_key_env,
-        args.oauth_env.as_deref(),
-        "upload-place",
-    )
-    .map_err(|failure| anyhow::anyhow!(failure.0.m))?;
-    validate_experience_upload(&loaded.root, universe_id, place_id)?;
-    let temporary = loaded
-        .root
-        .join(".renium/build")
-        .join(format!("upload-{place_id}.rbxl"));
-    let input = if let Some(input) = args.input {
-        let input = absolute_path(&input);
-        if !input.is_file() {
-            bail!("Upload input does not exist: {}", input.display());
-        }
-        input
-    } else {
-        build_once(
-            &loaded,
-            &BuildArgs {
-                output: Some(temporary.clone()),
-                project: Some(loaded.path.clone()),
-                watch: false,
-                sourcemap: true,
-                plugin: false,
-                target: None,
-                wally: ToolPolicy::Auto,
-                typescript: ToolPolicy::Auto,
-            },
-            &temporary,
-            false,
-            None,
-        )?;
-        temporary.clone()
-    };
-    let content_type = match input.extension().and_then(OsStr::to_str) {
-        Some(extension) if extension.eq_ignore_ascii_case("rbxl") => "application/octet-stream",
-        Some(extension) if extension.eq_ignore_ascii_case("rbxlx") => "application/xml",
-        _ => bail!("Place upload input must end in .rbxl or .rbxlx"),
-    };
-    let url = format!(
-        "https://apis.roblox.com/universes/v1/{universe_id}/places/{place_id}/versions?versionType=Published"
-    );
-    let response = crate::cloud::upload_file(&url, &auth, content_type, &input);
-    if input == temporary {
-        let _ = fs::remove_file(&temporary);
-    }
-    let response = response?;
-    crate::emit_global_output(
-        &json!({
-            "ok": true,
-            "universeId": universe_id,
-            "placeId": place_id,
-            "input": input,
-            "response": response,
-        }),
-        &format!("Uploaded place {place_id} in universe {universe_id}"),
-    )
 }
 
 fn detect_init_source_root(root: &Path) -> Result<PathBuf> {
@@ -1972,36 +1876,6 @@ fn newest_studio_executable(versions: impl IntoIterator<Item = PathBuf>) -> Resu
     newest
         .map(|(_, path)| path)
         .context("Roblox Studio is not installed in the local or system Versions directories")
-}
-
-fn validate_experience_upload(root: &Path, universe_id: u64, place_id: u64) -> Result<()> {
-    let path = root.join("renium.experience.json");
-    if !path.is_file() {
-        return Ok(());
-    }
-    let value: Value = serde_json::from_slice(&fs::read(&path)?)
-        .with_context(|| format!("Invalid {}", path.display()))?;
-    let configured_universe = value
-        .get("gameId")
-        .and_then(Value::as_u64)
-        .context("renium.experience.json is missing gameId")?;
-    if configured_universe != 0 && configured_universe != universe_id {
-        bail!(
-            "Universe ID {universe_id} does not match renium.experience.json gameId {configured_universe}"
-        );
-    }
-    let places = value
-        .get("places")
-        .and_then(Value::as_object)
-        .context("renium.experience.json is missing places")?;
-    let known = places
-        .values()
-        .filter_map(|place| place.get("placeId").and_then(Value::as_u64))
-        .any(|configured| configured == place_id);
-    if !known {
-        bail!("Place ID {place_id} is not listed in {}", path.display());
-    }
-    Ok(())
 }
 
 fn run_checked(command: &mut Command, label: &str) -> Result<()> {

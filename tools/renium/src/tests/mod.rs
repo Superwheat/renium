@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 use crate::bytecode::edit::{
     bytecode_clone_instance, bytecode_desync_package_link, bytecode_remove_instance,
 };
-use crate::bytecode::explorer::editor_target_settings_ids;
 use crate::bytecode::{
     bytecode_get_property, bytecode_set_property, bytecode_set_source, ensure_service_store_exists,
     lock_existing_service_store,
@@ -20,8 +19,7 @@ use crate::cli::{
     BytecodeDesyncPackageLinkArgs, BytecodeExportModelArgs, BytecodeExportPlaceArgs,
     BytecodeFileArgs, BytecodeGetPropertyArgs, BytecodeInstanceSelectorArgs,
     BytecodeRemoveInstanceArgs, BytecodeSetPropertyArgs, BytecodeSetSourceArgs, EditorMutationArgs,
-    MoveInstanceArgs, PlaceDesyncPackageLinkArgs, ProjectInstanceArgs, ProjectSourceArgs,
-    PushEditorChangesArgs,
+    MoveInstanceArgs, ProjectInstanceArgs, ProjectSourceArgs, PushEditorChangesArgs,
 };
 use crate::editor::diff::{
     append_editor_instance_reconcile, append_editor_property_changes,
@@ -48,7 +46,6 @@ use crate::editor::types::{
     EditorPropertyChange, EditorPropertyFilter, take_pre_routed_protected_writes,
 };
 use crate::project::commands::move_instance_command;
-use crate::project::package_links::place::place_desync_package_link;
 use crate::project::structural::{
     move_instance_between_service_stores, moved_references_between_documents,
 };
@@ -63,7 +60,6 @@ use crate::rbx::encode::{
 };
 use crate::rbx::model::{
     BytecodeModelExportRefs, BytecodeModelImportRefs, bytecode_export_model, bytecode_export_place,
-    rbx_dom_instance_by_path_unique,
 };
 use crate::roblox::schema::{
     EnumValueNameMap, MATERIAL_SERVICE_CLASS, MESH_INITIAL_SIZE_PROPERTY,
@@ -1627,60 +1623,6 @@ fn ordinary_remove_rejects_package_bearing_instances_and_links() {
     let _ = fs::remove_dir_all(project_root);
 }
 
-#[test]
-fn place_desync_package_link_writes_copy_without_package_link() {
-    let project_root = temp_dir("place-desync-package-link");
-    fs::create_dir_all(&project_root).unwrap();
-    let input_path = project_root.join("input.rbxlx");
-    let output_path = project_root.join("output.rbxlx");
-
-    let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
-    let workspace_ref = dom.insert(dom.root_ref(), RbxInstanceBuilder::new("Workspace"));
-    let garage_ref = dom.insert(
-        workspace_ref,
-        RbxInstanceBuilder::new("Model").with_name("Garage"),
-    );
-    dom.insert(
-        garage_ref,
-        RbxInstanceBuilder::new("PackageLink")
-            .with_property("PackageId", RbxContentId::from("rbxassetid://123456789")),
-    );
-    dom.insert(
-        garage_ref,
-        RbxInstanceBuilder::new("Part").with_name("Door"),
-    );
-    let input = File::create(&input_path).unwrap();
-    rbx_xml::to_writer_default(BufWriter::new(input), &dom, &[workspace_ref]).unwrap();
-
-    place_desync_package_link(PlaceDesyncPackageLinkArgs {
-        input: input_path,
-        output: output_path.clone(),
-        path_segments_json: "Workspace.Garage".to_string(),
-        path_ordinals_json: "[]".to_string(),
-        output_format: None,
-        pretty: false,
-    })
-    .unwrap();
-
-    let output_dom = read_exported_rbx_dom(&output_path, "rbxlx");
-    let garage_path = vec!["Workspace".to_string(), "Garage".to_string()];
-    let output_garage_ref =
-        rbx_dom_instance_by_path_unique(&output_dom, &garage_path, &[]).unwrap();
-    let output_garage = output_dom.get_by_ref(output_garage_ref).unwrap();
-    assert!(output_garage.children().iter().any(|child_ref| {
-        output_dom
-            .get_by_ref(*child_ref)
-            .is_some_and(|child| child.name == "Door")
-    }));
-    assert!(output_garage.children().iter().all(|child_ref| {
-        output_dom
-            .get_by_ref(*child_ref)
-            .is_none_or(|child| child.class.as_str() != "PackageLink")
-    }));
-
-    let _ = fs::remove_dir_all(project_root);
-}
-
 fn read_exported_rbx_dom(output_path: &Path, format: &str) -> RbxWeakDom {
     let file = File::open(output_path).unwrap();
     let reader = BufReader::new(file);
@@ -2141,21 +2083,6 @@ fn default_property_elision_never_skips_mesh_size_transport_property() {
     assert!(
         !is_default_property_value(&state, "MeshPart", "meshSize", &mesh_size),
         "MeshSize transport metadata should never be default-elided"
-    );
-}
-
-#[test]
-fn editor_targets_skip_service_roots() {
-    let document = settings_document(vec![
-        settings_instance("editor:0", "Workspace", "Workspace", None),
-        settings_instance("editor:1", "Folder", "Folder", Some(0)),
-        settings_instance("manual", "Manual", "Folder", Some(1)),
-        settings_instance("editor:orphan-root", "Lighting", "Lighting", None),
-    ]);
-
-    assert_eq!(
-        editor_target_settings_ids(&document, "Workspace", "editor:"),
-        vec!["editor:1".to_string()]
     );
 }
 

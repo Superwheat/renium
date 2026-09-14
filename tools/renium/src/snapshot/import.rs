@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -12,21 +12,12 @@ use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 use serde_json::{Map, Value, json};
 
-use crate::app::build::{
-    GIT_HASH as BUILD_GIT_HASH, TIMESTAMP_UNIX as BUILD_TIMESTAMP_UNIX, VERSION as BUILD_VERSION,
-};
-use crate::app::output::{emit_global_output, log_global};
-use crate::app::timing::{
-    elapsed_ms, log_timing, log_timing_ms, set_quiet_timings, verbose_timing_logs,
-};
+use crate::app::timing::{elapsed_ms, log_timing, log_timing_ms, verbose_timing_logs};
 use crate::bytecode::acquire_settings_file_lock;
-use crate::cli::args::{ImportServiceArgs, ImportSnapshotsArgs};
 use crate::editor::paths::{project_script_file_names, script_file_names};
-use crate::project::config;
-use crate::project::layout::apply_configured_project_layout;
 use crate::project::sourcemap::{
     SourcemapNode, build_service_sourcemap_from_state, finalize_project_sourcemap_temp,
-    load_existing_sourcemap_root, sourcemap_root_is_current, write_project_sourcemap_with_updates,
+    load_existing_sourcemap_root, sourcemap_root_is_current,
 };
 use crate::rbx::encode::settings_root_indices;
 use crate::roblox::schema::{MATERIAL_SERVICE_CLASS, USE_2022_MATERIALS_PROPERTY};
@@ -40,17 +31,14 @@ use crate::settings::equivalence::{SettingsAlignment, align_settings_bytes_to_re
 use crate::settings::tree::editor_service_root_index;
 use crate::snapshot::codec::parse_source_range_batch;
 use crate::snapshot::export::{
-    BRIDGE_PROTOCOL_VERSION, ExportProjectStage, LARGE_SERVICE_DETERMINISTIC_FETCH_MIN_INSTANCES,
-    collect_publish_hashes, exported_parts_to_service_state, fetch_json_payload,
-    log_chunk_fetch_metrics, merge_chunk_fetch_metrics, publish_operation_paths,
+    LARGE_SERVICE_DETERMINISTIC_FETCH_MIN_INSTANCES, exported_parts_to_service_state,
+    fetch_json_payload, log_chunk_fetch_metrics, merge_chunk_fetch_metrics,
 };
-use crate::snapshot::types::{
-    ExportedSnapshotParts, ServiceState, SnapshotInstance, SnapshotManifest,
-};
+use crate::snapshot::types::{ExportedSnapshotParts, ServiceState, SnapshotInstance};
 use crate::studio::bridge::{BridgeServer, ChunkFetchMetrics, SourceBatchMap};
 use crate::system::files::{
-    OnDrop, canonical_path, path_key, read_json_file, resolve_existing_project_root, sanitize_name,
-    service_settings_path, unique_child_stem, write_bytes_if_changed_in_existing_dir,
+    OnDrop, path_key, sanitize_name, service_settings_path, unique_child_stem,
+    write_bytes_if_changed_in_existing_dir,
 };
 
 enum DirectImportTask {
@@ -652,245 +640,6 @@ pub(crate) fn import_service_state_with_sourcemap(
     Ok(node)
 }
 
-pub(crate) fn import_snapshots(args: ImportSnapshotsArgs) -> Result<()> {
-    set_quiet_timings(true);
-    let snapshot_dir = args.snapshot_dir.clone();
-    let services = args.services.clone();
-    let changed_paths = import_snapshots_inner(args, true)?;
-    emit_global_output(
-        &json!({
-            "ok": true,
-            "snapshotDir": snapshot_dir,
-            "services": parse_services(&services)?,
-            "changedPaths": changed_paths,
-        }),
-        "Imported snapshots",
-    )
-}
-
-fn import_snapshots_inner(
-    mut args: ImportSnapshotsArgs,
-    allow_project_stage: bool,
-) -> Result<Vec<PathBuf>> {
-    if allow_project_stage {
-        apply_configured_project_layout(&mut args.project_root, &mut args.src_dir)?;
-    }
-    let project_root = resolve_existing_project_root(&args.project_root)?;
-    log_global(
-        5,
-        format_args!(
-            "[renium] import root: allow_stage={} project={} src={}",
-            allow_project_stage,
-            project_root.display(),
-            args.src_dir.display()
-        ),
-    );
-    let services = parse_services(&args.services)?;
-    if allow_project_stage
-        && !args.no_project_write
-        && config::try_load_project(None, Some(&project_root))?
-            .is_some_and(|loaded| loaded.root == project_root)
-    {
-        let mut stage = ExportProjectStage::create(&project_root, &args.src_dir, &services)?;
-        args.project_root.clone_from(&stage.import_project_root);
-        args.src_dir.clone_from(&stage.import_src_dir);
-        import_snapshots_inner(args, false)?;
-        stage.mark_settings_aligned();
-        stage.finish_projection(false)?;
-        return stage.publish(&project_root, false).map(|published| {
-            published
-                .changed_roots
-                .into_iter()
-                .map(|path| project_root.join(path))
-                .collect()
-        });
-    }
-    config::refresh_script_naming(&project_root)?;
-    let snapshot_dir = canonical_path(&args.snapshot_dir).with_context(|| {
-        format!(
-            "Failed to resolve snapshot directory: {}",
-            args.snapshot_dir.display()
-        )
-    })?;
-    config::validate_relative_portable_path(&args.src_dir, "srcDir")?;
-    let src_root = project_root.join(&args.src_dir);
-    fs::create_dir_all(&src_root)
-        .with_context(|| format!("Failed to create {}", src_root.display()))?;
-    let tracked_paths = services
-        .iter()
-        .map(|service| args.src_dir.join(sanitize_name(service)))
-        .chain(std::iter::once(PathBuf::from("sourcemap.json")))
-        .collect::<Vec<_>>();
-    let before = collect_publish_hashes(&project_root, &tracked_paths)?;
-
-    let thread_count = resolve_thread_count(args.threads, services.len());
-    log_global(
-        4,
-        format_args!(
-            "[renium] import-snapshots start: version={}, git={}, build_ts={}, protocol={}, services={}, threads={}",
-            BUILD_VERSION,
-            BUILD_GIT_HASH,
-            BUILD_TIMESTAMP_UNIX,
-            BRIDGE_PROTOCOL_VERSION,
-            services.len(),
-            thread_count
-        ),
-    );
-    let mut sourcemap_nodes: HashMap<String, SourcemapNode> = HashMap::new();
-
-    if thread_count <= 1 || services.len() <= 1 {
-        for service in &services {
-            log_global(4, format_args!("[renium] {service}: loading snapshot"));
-            let state = load_service_state(&snapshot_dir, service)?;
-            log_global(4, format_args!("[renium] {service}: writing src tree"));
-            let node =
-                import_service_state_with_sourcemap(&state, &project_root, &src_root, service)?;
-            sourcemap_nodes.insert(service.clone(), node);
-            log_global(4, format_args!("[renium] {service}: done"));
-        }
-    } else {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(thread_count)
-            .build()
-            .context("Failed to build thread pool")?;
-        let shared_nodes = Mutex::new(HashMap::<String, SourcemapNode>::new());
-        pool.install(|| -> Result<()> {
-            services.par_iter().try_for_each(|service| -> Result<()> {
-                log_global(4, format_args!("[renium] {service}: loading snapshot"));
-                let state = load_service_state(&snapshot_dir, service)?;
-                log_global(4, format_args!("[renium] {service}: writing src tree"));
-                let node =
-                    import_service_state_with_sourcemap(&state, &project_root, &src_root, service)?;
-                {
-                    let mut nodes = shared_nodes.lock().unwrap_or_else(PoisonError::into_inner);
-                    nodes.insert(service.clone(), node);
-                }
-                log_global(4, format_args!("[renium] {service}: done"));
-                Ok(())
-            })
-        })?;
-        let drained_nodes = shared_nodes
-            .into_inner()
-            .unwrap_or_else(PoisonError::into_inner);
-        sourcemap_nodes.extend(drained_nodes);
-    }
-
-    finish_import_sourcemap(&project_root, sourcemap_nodes)?;
-
-    log_global(4, format_args!("[renium] import-snapshots done"));
-    let after = collect_publish_hashes(&project_root, &tracked_paths)?;
-    Ok(publish_operation_paths(&before, &after)
-        .into_iter()
-        .map(|path| project_root.join(path))
-        .collect())
-}
-
-pub(crate) fn import_service(args: ImportServiceArgs) -> Result<()> {
-    import_service_inner(args, true)
-}
-
-fn import_service_inner(mut args: ImportServiceArgs, allow_project_stage: bool) -> Result<()> {
-    if allow_project_stage {
-        apply_configured_project_layout(&mut args.project_root, &mut args.src_dir)?;
-    }
-    let project_root = resolve_existing_project_root(&args.project_root)?;
-    let service = parse_single_service(&args.service)?;
-    if allow_project_stage
-        && !args.no_project_write
-        && config::try_load_project(None, Some(&project_root))?
-            .is_some_and(|loaded| loaded.root == project_root)
-    {
-        let mut stage = ExportProjectStage::create(
-            &project_root,
-            &args.src_dir,
-            std::slice::from_ref(&service),
-        )?;
-        args.project_root.clone_from(&stage.import_project_root);
-        args.src_dir.clone_from(&stage.import_src_dir);
-        import_service_inner(args, false)?;
-        stage.mark_settings_aligned();
-        stage.finish_projection(false)?;
-        stage.publish(&project_root, false)?;
-        return Ok(());
-    }
-    config::refresh_script_naming(&project_root)?;
-    config::validate_relative_portable_path(&args.src_dir, "srcDir")?;
-    let src_root = project_root.join(&args.src_dir);
-    fs::create_dir_all(&src_root)
-        .with_context(|| format!("Failed to create {}", src_root.display()))?;
-
-    println!(
-        "[renium] import-service start: version={BUILD_VERSION}, git={BUILD_GIT_HASH}, build_ts={BUILD_TIMESTAMP_UNIX}, protocol={BRIDGE_PROTOCOL_VERSION}, service={service}"
-    );
-
-    let payload = read_snapshot_payload(args.snapshot_file.as_deref())?;
-    let manifest: SnapshotManifest =
-        serde_json::from_str(&payload).context("Invalid snapshot JSON payload")?;
-
-    let state = service_state_from_manifest(&service, manifest)?;
-    let node = import_service_state_with_sourcemap(&state, &project_root, &src_root, &service)?;
-    let mut sourcemap_nodes = HashMap::new();
-    sourcemap_nodes.insert(service.clone(), node);
-
-    finish_import_sourcemap(&project_root, sourcemap_nodes)?;
-
-    println!("[renium] import-service done: {service}");
-    Ok(())
-}
-
-fn syncback_project_adapters_if_configured(project_root: &Path) -> Result<usize> {
-    let Some(loaded) = config::try_load_project(None, Some(project_root))? else {
-        return Ok(0);
-    };
-    if loaded.root != project_root {
-        return Ok(0);
-    }
-    if !loaded
-        .project
-        .adapters
-        .iter()
-        .any(|adapter| adapter.direction != config::AdapterDirection::ToProject)
-    {
-        return Ok(0);
-    }
-    let source_root = loaded.root.join(&loaded.project.source_root);
-    let adapters = loaded
-        .project
-        .adapters
-        .iter()
-        .filter(|adapter| {
-            adapter.direction != config::AdapterDirection::ToProject
-                && adapter.target.segments().first().is_some_and(|service| {
-                    service_settings_path(&source_root.join(service)).is_file()
-                })
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if adapters.is_empty() {
-        return Ok(0);
-    }
-    let mut project = loaded.project.clone();
-    project.adapters = adapters;
-    let loaded = config::LoadedProject {
-        path: loaded.path,
-        root: loaded.root,
-        project,
-    };
-    let started = Instant::now();
-    let changed = config::syncback_project_adapters(&loaded, false)?;
-    log_timing_ms("adapter syncback", elapsed_ms(started));
-    Ok(changed)
-}
-
-fn finish_import_sourcemap(
-    project_root: &Path,
-    nodes: HashMap<String, SourcemapNode>,
-) -> Result<()> {
-    write_project_sourcemap_with_updates(project_root, nodes)?;
-    syncback_project_adapters_if_configured(project_root)?;
-    Ok(())
-}
-
 pub(crate) fn parse_services(raw: &str) -> Result<Vec<String>> {
     if raw.trim().is_empty() {
         return Ok(DEFAULT_SYNC_SERVICES
@@ -951,24 +700,6 @@ pub(crate) fn direct_import_export_order(services: &[String]) -> Vec<String> {
     });
 
     ranked.into_iter().map(|(_, service, _)| service).collect()
-}
-
-fn parse_single_service(raw: &str) -> Result<String> {
-    let parsed = parse_services(raw)?;
-    if parsed.len() != 1 {
-        bail!("Expected exactly one service, got {}", parsed.len());
-    }
-    Ok(parsed[0].clone())
-}
-
-fn resolve_thread_count(requested: usize, service_count: usize) -> usize {
-    if service_count <= 1 {
-        return 1;
-    }
-    if requested > 0 {
-        return requested.min(service_count);
-    }
-    std::thread::available_parallelism().map_or(1, |value| value.get().min(service_count))
 }
 
 pub(crate) fn resolve_source_worker_count(
@@ -1157,28 +888,6 @@ fn direct_import_cpu_cap() -> usize {
 
 pub(crate) fn resolve_direct_import_workers() -> usize {
     4.min(direct_import_cpu_cap())
-}
-
-pub(crate) fn load_service_state(snapshot_dir: &Path, service: &str) -> Result<ServiceState> {
-    let snapshot_path = snapshot_dir.join(format!("{service}.json"));
-    let manifest: SnapshotManifest = read_json_file(&snapshot_path)
-        .with_context(|| format!("Failed to read snapshot: {}", snapshot_path.display()))?;
-
-    service_state_from_manifest(service, manifest)
-}
-
-fn service_state_from_manifest(service: &str, manifest: SnapshotManifest) -> Result<ServiceState> {
-    if manifest.instances.is_empty() {
-        bail!("Snapshot has no instances for service {service}");
-    }
-
-    build_service_state_from_instances(
-        service,
-        None,
-        manifest.instances,
-        normalize_class_defaults(manifest.class_defaults),
-        false,
-    )
 }
 
 pub(crate) fn build_service_state_from_instances(
@@ -1672,22 +1381,6 @@ pub(crate) fn normalize_class_defaults(raw: Value) -> HashMap<String, Map<String
         }
     }
     out
-}
-
-fn read_snapshot_payload(snapshot_file: Option<&Path>) -> Result<String> {
-    if let Some(path) = snapshot_file {
-        return fs::read_to_string(path)
-            .with_context(|| format!("Failed to read snapshot payload: {}", path.display()));
-    }
-
-    let mut payload = String::new();
-    io::stdin()
-        .read_to_string(&mut payload)
-        .context("Failed to read snapshot payload from stdin")?;
-    if payload.trim().is_empty() {
-        bail!("Snapshot payload is empty");
-    }
-    Ok(payload)
 }
 
 fn derive_parent_path(path: &str) -> Option<String> {
@@ -3024,6 +2717,7 @@ fn write_script_source_file(source_path: &Path, source: &str, fresh_stage: bool)
 #[cfg(test)]
 mod projection_tests {
     use super::*;
+    use crate::project::config;
     use std::time::Duration;
 
     fn test_root() -> Result<PathBuf> {

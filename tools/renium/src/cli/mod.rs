@@ -18,13 +18,11 @@ use crate::automation::commands::{
     StudioCloseArgs, StudioReopenArgs, StudioStatusArgs,
 };
 use crate::cli::args::{
-    CursorPollArgs, GenerateSourcemapArgs, ImportServiceArgs, ImportSnapshotsArgs, VcInitArgs,
-    VcMergeArgs, VcTextconvArgs, ViewArgs,
+    CursorPollArgs, GenerateSourcemapArgs, VcInitArgs, VcMergeArgs, VcTextconvArgs, ViewArgs,
 };
 use crate::daemon::transport::DEFAULT_DAEMON_CONTROL_PORT;
 use crate::project::config as project_config;
 use crate::project::workflows;
-use crate::studio::bridge::DEFAULT_EXPORT_CHUNK_SIZE;
 
 pub(crate) fn command() -> clap::Command {
     let mut command = Cli::command();
@@ -201,16 +199,12 @@ pub(super) enum Commands {
     StudioClose(StudioCloseArgs),
     #[command(name = "status", alias = "studio-status")]
     StudioStatus(StudioStatusArgs),
-    #[command(name = "up", alias = "upload-place", alias = "upload")]
-    Upload(workflows::UploadArgs),
     #[command(name = "upd", alias = "update")]
     Update(update::UpdateArgs),
     #[command(name = "oc", alias = "cloud", alias = "opencloud")]
     OpenCloud(crate::cloud::command::OpenCloudArgs),
     #[command(hide = true)]
     UpdateHelper(update::UpdateHelperArgs),
-    #[command(name = "sb", alias = "syncback")]
-    Syncback(SyncbackArgs),
     #[command(name = "ip", alias = "import-path")]
     ImportPath(ImportPathArgs),
     #[command(name = "cr", alias = "create")]
@@ -239,18 +233,12 @@ pub(super) enum Commands {
     ImportModel(ImportModelCommandArgs),
     #[command(name = "mep", alias = "export-model")]
     ExportModel(ExportModelCommandArgs),
-    #[command(name = "tst", alias = "test")]
-    Test(TestArgs),
-    #[command(name = "x", alias = "export-snapshots")]
-    ExportSnapshots(ExportSnapshotsArgs),
     #[command(name = "pl", alias = "pull", about = "Pull Studio into project files")]
-    Pull(ExportSnapshotsArgs),
+    Pull(PullArgs),
     #[command(name = "bd", alias = "bridge-daemon")]
     BridgeDaemon(BridgeDaemonArgs),
     #[command(name = "ed", alias = "explorer-daemon")]
     ExplorerDaemon(ExplorerDaemonArgs),
-    #[command(name = "src", alias = "bridge-get-source")]
-    BridgeGetSource(BridgeGetSourceArgs),
     #[command(name = "co", alias = "get-console-output", alias = "console")]
     GetConsoleOutput(PluginConsoleOutputArgs),
     #[command(name = "l", alias = "lx", alias = "execute-luau", alias = "luau")]
@@ -307,12 +295,6 @@ pub(super) enum Commands {
     GenerateModel(GenerateModelArgs),
     #[command(name = "js", alias = "job-status", about = "Read a creator job")]
     JobStatus(JobStatusArgs),
-    #[command(
-        name = "is",
-        alias = "image-store",
-        about = "Validate an image for upload"
-    )]
-    ImageStore(ImageStoreArgs),
     #[command(name = "iu", alias = "image-upload")]
     ImageUpload(ImageUploadArgs),
     #[command(
@@ -401,22 +383,16 @@ pub(super) enum Commands {
     BytecodeSetSource(BytecodeSetSourceArgs),
     #[command(name = "bb", alias = "bytecode-explorer-batch", alias = "batch")]
     BytecodeExplorerBatch(BytecodeExplorerBatchArgs),
-    #[command(name = "bt", alias = "bytecode-editor-targets")]
-    BytecodeEditorTargets(BytecodeEditorTargetsArgs),
     #[command(name = "ba", alias = "bytecode-add-instance", alias = "add")]
     BytecodeAddInstance(BytecodeAddInstanceArgs),
     #[command(name = "bcl", alias = "bytecode-clone-instance")]
     BytecodeCloneInstance(BytecodeCloneInstanceArgs),
     #[command(name = "br", alias = "bytecode-remove-instance")]
     BytecodeRemoveInstance(BytecodeRemoveInstanceArgs),
-    #[command(name = "bdp", alias = "bytecode-desync-package-link")]
-    BytecodeDesyncPackageLink(BytecodeDesyncPackageLinkArgs),
     #[command(name = "bem", alias = "bytecode-export-model")]
     BytecodeExportModel(BytecodeExportModelArgs),
     #[command(name = "bep", alias = "bytecode-export-place", alias = "export-place")]
     BytecodeExportPlace(BytecodeExportPlaceArgs),
-    #[command(name = "pdp", alias = "place-desync-package-link")]
-    PlaceDesyncPackageLink(PlaceDesyncPackageLinkArgs),
     #[command(name = "bim", alias = "bytecode-import-model")]
     BytecodeImportModel(BytecodeImportModelArgs),
     #[command(name = "wally", alias = "sync-wally-packages")]
@@ -445,10 +421,6 @@ pub(super) enum Commands {
     LinkDeletePackage(LinkDeletePackageArgs),
     #[command(name = "bpack", alias = "bytecode-repack")]
     BytecodeRepack(BytecodeRepackArgs),
-    #[command(name = "si", alias = "im", alias = "import-snapshots")]
-    ImportSnapshots(ImportSnapshotsArgs),
-    #[command(name = "ims", alias = "import-service")]
-    ImportService(ImportServiceArgs),
     #[command(name = "sm", alias = "generate-sourcemap", alias = "sourcemap")]
     GenerateSourcemap(GenerateSourcemapArgs),
     #[command(
@@ -502,8 +474,6 @@ mod tests {
 pub(super) struct BridgeConnectionArgs {
     #[arg(short, long, default_value_t = 8.0)]
     pub(super) wait_seconds: f64,
-    #[arg(short = 'H', long, default_value = "127.0.0.1")]
-    pub(super) host: String,
     #[arg(short = 'P', long, default_value = "8781,8782")]
     pub(super) ports: String,
 }
@@ -512,7 +482,6 @@ impl BridgeConnectionArgs {
     pub(super) fn local(wait_seconds: f64) -> Self {
         Self {
             wait_seconds,
-            host: "127.0.0.1".to_string(),
             ports: "8781,8782".to_string(),
         }
     }
@@ -524,6 +493,8 @@ pub(super) struct BridgeDaemonArgs {
     pub(super) name: Option<String>,
     #[arg(long = "serve", alias = "keep-alive", hide = true)]
     pub(super) _serve: bool,
+    #[arg(short = 'H', long, default_value = "127.0.0.1")]
+    pub(super) host: String,
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
     #[arg(long, alias = "ctl-port", default_value_t = DEFAULT_DAEMON_CONTROL_PORT)]
@@ -662,20 +633,6 @@ pub(super) struct InspectArgs {
     pub(super) fields: String,
     #[arg(long)]
     pub(super) pretty: bool,
-}
-
-#[derive(Parser)]
-pub(super) struct BridgeGetSourceArgs {
-    #[arg(short, long)]
-    pub(super) service: String,
-    #[arg(short = 'k', long, value_name = "KEY")]
-    pub(super) source_key: String,
-    #[arg(short, long, value_name = "PATH")]
-    pub(super) expect_file: Option<PathBuf>,
-    #[command(flatten)]
-    pub(super) bridge: BridgeConnectionArgs,
-    #[arg(short, long, default_value_t = DEFAULT_EXPORT_CHUNK_SIZE)]
-    pub(super) chunk_size: usize,
 }
 
 #[derive(Parser)]
@@ -832,11 +789,6 @@ pub(super) struct JobStatusArgs {
 }
 
 #[derive(Parser)]
-pub(super) struct ImageStoreArgs {
-    pub(super) path: PathBuf,
-}
-
-#[derive(Parser)]
 pub(super) struct ScriptSearchArgs {
     #[arg(required = true, num_args = 1..)]
     pub(super) keywords: Vec<String>,
@@ -874,36 +826,6 @@ pub(super) struct StartStopPlayArgs {
     pub(super) players: Option<u32>,
     #[arg(long, value_name = "play|run|server")]
     pub(super) mode: Option<String>,
-}
-
-#[derive(Parser)]
-pub(super) struct TestArgs {
-    #[arg(long, value_name = "play|run|server", default_value = "play")]
-    pub(super) mode: String,
-    #[arg(short, long, value_name = "N")]
-    pub(super) players: Option<u32>,
-    #[arg(short, long, default_value_t = 30.0)]
-    pub(super) timeout: f64,
-    #[arg(long)]
-    pub(super) fail_on_error: bool,
-    #[arg(long, value_name = "NAME|N")]
-    pub(super) player: Option<String>,
-}
-
-#[derive(Parser)]
-pub(super) struct SyncbackArgs {
-    #[arg(long, value_name = "PATH", default_value = "snapshots")]
-    pub(super) input: PathBuf,
-    #[arg(long)]
-    pub(super) project: Option<PathBuf>,
-    #[arg(long)]
-    pub(super) list: bool,
-    #[arg(long)]
-    pub(super) dry_run: bool,
-    #[arg(short, long)]
-    pub(super) yes: bool,
-    #[arg(short, long, default_value = "")]
-    pub(super) services: String,
 }
 
 #[derive(Parser)]
@@ -1300,7 +1222,7 @@ pub(super) struct StudioChangeStateArgs {
 }
 
 #[derive(Parser)]
-pub(super) struct ExportSnapshotsArgs {
+pub(super) struct PullArgs {
     #[arg(
         short = 'r',
         long,
@@ -1311,22 +1233,10 @@ pub(super) struct ExportSnapshotsArgs {
     pub(super) project_root: PathBuf,
     #[arg(long, alias = "src", value_name = "PATH", default_value = "src")]
     pub(super) src_dir: PathBuf,
-    #[arg(
-        short = 'd',
-        long,
-        alias = "out",
-        value_name = "PATH",
-        default_value = "snapshots"
-    )]
-    pub(super) snapshot_dir: PathBuf,
     #[arg(short, long, default_value = "")]
     pub(super) services: String,
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
-    #[arg(short = 'i', long)]
-    pub(super) run_import: bool,
-    #[arg(long, alias = "no-import")]
-    pub(super) no_run_import: bool,
     #[arg(long, alias = "all-props")]
     pub(super) export_all_properties: bool,
     #[arg(long, alias = "no-props")]
@@ -1637,22 +1547,6 @@ pub(super) struct BytecodeSetSourceArgs {
 }
 
 #[derive(Parser)]
-pub(super) struct BytecodeEditorTargetsArgs {
-    #[arg(
-        short = 'd',
-        long,
-        alias = "src",
-        value_name = "PATH",
-        default_value = "src"
-    )]
-    pub(super) src_root: PathBuf,
-    #[arg(short, long, default_value = "")]
-    pub(super) services: String,
-    #[arg(short = 'p', long, default_value = "editor:")]
-    pub(super) id_prefix: String,
-}
-
-#[derive(Parser)]
 pub(super) struct BytecodeExplorerBatchArgs {
     #[command(flatten)]
     pub(super) input: BytecodeFileArgs,
@@ -1862,27 +1756,6 @@ pub(super) struct BytecodeExportPlaceArgs {
     pub(super) output: PathBuf,
     #[arg(long, value_name = "rbxl|rbxlx")]
     pub(super) format: Option<String>,
-    #[arg(long)]
-    pub(super) pretty: bool,
-}
-
-#[derive(Parser)]
-pub(super) struct PlaceDesyncPackageLinkArgs {
-    #[arg(short, long, value_name = "PATH")]
-    pub(super) input: PathBuf,
-    #[arg(short, long, value_name = "PATH")]
-    pub(super) output: PathBuf,
-    #[arg(long = "path", alias = "path-segments", alias = "path-segments-json")]
-    pub(super) path_segments_json: String,
-    #[arg(
-        long = "ords",
-        alias = "path-ordinals",
-        alias = "path-ordinals-json",
-        default_value = "[]"
-    )]
-    pub(super) path_ordinals_json: String,
-    #[arg(long, value_name = "rbxl|rbxlx")]
-    pub(super) output_format: Option<String>,
     #[arg(long)]
     pub(super) pretty: bool,
 }

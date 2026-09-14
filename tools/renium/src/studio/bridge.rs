@@ -21,7 +21,6 @@ use crate::daemon::transport::normalize_loopback_host;
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 use crate::daemon::transport::pid_for_local_tcp_port;
 use crate::snapshot::export::{parse_bridge_chunk, validate_bridge_chunk, validate_bridge_info};
-use crate::studio::automation::TestLaunch;
 use crate::studio::target::{place_filter, place_matches};
 use crate::system::net::SharedTcpStream;
 
@@ -37,7 +36,6 @@ pub(crate) const BRIDGE_ROLE_PLAY_SERVER: &str = "play-server";
 pub(crate) const BRIDGE_ROLE_PLAY_CLIENT: &str = "play-client";
 const BRIDGE_ROLE_UNKNOWN: &str = "unknown";
 const BRIDGE_DUPLICATE_ROLE_KEY_SEPARATOR: char = '#';
-const MIN_BRIDGE_CHUNK_BYTES: usize = 256;
 pub(crate) const MAX_BRIDGE_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BRIDGE_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_BRIDGE_UNRELATED_MESSAGES: usize = 64;
@@ -105,9 +103,6 @@ impl Drop for HandshakePermit {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Release);
     }
-}
-pub(crate) fn clamp_bridge_chunk_size(size: usize) -> usize {
-    size.clamp(MIN_BRIDGE_CHUNK_BYTES, MAX_BRIDGE_CHUNK_BYTES)
 }
 
 #[derive(Debug)]
@@ -407,7 +402,6 @@ mod request_cancellation_tests {
                 ..Default::default()
             },
             request_session_id: "test".to_string(),
-            pending_final_console_snapshots: Vec::new(),
             pending_player_identity: None,
             active_request_lease: None,
             cancel_request_id: None,
@@ -435,7 +429,6 @@ mod request_cancellation_tests {
             runtime_pins: Mutex::new(HashMap::new()),
             #[cfg(any(windows, target_os = "macos"))]
             verified_full_pushes: Default::default(),
-            final_console_snapshots: Mutex::new(HashMap::new()),
             desired_device_request: Arc::new(Mutex::new(Value::Null)),
             routing: Default::default(),
             performance_manager: None,
@@ -605,7 +598,6 @@ pub(crate) struct BridgeSocket {
     pub(crate) last_focused_at: Instant,
     pub(crate) bridge_info: BridgeInfoPayload,
     pub(crate) request_session_id: String,
-    pub(crate) pending_final_console_snapshots: Vec<Value>,
     pending_player_identity: Option<(u64, Instant)>,
     active_request_lease: Option<Arc<BridgeRequestLease>>,
     cancel_request_id: Option<u64>,
@@ -796,7 +788,6 @@ pub(crate) struct BridgeServer {
 
     pub(crate) runtime_pins: Mutex<HashMap<RuntimePinKey, RuntimePin>>,
     routing: Arc<Mutex<RuntimeRouting>>,
-    pub(crate) final_console_snapshots: Mutex<HashMap<String, FinalConsoleSnapshot>>,
     desired_device_request: Arc<Mutex<Value>>,
     performance_manager: Option<Arc<crate::studio::performance::Manager>>,
 }
@@ -928,11 +919,6 @@ impl Drop for BridgeRequestLeaseGuard<'_> {
             self.lease.disarm();
         }
     }
-}
-
-pub(crate) struct FinalConsoleSnapshot {
-    pub(crate) received_at: Instant,
-    pub(crate) payload: Value,
 }
 
 pub(crate) struct BridgeListenMetrics {
@@ -1085,14 +1071,7 @@ impl BridgeServer {
             .cloned()
     }
 
-    pub(crate) fn listen(
-        host: &str,
-        ports: &[u16],
-        wait_seconds: f64,
-    ) -> Result<(Self, BridgeListenMetrics)> {
-        Self::listen_with_initial_wait(host, ports, wait_seconds, true)
-    }
-
+    #[cfg(test)]
     pub(crate) fn listen_with_initial_wait(
         host: &str,
         ports: &[u16],
@@ -1222,7 +1201,6 @@ impl BridgeServer {
             #[cfg(any(windows, target_os = "macos"))]
             verified_full_pushes,
             routing: Arc::clone(&accept_state.routing),
-            final_console_snapshots: Mutex::new(HashMap::new()),
             desired_device_request,
             performance_manager,
         };
@@ -1886,7 +1864,6 @@ impl BridgeServer {
             last_focused_at: accepted_at,
             bridge_info: BridgeInfoPayload::default(),
             request_session_id: request_session_id.to_string(),
-            pending_final_console_snapshots: Vec::new(),
             pending_player_identity: None,
             active_request_lease: None,
             cancel_request_id: None,
@@ -2858,7 +2835,7 @@ impl BridgeServer {
             );
             socket.active_request_lease = None;
             socket.cancel_request_id = None;
-            self.collect_socket_final_console_snapshots(&mut socket);
+            self.drain_socket_notifications(&mut socket);
             let routable = self.runtime_is_routable(&socket.bridge_info);
             drop(socket);
             if !routable {
@@ -3193,57 +3170,10 @@ impl BridgeServer {
             }
             return true;
         }
-        if value.get("event").and_then(Value::as_str) != Some("finalConsoleSnapshot") {
-            return false;
-        }
-        if value.get("runtimeId").and_then(Value::as_str).is_none()
-            || value.get("launchNonce").and_then(Value::as_str).is_none()
-            || value
-                .get("launchEditRuntimeId")
-                .and_then(Value::as_str)
-                .is_none()
-            || !value.get("snapshot").is_some_and(Value::is_object)
-        {
-            return true;
-        }
-        socket.pending_final_console_snapshots.push(value.clone());
-        true
+        false
     }
 
-    pub(crate) fn retain_socket_final_console_snapshots(&self, socket: &mut BridgeSocket) {
-        if socket.pending_final_console_snapshots.is_empty() {
-            return;
-        }
-        let mut snapshots = self
-            .final_console_snapshots
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        snapshots.retain(|_, snapshot| snapshot.received_at.elapsed() < Duration::from_secs(300));
-        for payload in socket.pending_final_console_snapshots.drain(..) {
-            let runtime_id = payload
-                .get("runtimeId")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let launch_nonce = payload
-                .get("launchNonce")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let epoch = payload
-                .pointer("/snapshot/epoch")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let key = format!("{launch_nonce}\u{1f}{runtime_id}\u{1f}{epoch}");
-            snapshots.insert(
-                key,
-                FinalConsoleSnapshot {
-                    received_at: Instant::now(),
-                    payload,
-                },
-            );
-        }
-    }
-
-    pub(crate) fn collect_socket_final_console_snapshots(&self, socket: &mut BridgeSocket) -> bool {
+    pub(crate) fn drain_socket_notifications(&self, socket: &mut BridgeSocket) -> bool {
         let mut closed = false;
         if socket.socket.get_mut().set_nonblocking(true).is_ok() {
             // Inventory is observational: a chatty client must not monopolize it.
@@ -3271,28 +3201,7 @@ impl BridgeServer {
             }
             let _ = socket.socket.get_mut().set_nonblocking(false);
         }
-        self.retain_socket_final_console_snapshots(socket);
         closed
-    }
-
-    pub(crate) fn take_final_console_snapshots(&self, launch: &TestLaunch) -> Vec<Value> {
-        let mut snapshots = self
-            .final_console_snapshots
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        snapshots.retain(|_, snapshot| snapshot.received_at.elapsed() < Duration::from_secs(300));
-        snapshots
-            .extract_if(|_, snapshot| {
-                snapshot.payload.get("launchNonce").and_then(Value::as_str)
-                    == Some(launch.nonce.as_str())
-                    && snapshot
-                        .payload
-                        .get("launchEditRuntimeId")
-                        .and_then(Value::as_str)
-                        == Some(launch.edit_runtime_id.as_str())
-            })
-            .map(|(_, snapshot)| snapshot.payload)
-            .collect()
     }
 
     pub(crate) fn socket_is_alive(socket: &mut BridgeSocket) -> bool {
@@ -3403,7 +3312,7 @@ impl BridgeServer {
                         Err(TryLockError::WouldBlock) => continue,
                     };
                     let dead = !self.runtime_is_routable(&socket.bridge_info)
-                        || self.collect_socket_final_console_snapshots(&mut socket)
+                        || self.drain_socket_notifications(&mut socket)
                         || !Self::socket_is_alive(&mut socket);
                     if dead {
                         drop(socket);

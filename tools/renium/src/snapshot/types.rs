@@ -13,13 +13,6 @@ use crate::roblox::schema::{EnumValueNameMap, PropertySchemaMap};
 use crate::studio::bridge::{BridgeServer, ChunkFetchMetrics};
 use crate::studio::native::editor::NativeServiceDom;
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct SnapshotManifest {
-    pub(crate) instances: Vec<SnapshotInstance>,
-    pub(crate) class_defaults: Value,
-}
-
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SnapshotInstance {

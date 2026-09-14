@@ -2301,19 +2301,6 @@ fn load_project_schema(path: &Path) -> Result<ReniumProject> {
     Ok(project)
 }
 
-pub fn refresh_script_naming(root: &Path) -> Result<()> {
-    let naming = match try_load_project(None, Some(root))? {
-        Some(loaded) => project_script_naming(&loaded.project),
-        None => ProjectScriptNaming::default(),
-    };
-    let cache = SCRIPT_NAMING_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(absolute_path(root), naming);
-    Ok(())
-}
-
 pub fn cache_script_naming(root: &Path, project: &ReniumProject) {
     let naming = project_script_naming(project);
     SCRIPT_NAMING_CACHE
@@ -2632,7 +2619,6 @@ fn validate_merged_config(value: &Value) -> Result<()> {
                     matches!(value.as_str(), Some("onStart" | "onError" | "silent")),
                 )?,
                 "projectRoot"
-                | "snapshotDir"
                 | "cliPath"
                 | "bridgePorts"
                 | "place"
@@ -2663,14 +2649,6 @@ fn validate_merged_config(value: &Value) -> Result<()> {
     }
 
     visit("", value)
-}
-
-pub fn filter_allows(
-    rules: &[FilterRule],
-    direction: FilterDirection,
-    candidate: &FilterCandidate<'_>,
-) -> Result<bool> {
-    filter_allows_scope(rules, direction, candidate, FilterScope::Any)
 }
 
 #[derive(Clone, Copy)]
@@ -3598,7 +3576,15 @@ mod tests {
                 ..Default::default()
             },
         ];
-        assert!(filter_allows(&rules, FilterDirection::StudioToFiles, &candidate).unwrap());
+        assert!(
+            filter_allows_scope(
+                &rules,
+                FilterDirection::StudioToFiles,
+                &candidate,
+                FilterScope::Any
+            )
+            .unwrap()
+        );
     }
 
     #[test]

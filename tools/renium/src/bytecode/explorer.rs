@@ -19,8 +19,8 @@ use crate::bytecode::{
     resolve_bytecode_read_input,
 };
 use crate::cli::{
-    BytecodeBatchFields, BytecodeEditorTargetsArgs, BytecodeExplorerBatchArgs,
-    BytecodeExplorerBatchOp, BytecodeExplorerBatchRequest, ExplorerDaemonArgs,
+    BytecodeBatchFields, BytecodeExplorerBatchArgs, BytecodeExplorerBatchOp,
+    BytecodeExplorerBatchRequest, ExplorerDaemonArgs,
 };
 use crate::daemon::transport::{BoundedLineRead, MAX_DAEMON_LINE_BYTES, read_bounded_line};
 use crate::editor::document::is_protected_engine_container;
@@ -1213,68 +1213,6 @@ impl BytecodeNodeProjection<'_> {
 
         Value::Object(node)
     }
-}
-
-pub(crate) fn editor_target_settings_ids(
-    document: &SettingsBytecode,
-    service: &str,
-    prefix: &str,
-) -> Vec<String> {
-    let paths_by_index = build_editor_instance_paths(document, service);
-    document
-        .instances
-        .iter()
-        .enumerate()
-        .filter_map(|(index, instance)| {
-            if instance.parent_index.is_none() || !instance.settings_id.starts_with(prefix) {
-                return None;
-            }
-            let path_info = paths_by_index.get(index)?.as_ref()?;
-            if !path_info.is_descendant_of(service) {
-                return None;
-            }
-            Some(instance.settings_id.clone())
-        })
-        .collect()
-}
-
-pub(crate) fn bytecode_editor_targets(args: BytecodeEditorTargetsArgs) -> Result<()> {
-    let services = explorer_daemon_services(&args.src_root, &args.services)?;
-    let mut paths = Vec::new();
-    let mut target_ids = Vec::new();
-    let mut services_out = Vec::new();
-    let prefix = args.id_prefix;
-
-    for service in services {
-        let settings_file = service_settings_path(&args.src_root.join(&service));
-        if !settings_file.exists() {
-            continue;
-        }
-        let document = SettingsBytecode::read_file(&settings_file)
-            .with_context(|| format!("Failed to read {}", settings_file.display()))?;
-        let ids = editor_target_settings_ids(&document, &service, &prefix);
-        if ids.is_empty() {
-            continue;
-        }
-
-        paths.push(settings_file.to_string_lossy().into_owned());
-        target_ids.extend(ids.iter().cloned());
-        services_out.push(json!({
-            "service": service,
-            "settingsFile": settings_file,
-            "targetSettingsIds": ids,
-        }));
-    }
-
-    println!(
-        "{}",
-        serde_json::to_string(&json!({
-            "paths": paths,
-            "targetSettingsIds": target_ids,
-            "services": services_out,
-        }))?
-    );
-    Ok(())
 }
 
 impl BytecodeNodeProjection<'_> {

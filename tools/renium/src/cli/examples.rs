@@ -45,16 +45,11 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ("ro", "Examples:\n  rbx ro Place.rbxl"),
     ("sx", "Examples:\n  rbx sx --save"),
     ("status", "Examples:\n  rbx status --all"),
-    (
-        "up",
-        "Examples:\n  rbx up --place-id 123456 --universe-id 654321",
-    ),
     ("upd", "Examples:\n  rbx upd"),
     (
         "oc",
         "Examples:\n  rbx oc key\n  rbx oc analytics metrics --field metric=DailyActiveUsers --field granularity=OneDay --field startTime=2026-01-01T00:00:00Z --field endTime=2026-02-01T00:00:00Z\n  rbx oc event list --limit 10\n  rbx oc experiment list --limit 25\n  rbx oc thumbnail personalization --limit 10",
     ),
-    ("sb", "Examples:\n  rbx sb --dry-run"),
     (
         "ip",
         "Examples:\n  rbx ip car.rbxm --destination ServerStorage.Cars",
@@ -94,15 +89,9 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
         "mep",
         "Examples:\n  rbx mep Workspace --settings-id editor:model --output model.rbxm",
     ),
-    ("tst", "Examples:\n  rbx tst --mode play --timeout 30"),
-    ("x", "Examples:\n  rbx x --snapshot-dir snapshots"),
     ("pl", "Examples:\n  rbx pl"),
     ("bd", "Examples:\n  rbx bd"),
     ("ed", "Examples:\n  rbx ed"),
-    (
-        "src",
-        "Examples:\n  rbx src --service ServerScriptService --source-key editor:script",
-    ),
     ("co", "Examples:\n  rbx co --player 1 --limit 20"),
     ("l", "Examples:\n  rbx l \"return game.PlaceId\""),
     ("lc", "Examples:\n  rbx lc \"return game.PlaceId\" 1"),
@@ -115,7 +104,6 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ("ai", "Examples:\n  rbx ai 123456789"),
     ("gm", "Examples:\n  rbx gm \"small wooden cabin\""),
     ("js", "Examples:\n  rbx js job-id --wait-seconds 30"),
-    ("is", "Examples:\n  rbx is icon.png"),
     ("iu", "Examples:\n  rbx iu icon.png --user 123456"),
     ("ss", "Examples:\n  rbx ss DataStore UpdateAsync"),
     ("sg", "Examples:\n  rbx sg \"DailyReward\""),
@@ -193,7 +181,6 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
         "bb",
         "Examples:\n  rbx bb Workspace -j '{\"ops\":[{\"type\":\"counts\"}]}'",
     ),
-    ("bt", "Examples:\n  rbx bt --services Workspace,StarterGui"),
     (
         "ba",
         "Examples:\n  rbx ba Workspace -n Door -c Part -I editor:parent",
@@ -204,18 +191,10 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ),
     ("br", "Examples:\n  rbx br Workspace -i editor:item"),
     (
-        "bdp",
-        "Examples:\n  rbx bdp ReplicatedStorage -i editor:package",
-    ),
-    (
         "bem",
         "Examples:\n  rbx bem Workspace -i editor:model -o model.rbxm",
     ),
     ("bep", "Examples:\n  rbx bep -o place.rbxl"),
-    (
-        "pdp",
-        "Examples:\n  rbx pdp -i place.rbxl -o copy.rbxl --path '[\"Workspace\",\"Model\"]'",
-    ),
     (
         "bim",
         "Examples:\n  rbx bim ReplicatedStorage --model model.rbxm -I editor:parent",
@@ -236,14 +215,6 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     (
         "bpack",
         "Examples:\n  rbx bpack Workspace ReplicatedStorage",
-    ),
-    (
-        "si",
-        "Examples:\n  rbx si --snapshot-dir snapshots --project-root .",
-    ),
-    (
-        "ims",
-        "Examples:\n  rbx ims --project-root . --service Workspace",
     ),
     ("sm", "Examples:\n  rbx sm -o sourcemap.json"),
     ("vci", "Examples:\n  rbx vci"),

@@ -2,37 +2,27 @@ use std::io::{self, Write};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
 use super::{console_entry_level, wait_for_player_bridge};
 use crate::app::output::{ensure_plugin_api_ok, print_json_output};
 use crate::automation::op;
 use crate::cli::PluginConsoleOutputArgs;
-use crate::daemon::try_daemon_control_request;
-use crate::snapshot::export::{is_transient_bridge_error, parse_bridge_ports};
+use crate::daemon::{daemon_control_request, try_daemon_control_request};
+use crate::snapshot::export::is_transient_bridge_error;
 use crate::studio::bridge::{BridgeServer, BridgeTarget};
 
 pub(crate) fn get_console_output_command(args: PluginConsoleOutputArgs) -> Result<()> {
     if args.follow {
-        if follow_console_via_daemon(&args)? {
-            return Ok(());
-        }
-    } else if let Some(result) = try_daemon_control_request(
+        return follow_console_via_daemon(&args);
+    }
+    let result = daemon_control_request(
         op::CONSOLE,
         None,
         console_daemon_parameters(&args, args.since_seq, args.clear, args.from_oldest),
         false,
-    )? {
-        return print_json_output(&result, true);
-    }
-    let ports = parse_bridge_ports(&args.bridge.ports)?;
-    let (bridge, _listen_metrics) =
-        BridgeServer::listen(&args.bridge.host, &ports, args.bridge.wait_seconds)?;
-    if args.follow {
-        return follow_console_with_bridge(&args, &bridge);
-    }
-    let result = get_console_output_result(&args, &bridge)?;
+    )?;
     print_json_output(&result, true)
 }
 
@@ -99,7 +89,7 @@ fn update_console_follow_epoch(
     changed
 }
 
-fn follow_console_via_daemon(args: &PluginConsoleOutputArgs) -> Result<bool> {
+fn follow_console_via_daemon(args: &PluginConsoleOutputArgs) -> Result<()> {
     let mut since_seq = args.since_seq;
     let mut from_oldest = false;
     let mut connected = false;
@@ -117,7 +107,7 @@ fn follow_console_via_daemon(args: &PluginConsoleOutputArgs) -> Result<bool> {
                 thread::sleep(console_follow_interval(args));
                 continue;
             }
-            Ok(None) => return Ok(false),
+            Ok(None) => bail!("Renium daemon did not accept the command"),
             Err(error) if connected && is_transient_console_follow_error(&error) => {
                 thread::sleep(console_follow_interval(args));
                 continue;
@@ -125,39 +115,6 @@ fn follow_console_via_daemon(args: &PluginConsoleOutputArgs) -> Result<bool> {
             Err(error) => return Err(error),
         };
         connected = true;
-        handle_console_follow_result(args, &result, &mut epoch, &mut since_seq, &mut from_oldest)?;
-    }
-}
-
-fn follow_console_with_bridge(args: &PluginConsoleOutputArgs, bridge: &BridgeServer) -> Result<()> {
-    let mut since_seq = args.since_seq;
-    let mut from_oldest = false;
-    let mut epoch = None;
-    let mut clear_pending = args.clear;
-    loop {
-        let request = PluginConsoleOutputArgs {
-            bridge: args.bridge.clone(),
-            limit: args.limit,
-            since_seq,
-            from_oldest: args.from_oldest || from_oldest,
-            clear: clear_pending,
-            client: args.client,
-            server: args.server,
-            player: args.player.clone(),
-            follow: false,
-            grep: args.grep.clone(),
-            level: args.level.clone(),
-            interval_ms: args.interval_ms,
-        };
-        let result = match get_console_output_result(&request, bridge) {
-            Ok(result) => result,
-            Err(error) if is_transient_console_follow_error(&error) => {
-                thread::sleep(console_follow_interval(args));
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
-        clear_pending = false;
         handle_console_follow_result(args, &result, &mut epoch, &mut since_seq, &mut from_oldest)?;
     }
 }

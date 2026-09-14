@@ -25,17 +25,17 @@ use crate::automation::runtime::{
     automation_parse_response_with_lease, oversized_automation_request_response,
 };
 use crate::bytecode::explorer::watch_parent_and_exit;
+use crate::cli::BridgeDaemonArgs;
 use crate::cli::args::CursorPollArgs;
-use crate::cli::{BridgeDaemonArgs, BridgeGetSourceArgs};
 use crate::daemon::transport::{
     DAEMON_CONTROL_IDLE_TIMEOUT, DAEMON_DISCOVERY_MAX_AGE_MS, DAEMON_DISCOVERY_MAX_FUTURE_SKEW_MS,
     DEFAULT_DAEMON_CONTROL_PORT, MAX_DAEMON_CONTROL_CONNECTIONS, host_port, is_loopback_endpoint,
     normalize_loopback_host,
 };
-use crate::snapshot::export::{fetch_text_chunks, parse_bridge_ports};
-use crate::studio::bridge::{BridgeRequestLease, BridgeServer, clamp_bridge_chunk_size};
+use crate::snapshot::export::parse_bridge_ports;
+use crate::studio::bridge::{BridgeRequestLease, BridgeServer};
 use crate::studio::target::place_filter;
-use crate::system::files::{absolutize_for_daemon, fnv1a_hex, sanitize_ascii_identifier};
+use crate::system::files::{absolutize_for_daemon, sanitize_ascii_identifier};
 
 const SHARED_DAEMON_START_TIMEOUT: Duration = Duration::from_secs(5);
 static NEXT_CONTROL_LEASE_ID: AtomicU64 = AtomicU64::new(1);
@@ -134,7 +134,7 @@ pub(super) fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
     crate::studio::input::watch_auto_recovery_dialogs();
     let automation_state = Arc::new(automation::State::default());
     check_for_available_update(Arc::clone(&automation_state));
-    let bridge_host = normalize_loopback_host(&args.bridge.host)?;
+    let bridge_host = normalize_loopback_host(&args.host)?;
     let ports = parse_bridge_ports(&args.bridge.ports)?;
     let (bridge, listen_metrics) =
         BridgeServer::listen_daemon(&bridge_host, &ports, args.bridge.wait_seconds)?;
@@ -298,63 +298,6 @@ fn handle_daemon_control_connection(
         write_result?;
     }
     Ok(())
-}
-
-pub(super) fn bridge_get_source(args: BridgeGetSourceArgs) -> Result<()> {
-    let ports = parse_bridge_ports(&args.bridge.ports)?;
-    let (bridge, listen_metrics) =
-        BridgeServer::listen(&args.bridge.host, &ports, args.bridge.wait_seconds)?;
-    let source = bridge_fetch_source(
-        &bridge,
-        &args.service,
-        &args.source_key,
-        clamp_bridge_chunk_size(args.chunk_size),
-    )?;
-    let expected = match &args.expect_file {
-        Some(path) => Some(
-            fs::read_to_string(path)
-                .with_context(|| format!("Failed to read expected file {}", path.display()))?,
-        ),
-        None => None,
-    };
-    let matches_expected = expected.as_ref().is_none_or(|expected| expected == &source);
-    let summary = json!({
-        "ok": matches_expected,
-        "service": args.service,
-        "sourceKey": args.source_key,
-        "sourceLen": source.len(),
-        "sourceHash": fnv1a_hex(source.as_bytes()),
-        "expectedLen": expected.as_ref().map(String::len),
-        "expectedHash": expected.as_ref().map(|value| fnv1a_hex(value.as_bytes())),
-        "matchesExpected": matches_expected,
-        "channels": bridge.channel_count(),
-        "handshakeMs": listen_metrics.wait_for_channels_ms,
-    });
-    println!("__ROBLOX_SYNC_BRIDGE_SOURCE_RESULT__ {summary}");
-    if !matches_expected {
-        bail!("Studio source did not match expected file");
-    }
-    Ok(())
-}
-
-pub(super) fn bridge_fetch_source(
-    bridge: &BridgeServer,
-    service: &str,
-    source_key: &str,
-    chunk_size: usize,
-) -> Result<String> {
-    let (source, _) = fetch_text_chunks(chunk_size, |start_index, max_len| {
-        bridge.call_chunk(
-            "getSourceChunk",
-            json!({
-                "service": service,
-                "instancePath": source_key,
-                "startIndex": start_index,
-                "maxLen": max_len,
-            }),
-        )
-    })?;
-    Ok(source)
 }
 
 fn write_daemon_discovery_file(
