@@ -52,6 +52,26 @@ pub(crate) fn configured_project_layout(
     Ok((root, source_root))
 }
 
+/// An explicit `-r DIR` names that directory as the project. When it holds no
+/// project yet, create the default one there instead of discovering a parent
+/// project and writing into it.
+pub(crate) fn ensure_explicit_project_root(project_root: &Path) -> Result<()> {
+    if project_root == Path::new(".") || !project_root.is_dir() {
+        return Ok(());
+    }
+    if ["renium.project.jsonc", "src", "instances", "places"]
+        .iter()
+        .any(|name| project_root.join(name).exists())
+    {
+        return Ok(());
+    }
+    let path = project_root.join("renium.project.jsonc");
+    std::fs::write(&path, "{\n  \"schemaVersion\": 1\n}\n")
+        .with_context(|| format!("Failed to create {}", path.display()))?;
+    crate::app::output::log_global(3, format_args!("[renium] created {}", path.display()));
+    Ok(())
+}
+
 pub(crate) fn apply_configured_project_layout(
     project_root: &mut PathBuf,
     source_root: &mut PathBuf,

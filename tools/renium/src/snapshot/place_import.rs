@@ -32,6 +32,7 @@ use crate::system::files::resolve_existing_project_root;
 /// Imports a saved place file into the project the same way a pull imports
 /// Studio's binary export, without a Studio session.
 pub(crate) fn import_place_file(mut args: ImportPlaceArgs) -> Result<()> {
+    crate::project::layout::ensure_explicit_project_root(&args.project_root)?;
     apply_configured_project_layout(&mut args.project_root, &mut args.src_dir)?;
     set_quiet_timings(true);
     let total_started = Instant::now();
