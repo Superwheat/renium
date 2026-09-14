@@ -706,7 +706,6 @@ type NativeContextPrepare = dyn Fn(u32, &str) -> Result<()> + Send + Sync;
 
 #[cfg(any(windows, target_os = "macos"))]
 struct NativeConnectionPreparation {
-    #[cfg(windows)]
     patch_notices: Box<dyn Fn(u32) -> Result<()> + Send + Sync>,
     pending: Mutex<HashSet<String>>,
     prepare: Box<NativeContextPrepare>,
@@ -1133,7 +1132,6 @@ impl BridgeServer {
             check_updates_on_connect,
             #[cfg(any(windows, target_os = "macos"))]
             native_preparation: Some(Arc::new(NativeConnectionPreparation {
-                #[cfg(windows)]
                 patch_notices: Box::new(
                     crate::studio::native::serializer::suppress_package_notices,
                 ),
@@ -1328,7 +1326,9 @@ impl BridgeServer {
                                     // Patch before exposing the Edit connection to commands.
                                     // The flag stays enabled through deferred engine work and
                                     // reconnects, including operations outside editor sync.
-                                    #[cfg(windows)]
+                                    // macOS needs the helper that only a Renium launch loads;
+                                    // without it package pushes fall back to the dialog watcher.
+                                    #[cfg(any(windows, target_os = "macos"))]
                                     if socket.role == BRIDGE_ROLE_EDIT
                                         && let Some(preparation) = native_preparation.as_ref()
                                     {
@@ -1337,12 +1337,14 @@ impl BridgeServer {
                                             .and_then(|pid| (preparation.patch_notices)(pid));
                                         if let Err(error) = patch {
                                             crate::app::output::log_global(
-                                                2,
+                                                if cfg!(windows) { 2 } else { 4 },
                                                 format_args!(
                                                     "[renium] Studio package notice patch failed: {error:#}"
                                                 ),
                                             );
-                                            return;
+                                            if cfg!(windows) {
+                                                return;
+                                            }
                                         }
                                     }
                                     let mut guard = channel
