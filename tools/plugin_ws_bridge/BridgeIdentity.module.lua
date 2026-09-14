@@ -335,14 +335,6 @@ function BridgeIdentity.getCachedInstanceIndex(state, instance)
 	return nil
 end
 
-function BridgeIdentity.getCachedParentInstanceIndex(state, instance)
-	local parent = instance.Parent
-	if parent == nil or parent == game then
-		return nil
-	end
-	return BridgeIdentity.getCachedInstanceIndex(state, parent)
-end
-
 function BridgeIdentity.parseInstanceIndexId(value)
 	if type(value) == "number" then
 		return value
