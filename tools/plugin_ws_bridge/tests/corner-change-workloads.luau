@@ -797,19 +797,13 @@ function wide:GetChildren()
 	siblingScans += 1
 	return self.children
 end
+local connectedBeforeWide = tracker.getState({}).connectedInstances
 tracker.beginSuppress()
-local attachmentProfile = {}
-tracker.expectParentChange(wide, deepParent, attachmentProfile)
-trackerConfig.syncProfile = { attachment = attachmentProfile }
+tracker.expectParentChange(wide, deepParent)
 add(wide, deepParent, true)
-trackerConfig.syncProfile.attachment = nil
 tracker.endSuppress(0)
-assert(attachmentProfile.connectedInstances == 2401 and attachmentProfile.primedInstances == 2401,
-	"descendant-first attachment profiling must include ancestors connected by a child event")
-assert(attachmentProfile.baselineMs >= 0 and attachmentProfile.attributeBaselineMs >= 0 and attachmentProfile.listenerSetupMs >= 0)
-assert(attachmentProfile.trackerAddedCallbacks == 2401)
-assert(attachmentProfile.trackerAddedCallbacksMs >= attachmentProfile.trackerPreExpectationMs
-	and attachmentProfile.trackerPreExpectationMs >= 0)
+assert(tracker.getState({}).connectedInstances - connectedBeforeWide == 2401,
+	"descendant-first attachment must connect the ancestors reached through a child event")
 assert(siblingScans <= 2, `bulk attachment rescanned siblings {siblingScans} times`)
 assert(ancestorVisits < 30, `bulk attachment revisited connected ancestors {ancestorVisits} times`)
 assert(tracker.pendingChangeCount() == 0)
@@ -1307,11 +1301,11 @@ do
 				observer.getState({ services = { "ReplicatedStorage" } })
 				observer.beginSuppress()
 				observer.beginChangeJournal("pre-exposure", { "ReplicatedStorage" })
-				local before, profile = observer.serviceGeneration("ReplicatedStorage"), {}
-				local token = observer.expectParentChange(root, storage, profile, serializedInsertion)
+				local before = observer.serviceGeneration("ReplicatedStorage")
+				local token = observer.expectParentChange(root, storage, serializedInsertion)
 				assert(attributeReads == (if serializedInsertion then 0 else 1),
 					"finished native payload eagerly copied attribute baselines")
-				assert(later.AttributeChanged:Count() == 1 and profile.primedInstances == 3,
+				assert(later.AttributeChanged:Count() == 1,
 					"fresh full-mode subtree must be observed before exposure")
 				add(root, storage)
 				propertyEvent(root, "Parent")
@@ -1323,7 +1317,7 @@ do
 				-- Delay structural delivery past complete(), not property sampling. This
 				-- checks deferred expectation lifetime, not a simulated engine scheduler.
 				for _, deliver in queued do deliver() end
-				assert(foreignCalls == 1 and laterDelivered and profile.primedInstances == 3,
+				assert(foreignCalls == 1 and laterDelivered,
 					"DescendantAdded must not re-prime an already prepared observer")
 				for _, expected in token.tokens do assert(not expected.active, "own structural/Parent event was not consumed") end
 				local records = observer.finishChangeJournal("pre-exposure")
@@ -1721,8 +1715,7 @@ do
 			services.RunService.Heartbeat:Fire()
 			assert(relay.Frame == 1, "native frame observation did not start")
 			observer.beginChangeJournal("relay", { "ReplicatedStorage" })
-			local profile = {}
-			observer.beginNativeImportObservations("relay", profile, if cycle % 2 == 0 then { Folder = true } else nil)
+			observer.beginNativeImportObservations("relay", if cycle % 2 == 0 then { Folder = true } else nil)
 			local fresh = instance("Folder", "RelayIncoming", storage)
 			function fresh:GetDebugId() return "relay-fresh" end
 			local attributes, reads = { Keep = false, Removed = 7 }, 0
@@ -1733,7 +1726,7 @@ do
 			testGame.ItemChanged:Fire(fresh, "Parent")
 			assert(observer.serviceGeneration("ReplicatedStorage") == parentGeneration,
 				"native receipt did not supply the initial parent baseline")
-			assert(reads == 0 and fresh.AttributeChanged:Count() == 0 and profile.nativeAttributeInstances == 1,
+			assert(reads == 0 and fresh.AttributeChanged:Count() == 0,
 				"transient native insertion eagerly primed attributes or installed a local listener")
 			attributes.Removed = nil
 			relay.Changed:Fire(fresh)

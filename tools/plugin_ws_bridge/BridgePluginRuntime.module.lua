@@ -26,7 +26,6 @@ type ServiceState = {
 	nativeNonArchivableIndices: { number }?,
 	nativeStructureGeneration: number?,
 	nativeContentGeneration: number?,
-	nativePreparationProfile: { [string]: number }?,
 	matchedSettingsIds: { { index: number, id: string } }?,
 	matchedSettingsIdVersion: number?,
 	scriptInstancesByIndex: { [number]: LuaSourceContainer }?,
@@ -301,8 +300,6 @@ function BridgePluginRuntime.start(context)
 		VRService = true,
 	}
 	Config.shouldIgnoreInstance = sessionLock.isLockInstance
-	-- Active only during traced attachment or native import operations.
-	Config.syncProfile = {}
 	local pendingStudioChangesSettingPrefix = SETTINGS_PREFIX .. "pendingStudioChanges:"
 	local function pendingStudioChangesTarget(): { [string]: any }?
 		-- Plugin settings are shared by every Studio DataModel. Published places have
@@ -725,25 +722,17 @@ function BridgePluginRuntime.start(context)
 			editor.TextDocumentDidClose:Connect(changed) }
 	end
 	local function markStructureChanged(serviceName: string, instance: Instance)
-		local profile = Config.syncProfile.attachment or Config.syncProfile.nativeImport
-		local started = if profile then os.clock() else 0
 		local included = includeExportInstance(serviceName, instance)
 		if included then
 			nativeStructureGenerationByService[serviceName] += 1
 			nativeContentGenerationByService[serviceName] += 1
 			nativeLastChangeByService[serviceName] = "hierarchy"
 		end
-		if profile then
-			profile.nativeStructureCallbacksMs = (profile.nativeStructureCallbacksMs or 0) + (os.clock() - started) * 1000
-			profile.nativeStructureCallbacks = (profile.nativeStructureCallbacks or 0) + 1
-		end
 		return included
 	end
 	-- Export includes camera objects even though Live Sync deliberately ignores
 	-- their edits. Its bytes therefore need a separate invalidation generation.
 	Config.studioChanges.observeExports(markStructureChanged, function(instance, propertyName)
-		local profile = Config.syncProfile.attachment or Config.syncProfile.nativeImport
-		local started = if profile then os.clock() else 0
 		-- Archivable is restored from the overlay; serialization temporarily sets it.
 		if typeof(instance) == "Instance" and exportPropertyRelevant(instance.ClassName, tostring(propertyName)) then
 			local root = Config.studioChanges.trackedServiceRoot(instance)
@@ -768,10 +757,6 @@ function BridgePluginRuntime.start(context)
 					end
 				end
 			end
-		end
-		if profile then
-			profile.nativeContentCallbacksMs = (profile.nativeContentCallbacksMs or 0) + (os.clock() - started) * 1000
-			profile.nativeContentCallbacks = (profile.nativeContentCallbacks or 0) + 1
 		end
 	end)
 
@@ -907,7 +892,6 @@ function BridgePluginRuntime.start(context)
 		expectParentChange = Config.studioChanges.expectParentChange,
 		expectPropertyEvent = Config.studioChanges.expectPropertyEvent,
 		samplePropertyChange = Config.studioChanges.samplePropertyChange,
-		syncProfile = Config.syncProfile,
 		expectAttributeEvent = Config.studioChanges.expectAttributeEvent,
 		expectTagChange = Config.studioChanges.expectTagChange,
 		cancelExpectedEvent = Config.studioChanges.cancelExpectedEvent,
@@ -2858,7 +2842,6 @@ function BridgePluginRuntime.start(context)
 		nativeScriptSourcesOverride: { [Instance]: string }?,
 		nativeInstancesOverride: { Instance }?
 	): ({ [string]: any }?, ServiceState)
-		local prepareStarted = os.clock()
 		if not ALLOWED_SERVICES[serviceName] then
 			error("Unsupported service: " .. tostring(serviceName))
 		end
@@ -2904,7 +2887,6 @@ function BridgePluginRuntime.start(context)
 				descendants[index] = nil
 			end
 		end
-		local enumerationMs = (os.clock() - prepareStarted) * 1000
 		local expectedCount = if providedInstances then #providedInstances else #descendants + 1
 		local instances = table.create(expectedCount)
 		instances[1] = if providedInstances then providedInstances[1] else service
@@ -2972,7 +2954,6 @@ function BridgePluginRuntime.start(context)
 			scriptObjects[scriptCount] = service
 		end
 
-		local instanceScanStarted = os.clock()
 		local firstDescendant = if providedInstances then 2 else 1
 		for descendantIndex = firstDescendant, #descendants do
 			local inst = descendants[descendantIndex]
@@ -3027,13 +3008,9 @@ function BridgePluginRuntime.start(context)
 				end
 			end
 		end
-		local instanceScanMs = (os.clock() - instanceScanStarted) * 1000
-
-		local debugFinalizeStarted = os.clock()
 		if nativeDebugIdData and not nativeSnapshot and typeof(nativeDebugIdData) ~= "buffer" then
 			nativeDebugIdData = buffer.fromstring(table.concat(nativeDebugIdData, "\0"))
 		end
-		local debugFinalizeMs = (os.clock() - debugFinalizeStarted) * 1000
 
 		local state: ServiceState = {
 			instances = instances,
@@ -3066,7 +3043,6 @@ function BridgePluginRuntime.start(context)
 			nativeLuaSourceIndices = nativeLuaSourceIndices,
 			nativeNonArchivableIndices = nativeNonArchivableIndices,
 			nativeStructureGeneration = nil,
-			nativePreparationProfile = nil,
 			matchedSettingsIds = nil,
 			matchedSettingsIdVersion = nil,
 			scriptInstancesByIndex = nil,
@@ -3079,15 +3055,7 @@ function BridgePluginRuntime.start(context)
 			hotPropertySchemaByClass = nil,
 			requiresPcallByClassProperty = {},
 		}
-		local matchedSettingsIdsStarted = os.clock()
 		refreshMatchedSettingsIds(state)
-		state.nativePreparationProfile = {
-			enumerationMs = enumerationMs,
-			instanceScanMs = instanceScanMs,
-			debugFinalizeMs = debugFinalizeMs,
-			matchedSettingsIdsMs = (os.clock() - matchedSettingsIdsStarted) * 1000,
-			totalMs = (os.clock() - prepareStarted) * 1000,
-		}
 
 		if nativeExport then
 			return nil, state

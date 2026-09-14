@@ -16,7 +16,7 @@ local target = { ClassName = "NumberValue", Parent = left, Archivable = true }
 local ordered = { service, left, target, right }
 local indexed, onProperty
 local states = {}
-local config = { syncProfile = {}, studioChanges = {
+local config = { studioChanges = {
 	observeExports = function(_, property) onProperty = property end,
 	trackedServiceRoot = function() return service end,
 	isTracking = function() return true end,

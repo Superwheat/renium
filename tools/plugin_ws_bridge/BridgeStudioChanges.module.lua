@@ -72,7 +72,6 @@ type ExpectedInstanceEvent = {
 	matchParent: boolean?,
 	parent: Instance?,
 	parentUnchanged: boolean?,
-	profile: { [string]: number }?,
 }
 type ExpectedInstanceEventQueue = { ExpectedInstanceEvent }
 type ExpectedInstanceEvents = { [Instance]: { [string]: ExpectedInstanceEventQueue } }
@@ -813,7 +812,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		return event
 	end
 
-	function api.expectParentChange(instance: Instance, nextParent: Instance?, profile: { [string]: number }?, serializedInsertion: boolean?)
+	function api.expectParentChange(instance: Instance, nextParent: Instance?, serializedInsertion: boolean?)
 		local tokens = {}
 		local wasInDataModel = instance:IsDescendantOf(game)
 		local willBeInDataModel = nextParent ~= nil and (nextParent == game or nextParent:IsDescendantOf(game))
@@ -843,7 +842,6 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				-- Attaching a root does not change its descendants' sibling order.
 				-- Preserve that cache across the resulting DescendantAdded fan-out.
 				token.parentUnchanged = target ~= instance
-				token.profile = profile
 				tokens[#tokens + 1] = token
 			end
 			if tagAction ~= nil then
@@ -860,9 +858,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			expectedPropertyFingerprint(instance, "Parent", nextParent), false, nil)
 		local token = { tokens = tokens }
 		if not wasInDataModel and willBeInDataModel and not state.onlyCodeMode then
-			prepareParentObservers(instances, nextParent, token, profile, serializedInsertion)
+			prepareParentObservers(instances, nextParent, token, serializedInsertion)
 		elseif wasInDataModel and not willBeInDataModel and state.changeJournal ~= nil then
-			prepareParentObservers(instances, nil, token, profile)
+			prepareParentObservers(instances, nil, token)
 		end
 		return token
 	end
@@ -1340,7 +1338,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		signalTrackedChange()
 	end
 
-	function api.beginNativeImportObservations(transactionId: string, profile: { [string]: number }?, untaggedClasses: { [string]: boolean }?)
+	function api.beginNativeImportObservations(transactionId: string, untaggedClasses: { [string]: boolean }?)
 		local journal = state.changeJournal
 		if journal == nil or journal.id ~= transactionId or journal.nativeAdditions ~= nil then
 			error("Native import observation requires its exclusive editor transaction")
@@ -1350,12 +1348,8 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			additions[serviceName] = {}
 		end
 		journal.nativeAdditions = additions
-		journal.nativeProfile = profile
 		journal.nativeUntaggedClasses = untaggedClasses
 		nativeParentReceipts[#nativeParentReceipts + 1] = additions
-		if config.syncProfile then
-			config.syncProfile.nativeImport = profile
-		end
 	end
 
 	local function directPropertyKey(
@@ -1607,11 +1601,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			return {}
 		end
 		journal.nativeAdditions = nil
-		journal.nativeProfile = nil
 		journal.nativeUntaggedClasses = nil
-		if config.syncProfile then
-			config.syncProfile.nativeImport = nil
-		end
 		for serviceName, instances in pairs(additions) do
 			for instance, parent in pairs(instances) do
 				local class = if createdById then createdById[BridgeIdentity.getDebugId(instance)] else nil
@@ -2902,7 +2892,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 	end
 
-	local function connectInstance(instance: Instance, serviceName: string, primeCurrentValues: boolean?, profile: { [string]: number }?, nativeInsertion: boolean?, serializedInsertion: boolean?)
+	local function connectInstance(instance: Instance, serviceName: string, primeCurrentValues: boolean?, nativeInsertion: boolean?, serializedInsertion: boolean?)
 		local connectedServiceName = state.connectionServiceByInstance[instance]
 		if state.instanceConnections[instance] ~= nil then
 			if connectedServiceName == serviceName then
@@ -2939,17 +2929,11 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			end
 			state.instanceConnections[instance] = nativeAttributeConnection
 			state.connectedInstanceCount += 1
-			if profile then
-				profile.nativeAttributeInstances = (profile.nativeAttributeInstances or 0) + 1
-				profile.receiptBaselineInstances = (profile.receiptBaselineInstances or 0) + 1
-				profile.connectedInstances = (profile.connectedInstances or 0) + 1
-			end
 			return
 		end
 		local tags = tagFingerprint(instance)
 		state.tagFingerprintByInstance[instance] = if tags == "" then nil else tags
 
-		local phaseStarted = if profile then os.clock() else 0
 		if primeCurrentValues or state.expectedFreshInstances[instance] then
 			-- The native loader sets ordinary values before exposing its objects.
 			-- Keep Parent for delayed insertion events. A property or attribute
@@ -2961,15 +2945,6 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			else
 				shouldRecordPropertyDirty(instance, "Parent")
 				primeCurrentProperties(instance)
-			end
-			if profile then
-				local now = os.clock()
-				local elapsed = (now - phaseStarted) * 1000
-				profile.baselineMs = (profile.baselineMs or 0) + elapsed
-				local key = `baseline:{instance.ClassName}`
-				profile[key] = (profile[key] or 0) + elapsed
-				phaseStarted = now
-				profile.primedInstances = (profile.primedInstances or 0) + 1
 			end
 			local fingerprints = state.propertyFingerprintByInstance[instance]
 			if not nativeAttributes and not serializedInsertion then
@@ -2984,11 +2959,6 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 					fingerprints["attribute:" .. attributeName] = stableValueString(value)
 				end
 			end
-			if profile then
-				local now = os.clock()
-				profile.attributeBaselineMs = (profile.attributeBaselineMs or 0) + (now - phaseStarted) * 1000
-				phaseStarted = now
-			end
 		end
 
 		state.lastParentByInstance[instance] = instance.Parent
@@ -2999,16 +2969,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		state.instanceConnections[instance] = if nativeAttributes then nativeAttributeConnection
 			else connectAttributeChanged(instance, serviceName)
 		state.connectedInstanceCount += 1
-		if profile then
-			if nativeAttributes then
-				profile.nativeAttributeInstances = (profile.nativeAttributeInstances or 0) + 1
-			end
-			profile.listenerSetupMs = (profile.listenerSetupMs or 0) + (os.clock() - phaseStarted) * 1000
-			profile.connectedInstances = (profile.connectedInstances or 0) + 1
-		end
 	end
 
-	prepareParentObservers = function(instances: { Instance }, nextParent: Instance?, token: any, profile: { [string]: number }?, serializedInsertion: boolean?)
+	prepareParentObservers = function(instances: { Instance }, nextParent: Instance?, token: any, serializedInsertion: boolean?)
 		local serviceName = serviceNameForTrackedInstance(nextParent or instances[1])
 		if serviceName == nil then
 			return
@@ -3038,7 +3001,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 					-- A detached native payload has finished setting its properties.
 					-- Keep all observers and Parent/attribute baselines; ordinary
 					-- property events without a baseline remain outside edits.
-					connectInstance(instance, serviceName, true, profile, nil, serializedInsertion)
+					connectInstance(instance, serviceName, true, nil, serializedInsertion)
 					acquired[instance] = state.instanceConnections[instance] or false
 				end
 				-- Serialized children are exposed by the immediately following root
@@ -3105,8 +3068,6 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		local itemChanged = (game :: any).ItemChanged
 		if itemChanged == nil then return false end
 		propertySignal = itemChanged:Connect(function(instance: Instance, propertyName: any)
-			local profile = config.syncProfile and (config.syncProfile.attachment or config.syncProfile.nativeImport)
-			local started = if profile then os.clock() else 0
 			if exportPropertyObserver then
 				exportPropertyObserver(instance, propertyName)
 			end
@@ -3124,13 +3085,6 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				if property == "tags" then
 					markTagChange(instance, "Tags", true)
 				end
-			end
-			if profile then
-				local elapsed = (os.clock() - started) * 1000
-				profile.globalPropertyCallbacksMs = (profile.globalPropertyCallbacksMs or 0) + elapsed
-				profile.globalPropertyCallbacks = (profile.globalPropertyCallbacks or 0) + 1
-				local key = `propertyCallback:{tostring(propertyName)}`
-				profile[key] = (profile[key] or 0) + elapsed
 			end
 		end)
 		return true
@@ -3169,7 +3123,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 	end
 
-	local function reconcileAncestorConnections(instance: Instance, service: Instance, serviceName: string, profile: { [string]: number }?)
+	local function reconcileAncestorConnections(instance: Instance, service: Instance, serviceName: string)
 		local current = instance.Parent
 		while current ~= nil and current ~= service and current:IsDescendantOf(service) do
 			-- Full-mode connections already cover the connected ancestor's chain.
@@ -3178,7 +3132,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				break
 			end
 			if not state.onlyCodeMode or hasLuaSourceDescendant(current) then
-				connectInstance(current, serviceName, nil, profile)
+				connectInstance(current, serviceName)
 			else
 				disconnectInstance(current, serviceName)
 			end
@@ -3245,9 +3199,6 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		local signals = ensureServiceSignals(serviceName)
 		signals.added = function(instance: Instance, exportIncluded: boolean?)
 			local journal = state.changeJournal
-			local nativeProfile = if journal and journal.services[serviceName] then journal.nativeProfile else nil
-			local activeProfile = (config.syncProfile and config.syncProfile.attachment) or nativeProfile
-			local started = if activeProfile then os.clock() else 0
 			state.exportInstancesByService[serviceName] = nil
 			updateTrackedArchivable(instance, serviceName, exportIncluded)
 			local additions = if journal and journal.nativeAdditions then journal.nativeAdditions[serviceName] else nil
@@ -3262,11 +3213,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				if parent ~= nil and instance:IsDescendantOf(service) then
 					additions[instance] = parent
 					invalidateSiblingOrdinals(parent)
-					connectInstance(instance, serviceName, true, nativeProfile, true)
-					if activeProfile then
-						activeProfile.trackerAddedCallbacksMs = (activeProfile.trackerAddedCallbacksMs or 0) + (os.clock() - started) * 1000
-						activeProfile.trackerAddedCallbacks = (activeProfile.trackerAddedCallbacks or 0) + 1
-					end
+					connectInstance(instance, serviceName, true, true)
 					return
 				end
 			end
@@ -3277,17 +3224,12 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				nil,
 				instance.Parent
 			)
-			local profile = if expectation then expectation.profile else nativeProfile
 			if included and not expected and additions ~= nil and additions[instance] == nil and instance.Parent ~= nil then
 				-- Only the first addition waits for the factory receipt. A
 				-- second add/remove follows the ordinary journal immediately;
 				-- property and attribute listeners are never suppressed here.
 				additions[instance] = instance.Parent
 				expected = true
-			end
-			local callbackStarted = if profile then os.clock() else 0
-			if activeProfile then
-				activeProfile.trackerPreExpectationMs = (activeProfile.trackerPreExpectationMs or 0) + (os.clock() - started) * 1000
 			end
 			if state.onlyCodeMode then
 				if isLuaSourceInstance(instance) then
@@ -3304,9 +3246,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				and (not state.onlyCodeMode or hasLuaSourceDescendant(instance))
 			then
 				if instance:IsDescendantOf(service) then
-					connectInstance(instance, serviceName, true, profile, additions ~= nil and additions[instance] ~= nil)
+					connectInstance(instance, serviceName, true, additions ~= nil and additions[instance] ~= nil)
 					releaseDetachedObserver(instance, serviceName)
-					reconcileAncestorConnections(instance, service, serviceName, profile)
+					reconcileAncestorConnections(instance, service, serviceName)
 				end
 				if not expected then
 					markDirty(
@@ -3314,13 +3256,6 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 						changeDetailsForInstance(instance, "added", nil, nil, "descendant added")
 					)
 				end
-			end
-			if profile then
-				profile.postExpectationCallbackMs = (profile.postExpectationCallbackMs or 0) + (os.clock() - callbackStarted) * 1000
-			end
-			if activeProfile then
-				activeProfile.trackerAddedCallbacksMs = (activeProfile.trackerAddedCallbacksMs or 0) + (os.clock() - started) * 1000
-				activeProfile.trackerAddedCallbacks = (activeProfile.trackerAddedCallbacks or 0) + 1
 			end
 		end
 		signals.removing = function(instance: Instance)
@@ -3455,9 +3390,6 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		localPushProofRequested = false
 		state.started = false
 		table.clear(nativeParentReceipts)
-		if config.syncProfile then
-			config.syncProfile.nativeImport = nil
-		end
 		if nativeAttributeRelay and nativeAttributeRelay.cached then
 			nativeAttributeRelay.ready = false
 		elseif nativeAttributeRelay then

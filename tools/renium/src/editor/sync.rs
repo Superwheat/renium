@@ -13,7 +13,7 @@ use walkdir::WalkDir;
 use crate::app::output::{
     global_log_enabled, global_pretty_output, global_yes, log_global, print_json_output,
 };
-use crate::app::timing::{current_millis, elapsed_ms, log_timing, verbose_timing_logs};
+use crate::app::timing::{current_millis, elapsed_ms, log_timing};
 use crate::automation::op;
 use crate::bytecode::{SettingsFileLock, acquire_settings_file_lock};
 use crate::cli::{
@@ -850,10 +850,7 @@ impl<'a> EditorTransaction<'a> {
     fn commit(&mut self) -> Result<EditorCommitStatus> {
         let commit_result = self.bridge.call(
             "commitEditorTransaction",
-            json!({
-                "transactionId": &self.id,
-                "profile": verbose_timing_logs(),
-            }),
+            json!({ "transactionId": &self.id }),
         );
         let result = match commit_result {
             Ok(result) => result,
@@ -862,12 +859,6 @@ impl<'a> EditorTransaction<'a> {
                     "getEditorTransactionState",
                     json!({ "transactionId": &self.id }),
                 );
-                if verbose_timing_logs()
-                    && let Ok(state) = &state_result
-                    && let Some(profile) = state.get("profile")
-                {
-                    eprintln!("[renium] native editor failed commit profile: {profile}");
-                }
                 match state_result {
                     Ok(result) => match editor_transaction_state(&result) {
                         Some("committed") => result,
@@ -937,11 +928,6 @@ impl<'a> EditorTransaction<'a> {
         let package_dialog_accepted = package_dialog_accepted
             .context("Studio did not finish accepting package changes")?
             .unwrap_or(false);
-        if verbose_timing_logs()
-            && let Some(profile) = result.get("profile")
-        {
-            eprintln!("[renium] native editor commit profile: {profile}");
-        }
         Ok(EditorCommitStatus {
             verified_push_proof: result
                 .get("verifiedPushProof")
