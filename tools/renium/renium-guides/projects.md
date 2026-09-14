@@ -19,7 +19,7 @@ rbx bpack
 ```
 
 `bem`/`bim` copy model trees; use `mv --to-service` for an existing subtree.
-`bep` builds a place without opening or publishing it; `pi` does the reverse, importing a saved `.rbxl`/`.rbxlx` into the project files like a pull, without Studio. Once Studio has that place open, run `pl` once before Live Sync or pushes so the files adopt Studio's instance identities.
+`bep` builds a place without opening or publishing it; `bep --base ORIGINAL.rbxl` keeps that file's unsynced services and engine root fields so the result is a complete place. `pi` does the reverse, importing a saved `.rbxl`/`.rbxlx` into the project files like a pull, without Studio. Once Studio has that place open, run `pl` once before Live Sync or pushes so the files adopt Studio's instance identities.
 `q` queries an RBXL/RBXLX without Studio or a project beside it. Filter by name, class, or source.
 `cmp` is script-only by default. Add `--full --all` for all instance/property/attribute changes; `--values` includes values and source. The input is the older/before state; the project (or `--against` file) is after. `.rbxl` and `.rbxlx` work on either side without opening Studio. See [comparison scope and output](data.md#inspect-files-without-importing).
 

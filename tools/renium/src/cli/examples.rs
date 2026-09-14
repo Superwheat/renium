@@ -194,7 +194,10 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
         "bem",
         "Examples:\n  rbx bem Workspace -i editor:model -o model.rbxm",
     ),
-    ("bep", "Examples:\n  rbx bep -o place.rbxl"),
+    (
+        "bep",
+        "Examples:\n  rbx bep -o place.rbxl\n  rbx bep --base Original.rbxl -o place.rbxl",
+    ),
     ("pi", "Examples:\n  rbx pi Place.rbxl"),
     (
         "bim",

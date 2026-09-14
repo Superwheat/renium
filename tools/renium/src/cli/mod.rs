@@ -2507,6 +2507,12 @@ pub(super) struct BytecodeExportPlaceArgs {
     pub(super) output: PathBuf,
     #[arg(help = "Output format", long, value_name = "rbxl|rbxlx")]
     pub(super) format: Option<String>,
+    #[arg(
+        help = "Place file whose unsynced services and root fields are kept",
+        long,
+        value_name = "PATH"
+    )]
+    pub(super) base: Option<PathBuf>,
     #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }
