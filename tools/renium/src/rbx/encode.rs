@@ -615,10 +615,10 @@ fn json_to_rbx_variant_for_type(
 ) -> Option<RbxVariant> {
     match target_type {
         RbxVariantType::Bool => value.as_bool().map(RbxVariant::Bool),
-        RbxVariantType::Int32 => json_i32(value).map(RbxVariant::Int32),
-        RbxVariantType::Int64 => json_i64(value).map(RbxVariant::Int64),
-        RbxVariantType::Float32 => json_f32(value).map(RbxVariant::Float32),
-        RbxVariantType::Float64 => json_f64(value).map(RbxVariant::Float64),
+        RbxVariantType::Int32 => json_i32(typed_number(value)).map(RbxVariant::Int32),
+        RbxVariantType::Int64 => json_i64(typed_number(value)).map(RbxVariant::Int64),
+        RbxVariantType::Float32 => json_f32(typed_number(value)).map(RbxVariant::Float32),
+        RbxVariantType::Float64 => json_f64(typed_number(value)).map(RbxVariant::Float64),
         RbxVariantType::String => {
             json_string_or_wrapped(value, "String").map(|text| RbxVariant::String(text.to_string()))
         }
@@ -949,6 +949,21 @@ pub(crate) fn json_f64(value: &Value) -> Option<f64> {
         .as_f64()
         .filter(|value| value.is_finite())
         .or_else(|| nonfinite_float_from_json(value))
+}
+
+/// Model imports keep numeric types as `{"_type":"Float32","value":n}`;
+/// a typed descriptor already fixes the type, so only the number matters.
+fn typed_number(value: &Value) -> &Value {
+    value
+        .as_object()
+        .filter(|obj| {
+            matches!(
+                obj.get("_type").and_then(Value::as_str),
+                Some("Int32" | "Int64" | "Float32" | "Float64")
+            )
+        })
+        .and_then(|obj| obj.get("value"))
+        .unwrap_or(value)
 }
 
 fn json_f32(value: &Value) -> Option<f32> {
@@ -1619,4 +1634,27 @@ pub(crate) fn settings_root_indices(document: &SettingsBytecode) -> Vec<usize> {
         .enumerate()
         .filter_map(|(index, instance)| instance.parent_index.is_none().then_some(index))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typed_numbers_convert_with_a_descriptor() {
+        let database = rbx_reflection_database::get().unwrap();
+        let refs = BytecodeModelExportRefs::default();
+        let descriptor = rbx_property_descriptor(database, "Part", "Transparency");
+        let value = json!({"_type": "Float32", "value": 1.0});
+        assert_eq!(
+            json_to_rbx_property_variant(&value, descriptor, database, &refs),
+            Some(RbxVariant::Float32(1.0))
+        );
+        let descriptor = rbx_property_descriptor(database, "IntValue", "Value");
+        let value = json!({"_type": "Int64", "value": 7});
+        assert_eq!(
+            json_to_rbx_property_variant(&value, descriptor, database, &refs),
+            Some(RbxVariant::Int64(7))
+        );
+    }
 }
