@@ -2630,7 +2630,6 @@ fn primary_part_models_preserve_their_separate_serialized_pivot() {
         dom.root(),
         database,
         &refs,
-        false,
         Some(&filter),
     );
     assert!(!properties.contains_key("WorldPivotData"));

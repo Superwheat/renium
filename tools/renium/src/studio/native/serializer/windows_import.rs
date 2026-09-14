@@ -452,10 +452,6 @@ pub(crate) fn read_service_payload(
         measured == total,
         "Native timing phases do not cover the helper timeline"
     );
-    let _accounted_ms = total as f64 * 1000.0 / frequency as f64;
-    let _factory_ms = read_u64(&accounting, 96)? as f64 * 1000.0 / frequency as f64;
-    let _constructor_ms = read_u64(&accounting, 104)? as f64 * 1000.0 / frequency as f64;
-    for (_index, _batch) in replacement.batches.iter().enumerate() {}
     let mut ordinals = HashSet::with_capacity(count);
     let mut identities = HashSet::with_capacity(count);
     for row in created.chunks_exact(CREATED_ROW) {

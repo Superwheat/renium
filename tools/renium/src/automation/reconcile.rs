@@ -967,7 +967,7 @@ impl Coordinator {
             .context("Reconciliation state disappeared while starting Live Sync")?;
         let _selection = bound_context::select(context);
         let (studio_guard, studio_state) =
-            current_studio_change_guard_with_state(context, bridge, None, |_| Ok(()))?;
+            current_studio_change_guard_with_state(context, bridge, |_| Ok(()))?;
         if setup.runtime_replacement_unproven && setup.resolution_preference.is_none() {
             setup.mode = PairMode::Verify;
             setup.error = Some(
@@ -2275,16 +2275,9 @@ fn acknowledge_verified_push(
 fn current_studio_change_guard_with_state(
     context: &BoundContext,
     bridge: &BridgeServer,
-    native_attribute_services: Option<&[String]>,
     arm_native: impl FnOnce(&Value) -> Result<()>,
 ) -> Result<(StudioChangeGuard, Value)> {
-    current_studio_change_guard_verifying(
-        context,
-        bridge,
-        native_attribute_services,
-        None,
-        arm_native,
-    )
+    current_studio_change_guard_verifying(context, bridge, None, None, arm_native)
 }
 
 fn current_studio_change_guard_verifying(
@@ -2380,8 +2373,7 @@ fn current_studio_change_guard(
     context: &BoundContext,
     bridge: &BridgeServer,
 ) -> Result<StudioChangeGuard> {
-    current_studio_change_guard_with_state(context, bridge, None, |_| Ok(()))
-        .map(|(guard, _)| guard)
+    current_studio_change_guard_with_state(context, bridge, |_| Ok(())).map(|(guard, _)| guard)
 }
 
 fn studio_guard_matches_state(
@@ -2606,20 +2598,20 @@ fn push_project(
         None
     };
     #[cfg(any(windows, target_os = "macos"))]
-    if let Some(candidate) = verified_candidate.take_if(|candidate| candidate.files_unchanged) {
-        if verified_full_push_proof_matches(context, bridge, &candidate.cached.proof)? {
-            if let Some(runtime) = context.runtime_id.as_deref() {
-                bridge
-                    .verified_full_pushes
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .insert(runtime.to_string(), candidate.cached);
-            }
-            return Ok(Map::from_iter([
-                ("ok".into(), json!(true)),
-                ("unchanged".into(), json!(true)),
-            ]));
+    if let Some(candidate) = verified_candidate.take_if(|candidate| candidate.files_unchanged)
+        && verified_full_push_proof_matches(context, bridge, &candidate.cached.proof)?
+    {
+        if let Some(runtime) = context.runtime_id.as_deref() {
+            bridge
+                .verified_full_pushes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(runtime.to_string(), candidate.cached);
         }
+        return Ok(Map::from_iter([
+            ("ok".into(), json!(true)),
+            ("unchanged".into(), json!(true)),
+        ]));
     }
     #[cfg(any(windows, target_os = "macos"))]
     let cache_input = if replace && guard.is_none() {
@@ -5968,7 +5960,8 @@ fn expected_map_mismatch(
                     ))
                 || reconciliation_property_is_derived(name)
                 || crate::settings::equivalence::reconciliation_property_is_forced(
-                    name, expected_map,
+                    name,
+                    expected_map,
                 )
                 || crate::settings::equivalence::reconciliation_property_is_metadata(
                     name, expected,
@@ -7646,15 +7639,17 @@ mod tests {
         let before = Map::new();
         let desired = Map::from_iter([("InertiaMigrated".to_string(), json!(false))]);
         let observed = Map::from_iter([("InertiaMigrated".to_string(), json!(true))]);
-        assert_eq!(expected_map_mismatch(&desired, &observed, true, &part), None);
-        assert_eq!(changed_map_mismatch(&before, &desired, &observed, true, &part), None);
-
-        let label = SettingsBytecodeInstance::new(
-            "label".into(),
-            "Title".into(),
-            "TextLabel".into(),
-            None,
+        assert_eq!(
+            expected_map_mismatch(&desired, &observed, true, &part),
+            None
         );
+        assert_eq!(
+            changed_map_mismatch(&before, &desired, &observed, true, &part),
+            None
+        );
+
+        let label =
+            SettingsBytecodeInstance::new("label".into(), "Title".into(), "TextLabel".into(), None);
         let desired = Map::from_iter([
             ("TextScaled".to_string(), json!(true)),
             ("TextWrapped".to_string(), json!(false)),
@@ -7663,8 +7658,14 @@ mod tests {
             ("TextScaled".to_string(), json!(true)),
             ("TextWrapped".to_string(), json!(true)),
         ]);
-        assert_eq!(expected_map_mismatch(&desired, &observed, true, &label), None);
-        assert_eq!(changed_map_mismatch(&before, &desired, &observed, true, &label), None);
+        assert_eq!(
+            expected_map_mismatch(&desired, &observed, true, &label),
+            None
+        );
+        assert_eq!(
+            changed_map_mismatch(&before, &desired, &observed, true, &label),
+            None
+        );
         let unscaled = Map::from_iter([
             ("TextScaled".to_string(), json!(false)),
             ("TextWrapped".to_string(), json!(false)),
@@ -7830,9 +7831,9 @@ mod tests {
                 .unwrap();
                 assert_eq!(mismatches, expected_paths);
                 assert!(
-                    detail
-                        .as_deref()
-                        .is_some_and(|detail| detail.starts_with("Part0017.Anchored was not retained (")),
+                    detail.as_deref().is_some_and(
+                        |detail| detail.starts_with("Part0017.Anchored was not retained (")
+                    ),
                     "{detail:?}"
                 );
                 let mut malformed = observed.clone();

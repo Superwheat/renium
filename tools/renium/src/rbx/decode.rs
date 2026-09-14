@@ -713,7 +713,6 @@ pub(crate) fn rbx_instance_to_settings_records(
     instance: &rbx_dom_weak::Instance,
     database: &ReflectionDatabase<'_>,
     refs: &BytecodeModelImportRefs,
-    elide_defaults: bool,
     native_filter: Option<&NativePropertyFilter>,
 ) -> (Map<String, Value>, Map<String, Value>, Option<String>) {
     rbx_properties_to_settings_records(
@@ -722,7 +721,7 @@ pub(crate) fn rbx_instance_to_settings_records(
         database,
         refs,
         RbxSettingsConversionOptions {
-            elide_defaults,
+            elide_defaults: false,
             defaults_already_elided: false,
             native_properties_pre_filtered: false,
             native_filter,

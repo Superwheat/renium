@@ -1762,7 +1762,7 @@ pub(crate) fn import_rbx_model_into_document(
             .get_by_ref(referent)
             .ok_or_else(|| anyhow::anyhow!("Model contains a missing referent"))?;
         let (properties, attributes, source) =
-            rbx_instance_to_settings_records(rbx_instance, database, &import_refs, false, None);
+            rbx_instance_to_settings_records(rbx_instance, database, &import_refs, None);
         if let Some(instance) = document.instances.get_mut(new_index) {
             instance.properties = properties;
             instance.attributes = attributes;

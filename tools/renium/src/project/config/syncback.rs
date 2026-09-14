@@ -132,7 +132,7 @@ fn load_adapter_baseline(loaded: &LoadedProject) -> Result<(PathBuf, AdapterBase
     Ok((path, baseline))
 }
 
-pub(super) fn build_adapters(loaded: &LoadedProject, check: bool, emit: bool) -> Result<()> {
+pub(super) fn build_adapters(loaded: &LoadedProject, check: bool) -> Result<()> {
     let mut changed = Vec::new();
     let (baseline_path, mut baseline) = load_adapter_baseline(loaded)?;
     let mut transaction_paths = Vec::new();
@@ -412,9 +412,6 @@ pub(super) fn build_adapters(loaded: &LoadedProject, check: bool, emit: bool) ->
     if check && !changed.is_empty() {
         bail!("Generated adapter output is stale: {}", changed.join(", "));
     }
-    if !emit {
-        return Ok(());
-    }
     crate::app::output::emit_global_output(
         &json!({
             "ok": true,
@@ -618,21 +615,17 @@ fn collect_reverse_plan(
 pub fn syncback_project_projection(
     loaded: &LoadedProject,
     projection_root: &Path,
-    check: bool,
 ) -> Result<usize> {
     let mut planned_writes = BTreeMap::new();
     let mut planned_removals = BTreeSet::new();
     let changed = syncback_project_projection_into(
         loaded,
         projection_root,
-        check,
+        false,
         &mut planned_writes,
         &mut planned_removals,
     )?;
-    if check && changed > 0 {
-        bail!("{changed} projected source owner(s) are stale");
-    }
-    if !check && (!planned_writes.is_empty() || !planned_removals.is_empty()) {
+    if !planned_writes.is_empty() || !planned_removals.is_empty() {
         let removals = planned_removals
             .into_iter()
             .filter(|path| !planned_writes.contains_key(path))
@@ -2990,7 +2983,7 @@ pub(super) fn watch_adapters(loaded: &LoadedProject, interval_ms: u64) -> Result
     let project_path = loaded.path.clone();
     let mut current = load_project(Some(&project_path), None)?;
     validate_project(&current)?;
-    build_adapters(&current, false, true)?;
+    build_adapters(&current, false)?;
     let mut announced = false;
     loop {
         let inputs = adapter_watch_inputs(&current)?;
@@ -3033,7 +3026,7 @@ pub(super) fn watch_adapters(loaded: &LoadedProject, interval_ms: u64) -> Result
         }
         match load_project(Some(&project_path), None).and_then(|next| {
             validate_project(&next)?;
-            build_adapters(&next, false, true)?;
+            build_adapters(&next, false)?;
             Ok(next)
         }) {
             Ok(next) => current = next,

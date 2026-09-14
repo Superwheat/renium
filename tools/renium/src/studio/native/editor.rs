@@ -25,7 +25,6 @@ use crate::bytecode::edit::{insert_unique_rbx_path, instance_path_key};
 use crate::cli::PushEditorChangesArgs;
 #[cfg(any(windows, target_os = "macos", test))]
 use crate::editor::review::is_externally_managed_editor_property;
-use crate::editor::review::request_editor_push_review;
 #[cfg(any(windows, target_os = "macos"))]
 use crate::editor::review::{studio_pid_for_bridge, studio_title_for_bridge};
 use crate::editor::types::{
@@ -116,20 +115,9 @@ fn write_rbx_place_build(
 
 pub(crate) fn begin_editor_binary_export(
     bridge: &BridgeServer,
-    partitioned: bool,
-    service_order: Option<&[String]>,
     service_filter: Option<&[String]>,
-    metadata_only: bool,
 ) -> Result<EditorBinaryExport> {
-    begin_editor_binary_export_for_runtime(
-        bridge,
-        partitioned,
-        service_order,
-        service_filter,
-        metadata_only,
-        None,
-        true,
-    )
+    begin_editor_binary_export_for_runtime(bridge, false, None, service_filter, false, None, true)
 }
 
 fn begin_editor_binary_export_for_runtime(
@@ -848,7 +836,7 @@ impl Drop for EditorBinaryExportFinishGuard<'_> {
 
 #[cfg(any(windows, target_os = "macos"))]
 fn receive_editor_binary_export(bridge: &BridgeServer) -> Result<EditorBinaryExport> {
-    let mut export = begin_editor_binary_export(bridge, false, None, None, false)?;
+    let mut export = begin_editor_binary_export(bridge, None)?;
     let mut finish_guard = EditorBinaryExportFinishGuard {
         bridge,
         export_id: export.export_id.clone(),
@@ -3867,8 +3855,6 @@ pub(crate) fn send_editor_change_batches(
     bridge: &BridgeServer,
     changes: &EditorChangeSet,
     probe_events: bool,
-    review: bool,
-    auto_apply_review: bool,
     binary_import: Option<&EditorBinaryImport>,
     transaction_id: Option<&str>,
 ) -> Result<Map<String, Value>> {
@@ -3911,15 +3897,6 @@ pub(crate) fn send_editor_change_batches(
             )?;
             merge_editor_summary_checked(&mut summary, &result)?;
         }
-        summary.insert(
-            "noops".to_string(),
-            Value::Number(serde_json::Number::from(0)),
-        );
-        return Ok(summary);
-    }
-
-    if review && !auto_apply_review && !request_editor_push_review(bridge, changes)? {
-        summary.insert("skippedByReview".to_string(), Value::Bool(true));
         summary.insert(
             "noops".to_string(),
             Value::Number(serde_json::Number::from(0)),

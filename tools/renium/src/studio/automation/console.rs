@@ -101,7 +101,7 @@ fn follow_console_via_daemon(args: &PluginConsoleOutputArgs) -> Result<()> {
             args.clear && !connected,
             args.from_oldest || from_oldest,
         );
-        let result = match try_daemon_control_request(op::CONSOLE, None, parameters, false) {
+        let result = match try_daemon_control_request(op::CONSOLE, parameters) {
             Ok(Some(result)) => result,
             Ok(None) if connected => {
                 thread::sleep(console_follow_interval(args));

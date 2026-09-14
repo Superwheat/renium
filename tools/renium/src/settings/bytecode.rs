@@ -900,11 +900,11 @@ fn collect_settings_bytecode_chunk<'a>(
     for (offset, instance) in instances.iter().enumerate() {
         let instance_index = base_index + offset;
         if parse_numeric_debug_settings_id(&instance.settings_id).is_none() {
-            add_count(&mut out.string_counts, instance.settings_id.as_str(), 1);
+            add_count(&mut out.string_counts, instance.settings_id.as_str());
         }
-        add_count(&mut out.string_counts, instance.name.as_str(), 1);
-        add_count(&mut out.string_counts, instance.class_name.as_str(), 1);
-        add_count(&mut out.class_counts, instance.class_name.as_str(), 1);
+        add_count(&mut out.string_counts, instance.name.as_str());
+        add_count(&mut out.string_counts, instance.class_name.as_str());
+        add_count(&mut out.class_counts, instance.class_name.as_str());
 
         for (property_name, raw_value) in &instance.properties {
             let kind = binary_raw_value_kind(raw_value, lookup)?;
@@ -1799,8 +1799,8 @@ fn push_settings_binary_value<'a>(
     kind: u8,
     source: SettingsBinaryValueSource<'a>,
 ) -> Result<()> {
-    add_count(&mut out.string_counts, property_name, 1);
-    add_count(&mut out.property_counts, property_name, 1);
+    add_count(&mut out.string_counts, property_name);
+    add_count(&mut out.property_counts, property_name);
     collect_binary_source_strings(&source, lookup, &mut out.string_counts)?;
     out.property_groups
         .entry((property_name, kind))
@@ -1823,11 +1823,11 @@ fn collect_settings_binary_chunk<'a>(
     for (offset, record) in instances.iter().enumerate() {
         let instance_index = base_index + offset;
         if let SettingsBinaryId::Text(settings_id) = &record.settings_id {
-            add_count(&mut out.string_counts, settings_id.as_ref(), 1);
+            add_count(&mut out.string_counts, settings_id.as_ref());
         }
-        add_count(&mut out.string_counts, record.name, 1);
-        add_count(&mut out.string_counts, record.class_name, 1);
-        add_count(&mut out.class_counts, record.class_name, 1);
+        add_count(&mut out.string_counts, record.name);
+        add_count(&mut out.string_counts, record.class_name);
+        add_count(&mut out.class_counts, record.class_name);
 
         let instance = &state.instances[record.source_index];
         if let Some(native_properties) = state
@@ -2333,11 +2333,11 @@ fn settings_path_parts(
     output
 }
 
-fn add_count<'a>(counts: &mut SettingsStringCounts<'a>, text: &'a str, amount: u64) {
+fn add_count<'a>(counts: &mut SettingsStringCounts<'a>, text: &'a str) {
     if let Some(count) = counts.get_mut(text) {
-        *count += amount;
+        *count += 1;
     } else {
-        counts.insert(Cow::Borrowed(text), amount);
+        counts.insert(Cow::Borrowed(text), 1);
     }
 }
 
@@ -2451,7 +2451,7 @@ fn collect_binary_source_strings<'a>(
         }
         SettingsBinaryValueSource::Attributes(attributes) => {
             for (name, value) in *attributes {
-                add_count(out, name, 1);
+                add_count(out, name);
                 collect_attribute_value_strings(value, out)
                     .with_context(|| format!("Could not collect attribute {name}"))?;
             }
@@ -2506,7 +2506,7 @@ fn collect_native_value_strings<'a>(
     out: &mut SettingsStringCounts<'a>,
 ) {
     if let NativeSettingsValue::String(value) | NativeSettingsValue::Enum(value) = value {
-        add_count(out, value, 1);
+        add_count(out, value);
     }
 }
 
@@ -3093,7 +3093,7 @@ fn collect_raw_value_strings<'a>(
         0 | 1 | 2 | 3 | 4 | 5 | 9 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 20 | 21 => {}
         6 | 19 => {
             if let Some(text) = raw_string_payload(value) {
-                add_count(out, text, 1);
+                add_count(out, text);
             }
         }
         7 => {
@@ -3126,13 +3126,13 @@ fn collect_raw_object_strings<'a>(
     if let Some(type_name) = obj.get("_type").and_then(Value::as_str) {
         match type_name {
             "BrickColor" => {
-                add_count(out, "BrickColor", 1);
+                add_count(out, "BrickColor");
                 collect_raw_value_strings(obj.get("number").unwrap_or(&Value::Null), lookup, out)?;
                 return Ok(());
             }
             "ColorSequence" => {
                 for key in ["ColorSequence", "keypoints", "time", "color"] {
-                    add_count(out, key, 1);
+                    add_count(out, key);
                 }
                 for keypoint in sequence_keypoint_values(obj)
                     .iter()
@@ -3148,7 +3148,7 @@ fn collect_raw_object_strings<'a>(
             }
             "NumberSequence" => {
                 for key in ["NumberSequence", "keypoints", "time", "value", "envelope"] {
-                    add_count(out, key, 1);
+                    add_count(out, key);
                 }
                 for keypoint in sequence_keypoint_values(obj)
                     .iter()
@@ -3172,7 +3172,7 @@ fn collect_raw_object_strings<'a>(
         }
     }
     for (key, child) in obj {
-        add_count(out, key, 1);
+        add_count(out, key);
         collect_raw_value_strings(child, lookup, out)?;
     }
     Ok(())
@@ -3180,20 +3180,20 @@ fn collect_raw_object_strings<'a>(
 
 fn collect_font_strings<'a>(obj: &'a Map<String, Value>, out: &mut SettingsStringCounts<'a>) {
     if let Some(family) = obj.get("family").and_then(Value::as_str) {
-        add_count(out, "family", 1);
-        add_count(out, family, 1);
+        add_count(out, "family");
+        add_count(out, family);
     }
     if let Some(weight) = obj.get("weight").and_then(Value::as_str) {
-        add_count(out, "weight", 1);
-        add_count(out, split_enum_tail(weight), 1);
+        add_count(out, "weight");
+        add_count(out, split_enum_tail(weight));
     }
     if let Some(style) = obj.get("style").and_then(Value::as_str) {
-        add_count(out, "style", 1);
-        add_count(out, split_enum_tail(style), 1);
+        add_count(out, "style");
+        add_count(out, split_enum_tail(style));
     }
     if let Some(cached_face_id) = obj.get("cachedFaceId").and_then(Value::as_str) {
-        add_count(out, "cachedFaceId", 1);
-        add_count(out, cached_face_id, 1);
+        add_count(out, "cachedFaceId");
+        add_count(out, cached_face_id);
     }
 }
 
@@ -3204,13 +3204,13 @@ fn collect_ref_strings<'a>(ref_value: &'a Map<String, Value>, out: &mut Settings
     }
     for key in ["settingsId", "instanceId", "debugId", "path"] {
         if let Some(text) = ref_value.get(key).and_then(Value::as_str) {
-            add_count(out, text, 1);
+            add_count(out, text);
         }
     }
     if let Some(path_segments) = ref_value.get("pathSegments").and_then(Value::as_array) {
         for segment in path_segments {
             if let Some(text) = segment.as_str() {
-                add_count(out, text, 1);
+                add_count(out, text);
             }
         }
     }
@@ -3669,13 +3669,13 @@ fn collect_attribute_value_strings<'a>(
     if let Some(obj) = value.as_object()
         && let Some(key) = attribute_type_key(obj)
     {
-        add_count(out, key, 1);
+        add_count(out, key);
         let lookup = SettingsBinaryInstanceLookup::default();
         let child = attribute_payload_child(obj, key, value);
         if key == "EnumItem" {
             if let Some((enum_type, name)) = enum_item_attribute_fields(child) {
                 for text in ["enumType", enum_type, "name", name] {
-                    add_count(out, text, 1);
+                    add_count(out, text);
                 }
             } else {
                 collect_raw_value_strings(child, &lookup, out)?;
@@ -3686,12 +3686,12 @@ fn collect_attribute_value_strings<'a>(
         return Ok(());
     }
     if value.is_boolean() {
-        add_count(out, "Bool", 1);
+        add_count(out, "Bool");
     } else if value.is_number() {
-        add_count(out, "Float64", 1);
+        add_count(out, "Float64");
     } else if let Some(text) = value.as_str() {
-        add_count(out, "String", 1);
-        add_count(out, text, 1);
+        add_count(out, "String");
+        add_count(out, text);
     } else {
         bail!("Unsupported attribute binary value");
     }
