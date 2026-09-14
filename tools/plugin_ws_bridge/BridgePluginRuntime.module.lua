@@ -4249,20 +4249,6 @@ function BridgePluginRuntime.start(context)
 		return changeState
 	end
 
-	Config.bridgeMethodHandlers.cancelStudioChangeWait = function()
-		Config.studioChanges.cancelWait()
-		return { ok = true }
-	end
-
-	Config.bridgeMethodHandlers.setConflictResolution = function(p)
-		if type(p.value) ~= "string" then
-			error("setConflictResolution requires a string value")
-		end
-		local conflictResolution = Config.studioChanges.setConflictResolution(p.value)
-		SettingsModule.saveConflictResolution(plugin, SETTINGS_PREFIX, conflictResolution)
-		return { ok = true, conflictResolution = conflictResolution }
-	end
-
 	Config.bridgeMethodHandlers.getConsoleOutput = RuntimeApi.getConsoleOutput
 	Config.bridgeMethodHandlers.getGuiBounds = RuntimeApi.getGuiBounds
 	Config.bridgeMethodHandlers.getGuiInventory = RuntimeApi.getGuiInventory
@@ -4304,9 +4290,6 @@ function BridgePluginRuntime.start(context)
 	end
 	Config.bridgeMethodHandlers.captureViewportProbe = RuntimeApi.captureViewportProbe
 	Config.bridgeMethodHandlers.executeLuau = RuntimeApi.executeLuau
-	Config.bridgeMethodHandlers.cancelLuauExecution = function(p, sessionGeneration)
-		return RuntimeApi.cancelLuauExecution(p, sessionGeneration)
-	end
 	Config.bridgeMethodHandlers.startStopPlay = RuntimeApi.startStopPlay
 	Config.bridgeMethodHandlers.getStudioState = RuntimeApi.studioState
 	Config.bridgeMethodHandlers.getCreatorContext = Config.creatorApi.creatorContext
@@ -4420,7 +4403,6 @@ function BridgePluginRuntime.start(context)
 		finishEditorBinaryImport = true,
 		beginEditorBinaryExport = true,
 		finishEditorBinaryExport = true,
-		setConflictResolution = true,
 		deviceSimulator = true,
 		networkSimulation = true,
 		captureViewportProbe = true,
@@ -4439,7 +4421,6 @@ function BridgePluginRuntime.start(context)
 		performance = true,
 		cancelEditorBinaryImport = true,
 		cancelEditorReconcile = true,
-		cancelLuauExecution = true,
 		awaitEditorBinaryExport = true,
 		readEditorBinaryExport = true,
 		readEditorBinaryExportBatch = true,
@@ -4475,7 +4456,6 @@ function BridgePluginRuntime.start(context)
 		finishEditorBinaryExport = true,
 		getStudioChangeState = true,
 		sampleStudioProperty = true,
-		setConflictResolution = true,
 		getConsoleOutput = true,
 		getGuiBounds = true,
 		getMouseLocation = true,
