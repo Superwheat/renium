@@ -2189,8 +2189,7 @@ fn pair_configuration(
         .unwrap_or_default();
     let raw_mode = runtime_settings
         .get("initialSyncPriority")
-        .and_then(Value::as_str)
-        .or_else(|| request.get("initialSyncMode").and_then(Value::as_str));
+        .and_then(Value::as_str);
     let resolution = request
         .get("resolveConflictPreference")
         .and_then(Value::as_str);
@@ -2200,7 +2199,6 @@ fn pair_configuration(
     let raw_preference = runtime_settings
         .get("initialConflictPreference")
         .and_then(Value::as_str)
-        .or_else(|| (raw_mode == Some("editor")).then_some("editor"))
         .or_else(|| {
             request
                 .get("initialConflictPreference")

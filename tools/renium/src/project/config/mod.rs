@@ -2580,10 +2580,7 @@ fn validate_merged_config(value: &Value) -> Result<()> {
                 "liveSync.initialSyncPriority" => require_kind(
                     &path,
                     "reconcile or verify",
-                    matches!(
-                        value.as_str(),
-                        Some("reconcile" | "verify" | "studio" | "editor" | "none")
-                    ),
+                    matches!(value.as_str(), Some("reconcile" | "verify")),
                 )?,
                 "liveSync.initialConflictPreference" => require_kind(
                     &path,
