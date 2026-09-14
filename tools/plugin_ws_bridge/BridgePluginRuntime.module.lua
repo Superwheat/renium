@@ -4227,7 +4227,6 @@ function BridgePluginRuntime.start(context)
 			error("Invalid native export overlay cache key")
 		end
 		local state = editorSync.getBinaryExportState(overlayId, serviceName)
-		local started = os.clock()
 		local result = Config.getInstanceBatchCompactChunk(
 			serviceName,
 			p.startIndex,
@@ -4245,7 +4244,6 @@ function BridgePluginRuntime.start(context)
 			overlayCacheKey
 		)
 		editorSync.validateBinaryExportState(overlayId, serviceName)
-		result.pluginServerMs = math.max(0, (os.clock() - started) * 1000 - (result.pluginEncodeMs or 0))
 		return result
 	end
 
