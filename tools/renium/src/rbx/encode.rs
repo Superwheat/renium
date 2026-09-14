@@ -908,6 +908,8 @@ pub(crate) fn json_to_rbx_attribute_variant(
     database: &ReflectionDatabase<'_>,
     refs: &BytecodeModelExportRefs,
 ) -> Option<RbxVariant> {
+    let canonical = crate::settings::bytecode::canonical_attribute_value(value);
+    let value = canonical.as_ref().unwrap_or(value);
     let variant = json_to_rbx_inferred_variant(value, database, refs)?;
     if matches!(
         variant,

@@ -961,9 +961,15 @@ fn normalized_editor_attributes(
         .attributes
         .iter()
         .map(|(name, value)| {
+            let canonical = crate::settings::bytecode::canonical_attribute_value(value);
             (
                 name.clone(),
-                normalize_editor_bridge_value(value, None, paths_by_index, settings_ids_by_index),
+                normalize_editor_bridge_value(
+                    canonical.as_ref().unwrap_or(value),
+                    None,
+                    paths_by_index,
+                    settings_ids_by_index,
+                ),
             )
         })
         .collect()
