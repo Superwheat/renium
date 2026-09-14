@@ -25,6 +25,7 @@
 #include <mach/vm_region.h>
 #include <mach/vm_statistics.h>
 #include <mach/vm_param.h>
+#include <libkern/OSCacheControl.h>
 #include <memory>
 #include <mutex>
 #include <pthread.h>
@@ -3247,6 +3248,73 @@ static bool ResolveImageData(
     return false;
 }
 
+static bool ResolveImageText(
+    const mach_header_64* header,
+    std::intptr_t slide,
+    const Request& request,
+    std::uint64_t rva,
+    std::uintptr_t& address,
+    std::string& error)
+{
+    const segment_command_64* text = nullptr;
+    const uuid_command* uuid = nullptr;
+    auto command = reinterpret_cast<const unsigned char*>(header) + sizeof(*header);
+    for (std::uint32_t index = 0; index < header->ncmds; ++index)
+    {
+        const auto load = reinterpret_cast<const load_command*>(command);
+        if (load->cmdsize < sizeof(load_command))
+        {
+            error = "Studio's loaded image commands are invalid";
+            return false;
+        }
+        if (load->cmd == LC_SEGMENT_64)
+        {
+            const auto segment = reinterpret_cast<const segment_command_64*>(load);
+            if (std::strcmp(segment->segname, "__TEXT") == 0)
+                text = segment;
+        }
+        else if (load->cmd == LC_UUID)
+            uuid = reinterpret_cast<const uuid_command*>(load);
+        command += load->cmdsize;
+    }
+    if (!text || !uuid || !rva || rva % 4 != 0 || rva + 4 > text->vmsize ||
+        std::memcmp(uuid->uuid, request.imageUuid, sizeof(request.imageUuid)) != 0)
+    {
+        error = "Studio's code patch does not match its loaded image";
+        return false;
+    }
+    address = static_cast<std::uintptr_t>(text->vmaddr + slide) + rva;
+    return true;
+}
+
+// Studio is re-signed with executable page protection disabled, so a private
+// copy of the code page can take the new instruction and run again.
+static bool PatchInstruction(std::uintptr_t address, std::uint32_t value, std::string& error)
+{
+    const auto page = address & ~static_cast<std::uintptr_t>(vm_page_size - 1);
+    auto result = mach_vm_protect(
+        mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (result != KERN_SUCCESS)
+    {
+        error = "could not make Studio code writable: " + std::to_string(result);
+        return false;
+    }
+    *reinterpret_cast<volatile std::uint32_t*>(address) = value;
+    result = mach_vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+    if (result != KERN_SUCCESS)
+    {
+        error = "could not restore Studio code protection: " + std::to_string(result);
+        return false;
+    }
+    sys_icache_invalidate(reinterpret_cast<void*>(address), sizeof(value));
+    if (*reinterpret_cast<volatile std::uint32_t*>(address) != value)
+    {
+        error = "Studio code patch was not retained";
+        return false;
+    }
+    return true;
+}
+
 // True transfers this socket to a bounded task; the accept loop retains all
 // other sockets. Waiting for the UI/DataModel queue must not block raw reads.
 static bool HandleClient(int client)
@@ -3255,8 +3323,8 @@ static bool HandleClient(int client)
     Response response{Magic, 7, 0, 0, {}};
     if (!ReadExact(client, &request, sizeof(request)) || request.magic != Magic ||
         (request.command != 1 && request.command != 2 && request.command != 3 &&
-            request.command != 4 && request.command != 5) ||
-        (request.command != 4 && request.command != 5 && request.pathLength == 0) ||
+            request.command != 4 && request.command != 5 && request.command != 6) ||
+        (request.command != 4 && request.command != 5 && request.command != 6 && request.pathLength == 0) ||
         request.pathLength >= (request.command == 3 ? 128u * 1024 * 1024 + 66216u : PATH_MAX) || request.titleLength >= PATH_MAX)
     {
         SetError(response, "invalid serializer request");
@@ -3279,6 +3347,41 @@ static bool HandleClient(int client)
             response.status = 0;
         else
             SetError(response, "could not arm background launch");
+        WriteExact(client, &response, sizeof(response));
+        return false;
+    }
+    if (request.command == 6)
+    {
+        std::intptr_t slide = 0;
+        const auto header = MainStudioImage(slide);
+        std::string error;
+        std::uintptr_t address = 0;
+        const auto expected = static_cast<std::uint32_t>(request.factoryRva);
+        if (request.pathLength != 0 || request.titleLength != 0 || request.reserved != 0 ||
+            request.factoryRva > 0xffffffffu)
+            SetError(response, "invalid code patch request");
+        else if (!header ||
+            !ResolveImageText(header, slide, request, request.executeRva, address, error))
+            SetError(response, error);
+        else
+        {
+            const std::uint32_t nop = 0xd503201fu;
+            const auto current = *reinterpret_cast<volatile std::uint32_t*>(address);
+            if (current == nop)
+            {
+                response.outputSize = 1;
+                response.status = 0;
+            }
+            else if (current != expected)
+                SetError(response, "Studio code changed before its patch");
+            else if (!PatchInstruction(address, nop, error))
+                SetError(response, error);
+            else
+            {
+                response.outputSize = 0;
+                response.status = 0;
+            }
+        }
         WriteExact(client, &response, sizeof(response));
         return false;
     }

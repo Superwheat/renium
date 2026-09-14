@@ -707,6 +707,7 @@ type NativeContextPrepare = dyn Fn(u32, &str) -> Result<()> + Send + Sync;
 #[cfg(any(windows, target_os = "macos"))]
 struct NativeConnectionPreparation {
     patch_notices: Box<dyn Fn(u32) -> Result<()> + Send + Sync>,
+    keep_selection: Box<dyn Fn(u32) -> Result<()> + Send + Sync>,
     pending: Mutex<HashSet<String>>,
     prepare: Box<NativeContextPrepare>,
 }
@@ -1135,6 +1136,9 @@ impl BridgeServer {
                 patch_notices: Box::new(
                     crate::studio::native::serializer::suppress_package_notices,
                 ),
+                keep_selection: Box::new(
+                    crate::studio::native::serializer::keep_selection_across_undo,
+                ),
                 pending: Default::default(),
                 prepare: Box::new(|pid, place_name| {
                     let title = crate::studio::native::serializer::target_name(pid, place_name)?;
@@ -1345,6 +1349,18 @@ impl BridgeServer {
                                             if cfg!(windows) {
                                                 return;
                                             }
+                                        }
+                                        // Undo keeps the user's selection; a failure only
+                                        // leaves Studio's own behaviour in place.
+                                        if let Some(pid) = socket.studio_pid
+                                            && let Err(error) = (preparation.keep_selection)(pid)
+                                        {
+                                            crate::app::output::log_global(
+                                                4,
+                                                format_args!(
+                                                    "[renium] Studio undo selection patch failed: {error:#}"
+                                                ),
+                                            );
                                         }
                                     }
                                     let mut guard = channel

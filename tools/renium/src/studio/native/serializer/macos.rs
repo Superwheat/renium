@@ -19,6 +19,9 @@ use crate::system::files::{atomic_write_file, sha256_hex};
 
 #[path = "macos_properties.rs"]
 mod properties;
+#[path = "macos_undo_selection.rs"]
+mod undo_selection;
+pub(crate) use undo_selection::keep_selection_across_undo;
 #[cfg(target_arch = "aarch64")]
 pub(crate) use properties::capture_identities;
 pub(crate) use properties::{
@@ -1298,7 +1301,7 @@ pub fn patched_studio_path() -> Result<PathBuf> {
     source_studio_path()
 }
 
-const PATCH_FORMAT: u32 = 2;
+const PATCH_FORMAT: u32 = 3;
 const PATCH_MARKER_NAME: &str = "ReniumStudioPatch.version";
 const PATCH_HELPER_NAME: &str = "ReniumStudioHelper.dylib";
 
@@ -1766,13 +1769,15 @@ fn install_studio_patch(studio: &Path, state: &StudioPatchState) -> Result<()> {
     write_patch_state(&studio_patch_journal()?, state)?;
     let entitlements = root.join("entitlements.plist");
     let result = (|| -> Result<()> {
-        let entitlement_text = add_entitlement(
-            add_entitlement(
-                extracted_entitlements(&studio_original_backup()?)?,
-                "com.apple.security.cs.allow-dyld-environment-variables",
-            )?,
+        let mut entitlement_text = extracted_entitlements(&studio_original_backup()?)?;
+        for key in [
+            "com.apple.security.cs.allow-dyld-environment-variables",
             "com.apple.security.cs.disable-library-validation",
-        )?;
+            "com.apple.security.cs.allow-unsigned-executable-memory",
+            "com.apple.security.cs.disable-executable-page-protection",
+        ] {
+            entitlement_text = add_entitlement(entitlement_text, key)?;
+        }
         atomic_write_file(&entitlements, entitlement_text.as_bytes())?;
         fs::rename(studio_launcher(studio), studio_patched_engine(studio))
             .with_context(|| format!("Could not prepare {} for Renium", studio.display()))?;

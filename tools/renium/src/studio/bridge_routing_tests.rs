@@ -550,6 +550,7 @@ fn native_connection_preparation_does_not_block_registration_or_other_places() {
             patch_count.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }),
+        keep_selection: Box::new(|_| Ok(())),
         pending: Default::default(),
         prepare: Box::new(move |pid, title| {
             assert_eq!(pid, std::process::id());
@@ -1617,6 +1618,7 @@ fn edit_status_response_filters_a_reconnected_daemons_previously_captured_invent
 fn failed_package_notice_patch_does_not_admit_unprotected_editor_commands() {
     let preparation = Arc::new(NativeConnectionPreparation {
         patch_notices: Box::new(|_| bail!("fixture unsupported package notice layout")),
+        keep_selection: Box::new(|_| Ok(())),
         pending: Default::default(),
         prepare: Box::new(|_, _| panic!("unprotected connection must not reach warmup")),
     });
