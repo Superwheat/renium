@@ -2247,7 +2247,7 @@ fn write_service_settings_file(
             preservation_started,
         );
         let state_to_write = preserved_state.as_ref().unwrap_or(state);
-        let observed = encode_service_settings_binary(&settings_path, state_to_write)?;
+        let observed = encode_service_settings_binary(state_to_write)?;
         let alignment_started = Instant::now();
         let aligned = match fs::read(&settings_path) {
             Ok(reference) => match align_settings_bytes_to_reference(&reference, &observed)
@@ -2536,7 +2536,7 @@ pub(crate) fn service_projection_in_memory(
     let output = SourceOutput::Memory(Mutex::new(BTreeMap::new()));
     output.directory(&service_dir)?;
     let (settings, sources) = rayon::join(
-        || encode_service_settings_binary(&settings_path, state),
+        || encode_service_settings_binary(state),
         || {
             let visited = (0..state.instances.len())
                 .map(|_| AtomicBool::new(false))
