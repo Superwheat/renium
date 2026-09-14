@@ -182,18 +182,31 @@ pub(crate) fn remove_instances_at_indices(
     }
 
     let mut remove_set = target_indices.iter().copied().collect::<HashSet<_>>();
-    let mut stack = target_indices.to_vec();
-    while let Some(parent_index) = stack.pop() {
-        for child_index in children_by_parent
-            .get(parent_index)
-            .map_or(&[][..], Vec::as_slice)
-        {
-            if !recursive {
-                bail!("Instance has descendants; pass recursive removal");
+    if recursive {
+        let mut stack = target_indices.to_vec();
+        while let Some(parent_index) = stack.pop() {
+            for child_index in children_by_parent
+                .get(parent_index)
+                .map_or(&[][..], Vec::as_slice)
+            {
+                if remove_set.insert(*child_index) {
+                    stack.push(*child_index);
+                }
             }
-            if remove_set.insert(*child_index) {
-                stack.push(*child_index);
+        }
+    } else {
+        // Kept descendants move up to the nearest ancestor that survives.
+        for index in 0..document.instances.len() {
+            if remove_set.contains(&index) {
+                continue;
             }
+            let mut parent = document.instances[index].parent_index;
+            while let Some(parent_index) = parent
+                && remove_set.contains(&parent_index)
+            {
+                parent = document.instances[parent_index].parent_index;
+            }
+            document.instances[index].parent_index = parent;
         }
     }
 
@@ -790,7 +803,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_instance_non_recursive_bails_without_mutating_document() {
+    fn remove_instance_non_recursive_keeps_descendants() {
         let mut document = sample_document();
         add_instance(
             &mut document,
@@ -802,13 +815,24 @@ mod tests {
             ),
         )
         .unwrap();
-        let before = document.instances.clone();
+        let part_parent = document.instances[1].parent_index;
+        let count = document.instances.len();
 
-        let err = remove_instance(&mut document, InstanceSelector::SettingsId("part"), false)
-            .unwrap_err();
+        remove_instance(&mut document, InstanceSelector::SettingsId("part"), false).unwrap();
 
-        assert!(err.to_string().contains("Instance has descendants"));
-        assert_eq!(document.instances, before);
+        assert_eq!(document.instances.len(), count - 1);
+        assert!(
+            document
+                .instances
+                .iter()
+                .all(|instance| instance.settings_id != "part")
+        );
+        let grandchild = document
+            .instances
+            .iter()
+            .find(|instance| instance.settings_id == "grandchild")
+            .unwrap();
+        assert_eq!(grandchild.parent_index, part_parent);
     }
 
     #[test]

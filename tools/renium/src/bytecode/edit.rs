@@ -32,6 +32,32 @@ use crate::settings::instance::{self as instance_api, AddInstanceSpec};
 use crate::settings::tree::settings_children_by_parent;
 use crate::system::files::{ensure_existing_ancestor_inside, exact_path_key, path_key};
 
+/// `-p NAME=JSON` names must be real properties of the class, stored under
+/// their canonical spelling, or every later consumer misses them.
+fn canonical_new_instance_properties(
+    class_name: &str,
+    properties: Map<String, Value>,
+) -> Result<Map<String, Value>> {
+    let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
+    if !database.classes.contains_key(class_name) {
+        return Ok(properties);
+    }
+    let mut out = Map::new();
+    for (name, value) in properties {
+        if name.eq_ignore_ascii_case("Source") {
+            out.insert("Source".to_string(), value);
+            continue;
+        }
+        let Some(logical) =
+            crate::rbx::encode::rbx_logical_property_name(database, class_name, &name)
+        else {
+            bail!("Property {name} does not exist on {class_name}; use -a for an attribute");
+        };
+        out.insert(logical.to_string(), value);
+    }
+    Ok(out)
+}
+
 pub(crate) fn bytecode_add_instance(args: BytecodeAddInstanceArgs) -> Result<()> {
     let (settings_file, service_hint) = resolve_bytecode_cli_settings_file(
         args.input.settings_file.as_deref(),
@@ -58,7 +84,10 @@ pub(crate) fn bytecode_add_instance(args: BytecodeAddInstanceArgs) -> Result<()>
     if class_name == "PackageLink" {
         bail!("PackageLink instances can only be created by Roblox package workflows");
     }
-    let mut properties = parse_property_assignments(&args.properties)?;
+    let mut properties = canonical_new_instance_properties(
+        &class_name,
+        parse_property_assignments(&args.properties)?,
+    )?;
     let source = if is_lua_source_class(&class_name) {
         match properties.get("Source") {
             Some(Value::String(source)) => source.clone(),
@@ -184,9 +213,7 @@ pub(crate) fn bytecode_clone_instance(args: BytecodeCloneInstanceArgs) -> Result
         bail!("Cannot copy an instance into itself or one of its descendants");
     }
 
-    let service_dir = settings_file
-        .parent()
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    let service_dir = crate::project::storage::source_directory(&settings_file);
     let source_paths_before = build_editor_source_paths_by_index(&document, &service, &service_dir);
     let (path_segments_before, path_ordinals_before) =
         build_editor_instance_path_parts(&document, &service);
