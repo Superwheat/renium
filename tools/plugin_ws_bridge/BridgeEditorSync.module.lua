@@ -4706,6 +4706,16 @@ function NativeSerialization.snapshotMarker(serviceName: string, service: Instan
 	return marker
 end
 
+function NativeSerialization.appendServiceJob(session: { [string]: any }, service: string, roots: { Instance })
+	NativeSerialization.appendJob(
+		session,
+		service,
+		{ service },
+		roots,
+		NativeSerialization.nonArchivableInstances(session, { service })
+	)
+end
+
 function NativeSerialization.appendGroups(
 	session: { [string]: any },
 	groups: { any },
@@ -4713,14 +4723,7 @@ function NativeSerialization.appendGroups(
 )
 	if #groups == 1 then
 		local group = groups[1]
-		local roots = rootsByService[group.service]
-		NativeSerialization.appendJob(
-			session,
-			group.service,
-			{ group.service },
-			roots,
-			NativeSerialization.nonArchivableInstances(session, { group.service })
-		)
+		NativeSerialization.appendServiceJob(session, group.service, rootsByService[group.service])
 		return
 	end
 
@@ -4773,14 +4776,7 @@ function NativeSerialization.finishSchedule(
 			pendingInstanceCount += group.instanceCount
 		else
 			flushPendingGroups()
-			local roots = rootsByService[group.service]
-			NativeSerialization.appendJob(
-				session,
-				group.service,
-				{ group.service },
-				roots,
-				NativeSerialization.nonArchivableInstances(session, { group.service })
-			)
+			NativeSerialization.appendServiceJob(session, group.service, rootsByService[group.service])
 		end
 	end
 	flushPendingGroups()
@@ -4931,6 +4927,21 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		return table.unpack(results, 2, results.n)
 	end
 
+	local function transactionOutcomeOrNotFound(transactionId: string): { [string]: any }
+		local outcome = transactionOutcomes.get(transactionId)
+		if outcome ~= nil then
+			return outcome
+		end
+		return {
+			ok = true,
+			found = false,
+			transactionId = transactionId,
+			state = "notFound",
+			committed = false,
+			rolledBack = false,
+		}
+	end
+
 	local function assertTransactionLease(session: { [string]: any })
 		local leaseId = currentRequestLeaseId()
 		if session.leaseId ~= nil and session.leaseId ~= leaseId then
@@ -5053,18 +5064,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				terrainBaseline = session.terrainBaseline,
 			}
 		end
-		local outcome = transactionOutcomes.get(transactionId)
-		if outcome ~= nil then
-			return outcome
-		end
-		return {
-			ok = true,
-			found = false,
-			transactionId = transactionId,
-			state = "notFound",
-			committed = false,
-			rolledBack = false,
-		}
+		return transactionOutcomeOrNotFound(transactionId)
 	end
 
 	function api.cancelRequestLease(leaseId: string): { [string]: any }
@@ -6173,18 +6173,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local transactionId = tostring(params.transactionId or "")
 		local session = editorTransactions[transactionId]
 		if type(session) ~= "table" then
-			local outcome = transactionOutcomes.get(transactionId)
-			if outcome ~= nil then
-				return outcome
-			end
-			return {
-				ok = true,
-				found = false,
-				transactionId = transactionId,
-				state = "notFound",
-				committed = false,
-				rolledBack = false,
-			}
+			return transactionOutcomeOrNotFound(transactionId)
 		end
 		assertTransactionLease(session)
 		local operation = beginTrackedOperation("editorRollback")
@@ -6414,13 +6403,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 						group.rootProperties = values
 					end
 					if partitioned and serviceIndex <= serializerWorkerCount then
-						NativeSerialization.appendJob(
-							session,
-							serviceName,
-							{ serviceName },
-							rootsByService[serviceName],
-							NativeSerialization.nonArchivableInstances(session, { serviceName })
-						)
+						NativeSerialization.appendServiceJob(session, serviceName, rootsByService[serviceName])
 					end
 				end
 				if nativeCapture then
@@ -8289,22 +8272,22 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			verified = 0,
 		}
 		local touchedServices = {}
+		local aborted = false
+		local function runStep(step, ...): boolean
+			local ok, err = pcall(runWithSessionOwnership, operationGeneration, assertReconcileActive, step, ...)
+			if not ok then
+				stats.ok = false
+				stats.errors += 1
+				stats.error = tostring(err)
+				aborted = true
+			end
+			return ok
+		end
 
 		local instanceChanges = params.instanceChanges
-		local aborted = false
 		if type(instanceChanges) == "table" then
 			for _, change in ipairs(instanceChanges) do
-				local ok, err = pcall(
-					runWithSessionOwnership,
-					operationGeneration,
-					assertReconcileActive,
-					applyInstanceChange,
-					change,
-					ctx,
-					stats,
-					touchedServices
-				)
-				if not ok then
+				if not runStep(applyInstanceChange, change, ctx, stats, touchedServices) then
 					if type(change) == "table" then
 						local mode = tostring(change.mode or "")
 						if
@@ -8321,10 +8304,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 							end
 						end
 					end
-					stats.ok = false
-					stats.errors += 1
-					stats.error = tostring(err)
-					aborted = true
 					break
 				end
 			end
@@ -8333,41 +8312,13 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local sourceChanges = params.sourceChanges
 		if not aborted and type(sourceChanges) == "table" then
 			for _, change in ipairs(sourceChanges) do
-				local ok, err = pcall(
-					runWithSessionOwnership,
-					operationGeneration,
-					assertReconcileActive,
-					applySourceChange,
-					change,
-					ctx,
-					stats,
-					touchedServices
-				)
-				if not ok then
-					stats.ok = false
-					stats.errors += 1
-					stats.error = tostring(err)
-					aborted = true
+				if not runStep(applySourceChange, change, ctx, stats, touchedServices) then
 					break
 				end
 			end
 		end
 		if not aborted then
-			local ok, err = pcall(
-				runWithSessionOwnership,
-				operationGeneration,
-				assertReconcileActive,
-				retargetReplacementReferences,
-				selectionReplacements,
-				ctx,
-				stats
-			)
-			if not ok then
-				stats.ok = false
-				stats.errors += 1
-				stats.error = tostring(err)
-				aborted = true
-			end
+			runStep(retargetReplacementReferences, selectionReplacements, ctx, stats)
 		end
 		if not aborted and outerTransaction ~= nil then
 			for original, replacement in pairs(selectionReplacements) do
@@ -8380,21 +8331,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			if not aborted then
 				local sliceStarted = os.clock()
 				for _, change in ipairs(propertyChanges) do
-					local ok, err = pcall(
-						runWithSessionOwnership,
-						operationGeneration,
-						assertReconcileActive,
-						applyPropertyChange,
-						change,
-						ctx,
-						stats,
-						touchedServices
-					)
-					if not ok then
-						stats.ok = false
-						stats.errors += 1
-						stats.error = tostring(err)
-						aborted = true
+					if not runStep(applyPropertyChange, change, ctx, stats, touchedServices) then
 						break
 					end
 					if os.clock() - sliceStarted >= 0.008 then

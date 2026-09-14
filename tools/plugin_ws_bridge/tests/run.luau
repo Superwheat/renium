@@ -232,6 +232,9 @@ do
 					session.serializationScheduleReady = true
 				end,
 			}
+			native.appendServiceJob = function(session, service, roots)
+				native.appendJob(session, service, { service }, roots, native.nonArchivableInstances(session, { service }))
+			end
 			luau.load(editorSyncSource:sub(first, last - 1), { environment = {
 				api = api, ctx = ctx, binaryExports = exports, NativeSerialization = native,
 				pruneExpiredSessions = function() end, armSessionExpiry = function() end,
