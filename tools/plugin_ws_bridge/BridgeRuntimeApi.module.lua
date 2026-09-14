@@ -290,6 +290,23 @@ local function serializeApiValue(value, depth, seen)
 			return out
 		end
 
+		local stringKeys: number? = 0
+		for key in pairs(value) do
+			if type(key) ~= "string" or key == "_type" then
+				stringKeys = nil
+				break
+			end
+			stringKeys += 1
+		end
+		if stringKeys ~= nil and stringKeys <= 128 then
+			local out = {}
+			for key, nested in pairs(value) do
+				out[key] = serializeApiValue(nested, depth + 1, seen)
+			end
+			seen[value] = nil
+			return out
+		end
+
 		local entries = {}
 		local truncated = false
 		count = 0
@@ -462,7 +479,7 @@ function BridgeRuntimeApi.create(plugin, runtimeContext)
 		local text = truncateText(tostring(message), CONSOLE_MESSAGE_BYTE_LIMIT)
 		local entry = {
 			seq = consoleSeq,
-			time = os.clock(),
+			time = math.floor(os.clock() * 1000 + 0.5) / 1000,
 			unix = os.time(),
 			message = text,
 			type = consoleTypeName(messageType),
@@ -2301,7 +2318,16 @@ updateMouse()
 		local deadline = os.clock() + timeoutSeconds
 		local executionThread = task.defer(function()
 			packed = table.pack(xpcall(chunk, function(message)
-				return debug.traceback(tostring(message), 2)
+				local lines = {}
+				for _, line in ipairs(string.split(debug.traceback(tostring(message), 2), "\n")) do
+					if line ~= "" and not string.find(line, "Renium%.Bridge%w+:%d+") then
+						lines[#lines + 1] = line
+					end
+				end
+				if #lines == 2 and string.sub(lines[1], 1, #lines[2] + 1) == lines[2] .. ":" then
+					return lines[1]
+				end
+				return table.concat(lines, "\n")
 			end))
 			finishedAt = os.clock()
 		end)
