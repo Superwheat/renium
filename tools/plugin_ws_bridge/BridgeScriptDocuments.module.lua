@@ -106,7 +106,7 @@ function BridgeScriptDocuments.setSource(
 	instance: Instance,
 	source: string,
 	ctx: { [string]: any }?
-): (boolean, any, string)
+): (boolean, any)
 	local document = findScriptDocument(instance)
 	local token = if instance:IsDescendantOf(game) and ctx ~= nil
 		then ctx.expectPropertyEvent(instance, "Source", source)
@@ -114,7 +114,7 @@ function BridgeScriptDocuments.setSource(
 	if document ~= nil then
 		local documentOk = setOpenDocumentSource(document, source)
 		if documentOk then
-			return true, nil, "ScriptDocument"
+			return true, nil
 		end
 	end
 
@@ -125,19 +125,19 @@ function BridgeScriptDocuments.setSource(
 		end)
 	end)
 	if updateOk then
-		return true, nil, "UpdateSourceAsync"
+		return true, nil
 	end
 	local ok, err = pcall(function()
 		local writableInstance = instance :: any
 		writableInstance.Source = source
 	end)
 	if ok then
-		return true, nil, "Source"
+		return true, nil
 	end
 	if token ~= nil and ctx ~= nil then
 		ctx.cancelExpectedEvent(token)
 	end
-	return false, err, "Source"
+	return false, err
 end
 
 local function readInstanceDebugId(instance: Instance): string?
