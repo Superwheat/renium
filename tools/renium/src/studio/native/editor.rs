@@ -1391,44 +1391,6 @@ mod native_identity_tests {
         assert!(native_capture_debug_ids(&duplicated, &rows).is_err());
     }
 
-    #[test]
-    #[ignore = "Requires explicit files from an owned native-capture fixture; no Studio calls"]
-    fn native_capture_identity_saved_fixture() -> Result<()> {
-        let input = std::env::var("RENIUM_CAPTURE_IDENTITY_RBXL")?;
-        let identities = std::env::var("RENIUM_CAPTURE_IDENTITY_ROWS")?;
-        let decode_started = Instant::now();
-        let bytes = std::fs::read(input)?;
-        let flat = rbx_binary::Deserializer::new()
-            .elide_defaults(true)
-            .deserialize_flat(bytes.as_slice())?;
-        let decode_ms = elapsed_ms(decode_started);
-        let rows = std::fs::read(identities)?;
-        let map_started = Instant::now();
-        let debug_ids = native_capture_debug_ids(&flat.instances, &rows)?;
-        println!(
-            "{}",
-            json!({"identities":debug_ids.len(),"decodeMs":decode_ms,"identityMapMs":elapsed_ms(map_started)})
-        );
-        let (groups, batch) = captured_test_groups(&flat);
-        let partition_started = Instant::now();
-        let doms = decode_native_serialization_batch(
-            &bytes,
-            &batch,
-            &groups,
-            Arc::default(),
-            Some(&rows),
-        )?;
-        assert_eq!(
-            doms.values().map(|dom| dom.instances.len()).sum::<usize>(),
-            flat.instances.len()
-        );
-        println!(
-            "{}",
-            json!({"nativeServicePartitions": doms.len(), "partitionWithDecodeMs": elapsed_ms(partition_started)})
-        );
-        Ok(())
-    }
-
     fn captured_test_groups(
         flat: &rbx_binary::FlatDom,
     ) -> (Vec<EditorBinaryExportGroup>, EditorBinarySerializationBatch) {

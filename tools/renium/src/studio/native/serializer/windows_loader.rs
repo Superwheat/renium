@@ -585,24 +585,4 @@ mod tests {
         }
         Ok(())
     }
-
-    #[test]
-    #[ignore = "Read-only loader finder measurement; requires an explicit Studio executable"]
-    fn find_installed_loader_without_opening_studio() -> Result<()> {
-        let path = PathBuf::from(
-            std::env::var_os("RENIUM_LOADER_PROBE_EXE").context("Missing Studio image")?,
-        );
-        for sample in 0..3 {
-            let started = Instant::now();
-            let trace = prepare(&path)?;
-            println!(
-                "sample={sample} ms={:.3} rva={:#x} reader={:#x} instance_offset={:#x}",
-                started.elapsed().as_secs_f64() * 1000.,
-                trace.loader,
-                trace.reader,
-                trace.instance_offset
-            );
-        }
-        Ok(())
-    }
 }

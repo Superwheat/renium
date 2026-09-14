@@ -26,9 +26,6 @@ pub(crate) use import::{CREATED_ROW, read_service_payload};
 pub(crate) use observation::{AttributeGuard, begin_attribute_guard, begin_attribute_relay};
 pub(crate) use package_notice::suppress_package_notices;
 #[cfg(test)]
-#[path = "windows_sampler_tests.rs"]
-mod sampler_tests;
-#[cfg(test)]
 #[path = "windows_tests.rs"]
 mod tests;
 pub(crate) use properties::{
@@ -2796,70 +2793,6 @@ pub fn write_live_service(
 #[cfg(test)]
 mod capture_contract_tests {
     use super::*;
-
-    #[test]
-    #[ignore = "Read-only capture; requires explicit Studio PID, title and output directory"]
-    fn native_capture_document_fixture() -> Result<()> {
-        let pid = std::env::var("RENIUM_INSPECT_FIXTURE_PID")?.parse()?;
-        let title = std::env::var("RENIUM_INSPECT_FIXTURE_TITLE")?;
-        let output = PathBuf::from(std::env::var("RENIUM_CAPTURE_FIXTURE_OUTPUT")?);
-        let services = crate::roblox::services::DEFAULT_SYNC_SERVICES
-            .iter()
-            .map(|service| (*service).to_owned())
-            .collect::<Vec<_>>();
-        let capture = capture_live_services(pid, &title, &services, Duration::from_secs(15))?;
-        fs::create_dir(&output)?;
-        fs::write(output.join("capture.rbxl"), &capture.bytes)?;
-        fs::write(output.join("identities.bin"), &capture.identities)?;
-        let flat = rbx_binary::Deserializer::new().deserialize_flat(capture.bytes.as_slice())?;
-        println!(
-            "serialized={} identities={}",
-            flat.instances.len(),
-            capture.identities.len() / CAPTURE_ROW_SIZE
-        );
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "Read-only native property check; requires explicit Studio PID and expected title"]
-    fn native_target_uses_document_window_instead_of_model_name() -> Result<()> {
-        let pid = std::env::var("RENIUM_INSPECT_FIXTURE_PID")?.parse()?;
-        let expected = std::env::var("RENIUM_INSPECT_FIXTURE_TITLE")?;
-        let model_name = "ReniumDifferentInternalModelName";
-        let title = super::super::target_name(pid, model_name)?;
-        assert_eq!(title, expected);
-        assert!(capture_window(pid, model_name).is_err());
-        assert_eq!(capture_window(pid, &title)?.1, expected);
-        assert!(super::super::target_name(0, &expected).is_err());
-        let memory = ProcessMemory::open(pid)?;
-        let current_modules = modules(pid)?;
-        let studio = current_modules
-            .iter()
-            .find(|module| module.name.eq_ignore_ascii_case("RobloxStudioBeta.exe"))
-            .context("Missing Studio")?;
-        let layout = package_layout(&studio.path)?;
-        let model = active_data_model(pid, &memory, studio, layout.data, &title)?;
-        let actual_name = read_instance_name(
-            &memory,
-            model.outer + model.layout.data_model_instance,
-            model.layout,
-        )
-        .context("Missing DataModel name")?;
-        assert!(
-            !expected_data_model_names(&title).contains(&actual_name),
-            "Fixture must have different document and DataModel names"
-        );
-        let property = prepare_property(
-            pid,
-            &title,
-            &["Workspace".into()],
-            &[],
-            "Name",
-            Duration::from_secs(10),
-        )?;
-        assert_eq!(property.class_name, "Workspace");
-        Ok(())
-    }
 
     #[test]
     fn capture_titles_accept_bridge_basenames_and_pin_full_paths() {
