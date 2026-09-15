@@ -200,6 +200,36 @@ struct ReferenceTargetPath {
     path_ordinals: Vec<usize>,
 }
 
+/// Cross-service references written by hand carry only a settings id; a pull
+/// stores the target path. Attach the path so both sides compare equal.
+pub(crate) fn qualify_value_references(
+    value: &mut Value,
+    settings_file: &Path,
+    own_document: &SettingsBytecode,
+) -> Result<()> {
+    let mut unqualified = BTreeSet::new();
+    unqualified_reference_ids(value, &mut unqualified);
+    if unqualified.is_empty() {
+        return Ok(());
+    }
+    let mut documents = BTreeMap::new();
+    let own_service = crate::project::storage::store_service_name(settings_file)
+        .context("Service settings path has no service name")?;
+    documents.insert(own_service, own_document.clone());
+    if let Some(src_root) = crate::project::storage::source_directory(settings_file).parent() {
+        for service_dir in crate::project::storage::service_directories(src_root)? {
+            let path = service_settings_path(&service_dir);
+            if path == settings_file || !path.is_file() {
+                continue;
+            }
+            let service_name = crate::project::storage::store_service_name(&path)
+                .context("Service settings path has no service name")?;
+            documents.insert(service_name, SettingsBytecode::read_file(&path)?);
+        }
+    }
+    qualify_reference_targets(value, &documents, &unqualified)
+}
+
 fn qualify_reference_targets(
     value: &mut Value,
     documents: &BTreeMap<String, SettingsBytecode>,
