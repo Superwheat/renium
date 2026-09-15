@@ -7,11 +7,16 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use windows_sys::Win32::Foundation::{CloseHandle, FreeLibrary, HMODULE};
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_BINARY, RegGetValueW};
 use windows_sys::Win32::System::Threading::{
     CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, CreateProcessW, PROCESS_INFORMATION, ResumeThread,
     STARTF_USESHOWWINDOW, STARTUPINFOW, TerminateProcess,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNOACTIVATE;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GetWindowPlacement, GetWindowTextLengthW, GetWindowThreadProcessId,
+    IsWindowVisible, SW_SHOWMAXIMIZED, SW_SHOWNA, SetWindowPlacement, WINDOWPLACEMENT,
+    WPF_ASYNCWINDOWPLACEMENT,
+};
 
 const LAUNCH_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-launch.dll"));
 
@@ -75,10 +80,12 @@ pub(super) fn spawn(executable: &Path, arguments: &[&OsStr]) -> Result<u32> {
         .encode_wide()
         .chain([0])
         .collect::<Vec<_>>();
+    // SW_SHOWNA keeps the size Studio restores for itself (maximized when
+    // it was maximized); SW_SHOWNOACTIVATE would force the normal size.
     let startup = STARTUPINFOW {
         cb: std::mem::size_of::<STARTUPINFOW>() as u32,
         dwFlags: STARTF_USESHOWWINDOW,
-        wShowWindow: SW_SHOWNOACTIVATE as u16,
+        wShowWindow: SW_SHOWNA as u16,
         ..unsafe { std::mem::zeroed() }
     };
     let mut process: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
@@ -128,7 +135,109 @@ pub(super) fn spawn(executable: &Path, arguments: &[&OsStr]) -> Result<u32> {
     if resumed == u32::MAX {
         return Err(error).context("Could not resume Studio");
     }
+    if studio_remembers_maximized() {
+        maximize_without_activation(process.dwProcessId);
+    }
     Ok(process.dwProcessId)
+}
+
+/// Studio saves its main window geometry the Qt way (`@ByteArray(...)` in
+/// UTF-16 around a saveGeometry blob). The blob's maximized byte carries
+/// Qt::WindowMaximized when the window was maximized. Showing a new window
+/// without activation gives it the normal size, so that state is reapplied.
+fn studio_remembers_maximized() -> bool {
+    let subkey = "Software\\Roblox\\RobloxStudio\\LayoutSettings\0"
+        .encode_utf16()
+        .collect::<Vec<_>>();
+    let value = "window_geometry_ribbon\0"
+        .encode_utf16()
+        .collect::<Vec<_>>();
+    let mut size = 0u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_BINARY,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut size,
+        )
+    };
+    if status != 0 || size == 0 || size > 4096 {
+        return false;
+    }
+    let mut bytes = vec![0u8; size as usize];
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_BINARY,
+            std::ptr::null_mut(),
+            bytes.as_mut_ptr().cast(),
+            &mut size,
+        )
+    };
+    if status != 0 {
+        return false;
+    }
+    let prefix = "@ByteArray("
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    let geometry = if bytes.starts_with(&prefix) {
+        bytes[prefix.len()..]
+            .chunks_exact(2)
+            .map(|unit| unit[0])
+            .collect::<Vec<_>>()
+    } else {
+        bytes
+    };
+    geometry.starts_with(&[0x01, 0xD9, 0xD0, 0xCB])
+        && geometry.get(44).is_some_and(|flags| flags & 2 != 0)
+}
+
+fn maximize_without_activation(pid: u32) {
+    struct Search {
+        pid: u32,
+        found: windows_sys::Win32::Foundation::HWND,
+    }
+    unsafe extern "system" fn visit(
+        window: windows_sys::Win32::Foundation::HWND,
+        parameter: windows_sys::Win32::Foundation::LPARAM,
+    ) -> windows_sys::Win32::Foundation::BOOL {
+        let search = unsafe { &mut *(parameter as *mut Search) };
+        let mut owner = 0u32;
+        unsafe { GetWindowThreadProcessId(window, &mut owner) };
+        if owner == search.pid
+            && unsafe { IsWindowVisible(window) } != 0
+            && unsafe { GetWindowTextLengthW(window) } > 0
+        {
+            search.found = window;
+            return 0;
+        }
+        1
+    }
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_secs(60) {
+        let mut search = Search {
+            pid,
+            found: std::ptr::null_mut(),
+        };
+        unsafe { EnumWindows(Some(visit), &mut search as *mut Search as isize) };
+        if !search.found.is_null() {
+            let mut placement: WINDOWPLACEMENT = unsafe { std::mem::zeroed() };
+            placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+            if unsafe { GetWindowPlacement(search.found, &mut placement) } != 0 {
+                placement.showCmd = SW_SHOWMAXIMIZED as u32;
+                placement.flags |= WPF_ASYNCWINDOWPLACEMENT;
+                unsafe { SetWindowPlacement(search.found, &placement) };
+            }
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
 }
 
 // Load into the exact Studio before resuming its first thread, or before

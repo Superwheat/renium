@@ -5350,9 +5350,12 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					end
 					local present = service:FindFirstChild(name) ~= nil
 					-- A renamed root keeps its identity: it is present under its old name.
-					if not present and lookup ~= nil and type(rootIds[name]) == "table" then
+					-- The live match map wins over the cached lookup: a settings id
+					-- is reused once its earlier instance was deleted.
+					if not present and type(rootIds) == "table" and type(rootIds[name]) == "table" then
 						for _, settingsId in ipairs(rootIds[name]) do
-							if liveInstance(lookup[tostring(settingsId)]) ~= nil then
+							if matchedSettingsInstance(serviceName, settingsId, ctx) ~= nil
+								or (lookup ~= nil and liveInstance(lookup[tostring(settingsId)]) ~= nil) then
 								present = true
 								break
 							end
