@@ -22,6 +22,19 @@ local function containsReference(value: any, seen: { [any]: boolean }?): boolean
 	return false
 end
 
+local function comparableCount(values: any): number
+	if type(values) ~= "table" then
+		return 0
+	end
+	local count = 0
+	for _, value in pairs(values) do
+		if not containsReference(value) then
+			count += 1
+		end
+	end
+	return count
+end
+
 local function scoreValues(candidate: any, values: any, compare: (any, string, any) -> boolean): number
 	if type(values) ~= "table" then
 		return 0
@@ -49,6 +62,7 @@ function BridgeCandidateMatch.choose(
 		return nil
 	end
 
+	local comparable = comparableCount(properties) + comparableCount(attributes)
 	local best = nil
 	local bestScore = 0
 	local tied = false
@@ -63,7 +77,10 @@ function BridgeCandidateMatch.choose(
 			tied = true
 		end
 	end
-	return if tied then nil else best
+	if tied and bestScore < comparable then
+		return nil
+	end
+	return best
 end
 
 return BridgeCandidateMatch

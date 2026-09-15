@@ -1737,6 +1737,7 @@ fn start_managed_live_operation(
     bridge_wait_seconds: f64,
     options: &LiveOperationOptions,
 ) -> std::result::Result<Value, automation::Failure> {
+    state.live_sync().clear_restore_failure(context);
     let mut start_parameters = parameters.clone();
     start_parameters["reset"] = json!(true);
     start_parameters["replaceServices"] = json!(true);
@@ -1833,6 +1834,7 @@ fn automation_live_operation(
     }
 
     if options.manage_files && matches!(operation, op::RETRY_PENDING | op::DISCARD_PENDING) {
+        state.live_sync().clear_restore_failure(context);
         let plugin = {
             let _gate = bridge.acquire_request_gate();
             automation_dispatch_with_retry(
@@ -1864,6 +1866,7 @@ fn automation_live_operation(
     }
 
     if options.manage_files && operation == op::LIVE_STOP {
+        state.live_sync().clear_restore_failure(context);
         let transition = state.live_sync().transition_lock();
         let _transition = transition.lock_recover();
         let plugin = {
@@ -1964,12 +1967,13 @@ fn automation_live_operation(
             .live_sync()
             .enabled(context, bridge)
             .map_err(automation_failure)?;
-        let restore = !attached_session && enabled;
+        let suppressed = state.live_sync().restore_failure(context).is_some();
+        let restore = !attached_session && enabled && !suppressed;
         log_global(
             5,
             format_args!(
-                "[renium] live status restore check: cx={} session={} enabled={} restore={}",
-                context.id, attached_session, enabled, restore
+                "[renium] live status restore check: cx={} session={} enabled={} suppressed={} restore={}",
+                context.id, attached_session, enabled, suppressed, restore
             ),
         );
         restore
@@ -1980,11 +1984,18 @@ fn automation_live_operation(
     let _transition = transition
         .as_ref()
         .map(|transition| transition.lock_recover());
+    let restore_failed = |failure: automation::Failure| {
+        state
+            .live_sync()
+            .note_restore_failure(context, failure.0.m.clone());
+        failure
+    };
     if restore_files {
         state
             .live_sync()
             .ensure_target_available(context, bridge)
-            .map_err(automation_failure)?;
+            .map_err(automation_failure)
+            .map_err(restore_failed)?;
     }
     if restore_files && plugin.get("tracking").and_then(Value::as_bool) != Some(true) {
         let mut start_parameters = parameters.clone();
@@ -1998,10 +2009,13 @@ fn automation_live_operation(
             bridge,
             bridge_wait_seconds,
             false,
-        )?;
+        )
+        .map_err(restore_failed)?;
     }
     let restored_daemon = if restore_files {
-        let configuration = pair_configuration(&plugin, object).map_err(automation_failure)?;
+        let configuration = pair_configuration(&plugin, object)
+            .map_err(automation_failure)
+            .map_err(restore_failed)?;
         let started = state
             .live_sync()
             .start(
@@ -2012,10 +2026,11 @@ fn automation_live_operation(
                 false,
                 configuration,
             )
-            .map_err(automation_failure)?;
+            .map_err(automation_failure)
+            .map_err(restore_failed)?;
         if let Err(error) = state.live_sync().set_enabled(context, bridge, true) {
             state.live_sync().rollback_start(&started);
-            return Err(automation_failure(error));
+            return Err(restore_failed(automation_failure(error)));
         }
         Some(started.status)
     } else {
@@ -2039,6 +2054,11 @@ fn automation_live_operation(
     };
     let refresh_plugin = restored_daemon.is_some() || settings_update.is_some();
     let mut daemon = restored_daemon.or(settings_update).unwrap_or(daemon);
+    if operation == op::LIVE_STATUS
+        && let Some(message) = state.live_sync().restore_failure(context)
+    {
+        daemon["restoreError"] = json!(message);
+    }
     if refresh_plugin {
         plugin = live_plugin_status(context, parameters, bridge, bridge_wait_seconds)?;
     }

@@ -630,6 +630,35 @@ local tiedCandidate = CandidateMatch.choose(
 )
 equal(tiedCandidate, nil, "candidate reference tie")
 
+local identicalCandidates = {
+	{ Value = "same", Marker = "same" },
+	{ Value = "same", Marker = "same" },
+}
+local interchangeableCandidate = CandidateMatch.choose(
+	identicalCandidates,
+	{ Value = "same" },
+	{ Marker = "same" },
+	function(candidate, name, value)
+		return candidate[name] == value
+	end,
+	function(candidate, name, value)
+		return candidate[name] == value
+	end
+)
+equal(interchangeableCandidate, identicalCandidates[1], "identical candidates are interchangeable")
+local partialTie = CandidateMatch.choose(
+	identicalCandidates,
+	{ Value = "same", Other = "missing" },
+	{},
+	function(candidate, name, value)
+		return candidate[name] == value
+	end,
+	function(candidate, name, value)
+		return candidate[name] == value
+	end
+)
+equal(partialTie, nil, "partial ties stay ambiguous")
+
 local oversizedCandidates = {}
 for index = 1, 33 do
 	oversizedCandidates[index] = { Value = index }

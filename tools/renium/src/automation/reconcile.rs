@@ -497,6 +497,7 @@ struct ReconcilePushPlan {
     geometry_properties: HashMap<(String, String), Vec<String>>,
     attribute_only_instances: HashSet<(String, String)>,
     in_place_instances: HashSet<(String, String)>,
+    unchanged_native_root_properties: HashMap<(String, String), Vec<String>>,
 }
 
 struct PreparedEditorSettingsChange {
@@ -1280,11 +1281,26 @@ impl Coordinator {
             let phase = Instant::now();
             if !changes.editor.is_empty() {
                 let mismatches = snapshot_differences(&readback, &merged)?;
-                if !mismatches.is_empty() {
-                    let mut paths = mismatches.into_iter().collect::<Vec<_>>();
-                    paths.sort();
-                    let detail = snapshot_mismatch_details(&readback, &merged, &paths)?
-                        .unwrap_or_else(|| paths[0].display().to_string());
+                let mut paths = mismatches.into_iter().collect::<Vec<_>>();
+                paths.sort();
+                let mut detail = None;
+                for path in &paths {
+                    let is_settings = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(is_service_settings_file_name);
+                    if !is_settings {
+                        detail = Some(path.display().to_string());
+                        break;
+                    }
+                    if let Some(found) =
+                        snapshot_mismatch_details(&readback, &merged, std::slice::from_ref(path))?
+                    {
+                        detail = Some(found);
+                        break;
+                    }
+                }
+                if let Some(detail) = detail {
                     bail!("Studio did not retain the reconciled project state: {detail}");
                 }
             }
@@ -3625,6 +3641,17 @@ fn amend_reconciled_changes(
             change.reset_properties.clear();
         }
     }
+    for change in &mut changes.property_changes {
+        if let Some(id) = &change.settings_id
+            && let Some(names) = plan
+                .unchanged_native_root_properties
+                .get(&(change.service.clone(), id.clone()))
+        {
+            for name in names {
+                change.properties.remove(name);
+            }
+        }
+    }
     for change in &changes.property_changes {
         if let Some(id) = &change.settings_id
             && let Some(properties) = plan
@@ -4048,6 +4075,28 @@ fn append_aligned_settings_push_plan(
         {
             plan.attribute_only_instances
                 .insert((service.clone(), instance.settings_id.clone()));
+        } else if plan
+            .in_place_instances
+            .contains(&(service.clone(), instance.settings_id.clone()))
+        {
+            let unchanged = instance
+                .properties
+                .iter()
+                .filter(|(name, value)| {
+                    crate::editor::native_roots::is_property(&instance.class_name, name)
+                        && reconciliation_property_values_equal(
+                            &instance.class_name,
+                            name,
+                            Some(value),
+                            observed_instance.properties.get(name.as_str()),
+                        )
+                })
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>();
+            if !unchanged.is_empty() {
+                plan.unchanged_native_root_properties
+                    .insert((service.clone(), instance.settings_id.clone()), unchanged);
+            }
         }
         let geometry =
             crate::editor::native_geometry::generated_properties(observed_instance, instance);
@@ -6200,6 +6249,7 @@ fn snapshot_mismatch_details(
     }) else {
         return Ok(None);
     };
+    let database = rbx_reflection_database::get()?;
     let observed_document = settings_document(observed.entries.get(path))?;
     let mut expected_document = settings_document(expected.entries.get(path))?;
     if observed_document.instances.len() != expected_document.instances.len() {
@@ -6243,6 +6293,7 @@ fn snapshot_mismatch_details(
             continue;
         }
         let instance_name = &expected.name;
+        let class_name = &expected_document.instances[expected_index].class_name;
         for (kind, observed, expected) in [
             ("property", &observed.properties, &expected.properties),
             ("attribute", &observed.attributes, &expected.attributes),
@@ -6252,7 +6303,16 @@ fn snapshot_mismatch_details(
             names.dedup();
             for name in names {
                 if kind == "property"
-                    && (name == "ScriptGuid" || reconciliation_property_is_derived(name))
+                    && (name == "ScriptGuid"
+                        || reconciliation_property_is_derived(name)
+                        || crate::rbx::decode::is_unexposed_service_property(
+                            database, class_name, name,
+                        )
+                        || crate::settings::equivalence::reconciliation_property_is_unknown_when_absent(name)
+                            && !expected.contains_key(name)
+                        || crate::editor::review::is_engine_managed_editor_property(
+                            class_name, name, database,
+                        ) && !observed.contains_key(name))
                 {
                     continue;
                 }
@@ -6279,6 +6339,7 @@ fn snapshot_mismatch_details(
                         reconciliation_values_equal(observed, expected, false)
                     }
                     (None, None) => true,
+                    (Some(_), None) if kind == "property" => true,
                     _ => false,
                 };
                 if !retained {
@@ -7046,6 +7107,68 @@ mod tests {
             assert_eq!(plan.instance_deletes[0].instances.len(), 1);
             assert_eq!(plan.instance_deletes[0].instances[0].settings_id, "removed");
         }
+    }
+
+    #[test]
+    fn default_collision_fidelity_and_unchanged_native_values_are_not_pushed() {
+        let root = SettingsBytecodeInstance::new(
+            "root".into(),
+            "ServerStorage".into(),
+            "ServerStorage".into(),
+            None,
+        );
+        let mut current = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![root],
+        };
+        for index in 0..3 {
+            let mut part = SettingsBytecodeInstance::new(
+                format!("mesh-{index}"),
+                format!("Mesh{index}"),
+                "MeshPart".into(),
+                Some(0),
+            );
+            part.properties
+                .insert("MeshContent".into(), json!("rbxassetid://123"));
+            part.properties.insert("SourceAssetId".into(), json!(456));
+            part.properties.insert("Transparency".into(), json!(0.25));
+            current.instances.push(part);
+        }
+        let mut previous = current.clone();
+        for (index, instance) in previous.instances.iter_mut().enumerate().skip(1) {
+            let fidelity = if index == 1 { "Hull" } else { "Default" };
+            instance.properties.insert(
+                "CollisionFidelity".into(),
+                json!({"_type": "EnumItem", "enumType": "CollisionFidelity", "name": fidelity}),
+            );
+        }
+        current.instances[2]
+            .properties
+            .insert("Transparency".into(), json!(0.5));
+        let path = PathBuf::from("src/ServerStorage/__roblox_sync_settings.renium");
+        let snapshot = |document: &SettingsBytecode| ProjectSnapshot {
+            entries: BTreeMap::from([(
+                path.clone(),
+                SnapshotEntry::File(encode_settings_bytecode(document).unwrap()),
+            )]),
+        };
+        let desired = snapshot(&current);
+        let observed = snapshot(&previous);
+        let paths = project_replacement_paths(&desired, &observed);
+        let mut prepared = HashMap::new();
+        prepare_project_replacement(&desired, &observed, &paths, &mut prepared).unwrap();
+        let plan = reconciliation_push_plan_for_paths_with_prepared_settings(
+            &observed, &desired, &paths, &prepared, true, false,
+        )
+        .unwrap();
+        assert_eq!(plan.target_settings_ids, vec!["mesh-1"]);
+        let mut unchanged = plan
+            .unchanged_native_root_properties
+            .get(&("ServerStorage".into(), "mesh-1".into()))
+            .cloned()
+            .unwrap();
+        unchanged.sort();
+        assert_eq!(unchanged, vec!["MeshContent", "SourceAssetId"]);
     }
 
     #[test]

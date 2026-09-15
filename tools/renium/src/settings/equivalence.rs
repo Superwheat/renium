@@ -2150,10 +2150,16 @@ fn reconciliation_maps_equal_with_ids(
     left_ids: &AHashMap<&str, usize>,
     right_ids: &AHashMap<&str, usize>,
 ) -> bool {
+    let database = rbx_reflection_database::get().ok();
     let stable = |name: &str, value: &Value| {
         name != "ScriptGuid"
             && !reconciliation_property_is_derived(name)
             && !reconciliation_property_is_metadata(name, value)
+            && !database.is_some_and(|database| {
+                crate::rbx::decode::is_unexposed_service_property(database, class_name, name)
+            })
+            && !(reconciliation_property_is_unknown_when_absent(name)
+                && (!left.contains_key(name) || !right.contains_key(name)))
     };
     for (name, value) in left {
         if !stable(name, value) {
@@ -2529,7 +2535,15 @@ pub(crate) fn reconciliation_property_value<'a>(
         .filter(|value| !reconciliation_property_is_metadata(name, value))
 }
 
-fn reconciliation_property_value_is_default(class_name: &str, name: &str, value: &Value) -> bool {
+pub(crate) fn reconciliation_property_is_unknown_when_absent(name: &str) -> bool {
+    matches!(name, "CollisionFidelity" | "ClockTime")
+}
+
+pub(crate) fn reconciliation_property_value_is_default(
+    class_name: &str,
+    name: &str,
+    value: &Value,
+) -> bool {
     if is_known_default_property_value(name, value) {
         return true;
     }

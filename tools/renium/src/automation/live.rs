@@ -721,6 +721,7 @@ pub(crate) struct Manager {
     transitions: Arc<Mutex<()>>,
     next_session: AtomicU64,
     coordinator: Arc<Coordinator>,
+    restore_failures: Mutex<HashMap<PathBuf, String>>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -754,6 +755,25 @@ impl Manager {
 
     pub(crate) fn transition_lock(&self) -> Arc<Mutex<()>> {
         Arc::clone(&self.transitions)
+    }
+
+    pub(crate) fn note_restore_failure(&self, context: &BoundContext, message: String) {
+        self.restore_failures
+            .lock_recover()
+            .insert(enabled_path(context), message);
+    }
+
+    pub(crate) fn clear_restore_failure(&self, context: &BoundContext) {
+        self.restore_failures
+            .lock_recover()
+            .remove(&enabled_path(context));
+    }
+
+    pub(crate) fn restore_failure(&self, context: &BoundContext) -> Option<String> {
+        self.restore_failures
+            .lock_recover()
+            .get(&enabled_path(context))
+            .cloned()
     }
 
     pub(crate) fn ensure_target_available(
