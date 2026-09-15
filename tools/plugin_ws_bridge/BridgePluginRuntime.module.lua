@@ -3077,6 +3077,20 @@ function BridgePluginRuntime.start(context)
 			nativeDebugIdData = buffer.fromstring(table.concat(nativeDebugIdData, "\0"))
 		end
 
+		-- Native debug ids are positional; a snapshot taken against a tree
+		-- that has since changed would stamp every later object with a
+		-- neighbour's identity. Sample the alignment before trusting it.
+		local nativeDebugIds = if nativeSnapshot then nativeSnapshot.debugIds else nil
+		if nativeDebugIds ~= nil and #instances > 0 then
+			for _, sampleIndex in ipairs({ 1, math.max(1, math.floor(#instances / 2)), #instances }) do
+				local sampled = instances[sampleIndex]
+				if sampled ~= nil and nativeDebugIds[sampleIndex] ~= sampled:GetDebugId(32) then
+					warn("[renium] native debug ids do not match the exported tree; reading them directly")
+					nativeDebugIds = nil
+					break
+				end
+			end
+		end
 		local state: ServiceState = {
 			instances = instances,
 			nativeExportOnly = nativeExport,
@@ -3084,7 +3098,7 @@ function BridgePluginRuntime.start(context)
 			nativeLiveSnapshot = if nativeSnapshot then nativeSnapshot.nativeLiveSnapshot == true else false,
 			exportedInstances = if nativeSnapshot then nativeSnapshot.exportedInstances else nil,
 			isExportedInstance = if nativeSnapshot then nativeSnapshot.isExportedInstance else nil,
-			nativeDebugIds = if nativeSnapshot then nativeSnapshot.debugIds else nil,
+			nativeDebugIds = nativeDebugIds,
 			nonArchivableInstance = nonArchivableInstance,
 			nonArchivableInstances = nonArchivableInstances,
 			nativeDebugIdBuffer = nativeDebugIdData,
