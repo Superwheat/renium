@@ -336,14 +336,13 @@ jobs:
           RENIUM_VERSION: ${{ needs.verify-tag.outputs.version }}
         run: |
           {
-            printf "# What's Changed\n"
             awk -v heading="## $RENIUM_VERSION" '
               index($0, heading) == 1 { found = 1; next }
               found && /^## / { exit }
               found { print }
               END { if (!found) exit 1 }
             ' tools/renium-vscode-extension/changelog.md
-            printf '%s\n\n' '## Install'
+            printf '%s\n\n' '### Install'
             printf '%s\n' 'On Windows, download and double-click **Install-Renium.cmd**; it selects the correct x64 or ARM64 package automatically. On macOS, extract the platform ZIP and double-click **Install Renium.command**. The installer asks which detected editor should receive the extension and puts `renium` on your PATH.'
           } > /tmp/renium-release-notes.md
 
