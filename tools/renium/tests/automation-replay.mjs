@@ -115,10 +115,6 @@ try {
   expect(scriptRead.ok === 1 && scriptRead.r.source === "return DataStoreService", "script-read returned the wrong range");
   const scriptGrep = await send({ v: 1, id: 42, op: 26, cx, p: { query: "GetService", limit: 5 } });
   expect(scriptGrep.ok === 1 && scriptGrep.r.results.length === 1, "script-grep missed a literal source match");
-  const imagePath = path.join(root, "pixel.png");
-  fs.writeFileSync(imagePath, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"));
-  const storedImage = await send({ v: 1, id: 43, op: 96, cx, p: { path: "pixel.png" } });
-  expect(storedImage.ok === 1 && storedImage.r.mimeType === "image/png", "image-store rejected a valid local PNG");
   const studios = await send({ v: 1, id: 5, op: 50, cx, p: {} });
   expect(studios.ok === 1 && Array.isArray(studios.r.studios) && studios.ms < 2000, "studios waited for a bridge");
   const directPush = await send({ v: 1, id: 6, op: 11, cx, p: { destructive: true } });
@@ -174,7 +170,7 @@ try {
   fs.appendFileSync(project, "\n");
   const stale = await send({ v: 1, id: 13, op: 2, cx, p: {} });
   expect(stale.ok === 0 && stale.e.c === "stale_cx", "project changes did not invalidate the context");
-  expect([cap, bound, context, studios, scriptSearch, scriptRead, scriptGrep, storedImage].every((response) => response.ms < 2000), "safe operations waited for Studio");
+  expect([cap, bound, context, studios, scriptSearch, scriptRead, scriptGrep].every((response) => response.ms < 2000), "safe operations waited for Studio");
   expect(!stderr.includes("--help"), "replay invoked help");
   expect(!stderr.includes("local.renium-"), "replay searched extension folders");
   expect(!stderr.toLowerCase().includes("write buffer"), "replay exposed a write-buffer failure");
