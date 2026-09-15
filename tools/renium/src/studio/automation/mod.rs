@@ -2484,6 +2484,11 @@ fn wait_for_studio_play_ready(bridge: &BridgeServer, runtime_id: &str) -> Result
     }
 }
 
+pub(crate) struct TestLaunch {
+    pub(crate) nonce: String,
+    pub(crate) edit_runtime_id: String,
+}
+
 #[cfg(test)]
 mod play_state_tests {
     use super::*;
@@ -2514,9 +2519,4 @@ mod play_state_tests {
         })));
         assert!(play_status_is_running(&json!({ "running": true })));
     }
-}
-
-pub(crate) struct TestLaunch {
-    pub(crate) nonce: String,
-    pub(crate) edit_runtime_id: String,
 }

@@ -4222,6 +4222,69 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
     Ok(changes)
 }
 
+fn log_change_set_composition(
+    changes: &EditorChangeSet,
+    binary_import: Option<&EditorBinaryImport>,
+) {
+    let instances = changes
+        .instance_changes
+        .iter()
+        .map(|change| {
+            format!(
+                "{}:{}(deletes={}, instances={}, preserve={})",
+                change.service,
+                change.mode,
+                change.allow_deletes,
+                change.instances.len(),
+                change.preserve_instances.len()
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut by_class = HashMap::<&str, (usize, usize)>::new();
+    for change in &changes.property_changes {
+        let entry = by_class.entry(change.class_name.as_str()).or_default();
+        entry.0 += 1;
+        entry.1 += change.properties.len() + change.reset_properties.len();
+    }
+    let mut by_class = by_class.into_iter().collect::<Vec<_>>();
+    by_class.sort_by_key(|(_, (rows, _))| std::cmp::Reverse(*rows));
+    let properties = by_class
+        .iter()
+        .take(12)
+        .map(|(class, (rows, fields))| format!("{class}:{rows}/{fields}"))
+        .collect::<Vec<_>>();
+    let import = binary_import.map(|import| {
+        format!(
+            "bytes={}, instances={}, replacement={}, post_apply_paths={}, groups=[{}]",
+            import.bytes.len(),
+            import.instance_count,
+            import.native_replacement.is_some(),
+            import.post_apply_properties_by_path.len(),
+            import
+                .groups
+                .iter()
+                .map(|group| format!(
+                    "{}:{}{}",
+                    group.service,
+                    group.count,
+                    if group.additive { " additive" } else { "" }
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    });
+    log_global(
+        5,
+        format_args!(
+            "[renium] editor change set: instances=[{}] sources={} properties=[{}] import={}",
+            instances.join(", "),
+            changes.source_changes.len(),
+            properties.join(", "),
+            import.unwrap_or_else(|| "none".into())
+        ),
+    );
+}
+
 #[cfg(test)]
 mod sync_tests {
     use super::*;
@@ -4822,67 +4885,4 @@ mod sync_tests {
             }])
         );
     }
-}
-
-fn log_change_set_composition(
-    changes: &EditorChangeSet,
-    binary_import: Option<&EditorBinaryImport>,
-) {
-    let instances = changes
-        .instance_changes
-        .iter()
-        .map(|change| {
-            format!(
-                "{}:{}(deletes={}, instances={}, preserve={})",
-                change.service,
-                change.mode,
-                change.allow_deletes,
-                change.instances.len(),
-                change.preserve_instances.len()
-            )
-        })
-        .collect::<Vec<_>>();
-    let mut by_class = HashMap::<&str, (usize, usize)>::new();
-    for change in &changes.property_changes {
-        let entry = by_class.entry(change.class_name.as_str()).or_default();
-        entry.0 += 1;
-        entry.1 += change.properties.len() + change.reset_properties.len();
-    }
-    let mut by_class = by_class.into_iter().collect::<Vec<_>>();
-    by_class.sort_by_key(|(_, (rows, _))| std::cmp::Reverse(*rows));
-    let properties = by_class
-        .iter()
-        .take(12)
-        .map(|(class, (rows, fields))| format!("{class}:{rows}/{fields}"))
-        .collect::<Vec<_>>();
-    let import = binary_import.map(|import| {
-        format!(
-            "bytes={}, instances={}, replacement={}, post_apply_paths={}, groups=[{}]",
-            import.bytes.len(),
-            import.instance_count,
-            import.native_replacement.is_some(),
-            import.post_apply_properties_by_path.len(),
-            import
-                .groups
-                .iter()
-                .map(|group| format!(
-                    "{}:{}{}",
-                    group.service,
-                    group.count,
-                    if group.additive { " additive" } else { "" }
-                ))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    });
-    log_global(
-        5,
-        format_args!(
-            "[renium] editor change set: instances=[{}] sources={} properties=[{}] import={}",
-            instances.join(", "),
-            changes.source_changes.len(),
-            properties.join(", "),
-            import.unwrap_or_else(|| "none".into())
-        ),
-    );
 }

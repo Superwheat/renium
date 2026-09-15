@@ -148,21 +148,13 @@ pub(super) fn document(
                     if let Variant::Attributes(attributes) = value
                         && key == "Attributes"
                     {
-                        for (name, value) in attributes {
-                            // Attribute strings share one byte encoding on disk.
-                            let value = match value {
-                                Variant::BinaryString(bytes) if elide_defaults => {
-                                    match std::str::from_utf8(bytes.as_ref()) {
-                                        Ok(text) => json!(text),
-                                        Err(_) => {
-                                            variant_value(value, None, database, &import_refs)?
-                                        }
-                                    }
-                                }
-                                _ => variant_value(value, None, database, &import_refs)?,
-                            };
-                            record.attributes.insert(name.clone(), value);
-                        }
+                        collect_attribute_values(
+                            attributes,
+                            elide_defaults,
+                            database,
+                            &import_refs,
+                            &mut record,
+                        )?;
                         continue;
                     }
                     let (canonical, descriptor, raw_default, default) = match property_metadata
@@ -278,6 +270,29 @@ pub(super) fn document(
     };
     stabilize_settings_reference_ids(&mut document);
     Ok(document)
+}
+
+fn collect_attribute_values(
+    attributes: &rbx_dom_weak::types::Attributes,
+    elide_defaults: bool,
+    database: &rbx_reflection::ReflectionDatabase<'_>,
+    refs: &BytecodeModelImportRefs,
+    record: &mut SettingsBytecodeInstance,
+) -> Result<()> {
+    for (name, value) in attributes {
+        // Attribute strings share one byte encoding on disk.
+        let value = match value {
+            Variant::BinaryString(bytes) if elide_defaults => {
+                match std::str::from_utf8(bytes.as_ref()) {
+                    Ok(text) => json!(text),
+                    Err(_) => variant_value(value, None, database, refs)?,
+                }
+            }
+            _ => variant_value(value, None, database, refs)?,
+        };
+        record.attributes.insert(name.clone(), value);
+    }
+    Ok(())
 }
 
 fn variant_value(
