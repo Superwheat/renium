@@ -86,6 +86,22 @@ pub(super) fn document(
         .enumerate()
         .map(|(index, id)| (*id, index))
         .collect::<HashMap<_, _>>();
+    // The viewport camera's placement is editor state, not place content.
+    let current_camera = dom
+        .root()
+        .children()
+        .iter()
+        .filter_map(|id| dom.get_by_ref(*id))
+        .find(|instance| instance.class == "Workspace")
+        .and_then(|workspace| {
+            match workspace
+                .properties
+                .get(&rbx_dom_weak::Ustr::from("CurrentCamera"))
+            {
+                Some(Variant::Ref(camera)) => Some(*camera),
+                _ => None,
+            }
+        });
     let mut import_refs = BytecodeModelImportRefs {
         new_index_by_ref: indices.clone(),
         ..Default::default()
@@ -121,6 +137,12 @@ pub(super) fn document(
                     // Serialized identity/history are not editable content. File-local
                     // referents are resolved below, never compared by their raw numbers.
                     if elide_defaults && matches!(key, "UniqueId" | "HistoryId" | "ScriptGuid") {
+                        continue;
+                    }
+                    if elide_defaults
+                        && current_camera == Some(*id)
+                        && matches!(key, "CFrame" | "Focus")
+                    {
                         continue;
                     }
                     if let Variant::Attributes(attributes) = value
