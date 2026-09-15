@@ -588,7 +588,9 @@ local function settingsIdLookupForService(serviceName: string, ctx: { [string]: 
 						lookup[instanceId] = instance
 					end
 				end
-				local debugId = identityModule.getCachedDebugId(state, instance)
+				-- Identity lookups read the live debug id; the snapshot's
+				-- positional list may predate later tree changes.
+				local debugId = identityModule.getDebugId(instance)
 				if type(debugId) == "string" and debugId ~= "" then
 					lookup["debug:" .. debugId] = instance
 				end
@@ -627,7 +629,24 @@ local function resolveInstanceBySettingsId(serviceName: string, rawSettingsId: a
 
 	local instance = liveInstance(lookup[settingsId])
 	if instance ~= nil then
-		return instance
+		if not strongSettingsId(settingsId) or "debug:" .. tostring(instance:GetDebugId(32)) == settingsId then
+			return instance
+		end
+		lookup[settingsId] = nil
+		instance = nil
+	end
+	if strongSettingsId(settingsId) then
+		local state = getStateForService(serviceName, ctx)
+		if state ~= nil and type(state.instances) == "table" then
+			for _, candidate in ipairs(state.instances) do
+				local live = liveInstance(candidate)
+				if live ~= nil and "debug:" .. tostring(live:GetDebugId(32)) == settingsId then
+					lookup[settingsId] = live
+					return live
+				end
+			end
+		end
+		return nil
 	end
 	local index = parseInstanceIndexId(settingsId, ctx.identityModule)
 	if index and index >= 1 then
