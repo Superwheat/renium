@@ -6,7 +6,9 @@ import path from "node:path";
 import readline from "node:readline";
 
 const repository = path.resolve(import.meta.dirname, "..", "..", "..");
-const opcodeCount = JSON.parse(fs.readFileSync(path.join(repository, "tools", "renium", "protocol", "opcodes.json"), "utf8")).operations.length;
+const registeredOps = JSON.parse(fs.readFileSync(path.join(repository, "tools", "renium", "protocol", "opcodes.json"), "utf8")).operations
+  .map((operation) => `${operation.id}:${operation.name}`)
+  .join(",");
 
 const executable = path.resolve(process.argv[2] ?? path.join("tools", "renium", "target", "debug", process.platform === "win32" ? "renium.exe" : "renium"));
 if (!fs.existsSync(executable)) {
@@ -92,7 +94,8 @@ const expect = (condition, message) => {
 
 try {
   const cap = await send({ v: 1, id: 1, op: 0, p: {} });
-  expect(cap.ok === 1 && cap.r.ops.length === opcodeCount, "cap did not return the checked-in registry");
+  const daemonOps = cap.ok === 1 ? cap.r.ops.map((operation) => `${operation.id}:${operation.name}`).join(",") : "";
+  expect(daemonOps === registeredOps, `cap did not return the checked-in registry: ${daemonOps}`);
   const bad = await send({ v: 1, id: 2, op: 999, p: {} });
   expect(bad.ok === 0 && bad.e.c === "bad_op" && bad.e.rt === 0, "bad opcode classification changed");
   const bound = await send({ v: 1, id: 3, op: 1, p: { root } });
