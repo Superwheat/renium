@@ -130,6 +130,7 @@ pub(super) fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
     if let Some(parent_pid) = args.parent_pid {
         watch_parent_and_exit(parent_pid);
     }
+    release_freed_memory_promptly();
     #[cfg(windows)]
     crate::studio::input::watch_auto_recovery_dialogs();
     let automation_state = Arc::new(automation::State::default());
@@ -163,6 +164,15 @@ pub(super) fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
     bridge.alive.store(false, Ordering::Relaxed);
     println!("[renium] daemon stopped");
     Ok(())
+}
+
+fn release_freed_memory_promptly() {
+    const MI_OPTION_PURGE_DECOMMITS: libmimalloc_sys::mi_option_t = 5;
+    const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
+    unsafe {
+        libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DECOMMITS, 1);
+        libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, 0);
+    }
 }
 
 fn check_for_available_update(state: Arc<automation::State>) {

@@ -1882,8 +1882,8 @@ where
     Ok((output, metrics))
 }
 
-const BRIDGE_TEXT_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
-const BRIDGE_TEXT_CACHE_MAX_ENTRIES: usize = 64;
+const BRIDGE_TEXT_CACHE_MAX_BYTES: usize = 48 * 1024 * 1024;
+const BRIDGE_TEXT_CACHE_MAX_ENTRIES: usize = 24;
 
 #[derive(Default)]
 struct BridgeTextPayloadCache {

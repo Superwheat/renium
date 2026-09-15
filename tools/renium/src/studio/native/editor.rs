@@ -397,8 +397,8 @@ pub(crate) fn decode_bridge_buffer(
 
 const NATIVE_BINARY_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
-const NATIVE_PAYLOAD_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
-const NATIVE_PAYLOAD_CACHE_MAX_ENTRIES: usize = 32;
+const NATIVE_PAYLOAD_CACHE_MAX_BYTES: usize = 48 * 1024 * 1024;
+const NATIVE_PAYLOAD_CACHE_MAX_ENTRIES: usize = 12;
 
 #[derive(Default)]
 struct NativePayloadCache {
