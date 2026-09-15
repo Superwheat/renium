@@ -410,6 +410,20 @@ mod tests {
                 .with_name("Config")
                 .with_property("Source", "return 1"),
         );
+        dom.insert(
+            storage,
+            InstanceBuilder::new("Script")
+                .with_name("Legacy")
+                .with_property("Source", "return 2")
+                .with_property("Disabled", true),
+        );
+        dom.insert(
+            storage,
+            InstanceBuilder::new("Script")
+                .with_name("Active")
+                .with_property("Source", "return 3")
+                .with_property("Disabled", false),
+        );
         let mut bytes = Vec::new();
         rbx_binary::to_writer(&mut bytes, &dom, dom.root().children()).expect("place bytes");
         std::fs::write(root.join("place.rbxl"), bytes).expect("place file");
@@ -424,11 +438,62 @@ mod tests {
 
         let first = run(&root);
         assert_eq!(first["ok"], true);
-        assert_eq!(first["instances"], 3);
+        assert_eq!(first["instances"], 5);
+        let storage_store =
+            SettingsBytecode::read_file(&root.join("instances").join("ReplicatedStorage.renium"))
+                .expect("storage store");
+        let script = |name: &str| {
+            storage_store
+                .instances
+                .iter()
+                .find(|instance| instance.name == name)
+                .expect(name)
+        };
+        assert_eq!(script("Legacy").properties["Enabled"], false);
+        assert!(!script("Active").properties.contains_key("Enabled"));
+        let exported = root.join("exported.rbxl");
+        crate::rbx::model::bytecode_export_place(crate::cli::BytecodeExportPlaceArgs {
+            project: crate::cli::ProjectSourceArgs {
+                project_root: root.clone(),
+                src_root: PathBuf::from("src"),
+            },
+            services: String::new(),
+            output: exported.clone(),
+            format: None,
+            base: None,
+            pretty: false,
+        })
+        .expect("place export");
+        let exported_dom =
+            rbx_binary::from_reader(std::fs::File::open(&exported).expect("exported file"))
+                .expect("exported dom");
+        let exported_script = |name: &str| {
+            exported_dom
+                .descendants()
+                .find(|instance| instance.name == name && instance.class == "Script")
+                .expect(name)
+        };
+        assert_eq!(
+            exported_script("Legacy")
+                .properties
+                .get(&rbx_dom_weak::Ustr::from("Disabled")),
+            Some(&rbx_dom_weak::types::Variant::Bool(true))
+        );
+        assert_ne!(
+            exported_script("Active")
+                .properties
+                .get(&rbx_dom_weak::Ustr::from("Disabled")),
+            Some(&rbx_dom_weak::types::Variant::Bool(true))
+        );
         let script = walkdir::WalkDir::new(root.join("src"))
             .into_iter()
             .filter_map(Result::ok)
-            .find(|entry| entry.path().extension().is_some_and(|ext| ext == "luau"))
+            .find(|entry| {
+                entry
+                    .path()
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("Config."))
+            })
             .expect("a script file");
         assert_eq!(
             std::fs::read_to_string(script.path()).expect("script source"),

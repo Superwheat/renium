@@ -116,6 +116,14 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
         let decal = class_metadata.decal;
 
         for (name, value) in &instance.properties {
+            if name == "Enabled"
+                && rbx_reflection_class_is_a(self.database, &instance.class_name, "BaseScript")
+            {
+                if let Some(enabled) = value.as_bool() {
+                    builder.add_property("Disabled", RbxVariant::Bool(!enabled));
+                }
+                continue;
+            }
             let property_metadata = class_metadata
                 .properties
                 .entry(name.as_str())

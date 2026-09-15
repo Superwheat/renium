@@ -948,6 +948,14 @@ pub(crate) fn rbx_properties_to_native_settings_records<'a>(
             source = rbx_variant_to_source_string(variant);
             continue;
         }
+        if property_name == "Disabled"
+            && rbx_reflection_class_is_a(database, class_name, "BaseScript")
+        {
+            if matches!(variant, RbxVariant::Bool(true)) {
+                properties.insert("Enabled".to_string(), Value::Bool(false));
+            }
+            continue;
+        }
         if rbx_variant_referent(variant).is_some_and(|referent| {
             imported_instance_index(refs, referent).is_none()
                 && !refs.path_segments_by_ref.contains_key(&referent)
@@ -1021,6 +1029,14 @@ pub(crate) fn rbx_properties_to_settings_records<'a>(
         }
         if property_name.eq_ignore_ascii_case("Source") && is_lua_source_class(class_name) {
             source = rbx_variant_to_source_string(variant);
+            continue;
+        }
+        if property_name == "Disabled"
+            && rbx_reflection_class_is_a(database, class_name, "BaseScript")
+        {
+            if matches!(variant, RbxVariant::Bool(true)) {
+                properties.insert("Enabled".to_string(), Value::Bool(false));
+            }
             continue;
         }
         if !options.native_properties_pre_filtered
