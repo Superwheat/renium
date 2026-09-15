@@ -55,6 +55,9 @@ pub(crate) struct EditorPropertyChange {
     pub(crate) attributes: Map<String, Value>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) deleted_attributes: Vec<String>,
+    /// `attributes` is the whole map; Studio drops attributes absent from it.
+    #[serde(skip_serializing_if = "is_false")]
+    pub(crate) attributes_complete: bool,
 }
 
 // Font.new cannot carry the serializer's cached face, and even a missing cache

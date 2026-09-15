@@ -3786,6 +3786,7 @@ fn texture_pack_routing_keeps_verified_setters_in_the_live_transaction() {
                 reset_properties: Vec::new(),
                 attributes: Map::new(),
                 deleted_attributes: Vec::new(),
+                attributes_complete: false,
             })
             .collect(),
         ..EditorChangeSet::default()
@@ -3935,6 +3936,7 @@ fn material_mode_uses_native_transaction_instead_of_place_reopen() {
             reset_properties: Vec::new(),
             attributes: Map::new(),
             deleted_attributes: Vec::new(),
+            attributes_complete: false,
         }],
         ..EditorChangeSet::default()
     };

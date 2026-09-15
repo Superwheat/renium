@@ -2790,6 +2790,7 @@ fn collect_direct_editor_property_change(
         reset_properties: Vec::new(),
         attributes,
         deleted_attributes,
+        attributes_complete: false,
     });
     Ok(changes)
 }
@@ -3624,6 +3625,7 @@ fn append_editor_reference_repairs(
             reset_properties,
             attributes,
             deleted_attributes,
+            attributes_complete: false,
         });
     }
 }
@@ -4034,6 +4036,7 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
                             reset_properties: Vec::new(),
                             attributes: Map::new(),
                             deleted_attributes: Vec::new(),
+                            attributes_complete: false,
                         });
                     }
                 }
@@ -4316,6 +4319,7 @@ mod sync_tests {
             reset_properties: Vec::new(),
             attributes: Map::new(),
             deleted_attributes: Vec::new(),
+            attributes_complete: false,
         }
     }
 

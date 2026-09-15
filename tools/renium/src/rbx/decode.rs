@@ -667,8 +667,14 @@ fn fetch_native_overlay_batch_once(
         Vec::new()
     };
     let settings_ids = if request.include_debug_ids {
-        decode_batch_settings_ids(batch.settings_ids, take_count, "Native overlay settings id")
-            .with_context(|| format!("Invalid native settings ids for {service}"))?
+        let mut ids =
+            decode_batch_settings_ids(batch.settings_ids, take_count, "Native overlay settings id")
+                .with_context(|| format!("Invalid native settings ids for {service}"))?;
+        // A repeated id would make the store undecodable; the later object
+        // keeps its positional id instead.
+        let mut seen = HashSet::new();
+        ids.retain(|(_, settings_id)| seen.insert(settings_id.clone()));
+        ids
     } else {
         Vec::new()
     };

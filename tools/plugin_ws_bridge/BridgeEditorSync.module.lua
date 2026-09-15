@@ -495,6 +495,14 @@ local function rememberMatchedSettingsInstance(
 		serviceMatches = {}
 		ctx.matchedSettingsInstancesByService[serviceName] = serviceMatches
 	end
+	-- One settings id names one instance; a stale binding to another live
+	-- object would make the next export emit the id twice.
+	local previous = liveInstance(serviceMatches[settingsId])
+	if previous ~= nil and previous ~= instance and type(ctx.matchedSettingsIdByInstance) == "table"
+		and ctx.matchedSettingsIdByInstance[previous] == settingsId then
+		ctx.matchedSettingsIdByInstance[previous] = nil
+		ctx.matchedSettingsIdVersion = (tonumber(ctx.matchedSettingsIdVersion) or 0) + 1
+	end
 	serviceMatches[settingsId] = instance
 	if settingsId ~= "1" and not strongSettingsId(settingsId) then
 		if type(ctx.matchedSettingsIdByInstance) ~= "table" then
@@ -2797,6 +2805,14 @@ local function applyPropertyChange(
 	end
 
 	local attributes = change.attributes
+	if change.attributesComplete == true then
+		local desired = if type(attributes) == "table" then attributes else {}
+		for attributeName in pairs(instance:GetAttributes()) do
+			if desired[attributeName] == nil and string.sub(attributeName, 1, 4) ~= "RBX_" then
+				deleteAttribute(instance, attributeName, change, ctx, stats)
+			end
+		end
+	end
 	if type(attributes) == "table" then
 		for attributeName, rawValue in pairs(attributes) do
 			attributeName = tostring(attributeName)

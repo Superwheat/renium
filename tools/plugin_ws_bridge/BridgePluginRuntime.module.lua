@@ -981,9 +981,11 @@ function BridgePluginRuntime.start(context)
 		end
 		local rows = {}
 		if version > 0 then
+			local seen = {}
 			for index, instance in ipairs(state.instances) do
 				local settingsId = editorSync.matchedSettingsId(instance)
-				if settingsId ~= nil then
+				if settingsId ~= nil and not seen[settingsId] then
+					seen[settingsId] = true
 					rows[#rows + 1] = { index = index, id = settingsId }
 				end
 			end
