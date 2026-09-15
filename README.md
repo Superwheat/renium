@@ -1,7 +1,7 @@
 # Renium
 
-Two-way Roblox Studio sync and automation. Edit code in VS Code or Cursor,
-build in Studio, and keep both in the same project.
+Renium is a fast, two-way Roblox Studio sync and automation tool written mostly
+in Rust. Bug reports and suggestions are welcome.
 
 ## Install
 
