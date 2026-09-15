@@ -193,6 +193,18 @@ fn service_subtrees(flat: &FlatDom) -> HashMap<String, Vec<usize>> {
     subtrees
 }
 
+fn clock_time_from_time_of_day(text: &str) -> Option<f64> {
+    let mut parts = text.split(':').map(|part| part.trim().parse::<f64>().ok());
+    let hours = parts.next()??;
+    let minutes = parts.next().flatten().unwrap_or(0.0);
+    let seconds = parts.next().flatten().unwrap_or(0.0);
+    if parts.next().is_some() {
+        return None;
+    }
+    let clock = (hours + minutes / 60.0 + seconds / 3600.0) as f32;
+    clock.is_finite().then_some(f64::from(clock))
+}
+
 fn empty_service_parts(service: &str) -> ExportedSnapshotParts {
     ExportedSnapshotParts {
         class_defaults: Value::Object(Default::default()),
@@ -284,8 +296,29 @@ fn convert_service(
         if let Some(source) = source {
             properties.insert("Source".to_string(), Value::String(source));
         }
+        properties.retain(|name, _| {
+            !crate::editor::review::is_engine_managed_editor_property(class_name, name, database)
+        });
         if local == 0 {
-            properties.remove("UniqueId");
+            properties.retain(|name, _| {
+                !crate::rbx::decode::is_unexposed_service_property(database, class_name, name)
+            });
+            if class_name == "Lighting"
+                && !properties.contains_key("ClockTime")
+                && let Some(clock_time) = properties
+                    .get("TimeOfDay")
+                    .and_then(Value::as_str)
+                    .and_then(clock_time_from_time_of_day)
+            {
+                properties.insert("ClockTime".to_string(), json!(clock_time));
+            }
+            native_properties.retain(|property| {
+                !crate::rbx::decode::is_unexposed_service_property(
+                    database,
+                    class_name,
+                    &property.name,
+                )
+            });
             properties.insert("Archivable".to_string(), Value::Bool(true));
             attributes.retain(|name, _| !name.starts_with("RBX"));
         }
@@ -339,11 +372,25 @@ mod tests {
     }
 
     #[test]
+    fn clock_time_derives_from_time_of_day() {
+        assert_eq!(
+            clock_time_from_time_of_day("10:36:00"),
+            Some(f64::from(10.6f32))
+        );
+        assert_eq!(clock_time_from_time_of_day("14:00:00"), Some(14.0));
+        assert_eq!(clock_time_from_time_of_day("00:30"), Some(0.5));
+        assert_eq!(clock_time_from_time_of_day("noon"), None);
+    }
+
+    #[test]
     fn place_import_writes_scripts_stores_and_references_once() {
         let root = create_unique_directory(&std::env::temp_dir(), "renium-place-import-")
             .expect("temp project");
         let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
-        let workspace = dom.insert(dom.root_ref(), InstanceBuilder::new("Workspace"));
+        let workspace = dom.insert(
+            dom.root_ref(),
+            InstanceBuilder::new("Workspace").with_property("SourceAssetId", 5i64),
+        );
         let door = dom.insert(
             workspace,
             InstanceBuilder::new("Part")
@@ -396,6 +443,13 @@ mod tests {
             .find(|instance| instance.name == "Door")
             .expect("door");
         assert_eq!(door.properties["Anchored"], true);
+        let workspace_root = workspace
+            .instances
+            .iter()
+            .find(|instance| instance.parent_index.is_none())
+            .expect("workspace root");
+        assert!(!workspace_root.properties.contains_key("SourceAssetId"));
+        assert_eq!(workspace_root.properties["Archivable"], true);
         let door_index = workspace
             .instances
             .iter()

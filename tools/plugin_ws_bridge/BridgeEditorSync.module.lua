@@ -2427,7 +2427,7 @@ local function queueNativeRootWrite(instance, propertyName, rawValue, change, ct
 		value = decoded
 	end
 	local okRead, current = readProperty(instance, propertyName)
-	if okRead and exactValuesEqual(current, value) then
+	if okRead and propertyValuesEqual(instance, propertyName, current, value) then
 		stats.noops += 1
 		return
 	end
@@ -5008,6 +5008,10 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local session = editorTransactions[transactionId]
 		if type(session) == "table" then
 			local state = if session.rollbackFailed ~= nil then "rollbackFailed" else tostring(session.state or "open")
+			if params.nativeRootWrite == nil and params.nativeTerrainBaseline == nil
+				and (state == "open" or state == "prepared") then
+				armSessionExpiry(editorTransactions, transactionId, session)
+			end
 			if params.nativeTerrainBaseline ~= nil then
 				assertTransactionLease(session)
 				if type(params.nativeTerrainBaseline) ~= "string" or #params.nativeTerrainBaseline ~= 88

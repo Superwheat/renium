@@ -102,7 +102,7 @@ assert(not predicate({ ClassName = "Part" }, "Scale"))
 local queue = extract("local function queueNativeRootWrite(", "local function applyChangedProperty(", {
 	decodePropertyValue = function(_, _, value) return true, value end,
 	readProperty = function(instance, name) return instance[name] ~= nil, instance[name] end,
-	exactValuesEqual = function(a, b) return a == b end,
+	propertyValuesEqual = function(_, _, a, b) return a == b end,
 	markLiveMutation = function(ctx) ctx.editorTransaction.mutated = true end,
 }, "queueNativeRootWrite")
 local ctx = { editorTransaction = { historyRecording = "owned-recording" } }

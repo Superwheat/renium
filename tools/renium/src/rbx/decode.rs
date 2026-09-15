@@ -90,6 +90,33 @@ fn native_property_data_type_supported(data_type: &RbxDataType<'_>) -> bool {
 
 /// Whether Studio saves this property as a field of its own. Properties
 /// without a serialized form only exist through live reads.
+pub(crate) fn is_unexposed_service_property(
+    database: &ReflectionDatabase<'_>,
+    class_name: &str,
+    name: &str,
+) -> bool {
+    if !database
+        .classes
+        .get(class_name)
+        .is_some_and(|class| class.tags.contains(&rbx_reflection::ClassTag::Service))
+    {
+        return false;
+    }
+    if matches!(
+        name,
+        "Capabilities" | "HistoryId" | "SourceAssetId" | "UniqueId"
+    ) {
+        return true;
+    }
+    if crate::editor::native_roots::is_property(class_name, name) {
+        return false;
+    }
+    match crate::rbx::encode::rbx_property_descriptor(database, class_name, name) {
+        Some(descriptor) => matches!(descriptor.scriptability, RbxScriptability::None),
+        None => true,
+    }
+}
+
 pub(crate) fn property_has_serialized_form(
     database: &ReflectionDatabase<'_>,
     class_name: &str,
