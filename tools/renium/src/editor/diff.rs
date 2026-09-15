@@ -668,17 +668,21 @@ fn append_editor_property_changes_with_paths(
             );
         }
 
-        let attributes = if !filter.property_names.is_empty() || import.is_some() {
-            Map::new()
-        } else {
+        let attributes_complete = filter.property_names.is_empty() && import.is_none();
+        let attributes = if attributes_complete {
             normalized_editor_attributes(
                 instance,
                 paths.paths_by_index,
                 paths.settings_ids_by_index,
             )
+        } else {
+            Map::new()
         };
 
-        if !properties.is_empty() || !attributes.is_empty() {
+        // A targeted push names its instances, so an empty complete map is
+        // still worth sending: it removes attributes Studio still holds.
+        let targeted = !filter.settings_ids.is_empty();
+        if !properties.is_empty() || !attributes.is_empty() || (attributes_complete && targeted) {
             append_editor_property_change(
                 changes,
                 service,
@@ -686,6 +690,7 @@ fn append_editor_property_changes_with_paths(
                 path_info.clone(),
                 properties,
                 attributes,
+                attributes_complete,
             );
         }
     }
@@ -982,8 +987,9 @@ fn append_editor_property_change(
     path: EditorInstancePath,
     properties: Map<String, Value>,
     attributes: Map<String, Value>,
+    attributes_complete: bool,
 ) {
-    if properties.is_empty() && attributes.is_empty() {
+    if properties.is_empty() && attributes.is_empty() && !attributes_complete {
         return;
     }
     changes.property_changes.push(EditorPropertyChange {
@@ -996,6 +1002,7 @@ fn append_editor_property_change(
         reset_properties: Vec::new(),
         attributes,
         deleted_attributes: Vec::new(),
+        attributes_complete,
     });
 }
 

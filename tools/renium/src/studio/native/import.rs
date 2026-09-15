@@ -2895,6 +2895,13 @@ fn build_editor_binary_import_for_services(
     );
     let (mut build, mut pending_groups) = build?;
     let mut live_preflight = live_preflight?;
+    crate::app::output::log_global(
+        5,
+        format_args!(
+            "[renium] additive roots: requested={additive_roots:?} ids={additive_root_ids:?} absent={:?}",
+            live_preflight.absent_roots
+        ),
+    );
     for group in &mut pending_groups {
         if group.additive {
             let mut kept_ids = Vec::new();

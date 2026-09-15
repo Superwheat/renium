@@ -4108,6 +4108,7 @@ fn append_aligned_settings_push_plan(
                 reset_properties,
                 attributes: Map::new(),
                 deleted_attributes,
+                attributes_complete: false,
             });
         }
     }
@@ -7134,6 +7135,7 @@ mod tests {
             reset_properties: Vec::new(),
             attributes: Map::from_iter([("Keep".into(), json!(false))]),
             deleted_attributes: vec!["Removed".into()],
+            attributes_complete: false,
         });
         amend_reconciled_changes(&mut changes, plan).unwrap();
         assert_eq!(changes.instance_changes[0].mode, "deleteInstances");

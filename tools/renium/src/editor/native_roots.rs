@@ -673,6 +673,7 @@ mod tests {
             reset_properties: vec![],
             attributes: Map::new(),
             deleted_attributes: vec![],
+            attributes_complete: false,
         };
         assert_eq!(NativeRootVerification::default().verified_fields(&row), 0);
         let mut verified = NativeRootVerification::default();
