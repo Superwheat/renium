@@ -1190,100 +1190,6 @@ mod platform {
             .collect()
     }
 
-    #[cfg(test)]
-    mod viewport_probe_tests {
-        use super::*;
-
-        #[test]
-        fn probe_cleanup_runs_after_failed_start_capture_and_unwind() {
-            for fail_start in [true, false] {
-                let mut phases = Vec::new();
-                let result: Result<()> = with_capture_probe(
-                    &mut |phase, _| {
-                        phases.push(phase);
-                        if fail_start && phase == 0 {
-                            bail!("response lost");
-                        }
-                        Ok(())
-                    },
-                    |set| {
-                        set(0, &[])?;
-                        bail!("capture cancelled");
-                    },
-                );
-                assert!(result.is_err());
-                assert_eq!(phases, [0, 2]);
-            }
-            let mut phases = Vec::new();
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _: Result<()> = with_capture_probe(
-                    &mut |phase, _| {
-                        phases.push(phase);
-                        Ok(())
-                    },
-                    |set| {
-                        set(0, &[])?;
-                        panic!("capture panicked");
-                    },
-                );
-            }));
-            assert_eq!(phases, [0, 2]);
-        }
-
-        #[test]
-        fn probe_cleanup_failure_preserves_the_capture_failure() {
-            let result: Result<()> = with_capture_probe(&mut |_, _| bail!("stop failed"), |_| {
-                bail!("capture timed out");
-            });
-            let message = format!("{:#}", result.unwrap_err());
-            assert!(message.contains("capture timed out"));
-            assert!(message.contains("stop failed"));
-        }
-
-        #[test]
-        fn delayed_probe_frames_must_show_the_transition_in_the_same_window() {
-            let first = probe_palette(0x12345678);
-            let second = first.map(|color| 0x00ff_ffff ^ color);
-            let frame = |hwnd, rendered: bool| {
-                let mut pixels = vec![100; 96 * 96 * 4];
-                if rendered {
-                    for y in 0..96 {
-                        for x in 0..96 {
-                            let tile = y / 24 * 4 + x / 24;
-                            for channel in 0..3 {
-                                let shift = 16 - channel * 8;
-                                let delta = ((second[tile] >> shift) & 255) as i16
-                                    - ((first[tile] >> shift) & 255) as i16;
-                                pixels[(y * 96 + x) * 4 + channel] =
-                                    (100 + delta.signum() * 4) as u8;
-                            }
-                        }
-                    }
-                }
-                ProbeFrame {
-                    candidate: CaptureCandidate {
-                        hwnd,
-                        width: 96,
-                        height: 96,
-                    },
-                    pixels,
-                }
-            };
-            let before = [frame(42, false)];
-            // Old frames remain pending; another session's matching colors never qualify.
-            assert!(
-                matching_probe_frames(&before, vec![frame(42, false)], &first, &second).is_empty()
-            );
-            assert!(
-                matching_probe_frames(&before, vec![frame(43, true)], &first, &second).is_empty()
-            );
-            assert_eq!(
-                matching_probe_frames(&before, vec![frame(42, true)], &first, &second).len(),
-                1
-            );
-        }
-    }
-
     fn capture_probe_frames(candidates: &[CaptureCandidate]) -> Vec<ProbeFrame> {
         candidates
             .iter()
@@ -2001,6 +1907,99 @@ mod platform {
 
     pub fn capture_window_rgba(handle: &WindowHandle) -> Result<(u32, u32, Vec<u8>)> {
         capture_hwnd_pixels(handle.capture, !handle.capture_verified)
+    }
+    #[cfg(test)]
+    mod viewport_probe_tests {
+        use super::*;
+
+        #[test]
+        fn probe_cleanup_runs_after_failed_start_capture_and_unwind() {
+            for fail_start in [true, false] {
+                let mut phases = Vec::new();
+                let result: Result<()> = with_capture_probe(
+                    &mut |phase, _| {
+                        phases.push(phase);
+                        if fail_start && phase == 0 {
+                            bail!("response lost");
+                        }
+                        Ok(())
+                    },
+                    |set| {
+                        set(0, &[])?;
+                        bail!("capture cancelled");
+                    },
+                );
+                assert!(result.is_err());
+                assert_eq!(phases, [0, 2]);
+            }
+            let mut phases = Vec::new();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _: Result<()> = with_capture_probe(
+                    &mut |phase, _| {
+                        phases.push(phase);
+                        Ok(())
+                    },
+                    |set| {
+                        set(0, &[])?;
+                        panic!("capture panicked");
+                    },
+                );
+            }));
+            assert_eq!(phases, [0, 2]);
+        }
+
+        #[test]
+        fn probe_cleanup_failure_preserves_the_capture_failure() {
+            let result: Result<()> = with_capture_probe(&mut |_, _| bail!("stop failed"), |_| {
+                bail!("capture timed out");
+            });
+            let message = format!("{:#}", result.unwrap_err());
+            assert!(message.contains("capture timed out"));
+            assert!(message.contains("stop failed"));
+        }
+
+        #[test]
+        fn delayed_probe_frames_must_show_the_transition_in_the_same_window() {
+            let first = probe_palette(0x12345678);
+            let second = first.map(|color| 0x00ff_ffff ^ color);
+            let frame = |hwnd, rendered: bool| {
+                let mut pixels = vec![100; 96 * 96 * 4];
+                if rendered {
+                    for y in 0..96 {
+                        for x in 0..96 {
+                            let tile = y / 24 * 4 + x / 24;
+                            for channel in 0..3 {
+                                let shift = 16 - channel * 8;
+                                let delta = ((second[tile] >> shift) & 255) as i16
+                                    - ((first[tile] >> shift) & 255) as i16;
+                                pixels[(y * 96 + x) * 4 + channel] =
+                                    (100 + delta.signum() * 4) as u8;
+                            }
+                        }
+                    }
+                }
+                ProbeFrame {
+                    candidate: CaptureCandidate {
+                        hwnd,
+                        width: 96,
+                        height: 96,
+                    },
+                    pixels,
+                }
+            };
+            let before = [frame(42, false)];
+            // Old frames remain pending; another session's matching colors never qualify.
+            assert!(
+                matching_probe_frames(&before, vec![frame(42, false)], &first, &second).is_empty()
+            );
+            assert!(
+                matching_probe_frames(&before, vec![frame(43, true)], &first, &second).is_empty()
+            );
+            assert_eq!(
+                matching_probe_frames(&before, vec![frame(42, true)], &first, &second).len(),
+                1
+            );
+        }
     }
 }
 
