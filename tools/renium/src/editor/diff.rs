@@ -588,6 +588,9 @@ fn append_editor_property_changes_with_paths(
         if !filter.includes_instance(&instance.settings_id) {
             continue;
         }
+        if filter.local_values_only && !instance.settings_id.starts_with("editor:") {
+            continue;
+        }
         let Some(path_info) = paths.paths_by_index.get(index).and_then(Option::as_ref) else {
             continue;
         };

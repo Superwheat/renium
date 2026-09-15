@@ -223,12 +223,17 @@ impl EditorInstancePath {
 pub(crate) struct EditorPropertyFilter {
     pub(crate) settings_ids: HashSet<String>,
     pub(crate) property_names: HashSet<String>,
+    /// An upsert of a whole service sends values only for instances the
+    /// project created; pulled instances already carry theirs in Studio.
+    pub(crate) local_values_only: bool,
 }
 
 impl EditorPropertyFilter {
     pub(crate) fn from_args(args: &PushEditorChangesArgs) -> Result<Self> {
+        let settings_ids = expand_editor_target_settings_ids(args)?;
         Ok(Self {
-            settings_ids: expand_editor_target_settings_ids(args)?,
+            local_values_only: args.upsert_instances_only && settings_ids.is_empty(),
+            settings_ids,
             property_names: args
                 .target_properties
                 .iter()
