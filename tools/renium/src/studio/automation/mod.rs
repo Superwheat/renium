@@ -11,7 +11,7 @@ use full_moon::node::Node;
 use full_moon::visitors::Visitor;
 use serde_json::{Map, Value, json};
 
-use crate::app::output::{ensure_luau_api_ok, ensure_plugin_api_ok, print_json_output};
+use crate::app::output::{ensure_luau_api_ok, ensure_plugin_api_ok, log_global, print_json_output};
 use crate::app::timing::current_millis;
 use crate::automation::{commands::daemon_result, op};
 use crate::cli::{
@@ -760,6 +760,118 @@ fn cancel_test_launch_best_effort(bridge: &BridgeServer, launch: &TestLaunch) {
         &launch.edit_runtime_id,
         Some(Duration::from_secs(2)),
     );
+    close_leftover_test_processes(bridge, &launch.edit_runtime_id, Duration::from_secs(15));
+}
+
+fn multiplayer_start_deadline(started: Instant, last_progress: Instant) -> Instant {
+    (last_progress + Duration::from_secs(60))
+        .max(started + Duration::from_secs(90))
+        .min(started + Duration::from_secs(240))
+}
+
+#[cfg(windows)]
+fn leftover_test_processes(edit_pid: u32) -> Vec<u32> {
+    crate::studio::performance::studio_descendant_processes(edit_pid).unwrap_or_default()
+}
+
+#[cfg(target_os = "macos")]
+fn leftover_test_processes(edit_pid: u32) -> Vec<u32> {
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid=,comm="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    let mut children = std::collections::HashMap::<u32, Vec<u32>>::new();
+    let mut studio = HashSet::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(pid), Some(parent)) = (
+            parts.next().and_then(|value| value.parse::<u32>().ok()),
+            parts.next().and_then(|value| value.parse::<u32>().ok()),
+        ) else {
+            continue;
+        };
+        children.entry(parent).or_default().push(pid);
+        if parts.collect::<Vec<_>>().join(" ").contains("RobloxStudio") {
+            studio.insert(pid);
+        }
+    }
+    let mut result = Vec::new();
+    let mut pending = vec![edit_pid];
+    let mut seen = HashSet::new();
+    while let Some(pid) = pending.pop() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        if pid != edit_pid && studio.contains(&pid) {
+            result.push(pid);
+        }
+        if let Some(found) = children.get(&pid) {
+            pending.extend(found.iter().copied());
+        }
+    }
+    result
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn leftover_test_processes(_edit_pid: u32) -> Vec<u32> {
+    Vec::new()
+}
+
+#[cfg(windows)]
+fn terminate_test_process(pid: u32) -> Result<()> {
+    crate::studio::input::terminate_studio_process(pid)
+}
+
+#[cfg(target_os = "macos")]
+fn terminate_test_process(pid: u32) -> Result<()> {
+    let status = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status()
+        .context("Could not signal the Studio test process")?;
+    if !status.success() {
+        bail!("Could not terminate Studio process {pid}");
+    }
+    Ok(())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn terminate_test_process(_pid: u32) -> Result<()> {
+    Ok(())
+}
+
+fn close_leftover_test_processes(
+    bridge: &BridgeServer,
+    edit_runtime_id: &str,
+    grace: Duration,
+) -> Vec<u32> {
+    let Ok(edit_pid) = bridge.studio_pid_for_runtime(BridgeTarget::Edit, edit_runtime_id) else {
+        return Vec::new();
+    };
+    let deadline = Instant::now() + grace;
+    let mut leftover = leftover_test_processes(edit_pid);
+    while !leftover.is_empty() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(250));
+        leftover = leftover_test_processes(edit_pid);
+    }
+    let mut closed = Vec::new();
+    for pid in leftover {
+        match terminate_test_process(pid) {
+            Ok(()) => closed.push(pid),
+            Err(error) => log_global(
+                5,
+                format_args!("[renium] Studio test process {pid} could not be closed: {error:#}"),
+            ),
+        }
+    }
+    if !closed.is_empty() {
+        log_global(
+            5,
+            format_args!("[renium] closed leftover Studio test processes: {closed:?}"),
+        );
+    }
+    closed
 }
 
 fn start_single_play_result(bridge: &BridgeServer, mode: &str) -> Result<Value> {
@@ -888,7 +1000,9 @@ fn start_multiplayer_test_result(bridge: &BridgeServer, players: u32) -> Result<
         {
             ensure_plugin_api_ok(&start_result)?;
         }
-        let deadline = Instant::now() + Duration::from_secs(90);
+        let started = Instant::now();
+        let mut last_progress = started;
+        let mut last_seen = (false, 0usize);
         loop {
             if let Ok(status) = studio_play_status_for_runtime(bridge, &launch.edit_runtime_id) {
                 if status.get("launchNonce").and_then(Value::as_str) != Some(launch.nonce.as_str())
@@ -920,7 +1034,11 @@ fn start_multiplayer_test_result(bridge: &BridgeServer, players: u32) -> Result<
                     "clients": clients,
                 }));
             }
-            if Instant::now() >= deadline {
+            if (server_ready, client_count) != last_seen {
+                last_seen = (server_ready, client_count);
+                last_progress = Instant::now();
+            }
+            if Instant::now() >= multiplayer_start_deadline(started, last_progress) {
                 bail!(
                     "Timed out waiting for the multiplayer test instances to connect \
                      (server ready: {server_ready}, clients connected: {client_count}/{players}). \
@@ -2366,7 +2484,13 @@ fn stop_studio_play_with_bridge_result(bridge: &BridgeServer) -> Result<Value> {
     if play_status_is_stopped(&initial) && active_clients.is_empty() {
         #[cfg(any(windows, target_os = "macos"))]
         process_exit::wait(&processes, shutdown_deadline)?;
+        let closed =
+            close_leftover_test_processes(bridge, &edit_runtime_id, Duration::from_secs(5));
         bridge.clear_runtime_pins();
+        let mut initial = initial;
+        if !closed.is_empty() {
+            initial["closedProcesses"] = json!(closed);
+        }
         return Ok(initial);
     }
     let launch_nonce = initial
@@ -2424,15 +2548,21 @@ fn stop_studio_play_with_bridge_result(bridge: &BridgeServer) -> Result<Value> {
         if stopped {
             #[cfg(any(windows, target_os = "macos"))]
             process_exit::wait(&processes, shutdown_deadline)?;
+            let closed =
+                close_leftover_test_processes(bridge, &edit_runtime_id, Duration::from_secs(5));
             retire_play_clients(bridge, &studio_play_clients(bridge, &edit_runtime_id));
             bridge.clear_runtime_pins();
-            return Ok(json!({
+            let mut result = json!({
                 "ok": true,
                 "action": "stop",
                 "method": "pluginApi",
                 "attempts": attempt,
                 "status": last_status,
-            }));
+            });
+            if !closed.is_empty() {
+                result["closedProcesses"] = json!(closed);
+            }
+            return Ok(result);
         }
         if Instant::now() >= shutdown_deadline {
             break;
@@ -2492,6 +2622,23 @@ pub(crate) struct TestLaunch {
 #[cfg(test)]
 mod play_state_tests {
     use super::*;
+
+    #[test]
+    fn multiplayer_start_waits_while_instances_keep_arriving() {
+        let started = Instant::now();
+        assert_eq!(
+            multiplayer_start_deadline(started, started),
+            started + Duration::from_secs(90)
+        );
+        assert_eq!(
+            multiplayer_start_deadline(started, started + Duration::from_secs(80)),
+            started + Duration::from_secs(140)
+        );
+        assert_eq!(
+            multiplayer_start_deadline(started, started + Duration::from_secs(600)),
+            started + Duration::from_secs(240)
+        );
+    }
 
     #[test]
     fn only_a_ready_controller_counts_as_stopped() {

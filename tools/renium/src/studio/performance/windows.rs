@@ -839,6 +839,54 @@ fn ensure_job_queryable(process: &OwnedHandle, job: &OwnedHandle) -> Result<()> 
     Ok(())
 }
 
+pub(crate) fn studio_descendant_processes(root: u32) -> Result<Vec<u32>> {
+    // SAFETY: CreateToolhelp32Snapshot returns a checked snapshot handle.
+    let snapshot = OwnedHandle::new(
+        unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) },
+        "Could not snapshot Windows processes",
+    )?;
+    // SAFETY: all-zero is a valid initial PROCESSENTRY32W before dwSize is set.
+    let mut entry: PROCESSENTRY32W = unsafe { zeroed() };
+    entry.dwSize = u32::try_from(size_of::<PROCESSENTRY32W>())?;
+    let mut children = HashMap::<u32, Vec<u32>>::new();
+    let mut studio = HashSet::new();
+    // SAFETY: snapshot and entry are valid for process enumeration.
+    let mut has_entry = unsafe { Process32FirstW(snapshot.0, &mut entry) } != 0;
+    while has_entry {
+        children
+            .entry(entry.th32ParentProcessID)
+            .or_default()
+            .push(entry.th32ProcessID);
+        let length = entry
+            .szExeFile
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(entry.szExeFile.len());
+        if String::from_utf16_lossy(&entry.szExeFile[..length])
+            .eq_ignore_ascii_case("RobloxStudioBeta.exe")
+        {
+            studio.insert(entry.th32ProcessID);
+        }
+        // SAFETY: snapshot and entry remain valid for the next enumeration call.
+        has_entry = unsafe { Process32NextW(snapshot.0, &mut entry) } != 0;
+    }
+    let mut result = Vec::new();
+    let mut pending = vec![root];
+    let mut seen = HashSet::new();
+    while let Some(pid) = pending.pop() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        if pid != root && studio.contains(&pid) {
+            result.push(pid);
+        }
+        if let Some(found) = children.get(&pid) {
+            pending.extend(found.iter().copied());
+        }
+    }
+    Ok(result)
+}
+
 fn process_tree(root: u32) -> Result<Vec<u32>> {
     // SAFETY: CreateToolhelp32Snapshot returns a checked snapshot handle.
     let snapshot = OwnedHandle::new(

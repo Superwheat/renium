@@ -18,6 +18,8 @@ mod macos;
 mod unsupported;
 #[cfg(windows)]
 mod windows;
+#[cfg(windows)]
+pub(crate) use windows::studio_descendant_processes;
 
 use crate::system::LockRecover;
 #[cfg(target_os = "macos")]
