@@ -6,6 +6,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use windows_sys::Win32::Foundation::{CloseHandle, FreeLibrary, HMODULE};
+use windows_sys::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+};
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_BINARY, RegGetValueW};
 use windows_sys::Win32::System::Threading::{
@@ -13,9 +16,9 @@ use windows_sys::Win32::System::Threading::{
     STARTF_USESHOWWINDOW, STARTUPINFOW, TerminateProcess,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowPlacement, GetWindowTextLengthW, GetWindowThreadProcessId,
-    IsWindowVisible, SW_SHOWMAXIMIZED, SW_SHOWNA, SetWindowPlacement, WINDOWPLACEMENT,
-    WPF_ASYNCWINDOWPLACEMENT,
+    EnumWindows, GWL_STYLE, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, IsWindowVisible, SW_SHOWNA, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOOWNERZORDER, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, WS_MAXIMIZE,
 };
 
 const LAUNCH_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-launch.dll"));
@@ -210,10 +213,19 @@ fn maximize_without_activation(pid: u32) {
         let search = unsafe { &mut *(parameter as *mut Search) };
         let mut owner = 0u32;
         unsafe { GetWindowThreadProcessId(window, &mut owner) };
-        if owner == search.pid
-            && unsafe { IsWindowVisible(window) } != 0
-            && unsafe { GetWindowTextLengthW(window) } > 0
-        {
+        if owner != search.pid || unsafe { IsWindowVisible(window) } == 0 {
+            return 1;
+        }
+        // The splash window is titled too; the main window ends with the
+        // application name after a separator.
+        let length = unsafe { GetWindowTextLengthW(window) };
+        if length <= 0 {
+            return 1;
+        }
+        let mut title = vec![0u16; length as usize + 1];
+        let copied = unsafe { GetWindowTextW(window, title.as_mut_ptr(), title.len() as i32) };
+        let title = String::from_utf16_lossy(&title[..copied.max(0) as usize]);
+        if title.ends_with("Roblox Studio") && title.contains(" - ") {
             search.found = window;
             return 0;
         }
@@ -227,12 +239,27 @@ fn maximize_without_activation(pid: u32) {
         };
         unsafe { EnumWindows(Some(visit), &mut search as *mut Search as isize) };
         if !search.found.is_null() {
-            let mut placement: WINDOWPLACEMENT = unsafe { std::mem::zeroed() };
-            placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
-            if unsafe { GetWindowPlacement(search.found, &mut placement) } != 0 {
-                placement.showCmd = SW_SHOWMAXIMIZED as u32;
-                placement.flags |= WPF_ASYNCWINDOWPLACEMENT;
-                unsafe { SetWindowPlacement(search.found, &placement) };
+            // Every show-style maximize activates the window. Setting the
+            // maximized style and the work-area frame directly does not.
+            let window = search.found;
+            let style = unsafe { GetWindowLongPtrW(window, GWL_STYLE) };
+            unsafe { SetWindowLongPtrW(window, GWL_STYLE, style | WS_MAXIMIZE as isize) };
+            let monitor = unsafe { MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST) };
+            let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
+            info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+            if unsafe { GetMonitorInfoW(monitor, &mut info) } != 0 {
+                let work = info.rcWork;
+                unsafe {
+                    SetWindowPos(
+                        window,
+                        std::ptr::null_mut(),
+                        work.left,
+                        work.top,
+                        work.right - work.left,
+                        work.bottom - work.top,
+                        SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOOWNERZORDER,
+                    )
+                };
             }
             return;
         }
