@@ -56,7 +56,14 @@ pub(crate) fn configured_project_layout(
 /// project yet, create the default one there instead of discovering a parent
 /// project and writing into it.
 pub(crate) fn ensure_explicit_project_root(project_root: &Path) -> Result<()> {
-    if project_root == Path::new(".") || !project_root.is_dir() {
+    if project_root == Path::new(".") {
+        return Ok(());
+    }
+    if !project_root.exists() {
+        std::fs::create_dir_all(project_root)
+            .with_context(|| format!("Failed to create {}", project_root.display()))?;
+    }
+    if !project_root.is_dir() {
         return Ok(());
     }
     if ["renium.project.jsonc", "src", "instances", "places"]
@@ -80,4 +87,26 @@ pub(crate) fn apply_configured_project_layout(
     *project_root = root;
     *source_root = source;
     Ok(())
+}
+
+#[cfg(test)]
+mod explicit_root_tests {
+    use super::ensure_explicit_project_root;
+
+    #[test]
+    fn explicit_missing_root_is_created_with_a_project_file() {
+        let base = std::env::temp_dir().join(format!(
+            "renium-explicit-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = base.join("artifacts").join("replication-lab");
+        ensure_explicit_project_root(&root).unwrap();
+        assert!(root.join("renium.project.jsonc").is_file());
+        ensure_explicit_project_root(&root).unwrap();
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 }
