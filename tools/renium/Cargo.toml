@@ -11,6 +11,7 @@ build = "build.rs"
 anyhow = "1.0.100"
 ahash = "0.8"
 mimalloc = "0.1"
+libmimalloc-sys = { version = "0.1", features = ["extended"] }
 memchr = "2.7"
 clap = { version = "4.5.53", features = ["derive", "string"] }
 renium-plugin-sdk = { path = "../renium-plugin-sdk" }
