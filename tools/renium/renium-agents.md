@@ -1,4 +1,4 @@
-<!-- renium-version: 0.3.6 -->
+<!-- renium-version: 0.3.7 -->
 # Renium for agents
 
 Use `rbx` from the place's project folder. Renium handles connections and the daemon.

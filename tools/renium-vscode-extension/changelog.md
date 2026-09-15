@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.3.7 - 2026-09-15
+
+### New
+
+- `rbx pi` imports a saved RBXL/RBXLX place into project files without Studio.
+- `rbx bep --base ORIGINAL.rbxl` rebuilds a place on top of its original file, keeping every service the project does not sync.
+- Pulling or importing into an empty folder with `-r` creates that folder's own project instead of writing into a parent project.
+- Every CLI argument is described in command help, and help is shorter.
+- CLI output is compact by default; Luau string-keyed tables come back as JSON objects and error traces are trimmed.
+
+### Improvements
+
+- The daemon returns freed memory to the OS promptly. Heavy push and pull sessions now hold about 300 MB instead of 850 MB.
+- Pushes skip work Studio already reflects, and the verified push proof survives while Live Sync is running.
+- Full pushes no longer reset properties Studio cannot reset.
+- Studio launched by Renium keeps its remembered window size and maximized state without taking focus.
+- Undoing a sync keeps your selection instead of selecting the restored instances.
+- On macOS, Studio's package modification notice is disabled when the plugin connects.
+- Every privileged daemon request must be signed.
+- The snapshot workflow, undocumented commands, hidden tuning knobs and pre-0.3.2 migrations are removed.
+
+### Bug fixes
+
+- Pulls no longer fail with "Unsupported attribute binary value" on BrickColor, Font, ColorSequence and NumberSequence attributes, and pushes accept those attributes again.
+- Targeted pushes (`ps -i`) remove attributes deleted from the store and never assign one settings id to two instances.
+- Instances inserted natively under a service keep their project identity, so renaming or moving them by id no longer duplicates them.
+- Filtered pushes record native insertions without change tracking, fixing "Native insertion is missing an expected root", and failed import sessions are released on rollback instead of hitting "Too many active native import sessions".
+- Whole-service upserts (`ps -u`) send values only for project-created instances, so they no longer take minutes on large services.
+- Instances moved out of a subtree that is deleted in the same push are moved before the delete.
+- `cp` clones script sources, `rm -R` keeps descendants, `cr` stores property names and qualified references, `ip` picks unique init stems and accepts dotted imports.
+- `cmp` ignores the viewport camera placement.
+- Model imports accept typed numbers, write scripts under the source root and store scalars the way pulls do.
+- macOS package pushes no longer resolve the wrong sibling.
+- Same-named new roots import natively, and pushes into an emptied place succeed.
+- Legacy migrated properties, engine migration flags and forced text wrapping compare correctly during verification.
+- Native import tag announcements and mesh re-applies stay out of the change journal.
+
 ## 0.3.6 - 2026-09-13
 
 - Windows package warnings no longer interrupt Renium; package links remain intact.
