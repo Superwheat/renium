@@ -88,6 +88,14 @@ pub(crate) fn bytecode_add_instance(args: BytecodeAddInstanceArgs) -> Result<()>
         &class_name,
         parse_property_assignments(&args.properties)?,
     )?;
+    let mut attributes = parse_property_assignments(&args.attributes)?;
+    for map in [&mut properties, &mut attributes] {
+        let mut value = Value::Object(std::mem::take(map));
+        crate::bytecode::qualify_value_references(&mut value, &settings_file, &document)?;
+        if let Value::Object(qualified) = value {
+            *map = qualified;
+        }
+    }
     let source = if is_lua_source_class(&class_name) {
         match properties.get("Source") {
             Some(Value::String(source)) => source.clone(),
@@ -111,7 +119,7 @@ pub(crate) fn bytecode_add_instance(args: BytecodeAddInstanceArgs) -> Result<()>
             class_name: args.class_name,
             parent_index,
             properties,
-            attributes: parse_property_assignments(&args.attributes)?,
+            attributes,
         },
     )?;
     let mut writes = BTreeMap::new();
