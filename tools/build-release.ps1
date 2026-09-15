@@ -293,8 +293,6 @@ $cliProtocolSourcePath = Join-Path $cliDirectory "src\snapshot\export.rs"
 $cliProtocolSource = Get-Content -LiteralPath $cliProtocolSourcePath -Raw
 $compatibilityConstants = [ordered]@{
     BRIDGE_PROTOCOL_VERSION = "BRIDGE_PROTOCOL_VERSION"
-    CHUNK_FRAME_PROTOCOL_VERSION = "BRIDGE_CHUNK_FRAME_PROTOCOL_VERSION"
-    COMPACT_VALUE_PROTOCOL_VERSION = "BRIDGE_COMPACT_VALUE_PROTOCOL_VERSION"
 }
 foreach ($pluginConstant in $compatibilityConstants.Keys) {
     $pluginMatch = [regex]::Match($pluginRuntime, ('(?m)\b' + $pluginConstant + '\s*=\s*"(?<value>[^"]+)"'))
