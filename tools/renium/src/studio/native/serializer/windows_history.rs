@@ -219,15 +219,27 @@ pub(super) fn binding(prepared: &NativeProperty, pid: u32, title: &str) -> Resul
         read_i32(&fields, offset + 8)? == 0,
         "Unsupported history member adjustment"
     );
-    let (voxel, length) = discover(&image, finish - studio.base)?;
-    let code = function(&image, voxel).unwrap();
-    verified_code(
-        &prepared.memory,
-        studio,
-        &layout,
-        studio.base + voxel,
-        code.len(),
-    )?;
+    let playback = match discover(&image, finish - studio.base) {
+        Ok(found) => Some(found),
+        Err(error) => {
+            crate::app::output::log_global(
+                2,
+                format_args!(
+                    "[renium] warning: Studio voxel playback hook unavailable on this build; cancellations restore Terrain explicitly ({error:#})"
+                ),
+            );
+            None
+        }
+    };
+    if let Some((voxel, _)) = playback {
+        verified_code(
+            &prepared.memory,
+            studio,
+            &layout,
+            studio.base + voxel,
+            function(&image, voxel).unwrap().len(),
+        )?;
+    }
     verified_code(
         &prepared.memory,
         studio,
@@ -241,12 +253,14 @@ pub(super) fn binding(prepared: &NativeProperty, pid: u32, title: &str) -> Resul
         (8, prepared.memory.read_u64(descriptor)? as usize),
         (16, offset),
         (24, finish),
-        (32, studio.base + voxel),
+        (32, playback.map_or(0, |(voxel, _)| studio.base + voxel)),
     ] {
         put_u64(&mut binding, at, value);
     }
-    put_u32(&mut binding, 40, length as u32);
-    binding[48..48 + length].copy_from_slice(&code[..length]);
+    if let Some((voxel, length)) = playback {
+        put_u32(&mut binding, 40, length as u32);
+        binding[48..48 + length].copy_from_slice(&function(&image, voxel).unwrap()[..length]);
+    }
     Ok(binding)
 }
 
