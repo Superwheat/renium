@@ -33,7 +33,7 @@ When Play is needed, reuse a suitable session. Test related changes together, wi
 | Studio lifecycle and place management | `RENIUM/advanced.md` |
 | Installed plugins and their commands | `RENIUM/plugins.md` |
 
-Read only guides needed for the task, before using their commands. Use command help for options not covered here.
+Read only guides needed for the task, before using their commands, once per session; reread after `rbx upd` or when a command says the instructions changed. Use command help for other options.
 
 ## Targeting and edits
 
@@ -47,6 +47,9 @@ Choose the source that answers the question. Compare states only when the task c
 
 Read an existing target once and reuse its ID; refresh IDs after a pull.
 Run mutations one at a time and inspect each result. If one fails, check the affected state before retrying or recovering.
+A usage error (unexpected argument, unknown flag, missing or conflicting selector, missing path) means the invocation was malformed, not that Renium failed: fix the quoting, flag, or path and rerun instead of stopping or asking. Quote code and JSON for the shell or pipe them on stdin.
+Keep query results small: request counts, slices, or specific fields; write large captures to a file.
+When a check exposes a defect in what you were asked to deliver, fix and verify it rather than reporting it.
 An empty `changedPaths` is a no-op. After cleanup, one prefix search is enough; `storeRemoved: true` needs no follow-up store query.
 
 Renium marks affected linked packages Changed before edits. Report `autoDesyncedPackages`, including packages named in a failed edit. Publishing needs user authorization; it is not part of syncing.

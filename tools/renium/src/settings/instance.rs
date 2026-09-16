@@ -22,6 +22,7 @@ pub(crate) enum InstanceSelector<'a> {
     SettingsId(&'a str),
     Name(&'a str),
     ClassName(&'a str),
+    NameAndClassName(&'a str, &'a str),
 }
 
 #[derive(Default)]
@@ -310,6 +311,11 @@ pub(crate) fn find_unique_instance_index(
             document,
             |instance| instance.class_name == class_name,
             &format!("className {class_name:?}"),
+        ),
+        InstanceSelector::NameAndClassName(name, class_name) => unique_position(
+            document,
+            |instance| instance.name == name && instance.class_name == class_name,
+            &format!("name {name:?} className {class_name:?}"),
         ),
     }
 }

@@ -35,18 +35,28 @@ pub(crate) fn bytecode_selector<'a>(
         selector = Some(InstanceSelector::SettingsId(settings_id));
         count += 1;
     }
-    if let Some(name) = name.filter(|value| !value.is_empty()) {
-        selector = Some(InstanceSelector::Name(name));
-        count += 1;
-    }
-    if let Some(class_name) = class_name.filter(|value| !value.is_empty()) {
-        selector = Some(InstanceSelector::ClassName(class_name));
-        count += 1;
+    match (
+        name.filter(|value| !value.is_empty()),
+        class_name.filter(|value| !value.is_empty()),
+    ) {
+        (Some(name), Some(class_name)) => {
+            selector = Some(InstanceSelector::NameAndClassName(name, class_name));
+            count += 1;
+        }
+        (Some(name), None) => {
+            selector = Some(InstanceSelector::Name(name));
+            count += 1;
+        }
+        (None, Some(class_name)) => {
+            selector = Some(InstanceSelector::ClassName(class_name));
+            count += 1;
+        }
+        (None, None) => {}
     }
     match (count, selector) {
         (1, Some(selector)) => Ok(selector),
         (0, _) => bail!("Provide one selector: --index, --settings-id, --name, or --class-name"),
-        _ => bail!("Provide only one selector"),
+        _ => bail!("Provide only one selector; --name and --class-name may be combined"),
     }
 }
 
@@ -164,4 +174,23 @@ pub(crate) fn parse_property_assignments(raw: &[String]) -> Result<Map<String, V
         out.insert(name.to_string(), value);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod selector_tests {
+    use super::*;
+
+    #[test]
+    fn name_and_class_selectors_combine() {
+        assert!(matches!(
+            bytecode_selector(None, None, Some("Baseplate"), Some("Part")).unwrap(),
+            InstanceSelector::NameAndClassName("Baseplate", "Part")
+        ));
+        assert!(matches!(
+            bytecode_selector(None, None, Some("Baseplate"), Some("")).unwrap(),
+            InstanceSelector::Name("Baseplate")
+        ));
+        assert!(bytecode_selector(Some(1), None, Some("Baseplate"), None).is_err());
+        assert!(bytecode_selector(None, None, None, None).is_err());
+    }
 }
