@@ -32,7 +32,9 @@ pub(crate) fn register_history(pid: u32, title: &str, token: &str) -> Result<()>
     prepared.invoke(6)?;
     let mut binding = prepared.parameters[96..176].to_vec();
     if binding.iter().all(|byte| *byte == 0) {
-        binding = history::binding(&prepared, pid, title)?;
+        binding = history::binding(&prepared, pid, title).map_err(|error| {
+            crate::studio::native::serializer::HistoryHookUnavailable(format!("{error:#}"))
+        })?;
     }
     binding.extend_from_slice(token.as_bytes());
     put_u32(&mut prepared.parameters, 65916, binding.len() as u32);

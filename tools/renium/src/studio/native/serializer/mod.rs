@@ -94,3 +94,51 @@ fn terrain_payload(
     payload.extend_from_slice(physics);
     Ok(payload)
 }
+
+#[derive(Debug)]
+pub(crate) struct HistoryHookUnavailable(pub(crate) String);
+
+impl std::fmt::Display for HistoryHookUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for HistoryHookUnavailable {}
+
+#[cfg(any(windows, target_os = "macos"))]
+static HISTORY_HOOK_WARNED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn register_history_if_available(
+    pid: u32,
+    title: &str,
+    token: &str,
+    terrain: bool,
+) -> anyhow::Result<bool> {
+    match register_history(pid, title, token) {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            let Some(unavailable) = error.downcast_ref::<HistoryHookUnavailable>() else {
+                return Err(error);
+            };
+            if terrain {
+                anyhow::bail!(
+                    "Terrain sync needs the Studio history hook, which this Studio build does not support yet: {unavailable}"
+                );
+            }
+            let mut warned = crate::system::LockRecover::lock_recover(&HISTORY_HOOK_WARNED);
+            let first = !warned.contains(&pid);
+            if first {
+                warned.push(pid);
+                crate::app::output::log_global(
+                    2,
+                    format_args!(
+                        "[renium] warning: Studio history hook unavailable on this Studio build; Terrain sync is disabled until Renium is updated ({unavailable})"
+                    ),
+                );
+            }
+            Ok(false)
+        }
+    }
+}

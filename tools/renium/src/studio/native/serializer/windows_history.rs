@@ -3,7 +3,7 @@
 use super::*;
 use std::collections::VecDeque;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Value {
     Entry,
     Direction,
@@ -151,7 +151,10 @@ fn discover(image: &PeImage<'_>, finish: usize) -> Result<(usize, usize)> {
     }
     anyhow::ensure!(
         found.len() == 1,
-        "Studio voxel history playback is missing or ambiguous"
+        "Studio voxel history playback is missing or ambiguous ({} candidates {:x?} among {} reachable functions from finish {finish:#x})",
+        found.len(),
+        found,
+        seen.len()
     );
     let target = found[0];
     let code = function(image, target).context("Missing voxel playback code")?;
@@ -245,4 +248,282 @@ pub(super) fn binding(prepared: &NativeProperty, pid: u32, title: &str) -> Resul
     put_u32(&mut binding, 40, length as u32);
     binding[48..48 + length].copy_from_slice(&code[..length]);
     Ok(binding)
+}
+
+#[cfg(test)]
+mod graph_dump_tests {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn dump_history_call_graph() {
+        let Ok(exe) = std::env::var("RENIUM_STUDIO_EXE") else {
+            return;
+        };
+        let finish = usize::from_str_radix(
+            std::env::var("RENIUM_FINISH_RVA")
+                .unwrap()
+                .trim_start_matches("0x"),
+            16,
+        )
+        .unwrap();
+        let bytes = fs::read(exe).unwrap();
+        let image = PeImage::parse(&bytes).unwrap();
+        let mut pending = VecDeque::from([(finish, 0)]);
+        let mut seen = HashSet::new();
+        while let Some((address, depth)) = pending.pop_front() {
+            if !seen.insert(address) {
+                continue;
+            }
+            let Some(code) = function(&image, address) else {
+                let bounds = image.rva_to_offset(address).ok().and_then(|offset| {
+                    image
+                        .function_bounds(offset)
+                        .ok()
+                        .map(|(s, e)| (offset, s, e))
+                });
+                println!("skip {address:#x} depth={depth} bounds={bounds:?}");
+                continue;
+            };
+            let instructions = Decoder::with_ip(64, code, address as u64, DecoderOptions::NONE)
+                .into_iter()
+                .collect::<Vec<_>>();
+            let calls = instructions
+                .iter()
+                .filter(|i| i.mnemonic() == Mnemonic::Call)
+                .count();
+            let indirect = instructions
+                .iter()
+                .filter(|i| i.mnemonic() == Mnemonic::Call && i.op0_kind() == OpKind::Memory)
+                .map(|i| format!("[{:?}+{:#x}]", i.memory_base(), i.memory_displacement64()))
+                .collect::<Vec<_>>();
+            let backward = instructions.iter().any(|i| {
+                i.flow_control() == FlowControl::ConditionalBranch
+                    && i.near_branch_target() < i.ip()
+            });
+            let loads = instructions
+                .iter()
+                .filter(|i| {
+                    matches!(i.mnemonic(), Mnemonic::Mov | Mnemonic::Movzx)
+                        && i.op0_kind() == OpKind::Register
+                        && i.op1_kind() == OpKind::Memory
+                        && i.memory_index() == Register::None
+                        && i.memory_size().size() == 8
+                })
+                .map(|i| {
+                    format!(
+                        "{:?}=[{:?}+{:#x}]",
+                        i.op0_register(),
+                        i.memory_base(),
+                        i.memory_displacement64()
+                    )
+                })
+                .collect::<Vec<_>>();
+            let matched = voxel_playback(code, address);
+            println!(
+                "fn {address:#x} depth={depth} len={} calls={calls} backward={backward} match={matched} indirect={indirect:?}
+    loads={}",
+                code.len(),
+                loads.join(" ")
+            );
+            if depth >= 8 {
+                continue;
+            }
+            let window = std::env::var("RENIUM_WINDOW")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(2 * 1024 * 1024);
+            for i in &instructions {
+                if matches!(i.mnemonic(), Mnemonic::Call | Mnemonic::Jmp)
+                    && i.op0_kind() == OpKind::NearBranch64
+                {
+                    let target = i.near_branch_target() as usize;
+                    if target.abs_diff(finish) < window {
+                        pending.push_back((target, depth + 1));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod disasm_dump_tests {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn dump_functions() {
+        let Ok(exe) = std::env::var("RENIUM_STUDIO_EXE") else {
+            return;
+        };
+        let bytes = fs::read(exe).unwrap();
+        let image = PeImage::parse(&bytes).unwrap();
+        for rva in std::env::var("RENIUM_DUMP_FNS").unwrap().split(',') {
+            let address = usize::from_str_radix(rva.trim().trim_start_matches("0x"), 16).unwrap();
+            let Some(code) = function(&image, address) else {
+                println!("no function at {address:#x}");
+                continue;
+            };
+            println!("== {address:#x} len={}", code.len());
+            for i in Decoder::with_ip(64, code, address as u64, DecoderOptions::NONE) {
+                let mut operands = Vec::new();
+                for index in 0..i.op_count() {
+                    operands.push(match i.op_kind(index) {
+                        OpKind::Register => format!("{:?}", i.op_register(index)),
+                        OpKind::Memory => format!(
+                            "[{:?}+{:?}*{}+{:#x}]",
+                            i.memory_base(),
+                            i.memory_index(),
+                            i.memory_index_scale(),
+                            i.memory_displacement64()
+                        ),
+                        OpKind::NearBranch64 => format!("{:#x}", i.near_branch_target()),
+                        _ => format!("{:#x}", i.immediate(index)),
+                    });
+                }
+                println!("{:#x}: {:?} {}", i.ip(), i.mnemonic(), operands.join(", "));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod image_scan_tests {
+    use super::*;
+
+    fn relaxed_playback(code: &[u8], address: usize) -> (bool, bool, bool, Vec<String>) {
+        let instructions = Decoder::with_ip(64, code, address as u64, DecoderOptions::NONE)
+            .into_iter()
+            .collect::<Vec<_>>();
+        if instructions.iter().any(Instruction::is_invalid) {
+            return (false, false, false, Vec::new());
+        }
+        let mut registers = HashMap::from([
+            (Register::RCX, Value::Entry),
+            (Register::RDX, Value::Direction),
+        ]);
+        let mut grid_call = false;
+        let mut voxel_call = false;
+        let mut trail = Vec::new();
+        for i in &instructions {
+            if matches!(i.mnemonic(), Mnemonic::Mov | Mnemonic::Movzx)
+                && i.op0_kind() == OpKind::Register
+            {
+                let value = if i.op1_kind() == OpKind::Register {
+                    registers.get(&i.op1_register().full_register()).copied()
+                } else if i.op1_kind() == OpKind::Memory
+                    && i.memory_index() == Register::None
+                    && i.memory_size().size() == 8
+                {
+                    let offset = i.memory_displacement64() as usize;
+                    match registers.get(&i.memory_base().full_register()) {
+                        Some(Value::Entry) if offset < 0x80 => Some(Value::History),
+                        Some(Value::History) if offset < 0x1000 && offset.is_multiple_of(8) => {
+                            Some(Value::Terrain)
+                        }
+                        Some(Value::Terrain) if offset < 0x1000 && offset.is_multiple_of(8) => {
+                            Some(Value::Grid)
+                        }
+                        Some(Value::Grid) if offset == 0 => Some(Value::Table),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                registers.remove(&i.op0_register().full_register());
+                if let Some(value) = value {
+                    if matches!(
+                        value,
+                        Value::History | Value::Terrain | Value::Grid | Value::Table
+                    ) {
+                        trail.push(format!(
+                            "{:?}<-[{:?}+{:#x}]",
+                            value,
+                            i.memory_base(),
+                            i.memory_displacement64()
+                        ));
+                    }
+                    registers.insert(i.op0_register().full_register(), value);
+                }
+            } else if i.mnemonic() == Mnemonic::Call {
+                if i.op0_kind() == OpKind::Memory
+                    && i.memory_index() == Register::None
+                    && registers.get(&i.memory_base().full_register()) == Some(&Value::Table)
+                    && registers.get(&Register::RCX) == Some(&Value::Grid)
+                {
+                    grid_call = true;
+                    trail.push(format!("gridcall+{:#x}", i.memory_displacement64()));
+                } else if i.op0_kind() == OpKind::NearBranch64
+                    && registers.get(&Register::RCX) == Some(&Value::Entry)
+                    && registers.get(&Register::R8) == Some(&Value::Direction)
+                {
+                    voxel_call = true;
+                    trail.push("voxelcall".into());
+                }
+                for register in [
+                    Register::RAX,
+                    Register::RCX,
+                    Register::RDX,
+                    Register::R8,
+                    Register::R9,
+                    Register::R10,
+                    Register::R11,
+                ] {
+                    registers.remove(&register);
+                }
+            } else {
+                let mut info = InstructionInfoFactory::new();
+                for used in info.info(i).used_registers() {
+                    if matches!(
+                        used.access(),
+                        OpAccess::Write
+                            | OpAccess::CondWrite
+                            | OpAccess::ReadWrite
+                            | OpAccess::ReadCondWrite
+                    ) {
+                        registers.remove(&used.register().full_register());
+                    }
+                }
+            }
+        }
+        let looped = instructions.iter().any(|i| {
+            i.flow_control() == FlowControl::ConditionalBranch && i.near_branch_target() < i.ip()
+        });
+        (grid_call, voxel_call, looped, trail)
+    }
+
+    #[test]
+    #[ignore]
+    fn scan_image_for_playback() {
+        let Ok(exe) = std::env::var("RENIUM_STUDIO_EXE") else {
+            return;
+        };
+        let bytes = fs::read(exe).unwrap();
+        let image = PeImage::parse(&bytes).unwrap();
+        let table = image.section(b".pdata").unwrap();
+        let mut scanned = 0;
+        for index in 0..table.raw_size / 12 {
+            let entry = table.raw_offset + index * 12;
+            let begin = read_u32(&bytes, entry).unwrap() as usize;
+            let end = read_u32(&bytes, entry + 4).unwrap() as usize;
+            if begin == 0 || end <= begin || !(32..=16384).contains(&(end - begin)) {
+                continue;
+            }
+            let Some(code) = function(&image, begin) else {
+                continue;
+            };
+            scanned += 1;
+            let strict = voxel_playback(code, begin);
+            let (grid_call, voxel_call, looped, trail) = relaxed_playback(code, begin);
+            if strict || (grid_call && looped) {
+                println!(
+                    "candidate {begin:#x} len={} strict={strict} grid={grid_call} voxel={voxel_call} loop={looped} trail={}",
+                    code.len(),
+                    trail.join(" ")
+                );
+            }
+        }
+        println!("scanned {scanned} functions");
+    }
 }

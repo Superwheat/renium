@@ -725,7 +725,20 @@ impl<'a> EditorTransaction<'a> {
             let info = bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?;
             let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, &info.runtime_id)?;
             let title = crate::studio::native::serializer::target_name(pid, &info.place_name)?;
-            crate::studio::native::serializer::register_history(pid, &title, token)?;
+            let terrain_write = changes.property_changes.iter().any(|change| {
+                change.class_name == "Terrain"
+                    && change
+                        .properties
+                        .keys()
+                        .chain(change.reset_properties.iter())
+                        .any(|name| matches!(name.as_str(), "SmoothGrid" | "PhysicsGrid"))
+            });
+            crate::studio::native::serializer::register_history_if_available(
+                pid,
+                &title,
+                token,
+                terrain_write,
+            )?;
             for change in &changes.property_changes {
                 if change.class_name == "Terrain"
                     && change
