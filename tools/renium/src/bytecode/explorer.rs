@@ -189,10 +189,13 @@ fn read_bytecode_explorer_batch_ops(
     let raw = if let Some(raw) = args.ops_json.as_deref() {
         raw.to_string()
     } else if let Some(path) = args.ops_file.as_deref() {
+        let inline = path.to_str().map(str::trim_start);
         if path == Path::new("-") {
             let mut raw = String::new();
             io::stdin().read_to_string(&mut raw)?;
             raw
+        } else if let Some(inline) = inline.filter(|text| text.starts_with(['{', '['])) {
+            inline.to_string()
         } else {
             fs::read_to_string(path)
                 .with_context(|| format!("Failed to read {}", path.display()))?
