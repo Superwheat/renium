@@ -113,10 +113,9 @@ pub(crate) fn bytecode_parent_index(
         if specified {
             bail!("--no-parent cannot be combined with a parent selector");
         }
-        if !document.instances.is_empty() {
-            bail!("--no-parent is only valid when creating the root of an empty settings store");
+        if document.instances.is_empty() {
+            return Ok(None);
         }
-        return Ok(None);
     }
 
     let specified = bytecode_selector_specified(index, settings_id, name, class_name);
@@ -192,5 +191,51 @@ mod selector_tests {
         ));
         assert!(bytecode_selector(Some(1), None, Some("Baseplate"), None).is_err());
         assert!(bytecode_selector(None, None, None, None).is_err());
+    }
+
+    #[test]
+    fn no_parent_on_a_populated_store_targets_the_root() {
+        let mut document = SettingsBytecode {
+            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
+            instances: Vec::new(),
+        };
+        document
+            .instances
+            .push(crate::settings::bytecode::SettingsBytecodeInstance::new(
+                "1".into(),
+                "TextChatService".into(),
+                "TextChatService".into(),
+                None,
+            ));
+        document
+            .instances
+            .push(crate::settings::bytecode::SettingsBytecodeInstance::new(
+                "editor:1".into(),
+                "Existing".into(),
+                "TextChatCommand".into(),
+                Some(0),
+            ));
+        assert_eq!(
+            bytecode_parent_index(&document, true, None, None, None, None).unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            bytecode_parent_index(
+                &SettingsBytecode {
+                    version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
+                    instances: Vec::new(),
+                },
+                true,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+            None
+        );
+        assert!(
+            bytecode_parent_index(&document, true, None, Some("editor:1"), None, None).is_err()
+        );
     }
 }
