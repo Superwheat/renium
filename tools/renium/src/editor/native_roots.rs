@@ -523,7 +523,9 @@ fn apply_write(
             .as_str()
             .context("Studio omitted the native write recording")?;
         // A native import can start a new recording after its insertion phase.
-        crate::studio::native::serializer::register_history(pid, &title, token)?;
+        crate::studio::native::serializer::register_history_if_available(
+            pid, &title, token, is_terrain,
+        )?;
         if let Some(terrain) = &mut terrain {
             terrain.expect(
                 begin["terrainBaseline"]
