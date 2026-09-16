@@ -133,18 +133,25 @@ static void FinishRecording(void* history, std::string token, std::uint32_t oper
         if (found != registrations.end() && found->second.history == history && found->second.modelOwner->Alive())
             registration = found->second;
     }
-    // Restore before Cancel: callbacks from inverse property/parent writes then
-    // remain the newest voxel edits. Failed restoration leaves the token alive.
-    if (registration && operation == 0 && registration->rollbackTerrain)
-        registration->rollbackTerrain();
+    struct Erase {
+        std::string token;
+        bool armed;
+        ~Erase() {
+            if (!armed) return;
+            std::lock_guard lock(registrationsMutex);
+            registrations.erase(token);
+        }
+    } erase{token, registration.has_value()};
     if (registration && operation != 0 && registration->terrainWritten && registration->checkTerrain)
         registration->checkTerrain();
-    CancellationScope scope(registration && operation == 0 ? history : nullptr);
-    originalFinish(history, token, operation, std::move(options));
-    if (registration) {
-        std::lock_guard lock(registrationsMutex);
-        registrations.erase(token);
+    {
+        // Skipping the engine's voxel playback is only an optimization; the
+        // explicit restoration below is the final voxel state either way.
+        CancellationScope scope(registration && operation == 0 && originalVoxelUndo ? history : nullptr);
+        originalFinish(history, token, operation, std::move(options));
     }
+    if (registration && operation == 0 && registration->rollbackTerrain)
+        registration->rollbackTerrain();
 }
 
 // Installation runs on the DataModel thread. Pause other threads only for the
@@ -313,7 +320,8 @@ static void Register(const Binding& binding, void* history, std::uintptr_t model
     Prune();
     std::lock_guard installationLock(installationMutex);
     if (token.empty() || token.size() > 256 || binding.memberOffset < 64 || binding.memberOffset >= 256 ||
-        binding.memberOffset % 8 || binding.prefixSize < Jump(0).size() || binding.prefixSize > sizeof(binding.prefix))
+        binding.memberOffset % 8 ||
+        (binding.voxelUndo && (binding.prefixSize < Jump(0).size() || binding.prefixSize > sizeof(binding.prefix))))
         throw std::runtime_error("Invalid Studio history binding");
     if (!originalFinish) {
         std::uintptr_t value = 0;
@@ -323,15 +331,17 @@ static void Register(const Binding& binding, void* history, std::uintptr_t model
 #if !defined(_WIN32)
             !read(binding.descriptor + binding.memberOffset + 8, &value, sizeof(value)) || value != 0 ||
 #endif
-            !read(binding.voxelUndo, prefix.data(), binding.prefixSize) ||
-            std::memcmp(prefix.data(), binding.prefix, binding.prefixSize) != 0)
+            (binding.voxelUndo && (!read(binding.voxelUndo, prefix.data(), binding.prefixSize) ||
+                                   std::memcmp(prefix.data(), binding.prefix, binding.prefixSize) != 0)))
             throw std::runtime_error("Studio history code changed before installation");
-        auto jump = Jump(reinterpret_cast<std::uintptr_t>(&UndoVoxels));
-        // The resolver supplies whole, position-independent prologue instructions.
-        jump.resize(binding.prefixSize, 0);
-        originalVoxelUndo = reinterpret_cast<VoxelUndo>(Trampoline(binding));
         installed = binding;
-        ReplaceCode(binding.voxelUndo, jump);
+        if (binding.voxelUndo) {
+            auto jump = Jump(reinterpret_cast<std::uintptr_t>(&UndoVoxels));
+            // The resolver supplies whole, position-independent prologue instructions.
+            jump.resize(binding.prefixSize, 0);
+            originalVoxelUndo = reinterpret_cast<VoxelUndo>(Trampoline(binding));
+            ReplaceCode(binding.voxelUndo, jump);
+        }
         originalFinish = reinterpret_cast<Finish>(binding.finish);
         std::atomic_ref<std::uintptr_t>(*reinterpret_cast<std::uintptr_t*>(binding.descriptor + binding.memberOffset))
             .store(reinterpret_cast<std::uintptr_t>(&FinishRecording), std::memory_order_release);

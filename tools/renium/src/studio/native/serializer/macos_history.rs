@@ -165,10 +165,24 @@ pub(super) fn binding(prepared: &NativeProperty) -> Result<Vec<u8>> {
         read_u64(&fields, offset + 8) == Some(0),
         "Unsupported history member adjustment"
     );
-    let voxel = discover(&image, native)?;
-    let code = function(&image, voxel).unwrap();
-    let target = prepared.memory.base + voxel - image.image_base;
-    prepared.memory.code(target, code.len())?;
+    let playback = match discover(&image, native) {
+        Ok(voxel) => Some(voxel),
+        Err(error) => {
+            crate::app::output::log_global(
+                2,
+                format_args!(
+                    "[renium] warning: Studio voxel playback hook unavailable on this build; cancellations restore Terrain explicitly ({error:#})"
+                ),
+            );
+            None
+        }
+    };
+    let mut target = 0;
+    if let Some(voxel) = playback {
+        let code = function(&image, voxel).unwrap();
+        target = prepared.memory.base + voxel - image.image_base;
+        prepared.memory.code(target, code.len())?;
+    }
     prepared
         .memory
         .code(finish, function(&image, native).unwrap().len())?;
@@ -182,7 +196,9 @@ pub(super) fn binding(prepared: &NativeProperty) -> Result<Vec<u8>> {
     ] {
         put64(&mut binding, at, value);
     }
-    put32(&mut binding, 40, 16);
-    binding[48..64].copy_from_slice(&code[..16]);
+    if let Some(voxel) = playback {
+        put32(&mut binding, 40, 16);
+        binding[48..64].copy_from_slice(&function(&image, voxel).unwrap()[..16]);
+    }
     Ok(binding)
 }
