@@ -57,9 +57,18 @@ end
 
 function BridgePluginRuntime.start(context)
 	-- Published places can still be streaming when plugins start. Local files
-	-- are deserialized before plugins run and do not set DataModel.IsLoaded.
+	-- are deserialized before plugins run and do not set DataModel.IsLoaded,
+	-- and some sessions never raise Loaded, so a quiet DataModel also counts.
 	if game.PlaceId > 0 and not game:IsLoaded() then
-		game.Loaded:Wait()
+		local settledSeconds = 3
+		local lastChange = os.clock()
+		local activity = game.DescendantAdded:Connect(function()
+			lastChange = os.clock()
+		end)
+		while not game:IsLoaded() and os.clock() - lastChange < settledSeconds do
+			task.wait(0.25)
+		end
+		activity:Disconnect()
 	end
 	local plugin = context.plugin
 	local rootScript = context.rootScript
@@ -169,7 +178,7 @@ function BridgePluginRuntime.start(context)
 	local PARALLEL_SOURCE_BATCH_MIN_ITEMS = 24
 	local BRIDGE_VERSION = "0.3.8"
 	local BRIDGE_PROTOCOL_VERSION = "compact-v5"
-	local BRIDGE_BUILD_UNIX = 1789606417
+	local BRIDGE_BUILD_UNIX = 1789616818
 	local MAX_ACTIVE_DEMAND_SERIALIZERS = 4
 	local MAX_SOURCE_BATCH_PATHS = 1024
 	local COMPACT_TYPE_IDS = {
