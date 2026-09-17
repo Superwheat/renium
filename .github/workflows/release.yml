@@ -377,14 +377,31 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           RENIUM_VERSION: ${{ needs.verify-tag.outputs.version }}
-          RELEASE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ github.ref_name }}
         run: |
           if [ -z "$DISCORD_WEBHOOK_URL" ]; then
             echo "DISCORD_WEBHOOK_URL is not set; skipping the announcement"
             exit 0
           fi
-          notes="$(awk '/^### Install/ { exit } { print }' /tmp/renium-release-notes.md | head -c 3800)"
-          jq -n --arg title "Renium $RENIUM_VERSION" --arg url "$RELEASE_URL" --arg notes "$notes" \
-            '{ username: "Renium", embeds: [{ title: $title, url: $url, description: ($notes + "\n[Download](" + $url + ")"), color: 6532082 }] }' \
-            > /tmp/renium-discord.json
-          curl -fsS -H "Content-Type: application/json" -d @/tmp/renium-discord.json "$DISCORD_WEBHOOK_URL"
+          python3 - <<'PY'
+          import json, os, urllib.request
+          notes = open("/tmp/renium-release-notes.md", encoding="utf-8").read().split("### Install")[0].strip()
+          text = f"# {os.environ['RENIUM_VERSION']}\n\n{notes}\n"
+          chunks, current = [], ""
+          for line in text.splitlines(keepends=True):
+              if len(current) + len(line) > 1900 and current:
+                  chunks.append(current)
+                  current = ""
+              current += line
+          if current.strip():
+              chunks.append(current)
+          for chunk in chunks:
+              body = json.dumps({"content": chunk, "allowed_mentions": {"parse": []}}).encode()
+              request = urllib.request.Request(
+                  os.environ["DISCORD_WEBHOOK_URL"],
+                  data=body,
+                  headers={"Content-Type": "application/json", "User-Agent": "renium-release"},
+              )
+              with urllib.request.urlopen(request) as response:
+                  response.read()
+          print(f"posted {len(chunks)} message(s) to Discord")
+          PY
