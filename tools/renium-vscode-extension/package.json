@@ -60,6 +60,35 @@
         "category": "Renium"
       },
       {
+        "command": "renium.collab.start",
+        "title": "Start Collaboration",
+        "category": "Renium",
+        "icon": "$(broadcast)"
+      },
+      {
+        "command": "renium.collab.join",
+        "title": "Join Collaboration",
+        "category": "Renium",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "renium.collab.copyInvite",
+        "title": "Copy Collaboration Invite",
+        "category": "Renium",
+        "icon": "$(link)"
+      },
+      {
+        "command": "renium.collab.stop",
+        "title": "Leave Collaboration",
+        "category": "Renium",
+        "icon": "$(debug-disconnect)"
+      },
+      {
+        "command": "renium.collab.menu",
+        "title": "Collaboration Menu",
+        "category": "Renium"
+      },
+      {
         "command": "renium.installStudioPlugin",
         "title": "Install Studio Plugin",
         "category": "Renium"
@@ -322,10 +351,19 @@
         {
           "id": "renium.packages",
           "name": "Packages"
+        },
+        {
+          "id": "renium.collaboration",
+          "name": "Collaboration"
         }
       ]
     },
     "viewsWelcome": [
+      {
+        "view": "renium.collaboration",
+        "contents": "Share this project live with other editors, or join someone else's session.\n[Start Collaboration](command:renium.collab.start)\n[Join Collaboration](command:renium.collab.join)",
+        "when": "!renium.collab.active"
+      },
       {
         "view": "renium.packages",
         "contents": "No link packages yet.\nPack any instance into a reusable read-only package: right-click it in the Renium Explorer and choose Create Link.\n[Open Explorer](command:renium.openExplorer)"
@@ -342,6 +380,26 @@
           "command": "renium.packages.refresh",
           "when": "view == renium.packages",
           "group": "navigation"
+        },
+        {
+          "command": "renium.collab.start",
+          "when": "view == renium.collaboration && !renium.collab.active",
+          "group": "navigation@1"
+        },
+        {
+          "command": "renium.collab.join",
+          "when": "view == renium.collaboration && !renium.collab.active",
+          "group": "navigation@2"
+        },
+        {
+          "command": "renium.collab.copyInvite",
+          "when": "view == renium.collaboration && renium.collab.active",
+          "group": "navigation@1"
+        },
+        {
+          "command": "renium.collab.stop",
+          "when": "view == renium.collaboration && renium.collab.active",
+          "group": "navigation@2"
         }
       ],
       "view/item/context": [
@@ -681,6 +739,21 @@
           ],
           "default": "ask",
           "description": "After materializing link targets into src, optionally push them to Studio. Link packages can contain Luau source."
+        },
+        "renium.collaboration.relayUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Relay base URL offered by Start Collaboration, for example https://renium-relay.example.workers.dev. Blank asks each time."
+        },
+        "renium.collaboration.displayName": {
+          "type": "string",
+          "default": "",
+          "description": "Name other participants see. Blank uses your OS user name."
+        },
+        "renium.collaboration.showCursors": {
+          "type": "boolean",
+          "default": true,
+          "description": "Draw other participants' cursors and selections in open editors."
         },
         "renium.gitSync.gitPath": {
           "type": "string",

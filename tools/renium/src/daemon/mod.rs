@@ -751,7 +751,14 @@ fn daemon_control_request_inner(
     ) && object.get("pid").and_then(Value::as_u64).is_some();
     if matches!(
         operation,
-        automation::op::CAP | automation::op::STUDIOS | automation::op::PERFORMANCE_PROFILE
+        automation::op::CAP
+            | automation::op::STUDIOS
+            | automation::op::PERFORMANCE_PROFILE
+            | automation::op::COLLAB_START
+            | automation::op::COLLAB_JOIN
+            | automation::op::COLLAB_STOP
+            | automation::op::COLLAB_STATUS
+            | automation::op::COLLAB_AWARENESS
     ) || direct_package
     {
         let request = automation::Request {

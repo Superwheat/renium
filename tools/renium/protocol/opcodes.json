@@ -72,6 +72,11 @@
     { "id": 98, "name": "performance-profile", "queued": false },
     { "id": 99, "name": "network-simulation", "runtime": true },
     { "id": 100, "name": "property-access", "runtime": true },
-    { "id": 101, "name": "performance-monitor", "runtime": true }
+    { "id": 101, "name": "performance-monitor", "runtime": true },
+    { "id": 102, "name": "collab-start", "queued": false },
+    { "id": 103, "name": "collab-join", "queued": false },
+    { "id": 104, "name": "collab-stop", "queued": false },
+    { "id": 105, "name": "collab-status", "queued": false },
+    { "id": 106, "name": "collab-awareness", "queued": false }
   ]
 }

@@ -146,6 +146,15 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ),
     ("lof", "Examples:\n  rbx lof"),
     ("lst", "Examples:\n  rbx lst\n  rbx lst --wait 10"),
+    (
+        "collab",
+        "Examples:
+  rbx collab start
+  rbx collab start --relay https://renium-relay.example.workers.dev
+  rbx collab join wss://host.trycloudflare.com/?token=abc -r C:/proj
+  rbx collab status
+  rbx collab stop",
+    ),
     ("rp", "Examples:\n  rbx rp"),
     ("dp", "Examples:\n  rbx dp"),
     ("ps", "Examples:\n  rbx ps src/StarterGui/Menu.client.luau"),

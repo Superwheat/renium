@@ -73,6 +73,11 @@ export const AUTOMATION_OP = {
   networkSimulation: 99,
   propertyAccess: 100,
   performanceMonitor: 101,
+  collabStart: 102,
+  collabJoin: 103,
+  collabStop: 104,
+  collabStatus: 105,
+  collabAwareness: 106,
 } as const;
 
 export const AUTOMATION_RUNTIME_OPS = new Set<number>([

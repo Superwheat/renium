@@ -93,7 +93,16 @@ impl Request {
         ) && self.p.get("pid").and_then(Value::as_u64).is_some();
         if !matches!(
             self.op,
-            op::CAP | op::BIND | op::STUDIOS | op::UPDATE_STUDIOS | op::PERFORMANCE_PROFILE
+            op::CAP
+                | op::BIND
+                | op::STUDIOS
+                | op::UPDATE_STUDIOS
+                | op::PERFORMANCE_PROFILE
+                | op::COLLAB_START
+                | op::COLLAB_JOIN
+                | op::COLLAB_STOP
+                | op::COLLAB_STATUS
+                | op::COLLAB_AWARENESS
         ) && !direct_package
             && self.cx.is_none()
         {
@@ -254,6 +263,7 @@ pub struct State {
     reviews: Mutex<HashMap<String, Review>>,
     available_update: Mutex<Option<String>>,
     live_sync: live::Manager,
+    collab: crate::collab::Manager,
 }
 
 impl Default for State {
@@ -269,6 +279,7 @@ impl Default for State {
             reviews: Mutex::new(HashMap::new()),
             available_update: Mutex::new(None),
             live_sync: live::Manager::default(),
+            collab: crate::collab::Manager::default(),
         }
     }
 }
@@ -426,6 +437,10 @@ impl State {
 
     pub(crate) fn live_sync(&self) -> &live::Manager {
         &self.live_sync
+    }
+
+    pub(crate) fn collab(&self) -> &crate::collab::Manager {
+        &self.collab
     }
 
     pub fn prepare_review(

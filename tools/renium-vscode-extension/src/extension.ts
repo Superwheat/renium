@@ -100,6 +100,7 @@ import {
   type SyncConfig,
 } from "./syncConfig";
 import { AUTOMATION_OP } from "./automationProtocol.generated";
+import { CollaborationController } from "./collaboration";
 
 const RENIUM_OPEN_PACKAGE_SCRIPT_TABS_STATE_KEY = "renium.openPackageScriptTabs";
 const RENIUM_ACTIVE_EXPERIENCE_PLACES_STATE_KEY = "renium.activeExperiencePlaces";
@@ -310,6 +311,7 @@ async function executeCommandBestEffort(command: string, ...args: unknown[]): Pr
 class RobloxSyncController {
   private readonly output: vscode.OutputChannel;
   private readonly statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 200);
+  public readonly collaboration: CollaborationController;
   private queue: Promise<void> = Promise.resolve();
   private liveSyncGraphRefreshTimer: NodeJS.Timeout | undefined;
   private liveSyncGraphRefreshPending = false;
@@ -438,6 +440,14 @@ class RobloxSyncController {
     this.statusItem.command = "renium.openMenu";
     this.statusItem.show();
     this.updateStatusBar();
+    this.collaboration = new CollaborationController({
+      output: this.output,
+      projectRoot: () => this.tryGetConfig()?.projectRoot ?? pickWorkspaceRoot(),
+      runOperation: (op, parameters, options) => {
+        const cfg = this.getConfig();
+        return this.runAutomationOperation(cfg.cliPath, cfg, "collab", op, parameters, options);
+      },
+    });
   }
 
   private ensureAgentInstructions(projectRoot: string): string[] {
@@ -858,6 +868,7 @@ class RobloxSyncController {
   }
 
   public dispose(): void {
+    this.collaboration.dispose();
     this.disposed = true;
     this.daemonFileSyncEnabled = false;
     this.daemonFileSyncError = undefined;
@@ -934,6 +945,14 @@ class RobloxSyncController {
           : "Send saved file changes to Studio when Live Sync is off",
         action: "toggleAuto",
       },
+      menuSeparator("Collaboration"),
+      {
+        label: this.collaboration.isActive() ? "$(broadcast) Collaboration Session" : "$(broadcast) Collaborate",
+        description: this.collaboration.isActive()
+          ? "Invite link, participants, leave"
+          : "Share this project live or join an invite",
+        action: "collab",
+      },
       menuSeparator("Project"),
       {
         label: "$(list-tree) Places...",
@@ -982,6 +1001,9 @@ class RobloxSyncController {
         return;
       case "managePlaces":
         await this.managePlaces();
+        return;
+      case "collab":
+        await this.collaboration.menu();
         return;
       case "startLive":
         await this.startLiveSync();
@@ -4892,6 +4914,13 @@ export function activate(context: vscode.ExtensionContext): void {
       { supportsMultipleEditorsPerDocument: true, webviewOptions: { retainContextWhenHidden: true } },
     ),
     vscode.commands.registerCommand("renium.openMenu", () => controller.openMenu()),
+    vscode.commands.registerCommand("renium.collab.start", () => controller.collaboration.start()),
+    vscode.commands.registerCommand("renium.collab.join", () => controller.collaboration.join()),
+    vscode.commands.registerCommand("renium.collab.stop", () => controller.collaboration.stop()),
+    vscode.commands.registerCommand("renium.collab.copyInvite", () => controller.collaboration.copyInvite()),
+    vscode.commands.registerCommand("renium.collab.menu", () => controller.collaboration.menu()),
+    vscode.commands.registerCommand("renium.collab.reveal", (id: number) => controller.collaboration.revealParticipant(id)),
+    vscode.window.registerTreeDataProvider("renium.collaboration", controller.collaboration),
     vscode.commands.registerCommand("renium.installStudioPlugin", () => controller.installStudioPlugin()),
     vscode.commands.registerCommand("renium.projectTools", () => controller.openProjectTools()),
     vscode.commands.registerCommand("renium.projectDoctor", () => controller.runProjectDoctor()),

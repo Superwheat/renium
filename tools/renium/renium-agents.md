@@ -11,7 +11,7 @@ If PATH is stale: Windows `%USERPROFILE%\.renium\bin\rbx.exe`; macOS/Linux `~/.r
 - **Runtime behavior:** use Play only for a specific unanswered question, such as input handling, replication, physics, or a runtime error. Identify the expected result first. A small edit is not itself a reason to playtest.
 - **Visual behavior:** a screenshot checks one state; a recording checks a transition. Review the captured evidence, not merely whether capture succeeded.
 
-Check Luau syntax offline with `rbx ck FILE...`; it parses without executing code. Use project checks for types, lint, and behavior. Never use Studio `loadstring` for validation or enable `LoadStringEnabled` to make a check work. Don't execute or require scripts merely to check syntax.
+Check Luau syntax offline with `rbx ck FILE...`. Use project checks for types, lint, and behavior. Never use Studio `loadstring` for validation or enable `LoadStringEnabled` to make a check work. Don't execute or require scripts merely to check syntax.
 
 With healthy Live Sync, trust successful file edits. Don't push, poll, or reread Studio after every save. Use one `lst --wait` after a reported problem or when the next operation needs synchronization. Don't start Play to prove a file edit synced.
 
@@ -28,7 +28,7 @@ When Play is needed, reuse a suitable session. Test related changes together, wi
 | UI, input, movement | `RENIUM/input.md` |
 | Screenshots, recording review, device simulation | `RENIUM/capture-device.md` |
 | Lag spikes, MicroProfiler dumps, network traffic, resource limits | `RENIUM/performance.md` |
-| Models, places, packages, links, Git | `RENIUM/projects.md` |
+| Models, places, packages, links, Git, live collaboration | `RENIUM/projects.md` |
 | Open Cloud and creator assets | `RENIUM/opencloud.md` |
 | Studio lifecycle and place management | `RENIUM/advanced.md` |
 | Installed plugins and their commands | `RENIUM/plugins.md` |

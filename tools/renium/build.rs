@@ -296,7 +296,9 @@ fn generate_config_settings(out_dir: &Path) {
         .iter()
         .filter_map(|(name, property)| {
             let name = name.strip_prefix("renium.")?;
-            if matches!(name, "automaticUpdateChecks" | "localPlaceUpdateBehavior") {
+            if matches!(name, "automaticUpdateChecks" | "localPlaceUpdateBehavior")
+                || name.starts_with("collaboration.")
+            {
                 return None;
             }
             let kind = property["type"].as_str().unwrap_or("value");
