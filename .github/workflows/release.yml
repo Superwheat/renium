@@ -386,7 +386,7 @@ jobs:
           python3 - <<'PY'
           import json, os, urllib.request
           notes = open("/tmp/renium-release-notes.md", encoding="utf-8").read().split("### Install")[0].strip()
-          text = f"# {os.environ['RENIUM_VERSION']}\n\n{notes}\n\n<{os.environ['RELEASE_URL']}>\n"
+          text = f"# {os.environ['RENIUM_VERSION']}\n\n{notes}\n\n{os.environ['RELEASE_URL']}\n"
           chunks, current = [], ""
           for line in text.splitlines(keepends=True):
               if len(current) + len(line) > 1900 and current:
