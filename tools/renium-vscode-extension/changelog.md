@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.8 - 2026-09-17
+
+### New
+
+- `--name` and `--class-name` combine into one selector in store commands.
+- `rbx bb -J` accepts inline JSON as well as a file or stdin.
+- Pulling or importing into a folder that does not exist yet creates it.
+
+### Improvements
+
+- Live Sync keeps working on Studio builds where the Terrain undo hook cannot be installed (Studio 0.739 and later). Cancelled recordings restore Terrain explicitly after Studio's own undo, so correctness no longer depends on that hook.
+- Multiplayer tests keep waiting while the server and clients are still connecting, and close test windows that never connected.
+- The agent guide tells agents to fix and rerun malformed commands, read each guide once per session, keep query results small, and fix defects they find instead of reporting them.
+
+### Bug fixes
+
+- Stores written by `rbx pi` no longer make Live Sync re-apply every mesh, fail verification on fields Studio never exposes, or report differences for CollisionFidelity and ClockTime the store never held.
+- A failed Live Sync restore no longer replays on every command; the status reports the error once until the next `lon`, `rp` or `dp`.
+- Long pushes no longer lose their Studio transaction while native writes run, and native MeshId and SourceAssetId values Studio already holds are not rewritten.
+- Identical sibling parts no longer fail with "Could not uniquely identify".
+- Place and model exports keep scripts disabled, and place and model imports read `Disabled` back.
+- `rbx ba --no-parent` on a populated store adds the instance under the service root, as documented.
+
 ## 0.3.7 - 2026-09-15
 
 ### New
