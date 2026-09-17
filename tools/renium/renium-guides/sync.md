@@ -27,6 +27,8 @@ For a failure, inspect `rbx lst --details`, fix the cause, then retry with `rbx 
 
 ## First connection and conflicts
 
+When no Studio runtime connects, the `no_studio` error and `rbx status` carry a `diagnosis.verdict` naming the cause: Studio closed, plugin missing, plugin needs a Studio restart, plugin not connecting, or another place open. Relay it to the user as is; do not guess.
+
 Live Sync compares each side with their last common Renium state. One-sided changes transfer; independent edits merge; conflicts wait without overwriting either side.
 
 The editor asks which version to keep, then resumes startup. The CLI returns the conflict and resolution commands. Choose only with user direction or an existing conflict preference.

@@ -825,9 +825,15 @@ fn daemon_control_request_inner(
             if let Some(error) = bind_error {
                 return Err(error);
             }
+            let clients = try_daemon_control_request(automation::op::STUDIOS, json!({}))
+                .ok()
+                .flatten()
+                .and_then(|result| result.get("clients")?.as_array().cloned())
+                .unwrap_or_default();
             bail!(
-                "No Studio runtime connected to this project within {:.1}s",
-                wait.as_secs_f64()
+                "No Studio runtime connected to this project within {:.1}s. {}",
+                wait.as_secs_f64(),
+                crate::studio::diagnosis::verdict(&clients, project_root)
             );
         }
     }
