@@ -1214,6 +1214,8 @@ local function buildStatusWidget(plugin, versionText)
 		local showSync = hasSync and (full or height >= (pad + cardPadY) * 2 + CONTROL_HEIGHT + syncHeight)
 		local textWidth = innerWidth - cardPadX * 2 - 20 - actionsWidth - 8
 		local showTitle = textWidth >= 56
+		local showDot = innerWidth - cardPadX * 2 >= 18 + actionsWidth
+		showSync = showSync and showTitle
 		statusTitle.TextSize = if full then TEXT_MD else TEXT_SM
 
 		local y = pad
@@ -1225,6 +1227,7 @@ local function buildStatusWidget(plugin, versionText)
 			y += 30 + gap
 		end
 
+		dot.Visible = showDot
 		dot.Position = UDim2.fromOffset(cardPadX, cardPadY + CONTROL_HEIGHT / 2 - 5)
 		statusTitle.Visible = showTitle
 		statusTitle.Position = UDim2.fromOffset(cardPadX + 20, cardPadY)
@@ -1242,8 +1245,14 @@ local function buildStatusWidget(plugin, versionText)
 			syncLine.Size = UDim2.fromOffset(innerWidth - cardPadX * 2, 18)
 			cardHeight += syncHeight
 		end
-		actions.AnchorPoint = Vector2.new(1, 0.5)
-		actions.Position = UDim2.new(1, -cardPadX, 0, math.floor((cardPadY + cardHeight) / 2))
+		local actionsY = math.floor((cardPadY + cardHeight) / 2)
+		if showDot then
+			actions.AnchorPoint = Vector2.new(1, 0.5)
+			actions.Position = UDim2.new(1, -cardPadX, 0, actionsY)
+		else
+			actions.AnchorPoint = Vector2.new(0.5, 0.5)
+			actions.Position = UDim2.new(0.5, 0, 0, actionsY)
+		end
 		cardHeight += cardPadY
 		card.Position = UDim2.fromOffset(pad, y)
 		card.Size = UDim2.fromOffset(innerWidth, cardHeight)
