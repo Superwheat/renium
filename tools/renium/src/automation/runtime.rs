@@ -912,6 +912,21 @@ fn studio_status_result(
     });
     let mut clients = result["clients"].as_array().cloned().unwrap_or_default();
     let has_edit = clients.iter().any(|client| client["role"] == "edit");
+    if !has_edit {
+        // A plugin reconnects within a second of the daemon starting; report it
+        // rather than a transient gap.
+        if bridge.list_bridge_clients().is_empty() {
+            bridge.wait_for_ready_channels_for_target(
+                1,
+                Duration::from_secs(2),
+                BridgeTarget::Edit,
+            );
+        }
+        result["diagnosis"] = crate::studio::diagnosis::diagnose(
+            &bridge.list_bridge_clients(),
+            Some(Path::new(&context.root)),
+        );
+    }
     let studio_state = if let Some(runtime_id) = context.runtime_id.as_deref().filter(|_| has_edit)
     {
         match bridge.call_for_runtime_with_timeout(
@@ -2247,15 +2262,21 @@ fn resolve_connected_context(
             Err(failure) => return Err(failure),
         }
         if Instant::now() >= deadline {
+            let root = state
+                .context(context_id)
+                .map(|context| PathBuf::from(&context.root));
+            let diagnosis =
+                crate::studio::diagnosis::diagnose(&bridge.list_bridge_clients(), root.as_deref());
+            let verdict = diagnosis["verdict"].as_str().unwrap_or_default();
             return Err(automation::Failure::new(
                 "no_studio",
                 format!(
-                    "No Studio runtime connected to this project within {:.1}s",
-                    wait_seconds
+                    "No Studio runtime connected to this project within {wait_seconds:.1}s. {verdict}"
                 ),
                 true,
                 "studios",
-            ));
+            )
+            .detail(diagnosis));
         }
         std::thread::sleep(Duration::from_millis(50));
     }
