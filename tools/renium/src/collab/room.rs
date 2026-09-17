@@ -55,7 +55,7 @@ impl Room {
         });
         let mut subscriptions = Vec::new();
         {
-            let mut guard = awareness.lock_recover();
+            let guard = awareness.lock_recover();
             let for_updates = Arc::downgrade(&room);
             subscriptions.push(
                 guard
@@ -144,7 +144,7 @@ impl Room {
 
     fn detach(&self, id: u64) {
         self.peers.lock_recover().retain(|peer| peer.id != id);
-        let mut awareness = self.awareness.lock_recover();
+        let awareness = self.awareness.lock_recover();
         let stale = awareness
             .iter()
             .filter(|(client, state)| *client != awareness.client_id() && state.data.is_none())
@@ -181,7 +181,7 @@ impl Room {
                 Ok(Some(Message::Awareness(awareness.update()?)))
             }
             Message::Awareness(update) => {
-                let mut awareness = self.awareness.lock_recover();
+                let awareness = self.awareness.lock_recover();
                 awareness.apply_update_with(update, origin.clone())?;
                 Ok(None)
             }
