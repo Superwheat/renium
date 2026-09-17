@@ -372,3 +372,19 @@ jobs:
             exit 1
           fi
           gh release edit "${{ github.ref_name }}" --draft=false
+
+      - name: Announce on Discord
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          RENIUM_VERSION: ${{ needs.verify-tag.outputs.version }}
+          RELEASE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ github.ref_name }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "DISCORD_WEBHOOK_URL is not set; skipping the announcement"
+            exit 0
+          fi
+          notes="$(awk '/^### Install/ { exit } { print }' /tmp/renium-release-notes.md | head -c 3800)"
+          jq -n --arg title "Renium $RENIUM_VERSION" --arg url "$RELEASE_URL" --arg notes "$notes" \
+            '{ username: "Renium", embeds: [{ title: $title, url: $url, description: ($notes + "\n[Download](" + $url + ")"), color: 6532082 }] }' \
+            > /tmp/renium-discord.json
+          curl -fsS -H "Content-Type: application/json" -d @/tmp/renium-discord.json "$DISCORD_WEBHOOK_URL"

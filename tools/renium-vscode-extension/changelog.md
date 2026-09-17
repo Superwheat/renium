@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.9 - 2026-09-17
+
+### New
+
+- Live collaboration: `rbx collab start` shares a project's files as one live document and prints an invite; `rbx collab join` fills a folder from it. The room runs on the host through a Cloudflare quick tunnel, or on a relay that keeps the room and its history. `rbx collab relay deploy` publishes that relay to a free Cloudflare account in one command and makes it the default.
+- The VS Code extension gained a Collaboration view with participants and the invite link, Start, Join, Leave and Copy Invite commands, a status bar item, and other participants' cursors and selections drawn in open editors.
+- When no Studio runtime connects, the error and `rbx status` now say why: Studio closed, plugin missing, plugin needs a Studio restart, plugin not connecting, or a different place open.
+
+### Improvements
+
+- The Studio panel lays itself out by its size: a single row with icon buttons when small, the card and header when there is room, and settings rows stack when the settings window is narrow.
+- Connect, Disconnect and Cancel are one power button whose color carries the state.
+- Building from source now requires the current stable Rust; the old-toolchain check was removed.
+
+### Bug fixes
+
+- The Studio plugin could wait forever for the place to report itself loaded and never show its toolbar or connect. It now starts once the place settles.
+- Studio process ages are read correctly on macOS.
+
 ## 0.3.8 - 2026-09-17
 
 ### New
