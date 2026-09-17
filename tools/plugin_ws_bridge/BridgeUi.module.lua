@@ -979,10 +979,69 @@ local function buildSettingsWidget(plugin)
 	}
 end
 
+local function makeIconButton(parent, name)
+	local button = Instance.new("TextButton")
+	button.Name = name
+	button.Size = UDim2.fromOffset(CONTROL_HEIGHT, CONTROL_HEIGHT)
+	button.BorderSizePixel = 0
+	button.Text = ""
+	button.AutoButtonColor = true
+	button.Parent = parent
+	addCorner(button)
+	return button
+end
+
+local function makePowerIcon(button)
+	local icon = Instance.new("Frame")
+	icon.Name = "Icon"
+	icon.AnchorPoint = Vector2.new(0.5, 0.5)
+	icon.Position = UDim2.fromScale(0.5, 0.5)
+	icon.Size = UDim2.fromOffset(16, 16)
+	icon.BackgroundTransparency = 1
+	icon.Parent = button
+
+	local ring = Instance.new("Frame")
+	ring.Name = "Ring"
+	ring.AnchorPoint = Vector2.new(0.5, 0.5)
+	ring.Position = UDim2.new(0.5, 0, 0.5, 1)
+	ring.Size = UDim2.fromOffset(13, 13)
+	ring.BackgroundTransparency = 1
+	ring.Parent = icon
+	local ringCorner = Instance.new("UICorner")
+	ringCorner.CornerRadius = UDim.new(1, 0)
+	ringCorner.Parent = ring
+	local ringStroke = Instance.new("UIStroke")
+	ringStroke.Thickness = 2
+	ringStroke.Color = WHITE
+	ringStroke.Parent = ring
+
+	local gap = Instance.new("Frame")
+	gap.Name = "Gap"
+	gap.AnchorPoint = Vector2.new(0.5, 0)
+	gap.Position = UDim2.fromScale(0.5, 0)
+	gap.Size = UDim2.fromOffset(7, 6)
+	gap.BorderSizePixel = 0
+	gap.Parent = icon
+
+	local bar = Instance.new("Frame")
+	bar.Name = "Bar"
+	bar.AnchorPoint = Vector2.new(0.5, 0)
+	bar.Position = UDim2.fromScale(0.5, 0)
+	bar.Size = UDim2.fromOffset(2, 9)
+	bar.BackgroundColor3 = WHITE
+	bar.BorderSizePixel = 0
+	bar.Parent = icon
+
+	return function(color)
+		button.BackgroundColor3 = color
+		gap.BackgroundColor3 = color
+	end
+end
+
 local function buildStatusWidget(plugin, versionText)
 	local refs = newRefs()
 
-	local info = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Right, false, false, 320, 220, 150, 24)
+	local info = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Right, false, false, 320, 220, 96, 24)
 	local widget = createWidget(plugin, "ReniumStatus", info, "Renium")
 
 	local root = Instance.new("Frame")
@@ -1026,36 +1085,56 @@ local function buildStatusWidget(plugin, versionText)
 
 	local card = makeCard(content, "Status", refs)
 	card.AutomaticSize = Enum.AutomaticSize.None
-	local cardStroke = refs.cardStrokes[#refs.cardStrokes]
-
-	local titleRow = Instance.new("Frame")
-	titleRow.Name = "TitleRow"
-	titleRow.Size = UDim2.new(1, 0, 0, 24)
-	titleRow.BackgroundTransparency = 1
-	titleRow.Parent = card
-
 	local dot = Instance.new("Frame")
 	dot.Name = "Dot"
 	dot.Size = UDim2.fromOffset(10, 10)
-	dot.Position = UDim2.new(0, 0, 0.5, -5)
 	dot.BackgroundColor3 = IDLE_GREY
 	dot.BorderSizePixel = 0
-	dot.Parent = titleRow
+	dot.Parent = card
 	local dotCorner = Instance.new("UICorner")
 	dotCorner.CornerRadius = UDim.new(1, 0)
 	dotCorner.Parent = dot
 
-	local statusTitle = makeText(titleRow, "StatusTitle", "Disconnected", { font = FONT_MEDIUM, size = TEXT_MD })
-	statusTitle.Position = UDim2.fromOffset(20, 0)
-	statusTitle.Size = UDim2.new(1, -20, 1, 0)
+	local statusTitle = makeText(card, "StatusTitle", "Disconnected", { font = FONT_MEDIUM, size = TEXT_MD })
 	table.insert(refs.text, statusTitle)
 
 	local statusSubtitle = makeSelectableText(card, "StatusSubtitle", refs)
 	statusSubtitle.Text = "Start the sync server, then connect."
 
 	local syncLine = makeText(card, "SyncedAt", "Not connected", { size = TEXT_XS })
-	syncLine.Size = UDim2.new(1, 0, 0, 18)
 	table.insert(refs.dimmed, syncLine)
+
+	local actions = Instance.new("Frame")
+	actions.Name = "Actions"
+	actions.Size = UDim2.fromOffset(CONTROL_HEIGHT * 2 + 8, CONTROL_HEIGHT)
+	actions.BackgroundTransparency = 1
+	actions.Parent = card
+
+	local connectButton = makeIconButton(actions, "Connect")
+	local paintConnect = makePowerIcon(connectButton)
+	paintConnect(BRAND)
+
+	local disconnectButton = makeIconButton(actions, "Disconnect")
+	disconnectButton.Visible = false
+	local paintDisconnect = makePowerIcon(disconnectButton)
+	paintDisconnect(ERROR_RED)
+
+	local settingsButton = makeIconButton(actions, "Settings")
+	settingsButton.Position = UDim2.fromOffset(CONTROL_HEIGHT + 8, 0)
+	table.insert(refs.secondaryButtons, settingsButton)
+
+	local settingsIcon = Instance.new("ImageLabel")
+	settingsIcon.Name = "Icon"
+	settingsIcon.AnchorPoint = Vector2.new(0.5, 0.5)
+	settingsIcon.Position = UDim2.fromScale(0.5, 0.5)
+	settingsIcon.Size = UDim2.fromOffset(20, 20)
+	settingsIcon.BackgroundTransparency = 1
+	settingsIcon.Image = GEAR_ICON
+	settingsIcon.ImageRectOffset = Vector2.new(9, 5)
+	settingsIcon.ImageRectSize = Vector2.new(72, 72)
+	settingsIcon.ScaleType = Enum.ScaleType.Fit
+	settingsIcon.Parent = settingsButton
+	table.insert(refs.icons, settingsIcon)
 
 	local notificationCard = makeCard(content, "Notification", refs)
 	notificationCard.Visible = false
@@ -1105,54 +1184,6 @@ local function buildStatusWidget(plugin, versionText)
 	notificationDismissButton.Parent = notificationActions
 	styleButton(notificationDismissButton, refs, false)
 
-	local actions = Instance.new("Frame")
-	actions.Name = "Actions"
-	actions.BackgroundTransparency = 1
-	actions.Parent = content
-
-	local primarySlot = Instance.new("Frame")
-	primarySlot.Name = "PrimarySlot"
-	primarySlot.Size = UDim2.new(1, -(CONTROL_HEIGHT + 8), 1, 0)
-	primarySlot.BackgroundTransparency = 1
-	primarySlot.Parent = actions
-
-	local connectButton = Instance.new("TextButton")
-	connectButton.Name = "Connect"
-	connectButton.Size = UDim2.fromScale(1, 1)
-	connectButton.Text = "Connect"
-	connectButton.Parent = primarySlot
-	styleButton(connectButton, refs, true)
-
-	local disconnectButton = Instance.new("TextButton")
-	disconnectButton.Name = "Disconnect"
-	disconnectButton.Size = UDim2.fromScale(1, 1)
-	disconnectButton.Text = "Disconnect"
-	disconnectButton.Visible = false
-	disconnectButton.Parent = primarySlot
-	styleButton(disconnectButton, refs, false)
-
-	local settingsButton = Instance.new("TextButton")
-	settingsButton.Name = "Settings"
-	settingsButton.AnchorPoint = Vector2.new(1, 0)
-	settingsButton.Position = UDim2.fromScale(1, 0)
-	settingsButton.Size = UDim2.new(0, CONTROL_HEIGHT, 1, 0)
-	settingsButton.Text = ""
-	settingsButton.Parent = actions
-	styleButton(settingsButton, refs, false)
-
-	local settingsIcon = Instance.new("ImageLabel")
-	settingsIcon.Name = "Icon"
-	settingsIcon.AnchorPoint = Vector2.new(0.5, 0.5)
-	settingsIcon.Position = UDim2.fromScale(0.5, 0.5)
-	settingsIcon.Size = UDim2.fromOffset(20, 20)
-	settingsIcon.BackgroundTransparency = 1
-	settingsIcon.Image = GEAR_ICON
-	settingsIcon.ImageRectOffset = Vector2.new(9, 5)
-	settingsIcon.ImageRectSize = Vector2.new(72, 72)
-	settingsIcon.ScaleType = Enum.ScaleType.Fit
-	settingsIcon.Parent = settingsButton
-	table.insert(refs.icons, settingsIcon)
-
 	local function blank(text)
 		return string.match(text, "^%s*$") ~= nil
 	end
@@ -1164,27 +1195,28 @@ local function buildStatusWidget(plugin, versionText)
 		if width < 2 or height < 2 then
 			return
 		end
+		local actionsWidth = CONTROL_HEIGHT * 2 + 8
 		local hasSubtitle = not blank(statusSubtitle.Text)
 		local hasSync = not blank(syncLine.Text)
-		local subtitleHeight = if hasSubtitle then 6 + math.max(statusSubtitle.AbsoluteSize.Y, TEXT_XS + 2) else 0
-		local syncHeight = if hasSync then 22 else 0
-		local fullCard = 48 + subtitleHeight + syncHeight
-		local fullHeight = WIDGET_PADDING * 2 + fullCard + LIST_SPACING + CONTROL_HEIGHT
+		local subtitleHeight = if hasSubtitle then 4 + math.max(statusSubtitle.AbsoluteSize.Y, TEXT_XS + 2) else 0
+		local syncHeight = if hasSync then 2 + 18 else 0
+		local fullInner = CONTROL_HEIGHT + subtitleHeight + syncHeight
+		local fullHeight = WIDGET_PADDING * 2 + 24 + fullInner
 		local headerHeight = fullHeight + 30 + LIST_SPACING
-		local compactHeight = 16 + 44 + syncHeight + 8 + CONTROL_HEIGHT
-		local compact = width < 260 or height < fullHeight
-		local oneRow = height < 16 + 44 + 8 + CONTROL_HEIGHT
-		local pad = if compact then 8 else WIDGET_PADDING
-		local gap = if compact then 8 else LIST_SPACING
+		local full = width >= 260 and height >= fullHeight
+		local showHeader = full and height >= headerHeight
+		local pad = if full then WIDGET_PADDING else 8
+		local gap = if full then LIST_SPACING else 8
 		local innerWidth = width - pad * 2
-		local showHeader = not compact and height >= headerHeight
-		local showSubtitle = not compact and hasSubtitle
-		local showSync = hasSync and not oneRow and (not compact or height >= compactHeight)
-		local chrome = not oneRow
-		local cardPadX = if not chrome then 0 elseif compact then 12 else 14
-		local cardPadY = if not chrome then 0 elseif compact then 10 else 12
+		local cardPadX = if full then 14 else 12
+		local cardPadY = if full then 12 else 10
+		local showSubtitle = full and hasSubtitle
+		local showSync = hasSync and (full or height >= (pad + cardPadY) * 2 + CONTROL_HEIGHT + syncHeight)
+		local textWidth = innerWidth - cardPadX * 2 - 20 - actionsWidth - 8
+		local showTitle = textWidth >= 56
+		statusTitle.TextSize = if full then TEXT_MD else TEXT_SM
 
-		local y = if oneRow then math.max(pad, math.floor((height - CONTROL_HEIGHT) / 2)) else pad
+		local y = pad
 		header.Visible = showHeader
 		if showHeader then
 			header.Position = UDim2.fromOffset(pad, y)
@@ -1193,48 +1225,35 @@ local function buildStatusWidget(plugin, versionText)
 			y += 30 + gap
 		end
 
-		local actionsWidth = if oneRow then math.clamp(math.floor(innerWidth * 0.45), 100, 150) else innerWidth
-		local cardWidth = if oneRow then innerWidth - actionsWidth - gap else innerWidth
-		statusTitle.Visible = not oneRow or cardWidth >= 96
-		card.BackgroundTransparency = if chrome then 0 else 1
-		cardStroke.Transparency = if chrome then 0.4 else 1
-		titleRow.Position = UDim2.fromOffset(cardPadX, cardPadY)
-		titleRow.Size = UDim2.new(1, -cardPadX * 2, 0, if oneRow then CONTROL_HEIGHT else 24)
-		local cardHeight = cardPadY + titleRow.Size.Y.Offset
+		dot.Position = UDim2.fromOffset(cardPadX, cardPadY + CONTROL_HEIGHT / 2 - 5)
+		statusTitle.Visible = showTitle
+		statusTitle.Position = UDim2.fromOffset(cardPadX + 20, cardPadY)
+		statusTitle.Size = UDim2.fromOffset(math.max(textWidth, 0), CONTROL_HEIGHT)
+		local cardHeight = cardPadY + CONTROL_HEIGHT
 		statusSubtitle.Visible = showSubtitle
 		if showSubtitle then
-			statusSubtitle.Position = UDim2.fromOffset(cardPadX, cardHeight + 6)
-			statusSubtitle.Size = UDim2.new(1, -cardPadX * 2, 0, 0)
-			cardHeight += 6 + math.max(statusSubtitle.AbsoluteSize.Y, TEXT_XS + 2)
+			statusSubtitle.Position = UDim2.fromOffset(cardPadX, cardHeight + 4)
+			statusSubtitle.Size = UDim2.fromOffset(innerWidth - cardPadX * 2, 0)
+			cardHeight += subtitleHeight
 		end
 		syncLine.Visible = showSync
 		if showSync then
-			syncLine.Position = UDim2.fromOffset(cardPadX, cardHeight + 4)
-			syncLine.Size = UDim2.new(1, -cardPadX * 2, 0, 18)
-			cardHeight += 4 + 18
+			syncLine.Position = UDim2.fromOffset(cardPadX, cardHeight + 2)
+			syncLine.Size = UDim2.fromOffset(innerWidth - cardPadX * 2, 18)
+			cardHeight += syncHeight
 		end
+		actions.AnchorPoint = Vector2.new(1, 0.5)
+		actions.Position = UDim2.new(1, -cardPadX, 0, math.floor((cardPadY + cardHeight) / 2))
 		cardHeight += cardPadY
 		card.Position = UDim2.fromOffset(pad, y)
-		card.Size = UDim2.fromOffset(cardWidth, cardHeight)
-
-		if oneRow then
-			actions.Position = UDim2.fromOffset(pad + cardWidth + gap, y)
-			actions.Size = UDim2.fromOffset(actionsWidth, CONTROL_HEIGHT)
-			y += math.max(cardHeight, CONTROL_HEIGHT)
-		else
-			y += cardHeight + gap
-		end
+		card.Size = UDim2.fromOffset(innerWidth, cardHeight)
+		y += cardHeight
 
 		if notificationCard.Visible then
+			y += gap
 			notificationCard.Position = UDim2.fromOffset(pad, y)
 			notificationCard.Size = UDim2.fromOffset(innerWidth, 0)
-			y += notificationCard.AbsoluteSize.Y + gap
-		end
-
-		if not oneRow then
-			actions.Position = UDim2.fromOffset(pad, y)
-			actions.Size = UDim2.fromOffset(innerWidth, CONTROL_HEIGHT)
-			y += CONTROL_HEIGHT
+			y += notificationCard.AbsoluteSize.Y
 		end
 
 		local canvasHeight = y + pad
@@ -1261,6 +1280,17 @@ local function buildStatusWidget(plugin, versionText)
 	notificationCard:GetPropertyChangedSignal("AbsoluteSize"):Connect(scheduleLayout)
 	scheduleLayout()
 
+	local function setPrimary(kind)
+		if kind == "connect" then
+			connectButton.Visible = true
+			disconnectButton.Visible = false
+		else
+			connectButton.Visible = false
+			disconnectButton.Visible = true
+			paintDisconnect(if kind == "cancel" then WARN_AMBER else ERROR_RED)
+		end
+	end
+
 	return {
 		widget = widget,
 		refs = refs,
@@ -1277,6 +1307,7 @@ local function buildStatusWidget(plugin, versionText)
 		settingsButton = settingsButton,
 		disconnectButton = disconnectButton,
 		connectButton = connectButton,
+		setPrimary = setPrimary,
 	}
 end
 
@@ -1784,9 +1815,7 @@ function BridgeUi.create(plugin, bridgeInfo)
 		statusUi.statusTitle.Text = "Connecting..."
 		statusUi.statusSubtitle.Text = " "
 		statusUi.syncLine.Text = "Waiting for sync"
-		statusUi.connectButton.Visible = false
-		statusUi.disconnectButton.Visible = true
-		statusUi.disconnectButton.Text = "Cancel"
+		statusUi.setPrimary("cancel")
 	end
 
 	statusUi.settingsButton.MouseButton1Click:Connect(function()
@@ -2326,19 +2355,7 @@ function BridgeUi.create(plugin, bridgeInfo)
 		local syncText = tostring(view.syncText or "")
 		statusUi.syncLine.Text = syncText
 
-		if mode == "connected" then
-			statusUi.connectButton.Visible = false
-			statusUi.disconnectButton.Visible = true
-			statusUi.disconnectButton.Text = "Disconnect"
-		elseif mode == "connecting" then
-			statusUi.connectButton.Visible = false
-			statusUi.disconnectButton.Visible = true
-			statusUi.disconnectButton.Text = "Cancel"
-		else
-			statusUi.connectButton.Visible = true
-			statusUi.connectButton.Text = "Connect"
-			statusUi.disconnectButton.Visible = false
-		end
+		statusUi.setPrimary(if mode == "connected" then "disconnect" elseif mode == "connecting" then "cancel" else "connect")
 	end
 
 	function ui.applyStudioTheme()
