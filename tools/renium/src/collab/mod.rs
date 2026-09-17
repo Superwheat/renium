@@ -209,7 +209,7 @@ impl Manager {
     ) -> Result<Arc<Session>> {
         let awareness = Arc::new(Mutex::new(Awareness::new(document::new_doc())));
         {
-            let mut guard = awareness.lock_recover();
+            let guard = awareness.lock_recover();
             guard.set_local_state(json!({ "user": name, "color": color_for(&name) }))?;
         }
         let room = Room::new(awareness)?;
@@ -261,7 +261,7 @@ impl Manager {
                     if heartbeat_room.stopping() {
                         break;
                     }
-                    let mut awareness = heartbeat_room.awareness().lock_recover();
+                    let awareness = heartbeat_room.awareness().lock_recover();
                     if let Some(state) = awareness.local_state::<Value>() {
                         let _ = awareness.set_local_state(state);
                     }
@@ -407,7 +407,7 @@ impl Session {
     }
 
     fn set_awareness(&self, fields: &Map<String, Value>) -> Result<()> {
-        let mut awareness = self.room.awareness().lock_recover();
+        let awareness = self.room.awareness().lock_recover();
         let mut state = awareness
             .local_state::<Value>()
             .and_then(|value| value.as_object().cloned())
