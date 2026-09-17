@@ -105,7 +105,7 @@ pub(crate) fn studio_processes() -> Vec<StudioProcess> {
     use std::time::SystemTime;
 
     let Ok(output) = std::process::Command::new("ps")
-        .args(["-axo", "pid=,etimes=,comm="])
+        .args(["-axo", "pid=,etime=,comm="])
         .output()
     else {
         return Vec::new();
@@ -119,12 +119,12 @@ pub(crate) fn studio_processes() -> Vec<StudioProcess> {
         let mut parts = line.split_whitespace();
         let (Some(pid), Some(elapsed)) = (
             parts.next().and_then(|value| value.parse::<u32>().ok()),
-            parts.next().and_then(|value| value.parse::<u64>().ok()),
+            parts.next().and_then(elapsed_seconds),
         ) else {
             continue;
         };
         let command = parts.collect::<Vec<_>>().join(" ");
-        if command.contains("RobloxStudio") && !command.contains("Helper") {
+        if command.rsplit('/').next() == Some("RobloxStudio") {
             processes.push(StudioProcess {
                 pid,
                 started_unix: Some(now.saturating_sub(elapsed)),
@@ -138,6 +138,21 @@ pub(crate) fn studio_processes() -> Vec<StudioProcess> {
 #[cfg(not(any(windows, target_os = "macos")))]
 pub(crate) fn studio_processes() -> Vec<StudioProcess> {
     Vec::new()
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn elapsed_seconds(text: &str) -> Option<u64> {
+    let (days, clock) = match text.split_once('-') {
+        Some((days, clock)) => (days.parse::<u64>().ok()?, clock),
+        None => (0, text),
+    };
+    let mut seconds = 0u64;
+    for part in clock.split(':') {
+        seconds = seconds
+            .checked_mul(60)?
+            .checked_add(part.parse::<u64>().ok()?)?;
+    }
+    Some(days * 86_400 + seconds)
 }
 
 fn plugin_file() -> Option<(String, Option<u64>)> {
@@ -246,7 +261,16 @@ pub(crate) fn verdict(clients: &[Value], project_root: Option<&Path>) -> String 
 
 #[cfg(test)]
 mod tests {
-    use super::verdict_text;
+    use super::{elapsed_seconds, verdict_text};
+
+    #[test]
+    fn elapsed_seconds_reads_ps_etime() {
+        assert_eq!(elapsed_seconds("05"), Some(5));
+        assert_eq!(elapsed_seconds("01:05"), Some(65));
+        assert_eq!(elapsed_seconds("02:00:01"), Some(7_201));
+        assert_eq!(elapsed_seconds("02-14:51:04"), Some(226_264));
+        assert_eq!(elapsed_seconds("x"), None);
+    }
 
     fn plugin(modified: Option<u64>) -> (String, Option<u64>) {
         ("plugins/Renium.rbxm".to_string(), modified)
