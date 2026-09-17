@@ -144,6 +144,7 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::LiveStatus(args) => {
             studio_change_state_operation_command(args, op::LIVE_STATUS, project)
         }
+        Commands::Collab(args) => crate::collab::command::collab_command(args, project),
         Commands::RetryPending(args) => {
             studio_change_state_operation_command(args, op::RETRY_PENDING, project)
         }

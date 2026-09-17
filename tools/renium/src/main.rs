@@ -58,6 +58,7 @@ mod automation;
 mod bytecode;
 mod cli;
 mod cloud;
+mod collab;
 mod daemon;
 mod editor;
 mod plugins;

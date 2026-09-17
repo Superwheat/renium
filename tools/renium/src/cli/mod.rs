@@ -563,6 +563,12 @@ pub(super) enum Commands {
     #[command(name = "lst", alias = "live-status", about = "Show Live Sync status")]
     LiveStatus(StudioChangeStateArgs),
     #[command(
+        name = "collab",
+        alias = "collaborate",
+        about = "Share this project live with other editors"
+    )]
+    Collab(CollabArgs),
+    #[command(
         name = "rp",
         alias = "retry-pending",
         about = "Retry pending Live Sync edits"
@@ -1735,6 +1741,38 @@ pub(super) struct RecordReviewArgs {
     /// Write the PNG here instead of beside the recording in its .review folder.
     #[arg(help = "Image path to write", short, long)]
     pub(super) output: Option<PathBuf>,
+}
+
+#[derive(Parser)]
+pub(crate) struct CollabArgs {
+    #[command(subcommand)]
+    pub(crate) action: CollabAction,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum CollabAction {
+    #[command(about = "Share this project; prints the invite link")]
+    Start {
+        #[arg(help = "Relay base URL instead of a direct tunnel", long)]
+        relay: Option<String>,
+        #[arg(help = "Keep the room on this machine without a public tunnel", long)]
+        local: bool,
+        #[arg(help = "Display name shown to other participants", long)]
+        name: Option<String>,
+    },
+    #[command(about = "Join a shared project from an invite link")]
+    Join {
+        #[arg(help = "Invite link from the host")]
+        invite: String,
+        #[arg(help = "Display name shown to other participants", long)]
+        name: Option<String>,
+    },
+    #[command(about = "Leave the shared session")]
+    Stop,
+    #[command(about = "Show session state and participants")]
+    Status,
+    #[command(about = "Print the invite link")]
+    Invite,
 }
 
 #[derive(Parser)]

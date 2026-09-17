@@ -2246,6 +2246,62 @@ fn pair_configuration(
     })
 }
 
+fn collab_operation(
+    operation: u16,
+    state: &automation::State,
+    parameters: &Value,
+) -> Result<Value> {
+    let root = parameters
+        .get("root")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .context("Collaboration requests name the project root")?;
+    let root = Path::new(root);
+    let manager = state.collab();
+    let name = parameters
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    match operation {
+        op::COLLAB_START => manager.start(
+            root,
+            crate::collab::StartOptions {
+                name,
+                relay: parameters
+                    .get("relay")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                tunnel: parameters
+                    .get("tunnel")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+            },
+        ),
+        op::COLLAB_JOIN => manager.join(
+            root,
+            parameters
+                .get("invite")
+                .and_then(Value::as_str)
+                .context("A join request needs an invite")?,
+            name,
+        ),
+        op::COLLAB_STOP => manager.stop(root),
+        op::COLLAB_STATUS => {
+            if let Some(restored) = manager.restore(root)? {
+                return Ok(restored);
+            }
+            manager.status(root)
+        }
+        _ => manager.set_awareness(
+            root,
+            parameters
+                .get("state")
+                .and_then(Value::as_object)
+                .context("Awareness updates carry a state object")?,
+        ),
+    }
+}
+
 fn resolve_connected_context(
     state: &automation::State,
     bridge: &BridgeServer,
@@ -2438,6 +2494,13 @@ fn automation_execute_request(
     match operation.id {
         op::CAP => automation::capabilities().map_err(automation_failure),
         op::BIND => bound_context::bind(state, bridge, &request.p),
+        op::COLLAB_START
+        | op::COLLAB_JOIN
+        | op::COLLAB_STOP
+        | op::COLLAB_STATUS
+        | op::COLLAB_AWARENESS => {
+            collab_operation(operation.id, state, &request.p).map_err(automation_failure)
+        }
         op::STUDIOS => {
             let wait_seconds = request
                 .p

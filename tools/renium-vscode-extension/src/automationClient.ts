@@ -35,6 +35,14 @@ type AutomationError = {
   d?: unknown;
 };
 
+const UNBOUND_OPS = new Set<number>([
+  AUTOMATION_OP.collabStart,
+  AUTOMATION_OP.collabJoin,
+  AUTOMATION_OP.collabStop,
+  AUTOMATION_OP.collabStatus,
+  AUTOMATION_OP.collabAwareness,
+]);
+
 export type CommandRunResult = {
   code: number;
   output: string;
@@ -120,7 +128,7 @@ export class AutomationClient {
     options: { quietWait?: boolean; timeoutMs?: number } = {},
   ): Promise<CommandRunResult> {
     await this.ensure(command, config);
-    if (op === AUTOMATION_OP.studios) {
+    if (op === AUTOMATION_OP.studios || UNBOUND_OPS.has(op)) {
       return this.send(config, label, op, undefined, parameters, options);
     }
     const requireRuntime = operationRequiresRuntime(op, parameters);
