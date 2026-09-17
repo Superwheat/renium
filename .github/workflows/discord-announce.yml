@@ -20,6 +20,7 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           RENIUM_VERSION: ${{ github.event.inputs.version }}
+          RELEASE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag
         run: |
           if [ -z "$DISCORD_WEBHOOK_URL" ]; then
             echo "DISCORD_WEBHOOK_URL is empty; set it with: gh secret set DISCORD_WEBHOOK_URL" >&2
@@ -33,7 +34,7 @@ jobs:
               match = re.search(rf"^## {re.escape(version)}\b[^\n]*\n(.*?)(?=^## |\Z)", changelog, re.S | re.M)
               if not match:
                   sys.exit(f"changelog has no entry for {version}")
-              text = f"# {version}\n\n{match.group(1).strip()}\n"
+              text = f"# {version}\n\n{match.group(1).strip()}\n\n<{os.environ['RELEASE_URL']}/v{version}>\n"
           else:
               text = "Renium release announcements are connected."
           chunks, current = [], ""
