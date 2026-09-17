@@ -1164,14 +1164,22 @@ local function buildStatusWidget(plugin, versionText)
 		if width < 2 or height < 2 then
 			return
 		end
-		local compact = height < 150 or width < 260
-		local oneRow = height < 96
+		local hasSubtitle = not blank(statusSubtitle.Text)
+		local hasSync = not blank(syncLine.Text)
+		local subtitleHeight = if hasSubtitle then 6 + math.max(statusSubtitle.AbsoluteSize.Y, TEXT_XS + 2) else 0
+		local syncHeight = if hasSync then 22 else 0
+		local fullCard = 48 + subtitleHeight + syncHeight
+		local fullHeight = WIDGET_PADDING * 2 + fullCard + LIST_SPACING + CONTROL_HEIGHT
+		local headerHeight = fullHeight + 30 + LIST_SPACING
+		local compactHeight = 20 + 48 + syncHeight + 8 + CONTROL_HEIGHT
+		local compact = width < 260 or height < fullHeight
+		local oneRow = height < 20 + 48 + 8 + CONTROL_HEIGHT
 		local pad = if oneRow then 8 elseif compact then 10 else WIDGET_PADDING
 		local gap = if compact then 8 else LIST_SPACING
 		local innerWidth = width - pad * 2
-		local showHeader = not compact and height >= 200
-		local showSubtitle = not compact and not blank(statusSubtitle.Text)
-		local showSync = not oneRow and height >= 112 and not blank(syncLine.Text)
+		local showHeader = not compact and height >= headerHeight
+		local showSubtitle = not compact and hasSubtitle
+		local showSync = hasSync and not oneRow and (not compact or height >= compactHeight)
 		local chrome = not oneRow
 		local cardPadX = if chrome then 14 else 0
 		local cardPadY = if chrome then 12 else 0
