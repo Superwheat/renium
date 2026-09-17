@@ -9,6 +9,7 @@ local TWEEN_FAST = TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirecti
 
 local LOGO_IMAGE = "rbxthumb://type=Asset&id=140594231959629&w=150&h=150"
 local TOOLBAR_ICON = "rbxassetid://122947751652516"
+local GEAR_ICON = "rbxasset://textures/ui/Settings/MenuBarIcons/GameSettingsTab@2x.png"
 
 local BRAND = Color3.fromRGB(96, 165, 250)
 local OK_GREEN = Color3.fromRGB(86, 194, 126)
@@ -46,6 +47,7 @@ local DROPDOWN_ENTRY_HEIGHT = 30
 local TOGGLE_WIDTH = 40
 local TOGGLE_HEIGHT = 22
 local TOGGLE_KNOB = 16
+local STACKED_ROW_WIDTH = 330
 
 local function studioColor(theme, name, fallback)
 	local style = Enum.StudioStyleGuideColor[name]
@@ -142,6 +144,7 @@ local function newRefs()
 		fieldStrokes = {},
 		fieldTexts = {},
 		secondaryButtons = {},
+		icons = {},
 		palette = palette(settings().Studio.Theme),
 	}
 end
@@ -377,7 +380,30 @@ local function makeRow(content, name, description, order, refs, isFirst, control
 	controlHost.Position = UDim2.fromScale(1, 0.5)
 	controlHost.Size = UDim2.fromOffset(controlWidth, CONTROL_HEIGHT)
 	controlHost.BackgroundTransparency = 1
+	controlHost.LayoutOrder = 3
 	controlHost.Parent = inner
+
+	local stacked = nil
+	local function arrange()
+		local wantStacked = row.AbsoluteSize.X < STACKED_ROW_WIDTH
+		if wantStacked == stacked then
+			return
+		end
+		stacked = wantStacked
+		if wantStacked then
+			left.Size = UDim2.fromScale(1, 0)
+			controlHost.AnchorPoint = Vector2.new(0, 0)
+			controlHost.Position = UDim2.new(0, 0, 0, 0)
+			controlHost.Parent = left
+		else
+			left.Size = UDim2.new(1, -(controlWidth + 16), 0, 0)
+			controlHost.AnchorPoint = Vector2.new(1, 0.5)
+			controlHost.Position = UDim2.fromScale(1, 0.5)
+			controlHost.Parent = inner
+		end
+	end
+	row:GetPropertyChangedSignal("AbsoluteSize"):Connect(arrange)
+	arrange()
 	return controlHost
 end
 
@@ -714,7 +740,7 @@ end
 local function buildSettingsWidget(plugin)
 	local refs = newRefs()
 
-	local info = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, false, true, 480, 700, 390, 440)
+	local info = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, false, true, 480, 700, 260, 200)
 	local widget = createWidget(plugin, "ReniumSettings", info, "Renium Settings")
 	widget.Enabled = false
 
@@ -956,7 +982,7 @@ end
 local function buildStatusWidget(plugin, versionText)
 	local refs = newRefs()
 
-	local info = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Right, false, false, 400, 300, 340, 240)
+	local info = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Right, false, false, 320, 220, 150, 48)
 	local widget = createWidget(plugin, "ReniumStatus", info, "Renium")
 
 	local root = Instance.new("Frame")
@@ -967,17 +993,11 @@ local function buildStatusWidget(plugin, versionText)
 	table.insert(refs.roots, root)
 
 	local content = makeScrollingFrame(root, "Content")
-	addPadding(content, WIDGET_PADDING, WIDGET_PADDING, WIDGET_PADDING, WIDGET_PADDING)
-	local contentLayout = addVerticalList(content, LIST_SPACING)
-	contentLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
-		content.CanvasSize = UDim2.fromOffset(0, contentLayout.AbsoluteContentSize.Y + WIDGET_PADDING * 2)
-	end)
+	content.VerticalScrollBarInset = Enum.ScrollBarInset.None
 
 	local header = Instance.new("Frame")
 	header.Name = "Header"
-	header.Size = UDim2.new(1, 0, 0, 30)
 	header.BackgroundTransparency = 1
-	header.LayoutOrder = 1
 	header.Parent = content
 
 	local logo = Instance.new("ImageLabel")
@@ -1005,15 +1025,13 @@ local function buildStatusWidget(plugin, versionText)
 	table.insert(refs.dimmed, versionLabel)
 
 	local card = makeCard(content, "Status", refs)
-	card.LayoutOrder = 2
-	addPadding(card, 14, 14, 12, 12)
-	addVerticalList(card, 6)
+	card.AutomaticSize = Enum.AutomaticSize.None
+	local cardStroke = refs.cardStrokes[#refs.cardStrokes]
 
 	local titleRow = Instance.new("Frame")
 	titleRow.Name = "TitleRow"
 	titleRow.Size = UDim2.new(1, 0, 0, 24)
 	titleRow.BackgroundTransparency = 1
-	titleRow.LayoutOrder = 1
 	titleRow.Parent = card
 
 	local dot = Instance.new("Frame")
@@ -1034,15 +1052,12 @@ local function buildStatusWidget(plugin, versionText)
 
 	local statusSubtitle = makeSelectableText(card, "StatusSubtitle", refs)
 	statusSubtitle.Text = "Start the sync server, then connect."
-	statusSubtitle.LayoutOrder = 2
 
 	local syncLine = makeText(card, "SyncedAt", "Not connected", { size = TEXT_XS })
 	syncLine.Size = UDim2.new(1, 0, 0, 18)
-	syncLine.LayoutOrder = 3
 	table.insert(refs.dimmed, syncLine)
 
 	local notificationCard = makeCard(content, "Notification", refs)
-	notificationCard.LayoutOrder = 3
 	notificationCard.Visible = false
 	addPadding(notificationCard, 14, 14, 12, 12)
 	addVerticalList(notificationCard, 6)
@@ -1092,14 +1107,12 @@ local function buildStatusWidget(plugin, versionText)
 
 	local actions = Instance.new("Frame")
 	actions.Name = "Actions"
-	actions.Size = UDim2.new(1, 0, 0, CONTROL_HEIGHT)
 	actions.BackgroundTransparency = 1
-	actions.LayoutOrder = 4
 	actions.Parent = content
 
 	local primarySlot = Instance.new("Frame")
 	primarySlot.Name = "PrimarySlot"
-	primarySlot.Size = UDim2.new(1, -104, 1, 0)
+	primarySlot.Size = UDim2.new(1, -(CONTROL_HEIGHT + 8), 1, 0)
 	primarySlot.BackgroundTransparency = 1
 	primarySlot.Parent = actions
 
@@ -1122,10 +1135,123 @@ local function buildStatusWidget(plugin, versionText)
 	settingsButton.Name = "Settings"
 	settingsButton.AnchorPoint = Vector2.new(1, 0)
 	settingsButton.Position = UDim2.fromScale(1, 0)
-	settingsButton.Size = UDim2.new(0, 96, 1, 0)
-	settingsButton.Text = "Settings"
+	settingsButton.Size = UDim2.new(0, CONTROL_HEIGHT, 1, 0)
+	settingsButton.Text = ""
 	settingsButton.Parent = actions
 	styleButton(settingsButton, refs, false)
+
+	local settingsIcon = Instance.new("ImageLabel")
+	settingsIcon.Name = "Icon"
+	settingsIcon.AnchorPoint = Vector2.new(0.5, 0.5)
+	settingsIcon.Position = UDim2.fromScale(0.5, 0.5)
+	settingsIcon.Size = UDim2.fromOffset(20, 20)
+	settingsIcon.BackgroundTransparency = 1
+	settingsIcon.Image = GEAR_ICON
+	settingsIcon.ImageRectOffset = Vector2.new(9, 5)
+	settingsIcon.ImageRectSize = Vector2.new(72, 72)
+	settingsIcon.ScaleType = Enum.ScaleType.Fit
+	settingsIcon.Parent = settingsButton
+	table.insert(refs.icons, settingsIcon)
+
+	local function blank(text)
+		return string.match(text, "^%s*$") ~= nil
+	end
+
+	local layoutScheduled = false
+	local function layout()
+		local width = content.AbsoluteSize.X
+		local height = content.AbsoluteSize.Y
+		if width < 2 or height < 2 then
+			return
+		end
+		local compact = height < 150 or width < 260
+		local oneRow = height < 96
+		local pad = if oneRow then 8 elseif compact then 10 else WIDGET_PADDING
+		local gap = if compact then 8 else LIST_SPACING
+		local innerWidth = width - pad * 2
+		local showHeader = not compact and height >= 200
+		local showSubtitle = not compact and not blank(statusSubtitle.Text)
+		local showSync = not oneRow and height >= 112 and not blank(syncLine.Text)
+		local chrome = not oneRow
+		local cardPadX = if chrome then 14 else 0
+		local cardPadY = if chrome then 12 else 0
+
+		local y = pad
+		header.Visible = showHeader
+		if showHeader then
+			header.Position = UDim2.fromOffset(pad, y)
+			header.Size = UDim2.fromOffset(innerWidth, 30)
+			versionLabel.Visible = innerWidth >= 220
+			y += 30 + gap
+		end
+
+		local actionsWidth = if oneRow then math.clamp(math.floor(innerWidth * 0.45), 100, 150) else innerWidth
+		local cardWidth = if oneRow then innerWidth - actionsWidth - gap else innerWidth
+		statusTitle.Visible = not oneRow or cardWidth >= 96
+		card.BackgroundTransparency = if chrome then 0 else 1
+		cardStroke.Transparency = if chrome then 0.4 else 1
+		titleRow.Position = UDim2.fromOffset(cardPadX, cardPadY)
+		titleRow.Size = UDim2.new(1, -cardPadX * 2, 0, if oneRow then CONTROL_HEIGHT else 24)
+		local cardHeight = cardPadY + titleRow.Size.Y.Offset
+		statusSubtitle.Visible = showSubtitle
+		if showSubtitle then
+			statusSubtitle.Position = UDim2.fromOffset(cardPadX, cardHeight + 6)
+			statusSubtitle.Size = UDim2.new(1, -cardPadX * 2, 0, 0)
+			cardHeight += 6 + math.max(statusSubtitle.AbsoluteSize.Y, TEXT_XS + 2)
+		end
+		syncLine.Visible = showSync
+		if showSync then
+			syncLine.Position = UDim2.fromOffset(cardPadX, cardHeight + 4)
+			syncLine.Size = UDim2.new(1, -cardPadX * 2, 0, 18)
+			cardHeight += 4 + 18
+		end
+		cardHeight += cardPadY
+		card.Position = UDim2.fromOffset(pad, y)
+		card.Size = UDim2.fromOffset(cardWidth, cardHeight)
+
+		if oneRow then
+			actions.Position = UDim2.fromOffset(pad + cardWidth + gap, y)
+			actions.Size = UDim2.fromOffset(actionsWidth, CONTROL_HEIGHT)
+			y += math.max(cardHeight, CONTROL_HEIGHT)
+		else
+			y += cardHeight + gap
+		end
+
+		if notificationCard.Visible then
+			notificationCard.Position = UDim2.fromOffset(pad, y)
+			notificationCard.Size = UDim2.fromOffset(innerWidth, 0)
+			y += notificationCard.AbsoluteSize.Y + gap
+		end
+
+		if not oneRow then
+			actions.Position = UDim2.fromOffset(pad, y)
+			actions.Size = UDim2.fromOffset(innerWidth, CONTROL_HEIGHT)
+			y += CONTROL_HEIGHT
+		end
+
+		local canvasHeight = y + pad
+		content.CanvasSize = UDim2.fromOffset(0, canvasHeight)
+		content.ScrollBarThickness = if canvasHeight > height + 1 then 6 else 0
+	end
+
+	local function scheduleLayout()
+		if layoutScheduled then
+			return
+		end
+		layoutScheduled = true
+		task.defer(function()
+			layoutScheduled = false
+			layout()
+		end)
+	end
+
+	content:GetPropertyChangedSignal("AbsoluteSize"):Connect(scheduleLayout)
+	statusSubtitle:GetPropertyChangedSignal("AbsoluteSize"):Connect(scheduleLayout)
+	statusSubtitle:GetPropertyChangedSignal("Text"):Connect(scheduleLayout)
+	syncLine:GetPropertyChangedSignal("Text"):Connect(scheduleLayout)
+	notificationCard:GetPropertyChangedSignal("Visible"):Connect(scheduleLayout)
+	notificationCard:GetPropertyChangedSignal("AbsoluteSize"):Connect(scheduleLayout)
+	scheduleLayout()
 
 	return {
 		widget = widget,
@@ -1184,6 +1310,9 @@ local function applyThemeToRefs(refs, p)
 	for _, button in ipairs(refs.secondaryButtons) do
 		button.BackgroundColor3 = p.Button
 		button.TextColor3 = p.ButtonText
+	end
+	for _, icon in ipairs(refs.icons) do
+		icon.ImageColor3 = p.ButtonText
 	end
 end
 
