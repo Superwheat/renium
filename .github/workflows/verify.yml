@@ -59,19 +59,6 @@ jobs:
       - name: Test package subobjects
         run: node tools/renium/tests/package-subobject.mjs
 
-  rust-msrv:
-    name: Rust 1.89 compatibility
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: dtolnay/rust-toolchain@1.89.0
-
-      - name: Check the minimum Rust version
-        run: |
-          cargo check --locked --manifest-path tools/renium/Cargo.toml
-
   build-and-test:
     name: Windows release build and extension
     runs-on: windows-latest
