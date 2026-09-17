@@ -34,7 +34,7 @@ jobs:
               match = re.search(rf"^## {re.escape(version)}\b[^\n]*\n(.*?)(?=^## |\Z)", changelog, re.S | re.M)
               if not match:
                   sys.exit(f"changelog has no entry for {version}")
-              text = f"# {version}\n\n{match.group(1).strip()}\n\n<{os.environ['RELEASE_URL']}/v{version}>\n"
+              text = f"# {version}\n\n{match.group(1).strip()}\n\n{os.environ['RELEASE_URL']}/v{version}\n"
           else:
               text = "Renium release announcements are connected."
           chunks, current = [], ""
