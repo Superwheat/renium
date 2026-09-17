@@ -982,7 +982,7 @@ end
 local function buildStatusWidget(plugin, versionText)
 	local refs = newRefs()
 
-	local info = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Right, false, false, 320, 220, 150, 48)
+	local info = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Right, false, false, 320, 220, 150, 24)
 	local widget = createWidget(plugin, "ReniumStatus", info, "Renium")
 
 	local root = Instance.new("Frame")
@@ -1171,20 +1171,20 @@ local function buildStatusWidget(plugin, versionText)
 		local fullCard = 48 + subtitleHeight + syncHeight
 		local fullHeight = WIDGET_PADDING * 2 + fullCard + LIST_SPACING + CONTROL_HEIGHT
 		local headerHeight = fullHeight + 30 + LIST_SPACING
-		local compactHeight = 20 + 48 + syncHeight + 8 + CONTROL_HEIGHT
+		local compactHeight = 16 + 44 + syncHeight + 8 + CONTROL_HEIGHT
 		local compact = width < 260 or height < fullHeight
-		local oneRow = height < 20 + 48 + 8 + CONTROL_HEIGHT
-		local pad = if oneRow then 8 elseif compact then 10 else WIDGET_PADDING
+		local oneRow = height < 16 + 44 + 8 + CONTROL_HEIGHT
+		local pad = if compact then 8 else WIDGET_PADDING
 		local gap = if compact then 8 else LIST_SPACING
 		local innerWidth = width - pad * 2
 		local showHeader = not compact and height >= headerHeight
 		local showSubtitle = not compact and hasSubtitle
 		local showSync = hasSync and not oneRow and (not compact or height >= compactHeight)
 		local chrome = not oneRow
-		local cardPadX = if chrome then 14 else 0
-		local cardPadY = if chrome then 12 else 0
+		local cardPadX = if not chrome then 0 elseif compact then 12 else 14
+		local cardPadY = if not chrome then 0 elseif compact then 10 else 12
 
-		local y = pad
+		local y = if oneRow then math.max(pad, math.floor((height - CONTROL_HEIGHT) / 2)) else pad
 		header.Visible = showHeader
 		if showHeader then
 			header.Position = UDim2.fromOffset(pad, y)
