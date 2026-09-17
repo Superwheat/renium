@@ -397,7 +397,7 @@ jobs:
           for chunk in chunks:
               body = json.dumps({"content": chunk, "allowed_mentions": {"parse": []}}).encode()
               request = urllib.request.Request(
-                  os.environ["DISCORD_WEBHOOK_URL"],
+                  os.environ["DISCORD_WEBHOOK_URL"].strip().strip("'\""),
                   data=body,
                   headers={"Content-Type": "application/json", "User-Agent": "renium-release"},
               )
