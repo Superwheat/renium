@@ -92,13 +92,14 @@ Avoid `--untracked-files=all` on generated packages. Git tracks files; a commit 
 
 ```powershell
 rbx collab start
-rbx collab start --relay https://renium-relay.example.workers.dev
+rbx collab relay deploy
+rbx collab start --relay
 rbx collab join wss://host.trycloudflare.com/?token=abc -r C:/proj
 rbx collab status
 rbx collab invite
 rbx collab stop
 ```
 
-`start` shares the project's files as one live document and prints an invite link; every participant's folder mirrors it. Without `--relay`, the room runs on the host through a Cloudflare quick tunnel, so the invite dies when the host stops. With `--relay`, a deployed relay keeps the room and its history, and the relay's copy wins over any local folder on join.
+`start` shares the project's files as one live document and prints an invite link; every participant's folder mirrors it. Without `--relay`, the room runs on the host through a Cloudflare quick tunnel, so the invite dies when the host stops. With `--relay`, a relay keeps the room and its history, and the relay's copy wins over any local folder on join. `relay deploy` publishes the relay to the user's free Cloudflare account once (Node.js required; a browser sign-in may open) and makes it the default; `relay set URL` picks an existing one.
 `join` fills an empty folder from the room; an existing folder is overwritten to match. Only one participant, the host, keeps Live Sync with Studio; others edit files and see the result through Team Create or the host.
 `status` lists participants with their open file and selection. Do not start a second session for the same folder; stop the first.

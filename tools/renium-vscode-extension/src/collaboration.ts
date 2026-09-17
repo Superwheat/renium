@@ -34,11 +34,15 @@ export type CollabStatus = {
   localChanges?: number;
   remoteChanges?: number;
   error?: string;
+  defaultRelay?: string;
 };
 
 export interface CollaborationDeps {
   output: vscode.OutputChannel;
   projectRoot: () => string | undefined;
+  cliPath: () => string | undefined;
+  liveSyncRunning: () => boolean;
+  startLiveSync: () => Promise<void>;
   runOperation: (
     op: number,
     parameters: Record<string, unknown>,
@@ -86,6 +90,8 @@ export class CollaborationController implements vscode.Disposable, vscode.TreeDa
   private polling = false;
   private disposed = false;
   private lastAwareness = "";
+  private lastInvite: string | undefined;
+  private sessionRoot: string | undefined;
 
   public readonly onDidChangeTreeData = this.treeEmitter.event;
 
@@ -133,7 +139,33 @@ export class CollaborationController implements vscode.Disposable, vscode.TreeDa
   }
 
   private root(): string | undefined {
-    return this.deps.projectRoot();
+    return this.sessionRoot ?? this.deps.projectRoot();
+  }
+
+  private async pickSessionFolder(title: string): Promise<string | undefined> {
+    const picked = await vscode.window.showOpenDialog({
+      title,
+      openLabel: "Use Folder",
+      canSelectFiles: false,
+      canSelectFolders: true,
+      canSelectMany: false,
+    });
+    return picked?.[0]?.fsPath;
+  }
+
+  private async openRelaySetup(): Promise<void> {
+    const cli = this.deps.cliPath();
+    if (!cli) {
+      void vscode.window.showErrorMessage("Renium CLI not found; install Renium first.");
+      return;
+    }
+    const terminal = vscode.window.createTerminal({ name: "Renium relay setup" });
+    terminal.show(true);
+    const quoted = cli.includes(" ") ? `"${cli}"` : cli;
+    terminal.sendText(`${quoted} collab relay deploy`, true);
+    void vscode.window.showInformationMessage(
+      "Deploying the relay. If Cloudflare asks you to sign in, finish that in the browser; the relay becomes the default when the deploy ends.",
+    );
   }
 
   private displayName(): string | undefined {
@@ -154,59 +186,68 @@ export class CollaborationController implements vscode.Disposable, vscode.TreeDa
       void vscode.window.showInformationMessage("A collaboration session is already running for this project.");
       return;
     }
-    const relayDefault = vscode.workspace.getConfiguration("renium").get<string>("collaboration.relayUrl", "").trim();
+    if (!this.deps.projectRoot()) {
+      void vscode.window.showInformationMessage("Open the project folder you want to share first.");
+      return;
+    }
+    const settingRelay = vscode.workspace.getConfiguration("renium").get<string>("collaboration.relayUrl", "").trim();
+    const relayDefault = settingRelay || this.status.defaultRelay || "";
+    type ModeItem = vscode.QuickPickItem & { mode: "tunnel" | "relay" | "local" | "setup" };
+    const relayItem: ModeItem = {
+      label: "$(server) Relay",
+      description: relayDefault
+        ? `${relayDefault} keeps the room and its history`
+        : "Deploy a free relay to your Cloudflare account",
+      mode: relayDefault ? "relay" : "setup",
+    };
+    const tunnelItem: ModeItem = {
+      label: "$(globe) Direct tunnel",
+      description: "No setup. The room lives on this machine while you share.",
+      mode: "tunnel",
+    };
+    const localItem: ModeItem = {
+      label: "$(home) This machine only",
+      description: "Share only with editors on this computer.",
+      mode: "local",
+    };
     const mode = await vscode.window.showQuickPick(
-      [
-        {
-          label: "$(globe) Public tunnel",
-          description: "No server needed. Renium opens a Cloudflare quick tunnel to this machine.",
-          mode: "tunnel",
-        },
-        {
-          label: "$(server) Relay",
-          description: relayDefault ? relayDefault : "A deployed Renium relay keeps the room when you go offline.",
-          mode: "relay",
-        },
-        {
-          label: "$(home) This machine only",
-          description: "Share only with editors on this computer.",
-          mode: "local",
-        },
-      ],
+      relayDefault ? [relayItem, tunnelItem, localItem] : [tunnelItem, relayItem, localItem],
       { title: "Start Collaboration", placeHolder: "How should others reach this project?" },
     );
     if (!mode) {
       return;
     }
+    if (mode.mode === "setup") {
+      await this.openRelaySetup();
+      return;
+    }
     const parameters: Record<string, unknown> = { name: this.displayName(), tunnel: mode.mode === "tunnel" };
     if (mode.mode === "relay") {
-      const relay = await vscode.window.showInputBox({
-        title: "Relay URL",
-        prompt: "Base URL of a deployed Renium relay",
-        value: relayDefault,
-        placeHolder: "https://renium-relay.example.workers.dev",
-        ignoreFocusOut: true,
-      });
-      if (!relay) {
-        return;
-      }
-      parameters.relay = relay.trim();
-      if (!relayDefault) {
-        await vscode.workspace
-          .getConfiguration("renium")
-          .update("collaboration.relayUrl", relay.trim(), vscode.ConfigurationTarget.Global);
-      }
+      parameters.relay = relayDefault;
     }
+    this.sessionRoot = undefined;
     await vscode.window.withProgress(
       { location: vscode.ProgressLocation.Notification, title: "Renium: starting collaboration" },
       async () => {
-        const result = await this.run(AUTOMATION_OP.collabStart, parameters, false, 120_000);
+        const result = await this.run(AUTOMATION_OP.collabStart, parameters, false, 180_000);
         this.applyResult(result, "start");
       },
     );
     await this.poll();
     if (this.status.running && this.status.invite) {
-      await this.offerInvite("Collaboration started.");
+      await vscode.env.clipboard.writeText(this.status.invite);
+      this.lastInvite = this.status.invite;
+      if (this.deps.liveSyncRunning()) {
+        void vscode.window.showInformationMessage("Collaboration started. The invite link is on your clipboard.");
+      } else {
+        const choice = await vscode.window.showInformationMessage(
+          "Collaboration started and the invite link is on your clipboard. Start Live Sync so guests' edits reach Studio?",
+          "Start Live Sync",
+        );
+        if (choice === "Start Live Sync") {
+          await this.deps.startLiveSync();
+        }
+      }
     }
   }
 
@@ -215,9 +256,11 @@ export class CollaborationController implements vscode.Disposable, vscode.TreeDa
       void vscode.window.showInformationMessage("Leave the current collaboration session before joining another.");
       return;
     }
+    const clipboard = (await vscode.env.clipboard.readText()).trim();
     const invite = await vscode.window.showInputBox({
       title: "Join Collaboration",
       prompt: "Paste the invite link from the host",
+      value: clipboard.includes("token=") ? clipboard : "",
       placeHolder: "wss://…trycloudflare.com/?token=…",
       ignoreFocusOut: true,
       validateInput: (value) => (value.trim().includes("token=") ? undefined : "Invite links carry a token"),
@@ -225,6 +268,29 @@ export class CollaborationController implements vscode.Disposable, vscode.TreeDa
     if (!invite) {
       return;
     }
+    let folder = this.deps.projectRoot();
+    const workspaceFolder = folder;
+    if (!folder) {
+      folder = await this.pickSessionFolder("Choose an empty folder for the shared project");
+      if (!folder) {
+        return;
+      }
+    }
+    const entries = await vscode.workspace.fs.readDirectory(vscode.Uri.file(folder)).then(
+      (found) => found.filter(([name]) => !name.startsWith(".")),
+      () => [],
+    );
+    if (entries.length > 0) {
+      const choice = await vscode.window.showWarningMessage(
+        `${path.basename(folder)} already has files. Joining replaces its project files with the room's copy.`,
+        { modal: true },
+        "Join and Replace",
+      );
+      if (choice !== "Join and Replace") {
+        return;
+      }
+    }
+    this.sessionRoot = folder;
     await vscode.window.withProgress(
       { location: vscode.ProgressLocation.Notification, title: "Renium: joining collaboration" },
       async () => {
@@ -239,7 +305,12 @@ export class CollaborationController implements vscode.Disposable, vscode.TreeDa
     );
     await this.poll();
     if (this.status.running) {
-      void vscode.window.showInformationMessage("Joined. Project files will fill in as the room syncs.");
+      if (workspaceFolder !== folder) {
+        this.sessionRoot = undefined;
+        await vscode.commands.executeCommand("vscode.openFolder", vscode.Uri.file(folder), { forceNewWindow: false });
+        return;
+      }
+      void vscode.window.showInformationMessage("Joined. Project files fill in as the room syncs.");
     }
   }
 
@@ -310,13 +381,6 @@ export class CollaborationController implements vscode.Disposable, vscode.TreeDa
     }
   }
 
-  private async offerInvite(message: string): Promise<void> {
-    const choice = await vscode.window.showInformationMessage(message, "Copy Invite");
-    if (choice === "Copy Invite") {
-      await this.copyInvite();
-    }
-  }
-
   private applyResult(result: CommandRunResult, action: string): void {
     if (result.code !== 0) {
       const message = result.automationError?.m ?? result.output.trim() ?? "Renium reported an error";
@@ -359,6 +423,21 @@ export class CollaborationController implements vscode.Disposable, vscode.TreeDa
         const status = result.code === 0 ? (result.result as CollabStatus | undefined) : undefined;
         if (status && typeof status.running === "boolean") {
           this.status = status;
+          if (
+            status.running &&
+            status.role === "host" &&
+            status.invite &&
+            this.lastInvite &&
+            status.invite !== this.lastInvite
+          ) {
+            await vscode.env.clipboard.writeText(status.invite);
+            void vscode.window.showInformationMessage(
+              "The collaboration invite changed after a restart. The new link is on your clipboard.",
+            );
+          }
+          if (status.running && status.invite) {
+            this.lastInvite = status.invite;
+          }
         } else if (result.code !== 0) {
           this.status = { running: false };
         }

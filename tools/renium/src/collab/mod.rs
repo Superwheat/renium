@@ -1,6 +1,7 @@
 pub(crate) mod command;
 pub(crate) mod document;
 pub(crate) mod mirror;
+pub(crate) mod relay;
 pub(crate) mod room;
 pub(crate) mod tunnel;
 
@@ -160,7 +161,13 @@ impl Manager {
             );
         }
         let name = options.name.unwrap_or_else(default_name);
-        let session = match options.relay {
+        let relay = match options.relay {
+            Some(relay) if relay.trim().is_empty() => Some(relay::default_relay().context(
+                "No relay is configured yet; run `rbx collab relay deploy` once, or pass --relay URL",
+            )?),
+            other => other,
+        };
+        let session = match relay {
             Some(relay) => {
                 let relay = relay.trim().trim_end_matches('/').to_string();
                 let base = websocket_url(&format!("{relay}/?token=x"))?;
@@ -316,10 +323,14 @@ impl Manager {
     pub(crate) fn status(&self, root: &Path) -> Result<Value> {
         let root = canonical_root(root)?;
         let session = self.sessions.lock_recover().get(&root).cloned();
-        Ok(match session {
+        let mut status = match session {
             Some(session) => session.status(),
             None => json!({ "running": false }),
-        })
+        };
+        if let Some(relay) = relay::default_relay() {
+            status["defaultRelay"] = json!(relay);
+        }
+        Ok(status)
     }
 
     pub(crate) fn set_awareness(&self, root: &Path, fields: &Map<String, Value>) -> Result<Value> {
