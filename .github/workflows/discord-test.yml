@@ -1,0 +1,32 @@
+name: Discord test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  post:
+    name: Post a test message
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Post
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          echo "secret length: ${#DISCORD_WEBHOOK_URL}"
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "DISCORD_WEBHOOK_URL is empty; set it with: gh secret set DISCORD_WEBHOOK_URL" >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json, os, urllib.request
+          body = json.dumps({"content": "Renium release announcements are connected.", "allowed_mentions": {"parse": []}}).encode()
+          request = urllib.request.Request(
+              os.environ["DISCORD_WEBHOOK_URL"],
+              data=body,
+              headers={"Content-Type": "application/json", "User-Agent": "renium-release"},
+          )
+          with urllib.request.urlopen(request) as response:
+              response.read()
+          print("posted")
+          PY
