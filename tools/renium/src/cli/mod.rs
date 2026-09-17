@@ -1753,12 +1753,23 @@ pub(crate) struct CollabArgs {
 pub(crate) enum CollabAction {
     #[command(about = "Share this project; prints the invite link")]
     Start {
-        #[arg(help = "Relay base URL instead of a direct tunnel", long)]
+        #[arg(
+            help = "Use a relay instead of a direct tunnel; omit the URL to use the configured relay",
+            long,
+            num_args = 0..=1,
+            default_missing_value = ""
+        )]
         relay: Option<String>,
         #[arg(help = "Keep the room on this machine without a public tunnel", long)]
         local: bool,
         #[arg(help = "Display name shown to other participants", long)]
         name: Option<String>,
+        #[arg(
+            help = "Project folder to share (default: current project)",
+            short,
+            long
+        )]
+        root: Option<PathBuf>,
     },
     #[command(about = "Join a shared project from an invite link")]
     Join {
@@ -1766,6 +1777,12 @@ pub(crate) enum CollabAction {
         invite: String,
         #[arg(help = "Display name shown to other participants", long)]
         name: Option<String>,
+        #[arg(
+            help = "Folder that receives the shared project (created if missing)",
+            short,
+            long
+        )]
+        root: Option<PathBuf>,
     },
     #[command(about = "Leave the shared session")]
     Stop,
@@ -1773,6 +1790,26 @@ pub(crate) enum CollabAction {
     Status,
     #[command(about = "Print the invite link")]
     Invite,
+    #[command(about = "Deploy or choose the relay used by --relay")]
+    Relay {
+        #[command(subcommand)]
+        action: CollabRelayAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum CollabRelayAction {
+    #[command(about = "Deploy the relay to your Cloudflare account and make it the default")]
+    Deploy,
+    #[command(about = "Use an already deployed relay by URL")]
+    Set {
+        #[arg(help = "Relay base URL, for example https://renium-relay.example.workers.dev")]
+        url: String,
+    },
+    #[command(about = "Forget the configured relay")]
+    Clear,
+    #[command(about = "Show the configured relay")]
+    Show,
 }
 
 #[derive(Parser)]

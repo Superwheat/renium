@@ -443,6 +443,12 @@ class RobloxSyncController {
     this.collaboration = new CollaborationController({
       output: this.output,
       projectRoot: () => this.tryGetConfig()?.projectRoot ?? pickWorkspaceRoot(),
+      cliPath: () => this.tryGetConfig()?.cliPath,
+      liveSyncRunning: () =>
+        this.getConfig().editorLiveSyncEnabled ||
+        this.editorLiveSyncRuntimeEnabled ||
+        this.liveSyncStartPromise !== undefined,
+      startLiveSync: () => this.startLiveSync(),
       runOperation: (op, parameters, options) => {
         const cfg = this.getConfig();
         return this.runAutomationOperation(cfg.cliPath, cfg, "collab", op, parameters, options);
