@@ -1792,6 +1792,16 @@ fn resolve_studio_file(
         }
     }
     candidates.sort();
+    if candidates.len() > 1 {
+        let top_level = candidates
+            .iter()
+            .filter(|path| path.parent() == Some(loaded.root.as_path()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if top_level.len() == 1 {
+            return Ok(top_level.into_iter().next());
+        }
+    }
     if candidates.len() == 1 {
         return Ok(Some(candidates.remove(0)));
     }

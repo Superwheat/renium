@@ -818,8 +818,15 @@ fn open_studio(
         .get("file")
         .and_then(Value::as_str)
         .map(PathBuf::from);
-    let game_id = context.game_id.filter(|id| *id > 0);
-    let place_id = context.place_id.filter(|id| *id > 0);
+    let selected = automation::published_selector(&context.selector);
+    let game_id = context
+        .game_id
+        .filter(|id| *id > 0)
+        .or(selected.map(|(game, _)| game));
+    let place_id = context
+        .place_id
+        .filter(|id| *id > 0)
+        .or(selected.map(|(_, place)| place));
     #[cfg(any(windows, target_os = "macos"))]
     let connected = connected_edit_studios(bridge);
     let target = if let Some(file) = requested_file {

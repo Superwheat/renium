@@ -1440,6 +1440,10 @@ local function writePropertyForSync(
 			okRead, current = readProperty(instance, propertyName)
 		end
 	end
+	if okRead and propertyName == "CanvasPosition" and instance:IsA("ScrollingFrame") then
+		-- The engine clamps the scroll offset to the laid-out canvas; whatever it kept is the result.
+		return true, result
+	end
 	if not okRead or not propertyValuesEqual(instance, propertyName, current, value) then
 		cancelExpectedEvent(ctx, token)
 		return false, `Roblox did not retain {propertyName}`
