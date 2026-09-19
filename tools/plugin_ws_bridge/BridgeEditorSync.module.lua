@@ -1509,6 +1509,31 @@ local function restoreMeshGeometry(instance: MeshPart, source: MeshPart, ctx): (
 	return writePropertyForSync(instance, "TextureContent", texture, ctx)
 end
 
+-- A natively written MeshId never runs the engine's mesh load, so the part
+-- keeps MeshSize zero and renders at the asset's native scale. Loading the
+-- asset through AssetService and applying it cooks the mesh like a file load.
+local function cookMeshPart(instance: MeshPart, ctx): (boolean, any)
+	if instance.MeshSize ~= Vector3.zero then
+		return true, nil
+	end
+	local content = instance.MeshContent
+	if content.SourceType ~= Enum.ContentSourceType.Uri or content.Uri == nil or content.Uri == "" then
+		return true, nil
+	end
+	local ok, donor = pcall(function()
+		return game:GetService("AssetService"):CreateMeshPartAsync(content, {
+			CollisionFidelity = instance.CollisionFidelity,
+			RenderFidelity = instance.RenderFidelity,
+		})
+	end)
+	if not ok then
+		return false, donor
+	end
+	local okApply, err = restoreMeshGeometry(instance, donor, ctx)
+	donor:Destroy()
+	return okApply, err
+end
+
 local function setTagForSync(instance: Instance, tag: string, added: boolean, ctx: { [string]: any })
 	if instance:IsA("PackageLink") then
 		error("PackageLink tags are read-only")
@@ -5037,6 +5062,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					error("Invalid Terrain transaction baseline")
 				end
 			end
+			local needsMeshCook: boolean? = nil
 			if params.nativeRootWrite ~= nil then
 				assertTransactionLease(session)
 				if state ~= "open" and state ~= "prepared" or session.historyRecording == nil then
@@ -5068,6 +5094,22 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				if params.nativeTerrainBaseline ~= nil and (write.instance ~= game:GetService("Workspace").Terrain or write.name ~= "SmoothGrid") then
 					error("Terrain baseline does not match the native root write")
 				end
+				if params.cookNativeRootWrite == true then
+					if not write.finished or not write.instance:IsA("MeshPart") then
+						error("Native root write has not finished")
+					end
+					beginSessionOperation(session)
+					local cooked, cookError = cookMeshPart(write.instance :: MeshPart, ctx)
+					endSessionOperation(editorTransactions, transactionId, session)
+					assertTransactionLease(session)
+					return {
+						transactionId = transactionId,
+						state = state,
+						nativeRootWrite = params.nativeRootWrite,
+						cooked = cooked,
+						cookError = if cooked then nil else tostring(cookError),
+					}
+				end
 				if params.finishNativeRootWrite == true then
 					if session.pendingNativeRootWrite ~= write then
 						error("Native root write is no longer in flight")
@@ -5083,6 +5125,10 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 						ctx.samplePropertyChange(write.instance, write.name)
 					end
 					write.finished = true
+					needsMeshCook = typeof(write.instance) == "Instance"
+						and write.instance:IsA("MeshPart")
+						and (write.name == "MeshId" or write.name == "MeshContent")
+						and (write.instance :: MeshPart).MeshSize.Magnitude == 0
 					endSessionOperation(editorTransactions, transactionId, session)
 				else
 					if session.pendingNativeRootWrite ~= nil or write.finished then
@@ -5139,6 +5185,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				rollbackError = session.rollbackFailed,
 				meshGeometry = geometry,
 				nativeRootWrite = params.nativeRootWrite,
+				needsMeshCook = needsMeshCook,
 				historyRecording = session.historyRecording,
 				terrainBaseline = session.terrainBaseline,
 			}
