@@ -2181,18 +2181,14 @@ fn reconciliation_maps_equal_with_ids(
 ) -> bool {
     let database = rbx_reflection_database::get().ok();
     let stable = |name: &str, value: &Value| {
-        name != "ScriptGuid"
-            && !reconciliation_property_is_derived(name)
-            && !reconciliation_property_is_metadata(name, value)
-            && !database.is_some_and(|database| {
-                crate::rbx::decode::is_unexposed_service_property(database, class_name, name)
-                    || reconciliation_property_is_engine_mirror(database, class_name, name)
-            })
-            && (left.contains_key(name) && right.contains_key(name)
-                || !reconciliation_property_is_unknown_when_absent(name)
-                    && !database.is_some_and(|database| {
-                        reconciliation_property_is_unreadable(database, class_name, name)
-                    }))
+        reconciliation_property_compares(
+            database,
+            class_name,
+            name,
+            value,
+            left.contains_key(name),
+            right.contains_key(name),
+        )
     };
     for (name, value) in left {
         if !stable(name, value) {
@@ -2638,6 +2634,41 @@ pub(crate) fn reconciliation_property_is_engine_mirror(
         && crate::rbx::decode::rbx_reflection_class_is_a(database, class_name, "Decal")
 }
 
+/// The one rule for whether a property takes part in comparing a Studio
+/// record with a file record. Equivalence, retention reporting and the merge
+/// driver all ask this, so a value never counts as equal in one place and
+/// different in another.
+pub(crate) fn reconciliation_property_compares(
+    database: Option<&rbx_reflection::ReflectionDatabase<'_>>,
+    class_name: &str,
+    name: &str,
+    value: &Value,
+    left_has: bool,
+    right_has: bool,
+) -> bool {
+    !reconciliation_property_is_engine_state(database, class_name, name, value)
+        && (left_has && right_has
+            || !reconciliation_property_is_unknown_when_absent(database, class_name, name))
+}
+
+/// Engine-owned values: identities, migration flags, caches the engine
+/// recomputes on load, mirrors of another property and service fields Studio
+/// never exposes. They are neither authored nor retained through a sync.
+pub(crate) fn reconciliation_property_is_engine_state(
+    database: Option<&rbx_reflection::ReflectionDatabase<'_>>,
+    class_name: &str,
+    name: &str,
+    value: &Value,
+) -> bool {
+    name == "ScriptGuid"
+        || reconciliation_property_is_derived(name)
+        || reconciliation_property_is_metadata(name, value)
+        || database.is_some_and(|database| {
+            crate::rbx::decode::is_unexposed_service_property(database, class_name, name)
+                || reconciliation_property_is_engine_mirror(database, class_name, name)
+        })
+}
+
 // Scripts cannot read a NotScriptable property, so a capture that lacks one
 // says nothing about its value.
 pub(crate) fn reconciliation_property_is_unreadable(
@@ -2655,10 +2686,18 @@ pub(crate) fn reconciliation_property_is_unreadable(
     )
 }
 
-// MeshSize is what the engine measured once a mesh loaded; a record without
-// it (a file import) says nothing about the loaded mesh.
-pub(crate) fn reconciliation_property_is_unknown_when_absent(name: &str) -> bool {
+// A record can lack these without saying anything: MeshSize is what the
+// engine measured once a mesh loaded, CollisionFidelity and ClockTime are
+// filled in by Studio, and NotScriptable properties cannot be captured.
+pub(crate) fn reconciliation_property_is_unknown_when_absent(
+    database: Option<&rbx_reflection::ReflectionDatabase<'_>>,
+    class_name: &str,
+    name: &str,
+) -> bool {
     matches!(name, "CollisionFidelity" | "ClockTime" | "MeshSize")
+        || database.is_some_and(|database| {
+            reconciliation_property_is_unreadable(database, class_name, name)
+        })
 }
 
 pub(crate) fn reconciliation_property_value_is_default(
