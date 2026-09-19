@@ -1831,6 +1831,31 @@ fn settings_parent_id(document: &SettingsBytecode, index: usize) -> Option<&str>
         .map(|parent| parent.settings_id.as_str())
 }
 
+// Reflection lists these file-only fields as properties of their own, so a
+// record decoded from a model or place file carries them under the serialized
+// name while Studio and pulls report the logical one.
+fn serialized_only_logical_name(
+    database: &rbx_reflection::ReflectionDatabase<'_>,
+    class_name: &str,
+    name: &str,
+) -> Option<&'static str> {
+    use crate::rbx::decode::rbx_reflection_class_is_a;
+    match name {
+        "WorldPivotData" if rbx_reflection_class_is_a(database, class_name, "Model") => {
+            Some("WorldPivot")
+        }
+        "InitialSize" if rbx_reflection_class_is_a(database, class_name, "TriangleMeshPart") => {
+            Some("MeshSize")
+        }
+        "FluidFidelityInternal"
+            if rbx_reflection_class_is_a(database, class_name, "TriangleMeshPart") =>
+        {
+            Some("FluidFidelity")
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn canonicalize_settings_property_names(document: &mut SettingsBytecode) -> Result<()> {
     let database = rbx_reflection_database::get()?;
     // A dominant service must not serialize canonicalization after decoding.
@@ -1847,7 +1872,8 @@ pub(crate) fn canonicalize_settings_property_names(document: &mut SettingsByteco
                     if let Some(renamed) = names.get(name) {
                         return *renamed;
                     }
-                    let renamed = rbx_logical_property_name(database, &instance.class_name, name)
+                    let renamed = serialized_only_logical_name(database, &instance.class_name, name)
+                        .or_else(|| rbx_logical_property_name(database, &instance.class_name, name))
                         .filter(|canonical| *canonical != name);
                     names.insert(name.to_string(), renamed);
                     renamed
