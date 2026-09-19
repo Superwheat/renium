@@ -6302,6 +6302,9 @@ fn snapshot_mismatch_details(
             names.sort();
             names.dedup();
             for name in names {
+                if kind == "attribute" && name.starts_with("RBX_") {
+                    continue;
+                }
                 if kind == "property"
                     && (name == "ScriptGuid"
                         || reconciliation_property_is_derived(name)

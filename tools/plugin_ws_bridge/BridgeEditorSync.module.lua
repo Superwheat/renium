@@ -3,6 +3,12 @@ local BridgeEditorSync = {}
 local BridgeCandidateMatch = require(script.Parent.BridgeCandidateMatch)
 local BridgeConnection = require(script.Parent.BridgeConnection)
 local BridgeIdentity = require(script.Parent.BridgeIdentity)
+
+-- Attributes Studio writes for itself (reimport tracking, migrations) are neither
+-- authored nor retained through a sync.
+local function isEngineManagedAttribute(name: any): boolean
+	return string.sub(tostring(name), 1, 4) == "RBX_"
+end
 local BridgeInstanceSwap = require(script.Parent.BridgeInstanceSwap)
 local BridgeMaterialService = require(script.Parent.BridgeMaterialService)
 local BridgeCollisionGroups = require(script.Parent.BridgeCollisionGroups)
@@ -2597,6 +2603,10 @@ local function deleteAttribute(instance, attributeName, change, ctx, stats)
 end
 
 local function applyChangedAttribute(instance, attributeName, rawValue, change, ctx, stats)
+	if isEngineManagedAttribute(attributeName) then
+		stats.noops += 1
+		return
+	end
 	local okDecode, decoded = decodeValue(rawValue, nil)
 	if not okDecode then
 		error(`Failed to decode attribute {attributeName}: {decoded}`)
@@ -2688,6 +2698,9 @@ local function verifyPropertyChange(instance, change, ctx, stats, unreadableName
 	end
 	for attributeName, rawValue in pairs(change.attributes or {}) do
 		attributeName = tostring(attributeName)
+		if isEngineManagedAttribute(attributeName) then
+			continue
+		end
 		local okDecode, decoded = decodeValue(rawValue, nil)
 		if not okDecode then
 			error(`Failed to decode attribute {attributeName}: {decoded}`)
@@ -5030,9 +5043,27 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					error("Native root sync requires an active undo recording")
 				end
 				local write = if session.nativeRootWrites then session.nativeRootWrites[params.nativeRootWrite] else nil
-				if write == nil or not isNativeRootProperty(write.instance, write.name)
-					or resolvePathSegments(write.change.pathSegments, nil, write.change.pathOrdinals) ~= write.instance then
+				if write == nil or not isNativeRootProperty(write.instance, write.name) then
 					error("Native root write target is no longer valid")
+				end
+				-- Earlier changes in this batch can shift sibling ordinals, so the path
+				-- the native writer uses is taken from the live instance, not the plan.
+				local livePathSegments, livePathOrdinals = write.change.pathSegments, write.change.pathOrdinals
+				if typeof(write.instance) == "Instance" then
+					livePathSegments, livePathOrdinals = BridgeIdentity.getRefPathParts(write.instance)
+				end
+				if livePathSegments == nil
+					or resolvePathSegments(livePathSegments, nil, livePathOrdinals) ~= write.instance then
+					error("Native root write target is no longer valid")
+				end
+				if params.describeNativeRootWrite == true then
+					return {
+						transactionId = transactionId,
+						state = state,
+						nativeRootWrite = params.nativeRootWrite,
+						pathSegments = livePathSegments,
+						pathOrdinals = livePathOrdinals,
+					}
 				end
 				if params.nativeTerrainBaseline ~= nil and (write.instance ~= game:GetService("Workspace").Terrain or write.name ~= "SmoothGrid") then
 					error("Terrain baseline does not match the native root write")
