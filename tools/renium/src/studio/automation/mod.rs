@@ -2223,12 +2223,22 @@ pub(crate) fn record_end_command(args: RecordEndArgs) -> Result<()> {
 
 pub(crate) fn list_clients_command(args: ListClientsArgs) -> Result<()> {
     let result = daemon_result(op::STUDIOS, None, json!({}), false, Some(&args.bridge))?;
-    print_json_output(
-        &json!({
-            "clients": result.get("clients").cloned().unwrap_or(Value::Array(Vec::new()))
-        }),
-        false,
-    )
+    let mut clients = result
+        .get("clients")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    // Ports and channels are daemon plumbing; a runtime id only selects
+    // between several Studios.
+    let single = clients.len() == 1;
+    for client in clients.iter_mut().filter_map(Value::as_object_mut) {
+        client.remove("channels");
+        client.remove("ports");
+        if single {
+            client.remove("runtimeId");
+        }
+    }
+    print_json_output(&json!({ "clients": clients }), false)
 }
 
 pub(crate) fn editor_review_decision_result(

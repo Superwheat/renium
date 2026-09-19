@@ -151,6 +151,11 @@ pub(crate) fn studio_status(args: StudioStatusArgs, project: Option<&Path>) -> R
             if let Some(map) = result.as_object_mut() {
                 map.remove("studios");
                 map.remove("studioState");
+                // A runtime id only selects between several Studios.
+                let single = map
+                    .get("clients")
+                    .and_then(Value::as_array)
+                    .is_some_and(|clients| clients.len() == 1);
                 for client in map
                     .get_mut("clients")
                     .and_then(Value::as_array_mut)
@@ -161,6 +166,9 @@ pub(crate) fn studio_status(args: StudioStatusArgs, project: Option<&Path>) -> R
                     client.remove("bridgeBuildUnix");
                     client.remove("channels");
                     client.remove("ports");
+                    if single {
+                        client.remove("runtimeId");
+                    }
                 }
             }
             app::output::strip_empty(&mut result);

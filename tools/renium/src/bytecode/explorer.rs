@@ -289,6 +289,39 @@ fn bytecode_batch_instance_index(
     instance_api::find_unique_instance_index(document, selector)
 }
 
+/// Compact output prints a path as one dotted string with `[n]` after any
+/// duplicate-name segment, the same form every path argument accepts. Names
+/// holding a separator or bracket keep the array form so they stay parseable.
+pub(crate) fn compact_path_string(
+    segments: &[String],
+    ordinals: Option<&[usize]>,
+) -> Option<String> {
+    if segments.is_empty()
+        || segments
+            .iter()
+            .any(|segment| segment.contains(['.', '/', '\\', '[', ']']))
+    {
+        return None;
+    }
+    let mut path = String::new();
+    for (index, segment) in segments.iter().enumerate() {
+        if index > 0 {
+            path.push('.');
+        }
+        path.push_str(segment);
+        let ordinal = ordinals
+            .and_then(|ordinals| ordinals.get(index))
+            .copied()
+            .unwrap_or(1);
+        if ordinal > 1 {
+            path.push('[');
+            path.push_str(&ordinal.to_string());
+            path.push(']');
+        }
+    }
+    Some(path)
+}
+
 fn node_field_aliases(key: &str) -> &'static [&'static str] {
     match key {
         "settingsId" => &["id", "settingsid"],
@@ -1125,20 +1158,42 @@ impl BytecodeNodeProjection<'_> {
                 ),
             );
         }
+        let mut path_rendered_inline = false;
         if should_include_node_field(self.mode, self.fields, "pathSegments")
             && let Some(Some(path_segments)) = self.path_segments_by_index.get(index)
         {
-            node.insert(
-                node_output_key(self.mode, "pathSegments").to_string(),
-                Value::Array(
-                    path_segments
-                        .iter()
-                        .map(|segment| Value::String(segment.clone()))
-                        .collect(),
-                ),
-            );
+            let ordinals = self
+                .path_ordinals_by_index
+                .get(index)
+                .and_then(|ordinals| ordinals.as_deref());
+            let inline = if self.mode.uses_short_keys() {
+                compact_path_string(path_segments, ordinals)
+            } else {
+                None
+            };
+            match inline {
+                Some(path) => {
+                    path_rendered_inline = true;
+                    node.insert(
+                        node_output_key(self.mode, "pathSegments").to_string(),
+                        Value::String(path),
+                    );
+                }
+                None => {
+                    node.insert(
+                        node_output_key(self.mode, "pathSegments").to_string(),
+                        Value::Array(
+                            path_segments
+                                .iter()
+                                .map(|segment| Value::String(segment.clone()))
+                                .collect(),
+                        ),
+                    );
+                }
+            }
         }
-        if should_include_node_field(self.mode, self.fields, "pathOrdinals")
+        if !path_rendered_inline
+            && should_include_node_field(self.mode, self.fields, "pathOrdinals")
             && let Some(Some(path_ordinals)) = self.path_ordinals_by_index.get(index)
         {
             node.insert(
@@ -2937,4 +2992,43 @@ pub(crate) fn explorer_daemon(args: ExplorerDaemonArgs) -> Result<()> {
         stdout.flush()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod compact_path_tests {
+    use super::compact_path_string;
+
+    fn segments(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| (*part).to_string()).collect()
+    }
+
+    #[test]
+    fn compact_paths_carry_only_duplicate_ordinals_and_keep_unsafe_names_as_arrays() {
+        let path = segments(&["Workspace", "Lobby", "Borders", "Border"]);
+        assert_eq!(
+            compact_path_string(&path, Some(&[1, 1, 1, 4])).as_deref(),
+            Some("Workspace.Lobby.Borders.Border[4]")
+        );
+        assert_eq!(
+            compact_path_string(&path, Some(&[1, 2, 1, 1])).as_deref(),
+            Some("Workspace.Lobby[2].Borders.Border")
+        );
+        assert_eq!(
+            compact_path_string(&path, None).as_deref(),
+            Some("Workspace.Lobby.Borders.Border")
+        );
+        assert_eq!(
+            compact_path_string(&segments(&["Workspace", "Body.001"]), None),
+            None
+        );
+        assert_eq!(
+            compact_path_string(&segments(&["Workspace", "Meshes/Body"]), None),
+            None
+        );
+        assert_eq!(
+            compact_path_string(&segments(&["Workspace", "A[1]"]), None),
+            None
+        );
+        assert_eq!(compact_path_string(&[], None), None);
+    }
 }
