@@ -277,6 +277,10 @@ mod tests {
                             examples += 1;
                             break;
                         }
+                        if token == "-r" {
+                            tokens.next();
+                            continue;
+                        }
                         if let Some(option) = token.strip_prefix("--") {
                             let (name, inline_value) = option
                                 .split_once('=')
