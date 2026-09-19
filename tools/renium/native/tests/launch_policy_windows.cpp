@@ -149,8 +149,15 @@ int main() {
     REQUIRE(callbackActivation == 1 && callbackPositionAfter == HWND_BOTTOM);
     REQUIRE(callbackPositionFlags & SWP_NOACTIVATE);
     observedForegroundPid = GetCurrentProcessId() + 1;
+    // The user selects Studio from the taskbar: Windows activates it before
+    // the foreground moves. From here Studio's own calls freeze the order
+    // instead of sinking the window under the app the user just left.
+    REQUIRE(!userSelectedStudio);
     launchWindowProc(reinterpret_cast<HWND>(3), WM_ACTIVATE, WA_ACTIVE, 0, 1, 0);
-    REQUIRE(postedMessages == 1);
+    REQUIRE(postedMessages == 1 && userSelectedStudio);
+    nativeWindowChange();
+    REQUIRE(callbackActivation == 0 && callbackPositionAfter == HWND_TOP);
+    REQUIRE(!(callbackPositionFlags & SWP_NOZORDER));
     launchWindowProc(reinterpret_cast<HWND>(3), deferredShowMessage(), 0, 0, 1, 0);
     REQUIRE(showCalls == 2 && pendingShow); // The user switched away before delivery.
     observedForegroundPid = GetCurrentProcessId();
@@ -164,16 +171,16 @@ int main() {
     REQUIRE(launchSetWindowPlacement(reinterpret_cast<HWND>(3), &placement));
     REQUIRE(appliedPlacement.showCmd == SW_SHOWNA && placement.showCmd == SW_RESTORE);
     REQUIRE(appliedPlacement.rcNormalPosition.left == 10 && appliedPlacement.rcNormalPosition.bottom == 600);
-    REQUIRE(callbackActivation == 1 && callbackPositionAfter == HWND_BOTTOM);
+    REQUIRE(callbackActivation == 1 && (callbackPositionFlags & SWP_NOZORDER));
     REQUIRE(launchDestroyWindow(reinterpret_cast<HWND>(3)));
     REQUIRE(callbackActivation == 1);
     nativeWindowChange();
     REQUIRE(callbackActivation == 0 && callbackPositionAfter == HWND_TOP);
     REQUIRE(launchSetWindowPos(reinterpret_cast<HWND>(3), HWND_TOP, 0, 0, 100, 100, 0));
-    REQUIRE(positionCalls == 1 && (positionFlags & SWP_NOACTIVATE) && positionAfter == HWND_BOTTOM);
+    REQUIRE(positionCalls == 1 && (positionFlags & SWP_NOACTIVATE) && (positionFlags & SWP_NOZORDER));
     windowFlags = WS_CHILD;
     REQUIRE(launchSetWindowPos(reinterpret_cast<HWND>(3), HWND_TOP, 0, 0, 100, 100, 0));
-    REQUIRE(positionCalls == 2 && positionAfter == HWND_TOP);
+    REQUIRE(positionCalls == 2 && !(positionFlags & SWP_NOZORDER));
     windowFlags = 0;
     windowFlags = WS_CHILD | WS_VISIBLE;
     const int shownBeforeParent = showCalls;
@@ -185,6 +192,30 @@ int main() {
     REQUIRE(launchSetParent(reinterpret_cast<HWND>(3), reinterpret_cast<HWND>(4)) == reinterpret_cast<HWND>(5));
     REQUIRE(parentCalls == 2 && appliedParent == reinterpret_cast<HWND>(4));
     REQUIRE(showCalls == shownBeforeParent && foregroundCalls == 0 && windowStyle == 0);
+    // Studio hides its foreground main window while a place settles and
+    // shows it again; that re-show may activate, once, even though the
+    // foreground has meanwhile fallen back to the user's previous app.
+    observedForegroundPid = GetCurrentProcessId();
+    REQUIRE(launchShowWindow(reinterpret_cast<HWND>(3), SW_HIDE));
+    observedForegroundPid = GetCurrentProcessId() + 1;
+    foregroundCalls = 0;
+    REQUIRE(launchShowWindow(reinterpret_cast<HWND>(3), SW_SHOW));
+    REQUIRE(showCommand == SW_SHOW && foregroundCalls == 1);
+    REQUIRE(launchShowWindow(reinterpret_cast<HWND>(3), SW_SHOW));
+    REQUIRE(showCommand == SW_SHOWNA && foregroundCalls == 1);
+    // A window hidden while another app held the foreground stays in the background.
+    REQUIRE(launchShowWindow(reinterpret_cast<HWND>(3), SW_HIDE));
+    REQUIRE(launchShowWindow(reinterpret_cast<HWND>(3), SW_SHOW));
+    REQUIRE(showCommand == SW_SHOWNA && foregroundCalls == 1);
+    // Destroying the foreground window lets the replacement window activate once.
+    observedForegroundPid = GetCurrentProcessId();
+    REQUIRE(launchDestroyWindow(reinterpret_cast<HWND>(3)));
+    observedForegroundPid = GetCurrentProcessId() + 1;
+    REQUIRE(launchShowWindow(reinterpret_cast<HWND>(7), SW_SHOW));
+    REQUIRE(showCommand == SW_SHOW && foregroundCalls == 2);
+    REQUIRE(launchShowWindow(reinterpret_cast<HWND>(7), SW_SHOW));
+    REQUIRE(showCommand == SW_SHOWNA && foregroundCalls == 2);
+    foregroundCalls = 0;
     // A synthetic loaded PE exercises the same import-table rebinding as Qt,
     // without loading Studio or modifying any system DLL's executable code.
     auto* image = static_cast<unsigned char*>(VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
