@@ -14,6 +14,8 @@ local MAX_DIRECT_PROPERTY_BYTES = 8 * 1024 * 1024
 local TRACKING_GUARD_TTL_SECONDS = 300
 local FLOAT32_FINGERPRINT_BUFFER = buffer.create(4)
 local CAMERA_FOV_PROPERTIES = { fieldofview = true, diagonalfieldofview = true, maxaxisfieldofview = true }
+-- A Decal's ColorMapContent mirrors TextureContent, so Studio signals both for one write.
+local DECAL_COLOR_MAP_PROPERTIES = { colormap = true, colormapcontent = true }
 local NIL_PROPERTY_BASELINE = {}
 
 type AllowedServices = { [string]: boolean }
@@ -1923,6 +1925,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		if loweredPropertyName == "ignoreguiinset" and instance:IsA("ScreenGui") then
 			return "screeninsets"
 		end
+		if DECAL_COLOR_MAP_PROPERTIES[loweredPropertyName] and instance:IsA("Decal") then
+			return "texturecontent"
+		end
 		local contentName = RbxDomModule.getContentPropertyAliases(instance.ClassName)[loweredPropertyName]
 		if contentName then
 			return string.lower(contentName)
@@ -2250,6 +2255,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 		if lowered == "ignoreguiinset" and instance:IsA("ScreenGui") then
 			return "ScreenInsets"
+		end
+		if DECAL_COLOR_MAP_PROPERTIES[lowered] and instance:IsA("Decal") then
+			return "TextureContent"
 		end
 		local contentName = RbxDomModule.getContentPropertyAliases(instance.ClassName)[lowered]
 		if contentName then

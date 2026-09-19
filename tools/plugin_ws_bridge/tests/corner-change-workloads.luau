@@ -51,6 +51,7 @@ local function instance(className, name, parent)
 	function item:IsA(class) return self.ClassName == class or class == "Instance"
 		or class == "BaseScript" and (self.ClassName == "Script" or self.ClassName == "LocalScript")
 		or class == "BasePart" and (self.ClassName == "Part" or self.ClassName == "MeshPart")
+		or class == "Decal" and self.ClassName == "Texture"
 		or class == "ValueBase" and self.ClassName == "StringValue" end
 	local propertySignals = {}
 	function item:GetPropertyChangedSignal(property)
@@ -92,6 +93,7 @@ local valueSibling = instance("StringValue", "ValueDuplicate", left)
 local mesh = instance("MeshPart", "Mesh", storage)
 local camera = instance("Camera", "Camera", storage)
 local beam = instance("Beam", "Beam", storage)
+local texture = instance("Texture", "Texture", storage)
 local gui = instance("ScreenGui", "Gui", storage)
 gui.ScreenInsets = roblox.Enum.ScreenInsets.CoreUISafeInsets
 local localScript = instance("LocalScript", "LocalScript", storage)
@@ -288,7 +290,27 @@ for _, test in { { beam, "Texture", "TextureContent" }, { mesh, "MeshId", "MeshC
 	assert(tracker.serviceGeneration("ReplicatedStorage") == generation, "Object Content must not compare equal to an empty URI")
 	tracker.drainChangeJournal("corner")
 end
-print("Content aliases: 200 own URI/None writes, both signal orders, cancellation and Object Content preserved")
+for index = 1, 100 do
+	local uri = if index % 3 == 0 then "" else `rbxassetid://{index}`
+	tracker.expectPropertyEvent(texture, if index % 2 == 0 then "Texture" else "TextureContent", uri)
+	texture.TextureContent = content(uri)
+	texture.ColorMapContent = texture.TextureContent
+	local order = if index % 2 == 0 then { "ColorMapContent", "TextureContent", "Texture", "ColorMap" }
+		else { "Texture", "TextureContent", "ColorMap", "ColorMapContent" }
+	for _, name in order do texture.Changed:Fire(name) end
+	assert(tracker.serviceGeneration("ReplicatedStorage") == generation, "a Decal's ColorMapContent echo became an outside edit")
+end
+assert(#tracker.drainChangeJournal("corner") == 0)
+texture.TextureContent = content("rbxassetid://outside")
+texture.ColorMapContent = texture.TextureContent
+texture.Changed:Fire("ColorMapContent")
+texture.Changed:Fire("TextureContent")
+generation += 1
+assert(tracker.serviceGeneration("ReplicatedStorage") == generation, "outside Decal texture edit must conflict exactly once")
+local textureJournal = tracker.drainChangeJournal("corner")
+assert(#textureJournal == 1 and textureJournal[1].properties.TextureContent.value == texture.TextureContent
+	and textureJournal[1].properties.ColorMapContent == nil, "a Decal journals its texture, not the mirrored color map")
+print("Content aliases: 300 own URI/None writes, Decal color map echoes, both signal orders, cancellation and Object Content preserved")
 local function change(name, value, aliasFirst)
 	corner[name] = value
 	if name == "TopLeftRadius" and aliasFirst then corner.Changed:Fire("CornerRadius") end
@@ -1180,7 +1202,8 @@ do
 			state = {}, api = api, propertyReadNamesByClass = names, propertyCacheKeysByClass = keys,
 			propertyPrimingPlansByClass = plans, propertyEventRelevanceByClass = relevance,
 			refreshValuePropertySignals = function() end,
-			ATTRIBUTE_EVENT_PROPERTIES = {}, exportPropertyNameForEvent = function(_, name) return name end,
+			ATTRIBUTE_EVENT_PROPERTIES = {}, DECAL_COLOR_MAP_PROPERTIES = {},
+			exportPropertyNameForEvent = function(_, name) return name end,
 			RbxDomModule = { getContentPropertyAliases = function() return {} end },
 		} }
 	)()

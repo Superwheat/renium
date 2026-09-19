@@ -372,7 +372,7 @@ fn normalize_editor_ref_value(
     Value::Object(out)
 }
 
-fn normalize_editor_sequence_value(value: &Value, type_name: &str) -> Value {
+pub(crate) fn normalize_editor_sequence_value(value: &Value, type_name: &str) -> Value {
     let sequence = value.as_object();
     let keypoints = sequence
         .and_then(|object| {

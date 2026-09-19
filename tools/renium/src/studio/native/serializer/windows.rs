@@ -908,14 +908,30 @@ fn package_layout(path: &Path) -> Result<PackageLayout> {
 }
 
 fn modules(pid: u32) -> Result<Vec<ModuleEntry>> {
-    let snapshot =
-        unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid) };
-    if snapshot == INVALID_HANDLE_VALUE {
-        bail!(
-            "Could not inspect Studio process {pid}: {}",
-            std::io::Error::last_os_error()
-        );
-    }
+    // A process still loading its modules answers ERROR_BAD_LENGTH; the
+    // documented remedy is to take the snapshot again.
+    const ERROR_BAD_LENGTH: i32 = 24;
+    const ERROR_PARTIAL_COPY: i32 = 299;
+    let mut attempt = 0;
+    let snapshot = loop {
+        let snapshot =
+            unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid) };
+        if snapshot != INVALID_HANDLE_VALUE {
+            break snapshot;
+        }
+        let error = std::io::Error::last_os_error();
+        attempt += 1;
+        if attempt < 40
+            && matches!(
+                error.raw_os_error(),
+                Some(ERROR_BAD_LENGTH | ERROR_PARTIAL_COPY)
+            )
+        {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            continue;
+        }
+        bail!("Could not inspect Studio process {pid}: {error}");
+    };
     let mut entry: MODULEENTRY32W = unsafe { zeroed() };
     entry.dwSize = size_of::<MODULEENTRY32W>() as u32;
     let mut result = Vec::new();

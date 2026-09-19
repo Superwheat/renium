@@ -2012,15 +2012,41 @@ fn align_snapshot_ids(
 
 fn conflict_message(conflicts: &[String]) -> String {
     let shown = conflicts.iter().take(3).cloned().collect::<Vec<_>>();
-    let remainder = conflicts.len().saturating_sub(shown.len());
-    if remainder == 0 {
-        format!("Sync needs review: {}", shown.join("; "))
-    } else {
-        format!(
-            "Sync needs review: {}; and {remainder} more",
-            shown.join("; ")
-        )
+    let remainder = &conflicts[shown.len()..];
+    if remainder.is_empty() {
+        return format!("Sync needs review: {}", shown.join("; "));
     }
+    let mut counts = Vec::<(String, usize)>::new();
+    for conflict in remainder {
+        let subject = conflict
+            .split_once(": property ")
+            .map(|(_, rest)| ("property", rest))
+            .or_else(|| {
+                conflict
+                    .split_once(": attribute ")
+                    .map(|(_, rest)| ("attribute", rest))
+            })
+            .and_then(|(kind, rest)| {
+                rest.split(':')
+                    .next()
+                    .map(|name| format!("{kind} {}", name.trim()))
+            })
+            .unwrap_or_else(|| "other".to_string());
+        match counts.iter_mut().find(|(name, _)| *name == subject) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((subject, 1)),
+        }
+    }
+    let breakdown = counts
+        .iter()
+        .map(|(name, count)| format!("{name} x{count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Sync needs review: {}; and {} more ({breakdown})",
+        shown.join("; "),
+        remainder.len()
+    )
 }
 
 pub(crate) fn sync_services() -> Vec<String> {
@@ -4729,6 +4755,58 @@ fn short_reconciliation_value(value: Option<&Value>) -> String {
     }
 }
 
+fn first_record_difference(
+    class_name: &str,
+    observed: (&Map<String, Value>, &Map<String, Value>),
+    expected: (&Map<String, Value>, &Map<String, Value>),
+) -> Option<String> {
+    let mut names = observed
+        .0
+        .keys()
+        .chain(expected.0.keys())
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    for name in names {
+        let left = observed.0.get(name);
+        let right = expected.0.get(name);
+        if !reconciliation_property_values_equal(class_name, name, left, right) {
+            return Some(format!(
+                "Studio {name} is {}; the files have {}",
+                short_reconciliation_value(left),
+                short_reconciliation_value(right)
+            ));
+        }
+    }
+    let mut names = observed
+        .1
+        .keys()
+        .chain(expected.1.keys())
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    for name in names {
+        if crate::settings::equivalence::is_engine_managed_attribute(name) {
+            continue;
+        }
+        let left = observed.1.get(name);
+        let right = expected.1.get(name);
+        let equal = match (left, right) {
+            (Some(left), Some(right)) => reconciliation_values_equal(left, right, false),
+            (None, None) => true,
+            _ => false,
+        };
+        if !equal {
+            return Some(format!(
+                "Studio attribute {name} is {}; the files have {}",
+                short_reconciliation_value(left),
+                short_reconciliation_value(right)
+            ));
+        }
+    }
+    None
+}
+
 fn first_three_way_property_difference(
     baseline: &SettingsBytecode,
     editor: &SettingsBytecode,
@@ -5210,13 +5288,19 @@ fn align_new_instance_ids(
         })
         .collect::<HashMap<_, _>>();
     let persistent_targets = persistent_pairs.values().copied().collect::<HashSet<_>>();
-    let candidates = studio_keys
+    let editor_index_by_id = editor
+        .instances
+        .iter()
+        .enumerate()
+        .map(|(index, instance)| (instance.settings_id.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    // Ordinal pairing alone resolves references inside the values compared below.
+    let provisional = studio_keys
         .iter()
         .copied()
         .enumerate()
         .filter_map(|(studio_index, key)| {
-            let persistent = persistent_pairs.get(&studio_index).copied();
-            let editor_index = persistent.or_else(|| {
+            let editor_index = persistent_pairs.get(&studio_index).copied().or_else(|| {
                 editor_by_key
                     .get(&key)
                     .copied()
@@ -5227,18 +5311,193 @@ fn align_new_instance_ids(
             (!baseline_ids.contains(editor_id)
                 && !baseline_ids.contains(studio_id)
                 && editor_id != studio_id)
-                .then_some((studio_index, editor_index, persistent.is_some()))
-        })
-        .collect::<Vec<_>>();
-    let mut remap = candidates
-        .iter()
-        .map(|(studio_index, editor_index, _)| {
-            (
-                studio.instances[*studio_index].settings_id.clone(),
-                editor.instances[*editor_index].settings_id.clone(),
-            )
+                .then(|| (studio_id.to_string(), editor_id.to_string()))
         })
         .collect::<HashMap<_, _>>();
+    let observed_record = |studio_index: usize| {
+        let observed = &studio.instances[studio_index];
+        let mut properties = observed.properties.clone();
+        let mut attributes = observed.attributes.clone();
+        remap_record_reference_ids(&mut properties, &provisional);
+        remap_record_reference_ids(&mut attributes, &provisional);
+        (properties, attributes)
+    };
+    let records_equal = |editor_index: usize, record: &(Map<String, Value>, Map<String, Value>)| {
+        let desired = &editor.instances[editor_index];
+        reconciliation_maps_equal(&desired.class_name, &desired.properties, &record.0)
+            && reconciliation_values_map_equal(&desired.attributes, &record.1)
+    };
+    fn slot_available(
+        editor: &SettingsBytecode,
+        editor_index: usize,
+        class_name: &str,
+        persistent_targets: &HashSet<usize>,
+        baseline_ids: &HashSet<&str>,
+        claimed: &HashSet<String>,
+    ) -> bool {
+        let desired = &editor.instances[editor_index];
+        !persistent_targets.contains(&editor_index)
+            && !baseline_ids.contains(desired.settings_id.as_str())
+            && !claimed.contains(&desired.settings_id)
+            && desired.class_name == class_name
+    }
+    // Parents pair before their children, so a subtree follows a parent that
+    // matched a differently ordered sibling instead of the slot at its ordinal.
+    let mut depth = vec![0usize; studio.instances.len()];
+    for (index, slot) in depth.iter_mut().enumerate() {
+        let mut current = index;
+        let mut level = 0;
+        while let Some(parent) = studio.instances[current].parent_index {
+            level += 1;
+            current = parent;
+            if level > studio.instances.len() {
+                break;
+            }
+        }
+        *slot = level;
+    }
+    let mut order = (0..studio.instances.len()).collect::<Vec<_>>();
+    order.sort_by_key(|index| depth[*index]);
+    let mut editor_key_of = HashMap::<PathId, PathId>::new();
+    let mut remap = HashMap::<String, String>::new();
+    let mut claimed = HashSet::<String>::new();
+    let mut unmatched = Vec::new();
+    for studio_index in order {
+        let key = studio_keys[studio_index];
+        let node = interner.node(key);
+        let mapped_parent = node
+            .parent
+            .map(|parent| editor_key_of.get(&parent).copied().unwrap_or(parent));
+        let observed = &studio.instances[studio_index];
+        let studio_id = observed.settings_id.as_str();
+        if baseline_ids.contains(studio_id) {
+            if let Some(editor_index) = editor_index_by_id.get(studio_id).copied() {
+                editor_key_of.insert(key, editor_keys[editor_index]);
+            }
+            continue;
+        }
+        // A unique engine identity remains valid across source edits and sibling
+        // reordering. Only structural fallback candidates need value evidence.
+        if let Some(editor_index) = persistent_pairs.get(&studio_index).copied() {
+            let editor_id = editor.instances[editor_index].settings_id.as_str();
+            editor_key_of.insert(key, editor_keys[editor_index]);
+            if !baseline_ids.contains(editor_id) && editor_id != studio_id {
+                claimed.insert(editor_id.to_string());
+                remap.insert(studio_id.to_string(), editor_id.to_string());
+            }
+            continue;
+        }
+        let ordinal_partner = interner
+            .find(mapped_parent, &node.part)
+            .and_then(|sibling| editor_by_key.get(&sibling).copied());
+        if let Some(editor_index) = ordinal_partner
+            && editor.instances[editor_index].settings_id == studio_id
+        {
+            editor_key_of.insert(key, editor_keys[editor_index]);
+            continue;
+        }
+        let mut second = node.part.clone();
+        second.ordinal = 2;
+        // New identities are paired by their unique structural location, not by
+        // value. Duplicate-name slots still require equivalent data: their
+        // ordinal alone is not identity, and the same new duplicates can sit in
+        // a different sibling order on each side.
+        let duplicate_slot = node.part.ordinal > 1
+            || interner
+                .find(mapped_parent, &second)
+                .is_some_and(|sibling| editor_by_key.contains_key(&sibling))
+            || interner
+                .find(node.parent, &second)
+                .is_some_and(|sibling| studio_by_key.contains_key(&sibling));
+        let record = observed_record(studio_index);
+        let mut partner = ordinal_partner.filter(|editor_index| {
+            slot_available(
+                editor,
+                *editor_index,
+                &observed.class_name,
+                &persistent_targets,
+                &baseline_ids,
+                &claimed,
+            )
+        });
+        if duplicate_slot
+            && partner.is_some_and(|editor_index| !records_equal(editor_index, &record))
+        {
+            partner = None;
+        }
+        if partner.is_none() && duplicate_slot {
+            let mut probe = node.part.clone();
+            for ordinal in 1.. {
+                probe.ordinal = ordinal;
+                let Some(sibling) = interner.find(mapped_parent, &probe) else {
+                    break;
+                };
+                let Some(editor_index) = editor_by_key.get(&sibling).copied() else {
+                    continue;
+                };
+                if slot_available(
+                    editor,
+                    editor_index,
+                    &observed.class_name,
+                    &persistent_targets,
+                    &baseline_ids,
+                    &claimed,
+                ) && records_equal(editor_index, &record)
+                {
+                    partner = Some(editor_index);
+                    break;
+                }
+            }
+        }
+        match partner {
+            Some(editor_index) => {
+                let editor_id = editor.instances[editor_index].settings_id.clone();
+                editor_key_of.insert(key, editor_keys[editor_index]);
+                claimed.insert(editor_id.clone());
+                remap.insert(studio_id.to_string(), editor_id);
+            }
+            None if duplicate_slot => unmatched.push((studio_index, key, mapped_parent, record)),
+            None => {}
+        }
+    }
+    // Slots left without a partner are additions of their own side, unless both
+    // sides keep unmatched siblings: then nothing tells an edit apart from a
+    // new instance.
+    for (studio_index, key, mapped_parent, record) in unmatched {
+        let observed = &studio.instances[studio_index];
+        let node = interner.node(key);
+        let mut probe = node.part.clone();
+        for ordinal in 1.. {
+            probe.ordinal = ordinal;
+            let Some(sibling) = interner.find(mapped_parent, &probe) else {
+                break;
+            };
+            let Some(editor_index) = editor_by_key.get(&sibling).copied() else {
+                continue;
+            };
+            if slot_available(
+                editor,
+                editor_index,
+                &observed.class_name,
+                &persistent_targets,
+                &baseline_ids,
+                &claimed,
+            ) {
+                let desired = &editor.instances[editor_index];
+                let difference = first_record_difference(
+                    &desired.class_name,
+                    (&record.0, &record.1),
+                    (&desired.properties, &desired.attributes),
+                )
+                .map(|difference| format!(" ({difference})"))
+                .unwrap_or_default();
+                bail!(
+                    "Ambiguous new duplicate instances at {}; Studio was not changed{difference}",
+                    render_structural_key(&interner, key)
+                );
+            }
+        }
+    }
     let targets = remap.values().cloned().collect::<HashSet<_>>();
     let mut all_ids = editor
         .instances
@@ -5253,41 +5512,6 @@ fn align_new_instance_ids(
             remap.insert(
                 id.clone(),
                 crate::bytecode::edit::next_editor_settings_id_fast(&mut all_ids, &mut seed),
-            );
-        }
-    }
-    // New identities are paired by their unique structural location, not by value.
-    // Requiring equal values turns a legitimate property difference into two instances.
-    // Duplicate-name slots still require equivalent data: their ordinal alone is not identity.
-    for (studio_index, editor_index, persistent) in candidates {
-        // A unique engine identity remains valid across source edits and sibling
-        // reordering. Only structural fallback candidates need value evidence.
-        if persistent {
-            continue;
-        }
-        let key = studio_keys[studio_index];
-        let node = interner.node(key);
-        let mut second = node.part.clone();
-        second.ordinal = 2;
-        let duplicate_slot = node.part.ordinal > 1
-            || interner.find(node.parent, &second).is_some_and(|second| {
-                editor_by_key.contains_key(&second) || studio_by_key.contains_key(&second)
-            });
-        if !duplicate_slot {
-            continue;
-        }
-        let observed = &studio.instances[studio_index];
-        let desired = &editor.instances[editor_index];
-        let mut properties = observed.properties.clone();
-        let mut attributes = observed.attributes.clone();
-        remap_record_reference_ids(&mut properties, &remap);
-        remap_record_reference_ids(&mut attributes, &remap);
-        if !reconciliation_maps_equal(&desired.class_name, &desired.properties, &properties)
-            || !reconciliation_values_map_equal(&desired.attributes, &attributes)
-        {
-            bail!(
-                "Ambiguous new duplicate instances at {}; Studio was not changed",
-                render_structural_key(&interner, key)
             );
         }
     }
@@ -6302,7 +6526,9 @@ fn snapshot_mismatch_details(
             names.sort();
             names.dedup();
             for name in names {
-                if kind == "attribute" && name.starts_with("RBX_") {
+                if kind == "attribute"
+                    && crate::settings::equivalence::is_engine_managed_attribute(name)
+                {
                     continue;
                 }
                 if kind == "property"
@@ -6311,8 +6537,14 @@ fn snapshot_mismatch_details(
                         || crate::rbx::decode::is_unexposed_service_property(
                             database, class_name, name,
                         )
+                        || crate::settings::equivalence::reconciliation_property_is_engine_mirror(
+                            database, class_name, name,
+                        )
                         || crate::settings::equivalence::reconciliation_property_is_unknown_when_absent(name)
                             && !expected.contains_key(name)
+                        || crate::settings::equivalence::reconciliation_property_is_unreadable(
+                            database, class_name, name,
+                        ) && (!observed.contains_key(name) || !expected.contains_key(name))
                         || crate::editor::review::is_engine_managed_editor_property(
                             class_name, name, database,
                         ) && !observed.contains_key(name))
@@ -6342,13 +6574,27 @@ fn snapshot_mismatch_details(
                         reconciliation_values_equal(observed, expected, false)
                     }
                     (None, None) => true,
-                    (Some(_), None) if kind == "property" => true,
+                    (Some(observed), None) if kind == "property" => {
+                        crate::settings::equivalence::reconciliation_property_value_is_default(
+                            class_name, name, observed,
+                        )
+                    }
+                    (None, Some(expected)) if kind == "property" => {
+                        crate::settings::equivalence::reconciliation_property_value_is_default(
+                            class_name, name, expected,
+                        )
+                    }
                     _ => false,
                 };
                 if !retained {
                     let detail = match (observed_value, expected_value) {
-                        (None, Some(_)) => "is missing from Studio".to_string(),
-                        (Some(_), None) => "was added by Studio".to_string(),
+                        (None, Some(expected)) => format!(
+                            "is missing from Studio; the files have {}",
+                            reconcile_value_label(expected)
+                        ),
+                        (Some(observed), None) => {
+                            format!("was added by Studio as {}", reconcile_value_label(observed))
+                        }
                         (Some(observed), Some(expected)) => format!(
                             "is {}; expected {}",
                             reconcile_value_label(observed),
@@ -6356,9 +6602,51 @@ fn snapshot_mismatch_details(
                         ),
                         (None, None) => continue,
                     };
-                    return Ok(Some(format!("{instance_name}.{name} {kind} {detail}")));
+                    let mut path = Vec::new();
+                    let mut current = Some(expected_index);
+                    while let Some(index) = current {
+                        path.push(expected_document.instances[index].name.as_str());
+                        current = expected_document.instances[index].parent_index;
+                    }
+                    path.reverse();
+                    let _ = instance_name;
+                    return Ok(Some(format!("{}.{name} {kind} {detail}", path.join("/"))));
                 }
             }
+        }
+        if !reconciliation_maps_equal(class_name, &expected.properties, &observed.properties)
+            || !reconciliation_values_map_equal(&expected.attributes, &observed.attributes)
+        {
+            let mut path = Vec::new();
+            let mut current = Some(expected_index);
+            while let Some(index) = current {
+                path.push(expected_document.instances[index].name.as_str());
+                current = expected_document.instances[index].parent_index;
+            }
+            path.reverse();
+            let mut one_sided = expected
+                .properties
+                .keys()
+                .filter(|name| !observed.properties.contains_key(*name))
+                .map(|name| format!("{name} (files only)"))
+                .chain(
+                    observed
+                        .properties
+                        .keys()
+                        .filter(|name| !expected.properties.contains_key(*name))
+                        .map(|name| format!("{name} (Studio only)")),
+                )
+                .collect::<Vec<_>>();
+            one_sided.sort();
+            return Ok(Some(format!(
+                "{} differs from the files: {}",
+                path.join("/"),
+                if one_sided.is_empty() {
+                    "same property set with different values".to_string()
+                } else {
+                    one_sided.join(", ")
+                }
+            )));
         }
     }
     Ok(None)
@@ -9264,6 +9552,9 @@ mod tests {
     #[test]
     fn new_duplicate_names_with_different_values_are_not_guessed() {
         let (base, editor, mut studio) = new_branch_fixture();
+        studio.instances[1]
+            .properties
+            .insert("Text".to_string(), json!("studio"));
         let mut duplicate = studio.instances[1].clone();
         duplicate.settings_id = "duplicate".to_string();
         studio.instances.push(duplicate);
@@ -9275,6 +9566,153 @@ mod tests {
                 .contains("Ambiguous new duplicate instances")
         );
         assert_eq!(encode_settings_bytecode(&studio).unwrap(), before);
+    }
+
+    #[test]
+    fn new_duplicates_in_a_different_sibling_order_pair_by_their_data() {
+        let (base, editor, mut studio) = new_branch_fixture();
+        let mut editor = editor;
+        let border = |id: &str, x: f64| {
+            let mut part = SettingsBytecodeInstance::new(
+                id.to_string(),
+                "Border".to_string(),
+                "Part".to_string(),
+                Some(0),
+            );
+            part.properties.insert(
+                "Size".to_string(),
+                json!({"_type":"Vector3","x":x,"y":1.0,"z":1.0}),
+            );
+            part
+        };
+        editor.instances.push(border("left", 1.0));
+        editor.instances.push(border("middle", 2.0));
+        editor.instances.push(border("right", 3.0));
+        studio.instances.push(border("s3", 3.0));
+        studio.instances.push(border("s1", 1.0));
+        studio.instances.push(border("s2", 2.0));
+        align_new_instance_ids(&base, &editor, &mut studio).unwrap();
+        let id_of = |x: f64| {
+            studio
+                .instances
+                .iter()
+                .find(|i| i.name == "Border" && i.properties["Size"]["x"] == json!(x))
+                .unwrap()
+                .settings_id
+                .clone()
+        };
+        assert_eq!(id_of(1.0), "left");
+        assert_eq!(id_of(2.0), "middle");
+        assert_eq!(id_of(3.0), "right");
+    }
+
+    #[test]
+    fn extra_new_duplicates_on_one_side_are_additions_once_the_rest_pair_by_data() {
+        let border = |id: &str, x: f64| {
+            let mut part = SettingsBytecodeInstance::new(
+                id.to_string(),
+                "Border".to_string(),
+                "Part".to_string(),
+                Some(0),
+            );
+            part.properties.insert(
+                "Size".to_string(),
+                json!({"_type":"Vector3","x":x,"y":1.0,"z":1.0}),
+            );
+            part
+        };
+        let (base, mut editor, mut studio) = new_branch_fixture();
+        editor.instances.push(border("left", 1.0));
+        editor.instances.push(border("right", 2.0));
+        studio.instances.push(border("extra", 9.0));
+        studio.instances.push(border("s2", 2.0));
+        studio.instances.push(border("s1", 1.0));
+        align_new_instance_ids(&base, &editor, &mut studio).unwrap();
+        let id_of = |x: f64| {
+            studio
+                .instances
+                .iter()
+                .find(|i| i.name == "Border" && i.properties["Size"]["x"] == json!(x))
+                .unwrap()
+                .settings_id
+                .clone()
+        };
+        assert_eq!(id_of(1.0), "left");
+        assert_eq!(id_of(2.0), "right");
+        assert_eq!(id_of(9.0), "extra");
+
+        let (base, mut editor, mut studio) = new_branch_fixture();
+        editor.instances.push(border("left", 1.0));
+        editor.instances.push(border("changed", 2.0));
+        studio.instances.push(border("s1", 1.0));
+        studio.instances.push(border("s2", 3.0));
+        let error = align_new_instance_ids(&base, &editor, &mut studio).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Ambiguous new duplicate instances")
+        );
+    }
+
+    #[test]
+    fn children_follow_a_new_parent_paired_with_a_reordered_sibling() {
+        let (base, mut editor, mut studio) = new_branch_fixture();
+        let part = |id: &str, x: f64| {
+            let mut part = SettingsBytecodeInstance::new(
+                id.to_string(),
+                "Part".to_string(),
+                "Part".to_string(),
+                Some(0),
+            );
+            part.properties.insert(
+                "Size".to_string(),
+                json!({"_type":"Vector3","x":x,"y":1.0,"z":1.0}),
+            );
+            part
+        };
+        let texture = |id: &str, parent: usize, r: f64| {
+            let mut texture = SettingsBytecodeInstance::new(
+                id.to_string(),
+                "Texture".to_string(),
+                "Texture".to_string(),
+                Some(parent),
+            );
+            texture.properties.insert(
+                "Color3".to_string(),
+                json!({"_type":"Color3","r":r,"g":1.0,"b":1.0}),
+            );
+            texture
+        };
+        let editor_first = editor.instances.len();
+        editor.instances.push(part("first", 1.0));
+        editor.instances.push(part("second", 2.0));
+        editor
+            .instances
+            .push(texture("first-texture", editor_first, 1.0));
+        editor
+            .instances
+            .push(texture("second-texture", editor_first + 1, 0.5));
+        let studio_first = studio.instances.len();
+        studio.instances.push(part("s2", 2.0));
+        studio.instances.push(part("s1", 1.0));
+        studio
+            .instances
+            .push(texture("s2-texture", studio_first, 0.5));
+        studio
+            .instances
+            .push(texture("s1-texture", studio_first + 1, 1.0));
+        align_new_instance_ids(&base, &editor, &mut studio).unwrap();
+        let id_of = |name: &str, r: f64| {
+            studio
+                .instances
+                .iter()
+                .find(|i| i.name == name && i.properties["Color3"]["r"] == json!(r))
+                .unwrap()
+                .settings_id
+                .clone()
+        };
+        assert_eq!(id_of("Texture", 1.0), "first-texture");
+        assert_eq!(id_of("Texture", 0.5), "second-texture");
     }
 
     #[test]
