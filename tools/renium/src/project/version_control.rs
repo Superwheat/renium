@@ -559,6 +559,22 @@ fn vc_instance_equal(
         && ia.attributes == ib.attributes
 }
 
+// Two branches that pulled the same Studio-created instance carry the same id,
+// name, class and parent; differing property edits merge like any other
+// three-way change instead of producing a second copy.
+fn vc_instance_same_identity(
+    a_doc: &SettingsBytecode,
+    a: usize,
+    b_doc: &SettingsBytecode,
+    b: usize,
+) -> bool {
+    let ia = &a_doc.instances[a];
+    let ib = &b_doc.instances[b];
+    ia.name == ib.name
+        && ia.class_name == ib.class_name
+        && settings_parent_id(a_doc, a) == settings_parent_id(b_doc, b)
+}
+
 fn vc_render_short(value: Option<&Value>) -> String {
     match value {
         None => "<absent>".to_string(),
@@ -714,7 +730,7 @@ fn prepare_settings_merge(
         if let Some(ours_index) = ours_ids.get(id).copied()
             && !aligned_additions.contains(id)
             && !base_ids.contains_key(id)
-            && !vc_instance_equal(&ours, ours_index, &theirs, theirs_index)
+            && !vc_instance_same_identity(&ours, ours_index, &theirs, theirs_index)
         {
             let fresh = next_editor_settings_id_fast(&mut all_ids, &mut id_seed);
             theirs_id_remap.insert(id.clone(), fresh);
