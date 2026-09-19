@@ -97,6 +97,11 @@ pub(crate) fn is_engine_managed_editor_property(
     if class_name == "Workspace" && property_name == "CurrentCamera" {
         return true;
     }
+    // The engine clamps a scroll offset to the laid-out canvas, so a saved
+    // CanvasPosition is runtime state that cannot be authored through a sync.
+    if class_name == "ScrollingFrame" && property_name == "CanvasPosition" {
+        return true;
+    }
     if property_name == "Tags"
         || class_name == "Workspace" && property_name == "CollisionGroupData"
         || class_name == "Terrain"

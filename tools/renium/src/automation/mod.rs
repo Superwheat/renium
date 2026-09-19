@@ -214,6 +214,19 @@ pub struct BoundContext {
     pub fingerprint: String,
 }
 
+fn studio_target_path(context: &BoundContext) -> PathBuf {
+    PathBuf::from(&context.root)
+        .join(".renium")
+        .join("studio-target.json")
+}
+
+pub(crate) fn published_selector(selector: &str) -> Option<(i64, i64)> {
+    let (game, place) = selector.trim().split_once(':')?;
+    let game = game.parse::<i64>().ok()?;
+    let place = place.parse::<i64>().ok()?;
+    (game > 0 && place > 0).then_some((game, place))
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StudioReopenTarget {
@@ -355,16 +368,31 @@ impl State {
 
     #[cfg(any(windows, target_os = "macos"))]
     pub fn remember_studio_target(&self, context: &BoundContext, target: StudioReopenTarget) {
+        let path = studio_target_path(context);
+        if crate::project::version_control::ensure_renium_local_state_ignored(std::path::Path::new(
+            &context.root,
+        ))
+        .is_ok()
+            && let Ok(bytes) = serde_json::to_vec_pretty(&target)
+        {
+            let _ = crate::system::files::atomic_write_file(&path, &bytes);
+        }
         self.studio_reopen_targets
             .lock_recover()
             .insert(context.project.clone(), target);
     }
 
     pub fn studio_target(&self, context: &BoundContext) -> Option<StudioReopenTarget> {
-        self.studio_reopen_targets
+        if let Some(target) = self
+            .studio_reopen_targets
             .lock_recover()
             .get(&context.project)
             .cloned()
+        {
+            return Some(target);
+        }
+        let bytes = std::fs::read(studio_target_path(context)).ok()?;
+        serde_json::from_slice(&bytes).ok()
     }
 
     pub fn recent_studio_launch(
@@ -500,6 +528,15 @@ pub fn capabilities() -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn published_selectors_need_two_positive_ids() {
+        assert_eq!(published_selector("10:20"), Some((10, 20)));
+        assert_eq!(published_selector(" 10:20 "), Some((10, 20)));
+        assert_eq!(published_selector("0:20"), None);
+        assert_eq!(published_selector("lobby"), None);
+        assert_eq!(published_selector("10"), None);
+    }
 
     #[test]
     fn registry_resolves_ids_and_metadata() {

@@ -2483,6 +2483,7 @@ pub(crate) fn reconciliation_property_is_derived(name: &str) -> bool {
             | "ModelMeshCFrame"
             | "ModelMeshSize"
             | "ModelMeshData"
+            | "CanvasPosition"
     )
 }
 
