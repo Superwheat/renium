@@ -39,6 +39,7 @@ fn plugin_preserves_small_edits_and_rejects_missing_writes() -> mlua::Result<()>
         writePropertyForSync = function(instance, name, value) instance[name] = value return true end
         decodeValue = function(value) return true, value end
         setAttributeForSync = function(instance, name, value) instance[name] = value return true end
+        isEngineManagedAttribute = function(name) return string.sub(tostring(name), 1, 4) == "RBX_" end
     "#).exec()?;
     let source = include_str!("../../plugin_ws_bridge/BridgeEditorSync.module.lua");
     let body = source

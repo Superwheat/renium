@@ -2157,9 +2157,13 @@ fn reconciliation_maps_equal_with_ids(
             && !reconciliation_property_is_metadata(name, value)
             && !database.is_some_and(|database| {
                 crate::rbx::decode::is_unexposed_service_property(database, class_name, name)
+                    || reconciliation_property_is_engine_mirror(database, class_name, name)
             })
-            && !(reconciliation_property_is_unknown_when_absent(name)
-                && (!left.contains_key(name) || !right.contains_key(name)))
+            && (left.contains_key(name) && right.contains_key(name)
+                || !reconciliation_property_is_unknown_when_absent(name)
+                    && !database.is_some_and(|database| {
+                        reconciliation_property_is_unreadable(database, class_name, name)
+                    }))
     };
     for (name, value) in left {
         if !stable(name, value) {
@@ -2192,14 +2196,21 @@ pub(crate) fn reconciliation_values_map_equal(
     reconciliation_values_map_equal_with_ids(left, right, &AHashMap::new(), &AHashMap::new())
 }
 
+// Studio writes RBX_ attributes for itself (reimport ids, migration markers)
+// and drops them from synced writes, so they never take part in equivalence.
+pub(crate) fn is_engine_managed_attribute(name: &str) -> bool {
+    name.starts_with("RBX_")
+}
+
 fn reconciliation_values_map_equal_with_ids(
     left: &Map<String, Value>,
     right: &Map<String, Value>,
     left_ids: &AHashMap<&str, usize>,
     right_ids: &AHashMap<&str, usize>,
 ) -> bool {
-    left.len() == right.len()
-        && left.iter().all(|(name, value)| {
+    let authored = |(name, _): &(&String, &Value)| !is_engine_managed_attribute(name);
+    left.iter().filter(authored).count() == right.iter().filter(authored).count()
+        && left.iter().filter(authored).all(|(name, value)| {
             right.get(name).is_some_and(|other| {
                 reconciliation_values_equal_with_ids(
                     value,
@@ -2276,6 +2287,41 @@ fn typed_scalar(value: &Value) -> &Value {
     .unwrap_or(value)
 }
 
+/// Bridge-shaped values wrap the type as the only key (`{"NumberSequence":
+/// {...}}`, `{"Ref": {...}}`, `{"BrickColor": n}`) and spell colour keypoints
+/// as arrays; stores merged from such exports carry them verbatim.
+fn canonical_wrapped_value(value: &Value) -> Option<Value> {
+    let object = value.as_object()?;
+    for type_name in ["NumberSequence", "ColorSequence"] {
+        let sequence = if object.len() == 1 {
+            object.get(type_name)
+        } else if object.get("_type").and_then(Value::as_str) == Some(type_name) {
+            Some(value)
+        } else {
+            None
+        };
+        if let Some(sequence) = sequence {
+            let normalized =
+                crate::editor::review::normalize_editor_sequence_value(sequence, type_name);
+            return (normalized != *value).then_some(normalized);
+        }
+    }
+    if object.len() == 1
+        && let Some(reference) = object.get("Ref").and_then(Value::as_object)
+    {
+        let mut out = reference.clone();
+        out.insert("_type".to_string(), Value::String("Ref".to_string()));
+        return Some(Value::Object(out));
+    }
+    if object.len() == 1
+        && let Some(number) = object.get("BrickColor")
+        && number.is_number()
+    {
+        return Some(serde_json::json!({"_type": "BrickColor", "number": number}));
+    }
+    None
+}
+
 fn reconciliation_values_equal_with_ids(
     left: &Value,
     right: &Value,
@@ -2284,6 +2330,14 @@ fn reconciliation_values_equal_with_ids(
     right_ids: Option<&AHashMap<&str, usize>>,
 ) -> bool {
     let (left, right) = (typed_scalar(left), typed_scalar(right));
+    let canonical = (
+        canonical_wrapped_value(left),
+        canonical_wrapped_value(right),
+    );
+    let (left, right) = (
+        canonical.0.as_ref().unwrap_or(left),
+        canonical.1.as_ref().unwrap_or(right),
+    );
     match (left, right) {
         (Value::Number(left), Value::Number(right)) if !approximate => {
             exact_json_numbers_equal(left, right)
@@ -2468,9 +2522,11 @@ fn reconciliation_value_uses_f32(type_name: &str) -> bool {
 
 pub(crate) fn reconciliation_property_is_derived(name: &str) -> bool {
     // Studio recomputes the World* fields from the local ones, flips the
-    // migration flags itself while loading a tree and caches a model's mesh
-    // bounds after insertion, so none of them can be authored or retained
-    // through a sync.
+    // migration flags itself while loading a tree, caches a model's mesh
+    // bounds after insertion, counts a MeshPart's vertices and integrates a
+    // mesh's mass properties once its mesh has loaded, and refreshes a
+    // WeldConstraint's cached offset from its parts, so none of them can be
+    // authored or retained through a sync.
     matches!(
         name,
         "WorldCFrame"
@@ -2484,6 +2540,12 @@ pub(crate) fn reconciliation_property_is_derived(name: &str) -> bool {
             | "ModelMeshSize"
             | "ModelMeshData"
             | "CanvasPosition"
+            | "VertexCount"
+            | "UnscaledCofm"
+            | "UnscaledVolInertiaDiags"
+            | "UnscaledVolInertiaOffDiags"
+            | "UnscaledVolume"
+            | "CFrame0"
     )
 }
 
@@ -2534,6 +2596,34 @@ pub(crate) fn reconciliation_property_value<'a>(
     properties
         .get(name)
         .filter(|value| !reconciliation_property_is_metadata(name, value))
+}
+
+// A Decal's ColorMapContent is the engine's view of TextureContent: Studio
+// reports it and captures reconstruct it, but it is never authored separately.
+pub(crate) fn reconciliation_property_is_engine_mirror(
+    database: &rbx_reflection::ReflectionDatabase<'_>,
+    class_name: &str,
+    name: &str,
+) -> bool {
+    name == "ColorMapContent"
+        && crate::rbx::decode::rbx_reflection_class_is_a(database, class_name, "Decal")
+}
+
+// Scripts cannot read a NotScriptable property, so a capture that lacks one
+// says nothing about its value.
+pub(crate) fn reconciliation_property_is_unreadable(
+    database: &rbx_reflection::ReflectionDatabase<'_>,
+    class_name: &str,
+    name: &str,
+) -> bool {
+    crate::rbx::encode::rbx_property_descriptor(database, class_name, name).is_some_and(
+        |descriptor| {
+            matches!(
+                descriptor.scriptability,
+                rbx_reflection::Scriptability::None
+            )
+        },
+    )
 }
 
 pub(crate) fn reconciliation_property_is_unknown_when_absent(name: &str) -> bool {

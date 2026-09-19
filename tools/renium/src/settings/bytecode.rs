@@ -363,7 +363,25 @@ pub(crate) fn is_known_default_property_value(property_name: &str, value: &Value
         (property_name, value),
         ("Archivable" | "CharacterAutoLoads", Value::Bool(true))
             | ("Sandboxed", Value::Bool(false))
-    )
+    ) || is_null_reference_value(value)
+}
+
+// A reference that names no target (a cleared PrimaryPart, an unset
+// ObjectValue) is what Studio reports by omitting the property.
+pub(crate) fn is_null_reference_value(value: &Value) -> bool {
+    let Value::Object(object) = value else {
+        return false;
+    };
+    object.get("_type").and_then(Value::as_str) == Some("Ref")
+        && ![
+            "settingsId",
+            "instanceId",
+            "instanceIndex",
+            "path",
+            "pathSegments",
+        ]
+        .iter()
+        .any(|key| object.get(*key).is_some_and(|value| !value.is_null()))
 }
 
 pub(crate) fn decode_settings_bytecode(bytes: &[u8]) -> Result<SettingsBytecode> {

@@ -602,6 +602,21 @@ struct VcMergeContext<'a> {
 }
 
 impl VcMergeContext<'_> {
+    fn property_is_engine_state(&self, name: &str) -> bool {
+        use crate::settings::equivalence::{
+            reconciliation_property_is_derived, reconciliation_property_is_engine_mirror,
+        };
+        name == "ScriptGuid"
+            || reconciliation_property_is_derived(name)
+            || rbx_reflection_database::get().is_ok_and(|database| {
+                reconciliation_property_is_engine_mirror(
+                    database,
+                    &self.document.instances[self.index].class_name,
+                    name,
+                )
+            })
+    }
+
     fn push_conflict(&mut self, detail: String) {
         self.conflicts.push(VcMergeConflict {
             path: settings_instance_path(self.document, self.index),
@@ -659,6 +674,10 @@ impl VcMergeContext<'_> {
             } else if o == b {
                 t.cloned()
             } else if t == b {
+                o.cloned()
+            } else if label == "property" && self.property_is_engine_state(key) {
+                // The engine recomputes these on load, so a difference is not
+                // an authored change on either side.
                 o.cloned()
             } else {
                 match self.value_prefer {
