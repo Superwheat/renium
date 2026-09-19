@@ -145,6 +145,7 @@ function BridgeReferenceOverlay.create(dependencies: { [string]: any })
 			local normalizedProperty = string.lower(tostring(propertyName))
 			if
 				typeof(instance) ~= "Instance"
+				or typeof(workspace) == "Instance" and instance == workspace.CurrentCamera
 				or ignoredProperties ~= nil and ignoredProperties[normalizedProperty]
 				or COMPUTED_LAYOUT_PROPERTIES[normalizedProperty]
 				or not allProperties and normalizedProperty ~= "name"
