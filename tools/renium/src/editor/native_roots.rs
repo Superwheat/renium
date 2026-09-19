@@ -432,6 +432,27 @@ fn apply_write(
         _ => &write.name,
     };
     let is_terrain = write.class_name == "Terrain" && write.name == "SmoothGrid";
+    // The plan's ordinals can be stale once earlier changes in the batch have
+    // landed; Studio reports where the queued instance actually sits now.
+    let described = bridge.call_for_runtime_with_timeout(
+        "getEditorTransactionState",
+        serde_json::json!({"transactionId": transaction_id, "nativeRootWrite": write.index, "describeNativeRootWrite": true}),
+        BridgeTarget::Edit,
+        &info.runtime_id,
+        Some(std::time::Duration::from_secs(2)),
+    )?;
+    let live_segments: Option<Vec<String>> =
+        serde_json::from_value(described["pathSegments"].clone()).ok();
+    let live_ordinals: Option<Vec<usize>> =
+        serde_json::from_value(described["pathOrdinals"].clone()).ok();
+    let (path_segments, path_ordinals) = match (live_segments, live_ordinals) {
+        (Some(segments), Some(ordinals))
+            if !segments.is_empty() && segments.len() == ordinals.len() =>
+        {
+            (segments, ordinals)
+        }
+        _ => (write.path_segments.clone(), write.path_ordinals.clone()),
+    };
     let grid = |name: &str| -> Result<Option<Vec<u8>>> {
         write
             .value
@@ -468,8 +489,8 @@ fn apply_write(
         Some(crate::studio::native::serializer::prepare_terrain(
             pid,
             &title,
-            &write.path_segments,
-            &write.path_ordinals,
+            &path_segments,
+            &path_ordinals,
             std::time::Duration::from_secs(3),
         )?)
     } else {
@@ -482,15 +503,15 @@ fn apply_write(
             crate::studio::native::serializer::prepare_property(
                 pid,
                 &title,
-                &write.path_segments,
-                &write.path_ordinals,
+                &path_segments,
+                &path_ordinals,
                 property_name,
                 std::time::Duration::from_secs(2),
             )
             .with_context(|| {
                 format!(
                     "Preparing native sync of {}.{}",
-                    write.path_segments.join("."),
+                    path_segments.join("."),
                     write.name
                 )
             })?,
