@@ -1004,12 +1004,26 @@ fn high_level_print_ambiguity(
             }
             insert_top_field(&mut response, mode, "matches", Value::Array(matches));
         }
-        None => insert_top_field(
-            &mut response,
-            mode,
-            "matches",
-            Value::Array(high_level_ambiguity_nodes(ctx, indices, mode)),
-        ),
+        None => {
+            let mut nodes = high_level_ambiguity_nodes(ctx, indices, mode);
+            if mode.uses_short_keys() {
+                // A field every match shares is printed once at the top.
+                for key in ["n", "c"] {
+                    let shared = nodes
+                        .first()
+                        .and_then(|node| node.get(key))
+                        .cloned()
+                        .filter(|value| nodes.iter().all(|node| node.get(key) == Some(value)));
+                    if let Some(value) = shared {
+                        for node in nodes.iter_mut().filter_map(Value::as_object_mut) {
+                            node.remove(key);
+                        }
+                        response.insert(key.to_string(), value);
+                    }
+                }
+            }
+            insert_top_field(&mut response, mode, "matches", Value::Array(nodes));
+        }
     }
     print_json_output(&Value::Object(response), pretty)?;
     Err(ReportedFailure.into())

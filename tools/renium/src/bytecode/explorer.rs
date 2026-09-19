@@ -289,6 +289,11 @@ fn bytecode_batch_instance_index(
     instance_api::find_unique_instance_index(document, selector)
 }
 
+fn is_engine_state_property(name: &str) -> bool {
+    crate::settings::equivalence::reconciliation_property_is_derived(name)
+        || matches!(name, "UniqueId" | "HistoryId")
+}
+
 /// Compact output prints a path as one dotted string with `[n]` after any
 /// duplicate-name segment, the same form every path argument accepts. Names
 /// holding a separator or bracket keep the array form so they stay parseable.
@@ -1166,7 +1171,9 @@ impl BytecodeNodeProjection<'_> {
                 .path_ordinals_by_index
                 .get(index)
                 .and_then(|ordinals| ordinals.as_deref());
-            let inline = if self.mode.uses_short_keys() {
+            // Machine consumers (--output-mode json) keep the two arrays.
+            let inline = if self.mode.uses_short_keys() || !crate::app::output::global_json_output()
+            {
                 compact_path_string(path_segments, ordinals)
             } else {
                 None
@@ -1174,10 +1181,7 @@ impl BytecodeNodeProjection<'_> {
             match inline {
                 Some(path) => {
                     path_rendered_inline = true;
-                    node.insert(
-                        node_output_key(self.mode, "pathSegments").to_string(),
-                        Value::String(path),
-                    );
+                    node.insert("path".to_string(), Value::String(path));
                 }
                 None => {
                     node.insert(
@@ -1239,6 +1243,13 @@ impl BytecodeNodeProjection<'_> {
                 self.canonical_settings_ids_by_index,
                 properties,
             );
+            // Values the engine recomputes on load are not authored data; a
+            // default full view leaves them out, and any field request shows them.
+            if !requested_field(self.fields, "properties", node_field_aliases("properties"))
+                && !crate::app::output::global_json_output()
+            {
+                properties.retain(|name, _| !is_engine_state_property(name));
+            }
         }
         if let Some(properties) = properties {
             node.insert(
