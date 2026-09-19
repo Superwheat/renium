@@ -27,7 +27,37 @@ pub(crate) fn get_console_output_command(args: PluginConsoleOutputArgs) -> Resul
         map.remove("count");
     }
     crate::app::output::drop_false(&mut result, &["hasMore", "truncated"]);
+    compact_console_entries(&mut result);
     print_json_output(&result, false)
+}
+
+/// Studio's MessageType names and a wall-clock stamp repeat on every line;
+/// the level word is what a reader filters on and `time` already orders them.
+fn compact_console_entries(result: &mut Value) {
+    if crate::app::output::global_json_output() {
+        return;
+    }
+    let Some(entries) = result.get_mut("entries").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for entry in entries {
+        let level = short_console_level(console_entry_level(entry)).to_string();
+        if let Some(map) = entry.as_object_mut() {
+            map.remove("unix");
+            map.insert("type".to_string(), Value::String(level));
+        }
+    }
+}
+
+/// Studio's MessageType names shortened to the level words `rbx l` prints.
+fn short_console_level(raw: &str) -> &str {
+    match raw {
+        "MessageOutput" => "print",
+        "MessageInfo" => "info",
+        "MessageWarning" => "warn",
+        "MessageError" => "error",
+        other => other,
+    }
 }
 
 fn console_daemon_parameters(
@@ -226,7 +256,9 @@ fn console_entry_matches(args: &PluginConsoleOutputArgs, entry: &Value) -> bool 
             .or_else(|| entry.get("level"))
             .and_then(Value::as_str)
             .unwrap_or("output");
-        if !entry_level.eq_ignore_ascii_case(level) {
+        if !entry_level.eq_ignore_ascii_case(level)
+            && !short_console_level(entry_level).eq_ignore_ascii_case(level)
+        {
             return false;
         }
     }
