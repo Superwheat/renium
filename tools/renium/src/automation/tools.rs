@@ -445,10 +445,13 @@ fn script_grep_at(root: &Path, source: &Path, parameters: &Value) -> Result<Valu
         request.query
     };
     let limit = request.limit.unwrap_or(100).clamp(1, 1000);
-    let mut results = Vec::new();
+    // Matches are grouped by file: one path per script instead of one per line.
+    let mut results: Vec<Value> = Vec::new();
+    let mut returned = 0;
     let mut total_matches = 0;
     for path in script_files(source) {
         let source = read_script(&path, "script-grep")?;
+        let mut hits = Vec::new();
         for (index, line) in source.lines().enumerate() {
             let matches = if request.case_insensitive {
                 line.to_ascii_lowercase().contains(&needle)
@@ -457,17 +460,17 @@ fn script_grep_at(root: &Path, source: &Path, parameters: &Value) -> Result<Valu
             };
             if matches {
                 total_matches += 1;
-                if results.len() < limit {
-                    results.push(json!({
-                        "path": relative(root, &path),
-                        "line": index + 1,
-                        "text": line,
-                    }));
+                if returned < limit {
+                    returned += 1;
+                    hits.push(json!({ "line": index + 1, "text": line }));
                 }
             }
         }
+        if !hits.is_empty() {
+            results.push(json!({ "path": relative(root, &path), "hits": hits }));
+        }
     }
-    let truncated = results.len() < total_matches;
+    let truncated = returned < total_matches;
     let mut result = json!({ "results": results, "totalMatches": total_matches });
     if truncated {
         result["truncated"] = json!(true);
