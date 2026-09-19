@@ -4268,3 +4268,89 @@ fn bridge_request_lease_cancels_only_before_completion() {
     completed.cancel();
     assert!(!completed.is_cancelled());
 }
+
+#[test]
+fn vc_merge_leaves_untouched_instances_alone() {
+    let base = settings_document(vec![
+        vc_test_instance("root", "ReplicatedStorage", "ReplicatedStorage", None, &[]),
+        vc_test_instance("a", "A", "Part", Some(0), &[("X", json!(1))]),
+        vc_test_instance("b", "B", "Part", Some(0), &[("Y", json!(1))]),
+        vc_test_instance("k", "Keep", "Folder", Some(0), &[("Z", json!("same"))]),
+    ]);
+    let ours = settings_document(vec![
+        vc_test_instance("root", "ReplicatedStorage", "ReplicatedStorage", None, &[]),
+        vc_test_instance("a", "A", "Part", Some(0), &[("X", json!(2))]),
+        vc_test_instance("b", "B", "Part", Some(0), &[("Y", json!(1))]),
+        vc_test_instance("k", "Keep", "Folder", Some(0), &[("Z", json!("same"))]),
+    ]);
+    let theirs = settings_document(vec![
+        vc_test_instance("root", "ReplicatedStorage", "ReplicatedStorage", None, &[]),
+        vc_test_instance("a", "A", "Part", Some(0), &[("X", json!(1))]),
+        vc_test_instance("b", "B", "Part", Some(0), &[("Y", json!(3))]),
+        vc_test_instance("k", "Keep", "Folder", Some(0), &[("Z", json!("same"))]),
+        vc_test_instance("n", "New", "Part", Some(0), &[("W", json!(9))]),
+    ]);
+    let (merged, conflicts) = merge_settings_documents(&base, &ours, &theirs, None);
+    assert!(conflicts.is_empty());
+    let mut ids = merged
+        .instances
+        .iter()
+        .map(|instance| instance.settings_id.to_string())
+        .collect::<Vec<_>>();
+    ids.sort();
+    assert_eq!(ids, ["a", "b", "k", "n", "root"]);
+    let by_id = |id: &str| {
+        merged
+            .instances
+            .iter()
+            .find(|instance| instance.settings_id == id)
+            .unwrap()
+    };
+    assert_eq!(by_id("a").properties.get("X"), Some(&json!(2)));
+    assert_eq!(by_id("b").properties.get("Y"), Some(&json!(3)));
+    assert_eq!(by_id("k").properties, base.instances[3].properties);
+    assert_eq!(by_id("n").properties.get("W"), Some(&json!(9)));
+}
+
+#[test]
+fn vc_merge_treats_the_same_addition_on_both_sides_as_one_instance() {
+    let base = settings_document(vec![vc_test_instance(
+        "root",
+        "ReplicatedStorage",
+        "ReplicatedStorage",
+        None,
+        &[],
+    )]);
+    let ours = settings_document(vec![
+        vc_test_instance("root", "ReplicatedStorage", "ReplicatedStorage", None, &[]),
+        vc_test_instance("shared", "Shared", "Part", Some(0), &[("A", json!(1))]),
+    ]);
+    let theirs = settings_document(vec![
+        vc_test_instance("root", "ReplicatedStorage", "ReplicatedStorage", None, &[]),
+        vc_test_instance(
+            "shared",
+            "Shared",
+            "Part",
+            Some(0),
+            &[("A", json!(1)), ("B", json!(2))],
+        ),
+    ]);
+    let (merged, conflicts) = merge_settings_documents(&base, &ours, &theirs, None);
+    assert!(
+        conflicts.is_empty(),
+        "{}",
+        conflicts
+            .iter()
+            .map(|conflict| conflict.detail.clone())
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    let shared = merged
+        .instances
+        .iter()
+        .filter(|instance| instance.name == "Shared")
+        .collect::<Vec<_>>();
+    assert_eq!(shared.len(), 1, "the same addition must not be duplicated");
+    assert_eq!(shared[0].properties.get("A"), Some(&json!(1)));
+    assert_eq!(shared[0].properties.get("B"), Some(&json!(2)));
+}
