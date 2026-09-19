@@ -621,6 +621,40 @@ pub(super) fn high_level_path_segments(raw: &str, service: &str) -> Result<Vec<S
     Ok(segments)
 }
 
+/// A dotted path may carry `[n]` after a segment, as compact output prints
+/// duplicates. Returns the bare segments and, when any ordinal was given,
+/// one ordinal per segment.
+pub(super) fn split_inline_ordinals(segments: Vec<String>) -> (Vec<String>, Vec<usize>) {
+    let mut bare = Vec::with_capacity(segments.len());
+    let mut ordinals = Vec::with_capacity(segments.len());
+    let mut any = false;
+    for segment in segments {
+        let ordinal = segment
+            .strip_suffix(']')
+            .and_then(|rest| rest.rsplit_once('['))
+            .filter(|(name, digits)| {
+                !name.is_empty() && !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+            })
+            .and_then(|(name, digits)| digits.parse::<usize>().ok().map(|n| (name.to_string(), n)))
+            .filter(|(_, n)| *n >= 1);
+        match ordinal {
+            Some((name, n)) => {
+                any = true;
+                bare.push(name);
+                ordinals.push(n);
+            }
+            None => {
+                bare.push(segment);
+                ordinals.push(1);
+            }
+        }
+    }
+    if !any {
+        ordinals.clear();
+    }
+    (bare, ordinals)
+}
+
 const HIGH_LEVEL_AMBIGUITY_LIMIT: usize = 20;
 
 enum HighLevelTargetResolution {
@@ -886,6 +920,60 @@ fn high_level_ambiguity_nodes(
         .collect()
 }
 
+/// Same-named matches under one parent share their path; compact output
+/// prints it once and lists each match by id and ordinal.
+fn high_level_shared_ambiguity(
+    ctx: &HighLevelBytecodeContext,
+    indices: &[usize],
+) -> Option<(Value, Option<String>, Vec<Value>)> {
+    let shown = &indices[..indices.len().min(HIGH_LEVEL_AMBIGUITY_LIMIT)];
+    let first = ctx.path_segments_by_index.get(*shown.first()?)?.as_ref()?;
+    if !shown.iter().all(|index| {
+        ctx.path_segments_by_index
+            .get(*index)
+            .and_then(|segments| segments.as_ref())
+            == Some(first)
+    }) {
+        return None;
+    }
+    let path = match crate::bytecode::explorer::compact_path_string(first, None) {
+        Some(path) => Value::String(path),
+        None => Value::Array(
+            first
+                .iter()
+                .map(|segment| Value::String(segment.clone()))
+                .collect(),
+        ),
+    };
+    let class_name = &ctx.document.instances[shown[0]].class_name;
+    let same_class = shown
+        .iter()
+        .all(|index| &ctx.document.instances[*index].class_name == class_name);
+    let matches = shown
+        .iter()
+        .map(|index| {
+            let instance = &ctx.document.instances[*index];
+            let ordinal = ctx
+                .path_ordinals_by_index
+                .get(*index)
+                .and_then(|ordinals| ordinals.as_ref())
+                .and_then(|ordinals| ordinals.last().copied())
+                .unwrap_or(1);
+            let mut node = Map::new();
+            node.insert(
+                "id".to_string(),
+                Value::String(instance.settings_id.clone()),
+            );
+            node.insert("ord".to_string(), json!(ordinal as u64));
+            if !same_class {
+                node.insert("c".to_string(), Value::String(instance.class_name.clone()));
+            }
+            Value::Object(node)
+        })
+        .collect();
+    Some((path, same_class.then(|| class_name.clone()), matches))
+}
+
 fn high_level_print_ambiguity(
     ctx: &HighLevelBytecodeContext,
     mode: OutputMode,
@@ -903,12 +991,26 @@ fn high_level_print_ambiguity(
     if indices.len() > HIGH_LEVEL_AMBIGUITY_LIMIT {
         insert_top_field(&mut response, mode, "truncated", Value::Bool(true));
     }
-    insert_top_field(
-        &mut response,
-        mode,
-        "matches",
-        Value::Array(high_level_ambiguity_nodes(ctx, indices, mode)),
-    );
+    let shared = if mode.uses_short_keys() {
+        high_level_shared_ambiguity(ctx, indices)
+    } else {
+        None
+    };
+    match shared {
+        Some((path, class_name, matches)) => {
+            response.insert("path".to_string(), path);
+            if let Some(class_name) = class_name {
+                response.insert("c".to_string(), Value::String(class_name));
+            }
+            insert_top_field(&mut response, mode, "matches", Value::Array(matches));
+        }
+        None => insert_top_field(
+            &mut response,
+            mode,
+            "matches",
+            Value::Array(high_level_ambiguity_nodes(ctx, indices, mode)),
+        ),
+    }
     print_json_output(&Value::Object(response), pretty)?;
     Err(ReportedFailure.into())
 }
@@ -1019,9 +1121,19 @@ fn high_level_target_resolution(
         if path.is_some()
             || !ordinals.is_empty()
             || raw_target.starts_with('[')
+            || raw_target.ends_with(']')
             || raw_target.chars().any(|ch| matches!(ch, '/' | '\\' | '.'))
         {
             let segments = high_level_path_segments(raw_target, &ctx.service)?;
+            let (segments, inline) = if raw_target.starts_with('[') {
+                (segments, Vec::new())
+            } else {
+                split_inline_ordinals(segments)
+            };
+            if !inline.is_empty() && !ordinals.is_empty() {
+                bail!("Give duplicate ordinals inline (Name[2]) or with --ords, not both");
+            }
+            let ordinals = if inline.is_empty() { ordinals } else { inline };
             return high_level_resolve_path_candidates(ctx, &segments, &ordinals);
         }
         return high_level_resolve_simple_target(ctx, raw_target);
@@ -2847,4 +2959,31 @@ pub(super) fn acquire_settings_file_lock(settings_file: &Path) -> Result<Setting
         "Timed out waiting for settings file lock: {}",
         settings_file.display()
     )
+}
+
+#[cfg(test)]
+mod inline_ordinal_tests {
+    use super::split_inline_ordinals;
+
+    fn segments(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| (*part).to_string()).collect()
+    }
+
+    #[test]
+    fn inline_ordinals_split_from_segments_and_default_to_one() {
+        let (bare, ordinals) =
+            split_inline_ordinals(segments(&["Workspace", "Lobby", "Border[4]"]));
+        assert_eq!(bare, segments(&["Workspace", "Lobby", "Border"]));
+        assert_eq!(ordinals, vec![1, 1, 4]);
+        let (bare, ordinals) =
+            split_inline_ordinals(segments(&["Workspace", "Lobby[2]", "Border"]));
+        assert_eq!(bare, segments(&["Workspace", "Lobby", "Border"]));
+        assert_eq!(ordinals, vec![1, 2, 1]);
+        let (bare, ordinals) = split_inline_ordinals(segments(&["Workspace", "Border"]));
+        assert_eq!(bare, segments(&["Workspace", "Border"]));
+        assert!(ordinals.is_empty());
+        let (bare, ordinals) = split_inline_ordinals(segments(&["[4]", "Item[0]", "Item[x]"]));
+        assert_eq!(bare, segments(&["[4]", "Item[0]", "Item[x]"]));
+        assert!(ordinals.is_empty());
+    }
 }

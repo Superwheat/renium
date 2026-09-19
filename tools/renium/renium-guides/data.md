@@ -37,7 +37,7 @@ rbx mv StarterGui -i editor:id --to-service ReplicatedStorage -I editor:parent
 rbx br Workspace -i editor:id
 ```
 
-Select with `-i`, `-x`, `-n`, `-c`, or `--path` plus `--ords` for duplicates.
+Select with `-i`, `-x`, `-n`, `-c`, or `--path`. Duplicates take inline ordinals (`Borders.Border[4]`, the form compact output prints) or `--ords`.
 Use a service name or `-f STORE`, not both.
 
 Values: `--str`, `--num`, `--bool`, `--null`, or `-j JSON`. Use `-j -` to read JSON from stdin, including values too large for the OS command line.

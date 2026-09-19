@@ -225,7 +225,9 @@ pub(crate) fn print_json_output(value: &Value, pretty: bool) -> Result<()> {
     }
     let relative;
     let value = if MODE.load(Ordering::Relaxed) == 0 {
-        relative = relativize_project_paths(value.clone());
+        let mut text = relativize_project_paths(value.clone());
+        shorten_single_precision_floats(&mut text);
+        relative = text;
         &relative
     } else {
         value
@@ -282,6 +284,32 @@ fn relativize_project_paths(mut value: Value) -> Value {
     }
     visit(&mut value);
     value
+}
+
+/// Studio stores most numbers as single precision; their exact double
+/// expansion (0.20000000298023224) costs tokens without adding information.
+/// Text output prints the shortest decimal that round-trips the same f32.
+pub(crate) fn shorten_single_precision_floats(value: &mut Value) {
+    match value {
+        Value::Number(number) => {
+            if let Some(double) = number.as_f64()
+                && number.as_i64().is_none()
+                && number.as_u64().is_none()
+                && double.is_finite()
+            {
+                let single = double as f32;
+                if f64::from(single) == double
+                    && let Ok(parsed) = single.to_string().parse::<f64>()
+                    && let Some(shortened) = serde_json::Number::from_f64(parsed)
+                {
+                    *number = shortened;
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(shorten_single_precision_floats),
+        Value::Object(map) => map.values_mut().for_each(shorten_single_precision_floats),
+        _ => {}
+    }
 }
 
 /// Removes null, empty-string, empty-array and empty-object members.
@@ -379,5 +407,31 @@ mod tests {
             writer.bytes,
             format!("[renium] profile {value}\n").as_bytes()
         );
+    }
+}
+
+#[cfg(test)]
+mod float_output_tests {
+    use super::shorten_single_precision_floats;
+    use serde_json::json;
+
+    #[test]
+    fn single_precision_expansions_print_short_and_doubles_stay_exact() {
+        let mut value = json!({
+            "size": [0.20000000298023224, 0.699999988079071, 1.0, 228.31427001953125],
+            "count": 3,
+            "big": 1789795605,
+            "precise": 0.1234567890123,
+            "nested": {"x": 0.960784375667572}
+        });
+        shorten_single_precision_floats(&mut value);
+        assert_eq!(
+            serde_json::to_string(&value).unwrap(),
+            r#"{"big":1789795605,"count":3,"nested":{"x":0.9607844},"precise":0.1234567890123,"size":[0.2,0.7,1.0,228.31427]}"#
+        );
+        let mut value = json!({"size": [0.2, 0.7, 228.31427]});
+        let before = serde_json::to_string(&value).unwrap();
+        shorten_single_precision_floats(&mut value);
+        assert_eq!(serde_json::to_string(&value).unwrap(), before);
     }
 }

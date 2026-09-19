@@ -1872,9 +1872,12 @@ pub(crate) fn canonicalize_settings_property_names(document: &mut SettingsByteco
                     if let Some(renamed) = names.get(name) {
                         return *renamed;
                     }
-                    let renamed = serialized_only_logical_name(database, &instance.class_name, name)
-                        .or_else(|| rbx_logical_property_name(database, &instance.class_name, name))
-                        .filter(|canonical| *canonical != name);
+                    let renamed =
+                        serialized_only_logical_name(database, &instance.class_name, name)
+                            .or_else(|| {
+                                rbx_logical_property_name(database, &instance.class_name, name)
+                            })
+                            .filter(|canonical| *canonical != name);
                     names.insert(name.to_string(), renamed);
                     renamed
                 };

@@ -43,7 +43,7 @@ Files → Studio edits mark affected linked packages **Changed** before modifyin
 - `upl`: remove the PackageLink while keeping contents. This is unlinking, not desync.
 
 On Windows/macOS, `pd`/`pp`/`pu` target the package root without selection, dialogs, or focus. Their operation budget is 20 seconds, not a guarantee that Roblox publishing always succeeds.
-Use a JSON string array for names containing dots, `--ords` for duplicates, and `--pid PID` only when several processes match.
+Use a JSON string array for names containing dots, `Name[2]` or `--ords` for duplicates, and `--pid PID` only when several processes match.
 
 ## Wally
 
