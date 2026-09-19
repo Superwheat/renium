@@ -4767,9 +4767,20 @@ fn first_record_difference(
         .collect::<Vec<_>>();
     names.sort();
     names.dedup();
+    let database = rbx_reflection_database::get().ok();
     for name in names {
         let left = observed.0.get(name);
         let right = expected.0.get(name);
+        if !crate::settings::equivalence::reconciliation_property_compares(
+            database,
+            class_name,
+            name,
+            left.or(right).unwrap_or(&Value::Null),
+            left.is_some(),
+            right.is_some(),
+        ) {
+            continue;
+        }
         if !reconciliation_property_values_equal(class_name, name, left, right) {
             return Some(format!(
                 "Studio {name} is {}; the files have {}",
@@ -6532,22 +6543,17 @@ fn snapshot_mismatch_details(
                     continue;
                 }
                 if kind == "property"
-                    && (name == "ScriptGuid"
-                        || reconciliation_property_is_derived(name)
-                        || crate::rbx::decode::is_unexposed_service_property(
-                            database, class_name, name,
-                        )
-                        || crate::settings::equivalence::reconciliation_property_is_engine_mirror(
-                            database, class_name, name,
-                        )
-                        || crate::settings::equivalence::reconciliation_property_is_unknown_when_absent(name)
-                            && !expected.contains_key(name)
-                        || crate::settings::equivalence::reconciliation_property_is_unreadable(
-                            database, class_name, name,
-                        ) && (!observed.contains_key(name) || !expected.contains_key(name))
-                        || crate::editor::review::is_engine_managed_editor_property(
-                            class_name, name, database,
-                        ) && !observed.contains_key(name))
+                    && !crate::settings::equivalence::reconciliation_property_compares(
+                        Some(database),
+                        class_name,
+                        name,
+                        observed
+                            .get(name)
+                            .or_else(|| expected.get(name))
+                            .unwrap_or(&Value::Null),
+                        observed.contains_key(name),
+                        expected.contains_key(name),
+                    )
                 {
                     continue;
                 }
