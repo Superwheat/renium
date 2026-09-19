@@ -62,9 +62,15 @@ do
 		"An auto-populated value must not replace a different explicitly requested value")
 end
 
-assert(not source:find("CreateMeshPartAsync", 1, true), "forward writes must not download donor geometry")
+do
+	local cookBegin = assert(source:find("local function cookMeshPart(", 1, true))
+	local cookEnd = assert(source:find("local function setTagForSync(", cookBegin, true))
+	local _, total = source:gsub("CreateMeshPartAsync", "")
+	local _, inCook = source:sub(cookBegin, cookEnd - 1):gsub("CreateMeshPartAsync", "")
+	assert(total == 1 and inCook == 1, "forward writes must not download donor geometry; only an uncooked native mesh loads its asset")
+end
 assert(not source:find("preloadPropertyMeshPartSources", 1, true), "forward writes must not scan for donor meshes")
-print("Mesh content: dependency ordering, Object Content preserved, no donor-loading path")
+print("Mesh content: dependency ordering, Object Content preserved, donor loading only cooks an uncooked native mesh")
 
 do
 	local enumerationCount = 0

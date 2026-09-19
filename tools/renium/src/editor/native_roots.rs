@@ -605,7 +605,25 @@ fn apply_write(
         ),
     );
     result?;
-    finish?;
+    let finish = finish?;
+    // A natively written MeshId skips the engine's mesh load; Studio loads the
+    // asset and applies it so the part stops rendering at its native scale.
+    if finish["needsMeshCook"] == true {
+        let cooked = bridge.call_for_runtime_with_timeout(
+            "getEditorTransactionState",
+            serde_json::json!({"transactionId": transaction_id, "nativeRootWrite": write.index, "cookNativeRootWrite": true}),
+            BridgeTarget::Edit,
+            &info.runtime_id,
+            Some(std::time::Duration::from_secs(90)),
+        )?;
+        ensure!(
+            cooked["cooked"] == true,
+            "Studio could not load the mesh {text} for {}.{}, which would leave it rendered at the asset's native size: {}",
+            path_segments.join("."),
+            write.name,
+            cooked["cookError"].as_str().unwrap_or("unknown error")
+        );
+    }
     Ok(())
 }
 

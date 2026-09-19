@@ -2626,8 +2626,10 @@ pub(crate) fn reconciliation_property_is_unreadable(
     )
 }
 
+// MeshSize is what the engine measured once a mesh loaded; a record without
+// it (a file import) says nothing about the loaded mesh.
 pub(crate) fn reconciliation_property_is_unknown_when_absent(name: &str) -> bool {
-    matches!(name, "CollisionFidelity" | "ClockTime")
+    matches!(name, "CollisionFidelity" | "ClockTime" | "MeshSize")
 }
 
 pub(crate) fn reconciliation_property_value_is_default(
