@@ -80,3 +80,8 @@ codegen-units = 16
 
 [profile.release.package.renium]
 codegen-units = 64
+
+[profile.fast]
+inherits = "release"
+lto = "off"
+codegen-units = 256
