@@ -20,7 +20,7 @@ use crate::project::config::{self, LoadedProject, PROJECT_FILE_NAME};
 use crate::project::experience::resolve_experience_place;
 use crate::system::files::{
     absolutize_for_daemon as absolute_path, atomic_write_file, ends_with_ignore_ascii_case,
-    exact_path_key as path_text, resolved_current_executable, write_bytes_if_changed,
+    exact_path_key as path_text, write_bytes_if_changed,
 };
 
 mod build_watch;
@@ -32,8 +32,6 @@ use build_watch::{package_uses_roblox_ts, roblox_ts_command, should_run_tool, wa
 const CLI_DOCS: &str = include_str!("../../../README.md");
 const AGENT_POINTER: &str =
     include_str!("../../../../renium-vscode-extension/resources/RENIUM.pointer.md");
-const AGENT_INSTRUCTIONS_FILE: &str = "renium-agents.md";
-const AGENT_GUIDES_DIRECTORY: &str = "renium-guides";
 const PROJECT_INSTRUCTIONS_FILE: &str = "RENIUM.md";
 const PROJECT_GUIDES_DIRECTORY: &str = "RENIUM";
 const AGENT_VERSION_PREFIX: &str = "<!-- renium-version: ";
@@ -1153,34 +1151,55 @@ pub(crate) fn refresh_outdated_agent_instructions(project: Option<&Path>) -> Res
     Ok(true)
 }
 
+const EMBEDDED_AGENT_INSTRUCTIONS: &str = include_str!("../../../renium-agents.md");
+const EMBEDDED_AGENT_GUIDES: &[(&str, &str)] = &[
+    (
+        "advanced.md",
+        include_str!("../../../renium-guides/advanced.md"),
+    ),
+    (
+        "capture-device.md",
+        include_str!("../../../renium-guides/capture-device.md"),
+    ),
+    (
+        "configuration.md",
+        include_str!("../../../renium-guides/configuration.md"),
+    ),
+    ("data.md", include_str!("../../../renium-guides/data.md")),
+    ("input.md", include_str!("../../../renium-guides/input.md")),
+    (
+        "opencloud.md",
+        include_str!("../../../renium-guides/opencloud.md"),
+    ),
+    (
+        "performance.md",
+        include_str!("../../../renium-guides/performance.md"),
+    ),
+    (
+        "playtest.md",
+        include_str!("../../../renium-guides/playtest.md"),
+    ),
+    (
+        "plugins.md",
+        include_str!("../../../renium-guides/plugins.md"),
+    ),
+    (
+        "projects.md",
+        include_str!("../../../renium-guides/projects.md"),
+    ),
+    ("sync.md", include_str!("../../../renium-guides/sync.md")),
+];
+
 fn agent_instructions() -> Result<Vec<u8>> {
-    let installed = resolved_current_executable()
-        .context("Failed to locate the Renium executable")?
-        .parent()
-        .context("The Renium executable has no parent directory")?
-        .join(AGENT_INSTRUCTIONS_FILE);
-    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join(AGENT_INSTRUCTIONS_FILE);
-    let path = [installed, source]
-        .into_iter()
-        .find(|path| path.is_file())
-        .context("Renium is missing renium-agents.md; reinstall Renium")?;
-    let contents = fs::read(&path).with_context(|| format!("Failed to read {}", path.display()))?;
-    let text = std::str::from_utf8(&contents)
-        .with_context(|| format!("{} is not UTF-8", path.display()))?;
-    let version = agent_instruction_version(text).with_context(|| {
-        format!(
-            "{} is missing its Renium version marker; reinstall Renium",
-            path.display()
-        )
-    })?;
+    let version = agent_instruction_version(EMBEDDED_AGENT_INSTRUCTIONS)
+        .context("The embedded agent instructions are missing their Renium version marker")?;
     if version != env!("CARGO_PKG_VERSION") {
         bail!(
-            "{} contains Renium guide version {version}, but this executable is version {}; reinstall Renium",
-            path.display(),
+            "The embedded agent instructions carry version {version}, but this executable is version {}",
             env!("CARGO_PKG_VERSION")
         );
     }
-    let mut contents = contents;
+    let mut contents = EMBEDDED_AGENT_INSTRUCTIONS.as_bytes().to_vec();
     if !contents.ends_with(b"\n") {
         contents.push(b'\n');
     }
@@ -1202,34 +1221,11 @@ fn agent_instruction_version(contents: &str) -> Option<&str> {
         .strip_suffix(AGENT_VERSION_SUFFIX)
 }
 
-fn agent_guides_directory() -> Result<PathBuf> {
-    let installed = resolved_current_executable()
-        .context("Failed to locate the Renium executable")?
-        .parent()
-        .context("The Renium executable has no parent directory")?
-        .join(AGENT_GUIDES_DIRECTORY);
-    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join(AGENT_GUIDES_DIRECTORY);
-    [installed, source]
-        .into_iter()
-        .find(|path| path.is_dir())
-        .context("Renium is missing its agent topic guides; reinstall Renium")
-}
-
 fn agent_guides() -> Result<Vec<(PathBuf, Vec<u8>)>> {
-    let directory = agent_guides_directory()?;
-    let mut entries = fs::read_dir(&directory)
-        .with_context(|| format!("Failed to read {}", directory.display()))?
-        .collect::<std::io::Result<Vec<_>>>()?;
-    entries.sort_by_key(|entry| entry.file_name());
-    let mut guides = Vec::with_capacity(entries.len());
-    for entry in entries {
-        if entry.file_type()?.is_file()
-            && entry.path().extension().and_then(OsStr::to_str) == Some("md")
-        {
-            guides.push((PathBuf::from(entry.file_name()), fs::read(entry.path())?));
-        }
-    }
-    Ok(guides)
+    Ok(EMBEDDED_AGENT_GUIDES
+        .iter()
+        .map(|(name, contents)| (PathBuf::from(name), contents.as_bytes().to_vec()))
+        .collect())
 }
 
 fn merged_instruction_file(path: &Path) -> Result<Vec<u8>> {
