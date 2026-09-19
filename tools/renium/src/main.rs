@@ -2,7 +2,7 @@ use std::ffi::OsStr;
 use std::path::Path;
 use std::process::ExitCode;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::FromArgMatches;
 use serde_json::json;
 
@@ -109,9 +109,43 @@ fn main_result() -> ExitCode {
     }
 }
 
+fn arguments_after_leading_root() -> Result<Vec<std::ffi::OsString>> {
+    let mut arguments: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let Some(first) = arguments.get(1).and_then(|value| value.to_str()) else {
+        return Ok(arguments);
+    };
+    let (root, consumed) = if matches!(first, "-r" | "--root" | "--project-root") {
+        match arguments.get(2) {
+            Some(path) => (std::path::PathBuf::from(path), 2),
+            None => return Ok(arguments),
+        }
+    } else if let Some(path) = first
+        .strip_prefix("--root=")
+        .or_else(|| first.strip_prefix("--project-root="))
+    {
+        (std::path::PathBuf::from(path), 1)
+    } else {
+        return Ok(arguments);
+    };
+    arguments.drain(1..=consumed);
+    if arguments.len() > 1 {
+        let mut with_flag = arguments.clone();
+        with_flag.push("-r".into());
+        with_flag.push(root.as_os_str().to_owned());
+        if cli::command().try_get_matches_from(&with_flag).is_ok() {
+            return Ok(with_flag);
+        }
+    }
+    std::fs::create_dir_all(&root)
+        .with_context(|| format!("Could not create {}", root.display()))?;
+    std::env::set_current_dir(&root)
+        .with_context(|| format!("Could not enter {}", root.display()))?;
+    Ok(arguments)
+}
+
 fn run_cli() -> Result<()> {
     app::crash::install_hook();
-    let matches = cli::command().get_matches();
+    let matches = cli::command().get_matches_from(arguments_after_leading_root()?);
     let mut cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
     app::output::prime_mode(&cli.output_mode);
     if cli.backtrace {
