@@ -10,7 +10,7 @@ use super::{ProjectSnapshot, SnapshotEntry};
 use crate::system::files::{atomic_write_file, sha256_hex};
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(super) struct StoredSnapshot {
+pub(crate) struct StoredSnapshot {
     entries: BTreeMap<PathBuf, StoredEntry>,
 }
 
