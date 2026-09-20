@@ -13,6 +13,7 @@ rbx f ReplicatedStorage --path Vehicles.Cars -c Model
 rbx tr Workspace Door --depth 2 --limit 100
 rbx in Workspace -i editor:id
 rbx bg Workspace -i editor:id -p Name
+rbx bg Workspace -p Gravity
 rbx ss DataStoreService UpdateAsync --limit 20
 rbx sg RemoteEvent --limit 100
 ```
@@ -26,19 +27,19 @@ Use one lookup on the relevant state: `f` for saved data, `q` for a closed place
 
 ```powershell
 rbx bs Workspace -i editor:id -p Name --str "VIP Man"
-rbx bs Workspace -i editor:id -p Transparency --num 0.5
-rbx bs Workspace -i editor:id -p Anchored --bool true
+rbx bs Workspace Lobby.Door -p Transparency --num 0.5
+rbx bs Workspace -p Gravity --num 120
 rbx bs Workspace -i editor:id -p Reviewed --scope attribute --bool true
 rbx ba Workspace -n NewModel -c Model
-rbx ba Workspace -I editor:parent -n NewPart -c Part
+rbx ba Workspace -I Lobby.Props -n NewPart -c Part
 rbx bss Workspace -i editor:script --str "return 1"
 rbx bcl Workspace -i editor:source -I editor:parent
 rbx mv Workspace -i editor:id -I editor:parent
 rbx mv StarterGui -i editor:id --to-service ReplicatedStorage -I editor:parent
-rbx br Workspace -i editor:id
+rbx br Workspace Lobby.OldPart
 ```
 
-Select with `-i`, `-x`, `-n`, `-c`, or `--path`. Duplicates take inline ordinals (`Borders.Border[4]`, the form compact output prints) or `--ords`.
+Every store command takes the target the same way: a positional name or dotted path (`Lobby.Door`), `-i ID`, `-x INDEX`, `-n NAME` or `-c CLASS`. `bg`/`bs` with no target address the service itself. Parent options (`-I`) take an ID or a dotted path. Duplicates take inline ordinals (`Borders.Border[4]`, the form compact output prints) or `--ords`.
 Use a service name or `-f STORE`, not both.
 
 Values: `--str`, `--num`, `--bool`, `--null`, or `-j JSON`. Use `-j -` to read JSON from stdin, including values too large for the OS command line.

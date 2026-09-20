@@ -278,7 +278,7 @@ fn bytecode_batch_instance_index(
         if default_to_service_root {
             return Ok(editor_service_root_index(document, service));
         }
-        bail!("Provide one selector: index, settingsId, name, className, or pathSegments")
+        bail!("Select the instance: id, path, index, name or className")
     }
     let selector = bytecode_selector(
         op.index,

@@ -19,6 +19,69 @@ pub(crate) fn bytecode_selector_specified(
         || class_name.is_some_and(|value| !value.is_empty())
 }
 
+/// The name of the service a store describes: its single root instance.
+pub(crate) fn document_root_service_name(document: &SettingsBytecode) -> &str {
+    document
+        .instances
+        .iter()
+        .find(|instance| instance.parent_index.is_none())
+        .map_or("", |instance| instance.name.as_str())
+}
+
+/// Resolves the target form every store command accepts: an instance name
+/// when it is unique in the store, otherwise a dotted path with optional
+/// `Name[n]` ordinals or a JSON string array.
+pub(crate) fn resolve_document_target(document: &SettingsBytecode, raw: &str) -> Result<usize> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        bail!("Target cannot be empty");
+    }
+    let path_like = raw.starts_with('[')
+        || raw.ends_with(']')
+        || raw.chars().any(|ch| matches!(ch, '/' | '\\' | '.'));
+    if !path_like {
+        let named = document
+            .instances
+            .iter()
+            .enumerate()
+            .filter_map(|(index, instance)| (instance.name == raw).then_some(index))
+            .collect::<Vec<_>>();
+        match named.len() {
+            1 => return Ok(named[0]),
+            0 => {}
+            count => bail!(
+                "{count} instances are named {raw:?}; give a dotted path such as Parent.{raw}, -i ID or -x INDEX"
+            ),
+        }
+    }
+    let (segments, ordinals) = if raw.starts_with('[') {
+        (super::parse_bracket_path_segments(raw)?, Vec::new())
+    } else {
+        super::split_inline_ordinals(super::high_level_split_path(raw))
+    };
+    let segments = super::ensure_bytecode_service_path_segments(
+        &segments,
+        document_root_service_name(document),
+    );
+    document_instance_index_by_path_unique(document, &segments, &ordinals)
+}
+
+/// A settings ID (`editor:5b78`) or any target form `resolve_document_target` takes.
+pub(crate) fn resolve_document_id_or_target(
+    document: &SettingsBytecode,
+    raw: &str,
+) -> Result<usize> {
+    let raw = raw.trim();
+    if raw.contains(':') {
+        return document
+            .instances
+            .iter()
+            .position(|instance| instance.settings_id == raw)
+            .with_context(|| format!("No instance with id {raw}"));
+    }
+    resolve_document_target(document, raw)
+}
+
 pub(crate) fn bytecode_selector<'a>(
     index: Option<usize>,
     settings_id: Option<&'a str>,
@@ -55,7 +118,9 @@ pub(crate) fn bytecode_selector<'a>(
     }
     match (count, selector) {
         (1, Some(selector)) => Ok(selector),
-        (0, _) => bail!("Provide one selector: --index, --settings-id, --name, or --class-name"),
+        (0, _) => bail!(
+            "Select the instance: a name or dotted path (Lobby.Door), -i ID, -x INDEX, -n NAME or -c CLASS"
+        ),
         _ => bail!("Provide only one selector; --name and --class-name may be combined"),
     }
 }
@@ -108,6 +173,20 @@ pub(crate) fn bytecode_parent_index(
     name: Option<&str>,
     class_name: Option<&str>,
 ) -> Result<Option<usize>> {
+    let parent_target = settings_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.contains(':'));
+    let resolved_parent = parent_target
+        .map(|raw| resolve_document_target(document, raw))
+        .transpose()?;
+    let (index, settings_id) = if resolved_parent.is_some() {
+        if index.is_some() {
+            bail!("Provide only one parent selector");
+        }
+        (resolved_parent, None)
+    } else {
+        (index, settings_id)
+    };
     if no_parent {
         let specified = bytecode_selector_specified(index, settings_id, name, class_name);
         if specified {

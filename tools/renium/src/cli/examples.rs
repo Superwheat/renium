@@ -180,7 +180,10 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ),
     ("tr", "Examples:\n  rbx tr Workspace Door --depth 2"),
     ("in", "Examples:\n  rbx in Workspace -i editor:item"),
-    ("bg", "Examples:\n  rbx bg Workspace -i editor:item -p Name"),
+    (
+        "bg",
+        "Examples:\n  rbx bg Workspace -i editor:item -p Name\n  rbx bg Workspace Lobby.Door -p Anchored\n  rbx bg Workspace -p Gravity",
+    ),
     (
         "bs",
         "Examples:\n  rbx bs Workspace -i editor:item -p Name --str Gate",
@@ -201,7 +204,10 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
         "bcl",
         "Examples:\n  rbx bcl Workspace -i editor:source -I editor:parent",
     ),
-    ("br", "Examples:\n  rbx br Workspace -i editor:item"),
+    (
+        "br",
+        "Examples:\n  rbx br Workspace -i editor:item\n  rbx br Workspace Lobby.OldPart",
+    ),
     (
         "bem",
         "Examples:\n  rbx bem Workspace -i editor:model -o model.rbxm",

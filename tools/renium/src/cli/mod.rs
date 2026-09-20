@@ -896,7 +896,7 @@ pub(super) struct FindArgs {
     #[arg(help = "Match class name", short, long, alias = "class")]
     pub(super) class_name: Option<String>,
     #[arg(
-        help = "Search only this parent's subtree",
+        help = "Search only this subtree (settings ID or dotted path)",
         short = 'I',
         long,
         alias = "parent-id"
@@ -1327,7 +1327,12 @@ pub(super) struct CreateInstanceArgs {
 pub(super) struct ProjectInstanceArgs {
     #[arg(help = "Service that owns the target")]
     pub(super) service: String,
-    #[arg(help = "Target settings ID", short = 'i', long, alias = "id")]
+    #[arg(
+        help = "Target settings ID or dotted path",
+        short = 'i',
+        long,
+        alias = "id"
+    )]
     pub(super) settings_id: String,
     #[arg(
         help = "Project root directory",
@@ -1343,7 +1348,7 @@ pub(super) struct CloneInstanceCommandArgs {
     #[command(flatten)]
     pub(super) target: ProjectInstanceArgs,
     #[arg(
-        help = "Destination parent settings ID",
+        help = "Destination parent settings ID or dotted path",
         short = 'I',
         long,
         alias = "parent-id"
@@ -1360,7 +1365,7 @@ pub(super) struct MoveInstanceArgs {
     #[arg(help = "Move into this service", long = "to-service")]
     pub(super) target_service: Option<String>,
     #[arg(
-        help = "New parent settings ID",
+        help = "New parent settings ID or dotted path",
         short = 'I',
         long,
         alias = "parent-id"
@@ -2197,6 +2202,8 @@ impl BytecodeFileArgs {
 
 #[derive(Args)]
 pub(super) struct BytecodeInstanceSelectorArgs {
+    #[arg(help = "Target name or dotted path (Lobby.Door, Borders.Border[4])")]
+    pub(super) target: Option<String>,
     #[arg(help = "Select by settings ID", short = 'i', long, alias = "id")]
     pub(super) settings_id: Option<String>,
     #[arg(help = "Select by store index", short = 'x', long)]
@@ -2206,7 +2213,7 @@ pub(super) struct BytecodeInstanceSelectorArgs {
     #[arg(help = "Select by class name", short, long, alias = "class")]
     pub(super) class_name: Option<String>,
     #[arg(
-        help = "Select by path (JSON string array); add --ords for duplicates",
+        help = "Select by path, dotted or as a JSON string array; add --ords for duplicates",
         long = "path",
         alias = "path-segments",
         alias = "path-segments-json"
@@ -2225,6 +2232,7 @@ pub(super) struct BytecodeInstanceSelectorArgs {
 impl Default for BytecodeInstanceSelectorArgs {
     fn default() -> Self {
         Self {
+            target: None,
             settings_id: None,
             index: None,
             name: None,
@@ -2509,7 +2517,12 @@ pub(super) struct BytecodeAddInstanceArgs {
 pub(super) struct BytecodeParentArgs {
     #[arg(help = "Parent store index", short = 'x', long)]
     pub(super) parent_index: Option<usize>,
-    #[arg(help = "Parent settings ID", short = 'I', long, alias = "parent-id")]
+    #[arg(
+        help = "Parent settings ID or dotted path",
+        short = 'I',
+        long,
+        alias = "parent-id"
+    )]
     pub(super) parent_settings_id: Option<String>,
     #[arg(help = "Parent exact name", short = 'N', long)]
     pub(super) parent_name: Option<String>,
@@ -2529,7 +2542,12 @@ pub(super) struct BytecodeCloneInstanceArgs {
     pub(super) selector: BytecodeInstanceSelectorArgs,
     #[arg(help = "Parent store index", short = 'X', long)]
     pub(super) parent_index: Option<usize>,
-    #[arg(help = "Parent settings ID", short = 'I', long, alias = "parent-id")]
+    #[arg(
+        help = "Parent settings ID or dotted path",
+        short = 'I',
+        long,
+        alias = "parent-id"
+    )]
     pub(super) parent_settings_id: Option<String>,
     #[arg(help = "Parent exact name", short = 'N', long)]
     pub(super) parent_name: Option<String>,

@@ -84,33 +84,34 @@ pub(crate) fn load_structural_project(
     })
 }
 
+/// Returns the target's projected path plus the settings ID it resolved to,
+/// so a dotted path given in place of an ID works everywhere an ID does.
 fn projected_structural_target(
     stage: &config::ProjectionStage,
     service: &str,
-    settings_id: Option<&str>,
-) -> Result<(Vec<String>, Vec<usize>)> {
+    target: Option<&str>,
+) -> Result<(Vec<String>, Vec<usize>, Option<String>)> {
     let settings = service_settings_path(&stage.root().join(service));
-    if settings_id.is_none() {
-        return Ok((vec![service.to_string()], vec![1]));
-    }
+    let Some(target) = target else {
+        return Ok((vec![service.to_string()], vec![1], None));
+    };
     if !settings.is_file() {
         bail!("Projected service '{service}' has no Renium store");
     }
     let document = SettingsBytecode::read_file(&settings)?;
-    let settings_id = settings_id.unwrap_or_default();
-    let index = document
-        .instances
-        .iter()
-        .position(|instance| instance.settings_id == settings_id)
-        .with_context(|| {
-            format!("Projected service '{service}' has no instance id '{settings_id}'")
-        })?;
+    let index = crate::bytecode::query::resolve_document_id_or_target(&document, target)
+        .with_context(|| format!("Projected service '{service}' has no instance '{target}'"))?;
+    let settings_id = document.instances[index].settings_id.clone();
     let paths = build_editor_instance_paths(&document, service);
     let path = paths
         .get(index)
         .and_then(Option::as_ref)
         .with_context(|| format!("Cannot resolve the projected path for '{settings_id}'"))?;
-    Ok((path.path_segments.clone(), path.path_ordinals.clone()))
+    Ok((
+        path.path_segments.clone(),
+        path.path_ordinals.clone(),
+        Some(settings_id),
+    ))
 }
 
 fn projected_structural_store(
@@ -121,7 +122,9 @@ fn projected_structural_store(
     reject_declarative_target: bool,
     override_packages: bool,
 ) -> Result<(PathBuf, Vec<String>, Option<String>)> {
-    let (target, target_ordinals) = projected_structural_target(stage, service, settings_id)?;
+    let (target, target_ordinals, resolved_id) =
+        projected_structural_target(stage, service, settings_id)?;
+    let settings_id = resolved_id.as_deref();
     build_loaded_project_link_enforcement(loaded, override_packages)?
         .reject_read_only_package_path(service, &target, &target_ordinals)?;
     if settings_id.is_none() && target_ordinals.iter().any(|ordinal| *ordinal > 1) {

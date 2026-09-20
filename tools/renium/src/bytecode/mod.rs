@@ -819,6 +819,22 @@ pub(super) fn resolve_bytecode_selector(
     selector: &BytecodeInstanceSelectorArgs,
     not_found: &str,
 ) -> Result<ResolvedBytecodeSelector> {
+    if let Some(target) = selector
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if bytecode_selector_args_specified(selector) {
+            bail!(
+                "Give the target once: as the positional argument, --path or one selector option"
+            );
+        }
+        return Ok(ResolvedBytecodeSelector {
+            index: query::resolve_document_target(document, target)?,
+            path_segments: None,
+        });
+    }
     let path_segments =
         parse_bytecode_path_segments(selector.path_segments_json.as_deref(), service)?;
     let path_ordinals = if path_segments.is_some() {
@@ -842,6 +858,49 @@ pub(super) fn resolve_bytecode_selector(
         index,
         path_segments,
     })
+}
+
+/// Property reads and writes without a selector address the service itself,
+/// so `bg Workspace -p Gravity` works like `in Workspace`.
+pub(super) fn resolve_bytecode_selector_or_service_root(
+    document: &SettingsBytecode,
+    service: &str,
+    selector: &BytecodeInstanceSelectorArgs,
+    not_found: &str,
+) -> Result<ResolvedBytecodeSelector> {
+    let unselected = !service.is_empty()
+        && selector
+            .target
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        && !bytecode_selector_args_specified(selector);
+    if unselected && let Some(index) = editor_service_root_index(document, service) {
+        return Ok(ResolvedBytecodeSelector {
+            index,
+            path_segments: None,
+        });
+    }
+    resolve_bytecode_selector(document, service, selector, not_found)
+}
+
+fn bytecode_selector_args_specified(selector: &BytecodeInstanceSelectorArgs) -> bool {
+    selector
+        .path_segments_json
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || selector.index.is_some()
+        || selector
+            .settings_id
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        || selector
+            .name
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        || selector
+            .class_name
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
 }
 
 pub(super) fn ensure_bytecode_service_path_segments(
@@ -1265,6 +1324,14 @@ pub(super) fn find_command(args: FindArgs) -> Result<()> {
         bail!("Provide a query or filter: find <SERVICE> <QUERY> or find <SERVICE> --class Script");
     }
 
+    let scope_parent = args
+        .parent_settings_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if scope_path.is_some() && scope_parent.is_some() {
+        bail!("Scope the search with --path or -I, not both");
+    }
     let scope = match scope_path {
         Some(path) => {
             let target = HighLevelTarget {
@@ -1287,14 +1354,20 @@ pub(super) fn find_command(args: FindArgs) -> Result<()> {
                 }
             }
         }
-        None => None,
+        None => scope_parent
+            .map(|raw| {
+                query::resolve_document_id_or_target(&ctx.document, raw).map(|root_index| {
+                    high_level_visible_tree(&ctx.children_by_parent, root_index, usize::MAX)
+                })
+            })
+            .transpose()?,
     };
 
     let structured_matches = has_structured_filters.then(|| {
         let query = InstanceQuery {
             name: args.name,
             class_name: args.class_name,
-            parent_settings_id: args.parent_settings_id,
+            parent_settings_id: None,
             tag: args.tag,
             properties,
             attributes,
@@ -1432,8 +1505,13 @@ pub(super) fn bytecode_get_property(args: BytecodeGetPropertyArgs) -> Result<()>
     let direct = read_bytecode_document_if_present(&settings_file, &service_hint)?;
     let use_project = projected_service.is_some()
         && direct.as_ref().is_none_or(|(document, service)| {
-            resolve_bytecode_selector(document, service, &args.selector, "No matching instance")
-                .is_err()
+            resolve_bytecode_selector_or_service_root(
+                document,
+                service,
+                &args.selector,
+                "No matching instance",
+            )
+            .is_err()
         });
     let (document, service, source_paths, canonical_settings_ids) = if use_project {
         let service = projected_service.context("Project service is missing")?;
@@ -1450,9 +1528,13 @@ pub(super) fn bytecode_get_property(args: BytecodeGetPropertyArgs) -> Result<()>
         (document, service, None, None)
     };
     let scope = parse_property_scope(&args.scope)?;
-    let index =
-        resolve_bytecode_selector(&document, &service, &args.selector, "No matching instance")?
-            .index;
+    let index = resolve_bytecode_selector_or_service_root(
+        &document,
+        &service,
+        &args.selector,
+        "No matching instance",
+    )?
+    .index;
     if args.property.eq_ignore_ascii_case("source")
         && is_lua_source_class(&document.instances[index].class_name)
     {
@@ -1596,8 +1678,12 @@ pub(super) fn bytecode_set_property(args: BytecodeSetPropertyArgs) -> Result<()>
         }
         qualify_reference_targets(&mut value, &documents, &unqualified_settings_ids)?;
     }
-    let resolved =
-        resolve_bytecode_selector(&document, &service, &args.selector, "No matching instance")?;
+    let resolved = resolve_bytecode_selector_or_service_root(
+        &document,
+        &service,
+        &args.selector,
+        "No matching instance",
+    )?;
     let index = resolved.index;
     reject_package_link_instance_mutation(&document, index, "edited")?;
     validate_auto_property_name(&document, index, &args.property, scope)?;
