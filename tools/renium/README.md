@@ -198,13 +198,28 @@ For bulk analysis, request fields once and process the result locally:
 Use live Luau only for unsaved Studio state or runtime APIs.
 [Full data guide](renium-guides/data.md).
 
-### Protected properties
+### Protected properties and functions
 
 ```powershell
 rbx access read Workspace StreamingEnabled
 rbx access approve REQUEST_ID
 rbx access write Workspace.Mesh CollisionFidelity Hull
+rbx access call HttpRbxApiService GetAsyncFullUrl '["https://apis.roblox.com/creator-inventory-api/v1/-/creator-inventory-items:search?maxPageSize=25&filter=assetTypes%3DModel%3Bsources%3DCreated"]'
 ```
+
+`access call TARGET FUNCTION '[ARGUMENTS]'` also supports `HttpRbxApiService`
+`GetAsync`, `GetAsyncFullUrl`, `PostAsync`, `PostAsyncFullUrl`, and
+`GetDocumentationUrl`. Function calls use the same exact, one-use approval flow;
+read-only mode rejects them because functions can have side effects. Arguments
+are a JSON array; optional enum arguments use their integer values. Unsupported
+functions fail before execution. Authenticated full URLs must use HTTPS on Roblox.
+No function grant changes ordinary script/plugin permissions. A timed-out call
+may still complete; inspect its result before repeating a mutation.
+
+`access batch TARGET FUNCTION '[[ARGUMENTS], [ARGUMENTS]]'` approves up to 32
+ordered calls together (60 KiB of input, 30-second total deadline). Every argument
+array is validated before execution. It stops at the first failure and reports
+completed, unconfirmed, and unexecuted calls separately; it never retries a call.
 
 On Windows and macOS Edit mode, `access` reads or writes properties blocked by
 ordinary APIs. The default `ask` mode requires approval for the exact operation;

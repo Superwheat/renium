@@ -35,7 +35,7 @@ const LAUNCHER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-s
 const REQUEST_MAGIC: u32 = 0x4d4e4552;
 // Fence property-operation additions as well as the outer serializer header.
 // An already-open Studio can still have an older helper mapped after an update.
-const REQUEST_VERSION: u32 = 7;
+const REQUEST_VERSION: u32 = 8;
 
 fn native_helper_error(error: &str) -> String {
     if error.contains("invalid serializer request")

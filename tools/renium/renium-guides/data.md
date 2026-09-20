@@ -90,6 +90,8 @@ The default `ask` mode returns an exact `approval-required` request for unlisted
 
 Values use Studio's text representation, up to 64 KiB. Writes verify the result and mark affected packages Changed; report `autoDesyncedPackages`. If a write times out, read the value before retrying—it may still finish. Windows and macOS Edit mode only, not play clients.
 
+`access call TARGET FUNCTION '[ARGUMENTS]'` supports HttpRbxApiService's `GetAsync`, `GetAsyncFullUrl`, `PostAsync`, `PostAsyncFullUrl`, and `GetDocumentationUrl`. `access batch TARGET FUNCTION '[[ARGUMENTS], [ARGUMENTS]]'` groups up to 32 ordered calls under one exact approval (60 KiB input, 30-second deadline). Calls require approval in `ask` and are rejected in `read-only`; unsupported functions are rejected before execution. Batches stop on failure, retain completed results, and label unconfirmed and unexecuted calls separately. Never replay a whole partial batch. See the Open Cloud guide for creator inventory and asset sharing.
+
 After a Studio update, Renium rediscovers the native entry points itself. If validation fails, the error names the detector that needs updating; don't force an old address or retry the same failure.
 
 ## Inspect files without importing

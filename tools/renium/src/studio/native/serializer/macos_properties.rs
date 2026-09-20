@@ -946,6 +946,69 @@ pub(crate) struct NativeProperty {
 }
 
 impl NativeProperty {
+    pub(crate) fn prepare_function(
+        &mut self,
+        _pid: u32,
+        _title: &str,
+        name: &str,
+        arguments: &[serde_json::Value],
+    ) -> Result<()> {
+        let mut input = super::super::functions::input(&self.class_name, name, arguments)?;
+        let instance = read_u64(&self.parameters, 8).context("Missing function target")?;
+        let class_offset = read_u64(&self.parameters, 80).context("Missing function class")?;
+        let descriptor = self.memory.member(instance, class_offset, name)?;
+        let signature = self.memory.rtti(descriptor)?;
+        let (kind, tail) = match input.mode {
+            1 => (
+                "18BoundYieldFuncDesc",
+                "S9_NS_18ThrottlingPriorityENS_15HttpRequestTypeEELb0ELi3EEE",
+            ),
+            2 => (
+                "18BoundYieldFuncDesc",
+                "S9_S9_NS_18ThrottlingPriorityENS_5Enums19HttpContentTypeEnum15HttpContentTypeENS_15HttpRequestTypeEELb0ELi5EEE",
+            ),
+            _ => ("13BoundFuncDesc", "S9_ELb0ELi1EEE"),
+        };
+        anyhow::ensure!(
+            signature
+                == format!(
+                    "N3RBX10Reflection{kind}INS_17HttpRbxApiServiceEFNSt3__112basic_stringIcNS3_11char_traitsIcEENS3_9allocatorIcEEEE{tail}"
+                ),
+            "Unsupported native function signature: {signature}"
+        );
+        let table = self.memory.pointer(descriptor)?;
+        anyhow::ensure!(
+            self.memory.pointer(table - 16)? == 0,
+            "Function descriptor is not a complete reflection object"
+        );
+        let mut candidates = Vec::new();
+        for field in (0x40..0xa0).step_by(8) {
+            let function = self.memory.pointer(descriptor + field)?;
+            if self.memory.code(function, 64).is_ok()
+                && self.memory.pointer(descriptor + field + 8)? == 0
+            {
+                candidates.push((field, function));
+            }
+        }
+        anyhow::ensure!(
+            candidates.len() == 1,
+            "Function binding has {} candidates; no call was executed",
+            candidates.len()
+        );
+        let (field, function) = candidates[0];
+        input.bytes[..8].copy_from_slice(&descriptor.to_le_bytes());
+        input.bytes[8..16].copy_from_slice(&table.to_le_bytes());
+        input.bytes[16..20].copy_from_slice(&(field as u32).to_le_bytes());
+        input.bytes[24..32].copy_from_slice(&function.to_le_bytes());
+        put32(&mut self.parameters, 136, input.bytes.len() as u32);
+        self.parameters[680..680 + input.bytes.len()].copy_from_slice(&input.bytes);
+        Ok(())
+    }
+
+    pub(crate) fn call_function(&mut self, timeout: Duration) -> Result<String> {
+        self.memory.deadline = Instant::now() + timeout.min(Duration::from_secs(30));
+        String::from_utf8(self.invoke(9)?[16..].to_vec()).context("Function response is not UTF-8")
+    }
     pub(crate) fn ensure_writable(&self) -> Result<()> {
         anyhow::ensure!(
             self.writable,
@@ -970,7 +1033,10 @@ impl NativeProperty {
                 self.memory.pid, self.class_name, self.property, self.title,
             ),
         );
-        let timeout = self.remaining()?.as_millis().clamp(1, 3000) as u32;
+        let timeout = self
+            .remaining()?
+            .as_millis()
+            .clamp(1, if operation == 9 { 30000 } else { 3000 }) as u32;
         put32(&mut self.parameters, 132, operation);
         put32(&mut self.parameters, 140, timeout);
         let output = self

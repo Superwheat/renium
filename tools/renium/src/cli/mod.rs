@@ -408,7 +408,7 @@ pub(super) enum Commands {
     NetworkSimulation(crate::studio::automation::network::NetworkArgs),
     #[command(
         name = "access",
-        about = "Control access to security-protected Studio properties"
+        about = "Control access to security-protected Studio properties and functions"
     )]
     PropertyAccess(crate::studio::automation::property_access::PropertyAccessArgs),
     #[command(

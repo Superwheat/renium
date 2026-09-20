@@ -66,6 +66,14 @@ rbx oc thumbnail upload-status -q operationIds=OPERATION_1 -q operationIds=OPERA
 
 ## Products, passes, and assets
 
+For creator inventory reads that need Studio's existing login, use
+`rbx access call HttpRbxApiService GetAsyncFullUrl '["https://apis.roblox.com/creator-inventory-api/v1/-/creator-inventory-items:search?maxPageSize=25&filter=assetTypes%3DModel%3Bsources%3DCreated"]'`,
+then `rbx access approve REQUEST_ID` for that exact call. The response is in `value`;
+pass each `nextPageToken` as `pageToken` until absent. Query asset types separately;
+add `;groupIds=GROUP_ID` inside the URL-encoded filter for group uploads.
+This does not change Roblox's owner permissions. Use `oc asset permissions` for
+authorized sharing; its key needs `asset-permissions:write`.
+
 ```powershell
 rbx oc product list
 rbx oc product get PRODUCT_ID

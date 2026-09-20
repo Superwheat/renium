@@ -1,7 +1,7 @@
 pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     (
         "access",
-        "Examples:\n  rbx access mode\n  rbx access mode ask\n  rbx access mode read-only\n  rbx access mode read-write --accept-risk",
+        "Examples:\n  rbx access mode\n  rbx access read Workspace StreamingEnabled\n  rbx access call HttpRbxApiService GetDocumentationUrl '[\"studio\"]'\n  rbx access batch HttpRbxApiService GetDocumentationUrl '[[\"studio\"],[\"cloud\"]]'\n  rbx access approve REQUEST_ID",
     ),
     (
         "perf",

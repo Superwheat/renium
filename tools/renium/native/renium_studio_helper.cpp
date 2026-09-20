@@ -1384,10 +1384,13 @@ struct PropertyReadParams
 };
 static_assert(sizeof(PropertyReadParams) == 132048);
 
+#include "renium_studio_functions.h"
+
 struct PropertyReadTask
 {
     PropertyReadParams result{};
     std::string extraInput;
+    std::shared_ptr<renium_functions::Completion> function;
     HANDLE completed = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     std::uint64_t deadline = 0;
     ~PropertyReadTask() { if (completed) CloseHandle(completed); }
@@ -1436,6 +1439,15 @@ static void ReadPropertyCore(PropertyReadTask* task)
         // write; subsequent ordinary reads/writes still require that identity.
         if (p.operation != 3 && memcmp(p.identity, p.expectedIdentity, sizeof(p.identity)))
             throw std::runtime_error("property target was replaced; request access again");
+        if (p.operation == 9) {
+            task->function = renium_functions::Begin(reinterpret_cast<void*>(p.target), targetHold,
+                p.input, p.inputSize, [](std::uintptr_t address, void* output, std::size_t size) {
+                    SIZE_T copied = 0;
+                    return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), output, size, &copied) && copied == size;
+                });
+            p.status = 4;
+            return;
+        }
         if (p.operation == 6)
         {
             renium_history::Binding binding{};
@@ -1539,13 +1551,13 @@ static DWORD RunPropertyRead(PropertyReadParams* params)
     if (!params || !params->taskContext || !params->submitTask || !params->target ||
         !params->owner || !params->dataModelOwner || !params->descriptor || !params->getter ||
         !params->classDescriptor || !params->descriptorVtable || params->classOffset > 0x100 ||
-        !params->identityBinding || !params->identityGetter || (params->operation > 3 && params->operation != 6 && params->operation != 7 && params->operation != 8) ||
+        !params->identityBinding || !params->identityGetter || (params->operation > 3 && params->operation != 6 && params->operation != 7 && params->operation != 8 && params->operation != 9) ||
         (params->operation == 2 && !params->setter) || params->inputSize > sizeof(params->input) ||
         params->extraInputSize > 128 * 1024 * 1024 ||
         (params->operation == 7 ? (!params->extraInput || !params->extraInputSize) : params->extraInputSize != 0) ||
         params->parentOffset > 0x200 || params->selfOffset > 0x80 || params->ancestorCount < 2 || params->ancestorCount > 65 ||
         params->ancestors[0] != params->target ||
-        !params->timeoutMs || params->timeoutMs > 3000)
+        !params->timeoutMs || params->timeoutMs > (params->operation == 9 ? 30000 : 3000))
         return 0xE401;
     auto modelOwner = reinterpret_cast<void*>(params->dataModelOwner);
     if (!AddOwnerReference(modelOwner)) return 0xE402;
@@ -1566,6 +1578,11 @@ static DWORD RunPropertyRead(PropertyReadParams* params)
     const auto remaining = RemainingMilliseconds(task->deadline);
     if (!remaining || WaitForSingleObject(task->completed, remaining) != WAIT_OBJECT_0)
         return 0xE40F;
+    if (task->result.status == 4 && params->operation == 9) {
+        const auto value = task->function->Wait(std::chrono::milliseconds(RemainingMilliseconds(task->deadline)));
+        task->result.outputSize = static_cast<std::uint32_t>(value.size());
+        std::memcpy(task->result.output, value.data(), value.size());
+    }
     *params = task->result;
     return params->status == 4 ? 0 : params->status;
 }

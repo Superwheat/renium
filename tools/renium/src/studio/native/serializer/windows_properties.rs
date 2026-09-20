@@ -392,6 +392,85 @@ pub(crate) struct NativeProperty {
 }
 
 impl NativeProperty {
+    pub(crate) fn prepare_function(
+        &mut self,
+        pid: u32,
+        title: &str,
+        name: &str,
+        arguments: &[serde_json::Value],
+    ) -> Result<()> {
+        let mut input = super::super::functions::input(&self.class_name, name, arguments)?;
+        let current = modules(pid)?;
+        let studio = current
+            .iter()
+            .find(|module| module.name.eq_ignore_ascii_case("RobloxStudioBeta.exe"))
+            .context("Studio module missing")?;
+        let layout = package_layout(&studio.path)?;
+        let model = active_data_model(pid, &self.memory, studio, layout.data, title)?;
+        anyhow::ensure!(
+            read_u64(&self.parameters, 32)? == model.owner as u64,
+            "Function DataModel was replaced"
+        );
+        let target = read_u64(&self.parameters, 16)? as usize;
+        let descriptor = find_class_member_descriptor(&self.memory, target, model.layout, name)?;
+        let signature = read_rtti_type(&self.memory, descriptor, studio.base, studio.size)
+            .context("Function descriptor has no RTTI")?;
+        let string = "?AV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@";
+        let (kind, tail) = match input.mode {
+            1 => (
+                "BoundYieldFuncDesc",
+                "V34@W4ThrottlingPriority@2@W4HttpRequestType@2@@Z$0A@$02@Reflection@RBX@@",
+            ),
+            2 => (
+                "BoundYieldFuncDesc",
+                "V34@0W4ThrottlingPriority@2@W4HttpContentType@HttpContentTypeEnum@Enums@2@W4HttpRequestType@2@@Z$0A@$04@Reflection@RBX@@",
+            ),
+            _ => ("BoundFuncDesc", "V34@@Z$0A@$00@Reflection@RBX@@"),
+        };
+        anyhow::ensure!(
+            signature == format!(".?AV?${kind}@VHttpRbxApiService@RBX@@$$A6A{string}{tail}"),
+            "Unsupported native function signature: {signature}"
+        );
+        let table = self.memory.read_u64(descriptor)? as usize;
+        let locator = self.memory.read_u64(table - 8)? as usize;
+        anyhow::ensure!(
+            self.memory.read_u32(locator + 4)? == 0
+                && studio
+                    .base
+                    .checked_add(self.memory.read_u32(locator + 20)? as usize)
+                    == Some(locator),
+            "Function descriptor is not a complete reflection object"
+        );
+        let mut candidates = Vec::new();
+        for field in (0x40..0xa0).step_by(8) {
+            let function = self.memory.read_u64(descriptor + field)? as usize;
+            if verified_code(&self.memory, studio, &layout, function, 64).is_ok()
+                && self.memory.read_u32(descriptor + field + 8)? == 0
+            {
+                candidates.push((field, function));
+            }
+        }
+        anyhow::ensure!(
+            candidates.len() == 1,
+            "Function binding has {} candidates; no call was executed",
+            candidates.len()
+        );
+        let (field, function) = candidates[0];
+        input.bytes[..8].copy_from_slice(&(descriptor as u64).to_le_bytes());
+        input.bytes[8..16].copy_from_slice(&(table as u64).to_le_bytes());
+        input.bytes[16..20].copy_from_slice(&(field as u32).to_le_bytes());
+        input.bytes[24..32].copy_from_slice(&(function as u64).to_le_bytes());
+        put_u32(&mut self.parameters, 65916, input.bytes.len() as u32);
+        self.parameters[INPUT..INPUT + input.bytes.len()].copy_from_slice(&input.bytes);
+        Ok(())
+    }
+
+    pub(crate) fn call_function(&mut self, timeout: Duration) -> Result<String> {
+        self.deadline = Instant::now() + timeout.min(Duration::from_secs(30));
+        self.invoke(9)?;
+        self.value()
+    }
+
     pub(crate) fn ensure_writable(&self) -> Result<()> {
         anyhow::ensure!(
             read_u64(&self.parameters, 65904)? != 0,
@@ -407,7 +486,11 @@ impl NativeProperty {
 
     fn invoke(&mut self, operation: u32) -> Result<()> {
         let remaining = self.remaining()?;
-        let timeout = u32::try_from(remaining.as_millis().clamp(1, 3000))?;
+        let timeout = u32::try_from(
+            remaining
+                .as_millis()
+                .clamp(1, if operation == 9 { 30000 } else { 3000 }),
+        )?;
         put_u32(&mut self.parameters, 80, timeout);
         put_u32(&mut self.parameters, 84, 0);
         put_u32(&mut self.parameters, 65912, operation);

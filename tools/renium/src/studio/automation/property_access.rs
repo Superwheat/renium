@@ -57,6 +57,26 @@ enum Action {
         #[serde(default)]
         ords: Vec<usize>,
     },
+    #[command(about = "Call an engine function with exact, runtime-scoped approval")]
+    Call {
+        target: String,
+        function: String,
+        #[arg(default_value = "[]", value_parser = function_arguments)]
+        arguments: Value,
+        #[arg(long, value_delimiter = ',')]
+        #[serde(default)]
+        ords: Vec<usize>,
+    },
+    #[command(about = "Call one function with up to 32 argument arrays under one exact approval")]
+    Batch {
+        target: String,
+        function: String,
+        #[arg(value_parser = function_arguments)]
+        arguments: Value,
+        #[arg(long, value_delimiter = ',')]
+        #[serde(default)]
+        ords: Vec<usize>,
+    },
     #[command(about = "Approve and execute one exact pending property request")]
     Approve {
         #[arg(allow_hyphen_values = true)]
@@ -73,6 +93,64 @@ fn property_value(raw: &str) -> Result<Value, String> {
     let value = serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.into()));
     value_text(&value).map_err(|error| error.to_string())?;
     Ok(value)
+}
+
+fn function_arguments(raw: &str) -> Result<Value, String> {
+    if raw.len() > 60 * 1024 {
+        return Err("Function arguments exceed 60 KiB".into());
+    }
+    let value: Value = serde_json::from_str(raw)
+        .map_err(|error| format!("Arguments must be a JSON array: {error}"))?;
+    if !value.is_array() {
+        return Err("Arguments must be a JSON array".into());
+    }
+    Ok(value)
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn batch_arguments(value: &Value) -> Result<Vec<Vec<Value>>> {
+    let arrays = value
+        .as_array()
+        .context("Batch arguments must be an array of argument arrays")?;
+    anyhow::ensure!(
+        (1..=32).contains(&arrays.len()) && serde_json::to_vec(value)?.len() <= 60 * 1024,
+        "Function batches require 1–32 calls and at most 60 KiB of arguments"
+    );
+    arrays
+        .iter()
+        .map(|value| {
+            value
+                .as_array()
+                .cloned()
+                .context("Every batch item must be an argument array")
+        })
+        .collect()
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn ordered_function_batch(
+    arguments: &[Vec<Value>],
+    mut call: impl FnMut(&[Value]) -> Result<String>,
+) -> Value {
+    let mut results = Vec::with_capacity(arguments.len());
+    let mut stopped = false;
+    let mut bytes = 0;
+    for (index, arguments) in arguments.iter().enumerate() {
+        if stopped || bytes >= 1024 * 1024 {
+            results.push(json!({"index":index,"status":"not-executed","reason":if stopped {"earlier-call-failed"} else {"response-limit"}}));
+            continue;
+        }
+        let item = match call(arguments) {
+            Ok(value) => json!({"index":index,"status":"applied","value":value}),
+            Err(error) => {
+                stopped = true;
+                json!({"index":index,"status":"unconfirmed","error":format!("{error:#}")})
+            }
+        };
+        bytes += item.to_string().len();
+        results.push(item);
+    }
+    json!(results)
 }
 
 fn value_text(value: &Value) -> Result<String> {
@@ -105,7 +183,13 @@ pub(crate) fn command(args: PropertyAccessArgs) -> Result<()> {
         Some(&args.bridge),
     )?;
     crate::app::output::strip_empty(&mut result);
-    print_json_output(&result, false)
+    print_json_output(&result, false)?;
+    if result["status"] == "partial" {
+        bail!(
+            "Function batch stopped; completed results and the unconfirmed call are shown above. Inspect before retrying"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(any(windows, target_os = "macos", test))]
@@ -237,6 +321,27 @@ fn perform(
                 value_text(&value)?;
                 (target, property, ords, Operation::Write { value })
             }
+            Action::Call {
+                target,
+                function,
+                arguments,
+                ords,
+            } => {
+                let arguments = arguments
+                    .as_array()
+                    .context("Function arguments must be a JSON array")?
+                    .clone();
+                (target, function, ords, Operation::Call { arguments })
+            }
+            Action::Batch {
+                target,
+                function,
+                arguments,
+                ords,
+            } => {
+                let arguments = batch_arguments(&arguments)?;
+                (target, function, ords, Operation::CallBatch { arguments })
+            }
             _ => unreachable!("permission action handled before native invocation"),
         }
     };
@@ -257,7 +362,14 @@ fn perform(
         &title,
         &path,
         &ordinals,
-        &property,
+        if matches!(
+            operation,
+            Operation::Call { .. } | Operation::CallBatch { .. }
+        ) {
+            "Name"
+        } else {
+            &property
+        },
         Duration::from_secs(3),
     )?;
     let intent = Intent {
@@ -268,6 +380,19 @@ fn perform(
         class_name: native.class_name.clone(),
         instance_id: native.instance_id.clone(),
     };
+    if let Operation::Call { arguments } = &intent.operation {
+        native.prepare_function(scope.pid, &title, &intent.property, arguments)?;
+    }
+    if let Operation::CallBatch { arguments } = &intent.operation {
+        for item in arguments {
+            crate::studio::native::serializer::validate_function_arguments(
+                &native.class_name,
+                &intent.property,
+                item,
+            )?;
+        }
+        native.prepare_function(scope.pid, &title, &intent.property, &arguments[0])?;
+    }
     if let Some(approved) = approved {
         if intent != approved {
             bail!("Property target changed since approval; request access again");
@@ -282,9 +407,42 @@ fn perform(
     if bridge.studio_pid_for_runtime(BridgeTarget::Edit, &scope.runtime)? != scope.pid {
         bail!("Protected property runtime was replaced");
     }
+    if matches!(intent.operation, Operation::Call { .. }) {
+        let value = native.call_function(Duration::from_secs(30))?;
+        return Ok(
+            json!({"status":"applied","path":intent.path,"function":intent.property,
+            "className":intent.class_name,"value":value,"runtimeId":scope.runtime}),
+        );
+    }
+    if let Operation::CallBatch { arguments } = &intent.operation {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut result = json!({"status":"applied","path":intent.path,"function":intent.property,
+            "className":intent.class_name,"runtimeId":scope.runtime});
+        result["results"] = ordered_function_batch(arguments, |arguments| {
+            anyhow::ensure!(
+                bridge.studio_pid_for_runtime(BridgeTarget::Edit, &scope.runtime)? == scope.pid,
+                "Function batch runtime was replaced"
+            );
+            native.prepare_function(scope.pid, &title, &intent.property, arguments)?;
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .context("Function batch exceeded its 30-second deadline")?;
+            native.call_function(remaining)
+        });
+        if result["results"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["status"] != "applied"))
+        {
+            result["status"] = json!("partial");
+        }
+        return Ok(result);
+    }
     let before = native.read()?;
     let mut packages = Vec::new();
     let result = match &intent.operation {
+        Operation::Call { .. } | Operation::CallBatch { .. } => {
+            unreachable!("function handled above")
+        }
         Operation::Read => Ok(before.clone()),
         Operation::Write { value } => {
             let text = value_text(value)?;
@@ -448,5 +606,45 @@ mod tests {
         assert!(target_parts("Workspace.Name", &[1]).is_err());
         assert!(target_parts("Workspace.Name", &[1, 0]).is_err());
         assert!(value_text(&json!({"script":"not executable"})).is_err());
+    }
+
+    #[test]
+    fn function_cli_accepts_one_typed_json_array() -> Result<()> {
+        use clap::FromArgMatches;
+        let matches = PropertyAccessArgs::augment_args(clap::Command::new("access"))
+            .try_get_matches_from([
+                "access",
+                "call",
+                "HttpRbxApiService",
+                "GetAsyncFullUrl",
+                r#"["https://apis.roblox.com/x",0,0]"#,
+            ])?;
+        let args = PropertyAccessArgs::from_arg_matches(&matches)?;
+        assert_eq!(
+            serde_json::to_value(args.action)?["arguments"],
+            json!(["https://apis.roblox.com/x", 0, 0])
+        );
+        assert!(function_arguments("{}").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn batches_validate_before_execution_and_stop_without_replaying() {
+        assert!(batch_arguments(&json!([])).is_err());
+        assert!(batch_arguments(&json!([["one"], "two"])).is_err());
+        assert!(batch_arguments(&json!(vec![vec!["x"]; 33])).is_err());
+        let arguments = batch_arguments(&json!([[1], [2], [3]])).unwrap();
+        let mut invoked = Vec::new();
+        let results = ordered_function_batch(&arguments, |arguments| {
+            invoked.push(arguments[0].clone());
+            if arguments[0] == 2 {
+                bail!("response lost")
+            }
+            Ok("first response".into())
+        });
+        assert_eq!(invoked, vec![json!(1), json!(2)]);
+        assert_eq!(results[0]["value"], "first response");
+        assert_eq!(results[1]["status"], "unconfirmed");
+        assert_eq!(results[2]["status"], "not-executed");
     }
 }

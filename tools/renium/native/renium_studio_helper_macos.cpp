@@ -115,7 +115,7 @@ struct DataModelScanStats
 };
 
 static constexpr std::uint32_t Magic = 0x4d4e4552;
-static constexpr std::uint32_t Version = 7;
+static constexpr std::uint32_t Version = 8;
 // Command 3 does not use factoryRva as a function address. Its top bit opts in
 // to per-candidate clocks; older helpers ignore it and keep the same payloads.
 static constexpr std::uint64_t PropertyPhaseTimingFlag = std::uint64_t{1} << 63;
@@ -2553,6 +2553,8 @@ struct PropertyPermit
     }
 };
 struct PropertyModelContext;
+#include "renium_studio_functions.h"
+
 struct PropertyCallTask
 {
     // Released last, after both the waiter and every queued callback dispose
@@ -2561,6 +2563,7 @@ struct PropertyCallTask
     std::shared_ptr<PropertyTiming> timing;
     PropertyCallParams params{};
     std::string extraInput;
+    std::shared_ptr<renium_functions::Completion> function;
     bool prepareOnly = false;
     std::shared_ptr<PropertyModelContext> modelContext;
     std::chrono::steady_clock::time_point deadline;
@@ -2756,7 +2759,11 @@ static void ExecutePropertyCall(const std::shared_ptr<PropertyCallTask>& task)
             if (p.operation != 3 && p.operation != 4 &&
                 std::memcmp(&identity, p.expectedIdentity, sizeof(identity)) != 0)
                 throw std::runtime_error("Protected property instance identity changed");
-            if (p.operation == 6)
+            if (p.operation == 9) {
+                task->function = renium_functions::Begin(reinterpret_cast<void*>(p.instance), owner,
+                    p.input, p.inputSize, ReadMemory);
+            }
+            else if (p.operation == 6)
             {
                 renium_history::Binding binding{};
                 if (p.inputSize) {
@@ -2885,9 +2892,9 @@ static bool RunPropertyCall(const std::string& payload, const std::string& title
         task->extraInput.assign(payload.data() + sizeof(PropertyCallParams), payload.size() - sizeof(PropertyCallParams));
     }
     const auto& p = task->params;
-    if (p.operation > 8 || p.inputSize > sizeof(p.input) || p.ancestorCount < 2 || p.ancestorCount > 65 ||
+    if (p.operation > 9 || p.inputSize > sizeof(p.input) || p.ancestorCount < 2 || p.ancestorCount > 65 ||
         (p.operation == 7 ? task->extraInput.empty() : !task->extraInput.empty()) ||
-        p.timeoutMs < 1 || p.timeoutMs > 3000 || p.ancestors[0] != p.instance)
+        p.timeoutMs < 1 || p.timeoutMs > (p.operation == 9 ? 30000 : 3000) || p.ancestors[0] != p.instance)
         throw std::runtime_error("Invalid protected-property request");
     task->deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(p.timeoutMs);
     struct Submission
@@ -2977,6 +2984,12 @@ static bool RunPropertyCall(const std::string& payload, const std::string& title
     }
     error = task->error;
     output = std::move(task->output);
+    if (error.empty() && p.operation == 9) {
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(task->deadline - std::chrono::steady_clock::now());
+        taskLock.unlock();
+        const auto value = task->function->Wait(remaining);
+        output.insert(output.end(), value.begin(), value.end());
+    }
     return error.empty();
 }
 

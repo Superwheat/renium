@@ -34,6 +34,8 @@ pub(crate) struct Scope {
 pub(crate) enum Operation {
     Read,
     Write { value: Value },
+    Call { arguments: Vec<Value> },
+    CallBatch { arguments: Vec<Vec<Value>> },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -157,9 +159,12 @@ impl Policy {
         let trusted = trusted_property(intent)?;
         match (self.mode(scope), &intent.operation) {
             (Mode::ReadWrite, _) | (Mode::ReadOnly, Operation::Read) => Ok(Decision::Allowed),
-            (Mode::ReadOnly, Operation::Write { .. }) => {
+            (
+                Mode::ReadOnly,
+                Operation::Write { .. } | Operation::Call { .. } | Operation::CallBatch { .. },
+            ) => {
                 bail!(
-                    "Read-only mode rejects protected writes; request approval in ask mode or explicitly enable read-write"
+                    "Read-only mode rejects protected writes and function calls; request approval in ask mode or explicitly enable read-write"
                 )
             }
             (Mode::Ask, _) => {
@@ -230,7 +235,10 @@ impl Policy {
 // wildcard or a trusted flag that requests can supply.
 #[cfg(any(windows, target_os = "macos", test))]
 fn trusted_property(intent: &Intent) -> Result<bool> {
-    if intent.property != "CollisionFidelity"
+    if matches!(
+        intent.operation,
+        Operation::Call { .. } | Operation::CallBatch { .. }
+    ) || intent.property != "CollisionFidelity"
         || !crate::rbx::decode::rbx_reflection_class_is_a(
             rbx_reflection_database::get()?,
             &intent.class_name,
@@ -435,6 +443,52 @@ mod tests {
         }
         assert_eq!(policy.approve(&scope(), &id).unwrap(), original);
         assert!(policy.approve(&scope(), &id).is_err());
+    }
+
+    #[test]
+    fn function_approvals_bind_arguments_and_never_inherit_property_trust() {
+        let mut policy = Policy::default();
+        let original = Intent {
+            class_name: "HttpRbxApiService".into(),
+            property: "GetAsyncFullUrl".into(),
+            operation: Operation::Call {
+                arguments: vec![json!("https://apis.roblox.com/first")],
+            },
+            ..intent(None)
+        };
+        let id = ticket(&mut policy, &original);
+        let mut changed = original.clone();
+        changed.operation = Operation::Call {
+            arguments: vec![json!("https://apis.roblox.com/second")],
+        };
+        assert_ne!(id, ticket(&mut policy, &changed));
+        changed.property = "PostAsyncFullUrl".into();
+        assert_ne!(id, ticket(&mut policy, &changed));
+        assert_eq!(policy.approve(&scope(), &id).unwrap(), original);
+        assert!(policy.approve(&scope(), &id).is_err());
+        changed.class_name = "MeshPart".into();
+        changed.property = "CollisionFidelity".into();
+        assert!(matches!(
+            policy.check(&scope(), &changed).unwrap(),
+            Decision::ApprovalRequired { .. }
+        ));
+        policy.set_mode(&scope(), Mode::ReadOnly, false).unwrap();
+        assert!(policy.check(&scope(), &original).is_err());
+        let batch = Intent {
+            operation: Operation::CallBatch {
+                arguments: vec![vec![json!("one")], vec![json!("two")]],
+            },
+            ..original
+        };
+        assert!(policy.check(&scope(), &batch).is_err());
+        policy.set_mode(&scope(), Mode::Ask, false).unwrap();
+        let batch_id = ticket(&mut policy, &batch);
+        let mut reordered = batch.clone();
+        if let Operation::CallBatch { arguments } = &mut reordered.operation {
+            arguments.reverse();
+        }
+        assert_ne!(batch_id, ticket(&mut policy, &reordered));
+        assert_eq!(policy.approve(&scope(), &batch_id).unwrap(), batch);
     }
 
     #[test]

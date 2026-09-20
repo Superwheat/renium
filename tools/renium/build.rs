@@ -94,6 +94,21 @@ fn build_windows(out_dir: &Path) {
         "Windows background launch regression build",
     );
     println!("cargo:rerun-if-changed={}", launch_test.display());
+    let function_test = PathBuf::from("native/tests/functions_windows.cpp");
+    let mut function_test_command = compiler.to_command();
+    function_test_command.args(["/nologo", "/O2", "/EHsc", "/std:c++20", "/MT"]);
+    function_test_command.arg(&function_test);
+    function_test_command.arg(format!("/Fo{}\\", out_dir.display()));
+    function_test_command.arg(format!(
+        "/Fe{}",
+        out_dir.join("renium-functions-test.exe").display()
+    ));
+    function_test_command.args(["/link", "/INCREMENTAL:NO"]);
+    run(
+        &mut function_test_command,
+        "Windows function ABI regression build",
+    );
+    println!("cargo:rerun-if-changed={}", function_test.display());
     println!("cargo:rerun-if-changed={}", launch_source.display());
     println!("cargo:rerun-if-changed=native/renium_launch_windows_process.h");
     println!("cargo:rerun-if-changed={}", source.display());
@@ -398,6 +413,7 @@ fn embed_windows_manifest(out_dir: &Path) {
 }
 
 fn main() {
+    println!("cargo:rerun-if-changed=native/renium_studio_functions.h");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
     emit_build_metadata();

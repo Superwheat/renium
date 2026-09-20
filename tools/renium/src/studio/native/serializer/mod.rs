@@ -1,3 +1,5 @@
+#[cfg(any(windows, target_os = "macos", test))]
+mod functions;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(windows)]
@@ -9,6 +11,15 @@ use std::time::Duration;
 
 use anyhow::Result;
 use serde::Serialize;
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn validate_function_arguments(
+    class: &str,
+    name: &str,
+    arguments: &[serde_json::Value],
+) -> Result<()> {
+    functions::input(class, name, arguments).map(|_| ())
+}
 
 // Windows binds native work to a document window; macOS discovers the DataModel
 // by its internal name. Never substitute game.Name for a Windows window title.
