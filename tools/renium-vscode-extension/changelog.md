@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.3.10 - 2026-09-20
+
+### New
+
+- Every store command takes its target the same way: a positional name or dotted path (`rbx bs Workspace Lobby.Door -p Anchored --bool true`, `rbx br Workspace Lobby.OldPart`), `-i ID`, `-x INDEX`, `-n NAME` or `-c CLASS`. `mv`, `cp`, `rn`, `rm`, `upl`, `mep` and every parent option (`-I`) accept a dotted path where they took only a settings ID.
+- `rbx bg` and `rbx bs` with no target address the service itself, so `rbx bg Workspace -p Gravity` works like `rbx in Workspace`.
+- `rbx f` scopes a search to one subtree with `--path` or `-I`; `-I` takes an ID or a dotted path.
+- Native mesh writes: after a MeshId is written directly, Renium cooks the mesh so the part renders at its saved size instead of the mesh's native scale.
+- A `fast` Cargo profile (`cargo build --profile fast`) builds without link-time optimization in less than half the time of a release build.
+
+### Improvements
+
+- Text output is cheaper for agents: paths print as one dotted string with `[n]` ordinals (the same form path arguments accept), ambiguous-match lists share one path and repeat only id and ordinal, single-precision numbers print short, full records hide engine-recomputed properties unless `-F props` asks for them, console entries drop the unix stamp and use print/info/warn/error, script grep groups hits by file, and `rbx clients` drops channels and ports.
+- Which properties take part in a comparison is decided in one place for equivalence checks, retention reports and merges, so a value never counts as equal in one and different in another.
+- The reconcile engine is split into modules by concern.
+
+### Bug fixes
+
+- A Studio launched in the background stays in front once the user selects it, even while it is still settling.
+- The viewport camera can move while a native sync is staged; Workspace.Camera changes no longer abort the sync.
+- Live Sync starts when Studio and the files hold the same new instances in a different order; duplicate new instances pair by their data, and only a genuinely ambiguous pairing is reported.
+- Merges no longer duplicate an instance both branches added under the same id, and engine-recomputed properties (VertexCount, Unscaled sizes, CFrame0, Decal ColorMapContent, RBX_ attributes) never conflict.
+- Native root writes locate their instance by live path, and Roblox-internal attributes are left to Studio.
+- File-only property names (WorldPivotData, InitialSize, FluidFidelityInternal) compare under their logical names, so a model import no longer reports false differences.
+- ScrollingFrame.CanvasPosition is treated as engine state; the Studio reopen target survives daemon restarts; a root place file is preferred.
+- Guide examples and the CLI accept `-r` before the command name, and the guides are embedded in the executable so a stale copy on disk cannot block commands.
+- The build cache stays small: line-table debug info only, no debug info for dependencies, no incremental release cache.
+
 ## 0.3.9 - 2026-09-17
 
 ### New
