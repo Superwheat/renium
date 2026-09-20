@@ -313,7 +313,10 @@ fn dispatch_fields(
         let mut state = states[&pc].clone();
         state.step(i);
         let successors = match i.flow_control() {
-            FlowControl::Return | FlowControl::Exception | FlowControl::Interrupt | FlowControl::IndirectBranch => vec![],
+            FlowControl::Return
+            | FlowControl::Exception
+            | FlowControl::Interrupt
+            | FlowControl::IndirectBranch => vec![],
             FlowControl::UnconditionalBranch
                 if instructions.contains_key(&i.near_branch_target()) =>
             {
@@ -448,7 +451,15 @@ pub(super) fn binding(
             bail!("Could not verify reflection dispatch: {error}");
         }
         #[cfg(test)]
-        if std::env::var_os("RENIUM_DISPATCH_TRACE").is_some() { eprintln!("slot={slot:x} rva={rva:x} field={field:?} spans={:?}", methods.iter().map(|(rva, code)| (rva, code.len())).collect::<Vec<_>>()); }
+        if std::env::var_os("RENIUM_DISPATCH_TRACE").is_some() {
+            eprintln!(
+                "slot={slot:x} rva={rva:x} field={field:?} spans={:?}",
+                methods
+                    .iter()
+                    .map(|(rva, code)| (rva, code.len()))
+                    .collect::<Vec<_>>()
+            );
+        }
         if let Some(field) = field {
             candidates.insert(resolve(memory, studio, layout, descriptor, field)?);
         }

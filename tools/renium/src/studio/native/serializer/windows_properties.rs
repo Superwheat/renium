@@ -1430,7 +1430,9 @@ mod tests {
                 if name.starts_with("Post") {
                     arguments.push(serde_json::json!(""));
                 }
-                native.prepare_function(pid, &title, name, &arguments).with_context(|| format!("Discover {name}"))?;
+                native
+                    .prepare_function(pid, &title, name, &arguments)
+                    .with_context(|| format!("Discover {name}"))?;
             }
         }
         Ok(())
