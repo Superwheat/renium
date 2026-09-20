@@ -1238,6 +1238,10 @@ pub(super) fn find_command(args: FindArgs) -> Result<()> {
     let fields = parse_requested_fields(Some(args.fields.as_str()));
     let properties = parse_property_predicates(&args.properties)?;
     let attributes = parse_property_predicates(&args.attributes)?;
+    let scope_path = args
+        .path
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
     let has_structured_filters = args.name.as_deref().is_some_and(|value| !value.is_empty())
         || args
             .class_name
@@ -1247,6 +1251,7 @@ pub(super) fn find_command(args: FindArgs) -> Result<()> {
             .parent_settings_id
             .as_deref()
             .is_some_and(|value| !value.is_empty())
+        || scope_path.is_some()
         || args.tag.as_deref().is_some_and(|value| !value.is_empty())
         || !properties.is_empty()
         || !attributes.is_empty();
@@ -1259,6 +1264,31 @@ pub(super) fn find_command(args: FindArgs) -> Result<()> {
     if groups.is_empty() && !has_structured_filters {
         bail!("Provide a query or filter: find <SERVICE> <QUERY> or find <SERVICE> --class Script");
     }
+
+    let scope = match scope_path {
+        Some(path) => {
+            let target = HighLevelTarget {
+                index: None,
+                settings_id: None,
+                name: None,
+                class_name: None,
+                path: Some(path),
+                ordinals: args.ords.as_deref(),
+                positional: None,
+            };
+            match high_level_target_resolution(&ctx, target)? {
+                HighLevelTargetResolution::Found(root_index) => Some(high_level_visible_tree(
+                    &ctx.children_by_parent,
+                    root_index,
+                    usize::MAX,
+                )),
+                HighLevelTargetResolution::Ambiguous(indices) => {
+                    return high_level_print_ambiguity(&ctx, mode, &indices, args.pretty);
+                }
+            }
+        }
+        None => None,
+    };
 
     let structured_matches = has_structured_filters.then(|| {
         let query = InstanceQuery {
@@ -1277,6 +1307,11 @@ pub(super) fn find_command(args: FindArgs) -> Result<()> {
     let limit = if args.all { 0 } else { args.limit };
     let mut match_indices = Vec::new();
     for index in 0..ctx.document.instances.len() {
+        if let Some(scope) = scope.as_ref()
+            && !scope.contains(&index)
+        {
+            continue;
+        }
         if let Some(structured_matches) = structured_matches.as_ref()
             && !structured_matches.contains(&index)
         {

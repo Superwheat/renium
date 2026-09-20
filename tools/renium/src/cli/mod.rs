@@ -902,6 +902,17 @@ pub(super) struct FindArgs {
         alias = "parent-id"
     )]
     pub(super) parent_settings_id: Option<String>,
+    #[arg(
+        help = "Search only this subtree, dotted path or JSON string array",
+        long,
+        alias = "path-json"
+    )]
+    pub(super) path: Option<String>,
+    #[arg(
+        help = "Sibling ordinals (JSON array) for duplicate names in --path",
+        long
+    )]
+    pub(super) ords: Option<String>,
     #[arg(help = "Match instances with this tag", short, long)]
     pub(super) tag: Option<String>,
     #[arg(

@@ -9,6 +9,7 @@ in `instances/` beside `src`.
 ```powershell
 rbx f Workspace -n Door --limit 5
 rbx f ServerScriptService -c Script --limit 5
+rbx f ReplicatedStorage --path Vehicles.Cars -c Model
 rbx tr Workspace Door --depth 2 --limit 100
 rbx in Workspace -i editor:id
 rbx bg Workspace -i editor:id -p Name
@@ -16,7 +17,7 @@ rbx ss DataStoreService UpdateAsync --limit 20
 rbx sg RemoteEvent --limit 100
 ```
 
-`f SERVICE text` searches text; `-n` matches an exact name, without wildcards.
+`f SERVICE text` searches text; `-n` matches an exact name, without wildcards; `--path` limits the search to one subtree.
 `ss` finds scripts containing every keyword, case-insensitively. `sg` finds literal lines, case-sensitive by default. Limits cap returned results, not totals. Read known scripts directly; use `sr` for bounded reads when file access is unavailable.
 
 Use one lookup on the relevant state: `f` for saved data, `q` for a closed place, `l` for unsaved Studio state. Refine ambiguous results instead of repeating the query through different tools. Git comparisons are useful when the question concerns revisions, not as an extra existence check.

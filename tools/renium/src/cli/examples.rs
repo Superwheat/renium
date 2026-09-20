@@ -174,7 +174,10 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
         "me",
         "Examples:\n  rbx me src/ServerScriptService/Main.server.luau oldName newName",
     ),
-    ("f", "Examples:\n  rbx f Workspace -n Door --limit 5"),
+    (
+        "f",
+        "Examples:\n  rbx f Workspace -n Door --limit 5\n  rbx f ReplicatedStorage --path Vehicles.Cars -c Model",
+    ),
     ("tr", "Examples:\n  rbx tr Workspace Door --depth 2"),
     ("in", "Examples:\n  rbx in Workspace -i editor:item"),
     ("bg", "Examples:\n  rbx bg Workspace -i editor:item -p Name"),
