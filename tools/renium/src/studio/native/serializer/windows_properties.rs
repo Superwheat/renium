@@ -9,6 +9,9 @@ use std::io::{Read, Seek, SeekFrom};
 #[path = "windows_history.rs"]
 mod history;
 
+#[path = "windows_functions.rs"]
+mod functions;
+
 #[path = "windows_terrain.rs"]
 mod terrain;
 pub(crate) use terrain::prepare_terrain;
@@ -441,21 +444,8 @@ impl NativeProperty {
                     == Some(locator),
             "Function descriptor is not a complete reflection object"
         );
-        let mut candidates = Vec::new();
-        for field in (0x40..0xa0).step_by(8) {
-            let function = self.memory.read_u64(descriptor + field)? as usize;
-            if verified_code(&self.memory, studio, &layout, function, 64).is_ok()
-                && self.memory.read_u32(descriptor + field + 8)? == 0
-            {
-                candidates.push((field, function));
-            }
-        }
-        anyhow::ensure!(
-            candidates.len() == 1,
-            "Function binding has {} candidates; no call was executed",
-            candidates.len()
-        );
-        let (field, function) = candidates[0];
+        let (field, function) =
+            functions::binding(&self.memory, studio, &layout, descriptor, table)?;
         input.bytes[..8].copy_from_slice(&(descriptor as u64).to_le_bytes());
         input.bytes[8..16].copy_from_slice(&(table as u64).to_le_bytes());
         input.bytes[16..20].copy_from_slice(&(field as u32).to_le_bytes());
@@ -1410,6 +1400,41 @@ fn prepare(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore]
+    fn live_function_dispatch() -> Result<()> {
+        let pid = std::env::var("RENIUM_INSPECT_PID")?.parse()?;
+        let title = crate::studio::input::studio_window_title(pid)?;
+        let mut native = prepare_property(
+            pid,
+            &title,
+            &["HttpRbxApiService".into()],
+            &[],
+            "Name",
+            Duration::from_secs(3),
+        )?;
+        for _ in 0..2 {
+            for name in [
+                "GetDocumentationUrl",
+                "GetAsync",
+                "GetAsyncFullUrl",
+                "PostAsync",
+                "PostAsyncFullUrl",
+            ] {
+                let mut arguments = vec![serde_json::json!(if name.ends_with("FullUrl") {
+                    "https://apis.roblox.com/"
+                } else {
+                    "Folder"
+                })];
+                if name.starts_with("Post") {
+                    arguments.push(serde_json::json!(""));
+                }
+                native.prepare_function(pid, &title, name, &arguments).with_context(|| format!("Discover {name}"))?;
+            }
+        }
+        Ok(())
+    }
 
     fn debug_id_fixture(field: i32, variant: usize) -> Vec<u8> {
         // Move the saved descriptor/Instance/Lua, SSE pair, signed adjustment,

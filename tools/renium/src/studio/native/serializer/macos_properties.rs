@@ -362,6 +362,16 @@ struct ValidatedAbi {
 type AbiKey = ([u8; 16], u64, CallKind);
 static ABIS: OnceLock<Mutex<HashMap<AbiKey, ValidatedAbi>>> = OnceLock::new();
 
+#[derive(Clone)]
+struct FunctionBinding {
+    field: usize,
+    table: Vec<u8>,
+    code: Vec<(u64, Vec<u8>)>,
+    conditions: Vec<(usize, u64)>,
+}
+type FunctionKey = ([u8; 16], u64);
+static FUNCTION_BINDINGS: OnceLock<Mutex<HashMap<FunctionKey, FunctionBinding>>> = OnceLock::new();
+
 enum StringSource {
     Inline(Vec<u8>),
     Indirect(u64, usize),
@@ -538,6 +548,128 @@ impl Memory {
             "Studio reflection code differs from its executable; refusing the call"
         );
         Ok(expected)
+    }
+
+    fn dispatch_code(&self, address: u64) -> Result<Vec<u8>> {
+        let original = address
+            .checked_sub(self.base)
+            .and_then(|rva| rva.checked_add(self.trace.image_base))
+            .context("Invalid reflection dispatch address")?;
+        let index = self
+            .trace
+            .function_starts
+            .binary_search(&original)
+            .map_err(|_| anyhow::anyhow!("Reflection dispatch has no Mach-O function boundary"))?;
+        let end = self
+            .trace
+            .function_starts
+            .get(index + 1)
+            .copied()
+            .unwrap_or(self.trace.text.address + self.trace.text.size);
+        let length = usize::try_from(
+            end.checked_sub(original)
+                .context("Invalid reflection function bounds")?,
+        )?;
+        anyhow::ensure!(
+            length <= 65536,
+            "Reflection dispatch exceeds its analysis budget"
+        );
+        self.code(address, length)
+    }
+
+    fn function_binding(&self, descriptor: u64, table: u64) -> Result<(usize, u64)> {
+        let key = (self.trace.image_uuid, table);
+        let cache = FUNCTION_BINDINGS.get_or_init(|| Mutex::new(HashMap::new()));
+        let cached = cache.lock_recover().get(&key).cloned();
+        if let Some(binding) = cached
+            && self.read(table, binding.table.len()).ok().as_ref() == Some(&binding.table)
+            && binding
+                .code
+                .iter()
+                .all(|(address, code)| self.read(*address, code.len()).ok().as_ref() == Some(code))
+            && binding
+                .conditions
+                .iter()
+                .all(|(field, value)| self.pointer(descriptor + *field as u64).ok() == Some(*value))
+        {
+            return self.resolve_function(descriptor, binding.field);
+        }
+        let start = self.base + self.trace.text.address - self.trace.image_base;
+        let mut fields = HashSet::new();
+        let mut table_bytes = Vec::new();
+        let mut methods = HashMap::new();
+        let mut conditions = HashMap::new();
+        let mut terminated = false;
+        for slot in (0..2048).step_by(8) {
+            let method = self.pointer(table + slot)?;
+            table_bytes.extend_from_slice(&method.to_le_bytes());
+            if method
+                .checked_sub(start)
+                .is_none_or(|offset| offset >= self.trace.text.size)
+            {
+                terminated = true;
+                break;
+            }
+            let mut error = None;
+            let field = super::super::arm64_functions::dispatch_field(
+                method,
+                |address| {
+                    if let Some(code) = methods.get(&address) {
+                        return Some(Vec::clone(code));
+                    }
+                    match self.dispatch_code(address) {
+                        Ok(code) => {
+                            methods.insert(address, code.clone());
+                            Some(code)
+                        }
+                        Err(message) => {
+                            error = Some(format!("{message:#}"));
+                            None
+                        }
+                    }
+                },
+                |field| {
+                    let value = self.pointer(descriptor + field as u64).ok()?;
+                    conditions.insert(field, value);
+                    Some(value)
+                },
+            );
+            if let Some(error) = error {
+                bail!("Could not verify reflection dispatch: {error}");
+            }
+            fields.extend(field);
+        }
+        anyhow::ensure!(
+            terminated && fields.len() == 1,
+            "Reflection dispatch resolved {} function bindings; no call was executed",
+            fields.len()
+        );
+        let field = *fields.iter().next().unwrap();
+        let result = self.resolve_function(descriptor, field)?;
+        let mut cache = cache.lock_recover();
+        if cache.len() >= 128 {
+            cache.clear();
+        }
+        cache.insert(
+            key,
+            FunctionBinding {
+                field,
+                table: table_bytes,
+                code: methods.into_iter().collect(),
+                conditions: conditions.into_iter().collect(),
+            },
+        );
+        Ok(result)
+    }
+
+    fn resolve_function(&self, descriptor: u64, field: usize) -> Result<(usize, u64)> {
+        let function = self.pointer(descriptor + field as u64)?;
+        anyhow::ensure!(
+            self.pointer(descriptor + field as u64 + 8)? == 0,
+            "Function receiver requires an unsupported adjustment"
+        );
+        self.code(function, 64)?;
+        Ok((field, function))
     }
 
     fn bindings(&self, descriptor: u64) -> Result<Vec<usize>> {
@@ -981,21 +1113,7 @@ impl NativeProperty {
             self.memory.pointer(table - 16)? == 0,
             "Function descriptor is not a complete reflection object"
         );
-        let mut candidates = Vec::new();
-        for field in (0x40..0xa0).step_by(8) {
-            let function = self.memory.pointer(descriptor + field)?;
-            if self.memory.code(function, 64).is_ok()
-                && self.memory.pointer(descriptor + field + 8)? == 0
-            {
-                candidates.push((field, function));
-            }
-        }
-        anyhow::ensure!(
-            candidates.len() == 1,
-            "Function binding has {} candidates; no call was executed",
-            candidates.len()
-        );
-        let (field, function) = candidates[0];
+        let (field, function) = self.memory.function_binding(descriptor, table)?;
         input.bytes[..8].copy_from_slice(&descriptor.to_le_bytes());
         input.bytes[8..16].copy_from_slice(&table.to_le_bytes());
         input.bytes[16..20].copy_from_slice(&(field as u32).to_le_bytes());
@@ -1421,56 +1539,40 @@ fn discover_property(
 }
 
 #[cfg(test)]
-fn terrain_fixture_binary_property(pid: u32, name: &str) -> Result<NativeProperty> {
-    let mut prepared = prepare_property(
+#[test]
+#[ignore]
+fn live_function_dispatch() -> Result<()> {
+    let pid = std::env::var("RENIUM_INSPECT_PID")?.parse()?;
+    let title = std::env::var("RENIUM_INSPECT_TITLE")?;
+    let mut native = prepare_property(
         pid,
-        "ReniumPropertyPackageTest.rbxl",
-        &["Workspace".into(), "Terrain".into()],
+        &title,
+        &["HttpRbxApiService".into()],
         &[],
         "Name",
         Duration::from_secs(3),
     )?;
-    anyhow::ensure!(
-        prepared.class_name == "Terrain",
-        "Not the owned Terrain target"
-    );
-    let instance = read_u64(&prepared.parameters, 8).unwrap();
-    let class_offset = read_u64(&prepared.parameters, 80).unwrap();
-    let descriptor = prepared.memory.member(instance, class_offset, name)?;
-    anyhow::ensure!(
-        prepared.memory.rtti(descriptor)?
-            == "N3RBX10Reflection14PropDescriptorINS_19MegaClusterInstanceENS_12BinaryStringEEE",
-        "Not a Terrain BinaryString descriptor"
-    );
-    // Read-only probe of the inspected 0.738 ARM64 ABI, not a production resolver.
-    // Its copy method loads this binding, returns 24-byte string storage via x8,
-    // passes that storage to the setter, and disposes it as libc++ std::string.
-    let binding = prepared.memory.pointer(descriptor + 144)?;
-    anyhow::ensure!(
-        prepared.memory.rtti(binding)?
-            == "N3RBX10Reflection14PropDescriptorINS_19MegaClusterInstanceENS_12BinaryStringEE10GetSetImplIMNS_11TerrainPropEKFS3_vEMS6_FvS3_EEE",
-        "Not the inspected Terrain getter binding"
-    );
-    let table = prepared.memory.pointer(binding)?;
-    let getter = prepared.memory.pointer(table + 32)?;
-    let code = prepared.memory.code(getter, 36)?;
-    anyhow::ensure!(
-        read_u32(&code, 0) == Some(0x91070029) && read_u32(&code, 32) == Some(0xd61f0020),
-        "The inspected Terrain getter changed"
-    );
-    for (offset, value) in [
-        (24, binding),
-        (32, table),
-        (48, getter),
-        (56, 0),
-        (104, 32),
-        (112, 0),
-    ] {
-        put64(&mut prepared.parameters, offset, value);
+    native.memory.deadline = Instant::now() + Duration::from_secs(30);
+    for _ in 0..2 {
+        for name in [
+            "GetDocumentationUrl",
+            "GetAsync",
+            "GetAsyncFullUrl",
+            "PostAsync",
+            "PostAsyncFullUrl",
+        ] {
+            let mut arguments = vec![serde_json::json!(if name.ends_with("FullUrl") {
+                "https://apis.roblox.com/"
+            } else {
+                "Folder"
+            })];
+            if name.starts_with("Post") {
+                arguments.push(serde_json::json!(""));
+            }
+            native.prepare_function(pid, &title, name, &arguments)?;
+        }
     }
-    prepared.property = name.into();
-    prepared.writable = false;
-    Ok(prepared)
+    Ok(())
 }
 
 #[test]

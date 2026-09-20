@@ -115,7 +115,7 @@ struct DataModelScanStats
 };
 
 static constexpr std::uint32_t Magic = 0x4d4e4552;
-static constexpr std::uint32_t Version = 8;
+static constexpr std::uint32_t Version = 9;
 // Command 3 does not use factoryRva as a function address. Its top bit opts in
 // to per-candidate clocks; older helpers ignore it and keep the same payloads.
 static constexpr std::uint64_t PropertyPhaseTimingFlag = std::uint64_t{1} << 63;

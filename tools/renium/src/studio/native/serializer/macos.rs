@@ -35,7 +35,7 @@ const LAUNCHER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-s
 const REQUEST_MAGIC: u32 = 0x4d4e4552;
 // Fence property-operation additions as well as the outer serializer header.
 // An already-open Studio can still have an older helper mapped after an update.
-const REQUEST_VERSION: u32 = 8;
+const REQUEST_VERSION: u32 = 9;
 
 fn native_helper_error(error: &str) -> String {
     if error.contains("invalid serializer request")
@@ -79,6 +79,7 @@ struct PackageActionTrace {
     image_uuid: [u8; 16],
     image_base: u64,
     text: MachSection,
+    function_starts: std::sync::Arc<[u64]>,
 }
 
 struct CachedPackageActionTrace {
@@ -846,6 +847,7 @@ fn trace_package_action(path: &Path) -> Result<PackageActionTrace> {
         image_uuid: image.image_uuid,
         image_base: image.image_base,
         text: image.text,
+        function_starts: image.function_starts.clone().into(),
     };
     trace.submit_rva = match image.cpu {
         CPU_TYPE_ARM64 => trace_arm64_task_submitter(&image)?,

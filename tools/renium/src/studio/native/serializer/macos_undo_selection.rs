@@ -185,7 +185,9 @@ fn undo_selection_sites(image: &MachImage<'_>) -> Result<Vec<(u64, u32)>> {
         .collect()
 }
 
-fn cached_sites(path: &Path) -> Result<(Vec<(u64, u32)>, [u8; 16])> {
+type SelectionSites = (Vec<(u64, u32)>, [u8; 16]);
+
+fn cached_sites(path: &Path) -> Result<SelectionSites> {
     let metadata =
         fs::metadata(path).with_context(|| format!("Could not inspect {}", path.display()))?;
     let modified = metadata.modified().ok();

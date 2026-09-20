@@ -41,12 +41,18 @@ std::shared_ptr<Completion> Begin(void* target, std::shared_ptr<void> hold,
     Input input{};
     if (size < sizeof(input)) throw std::runtime_error("Truncated function request");
     std::memcpy(&input, bytes, sizeof(input));
-    if (input.mode < 1 || input.mode > 3 || input.reserved || input.field < 0x40 || input.field > 0x200
+    if (input.mode < 1 || input.mode > 3 || input.reserved || input.field < 8 || input.field > 65520
         || input.field % 8 || size != sizeof(input) + static_cast<std::uint64_t>(input.firstSize) + input.secondSize)
         throw std::runtime_error("Invalid function request");
     std::uint64_t table = 0, function = 0;
+#ifdef _WIN32
+    std::int32_t adjustment = 0;
+#else
+    std::int64_t adjustment = 0;
+#endif
     if (!read(input.descriptor, &table, sizeof(table)) || table != input.table
-        || !read(input.descriptor + input.field, &function, sizeof(function)) || function != input.function)
+        || !read(input.descriptor + input.field, &function, sizeof(function)) || function != input.function
+        || !read(input.descriptor + input.field + 8, &adjustment, sizeof(adjustment)) || adjustment != 0)
         throw std::runtime_error("Function binding was replaced before execution");
     const std::string first(bytes + sizeof(input), input.firstSize);
     const std::string second(bytes + sizeof(input) + input.firstSize, input.secondSize);

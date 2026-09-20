@@ -141,6 +141,7 @@ struct PackageLayout {
     text: PeSection,
     submit_task: usize,
     image_stamp: [u32; 3],
+    function_ranges: std::sync::Arc<[(usize, usize)]>,
 }
 
 #[derive(Clone, Copy)]
@@ -895,6 +896,19 @@ fn package_layout(path: &Path) -> Result<PackageLayout> {
         text: image.section(b".text")?,
         submit_task: renderer_submit_task_rva(&bytes, &image)?,
         image_stamp: image.image_stamp,
+        function_ranges: {
+            let table = image.section(b".pdata")?;
+            (table.raw_offset..table.raw_offset + table.raw_size)
+                .step_by(12)
+                .map(|offset| {
+                    Ok((
+                        read_u32(&bytes, offset)? as usize,
+                        read_u32(&bytes, offset + 4)? as usize,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?
+                .into()
+        },
     };
     cache.lock_recover().insert(
         path.to_path_buf(),
