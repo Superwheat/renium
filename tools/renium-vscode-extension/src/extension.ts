@@ -389,6 +389,7 @@ class RobloxSyncController {
       output,
       () => this.configuredProjectRoot ?? this.context.extensionPath,
       () => this.scheduleDaemonFileSyncRestart(),
+      (projectRoot) => this.offerProjectInit(projectRoot),
     );
     this.git = new GitController<SyncConfig>({
       context: this.context,
@@ -839,6 +840,40 @@ class RobloxSyncController {
 
   private configuredLogLevel(): ReniumLogLevel {
     return this.configResolver.configuredLogLevel(this.studioRuntimeSettings);
+  }
+
+  private readonly declinedInitRoots = new Set<string>();
+
+  private async offerProjectInit(projectRoot: string): Promise<boolean> {
+    if (this.declinedInitRoots.has(projectRoot)) {
+      return false;
+    }
+    const cliPath = this.tryGetConfig()?.cliPath;
+    if (!cliPath || !fs.existsSync(cliPath)) {
+      return false;
+    }
+    const choice = await vscode.window.showInformationMessage(
+      `Renium: ${projectRoot} has no Renium project. Initialize one here? This writes renium.project.jsonc and the agent guides.`,
+      "Initialize",
+      "Not now",
+    );
+    if (choice !== "Initialize") {
+      this.declinedInitRoots.add(projectRoot);
+      return false;
+    }
+    const { child, closed } = spawnTrackedProcess(cliPath, ["init"], projectRoot);
+    let stderr = "";
+    child.stderr.on("data", (chunk: Buffer | string) => {
+      stderr += String(chunk);
+    });
+    child.stdout.on("data", () => undefined);
+    await closed;
+    if (child.exitCode !== 0) {
+      void vscode.window.showErrorMessage(`Renium: rbx init failed: ${stderr.trim() || `exit ${child.exitCode}`}`);
+      return false;
+    }
+    this.output.appendLine(`[renium] initialized a project in ${projectRoot}`);
+    return true;
   }
 
   private outputLevel(message: string): Exclude<ReniumLogLevel, "off"> {

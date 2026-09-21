@@ -18,6 +18,19 @@ require Windows or macOS.
 
 `rbx upd` updates installed components. `rbx setup --repair` repairs the plugin.
 
+### Tell your agent
+
+The installer runs `rbx setup`, which adds a short Renium note to the global
+instruction files of the agents it finds: Claude Code (`~/.claude/CLAUDE.md`),
+Codex (`~/.codex/AGENTS.md`), Gemini CLI, OpenCode and Windsurf. The note says
+what `rbx` is and to run `rbx init` in a Roblox project folder. `rbx setup
+--status` lists the files; `rbx setup --uninstall` removes the note.
+
+Inside a project, `rbx init` writes RENIUM.md plus AGENTS.md and CLAUDE.md
+pointers, which Cursor, Claude Code, Codex and Copilot pick up on their own. The
+editor extension offers to initialize a folder that has no project yet. Nothing
+creates a project by itself.
+
 ## Start syncing
 
 Open your place in Studio. For a new project, use a **dedicated empty folder**:

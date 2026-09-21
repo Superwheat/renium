@@ -1,3 +1,4 @@
+pub(crate) mod agent_hints;
 pub(crate) mod build;
 pub(crate) mod context;
 pub(crate) mod crash;

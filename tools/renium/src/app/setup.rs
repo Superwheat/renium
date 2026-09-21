@@ -160,6 +160,7 @@ pub(crate) fn setup_command(args: SetupArgs) -> Result<()> {
             "bundledSha256": bundled_hash,
             "matchesBundled": installed_hash.is_some() && installed_hash == bundled_hash,
             "version": BUILD_VERSION,
+            "agentHints": crate::app::agent_hints::status(),
         });
         let text = if !installed {
             format!(
@@ -235,11 +236,13 @@ pub(crate) fn setup_command(args: SetupArgs) -> Result<()> {
         }
         #[cfg(target_os = "macos")]
         studio_patch_removal.commit()?;
+        let agent_hints = crate::app::agent_hints::remove()?;
         let response = json!({
             "ok": true,
             "action": "uninstall",
             "removed": target,
             "removedVersion": installed_version,
+            "agentHintsRemoved": agent_hints,
         });
         return emit_global_output(
             &response,
@@ -321,12 +324,15 @@ pub(crate) fn setup_command(args: SetupArgs) -> Result<()> {
             return Err(error);
         }
     };
+    let agent_hints = crate::app::agent_hints::install(BUILD_VERSION)?;
     let response = json!({
         "ok": true,
         "action": if args.repair { "repair" } else { "setup" },
         "source": source_label,
         "installedTo": target.display().to_string(),
         "bytes": bytes.len(),
+        "agentHints": crate::app::agent_hints::status(),
+        "agentHintsWritten": agent_hints,
         "note": "Restart Roblox Studio (or toggle the plugin) to load the new version",
     });
     #[cfg(target_os = "macos")]
@@ -338,8 +344,9 @@ pub(crate) fn setup_command(args: SetupArgs) -> Result<()> {
     emit_global_output(
         &response,
         &format!(
-            "Installed the Studio plugin from {source_label} to {}",
-            target.display()
+            "Installed the Studio plugin from {source_label} to {}; {}",
+            target.display(),
+            crate::app::agent_hints::describe(&agent_hints)
         ),
     )
 }

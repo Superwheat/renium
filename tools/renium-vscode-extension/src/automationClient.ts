@@ -106,6 +106,7 @@ export class AutomationClient {
     private readonly output: vscode.OutputChannel,
     private readonly ownerRoot: () => string,
     private readonly onProcessStopped?: () => void,
+    private readonly onMissingProject?: (projectRoot: string) => Promise<boolean>,
   ) {}
 
   public isRunning(): boolean {
@@ -290,6 +291,7 @@ export class AutomationClient {
     }
     const deadline = Date.now() + editorBridgeWaitSeconds(config) * 1_000 + 2_000;
     let observedConnection = false;
+    let offeredInit = false;
     while (true) {
       const bound = await this.send(
         config,
@@ -300,6 +302,16 @@ export class AutomationClient {
         { quietWait: true, timeoutMs: 2_000 },
       );
       if (bound.code !== 0) {
+        // A folder never becomes a project on its own; the user is asked once.
+        if (
+          bound.automationError?.c === "no_project"
+          && !offeredInit
+          && this.onMissingProject
+          && await this.onMissingProject(config.projectRoot)
+        ) {
+          offeredInit = true;
+          continue;
+        }
         throw new Error(bound.automationError?.m ?? "Renium could not bind this project.");
       }
       const result = bound.result as Record<string, unknown> | undefined;

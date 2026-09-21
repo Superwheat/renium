@@ -32,7 +32,9 @@ pub(crate) fn command() -> clap::Command {
             .expect("command example must name an existing command");
         *subcommand = std::mem::take(subcommand).after_help(*examples);
     }
-    command.term_width(0).after_help(
+    command.term_width(0).before_help(
+        "New here? In a Roblox project folder run `rbx init` once, then read the RENIUM.md it creates.",
+    ).after_help(
         "Global options (any command):\n  --place <NAME|ID|GAME:PLACE>  Pin to one Studio place (env: RENIUM_PLACE)\n  --project <PATH>              Use this renium.project.jsonc\n  --output-mode text|json|pretty  --log-level off|error|warn|info|debug|trace  -v\n  --color auto|always|never  --yes  --backtrace  --daemon <NAME>\n\nExamples:\n  rbx f Workspace -n Door\n  rbx pl\n  rbx ps src/StarterGui/Menu.client.luau\n  rbx l \"return game.PlaceId\"\n  rbx sc --studio -o studio.png",
     )
 }
