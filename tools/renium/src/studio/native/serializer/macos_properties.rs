@@ -1381,7 +1381,10 @@ pub(crate) fn prepare_property(
     property: &str,
     timeout: Duration,
 ) -> Result<NativeProperty> {
-    prepare(pid, title, segments, ordinals, property, timeout, None).map(|(prepared, _)| prepared)
+    prepare(
+        pid, title, segments, ordinals, property, timeout, None, None,
+    )
+    .map(|(prepared, _)| prepared)
 }
 
 /// A trusted snapshot read captures identity and value on the same engine task.
@@ -1403,10 +1406,12 @@ pub(crate) fn read_property(
         property,
         timeout,
         Some(class),
+        None,
     )
     .map(|(_, value)| value)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare(
     pid: u32,
     title: &str,
@@ -1415,9 +1420,10 @@ fn prepare(
     property: &str,
     timeout: Duration,
     read_class: Option<&str>,
+    context: Option<&[u8]>,
 ) -> Result<(NativeProperty, String)> {
     let mut prepared = discover_property(
-        pid, title, segments, ordinals, property, timeout, read_class,
+        pid, title, segments, ordinals, property, timeout, read_class, context,
     )?;
     let response = prepared.invoke(if read_class.is_some() { 3 } else { 0 })?;
     let identity = response
@@ -1429,6 +1435,7 @@ fn prepare(
     Ok((prepared, String::from_utf8(response[16..].to_vec())?))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn discover_property(
     pid: u32,
     title: &str,
@@ -1437,6 +1444,7 @@ fn discover_property(
     property: &str,
     timeout: Duration,
     read_class: Option<&str>,
+    context: Option<&[u8]>,
 ) -> Result<NativeProperty> {
     crate::app::output::log_global(
         5,
@@ -1447,7 +1455,10 @@ fn discover_property(
     let started = Instant::now();
     let mut memory = Memory::for_process(pid, timeout)?;
     let traced = Instant::now();
-    let context = memory.request(0, &[0], title)?;
+    let context = match context {
+        Some(context) => context.to_vec(),
+        None => memory.request(0, &[0], title)?,
+    };
     anyhow::ensure!(
         context.len() == 64,
         "Unsupported reflection context; install the matching helper"

@@ -178,7 +178,7 @@ function BridgePluginRuntime.start(context)
 	local PARALLEL_SOURCE_BATCH_MIN_ITEMS = 24
 	local BRIDGE_VERSION = "0.3.10"
 	local BRIDGE_PROTOCOL_VERSION = "compact-v5"
-	local BRIDGE_BUILD_UNIX = 1789969402
+	local BRIDGE_BUILD_UNIX = 1789975551
 	local MAX_ACTIVE_DEMAND_SERIALIZERS = 4
 	local MAX_SOURCE_BATCH_PATHS = 1024
 	local COMPACT_TYPE_IDS = {
@@ -4236,6 +4236,9 @@ function BridgePluginRuntime.start(context)
 			}
 		end
 		local changeState = Config.studioChanges.getState(p, leaseId)
+		if p.nativeTerrainRelay == true then
+			changeState.nativeTerrainPaused = RuntimeApi.isPlayModeRunning()
+		end
 		changeState.twoWaySyncEnabled = true
 		changeState.runtimeSettingChanges = runtimeSettingChanges
 		changeState.runtimeSettingChangeCount = runtimeSettingChangeCount

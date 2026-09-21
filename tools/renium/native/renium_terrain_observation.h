@@ -15,8 +15,8 @@ struct Relay {
     unsigned char identity[16];
     std::uintptr_t descriptor, descriptorTable, setter;
 };
-struct Request { Binding binding; Relay relay; };
-static_assert(sizeof(Binding) == 32 && sizeof(Request) == 120);
+struct Request { Binding binding; Relay relay; std::uint64_t catchUp; };
+static_assert(sizeof(Binding) == 32 && sizeof(Request) == 128);
 struct Table { Binding binding; std::vector<std::uintptr_t> entries; };
 struct Subscription {
     Relay relay;
@@ -82,7 +82,7 @@ static Binding GetBinding(void* terrain) {
 
 template<class Read, class Retain, class Release>
 static void Install(void* terrain, void* terrainOwner, const Request& request,
-    std::uintptr_t classOffset, std::uintptr_t selfOffset, std::uintptr_t parentOffset,
+    std::uintptr_t classOffset, std::uintptr_t selfOffset, std::uintptr_t parentOffset, std::uintptr_t model,
     Read read, Retain retain, Release release) {
     const auto& binding = request.binding;
     const auto& relay = request.relay;
@@ -107,7 +107,8 @@ static void Install(void* terrain, void* terrainOwner, const Request& request,
         (*listener != binding.table && (!existing || existing->binding.table != binding.table) &&
             !sameInterface(*listener)) ||
         !equal(relay.instance + classOffset, relay.classDescriptor) || !equal(relay.instance + selfOffset, relay.instance) ||
-        !equal(relay.instance + selfOffset + 8, relay.owner) || !equal(relay.instance + parentOffset, relay.parent))
+        !equal(relay.instance + selfOffset + 8, relay.owner) || !equal(relay.instance + parentOffset, relay.parent) ||
+        !equal(relay.parent + parentOffset, model))
         throw std::runtime_error("Terrain notification target changed");
     if (!retain(reinterpret_cast<void*>(relay.owner))) throw std::runtime_error("Terrain relay expired");
     const auto relayHold = std::shared_ptr<void>(reinterpret_cast<void*>(relay.owner), release);
@@ -128,7 +129,7 @@ static void Install(void* terrain, void* terrainOwner, const Request& request,
         if (!retain(weak->owner)) return {};
         return std::shared_ptr<void>(weak->owner, release);
     };
-    std::lock_guard lock(tablesMutex);
+    std::unique_lock lock(tablesMutex);
     for (auto it = subscriptions.begin(); it != subscriptions.end();) {
         if (!it->second->terrainOwner->Alive() || !it->second->relayOwner->Alive()) it = subscriptions.erase(it);
         else ++it;
@@ -147,5 +148,11 @@ static void Install(void* terrain, void* terrainOwner, const Request& request,
     }
     subscriptions[terrain] = std::move(subscription);
     *listener = reinterpret_cast<std::uintptr_t>(table->entries.data() + 2);
+    lock.unlock();
+    if (request.catchUp) {
+        const std::string changed = "true";
+        reinterpret_cast<bool (*)(void*, void*, const std::string*)>(relay.setter)(
+            reinterpret_cast<void*>(relay.descriptor), reinterpret_cast<void*>(relay.instance), &changed);
+    }
 }
 }

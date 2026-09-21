@@ -1,34 +1,47 @@
 //! Resolve the Terrain listener interface and Instance property notification ABI.
 use super::*;
 
-pub(crate) fn observe_terrain(pid: u32, title: &str, relay_path: &[String]) -> Result<()> {
+pub(crate) fn observe_terrain(
+    pid: u32,
+    title: &str,
+    relay_path: &[String],
+    catch_up: bool,
+) -> Result<()> {
     anyhow::ensure!(
         relay_path.len() == 2
             && relay_path[0] == "CoreGui"
             && relay_path[1].starts_with("ReniumTerrainChanges_"),
         "Invalid Terrain relay path"
     );
-    let relay = prepare_property(
+    let (relay, _) = prepare(
         pid,
         title,
         relay_path,
         &[],
         "Value",
         Duration::from_secs(10),
+        None,
+        Some(relay_path),
     )?;
     anyhow::ensure!(
         relay.class_name == "BoolValue",
         "Terrain relay changed class"
     );
     relay.ensure_writable()?;
-    let mut property = prepare_property(
+    let (mut property, _) = prepare(
         pid,
         title,
         &["Workspace".into(), "Terrain".into()],
         &[],
         "Name",
         Duration::from_secs(10),
+        None,
+        Some(relay_path),
     )?;
+    anyhow::ensure!(
+        read_u64(&relay.parameters, 32)? == read_u64(&property.parameters, 32)?,
+        "Terrain and its relay belong to different Studio DataModels"
+    );
     anyhow::ensure!(
         property.class_name == "Terrain",
         "Voxel observer target is not Terrain"
@@ -55,6 +68,7 @@ pub(crate) fn observe_terrain(pid: u32, title: &str, relay_path: &[String]) -> R
     for field in [40, 64, 65904] {
         bytes.extend_from_slice(&read_u64(&relay.parameters, field)?.to_le_bytes());
     }
+    bytes.extend_from_slice(&u64::from(catch_up).to_le_bytes());
     property.parameters[INPUT..INPUT + bytes.len()].copy_from_slice(&bytes);
     put_u32(&mut property.parameters, 65916, bytes.len() as u32);
     property.invoke(8)
@@ -213,7 +227,7 @@ mod tests {
         let pid: u32 = std::env::var("RENIUM_INSPECT_PID")?.parse()?;
         let relay = std::env::var("RENIUM_TERRAIN_RELAY")?;
         let title = crate::studio::input::studio_window_title(pid)?;
-        let result = observe_terrain(pid, &title, &["CoreGui".into(), relay]);
+        let result = observe_terrain(pid, &title, &["CoreGui".into(), relay], false);
         println!("observe_terrain: {result:?}");
         result
     }

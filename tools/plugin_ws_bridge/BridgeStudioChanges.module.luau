@@ -1587,8 +1587,21 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		}
 	end
 
-	local function prepareNativeTerrainRelay(): { string }
-		if nativeTerrainRelay then return nativeTerrainRelay.path end
+	local function releaseNativeTerrainRelay()
+		local relay = nativeTerrainRelay
+		if relay == nil then return end
+		nativeTerrainRelay = nil
+		relay.connection:Disconnect()
+		relay.ancestryConnection:Disconnect()
+		relay.notify:Destroy()
+	end
+
+	local function prepareNativeTerrainRelay(): ({ string }, boolean)
+		local coreGui = game:GetService("CoreGui")
+		if nativeTerrainRelay then
+			if nativeTerrainRelay.notify.Parent == coreGui then return nativeTerrainRelay.path, false end
+			releaseNativeTerrainRelay()
+		end
 		local notify = Instance.new("BoolValue")
 		notify.Name = "ReniumTerrainChanges_" .. game:GetService("HttpService"):GenerateGUID(false)
 		notify.Archivable = false
@@ -1606,8 +1619,14 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				end
 			end)
 		end)
-		notify.Parent = game:GetService("CoreGui")
-		return relay.path
+		notify.Parent = coreGui
+		relay.ancestryConnection = notify.AncestryChanged:Connect(function()
+			if nativeTerrainRelay ~= relay or notify.Parent == coreGui then return end
+			releaseNativeTerrainRelay()
+			state.waitGeneration += 1
+			signalChange()
+		end)
+		return relay.path, true
 	end
 
 	function api.finishNativeImportObservations(transactionId: string, createdById: { [string]: string }?): { [string]: { [Instance]: Instance } }
@@ -3475,11 +3494,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		if state.changeJournal ~= nil and not force then
 			return
 		end
-		if nativeTerrainRelay then
-			nativeTerrainRelay.connection:Disconnect()
-			nativeTerrainRelay.notify:Destroy()
-			nativeTerrainRelay = nil
-		end
+		releaseNativeTerrainRelay()
 		releaseLocalPushObservation()
 		localPushProofRequested = false
 		state.started = false
@@ -4101,6 +4116,11 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 		applyStateParams(params, services)
 
+		local terrainRelayCreated = false
+		if params.nativeTerrainRelay == true and state.started then
+			local _, created = prepareNativeTerrainRelay()
+			terrainRelayCreated = created
+		end
 		local waitSeconds = tonumber(params.waitSeconds)
 		local waitedForChange = false
 		local waitCancelled = false
@@ -4110,6 +4130,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			and params.clearPending ~= true
 			and params.reset ~= true
 			and params.ackSeq == nil
+			and not terrainRelayCreated
 		then
 			waitedForChange = true
 			_, waitCancelled = waitForDirtyServices(services, waitSeconds, leaseId)

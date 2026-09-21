@@ -1475,7 +1475,7 @@ static void ReadPropertyCore(PropertyReadTask* task)
                 renium_terrain_observation::Request request{};
                 std::memcpy(&request, p.input, sizeof(request));
                 renium_terrain_observation::Install(reinterpret_cast<void*>(p.target), reinterpret_cast<void*>(p.owner), request,
-                    p.classOffset, p.selfOffset, p.parentOffset,
+                    p.classOffset, p.selfOffset, p.parentOffset, p.ancestors[p.ancestorCount - 1],
                     [](std::uintptr_t address, void* output, std::size_t size) {
                         SIZE_T copied = 0;
                         return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), output, size, &copied) && copied == size;

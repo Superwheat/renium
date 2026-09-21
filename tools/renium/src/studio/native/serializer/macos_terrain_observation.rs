@@ -1,33 +1,58 @@
 //! Itanium RTTI and ARM64 argument flow locate Terrain's voxel notification.
 use super::*;
 
-pub(crate) fn observe_terrain(pid: u32, title: &str, relay_path: &[String]) -> Result<()> {
+pub(crate) fn observe_terrain(
+    pid: u32,
+    title: &str,
+    relay_path: &[String],
+    catch_up: bool,
+) -> Result<()> {
     anyhow::ensure!(
         relay_path.len() == 2
             && relay_path[0] == "CoreGui"
             && relay_path[1].starts_with("ReniumTerrainChanges_"),
         "Invalid Terrain relay path"
     );
-    let relay = prepare_property(
+    let memory = Memory::for_process(pid, Duration::from_secs(10))?;
+    let contexts = memory.request(5, &[0], title)?;
+    anyhow::ensure!(
+        contexts.len().is_multiple_of(64),
+        "Invalid Studio DataModel inventory"
+    );
+    let matches: Vec<_> = contexts
+        .chunks_exact(64)
+        .filter(|context| resolve_path(&memory, context, relay_path, &[]).is_ok())
+        .collect();
+    anyhow::ensure!(
+        matches.len() == 1,
+        "Terrain relay must identify exactly one Studio DataModel ({} matches)",
+        matches.len()
+    );
+    let context = matches[0];
+    let (relay, _) = prepare(
         pid,
         title,
         relay_path,
         &[],
         "Value",
         Duration::from_secs(10),
+        None,
+        Some(context),
     )?;
     anyhow::ensure!(
         relay.class_name == "BoolValue",
         "Terrain relay changed class"
     );
     relay.ensure_writable()?;
-    let mut property = prepare_property(
+    let (mut property, _) = prepare(
         pid,
         title,
         &["Workspace".into(), "Terrain".into()],
         &[],
         "Name",
         Duration::from_secs(10),
+        None,
+        Some(context),
     )?;
     anyhow::ensure!(
         property.class_name == "Terrain",
@@ -54,6 +79,7 @@ pub(crate) fn observe_terrain(pid: u32, title: &str, relay_path: &[String]) -> R
     for field in [24, 32, 56] {
         bytes.extend_from_slice(&read_u64(&relay.parameters, field).unwrap().to_le_bytes());
     }
+    bytes.extend_from_slice(&u64::from(catch_up).to_le_bytes());
     property.parameters[680..680 + bytes.len()].copy_from_slice(&bytes);
     put32(&mut property.parameters, 136, bytes.len() as u32);
     property.invoke(8).map(|_| ())

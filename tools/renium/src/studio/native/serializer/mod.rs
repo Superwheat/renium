@@ -14,6 +14,21 @@ use std::time::Duration;
 use anyhow::Result;
 use serde::Serialize;
 
+#[test]
+fn terrain_observation_retains_one_subscription_and_validates_model_ownership() {
+    let name = if cfg!(windows) {
+        "renium-terrain-observation-test.exe"
+    } else {
+        "renium-terrain-observation-test"
+    };
+    assert!(
+        std::process::Command::new(std::path::Path::new(env!("OUT_DIR")).join(name))
+            .status()
+            .expect("run native Terrain lifecycle regression")
+            .success()
+    );
+}
+
 #[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn validate_function_arguments(
     class: &str,

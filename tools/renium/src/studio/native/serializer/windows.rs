@@ -1303,6 +1303,7 @@ fn find_active_data_model(
     module: &ModuleEntry,
     data: PeSection,
     title: &str,
+    required_path: Option<&[String]>,
 ) -> Result<ActiveDataModel> {
     let data_base = module
         .base
@@ -1326,7 +1327,7 @@ fn find_active_data_model(
     let mut candidates = Vec::new();
     for (outer, offsets) in references
         .into_iter()
-        .filter(|(_, offsets)| offsets.len() >= 2)
+        .filter(|(_, offsets)| required_path.is_some() || offsets.len() >= 2)
     {
         if read_rtti_type(memory, outer, module.base, module.size).as_deref()
             != Some(".?AVDataModel@RBX@@")
@@ -1349,25 +1350,35 @@ fn find_active_data_model(
             continue;
         };
         for (layout, name, roots) in discover_instance_layout(memory, module, outer) {
+            let model = ActiveDataModel {
+                outer,
+                owner,
+                roots,
+                layout,
+            };
+            if required_path
+                .is_some_and(|path| properties::resolve_path(memory, &model, path, &[]).is_err())
+            {
+                continue;
+            }
             let exact_name = expected_names
                 .iter()
                 .any(|expected| expected.eq_ignore_ascii_case(&name));
             let score = usize::from(exact_name) * 1000
                 + usize::from(!name.eq_ignore_ascii_case("Game")) * 100
                 + offsets.len().min(20);
-            candidates.push((
-                score,
-                name,
-                ActiveDataModel {
-                    outer,
-                    owner,
-                    roots,
-                    layout,
-                },
-            ));
+            candidates.push((score, name, model));
         }
     }
     candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
+    if required_path.is_some() {
+        anyhow::ensure!(
+            candidates.len() == 1,
+            "Terrain relay must identify exactly one Studio DataModel ({} matches)",
+            candidates.len()
+        );
+        return Ok(candidates.remove(0).2);
+    }
     let Some((best_score, best_name, _)) = candidates.first() else {
         bail!("Could not locate the active Studio DataModel");
     };
@@ -1487,6 +1498,17 @@ fn active_data_model(
     data: PeSection,
     title: &str,
 ) -> Result<ActiveDataModel> {
+    active_data_model_for_path(pid, memory, module, data, title, None)
+}
+
+fn active_data_model_for_path(
+    pid: u32,
+    memory: &ProcessMemory,
+    module: &ModuleEntry,
+    data: PeSection,
+    title: &str,
+    required_path: Option<&[String]>,
+) -> Result<ActiveDataModel> {
     // Bridge selectors use a file name; native property calls may use the full
     // window caption. Cache the uniquely resolved window, not either spelling.
     let (_, title) = capture_window(pid, title)?;
@@ -1495,10 +1517,14 @@ fn active_data_model(
     if let Some(data_model) = cached
         .as_ref()
         .and_then(|cached| refresh_active_data_model(memory, module, &title, cached))
+        .filter(|model| {
+            required_path
+                .is_none_or(|path| properties::resolve_path(memory, model, path, &[]).is_ok())
+        })
     {
         return Ok(data_model);
     }
-    let data_model = find_active_data_model(memory, module, data, &title)?;
+    let data_model = find_active_data_model(memory, module, data, &title, required_path)?;
     cache.lock_recover().insert(
         pid,
         CachedDataModel {

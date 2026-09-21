@@ -112,6 +112,7 @@ mesh.Color = roblox.Color3.new(1, 1, 1)
 mesh.BrickColor = roblox.BrickColor.new(mesh.Color)
 local names = { "TopLeftRadius", "TopRightRadius", "BottomLeftRadius", "BottomRightRadius" }
 for _, name in names do corner[name] = roblox.UDim.new(0, 8) end
+local nextRelay = 0
 local services = {
 	ReplicatedStorage = storage, Workspace = workspace, EncodingService = {},
 	CollectionService = { GetTags = function() return {} end, GetAllTags = function() return {} end,
@@ -119,7 +120,7 @@ local services = {
 		GetInstanceRemovedSignal = function() return signal() end,
 		TagAdded = signal(), TagRemoved = signal() },
 	CoreGui = instance("CoreGui", "CoreGui", testGame),
-	HttpService = { GenerateGUID = function() return "owned-relay-test" end },
+	HttpService = { GenerateGUID = function() nextRelay += 1 return `owned-relay-test-{nextRelay}` end },
 	RunService = { Heartbeat = signal() },
 }
 function testGame:GetService(name) return assert(services[name], name) end
@@ -148,7 +149,7 @@ local trackerModule = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeStudio
 		Enum = { ContentSourceType = contentTypes, ScreenInsets = roblox.Enum.ScreenInsets },
 		script = { Parent = dependencies }, require = function(module) return module end,
 		Instance = { new = function(class)
-			if class == "ObjectValue" then
+			if class == "ObjectValue" or class == "BoolValue" then
 				local relay = instance(class, "Notify")
 				function relay:Destroy() self.destroyed = true self.Parent = nil end
 				function relay:SetAttribute(name, value) self[name] = value end
@@ -2052,3 +2053,52 @@ do
 	testGame.ItemChanged, workspace.CurrentCamera = savedItemChanged, savedCamera
 end
 print("Local push proof: existing observers, raw edits, camera, asynchronous Terrain fence, expiry and lease transitions verified")
+
+do
+	local config = table.clone(trackerConfig)
+	local invalidations = 0
+	config.invalidateTerrainExport = function() invalidations += 1 end
+	workspace.Terrain = instance("Terrain", "Terrain", workspace)
+	local observer = trackerModule.create(config, { Workspace = true })
+	local previous = nil
+	for _ = 1, 20 do
+		local state = observer.getState({ services = { "Workspace" }, nativeTerrainRelay = true })
+		local relay = createdRelays[#createdRelays]
+		assert(relay.Name == state.nativeTerrainRelay[2] and relay ~= previous)
+		assert(relay:GetPropertyChangedSignal("Value"):Count() == 1 and relay.AncestryChanged:Count() == 1)
+		local same = observer.getState({ start = false, nativeTerrainRelay = true })
+		assert(same.nativeTerrainRelay[2] == state.nativeTerrainRelay[2])
+		relay.Value = true
+		relay:GetPropertyChangedSignal("Value"):Fire()
+		assert(observer.getState({ start = false }).dirtyServices[1] == "Workspace")
+		relay.Parent = nil
+		relay.AncestryChanged:Fire()
+		assert(relay.destroyed and relay:GetPropertyChangedSignal("Value"):Count() == 0 and relay.AncestryChanged:Count() == 0)
+		previous = relay
+	end
+	assert(invalidations == 20)
+	observer.getState({ nativeTerrainRelay = true })
+	local beforeStop = createdRelays[#createdRelays]
+	observer.getState({ stop = true, nativeTerrainRelay = true })
+	assert(beforeStop.destroyed and beforeStop.AncestryChanged:Count() == 0)
+	local restarted = observer.getState({ nativeTerrainRelay = true })
+	assert(restarted.nativeTerrainRelay[2] ~= beforeStop.Name)
+	observer.stop()
+	local state
+	local function requestRelay()
+		local thread = coroutine.create(function()
+			state = observer.getState({ services = { "Workspace" }, nativeTerrainRelay = true, waitSeconds = 25 })
+		end)
+		assert(coroutine.resume(thread))
+		assert(coroutine.status(thread) == "dead", "a lost relay must return before waiting for unobservable changes")
+		return createdRelays[#createdRelays]
+	end
+	local waitingRelay = requestRelay()
+	assert(state.nativeTerrainRelay[2] == waitingRelay.Name)
+	waitingRelay.Parent = nil
+	waitingRelay.AncestryChanged:Fire()
+	assert(requestRelay() ~= waitingRelay)
+	observer.stop()
+	workspace.Terrain = nil
+end
+print("Terrain relay: lost relays are replaced, stop/restart renews identity, and old listeners are disconnected")

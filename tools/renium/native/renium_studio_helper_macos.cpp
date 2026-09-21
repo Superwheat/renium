@@ -115,7 +115,7 @@ struct DataModelScanStats
 };
 
 static constexpr std::uint32_t Magic = 0x4d4e4552;
-static constexpr std::uint32_t Version = 9;
+static constexpr std::uint32_t Version = 10;
 // Command 3 does not use factoryRva as a function address. Its top bit opts in
 // to per-candidate clocks; older helpers ignore it and keep the same payloads.
 static constexpr std::uint64_t PropertyPhaseTimingFlag = std::uint64_t{1} << 63;
@@ -656,7 +656,8 @@ static bool FindDataModel(
     void*& output,
     DataModelLayout& layout,
     std::string& error,
-    PropertyTiming* timing = nullptr)
+    PropertyTiming* timing = nullptr,
+    std::uintptr_t expectedModel = 0)
 {
     const auto lockStart = std::chrono::steady_clock::now();
     std::lock_guard lock(DataModelCacheMutex);
@@ -668,7 +669,7 @@ static bool FindDataModel(
         const auto instance = cached + CachedDataModelInstanceOffset;
         std::vector<SharedInstance> children;
         std::size_t readableClasses = 0;
-        if (CachedDataModelTitle == title && CachedDataModelInstanceOffset &&
+        if ((!expectedModel || cached == expectedModel) && CachedDataModelTitle == title && CachedDataModelInstanceOffset &&
             CachedDataModelChildrenOffset &&
             IsDataModelInstance(instance) &&
             ReadChildren(instance, CachedDataModelChildrenOffset, children) &&
@@ -694,6 +695,11 @@ static bool FindDataModel(
     DataModelScanStats stats;
     const auto scanStart = std::chrono::steady_clock::now();
     AddCandidates(header, slide, ExpectedDataModelNames(title), candidates, stats, timing && timing->detailed);
+    if (expectedModel) {
+        candidates.erase(std::remove_if(candidates.begin(), candidates.end(), [&](const auto& candidate) {
+            return reinterpret_cast<std::uintptr_t>(candidate.outer) != expectedModel;
+        }), candidates.end());
+    }
     if (timing)
     {
         timing->scanUs = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -2784,7 +2790,7 @@ static void ExecutePropertyCall(const std::shared_ptr<PropertyCallTask>& task)
                     renium_terrain_observation::Request request{};
                     std::memcpy(&request, p.input, sizeof(request));
                     renium_terrain_observation::Install(reinterpret_cast<void*>(p.instance), reinterpret_cast<void*>(p.owner), request,
-                        p.classOffset, p.selfOffset, p.parentOffset, ReadMemory, RetainOwner, ReleaseOwner);
+                        p.classOffset, p.selfOffset, p.parentOffset, p.ancestors[p.ancestorCount - 1], ReadMemory, RetainOwner, ReleaseOwner);
                 }
                 const auto binding = renium_terrain_observation::GetBinding(reinterpret_cast<void*>(p.instance));
                 const auto data = reinterpret_cast<const unsigned char*>(&binding);
@@ -2948,7 +2954,7 @@ static bool RunPropertyCall(const std::string& payload, const std::string& title
             std::uintptr_t owner = 0;
             DataModelLayout layout;
             const auto& params = current->params;
-            if (!FindDataModel(state->header, state->slide, state->title, model, layout, problem, current->timing.get()) ||
+            if (!FindDataModel(state->header, state->slide, state->title, model, layout, problem, current->timing.get(), params.model) ||
                 reinterpret_cast<std::uintptr_t>(model) != params.model ||
                 params.ancestors[params.ancestorCount - 1] != params.model + layout.instanceOffset ||
                 !ResolveDataModelTaskContext(model, layout, state->header, state->submit, context, problem) ||
@@ -3038,6 +3044,26 @@ static Response PropertyTransport(
             InstanceClassDescriptorOffset, 8, reinterpret_cast<std::uintptr_t>(model)};
         output.resize(sizeof(context));
         std::memcpy(output.data(), context, sizeof(context));
+    }
+    else if (request.reserved == 5 && payload.size() == 1)
+    {
+        std::lock_guard lock(DataModelCacheMutex);
+        std::vector<DataModelCandidate> candidates;
+        DataModelScanStats stats;
+        AddCandidates(header, slide, ExpectedDataModelNames(title), candidates, stats);
+        for (const auto& candidate : candidates) {
+            const auto model = reinterpret_cast<std::uintptr_t>(candidate.outer);
+            const auto instance = model + candidate.instanceOffset;
+            std::uintptr_t owner = 0;
+            if (!IsDataModelInstance(instance) || !ReadValue(instance + 16, owner) || !LikelyPointer(owner))
+                continue;
+            const std::uint64_t context[] = {
+                reinterpret_cast<std::uintptr_t>(header), instance, owner,
+                candidate.childrenOffset, CachedInstanceNameOffset.load(std::memory_order_relaxed),
+                InstanceClassDescriptorOffset, 8, model};
+            const auto bytes = reinterpret_cast<const unsigned char*>(context);
+            output.insert(output.end(), bytes, bytes + sizeof(context));
+        }
     }
     else if (request.reserved == 1 && payload.size() == 12)
     {

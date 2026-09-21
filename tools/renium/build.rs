@@ -414,6 +414,34 @@ fn embed_windows_manifest(out_dir: &Path) {
     );
 }
 
+fn build_terrain_observation_test(out_dir: &Path) {
+    let source = Path::new("native/tests/terrain_observation.cpp");
+    let compiler = cc::Build::new().cpp(true).static_crt(true).get_compiler();
+    let mut command = compiler.to_command();
+    if compiler.is_like_msvc() {
+        command.args(["/nologo", "/O2", "/EHsc", "/std:c++20", "/MT"]);
+        command
+            .arg(source)
+            .arg(format!("/Fo{}\\", out_dir.display()));
+        command.arg(format!(
+            "/Fe{}",
+            out_dir
+                .join("renium-terrain-observation-test.exe")
+                .display()
+        ));
+        command.args(["/link", "/INCREMENTAL:NO"]);
+    } else {
+        command.args(["-O2", "-std=c++20", "-pthread"]);
+        command
+            .arg(source)
+            .arg("-o")
+            .arg(out_dir.join("renium-terrain-observation-test"));
+    }
+    run(&mut command, "Terrain observation regression build");
+    println!("cargo:rerun-if-changed={}", source.display());
+    println!("cargo:rerun-if-changed=native/renium_terrain_observation.h");
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=native/renium_studio_functions.h");
     println!("cargo:rerun-if-changed=build.rs");
@@ -425,6 +453,9 @@ fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is missing"));
     generate_operations(&out_dir);
     generate_config_settings(&out_dir);
+    if host == env::var("TARGET").expect("TARGET is missing") {
+        build_terrain_observation_test(&out_dir);
+    }
     match target_os.as_str() {
         "windows" => {
             build_windows(&out_dir);

@@ -39,6 +39,10 @@ const STUDIO_PULL_SETTLE_LIMIT: Duration = Duration::from_secs(2);
 const RESCAN_RETRY: Duration = Duration::from_millis(500);
 const MAX_PUSH_RETRY_DELAY: Duration = Duration::from_secs(5);
 const ENABLED_FILE: &str = "live-watch-state.enabled";
+
+#[cfg(any(windows, target_os = "macos"))]
+#[path = "live_terrain.rs"]
+mod terrain;
 const ENABLED_MARKER_VERSION: u8 = 1;
 
 #[derive(Deserialize, Serialize)]
@@ -193,6 +197,8 @@ struct Control {
     status: Mutex<Status>,
     plugin_state: Mutex<Value>,
     studio_wait_error: Mutex<Option<String>>,
+    #[cfg(any(windows, target_os = "macos"))]
+    terrain_observer: Mutex<terrain::Observer>,
     finished: Mutex<bool>,
     finished_event: Condvar,
 }
@@ -266,6 +272,8 @@ impl Control {
             }),
             plugin_state: Mutex::new(json!({})),
             studio_wait_error: Mutex::new(None),
+            #[cfg(any(windows, target_os = "macos"))]
+            terrain_observer: Mutex::new(terrain::Observer::default()),
             finished: Mutex::new(false),
             finished_event: Condvar::new(),
         }
@@ -949,44 +957,7 @@ impl Manager {
         }
         let phase = Instant::now();
         #[cfg(any(windows, target_os = "macos"))]
-        let terrain_observation = {
-            let runtime_id = context
-                .runtime_id
-                .as_deref()
-                .context("Live Sync has no Studio runtime")?;
-            let info = bridge.cached_bridge_info_for_runtime(BridgeTarget::Edit, runtime_id)?;
-            let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, runtime_id)?;
-            let title = crate::studio::native::serializer::target_name(pid, &info.place_name)?;
-            let state = bridge.call_for_runtime_with_timeout(
-                "getStudioChangeState",
-                json!({"nativeTerrainRelay":true}),
-                BridgeTarget::Edit,
-                runtime_id,
-                Some(Duration::from_secs(3)),
-            )?;
-            ensure_plugin_api_ok(&state)?;
-            let path: Vec<String> = serde_json::from_value(state["nativeTerrainRelay"].clone())
-                .context("Studio plugin does not support Terrain observation; update the plugin")?;
-            // Terrain edits made in Studio are only noticed through this
-            // observer. Its discovery anchors on Studio code shapes, so a
-            // Studio update can break it; everything else still syncs.
-            match crate::studio::native::serializer::observe_terrain(pid, &title, &path) {
-                Ok(()) => None,
-                Err(error) => {
-                    log_global(
-                        5,
-                        format_args!(
-                            "[renium] Terrain observation unavailable; Studio Terrain edits will not sync live: {error:#}"
-                        ),
-                    );
-                    Some(format!(
-                        "unavailable, Studio Terrain edits will not sync live: {error:#}"
-                    ))
-                }
-            }
-        };
-        #[cfg(not(any(windows, target_os = "macos")))]
-        let terrain_observation: Option<String> = None;
+        let terrain_observer = terrain::Observer::start(&context, &bridge);
         self.coordinator.reconcile(&context, &bridge, &mut setup)?;
         log_live_timing("startup reconcile", phase);
         let phase = Instant::now();
@@ -1008,7 +979,11 @@ impl Manager {
         if let Some(error) = setup.error {
             control.fail(error);
         }
-        control.status.lock_recover().terrain_observation = terrain_observation;
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            control.status.lock_recover().terrain_observation = terrain_observer.error.clone();
+            *control.terrain_observer.lock_recover() = terrain_observer;
+        }
         let session_id = self.next_session.fetch_add(1, Ordering::Relaxed) + 1;
         let context_id = context.id;
         let runtime_id = context.runtime_id.clone();
@@ -1964,18 +1939,29 @@ fn wait_for_studio_event(
         .runtime_id
         .as_deref()
         .context("Live sync context has no Studio runtime")?;
+    #[cfg(any(windows, target_os = "macos"))]
+    let wait_seconds = control.terrain_observer.lock_recover().wait_seconds();
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let wait_seconds = 25;
     let state = bridge.call_for_runtime_with_timeout(
         "getStudioChangeState",
         json!({
             "start": false,
-            "waitSeconds": 25,
+            "waitSeconds": wait_seconds,
             "compact": true,
+            "nativeTerrainRelay": true,
         }),
         BridgeTarget::Edit,
         runtime_id,
         Some(Duration::from_secs(27)),
     )?;
     ensure_plugin_api_ok(&state)?;
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let mut observer = control.terrain_observer.lock_recover();
+        observer.refresh(context, bridge, &state);
+        control.status.lock_recover().terrain_observation = observer.error.clone();
+    }
     Ok(state)
 }
 

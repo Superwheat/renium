@@ -1268,7 +1268,10 @@ pub(crate) fn prepare_property(
     property: &str,
     timeout: Duration,
 ) -> Result<NativeProperty> {
-    prepare(pid, title, segments, ordinals, property, timeout, None).map(|(prepared, _)| prepared)
+    prepare(
+        pid, title, segments, ordinals, property, timeout, None, None,
+    )
+    .map(|(prepared, _)| prepared)
 }
 
 /// A trusted snapshot read captures identity and value on the same engine task.
@@ -1290,10 +1293,12 @@ pub(crate) fn read_property(
         property,
         timeout,
         Some(class),
+        None,
     )
     .map(|(_, value)| value)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare(
     pid: u32,
     title: &str,
@@ -1302,6 +1307,7 @@ fn prepare(
     property: &str,
     timeout: Duration,
     read_class: Option<&str>,
+    model_path: Option<&[String]>,
 ) -> Result<(NativeProperty, String)> {
     let deadline = Instant::now() + timeout;
     let current_modules = modules(pid)?;
@@ -1312,7 +1318,7 @@ fn prepare(
     let layout = package_layout(&studio.path)?;
     let memory = ProcessMemory::open(pid)?;
     verify_loaded_image(&memory, studio, layout.image_stamp)?;
-    let model = active_data_model(pid, &memory, studio, layout.data, title)?;
+    let model = active_data_model_for_path(pid, &memory, studio, layout.data, title, model_path)?;
     let model_instance = model.outer + model.layout.data_model_instance;
     // active_data_model binds the selected PID and document window. game.Name
     // can differ from that caption; the native invocation validates the model

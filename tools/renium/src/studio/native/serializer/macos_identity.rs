@@ -145,6 +145,7 @@ pub(crate) fn capture_identities(
         "Name",
         timeout,
         None,
+        None,
     )?;
     let memory = &prepared.memory;
     let context = memory.request(0, &[0], title)?;
