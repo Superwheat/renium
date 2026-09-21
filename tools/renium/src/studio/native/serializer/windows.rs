@@ -138,6 +138,7 @@ struct SerializerTrace {
 #[derive(Clone)]
 struct PackageLayout {
     data: PeSection,
+    rdata: Option<PeSection>,
     text: PeSection,
     submit_task: usize,
     image_stamp: [u32; 3],
@@ -893,6 +894,7 @@ fn package_layout(path: &Path) -> Result<PackageLayout> {
     let image = PeImage::parse(&bytes)?;
     let layout = PackageLayout {
         data: image.section(b".data")?,
+        rdata: image.section(b".rdata").ok(),
         text: image.section(b".text")?,
         submit_task: renderer_submit_task_rva(&bytes, &image)?,
         image_stamp: image.image_stamp,

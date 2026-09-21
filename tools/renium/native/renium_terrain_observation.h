@@ -95,8 +95,17 @@ static void Install(void* terrain, void* terrainOwner, const Request& request,
         std::uintptr_t value = 0;
         return read(address, &value, sizeof(value)) && value == expected;
     };
+    // An older helper generation may still hold the listener through its own
+    // copy of this interface; the copy keeps the locator, so it is recognised
+    // and replaced by a copy of the engine table rather than hooked in turn.
+    const auto sameInterface = [&](std::uintptr_t table) {
+        std::uintptr_t current = 0, original = 0;
+        return read(table - 8, &current, sizeof(current)) && read(binding.table - 8, &original, sizeof(original)) &&
+            current == original;
+    };
     if (!relay.setter || !equal(relay.descriptor, relay.descriptorTable) ||
-        (*listener != binding.table && (!existing || existing->binding.table != binding.table)) ||
+        (*listener != binding.table && (!existing || existing->binding.table != binding.table) &&
+            !sameInterface(*listener)) ||
         !equal(relay.instance + classOffset, relay.classDescriptor) || !equal(relay.instance + selfOffset, relay.instance) ||
         !equal(relay.instance + selfOffset + 8, relay.owner) || !equal(relay.instance + parentOffset, relay.parent))
         throw std::runtime_error("Terrain notification target changed");

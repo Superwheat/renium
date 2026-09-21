@@ -80,6 +80,8 @@ struct Status {
     auto_desynced_at_push: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terrain_observation: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -947,7 +949,7 @@ impl Manager {
         }
         let phase = Instant::now();
         #[cfg(any(windows, target_os = "macos"))]
-        {
+        let terrain_observation = {
             let runtime_id = context
                 .runtime_id
                 .as_deref()
@@ -965,9 +967,26 @@ impl Manager {
             ensure_plugin_api_ok(&state)?;
             let path: Vec<String> = serde_json::from_value(state["nativeTerrainRelay"].clone())
                 .context("Studio plugin does not support Terrain observation; update the plugin")?;
-            crate::studio::native::serializer::observe_terrain(pid, &title, &path)
-                .context("Could not observe Terrain changes for Live Sync")?;
-        }
+            // Terrain edits made in Studio are only noticed through this
+            // observer. Its discovery anchors on Studio code shapes, so a
+            // Studio update can break it; everything else still syncs.
+            match crate::studio::native::serializer::observe_terrain(pid, &title, &path) {
+                Ok(()) => None,
+                Err(error) => {
+                    log_global(
+                        5,
+                        format_args!(
+                            "[renium] Terrain observation unavailable; Studio Terrain edits will not sync live: {error:#}"
+                        ),
+                    );
+                    Some(format!(
+                        "unavailable, Studio Terrain edits will not sync live: {error:#}"
+                    ))
+                }
+            }
+        };
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let terrain_observation: Option<String> = None;
         self.coordinator.reconcile(&context, &bridge, &mut setup)?;
         log_live_timing("startup reconcile", phase);
         let phase = Instant::now();
@@ -989,6 +1008,7 @@ impl Manager {
         if let Some(error) = setup.error {
             control.fail(error);
         }
+        control.status.lock_recover().terrain_observation = terrain_observation;
         let session_id = self.next_session.fetch_add(1, Ordering::Relaxed) + 1;
         let context_id = context.id;
         let runtime_id = context.runtime_id.clone();
@@ -2498,6 +2518,8 @@ struct LiveLoop {
     last_rescan: Instant,
     push_retry_delay: Duration,
     rescan_pending: bool,
+    reconcile_retry: Option<Instant>,
+    reconcile_retry_delay: Duration,
 }
 
 impl LiveLoop {
@@ -2542,6 +2564,8 @@ impl LiveLoop {
             last_rescan: Instant::now() - RESCAN_RETRY,
             push_retry_delay: Duration::ZERO,
             rescan_pending: false,
+            reconcile_retry: None,
+            reconcile_retry_delay: Duration::ZERO,
         })
     }
 
@@ -2625,6 +2649,10 @@ impl LiveLoop {
 
     fn apply_retry_requests(&mut self) {
         if self.control.retry.swap(false, Ordering::AcqRel) {
+            if self.reconcile_retry.is_some() {
+                self.reconcile_retry = Some(Instant::now());
+                self.reconcile_retry_delay = Duration::ZERO;
+            }
             self.blocked.clear();
             self.push_retry_delay = Duration::ZERO;
             self.studio.retry_delay = Duration::ZERO;
@@ -2698,6 +2726,8 @@ impl LiveLoop {
                 self.studio.pending_payload = None;
                 self.studio.pull_ready = true;
                 self.last_event = Instant::now();
+                self.reconcile_retry = None;
+                self.reconcile_retry_delay = Duration::ZERO;
             }
             Err(error) if automation_failure_ref(&error).0.c == "no_studio" => return Err(error),
             Err(error) => {
@@ -2707,9 +2737,32 @@ impl LiveLoop {
                 ));
                 self.push_ready = false;
                 self.rescan_pending = true;
+                // Studio still holds its changes and the files may never change
+                // again, so nothing else would try again; retry with backoff.
+                self.reconcile_retry_delay = if self.reconcile_retry_delay.is_zero() {
+                    Duration::from_secs(1)
+                } else {
+                    (self.reconcile_retry_delay * 2).min(Duration::from_secs(30))
+                };
+                self.reconcile_retry = Some(Instant::now() + self.reconcile_retry_delay);
             }
         }
         Ok(None)
+    }
+
+    fn maybe_retry_reconcile(&mut self) -> Result<bool> {
+        let Some(due) = self.reconcile_retry else {
+            return Ok(false);
+        };
+        if Instant::now() < due
+            || self.rescan_pending
+            || self.control.file_pause_count.load(Ordering::Acquire) > 0
+        {
+            return Ok(false);
+        }
+        self.reconcile_retry = Some(Instant::now() + RESCAN_RETRY);
+        self.reconcile_concurrent_changes()?;
+        Ok(true)
     }
 
     fn pending_push_paths(&self) -> Vec<PathBuf> {
@@ -3180,6 +3233,9 @@ impl LiveLoop {
                 continue;
             }
             if self.maybe_push()? {
+                continue;
+            }
+            if self.maybe_retry_reconcile()? {
                 continue;
             }
             self.maybe_pull()?;

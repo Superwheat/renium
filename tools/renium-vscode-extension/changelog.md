@@ -13,6 +13,8 @@
 ### Bug fixes
 
 - On macOS, a Studio that Renium launched no longer locks, warps or hides the pointer while it is not the active application. A Play session that captures the mouse takes it only once the user switches to Studio and releases it when they switch away.
+- Live Sync retries a reconcile that failed because files changed while Studio was exporting, with backoff, instead of staying on "Sync failed" until the next file edit; a manual retry also triggers it.
+- Terrain observation anchors on the engine's own listener table, so a newer helper generation no longer fails discovery on an older generation's hook; if observation is unavailable, Live Sync still starts and reports it in the status instead of refusing.
 
 ## 0.3.10 - 2026-09-20
 
