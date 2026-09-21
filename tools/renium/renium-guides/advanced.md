@@ -35,10 +35,21 @@ those changes and stops automatic control. `rbx audio status` reads the mode,
 focus and output-session counts. Use `--player 1` for a separate test client or
 `--pid PID` for an exact local Studio process. Other Studio processes are untouched.
 
-Default: off. Control lasts until that Studio process closes, including across
-daemon reconnects; new windows start unchanged. No Sound objects or saved volume
+Add `--global` for a persistent user-wide mode covering existing and newly opened
+Studio windows, without a project or connection: `rbx audio auto --global`.
+Read it with `rbx audio status --global`; `off --global` or `unmute --global`
+disables it and restores prior mute states, preserving manual mutes. Explicit
+window commands override it until the next global change. The setting resumes
+when Renium starts; it also keeps watching when all Studio windows are closed.
+The same setting is **Renium: Studio Audio Mode** in editor User Settings, or
+`rbx cfg set studioAudioMode auto --scope user` (`off`, `auto`, `mute`).
+Settings and menu/CLI changes stay synchronized; project overrides are rejected.
+
+Default: off. Without `--global`, control lasts until that Studio process closes,
+including across daemon reconnects. No Sound objects or saved volume
 levels are edited. The editor offers **Renium: Studio Audio**. macOS requires
-Studio opened with the matching Renium helper; unsupported aggregate/virtual
+Studio opened with the matching Renium helper; global status lists any window
+that needs reopening rather than reopening it automatically. Unsupported aggregate/virtual
 output devices report an error instead of muting the system output.
 
 ## Publishing places

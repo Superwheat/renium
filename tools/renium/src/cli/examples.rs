@@ -1,7 +1,7 @@
 pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     (
         "audio",
-        "Examples:\n  rbx audio mute\n  rbx audio unmute\n  rbx audio auto\n  rbx audio off\n  rbx audio status",
+        "Examples:\n  rbx audio auto --global\n  rbx audio status --global\n  rbx audio off --global\n  rbx audio mute\n  rbx audio unmute\n  rbx audio auto\n  rbx audio off\n  rbx audio status",
     ),
     (
         "publish",

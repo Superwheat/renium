@@ -8,6 +8,23 @@ loader._load = (request, parent, isMain) => request === "vscode" ? {} : original
 const { AutomationClient } = require("../src/automationClient") as typeof import("../src/automationClient");
 loader._load = original;
 
+test("global audio bypasses project binding while selected-window audio retains it", async () => {
+  const { AUTOMATION_OP } = require("../src/automationProtocol.generated");
+  for (const global of [true, false]) {
+    const client = new AutomationClient({ appendLine() {} } as never, () => "") as any;
+    let binds = 0;
+    client.ensure = async () => {};
+    client.ensureContext = async () => { binds++; return 42; };
+    client.send = async (_config: unknown, _label: string, op: number, cx: number | undefined) => {
+      assert.equal(op, AUTOMATION_OP.studioAudio);
+      assert.equal(cx, global ? undefined : 42);
+      return { code: 0 };
+    };
+    await client.runOperation("rbx", {}, "audio", AUTOMATION_OP.studioAudio, { global, action: "auto" });
+    assert.equal(binds, global ? 0 : 1);
+  }
+});
+
 test("unmatched connected Studios cannot cause a bind loop; a newly ready target can bind", async () => {
   for (const ready of [false, true]) {
     const client = new AutomationClient({ appendLine() {} } as never, () => "") as any;

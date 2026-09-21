@@ -12,7 +12,7 @@ pub(crate) struct StudioProcess {
 }
 
 #[cfg(windows)]
-pub(crate) fn studio_processes() -> Vec<StudioProcess> {
+fn process_list(titles: bool) -> Vec<StudioProcess> {
     use std::mem::{size_of, zeroed};
     use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -40,8 +40,9 @@ pub(crate) fn studio_processes() -> Vec<StudioProcess> {
             .iter()
             .position(|unit| *unit == 0)
             .unwrap_or(entry.szExeFile.len());
-        if String::from_utf16_lossy(&entry.szExeFile[..length])
-            .eq_ignore_ascii_case("RobloxStudioBeta.exe")
+        let name = String::from_utf16_lossy(&entry.szExeFile[..length]);
+        if name.eq_ignore_ascii_case("RobloxStudioBeta.exe")
+            || name.eq_ignore_ascii_case("RobloxStudio.exe")
         {
             let pid = entry.th32ProcessID;
             // SAFETY: OpenProcess returns a new handle or null; it is closed below.
@@ -89,7 +90,9 @@ pub(crate) fn studio_processes() -> Vec<StudioProcess> {
             processes.push(StudioProcess {
                 pid,
                 started_unix,
-                title: crate::studio::input::studio_window_title(pid).ok(),
+                title: titles
+                    .then(|| crate::studio::input::studio_window_title(pid).ok())
+                    .flatten(),
             });
         }
         // SAFETY: snapshot and entry remain valid for the next enumeration call.
@@ -101,7 +104,7 @@ pub(crate) fn studio_processes() -> Vec<StudioProcess> {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn studio_processes() -> Vec<StudioProcess> {
+fn process_list(titles: bool) -> Vec<StudioProcess> {
     use std::time::SystemTime;
 
     let Ok(output) = std::process::Command::new("ps")
@@ -124,11 +127,16 @@ pub(crate) fn studio_processes() -> Vec<StudioProcess> {
             continue;
         };
         let command = parts.collect::<Vec<_>>().join(" ");
-        if command.rsplit('/').next() == Some("RobloxStudio") {
+        if matches!(
+            command.rsplit('/').next(),
+            Some("RobloxStudio" | "RobloxStudio.bin")
+        ) {
             processes.push(StudioProcess {
                 pid,
                 started_unix: Some(now.saturating_sub(elapsed)),
-                title: crate::studio::input::studio_window_title(pid).ok(),
+                title: titles
+                    .then(|| crate::studio::input::studio_window_title(pid).ok())
+                    .flatten(),
             });
         }
     }
@@ -136,8 +144,19 @@ pub(crate) fn studio_processes() -> Vec<StudioProcess> {
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
-pub(crate) fn studio_processes() -> Vec<StudioProcess> {
+fn process_list(_titles: bool) -> Vec<StudioProcess> {
     Vec::new()
+}
+
+pub(crate) fn studio_processes() -> Vec<StudioProcess> {
+    process_list(true)
+}
+
+pub(crate) fn studio_process_ids() -> Vec<u32> {
+    process_list(false)
+        .into_iter()
+        .map(|process| process.pid)
+        .collect()
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]

@@ -438,6 +438,8 @@ pub(super) enum Commands {
     #[command(hide = true)]
     AudioWorker(crate::studio::audio::WorkerArgs),
     #[command(hide = true)]
+    AudioGlobalWorker,
+    #[command(hide = true)]
     PerformanceWorker,
     #[command(hide = true)]
     PerformanceHolder(performance::PerformanceHolderArgs),

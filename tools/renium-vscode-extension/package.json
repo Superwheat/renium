@@ -497,6 +497,14 @@
     "configuration": {
       "title": "Renium",
       "properties": {
+        "renium.studioAudioMode": {
+          "type": "string",
+          "default": "off",
+          "enum": ["off", "auto", "mute"],
+          "enumDescriptions": ["Restore prior mute states; do not control audio.", "Mute each Studio window while it is unfocused.", "Mute all Studio windows."],
+          "scope": "application",
+          "description": "Global Studio audio mode, including newly opened windows. Shared with rbx cfg set studioAudioMode MODE --scope user. Does not change game sounds or system volume."
+        },
         "renium.cliPath": {
           "type": "string",
           "default": "",

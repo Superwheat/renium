@@ -2539,6 +2539,20 @@ fn automation_execute_request(
     );
     match operation.id {
         op::CAP => automation::capabilities().map_err(automation_failure),
+        op::STUDIO_AUDIO if request.p.get("global").and_then(Value::as_bool) == Some(true) => {
+            (|| -> Result<Value> {
+                anyhow::ensure!(
+                    request.p.get("player").is_none_or(Value::is_null)
+                        && request.p.get("pid").is_none_or(Value::is_null),
+                    "Global audio cannot be combined with a PID or player target"
+                );
+                let action = serde_json::from_value(
+                    request.p.get("action").cloned().unwrap_or(json!("status")),
+                )?;
+                crate::studio::audio::global::command(action)
+            })()
+            .map_err(automation_failure)
+        }
         op::BIND => bound_context::bind(state, bridge, &request.p),
         op::COLLAB_START
         | op::COLLAB_JOIN
@@ -2874,6 +2888,8 @@ fn automation_response(
     let started = Instant::now();
     let operation = automation::opcode_by_id(request.op).ok();
     let queued = operation.is_some_and(|operation| operation.queued)
+        && !(request.op == op::STUDIO_AUDIO
+            && request.p.get("global").and_then(Value::as_bool) == Some(true))
         && !(request.op == op::PERFORMANCE_MONITOR
             && crate::studio::automation::monitor::is_edit_request(&request.p));
     let cancelled = |error: anyhow::Error| {

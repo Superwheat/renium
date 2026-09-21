@@ -42,6 +42,8 @@ rbx xp data/config.json
 ```
 
 `cfg list` includes current and allowed values. Writes affect the active place; use `--scope user`, `workspace`, or `experience` only for wider changes.
+`studioAudioMode` is user-only: `rbx cfg set studioAudioMode auto --scope user`
+enables background muting for every Studio window; `off` restores prior audio.
 `pv` validates project configuration and mappings offline, not script syntax; use `ck` for Luau syntax. `xp` explains how a path maps to instances, including nested projects.
 
 ## Adapters and imports

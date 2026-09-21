@@ -2045,6 +2045,7 @@ pub fn run_config(args: ConfigArgs) -> Result<()> {
             set_dotted(&mut value, &args.key, parsed.clone())?;
             validate_config_scope_change(args.scope, &args.root, &path, &value)?;
             write_json(&path, &value)?;
+            apply_user_audio_change(args.scope, Some(&args.key))?;
             crate::app::output::emit_global_output(
                 &json!({ "ok": true, "key": args.key, "value": parsed }),
                 &format!("{}={}", args.key, config_value_text(&parsed)?),
@@ -2063,6 +2064,7 @@ pub fn run_config(args: ConfigArgs) -> Result<()> {
             }
             validate_config_scope_change(args.scope, &args.root, &path, &value)?;
             write_config_scope(&path, &value)?;
+            apply_user_audio_change(args.scope, Some(&args.key))?;
             crate::app::output::emit_global_output(
                 &json!({ "ok": true, "action": "unset", "key": args.key, "path": path }),
                 &format!("Removed {} from {}", args.key, path.display()),
@@ -2073,6 +2075,7 @@ pub fn run_config(args: ConfigArgs) -> Result<()> {
             let path = config_scope_path(args.scope, &args.root)?;
             validate_config_scope_change(args.scope, &args.root, &path, &json!({}))?;
             remove_config_scope(&path)?;
+            apply_user_audio_change(args.scope, None)?;
             crate::app::output::emit_global_output(
                 &json!({ "ok": true, "action": "reset", "path": path }),
                 &format!("Reset {}", path.display()),
@@ -2458,6 +2461,44 @@ pub fn load_merged_config(root: &Path) -> Result<Value> {
     load_merged_config_with_override(root, None)
 }
 
+pub(crate) fn user_studio_audio_mode() -> Result<Value> {
+    let config = read_json_object_or_empty(&user_config_path()?)?;
+    Ok(config
+        .get("studioAudioMode")
+        .cloned()
+        .unwrap_or(json!("off")))
+}
+
+pub(crate) fn set_user_studio_audio_mode(mode: Value) -> Result<()> {
+    let path = user_config_path()?;
+    let mut value = read_json_object_or_empty(&path)?;
+    if value.get("studioAudioMode") != Some(&mode) {
+        value["studioAudioMode"] = mode;
+        validate_merged_config(&value)?;
+        write_json(&path, &value)?;
+    }
+    Ok(())
+}
+
+fn apply_user_audio_change(scope: ConfigScope, key: Option<&str>) -> Result<()> {
+    if scope == ConfigScope::User && key.is_none_or(|key| key == "studioAudioMode") {
+        let status = crate::studio::audio::global::command(crate::studio::audio::Action::Status)?;
+        anyhow::ensure!(
+            status["ok"] == true,
+            "Studio audio setting was saved, but some windows could not apply it: {status}"
+        );
+    }
+    Ok(())
+}
+
+fn validate_audio_scope(scope: ConfigScope, value: &Value) -> Result<()> {
+    anyhow::ensure!(
+        scope == ConfigScope::User || value.get("studioAudioMode").is_none(),
+        "studioAudioMode is global; use `rbx cfg set studioAudioMode MODE --scope user`"
+    );
+    Ok(())
+}
+
 fn load_merged_config_with_override(
     root: &Path,
     scope_override: Option<(&Path, &Value)>,
@@ -2473,14 +2514,18 @@ fn load_merged_config_with_override(
         if let Some((override_path, override_value)) = scope_override
             && absolute_path(override_path) == absolute_path(&path)
         {
+            validate_audio_scope(scope, override_value)?;
             merge_json(&mut merged, override_value.clone());
         } else if path.is_file() {
-            merge_json(&mut merged, read_json_object_or_empty(&path)?);
+            let value = read_json_object_or_empty(&path)?;
+            validate_audio_scope(scope, &value)?;
+            merge_json(&mut merged, value);
         }
     }
     if nearest_project_marker(root).is_some() {
         let project = load_project(None, Some(root))?;
         if project.project.settings.is_object() {
+            validate_audio_scope(ConfigScope::Place, &project.project.settings)?;
             merge_json(&mut merged, project.project.settings);
         }
     }
@@ -2563,6 +2608,11 @@ fn validate_merged_config(value: &Value) -> Result<()> {
                         value.as_str(),
                         Some("off" | "error" | "warn" | "info" | "debug" | "trace")
                     ),
+                )?,
+                "studioAudioMode" => require_kind(
+                    &path,
+                    "off, mute, or auto",
+                    matches!(value.as_str(), Some("off" | "mute" | "auto")),
                 )?,
                 "color" => require_kind(
                     &path,
@@ -3584,6 +3634,24 @@ mod tests {
             }
         }
         validate_merged_config(&values).unwrap();
+    }
+
+    #[test]
+    fn studio_audio_setting_is_validated_and_user_only() {
+        for mode in ["off", "auto", "mute"] {
+            let value = json!({"studioAudioMode": mode});
+            validate_merged_config(&value).unwrap();
+            validate_audio_scope(ConfigScope::User, &value).unwrap();
+            for scope in [
+                ConfigScope::Place,
+                ConfigScope::Workspace,
+                ConfigScope::Experience,
+            ] {
+                assert!(validate_audio_scope(scope, &value).is_err());
+            }
+        }
+        assert!(validate_merged_config(&json!({"studioAudioMode": true})).is_err());
+        assert!(validate_merged_config(&json!({"studioAudioMode": "status"})).is_err());
     }
 
     #[test]

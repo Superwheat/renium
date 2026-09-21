@@ -12,6 +12,8 @@ use crate::app::{output, update};
 use crate::automation::{commands::daemon_result, op};
 use crate::system::files::atomic_write_file;
 
+pub(crate) mod global;
+
 #[cfg(windows)]
 #[path = "audio_windows.rs"]
 mod platform;
@@ -34,6 +36,8 @@ pub(crate) enum Action {
 pub(crate) struct AudioArgs {
     #[arg(value_enum, default_value = "status")]
     action: Action,
+    #[arg(long, conflicts_with_all = ["pid", "player"], help = "Remember the mode for all current and future Studio windows")]
+    global: bool,
     #[arg(long, help = "Target an exact local Studio process")]
     pid: Option<u32>,
     #[arg(
@@ -77,7 +81,9 @@ struct Reply {
 }
 
 pub(crate) fn run(args: AudioArgs, project: Option<&std::path::Path>) -> Result<()> {
-    let value = if let Some(pid) = args.pid {
+    let value = if args.global {
+        global::command(args.action)?
+    } else if let Some(pid) = args.pid {
         command(pid, args.action)?
     } else {
         daemon_result(
@@ -96,6 +102,20 @@ fn state_dir(pid: u32, identity: &str) -> Result<PathBuf> {
     Ok(update::user_data_dir()?
         .join("studio-audio")
         .join(format!("{pid}-{key}")))
+}
+
+fn background_command() -> Result<Command> {
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    Ok(command)
 }
 
 fn validate_studio(pid: u32) -> Result<String> {
@@ -150,7 +170,7 @@ pub(crate) fn command(pid: u32, action: Action) -> Result<Value> {
             action,
         })?,
     )?;
-    let mut worker = Command::new(std::env::current_exe()?);
+    let mut worker = background_command()?;
     worker.args([
         "audio-worker",
         "--pid",
@@ -158,15 +178,6 @@ pub(crate) fn command(pid: u32, action: Action) -> Result<Value> {
         "--identity",
         &identity,
     ]);
-    worker
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        worker.creation_flags(0x0800_0000);
-    }
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)

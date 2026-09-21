@@ -158,7 +158,12 @@ pub(super) fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
         listen_metrics.bind_ms,
         listen_metrics.wait_for_channels_ms
     );
+    let mut audio_check = Instant::now();
     while bridge.alive.load(Ordering::Relaxed) {
+        if audio_check.elapsed() >= Duration::from_secs(2) {
+            let _ = crate::studio::audio::global::resume();
+            audio_check = Instant::now();
+        }
         thread::sleep(Duration::from_millis(250));
     }
     bridge.alive.store(false, Ordering::Relaxed);
@@ -760,6 +765,8 @@ fn daemon_control_request_inner(
             | automation::op::COLLAB_STATUS
             | automation::op::COLLAB_AWARENESS
     ) || direct_package
+        || operation == automation::op::STUDIO_AUDIO
+            && object.get("global").and_then(Value::as_bool) == Some(true)
     {
         let request = automation::Request {
             v: automation::PROTOCOL_VERSION,

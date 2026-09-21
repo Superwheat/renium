@@ -4,7 +4,7 @@
 
 ### New
 
-- Mute or unmute Studio audio, or opt into muting only while its window is unfocused, from `rbx audio` or the editor's Studio Audio menu. Project sounds and volume levels are unchanged.
+- Mute or unmute Studio audio, or opt into muting only while its window is unfocused, from `rbx audio` or the editor's Studio Audio menu. A persistent global setting covers current and newly opened windows and is editable by agents. Project sounds and volume levels are unchanged.
 - Publish places from Studio with `rbx publish`, or build and upload project files with `--open-cloud`; the editor includes a publish preview and confirmation.
 - Agents find Renium after a fresh install: `rbx setup` (run by the installer) writes a short note into the global instruction files of installed agents (Claude Code, Codex, Gemini CLI, OpenCode, Windsurf) that explains `rbx` and points to `rbx init`; `rbx --help` opens with the same hint, and the editor extension offers to initialize a folder that has no project instead of creating one silently.
 - Approved protected Studio function calls, including ordered batches of up to 32 calls with exact approvals and partial-failure results.

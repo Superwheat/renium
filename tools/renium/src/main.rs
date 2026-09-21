@@ -190,6 +190,13 @@ fn run_cli() -> Result<()> {
         );
     }
 
+    if !matches!(
+        &cli.command,
+        Commands::AudioWorker(_) | Commands::AudioGlobalWorker | Commands::UpdateHelper(_)
+    ) && let Err(error) = studio::audio::global::resume()
+    {
+        eprintln!("[renium] Global Studio audio could not resume: {error:#}");
+    }
     cli::dispatch::dispatch(cli.command, cli.project.as_deref())
 }
 
@@ -206,6 +213,7 @@ fn checks_agent_update(command: &Commands) -> bool {
             | Commands::ExplorerDaemon(_)
             | Commands::PerformanceWorker
             | Commands::AudioWorker(_)
+            | Commands::AudioGlobalWorker
             | Commands::PerformanceHolder(_)
             | Commands::CursorPoll(_)
     )
@@ -244,6 +252,7 @@ fn checks_agent_instructions(command: &Commands) -> bool {
             | Commands::PerformanceProfile(_)
             | Commands::PerformanceWorker
             | Commands::AudioWorker(_)
+            | Commands::AudioGlobalWorker
             | Commands::PerformanceHolder(_)
             | Commands::CursorPoll(_)
     )

@@ -37,6 +37,7 @@ const NUMBER_CONFIG_KEYS = new Set([
 ]);
 const STRING_ARRAY_CONFIG_KEYS = new Set(["services", "gitSync.stagePaths"]);
 const ENUM_CONFIG_KEYS = new Map<string, readonly string[]>([
+  ["studioAudioMode", ["off", "auto", "mute"]],
   ["logLevel", ["off", "error", "warn", "info", "debug", "trace"]],
   ["color", ["auto", "always", "never"]],
   ["outputMode", ["text", "json", "pretty"]],
@@ -625,7 +626,7 @@ function projectFilePath(projectRoot: string): string {
   return hasJson ? json : jsonc;
 }
 
-function userConfigPath(): string {
+export function userConfigPath(): string {
   if (process.platform === "win32") {
     return path.join(process.env.APPDATA ?? path.join(os.homedir(), "AppData", "Roaming"), "Renium", "config.json");
   }
@@ -633,6 +634,15 @@ function userConfigPath(): string {
     return path.join(os.homedir(), "Library", "Application Support", "Renium", "config.json");
   }
   return path.join(process.env.XDG_CONFIG_HOME ?? path.join(os.homedir(), ".config"), "renium", "config.json");
+}
+
+export function userStudioAudioMode(): string | undefined {
+  const value = readObject(userConfigPath()).studioAudioMode;
+  if (value === undefined) { return undefined; }
+  if (value !== "off" && value !== "auto" && value !== "mute") {
+    throw new Error("studioAudioMode must be off, auto, or mute");
+  }
+  return value;
 }
 
 export function loadSharedConfig(workspaceRoot: string, projectRoot: string): SharedConfig {
@@ -658,11 +668,18 @@ export function loadSharedConfig(workspaceRoot: string, projectRoot: string): Sh
   }
   const merged: SharedConfig = { schemaVersion: 1 };
   for (const filePath of files.slice(0, -1)) {
-    merge(merged, readObject(filePath));
+    const config = readObject(filePath);
+    if (filePath !== files[0] && config.studioAudioMode !== undefined) {
+      throw new Error("studioAudioMode is global; set it in User settings, not the project");
+    }
+    merge(merged, config);
   }
   const project = readObject(files[files.length - 1]);
   const settings = project.settings;
   if (settings && typeof settings === "object" && !Array.isArray(settings)) {
+    if ((settings as SharedConfig).studioAudioMode !== undefined) {
+      throw new Error("studioAudioMode is global; set it in User settings, not the project");
+    }
     merge(merged, settings as SharedConfig);
   }
   validateSharedConfig(merged);

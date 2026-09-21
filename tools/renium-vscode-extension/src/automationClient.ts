@@ -129,7 +129,8 @@ export class AutomationClient {
     options: { quietWait?: boolean; timeoutMs?: number } = {},
   ): Promise<CommandRunResult> {
     await this.ensure(command, config);
-    if (op === AUTOMATION_OP.studios || UNBOUND_OPS.has(op)) {
+    if (op === AUTOMATION_OP.studios || UNBOUND_OPS.has(op)
+      || (op === AUTOMATION_OP.studioAudio && parameters.global === true)) {
       return this.send(config, label, op, undefined, parameters, options);
     }
     const requireRuntime = operationRequiresRuntime(op, parameters);

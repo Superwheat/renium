@@ -101,6 +101,7 @@ import {
 } from "./syncConfig";
 import { AUTOMATION_OP } from "./automationProtocol.generated";
 import { CollaborationController } from "./collaboration";
+import { watchStudioAudioSettings } from "./studioAudioSettings";
 
 const RENIUM_OPEN_PACKAGE_SCRIPT_TABS_STATE_KEY = "renium.openPackageScriptTabs";
 const RENIUM_ACTIVE_EXPERIENCE_PLACES_STATE_KEY = "renium.activeExperiencePlaces";
@@ -1208,20 +1209,37 @@ class RobloxSyncController {
   }
 
   public async studioAudio(): Promise<void> {
-    const action = await pickMenuAction("Renium — Studio Audio (selected window)", [
+    const scope = await pickMenuAction("Renium — Studio Audio", [
+      { label: "All Studio Windows", description: "Persistent default, including newly opened windows", action: "global" },
+      { label: "Selected Window", description: "Override until this window closes or the global mode changes", action: "window" },
+    ]);
+    if (!scope) { return; }
+    const global = scope === "global";
+    const action = await pickMenuAction(`Renium — Studio Audio (${global ? "all windows" : "selected window"})`, [
       { label: "Mute", action: "mute" },
-      { label: "Unmute", action: "unmute" },
-      { label: "Mute While Unfocused", description: "Restore previous audio when focused; lasts until Studio closes", action: "auto" },
+      { label: global ? "Restore Audio" : "Unmute", description: global ? "Restore prior mute states and disable global control" : undefined, action: "unmute" },
+      { label: "Mute While Unfocused", description: global ? "Remember for current and future Studio windows" : "Restore previous audio when focused; lasts until Studio closes", action: "auto" },
       { label: "Turn Off Audio Control", description: "Restore only Renium's mute changes", action: "off" },
     ]);
     if (!action) { return; }
-    const cfg = this.getConfig();
     try {
-      await this.runAutomationOperation(cfg.cliPath, cfg, "audio", AUTOMATION_OP.studioAudio, { action });
-      void vscode.window.showInformationMessage(`Studio audio: ${action === "auto" ? "mute while unfocused" : action}.`);
+      if (global) {
+        await this.applyGlobalStudioAudio(action);
+      } else {
+        const cfg = this.getConfig();
+        const result = await this.runAutomationOperation(cfg.cliPath, cfg, "audio", AUTOMATION_OP.studioAudio, { action });
+        if (result.code !== 0) { throw new Error(result.output); }
+      }
+      void vscode.window.showInformationMessage(`Studio audio (${global ? "all windows" : "selected window"}): ${action === "auto" ? "mute while unfocused" : action}.`);
     } catch (error) {
       void vscode.window.showErrorMessage(`Studio audio: ${String(error)}`);
     }
+  }
+
+  public async applyGlobalStudioAudio(mode: string): Promise<void> {
+    const result = await this.runCommand(this.updateCli(), ["audio", mode, "--global"],
+      this.context.extensionPath, "audio", 2, { quietLog: true, timeoutMs: 15000 });
+    if (result.code !== 0) { throw new Error(result.output); }
   }
 
   private async connectedStudioPlaces(): Promise<ConnectedStudioPlace[]> {
@@ -4904,6 +4922,10 @@ export function activate(context: vscode.ExtensionContext): void {
     context.environmentVariableCollection.delete("PATH");
   }
   const controller = new RobloxSyncController(context);
+  context.subscriptions.push(watchStudioAudioSettings(
+    mode => controller.applyGlobalStudioAudio(mode),
+    error => { void vscode.window.showErrorMessage(`Studio audio: ${String(error)}`); },
+  ));
   activeController = controller;
   controller.scheduleAutomaticUpdateCheck();
   void (async () => {
