@@ -229,7 +229,7 @@ pub(crate) fn run_worker(args: WorkerArgs) -> Result<()> {
         if lock.try_lock().is_err() {
             return Ok(());
         }
-        let mut backend = match platform::Backend::new(args.pid) {
+        let mut backend = match platform::Backend::new(args.pid, &dir) {
             Ok(backend) => backend,
             Err(error) => {
                 let request: Request =

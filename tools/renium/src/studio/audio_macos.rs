@@ -6,7 +6,7 @@ pub(super) struct Backend {
 }
 
 impl Backend {
-    pub(super) fn new(pid: u32) -> Result<Self> {
+    pub(super) fn new(pid: u32, _dir: &std::path::Path) -> Result<Self> {
         Ok(Self { pid })
     }
 

@@ -47,7 +47,8 @@ Settings and menu/CLI changes stay synchronized; project overrides are rejected.
 
 Default: off. Without `--global`, control lasts until that Studio process closes,
 including across daemon reconnects. No Sound objects or saved volume
-levels are edited. The editor offers **Renium: Studio Audio**. macOS requires
+levels are edited. Renium remembers its mute changes across audio-worker restarts
+so returning focus restores audio. The editor offers **Renium: Studio Audio**. macOS requires
 Studio opened with the matching Renium helper; global status lists any window
 that needs reopening rather than reopening it automatically. Unsupported aggregate/virtual
 output devices report an error instead of muting the system output.
