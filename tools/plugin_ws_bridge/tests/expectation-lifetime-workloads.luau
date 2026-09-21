@@ -1,6 +1,6 @@
 local fs = require("@lune/fs")
 local luau = require("@lune/luau")
-local source = fs.readFile("tools/plugin_ws_bridge/BridgeStudioChanges.module.lua")
+local source = fs.readFile("tools/plugin_ws_bridge/BridgeStudioChanges.module.luau")
 local function section(first, after)
 	local start = assert(source:find(first, 1, true))
 	return source:sub(start, assert(source:find(after, start, true)) - 1)

@@ -4,7 +4,7 @@ $pluginRoot = Split-Path -Parent $PSScriptRoot
 $manifestPath = Join-Path $pluginRoot "Renium.project.json"
 $configPath = Join-Path $pluginRoot "selene.toml"
 $manifest = Get-Content -LiteralPath $manifestPath -Raw
-$luaPaths = [regex]::Matches($manifest, '"\$path"\s*:\s*"(?<path>[^"]+\.lua)"') |
+$luaPaths = [regex]::Matches($manifest, '"\$path"\s*:\s*"(?<path>[^"]+\.luau)"') |
     ForEach-Object { Join-Path $pluginRoot $_.Groups["path"].Value } |
     Sort-Object -Unique
 

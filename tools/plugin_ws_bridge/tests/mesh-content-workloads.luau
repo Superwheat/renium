@@ -1,6 +1,6 @@
 local fs = require("@lune/fs")
 local luau = require("@lune/luau")
-local source = fs.readFile("tools/plugin_ws_bridge/BridgeEditorSync.module.lua")
+local source = fs.readFile("tools/plugin_ws_bridge/BridgeEditorSync.module.luau")
 do
 	local begin = assert(source:find("local runtimePropertiesByClass =", 1, true))
 	local finish = assert(source:find("local function decodePropertyValue(", begin, true))
@@ -79,7 +79,7 @@ do
 		enumerationCount += 1
 		return { enum.None, enum.Activate, enum.All }
 	end
-	local codec = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeValueCodec.module.lua"), { environment = {
+	local codec = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeValueCodec.module.luau"), { environment = {
 		game = { GetService = function() return {} end }, Enum = { InputSink = enum },
 	} })()
 	for _ = 1, 100 do

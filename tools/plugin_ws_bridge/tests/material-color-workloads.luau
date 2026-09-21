@@ -13,8 +13,8 @@ local environment = {
 	script = { Parent = { Error = {} } },
 	require = function(value) return value end,
 }
-local codec = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeValueCodec.module.lua"), { environment = environment })()
-local custom = luau.load(fs.readFile("tools/plugin_ws_bridge/rbx_dom_lua/customProperties.module.lua"), { environment = environment })()
+local codec = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeValueCodec.module.luau"), { environment = environment })()
+local custom = luau.load(fs.readFile("tools/plugin_ws_bridge/rbx_dom_lua/customProperties.module.luau"), { environment = environment })()
 local ok, palette = codec.decode({ _type = "MaterialColors", colors = { Grass = { 12, 34, 56 }, Rock = { 255, 0, 128 } } })
 assert(ok, tostring(palette))
 assert(palette[materials.Grass] == roblox.Color3.fromRGB(12, 34, 56))

@@ -10,10 +10,10 @@ local function extract(file, first, after, environment, returned)
 end
 
 local readers = {
-	extract("tools/plugin_ws_bridge/BridgeEditorSync.module.lua", "local function readProperty(", "local function candidateBucketsForParent(", {}, "readProperty"),
-	extract("tools/plugin_ws_bridge/BridgePluginRuntime.module.lua", "local function tryReadModelPivotProperty(", "local function tryRead(", {}, "tryReadModelPivotProperty"),
+	extract("tools/plugin_ws_bridge/BridgeEditorSync.module.luau", "local function readProperty(", "local function candidateBucketsForParent(", {}, "readProperty"),
+	extract("tools/plugin_ws_bridge/BridgePluginRuntime.module.luau", "local function tryReadModelPivotProperty(", "local function tryRead(", {}, "tryReadModelPivotProperty"),
 }
-local custom = luau.load(fs.readFile("tools/plugin_ws_bridge/rbx_dom_lua/customProperties.module.lua"), {
+local custom = luau.load(fs.readFile("tools/plugin_ws_bridge/rbx_dom_lua/customProperties.module.luau"), {
 	environment = {
 		game = { GetService = function() return {} end },
 		Enum = roblox.Enum,
@@ -44,11 +44,11 @@ for _, class in { "Model", "WorldModel" } do
 end
 print("Model pivots: export, transactional readback and custom codec keep saved pivots separate from PrimaryPart origin")
 
-local codec = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeValueCodec.module.lua"), {
+local codec = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeValueCodec.module.luau"), {
 	environment = { game = { GetService = function() return {} end } },
 })()
 local equality = require("../BridgeValueEquality.module")
-local source = fs.readFile("tools/plugin_ws_bridge/BridgeEditorSync.module.lua")
+local source = fs.readFile("tools/plugin_ws_bridge/BridgeEditorSync.module.luau")
 local loopStart = assert(source:find("local postCommitPropertyChanges = session.postCommitPropertyChanges", 1, true))
 local start = assert(source:find('local okRead, current = readProperty(instance, "WorldPivot")', loopStart, true))
 local finish = assert(source:find("local okDecode, value = decodePropertyValue(", start, true))

@@ -1,6 +1,6 @@
 local fs = require("@lune/fs")
 local luau = require("@lune/luau")
-local source = fs.readFile("tools/plugin_ws_bridge/BridgeEditorSync.module.lua")
+local source = fs.readFile("tools/plugin_ws_bridge/BridgeEditorSync.module.luau")
 local function extract(first, after, environment, returned)
 	local start = assert(source:find(first, 1, true))
 	local finish = assert(source:find(after, start, true))

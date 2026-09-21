@@ -44,7 +44,7 @@ local physics = {
 		writes += 1
 	end,
 }
-local module = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeCollisionGroups.module.lua"), {
+local module = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeCollisionGroups.module.luau"), {
 	environment = { game = { GetService = function(_, name) assert(name == "PhysicsService") return physics end } },
 })()
 -- Exact CollisionGroupData bytes from the user's original RBXL.

@@ -3,7 +3,7 @@ local luau = require("@lune/luau")
 
 -- Exercise both shipped invalidation and cache reuse. A within-service move
 -- emits Parent without a service DescendantAdded/Removing event.
-local source = fs.readFile("tools/plugin_ws_bridge/BridgePluginRuntime.module.lua")
+local source = fs.readFile("tools/plugin_ws_bridge/BridgePluginRuntime.module.luau")
 local first = assert(source:find("local nativeStructureGenerationByService:", 1, true))
 local last = assert(source:find("function Config.updateStatusText()", first, true))
 local prepareFirst = assert(source:find("prepareNativeState = function(", last, true)) + #"prepareNativeState = "

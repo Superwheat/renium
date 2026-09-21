@@ -3,119 +3,119 @@
   "tree": {
     "$className": "Folder",
     "Renium": {
-      "$path": "Renium.plugin.lua",
+      "$path": "Renium.plugin.luau",
       "BridgeSettings": {
-        "$path": "BridgeSettings.module.lua"
+        "$path": "BridgeSettings.module.luau"
       },
       "BridgeStatus": {
-        "$path": "BridgeStatus.module.lua"
+        "$path": "BridgeStatus.module.luau"
       },
       "BridgeUpdate": {
-        "$path": "BridgeUpdate.module.lua"
+        "$path": "BridgeUpdate.module.luau"
       },
       "BridgeParallel": {
-        "$path": "BridgeParallel.module.lua"
+        "$path": "BridgeParallel.module.luau"
       },
       "BridgeChunking": {
-        "$path": "BridgeChunking.module.lua"
+        "$path": "BridgeChunking.module.luau"
       },
       "BridgeTransport": {
-        "$path": "BridgeTransport.module.lua"
+        "$path": "BridgeTransport.module.luau"
       },
       "BridgeConnection": {
-        "$path": "BridgeConnection.module.lua"
+        "$path": "BridgeConnection.module.luau"
       },
       "BridgeSessionLock": {
-        "$path": "BridgeSessionLock.module.lua"
+        "$path": "BridgeSessionLock.module.luau"
       },
       "BridgePluginRuntime": {
-        "$path": "BridgePluginRuntime.module.lua"
+        "$path": "BridgePluginRuntime.module.luau"
       },
       "BridgeIdentity": {
-        "$path": "BridgeIdentity.module.lua"
+        "$path": "BridgeIdentity.module.luau"
       },
       "BridgeScriptDocuments": {
-        "$path": "BridgeScriptDocuments.module.lua"
+        "$path": "BridgeScriptDocuments.module.luau"
       },
       "BridgeContent": {
-        "$path": "BridgeContent.module.lua"
+        "$path": "BridgeContent.module.luau"
       },
       "BridgeMaterialService": {
-        "$path": "BridgeMaterialService.module.lua"
+        "$path": "BridgeMaterialService.module.luau"
       },
       "BridgeCollisionGroups": {
-        "$path": "BridgeCollisionGroups.module.lua"
+        "$path": "BridgeCollisionGroups.module.luau"
       },
       "BridgeCandidateMatch": {
-        "$path": "BridgeCandidateMatch.module.lua"
+        "$path": "BridgeCandidateMatch.module.luau"
       },
       "BridgeInstanceSwap": {
-        "$path": "BridgeInstanceSwap.module.lua"
+        "$path": "BridgeInstanceSwap.module.luau"
       },
       "BridgeReferenceRetarget": {
-        "$path": "BridgeReferenceRetarget.module.lua"
+        "$path": "BridgeReferenceRetarget.module.luau"
       },
       "BridgeReferenceOverlay": {
-        "$path": "BridgeReferenceOverlay.module.lua"
+        "$path": "BridgeReferenceOverlay.module.luau"
       },
       "BridgeValueEquality": {
-        "$path": "BridgeValueEquality.module.lua"
+        "$path": "BridgeValueEquality.module.luau"
       },
       "BridgeValueCodec": {
-        "$path": "BridgeValueCodec.module.lua"
+        "$path": "BridgeValueCodec.module.luau"
       },
       "BridgeUi": {
-        "$path": "BridgeUi.module.lua"
+        "$path": "BridgeUi.module.luau"
       },
       "BridgeReviewModel": {
-        "$path": "BridgeReviewModel.module.lua"
+        "$path": "BridgeReviewModel.module.luau"
       },
       "BridgeRuntimeApi": {
-        "$path": "BridgeRuntimeApi.module.lua"
+        "$path": "BridgeRuntimeApi.module.luau"
       },
       "BridgePerformance": {
-        "$path": "BridgePerformance.module.lua"
+        "$path": "BridgePerformance.module.luau"
       },
       "BridgeMicroProfiler": {
-        "$path": "BridgeMicroProfiler.module.lua"
+        "$path": "BridgeMicroProfiler.module.luau"
       },
       "BridgeNetworkSimulation": {
-        "$path": "BridgeNetworkSimulation.module.lua"
+        "$path": "BridgeNetworkSimulation.module.luau"
       },
       "BridgeCreatorApi": {
-        "$path": "BridgeCreatorApi.module.lua"
+        "$path": "BridgeCreatorApi.module.luau"
       },
       "BridgePropertySchema": {
-        "$path": "BridgePropertySchema.module.lua"
+        "$path": "BridgePropertySchema.module.luau"
       },
       "BridgeStudioApiSchema": {
-        "$path": "BridgeStudioApiSchema.module.lua"
+        "$path": "BridgeStudioApiSchema.module.luau"
       },
       "BridgeEditorSync": {
-        "$path": "BridgeEditorSync.module.lua"
+        "$path": "BridgeEditorSync.module.luau"
       },
       "BridgeTransactionUpload": {
-        "$path": "BridgeTransactionUpload.module.lua"
+        "$path": "BridgeTransactionUpload.module.luau"
       },
       "BridgeStudioChanges": {
-        "$path": "BridgeStudioChanges.module.lua"
+        "$path": "BridgeStudioChanges.module.luau"
       },
       "RbxDom": {
-        "$path": "rbx_dom_lua/init.module.lua",
+        "$path": "rbx_dom_lua/init.module.luau",
         "EncodedValue": {
-          "$path": "rbx_dom_lua/EncodedValue.module.lua"
+          "$path": "rbx_dom_lua/EncodedValue.module.luau"
         },
         "PropertyDescriptor": {
-          "$path": "rbx_dom_lua/PropertyDescriptor.module.lua"
+          "$path": "rbx_dom_lua/PropertyDescriptor.module.luau"
         },
         "Error": {
-          "$path": "rbx_dom_lua/Error.module.lua"
+          "$path": "rbx_dom_lua/Error.module.luau"
         },
         "customProperties": {
-          "$path": "rbx_dom_lua/customProperties.module.lua"
+          "$path": "rbx_dom_lua/customProperties.module.luau"
         },
         "base64": {
-          "$path": "rbx_dom_lua/base64.module.lua"
+          "$path": "rbx_dom_lua/base64.module.luau"
         },
         "database": {
           "$path": "rbx_dom_lua/database.json"

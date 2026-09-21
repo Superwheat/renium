@@ -32,7 +32,7 @@ end
 
 local timers = {}
 local destroyedSignals = 0
-local Connection = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeConnection.module.lua"), {
+local Connection = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeConnection.module.luau"), {
 	environment = {
 		task = {
 			spawn = scheduler.spawn,
@@ -179,7 +179,7 @@ assert(returned and destroyedSignals == 3, "yielded cleanup must wake and dispos
 
 -- Use the shipped method classifications: a profiler read must run during a
 -- yielding commit without admitting another mutation or losing its fences.
-local runtimeSource = fs.readFile("tools/plugin_ws_bridge/BridgePluginRuntime.module.lua")
+local runtimeSource = fs.readFile("tools/plugin_ws_bridge/BridgePluginRuntime.module.luau")
 local exclusiveMethods = luau.load("return " .. assert(runtimeSource:match("Config.bridgeExclusiveMethods = (%b{})")))()
 local ownedMethods = luau.load("return " .. assert(runtimeSource:match("Config.bridgeSessionOwnedMethods = (%b{})")))()
 local replayMethods = luau.load("return " .. assert(runtimeSource:match("Config.bridgeReplayProtectedMethods = (%b{})")))()
@@ -231,7 +231,7 @@ table.clear(timers)
 config.disconnectAll("Disconnected")
 assert(not config.hasOpenChannel() and not config.bridgeConnectRequested)
 assert(#timers == 0, "intentional disconnect must not schedule a reconnect")
-local Status = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeStatus.module.lua"), {
+local Status = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeStatus.module.luau"), {
 	environment = { DateTime = { fromUnixTimestamp = function()
 		return { FormatLocalTime = function() return "12:00" end }
 	end } },

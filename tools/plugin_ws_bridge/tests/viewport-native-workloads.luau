@@ -1,15 +1,15 @@
 local fs = require("@lune/fs")
 local luau = require("@lune/luau")
 local roblox = require("@lune/roblox")
-local identitySource = fs.readFile("tools/plugin_ws_bridge/BridgeIdentity.module.lua")
+local identitySource = fs.readFile("tools/plugin_ws_bridge/BridgeIdentity.module.luau")
 local Overlay = require("../BridgeReferenceOverlay.module")
 local Retarget = require("../BridgeReferenceRetarget.module")
-local source = fs.readFile("tools/plugin_ws_bridge/BridgeEditorSync.module.lua")
+local source = fs.readFile("tools/plugin_ws_bridge/BridgeEditorSync.module.luau")
 local first = assert(source:find("local function cancelExpectedEvent(", 1, true))
 local last = assert(source:find("local function setNameForSync(", first, true))
 
 do
-	local overlaySource = fs.readFile("tools/plugin_ws_bridge/BridgeReferenceOverlay.module.lua")
+	local overlaySource = fs.readFile("tools/plugin_ws_bridge/BridgeReferenceOverlay.module.luau")
 	local start = assert(overlaySource:find("local function indexPackagePresence(", 1, true))
 	local finish = assert(overlaySource:find("local function initializePreparedGroup(", start, true))
 	local index = luau.load(overlaySource:sub(start, finish - 1) .. "\nreturn indexPackagePresence")()

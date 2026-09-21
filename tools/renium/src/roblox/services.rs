@@ -59,7 +59,7 @@ mod tests {
             extension["contributes"]["configuration"]["properties"]["renium.services"]["default"],
             serde_json::json!(DEFAULT_SYNC_SERVICES)
         );
-        let plugin = include_str!("../../../plugin_ws_bridge/BridgePluginRuntime.module.lua");
+        let plugin = include_str!("../../../plugin_ws_bridge/BridgePluginRuntime.module.luau");
         let allowed = plugin
             .split("local ALLOWED_SERVICES = {")
             .nth(1)

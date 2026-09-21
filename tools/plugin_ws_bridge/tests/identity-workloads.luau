@@ -1,7 +1,7 @@
 local fs = require("@lune/fs")
 local luau = require("@lune/luau")
 local mockGame = {}
-local Identity = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeIdentity.module.lua"), {
+local Identity = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeIdentity.module.luau"), {
 	environment = { game = mockGame },
 })()
 

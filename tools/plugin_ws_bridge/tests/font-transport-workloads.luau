@@ -12,7 +12,7 @@ local function equal(a, b)
 	return a.Family == b.Family and a.Weight == b.Weight and a.Style == b.Style
 end
 local function extract(first, after, environment, returned)
-	local source = fs.readFile("tools/plugin_ws_bridge/BridgeEditorSync.module.lua")
+	local source = fs.readFile("tools/plugin_ws_bridge/BridgeEditorSync.module.luau")
 	local start = assert(source:find(first, 1, true))
 	local finish = assert(source:find(after, start, true))
 	return luau.load(source:sub(start, finish - 1) .. "\nreturn " .. returned, { environment = environment })()
@@ -51,7 +51,7 @@ local environment = {
 		return { DeserializeInstancesAsync = function() return roots end }
 	end },
 }
-local codec = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeValueCodec.module.lua"), { environment = environment })()
+local codec = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeValueCodec.module.luau"), { environment = environment })()
 local raw = { _type = "Font", family = "family", weight = "Medium", style = "Normal", _nativeFont = "payload" }
 local carrier = { ClassName = "TextLabel", FontFace = desired, GetChildren = function() return {} end,
 	Destroy = function() destroyed += 1 end }
@@ -70,7 +70,7 @@ assert(not codec.decode(raw), "payload size must be bounded before deserializati
 print("Font transport: exact cache replacement and rollback, expected events, bounded native payload validation")
 
 do
-	local source = fs.readFile("tools/plugin_ws_bridge/BridgeEditorSync.module.lua")
+	local source = fs.readFile("tools/plugin_ws_bridge/BridgeEditorSync.module.luau")
 	local start = assert(source:find("\tlocal nativeFont = type(rawValue)", 1, true))
 	local finish = assert(source:find("\tif okWrite then", start, true))
 	local block = "return function(instance, propertyName, rawValue, ctx, stats, serviceName)\n"

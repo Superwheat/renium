@@ -9,6 +9,7 @@
 
 ### Improvements
 
+- The Studio plugin's sources are `.luau` files.
 - Native function discovery follows Studio's reflection dispatch and receiver relationships across relocated layouts, with verification on Windows and Apple Silicon.
 
 ### Bug fixes

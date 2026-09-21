@@ -222,7 +222,7 @@ $extensionDirectory = Join-Path $repositoryRoot "tools\renium-vscode-extension"
 $extensionPackagePath = Join-Path $extensionDirectory "package.json"
 $pluginDirectory = Join-Path $repositoryRoot "tools\plugin_ws_bridge"
 $pluginProjectPath = Join-Path $pluginDirectory "Renium.project.json"
-$pluginRuntimePath = Join-Path $pluginDirectory "BridgePluginRuntime.module.lua"
+$pluginRuntimePath = Join-Path $pluginDirectory "BridgePluginRuntime.module.luau"
 
 foreach ($requiredPath in @($cargoManifest, $extensionPackagePath, $pluginProjectPath, $pluginRuntimePath)) {
     if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {

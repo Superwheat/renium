@@ -31,7 +31,7 @@ jobs:
           }
           $package = Get-Content tools/renium-vscode-extension/package.json -Raw | ConvertFrom-Json
           if ([string]$package.version -ne $version) { throw "Extension version does not match $version" }
-          $runtime = Get-Content tools/plugin_ws_bridge/BridgePluginRuntime.module.lua -Raw
+          $runtime = Get-Content tools/plugin_ws_bridge/BridgePluginRuntime.module.luau -Raw
           if ($runtime -notmatch ('BRIDGE_VERSION\s*=\s*"' + [regex]::Escape($version) + '"')) {
             throw "Studio plugin version does not match $version"
           }

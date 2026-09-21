@@ -13,7 +13,7 @@ fn plugin_preserves_small_edits_and_rejects_missing_writes() -> mlua::Result<()>
     "#).exec()?;
     let equality: mlua::Table = lua
         .load(include_str!(
-            "../../plugin_ws_bridge/BridgeValueEquality.module.lua"
+            "../../plugin_ws_bridge/BridgeValueEquality.module.luau"
         ))
         .eval()?;
     lua.globals().set("equality", equality)?;
@@ -41,7 +41,7 @@ fn plugin_preserves_small_edits_and_rejects_missing_writes() -> mlua::Result<()>
         setAttributeForSync = function(instance, name, value) instance[name] = value return true end
         isEngineManagedAttribute = function(name) return string.sub(tostring(name), 1, 4) == "RBX_" end
     "#).exec()?;
-    let source = include_str!("../../plugin_ws_bridge/BridgeEditorSync.module.lua");
+    let source = include_str!("../../plugin_ws_bridge/BridgeEditorSync.module.luau");
     let body = source
         .split("local function propertyValuesEqual(")
         .nth(1)

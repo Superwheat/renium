@@ -3,7 +3,7 @@ local luau = require("@lune/luau")
 local roblox = require("@lune/roblox")
 local serde = require("@lune/serde")
 
-local rbxDomSource = fs.readFile("tools/plugin_ws_bridge/rbx_dom_lua/init.module.lua")
+local rbxDomSource = fs.readFile("tools/plugin_ws_bridge/rbx_dom_lua/init.module.luau")
 local aliasStart = assert(rbxDomSource:find("local contentPropertyAliasesByClass =", 1, true))
 local aliasEnd = assert(rbxDomSource:find("local function getPropertyNames(", aliasStart, true))
 local contentAliases = luau.load(rbxDomSource:sub(aliasStart, aliasEnd - 1) .. "\nreturn getContentPropertyAliases", {
@@ -123,7 +123,7 @@ local services = {
 	RunService = { Heartbeat = signal() },
 }
 function testGame:GetService(name) return assert(services[name], name) end
-local codec = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeValueCodec.module.lua"), { environment = { game = testGame } })()
+local codec = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeValueCodec.module.luau"), { environment = { game = testGame } })()
 local dependencies = { BridgeScriptDocuments = { readSource = function(instance) return true, instance.Source end }, BridgeValueCodec = codec, BridgeValueEquality = require("../BridgeValueEquality.module"),
 	BridgeIdentity = require("../BridgeIdentity.module"),
 	BridgeContent = require("../BridgeContent.module"),
@@ -140,7 +140,7 @@ local function flushDeferred()
 	end
 end
 local createdRelays = {}
-local trackerModule = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeStudioChanges.module.lua"), {
+local trackerModule = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeStudioChanges.module.luau"), {
 	environment = {
 		game = testGame,
 		typeof = function(value) return if type(value) == "table" and value.__type then value.__type
@@ -1189,7 +1189,7 @@ assert(not tracker.getState({ start = false }).tracking, "observer restarted sto
 print("Studio wait cancellation: 100 lease-isolated cycles, multiple waits, global cancel and stopped observer passed")
 
 do
-	local source = fs.readFile("tools/plugin_ws_bridge/BridgeStudioChanges.module.lua")
+	local source = fs.readFile("tools/plugin_ws_bridge/BridgeStudioChanges.module.luau")
 	local function section(first, after)
 		local start = assert(source:find(first, 1, true))
 		return source:sub(start, assert(source:find(after, start, true)) - 1)

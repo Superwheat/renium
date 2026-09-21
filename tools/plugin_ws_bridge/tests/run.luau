@@ -82,7 +82,7 @@ do
 	end
 	task.defer = nil
 end
-local editorSyncSource = fs.readFile("tools/plugin_ws_bridge/BridgeEditorSync.module.lua")
+local editorSyncSource = fs.readFile("tools/plugin_ws_bridge/BridgeEditorSync.module.luau")
 do
 	local first = assert(editorSyncSource:find("local function validateChangeList(", 1, true))
 	local last = assert(editorSyncSource:find("local function addSnapshotMetadataTarget(", first, true))
@@ -910,12 +910,12 @@ do
 	function gui:GetFullName() return "StarterGui.ReniumFinalGui" end
 	function gui:IsDescendantOf(parent) return parent == service end
 	local database = require("@lune/serde").decode("json", fs.readFile("tools/plugin_ws_bridge/rbx_dom_lua/database.json"))
-	local descriptorSource = fs.readFile("tools/plugin_ws_bridge/rbx_dom_lua/PropertyDescriptor.module.lua")
+	local descriptorSource = fs.readFile("tools/plugin_ws_bridge/rbx_dom_lua/PropertyDescriptor.module.luau")
 	local descriptorStart = assert(descriptorSource:find("function PropertyDescriptor.fromRaw(", 1, true))
 	local descriptorEnd = assert(descriptorSource:find("function PropertyDescriptor:read(", descriptorStart, true))
 	local descriptor = luau.load("local PropertyDescriptor = {}\n" .. descriptorSource:sub(descriptorStart, descriptorEnd - 1)
 		.. "\nreturn PropertyDescriptor.fromRaw")()
-	local overlay = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeReferenceOverlay.module.lua"), {
+	local overlay = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeReferenceOverlay.module.luau"), {
 		environment = {
 			game = { ItemChanged = changed },
 			typeof = function(value) return if value == gui or value == service then "Instance" else typeof(value) end,

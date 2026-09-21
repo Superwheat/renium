@@ -8,7 +8,7 @@ import metadata from "../src/propertyMetadata.js";
 const { MODEL_PIVOT_CLASSES, WORKSPACE_HIDDEN_STUDIO_PROPERTIES, WORKSPACE_VISIBLE_NON_SERIALIZED_PROPERTIES, WORKSPACE_VISIBLE_SERVICE_REF_PROPERTIES, WORKSPACE_SERVER_AUTHORITY_PROPERTIES, normalizeApiDump } = metadata;
 
 const GENERATED_FILE_NAME = "roblox-properties.generated.json";
-const GENERATED_STUDIO_API_SCHEMA_FILE_NAME = "BridgeStudioApiSchema.module.lua";
+const GENERATED_STUDIO_API_SCHEMA_FILE_NAME = "BridgeStudioApiSchema.module.luau";
 const GENERATED_CLASS_LIST_FILE_NAME = "robloxClasses.ts";
 const BLOCKED_TAGS = new Set(["ReadOnly", "Hidden", "Deprecated", "NotScriptable", "NotBrowsable", "WriteOnly"]);
 const ENGINE_MANAGED_TYPES = new Set(["UniqueId", "SecurityCapabilities"]);

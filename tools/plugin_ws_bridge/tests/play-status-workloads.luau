@@ -47,7 +47,7 @@ local runtimeGame = {
 	end,
 }
 local codec = {}
-local RuntimeApi = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeRuntimeApi.module.lua"), {
+local RuntimeApi = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeRuntimeApi.module.luau"), {
 	environment = {
 		game = runtimeGame,
 		Enum = { RunState = { Stopped = "stopped" } },

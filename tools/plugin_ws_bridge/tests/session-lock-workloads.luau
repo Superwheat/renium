@@ -15,7 +15,7 @@ local function create(className, name, parent)
 end
 local noSignal = { Connect = function() end }
 local storageProxy = { ChildAdded = noSignal, ChildRemoved = noSignal, GetChildren = function() return {} end }
-local module = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeSessionLock.module.lua"), {
+local module = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeSessionLock.module.luau"), {
 	environment = { game = { GetService = function(_, name)
 		return if name == "ServerStorage" then storageProxy else players
 	end } },
