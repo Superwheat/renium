@@ -272,21 +272,6 @@ mod tests {
                     rdata.virtual_address, rdata.virtual_size
                 );
             }
-            let mut hits = 0;
-            let mut position = 0usize;
-            while position < studio.size {
-                let len = (studio.size - position).min(1 << 20);
-                if let Ok(chunk) = memory.read_vec(studio.base + position, len) {
-                    for offset in (0..chunk.len().saturating_sub(8)).step_by(8) {
-                        if read_u64(&chunk, offset)? as usize == locator {
-                            hits += 1;
-                            println!("  locator hit at rva {:#x}", position + offset);
-                        }
-                    }
-                }
-                position += len;
-            }
-            println!("  locator hits {hits}");
             for slot in (0..256).step_by(8) {
                 let target = memory.read_u64(table + slot)? as usize;
                 let code = match verified_code(memory, studio, &layout, target, 256) {
