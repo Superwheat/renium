@@ -142,6 +142,8 @@ fn build_macos(out_dir: &Path) {
         "CoreFoundation",
         "-framework",
         "AppKit",
+        "-framework",
+        "CoreGraphics",
         "-Wl,-dead_strip",
         "-o",
     ]);

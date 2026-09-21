@@ -1,6 +1,7 @@
 #import <AppKit/AppKit.h>
 #import <objc/runtime.h>
 #include <atomic>
+#include <mutex>
 #include <cstdlib>
 #include <ctime>
 #include <cstring>
@@ -10,7 +11,7 @@
 #include <unistd.h>
 
 namespace {
-std::atomic<double> guardedUntil{0};
+std::atomic<bool> guarded{false};
 char enginePath[PATH_MAX] = {};
 char launcherPath[PATH_MAX] = {};
 
@@ -59,7 +60,10 @@ double now()
 
 bool backgroundRequest()
 {
-    if (now() >= guardedUntil.load(std::memory_order_relaxed))
+    // Like the Windows guard, this lasts for the process's lifetime: late
+    // dialogs, Play windows and the engine's own focus grabs stay behind
+    // until the user selects Studio themselves.
+    if (!guarded.load(std::memory_order_relaxed))
         return false;
     NSRunningApplication* foreground = NSWorkspace.sharedWorkspace.frontmostApplication;
     if (!foreground || foreground.processIdentifier == getpid())
@@ -78,6 +82,101 @@ bool backgroundRequest()
                 break;
         }
     return true;
+}
+
+// A Play session locks and hides the pointer through CoreGraphics, which acts
+// on the whole session regardless of which application is active. Studio's
+// own calls are honoured only while Studio is the active application; the
+// requested state is remembered and applied when the user switches to Studio,
+// and undone when they switch away.
+std::mutex pointerLock;
+bool pointerOwner = false;
+bool associationRequested = true;
+int hiddenDisplayCursor = 0;
+int hiddenCursor = 0;
+void (*originalHide)(id, SEL);
+void (*originalUnhide)(id, SEL);
+
+void applyPointerOwnership(bool owner)
+{
+    std::lock_guard<std::mutex> guard(pointerLock);
+    if (pointerOwner == owner) return;
+    pointerOwner = owner;
+    if (!associationRequested) CGAssociateMouseAndMouseCursorPosition(!owner);
+    for (int count = hiddenDisplayCursor; count > 0; --count)
+    {
+        if (owner) CGDisplayHideCursor(kCGDirectMainDisplay);
+        else CGDisplayShowCursor(kCGDirectMainDisplay);
+    }
+    for (int count = hiddenCursor; count > 0; --count)
+    {
+        if (owner) originalHide(NSCursor.class, @selector(hide));
+        else originalUnhide(NSCursor.class, @selector(unhide));
+    }
+}
+
+CGError pointerWarp(CGPoint point)
+{
+    std::lock_guard<std::mutex> guard(pointerLock);
+    return pointerOwner ? CGWarpMouseCursorPosition(point) : kCGErrorSuccess;
+}
+CGError pointerMove(CGDirectDisplayID display, CGPoint point)
+{
+    std::lock_guard<std::mutex> guard(pointerLock);
+    return pointerOwner ? CGDisplayMoveCursorToPoint(display, point) : kCGErrorSuccess;
+}
+CGError pointerAssociate(boolean_t connected)
+{
+    std::lock_guard<std::mutex> guard(pointerLock);
+    associationRequested = connected;
+    return pointerOwner ? CGAssociateMouseAndMouseCursorPosition(connected) : kCGErrorSuccess;
+}
+CGError pointerHideDisplayCursor(CGDirectDisplayID display)
+{
+    std::lock_guard<std::mutex> guard(pointerLock);
+    ++hiddenDisplayCursor;
+    return pointerOwner ? CGDisplayHideCursor(display) : kCGErrorSuccess;
+}
+CGError pointerShowDisplayCursor(CGDirectDisplayID display)
+{
+    std::lock_guard<std::mutex> guard(pointerLock);
+    if (hiddenDisplayCursor > 0) --hiddenDisplayCursor;
+    return pointerOwner ? CGDisplayShowCursor(display) : kCGErrorSuccess;
+}
+void pointerHide(id cursorClass, SEL selector)
+{
+    std::lock_guard<std::mutex> guard(pointerLock);
+    ++hiddenCursor;
+    if (pointerOwner) originalHide(cursorClass, selector);
+}
+void pointerUnhide(id cursorClass, SEL selector)
+{
+    std::lock_guard<std::mutex> guard(pointerLock);
+    if (hiddenCursor > 0) --hiddenCursor;
+    if (pointerOwner) originalUnhide(cursorClass, selector);
+}
+
+void installPointerGuard()
+{
+    originalHide = reinterpret_cast<void (*)(id, SEL)>(method_setImplementation(
+        class_getClassMethod(NSCursor.class, @selector(hide)), reinterpret_cast<IMP>(pointerHide)));
+    originalUnhide = reinterpret_cast<void (*)(id, SEL)>(method_setImplementation(
+        class_getClassMethod(NSCursor.class, @selector(unhide)), reinterpret_cast<IMP>(pointerUnhide)));
+    NSNotificationCenter* center = NSNotificationCenter.defaultCenter;
+    [center addObserverForName:NSApplicationDidBecomeActiveNotification
+                        object:nil
+                         queue:nil
+                    usingBlock:^(NSNotification*) {
+                        // Studio's own requests were suppressed, so the
+                        // application became active through the user (Dock,
+                        // Cmd-Tab, a click) or the system: the guard is over.
+                        guarded.store(false, std::memory_order_relaxed);
+                        applyPointerOwnership(true);
+                    }];
+    [center addObserverForName:NSApplicationWillResignActiveNotification
+                        object:nil
+                         queue:nil
+                    usingBlock:^(NSNotification*) { applyPointerOwnership(false); }];
 }
 
 using Activate = void (*)(id, SEL, BOOL);
@@ -127,7 +226,7 @@ extern "C" bool ReniumArmLaunchGuard()
     // Inherited only by children of this exact Studio. A manually opened,
     // unrelated Studio never receives this opt-in.
     if (setenv("RENIUM_BACKGROUND_LAUNCH", "1", 1) != 0) return false;
-    guardedUntil.store(now() + 90, std::memory_order_relaxed);
+    guarded.store(true, std::memory_order_relaxed);
     return true;
 }
 
@@ -162,6 +261,7 @@ extern "C" void ReniumInitializeLaunchGuard()
     originalFrontRegardless = reinterpret_cast<decltype(originalFrontRegardless)>(method_setImplementation(
         class_getInstanceMethod(NSWindow.class, @selector(orderFrontRegardless)),
         reinterpret_cast<IMP>(frontRegardless)));
+    installPointerGuard();
     if (const char* enabled = getenv("RENIUM_BACKGROUND_LAUNCH"); enabled && *enabled == '1')
         ReniumArmLaunchGuard();
 }
@@ -187,4 +287,9 @@ static const struct { const void* replacement; const void* original; } spawnInte
     { reinterpret_cast<const void*>(launchExecv), reinterpret_cast<const void*>(execv) },
     { reinterpret_cast<const void*>(launchExecve), reinterpret_cast<const void*>(execve) },
     { reinterpret_cast<const void*>(launchSpawn), reinterpret_cast<const void*>(posix_spawn) },
+    { reinterpret_cast<const void*>(pointerWarp), reinterpret_cast<const void*>(CGWarpMouseCursorPosition) },
+    { reinterpret_cast<const void*>(pointerMove), reinterpret_cast<const void*>(CGDisplayMoveCursorToPoint) },
+    { reinterpret_cast<const void*>(pointerAssociate), reinterpret_cast<const void*>(CGAssociateMouseAndMouseCursorPosition) },
+    { reinterpret_cast<const void*>(pointerHideDisplayCursor), reinterpret_cast<const void*>(CGDisplayHideCursor) },
+    { reinterpret_cast<const void*>(pointerShowDisplayCursor), reinterpret_cast<const void*>(CGDisplayShowCursor) },
 };

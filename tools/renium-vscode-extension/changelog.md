@@ -1,10 +1,23 @@
 # Changelog
 
-## 0.3.10 - 2026-09-20
+## Unreleased
 
 ### New
 
 - Approved protected Studio function calls, including ordered batches of up to 32 calls with exact approvals and partial-failure results.
+
+### Improvements
+
+- Native function discovery follows Studio's reflection dispatch and receiver relationships across relocated layouts, with verification on Windows and Apple Silicon.
+
+### Bug fixes
+
+- On macOS, a Studio that Renium launched no longer locks, warps or hides the pointer while it is not the active application. A Play session that captures the mouse takes it only once the user switches to Studio and releases it when they switch away.
+
+## 0.3.10 - 2026-09-20
+
+### New
+
 - Every store command takes its target the same way: a positional name or dotted path (`rbx bs Workspace Lobby.Door -p Anchored --bool true`, `rbx br Workspace Lobby.OldPart`), `-i ID`, `-x INDEX`, `-n NAME` or `-c CLASS`. `mv`, `cp`, `rn`, `rm`, `upl`, `mep` and every parent option (`-I`) accept a dotted path where they took only a settings ID.
 - `rbx bg` and `rbx bs` with no target address the service itself, so `rbx bg Workspace -p Gravity` works like `rbx in Workspace`.
 - `rbx f` scopes a search to one subtree with `--path` or `-I`; `-I` takes an ID or a dotted path.
@@ -13,7 +26,6 @@
 
 ### Improvements
 
-- Native function discovery follows Studio's reflection dispatch and receiver relationships across relocated layouts, with verification on Windows and Apple Silicon.
 - Text output is cheaper for agents: paths print as one dotted string with `[n]` ordinals (the same form path arguments accept), ambiguous-match lists share one path and repeat only id and ordinal, single-precision numbers print short, full records hide engine-recomputed properties unless `-F props` asks for them, console entries drop the unix stamp and use print/info/warn/error, script grep groups hits by file, and `rbx clients` drops channels and ports.
 - Which properties take part in a comparison is decided in one place for equivalence checks, retention reports and merges, so a value never counts as equal in one and different in another.
 - The reconcile engine is split into modules by concern.
