@@ -1160,6 +1160,11 @@ class RobloxSyncController {
           : "Stream Studio output into the editor",
         action: "console",
       },
+      {
+        label: "$(unmute) Studio Audio",
+        description: "Mute, unmute, or mute automatically when Studio is unfocused",
+        action: "audio",
+      },
       menuSeparator("Plugin"),
       {
         label: "$(cloud-download) Install or Update Studio Plugin",
@@ -1187,6 +1192,9 @@ class RobloxSyncController {
       case "console":
         await this.followStudioConsole();
         return;
+      case "audio":
+        await this.studioAudio();
+        return;
       case "install":
         await this.installStudioPlugin();
         return;
@@ -1196,6 +1204,23 @@ class RobloxSyncController {
       case "uninstall":
         await this.uninstallStudioPlugin();
         return;
+    }
+  }
+
+  public async studioAudio(): Promise<void> {
+    const action = await pickMenuAction("Renium — Studio Audio (selected window)", [
+      { label: "Mute", action: "mute" },
+      { label: "Unmute", action: "unmute" },
+      { label: "Mute While Unfocused", description: "Restore previous audio when focused; lasts until Studio closes", action: "auto" },
+      { label: "Turn Off Audio Control", description: "Restore only Renium's mute changes", action: "off" },
+    ]);
+    if (!action) { return; }
+    const cfg = this.getConfig();
+    try {
+      await this.runAutomationOperation(cfg.cliPath, cfg, "audio", AUTOMATION_OP.studioAudio, { action });
+      void vscode.window.showInformationMessage(`Studio audio: ${action === "auto" ? "mute while unfocused" : action}.`);
+    } catch (error) {
+      void vscode.window.showErrorMessage(`Studio audio: ${String(error)}`);
     }
   }
 
@@ -5033,6 +5058,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("renium.gitSync.checkoutBranch", () => controller.git.gitCheckoutBranch()),
     vscode.commands.registerCommand("renium.gitSync.openRemote", () => controller.git.gitOpenRemote()),
     vscode.commands.registerCommand("renium.pullFromStudio", () => controller.pullFromStudio()),
+    vscode.commands.registerCommand("renium.studioAudio", () => controller.studioAudio()),
     vscode.commands.registerCommand("renium.pushToStudio", () => controller.pushToStudio()),
     vscode.commands.registerCommand("renium.exportGameFile", () => controller.exportGameFile()),
     vscode.commands.registerCommand("renium.syncWallyPackages", () => controller.packages.syncWallyPackages()),

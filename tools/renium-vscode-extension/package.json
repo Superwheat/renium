@@ -55,6 +55,11 @@
     ],
     "commands": [
       {
+        "command": "renium.studioAudio",
+        "title": "Studio Audio",
+        "category": "Renium"
+      },
+      {
         "command": "renium.openMenu",
         "title": "Open Menu",
         "category": "Renium"

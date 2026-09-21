@@ -107,6 +107,8 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::PropertyAccess(args) => crate::studio::automation::property_access::command(args),
         Commands::PerformanceMonitor(args) => crate::studio::automation::monitor::command(args),
         Commands::PerformanceProfile(args) => crate::cli::performance::run(args),
+        Commands::StudioAudio(args) => crate::studio::audio::run(args, project),
+        Commands::AudioWorker(args) => crate::studio::audio::run_worker(args),
         Commands::PerformanceWorker => crate::studio::performance::run_worker(),
         Commands::PerformanceHolder(args) => {
             crate::studio::performance::run_holder(args.pid, &args.identity, &args.locator)

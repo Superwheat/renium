@@ -73,7 +73,7 @@ pub(super) fn logical_processors() -> usize {
         .unwrap_or(1)
 }
 
-pub(super) fn process_identity(pid: u32) -> Option<String> {
+pub(crate) fn process_identity(pid: u32) -> Option<String> {
     let mut info = ProcBsdInfo {
         flags: 0,
         status: 0,

@@ -144,13 +144,16 @@ fn build_macos(out_dir: &Path) {
         "AppKit",
         "-framework",
         "CoreGraphics",
+        "-framework",
+        "CoreAudio",
         "-Wl,-dead_strip",
         "-o",
     ]);
     helper_command
         .arg(&helper)
         .arg(&helper_source)
-        .arg(&launch_guard_source);
+        .arg(&launch_guard_source)
+        .arg("native/renium_audio_macos.mm");
     run(&mut helper_command, "macOS Studio helper build");
     let mut launcher_command = Command::new("clang");
     launcher_command.args([
@@ -179,6 +182,7 @@ fn build_macos(out_dir: &Path) {
     shield_command.arg(&shield).arg(&shield_source);
     run(&mut shield_command, "macOS input shield build");
     println!("cargo:rerun-if-changed={}", helper_source.display());
+    println!("cargo:rerun-if-changed=native/renium_audio_macos.mm");
     println!("cargo:rerun-if-changed={}", launch_guard_source.display());
     println!("cargo:rerun-if-changed={}", launcher_source.display());
     println!("cargo:rerun-if-changed={}", shield_source.display());

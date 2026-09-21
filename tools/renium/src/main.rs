@@ -205,6 +205,7 @@ fn checks_agent_update(command: &Commands) -> bool {
             | Commands::BridgeDaemon(_)
             | Commands::ExplorerDaemon(_)
             | Commands::PerformanceWorker
+            | Commands::AudioWorker(_)
             | Commands::PerformanceHolder(_)
             | Commands::CursorPoll(_)
     )
@@ -242,6 +243,7 @@ fn checks_agent_instructions(command: &Commands) -> bool {
             | Commands::ExplorerDaemon(_)
             | Commands::PerformanceProfile(_)
             | Commands::PerformanceWorker
+            | Commands::AudioWorker(_)
             | Commands::PerformanceHolder(_)
             | Commands::CursorPoll(_)
     )

@@ -430,6 +430,13 @@ pub(super) enum Commands {
         about = "Constrain Studio resources for performance testing"
     )]
     PerformanceProfile(performance::PerformanceArgs),
+    #[command(
+        name = "audio",
+        about = "Mute Studio audio, or mute automatically while unfocused"
+    )]
+    StudioAudio(crate::studio::audio::AudioArgs),
+    #[command(hide = true)]
+    AudioWorker(crate::studio::audio::WorkerArgs),
     #[command(hide = true)]
     PerformanceWorker,
     #[command(hide = true)]

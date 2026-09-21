@@ -35,7 +35,7 @@ const LAUNCHER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-s
 const REQUEST_MAGIC: u32 = 0x4d4e4552;
 // Fence property-operation additions as well as the outer serializer header.
 // An already-open Studio can still have an older helper mapped after an update.
-const REQUEST_VERSION: u32 = 10;
+const REQUEST_VERSION: u32 = 11;
 
 fn native_helper_error(error: &str) -> String {
     if error.contains("invalid serializer request")
@@ -881,7 +881,7 @@ unsafe extern "C" {
     fn proc_pidpath(pid: i32, buffer: *mut c_void, buffer_size: u32) -> i32;
 }
 
-fn process_executable_path(pid: u32) -> Result<PathBuf> {
+pub(crate) fn process_executable_path(pid: u32) -> Result<PathBuf> {
     let mut bytes = vec![0u8; 4096];
     let length = unsafe { proc_pidpath(pid as i32, bytes.as_mut_ptr().cast(), bytes.len() as u32) };
     if length <= 0 {
@@ -894,6 +894,57 @@ fn process_executable_path(pid: u32) -> Result<PathBuf> {
     Ok(PathBuf::from(
         String::from_utf8(bytes).context("Studio executable path is not valid UTF-8")?,
     ))
+}
+
+pub(crate) fn studio_audio(
+    pid: u32,
+    action: crate::studio::audio::Action,
+) -> Result<crate::studio::audio::Status> {
+    use crate::studio::audio::{Action, Status};
+    let mut socket = UnixStream::connect(format!("/tmp/renium-studio-{pid}.sock")).context(
+        "Audio control needs the current Renium helper; reopen this Studio window with `rbx ro`",
+    )?;
+    socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+    socket.set_write_timeout(Some(Duration::from_secs(2)))?;
+    let mut request = [0u8; 56];
+    request[..4].copy_from_slice(&REQUEST_MAGIC.to_le_bytes());
+    request[4..8].copy_from_slice(&REQUEST_VERSION.to_le_bytes());
+    request[8..12].copy_from_slice(&7u32.to_le_bytes());
+    let action: u32 = match action {
+        Action::Status => 0,
+        Action::Off => 1,
+        Action::Mute => 2,
+        Action::Unmute => 3,
+        Action::Auto => 4,
+    };
+    request[20..24].copy_from_slice(&action.to_le_bytes());
+    socket.write_all(&request)?;
+    let mut response = [0u8; RESPONSE_SIZE];
+    socket.read_exact(&mut response)?;
+    anyhow::ensure!(
+        read_u32(&response, 0) == Some(REQUEST_MAGIC),
+        "Invalid Studio audio response"
+    );
+    let error = if read_u32(&response, 4) == Some(0) {
+        None
+    } else {
+        let bytes = &response[24..];
+        let length = bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(bytes.len());
+        Some(native_helper_error(&String::from_utf8_lossy(
+            &bytes[..length],
+        )))
+    };
+    Ok(Status {
+        sessions: read_u32(&response, 12).unwrap_or(0) as usize,
+        muted_sessions: read_u32(&response, 8).unwrap_or(0) as usize,
+        focused: read_u32(&response, 16) == Some(1),
+        pending_restores: read_u32(&response, 20).unwrap_or(0) as usize,
+        error,
+        ..Status::default()
+    })
 }
 
 /// Protect an existing Edit process before it starts or closes Play children.

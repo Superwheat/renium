@@ -1089,6 +1089,23 @@ fn automation_dispatch_operation(
     }
     let _selection = select_bridge_context(context, bridge);
     match operation {
+        op::STUDIO_AUDIO => {
+            let player = match parameters.get("player") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(player)) if !player.trim().is_empty() => Some(player.as_str()),
+                _ => bail!("Audio player must be a non-empty client name or index"),
+            };
+            let target = if player.is_some() {
+                BridgeTarget::Client
+            } else {
+                BridgeTarget::Edit
+            };
+            let pid = bridge.studio_pid_for_selector(target, player)?;
+            let action = serde_json::from_value(
+                parameters.get("action").cloned().unwrap_or(json!("status")),
+            )?;
+            crate::studio::audio::command(pid, action)
+        }
         op::PULL => automation_pull_operation(context, parameters, bridge, bridge_wait_seconds)
             .map(|(result, _)| result),
         op::PUSH => {

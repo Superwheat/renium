@@ -14,6 +14,8 @@ use crate::app::update;
 
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+pub(crate) use macos::process_identity as audio_process_identity;
 #[cfg(not(any(windows, target_os = "macos")))]
 mod unsupported;
 #[cfg(windows)]

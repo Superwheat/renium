@@ -46,6 +46,7 @@
 
 extern "C" bool ReniumArmLaunchGuard();
 extern "C" void ReniumInitializeLaunchGuard();
+extern "C" bool ReniumStudioAudio(unsigned, unsigned*, unsigned*, unsigned*, bool*, char*, std::size_t);
 
 #if defined(_WIN32)
 extern "C" int unsetenv(const char*);
@@ -115,7 +116,7 @@ struct DataModelScanStats
 };
 
 static constexpr std::uint32_t Magic = 0x4d4e4552;
-static constexpr std::uint32_t Version = 10;
+static constexpr std::uint32_t Version = 11;
 // Command 3 does not use factoryRva as a function address. Its top bit opts in
 // to per-candidate clocks; older helpers ignore it and keep the same payloads.
 static constexpr std::uint64_t PropertyPhaseTimingFlag = std::uint64_t{1} << 63;
@@ -3362,8 +3363,8 @@ static bool HandleClient(int client)
     Response response{Magic, 7, 0, 0, {}};
     if (!ReadExact(client, &request, sizeof(request)) || request.magic != Magic ||
         (request.command != 1 && request.command != 2 && request.command != 3 &&
-            request.command != 4 && request.command != 5 && request.command != 6) ||
-        (request.command != 4 && request.command != 5 && request.command != 6 && request.pathLength == 0) ||
+            request.command != 4 && request.command != 5 && request.command != 6 && request.command != 7) ||
+        (request.command < 4 && request.pathLength == 0) ||
         request.pathLength >= (request.command == 3 ? 128u * 1024 * 1024 + 66216u : PATH_MAX) || request.titleLength >= PATH_MAX)
     {
         SetError(response, "invalid serializer request");
@@ -3373,6 +3374,19 @@ static bool HandleClient(int client)
     if (request.version != Version)
     {
         SetError(response, "incompatible native helper protocol; restart Studio with the matching Renium build");
+        WriteExact(client, &response, sizeof(response));
+        return false;
+    }
+    if (request.command == 7)
+    {
+        unsigned count = 0, muted = 0, pending = 0;
+        bool focused = false;
+        if (request.pathLength != 0 || request.titleLength != 0 || request.reserved > 4 || request.factoryRva != 0 || request.executeRva != 0)
+            SetError(response, "invalid process audio request");
+        else if (ReniumStudioAudio(request.reserved, &count, &muted, &pending, &focused, response.error, sizeof(response.error)))
+            response.status = 0;
+        response.outputSize = (std::uint64_t{count} << 32) | muted;
+        response.elapsedMicros = (std::uint64_t{pending} << 32) | static_cast<unsigned>(focused);
         WriteExact(client, &response, sizeof(response));
         return false;
     }

@@ -1,3 +1,4 @@
+pub(crate) mod audio;
 pub(crate) mod automation;
 pub(crate) mod bridge;
 pub(crate) mod diagnosis;

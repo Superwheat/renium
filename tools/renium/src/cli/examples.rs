@@ -1,5 +1,9 @@
 pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     (
+        "audio",
+        "Examples:\n  rbx audio mute\n  rbx audio unmute\n  rbx audio auto\n  rbx audio off\n  rbx audio status",
+    ),
+    (
         "publish",
         "Examples:\n  rbx publish --dry-run\n  rbx --place lobby publish\n  rbx publish --open-cloud\n  rbx publish --open-cloud --file build.rbxl --universe 123 --place-id 456",
     ),

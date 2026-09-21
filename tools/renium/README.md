@@ -31,7 +31,17 @@ pointers, which Cursor, Claude Code, Codex and Copilot pick up on their own. The
 editor extension offers to initialize a folder that has no project yet. Nothing
 creates a project by itself.
 
-## Start syncing
+## Studio audio
+
+`rbx audio mute` / `rbx audio unmute` control the selected Studio's audio without
+editing game sounds. Opt into `rbx audio auto` to mute while Studio is unfocused;
+`rbx audio off` restores Renium's changes. Nothing is enabled by default.
+The mode lasts until that process closes. Use `--player 1` for a separate test
+client, `--pid PID` for an exact process, or the editor's **Studio Audio** menu.
+macOS requires a current Renium-launched Studio; unsupported virtual/aggregate
+audio devices report an error. `rbx audio status` shows actual output counts.
+
+## Start two-way sync
 
 Open your place in Studio. For a new project, use a **dedicated empty folder**:
 
