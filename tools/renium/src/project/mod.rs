@@ -5,6 +5,7 @@ pub(crate) mod layout;
 pub(crate) mod package_links;
 mod place_diff;
 pub(crate) mod place_file;
+pub(crate) mod publish;
 pub(crate) mod sourcemap;
 pub(crate) mod storage;
 pub(crate) mod structural;

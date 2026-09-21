@@ -26,6 +26,29 @@ Launch or close Studio only when needed. Don't call `PluginManager:ExportPlace`:
 Place order uses published IDs. `pa`, `pn`, and `po` invalidate old bindings automatically.
 Ambiguous targeting returns candidates. Transient reads retry automatically; after a lost mutation response, inspect the affected state before repeating it.
 
+## Publishing
+
+```powershell
+rbx publish --dry-run
+rbx --place lobby publish
+rbx publish --open-cloud
+rbx publish --open-cloud --file build.rbxl --universe 123 --place-id 456
+```
+
+Publishing requires user authorization. Default: publish the selected Studio Edit
+state to its existing place with the Studio login, without pushing files first.
+Settle pending Live Sync with `lst --wait`. Studio's Save Place API must be enabled
+for the place; an active Team Create session blocks it. Don't change those settings
+or credentials to work around a refusal without authorization.
+
+`--open-cloud` builds the selected place project, or uploads `--file` unchanged.
+Use `ROBLOX_API_KEY` / `--key-env ENV` with Universe Places Write. IDs come from the
+experience or explicit flags. Cloud rejects instance types its API cannot update
+reliably; use Studio for those. `--dry-run` validates the input/target without an
+upload or permission check (cloud mode still builds). Temporary builds are cleaned.
+Neither mode creates places, publishes packages, or restarts servers. An unconfirmed
+response is not success: inspect Version History before retrying.
+
 ## Source edits and ordered input
 
 ```powershell

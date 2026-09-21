@@ -93,6 +93,38 @@ Newer edits are protected: restore stops if the affected files have changed.
 Live Sync transfers the restored files; otherwise add `--apply-studio`.
 Add `--details` only when you need every restored path.
 
+## Publish a place
+
+```powershell
+rbx publish --dry-run
+rbx --place lobby publish
+rbx publish --open-cloud
+rbx publish --open-cloud --file build.rbxl --universe 123 --place-id 456
+```
+
+`publish` defaults to the selected Studio **Edit** session and its existing place,
+using your Studio login. It publishes Studio's current state, not unsynced files.
+Settle Live Sync first with `rbx lst --wait`. The Studio API needs **Save Place API**
+enabled for the place and cannot save during an active Team Create session. Renium
+does not change those settings or switch authentication automatically.
+
+`--open-cloud` builds the selected place project with its normal adapters/toolchains,
+or uploads `--file` without building. It uses `ROBLOX_API_KEY` (or `--key-env ENV`),
+with **Universe Places → Write** permission for the destination. Place/universe IDs
+come from the project unless explicitly supplied. At an experience root, select
+`--place ALIAS`. Builds/uploads are staged locally and cleaned up afterwards.
+
+`--dry-run` validates the source and destination without publishing; it does not
+check Roblox permissions. Cloud dry runs still build the project. Files containing
+EditableImage, EditableMesh, PartOperation, SurfaceAppearance or BaseWrap instances
+are refused because the [Open Cloud API cannot reliably update them](https://create.roblox.com/docs/cloud/guides/usage-place-publishing).
+Studio uses [AssetService.SavePlaceAsync](https://create.roblox.com/docs/reference/engine/classes/AssetService#SavePlaceAsync).
+
+The VS Code/Cursor **Publish Place...** command offers both modes with a destination
+preview and confirmation. Publishing never happens as part of sync, does not create
+a new place, publish packages, or restart servers. A lost response is not success:
+check Roblox's Version History before retrying an unconfirmed publish.
+
 ## Project files
 
 ```text

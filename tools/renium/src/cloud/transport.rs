@@ -62,6 +62,7 @@ struct CloudRequest {
     headers: Map<String, Value>,
     if_match: Option<String>,
     if_none_match: Option<String>,
+    timeout_seconds: Option<u64>,
 }
 
 pub(crate) struct CloudResponse {
@@ -424,8 +425,22 @@ fn execute_request(
             Ok((name.as_str(), value))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let timeout = request
+        .timeout_seconds
+        .map(|seconds| {
+            if !(1..=600).contains(&seconds) {
+                return Err(bad_request(
+                    "timeoutSeconds must be between 1 and 600".to_string(),
+                ));
+            }
+            Ok(Duration::from_secs(seconds))
+        })
+        .transpose()?;
     let send = || {
         let mut outgoing = auth.apply(agent().request(&method, &url));
+        if let Some(timeout) = timeout {
+            outgoing = outgoing.timeout(timeout);
+        }
         if let Some(value) = request.if_match.as_deref() {
             outgoing = outgoing.set("If-Match", value);
         }

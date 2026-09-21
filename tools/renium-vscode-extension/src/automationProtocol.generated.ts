@@ -78,6 +78,7 @@ export const AUTOMATION_OP = {
   collabStop: 104,
   collabStatus: 105,
   collabAwareness: 106,
+  placePublish: 107,
 } as const;
 
 export const AUTOMATION_RUNTIME_OPS = new Set<number>([
@@ -115,4 +116,5 @@ export const AUTOMATION_RUNTIME_OPS = new Set<number>([
   99,
   100,
   101,
+  107,
 ]);

@@ -230,6 +230,11 @@ pub(super) enum Commands {
     )]
     Build(workflows::BuildArgs),
     #[command(
+        name = "publish",
+        about = "Publish the selected Studio place, or project files with --open-cloud"
+    )]
+    Publish(crate::project::publish::PublishArgs),
+    #[command(
         name = "q",
         alias = "query-place",
         alias = "place-find",

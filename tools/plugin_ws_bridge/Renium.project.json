@@ -85,6 +85,9 @@
       "BridgeCreatorApi": {
         "$path": "BridgeCreatorApi.module.luau"
       },
+      "BridgePublish": {
+        "$path": "BridgePublish.module.luau"
+      },
       "BridgePropertySchema": {
         "$path": "BridgePropertySchema.module.luau"
       },

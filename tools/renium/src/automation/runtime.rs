@@ -1127,6 +1127,7 @@ fn automation_dispatch_operation(
             ensure_plugin_api_ok(&result)?;
             Ok(result)
         }
+        op::PLACE_PUBLISH => crate::project::publish::studio_result(context, parameters, bridge),
         op::FIND
         | op::TREE
         | op::INSPECT
@@ -1384,6 +1385,26 @@ fn automation_dispatch_managed(
     }
     if operation == op::STUDIO_OPEN {
         return open_studio(context, parameters, state, bridge).map_err(automation_failure);
+    }
+    if operation == op::PLACE_PUBLISH {
+        let status = state.live_sync().status(context.id);
+        if status.get("running").and_then(Value::as_bool) == Some(true)
+            && (status.get("syncing").and_then(Value::as_bool) == Some(true)
+                || status.get("paused").and_then(Value::as_bool) == Some(true)
+                || status.get("resolutionRequired").and_then(Value::as_bool) == Some(true)
+                || status.get("error").and_then(Value::as_str).is_some()
+                || status
+                    .get("pendingPaths")
+                    .and_then(Value::as_array)
+                    .is_some_and(|paths| !paths.is_empty()))
+        {
+            return Err(automation::Failure::new(
+                "conflict",
+                "Live Sync is not settled; run rbx lst --wait and resolve pending changes before publishing",
+                false,
+                "live-status",
+            ));
+        }
     }
     if operation == op::PROPERTY_ACCESS {
         let _selection = select_bridge_context(context, bridge);
@@ -2174,6 +2195,7 @@ fn restore_persisted_live_sync_for_request(
             | op::DISCARD_PENDING
             | op::STUDIO_OPEN
             | op::STUDIO_CLOSE
+            | op::PLACE_PUBLISH
             | op::REVIEW_PREPARE
             | op::REVIEW_APPLY
             | op::REVIEW_REJECT
@@ -2579,6 +2601,8 @@ fn automation_execute_request(
             }
             let requires_review = operation.review
                 && (matches!(operation.id, op::STUDIO_OPEN | op::STUDIO_CLOSE)
+                    || operation.id == op::PLACE_PUBLISH
+                        && request.p.get("dryRun").and_then(Value::as_bool) != Some(true)
                     || request.p.get("destructive").and_then(Value::as_bool) == Some(true));
             if requires_review {
                 return Err(automation::Failure::new(
@@ -2727,7 +2751,7 @@ fn automation_execute_request(
                         "cap",
                     ));
                 }
-                let parameters = object.get("p").cloned().unwrap_or_else(|| json!({}));
+                let mut parameters = object.get("p").cloned().unwrap_or_else(|| json!({}));
                 if !parameters.is_object() {
                     return Err(automation::Failure::new(
                         "bad_req",
@@ -2735,6 +2759,9 @@ fn automation_execute_request(
                         false,
                         "review-prepare",
                     ));
+                }
+                if target == op::PLACE_PUBLISH {
+                    parameters["runtimeId"] = json!(context.runtime_id);
                 }
                 let review_id = state.prepare_review(&context, target, parameters);
                 return Ok(
@@ -2967,6 +2994,7 @@ mod tests {
             op::MULTI_EDIT,
             op::PUSH,
             op::PACKAGE_PUBLISH,
+            op::PLACE_PUBLISH,
             op::INPUT,
             op::PLAY_START,
         ] {

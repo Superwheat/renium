@@ -77,6 +77,7 @@
     { "id": 103, "name": "collab-join", "queued": false },
     { "id": 104, "name": "collab-stop", "queued": false },
     { "id": 105, "name": "collab-status", "queued": false },
-    { "id": 106, "name": "collab-awareness", "queued": false }
+    { "id": 106, "name": "collab-awareness", "queued": false },
+    { "id": 107, "name": "place-publish", "review": true, "runtime": true }
   ]
 }

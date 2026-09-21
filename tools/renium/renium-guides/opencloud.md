@@ -13,6 +13,10 @@ Public reads can explicitly use `--anonymous`; authenticated requests never fall
 
 ## Resource commands
 
+For place publishing, prefer `rbx publish --open-cloud`: it builds the selected
+project (or accepts `--file`) and checks Open Cloud's place-file fidelity limits.
+See `advanced.md` for Studio publishing, targeting, and dry runs.
+
 Prefer a resource command over raw HTTP. Run writes only when requested.
 
 ```powershell

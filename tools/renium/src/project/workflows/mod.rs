@@ -1288,7 +1288,7 @@ fn should_update_instruction_file(path: &Path, replacement: &[u8]) -> Result<boo
     Ok(current != replacement)
 }
 
-fn build_once(
+pub(super) fn build_once(
     loaded: &LoadedProject,
     args: &BuildArgs,
     output: &Path,

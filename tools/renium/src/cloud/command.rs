@@ -307,7 +307,7 @@ fn run_route(
     super::routes::run(category, identity, key_env, oauth_env, anonymous, route)
 }
 
-fn discover_identity(
+pub(crate) fn discover_identity(
     project: Option<&Path>,
     universe: Option<i64>,
     place_id: Option<i64>,

@@ -60,6 +60,7 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::ImportRojo(args) => config::run_import_rojo(args),
         Commands::Init(args) => workflows::run_init(args),
         Commands::Build(args) => workflows::run_build(args, project),
+        Commands::Publish(args) => crate::project::publish::run(args, project),
         Commands::QueryPlace(args) => crate::project::place_file::query_place(args),
         Commands::ComparePlace(args) => crate::project::place_file::compare_place(args, project),
         Commands::Doctor(args) => workflows::run_doctor(args, project),

@@ -1116,6 +1116,11 @@ class RobloxSyncController {
         action: "build",
       },
       {
+        label: "$(cloud-upload) Publish Place...",
+        description: "Publish from Studio or build and upload with Open Cloud",
+        action: "publish",
+      },
+      {
         label: "$(save) Export Place File...",
         description: "Write a standalone .rbxl or .rbxlx file from project files",
         action: "placeFile",
@@ -1123,6 +1128,9 @@ class RobloxSyncController {
     ])) {
       case "build":
         await this.buildProject();
+        return;
+      case "publish":
+        await this.publishPlace();
         return;
       case "placeFile":
         await this.exportGameFile();
@@ -2025,6 +2033,35 @@ class RobloxSyncController {
     const cfg = this.getConfig();
     const manifest = this.requireProjectManifest(cfg);
     await vscode.window.showTextDocument(vscode.Uri.file(manifest), { preview: false });
+  }
+
+  public async publishPlace(): Promise<void> {
+    const cfg = this.getConfig();
+    const manifest = this.requireProjectManifest(cfg);
+    const mode = await vscode.window.showQuickPick([
+      { label: "Studio (default)", description: "Publish the selected Edit session using your Studio login", cloud: false },
+      { label: "Open Cloud", description: "Build saved project files and upload using ROBLOX_API_KEY", cloud: true },
+    ], { title: "Publish Place", placeHolder: "Choose the source to publish" });
+    if (!mode) return;
+    const args = ["publish", "--project", manifest, "--output-mode", "json"];
+    if (mode.cloud) args.push("--open-cloud");
+    const preview = await this.runProjectCommand("Publish preview", "publish", [...args, "--dry-run"]);
+    const plan = recordValue(preview?.result);
+    if (typeof plan?.gameId !== "number" || typeof plan.placeId !== "number") {
+      throw new Error("Publish preview did not confirm a destination; nothing was published");
+    }
+    const answer = await vscode.window.showWarningMessage(
+      `Publish place ${plan.placeId} in universe ${plan.gameId}?`,
+      { modal: true, detail: `${mode.cloud ? "Saved project files" : "The current Studio Edit state"} will become the published version. This does not publish packages or restart running servers.` },
+      "Publish",
+    );
+    if (answer !== "Publish") return;
+    if (mode.cloud) {
+      args.push("--universe", String(plan.gameId), "--place-id", String(plan.placeId));
+    } else {
+      args.push("--place", `${plan.gameId}:${plan.placeId}`);
+    }
+    await this.runProjectCommand("Publish place", "publish", args);
   }
 
   public async openCliDocumentation(): Promise<void> {
@@ -4966,6 +5003,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("renium.projectTools", () => controller.openProjectTools()),
     vscode.commands.registerCommand("renium.projectDoctor", () => controller.runProjectDoctor()),
     vscode.commands.registerCommand("renium.projectBuild", () => controller.buildProject()),
+    vscode.commands.registerCommand("renium.placePublish", () => controller.publishPlace()),
     vscode.commands.registerCommand("renium.projectConfig", () => controller.openProjectConfiguration()),
     vscode.commands.registerCommand("renium.projectDocs", () => controller.openCliDocumentation()),
     vscode.commands.registerCommand("renium.createAgentInstructions", () => controller.createAgentInstructions()),

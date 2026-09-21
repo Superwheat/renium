@@ -178,7 +178,7 @@ function BridgePluginRuntime.start(context)
 	local PARALLEL_SOURCE_BATCH_MIN_ITEMS = 24
 	local BRIDGE_VERSION = "0.3.10"
 	local BRIDGE_PROTOCOL_VERSION = "compact-v5"
-	local BRIDGE_BUILD_UNIX = 1789917571
+	local BRIDGE_BUILD_UNIX = 1789969402
 	local MAX_ACTIVE_DEMAND_SERIALIZERS = 4
 	local MAX_SOURCE_BATCH_PATHS = 1024
 	local COMPACT_TYPE_IDS = {
@@ -411,6 +411,7 @@ function BridgePluginRuntime.start(context)
 			editorSync.assertCurrentRequestLeaseActive()
 		end,
 	})
+	local Publish = requireChildModule("BridgePublish")
 	local networkSimulation = requireChildModule("BridgeNetworkSimulation").create(function()
 		return settings():GetService("NetworkSettings")
 	end)
@@ -4295,6 +4296,16 @@ function BridgePluginRuntime.start(context)
 	Config.bridgeMethodHandlers.creatorJob = Config.creatorApi.creatorJob
 	Config.bridgeMethodHandlers.multiEdit = Config.creatorApi.multiEdit
 	Config.bridgeMethodHandlers.uploadImages = Config.creatorApi.uploadImages
+	Config.bridgeMethodHandlers.publishPlace = function(p, sessionGeneration)
+		return Publish.run(p, {
+			runtimeId = Config.bridgeRuntimeId,
+			isPlayModeRunning = RuntimeApi.isPlayModeRunning,
+			assertRequestLeaseActive = editorSync.assertCurrentRequestLeaseActive,
+			assertSessionOwnership = function()
+				assert(sessionLock.validate(sessionGeneration), "Renium session ownership was lost")
+			end,
+		})
+	end
 
 	Config.bridgeMethodHandlers.recordSyncCompletion = function()
 		Config.recordSyncCompletion()
@@ -4404,6 +4415,7 @@ function BridgePluginRuntime.start(context)
 		generateModel = true,
 		multiEdit = true,
 		uploadImages = true,
+		publishPlace = true,
 	}
 	Config.bridgeSessionOwnedMethods = {
 		-- Profiling is synchronous and independent of place mutations. Keep its
@@ -4464,6 +4476,7 @@ function BridgePluginRuntime.start(context)
 		creatorJob = true,
 		multiEdit = true,
 		uploadImages = true,
+		publishPlace = true,
 	}
 
 	ConnectionModule.create({
