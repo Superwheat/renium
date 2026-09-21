@@ -584,9 +584,10 @@ pub(crate) fn align_first_pairing(
         }
         match preference {
             ConflictPreference::None => conflicts.push(format!(
-                "{} has different values for {}",
+                "{} has different values for {}{}",
                 path.display(),
-                render_structural_key(&structural_interner, *key)
+                render_structural_key(&structural_interner, *key),
+                describe_instance_differences(editor, *editor_index, studio, studio_index)
             )),
             ConflictPreference::Editor => {
                 copy_settings_instance(editor, *editor_index, studio, studio_index)
@@ -724,6 +725,145 @@ pub(crate) fn settings_instances_equal(
             &right_instance.properties,
         )
         && reconciliation_values_map_equal(&left_instance.attributes, &right_instance.attributes)
+}
+
+/// What differs between the two records of one instance, in the form the
+/// conflict summary groups by (`: property NAME: ...`, `; attribute NAME: ...`),
+/// with Studio's side first.
+pub(crate) fn describe_instance_differences(
+    editor: &SettingsBytecode,
+    editor_index: usize,
+    studio: &SettingsBytecode,
+    studio_index: usize,
+) -> String {
+    let files = &editor.instances[editor_index];
+    let live = &studio.instances[studio_index];
+    let database = rbx_reflection_database::get().ok();
+    let mut parts = Vec::new();
+    if live.name != files.name {
+        parts.push(format!(
+            "property Name: {:?} vs {:?}",
+            live.name, files.name
+        ));
+    }
+    if live.class_name != files.class_name {
+        parts.push(format!(
+            "property ClassName: {} vs {}",
+            live.class_name, files.class_name
+        ));
+    }
+    let (live_parent, files_parent) = (
+        settings_parent_id(studio, studio_index),
+        settings_parent_id(editor, editor_index),
+    );
+    if live_parent != files_parent {
+        parts.push(format!(
+            "parent identity: {} vs {}",
+            live_parent.unwrap_or("none"),
+            files_parent.unwrap_or("none")
+        ));
+    }
+    let mut names = live
+        .properties
+        .keys()
+        .chain(files.properties.keys())
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    for name in names {
+        let (left, right) = (live.properties.get(name), files.properties.get(name));
+        if let (Some(left), Some(right)) = (left, right)
+            && crate::settings::equivalence::reconciliation_values_equal(left, right, false)
+        {
+            continue;
+        }
+        if !crate::settings::equivalence::reconciliation_property_compares(
+            database,
+            &live.class_name,
+            name,
+            left.or(right).unwrap_or(&Value::Null),
+            left.is_some(),
+            right.is_some(),
+        ) {
+            continue;
+        }
+        parts.push(format!(
+            "property {name}: {}",
+            describe_value_difference(name, left, right)
+        ));
+    }
+    let mut attributes = live
+        .attributes
+        .keys()
+        .chain(files.attributes.keys())
+        .collect::<Vec<_>>();
+    attributes.sort();
+    attributes.dedup();
+    for name in attributes {
+        let (left, right) = (live.attributes.get(name), files.attributes.get(name));
+        if let (Some(left), Some(right)) = (left, right)
+            && crate::settings::equivalence::reconciliation_values_equal(left, right, false)
+        {
+            continue;
+        }
+        parts.push(format!(
+            "attribute {name}: {}",
+            describe_value_difference(name, left, right)
+        ));
+    }
+    if parts.is_empty() {
+        let only = |a: &Map<String, Value>, b: &Map<String, Value>| {
+            a.keys()
+                .filter(|name| !b.contains_key(*name))
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        parts.push(format!(
+            "records differ; keys only in studio [{}], only in files [{}], attributes only in studio [{}], only in files [{}]",
+            only(&live.properties, &files.properties),
+            only(&files.properties, &live.properties),
+            only(&live.attributes, &files.attributes),
+            only(&files.attributes, &live.attributes)
+        ));
+    }
+    format!(": {}", parts.join("; "))
+}
+
+fn describe_value_difference(name: &str, studio: Option<&Value>, files: Option<&Value>) -> String {
+    if name == "Source"
+        && let (Some(Value::String(live)), Some(Value::String(saved))) = (studio, files)
+    {
+        let first = live
+            .lines()
+            .zip(saved.lines())
+            .position(|(a, b)| a != b)
+            .map_or_else(
+                || live.lines().count().min(saved.lines().count()) + 1,
+                |index| index + 1,
+            );
+        return format!(
+            "studio {} lines vs files {} lines, first difference at line {first}",
+            live.lines().count(),
+            saved.lines().count()
+        );
+    }
+    format!("{} vs {}", describe_value(studio), describe_value(files))
+}
+
+fn describe_value(value: Option<&Value>) -> String {
+    let Some(value) = value else {
+        return "absent".to_string();
+    };
+    let text = match value {
+        Value::String(text) => format!("{text:?}"),
+        other => other.to_string(),
+    };
+    if text.chars().count() > 60 {
+        format!("{}…", text.chars().take(59).collect::<String>())
+    } else {
+        text
+    }
 }
 
 pub(crate) fn copy_settings_instance(

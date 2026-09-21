@@ -1,12 +1,25 @@
 # Open Cloud and creator assets
 
-Cloud commands run without Studio. Put API keys in `ROBLOX_API_KEY`, or select an environment variable with `--key-env ENV` / `--oauth-env ENV`. Never put credentials in arguments or project files.
+Cloud commands run without Studio. Store a key once with `rbx oc key add NAME` (the key is read from a hidden prompt, never from arguments) and every `rbx oc` command uses it; `--key NAME` picks another stored key, `ROBLOX_API_KEY` or `--key-env ENV` / `--oauth-env ENV` override the store. Keys are kept per user outside every project (DPAPI on Windows, the Keychain on macOS). Never put credentials in arguments, project files or shell profiles.
 
 ```powershell
+rbx oc key add studio
+rbx oc key list
 rbx oc key
 ```
 
-This reports key permissions without exposing the secret. Roblox enforces owner permissions, scopes, and targets; Renium does not widen access or switch credentials.
+`key` alone reports the active key's permissions without exposing the secret. Roblox enforces owner permissions, scopes, and targets; Renium does not widen access or switch credentials.
+
+## Find and pull an experience
+
+```powershell
+rbx oc games
+rbx oc games "Brainrot Town"
+rbx oc fetch "Brainrot Town" -r ./BrainrotTown
+rbx oc fetch --universe 8108639406 -o brainrot.rbxl
+```
+
+`games` lists what the key can reach: the universes it is scoped to plus the public experiences of the key's user and groups; a name matches ignoring case, emoji and punctuation. `fetch` downloads the experience's root place and, with `-r DIR`, imports it into that project (creating it) so the files are ready to open with `rbx so`. Private experiences the key is not scoped to need `--universe ID` or `--place-id ID`.
 
 The project supplies universe/place IDs. Otherwise put `--universe ID` and `--place-id ID` before the resource.
 Public reads can explicitly use `--anonymous`; authenticated requests never fall back to anonymous access.

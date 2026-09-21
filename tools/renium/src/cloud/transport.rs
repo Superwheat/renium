@@ -97,7 +97,7 @@ impl CloudAuth {
         } else if let Some(oauth_env) = oauth_env {
             Ok(Self::OAuth(required_secret(oauth_env, next)?))
         } else {
-            Ok(Self::ApiKey(required_secret(key_env, next)?))
+            Ok(Self::ApiKey(api_key_secret(key_env, next)?))
         }
     }
 
@@ -121,6 +121,111 @@ pub(crate) fn agent() -> &'static ureq::Agent {
             .timeout_read(Duration::from_secs(30))
             .timeout_write(Duration::from_secs(30))
             .build()
+    })
+}
+
+/// `--key NAME` wins, then the environment variable, then the stored default
+/// key, so a key added once with `rbx oc key add` works from any shell.
+fn api_key_secret(env_name: &str, next: &str) -> Result<String, Failure> {
+    let stored = |name: Option<&str>| {
+        super::keys::secret(name)
+            .map_err(|error| Failure::new("cloud_auth", format!("{error:#}"), false, next))
+    };
+    if let Some(name) = super::keys::selected() {
+        return stored(Some(name))?.ok_or_else(|| {
+            Failure::new(
+                "cloud_auth",
+                format!("No stored key named {name}"),
+                false,
+                next,
+            )
+        });
+    }
+    if let Some(value) = environment_value(env_name).filter(|value| !value.trim().is_empty()) {
+        return Ok(value);
+    }
+    if let Some(secret) = stored(None)? {
+        return Ok(secret);
+    }
+    Err(Failure::new(
+        "cloud_auth",
+        format!(
+            "No Open Cloud API key: {env_name} is not set and no key is stored; add one with `rbx oc key add NAME`"
+        ),
+        false,
+        next,
+    ))
+}
+
+/// A public Roblox endpoint (no credentials), parsed as JSON.
+pub(crate) fn fetch_public_json(url: &str, next: &str) -> Result<Value, Failure> {
+    let mut attempt = 0;
+    let response = loop {
+        let response = match agent().get(url).call() {
+            Ok(response) | Err(ureq::Error::Status(_, response)) => response,
+            Err(ureq::Error::Transport(error)) => {
+                return Err(Failure::new(
+                    "cloud_http",
+                    format!("Request to {url} failed: {error}"),
+                    true,
+                    next,
+                ));
+            }
+        };
+        // Public endpoints rate-limit bursts; wait as told, then a little longer.
+        if response.status() == 429 && attempt < 3 {
+            let wait = response
+                .header("retry-after")
+                .or_else(|| response.header("x-ratelimit-reset"))
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .unwrap_or(1 << attempt)
+                .clamp(1, 15);
+            std::thread::sleep(Duration::from_secs(wait));
+            attempt += 1;
+            continue;
+        }
+        break response;
+    };
+    let response = read_response(response)
+        .map_err(|message| Failure::new("cloud_http", message, false, next))?;
+    if !(200..300).contains(&response.status) {
+        return Err(Failure::new(
+            "cloud_http",
+            format!("{url} returned HTTP {}", response.status),
+            false,
+            next,
+        )
+        .detail(json!({ "status": response.status, "body": response.body })));
+    }
+    Ok(response.body)
+}
+
+/// Streams a download location to a file and returns its size.
+pub(crate) fn download_to_file(url: &str, path: &Path, next: &str) -> Result<u64, Failure> {
+    let response = agent().get(url).call().map_err(|error| {
+        Failure::new(
+            "cloud_http",
+            format!("Download from {url} failed: {error}"),
+            true,
+            next,
+        )
+    })?;
+    let mut file = std::fs::File::create(path).map_err(|error| {
+        Failure::new(
+            "io",
+            format!("Failed to create {}: {error}", path.display()),
+            false,
+            next,
+        )
+    })?;
+    let mut reader = response.into_reader();
+    std::io::copy(&mut reader, &mut file).map_err(|error| {
+        Failure::new(
+            "io",
+            format!("Failed to write {}: {error}", path.display()),
+            false,
+            next,
+        )
     })
 }
 
@@ -278,7 +383,7 @@ pub(crate) fn execute_one(
 }
 
 pub(crate) fn introspect_key(key_env: &str) -> Result<Value, Failure> {
-    let key = required_secret(key_env, "cloud key")?;
+    let key = api_key_secret(key_env, "cloud key")?;
     let result = agent()
         .post(&format!("{API_ROOT}/api-keys/v1/introspect"))
         .send_json(json!({ "apiKey": key }));

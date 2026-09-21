@@ -56,7 +56,7 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ("upd", "Examples:\n  rbx upd"),
     (
         "oc",
-        "Examples:\n  rbx oc key\n  rbx oc analytics metrics --field metric=DailyActiveUsers --field granularity=OneDay --field startTime=2026-01-01T00:00:00Z --field endTime=2026-02-01T00:00:00Z\n  rbx oc event list --limit 10\n  rbx oc experiment list --limit 25\n  rbx oc thumbnail personalization --limit 10",
+        "Examples:\n  rbx oc key add studio\n  rbx oc games \"Brainrot Town\"\n  rbx oc fetch \"Brainrot Town\" -r ./BrainrotTown\n  rbx oc key\n  rbx oc analytics metrics --field metric=DailyActiveUsers --field granularity=OneDay --field startTime=2026-01-01T00:00:00Z --field endTime=2026-02-01T00:00:00Z\n  rbx oc event list --limit 10\n  rbx oc experiment list --limit 25\n  rbx oc thumbnail personalization --limit 10",
     ),
     (
         "ip",

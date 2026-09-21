@@ -1,5 +1,7 @@
 pub(crate) mod assets;
 pub(crate) mod command;
+mod discovery;
+pub(crate) mod keys;
 mod parameters;
 pub(crate) mod products;
 mod routes;

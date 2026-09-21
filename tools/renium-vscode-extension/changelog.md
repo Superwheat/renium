@@ -4,6 +4,9 @@
 
 ### New
 
+- `rbx oc key add NAME` stores an Open Cloud API key once per user, read from a hidden prompt and kept DPAPI-protected on Windows or in the Keychain on macOS; every `rbx oc` command uses the stored default when the environment variable is unset, `--key NAME` picks another, and `key list`, `key use` and `key remove` manage them. The key never appears in arguments, project files or listings.
+- `rbx oc games [NAME]` lists the experiences a key can reach (its scoped universes plus the public experiences of the key's user and their groups) and finds one by name ignoring case, emoji and punctuation; `rbx oc fetch NAME -r DIR` downloads its root place and imports it into a project in one step.
+- `rbx lst --details` and `rbx lon --details` list every first-connection conflict with the properties that differ and both values instead of three names and a count.
 - Mute or unmute Studio audio, or opt into muting only while its window is unfocused, from `rbx audio` or the editor's Studio Audio menu. A persistent global setting covers current and newly opened windows and is editable by agents. Project sounds and volume levels are unchanged.
 - Publish places from Studio with `rbx publish`, or build and upload project files with `--open-cloud`; the editor includes a publish preview and confirmation.
 - Agents find Renium after a fresh install: `rbx setup` (run by the installer) writes a short note into the global instruction files of installed agents (Claude Code, Codex, Gemini CLI, OpenCode, Windsurf) that explains `rbx` and points to `rbx init`; `rbx --help` opens with the same hint, and the editor extension offers to initialize a folder that has no project instead of creating one silently.
@@ -16,6 +19,7 @@
 
 ### Bug fixes
 
+- A script whose files hold the legacy `Disabled` flag no longer conflicts with Studio's `Enabled`, and a property the reflection database does not know yet no longer conflicts when only Studio reports it; a first connection that differed only in those ways starts without review.
 - On macOS, a Studio that Renium launched no longer locks, warps or hides the pointer while it is not the active application. A Play session that captures the mouse takes it only once the user switches to Studio and releases it when they switch away.
 - Live Sync retries a reconcile that failed because files changed while Studio was exporting, with backoff, instead of staying on "Sync failed" until the next file edit; a manual retry also triggers it.
 - A command run outside a project no longer creates a project file and agent guides in that folder; it reports that no project was found and how to create one. Only `rbx init` and an explicit `-r DIR` create projects.

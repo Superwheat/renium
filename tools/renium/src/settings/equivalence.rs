@@ -1891,10 +1891,19 @@ pub(crate) fn canonicalize_settings_property_names(document: &mut SettingsByteco
                     migrations.insert(name.to_string(), migrated);
                     migrated
                 };
-                if !instance
-                    .properties
-                    .keys()
-                    .any(|name| renamed_property(name).is_some() || migrated_property(name))
+                // Scripts serialize the legacy `Disabled` flag while Studio reports
+                // `Enabled`; one fact, two spellings, kept as `Enabled`.
+                let legacy_disabled = instance.properties.contains_key("Disabled")
+                    && crate::rbx::decode::rbx_reflection_class_is_a(
+                        database,
+                        &instance.class_name,
+                        "BaseScript",
+                    );
+                if !legacy_disabled
+                    && !instance
+                        .properties
+                        .keys()
+                        .any(|name| renamed_property(name).is_some() || migrated_property(name))
                 {
                     continue;
                 }
@@ -1918,6 +1927,13 @@ pub(crate) fn canonicalize_settings_property_names(document: &mut SettingsByteco
                     .collect::<Vec<_>>();
                 for name in legacy {
                     migrate_legacy_property(database, &instance.class_name, &name, &mut canonical);
+                }
+                if legacy_disabled
+                    && let Some(disabled) = canonical.remove("Disabled")
+                    && !canonical.contains_key("Enabled")
+                    && let Some(flag) = disabled.as_bool()
+                {
+                    canonical.insert("Enabled".to_string(), Value::Bool(!flag));
                 }
                 instance.properties = canonical;
             }
@@ -2697,6 +2713,7 @@ pub(crate) fn reconciliation_property_is_unknown_when_absent(
     matches!(name, "CollisionFidelity" | "ClockTime" | "MeshSize")
         || database.is_some_and(|database| {
             reconciliation_property_is_unreadable(database, class_name, name)
+                || crate::rbx::encode::rbx_property_descriptor(database, class_name, name).is_none()
         })
 }
 

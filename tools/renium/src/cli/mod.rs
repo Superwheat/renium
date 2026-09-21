@@ -1926,9 +1926,9 @@ pub(super) struct StudioChangeStateArgs {
 }
 
 #[derive(Parser)]
-pub(super) struct ImportPlaceArgs {
+pub(crate) struct ImportPlaceArgs {
     #[arg(help = "Place file to import (.rbxl or .rbxlx)", value_name = "PLACE")]
-    pub(super) input: PathBuf,
+    pub(crate) input: PathBuf,
     #[arg(
         help = "Project root directory",
         short = 'r',
@@ -1937,7 +1937,7 @@ pub(super) struct ImportPlaceArgs {
         value_name = "PATH",
         default_value = "."
     )]
-    pub(super) project_root: PathBuf,
+    pub(crate) project_root: PathBuf,
     #[arg(
         help = "Script source directory",
         long,
@@ -1945,14 +1945,14 @@ pub(super) struct ImportPlaceArgs {
         value_name = "PATH",
         default_value = "src"
     )]
-    pub(super) src_dir: PathBuf,
+    pub(crate) src_dir: PathBuf,
     #[arg(
         help = "Services to import (comma-separated)",
         short,
         long,
         default_value = ""
     )]
-    pub(super) services: String,
+    pub(crate) services: String,
 }
 
 #[derive(Parser)]

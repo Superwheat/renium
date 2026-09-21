@@ -13,6 +13,7 @@ pub(crate) struct PairSetup {
     pub(crate) resolution_preference: Option<ConflictPreference>,
     pub(crate) resolution_required: bool,
     pub(crate) error: Option<String>,
+    pub(crate) conflicts: Vec<String>,
     pub(crate) requires_reconcile: bool,
     pub(crate) runtime_id: Option<String>,
     pub(crate) local_file_stamp: Option<LocalFileStamp>,
@@ -179,6 +180,7 @@ impl Coordinator {
             identity,
             mode,
             resolution_preference,
+            conflicts: record.conflicts.clone(),
             resolution_required: !unresolved_local
                 && owner_conflict.is_none()
                 && (record.resolution_required
@@ -440,6 +442,7 @@ impl Coordinator {
             setup.mode = PairMode::Verify;
             setup.resolution_required = record.resolution_required;
             setup.error = Some(conflict_message(&record.conflicts));
+            setup.conflicts = record.conflicts.clone();
             return Ok(());
         }
 
@@ -622,6 +625,7 @@ impl Coordinator {
             resolution_preference: None,
             resolution_required: record.resolution_required,
             error: None,
+            conflicts: Vec::new(),
             requires_reconcile: true,
             runtime_id: context.runtime_id.clone(),
             local_file_stamp: current_local_file_stamp,

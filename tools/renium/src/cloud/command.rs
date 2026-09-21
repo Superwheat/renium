@@ -20,6 +20,13 @@ use crate::system::files::absolutize_for_daemon as absolute_path;
 pub(crate) struct OpenCloudArgs {
     #[arg(long, global = true, default_value = "ROBLOX_API_KEY")]
     key_env: String,
+    #[arg(
+        long,
+        global = true,
+        value_name = "NAME",
+        help = "Use this stored API key"
+    )]
+    key: Option<String>,
     #[arg(long, global = true, value_name = "ENV")]
     oauth_env: Option<String>,
     #[arg(long, global = true)]
@@ -34,8 +41,14 @@ pub(crate) struct OpenCloudArgs {
 
 #[derive(Subcommand)]
 enum OpenCloudCommand {
-    #[command(about = "Show the active API key's scopes and resource limits")]
-    Key,
+    #[command(
+        about = "Show the active API key's scopes, or store keys with add, list, remove and use"
+    )]
+    Key(KeyArgs),
+    #[command(about = "List the experiences the key can reach, or find one by name")]
+    Games(GamesArgs),
+    #[command(about = "Download a place the key can reach, optionally into a new project")]
+    Fetch(FetchArgs),
     #[command(about = "List native Open Cloud operations")]
     Routes(super::routes::RoutesArgs),
     #[command(about = "Manage persistent data stores")]
@@ -102,6 +115,62 @@ enum OpenCloudCommand {
     Product(super::products::DeveloperProductCommand),
     #[command(about = "Upload images through Open Cloud")]
     ImageUpload(ImageUploadArgs),
+}
+
+#[derive(Args)]
+struct KeyArgs {
+    #[command(subcommand)]
+    action: Option<KeyAction>,
+}
+
+#[derive(Subcommand)]
+enum KeyAction {
+    #[command(
+        about = "Store a key read from stdin (hidden prompt on a terminal); the first key becomes the default"
+    )]
+    Add {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    #[command(about = "List stored keys without their secrets")]
+    List,
+    #[command(about = "Remove a stored key")]
+    Remove {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    #[command(about = "Make a stored key the default")]
+    Use {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+}
+
+#[derive(Args)]
+struct GamesArgs {
+    #[arg(
+        value_name = "NAME",
+        help = "Name, universe ID or place ID to look for"
+    )]
+    query: Option<String>,
+}
+
+#[derive(Args)]
+struct FetchArgs {
+    #[arg(
+        value_name = "NAME",
+        help = "Experience name; or pass --universe ID / --place-id ID"
+    )]
+    name: Option<String>,
+    #[arg(short, long, value_name = "FILE", help = "Where to write the .rbxl")]
+    output: Option<PathBuf>,
+    #[arg(
+        short = 'r',
+        long = "project-root",
+        value_name = "DIR",
+        help = "Import the place into this project folder, creating it when missing"
+    )]
+    project_root: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -185,6 +254,7 @@ struct ImageUploadArgs {
 }
 
 pub(crate) fn run(args: OpenCloudArgs, project: Option<&Path>) -> Result<()> {
+    super::keys::select(args.key.clone());
     let identity = discover_identity(project, args.universe, args.place_id)?;
     let key_env = args.key_env.clone();
     let oauth_env = args.oauth_env.clone();
@@ -200,11 +270,41 @@ pub(crate) fn run(args: OpenCloudArgs, project: Option<&Path>) -> Result<()> {
         )
     };
     let result = match args.command {
-        OpenCloudCommand::Key => {
-            if anonymous || oauth_env.is_some() {
-                bail!("cloud key requires an API key");
+        OpenCloudCommand::Key(key) => match key.action {
+            None => {
+                if anonymous || oauth_env.is_some() {
+                    bail!("cloud key requires an API key");
+                }
+                super::introspect_key(&key_env).map_err(cloud_error)?
             }
-            super::introspect_key(&key_env).map_err(cloud_error)?
+            Some(KeyAction::Add { name }) => {
+                let secret = super::keys::read_secret_from_stdin()?;
+                super::keys::add(&name, &secret)?
+            }
+            Some(KeyAction::List) => super::keys::list()?,
+            Some(KeyAction::Remove { name }) => super::keys::remove(&name)?,
+            Some(KeyAction::Use { name }) => super::keys::set_default(&name)?,
+        },
+        OpenCloudCommand::Games(games) => {
+            if anonymous || oauth_env.is_some() {
+                bail!("cloud games requires an API key");
+            }
+            super::discovery::games_command(&key_env, games.query.as_deref())?
+        }
+        OpenCloudCommand::Fetch(fetch) => {
+            if anonymous {
+                bail!("cloud fetch requires an API key");
+            }
+            super::discovery::fetch_command(
+                identity,
+                &key_env,
+                oauth_env.as_deref(),
+                super::discovery::FetchRequest {
+                    name: fetch.name,
+                    output: fetch.output,
+                    project_root: fetch.project_root,
+                },
+            )?
         }
         OpenCloudCommand::Routes(routes) => super::routes::list(routes)?,
         OpenCloudCommand::Data(route) => native("data", route)?,

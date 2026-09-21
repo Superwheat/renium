@@ -86,6 +86,8 @@ struct Status {
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     terrain_observation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conflicts: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -608,12 +610,22 @@ impl Control {
     }
 
     fn fail(&self, error: String) {
-        self.status.lock_recover().error = Some(error);
+        self.fail_with_conflicts(error, Vec::new());
+    }
+
+    fn fail_with_conflicts(&self, error: String, conflicts: Vec<String>) {
+        let mut status = self.status.lock_recover();
+        status.error = Some(error);
+        status.conflicts = (!conflicts.is_empty()).then_some(conflicts);
+        drop(status);
         self.notify_sync_state();
     }
 
     fn clear_error(&self) {
-        self.status.lock_recover().error = None;
+        let mut status = self.status.lock_recover();
+        status.error = None;
+        status.conflicts = None;
+        drop(status);
         self.notify_sync_state();
     }
 
@@ -976,8 +988,8 @@ impl Manager {
             setup.mode,
             setup.resolution_required,
         ));
-        if let Some(error) = setup.error {
-            control.fail(error);
+        if let Some(error) = setup.error.clone() {
+            control.fail_with_conflicts(error, setup.conflicts.clone());
         }
         #[cfg(any(windows, target_os = "macos"))]
         {
@@ -2699,8 +2711,9 @@ impl LiveLoop {
                 self.control.set_mode(setup.mode);
                 self.control
                     .set_resolution_required(setup.resolution_required);
-                if let Some(error) = setup.error {
-                    self.control.fail(error);
+                if let Some(error) = setup.error.clone() {
+                    self.control
+                        .fail_with_conflicts(error, setup.conflicts.clone());
                 } else {
                     self.control.clear_error();
                 }
@@ -2866,8 +2879,9 @@ impl LiveLoop {
                 self.control.set_mode(setup.mode);
                 self.control
                     .set_resolution_required(setup.resolution_required);
-                if let Some(error) = setup.error {
-                    self.control.fail(error);
+                if let Some(error) = setup.error.clone() {
+                    self.control
+                        .fail_with_conflicts(error, setup.conflicts.clone());
                     self.push_ready = false;
                     return Ok(false);
                 }

@@ -31,7 +31,7 @@ When no Studio runtime connects, the `no_studio` error and `rbx status` carry a 
 
 Live Sync compares each side with their last common Renium state. One-sided changes transfer; independent edits merge; conflicts wait without overwriting either side.
 
-The editor asks which version to keep, then resumes startup. The CLI returns the conflict and resolution commands. Choose only with user direction or an existing conflict preference.
+The editor asks which version to keep, then resumes startup. The CLI returns the conflict and resolution commands; `rbx lst --details` lists every conflict with the properties that differ and both values. Choose only with user direction or an existing conflict preference.
 
 ```powershell
 rbx cfg get liveSync.initialSyncPriority

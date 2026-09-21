@@ -494,7 +494,31 @@ fn finish_studio_change_state_command(
         if operation == op::LIVE_START && has_preference {
             bail!(error.to_string());
         }
-        bail!("{error}\nResolve with one:\nrbx lon --prefer studio\nrbx lon --prefer editor");
+        let conflicts = result
+            .pointer("/daemon/conflicts")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let listing = if details && conflicts.len() > 3 {
+            format!(
+                "\nAll {} conflicts:\n{}",
+                conflicts.len(),
+                conflicts.join("\n")
+            )
+        } else if error.contains(" more (") {
+            "\n`rbx lst --details` lists every conflict and what differs".to_string()
+        } else {
+            String::new()
+        };
+        bail!(
+            "{error}{listing}\nResolve with one:\nrbx lon --prefer studio\nrbx lon --prefer editor"
+        );
     }
     if failed {
         let error = result

@@ -55,7 +55,7 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder", "instr_info"] }
 windows = { version = "0.61.3", features = ["Win32_Media_Audio", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Ole", "Win32_System_Variant", "Win32_UI_Accessibility"] }
-windows-sys = { version = "0.59.0", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_ProcessStatus", "Win32_System_Power", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Memory", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_Graphics_Gdi", "Win32_UI_Accessibility", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock"] }
+windows-sys = { version = "0.59.0", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_System_Console", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_ProcessStatus", "Win32_System_Power", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Memory", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_Graphics_Gdi", "Win32_UI_Accessibility", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock"] }
 
 [build-dependencies]
 cc = "1.2"
