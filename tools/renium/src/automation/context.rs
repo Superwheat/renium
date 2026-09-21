@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
@@ -483,13 +483,16 @@ pub(super) fn bind(
         if explicit_project.is_some() {
             return config::load_project(explicit_project.as_deref(), Some(&selected_root));
         }
-        if let Some(loaded) = config::try_load_project(None, Some(&selected_root))?
-            && loaded.root == selected_root
-        {
+        // A command never turns the folder it runs from into a project;
+        // `rbx init` and `-r DIR` do that on purpose. Nested place folders
+        // carry their own project file, so the nearest one is the right one.
+        if let Some(loaded) = config::try_load_project(None, Some(&selected_root))? {
             return Ok(loaded);
         }
-        let project = workflows::initialize_place_root(&selected_root, Path::new("src"))?;
-        config::load_project(Some(&project), None)
+        bail!(
+            "No Renium project in {} or its parents; run the command from the project folder, pass --project, or create one with `rbx init`",
+            selected_root.display()
+        )
     })()
     .map_err(|error| Failure::new("no_project", format!("{error:#}"), false, "project-init"))?;
     let project_root = canonical_path(&loaded.root).map_err(|error| {
