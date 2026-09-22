@@ -12,6 +12,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use memchr::memmem;
+#[path = "windows_audio.rs"]
+mod audio;
 #[path = "windows_import.rs"]
 mod import;
 #[path = "windows_loader.rs"]
@@ -24,6 +26,7 @@ mod package_notice;
 mod properties;
 #[path = "windows_undo_selection.rs"]
 mod undo_selection;
+pub(crate) use audio::AudioOutputGate;
 pub(crate) use import::{CREATED_ROW, read_service_payload};
 pub(crate) use observation::{AttributeGuard, begin_attribute_guard, begin_attribute_relay};
 pub(crate) use package_notice::suppress_package_notices;
@@ -1602,9 +1605,19 @@ fn ensure_helper_loaded_with_timeout(
     timeout: u32,
 ) -> Result<usize> {
     let path = helper_path()?;
+    ensure_library_loaded(pid, memory, current_modules, timeout, &path)
+}
+
+fn ensure_library_loaded(
+    pid: u32,
+    memory: &ProcessMemory,
+    current_modules: &[ModuleEntry],
+    timeout: u32,
+    path: &Path,
+) -> Result<usize> {
     if let Some(module) = current_modules
         .iter()
-        .find(|module| module_path_matches(module, &path))
+        .find(|module| module_path_matches(module, path))
     {
         return Ok(module.base);
     }
@@ -1641,7 +1654,7 @@ fn ensure_helper_loaded_with_timeout(
     remote_path.run(load_library, timeout)?;
     let loaded = modules(pid)?
         .into_iter()
-        .find(|module| module_path_matches(module, &path))
+        .find(|module| module_path_matches(module, path))
         .with_context(|| format!("Studio did not load {}", path.display()))?;
     Ok(loaded.base)
 }

@@ -64,8 +64,16 @@ pub(crate) struct Status {
     pub(super) sessions: usize,
     pub(super) muted_sessions: usize,
     pub(super) pending_restores: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(super) output_buffers: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(super) suppressed_buffers: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) error: Option<String>,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Deserialize, Serialize)]
@@ -326,50 +334,5 @@ fn identity(pid: u32) -> Option<String> {
     #[cfg(target_os = "macos")]
     {
         crate::studio::performance::audio_process_identity(pid)
-    }
-}
-
-#[cfg(any(windows, test))]
-#[derive(Default)]
-pub(super) struct MuteOwnership {
-    changed: bool,
-}
-
-#[cfg(any(windows, test))]
-impl MuteOwnership {
-    pub(super) fn desired(&self, current: bool, mute: bool, unmute: bool) -> Option<bool> {
-        if unmute {
-            current.then_some(false)
-        } else if mute {
-            (!current).then_some(true)
-        } else if self.changed && current {
-            Some(false)
-        } else {
-            None
-        }
-    }
-
-    pub(super) fn accepted(&mut self, mute: bool, changed: bool) {
-        self.changed = mute && (self.changed || changed);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn audio_restores_only_owned_mutes() {
-        let mut state = MuteOwnership::default();
-        assert_eq!(state.desired(true, true, false), None);
-        state.accepted(true, false);
-        assert_eq!(state.desired(true, false, false), None);
-        assert_eq!(state.desired(false, true, false), Some(true));
-        state.accepted(true, true);
-        assert_eq!(state.desired(true, false, false), Some(false));
-        assert_eq!(state.desired(false, false, false), None);
-        state.accepted(false, false);
-        assert_eq!(state.desired(true, false, false), None);
-        assert_eq!(state.desired(true, false, true), Some(false));
     }
 }

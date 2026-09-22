@@ -71,6 +71,32 @@ fn build_windows(out_dir: &Path) {
         out_dir.join("renium-launch.lib").display()
     ));
     run(&mut launch_command, "Windows background launch guard build");
+    let audio_source = PathBuf::from("native/renium_audio_windows.cpp");
+    let audio_test = PathBuf::from("native/tests/audio_windows.cpp");
+    for (source, name, library) in [
+        (&audio_source, "renium-audio.dll", true),
+        (&audio_test, "renium-audio-test.exe", false),
+    ] {
+        let mut command = compiler.to_command();
+        command.args(["/nologo", "/O2", "/EHsc", "/std:c++20", "/MT"]);
+        if library {
+            command.arg("/LD");
+        }
+        command.arg(source);
+        command.arg(format!("/Fo{}\\", out_dir.display()));
+        command.arg(format!("/Fe{}", out_dir.join(name).display()));
+        command.args([
+            "/link",
+            "/INCREMENTAL:NO",
+            "/Brepro",
+            "user32.lib",
+            "ole32.lib",
+            "uuid.lib",
+        ]);
+        run(&mut command, "Windows process audio build");
+        println!("cargo:rerun-if-changed={}", source.display());
+    }
+    println!("cargo:rerun-if-changed=native/renium_audio_policy.h");
     let launch_test = PathBuf::from("native/tests/launch_policy_windows.cpp");
     let mut test_command = compiler.to_command();
     test_command.args([

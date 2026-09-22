@@ -1218,7 +1218,7 @@ class RobloxSyncController {
     const action = await pickMenuAction(`Renium — Studio Audio (${global ? "all windows" : "selected window"})`, [
       { label: "Mute", action: "mute" },
       { label: global ? "Restore Audio" : "Unmute", description: global ? "Restore prior mute states and disable global control" : undefined, action: "unmute" },
-      { label: "Mute While Unfocused", description: global ? "Remember for current and future Studio windows" : "Restore previous audio when focused; lasts until Studio closes", action: "auto" },
+      { label: "Mute While Unfocused", description: global ? "Unmute on focus; remember for current and future Studio windows" : "Unmute on focus; lasts until Studio closes", action: "auto" },
       { label: "Turn Off Audio Control", description: "Restore only Renium's mute changes", action: "off" },
     ]);
     if (!action) { return; }

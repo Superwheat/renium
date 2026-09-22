@@ -69,7 +69,8 @@ void Apply(unsigned action, unsigned& count, unsigned& muted, unsigned& pending,
             }
             bool current = Read<UInt32>(device, kAudioDevicePropertyProcessMute, kAudioObjectPropertyScopeOutput) != 0;
             const bool owned = state.changed.count(key) != 0;
-            const bool desired = action == 3 ? false : mute ? true : owned ? false : current;
+            const bool unmute = action == 3 || (action == 4 && focused);
+            const bool desired = unmute ? false : mute ? true : owned ? false : current;
             if (action != 0 && desired != current) {
                 UInt32 value = desired;
                 Check(AudioObjectSetPropertyData(device, &address, 0, nullptr, sizeof(value), &value), "Could not change process mute");

@@ -19,7 +19,7 @@
 
 ### Bug fixes
 
-- Returning to Studio restores its audio even after Renium's audio controller restarts or updates.
+- Auto audio always unmutes the focused Studio window, including after reopening or controller restarts. Windows suppression no longer leaves a persistent mixer mute behind.
 - A script whose files hold the legacy `Disabled` flag no longer conflicts with Studio's `Enabled`, and a property the reflection database does not know yet no longer conflicts when only Studio reports it; a first connection that differed only in those ways starts without review.
 - On macOS, a Studio that Renium launched no longer locks, warps or hides the pointer while it is not the active application. A Play session that captures the mouse takes it only once the user switches to Studio and releases it when they switch away.
 - Live Sync retries a reconcile that failed because files changed while Studio was exporting, with backoff, instead of staying on "Sync failed" until the next file edit; a manual retry also triggers it.

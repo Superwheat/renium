@@ -34,7 +34,8 @@ creates a project by itself.
 ## Studio audio
 
 `rbx audio mute` / `rbx audio unmute` control the selected Studio's audio without
-editing game sounds. Opt into `rbx audio auto` to mute while Studio is unfocused;
+editing game sounds. Opt into `rbx audio auto` to mute while Studio is unfocused
+and always unmute when it gains focus, including after reopening;
 `rbx audio off` restores Renium's changes. Nothing is enabled by default.
 Add `--global` to remember the mode for every current and newly opened Studio:
 `rbx audio auto --global`, `rbx audio status --global`, `rbx audio off --global`.
@@ -43,6 +44,8 @@ The same global setting is **Renium: Studio Audio Mode** in editor User Settings
 or `rbx cfg set studioAudioMode auto --scope user` (`off`, `auto`, or `mute`).
 Changes through settings, the menu and the CLI stay in sync.
 Global `unmute`/`off` restores prior mute states; it does not clear manual mutes.
+On Windows, suppression happens inside Studio, without changing mixer volume
+or leaving a persistent mixer mute. Focused Auto also clears earlier Studio mutes.
 An explicit window command overrides the global mode until the next global change.
 The mode lasts until that process closes. Use `--player 1` for a separate test
 client, `--pid PID` for an exact process, or the editor's **Studio Audio** menu.

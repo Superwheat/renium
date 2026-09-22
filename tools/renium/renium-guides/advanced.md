@@ -30,15 +30,16 @@ Ambiguous targeting returns candidates. Transient reads retry automatically; aft
 
 `rbx audio mute` silences the selected Studio process; `unmute` explicitly unmutes
 it. `rbx audio auto` mutes while another application or Studio window is focused
-and restores only Renium's mute changes when you return. `rbx audio off` restores
-those changes and stops automatic control. `rbx audio status` reads the mode,
+and always unmutes that window when you return, including a mute inherited from
+an older session. `rbx audio off` releases Renium's suppression and stops
+automatic control. `rbx audio status` reads the mode,
 focus and output-session counts. Use `--player 1` for a separate test client or
 `--pid PID` for an exact local Studio process. Other Studio processes are untouched.
 
 Add `--global` for a persistent user-wide mode covering existing and newly opened
 Studio windows, without a project or connection: `rbx audio auto --global`.
 Read it with `rbx audio status --global`; `off --global` or `unmute --global`
-disables it and restores prior mute states, preserving manual mutes. Explicit
+disables it and releases Renium's suppression, preserving other manual mutes. Explicit
 window commands override it until the next global change. The setting resumes
 when Renium starts; it also keeps watching when all Studio windows are closed.
 The same setting is **Renium: Studio Audio Mode** in editor User Settings, or
@@ -47,8 +48,10 @@ Settings and menu/CLI changes stay synchronized; project overrides are rejected.
 
 Default: off. Without `--global`, control lasts until that Studio process closes,
 including across daemon reconnects. No Sound objects or saved volume
-levels are edited. Renium remembers its mute changes across audio-worker restarts
-so returning focus restores audio. The editor offers **Renium: Studio Audio**. macOS requires
+levels are edited. Windows silences audio buffers inside the selected process;
+it does not use the persistent Windows mixer mute for suppression. Focused Auto
+and explicit `unmute` also clear an earlier Windows mute on that Studio session.
+Suppression expires if its controller disappears. The editor offers **Renium: Studio Audio**. macOS requires
 Studio opened with the matching Renium helper; global status lists any window
 that needs reopening rather than reopening it automatically. Unsupported aggregate/virtual
 output devices report an error instead of muting the system output.
