@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::Args;
@@ -18,6 +18,8 @@ use crate::system::files::{absolutize_for_daemon, create_unique_directory};
 
 const MAX_PLACE_BYTES: u64 = 100 * 1024 * 1024;
 const PUBLISH_SECONDS: u64 = 120;
+const STUDIO_PUBLISH_ACTION: &str = "publishToRobloxAction";
+const STUDIO_PUBLISH_WAIT: Duration = Duration::from_secs(600);
 
 #[derive(Args)]
 pub(crate) struct PublishArgs {
@@ -83,11 +85,15 @@ pub(crate) fn studio_result(
             "Studio changed after publish review; review the selected place again"
         );
     }
+    let dry_run = parameters
+        .get("dryRun")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let result = bridge
         .call_for_runtime_with_timeout(
             "publishPlace",
             json!({
-                "dryRun": parameters.get("dryRun").and_then(Value::as_bool).unwrap_or(false),
+                "dryRun": dry_run,
                 "runtimeId": runtime,
                 "gameId": context.game_id,
                 "placeId": context.place_id,
@@ -97,8 +103,220 @@ pub(crate) fn studio_result(
             Some(Duration::from_secs(PUBLISH_SECONDS)),
         )
         .map_err(studio_failure)?;
-    crate::app::output::ensure_plugin_api_ok(&result)?;
-    Ok(result)
+    match crate::app::output::ensure_plugin_api_ok(&result) {
+        Ok(()) => Ok(result),
+        Err(error) if !dry_run && save_place_api_refused(&error.to_string()) => {
+            publish_with_studio_action(context, bridge, runtime, &result)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+// AssetService:SavePlaceAsync only works where the Save Place API is enabled.
+// Studio's own Publish to Roblox command has no such gate, so run that command
+// and read its outcome from the Studio log.
+fn save_place_api_refused(message: &str) -> bool {
+    message.contains("Save Place API") || message.contains("SavePlace")
+}
+
+fn publish_with_studio_action(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+    runtime: &str,
+    plugin_result: &Value,
+) -> Result<Value> {
+    let info = bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?;
+    let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, runtime)?;
+    let title = crate::studio::native::serializer::target_name(pid, &info.place_name)?;
+    let started = SystemTime::now();
+    let outcome = crate::studio::native::serializer::trigger_studio_action(
+        pid,
+        &title,
+        STUDIO_PUBLISH_ACTION,
+    )
+    .with_context(|| {
+        format!(
+            "Studio refused SavePlaceAsync ({}) and its Publish command could not be run",
+            plugin_result
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("no detail")
+        )
+    })?;
+    let directory = studio_log_directory().context("Studio log directory is unknown")?;
+    let published = wait_for_studio_publish(&directory, started, STUDIO_PUBLISH_WAIT)?;
+    Ok(json!({
+        "ok": true,
+        "published": true,
+        "dryRun": false,
+        "source": "studio",
+        "method": "studioPublishCommand",
+        "runtimeId": runtime,
+        "gameId": context.game_id,
+        "placeId": context.place_id,
+        "window": outcome.window_title,
+        "actionMatches": outcome.found,
+        "version": published.version,
+        "url": format!("https://www.roblox.com/games/{}", context.place_id.unwrap_or_default()),
+    }))
+}
+
+struct StudioPublishReport {
+    version: Option<u64>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StudioPublishEvent {
+    Succeeded { version: Option<u64> },
+    Failed(String),
+}
+
+fn studio_log_directory() -> Option<PathBuf> {
+    if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA").map(|base| PathBuf::from(base).join("Roblox").join("logs"))
+    } else {
+        std::env::var_os("HOME").map(|home| {
+            PathBuf::from(home)
+                .join("Library")
+                .join("Logs")
+                .join("Roblox")
+        })
+    }
+}
+
+// Studio writes `2026-09-22T13:15:11.403Z,...,Info [FLog::CreatorOutput] Place published.`
+// lines; only lines stamped after the command was triggered count.
+fn studio_publish_event(line: &str, since: SystemTime) -> Option<StudioPublishEvent> {
+    let (stamp, rest) = line.split_once(',')?;
+    let stamped = humantime_parse(stamp)?;
+    if stamped < since {
+        return None;
+    }
+    if rest.contains("[FLog::PublishSessionStateController] Go to PublishSuccessful")
+        || rest.contains("[FLog::CreatorOutput] Place published.")
+    {
+        return Some(StudioPublishEvent::Succeeded { version: None });
+    }
+    if let Some(index) = rest.find("Add publish notes to v") {
+        let digits = rest[index + "Add publish notes to v".len()..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>();
+        return Some(StudioPublishEvent::Succeeded {
+            version: digits.parse().ok(),
+        });
+    }
+    if rest.contains("[FLog::PublishSessionStateController] Go to PublishFailed")
+        || rest.contains("[FLog::PublishSessionStateController] Go to PublishCanceled")
+        || rest.contains("[FLog::PublishSessionStateController] Go to PublishCancelled")
+        || rest.contains("PublishPlaceToRobloxIsCanceled")
+    {
+        return Some(StudioPublishEvent::Failed(rest.trim().to_string()));
+    }
+    None
+}
+
+fn humantime_parse(stamp: &str) -> Option<SystemTime> {
+    let stamp = stamp.strip_suffix('Z')?;
+    let (date, time) = stamp.split_once('T')?;
+    let mut date_parts = date.split('-').map(|part| part.parse::<i64>().ok());
+    let (year, month, day) = (
+        date_parts.next()??,
+        date_parts.next()??,
+        date_parts.next()??,
+    );
+    let mut time_parts = time.split(':');
+    let hour = time_parts.next()?.parse::<i64>().ok()?;
+    let minute = time_parts.next()?.parse::<i64>().ok()?;
+    let second = time_parts.next()?.parse::<f64>().ok()?;
+    let days = days_from_civil(year, month, day);
+    let seconds = days * 86_400 + hour * 3_600 + minute * 60;
+    let total = seconds as f64 + second;
+    if total < 0.0 {
+        return None;
+    }
+    Some(SystemTime::UNIX_EPOCH + Duration::from_secs_f64(total))
+}
+
+#[cfg(test)]
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let days = days + 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month_index = (month + 9) % 12;
+    let day_of_year = (153 * month_index + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+// Windows leaves a log's modified time stale while Studio holds it open, so
+// every Studio log is read and only the timestamps inside the lines decide.
+fn wait_for_studio_publish(
+    directory: &Path,
+    since: SystemTime,
+    limit: Duration,
+) -> Result<StudioPublishReport> {
+    let deadline = Instant::now() + limit;
+    let mut version = None;
+    loop {
+        let mut succeeded = false;
+        for entry in fs::read_dir(directory)
+            .with_context(|| format!("Could not read {}", directory.display()))?
+            .flatten()
+        {
+            let path = entry.path();
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            if !name.contains("Studio") || !name.ends_with(".log") {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&path) else {
+                continue;
+            };
+            let text = String::from_utf8_lossy(&bytes);
+            for line in text.lines().rev().take(4000) {
+                match studio_publish_event(line, since) {
+                    Some(StudioPublishEvent::Succeeded { version: found }) => {
+                        succeeded = true;
+                        version = version.or(found);
+                    }
+                    Some(StudioPublishEvent::Failed(detail)) => {
+                        bail!("Studio reported the publish did not complete: {detail}");
+                    }
+                    None => {}
+                }
+            }
+        }
+        if succeeded {
+            return Ok(StudioPublishReport { version });
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "Studio's Publish command was triggered but its log reported no result within {} seconds; check the place's Version History before retrying",
+            limit.as_secs()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }
 
 fn studio_failure(error: anyhow::Error) -> anyhow::Error {
@@ -330,6 +548,103 @@ mod tests {
         } else {
             rbx_binary::to_writer(file, &dom, &[service]).unwrap();
         }
+    }
+
+    #[test]
+    fn studio_publish_watcher_reads_logs_studio_still_holds_open() {
+        let directory =
+            create_unique_directory(&std::env::temp_dir(), "renium-publish-log-").unwrap();
+        let since = SystemTime::now() - Duration::from_secs(5);
+        let stamp = |offset: i64| {
+            let seconds = since
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+                + offset;
+            let days = seconds.div_euclid(86_400);
+            let rest = seconds.rem_euclid(86_400);
+            let (year, month, day) = civil_from_days(days);
+            format!(
+                "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.000Z",
+                rest / 3600,
+                rest % 3600 / 60,
+                rest % 60
+            )
+        };
+        let log = directory.join("0.739.0.7390687_20260922T130705Z_Studio_35E2B_last.log");
+        let old = std::fs::File::create(directory.join("old_Studio_1_last.log")).unwrap();
+        drop(old);
+        std::fs::write(
+            &log,
+            format!(
+                "{},1.0,a8fc,6,Debug [FLog::PublishSessionStateController] Go to PublishSuccessful\n{},2.0,0b4c,6,Info [FLog::CreatorOutput] Add publish notes to v2746\n",
+                stamp(1),
+                stamp(2)
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("old_Studio_1_last.log"),
+            format!(
+                "{},1.0,a8fc,6,Debug [FLog::PublishSessionStateController] Go to PublishSuccessful\n",
+                stamp(-30)
+            ),
+        )
+        .unwrap();
+        let report = wait_for_studio_publish(&directory, since, Duration::from_secs(5)).unwrap();
+        assert_eq!(report.version, Some(2746));
+        std::fs::write(
+            &log,
+            format!(
+                "{},3.0,a8fc,6,Debug [FLog::PublishSessionStateController] Go to PublishFailed\n",
+                stamp(3)
+            ),
+        )
+        .unwrap();
+        let failed = wait_for_studio_publish(&directory, since, Duration::from_secs(2));
+        assert!(failed.is_err());
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn studio_publish_log_lines_report_success_failure_and_version() {
+        let since = humantime_parse("2026-09-22T13:15:00.000Z").unwrap();
+        assert_eq!(
+            studio_publish_event(
+                "2026-09-22T13:15:11.403Z,486.403290,a8fc,6,Debug [FLog::PublishSessionStateController] Go to PublishSuccessful",
+                since
+            ),
+            Some(StudioPublishEvent::Succeeded { version: None })
+        );
+        assert_eq!(
+            studio_publish_event(
+                "2026-09-22T13:15:11.414Z,486.414337,0b4c,6,Info [FLog::CreatorOutput] \u{2192} Add publish notes to v2745",
+                since
+            ),
+            Some(StudioPublishEvent::Succeeded {
+                version: Some(2745)
+            })
+        );
+        assert_eq!(
+            studio_publish_event(
+                "2026-09-22T13:14:59.000Z,480.0,a8fc,6,Debug [FLog::PublishSessionStateController] Go to PublishSuccessful",
+                since
+            ),
+            None
+        );
+        assert!(matches!(
+            studio_publish_event(
+                "2026-09-22T13:16:00.000Z,500.0,a8fc,6,Debug [FLog::PublishSessionStateController] Go to PublishFailed",
+                since
+            ),
+            Some(StudioPublishEvent::Failed(_))
+        ));
+        assert!(save_place_api_refused(
+            "Studio publish failed: Game:SavePlace can only be called from a server script. Save Place API must be enabled for this place"
+        ));
+        assert!(!save_place_api_refused("connection closed"));
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(2000, 3, 1), 11_017);
     }
 
     #[test]

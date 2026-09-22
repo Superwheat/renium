@@ -1610,3 +1610,233 @@ extern "C" __declspec(dllexport) DWORD WINAPI ReniumReadProperty(PropertyReadPar
 }
 
 #include "renium_studio_reader.h"
+
+// Studio's menu and ribbon commands are QActions owned by the main window.
+// Triggering one by object name runs the same code as the user's click, which
+// is how a place publishes when AssetService:SavePlaceAsync is refused.
+struct StudioActionParams
+{
+    std::uint32_t status;
+    std::uint32_t exceptionCode;
+    std::uint32_t uiThreadId;
+    std::uint32_t found;
+    std::uint32_t enabled;
+    std::uint32_t reserved;
+    std::uint64_t window;
+    char actionName[96];
+    char error[256];
+};
+
+static_assert(sizeof(StudioActionParams) == 384);
+
+constexpr UINT StudioActionMessage = WM_APP + 0x371;
+constexpr WPARAM StudioActionMarker = 0x5354554449414354;
+
+using QtObjectChildren = const void*(__fastcall*)(const void*);
+using QtObjectObjectName = void*(__fastcall*)(const void*, void*);
+using QtObjectInherits = bool(__fastcall*)(const void*, const char*);
+using QtStringDestructor = void(__fastcall*)(void*);
+using QtWidgetFind = void*(__fastcall*)(std::uint64_t);
+using QtActionActivate = void(__fastcall*)(void*, int);
+using QtActionIsEnabled = bool(__fastcall*)(void*);
+
+struct QtObjectListData
+{
+    std::int32_t ref;
+    std::int32_t alloc;
+    std::int32_t begin;
+    std::int32_t end;
+    void* entries[1];
+};
+
+static bool QtObjectNameAscii(
+    void* object,
+    QtObjectObjectName objectName,
+    QtStringDestructor destroyString,
+    char* output,
+    std::size_t capacity)
+{
+    void* stringData = nullptr;
+    objectName(object, &stringData);
+    if (!stringData)
+        return false;
+    auto bytes = reinterpret_cast<unsigned char*>(stringData);
+    const auto length = *reinterpret_cast<std::int32_t*>(bytes + 4);
+    const auto offset = *reinterpret_cast<std::intptr_t*>(bytes + 16);
+    bool valid = length >= 0 && static_cast<std::size_t>(length) < capacity && offset >= 0;
+    if (valid)
+    {
+        auto characters = reinterpret_cast<const wchar_t*>(bytes + offset);
+        for (std::int32_t index = 0; index < length; ++index)
+        {
+            if (characters[index] > 0x7f)
+            {
+                valid = false;
+                break;
+            }
+            output[index] = static_cast<char>(characters[index]);
+        }
+        if (valid)
+            output[length] = '\0';
+    }
+    destroyString(&stringData);
+    return valid;
+}
+
+static void* FindQtActionByName(
+    void* root,
+    const char* expected,
+    QtObjectChildren children,
+    QtObjectObjectName objectName,
+    QtStringDestructor destroyString,
+    QtObjectInherits inherits,
+    std::uint32_t* count)
+{
+    std::vector<void*> pending{root};
+    void* result = nullptr;
+    *count = 0;
+    std::size_t visited = 0;
+    while (!pending.empty() && visited++ < 200000)
+    {
+        auto object = pending.back();
+        pending.pop_back();
+        char name[128]{};
+        if (inherits(object, "QAction") &&
+            QtObjectNameAscii(object, objectName, destroyString, name, sizeof(name)) &&
+            strcmp(name, expected) == 0)
+        {
+            if (!result)
+                result = object;
+            ++*count;
+        }
+        auto list = reinterpret_cast<const QtObjectListData* const*>(children(object));
+        if (!list || !*list)
+            continue;
+        auto data = *list;
+        if (data->begin < 0 || data->end < data->begin ||
+            data->end > data->alloc || data->end - data->begin > 200000)
+            continue;
+        for (auto index = data->begin; index < data->end; ++index)
+            if (data->entries[index])
+                pending.push_back(data->entries[index]);
+    }
+    return result;
+}
+
+static void TriggerStudioActionCore(StudioActionParams* params)
+{
+    auto qtCore = GetModuleHandleW(L"Qt5Core.dll");
+    auto qtWidgets = GetModuleHandleW(L"Qt5Widgets.dll");
+    auto findWidget = qtWidgets ? reinterpret_cast<QtWidgetFind>(
+        GetProcAddress(qtWidgets, "?find@QWidget@@SAPEAV1@_K@Z")) : nullptr;
+    auto children = qtCore ? reinterpret_cast<QtObjectChildren>(
+        GetProcAddress(qtCore, "?children@QObject@@QEBAAEBV?$QList@PEAVQObject@@@@XZ")) : nullptr;
+    auto objectName = qtCore ? reinterpret_cast<QtObjectObjectName>(
+        GetProcAddress(qtCore, "?objectName@QObject@@QEBA?AVQString@@XZ")) : nullptr;
+    auto destroyString = qtCore ? reinterpret_cast<QtStringDestructor>(
+        GetProcAddress(qtCore, "??1QString@@QEAA@XZ")) : nullptr;
+    auto inherits = qtCore ? reinterpret_cast<QtObjectInherits>(
+        GetProcAddress(qtCore, "?inherits@QObject@@QEBA_NPEBD@Z")) : nullptr;
+    auto activate = qtWidgets ? reinterpret_cast<QtActionActivate>(
+        GetProcAddress(qtWidgets, "?activate@QAction@@QEAAXW4ActionEvent@1@@Z")) : nullptr;
+    auto isEnabled = qtWidgets ? reinterpret_cast<QtActionIsEnabled>(
+        GetProcAddress(qtWidgets, "?isEnabled@QAction@@QEBA_NXZ")) : nullptr;
+    if (!findWidget || !children || !objectName || !destroyString || !inherits || !activate || !isEnabled)
+    {
+        params->status = 0xE903;
+        strcpy_s(params->error, "required Qt action path is unavailable");
+        return;
+    }
+    auto root = findWidget(params->window);
+    if (!root)
+    {
+        params->status = 0xE904;
+        strcpy_s(params->error, "Studio root QWidget was not found");
+        return;
+    }
+    auto action = FindQtActionByName(
+        root, params->actionName, children, objectName, destroyString, inherits, &params->found);
+    if (!action)
+    {
+        params->status = 0xE905;
+        sprintf_s(params->error, "Studio has no action named %s", params->actionName);
+        return;
+    }
+    params->enabled = isEnabled(action) ? 1u : 0u;
+    if (!params->enabled)
+    {
+        params->status = 0xE907;
+        sprintf_s(params->error, "Studio action %s is disabled right now", params->actionName);
+        return;
+    }
+    activate(action, 0);
+    params->status = 4;
+}
+
+static LRESULT CALLBACK TriggerStudioActionOnUiThread(int code, WPARAM hookParam, LPARAM messageParam)
+{
+    if (code >= 0)
+    {
+        auto message = reinterpret_cast<CWPSTRUCT*>(messageParam);
+        if (message->message == StudioActionMessage && message->wParam == StudioActionMarker)
+        {
+            auto params = reinterpret_cast<StudioActionParams*>(message->lParam);
+            __try
+            {
+                TriggerStudioActionCore(params);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                params->status = 0xE908;
+                params->exceptionCode = GetExceptionCode();
+                strcpy_s(params->error, "Studio action raised an exception");
+            }
+        }
+    }
+    return CallNextHookEx(nullptr, code, hookParam, messageParam);
+}
+
+extern "C" __declspec(dllexport) DWORD WINAPI ReniumTriggerStudioAction(StudioActionParams* params)
+{
+    if (!params || !params->window || !params->actionName[0])
+        return ERROR_INVALID_PARAMETER;
+    params->status = 1;
+    params->exceptionCode = 0;
+    params->found = 0;
+    params->enabled = 0;
+    params->error[0] = '\0';
+    DWORD processId = 0;
+    auto uiThreadId = GetWindowThreadProcessId(reinterpret_cast<HWND>(params->window), &processId);
+    if (!uiThreadId || processId != GetCurrentProcessId())
+    {
+        params->status = 0xE901;
+        strcpy_s(params->error, "Studio window does not belong to this process");
+        return params->status;
+    }
+    params->uiThreadId = uiThreadId;
+    auto hook = SetWindowsHookExW(WH_CALLWNDPROC, TriggerStudioActionOnUiThread, nullptr, uiThreadId);
+    if (!hook)
+    {
+        params->status = 0xE902;
+        params->exceptionCode = GetLastError();
+        strcpy_s(params->error, "could not hook the Studio UI thread");
+        return params->status;
+    }
+    DWORD_PTR ignored = 0;
+    auto sent = SendMessageTimeoutW(
+        reinterpret_cast<HWND>(params->window),
+        StudioActionMessage,
+        StudioActionMarker,
+        reinterpret_cast<LPARAM>(params),
+        SMTO_ABORTIFHUNG | SMTO_BLOCK,
+        15000,
+        &ignored);
+    UnhookWindowsHookEx(hook);
+    if (!sent && params->status == 1)
+    {
+        params->status = 0xE909;
+        params->exceptionCode = GetLastError();
+        strcpy_s(params->error, "Studio UI thread did not process the action request");
+    }
+    return params->status == 4 ? 0 : params->status;
+}

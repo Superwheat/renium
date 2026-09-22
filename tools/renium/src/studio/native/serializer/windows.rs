@@ -2487,6 +2487,47 @@ unsafe extern "system" fn capture_window_callback(window: HWND, parameter: LPARA
     1
 }
 
+pub(super) fn platform_trigger_studio_action(
+    pid: u32,
+    studio_title: &str,
+    action: &str,
+) -> Result<super::StudioActionOutcome> {
+    const PARAM_SIZE: usize = 384;
+    const NAME_OFFSET: usize = 32;
+    const ERROR_OFFSET: usize = 128;
+    let name = action.as_bytes();
+    anyhow::ensure!(
+        !name.is_empty() && name.len() < 96 && name.is_ascii(),
+        "Studio action names are short ASCII identifiers"
+    );
+    let (window, window_title) = capture_window(pid, studio_title)?;
+    let current_modules = modules(pid)?;
+    let memory = ProcessMemory::open(pid)?;
+    let helper = ensure_helper_loaded(pid, &memory, &current_modules)?;
+    let run = helper
+        .checked_add(helper_export_rva("ReniumTriggerStudioAction")?)
+        .context("Studio action helper address overflowed")?;
+    let mut parameters = vec![0u8; PARAM_SIZE];
+    put_u64(&mut parameters, 24, window);
+    parameters[NAME_OFFSET..NAME_OFFSET + name.len()].copy_from_slice(name);
+    let mut remote = memory.allocate(parameters.len())?;
+    memory.write(remote.address, &parameters)?;
+    let exit_code = remote.run(run, REMOTE_TIMEOUT)?;
+    memory.read(remote.address, &mut parameters)?;
+    let status = read_u32(&parameters, 0)?;
+    if exit_code != 0 || status != 4 {
+        bail!(
+            "Studio action {action} failed with status 0x{status:X}, exit 0x{exit_code:X}, exception 0x{:X}: {}",
+            read_u32(&parameters, 4)?,
+            error_text_at(&parameters, ERROR_OFFSET)
+        );
+    }
+    Ok(super::StudioActionOutcome {
+        window_title,
+        found: read_u32(&parameters, 12)?,
+    })
+}
+
 fn capture_window(pid: u32, title: &str) -> Result<(usize, String)> {
     anyhow::ensure!(
         !title.is_empty(),

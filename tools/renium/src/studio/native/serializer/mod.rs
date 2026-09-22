@@ -74,6 +74,21 @@ pub(crate) struct PackageActionResult {
     pub(crate) version: i64,
 }
 
+pub(crate) struct StudioActionOutcome {
+    pub(crate) window_title: String,
+    pub(crate) found: u32,
+}
+
+/// Runs one of Studio's own menu commands by its QAction object name on the
+/// UI thread of the Studio window titled `studio_title`.
+pub(crate) fn trigger_studio_action(
+    pid: u32,
+    studio_title: &str,
+    action: &str,
+) -> Result<StudioActionOutcome> {
+    platform_trigger_studio_action(pid, studio_title, action)
+}
+
 pub(crate) fn run_package_action(
     pid: u32,
     studio_title: &str,

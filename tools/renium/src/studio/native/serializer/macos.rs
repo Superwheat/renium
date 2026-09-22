@@ -1141,6 +1141,14 @@ fn invoke_package_helper(
     Ok((changed, version, text))
 }
 
+pub(super) fn platform_trigger_studio_action(
+    _pid: u32,
+    _studio_title: &str,
+    action: &str,
+) -> Result<super::StudioActionOutcome> {
+    anyhow::bail!("Triggering the Studio action {action} natively is only supported on Windows")
+}
+
 pub(super) fn platform_package_action(
     pid: u32,
     studio_title: &str,

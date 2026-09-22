@@ -14,6 +14,7 @@
 
 ### Improvements
 
+- `rbx publish` from Studio runs Studio's own Publish to Roblox command when the place refuses `SavePlaceAsync` (no Save Place API), waits for Studio to log the result and reports the new version; it no longer needs a stored API key or manual publishing for such places.
 - The Studio plugin's sources are `.luau` files.
 - Native function discovery follows Studio's reflection dispatch and receiver relationships across relocated layouts, with verification on Windows and Apple Silicon.
 
