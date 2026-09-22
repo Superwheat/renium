@@ -19,6 +19,7 @@
 
 ### Bug fixes
 
+- A push no longer reports a property Roblox never saves (such as `VRService.GuiInputUserCFrame`) as "not retained" when the project files lack it.
 - Pushing a place whose MeshParts share names no longer stops with "Mesh geometry target path changed" when Studio orders those siblings differently from the files; the native geometry write now targets the part by its live position.
 - Auto audio always unmutes the focused Studio window, including after reopening or controller restarts. Windows suppression no longer leaves a persistent mixer mute behind.
 - A script whose files hold the legacy `Disabled` flag no longer conflicts with Studio's `Enabled`, and a property the reflection database does not know yet no longer conflicts when only Studio reports it; a first connection that differed only in those ways starts without review.

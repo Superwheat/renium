@@ -2713,7 +2713,15 @@ pub(crate) fn reconciliation_property_is_unknown_when_absent(
     matches!(name, "CollisionFidelity" | "ClockTime" | "MeshSize")
         || database.is_some_and(|database| {
             reconciliation_property_is_unreadable(database, class_name, name)
-                || crate::rbx::encode::rbx_property_descriptor(database, class_name, name).is_none()
+                || match crate::rbx::encode::rbx_property_descriptor(database, class_name, name) {
+                    None => true,
+                    Some(descriptor) => matches!(
+                        descriptor.kind,
+                        rbx_reflection::PropertyKind::Canonical {
+                            serialization: rbx_reflection::PropertySerialization::DoesNotSerialize
+                        }
+                    ),
+                }
         })
 }
 
@@ -4881,6 +4889,36 @@ mod tests {
             &concise,
             &studio_float32,
             false,
+        ));
+    }
+}
+
+#[cfg(test)]
+mod never_serialized_properties {
+    use super::*;
+
+    #[test]
+    fn a_property_roblox_never_saves_is_unknown_when_files_lack_it() {
+        let database = rbx_reflection_database::get().unwrap();
+        assert!(reconciliation_property_is_unknown_when_absent(
+            Some(database),
+            "VRService",
+            "GuiInputUserCFrame"
+        ));
+        assert!(reconciliation_property_is_unknown_when_absent(
+            Some(database),
+            "VRService",
+            "VREnabled"
+        ));
+        assert!(!reconciliation_property_is_unknown_when_absent(
+            Some(database),
+            "VRService",
+            "AutomaticScaling"
+        ));
+        assert!(!reconciliation_property_is_unknown_when_absent(
+            Some(database),
+            "Part",
+            "Anchored"
         ));
     }
 }
