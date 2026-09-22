@@ -477,9 +477,10 @@ mod platform {
     };
     use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT, WPARAM};
     use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+    use windows_sys::Win32::Storage::FileSystem::{GetLogicalDrives, QueryDosDeviceW};
     use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-        QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
+        OpenProcess, PROCESS_NAME_NATIVE, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        PROCESS_TERMINATE, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
     };
     use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MAPVK_VK_TO_VSC, MapVirtualKeyW};
@@ -1297,21 +1298,79 @@ mod platform {
         }
     }
 
+    // Windows sometimes cannot express a running image as a drive-letter path
+    // (QueryFullProcessImageNameW fails with ERROR_GEN_FAILURE) even though the
+    // native \Device\HarddiskVolumeN form is available, so that form is the
+    // fallback, mapped back to a drive letter when one is known.
     pub fn process_executable_path(pid: u32) -> Result<std::path::PathBuf> {
         let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         if handle.is_null() {
             bail!("Could not open Studio process {pid}");
         }
-        let mut buffer = vec![0u16; 32768];
-        let mut length = buffer.len() as u32;
-        let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut length) };
+        let query = |flags: u32| {
+            let mut buffer = vec![0u16; 32768];
+            let mut length = buffer.len() as u32;
+            let ok = unsafe {
+                QueryFullProcessImageNameW(handle, flags, buffer.as_mut_ptr(), &mut length)
+            };
+            (ok != 0 && length > 0).then(|| String::from_utf16_lossy(&buffer[..length as usize]))
+        };
+        let win32 = query(0);
+        let native = if win32.is_none() {
+            query(PROCESS_NAME_NATIVE)
+        } else {
+            None
+        };
         unsafe { CloseHandle(handle) };
-        if ok == 0 || length == 0 {
-            bail!("Could not read the executable path for Studio process {pid}");
+        if let Some(path) = win32 {
+            return Ok(std::path::PathBuf::from(path));
         }
-        Ok(std::path::PathBuf::from(String::from_utf16_lossy(
-            &buffer[..length as usize],
+        let native = native.with_context(|| {
+            format!("Could not read the executable path for Studio process {pid}")
+        })?;
+        Ok(std::path::PathBuf::from(device_path_to_drive_path(
+            &native,
+            &drive_device_targets(),
         )))
+    }
+
+    fn drive_device_targets() -> Vec<(String, String)> {
+        let mask = unsafe { GetLogicalDrives() };
+        (0..26u32)
+            .filter(|bit| mask & (1 << bit) != 0)
+            .filter_map(|bit| {
+                let letter = char::from(b'A' + bit as u8);
+                let name: Vec<u16> = format!("{letter}:")
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .collect();
+                let mut target = vec![0u16; 1024];
+                let length = unsafe {
+                    QueryDosDeviceW(name.as_ptr(), target.as_mut_ptr(), target.len() as u32)
+                };
+                if length == 0 {
+                    return None;
+                }
+                let end = target.iter().position(|value| *value == 0).unwrap_or(0);
+                Some((
+                    String::from_utf16_lossy(&target[..end]),
+                    format!("{letter}:"),
+                ))
+            })
+            .collect()
+    }
+
+    pub(crate) fn device_path_to_drive_path(native: &str, drives: &[(String, String)]) -> String {
+        drives
+            .iter()
+            .filter(|(device, _)| !device.is_empty())
+            .find_map(|(device, drive)| {
+                native
+                    .strip_prefix(device.as_str())
+                    .filter(|rest| rest.starts_with('\\'))
+                    .map(|rest| format!("{drive}{rest}"))
+            })
+            .unwrap_or_else(|| native.to_owned())
     }
 
     pub fn studio_window_title(pid: u32) -> Result<String> {
@@ -3119,5 +3178,40 @@ mod platform {
 
     pub fn capture_window_rgba(_handle: &WindowHandle) -> Result<(u32, u32, Vec<u8>)> {
         bail!("Window capture is only supported on Windows and macOS")
+    }
+}
+
+#[cfg(all(test, windows))]
+mod device_path_tests {
+    #[test]
+    fn native_image_paths_map_back_to_drive_letters() {
+        let drives = vec![
+            (
+                String::from("\\Device\\HarddiskVolume3"),
+                String::from("C:"),
+            ),
+            (
+                String::from("\\Device\\HarddiskVolume30"),
+                String::from("E:"),
+            ),
+        ];
+        assert_eq!(
+            super::platform::device_path_to_drive_path(
+                "\\Device\\HarddiskVolume3\\Users\\x\\RobloxStudioBeta.exe",
+                &drives
+            ),
+            "C:\\Users\\x\\RobloxStudioBeta.exe"
+        );
+        assert_eq!(
+            super::platform::device_path_to_drive_path(
+                "\\Device\\HarddiskVolume30\\Studio.exe",
+                &drives
+            ),
+            "E:\\Studio.exe"
+        );
+        assert_eq!(
+            super::platform::device_path_to_drive_path("\\Device\\Other\\Studio.exe", &drives),
+            "\\Device\\Other\\Studio.exe"
+        );
     }
 }

@@ -20,6 +20,7 @@
 
 ### Bug fixes
 
+- Studio audio control and other per-process features no longer fail with "Could not read the executable path" on Studio windows whose image Windows cannot express as a drive-letter path; the native path is used and mapped back to a drive letter.
 - A push no longer reports a property Roblox never saves (such as `VRService.GuiInputUserCFrame`) as "not retained" when the project files lack it.
 - Pushing a place whose MeshParts share names no longer stops with "Mesh geometry target path changed" when Studio orders those siblings differently from the files; the native geometry write now targets the part by its live position.
 - Auto audio always unmutes the focused Studio window, including after reopening or controller restarts. Windows suppression no longer leaves a persistent mixer mute behind.
