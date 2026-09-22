@@ -2523,13 +2523,24 @@ local function applyChangedProperty(instance, propertyName, rawValue, change, ct
 		if ctx.editorTransaction == nil then
 			error("Mesh geometry sync requires an active transaction")
 		end
-		if resolvePathSegments(change.pathSegments, nil, change.pathOrdinals) ~= instance then
-			error("Mesh geometry target path changed; retry the sync")
+		-- The native writer targets this part by path, and duplicate sibling
+		-- names can order differently in Studio than in the store, so the
+		-- recorded path must be the one Studio resolves to this instance now.
+		local staged = if ctx.resolveStagedPath ~= nil
+			then ctx.resolveStagedPath(change.pathSegments, change.pathOrdinals)
+			else nil
+		local pathSegments, pathOrdinals = change.pathSegments, change.pathOrdinals
+		if staged ~= instance and resolvePathSegments(pathSegments, nil, pathOrdinals) ~= instance then
+			local liveSegments, liveOrdinals = BridgeIdentity.getRefPathParts(instance)
+			if liveSegments == nil or resolvePathSegments(liveSegments, nil, liveOrdinals) ~= instance then
+				error("Mesh geometry target is not addressable in the DataModel; retry the sync")
+			end
+			pathSegments, pathOrdinals = liveSegments, liveOrdinals
 		end
 		stats.nativeGeometryWrites = stats.nativeGeometryWrites or {}
 		table.insert(stats.nativeGeometryWrites, {
-			className = instance.ClassName, pathSegments = change.pathSegments,
-			pathOrdinals = change.pathOrdinals, name = propertyName, value = rawValue,
+			className = instance.ClassName, pathSegments = pathSegments,
+			pathOrdinals = pathOrdinals, name = propertyName, value = rawValue,
 		})
 		markLiveMutation(ctx, instance)
 		stats.propertyUpdated += 1
