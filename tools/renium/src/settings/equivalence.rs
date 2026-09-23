@@ -2715,12 +2715,18 @@ pub(crate) fn reconciliation_property_is_unknown_when_absent(
             reconciliation_property_is_unreadable(database, class_name, name)
                 || match crate::rbx::encode::rbx_property_descriptor(database, class_name, name) {
                     None => true,
-                    Some(descriptor) => matches!(
-                        descriptor.kind,
-                        rbx_reflection::PropertyKind::Canonical {
-                            serialization: rbx_reflection::PropertySerialization::DoesNotSerialize
-                        }
-                    ),
+                    Some(descriptor) => {
+                        descriptor
+                            .tags
+                            .contains(&rbx_reflection::PropertyTag::Deprecated)
+                            || matches!(
+                                descriptor.kind,
+                                rbx_reflection::PropertyKind::Canonical {
+                                    serialization:
+                                        rbx_reflection::PropertySerialization::DoesNotSerialize
+                                }
+                            )
+                    }
                 }
         })
 }
@@ -4914,6 +4920,16 @@ mod never_serialized_properties {
             Some(database),
             "VRService",
             "AutomaticScaling"
+        ));
+        assert!(reconciliation_property_is_unknown_when_absent(
+            Some(database),
+            "Part",
+            "CollisionGroupId"
+        ));
+        assert!(!reconciliation_property_is_unknown_when_absent(
+            Some(database),
+            "Part",
+            "CollisionGroup"
         ));
         assert!(!reconciliation_property_is_unknown_when_absent(
             Some(database),
