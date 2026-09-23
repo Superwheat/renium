@@ -1853,7 +1853,6 @@ fn pull_studio_changes(
         .context("Studio change state did not include runtimeId")?
         .to_string();
     let parameters = json!({ "services": &services });
-    let _gate = bridge.acquire_request_gate();
     let _selection = bound_context::select(context);
     bridge.clear_runtime_pins();
     bridge.pin_runtime(BridgeTarget::Main, runtime_id);
@@ -2700,12 +2699,15 @@ impl LiveLoop {
             format_args!("[renium] reconcile reason: concurrent editor and Studio changes"),
         );
         let generation = self.control.generation.load(Ordering::Acquire);
+        let Some(_gate) = self.bridge.try_acquire_request_gate() else {
+            return Ok(None);
+        };
         let Some(_activity) = self.control.begin_sync(generation) else {
             return Ok(None);
         };
         match self
             .coordinator
-            .reconcile_current(&self.context, &self.bridge)
+            .reconcile_current_with_gate_held(&self.context, &self.bridge)
         {
             Ok(setup) => {
                 self.control.set_mode(setup.mode);
@@ -2809,16 +2811,8 @@ impl LiveLoop {
 
     fn execute_push(&self, push: &PreparedPush) -> Option<Result<LivePushResult>> {
         let generation = self.control.generation.load(Ordering::Acquire);
+        let gate = self.bridge.try_acquire_request_gate()?;
         let _activity = self.control.begin_sync(generation)?;
-        let gate_started = Instant::now();
-        let gate = self.bridge.acquire_request_gate();
-        log_global(
-            5,
-            format_args!(
-                "[renium] live push request gate: {:.1}ms",
-                gate_started.elapsed().as_secs_f64() * 1000.0
-            ),
-        );
         if self.control.generation.load(Ordering::Acquire) != generation
             || self.control.file_pause_count.load(Ordering::Acquire) > 0
         {
@@ -3201,6 +3195,10 @@ impl LiveLoop {
         self.last_pull_attempt = Instant::now();
         let generation = self.control.generation.load(Ordering::Acquire);
         let control = Arc::clone(&self.control);
+        let bridge = Arc::clone(&self.bridge);
+        let Some(_gate) = bridge.try_acquire_request_gate() else {
+            return Ok(true);
+        };
         let Some(_activity) = control.begin_sync(generation) else {
             return Ok(true);
         };

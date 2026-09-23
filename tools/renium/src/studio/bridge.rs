@@ -989,6 +989,16 @@ impl BridgeServer {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    // Live Sync's loop thread must never block on the gate: a request holding
+    // it may be waiting for that thread to refresh the watcher state.
+    pub(crate) fn try_acquire_request_gate(&self) -> Option<MutexGuard<'_, ()>> {
+        match self.request_gate.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) => None,
+        }
+    }
+
     pub(crate) fn acquire_request_gate_for_lease(
         &self,
         lease: &BridgeRequestLease,

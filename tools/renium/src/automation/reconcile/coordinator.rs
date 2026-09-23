@@ -216,8 +216,19 @@ impl Coordinator {
         setup: &mut PairSetup,
     ) -> Result<()> {
         let _gate = bridge.acquire_request_gate();
-        // Every operation that needs both locks takes the bridge gate first.
-        // LiveLoop::execute_push already follows this order.
+        self.reconcile_with_gate_held(context, bridge, setup)
+    }
+
+    // Lock order everywhere: the bridge request gate first, then the Live Sync
+    // activity, then the pair lock. A request holding the gate may wait for
+    // the sync activity to clear, so a sync must never hold the activity
+    // while it waits for the gate.
+    pub(crate) fn reconcile_with_gate_held(
+        &self,
+        context: &BoundContext,
+        bridge: &BridgeServer,
+        setup: &mut PairSetup,
+    ) -> Result<()> {
         let pair_lock = self.pair_lock(&setup.key);
         let _pair = pair_lock.lock_recover();
         let mut record = load_record(context, &setup.key)?
@@ -595,6 +606,16 @@ impl Coordinator {
     ) -> Result<PairSetup> {
         let mut setup = self.current_setup(context, bridge)?;
         self.reconcile(context, bridge, &mut setup)?;
+        Ok(setup)
+    }
+
+    pub(crate) fn reconcile_current_with_gate_held(
+        &self,
+        context: &BoundContext,
+        bridge: &BridgeServer,
+    ) -> Result<PairSetup> {
+        let mut setup = self.current_setup(context, bridge)?;
+        self.reconcile_with_gate_held(context, bridge, &mut setup)?;
         Ok(setup)
     }
 

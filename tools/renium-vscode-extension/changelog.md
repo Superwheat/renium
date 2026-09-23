@@ -20,6 +20,8 @@
 
 ### Bug fixes
 
+- The daemon no longer deadlocks when a pull, push or property command arrives while Live Sync is applying a Studio change; every command on that daemon, including Luau runs on another Studio, used to hang until the daemon was restarted.
+- `rbx l` gives up with a timeout error once its own limit plus the Studio connection wait has passed instead of waiting up to thirty minutes for the daemon.
 - AudioEmitter custom attenuation curves (`DistanceAttenuation` and `AngleAttenuation`) now sync: a push applies them through the engine's curve setters and a pull reads them back, instead of silently skipping them as unreadable while the files kept the curves.
 - A deprecated property that Studio no longer reports (such as `CollisionGroupId`) no longer fails a push or a Live Sync start as "missing from Studio" when the project files still carry it.
 - Studio audio control and other per-process features no longer fail with "Could not read the executable path" on Studio windows whose image Windows cannot express as a drive-letter path; the native path is used and mapped back to a drive letter.

@@ -57,9 +57,24 @@ fn send_on_stream(stream: &TcpStream, request: &super::Request) -> Result<super:
         | op::STUDIO_STATUS
         | op::PROPERTY_ACCESS
         | op::PERFORMANCE_MONITOR => Duration::from_secs(5),
+        op::LUAU => luau_response_limit(&request.p),
         _ => DAEMON_CONTROL_RESPONSE_TIMEOUT,
     };
     send_on_stream_with_timeout(stream, request, timeout)
+}
+
+// A Luau run has its own execution limit, so the client stops waiting once
+// that limit, the Studio connection wait and a queueing margin have passed
+// instead of holding on for the generic half-hour cap.
+const LUAU_QUEUE_MARGIN: Duration = Duration::from_secs(25);
+
+fn luau_response_limit(parameters: &serde_json::Value) -> Duration {
+    let timeout = parameters["timeout"].as_f64().unwrap_or(10.0).clamp(0.1, 120.0);
+    let bridge_wait = parameters["bridgeWaitSeconds"]
+        .as_f64()
+        .unwrap_or(8.0)
+        .clamp(1.0, 30.0);
+    Duration::from_secs_f64(timeout + bridge_wait) + LUAU_QUEUE_MARGIN
 }
 
 struct DeadlineReader<'a> {
@@ -201,5 +216,23 @@ mod tests {
         .err()
         .expect("an unanswered capability request must time out");
         assert!(format!("{error:#}").contains("Waiting for daemon response to operation 0"));
+    }
+}
+
+#[cfg(test)]
+mod luau_response_limit_tests {
+    use super::*;
+
+    #[test]
+    fn luau_runs_wait_for_their_own_limit_plus_connection_and_queue_margins() {
+        assert_eq!(
+            luau_response_limit(&json!({ "timeout": 10.0, "bridgeWaitSeconds": 8.0 })),
+            Duration::from_secs(43)
+        );
+        assert_eq!(
+            luau_response_limit(&json!({ "timeout": 600.0, "bridgeWaitSeconds": 90.0 })),
+            Duration::from_secs(175)
+        );
+        assert_eq!(luau_response_limit(&json!({})), Duration::from_secs(43));
     }
 }
