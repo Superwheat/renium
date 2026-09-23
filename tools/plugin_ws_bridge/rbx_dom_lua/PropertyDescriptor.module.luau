@@ -14,13 +14,14 @@ end
 
 function PropertyDescriptor.fromRaw(data, className, propertyName)
 	local key, value = next(data.DataType)
+	local custom = customProperties[className]
 
 	return setmetatable({
 
 		dataType = key == "Enum" and key or value,
 		enumType = key == "Enum" and ("Enum." .. value) or nil,
 
-		scriptability = data.Scriptability,
+		scriptability = if custom ~= nil and custom[propertyName] ~= nil then "Custom" else data.Scriptability,
 		serialization = data.Kind.Canonical and data.Kind.Canonical.Serialization,
 		className = className,
 		name = propertyName,

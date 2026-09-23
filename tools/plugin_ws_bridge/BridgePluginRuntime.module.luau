@@ -268,6 +268,7 @@ function BridgePluginRuntime.start(context)
 	local editorSync
 	local sessionLock
 	local transactionExpectations = {}
+	local RbxDomModule = requireChildModule("RbxDom")
 	local RbxDomDatabase = requireModule(rootScript:FindFirstChild("RbxDom"), "database")
 	sessionLock = SessionLockModule.create(
 		Config.bridgeRuntimeId,
@@ -1058,9 +1059,17 @@ function BridgePluginRuntime.start(context)
 		if isMaterialOverride then
 			return true, materialOverride
 		end
-		return pcall(function()
+		local ok, value = pcall(function()
 			return (instance :: any)[propertyName]
 		end)
+		if ok then
+			return true, value
+		end
+		local okCustom, okRead, customValue = pcall(RbxDomModule.readProperty, instance, propertyName)
+		if okCustom and okRead then
+			return true, customValue
+		end
+		return false, value
 	end
 
 	local function physicalPropertiesComparable(value: any): { number }?
@@ -1125,9 +1134,24 @@ function BridgePluginRuntime.start(context)
 		return fallbackMap
 	end
 
+	-- JSON carries text only; bytes that are not UTF-8 travel base64 encoded
+	-- under the same shape the CLI uses for binary values in project files.
+	local function serializeTransportString(value: string): any
+		if utf8.len(value) ~= nil and string.find(value, "\xED[\xA0-\xBF]") == nil then
+			return value
+		end
+		return {
+			_type = "BinaryString",
+			base64 = buffer.tostring(EncodingService:Base64Encode(buffer.fromstring(value))),
+		}
+	end
+	Config.serializeTransportString = serializeTransportString
+
 	local function serializeValue(value: any, state: ServiceState?): any
 		local valueType = typeof(value)
-		if valueType == "string" or valueType == "boolean" then
+		if valueType == "string" then
+			return serializeTransportString(value)
+		elseif valueType == "boolean" then
 			return value
 		elseif valueType == "number" then
 			return ValueCodecModule.encodeNumber(value)
@@ -2323,7 +2347,11 @@ function BridgePluginRuntime.start(context)
 			stringIds: { [string]: number }
 		): any
 			if type(value) == "string" then
-				return Config.internBatchString(strings, stringIds, value)
+				local serialized = serializeTransportString(value)
+				if type(serialized) == "table" then
+					return serialized
+				end
+				return Config.internBatchString(strings, stringIds, serialized)
 			end
 			return nil
 		end,

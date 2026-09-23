@@ -32,6 +32,7 @@ require("./play-status-workloads")
 require("./corner-change-workloads")
 require("./expectation-lifetime-workloads")
 require("./material-color-workloads")
+require("./audio-attenuation-workloads")
 require("./model-pivot-workloads")
 require("./native-order-workloads")
 require("./payload-receipt-workloads")
@@ -913,7 +914,7 @@ do
 	local descriptorSource = fs.readFile("tools/plugin_ws_bridge/rbx_dom_lua/PropertyDescriptor.module.luau")
 	local descriptorStart = assert(descriptorSource:find("function PropertyDescriptor.fromRaw(", 1, true))
 	local descriptorEnd = assert(descriptorSource:find("function PropertyDescriptor:read(", descriptorStart, true))
-	local descriptor = luau.load("local PropertyDescriptor = {}\n" .. descriptorSource:sub(descriptorStart, descriptorEnd - 1)
+	local descriptor = luau.load("local PropertyDescriptor = {}\nlocal customProperties = {}\n" .. descriptorSource:sub(descriptorStart, descriptorEnd - 1)
 		.. "\nreturn PropertyDescriptor.fromRaw")()
 	local overlay = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeReferenceOverlay.module.luau"), {
 		environment = {

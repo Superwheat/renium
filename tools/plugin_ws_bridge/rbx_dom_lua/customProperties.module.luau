@@ -27,6 +27,63 @@ local TERRAIN_MATERIAL_COLORS = {
 	Enum.Material.Pavement,
 }
 
+-- AudioEmitter curves are saved as one version byte (0) followed by
+-- little-endian float32 (input, gain) pairs sorted by input.
+local ATTENUATION_CURVE_VERSION = 0
+local ATTENUATION_POINT_FORMAT = "<ff"
+local ATTENUATION_POINT_SIZE = 8
+
+local function encodeAttenuationCurve(points: { [number]: number }): string
+	local inputs = {}
+	for input, gain in pairs(points) do
+		if type(input) == "number" and type(gain) == "number" then
+			inputs[#inputs + 1] = input
+		end
+	end
+	table.sort(inputs)
+	local parts = { string.char(ATTENUATION_CURVE_VERSION) }
+	for _, input in ipairs(inputs) do
+		parts[#parts + 1] = string.pack(ATTENUATION_POINT_FORMAT, input, points[input])
+	end
+	return table.concat(parts)
+end
+
+local function decodeAttenuationCurve(blob: any): (boolean, any)
+	if type(blob) ~= "string" then
+		return false, Error.new(Error.Kind.CannotParseBinaryString)
+	end
+	if #blob == 0 then
+		return true, {}
+	end
+	if string.byte(blob, 1) ~= ATTENUATION_CURVE_VERSION or (#blob - 1) % ATTENUATION_POINT_SIZE ~= 0 then
+		return false, Error.new(Error.Kind.CannotParseBinaryString)
+	end
+	local points = {}
+	local offset = 2
+	while offset <= #blob do
+		local input, gain = string.unpack(ATTENUATION_POINT_FORMAT, blob, offset)
+		points[input] = gain
+		offset += ATTENUATION_POINT_SIZE
+	end
+	return true, points
+end
+
+local function attenuationCurveProperty(getter: string, setter: string)
+	return {
+		read = function(instance)
+			return true, encodeAttenuationCurve(instance[getter](instance))
+		end,
+		write = function(instance, _, value)
+			local ok, points = decodeAttenuationCurve(value)
+			if not ok then
+				return false, points
+			end
+			instance[setter](instance, points)
+			return true
+		end,
+	}
+end
+
 local function isAttributeNameValid(attributeName)
 	return #attributeName <= 100 and attributeName:match("[^%w%.%-_/]") == nil
 end
@@ -104,6 +161,10 @@ return {
 				return true
 			end,
 		},
+	},
+	AudioEmitter = {
+		DistanceAttenuation = attenuationCurveProperty("GetDistanceAttenuation", "SetDistanceAttenuation"),
+		AngleAttenuation = attenuationCurveProperty("GetAngleAttenuation", "SetAngleAttenuation"),
 	},
 	LocalizationTable = {
 		Contents = {

@@ -225,6 +225,7 @@ pub(crate) fn decode_compact_v5_value(
     match type_id {
         TYPE_ID_BOOL => Ok(raw),
         TYPE_ID_NUMBER => Ok(canonicalize_nonfinite_float_json(raw)),
+        TYPE_ID_BINARY_STRING if raw.is_object() => Ok(raw),
         TYPE_ID_STRING | TYPE_ID_CONTENT_ID | TYPE_ID_BINARY_STRING => Ok(Value::String(
             decode_compact_v5_string(raw, strings, "property string")?,
         )),
@@ -743,5 +744,28 @@ mod tests {
             decode_batch_settings_ids(vec![json!([3, "editor:a"])], 2, "Test settings id",)
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod compact_v5_binary_string_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn binary_strings_arrive_interned_or_as_base64_payloads() {
+        let strings = vec![String::from("plain")];
+        let enums = EnumValueNameMap::default();
+        assert_eq!(
+            decode_compact_v5_value(TYPE_ID_BINARY_STRING, None, json!(1), &strings, &enums).unwrap(),
+            json!("plain")
+        );
+        let payload = json!({"_type": "BinaryString", "base64": "AAAAIEEAAIA/"});
+        assert_eq!(
+            decode_compact_v5_value(TYPE_ID_BINARY_STRING, None, payload.clone(), &strings, &enums)
+                .unwrap(),
+            payload
+        );
+        assert!(decode_compact_v5_value(TYPE_ID_STRING, None, payload, &strings, &enums).is_err());
     }
 }

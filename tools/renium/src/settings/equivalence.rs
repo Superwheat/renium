@@ -2687,19 +2687,31 @@ pub(crate) fn reconciliation_property_is_engine_state(
 
 // Scripts cannot read a NotScriptable property, so a capture that lacks one
 // says nothing about its value.
+// AudioEmitter curves are not scriptable, but the plugin reads and writes
+// them through Get/SetDistanceAttenuation and Get/SetAngleAttenuation.
+pub(crate) fn plugin_accesses_property_natively(
+    database: &rbx_reflection::ReflectionDatabase<'_>,
+    class_name: &str,
+    name: &str,
+) -> bool {
+    matches!(name, "DistanceAttenuation" | "AngleAttenuation")
+        && crate::rbx::decode::rbx_reflection_class_is_a(database, class_name, "AudioEmitter")
+}
+
 pub(crate) fn reconciliation_property_is_unreadable(
     database: &rbx_reflection::ReflectionDatabase<'_>,
     class_name: &str,
     name: &str,
 ) -> bool {
-    crate::rbx::encode::rbx_property_descriptor(database, class_name, name).is_some_and(
-        |descriptor| {
-            matches!(
-                descriptor.scriptability,
-                rbx_reflection::Scriptability::None
-            )
-        },
-    )
+    !plugin_accesses_property_natively(database, class_name, name)
+        && crate::rbx::encode::rbx_property_descriptor(database, class_name, name).is_some_and(
+            |descriptor| {
+                matches!(
+                    descriptor.scriptability,
+                    rbx_reflection::Scriptability::None
+                )
+            },
+        )
 }
 
 // A record can lack these without saying anything: MeshSize is what the
@@ -4931,6 +4943,21 @@ mod never_serialized_properties {
             "Part",
             "CollisionGroup"
         ));
+    }
+
+    #[test]
+    fn audio_emitter_curves_are_readable_through_their_accessors() {
+        let database = rbx_reflection_database::get().unwrap();
+        for name in ["DistanceAttenuation", "AngleAttenuation"] {
+            assert!(!reconciliation_property_is_unreadable(database, "AudioEmitter", name));
+            assert!(!reconciliation_property_is_unknown_when_absent(
+                Some(database),
+                "AudioEmitter",
+                name
+            ));
+        }
+        assert!(reconciliation_property_is_unreadable(database, "Terrain", "SmoothGrid"));
+        assert!(!plugin_accesses_property_natively(database, "Part", "DistanceAttenuation"));
         assert!(!reconciliation_property_is_unknown_when_absent(
             Some(database),
             "Part",
