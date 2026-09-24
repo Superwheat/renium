@@ -161,6 +161,76 @@ fn native_property_descriptor_supported(descriptor: &RbxPropertyDescriptor<'_>) 
     native_property_data_type_supported(&descriptor.data_type)
 }
 
+// A service root's saved fields without any plugin API (Lighting.Technology,
+// Workspace.StreamingMinRadius, ...) are known only through a native capture,
+// so the capture keeps them; rollout flags stay engine-managed.
+fn native_unscriptable_root_descriptor_supported(descriptor: &RbxPropertyDescriptor<'_>) -> bool {
+    let RbxPropertyKind::Canonical { serialization } = &descriptor.kind else {
+        return false;
+    };
+    if matches!(serialization, RbxPropertySerialization::DoesNotSerialize)
+        || !matches!(descriptor.scriptability, RbxScriptability::None)
+        || matches!(&descriptor.data_type, RbxDataType::Enum(name) if *name == "RolloutState")
+    {
+        return false;
+    }
+    if descriptor.tags.iter().any(|tag| {
+        matches!(
+            tag,
+            RbxPropertyTag::Deprecated
+                | RbxPropertyTag::Hidden
+                | RbxPropertyTag::NotBrowsable
+                | RbxPropertyTag::WriteOnly
+                | RbxPropertyTag::ReadOnly
+        )
+    }) {
+        return false;
+    }
+    native_property_data_type_supported(&descriptor.data_type)
+}
+
+// The service root's record comes from the plugin, which cannot read these
+// fields, so a native capture supplies them explicitly, defaults included.
+pub(crate) fn native_unscriptable_root_fields<'a>(
+    class_name: &str,
+    property_entries: impl IntoIterator<Item = (&'a rbx_dom_weak::Ustr, &'a RbxVariant)>,
+    database: &ReflectionDatabase<'_>,
+    refs: &BytecodeModelImportRefs,
+) -> Map<String, Value> {
+    let mut fields = Map::new();
+    if !native_capture_keeps_unscriptable_fields(database, class_name) {
+        return fields;
+    }
+    for (property_name, variant) in property_entries {
+        let name = property_name.as_str();
+        let logical = crate::rbx::encode::rbx_logical_property_name(database, class_name, name).unwrap_or(name);
+        let Some(descriptor) = rbx_property_descriptor(database, class_name, logical) else {
+            continue;
+        };
+        if !native_unscriptable_root_descriptor_supported(descriptor)
+            || super::super::editor::native_roots::is_property(class_name, logical)
+        {
+            continue;
+        }
+        if let Some(value) = rbx_variant_to_settings_json(variant, Some(descriptor), database, refs)
+        {
+            fields.insert(logical.to_string(), value);
+        }
+    }
+    fields
+}
+
+fn native_capture_keeps_unscriptable_fields(
+    database: &ReflectionDatabase<'_>,
+    class_name: &str,
+) -> bool {
+    class_name == "Terrain"
+        || database
+            .classes
+            .get(class_name)
+            .is_some_and(|class| class.tags.contains(&rbx_reflection::ClassTag::Service))
+}
+
 pub(crate) fn rbx_reflection_class_is_a(
     database: &ReflectionDatabase<'_>,
     class_name: &str,
@@ -180,10 +250,14 @@ pub(crate) fn native_property_filter(
 ) -> NativePropertyFilter {
     let mut allowed = HashSet::new();
     let mut renamed = HashMap::new();
+    let keeps_unscriptable = native_capture_keeps_unscriptable_fields(database, class_name);
     if let Some(class) = database.classes.get(class_name) {
         for descriptor in database.superclasses_iter(class) {
             for property in descriptor.properties.values() {
-                if !native_property_descriptor_supported(property) {
+                if !native_property_descriptor_supported(property)
+                    && !(keeps_unscriptable
+                        && native_unscriptable_root_descriptor_supported(property))
+                {
                     continue;
                 }
                 match &property.kind {
@@ -1491,5 +1565,28 @@ fn rbx_font_style_name(value: RbxFontStyle) -> &'static str {
     match value {
         RbxFontStyle::Italic => "Italic",
         _ => "Normal",
+    }
+}
+
+#[cfg(test)]
+mod native_capture_root_field_tests {
+    use super::*;
+
+    #[test]
+    fn service_roots_keep_saved_fields_without_a_plugin_api() {
+        let database = rbx_reflection_database::get().unwrap();
+        let lighting = native_property_filter(database, "Lighting");
+        assert!(lighting.allowed.contains("Technology"));
+        assert!(lighting.allowed.contains("Brightness"));
+        let workspace = native_property_filter(database, "Workspace");
+        assert!(workspace.allowed.contains("StreamingMinRadius"));
+        assert!(workspace.allowed.contains("PhysicsSteppingMethod"));
+        assert!(!workspace.allowed.contains("UseNewLuauTypeSolver"));
+        let terrain = native_property_filter(database, "Terrain");
+        assert!(terrain.allowed.contains("GrassLength"));
+        let path = native_property_filter(database, "Path2D");
+        assert!(!path.allowed.contains("Transparency"));
+        let emitter = native_property_filter(database, "AudioEmitter");
+        assert!(!emitter.allowed.contains("DistanceAttenuation"));
     }
 }

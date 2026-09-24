@@ -2250,6 +2250,55 @@ struct ProtectedWritePlan {
     apply_offline: bool,
 }
 
+fn record_unsupported_properties(
+    summary: &mut Map<String, Value>,
+    names: impl IntoIterator<Item = String>,
+) {
+    let mut merged = summary
+        .get("unsupportedProperties")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<std::collections::BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    merged.extend(names);
+    if !merged.is_empty() {
+        summary.insert(
+            "unsupportedProperties".to_string(),
+            json!(merged.into_iter().collect::<Vec<_>>()),
+        );
+    }
+}
+
+fn warn_unsupported_properties(summary: &Map<String, Value>) {
+    let names = summary
+        .get("unsupportedProperties")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if names.is_empty() {
+        return;
+    }
+    log_global(
+        2,
+        format_args!(
+            "[renium] warning: Studio exposes no plugin API for {} propert{}; the files keep the value but the open place was left unchanged: {}",
+            names.len(),
+            if names.len() == 1 { "y" } else { "ies" },
+            names.join(", ")
+        ),
+    );
+}
+
 fn prepare_protected_writes(
     args: &PushEditorChangesArgs,
     bridge: &BridgeServer,
@@ -2583,6 +2632,11 @@ fn push_editor_changes_with_collected(
         if summary.get("ok").and_then(Value::as_bool) == Some(false) || errors > 0.0 {
             bail!("Studio rejected or failed one or more editor push changes");
         }
+        record_unsupported_properties(
+            &mut summary,
+            crate::automation::reconcile::verify::take_unsupported_retention(),
+        );
+        warn_unsupported_properties(&summary);
         Ok(summary)
     })();
     EditorTransaction::finish(transaction.as_mut(), result)

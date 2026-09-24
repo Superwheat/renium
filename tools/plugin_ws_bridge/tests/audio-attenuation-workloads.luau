@@ -67,3 +67,6 @@ assert(descriptor.fromRaw(raw, "AudioEmitter", "AudioInteractionGroup").scriptab
 assert(descriptor.fromRaw(raw, "Part", "DistanceAttenuation").scriptability == "None")
 local okRead, value = descriptor.fromRaw(raw, "AudioEmitter", "AngleAttenuation"):read(emitter)
 assert(okRead and value == "\0" .. pack(0, 1) .. pack(90, 0.25), "Descriptor reads route through the custom accessor")
+assert(descriptor.fromRaw(raw, "AudioListener", "DistanceAttenuation").scriptability == "Custom")
+assert(custom.AudioListener.AngleAttenuation.write(emitter, "AngleAttenuation", "\0" .. pack(45, 0.75)))
+assert(saved.angle[45] == 0.75)

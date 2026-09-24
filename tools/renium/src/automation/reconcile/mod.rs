@@ -79,7 +79,7 @@ mod staging;
 #[cfg(test)]
 mod tests;
 mod types;
-mod verify;
+pub(crate) mod verify;
 
 pub(crate) use coordinator::*;
 pub(crate) use guards::*;

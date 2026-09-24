@@ -377,6 +377,47 @@ pub(crate) fn verification_value<'a>(
     }
 }
 
+// A saved field Studio exposes to no plugin API cannot be retained by a
+// push, so a difference is reported as unsupported instead of failing the
+// push; the push summary drains this set.
+static UNSUPPORTED_RETENTION: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+pub(crate) fn note_unsupported_properties(names: impl IntoIterator<Item = String>) {
+    UNSUPPORTED_RETENTION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .extend(names);
+}
+
+pub(crate) fn take_unsupported_retention() -> Vec<String> {
+    let mut names = UNSUPPORTED_RETENTION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::mem::take(&mut *names).into_iter().collect()
+}
+
+fn note_unsupported_retention(
+    class_name: &str,
+    name: &str,
+    expected: Option<&Value>,
+    actual: Option<&Value>,
+) -> bool {
+    let unsupported = rbx_reflection_database::get().is_ok_and(|database| {
+        crate::editor::review::plugin_cannot_write_property(database, class_name, name)
+    });
+    if !unsupported {
+        return false;
+    }
+    if !verification_values_equal(true, class_name, name, expected, actual) {
+        UNSUPPORTED_RETENTION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(format!("{class_name}.{name}"));
+    }
+    true
+}
+
 pub(crate) fn expected_map_mismatch(
     expected: &Map<String, Value>,
     actual: &Map<String, Value>,
@@ -392,6 +433,9 @@ pub(crate) fn expected_map_mismatch(
             return None;
         }
         let actual = verification_value(actual, name, properties);
+        if properties && note_unsupported_retention(class_name, name, Some(value), actual) {
+            return None;
+        }
         (!verification_values_equal(properties, class_name, name, Some(value), actual))
             .then(|| retention_mismatch(name, Some(value), actual))
     })
@@ -433,6 +477,9 @@ pub(crate) fn changed_map_mismatch(
             return None;
         }
         let actual = verification_value(observed, name, properties);
+        if properties && note_unsupported_retention(class_name, name, expected, actual) {
+            return None;
+        }
         (!verification_values_equal(properties, class_name, name, expected, actual))
             .then(|| retention_mismatch(name, expected, actual))
     })

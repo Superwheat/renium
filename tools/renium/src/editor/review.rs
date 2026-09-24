@@ -157,6 +157,42 @@ pub(crate) fn is_externally_managed_protected_write(row: &Value) -> bool {
     is_externally_managed_editor_property(service, class_name, &path_segments, property_name)
 }
 
+// Saved fields with no plugin API and no native setter cannot reach an open
+// place at all; a push names them instead of dropping them quietly.
+pub(crate) fn plugin_cannot_write_property(
+    database: &ReflectionDatabase<'_>,
+    class_name: &str,
+    name: &str,
+) -> bool {
+    if name == "Tags"
+        || name.starts_with("RBX_")
+        || class_name == "Workspace" && name == "CollisionGroupData"
+        || class_name == MATERIAL_SERVICE_CLASS
+            && (name == USE_2022_MATERIALS_PROPERTY || name.ends_with("Name"))
+        || has_protected_texture_pack(class_name) && name == TEXTURE_PACK_PROPERTY
+        || super::native_roots::is_property(class_name, name)
+        || super::native_geometry::is_mesh_geometry_property(class_name, name)
+        || crate::settings::equivalence::plugin_accesses_property_natively(
+            database, class_name, name,
+        )
+    {
+        return false;
+    }
+    rbx_property_descriptor(database, class_name, name).is_some_and(|descriptor| {
+        matches!(descriptor.scriptability, RbxScriptability::None)
+            && !descriptor.tags.iter().any(|tag| {
+                matches!(
+                    tag,
+                    RbxPropertyTag::Deprecated
+                        | RbxPropertyTag::Hidden
+                        | RbxPropertyTag::NotBrowsable
+                        | RbxPropertyTag::ReadOnly
+                        | RbxPropertyTag::WriteOnly
+                )
+            })
+    })
+}
+
 pub(crate) fn is_user_facing_protected_write(
     row: &Value,
     database: &ReflectionDatabase<'_>,
@@ -1436,5 +1472,50 @@ mod root_write_evidence_tests {
         assert!(rows[0].get("oldValue").is_none());
         assert_eq!(rows[0]["oldValueMissing"], true);
         assert_eq!(&rows[1..], others);
+    }
+}
+
+#[cfg(test)]
+mod unsupported_property_tests {
+    use super::*;
+
+    #[test]
+    fn fields_without_a_plugin_api_or_native_setter_are_unsupported() {
+        let database = rbx_reflection_database::get().unwrap();
+        for (class_name, name) in [
+            ("Lighting", "Technology"),
+            ("Workspace", "StreamingMinRadius"),
+            ("Workspace", "PhysicsSteppingMethod"),
+            ("SoundService", "VolumetricAudio"),
+            ("Players", "BanningEnabled"),
+            ("ServerScriptService", "LoadStringEnabled"),
+            ("Terrain", "GrassLength"),
+            ("Path2D", "Transparency"),
+        ] {
+            assert!(
+                plugin_cannot_write_property(database, class_name, name),
+                "{class_name}.{name}"
+            );
+        }
+        for (class_name, name) in [
+            ("Workspace", "StreamingTargetRadius"),
+            ("Workspace", "CollisionGroupData"),
+            ("AudioEmitter", "DistanceAttenuation"),
+            ("AudioListener", "AngleAttenuation"),
+            ("MaterialService", "AsphaltName"),
+            ("MaterialService", "Use2022Materials"),
+            ("SurfaceAppearance", "TexturePack"),
+            ("MeshPart", "MeshId"),
+            ("Terrain", "SmoothGrid"),
+            ("Lighting", "LightingStyle"),
+            ("Model", "Scale"),
+            ("Part", "Anchored"),
+            ("Part", "Tags"),
+        ] {
+            assert!(
+                !plugin_cannot_write_property(database, class_name, name),
+                "{class_name}.{name}"
+            );
+        }
     }
 }

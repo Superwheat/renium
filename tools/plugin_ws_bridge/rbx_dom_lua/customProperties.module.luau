@@ -166,6 +166,10 @@ return {
 		DistanceAttenuation = attenuationCurveProperty("GetDistanceAttenuation", "SetDistanceAttenuation"),
 		AngleAttenuation = attenuationCurveProperty("GetAngleAttenuation", "SetAngleAttenuation"),
 	},
+	AudioListener = {
+		DistanceAttenuation = attenuationCurveProperty("GetDistanceAttenuation", "SetDistanceAttenuation"),
+		AngleAttenuation = attenuationCurveProperty("GetAngleAttenuation", "SetAngleAttenuation"),
+	},
 	LocalizationTable = {
 		Contents = {
 			read = function(instance, _)

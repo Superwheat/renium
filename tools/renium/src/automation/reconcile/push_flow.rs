@@ -242,6 +242,16 @@ pub(crate) fn push_project(
         },
         phase,
     );
+    for path in &differences {
+        if let Some(change) = prepared_settings.get(path) {
+            super::verify::note_unsupported_properties(
+                crate::settings::equivalence::unsupported_property_differences(
+                    &change.current,
+                    &change.previous,
+                ),
+            );
+        }
+    }
     if differences.is_empty() {
         tracking_release.proof = capture_push_proof(bridge, &guard)?;
         acknowledge_verified_push(bridge, services, &guard, &mut tracking_release)?;

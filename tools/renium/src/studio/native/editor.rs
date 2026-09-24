@@ -1760,6 +1760,7 @@ fn decode_native_service_dom(
     let decode_started = Instant::now();
     let mut flat = rbx_binary::Deserializer::new()
         .elide_defaults(true)
+        .retain_defaults_for_classes(HashSet::from([group.service.clone()]))
         .flat_property_filter(property_filter)
         .deserialize_flat(std::io::Cursor::new(bytes))
         .with_context(|| {
@@ -1856,13 +1857,12 @@ fn decode_native_serialization_batch(
             .context("Native serialization batch instance count overflowed")
     })?;
     let decode_started = Instant::now();
+    // Service roots keep their defaults: a saved field without a plugin API is
+    // known only through this capture, so its default must arrive explicitly
+    // for a stale file value to be corrected.
     let mut flat = match rbx_binary::Deserializer::new()
         .elide_defaults(true)
-        .retain_defaults_for_classes(if identity_rows.is_some() {
-            groups.iter().map(|group| group.service.clone()).collect()
-        } else {
-            HashSet::new()
-        })
+        .retain_defaults_for_classes(groups.iter().map(|group| group.service.clone()).collect())
         .flat_property_filter(property_filter)
         .deserialize_flat(std::io::Cursor::new(bytes))
     {
@@ -2396,6 +2396,19 @@ fn convert_native_service_output(
             |(index, (((rbx_instance, overlay), debug_id), transported_settings_id))| -> Result<_> {
                 let parent_index = rbx_instance.parent_index.map(|parent| parent + 1);
                 let native_filter = dependencies.native_filters.get(rbx_instance.class.as_str());
+                let unscriptable_root_fields = if index == 0 {
+                    crate::rbx::decode::native_unscriptable_root_fields(
+                        rbx_instance.class.as_str(),
+                        rbx_instance
+                            .properties
+                            .iter()
+                            .map(|(property_name, variant)| (property_name, variant)),
+                        dependencies.database,
+                        &refs,
+                    )
+                } else {
+                    Map::new()
+                };
                 let (mut native_properties, mut properties, mut attributes, source) =
                     rbx_properties_to_native_settings_records(
                         rbx_instance.class.as_str(),
@@ -2436,6 +2449,9 @@ fn convert_native_service_output(
                     properties.clone_from(&root_properties);
                     if let Some(tags) = tags {
                         properties.insert("Tags".to_string(), tags);
+                    }
+                    for (name, value) in unscriptable_root_fields {
+                        properties.entry(name).or_insert(value);
                     }
                 }
                 if let Some(source) = source {

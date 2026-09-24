@@ -468,6 +468,7 @@ fn compact_push_summary(summary: &Map<String, Value>, parameters: &Value) -> Map
         "sourceVerifyErrors",
         "protectedWrites",
         "protectedApplied",
+        "unsupportedProperties",
         "packageModified",
         "autoDesyncedPackages",
     ] {

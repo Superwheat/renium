@@ -2680,22 +2680,26 @@ pub(crate) fn reconciliation_property_is_engine_state(
         || reconciliation_property_is_derived(name)
         || reconciliation_property_is_metadata(name, value)
         || database.is_some_and(|database| {
-            crate::rbx::decode::is_unexposed_service_property(database, class_name, name)
-                || reconciliation_property_is_engine_mirror(database, class_name, name)
+            reconciliation_property_is_engine_mirror(database, class_name, name)
         })
 }
 
 // Scripts cannot read a NotScriptable property, so a capture that lacks one
 // says nothing about its value.
-// AudioEmitter curves are not scriptable, but the plugin reads and writes
-// them through Get/SetDistanceAttenuation and Get/SetAngleAttenuation.
+// Audio attenuation curves are not scriptable, but the plugin reads and
+// writes them through Get/SetDistanceAttenuation and Get/SetAngleAttenuation.
 pub(crate) fn plugin_accesses_property_natively(
     database: &rbx_reflection::ReflectionDatabase<'_>,
     class_name: &str,
     name: &str,
 ) -> bool {
     matches!(name, "DistanceAttenuation" | "AngleAttenuation")
-        && crate::rbx::decode::rbx_reflection_class_is_a(database, class_name, "AudioEmitter")
+        && (crate::rbx::decode::rbx_reflection_class_is_a(database, class_name, "AudioEmitter")
+            || crate::rbx::decode::rbx_reflection_class_is_a(
+                database,
+                class_name,
+                "AudioListener",
+            ))
 }
 
 pub(crate) fn reconciliation_property_is_unreadable(
@@ -2716,7 +2720,9 @@ pub(crate) fn reconciliation_property_is_unreadable(
 
 // A record can lack these without saying anything: MeshSize is what the
 // engine measured once a mesh loaded, CollisionFidelity and ClockTime are
-// filled in by Studio, and NotScriptable properties cannot be captured.
+// filled in by Studio, and NotScriptable properties cannot be captured. Service
+// settings without a plugin API arrive only through a native capture, so they
+// compare when both records carry them and say nothing when one lacks them.
 pub(crate) fn reconciliation_property_is_unknown_when_absent(
     database: Option<&rbx_reflection::ReflectionDatabase<'_>>,
     class_name: &str,
@@ -2725,6 +2731,7 @@ pub(crate) fn reconciliation_property_is_unknown_when_absent(
     matches!(name, "CollisionFidelity" | "ClockTime" | "MeshSize")
         || database.is_some_and(|database| {
             reconciliation_property_is_unreadable(database, class_name, name)
+                || crate::rbx::decode::is_unexposed_service_property(database, class_name, name)
                 || match crate::rbx::encode::rbx_property_descriptor(database, class_name, name) {
                     None => true,
                     Some(descriptor) => {
@@ -2805,6 +2812,43 @@ pub(crate) fn reconciliation_property_values_equal(
         }
         (None, None) => true,
     }
+}
+
+/// Saved fields the files carry with a value the open place does not have
+/// and that no plugin API can set: a push reports them by name.
+pub(crate) fn unsupported_property_differences(
+    files: &SettingsBytecode,
+    studio: &SettingsBytecode,
+) -> Vec<String> {
+    let Ok(database) = rbx_reflection_database::get() else {
+        return Vec::new();
+    };
+    let studio_by_id = studio
+        .instances
+        .iter()
+        .map(|instance| (instance.settings_id.as_str(), instance))
+        .collect::<HashMap<_, _>>();
+    let mut names = std::collections::BTreeSet::new();
+    for instance in &files.instances {
+        let Some(observed) = studio_by_id.get(instance.settings_id.as_str()) else {
+            continue;
+        };
+        let class_name = &instance.class_name;
+        for (name, value) in &instance.properties {
+            if !crate::editor::review::plugin_cannot_write_property(database, class_name, name) {
+                continue;
+            }
+            if !reconciliation_property_values_equal(
+                class_name,
+                name,
+                Some(value),
+                observed.properties.get(name),
+            ) {
+                names.insert(format!("{class_name}.{name}"));
+            }
+        }
+    }
+    names.into_iter().collect()
 }
 
 pub(crate) fn remove_reconciliation_derived_properties(document: &mut SettingsBytecode) {
@@ -4948,16 +4992,72 @@ mod never_serialized_properties {
     #[test]
     fn audio_emitter_curves_are_readable_through_their_accessors() {
         let database = rbx_reflection_database::get().unwrap();
-        for name in ["DistanceAttenuation", "AngleAttenuation"] {
-            assert!(!reconciliation_property_is_unreadable(database, "AudioEmitter", name));
-            assert!(!reconciliation_property_is_unknown_when_absent(
-                Some(database),
-                "AudioEmitter",
-                name
-            ));
+        for class_name in ["AudioEmitter", "AudioListener"] {
+            for name in ["DistanceAttenuation", "AngleAttenuation"] {
+                assert!(!reconciliation_property_is_unreadable(database, class_name, name));
+                assert!(!reconciliation_property_is_unknown_when_absent(
+                    Some(database),
+                    class_name,
+                    name
+                ));
+            }
         }
         assert!(reconciliation_property_is_unreadable(database, "Terrain", "SmoothGrid"));
         assert!(!plugin_accesses_property_natively(database, "Part", "DistanceAttenuation"));
+    }
+
+    #[test]
+    fn a_stale_service_setting_in_the_files_differs_from_the_captured_value() {
+        let file = Map::from_iter([(
+            "Technology".to_string(),
+            serde_json::json!({"_type": "EnumItem", "name": "ShadowMap"}),
+        )]);
+        let studio = Map::from_iter([(
+            "Technology".to_string(),
+            serde_json::json!({"_type": "EnumItem", "enumType": "Enum.Technology", "name": "Voxel", "value": 1}),
+        )]);
+        assert!(!reconciliation_maps_equal("Lighting", &file, &studio));
+        assert!(!reconciliation_maps_equal("Lighting", &studio, &file));
+        assert!(reconciliation_maps_equal("Lighting", &Map::new(), &studio));
+    }
+
+    #[test]
+    fn service_settings_without_a_plugin_api_compare_when_both_records_carry_them() {
+        let database = rbx_reflection_database::get().unwrap();
+        let value = serde_json::json!({"_type": "EnumItem", "name": "ShadowMap"});
+        for (class_name, name) in [
+            ("Lighting", "Technology"),
+            ("SoundService", "VolumetricAudio"),
+            ("Workspace", "StreamingMinRadius"),
+        ] {
+            assert!(!reconciliation_property_is_engine_state(
+                Some(database),
+                class_name,
+                name,
+                &value
+            ));
+            assert!(reconciliation_property_is_unknown_when_absent(
+                Some(database),
+                class_name,
+                name
+            ));
+            assert!(reconciliation_property_compares(
+                Some(database),
+                class_name,
+                name,
+                &value,
+                true,
+                true
+            ));
+            assert!(!reconciliation_property_compares(
+                Some(database),
+                class_name,
+                name,
+                &value,
+                true,
+                false
+            ));
+        }
         assert!(!reconciliation_property_is_unknown_when_absent(
             Some(database),
             "Part",
