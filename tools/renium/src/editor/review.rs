@@ -157,8 +157,8 @@ pub(crate) fn is_externally_managed_protected_write(row: &Value) -> bool {
     is_externally_managed_editor_property(service, class_name, &path_segments, property_name)
 }
 
-// Saved fields with no plugin API and no native setter cannot reach an open
-// place at all; a push names them instead of dropping them quietly.
+// Saved fields with no plugin API and no dedicated native setter; a push
+// applies them through the native property writer and names the rest.
 pub(crate) fn plugin_cannot_write_property(
     database: &ReflectionDatabase<'_>,
     class_name: &str,

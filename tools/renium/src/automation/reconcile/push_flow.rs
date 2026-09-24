@@ -244,8 +244,8 @@ pub(crate) fn push_project(
     );
     for path in &differences {
         if let Some(change) = prepared_settings.get(path) {
-            super::verify::note_unsupported_properties(
-                crate::settings::equivalence::unsupported_property_differences(
+            super::verify::note_saved_field_differences(
+                crate::settings::equivalence::saved_field_differences(
                     &change.current,
                     &change.previous,
                 ),

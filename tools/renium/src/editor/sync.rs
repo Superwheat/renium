@@ -2250,6 +2250,42 @@ struct ProtectedWritePlan {
     apply_offline: bool,
 }
 
+// Saved fields with no plugin API (Lighting.Technology, Players.BanningEnabled,
+// Path2D.Transparency, ...) are ordinary settings a user can change in Studio,
+// so the push writes them natively without an approval; whatever cannot be
+// written is named in the result.
+fn apply_saved_field_differences(bridge: &BridgeServer, summary: &mut Map<String, Value>) {
+    let differences = crate::automation::reconcile::verify::take_saved_field_differences();
+    if differences.is_empty() {
+        return;
+    }
+    let mut applied = 0u64;
+    let mut unsupported = Vec::new();
+    for difference in differences {
+        if difference.ambiguous {
+            unsupported.push(format!(
+                "{} (duplicate sibling names along {})",
+                difference.label(),
+                difference.path_segments.join(".")
+            ));
+            continue;
+        }
+        match crate::studio::automation::property_access::write_saved_field(
+            bridge,
+            &difference.path_segments,
+            &difference.property,
+            &difference.value,
+        ) {
+            Ok(_) => applied += 1,
+            Err(error) => unsupported.push(format!("{} ({error:#})", difference.label())),
+        }
+    }
+    if applied > 0 {
+        summary.insert("savedFieldsApplied".to_string(), json!(applied));
+    }
+    record_unsupported_properties(summary, unsupported);
+}
+
 fn record_unsupported_properties(
     summary: &mut Map<String, Value>,
     names: impl IntoIterator<Item = String>,
@@ -2286,7 +2322,7 @@ fn warn_unsupported_properties(summary: &Map<String, Value>) {
     log_global(
         2,
         format_args!(
-            "[renium] warning: Studio exposes no plugin API for {} propert{}; the files keep the value but the open place was left unchanged: {}",
+            "[renium] warning: {} saved propert{} could not be written to the open place; the files keep the value: {}",
             names.len(),
             if names.len() == 1 { "y" } else { "ies" },
             names.join(", ")
@@ -2627,10 +2663,7 @@ fn push_editor_changes_with_collected(
         if summary.get("ok").and_then(Value::as_bool) == Some(false) || errors > 0.0 {
             bail!("Studio rejected or failed one or more editor push changes");
         }
-        record_unsupported_properties(
-            &mut summary,
-            crate::automation::reconcile::verify::take_unsupported_retention(),
-        );
+        apply_saved_field_differences(bridge, &mut summary);
         warn_unsupported_properties(&summary);
         Ok(summary)
     })();

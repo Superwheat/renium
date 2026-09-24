@@ -2810,12 +2810,28 @@ pub(crate) fn reconciliation_property_values_equal(
     }
 }
 
-/// Saved fields the files carry with a value the open place does not have
-/// and that no plugin API can set: a push reports them by name.
-pub(crate) fn unsupported_property_differences(
+/// A saved field the files carry with a value the open place does not have
+/// and that no plugin API can set; a push applies it through the native
+/// property writer, or names it when that is impossible.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SavedFieldDifference {
+    pub(crate) path_segments: Vec<String>,
+    pub(crate) class_name: String,
+    pub(crate) property: String,
+    pub(crate) value: Value,
+    pub(crate) ambiguous: bool,
+}
+
+impl SavedFieldDifference {
+    pub(crate) fn label(&self) -> String {
+        format!("{}.{}", self.class_name, self.property)
+    }
+}
+
+pub(crate) fn saved_field_differences(
     files: &SettingsBytecode,
     studio: &SettingsBytecode,
-) -> Vec<String> {
+) -> Vec<SavedFieldDifference> {
     let Ok(database) = rbx_reflection_database::get() else {
         return Vec::new();
     };
@@ -2824,27 +2840,62 @@ pub(crate) fn unsupported_property_differences(
         .iter()
         .map(|instance| (instance.settings_id.as_str(), instance))
         .collect::<HashMap<_, _>>();
-    let mut names = std::collections::BTreeSet::new();
+    let mut sibling_counts: HashMap<(Option<usize>, &str), usize> = HashMap::new();
+    for instance in &files.instances {
+        *sibling_counts
+            .entry((instance.parent_index, instance.name.as_str()))
+            .or_default() += 1;
+    }
+    let mut differences = Vec::new();
     for instance in &files.instances {
         let Some(observed) = studio_by_id.get(instance.settings_id.as_str()) else {
             continue;
         };
         let class_name = &instance.class_name;
+        let mut path = None;
         for (name, value) in &instance.properties {
             if !crate::editor::review::plugin_cannot_write_property(database, class_name, name) {
                 continue;
             }
-            if !reconciliation_property_values_equal(
+            if reconciliation_property_values_equal(
                 class_name,
                 name,
                 Some(value),
                 observed.properties.get(name),
             ) {
-                names.insert(format!("{class_name}.{name}"));
+                continue;
             }
+            let (segments, ambiguous) = path
+                .get_or_insert_with(|| {
+                    let mut segments = Vec::new();
+                    let mut ambiguous = false;
+                    let mut cursor = Some(instance);
+                    while let Some(current) = cursor {
+                        ambiguous |= sibling_counts
+                            .get(&(current.parent_index, current.name.as_str()))
+                            .is_some_and(|count| *count > 1);
+                        segments.push(current.name.clone());
+                        cursor = current
+                            .parent_index
+                            .and_then(|index| files.instances.get(index));
+                    }
+                    segments.reverse();
+                    (segments, ambiguous)
+                })
+                .clone();
+            differences.push(SavedFieldDifference {
+                path_segments: segments,
+                class_name: class_name.clone(),
+                property: name.clone(),
+                value: value.clone(),
+                ambiguous,
+            });
         }
     }
-    names.into_iter().collect()
+    differences.sort_by(|left, right| {
+        (&left.path_segments, &left.property).cmp(&(&right.path_segments, &right.property))
+    });
+    differences
 }
 
 pub(crate) fn remove_reconciliation_derived_properties(document: &mut SettingsBytecode) {

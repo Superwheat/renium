@@ -161,6 +161,123 @@ fn value_text(value: &Value) -> Result<String> {
     }
 }
 
+/// Studio text for a stored value, as the native property writer takes it.
+/// Stores keep integers as floats, so an integer field gets integer text.
+pub(crate) fn saved_field_text(value: &Value, class_name: &str, property: &str) -> Result<String> {
+    match value {
+        Value::Number(number) => {
+            let integer_field = rbx_reflection_database::get()
+                .ok()
+                .and_then(|database| {
+                    crate::rbx::encode::rbx_property_descriptor(database, class_name, property)
+                })
+                .is_some_and(|descriptor| {
+                    matches!(
+                        descriptor.data_type,
+                        rbx_reflection::DataType::Value(
+                            rbx_dom_weak::types::VariantType::Int32
+                                | rbx_dom_weak::types::VariantType::Int64
+                        )
+                    )
+                });
+            match number.as_f64() {
+                Some(float) if integer_field && float.fract() == 0.0 => {
+                    Ok(format!("{}", float as i64))
+                }
+                _ => value_text(value),
+            }
+        }
+        Value::String(_) | Value::Bool(_) => value_text(value),
+        Value::Object(object)
+            if object.get("_type").and_then(Value::as_str) == Some("EnumItem") =>
+        {
+            object
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .context("Enum value has no name")
+        }
+        _ => bail!("only text, numbers, booleans and enum values can be written natively"),
+    }
+}
+
+/// Writes one saved field the plugin cannot set, through the same native
+/// property writer as `rbx access write`, on the pinned Edit runtime. Returns
+/// whether Studio's value changed.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn write_saved_field(
+    bridge: &BridgeServer,
+    path: &[String],
+    property: &str,
+    value: &Value,
+) -> Result<bool> {
+    let info = bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?;
+    let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, &info.runtime_id)?;
+    let title = crate::studio::native::serializer::target_name(pid, &info.place_name)?;
+    let mut native = crate::studio::native::serializer::prepare_property(
+        pid,
+        &title,
+        path,
+        &[],
+        property,
+        Duration::from_secs(3),
+    )?;
+    let text = saved_field_text(value, &native.class_name, property)?;
+    let before = native.read()?;
+    if crate::automation::property_access::property_text_matches(
+        &native.class_name,
+        property,
+        &text,
+        &before,
+    ) {
+        return Ok(false);
+    }
+    native.ensure_writable()?;
+    native.write(&text)?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod saved_field_text_tests {
+    use super::*;
+
+    #[test]
+    fn integer_fields_get_integer_text_and_enums_their_name() {
+        assert_eq!(
+            saved_field_text(&json!(64.0), "Workspace", "StreamingMinRadius").unwrap(),
+            "64"
+        );
+        assert_eq!(
+            saved_field_text(&json!(0.7), "Terrain", "GrassLength").unwrap(),
+            "0.7"
+        );
+        assert_eq!(
+            saved_field_text(
+                &json!({"_type": "EnumItem", "name": "Future"}),
+                "Lighting",
+                "Technology"
+            )
+            .unwrap(),
+            "Future"
+        );
+        assert_eq!(
+            saved_field_text(&json!(true), "Players", "BanningEnabled").unwrap(),
+            "true"
+        );
+        assert!(saved_field_text(&json!([1, 2]), "Part", "Size").is_err());
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+pub(crate) fn write_saved_field(
+    _bridge: &BridgeServer,
+    _path: &[String],
+    _property: &str,
+    _value: &Value,
+) -> Result<bool> {
+    bail!("the native property writer is unavailable on this platform")
+}
+
 pub(crate) fn command(args: PropertyAccessArgs) -> Result<()> {
     if let Action::Mode { mode, accept_risk } = &args.action {
         if *accept_risk && *mode != Some(Mode::ReadWrite) {
