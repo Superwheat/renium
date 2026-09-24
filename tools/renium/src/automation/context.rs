@@ -369,13 +369,8 @@ fn bootstrap(state: &State, root: &Path) -> std::result::Result<Value, Failure> 
         plugin_build: None,
         fingerprint,
     });
-    let protected = context.resource_lease.is_some();
-    let mut response = serde_json::to_value(context)
-        .map_err(|error| Failure::new("internal", error.to_string(), false, "bind"))?;
-    if protected {
-        response["resourceLeaseProtected"] = json!(true);
-    }
-    Ok(response)
+    serde_json::to_value(context)
+        .map_err(|error| Failure::new("internal", error.to_string(), false, "bind"))
 }
 
 pub(super) fn bind(
@@ -632,8 +627,15 @@ pub(super) fn bind(
         plugin_build,
         fingerprint,
     });
-    serde_json::to_value(context)
-        .map_err(|error| Failure::new("internal", error.to_string(), false, "bind"))
+    // The lease was verified against this place above; confirm it so a leased
+    // caller knows this daemon enforces ownership on every later operation.
+    let protected = context.resource_lease.is_some();
+    let mut response = serde_json::to_value(context)
+        .map_err(|error| Failure::new("internal", error.to_string(), false, "bind"))?;
+    if protected {
+        response["resourceLeaseProtected"] = json!(true);
+    }
+    Ok(response)
 }
 
 pub(super) fn resolve_project(

@@ -23,6 +23,8 @@
 
 ### Bug fixes
 
+- A push into a place whose service roots lack the project's attributes (for example a fresh or empty place) no longer fails with "Studio did not retain native supplemental properties"; service-root attributes are now written after the native import, which applies only their properties.
+- Commands run by a plugin that holds a Studio place lease no longer fail with "The running daemon did not confirm exclusive Studio ownership"; the daemon now confirms the lease after verifying it against the place.
 - `rbx oc --key-env NAME` no longer falls back to the stored default key when `NAME` is unset; only the default `ROBLOX_API_KEY` does, so a caller that names its own key never runs with another one.
 - A push that adds an instance Studio refuses to create for plugin code (such as `Noise`) now names the instance and the reason instead of "Native insertion is missing an expected root".
 - Saved fields that no plugin API exposes (`Lighting.Technology`, `Workspace.StreamingMinRadius`, `Players.BanningEnabled`, `ServerScriptService.LoadStringEnabled`, `Terrain.GrassLength`, `Path2D.Transparency`, ...) now sync both ways: native captures carry them, so pulls and Live Sync reconciles compare them and correct a stale file value, and a push writes a changed one through the native property writer without an approval, as these are ordinary settings a user can change in Studio. A field that still cannot be written is returned as `unsupportedProperties` with the reason and a warning on stderr, instead of being dropped silently or failing the push as "not retained".
