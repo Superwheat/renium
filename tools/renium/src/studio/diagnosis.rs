@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use serde_json::{Value, json};
@@ -174,6 +175,92 @@ fn elapsed_seconds(text: &str) -> Option<u64> {
     Some(days * 86_400 + seconds)
 }
 
+pub(crate) fn studio_log_directory() -> Option<PathBuf> {
+    if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA").map(|base| PathBuf::from(base).join("Roblox").join("logs"))
+    } else if cfg!(target_os = "macos") {
+        std::env::var_os("HOME").map(|home| {
+            PathBuf::from(home)
+                .join("Library")
+                .join("Logs")
+                .join("Roblox")
+        })
+    } else {
+        None
+    }
+}
+
+// Studio names its process near the top of each log, for example
+// "Constructing UIThreadNotifier for process '4700' ...".
+const LOG_HEAD_BYTES: u64 = 256 * 1024;
+
+fn studio_log_for_process(pid: u32, started_unix: Option<u64>) -> Option<PathBuf> {
+    let marker = format!("for process '{pid}'");
+    let mut newest: Option<(u64, PathBuf)> = None;
+    for entry in std::fs::read_dir(studio_log_directory()?).ok()?.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.contains("Studio") || !name.ends_with(".log") {
+            continue;
+        }
+        let created = entry
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.created().ok())
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |time| time.as_secs());
+        // A reused PID must not match the log of an older Studio.
+        if started_unix.is_some_and(|started| created + 300 < started) {
+            continue;
+        }
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        let mut head = Vec::new();
+        if file.take(LOG_HEAD_BYTES).read_to_end(&mut head).is_err()
+            || !String::from_utf8_lossy(&head).contains(&marker)
+        {
+            continue;
+        }
+        if newest.as_ref().is_none_or(|(time, _)| created >= *time) {
+            newest = Some((created, path));
+        }
+    }
+    newest.map(|(_, path)| path)
+}
+
+/// Why the latest place open of this Studio failed, read from its log, or None
+/// when it opened a place or has not finished trying.
+pub(crate) fn studio_open_failure(pid: u32, started_unix: Option<u64>) -> Option<String> {
+    let bytes = std::fs::read(studio_log_for_process(pid, started_unix)?).ok()?;
+    open_failure_in_log(&String::from_utf8_lossy(&bytes))
+}
+
+fn open_failure_in_log(text: &str) -> Option<String> {
+    let mut failure = None;
+    let mut awaiting_message = false;
+    for line in text.lines() {
+        if line.contains("[telemetryLog] State: OpenPlaceSuccess") {
+            failure = None;
+            awaiting_message = false;
+        } else if line.contains("[telemetryLog] State: OpenPlaceFailure") {
+            failure = Some("Studio could not open the place".to_string());
+            awaiting_message = true;
+        } else if awaiting_message
+            && let Some((_, message)) = line.split_once("[telemetryLog] ErrorMessage:")
+        {
+            let message = message.trim();
+            if !message.is_empty() {
+                failure = Some(message.to_string());
+            }
+            awaiting_message = false;
+        }
+    }
+    failure
+}
+
 fn plugin_file() -> Option<(String, Option<u64>)> {
     let path = roblox_plugins_dir().ok()?.join(PLUGIN_ASSET_NAME);
     let modified = std::fs::metadata(&path).ok().and_then(|metadata| {
@@ -203,9 +290,16 @@ fn verdict_text(
     clients_connected: bool,
     open_places: &[String],
     bound: Option<&str>,
+    open_failures: &[(u32, String)],
 ) -> String {
     if !studio_running {
         return "Studio is not running; open the place with `rbx so FILE` or `rbx ro`.".to_string();
+    }
+    if let Some((pid, reason)) = open_failures.first() {
+        return format!(
+            "Studio (pid {pid}) could not open its place: {}. It is left at its start page; close it, and check that the signed-in Studio account can edit the place.",
+            reason.trim_end_matches('.')
+        );
     }
     if let Some((path, None)) = plugin {
         return format!(
@@ -250,6 +344,18 @@ pub(crate) fn diagnose(clients: &[Value], project_root: Option<&Path>) -> Value 
         .filter(|client| client["role"] == "edit")
         .filter_map(|client| client["placeName"].as_str().map(str::to_string))
         .collect::<Vec<_>>();
+    let connected_pids = clients
+        .iter()
+        .filter_map(|client| client["pid"].as_u64())
+        .collect::<Vec<_>>();
+    let open_failures = processes
+        .iter()
+        .filter(|process| !connected_pids.contains(&u64::from(process.pid)))
+        .filter_map(|process| {
+            studio_open_failure(process.pid, process.started_unix)
+                .map(|reason| (process.pid, reason))
+        })
+        .collect::<Vec<_>>();
     let verdict = verdict_text(
         !processes.is_empty(),
         plugin.as_ref(),
@@ -257,6 +363,7 @@ pub(crate) fn diagnose(clients: &[Value], project_root: Option<&Path>) -> Value 
         !clients.is_empty(),
         &open_places,
         bound.as_deref(),
+        &open_failures,
     );
     json!({
         "studioProcesses": processes.iter().map(|process| json!({
@@ -266,6 +373,7 @@ pub(crate) fn diagnose(clients: &[Value], project_root: Option<&Path>) -> Value 
         })).collect::<Vec<_>>(),
         "plugin": plugin.as_ref().map(|(path, modified)| json!({"path": path, "modifiedUnix": modified})),
         "openPlaces": open_places,
+        "openFailures": open_failures.iter().map(|(pid, reason)| json!({"pid": pid, "reason": reason})).collect::<Vec<_>>(),
         "boundTarget": bound,
         "verdict": verdict,
     })
@@ -280,7 +388,7 @@ pub(crate) fn verdict(clients: &[Value], project_root: Option<&Path>) -> String 
 
 #[cfg(test)]
 mod tests {
-    use super::{elapsed_seconds, verdict_text};
+    use super::{elapsed_seconds, open_failure_in_log, verdict_text};
 
     #[test]
     fn elapsed_seconds_reads_ps_etime() {
@@ -297,21 +405,37 @@ mod tests {
 
     #[test]
     fn verdict_names_the_blocking_condition() {
-        assert!(verdict_text(false, None, None, false, &[], None).contains("not running"));
+        assert!(verdict_text(false, None, None, false, &[], None, &[]).contains("not running"));
         assert!(
-            verdict_text(true, Some(&plugin(None)), Some(10), false, &[], None)
+            verdict_text(true, Some(&plugin(None)), Some(10), false, &[], None, &[])
                 .contains("rbx setup")
         );
         assert!(
-            verdict_text(true, Some(&plugin(Some(20))), Some(10), false, &[], None)
-                .contains("restart Studio")
+            verdict_text(
+                true,
+                Some(&plugin(Some(20))),
+                Some(10),
+                false,
+                &[],
+                None,
+                &[]
+            )
+            .contains("restart Studio")
         );
         assert!(
-            verdict_text(true, Some(&plugin(Some(5))), Some(10), false, &[], None)
-                .contains("no Renium plugin has connected")
+            verdict_text(
+                true,
+                Some(&plugin(Some(5))),
+                Some(10),
+                false,
+                &[],
+                None,
+                &[]
+            )
+            .contains("no Renium plugin has connected")
         );
         assert!(
-            verdict_text(true, Some(&plugin(Some(5))), Some(10), true, &[], None)
+            verdict_text(true, Some(&plugin(Some(5))), Some(10), true, &[], None, &[])
                 .contains("Edit session")
         );
         let open = ["Other".to_string()];
@@ -322,7 +446,40 @@ mod tests {
             true,
             &open,
             Some("E:/place.rbxl"),
+            &[],
         );
         assert!(mismatch.contains("Other") && mismatch.contains("E:/place.rbxl"));
+        let refused = verdict_text(
+            true,
+            Some(&plugin(Some(5))),
+            Some(10),
+            false,
+            &[],
+            None,
+            &[(4700, "User is not authorized to access Asset.".to_string())],
+        );
+        assert!(refused.contains("4700") && refused.contains("not authorized"));
+    }
+
+    #[test]
+    fn the_latest_open_attempt_decides_the_failure() {
+        let failed = "a,b,c,6 [telemetryLog] State: OpenPlaceLoadDataModel\r\n\
+            a,b,c,6 [telemetryLog] State: OpenPlaceFailure\r\n\
+            a,b,c,6 [telemetryLog] ErrorType: DataModelLoadingFailure\r\n\
+            a,b,c,6 [telemetryLog] ErrorMessage: User is not authorized to access Asset.\r\n";
+        assert_eq!(
+            open_failure_in_log(failed).as_deref(),
+            Some("User is not authorized to access Asset.")
+        );
+        let recovered = format!("{failed}a,b,c,6 [telemetryLog] State: OpenPlaceSuccess\n");
+        assert_eq!(open_failure_in_log(&recovered), None);
+        assert_eq!(
+            open_failure_in_log("x [telemetryLog] State: OpenPlaceFailure\n").as_deref(),
+            Some("Studio could not open the place")
+        );
+        assert_eq!(
+            open_failure_in_log("x [telemetryLog] State: PlaceIdle\n"),
+            None
+        );
     }
 }

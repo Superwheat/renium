@@ -144,6 +144,16 @@ fn api_key_secret(env_name: &str, next: &str) -> Result<String, Failure> {
     if let Some(value) = environment_value(env_name).filter(|value| !value.trim().is_empty()) {
         return Ok(value);
     }
+    // A caller that names its own variable chose that key; never substitute the
+    // stored default, which may reach other experiences.
+    if env_name != DEFAULT_KEY_ENV {
+        return Err(Failure::new(
+            "cloud_auth",
+            format!("No Open Cloud API key: {env_name} is not set"),
+            false,
+            next,
+        ));
+    }
     if let Some(secret) = stored(None)? {
         return Ok(secret);
     }
@@ -993,6 +1003,17 @@ fn bad_request(message: String) -> Failure {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_named_key_variable_never_falls_back_to_the_stored_default() {
+        let failure = super::api_key_secret("RENIUM_TEST_UNSET_SANDBOX_KEY", "cloud").unwrap_err();
+        assert!(
+            failure
+                .0
+                .m
+                .contains("RENIUM_TEST_UNSET_SANDBOX_KEY is not set")
+        );
+    }
+
     use super::*;
 
     fn identity() -> CloudIdentity {

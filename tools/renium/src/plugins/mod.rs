@@ -47,7 +47,15 @@ enum PluginCommand {
     /// Export the selected project's complete projection into a new isolated project.
     Snapshot { destination: PathBuf },
     /// Inspect process liveness without depending on a Studio bridge connection.
-    Process { pid: std::num::NonZeroU32 },
+    Process {
+        pid: std::num::NonZeroU32,
+        /// Terminate this Studio process, which must have started at --started-unix
+        #[arg(long, requires = "started_unix")]
+        terminate_studio: bool,
+        /// Start time the process reported when it was launched
+        #[arg(long)]
+        started_unix: Option<u64>,
+    },
     /// Verify that the active daemon can enforce plugin resource ownership.
     RuntimeCheck,
     /// Unregister a plugin; preserve its source, state and resource leases.
@@ -186,9 +194,11 @@ pub(crate) fn manage(args: PluginArgs) -> Result<()> {
             json!({"valid":true,"name":manifest.name,"commands":manifest.commands,"compiled":false})
         }
         PluginCommand::Snapshot { destination } => snapshot::create(&destination)?,
-        PluginCommand::Process { pid } => {
-            json!({"pid":pid.get(),"alive":renium_plugin_sdk::process::alive(pid.get())?})
-        }
+        PluginCommand::Process {
+            pid,
+            terminate_studio,
+            started_unix,
+        } => process_report(pid.get(), terminate_studio, started_unix)?,
         PluginCommand::RuntimeCheck => {
             let capabilities = crate::automation::commands::daemon_result(
                 crate::automation::op::CAP,
@@ -383,6 +393,54 @@ pub(crate) fn run(args: Vec<OsString>, project: Option<&Path>) -> Result<()> {
         .context("Plugin response omitted result")?;
     crate::app::output::print_json_output(result, false)?;
     Ok(())
+}
+
+// A PID alone can be reused; a Studio is identified by its PID and start time.
+// Studio's start time is second-granular (and derived from elapsed time on macOS).
+const START_TIME_TOLERANCE_SECONDS: u64 = 3;
+
+fn process_report(pid: u32, terminate_studio: bool, started_unix: Option<u64>) -> Result<Value> {
+    let alive = renium_plugin_sdk::process::alive(pid)?;
+    let studio = crate::studio::diagnosis::studio_processes()
+        .into_iter()
+        .find(|process| process.pid == pid);
+    let started = studio.as_ref().and_then(|process| process.started_unix);
+    let same_studio = match (started, started_unix) {
+        (Some(actual), Some(expected)) => actual.abs_diff(expected) <= START_TIME_TOLERANCE_SECONDS,
+        _ => false,
+    };
+    let mut report = json!({
+        "pid": pid,
+        "alive": alive,
+        "studio": studio.is_some(),
+        "startedUnix": started,
+    });
+    if studio.is_some()
+        && let Some(reason) = crate::studio::diagnosis::studio_open_failure(pid, started)
+    {
+        report["openFailure"] = json!(reason);
+    }
+    if terminate_studio {
+        if studio.is_none() || !same_studio {
+            bail!(
+                "Process {pid} is not the Roblox Studio that started at {}; nothing was terminated",
+                started_unix.unwrap_or_default()
+            );
+        }
+        terminate_owned_studio(pid)?;
+        report["terminated"] = json!(true);
+    }
+    Ok(report)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn terminate_owned_studio(pid: u32) -> Result<()> {
+    crate::studio::input::terminate_studio_process(pid)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn terminate_owned_studio(_pid: u32) -> Result<()> {
+    bail!("Studio termination is unsupported on this platform")
 }
 
 fn diagnostics_note(diagnostics: &str) -> String {

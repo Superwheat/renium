@@ -160,7 +160,8 @@ fn publish_with_studio_action(
                 .unwrap_or("no detail")
         )
     })?;
-    let directory = studio_log_directory().context("Studio log directory is unknown")?;
+    let directory = crate::studio::diagnosis::studio_log_directory()
+        .context("Studio log directory is unknown")?;
     let published = wait_for_studio_publish(&directory, started, STUDIO_PUBLISH_WAIT)?;
     Ok(json!({
         "ok": true,
@@ -188,20 +189,6 @@ struct StudioPublishReport {
 enum StudioPublishEvent {
     Succeeded { version: Option<u64> },
     Failed(String),
-}
-
-#[cfg(any(windows, target_os = "macos"))]
-fn studio_log_directory() -> Option<PathBuf> {
-    if cfg!(windows) {
-        std::env::var_os("LOCALAPPDATA").map(|base| PathBuf::from(base).join("Roblox").join("logs"))
-    } else {
-        std::env::var_os("HOME").map(|home| {
-            PathBuf::from(home)
-                .join("Library")
-                .join("Logs")
-                .join("Roblox")
-        })
-    }
 }
 
 #[cfg(any(windows, target_os = "macos", test))]
