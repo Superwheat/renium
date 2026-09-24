@@ -21,6 +21,7 @@
 
 ### Bug fixes
 
+- A push that adds an instance Studio refuses to create for plugin code (such as `Noise`) now names the instance and the reason instead of "Native insertion is missing an expected root".
 - Saved fields that no plugin API exposes (`Lighting.Technology`, `Workspace.StreamingMinRadius`, `Players.BanningEnabled`, `ServerScriptService.LoadStringEnabled`, `Terrain.GrassLength`, `Path2D.Transparency`, ...) now sync both ways: native captures carry them, so pulls and Live Sync reconciles compare them and correct a stale file value, and a push writes a changed one through the native property writer without an approval, as these are ordinary settings a user can change in Studio. A field that still cannot be written is returned as `unsupportedProperties` with the reason and a warning on stderr, instead of being dropped silently or failing the push as "not retained".
 - The daemon no longer deadlocks when a pull, push or property command arrives while Live Sync is applying a Studio change; every command on that daemon, including Luau runs on another Studio, used to hang until the daemon was restarted.
 - `rbx l` gives up with a timeout error once its own limit plus the Studio connection wait has passed instead of waiting up to thirty minutes for the daemon.

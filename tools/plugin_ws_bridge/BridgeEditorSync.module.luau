@@ -7883,7 +7883,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					indices[name] = nextIndex
 					instance = byName[name] and byName[name][nextIndex]
 					if instance == nil then
-						error("Native insertion is missing an expected root")
+						error(`Native insertion is missing an expected root: Studio did not create "{name}" under {group.target:GetFullName()}; a class Studio reserves for its own code (such as Noise) cannot be inserted into an open place`)
 					end
 					ordered[#ordered + 1] = instance
 				end
