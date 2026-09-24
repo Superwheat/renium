@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::Duration;
+#[cfg(any(windows, target_os = "macos", test))]
+use std::time::{Instant, SystemTime};
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::Args;
@@ -18,9 +20,9 @@ use crate::system::files::{absolutize_for_daemon, create_unique_directory};
 
 const MAX_PLACE_BYTES: u64 = 100 * 1024 * 1024;
 const PUBLISH_SECONDS: u64 = 120;
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos"))]
 const STUDIO_PUBLISH_ACTION: &str = "publishToRobloxAction";
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos"))]
 const STUDIO_PUBLISH_WAIT: Duration = Duration::from_secs(600);
 
 #[derive(Args)]
@@ -188,7 +190,7 @@ enum StudioPublishEvent {
     Failed(String),
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos"))]
 fn studio_log_directory() -> Option<PathBuf> {
     if cfg!(windows) {
         std::env::var_os("LOCALAPPDATA").map(|base| PathBuf::from(base).join("Roblox").join("logs"))
