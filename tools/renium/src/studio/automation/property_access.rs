@@ -163,6 +163,7 @@ fn value_text(value: &Value) -> Result<String> {
 
 /// Studio text for a stored value, as the native property writer takes it.
 /// Stores keep integers as floats, so an integer field gets integer text.
+#[cfg(any(windows, target_os = "macos", test))]
 pub(crate) fn saved_field_text(value: &Value, class_name: &str, property: &str) -> Result<String> {
     match value {
         Value::Number(number) => {
