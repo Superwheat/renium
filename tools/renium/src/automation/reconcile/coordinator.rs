@@ -20,6 +20,9 @@ pub(crate) struct PairSetup {
     pub(crate) local_file_digest: Option<String>,
     pub(crate) bootstrap_studio_from_editor: bool,
     pub(crate) runtime_replacement_unproven: bool,
+    /// Project paths edited while the reconcile ran. Studio has not received
+    /// them, so Live Sync keeps them pending instead of absorbing them.
+    pub(crate) unsynced_paths: Vec<PathBuf>,
 }
 
 #[derive(Default)]
@@ -202,6 +205,7 @@ impl Coordinator {
             local_file_digest: current_local_file_digest,
             bootstrap_studio_from_editor,
             runtime_replacement_unproven,
+            unsynced_paths: Vec::new(),
         })
     }
 
@@ -346,6 +350,7 @@ impl Coordinator {
         log_reconcile_timing("side comparison", phase);
         if sides_match {
             let phase = Instant::now();
+            setup.unsynced_paths = unsynced_project_paths(context, &publish_paths, &editor)?.0;
             let baseline_matches = record
                 .baseline
                 .as_ref()
@@ -477,7 +482,14 @@ impl Coordinator {
         log_reconcile_timing("push plan", phase);
         let _readback = if push_plan.is_empty() {
             if !changes.editor.is_empty() {
-                publish_captured_studio(context, bridge, stage, &studio_guard)?;
+                publish_captured_studio(
+                    context,
+                    bridge,
+                    stage,
+                    &studio_guard,
+                    &changes.editor,
+                    &editor,
+                )?;
             }
             studio
         } else {
@@ -501,9 +513,14 @@ impl Coordinator {
                     guard: Some(&studio_guard),
                     args: automation_push_args(context, &json!({}), false)?,
                     expected_project: Some(&editor),
+                    later_edits_follow: true,
                 },
             )?
             .generated;
+            // Studio now holds the project's content for these paths. Record
+            // that before anything else can fail, or the next reconcile would
+            // mistake Renium's own push for a Studio edit and report a conflict.
+            record_pushed_baseline(context, &setup.key, &mut record, &changes.studio, &editor)?;
             let generated_paths = generated.entries.keys().cloned().collect::<HashSet<_>>();
             if !generated_paths.is_empty() {
                 apply_snapshot_paths(&stage.project_root, &generated_paths, &generated)?;
@@ -570,14 +587,15 @@ impl Coordinator {
                 }
             }
             if !changes.editor.is_empty() {
-                readback_stage.publish(Path::new(&context.root), false)?;
+                publish_studio_paths(context, readback_stage, &changes.editor, &editor)?;
             }
             log_reconcile_timing("readback verification", phase);
             readback
         };
 
         let phase = Instant::now();
-        let baseline = capture_snapshot(Path::new(&context.root), &publish_paths)?;
+        let (baseline, unsynced) = synchronized_baseline(context, &publish_paths, &merged)?;
+        setup.unsynced_paths = unsynced;
         if let Some(history) = sync_history {
             // Readback publication can normalize generated settings. Guard undo
             // against those accepted file bytes, not the earlier staged bytes.
@@ -653,6 +671,7 @@ impl Coordinator {
             local_file_digest: current_local_file_digest,
             bootstrap_studio_from_editor: false,
             runtime_replacement_unproven: false,
+            unsynced_paths: Vec::new(),
         })
     }
 
@@ -904,6 +923,7 @@ impl Coordinator {
                 guard,
                 args: automation_push_args(context, &json!({}), false)?,
                 expected_project: None,
+                later_edits_follow: false,
             },
         )?;
         summary.insert(
@@ -1008,4 +1028,79 @@ impl Coordinator {
             owners.by_target.remove(&target);
         }
     }
+}
+
+// Files edited while a reconcile ran differ from the state it synchronized.
+// Returns those paths and the project as it is now.
+fn unsynced_project_paths(
+    context: &BoundContext,
+    publish_paths: &[PathBuf],
+    synchronized: &ProjectSnapshot,
+) -> Result<(Vec<PathBuf>, ProjectSnapshot)> {
+    let current = capture_snapshot(Path::new(&context.root), publish_paths)?;
+    let mut paths = snapshot_differences(synchronized, &current)?
+        .into_iter()
+        .collect::<Vec<_>>();
+    paths.sort();
+    if !paths.is_empty() {
+        log_global(
+            5,
+            format_args!(
+                "[renium] reconcile kept pending edits made during it: {}",
+                paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
+    }
+    Ok((paths, current))
+}
+
+// The project as it is now, except that files edited during the reconcile
+// keep the content it synchronized, so Live Sync still pushes those edits.
+fn synchronized_baseline(
+    context: &BoundContext,
+    publish_paths: &[PathBuf],
+    synchronized: &ProjectSnapshot,
+) -> Result<(ProjectSnapshot, Vec<PathBuf>)> {
+    let (unsynced, mut baseline) = unsynced_project_paths(context, publish_paths, synchronized)?;
+    for path in &unsynced {
+        match synchronized.entries.get(path) {
+            Some(entry) => {
+                baseline.entries.insert(path.clone(), entry.clone());
+            }
+            None => {
+                baseline.entries.remove(path);
+            }
+        }
+    }
+    Ok((baseline, unsynced))
+}
+
+fn record_pushed_baseline(
+    context: &BoundContext,
+    key: &str,
+    record: &mut PairRecord,
+    pushed: &HashSet<PathBuf>,
+    editor: &ProjectSnapshot,
+) -> Result<()> {
+    let Some(baseline) = record.baseline.as_mut() else {
+        return Ok(());
+    };
+    if pushed.is_empty() {
+        return Ok(());
+    }
+    let scopes = pushed.iter().cloned().collect::<Vec<_>>();
+    let pushed_content = ProjectSnapshot {
+        entries: editor
+            .entries
+            .iter()
+            .filter(|(path, _)| scopes.iter().any(|scope| path.starts_with(scope)))
+            .map(|(path, entry)| (path.clone(), entry.clone()))
+            .collect(),
+    };
+    baseline.replace_scopes(Path::new(&context.root), key, &scopes, &pushed_content)?;
+    write_record(context, key, record)
 }

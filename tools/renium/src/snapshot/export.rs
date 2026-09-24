@@ -319,6 +319,34 @@ impl ExportProjectStage {
         &self.publish_paths
     }
 
+    /// Narrows publication to these project paths. Files outside them keep
+    /// whatever the project holds, including edits made during the export.
+    pub(crate) fn restrict_publish_paths(&mut self, paths: &HashSet<PathBuf>) {
+        let mut kept = paths
+            .iter()
+            .filter(|path| {
+                self.publish_paths
+                    .iter()
+                    .any(|scope| path.starts_with(scope))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        normalize_owned_paths(&mut kept);
+        self.publish_baseline
+            .retain(|path, _| kept.iter().any(|scope| path.starts_with(scope)));
+        self.publish_paths = kept;
+    }
+
+    /// Treats the project's current content at these paths as already
+    /// accounted for, after the stage has taken those edits into its copy.
+    pub(crate) fn accept_project_changes(
+        &mut self,
+        project_root: &Path,
+        paths: &[PathBuf],
+    ) -> Result<()> {
+        refresh_publish_hashes(project_root, &mut self.publish_baseline, paths)
+    }
+
     pub(crate) fn capture_publish_baseline(&mut self, project_root: &Path) -> Result<()> {
         self.publish_baseline = collect_publish_hashes(project_root, &self.publish_paths)?;
         Ok(())
@@ -2460,6 +2488,38 @@ mod publication_tests {
         assert_eq!(
             fs::read_to_string(fixture.root.join(SOURCE)).unwrap(),
             "return 'original'\n"
+        );
+    }
+
+    #[test]
+    fn restricted_publication_keeps_concurrent_edits_outside_its_paths() {
+        let mut fixture = Fixture::new();
+        let mut stage = fixture.stage.take().unwrap();
+        let outside = PathBuf::from("src/ReplicatedStorage/Outside.luau");
+        fs::write(fixture.root.join(&outside), "concurrent new file").unwrap();
+        stage.restrict_publish_paths(&HashSet::from([PathBuf::from(SOURCE)]));
+        stage.publish(&fixture.root, false).unwrap();
+        assert_eq!(
+            fs::read_to_string(fixture.root.join(SOURCE)).unwrap(),
+            "return 'captured'\n"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.root.join(outside)).unwrap(),
+            "concurrent new file"
+        );
+    }
+
+    #[test]
+    fn restricted_publication_still_refuses_a_concurrent_edit_it_would_overwrite() {
+        let mut fixture = Fixture::new();
+        let mut stage = fixture.stage.take().unwrap();
+        fs::write(fixture.root.join(SOURCE), "return 'edited meanwhile'\n").unwrap();
+        stage.restrict_publish_paths(&HashSet::from([PathBuf::from(SOURCE)]));
+        let error = stage.publish(&fixture.root, false).err().unwrap();
+        assert!(error.to_string().contains("Project files changed"));
+        assert_eq!(
+            fs::read_to_string(fixture.root.join(SOURCE)).unwrap(),
+            "return 'edited meanwhile'\n"
         );
     }
 

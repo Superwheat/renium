@@ -23,6 +23,9 @@
 
 ### Bug fixes
 
+- Several agents or editors working in one project while Studio also changes no longer get "changed on both sides" reviews for files only one of them edited. A reconcile that pushed to Studio and then failed used to leave its own push looking like a Studio edit, and the next reconcile reported every pushed file as a conflict.
+- Files edited while Live Sync reconciled now reach Studio. The reconcile used to record them as already synchronized, so those edits stayed only in the files.
+- Live Sync keeps working while files change continuously. A reconcile or Studio pull that races a file edit retries quietly instead of failing with "Project files changed while Studio export was running", and a store Studio changed is merged with edits made to other instances in it meanwhile.
 - A push into a place whose service roots lack the project's attributes (for example a fresh or empty place) no longer fails with "Studio did not retain native supplemental properties"; service-root attributes are now written after the native import, which applies only their properties.
 - Commands run by a plugin that holds a Studio place lease no longer fail with "The running daemon did not confirm exclusive Studio ownership"; the daemon now confirms the lease after verifying it against the place.
 - `rbx oc --key-env NAME` no longer falls back to the stored default key when `NAME` is unset; only the default `ROBLOX_API_KEY` does, so a caller that names its own key never runs with another one.

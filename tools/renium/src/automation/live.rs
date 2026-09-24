@@ -979,7 +979,11 @@ impl Manager {
         let current = scan(&project)?;
         log_live_timing("startup filesystem scan", phase);
         let phase = Instant::now();
-        let baseline = current.clone();
+        let mut baseline = current.clone();
+        // Files edited while the startup reconcile ran start out pending.
+        for path in &setup.unsynced_paths {
+            baseline.remove(&absolute(path.clone(), &project.root));
+        }
         log_live_timing("startup baseline clone", phase);
         let control = Arc::new(Control::new(
             PathBuf::from(&context.root),
@@ -2517,6 +2521,7 @@ struct LiveLoop {
     rescan_pending: bool,
     reconcile_retry: Option<Instant>,
     reconcile_retry_delay: Duration,
+    concurrent_edit_retries: u32,
 }
 
 impl LiveLoop {
@@ -2563,6 +2568,7 @@ impl LiveLoop {
             rescan_pending: false,
             reconcile_retry: None,
             reconcile_retry_delay: Duration::ZERO,
+            concurrent_edit_retries: 0,
         })
     }
 
@@ -2722,16 +2728,45 @@ impl LiveLoop {
                 self.baseline = scan(&self.project)?;
                 self.pending.clear();
                 self.blocked.clear();
+                // Files edited while the reconcile ran are not in Studio yet.
+                // Dropping them from the stamp baseline keeps later watcher
+                // events for them from counting as already synchronized.
+                for path in &setup.unsynced_paths {
+                    let path = absolute(path.clone(), &self.project.root);
+                    self.baseline.remove(&path);
+                    self.pending.insert(path);
+                }
                 self.control.update_pending(&self.pending);
-                self.push_ready = false;
+                self.push_ready = !self.pending.is_empty();
                 self.studio.pending_payload = None;
                 self.studio.pull_ready = true;
                 self.last_event = Instant::now();
                 self.reconcile_retry = None;
                 self.reconcile_retry_delay = Duration::ZERO;
+                self.concurrent_edit_retries = 0;
             }
             Err(error) if automation_failure_ref(&error).0.c == "no_studio" => return Err(error),
+            // Project files changed under a reconcile that was already
+            // running. That is ordinary activity, not a failure: try again
+            // shortly with the newer files and only report it if it persists.
+            Err(error)
+                if is_concurrent_edit_failure(&error)
+                    && self.concurrent_edit_retries < CONCURRENT_EDIT_RETRY_LIMIT =>
+            {
+                self.concurrent_edit_retries += 1;
+                log_global(
+                    5,
+                    format_args!(
+                        "[renium] reconcile retry {} after concurrent edits: {error:#}",
+                        self.concurrent_edit_retries
+                    ),
+                );
+                self.push_ready = false;
+                self.rescan_pending = true;
+                self.reconcile_retry = Some(Instant::now() + CONCURRENT_EDIT_RETRY_DELAY);
+            }
             Err(error) => {
+                self.concurrent_edit_retries = 0;
                 self.control.set_mode(PairMode::Verify);
                 self.control.fail(format!(
                     "Live sync could not reconcile concurrent changes: {error:#}"
@@ -3165,6 +3200,13 @@ impl LiveLoop {
         if failure.0.c == "no_studio" {
             return Err(error);
         }
+        // A project file changed while Studio's side was exported. Those
+        // edits are pending pushes; the next pass reconciles both sides.
+        if is_concurrent_edit_failure(&error) {
+            self.studio.pull_ready = true;
+            self.studio.retry_delay = CONCURRENT_EDIT_RETRY_DELAY;
+            return Ok(());
+        }
         let retry = failure.0.rt == 1;
         self.control
             .fail(format!("Studio live sync failed: {}", failure.0.m));
@@ -3246,9 +3288,43 @@ fn run(worker: Worker) -> Result<()> {
     LiveLoop::new(worker)?.run()
 }
 
+const CONCURRENT_EDIT_RETRY_LIMIT: u32 = 20;
+const CONCURRENT_EDIT_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+fn is_concurrent_edit_failure(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}");
+    message.contains("changed while")
+        && (message.contains("retry the sync") || message.contains("retry without overwriting"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edits_racing_a_reconcile_are_retried_quietly_and_real_failures_are_not() {
+        for message in [
+            "Project file src/A.luau changed while its Studio update was being prepared; retry the sync",
+            "Project files changed while Studio export was running; retry without overwriting: instances/Workspace.renium",
+            "Project files changed while Studio recovery was being captured; retry the sync",
+            "Project store instances/Workspace.renium changed while Studio changes to the same instances were being applied; retry the sync",
+        ] {
+            assert!(
+                is_concurrent_edit_failure(&anyhow::anyhow!(message)),
+                "{message}"
+            );
+        }
+        for message in [
+            "Studio did not retain the reconciled project state: src/A.luau",
+            "Sync needs review: src/A.luau changed on both sides",
+            "Studio changed Workspace while native import was staged; retry the sync",
+        ] {
+            assert!(
+                !is_concurrent_edit_failure(&anyhow::anyhow!(message)),
+                "{message}"
+            );
+        }
+    }
 
     fn test_control() -> Arc<Control> {
         Arc::new(Control::new(

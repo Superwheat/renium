@@ -365,21 +365,102 @@ pub(crate) fn studio_states_share_epoch(
     })
 }
 
+// Only the paths Studio contributed are published, so a project file edited
+// meanwhile elsewhere is neither overwritten nor a reason to fail.
 pub(crate) fn publish_captured_studio(
     context: &BoundContext,
     bridge: &BridgeServer,
     stage: ExportProjectStage,
     guard: &StudioChangeGuard,
+    studio_paths: &HashSet<PathBuf>,
+    captured_project: &ProjectSnapshot,
 ) -> Result<()> {
     let confirmed = read_studio_change_state(context, bridge)?;
-    if studio_guard_matches_state(context, guard, &confirmed) {
-        stage.publish(Path::new(&context.root), false)?;
+    let stage = if studio_guard_matches_state(context, guard, &confirmed) {
+        stage
     } else {
-        capture_studio_project(context, bridge)?
-            .0
-            .publish(Path::new(&context.root), false)?;
-    }
+        capture_studio_project(context, bridge)?.0
+    };
+    publish_studio_paths(context, stage, studio_paths, captured_project)
+}
+
+pub(crate) fn publish_studio_paths(
+    context: &BoundContext,
+    mut stage: ExportProjectStage,
+    studio_paths: &HashSet<PathBuf>,
+    captured_project: &ProjectSnapshot,
+) -> Result<()> {
+    stage.restrict_publish_paths(studio_paths);
+    carry_project_edits_into_stage(context, &mut stage, studio_paths, captured_project)?;
+    stage.publish(Path::new(&context.root), false)?;
     Ok(())
+}
+
+// A service store Studio changed may also have been edited in the project
+// since the capture, for example another instance in the same service. Both
+// sides' instance edits are kept. Any other file edited on both sides waits
+// for the next reconcile, which reports a real conflict if one remains.
+fn carry_project_edits_into_stage(
+    context: &BoundContext,
+    stage: &mut ExportProjectStage,
+    studio_paths: &HashSet<PathBuf>,
+    captured_project: &ProjectSnapshot,
+) -> Result<()> {
+    let root = Path::new(&context.root);
+    let mut paths = studio_paths.iter().cloned().collect::<Vec<_>>();
+    paths.sort();
+    let current = capture_snapshot(root, &paths)?;
+    let mut carried = Vec::new();
+    for path in &paths {
+        let captured = captured_project.entries.get(path);
+        let now = current.entries.get(path);
+        if captured == now {
+            continue;
+        }
+        let is_store = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_service_settings_file_name);
+        let (Some(captured), Some(now), true) = (captured, now, is_store) else {
+            bail!(
+                "Project file {} changed while Studio changes were being applied; retry the sync",
+                path.display()
+            );
+        };
+        let single = |entry: &SnapshotEntry| ProjectSnapshot {
+            entries: BTreeMap::from([(path.clone(), entry.clone())]),
+        };
+        let studio = capture_snapshot(&stage.project_root, std::slice::from_ref(path))?;
+        let (merged, conflicts, _) = merge_snapshots_with_changes(
+            Some(&single(captured)),
+            &single(now),
+            &studio,
+            ConflictPreference::None,
+            None,
+        )?;
+        if !conflicts.is_empty() {
+            bail!(
+                "Project store {} changed while Studio changes to the same instances were being applied; retry the sync",
+                path.display()
+            );
+        }
+        apply_snapshot_paths(&stage.project_root, &HashSet::from([path.clone()]), &merged)?;
+        carried.push(path.clone());
+    }
+    if !carried.is_empty() {
+        log_global(
+            5,
+            format_args!(
+                "[renium] reconcile kept project edits in Studio-changed stores: {}",
+                carried
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
+    }
+    stage.accept_project_changes(root, &carried)
 }
 
 pub(crate) fn capture_studio_project(
@@ -481,15 +562,26 @@ pub(crate) fn capture_changed_studio_services(
     if !studio_states_share_epoch(context, initial_state, &confirmed) {
         return Ok(None);
     }
+    // Files edited while Studio was captured are compared at their latest
+    // content. The stage keeps Studio's captured scopes and takes the rest
+    // from the project, so a busy project does not keep failing this capture.
     let current_editor = capture_snapshot(root, stage.publish_paths())?;
     if editor != current_editor {
-        bail!("Project files changed while Studio recovery was being captured; retry the sync");
+        let refreshed = current_editor
+            .entries
+            .keys()
+            .chain(editor.entries.keys())
+            .filter(|path| editor.entries.get(*path) != current_editor.entries.get(*path))
+            .filter(|path| !scopes.iter().any(|scope| path.starts_with(scope)))
+            .cloned()
+            .collect::<HashSet<_>>();
+        apply_snapshot_paths(&stage.project_root, &refreshed, &current_editor)?;
     }
     log_global(
         5,
         format_args!("[renium] selective Studio capture: {}", services.join(",")),
     );
-    Ok(Some((stage, studio, editor)))
+    Ok(Some((stage, studio, current_editor)))
 }
 
 pub(crate) fn project_comparison_stage(

@@ -325,6 +325,7 @@ pub(crate) fn push_project(
             guard: Some(&guard),
             args: push_args,
             expected_project: Some(&project),
+            later_edits_follow: false,
         },
     )?;
     pushed.summary.insert(

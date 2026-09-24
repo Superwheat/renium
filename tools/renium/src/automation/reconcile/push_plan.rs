@@ -73,6 +73,9 @@ pub(crate) struct StagedPushRequest<'a> {
     pub(crate) guard: Option<&'a StudioChangeGuard>,
     pub(crate) args: PushEditorChangesArgs,
     pub(crate) expected_project: Option<&'a ProjectSnapshot>,
+    /// Live Sync keeps later edits pending and pushes them next, so a file
+    /// edited during this push is not a reason to refuse it.
+    pub(crate) later_edits_follow: bool,
 }
 
 pub(crate) fn push_staged_project(
@@ -87,6 +90,7 @@ pub(crate) fn push_staged_project(
         guard,
         args: mut push_args,
         expected_project,
+        later_edits_follow,
     } = request;
     if plan.is_empty() {
         return Ok(StagedPushResult {
@@ -99,40 +103,41 @@ pub(crate) fn push_staged_project(
         .into_iter()
         .filter(|path| !changed_paths.contains(path))
         .collect::<Vec<_>>();
-    if !supporting_paths.is_empty() {
+    // A reconcile pushes the project as it captured it; the stage already
+    // holds that supporting data, and later edits stay pending in Live Sync.
+    if !supporting_paths.is_empty() && expected_project.is_none() {
         let root = Path::new(&context.root);
-        let staged = expected_project
-            .is_none()
-            .then(|| capture_snapshot(&stage.project_root, &supporting_paths))
-            .transpose()?;
+        let staged = capture_snapshot(&stage.project_root, &supporting_paths)?;
         let current = capture_snapshot(root, &supporting_paths)?;
         let supporting_paths = supporting_paths.into_iter().collect::<HashSet<_>>();
-        let differences = if let Some(expected_project) = expected_project {
-            snapshot_path_differences(expected_project, &current, &supporting_paths)?
-        } else {
-            snapshot_path_differences(
-                staged.as_ref().expect("staged snapshot exists"),
-                &current,
-                &supporting_paths,
-            )?
-        };
+        let differences = snapshot_path_differences(&staged, &current, &supporting_paths)?;
         if !differences.is_empty() {
             bail!(
                 "Supporting project data {} changed while its Studio update was being prepared; retry the sync",
                 root.join(&differences[0]).display()
             );
         }
-        if expected_project.is_none() {
-            apply_snapshot_paths(&stage.project_root, &supporting_paths, &current)?;
-        }
+        apply_snapshot_paths(&stage.project_root, &supporting_paths, &current)?;
     }
     let project_root = push_args.project.project_root.clone();
+    let planned_paths = plan.changed_paths.clone();
+    // Only the files this push sends matter here. Edits elsewhere in the
+    // project stay pending in Live Sync and follow once this push lands.
     let validate_project = || -> Result<()> {
-        let Some(expected_project) = expected_project else {
+        let Some(expected_project) = expected_project.filter(|_| !later_edits_follow) else {
             return Ok(());
         };
-        let current = capture_snapshot(&project_root, stage.publish_paths())?;
-        let differences = snapshot_differences(expected_project, &current)?;
+        let current = capture_snapshot(&project_root, &planned_paths)?;
+        let planned = planned_paths.iter().cloned().collect::<HashSet<_>>();
+        let expected = ProjectSnapshot {
+            entries: expected_project
+                .entries
+                .iter()
+                .filter(|(path, _)| planned.iter().any(|scope| path.starts_with(scope)))
+                .map(|(path, entry)| (path.clone(), entry.clone()))
+                .collect(),
+        };
+        let differences = snapshot_differences(&expected, &current)?;
         if let Some(changed) = differences.iter().next() {
             bail!(
                 "Project file {} changed while its Studio update was being prepared; retry the sync",
