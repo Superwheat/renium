@@ -2695,11 +2695,7 @@ pub(crate) fn plugin_accesses_property_natively(
 ) -> bool {
     matches!(name, "DistanceAttenuation" | "AngleAttenuation")
         && (crate::rbx::decode::rbx_reflection_class_is_a(database, class_name, "AudioEmitter")
-            || crate::rbx::decode::rbx_reflection_class_is_a(
-                database,
-                class_name,
-                "AudioListener",
-            ))
+            || crate::rbx::decode::rbx_reflection_class_is_a(database, class_name, "AudioListener"))
 }
 
 pub(crate) fn reconciliation_property_is_unreadable(
@@ -4994,7 +4990,9 @@ mod never_serialized_properties {
         let database = rbx_reflection_database::get().unwrap();
         for class_name in ["AudioEmitter", "AudioListener"] {
             for name in ["DistanceAttenuation", "AngleAttenuation"] {
-                assert!(!reconciliation_property_is_unreadable(database, class_name, name));
+                assert!(!reconciliation_property_is_unreadable(
+                    database, class_name, name
+                ));
                 assert!(!reconciliation_property_is_unknown_when_absent(
                     Some(database),
                     class_name,
@@ -5002,8 +5000,16 @@ mod never_serialized_properties {
                 ));
             }
         }
-        assert!(reconciliation_property_is_unreadable(database, "Terrain", "SmoothGrid"));
-        assert!(!plugin_accesses_property_natively(database, "Part", "DistanceAttenuation"));
+        assert!(reconciliation_property_is_unreadable(
+            database,
+            "Terrain",
+            "SmoothGrid"
+        ));
+        assert!(!plugin_accesses_property_natively(
+            database,
+            "Part",
+            "DistanceAttenuation"
+        ));
     }
 
     #[test]

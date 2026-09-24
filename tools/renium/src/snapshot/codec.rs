@@ -757,13 +757,20 @@ mod compact_v5_binary_string_tests {
         let strings = vec![String::from("plain")];
         let enums = EnumValueNameMap::default();
         assert_eq!(
-            decode_compact_v5_value(TYPE_ID_BINARY_STRING, None, json!(1), &strings, &enums).unwrap(),
+            decode_compact_v5_value(TYPE_ID_BINARY_STRING, None, json!(1), &strings, &enums)
+                .unwrap(),
             json!("plain")
         );
         let payload = json!({"_type": "BinaryString", "base64": "AAAAIEEAAIA/"});
         assert_eq!(
-            decode_compact_v5_value(TYPE_ID_BINARY_STRING, None, payload.clone(), &strings, &enums)
-                .unwrap(),
+            decode_compact_v5_value(
+                TYPE_ID_BINARY_STRING,
+                None,
+                payload.clone(),
+                &strings,
+                &enums
+            )
+            .unwrap(),
             payload
         );
         assert!(decode_compact_v5_value(TYPE_ID_STRING, None, payload, &strings, &enums).is_err());

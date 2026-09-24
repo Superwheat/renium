@@ -69,7 +69,10 @@ fn send_on_stream(stream: &TcpStream, request: &super::Request) -> Result<super:
 const LUAU_QUEUE_MARGIN: Duration = Duration::from_secs(25);
 
 fn luau_response_limit(parameters: &serde_json::Value) -> Duration {
-    let timeout = parameters["timeout"].as_f64().unwrap_or(10.0).clamp(0.1, 120.0);
+    let timeout = parameters["timeout"]
+        .as_f64()
+        .unwrap_or(10.0)
+        .clamp(0.1, 120.0);
     let bridge_wait = parameters["bridgeWaitSeconds"]
         .as_f64()
         .unwrap_or(8.0)

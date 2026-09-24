@@ -203,7 +203,8 @@ pub(crate) fn native_unscriptable_root_fields<'a>(
     }
     for (property_name, variant) in property_entries {
         let name = property_name.as_str();
-        let logical = crate::rbx::encode::rbx_logical_property_name(database, class_name, name).unwrap_or(name);
+        let logical = crate::rbx::encode::rbx_logical_property_name(database, class_name, name)
+            .unwrap_or(name);
         let Some(descriptor) = rbx_property_descriptor(database, class_name, logical) else {
             continue;
         };
@@ -254,10 +255,10 @@ pub(crate) fn native_property_filter(
     if let Some(class) = database.classes.get(class_name) {
         for descriptor in database.superclasses_iter(class) {
             for property in descriptor.properties.values() {
-                if !native_property_descriptor_supported(property)
-                    && !(keeps_unscriptable
-                        && native_unscriptable_root_descriptor_supported(property))
-                {
+                let supported = native_property_descriptor_supported(property)
+                    || keeps_unscriptable
+                        && native_unscriptable_root_descriptor_supported(property);
+                if !supported {
                     continue;
                 }
                 match &property.kind {

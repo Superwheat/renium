@@ -2278,12 +2278,7 @@ fn warn_unsupported_properties(summary: &Map<String, Value>) {
     let names = summary
         .get("unsupportedProperties")
         .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-        })
+        .map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>())
         .unwrap_or_default();
     if names.is_empty() {
         return;

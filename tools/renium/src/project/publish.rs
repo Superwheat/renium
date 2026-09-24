@@ -18,7 +18,9 @@ use crate::system::files::{absolutize_for_daemon, create_unique_directory};
 
 const MAX_PLACE_BYTES: u64 = 100 * 1024 * 1024;
 const PUBLISH_SECONDS: u64 = 120;
+#[cfg(any(windows, target_os = "macos", test))]
 const STUDIO_PUBLISH_ACTION: &str = "publishToRobloxAction";
+#[cfg(any(windows, target_os = "macos", test))]
 const STUDIO_PUBLISH_WAIT: Duration = Duration::from_secs(600);
 
 #[derive(Args)]
@@ -119,6 +121,19 @@ fn save_place_api_refused(message: &str) -> bool {
     message.contains("Save Place API") || message.contains("SavePlace")
 }
 
+#[cfg(not(any(windows, target_os = "macos")))]
+fn publish_with_studio_action(
+    _context: &BoundContext,
+    _bridge: &BridgeServer,
+    _runtime: &str,
+    plugin_result: &Value,
+) -> Result<Value> {
+    bail!(
+        "Studio refused SavePlaceAsync ({plugin_result}) and its Publish command cannot be run on this platform"
+    )
+}
+
+#[cfg(any(windows, target_os = "macos"))]
 fn publish_with_studio_action(
     context: &BoundContext,
     bridge: &BridgeServer,
@@ -161,16 +176,19 @@ fn publish_with_studio_action(
     }))
 }
 
+#[cfg(any(windows, target_os = "macos", test))]
 struct StudioPublishReport {
     version: Option<u64>,
 }
 
+#[cfg(any(windows, target_os = "macos", test))]
 #[derive(Debug, PartialEq, Eq)]
 enum StudioPublishEvent {
     Succeeded { version: Option<u64> },
     Failed(String),
 }
 
+#[cfg(any(windows, target_os = "macos", test))]
 fn studio_log_directory() -> Option<PathBuf> {
     if cfg!(windows) {
         std::env::var_os("LOCALAPPDATA").map(|base| PathBuf::from(base).join("Roblox").join("logs"))
@@ -184,6 +202,7 @@ fn studio_log_directory() -> Option<PathBuf> {
     }
 }
 
+#[cfg(any(windows, target_os = "macos", test))]
 // Studio writes `2026-09-22T13:15:11.403Z,...,Info [FLog::CreatorOutput] Place published.`
 // lines; only lines stamped after the command was triggered count.
 fn studio_publish_event(line: &str, since: SystemTime) -> Option<StudioPublishEvent> {
@@ -216,6 +235,7 @@ fn studio_publish_event(line: &str, since: SystemTime) -> Option<StudioPublishEv
     None
 }
 
+#[cfg(any(windows, target_os = "macos", test))]
 fn humantime_parse(stamp: &str) -> Option<SystemTime> {
     let stamp = stamp.strip_suffix('Z')?;
     let (date, time) = stamp.split_once('T')?;
@@ -257,6 +277,7 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
+#[cfg(any(windows, target_os = "macos", test))]
 fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let year = if month <= 2 { year - 1 } else { year };
     let era = if year >= 0 { year } else { year - 399 } / 400;
@@ -267,6 +288,7 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     era * 146_097 + day_of_era - 719_468
 }
 
+#[cfg(any(windows, target_os = "macos", test))]
 // Windows leaves a log's modified time stale while Studio holds it open, so
 // every Studio log is read and only the timestamps inside the lines decide.
 fn wait_for_studio_publish(
