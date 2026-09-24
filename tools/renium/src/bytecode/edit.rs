@@ -53,6 +53,7 @@ fn canonical_new_instance_properties(
         else {
             bail!("Property {name} does not exist on {class_name}; use -a for an attribute");
         };
+        let value = crate::rbx::encode::typed_store_property_value(class_name, logical, value)?;
         out.insert(logical.to_string(), value);
     }
     Ok(out)

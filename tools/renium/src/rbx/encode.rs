@@ -925,6 +925,66 @@ pub(crate) fn normalize_project_typed_value(
         .context("Roblox property literal isn't supported by Renium")
 }
 
+/// Store writes keep composite property values in their typed form. A bare
+/// `{x,y,z}` for a Vector3 would reach Studio as a table and fail every push.
+pub(crate) fn typed_store_property_value(
+    class_name: &str,
+    property_name: &str,
+    value: Value,
+) -> Result<Value> {
+    let database =
+        rbx_reflection_database::get().context("Roblox reflection database is unavailable")?;
+    let Some(descriptor) = rbx_property_descriptor(database, class_name, property_name) else {
+        return Ok(value);
+    };
+    let RbxDataType::Value(value_type) = &descriptor.data_type else {
+        return Ok(value);
+    };
+    let value_type = *value_type;
+    if value.is_null() || !is_composite_value_type(value_type) {
+        return Ok(value);
+    }
+    json_to_rbx_variant_for_type(&value, value_type, database, &Default::default())
+        .and_then(|variant| {
+            rbx_variant_to_persisted_settings_json(
+                &variant,
+                Some(descriptor),
+                database,
+                &Default::default(),
+            )
+        })
+        .with_context(|| {
+            format!(
+                "{property_name} needs a {value_type:?} value, got {value}; `rbx bg` shows the stored form"
+            )
+        })
+}
+
+fn is_composite_value_type(value_type: RbxVariantType) -> bool {
+    matches!(
+        value_type,
+        RbxVariantType::Vector2
+            | RbxVariantType::Vector3
+            | RbxVariantType::Vector2int16
+            | RbxVariantType::Vector3int16
+            | RbxVariantType::UDim
+            | RbxVariantType::UDim2
+            | RbxVariantType::Color3
+            | RbxVariantType::Color3uint8
+            | RbxVariantType::CFrame
+            | RbxVariantType::OptionalCFrame
+            | RbxVariantType::Rect
+            | RbxVariantType::NumberRange
+            | RbxVariantType::NumberSequence
+            | RbxVariantType::ColorSequence
+            | RbxVariantType::PhysicalProperties
+            | RbxVariantType::Font
+            | RbxVariantType::Axes
+            | RbxVariantType::Faces
+            | RbxVariantType::Ray
+    )
+}
+
 fn json_attributes_to_rbx(
     attributes: &Map<String, Value>,
     database: &ReflectionDatabase<'_>,

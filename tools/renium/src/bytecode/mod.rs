@@ -1716,6 +1716,11 @@ pub(super) fn bytecode_set_property(args: BytecodeSetPropertyArgs) -> Result<()>
         document.instances[index].properties.retain(|name, _| {
             name == logical_property || !name.eq_ignore_ascii_case(logical_property)
         });
+        value = crate::rbx::encode::typed_store_property_value(
+            &document.instances[index].class_name,
+            logical_property,
+            value,
+        )?;
     }
     let moved_indices = structural_reference_update.then(|| {
         let children = settings_children_by_parent(&document);

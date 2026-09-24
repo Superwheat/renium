@@ -1593,6 +1593,53 @@ fn ordinary_remove_rejects_package_bearing_instances_and_links() {
     let _ = fs::remove_dir_all(project_root);
 }
 
+#[test]
+fn store_writes_keep_composite_property_values_typed() {
+    let project_root = temp_dir("typed-store-values");
+    let service_dir = project_root.join("src").join("Workspace");
+    fs::create_dir_all(&service_dir).unwrap();
+    let settings_path = service_settings_path(&service_dir);
+    settings_document(vec![
+        settings_instance("root", "Workspace", "Workspace", None),
+        settings_instance("step", "Step", "Part", Some(0)),
+    ])
+    .write_file(&settings_path)
+    .unwrap();
+    let set = |property: &str, value: &str| {
+        bytecode_set_property(BytecodeSetPropertyArgs {
+            input: BytecodeFileArgs::settings_file(settings_path.clone()),
+            selector: BytecodeInstanceSelectorArgs::by_settings_id(Some("step".into())),
+            property: property.to_string(),
+            value_json: Some(value.to_string()),
+            value_str: None,
+            value_num: None,
+            value_bool: None,
+            value_null: false,
+            scope: "auto".to_string(),
+            pretty: false,
+        })
+    };
+
+    set("Size", r#"{"x":6,"y":1,"z":6}"#).unwrap();
+    set("Transparency", "0.3").unwrap();
+    let error = set("CFrame", r#"{"x":1}"#).unwrap_err();
+    assert!(
+        error.to_string().contains("CFrame needs a CFrame value"),
+        "{error}"
+    );
+
+    let decoded = SettingsBytecode::read_file(&settings_path).unwrap();
+    let properties = &decoded.instances[1].properties;
+    assert_eq!(
+        properties["Size"],
+        json!({"_type": "Vector3", "x": 6.0, "y": 1.0, "z": 6.0})
+    );
+    assert_eq!(properties["Transparency"], json!(0.3));
+    assert!(!properties.contains_key("CFrame"));
+
+    let _ = fs::remove_dir_all(project_root);
+}
+
 fn read_exported_rbx_dom(output_path: &Path, format: &str) -> RbxWeakDom {
     let file = File::open(output_path).unwrap();
     let reader = BufReader::new(file);
