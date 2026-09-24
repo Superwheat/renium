@@ -2441,10 +2441,17 @@ fn reconciliation_values_equal_with_ids(
                     (Some(left), Some(right)) => left == right,
                     _ => true,
                 };
-                let values_match = match (
-                    left.get("value").and_then(Value::as_u64),
-                    right.get("value").and_then(Value::as_u64),
-                ) {
+                // A store written before the reflection database knew an enum
+                // keeps the item's number as its name.
+                let enum_number = |value: &Map<String, Value>| {
+                    value.get("value").and_then(Value::as_u64).or_else(|| {
+                        value
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .and_then(|name| name.parse::<u64>().ok())
+                    })
+                };
+                let values_match = match (enum_number(left), enum_number(right)) {
                     (Some(left), Some(right)) => left == right,
                     _ => false,
                 };
