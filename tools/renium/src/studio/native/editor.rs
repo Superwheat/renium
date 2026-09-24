@@ -4184,8 +4184,9 @@ pub(crate) fn send_editor_change_batches(
                 || path_names.is_some_and(|names| names.contains(name))
         };
         if payload_container {
+            // Studio's reader applies a retained container's properties from the
+            // payload but not its attributes, so those are written afterwards.
             let mut remaining = change.clone();
-            remaining.attributes.clear();
             remaining.properties.retain(|name, _| {
                 crate::editor::native_roots::is_property(&change.class_name, name)
                     || retained_name(name)
@@ -4195,6 +4196,7 @@ pub(crate) fn send_editor_change_batches(
             }
             if !remaining.properties.is_empty()
                 || !remaining.reset_properties.is_empty()
+                || !remaining.attributes.is_empty()
                 || !remaining.deleted_attributes.is_empty()
             {
                 property_changes.push(remaining);
