@@ -612,6 +612,57 @@ pub(crate) fn absolutize_for_daemon(path: &Path) -> PathBuf {
         .collect()
 }
 
+/// Windows 8.3 names (`SUPERW~1`) name the same folder as the long form that
+/// loaded projects register. The longest existing ancestor is expanded; the
+/// rest is kept as given.
+#[cfg(windows)]
+pub(crate) fn expand_short_names(path: PathBuf) -> PathBuf {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::Storage::FileSystem::GetLongPathNameW;
+
+    if !path.as_os_str().to_string_lossy().contains('~') {
+        return path;
+    }
+    let mut existing = path.as_path();
+    let mut rest = Vec::new();
+    loop {
+        let wide = existing
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let mut buffer = vec![0u16; 260];
+        loop {
+            let length = unsafe {
+                GetLongPathNameW(wide.as_ptr(), buffer.as_mut_ptr(), buffer.len() as u32)
+            } as usize;
+            if length == 0 {
+                break;
+            }
+            if length < buffer.len() {
+                buffer.truncate(length);
+                let mut long = PathBuf::from(OsString::from_wide(&buffer));
+                long.extend(rest.iter().rev());
+                return long;
+            }
+            buffer.resize(length, 0);
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_owned());
+                existing = parent;
+            }
+            _ => return path,
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn expand_short_names(path: PathBuf) -> PathBuf {
+    path
+}
+
 pub(crate) fn validate_filesystem_instance_name(raw: &str, label: &str) -> Result<()> {
     if raw.is_empty() {
         bail!("{label} cannot be empty");

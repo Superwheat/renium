@@ -23,6 +23,7 @@
 
 ### Bug fixes
 
+- Store commands such as `rbx bem` no longer fail with "Failed to stat ...\src\<Service>\__roblox_sync_settings.renium" when the project folder or working directory is given as a Windows short path (`rbx -r C:\Users\SUPERW~1\...`); the short path is expanded to the long form the project is registered under, so the store in `instances/` is found.
 - Several agents or editors working in one project while Studio also changes no longer get "changed on both sides" reviews for files only one of them edited. A reconcile that pushed to Studio and then failed used to leave its own push looking like a Studio edit, and the next reconcile reported every pushed file as a conflict.
 - Files edited while Live Sync reconciled now reach Studio. The reconcile used to record them as already synchronized, so those edits stayed only in the files.
 - Live Sync keeps working while files change continuously. A reconcile or Studio pull that races a file edit retries quietly instead of failing with "Project files changed while Studio export was running", and a store Studio changed is merged with edits made to other instances in it meanwhile.

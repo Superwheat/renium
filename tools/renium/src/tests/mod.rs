@@ -1593,6 +1593,36 @@ fn ordinary_remove_rejects_package_bearing_instances_and_links() {
     let _ = fs::remove_dir_all(project_root);
 }
 
+#[cfg(windows)]
+#[test]
+fn short_windows_names_expand_to_their_long_form() {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+
+    let root = temp_dir("short-names");
+    let long = root.join("LongProjectFolderName");
+    fs::create_dir_all(&long).unwrap();
+    let wide = long
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let mut buffer = vec![0u16; 1024];
+    let length =
+        unsafe { GetShortPathNameW(wide.as_ptr(), buffer.as_mut_ptr(), buffer.len() as u32) }
+            as usize;
+    buffer.truncate(length);
+    let short = PathBuf::from(std::ffi::OsString::from_wide(&buffer));
+    if length > 0 && short != long {
+        let missing = Path::new("instances").join("ReplicatedStorage.renium");
+        assert_eq!(
+            crate::system::files::expand_short_names(short.join(&missing)),
+            crate::system::files::expand_short_names(long.clone()).join(&missing),
+        );
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn store_writes_keep_composite_property_values_typed() {
     let project_root = temp_dir("typed-store-values");

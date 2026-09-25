@@ -146,6 +146,12 @@ fn arguments_after_leading_root() -> Result<Vec<std::ffi::OsString>> {
 fn run_cli() -> Result<()> {
     app::crash::install_hook();
     let matches = cli::command().get_matches_from(arguments_after_leading_root()?);
+    if let Ok(cwd) = std::env::current_dir() {
+        let long = system::files::expand_short_names(cwd.clone());
+        if long != cwd {
+            let _ = std::env::set_current_dir(long);
+        }
+    }
     let mut cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
     app::output::prime_mode(&cli.output_mode);
     if cli.backtrace {
