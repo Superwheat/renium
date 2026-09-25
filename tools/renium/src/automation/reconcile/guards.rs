@@ -367,21 +367,24 @@ pub(crate) fn studio_states_share_epoch(
 
 // Only the paths Studio contributed are published, so a project file edited
 // meanwhile elsewhere is neither overwritten nor a reason to fail.
+// Returns the Studio snapshot that was published.
 pub(crate) fn publish_captured_studio(
     context: &BoundContext,
     bridge: &BridgeServer,
     stage: ExportProjectStage,
+    studio: ProjectSnapshot,
     guard: &StudioChangeGuard,
     studio_paths: &HashSet<PathBuf>,
     captured_project: &ProjectSnapshot,
-) -> Result<()> {
+) -> Result<ProjectSnapshot> {
     let confirmed = read_studio_change_state(context, bridge)?;
-    let stage = if studio_guard_matches_state(context, guard, &confirmed) {
-        stage
+    let (stage, studio) = if studio_guard_matches_state(context, guard, &confirmed) {
+        (stage, studio)
     } else {
-        capture_studio_project(context, bridge)?.0
+        capture_studio_project(context, bridge)?
     };
-    publish_studio_paths(context, stage, studio_paths, captured_project)
+    publish_studio_paths(context, stage, studio_paths, captured_project)?;
+    Ok(studio)
 }
 
 pub(crate) fn publish_studio_paths(

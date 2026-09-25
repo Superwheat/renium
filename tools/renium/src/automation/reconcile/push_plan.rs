@@ -105,19 +105,27 @@ pub(crate) fn push_staged_project(
         .collect::<Vec<_>>();
     // A reconcile pushes the project as it captured it; the stage already
     // holds that supporting data, and later edits stay pending in Live Sync.
-    if !supporting_paths.is_empty() && expected_project.is_none() {
+    if !supporting_paths.is_empty() && !later_edits_follow {
         let root = Path::new(&context.root);
-        let staged = capture_snapshot(&stage.project_root, &supporting_paths)?;
+        let staged = expected_project
+            .is_none()
+            .then(|| capture_snapshot(&stage.project_root, &supporting_paths))
+            .transpose()?;
         let current = capture_snapshot(root, &supporting_paths)?;
         let supporting_paths = supporting_paths.into_iter().collect::<HashSet<_>>();
-        let differences = snapshot_path_differences(&staged, &current, &supporting_paths)?;
+        let reference = expected_project
+            .or(staged.as_ref())
+            .expect("reference snapshot");
+        let differences = snapshot_path_differences(reference, &current, &supporting_paths)?;
         if !differences.is_empty() {
             bail!(
                 "Supporting project data {} changed while its Studio update was being prepared; retry the sync",
                 root.join(&differences[0]).display()
             );
         }
-        apply_snapshot_paths(&stage.project_root, &supporting_paths, &current)?;
+        if expected_project.is_none() {
+            apply_snapshot_paths(&stage.project_root, &supporting_paths, &current)?;
+        }
     }
     let project_root = push_args.project.project_root.clone();
     let planned_paths = plan.changed_paths.clone();

@@ -480,18 +480,20 @@ impl Coordinator {
             reconciliation_push_plan_for_paths(&studio, &merged, &changes.studio)?
         };
         log_reconcile_timing("push plan", phase);
-        let _readback = if push_plan.is_empty() {
-            if !changes.editor.is_empty() {
+        let readback = if push_plan.is_empty() {
+            if changes.editor.is_empty() {
+                studio
+            } else {
                 publish_captured_studio(
                     context,
                     bridge,
                     stage,
+                    studio,
                     &studio_guard,
                     &changes.editor,
                     &editor,
-                )?;
+                )?
             }
-            studio
         } else {
             let phase = Instant::now();
             sync_history = Some(history::SyncHistory::begin(
@@ -594,6 +596,7 @@ impl Coordinator {
         };
 
         let phase = Instant::now();
+        overlay_snapshot_paths(&mut merged, &readback, &changes.editor);
         let (baseline, unsynced) = synchronized_baseline(context, &publish_paths, &merged)?;
         setup.unsynced_paths = unsynced;
         if let Some(history) = sync_history {
@@ -1056,6 +1059,25 @@ fn unsynced_project_paths(
         );
     }
     Ok((paths, current))
+}
+
+// The files hold what the readback published for Studio's paths, which can
+// differ from the merge by properties the engine recomputes.
+fn overlay_snapshot_paths(
+    target: &mut ProjectSnapshot,
+    source: &ProjectSnapshot,
+    paths: &HashSet<PathBuf>,
+) {
+    for path in paths {
+        match source.entries.get(path) {
+            Some(entry) => {
+                target.entries.insert(path.clone(), entry.clone());
+            }
+            None => {
+                target.entries.remove(path);
+            }
+        }
+    }
 }
 
 // The project as it is now, except that files edited during the reconcile
