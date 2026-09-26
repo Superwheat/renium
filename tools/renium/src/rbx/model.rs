@@ -44,7 +44,7 @@ use crate::project::package_links::local_project_package_paths;
 use crate::rbx::decode::rbx_instance_to_settings_records;
 use crate::rbx::encode::{
     BytecodeRbxBuildOptions, BytecodeRbxEncoder, collect_rbx_subtree_preorder,
-    rbx_model_top_level_refs, settings_root_indices,
+    rbx_model_top_level_refs, rbx_property_descriptor, settings_root_indices,
 };
 use crate::roblox::services::DEFAULT_SYNC_SERVICES;
 use crate::settings::bytecode::{
@@ -1588,6 +1588,7 @@ pub(crate) fn bytecode_export_place(mut args: BytecodeExportPlaceArgs) -> Result
         }
         dom = base_dom;
         top_level_refs = dom.root().children().to_vec();
+        coerce_numeric_property_widths(&mut dom);
     }
     format.write(&args.output, &dom, &top_level_refs)?;
     let exported_services = build
@@ -1607,6 +1608,53 @@ pub(crate) fn bytecode_export_place(mut args: BytecodeExportPlaceArgs) -> Result
         }),
         args.pretty,
     )
+}
+
+/// A place file can store a number wider than the reflection database
+/// declares (Studio writes `Workspace.SimulationRate` as a double while the
+/// database says Float32). The writer refuses such a value, so numbers taken
+/// from a base place are brought to the declared width.
+pub(crate) fn coerce_numeric_property_widths(dom: &mut RbxWeakDom) {
+    use rbx_dom_weak::types::VariantType;
+    use rbx_reflection::DataType;
+
+    let Ok(database) = rbx_reflection_database::get() else {
+        return;
+    };
+    let referents = dom
+        .descendants()
+        .map(|instance| instance.referent())
+        .collect::<Vec<_>>();
+    for referent in referents {
+        let Some(instance) = dom.get_by_ref_mut(referent) else {
+            continue;
+        };
+        let class_name = instance.class;
+        for (name, value) in instance.properties.iter_mut() {
+            let Some(DataType::Value(declared)) =
+                rbx_property_descriptor(database, &class_name, name)
+                    .map(|descriptor| &descriptor.data_type)
+            else {
+                continue;
+            };
+            let coerced = match (&*value, declared) {
+                (RbxVariant::Float64(number), VariantType::Float32) => {
+                    RbxVariant::Float32(*number as f32)
+                }
+                (RbxVariant::Float32(number), VariantType::Float64) => {
+                    RbxVariant::Float64(f64::from(*number))
+                }
+                (RbxVariant::Int64(number), VariantType::Int32) => {
+                    RbxVariant::Int32(*number as i32)
+                }
+                (RbxVariant::Int32(number), VariantType::Int64) => {
+                    RbxVariant::Int64(i64::from(*number))
+                }
+                _ => continue,
+            };
+            *value = coerced;
+        }
+    }
 }
 
 pub(crate) fn bytecode_import_model(args: BytecodeImportModelArgs) -> Result<()> {

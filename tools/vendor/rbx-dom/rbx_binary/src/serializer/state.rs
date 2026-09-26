@@ -1160,14 +1160,23 @@ impl<'dom, 'db: 'dom, W: Write> SerializerState<'dom, 'db, W> {
                             }
                         }
                     }
+                    // A number wider than the reflection database declares
+                    // (Studio writes some float properties as doubles) is
+                    // narrowed instead of failing the whole file.
                     Type::Int32 => {
                         let mut buf = Vec::with_capacity(values.len());
 
                         for (i, rbx_value) in values {
-                            if let Variant::Int32(value) = rbx_value {
-                                buf.push(*value);
-                            } else {
-                                return type_mismatch(i, rbx_value, "Int32");
+                            match rbx_value {
+                                Variant::Int32(value) => buf.push(*value),
+                                Variant::Int64(value) => buf.push(*value as i32),
+                                Variant::Float32(value) if value.fract() == 0.0 => {
+                                    buf.push(*value as i32)
+                                }
+                                Variant::Float64(value) if value.fract() == 0.0 => {
+                                    buf.push(*value as i32)
+                                }
+                                _ => return type_mismatch(i, rbx_value, "Int32"),
                             }
                         }
 
@@ -1177,10 +1186,12 @@ impl<'dom, 'db: 'dom, W: Write> SerializerState<'dom, 'db, W> {
                         let mut buf = Vec::with_capacity(values.len());
 
                         for (i, rbx_value) in values {
-                            if let Variant::Float32(value) = rbx_value {
-                                buf.push(*value);
-                            } else {
-                                return type_mismatch(i, rbx_value, "Float32");
+                            match rbx_value {
+                                Variant::Float32(value) => buf.push(*value),
+                                Variant::Float64(value) => buf.push(*value as f32),
+                                Variant::Int32(value) => buf.push(*value as f32),
+                                Variant::Int64(value) => buf.push(*value as f32),
+                                _ => return type_mismatch(i, rbx_value, "Float32"),
                             }
                         }
 
@@ -1193,6 +1204,12 @@ impl<'dom, 'db: 'dom, W: Write> SerializerState<'dom, 'db, W> {
                                     chunk.write_le_f64(*value)?;
                                 }
                                 Variant::Float32(value) => {
+                                    chunk.write_le_f64(*value as f64)?;
+                                }
+                                Variant::Int32(value) => {
+                                    chunk.write_le_f64(*value as f64)?;
+                                }
+                                Variant::Int64(value) => {
                                     chunk.write_le_f64(*value as f64)?;
                                 }
                                 _ => return type_mismatch(i, rbx_value, "Float64"),

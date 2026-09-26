@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Bug fixes
+
+- Writing a place or model no longer fails with "Property type mismatch: Expected Workspace.SimulationRate to be of type Float32, but it was of type Float64" (or any other number stored wider or narrower than the reflection database declares, as Studio does for several properties). Every export, build, publish and native import now converts such values to the declared width, so a single property can no longer abort the whole file.
+
 ## 0.3.11 - 2026-09-25
 
 ### New

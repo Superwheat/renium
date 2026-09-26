@@ -1973,6 +1973,60 @@ fn assert_mesh_exports(project_root: &Path, settings_path: &Path, expected: (f32
 }
 
 #[test]
+fn base_place_numbers_take_the_declared_width_before_writing() {
+    let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+    let root = dom.root_ref();
+    let workspace = dom.insert(
+        root,
+        RbxInstanceBuilder::new("Workspace")
+            .with_property("SimulationRate", RbxVariant::Float64(1.0))
+            .with_property("FallenPartsDestroyHeight", RbxVariant::Float64(-500.0))
+            .with_property("Gravity", RbxVariant::Float32(196.2)),
+    );
+    crate::rbx::model::coerce_numeric_property_widths(&mut dom);
+    let properties = &dom.get_by_ref(workspace).unwrap().properties;
+    assert_eq!(
+        properties.get(&"SimulationRate".into()),
+        Some(&RbxVariant::Float32(1.0))
+    );
+    assert_eq!(
+        properties.get(&"FallenPartsDestroyHeight".into()),
+        Some(&RbxVariant::Float32(-500.0))
+    );
+    assert_eq!(
+        properties.get(&"Gravity".into()),
+        Some(&RbxVariant::Float32(196.2))
+    );
+    let mut output = Vec::new();
+    rbx_binary::to_writer(&mut output, &dom, &[workspace]).unwrap();
+}
+
+#[test]
+fn binary_writer_narrows_wider_numbers_to_the_declared_type() {
+    let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+    let root = dom.root_ref();
+    let workspace = dom.insert(
+        root,
+        RbxInstanceBuilder::new("Workspace")
+            .with_property("SimulationRate", RbxVariant::Float64(1.0))
+            .with_property("StreamingMinRadius", RbxVariant::Int64(64)),
+    );
+    let mut output = Vec::new();
+    rbx_binary::to_writer(&mut output, &dom, &[workspace]).unwrap();
+    let read = rbx_binary::from_reader(output.as_slice()).unwrap();
+    let written = read.root().children()[0];
+    let properties = &read.get_by_ref(written).unwrap().properties;
+    assert_eq!(
+        properties.get(&"SimulationRate".into()),
+        Some(&RbxVariant::Float32(1.0))
+    );
+    assert_eq!(
+        properties.get(&"StreamingMinRadius".into()),
+        Some(&RbxVariant::Int32(64))
+    );
+}
+
+#[test]
 fn bytecode_export_uses_size_for_file_created_meshes_in_all_formats() {
     let mut properties = Map::new();
     properties.insert("Size".to_string(), vector3_json(4.0, 5.0, 6.0));
