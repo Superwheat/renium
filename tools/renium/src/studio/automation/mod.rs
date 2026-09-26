@@ -270,8 +270,8 @@ pub(crate) fn package_action_command(
     project: Option<&Path>,
     operation: u16,
 ) -> Result<()> {
-    if !args.timeout.is_finite() || args.timeout <= 0.0 || args.timeout > 20.0 {
-        bail!("Package timeout must be >0 and <=20s");
+    if !args.timeout.is_finite() || args.timeout <= 0.0 || args.timeout > 600.0 {
+        bail!("Package timeout must be >0 and <=600s");
     }
     let result = daemon_result(
         operation,

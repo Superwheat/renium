@@ -1436,9 +1436,9 @@ pub(super) struct PackageActionArgs {
     #[arg(long, help = "Target Studio process when more than one is connected")]
     pub(super) pid: Option<u32>,
     #[arg(
-        help = "Seconds to wait for the package update",
+        help = "Seconds to wait for the package operation, up to 600",
         long,
-        default_value_t = 20.0
+        default_value_t = 120.0
     )]
     pub(super) timeout: f64,
     #[command(flatten)]
@@ -2274,8 +2274,18 @@ pub(super) struct BytecodeGetPropertyArgs {
     pub(super) input: BytecodeFileArgs,
     #[command(flatten)]
     pub(super) selector: BytecodeInstanceSelectorArgs,
-    #[arg(help = "Property or attribute name", short, long, alias = "prop")]
-    pub(super) property: String,
+    #[arg(
+        help = "Property or attribute name; also accepted after the target",
+        short,
+        long,
+        alias = "prop"
+    )]
+    pub(super) property: Option<String>,
+    #[arg(
+        help = "Property or attribute name, after the target",
+        value_name = "PROPERTY"
+    )]
+    pub(super) property_after_target: Option<String>,
     #[arg(
         help = "auto, property or attribute",
         short = 'S',

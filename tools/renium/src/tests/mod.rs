@@ -186,6 +186,48 @@ fn changed_directory_collects_every_external_script() {
     let _ = fs::remove_dir_all(project_root);
 }
 
+#[test]
+fn get_property_accepts_the_property_after_the_target() {
+    let name = |arguments: &[&str]| {
+        let mut args = BytecodeGetPropertyArgs::try_parse_from(
+            std::iter::once("bg").chain(arguments.iter().copied()),
+        )
+        .unwrap();
+        let property =
+            crate::bytecode::get_property_name(&mut args).map_err(|error| error.to_string());
+        (property, args.selector.target)
+    };
+    assert_eq!(
+        name(&["Workspace", "Lobby.Door", "Anchored"]),
+        (Ok("Anchored".into()), Some("Lobby.Door".into()))
+    );
+    assert_eq!(
+        name(&["Workspace", "Lobby.Door", "-p", "Anchored"]),
+        (Ok("Anchored".into()), Some("Lobby.Door".into()))
+    );
+    assert_eq!(
+        name(&["Workspace", "-p", "Gravity"]),
+        (Ok("Gravity".into()), None)
+    );
+    assert_eq!(
+        name(&["Workspace", "-i", "editor:door", "Anchored"]),
+        (Ok("Anchored".into()), None)
+    );
+    let (missing, target) = name(&["Workspace", "Gravity"]);
+    assert!(
+        missing
+            .unwrap_err()
+            .contains("rbx bg SERVICE TARGET PROPERTY")
+    );
+    assert_eq!(target, Some("Gravity".into()));
+    assert!(
+        name(&["Workspace", "Lobby.Door", "Anchored", "-p", "Name"])
+            .0
+            .unwrap_err()
+            .contains("twice")
+    );
+}
+
 fn get_source_property_args(settings_file: &Path) -> BytecodeGetPropertyArgs {
     BytecodeGetPropertyArgs::try_parse_from([
         "bytecode-get-property",

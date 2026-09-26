@@ -60,7 +60,12 @@ pub(crate) struct Intent {
 )]
 pub(crate) enum Decision {
     Allowed,
-    ApprovalRequired { request_id: String, intent: Intent },
+    ApprovalRequired {
+        request_id: String,
+        intent: Intent,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        more: Vec<Intent>,
+    },
 }
 
 // Studio prints numbers canonically (and rounds float properties to f32).
@@ -115,7 +120,7 @@ pub(crate) fn property_text_matches(
 
 struct Pending {
     scope: Scope,
-    intent: Intent,
+    intents: Vec<Intent>,
     created: Instant,
 }
 
@@ -156,32 +161,44 @@ impl Policy {
 
     #[cfg(any(windows, target_os = "macos", test))]
     pub(crate) fn check(&mut self, scope: &Scope, intent: &Intent) -> Result<Decision> {
-        let trusted = trusted_property(intent)?;
-        match (self.mode(scope), &intent.operation) {
-            (Mode::ReadWrite, _) | (Mode::ReadOnly, Operation::Read) => Ok(Decision::Allowed),
-            (
-                Mode::ReadOnly,
-                Operation::Write { .. } | Operation::Call { .. } | Operation::CallBatch { .. },
-            ) => {
+        self.check_many(scope, std::slice::from_ref(intent))
+    }
+
+    #[cfg(any(windows, target_os = "macos", test))]
+    pub(crate) fn check_many(&mut self, scope: &Scope, intents: &[Intent]) -> Result<Decision> {
+        anyhow::ensure!(!intents.is_empty(), "Nothing to check");
+        let mut trusted = true;
+        for intent in intents {
+            trusted &= trusted_property(intent)?;
+        }
+        let reads_only = intents
+            .iter()
+            .all(|intent| intent.operation == Operation::Read);
+        match self.mode(scope) {
+            Mode::ReadWrite => Ok(Decision::Allowed),
+            Mode::ReadOnly if reads_only => Ok(Decision::Allowed),
+            Mode::ReadOnly => {
                 bail!(
                     "Read-only mode rejects protected writes and function calls; request approval in ask mode or explicitly enable read-write"
                 )
             }
-            (Mode::Ask, _) => {
+            Mode::Ask => {
                 if trusted {
                     return Ok(Decision::Allowed);
                 }
                 self.pending
                     .retain(|_, p| p.created.elapsed() < APPROVAL_TTL);
+                let decision = |request_id: String| Decision::ApprovalRequired {
+                    request_id,
+                    intent: intents[0].clone(),
+                    more: intents[1..].to_vec(),
+                };
                 if let Some((id, _)) = self
                     .pending
                     .iter()
-                    .find(|(_, p)| &p.scope == scope && &p.intent == intent)
+                    .find(|(_, p)| &p.scope == scope && p.intents == intents)
                 {
-                    return Ok(Decision::ApprovalRequired {
-                        request_id: id.clone(),
-                        intent: intent.clone(),
-                    });
+                    return Ok(decision(id.clone()));
                 }
                 if self.pending.len() >= MAX_PENDING {
                     bail!(
@@ -193,21 +210,18 @@ impl Policy {
                     id.clone(),
                     Pending {
                         scope: scope.clone(),
-                        intent: intent.clone(),
+                        intents: intents.to_vec(),
                         created: Instant::now(),
                     },
                 );
-                Ok(Decision::ApprovalRequired {
-                    request_id: id,
-                    intent: intent.clone(),
-                })
+                Ok(decision(id))
             }
         }
     }
 
     // Consume before invoking the backend. A lost reply does not create a
     // reusable permission. The backend must recheck instance identity first.
-    pub(crate) fn approve(&mut self, scope: &Scope, id: &str) -> Result<Intent> {
+    pub(crate) fn approve(&mut self, scope: &Scope, id: &str) -> Result<Vec<Intent>> {
         let Some(pending) = self.pending.get(id) else {
             bail!("Property approval is unknown, expired, revoked, or already used");
         };
@@ -218,7 +232,7 @@ impl Policy {
         if pending.created.elapsed() >= APPROVAL_TTL {
             bail!("Property approval expired; request the operation again");
         }
-        Ok(pending.intent)
+        Ok(pending.intents)
     }
 
     pub(crate) fn reject(&mut self, scope: &Scope, id: &str) -> Result<()> {
@@ -441,7 +455,10 @@ mod tests {
         ] {
             assert!(policy.approve(&changed, &id).is_err());
         }
-        assert_eq!(policy.approve(&scope(), &id).unwrap(), original);
+        assert_eq!(
+            policy.approve(&scope(), &id).unwrap(),
+            vec![original.clone()]
+        );
         assert!(policy.approve(&scope(), &id).is_err());
     }
 
@@ -464,7 +481,10 @@ mod tests {
         assert_ne!(id, ticket(&mut policy, &changed));
         changed.property = "PostAsyncFullUrl".into();
         assert_ne!(id, ticket(&mut policy, &changed));
-        assert_eq!(policy.approve(&scope(), &id).unwrap(), original);
+        assert_eq!(
+            policy.approve(&scope(), &id).unwrap(),
+            vec![original.clone()]
+        );
         assert!(policy.approve(&scope(), &id).is_err());
         changed.class_name = "MeshPart".into();
         changed.property = "CollisionFidelity".into();
@@ -488,7 +508,7 @@ mod tests {
             arguments.reverse();
         }
         assert_ne!(batch_id, ticket(&mut policy, &reordered));
-        assert_eq!(policy.approve(&scope(), &batch_id).unwrap(), batch);
+        assert_eq!(policy.approve(&scope(), &batch_id).unwrap(), vec![batch]);
     }
 
     #[test]
@@ -505,5 +525,47 @@ mod tests {
         let id = ticket(&mut policy, &intent(None));
         policy.reject(&scope(), &id).unwrap();
         assert!(policy.approve(&scope(), &id).is_err());
+    }
+
+    #[test]
+    fn several_reads_share_one_pending_decision() {
+        let mut policy = Policy::default();
+        let first = intent(None);
+        let second = Intent {
+            path: "Workspace.Other".into(),
+            instance_id: "instance-two".into(),
+            ..intent(None)
+        };
+        let both = [first.clone(), second.clone()];
+        let Decision::ApprovalRequired {
+            request_id,
+            intent: head,
+            more,
+        } = policy.check_many(&scope(), &both).unwrap()
+        else {
+            panic!("ask must not grant automatic permission")
+        };
+        assert_eq!((head, more), (first.clone(), vec![second.clone()]));
+        let Decision::ApprovalRequired {
+            request_id: repeated,
+            ..
+        } = policy.check_many(&scope(), &both).unwrap()
+        else {
+            panic!("repeat prompts reuse the same pending decision")
+        };
+        assert_eq!(request_id, repeated);
+        assert_ne!(request_id, ticket(&mut policy, &first));
+        assert_eq!(policy.approve(&scope(), &request_id).unwrap(), both);
+        assert!(policy.approve(&scope(), &request_id).is_err());
+        policy.set_mode(&scope(), Mode::ReadOnly, false).unwrap();
+        assert!(matches!(
+            policy.check_many(&scope(), &both).unwrap(),
+            Decision::Allowed
+        ));
+        assert!(
+            policy
+                .check_many(&scope(), &[first, intent(Some(json!(true)))])
+                .is_err()
+        );
     }
 }

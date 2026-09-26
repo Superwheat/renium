@@ -39,52 +39,101 @@ enum Action {
         #[serde(default)]
         accept_risk: bool,
     },
-    #[command(about = "Read an engine property, requesting exact approval when needed")]
+    #[command(
+        about = "Read an engine property from one or more instances, requesting exact approval when needed"
+    )]
     Read {
+        #[arg(help = "Instance path, dotted or a JSON string array when a name contains dots")]
         target: String,
+        #[arg(help = "Property name as Studio shows it")]
         property: String,
-        #[arg(long, value_delimiter = ',')]
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "One-based sibling ordinal per path segment for duplicate names"
+        )]
         #[serde(default)]
         ords: Vec<usize>,
+        #[arg(
+            help = "More instances to read with the same property under one approval (64 per call)",
+            value_name = "TARGET"
+        )]
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        more: Vec<String>,
     },
     #[command(about = "Write and verify an engine property; respects the selected access mode")]
     Write {
+        #[arg(help = "Instance path, dotted or a JSON string array when a name contains dots")]
         target: String,
+        #[arg(help = "Property name as Studio shows it")]
         property: String,
-        #[arg(value_parser = property_value, allow_hyphen_values = true)]
+        #[arg(
+            value_parser = property_value,
+            allow_hyphen_values = true,
+            help = "New value in Studio's text form, a number or a boolean"
+        )]
         value: Value,
-        #[arg(long, value_delimiter = ',')]
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "One-based sibling ordinal per path segment for duplicate names"
+        )]
         #[serde(default)]
         ords: Vec<usize>,
     },
     #[command(about = "Call an engine function with exact, runtime-scoped approval")]
     Call {
+        #[arg(help = "Instance path, dotted or a JSON string array when a name contains dots")]
         target: String,
+        #[arg(help = "Function name")]
         function: String,
-        #[arg(default_value = "[]", value_parser = function_arguments)]
+        #[arg(
+            default_value = "[]",
+            value_parser = function_arguments,
+            help = "Arguments as one JSON array"
+        )]
         arguments: Value,
-        #[arg(long, value_delimiter = ',')]
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "One-based sibling ordinal per path segment for duplicate names"
+        )]
         #[serde(default)]
         ords: Vec<usize>,
     },
     #[command(about = "Call one function with up to 32 argument arrays under one exact approval")]
     Batch {
+        #[arg(help = "Instance path, dotted or a JSON string array when a name contains dots")]
         target: String,
+        #[arg(help = "Function name")]
         function: String,
-        #[arg(value_parser = function_arguments)]
+        #[arg(
+            value_parser = function_arguments,
+            help = "JSON array of argument arrays, one per call"
+        )]
         arguments: Value,
-        #[arg(long, value_delimiter = ',')]
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "One-based sibling ordinal per path segment for duplicate names"
+        )]
         #[serde(default)]
         ords: Vec<usize>,
     },
     #[command(about = "Approve and execute one exact pending property request")]
     Approve {
-        #[arg(allow_hyphen_values = true)]
+        #[arg(
+            allow_hyphen_values = true,
+            help = "Request ID from an approval-required result"
+        )]
         request_id: String,
     },
     #[command(about = "Reject a pending property request")]
     Reject {
-        #[arg(allow_hyphen_values = true)]
+        #[arg(
+            allow_hyphen_values = true,
+            help = "Request ID from an approval-required result"
+        )]
         request_id: String,
     },
 }
@@ -411,11 +460,17 @@ pub(crate) fn result(
 #[cfg(any(windows, target_os = "macos"))]
 fn perform(
     action: Action,
-    approved: Option<Intent>,
+    approved: Option<Vec<Intent>>,
     scope: &Scope,
     state: &crate::automation::State,
     bridge: &BridgeServer,
 ) -> Result<Value> {
+    if approved.as_ref().is_some_and(|intents| intents.len() > 1)
+        || matches!(&action, Action::Read { more, .. } if !more.is_empty())
+    {
+        return perform_reads(action, approved, scope, state, bridge);
+    }
+    let approved = approved.and_then(|mut intents| intents.pop());
     let (target, property, ordinals, operation) = if let Some(intent) = &approved {
         (
             intent.path.clone(),
@@ -429,6 +484,7 @@ fn perform(
                 target,
                 property,
                 ords,
+                ..
             } => (target, property, ords, Operation::Read),
             Action::Write {
                 target,
@@ -605,6 +661,98 @@ fn perform(
 }
 
 #[cfg(any(windows, target_os = "macos"))]
+fn perform_reads(
+    action: Action,
+    approved: Option<Vec<Intent>>,
+    scope: &Scope,
+    state: &crate::automation::State,
+    bridge: &BridgeServer,
+) -> Result<Value> {
+    let (targets, property) = match (&approved, action) {
+        (Some(intents), _) => (
+            intents
+                .iter()
+                .map(|intent| (intent.path.clone(), intent.ordinals.clone()))
+                .collect::<Vec<_>>(),
+            intents[0].property.clone(),
+        ),
+        (
+            None,
+            Action::Read {
+                target,
+                property,
+                ords,
+                more,
+            },
+        ) => {
+            let mut targets = vec![(target, ords)];
+            targets.extend(more.into_iter().map(|target| (target, Vec::new())));
+            (targets, property)
+        }
+        _ => unreachable!("only reads carry several targets"),
+    };
+    if property.is_empty() || property.len() > 256 {
+        bail!("Property name must contain 1–256 bytes");
+    }
+    if targets.len() > 64 {
+        bail!("Read up to 64 instances per call");
+    }
+    let info = bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?;
+    anyhow::ensure!(
+        info.runtime_id == scope.runtime,
+        "Protected property runtime was replaced"
+    );
+    let title = crate::studio::native::serializer::target_name(scope.pid, &info.place_name)?;
+    let mut natives = Vec::with_capacity(targets.len());
+    let mut intents = Vec::with_capacity(targets.len());
+    for (target, ordinals) in targets {
+        let path = target_parts(&target, &ordinals)?;
+        let native = crate::studio::native::serializer::prepare_property(
+            scope.pid,
+            &title,
+            &path,
+            &ordinals,
+            &property,
+            Duration::from_secs(3),
+        )?;
+        intents.push(Intent {
+            path: target,
+            ordinals,
+            property: property.clone(),
+            operation: Operation::Read,
+            class_name: native.class_name.clone(),
+            instance_id: native.instance_id.clone(),
+        });
+        natives.push(native);
+    }
+    if let Some(approved) = approved {
+        if intents != approved {
+            bail!("Property target changed since approval; request access again");
+        }
+    } else {
+        let decision = state
+            .property_access
+            .lock_recover()
+            .check_many(scope, &intents)?;
+        if matches!(decision, Decision::ApprovalRequired { .. }) {
+            return Ok(serde_json::to_value(decision)?);
+        }
+    }
+    if bridge.studio_pid_for_runtime(BridgeTarget::Edit, &scope.runtime)? != scope.pid {
+        bail!("Protected property runtime was replaced");
+    }
+    let mut results = Vec::with_capacity(intents.len());
+    for (native, intent) in natives.iter_mut().zip(&intents) {
+        let value = native.read()?;
+        results.push(json!({"path":intent.path,"className":intent.class_name,"value":value}));
+    }
+    Ok(
+        json!({"status":"applied","property":property,"encoding":"studio-text",
+        "runtimeId":scope.runtime,"results":results}),
+    )
+}
+
+#[cfg(any(windows, target_os = "macos"))]
 fn sample_completed_write(
     bridge: &BridgeServer,
     scope: &Scope,
@@ -681,7 +829,7 @@ fn prepare_packages(
 #[cfg(not(any(windows, target_os = "macos")))]
 fn perform(
     _action: Action,
-    _approved: Option<Intent>,
+    _approved: Option<Vec<Intent>>,
     _scope: &Scope,
     _state: &crate::automation::State,
     _bridge: &BridgeServer,
@@ -709,6 +857,35 @@ mod tests {
             .try_get_matches_from(["access", "write", "Workspace.Value", "Value", "-3.5"])?;
         let args = PropertyAccessArgs::from_arg_matches(&matches)?;
         assert_eq!(serde_json::to_value(args.action)?["value"], -3.5);
+        Ok(())
+    }
+
+    #[test]
+    fn reads_take_more_targets_after_the_property() -> Result<()> {
+        use clap::FromArgMatches;
+        let matches = PropertyAccessArgs::augment_args(clap::Command::new("access"))
+            .try_get_matches_from([
+                "access",
+                "read",
+                "ReplicatedStorage.Shared.PackageLink",
+                "Status",
+                "ServerStorage.Tools.PackageLink",
+                "Workspace.Map.PackageLink",
+            ])?;
+        let args = PropertyAccessArgs::from_arg_matches(&matches)?;
+        let action = serde_json::to_value(args.action)?;
+        assert_eq!(
+            action["more"],
+            json!([
+                "ServerStorage.Tools.PackageLink",
+                "Workspace.Map.PackageLink"
+            ])
+        );
+        assert!(serde_json::from_value::<Action>(action).is_ok());
+        let matches = PropertyAccessArgs::augment_args(clap::Command::new("access"))
+            .try_get_matches_from(["access", "read", "Workspace", "StreamingEnabled"])?;
+        let args = PropertyAccessArgs::from_arg_matches(&matches)?;
+        assert!(serde_json::to_value(args.action)?.get("more").is_none());
         Ok(())
     }
 

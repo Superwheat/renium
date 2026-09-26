@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Improvements
+
+- `rbx access read TARGET PROPERTY [TARGET ...]` reads one property from several instances in one call and under one approval, up to 64 per call, and returns a `results` list with each path, class name and value. Reading the Status of every PackageLink in a place used to take a separate `read` and `approve` for each package.
+- `rbx access` describes every argument in `--help`; TARGET, PROPERTY, `--ords`, VALUE, FUNCTION, ARGUMENTS and REQUEST_ID used to be blank.
+- `rbx bg SERVICE TARGET PROPERTY` takes the property as a plain word after the target; `-p PROPERTY` still works, and with a flag selector such as `-i ID` or `-n NAME` the one free word is the property. A property written without `-p` used to be rejected, for example with "the following required arguments were not provided: --property".
+- `rbx pp` and `rbx pu` wait up to 120 seconds by default instead of 20, and `--timeout` accepts up to 600 seconds. Publishing a large package used to fail every time with "Package operation did not finish before the deadline" or "Studio helper exceeded its 19989ms deadline", and `--timeout 60` was rejected with "Package timeout must be >0 and <=20s".
+
 ### Bug fixes
 
 - `rbx ro` and `rbx so` no longer fail on Windows with "Could not protect Studio activation: A dynamic link library (DLL) initialization routine failed. (os error 1114)" when Studio is still running its loader at launch. The launch guard retries a module snapshot that Windows briefly reports as unreadable, recognizes its own image under another spelling of the same path, and repeats the protection call instead of giving up on the first transient failure.

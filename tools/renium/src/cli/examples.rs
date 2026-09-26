@@ -9,7 +9,7 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ),
     (
         "access",
-        "Examples:\n  rbx access mode\n  rbx access read Workspace StreamingEnabled\n  rbx access call HttpRbxApiService GetDocumentationUrl '[\"studio\"]'\n  rbx access batch HttpRbxApiService GetDocumentationUrl '[[\"studio\"],[\"cloud\"]]'\n  rbx access approve REQUEST_ID",
+        "Examples:\n  rbx access mode\n  rbx access read Workspace StreamingEnabled\n  rbx access read ReplicatedStorage.Shared.PackageLink Status ServerStorage.Tools.PackageLink\n  rbx access call HttpRbxApiService GetDocumentationUrl '[\"studio\"]'\n  rbx access batch HttpRbxApiService GetDocumentationUrl '[[\"studio\"],[\"cloud\"]]'\n  rbx access approve REQUEST_ID",
     ),
     (
         "perf",
@@ -87,7 +87,10 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
         "Examples:\n  rbx upl ReplicatedStorage --settings-id editor:package",
     ),
     ("pd", "Examples:\n  rbx pd ReplicatedStorage.testPackage"),
-    ("pp", "Examples:\n  rbx pp ReplicatedStorage.testPackage"),
+    (
+        "pp",
+        "Examples:\n  rbx pp ReplicatedStorage.testPackage\n  rbx pp ReplicatedStorage.testPackage --timeout 300",
+    ),
     ("pu", "Examples:\n  rbx pu ReplicatedStorage.testPackage"),
     (
         "mip",
@@ -190,7 +193,7 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ("in", "Examples:\n  rbx in Workspace -i editor:item"),
     (
         "bg",
-        "Examples:\n  rbx bg Workspace -i editor:item -p Name\n  rbx bg Workspace Lobby.Door -p Anchored\n  rbx bg Workspace -p Gravity",
+        "Examples:\n  rbx bg Workspace Lobby.Door Anchored\n  rbx bg Workspace -i editor:item Name\n  rbx bg Workspace -p Gravity",
     ),
     (
         "bs",

@@ -2424,9 +2424,9 @@ fn package_action_result(
     let timeout_seconds = object
         .get("timeout")
         .and_then(Value::as_f64)
-        .unwrap_or(20.0);
-    if !timeout_seconds.is_finite() || timeout_seconds <= 0.0 || timeout_seconds > 20.0 {
-        bail!("Package timeout must be >0 and <=20s");
+        .unwrap_or(120.0);
+    if !timeout_seconds.is_finite() || timeout_seconds <= 0.0 || timeout_seconds > 600.0 {
+        bail!("Package timeout must be >0 and <=600s");
     }
     let timeout = Duration::from_secs_f64(timeout_seconds);
     let requested_pid = object.get("pid").and_then(Value::as_u64);

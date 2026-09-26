@@ -12,7 +12,8 @@ rbx f ServerScriptService -c Script --limit 5
 rbx f ReplicatedStorage --path Vehicles.Cars -c Model
 rbx tr Workspace Door --depth 2 --limit 100
 rbx in Workspace -i editor:id
-rbx bg Workspace -i editor:id -p Name
+rbx bg Workspace Lobby.Door Anchored
+rbx bg Workspace -i editor:id Name
 rbx bg Workspace -p Gravity
 rbx ss DataStoreService UpdateAsync --limit 20
 rbx sg RemoteEvent --limit 100
@@ -39,7 +40,7 @@ rbx mv StarterGui -i editor:id --to-service ReplicatedStorage -I editor:parent
 rbx br Workspace Lobby.OldPart
 ```
 
-Every store command takes the target the same way: a positional name or dotted path (`Lobby.Door`), `-i ID`, `-x INDEX`, `-n NAME` or `-c CLASS`. `bg`/`bs` with no target address the service itself. Parent options (`-I`) take an ID or a dotted path. Duplicates take inline ordinals (`Borders.Border[4]`, the form compact output prints) or `--ords`.
+Every store command takes the target the same way: a positional name or dotted path (`Lobby.Door`), `-i ID`, `-x INDEX`, `-n NAME` or `-c CLASS`. `bg` takes the property after the target or as `-p`; `bs` takes `-p`. `bg`/`bs` with no target address the service itself. Parent options (`-I`) take an ID or a dotted path. Duplicates take inline ordinals (`Borders.Border[4]`, the form compact output prints) or `--ords`.
 Use a service name or `-f STORE`, not both.
 
 Values: `--str`, `--num`, `--bool`, `--null`, or `-j JSON`. Use `-j -` to read JSON from stdin, including values too large for the OS command line.
@@ -78,12 +79,14 @@ Use ordinary file edits and queries first. `access` is for live engine propertie
 
 ```powershell
 rbx access read Workspace StreamingEnabled
+rbx access read ReplicatedStorage.Shared.PackageLink Status ServerStorage.Tools.PackageLink
 rbx access approve REQUEST_ID
 rbx access write Workspace.Mesh CollisionFidelity Hull
 rbx access mode read-only
 rbx access mode ask
 ```
 
+`read` takes more targets after the property and reads them all in one call under one approval (64 per call); `results` lists each path, class and value. Enumerate the instances first (`f`, `bb` or `l`), then read once.
 The default `ask` mode returns an exact `approval-required` request for unlisted properties. Inspect its target, property and write value before approving; approvals expire, are single-use, and cannot transfer to replacement instances or sessions. `reject REQUEST_ID` discards one. CollisionFidelity is allowlisted with validated enum values.
 
 `read-only` allows protected reads and rejects protected writes. `read-write` allows both, but requires the user's explicit request, a warning about unknown scripts/plugins, and `--accept-risk`. Modes apply only to the selected runtime; they do not restrict ordinary edits or Live Sync. Built-in performance diagnostics remain trusted operations.

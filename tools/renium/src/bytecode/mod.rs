@@ -1491,7 +1491,8 @@ pub(super) fn inspect_command(args: InspectArgs) -> Result<()> {
     print_json_output(&node, args.pretty)
 }
 
-pub(super) fn bytecode_get_property(args: BytecodeGetPropertyArgs) -> Result<()> {
+pub(super) fn bytecode_get_property(mut args: BytecodeGetPropertyArgs) -> Result<()> {
+    let property = get_property_name(&mut args)?;
     let projected_service = project_service_input(
         args.input.settings_file.as_deref(),
         args.input.service_or_file.as_deref(),
@@ -1535,7 +1536,7 @@ pub(super) fn bytecode_get_property(args: BytecodeGetPropertyArgs) -> Result<()>
         "No matching instance",
     )?
     .index;
-    if args.property.eq_ignore_ascii_case("source")
+    if property.eq_ignore_ascii_case("source")
         && is_lua_source_class(&document.instances[index].class_name)
     {
         let direct_source_paths;
@@ -1556,10 +1557,9 @@ pub(super) fn bytecode_get_property(args: BytecodeGetPropertyArgs) -> Result<()>
             return print_json_output(&json!(source), args.pretty);
         }
     }
-    let canonical_property =
-        canonical_stored_property_name(&document, index, &args.property, scope)?;
-    let value = instance_api::get_instance_property(&document, index, &args.property, scope)
-        .or_else(|| {
+    let canonical_property = canonical_stored_property_name(&document, index, &property, scope)?;
+    let value =
+        instance_api::get_instance_property(&document, index, &property, scope).or_else(|| {
             canonical_property.as_deref().and_then(|property| {
                 instance_api::get_instance_property(&document, index, property, scope)
             })
@@ -1581,11 +1581,33 @@ pub(super) fn bytecode_get_property(args: BytecodeGetPropertyArgs) -> Result<()>
     }
     if matches!(scope, PropertyScope::Auto | PropertyScope::Property)
         && let Some((_, value)) =
-            reflected_property_default(&document.instances[index].class_name, &args.property)
+            reflected_property_default(&document.instances[index].class_name, &property)
     {
         return print_json_output(&value, args.pretty);
     }
-    bail!("Property not found: {}", args.property)
+    bail!("Property not found: {property}")
+}
+
+pub(crate) fn get_property_name(args: &mut BytecodeGetPropertyArgs) -> Result<String> {
+    match (args.property.take(), args.property_after_target.take()) {
+        (Some(flag), Some(word)) if flag != word => {
+            bail!("Property given twice: {flag} and {word}")
+        }
+        (Some(property), _) | (None, Some(property)) => return Ok(property),
+        (None, None) => {}
+    }
+    let selector = &mut args.selector;
+    let flagged = selector.settings_id.is_some()
+        || selector.index.is_some()
+        || selector.name.is_some()
+        || selector.class_name.is_some()
+        || selector.path_segments_json.is_some();
+    if flagged && let Some(property) = selector.target.take() {
+        return Ok(property);
+    }
+    bail!(
+        "Name the property: rbx bg SERVICE TARGET PROPERTY, or -p PROPERTY for the service itself"
+    )
 }
 
 fn reflected_property_default(class_name: &str, name: &str) -> Option<(String, Value)> {
