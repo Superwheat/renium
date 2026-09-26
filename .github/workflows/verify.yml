@@ -44,9 +44,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-11-arm]
-    # macOS tests for maintainer pushes run on the maintainer's own Mac; pull
-    # requests never reach that machine.
-    runs-on: ${{ matrix.os == 'macos-latest' && github.event_name == 'push' && fromJSON('["self-hosted", "macOS", "ARM64"]') || matrix.os }}
+    # Linux x64 and macOS tests for maintainer pushes run on the maintainer's
+    # own machines; pull requests never reach them.
+    runs-on: ${{ github.event_name == 'push' && matrix.os == 'macos-latest' && fromJSON('["self-hosted", "macOS", "ARM64"]') || github.event_name == 'push' && matrix.os == 'ubuntu-latest' && fromJSON('["self-hosted", "Linux", "X64"]') || matrix.os }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
@@ -54,7 +54,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.95.0
 
       - uses: Swatinem/rust-cache@v2
-        if: ${{ !(matrix.os == 'macos-latest' && github.event_name == 'push') }}
+        if: ${{ !(github.event_name == 'push' && (matrix.os == 'macos-latest' || matrix.os == 'ubuntu-latest')) }}
         with:
           workspaces: |
             tools/renium

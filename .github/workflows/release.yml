@@ -71,28 +71,33 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # The Windows x64 and both macOS builds run on the maintainer's own
-          # runners; their target directories persist between runs, so nothing
-          # is cached there. The Intel macOS build is cross-compiled on the
-          # Apple Silicon runner and its tests run under Rosetta.
+          # Every CLI build runs on the maintainer's own runners, whose target
+          # directories persist between runs. The ARM64 builds are
+          # cross-compiled: Windows ARM64 on the Windows runner (build only,
+          # nothing there can run ARM64 code), Linux ARM64 on the Linux runner
+          # with its tests under QEMU, and Intel macOS on the Apple Silicon
+          # runner with its tests under Rosetta.
           - os: windows-x64
             runner: '["self-hosted", "Windows", "X64"]'
             hosted: false
             platform: windows-x64
             artifact: cli-Windows-X64
-          - os: windows-11-arm
-            runner: '"windows-11-arm"'
-            hosted: true
+          - os: windows-arm64
+            runner: '["self-hosted", "Windows", "X64"]'
+            hosted: false
+            target: aarch64-pc-windows-msvc
+            skip_tests: true
             platform: windows-arm64
             artifact: cli-Windows-ARM64
-          - os: ubuntu-latest
-            runner: '"ubuntu-latest"'
-            hosted: true
+          - os: linux-x64
+            runner: '["self-hosted", "Linux", "X64"]'
+            hosted: false
             platform: linux-x64
             artifact: cli-Linux-X64
-          - os: ubuntu-24.04-arm
-            runner: '"ubuntu-24.04-arm"'
-            hosted: true
+          - os: linux-arm64
+            runner: '["self-hosted", "Linux", "X64"]'
+            hosted: false
+            target: aarch64-unknown-linux-gnu
             platform: linux-arm64
             artifact: cli-Linux-ARM64
           - os: macos-arm64
@@ -110,6 +115,11 @@ jobs:
     timeout-minutes: 30
     env:
       RENIUM_UPDATE_PUBLIC_KEY: ${{ vars.RENIUM_UPDATE_PUBLIC_KEY }}
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64 -L /usr/aarch64-linux-gnu
+      CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+      CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
+      AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
     steps:
       - uses: actions/checkout@v6
 
@@ -122,6 +132,25 @@ jobs:
         with:
           workspaces: tools/renium
 
+      # ring compiles its C sources for Windows ARM64 with clang, which finds
+      # the C runtime headers and libraries only through the MSVC cross
+      # environment; cl.exe and link.exe come from the same Build Tools.
+      - name: Import the MSVC ARM64 cross environment
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath
+          if (-not $vs) { throw "No Visual Studio instance with the MSVC ARM64 build tools was found" }
+          $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvarsall.bat"
+          $lines = cmd /c "`"$vcvars`" x64_arm64 >nul 2>&1 && set"
+          foreach ($line in $lines) {
+            if ($line -match '^(INCLUDE|LIB|LIBPATH|VCToolsInstallDir|VCINSTALLDIR|WindowsSdkDir|WindowsSDKVersion|UniversalCRTSdkDir|UCRTVersion)=(.*)$') {
+              "$($matches[1])=$($matches[2])" >> $env:GITHUB_ENV
+            }
+          }
+
       - name: Test and build
         shell: pwsh
         run: |
@@ -132,7 +161,9 @@ jobs:
           $env:RUSTFLAGS = "--remap-path-prefix=$cargoHome=/cargo --remap-path-prefix=$PWD=/renium --remap-path-prefix=$HOME=/home"
           $target = "${{ matrix.target }}"
           $targetArgs = if ($target) { @("--target", $target) } else { @() }
-          cargo test --locked --release --manifest-path tools/renium/Cargo.toml @targetArgs
+          if ("${{ matrix.skip_tests }}" -ne "true") {
+            cargo test --locked --release --manifest-path tools/renium/Cargo.toml @targetArgs
+          }
           cargo build --locked --release --manifest-path tools/renium/Cargo.toml @targetArgs
           $binaryDir = if ($target) { "tools/renium/target/$target/release" } else { "tools/renium/target/release" }
           "RENIUM_BINARY_DIR=$binaryDir" >> $env:GITHUB_ENV
