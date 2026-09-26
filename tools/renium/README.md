@@ -1,428 +1,231 @@
-# Renium
+# Renium CLI
 
-Renium keeps Roblox Studio and project files in sync. It includes a CLI,
-[VS Code/Cursor extension](../renium-vscode-extension/readme.md), and
-[Studio plugin](../plugin_ws_bridge/README.md).
+`rbx` keeps a Roblox Studio place and a project folder in sync, edits saved
+instances without Studio, drives Studio and playtests, and calls Open Cloud.
+`renium` is another name for the same program. The
+[VS Code/Cursor extension](../renium-vscode-extension/readme.md) and the
+[Studio plugin](../plugin_ws_bridge/README.md) install with it.
+
+Run `rbx` for the command list and `rbx COMMAND --help` for every option.
 
 ## Install
 
-Get the installer from [Releases](https://github.com/Superwheat/renium/releases/latest).
+Download from [Releases](https://github.com/Superwheat/renium/releases/latest):
 
-- **Windows:** run `Install-Renium.cmd`.
-- **macOS/Linux:** extract the matching ZIP and run `./install.sh`.
+- **Windows:** run `Install-Renium.cmd`. It picks the x64 or ARM64 build.
+- **macOS:** extract the ZIP and open `Install Renium.command`, or run `./install.sh`. Use `~/Applications/Renium Studio.app` for protected properties; the original Studio app is unchanged. Capture and input may need Screen Recording or Accessibility permission.
+- **Linux:** extract the ZIP and run `./install.sh`. Linux gets the offline tools, Open Cloud and plugins, but no Studio features.
 
-Restart the editor and Studio. On macOS, use `~/Applications/Renium Studio.app`
-for protected-property support; capture/input features may need Screen Recording
-or Accessibility permission. Linux supports offline project tools; Studio features
-require Windows or macOS.
+The installer asks which editor should get the extension, puts `rbx` on PATH and
+installs the Studio plugin. Restart the editor and Studio afterwards. Later,
+`rbx upd` updates all three together and `rbx setup --repair` reinstalls the plugin.
 
-`rbx upd` updates installed components. `rbx setup --repair` repairs the plugin.
+### Agents
 
-### Tell your agent
+The installer runs `rbx setup`, which adds a short note about `rbx` to the global
+instructions of the agents it finds: Claude Code (`~/.claude/CLAUDE.md`), Codex
+(`~/.codex/AGENTS.md`), Gemini CLI, OpenCode and Windsurf. `rbx setup --status`
+reports the installation; `rbx setup --uninstall` removes the note and the plugin.
 
-The installer runs `rbx setup`, which adds a short Renium note to the global
-instruction files of the agents it finds: Claude Code (`~/.claude/CLAUDE.md`),
-Codex (`~/.codex/AGENTS.md`), Gemini CLI, OpenCode and Windsurf. The note says
-what `rbx` is and to run `rbx init` in a Roblox project folder. `rbx setup
---status` lists the files; `rbx setup --uninstall` removes the note.
+In a project, `rbx init` writes `RENIUM.md` and its guides, plus pointers in
+`AGENTS.md` and `CLAUDE.md` for Cursor, Claude Code, Codex and Copilot, keeping any
+instructions already there. Other commands never create a project unasked, and the
+editor extension offers to initialize a folder that has none.
 
-Inside a project, `rbx init` writes RENIUM.md plus AGENTS.md and CLAUDE.md
-pointers, which Cursor, Claude Code, Codex and Copilot pick up on their own. The
-editor extension offers to initialize a folder that has no project yet. Nothing
-creates a project by itself.
+## First sync
 
-## Studio audio
-
-`rbx audio mute` / `rbx audio unmute` control the selected Studio's audio without
-editing game sounds. Opt into `rbx audio auto` to mute while Studio is unfocused
-and always unmute when it gains focus, including after reopening;
-`rbx audio off` restores Renium's changes. Nothing is enabled by default.
-Add `--global` to remember the mode for every current and newly opened Studio:
-`rbx audio auto --global`, `rbx audio status --global`, `rbx audio off --global`.
-No project or connection is needed. The setting resumes when Renium starts.
-The same global setting is **Renium: Studio Audio Mode** in editor User Settings,
-or `rbx cfg set studioAudioMode auto --scope user` (`off`, `auto`, or `mute`).
-Changes through settings, the menu and the CLI stay in sync.
-Global `unmute`/`off` restores prior mute states; it does not clear manual mutes.
-On Windows, suppression happens inside Studio, without changing mixer volume
-or leaving a persistent mixer mute. Focused Auto also clears earlier Studio mutes.
-An explicit window command overrides the global mode until the next global change.
-The mode lasts until that process closes. Use `--player 1` for a separate test
-client, `--pid PID` for an exact process, or the editor's **Studio Audio** menu.
-macOS requires a current Renium-launched Studio; unsupported virtual/aggregate
-audio devices report an error. `rbx audio status` shows actual output counts.
-
-## Start two-way sync
-
-Open your place in Studio. For a new project, use a **dedicated empty folder**:
+Open the place in Studio. For a new project, start in an empty folder:
 
 ```powershell
-rbx pl       # Studio → files
-rbx lon      # Start two-way Live Sync
-```
-
-Open that folder in your editor. Save code in the editor; build in Studio.
-For an existing project, start with `rbx lon` from its place folder—don't pull
-over existing work just to connect. The extension offers the same controls.
-
-```powershell
-rbx status   # Studio connection and play state
-rbx lst      # Live Sync state
-rbx lof      # Stop Live Sync
-```
-
-Renium manages its background process and ports. No manual daemon setup is needed.
-
-### Conflicts
-
-Live Sync compares both sides against their last common state. One-sided changes
-transfer, independent changes merge, and conflicting changes wait for a choice.
-The editor prompts; the CLI returns resolution commands.
-
-```powershell
-rbx cfg set liveSync.initialSyncPriority reconcile
-rbx cfg set liveSync.initialConflictPreference none
-```
-
-Initial modes are `reconcile` (apply) and `verify` (report only).
-Conflict preferences are `none`, `studio`, or `editor` (files). A preference
-resolves ordinary conflicts, not direct PackageLink edits.
-
-### Manual sync and failures
-
-```powershell
+rbx init
 rbx pl
-rbx ps src/ServerScriptService/Main.server.luau --verify
-rbx ps src/ReplicatedStorage/Shared
+rbx lon
 ```
 
-Scope pushes to intended files/directories. An unfiltered push reconciles the
-whole place and can remove Studio-only content; it is not a connection check.
+`init` creates the project, `pl` pulls the place into files and `lon` starts Live
+Sync. Open the folder in your editor: saved files go to Studio and Studio edits come
+back as files. The extension has the same controls.
 
-Healthy Live Sync needs no push or repeated verification after each save.
-Unsaved editor buffers do not sync. File edits during Play wait for Edit mode.
+For an existing project, run only `rbx lon`; do not pull over your work to connect.
+To start from a place file, run `rbx init` in its folder, open the file with
+`rbx so Place.rbxl`, then pull. `rbx status` shows the connection, `rbx lst` shows Live Sync and `rbx lof`
+stops it. Renium runs its own background service; there is nothing to set up.
 
-After a failure, inspect `rbx lst --details`, fix the cause, then `rbx rp` to
-retry. `rbx dp` discards pending work. When the next operation needs completed
-sync, `rbx lst --wait 10` waits up to ten seconds.
+## Live Sync
 
-### Undo a sync
+Live Sync compares Studio and the files with the last state they had in common.
+One-sided changes transfer, separate changes merge, and a conflict waits for your
+choice instead of overwriting either side. The editor asks; the CLI prints the
+commands that resolve it, and `rbx lst --details` shows both values. Setting
+`liveSync.initialConflictPreference` to `studio` or `editor` settles ordinary
+first-connection conflicts toward that side.
 
-`rbx rev --sync latest` restores the last reconciled sync's affected files from
-`.renium/editor-history/sync`. A push's `historyId` selects a specific sync.
-Newer edits are protected: restore stops if the affected files have changed.
-Live Sync transfers the restored files; otherwise add `--apply-studio`.
-Add `--details` only when you need every restored path.
+- Unsaved editor buffers do not sync, and file edits made during Play wait for Edit mode.
+- While Live Sync reports no problem, there is no need to push, poll or playtest after each save.
+- After a failure, read `rbx lst --details`, fix the cause, then `rbx rp` to retry or `rbx dp` to discard.
 
-## Publish a place
+Without Live Sync, push only what you changed; `--verify` confirms the script
+source in Studio. A push with no paths reconciles the whole place and can remove
+content that exists only in Studio.
 
 ```powershell
-rbx publish --dry-run
-rbx --place lobby publish
-rbx publish --open-cloud
-rbx publish --open-cloud --file build.rbxl --universe 123 --place-id 456
+rbx ps src/ServerScriptService/Main.server.luau --verify
+rbx rev --sync latest
 ```
 
-`publish` defaults to the selected Studio **Edit** session and its existing place,
-using your Studio login. It publishes Studio's current state, not unsynced files.
-Settle Live Sync first with `rbx lst --wait`. The Studio API needs **Save Place API**
-enabled for the place and cannot save during an active Team Create session. Renium
-does not change those settings or switch authentication automatically.
+`rev` undoes the last sync by restoring the files it changed from
+`.renium/editor-history/sync`, and refuses if they have changed since. Live Sync
+carries the result to Studio; otherwise add `--apply-studio`.
 
-`--open-cloud` builds the selected place project with its normal adapters/toolchains,
-or uploads `--file` without building. It uses `ROBLOX_API_KEY` (or `--key-env ENV`),
-with **Universe Places → Write** permission for the destination. Place/universe IDs
-come from the project unless explicitly supplied. At an experience root, select
-`--place ALIAS`. Builds/uploads are staged locally and cleaned up afterwards.
-
-`--dry-run` validates the source and destination without publishing; it does not
-check Roblox permissions. Cloud dry runs still build the project. Files containing
-EditableImage, EditableMesh, PartOperation, SurfaceAppearance or BaseWrap instances
-are refused because the [Open Cloud API cannot reliably update them](https://create.roblox.com/docs/cloud/guides/usage-place-publishing).
-Studio uses [AssetService.SavePlaceAsync](https://create.roblox.com/docs/reference/engine/classes/AssetService#SavePlaceAsync).
-
-The VS Code/Cursor **Publish Place...** command offers both modes with a destination
-preview and confirmation. Publishing never happens as part of sync, does not create
-a new place, publish packages, or restart servers. A lost response is not success:
-check Roblox's Version History before retrying an unconfirmed publish.
-
-## Project files
+## Project layout
 
 ```text
 renium.project.jsonc
 src/
-  ServerScriptService/
-    Main.server.luau
-  ReplicatedStorage/
-    Config.luau
+  ServerScriptService/Main.server.luau
+  ReplicatedStorage/Config.luau
 instances/
   ServerScriptService.renium
   ReplicatedStorage.renium
 sourcemap.json
 ```
 
-Scripts are normal files. Service stores hold instances, properties, attributes,
-and references; edit them through Renium's Explorer or CLI. Sourcemaps are generated.
-The project config supports custom source roots, mounts, adapters, and filters.
+Scripts are ordinary files; the suffix sets the type (`.server.luau`,
+`.client.luau`, or `.luau` for a ModuleScript). The `instances/` stores hold
+everything else: instances, properties, attributes and references. Commit `src/`
+and `instances/`. `sourcemap.json` is generated and `.renium/` holds local cache and
+undo data.
 
-Keep `instances/` in version control with your scripts. Renium automatically moves
-older stores out of the source folders without changing their bytes. If both
-locations contain different data, migration stops and preserves both copies.
-Each place has its own `instances/`, even with a custom `sourceRoot`.
-The separate `.renium/` directory contains local cache and undo data.
+An experience keeps one project per place under `places/<alias>/`; work from the
+place folder or put `--place <alias|placeId>` before a command. The
+[configuration guide](renium-guides/configuration.md) covers client and server
+folders, mounts, adapters, filters and Rojo import (`rbx ir`). `rbx pv` validates
+the configuration and `rbx ck FILE...` checks Luau syntax, both offline.
 
-The default script layout remains unchanged. To opt into client/server folders,
-add these mappings to `renium.project.jsonc`:
+`rbx cfg list --origins` shows every setting, its allowed values and where its
+value comes from. `rbx cfg set KEY VALUE` writes to the active place; add
+`--scope user`, `workspace` or `experience` to apply it more widely.
 
-```jsonc
-{
-  "schemaVersion": 1,
-  "tree": {
-    "ServerScriptService": { "$path": "src/server" },
-    "StarterPlayer": {
-      "StarterPlayerScripts": {
-        "$className": "StarterPlayerScripts",
-        "$path": "src/client"
-      }
-    },
-    "ReplicatedStorage": { "$path": "src/shared" }
-  }
-}
-```
+## Saved data
 
-Use `Main.server.luau` in `src/server`, `Main.client.luau` in `src/client`,
-and module scripts such as `Config.luau` in `src/shared`. Mappings choose the
-Roblox parent; file suffixes choose script types. Mapped instance stores also
-live under `instances/`, following their Roblox target path.
-
-```powershell
-rbx init my-place --with git,wally,selene,docs
-rbx pv
-rbx build -o build/place.rbxl
-```
-
-`init` preserves existing files; `--preview` shows proposed additions.
-`pv` validates project configuration and mappings, not script syntax.
-`build` creates a place without opening or publishing it.
-
-Check script syntax without Studio or code execution:
-
-```powershell
-rbx ck src/ReplicatedStorage/Config.luau src/ServerScriptService/Main.server.luau
-```
-
-`ck` (`check`) accepts files or `-` for UTF-8 stdin, reports errors per file,
-and exits nonzero if any fail. It does not check types or behavior.
-Use project checks for those; don't use `loadstring` or enable it in Studio for validation.
-
-For multiple places, work in the place folder or use
-`rbx --place <alias|placeId> COMMAND`. Studio targets also accept
-`gameId:placeId`. `rbx cs` lists connected Edit/server/client runtimes.
-
-## Network simulation
-
-For network testing during Play:
-
-```powershell
-rbx net presets
-rbx net set --player 1 --preset mid
-rbx net set --player 2 --preset poor
-rbx net set --player 1 --in-delay 75 --out-jitter 20
-rbx net restore --player 1
-```
-
-`normal`, `mid`, `high` and `poor` are editable starting templates, not guaranteed ping measurements. Each client can use different settings without restarting Play. Commands return the applied values. [Network settings, ranges, templates and cleanup](renium-guides/playtest.md#network-simulation).
-
-## Read and edit data
-
-Saved-data commands work without Studio:
+These commands work on the project files, so Studio can stay closed; Live Sync
+sends the changes to Studio.
 
 ```powershell
 rbx f Workspace -n Door
-rbx in Workspace -i editor:id
-rbx bs Workspace -i editor:id -p Transparency --num 0.5
-rbx ba Workspace -I editor:parent -n NewPart -c Part
-rbx mv Workspace -i editor:id -I editor:parent
-rbx ss DataStoreService UpdateAsync --limit 20
-rbx sg RemoteEvent --limit 100
-rbx q Place.rbxl -n RewardHandler
-rbx cmp Place.rbxl
-rbx cmp Before.rbxl --full --all
-rbx cmp Before.rbxl --against After.rbxlx --full --all
+rbx bs Workspace Lobby.Door -p Transparency --num 0.5
 ```
 
-Reuse returned IDs when names repeat. Live Sync sends changed paths automatically.
-Without Live Sync, push returned paths with their settings IDs rather than the whole service.
-`cmp` compares scripts by default; `--full` includes saved instances, properties, attributes and references. Input is before, project/`--against` is after. `--values` includes source and values, which may contain secrets. `v FILE --json` inspects models, places and Renium stores; use `cmp` for comparisons.
+A target is a dotted path (`Lobby.Door`, or `Borders.Border[4]` for a duplicate
+name), `-i ID`, `-n NAME` or `-c CLASS`. `in` inspects an instance, `bg` reads a
+property, `ba` adds an instance and `sg` searches script lines. `bb` answers many
+field queries in one JSON request.
 
-For bulk analysis, request fields once and process the result locally:
+Place files need no Studio either: `rbx q Place.rbxl -n Door` searches one, `rbx cmp Before.rbxl --full` compares every saved instance and property with
+the project (or `--against` another file), `rbx bep -o place.rbxl` builds one and
+`rbx pi Place.rbxl` imports one into the project.
 
-```powershell
-'{"ops":[{"type":"search","q":"Door","limit":10,"fields":"lookup,prop:Anchored"}]}' | rbx bb Workspace -J -
-```
-
-Use live Luau only for unsaved Studio state or runtime APIs.
-[Full data guide](renium-guides/data.md).
-
-### Protected properties and functions
+## Protected properties
 
 ```powershell
 rbx access read Workspace StreamingEnabled
 rbx access approve REQUEST_ID
-rbx access write Workspace.Mesh CollisionFidelity Hull
-rbx access call HttpRbxApiService GetAsyncFullUrl '["https://apis.roblox.com/creator-inventory-api/v1/-/creator-inventory-items:search?maxPageSize=25&filter=assetTypes%3DModel%3Bsources%3DCreated"]'
 ```
 
-`access call TARGET FUNCTION '[ARGUMENTS]'` also supports `HttpRbxApiService`
-`GetAsync`, `GetAsyncFullUrl`, `PostAsync`, `PostAsyncFullUrl`, and
-`GetDocumentationUrl`. Function calls use the same exact, one-use approval flow;
-read-only mode rejects them because functions can have side effects. Arguments
-are a JSON array; optional enum arguments use their integer values. Unsupported
-functions fail before execution. Authenticated full URLs must use HTTPS on Roblox.
-No function grant changes ordinary script/plugin permissions. A timed-out call
-may still complete; inspect its result before repeating a mutation.
+`access` reads and writes engine properties that Studio's scripting API blocks, in
+Edit mode on Windows and macOS. By default, a read or write outside a short
+allowlist runs only after you approve that exact operation, and each approval works
+once. One read can list up to 64 instances after the property under a single
+approval. `rbx access mode read-only` refuses writes. See the
+[data guide](renium-guides/data.md#protected-studio-properties) for details.
 
-`access batch TARGET FUNCTION '[[ARGUMENTS], [ARGUMENTS]]'` approves up to 32
-ordered calls together (60 KiB of input, 30-second total deadline). Every argument
-array is validated before execution. It stops at the first failure and reports
-completed, unconfirmed, and unexecuted calls separately; it never retries a call.
-
-On Windows and macOS Edit mode, `access` reads or writes properties blocked by
-ordinary APIs. The default `ask` mode requires approval for the exact operation;
-validated CollisionFidelity operations are allowlisted. `read-only` permits reads
-but not protected writes. Unrestricted `read-write` requires explicit user opt-in.
-[Modes, safety and supported values](renium-guides/data.md#protected-studio-properties).
-
-## Roblox packages
-
-Editing a linked package marks it **Changed** while preserving its PackageLink.
-The result names affected packages, even if a later part of the edit fails.
+## Studio and playtests
 
 ```powershell
-rbx pd ReplicatedStorage.SharedPackage   # Mark Changed
-rbx pp ReplicatedStorage.SharedPackage   # Publish changes
-rbx pu ReplicatedStorage.SharedPackage   # Discard changes and fetch latest
-```
-
-These target package roots on Windows/macOS. Use `--ords` for duplicate names
-or a JSON array for path segments containing dots.
-`upl` removes the PackageLink but keeps contents; it is not desync.
-Publishing is a separate choice, never an automatic part of syncing.
-
-## Verify without unnecessary playtests
-
-Check saved code/data with offline queries, focused assertions, and the project's
-tests first. Use Play only for a specific runtime question those checks cannot answer,
-such as replication, input, or physics—not every edit or sync verification.
-Reuse a suitable session and batch related checks.
-
-```powershell
-rbx play -s
+rbx play -s --players 2
 rbx lc "return game.Players.LocalPlayer.Name" 1
-rbx co --player 1 -n 20
-rbx play -x
 ```
 
-Ordinary Play is enough for one-client checks. `--players 2` starts a local server
-and two clients. `l` targets Edit or the Play server; `lc` targets a client.
+`play -s` starts Play and `play -x` stops it; `--players 2` starts a local server
+with two clients. `l` runs Luau in Edit, or on the server during Play, and `lc`
+runs it on a client. `co` reads a console. Printed output comes back to you instead
+of Studio's Output. Check saved code with offline queries and tests first, start
+Play only for runtime questions such as input, replication or physics, and reuse a
+running session.
 
-### Record and inspect
+`ro` reopens the remembered place and `so` opens a file, both without Studio taking
+focus; `sx` closes Studio. `rbx audio auto --global` mutes Studio while it is not
+focused, leaving game sounds unchanged.
 
-For an Edit-mode recording:
+## Packages and publishing
 
 ```powershell
-rbx rs --studio -o clips/edit.mp4
-rbx re
-rbx rf clips/edit.mp4 --page 1
-rbx rf clips/edit.mp4 --frame 15
+rbx pp ReplicatedStorage.SharedPackage
+rbx publish --dry-run
 ```
 
-`re` returns a timestamped overview PNG alongside the silent MP4.
-An overview samples the clip; pages contain every consecutive captured frame.
-Extract a full-resolution frame for detail. Review runs offline without FFmpeg
-or scripts. [Capture guide](renium-guides/capture-device.md).
+An edit inside a linked package marks it Changed first and keeps its PackageLink;
+the result lists those packages in `autoDesyncedPackages`, even when the edit
+fails. `pd` marks a package Changed, `pp` publishes it and `pu` discards changes
+and fetches the published version, without dialogs or focus. They wait up to two
+minutes (`--timeout` up to 600 seconds).
 
-Device simulation changes viewport layout. Resource profiles limit CPU/memory;
-they are approximate tiers, not hardware emulators, and cannot exceed the host.
+`publish` sends the selected Studio Edit session to its existing place with your
+Studio login, so let Live Sync settle first (`rbx lst --wait`). When the place
+refuses the save API, Renium uses Studio's own Publish command. `--open-cloud`
+builds and uploads the project with an API key instead. If a publish is not
+confirmed, check Version History before retrying. Nothing is published as part of
+sync.
 
-### Investigate lag and network traffic
-
-Built-in profiling is a trusted Renium workflow, separate from arbitrary
-protected-property access. See the [performance guide](renium-guides/performance.md)
-for runtime targeting, measurements and resource limits.
-
-## Settings and references
+## Git, collaboration and Open Cloud
 
 ```powershell
-rbx cfg list --origins
-rbx cfg get liveSync.initialSyncPriority
-rbx cfg set liveSync.initialConflictPreference none
-rbx cfg unset liveSync.initialConflictPreference
+rbx vci
+rbx oc key add studio
 ```
 
-Settings list their current and allowed values. Writes target the active place;
-`--scope user`, `workspace`, or `experience` selects a wider scope.
-Precedence: user, workspace, experience, place, project, editor, CLI overrides.
-
-Use `rbx` to list commands and `rbx COMMAND --help` for exact options.
-
-| Workflow | Guide |
-|---|---|
-| Instances, scripts, batch reads/edits | [Data](renium-guides/data.md) |
-| Pull, push, Live Sync | [Sync](renium-guides/sync.md) |
-| Mounts, adapters, filters, Rojo import | [Configuration](renium-guides/configuration.md) |
-| Models, place files, packages, links, Wally, Git | [Projects](renium-guides/projects.md) |
-| Play, client/server Luau, console | [Playtests](renium-guides/playtest.md) |
-| UI, input, movement | [Input](renium-guides/input.md) |
-| Screenshots, recordings, device layout | [Capture](renium-guides/capture-device.md) |
-| Lag spikes, MicroProfiler, replication, resource limits | [Performance](renium-guides/performance.md) |
-| Open Cloud, publishing, Creator Store | [Cloud](renium-guides/opencloud.md) |
-| Studio lifecycle and place management | [Advanced](renium-guides/advanced.md) |
-
-Git commits, Studio sync, place builds, and Roblox publishing are separate operations.
-Cloud commands need no Studio; supply credentials through environment variables,
-not arguments. `rbx oc routes` lists cloud operations.
-
-Agents read generated `RENIUM.md` and its guides. `init` adds pointers in
-`AGENTS.md`/`CLAUDE.md` without replacing existing instructions.
-
-## Troubleshooting
-
-- **Disconnected:** `rbx status`; check the target place/plugin. Restart that
-  Studio target after a plugin update.
-- **Ambiguous runtime:** specify the place; `rbx cs` distinguishes Edit/server/client.
-- **Pending sync:** `rbx lst --details`; resolve the cause instead of forcing a push/pull.
-- **Installation/config:** `rbx dr --json`. `rbx dr --bundle diagnostics` creates
-  a report; review it before sharing.
-
-[Report bugs](https://github.com/Superwheat/renium/issues) with the version, OS,
-command/editor action, and actual error.
-
-Format limits: `TextChatMessage.Timestamp` and Studio-only `QDir`/`QFont` fields
-are unsupported. Content supports URI/None; Object/Opaque sources stop export
-instead of silently losing data. Infinity/NaN use tagged values. Script comparison
-ignores line-ending-only differences.
+`vci` sets up Git to diff `.renium` stores as text and merge them with Renium. A
+commit or push never publishes to Roblox. `rbx collab start` shares the project live
+with other editors and prints an invite. `oc key add` stores an API key from a
+hidden prompt (DPAPI on Windows, the Keychain on macOS), and every `oc` command uses
+it when `ROBLOX_API_KEY` is unset, so keys stay out of arguments and project files.
 
 ## Plugins
 
-Plugins add commands to Renium, from small helpers to whole workflows, without
-changing its source.
+`rbx plugin new my-plugin` starts a plugin: one manifest for its commands and a
+Rust handler using the included SDK. Build it with `cargo build --release` in its
+folder, then `rbx plugin install ./my-plugin --dev`. Installing never builds or runs it.
+Plugins are native code with your account's access; install only ones you trust.
 
-```powershell
-rbx plugin new my-plugin
-# In my-plugin: cargo build --release
-rbx plugin install ./my-plugin --dev
-rbx my-plugin hello --name World
-```
+## Guides
 
-One manifest defines commands, arguments, help and time budgets; one Rust handler
-implements them using the included SDK. No Renium source changes or separate SDK
-install. `plugin list` shows installed plugins; `plugin info NAME` shows a plugin's
-guide. Installation never builds or executes a plugin. Install only trusted native code.
+Agents read the same guides, starting from the [agent guide](renium-agents.md).
 
-[Authoring guide](renium-guides/plugins.md).
+| Topic | Start with | Guide |
+|---|---|---|
+| Pull, push, Live Sync, conflicts, undo | `rbx lon` | [Sync](renium-guides/sync.md) |
+| Saved instances, scripts, bulk queries, protected properties, place comparison | `rbx f`, `rbx bb` | [Data](renium-guides/data.md) |
+| Layout, mappings, mounts, adapters, filters, Rojo import | `rbx cfg list` | [Configuration](renium-guides/configuration.md) |
+| Models, place files, packages, links, Wally, Git, live collaboration | `rbx bep`, `rbx collab` | [Projects](renium-guides/projects.md) |
+| Play, live Luau, consoles, network simulation | `rbx play -s`, `rbx net` | [Playtests](renium-guides/playtest.md) |
+| UI, input, movement | `rbx ui`, `rbx inp` | [Input](renium-guides/input.md) |
+| Screenshots, recordings, device simulation | `rbx sc`, `rbx rs` | [Capture](renium-guides/capture-device.md) |
+| Lag spikes, MicroProfiler, resource limits | `rbx perf`, `rbx pf` | [Performance](renium-guides/performance.md) |
+| Open Cloud, API keys, creator assets | `rbx oc` | [Cloud](renium-guides/opencloud.md) |
+| Studio lifecycle, places, audio, publishing | `rbx ro`, `rbx publish` | [Advanced](renium-guides/advanced.md) |
+| Using and writing plugins | `rbx plugin` | [Plugins](renium-guides/plugins.md) |
 
-## Build
+## Troubleshooting
+
+- **No Studio connection:** `rbx status` names the cause: Studio closed, plugin missing, plugin needs a Studio restart, plugin not connecting, or another place open. Restart Studio after a plugin update.
+- **Several Studios or places:** `rbx cs` lists Edit, server and client runtimes; add `--place` to pick one.
+- **Sync failed or pending:** read `rbx lst --details` and fix the cause instead of forcing a push or pull.
+- **Installation or configuration:** run `rbx dr --json`. `rbx dr --bundle diagnostics` writes a report; review it before sharing.
+
+[Report a bug](https://github.com/Superwheat/renium/issues) with the Renium version,
+your OS, the command or editor action, and the exact error.
+
+## Build from source
 
 Run Cargo from `tools/renium` so it uses the pinned Rust toolchain:
 
@@ -434,11 +237,9 @@ cd ../..
 ./tools/build-release.ps1 -LocalBuild
 ```
 
-Release builds retain optimized code between edits. Keep `target/` to benefit from
-the cache; the first build takes longer. ThinLTO and full release optimization
-remain enabled.
-
-The last command bundles the CLI, extension, and plugin. Before replacing a locked
-installed executable, stop Renium with `rbx dm stop --all`, not unrelated Studio processes.
+`cargo build --profile fast` skips link-time optimization and takes about half
+the time of a release build. The last command bundles the CLI, extension and plugin
+under `dist/`. To replace an installed executable that is in use, stop Renium with
+`rbx dm stop --all` rather than closing Studio.
 
 [License](../../LICENSE)
