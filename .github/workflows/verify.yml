@@ -44,7 +44,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-11-arm]
-    runs-on: ${{ matrix.os }}
+    # macOS tests for maintainer pushes run on the maintainer's own Mac; pull
+    # requests never reach that machine.
+    runs-on: ${{ matrix.os == 'macos-latest' && github.event_name == 'push' && fromJSON('["self-hosted", "macOS", "ARM64"]') || matrix.os }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
@@ -52,11 +54,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.95.0
 
       - uses: Swatinem/rust-cache@v2
+        if: ${{ !(matrix.os == 'macos-latest' && github.event_name == 'push') }}
         with:
           workspaces: |
             tools/renium
             tools/renium-plugin-sdk
             tools/vendor/rbx-dom
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
 
       - name: Run CLI tests
         run: cargo test --locked --manifest-path tools/renium/Cargo.toml
@@ -92,7 +99,10 @@ jobs:
         with:
           workspaces: tools/renium
 
+      # The maintainer's runner carries its own rojo and lune; aftman would
+      # install into the user profile instead.
       - uses: ok-nick/setup-aftman@e226f24209f47677da7b215bab44f6351a2c043b
+        if: github.event_name != 'push'
         with:
           version: v0.3.0
 

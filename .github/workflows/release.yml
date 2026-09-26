@@ -71,26 +71,41 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # The Windows x64 build runs on the maintainer's own runner; its
-          # target directory persists between runs, so nothing is cached here.
+          # The Windows x64 and both macOS builds run on the maintainer's own
+          # runners; their target directories persist between runs, so nothing
+          # is cached there. The Intel macOS build is cross-compiled on the
+          # Apple Silicon runner and its tests run under Rosetta.
           - os: windows-x64
             runner: '["self-hosted", "Windows", "X64"]'
             hosted: false
+            platform: windows-x64
+            artifact: cli-Windows-X64
           - os: windows-11-arm
             runner: '"windows-11-arm"'
             hosted: true
+            platform: windows-arm64
+            artifact: cli-Windows-ARM64
           - os: ubuntu-latest
             runner: '"ubuntu-latest"'
             hosted: true
+            platform: linux-x64
+            artifact: cli-Linux-X64
           - os: ubuntu-24.04-arm
             runner: '"ubuntu-24.04-arm"'
             hosted: true
-          - os: macos-latest
-            runner: '"macos-latest"'
-            hosted: true
-          - os: macos-15-intel
-            runner: '"macos-15-intel"'
-            hosted: true
+            platform: linux-arm64
+            artifact: cli-Linux-ARM64
+          - os: macos-arm64
+            runner: '["self-hosted", "macOS", "ARM64"]'
+            hosted: false
+            platform: macos-arm64
+            artifact: cli-macOS-ARM64
+          - os: macos-x64
+            runner: '["self-hosted", "macOS", "ARM64"]'
+            hosted: false
+            target: x86_64-apple-darwin
+            platform: macos-x64
+            artifact: cli-macOS-X64
     runs-on: ${{ fromJSON(matrix.runner) }}
     timeout-minutes: 30
     env:
@@ -99,6 +114,8 @@ jobs:
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         if: matrix.hosted
@@ -113,18 +130,22 @@ jobs:
           # Paths of the build machine never reach the binary or the logs.
           $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME ".cargo" }
           $env:RUSTFLAGS = "--remap-path-prefix=$cargoHome=/cargo --remap-path-prefix=$PWD=/renium --remap-path-prefix=$HOME=/home"
-          cargo test --locked --release --manifest-path tools/renium/Cargo.toml
-          cargo build --locked --release --manifest-path tools/renium/Cargo.toml
+          $target = "${{ matrix.target }}"
+          $targetArgs = if ($target) { @("--target", $target) } else { @() }
+          cargo test --locked --release --manifest-path tools/renium/Cargo.toml @targetArgs
+          cargo build --locked --release --manifest-path tools/renium/Cargo.toml @targetArgs
+          $binaryDir = if ($target) { "tools/renium/target/$target/release" } else { "tools/renium/target/release" }
+          "RENIUM_BINARY_DIR=$binaryDir" >> $env:GITHUB_ENV
 
       - name: Package CLI
         shell: pwsh
         run: |
           $version = "${{ needs.verify-tag.outputs.version }}"
-          $platform = "${{ runner.os }}-${{ runner.arch }}".ToLowerInvariant()
+          $platform = "${{ matrix.platform }}"
           $stage = Join-Path $env:RUNNER_TEMP "renium-$version-$platform"
           New-Item -ItemType Directory -Path $stage | Out-Null
           $binary = if ("${{ runner.os }}" -eq "Windows") { "renium.exe" } else { "renium" }
-          Copy-Item "tools/renium/target/release/$binary" $stage
+          Copy-Item (Join-Path $env:RENIUM_BINARY_DIR $binary) $stage
           Copy-Item tools/renium/renium-agents.md $stage
           Copy-Item tools/renium/renium-guides $stage -Recurse
           $readme = (Get-Content tools/renium/RELEASE_README.md -Raw).Replace("{{VERSION}}", $version)
@@ -164,7 +185,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: cli-${{ runner.os }}-${{ runner.arch }}
+          name: ${{ matrix.artifact }}
           path: ${{ env.RENIUM_ARCHIVE }}
           if-no-files-found: error
 
