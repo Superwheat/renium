@@ -660,14 +660,22 @@ fn stage_tree_node(
     } else {
         fs::create_dir_all(&target_path)?;
     }
+    let container_class = if node.class_name.is_none() {
+        super::engine_container_class(&target.join("."))
+    } else {
+        None
+    };
     if node.id.is_some()
         || node.class_name.is_some()
+        || container_class.is_some()
         || !node.properties.is_empty()
         || !node.attributes.is_empty()
         || node.tags.is_some()
     {
         let inferred_class;
         let class_name = if let Some(class_name) = node.class_name.as_deref() {
+            class_name
+        } else if let Some(class_name) = container_class {
             class_name
         } else if target.len() == 1 {
             target[0].as_str()
@@ -692,7 +700,7 @@ fn stage_tree_node(
         override_stage_identity(
             stage,
             target,
-            node.class_name.as_deref(),
+            node.class_name.as_deref().or(container_class),
             node.id.as_deref(),
         )?;
         update_stage_instance(

@@ -35,7 +35,10 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
         "Examples:\n  rbx cfg list\n  rbx cfg get liveSync.initialSyncPriority\n  rbx cfg set liveSync.initialSyncPriority reconcile",
     ),
     ("ad", "Examples:\n  rbx ad validate"),
-    ("ir", "Examples:\n  rbx ir --project default.project.json"),
+    (
+        "ir",
+        "Examples:\n  rbx ir --preview\n  rbx ir default.project.json --apply",
+    ),
     ("init", "Examples:\n  rbx init ."),
     ("build", "Examples:\n  rbx build"),
     (

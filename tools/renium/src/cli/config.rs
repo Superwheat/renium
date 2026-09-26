@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::parser::ValueSource;
@@ -23,10 +23,10 @@ pub(crate) fn apply_merged(cli: &mut Cli, matches: &clap::ArgMatches) -> Result<
         .or_else(|| active_command_path(matches, "root"));
     let root = match cli.project.as_deref().or(command_root.as_deref()) {
         Some(project) if project.is_dir() => project.to_path_buf(),
-        Some(project) => project
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf(),
+        Some(project) => match project.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+            _ => std::env::current_dir()?,
+        },
         None => std::env::current_dir()?,
     };
     let config = config::load_merged_config(&root)?;

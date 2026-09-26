@@ -729,6 +729,57 @@ mod tests {
     }
 
     #[test]
+    fn starter_player_containers_take_their_engine_class_without_a_declaration() -> Result<()> {
+        let root = fixture()?;
+        let _cleanup = OnDrop::new(|| {
+            forget(&root);
+            let _ = fs::remove_dir_all(&root);
+        });
+        fs::write(
+            root.join("renium.project.jsonc"),
+            serde_json::to_vec(&json!({
+                "schemaVersion": 1,
+                "tree": {
+                    "StarterPlayer": {
+                        "StarterPlayerScripts": { "$path": "src/client" },
+                        "StarterCharacterScripts": { "$path": "src/character" },
+                        "Extras": { "$path": "src/extras" }
+                    }
+                }
+            }))?,
+        )?;
+        for directory in ["client", "character", "extras"] {
+            fs::create_dir_all(root.join("src").join(directory))?;
+            fs::write(
+                root.join("src").join(directory).join("Main.client.luau"),
+                b"print('mapped')\n",
+            )?;
+        }
+        let loaded = config::load_project(Some(&root.join("renium.project.jsonc")), None)?;
+        let stage = config::stage_project(&loaded)?;
+        let settings =
+            crate::system::files::service_settings_path(&stage.root().join("StarterPlayer"));
+        let document = SettingsBytecode::read_file(&settings)?;
+        let class_of = |name: &str| {
+            document
+                .instances
+                .iter()
+                .find(|instance| instance.name == name)
+                .map(|instance| instance.class_name.clone())
+        };
+        assert_eq!(
+            class_of("StarterPlayerScripts").as_deref(),
+            Some("StarterPlayerScripts")
+        );
+        assert_eq!(
+            class_of("StarterCharacterScripts").as_deref(),
+            Some("StarterCharacterScripts")
+        );
+        assert_eq!(class_of("Extras").as_deref(), Some("Folder"));
+        Ok(())
+    }
+
+    #[test]
     fn stores_without_scripts_survive_projection_and_snapshot_publication() -> Result<()> {
         let root = fixture()?;
         let _cleanup = OnDrop::new(|| {

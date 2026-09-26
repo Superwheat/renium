@@ -244,6 +244,7 @@ fn checks_agent_instructions(command: &Commands) -> bool {
     !matches!(
         command,
         Commands::Init(_)
+            | Commands::ImportRojo(_)
             | Commands::Plugin(_)
             | Commands::External(_)
             | Commands::CheckLuau(_)

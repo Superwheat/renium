@@ -621,15 +621,30 @@ pub struct AdapterWatchArgs {
 
 #[derive(Args)]
 pub struct ImportRojoArgs {
-    #[arg(long, value_name = "PATH")]
-    pub project: PathBuf,
-    #[arg(long, conflicts_with = "apply")]
+    #[arg(
+        help = "Rojo project file, or a folder that holds one (default: the current folder)",
+        value_name = "PATH"
+    )]
+    pub path: Option<PathBuf>,
+    #[arg(
+        long,
+        conflicts_with = "apply",
+        help = "Print the converted project instead of writing it"
+    )]
     pub preview: bool,
-    #[arg(long)]
+    #[arg(long, help = "Write renium.project.jsonc next to the Rojo project")]
     pub apply: bool,
-    #[arg(short, long, value_name = "PATH")]
+    #[arg(
+        short,
+        long,
+        value_name = "PATH",
+        help = "Write the converted project to this file instead"
+    )]
     pub output: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Replace an existing renium.project.jsonc that differs from the conversion"
+    )]
     pub force: bool,
 }
 
@@ -2197,17 +2212,18 @@ pub fn run_adapters(args: AdaptersArgs, global_project: Option<&Path>) -> Result
 }
 
 pub fn run_import_rojo(args: ImportRojoArgs) -> Result<()> {
-    let source = if args.project.is_dir() {
-        let candidates = rojo_project_files(&args.project)?;
+    let requested = args
+        .path
+        .or_else(crate::app::context::project_override)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let source = if requested.is_dir() {
+        let candidates = rojo_project_files(&requested)?;
         match candidates.as_slice() {
             [only] => only.clone(),
-            [] => bail!(
-                "No *.project.json file exists in {}",
-                args.project.display()
-            ),
+            [] => bail!("No *.project.json file exists in {}", requested.display()),
             many => bail!(
                 "Multiple Rojo projects exist in {}: {}",
-                args.project.display(),
+                requested.display(),
                 many.iter()
                     .map(|path| path.display().to_string())
                     .collect::<Vec<_>>()
@@ -2215,36 +2231,70 @@ pub fn run_import_rojo(args: ImportRojoArgs) -> Result<()> {
             ),
         }
     } else {
-        args.project
+        requested
     };
-    let converted = convert_rojo_project(&source)?;
-    let value = serde_json::to_value(&converted)?;
-    let text = serde_json::to_string_pretty(&value)? + "\n";
+    let text = rojo_project_text(&source)?;
     if !args.apply || args.preview {
         print!("{text}");
         return Ok(());
     }
+    let explicit_output = args.output.is_some();
     let output = args.output.unwrap_or_else(|| {
         source
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join(PROJECT_FILE_NAME)
     });
-    if output.exists() && !args.force {
-        bail!(
-            "{} already exists; use --force to replace it",
-            output.display()
-        );
+    if output.exists() {
+        let current =
+            fs::read(&output).with_context(|| format!("Failed to read {}", output.display()))?;
+        if current == text.as_bytes() {
+            return crate::app::output::emit_global_output(
+                &json!({
+                    "ok": true,
+                    "source": source,
+                    "output": output,
+                    "changed": false,
+                }),
+                &format!("{} already matches {}", output.display(), source.display()),
+            );
+        }
+        if !args.force {
+            bail!(
+                "{} already exists and differs from the conversion; use --force to replace it",
+                output.display()
+            );
+        }
     }
     atomic_write_file(&output, text.as_bytes())?;
+    if !explicit_output {
+        crate::project::workflows::refresh_agent_instructions(
+            output.parent().unwrap_or_else(|| Path::new(".")),
+        )?;
+    }
     crate::app::output::emit_global_output(
         &json!({
             "ok": true,
             "source": source,
             "output": output,
+            "changed": true,
         }),
         &format!("Imported {} into {}", source.display(), output.display()),
     )
+}
+
+pub(crate) fn rojo_project_text(source: &Path) -> Result<String> {
+    let converted = convert_rojo_project(source)?;
+    let value = serde_json::to_value(&converted)?;
+    Ok(serde_json::to_string_pretty(&value)? + "\n")
+}
+
+pub(crate) fn engine_container_class(target: &str) -> Option<&'static str> {
+    match target {
+        "StarterPlayer.StarterPlayerScripts" => Some("StarterPlayerScripts"),
+        "StarterPlayer.StarterCharacterScripts" => Some("StarterCharacterScripts"),
+        _ => None,
+    }
 }
 
 pub fn load_project(explicit: Option<&Path>, start: Option<&Path>) -> Result<LoadedProject> {
@@ -2435,7 +2485,7 @@ fn project_file_in_directory(directory: &Path) -> Result<PathBuf> {
     }
 }
 
-fn rojo_project_files(directory: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) fn rojo_project_files(directory: &Path) -> Result<Vec<PathBuf>> {
     if !directory.is_dir() {
         return Ok(Vec::new());
     }
@@ -2846,7 +2896,7 @@ fn filter_matches(
         || rule.id.is_some())
 }
 
-fn convert_rojo_project(path: &Path) -> Result<ReniumProject> {
+pub(crate) fn convert_rojo_project(path: &Path) -> Result<ReniumProject> {
     let text =
         fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
     let value = parse_jsonc_value(&text)?;
@@ -2971,6 +3021,11 @@ fn convert_rojo_node(
         .as_object()
         .with_context(|| format!("Rojo tree node '{target}' must be an object"))?;
     let mut converted = convert_rojo_node_fields(node, Some(target))?;
+    if converted.class_name.is_none()
+        && let Some(class_name) = engine_container_class(target)
+    {
+        converted.class_name = Some(class_name.to_string());
+    }
     if let Some(path) = node.get("$path").and_then(Value::as_str) {
         let relative = PathBuf::from(path);
         let resolved = root.join(&relative);
@@ -3529,6 +3584,41 @@ fn print_json(value: &Value, pretty: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rojo_conversion_names_starter_player_containers() -> Result<()> {
+        let root = crate::tests::support::temp_dir("rojo-starter-player");
+        fs::create_dir_all(root.join("src/client"))?;
+        let project = root.join("default.project.json");
+        fs::write(
+            &project,
+            serde_json::to_vec(&json!({
+                "name": "starter",
+                "tree": {
+                    "$className": "DataModel",
+                    "StarterPlayer": {
+                        "StarterPlayerScripts": { "$path": "src/client" },
+                        "StarterCharacterScripts": { "$path": "src/character" },
+                        "Extras": { "$path": "src/extras" }
+                    }
+                }
+            }))?,
+        )?;
+        let converted = convert_rojo_project(&project)?;
+        let starter = &converted.tree["StarterPlayer"];
+        assert_eq!(
+            starter.children["StarterPlayerScripts"]["$className"],
+            "StarterPlayerScripts"
+        );
+        assert_eq!(
+            starter.children["StarterCharacterScripts"]["$className"],
+            "StarterCharacterScripts"
+        );
+        assert!(starter.children["Extras"].get("$className").is_none());
+        assert!(rojo_project_text(&project)?.contains("\"StarterPlayerScripts\""));
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
 
     #[test]
     fn script_naming_uses_nearest_ancestor_not_a_textual_prefix() {

@@ -8,9 +8,11 @@
 - `rbx access` describes every argument in `--help`; TARGET, PROPERTY, `--ords`, VALUE, FUNCTION, ARGUMENTS and REQUEST_ID used to be blank.
 - `rbx bg SERVICE TARGET PROPERTY` takes the property as a plain word after the target; `-p PROPERTY` still works, and with a flag selector such as `-i ID` or `-n NAME` the one free word is the property. A property written without `-p` used to be rejected, for example with "the following required arguments were not provided: --property".
 - `rbx pp` and `rbx pu` wait up to 120 seconds by default instead of 20, and `--timeout` accepts up to 600 seconds. Publishing a large package used to fail every time with "Package operation did not finish before the deadline" or "Studio helper exceeded its 19989ms deadline", and `--timeout 60` was rejected with "Package timeout must be >0 and <=20s".
+- `rbx init` in a folder that holds a Rojo project converts its `*.project.json` into `renium.project.jsonc` instead of writing a starter project beside it, so a Rojo project moves over with `rbx init` and `rbx lon`. `rbx ir` takes the Rojo file or folder as its argument (`rbx ir --preview`, `rbx ir default.project.json --apply`), writes the agent guides together with the project, and reports an existing identical file as unchanged instead of demanding `--force`. `rbx ir --project FILE` used to stop before converting anything.
 
 ### Bug fixes
 
+- A project tree node named `StarterPlayerScripts` or `StarterCharacterScripts` under `StarterPlayer` builds that class when it declares no `$className`, as it does in Rojo, instead of becoming a Folder that Studio ignores; converted Rojo projects also carry the class explicitly.
 - `rbx ro` and `rbx so` no longer fail on Windows with "Could not protect Studio activation: A dynamic link library (DLL) initialization routine failed. (os error 1114)" when Studio is still running its loader at launch. The launch guard retries a module snapshot that Windows briefly reports as unreadable, recognizes its own image under another spelling of the same path, and repeats the protection call instead of giving up on the first transient failure.
 
 ## 0.3.12 - 2026-09-26

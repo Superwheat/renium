@@ -144,6 +144,8 @@ struct InitPlan {
     update: Vec<String>,
     keep: Vec<String>,
     directories: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    converted: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -172,8 +174,12 @@ fn default_daemon_name() -> String {
 
 pub fn run_init(args: InitArgs) -> Result<()> {
     let root = absolute_path(&args.path);
-    let source_root = detect_init_source_root(&root)?;
-    let files = init_files(&root, &source_root, &args.with)?;
+    let rojo_project = rojo_project_to_convert(&root)?;
+    let source_root = match &rojo_project {
+        Some(path) => config::convert_rojo_project(path)?.source_root,
+        None => detect_init_source_root(&root)?,
+    };
+    let files = init_files(&root, &source_root, &args.with, rojo_project.as_deref())?;
     let source_directory = root.join(&source_root);
     validate_init_output_types(&files, &source_directory)?;
     let mut create = Vec::new();
@@ -201,6 +207,9 @@ pub fn run_init(args: InitArgs) -> Result<()> {
             .then(|| relative_display(&root, &source_directory))
             .into_iter()
             .collect(),
+        converted: rojo_project
+            .as_deref()
+            .map(|path| relative_display(&root, path)),
     };
     if args.preview {
         return crate::emit_global_output(
@@ -339,14 +348,30 @@ fn format_init_plan(action: &str, plan: &InitPlan, completed: bool) -> String {
     } else {
         ("create", "update", "keep", "create directories")
     };
+    let converted = plan
+        .converted
+        .as_deref()
+        .map_or(String::new(), |name| format!(", converted {name}"));
     format!(
-        "{action} {}: {create} {}, {update} {}, {keep} {}, {directories} {}",
+        "{action} {}: {create} {}, {update} {}, {keep} {}, {directories} {}{converted}",
         plan.root.display(),
         format_init_paths(&plan.create),
         format_init_paths(&plan.update),
         format_init_paths(&plan.keep),
         format_init_paths(&plan.directories),
     )
+}
+
+fn rojo_project_to_convert(root: &Path) -> Result<Option<PathBuf>> {
+    if root.join(PROJECT_FILE_NAME).is_file() || root.join(config::PROJECT_JSON_FILE_NAME).is_file()
+    {
+        return Ok(None);
+    }
+    let candidates = config::rojo_project_files(root)?;
+    Ok(match candidates.as_slice() {
+        [only] => Some(only.clone()),
+        _ => None,
+    })
 }
 
 fn format_init_paths(paths: &[String]) -> String {
@@ -986,6 +1011,7 @@ fn init_files(
     root: &Path,
     source_root: &Path,
     features: &[InitFeature],
+    rojo_project: Option<&Path>,
 ) -> Result<Vec<(PathBuf, Vec<u8>)>> {
     let renium_instructions = agent_instructions()?;
     let agent_instructions = merged_instruction_file(&root.join("AGENTS.md"))?;
@@ -995,7 +1021,10 @@ fn init_files(
         .and_then(OsStr::to_str)
         .filter(|name| !name.is_empty())
         .unwrap_or("Renium project");
-    let project = minimal_project_file(source_root)?;
+    let project = match rojo_project {
+        Some(path) => config::rojo_project_text(path)?.into_bytes(),
+        None => minimal_project_file(source_root)?,
+    };
     let mut files = vec![
         (root.join("AGENTS.md"), agent_instructions),
         (root.join(PROJECT_INSTRUCTIONS_FILE), renium_instructions),
@@ -2065,6 +2094,42 @@ mod tests {
         );
         assert_eq!(newest_studio_executable([local]).unwrap(), old);
         assert!(newest_studio_executable([missing]).is_err());
+    }
+
+    #[test]
+    fn init_converts_a_rojo_project_in_place() -> Result<()> {
+        let root = crate::tests::support::temp_dir("init-rojo-project");
+        fs::create_dir_all(root.join("src/client"))?;
+        fs::write(
+            root.join("default.project.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "name": "rojo-place",
+                "tree": {
+                    "$className": "DataModel",
+                    "ReplicatedStorage": { "$path": "src/shared" },
+                    "StarterPlayer": { "StarterPlayerScripts": { "$path": "src/client" } }
+                }
+            }))?,
+        )?;
+        run_init(InitArgs {
+            path: root.clone(),
+            with: Vec::new(),
+            preview: false,
+        })?;
+        let project = fs::read_to_string(root.join(PROJECT_FILE_NAME))?;
+        let value: serde_json::Value = serde_json::from_str(&project)?;
+        assert_eq!(value["schemaVersion"], 1);
+        assert_eq!(
+            value["tree"]["StarterPlayer"]["StarterPlayerScripts"]["$className"],
+            "StarterPlayerScripts"
+        );
+        assert_eq!(value["tree"]["ReplicatedStorage"]["$path"], "src/shared");
+        assert!(root.join(PROJECT_INSTRUCTIONS_FILE).is_file());
+        assert!(!refresh_outdated_agent_instructions(Some(
+            &root.join(PROJECT_FILE_NAME)
+        ))?);
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
