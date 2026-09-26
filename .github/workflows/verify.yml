@@ -26,6 +26,10 @@ jobs:
         with:
           components: clippy,rustfmt
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/renium
+
       - name: Check formatting
         run: |
           cargo fmt --manifest-path tools/renium/Cargo.toml -- --check
@@ -47,6 +51,13 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@1.95.0
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            tools/renium
+            tools/renium-plugin-sdk
+            tools/vendor/rbx-dom
+
       - name: Run CLI tests
         run: cargo test --locked --manifest-path tools/renium/Cargo.toml
 
@@ -64,7 +75,9 @@ jobs:
 
   build-and-test:
     name: Windows release build and extension
-    runs-on: windows-latest
+    # Pushes by maintainers build on the maintainer's own runner, whose target
+    # directory persists between runs; pull requests never reach that machine.
+    runs-on: ${{ github.event_name == 'push' && fromJSON('["self-hosted", "Windows", "X64"]') || 'windows-latest' }}
     timeout-minutes: 30
     defaults:
       run:
@@ -73,6 +86,11 @@ jobs:
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@1.95.0
+
+      - uses: Swatinem/rust-cache@v2
+        if: github.event_name != 'push'
+        with:
+          workspaces: tools/renium
 
       - uses: ok-nick/setup-aftman@e226f24209f47677da7b215bab44f6351a2c043b
         with:
