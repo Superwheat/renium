@@ -146,7 +146,20 @@ fn build_windows(out_dir: &Path) {
     println!("cargo:rerun-if-changed=native/renium_terrain_grid.h");
 }
 
+// The helper, launcher and shield are embedded in the CLI and must match its
+// architecture, which differs from the host's when cross-compiling.
+fn macos_arch_flags() -> [String; 2] {
+    let arch = match std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+        Ok("aarch64") => "arm64",
+        Ok("x86_64") => "x86_64",
+        Ok(other) => panic!("unsupported macOS target architecture {other}"),
+        Err(_) => panic!("CARGO_CFG_TARGET_ARCH is not set"),
+    };
+    ["-arch".to_string(), arch.to_string()]
+}
+
 fn build_macos(out_dir: &Path) {
+    let arch = macos_arch_flags();
     let helper_source = PathBuf::from("native").join("renium_studio_helper_macos.cpp");
     let launch_guard_source = PathBuf::from("native").join("renium_launch_macos.mm");
     let launcher_source = PathBuf::from("native").join("renium_studio_launcher_macos.c");
@@ -155,6 +168,7 @@ fn build_macos(out_dir: &Path) {
     let launcher = out_dir.join("renium-studio-launcher");
     let shield = out_dir.join("renium-input-shield");
     let mut helper_command = Command::new("clang++");
+    helper_command.args(&arch);
     helper_command.args([
         "-dynamiclib",
         "-O2",
@@ -182,6 +196,7 @@ fn build_macos(out_dir: &Path) {
         .arg("native/renium_audio_macos.mm");
     run(&mut helper_command, "macOS Studio helper build");
     let mut launcher_command = Command::new("clang");
+    launcher_command.args(&arch);
     launcher_command.args([
         "-O2",
         "-Wall",
@@ -193,6 +208,7 @@ fn build_macos(out_dir: &Path) {
     launcher_command.arg(&launcher).arg(&launcher_source);
     run(&mut launcher_command, "macOS Studio launcher build");
     let mut shield_command = Command::new("clang");
+    shield_command.args(&arch);
     shield_command.args([
         "-O2",
         "-Wall",

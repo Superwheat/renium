@@ -105,6 +105,9 @@ jobs:
       - name: Build and test the CLI
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
+          # Paths of the build machine never reach the binary or the logs.
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME ".cargo" }
+          $env:RUSTFLAGS = "--remap-path-prefix=$cargoHome=/cargo --remap-path-prefix=$PWD=/renium --remap-path-prefix=$HOME=/home"
           cargo build --locked --release --manifest-path tools/renium/Cargo.toml
           cargo test --locked --release --manifest-path tools/renium/Cargo.toml
           node tools/renium/tests/automation-replay.mjs tools/renium/target/release/renium.exe

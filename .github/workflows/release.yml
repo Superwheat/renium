@@ -110,6 +110,9 @@ jobs:
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
           $env:SOURCE_DATE_EPOCH = git log -1 --format=%ct
+          # Paths of the build machine never reach the binary or the logs.
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME ".cargo" }
+          $env:RUSTFLAGS = "--remap-path-prefix=$cargoHome=/cargo --remap-path-prefix=$PWD=/renium --remap-path-prefix=$HOME=/home"
           cargo test --locked --release --manifest-path tools/renium/Cargo.toml
           cargo build --locked --release --manifest-path tools/renium/Cargo.toml
 
