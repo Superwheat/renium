@@ -121,7 +121,11 @@ jobs:
       CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
       AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
     steps:
+      # A self-hosted runner keeps its target directory between runs; the
+      # checkout must not clean it away.
       - uses: actions/checkout@v6
+        with:
+          clean: ${{ matrix.hosted }}
 
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
