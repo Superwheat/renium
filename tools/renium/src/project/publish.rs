@@ -145,6 +145,17 @@ fn publish_with_studio_action(
     let info = bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?;
     let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, runtime)?;
     let title = crate::studio::native::serializer::target_name(pid, &info.place_name)?;
+    // Only this Studio's own log can report this publish; another open Studio
+    // publishing at the same time must not be mistaken for it.
+    let log = crate::studio::diagnosis::studio_log_for_process(
+        pid,
+        crate::studio::diagnosis::studio_process_started_unix(pid),
+    )
+    .with_context(|| {
+        format!(
+            "Studio refused SavePlaceAsync and the log of Studio process {pid} could not be found to confirm its Publish command, so it was not run"
+        )
+    })?;
     let started = SystemTime::now();
     let outcome = crate::studio::native::serializer::trigger_studio_action(
         pid,
@@ -160,9 +171,7 @@ fn publish_with_studio_action(
                 .unwrap_or("no detail")
         )
     })?;
-    let directory = crate::studio::diagnosis::studio_log_directory()
-        .context("Studio log directory is unknown")?;
-    let published = wait_for_studio_publish(&directory, started, STUDIO_PUBLISH_WAIT)?;
+    let published = wait_for_studio_publish(&log, started, STUDIO_PUBLISH_WAIT)?;
     Ok(json!({
         "ok": true,
         "published": true,
@@ -279,9 +288,9 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 
 #[cfg(any(windows, target_os = "macos", test))]
 // Windows leaves a log's modified time stale while Studio holds it open, so
-// every Studio log is read and only the timestamps inside the lines decide.
+// the log is re-read and only the timestamps inside the lines decide.
 fn wait_for_studio_publish(
-    directory: &Path,
+    log: &Path,
     since: SystemTime,
     limit: Duration,
 ) -> Result<StudioPublishReport> {
@@ -289,33 +298,18 @@ fn wait_for_studio_publish(
     let mut version = None;
     loop {
         let mut succeeded = false;
-        for entry in fs::read_dir(directory)
-            .with_context(|| format!("Could not read {}", directory.display()))?
-            .flatten()
-        {
-            let path = entry.path();
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("");
-            if !name.contains("Studio") || !name.ends_with(".log") {
-                continue;
-            }
-            let Ok(bytes) = fs::read(&path) else {
-                continue;
-            };
-            let text = String::from_utf8_lossy(&bytes);
-            for line in text.lines().rev().take(4000) {
-                match studio_publish_event(line, since) {
-                    Some(StudioPublishEvent::Succeeded { version: found }) => {
-                        succeeded = true;
-                        version = version.or(found);
-                    }
-                    Some(StudioPublishEvent::Failed(detail)) => {
-                        bail!("Studio reported the publish did not complete: {detail}");
-                    }
-                    None => {}
+        let bytes = fs::read(log).with_context(|| format!("Could not read {}", log.display()))?;
+        let text = String::from_utf8_lossy(&bytes);
+        for line in text.lines().rev().take(4000) {
+            match studio_publish_event(line, since) {
+                Some(StudioPublishEvent::Succeeded { version: found }) => {
+                    succeeded = true;
+                    version = version.or(found);
                 }
+                Some(StudioPublishEvent::Failed(detail)) => {
+                    bail!("Studio reported the publish did not complete: {detail}");
+                }
+                None => {}
             }
         }
         if succeeded {
@@ -583,8 +577,7 @@ mod tests {
             )
         };
         let log = directory.join("0.739.0.7390687_20260922T130705Z_Studio_35E2B_last.log");
-        let old = std::fs::File::create(directory.join("old_Studio_1_last.log")).unwrap();
-        drop(old);
+        let other = directory.join("0.739.0.7390687_20260922T130800Z_Studio_9A1F0_last.log");
         std::fs::write(
             &log,
             format!(
@@ -595,14 +588,14 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
-            directory.join("old_Studio_1_last.log"),
+            &other,
             format!(
-                "{},1.0,a8fc,6,Debug [FLog::PublishSessionStateController] Go to PublishSuccessful\n",
-                stamp(-30)
+                "{},1.0,a8fc,6,Debug [FLog::PublishSessionStateController] Go to PublishFailed\n",
+                stamp(1)
             ),
         )
         .unwrap();
-        let report = wait_for_studio_publish(&directory, since, Duration::from_secs(5)).unwrap();
+        let report = wait_for_studio_publish(&log, since, Duration::from_secs(5)).unwrap();
         assert_eq!(report.version, Some(2746));
         std::fs::write(
             &log,
@@ -612,8 +605,23 @@ mod tests {
             ),
         )
         .unwrap();
-        let failed = wait_for_studio_publish(&directory, since, Duration::from_secs(2));
+        std::fs::write(
+            &other,
+            format!(
+                "{},4.0,0b4c,6,Info [FLog::CreatorOutput] Add publish notes to v900001\n",
+                stamp(4)
+            ),
+        )
+        .unwrap();
+        let failed = wait_for_studio_publish(&log, since, Duration::from_secs(2));
         assert!(failed.is_err());
+        std::fs::write(&log, "").unwrap();
+        let silent = wait_for_studio_publish(&log, since, Duration::from_secs(1));
+        assert!(
+            silent
+                .err()
+                .is_some_and(|error| error.to_string().contains("reported no result"))
+        );
         let _ = std::fs::remove_dir_all(&directory);
     }
 

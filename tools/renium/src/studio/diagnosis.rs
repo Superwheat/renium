@@ -153,6 +153,13 @@ pub(crate) fn studio_processes() -> Vec<StudioProcess> {
     process_list(true)
 }
 
+pub(crate) fn studio_process_started_unix(pid: u32) -> Option<u64> {
+    process_list(false)
+        .into_iter()
+        .find(|process| process.pid == pid)
+        .and_then(|process| process.started_unix)
+}
+
 pub(crate) fn studio_process_ids() -> Vec<u32> {
     process_list(false)
         .into_iter()
@@ -194,7 +201,7 @@ pub(crate) fn studio_log_directory() -> Option<PathBuf> {
 // "Constructing UIThreadNotifier for process '4700' ...".
 const LOG_HEAD_BYTES: u64 = 256 * 1024;
 
-fn studio_log_for_process(pid: u32, started_unix: Option<u64>) -> Option<PathBuf> {
+pub(crate) fn studio_log_for_process(pid: u32, started_unix: Option<u64>) -> Option<PathBuf> {
     let marker = format!("for process '{pid}'");
     let mut newest: Option<(u64, PathBuf)> = None;
     for entry in std::fs::read_dir(studio_log_directory()?).ok()?.flatten() {

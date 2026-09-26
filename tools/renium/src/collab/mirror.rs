@@ -11,6 +11,7 @@ use yrs::types::{Event, PathSegment};
 use yrs::{MapRef, Subscription, Transact};
 
 use super::document::{self, Content};
+use crate::app::output::log_global;
 use crate::project::config;
 use crate::system::LockRecover;
 use crate::system::files::{atomic_write_file, fnv1a};
@@ -27,6 +28,24 @@ pub(crate) struct MirrorStats {
     pub(crate) error: Mutex<Option<String>>,
 }
 
+/// The content last agreed between the file and the document. The text is
+/// the base for merging a later local save with remote changes that reached
+/// the document meanwhile.
+struct Synced {
+    hash: u64,
+    text: Option<String>,
+}
+
+fn synced(content: &Content) -> Synced {
+    Synced {
+        hash: fnv1a(&content.bytes()),
+        text: match content {
+            Content::Text(text) => Some(text.clone()),
+            Content::Binary(_) => None,
+        },
+    }
+}
+
 pub(crate) struct Mirror {
     root: PathBuf,
     awareness: Arc<Mutex<Awareness>>,
@@ -34,7 +53,7 @@ pub(crate) struct Mirror {
     watched_files: BTreeSet<PathBuf>,
     watched_directories: BTreeSet<PathBuf>,
     watcher: FileWatcher,
-    ledger: HashMap<String, u64>,
+    ledger: HashMap<String, Synced>,
     dirty: Arc<Mutex<BTreeSet<String>>>,
     stats: Arc<MirrorStats>,
     _subscription: Subscription,
@@ -65,12 +84,24 @@ pub(crate) fn key_for(root: &Path, path: &Path) -> Option<String> {
     (!key.is_empty()).then_some(key)
 }
 
-fn path_for(root: &Path, key: &str) -> PathBuf {
+// A key from another participant names a file inside the project, never a
+// parent directory, another drive or Renium's own metadata.
+fn path_for(root: &Path, key: &str) -> Option<PathBuf> {
     let mut path = root.to_path_buf();
     for part in key.split('/') {
+        if part.is_empty() || part == "." || part == ".." || part.contains(['\\', ':', '\0']) {
+            return None;
+        }
         path.push(part);
     }
-    path
+    (!is_ignored(&path)).then_some(path)
+}
+
+fn refuse_key(key: &str) {
+    log_global(
+        1,
+        format_args!("[renium] collaboration refused a file outside the project: {key}"),
+    );
 }
 
 fn project_file_present(root: &Path) -> bool {
@@ -180,7 +211,7 @@ impl Mirror {
                 if document::write_entry(&mut txn, &self.files, key, &content) {
                     written += 1;
                 }
-                self.ledger.insert(key.clone(), fnv1a(&content.bytes()));
+                self.ledger.insert(key.clone(), synced(&content));
             }
             let name = self
                 .root
@@ -205,22 +236,23 @@ impl Mirror {
         let disk = self.disk_snapshot()?;
         let mut written = 0;
         for (key, content) in &entries {
-            let bytes = content.bytes();
-            let hash = fnv1a(&bytes);
+            let hash = fnv1a(&content.bytes());
             if disk
                 .get(key)
                 .is_some_and(|existing| fnv1a(existing) == hash)
             {
-                self.ledger.insert(key.clone(), hash);
+                self.ledger.insert(key.clone(), synced(content));
                 continue;
             }
-            self.write_file(key, &bytes)?;
-            written += 1;
+            if self.write_file(key, content)? {
+                written += 1;
+            }
         }
         for key in disk.keys() {
             if !entries.contains_key(key) {
-                let path = path_for(&self.root, key);
-                let _ = std::fs::remove_file(&path);
+                if let Some(path) = path_for(&self.root, key) {
+                    let _ = std::fs::remove_file(&path);
+                }
                 self.ledger.remove(key);
                 written += 1;
             }
@@ -246,14 +278,64 @@ impl Mirror {
         Ok(())
     }
 
-    fn write_file(&mut self, key: &str, bytes: &[u8]) -> Result<()> {
-        let path = path_for(&self.root, key);
+    fn write_file(&mut self, key: &str, content: &Content) -> Result<bool> {
+        let Some(path) = path_for(&self.root, key) else {
+            refuse_key(key);
+            return Ok(false);
+        };
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        atomic_write_file(&path, bytes)?;
-        self.ledger.insert(key.to_string(), fnv1a(bytes));
-        Ok(())
+        atomic_write_file(&path, &content.bytes())?;
+        self.ledger.insert(key.to_string(), synced(content));
+        Ok(true)
+    }
+
+    fn is_input(&self, path: &Path) -> bool {
+        self.watched_files.contains(path)
+            || self
+                .watched_directories
+                .iter()
+                .any(|directory| path.starts_with(directory))
+    }
+
+    // Folds a saved file into the document as the change since the content
+    // last synchronized, so a remote edit that reached the document meanwhile
+    // survives in the merged result. Returns the merged content and whether
+    // the document changed.
+    fn absorb_local(&mut self, key: &str, content: Content) -> (Content, bool) {
+        let base = self.ledger.get(key).and_then(|entry| entry.text.clone());
+        let guard = self.awareness.lock_recover();
+        let mut txn = document::transact_local(guard.doc());
+        let merged = match (&content, base, document::read_entry(&txn, &self.files, key)) {
+            (Content::Text(local), Some(base), Some(Content::Text(remote))) if remote != base => {
+                Content::Text(document::merge_lines(&base, local, &remote))
+            }
+            _ => content,
+        };
+        let changed = document::write_entry(&mut txn, &self.files, key, &merged);
+        (merged, changed)
+    }
+
+    // A saved file whose content is not what was last synchronized becomes a
+    // local change first; without this a remote flush would overwrite it.
+    fn absorb_pending_save(&mut self, key: &str, path: &Path) -> Result<Option<Content>> {
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let bytes = read_settled(path)?;
+        if self
+            .ledger
+            .get(key)
+            .is_some_and(|entry| entry.hash == fnv1a(&bytes))
+        {
+            return Ok(None);
+        }
+        let (merged, changed) = self.absorb_local(key, Content::from_bytes(path, bytes));
+        if changed {
+            self.stats.local_changes.fetch_add(1, Ordering::AcqRel);
+        }
+        Ok(Some(merged))
     }
 
     pub(crate) fn run(&mut self, stop: &AtomicBool) {
@@ -297,22 +379,26 @@ impl Mirror {
         self.refresh_inputs()?;
         let disk = self.disk_snapshot()?;
         let mut changed = 0;
+        for (key, bytes) in &disk {
+            if self
+                .ledger
+                .get(key)
+                .is_some_and(|entry| entry.hash == fnv1a(bytes))
+            {
+                continue;
+            }
+            let content = Content::from_bytes(Path::new(key), bytes.clone());
+            let (merged, wrote) = self.absorb_local(key, content);
+            if wrote {
+                changed += 1;
+            }
+            self.keep_merged(key, &merged, bytes)?;
+        }
         {
             let guard = self.awareness.lock_recover();
             let doc = guard.doc();
             let mut txn = document::transact_local(doc);
             let existing = document::snapshot(&txn, &self.files);
-            for (key, bytes) in &disk {
-                let hash = fnv1a(bytes);
-                if self.ledger.get(key) == Some(&hash) {
-                    continue;
-                }
-                let content = Content::from_bytes(Path::new(key), bytes.clone());
-                if document::write_entry(&mut txn, &self.files, key, &content) {
-                    changed += 1;
-                }
-                self.ledger.insert(key.clone(), hash);
-            }
             for key in existing.keys() {
                 if !disk.contains_key(key) && self.ledger.contains_key(key) {
                     document::remove_entry(&mut txn, &self.files, key);
@@ -328,6 +414,18 @@ impl Mirror {
         Ok(())
     }
 
+    // The merged content is what the document holds now; when it differs
+    // from the saved bytes the file receives it, and the watcher's later event
+    // for that write finds the ledger already matching.
+    fn keep_merged(&mut self, key: &str, merged: &Content, saved: &[u8]) -> Result<()> {
+        if merged.bytes() == saved {
+            self.ledger.insert(key.to_string(), synced(merged));
+        } else {
+            self.write_file(key, merged)?;
+        }
+        Ok(())
+    }
+
     fn flush_local(&mut self, paths: BTreeSet<PathBuf>) -> Result<()> {
         let mut project_changed = false;
         let mut changed = 0u64;
@@ -337,7 +435,13 @@ impl Mirror {
                 continue;
             }
             if path.is_dir() {
-                directories.push(path);
+                if self
+                    .watched_directories
+                    .iter()
+                    .any(|directory| directory.starts_with(&path) || path.starts_with(directory))
+                {
+                    directories.push(path);
+                }
                 continue;
             }
             if path.file_name().and_then(|name| name.to_str()) == Some("renium.project.jsonc") {
@@ -346,20 +450,24 @@ impl Mirror {
             let Some(key) = key_for(&self.root, &path) else {
                 continue;
             };
-            if path.is_file() {
+            // Only files the project shares travel; a file saved elsewhere in
+            // the folder, such as an .env, stays local.
+            if path.is_file() && self.is_input(&path) {
                 let bytes = read_settled(&path)?;
-                let hash = fnv1a(&bytes);
-                if self.ledger.get(&key) == Some(&hash) {
+                if self
+                    .ledger
+                    .get(&key)
+                    .is_some_and(|entry| entry.hash == fnv1a(&bytes))
+                {
                     continue;
                 }
-                let content = Content::from_bytes(&path, bytes);
-                let guard = self.awareness.lock_recover();
-                let mut txn = document::transact_local(guard.doc());
-                if document::write_entry(&mut txn, &self.files, &key, &content) {
+                let content = Content::from_bytes(&path, bytes.clone());
+                let (merged, wrote) = self.absorb_local(&key, content);
+                if wrote {
                     changed += 1;
                 }
-                self.ledger.insert(key, hash);
-            } else if self.ledger.remove(&key).is_some() {
+                self.keep_merged(&key, &merged, &bytes)?;
+            } else if !path.is_file() && self.ledger.remove(&key).is_some() {
                 let guard = self.awareness.lock_recover();
                 let mut txn = document::transact_local(guard.doc());
                 if document::remove_entry(&mut txn, &self.files, &key) {
@@ -399,18 +507,25 @@ impl Mirror {
         let mut changed = 0u64;
         let mut project_changed = false;
         for (key, content) in entries {
+            let Some(path) = path_for(&self.root, &key) else {
+                refuse_key(&key);
+                continue;
+            };
             match content {
                 Some(content) => {
-                    let bytes = content.bytes();
-                    let hash = fnv1a(&bytes);
-                    if self.ledger.get(&key) == Some(&hash) {
+                    let content = self.absorb_pending_save(&key, &path)?.unwrap_or(content);
+                    if self
+                        .ledger
+                        .get(&key)
+                        .is_some_and(|entry| entry.hash == fnv1a(&content.bytes()))
+                    {
                         continue;
                     }
-                    self.write_file(&key, &bytes)?;
-                    changed += 1;
+                    if self.write_file(&key, &content)? {
+                        changed += 1;
+                    }
                 }
                 None => {
-                    let path = path_for(&self.root, &key);
                     if path.is_file() {
                         std::fs::remove_file(&path)?;
                         changed += 1;
@@ -509,8 +624,27 @@ mod tests {
         assert_eq!(key_for(root, Path::new("E:/other/x")), None);
         assert_eq!(
             path_for(root, "src/a/b.luau"),
-            PathBuf::from("E:/proj/src/a/b.luau")
+            Some(PathBuf::from("E:/proj/src/a/b.luau"))
         );
+    }
+
+    #[test]
+    fn remote_keys_stay_inside_the_project() {
+        let root = Path::new("E:/proj");
+        for key in [
+            "../escaped.txt",
+            "src/../../escaped.txt",
+            "/etc/passwd",
+            "C:/Windows/notepad.exe",
+            "src\\..\\x.luau",
+            "src//a.luau",
+            "./a.luau",
+            ".git/hooks/pre-commit",
+            ".renium/config.json",
+            "a\0b",
+        ] {
+            assert_eq!(path_for(root, key), None, "{key}");
+        }
     }
 
     #[test]

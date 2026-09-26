@@ -52,10 +52,10 @@ impl Content {
                 .and_then(|value| value.to_str())
                 .is_some_and(|name| name.starts_with('.'));
         if looks_text && !bytes.contains(&0) {
-            if let Ok(text) = String::from_utf8(bytes) {
-                return Content::Text(text);
-            }
-            return Content::Binary(Vec::new());
+            return match String::from_utf8(bytes) {
+                Ok(text) => Content::Text(text),
+                Err(error) => Content::Binary(error.into_bytes()),
+            };
         }
         Content::Binary(bytes)
     }
@@ -176,6 +176,98 @@ fn apply_text_diff(txn: &mut TransactionMut, target: &yrs::TextRef, wanted: &str
     true
 }
 
+struct Hunk {
+    old_index: usize,
+    old_len: usize,
+    lines: Vec<String>,
+}
+
+fn hunks(base: &str, side: &str) -> Vec<Hunk> {
+    let diff = TextDiff::from_lines(base, side);
+    let side_lines = split_lines(side);
+    let replacement = |new_index: usize, new_len: usize| {
+        side_lines[new_index..new_index + new_len]
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+    };
+    diff.ops()
+        .iter()
+        .filter_map(|op| match *op {
+            DiffOp::Equal { .. } => None,
+            DiffOp::Delete {
+                old_index, old_len, ..
+            } => Some(Hunk {
+                old_index,
+                old_len,
+                lines: Vec::new(),
+            }),
+            DiffOp::Insert {
+                old_index,
+                new_index,
+                new_len,
+            } => Some(Hunk {
+                old_index,
+                old_len: 0,
+                lines: replacement(new_index, new_len),
+            }),
+            DiffOp::Replace {
+                old_index,
+                old_len,
+                new_index,
+                new_len,
+            } => Some(Hunk {
+                old_index,
+                old_len,
+                lines: replacement(new_index, new_len),
+            }),
+        })
+        .collect()
+}
+
+fn overlaps(a: &Hunk, b: &Hunk) -> bool {
+    let (a_start, a_end) = (a.old_index, a.old_index + a.old_len);
+    let (b_start, b_end) = (b.old_index, b.old_index + b.old_len);
+    match (a.old_len, b.old_len) {
+        (0, 0) => false,
+        (0, _) => b_start < a_start && a_start < b_end,
+        (_, 0) => a_start < b_start && b_start < a_end,
+        _ => a_start < b_end && b_start < a_end,
+    }
+}
+
+/// Three-way merge by line: every local and remote change since `base` is
+/// kept; where both changed the same lines the local change stands, since a
+/// pending local save is the user's own work and the remote side still holds
+/// its version.
+pub(crate) fn merge_lines(base: &str, local: &str, remote: &str) -> String {
+    let base_lines = split_lines(base);
+    let local_hunks = hunks(base, local);
+    let remote_hunks = hunks(base, remote)
+        .into_iter()
+        .filter(|remote| !local_hunks.iter().any(|local| overlaps(local, remote)))
+        .collect::<Vec<_>>();
+    let mut ordered = local_hunks
+        .iter()
+        .map(|hunk| (hunk, true))
+        .chain(remote_hunks.iter().map(|hunk| (hunk, false)))
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|(hunk, local)| (hunk.old_index, !local));
+    let mut merged = String::new();
+    let mut cursor = 0;
+    for (hunk, _) in ordered {
+        if hunk.old_index > cursor {
+            merged.push_str(&base_lines[cursor..hunk.old_index].concat());
+        }
+        for line in &hunk.lines {
+            merged.push_str(line);
+        }
+        cursor = cursor.max(hunk.old_index + hunk.old_len);
+    }
+    merged.push_str(&base_lines[cursor..].concat());
+    merged
+}
+
 fn offset(start: usize, shift: i64) -> u32 {
     (start as i64 + shift).max(0) as u32
 }
@@ -242,6 +334,117 @@ mod tests {
         let files = files_map(doc);
         let txn = doc.transact();
         read_entry(&txn, &files, key)
+    }
+
+    #[test]
+    fn text_like_files_that_are_not_utf8_keep_their_bytes() {
+        let bytes = vec![0x63, 0x61, 0x66, 0xe9, 0x0a];
+        assert_eq!(
+            Content::from_bytes(Path::new("legacy.txt"), bytes.clone()),
+            Content::Binary(bytes)
+        );
+        assert_eq!(
+            Content::from_bytes(
+                Path::new("a.luau"),
+                b"return 1
+"
+                .to_vec()
+            ),
+            Content::Text(
+                "return 1
+"
+                .into()
+            )
+        );
+    }
+
+    #[test]
+    fn three_way_line_merge_keeps_both_sides_and_prefers_local_on_conflict() {
+        let base = "local=0
+remote=0
+";
+        assert_eq!(
+            merge_lines(
+                base,
+                "local=1
+remote=0
+",
+                "local=0
+remote=1
+"
+            ),
+            "local=1
+remote=1
+"
+        );
+        assert_eq!(
+            merge_lines(
+                base,
+                "local=1
+remote=0
+",
+                "local=2
+remote=0
+"
+            ),
+            "local=1
+remote=0
+"
+        );
+        assert_eq!(
+            merge_lines(
+                base,
+                base,
+                "local=0
+remote=1
+"
+            ),
+            "local=0
+remote=1
+"
+        );
+        assert_eq!(
+            merge_lines(
+                base,
+                "top
+local=0
+remote=0
+",
+                "local=0
+remote=0
+bottom
+"
+            ),
+            "top
+local=0
+remote=0
+bottom
+"
+        );
+        assert_eq!(
+            merge_lines(
+                base,
+                "remote=0
+",
+                "local=0
+remote=0
+end
+"
+            ),
+            "remote=0
+end
+"
+        );
+        assert_eq!(
+            merge_lines(
+                "", "a
+", "b
+"
+            ),
+            "a
+b
+"
+        );
     }
 
     #[test]

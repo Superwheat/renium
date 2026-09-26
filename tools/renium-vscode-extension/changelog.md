@@ -4,6 +4,11 @@
 
 ### Bug fixes
 
+- Live collaboration no longer loses a file saved while a change from another participant arrives for it. The mirror used to write the remote content over the pending save; it now merges the save with the remote change line by line (a line both sides changed keeps the local version) and shares the merged result.
+- A collaboration participant can no longer write outside the shared project: a document key that leaves the project folder (`../x`), names another drive, or targets `.git` or `.renium` is refused and logged instead of written.
+- Saving a file the project does not share (such as an `.env` in the project folder) no longer sends it to collaborators; only files under the configured project inputs and the recognized root files travel.
+- A text-like file that is not valid UTF-8 (for example a Latin-1 `.txt`) is shared with its original bytes instead of arriving empty.
+- `rbx publish` through Studio's own Publish command reads the result only from the log of the Studio it triggered, so a second open Studio publishing at the same time can no longer be reported as this place's success or failure.
 - Writing a place or model no longer fails with "Property type mismatch: Expected Workspace.SimulationRate to be of type Float32, but it was of type Float64" (or any other number stored wider or narrower than the reflection database declares, as Studio does for several properties). Every export, build, publish and native import now converts such values to the declared width, so a single property can no longer abort the whole file.
 
 ## 0.3.11 - 2026-09-25
