@@ -53,6 +53,9 @@ jobs:
       - name: Run plugin SDK tests
         run: cargo test --locked --manifest-path tools/renium-plugin-sdk/Cargo.toml
 
+      - name: Run vendored rbx-dom tests
+        run: cargo test --locked --manifest-path tools/vendor/rbx-dom/Cargo.toml -p rbx_binary -p rbx_xml -p rbx_dom_weak -p rbx_types -p rbx_reflection -p rbx_reflection_database
+
       - name: Test launchers
         run: node tools/renium/tests/launcher-smoke.mjs
 

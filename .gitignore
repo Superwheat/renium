@@ -63,6 +63,11 @@ tools/**/_external/
 
 # Runtime/generated output
 snapshots/
+
+# Vendored rbx-dom test fixtures and Insta snapshots are part of the crate tests
+!tools/vendor/rbx-dom/test-files/**
+!tools/vendor/rbx-dom/**/snapshots/
+!tools/vendor/rbx-dom/**/snapshots/**
 *.log
 *.tmp
 .renium/

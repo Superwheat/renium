@@ -1,0 +1,149 @@
+<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">
+	<Meta name="ExplicitAutoJoints">true</Meta>
+	<External>null</External>
+	<External>nil</External>
+	<Item class="ArcHandles" referent="RBX7A9B370E25A74AD4AFEC7CDE7C505A3E">
+		<Properties>
+			<Ref name="Adornee">null</Ref>
+			<BinaryString name="AttributesSerialize"></BinaryString>
+			<Axes name="Axes">
+				<axes>0</axes>
+			</Axes>
+			<Color3 name="Color3">
+				<R>0.0509803966</R>
+				<G>0.411764741</G>
+				<B>0.674509823</B>
+			</Color3>
+			<string name="Name"></string>
+			<BinaryString name="Tags"></BinaryString>
+			<float name="Transparency">0</float>
+			<bool name="Visible">true</bool>
+		</Properties>
+	</Item>
+	<Item class="ArcHandles" referent="RBX78804793E56B4A68B7A31C5E82064AB9">
+		<Properties>
+			<Ref name="Adornee">null</Ref>
+			<BinaryString name="AttributesSerialize"></BinaryString>
+			<Axes name="Axes">
+				<axes>1</axes>
+			</Axes>
+			<Color3 name="Color3">
+				<R>0.0509803966</R>
+				<G>0.411764741</G>
+				<B>0.674509823</B>
+			</Color3>
+			<string name="Name">X</string>
+			<BinaryString name="Tags"></BinaryString>
+			<float name="Transparency">0</float>
+			<bool name="Visible">true</bool>
+		</Properties>
+	</Item>
+	<Item class="ArcHandles" referent="RBX2B367F65422745B1ACF224FC774B66E4">
+		<Properties>
+			<Ref name="Adornee">null</Ref>
+			<BinaryString name="AttributesSerialize"></BinaryString>
+			<Axes name="Axes">
+				<axes>3</axes>
+			</Axes>
+			<Color3 name="Color3">
+				<R>0.0509803966</R>
+				<G>0.411764741</G>
+				<B>0.674509823</B>
+			</Color3>
+			<string name="Name">X, Y</string>
+			<BinaryString name="Tags"></BinaryString>
+			<float name="Transparency">0</float>
+			<bool name="Visible">true</bool>
+		</Properties>
+	</Item>
+	<Item class="ArcHandles" referent="RBX7A7A2C51FD1D40BBB2CB71F7D8B2BF6E">
+		<Properties>
+			<Ref name="Adornee">null</Ref>
+			<BinaryString name="AttributesSerialize"></BinaryString>
+			<Axes name="Axes">
+				<axes>7</axes>
+			</Axes>
+			<Color3 name="Color3">
+				<R>0.0509803966</R>
+				<G>0.411764741</G>
+				<B>0.674509823</B>
+			</Color3>
+			<string name="Name">X, Y, Z</string>
+			<BinaryString name="Tags"></BinaryString>
+			<float name="Transparency">0</float>
+			<bool name="Visible">true</bool>
+		</Properties>
+	</Item>
+	<Item class="ArcHandles" referent="RBX12E79C23E2004E4F9CAE83B43AE9531E">
+		<Properties>
+			<Ref name="Adornee">null</Ref>
+			<BinaryString name="AttributesSerialize"></BinaryString>
+			<Axes name="Axes">
+				<axes>5</axes>
+			</Axes>
+			<Color3 name="Color3">
+				<R>0.0509803966</R>
+				<G>0.411764741</G>
+				<B>0.674509823</B>
+			</Color3>
+			<string name="Name">X, Z</string>
+			<BinaryString name="Tags"></BinaryString>
+			<float name="Transparency">0</float>
+			<bool name="Visible">true</bool>
+		</Properties>
+	</Item>
+	<Item class="ArcHandles" referent="RBX14F0F07791F348CAA2B8E097D0EEE32A">
+		<Properties>
+			<Ref name="Adornee">null</Ref>
+			<BinaryString name="AttributesSerialize"></BinaryString>
+			<Axes name="Axes">
+				<axes>2</axes>
+			</Axes>
+			<Color3 name="Color3">
+				<R>0.0509803966</R>
+				<G>0.411764741</G>
+				<B>0.674509823</B>
+			</Color3>
+			<string name="Name">Y</string>
+			<BinaryString name="Tags"></BinaryString>
+			<float name="Transparency">0</float>
+			<bool name="Visible">true</bool>
+		</Properties>
+	</Item>
+	<Item class="ArcHandles" referent="RBX02CE15780A224332B7E5C8E3B11EF269">
+		<Properties>
+			<Ref name="Adornee">null</Ref>
+			<BinaryString name="AttributesSerialize"></BinaryString>
+			<Axes name="Axes">
+				<axes>6</axes>
+			</Axes>
+			<Color3 name="Color3">
+				<R>0.0509803966</R>
+				<G>0.411764741</G>
+				<B>0.674509823</B>
+			</Color3>
+			<string name="Name">Y, Z</string>
+			<BinaryString name="Tags"></BinaryString>
+			<float name="Transparency">0</float>
+			<bool name="Visible">true</bool>
+		</Properties>
+	</Item>
+	<Item class="ArcHandles" referent="RBX4E38C98F8B584CACBB492AE7A791BF21">
+		<Properties>
+			<Ref name="Adornee">null</Ref>
+			<BinaryString name="AttributesSerialize"></BinaryString>
+			<Axes name="Axes">
+				<axes>4</axes>
+			</Axes>
+			<Color3 name="Color3">
+				<R>0.0509803966</R>
+				<G>0.411764741</G>
+				<B>0.674509823</B>
+			</Color3>
+			<string name="Name">Z</string>
+			<BinaryString name="Tags"></BinaryString>
+			<float name="Transparency">0</float>
+			<bool name="Visible">true</bool>
+		</Properties>
+	</Item>
+</roblox>
