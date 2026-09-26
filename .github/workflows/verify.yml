@@ -118,12 +118,15 @@ jobs:
           # Paths of the build machine never reach the binary or the logs.
           $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME ".cargo" }
           $env:RUSTFLAGS = "--remap-path-prefix=$cargoHome=/cargo --remap-path-prefix=$PWD=/renium --remap-path-prefix=$HOME=/home"
-          cargo build --locked --release --manifest-path tools/renium/Cargo.toml
-          cargo test --locked --release --manifest-path tools/renium/Cargo.toml
-          node tools/renium/tests/automation-replay.mjs tools/renium/target/release/renium.exe
+          # Verification builds skip LTO; the Release workflow builds and
+          # tests the optimized profile on every platform.
+          cargo build --locked --profile fast --manifest-path tools/renium/Cargo.toml
+          cargo test --locked --profile fast --manifest-path tools/renium/Cargo.toml
+          node tools/renium/tests/automation-replay.mjs tools/renium/target/fast/renium.exe
           node tools/renium-vscode-extension/scripts/sync-assets.mjs --docs-only
-          node tools/renium/tests/agent-docs-smoke.mjs tools/renium/target/release/renium.exe
+          node tools/renium/tests/agent-docs-smoke.mjs tools/renium/target/fast/renium.exe
           node tools/renium/tests/launcher-smoke.mjs
+          "RENIUM_CLI_BUILD=$(Join-Path $PWD 'tools/renium/target/fast/renium.exe')" >> $env:GITHUB_ENV
 
       - name: Build both Studio plugin formats
         run: |
@@ -195,7 +198,7 @@ jobs:
               $cliSha256.Dispose()
               $cliStream.Dispose()
             }
-            $expectedCliHash = (Get-FileHash -LiteralPath "tools/renium/target/release/renium.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+            $expectedCliHash = (Get-FileHash -LiteralPath "tools/renium/target/fast/renium.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
             if ($packagedCliHash -ne $expectedCliHash) { throw "VSIX CLI does not match the built Renium CLI" }
           }
           finally {
