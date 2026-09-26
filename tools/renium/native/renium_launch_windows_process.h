@@ -9,17 +9,46 @@ struct LaunchConfiguration
 
 extern "C" __declspec(dllexport) DWORD WINAPI ReniumInitializeLaunch(void* argument);
 
+static bool sameFile(const wchar_t* first, const wchar_t* second)
+{
+    if (_wcsicmp(first, second) == 0) return true;
+    BY_HANDLE_FILE_INFORMATION information[2]{};
+    const wchar_t* paths[2] = { first, second };
+    for (int index = 0; index < 2; ++index)
+    {
+        HANDLE file = CreateFileW(paths[index], 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) return false;
+        const BOOL described = GetFileInformationByHandle(file, &information[index]);
+        CloseHandle(file);
+        if (!described) return false;
+    }
+    return information[0].dwVolumeSerialNumber == information[1].dwVolumeSerialNumber
+        && information[0].nFileIndexHigh == information[1].nFileIndexHigh
+        && information[0].nFileIndexLow == information[1].nFileIndexLow;
+}
+
 static HMODULE remoteLaunchModule(DWORD pid, const wchar_t* path)
 {
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid);
-    if (snapshot == INVALID_HANDLE_VALUE) return nullptr;
-    MODULEENTRY32W entry{sizeof(entry)};
-    HMODULE module = nullptr;
-    if (Module32FirstW(snapshot, &entry))
-        do { if (_wcsicmp(entry.szExePath, path) == 0) { module = entry.hModule; break; } }
-        while (Module32NextW(snapshot, &entry));
-    CloseHandle(snapshot);
-    return module;
+    for (int attempt = 0; attempt < 50; ++attempt)
+    {
+        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid);
+        if (snapshot == INVALID_HANDLE_VALUE)
+        {
+            const DWORD error = GetLastError();
+            if (error != ERROR_BAD_LENGTH && error != ERROR_PARTIAL_COPY) return nullptr;
+            Sleep(20);
+            continue;
+        }
+        MODULEENTRY32W entry{sizeof(entry)};
+        HMODULE module = nullptr;
+        if (Module32FirstW(snapshot, &entry))
+            do { if (sameFile(entry.szExePath, path)) { module = entry.hModule; break; } }
+            while (Module32NextW(snapshot, &entry));
+        CloseHandle(snapshot);
+        return module;
+    }
+    return nullptr;
 }
 
 static DWORD launchRemoteCall(HANDLE process, LPTHREAD_START_ROUTINE function,
@@ -66,8 +95,13 @@ static DWORD protectLaunchProcess(HANDLE process, DWORD pid, const LaunchConfigu
         const auto load = reinterpret_cast<LPTHREAD_START_ROUTINE>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW"));
         if (!load) return GetLastError();
         const DWORD result = launchRemoteCall(process, load, path, (wcslen(path) + 1) * sizeof(wchar_t));
-        remote = remoteLaunchModule(pid, path);
-        if (!remote) return result == ERROR_TIMEOUT ? result : ERROR_DLL_INIT_FAILED;
+        if (result == ERROR_TIMEOUT) return result;
+        for (int attempt = 0; attempt < 25 && !remote; ++attempt)
+        {
+            remote = remoteLaunchModule(pid, path);
+            if (!remote) Sleep(20);
+        }
+        if (!remote) return result ? ERROR_DLL_INIT_FAILED : ERROR_MOD_NOT_FOUND;
     }
     const auto offset = reinterpret_cast<ULONG_PTR>(&ReniumInitializeLaunch) - reinterpret_cast<ULONG_PTR>(self);
     return launchRemoteCall(process,

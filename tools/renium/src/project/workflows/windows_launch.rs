@@ -5,7 +5,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use windows_sys::Win32::Foundation::{CloseHandle, FreeLibrary, HMODULE};
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_DLL_INIT_FAILED, FreeLibrary, HMODULE};
 use windows_sys::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
 };
@@ -25,7 +25,8 @@ const LAUNCH_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-lau
 
 fn launch_module() -> Result<HMODULE> {
     use sha2::{Digest, Sha256};
-    let directory = std::env::temp_dir().join("renium-native");
+    let directory =
+        crate::system::files::expand_short_names(std::env::temp_dir()).join("renium-native");
     std::fs::create_dir_all(&directory)?;
     // One immutable image per build. Configuration lives inside each selected
     // Studio, so simultaneous places and repeated reopens can share the file.
@@ -277,7 +278,16 @@ pub(crate) fn protect_process(pid: u32) -> Result<()> {
         let protect = unsafe { GetProcAddress(module, c"ReniumProtectLaunch".as_ptr().cast()) }
             .context("Studio launch guard omitted process protection")?;
         let protect: unsafe extern "C" fn(u32) -> u32 = unsafe { std::mem::transmute(protect) };
-        let error = unsafe { protect(pid) };
+        let mut error = 0;
+        for attempt in 0..5 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            error = unsafe { protect(pid) };
+            if error != ERROR_DLL_INIT_FAILED {
+                break;
+            }
+        }
         if error != 0 {
             return Err(std::io::Error::from_raw_os_error(error as i32))
                 .context("Could not protect Studio activation");

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Bug fixes
+
+- `rbx ro` and `rbx so` no longer fail on Windows with "Could not protect Studio activation: A dynamic link library (DLL) initialization routine failed. (os error 1114)" when Studio is still running its loader at launch. The launch guard retries a module snapshot that Windows briefly reports as unreadable, recognizes its own image under another spelling of the same path, and repeats the protection call instead of giving up on the first transient failure.
+
 ## 0.3.12 - 2026-09-26
 
 ### Bug fixes
