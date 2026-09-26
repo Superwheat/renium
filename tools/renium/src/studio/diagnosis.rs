@@ -153,6 +153,7 @@ pub(crate) fn studio_processes() -> Vec<StudioProcess> {
     process_list(true)
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn studio_process_started_unix(pid: u32) -> Option<u64> {
     process_list(false)
         .into_iter()
