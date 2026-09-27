@@ -13,11 +13,13 @@ permissions:
 jobs:
   verify-tag:
     name: Verify release tag
-    runs-on: ubuntu-latest
+    runs-on: ["self-hosted", "Windows", "X64"]
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          clean: false
 
       # A release comes only from a tag signed with the maintainer's key.
       - name: Verify the tag signature
@@ -46,18 +48,16 @@ jobs:
   quality:
     name: Rust format and lints
     needs: verify-tag
-    runs-on: ubuntu-latest
+    runs-on: ["self-hosted", "Linux", "X64"]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
+        with:
+          clean: false
 
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: clippy,rustfmt
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: tools/renium
 
       - name: Check Rust quality
         run: |
@@ -224,7 +224,8 @@ jobs:
   integration:
     name: Plugin and extension
     needs: [verify-tag, cli]
-    runs-on: windows-latest
+    # The maintainer's Windows runner carries its own rojo and lune.
+    runs-on: ["self-hosted", "Windows", "X64"]
     timeout-minutes: 30
     env:
       RENIUM_UPDATE_PUBLIC_KEY: ${{ vars.RENIUM_UPDATE_PUBLIC_KEY }}
@@ -233,16 +234,10 @@ jobs:
         shell: pwsh
     steps:
       - uses: actions/checkout@v6
+        with:
+          clean: false
 
       - uses: dtolnay/rust-toolchain@1.95.0
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: tools/renium
-
-      - uses: ok-nick/setup-aftman@e226f24209f47677da7b215bab44f6351a2c043b
-        with:
-          version: v0.3.0
 
       - uses: actions/setup-node@v4
         with:
@@ -295,34 +290,38 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
+          # Each extension is packaged on a maintainer runner of its own
+          # operating system so the bundled CLI keeps its file mode.
+          - runner: '["self-hosted", "Windows", "X64"]'
             cliArtifact: cli-Windows-X64
             target: win32-x64
             binary: renium.exe
-          - os: windows-11-arm
+          - runner: '["self-hosted", "Windows", "X64"]'
             cliArtifact: cli-Windows-ARM64
             target: win32-arm64
             binary: renium.exe
-          - os: ubuntu-latest
+          - runner: '["self-hosted", "Linux", "X64"]'
             cliArtifact: cli-Linux-X64
             target: linux-x64
             binary: renium
-          - os: ubuntu-24.04-arm
+          - runner: '["self-hosted", "Linux", "X64"]'
             cliArtifact: cli-Linux-ARM64
             target: linux-arm64
             binary: renium
-          - os: macos-latest
+          - runner: '["self-hosted", "macOS", "ARM64"]'
             cliArtifact: cli-macOS-ARM64
             target: darwin-arm64
             binary: renium
-          - os: macos-15-intel
+          - runner: '["self-hosted", "macOS", "ARM64"]'
             cliArtifact: cli-macOS-X64
             target: darwin-x64
             binary: renium
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ fromJSON(matrix.runner) }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
+        with:
+          clean: false
 
       - uses: actions/setup-node@v4
         with:
@@ -385,11 +384,17 @@ jobs:
   publish:
     name: Publish GitHub release
     needs: [verify-tag, quality, cli, integration, extension]
-    runs-on: ubuntu-latest
+    runs-on: ["self-hosted", "Linux", "X64"]
     env:
       VSCE_PAT: ${{ secrets.VSCE_PAT }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          clean: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
 
       - uses: actions/download-artifact@v4
         with:

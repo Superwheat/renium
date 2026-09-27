@@ -478,6 +478,9 @@ fn build_terrain_observation_test(out_dir: &Path) {
         command.args(["/link", "/INCREMENTAL:NO"]);
     } else {
         command.args(["-O2", "-std=c++20", "-pthread"]);
+        if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+            command.args(macos_arch_flags());
+        }
         command
             .arg(source)
             .arg("-o")
@@ -499,7 +502,8 @@ fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is missing"));
     generate_operations(&out_dir);
     generate_config_settings(&out_dir);
-    if host == env::var("TARGET").expect("TARGET is missing") {
+    let target = env::var("TARGET").expect("TARGET is missing");
+    if host == target || (target_os == "macos" && host.contains("apple-darwin")) {
         build_terrain_observation_test(&out_dir);
     }
     match target_os.as_str() {
