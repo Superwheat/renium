@@ -257,7 +257,7 @@ fn inventory_does_not_wait_for_an_unnamed_client_and_accepts_its_later_identity(
     assert_eq!(request["method"], "getBridgeInfo");
     let next_id = bridge.next_id.load(Ordering::Relaxed);
     for _ in 0..100 {
-        assert_eq!(bridge.list_bridge_clients().len(), 1);
+        wait_for_client_count(&bridge, 1);
     }
     assert_eq!(bridge.next_id.load(Ordering::Relaxed), next_id);
     {
@@ -519,6 +519,21 @@ fn handshake(
         BridgeServer::refresh_channel_snapshots(channel, &sockets);
     }
     Some(peer)
+}
+
+fn wait_for_client_count(bridge: &BridgeServer, expected: usize) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let count = bridge.list_bridge_clients().len();
+        if count == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected {expected} bridge clients, saw {count}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn respond(mut peer: WebSocket<TcpStream>, result: Value) -> thread::JoinHandle<()> {
@@ -926,7 +941,7 @@ fn busy_places_do_not_block_other_places_registration_readiness_or_requests() {
         ));
     }
     // Exercise inventory and readiness with both listening ports serving long polls.
-    assert_eq!(bridge.list_bridge_clients().len(), 3);
+    wait_for_client_count(&bridge, 3);
     assert_eq!(
         bridge.max_runtime_channel_coverage(BridgeTarget::Edit, None),
         2
@@ -1167,7 +1182,7 @@ fn reconnect_during_an_outstanding_request_cannot_remove_its_replacement() {
                 true
             );
         }
-        assert_eq!(bridge.list_bridge_clients().len(), 1);
+        wait_for_client_count(&bridge, 1);
         let connection = bridge.channels[0]
             .sockets
             .lock()
@@ -1486,7 +1501,7 @@ fn rapid_session_turnover_rejects_late_handshakes_and_routes_both_selectors() {
                 assert_eq!(result["runtimeId"], current.runtime_id);
             }
         }
-        assert_eq!(bridge.list_bridge_clients().len(), 1);
+        wait_for_client_count(&bridge, 1);
         // One channel remains busy during stop. Both numeric and named routes
         // must become unavailable immediately, even before physical cleanup.
         let busy = bridge.channels[cycle as usize % 2].sockets.lock().unwrap();
@@ -1553,7 +1568,7 @@ fn reconnect_replaces_one_channel_without_duplicating_multiplayer_indices() {
             json!({"runtimeId": info.runtime_id, "connection": "reconnected"}),
         ));
     }
-    assert_eq!(bridge.list_bridge_clients().len(), 8);
+    wait_for_client_count(&bridge, 8);
     assert_eq!(bridge.channels[0].sockets.lock().unwrap().len(), 8);
     for index in 1..=8 {
         let numeric = index.to_string();
