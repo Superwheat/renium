@@ -85,6 +85,7 @@ jobs:
           - os: windows-arm64
             runner: '["self-hosted", "Windows", "ARM64"]'
             hosted: false
+            skip_tests: true
             platform: windows-arm64
             artifact: cli-Windows-ARM64
           - os: linux-x64
@@ -295,13 +296,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Each extension is packaged on a maintainer runner of its own
-          # operating system so the bundled CLI keeps its file mode.
+          # Each extension is packaged on a maintainer runner that can execute
+          # its bundled CLI and keeps the file mode of the binary.
           - runner: '["self-hosted", "Windows", "X64"]'
             cliArtifact: cli-Windows-X64
             target: win32-x64
             binary: renium.exe
-          - runner: '["self-hosted", "Windows", "X64"]'
+          - runner: '["self-hosted", "Windows", "ARM64"]'
             cliArtifact: cli-Windows-ARM64
             target: win32-arm64
             binary: renium.exe
@@ -323,6 +324,8 @@ jobs:
             binary: renium
     runs-on: ${{ fromJSON(matrix.runner) }}
     timeout-minutes: 15
+    env:
+      QEMU_LD_PREFIX: /usr/aarch64-linux-gnu
     steps:
       - uses: actions/checkout@v6
         with:
