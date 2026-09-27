@@ -412,6 +412,13 @@ fn native_payload_cache() -> &'static Mutex<NativePayloadCache> {
     CACHE.get_or_init(|| Mutex::new(NativePayloadCache::default()))
 }
 
+pub(crate) fn drop_native_payload_cache() -> usize {
+    let mut cache = native_payload_cache().lock_recover();
+    let dropped = cache.total_bytes;
+    *cache = NativePayloadCache::default();
+    dropped
+}
+
 fn native_payload_cache_for_slot(slot: &str) -> Option<(String, Arc<[u8]>)> {
     let cache = native_payload_cache().lock_recover();
     let hash = cache.last_hash_by_slot.get(slot)?;

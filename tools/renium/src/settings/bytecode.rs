@@ -126,6 +126,16 @@ impl SettingsBytecode {
     }
 }
 
+pub(crate) fn drop_settings_document_cache() -> (usize, usize) {
+    let Some(cache) = SETTINGS_DOCUMENT_CACHE.get() else {
+        return (0, 0);
+    };
+    let mut cache = cache.lock_recover();
+    let dropped = (cache.source_bytes, cache.instances);
+    *cache = SettingsDocumentCache::default();
+    dropped
+}
+
 fn cached_settings_document(bytes: &[u8]) -> Result<Arc<SettingsBytecode>> {
     let cache =
         SETTINGS_DOCUMENT_CACHE.get_or_init(|| Mutex::new(SettingsDocumentCache::default()));

@@ -1726,7 +1726,10 @@ impl BridgeServer {
                             .filter_map(|key| entries.remove(&key))
                             .collect::<Vec<_>>()
                     };
-                    drop(evicted);
+                    if !evicted.is_empty() {
+                        drop(evicted);
+                        crate::daemon::memory::after_background_work();
+                    }
                 }
 
                 let multiple_plugins = channels.iter().any(|channel| {

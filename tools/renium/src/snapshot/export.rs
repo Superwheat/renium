@@ -1925,6 +1925,13 @@ fn bridge_text_payload_cache() -> &'static Mutex<BridgeTextPayloadCache> {
     CACHE.get_or_init(|| Mutex::new(BridgeTextPayloadCache::default()))
 }
 
+pub(crate) fn drop_bridge_text_payload_cache() -> usize {
+    let mut cache = bridge_text_payload_cache().lock_recover();
+    let dropped = cache.total_bytes;
+    *cache = BridgeTextPayloadCache::default();
+    dropped
+}
+
 fn bridge_text_payload_known(slot: &str) -> Option<(String, Arc<str>)> {
     let cache = bridge_text_payload_cache().lock_recover();
     let hash = cache.last_hash_by_slot.get(slot)?;

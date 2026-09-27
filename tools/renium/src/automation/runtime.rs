@@ -2514,7 +2514,9 @@ fn automation_execute_request(
     bridge_wait_seconds: f64,
 ) -> std::result::Result<Value, automation::Failure> {
     let started = Instant::now();
+    let request_guard = crate::daemon::memory::begin_request();
     let result = automation_execute_request_inner(request, state, bridge, bridge_wait_seconds);
+    drop(request_guard);
     let name = request.validate().map_or_else(
         |_| format!("op{}", request.op),
         |operation| operation.name.to_string(),

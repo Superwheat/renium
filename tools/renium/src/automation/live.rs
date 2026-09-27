@@ -2798,6 +2798,7 @@ impl LiveLoop {
         }
         self.reconcile_retry = Some(Instant::now() + RESCAN_RETRY);
         self.reconcile_concurrent_changes()?;
+        crate::daemon::memory::after_background_work();
         Ok(true)
     }
 
@@ -3065,7 +3066,9 @@ impl LiveLoop {
                 return Ok(true);
             }
         };
-        let Some(result) = self.execute_push(&push) else {
+        let result = self.execute_push(&push);
+        crate::daemon::memory::after_background_work();
+        let Some(result) = result else {
             return Ok(true);
         };
         match result {
@@ -3245,7 +3248,10 @@ impl LiveLoop {
             return Ok(true);
         };
         match self.pull_studio() {
-            Ok(Some(pulled)) => self.record_pull(pulled)?,
+            Ok(Some(pulled)) => {
+                self.record_pull(pulled)?;
+                crate::daemon::memory::after_background_work();
+            }
             Ok(None) => self.record_empty_pull(),
             Err(error) => self.record_pull_failure(error)?,
         }

@@ -65,6 +65,16 @@ static SCRIPT_NAMING_CACHE: OnceLock<Mutex<HashMap<PathBuf, ProjectScriptNaming>
 static GLOB_MATCHER_CACHE: OnceLock<Mutex<HashMap<String, GlobMatcher>>> = OnceLock::new();
 type ProjectionCacheEntry = Arc<Mutex<Option<CachedProjection>>>;
 static PROJECTION_CACHE: OnceLock<Mutex<HashMap<PathBuf, ProjectionCacheEntry>>> = OnceLock::new();
+
+pub(crate) fn drop_projection_cache() -> usize {
+    let Some(cache) = PROJECTION_CACHE.get() else {
+        return 0;
+    };
+    let mut cache = cache.lock_recover();
+    let entries = cache.len();
+    cache.clear();
+    entries
+}
 thread_local! {
     static NESTED_STAGE_STACK: RefCell<HashSet<PathBuf>> = RefCell::new(HashSet::new());
     static PROJECTION_TRANSFORM_STACK: RefCell<Vec<Vec<ProjectionTransform>>> = const { RefCell::new(Vec::new()) };

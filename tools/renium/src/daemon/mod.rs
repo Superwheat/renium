@@ -13,6 +13,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 mod control_reader;
+pub(crate) mod memory;
 pub(crate) mod transport;
 
 use crate::app::timing::current_millis;
@@ -165,6 +166,7 @@ pub(super) fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
             let _ = crate::studio::audio::global::resume();
             audio_check = Instant::now();
         }
+        memory::release_when_idle();
         thread::sleep(Duration::from_millis(250));
     }
     bridge.alive.store(false, Ordering::Relaxed);
@@ -174,9 +176,11 @@ pub(super) fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
 
 fn release_freed_memory_promptly() {
     const MI_OPTION_PURGE_DECOMMITS: libmimalloc_sys::mi_option_t = 5;
+    const MI_OPTION_ABANDONED_PAGE_PURGE: libmimalloc_sys::mi_option_t = 12;
     const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
     unsafe {
         libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DECOMMITS, 1);
+        libmimalloc_sys::mi_option_set(MI_OPTION_ABANDONED_PAGE_PURGE, 1);
         libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, 0);
     }
 }
