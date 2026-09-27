@@ -18,18 +18,26 @@ if (!source) {
 }
 
 const packageJson = JSON.parse(fs.readFileSync(path.join(extensionRoot, "package.json"), "utf8"));
-const versionResult = childProcess.spawnSync(source, ["--version"], {
-  encoding: "utf8",
-  windowsHide: true,
-});
-const versionOutput = `${versionResult.stdout ?? ""}\n${versionResult.stderr ?? ""}`;
-const versionMatch = versionOutput.match(/^renium\s+(\d+\.\d+\.\d+)\s*$/m);
-if (versionResult.status !== 0 || versionMatch?.[1] !== String(packageJson.version)) {
-  throw new Error(`Renium CLI at ${source} does not match extension v${packageJson.version}.`);
-}
-
 const targetPlatform = process.env.RENIUM_CLI_TARGET_PLATFORM?.trim() || process.platform;
 const targetArchitecture = process.env.RENIUM_CLI_TARGET_ARCH?.trim() || process.arch;
+const foreignTarget = targetPlatform !== process.platform || targetArchitecture !== process.arch;
+const declaredVersion = process.env.RENIUM_CLI_VERSION?.trim();
+if (foreignTarget && declaredVersion) {
+  if (declaredVersion !== String(packageJson.version)) {
+    throw new Error(`Renium CLI version ${declaredVersion} does not match extension v${packageJson.version}.`);
+  }
+} else {
+  const versionResult = childProcess.spawnSync(source, ["--version"], {
+    encoding: "utf8",
+    windowsHide: true,
+  });
+  const versionOutput = `${versionResult.stdout ?? ""}\n${versionResult.stderr ?? ""}`;
+  const versionMatch = versionOutput.match(/^renium\s+(\d+\.\d+\.\d+)\s*$/m);
+  if (versionResult.status !== 0 || versionMatch?.[1] !== String(packageJson.version)) {
+    throw new Error(`Renium CLI at ${source} does not match extension v${packageJson.version}.`);
+  }
+}
+
 const destinationDir = path.join(extensionRoot, "bin", `${targetPlatform}-${targetArchitecture}`);
 fs.mkdirSync(destinationDir, { recursive: true });
 const destination = path.join(destinationDir, binaryName);

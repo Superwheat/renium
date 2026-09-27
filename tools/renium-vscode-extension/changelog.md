@@ -10,6 +10,7 @@
 ### Bug fixes
 
 - `rbx pl` and the first comparison when Live Sync starts no longer hang forever on computers with a single CPU core, such as small cloud VMs and some containers, or when `RAYON_NUM_THREADS` limits the daemon to one worker thread. The pull kept its only worker thread busy waiting for results that needed that same thread to run, so it never finished and showed no error. It now completes with any number of threads.
+- The extension on Intel Macs and Linux ARM64 uses its bundled `rbx` again, so it no longer needs a separately installed Renium CLI to run commands. The 0.3.13 packages for those two platforms put `rbx` in the folder for a different processor, so the extension never found it. Windows, Linux x64 and Apple Silicon packages were not affected.
 
 ## 0.3.13 - 2026-09-27
 

@@ -313,13 +313,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Each extension is packaged on a maintainer runner that can execute
-          # its bundled CLI and keeps the file mode of the binary.
+          # Each extension is packaged on a maintainer runner of its own
+          # operating system so the bundled binary keeps its file mode; the
+          # bundle folder is named after the target, not the runner, and a
+          # binary the runner cannot execute is checked by version only.
           - runner: '["self-hosted", "Windows", "X64"]'
             cliArtifact: cli-Windows-X64
             target: win32-x64
             binary: renium.exe
-          - runner: '["self-hosted", "Windows", "ARM64"]'
+          - runner: '["self-hosted", "Windows", "X64"]'
             cliArtifact: cli-Windows-ARM64
             target: win32-arm64
             binary: renium.exe
@@ -381,21 +383,29 @@ jobs:
           $cli = Get-ChildItem $stage -Recurse -File -Filter "${{ matrix.binary }}" | Select-Object -First 1
           if ($null -eq $cli) { throw "CLI archive is missing ${{ matrix.binary }}" }
           if ("${{ runner.os }}" -ne "Windows") { chmod +x $cli.FullName }
+          $targetPlatform, $targetArch = "${{ matrix.target }}".Split('-')
+          $runnable = $true
           if ($IsWindows) {
             $reader = [System.Reflection.PortableExecutable.PEReader]::new([System.IO.File]::OpenRead($cli.FullName))
             $machine = "$($reader.PEHeaders.CoffHeader.Machine)"
             $reader.Dispose()
-            $expected = @{ AMD64 = 'Amd64'; ARM64 = 'Arm64' }[$env:PROCESSOR_ARCHITECTURE]
-            if ($machine -ne $expected) { throw "The CLI archive is built for $machine but this runner is $env:PROCESSOR_ARCHITECTURE" }
+            $expected = @{ x64 = 'Amd64'; arm64 = 'Arm64' }[$targetArch]
+            if ($machine -ne $expected) { throw "The CLI archive is built for $machine but the ${{ matrix.target }} extension needs $expected" }
+            $runnable = $expected -eq @{ AMD64 = 'Amd64'; ARM64 = 'Arm64' }[$env:PROCESSOR_ARCHITECTURE]
           }
-          # Give a freshly extracted executable a moment to become runnable.
-          $ready = $false
-          for ($attempt = 0; $attempt -lt 30 -and -not $ready; $attempt++) {
-            try { & $cli.FullName --version *> $null; $ready = ($LASTEXITCODE -eq 0) } catch { $ready = $false }
-            if (-not $ready) { Start-Sleep -Seconds 1 }
+          if ($runnable) {
+            # Give a freshly extracted executable a moment to become runnable.
+            $ready = $false
+            for ($attempt = 0; $attempt -lt 30 -and -not $ready; $attempt++) {
+              try { & $cli.FullName --version *> $null; $ready = ($LASTEXITCODE -eq 0) } catch { $ready = $false }
+              if (-not $ready) { Start-Sleep -Seconds 1 }
+            }
+            if (-not $ready) { throw "The extracted CLI could not be executed" }
           }
-          if (-not $ready) { throw "The extracted CLI could not be executed" }
           "RENIUM_CLI_BUILD=$($cli.FullName)" >> $env:GITHUB_ENV
+          "RENIUM_CLI_TARGET_PLATFORM=$targetPlatform" >> $env:GITHUB_ENV
+          "RENIUM_CLI_TARGET_ARCH=$targetArch" >> $env:GITHUB_ENV
+          "RENIUM_CLI_VERSION=${{ needs.verify-tag.outputs.version }}" >> $env:GITHUB_ENV
 
       - name: Package extension
         shell: pwsh
