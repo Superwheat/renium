@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### New
+
+- `rbx report -m "what went wrong"` compiles a bug report for the Renium developer: the doctor checks, Studio status, the project file, the daemon log tail, recent crash reports and the last `rbx` commands with their output taken from the project's Codex or Claude Code transcripts, written to `.renium/reports/<ID>/` plus a zip, with home paths and key, token or password values masked. It prints the report ID and a GitHub issue link to attach the zip to. An agent that hits a Renium failure is told to run it and hand the user the ID.
+- The daemon keeps a rolling log (`logs/daemon.log` beside its discovery file, 8 MB with one rotation) with one line per request, its duration and outcome, so a report shows what Renium did before a problem.
+
 ### Improvements
 
 - `rbx access read TARGET PROPERTY [TARGET ...]` reads one property from several instances in one call and under one approval, up to 64 per call, and returns a `results` list with each path, class name and value. Reading the Status of every PackageLink in a place used to take a separate `read` and `approve` for each package.

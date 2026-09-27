@@ -130,6 +130,7 @@ pub(super) fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
     if let Some(parent_pid) = args.parent_pid {
         watch_parent_and_exit(parent_pid);
     }
+    crate::app::output::open_daemon_log();
     release_freed_memory_promptly();
     #[cfg(windows)]
     crate::studio::input::watch_auto_recovery_dialogs();

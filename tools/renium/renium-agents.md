@@ -11,11 +11,11 @@ If PATH is stale: Windows `%USERPROFILE%\.renium\bin\rbx.exe`; macOS/Linux `~/.r
 - **Runtime behavior:** use Play only for a specific unanswered question, such as input handling, replication, physics, or a runtime error. Identify the expected result first. A small edit is not itself a reason to playtest.
 - **Visual behavior:** a screenshot checks one state; a recording checks a transition. Review the captured evidence, not merely whether capture succeeded.
 
-Check Luau syntax offline with `rbx ck FILE...`. Use project checks for types, lint, and behavior. Never use Studio `loadstring` for validation or enable `LoadStringEnabled` to make a check work. Don't execute or require scripts merely to check syntax.
+Check Luau syntax offline with `rbx ck FILE...`; project checks cover types, lint and behavior. Never use Studio `loadstring` or enable `LoadStringEnabled` for validation, and don't execute or require scripts just to check syntax.
 
-With healthy Live Sync, trust successful file edits. Don't push, poll, or reread Studio after every save. Use one `lst --wait` after a reported problem or when the next operation needs synchronization. Don't start Play to prove a file edit synced.
+With healthy Live Sync, trust successful file edits: don't push, poll, or reread Studio after every save, and don't start Play to prove an edit synced. Use one `lst --wait` after a reported problem or when the next operation needs synchronization.
 
-When Play is needed, reuse a suitable session. Test related changes together, with the fewest clients required. Don't stop a user's session just to create your own.
+When Play is needed, reuse a suitable session, test related changes together with the fewest clients required, and don't stop a user's session to create your own.
 
 ## Read the relevant guide
 
@@ -33,7 +33,7 @@ When Play is needed, reuse a suitable session. Test related changes together, wi
 | Studio lifecycle and place management | `RENIUM/advanced.md` |
 | Installed plugins and their commands | `RENIUM/plugins.md` |
 
-Read only guides needed for the task, before using their commands, once per session; reread after `rbx upd` or when a command says the instructions changed. Use command help for other options.
+Read only the guides the task needs, once per session, before using their commands; reread after `rbx upd` or when a command says the instructions changed. Command help covers other options.
 
 ## Targeting and edits
 
@@ -41,23 +41,24 @@ Single-place projects use `src`; experiences use `places/<alias>/src`.
 A place folder selects its target. At the experience root, add `--place <alias|placeId>` when needed.
 Studio commands also accept `gameId:placeId` or a Studio window name; ambiguity returns candidates.
 
-Edit existing scripts as files. Use Renium for generated `.renium` stores and sourcemaps.
+Edit scripts as files; use Renium for generated `.renium` stores and sourcemaps.
 `f`/`bg`/`bb` read saved data; `q` searches a closed place; `v` inspects a model/place; `l` reads live Studio. For a full place comparison, use `cmp BEFORE --full` (optionally `--against AFTER`). Counts cover the whole place; request `--all` or `--values` only when needed.
 Choose the source that answers the question. Compare states only when the task calls for it.
 
 Read an existing target once and reuse its ID; refresh IDs after a pull.
-Run mutations one at a time and inspect each result. If one fails, check the affected state before retrying or recovering.
-A usage error (unexpected argument, unknown flag, missing or conflicting selector, missing path) means the invocation was malformed, not that Renium failed: fix the quoting, flag, or path and rerun instead of stopping or asking. Quote code and JSON for the shell or pipe them on stdin.
-Keep query results small: request counts, slices, or specific fields; write large captures to a file.
+Run mutations one at a time and inspect each result; if one fails, check the affected state before retrying.
+A usage error (unexpected argument, unknown flag, missing or conflicting selector, missing path) means the invocation was malformed, not that Renium failed: fix it and rerun instead of stopping or asking. Quote code and JSON for the shell or pipe them on stdin.
+Keep query results small (counts, slices, specific fields); write large captures to a file.
 When a check exposes a defect in what you were asked to deliver, fix and verify it rather than reporting it.
-An empty `changedPaths` is a no-op. After cleanup, one prefix search is enough; `storeRemoved: true` needs no follow-up store query.
+An empty `changedPaths` is a no-op; after cleanup, one prefix search is enough and `storeRemoved: true` needs no follow-up query.
 
 Renium marks affected linked packages Changed before edits. Report `autoDesyncedPackages`, including packages named in a failed edit. Publishing needs user authorization; it is not part of syncing.
 
 ## Tools and boundaries
 
-- Use project-declared tools through their normal commands. If unavailable, report that; don't hunt for executables inside caches or extension folders.
+- Use project-declared tools through their normal commands; if one is unavailable, say so instead of hunting for executables in caches or extension folders.
 - Pass arguments or pipe JSON/code through stdin; don't create payload files.
 - Launch, close, or replace Studio only when the task needs it. Never take focus or global input.
-- Ignore `.renium/editor-history`; it is local revert data.
+- Ignore `.renium/editor-history`: local revert data.
 - Update with `rbx upd` when requested or an update is reported, then reread these guides.
+- If Renium itself fails (internal error, crash, lost sync data), run `rbx report -m "what happened"` and give the user its ID and path.

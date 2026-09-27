@@ -254,6 +254,12 @@ pub(super) enum Commands {
     )]
     Doctor(workflows::DoctorArgs),
     #[command(
+        name = "report",
+        alias = "bug",
+        about = "Compile a bug report for the Renium developer"
+    )]
+    Report(crate::app::report::ReportArgs),
+    #[command(
         name = "docs",
         alias = "open-docs",
         about = "Print a documentation topic"

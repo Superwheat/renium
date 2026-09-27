@@ -91,3 +91,11 @@ rbx inp -p 1 click "Shop.BuyButton" wait 100 key E
 
 `inp` accepts action/value pairs: `click`, `right`, `move`, `down`, `up`, `right-down`, `right-up`, `scroll-up`, `scroll-down`, `key`, `kd`, `ku`, `text`, `wait`.
 Mouse targets are UI paths or `x,y`; waits are milliseconds. Put `-p` first.
+
+## Report a Renium bug
+
+```powershell
+rbx report -m "what went wrong"
+```
+
+When Renium itself fails (an internal error, a crash, a sync that lost or mangled data), `report` writes `.renium/reports/<ID>/` and a zip beside it: the doctor checks, Studio status, the project file, the daemon log tail, recent crash reports, and the last `rbx` commands with their output from this project's Codex or Claude Code transcripts (`--since MINUTES`, default 120; `--no-transcript` leaves them out). Home paths and values after key, token or password words are masked. Tell the user the ID and path; they review the folder and attach the zip to the GitHub issue link the command prints.

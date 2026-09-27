@@ -474,11 +474,49 @@ pub fn run_build(args: BuildArgs, global_project: Option<&Path>) -> Result<()> {
 
 pub fn run_doctor(args: DoctorArgs, global_project: Option<&Path>) -> Result<()> {
     let root = absolute_path(&args.root);
+    let (result, bundle_project) =
+        doctor_result(&root, args.project.as_deref().or(global_project))?;
+    if let Some(bundle) = args.bundle {
+        write_doctor_bundle(&bundle, &result, bundle_project.as_deref())?;
+    }
+    if args.json {
+        crate::app::output::print_json_output(&result, false)?;
+    } else {
+        let text = result["checks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|check| {
+                let field = |name: &str| check.get(name).and_then(Value::as_str).unwrap_or("");
+                let mut lines = vec![format!(
+                    "{:<10} {:<18} {}",
+                    field("status"),
+                    field("name"),
+                    field("detail")
+                )];
+                if let Some(action) = check.get("action").and_then(Value::as_str) {
+                    lines.push(format!("{:<10} {:<18} {}", "", "", action));
+                }
+                lines
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        crate::emit_global_output(&result, &text)?;
+    }
+    if result["ok"] != json!(true) {
+        bail!("Renium doctor found errors");
+    }
+    Ok(())
+}
+
+pub(crate) fn doctor_result(
+    root: &Path,
+    explicit_project: Option<&Path>,
+) -> Result<(Value, Option<PathBuf>)> {
     let mut checks = Vec::new();
-    let explicit_project = args.project.as_deref().or(global_project);
-    let project_marker_exists = project_marker_exists_from(&root);
+    let project_marker_exists = project_marker_exists_from(root);
     let mut bundle_project = None;
-    match config::load_project(explicit_project, Some(&root)) {
+    match config::load_project(explicit_project, Some(root)) {
         Ok(project) => {
             bundle_project = Some(project.path.clone());
             match config::validate_project(&project)
@@ -520,7 +558,7 @@ pub fn run_doctor(args: DoctorArgs, global_project: Option<&Path>) -> Result<()>
             }),
         }),
     }
-    let config = config::load_merged_config(&root);
+    let config = config::load_merged_config(root);
     checks.push(match config {
         Ok(_) => DoctorCheck {
             name: "configuration".to_string(),
@@ -610,32 +648,7 @@ pub fn run_doctor(args: DoctorArgs, global_project: Option<&Path>) -> Result<()>
         "root": root,
         "checks": checks,
     });
-    if let Some(bundle) = args.bundle {
-        write_doctor_bundle(&bundle, &result, bundle_project.as_deref())?;
-    }
-    if args.json {
-        crate::app::output::print_json_output(&result, false)?;
-    } else {
-        let text = checks
-            .iter()
-            .flat_map(|check| {
-                let mut lines = vec![format!(
-                    "{:<10} {:<18} {}",
-                    check.status, check.name, check.detail
-                )];
-                if let Some(action) = &check.action {
-                    lines.push(format!("{:<10} {:<18} {}", "", "", action));
-                }
-                lines
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        crate::emit_global_output(&result, &text)?;
-    }
-    if checks.iter().any(|check| check.status == "error") {
-        bail!("Renium doctor found errors");
-    }
-    Ok(())
+    Ok((result, bundle_project))
 }
 
 fn project_marker_exists_from(start: &Path) -> bool {

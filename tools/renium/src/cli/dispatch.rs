@@ -64,6 +64,7 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::QueryPlace(args) => crate::project::place_file::query_place(args),
         Commands::ComparePlace(args) => crate::project::place_file::compare_place(args, project),
         Commands::Doctor(args) => workflows::run_doctor(args, project),
+        Commands::Report(args) => crate::app::report::run(args, project),
         Commands::Docs(args) => workflows::run_docs(args),
         Commands::Daemon(args) => workflows::run_daemon(args),
         Commands::Studio(args) => workflows::run_studio(args, project),

@@ -50,6 +50,10 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
         "Examples:\n  rbx cmp Place.rbxl\n  rbx cmp Before.rbxl --full --all\n  rbx cmp Before.rbxl --against After.rbxlx --full --all",
     ),
     ("dr", "Examples:\n  rbx dr"),
+    (
+        "report",
+        "Examples:\n  rbx report -m \"lon dropped my Lighting edit after the pull\"\n  rbx report --since 30 --no-transcript",
+    ),
     ("docs", "Examples:\n  rbx docs sync"),
     ("dm", "Examples:\n  rbx dm list"),
     ("so", "Examples:\n  rbx so Place.rbxl"),

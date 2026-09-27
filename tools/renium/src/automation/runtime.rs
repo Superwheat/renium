@@ -2513,6 +2513,33 @@ fn automation_execute_request(
     bridge: &Arc<BridgeServer>,
     bridge_wait_seconds: f64,
 ) -> std::result::Result<Value, automation::Failure> {
+    let started = Instant::now();
+    let result = automation_execute_request_inner(request, state, bridge, bridge_wait_seconds);
+    let name = request.validate().map_or_else(
+        |_| format!("op{}", request.op),
+        |operation| operation.name.to_string(),
+    );
+    let elapsed = started.elapsed().as_millis();
+    match &result {
+        Ok(_) => log_global(3, format_args!("[renium] {name} ok in {elapsed} ms")),
+        Err(failure) => log_global(
+            3,
+            format_args!(
+                "[renium] {name} failed in {elapsed} ms: {} {}",
+                failure.0.c,
+                failure.0.m.chars().take(300).collect::<String>()
+            ),
+        ),
+    }
+    result
+}
+
+fn automation_execute_request_inner(
+    request: &automation::Request,
+    state: &automation::State,
+    bridge: &Arc<BridgeServer>,
+    bridge_wait_seconds: f64,
+) -> std::result::Result<Value, automation::Failure> {
     let operation = request.validate()?;
     // Unbound PID/bulk operations must not bypass workflow ownership.
     if matches!(operation.id, op::UPDATE_STUDIOS | op::PERFORMANCE_PROFILE)

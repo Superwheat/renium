@@ -220,7 +220,8 @@ Agents read the same guides, starting from the [agent guide](renium-agents.md).
 - **No Studio connection:** `rbx status` names the cause: Studio closed, plugin missing, plugin needs a Studio restart, plugin not connecting, or another place open. Restart Studio after a plugin update.
 - **Several Studios or places:** `rbx cs` lists Edit, server and client runtimes; add `--place` to pick one.
 - **Sync failed or pending:** read `rbx lst --details` and fix the cause instead of forcing a push or pull.
-- **Installation or configuration:** run `rbx dr --json`. `rbx dr --bundle diagnostics` writes a report; review it before sharing.
+- **Installation or configuration:** run `rbx dr --json`.
+- **Something in Renium itself broke:** run `rbx report -m "what went wrong"`. It writes a zip with the diagnostics, the daemon log and the recent `rbx` commands from your agent's transcript, with keys and home paths masked; review it, then attach it to the issue link it prints.
 
 [Report a bug](https://github.com/Superwheat/renium/issues) with the Renium version,
 your OS, the command or editor action, and the exact error.

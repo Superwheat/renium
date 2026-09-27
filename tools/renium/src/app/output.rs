@@ -9,6 +9,76 @@ use serde_json::Value;
 
 use crate::app::timing::current_millis;
 use crate::cli::Cli;
+use crate::system::LockRecover;
+
+static LOG_FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+const LOG_FILE_LIMIT: u64 = 8 * 1024 * 1024;
+const LOG_FILE_LEVEL: u8 = 3;
+
+pub(crate) fn daemon_log_path() -> Option<std::path::PathBuf> {
+    crate::daemon::local_app_data_daemon_path().and_then(|path| {
+        path.parent()
+            .map(|parent| parent.join("logs").join("daemon.log"))
+    })
+}
+
+pub(crate) fn open_daemon_log() {
+    let Some(path) = daemon_log_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    rotate_if_large(&path);
+    if let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        *LOG_FILE.lock_recover() = Some(file);
+        log_global(
+            3,
+            format_args!(
+                "[renium] daemon {} ({}) started, pid {}",
+                crate::app::build::VERSION,
+                crate::app::build::GIT_HASH,
+                std::process::id()
+            ),
+        );
+    }
+}
+
+fn rotate_if_large(path: &std::path::Path) {
+    if std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > LOG_FILE_LIMIT) {
+        let _ = std::fs::rename(path, path.with_extension("log.1"));
+    }
+}
+
+fn append_log_file(message: fmt::Arguments<'_>) {
+    let mut guard = LOG_FILE.lock_recover();
+    let Some(file) = guard.as_mut() else {
+        return;
+    };
+    let line = format!(
+        "{} {}\n",
+        crate::app::report::utc_stamp(std::time::SystemTime::now()),
+        message
+    );
+    let _ = file.write_all(line.as_bytes());
+    if file
+        .metadata()
+        .is_ok_and(|metadata| metadata.len() > LOG_FILE_LIMIT)
+        && let Some(path) = daemon_log_path()
+    {
+        *guard = None;
+        rotate_if_large(&path);
+        *guard = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .ok();
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct ReportedFailure;
@@ -128,6 +198,9 @@ pub(crate) fn global_log_enabled(level: u8) -> bool {
 pub(crate) fn log_global(level: u8, message: std::fmt::Arguments<'_>) {
     if global_log_enabled(level) {
         write_stderr(message);
+    }
+    if level <= LOG_FILE_LEVEL {
+        append_log_file(message);
     }
 }
 
