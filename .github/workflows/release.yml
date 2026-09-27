@@ -261,9 +261,12 @@ jobs:
           $cli = Get-ChildItem $cliStage -Recurse -File -Filter renium.exe | Select-Object -First 1
           if ($null -eq $cli) { throw "Windows x64 CLI binary is missing" }
           $output = Join-Path $env:RUNNER_TEMP "release-output"
+          # The persistent workspace keeps generated files between runs; the tag
+          # checkout above already guarantees the tracked tree.
           ./tools/build-release.ps1 `
             -OutputDirectory $output `
             -AllowLocalPublisher `
+            -AllowDirty `
             -PrebuiltCli $cli.FullName
           $release = Join-Path $output "renium-${{ needs.verify-tag.outputs.version }}"
           if (-not (Test-Path $release -PathType Container)) { throw "Release directory was not produced" }
