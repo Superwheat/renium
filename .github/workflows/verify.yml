@@ -88,18 +88,20 @@ jobs:
 
   rust-windows-arm:
     name: Rust tests (windows-11-arm)
-    # No maintainer machine runs Windows on ARM64, so these tests stay on a
-    # hosted runner for pull requests and the nightly run; a push instead
-    # cross-checks the ARM64 build on the maintainer's Windows runner.
-    if: github.event_name != 'push'
-    runs-on: windows-11-arm
+    # Maintainer pushes run these on the Windows ARM64 virtual machine on the
+    # maintainer's Mac, whose target directories persist between runs; pull
+    # requests and the nightly run use GitHub's hosted ARM64 runner.
+    runs-on: ${{ github.event_name == 'push' && fromJSON('["self-hosted", "Windows", "ARM64"]') || 'windows-11-arm' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
+        with:
+          clean: ${{ github.event_name != 'push' }}
 
       - uses: dtolnay/rust-toolchain@1.95.0
 
       - uses: Swatinem/rust-cache@v2
+        if: github.event_name != 'push'
         with:
           workspaces: |
             tools/renium
@@ -107,6 +109,7 @@ jobs:
             tools/vendor/rbx-dom
 
       - uses: actions/setup-node@v4
+        if: github.event_name != 'push'
         with:
           node-version-file: .node-version
 
@@ -140,8 +143,6 @@ jobs:
           clean: ${{ github.event_name != 'push' }}
 
       - uses: dtolnay/rust-toolchain@1.95.0
-        with:
-          targets: aarch64-pc-windows-msvc
 
       - uses: Swatinem/rust-cache@v2
         if: github.event_name != 'push'
@@ -253,23 +254,3 @@ jobs:
           finally {
             $archive.Dispose()
           }
-
-      # The hosted Windows ARM64 tests run only for pull requests and the
-      # nightly schedule; a push checks that the ARM64 target still compiles,
-      # native helpers included. The whole x64_arm64 developer environment is
-      # imported into this one step: with VCINSTALLDIR set, rustc takes
-      # link.exe from PATH, so PATH has to lead with the MSVC tools rather
-      # than Git's coreutils link.
-      - name: Check the Windows ARM64 build
-        if: github.event_name == 'push'
-        run: |
-          $PSNativeCommandUseErrorActionPreference = $true
-          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
-          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath
-          if (-not $vs) { throw "No Visual Studio instance with the MSVC ARM64 build tools was found" }
-          $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvarsall.bat"
-          $lines = cmd /c "`"$vcvars`" x64_arm64 >nul 2>&1 && set"
-          foreach ($line in $lines) {
-            if ($line -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($matches[1])" -Value $matches[2] }
-          }
-          cargo check --locked --tests --manifest-path tools/renium/Cargo.toml --target aarch64-pc-windows-msvc
