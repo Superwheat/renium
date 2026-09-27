@@ -1,7 +1,9 @@
 //! Permission state for protected properties only. Ordinary edits do not enter
 //! this gate, and a permission grant never changes Roblox's global security.
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+#[cfg(any(windows, target_os = "macos", test))]
+use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::{Result, bail};
 use clap::ValueEnum;
@@ -9,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub(crate) const WRITE_WARNING: &str = "Protected property writes can change engine-managed state. Running unknown scripts or plugins in this session may be dangerous. Enable read-write only at the user's explicit request.";
+#[cfg(any(windows, target_os = "macos", test))]
 const APPROVAL_TTL: Duration = Duration::from_secs(300);
 #[cfg(any(windows, target_os = "macos", test))]
 const MAX_PENDING: usize = 128;
