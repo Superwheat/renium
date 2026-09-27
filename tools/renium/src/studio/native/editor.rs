@@ -2724,8 +2724,6 @@ pub(crate) fn editor_binary_export_parts<'a>(
         native_filters: &native_filters,
         run_started,
     };
-    let (sender, receiver) = mpsc::channel::<Result<NativeServiceExportResult>>();
-    let receiver = Mutex::new(receiver);
     let mut metrics = ChunkFetchMetrics::default();
     let mut compact_expand_ms = 0.0;
     let serialization_complete_signal = AtomicBool::new(false);
@@ -2777,68 +2775,76 @@ pub(crate) fn editor_binary_export_parts<'a>(
                 });
             }
         }
-        rayon::scope_fifo(|scope| -> Result<()> {
-            for worker_index in 0..worker_count {
-                let sender = sender.clone();
-                let fetch_overlay = &fetch_overlay;
-                let overlay_receivers = &overlay_receivers;
-                let conditional_ref_schema = &conditional_ref_schema;
-                let enum_value_names_by_type = &export.enum_value_names_by_type;
-                let native_decode_filter = &native_decode_filter;
-                let priority_groups = &priority_groups;
-                let service_queue = &service_queue;
-                let priority_gate = &priority_gate;
-                let batched_service_names = &batched_service_names;
-                let batched_service_set = &batched_service_set;
-                let native_binary_batches = &native_binary_batches;
-                let serialization_batch_by_service = &serialization_batch_by_service;
-                let native_serialization_batches = &native_serialization_batches;
-                #[cfg(windows)]
-                let captured_native_services = &captured_native_services;
-                let serialization_complete_signal = &serialization_complete_signal;
-                let service_groups = &export.groups;
-                let finish_dependencies = &finish_dependencies;
-                scope.spawn_fifo(move |_| {
-                    if worker_index >= priority_worker_count {
-                        priority_gate.wait();
+        let fetch_overlay = &fetch_overlay;
+        let overlay_receivers = &overlay_receivers;
+        let conditional_ref_schema = &conditional_ref_schema;
+        let enum_value_names_by_type = &export.enum_value_names_by_type;
+        let native_decode_filter = &native_decode_filter;
+        let priority_groups = &priority_groups;
+        let service_queue = &service_queue;
+        let priority_gate = &priority_gate;
+        let batched_service_names = &batched_service_names;
+        let batched_service_set = &batched_service_set;
+        let native_binary_batches = &native_binary_batches;
+        let serialization_batch_by_service = &serialization_batch_by_service;
+        let native_serialization_batches = &native_serialization_batches;
+        #[cfg(windows)]
+        let captured_native_services = &captured_native_services;
+        let serialization_complete_signal = &serialization_complete_signal;
+        let service_groups = &export.groups;
+        let finish_dependencies = &finish_dependencies;
+        run_workers_and_drain(
+            worker_count,
+            |worker_index, sender: mpsc::Sender<Result<NativeServiceExportResult>>| {
+                if worker_index >= priority_worker_count {
+                    priority_gate.wait();
+                }
+                let mut priority_release = OnDrop::new(|| {
+                    if priority_worker_count < worker_count && worker_index == 0 {
+                        priority_gate.release();
                     }
-                    let mut priority_release = OnDrop::new(|| {
-                        if priority_worker_count < worker_count && worker_index == 0 {
-                            priority_gate.release();
-                        }
-                    });
-                    let mut priority_service = priority_groups.get(worker_index).copied();
-                    loop {
-                        let service = priority_service.take().or_else(|| {
-                            service_queue
-                                .lock_recover()
-                                .pop_front()
-                        });
-                        let Some(group) = service else {
-                            break;
-                        };
-                        let result = thread::scope(|reference_scope| -> Result<NativeServiceExportResult> {
-                        // Root reads use the same active export guard, but must
-                        // not hold up unrelated binary decoding and file writes.
-                        #[cfg(any(windows, target_os = "macos"))]
-                        let root_capture = (!native_capture && !crate::editor::native_roots::capture_properties(&group.service).is_empty())
-                            .then(|| reference_scope.spawn(move || -> Result<EditorBinaryExportGroup> {
-                                let mut captured = group.clone();
-                                capture_native_service_root_properties(bridge, None, std::slice::from_mut(&mut captured))?;
-                                Ok(captured)
-                            }));
-                        let selective_refs =
-                            group.instance_count >= NATIVE_SERIALIZATION_SERVICE_LIMIT
-                            && group.class_names.iter().any(|class_name| {
-                                conditional_ref_schema.contains_key(class_name)
+                });
+                let mut priority_service = priority_groups.get(worker_index).copied();
+                loop {
+                    let service = priority_service
+                        .take()
+                        .or_else(|| service_queue.lock_recover().pop_front());
+                    let Some(group) = service else {
+                        break;
+                    };
+                    let result = thread::scope(
+                        |reference_scope| -> Result<NativeServiceExportResult> {
+                            // Root reads use the same active export guard, but must
+                            // not hold up unrelated binary decoding and file writes.
+                            #[cfg(any(windows, target_os = "macos"))]
+                            let root_capture = (!native_capture
+                                && !crate::editor::native_roots::capture_properties(
+                                    &group.service,
+                                )
+                                .is_empty())
+                            .then(|| {
+                                reference_scope.spawn(move || -> Result<EditorBinaryExportGroup> {
+                                    let mut captured = group.clone();
+                                    capture_native_service_root_properties(
+                                        bridge,
+                                        None,
+                                        std::slice::from_mut(&mut captured),
+                                    )?;
+                                    Ok(captured)
+                                })
                             });
-                        let (reference_sender, reference_receiver) = mpsc::sync_channel(1);
-                        let (native, overlay) = rayon::join(
-                            || -> Result<NativeServiceFetch> {
-                                let (native, one_chunk) = if native_capture {
-                                    #[cfg(windows)]
-                                    {
-                                        let captured = captured_native_services.get_or_init(|| {
+                            let selective_refs = group.instance_count
+                                >= NATIVE_SERIALIZATION_SERVICE_LIMIT
+                                && group.class_names.iter().any(|class_name| {
+                                    conditional_ref_schema.contains_key(class_name)
+                                });
+                            let (reference_sender, reference_receiver) = mpsc::sync_channel(1);
+                            let (native, overlay) = rayon::join(
+                                || -> Result<NativeServiceFetch> {
+                                    let (native, one_chunk) = if native_capture {
+                                        #[cfg(windows)]
+                                        {
+                                            let captured = captured_native_services.get_or_init(|| {
                                             (|| -> Result<_> {
                                                 let info = bridge.cached_bridge_info_for_target(crate::studio::bridge::BridgeTarget::Edit)?;
                                                 let pid = bridge.studio_pid_for_runtime(crate::studio::bridge::BridgeTarget::Edit, &info.runtime_id)?;
@@ -2852,101 +2858,179 @@ pub(crate) fn editor_binary_export_parts<'a>(
                                                     Arc::clone(native_decode_filter), Some(&captured.identities)).map(Mutex::new)
                                             })().map_err(|error| format!("{error:#}"))
                                         });
-                                        let captured = match captured { Ok(captured) => captured, Err(error) => bail!("{error}") };
-                                        let native = captured.lock_recover().remove(&group.service)
-                                            .with_context(|| format!("Native capture omitted {}", group.service))?;
-                                        (native, false)
-                                    }
-                                    #[cfg(not(windows))]
-                                    { bail!("Native service capture is unavailable on this platform"); }
-                                } else if let Some(batch) =
-                                    serialization_batch_by_service.get(group.service.as_str())
-                                {
-                                    let batch_doms = native_serialization_batches
-                                        .get(batch.id.as_str())
-                                        .context("Native serialization batch state is missing")?
-                                        .get_or_init(|| {
-                                            (|| -> Result<_> {
-                                                let bytes = receive_editor_binary_export_bytes(
-                                                    bridge,
-                                                    export_id,
-                                                    Some(&batch.id),
-                                                    Some(serialization_complete_signal),
-                                                )?;
-                                                decode_native_serialization_batch(
-                                                    &bytes,
-                                                    batch,
-                                                    service_groups,
-                                                    Arc::clone(native_decode_filter),
-                                                    None,
+                                            let captured = match captured {
+                                                Ok(captured) => captured,
+                                                Err(error) => bail!("{error}"),
+                                            };
+                                            let native = captured
+                                                .lock_recover()
+                                                .remove(&group.service)
+                                                .with_context(|| {
+                                                    format!(
+                                                        "Native capture omitted {}",
+                                                        group.service
+                                                    )
+                                                })?;
+                                            (native, false)
+                                        }
+                                        #[cfg(not(windows))]
+                                        {
+                                            bail!(
+                                                "Native service capture is unavailable on this platform"
+                                            );
+                                        }
+                                    } else if let Some(batch) =
+                                        serialization_batch_by_service.get(group.service.as_str())
+                                    {
+                                        let batch_doms = native_serialization_batches
+                                            .get(batch.id.as_str())
+                                            .context("Native serialization batch state is missing")?
+                                            .get_or_init(|| {
+                                                (|| -> Result<_> {
+                                                    let bytes = receive_editor_binary_export_bytes(
+                                                        bridge,
+                                                        export_id,
+                                                        Some(&batch.id),
+                                                        Some(serialization_complete_signal),
+                                                    )?;
+                                                    decode_native_serialization_batch(
+                                                        &bytes,
+                                                        batch,
+                                                        service_groups,
+                                                        Arc::clone(native_decode_filter),
+                                                        None,
+                                                    )
+                                                    .map(Mutex::new)
+                                                })()
+                                                .map_err(|error| format!("{error:#}"))
+                                            });
+                                        let batch_doms = match batch_doms {
+                                            Ok(batch_doms) => batch_doms,
+                                            Err(error) => bail!("{error}"),
+                                        };
+                                        let native = batch_doms
+                                            .lock_recover()
+                                            .remove(&group.service)
+                                            .with_context(|| {
+                                                format!(
+                                                    "Native serialization batch {} omitted {}",
+                                                    batch.id, group.service
                                                 )
-                                                .map(Mutex::new)
-                                            })()
+                                            })?;
+                                        (native, false)
+                                    } else if batched_service_set.contains(group.service.as_str()) {
+                                        let batches = native_binary_batches.get_or_init(|| {
+                                            receive_editor_binary_export_batches(
+                                                bridge,
+                                                export_id,
+                                                batched_service_names,
+                                                Some(serialization_complete_signal),
+                                            )
+                                            .map(Arc::new)
                                             .map_err(|error| format!("{error:#}"))
                                         });
-                                    let batch_doms = match batch_doms {
-                                        Ok(batch_doms) => batch_doms,
-                                        Err(error) => bail!("{error}"),
-                                    };
-                                    let native = batch_doms
-                                        .lock_recover()
-                                        .remove(&group.service)
-                                    .with_context(|| {
-                                        format!(
-                                            "Native serialization batch {} omitted {}",
-                                            batch.id, group.service
+                                        let batches = match batches {
+                                            Ok(batches) => batches,
+                                            Err(error) => bail!("{error}"),
+                                        };
+                                        let part = batches.parts.get(&group.service).with_context(
+                                            || {
+                                                format!(
+                                                    "Native binary batch omitted {}",
+                                                    group.service
+                                                )
+                                            },
+                                        )?;
+                                        (
+                                            decode_native_service_dom(
+                                                &part.bytes[part.start..part.end],
+                                                group,
+                                                Arc::clone(native_decode_filter),
+                                            )?,
+                                            false,
                                         )
-                                    })
-                                    ?;
-                                    (native, false)
-                                } else if batched_service_set.contains(group.service.as_str()) {
-                                    let batches = native_binary_batches.get_or_init(|| {
-                                        receive_editor_binary_export_batches(
+                                    } else {
+                                        let bytes = receive_editor_binary_export_bytes(
                                             bridge,
                                             export_id,
-                                            batched_service_names,
+                                            Some(&group.service),
                                             Some(serialization_complete_signal),
+                                        )?;
+                                        let one_chunk = bytes.len() <= NATIVE_BINARY_CHUNK_BYTES;
+                                        (
+                                            decode_native_service_dom(
+                                                &bytes,
+                                                group,
+                                                Arc::clone(native_decode_filter),
+                                            )?,
+                                            one_chunk,
                                         )
-                                        .map(Arc::new)
-                                        .map_err(|error| format!("{error:#}"))
-                                    });
-                                    let batches = match batches {
-                                        Ok(batches) => batches,
-                                        Err(error) => bail!("{error}"),
                                     };
-                                    let part =
-                                        batches.parts.get(&group.service).with_context(|| {
-                                            format!(
-                                                "Native binary batch omitted {}",
-                                                group.service
+                                    let reference_request = (selective_refs && !native_capture)
+                                        .then(|| {
+                                            conditional_ref_overlay_request(
+                                                &native.instances,
+                                                conditional_ref_schema,
+                                                &native.native_index_by_overlay_index,
                                             )
-                                        })?;
-                                    (
-                                        decode_native_service_dom(
-                                            &part.bytes[part.start..part.end],
-                                            group,
-                                            Arc::clone(native_decode_filter),
-                                        )?,
-                                        false,
-                                    )
-                                } else {
-                                    let bytes = receive_editor_binary_export_bytes(
-                                        bridge,
-                                        export_id,
-                                        Some(&group.service),
-                                        Some(serialization_complete_signal),
-                                    )?;
-                                    let one_chunk = bytes.len() <= NATIVE_BINARY_CHUNK_BYTES;
-                                    (
-                                        decode_native_service_dom(
-                                            &bytes,
-                                            group,
-                                            Arc::clone(native_decode_filter),
-                                        )?,
-                                        one_chunk,
-                                    )
-                                };
-                                let reference_request = (selective_refs && !native_capture)
+                                        })
+                                        .filter(|request| request.2 > 0);
+                                    let reference_prefetched =
+                                        one_chunk && reference_request.is_some();
+                                    if reference_prefetched {
+                                        let request = reference_request.clone().context(
+                                            "Native conditional-reference request is missing",
+                                        )?;
+                                        reference_scope.spawn(move || {
+                                            let result = fetch_native_conditional_overlay(
+                                                bridge,
+                                                export_id,
+                                                group,
+                                                enum_value_names_by_type,
+                                                request,
+                                            );
+                                            let _ = reference_sender.send(result);
+                                        });
+                                    }
+                                    Ok((
+                                        native,
+                                        reference_prefetched,
+                                        (!reference_prefetched)
+                                            .then_some(reference_request)
+                                            .flatten(),
+                                    ))
+                                },
+                                || {
+                                    if let Some(receiver) =
+                                        overlay_receivers.get(group.service.as_str())
+                                    {
+                                        receiver.lock_recover().recv().context(
+                                            "Native overlay worker ended without a result",
+                                        )?
+                                    } else {
+                                        fetch_overlay(group)
+                                    }
+                                },
+                            );
+                            if let Ok(overlay) = &overlay
+                                && verbose_timing_logs()
+                            {
+                                println!(
+                                    "[renium] timing: native editor {} overlay fetch took {:.1}ms -> bytes={}, chunks={}, parse_ms={:.1}, expand_ms={:.1}",
+                                    group.service,
+                                    overlay.request_ms,
+                                    overlay.metrics.bytes,
+                                    overlay.metrics.chunks,
+                                    overlay.metrics.json_parse_ms,
+                                    overlay.compact_expand_ms
+                                );
+                            }
+                            let (mut native, reference_prefetched, mut reference_request) = native?;
+                            let mut overlay = overlay?;
+                            let debug_ids = std::mem::take(&mut overlay.debug_ids);
+                            if native_capture {
+                                match_native_capture_overlay(&mut native, &debug_ids)?;
+                                reference_request = selective_refs
                                     .then(|| {
                                         conditional_ref_overlay_request(
                                             &native.instances,
@@ -2955,159 +3039,127 @@ pub(crate) fn editor_binary_export_parts<'a>(
                                         )
                                     })
                                     .filter(|request| request.2 > 0);
-                                let reference_prefetched =
-                                    one_chunk && reference_request.is_some();
-                                if reference_prefetched {
-                                    let request = reference_request
-                                        .clone()
-                                        .context("Native conditional-reference request is missing")?;
-                                    reference_scope.spawn(move || {
-                                        let result = fetch_native_conditional_overlay(
-                                            bridge,
-                                            export_id,
-                                            group,
-                                            enum_value_names_by_type,
-                                            request,
-                                        );
-                                        let _ = reference_sender.send(result);
-                                    });
-                                }
-                                Ok((
+                            }
+                            let settings_ids = std::mem::take(&mut overlay.settings_ids);
+                            #[cfg(any(windows, target_os = "macos"))]
+                            let captured_group = root_capture
+                                .map(|task| task.join().expect("native root capture panicked"))
+                                .transpose()?;
+                            #[cfg(any(windows, target_os = "macos"))]
+                            let group = captured_group.as_ref().unwrap_or(group);
+                            let mut result = finish_native_service_export(
+                                finish_dependencies,
+                                group,
+                                NativeServiceFinishInput {
                                     native,
-                                    reference_prefetched,
-                                    (!reference_prefetched)
-                                        .then_some(reference_request)
-                                        .flatten(),
-                                ))
-                            },
-                            || {
-                                if let Some(receiver) = overlay_receivers.get(group.service.as_str()) {
-                                    receiver.lock_recover().recv()
-                                        .context("Native overlay worker ended without a result")?
-                                } else {
-                                    fetch_overlay(group)
-                                }
-                            },
-                        );
-                        if let Ok(overlay) = &overlay && verbose_timing_logs() {
-                            println!(
-                                "[renium] timing: native editor {} overlay fetch took {:.1}ms -> bytes={}, chunks={}, parse_ms={:.1}, expand_ms={:.1}",
-                                group.service,
-                                overlay.request_ms,
-                                overlay.metrics.bytes,
-                                overlay.metrics.chunks,
-                                overlay.metrics.json_parse_ms,
-                                overlay.compact_expand_ms
-                            );
-                        }
-                        let (mut native, reference_prefetched, mut reference_request) = native?;
-                        let mut overlay = overlay?;
-                        let debug_ids = std::mem::take(&mut overlay.debug_ids);
-                        if native_capture {
-                            match_native_capture_overlay(&mut native, &debug_ids)?;
-                            reference_request = selective_refs.then(|| conditional_ref_overlay_request(
-                                &native.instances, conditional_ref_schema, &native.native_index_by_overlay_index))
-                                .filter(|request| request.2 > 0);
-                        }
-                        let settings_ids = std::mem::take(&mut overlay.settings_ids);
-                        #[cfg(any(windows, target_os = "macos"))]
-                        let captured_group = root_capture.map(|task| task.join().expect("native root capture panicked")).transpose()?;
-                        #[cfg(any(windows, target_os = "macos"))]
-                        let group = captured_group.as_ref().unwrap_or(group);
-                        let mut result = finish_native_service_export(
-                            finish_dependencies,
-                            group,
-                            NativeServiceFinishInput {
-                            native,
-                            debug_ids,
-                            settings_ids,
-                            overlay,
-                            reference_prefetch: reference_prefetched
-                                .then_some(reference_receiver),
-                            reference_request,
-                            export_started_ms,
+                                    debug_ids,
+                                    settings_ids,
+                                    overlay,
+                                    reference_prefetch: reference_prefetched
+                                        .then_some(reference_receiver),
+                                    reference_request,
+                                    export_started_ms,
+                                },
+                            )?;
+                            if group.script_count > 0 {
+                                let worker_count = resolve_source_worker_count(
+                                    bridge.channel_count(),
+                                    group.script_count,
+                                    group.instance_count,
+                                );
+                                let mut sources = fetch_script_sources(
+                                    bridge,
+                                    &group.service,
+                                    DEFAULT_EXPORT_CHUNK_SIZE,
+                                    group.script_count,
+                                    worker_count,
+                                    Some(export_id),
+                                )?;
+                                remap_script_source_indices(
+                                    &mut sources,
+                                    &result.native_index_by_overlay_index,
+                                )?;
+                                merge_script_sources(&mut result.output.parts.instances, &sources);
+                            }
+                            Ok(result)
                         },
-                        )?;
-                        if group.script_count > 0 {
-                            let worker_count = resolve_source_worker_count(
-                                bridge.channel_count(),
-                                group.script_count,
-                                group.instance_count,
-                            );
-                            let mut sources = fetch_script_sources(
-                                bridge,
-                                &group.service,
-                                DEFAULT_EXPORT_CHUNK_SIZE,
-                                group.script_count,
-                                worker_count,
-                                Some(export_id),
-                            )?;
-                            remap_script_source_indices(
-                                &mut sources,
-                                &result.native_index_by_overlay_index,
-                            )?;
-                            merge_script_sources(&mut result.output.parts.instances, &sources);
-                        }
-                        Ok(result)
-                        });
-                        priority_release.run();
-                        if sender.send(result).is_err() {
-                            break;
-                        }
-                    }
-                });
-            }
-            drop(sender);
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            let persistent_identities = identity_worker
-                .join()
-                .map_err(|_| anyhow::anyhow!("Native identity capture worker panicked"))??;
-            for _ in 0..requested_services.len() {
-                let result = receiver
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("Native service export receiver was poisoned"))?
-                    .recv()
-                    .context("Native service export worker closed")??;
-                merge_chunk_fetch_metrics(&mut metrics, result.metrics);
-                compact_expand_ms += result.compact_expand_ms;
-                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-                let result = {
-                    let mut result = result;
-                    for instance in &mut result.output.parts.instances {
-                        let id = instance
-                            .debug_id
-                            .as_deref()
-                            .and_then(|id| persistent_identities.get(id))
-                            .context("Exported instance is missing from native identity capture")?;
-                        // Use the existing metadata codec. The final export guard
-                        // covers the whole interval from identity read to publication.
-                        instance.properties.insert(
-                            "UniqueId".into(),
-                            json!({"_type": "UniqueId", "value": id.to_string()}),
-                        );
-                    }
-                    result
-                };
-                on_output(result.output)?;
-                if !serialization_complete && serialization_complete_signal.load(Ordering::Acquire)
-                {
-                    serialization_complete = true;
-                    on_serialization_complete()?;
-                    if verbose_timing_logs() {
-                        println!(
-                            "[renium] native editor serialization complete at {:.1}ms",
-                            elapsed_ms(run_started)
-                        );
+                    );
+                    priority_release.run();
+                    if sender.send(result).is_err() {
+                        break;
                     }
                 }
-            }
-            Ok(())
-        })
+            },
+            |receiver| -> Result<()> {
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                let persistent_identities = identity_worker
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("Native identity capture worker panicked"))??;
+                for _ in 0..requested_services.len() {
+                    let result = receiver
+                        .recv()
+                        .context("Native service export worker closed")??;
+                    merge_chunk_fetch_metrics(&mut metrics, result.metrics);
+                    compact_expand_ms += result.compact_expand_ms;
+                    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                    let result = {
+                        let mut result = result;
+                        for instance in &mut result.output.parts.instances {
+                            let id = instance
+                                .debug_id
+                                .as_deref()
+                                .and_then(|id| persistent_identities.get(id))
+                                .context(
+                                    "Exported instance is missing from native identity capture",
+                                )?;
+                            // Use the existing metadata codec. The final export guard
+                            // covers the whole interval from identity read to publication.
+                            instance.properties.insert(
+                                "UniqueId".into(),
+                                json!({"_type": "UniqueId", "value": id.to_string()}),
+                            );
+                        }
+                        result
+                    };
+                    on_output(result.output)?;
+                    if !serialization_complete
+                        && serialization_complete_signal.load(Ordering::Acquire)
+                    {
+                        serialization_complete = true;
+                        on_serialization_complete()?;
+                        if verbose_timing_logs() {
+                            println!(
+                                "[renium] native editor serialization complete at {:.1}ms",
+                                elapsed_ms(run_started)
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            },
+        )
     })?;
     log_chunk_fetch_metrics("native editor overlay payloads", metrics);
     log_timing_ms("native editor overlay compact expansion", compact_expand_ms);
     log_timing("native editor streaming export", stream_started);
     Ok(finish_guard)
+}
+
+pub(crate) fn run_workers_and_drain<T: Send, R>(
+    worker_count: usize,
+    work: impl Fn(usize, mpsc::Sender<T>) + Sync,
+    drain: impl FnOnce(&mpsc::Receiver<T>) -> R,
+) -> R {
+    let (sender, receiver) = mpsc::channel();
+    thread::scope(|scope| {
+        for worker_index in 0..worker_count {
+            let sender = sender.clone();
+            let work = &work;
+            scope.spawn(move || work(worker_index, sender));
+        }
+        drop(sender);
+        drain(&receiver)
+    })
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -4830,4 +4882,43 @@ fn send_property_batches(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod export_worker_tests {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::run_workers_and_drain;
+
+    #[test]
+    fn export_workers_finish_when_the_caller_holds_the_only_pool_thread() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("single-thread pool");
+        let (finished, wait) = mpsc::channel();
+        std::thread::spawn(move || {
+            let total = pool.install(|| {
+                run_workers_and_drain(
+                    4,
+                    |worker_index, sender| {
+                        let (doubled, tripled) =
+                            rayon::join(|| worker_index * 2, || worker_index * 3);
+                        sender.send(doubled + tripled).expect("drain is listening");
+                    },
+                    |receiver| {
+                        (0..4)
+                            .map(|_| receiver.recv().expect("worker result"))
+                            .sum::<usize>()
+                    },
+                )
+            });
+            let _ = finished.send(total);
+        });
+        let total = wait
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the export workers deadlocked inside a single-thread pool");
+        assert_eq!(total, (0..4).map(|index| index * 5).sum::<usize>());
+    }
 }

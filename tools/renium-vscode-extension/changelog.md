@@ -7,6 +7,10 @@
 - The daemon now gives memory back to the system about a second after a pull, push or Live Sync cycle finishes, so after pulling a large place it sits idle at about 70 MB instead of about 290 MB and no longer grows with repeated pulls. The daemon's worker threads used to keep memory that had already been freed until they ran again, which could take indefinitely while the daemon was idle.
 - Five minutes after the last pull, push or Live Sync activity, the daemon now also drops the caches it keeps to make back-to-back syncs fast. After a Live Sync push of a large place, idle memory falls from about 190 MB to about 75 MB. Most of that memory is the parsed copy of the project's `.renium` store files. The other caches are the project layout and the copy of the last Studio export. The first push or pull after a break like this reads the stores again, which takes well under a second, and a pull transfers unchanged services from Studio again.
 
+### Bug fixes
+
+- `rbx pl` and the first comparison when Live Sync starts no longer hang forever on computers with a single CPU core, such as small cloud VMs and some containers, or when `RAYON_NUM_THREADS` limits the daemon to one worker thread. The pull kept its only worker thread busy waiting for results that needed that same thread to run, so it never finished and showed no error. It now completes with any number of threads.
+
 ## 0.3.13 - 2026-09-27
 
 ### New

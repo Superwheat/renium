@@ -1235,7 +1235,7 @@ pub(crate) fn capture_exported_services<T: Send>(
     let outputs = Mutex::new(Vec::with_capacity(prelude.services.len()));
     // Consume each exported service immediately. Waiting for the last export
     // before projecting the first would serialize two otherwise parallel stages.
-    let mut guard = rayon::scope(|scope| {
+    let mut guard = std::thread::scope(|scope| {
         editor_binary_export_parts(
             bridge,
             &prelude.services,
@@ -1243,7 +1243,7 @@ pub(crate) fn capture_exported_services<T: Send>(
             &mut |output| {
                 let outputs = &outputs;
                 let project_service = &project_service;
-                scope.spawn(move |_| {
+                scope.spawn(move || {
                     let service = output.span.service;
                     let result = exported_parts_to_service_state(&service, output.parts)
                         .and_then(|state| project_service(&service, state));
