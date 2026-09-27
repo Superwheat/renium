@@ -121,7 +121,7 @@ pub(crate) fn property_text_matches(
 struct Pending {
     scope: Scope,
     intents: Vec<Intent>,
-    created: Instant,
+    deadline: Instant,
 }
 
 #[derive(Default)]
@@ -155,7 +155,7 @@ impl Policy {
         self.modes
             .retain(|scope, _| active.contains(&scope.runtime));
         self.pending.retain(|_, pending| {
-            pending.created.elapsed() < APPROVAL_TTL && active.contains(&pending.scope.runtime)
+            Instant::now() < pending.deadline && active.contains(&pending.scope.runtime)
         });
     }
 
@@ -186,8 +186,7 @@ impl Policy {
                 if trusted {
                     return Ok(Decision::Allowed);
                 }
-                self.pending
-                    .retain(|_, p| p.created.elapsed() < APPROVAL_TTL);
+                self.pending.retain(|_, p| Instant::now() < p.deadline);
                 let decision = |request_id: String| Decision::ApprovalRequired {
                     request_id,
                     intent: intents[0].clone(),
@@ -211,7 +210,7 @@ impl Policy {
                     Pending {
                         scope: scope.clone(),
                         intents: intents.to_vec(),
-                        created: Instant::now(),
+                        deadline: Instant::now() + APPROVAL_TTL,
                     },
                 );
                 Ok(decision(id))
@@ -229,7 +228,7 @@ impl Policy {
             bail!("Property approval belongs to a different Studio runtime or project");
         }
         let pending = self.pending.remove(id).expect("approval checked above");
-        if pending.created.elapsed() >= APPROVAL_TTL {
+        if Instant::now() >= pending.deadline {
             bail!("Property approval expired; request the operation again");
         }
         Ok(pending.intents)
@@ -520,7 +519,7 @@ mod tests {
         policy.retain_runtimes(&[]);
         assert_eq!(policy.mode(&scope()), Mode::Ask);
         let id = ticket(&mut policy, &intent(None));
-        policy.pending.get_mut(&id).unwrap().created -= APPROVAL_TTL;
+        policy.pending.get_mut(&id).unwrap().deadline = Instant::now();
         assert!(policy.approve(&scope(), &id).is_err());
         let id = ticket(&mut policy, &intent(None));
         policy.reject(&scope(), &id).unwrap();
