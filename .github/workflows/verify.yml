@@ -217,6 +217,7 @@ jobs:
       - name: Install, test, and package the extension
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
+          Remove-Item -LiteralPath tools/renium-vscode-extension/bin -Recurse -Force -ErrorAction Ignore
           npm.cmd ci --prefix tools/renium-vscode-extension
           npm.cmd --prefix tools/renium-vscode-extension run verify
           $vsix = Join-Path $env:RUNNER_TEMP "renium-ci.vsix"

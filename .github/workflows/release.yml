@@ -354,9 +354,9 @@ jobs:
         with:
           node-version-file: .node-version
 
-      - name: Clear downloads left by earlier runs
+      - name: Clear downloads and bundles left by earlier runs
         shell: pwsh
-        run: Remove-Item -LiteralPath cli-artifact, integration-artifact -Recurse -Force -ErrorAction Ignore
+        run: Remove-Item -LiteralPath cli-artifact, integration-artifact, tools/renium-vscode-extension/bin -Recurse -Force -ErrorAction Ignore
 
       - uses: actions/download-artifact@v4
         with:
