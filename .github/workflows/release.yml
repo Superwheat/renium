@@ -115,6 +115,7 @@ jobs:
       RENIUM_UPDATE_PUBLIC_KEY: ${{ vars.RENIUM_UPDATE_PUBLIC_KEY }}
       CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
       CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64 -L /usr/aarch64-linux-gnu
+      QEMU_LD_PREFIX: /usr/aarch64-linux-gnu
       CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
       CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
       AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
