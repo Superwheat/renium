@@ -136,30 +136,25 @@ jobs:
         with:
           workspaces: tools/renium
 
-      # ring compiles its C sources for Windows ARM64 with clang, which finds
-      # the C runtime headers and libraries only through the MSVC cross
-      # environment; cl.exe and link.exe come from the same Build Tools.
-      - name: Import the MSVC ARM64 cross environment
-        if: matrix.target == 'aarch64-pc-windows-msvc'
-        shell: pwsh
-        run: |
-          $PSNativeCommandUseErrorActionPreference = $true
-          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
-          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath
-          if (-not $vs) { throw "No Visual Studio instance with the MSVC ARM64 build tools was found" }
-          $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvarsall.bat"
-          $lines = cmd /c "`"$vcvars`" x64_arm64 >nul 2>&1 && set"
-          foreach ($line in $lines) {
-            if ($line -match '^(INCLUDE|LIB|LIBPATH|VCToolsInstallDir|VCINSTALLDIR|WindowsSdkDir|WindowsSDKVersion|UniversalCRTSdkDir|UCRTVersion)=(.*)$') {
-              "$($matches[1])=$($matches[2])" >> $env:GITHUB_ENV
-            }
-          }
-
       - name: Test and build
         shell: pwsh
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
           $env:SOURCE_DATE_EPOCH = git log -1 --format=%ct
+          # ring compiles its C sources for Windows ARM64 with clang, which
+          # finds the C runtime only through the MSVC cross environment, and
+          # with VCINSTALLDIR set rustc takes link.exe from PATH, so the whole
+          # x64_arm64 developer environment is imported into this process.
+          if ("${{ matrix.target }}" -eq "aarch64-pc-windows-msvc") {
+            $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+            $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath
+            if (-not $vs) { throw "No Visual Studio instance with the MSVC ARM64 build tools was found" }
+            $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvarsall.bat"
+            $lines = cmd /c "`"$vcvars`" x64_arm64 >nul 2>&1 && set"
+            foreach ($line in $lines) {
+              if ($line -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($matches[1])" -Value $matches[2] }
+            }
+          }
           # Paths of the build machine never reach the binary or the logs.
           $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME ".cargo" }
           $env:RUSTFLAGS = "--remap-path-prefix=$cargoHome=/cargo --remap-path-prefix=$PWD=/renium --remap-path-prefix=$HOME=/home"

@@ -256,8 +256,10 @@ jobs:
 
       # The hosted Windows ARM64 tests run only for pull requests and the
       # nightly schedule; a push checks that the ARM64 target still compiles,
-      # native helpers included, with the MSVC cross environment kept inside
-      # this step so it cannot leak into anything else.
+      # native helpers included. The whole x64_arm64 developer environment is
+      # imported into this one step: with VCINSTALLDIR set, rustc takes
+      # link.exe from PATH, so PATH has to lead with the MSVC tools rather
+      # than Git's coreutils link.
       - name: Check the Windows ARM64 build
         if: github.event_name == 'push'
         run: |
@@ -268,8 +270,6 @@ jobs:
           $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvarsall.bat"
           $lines = cmd /c "`"$vcvars`" x64_arm64 >nul 2>&1 && set"
           foreach ($line in $lines) {
-            if ($line -match '^(INCLUDE|LIB|LIBPATH|VCToolsInstallDir|VCINSTALLDIR|WindowsSdkDir|WindowsSDKVersion|UniversalCRTSdkDir|UCRTVersion)=(.*)$') {
-              Set-Item -Path "env:$($matches[1])" -Value $matches[2]
-            }
+            if ($line -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($matches[1])" -Value $matches[2] }
           }
           cargo check --locked --tests --manifest-path tools/renium/Cargo.toml --target aarch64-pc-windows-msvc
