@@ -261,6 +261,14 @@ jobs:
           Expand-Archive -LiteralPath $archive.FullName -DestinationPath $cliStage
           $cli = Get-ChildItem $cliStage -Recurse -File -Filter renium.exe | Select-Object -First 1
           if ($null -eq $cli) { throw "Windows x64 CLI binary is missing" }
+          # A freshly extracted executable can be refused for a few seconds while
+          # the antivirus inspects it; wait until it runs before handing it on.
+          $ready = $false
+          for ($attempt = 0; $attempt -lt 30 -and -not $ready; $attempt++) {
+            try { & $cli.FullName --version *> $null; $ready = ($LASTEXITCODE -eq 0) } catch { $ready = $false }
+            if (-not $ready) { Start-Sleep -Seconds 1 }
+          }
+          if (-not $ready) { throw "The extracted CLI could not be executed" }
           $output = Join-Path $env:RUNNER_TEMP "release-output"
           # The persistent workspace keeps generated files between runs; the tag
           # checkout above already guarantees the tracked tree.
@@ -362,6 +370,14 @@ jobs:
           $cli = Get-ChildItem $stage -Recurse -File -Filter "${{ matrix.binary }}" | Select-Object -First 1
           if ($null -eq $cli) { throw "CLI archive is missing ${{ matrix.binary }}" }
           if ("${{ runner.os }}" -ne "Windows") { chmod +x $cli.FullName }
+          # A freshly extracted executable can be refused for a few seconds while
+          # the antivirus inspects it; wait until it runs before handing it on.
+          $ready = $false
+          for ($attempt = 0; $attempt -lt 30 -and -not $ready; $attempt++) {
+            try { & $cli.FullName --version *> $null; $ready = ($LASTEXITCODE -eq 0) } catch { $ready = $false }
+            if (-not $ready) { Start-Sleep -Seconds 1 }
+          }
+          if (-not $ready) { throw "The extracted CLI could not be executed" }
           "RENIUM_CLI_BUILD=$($cli.FullName)" >> $env:GITHUB_ENV
 
       - name: Package extension
