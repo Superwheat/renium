@@ -6,6 +6,10 @@
 
 - `rbx l` now loads a ModuleScript's current source when you run it with Studio stopped. A module that changed since an earlier run, through Live Sync or an edit in Studio, returns its new version, not the version from the first run that required it. Edit-mode code runs inside Renium's plugin, which stays loaded between runs, and Roblox keeps each `require` result for as long as the plugin is loaded. Each run now has its own `require`. A module required twice in one run still returns one table, but nothing carries over to the next run. Cyclic requires and modules that return nothing raise the same errors as in Roblox, and requiring by asset ID still goes through Roblox. During Play, `rbx l` and `rbx lc` still use the running game's own `require`, so they share the modules the game has already loaded.
 
+### Bug fixes
+
+- Resizing the Renium widget around the width where its settings rows switch between side-by-side and stacked no longer fills Studio's Output with "Maximum event re-entrancy depth exceeded for Object.AbsoluteSizeChanged" or makes the rows flicker. Switching layout changed the rows' height, which showed or hid the list's scrollbar and changed their width again. The widget now switches layout at most once per frame, and a stacked row needs 12 extra pixels of width before it goes back to side-by-side.
+
 ## 0.3.14 - 2026-09-27
 
 ### Improvements

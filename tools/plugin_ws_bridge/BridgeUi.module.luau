@@ -48,6 +48,7 @@ local TOGGLE_WIDTH = 40
 local TOGGLE_HEIGHT = 22
 local TOGGLE_KNOB = 16
 local STACKED_ROW_WIDTH = 330
+local STACKED_ROW_HYSTERESIS = 12
 
 local function studioColor(theme, name, fallback)
 	local style = Enum.StudioStyleGuideColor[name]
@@ -384,8 +385,12 @@ local function makeRow(content, name, description, order, refs, isFirst, control
 	controlHost.Parent = inner
 
 	local stacked = nil
-	local function arrange()
-		local wantStacked = row.AbsoluteSize.X < STACKED_ROW_WIDTH
+	local arrangeScheduled = false
+	local function applyArrangement()
+		local width = row.AbsoluteSize.X
+		local wantStacked = if stacked
+			then width < STACKED_ROW_WIDTH + STACKED_ROW_HYSTERESIS
+			else width < STACKED_ROW_WIDTH
 		if wantStacked == stacked then
 			return
 		end
@@ -402,8 +407,18 @@ local function makeRow(content, name, description, order, refs, isFirst, control
 			controlHost.Parent = inner
 		end
 	end
+	local function arrange()
+		if arrangeScheduled then
+			return
+		end
+		arrangeScheduled = true
+		task.defer(function()
+			arrangeScheduled = false
+			applyArrangement()
+		end)
+	end
 	row:GetPropertyChangedSignal("AbsoluteSize"):Connect(arrange)
-	arrange()
+	applyArrangement()
 	return controlHost
 end
 
