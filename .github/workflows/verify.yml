@@ -5,6 +5,8 @@ on:
   push:
     branches:
       - "**"
+  schedule:
+    - cron: "17 3 * * *"
   workflow_dispatch:
 
 permissions:
@@ -43,7 +45,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-11-arm]
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
     # Linux x64 and macOS tests for maintainer pushes run on the maintainer's
     # own machines; pull requests never reach them.
     runs-on: ${{ github.event_name == 'push' && matrix.os == 'macos-latest' && fromJSON('["self-hosted", "macOS", "ARM64"]') || github.event_name == 'push' && matrix.os == 'ubuntu-latest' && fromJSON('["self-hosted", "Linux", "X64"]') || matrix.os }}
@@ -84,6 +86,45 @@ jobs:
       - name: Test package subobjects
         run: node tools/renium/tests/package-subobject.mjs
 
+  rust-windows-arm:
+    name: Rust tests (windows-11-arm)
+    # No maintainer machine runs Windows on ARM64, so these tests stay on a
+    # hosted runner for pull requests and the nightly run; a push instead
+    # cross-checks the ARM64 build on the maintainer's Windows runner.
+    if: github.event_name != 'push'
+    runs-on: windows-11-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            tools/renium
+            tools/renium-plugin-sdk
+            tools/vendor/rbx-dom
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+
+      - name: Run CLI tests
+        run: cargo test --locked --manifest-path tools/renium/Cargo.toml
+
+      - name: Run plugin SDK tests
+        run: cargo test --locked --manifest-path tools/renium-plugin-sdk/Cargo.toml
+
+      - name: Run vendored rbx-dom tests
+        run: cargo test --locked --manifest-path tools/vendor/rbx-dom/Cargo.toml -p rbx_binary -p rbx_xml -p rbx_dom_weak -p rbx_types -p rbx_reflection -p rbx_reflection_database
+
+      - name: Test launchers
+        run: node tools/renium/tests/launcher-smoke.mjs
+
+      - name: Test package subobjects
+        run: node tools/renium/tests/package-subobject.mjs
+
   build-and-test:
     name: Windows release build and extension
     # Pushes by maintainers build on the maintainer's own runner, whose target
@@ -99,6 +140,8 @@ jobs:
           clean: ${{ github.event_name != 'push' }}
 
       - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: aarch64-pc-windows-msvc
 
       - uses: Swatinem/rust-cache@v2
         if: github.event_name != 'push'
@@ -210,3 +253,23 @@ jobs:
           finally {
             $archive.Dispose()
           }
+
+      # The hosted Windows ARM64 tests run only for pull requests and the
+      # nightly schedule; a push checks that the ARM64 target still compiles,
+      # native helpers included, with the MSVC cross environment kept inside
+      # this step so it cannot leak into anything else.
+      - name: Check the Windows ARM64 build
+        if: github.event_name == 'push'
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath
+          if (-not $vs) { throw "No Visual Studio instance with the MSVC ARM64 build tools was found" }
+          $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvarsall.bat"
+          $lines = cmd /c "`"$vcvars`" x64_arm64 >nul 2>&1 && set"
+          foreach ($line in $lines) {
+            if ($line -match '^(INCLUDE|LIB|LIBPATH|VCToolsInstallDir|VCINSTALLDIR|WindowsSdkDir|WindowsSDKVersion|UniversalCRTSdkDir|UCRTVersion)=(.*)$') {
+              Set-Item -Path "env:$($matches[1])" -Value $matches[2]
+            }
+          }
+          cargo check --locked --tests --manifest-path tools/renium/Cargo.toml --target aarch64-pc-windows-msvc
