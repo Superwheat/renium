@@ -248,6 +248,11 @@ jobs:
           cache: npm
           cache-dependency-path: tools/renium-vscode-extension/package-lock.json
 
+      # The workspace persists between runs, so downloads from earlier jobs
+      # must not be mistaken for this run's artifacts.
+      - name: Clear downloads left by earlier runs
+        run: Remove-Item -LiteralPath cli-artifact -Recurse -Force -ErrorAction Ignore
+
       - uses: actions/download-artifact@v4
         with:
           name: cli-Windows-X64
@@ -255,14 +260,20 @@ jobs:
 
       - name: Build release components
         run: |
-          $archive = Get-ChildItem cli-artifact -Recurse -File -Filter *.zip | Select-Object -First 1
+          $archive = Get-ChildItem cli-artifact -Recurse -File -Filter *-windows-x64.zip | Select-Object -First 1
           if ($null -eq $archive) { throw "Windows x64 CLI artifact is missing" }
           $cliStage = Join-Path $env:RUNNER_TEMP "renium-integration-cli"
           Expand-Archive -LiteralPath $archive.FullName -DestinationPath $cliStage
           $cli = Get-ChildItem $cliStage -Recurse -File -Filter renium.exe | Select-Object -First 1
           if ($null -eq $cli) { throw "Windows x64 CLI binary is missing" }
-          # A freshly extracted executable can be refused for a few seconds while
-          # the antivirus inspects it; wait until it runs before handing it on.
+          if ($IsWindows) {
+            $reader = [System.Reflection.PortableExecutable.PEReader]::new([System.IO.File]::OpenRead($cli.FullName))
+            $machine = "$($reader.PEHeaders.CoffHeader.Machine)"
+            $reader.Dispose()
+            $expected = @{ AMD64 = 'Amd64'; ARM64 = 'Arm64' }[$env:PROCESSOR_ARCHITECTURE]
+            if ($machine -ne $expected) { throw "The CLI archive is built for $machine but this runner is $env:PROCESSOR_ARCHITECTURE" }
+          }
+          # Give a freshly extracted executable a moment to become runnable.
           $ready = $false
           for ($attempt = 0; $attempt -lt 30 -and -not $ready; $attempt++) {
             try { & $cli.FullName --version *> $null; $ready = ($LASTEXITCODE -eq 0) } catch { $ready = $false }
@@ -345,6 +356,10 @@ jobs:
           cache: npm
           cache-dependency-path: tools/renium-vscode-extension/package-lock.json
 
+      - name: Clear downloads left by earlier runs
+        shell: pwsh
+        run: Remove-Item -LiteralPath cli-artifact, integration-artifact -Recurse -Force -ErrorAction Ignore
+
       - uses: actions/download-artifact@v4
         with:
           name: integration
@@ -370,8 +385,14 @@ jobs:
           $cli = Get-ChildItem $stage -Recurse -File -Filter "${{ matrix.binary }}" | Select-Object -First 1
           if ($null -eq $cli) { throw "CLI archive is missing ${{ matrix.binary }}" }
           if ("${{ runner.os }}" -ne "Windows") { chmod +x $cli.FullName }
-          # A freshly extracted executable can be refused for a few seconds while
-          # the antivirus inspects it; wait until it runs before handing it on.
+          if ($IsWindows) {
+            $reader = [System.Reflection.PortableExecutable.PEReader]::new([System.IO.File]::OpenRead($cli.FullName))
+            $machine = "$($reader.PEHeaders.CoffHeader.Machine)"
+            $reader.Dispose()
+            $expected = @{ AMD64 = 'Amd64'; ARM64 = 'Arm64' }[$env:PROCESSOR_ARCHITECTURE]
+            if ($machine -ne $expected) { throw "The CLI archive is built for $machine but this runner is $env:PROCESSOR_ARCHITECTURE" }
+          }
+          # Give a freshly extracted executable a moment to become runnable.
           $ready = $false
           for ($attempt = 0; $attempt -lt 30 -and -not $ready; $attempt++) {
             try { & $cli.FullName --version *> $null; $ready = ($LASTEXITCODE -eq 0) } catch { $ready = $false }
@@ -419,6 +440,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version-file: .node-version
+
+      - name: Clear downloads left by earlier runs
+        run: rm -rf artifacts release-assets
 
       - uses: actions/download-artifact@v4
         with:
