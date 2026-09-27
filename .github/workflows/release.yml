@@ -72,19 +72,19 @@ jobs:
       matrix:
         include:
           # Every CLI build runs on the maintainer's own runners, whose target
-          # directories persist between runs. Windows ARM64 builds and tests
-          # natively in a virtual machine on the maintainer's Mac; Linux ARM64
-          # is cross-compiled on the Linux runner (its tests run natively on every
-          # push in Verify), and Intel macOS on the Apple Silicon runner with its tests under
-          # Rosetta.
+          # directories persist between runs. Windows ARM64 and Linux ARM64 are
+          # cross-compiled on the x64 runners (their tests run on every push in
+          # Verify, natively), and Intel macOS is cross-compiled on the Apple
+          # Silicon runner with its tests under Rosetta.
           - os: windows-x64
             runner: '["self-hosted", "Windows", "X64"]'
             hosted: false
             platform: windows-x64
             artifact: cli-Windows-X64
           - os: windows-arm64
-            runner: '["self-hosted", "Windows", "ARM64"]'
+            runner: '["self-hosted", "Windows", "X64"]'
             hosted: false
+            target: aarch64-pc-windows-msvc
             skip_tests: true
             platform: windows-arm64
             artifact: cli-Windows-ARM64
