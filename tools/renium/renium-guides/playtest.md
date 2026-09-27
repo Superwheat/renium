@@ -30,6 +30,7 @@ rbx co --player 1 -n 20
 ```
 
 `l` targets Edit when stopped and the server during Play. `lc CODE PLAYER` targets a client by name or index. Edit has no `LocalPlayer` or `PlayerGui`.
+In Edit, each `l` run requires ModuleScripts fresh from their current source, so module tables don't persist between runs; don't clone a module to reload it. During Play, `l` and `lc` share the running game's `require` cache.
 
 Return values instead of printing. Luau errors and timeouts exit nonzero; captured `print`/`warn` text returns to the caller without entering Studio Output. `co` reads game/Studio messages.
 

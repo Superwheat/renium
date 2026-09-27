@@ -340,6 +340,43 @@ local function cancelTrackedThreads(threads)
 	end
 end
 
+local MODULE_LOADING = {}
+
+local function createRunRequire(env, baseRequire)
+	local loaded = {}
+	local function runRequire(target)
+		if typeof(target) ~= "Instance" or not target:IsA("ModuleScript") then
+			return baseRequire(target)
+		end
+		local cached = loaded[target]
+		if cached == MODULE_LOADING then
+			error(("Requested module was required recursively: %s"):format(target:GetFullName()), 2)
+		end
+		if cached ~= nil then
+			return cached.value
+		end
+		local chunk, compileError = loadstring(target.Source, "=" .. target:GetFullName())
+		if chunk == nil then
+			error(tostring(compileError), 2)
+		end
+		local moduleEnv = setmetatable({ script = target, require = runRequire }, { __index = env })
+		setfenv(chunk, moduleEnv)
+		loaded[target] = MODULE_LOADING
+		local ok, result = pcall(chunk)
+		if not ok then
+			loaded[target] = nil
+			error(result, 0)
+		end
+		if result == nil then
+			loaded[target] = nil
+			error(("Module code did not return exactly one value: %s"):format(target:GetFullName()), 2)
+		end
+		loaded[target] = { value = result }
+		return result
+	end
+	return runRequire
+end
+
 local function createTrackedTaskProxy(trackedThreads)
 	local proxy = table.clone(task)
 
@@ -2311,6 +2348,7 @@ updateMouse()
 			end
 			return baseSetfenv(target, replacement)
 		end
+		env.require = createRunRequire(env, baseEnv.require)
 		setfenv(chunk, env)
 
 		local packed = nil
