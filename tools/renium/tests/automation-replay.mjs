@@ -210,7 +210,7 @@ try {
       throw new Error(`Could not stop replay daemon: ${stopped.stderr || stopped.stdout}`);
     }
   }
-  fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+  fs.rmSync(root, { recursive: true, force: true, maxRetries: 60, retryDelay: 100 });
 }
 
 console.log("Renium automation replay passed");

@@ -115,6 +115,7 @@ fn state_dir(pid: u32, identity: &str) -> Result<PathBuf> {
 fn background_command() -> Result<Command> {
     let mut command = Command::new(std::env::current_exe()?);
     command
+        .current_dir(update::user_data_dir()?)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());

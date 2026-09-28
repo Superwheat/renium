@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Bug fixes
+
+- `rbx upd` no longer gets stuck on the old CLI version after Cursor or VS Code has already installed a Renium extension update since the editor was opened. The editor refused the next update with "Please restart VS Code before reinstalling Renium", and `rbx upd` treated that as fatal, failed to roll back, and then failed the same way every time after that. It now finishes the CLI and plugin update and tells you to restart the editor and then run `rbx upd apply --component extension`.
+- `rbx upd` no longer fails on Windows with "Access is denied" while replacing the CLI's folder. Renium's audio helper processes, which the daemon starts from that folder, were still running and kept it locked. The updater now stops them before it swaps the folder or restores the old one, and the daemon starts them again on its own.
+
 ## 0.3.15 - 2026-09-28
 
 ### Improvements

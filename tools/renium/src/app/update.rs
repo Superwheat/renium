@@ -184,6 +184,8 @@ struct DeferredUpdateResult {
     target: PathBuf,
     error: Option<String>,
     helper: PathBuf,
+    #[serde(default)]
+    notices: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -315,6 +317,76 @@ fn lifecycle_lock_owner_is_alive(owner: &LifecycleLockOwner) -> bool {
             .start
             .as_ref()
             .is_none_or(|expected| process_start_identity(owner.pid).as_ref() == Some(expected))
+}
+
+#[cfg(windows)]
+fn stop_renium_processes_under(root: &Path) {
+    use std::mem::{size_of, zeroed};
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+        QueryFullProcessImageNameW, TerminateProcess,
+    };
+
+    let root = root.to_string_lossy();
+    let root = root.strip_prefix(r"\\?\").unwrap_or(&root);
+    let prefix = format!("{}\\", root.trim_end_matches('\\')).to_ascii_lowercase();
+    // SAFETY: CreateToolhelp32Snapshot returns a handle that is checked below.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return;
+    }
+    // SAFETY: all-zero is a valid initial PROCESSENTRY32W before dwSize is set.
+    let mut entry: PROCESSENTRY32W = unsafe { zeroed() };
+    entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+    // SAFETY: snapshot and entry are valid for process enumeration.
+    let mut has_entry = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    let current = std::process::id();
+    while has_entry {
+        let length = entry
+            .szExeFile
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(entry.szExeFile.len());
+        let name = String::from_utf16_lossy(&entry.szExeFile[..length]).to_ascii_lowercase();
+        let pid = entry.th32ProcessID;
+        if pid != current && (name == "rbx.exe" || name == "renium.exe") {
+            // SAFETY: OpenProcess returns a new handle or null; it is closed below.
+            let handle = unsafe {
+                OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+                    0,
+                    pid,
+                )
+            };
+            if !handle.is_null() {
+                let mut buffer = vec![0u16; 32768];
+                let mut size = buffer.len() as u32;
+                // SAFETY: the buffer and size describe a valid writable UTF-16 buffer.
+                let queried = unsafe {
+                    QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut size)
+                };
+                if queried != 0 {
+                    let image =
+                        String::from_utf16_lossy(&buffer[..size as usize]).to_ascii_lowercase();
+                    if image.starts_with(&prefix) {
+                        // SAFETY: the handle was opened with PROCESS_TERMINATE.
+                        unsafe { TerminateProcess(handle, 1) };
+                    }
+                }
+                // SAFETY: the handle came from OpenProcess above.
+                unsafe { CloseHandle(handle) };
+            }
+        }
+        // SAFETY: snapshot and entry stay valid for the whole enumeration.
+        has_entry = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    // SAFETY: the snapshot handle came from CreateToolhelp32Snapshot above.
+    unsafe { CloseHandle(snapshot) };
 }
 
 pub(crate) fn process_start_identity(pid: u32) -> Option<String> {
@@ -1693,6 +1765,12 @@ fn verify_update_originals(originals: &DeferredUpdateOriginals) -> Result<()> {
 
 fn restore_update_originals(originals: &DeferredUpdateOriginals) -> Result<()> {
     let mut errors = Vec::new();
+    #[cfg(windows)]
+    for backup in &originals.core_backups {
+        if backup.directory {
+            stop_renium_processes_under(&backup.target);
+        }
+    }
     for backup in originals.core_backups.iter().rev() {
         if let Err(error) = restore_path_backup(backup) {
             errors.push(format!("{}: {error:#}", backup.target.display()));
@@ -1980,6 +2058,8 @@ fn prepare_core_directory(source: &Path, target_root: &Path) -> Result<PathBuf> 
 }
 
 fn replace_core_directory(target_root: &Path, prepared: &Path) -> Result<()> {
+    #[cfg(windows)]
+    stop_renium_processes_under(target_root);
     let parent = target_root
         .parent()
         .context("Core installation directory has no parent")?;
@@ -2142,7 +2222,8 @@ fn install_shared_core_files(target: &Path, core_root: &Path) -> Result<()> {
 fn apply_staged_update_plan(
     plan: &DeferredUpdatePlan,
     _lifecycle_lock: &LifecycleLock,
-) -> Result<()> {
+) -> Result<Vec<String>> {
+    let mut notices = Vec::new();
     if let Some(plugin) = plan.plugin.as_ref() {
         let bytes = fs::read(&plugin.source)
             .with_context(|| format!("Failed to read {}", plugin.source.display()))?;
@@ -2184,20 +2265,40 @@ fn apply_staged_update_plan(
     }
     for install in &plan.extension_installs {
         for editor in &install.editors {
-            let status = Command::new(&editor.cli)
+            let output = Command::new(&editor.cli)
                 .arg("--extensions-dir")
                 .arg(&editor.root)
                 .arg("--install-extension")
                 .arg(&install.source)
                 .arg("--force")
-                .status()
+                .output()
                 .with_context(|| format!("Failed to start {}", editor.cli.display()))?;
-            if !status.success() {
-                bail!(
-                    "Extension installer {} exited with {status}",
-                    editor.cli.display()
-                );
+            if output.status.success() {
+                continue;
             }
+            let text = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if editor_requires_restart(&text) {
+                notices.push(format!(
+                    "{} must be restarted before its Renium extension can update to {}; after restarting it, run `rbx upd apply --component extension`",
+                    editor_display_name(&editor.cli),
+                    plan.version
+                ));
+                continue;
+            }
+            let detail = text
+                .lines()
+                .map(str::trim)
+                .rfind(|line| !line.is_empty() && !line.starts_with("at "))
+                .unwrap_or("");
+            bail!(
+                "Extension installer {} exited with {}: {detail}",
+                editor.cli.display(),
+                output.status
+            );
         }
     }
     if plan.components.contains(&UpdateComponent::Cli)
@@ -2214,7 +2315,23 @@ fn apply_staged_update_plan(
         #[cfg(not(windows))]
         install_cli_update(&plan.target, core_root)?;
     }
-    Ok(())
+    Ok(notices)
+}
+
+fn editor_requires_restart(installer_output: &str) -> bool {
+    let text = installer_output.to_ascii_lowercase();
+    text.contains("restart") && text.contains("before reinstalling")
+}
+
+fn editor_display_name(cli: &Path) -> String {
+    let lowered = cli.to_string_lossy().to_ascii_lowercase();
+    if lowered.contains("cursor") {
+        "Cursor".to_string()
+    } else if lowered.contains("code") {
+        "VS Code".to_string()
+    } else {
+        cli.display().to_string()
+    }
 }
 
 fn pending_update_transaction_path() -> Result<PathBuf> {
@@ -2272,23 +2389,29 @@ fn recover_pending_update_transaction(lifecycle_lock: &LifecycleLock) -> Result<
     }
     plan.phase = "applying".to_string();
     write_pending_update_transaction(&plan)?;
-    if let Err(error) = apply_staged_update_plan(&plan, lifecycle_lock) {
-        if let Err(rollback_error) = restore_update_originals(
-            plan.originals
-                .as_ref()
-                .context("The interrupted update has no original-state baseline")?,
-        ) {
+    let notices = match apply_staged_update_plan(&plan, lifecycle_lock) {
+        Ok(notices) => notices,
+        Err(error) => {
+            if let Err(rollback_error) = restore_update_originals(
+                plan.originals
+                    .as_ref()
+                    .context("The interrupted update has no original-state baseline")?,
+            ) {
+                reopen_studios(&plan.studio_reopen_targets);
+                return Err(error).context(format!(
+                    "Interrupted update rollback was incomplete: {rollback_error:#}"
+                ));
+            }
             reopen_studios(&plan.studio_reopen_targets);
+            clear_pending_update_transaction()?;
             return Err(error).context(format!(
-                "Interrupted update rollback was incomplete: {rollback_error:#}"
+                "Could not finish the interrupted Renium {} update; the original installation was restored",
+                plan.version
             ));
         }
-        reopen_studios(&plan.studio_reopen_targets);
-        clear_pending_update_transaction()?;
-        return Err(error).context(format!(
-            "Could not finish the interrupted Renium {} update; the original installation was restored",
-            plan.version
-        ));
+    };
+    for notice in &notices {
+        eprintln!("[renium] warning: {notice}");
     }
     reopen_studios(&plan.studio_reopen_targets);
     plan.phase = "applied".to_string();
@@ -2457,7 +2580,7 @@ pub fn run_update_helper(args: UpdateHelperArgs) -> Result<()> {
     let lifecycle_lock = acquire_lifecycle_lock()?;
     reservation.phase = "claimed".to_string();
     write_update_helper_reservation(&reservation)?;
-    let outcome = (|| -> Result<()> {
+    let outcome = (|| -> Result<Vec<String>> {
         crate::project::workflows::stop_all_daemons_for_update()?;
         if let Some(target_root) = managed_core_root(&plan.target) {
             recover_core_install(&target_root)?;
@@ -2471,32 +2594,35 @@ pub fn run_update_helper(args: UpdateHelperArgs) -> Result<()> {
         )?;
         plan.phase = "applying".to_string();
         write_pending_update_transaction(&plan)?;
-        let applied = apply_staged_update_plan(&plan, &lifecycle_lock);
-        if let Err(error) = applied {
-            if let Err(rollback_error) = restore_update_originals(
-                plan.originals
-                    .as_ref()
-                    .context("The deferred update has no original-state baseline")?,
-            ) {
+        let notices = match apply_staged_update_plan(&plan, &lifecycle_lock) {
+            Ok(notices) => notices,
+            Err(error) => {
+                if let Err(rollback_error) = restore_update_originals(
+                    plan.originals
+                        .as_ref()
+                        .context("The deferred update has no original-state baseline")?,
+                ) {
+                    reopen_studios(&plan.studio_reopen_targets);
+                    return Err(error).context(format!(
+                        "Deferred update rollback was incomplete: {rollback_error:#}"
+                    ));
+                }
                 reopen_studios(&plan.studio_reopen_targets);
-                return Err(error).context(format!(
-                    "Deferred update rollback was incomplete: {rollback_error:#}"
-                ));
+                return Err(error);
             }
-            reopen_studios(&plan.studio_reopen_targets);
-            return Err(error);
-        }
+        };
         reopen_studios(&plan.studio_reopen_targets);
         plan.phase = "applied".to_string();
         write_pending_update_transaction(&plan)?;
         clear_pending_update_transaction()?;
-        Ok(())
+        Ok(notices)
     })();
     let errors = outcome
         .as_ref()
         .err()
         .map(|error| vec![format!("{error:#}")])
         .unwrap_or_default();
+    let notices = outcome.as_ref().ok().cloned().unwrap_or_default();
     if outcome.is_ok()
         && let Err(error) = fs::remove_dir_all(&plan.stage)
         && error.kind() != std::io::ErrorKind::NotFound
@@ -2512,6 +2638,7 @@ pub fn run_update_helper(args: UpdateHelperArgs) -> Result<()> {
         target: plan.target,
         error: (!errors.is_empty()).then(|| errors.join("; ")),
         helper,
+        notices,
     };
     let primary_written = match write_deferred_update_result(&args.result, &record) {
         Ok(()) => true,
@@ -2832,6 +2959,9 @@ pub(crate) fn report_pending_update_result() {
             result.version,
             result.target.display()
         );
+        for notice in &result.notices {
+            eprintln!("[renium] warning: {notice}");
+        }
     } else {
         eprintln!(
             "[renium] Renium {} update failed for {}: {}",
@@ -3150,6 +3280,7 @@ mod result_tests {
             target: current.clone(),
             error: None,
             helper: temp.join("renium-update-helper-1-2.exe"),
+            notices: Vec::new(),
         };
         fs::write(&record.helper, b"helper").unwrap();
         assert!(owned_update_helper(&record.helper, &temp));
@@ -3196,5 +3327,18 @@ mod result_tests {
         let foreign = root.join("foreign.exe");
         fs::write(&foreign, b"other").unwrap();
         assert!(pending_update_result(&primary, &foreign, &temp, Some(&reservation)).is_none());
+    }
+}
+
+#[cfg(test)]
+mod editor_install_tests {
+    #[test]
+    fn editor_restart_refusal_is_recognized() {
+        assert!(super::editor_requires_restart(
+            "Installing extensions...\nError: Please restart VS Code before reinstalling Renium.\n"
+        ));
+        assert!(!super::editor_requires_restart(
+            "Error: Extension 'local.renium' is not compatible with this editor"
+        ));
     }
 }
