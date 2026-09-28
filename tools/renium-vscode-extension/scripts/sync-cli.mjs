@@ -40,7 +40,7 @@ if (foreignTarget && declaredVersion) {
 
 const destinationDir = path.join(extensionRoot, "bin", `${targetPlatform}-${targetArchitecture}`);
 fs.mkdirSync(destinationDir, { recursive: true });
-const destination = path.join(destinationDir, binaryName);
+const destination = path.join(destinationDir, targetPlatform === "win32" ? "renium.exe" : "renium");
 fs.copyFileSync(source, destination);
 fs.copyFileSync(
   path.join(repoRoot, "tools", "renium", "renium-agents.md"),
@@ -51,14 +51,16 @@ fs.rmSync(guideDestination, { recursive: true, force: true });
 fs.cpSync(path.join(repoRoot, "tools", "renium", "renium-guides"), guideDestination, {
   recursive: true,
 });
-if (process.platform === "win32") {
+if (targetPlatform === "win32") {
   fs.copyFileSync(path.join(repoRoot, "rbx.cmd"), path.join(destinationDir, "rbx.cmd"));
   fs.rmSync(path.join(destinationDir, "rbx-run.ps1"), { force: true });
 } else {
   const launcher = path.join(destinationDir, "rbx");
   fs.copyFileSync(path.join(repoRoot, "rbx"), launcher);
-  fs.chmodSync(destination, 0o755);
-  fs.chmodSync(launcher, 0o755);
+  if (process.platform !== "win32") {
+    fs.chmodSync(destination, 0o755);
+    fs.chmodSync(launcher, 0o755);
+  }
 }
 
 process.stdout.write(`Bundled ${source} as ${destination}\n`);

@@ -109,6 +109,16 @@ function reniumCliFallbackRelativePaths(
   ];
 }
 
+function ensureBundledExecutables(binaryPath: string): void {
+  for (const file of [binaryPath, path.join(path.dirname(binaryPath), "rbx")]) {
+    try {
+      if ((fs.statSync(file).mode & 0o111) !== 0o111) {
+        fs.chmodSync(file, 0o755);
+      }
+    } catch {}
+  }
+}
+
 export function resolveReniumCliPath(options: {
   configuredPath?: string;
   extensionRoot?: string;
@@ -134,6 +144,9 @@ export function resolveReniumCliPath(options: {
     : undefined;
   for (const candidate of [configuredPath, bundled]) {
     if (candidate && isFile(candidate)) {
+      if (candidate === bundled && platform !== "win32") {
+        ensureBundledExecutables(candidate);
+      }
       return path.normalize(candidate);
     }
   }

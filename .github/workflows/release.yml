@@ -307,45 +307,17 @@ jobs:
           path: ${{ env.RENIUM_SHARED_DIR }}
           if-no-files-found: error
 
-  extension:
-    name: Extension (${{ matrix.target }})
+  extensions:
+    name: Extension packages
     needs: [verify-tag, cli, integration]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Each extension is packaged on a maintainer runner of its own
-          # operating system so the bundled binary keeps its file mode; the
-          # bundle folder is named after the target, not the runner, and a
-          # binary the runner cannot execute is checked by version only.
-          - runner: '["self-hosted", "Windows", "X64"]'
-            cliArtifact: cli-Windows-X64
-            target: win32-x64
-            binary: renium.exe
-          - runner: '["self-hosted", "Windows", "X64"]'
-            cliArtifact: cli-Windows-ARM64
-            target: win32-arm64
-            binary: renium.exe
-          - runner: '["self-hosted", "Linux", "X64"]'
-            cliArtifact: cli-Linux-X64
-            target: linux-x64
-            binary: renium
-          - runner: '["self-hosted", "Linux", "X64"]'
-            cliArtifact: cli-Linux-ARM64
-            target: linux-arm64
-            binary: renium
-          - runner: '["self-hosted", "macOS", "ARM64"]'
-            cliArtifact: cli-macOS-ARM64
-            target: darwin-arm64
-            binary: renium
-          - runner: '["self-hosted", "macOS", "ARM64"]'
-            cliArtifact: cli-macOS-X64
-            target: darwin-x64
-            binary: renium
-    runs-on: ${{ fromJSON(matrix.runner) }}
+    # One job packages every target: the extension compiles once, each package
+    # only differs by the CLI it bundles, and the extension sets the file mode
+    # of a bundled binary itself when it first runs.
+    runs-on: ["self-hosted", "Windows", "X64"]
     timeout-minutes: 15
-    env:
-      QEMU_LD_PREFIX: /usr/aarch64-linux-gnu
+    defaults:
+      run:
+        shell: pwsh
     steps:
       - uses: actions/checkout@v6
         with:
@@ -356,8 +328,7 @@ jobs:
           node-version-file: .node-version
 
       - name: Clear downloads and bundles left by earlier runs
-        shell: pwsh
-        run: Remove-Item -LiteralPath cli-artifact, integration-artifact, tools/renium-vscode-extension/bin -Recurse -Force -ErrorAction Ignore
+        run: Remove-Item -LiteralPath cli-artifacts, integration-artifact, tools/renium-vscode-extension/bin -Recurse -Force -ErrorAction Ignore
 
       - uses: actions/download-artifact@v4
         with:
@@ -366,76 +337,84 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: ${{ matrix.cliArtifact }}
-          path: cli-artifact
+          pattern: cli-*
+          path: cli-artifacts
 
-      - name: Prepare matching plugin and CLI
-        shell: pwsh
+      - name: Package every extension target
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $version = "${{ needs.verify-tag.outputs.version }}"
           $plugin = Get-ChildItem integration-artifact -Recurse -File -Filter Renium.rbxm | Select-Object -First 1
           if ($null -eq $plugin) { throw "Integration artifact is missing Renium.rbxm" }
           Copy-Item -LiteralPath $plugin.FullName -Destination tools/plugin_ws_bridge/Renium.rbxm -Force
           Copy-Item -LiteralPath $plugin.FullName -Destination tools/renium-vscode-extension/assets/Renium.rbxm -Force
-          "RENIUM_PLUGIN_BUNDLE=$($plugin.FullName)" >> $env:GITHUB_ENV
-          $archive = Get-ChildItem cli-artifact -Recurse -File -Filter *.zip | Select-Object -First 1
-          if ($null -eq $archive) { throw "CLI artifact is missing its archive" }
-          $stage = Join-Path $env:RUNNER_TEMP "renium-cli"
-          Expand-Archive -LiteralPath $archive.FullName -DestinationPath $stage
-          $cli = Get-ChildItem $stage -Recurse -File -Filter "${{ matrix.binary }}" | Select-Object -First 1
-          if ($null -eq $cli) { throw "CLI archive is missing ${{ matrix.binary }}" }
-          if ("${{ runner.os }}" -ne "Windows") { chmod +x $cli.FullName }
-          $targetPlatform, $targetArch = "${{ matrix.target }}".Split('-')
-          $runnable = $true
-          if ($IsWindows) {
-            $reader = [System.Reflection.PortableExecutable.PEReader]::new([System.IO.File]::OpenRead($cli.FullName))
-            $machine = "$($reader.PEHeaders.CoffHeader.Machine)"
-            $reader.Dispose()
-            $expected = @{ x64 = 'Amd64'; arm64 = 'Arm64' }[$targetArch]
-            if ($machine -ne $expected) { throw "The CLI archive is built for $machine but the ${{ matrix.target }} extension needs $expected" }
-            $runnable = $expected -eq @{ AMD64 = 'Amd64'; ARM64 = 'Arm64' }[$env:PROCESSOR_ARCHITECTURE]
-          }
-          if ($runnable) {
-            # Give a freshly extracted executable a moment to become runnable.
-            $ready = $false
-            for ($attempt = 0; $attempt -lt 30 -and -not $ready; $attempt++) {
-              try { & $cli.FullName --version *> $null; $ready = ($LASTEXITCODE -eq 0) } catch { $ready = $false }
-              if (-not $ready) { Start-Sleep -Seconds 1 }
-            }
-            if (-not $ready) { throw "The extracted CLI could not be executed" }
-          }
-          "RENIUM_CLI_BUILD=$($cli.FullName)" >> $env:GITHUB_ENV
-          "RENIUM_CLI_TARGET_PLATFORM=$targetPlatform" >> $env:GITHUB_ENV
-          "RENIUM_CLI_TARGET_ARCH=$targetArch" >> $env:GITHUB_ENV
-          "RENIUM_CLI_VERSION=${{ needs.verify-tag.outputs.version }}" >> $env:GITHUB_ENV
-
-      - name: Package extension
-        shell: pwsh
-        run: |
+          $env:RENIUM_PLUGIN_BUNDLE = $plugin.FullName
+          $env:RENIUM_CLI_VERSION = $version
+          $output = Join-Path $env:RUNNER_TEMP "renium-extensions"
+          New-Item -ItemType Directory -Path $output | Out-Null
           npm ci --prefix tools/renium-vscode-extension
-          $output = Join-Path $env:RUNNER_TEMP "renium-${{ needs.verify-tag.outputs.version }}-${{ matrix.target }}.vsix"
-          Push-Location tools/renium-vscode-extension
-          try {
-            npx --no-install vsce package --target "${{ matrix.target }}" --out $output
+          $targets = @(
+            @{ target = 'win32-x64'; archive = "renium-$version-windows-x64.zip"; binary = 'renium.exe' },
+            @{ target = 'win32-arm64'; archive = "renium-$version-windows-arm64.zip"; binary = 'renium.exe' },
+            @{ target = 'linux-x64'; archive = "renium-$version-linux-x64.zip"; binary = 'renium' },
+            @{ target = 'linux-arm64'; archive = "renium-$version-linux-arm64.zip"; binary = 'renium' },
+            @{ target = 'darwin-arm64'; archive = "renium-$version-macos-arm64.zip"; binary = 'renium' },
+            @{ target = 'darwin-x64'; archive = "renium-$version-macos-x64.zip"; binary = 'renium' }
+          )
+          foreach ($entry in $targets) {
+            $target = $entry.target
+            $archive = Get-ChildItem cli-artifacts -Recurse -File -Filter $entry.archive | Select-Object -First 1
+            if ($null -eq $archive) { throw "CLI archive $($entry.archive) is missing" }
+            $stage = Join-Path $env:RUNNER_TEMP "renium-cli-$target"
+            Expand-Archive -LiteralPath $archive.FullName -DestinationPath $stage
+            $cli = Get-ChildItem $stage -Recurse -File -Filter $entry.binary | Select-Object -First 1
+            if ($null -eq $cli) { throw "CLI archive $($entry.archive) is missing $($entry.binary)" }
+            $targetPlatform, $targetArch = $target.Split('-')
+            if ($targetPlatform -eq 'win32') {
+              $reader = [System.Reflection.PortableExecutable.PEReader]::new([System.IO.File]::OpenRead($cli.FullName))
+              $machine = "$($reader.PEHeaders.CoffHeader.Machine)"
+              $reader.Dispose()
+              $expected = @{ x64 = 'Amd64'; arm64 = 'Arm64' }[$targetArch]
+              if ($machine -ne $expected) { throw "The CLI archive is built for $machine but the $target extension needs $expected" }
+              if ($targetArch -eq 'x64') {
+                # Give a freshly extracted executable a moment to become runnable.
+                $ready = $false
+                for ($attempt = 0; $attempt -lt 30 -and -not $ready; $attempt++) {
+                  try { & $cli.FullName --version *> $null; $ready = ($LASTEXITCODE -eq 0) } catch { $ready = $false }
+                  if (-not $ready) { Start-Sleep -Seconds 1 }
+                }
+                if (-not $ready) { throw "The extracted CLI could not be executed" }
+              }
+            }
+            $env:RENIUM_CLI_BUILD = $cli.FullName
+            $env:RENIUM_CLI_TARGET_PLATFORM = $targetPlatform
+            $env:RENIUM_CLI_TARGET_ARCH = $targetArch
+            Remove-Item -LiteralPath tools/renium-vscode-extension/bin -Recurse -Force -ErrorAction Ignore
+            $vsix = Join-Path $output "renium-$version-$target.vsix"
+            Push-Location tools/renium-vscode-extension
+            try {
+              npx --no-install vsce package --target $target --out $vsix
+            }
+            finally {
+              Pop-Location
+            }
+            if (-not (Test-Path -LiteralPath $vsix -PathType Leaf)) { throw "VSIX for $target was not produced" }
           }
-          finally {
-            Pop-Location
-          }
-          if (-not (Test-Path -LiteralPath $output -PathType Leaf)) { throw "VSIX was not produced" }
-          "RENIUM_VSIX=$output" >> $env:GITHUB_ENV
+          "RENIUM_EXTENSIONS_DIR=$output" >> $env:GITHUB_ENV
 
       - uses: actions/upload-artifact@v4
         with:
-          name: extension-${{ matrix.target }}
-          path: ${{ env.RENIUM_VSIX }}
+          name: extensions
+          path: ${{ env.RENIUM_EXTENSIONS_DIR }}
           if-no-files-found: error
 
       - uses: actions/attest@v4
         with:
-          subject-path: ${{ env.RENIUM_VSIX }}
+          subject-path: ${{ env.RENIUM_EXTENSIONS_DIR }}/*.vsix
 
   publish:
     name: Publish GitHub release
-    needs: [verify-tag, quality, cli, integration, extension]
+    needs: [verify-tag, quality, cli, integration, extensions]
     runs-on: ["self-hosted", "Linux", "X64"]
     env:
       VSCE_PAT: ${{ secrets.VSCE_PAT }}
