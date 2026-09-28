@@ -16,7 +16,7 @@ rbx wait "workspace:GetAttribute('Ready') ~= nil" -c -t 20
 
 Reuse paths from `ui`'s `p` field. Paths are relative to `PlayerGui`; its prefix is optional. `Name[n]` selects duplicates.
 
-`pr --world` needs an on-screen target; use `go` first. `go` stops within eight studs and returns the distance. Injected clicks do not fire `ClickDetector`; use a ProximityPrompt or game input.
+`pr --world` needs an on-screen target; use `go` first. `go PATH` walks to the nearest point of the part's or model's bounding box and stops within eight studs; `--pos` targets an exact point. Both return the remaining distance. Injected clicks do not fire `ClickDetector`; use a ProximityPrompt or game input. Injected mouse moves fire no hover events (`MouseEnter`, `MouseMoved`); check a hover style by setting its state directly.
 
 Input targets one Play window without moving the cursor or taking focus. The orange shield blocks interfering physical input. Escape belongs to CoreGui; use another key or an on-screen control.
 

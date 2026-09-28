@@ -6,6 +6,9 @@
 
 - `rbx status` now reports `teamCreate` and `placeVersion` for the selected Edit place. `teamCreate` is true when the place is in a Team Create session, where Studio saves every edit to Roblox by itself, and `placeVersion` is the place's saved version number. Agents used to tell users their synced work was "not saved" without any way to check, so the agent guides now tell them to report work as synced and to read these fields instead of guessing.
 - The agent guides now explain how saving and publishing differ from syncing, that an agent can reopen a closed bound place with `rbx ro` instead of stopping, and that a reopened cloud place should be compared in verify mode before Live Sync merges it. They also give the real filter syntax for `rbx bb` searches (`is:Class`, `tag:Name`, `Prop=value`) and say that an empty `rbx co` result means there are no messages. They also cover Windows PowerShell 5.1 quoting, MicroProfiler capture windows, keeping the capture id, and Creator Store inserts becoming project content under Live Sync.
+- `rbx status` now waits while a Studio that was just launched is still opening its place. Right after `rbx ro`, it used to report at once that Studio had a different place open, because another Studio was connected while the launched one was still loading, and its verdict told the agent to run `rbx ro` again. The verdict now names the starting Studio and how long ago it launched, and `status -w SECONDS` keeps waiting for it up to that long. A closed Studio still reports immediately.
+- `rbx go PATH` now walks to the nearest point of the target part's or model's bounding box instead of its pivot. A wide or tall model such as a tree has its pivot inside the canopy or trunk, so the character could not get within eight studs of it and `go` reported a failure after its timeout. `go --pos` still targets the exact point.
+- The agent guides now say that injected mouse moves fire no hover events, that Play runs the game's real server code against the signed-in account's live data when Studio API access is on, and that agents should not make backup copies of a project because `rbx rev` and Studio undo already cover reverts.
 
 ### Bug fixes
 
@@ -14,6 +17,7 @@
 - `rbx l -`, `rbx lc -` and `rbx ck -` no longer fail with "got Unicode character U+feff" when the piped code starts with a UTF-8 byte order mark, which PowerShell adds to text it pipes. The mark is now ignored, as `rbx bb -J -` already did.
 - `rbx go --pos X,Y,Z` no longer rejects a negative first coordinate such as `-330,300,1485` as an unknown flag, and the same fix applies to the model generator's `--size`. A value that starts with a minus sign used to be read as a flag.
 - When Studio has a different place open than the one the project is bound to, the `rbx status` verdict now says that `rbx ro` opens the bound place, instead of only telling you to "open that place".
+- `rbx pl` and Live Sync no longer fail with "Studio native Workspace snapshot contains N instances; expected N+1" on places with an R15 rig. Studio adds a `Status` object under such a rig's Humanoid and never saves it, whatever its `Archivable` value, so Renium counted one instance more than Studio serialized. Renium now leaves `Status` objects out of exports and change tracking, as it already did for touch transmitters. Agents used to work around this by deleting the object from the user's place.
 
 ## 0.3.15 - 2026-09-28
 

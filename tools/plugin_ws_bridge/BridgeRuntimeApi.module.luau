@@ -1339,13 +1339,28 @@ end)
 			current = nextInstance
 			index += 1
 		end
-		local position
+		local position, boxCFrame, boxSize
 		if current:IsA("BasePart") then
 			position = current.Position
+			boxCFrame, boxSize = current.CFrame, current.Size
 		elseif current:IsA("Model") then
 			position = current:GetPivot().Position
+			boxCFrame, boxSize = current:GetBoundingBox()
 		else
 			return { ok = false, error = current:GetFullName() .. " is not a BasePart or Model" }
+		end
+		if params.approach == true then
+			local localPlayer = game:GetService("Players").LocalPlayer
+			local character = if localPlayer ~= nil then localPlayer.Character else nil
+			if character ~= nil then
+				local from = boxCFrame:PointToObjectSpace(character:GetPivot().Position)
+				local half = boxSize / 2
+				position = boxCFrame:PointToWorldSpace(Vector3.new(
+					math.clamp(from.X, -half.X, half.X),
+					math.clamp(from.Y, -half.Y, half.Y),
+					math.clamp(from.Z, -half.Z, half.Z)
+				))
+			end
 		end
 		local camera = game:GetService("Workspace").CurrentCamera
 		if camera == nil then

@@ -2,7 +2,7 @@
 # Renium for agents
 
 Use `rbx` from the place's project folder. Renium handles connections and the daemon.
-If PATH is stale: Windows `%USERPROFILE%\.renium\bin\rbx.exe`; macOS/Linux `~/.renium/bin/rbx`.
+If PATH is stale: `%USERPROFILE%\.renium\bin\rbx.exe` on Windows, else `~/.renium/bin/rbx`.
 
 ## Choose the smallest sufficient check
 
@@ -42,7 +42,7 @@ A place folder selects its target. At the experience root, add `--place <alias|p
 Studio commands also accept `gameId:placeId` or a Studio window name; ambiguity returns candidates.
 
 Edit scripts as files; use Renium for generated `.renium` stores and sourcemaps.
-`f`/`bg`/`bb` read saved data; `q` searches a closed place; `v` inspects a model/place; `l` reads live Studio. For a full place comparison, use `cmp BEFORE --full` (optionally `--against AFTER`). Counts cover the whole place; request `--all` or `--values` only when needed.
+`f`/`bg`/`bb` read saved data; `q` searches a closed place; `v` inspects a model/place; `l` reads live Studio. For a full place comparison, use `cmp BEFORE --full` (optionally `--against AFTER`).
 Compare states only when the task calls for it.
 
 Read an existing target once and reuse its ID; refresh IDs after a pull.
@@ -59,6 +59,6 @@ Renium marks affected linked packages Changed before edits. Report `autoDesynced
 - Use project-declared tools through their normal commands; if one is unavailable, say so instead of hunting for executables in caches or extension folders.
 - Pass arguments or pipe JSON/code through stdin; don't create payload files.
 - Launch, close, or replace Studio only when the task needs it; `rbx ro` reopens a closed bound place. Never take focus or global input.
-- Ignore `.renium/editor-history`: local revert data.
+- Don't back up the project: `rbx rev` restores files a sync changed and Studio undo covers pushed edits; `.renium/editor-history` holds that data.
 - Update with `rbx upd` when requested or an update is reported, then reread these guides.
 - If Renium itself fails (internal error, crash, lost sync data), run `rbx report -m "what happened"` and give the user its ID and path.

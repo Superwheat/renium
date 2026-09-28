@@ -1781,7 +1781,7 @@ pub(crate) fn goto_result(args: &GotoArgs, bridge: &BridgeServer) -> Result<Valu
             .context("Provide a part path or --pos")?;
         let point = bridge.call_for_selector(
             "getWorldPoint",
-            json!({ "path": path }),
+            json!({ "path": path, "approach": true }),
             BridgeTarget::Client,
             player,
         )?;

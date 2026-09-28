@@ -1,6 +1,6 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
@@ -291,15 +291,34 @@ fn bound_target(project_root: Option<&Path>) -> Option<String> {
     }
 }
 
-fn verdict_text(
+/// How long a Studio process may take to open its place and connect the
+/// plugin before its silence counts as a problem.
+const STARTING_GRACE_SECONDS: u64 = 180;
+
+/// What the daemon can see of Studio: its processes, the installed plugin,
+/// the connected clients, and the project's bound place.
+struct Observation<'a> {
     studio_running: bool,
-    plugin: Option<&(String, Option<u64>)>,
+    plugin: Option<&'a (String, Option<u64>)>,
     earliest_start: Option<u64>,
     clients_connected: bool,
-    open_places: &[String],
-    bound: Option<&str>,
-    open_failures: &[(u32, String)],
-) -> String {
+    open_places: &'a [String],
+    bound: Option<&'a str>,
+    open_failures: &'a [(u32, String)],
+    starting: &'a [(u32, u64)],
+}
+
+fn verdict_text(observation: &Observation<'_>) -> String {
+    let Observation {
+        studio_running,
+        plugin,
+        earliest_start,
+        clients_connected,
+        open_places,
+        bound,
+        open_failures,
+        starting,
+    } = *observation;
     if !studio_running {
         return "Studio is not running; open the place with `rbx so FILE` or `rbx ro`.".to_string();
     }
@@ -320,6 +339,11 @@ fn verdict_text(
     {
         return "The Renium plugin file changed after Studio started; restart Studio to load it."
             .to_string();
+    }
+    if let Some((pid, elapsed)) = starting.first() {
+        return format!(
+            "Studio (pid {pid}) started {elapsed}s ago and has not connected yet; Studio commands wait for it, and `-w SECONDS` extends the wait."
+        );
     }
     if !clients_connected {
         return "Studio is running with the plugin installed, but no Renium plugin has connected. In Studio, check the Renium panel's connect setting and that the plugin is enabled in the Plugins Manager.".to_string();
@@ -364,15 +388,28 @@ pub(crate) fn diagnose(clients: &[Value], project_root: Option<&Path>) -> Value 
                 .map(|reason| (process.pid, reason))
         })
         .collect::<Vec<_>>();
-    let verdict = verdict_text(
-        !processes.is_empty(),
-        plugin.as_ref(),
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |value| value.as_secs());
+    let starting = processes
+        .iter()
+        .filter(|process| !connected_pids.contains(&u64::from(process.pid)))
+        .filter(|process| !open_failures.iter().any(|(pid, _)| *pid == process.pid))
+        .filter_map(|process| {
+            let elapsed = now.saturating_sub(process.started_unix?);
+            (elapsed < STARTING_GRACE_SECONDS).then_some((process.pid, elapsed))
+        })
+        .collect::<Vec<_>>();
+    let verdict = verdict_text(&Observation {
+        studio_running: !processes.is_empty(),
+        plugin: plugin.as_ref(),
         earliest_start,
-        !clients.is_empty(),
-        &open_places,
-        bound.as_deref(),
-        &open_failures,
-    );
+        clients_connected: !clients.is_empty(),
+        open_places: &open_places,
+        bound: bound.as_deref(),
+        open_failures: &open_failures,
+        starting: &starting,
+    });
     json!({
         "studioProcesses": processes.iter().map(|process| json!({
             "pid": process.pid,
@@ -382,6 +419,7 @@ pub(crate) fn diagnose(clients: &[Value], project_root: Option<&Path>) -> Value 
         "plugin": plugin.as_ref().map(|(path, modified)| json!({"path": path, "modifiedUnix": modified})),
         "openPlaces": open_places,
         "openFailures": open_failures.iter().map(|(pid, reason)| json!({"pid": pid, "reason": reason})).collect::<Vec<_>>(),
+        "starting": starting.iter().map(|(pid, elapsed)| json!({"pid": pid, "elapsedSeconds": elapsed})).collect::<Vec<_>>(),
         "boundTarget": bound,
         "verdict": verdict,
     })
@@ -394,9 +432,16 @@ pub(crate) fn verdict(clients: &[Value], project_root: Option<&Path>) -> String 
         .to_string()
 }
 
+/// Whether a diagnosis reports a Studio that is still opening its place.
+pub(crate) fn is_starting(diagnosis: &Value) -> bool {
+    diagnosis["starting"]
+        .as_array()
+        .is_some_and(|starting| !starting.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{elapsed_seconds, open_failure_in_log, verdict_text};
+    use super::{Observation, elapsed_seconds, open_failure_in_log, verdict_text};
 
     #[test]
     fn elapsed_seconds_reads_ps_etime() {
@@ -411,62 +456,75 @@ mod tests {
         ("plugins/Renium.rbxm".to_string(), modified)
     }
 
+    fn observation<'a>(
+        plugin: Option<&'a (String, Option<u64>)>,
+        clients_connected: bool,
+    ) -> Observation<'a> {
+        Observation {
+            studio_running: true,
+            plugin,
+            earliest_start: Some(10),
+            clients_connected,
+            open_places: &[],
+            bound: None,
+            open_failures: &[],
+            starting: &[],
+        }
+    }
+
     #[test]
     fn verdict_names_the_blocking_condition() {
-        assert!(verdict_text(false, None, None, false, &[], None, &[]).contains("not running"));
         assert!(
-            verdict_text(true, Some(&plugin(None)), Some(10), false, &[], None, &[])
-                .contains("rbx setup")
+            verdict_text(&Observation {
+                studio_running: false,
+                earliest_start: None,
+                ..observation(None, false)
+            })
+            .contains("not running")
+        );
+        assert!(verdict_text(&observation(Some(&plugin(None)), false)).contains("rbx setup"));
+        assert!(
+            verdict_text(&observation(Some(&plugin(Some(20))), false)).contains("restart Studio")
         );
         assert!(
-            verdict_text(
-                true,
-                Some(&plugin(Some(20))),
-                Some(10),
-                false,
-                &[],
-                None,
-                &[]
-            )
-            .contains("restart Studio")
+            verdict_text(&observation(Some(&plugin(Some(5))), false))
+                .contains("no Renium plugin has connected")
         );
-        assert!(
-            verdict_text(
-                true,
-                Some(&plugin(Some(5))),
-                Some(10),
-                false,
-                &[],
-                None,
-                &[]
-            )
-            .contains("no Renium plugin has connected")
-        );
-        assert!(
-            verdict_text(true, Some(&plugin(Some(5))), Some(10), true, &[], None, &[])
-                .contains("Edit session")
-        );
+        assert!(verdict_text(&observation(Some(&plugin(Some(5))), true)).contains("Edit session"));
         let open = ["Other".to_string()];
-        let mismatch = verdict_text(
-            true,
-            Some(&plugin(Some(20))),
-            Some(10),
-            true,
-            &open,
-            Some("E:/place.rbxl"),
-            &[],
-        );
+        let mismatch = verdict_text(&Observation {
+            open_places: &open,
+            bound: Some("E:/place.rbxl"),
+            ..observation(Some(&plugin(Some(20))), true)
+        });
         assert!(mismatch.contains("Other") && mismatch.contains("E:/place.rbxl"));
-        let refused = verdict_text(
-            true,
-            Some(&plugin(Some(5))),
-            Some(10),
-            false,
-            &[],
-            None,
-            &[(4700, "User is not authorized to access Asset.".to_string())],
-        );
+        let refused = verdict_text(&Observation {
+            open_failures: &[(4700, "User is not authorized to access Asset.".to_string())],
+            ..observation(Some(&plugin(Some(5))), false)
+        });
         assert!(refused.contains("4700") && refused.contains("not authorized"));
+    }
+
+    #[test]
+    fn a_studio_that_just_launched_is_reported_as_starting() {
+        let open = ["Other".to_string()];
+        let starting = verdict_text(&Observation {
+            open_places: &open,
+            bound: Some("published place 2 in game 1"),
+            starting: &[(4711, 12)],
+            ..observation(Some(&plugin(Some(5))), true)
+        });
+        assert!(starting.contains("4711") && starting.contains("12s"));
+        assert!(!starting.contains("Other"));
+        let unconnected = verdict_text(&Observation {
+            starting: &[(4711, 12)],
+            ..observation(Some(&plugin(Some(5))), false)
+        });
+        assert!(unconnected.contains("has not connected yet"));
+        assert!(super::is_starting(
+            &serde_json::json!({"starting": [{"pid": 4711}]})
+        ));
+        assert!(!super::is_starting(&serde_json::json!({"starting": []})));
     }
 
     #[test]

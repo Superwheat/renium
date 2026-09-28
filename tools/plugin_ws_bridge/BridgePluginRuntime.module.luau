@@ -45,6 +45,12 @@ type ServiceState = {
 
 local BridgePluginRuntime = {}
 
+local NEVER_SERIALIZED_CLASSES = { TouchTransmitter = true, Status = true }
+
+local function isNeverSerialized(instance: Instance): boolean
+	return NEVER_SERIALIZED_CLASSES[instance.ClassName] == true
+end
+
 function BridgePluginRuntime.withSuppression(studioChanges, callback, params, scopeChanges)
 	studioChanges.beginSuppress(nil, scopeChanges)
 	local ok, result = pcall(callback, params)
@@ -757,7 +763,7 @@ function BridgePluginRuntime.start(context)
 	end
 
 	local function includeExportInstance(serviceName: string, instance: Instance): boolean
-		if instance:IsA("TouchTransmitter") then
+		if isNeverSerialized(instance) then
 			return false
 		end
 		if serviceName == "ServerStorage" then
@@ -2964,7 +2970,7 @@ function BridgePluginRuntime.start(context)
 			if #excludedRoots == 0 then
 				for index = 1, descendantCount do
 					local instance = descendants[index]
-					if instance.ClassName ~= "TouchTransmitter" then
+					if not isNeverSerialized(instance) then
 						includedCount += 1
 						descendants[includedCount] = instance
 					end
@@ -2980,7 +2986,7 @@ function BridgePluginRuntime.start(context)
 						or excludedByInstance[instance.Parent] == true
 					if excluded then
 						excludedByInstance[instance] = true
-					elseif instance.ClassName ~= "TouchTransmitter" then
+					elseif not isNeverSerialized(instance) then
 						includedCount += 1
 						descendants[includedCount] = instance
 					end

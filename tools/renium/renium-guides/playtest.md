@@ -20,6 +20,8 @@ rbx play -x
 
 Use ordinary Play for one-client checks. `--players 1` explicitly launches a separate server and client; `mode: "play"` means ordinary Play. Stop only a session you started or were asked to stop. File edits during Play can wait for Edit mode; that alone is not a sync failure.
 
+Play runs the game's real server code. With Studio API access enabled, its DataStore writes (currency, inventories, progress) change the signed-in account's live data, so don't spend or alter saved data without asking.
+
 ## Query the right runtime
 
 ```powershell

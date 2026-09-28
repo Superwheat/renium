@@ -907,21 +907,21 @@ fn studio_status_result(
     context: &automation::BoundContext,
     parameters: &Value,
     bridge: &BridgeServer,
+    bridge_wait_seconds: f64,
 ) -> Value {
-    let clients = bridge.list_bridge_clients();
-    let clients = if parameters.get("all").and_then(Value::as_bool) == Some(true) {
-        clients
-    } else {
-        bound_context::context_clients(clients, context)
+    let all = parameters.get("all").and_then(Value::as_bool) == Some(true);
+    let select_clients = || {
+        let clients = bridge.list_bridge_clients();
+        if all {
+            clients
+        } else {
+            bound_context::context_clients(clients, context)
+        }
     };
-    let mut result = json!({
-        "studios": bound_context::studio_candidates_from(&clients, ""),
-        "clients": clients,
-        "selected": context.runtime_id,
-    });
-    let mut clients = result["clients"].as_array().cloned().unwrap_or_default();
-    let has_edit = clients.iter().any(|client| client["role"] == "edit");
-    if !has_edit {
+    let has_edit_client = |clients: &[Value]| clients.iter().any(|client| client["role"] == "edit");
+    let mut clients = select_clients();
+    let mut diagnosis = None;
+    if !has_edit_client(&clients) {
         // A plugin reconnects within a second of the daemon starting; report it
         // rather than a transient gap.
         if bridge.list_bridge_clients().is_empty() {
@@ -931,11 +931,33 @@ fn studio_status_result(
                 BridgeTarget::Edit,
             );
         }
-        result["diagnosis"] = crate::studio::diagnosis::diagnose(
-            &bridge.list_bridge_clients(),
-            Some(Path::new(&context.root)),
-        );
+        let deadline = Instant::now() + Duration::from_secs_f64(bridge_wait_seconds.max(0.0));
+        loop {
+            clients = select_clients();
+            if has_edit_client(&clients) {
+                break;
+            }
+            let current = crate::studio::diagnosis::diagnose(
+                &bridge.list_bridge_clients(),
+                Some(Path::new(&context.root)),
+            );
+            if !crate::studio::diagnosis::is_starting(&current) || Instant::now() >= deadline {
+                diagnosis = Some(current);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
     }
+    let mut result = json!({
+        "studios": bound_context::studio_candidates_from(&clients, ""),
+        "clients": clients,
+        "selected": context.runtime_id,
+    });
+    if let Some(diagnosis) = diagnosis {
+        result["diagnosis"] = diagnosis;
+    }
+    let mut clients = result["clients"].as_array().cloned().unwrap_or_default();
+    let has_edit = has_edit_client(&clients);
     let studio_state = if let Some(runtime_id) = context.runtime_id.as_deref().filter(|_| has_edit)
     {
         match bridge.call_for_runtime_with_timeout(
@@ -1064,7 +1086,12 @@ fn automation_dispatch_operation(
     // Status is deliberately unqueued. It must not overwrite the global selection
     // used by a serialized mutation (or another simultaneous status request).
     if operation == op::STUDIO_STATUS {
-        return Ok(studio_status_result(context, parameters, bridge));
+        return Ok(studio_status_result(
+            context,
+            parameters,
+            bridge,
+            bridge_wait_seconds,
+        ));
     }
     if matches!(
         operation,
