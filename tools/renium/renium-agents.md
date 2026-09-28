@@ -33,23 +33,22 @@ When Play is needed, reuse a suitable session, test related changes together wit
 | Studio lifecycle and place management | `RENIUM/advanced.md` |
 | Installed plugins and their commands | `RENIUM/plugins.md` |
 
-Read only the guides the task needs, once per session, before using their commands; reread after `rbx upd` or when a command says so. Command help covers other options.
+Read only the guides the task needs, once per session, before using their commands; reread after `rbx upd` or when a command says so.
 
 ## Targeting and edits
 
 Single-place projects use `src`; experiences use `places/<alias>/src`.
 A place folder selects its target. At the experience root, add `--place <alias|placeId>` when needed.
-Studio commands also accept `gameId:placeId` or a Studio window name; ambiguity returns candidates.
+Studio commands also accept `gameId:placeId` or a Studio window name.
 
 Edit scripts as files; use Renium for generated `.renium` stores and sourcemaps.
 `f`/`bg`/`bb` read saved data; `q` searches a closed place; `v` inspects a model/place; `l` reads live Studio. For a full place comparison, use `cmp BEFORE --full` (optionally `--against AFTER`).
-Compare states only when the task calls for it.
 
 Read an existing target once and reuse its ID; refresh IDs after a pull.
 Run mutations one at a time and inspect each result; if one fails, check the affected state before retrying.
 A usage error (unknown flag, unexpected argument, missing selector or path) means the invocation was malformed, not that Renium failed: fix it and rerun instead of stopping or asking. Quote code and JSON for the shell or pipe them on stdin.
 Keep query results small (counts, slices, specific fields); write large captures to a file.
-When a check exposes a defect in what you were asked to deliver, fix and verify it rather than reporting it.
+When a check exposes a defect in what you were asked to deliver, fix and verify it rather than reporting it. Never give the user undo instructions; if they want your work undone, revert it yourself.
 After cleanup, one prefix search is enough; `storeRemoved: true` needs no follow-up query.
 
 Renium marks affected linked packages Changed before edits. Report `autoDesyncedPackages`, including packages named in a failed edit. Publishing needs user authorization; it is not part of syncing. Say synced, not saved: with `teamCreate: true` in `rbx status` Studio saves to Roblox itself; otherwise only the user saves or publishes.
