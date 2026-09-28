@@ -73,12 +73,15 @@ jobs:
         include:
           # Every CLI build runs on the maintainer's own runners, whose target
           # directories persist between runs. Windows ARM64, Linux ARM64 and
-          # Intel macOS are cross-compiled without running their tests: the
-          # same code is tested natively by the other jobs of this run, and
-          # ARM64 Windows in the nightly Verify run.
+          # Intel macOS are cross-compiled without running their tests, and the
+          # Windows x64 and Apple Silicon builds skip theirs as well: every push
+          # already runs the suite natively on Windows, macOS and Linux in
+          # Verify, and the Linux x64 job below still runs it against the
+          # optimized profile once per release.
           - os: windows-x64
             runner: '["self-hosted", "Windows", "X64"]'
             hosted: false
+            skip_tests: true
             platform: windows-x64
             artifact: cli-Windows-X64
           - os: windows-arm64
@@ -103,6 +106,7 @@ jobs:
           - os: macos-arm64
             runner: '["self-hosted", "macOS", "ARM64"]'
             hosted: false
+            skip_tests: true
             platform: macos-arm64
             artifact: cli-macOS-ARM64
           - os: macos-x64
@@ -137,6 +141,21 @@ jobs:
         if: matrix.hosted
         with:
           workspaces: tools/renium
+
+      # Self-hosted workspaces keep target directories between runs, and every
+      # release leaves its predecessor's artifacts behind; wipe the cache once
+      # it passes 6 GB so it never grows without bound.
+      - name: Bound the build cache
+        shell: pwsh
+        run: |
+          $target = "tools/renium/target"
+          if (Test-Path -LiteralPath $target) {
+            $bytes = (Get-ChildItem -LiteralPath $target -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+            if ($bytes -gt 6GB) {
+              Remove-Item -LiteralPath $target -Recurse -Force
+              "Removed a $([math]::Round($bytes / 1GB, 1)) GB build cache; this run rebuilds from scratch"
+            }
+          }
 
       - name: Test and build
         shell: pwsh
@@ -220,6 +239,7 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ env.RENIUM_ARCHIVE }}
           if-no-files-found: error
+          compression-level: 0
 
       - uses: actions/attest@v4
         with:
@@ -227,7 +247,7 @@ jobs:
 
   integration:
     name: Plugin and extension
-    needs: [verify-tag, cli]
+    needs: [verify-tag]
     # The maintainer's Windows runner carries its own rojo and lune.
     runs-on: ["self-hosted", "Windows", "X64"]
     timeout-minutes: 30
@@ -247,38 +267,32 @@ jobs:
         with:
           node-version-file: .node-version
 
-      # The workspace persists between runs, so downloads from earlier jobs
-      # must not be mistaken for this run's artifacts.
-      - name: Clear downloads left by earlier runs
-        run: Remove-Item -LiteralPath cli-artifact -Recurse -Force -ErrorAction Ignore
+      # Self-hosted workspaces keep target directories between runs, and every
+      # release leaves its predecessor's artifacts behind; wipe the cache once
+      # it passes 6 GB so it never grows without bound.
+      - name: Bound the build cache
+        shell: pwsh
+        run: |
+          $target = "tools/renium/target"
+          if (Test-Path -LiteralPath $target) {
+            $bytes = (Get-ChildItem -LiteralPath $target -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+            if ($bytes -gt 6GB) {
+              Remove-Item -LiteralPath $target -Recurse -Force
+              "Removed a $([math]::Round($bytes / 1GB, 1)) GB build cache; this run rebuilds from scratch"
+            }
+          }
 
-      - uses: actions/download-artifact@v4
-        with:
-          name: cli-Windows-X64
-          path: cli-artifact
-
+      # The plugin and the smoke tests only need a CLI of this commit, not the
+      # published one, so this job builds its own with the verification
+      # profile instead of waiting for every release build to finish.
       - name: Build release components
         run: |
-          $archive = Get-ChildItem cli-artifact -Recurse -File -Filter *-windows-x64.zip | Select-Object -First 1
-          if ($null -eq $archive) { throw "Windows x64 CLI artifact is missing" }
-          $cliStage = Join-Path $env:RUNNER_TEMP "renium-integration-cli"
-          Expand-Archive -LiteralPath $archive.FullName -DestinationPath $cliStage
-          $cli = Get-ChildItem $cliStage -Recurse -File -Filter renium.exe | Select-Object -First 1
-          if ($null -eq $cli) { throw "Windows x64 CLI binary is missing" }
-          if ($IsWindows) {
-            $reader = [System.Reflection.PortableExecutable.PEReader]::new([System.IO.File]::OpenRead($cli.FullName))
-            $machine = "$($reader.PEHeaders.CoffHeader.Machine)"
-            $reader.Dispose()
-            $expected = @{ AMD64 = 'Amd64'; ARM64 = 'Arm64' }[$env:PROCESSOR_ARCHITECTURE]
-            if ($machine -ne $expected) { throw "The CLI archive is built for $machine but this runner is $env:PROCESSOR_ARCHITECTURE" }
-          }
-          # Give a freshly extracted executable a moment to become runnable.
-          $ready = $false
-          for ($attempt = 0; $attempt -lt 30 -and -not $ready; $attempt++) {
-            try { & $cli.FullName --version *> $null; $ready = ($LASTEXITCODE -eq 0) } catch { $ready = $false }
-            if (-not $ready) { Start-Sleep -Seconds 1 }
-          }
-          if (-not $ready) { throw "The extracted CLI could not be executed" }
+          $PSNativeCommandUseErrorActionPreference = $true
+          $env:SOURCE_DATE_EPOCH = git log -1 --format=%ct
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME ".cargo" }
+          $env:RUSTFLAGS = "--remap-path-prefix=$cargoHome=/cargo --remap-path-prefix=$PWD=/renium --remap-path-prefix=$HOME=/home"
+          cargo build --locked --profile fast --manifest-path tools/renium/Cargo.toml
+          $cli = Get-Item -LiteralPath (Join-Path $PWD "tools/renium/target/fast/renium.exe")
           $output = Join-Path $env:RUNNER_TEMP "release-output"
           # The persistent workspace keeps generated files between runs; the tag
           # checkout above already guarantees the tracked tree.
@@ -306,6 +320,7 @@ jobs:
           name: integration
           path: ${{ env.RENIUM_SHARED_DIR }}
           if-no-files-found: error
+          compression-level: 0
 
   extensions:
     name: Extension packages
@@ -407,6 +422,7 @@ jobs:
           name: extensions
           path: ${{ env.RENIUM_EXTENSIONS_DIR }}
           if-no-files-found: error
+          compression-level: 0
 
       - uses: actions/attest@v4
         with:

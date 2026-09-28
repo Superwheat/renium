@@ -73,6 +73,21 @@ jobs:
         with:
           node-version-file: .node-version
 
+      # Self-hosted workspaces keep target directories between runs, and every
+      # release leaves its predecessor's artifacts behind; wipe the cache once
+      # it passes 6 GB so it never grows without bound.
+      - name: Bound the build cache
+        shell: pwsh
+        run: |
+          $target = "tools/renium/target"
+          if (Test-Path -LiteralPath $target) {
+            $bytes = (Get-ChildItem -LiteralPath $target -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+            if ($bytes -gt 6GB) {
+              Remove-Item -LiteralPath $target -Recurse -Force
+              "Removed a $([math]::Round($bytes / 1GB, 1)) GB build cache; this run rebuilds from scratch"
+            }
+          }
+
       - name: Run CLI tests
         run: cargo test --locked --manifest-path tools/renium/Cargo.toml
 
@@ -109,6 +124,21 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version-file: .node-version
+
+      # Self-hosted workspaces keep target directories between runs, and every
+      # release leaves its predecessor's artifacts behind; wipe the cache once
+      # it passes 6 GB so it never grows without bound.
+      - name: Bound the build cache
+        shell: pwsh
+        run: |
+          $target = "tools/renium/target"
+          if (Test-Path -LiteralPath $target) {
+            $bytes = (Get-ChildItem -LiteralPath $target -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+            if ($bytes -gt 6GB) {
+              Remove-Item -LiteralPath $target -Recurse -Force
+              "Removed a $([math]::Round($bytes / 1GB, 1)) GB build cache; this run rebuilds from scratch"
+            }
+          }
 
       - name: Run CLI tests
         run: cargo test --locked --manifest-path tools/renium/Cargo.toml
@@ -160,6 +190,21 @@ jobs:
           node-version-file: .node-version
           cache: ${{ github.event_name != 'push' && 'npm' || '' }}
           cache-dependency-path: tools/renium-vscode-extension/package-lock.json
+
+      # Self-hosted workspaces keep target directories between runs, and every
+      # release leaves its predecessor's artifacts behind; wipe the cache once
+      # it passes 6 GB so it never grows without bound.
+      - name: Bound the build cache
+        shell: pwsh
+        run: |
+          $target = "tools/renium/target"
+          if (Test-Path -LiteralPath $target) {
+            $bytes = (Get-ChildItem -LiteralPath $target -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+            if ($bytes -gt 6GB) {
+              Remove-Item -LiteralPath $target -Recurse -Force
+              "Removed a $([math]::Round($bytes / 1GB, 1)) GB build cache; this run rebuilds from scratch"
+            }
+          }
 
       - name: Build and test the CLI
         run: |
