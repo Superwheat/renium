@@ -1211,7 +1211,12 @@ pub(super) struct GenerateModelArgs {
         default_value = "GeneratedModel"
     )]
     pub(super) name: String,
-    #[arg(help = "Target size", long, value_name = "X,Y,Z")]
+    #[arg(
+        help = "Target size",
+        long,
+        value_name = "X,Y,Z",
+        allow_hyphen_values = true
+    )]
     pub(super) size: Option<String>,
     #[arg(help = "Triangle budget", long)]
     pub(super) max_triangles: Option<u32>,
@@ -1674,7 +1679,12 @@ pub(super) struct GotoArgs {
         required_unless_present = "pos"
     )]
     pub(super) target: Option<String>,
-    #[arg(help = "World position to walk to", long, value_name = "X,Y,Z")]
+    #[arg(
+        help = "World position to walk to",
+        long,
+        value_name = "X,Y,Z",
+        allow_hyphen_values = true
+    )]
     pub(super) pos: Option<String>,
     #[arg(
         help = "Play client by name or index",

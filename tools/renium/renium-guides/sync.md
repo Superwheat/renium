@@ -27,9 +27,11 @@ For a failure, inspect `rbx lst --details`, fix the cause, then retry with `rbx 
 
 ## First connection and conflicts
 
-When no Studio runtime connects, the `no_studio` error and `rbx status` carry a `diagnosis.verdict` naming the cause: Studio closed, plugin missing, plugin needs a Studio restart, plugin not connecting, or another place open. Relay it to the user as is; do not guess.
+When no Studio runtime connects, the `no_studio` error and `rbx status` carry a `diagnosis.verdict` naming the cause: Studio closed, plugin missing, plugin needs a Studio restart, plugin not connecting, or another place open. If Studio is closed or another place is open and the task needs Studio, reopen the bound place with `rbx ro`; relay other verdicts as is. Don't guess why a place closed.
 
 Live Sync compares each side with their last common Renium state. One-sided changes transfer; independent edits merge; conflicts wait without overwriting either side.
+
+A published place that closed without saving reopens older than the files, and its differences count as Studio edits. Before reopening one, run `rbx cfg set liveSync.initialSyncPriority verify`, then read `rbx lst --details`: no differences means Studio kept the work. Otherwise ask the user which side to keep and use the resolution commands the CLI returns.
 
 The editor asks which version to keep, then resumes startup. The CLI returns the conflict and resolution commands; `rbx lst --details` lists every conflict with the properties that differ and both values. Choose only with user direction or an existing conflict preference.
 

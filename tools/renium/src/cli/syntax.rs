@@ -39,7 +39,9 @@ fn check(files: &[PathBuf], stdin: &mut impl Read) -> Result<Value> {
         .map(|file| {
             let source = if file == Path::new("-") {
                 let mut source = String::new();
-                stdin.read_to_string(&mut source).map(|_| source)
+                stdin
+                    .read_to_string(&mut source)
+                    .map(|_| source.trim_start_matches('\u{feff}').to_string())
             } else {
                 fs::read_to_string(file)
             };

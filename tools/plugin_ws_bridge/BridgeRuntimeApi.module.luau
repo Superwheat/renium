@@ -2752,6 +2752,8 @@ updateMouse()
 			playStarting = status.starting,
 			readyForStart = status.readyForStart,
 			launchNonce = status.launchNonce or game:GetAttribute("__ReniumLaunchNonce"),
+			teamCreate = RunService:IsEdit() and #game:GetService("Players"):GetChildren() > 0,
+			placeVersion = game.PlaceVersion,
 		}
 	end
 

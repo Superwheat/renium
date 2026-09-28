@@ -67,7 +67,7 @@ Request the needed fields once and analyze locally; don't make Studio scan saved
 '{"ops":[{"type":"counts","id":"editor:folder"},{"type":"search","id":"editor:folder","q":"Door","limit":5,"fields":"lookup"}]}' | rbx bb Workspace -J -
 ```
 
-Results are flat in `rs`. Scope `search`/`counts` by `id`, `path`, `index`, `name`, or `className`.
+Results are flat in `rs`. Scope `search`/`counts` to one instance by `id`, `path`, `index`, `name`, or `className`; each must match exactly one. `q` filters that scope: a word matches names, `is:Class` a class, `tag:Name` a tag, `Prop=value` (`!=`, `<`, `>`, `<=`, `>=`) a property or attribute, and dotted `*`/`**` patterns match paths; `or` separates alternatives.
 `path` accepts `"Workspace.Lobby.Barrier"` or `["Workspace","Lobby","Barrier"]`; use an array when a name contains dots or slashes. A search without `q` lists the selected subtree up to `limit` (default 20; 0 means unlimited).
 Field presets: `lookup=id,n,c,path`, `tree=id,n,c,cc,ch`, `brief=id,n,c,path,cc`.
 Use `prop:Name`/`attr:Tags` for fields; `src` is a source path, `prop:Source` is exact text.

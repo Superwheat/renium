@@ -16,7 +16,7 @@ rbx perf stop --player 1 --capture ID
 rbx perf export --player 1 --capture ID --out reports/performance.json
 ```
 
-Use the ID from `start`. Capture stops at its duration limit; `stop` ends it earlier. `read` returns percentiles and the five slowest frames. Request `--page N` only for raw samples. `export` saves every frame and refuses an unfinished or changed capture.
+Keep the `captureId` from `start`; `read`, `stop` and `export` require it. Capture stops at its duration limit; `stop` ends it earlier. `read` returns percentiles and the five slowest frames. Request `--page N` only for raw samples. `export` saves every frame and refuses an unfinished or changed capture.
 
 Target a play client with `--player`, the play server with `--server`, or Edit mode by omitting both. These commands never start Play. Reuse an existing runtime when the question requires runtime measurements.
 
@@ -35,7 +35,7 @@ rbx perf analyze reports/spike.gprx --frame 84 --scope '*Script*|*Physics*'
 rbx perf analyze reports/spike.gprx --thread '*Main*' --counter '**/Luau/**'
 ```
 
-`micro-start` enables collection without opening the profiler UI. `micro-stop` freezes and saves the current rolling capture, then disables instrumentation. `micro --out FILE` snapshots without ending collection: Renium briefly pauses its own capture while copying, then resumes it, including if copying fails. It does not control a capture this runtime did not start. Controls affect the selected **Studio process**, not just one DataModel within it; don't overlap another profiling task. A capture holds at most 256 recent frames and can contain gaps from earlier collection.
+`micro-start` enables collection without opening the profiler UI. `micro-stop` freezes and saves the current rolling capture, then disables instrumentation. `micro --out FILE` snapshots without ending collection: Renium briefly pauses its own capture while copying, then resumes it, including if copying fails. It does not control a capture this runtime did not start. Controls affect the selected **Studio process**, not just one DataModel within it; don't overlap another profiling task. A capture holds at most 256 recent frames and can contain gaps from earlier collection. At Studio frame rates that is one or two seconds: start just before the event and stop within a second after it.
 
 Edit-mode diagnostics can run during a sync, without changing its target or acquiring its mutation lock. Studio must still yield to handle the capture; a busy engine can delay it. Capture the relevant interval, not just the idle frames after the operation.
 

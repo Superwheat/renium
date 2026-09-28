@@ -2,10 +2,18 @@
 
 ## Unreleased
 
+### Improvements
+
+- `rbx status` now reports `teamCreate` and `placeVersion` for the selected Edit place. `teamCreate` is true when the place is in a Team Create session, where Studio saves every edit to Roblox by itself, and `placeVersion` is the place's saved version number. Agents used to tell users their synced work was "not saved" without any way to check, so the agent guides now tell them to report work as synced and to read these fields instead of guessing.
+- The agent guides now explain how saving and publishing differ from syncing, that an agent can reopen a closed bound place with `rbx ro` instead of stopping, and that a reopened cloud place should be compared in verify mode before Live Sync merges it. They also give the real filter syntax for `rbx bb` searches (`is:Class`, `tag:Name`, `Prop=value`) and say that an empty `rbx co` result means there are no messages. They also cover Windows PowerShell 5.1 quoting, MicroProfiler capture windows, keeping the capture id, and Creator Store inserts becoming project content under Live Sync.
+
 ### Bug fixes
 
 - `rbx upd` no longer gets stuck on the old CLI version after Cursor or VS Code has already installed a Renium extension update since the editor was opened. The editor refused the next update with "Please restart VS Code before reinstalling Renium", and `rbx upd` treated that as fatal, failed to roll back, and then failed the same way every time after that. It now finishes the CLI and plugin update and tells you to restart the editor and then run `rbx upd apply --component extension`.
 - `rbx upd` no longer fails on Windows with "Access is denied" while replacing the CLI's folder. Renium's audio helper processes, which the daemon starts from that folder, were still running and kept it locked. The updater now stops them before it swaps the folder or restores the old one, and the daemon starts them again on its own.
+- `rbx l -`, `rbx lc -` and `rbx ck -` no longer fail with "got Unicode character U+feff" when the piped code starts with a UTF-8 byte order mark, which PowerShell adds to text it pipes. The mark is now ignored, as `rbx bb -J -` already did.
+- `rbx go --pos X,Y,Z` no longer rejects a negative first coordinate such as `-330,300,1485` as an unknown flag, and the same fix applies to the model generator's `--size`. A value that starts with a minus sign used to be read as a flag.
+- When Studio has a different place open than the one the project is bound to, the `rbx status` verdict now says that `rbx ro` opens the bound place, instead of only telling you to "open that place".
 
 ## 0.3.15 - 2026-09-28
 

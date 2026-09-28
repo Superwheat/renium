@@ -11,7 +11,7 @@ rbx pn <PLACE_ID> lobby
 rbx po <PLACE_ID> <OTHER_PLACE_ID>
 ```
 
-`status` reads connection/play state. `ro` opens the remembered local file or published place; an explicit file overrides it. An already-open matching place is reused.
+`status` reads connection/play state. `ro` opens the remembered local file or published place; an explicit file overrides it. An already-open matching place is reused. With several Studio places open, bind a single-place project once: `rbx cfg set place GAME_ID:PLACE_ID`.
 
 `ro` confirms launch, not bridge readiness. Run the needed Studio command next; it waits for connection. An immediate `status` can still show no clients during startup.
 
@@ -19,7 +19,7 @@ rbx po <PLACE_ID> <OTHER_PLACE_ID>
 
 Renium dismisses Auto-Recovery with **Ignore** (preserving recovery files) and Lighting Technology Migration with **Continue**. On macOS, it also dismisses the known `BulkPluginAssetDetailsFetcher::sendRequest()` HTTP 500 startup alert with **OK**. Other dialogs still require their normal decision. On macOS, this and window-name targeting require Accessibility permission for the app launching Renium (for SSH, `sshd-keygen-wrapper`/Remote Login).
 
-`sx` closes the target. Local files require `--save` or `--terminate`; termination discards unsaved work.
+`sx` closes the target. Local files require `--save` or `--terminate`; termination discards unsaved work. A published place closes without saving; Studio edits not yet saved to Roblox then exist only in the project files.
 
 Launch or close Studio only when needed. Don't call `PluginManager:ExportPlace`: it opens a modal save panel on macOS. Use Renium's pull/export commands.
 
@@ -56,6 +56,10 @@ Studio opened with the matching Renium helper; global status lists any window
 that needs reopening rather than reopening it automatically. Unsupported aggregate/virtual
 output devices report an error instead of muting the system output.
 
+## Save and publish state
+
+Synced work is in the project files and the open Studio session. `rbx status` reports `teamCreate` and `placeVersion` for the selected Edit place: with Team Create, Studio saves every edit to Roblox itself; without it, only File > Save to Roblox or a publish does, and Renium cannot see whether that happened. Players get changes only from a publish. Report what is synced and whether you published; don't call the place saved or unsaved. Offer `rbx publish` when the user wants the changes live.
+
 ## Publishing places
 
 ```powershell
@@ -67,9 +71,10 @@ rbx publish --open-cloud --file build.rbxl --universe 123 --place-id 456
 
 Publishing requires user authorization. Default: publish the selected Studio Edit
 state to its existing place with the Studio login, without pushing files first.
-Settle pending Live Sync with `lst --wait`. Studio's Save Place API must be enabled
-for the place; an active Team Create session blocks it. Don't change those settings
-or credentials to work around a refusal without authorization.
+Settle pending Live Sync with `lst --wait`. When the place refuses `SavePlaceAsync`
+(Save Place API off, Team Create), Renium runs Studio's own Publish command and reads
+the result from Studio's log (Windows and macOS). Don't change place settings or
+credentials to work around a refusal without authorization.
 
 `--open-cloud` builds the selected place project, or uploads `--file` unchanged.
 Use `ROBLOX_API_KEY` / `--key-env ENV` with Universe Places Write. IDs come from the
@@ -93,6 +98,8 @@ rbx inp -p 1 click "Shop.BuyButton" wait 100 key E
 Mouse targets are UI paths or `x,y`; waits are milliseconds. Put `-p` first.
 
 ## Report a Renium bug
+
+Tell the user about any change you made to their place to get past a Renium failure.
 
 ```powershell
 rbx report -m "what went wrong"

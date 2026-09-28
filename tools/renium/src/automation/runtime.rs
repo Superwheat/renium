@@ -992,6 +992,11 @@ fn studio_status_result(
         "unknown"
     });
     if let Some(state) = studio_state {
+        for key in ["teamCreate", "placeVersion"] {
+            if let Some(value) = state.get(key).filter(|value| !value.is_null()) {
+                result[key] = value.clone();
+            }
+        }
         result["studioState"] = state;
     }
     result

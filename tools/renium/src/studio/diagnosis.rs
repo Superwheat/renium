@@ -329,7 +329,7 @@ fn verdict_text(
     }
     match bound {
         Some(bound) => format!(
-            "Studio has {} open, but this project is bound to {bound}; open that place or run from its project.",
+            "Studio has {} open, but this project is bound to {bound}; `rbx ro` opens it, or run from its project.",
             open_places.join(", ")
         ),
         None => format!(

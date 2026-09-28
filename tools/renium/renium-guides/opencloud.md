@@ -114,4 +114,6 @@ rbx gm "small wooden crate" --parent Workspace --name GeneratedCrate
 rbx js JOB_ID --wait-seconds 30
 ```
 
+`as --details` returns the store's full records (asset, creator, voting) including `hasScripts`; check them before inserting. Live Sync writes inserted assets to the project like any Studio edit: take what you need from inspection-only inserts and delete them in the same step.
+
 Use normal web tools for Roblox documentation.

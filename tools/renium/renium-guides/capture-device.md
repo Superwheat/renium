@@ -1,6 +1,6 @@
 # Screenshots, recordings, and devices
 
-Capture only when the task needs visual evidence. Use a screenshot for one state and a recording for motion or a transition. Capturing does not require starting Play; use `--studio` for Edit. Read the Play guide only for runtime work.
+Capture only when the task needs visual evidence. Use a screenshot for one state and a recording for motion or a transition. Record short-lived effects; don't time screenshots with sleeps. Save captures outside the project or delete them when done. Capturing does not require starting Play; use `--studio` for Edit. Read the Play guide only for runtime work.
 
 ## Capture
 

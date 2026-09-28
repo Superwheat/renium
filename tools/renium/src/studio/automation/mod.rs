@@ -59,7 +59,7 @@ pub(crate) fn execute_luau_command(mut args: ExecuteLuauArgs) -> Result<()> {
     {
         let mut code = String::new();
         io::stdin().read_to_string(&mut code)?;
-        args.code = Some(code);
+        args.code = Some(code.trim_start_matches('\u{feff}').to_string());
         args.file = None;
     }
     let parameters = json!({
