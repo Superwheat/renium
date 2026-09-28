@@ -34,7 +34,7 @@ rbx co --player 1 -n 20
 `l` targets Edit when stopped and the server during Play. `lc CODE PLAYER` targets a client by name or index. Edit has no `LocalPlayer` or `PlayerGui`.
 In Edit, each `l` run requires ModuleScripts fresh from their current source, so module tables don't persist between runs; don't clone a module to reload it. During Play, `l` and `lc` share the running game's `require` cache.
 
-Return values instead of printing. Luau errors and timeouts exit nonzero; captured `print`/`warn` text returns to the caller without entering Studio Output. `co` reads game/Studio messages. An empty `co` result means there were none; don't re-read `LogService` with `l` or `lc`.
+Return values instead of printing. Luau errors and timeouts exit nonzero; captured `print`/`warn` text returns to the caller without entering Studio Output. `co` reads game/Studio messages. An empty `co` result means there were none; don't re-read `LogService` with `l` or `lc`. A stack naming `cloud_<id>` or `user_<name>` scripts comes from an installed Studio plugin, not the game.
 
 Keep live queries bounded. Don't run nested descendant scans over saved data. Don't hold a command open while issuing another: register an observer, return, act, then read its result. Runners are removed on return; persistent test fixtures need a temporary source script.
 
