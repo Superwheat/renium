@@ -112,7 +112,32 @@ fn state_dir(pid: u32, identity: &str) -> Result<PathBuf> {
         .join(format!("{pid}-{key}")))
 }
 
+#[cfg(windows)]
+fn keep_standard_handles_private() {
+    use windows_sys::Win32::Foundation::{
+        HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+    };
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: GetStdHandle returns a handle owned by this process or an invalid value.
+        let handle = unsafe { GetStdHandle(id) };
+        if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+            // SAFETY: clearing the inherit flag on our own standard handle is always valid.
+            unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+        }
+    }
+}
+
+pub(crate) fn helpers_disabled() -> bool {
+    std::env::var_os("RENIUM_NO_AUDIO_HELPERS").is_some()
+}
+
 fn background_command() -> Result<Command> {
+    #[cfg(windows)]
+    keep_standard_handles_private();
     let mut command = Command::new(std::env::current_exe()?);
     command
         .current_dir(update::user_data_dir()?)
@@ -179,6 +204,9 @@ pub(crate) fn command(pid: u32, action: Action) -> Result<Value> {
             action,
         })?,
     )?;
+    if helpers_disabled() {
+        bail!("Studio audio helpers are disabled by RENIUM_NO_AUDIO_HELPERS");
+    }
     let mut worker = background_command()?;
     worker.args([
         "audio-worker",

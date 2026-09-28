@@ -85,6 +85,9 @@ fn start_worker(dir: &Path) -> Result<()> {
 }
 
 pub(crate) fn resume() -> Result<()> {
+    if super::helpers_disabled() {
+        return Ok(());
+    }
     let dir = directory()?;
     if read_setting()?.enabled() {
         start_worker(&dir)?;

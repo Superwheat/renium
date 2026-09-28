@@ -207,6 +207,8 @@ jobs:
           }
 
       - name: Build and test the CLI
+        env:
+          RENIUM_NO_AUDIO_HELPERS: "1"
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
           # Paths of the build machine never reach the binary or the logs.

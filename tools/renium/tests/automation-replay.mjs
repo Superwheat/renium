@@ -46,6 +46,7 @@ const daemonEnvironment = {
   RENIUM_DAEMON_NAME: path.basename(root),
   RENIUM_DAEMON_CONTROL_PORT: String(controlPort),
   RENIUM_DAEMON_FILE: path.join(root, "daemon.json"),
+  RENIUM_NO_AUDIO_HELPERS: "1",
 };
 const daemon = childProcess.spawn(executable, ["bd", "--editor-stdio", "--control-port", String(controlPort), "-w", "0.1", "-P", `${firstPort},${secondPort}`], {
   cwd: root,
@@ -214,3 +215,4 @@ try {
 }
 
 console.log("Renium automation replay passed");
+process.exit(0);

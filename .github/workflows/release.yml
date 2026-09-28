@@ -286,6 +286,8 @@ jobs:
       # published one, so this job builds its own with the verification
       # profile instead of waiting for every release build to finish.
       - name: Build release components
+        env:
+          RENIUM_NO_AUDIO_HELPERS: "1"
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
           $env:SOURCE_DATE_EPOCH = git log -1 --format=%ct
