@@ -90,10 +90,8 @@ jobs:
 
   rust-windows-arm:
     name: Rust tests (windows-11-arm)
-    # Pull requests and the nightly run test Windows ARM64 on GitHub's hosted
-    # runner; a maintainer push only cross-checks the target on the Windows
-    # runner below, which keeps push verification within the x64 build time.
-    if: github.event_name != 'push'
+    # Windows ARM64 has no maintainer runner, so every push, pull request and
+    # the nightly run test it on GitHub's hosted runner.
     runs-on: windows-11-arm
     timeout-minutes: 30
     steps:
@@ -178,25 +176,6 @@ jobs:
           node tools/renium/tests/agent-docs-smoke.mjs tools/renium/target/fast/renium.exe
           node tools/renium/tests/launcher-smoke.mjs
           "RENIUM_CLI_BUILD=$(Join-Path $PWD 'tools/renium/target/fast/renium.exe')" >> $env:GITHUB_ENV
-
-      - name: Check the Windows ARM64 target
-        if: github.event_name == 'push'
-        run: |
-          $PSNativeCommandUseErrorActionPreference = $true
-          # The whole x64_arm64 developer environment is imported into this
-          # process: clang needs INCLUDE and LIB, and with VCINSTALLDIR set
-          # rustc takes link.exe from PATH.
-          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
-          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath
-          if (-not $vs) { throw "No Visual Studio instance with the MSVC ARM64 build tools was found" }
-          $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvarsall.bat"
-          $lines = cmd /c "`"$vcvars`" x64_arm64 >nul 2>&1 && set"
-          foreach ($line in $lines) {
-            if ($line -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($matches[1])" -Value $matches[2] }
-          }
-          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME ".cargo" }
-          $env:RUSTFLAGS = "--remap-path-prefix=$cargoHome=/cargo --remap-path-prefix=$PWD=/renium --remap-path-prefix=$HOME=/home"
-          cargo check --locked --profile fast --tests --target aarch64-pc-windows-msvc --manifest-path tools/renium/Cargo.toml
 
       - name: Build both Studio plugin formats
         run: |
