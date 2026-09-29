@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Improvements
+
+- `rbx perf micro-stop` and `rbx perf micro` now report `frames`, the number of complete frames the saved dump holds, with a note when it is zero. Studio keeps a fixed amount of profiler log per thread and drops frames whose data was overwritten, so a busy client keeps far fewer than the frame limit and a heavy game phase can leave none; an agent used to learn that only from `rbx perf analyze`, which now explains it as well instead of claiming collection was off. The performance guide describes the limit.
+
 ### Bug fixes
 
 - On Windows, `rbx ky` and `rbx ty` now use the game's virtual input like every other input command, so they report `inputMethod: "virtual"` and touch neither the cursor nor window focus. 0.4.5 had moved the pointer commands but left key presses and typing on the window path, which contradicted the input guide and made an agent stop a test to report it. A key can now be held for up to 60 seconds; the old limit was 2 seconds, and a longer request was silently shortened.

@@ -4,7 +4,7 @@ return function(lib, bytes, selectedFrame, top, scopeMask, threadMask, counterMa
 	local session = lib.Session.OpenFromBuffer(bytes)
 	assert(session and session:IsValid(), "Invalid or unsupported MicroProfiler capture")
 	local first, last = session:GetFrameIdMin(), session:GetFrameIdMax()
-	assert(last >= first and first > 0, "Capture contains no frames; enable MicroProfiler capture before recording")
+	assert(last >= first and first > 0, "Capture holds no complete frames: the engine's fixed per-thread profiler log held less than one frame of that runtime's data. Retry at a lighter moment or profile the server; micro-stop reports the frames a dump keeps")
 	assert(not selectedFrame or (selectedFrame >= first and selectedFrame <= last), `Frame is outside capture range {first}–{last}`)
 	local scale = session:FetchGlobalDesc()
 	local descriptors, frames, ranked, durations, segments = {}, {}, {}, {}, {}

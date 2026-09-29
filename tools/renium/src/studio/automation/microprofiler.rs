@@ -7,6 +7,11 @@ const LIBMP_SHA256: &str = "ab9579e592e8751386a01537152f2b739cc7942ce565d3c11337
 // An asset ID does not follow the mutable `latest` tag when Roblox updates it.
 const LIBMP_URL: &str = "https://api.github.com/repos/Roblox/libmp/releases/assets/456813947";
 const MAX_CAPTURE_BYTES: u64 = 128 * 1024 * 1024;
+const DUMP_MAGIC: &[u8] = b"A0BF";
+/// Studio keeps a fixed log per thread; frames whose entries were overwritten
+/// are dropped from a dump, so a busy place keeps fewer than the limit and
+/// can keep none.
+const NO_FRAMES_NOTE: &str = "The dump holds no complete frames: the engine's fixed per-thread profiler log held less than one frame of this runtime's data. Retry at a lighter moment or profile the server; use perf start for longer windows";
 
 fn metadata_path(capture: &Path) -> PathBuf {
     let mut name = capture.as_os_str().to_owned();
@@ -68,9 +73,42 @@ pub(super) fn save_capture(path: &Path, result: &Value) -> Result<Value> {
                 path.display()
             )
         })?;
-    Ok(
-        json!({"path":path,"metadata":sidecar,"bytes":bytes.len(),"runtimeId":result["runtimeId"],"format":"gprx"}),
-    )
+    let mut saved = json!({"path":path,"metadata":sidecar,"bytes":bytes.len(),"runtimeId":result["runtimeId"],"format":"gprx"});
+    if let Some(frames) = frame_count(&bytes) {
+        saved["frames"] = json!(frames);
+        if frames == 0 {
+            saved["note"] = json!(NO_FRAMES_NOTE);
+        }
+    }
+    Ok(saved)
+}
+
+/// The number of complete frames a dump holds, when the parser is available
+/// and the bytes are a Studio dump; saving a capture never fails over this.
+fn frame_count(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() < 8 || &bytes[4..8] != DUMP_MAGIC {
+        return None;
+    }
+    let (lua, library) = parser_vm(Duration::from_secs(20)).ok()?;
+    let span: mlua::Function = lua
+        .load(
+            "return function(lib, bytes)
+                local session = lib.Session.OpenFromBuffer(bytes)
+                if not (session and session:IsValid()) then return nil end
+                return session:GetFrameIdMin(), session:GetFrameIdMax()
+            end",
+        )
+        .set_name("Renium/MicroProfilerFrames")
+        .eval()
+        .ok()?;
+    let (first, last): (Option<u64>, Option<u64>) =
+        span.call((library, lua.create_buffer(bytes).ok()?)).ok()?;
+    let (first, last) = (first?, last?);
+    Some(if last >= first && first > 0 {
+        last - first + 1
+    } else {
+        0
+    })
 }
 
 fn future_path(path: &Path) -> Result<PathBuf> {
@@ -153,6 +191,38 @@ fn parser_source() -> Result<Vec<u8>> {
     Ok(source)
 }
 
+fn parser_vm(budget: Duration) -> Result<(Lua, mlua::Table)> {
+    let source = parser_source()?;
+    let started = Instant::now();
+    let lua = Lua::new();
+    lua.set_memory_limit(768 * 1024 * 1024)?;
+    lua.set_compiler(mlua::Compiler::new().set_optimization_level(2));
+    lua.set_interrupt(move |_| {
+        if started.elapsed() >= budget {
+            return Err(mlua::Error::RuntimeError(
+                "MicroProfiler analysis exceeded 20 seconds; select one frame with --frame".into(),
+            ));
+        }
+        Ok(mlua::VmState::Continue)
+    });
+    // LibMP also supports Lute file I/O; this host intentionally exposes none.
+    lua.globals().set(
+        "require",
+        lua.create_function(|lua, name: String| {
+            if matches!(name.as_str(), "@std/fs" | "@lute/process") {
+                lua.create_table()
+            } else {
+                Err(mlua::Error::RuntimeError(
+                    "Module access is disabled in the profiler parser".into(),
+                ))
+            }
+        })?,
+    )?;
+    lua.sandbox(true)?;
+    let library: mlua::Table = lua.load(source).set_name("Roblox/LibMP").eval()?;
+    Ok((lua, library))
+}
+
 pub(super) fn analyze(
     path: &Path,
     frame: Option<u32>,
@@ -180,34 +250,8 @@ pub(super) fn analyze(
         bail!("MicroProfiler captures must be nonempty and at most 128 MiB");
     }
     let metadata = read_metadata(path, &bytes)?;
-    let source = parser_source()?;
     let started = Instant::now();
-    let lua = Lua::new();
-    lua.set_memory_limit(768 * 1024 * 1024)?;
-    lua.set_compiler(mlua::Compiler::new().set_optimization_level(2));
-    lua.set_interrupt(move |_| {
-        if started.elapsed() >= Duration::from_secs(20) {
-            return Err(mlua::Error::RuntimeError(
-                "MicroProfiler analysis exceeded 20 seconds; select one frame with --frame".into(),
-            ));
-        }
-        Ok(mlua::VmState::Continue)
-    });
-    // LibMP also supports Lute file I/O; this host intentionally exposes none.
-    lua.globals().set(
-        "require",
-        lua.create_function(|lua, name: String| {
-            if matches!(name.as_str(), "@std/fs" | "@lute/process") {
-                lua.create_table()
-            } else {
-                Err(mlua::Error::RuntimeError(
-                    "Module access is disabled in the profiler parser".into(),
-                ))
-            }
-        })?,
-    )?;
-    lua.sandbox(true)?;
-    let library: mlua::Table = lua.load(source).set_name("Roblox/LibMP").eval()?;
+    let (lua, library) = parser_vm(Duration::from_secs(20))?;
     let analyze: mlua::Function = lua
         .load(include_str!("microprofiler_analysis.luau"))
         .set_name("Renium/MicroProfilerAnalysis")
