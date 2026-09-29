@@ -1005,6 +1005,36 @@ fn push_verification_distinguishes_engine_identity_from_authored_data() {
 }
 
 #[test]
+fn push_verification_accepts_the_cframe_a_weld_re_derives_for_a_part() {
+    let part = SettingsBytecodeInstance::new("part".into(), "Part".into(), "Part".into(), None);
+    let cframe = |x: f64, y: f64| {
+        let mut components = vec![x, y, -1719.797607421875];
+        components.extend([0.867, 0.0, 0.498, 0.0, 1.0, 0.0, -0.498, 0.0, 0.867]);
+        Map::from_iter([(
+            "CFrame".to_string(),
+            json!({"_type": "CFrame", "components": components}),
+        )])
+    };
+    let desired = cframe(-225.7361297607422, 17.22353172302246);
+    let observed = cframe(-225.73619079589844, 17.223518371582);
+    assert_eq!(
+        expected_map_mismatch(&desired, &observed, true, &part),
+        None
+    );
+    assert_eq!(
+        changed_map_mismatch(&cframe(0.0, 0.0), &desired, &observed, true, &part),
+        None
+    );
+    assert!(
+        expected_map_mismatch(&desired, &cframe(-225.2, 17.22353172302246), true, &part).is_some()
+    );
+    let mut turned = observed.clone();
+    turned["CFrame"]["components"][3] = json!(0.866);
+    assert!(expected_map_mismatch(&desired, &turned, true, &part).is_some());
+    assert!(expected_map_mismatch(&desired, &Map::new(), true, &part).is_some());
+}
+
+#[test]
 fn push_verification_accepts_the_velocity_the_engine_recomputes_for_a_part() {
     let part = SettingsBytecodeInstance::new("part".into(), "Part".into(), "Part".into(), None);
     let velocity = |y: f64| {

@@ -323,6 +323,32 @@ pub(crate) fn changed_instance_mismatch(
     })
 }
 
+const ASSEMBLY_POSITION_TOLERANCE: f64 = 1e-3;
+const ASSEMBLY_ROTATION_TOLERANCE: f64 = 1e-4;
+
+fn cframes_within_assembly_tolerance(left: &Value, right: &Value) -> bool {
+    let components = |value: &Value| {
+        value
+            .get("components")?
+            .as_array()
+            .filter(|components| components.len() == 12)?
+            .iter()
+            .map(Value::as_f64)
+            .collect::<Option<Vec<f64>>>()
+    };
+    let (Some(left), Some(right)) = (components(left), components(right)) else {
+        return false;
+    };
+    left.iter().zip(&right).enumerate().all(|(index, (a, b))| {
+        let tolerance = if index < 3 {
+            ASSEMBLY_POSITION_TOLERANCE
+        } else {
+            ASSEMBLY_ROTATION_TOLERANCE
+        };
+        a.is_finite() && b.is_finite() && (a - b).abs() <= tolerance
+    })
+}
+
 pub(crate) fn verification_values_equal(
     properties: bool,
     class_name: &str,
@@ -334,6 +360,16 @@ pub(crate) fn verification_values_equal(
         // Studio recalculates this state when inserting a package or changing
         // its contents. Verify the package identity/content, not that readback.
         if class_name == "PackageLink" && name == "ModifiedState" {
+            return true;
+        }
+        // A part inside a welded assembly gets its CFrame re-derived from the
+        // assembly root through the weld offsets once the tree is in the
+        // place, which moves it by a few float steps; a lost CFrame is off by
+        // whole studs.
+        if name == "CFrame"
+            && let (Some(left), Some(right)) = (left, right)
+            && cframes_within_assembly_tolerance(left, right)
+        {
             return true;
         }
         // The physics engine owns a part's velocities: a part inside a welded
