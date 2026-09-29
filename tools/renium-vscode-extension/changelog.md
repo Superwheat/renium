@@ -4,6 +4,8 @@
 
 ### Improvements
 
+- Pulls and pushes of large places are faster. A pull copies the existing project into its stage while Studio serializes and discards the stage without waiting for the delete, which antivirus scanning had stretched to about five seconds; a repeat pull of a 79,000-instance place went from about 6.6 s to about 1 s. A push prefetches its changed files in parallel, looks up scopes by ancestor instead of scanning every scope per path, reads snapshot files in parallel, keeps every service store cached and fetches live sources in byte-bounded batches across the bridge channels; a no-op push of that place went from about 700 ms to about 300 ms and its editor commit from about 900 ms to about 100 ms.
+- A full push of a place with more than 5,000 models no longer fails at transaction begin with "post-commit property changes must be a bounded array", and paths with empty instance names, which Roblox allows, are accepted.
 - `rbx perf micro-stop` and `rbx perf micro` now report `frames`, the number of complete frames the saved dump holds, with a note when it is zero. Studio keeps a fixed amount of profiler log per thread and drops frames whose data was overwritten, so a busy client keeps far fewer than the frame limit and a heavy game phase can leave none; an agent used to learn that only from `rbx perf analyze`, which now explains it as well instead of claiming collection was off. The performance guide describes the limit.
 
 ### Bug fixes
