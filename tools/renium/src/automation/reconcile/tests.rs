@@ -1005,6 +1005,32 @@ fn push_verification_distinguishes_engine_identity_from_authored_data() {
 }
 
 #[test]
+fn push_verification_accepts_the_texture_pack_studio_issues_for_an_appearance() {
+    let appearance = SettingsBytecodeInstance::new(
+        "appearance".into(),
+        "SurfaceAppearance".into(),
+        "SurfaceAppearance".into(),
+        None,
+    );
+    let pack = |value: &str| Map::from_iter([("TexturePack".to_string(), json!(value))]);
+    let before = pack("rbxassetid://1");
+    let desired = pack("rbxassetid://102986607617177");
+    let observed = pack("rbxassetid://99673417571091");
+    assert_eq!(
+        expected_map_mismatch(&desired, &observed, true, &appearance),
+        None
+    );
+    assert_eq!(
+        changed_map_mismatch(&before, &desired, &observed, true, &appearance),
+        None
+    );
+    assert!(expected_map_mismatch(&desired, &pack(""), true, &appearance).is_some());
+    assert!(expected_map_mismatch(&desired, &Map::new(), true, &appearance).is_some());
+    let part = SettingsBytecodeInstance::new("part".into(), "Part".into(), "Part".into(), None);
+    assert!(expected_map_mismatch(&desired, &observed, true, &part).is_some());
+}
+
+#[test]
 fn push_verification_accepts_engine_migrations_and_forced_text_wrapping() {
     let part = SettingsBytecodeInstance::new("part".into(), "Part".into(), "Part".into(), None);
     let before = Map::new();

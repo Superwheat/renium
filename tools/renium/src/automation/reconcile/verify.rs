@@ -336,6 +336,15 @@ pub(crate) fn verification_values_equal(
         if class_name == "PackageLink" && name == "ModifiedState" {
             return true;
         }
+        // Studio issues its own texture pack asset for the maps an appearance
+        // carries, so a pushed pack id is a hint and whichever pack Studio
+        // holds afterwards is the retained value.
+        if crate::roblox::schema::has_protected_texture_pack(class_name)
+            && name == crate::roblox::schema::TEXTURE_PACK_PROPERTY
+            && right.is_some_and(|pack| pack.as_str().is_none_or(|uri| !uri.is_empty()))
+        {
+            return true;
+        }
         reconciliation_property_values_equal(class_name, name, left, right)
     } else {
         match (left, right) {
