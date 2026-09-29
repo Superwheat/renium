@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -3083,54 +3084,122 @@ struct LiveSource {
     class_name: Option<String>,
 }
 
+// Batches are bounded by the Source bytes the files expect. Studio's replies
+// are limited to 16 MiB of JSON, so a batch that still outgrows that is split.
+const LIVE_SOURCE_BATCH_ITEMS: usize = 512;
+const LIVE_SOURCE_BATCH_BYTES: usize = 2 * 1024 * 1024;
+
 fn fetch_live_editor_sources(
     bridge: &BridgeServer,
     changes: &EditorChangeSet,
     indexes: &[usize],
     transaction_id: Option<&str>,
 ) -> Result<HashMap<usize, std::result::Result<LiveSource, String>>> {
-    let mut sources = HashMap::with_capacity(indexes.len());
-    for batch in indexes.chunks(64) {
-        let selectors = batch
-            .iter()
-            .map(|index| {
-                let change = &changes.source_changes[*index];
-                json!({
-                    "index": index,
-                    "pathSegments": &change.path_segments,
-                    "pathOrdinals": &change.path_ordinals,
+    let mut batches = Vec::<&[usize]>::new();
+    let mut batch_start = 0;
+    let mut batch_bytes = 0;
+    for (position, index) in indexes.iter().enumerate() {
+        let bytes = changes.source_changes[*index]
+            .source
+            .as_ref()
+            .map_or(0, String::len);
+        if position > batch_start
+            && (position - batch_start == LIVE_SOURCE_BATCH_ITEMS
+                || batch_bytes + bytes > LIVE_SOURCE_BATCH_BYTES)
+        {
+            batches.push(&indexes[batch_start..position]);
+            batch_start = position;
+            batch_bytes = 0;
+        }
+        batch_bytes += bytes;
+    }
+    if batch_start < indexes.len() {
+        batches.push(&indexes[batch_start..]);
+    }
+    let request_lease = bridge.active_request_lease();
+    let workers = bridge.channel_count().clamp(1, batches.len().max(1));
+    let fetched = rayon::ThreadPoolBuilder::new()
+        .num_threads(workers)
+        .build()
+        .context("Failed to start live source readers")?
+        .install(|| {
+            batches
+                .par_iter()
+                .map(|batch| {
+                    let _lease = request_lease
+                        .as_ref()
+                        .map(|lease| bridge.inherit_request_lease(Arc::clone(lease)))
+                        .transpose()?;
+                    fetch_live_source_batch(bridge, changes, batch, transaction_id)
                 })
+                .collect::<Result<Vec<_>>>()
+        })?;
+    let mut sources = HashMap::with_capacity(indexes.len());
+    for batch in fetched {
+        sources.extend(batch);
+    }
+    Ok(sources)
+}
+
+fn fetch_live_source_batch(
+    bridge: &BridgeServer,
+    changes: &EditorChangeSet,
+    batch: &[usize],
+    transaction_id: Option<&str>,
+) -> Result<HashMap<usize, std::result::Result<LiveSource, String>>> {
+    let selectors = batch
+        .iter()
+        .map(|index| {
+            let change = &changes.source_changes[*index];
+            json!({
+                "index": index,
+                "pathSegments": &change.path_segments,
+                "pathOrdinals": &change.path_ordinals,
             })
-            .collect::<Vec<_>>();
-        let response = bridge
-            .call(
-                "getLiveSourceBatch",
-                json!({ "selectors": selectors, "transactionId": transaction_id }),
-            )
-            .and_then(|value| {
-                serde_json::from_value::<LiveSourceBatch>(value)
-                    .context("Studio returned an invalid live source batch")
-            })?;
-        let batch_indexes = batch.iter().copied().collect::<HashSet<_>>();
-        for row in response.rows {
-            if !batch_indexes.contains(&row.index) || sources.contains_key(&row.index) {
-                continue;
-            }
-            let value = match (row.source, row.error) {
-                (Some(source), _) => Ok(LiveSource {
-                    source,
-                    class_name: row.class_name,
-                }),
-                (None, Some(error)) => Err(error),
-                (None, None) => Err("Studio did not return the script Source".to_string()),
-            };
-            sources.insert(row.index, value);
+        })
+        .collect::<Vec<_>>();
+    let response = match bridge.call(
+        "getLiveSourceBatch",
+        json!({ "selectors": selectors, "transactionId": transaction_id }),
+    ) {
+        Err(error)
+            if batch.len() > 1 && format!("{error:#}").contains("exceeds safe size limit") =>
+        {
+            let (left, right) = batch.split_at(batch.len() / 2);
+            let mut sources = fetch_live_source_batch(bridge, changes, left, transaction_id)?;
+            sources.extend(fetch_live_source_batch(
+                bridge,
+                changes,
+                right,
+                transaction_id,
+            )?);
+            return Ok(sources);
         }
-        for index in batch {
-            sources
-                .entry(*index)
-                .or_insert_with(|| Err("Studio did not return the script Source".to_string()));
+        response => response.and_then(|value| {
+            serde_json::from_value::<LiveSourceBatch>(value)
+                .context("Studio returned an invalid live source batch")
+        })?,
+    };
+    let batch_indexes = batch.iter().copied().collect::<HashSet<_>>();
+    let mut sources = HashMap::with_capacity(batch.len());
+    for row in response.rows {
+        if !batch_indexes.contains(&row.index) || sources.contains_key(&row.index) {
+            continue;
         }
+        let value = match (row.source, row.error) {
+            (Some(source), _) => Ok(LiveSource {
+                source,
+                class_name: row.class_name,
+            }),
+            (None, Some(error)) => Err(error),
+            (None, None) => Err("Studio did not return the script Source".to_string()),
+        };
+        sources.insert(row.index, value);
+    }
+    for index in batch {
+        sources
+            .entry(*index)
+            .or_insert_with(|| Err("Studio did not return the script Source".to_string()));
     }
     Ok(sources)
 }
@@ -3170,6 +3239,22 @@ fn drop_unchanged_source_changes(
     if unchanged.is_empty() {
         return Ok(0);
     }
+    // History keeps a script's previous Source only when the push changes it,
+    // so these entries would fetch the same live sources again for nothing.
+    let unchanged_keys = unchanged
+        .iter()
+        .map(|index| {
+            let change = &changes.source_changes[*index];
+            (change.service.clone(), editor_source_key(change))
+        })
+        .collect::<HashSet<_>>();
+    changes.history_entries.retain(|entry| {
+        entry.settings_before.is_some()
+            || !entry
+                .source_key
+                .as_ref()
+                .is_some_and(|key| unchanged_keys.contains(&(entry.service.clone(), key.clone())))
+    });
     let mut index = 0;
     changes.source_changes.retain(|_| {
         let keep = !unchanged.contains(&index);
@@ -3939,13 +4024,11 @@ fn load_editor_service_document(
     Ok(())
 }
 
-fn unique_editor_changed_path(
-    project_root: &Path,
+fn unique_editor_canonical_path(
     src_root: &Path,
-    changed_path: &Path,
+    absolute_path: PathBuf,
     seen_paths: &mut HashSet<String>,
 ) -> Option<(PathBuf, String)> {
-    let absolute_path = canonical_editor_changed_path(project_root, changed_path);
     if !seen_paths.insert(path_key(&absolute_path)) {
         return None;
     }
@@ -3987,9 +4070,31 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
     }
     let enforced_changed_paths =
         apply_link_enforcement_to_changed_paths(project_root, link_enforcement, changed_paths)?;
-    for changed_path in enforced_changed_paths {
+    // Each path needs a canonical form, its metadata and, for scripts, its
+    // contents. Those file system calls dominate a large push, so they run in
+    // parallel before the ordered pass below.
+    let inspected_paths = enforced_changed_paths
+        .par_iter()
+        .map(|changed_path| {
+            let absolute_path = canonical_editor_changed_path(project_root, changed_path);
+            let metadata = fs::metadata(&absolute_path).ok();
+            let source = metadata
+                .as_ref()
+                .is_some_and(std::fs::Metadata::is_file)
+                .then(|| {
+                    absolute_path
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| matches!(extension, "lua" | "luau"))
+                        .then(|| fs::read_to_string(&absolute_path))
+                })
+                .flatten();
+            (absolute_path, metadata, source)
+        })
+        .collect::<Vec<_>>();
+    for (absolute_path, metadata, mut prefetched_source) in inspected_paths {
         let Some((absolute_path, service)) =
-            unique_editor_changed_path(project_root, src_root, &changed_path, &mut seen_paths)
+            unique_editor_canonical_path(src_root, absolute_path, &mut seen_paths)
         else {
             continue;
         };
@@ -4011,7 +4116,7 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
             continue;
         }
 
-        if absolute_path.is_dir()
+        if metadata.as_ref().is_some_and(std::fs::Metadata::is_dir)
             && let Some(document) = documents.get(&service).and_then(Option::as_ref)
             && let Some(target) = editor_directory_target(
                 document,
@@ -4059,7 +4164,6 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
                 )
             });
 
-        let metadata = fs::metadata(&absolute_path).ok();
         let exists_as_file = metadata.as_ref().is_some_and(std::fs::Metadata::is_file);
         let inferred_spec = infer_editor_source_path_spec(src_root, &service, &absolute_path);
         let protected_path = mapped_target
@@ -4270,7 +4374,9 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
 
         let source = if exists_as_file {
             Some(
-                fs::read_to_string(&absolute_path)
+                prefetched_source
+                    .take()
+                    .unwrap_or_else(|| fs::read_to_string(&absolute_path))
                     .with_context(|| format!("Failed to read {}", absolute_path.display()))?,
             )
         } else {
