@@ -1,6 +1,6 @@
 {
   "name": "renium-relay",
-  "version": "0.3.15",
+  "version": "0.4.5",
   "private": true,
   "description": "Cloudflare Worker that hosts Renium collaboration rooms",
   "type": "module",
