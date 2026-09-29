@@ -191,7 +191,7 @@ pub(crate) fn rbx_dom_instance_path_parts(
     (segments, ordinals)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RbxPlaceFormat {
     Binary,
     Xml,
@@ -234,11 +234,27 @@ impl RbxPlaceFormat {
         self.read_with_defaults(path, true)
     }
 
+    /// The format the file's own content declares, when it declares one. A
+    /// place saved as XML under an .rbxl name, or the reverse, still opens
+    /// in Studio, which reads the content rather than the name.
+    pub(crate) fn sniff(bytes: &[u8]) -> Option<Self> {
+        if bytes.starts_with(b"<roblox!") {
+            return Some(Self::Binary);
+        }
+        let text = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+        let head = String::from_utf8_lossy(&text[..text.len().min(256)]);
+        head.trim_start().starts_with('<').then_some(Self::Xml)
+    }
+
     fn read_with_defaults(self, path: &Path, elide_defaults: bool) -> Result<RbxWeakDom> {
         let input =
             File::open(path).with_context(|| format!("Failed to read {}", path.display()))?;
-        let reader = BufReader::new(input);
-        match self {
+        let mut reader = BufReader::new(input);
+        let format = std::io::BufRead::fill_buf(&mut reader)
+            .ok()
+            .and_then(Self::sniff)
+            .unwrap_or(self);
+        match format {
             Self::Binary => rbx_binary::Deserializer::new()
                 .elide_defaults(elide_defaults)
                 .deserialize(reader)
