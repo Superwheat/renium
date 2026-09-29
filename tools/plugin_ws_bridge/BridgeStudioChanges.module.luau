@@ -538,6 +538,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	-- Native receipts already retain initial parent identities. Materialize a
 	-- separate baseline only when that object actually receives a Parent event.
 	local nativeParentReceipts = {}
+	local incomingNotes: { [Instance]: { [string]: string } } = {}
 	local function nativeInitialParent(instance: Instance): Instance?
 		local serviceName = state.connectionServiceByInstance[instance]
 		for index = #nativeParentReceipts, 1, -1 do
@@ -994,6 +995,14 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				local path = table.concat(record.pathSegments or { record.instance.Name }, ".")
 				local origin = if journal.detachedInstances[record.instance] then "detached original"
 					else if nativeInitialParent(record.instance) then "native incoming" else "live"
+				local notes = incomingNotes[record.instance]
+				if notes ~= nil then
+					for name in pairs(record.properties) do
+						if notes[name] ~= nil then
+							fields[#fields + 1] = `{name}[{notes[name]}]`
+						end
+					end
+				end
 				return `{path} ({table.concat(fields, ", ")}; {origin})`
 			end
 		end
@@ -1667,12 +1676,6 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		journalValueCaptured: boolean?,
 		journalValue: any
 	): boolean
-		-- While a transaction holds a natively inserted tree, the engine still
-		-- settles that tree (constraint attachments, pivots) and reports the
-		-- writes as property changes. They belong to the import, not to Studio.
-		if state.changeJournal ~= nil and nativeIncomingTree(instance) then
-			return true
-		end
 		local pathSegments, pathOrdinals = pathSegmentsAndOrdinalsForInstance(instance)
 		if pathSegments == nil or pathOrdinals == nil or #pathSegments == 0 or pathSegments[1] ~= serviceName then
 			-- Structural events own removals and cross-service moves. Late property
@@ -2477,6 +2480,26 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			previous = propertyValueFingerprint(instance, readName or propertyName,
 				if baseline == NIL_PROPERTY_BASELINE then nil else baseline)
 		end
+		-- A natively inserted tree settles its own references after insertion:
+		-- the engine relinks a constraint's attachments to the objects that end
+		-- up in the tree and reports each relink as a change. A reference that
+		-- now points inside the tree, and was empty or a reference before, is
+		-- that initialization, not an edit.
+		if previous ~= fingerprint and #nativeParentReceipts > 0 and nativeIncomingTree(instance) then
+			local valueInTree = typeof(value) == "Instance" and nativeIncomingTree(value)
+			local previousReference = previous == nil
+				or previous == propertyValueFingerprint(instance, readName or propertyName, nil)
+				or string.sub(previous, 1, 9) == "Instance:"
+			local notes = incomingNotes[instance]
+			if notes == nil then
+				notes = {}
+				incomingNotes[instance] = notes
+			end
+			notes[propertyName] = `previous={tostring(previous)} now={fingerprint} type={typeof(value)} inTree={tostring(valueInTree)}`
+			if valueInTree and previousReference then
+				return false, directOk, directValue, fingerprint, valueCaptured, value, readName
+			end
+		end
 		return previous == nil or previous ~= fingerprint, directOk, directValue, fingerprint, valueCaptured, value, readName
 	end
 
@@ -2657,6 +2680,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			end
 		end
 		table.clear(nativeParentReceipts)
+		table.clear(incomingNotes)
 	end
 
 	local function prepareNativeAttributeRelay(services: { string })

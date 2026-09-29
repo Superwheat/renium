@@ -1183,6 +1183,17 @@ fn os_input_preferred() -> bool {
     cfg!(windows) && std::env::var_os("RENIUM_INPUT_OS").is_some_and(|value| value != "0")
 }
 
+/// Copies the plugin's note that a pointer event was delivered through a
+/// hidden system element, where a player could not have clicked.
+fn note_system_ui(result: &mut Value, response: &Value) {
+    if let Some(through) = response
+        .get("throughSystemUi")
+        .filter(|value| !value.is_null())
+    {
+        result["throughSystemUi"] = through.clone();
+    }
+}
+
 fn send_virtual_input(
     bridge: &BridgeServer,
     player: Option<&str>,
@@ -1430,13 +1441,14 @@ pub(crate) fn press_result(args: &PressArgs, bridge: &BridgeServer) -> Result<Va
             .get("id")
             .and_then(Value::as_str)
             .context("The target GuiButton has no stable id")?;
-        send_virtual_input(
+        let response = send_virtual_input(
             bridge,
             player,
             virtual_click_actions(x.round() as i32, y.round() as i32, false, args.hold, false),
             Some(id),
         )?;
         result["inputMethod"] = json!("virtual");
+        note_system_ui(&mut result, &response);
         return Ok(result);
     }
     #[cfg(windows)]
@@ -1465,7 +1477,7 @@ pub(crate) fn press_result(args: &PressArgs, bridge: &BridgeServer) -> Result<Va
         result["window"] = json!(window.label);
         return Ok(result);
     }
-    send_virtual_input(
+    let response = send_virtual_input(
         bridge,
         player,
         virtual_click_actions(
@@ -1478,6 +1490,7 @@ pub(crate) fn press_result(args: &PressArgs, bridge: &BridgeServer) -> Result<Va
         None,
     )?;
     result["inputMethod"] = json!("virtual");
+    note_system_ui(&mut result, &response);
     Ok(result)
 }
 
@@ -1509,13 +1522,14 @@ pub(crate) fn click_result(args: &ClickArgs, bridge: &BridgeServer) -> Result<Va
         result["window"] = json!(window.label);
         return Ok(result);
     }
-    send_virtual_input(
+    let response = send_virtual_input(
         bridge,
         player,
         virtual_click_actions(args.x, args.y, args.right, args.hold, true),
         None,
     )?;
     result["inputMethod"] = json!("virtual");
+    note_system_ui(&mut result, &response);
     Ok(result)
 }
 

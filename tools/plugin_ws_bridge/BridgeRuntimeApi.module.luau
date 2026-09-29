@@ -1525,18 +1525,75 @@ updateMouse()
 			end
 			coreGuiStates = nil
 		end
-		local function sendPointer(send: () -> ())
+		local CoreGui = game:GetService("CoreGui")
+		local hiddenSystemUi = {}
+		local throughSystemUi = {}
+		-- Some system elements stay hittable with every overlay off. Hide the
+		-- elements under the point one at a time until the event passes, keep
+		-- them hidden until the batch ends, and report it: a player could not
+		-- have clicked there. The engine reserves the Roblox menu button's own
+		-- corner; nothing under it can be reached.
+		local function sendThroughSystemUi(position: Vector2, send: () -> ()): string?
+			local okList, objects = pcall(CoreGui.GetGuiObjectsAtPosition, CoreGui, position.X, position.Y)
+			if not okList or type(objects) ~= "table" then
+				return nil
+			end
+			local hidden = {}
+			for _, object in objects do
+				if object:IsA("GuiObject") and object.Visible then
+					local okHide = pcall(function()
+						object.Visible = false
+					end)
+					if okHide then
+						hidden[#hidden + 1] = object
+						task.wait()
+						if pcall(send) then
+							for _, element in hidden do
+								hiddenSystemUi[#hiddenSystemUi + 1] = element
+							end
+							return object:GetFullName()
+						end
+					end
+				end
+			end
+			for _, element in hidden do
+				pcall(function()
+					element.Visible = true
+				end)
+			end
+			return nil
+		end
+		local function restoreSystemUi()
+			for _, object in hiddenSystemUi do
+				pcall(function()
+					object.Visible = true
+				end)
+			end
+			table.clear(hiddenSystemUi)
+		end
+		local function sendPointer(position: Vector2, send: () -> ())
 			local okSend, sendError = pcall(send)
 			if okSend then
 				return
 			end
-			if not string.find(tostring(sendError), "hits CoreGUI", 1, true) or not hideCoreGui() then
+			if not string.find(tostring(sendError), "hits CoreGUI", 1, true) then
 				error(sendError, 0)
 			end
-			send()
+			if hideCoreGui() then
+				local okRetry, retryError = pcall(send)
+				if okRetry then
+					return
+				end
+				sendError = retryError
+			end
+			local element = sendThroughSystemUi(position, send)
+			if element == nil then
+				error(`{tostring(sendError)} The engine reserves this point (the Roblox menu button); a player could not click there either.`, 0)
+			end
+			throughSystemUi[#throughSystemUi + 1] = { x = position.X, y = position.Y, hid = element }
 		end
 		local function sendMousePosition(position)
-			sendPointer(function()
+			sendPointer(position, function()
 				virtualInput:SendMousePosition(position)
 			end)
 		end
@@ -1545,7 +1602,7 @@ updateMouse()
 			heldKeys[keyCode] = if down then true else nil
 		end
 		local function sendMouseButton(position, button, down, repeatCount)
-			sendPointer(function()
+			sendPointer(position, function()
 				virtualInput:SendMouseButton(position, button, down, repeatCount)
 			end)
 			heldButtons[button] = if down then position else nil
@@ -1689,11 +1746,13 @@ updateMouse()
 				verifiedClicks = verifiedClicks,
 				activated = if activationId ~= "" then activationCount == 1 else nil,
 				clicked = if activationId ~= "" then clickCount == 1 else nil,
+				throughSystemUi = if #throughSystemUi > 0 then throughSystemUi else nil,
 			}
 		end, function(message)
 			return message
 		end)
 		restoreCoreGui()
+		restoreSystemUi()
 		if not ok or result.ok ~= true then
 			releaseHeldInput()
 		end

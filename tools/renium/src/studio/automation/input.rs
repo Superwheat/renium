@@ -10,7 +10,8 @@ use serde_json::{Value, json};
 #[cfg(windows)]
 use super::{client_viewport_size, input_delta, os_input_preferred, resolve_player_window};
 use super::{
-    ensure_plugin_api_ok, send_virtual_input, virtual_click_actions, wait_for_player_bridge,
+    ensure_plugin_api_ok, note_system_ui, send_virtual_input, virtual_click_actions,
+    wait_for_player_bridge,
 };
 use crate::studio::bridge::{BridgeServer, BridgeTarget};
 use crate::studio::input as input_inject;
@@ -110,14 +111,16 @@ fn semantic_click_batch_result(
     let Some(actions) = semantic_click_batch(request) else {
         return Ok(None);
     };
-    let result = send_virtual_input(bridge, player, actions, None)?;
-    Ok(Some(json!({
+    let response = send_virtual_input(bridge, player, actions, None)?;
+    let mut result = json!({
         "ok": true,
         "action": "input",
         "actions": request.actions.len(),
-        "verifiedClicks": result.get("verifiedClicks").cloned().unwrap_or(Value::Null),
+        "verifiedClicks": response.get("verifiedClicks").cloned().unwrap_or(Value::Null),
         "inputMethod": "virtual",
-    })))
+    });
+    note_system_ui(&mut result, &response);
+    Ok(Some(result))
 }
 
 fn action_position(
@@ -430,11 +433,13 @@ fn virtual_input_result(parameters: &Value, bridge: &BridgeServer) -> Result<Val
             }
         }
     }
-    send_virtual_input(bridge, player, commands, None)?;
-    Ok(json!({
+    let response = send_virtual_input(bridge, player, commands, None)?;
+    let mut result = json!({
         "ok": true,
         "action": "input",
         "actions": request.actions.len(),
         "inputMethod": "virtual",
-    }))
+    });
+    note_system_ui(&mut result, &response);
+    Ok(result)
 }

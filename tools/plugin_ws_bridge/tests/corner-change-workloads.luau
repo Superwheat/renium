@@ -1701,6 +1701,54 @@ do
 end
 print("Imported references: repeated notifications are no-ops; changed targets and cleared references remain journaled")
 do
+	local savedItemChanged = testGame.ItemChanged
+	testGame.ItemChanged = nil
+	local observer = trackerModule.create(trackerConfig, { ReplicatedStorage = true })
+	observer.configurePropertyCandidates({ BallSocketConstraint = { "Attachment0", "Attachment1" } })
+	observer.getState({ services = { "ReplicatedStorage" }, trackingGuardId = "settling" })
+	observer.beginChangeJournal("settling", { "ReplicatedStorage" })
+	observer.beginSuppress()
+	local socket = instance("BallSocketConstraint", "IncomingSocket")
+	function socket:IsA(class) return class == "BallSocketConstraint" or class == "Constraint" or class == "Instance" end
+	function socket:GetDebugId() return "incoming-socket" end
+	local anchor = instance("Attachment", "IncomingAttachment")
+	function anchor:GetDebugId() return "incoming-attachment" end
+	local relinked = instance("Attachment", "RelinkedAttachment")
+	function relinked:GetDebugId() return "relinked-attachment" end
+	socket.Attachment1 = anchor
+	observer.beginNativeImportObservations("settling")
+	socket.Parent = storage
+	table.insert(storage.children, socket)
+	storage.DescendantAdded:Fire(socket)
+	anchor.Parent = socket
+	table.insert(socket.children, anchor)
+	storage.DescendantAdded:Fire(anchor)
+	relinked.Parent = socket
+	table.insert(socket.children, relinked)
+	storage.DescendantAdded:Fire(relinked)
+	local generation = observer.serviceGeneration("ReplicatedStorage")
+	socket.Attachment0 = anchor
+	socket.Changed:Fire("Attachment0")
+	socket.Attachment1 = relinked
+	socket.Changed:Fire("Attachment1")
+	assert(observer.serviceGeneration("ReplicatedStorage") == generation,
+		"A reference the engine resolves or relinks inside an imported tree is initialization, not an edit")
+	socket.Attachment1 = sibling
+	socket.Changed:Fire("Attachment1")
+	observer.finishNativeImportObservations("settling", { ["incoming-socket"] = "BallSocketConstraint", ["incoming-attachment"] = "Attachment", ["relinked-attachment"] = "Attachment" })
+	local records = observer.finishChangeJournal("settling")
+	assert(#records == 1 and records[1].properties.Attachment0 == nil
+		and records[1].properties.Attachment1.value == sibling,
+		"An edit that points an imported reference outside the tree is still journaled")
+	observer.endSuppress(0)
+	observer.stop()
+	table.remove(socket.children, table.find(socket.children, relinked))
+	table.remove(socket.children, table.find(socket.children, anchor))
+	table.remove(storage.children, table.find(storage.children, socket))
+	testGame.ItemChanged = savedItemChanged
+end
+print("Imported references: resolutions inside the tree are initialization; retargeting outside the tree is journaled")
+do
 	local fresh = instance("SpringConstraint", "ExistingConstraint")
 	function fresh:IsA(class) return class == "SpringConstraint" or class == "Constraint" or class == "Instance" end
 	fresh.Radius, fresh.Thickness, fresh.FreeLength = 0.7, 0.13, 3.7
