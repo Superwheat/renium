@@ -1,8 +1,8 @@
 <!-- renium-version: 0.3.15 -->
 # Renium for agents
 
-Use `rbx` from the place's project folder. Renium handles connections and the daemon.
-If PATH is stale: `%USERPROFILE%\.renium\bin\rbx.exe` on Windows, else `~/.renium/bin/rbx`.
+Use `rbx` from the place's project folder. Renium handles the daemon.
+PATH stale? `%USERPROFILE%\.renium\bin\rbx.exe` (Windows) or `~/.renium/bin/rbx`.
 
 ## Choose the smallest sufficient check
 
@@ -33,7 +33,7 @@ When Play is needed, reuse a suitable session, test related changes together wit
 | Studio lifecycle and place management | `RENIUM/advanced.md` |
 | Installed plugins and their commands | `RENIUM/plugins.md` |
 
-Read only the guides the task needs, once per session, before using their commands; reread after `rbx upd` or when a command says so.
+Read only the guides the task needs, once per session, before using their commands; reread after `rbx upd` or when told.
 
 ## Targeting and edits
 
@@ -51,7 +51,7 @@ Keep query results small (counts, slices, specific fields); write large captures
 When a check exposes a defect in what you were asked to deliver, fix and verify it rather than reporting it. Never hand the user steps you could run yourself; do them, or offer to when it is their call.
 After cleanup, one prefix search is enough; `storeRemoved: true` needs no follow-up query.
 
-Renium marks affected linked packages Changed before edits. Report `autoDesyncedPackages`, including packages named in a failed edit. Publishing needs user authorization; it is not part of syncing. Say synced, not saved: with `teamCreate: true` in `rbx status` Studio saves instances itself, but script edits stay drafts until the user commits them; otherwise only the user saves or publishes.
+Renium marks affected linked packages Changed before edits. Report `autoDesyncedPackages`, including packages named in a failed edit. Publishing needs user authorization; it is not part of syncing. Say synced, not saved: with `teamCreate: true` in `rbx status` Studio saves instances, but scripts stay drafts until the user commits them; otherwise only the user saves or publishes.
 
 ## Tools and boundaries
 
