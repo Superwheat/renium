@@ -822,6 +822,9 @@ fn ensure_process_identity(process: &OwnedHandle, expected: &str) -> Result<()> 
     {
         return Err(last_error("GetProcessTimes failed"));
     }
+    if exit.dwLowDateTime != 0 || exit.dwHighDateTime != 0 {
+        bail!("Studio process exited during profile operation");
+    }
     let actual = ((u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime))
         .to_string();
     if actual != expected {

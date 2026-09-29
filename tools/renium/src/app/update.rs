@@ -413,7 +413,9 @@ pub(crate) fn process_start_identity(pid: u32) -> Option<String> {
         let mut user = creation;
         let ok = GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) != 0;
         CloseHandle(handle);
-        if !ok {
+        // A process that exited stays openable while any handle to it is held;
+        // it is not running, so it has no identity.
+        if !ok || exit.dwLowDateTime != 0 || exit.dwHighDateTime != 0 {
             return None;
         }
         Some(
@@ -3260,6 +3262,17 @@ fn group_editor_installs_by_platform(
 #[cfg(test)]
 mod result_tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn an_exited_process_held_open_by_a_handle_has_no_identity() {
+        let mut child = Command::new("cmd")
+            .args(["/c", "exit 0"])
+            .spawn()
+            .expect("cmd spawns");
+        child.wait().expect("cmd exits");
+        assert_eq!(process_start_identity(child.id()), None);
+    }
 
     #[test]
     fn update_results_use_exact_paths_and_recover_legacy_helpers_once() {
