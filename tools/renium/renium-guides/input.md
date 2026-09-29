@@ -8,7 +8,7 @@ rbx pr "Shop.BuyButton" -p 1
 rbx ty "hello" --path "Chat.Box" --enter -p 1
 rbx clk 450 323 -p 1
 rbx ky E -p 1
-rbx ky W --hold-ms 700 -p 1
+rbx ky W --hold-ms 700 -p 1        # holds up to 60 s
 rbx go "Workspace.Shop.Door" -p 1
 rbx go --pos "745,40,510" -p 1
 rbx wait "workspace:GetAttribute('Ready') ~= nil" -c -t 20

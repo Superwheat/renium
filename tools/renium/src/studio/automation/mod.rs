@@ -1539,44 +1539,50 @@ pub(crate) fn key_result(args: &KeyArgs, bridge: &BridgeServer) -> Result<Value>
         wait_for_player_bridge(bridge, player, args.bridge.wait_seconds)?;
     }
     let key = input_inject::resolve_key(&args.key)?;
-    let hold_ms = args.hold_ms.clamp(10, 2000);
-    let mut result = json!({
-        "ok": true,
-        "action": "key",
-        "key": key.name,
-        "holdMs": hold_ms,
-    });
     if key.name == "Escape" {
         bail!(
             "Escape is reserved by Roblox CoreGui and cannot be injected; use the game's on-screen control or an alternate key"
         );
     }
     #[cfg(windows)]
-    {
+    if os_input_preferred() {
+        let hold_ms = args.hold_ms.clamp(10, 2000);
         let (window, _, _) =
             resolve_player_window(bridge, player, client_viewport_size(bridge, player))?;
         let _shield = input_inject::input_shield(&window)?;
         input_inject::post_key(&window, &key, hold_ms)?;
-        result["inputMethod"] = json!("os");
-        result["window"] = json!(window.label);
-        Ok(result)
+        return Ok(json!({
+            "ok": true,
+            "action": "key",
+            "key": key.name,
+            "holdMs": hold_ms,
+            "inputMethod": "os",
+            "window": window.label,
+        }));
     }
-    #[cfg(not(windows))]
-    {
-        send_virtual_input(
-            bridge,
-            player,
-            vec![
-                json!({ "type": "key", "key": key.name, "down": true }),
-                json!({ "type": "wait", "ms": hold_ms }),
-                json!({ "type": "key", "key": key.name, "down": false }),
-            ],
-            None,
-        )?;
-        result["inputMethod"] = json!("virtual");
-        Ok(result)
+    let hold_ms = args.hold_ms.clamp(10, MAX_KEY_HOLD_MS);
+    let mut actions = vec![json!({ "type": "key", "key": key.name, "down": true })];
+    let mut remaining = hold_ms;
+    while remaining > 0 {
+        let step = remaining.min(MAX_VIRTUAL_WAIT_MS);
+        actions.push(json!({ "type": "wait", "ms": step }));
+        remaining -= step;
     }
+    actions.push(json!({ "type": "key", "key": key.name, "down": false }));
+    send_virtual_input(bridge, player, actions, None)?;
+    Ok(json!({
+        "ok": true,
+        "action": "key",
+        "key": key.name,
+        "holdMs": hold_ms,
+        "inputMethod": "virtual",
+    }))
 }
+
+/// A key can be held for a minute; the plugin runs each wait for at most
+/// ten seconds, so longer holds are several waits.
+const MAX_KEY_HOLD_MS: u64 = 60_000;
+const MAX_VIRTUAL_WAIT_MS: u64 = 10_000;
 
 pub(crate) fn ui_result(args: &UiArgs, bridge: &BridgeServer) -> Result<Value> {
     let player = args.player.as_deref();
@@ -1618,7 +1624,7 @@ pub(crate) fn type_result(args: &TypeArgs, bridge: &BridgeServer) -> Result<Valu
         wait_for_player_bridge(bridge, player, args.bridge.wait_seconds)?;
     }
     #[cfg(windows)]
-    {
+    if os_input_preferred() {
         let (pressed, click, viewport) = if let Some(path) = args.path.as_ref() {
             let (bounds, x, y) = gui_input_bounds(bridge, player, Some(path), None, path)?;
             if bounds.get("className").and_then(Value::as_str) != Some("TextBox") {
@@ -1653,7 +1659,7 @@ pub(crate) fn type_result(args: &TypeArgs, bridge: &BridgeServer) -> Result<Valu
             let enter = input_inject::resolve_key("Enter")?;
             input_inject::post_key(&window, &enter, 40)?;
         }
-        Ok(json!({
+        return Ok(json!({
             "ok": true,
             "action": "type",
             "chars": args.text.chars().count(),
@@ -1661,45 +1667,42 @@ pub(crate) fn type_result(args: &TypeArgs, bridge: &BridgeServer) -> Result<Valu
             "enter": args.enter,
             "inputMethod": "os",
             "window": window.label,
-        }))
+        }));
     }
-    #[cfg(not(windows))]
-    {
-        let mut pressed = Value::Null;
-        let mut actions = Vec::new();
-        if let Some(path) = args.path.as_ref() {
-            let (bounds, _, _) = gui_input_bounds(bridge, player, Some(path), None, path)?;
-            if bounds.get("className").and_then(Value::as_str) != Some("TextBox") {
-                bail!("{path} is not a TextBox");
-            }
-            pressed = bounds
-                .get("fullName")
-                .cloned()
-                .unwrap_or_else(|| Value::String(path.clone()));
-            actions.push(json!({
-                "type": "focus",
-                "id": bounds.get("id").context("The target TextBox has no stable id")?,
-            }));
+    let mut pressed = Value::Null;
+    let mut actions = Vec::new();
+    if let Some(path) = args.path.as_ref() {
+        let (bounds, _, _) = gui_input_bounds(bridge, player, Some(path), None, path)?;
+        if bounds.get("className").and_then(Value::as_str) != Some("TextBox") {
+            bail!("{path} is not a TextBox");
         }
-        actions.push(json!({ "type": "text", "text": args.text }));
-        if args.enter {
-            actions.extend([
-                json!({ "type": "wait", "ms": 0 }),
-                json!({ "type": "key", "key": "Return", "down": true }),
-                json!({ "type": "wait", "ms": 40 }),
-                json!({ "type": "key", "key": "Return", "down": false }),
-            ]);
-        }
-        send_virtual_input(bridge, player, actions, None)?;
-        Ok(json!({
-            "ok": true,
-            "action": "type",
-            "chars": args.text.chars().count(),
-            "focused": pressed,
-            "enter": args.enter,
-            "inputMethod": "virtual",
-        }))
+        pressed = bounds
+            .get("fullName")
+            .cloned()
+            .unwrap_or_else(|| Value::String(path.clone()));
+        actions.push(json!({
+            "type": "focus",
+            "id": bounds.get("id").context("The target TextBox has no stable id")?,
+        }));
     }
+    actions.push(json!({ "type": "text", "text": args.text }));
+    if args.enter {
+        actions.extend([
+            json!({ "type": "wait", "ms": 0 }),
+            json!({ "type": "key", "key": "Return", "down": true }),
+            json!({ "type": "wait", "ms": 40 }),
+            json!({ "type": "key", "key": "Return", "down": false }),
+        ]);
+    }
+    send_virtual_input(bridge, player, actions, None)?;
+    Ok(json!({
+        "ok": true,
+        "action": "type",
+        "chars": args.text.chars().count(),
+        "focused": pressed,
+        "enter": args.enter,
+        "inputMethod": "virtual",
+    }))
 }
 
 pub(crate) fn wait_until_result(args: &WaitUntilArgs, bridge: &BridgeServer) -> Result<Value> {

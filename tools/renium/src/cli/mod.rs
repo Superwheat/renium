@@ -1575,7 +1575,7 @@ pub(super) struct KeyArgs {
     )]
     pub(super) player: Option<String>,
     #[arg(
-        help = "Milliseconds to hold the key",
+        help = "Milliseconds to hold the key, up to 60000",
         long,
         value_name = "MS",
         default_value_t = 60
