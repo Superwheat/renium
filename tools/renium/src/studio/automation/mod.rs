@@ -1174,6 +1174,15 @@ fn resolve_client_capture_window(
     bail!("Studio screenshots are only supported on Windows and macOS")
 }
 
+/// Pointer input goes through the game's own virtual input: it moves the
+/// game's mouse, so hover, `Mouse.Target` and ClickDetector events follow,
+/// and the cursor and window focus stay untouched. RENIUM_INPUT_OS restores
+/// window-level injection on Windows.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn os_input_preferred() -> bool {
+    cfg!(windows) && std::env::var_os("RENIUM_INPUT_OS").is_some_and(|value| value != "0")
+}
+
 fn send_virtual_input(
     bridge: &BridgeServer,
     player: Option<&str>,
@@ -1431,7 +1440,7 @@ pub(crate) fn press_result(args: &PressArgs, bridge: &BridgeServer) -> Result<Va
         return Ok(result);
     }
     #[cfg(windows)]
-    {
+    if os_input_preferred() {
         let viewport = match (
             bounds.get("viewportWidth").and_then(Value::as_f64),
             bounds.get("viewportHeight").and_then(Value::as_f64),
@@ -1454,23 +1463,21 @@ pub(crate) fn press_result(args: &PressArgs, bridge: &BridgeServer) -> Result<Va
         )?;
         result["inputMethod"] = json!("os");
         result["window"] = json!(window.label);
+        return Ok(result);
     }
-    #[cfg(not(windows))]
-    {
-        send_virtual_input(
-            bridge,
-            player,
-            virtual_click_actions(
-                x.round() as i32,
-                y.round() as i32,
-                args.right,
-                args.hold,
-                true,
-            ),
-            None,
-        )?;
-        result["inputMethod"] = json!("virtual");
-    }
+    send_virtual_input(
+        bridge,
+        player,
+        virtual_click_actions(
+            x.round() as i32,
+            y.round() as i32,
+            args.right,
+            args.hold,
+            true,
+        ),
+        None,
+    )?;
+    result["inputMethod"] = json!("virtual");
     Ok(result)
 }
 
@@ -1486,7 +1493,7 @@ pub(crate) fn click_result(args: &ClickArgs, bridge: &BridgeServer) -> Result<Va
         "viewportY": args.y,
     });
     #[cfg(windows)]
-    {
+    if os_input_preferred() {
         let (window, offset_x, offset_y) =
             resolve_player_window(bridge, player, client_viewport_size(bridge, player))?;
         let _shield = input_inject::input_shield(&window)?;
@@ -1500,17 +1507,15 @@ pub(crate) fn click_result(args: &ClickArgs, bridge: &BridgeServer) -> Result<Va
         )?;
         result["inputMethod"] = json!("os");
         result["window"] = json!(window.label);
+        return Ok(result);
     }
-    #[cfg(not(windows))]
-    {
-        send_virtual_input(
-            bridge,
-            player,
-            virtual_click_actions(args.x, args.y, args.right, args.hold, true),
-            None,
-        )?;
-        result["inputMethod"] = json!("virtual");
-    }
+    send_virtual_input(
+        bridge,
+        player,
+        virtual_click_actions(args.x, args.y, args.right, args.hold, true),
+        None,
+    )?;
+    result["inputMethod"] = json!("virtual");
     Ok(result)
 }
 

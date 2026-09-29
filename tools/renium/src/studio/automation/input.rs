@@ -7,11 +7,12 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-#[cfg(not(windows))]
-use super::virtual_click_actions;
 #[cfg(windows)]
 use super::{client_viewport_size, input_delta, resolve_player_window};
-use super::{ensure_plugin_api_ok, send_virtual_input, wait_for_player_bridge};
+use super::{
+    ensure_plugin_api_ok, os_input_preferred, send_virtual_input, virtual_click_actions,
+    wait_for_player_bridge,
+};
 use crate::studio::bridge::{BridgeServer, BridgeTarget};
 use crate::studio::input as input_inject;
 
@@ -165,8 +166,16 @@ fn action_position(
     }
 }
 
-#[cfg(windows)]
 pub(crate) fn input_result(parameters: &Value, bridge: &BridgeServer) -> Result<Value> {
+    #[cfg(windows)]
+    if os_input_preferred() {
+        return os_input_result(parameters, bridge);
+    }
+    virtual_input_result(parameters, bridge)
+}
+
+#[cfg(windows)]
+fn os_input_result(parameters: &Value, bridge: &BridgeServer) -> Result<Value> {
     let request: InputRequest = serde_json::from_value(parameters.clone())?;
     if request.actions.is_empty() || request.actions.len() > 256 {
         bail!("input requires 1 through 256 actions");
@@ -319,8 +328,7 @@ pub(crate) fn input_result(parameters: &Value, bridge: &BridgeServer) -> Result<
     }))
 }
 
-#[cfg(not(windows))]
-pub(crate) fn input_result(parameters: &Value, bridge: &BridgeServer) -> Result<Value> {
+fn virtual_input_result(parameters: &Value, bridge: &BridgeServer) -> Result<Value> {
     let request: InputRequest = serde_json::from_value(parameters.clone())?;
     if request.actions.is_empty() || request.actions.len() > 256 {
         bail!("input requires 1 through 256 actions");

@@ -16,8 +16,8 @@ rbx wait "workspace:GetAttribute('Ready') ~= nil" -c -t 20
 
 Reuse paths from `ui`'s `p` field. Paths are relative to `PlayerGui`; its prefix is optional. `Name[n]` selects duplicates.
 
-`pr --world` needs an on-screen target; use `go` first. `go PATH` walks to the nearest point of the part's or model's bounding box and stops within eight studs; `--pos` targets an exact point. Both return the remaining distance. Injected clicks do not fire `ClickDetector`; use a ProximityPrompt or game input. Injected mouse moves fire no hover events (`MouseEnter`, `MouseMoved`); check a hover style by setting its state directly.
+`pr --world` needs an on-screen target; use `go` first. `go PATH` walks to the nearest point of the part's or model's bounding box and stops within eight studs; `--pos` targets an exact point. Both return the remaining distance. `inp move X Y` moves the game's mouse: hover events fire, `Mouse.Target` follows it, and a following click reaches `ClickDetector`s. Positions over the top bar are refused.
 
-Input targets one Play window without moving the cursor or taking focus. The orange shield blocks interfering physical input. Escape belongs to CoreGui; use another key or an on-screen control.
+Input goes through the game's own input pipeline: the cursor, window focus and physical input stay untouched. Escape belongs to CoreGui; use another key or an on-screen control.
 
 For several ordered actions, use `rbx inp -p 1 click "Shop.BuyButton" wait 100 key E`.
