@@ -410,6 +410,7 @@ pub(crate) struct FetchRequest {
     pub(crate) name: Option<String>,
     pub(crate) output: Option<PathBuf>,
     pub(crate) project_root: Option<PathBuf>,
+    pub(crate) version: Option<u64>,
 }
 
 fn file_name_for(name: &str, place_id: i64) -> String {
@@ -485,17 +486,19 @@ pub(crate) fn fetch_command(
     request: FetchRequest,
 ) -> Result<Value> {
     let (place_id, name) = resolve_place(key_env, identity, request.name.as_deref())?;
-    let delivery = match execute_one(
-        identity,
-        key_env,
-        oauth_env,
-        false,
-        json!({
+    let delivery_request = match request.version {
+        Some(version) => json!({
+            "method": "GET",
+            "path": "/asset-delivery-api/v1/assetId/{assetId}/version/{versionNumber}",
+            "pathParams": { "assetId": place_id, "versionNumber": version },
+        }),
+        None => json!({
             "method": "GET",
             "path": "/asset-delivery-api/v1/assetId/{assetId}",
             "pathParams": { "assetId": place_id },
         }),
-    ) {
+    };
+    let delivery = match execute_one(identity, key_env, oauth_env, false, delivery_request) {
         Ok(delivery) => delivery,
         Err(failure) => {
             let status = failure
@@ -534,10 +537,17 @@ pub(crate) fn fetch_command(
                 .unwrap_or_default()
         );
     };
+    let file_name = match request.version {
+        Some(version) => {
+            let base = file_name_for(&name, place_id);
+            format!("{}-v{version}.rbxl", base.trim_end_matches(".rbxl"))
+        }
+        None => file_name_for(&name, place_id),
+    };
     let output = match (request.output, request.project_root.as_deref()) {
         (Some(output), _) => output,
-        (None, Some(root)) => root.join(file_name_for(&name, place_id)),
-        (None, None) => PathBuf::from(file_name_for(&name, place_id)),
+        (None, Some(root)) => root.join(&file_name),
+        (None, None) => PathBuf::from(&file_name),
     };
     if let Some(parent) = output
         .parent()
@@ -555,6 +565,9 @@ pub(crate) fn fetch_command(
         "file": output,
         "bytes": bytes,
     });
+    if let Some(version) = request.version {
+        result["version"] = json!(version);
+    }
     if let Some(root) = request.project_root {
         import_into(&root, &output)?;
         result["projectRoot"] = json!(root);

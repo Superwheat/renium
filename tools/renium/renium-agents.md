@@ -42,7 +42,7 @@ A place folder selects its target. At the experience root, add `--place <alias|p
 Studio commands also accept `gameId:placeId` or a Studio window name.
 
 Edit scripts as files; use Renium for generated `.renium` stores and sourcemaps.
-`f`/`bg`/`bb` read saved data; `q` searches a closed place; `v` inspects a model/place; `l` reads live Studio. For a full place comparison, use `cmp BEFORE --full` (optionally `--against AFTER`).
+`f`/`bg`/`bb` read saved data; `q` searches a closed place; `v` inspects a model/place; `l` reads live Studio; `oc fetch --version` gets an older saved place. For a full place comparison, use `cmp BEFORE --full` (optionally `--against AFTER`).
 
 Read an existing target once and reuse its ID; refresh IDs after a pull.
 Run mutations one at a time and inspect each result; if one fails, check the affected state before retrying.

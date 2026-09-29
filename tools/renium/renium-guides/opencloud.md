@@ -17,9 +17,11 @@ rbx oc games
 rbx oc games "Brainrot Town"
 rbx oc fetch "Brainrot Town" -r ./BrainrotTown
 rbx oc fetch --universe 8108639406 -o brainrot.rbxl
+rbx oc place history
+rbx oc fetch --version 940 -o old.rbxl
 ```
 
-`games` lists what the key can reach: the universes it is scoped to plus the public experiences of the key's user and groups; a name matches ignoring case, emoji and punctuation. `fetch` downloads the experience's root place and, with `-r DIR`, imports it into that project (creating it) so the files are ready to open with `rbx so`. Private experiences the key is not scoped to need `--universe ID` or `--place-id ID`.
+`games` lists what the key can reach: the universes it is scoped to plus the public experiences of the key's user and groups; a name matches ignoring case, emoji and punctuation. `fetch` downloads the experience's root place and, with `-r DIR`, imports it into that project (creating it) so the files are ready to open with `rbx so`. Private experiences the key is not scoped to need `--universe ID` or `--place-id ID`. Older versions of the bound place come from Roblox: `place history` lists its saved versions (newest first, with times and authors) and `fetch --version N` downloads one for `q`, `v` or `cmp`. Place files found elsewhere on the machine are not versions of the project unless the user says so.
 
 The project supplies universe/place IDs. Otherwise put `--universe ID` and `--place-id ID` before the resource.
 Public reads can explicitly use `--anonymous`; authenticated requests never fall back to anonymous access.

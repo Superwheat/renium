@@ -171,6 +171,12 @@ struct FetchArgs {
         help = "Import the place into this project folder, creating it when missing"
     )]
     project_root: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Download this saved version instead of the current one (see `rbx oc place history`)"
+    )]
+    version: Option<u64>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -303,6 +309,7 @@ pub(crate) fn run(args: OpenCloudArgs, project: Option<&Path>) -> Result<()> {
                     name: fetch.name,
                     output: fetch.output,
                     project_root: fetch.project_root,
+                    version: fetch.version,
                 },
             )?
         }
