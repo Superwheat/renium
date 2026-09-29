@@ -91,12 +91,13 @@ pub(crate) fn service_settings_paths(
     current: &ProjectSnapshot,
     scopes: &[PathBuf],
 ) -> Vec<PathBuf> {
+    let scopes = ScopeSet::new(scopes);
     let mut paths = baseline
         .entries
         .keys()
         .chain(current.entries.keys())
         .filter(|path| {
-            scopes.iter().any(|scope| path.starts_with(scope))
+            scopes.contains(path)
                 && path
                     .file_name()
                     .and_then(|name| name.to_str())

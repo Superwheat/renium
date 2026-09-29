@@ -136,12 +136,12 @@ pub(crate) fn push_staged_project(
             return Ok(());
         };
         let current = capture_snapshot(&project_root, &planned_paths)?;
-        let planned = planned_paths.iter().cloned().collect::<HashSet<_>>();
+        let planned = ScopeSet::new(&planned_paths);
         let expected = ProjectSnapshot {
             entries: expected_project
                 .entries
                 .iter()
-                .filter(|(path, _)| planned.iter().any(|scope| path.starts_with(scope)))
+                .filter(|(path, _)| planned.contains(path))
                 .map(|(path, entry)| (path.clone(), entry.clone()))
                 .collect(),
         };
@@ -1010,6 +1010,7 @@ pub(crate) fn move_escaping_instances_before_deletes(
 
 pub(crate) fn capture_snapshot(root: &Path, roots: &[PathBuf]) -> Result<ProjectSnapshot> {
     let mut entries = BTreeMap::new();
+    let mut files = Vec::new();
     for relative_root in roots {
         if derived_project_path(relative_root) {
             continue;
@@ -1033,7 +1034,7 @@ pub(crate) fn capture_snapshot(root: &Path, roots: &[PathBuf]) -> Result<Project
             continue;
         }
         if metadata.is_file() {
-            entries.insert(relative_root.clone(), SnapshotEntry::File(fs::read(&path)?));
+            files.push((relative_root.clone(), path));
             continue;
         }
         if !metadata.is_dir() {
@@ -1048,7 +1049,8 @@ pub(crate) fn capture_snapshot(root: &Path, roots: &[PathBuf]) -> Result<Project
             let value = if entry.file_type().is_dir() {
                 SnapshotEntry::Directory
             } else if entry.file_type().is_file() {
-                SnapshotEntry::File(fs::read(entry.path())?)
+                files.push((relative, entry.into_path()));
+                continue;
             } else if entry.file_type().is_symlink() {
                 SnapshotEntry::Symlink {
                     target: fs::read_link(entry.path())?,
@@ -1060,5 +1062,12 @@ pub(crate) fn capture_snapshot(root: &Path, roots: &[PathBuf]) -> Result<Project
             entries.insert(relative, value);
         }
     }
+    // Opening each file dominates, especially under antivirus scanning, so
+    // the reads run in parallel.
+    let contents = files
+        .into_par_iter()
+        .map(|(relative, path)| Ok((relative, SnapshotEntry::File(fs::read(path)?))))
+        .collect::<Result<Vec<_>>>()?;
+    entries.extend(contents);
     Ok(ProjectSnapshot { entries })
 }

@@ -1115,11 +1115,12 @@ fn record_pushed_baseline(
         return Ok(());
     }
     let scopes = pushed.iter().cloned().collect::<Vec<_>>();
+    let pushed_scopes = ScopeSet::new(&scopes);
     let pushed_content = ProjectSnapshot {
         entries: editor
             .entries
             .iter()
-            .filter(|(path, _)| scopes.iter().any(|scope| path.starts_with(scope)))
+            .filter(|(path, _)| pushed_scopes.contains(path))
             .map(|(path, entry)| (path.clone(), entry.clone()))
             .collect(),
     };

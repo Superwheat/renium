@@ -556,10 +556,9 @@ pub(crate) fn capture_changed_studio_services(
     let editor = capture_snapshot(&stage.project_root, stage.publish_paths())?;
     let stage = import_studio_services_into_stage(context, bridge, services, true, stage)?;
     let captured = capture_snapshot(&stage.project_root, &scopes)?;
+    let scope_set = ScopeSet::new(&scopes);
     let mut studio = baseline.clone();
-    studio
-        .entries
-        .retain(|path, _| !scopes.iter().any(|scope| path.starts_with(scope)));
+    studio.entries.retain(|path, _| !scope_set.contains(path));
     studio.entries.extend(captured.entries);
     let confirmed = read_studio_change_state(context, bridge)?;
     if !studio_states_share_epoch(context, initial_state, &confirmed) {
@@ -575,7 +574,7 @@ pub(crate) fn capture_changed_studio_services(
             .keys()
             .chain(editor.entries.keys())
             .filter(|path| editor.entries.get(*path) != current_editor.entries.get(*path))
-            .filter(|path| !scopes.iter().any(|scope| path.starts_with(scope)))
+            .filter(|path| !scope_set.contains(path))
             .cloned()
             .collect::<HashSet<_>>();
         apply_snapshot_paths(&stage.project_root, &refreshed, &current_editor)?;

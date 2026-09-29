@@ -40,7 +40,9 @@ const MAX_SETTINGS_COLLECTION_ITEMS: usize = 500_000;
 const MAX_SETTINGS_STRING_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SETTINGS_VALUE_DEPTH: usize = 128;
 const MAX_SETTINGS_HIERARCHY_DEPTH: usize = 512;
-const MAX_CACHED_SETTINGS_DOCUMENTS: usize = 2;
+// One document per service store; memory is bounded by the instance and byte
+// limits below, so a project's whole set of small stores stays cached.
+const MAX_CACHED_SETTINGS_DOCUMENTS: usize = 64;
 const MAX_CACHED_SETTINGS_INSTANCES: usize = 80_000;
 const MAX_CACHED_SETTINGS_BYTES: usize = 8 * 1024 * 1024;
 

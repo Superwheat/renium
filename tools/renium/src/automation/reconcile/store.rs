@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{ProjectSnapshot, SnapshotEntry};
+use super::{ProjectSnapshot, ScopeSet, SnapshotEntry};
 use crate::system::files::{atomic_write_file, sha256_hex};
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,9 +98,8 @@ impl StoredSnapshot {
         key: &str,
         scopes: &[PathBuf],
     ) -> Result<ProjectSnapshot> {
-        self.load_selected(root, key, |path| {
-            scopes.iter().any(|scope| path.starts_with(scope))
-        })
+        let scopes = ScopeSet::new(scopes);
+        self.load_selected(root, key, |path| scopes.contains(path))
     }
 
     pub(super) fn replace_scopes(
@@ -110,8 +109,8 @@ impl StoredSnapshot {
         scopes: &[PathBuf],
         current: &ProjectSnapshot,
     ) -> Result<()> {
-        self.entries
-            .retain(|path, _| !scopes.iter().any(|scope| path.starts_with(scope)));
+        let scope_set = ScopeSet::new(scopes);
+        self.entries.retain(|path, _| !scope_set.contains(path));
         self.entries.extend(store_entries(
             &pack_directory(root, key),
             current.entries.iter(),

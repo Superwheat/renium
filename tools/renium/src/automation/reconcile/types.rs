@@ -12,6 +12,20 @@ pub(crate) struct ProjectSnapshot {
     pub(crate) entries: BTreeMap<PathBuf, SnapshotEntry>,
 }
 
+/// Paths inside any of a set of scopes. Looking up each ancestor keeps a push
+/// that names every file linear instead of scanning all scopes per path.
+pub(crate) struct ScopeSet(HashSet<PathBuf>);
+
+impl ScopeSet {
+    pub(crate) fn new<'a>(scopes: impl IntoIterator<Item = &'a PathBuf>) -> Self {
+        Self(scopes.into_iter().cloned().collect())
+    }
+
+    pub(crate) fn contains(&self, path: &Path) -> bool {
+        path.ancestors().any(|ancestor| self.0.contains(ancestor))
+    }
+}
+
 #[cfg(any(windows, target_os = "macos"))]
 pub(crate) struct VerifiedFullPush {
     pub(crate) connections: Vec<usize>,
