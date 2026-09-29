@@ -246,6 +246,35 @@ pub(crate) fn studio_open_failure(pid: u32, started_unix: Option<u64>) -> Option
     open_failure_in_log(&String::from_utf8_lossy(&bytes))
 }
 
+/// Whether this Studio's main thread hung while signing in at launch, with
+/// the number of Studio instances running at that launch. Studio 0.741 does
+/// this for every window opened while another window is running: the first
+/// window keeps the sign-in mutex locked, so the next one waits forever.
+pub(crate) fn studio_login_hang(pid: u32, started_unix: Option<u64>) -> Option<u32> {
+    let bytes = std::fs::read(studio_log_for_process(pid, started_unix)?).ok()?;
+    login_hang_in_log(&String::from_utf8_lossy(&bytes))
+}
+
+fn login_hang_in_log(text: &str) -> Option<u32> {
+    let mut instances = 1;
+    let mut signing_in = false;
+    let mut hung = false;
+    for line in text.lines() {
+        if let Some((_, count)) = line.split_once("Running instance count at launch ") {
+            instances = count.trim().parse().unwrap_or(1);
+        } else if line.contains("[FLog::StudioKeyEvents] login (automatic) [start]") {
+            signing_in = true;
+        } else if line.contains("[FLog::LoginController] Login got Standalone DM ready")
+            || line.contains("[FLog::StudioKeyEvents] login (automatic) [end]")
+        {
+            signing_in = false;
+        } else if line.contains("[FLog::StudioHangMonitor] Hang") {
+            hung = true;
+        }
+    }
+    (signing_in && hung).then_some(instances)
+}
+
 fn open_failure_in_log(text: &str) -> Option<String> {
     let mut failure = None;
     let mut awaiting_message = false;
@@ -305,6 +334,7 @@ struct Observation<'a> {
     open_places: &'a [String],
     bound: Option<&'a str>,
     open_failures: &'a [(u32, String)],
+    login_hangs: &'a [(u32, u32)],
     starting: &'a [(u32, u64)],
 }
 
@@ -317,6 +347,7 @@ fn verdict_text(observation: &Observation<'_>) -> String {
         open_places,
         bound,
         open_failures,
+        login_hangs,
         starting,
     } = *observation;
     if !studio_running {
@@ -326,6 +357,16 @@ fn verdict_text(observation: &Observation<'_>) -> String {
         return format!(
             "Studio (pid {pid}) could not open its place: {}. It is left at its start page; close it, and check that the signed-in Studio account can edit the place.",
             reason.trim_end_matches('.')
+        );
+    }
+    if let Some((pid, instances)) = login_hangs.first() {
+        let cause = if *instances > 1 {
+            "Studio 0.741 hangs a window opened while another Studio window is running, because the first window keeps the sign-in mutex locked. Close every Studio window, then open the place again, or open it from the running Studio with File > Open"
+        } else {
+            "Close it and open the place again"
+        };
+        return format!(
+            "Studio (pid {pid}) hung while signing in at launch and will not open its place or connect. {cause}."
         );
     }
     if let Some((path, None)) = plugin {
@@ -388,6 +429,14 @@ pub(crate) fn diagnose(clients: &[Value], project_root: Option<&Path>) -> Value 
                 .map(|reason| (process.pid, reason))
         })
         .collect::<Vec<_>>();
+    let login_hangs = processes
+        .iter()
+        .filter(|process| !connected_pids.contains(&u64::from(process.pid)))
+        .filter_map(|process| {
+            studio_login_hang(process.pid, process.started_unix)
+                .map(|instances| (process.pid, instances))
+        })
+        .collect::<Vec<_>>();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |value| value.as_secs());
@@ -395,6 +444,7 @@ pub(crate) fn diagnose(clients: &[Value], project_root: Option<&Path>) -> Value 
         .iter()
         .filter(|process| !connected_pids.contains(&u64::from(process.pid)))
         .filter(|process| !open_failures.iter().any(|(pid, _)| *pid == process.pid))
+        .filter(|process| !login_hangs.iter().any(|(pid, _)| *pid == process.pid))
         .filter_map(|process| {
             let elapsed = now.saturating_sub(process.started_unix?);
             (elapsed < STARTING_GRACE_SECONDS).then_some((process.pid, elapsed))
@@ -408,6 +458,7 @@ pub(crate) fn diagnose(clients: &[Value], project_root: Option<&Path>) -> Value 
         open_places: &open_places,
         bound: bound.as_deref(),
         open_failures: &open_failures,
+        login_hangs: &login_hangs,
         starting: &starting,
     });
     json!({
@@ -419,6 +470,7 @@ pub(crate) fn diagnose(clients: &[Value], project_root: Option<&Path>) -> Value 
         "plugin": plugin.as_ref().map(|(path, modified)| json!({"path": path, "modifiedUnix": modified})),
         "openPlaces": open_places,
         "openFailures": open_failures.iter().map(|(pid, reason)| json!({"pid": pid, "reason": reason})).collect::<Vec<_>>(),
+        "loginHangs": login_hangs.iter().map(|(pid, instances)| json!({"pid": pid, "instancesAtLaunch": instances})).collect::<Vec<_>>(),
         "starting": starting.iter().map(|(pid, elapsed)| json!({"pid": pid, "elapsedSeconds": elapsed})).collect::<Vec<_>>(),
         "boundTarget": bound,
         "verdict": verdict,
@@ -441,7 +493,9 @@ pub(crate) fn is_starting(diagnosis: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Observation, elapsed_seconds, open_failure_in_log, verdict_text};
+    use super::{
+        Observation, elapsed_seconds, login_hang_in_log, open_failure_in_log, verdict_text,
+    };
 
     #[test]
     fn elapsed_seconds_reads_ps_etime() {
@@ -468,6 +522,7 @@ mod tests {
             open_places: &[],
             bound: None,
             open_failures: &[],
+            login_hangs: &[],
             starting: &[],
         }
     }
@@ -539,6 +594,24 @@ mod tests {
         );
         let recovered = format!("{failed}a,b,c,6 [telemetryLog] State: OpenPlaceSuccess\n");
         assert_eq!(open_failure_in_log(&recovered), None);
+        let hung = "x [FLog::SystemCheck] Running instance count at launch 2
+x [FLog::StudioKeyEvents] login (automatic) [start]
+x [FLog::LoginController] LoginController::login with category 'Local'
+x,Warning [FLog::StudioHangMonitor] Hang In Progress. HangId: 1
+";
+        assert_eq!(login_hang_in_log(hung), Some(2));
+        let signed_in = format!(
+            "{hung}x [FLog::LoginController] Login got Standalone DM ready to enter User scope
+"
+        );
+        assert_eq!(login_hang_in_log(&signed_in), None);
+        assert_eq!(
+            login_hang_in_log(
+                "x [FLog::StudioKeyEvents] login (automatic) [start]
+"
+            ),
+            None
+        );
         assert_eq!(
             open_failure_in_log("x [telemetryLog] State: OpenPlaceFailure\n").as_deref(),
             Some("Studio could not open the place")
