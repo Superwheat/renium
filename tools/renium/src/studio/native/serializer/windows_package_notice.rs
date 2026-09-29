@@ -57,18 +57,9 @@ fn discover(image: &PeImage<'_>) -> Result<Layout> {
         let registrar = image.offset_to_rva(offset + 12)? as i64
             + i64::from(read_i32(image.bytes, offset + 8)?);
         image.require_executable_rva(usize::try_from(registrar)?)?;
-        // Independently confirm that the named storage controls a byte comparison
-        // followed by a conditional branch in executable code.
-        let consumers = memmem::find_iter(code, b"\x44\x38\x3d")
-            .filter(|index| {
-                let offset = text.raw_offset + index;
-                image.rip_target(offset, 7).ok() == Some(flag)
-                    && code.get(index + 7..index + 9) == Some(&[0x0f, 0x85])
-            })
-            .count();
         anyhow::ensure!(
-            consumers == 1,
-            "Studio package popup flag consumer is not unique"
+            flag_is_consumed(image, code, text.raw_offset, flag),
+            "Studio package popup flag has no consumer"
         );
         matches.push(Layout {
             flag,
@@ -82,6 +73,33 @@ fn discover(image: &PeImage<'_>) -> Result<Layout> {
         "Studio package popup flag registration is unsupported"
     );
     Ok(matches.remove(0))
+}
+
+/// Independently confirm that the named storage controls a byte comparison
+/// followed by a conditional branch in executable code. Studio compiles that
+/// check as `cmp [rip+flag], r8b..r15b`, `cmp [rip+flag], al..bh` or
+/// `cmp byte [rip+flag], imm8`, with a short or near jcc; 0.741 uses all three.
+fn flag_is_consumed(image: &PeImage<'_>, code: &[u8], code_offset: usize, flag: usize) -> bool {
+    let jcc_follows = |index: usize| {
+        matches!(code.get(index), Some(0x74 | 0x75))
+            || matches!(code.get(index..index + 2), Some([0x0f, 0x84 | 0x85]))
+    };
+    (0..code.len()).any(|index| {
+        // The displacement is relative to the end of the whole instruction,
+        // including the immediate of the third form.
+        let (displacement, length) = match code.get(index..index + 3) {
+            Some([0x44, 0x38, modrm]) if modrm & 0xc7 == 0x05 => (3, 7),
+            Some([0x38, modrm, _]) if modrm & 0xc7 == 0x05 => (2, 6),
+            Some([0x80, 0x3d, _]) => (2, 7),
+            _ => return false,
+        };
+        let offset = code_offset + index;
+        let target = read_i32(image.bytes, offset + displacement)
+            .ok()
+            .zip(image.offset_to_rva(offset + length).ok())
+            .map(|(displacement, next)| i64::from(displacement) + next as i64);
+        target == Some(flag as i64) && jcc_follows(index + length)
+    })
 }
 
 fn layout(path: &Path) -> Result<Layout> {
@@ -195,8 +213,37 @@ mod tests {
             assert_eq!(layout.registration, 32);
         }
         let mut bytes = fixture(768);
-        bytes[96] = 0x90;
+        bytes[96..98].copy_from_slice(&[0x90, 0x90]);
         assert!(discover(&image(&bytes)).is_err(), "missing consumer");
+        for consumer in [
+            &[0x44, 0x38, 0x35, 0, 0, 0, 0, 0x0f, 0x85][..],
+            &[0x80, 0x3d, 0, 0, 0, 0, 0, 0x75, 0x0c],
+            &[0x80, 0x3d, 0, 0, 0, 0, 0, 0x0f, 0x84],
+            &[0x38, 0x05, 0, 0, 0, 0, 0x74, 0x0c, 0x90],
+        ] {
+            let mut bytes = fixture(768);
+            bytes[96..105].copy_from_slice(consumer);
+            let rip_end = if consumer[0] == 0x38 { 102 } else { 103 };
+            let displacement = if consumer[0] == 0x44 { 99 } else { 98 };
+            bytes[displacement..displacement + 4]
+                .copy_from_slice(&(768i32 - rip_end).to_le_bytes());
+            assert_eq!(
+                discover(&image(&bytes))?.flag,
+                768,
+                "consumer {consumer:x?}"
+            );
+        }
+        let mut bytes = fixture(768);
+        bytes[128..137].copy_from_slice(&[0x44, 0x38, 0x3d, 0, 0, 0, 0, 0x0f, 0x85]);
+        bytes[131..135].copy_from_slice(&(768i32 - 135).to_le_bytes());
+        assert_eq!(discover(&image(&bytes))?.flag, 768, "two consumers");
+        let mut bytes = fixture(768);
+        bytes[103] = 0x90;
+        bytes[104] = 0x90;
+        assert!(
+            discover(&image(&bytes)).is_err(),
+            "comparison without a branch"
+        );
         let mut bytes = fixture(768);
         bytes[600..600 + FLAG.len()].copy_from_slice(FLAG);
         assert!(discover(&image(&bytes)).is_err(), "ambiguous name");
@@ -205,6 +252,21 @@ mod tests {
         let mut bytes = fixture(768);
         bytes[34] = 0;
         assert!(discover(&image(&bytes)).is_err(), "wrong registration ABI");
+        Ok(())
+    }
+
+    /// `RENIUM_STUDIO_EXES=path;path cargo test -- --ignored` checks installed builds.
+    #[test]
+    #[ignore]
+    fn installed_studio_builds_expose_the_package_popup_flag() -> Result<()> {
+        for path in std::env::var("RENIUM_STUDIO_EXES")?.split(';') {
+            let bytes = fs::read(path)?;
+            let layout = discover(&PeImage::parse(&bytes)?)?;
+            println!(
+                "{path}: flag {:#x} registration {:#x}",
+                layout.flag, layout.registration
+            );
+        }
         Ok(())
     }
 }

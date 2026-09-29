@@ -1630,15 +1630,15 @@ fn edit_status_response_filters_a_reconnected_daemons_previously_captured_invent
 
 #[cfg(windows)]
 #[test]
-fn failed_package_notice_patch_does_not_admit_unprotected_editor_commands() {
+fn failed_package_notice_patch_still_admits_the_connection() {
     let preparation = Arc::new(NativeConnectionPreparation {
         patch_notices: Box::new(|_| bail!("fixture unsupported package notice layout")),
         keep_selection: Box::new(|_| Ok(())),
         pending: Default::default(),
-        prepare: Box::new(|_, _| panic!("unprotected connection must not reach warmup")),
+        prepare: Box::new(|_, _| Ok(())),
     });
     let bridge = listening_fixture_with_preparation(Some(preparation));
-    assert!(handshake(&bridge, 0, &edit_info("unpatched", 1)).is_none());
-    assert!(bridge.channels[0].sockets.lock().unwrap().is_empty());
+    let _peer = handshake(&bridge, 0, &edit_info("unpatched", 1)).unwrap();
+    assert_eq!(bridge.channels[0].sockets.lock().unwrap().len(), 1);
     bridge.alive.store(false, Ordering::Relaxed);
 }

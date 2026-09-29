@@ -1320,8 +1320,10 @@ impl BridgeServer {
                                     // Patch before exposing the Edit connection to commands.
                                     // The flag stays enabled through deferred engine work and
                                     // reconnects, including operations outside editor sync.
-                                    // macOS needs the helper that only a Renium launch loads;
-                                    // without it package pushes fall back to the dialog watcher.
+                                    // macOS needs the helper that only a Renium launch loads.
+                                    // Without the patch, package pushes fall back to the dialog
+                                    // watcher on both platforms; a Studio build the scan does not
+                                    // recognise must not keep Studio from connecting.
                                     #[cfg(any(windows, target_os = "macos"))]
                                     if socket.role == BRIDGE_ROLE_EDIT
                                         && let Some(preparation) = native_preparation.as_ref()
@@ -1336,9 +1338,6 @@ impl BridgeServer {
                                                     "[renium] Studio package notice patch failed: {error:#}"
                                                 ),
                                             );
-                                            if cfg!(windows) {
-                                                return;
-                                            }
                                         }
                                         // Undo keeps the user's selection; a failure only
                                         // leaves Studio's own behaviour in place.
