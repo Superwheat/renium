@@ -750,7 +750,9 @@ impl Manager {
                 cap,
             ));
         }
-        if let Some(commit) = platform::commit_info() {
+        if let Some(commit) = platform::commit_info()
+            .filter(|_| commit_check_needed(current_studio_commit, proposed_studio_commit))
+        {
             let reserve = (commit.limit / 10).max(2 * GIB);
             let projected = projected_commit(
                 commit.total,
@@ -1066,6 +1068,12 @@ fn now_ms() -> u64 {
     current_millis().min(u128::from(u64::MAX)) as u64
 }
 
+/// CPU, core and priority limits add no commit; only caps above the current
+/// commit can exhaust the system budget.
+fn commit_check_needed(current_studio: u64, proposed_studio: u64) -> bool {
+    proposed_studio > current_studio
+}
+
 fn projected_commit(
     current_total: u64,
     current_studio: u64,
@@ -1155,7 +1163,8 @@ pub(super) struct CommitInfo {
 #[cfg(test)]
 mod tests {
     use super::{
-        MemoryPlan, materialize_memory_cap, normalize_saved_name, parse_bytes, projected_commit,
+        MemoryPlan, commit_check_needed, materialize_memory_cap, normalize_saved_name, parse_bytes,
+        projected_commit,
     };
 
     #[test]
@@ -1175,6 +1184,8 @@ mod tests {
     fn commit_projection_replaces_current_studio_usage_without_underflow() {
         assert_eq!(projected_commit(10_000, 3_000, 5_000, 1_000), 13_000);
         assert_eq!(projected_commit(1_000, 2_000, 500, 250), 750);
+        assert!(!commit_check_needed(3_000, 3_000));
+        assert!(commit_check_needed(3_000, 5_000));
     }
 
     #[test]
