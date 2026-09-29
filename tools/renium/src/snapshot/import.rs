@@ -146,9 +146,16 @@ fn update_sourcemap_service_node(
 }
 
 impl SourcemapWriter {
-    pub(crate) fn start(project_root: PathBuf, durable: bool) -> Self {
+    pub(crate) fn start(
+        project_root: PathBuf,
+        durable: bool,
+        ready: Option<ImportReadyGate>,
+    ) -> Self {
         let (sender, receiver) = mpsc::channel::<SourcemapWriterMessage>();
         let handle = thread::spawn(move || -> Result<()> {
+            if let Some(ready) = &ready {
+                ready()?;
+            }
             let existing_root = load_existing_sourcemap_root(&project_root)?;
             let mut wrote_update = existing_root
                 .as_ref()
@@ -241,9 +248,14 @@ pub(crate) struct DirectImportDispatcher {
     pending_signal: Arc<(Mutex<()>, Condvar)>,
 }
 
+/// Blocks until the import destination is fully prepared; see
+/// `ExportProjectStage::copy_gate`.
+pub(crate) type ImportReadyGate = Arc<dyn Fn() -> Result<()> + Send + Sync>;
+
 #[derive(Clone)]
 struct DirectImportWorker {
     queue: Arc<DirectImportTaskQueue>,
+    ready: Option<ImportReadyGate>,
     project_root: PathBuf,
     src_dir: PathBuf,
     first_error: Arc<Mutex<Option<String>>>,
@@ -291,6 +303,11 @@ impl DirectImportWorker {
                 Ok(state)
             })
             .and_then(|state| {
+                // Conversion above is CPU-only; wait for the destination only
+                // before reading or writing it.
+                if let Some(ready) = &self.ready {
+                    ready()?;
+                }
                 import_service_state_with_sourcemap(&state, &self.project_root, &src_root, &service)
             });
         match result {
@@ -351,6 +368,7 @@ impl DirectImportDispatcher {
         drain_worker_count: usize,
         sourcemap_sender: Option<mpsc::Sender<SourcemapWriterMessage>>,
         run_started: Instant,
+        ready: Option<ImportReadyGate>,
     ) -> Result<Self> {
         let worker_count = drain_worker_count.max(active_worker_count);
         let queue = Arc::new(DirectImportTaskQueue::new(active_worker_count));
@@ -361,6 +379,7 @@ impl DirectImportDispatcher {
 
         let worker = DirectImportWorker {
             queue: Arc::clone(&queue),
+            ready,
             project_root,
             src_dir,
             first_error: Arc::clone(&first_error),

@@ -109,6 +109,63 @@ pub(crate) fn create_unique_directory(parent: &Path, prefix: &str) -> Result<Pat
     bail!("Could not allocate a fresh temporary directory")
 }
 
+const TRASH_PREFIX: &str = ".renium-trash-";
+
+/// Removes a directory tree without making the caller wait for it. The tree is
+/// renamed aside, which is instant on one volume, and deleted on a background
+/// thread: with antivirus scanning, deleting a staged copy of a large project
+/// takes seconds on Windows. Trees left by processes that exited before their
+/// deletion finished are swept here too.
+pub(crate) fn discard_directory(path: &Path) {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let Some(parent) = path.parent().map(Path::to_path_buf) else {
+        let _ = fs::remove_dir_all(path);
+        return;
+    };
+    let trash = parent.join(format!(
+        "{TRASH_PREFIX}{}-{}-{}",
+        std::process::id(),
+        current_millis(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let target = if fs::rename(path, &trash).is_ok() {
+        trash
+    } else {
+        path.to_path_buf()
+    };
+    let background_target = target.clone();
+    let spawned = std::thread::Builder::new()
+        .name("renium-discard".to_string())
+        .spawn(move || {
+            let _ = fs::remove_dir_all(&background_target);
+            sweep_abandoned_trash(&parent);
+        });
+    if spawned.is_err() {
+        let _ = fs::remove_dir_all(&target);
+    }
+}
+
+fn sweep_abandoned_trash(parent: &Path) {
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    let current_pid = std::process::id();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|value| value.strip_prefix(TRASH_PREFIX))
+            .and_then(|value| value.split_once('-'))
+            .and_then(|(pid, _)| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid != current_pid && !is_process_alive(pid) {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 pub(crate) fn case_folded_path_key(path: &Path) -> String {
     exact_path_key(path).to_ascii_lowercase()
 }

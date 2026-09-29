@@ -124,9 +124,54 @@ struct ExportPrelude {
     services: Vec<String>,
 }
 
+/// Copy of the project's existing files into a stage, run on a background
+/// thread so Studio can serialize at the same time. Every consumer of the staged
+/// files waits for it first.
+#[derive(Clone)]
+pub(crate) struct StageCopy(Arc<StageCopyState>);
+
+struct StageCopyState {
+    handle: Mutex<Option<std::thread::JoinHandle<Result<()>>>>,
+    outcome: OnceLock<Result<(), String>>,
+}
+
+impl StageCopy {
+    fn spawn(jobs: Vec<(PathBuf, PathBuf)>) -> Result<Self> {
+        let handle = std::thread::Builder::new()
+            .name("renium-stage-copy".to_string())
+            .spawn(move || {
+                for (source, destination) in jobs {
+                    copy_isolated_path(&source, &destination)?;
+                }
+                Ok(())
+            })
+            .context("Failed to start the export stage copy")?;
+        Ok(Self(Arc::new(StageCopyState {
+            handle: Mutex::new(Some(handle)),
+            outcome: OnceLock::new(),
+        })))
+    }
+
+    pub(crate) fn wait(&self) -> Result<()> {
+        self.0
+            .outcome
+            .get_or_init(|| match self.0.handle.lock_recover().take() {
+                Some(handle) => match handle.join() {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(error)) => Err(format!("{error:#}")),
+                    Err(_) => Err("The export stage copy panicked".to_string()),
+                },
+                None => Ok(()),
+            })
+            .clone()
+            .map_err(anyhow::Error::msg)
+    }
+}
+
 pub(crate) struct ExportProjectStage {
     pub(crate) project_root: PathBuf,
     container: PathBuf,
+    copy: Option<StageCopy>,
     pub(crate) import_project_root: PathBuf,
     pub(crate) import_src_dir: PathBuf,
     publish_paths: Vec<PathBuf>,
@@ -139,7 +184,27 @@ pub(crate) struct ExportProjectStage {
 
 impl ExportProjectStage {
     pub(crate) fn create(project_root: &Path, src_dir: &Path, services: &[String]) -> Result<Self> {
-        Self::create_inner(project_root, src_dir, services, true)
+        Self::create_inner(project_root, src_dir, services, true, false)
+    }
+
+    /// Like `create`, but copies existing files in the background. Only callers
+    /// that wait through `copy_gate` before touching staged files may use it.
+    fn create_with_background_copy(
+        project_root: &Path,
+        src_dir: &Path,
+        services: &[String],
+    ) -> Result<Self> {
+        Self::create_inner(project_root, src_dir, services, true, true)
+    }
+
+    pub(crate) fn copy_gate(&self) -> Option<crate::snapshot::import::ImportReadyGate> {
+        self.copy
+            .clone()
+            .map(|copy| Arc::new(move || copy.wait()) as crate::snapshot::import::ImportReadyGate)
+    }
+
+    fn wait_for_copy(&self) -> Result<()> {
+        self.copy.as_ref().map_or(Ok(()), StageCopy::wait)
     }
 
     pub(crate) fn create_for_comparison(
@@ -152,7 +217,7 @@ impl ExportProjectStage {
         {
             bail!("Project requires a staged comparison");
         }
-        Self::create_inner(project_root, src_dir, services, false)
+        Self::create_inner(project_root, src_dir, services, false, false)
     }
 
     fn create_inner(
@@ -160,6 +225,7 @@ impl ExportProjectStage {
         src_dir: &Path,
         services: &[String],
         clone_project_data: bool,
+        background_copy: bool,
     ) -> Result<Self> {
         let started = Instant::now();
         let parent = project_root
@@ -211,12 +277,31 @@ impl ExportProjectStage {
         } else {
             BTreeMap::new()
         };
+        // Loading the staged project below reads its configuration files, and a
+        // temporary projection, tree nodes or mounts can read staged data too.
+        // Only a plain layout copies its service directories while Studio
+        // serializes; single files (configuration, stores) are copied now.
+        let background_copy = background_copy
+            && loaded.as_ref().map_or(Ok(true), |loaded| {
+                Ok::<_, anyhow::Error>(
+                    loaded.project.tree.is_empty()
+                        && loaded.project.mounts.is_empty()
+                        && !config::project_requires_temporary_stage(loaded)?,
+                )
+            })?;
+        let mut deferred = Vec::new();
         for relative in &clone_paths {
             let source = project_root.join(relative);
-            if source.exists() {
-                copy_isolated_path(&source, &staged_root.join(relative))?;
+            let destination = staged_root.join(relative);
+            match fs::symlink_metadata(&source) {
+                Ok(metadata) if background_copy && metadata.is_dir() => {
+                    deferred.push((source, destination));
+                }
+                Ok(_) => copy_isolated_path(&source, &destination)?,
+                Err(_) => {}
             }
         }
+
         let staged_loaded = if let Some(original) = loaded.as_ref() {
             let relative = original.path.strip_prefix(project_root)?;
             // Only the private copy is scoped; the user's configuration is
@@ -250,11 +335,19 @@ impl ExportProjectStage {
             ),
             None => (staged_root.clone(), src_dir.to_path_buf()),
         };
+        // Started last: an earlier failure discards the container, which a
+        // running copy would otherwise recreate.
+        let copy = if deferred.is_empty() {
+            None
+        } else {
+            Some(StageCopy::spawn(deferred)?)
+        };
         cleanup.disarm();
         drop(cleanup);
         let stage = Self {
             project_root: staged_root,
             container,
+            copy,
             import_project_root,
             import_src_dir,
             publish_paths,
@@ -287,6 +380,7 @@ impl ExportProjectStage {
     }
 
     pub(crate) fn finish_projection(&self, generate_sourcemap: bool) -> Result<()> {
+        self.wait_for_copy()?;
         if let (Some(loaded), Some(projection)) = (&self.loaded, &self.projection)
             && projection.is_temporary()
         {
@@ -353,6 +447,7 @@ impl ExportProjectStage {
     }
 
     pub(crate) fn preview_operations(&self, project_root: &Path) -> Result<Vec<Value>> {
+        self.wait_for_copy()?;
         let staged = collect_publish_hashes(&self.project_root, &self.publish_paths)?;
         let current = collect_publish_hashes(project_root, &self.publish_paths)?;
         let mut adapter_paths = Vec::new();
@@ -496,6 +591,7 @@ impl ExportProjectStage {
         project_root: &Path,
         repair_reference_paths: bool,
     ) -> Result<PublishedProjectChanges> {
+        self.wait_for_copy()?;
         let started = Instant::now();
         let log_phase = |name: &str, phase: Instant| {
             log_global(
@@ -683,19 +779,13 @@ impl ExportProjectStage {
         log_phase("file swaps", phase);
         self.active = false;
         let phase = Instant::now();
-        published
-            .par_iter()
-            .filter_map(|(_, backup)| backup.as_ref())
-            .for_each(|backup| match fs::symlink_metadata(backup) {
-                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-                    let _ = fs::remove_dir_all(backup);
-                }
-                Ok(_) => {
-                    let _ = fs::remove_file(backup);
-                }
-                Err(_) => {}
-            });
-        let _ = fs::remove_dir_all(&self.container);
+        // Backups live under the container, so discarding it removes them too.
+        debug_assert!(published.iter().all(|(_, backup)| {
+            backup
+                .as_ref()
+                .is_none_or(|backup| backup.starts_with(&self.container))
+        }));
+        crate::system::files::discard_directory(&self.container);
         log_phase("cleanup", phase);
         log_timing_ms("export project stage publish", elapsed_ms(started));
         Ok(PublishedProjectChanges {
@@ -708,8 +798,10 @@ impl ExportProjectStage {
 impl Drop for ExportProjectStage {
     fn drop(&mut self) {
         config::remove_cached_script_naming(&self.project_root);
+        // The copy must not recreate paths inside a container being discarded.
+        let _ = self.wait_for_copy();
         if self.active {
-            let _ = fs::remove_dir_all(&self.container);
+            crate::system::files::discard_directory(&self.container);
         }
     }
 }
@@ -1087,6 +1179,10 @@ fn copy_isolated_path(source: &Path, destination: &Path) -> Result<()> {
     if !metadata.is_dir() {
         bail!("Cannot stage unsupported path {}", source.display());
     }
+    // Directories are created in walk order (parents first); file copies are
+    // independent and dominated by per-file system overhead, so they run in
+    // parallel.
+    let mut files = Vec::new();
     for entry in WalkDir::new(source).follow_links(false) {
         let entry = entry.with_context(|| format!("Failed to scan {}", source.display()))?;
         let relative = entry.path().strip_prefix(source)?;
@@ -1099,13 +1195,12 @@ fn copy_isolated_path(source: &Path, destination: &Path) -> Result<()> {
             }
             copy_symbolic_link(entry.path(), &target)?;
         } else if entry.file_type().is_file() {
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            copy_isolated_file(entry.path(), &target)?;
+            files.push((entry.into_path(), target));
         }
     }
-    Ok(())
+    files
+        .par_iter()
+        .try_for_each(|(source, target)| copy_isolated_file(source, target))
 }
 
 fn copy_isolated_file(source: &Path, destination: &Path) -> Result<()> {
@@ -1412,7 +1507,8 @@ pub(crate) fn prepare_export_execution(
     services: &[String],
     total_started: Instant,
 ) -> Result<ExportExecutionSetup> {
-    let project_stage = ExportProjectStage::create(project_root, src_dir, services)?;
+    let project_stage =
+        ExportProjectStage::create_with_background_copy(project_root, src_dir, services)?;
     let import_project_root = project_stage.import_project_root.clone();
     let import_src_dir = project_stage.import_src_dir.clone();
     log_global(
@@ -1425,7 +1521,11 @@ pub(crate) fn prepare_export_execution(
             import_src_dir.display()
         ),
     );
-    let sourcemap_writer = SourcemapWriter::start(import_project_root.clone(), false);
+    let sourcemap_writer = SourcemapWriter::start(
+        import_project_root.clone(),
+        false,
+        project_stage.copy_gate(),
+    );
     let workers = resolve_direct_import_workers();
     println!("[renium] direct import workers during export: {workers}");
     let direct_import_dispatcher = DirectImportDispatcher::start(
@@ -1435,6 +1535,7 @@ pub(crate) fn prepare_export_execution(
         workers,
         Some(sourcemap_writer.sender()),
         total_started,
+        project_stage.copy_gate(),
     )?;
     let export_services = direct_import_export_order(services);
     if export_services != services {
@@ -2740,6 +2841,10 @@ mod publication_tests {
         let import_src_dir = setup.project_stage.import_src_dir.clone();
         assert!(import_project_root.starts_with(&stage_container));
         assert_ne!(import_project_root, fixture.root);
+        // Import workers wait for the background stage copy the same way.
+        if let Some(ready) = setup.project_stage.copy_gate() {
+            ready().unwrap();
+        }
         fs::write(
             import_project_root
                 .join(import_src_dir)
