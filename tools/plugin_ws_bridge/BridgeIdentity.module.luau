@@ -34,9 +34,41 @@ function BridgeIdentity.pathCacheKey(pathSegments: any, pathOrdinals: any): stri
 	return base .. separator .. "ord" .. separator .. ordinals
 end
 
-function BridgeIdentity.resolveOrdinalChild(parent: Instance, childName: string, ordinal: number): Instance?
+export type ChildIndex = { [Instance]: { [string]: { Instance } } }
+
+-- Lists each parent's children by name on first use, so resolving many
+-- ordinal paths costs one child scan per parent. Discard it before any
+-- instance is added, removed, renamed or reparented.
+function BridgeIdentity.newChildIndex(): ChildIndex
+	return {}
+end
+
+function BridgeIdentity.resolveOrdinalChild(
+	parent: Instance,
+	childName: string,
+	ordinal: number,
+	childIndex: ChildIndex?
+): Instance?
 	if ordinal <= 1 then
 		return parent:FindFirstChild(childName)
+	end
+	if childIndex ~= nil then
+		local childrenByName = childIndex[parent]
+		if childrenByName == nil then
+			childrenByName = {}
+			for _, child in ipairs(parent:GetChildren()) do
+				local name = child.Name
+				local named = childrenByName[name]
+				if named == nil then
+					named = {}
+					childrenByName[name] = named
+				end
+				named[#named + 1] = child
+			end
+			childIndex[parent] = childrenByName
+		end
+		local named = childrenByName[childName]
+		return if named ~= nil then named[ordinal] else nil
 	end
 	local seen = 0
 	for _, child in ipairs(parent:GetChildren()) do
@@ -53,7 +85,8 @@ end
 function BridgeIdentity.resolvePathSegments(
 	pathSegments: any,
 	resolveCache: { [string]: any }?,
-	pathOrdinals: any?
+	pathOrdinals: any?,
+	childIndex: ChildIndex?
 ): Instance?
 	if type(pathSegments) ~= "table" or #pathSegments == 0 then
 		return nil
@@ -76,7 +109,7 @@ function BridgeIdentity.resolvePathSegments(
 	local current = game:GetService(tostring(pathSegments[1]))
 	for i = 2, #pathSegments do
 		local ordinal = if type(pathOrdinals) == "table" then tonumber(pathOrdinals[i]) or 1 else 1
-		current = BridgeIdentity.resolveOrdinalChild(current, tostring(pathSegments[i]), ordinal)
+		current = BridgeIdentity.resolveOrdinalChild(current, tostring(pathSegments[i]), ordinal, childIndex)
 		if current == nil then
 			if resolveCache ~= nil and cacheKey ~= nil then
 				resolveCache[cacheKey] = false

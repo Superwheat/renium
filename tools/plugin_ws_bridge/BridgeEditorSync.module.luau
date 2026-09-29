@@ -726,7 +726,8 @@ local function resolveInstance(
 		return persistent
 	end
 	if type(pathSegments) == "table" and #pathSegments > 0 then
-		local pathInstance = resolvePathSegments(pathSegments, ctx.resolveCache, change.pathOrdinals)
+		local pathInstance =
+			resolvePathSegments(pathSegments, ctx.resolveCache, change.pathOrdinals, ctx.resolveChildIndex)
 		if
 			pathInstance ~= nil and (allowClassMismatch or instanceMatchesExpectedClass(pathInstance, change.className))
 		then
@@ -989,8 +990,9 @@ local function validateChangePath(change: { [string]: any }, serviceName: string
 	if tostring(pathSegments[1]) ~= serviceName then
 		error("Editor mutation path root does not match service: " .. pathKey(pathSegments))
 	end
+	-- Roblox allows empty instance names; paths identify them with ordinals.
 	for _, segment in ipairs(pathSegments) do
-		if type(segment) ~= "string" or segment == "" or #segment > 255 then
+		if type(segment) ~= "string" or #segment > 255 then
 			error("Editor mutation path contains an invalid segment")
 		end
 	end
@@ -2918,8 +2920,8 @@ local function validateMutationPath(
 		error(label .. " path has too many segments")
 	end
 	for index, segment in ipairs(change.pathSegments) do
-		if type(segment) ~= "string" or segment == "" or #segment > 255 then
-			error(string.format("%s path segment %d must be a non-empty string", label, index))
+		if type(segment) ~= "string" or #segment > 255 then
+			error(string.format("%s path segment %d must be a string of at most 255 bytes", label, index))
 		end
 	end
 	if change.pathSegments[1] ~= serviceName then
@@ -5687,7 +5689,8 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			return {}
 		end
 		local changesAreArray, changeCount = denseArrayLength(rawChanges)
-		if not changesAreArray or changeCount > (tonumber(ctx.maxChangesPerRequest) or 5000) then
+		-- Chunked uploads reassemble these rows, so the bound is the transaction's.
+		if not changesAreArray or changeCount > BridgeTransactionUpload.MAX_ROWS then
 			error("Editor post-commit property changes must be a bounded array")
 		end
 		for changeIndex, change in ipairs(rawChanges) do
@@ -6150,48 +6153,59 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			local updated = 0
 			RunService.Heartbeat:Wait()
 			assertCommitActive()
-			for _, change in ipairs(postCommitPropertyChanges) do
-				assertCommitActive()
-				local _, service = validatedChangeService(change, ctx)
-				local instance = resolveInstance(change, ctx)
-				if instance == nil or not instance:IsA("Model") then
-					error(`WorldPivot target was not found: {pathKey(change.pathSegments)}`)
-				end
-				assertInstanceInService(instance, service)
-				local okRead, current = readProperty(instance, "WorldPivot")
-				local rawValue = change.properties.WorldPivot
-				-- Compare serialized components before constructing another CFrame:
-				-- Studio's constructor can flush an already-correct subnormal to zero.
-				if
-					okRead
-					and type(rawValue) == "table"
-					and rawValue._type == "CFrame"
-					and BridgeValueEquality.exactValuesEqual(
-						BridgeValueCodec.encodeComponents(current:GetComponents()),
-						rawValue.components
-					)
-				then
-					continue
-				end
-				local okDecode, value = decodePropertyValue(
-					instance,
-					"WorldPivot",
-					change.properties.WorldPivot,
-					ctx,
-					change.service
-				)
-				if not okDecode then
-					error(`Failed to decode WorldPivot: {value}`)
-				end
-				if not okRead or current ~= value then
-					local okWrite, writeError = writePropertyForSync(instance, "WorldPivot", value, ctx)
-					if not okWrite then
-						error(
-							`Failed to write WorldPivot for {pathKey(change.pathSegments)} on {instance:GetFullName()}: {writeError}`
-						)
+			-- The loop does not yield, and a write clears the index before any
+			-- handler it triggers could have changed the hierarchy.
+			local childIndex = BridgeIdentity.newChildIndex()
+			ctx.resolveChildIndex = childIndex
+			local okPivots, pivotError = pcall(function()
+				for _, change in ipairs(postCommitPropertyChanges) do
+					assertCommitActive()
+					local _, service = validatedChangeService(change, ctx)
+					local instance = resolveInstance(change, ctx)
+					if instance == nil or not instance:IsA("Model") then
+						error(`WorldPivot target was not found: {pathKey(change.pathSegments)}`)
 					end
-					updated += 1
+					assertInstanceInService(instance, service)
+					local okRead, current = readProperty(instance, "WorldPivot")
+					local rawValue = change.properties.WorldPivot
+					-- Compare serialized components before constructing another CFrame:
+					-- Studio's constructor can flush an already-correct subnormal to zero.
+					if
+						okRead
+						and type(rawValue) == "table"
+						and rawValue._type == "CFrame"
+						and BridgeValueEquality.exactValuesEqual(
+							BridgeValueCodec.encodeComponents(current:GetComponents()),
+							rawValue.components
+						)
+					then
+						continue
+					end
+					local okDecode, value = decodePropertyValue(
+						instance,
+						"WorldPivot",
+						change.properties.WorldPivot,
+						ctx,
+						change.service
+					)
+					if not okDecode then
+						error(`Failed to decode WorldPivot: {value}`)
+					end
+					if not okRead or current ~= value then
+						local okWrite, writeError = writePropertyForSync(instance, "WorldPivot", value, ctx)
+						if not okWrite then
+							error(
+								`Failed to write WorldPivot for {pathKey(change.pathSegments)} on {instance:GetFullName()}: {writeError}`
+							)
+						end
+						updated += 1
+						table.clear(childIndex)
+					end
 				end
+			end)
+			ctx.resolveChildIndex = nil
+			if not okPivots then
+				error(pivotError, 0)
 			end
 		end
 		session.commitPrepared = true
