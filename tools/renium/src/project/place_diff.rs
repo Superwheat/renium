@@ -15,12 +15,80 @@ use crate::app::output::log_global;
 use crate::cli::ComparePlaceArgs;
 use crate::rbx::encode::{
     rbx_logical_property_name, rbx_model_property_descriptor, rbx_property_descriptor,
+    rbx_serialized_property_name_for_logical,
 };
-use crate::rbx::{decode::rbx_variant_to_settings_json, model::BytecodeModelImportRefs};
+use crate::rbx::{
+    decode::{native_property_filter, rbx_variant_to_settings_json},
+    model::BytecodeModelImportRefs,
+};
 use crate::settings::{
     bytecode::{SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance},
-    equivalence::{align_settings_ids_to_reference, stabilize_settings_reference_ids},
+    equivalence::{
+        align_settings_ids_to_reference, reconciliation_property_is_derived,
+        stabilize_settings_reference_ids,
+    },
 };
+
+const UNIFIED_LIGHTING_MARKER: &str = "RBX_LightingTechnologyUnifiedMigration";
+
+enum Skipped {
+    EngineManaged,
+    NotCaptured,
+}
+
+/// Studio recomputes these from other saved data or from loaded assets, so two
+/// saves of one place can disagree on them without any edit in between.
+fn engine_managed_property(class_name: &str, name: &str) -> bool {
+    reconciliation_property_is_derived(name)
+        || matches!(
+            name,
+            "PhysicalConfigData"
+                | "CollisionGroupId"
+                | "ClockTime"
+                | "InitialSize"
+                | "MeshSize"
+                | "FluidFidelityInternal"
+                | "CFrame1"
+                | "Part0Internal"
+                | "Part1Internal"
+        )
+        || class_name == "WeldConstraint" && name == "State"
+}
+
+fn omit_engine_managed_properties(document: &mut SettingsBytecode) -> BTreeMap<String, usize> {
+    let mut omitted = BTreeMap::new();
+    for instance in &mut document.instances {
+        let class_name = &instance.class_name;
+        instance.properties.retain(|name, _| {
+            let managed = engine_managed_property(class_name, name);
+            if managed {
+                *omitted.entry(name.clone()).or_default() += 1;
+            }
+            !managed
+        });
+    }
+    omitted
+}
+
+/// A saved place never contains instances with Archivable off, so a project
+/// that carries them (Studio-only helpers, plugin state) cannot be compared on
+/// them.
+pub(super) fn omit_unsaved_project_instances(dom: &mut WeakDom) -> usize {
+    let archivable = rbx_dom_weak::Ustr::from("Archivable");
+    let unsaved = dom
+        .descendants()
+        .filter(|node| matches!(node.properties.get(&archivable), Some(Variant::Bool(false))))
+        .map(|node| node.referent())
+        .collect::<Vec<_>>();
+    let mut omitted = 0;
+    for id in unsaved {
+        if dom.get_by_ref(id).is_some() {
+            omitted += dom.descendants_of(id).count();
+            dom.destroy(id);
+        }
+    }
+    omitted
+}
 use crate::system::text::normalized_source_bytes;
 
 #[cfg(test)]
@@ -174,15 +242,30 @@ pub(super) fn document(
                                             canonical,
                                         )
                                     });
-                            let raw_default = if elide_defaults {
-                                database.classes.get(node.class.as_str()).and_then(|class| {
-                                    database
-                                        .find_default_property(class, canonical)
-                                        .or_else(|| database.find_default_property(class, key))
-                                })
-                            } else {
-                                None
-                            };
+                            let raw_default =
+                                if elide_defaults {
+                                    database.classes.get(node.class.as_str()).and_then(|class| {
+                                        database
+                                            .find_default_property(class, canonical)
+                                            .or_else(|| database.find_default_property(class, key))
+                                            .or_else(|| {
+                                                rbx_serialized_property_name_for_logical(
+                                                    database,
+                                                    node.class.as_str(),
+                                                    canonical,
+                                                )
+                                                .filter(|serialized| {
+                                                    *serialized != canonical && *serialized != key
+                                                })
+                                                .and_then(|serialized| {
+                                                    database
+                                                        .find_default_property(class, serialized)
+                                                })
+                                            })
+                                    })
+                                } else {
+                                    None
+                                };
                             let default = raw_default
                                 .map(|value| {
                                     variant_value(value, descriptor, database, &import_refs)
@@ -371,8 +454,13 @@ pub(super) fn compare(
         || document(before, "before", Some(services), true),
         || document(after, "after", Some(services), true),
     );
-    let before = before?;
+    let mut before = before?;
     let mut after = after?;
+    let mut engine_managed = omit_engine_managed_properties(&mut before);
+    for (name, count) in omit_engine_managed_properties(&mut after) {
+        *engine_managed.entry(name).or_default() += count;
+    }
+    let mut not_captured = BTreeMap::new();
     log_global(
         4,
         format_args!(
@@ -408,6 +496,27 @@ pub(super) fn compare(
     } else {
         args.limit.get()
     };
+    // Against a project, a saved field the project never captures says nothing
+    // when the project lacks it.
+    let project_target = args.against.is_none();
+    let database = rbx_reflection_database::get()?;
+    let captured_by_class = if project_target {
+        before
+            .instances
+            .iter()
+            .map(|instance| instance.class_name.as_str())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|class_name| {
+                (
+                    class_name.to_string(),
+                    native_property_filter(database, class_name).allowed,
+                )
+            })
+            .collect::<HashMap<_, _>>()
+    } else {
+        HashMap::new()
+    };
     // Compare records independently; emit in file order so limits and reports
     // remain deterministic, including duplicate sibling identities.
     let compare_record = |instance: &SettingsBytecodeInstance| {
@@ -415,11 +524,42 @@ pub(super) fn compare(
             .get(instance.settings_id.as_str())
             .map(|&previous| {
                 let old = &before.instances[previous];
-                (
-                    previous,
-                    changed_fields(&old.properties, &instance.properties, args.values),
-                    changed_fields(&old.attributes, &instance.attributes, args.values),
-                )
+                let mut skipped = Vec::new();
+                let mut properties =
+                    changed_fields(&old.properties, &instance.properties, args.values);
+                let mut attributes =
+                    changed_fields(&old.attributes, &instance.attributes, args.values);
+                // Once a place is on Unified lighting, Studio keeps the saved
+                // Technology only for rollback and shows Unified regardless.
+                let unified = old.attributes.contains_key(UNIFIED_LIGHTING_MARKER)
+                    || instance.attributes.contains_key(UNIFIED_LIGHTING_MARKER);
+                properties.retain(|entry| {
+                    let name = entry["name"].as_str().unwrap_or_default();
+                    if unified && instance.class_name == "Lighting" && name == "Technology" {
+                        skipped.push((name.to_string(), Skipped::EngineManaged));
+                        return false;
+                    }
+                    if project_target
+                        && !instance.properties.contains_key(name)
+                        && captured_by_class
+                            .get(instance.class_name.as_str())
+                            .is_some_and(|captured| !captured.contains(name))
+                        && rbx_property_descriptor(database, &instance.class_name, name).is_some()
+                    {
+                        skipped.push((name.to_string(), Skipped::NotCaptured));
+                        return false;
+                    }
+                    true
+                });
+                attributes.retain(|entry| {
+                    let name = entry["name"].as_str().unwrap_or_default();
+                    if name.starts_with("RBX_") {
+                        skipped.push((name.to_string(), Skipped::EngineManaged));
+                        return false;
+                    }
+                    true
+                });
+                (previous, properties, attributes, skipped)
             })
     };
     let records = if after.instances.len() >= 2_048 {
@@ -436,7 +576,7 @@ pub(super) fn compare(
             .collect::<Vec<_>>()
     };
     for (index, (instance, record)) in after.instances.iter().zip(records).enumerate() {
-        let Some((previous, properties, attributes)) = record else {
+        let Some((previous, properties, attributes, skipped)) = record else {
             added += 1;
             if differences.len() < limit {
                 let mut entry = json!({"kind":"added","after":location(&after, index)});
@@ -449,6 +589,13 @@ pub(super) fn compare(
             continue;
         };
         matched[previous] = true;
+        for (name, kind) in skipped {
+            let bucket = match kind {
+                Skipped::EngineManaged => &mut engine_managed,
+                Skipped::NotCaptured => &mut not_captured,
+            };
+            *bucket.entry(name).or_default() += 1;
+        }
         if properties.is_empty() && attributes.is_empty() {
             unchanged += 1;
         } else {
@@ -480,6 +627,12 @@ pub(super) fn compare(
     );
     let mut result = json!({"ok":true,"scope":"full","direction":"input -> target","services":services,"matches":added+removed+changed == 0,"beforeInstances":before.instances.len(),"afterInstances":after.instances.len(),"added":added,"removed":removed,"changed":changed,"unchanged":unchanged,"differenceCount":added+removed+changed,"truncated":added+removed+changed > differences.len(),"differences":differences});
     crate::app::output::drop_false(&mut result, &["truncated"]);
+    if !engine_managed.is_empty() {
+        result["engineManagedProperties"] = json!(engine_managed);
+    }
+    if !not_captured.is_empty() {
+        result["notCapturedProjectProperties"] = json!(not_captured);
+    }
     drop(before_ids);
     let started = Instant::now();
     before

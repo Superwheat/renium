@@ -277,14 +277,20 @@ pub(crate) fn compare_place(args: ComparePlaceArgs, project: Option<&Path>) -> R
         ),
     );
     if args.full {
-        let not_serialized = if args.against.is_none() {
-            super::place_diff::omit_unsaved_project_properties(&mut project_dom)?
+        let (not_serialized, unsaved_instances) = if args.against.is_none() {
+            (
+                super::place_diff::omit_unsaved_project_properties(&mut project_dom)?,
+                super::place_diff::omit_unsaved_project_instances(&mut project_dom),
+            )
         } else {
-            BTreeMap::new()
+            (BTreeMap::new(), 0)
         };
         let mut result = super::place_diff::compare(&place_dom, &project_dom, &service_set, &args)?;
         if !not_serialized.is_empty() {
             result["notSerializedProjectProperties"] = json!(not_serialized);
+        }
+        if unsaved_instances > 0 {
+            result["unsavedProjectInstances"] = json!(unsaved_instances);
         }
         result["input"] = json!(args.input);
         result["target"] = json!(project_path);

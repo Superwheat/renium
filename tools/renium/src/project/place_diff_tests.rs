@@ -452,3 +452,138 @@ fn failed_place_encoding_preserves_the_existing_file() {
     }
     assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
 }
+
+fn lighting_fixture(state: i32, technology: u32, marker: bool, original: Option<i32>) -> WeakDom {
+    let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+    let root = dom.insert(dom.root_ref(), InstanceBuilder::new("Workspace"));
+    dom.insert(
+        root,
+        InstanceBuilder::new("WeldConstraint").with_property("State", state),
+    );
+    dom.insert(
+        root,
+        InstanceBuilder::new("MeshPart").with_property(
+            "PhysicalConfigData",
+            rbx_dom_weak::types::SharedString::new(vec![state as u8, 7]),
+        ),
+    );
+    let mut attributes = Attributes::new();
+    if marker {
+        attributes.insert(
+            "RBX_LightingTechnologyUnifiedMigration".to_string(),
+            Variant::Bool(true),
+        );
+    }
+    if let Some(original) = original {
+        attributes.insert(
+            "RBX_OriginalTechnologyOnFileLoad".to_string(),
+            Variant::Int32(original),
+        );
+    }
+    dom.insert(
+        dom.root_ref(),
+        InstanceBuilder::new("Lighting")
+            .with_property(
+                "Technology",
+                rbx_dom_weak::types::Enum::from_u32(technology),
+            )
+            .with_property("Attributes", attributes),
+    );
+    dom
+}
+
+#[test]
+fn full_diff_skips_engine_managed_values_and_migration_markers() {
+    let services = BTreeSet::from(["Workspace".to_string(), "Lighting".to_string()]);
+    let result = compare(
+        &lighting_fixture(1, 4, true, Some(4)),
+        &lighting_fixture(2, 5, true, None),
+        &services,
+        &args(&[]),
+    )
+    .unwrap();
+    assert_eq!(result["matches"], true, "{result}");
+    assert_eq!(result["engineManagedProperties"]["State"], 2);
+    assert_eq!(result["engineManagedProperties"]["PhysicalConfigData"], 2);
+    assert_eq!(result["engineManagedProperties"]["Technology"], 1);
+    assert_eq!(
+        result["engineManagedProperties"]["RBX_OriginalTechnologyOnFileLoad"],
+        1
+    );
+    let legacy = compare(
+        &lighting_fixture(1, 4, false, None),
+        &lighting_fixture(1, 5, false, None),
+        &services,
+        &args(&["--values"]),
+    )
+    .unwrap();
+    assert_eq!(legacy["changed"], 1, "{legacy}");
+    assert_eq!(
+        legacy["differences"][0]["properties"][0]["name"],
+        "Technology"
+    );
+    assert!(
+        legacy["engineManagedProperties"]
+            .get("Technology")
+            .is_none()
+    );
+}
+
+#[test]
+fn full_diff_elides_an_explicit_input_sink_default() {
+    let mut before = WeakDom::new(InstanceBuilder::new("DataModel"));
+    let root = before.insert(before.root_ref(), InstanceBuilder::new("Workspace"));
+    let frame = before.insert(
+        root,
+        InstanceBuilder::new("Frame")
+            .with_property("InputSink", rbx_dom_weak::types::Enum::from_u32(0)),
+    );
+    let mut after = WeakDom::new(InstanceBuilder::new("DataModel"));
+    let root = after.insert(after.root_ref(), InstanceBuilder::new("Workspace"));
+    after.insert(root, InstanceBuilder::new("Frame"));
+    assert_eq!(diff(&before, &after, &[])["matches"], true);
+    before.get_by_ref_mut(frame).unwrap().properties.insert(
+        "InputSink".into(),
+        Variant::Enum(rbx_dom_weak::types::Enum::from_u32(1)),
+    );
+    assert_eq!(diff(&before, &after, &[])["changed"], 1);
+}
+
+#[test]
+fn project_diff_omits_unsaved_instances_and_fields_the_project_never_captures() {
+    let mut place = WeakDom::new(InstanceBuilder::new("DataModel"));
+    let root = place.insert(place.root_ref(), InstanceBuilder::new("Workspace"));
+    place.insert(root, InstanceBuilder::new("Part").with_name("Saved"));
+    place.insert(
+        place.root_ref(),
+        InstanceBuilder::new("TextChatService").with_property("IsLegacyChatDisabled", true),
+    );
+    let mut project = WeakDom::new(InstanceBuilder::new("DataModel"));
+    let root = project.insert(project.root_ref(), InstanceBuilder::new("Workspace"));
+    project.insert(root, InstanceBuilder::new("Part").with_name("Saved"));
+    let hats = project.insert(
+        root,
+        InstanceBuilder::new("Folder")
+            .with_name("Hats")
+            .with_property("Archivable", false),
+    );
+    project.insert(hats, InstanceBuilder::new("Part").with_name("Hat"));
+    project.insert(project.root_ref(), InstanceBuilder::new("TextChatService"));
+    let services = BTreeSet::from(["Workspace".to_string(), "TextChatService".to_string()]);
+    let against = compare(
+        &place,
+        &project,
+        &services,
+        &args(&["--against", "Other.rbxl"]),
+    )
+    .unwrap();
+    assert_eq!(against["added"], 2, "{against}");
+    assert_eq!(against["changed"], 1);
+    assert_eq!(omit_unsaved_project_instances(&mut project), 2);
+    let result = compare(&place, &project, &services, &args(&[])).unwrap();
+    assert_eq!(result["matches"], true, "{result}");
+    assert_eq!(
+        result["notCapturedProjectProperties"]["IsLegacyChatDisabled"],
+        1
+    );
+}
