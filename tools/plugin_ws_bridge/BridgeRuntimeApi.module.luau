@@ -1494,12 +1494,60 @@ updateMouse()
 		local verifiedClicks = 0
 		local heldKeys = {}
 		local heldButtons = {}
+		local StarterGui = game:GetService("StarterGui")
+		local coreGuiStates = nil
+		-- Roblox refuses a virtual pointer event under one of its own overlays
+		-- (chat, player list, backpack). Hide them for the event, as a tester
+		-- closing the chat would, and restore them when the batch ends.
+		local function hideCoreGui(): boolean
+			if coreGuiStates ~= nil then
+				return false
+			end
+			coreGuiStates = {}
+			for _, coreGuiType in Enum.CoreGuiType:GetEnumItems() do
+				if coreGuiType ~= Enum.CoreGuiType.All then
+					local okRead, enabled = pcall(StarterGui.GetCoreGuiEnabled, StarterGui, coreGuiType)
+					if okRead then
+						coreGuiStates[coreGuiType] = enabled
+					end
+				end
+			end
+			local okHide = pcall(StarterGui.SetCoreGuiEnabled, StarterGui, Enum.CoreGuiType.All, false)
+			task.wait()
+			return okHide
+		end
+		local function restoreCoreGui()
+			if coreGuiStates == nil then
+				return
+			end
+			for coreGuiType, enabled in coreGuiStates do
+				pcall(StarterGui.SetCoreGuiEnabled, StarterGui, coreGuiType, enabled)
+			end
+			coreGuiStates = nil
+		end
+		local function sendPointer(send: () -> ())
+			local okSend, sendError = pcall(send)
+			if okSend then
+				return
+			end
+			if not string.find(tostring(sendError), "hits CoreGUI", 1, true) or not hideCoreGui() then
+				error(sendError, 0)
+			end
+			send()
+		end
+		local function sendMousePosition(position)
+			sendPointer(function()
+				virtualInput:SendMousePosition(position)
+			end)
+		end
 		local function sendKey(down, keyCode, repeated)
 			virtualInput:SendKey(down, keyCode, repeated)
 			heldKeys[keyCode] = if down then true else nil
 		end
 		local function sendMouseButton(position, button, down, repeatCount)
-			virtualInput:SendMouseButton(position, button, down, repeatCount)
+			sendPointer(function()
+				virtualInput:SendMouseButton(position, button, down, repeatCount)
+			end)
 			heldButtons[button] = if down then position else nil
 		end
 		local function releaseHeldInput()
@@ -1596,7 +1644,7 @@ updateMouse()
 				else
 					local position = Vector2.new(tonumber(action.x) or 0, tonumber(action.y) or 0)
 					if actionType == "move" then
-						virtualInput:SendMousePosition(position)
+						sendMousePosition(position)
 					elseif actionType == "button" then
 						local button = Enum.UserInputType.MouseButton1
 						if action.button == "right" then
@@ -1645,6 +1693,7 @@ updateMouse()
 		end, function(message)
 			return message
 		end)
+		restoreCoreGui()
 		if not ok or result.ok ~= true then
 			releaseHeldInput()
 		end

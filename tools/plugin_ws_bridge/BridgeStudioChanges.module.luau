@@ -1667,6 +1667,12 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		journalValueCaptured: boolean?,
 		journalValue: any
 	): boolean
+		-- While a transaction holds a natively inserted tree, the engine still
+		-- settles that tree (constraint attachments, pivots) and reports the
+		-- writes as property changes. They belong to the import, not to Studio.
+		if state.changeJournal ~= nil and nativeIncomingTree(instance) then
+			return true
+		end
 		local pathSegments, pathOrdinals = pathSegmentsAndOrdinalsForInstance(instance)
 		if pathSegments == nil or pathOrdinals == nil or #pathSegments == 0 or pathSegments[1] ~= serviceName then
 			-- Structural events own removals and cross-service moves. Late property

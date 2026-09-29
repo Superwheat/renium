@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -367,12 +368,34 @@ pub(crate) fn editor_revert(mut args: EditorRevertArgs) -> Result<()> {
             requested_path.as_deref().map(path_key).as_deref(),
         )?,
     };
+    if args.print {
+        let source = history_source_backup(&manifest_path)?;
+        std::io::stdout()
+            .write_all(&source)
+            .context("Failed to write the saved file content")?;
+        return Ok(());
+    }
     let (mut output, changed_paths) =
         revert_history_manifest(&project_root, &src_root, &manifest_path)?;
     if let Some(studio) = apply_reverted_paths(args, project_root, changed_paths)? {
         output["studio"] = studio;
     }
     print_json_output(&output, false)
+}
+
+/// The saved file content of a history entry, without restoring anything.
+fn history_source_backup(manifest_path: &Path) -> Result<Vec<u8>> {
+    let manifest: EditorRevertManifest = read_json_file(manifest_path)?;
+    let name = manifest
+        .source_backup
+        .as_deref()
+        .context("This history entry has no saved file content")?;
+    let manifest_dir = manifest_path
+        .parent()
+        .context("Editor revert manifest has no parent directory")?;
+    let path = manifest_dir.join(name);
+    ensure_existing_ancestor_inside(manifest_dir, &path, "source backup")?;
+    fs::read(&path).with_context(|| format!("Failed to read source backup {}", path.display()))
 }
 
 fn history_manifest_from_request(history_root: &Path, requested: &Path) -> Option<PathBuf> {
@@ -1298,6 +1321,24 @@ mod tests {
             "no temp or lock files may remain next to the store: {:?}",
             project.leftover_files()
         );
+    }
+
+    #[test]
+    fn printing_a_history_entry_returns_its_saved_source_without_restoring() {
+        let (backup, current) = deleted_script_fixture();
+        let project = HistoryProject::new(&current);
+        let manifest_path = project.write_entry(
+            "1-0-Workspace-a",
+            Some(&backup),
+            Some(("src/Workspace/A.server.luau", "return 'saved'\n")),
+            &[],
+        );
+        assert_eq!(
+            history_source_backup(&manifest_path).expect("saved source"),
+            b"return 'saved'\n"
+        );
+        let without_source = project.write_entry("2-0-Workspace-a", Some(&backup), None, &[]);
+        assert!(history_source_backup(&without_source).is_err());
     }
 
     #[test]

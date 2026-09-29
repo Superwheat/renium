@@ -16,7 +16,7 @@ rbx wait "workspace:GetAttribute('Ready') ~= nil" -c -t 20
 
 Reuse paths from `ui`'s `p` field. Paths are relative to `PlayerGui`; its prefix is optional. `Name[n]` selects duplicates.
 
-`pr --world` needs an on-screen target; use `go` first. `go PATH` walks to the nearest point of the part's or model's bounding box and stops within eight studs; `--pos` targets an exact point. Both return the remaining distance. `inp move X Y` moves the game's mouse: hover events fire, `Mouse.Target` follows it, and a following click reaches `ClickDetector`s. Positions over the top bar are refused.
+`pr --world` needs an on-screen target; use `go` first. `go PATH` walks to the nearest point of the part's or model's bounding box and stops within eight studs; `--pos` targets an exact point. Both return the remaining distance. `inp move X Y` moves the game's mouse: hover events fire, `Mouse.Target` follows it, and a following click reaches `ClickDetector`s. A point under a Roblox overlay (chat, player list) is clicked with that overlay hidden for the moment; the top bar cannot be hidden, so positions on it are refused.
 
 Input goes through the game's own input pipeline: the cursor, window focus and physical input stay untouched. Escape belongs to CoreGui; use another key or an on-screen control.
 

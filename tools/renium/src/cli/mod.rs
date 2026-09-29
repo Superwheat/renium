@@ -2205,6 +2205,12 @@ pub(super) struct EditorRevertArgs {
     pub(super) details: bool,
     #[arg(help = "Also push the restored files to Studio", long)]
     pub(super) apply_studio: bool,
+    #[arg(
+        help = "Write the saved file content to stdout instead of restoring it",
+        long,
+        conflicts_with_all = ["sync", "apply_studio", "settings_id"]
+    )]
+    pub(super) print: bool,
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
 }

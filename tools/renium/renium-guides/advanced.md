@@ -11,7 +11,7 @@ rbx pn <PLACE_ID> lobby
 rbx po <PLACE_ID> <OTHER_PLACE_ID>
 ```
 
-`status` reads connection/play state. `ro` opens the remembered local file or published place; an explicit file overrides it. An already-open matching place is reused. With several Studio places open, bind a single-place project once: `rbx cfg set place GAME_ID:PLACE_ID`.
+`status` reads connection/play state. `ro` opens the remembered local file or published place; an explicit file overrides it. An already-open matching place is reused. Other places open in Studio belong to other work; never read or change them. With several Studio places open, bind a single-place project once: `rbx cfg set place GAME_ID:PLACE_ID`.
 
 `ro` confirms launch, not bridge readiness. Run the needed Studio command next; it waits for the connection. `status -w SECONDS` waits while Studio is still starting and otherwise reports at once.
 

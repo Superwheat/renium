@@ -29,7 +29,7 @@ For a failure, inspect `rbx lst --details`, fix the cause, then retry with `rbx 
 
 When no Studio runtime connects, the `no_studio` error and `rbx status` carry a `diagnosis.verdict` naming the cause: Studio closed, plugin missing, plugin needs a Studio restart, plugin not connecting, or another place open. If Studio is closed or another place is open and the task needs Studio, reopen the bound place with `rbx ro`; relay other verdicts as is. Don't guess why a place closed.
 
-Live Sync compares each side with their last common Renium state. One-sided changes transfer; independent edits merge; conflicts wait without overwriting either side.
+Live Sync compares each side with their last common Renium state. One-sided changes transfer; independent edits merge; conflicts wait without overwriting either side. Something you added that is now missing from both Studio and the files was deleted in Studio, and the deletion synced; ask before putting it back.
 
 A published place that closed without saving reopens older than the files, and its differences count as Studio edits. Before reopening one, run `rbx cfg set liveSync.initialSyncPriority verify`, then read `rbx lst --details`: no differences means Studio kept the work. Otherwise ask the user which side to keep and use the resolution commands the CLI returns.
 
@@ -57,6 +57,6 @@ Player capacity (`Players.MaxPlayers` and `PreferredPlayers`) is managed through
 ## File-backed undo
 
 Reconciled syncs save their pre-sync state in `.renium/editor-history/sync`.
-`rbx rev --sync latest` restores the last sync's affected files; use a returned `historyId` instead of `latest` to select one. It refuses to overwrite newer edits or restore an unconfirmed transaction.
+`rbx rev --sync latest` restores the last sync's affected files; use a returned `historyId` instead of `latest` to select one. It refuses to overwrite newer edits or restore an unconfirmed transaction. `rbx rev --path FILE --print` writes a file's saved copy to stdout instead of restoring it; pass a `.renium/editor-history/<id>` entry as `--path` to pick an older copy.
 
 Live Sync transfers restored files normally. Without Live Sync, add `--apply-studio`. Use `--details` only when you need every restored path. Don't delete history you still need.
