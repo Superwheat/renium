@@ -336,6 +336,16 @@ pub(crate) fn verification_values_equal(
         if class_name == "PackageLink" && name == "ModifiedState" {
             return true;
         }
+        // The physics engine owns a part's velocities: a part inside a welded
+        // assembly gets its velocity recomputed from the assembly root once
+        // the tree is in the place, so the pushed value cannot be retained.
+        if matches!(
+            name,
+            "Velocity" | "RotVelocity" | "AssemblyLinearVelocity" | "AssemblyAngularVelocity"
+        ) && right.is_some()
+        {
+            return true;
+        }
         // Studio issues its own texture pack asset for the maps an appearance
         // carries, so a pushed pack id is a hint and whichever pack Studio
         // holds afterwards is the retained value.

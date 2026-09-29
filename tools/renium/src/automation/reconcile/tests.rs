@@ -1005,6 +1005,31 @@ fn push_verification_distinguishes_engine_identity_from_authored_data() {
 }
 
 #[test]
+fn push_verification_accepts_the_velocity_the_engine_recomputes_for_a_part() {
+    let part = SettingsBytecodeInstance::new("part".into(), "Part".into(), "Part".into(), None);
+    let velocity = |y: f64| {
+        Map::from_iter([(
+            "Velocity".to_string(),
+            json!({"x": -84.39002227783203, "y": y, "z": 8.707216262817383}),
+        )])
+    };
+    let desired = velocity(-0.8368339538574219);
+    let observed = velocity(-0.8368288278579712);
+    assert_eq!(
+        expected_map_mismatch(&desired, &observed, true, &part),
+        None
+    );
+    assert_eq!(
+        changed_map_mismatch(&velocity(0.0), &desired, &observed, true, &part),
+        None
+    );
+    assert!(expected_map_mismatch(&desired, &Map::new(), true, &part).is_some());
+    let size = Map::from_iter([("Size".to_string(), json!({"x": 1.0, "y": 2.0, "z": 3.0}))]);
+    let other = Map::from_iter([("Size".to_string(), json!({"x": 1.0, "y": 2.5, "z": 3.0}))]);
+    assert!(expected_map_mismatch(&size, &other, true, &part).is_some());
+}
+
+#[test]
 fn push_verification_accepts_the_texture_pack_studio_issues_for_an_appearance() {
     let appearance = SettingsBytecodeInstance::new(
         "appearance".into(),
