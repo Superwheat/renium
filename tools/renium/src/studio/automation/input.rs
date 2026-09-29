@@ -8,10 +8,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 #[cfg(windows)]
-use super::{client_viewport_size, input_delta, resolve_player_window};
+use super::{client_viewport_size, input_delta, os_input_preferred, resolve_player_window};
 use super::{
-    ensure_plugin_api_ok, os_input_preferred, send_virtual_input, virtual_click_actions,
-    wait_for_player_bridge,
+    ensure_plugin_api_ok, send_virtual_input, virtual_click_actions, wait_for_player_bridge,
 };
 use crate::studio::bridge::{BridgeServer, BridgeTarget};
 use crate::studio::input as input_inject;
