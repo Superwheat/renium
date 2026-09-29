@@ -58,7 +58,7 @@ output devices report an error instead of muting the system output.
 
 ## Save and publish state
 
-Synced work is in the project files and the open Studio session. `rbx status` reports `teamCreate` and `placeVersion` for the selected Edit place: with Team Create, Studio saves every edit to Roblox itself; without it, only File > Save to Roblox or a publish does, and Renium cannot see whether that happened. Players get changes only from a publish. Report what is synced and whether you published; don't call the place saved or unsaved. Offer `rbx publish` when the user wants the changes live.
+Synced work is in the project files and the open Studio session. `rbx status` reports `teamCreate` and `placeVersion` for the selected Edit place: with Team Create, Studio saves instance edits to Roblox itself, but under collaborative editing every script edit, including one Renium wrote, stays a draft that other collaborators and the saved place get only after it is committed in Studio's Drafts window; Renium cannot commit or see drafts. Without Team Create, only File > Save to Roblox or a publish saves, and Renium cannot see whether that happened. Players get changes only from a publish. A collaborator who does not see a script change in their Studio needs the draft committed, not a publish. Report what is synced and whether you published; don't call the place saved or unsaved. Offer `rbx publish` when the user wants the changes live.
 
 ## Publishing places
 

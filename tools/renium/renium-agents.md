@@ -51,7 +51,7 @@ Keep query results small (counts, slices, specific fields); write large captures
 When a check exposes a defect in what you were asked to deliver, fix and verify it rather than reporting it. Never hand the user steps you could run yourself; do them, or offer to when it is their call.
 After cleanup, one prefix search is enough; `storeRemoved: true` needs no follow-up query.
 
-Renium marks affected linked packages Changed before edits. Report `autoDesyncedPackages`, including packages named in a failed edit. Publishing needs user authorization; it is not part of syncing. Say synced, not saved: with `teamCreate: true` in `rbx status` Studio saves to Roblox itself; otherwise only the user saves or publishes.
+Renium marks affected linked packages Changed before edits. Report `autoDesyncedPackages`, including packages named in a failed edit. Publishing needs user authorization; it is not part of syncing. Say synced, not saved: with `teamCreate: true` in `rbx status` Studio saves instances itself, but script edits stay drafts until the user commits them; otherwise only the user saves or publishes.
 
 ## Tools and boundaries
 
