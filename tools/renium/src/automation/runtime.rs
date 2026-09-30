@@ -3009,7 +3009,7 @@ fn automation_response(
             let response = automation::Response::failure(request.id, started, failure);
             if let Some(error) = response.e.as_ref() {
                 eprintln!(
-                    "[renium] daemon request failed: id={}, op={}, elapsed_ms={:.1},  error={}",
+                    "[renium] daemon request failed: id={}  op={}  elapsed_ms={:.1}  error={}",
                     request.id, request.op, response.ms, error.m
                 );
             }
