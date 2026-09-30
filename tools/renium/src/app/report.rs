@@ -675,8 +675,13 @@ fn write_zip(path: &Path, files: &[(String, Vec<u8>)]) -> Result<()> {
     let file =
         fs::File::create(path).with_context(|| format!("Failed to create {}", path.display()))?;
     let mut writer = zip::ZipWriter::new(file);
+    // A fixed entry time keeps two reports of the same files byte-identical.
     let options = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
+        .compression_method(zip::CompressionMethod::Deflated)
+        .last_modified_time(
+            zip::DateTime::from_date_and_time(1980, 1, 1, 0, 0, 2)
+                .map_err(|error| anyhow::anyhow!("{error}"))?,
+        );
     for (name, bytes) in files {
         writer.start_file(name.replace('\\', "/"), options)?;
         writer.write_all(bytes)?;
