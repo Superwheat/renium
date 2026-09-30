@@ -1261,7 +1261,7 @@ end)
 
 		local items = {}
 		local truncated = false
-		local includeOffscreen = params.includeOffscreen == true
+		local includeOffscreen = params.includeOffscreen == true or params.includeOffScreen == true
 		for _, descendant in ipairs(playerGui:GetDescendants()) do
 			if descendant:IsA("GuiButton") or descendant:IsA("TextBox") then
 				local visible = inventoryVisibility(descendant)
