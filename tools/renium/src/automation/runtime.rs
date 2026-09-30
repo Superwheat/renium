@@ -1179,6 +1179,10 @@ fn automation_dispatch_operation(
             Ok(result)
         }
         op::PLACE_PUBLISH => crate::project::publish::studio_result(context, parameters, bridge),
+        #[cfg(any(windows, target_os = "macos"))]
+        op::PLACE_SNAPSHOT => crate::project::publish::snapshot_result(context, parameters, bridge),
+        #[cfg(not(any(windows, target_os = "macos")))]
+        op::PLACE_SNAPSHOT => bail!("Snapshots of the open Studio place require Windows or macOS"),
         op::FIND
         | op::TREE
         | op::INSPECT

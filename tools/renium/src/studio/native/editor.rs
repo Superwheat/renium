@@ -3442,6 +3442,17 @@ pub(crate) fn write_live_editor_place_snapshot(
     write_editor_place_snapshot(bridge, Some(args), output_path, existing_place, None, true)
 }
 
+/// The open place of a connected Edit runtime as Studio itself serializes it,
+/// written to `output_path` without any place file to merge from.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn write_edit_place_snapshot(
+    bridge: &BridgeServer,
+    runtime_id: &str,
+    output_path: &Path,
+) -> Result<usize> {
+    write_editor_place_snapshot(bridge, None, output_path, None, Some(runtime_id), true)
+}
+
 #[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn write_connected_editor_place_snapshot(
     bridge: &BridgeServer,

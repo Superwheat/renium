@@ -26,6 +26,7 @@ const STUDIO_PUBLISH_ACTION: &str = "publishToRobloxAction";
 const STUDIO_PUBLISH_WAIT: Duration = Duration::from_secs(600);
 
 #[derive(Args)]
+#[command(group = clap::ArgGroup::new("cloud_mode").args(["open_cloud", "publish_as"]))]
 pub(crate) struct PublishArgs {
     #[arg(
         long,
@@ -39,20 +40,39 @@ pub(crate) struct PublishArgs {
         help = "Upload this place file instead of building the project"
     )]
     file: Option<PathBuf>,
-    #[arg(long, requires = "open_cloud", value_parser = clap::value_parser!(i64).range(1..))]
+    #[arg(
+        long = "as",
+        value_name = "PLACE_ID",
+        conflicts_with_all = ["open_cloud", "file", "place_id"],
+        value_parser = clap::value_parser!(i64).range(1..),
+        help = "Publish the open Studio place to this place through Open Cloud, as Studio's Publish As does, without a file round trip"
+    )]
+    publish_as: Option<i64>,
+    #[arg(
+        long,
+        requires = "publish_as",
+        help = "With --as, save a version without publishing it"
+    )]
+    saved: bool,
+    #[arg(
+        long,
+        requires = "cloud_mode",
+        value_parser = clap::value_parser!(i64).range(1..),
+        help = "Universe of the destination place; defaults to the project's experience"
+    )]
     universe: Option<i64>,
     #[arg(long, requires = "open_cloud", value_parser = clap::value_parser!(i64).range(1..))]
     place_id: Option<i64>,
     #[arg(
         long,
-        requires = "open_cloud",
+        requires = "cloud_mode",
         value_name = "ENV",
         help = "API-key environment variable (default ROBLOX_API_KEY)"
     )]
     key_env: Option<String>,
     #[arg(
         long,
-        requires = "open_cloud",
+        requires = "cloud_mode",
         value_name = "NAME",
         help = "Use this stored API key"
     )]
@@ -69,6 +89,8 @@ pub(crate) struct PublishArgs {
 pub(crate) fn run(args: PublishArgs, project: Option<&Path>) -> Result<()> {
     let result = if args.open_cloud {
         open_cloud(&args, project)?
+    } else if args.publish_as.is_some() {
+        publish_as(&args, project)?
     } else {
         daemon_result(
             op::PLACE_PUBLISH,
@@ -126,6 +148,97 @@ pub(crate) fn studio_result(
 // AssetService:SavePlaceAsync only works where the Save Place API is enabled.
 // Studio's own Publish to Roblox command has no such gate, so run that command
 // and read its outcome from the Studio log.
+/// Writes the open place of the bound Edit runtime, as Studio serializes it,
+/// to the path the caller chose.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn snapshot_result(
+    context: &BoundContext,
+    parameters: &Value,
+    bridge: &BridgeServer,
+) -> Result<Value> {
+    let runtime = context
+        .runtime_id
+        .as_deref()
+        .context("No bound Edit runtime")?;
+    let output = parameters
+        .get("output")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .context("A snapshot needs an output path")?;
+    ensure!(
+        output.is_absolute() && output.extension().is_some_and(|ext| ext == "rbxl"),
+        "The snapshot output must be an absolute .rbxl path"
+    );
+    let instances =
+        crate::studio::native::editor::write_edit_place_snapshot(bridge, runtime, &output)
+            .map_err(studio_failure)?;
+    Ok(json!({
+        "ok": true,
+        "runtimeId": runtime,
+        "file": output,
+        "instances": instances,
+        "gameId": context.game_id,
+        "placeId": context.place_id,
+    }))
+}
+
+fn publish_as(args: &PublishArgs, project: Option<&Path>) -> Result<Value> {
+    cloud::keys::select(args.key.clone());
+    let target = args.publish_as.context("--as needs a place id")?;
+    let identity = cloud::command::discover_identity(project, args.universe, None)?;
+    let game_id = identity.game_id.context(
+        "Publishing as another place requires its universe; pass --universe ID when it is not the project's experience",
+    )?;
+    let identity = cloud::CloudIdentity {
+        game_id: Some(game_id),
+        place_id: Some(target),
+    };
+    let key_env = args.key_env.as_deref().unwrap_or("ROBLOX_API_KEY");
+    if !args.dry_run {
+        cloud::CloudAuth::from_env(false, key_env, None, "publish")
+            .map_err(cloud::command::cloud_error)?;
+    }
+    let file = std::env::temp_dir().join(format!(
+        "renium-publish-as-{}-{}.rbxl",
+        std::process::id(),
+        crate::app::timing::current_millis()
+    ));
+    let result = (|| -> Result<Value> {
+        let snapshot = daemon_result(
+            op::PLACE_SNAPSHOT,
+            project,
+            json!({ "output": file }),
+            false,
+            Some(&args.bridge),
+        )?;
+        // Studio serialized this place itself, so unions, appearances and every
+        // engine-owned field are intact; only the upload size limit applies.
+        let bytes = fs::metadata(&file)
+            .with_context(|| format!("Snapshot {} was not written", file.display()))?
+            .len();
+        validate_size(bytes)?;
+        let mut result = json!({
+            "ok": true, "published": false, "dryRun": args.dry_run,
+            "source": "studio", "sourcePlaceId": snapshot["placeId"],
+            "sourceRuntimeId": snapshot["runtimeId"], "instances": snapshot["instances"],
+            "gameId": game_id, "placeId": target, "bytes": bytes,
+            "versionType": if args.saved { "Saved" } else { "Published" },
+            "url": format!("https://www.roblox.com/games/{target}"),
+        });
+        if !args.dry_run {
+            let response = cloud::execute_one(identity, key_env, None, false,
+                cloud_request_with_type(&file, !args.saved))
+                .map_err(cloud::command::cloud_error)
+                .context("Publish was not confirmed. Check Version History before retrying; the upload is not automatically repeated")?;
+            result["versionNumber"] = json!(published_version(&response)?);
+            result["published"] = json!(!args.saved);
+        }
+        Ok(result)
+    })();
+    let _ = fs::remove_file(&file);
+    result
+}
+
 fn save_place_api_refused(message: &str) -> bool {
     message.contains("Save Place API") || message.contains("SavePlace")
 }
@@ -521,9 +634,13 @@ fn validate_file(path: &Path) -> Result<u64> {
 }
 
 fn cloud_request(file: &Path) -> Value {
+    cloud_request_with_type(file, true)
+}
+
+fn cloud_request_with_type(file: &Path, published: bool) -> Value {
     json!({
         "method": "POST", "path": "/universes/v1/{universe}/places/{place}/versions",
-        "query": { "versionType": "Published" }, "rawFile": file,
+        "query": { "versionType": if published { "Published" } else { "Saved" } }, "rawFile": file,
         "contentType": if file.extension().is_some_and(|ext| ext == "rbxlx") { "application/xml" } else { "application/octet-stream" },
         "timeoutSeconds": PUBLISH_SECONDS,
     })
@@ -677,6 +794,29 @@ mod tests {
     #[test]
     fn publish_defaults_to_studio_and_requires_explicit_cloud_options() {
         assert!(!args(&["rbx", "publish"]).open_cloud);
+        let publish_as = args(&[
+            "rbx",
+            "publish",
+            "--as",
+            "112966546347918",
+            "--universe",
+            "8420907710",
+            "--key",
+            "live",
+        ]);
+        assert_eq!(publish_as.publish_as, Some(112966546347918));
+        assert_eq!(publish_as.universe, Some(8420907710));
+        assert_eq!(publish_as.key.as_deref(), Some("live"));
+        assert!(!publish_as.saved);
+        assert!(
+            crate::cli::Cli::try_parse_from(["rbx", "publish", "--as", "5", "--open-cloud"])
+                .is_err()
+        );
+        assert!(crate::cli::Cli::try_parse_from(["rbx", "publish", "--saved"]).is_err());
+        assert_eq!(
+            cloud_request_with_type(Path::new("a.rbxl"), false)["query"]["versionType"],
+            "Saved"
+        );
         assert!(args(&["rbx", "publish", "--dry-run"]).dry_run);
         assert!(args(&["rbx", "publish", "--open-cloud"]).open_cloud);
         for options in [

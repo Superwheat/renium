@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### New
+
+- `rbx publish --as PLACE_ID` publishes the open Studio place to another place, as Studio's Publish As does: the place is serialized by Studio itself and uploaded through Open Cloud in one command, so a development place reaches its live place without publishing it first and downloading the version back. `--universe` names the destination's experience when it differs from the project's, `--key NAME` or `--key-env ENV` selects the key, and `--saved` stores a version without publishing it. Roblox refuses the upload with HTTP 409 while the destination is open in a Team Create session.
+
 ### Bug fixes
 
 - `rbx oc place publish FILE` no longer fails with "Invalid version type": the request defaults to `versionType=Published`, and `-q versionType=Saved` still saves without publishing. `rbx publish --open-cloud` accepts a stored key with `--key NAME` like every `rbx oc` command, not only `--key-env`.

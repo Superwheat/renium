@@ -67,6 +67,7 @@ rbx publish --dry-run
 rbx --place lobby publish
 rbx publish --open-cloud
 rbx publish --open-cloud --file build.rbxl --universe 123 --place-id 456
+rbx publish --as 456 --universe 123 --key live
 ```
 
 Publishing requires user authorization. Default: publish the selected Studio Edit
@@ -76,6 +77,12 @@ Settle pending Live Sync with `lst --wait`. When the place refuses `SavePlaceAsy
 the result from Studio's log (Windows and macOS). Don't change place settings or
 credentials to work around a refusal without authorization.
 
+`--as PLACE_ID` is Studio's Publish As: the open Edit place, serialized by Studio
+itself, goes to that place through Open Cloud in one step, so a development place
+reaches its live place without publishing it first and downloading the version
+back. `--universe` names the destination's experience when it differs from the
+project's; `--saved` stores a version without publishing it. Roblox refuses the
+upload with HTTP 409 while the destination place is open in a Team Create session.
 `--open-cloud` builds the selected place project, or uploads `--file` unchanged.
 Use `ROBLOX_API_KEY` / `--key-env ENV` with Universe Places Write. IDs come from the
 experience or explicit flags. Cloud rejects instance types its API cannot update
