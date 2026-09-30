@@ -44,3 +44,58 @@ fn snapshot_parameters_use_discovered_layout_and_captured_roots() -> Result<()> 
     }
     Ok(())
 }
+
+/// `RENIUM_PROBE_PID=PID cargo test probe_reflection_members -- --ignored --nocapture`
+/// prints the reflection descriptors of the listed members in a running Studio.
+#[test]
+#[ignore]
+fn probe_reflection_members() -> Result<()> {
+    let pid: u32 = std::env::var("RENIUM_PROBE_PID")?.parse()?;
+    let title = crate::studio::input::studio_window_title(pid)?;
+    let current = modules(pid)?;
+    let studio = current
+        .iter()
+        .find(|module| module.name.eq_ignore_ascii_case("RobloxStudioBeta.exe"))
+        .context("Studio module missing")?;
+    let layout = package_layout(&studio.path)?;
+    let memory = ProcessMemory::open(pid)?;
+    let model = active_data_model(pid, &memory, studio, layout.data, &title)?;
+    for (class, members) in [
+        (
+            "StudioPublishService",
+            &[
+                "PublishAs",
+                "ShowSaveOrPublishPlaceToRoblox",
+                "SetUploadNames",
+                "PublishLocked",
+            ][..],
+        ),
+        (
+            "HttpRbxApiService",
+            &["GetAsync", "GetDocumentationUrl"][..],
+        ),
+    ] {
+        let Some(service) = model.roots.iter().copied().find(|entry| {
+            read_instance_class(&memory, entry.instance, model.layout).as_deref() == Some(class)
+        }) else {
+            println!("{class}: no service root");
+            continue;
+        };
+        for name in members {
+            match find_class_member_descriptor(&memory, service.instance, model.layout, name) {
+                Ok(descriptor) => {
+                    let signature = read_rtti_type(&memory, descriptor, studio.base, studio.size);
+                    let kind = memory
+                        .read_u64(descriptor + 0x28)
+                        .ok()
+                        .and_then(|kind| read_msvc_string(&memory, kind as usize));
+                    println!(
+                        "{class}.{name}: descriptor={descriptor:#x} kind={kind:?} rtti={signature:?}"
+                    );
+                }
+                Err(error) => println!("{class}.{name}: {error:#}"),
+            }
+        }
+    }
+    Ok(())
+}
