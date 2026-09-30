@@ -24,6 +24,8 @@ use crate::system::files::{
 };
 
 mod build_watch;
+mod recovery;
+pub(crate) use recovery::set_aside_recovery_files;
 #[cfg(windows)]
 pub(crate) mod windows_launch;
 
@@ -831,6 +833,9 @@ pub fn launch_studio(file: Option<&Path>, project: Option<&Path>) -> Result<Valu
     let executable = studio_executable()?;
     let file = resolve_studio_file(file, project, true)?
         .context("No Studio file exists and one could not be built")?;
+    if let Some(name) = file.file_stem().and_then(OsStr::to_str) {
+        set_aside_recovery_files(name);
+    }
     let pid = spawn_studio(&executable, &[file.as_os_str()])?;
     Ok(json!({
         "ok": true,
@@ -854,6 +859,7 @@ pub fn launch_published_studio(game_id: i64, place_id: i64) -> Result<Value> {
         "--universeId",
         &game_id.to_string(),
     ];
+    set_aside_recovery_files(&place_id.to_string());
     let pid = spawn_studio(&executable, &arguments.map(OsStr::new))?;
     Ok(json!({
         "ok": true,

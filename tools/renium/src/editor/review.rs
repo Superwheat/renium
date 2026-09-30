@@ -1210,6 +1210,9 @@ fn protected_write_studio_target(_pid: u32) -> Result<PathBuf> {
 
 #[cfg(any(windows, target_os = "macos"))]
 fn reopen_protected_write_studio(target: &Path, place: &Path) -> Result<()> {
+    if let Some(name) = place.file_stem().and_then(|name| name.to_str()) {
+        crate::project::workflows::set_aside_recovery_files(name);
+    }
     crate::project::workflows::spawn_studio(target, &[place.as_os_str()])
         .with_context(|| format!("Failed to reopen Studio with {}", place.display()))?;
     Ok(())
