@@ -56,8 +56,9 @@ pub struct Request {
     pub v: u8,
     pub id: u64,
     pub op: u16,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "ctx", skip_serializing_if = "Option::is_none")]
     pub cx: Option<u64>,
+    #[serde(alias = "args")]
     pub p: Value,
 }
 
