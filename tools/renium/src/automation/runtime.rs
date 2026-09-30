@@ -1212,7 +1212,11 @@ fn automation_dispatch_operation(
         op::CONSOLE => {
             let parsed = studio_args::console(parameters)?;
             if parsed.player.is_none() {
-                let target = BridgeTarget::main_or_client(parsed.client);
+                let target = if parsed.server {
+                    BridgeTarget::Server
+                } else {
+                    BridgeTarget::main_or_client(parsed.client)
+                };
                 bridge.wait_for_target(bridge_wait_seconds, target)?;
             }
             get_console_output_result(&parsed, bridge)

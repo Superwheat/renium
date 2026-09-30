@@ -8,6 +8,7 @@
 
 ### Bug fixes
 
+- `rbx co --server` and `rbx perf --server` read the play server only. Before, when the server's bridge was not connected yet, or a request had been routed before it connected, the daemon quietly answered from the Edit window, whose console holds only the lines from launch, so later server output never appeared and an agent concluded the game had stopped logging. An explicit server request now waits for the play server and fails with the connected bridges listed when there is none.
 - `rbx oc place publish FILE` no longer fails with "Invalid version type": the request defaults to `versionType=Published`, and `-q versionType=Saved` still saves without publishing. `rbx publish --open-cloud` accepts a stored key with `--key NAME` like every `rbx oc` command, not only `--key-env`.
 - `rbx oc fetch` without `--version` now downloads the newest published version by number, read from the place's history, instead of the delivery copy, which could still serve the previous version right after a publish; the result reports the version. When the key cannot read the history, the delivery copy is used as before.
 

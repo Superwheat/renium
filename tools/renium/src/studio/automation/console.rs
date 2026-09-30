@@ -85,8 +85,11 @@ pub(crate) fn get_console_output_result(
     args: &PluginConsoleOutputArgs,
     bridge: &BridgeServer,
 ) -> Result<Value> {
-    let client = !args.server && (args.client || args.player.is_some());
-    let target = BridgeTarget::main_or_client(client);
+    let target = if args.server {
+        BridgeTarget::Server
+    } else {
+        BridgeTarget::main_or_client(args.client || args.player.is_some())
+    };
     if let Some(player) = args.player.as_deref() {
         wait_for_player_bridge(bridge, player, args.bridge.wait_seconds)?;
     }

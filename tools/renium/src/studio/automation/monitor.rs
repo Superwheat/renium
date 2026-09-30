@@ -270,7 +270,7 @@ pub(crate) fn result(
     let target = if parameters.player.is_some() {
         BridgeTarget::Client
     } else if parameters.server {
-        BridgeTarget::Main
+        BridgeTarget::Server
     } else {
         BridgeTarget::Edit
     };

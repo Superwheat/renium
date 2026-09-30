@@ -917,6 +917,9 @@ pub(crate) struct BridgeListenMetrics {
 pub(crate) enum BridgeTarget {
     Edit,
     Main,
+    /// The play server only. Unlike `Main`, an explicit server request never
+    /// falls back to the Edit window, whose console holds only launch lines.
+    Server,
     Client,
 }
 
@@ -933,6 +936,7 @@ impl BridgeTarget {
                 BRIDGE_ROLE_EDIT,
                 BRIDGE_ROLE_UNKNOWN,
             ],
+            Self::Server => &[BRIDGE_ROLE_PLAY_SERVER],
             Self::Client => &[BRIDGE_ROLE_PLAY_CLIENT],
         }
     }
@@ -1902,6 +1906,7 @@ impl BridgeServer {
                     || role == BRIDGE_ROLE_PLAY_SERVER
                     || role == BRIDGE_ROLE_UNKNOWN
             }
+            BridgeTarget::Server => role == BRIDGE_ROLE_PLAY_SERVER,
             BridgeTarget::Client => role == BRIDGE_ROLE_PLAY_CLIENT,
         }
     }
@@ -2058,6 +2063,7 @@ impl BridgeServer {
         match target {
             BridgeTarget::Edit => "edit",
             BridgeTarget::Main => "main",
+            BridgeTarget::Server => "play-server",
             BridgeTarget::Client => "play-client",
         }
     }
@@ -2072,6 +2078,7 @@ impl BridgeServer {
                 BRIDGE_ROLE_UNKNOWN => 2,
                 _ => 3,
             },
+            BridgeTarget::Server => usize::from(role != BRIDGE_ROLE_PLAY_SERVER),
             BridgeTarget::Client => usize::from(role != BRIDGE_ROLE_PLAY_CLIENT),
         }
     }

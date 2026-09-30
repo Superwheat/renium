@@ -1598,6 +1598,37 @@ fn reconnect_replaces_one_channel_without_duplicating_multiplayer_indices() {
 }
 
 #[test]
+fn an_explicit_server_target_never_falls_back_to_the_edit_window() {
+    let bridge = fixture();
+    let mut edit = client_info("edit-only", "");
+    edit.bridge_role = BRIDGE_ROLE_EDIT.into();
+    let _edit = connect(&bridge, 0, edit);
+    assert_eq!(
+        bridge.channel_count_for_selector(BridgeTarget::Main, None),
+        1
+    );
+    assert_eq!(
+        bridge.channel_count_for_selector(BridgeTarget::Server, None),
+        0
+    );
+    let mut server = client_info("server-runtime", "current");
+    server.bridge_role = BRIDGE_ROLE_PLAY_SERVER.into();
+    let _server = connect(&bridge, 1, server);
+    wait_for_client_count(&bridge, 2);
+    assert_eq!(
+        bridge.channel_count_for_selector(BridgeTarget::Server, None),
+        1
+    );
+    assert_eq!(
+        bridge
+            .runtime_pin_for_selector(BridgeTarget::Server, None)
+            .unwrap()
+            .runtime_id,
+        "server-runtime"
+    );
+}
+
+#[test]
 fn edit_status_response_filters_a_reconnected_daemons_previously_captured_inventory() {
     let bridge = fixture();
     let mut info = client_info("edit-dte", "");
