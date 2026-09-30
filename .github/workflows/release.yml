@@ -491,7 +491,8 @@ jobs:
               END { if (!found) exit 1 }
             ' tools/renium-vscode-extension/changelog.md
             printf '%s\n\n' '### Install'
-            printf '%s\n' 'On Windows, download and double-click **Install-Renium.cmd**; it selects the correct x64 or ARM64 package automatically. On macOS, extract the platform ZIP and double-click **Install Renium.command**. The installer asks which detected editor should receive the extension and puts `renium` on your PATH.'
+            printf '%s\n\n' 'On Windows, download and double-click **Install-Renium.cmd**; it selects the correct x64 or ARM64 package automatically. On macOS, extract the platform ZIP and double-click **Install Renium.command**. The installer asks which detected editor should receive the extension and puts `renium` on your PATH.'
+            printf '%s\n' 'Questions and help: [Discord](https://discord.gg/wwTFHSSNn3). Bugs: [GitHub issues](https://github.com/Superwheat/renium/issues).'
           } > /tmp/renium-release-notes.md
 
       - name: Publish

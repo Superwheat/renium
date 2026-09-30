@@ -88,6 +88,10 @@ Signed update checks run when the editor opens. **Install Update** installs
 matching components; reload the editor and restart Studio afterward.
 `renium.automaticUpdateChecks` controls these checks.
 
+## Help
+
+Questions and help: the [Discord server](https://discord.gg/wwTFHSSNn3). Bugs: [GitHub issues](https://github.com/Superwheat/renium/issues), with the Renium version, your OS, the action and the exact error.
+
 ## Development
 
 From this extension folder:

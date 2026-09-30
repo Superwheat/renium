@@ -8,7 +8,9 @@ directions while you work in either one.
 Renium also drives Studio itself: playtests with several clients, live Luau,
 consoles, input, screenshots, packages and publishing. People use it through the
 `rbx` command and a VS Code/Cursor extension, and AI coding agents use the same
-commands. It is written mostly in Rust. Bug reports and suggestions are welcome.
+commands. It is written mostly in Rust. Bug reports and suggestions are welcome
+on [GitHub issues](https://github.com/Superwheat/renium/issues) and in the
+[Discord server](https://discord.gg/wwTFHSSNn3).
 
 ## Compared with Rojo and other sync tools
 
@@ -164,6 +166,12 @@ cargo build --locked --release --manifest-path tools/renium/Cargo.toml
 The [CLI guide](tools/renium/README.md#build-from-source) has the full build and
 bundle steps. Builds and release bundles are not stored in Git. Contributors should
 read [AGENTS.md](AGENTS.md).
+
+## Community
+
+Questions, help and discussion happen in the [Discord server](https://discord.gg/wwTFHSSNn3).
+Bugs go to [GitHub issues](https://github.com/Superwheat/renium/issues); `rbx report`
+prepares a diagnostics zip to attach. Every release is announced in Discord.
 
 ## License
 

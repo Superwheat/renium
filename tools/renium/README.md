@@ -224,7 +224,8 @@ Agents read the same guides, starting from the [agent guide](renium-agents.md).
 - **Something in Renium itself broke:** run `rbx report -m "what went wrong"`. It writes a zip with the diagnostics, the daemon log and the recent `rbx` commands from your agent's transcript, with keys and home paths masked; review it, then attach it to the issue link it prints.
 
 [Report a bug](https://github.com/Superwheat/renium/issues) with the Renium version,
-your OS, the command or editor action, and the exact error.
+your OS, the command or editor action, and the exact error. For questions and help,
+join the [Discord server](https://discord.gg/wwTFHSSNn3).
 
 ## Build from source
 

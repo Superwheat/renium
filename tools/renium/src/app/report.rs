@@ -282,7 +282,7 @@ pub(crate) fn run(args: ReportArgs, global_project: Option<&Path>) -> Result<()>
             "files": files.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>(),
         }),
         &format!(
-            "Report {id} written to {}\nZip: {}\nReview it (project file, command outputs and log lines are inside; keys and home paths are masked), then open {} and attach the zip.",
+            "Report {id} written to {}\nZip: {}\nReview it (project file, command outputs and log lines are inside; keys and home paths are masked), then open {} and attach the zip, or post it in the Discord server: https://discord.gg/wwTFHSSNn3",
             directory.display(),
             zip_path.display(),
             issue_url
