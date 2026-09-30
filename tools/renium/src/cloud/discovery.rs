@@ -406,6 +406,55 @@ pub(crate) fn games_command(key_env: &str, query: Option<&str>) -> Result<Value>
     }))
 }
 
+/// The newest version that is published, read from the place's history, or
+/// None when the history cannot be read or holds no published version.
+fn latest_published_version(
+    identity: CloudIdentity,
+    key_env: &str,
+    oauth_env: Option<&str>,
+    place_id: i64,
+) -> Option<u64> {
+    let mut cursor: Option<String> = None;
+    for _ in 0..5 {
+        let mut query = json!({ "pageSize": 20 });
+        if let Some(cursor) = &cursor {
+            query["cursor"] = json!(cursor);
+        }
+        let response = execute_one(
+            identity,
+            key_env,
+            oauth_env,
+            false,
+            json!({
+                "method": "GET",
+                "path": "/place-version-history-api/v1/{place}/history",
+                "pathParams": { "place": place_id },
+                "query": query,
+            }),
+        )
+        .ok()?;
+        let body = response.get("body").unwrap_or(&response);
+        let versions = body.get("placeVersions")?.as_array()?;
+        if let Some(version) = versions.iter().find_map(|entry| {
+            entry
+                .get("isPublished")?
+                .as_bool()
+                .filter(|published| *published)?;
+            let version = entry.get("version")?;
+            version.as_u64().or_else(|| version.as_str()?.parse().ok())
+        }) {
+            return Some(version);
+        }
+        cursor = body
+            .get("hasMore")
+            .and_then(Value::as_bool)
+            .filter(|more| *more)
+            .and_then(|_| body.get("nextCursor")?.as_str().map(str::to_string));
+        cursor.as_ref()?;
+    }
+    None
+}
+
 pub(crate) struct FetchRequest {
     pub(crate) name: Option<String>,
     pub(crate) output: Option<PathBuf>,
@@ -486,7 +535,13 @@ pub(crate) fn fetch_command(
     request: FetchRequest,
 ) -> Result<Value> {
     let (place_id, name) = resolve_place(key_env, identity, request.name.as_deref())?;
-    let delivery_request = match request.version {
+    // Asset delivery can serve a stale copy of "the current place" for a while
+    // after a publish, so the newest published version is fetched by number
+    // whenever the key can read the place's history.
+    let version = request
+        .version
+        .or_else(|| latest_published_version(identity, key_env, oauth_env, place_id));
+    let delivery_request = match version {
         Some(version) => json!({
             "method": "GET",
             "path": "/asset-delivery-api/v1/assetId/{assetId}/version/{versionNumber}",
@@ -565,7 +620,7 @@ pub(crate) fn fetch_command(
         "file": output,
         "bytes": bytes,
     });
-    if let Some(version) = request.version {
+    if let Some(version) = version {
         result["version"] = json!(version);
     }
     if let Some(root) = request.project_root {

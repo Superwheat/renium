@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Bug fixes
+
+- `rbx oc place publish FILE` no longer fails with "Invalid version type": the request defaults to `versionType=Published`, and `-q versionType=Saved` still saves without publishing. `rbx publish --open-cloud` accepts a stored key with `--key NAME` like every `rbx oc` command, not only `--key-env`.
+- `rbx oc fetch` without `--version` now downloads the newest published version by number, read from the place's history, instead of the delivery copy, which could still serve the previous version right after a publish; the result reports the version. When the key cannot read the history, the delivery copy is used as before.
+
 ## 0.4.6 - 2026-09-30
 
 ### Improvements

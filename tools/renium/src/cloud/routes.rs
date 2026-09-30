@@ -268,6 +268,9 @@ macro_rules! route {
     ($category:literal, $action:literal, $method:literal, $path:literal, [$($operand:expr),* $(,)?], raw $content_type:literal) => {
         route!(@make $category, $action, $method, $path, [$($operand),*], [], None, None, BodyMode::Raw($content_type))
     };
+    ($category:literal, $action:literal, $method:literal, $path:literal, [$($operand:expr),* $(,)?], presets [$($preset:expr),* $(,)?], raw $content_type:literal) => {
+        route!(@make $category, $action, $method, $path, [$($operand),*], [$($preset),*], None, None, BodyMode::Raw($content_type))
+    };
 }
 
 static ROUTES: &[Route] = &[
@@ -559,6 +562,7 @@ static ROUTES: &[Route] = &[
         "POST",
         "/universes/v1/{universe}/places/{place}/versions",
         [raw_file("FILE")],
+        presets [q("versionType", "Published")],
         raw "application/octet-stream"
     ),
     route!(
@@ -2174,8 +2178,12 @@ fn build_request(category: &str, identity: CloudIdentity, args: RouteArgs) -> Re
         files: Map::new(),
         raw_file: None,
     };
+    // A query preset is the route's default; a `-q` value for the same name wins.
     for preset in route.presets {
-        assign_target(preset.target, parse_value(preset.value), &mut parts)?;
+        match preset.target {
+            Target::Query(name) if parts.query.contains_key(name) => {}
+            target => assign_target(target, parse_value(preset.value), &mut parts)?,
+        }
     }
     for (operand, value) in route.operands.iter().zip(args.values) {
         assign_target(operand.target, parse_value(&value), &mut parts)?;
@@ -2583,6 +2591,24 @@ mod tests {
                 )
             });
         }
+    }
+
+    #[test]
+    fn place_publish_defaults_to_a_published_version_unless_told_otherwise() {
+        let identity = CloudIdentity {
+            game_id: Some(123),
+            place_id: Some(456),
+        };
+        let file = std::env::temp_dir().join("renium-publish-route-test.rbxl");
+        std::fs::write(&file, b"<roblox!").unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let request = build_request("place", identity, args("publish", &[&path])).unwrap();
+        assert_eq!(request["query"], json!({"versionType": "Published"}));
+        let mut saved = args("publish", &[&path]);
+        saved.query = vec!["versionType=Saved".to_string()];
+        let request = build_request("place", identity, saved).unwrap();
+        assert_eq!(request["query"], json!({"versionType": "Saved"}));
+        let _ = std::fs::remove_file(file);
     }
 
     #[test]

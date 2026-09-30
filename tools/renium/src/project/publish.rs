@@ -52,6 +52,13 @@ pub(crate) struct PublishArgs {
     key_env: Option<String>,
     #[arg(
         long,
+        requires = "open_cloud",
+        value_name = "NAME",
+        help = "Use this stored API key"
+    )]
+    key: Option<String>,
+    #[arg(
+        long,
         help = "Validate and show the source and destination without publishing or checking cloud permissions"
     )]
     dry_run: bool,
@@ -357,6 +364,7 @@ fn selected_project(
 }
 
 fn open_cloud(args: &PublishArgs, project: Option<&Path>) -> Result<Value> {
+    cloud::keys::select(args.key.clone());
     let loaded = if args.file.is_none() || args.universe.is_none() || args.place_id.is_none() {
         selected_project(project, app::context::place_selector().as_deref())?
     } else {
