@@ -570,7 +570,7 @@ mod platform {
 
     unsafe extern "system" fn enum_recovery_proc(hwnd: HWND, lparam: LPARAM) -> i32 {
         let state = unsafe { &mut *(lparam as *mut EnumRecoveryState) };
-        if startup_notice(hwnd).is_some() {
+        if startup_notice_candidate(hwnd) {
             state.dialogs.push(hwnd as isize);
         }
         1
@@ -615,7 +615,7 @@ mod platform {
         state.pids
     }
 
-    fn startup_notice(hwnd: HWND) -> Option<(u32, &'static str)> {
+    fn startup_notice_window(hwnd: HWND) -> Option<(String, bool)> {
         if unsafe { IsWindowVisible(hwnd) } == 0 {
             return None;
         }
@@ -624,8 +624,51 @@ mod platform {
         if len <= 0 {
             return None;
         }
-        let button = startup_dialog_button(&String::from_utf16_lossy(&title[..len as usize]))?;
-        Some((studio_window_pid(hwnd)?, button))
+        let owned = !unsafe { GetWindow(hwnd, GW_OWNER) }.is_null();
+        Some((String::from_utf16_lossy(&title[..len as usize]), owned))
+    }
+
+    // The package notice carries Studio's generic title, so a window is only a
+    // candidate until its message is read; that read stays off the event hook.
+    fn startup_notice_candidate(hwnd: HWND) -> bool {
+        startup_notice_window(hwnd).is_some_and(|(title, owned)| {
+            startup_dialog_button(&title).is_some() || owned && title == "Roblox Studio"
+        }) && studio_window_pid(hwnd).is_some()
+    }
+
+    fn startup_notice(hwnd: HWND) -> Option<(u32, &'static str)> {
+        let (title, owned) = startup_notice_window(hwnd)?;
+        let pid = studio_window_pid(hwnd)?;
+        if let Some(button) = startup_dialog_button(&title) {
+            return Some((pid, button));
+        }
+        // Studio raises the package notice while it loads a place, before any
+        // push is watching for it, and it blocks the plugin until answered.
+        (owned && title == "Roblox Studio" && shows_package_changes_message(hwnd))
+            .then_some((pid, "OK"))
+    }
+
+    fn shows_package_changes_message(hwnd: HWND) -> bool {
+        (|| -> Result<bool> {
+            let _com = ComGuard::initialize()?;
+            let automation: IUIAutomation =
+                unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
+                    .context("Could not start Windows UI Automation")?;
+            let root = unsafe { automation.ElementFromHandle(AutomationHwnd(hwnd)) }
+                .context("Could not inspect a Studio dialog")?;
+            let condition = unsafe {
+                automation.CreatePropertyCondition(
+                    UIA_NamePropertyId,
+                    &VARIANT::from(PACKAGE_CHANGES_MESSAGE),
+                )
+            }
+            .context("Could not create the package dialog message query")?;
+            let Ok(message) = (unsafe { root.FindFirst(TreeScope_Descendants, &condition) }) else {
+                return Ok(false);
+            };
+            Ok(unsafe { message.CurrentName() }.is_ok_and(|name| name == PACKAGE_CHANGES_MESSAGE))
+        })()
+        .unwrap_or(false)
     }
 
     fn dismiss_auto_recovery_until_closed(hwnd: HWND) {
@@ -672,7 +715,7 @@ mod platform {
             && object == OBJID_WINDOW
             && child == CHILDID_SELF as i32
             && unsafe { GetAncestor(hwnd, GA_ROOT) } == hwnd
-            && startup_notice(hwnd).is_some()
+            && startup_notice_candidate(hwnd)
         {
             let window = hwnd as isize;
             std::thread::spawn(move || dismiss_auto_recovery_until_closed(window as HWND));
@@ -2707,6 +2750,11 @@ mod platform {
         unsafe {
             CFRelease(windows);
             CFRelease(application);
+        }
+        if button.is_none() {
+            // Studio raises the package notice while it loads a place, before
+            // any push is watching for it, and it blocks the plugin until answered.
+            return package_changes_ok_button(pid);
         }
         Ok(button)
     }
