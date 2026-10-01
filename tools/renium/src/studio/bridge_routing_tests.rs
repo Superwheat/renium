@@ -17,6 +17,7 @@ fn fixture() -> BridgeServer {
         next_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         preferred_index: Default::default(),
         request_gate: Mutex::new(()),
+        runtime_gates: Mutex::new(HashSet::new()),
         active_request_leases: Mutex::new(HashMap::new()),
         runtime_pins: Mutex::new(HashMap::new()),
         routing: Default::default(),

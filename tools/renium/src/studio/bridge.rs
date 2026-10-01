@@ -425,6 +425,7 @@ mod request_cancellation_tests {
             next_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             preferred_index: Default::default(),
             request_gate: Mutex::new(()),
+            runtime_gates: Mutex::new(HashSet::new()),
             active_request_leases: Mutex::new(HashMap::new()),
             runtime_pins: Mutex::new(HashMap::new()),
             #[cfg(any(windows, target_os = "macos"))]
@@ -775,6 +776,7 @@ pub(crate) struct BridgeServer {
     pub(crate) preferred_index: std::sync::atomic::AtomicUsize,
 
     pub(crate) request_gate: Mutex<()>,
+    runtime_gates: Mutex<HashSet<String>>,
     active_request_leases: Mutex<HashMap<thread::ThreadId, Arc<BridgeRequestLease>>>,
 
     pub(crate) runtime_pins: Mutex<HashMap<RuntimePinKey, RuntimePin>>,
@@ -786,6 +788,21 @@ pub(crate) struct BridgeServer {
 pub(crate) struct BridgeRequestLease {
     id: String,
     state: AtomicU8,
+}
+
+/// Holds one play runtime's request gate until dropped.
+pub(crate) struct RuntimeGateGuard<'a> {
+    bridge: &'a BridgeServer,
+    runtime_id: String,
+}
+
+impl Drop for RuntimeGateGuard<'_> {
+    fn drop(&mut self) {
+        self.bridge
+            .runtime_gates
+            .lock_recover()
+            .remove(&self.runtime_id);
+    }
 }
 
 const REQUEST_LEASE_PENDING: u8 = 0;
@@ -1017,6 +1034,60 @@ impl BridgeServer {
         }
     }
 
+    /// The play runtime a selector addresses, or None when it resolves to the
+    /// Edit window or to nothing yet.
+    pub(crate) fn play_runtime_for_selector(
+        &self,
+        target: BridgeTarget,
+        player: Option<&str>,
+    ) -> Option<String> {
+        let pin = self.runtime_pin_for_selector(target, player).ok()?;
+        match target {
+            BridgeTarget::Client | BridgeTarget::Server => Some(pin.runtime_id),
+            BridgeTarget::Main | BridgeTarget::Edit => (self.runtime_role(&pin.runtime_id)
+                == Some(BRIDGE_ROLE_PLAY_SERVER))
+            .then_some(pin.runtime_id),
+        }
+    }
+
+    fn runtime_role(&self, runtime_id: &str) -> Option<&'static str> {
+        for channel in &self.channels {
+            for snapshot in Self::cached_channel_snapshots(channel) {
+                if snapshot.bridge_info.runtime_id == runtime_id {
+                    return Some(normalize_bridge_role(Self::bridge_role_key_base(
+                        &snapshot.role_key,
+                    )));
+                }
+            }
+        }
+        None
+    }
+
+    // Requests to one play runtime run one after another. Different runtimes,
+    // and the Edit window behind the request gate, proceed concurrently.
+    pub(crate) fn acquire_runtime_gate(
+        &self,
+        runtime_id: &str,
+        lease: Option<&BridgeRequestLease>,
+    ) -> Result<RuntimeGateGuard<'_>> {
+        loop {
+            if let Some(lease) = lease {
+                lease.ensure_active()?;
+            }
+            {
+                let mut busy = self.runtime_gates.lock_recover();
+                if !busy.contains(runtime_id) {
+                    busy.insert(runtime_id.to_string());
+                    return Ok(RuntimeGateGuard {
+                        bridge: self,
+                        runtime_id: runtime_id.to_string(),
+                    });
+                }
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     pub(crate) fn activate_request_lease(
         &self,
         lease: Arc<BridgeRequestLease>,
@@ -1189,6 +1260,7 @@ impl BridgeServer {
             next_id,
             preferred_index: std::sync::atomic::AtomicUsize::new(0),
             request_gate: Mutex::new(()),
+            runtime_gates: Mutex::new(HashSet::new()),
             active_request_leases: Mutex::new(HashMap::new()),
             runtime_pins: Mutex::new(HashMap::new()),
             #[cfg(any(windows, target_os = "macos"))]

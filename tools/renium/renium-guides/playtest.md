@@ -36,7 +36,7 @@ In Edit, each `l` run requires ModuleScripts fresh from their current source, so
 
 Return values instead of printing. Luau errors and timeouts exit nonzero; captured `print`/`warn` text returns to the caller without entering Studio Output. `co` reads game/Studio messages. An empty `co` result means there were none; don't re-read `LogService` with `l` or `lc`. A stack naming `cloud_<id>` or `user_<name>` scripts comes from an installed Studio plugin, not the game.
 
-Keep live queries bounded. Don't run nested descendant scans over saved data. Don't hold a command open while issuing another: register an observer, return, act, then read its result. Runners are removed on return; persistent test fixtures need a temporary source script.
+Keep live queries bounded. Don't run nested descendant scans over saved data. Requests to different play runtimes (the server, each client) run concurrently; two requests to the same runtime run one after another, so a long `lc` on client 1 never holds up client 2. Don't hold a command open while issuing another: register an observer, return, act, then read its result. Runners are removed on return; persistent test fixtures need a temporary source script. A Renium call takes about 30 ms inside the process; the rest of what you measure is your shell.
 
 For larger programs, pipe code to `rbx l -` or `rbx lc - PLAYER`. In PowerShell, single-quote code and double an embedded apostrophe; backslash does not escape PowerShell quotes. Windows PowerShell 5.1 also drops double quotes inside native arguments: there, write Luau strings as `[[text]]` or pipe the code.
 

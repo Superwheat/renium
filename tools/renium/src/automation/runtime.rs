@@ -42,7 +42,7 @@ use crate::studio::automation::{
     record_end_result, record_start_result, shot_result, start_stop_play_result,
     studio_change_state_result, studio_device_result, type_result, ui_result, wait_until_result,
 };
-use crate::studio::bridge::{BridgeRequestLease, BridgeServer, BridgeTarget};
+use crate::studio::bridge::{BridgeRequestLease, BridgeServer, BridgeTarget, RuntimeGateGuard};
 #[cfg(any(windows, target_os = "macos"))]
 use crate::studio::input as input_inject;
 use crate::system::LockRecover;
@@ -2985,15 +2985,23 @@ fn automation_response(
         {
             restore_persisted_live_sync_for_request(&request, state, bridge, bridge_wait_seconds)?;
         }
-        let _request_guard = if queued {
-            Some(match request_lease.as_deref() {
-                Some(lease) => bridge
-                    .acquire_request_gate_for_lease(lease)
+        let _request_guard = if !queued {
+            None
+        } else if let Some(runtime_id) = play_target_runtime(bridge, request.op, &request.p) {
+            Some(RequestGuard::Runtime {
+                _held: bridge
+                    .acquire_runtime_gate(&runtime_id, request_lease.as_deref())
                     .map_err(cancelled)?,
-                None => bridge.acquire_request_gate(),
             })
         } else {
-            None
+            Some(RequestGuard::Global {
+                _held: match request_lease.as_deref() {
+                    Some(lease) => bridge
+                        .acquire_request_gate_for_lease(lease)
+                        .map_err(cancelled)?,
+                    None => bridge.acquire_request_gate(),
+                },
+            })
         };
         let _lease_guard = match request_lease.as_ref() {
             Some(lease) => Some(
@@ -3025,6 +3033,65 @@ fn automation_response(
         }
     };
     response.with_update(state.available_update())
+}
+
+enum RequestGuard<'a> {
+    Global {
+        _held: std::sync::MutexGuard<'a, ()>,
+    },
+    Runtime {
+        _held: RuntimeGateGuard<'a>,
+    },
+}
+
+/// The play runtime a request works inside, when its operation touches only
+/// that runtime and the selector resolves to a play server or client.
+fn play_target_runtime(
+    bridge: &BridgeServer,
+    operation: u16,
+    parameters: &Value,
+) -> Option<String> {
+    let (target, player) = play_target_selector(operation, parameters)?;
+    bridge.play_runtime_for_selector(target, player.as_deref())
+}
+
+fn play_target_selector(
+    operation: u16,
+    parameters: &Value,
+) -> Option<(BridgeTarget, Option<String>)> {
+    if !matches!(
+        operation,
+        op::LUAU
+            | op::CONSOLE
+            | op::SHOT
+            | op::UI
+            | op::PRESS
+            | op::CLICK
+            | op::KEY
+            | op::TYPE
+            | op::WAIT
+            | op::GOTO
+            | op::INPUT
+    ) {
+        return None;
+    }
+    let object = parameters.as_object()?;
+    let flag = |key: &str| object.get(key).and_then(Value::as_bool) == Some(true);
+    if flag("studio") {
+        return None;
+    }
+    let player = object.get("player").and_then(|value| match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    });
+    if player.is_some() || flag("client") {
+        Some((BridgeTarget::Client, player))
+    } else if flag("server") {
+        Some((BridgeTarget::Server, None))
+    } else {
+        Some((BridgeTarget::Main, None))
+    }
 }
 
 pub(crate) fn automation_parse_response_with_lease(
@@ -3085,6 +3152,35 @@ mod tests {
             assert!(!automation_retry_is_safe(operation, &json!({}), &ended));
             assert!(!automation_retry_is_safe(operation, &json!({}), &busy));
         }
+    }
+
+    #[test]
+    fn play_target_requests_are_gated_by_the_runtime_they_address() {
+        assert_eq!(
+            play_target_selector(op::LUAU, &json!({"player": "2"})),
+            Some((BridgeTarget::Client, Some("2".to_string())))
+        );
+        assert_eq!(
+            play_target_selector(op::INPUT, &json!({"player": 1})),
+            Some((BridgeTarget::Client, Some("1".to_string())))
+        );
+        assert_eq!(
+            play_target_selector(op::CONSOLE, &json!({"server": true})),
+            Some((BridgeTarget::Server, None))
+        );
+        assert_eq!(
+            play_target_selector(op::LUAU, &json!({"code": "return 1"})),
+            Some((BridgeTarget::Main, None))
+        );
+        assert_eq!(
+            play_target_selector(op::SHOT, &json!({"studio": true})),
+            None
+        );
+        assert_eq!(
+            play_target_selector(op::PUSH, &json!({"player": "1"})),
+            None
+        );
+        assert_eq!(play_target_selector(op::PLAY_START, &json!({})), None);
     }
 
     #[test]
