@@ -55,6 +55,9 @@ pub(crate) fn execute_luau_command(mut args: ExecuteLuauArgs) -> Result<()> {
     if args.code.is_none() {
         args.code = args.inline_code.take();
     }
+    if args.runner.collect.is_some() && (args.code.is_some() || args.file.is_some()) {
+        bail!("--collect reads a detached runner and takes no code");
+    }
     if args.code.as_deref() == Some("-") || args.file.as_deref() == Some(std::path::Path::new("-"))
     {
         let mut code = String::new();
@@ -68,6 +71,10 @@ pub(crate) fn execute_luau_command(mut args: ExecuteLuauArgs) -> Result<()> {
         "client": args.client,
         "player": args.player,
         "timeout": args.timeout,
+        "detach": args.runner.detach,
+        "collect": args.runner.collect,
+        "stop": args.runner.stop,
+        "lifetime": args.runner.lifetime,
         "bridgeWaitSeconds": args.bridge.wait_seconds,
         "bridgePorts": args.bridge.ports,
     });
@@ -198,6 +205,16 @@ pub(crate) fn cooperative_luau(code: &str) -> Result<String> {
     })
 }
 
+fn luau_request(code: &str, chunk_name: &str, target: BridgeTarget, timeout: f64) -> Result<Value> {
+    let code = cooperative_luau(code)?;
+    Ok(json!({
+        "code": code,
+        "chunkName": chunk_name,
+        "context": if target == BridgeTarget::Client { "client" } else { "plugin" },
+        "timeoutSeconds": timeout,
+    }))
+}
+
 fn call_execute_luau(
     bridge: &BridgeServer,
     target: BridgeTarget,
@@ -207,22 +224,45 @@ fn call_execute_luau(
     timeout: f64,
     response_padding: f64,
 ) -> Result<Value> {
-    let code = cooperative_luau(code)?;
     bridge.call_for_selector_with_timeout(
         "executeLuau",
-        json!({
-            "code": code,
-            "chunkName": chunk_name,
-            "context": if target == BridgeTarget::Client { "client" } else { "plugin" },
-            "timeoutSeconds": timeout,
-        }),
+        luau_request(code, chunk_name, target, timeout)?,
         target,
         player,
         Some(Duration::from_secs_f64(timeout + response_padding)),
     )
 }
 
+fn runner_name(name: &str) -> Result<&str> {
+    let valid = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
+    if !valid {
+        bail!("Runner names use up to 64 letters, digits, '_' or '-'");
+    }
+    Ok(name)
+}
+
 pub(crate) fn execute_luau_result(args: ExecuteLuauArgs, bridge: &BridgeServer) -> Result<Value> {
+    let client = args.client || args.player.is_some();
+    let target = BridgeTarget::main_or_client(client);
+    let player = args.player.as_deref();
+    if let Some(player) = player {
+        wait_for_player_bridge(bridge, player, args.bridge.wait_seconds)?;
+    }
+    if let Some(name) = args.runner.collect.as_deref() {
+        let result = bridge.call_for_selector_with_timeout(
+            "collectLuauRunner",
+            json!({ "name": runner_name(name)?, "stop": args.runner.stop }),
+            target,
+            player,
+            Some(Duration::from_secs(30)),
+        )?;
+        ensure_luau_api_ok(&result)?;
+        return Ok(result);
+    }
     let code = if let Some(code) = args.code.or(args.inline_code) {
         code
     } else if let Some(path) = args.file {
@@ -230,22 +270,24 @@ pub(crate) fn execute_luau_result(args: ExecuteLuauArgs, bridge: &BridgeServer) 
     } else {
         bail!("Missing Luau code. Use -e <code> or -f <file>.");
     };
-    let client = args.client || args.player.is_some();
     let timeout = args.timeout.clamp(0.1, 120.0);
-    let target = BridgeTarget::main_or_client(client);
-    if let Some(player) = args.player.as_deref() {
-        wait_for_player_bridge(bridge, player, args.bridge.wait_seconds)?;
+    let mut request = luau_request(&code, "Renium", target, timeout)?;
+    let detached = args.runner.detach.as_deref().map(runner_name).transpose()?;
+    if let Some(name) = detached {
+        request["detach"] = json!(name);
+        request["lifetimeSeconds"] = json!(args.runner.lifetime.clamp(1.0, 3600.0));
     }
-    let result = call_execute_luau(
-        bridge,
+    let result = bridge.call_for_selector_with_timeout(
+        "executeLuau",
+        request,
         target,
-        args.player.as_deref(),
-        &code,
-        "Renium",
-        timeout,
-        10.0,
+        player,
+        Some(Duration::from_secs_f64(timeout + 10.0)),
     )?;
     ensure_luau_api_ok(&result)?;
+    if detached.is_some() && result.get("detached").is_none() {
+        bail!("The Studio plugin predates detached runners; run rbx setup and restart Studio");
+    }
     Ok(result)
 }
 
@@ -2679,6 +2721,14 @@ pub(crate) struct TestLaunch {
 #[cfg(test)]
 mod play_state_tests {
     use super::*;
+
+    #[test]
+    fn runner_names_are_short_identifiers() {
+        assert!(runner_name("jump-sampler_2").is_ok());
+        assert!(runner_name("").is_err());
+        assert!(runner_name("has space").is_err());
+        assert!(runner_name(&"x".repeat(65)).is_err());
+    }
 
     #[test]
     fn multiplayer_start_waits_while_instances_keep_arriving() {

@@ -42,6 +42,7 @@ require("./network-workloads")
 require("./performance-workloads")
 require("./microprofiler-workloads")
 require("./microprofiler-analysis-workloads")
+require("./detached-runner-workloads")
 
 local function equal(actual, expected, label)
 	if actual ~= expected then

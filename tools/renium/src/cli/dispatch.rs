@@ -94,15 +94,21 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::ExplorerDaemon(args) => explorer_daemon(args),
         Commands::GetConsoleOutput(args) => get_console_output_command(args),
         Commands::ExecuteLuau(args) => execute_luau_command(args),
-        Commands::ExecuteClientLuau(args) => execute_luau_command(ExecuteLuauArgs {
-            bridge: args.bridge,
-            code: Some(args.code),
-            inline_code: None,
-            file: None,
-            client: args.player.is_none(),
-            player: args.player,
-            timeout: args.timeout,
-        }),
+        Commands::ExecuteClientLuau(mut args) => {
+            if args.runner.collect.is_some() && args.player.is_none() {
+                args.player = args.code.take();
+            }
+            execute_luau_command(ExecuteLuauArgs {
+                bridge: args.bridge,
+                code: args.code,
+                inline_code: None,
+                file: None,
+                client: args.player.is_none(),
+                player: args.player,
+                timeout: args.timeout,
+                runner: args.runner,
+            })
+        }
         Commands::StudioDevice(args) => studio_device_command(args),
         Commands::NetworkSimulation(args) => crate::studio::automation::network::command(args),
         Commands::PropertyAccess(args) => crate::studio::automation::property_access::command(args),

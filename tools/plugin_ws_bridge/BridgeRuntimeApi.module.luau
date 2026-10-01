@@ -502,6 +502,7 @@ function BridgeRuntimeApi.create(plugin, runtimeContext)
 	local cancellationGeneration = 0
 	local retainedRunners = {}
 	local retainedRunnerSequence = 0
+	local detachedRunners = {}
 
 	local function assertOperationOwnership(operationGeneration, sessionGeneration)
 		if operationGeneration ~= cancellationGeneration then
@@ -592,6 +593,15 @@ function BridgeRuntimeApi.create(plugin, runtimeContext)
 
 	local api = {}
 
+	local function dropDetachedRunner(name)
+		local entry = detachedRunners[name]
+		if entry == nil then
+			return
+		end
+		detachedRunners[name] = nil
+		entry.instance:Destroy()
+	end
+
 	local function executeWithRunner(
 		parent,
 		className,
@@ -601,9 +611,13 @@ function BridgeRuntimeApi.create(plugin, runtimeContext)
 		timeoutSeconds,
 		context,
 		backgroundLifetimeSeconds,
-		operationGeneration
+		operationGeneration,
+		detach
 	)
 		assertOperationOwnership(operationGeneration)
+		if detach ~= nil then
+			dropDetachedRunner(detach.name)
+		end
 		local scriptInstance = Instance.new(className)
 		scriptInstance.Name = baseName .. "_" .. tostring(runnerSequence + 1)
 		scriptInstance.Enabled = false
@@ -613,6 +627,12 @@ function BridgeRuntimeApi.create(plugin, runtimeContext)
 		local resultEvent = Instance.new("BindableEvent")
 		resultEvent.Name = "__ReniumResult"
 		resultEvent.Parent = scriptInstance
+		local collectFunction = nil
+		if detach ~= nil then
+			collectFunction = Instance.new("BindableFunction")
+			collectFunction.Name = "__ReniumCollect"
+			collectFunction.Parent = scriptInstance
+		end
 		local status = nil
 		local values = nil
 		local resultConnection = resultEvent.Event:Connect(function(nextStatus, ...)
@@ -636,6 +656,9 @@ function BridgeRuntimeApi.create(plugin, runtimeContext)
 		local wrapped = ([==[
 local resultEvent = script:FindFirstChild("__ReniumResult")
 if resultEvent == nil then return end
+local collectFunction = script:FindFirstChild("__ReniumCollect")
+local detached = %s
+local state = {}
 local output = {}
 local outputBytes = 0
 local outputTruncated = false
@@ -665,6 +688,8 @@ end
 local print = function(...) capture("print", ...) end
 local warn = function(...) capture("warn", ...) end
 local finished = false
+local finalStatus = nil
+local finalValues = nil
 local worker
 worker = task.spawn(function()
 	local packed = table.pack(xpcall(function()
@@ -675,18 +700,34 @@ worker = task.spawn(function()
 	if finished then return end
 	finished = true
 	if packed[1] then
+		finalStatus = "ok"
+		finalValues = table.pack(table.unpack(packed, 2, packed.n))
 		resultEvent:Fire("ok", output, table.unpack(packed, 2, packed.n))
 	else
+		finalStatus = "error"
+		finalValues = table.pack(tostring(packed[2]))
 		resultEvent:Fire("error", tostring(packed[2]), output)
 	end
 end)
-task.delay(%.6f, function()
-	if finished then return end
-	finished = true
-	pcall(task.cancel, worker)
-	resultEvent:Fire("timeout", output)
-end)
+if detached then
+	if collectFunction ~= nil then
+		collectFunction.OnInvoke = function()
+			return { done = finished, status = finalStatus, results = finalValues, output = output, state = state }
+		end
+	end
+	if not finished then
+		resultEvent:Fire("detached", output)
+	end
+else
+	task.delay(%.6f, function()
+		if finished then return end
+		finished = true
+		pcall(task.cancel, worker)
+		resultEvent:Fire("timeout", output)
+	end)
+end
 ]==]):format(
+			if detach ~= nil then "true" else "false",
 			COMMAND_OUTPUT_MESSAGE_BYTE_LIMIT,
 			COMMAND_OUTPUT_ENTRY_LIMIT,
 			COMMAND_OUTPUT_BYTE_LIMIT,
@@ -709,8 +750,26 @@ end)
 			logError = tostring(ownershipError)
 		end
 		local retained = logError == nil and status == "ok" and backgroundLifetimeSeconds and backgroundLifetimeSeconds > 0
+		local detachedEntry = nil
+		if detach ~= nil and logError == nil and (status == "ok" or status == "detached") then
+			detachedEntry = {
+				instance = scriptInstance,
+				collect = collectFunction,
+				generation = operationGeneration,
+				context = context,
+				path = path,
+				startedAt = os.clock(),
+			}
+			detachedRunners[detach.name] = detachedEntry
+			task.delay(detach.lifetimeSeconds, function()
+				if detachedRunners[detach.name] == detachedEntry then
+					detachedRunners[detach.name] = nil
+					scriptInstance:Destroy()
+				end
+			end)
+		end
 		local executionId = nil
-		if retained then
+		if retained and detachedEntry == nil then
 			retainedRunnerSequence += 1
 			executionId = `{runtimeContext.runtimeId or "runtime"}:{retainedRunnerSequence}`
 			retainedRunners[executionId] = {
@@ -724,7 +783,7 @@ end)
 					scriptInstance:Destroy()
 				end
 			end)
-		else
+		elseif detachedEntry == nil then
 			scriptInstance.Enabled = false
 			scriptInstance:Destroy()
 		end
@@ -736,6 +795,17 @@ end)
 				ok = false,
 				error = tostring(values and values[1] or "Luau runner failed"),
 				output = if values and type(values[2]) == "table" then values[2] else {},
+				runner = true,
+				path = path,
+				context = context,
+			}
+		end
+		if status == "detached" then
+			return {
+				ok = true,
+				detached = detach.name,
+				running = true,
+				output = if values and type(values[1]) == "table" then values[1] else {},
 				runner = true,
 				path = path,
 				context = context,
@@ -766,8 +836,62 @@ end)
 			runner = true,
 			background = not not retained,
 			executionId = executionId,
+			detached = if detach ~= nil then detach.name else nil,
+			running = if detach ~= nil then false else nil,
 			path = path,
 			context = context,
+		}
+	end
+
+	local function detachedRunnerNames()
+		local names = {}
+		for name in pairs(detachedRunners) do
+			names[#names + 1] = name
+		end
+		table.sort(names)
+		return names
+	end
+
+	function api.collectLuauRunner(params)
+		local name = tostring(params.name or "")
+		local entry = detachedRunners[name]
+		if entry == nil then
+			local names = detachedRunnerNames()
+			return {
+				ok = false,
+				error = if #names == 0
+					then `No detached runner named "{name}" is running here`
+					else `No detached runner named "{name}"; running: {table.concat(names, ", ")}`,
+			}
+		end
+		local invokeOk, snapshot = pcall(entry.collect.Invoke, entry.collect)
+		if params.stop == true then
+			dropDetachedRunner(name)
+		end
+		if not invokeOk then
+			return { ok = false, error = `Could not read runner "{name}": {tostring(snapshot)}` }
+		end
+		if type(snapshot) ~= "table" then
+			return { ok = false, error = `Runner "{name}" returned no state` }
+		end
+		local results = {}
+		if type(snapshot.results) == "table" then
+			for index = 1, snapshot.results.n or #snapshot.results do
+				results[#results + 1] = serializeApiValue(snapshot.results[index])
+			end
+		end
+		return {
+			ok = true,
+			name = name,
+			done = snapshot.done == true,
+			status = snapshot.status,
+			results = results,
+			output = if type(snapshot.output) == "table" then snapshot.output else {},
+			state = serializeApiValue(snapshot.state),
+			stopped = params.stop == true,
+			elapsedSeconds = math.floor((os.clock() - entry.startedAt) * 1000 + 0.5) / 1000,
+			path = entry.path,
+			context = entry.context,
 		}
 	end
 
@@ -2367,6 +2491,13 @@ updateMouse()
 		backgroundLifetimeSeconds = if backgroundLifetimeSeconds
 			then math.clamp(backgroundLifetimeSeconds, 0.1, 610)
 			else nil
+		local detach = nil
+		if params.detach ~= nil then
+			detach = {
+				name = tostring(params.detach),
+				lifetimeSeconds = math.clamp(BridgeValueCodec.decodeNumber(params.lifetimeSeconds) or 600, 1, 3600),
+			}
+		end
 
 		local context = string.lower(tostring(params.context or "plugin"))
 		if context == "client" then
@@ -2390,7 +2521,8 @@ updateMouse()
 				timeoutSeconds,
 				"client",
 				backgroundLifetimeSeconds,
-				operationGeneration
+				operationGeneration,
+				detach
 			)
 		end
 
@@ -2404,8 +2536,13 @@ updateMouse()
 				timeoutSeconds,
 				"server",
 				backgroundLifetimeSeconds,
-				operationGeneration
+				operationGeneration,
+				detach
 			)
+		end
+
+		if detach ~= nil then
+			return { ok = false, error = "Detached runners need Play; the Edit window runs code to completion" }
 		end
 
 		if type(loadstring) ~= "function" then
@@ -2893,6 +3030,12 @@ updateMouse()
 		for executionId, entry in pairs(retainedRunners) do
 			if entry.generation == cancelledGeneration then
 				retainedRunners[executionId] = nil
+				entry.instance:Destroy()
+			end
+		end
+		for name, entry in pairs(detachedRunners) do
+			if entry.generation == cancelledGeneration then
+				detachedRunners[name] = nil
 				entry.instance:Destroy()
 			end
 		end

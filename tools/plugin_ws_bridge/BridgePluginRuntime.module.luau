@@ -4324,6 +4324,7 @@ function BridgePluginRuntime.start(context)
 	end
 	Config.bridgeMethodHandlers.captureViewportProbe = RuntimeApi.captureViewportProbe
 	Config.bridgeMethodHandlers.executeLuau = RuntimeApi.executeLuau
+	Config.bridgeMethodHandlers.collectLuauRunner = RuntimeApi.collectLuauRunner
 	Config.bridgeMethodHandlers.startStopPlay = RuntimeApi.startStopPlay
 	Config.bridgeMethodHandlers.getStudioState = RuntimeApi.studioState
 	Config.bridgeMethodHandlers.getCreatorContext = Config.creatorApi.creatorContext
@@ -4504,6 +4505,7 @@ function BridgePluginRuntime.start(context)
 		performance = true,
 		captureViewportProbe = true,
 		executeLuau = true,
+		collectLuauRunner = true,
 		startStopPlay = true,
 		getStudioState = true,
 		getCreatorContext = true,

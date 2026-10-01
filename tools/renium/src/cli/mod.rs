@@ -1111,14 +1111,16 @@ pub(super) struct ExecuteLuauArgs {
         default_value_t = 10.0
     )]
     pub(super) timeout: f64,
+    #[command(flatten)]
+    pub(super) runner: LuauRunnerArgs,
 }
 
 #[derive(Parser)]
 pub(super) struct ExecuteClientLuauArgs {
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
-    #[arg(help = "Luau code (- for stdin)")]
-    pub(super) code: String,
+    #[arg(help = "Luau code (- for stdin)", required_unless_present = "collect")]
+    pub(super) code: Option<String>,
     #[arg(help = "Play client by name or index")]
     pub(super) player: Option<String>,
     #[arg(
@@ -1128,6 +1130,39 @@ pub(super) struct ExecuteClientLuauArgs {
         default_value_t = 10.0
     )]
     pub(super) timeout: f64,
+    #[command(flatten)]
+    pub(super) runner: LuauRunnerArgs,
+}
+
+#[derive(Parser, Default)]
+pub(super) struct LuauRunnerArgs {
+    #[arg(
+        long,
+        value_name = "NAME",
+        help = "During Play, return once the code first yields and keep its threads running; it records into the `state` table"
+    )]
+    pub(super) detach: Option<String>,
+    #[arg(
+        long,
+        value_name = "NAME",
+        conflicts_with = "detach",
+        help = "Read a detached runner's state, output and final result (lc: --collect NAME [PLAYER])"
+    )]
+    pub(super) collect: Option<String>,
+    #[arg(
+        long,
+        requires = "collect",
+        help = "With --collect, stop and remove the runner"
+    )]
+    pub(super) stop: bool,
+    #[arg(
+        long,
+        requires = "detach",
+        value_name = "SECONDS",
+        default_value_t = 600.0,
+        help = "Seconds a detached runner stays alive"
+    )]
+    pub(super) lifetime: f64,
 }
 
 #[derive(Parser)]
