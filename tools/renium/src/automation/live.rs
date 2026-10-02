@@ -85,6 +85,10 @@ struct Status {
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_error_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     terrain_observation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     conflicts: Option<Vec<String>>,
@@ -614,7 +618,10 @@ impl Control {
     }
 
     fn fail_with_conflicts(&self, error: String, conflicts: Vec<String>) {
+        log_global(3, format_args!("[renium] live sync error: {error}"));
         let mut status = self.status.lock_recover();
+        status.last_error = Some(error.clone());
+        status.last_error_at = Some((crate::app::timing::current_millis() / 1000) as u64);
         status.error = Some(error);
         status.conflicts = (!conflicts.is_empty()).then_some(conflicts);
         drop(status);
