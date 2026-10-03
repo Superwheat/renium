@@ -111,6 +111,7 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         }
         Commands::StudioDevice(args) => studio_device_command(args),
         Commands::NetworkSimulation(args) => crate::studio::automation::network::command(args),
+        Commands::RenderQuality(args) => crate::studio::automation::render_quality::command(args),
         Commands::PropertyAccess(args) => crate::studio::automation::property_access::command(args),
         Commands::PerformanceMonitor(args) => crate::studio::automation::monitor::command(args),
         Commands::PerformanceProfile(args) => crate::cli::performance::run(args),

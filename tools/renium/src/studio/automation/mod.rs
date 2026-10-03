@@ -37,6 +37,7 @@ mod process_exit;
 pub(crate) mod property_access;
 mod recording;
 mod recording_review;
+pub(crate) mod render_quality;
 
 pub(crate) use console::{get_console_output_command, get_console_output_result};
 pub(crate) use input::input_result;

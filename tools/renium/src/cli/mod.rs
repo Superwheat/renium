@@ -420,6 +420,12 @@ pub(super) enum Commands {
     )]
     NetworkSimulation(crate::studio::automation::network::NetworkArgs),
     #[command(
+        name = "gfx",
+        alias = "quality",
+        about = "Show or set Studio render quality for the Edit window or a play client"
+    )]
+    RenderQuality(crate::studio::automation::render_quality::RenderQualityArgs),
+    #[command(
         name = "access",
         about = "Control access to security-protected Studio properties and functions"
     )]

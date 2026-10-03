@@ -16,6 +16,10 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
         "Examples:\n  rbx perf snapshot --player 1\n  rbx perf start --player 1 --seconds 10\n  rbx perf stop --player 1 --capture ID\n  rbx perf export --player 1 --capture ID --out trace.json",
     ),
     (
+        "gfx",
+        "Examples:\n  rbx gfx\n  rbx gfx max\n  rbx gfx set --play 21 --player 1\n  rbx gfx set --edit auto\n  rbx gfx restore",
+    ),
+    (
         "net",
         "Examples:\n  rbx net presets\n  rbx net set --player 1 --preset mid\n  rbx net set --player 1 --in-delay 50 --out-jitter 10\n  rbx net show --player 2\n  rbx net restore --player 1",
     ),

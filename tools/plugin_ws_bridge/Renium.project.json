@@ -82,6 +82,9 @@
       "BridgeNetworkSimulation": {
         "$path": "BridgeNetworkSimulation.module.luau"
       },
+      "BridgeRenderQuality": {
+        "$path": "BridgeRenderQuality.module.luau"
+      },
       "BridgeCreatorApi": {
         "$path": "BridgeCreatorApi.module.luau"
       },

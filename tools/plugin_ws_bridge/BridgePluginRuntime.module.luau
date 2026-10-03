@@ -422,6 +422,11 @@ function BridgePluginRuntime.start(context)
 	local networkSimulation = requireChildModule("BridgeNetworkSimulation").create(function()
 		return settings():GetService("NetworkSettings")
 	end)
+	local renderQuality = requireChildModule("BridgeRenderQuality").create(function()
+		return settings():GetService("RenderSettings")
+	end, function()
+		return UserSettings():GetService("UserGameSettings")
+	end, Enum.QualityLevel:GetEnumItems())
 	-- Roblox's version() global is available in Studio but absent from Selene's stdlib.
 	-- selene: allow(undefined_variable)
 	local studioVersion = version()
@@ -4303,6 +4308,14 @@ function BridgePluginRuntime.start(context)
 		result.scope = if isClient then "client-process" else "studio-settings"
 		return result
 	end
+	Config.bridgeMethodHandlers.renderQuality = function(p)
+		local isClient = Config.bridgeRole == "play-client"
+		assert((p.client == true) == isClient, "Render quality target changed; select the current client")
+		local result = renderQuality.handle(p)
+		result.runtimeId = Config.bridgeRuntimeId
+		result.scope = if isClient then "client-process" else "studio-settings"
+		return result
+	end
 	Config.bridgeMethodHandlers.performance = function(p)
 		assert(p.runtimeId == Config.bridgeRuntimeId, "Performance target changed; select the current runtime")
 		if p.action == "micro-start" then
@@ -4444,6 +4457,7 @@ function BridgePluginRuntime.start(context)
 		finishEditorBinaryExport = true,
 		deviceSimulator = true,
 		networkSimulation = true,
+		renderQuality = true,
 		captureViewportProbe = true,
 		sendVirtualInput = true,
 		executeLuau = true,
@@ -4502,6 +4516,7 @@ function BridgePluginRuntime.start(context)
 		sendVirtualInput = true,
 		deviceSimulator = true,
 		networkSimulation = true,
+		renderQuality = true,
 		performance = true,
 		captureViewportProbe = true,
 		executeLuau = true,
@@ -4585,6 +4600,7 @@ function BridgePluginRuntime.start(context)
 				performance.cleanup()
 				if unloading then
 					networkSimulation.restore()
+					renderQuality.restore()
 				end
 				microProfiler.cleanup()
 			end

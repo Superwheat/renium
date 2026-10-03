@@ -4,7 +4,7 @@
 
 Performance diagnostics need no protected-property mode or per-property approval.
 
-Select the intended place and Edit/server/client runtime. Reuse existing sessions; profiling is not a reason to start Play when the data needed is already captured. Keep raw captures tied to their runtime, build and timestamps. Report measured frame times and supporting scopes, not guessed causes or sums of overlapping work.
+Select the intended place and Edit/server/client runtime. Reuse existing sessions; profiling is not a reason to start Play when the data needed is already captured. Keep raw captures tied to their runtime, build and timestamps. Report measured frame times and supporting scopes, not guessed causes or sums of overlapping work. Record the render quality with the numbers (`rbx gfx`, `--player N` for a client): frame times at level 21 and at automatic are different measurements. Change it only when the task names a level, and `rbx gfx restore` afterwards.
 
 ## Renium frame counters
 

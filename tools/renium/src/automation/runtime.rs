@@ -1243,6 +1243,11 @@ fn automation_dispatch_operation(
         op::NETWORK_SIMULATION => {
             crate::studio::automation::network::result(parameters, bridge, bridge_wait_seconds)
         }
+        op::RENDER_QUALITY => crate::studio::automation::render_quality::result(
+            parameters,
+            bridge,
+            bridge_wait_seconds,
+        ),
         op::PERFORMANCE_MONITOR => crate::studio::automation::monitor::result(
             parameters,
             bridge,
