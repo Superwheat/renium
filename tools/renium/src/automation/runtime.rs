@@ -2223,15 +2223,29 @@ fn restore_persisted_live_sync(
     {
         return Ok(());
     }
-    automation_live_operation(
-        op::LIVE_STATUS,
-        context,
-        &json!({ "compact": true }),
-        state,
-        bridge,
-        bridge_wait_seconds,
-    )?;
-    Ok(())
+    // The restore reconciles the place; a collaborator editing during that
+    // pass is ordinary activity, so try again briefly before giving up.
+    let mut attempts = 0;
+    loop {
+        match automation_live_operation(
+            op::LIVE_STATUS,
+            context,
+            &json!({ "compact": true }),
+            state,
+            bridge,
+            bridge_wait_seconds,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(failure)
+                if attempts < 3 && automation::live::is_concurrent_edit_message(&failure.0.m) =>
+            {
+                attempts += 1;
+                state.live_sync().clear_restore_failure(context);
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            Err(failure) => return Err(failure),
+        }
+    }
 }
 
 fn restore_persisted_live_sync_for_request(

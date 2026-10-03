@@ -2762,7 +2762,7 @@ impl LiveLoop {
             {
                 self.concurrent_edit_retries += 1;
                 log_global(
-                    5,
+                    3,
                     format_args!(
                         "[renium] reconcile retry {} after concurrent edits: {error:#}",
                         self.concurrent_edit_retries
@@ -3205,7 +3205,7 @@ impl LiveLoop {
     }
 
     fn record_pull_failure(&mut self, error: anyhow::Error) -> Result<()> {
-        log_global(5, format_args!("[renium] live pull failed: {error:#}"));
+        log_global(3, format_args!("[renium] live pull failed: {error:#}"));
         let failure = automation_failure_ref(&error);
         if failure.0.c == "no_studio" {
             return Err(error);
@@ -3304,10 +3304,21 @@ fn run(worker: Worker) -> Result<()> {
 const CONCURRENT_EDIT_RETRY_LIMIT: u32 = 20;
 const CONCURRENT_EDIT_RETRY_DELAY: Duration = Duration::from_millis(500);
 
+// A file or Studio change that landed while a sync pass was staged is
+// ordinary activity (an editor saving, a collaborator moving a part), not a
+// failure: the next pass simply starts from the newer state.
 fn is_concurrent_edit_failure(error: &anyhow::Error) -> bool {
-    let message = format!("{error:#}");
-    message.contains("changed while")
-        && (message.contains("retry the sync") || message.contains("retry without overwriting"))
+    is_concurrent_edit_message(&format!("{error:#}"))
+}
+
+pub(crate) fn is_concurrent_edit_message(message: &str) -> bool {
+    let retryable =
+        message.contains("retry the sync") || message.contains("retry without overwriting");
+    retryable
+        && (message.contains("changed while")
+            || message.contains("changed during")
+            || message.contains("Studio changed")
+            || message.contains("Studio structure changed"))
 }
 
 #[cfg(test)]
@@ -3321,6 +3332,10 @@ mod tests {
             "Project files changed while Studio export was running; retry without overwriting: instances/Workspace.renium",
             "Project files changed while Studio recovery was being captured; retry the sync",
             "Project store instances/Workspace.renium changed while Studio changes to the same instances were being applied; retry the sync",
+            "Studio changed Workspace while native import was staged; retry the sync",
+            "Bridge method getEditorBinaryOverlayChunk failed: Studio changed Workspace while native sync was staged: Workspace.Car.Body (property CFrame); retry the sync",
+            "Bridge method finishEditorBinaryExport failed: Studio changed Workspace during native export; retry the sync",
+            "Studio structure changed during native export; retry the sync",
         ] {
             assert!(
                 is_concurrent_edit_failure(&anyhow::anyhow!(message)),
@@ -3330,7 +3345,8 @@ mod tests {
         for message in [
             "Studio did not retain the reconciled project state: src/A.luau",
             "Sync needs review: src/A.luau changed on both sides",
-            "Studio changed Workspace while native import was staged; retry the sync",
+            "Studio changed Workspace while native import was staged",
+            "Bridge call getStudioChangeState exceeded its response deadline",
         ] {
             assert!(
                 !is_concurrent_edit_failure(&anyhow::anyhow!(message)),
