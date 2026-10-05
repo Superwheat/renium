@@ -2,6 +2,19 @@
 
 Capture only when the task needs visual evidence. Use a screenshot for one state and a recording for motion or a transition. Record short-lived effects; don't time screenshots with sleeps. Save captures outside the project or delete them when done. Capturing does not require starting Play; use `--studio` for Edit. Read the Play guide only for runtime work.
 
+## Check what the player sees
+
+When the user describes something they saw, or you need to judge whether a change is visible, measuring state does not answer it: what a player sees is relative to their camera and their frame. Reproduce it the way the player does and look at the result:
+
+```powershell
+rbx rs -p 1 -o clips/jump.mp4 --max-seconds 6      # record the client the player is in
+rbx inp -p 1 key E                                  # the real input, not a function call
+rbx re                                              # stop; returns the overview image
+rbx rf clips/jump.mp4 --page 1                      # open the frames and look
+```
+
+If the user says they cannot see it, record from their viewpoint before touching code again; do not re-measure internals. When a number is still needed, measure on screen (`Camera:WorldToViewportPoint`) or relative to `workspace.CurrentCamera.CFrame`, never world or chassis coordinates alone.
+
 ## Capture
 
 ```powershell

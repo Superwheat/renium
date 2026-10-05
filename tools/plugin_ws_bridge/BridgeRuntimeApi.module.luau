@@ -1763,18 +1763,28 @@ updateMouse()
 				virtualInput:SendMousePosition(position)
 			end)
 		end
+		local function gameHoldsKey(keyCode)
+			local snapshot = api.getMouseLocation({})
+			if snapshot.ok ~= true then
+				return nil
+			end
+			for name in string.gmatch(snapshot.heldKeys, "[^,]+") do
+				if name == keyCode.Name then
+					return true
+				end
+			end
+			return false
+		end
 		local function sendKey(down, keyCode, repeated)
 			virtualInput:SendKey(down, keyCode, repeated)
 			heldKeys[keyCode] = if down then true else nil
 			RunService.Heartbeat:Wait()
-			local snapshot = api.getMouseLocation({})
-			if snapshot.ok == true then
-				local pressed = false
-				for name in string.gmatch(snapshot.heldKeys, "[^,]+") do
-					if name == keyCode.Name then
-						pressed = true
-					end
-				end
+			local pressed = gameHoldsKey(keyCode)
+			if pressed ~= nil and pressed ~= down then
+				RunService.Heartbeat:Wait()
+				pressed = gameHoldsKey(keyCode)
+			end
+			if pressed ~= nil then
 				keysObserved[keyCode.Name] = pressed == down
 			end
 		end
