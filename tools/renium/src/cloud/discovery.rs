@@ -491,6 +491,16 @@ pub(crate) fn place_history(
     Some(versions)
 }
 
+/// The version a fetch without `--version` downloads: the newest published
+/// one, else the newest saved one.
+fn default_version(history: &[PlaceVersion]) -> Option<u64> {
+    history
+        .iter()
+        .find(|version| version.published)
+        .or_else(|| history.first())
+        .map(|version| version.number)
+}
+
 pub(crate) struct FetchRequest {
     pub(crate) name: Option<String>,
     pub(crate) output: Option<PathBuf>,
@@ -579,10 +589,9 @@ pub(crate) fn fetch_command(
             |request| execute_one(identity, key_env, oauth_env, false, request).ok(),
             place_id,
             |versions| versions.iter().any(|version| version.published),
-        )?
-        .into_iter()
-        .find(|version| version.published)
-        .map(|version| version.number)
+        )
+        .as_deref()
+        .and_then(default_version)
     });
     let delivery_request = match version {
         Some(version) => json!({
@@ -662,9 +671,12 @@ pub(crate) fn fetch_command(
         "name": name,
         "file": output,
         "bytes": bytes,
+        "version": version,
     });
-    if let Some(version) = version {
-        result["version"] = json!(version);
+    if version.is_none() {
+        result["versionNote"] = json!(
+            "this key cannot read the place's version history, so the number of the current version it downloaded is unknown"
+        );
     }
     if let Some(root) = request.project_root {
         import_into(&root, &output)?;
@@ -727,6 +739,17 @@ mod tests {
         );
         assert!(counts_from(&page, 9).is_empty());
         assert!(counts_from(&json!({"errors": []}), 7).is_empty());
+    }
+
+    #[test]
+    fn fetch_defaults_to_the_newest_published_version_then_the_newest_saved() {
+        let version = |number, published| PlaceVersion { number, published };
+        assert_eq!(
+            default_version(&[version(12, false), version(11, true), version(10, true)]),
+            Some(11)
+        );
+        assert_eq!(default_version(&[version(12, false)]), Some(12));
+        assert_eq!(default_version(&[]), None);
     }
 
     #[test]

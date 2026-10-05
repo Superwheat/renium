@@ -407,8 +407,16 @@ pub(crate) fn run(args: OpenCloudArgs, project: Option<&Path>) -> Result<()> {
             if anonymous {
                 bail!("cloud fetch requires an API key");
             }
+            let identity = if fetch.name.is_some() {
+                CloudIdentity {
+                    game_id: universe,
+                    place_id,
+                }
+            } else {
+                identity()?
+            };
             super::discovery::fetch_command(
-                identity()?,
+                identity,
                 &key_env,
                 oauth_env.as_deref(),
                 super::discovery::FetchRequest {
