@@ -51,7 +51,7 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
     match command {
         Commands::Plugin(args) => crate::plugins::manage(args),
         Commands::External(args) => crate::plugins::run(args, project),
-        Commands::CheckLuau(args) => crate::cli::syntax::run(args),
+        Commands::CheckLuau(args) => crate::cli::syntax::run(args, project),
         Commands::FmtProject(args) => config::run_fmt_project(args, project),
         Commands::ProjectValidate(args) => config::run_validate_project(args, project),
         Commands::ExplainPath(args) => config::run_explain_path(args, project),

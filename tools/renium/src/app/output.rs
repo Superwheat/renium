@@ -256,6 +256,24 @@ pub(crate) fn ensure_plugin_api_ok(result: &Value) -> Result<()> {
     Ok(())
 }
 
+const LUAU_ERROR_HINTS: [(&str, &str); 2] = [
+    (
+        "lacking capability Plugin",
+        "profiling inside runners is blocked; use `rbx perf start --player N` or `rbx perf micro-start`",
+    ),
+    (
+        "Luau runner timed out after",
+        "pass -t SECONDS, or use --detach NAME for samplers and read them with --collect NAME",
+    ),
+];
+
+fn luau_error_hint(text: &str) -> Option<&'static str> {
+    LUAU_ERROR_HINTS
+        .iter()
+        .find(|(pattern, _)| text.contains(pattern))
+        .map(|(_, hint)| *hint)
+}
+
 pub(crate) fn ensure_luau_api_ok(result: &Value) -> Result<()> {
     if result.get("ok").and_then(Value::as_bool) == Some(false) {
         let message = result
@@ -284,15 +302,33 @@ pub(crate) fn ensure_luau_api_ok(result: &Value) -> Result<()> {
             .flatten()
             .filter_map(Value::as_str)
             .collect::<Vec<_>>()
-            .join("\n");
+            .join(
+                "
+",
+            );
         let mut text = message.to_string();
         if !captured.is_empty() {
-            text.push_str("\nCommand output:\n");
+            text.push_str(
+                "
+Command output:
+",
+            );
             text.push_str(&captured);
         }
         if !console.is_empty() {
-            text.push_str("\nStudio logged during the run:\n");
+            text.push_str(
+                "
+Studio logged during the run:
+",
+            );
             text.push_str(&console);
+        }
+        if let Some(hint) = luau_error_hint(&text) {
+            text.push_str(
+                "
+Hint: ",
+            );
+            text.push_str(hint);
         }
         bail!("{text}");
     }
@@ -494,6 +530,44 @@ mod tests {
             writer.bytes,
             format!("[renium] profile {value}\n").as_bytes()
         );
+    }
+}
+
+#[cfg(test)]
+mod luau_hint_tests {
+    use super::ensure_luau_api_ok;
+    use serde_json::json;
+
+    #[test]
+    fn luau_failures_name_the_next_step() {
+        let error = |result| format!("{:#}", ensure_luau_api_ok(&result).unwrap_err());
+        let profiler = error(json!({
+            "ok": false,
+            "error": "ReniumRunner:2: The current thread cannot call 'Start' (lacking capability Plugin)",
+        }));
+        assert!(profiler.ends_with(
+            "\nHint: profiling inside runners is blocked; use `rbx perf start --player N` or `rbx perf micro-start`"
+        ));
+        let captured = error(json!({
+            "ok": false,
+            "error": "Luau command failed",
+            "output": [{"type": "error", "message": "cannot call ScriptProfilerService (lacking capability Plugin)"}],
+        }));
+        assert!(
+            captured.contains("Command output:\n[error]") && captured.contains("Hint: profiling")
+        );
+        let timeout = error(
+            json!({"ok": false, "error": "Luau runner timed out after 10.0s and was stopped"}),
+        );
+        assert_eq!(
+            timeout,
+            "Luau runner timed out after 10.0s and was stopped\nHint: pass -t SECONDS, or use --detach NAME for samplers and read them with --collect NAME"
+        );
+        let edit = error(
+            json!({"ok": false, "error": "Luau execution timed out after 10.0s and was stopped"}),
+        );
+        assert!(!edit.contains("Hint:"));
+        assert!(ensure_luau_api_ok(&json!({"ok": true})).is_ok());
     }
 }
 

@@ -454,7 +454,43 @@ pub(crate) fn acknowledge_pulled_changes(
     Ok(result)
 }
 
-fn compact_push_summary(summary: &Map<String, Value>, parameters: &Value) -> Map<String, Value> {
+const PUSH_COUNTS: [(&str, Option<&str>, &str); 8] = [
+    ("instances", Some("created"), "instanceCreated"),
+    ("instances", Some("replaced"), "instanceReplaced"),
+    ("instances", Some("deleted"), "instanceDeleted"),
+    ("scripts", Some("created"), "sourceCreated"),
+    ("scripts", Some("updated"), "sourceUpdated"),
+    ("scripts", Some("deleted"), "sourceDeleted"),
+    ("properties", None, "propertyUpdated"),
+    ("attributes", None, "attributeUpdated"),
+];
+
+fn push_counts(summary: &Map<String, Value>) -> Map<String, Value> {
+    let mut counts = Map::new();
+    for (group, label, key) in PUSH_COUNTS {
+        let Some(count) = summary
+            .get(key)
+            .and_then(Value::as_f64)
+            .filter(|count| *count > 0.0)
+        else {
+            continue;
+        };
+        let count = json!(count as u64);
+        match label {
+            Some(label) => counts.entry(group).or_insert_with(|| json!({}))[label] = count,
+            None => {
+                counts.insert(group.to_string(), count);
+            }
+        }
+    }
+    counts
+}
+
+fn compact_push_summary(
+    summary: &Map<String, Value>,
+    parameters: &Value,
+    read_back: bool,
+) -> Map<String, Value> {
     let mut result = Map::new();
     result.insert(
         "ok".to_string(),
@@ -483,6 +519,30 @@ fn compact_push_summary(summary: &Map<String, Value>, parameters: &Value) -> Map
     {
         result.insert("packageDialogAccepted".to_string(), value.clone());
     }
+    if result.contains_key("skippedByReview") {
+        return result;
+    }
+    let counts = push_counts(summary);
+    let changed = !counts.is_empty()
+        || ["protectedApplied", "savedFieldsApplied", "packageModified"]
+            .iter()
+            .any(|key| result.contains_key(*key));
+    let nothing_sent = summary.get("unchanged") == Some(&Value::Bool(true))
+        || summary.keys().all(|key| key == "ok")
+        || ["instanceQueued", "sourceQueued", "propertyQueued"]
+            .iter()
+            .all(|key| summary.get(*key).and_then(Value::as_f64) == Some(0.0));
+    if !changed && nothing_sent {
+        result.insert("unchanged".to_string(), Value::Bool(true));
+        return result;
+    }
+    result.extend(counts);
+    let verified = read_back
+        || summary.contains_key("sourceVerified")
+        || ["nativeVerifiedServices", "fieldVerifiedServices"]
+            .iter()
+            .any(|key| summary.get(*key).is_some_and(automation_value_is_non_empty));
+    result.insert("verified".to_string(), Value::Bool(verified));
     result
 }
 
@@ -1177,15 +1237,21 @@ fn automation_dispatch_operation(
             let args = automation_push_args(context, parameters, reviewed)?;
             if !push_is_filtered(parameters) {
                 let summary = push_project_replacement(context, bridge, &sync_services(), args)?;
-                return Ok(Value::Object(compact_push_summary(&summary, parameters)));
+                return Ok(Value::Object(compact_push_summary(
+                    &summary, parameters, true,
+                )));
             }
             let delta_services = selected_push_delta_services(context, &args)?;
             if let Some(services) = delta_services {
                 let summary = push_project_delta(context, bridge, &services, args, None)?;
-                return Ok(Value::Object(compact_push_summary(&summary, parameters)));
+                return Ok(Value::Object(compact_push_summary(
+                    &summary, parameters, true,
+                )));
             }
             let summary = push_editor_changes_with_warm_bridge(args, bridge)?;
-            Ok(Value::Object(compact_push_summary(&summary, parameters)))
+            Ok(Value::Object(compact_push_summary(
+                &summary, parameters, false,
+            )))
         }
         op::SET_PROPERTY if parameters.get("editor").and_then(Value::as_bool) == Some(true) => {
             bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Main)?;
@@ -3379,26 +3445,76 @@ mod tests {
             "changedPaths": ["src/ReplicatedStorage/Test.luau"],
             "targetSettingsIds": ["test-id"]
         });
-        let summary = json!({
-            "ok": true,
-            "changedPaths": ["src/ReplicatedStorage/Test.luau"],
-            "targetSettingsIds": ["test-id"]
-        });
-        assert_eq!(
+        let compact = |summary: Value, read_back: bool| {
             Value::Object(compact_push_summary(
                 summary.as_object().unwrap(),
-                &parameters
-            )),
-            json!({ "ok": true })
+                &parameters,
+                read_back,
+            ))
+        };
+        assert_eq!(
+            compact(
+                json!({
+                    "ok": true,
+                    "changedPaths": ["src/ReplicatedStorage/Test.luau"],
+                    "targetSettingsIds": ["test-id"],
+                    "instanceQueued": 0, "sourceQueued": 0, "propertyQueued": 0, "noops": 0
+                }),
+                false
+            ),
+            json!({ "ok": true, "unchanged": true })
+        );
+        assert_eq!(
+            compact(json!({ "ok": true }), true),
+            json!({ "ok": true, "unchanged": true })
+        );
+        assert_eq!(
+            compact(json!({ "ok": true, "unchanged": true }), true),
+            json!({ "ok": true, "unchanged": true })
         );
 
-        let verified = json!({ "ok": true, "sourceVerified": true });
         assert_eq!(
-            Value::Object(compact_push_summary(
-                verified.as_object().unwrap(),
-                &parameters
-            )),
-            json!({ "ok": true, "sourceVerified": true })
+            compact(
+                json!({
+                    "ok": true, "sourceQueued": 1, "sourceUpdated": 1.0,
+                    "sourceVerified": 1, "sourceVerifyFailed": 0
+                }),
+                false
+            ),
+            json!({
+                "ok": true, "sourceVerified": 1, "scripts": {"updated": 1}, "verified": true
+            })
+        );
+        assert_eq!(
+            compact(
+                json!({"ok": true, "sourceQueued": 1, "sourceUpdated": 1}),
+                false
+            ),
+            json!({ "ok": true, "scripts": {"updated": 1}, "verified": false })
+        );
+        assert_eq!(
+            compact(
+                json!({
+                    "ok": true, "instanceQueued": 3, "instanceCreated": 2.0,
+                    "instanceDeleted": 1, "instanceReplaced": 0, "sourceCreated": 1,
+                    "propertyUpdated": 4, "attributeUpdated": 0, "historyId": "h1"
+                }),
+                true
+            ),
+            json!({
+                "ok": true, "historyId": "h1",
+                "instances": {"created": 2, "deleted": 1},
+                "scripts": {"created": 1},
+                "properties": 4,
+                "verified": true
+            })
+        );
+        assert_eq!(
+            compact(
+                json!({"ok": true, "skippedByReview": true, "instanceQueued": 1}),
+                true
+            ),
+            json!({ "ok": true, "skippedByReview": true })
         );
 
         let package = json!({
@@ -3406,13 +3522,9 @@ mod tests {
             "packageModified": true,
             "autoDesyncedPackages": ["ReplicatedStorage.Package"]
         });
-        assert_eq!(
-            Value::Object(compact_push_summary(
-                package.as_object().unwrap(),
-                &parameters
-            )),
-            package
-        );
+        let mut expected = package.clone();
+        expected["verified"] = json!(false);
+        assert_eq!(compact(package, false), expected);
     }
 
     #[test]

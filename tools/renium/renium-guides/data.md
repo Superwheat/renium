@@ -53,7 +53,7 @@ Without an ID, use `pathSegments` and `pathOrdinals`.
 Edit existing script files directly; no follow-up `bss` is needed.
 For a new script, create its entry with `ba`, then edit the file. `bss --str` or `--source-file` writes source through the store.
 
-Check changed scripts together with `rbx ck src/ReplicatedStorage/Config.luau src/ServerScriptService/Main.server.luau`. It parses Luau offline without executing it; use `rbx ck -` for UTF-8 source on stdin. Errors include the file and syntax location, and return a failing exit code. This is not type checking, lint, or a behavior test.
+Check changed scripts together with `rbx ck`, which takes the `.luau`/`.lua` files git reports as changed in the project; name files or folders (`rbx ck src/ServerScriptService`) otherwise. It parses Luau offline without executing it; use `rbx ck -` for UTF-8 source on stdin. Errors include the file and syntax location, and return a failing exit code. This is not type checking, lint, or a behavior test.
 
 `changedPaths` lists actual file changes; empty means no-op. Live Sync sends them automatically.
 Without Live Sync, push returned paths with their settings IDs, not an entire service.
@@ -108,12 +108,12 @@ rbx q Place.rbxl -n Door
 rbx q Place.rbxl --source "reward granted"
 rbx cmp Place.rbxl
 rbx cmp Before.rbxl --full --all
-rbx cmp Before.rbxl --against After.rbxlx --full --all
+rbx cmp Before.rbxl After.rbxlx --full --all
 ```
 
 `v` accepts `.rbxl`/`.rbxlx` places, `.rbxm`/`.rbxmx` models and `.renium` stores; `--json` includes source, properties, attributes and references. It inspects one file; it does not compare two states.
 Use `v STORE.renium --json` to distinguish stored overrides from materialized defaults.
-For a full saved-place diff, use `cmp BEFORE --full` from the target project. Add `--against AFTER` for two files; no project is required. Both place formats work in either position. The direction is BEFORE → project/AFTER. Without `--full`, `cmp` is script-only. Counts cover the whole place; request `--all` or `--values` only when needed.
+For a full saved-place diff, use `cmp BEFORE --full` from the target project. Add `AFTER` (or `--against AFTER`) for two files; no project is required, and Studio session services such as `ConfigureServerService` are skipped. Both place formats work in either position. The direction is BEFORE → project/AFTER. Without `--full`, `cmp` is script-only. Counts cover the whole place; request `--all` or `--values` only when needed.
 
 The full report lists added/removed instances and changed property/attribute names, including Source, references, packages and serialized Terrain data. `--values` includes before/after values and source; these may contain credentials, so redact them before sharing. `--limit` caps entries, not counts; `--all` returns every difference.
 

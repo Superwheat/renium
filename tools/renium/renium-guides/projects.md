@@ -11,7 +11,7 @@ rbx q Place.rbxl -n RewardHandler
 rbx q Place.rbxl --source "reward granted"
 rbx cmp Place.rbxl
 rbx cmp Before.rbxl --full --all
-rbx cmp Before.rbxl --against After.rbxlx --full --all
+rbx cmp Before.rbxl After.rbxlx --full --all
 rbx sm
 rbx sm --stdout
 rbx sm --cached --stdout --filter "*Tutorial*"

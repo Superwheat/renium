@@ -242,8 +242,11 @@ fn difference_value(
     Value::Object(value)
 }
 
-pub(crate) fn compare_place(args: ComparePlaceArgs, project: Option<&Path>) -> Result<()> {
+pub(crate) fn compare_place(mut args: ComparePlaceArgs, project: Option<&Path>) -> Result<()> {
     let started = std::time::Instant::now();
+    if args.against.is_none() {
+        args.against = args.other.take();
+    }
     let read = |path: &Path| {
         if args.full {
             // Full comparison already normalizes exact reflection defaults away.
@@ -266,6 +269,7 @@ pub(crate) fn compare_place(args: ComparePlaceArgs, project: Option<&Path>) -> R
                         .iter()
                         .filter_map(|id| dom.get_by_ref(*id).map(|node| node.name.clone()))
                 })
+                .filter(|name| !super::place_diff::is_engine_internal_service(name))
                 .collect::<BTreeSet<_>>();
             (before, target, against.clone(), services)
         } else {
@@ -299,6 +303,22 @@ pub(crate) fn compare_place(args: ComparePlaceArgs, project: Option<&Path>) -> R
         }
         if unsaved_instances > 0 {
             result["unsavedProjectInstances"] = json!(unsaved_instances);
+        }
+        if args.against.is_some() {
+            let internal = [&place_dom, &project_dom]
+                .into_iter()
+                .flat_map(|dom| {
+                    dom.root()
+                        .children()
+                        .iter()
+                        .filter_map(|id| dom.get_by_ref(*id))
+                })
+                .map(|node| node.name.as_str())
+                .filter(|name| super::place_diff::is_engine_internal_service(name))
+                .collect::<BTreeSet<_>>();
+            if !internal.is_empty() {
+                result["engineManagedServices"] = json!(internal);
+            }
         }
         result["input"] = json!(args.input);
         result["target"] = json!(project_path);

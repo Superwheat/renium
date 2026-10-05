@@ -69,13 +69,15 @@ rbx net reset --player 2                     # Zero all six simulation values
 | `normal` | 15 ms | 2 ms | 0% | Typical low-latency test |
 | `mid` | 50 ms | 10 ms | 0.05% | Moderate latency |
 | `high` | 100 ms | 15 ms | 0.1% | High latency |
-| `poor` | 100 ms | 100 ms | 0.5% | Highly variable, lossy connection |
+| `poor` | 100 ms | 30 ms | 0.5% | Highly variable, lossy connection |
+
+`poor` keeps jitter at 30 ms: Studio applies jitter cumulatively to a 20 Hz replication stream, so 100 ms made a client fall a whole round behind.
 
 These are test templates, not measured device profiles. Added round-trip delay is at least twice the listed delay. Studio supports 0–1000 ms delay/jitter per direction and at most 0.5% loss; a loss value of `0.5` means **0.5%**, not 50%. Presets do not simulate outages or bandwidth caps.
 
 For custom asymmetric conditions, use `--in-delay`, `--out-delay`, `--in-jitter`, `--out-jitter`, `--in-loss` and `--out-loss`. Inbound means server→client; outbound means client→server. A preset fills all six values; explicit flags override it. Without a preset, omitted settings stay unchanged.
 
-Commands return the selected runtime/PID, applied settings and changed fields; trust a successful result instead of rereading. A readback does not prove gameplay works under those conditions. Large latency jumps trigger congestion control—step changes gradually when measuring steady state.
+`set`, `reset` and `restore` return the selected runtime/PID, applied settings and changed fields; trust a successful result instead of rereading. `show` returns `settings`, `active` (any non-zero value) and the matching `preset` or `null`. A readback does not prove gameplay works under those conditions. Large latency jumps trigger congestion control—step changes gradually when measuring steady state.
 
 Without `--player`, `net show/set/reset` targets the selected Studio's settings in Edit. During Play, use `--player` to avoid changing the server/defaults. These settings are process-local; Renium refuses a shared-process layout that cannot isolate the requested client. Client overrides are restored when its plugin unloads, without undoing later manual changes. Explicit `restore` is useful before ending a test. An abrupt process crash cannot run cleanup.
 

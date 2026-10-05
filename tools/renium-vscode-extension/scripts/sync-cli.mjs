@@ -51,16 +51,14 @@ fs.rmSync(guideDestination, { recursive: true, force: true });
 fs.cpSync(path.join(repoRoot, "tools", "renium", "renium-guides"), guideDestination, {
   recursive: true,
 });
+const launcher = path.join(destinationDir, "rbx");
+fs.copyFileSync(path.join(repoRoot, "rbx"), launcher);
 if (targetPlatform === "win32") {
   fs.copyFileSync(path.join(repoRoot, "rbx.cmd"), path.join(destinationDir, "rbx.cmd"));
   fs.rmSync(path.join(destinationDir, "rbx-run.ps1"), { force: true });
-} else {
-  const launcher = path.join(destinationDir, "rbx");
-  fs.copyFileSync(path.join(repoRoot, "rbx"), launcher);
-  if (process.platform !== "win32") {
-    fs.chmodSync(destination, 0o755);
-    fs.chmodSync(launcher, 0o755);
-  }
+} else if (process.platform !== "win32") {
+  fs.chmodSync(destination, 0o755);
+  fs.chmodSync(launcher, 0o755);
 }
 
 process.stdout.write(`Bundled ${source} as ${destination}\n`);

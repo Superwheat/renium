@@ -30,6 +30,13 @@ use crate::settings::{
 };
 
 const UNIFIED_LIGHTING_MARKER: &str = "RBX_LightingTechnologyUnifiedMigration";
+const ENGINE_INTERNAL_SERVICES: [&str; 2] = ["ConfigureServerService", "FilteredSelection"];
+
+/// Studio session state saved with a place; two saves of unchanged content
+/// disagree on it.
+pub(super) fn is_engine_internal_service(name: &str) -> bool {
+    ENGINE_INTERNAL_SERVICES.contains(&name)
+}
 
 enum Skipped {
     EngineManaged,

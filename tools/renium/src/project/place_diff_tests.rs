@@ -194,6 +194,54 @@ fn full_diff_reports_attributes_sources_references_additions_and_removals() {
 }
 
 #[test]
+fn place_comparison_takes_the_target_positionally_and_skips_engine_session_services() {
+    let root =
+        crate::system::files::create_unique_directory(&std::env::temp_dir(), "renium-place-cmp-")
+            .unwrap();
+    let _cleanup = crate::system::files::OnDrop::new(|| {
+        let _ = std::fs::remove_dir_all(&root);
+    });
+    let mut files = Vec::new();
+    for (name, revision) in [("before", 1.0), ("after", 2.0)] {
+        let mut dom = fixture(false, 1.0);
+        let session = dom.insert(
+            dom.root_ref(),
+            InstanceBuilder::new("ConfigureServerService").with_name("ConfigureServerService"),
+        );
+        let mut attributes = Attributes::new();
+        attributes.insert("Session".to_string(), Variant::Float64(revision));
+        dom.insert(
+            session,
+            InstanceBuilder::new("Folder")
+                .with_name(format!("Session{revision}"))
+                .with_property("Attributes", attributes),
+        );
+        let file = root.join(format!("{name}.rbxl"));
+        crate::rbx::model::RbxPlaceFormat::from_path(&file)
+            .unwrap()
+            .write(&file, &dom, dom.root().children())
+            .unwrap();
+        files.push(file);
+    }
+    let before = files[0].to_str().unwrap();
+    let after = files[1].to_str().unwrap();
+    let result = crate::app::output::capture_json_output(|| {
+        super::super::place_file::compare_place(
+            ComparePlaceArgs::try_parse_from(["cmp", before, after, "--full"]).unwrap(),
+            None,
+        )
+    })
+    .unwrap();
+    assert_eq!(result["matches"], true, "{result}");
+    assert_eq!(result["targetKind"], "place");
+    assert_eq!(
+        result["engineManagedServices"],
+        json!(["ConfigureServerService"])
+    );
+    assert!(ComparePlaceArgs::try_parse_from(["cmp", before, after, "--against", after]).is_err());
+}
+
+#[test]
 fn full_diff_reads_binary_and_xml_places_without_studio_and_view_keeps_exact_source() {
     let root =
         crate::system::files::create_unique_directory(&std::env::temp_dir(), "renium-place-diff-")

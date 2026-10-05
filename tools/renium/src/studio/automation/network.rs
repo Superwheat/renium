@@ -39,7 +39,7 @@ impl Preset {
             Self::Normal => (15.0, 2.0, 0.0),
             Self::Mid => (50.0, 10.0, 0.05),
             Self::High => (100.0, 15.0, 0.1),
-            Self::Poor => (100.0, 100.0, 0.5),
+            Self::Poor => (100.0, 30.0, 0.5),
         };
         NetworkValues {
             in_delay: Some(delay),
@@ -50,6 +50,31 @@ impl Preset {
             out_loss: Some(loss),
         }
     }
+}
+
+fn show_summary(result: &Value) -> Value {
+    let settings = result.get("settings").cloned().unwrap_or_else(|| json!({}));
+    let differs = |value: Option<&Value>, expected: f64| {
+        value
+            .and_then(Value::as_f64)
+            .is_none_or(|value| (value - expected).abs() > 0.0001)
+    };
+    let active = settings
+        .as_object()
+        .is_some_and(|values| values.values().any(|value| differs(Some(value), 0.0)));
+    let preset = [Preset::Normal, Preset::Mid, Preset::High, Preset::Poor]
+        .into_iter()
+        .find(|preset| {
+            serde_json::to_value(preset.values())
+                .ok()
+                .and_then(|values| values.as_object().cloned())
+                .is_some_and(|values| {
+                    values.iter().all(|(key, expected)| {
+                        !differs(settings.get(key), expected.as_f64().unwrap_or(f64::NAN))
+                    })
+                })
+        });
+    json!({"settings": settings, "active": active, "preset": preset})
 }
 
 #[derive(Args, Default, Deserialize, Serialize)]
@@ -166,6 +191,7 @@ pub(crate) fn command(args: NetworkArgs) -> Result<()> {
         );
     }
     request.validate()?;
+    let show = request.action == "show";
     let result = daemon_result(
         op::NETWORK_SIMULATION,
         None,
@@ -173,6 +199,9 @@ pub(crate) fn command(args: NetworkArgs) -> Result<()> {
         false,
         Some(&args.bridge),
     )?;
+    if show {
+        return print_json_output(&show_summary(&result), false);
+    }
     print_json_output(&result, false)
 }
 
@@ -354,6 +383,31 @@ mod tests {
         let mut shared = clients;
         shared.push(json!({"pid":1,"role":"play-client","runtimeId":"three"}));
         assert!(verify_scope(&shared, "one", 1, true, true).is_err());
+    }
+
+    #[test]
+    fn network_show_reports_whether_emulation_is_active_and_which_preset_matches() {
+        let show = |settings: Value| {
+            show_summary(
+                &json!({"ok": true, "settings": settings, "before": settings, "changed": []}),
+            )
+        };
+        let zero =
+            json!({"inDelay":0,"outDelay":0,"inJitter":0,"outJitter":0,"inLoss":0,"outLoss":0});
+        assert_eq!(
+            show(zero.clone()),
+            json!({"settings": zero, "active": false, "preset": null})
+        );
+        let mid = json!({"inDelay":50,"outDelay":50,"inJitter":10,"outJitter":10,"inLoss":0.05000000074505806,"outLoss":0.05000000074505806});
+        assert_eq!(show(mid)["preset"], "mid");
+        let poor = json!({"inDelay":100,"outDelay":100,"inJitter":30,"outJitter":30,"inLoss":0.5,"outLoss":0.5});
+        assert_eq!(show(poor.clone())["preset"], "poor");
+        let mut custom = poor;
+        custom["outJitter"] = json!(100);
+        let custom = show(custom);
+        assert_eq!(custom["active"], true);
+        assert_eq!(custom["preset"], Value::Null);
+        assert!(custom.get("before").is_none() && custom.get("changed").is_none());
     }
 
     #[test]

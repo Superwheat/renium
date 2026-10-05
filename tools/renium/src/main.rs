@@ -3,7 +3,7 @@ use std::io::IsTerminal;
 use std::path::Path;
 use std::process::ExitCode;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::FromArgMatches;
 use serde_json::json;
 
@@ -188,13 +188,8 @@ fn run_cli() -> Result<()> {
     if is_agent_launcher() && checks_agent_update(&cli.command) {
         update::check_agent_update();
     }
-    if is_agent_launcher()
-        && checks_agent_instructions(&cli.command)
-        && project::workflows::refresh_outdated_agent_instructions(cli.project.as_deref())?
-    {
-        bail!(
-            "Renium instructions were outdated and have been updated. Reread RENIUM.md, then run the command again"
-        );
+    if !is_plugin_child() && checks_agent_instructions(&cli.command) {
+        refresh_agent_instructions(cli.project.as_deref());
     }
 
     if !matches!(
@@ -226,8 +221,23 @@ fn checks_agent_update(command: &Commands) -> bool {
     )
 }
 
+fn refresh_agent_instructions(project: Option<&Path>) {
+    match project::workflows::refresh_outdated_agent_instructions(project) {
+        Ok(true) => eprintln!("[renium] RENIUM.md was updated; reread it when convenient"),
+        Ok(false) => {}
+        Err(error) => log_global(
+            4,
+            format_args!("[renium] agent instructions were not refreshed: {error:#}"),
+        ),
+    }
+}
+
+fn is_plugin_child() -> bool {
+    std::env::var_os("RENIUM_PLUGIN_CHILD").is_some_and(|value| value == "1")
+}
+
 fn is_agent_launcher() -> bool {
-    if std::env::var_os("RENIUM_PLUGIN_CHILD").is_some_and(|value| value == "1") {
+    if is_plugin_child() {
         return false;
     }
     if std::env::var_os("RENIUM_AGENT_CLI").is_some_and(|value| value != "0") {
