@@ -51,16 +51,26 @@ fn send_on_stream(stream: &TcpStream, request: &super::Request) -> Result<super:
         {
             Duration::from_secs(30)
         }
-        op::CAP
-        | op::BIND
-        | op::STUDIOS
-        | op::STUDIO_STATUS
-        | op::PROPERTY_ACCESS
-        | op::PERFORMANCE_MONITOR => Duration::from_secs(5),
+        op::CAP | op::BIND | op::STUDIOS | op::PROPERTY_ACCESS | op::PERFORMANCE_MONITOR => {
+            Duration::from_secs(5)
+        }
+        op::STUDIO_STATUS => {
+            status_response_limit(request.p["bridgeWaitSeconds"].as_f64().unwrap_or(8.0))
+        }
         op::LUAU => luau_response_limit(&request.p),
         _ => DAEMON_CONTROL_RESPONSE_TIMEOUT,
     };
     send_on_stream_with_timeout(stream, request, timeout)
+}
+
+// Status waits for a Studio that is still launching for up to the Studio
+// connection wait, then reads its state, so its answer can take that long.
+const STATUS_RESPONSE_MARGIN: Duration = Duration::from_secs(4);
+
+pub(crate) fn status_response_limit(bridge_wait_seconds: f64) -> Duration {
+    Duration::try_from_secs_f64(bridge_wait_seconds.clamp(1.0, 30.0))
+        .unwrap_or(Duration::from_secs(8))
+        + STATUS_RESPONSE_MARGIN
 }
 
 // A Luau run has its own execution limit, so the client stops waiting once
@@ -140,18 +150,79 @@ pub(crate) fn shared_daemon_available() -> bool {
         .any(|address| daemon_endpoint_available(address, Duration::from_millis(500)))
 }
 
-pub(crate) fn daemon_endpoint_available(address: SocketAddr, timeout: Duration) -> bool {
-    let request = super::Request {
+fn capability_request() -> super::Request {
+    super::Request {
         v: super::PROTOCOL_VERSION,
         id: current_millis().min(u128::from(u64::MAX)) as u64,
         op: op::CAP,
         cx: None,
         p: json!({}),
-    };
+    }
+}
+
+pub(crate) fn daemon_endpoint_available(address: SocketAddr, timeout: Duration) -> bool {
     let Ok(stream) = TcpStream::connect_timeout(&address, DAEMON_CONTROL_CONNECT_TIMEOUT) else {
         return false;
     };
-    send_on_stream_with_timeout(&stream, &request, timeout).is_ok_and(|response| response.ok == 1)
+    send_on_stream_with_timeout(&stream, &capability_request(), timeout)
+        .is_ok_and(|response| response.ok == 1)
+}
+
+fn daemon_active_operations(timeout: Duration) -> Option<Vec<serde_json::Value>> {
+    let stream = connect_daemon()?;
+    let response = send_on_stream_with_timeout(&stream, &capability_request(), timeout).ok()?;
+    response.r?.get("active")?.as_array().cloned()
+}
+
+/// Whether a daemon request failed because its response deadline passed.
+pub(crate) fn is_response_timeout(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            )
+        })
+    })
+}
+
+/// The error for a command the daemon did not answer within `waited`, naming
+/// what the daemon reports it is serving.
+pub(crate) fn daemon_busy_error(command: &str, waited: Duration) -> anyhow::Error {
+    anyhow::anyhow!(daemon_busy_message(
+        command,
+        waited,
+        daemon_active_operations(Duration::from_secs(2)).as_deref()
+    ))
+}
+
+fn daemon_busy_message(
+    command: &str,
+    waited: Duration,
+    active: Option<&[serde_json::Value]>,
+) -> String {
+    let serving = active
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|entry| {
+            Some(format!(
+                "{} ({}s)",
+                entry["op"].as_str()?,
+                entry["seconds"].as_u64().unwrap_or_default()
+            ))
+        })
+        .collect::<Vec<_>>();
+    let state = match active {
+        None => "it is not answering requests".to_string(),
+        Some(_) if serving.is_empty() => {
+            "it is busy and did not say which operation it is serving".to_string()
+        }
+        Some(_) => format!("it is busy serving {}", serving.join(", ")),
+    };
+    format!(
+        "The Renium daemon did not answer `{command}` within {}s; {state}. `rbx dm status` shows whether it responds and `rbx report` collects a bug report",
+        waited.as_secs()
+    )
 }
 
 fn forward_proxy_request(
@@ -219,6 +290,33 @@ mod tests {
         .err()
         .expect("an unanswered capability request must time out");
         assert!(format!("{error:#}").contains("Waiting for daemon response to operation 0"));
+        assert!(is_response_timeout(&error));
+        assert!(!is_response_timeout(&anyhow::anyhow!("connection refused")));
+    }
+
+    #[test]
+    fn busy_daemon_errors_name_the_operations_it_is_serving() {
+        let waited = Duration::from_secs(10);
+        let serving = daemon_busy_message(
+            "rbx status",
+            waited,
+            Some(&[
+                json!({ "op": "push", "seconds": 1520 }),
+                json!({ "op": "studio-status", "seconds": 10 }),
+            ]),
+        );
+        assert!(
+            serving.starts_with(
+                "The Renium daemon did not answer `rbx status` within 10s; it is busy serving push (1520s), studio-status (10s)."
+            ),
+            "{serving}"
+        );
+        assert!(serving.contains("`rbx dm status`") && serving.contains("`rbx report`"));
+        assert!(
+            daemon_busy_message("rbx status", waited, Some(&[]))
+                .contains("did not say which operation")
+        );
+        assert!(daemon_busy_message("rbx status", waited, None).contains("not answering"));
     }
 }
 
@@ -237,5 +335,12 @@ mod luau_response_limit_tests {
             Duration::from_secs(175)
         );
         assert_eq!(luau_response_limit(&json!({})), Duration::from_secs(43));
+    }
+
+    #[test]
+    fn status_waits_for_a_launching_studio_plus_its_state_read() {
+        assert_eq!(status_response_limit(8.0), Duration::from_secs(12));
+        assert_eq!(status_response_limit(90.0), Duration::from_secs(34));
+        assert_eq!(status_response_limit(f64::NAN), Duration::from_secs(12));
     }
 }

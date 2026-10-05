@@ -1,15 +1,20 @@
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::thread;
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Args;
 use serde_json::{Map, Value, json};
 
-use super::op;
+use super::{client, op};
 use crate::app;
 use crate::cli::BridgeConnectionArgs;
 use crate::cloud;
 use crate::daemon::{daemon_control_request, daemon_project_root};
 use crate::project::config;
+
+const STATUS_DEADLINE: Duration = Duration::from_secs(10);
 
 #[derive(Args)]
 pub(crate) struct StudioStatusArgs {
@@ -137,8 +142,27 @@ pub(super) fn run_daemon(
 }
 
 pub(crate) fn studio_status(args: StudioStatusArgs, project: Option<&Path>) -> Result<()> {
+    let started = Instant::now();
+    let deadline = STATUS_DEADLINE.max(client::status_response_limit(args.bridge.wait_seconds));
+    let project = project.map(Path::to_path_buf);
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send(studio_status_result(&args, project.as_deref()));
+    });
+    let result = match receiver.recv_timeout(deadline) {
+        Ok(Err(error)) if client::is_response_timeout(&error) => {
+            Err(client::daemon_busy_error("rbx status", started.elapsed()))
+        }
+        Ok(result) => result,
+        Err(RecvTimeoutError::Timeout) => Err(client::daemon_busy_error("rbx status", deadline)),
+        Err(RecvTimeoutError::Disconnected) => Err(anyhow!("rbx status stopped without a result")),
+    }?;
+    app::output::print_json_output(&result, false)
+}
+
+fn studio_status_result(args: &StudioStatusArgs, project: Option<&Path>) -> Result<Value> {
     if args.all {
-        return run_daemon(op::STUDIOS, None, json!({}), false, Some(&args.bridge));
+        return daemon_result(op::STUDIOS, None, json!({}), false, Some(&args.bridge));
     }
     match daemon_result(
         op::STUDIO_STATUS,
@@ -172,14 +196,14 @@ pub(crate) fn studio_status(args: StudioStatusArgs, project: Option<&Path>) -> R
                 }
             }
             app::output::strip_empty(&mut result);
-            app::output::print_json_output(&result, false)
+            Ok(result)
         }
         Err(error)
             if error
                 .to_string()
                 .contains("More than one Studio runtime matches this project") =>
         {
-            run_daemon(op::STUDIOS, None, json!({}), false, Some(&args.bridge))
+            daemon_result(op::STUDIOS, None, json!({}), false, Some(&args.bridge))
         }
         Err(error) => Err(error),
     }

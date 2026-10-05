@@ -2581,7 +2581,9 @@ fn automation_execute_request(
     bridge_wait_seconds: f64,
 ) -> std::result::Result<Value, automation::Failure> {
     let started = Instant::now();
-    let request_guard = crate::daemon::memory::begin_request();
+    let request_guard = crate::daemon::memory::begin_request(
+        automation::opcode_by_id(request.op).map_or("unknown", |operation| operation.name),
+    );
     let result = automation_execute_request_inner(request, state, bridge, bridge_wait_seconds);
     drop(request_guard);
     let name = request.validate().map_or_else(
@@ -2636,7 +2638,16 @@ fn automation_execute_request_inner(
         ),
     );
     match operation.id {
-        op::CAP => automation::capabilities().map_err(automation_failure),
+        op::CAP => automation::capabilities()
+            .map(|mut capabilities| {
+                capabilities["active"] = crate::daemon::memory::active_requests()
+                    .into_iter()
+                    .filter(|(name, _)| *name != operation.name)
+                    .map(|(name, elapsed)| json!({ "op": name, "seconds": elapsed.as_secs() }))
+                    .collect();
+                capabilities
+            })
+            .map_err(automation_failure),
         op::STUDIO_AUDIO if request.p.get("global").and_then(Value::as_bool) == Some(true) => {
             (|| -> Result<Value> {
                 anyhow::ensure!(
