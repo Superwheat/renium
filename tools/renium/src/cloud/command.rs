@@ -565,7 +565,27 @@ pub(crate) fn discover_identity(
             Err(error) => return Err(error),
         }
     }
+    if identity.game_id.is_none() || identity.place_id.is_none() {
+        let bound = bound_studio_target(&loaded.root);
+        identity.game_id = identity.game_id.or(bound.0);
+        identity.place_id = identity.place_id.or(bound.1);
+    }
     Ok(identity)
+}
+
+/// The place a single-place project is bound to in Studio, remembered by
+/// `rbx so`/`sx` in `.renium/studio-target.json`, so Open Cloud commands run
+/// against it without `--universe` and `--place-id`.
+fn bound_studio_target(root: &Path) -> (Option<i64>, Option<i64>) {
+    let path = root.join(".renium").join("studio-target.json");
+    let Ok(bytes) = fs::read(&path) else {
+        return (None, None);
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return (None, None);
+    };
+    let id = |key: &str| value.get(key).and_then(Value::as_i64).filter(|id| *id > 0);
+    (id("gameId"), id("placeId"))
 }
 
 fn request_command(
@@ -675,6 +695,30 @@ fn json_assignments(values: &[String]) -> Result<Map<String, Value>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bound_studio_target_supplies_the_universe_and_place() {
+        let root = std::env::temp_dir().join(format!("renium-oc-target-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".renium")).unwrap();
+        assert_eq!(bound_studio_target(&root), (None, None));
+        fs::write(
+            root.join(".renium").join("studio-target.json"),
+            br#"{"gameId": 10765011239, "placeId": 127769757912519}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            bound_studio_target(&root),
+            (Some(10765011239), Some(127769757912519))
+        );
+        fs::write(
+            root.join(".renium").join("studio-target.json"),
+            b"{\"gameId\": 0}",
+        )
+        .unwrap();
+        assert_eq!(bound_studio_target(&root), (None, None));
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn a_numeric_place_selector_is_a_place_id() {
