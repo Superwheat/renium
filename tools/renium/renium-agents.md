@@ -1,7 +1,7 @@
 <!-- renium-version: 0.4.7 -->
 # Renium for agents
 
-Use `rbx` from the place's project folder. Renium handles the daemon.
+Use `rbx` from the place's project folder.
 PATH stale? `%USERPROFILE%\.renium\bin\rbx.exe` or `~/.renium/bin/rbx`.
 
 ## Choose the smallest sufficient check
@@ -39,23 +39,22 @@ Read only the guides the task needs, once per session, before using their comman
 
 Single-place projects use `src`; experiences use `places/<alias>/src`.
 A place folder selects its target. At the experience root, add `--place <alias|placeId>` when needed.
-Studio commands also accept `gameId:placeId` or a Studio window name.
+With two Studios open on one project, put `--place <placeId|window name>` before the command (or set `RENIUM_PLACE`); `--runtime-id` does not choose.
 
 Edit scripts as files; use Renium for generated `.renium` stores and sourcemaps.
 `f`/`bg`/`bb` read saved data; `q` searches a closed place; `v` inspects a model/place; `l` reads live Studio; `oc fetch --version` gets an older saved place. For a full place comparison, use `cmp BEFORE --full` (optionally `--against AFTER`).
 
-Read an existing target once and reuse its ID; refresh IDs after a pull.
+Read a target once and reuse its ID; refresh IDs after a pull.
 Run mutations one at a time and inspect each result; if one fails, check the affected state before retrying.
-A usage error (unknown flag, unexpected argument, missing selector or path) means the invocation was malformed, not that Renium failed: fix it and rerun instead of stopping or asking. Quote code and JSON for the shell or pipe them on stdin.
-Keep query results small (counts, slices, specific fields); write large captures to a file.
+A usage error (unknown flag, unexpected argument, missing selector or path) means the invocation was malformed, not that Renium failed: fix it and rerun instead of stopping or asking. Quote code and JSON or pipe them on stdin.
+Keep query results small (counts, slices, specific fields); `l` tables over 128 keys are cut with `_truncated`. `co --grep` is a regex (`-F` for text). Write large captures to a file.
 When a check exposes a defect in what you were asked to deliver, fix and verify it rather than reporting it. Never hand the user steps you could run yourself; do them, or offer to when it is their call.
-After cleanup, one prefix search is enough; `storeRemoved: true` needs no follow-up query.
 
 Renium marks affected linked packages Changed before edits. Report `autoDesyncedPackages`, including packages named in a failed edit. Publishing needs user authorization; it is not part of syncing. Say synced, not saved: with `teamCreate: true` in `rbx status` Studio saves to Roblox itself; otherwise only the user saves or publishes.
 
 ## Tools and boundaries
 
-- Use project-declared tools through their normal commands; if one is unavailable, say so instead of hunting for executables in caches or extension folders.
+- Use project-declared tools through their normal commands; if one is unavailable, say so instead of hunting for executables.
 - Pass arguments or pipe JSON/code through stdin; don't create payload files.
 - Launch, close, or replace Studio only when the task needs it; `rbx ro` reopens a closed bound place. Never take focus or global input.
 - Don't back up the project: `rbx rev` restores files a sync changed and Studio undo covers pushed edits; `.renium/editor-history` holds that data.

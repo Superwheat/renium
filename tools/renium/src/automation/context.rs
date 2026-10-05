@@ -74,9 +74,26 @@ fn ambiguous_studios(candidates: &[Value]) -> Failure {
             })
         })
         .collect::<Vec<_>>();
+    let names = candidates
+        .iter()
+        .map(|entry| {
+            let name = entry
+                .get("studioName")
+                .or_else(|| entry.get("placeName"))
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            match entry.get("placeId").and_then(Value::as_i64) {
+                Some(place) if place > 0 => format!("{name} ({place})"),
+                _ => name.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     Failure::new(
         "ambiguous_place",
-        "More than one Studio runtime matches this project",
+        format!(
+            "More than one Studio runtime matches this project: {names}. Pass --place <placeId|window name> before the command (or set RENIUM_PLACE); --runtime-id does not choose"
+        ),
         false,
         "studios",
     )

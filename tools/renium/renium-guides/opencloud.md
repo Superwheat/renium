@@ -68,6 +68,22 @@ rbx oc server logs VERSION JOB -l 1000 --severity error --grep "Ranked"
 Categories include data, ordered, memory, universe, place, restriction, secret, notification, user, group, interaction, team, asset, creator-store, pass, localization, config, luau, server, advertising, analytics, avatar, badge, experiment, event, ai, matchmaking, and thumbnail.
 Use `oc request` for unlisted endpoints; pipe complex bodies through stdin.
 
+`team members` lists who is in a place's Team Create session. `team remove-members` is not "end their session": it revokes those users' collaborator access for the whole universe (`DELETE .../teamcreate/memberships`); only run it when the user asks for exactly that.
+
+## Publish while someone else is in the live place
+
+An Open Cloud upload to a place that another collaborator has open in Team Create fails with HTTP 409; the error names the members and any newer unpublished saves. Publish from inside the session instead:
+
+```powershell
+rbx oc fetch --version N -r ./live             # the live place as a project
+rbx cmp ./live/place.rbxl --against dev.rbxl --full   # confirm their saves changed nothing you need
+rbx so ./live/place.rbxl                       # open the live place
+rbx cfg set liveSync.initialSyncPriority verify   # in ./live: first contact must not overwrite anything
+rbx --place LIVE_PLACE_ID ps src/Path/Changed.luau    # copy only the changed files in, then push them
+rbx --place LIVE_PLACE_ID ps --verify
+rbx --place LIVE_PLACE_ID publish              # Studio-side publish inside the session
+```
+
 ## Analytics and media
 
 ```powershell
