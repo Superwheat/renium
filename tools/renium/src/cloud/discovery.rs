@@ -406,6 +406,84 @@ pub(crate) fn games_command(key_env: &str, query: Option<&str>) -> Result<Value>
     }))
 }
 
+fn history_page(
+    identity: CloudIdentity,
+    key_env: &str,
+    oauth_env: Option<&str>,
+    place_id: i64,
+    cursor: Option<&str>,
+) -> Option<Value> {
+    let mut query = json!({ "pageSize": 20 });
+    if let Some(cursor) = cursor {
+        query["cursor"] = json!(cursor);
+    }
+    let response = execute_one(
+        identity,
+        key_env,
+        oauth_env,
+        false,
+        json!({
+            "method": "GET",
+            "path": "/place-version-history-api/v1/{place}/history",
+            "pathParams": { "place": place_id },
+            "query": query,
+        }),
+    )
+    .ok()?;
+    Some(response.get("body").cloned().unwrap_or(response))
+}
+
+/// `(version, published)` for each entry of a version history page, newest first.
+pub(crate) fn place_versions(body: &Value) -> Vec<(u64, bool)> {
+    body.get("placeVersions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let version = entry.get("version")?;
+            let version = version
+                .as_u64()
+                .or_else(|| version.as_str()?.parse().ok())?;
+            Some((
+                version,
+                entry.get("isPublished").and_then(Value::as_bool) == Some(true),
+            ))
+        })
+        .collect()
+}
+
+/// The newest page of a place's version history, or None when the key cannot
+/// read it.
+pub(crate) fn place_history(
+    identity: CloudIdentity,
+    key_env: &str,
+    place_id: i64,
+) -> Option<Value> {
+    history_page(identity, key_env, None, place_id, None)
+}
+
+/// The users in the Team Create session open on a place, or None when the key
+/// cannot read it.
+pub(crate) fn team_create_members(
+    identity: CloudIdentity,
+    key_env: &str,
+    place_id: i64,
+) -> Option<Value> {
+    let response = execute_one(
+        identity,
+        key_env,
+        None,
+        false,
+        json!({
+            "method": "GET",
+            "path": "/legacy-develop/v1/places/{place}/teamcreate/active_session/members",
+            "pathParams": { "place": place_id },
+        }),
+    )
+    .ok()?;
+    Some(response.get("body").cloned().unwrap_or(response))
+}
+
 /// The newest version that is published, read from the place's history, or
 /// None when the history cannot be read or holds no published version.
 fn latest_published_version(
@@ -416,33 +494,12 @@ fn latest_published_version(
 ) -> Option<u64> {
     let mut cursor: Option<String> = None;
     for _ in 0..5 {
-        let mut query = json!({ "pageSize": 20 });
-        if let Some(cursor) = &cursor {
-            query["cursor"] = json!(cursor);
-        }
-        let response = execute_one(
-            identity,
-            key_env,
-            oauth_env,
-            false,
-            json!({
-                "method": "GET",
-                "path": "/place-version-history-api/v1/{place}/history",
-                "pathParams": { "place": place_id },
-                "query": query,
-            }),
-        )
-        .ok()?;
-        let body = response.get("body").unwrap_or(&response);
-        let versions = body.get("placeVersions")?.as_array()?;
-        if let Some(version) = versions.iter().find_map(|entry| {
-            entry
-                .get("isPublished")?
-                .as_bool()
-                .filter(|published| *published)?;
-            let version = entry.get("version")?;
-            version.as_u64().or_else(|| version.as_str()?.parse().ok())
-        }) {
+        let body = history_page(identity, key_env, oauth_env, place_id, cursor.as_deref())?;
+        body.get("placeVersions")?.as_array()?;
+        if let Some((version, _)) = place_versions(&body)
+            .into_iter()
+            .find(|(_, published)| *published)
+        {
             return Some(version);
         }
         cursor = body

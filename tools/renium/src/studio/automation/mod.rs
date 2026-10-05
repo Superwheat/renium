@@ -716,8 +716,15 @@ pub(crate) fn normalize_live_status(mut value: Value) -> Value {
         .map(str::to_owned)
         .or_else(|| {
             (value.pointer("/daemon/settled").and_then(Value::as_bool) == Some(false)).then(|| {
-                "Live Sync did not finish before the wait ended; inspect rbx lst --details"
-                    .to_string()
+                match value.pointer("/daemon/unsettled").and_then(Value::as_str) {
+                    Some(reason) => {
+                        format!("Live Sync did not settle before the wait ended: {reason}")
+                    }
+                    None => {
+                        "Live Sync did not finish before the wait ended; inspect rbx lst --details"
+                            .to_string()
+                    }
+                }
             })
         });
     if let Some(error) = error
@@ -1108,6 +1115,7 @@ fn start_single_play_result(bridge: &BridgeServer, mode: &str) -> Result<Value> 
                     "mode": plugin_mode,
                     "launchNonce": launch.nonce,
                     "editRuntimeId": launch.edit_runtime_id,
+                    "editPid": bridge.studio_pid_for_runtime(BridgeTarget::Edit, &launch.edit_runtime_id).ok(),
                     "deviceSimulation": device_simulation,
                     "clients": clients,
                 }));
@@ -1211,6 +1219,8 @@ fn start_multiplayer_test_result(bridge: &BridgeServer, players: u32) -> Result<
                     "action": "start",
                     "mode": "multi",
                     "players": players,
+                    "editRuntimeId": launch.edit_runtime_id,
+                    "editPid": bridge.studio_pid_for_runtime(BridgeTarget::Edit, &launch.edit_runtime_id).ok(),
                     "deviceSimulation": device_simulation,
                     "clients": clients,
                 }));

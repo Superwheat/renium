@@ -171,7 +171,8 @@ and fetches the published version, without dialogs or focus. They wait up to two
 minutes (`--timeout` up to 600 seconds).
 
 `publish` sends the selected Studio Edit session to its existing place with your
-Studio login, so let Live Sync settle first (`rbx lst --wait`). When the place
+Studio login once Live Sync has settled; it refuses during Play or while file
+changes are still pending (`--allow-pending` publishes Studio as it is). When the place
 refuses the save API, Renium uses Studio's own Publish command. `--open-cloud`
 builds and uploads the project with an API key instead. If a publish is not
 confirmed, check Version History before retrying. Nothing is published as part of

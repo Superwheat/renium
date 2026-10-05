@@ -1565,25 +1565,19 @@ fn automation_dispatch_managed(
         }
         return Ok(result);
     }
-    if operation == op::PLACE_PUBLISH {
-        let status = state.live_sync().status(context.id);
-        if status.get("running").and_then(Value::as_bool) == Some(true)
-            && (status.get("syncing").and_then(Value::as_bool) == Some(true)
-                || status.get("paused").and_then(Value::as_bool) == Some(true)
-                || status.get("resolutionRequired").and_then(Value::as_bool) == Some(true)
-                || status.get("error").and_then(Value::as_str).is_some()
-                || status
-                    .get("pendingPaths")
-                    .and_then(Value::as_array)
-                    .is_some_and(|paths| !paths.is_empty()))
-        {
-            return Err(automation::Failure::new(
-                "conflict",
-                "Live Sync is not settled; run rbx lst --wait and resolve pending changes before publishing",
-                false,
-                "live-status",
-            ));
-        }
+    if operation == op::PLACE_PUBLISH
+        && parameters.get("allowPending").and_then(Value::as_bool) != Some(true)
+        && let Some(reason) =
+            automation::live::unsettled_reason(&state.live_sync().status(context.id), &Value::Null)
+    {
+        return Err(automation::Failure::new(
+            "conflict",
+            format!(
+                "Live Sync is not settled: {reason}. Let it finish (rbx lst --wait) or pass --allow-pending to publish Studio as it is"
+            ),
+            false,
+            "live-status",
+        ));
     }
     if operation == op::PROPERTY_ACCESS {
         let _selection = select_bridge_context(context, bridge);
@@ -2313,8 +2307,16 @@ fn automation_live_operation(
             .live_sync()
             .set_plugin_status(context.id, plugin.clone());
         daemon = state.live_sync().status(context.id);
+        let unsettled = if settled {
+            None
+        } else {
+            automation::live::unsettled_reason(&daemon, &plugin)
+        };
         if let Some(daemon) = daemon.as_object_mut() {
-            daemon.insert("settled".to_string(), Value::Bool(settled));
+            daemon.insert("settled".to_string(), Value::Bool(unsettled.is_none()));
+            if let Some(reason) = unsettled {
+                daemon.insert("unsettled".to_string(), Value::String(reason));
+            }
         }
     }
     Ok(merge_live_status(plugin, daemon, options.compact))
@@ -2688,7 +2690,9 @@ fn automation_execute_request(
     bridge_wait_seconds: f64,
 ) -> std::result::Result<Value, automation::Failure> {
     let started = Instant::now();
-    let request_guard = crate::daemon::memory::begin_request();
+    let request_guard = crate::daemon::memory::begin_request(
+        automation::opcode_by_id(request.op).map_or("unknown", |operation| operation.name),
+    );
     let result = automation_execute_request_inner(request, state, bridge, bridge_wait_seconds);
     drop(request_guard);
     let name = request.validate().map_or_else(
@@ -2743,7 +2747,16 @@ fn automation_execute_request_inner(
         ),
     );
     match operation.id {
-        op::CAP => automation::capabilities().map_err(automation_failure),
+        op::CAP => automation::capabilities()
+            .map(|mut capabilities| {
+                capabilities["active"] = crate::daemon::memory::active_requests()
+                    .into_iter()
+                    .filter(|(name, _)| *name != operation.name)
+                    .map(|(name, elapsed)| json!({ "op": name, "seconds": elapsed.as_secs() }))
+                    .collect();
+                capabilities
+            })
+            .map_err(automation_failure),
         op::STUDIO_AUDIO if request.p.get("global").and_then(Value::as_bool) == Some(true) => {
             (|| -> Result<Value> {
                 anyhow::ensure!(
@@ -3618,6 +3631,17 @@ mod tests {
         );
         assert_eq!(healthy["ok"], true);
         assert!(healthy.get("error").is_none());
+        for compact in [false, true] {
+            let waiting = merge_live_status(
+                json!({"ok":true}),
+                json!({"running":true,"settled":false,"unsettled":"a sync pass is still running"}),
+                compact,
+            );
+            assert_eq!(
+                waiting["error"],
+                "Live Sync did not settle before the wait ended: a sync pass is still running"
+            );
+        }
     }
 
     #[test]

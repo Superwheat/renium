@@ -1,5 +1,5 @@
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::app::output::log_global;
@@ -9,29 +9,48 @@ const IDLE_BEFORE_RELEASE: Duration = Duration::from_secs(1);
 const HEAVY_REQUEST: Duration = Duration::from_millis(50);
 const PAYLOAD_CACHE_IDLE_LIMIT: Duration = Duration::from_secs(5 * 60);
 
-static ACTIVE_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_REQUESTS: Mutex<Vec<(u64, &'static str, Instant)>> = Mutex::new(Vec::new());
+static NEXT_REQUEST: AtomicU64 = AtomicU64::new(0);
 static RELEASE_PENDING: AtomicBool = AtomicBool::new(false);
 static PAYLOAD_CACHES_HELD: AtomicBool = AtomicBool::new(false);
 static LAST_FINISHED: Mutex<Option<Instant>> = Mutex::new(None);
 
 pub(crate) struct RequestGuard {
+    id: u64,
     started: Instant,
 }
 
-pub(crate) fn begin_request() -> RequestGuard {
-    ACTIVE_REQUESTS.fetch_add(1, Ordering::Relaxed);
-    RequestGuard {
+pub(crate) fn begin_request(operation: &'static str) -> RequestGuard {
+    let guard = RequestGuard {
+        id: NEXT_REQUEST.fetch_add(1, Ordering::Relaxed),
         started: Instant::now(),
-    }
+    };
+    ACTIVE_REQUESTS
+        .lock_recover()
+        .push((guard.id, operation, guard.started));
+    guard
 }
 
 impl Drop for RequestGuard {
     fn drop(&mut self) {
-        ACTIVE_REQUESTS.fetch_sub(1, Ordering::Relaxed);
+        ACTIVE_REQUESTS
+            .lock_recover()
+            .retain(|(id, _, _)| *id != self.id);
         if self.started.elapsed() >= HEAVY_REQUEST {
             note_work_finished();
         }
     }
+}
+
+/// The operations the daemon is serving, longest-running first.
+pub(crate) fn active_requests() -> Vec<(&'static str, Duration)> {
+    let mut active = ACTIVE_REQUESTS
+        .lock_recover()
+        .iter()
+        .map(|(_, operation, started)| (*operation, started.elapsed()))
+        .collect::<Vec<_>>();
+    active.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+    active
 }
 
 pub(crate) fn after_background_work() {
@@ -46,7 +65,7 @@ fn note_work_finished() {
 }
 
 pub(crate) fn release_when_idle() {
-    if ACTIVE_REQUESTS.load(Ordering::Relaxed) != 0 {
+    if !ACTIVE_REQUESTS.lock_recover().is_empty() {
         return;
     }
     let Some(idle_for) = LAST_FINISHED
@@ -86,4 +105,28 @@ fn release_now() {
 
 fn collect_thread_heap() {
     unsafe { libmimalloc_sys::mi_collect(true) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_requests_list_running_operations_until_they_finish() {
+        let outer = begin_request("memory-test-outer");
+        std::thread::sleep(Duration::from_millis(5));
+        let inner = begin_request("memory-test-inner");
+        let names = || {
+            active_requests()
+                .into_iter()
+                .map(|(name, _)| name)
+                .filter(|name| name.starts_with("memory-test-"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(), ["memory-test-outer", "memory-test-inner"]);
+        drop(outer);
+        assert_eq!(names(), ["memory-test-inner"]);
+        drop(inner);
+        assert!(names().is_empty());
+    }
 }

@@ -722,6 +722,64 @@ fn studio_has_pending_changes(state: &Value) -> bool {
             .is_some_and(|services| !services.is_empty())
 }
 
+/// Why Live Sync is not settled, from its daemon status and the Studio change
+/// state (`Value::Null` ignores Studio-side changes); None when nothing is
+/// pending and no pass is running.
+pub(crate) fn unsettled_reason(daemon: &Value, studio: &Value) -> Option<String> {
+    if daemon["running"].as_bool() != Some(true) {
+        return None;
+    }
+    let error = daemon["error"].as_str().filter(|error| !error.is_empty());
+    let paths = daemon["pendingPaths"]
+        .as_array()
+        .map(|paths| paths.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let pending = daemon["pendingCount"]
+        .as_u64()
+        .map_or(paths.len(), |count| count as usize)
+        .max(paths.len());
+    let reason = if daemon["resolutionRequired"].as_bool() == Some(true) {
+        format!(
+            "a conflict needs resolution ({}); resolve it with rbx lon --prefer studio|editor",
+            error.unwrap_or("Studio and project files changed the same content")
+        )
+    } else if let Some(error) = error {
+        format!("Live Sync stopped on an error: {error}")
+    } else if daemon["paused"].as_bool() == Some(true) {
+        "file syncing is paused while another command writes project files".to_string()
+    } else if daemon["syncing"].as_bool() == Some(true) {
+        "a sync pass is still running".to_string()
+    } else if pending > 0 {
+        let noun = if pending == 1 { "change" } else { "changes" };
+        let mut reason = format!("{pending} file {noun} not yet in Studio");
+        if !paths.is_empty() {
+            reason.push_str(": ");
+            reason.push_str(&paths.iter().take(3).copied().collect::<Vec<_>>().join(", "));
+            if pending > 3 {
+                reason.push_str(&format!(" and {} more", pending - 3));
+            }
+        }
+        reason
+    } else if studio_has_pending_changes(studio) {
+        if daemon["pullChanges"].as_bool() == Some(false) {
+            "Studio has changes that Live Sync does not pull into files".to_string()
+        } else {
+            "Studio changes are still being pulled into files".to_string()
+        }
+    } else {
+        return None;
+    };
+    Some(
+        match daemon["lastError"]
+            .as_str()
+            .filter(|last| error.is_none() && !last.is_empty())
+        {
+            Some(last) => format!("{reason}; last error: {last}"),
+            None => reason,
+        },
+    )
+}
+
 fn studio_sync_activity(state: &Value) -> (Option<&str>, Option<u64>, bool) {
     (
         state["runtimeId"].as_str(),
@@ -3715,5 +3773,77 @@ mod tests {
         let started = Instant::now();
         assert!(!control.wait_settled(Duration::from_secs(1)));
         assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn unsettled_reasons_name_what_live_sync_still_waits_for() {
+        let control = test_control();
+        assert_eq!(
+            unsettled_reason(&control.snapshot(), &control.plugin_snapshot()),
+            None
+        );
+        assert_eq!(
+            unsettled_reason(
+                &json!({"running": false, "pendingPaths": ["a"]}),
+                &Value::Null
+            ),
+            None
+        );
+        control.queue(["a", "b", "c", "d"].map(|name| PathBuf::from(format!("{name}.luau"))));
+        assert_eq!(
+            unsettled_reason(&control.snapshot(), &Value::Null).as_deref(),
+            Some("4 file changes not yet in Studio: a.luau, b.luau, c.luau and 1 more")
+        );
+        assert_eq!(
+            unsettled_reason(&json!({"running": true, "pendingCount": 12}), &Value::Null)
+                .as_deref(),
+            Some("12 file changes not yet in Studio")
+        );
+        assert_eq!(
+            unsettled_reason(
+                &json!({"running": true, "pendingPaths": ["a.luau"], "lastError": "timed out"}),
+                &Value::Null
+            )
+            .as_deref(),
+            Some("1 file change not yet in Studio: a.luau; last error: timed out")
+        );
+        for (daemon, expected) in [
+            (
+                json!({"running": true, "syncing": true}),
+                "a sync pass is still running",
+            ),
+            (
+                json!({"running": true, "paused": true, "syncing": true}),
+                "file syncing is paused while another command writes project files",
+            ),
+            (
+                json!({"running": true, "error": "Export failed", "lastError": "Export failed"}),
+                "Live Sync stopped on an error: Export failed",
+            ),
+        ] {
+            assert_eq!(
+                unsettled_reason(&daemon, &Value::Null).as_deref(),
+                Some(expected)
+            );
+        }
+        let conflict = unsettled_reason(
+            &json!({"running": true, "resolutionRequired": true, "error": "Size differs"}),
+            &Value::Null,
+        )
+        .unwrap();
+        assert!(conflict.contains("Size differs") && conflict.contains("--prefer"));
+        let studio = json!({"changeCount": 2});
+        assert_eq!(
+            unsettled_reason(&json!({"running": true}), &studio).as_deref(),
+            Some("Studio changes are still being pulled into files")
+        );
+        assert_eq!(
+            unsettled_reason(&json!({"running": true, "pullChanges": false}), &studio).as_deref(),
+            Some("Studio has changes that Live Sync does not pull into files")
+        );
+        assert_eq!(
+            unsettled_reason(&json!({"running": true, "lastError": "old"}), &Value::Null),
+            None
+        );
     }
 }

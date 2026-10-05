@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use super::{config, experience, workflows};
 use crate::app;
-use crate::automation::{BoundContext, commands::daemon_result, op};
+use crate::automation::{BoundContext, commands::daemon_result, live, op};
 use crate::cli::BridgeConnectionArgs;
 use crate::cloud;
 use crate::rbx::model::RbxPlaceFormat;
@@ -20,6 +20,7 @@ use crate::system::files::{absolutize_for_daemon, create_unique_directory};
 
 const MAX_PLACE_BYTES: u64 = 100 * 1024 * 1024;
 const PUBLISH_SECONDS: u64 = 120;
+const LIVE_SYNC_SETTLE_SECONDS: f64 = 20.0;
 #[cfg(any(windows, target_os = "macos"))]
 const STUDIO_PUBLISH_ACTION: &str = "publishToRobloxAction";
 #[cfg(any(windows, target_os = "macos"))]
@@ -82,6 +83,18 @@ pub(crate) struct PublishArgs {
         help = "Validate and show the source and destination without publishing or checking cloud permissions"
     )]
     dry_run: bool,
+    #[arg(
+        long,
+        conflicts_with = "open_cloud",
+        help = "Publish Studio as it is even when Live Sync has file changes pending or a conflict to resolve"
+    )]
+    allow_pending: bool,
+    #[arg(
+        long,
+        requires = "publish_as",
+        help = "With --as, publish while a Play session runs in the selected Studio"
+    )]
+    allow_play: bool,
     #[command(flatten)]
     bridge: BridgeConnectionArgs,
 }
@@ -92,15 +105,134 @@ pub(crate) fn run(args: PublishArgs, project: Option<&Path>) -> Result<()> {
     } else if args.publish_as.is_some() {
         publish_as(&args, project)?
     } else {
-        daemon_result(
-            op::PLACE_PUBLISH,
-            project,
-            json!({ "dryRun": args.dry_run }),
-            !args.dry_run,
-            Some(&args.bridge),
-        )?
+        publish_from_studio(&args, project)?
     };
     app::output::print_json_output(&result, false)
+}
+
+struct StudioPreflight {
+    live_sync: Value,
+    place_version: Option<u64>,
+}
+
+/// Checks the selected Studio before its open place is published: no Play
+/// session, and Live Sync, when running, settled so every file edit is in Studio.
+fn studio_preflight(args: &PublishArgs, project: Option<&Path>) -> Result<StudioPreflight> {
+    let status = daemon_result(
+        op::STUDIO_STATUS,
+        project,
+        json!({ "all": false }),
+        false,
+        Some(&args.bridge),
+    )?;
+    ensure_play_stopped(&status, args.allow_play, args.publish_as.is_some())?;
+    let mut live_status = daemon_result(
+        op::LIVE_STATUS,
+        project,
+        json!({ "manageFiles": true, "filesOnly": true, "compact": true }),
+        false,
+        Some(&args.bridge),
+    )?;
+    if live_status
+        .pointer("/daemon/running")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        live_status = daemon_result(
+            op::LIVE_STATUS,
+            project,
+            json!({
+                "manageFiles": true,
+                "compact": true,
+                "settleWaitSeconds": LIVE_SYNC_SETTLE_SECONDS,
+            }),
+            false,
+            Some(&args.bridge),
+        )?;
+    }
+    Ok(StudioPreflight {
+        live_sync: live_sync_preflight(&live_status["daemon"], args.allow_pending)?,
+        place_version: studio_place_version(&status),
+    })
+}
+
+fn studio_place_version(status: &Value) -> Option<u64> {
+    status["placeVersion"]
+        .as_u64()
+        .filter(|version| *version > 0)
+}
+
+fn ensure_play_stopped(status: &Value, allow_play: bool, publish_as: bool) -> Result<()> {
+    let playing = matches!(status["playState"].as_str(), Some("running" | "starting"))
+        || status["clients"].as_array().is_some_and(|clients| {
+            clients.iter().any(|client| {
+                matches!(client["role"].as_str(), Some("play-server" | "play-client"))
+            })
+        });
+    if !playing || allow_play {
+        return Ok(());
+    }
+    if publish_as {
+        bail!(
+            "A Play session is running in the selected Studio; stop Play first (rbx play -x) or pass --allow-play"
+        );
+    }
+    bail!(
+        "A Play session is running in the selected Studio; stop Play first (rbx play -x). Studio publishes its open place only from Edit"
+    )
+}
+
+fn live_sync_preflight(daemon: &Value, allow_pending: bool) -> Result<Value> {
+    if daemon["running"].as_bool() != Some(true) {
+        return Ok(json!({ "running": false }));
+    }
+    let unsettled = live::unsettled_reason(daemon, &Value::Null);
+    if let Some(reason) = &unsettled
+        && !allow_pending
+    {
+        bail!(
+            "Live Sync is not settled: {reason}. Let it finish (rbx lst --wait) or pass --allow-pending to publish Studio as it is"
+        );
+    }
+    let mut result = json!({
+        "pending": daemon["pendingCount"].as_u64().unwrap_or_default(),
+        "settled": unsettled.is_none(),
+    });
+    if let Some(reason) = unsettled {
+        result["unsettled"] = json!(reason);
+    }
+    Ok(result)
+}
+
+fn publish_from_studio(args: &PublishArgs, project: Option<&Path>) -> Result<Value> {
+    let preflight = studio_preflight(args, project)?;
+    let mut result = daemon_result(
+        op::PLACE_PUBLISH,
+        project,
+        json!({ "dryRun": args.dry_run, "allowPending": args.allow_pending }),
+        !args.dry_run,
+        Some(&args.bridge),
+    )?;
+    if result["published"] == true
+        && result["versionNumber"].is_null()
+        && let Some(previous) = preflight.place_version
+        && let Some(current) = daemon_result(
+            op::STUDIO_STATUS,
+            project,
+            json!({ "all": false }),
+            false,
+            Some(&args.bridge),
+        )
+        .ok()
+        .as_ref()
+        .and_then(studio_place_version)
+        .filter(|current| *current > previous)
+    {
+        result["versionNumber"] = json!(current);
+    }
+    result["previousVersion"] = json!(preflight.place_version);
+    result["liveSync"] = preflight.live_sync;
+    Ok(result)
 }
 
 pub(crate) fn studio_result(
@@ -198,6 +330,9 @@ fn publish_as(args: &PublishArgs, project: Option<&Path>) -> Result<Value> {
         cloud::CloudAuth::from_env(false, key_env, None, "publish")
             .map_err(cloud::command::cloud_error)?;
     }
+    let preflight = studio_preflight(args, project)?;
+    let previous_version = cloud::place_history(identity, key_env, target)
+        .and_then(|history| cloud::place_versions(&history).first().map(|entry| entry.0));
     let file = std::env::temp_dir().join(format!(
         "renium-publish-as-{}-{}.rbxl",
         std::process::id(),
@@ -224,12 +359,15 @@ fn publish_as(args: &PublishArgs, project: Option<&Path>) -> Result<Value> {
             "gameId": game_id, "placeId": target, "bytes": bytes,
             "versionType": if args.saved { "Saved" } else { "Published" },
             "url": format!("https://www.roblox.com/games/{target}"),
+            "previousVersion": previous_version, "liveSync": preflight.live_sync,
         });
         if !args.dry_run {
-            let response = cloud::execute_one(identity, key_env, None, false,
-                cloud_request_with_type(&file, !args.saved))
-                .map_err(cloud::command::cloud_error)
-                .context("Publish was not confirmed. Check Version History before retrying; the upload is not automatically repeated")?;
+            let response = upload(
+                identity,
+                key_env,
+                target,
+                cloud_request_with_type(&file, !args.saved),
+            )?;
             result["versionNumber"] = json!(published_version(&response)?);
             result["published"] = json!(!args.saved);
         }
@@ -303,7 +441,7 @@ fn publish_with_studio_action(
         "placeId": context.place_id,
         "window": outcome.window_title,
         "actionMatches": outcome.found,
-        "version": published.version,
+        "versionNumber": published.version,
         "url": format!("https://www.roblox.com/games/{}", context.place_id.unwrap_or_default()),
     }))
 }
@@ -561,10 +699,8 @@ fn open_cloud(args: &PublishArgs, project: Option<&Path>) -> Result<Value> {
             "url": format!("https://www.roblox.com/games/{place_id}"),
         });
         if !args.dry_run {
-            let response = cloud::execute_one(identity, args.key_env.as_deref().unwrap_or("ROBLOX_API_KEY"), None, false,
-                cloud_request(&file))
-                .map_err(cloud::command::cloud_error)
-                .context("Publish was not confirmed. Check Version History before retrying; the upload is not automatically repeated")?;
+            let key_env = args.key_env.as_deref().unwrap_or("ROBLOX_API_KEY");
+            let response = upload(identity, key_env, place_id, cloud_request(&file))?;
             result["versionNumber"] = json!(published_version(&response)?);
             result["published"] = json!(true);
         }
@@ -650,6 +786,120 @@ fn published_version(response: &Value) -> Result<u64> {
     response.pointer("/body/versionNumber").and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
         .filter(|version| *version > 0)
         .context("Roblox did not return a published version number. Check Version History before retrying")
+}
+
+fn upload(
+    identity: cloud::CloudIdentity,
+    key_env: &str,
+    place_id: i64,
+    request: Value,
+) -> Result<Value> {
+    cloud::execute_one(identity, key_env, None, false, request).map_err(|failure| {
+        let detail = failure.0.d.clone().unwrap_or_default();
+        let error = cloud::command::cloud_error(failure);
+        if detail["status"].as_u64() != Some(409) {
+            return error.context("Publish was not confirmed. Check Version History before retrying; the upload is not automatically repeated");
+        }
+        let report = busy_upload_report(
+            cloud::team_create_members(identity, key_env, place_id).as_ref(),
+            cloud::place_history(identity, key_env, place_id).as_ref(),
+        );
+        busy_upload_error(&error.to_string(), &detail["body"], report)
+    })
+}
+
+// Roblox answers 409 "Server is busy" while the destination is open in a Team
+// Create session; who is in it and which saves are unpublished says what blocks it.
+fn busy_upload_report(members: Option<&Value>, history: Option<&Value>) -> Option<Value> {
+    if members.is_none() && history.is_none() {
+        return None;
+    }
+    let members = members.map(team_members);
+    let newer_saves = history.map(|history| {
+        cloud::place_versions(history)
+            .into_iter()
+            .take_while(|(_, published)| !published)
+            .take(10)
+            .map(|(version, _)| json!({ "version": version, "published": false }))
+            .collect::<Vec<_>>()
+    });
+    let names = members
+        .iter()
+        .flatten()
+        .filter_map(|member| member["name"].as_str())
+        .collect::<Vec<_>>();
+    let (code, hint) = if members.as_ref().is_some_and(|members| !members.is_empty()) {
+        let who = match names.as_slice() {
+            [] => "Someone has".to_string(),
+            [one] => format!("{one} has"),
+            [rest @ .., last] => format!("{} and {last} have", rest.join(", ")),
+        };
+        (
+            "team_create_active",
+            format!(
+                "{who} this place open in Team Create, and Roblox refuses uploads while that session is open. Ask them to close it or publish from that Studio, then publish again"
+            ),
+        )
+    } else if let Some(version) = newer_saves.iter().flatten().next() {
+        (
+            "unpublished_newer_save",
+            format!(
+                "Version {} was saved after the last published version and is not published, which happens while a Team Create session edits this place. Publish from that session or close it, then publish again",
+                version["version"]
+            ),
+        )
+    } else {
+        (
+            "place_busy",
+            "Roblox reported the place busy; a Team Create session open on it causes this. Close that session, then publish again".to_string(),
+        )
+    };
+    let mut report = json!({ "code": code, "hint": hint });
+    if let Some(members) = members {
+        report["members"] = json!(members);
+    }
+    if let Some(newer_saves) = newer_saves {
+        report["newerSaves"] = json!(newer_saves);
+    }
+    Some(report)
+}
+
+fn team_members(body: &Value) -> Vec<Value> {
+    body.get("data")
+        .unwrap_or(body)
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|member| {
+            let mut entry = json!({});
+            if let Some(id) = member["id"].as_i64().or_else(|| member["userId"].as_i64()) {
+                entry["id"] = json!(id);
+            }
+            if let Some(name) = ["name", "username", "displayName"]
+                .iter()
+                .find_map(|key| member[key].as_str())
+            {
+                entry["name"] = json!(name);
+            }
+            entry
+        })
+        .collect()
+}
+
+fn busy_upload_error(original: &str, body: &Value, report: Option<Value>) -> anyhow::Error {
+    let Some(report) = report else {
+        return anyhow::anyhow!(
+            "{original}\nA Team Create session open on the destination place causes this; close it, then publish again"
+        );
+    };
+    let message = body
+        .as_str()
+        .or_else(|| body["message"].as_str())
+        .or_else(|| body.pointer("/errors/0/message").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .unwrap_or("the place is busy");
+    anyhow::anyhow!("Roblox refused the upload with HTTP 409 ({message}): {report}")
 }
 
 #[cfg(test)]
@@ -813,6 +1063,23 @@ mod tests {
                 .is_err()
         );
         assert!(crate::cli::Cli::try_parse_from(["rbx", "publish", "--saved"]).is_err());
+        assert!(args(&["rbx", "publish", "--allow-pending"]).allow_pending);
+        assert!(
+            args(&[
+                "rbx",
+                "publish",
+                "--as",
+                "5",
+                "--allow-play",
+                "--allow-pending"
+            ])
+            .allow_play
+        );
+        assert!(crate::cli::Cli::try_parse_from(["rbx", "publish", "--allow-play"]).is_err());
+        assert!(
+            crate::cli::Cli::try_parse_from(["rbx", "publish", "--open-cloud", "--allow-pending"])
+                .is_err()
+        );
         assert_eq!(
             cloud_request_with_type(Path::new("a.rbxl"), false)["query"]["versionType"],
             "Saved"
@@ -832,6 +1099,154 @@ mod tests {
         assert!(
             crate::cli::Cli::try_parse_from(["rbx", "publish", "--open-cloud", "--place-id", "0"])
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn studio_preflight_blocks_play_and_unsettled_live_sync_unless_allowed() {
+        let stopped = json!({"playState": "stopped", "clients": [{"role": "edit"}]});
+        assert!(ensure_play_stopped(&stopped, false, false).is_ok());
+        for status in [
+            json!({"playState": "running"}),
+            json!({"playState": "starting"}),
+            json!({"playState": "unknown", "clients": [{"role": "edit"}, {"role": "play-server"}]}),
+        ] {
+            let studio = ensure_play_stopped(&status, false, false)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                studio.contains("stop Play first (rbx play -x)")
+                    && !studio.contains("--allow-play"),
+                "{studio}"
+            );
+            let publish_as = ensure_play_stopped(&status, false, true)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                publish_as.ends_with("stop Play first (rbx play -x) or pass --allow-play"),
+                "{publish_as}"
+            );
+            assert!(ensure_play_stopped(&status, true, true).is_ok());
+        }
+        assert_eq!(
+            live_sync_preflight(&json!({"running": false}), false).unwrap(),
+            json!({"running": false})
+        );
+        assert_eq!(
+            live_sync_preflight(
+                &json!({"running": true, "settled": true, "pendingCount": 0}),
+                false
+            )
+            .unwrap(),
+            json!({"pending": 0, "settled": true})
+        );
+        let pending = json!({
+            "running": true, "settled": false, "pendingCount": 2,
+            "pendingPaths": ["src/A.luau", "src/B.luau"],
+        });
+        let error = live_sync_preflight(&pending, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("2 file changes not yet in Studio: src/A.luau, src/B.luau")
+                && error.contains("--allow-pending"),
+            "{error}"
+        );
+        let allowed = live_sync_preflight(&pending, true).unwrap();
+        assert_eq!(allowed["pending"], 2);
+        assert_eq!(allowed["settled"], false);
+        assert!(
+            live_sync_preflight(
+                &json!({"running": true, "resolutionRequired": true, "error": "Size differs"}),
+                false
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("conflict needs resolution (Size differs)")
+        );
+        assert_eq!(studio_place_version(&json!({"placeVersion": 0})), None);
+        assert_eq!(
+            studio_place_version(&json!({"placeVersion": 2848})),
+            Some(2848)
+        );
+    }
+
+    #[test]
+    fn busy_upload_names_team_create_members_and_unpublished_saves() {
+        let members = json!({
+            "previousPageCursor": null, "nextPageCursor": null,
+            "data": [
+                {"id": 1, "name": "Builder", "displayName": "B"},
+                {"userId": 2, "displayName": "Scripter"},
+            ],
+        });
+        let history = json!({
+            "placeVersions": [
+                {"version": 2849, "isPublished": false},
+                {"version": 2848, "isPublished": true},
+                {"version": 2847, "isPublished": false},
+            ],
+            "hasMore": true,
+        });
+        let report = busy_upload_report(Some(&members), Some(&history)).unwrap();
+        assert_eq!(report["code"], "team_create_active");
+        assert_eq!(
+            report["members"],
+            json!([{"id": 1, "name": "Builder"}, {"id": 2, "name": "Scripter"}])
+        );
+        assert_eq!(
+            report["newerSaves"],
+            json!([{"version": 2849, "published": false}])
+        );
+        assert!(
+            report["hint"]
+                .as_str()
+                .unwrap()
+                .starts_with("Builder and Scripter have this place open in Team Create")
+        );
+        let saves_only = busy_upload_report(None, Some(&history)).unwrap();
+        assert_eq!(saves_only["code"], "unpublished_newer_save");
+        assert!(saves_only.get("members").is_none());
+        assert!(
+            saves_only["hint"]
+                .as_str()
+                .unwrap()
+                .starts_with("Version 2849 was saved after the last published version")
+        );
+        let quiet = busy_upload_report(
+            Some(&json!({"data": []})),
+            Some(&json!({"placeVersions": [{"version": 7, "isPublished": true}]})),
+        )
+        .unwrap();
+        assert_eq!(quiet["code"], "place_busy");
+        assert_eq!(quiet["members"], json!([]));
+        assert_eq!(quiet["newerSaves"], json!([]));
+        assert_eq!(busy_upload_report(None, None), None);
+
+        let structured = busy_upload_error(
+            "Open Cloud request 0 returned HTTP 409",
+            &json!({"message": "Server is busy and unable to process your upload request"}),
+            Some(report),
+        )
+        .to_string();
+        assert!(
+            structured.starts_with(
+                "Roblox refused the upload with HTTP 409 (Server is busy and unable to process your upload request): {"
+            ),
+            "{structured}"
+        );
+        assert!(structured.contains(r#""code":"team_create_active""#));
+        let fallback = busy_upload_error(
+            "Open Cloud request 0 returned HTTP 409\n{\"status\":409}",
+            &Value::Null,
+            None,
+        )
+        .to_string();
+        assert!(
+            fallback.starts_with(
+                "Open Cloud request 0 returned HTTP 409\n{\"status\":409}\nA Team Create session open on the destination place causes this"
+            ),
+            "{fallback}"
         );
     }
 

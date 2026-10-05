@@ -3283,6 +3283,7 @@ impl BridgeServer {
             place_name: String,
             build_unix: i64,
             ports: Vec<u16>,
+            pid: Option<u32>,
         }
         let mut entries: Vec<ClientEntry> = Vec::new();
         for channel in &self.channels {
@@ -3372,6 +3373,7 @@ impl BridgeServer {
                             entry.place_name.clone_from(&info.place_name);
                         }
                         entry.build_unix = entry.build_unix.max(info.bridge_build_unix);
+                        entry.pid = entry.pid.or(snapshot.studio_pid);
                     }
                     None => entries.push(ClientEntry {
                         runtime_id: info.runtime_id.clone(),
@@ -3387,6 +3389,7 @@ impl BridgeServer {
                         place_name: info.place_name.clone(),
                         build_unix: info.bridge_build_unix,
                         ports: vec![snapshot.port],
+                        pid: snapshot.studio_pid,
                     }),
                 }
             }
@@ -3441,6 +3444,9 @@ impl BridgeServer {
                 }
                 if let Some(game_id) = entry.game_id {
                     object.insert("gameId".to_string(), json!(game_id));
+                }
+                if let Some(pid) = entry.pid {
+                    object.insert("pid".to_string(), json!(pid));
                 }
                 object.insert("bridgeBuildUnix".to_string(), json!(entry.build_unix));
                 object.insert("channels".to_string(), json!(entry.ports.len()));

@@ -72,17 +72,22 @@ rbx publish --as 456 --universe 123 --key live
 
 Publishing requires user authorization. Default: publish the selected Studio Edit
 state to its existing place with the Studio login, without pushing files first.
-Settle pending Live Sync with `lst --wait`. When the place refuses `SavePlaceAsync`
-(Save Place API off, Team Create), Renium runs Studio's own Publish command and reads
-the result from Studio's log (Windows and macOS). Don't change place settings or
-credentials to work around a refusal without authorization.
+Both Studio routes first wait up to 20 s for Live Sync to settle and refuse while
+file changes are pending or a conflict is open (`--allow-pending` publishes Studio
+as it is) or while Play runs (`rbx play -x`; `--as` also takes `--allow-play`).
+Results report `liveSync`, `previousVersion` and `versionNumber`. When the place
+refuses `SavePlaceAsync` (Save Place API off, Team Create), Renium runs Studio's own
+Publish command and reads the result from Studio's log (Windows and macOS). Don't
+change place settings or credentials to work around a refusal without authorization.
 
 `--as PLACE_ID` is Studio's Publish As: the open Edit place, serialized by Studio
 itself, goes to that place through Open Cloud in one step, so a development place
 reaches its live place without publishing it first and downloading the version
 back. `--universe` names the destination's experience when it differs from the
 project's; `--saved` stores a version without publishing it. Roblox refuses the
-upload with HTTP 409 while the destination place is open in a Team Create session.
+upload with HTTP 409 while the destination place is open in a Team Create session;
+the error names that session's members and unpublished newer saves when the key
+can read them.
 `--open-cloud` builds the selected place project, or uploads `--file` unchanged.
 Use `ROBLOX_API_KEY` / `--key-env ENV` with Universe Places Write. IDs come from the
 experience or explicit flags. Cloud rejects instance types its API cannot update

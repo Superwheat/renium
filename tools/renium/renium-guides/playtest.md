@@ -22,7 +22,7 @@ rbx play -x
 
 Play keeps the scripts it started with; after editing server or client code, `rbx play -r` restarts the session. `--until EXPR` returns once the server expression is true (`--until-timeout`, default 120 s), so no loop is needed before the first test step.
 
-Use ordinary Play for one-client checks. `--players 1` explicitly launches a separate server and client; `mode: "play"` means ordinary Play. Stop only a session you started or were asked to stop. File edits during Play can wait for Edit mode; that alone is not a sync failure.
+Use ordinary Play for one-client checks. `--players 1` explicitly launches a separate server and client; `mode: "play"` means ordinary Play. Stop only a session you started or were asked to stop. `play -s`, `status` and `cs` give each runtime's Studio `pid`. File edits during Play can wait for Edit mode; that alone is not a sync failure.
 
 Play runs the game's real server code. With Studio API access enabled, its DataStore writes (currency, inventories, progress) change the signed-in account's live data, so don't spend or alter saved data without asking.
 
