@@ -1084,13 +1084,28 @@ pub(super) struct PluginConsoleOutputArgs {
     pub(super) client: bool,
     #[arg(help = "Read the play server console", long, conflicts_with_all = ["client", "player"])]
     pub(super) server: bool,
-    #[arg(help = "Play client by name or index", long, value_name = "NAME|N")]
+    #[arg(
+        help = "Play client by name or index",
+        short,
+        long,
+        value_name = "NAME|N"
+    )]
     pub(super) player: Option<String>,
     #[arg(help = "Keep streaming new entries", short, long)]
     pub(super) follow: bool,
-    #[arg(help = "Only entries containing TEXT", long, value_name = "TEXT")]
+    #[arg(
+        help = "Only entries matching this case-insensitive regex (plain text when -F)",
+        long,
+        value_name = "PATTERN"
+    )]
     pub(super) grep: Option<String>,
-    #[arg(help = "Only entries of this message type", long, value_name = "TYPE")]
+    #[arg(help = "Treat --grep as plain text", short = 'F', long)]
+    pub(super) fixed: bool,
+    #[arg(
+        help = "Only entries of this level: error, warn, info, output",
+        long,
+        value_name = "LEVEL"
+    )]
     pub(super) level: Option<String>,
     #[arg(help = "Poll interval while following", long, default_value_t = 200)]
     pub(super) interval_ms: u64,
@@ -1108,8 +1123,25 @@ pub(super) struct ExecuteLuauArgs {
     pub(super) file: Option<PathBuf>,
     #[arg(help = "Run on a play client", short, long)]
     pub(super) client: bool,
-    #[arg(help = "Play client by name or index", long, value_name = "NAME|N")]
+    #[arg(
+        help = "Play client by name or index",
+        short,
+        long,
+        value_name = "NAME|N"
+    )]
     pub(super) player: Option<String>,
+    #[arg(
+        help = "Run on the play server only; fails instead of falling back to Edit",
+        long,
+        conflicts_with_all = ["client", "player", "edit"]
+    )]
+    pub(super) server: bool,
+    #[arg(
+        help = "Run in the Edit window even while Play is running",
+        long,
+        conflicts_with_all = ["client", "player"]
+    )]
+    pub(super) edit: bool,
     #[arg(
         help = "Seconds before the run is cancelled",
         short,
@@ -1317,10 +1349,38 @@ pub(super) struct StartStopPlayArgs {
     pub(super) start: bool,
     #[arg(help = "Stop the session", short = 'x', long)]
     pub(super) stop: bool,
-    #[arg(help = "Launch a server and N clients", short, long, value_name = "N")]
+    #[arg(
+        help = "Stop any running session first, then start (same players and mode)",
+        short,
+        long,
+        conflicts_with = "stop"
+    )]
+    pub(super) restart: bool,
+    #[arg(
+        help = "Launch a server and N clients",
+        short,
+        long,
+        alias = "clients",
+        short_alias = 'n',
+        value_name = "N"
+    )]
     pub(super) players: Option<u32>,
     #[arg(help = "Session kind", long, value_name = "play|run|server")]
     pub(super) mode: Option<String>,
+    #[arg(
+        help = "After starting, wait until this Luau expression is true on the server",
+        long,
+        value_name = "LUAU",
+        conflicts_with = "stop"
+    )]
+    pub(super) until: Option<String>,
+    #[arg(
+        help = "Seconds to wait for --until",
+        long,
+        default_value_t = 120.0,
+        requires = "until"
+    )]
+    pub(super) until_timeout: f64,
 }
 
 #[derive(Parser)]
@@ -1704,7 +1764,12 @@ pub(super) struct WaitUntilArgs {
     pub(super) player: Option<String>,
     #[arg(help = "Evaluate on a play client", short, long)]
     pub(super) client: bool,
-    #[arg(help = "Seconds before giving up", short, long, default_value_t = 10.0)]
+    #[arg(
+        help = "Seconds before giving up (up to 3600)",
+        short,
+        long,
+        default_value_t = 60.0
+    )]
     pub(super) timeout: f64,
     #[arg(help = "Seconds between checks", long, default_value_t = 0.25)]
     pub(super) interval: f64,

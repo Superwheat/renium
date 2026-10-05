@@ -71,6 +71,8 @@ pub(crate) fn execute_luau_command(mut args: ExecuteLuauArgs) -> Result<()> {
         "file": args.file,
         "client": args.client,
         "player": args.player,
+        "server": args.server,
+        "edit": args.edit,
         "timeout": args.timeout,
         "detach": args.runner.detach,
         "collect": args.runner.collect,
@@ -83,6 +85,10 @@ pub(crate) fn execute_luau_command(mut args: ExecuteLuauArgs) -> Result<()> {
     if let Some(map) = result.as_object_mut() {
         if map.get("background") == Some(&Value::Bool(false)) {
             map.remove("background");
+        }
+        if map.get("ok") == Some(&Value::Bool(true)) {
+            map.remove("path");
+            map.remove("runner");
         }
         for key in ["output", "results"] {
             if map
@@ -246,9 +252,34 @@ fn runner_name(name: &str) -> Result<&str> {
     Ok(name)
 }
 
+/// Where a Luau run landed, for error messages: an error from the Edit window
+/// reads differently from one on the play server or a client.
+fn luau_context_label(result: &Value, player: Option<&str>) -> String {
+    match result.get("context").and_then(Value::as_str) {
+        Some("client") => match player {
+            Some(player) => format!("client {player}"),
+            None => "play client".to_string(),
+        },
+        Some("server") => "play server".to_string(),
+        Some("edit") | Some("plugin") => "Edit window".to_string(),
+        _ => "Studio".to_string(),
+    }
+}
+
+fn ensure_luau_ok_in_context(result: &Value, player: Option<&str>) -> Result<()> {
+    ensure_luau_api_ok(result)
+        .map_err(|error| anyhow::anyhow!("[{}] {error:#}", luau_context_label(result, player)))
+}
+
 pub(crate) fn execute_luau_result(args: ExecuteLuauArgs, bridge: &BridgeServer) -> Result<Value> {
     let client = args.client || args.player.is_some();
-    let target = BridgeTarget::main_or_client(client);
+    let target = if args.server {
+        BridgeTarget::Server
+    } else if args.edit {
+        BridgeTarget::Edit
+    } else {
+        BridgeTarget::main_or_client(client)
+    };
     let player = args.player.as_deref();
     if let Some(player) = player {
         wait_for_player_bridge(bridge, player, args.bridge.wait_seconds)?;
@@ -261,7 +292,7 @@ pub(crate) fn execute_luau_result(args: ExecuteLuauArgs, bridge: &BridgeServer) 
             player,
             Some(Duration::from_secs(30)),
         )?;
-        ensure_luau_api_ok(&result)?;
+        ensure_luau_ok_in_context(&result, player)?;
         return Ok(result);
     }
     let code = if let Some(code) = args.code.or(args.inline_code) {
@@ -285,7 +316,7 @@ pub(crate) fn execute_luau_result(args: ExecuteLuauArgs, bridge: &BridgeServer) 
         player,
         Some(Duration::from_secs_f64(timeout + 10.0)),
     )?;
-    ensure_luau_api_ok(&result)?;
+    ensure_luau_ok_in_context(&result, player)?;
     if detached.is_some() && result.get("detached").is_none() {
         bail!("The Studio plugin predates detached runners; run rbx setup and restart Studio");
     }
@@ -461,7 +492,60 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
         "bridgeWaitSeconds": args.bridge.wait_seconds,
         "bridgePorts": args.bridge.ports,
     });
-    let result = daemon_control_request(operation, None, parameters, false)?;
+    let mut stopped = None;
+    if args.restart {
+        let status = daemon_control_request(
+            op::PLAY_START,
+            None,
+            json!({
+                "bridgeWaitSeconds": args.bridge.wait_seconds,
+                "bridgePorts": args.bridge.ports,
+            }),
+            false,
+        )?;
+        let running = status.get("running").and_then(Value::as_bool) == Some(true)
+            || status.get("starting").and_then(Value::as_bool) == Some(true);
+        if running {
+            let stop = daemon_control_request(
+                op::PLAY_STOP,
+                None,
+                json!({
+                    "bridgeWaitSeconds": args.bridge.wait_seconds,
+                    "bridgePorts": args.bridge.ports,
+                }),
+                false,
+            )?;
+            stopped = Some(stop.get("ok").and_then(Value::as_bool) == Some(true));
+        } else {
+            stopped = Some(false);
+        }
+    }
+    let mut result = daemon_control_request(operation, None, parameters, false)?;
+    if let Some(stopped) = stopped {
+        result["restarted"] = json!(stopped);
+    }
+    if let Some(condition) = args.until.as_deref()
+        && result.get("ok").and_then(Value::as_bool) != Some(false)
+    {
+        let wait = daemon_control_request(
+            op::WAIT,
+            None,
+            json!({
+                "condition": condition,
+                "timeout": args.until_timeout,
+                "bridgeWaitSeconds": args.bridge.wait_seconds,
+                "bridgePorts": args.bridge.ports,
+            }),
+            false,
+        );
+        match wait {
+            Ok(wait) => result["until"] = wait,
+            Err(error) => {
+                print_json_output(&result, false)?;
+                return Err(error);
+            }
+        }
+    }
     print_json_output(&result, false)
 }
 
@@ -777,14 +861,43 @@ pub(crate) fn start_stop_play_result(
         return stop_studio_play_with_bridge_result(bridge);
     }
     if let Some(players) = args.players {
-        return start_multiplayer_test_result(bridge, players);
+        let mut result = start_multiplayer_test_result(bridge, players)?;
+        result["serverReady"] = json!(server_answers_luau(bridge));
+        return Ok(result);
     }
     if args.start {
-        return start_single_play_result(bridge, mode);
+        let mut result = start_single_play_result(bridge, mode)?;
+        result["serverReady"] = json!(server_answers_luau(bridge));
+        return Ok(result);
     }
     let result = bridge.call_for_target("startStopPlay", json!({}), BridgeTarget::Edit)?;
     ensure_plugin_api_ok(&result)?;
     Ok(result)
+}
+
+// A freshly launched server bridge connects before its scripts can run; the
+// first Luau call would otherwise be the one that discovers that.
+fn server_answers_luau(bridge: &BridgeServer) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let ready = call_execute_luau(
+            bridge,
+            BridgeTarget::Main,
+            None,
+            "return true",
+            "ReniumReady",
+            5.0,
+            2.0,
+        )
+        .is_ok_and(|result| result.get("ok").and_then(Value::as_bool) == Some(true));
+        if ready {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
 }
 
 fn new_play_launch(bridge: &BridgeServer, label: &str) -> Result<TestLaunch> {
@@ -1758,35 +1871,48 @@ pub(crate) fn wait_until_result(args: &WaitUntilArgs, bridge: &BridgeServer) -> 
     if !args.timeout.is_finite() || !args.interval.is_finite() {
         bail!("--timeout and --interval must be finite numbers");
     }
-    let timeout = args.timeout.clamp(0.1, 600.0);
+    let timeout = args.timeout.clamp(0.1, 3600.0);
     let interval = args.interval.clamp(0.05, 10.0);
-    let code = format!(
-        "local deadline = os.clock() + {timeout}\n\
-         local detail = nil\n\
-         \twhile true do\n\
-         \t\tlocal ok, value = pcall(function() return ({condition}) end)\n\
-         \t\tdetail = value\n\
-         \t\tif ok and value then return true, tostring(value) end\n\
-         \t\tif os.clock() >= deadline then return false, tostring(detail) end\n\
-         \t\ttask.wait({interval})\n\
-         \tend",
-        condition = args.condition,
-    );
-    let outcome = run_luau_task(bridge, target, player, &code, timeout + 5.0)?;
-    if outcome.success {
-        Ok(json!({
-            "ok": true,
-            "action": "wait",
-            "condition": args.condition,
-            "elapsedSeconds": outcome.elapsed,
-        }))
-    } else {
-        bail!(
-            "Timed out after {timeout}s waiting for condition (last value: {})",
-            outcome.detail
-        )
+    let started = Instant::now();
+    let mut detail = Value::Null;
+    loop {
+        let remaining = timeout - started.elapsed().as_secs_f64();
+        if remaining <= 0.0 {
+            bail!(
+                "Timed out after {timeout}s waiting for condition (last value: {detail}); \
+                 raise -t, or use rbx l --detach for a sampler"
+            );
+        }
+        let slice = remaining.min(WAIT_RUNNER_SLICE_SECONDS);
+        let code = format!(
+            "local deadline = os.clock() + {slice}\n\
+             local detail = nil\n\
+             \twhile true do\n\
+             \t\tlocal ok, value = pcall(function() return ({condition}) end)\n\
+             \t\tdetail = value\n\
+             \t\tif ok and value then return true, tostring(value) end\n\
+             \t\tif os.clock() >= deadline then return false, tostring(detail) end\n\
+             \t\ttask.wait({interval})\n\
+             \tend",
+            condition = args.condition,
+        );
+        let outcome = run_luau_task(bridge, target, player, &code, slice + 5.0)?;
+        if outcome.success {
+            return Ok(json!({
+                "ok": true,
+                "action": "wait",
+                "condition": args.condition,
+                "value": outcome.detail,
+                "elapsedSeconds": started.elapsed().as_secs_f64(),
+            }));
+        }
+        detail = outcome.detail;
     }
 }
+
+// Studio stops a runner after 120 s; each slice stays under that so a long
+// wait keeps checking instead of dying with the runner.
+const WAIT_RUNNER_SLICE_SECONDS: f64 = 100.0;
 
 struct LuauTaskOutcome {
     success: bool,

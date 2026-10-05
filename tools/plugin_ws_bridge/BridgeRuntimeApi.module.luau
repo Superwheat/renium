@@ -298,9 +298,15 @@ local function serializeApiValue(value, depth, seen)
 			end
 			stringKeys += 1
 		end
-		if stringKeys ~= nil and stringKeys <= 128 then
+		if stringKeys ~= nil then
 			local out = {}
+			local kept = 0
 			for key, nested in pairs(value) do
+				if kept >= 128 then
+					out._truncated = { kept = kept, total = stringKeys }
+					break
+				end
+				kept += 1
 				out[key] = serializeApiValue(nested, depth + 1, seen)
 			end
 			seen[value] = nil
@@ -503,6 +509,17 @@ function BridgeRuntimeApi.create(plugin, runtimeContext)
 	local retainedRunners = {}
 	local retainedRunnerSequence = 0
 	local detachedRunners = {}
+	local sharedVirtualInput = nil
+	local sharedHeldKeys = {}
+
+	local function releaseSharedKeys()
+		if sharedVirtualInput ~= nil then
+			for keyCode in pairs(sharedHeldKeys) do
+				pcall(sharedVirtualInput.SendKey, sharedVirtualInput, false, keyCode, false)
+			end
+		end
+		table.clear(sharedHeldKeys)
+	end
 
 	local function assertOperationOwnership(operationGeneration, sessionGeneration)
 		if operationGeneration ~= cancellationGeneration then
@@ -642,12 +659,15 @@ function BridgeRuntimeApi.create(plugin, runtimeContext)
 			end
 		end)
 		local logError = nil
+		local runErrors = {}
 		local logConnection = LogService.MessageOut:Connect(function(message, messageType)
-			if
-				logError == nil
-				and string.find(tostring(message), scriptInstance.Name, 1, true)
-				and string.find(string.lower(consoleTypeName(messageType)), "error", 1, true)
-			then
+			if not string.find(string.lower(consoleTypeName(messageType)), "error", 1, true) then
+				return
+			end
+			if #runErrors < 5 then
+				runErrors[#runErrors + 1] = truncateText(tostring(message), 2048)
+			end
+			if logError == nil and string.find(tostring(message), scriptInstance.Name, 1, true) then
 				logError = tostring(message)
 			end
 		end)
@@ -787,14 +807,24 @@ end
 			scriptInstance.Enabled = false
 			scriptInstance:Destroy()
 		end
+		local consoleErrors = if #runErrors > 0 then runErrors else nil
 		if logError ~= nil then
-			return { ok = false, error = logError, output = {}, runner = true, path = path, context = context }
+			return {
+				ok = false,
+				error = logError,
+				output = {},
+				consoleErrors = consoleErrors,
+				runner = true,
+				path = path,
+				context = context,
+			}
 		end
 		if status == "error" then
 			return {
 				ok = false,
 				error = tostring(values and values[1] or "Luau runner failed"),
 				output = if values and type(values[2]) == "table" then values[2] else {},
+				consoleErrors = consoleErrors,
 				runner = true,
 				path = path,
 				context = context,
@@ -1614,9 +1644,13 @@ updateMouse()
 			end)
 		end
 
-		local virtualInput = UserInputService:CreateVirtualInput()
+		if sharedVirtualInput == nil then
+			sharedVirtualInput = UserInputService:CreateVirtualInput()
+		end
+		local virtualInput = sharedVirtualInput
 		local verifiedClicks = 0
-		local heldKeys = {}
+		local heldKeys = sharedHeldKeys
+		local keysObserved = {}
 		local heldButtons = {}
 		local StarterGui = game:GetService("StarterGui")
 		local coreGuiStates = nil
@@ -1724,6 +1758,9 @@ updateMouse()
 		local function sendKey(down, keyCode, repeated)
 			virtualInput:SendKey(down, keyCode, repeated)
 			heldKeys[keyCode] = if down then true else nil
+			RunService.Heartbeat:Wait()
+			local okRead, observed = pcall(UserInputService.IsKeyDown, UserInputService, keyCode)
+			keysObserved[keyCode.Name] = okRead and observed == down
 		end
 		local function sendMouseButton(position, button, down, repeatCount)
 			sendPointer(position, function()
@@ -1732,9 +1769,7 @@ updateMouse()
 			heldButtons[button] = if down then position else nil
 		end
 		local function releaseHeldInput()
-			for keyCode in heldKeys do
-				pcall(virtualInput.SendKey, virtualInput, false, keyCode, false)
-			end
+			releaseSharedKeys()
 			for button, position in heldButtons do
 				pcall(virtualInput.SendMouseButton, virtualInput, position, button, false, 0)
 			end
@@ -1882,6 +1917,19 @@ updateMouse()
 		end
 		if not ok then
 			error(result, 0)
+		end
+		if type(result) == "table" then
+			local held = {}
+			for keyCode in pairs(heldKeys) do
+				held[#held + 1] = keyCode.Name
+			end
+			table.sort(held)
+			if #held > 0 then
+				result.heldKeys = held
+			end
+			if next(keysObserved) ~= nil then
+				result.keysObserved = keysObserved
+			end
 		end
 		return result
 	end
@@ -2566,7 +2614,7 @@ updateMouse()
 			end
 		end
 		if chunk == nil then
-			return { ok = false, error = tostring(compileError) }
+			return { ok = false, error = tostring(compileError), context = "edit" }
 		end
 
 		local output = {}
@@ -2660,6 +2708,7 @@ updateMouse()
 				timedOut = operationGeneration == cancellationGeneration and cancellationError == nil,
 				stopped = true,
 				output = output,
+				context = "edit",
 			}
 		end
 		activeEditExecutionThread = nil
@@ -2671,6 +2720,7 @@ updateMouse()
 				error = tostring(ownershipError),
 				stopped = true,
 				output = output,
+				context = "edit",
 			}
 		end
 		if not packed[1] then
@@ -2679,6 +2729,7 @@ updateMouse()
 				ok = false,
 				error = tostring(packed[2]),
 				output = output,
+				context = "edit",
 			}
 		end
 		if backgroundLifetimeSeconds then
@@ -2703,6 +2754,7 @@ updateMouse()
 			results = results,
 			output = output,
 			background = backgroundLifetimeSeconds ~= nil,
+			context = "edit",
 		}
 	end
 
@@ -3039,6 +3091,8 @@ updateMouse()
 				entry.instance:Destroy()
 			end
 		end
+		releaseSharedKeys()
+		sharedVirtualInput = nil
 		playSession.token += 1
 		return cancelledGeneration
 	end

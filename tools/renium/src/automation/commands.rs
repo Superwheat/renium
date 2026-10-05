@@ -265,8 +265,34 @@ fn action(name: &str) -> &'static str {
         "scroll-up" | "su" => "scroll-up",
         "scroll-down" | "sd" => "scroll-down",
         "wait" => "wait",
+        "hold" => "hold",
         _ => "",
     }
+}
+
+/// Milliseconds from `300`, `300ms`, `0.3s` or `1.5`; bare fractions are seconds.
+fn wait_milliseconds(value: &str) -> Result<u64> {
+    let text = value.trim().to_ascii_lowercase();
+    let (number, unit) = if let Some(stripped) = text.strip_suffix("ms") {
+        (stripped, "ms")
+    } else if let Some(stripped) = text.strip_suffix('s') {
+        (stripped, "s")
+    } else {
+        (text.as_str(), "")
+    };
+    let number: f64 = number.trim().parse().with_context(|| {
+        format!("wait takes a duration such as 300, 300ms or 0.3s, not '{value}'")
+    })?;
+    if !number.is_finite() || number < 0.0 {
+        bail!("wait takes a non-negative duration, not '{value}'");
+    }
+    let milliseconds = match unit {
+        "ms" => number,
+        "s" => number * 1000.0,
+        _ if number.fract() != 0.0 => number * 1000.0,
+        _ => number,
+    };
+    Ok(milliseconds.round() as u64)
 }
 
 fn input_actions(tokens: &[String]) -> Result<Vec<Value>> {
@@ -281,6 +307,17 @@ fn input_actions(tokens: &[String]) -> Result<Vec<Value>> {
         let value = tokens
             .get(index + 1)
             .with_context(|| format!("Input action '{command}' needs a value"))?;
+        if kind == "hold" {
+            let duration = tokens
+                .get(index + 2)
+                .with_context(|| "hold needs a key and a duration, e.g. hold W 3000")?;
+            let ms = wait_milliseconds(duration)?;
+            actions.push(json!({ "action": "key-down", "key": value }));
+            actions.push(json!({ "action": "wait", "ms": ms }));
+            actions.push(json!({ "action": "key-up", "key": value }));
+            index += 3;
+            continue;
+        }
         let mut entry = Map::new();
         entry.insert("action".to_string(), json!(kind));
         match kind {
@@ -291,7 +328,7 @@ fn input_actions(tokens: &[String]) -> Result<Vec<Value>> {
                 entry.insert("text".to_string(), json!(value));
             }
             "wait" => {
-                entry.insert("ms".to_string(), json!(value.parse::<u64>()?));
+                entry.insert("ms".to_string(), json!(wait_milliseconds(value)?));
             }
             _ => entry.extend(target(value)?),
         }
@@ -381,4 +418,38 @@ pub(crate) fn image_upload(args: ImageUploadArgs, project: Option<&Path>) -> Res
         false,
         Some(&args.bridge),
     )
+}
+
+#[cfg(test)]
+mod input_action_tests {
+    use super::*;
+
+    #[test]
+    fn wait_durations_accept_milliseconds_and_seconds() {
+        assert_eq!(wait_milliseconds("300").unwrap(), 300);
+        assert_eq!(wait_milliseconds("300ms").unwrap(), 300);
+        assert_eq!(wait_milliseconds("0.3s").unwrap(), 300);
+        assert_eq!(wait_milliseconds("1.5").unwrap(), 1500);
+        assert_eq!(wait_milliseconds("2s").unwrap(), 2000);
+        assert!(wait_milliseconds("fast").is_err());
+        assert!(wait_milliseconds("-1").is_err());
+    }
+
+    #[test]
+    fn hold_expands_to_a_press_with_a_wait() {
+        let actions = input_actions(&[
+            "hold".into(),
+            "W".into(),
+            "0.5s".into(),
+            "ku".into(),
+            "D".into(),
+        ])
+        .unwrap();
+        assert_eq!(actions.len(), 4);
+        assert_eq!(actions[0], json!({ "action": "key-down", "key": "W" }));
+        assert_eq!(actions[1], json!({ "action": "wait", "ms": 500 }));
+        assert_eq!(actions[2], json!({ "action": "key-up", "key": "W" }));
+        assert_eq!(actions[3], json!({ "action": "key-up", "key": "D" }));
+        assert!(input_actions(&["hold".into(), "W".into()]).is_err());
+    }
 }

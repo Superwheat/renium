@@ -410,7 +410,7 @@ fn verdict_text(observation: &Observation<'_>) -> String {
             open_places.join(", ")
         ),
         None => format!(
-            "Studio has {} open, but no connected Studio matches this project; open the project's place or pass --place.",
+            "Studio has {} open, but no connected Studio matches this project; `rbx ro` reopens the project's place, or pass --place.",
             open_places.join(", ")
         ),
     }

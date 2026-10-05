@@ -14,9 +14,13 @@ Start Play for a concrete runtime question that those checks cannot answer: repl
 rbx status
 rbx play -s                         # ordinary Play
 rbx play -s --players 2             # local server and two clients
+rbx play -s --players 2 --until 'shared.RoundHandler.GameState == "InRound"'
+rbx play -r                         # restart after a code change (stops, then starts the same way)
 rbx cs
 rbx play -x
 ```
+
+Play keeps the scripts it started with; after editing server or client code, `rbx play -r` restarts the session. `--until EXPR` returns once the server expression is true (`--until-timeout`, default 120 s), so no loop is needed before the first test step.
 
 Use ordinary Play for one-client checks. `--players 1` explicitly launches a separate server and client; `mode: "play"` means ordinary Play. Stop only a session you started or were asked to stop. File edits during Play can wait for Edit mode; that alone is not a sync failure.
 
@@ -26,12 +30,17 @@ Play runs the game's real server code. With Studio API access enabled, its DataS
 
 ```powershell
 rbx l "return game.PlaceId"
+rbx l --server "return shared.RoundHandler.GameState"   # play server only; fails if none
+rbx l --edit "return workspace.Name"                     # Edit window even during Play
 rbx lc "return game.Players.LocalPlayer.Name" 1
-rbx co --server -n 20
-rbx co --player 1 -n 20
+rbx wait 'shared.RoundHandler.GameState == "InRound"' -t 300   # server; -p N for a client
+rbx co --server --level error -n 20
+rbx co -p 1 --grep "round|tag" -n 20
 ```
 
-`l` targets Edit when stopped and the server during Play. `lc CODE PLAYER` targets a client by name or index. Edit has no `LocalPlayer` or `PlayerGui`.
+`l` targets Edit when stopped and the server during Play; `--server` and `--edit` pin it, and an error names where it ran (`[Edit window]`, `[play server]`, `[client 1]`). `lc CODE PLAYER` targets a client by name or index. Edit has no `LocalPlayer` or `PlayerGui`.
+
+To wait for runtime state, use `rbx wait EXPR -t SECONDS` (returns the value; up to an hour), never a shell loop of `l` calls with sleeps. `co` filters (`--level`, `--grep` regex, `-F` for plain text) search the whole retained console before the `-n` limit and report `scanned` and `matched`, so `matched: 0` means nothing matched, not that the filter was ignored. A runner error from a module that failed to load carries `consoleErrors` with the lines Studio logged during the run.
 In Edit, each `l` run requires ModuleScripts fresh from their current source, so module tables don't persist between runs; don't clone a module to reload it. During Play, `l` and `lc` share the running game's `require` cache.
 
 Return values instead of printing. Luau errors and timeouts exit nonzero; captured `print`/`warn` text returns to the caller without entering Studio Output. `co` reads game/Studio messages. An empty `co` result means there were none; don't re-read `LogService` with `l` or `lc`. A stack naming `cloud_<id>` or `user_<name>` scripts comes from an installed Studio plugin, not the game.

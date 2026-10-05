@@ -2,7 +2,7 @@ use std::io::{self, Write};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use super::{console_entry_level, wait_for_player_bridge};
@@ -93,10 +93,13 @@ pub(crate) fn get_console_output_result(
     if let Some(player) = args.player.as_deref() {
         wait_for_player_bridge(bridge, player, args.bridge.wait_seconds)?;
     }
+    // A filter reads the whole retained buffer and applies the limit to the
+    // matches; otherwise the limit would be spent on lines the filter drops.
+    let filtering = args.grep.is_some() || args.level.is_some();
     let result = bridge.call_for_selector(
         "getConsoleOutput",
         json!({
-            "limit": args.limit,
+            "limit": if filtering { CONSOLE_FILTER_SCAN_LIMIT } else { args.limit },
             "sinceSeq": args.since_seq,
             "fromOldest": args.from_oldest,
             "clear": args.clear,
@@ -105,8 +108,10 @@ pub(crate) fn get_console_output_result(
         args.player.as_deref(),
     )?;
     ensure_plugin_api_ok(&result)?;
-    Ok(filtered_console_result(args, result))
+    filtered_console_result(args, result)
 }
+
+const CONSOLE_FILTER_SCAN_LIMIT: usize = 1000;
 
 fn update_console_follow_epoch(
     result: &Value,
@@ -215,18 +220,112 @@ fn is_transient_console_follow_error(error: &anyhow::Error) -> bool {
         .any(|needle| message.contains(needle))
 }
 
-fn filtered_console_result(args: &PluginConsoleOutputArgs, mut result: Value) -> Value {
-    let filtered_count =
-        if let Some(entries) = result.get_mut("entries").and_then(Value::as_array_mut) {
-            entries.retain(|entry| console_entry_matches(args, entry));
-            entries.len()
-        } else {
-            return result;
-        };
-    if let Some(object) = result.as_object_mut() {
-        object.insert("count".to_string(), json!(filtered_count));
+fn filtered_console_result(args: &PluginConsoleOutputArgs, mut result: Value) -> Result<Value> {
+    let matcher = ConsoleMatcher::new(args)?;
+    let Some(entries) = result.get_mut("entries").and_then(Value::as_array_mut) else {
+        return Ok(result);
+    };
+    let scanned = entries.len();
+    entries.retain(|entry| matcher.matches(entry));
+    let matched = entries.len();
+    if matched > args.limit {
+        entries.drain(..matched - args.limit);
     }
-    result
+    let folded = fold_repeated_entries(entries);
+    let count = entries.len();
+    if let Some(object) = result.as_object_mut() {
+        object.insert("count".to_string(), json!(count));
+        if matcher.active() {
+            object.insert("scanned".to_string(), json!(scanned));
+            object.insert("matched".to_string(), json!(matched));
+        }
+        if folded > 0 {
+            object.insert("folded".to_string(), json!(folded));
+        }
+    }
+    Ok(result)
+}
+
+/// Consecutive identical messages collapse into one entry with `repeat`.
+fn fold_repeated_entries(entries: &mut Vec<Value>) -> usize {
+    let mut folded = Vec::with_capacity(entries.len());
+    let mut removed = 0;
+    for entry in entries.drain(..) {
+        let same = folded.last().is_some_and(|previous: &Value| {
+            previous.get("message") == entry.get("message")
+                && previous.get("type") == entry.get("type")
+        });
+        if same {
+            let last = folded.last_mut().unwrap();
+            let repeat = last.get("repeat").and_then(Value::as_u64).unwrap_or(1) + 1;
+            last["repeat"] = json!(repeat);
+            last["seq"] = entry.get("seq").cloned().unwrap_or(Value::Null);
+            removed += 1;
+        } else {
+            folded.push(entry);
+        }
+    }
+    *entries = folded;
+    removed
+}
+
+struct ConsoleMatcher {
+    level: Option<String>,
+    pattern: Option<regex::Regex>,
+}
+
+impl ConsoleMatcher {
+    fn new(args: &PluginConsoleOutputArgs) -> Result<Self> {
+        let pattern = match args.grep.as_deref() {
+            None => None,
+            Some(text) if args.fixed => Some(
+                regex::RegexBuilder::new(&regex::escape(text))
+                    .case_insensitive(true)
+                    .build()?,
+            ),
+            Some(text) => Some(
+                regex::RegexBuilder::new(text)
+                    .case_insensitive(true)
+                    .build()
+                    .with_context(|| {
+                        format!("--grep takes a regex; pass -F for the plain text '{text}'")
+                    })?,
+            ),
+        };
+        Ok(Self {
+            level: args.level.clone(),
+            pattern,
+        })
+    }
+
+    fn active(&self) -> bool {
+        self.level.is_some() || self.pattern.is_some()
+    }
+
+    fn matches(&self, entry: &Value) -> bool {
+        if let Some(level) = self.level.as_deref() {
+            let entry_level = entry
+                .get("type")
+                .or_else(|| entry.get("level"))
+                .and_then(Value::as_str)
+                .unwrap_or("output");
+            if !entry_level.eq_ignore_ascii_case(level)
+                && !short_console_level(entry_level).eq_ignore_ascii_case(level)
+            {
+                return false;
+            }
+        }
+        if let Some(pattern) = &self.pattern {
+            let message = entry
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !pattern.is_match(message) {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 fn print_followed_console_entries(args: &PluginConsoleOutputArgs, result: &Value) -> Result<()> {
@@ -235,11 +334,9 @@ fn print_followed_console_entries(args: &PluginConsoleOutputArgs, result: &Value
             "[renium] console history was truncated; continuing from the oldest retained line"
         );
     }
+    let matcher = ConsoleMatcher::new(args)?;
     if let Some(entries) = result.get("entries").and_then(Value::as_array) {
-        for entry in entries
-            .iter()
-            .filter(|entry| console_entry_matches(args, entry))
-        {
+        for entry in entries.iter().filter(|entry| matcher.matches(entry)) {
             let level = console_entry_level(entry);
             let message = entry
                 .get("message")
@@ -252,30 +349,104 @@ fn print_followed_console_entries(args: &PluginConsoleOutputArgs, result: &Value
     Ok(())
 }
 
-fn console_entry_matches(args: &PluginConsoleOutputArgs, entry: &Value) -> bool {
-    if let Some(level) = args.level.as_deref() {
-        let entry_level = entry
-            .get("type")
-            .or_else(|| entry.get("level"))
-            .and_then(Value::as_str)
-            .unwrap_or("output");
-        if !entry_level.eq_ignore_ascii_case(level)
-            && !short_console_level(entry_level).eq_ignore_ascii_case(level)
-        {
-            return false;
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+    use crate::cli::BridgeConnectionArgs;
+
+    fn args(
+        grep: Option<&str>,
+        fixed: bool,
+        level: Option<&str>,
+        limit: usize,
+    ) -> PluginConsoleOutputArgs {
+        PluginConsoleOutputArgs {
+            bridge: BridgeConnectionArgs::local(1.0),
+            limit,
+            since_seq: 0,
+            from_oldest: false,
+            clear: false,
+            client: false,
+            server: false,
+            player: None,
+            follow: false,
+            grep: grep.map(str::to_string),
+            fixed,
+            level: level.map(str::to_string),
+            interval_ms: 200,
         }
     }
-    if let Some(needle) = args.grep.as_deref() {
-        let message = entry
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if !message
-            .to_ascii_lowercase()
-            .contains(&needle.to_ascii_lowercase())
-        {
-            return false;
-        }
+
+    fn entry(seq: u64, kind: &str, message: &str) -> Value {
+        json!({ "seq": seq, "type": kind, "message": message })
     }
-    true
+
+    #[test]
+    fn filters_apply_before_the_limit_and_report_counts() {
+        let entries = (1..=50)
+            .map(|seq| {
+                entry(
+                    seq,
+                    if seq % 10 == 0 { "error" } else { "output" },
+                    &format!("line {seq}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let result = filtered_console_result(
+            &args(None, false, Some("error"), 3),
+            json!({ "entries": entries, "ok": true }),
+        )
+        .unwrap();
+        let kept = result["entries"].as_array().unwrap();
+        assert_eq!(kept.len(), 3);
+        assert_eq!(kept[0]["seq"], 30);
+        assert_eq!(result["scanned"], 50);
+        assert_eq!(result["matched"], 5);
+        assert_eq!(result["count"], 3);
+    }
+
+    #[test]
+    fn grep_is_a_regex_unless_fixed() {
+        let entries = vec![
+            entry(1, "output", "Round started"),
+            entry(2, "error", "Script Error: boom"),
+            entry(3, "warn", r"ranked\|warn literal"),
+        ];
+        let result = filtered_console_result(
+            &args(Some("rror|ranked"), false, None, 10),
+            json!({ "entries": entries.clone() }),
+        )
+        .unwrap();
+        assert_eq!(result["matched"], 2);
+        let fixed = filtered_console_result(
+            &args(Some("ranked\\|warn"), true, None, 10),
+            json!({ "entries": entries }),
+        )
+        .unwrap();
+        assert_eq!(fixed["matched"], 1);
+        assert!(
+            filtered_console_result(&args(Some("("), false, None, 10), json!({ "entries": [] }))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn consecutive_duplicates_fold_with_a_repeat_count() {
+        let entries = vec![
+            entry(1, "output", "tick"),
+            entry(2, "output", "tick"),
+            entry(3, "output", "tick"),
+            entry(4, "output", "other"),
+            entry(5, "output", "tick"),
+        ];
+        let result =
+            filtered_console_result(&args(None, false, None, 10), json!({ "entries": entries }))
+                .unwrap();
+        let kept = result["entries"].as_array().unwrap();
+        assert_eq!(kept.len(), 3);
+        assert_eq!(kept[0]["repeat"], 3);
+        assert_eq!(kept[0]["seq"], 3);
+        assert_eq!(result["folded"], 2);
+        assert!(result.get("scanned").is_none());
+    }
 }

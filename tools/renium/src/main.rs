@@ -1,4 +1,5 @@
 use std::ffi::OsStr;
+use std::io::IsTerminal;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -92,7 +93,7 @@ fn main_result() -> ExitCode {
             {
                 return ExitCode::FAILURE;
             }
-            if app::output::global_json_output() {
+            if app::output::global_json_output() || !std::io::stderr().is_terminal() {
                 eprintln!(
                     "{}",
                     serde_json::to_string(&json!({

@@ -20,4 +20,4 @@ Reuse paths from `ui`'s `p` field. Paths are relative to `PlayerGui`; its prefix
 
 Input goes through the game's own input pipeline: the cursor, window focus and physical input stay untouched. Escape belongs to CoreGui; use another key or an on-screen control.
 
-For several ordered actions, use `rbx inp -p 1 click "Shop.BuyButton" wait 100 key E`.
+For several ordered actions, use `rbx inp -p 1 click "Shop.BuyButton" wait 100 key E`. Actions: `kd KEY`, `ku KEY`, `key KEY`, `hold KEY MS`, `text STRING`, `click`/`right`/`down`/`up`/`su`/`sd` with a GUI path or `X,Y`, `move X,Y`, `wait MS` (also `300ms` or `0.3s`). A key held with `kd` stays held across later `inp` calls until `ku`; the result lists `heldKeys` and `keysObserved` (whether the client saw each key change), so a drive test can be `inp -p 2 kd W`, then steer with separate calls, then `ku W`.

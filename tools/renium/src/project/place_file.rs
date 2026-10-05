@@ -113,10 +113,12 @@ pub(crate) fn query_place(args: QueryPlaceArgs) -> Result<()> {
     };
     let mut matches = Vec::new();
     let mut truncated = false;
+    let mut searched = 0usize;
     for referent in descendants(&dom) {
         let Some(instance) = dom.get_by_ref(referent) else {
             continue;
         };
+        searched += 1;
         if name.is_some_and(|name| instance.name != name)
             || class_name.is_some_and(|class_name| instance.class.as_str() != class_name)
             || source.is_some_and(|source| {
@@ -140,8 +142,14 @@ pub(crate) fn query_place(args: QueryPlaceArgs) -> Result<()> {
         "ok": true,
         "input": args.input,
         "matches": matches,
+        "searched": searched,
         "truncated": truncated,
     });
+    if result["matches"].as_array().is_some_and(Vec::is_empty) && source.is_none() {
+        result["hint"] = json!(
+            "A query matches instance names and classes only; use -s TEXT to search script source"
+        );
+    }
     crate::app::output::drop_false(&mut result, &["truncated"]);
     print_json_output(&result, args.pretty)
 }

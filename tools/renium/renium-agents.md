@@ -2,20 +2,20 @@
 # Renium for agents
 
 Use `rbx` from the place's project folder. Renium handles the daemon.
-PATH stale? `%USERPROFILE%\.renium\bin\rbx.exe` (Windows) or `~/.renium/bin/rbx`.
+PATH stale? `%USERPROFILE%\.renium\bin\rbx.exe` or `~/.renium/bin/rbx`.
 
 ## Choose the smallest sufficient check
 
 - **Saved code or data:** read the files; use focused assertions, the project's checks, or Renium's offline queries. Names, values, references, source edits, and pure logic usually need no Play session.
 - **Unsaved Studio state:** make one bounded live query. Don't scan Studio for data already saved locally.
 - **Runtime behavior:** use Play only for a specific unanswered question, such as input handling, replication, physics, or a runtime error. Identify the expected result first. A small edit is not itself a reason to playtest.
-- **Visual behavior:** a screenshot checks one state; a recording checks a transition. Review the captured evidence, not merely whether capture succeeded.
+- **Visual behavior:** a screenshot checks one state; a recording checks a transition. Review the captured evidence, not just that capture succeeded.
 
 Check Luau syntax offline with `rbx ck FILE...`, never with Studio `loadstring`, `LoadStringEnabled`, or by running scripts; project checks cover types, lint and behavior.
 
 With healthy Live Sync, trust successful file edits: don't push, poll, or reread Studio after every save, and don't start Play to prove an edit synced. Use one `lst --wait` after a reported problem or when the next operation needs synchronization.
 
-When Play is needed, reuse a suitable session, test related changes together with the fewest clients required, and don't stop a user's session to create your own.
+When Play is needed, reuse a session, batch related checks with the fewest clients, and don't stop a user's session. Wait for runtime state with `rbx wait EXPR -t N`, never a shell loop of `l` calls.
 
 ## Read the relevant guide
 
@@ -33,7 +33,7 @@ When Play is needed, reuse a suitable session, test related changes together wit
 | Studio lifecycle and place management | `RENIUM/advanced.md` |
 | Installed plugins and their commands | `RENIUM/plugins.md` |
 
-Read only the guides the task needs, once per session, before using their commands; reread after `rbx upd` or when told.
+Read only the guides the task needs, once per session, before using their commands; reread after `rbx upd`.
 
 ## Targeting and edits
 

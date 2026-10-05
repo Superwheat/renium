@@ -105,6 +105,8 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
                 file: None,
                 client: args.player.is_none(),
                 player: args.player,
+                server: false,
+                edit: false,
                 timeout: args.timeout,
                 runner: args.runner,
             })

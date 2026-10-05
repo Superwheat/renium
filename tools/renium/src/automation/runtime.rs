@@ -903,6 +903,36 @@ fn open_studio(
     Ok(result)
 }
 
+/// The part of the Live Sync status a reader of `rbx status` acts on:
+/// whether it runs, what is pending, and the last failure.
+fn live_sync_summary(status: &Value) -> Option<Value> {
+    let object = status.as_object()?;
+    if object.get("running").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let mut summary = json!({
+        "running": true,
+        "pending": object
+            .get("pendingPaths")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len),
+    });
+    for key in ["syncing", "paused", "resolutionRequired"] {
+        if object.get(key).and_then(Value::as_bool) == Some(true) {
+            summary[key] = json!(true);
+        }
+    }
+    for key in ["error", "lastError", "lastErrorAt"] {
+        if let Some(value) = object.get(key).filter(|value| !value.is_null()) {
+            summary[key] = value.clone();
+        }
+    }
+    if summary["pending"].as_u64() > Some(0) {
+        summary["see"] = json!("rbx lst --details");
+    }
+    Some(summary)
+}
+
 fn studio_status_result(
     context: &automation::BoundContext,
     parameters: &Value,
@@ -1204,7 +1234,13 @@ fn automation_dispatch_operation(
         op::LUAU => {
             let parsed = studio_args::luau(Path::new(&context.root), parameters)?;
             if parsed.player.is_none() {
-                let target = BridgeTarget::main_or_client(parsed.client);
+                let target = if parsed.server {
+                    BridgeTarget::Server
+                } else if parsed.edit {
+                    BridgeTarget::Edit
+                } else {
+                    BridgeTarget::main_or_client(parsed.client)
+                };
                 bridge.wait_for_target(bridge_wait_seconds, target)?;
             }
             execute_luau_result(parsed, bridge)
@@ -1449,6 +1485,13 @@ fn automation_dispatch_managed(
     }
     if operation == op::STUDIO_OPEN {
         return open_studio(context, parameters, state, bridge).map_err(automation_failure);
+    }
+    if operation == op::STUDIO_STATUS {
+        let mut result = studio_status_result(context, parameters, bridge, bridge_wait_seconds);
+        if let Some(summary) = live_sync_summary(&state.live_sync().status(context.id)) {
+            result["liveSync"] = summary;
+        }
+        return Ok(result);
     }
     if operation == op::PLACE_PUBLISH {
         let status = state.live_sync().status(context.id);
@@ -3096,7 +3139,7 @@ fn play_target_selector(
     }
     let object = parameters.as_object()?;
     let flag = |key: &str| object.get(key).and_then(Value::as_bool) == Some(true);
-    if flag("studio") {
+    if flag("studio") || flag("edit") {
         return None;
     }
     let player = object.get("player").and_then(|value| match value {
@@ -3174,6 +3217,24 @@ mod tests {
     }
 
     #[test]
+    fn status_summarizes_live_sync_only_while_it_runs() {
+        assert!(live_sync_summary(&json!({ "running": false })).is_none());
+        let summary = live_sync_summary(&json!({
+            "running": true,
+            "pendingPaths": ["src/A.luau", "src/B.luau"],
+            "syncing": false,
+            "paused": false,
+            "lastError": "Studio live sync failed: x",
+            "lastErrorAt": 1,
+        }))
+        .unwrap();
+        assert_eq!(summary["pending"], 2);
+        assert_eq!(summary["see"], "rbx lst --details");
+        assert_eq!(summary["lastError"], "Studio live sync failed: x");
+        assert!(summary.get("syncing").is_none());
+    }
+
+    #[test]
     fn play_target_requests_are_gated_by_the_runtime_they_address() {
         assert_eq!(
             play_target_selector(op::LUAU, &json!({"player": "2"})),
@@ -3195,6 +3256,7 @@ mod tests {
             play_target_selector(op::SHOT, &json!({"studio": true})),
             None
         );
+        assert_eq!(play_target_selector(op::LUAU, &json!({"edit": true})), None);
         assert_eq!(
             play_target_selector(op::PUSH, &json!({"player": "1"})),
             None

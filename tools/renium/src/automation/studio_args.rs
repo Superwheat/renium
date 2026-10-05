@@ -140,6 +140,8 @@ pub(super) fn luau(root: &Path, parameters: &Value) -> Result<ExecuteLuauArgs> {
         file,
         client: boolean(object, "client")?,
         player: string(object, "player"),
+        server: boolean(object, "server")?,
+        edit: boolean(object, "edit")?,
         timeout: number(object, "timeout", 10.0)?,
         runner: crate::cli::LuauRunnerArgs {
             detach: string(object, "detach"),
@@ -163,6 +165,7 @@ pub(super) fn console(parameters: &Value) -> Result<PluginConsoleOutputArgs> {
         player: string(object, "player"),
         follow: boolean(object, "follow")?,
         grep: string(object, "grep"),
+        fixed: boolean(object, "fixed")?,
         level: string(object, "level"),
         interval_ms: number(object, "intervalMs", 200)?,
     })
@@ -174,8 +177,11 @@ pub(super) fn play(operation: u16, parameters: &Value) -> Result<StartStopPlayAr
         bridge: bridge(object)?,
         start: operation == op::PLAY_START,
         stop: operation == op::PLAY_STOP,
+        restart: false,
         players: optional_number(object, "players")?,
         mode: string(object, "mode"),
+        until: None,
+        until_timeout: 120.0,
     })
 }
 
@@ -311,7 +317,7 @@ pub(super) fn wait(parameters: &Value) -> Result<WaitUntilArgs> {
         condition: required_string(object, "condition")?,
         player: string(object, "player"),
         client: boolean(object, "client")?,
-        timeout: number(object, "timeout", 10.0)?,
+        timeout: number(object, "timeout", 60.0)?,
         interval: number(object, "interval", 0.25)?,
     })
 }
