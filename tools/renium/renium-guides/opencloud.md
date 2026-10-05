@@ -70,6 +70,8 @@ Use `oc request` for unlisted endpoints; pipe complex bodies through stdin.
 
 `team members` lists who is in a place's Team Create session. `team remove-members` is not "end their session": it revokes those users' collaborator access for the whole universe (`DELETE .../teamcreate/memberships`); only run it when the user asks for exactly that.
 
+After an upload, `publish` waits up to 90 s (`--wait-live SECONDS`, 0 to skip) for the version to go live and reports `live: true`. `live: false` with `publishStatus: 1` means Roblox is still processing it: players and restarted servers keep getting the previous version until `oc place history` shows status 2, so do not restart servers on the strength of `versionNumber` alone.
+
 ## Publish while someone else is in the live place
 
 An Open Cloud upload to a place that another collaborator has open in Team Create fails with HTTP 409; the error names the members and any newer unpublished saves. Publish from inside the session instead:

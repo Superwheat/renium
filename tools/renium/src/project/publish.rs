@@ -95,8 +95,54 @@ pub(crate) struct PublishArgs {
         help = "With --as, publish while a Play session runs in the selected Studio"
     )]
     allow_play: bool,
+    #[arg(
+        long,
+        requires = "cloud_mode",
+        value_name = "SECONDS",
+        default_value_t = 90.0,
+        help = "Seconds to wait for Roblox to make the uploaded version live (0 returns right after the upload)"
+    )]
+    wait_live: f64,
     #[command(flatten)]
     bridge: BridgeConnectionArgs,
+}
+
+const LIVE_POLL: Duration = Duration::from_secs(5);
+
+/// Roblox processes an uploaded version before it goes live; a restart or a
+/// test before that serves the previous version. Reports what the version
+/// history says, so the caller knows whether the upload is live yet.
+fn report_live(
+    result: &mut Value,
+    identity: cloud::CloudIdentity,
+    key_env: &str,
+    place_id: i64,
+    version: u64,
+    wait_seconds: f64,
+) {
+    let started = Instant::now();
+    let mut status = None;
+    loop {
+        status = cloud::place_history_page(identity, key_env, place_id)
+            .and_then(|body| cloud::version_publish_status(&body, version))
+            .or(status);
+        if status == Some(2) || started.elapsed().as_secs_f64() >= wait_seconds {
+            break;
+        }
+        std::thread::sleep(LIVE_POLL);
+    }
+    result["waitedSeconds"] = json!((started.elapsed().as_secs_f64() * 10.0).round() / 10.0);
+    match status {
+        Some(2) => result["live"] = json!(true),
+        Some(code) => {
+            result["live"] = json!(false);
+            result["publishStatus"] = json!(code);
+            result["hint"] = json!(
+                "Roblox has not made this version live yet; players and restarted servers still get the previous version. Check rbx oc place history for publishStatus 2 before restarting servers"
+            );
+        }
+        None => result["live"] = Value::Null,
+    }
 }
 
 pub(crate) fn run(args: PublishArgs, project: Option<&Path>) -> Result<()> {
@@ -368,8 +414,19 @@ fn publish_as(args: &PublishArgs, project: Option<&Path>) -> Result<Value> {
                 target,
                 cloud_request_with_type(&file, !args.saved),
             )?;
-            result["versionNumber"] = json!(published_version(&response)?);
+            let version = published_version(&response)?;
+            result["versionNumber"] = json!(version);
             result["published"] = json!(!args.saved);
+            if !args.saved {
+                report_live(
+                    &mut result,
+                    identity,
+                    key_env,
+                    target,
+                    version,
+                    args.wait_live,
+                );
+            }
         }
         Ok(result)
     })();
@@ -701,8 +758,17 @@ fn open_cloud(args: &PublishArgs, project: Option<&Path>) -> Result<Value> {
         if !args.dry_run {
             let key_env = args.key_env.as_deref().unwrap_or("ROBLOX_API_KEY");
             let response = upload(identity, key_env, place_id, cloud_request(&file))?;
-            result["versionNumber"] = json!(published_version(&response)?);
+            let version = published_version(&response)?;
+            result["versionNumber"] = json!(version);
             result["published"] = json!(true);
+            report_live(
+                &mut result,
+                identity,
+                key_env,
+                place_id,
+                version,
+                args.wait_live,
+            );
         }
         Ok(result)
     })();

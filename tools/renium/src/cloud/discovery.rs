@@ -547,6 +547,22 @@ pub(crate) fn place_versions(body: &Value) -> Vec<(u64, bool)> {
         .collect()
 }
 
+/// Roblox's publish status for one version of a history page: 0 for a saved
+/// version, 1 while publishing is still processing, 2 once it is live.
+pub(crate) fn version_publish_status(body: &Value, version: u64) -> Option<u64> {
+    body.get("placeVersions")?
+        .as_array()?
+        .iter()
+        .find(|entry| {
+            entry
+                .get("version")
+                .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
+                == Some(version)
+        })?
+        .get("publishStatus")?
+        .as_u64()
+}
+
 /// The newest page of a place's version history, or None when the key cannot
 /// read it.
 pub(crate) fn place_history_page(
@@ -777,6 +793,20 @@ fn import_into(root: &Path, place: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publish_status_is_read_for_the_requested_version() {
+        let body = json!({ "placeVersions": [
+            { "version": "2855", "isPublished": true, "publishStatus": 1 },
+            { "version": 2854, "isPublished": true, "publishStatus": 2 },
+            { "version": "2852", "isPublished": false, "publishStatus": 0 },
+        ]});
+        assert_eq!(version_publish_status(&body, 2855), Some(1));
+        assert_eq!(version_publish_status(&body, 2854), Some(2));
+        assert_eq!(version_publish_status(&body, 2852), Some(0));
+        assert_eq!(version_publish_status(&body, 2800), None);
+        assert_eq!(version_publish_status(&json!({}), 2855), None);
+    }
 
     fn experience(id: i64, name: &str) -> Experience {
         Experience {
