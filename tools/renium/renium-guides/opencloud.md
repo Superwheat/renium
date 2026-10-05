@@ -56,12 +56,13 @@ Data/ordered stores default to `global`; override with `--scope`.
 `--field a.b=value` sets nested JSON. JSON-like values retain their types; others are strings.
 Additional options include `--query`, `--filter`, `--cursor`, `--if-match`, `--form`, and `--file`. Repeated query/form/file names retain every value.
 
-Discover routes only when needed:
+`rbx oc CATEGORY --help` lists that category's actions with their values, method and path, marks paged and destructive ones, and says which flag fills `{place}` (`--place-id`) or `{universe}`. An unknown action fails at once with the valid list. Actions that answer with an empty body (such as `universe restart`) return what ran. On paged actions `-l N` is a total fetched 100 per request, `--all` follows every page, `--pages N` stops after N, and `"more": true` says a page remains.
 
 ```powershell
-rbx oc routes data
-rbx oc routes matchmaking
-rbx oc routes
+rbx oc universe                              # includes live playing and visits counts
+rbx oc server list                           # active servers of the newest versions, by version
+rbx oc server find JOB_ID
+rbx oc server logs VERSION JOB -l 1000 --severity error --grep "Ranked"
 ```
 
 Categories include data, ordered, memory, universe, place, restriction, secret, notification, user, group, interaction, team, asset, creator-store, pass, localization, config, luau, server, advertising, analytics, avatar, badge, experiment, event, ai, matchmaking, and thumbnail.

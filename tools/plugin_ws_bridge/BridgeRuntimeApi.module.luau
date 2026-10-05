@@ -763,6 +763,7 @@ end
 				logError = tostring(ownershipError)
 			end
 		end
+		task.wait()
 		resultConnection:Disconnect()
 		logConnection:Disconnect()
 		local ownsOperation, ownershipError = pcall(assertOperationOwnership, operationGeneration)
