@@ -2198,8 +2198,16 @@ fn automation_live_operation(
             .live_sync()
             .set_plugin_status(context.id, plugin.clone());
         daemon = state.live_sync().status(context.id);
+        let unsettled = if settled {
+            None
+        } else {
+            automation::live::unsettled_reason(&daemon, &plugin)
+        };
         if let Some(daemon) = daemon.as_object_mut() {
-            daemon.insert("settled".to_string(), Value::Bool(settled));
+            daemon.insert("settled".to_string(), Value::Bool(unsettled.is_none()));
+            if let Some(reason) = unsettled {
+                daemon.insert("unsettled".to_string(), Value::String(reason));
+            }
         }
     }
     Ok(merge_live_status(plugin, daemon, options.compact))
@@ -3438,6 +3446,17 @@ mod tests {
         );
         assert_eq!(healthy["ok"], true);
         assert!(healthy.get("error").is_none());
+        for compact in [false, true] {
+            let waiting = merge_live_status(
+                json!({"ok":true}),
+                json!({"running":true,"settled":false,"unsettled":"a sync pass is still running"}),
+                compact,
+            );
+            assert_eq!(
+                waiting["error"],
+                "Live Sync did not settle before the wait ended: a sync pass is still running"
+            );
+        }
     }
 
     #[test]

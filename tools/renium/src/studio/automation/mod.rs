@@ -632,8 +632,15 @@ pub(crate) fn normalize_live_status(mut value: Value) -> Value {
         .map(str::to_owned)
         .or_else(|| {
             (value.pointer("/daemon/settled").and_then(Value::as_bool) == Some(false)).then(|| {
-                "Live Sync did not finish before the wait ended; inspect rbx lst --details"
-                    .to_string()
+                match value.pointer("/daemon/unsettled").and_then(Value::as_str) {
+                    Some(reason) => {
+                        format!("Live Sync did not settle before the wait ended: {reason}")
+                    }
+                    None => {
+                        "Live Sync did not finish before the wait ended; inspect rbx lst --details"
+                            .to_string()
+                    }
+                }
             })
         });
     if let Some(error) = error
