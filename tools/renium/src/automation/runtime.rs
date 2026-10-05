@@ -1450,25 +1450,19 @@ fn automation_dispatch_managed(
     if operation == op::STUDIO_OPEN {
         return open_studio(context, parameters, state, bridge).map_err(automation_failure);
     }
-    if operation == op::PLACE_PUBLISH {
-        let status = state.live_sync().status(context.id);
-        if status.get("running").and_then(Value::as_bool) == Some(true)
-            && (status.get("syncing").and_then(Value::as_bool) == Some(true)
-                || status.get("paused").and_then(Value::as_bool) == Some(true)
-                || status.get("resolutionRequired").and_then(Value::as_bool) == Some(true)
-                || status.get("error").and_then(Value::as_str).is_some()
-                || status
-                    .get("pendingPaths")
-                    .and_then(Value::as_array)
-                    .is_some_and(|paths| !paths.is_empty()))
-        {
-            return Err(automation::Failure::new(
-                "conflict",
-                "Live Sync is not settled; run rbx lst --wait and resolve pending changes before publishing",
-                false,
-                "live-status",
-            ));
-        }
+    if operation == op::PLACE_PUBLISH
+        && parameters.get("allowPending").and_then(Value::as_bool) != Some(true)
+        && let Some(reason) =
+            automation::live::unsettled_reason(&state.live_sync().status(context.id), &Value::Null)
+    {
+        return Err(automation::Failure::new(
+            "conflict",
+            format!(
+                "Live Sync is not settled: {reason}. Let it finish (rbx lst --wait) or pass --allow-pending to publish Studio as it is"
+            ),
+            false,
+            "live-status",
+        ));
     }
     if operation == op::PROPERTY_ACCESS {
         let _selection = select_bridge_context(context, bridge);
