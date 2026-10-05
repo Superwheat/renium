@@ -2,9 +2,11 @@ pub(crate) mod assets;
 pub(crate) mod command;
 mod discovery;
 pub(crate) mod keys;
+mod paging;
 mod parameters;
 pub(crate) mod products;
 mod routes;
+mod servers;
 mod transport;
 
 pub(crate) use transport::{

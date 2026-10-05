@@ -1,41 +1,69 @@
 use std::path::Path;
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
 use clap::Args;
 use serde_json::{Map, Value, json};
 
+use super::paging::{PAGE_SIZE, Pager, Plan};
 use super::parameters::{
     absolutize_files, assignment, assignments, merge_assignments, parse_value,
 };
-use super::{CloudIdentity, execute_one};
+use super::transport::{execute_authorized, placeholder_hint};
+use super::{CloudAuth, CloudIdentity};
 use crate::automation::Failure;
-use crate::system::files::absolutize_for_daemon as absolute_path;
+use crate::system::files::{absolutize_for_daemon as absolute_path, atomic_write_file};
 
 #[derive(Args)]
 pub(super) struct RouteArgs {
-    action: String,
-    #[arg(value_name = "VALUE")]
-    values: Vec<String>,
-    #[arg(short, long, value_name = "NAME=VALUE")]
+    #[arg(help = "Operation to run (listed below)")]
+    pub(super) action: Option<String>,
+    #[arg(value_name = "VALUE", help = "The operation's values, in order")]
+    pub(super) values: Vec<String>,
+    #[arg(short, long, value_name = "NAME=VALUE", help = "Add a query parameter")]
     query: Vec<String>,
-    #[arg(short, long, value_name = "NAME=VALUE")]
+    #[arg(
+        short,
+        long,
+        value_name = "NAME=VALUE",
+        help = "Set a JSON body field; dotted names nest, values parse as JSON"
+    )]
     field: Vec<String>,
-    #[arg(long, value_name = "NAME=VALUE")]
+    #[arg(long, value_name = "NAME=VALUE", help = "Set a multipart form field")]
     form: Vec<String>,
-    #[arg(long, value_name = "NAME=PATH")]
+    #[arg(long, value_name = "NAME=PATH", help = "Attach a multipart file")]
     file: Vec<String>,
-    #[arg(long)]
+    #[arg(long, help = "Data store scope (default global)")]
     scope: Option<String>,
-    #[arg(short, long)]
-    limit: Option<u32>,
-    #[arg(long)]
-    cursor: Option<String>,
-    #[arg(long)]
+    #[arg(
+        short,
+        long,
+        value_name = "N",
+        help = "Items to return in total; paged operations fetch 100 per request"
+    )]
+    pub(super) limit: Option<u32>,
+    #[arg(long, help = "Start from this page token")]
+    pub(super) cursor: Option<String>,
+    #[arg(long, help = "Follow page tokens to the last page")]
+    pub(super) all: bool,
+    #[arg(
+        long,
+        value_name = "N",
+        conflicts_with = "all",
+        help = "Fetch at most N pages"
+    )]
+    pub(super) pages: Option<std::num::NonZeroUsize>,
+    #[arg(long, help = "Filter expression passed to the API")]
     filter: Option<String>,
-    #[arg(long)]
+    #[arg(long, help = "Only change the resource when its etag matches")]
     if_match: Option<String>,
-    #[arg(short, long, value_name = "PATH")]
-    output: Option<String>,
+    #[arg(
+        short,
+        long,
+        value_name = "PATH",
+        help = "Write the response to this file"
+    )]
+    pub(super) output: Option<String>,
 }
 
 #[derive(Args)]
@@ -2131,25 +2159,366 @@ static ROUTES: &[Route] = &[
     route!("server", "logs", "GET", "/server-management/v1/universes/{universe}/places/{place}/versions/{version}/game-servers/{job}/logs", [path("VERSION", "version"), path("JOB", "job")], page "MaxPageSize", "PageToken"),
 ];
 
+/// Actions that combine several requests; `servers.rs` runs them.
+static COMPOSITES: &[(&str, &str, &str)] = &[
+    (
+        "server",
+        "list",
+        "active servers and players of the 10 newest versions that have servers, by version; --pages N per version (default 10)",
+    ),
+    (
+        "server",
+        "find JOB",
+        "the server with this job ID and its version, from the same versions",
+    ),
+];
+
+static ALIASES: &[(&str, &str, &str)] = &[
+    ("universe", "restart-servers", "restart"),
+    ("server", "restart-servers", "restart"),
+];
+
+const UNIVERSE_NAMES: &[&str] = &[
+    "universe",
+    "universe_id",
+    "universeId",
+    "game",
+    "game_id",
+    "gameId",
+];
+const PLACE_NAMES: &[&str] = &["place", "place_id", "placeId"];
+const DESTRUCTIVE_WORDS: &[&str] = &[
+    "restart",
+    "shutdown",
+    "flush",
+    "delete",
+    "remove",
+    "deactivate",
+    "archive",
+    "discard",
+    "rollback",
+];
+
+impl Route {
+    fn paged(&self) -> bool {
+        self.limit.is_some() && self.cursor.is_some()
+    }
+
+    fn destructive(&self) -> bool {
+        self.method == "DELETE"
+            || (self.method != "GET"
+                && self
+                    .action
+                    .split('-')
+                    .any(|word| DESTRUCTIVE_WORDS.contains(&word)))
+    }
+
+    fn usage(&self) -> String {
+        std::iter::once(self.action)
+            .chain(self.operands.iter().map(|operand| operand.label))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+/// A resolved request context whose credentials are read on the first send
+/// and reused by every request after it.
+pub(super) struct Access<'a> {
+    pub(super) identity: CloudIdentity,
+    key_env: &'a str,
+    oauth_env: Option<&'a str>,
+    anonymous: bool,
+    auth: OnceLock<CloudAuth>,
+}
+
+impl<'a> Access<'a> {
+    pub(super) fn new(
+        identity: CloudIdentity,
+        key_env: &'a str,
+        oauth_env: Option<&'a str>,
+        anonymous: bool,
+    ) -> Self {
+        Self {
+            identity,
+            key_env,
+            oauth_env,
+            anonymous,
+            auth: OnceLock::new(),
+        }
+    }
+
+    pub(super) fn send(&self, request: Value) -> Result<Value> {
+        let auth = match self.auth.get() {
+            Some(auth) => auth,
+            None => {
+                let auth =
+                    CloudAuth::from_env(self.anonymous, self.key_env, self.oauth_env, "cloud")
+                        .map_err(cloud_error)?;
+                self.auth.get_or_init(|| auth)
+            }
+        };
+        execute_authorized(self.identity, auth, request).map_err(cloud_error)
+    }
+}
+
+fn kebab(name: &str) -> String {
+    let mut result = String::with_capacity(name.len() + 4);
+    let mut after_word = false;
+    for character in name.trim().chars() {
+        if matches!(character, '_' | ' ') {
+            result.push('-');
+            after_word = false;
+            continue;
+        }
+        if character.is_ascii_uppercase() && after_word {
+            result.push('-');
+        }
+        after_word = character.is_ascii_lowercase() || character.is_ascii_digit();
+        result.push(character.to_ascii_lowercase());
+    }
+    result
+}
+
+fn category_actions(category: &str) -> impl Iterator<Item = &'static str> + '_ {
+    ROUTES
+        .iter()
+        .filter(move |route| route.category == category)
+        .map(|route| route.action)
+        .chain(
+            COMPOSITES
+                .iter()
+                .filter(move |(name, _, _)| *name == category)
+                .filter_map(|(_, usage, _)| usage.split_whitespace().next()),
+        )
+}
+
+/// The canonical action for what was typed: kebab-cased, aliases resolved,
+/// `show` read as `get`, and no action meaning `get` when it takes no values.
+pub(super) fn resolve_action(category: &str, action: Option<&str>) -> Result<&'static str> {
+    if category_actions(category).next().is_none() {
+        bail!("Unknown Open Cloud category '{category}'");
+    }
+    let Some(action) = action else {
+        return ROUTES
+            .iter()
+            .find(|route| {
+                route.category == category && route.action == "get" && route.operands.is_empty()
+            })
+            .map(|route| route.action)
+            .with_context(|| {
+                format!(
+                    "rbx oc {category} needs an ACTION: {}; `rbx oc {category} --help` shows each with its method and path",
+                    category_actions(category).collect::<Vec<_>>().join(", ")
+                )
+            });
+    };
+    let name = kebab(action);
+    let name = ALIASES
+        .iter()
+        .find(|(alias_category, alias, _)| *alias_category == category && *alias == name)
+        .map_or(name.as_str(), |(_, _, target)| target);
+    let name = if name == "show" { "get" } else { name };
+    category_actions(category)
+        .find(|candidate| *candidate == name)
+        .with_context(|| available_error(category, action))
+}
+
+fn find_route(category: &str, action: &str) -> Result<&'static Route> {
+    ROUTES
+        .iter()
+        .find(|route| route.category == category && route.action == action)
+        .with_context(|| format!("rbx oc {category} {action} is not a single request"))
+}
+
+/// The help text listing a category's actions, one line each, read from the
+/// route table.
+pub(super) fn category_help(category: &str) -> String {
+    use std::fmt::Write as _;
+
+    let routes = ROUTES
+        .iter()
+        .filter(|route| route.category == category)
+        .collect::<Vec<_>>();
+    let mut rows = routes
+        .iter()
+        .map(|route| {
+            let mut description = format!("{:<6} {}", route.method, route.path);
+            if route.paged() {
+                description.push_str("  (paged)");
+            }
+            if route.destructive() {
+                description.push_str("  (destructive)");
+            }
+            (route.usage(), description)
+        })
+        .collect::<Vec<_>>();
+    for (_, usage, summary) in COMPOSITES.iter().filter(|(name, _, _)| *name == category) {
+        let action = usage.split_whitespace().next().unwrap_or(usage);
+        let at = rows
+            .iter()
+            .rposition(|(row, _)| row.split_whitespace().next() == Some(action))
+            .map_or(rows.len(), |index| index + 1);
+        rows.insert(at, ((*usage).to_string(), (*summary).to_string()));
+    }
+    let width = rows.iter().map(|(usage, _)| usage.len()).max().unwrap_or(0);
+    let mut text = String::from("Actions:\n");
+    for (usage, description) in rows {
+        let _ = writeln!(text, "  {usage:<width$}  {description}");
+    }
+    let mut sources = Vec::new();
+    let uses = |names: &[&str]| {
+        routes
+            .iter()
+            .any(|route| placeholders(route.path).any(|placeholder| names.contains(&placeholder)))
+    };
+    if uses(UNIVERSE_NAMES) {
+        sources.push("{universe} from --universe or the project's experience");
+    }
+    if uses(PLACE_NAMES) {
+        sources.push("{place} from --place-id or the project's place");
+    }
+    if uses(&["scope_id"]) {
+        sources.push("{scope_id} from --scope");
+    }
+    if !sources.is_empty() {
+        let _ = writeln!(text, "\nPath values: {}.", sources.join("; "));
+    }
+    if routes.iter().any(|route| route.paged()) {
+        text.push_str(
+            "Paged actions: -l N returns N items in total (100 per request), --all follows every page, --pages N stops after N; \"more\": true means another page exists.\n",
+        );
+    }
+    let mut aliases = vec!["camelCase names work too".to_string()];
+    if routes
+        .iter()
+        .any(|route| route.action == "get" && route.operands.is_empty())
+    {
+        aliases.insert(0, "no action or show = get".to_string());
+    } else if routes.iter().any(|route| route.action == "get") {
+        aliases.insert(0, "show = get".to_string());
+    }
+    aliases.extend(
+        ALIASES
+            .iter()
+            .filter(|(name, _, _)| *name == category)
+            .map(|(_, alias, target)| format!("{alias} = {target}")),
+    );
+    let _ = writeln!(text, "Aliases: {}.", aliases.join(", "));
+    text
+}
+
+fn placeholders(path: &str) -> impl Iterator<Item = &str> {
+    path.split('{')
+        .skip(1)
+        .filter_map(|part| part.split_once('}').map(|(name, _)| name))
+}
+
 pub(super) fn run(
     category: &str,
-    identity: CloudIdentity,
-    key_env: &str,
-    oauth_env: Option<&str>,
-    anonymous: bool,
-    args: RouteArgs,
+    access: &Access,
+    mut args: RouteArgs,
+    shape: impl FnOnce(&mut Value),
 ) -> Result<Value> {
-    let request = build_request(category, identity, args)?;
-    let response =
-        execute_one(identity, key_env, oauth_env, anonymous, request).map_err(cloud_error)?;
-    compact_response(response)
+    let action = resolve_action(category, args.action.as_deref())?;
+    let route = find_route(category, action)?;
+    let values = args.values.clone();
+    let plan = Plan::new(args.limit, args.pages, args.all);
+    let writes_file = args.output.is_some();
+    let output = if route.paged() {
+        args.output.take()
+    } else {
+        None
+    };
+    let request = build_request(category, access.identity, args)?;
+    let (mut body, more) = match (route.limit, route.cursor) {
+        (Some(size), Some(token)) => {
+            let pages = Pager { size, token, plan }.collect(
+                request,
+                |request| Ok(access.send(request.clone())?["body"].take()),
+                |_| false,
+            )?;
+            (pages.body, pages.more)
+        }
+        _ => (access.send(request)?["body"].take(), false),
+    };
+    if body.is_null() || body.as_object().is_some_and(Map::is_empty) {
+        body = completed(route, access.identity, &values);
+    }
+    if route.category == "universe"
+        && route.action == "get"
+        && !writes_file
+        && let Some(universe) = access.identity.game_id
+        && let Some(object) = body.as_object_mut()
+        && let Some(counts) = super::discovery::live_counts(universe)
+    {
+        object.extend(counts);
+    }
+    shape(&mut body);
+    match output {
+        Some(path) => write_output(&path, &body, more),
+        None => Ok(body),
+    }
+}
+
+/// What a request that answered with no body did, so the result still says
+/// which action ran and on what.
+fn completed(route: &Route, identity: CloudIdentity, values: &[String]) -> Value {
+    let mut result = Map::new();
+    result.insert("ok".to_string(), Value::Bool(true));
+    result.insert(
+        "action".to_string(),
+        Value::String(route.action.to_string()),
+    );
+    let names = placeholders(route.path).collect::<Vec<_>>();
+    if let Some(universe) = identity.game_id
+        && names.iter().any(|name| UNIVERSE_NAMES.contains(name))
+    {
+        result.insert("universeId".to_string(), json!(universe));
+    }
+    if let Some(place) = identity.place_id
+        && names.iter().any(|name| PLACE_NAMES.contains(name))
+    {
+        result.insert("placeId".to_string(), json!(place));
+    }
+    for (operand, value) in route.operands.iter().zip(values) {
+        result.insert(camel_case(operand.label), parse_value(value));
+    }
+    Value::Object(result)
+}
+
+fn camel_case(label: &str) -> String {
+    label
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .enumerate()
+        .map(|(index, part)| {
+            let lower = part.to_ascii_lowercase();
+            if index == 0 {
+                lower
+            } else {
+                let mut characters = lower.chars();
+                characters.next().map_or_else(String::new, |first| {
+                    first.to_ascii_uppercase().to_string() + characters.as_str()
+                })
+            }
+        })
+        .collect()
+}
+
+pub(super) fn write_output(path: &str, body: &Value, more: bool) -> Result<Value> {
+    let path = absolute_path(Path::new(path));
+    let bytes = serde_json::to_vec(body)?;
+    atomic_write_file(&path, &bytes)?;
+    let mut result = json!({ "file": path, "bytes": bytes.len() });
+    if more {
+        result["more"] = Value::Bool(true);
+    }
+    Ok(result)
 }
 
 fn build_request(category: &str, identity: CloudIdentity, args: RouteArgs) -> Result<Value> {
-    let route = ROUTES
-        .iter()
-        .find(|route| route.category == category && route.action == args.action)
-        .with_context(|| available_error(category, &args.action))?;
+    let action = resolve_action(category, args.action.as_deref())?;
+    let route = find_route(category, action)?;
     if args.values.len() != route.operands.len() {
         let usage = route
             .operands
@@ -2230,7 +2599,28 @@ fn build_request(category: &str, identity: CloudIdentity, args: RouteArgs) -> Re
         let name = route
             .limit
             .context("--limit isn't valid for this operation")?;
-        parts.query.insert(name.to_string(), json!(limit));
+        let size = if route.paged() {
+            limit.min(PAGE_SIZE)
+        } else {
+            limit
+        };
+        parts.query.insert(name.to_string(), json!(size));
+    }
+    if (args.all || args.pages.is_some()) && !route.paged() {
+        bail!("--all and --pages work with paged operations only");
+    }
+    let filled = |name: &str| {
+        parts.path.contains_key(name)
+            || (UNIVERSE_NAMES.contains(&name) && identity.game_id.is_some())
+            || (PLACE_NAMES.contains(&name) && identity.place_id.is_some())
+    };
+    if let Some(name) = placeholders(&request_path).find(|name| !filled(name)) {
+        bail!(
+            "rbx oc {} {} needs {{{name}}} for {request_path}: {}",
+            route.category,
+            route.action,
+            placeholder_hint(name)
+        );
     }
     if let Some(cursor) = args.cursor {
         let name = route
@@ -2344,34 +2734,21 @@ pub(super) fn list(args: RoutesArgs) -> Result<Value> {
             .as_deref()
             .is_none_or(|value| value == route.category)
     }) {
-        let usage = std::iter::once(route.action)
-            .chain(route.operands.iter().map(|operand| operand.label))
-            .collect::<Vec<_>>()
-            .join(" ");
         result
             .entry(route.category.to_string())
             .or_insert_with(|| Value::Array(Vec::new()))
             .as_array_mut()
             .expect("route category is always an array")
-            .push(Value::String(usage));
+            .push(Value::String(route.usage()));
     }
     Ok(Value::Object(result))
 }
 
 fn available_error(category: &str, action: &str) -> String {
-    let actions = ROUTES
-        .iter()
-        .filter(|route| route.category == category)
-        .map(|route| route.action)
-        .collect::<Vec<_>>();
-    if actions.is_empty() {
-        format!("Unknown Open Cloud category '{category}'")
-    } else {
-        format!(
-            "Unknown {category} action '{action}'. Available: {}",
-            actions.join(", ")
-        )
-    }
+    format!(
+        "Unknown {category} action '{action}'. Available: {}; `rbx oc {category} --help` shows each with its values, method and path",
+        category_actions(category).collect::<Vec<_>>().join(", ")
+    )
 }
 
 fn assign_target(target: Target, value: Value, parts: &mut RequestParts) -> Result<()> {
@@ -2485,14 +2862,6 @@ fn insert_nested(map: &mut Map<String, Value>, path: &str, value: Value) -> Resu
     bail!("Field names cannot be empty")
 }
 
-fn compact_response(response: Value) -> Result<Value> {
-    let status = response.get("status").cloned().unwrap_or(json!(200));
-    match response.get("body") {
-        Some(Value::Null) | None => Ok(json!({ "ok": true, "status": status })),
-        Some(body) => Ok(body.clone()),
-    }
-}
-
 fn cloud_error(failure: Failure) -> anyhow::Error {
     match failure.0.d {
         Some(detail) => anyhow::anyhow!("{}\n{}", failure.0.m, detail),
@@ -2508,7 +2877,7 @@ mod tests {
 
     fn args(action: &str, values: &[&str]) -> RouteArgs {
         RouteArgs {
-            action: action.to_string(),
+            action: Some(action.to_string()),
             values: values.iter().map(|value| (*value).to_string()).collect(),
             query: Vec::new(),
             field: Vec::new(),
@@ -2517,10 +2886,161 @@ mod tests {
             scope: None,
             limit: None,
             cursor: None,
+            all: false,
+            pages: None,
             filter: None,
             if_match: None,
             output: None,
         }
+    }
+
+    #[test]
+    fn actions_resolve_aliases_case_and_defaults() {
+        assert_eq!(
+            resolve_action("universe", Some("restart")).unwrap(),
+            "restart"
+        );
+        assert_eq!(
+            resolve_action("universe", Some("restart-servers")).unwrap(),
+            "restart"
+        );
+        assert_eq!(
+            resolve_action("universe", Some("restartServers")).unwrap(),
+            "restart"
+        );
+        assert_eq!(resolve_action("universe", None).unwrap(), "get");
+        assert_eq!(resolve_action("universe", Some("show")).unwrap(), "get");
+        assert_eq!(
+            resolve_action("memory", Some("queueRead")).unwrap(),
+            "queue-read"
+        );
+        assert_eq!(
+            resolve_action("memory", Some("SORTED_LIST")).unwrap(),
+            "sorted-list"
+        );
+        assert_eq!(resolve_action("server", Some("find")).unwrap(), "find");
+        let error = resolve_action("universe", Some("reboot"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Available: get, update, message, restart"),
+            "{error}"
+        );
+        let error = resolve_action("data", None).unwrap_err().to_string();
+        assert!(error.contains("needs an ACTION"), "{error}");
+        assert!(resolve_action("nothing", Some("get")).is_err());
+    }
+
+    #[test]
+    fn category_help_lists_every_action_with_method_path_and_warnings() {
+        for category in ROUTES.iter().map(|route| route.category) {
+            let help = category_help(category);
+            for route in ROUTES.iter().filter(|route| route.category == category) {
+                let line = help
+                    .lines()
+                    .find(|line| {
+                        line.trim_start()
+                            .starts_with(&format!("{} ", route.usage()))
+                            && line.contains(route.path)
+                    })
+                    .unwrap_or_else(|| panic!("{category} help misses {}", route.usage()));
+                assert!(line.contains(route.method), "{line}");
+                assert_eq!(
+                    line.contains("(destructive)"),
+                    route.destructive(),
+                    "{line}"
+                );
+                assert_eq!(line.contains("(paged)"), route.paged(), "{line}");
+            }
+        }
+        let help = category_help("universe");
+        assert!(help.contains("restart-servers = restart"), "{help}");
+        assert!(help.contains("{universe} from --universe"), "{help}");
+        let help = category_help("server");
+        assert!(help.contains("\n  find JOB "), "{help}");
+        assert!(help.contains("{place} from --place-id"), "{help}");
+        let destructive = ROUTES
+            .iter()
+            .filter(|route| route.destructive())
+            .map(|route| format!("{} {}", route.category, route.action))
+            .collect::<Vec<_>>();
+        for expected in [
+            "universe restart",
+            "server restart",
+            "data delete",
+            "team remove-members",
+            "memory flush",
+        ] {
+            assert!(
+                destructive.iter().any(|name| name == expected),
+                "{expected}"
+            );
+        }
+        for safe in ["data undelete", "server restarts", "universe activate"] {
+            assert!(!destructive.iter().any(|name| name == safe), "{safe}");
+        }
+    }
+
+    #[test]
+    fn missing_universe_or_place_names_the_flag_before_any_request() {
+        let error = build_request(
+            "team",
+            CloudIdentity {
+                game_id: Some(1),
+                place_id: None,
+            },
+            args("members", &[]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("{place}"), "{error}");
+        assert!(error.contains("--place-id"), "{error}");
+        let error = build_request("universe", CloudIdentity::default(), args("get", &[]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--universe"), "{error}");
+    }
+
+    #[test]
+    fn empty_responses_say_what_ran() {
+        let identity = CloudIdentity {
+            game_id: Some(123),
+            place_id: Some(456),
+        };
+        let restart = find_route("universe", "restart").unwrap();
+        assert_eq!(
+            completed(restart, identity, &[]),
+            json!({"ok": true, "action": "restart", "universeId": 123})
+        );
+        let discard = find_route("memory", "queue-discard").unwrap();
+        assert_eq!(
+            completed(discard, identity, &["jobs".to_string(), "r1".to_string()]),
+            json!({"ok": true, "action": "queue-discard", "universeId": 123, "queue": "jobs", "readId": "r1"})
+        );
+        let stop = find_route("team", "stop-test").unwrap();
+        assert_eq!(
+            completed(stop, identity, &[]),
+            json!({"ok": true, "action": "stop-test", "placeId": 456})
+        );
+    }
+
+    #[test]
+    fn paged_limits_start_at_one_page_and_paging_needs_a_paged_route() {
+        let identity = CloudIdentity {
+            game_id: Some(123),
+            place_id: Some(456),
+        };
+        let mut logs = args("logs", &["2797", "job"]);
+        logs.limit = Some(1000);
+        let request = build_request("server", identity, logs).unwrap();
+        assert_eq!(request["query"], json!({"MaxPageSize": 100}));
+        let mut queue = args("queue-read", &["jobs"]);
+        queue.limit = Some(500);
+        let request = build_request("memory", identity, queue).unwrap();
+        assert_eq!(request["query"], json!({"count": 500}));
+        let mut get = args("get", &[]);
+        get.all = true;
+        assert!(build_request("universe", identity, get).is_err());
     }
 
     #[test]

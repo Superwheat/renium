@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use super::transport::{
     CloudIdentity, download_to_file, execute_one, fetch_public_json, introspect_key,
@@ -16,6 +16,7 @@ const GROUP_LIMIT: usize = 40;
 const CACHE_SECONDS: u64 = 15 * 60;
 const DEVELOP_HOST: &str = "https://develop.roblox.com";
 const PAGE_LIMIT: usize = 10;
+const HISTORY_PAGES: usize = 5;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Experience {
@@ -406,53 +407,88 @@ pub(crate) fn games_command(key_env: &str, query: Option<&str>) -> Result<Value>
     }))
 }
 
-/// The newest version that is published, read from the place's history, or
-/// None when the history cannot be read or holds no published version.
-fn latest_published_version(
-    identity: CloudIdentity,
-    key_env: &str,
-    oauth_env: Option<&str>,
+/// Live player count and visits from the public games endpoint, which needs
+/// no key; None when it cannot be read.
+pub(crate) fn live_counts(universe_id: i64) -> Option<Map<String, Value>> {
+    let page = fetch_public_json(
+        &format!("{GAMES_HOST}/v1/games?universeIds={universe_id}"),
+        "cloud universe",
+    )
+    .ok()?;
+    let counts = counts_from(&page, universe_id);
+    (!counts.is_empty()).then_some(counts)
+}
+
+fn counts_from(page: &Value, universe_id: i64) -> Map<String, Value> {
+    let game = page
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|game| game.get("id").and_then(Value::as_i64) == Some(universe_id));
+    ["playing", "visits"]
+        .into_iter()
+        .filter_map(|name| Some((name.to_string(), game?.get(name)?.clone())))
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PlaceVersion {
+    pub(crate) number: u64,
+    pub(crate) published: bool,
+}
+
+/// The place's versions, newest first, read page by page until `enough`
+/// accepts them or the history ends; None when the history cannot be read.
+pub(crate) fn place_history(
+    send: impl Fn(Value) -> Option<Value>,
     place_id: i64,
-) -> Option<u64> {
+    enough: impl Fn(&[PlaceVersion]) -> bool,
+) -> Option<Vec<PlaceVersion>> {
+    let mut versions = Vec::new();
     let mut cursor: Option<String> = None;
-    for _ in 0..5 {
+    for _ in 0..HISTORY_PAGES {
         let mut query = json!({ "pageSize": 20 });
         if let Some(cursor) = &cursor {
             query["cursor"] = json!(cursor);
         }
-        let response = execute_one(
-            identity,
-            key_env,
-            oauth_env,
-            false,
-            json!({
-                "method": "GET",
-                "path": "/place-version-history-api/v1/{place}/history",
-                "pathParams": { "place": place_id },
-                "query": query,
-            }),
-        )
-        .ok()?;
+        let response = send(json!({
+            "method": "GET",
+            "path": "/place-version-history-api/v1/{place}/history",
+            "pathParams": { "place": place_id },
+            "query": query,
+        }))?;
         let body = response.get("body").unwrap_or(&response);
-        let versions = body.get("placeVersions")?.as_array()?;
-        if let Some(version) = versions.iter().find_map(|entry| {
-            entry
-                .get("isPublished")?
-                .as_bool()
-                .filter(|published| *published)?;
-            let version = entry.get("version")?;
-            version.as_u64().or_else(|| version.as_str()?.parse().ok())
-        }) {
-            return Some(version);
+        versions.extend(
+            body.get("placeVersions")?
+                .as_array()?
+                .iter()
+                .filter_map(|entry| {
+                    let version = entry.get("version")?;
+                    Some(PlaceVersion {
+                        number: version
+                            .as_u64()
+                            .or_else(|| version.as_str()?.parse().ok())?,
+                        published: entry
+                            .get("isPublished")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    })
+                }),
+        );
+        if enough(&versions) {
+            break;
         }
         cursor = body
             .get("hasMore")
             .and_then(Value::as_bool)
             .filter(|more| *more)
             .and_then(|_| body.get("nextCursor")?.as_str().map(str::to_string));
-        cursor.as_ref()?;
+        if cursor.is_none() {
+            break;
+        }
     }
-    None
+    Some(versions)
 }
 
 pub(crate) struct FetchRequest {
@@ -538,9 +574,16 @@ pub(crate) fn fetch_command(
     // Asset delivery can serve a stale copy of "the current place" for a while
     // after a publish, so the newest published version is fetched by number
     // whenever the key can read the place's history.
-    let version = request
-        .version
-        .or_else(|| latest_published_version(identity, key_env, oauth_env, place_id));
+    let version = request.version.or_else(|| {
+        place_history(
+            |request| execute_one(identity, key_env, oauth_env, false, request).ok(),
+            place_id,
+            |versions| versions.iter().any(|version| version.published),
+        )?
+        .into_iter()
+        .find(|version| version.published)
+        .map(|version| version.number)
+    });
     let delivery_request = match version {
         Some(version) => json!({
             "method": "GET",
@@ -670,6 +713,58 @@ mod tests {
         assert_eq!(matches(&list, "2")[0].universe_id, 2);
         assert!(matches(&list, "").is_empty());
         assert!(matches(&list, "🏘️").is_empty());
+    }
+
+    #[test]
+    fn live_counts_come_from_the_matching_game_only() {
+        let page = json!({"data": [
+            {"id": 7, "playing": 1, "visits": 2},
+            {"id": 8420907710_i64, "playing": 1234, "visits": 98765, "name": "Drift Tag"},
+        ]});
+        assert_eq!(
+            Value::Object(counts_from(&page, 8420907710)),
+            json!({"playing": 1234, "visits": 98765})
+        );
+        assert!(counts_from(&page, 9).is_empty());
+        assert!(counts_from(&json!({"errors": []}), 7).is_empty());
+    }
+
+    #[test]
+    fn place_history_reads_pages_until_enough() {
+        let calls = std::cell::Cell::new(0);
+        let versions = place_history(
+            |request| {
+                calls.set(calls.get() + 1);
+                let page = if request["query"].get("cursor").is_some() {
+                    json!({"placeVersions": [{"version": 3, "isPublished": true}], "hasMore": false})
+                } else {
+                    json!({"placeVersions": [{"version": "5"}, {"version": 4, "isPublished": false}], "hasMore": true, "nextCursor": "next"})
+                };
+                Some(json!({ "status": 200, "body": page }))
+            },
+            1,
+            |versions| versions.iter().any(|version| version.published),
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 2);
+        assert_eq!(
+            versions,
+            vec![
+                PlaceVersion {
+                    number: 5,
+                    published: false
+                },
+                PlaceVersion {
+                    number: 4,
+                    published: false
+                },
+                PlaceVersion {
+                    number: 3,
+                    published: true
+                },
+            ]
+        );
+        assert!(place_history(|_| None, 1, |_| false).is_none());
     }
 
     #[test]

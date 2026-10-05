@@ -67,7 +67,7 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ("upd", "Examples:\n  rbx upd"),
     (
         "oc",
-        "Examples:\n  rbx oc key add studio\n  rbx oc games \"Brainrot Town\"\n  rbx oc fetch \"Brainrot Town\" -r ./BrainrotTown\n  rbx oc key\n  rbx oc analytics metrics --field metric=DailyActiveUsers --field granularity=OneDay --field startTime=2026-01-01T00:00:00Z --field endTime=2026-02-01T00:00:00Z\n  rbx oc event list --limit 10\n  rbx oc experiment list --limit 25\n  rbx oc thumbnail personalization --limit 10",
+        "Categories from data to server take ACTION [VALUE]...; `rbx oc CATEGORY --help` lists each action with its values, method and path.\n\nExamples:\n  rbx oc key add studio\n  rbx oc games \"Brainrot Town\"\n  rbx oc fetch \"Brainrot Town\" -r ./BrainrotTown\n  rbx oc key\n  rbx oc universe\n  rbx oc server list\n  rbx oc server find 61146e49-9b1a-496d-ab0e-acb8122eba02\n  rbx oc server logs 2797 61146e49-9b1a-496d-ab0e-acb8122eba02 -l 1000 --severity error --grep DataStore\n  rbx oc data entries Players --all\n  rbx oc analytics metrics --field metric=DailyActiveUsers --field granularity=OneDay --field startTime=2026-01-01T00:00:00Z --field endTime=2026-02-01T00:00:00Z\n  rbx oc event list --limit 10",
     ),
     (
         "ip",

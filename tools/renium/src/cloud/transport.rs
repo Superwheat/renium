@@ -17,6 +17,7 @@ const DEFAULT_KEY_ENV: &str = "ROBLOX_API_KEY";
 const MAX_BODY_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_MULTIPART_FILE_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_RAW_FILE_BYTES: u64 = 200 * 1024 * 1024;
+const RETRIES: u32 = 3;
 static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
 
 #[derive(Clone, Copy, Default)]
@@ -392,6 +393,24 @@ pub(crate) fn execute_one(
         })
 }
 
+/// One request with credentials resolved once by the caller, for commands that
+/// send many requests in a row.
+pub(crate) fn execute_authorized(
+    identity: CloudIdentity,
+    auth: &CloudAuth,
+    request: Value,
+) -> Result<Value, Failure> {
+    let request: CloudRequest = serde_json::from_value(request).map_err(|error| {
+        Failure::new(
+            "bad_req",
+            format!("Invalid cloud request: {error}"),
+            false,
+            "cloud",
+        )
+    })?;
+    execute_request(identity, auth, 0, &request)
+}
+
 pub(crate) fn introspect_key(key_env: &str) -> Result<Value, Failure> {
     let key = api_key_secret(key_env, "cloud key")?;
     let result = agent()
@@ -593,8 +612,14 @@ fn execute_request(
         .map_err(Box::new)
     };
     let mut result = send();
-    if matches!(method.as_str(), "GET" | "HEAD") && is_transient(&result) {
-        result = send();
+    if matches!(method.as_str(), "GET" | "HEAD") {
+        for attempt in 0..RETRIES {
+            let Some(wait) = transient_wait(&result, attempt) else {
+                break;
+            };
+            std::thread::sleep(wait);
+            result = send();
+        }
     }
     let response = match result {
         Ok(response) => response,
@@ -659,13 +684,39 @@ fn execute_request(
     Ok(value)
 }
 
-fn is_transient(result: &Result<ureq::Response, Box<ureq::Error>>) -> bool {
-    result.as_ref().is_err_and(|error| {
-        matches!(
-            error.as_ref(),
-            ureq::Error::Transport(_) | ureq::Error::Status(429 | 502 | 503 | 504, _)
-        )
-    })
+/// How long to wait before retrying a read that failed in transit, was rate
+/// limited or hit a server error; None when the failure is final.
+fn transient_wait(
+    result: &Result<ureq::Response, Box<ureq::Error>>,
+    attempt: u32,
+) -> Option<Duration> {
+    match result.as_ref().err()?.as_ref() {
+        ureq::Error::Transport(_) => Some(backoff(attempt, None)),
+        ureq::Error::Status(status, response) if *status == 429 || *status >= 500 => {
+            Some(backoff(attempt, response.header("retry-after")))
+        }
+        ureq::Error::Status(..) => None,
+    }
+}
+
+fn backoff(attempt: u32, retry_after: Option<&str>) -> Duration {
+    retry_after
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|seconds| Duration::from_secs(seconds.clamp(1, 10)))
+        .unwrap_or_else(|| Duration::from_millis(500 << attempt.min(4)))
+}
+
+pub(crate) fn placeholder_hint(name: &str) -> String {
+    match name {
+        "universe" | "universe_id" | "universeId" | "game" | "game_id" | "gameId" => {
+            "pass --universe ID or run inside a Renium experience".to_string()
+        }
+        "place" | "place_id" | "placeId" => {
+            "pass --place-id ID or run inside a Renium project bound to a place".to_string()
+        }
+        "scope_id" => "pass --scope NAME".to_string(),
+        other => format!("pass --param {other}=VALUE"),
+    }
 }
 
 fn url_encoded_body(fields: &Map<String, Value>) -> Result<Vec<u8>, String> {
@@ -909,6 +960,11 @@ fn expand_path(
             "path must be an absolute API path without a host, query, or fragment".to_string(),
         );
     }
+    for (name, value) in parameters {
+        let value = scalar(value)
+            .ok_or_else(|| format!("pathParams.{name} must be a string, number, or boolean"))?;
+        path = path.replace(&format!("{{{name}}}"), &encode_segment(&value));
+    }
     if let Some(id) = identity.game_id {
         for name in [
             "universe",
@@ -926,13 +982,19 @@ fn expand_path(
             path = path.replace(&format!("{{{name}}}"), &id.to_string());
         }
     }
-    for (name, value) in parameters {
-        let value = scalar(value)
-            .ok_or_else(|| format!("pathParams.{name} must be a string, number, or boolean"))?;
-        path = path.replace(&format!("{{{name}}}"), &encode_segment(&value));
+    if let Some(name) = path
+        .split('{')
+        .nth(1)
+        .and_then(|rest| rest.split_once('}'))
+        .map(|(name, _)| name)
+    {
+        return Err(format!(
+            "path has an unresolved placeholder {{{name}}} in {path}: {}",
+            placeholder_hint(name)
+        ));
     }
     if path.contains('{') || path.contains('}') {
-        return Err(format!("path has an unresolved placeholder: {path}"));
+        return Err(format!("path has an unbalanced brace: {path}"));
     }
     Ok(path)
 }
@@ -1038,6 +1100,50 @@ mod tests {
             .unwrap(),
             "/cloud/v2/universes/123/data-stores/Player%20Data/entries/user%2F1"
         );
+    }
+
+    #[test]
+    fn explicit_path_parameters_win_over_the_project_identity() {
+        let parameters = Map::from_iter([("place".to_string(), json!(789))]);
+        assert_eq!(
+            expand_path(
+                identity(),
+                "/place-version-history-api/v1/{place}/history",
+                &parameters
+            )
+            .unwrap(),
+            "/place-version-history-api/v1/789/history"
+        );
+    }
+
+    #[test]
+    fn unresolved_placeholders_name_the_flag_that_fills_them() {
+        let message = expand_path(
+            CloudIdentity::default(),
+            "/legacy-develop/v1/places/{place}/teamcreate/active_session/members",
+            &Map::new(),
+        )
+        .unwrap_err();
+        assert!(message.contains("{place}"), "{message}");
+        assert!(message.contains("--place-id"), "{message}");
+        let message = expand_path(
+            CloudIdentity::default(),
+            "/cloud/v2/universes/{universe}",
+            &Map::new(),
+        )
+        .unwrap_err();
+        assert!(message.contains("--universe"), "{message}");
+        let message = expand_path(identity(), "/v1/badges/{badge_id}", &Map::new()).unwrap_err();
+        assert!(message.contains("--param badge_id=VALUE"), "{message}");
+    }
+
+    #[test]
+    fn retries_back_off_and_honour_retry_after() {
+        assert_eq!(backoff(0, None), Duration::from_millis(500));
+        assert_eq!(backoff(2, None), Duration::from_secs(2));
+        assert_eq!(backoff(0, Some("3")), Duration::from_secs(3));
+        assert_eq!(backoff(0, Some("600")), Duration::from_secs(10));
+        assert_eq!(backoff(1, Some("soon")), Duration::from_secs(1));
     }
 
     #[test]
