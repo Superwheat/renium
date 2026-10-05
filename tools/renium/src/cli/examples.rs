@@ -51,7 +51,7 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ),
     (
         "cmp",
-        "Examples:\n  rbx cmp Place.rbxl\n  rbx cmp Before.rbxl --full --all\n  rbx cmp Before.rbxl --against After.rbxlx --full --all",
+        "Examples:\n  rbx cmp Place.rbxl\n  rbx cmp Before.rbxl --full --all\n  rbx cmp Before.rbxl After.rbxlx --full --all",
     ),
     ("dr", "Examples:\n  rbx dr"),
     (

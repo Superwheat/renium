@@ -141,6 +141,12 @@ pub(super) struct ComparePlaceArgs {
     )]
     pub(super) input: PathBuf,
     #[arg(
+        value_name = "AGAINST",
+        conflicts_with = "against",
+        help = "Place file holding the after state; same as --against"
+    )]
+    pub(super) other: Option<PathBuf>,
+    #[arg(
         long,
         value_name = "PLACE.rbxl|PLACE.rbxlx",
         help = "Compare against another place file instead of the project"
