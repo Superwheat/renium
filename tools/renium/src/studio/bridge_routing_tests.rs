@@ -1643,6 +1643,12 @@ fn edit_status_response_filters_a_reconnected_daemons_previously_captured_invent
     let _current = connect(&bridge, 1, client_info("f2-current", "current"));
     let mut inventory = bridge.list_bridge_clients();
     assert_eq!(inventory.len(), 3);
+    assert!(
+        inventory
+            .iter()
+            .all(|entry| entry["pid"] == std::process::id()),
+        "every edit and play runtime lists its Studio process: {inventory:?}"
+    );
     bridge
         .call_for_runtime_with_timeout(
             "getStudioState",

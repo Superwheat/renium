@@ -1002,6 +1002,7 @@ fn start_single_play_result(bridge: &BridgeServer, mode: &str) -> Result<Value> 
                     "mode": plugin_mode,
                     "launchNonce": launch.nonce,
                     "editRuntimeId": launch.edit_runtime_id,
+                    "editPid": bridge.studio_pid_for_runtime(BridgeTarget::Edit, &launch.edit_runtime_id).ok(),
                     "deviceSimulation": device_simulation,
                     "clients": clients,
                 }));
@@ -1105,6 +1106,8 @@ fn start_multiplayer_test_result(bridge: &BridgeServer, players: u32) -> Result<
                     "action": "start",
                     "mode": "multi",
                     "players": players,
+                    "editRuntimeId": launch.edit_runtime_id,
+                    "editPid": bridge.studio_pid_for_runtime(BridgeTarget::Edit, &launch.edit_runtime_id).ok(),
                     "deviceSimulation": device_simulation,
                     "clients": clients,
                 }));
