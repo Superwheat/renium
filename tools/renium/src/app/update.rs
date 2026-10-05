@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::{Cursor, Write};
+use std::io::{Cursor, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +26,7 @@ const UPDATE_PUBLIC_KEY: &str = "rgtfzbsFaGc3ZiDXdBcZ4KMLhaKcuv1BSD7b8D1lt7I=";
 const SHARED_CORE_LAUNCHERS: [&str; 2] = ["rbx", "rbx.cmd"];
 const AGENT_INSTRUCTIONS_FILE: &str = "renium-agents.md";
 const AGENT_GUIDES_DIRECTORY: &str = "renium-guides";
+const UPDATE_NOTICE_INTERVAL_MS: u128 = 60 * 60 * 1000;
 static UPDATE_NOTICE_PRINTED: AtomicBool = AtomicBool::new(false);
 
 #[path = "update/check.rs"]
@@ -864,20 +865,30 @@ pub(crate) fn available_release_version() -> Result<Option<String>> {
     Ok((parsed > current).then_some(latest))
 }
 
+fn newer_than_running(version: &str) -> bool {
+    matches!(
+        (Version::parse(crate::app::build::VERSION), Version::parse(version)),
+        (Ok(current), Ok(latest)) if latest > current
+    )
+}
+
 pub(crate) fn check_agent_update() {
     let (manifest, fresh) = check::cached_manifest_status();
     if let Some(manifest) = manifest
-        && let (Ok(current), Ok(latest)) = (
-            Version::parse(crate::app::build::VERSION),
-            Version::parse(&manifest.payload.version),
-        )
-        && latest > current
+        && newer_than_running(&manifest.payload.version)
     {
         report_update_notice(&manifest.payload.version);
     }
     if !fresh {
         spawn_agent_update_check();
     }
+}
+
+pub(crate) fn cached_available_update() -> Option<String> {
+    check::cached_manifest_status()
+        .0
+        .map(|manifest| manifest.payload.version)
+        .filter(|version| newer_than_running(version))
 }
 
 fn spawn_agent_update_check() {
@@ -904,9 +915,26 @@ fn spawn_agent_update_check() {
 }
 
 pub(crate) fn report_update_notice(version: &str) {
-    if !UPDATE_NOTICE_PRINTED.swap(true, Ordering::Relaxed) {
-        eprintln!("[renium] update available: {version}; run `rbx upd`");
+    if UPDATE_NOTICE_PRINTED.swap(true, Ordering::Relaxed) || !std::io::stderr().is_terminal() {
+        return;
     }
+    let Ok(root) = user_data_dir() else {
+        return;
+    };
+    let stamp = root.join("update-notice.stamp");
+    let now = current_millis();
+    let last = fs::read_to_string(&stamp)
+        .ok()
+        .and_then(|text| text.trim().parse::<u128>().ok());
+    if !update_notice_due(last, now) {
+        return;
+    }
+    let _ = fs::create_dir_all(&root).and_then(|()| fs::write(&stamp, now.to_string()));
+    eprintln!("[renium] update available: {version}; run `rbx upd`");
+}
+
+fn update_notice_due(last: Option<u128>, now: u128) -> bool {
+    last.is_none_or(|last| now < last || now - last >= UPDATE_NOTICE_INTERVAL_MS)
 }
 
 fn verify_manifest(manifest: &SignedUpdateManifest) -> Result<()> {
@@ -3264,6 +3292,21 @@ fn group_editor_installs_by_platform(
 #[cfg(test)]
 mod result_tests {
     use super::*;
+
+    #[test]
+    fn update_notice_prints_at_most_once_an_hour() {
+        assert!(update_notice_due(None, 5));
+        assert!(!update_notice_due(Some(1_000), 1_000));
+        assert!(!update_notice_due(
+            Some(1_000),
+            1_000 + UPDATE_NOTICE_INTERVAL_MS - 1
+        ));
+        assert!(update_notice_due(
+            Some(1_000),
+            1_000 + UPDATE_NOTICE_INTERVAL_MS
+        ));
+        assert!(update_notice_due(Some(10_000), 9_999));
+    }
 
     #[cfg(windows)]
     #[test]

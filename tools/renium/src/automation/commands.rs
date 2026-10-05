@@ -137,8 +137,18 @@ pub(super) fn run_daemon(
 }
 
 pub(crate) fn studio_status(args: StudioStatusArgs, project: Option<&Path>) -> Result<()> {
+    let mut result = studio_status_result(&args, project)?;
+    if let Some(map) = result.as_object_mut()
+        && let Some(version) = app::update::cached_available_update()
+    {
+        map.insert("updateAvailable".to_string(), json!(version));
+    }
+    app::output::print_json_output(&result, false)
+}
+
+fn studio_status_result(args: &StudioStatusArgs, project: Option<&Path>) -> Result<Value> {
     if args.all {
-        return run_daemon(op::STUDIOS, None, json!({}), false, Some(&args.bridge));
+        return daemon_result(op::STUDIOS, None, json!({}), false, Some(&args.bridge));
     }
     match daemon_result(
         op::STUDIO_STATUS,
@@ -172,14 +182,14 @@ pub(crate) fn studio_status(args: StudioStatusArgs, project: Option<&Path>) -> R
                 }
             }
             app::output::strip_empty(&mut result);
-            app::output::print_json_output(&result, false)
+            Ok(result)
         }
         Err(error)
             if error
                 .to_string()
                 .contains("More than one Studio runtime matches this project") =>
         {
-            run_daemon(op::STUDIOS, None, json!({}), false, Some(&args.bridge))
+            daemon_result(op::STUDIOS, None, json!({}), false, Some(&args.bridge))
         }
         Err(error) => Err(error),
     }

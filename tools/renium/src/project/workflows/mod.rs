@@ -501,6 +501,12 @@ pub fn run_doctor(args: DoctorArgs, global_project: Option<&Path>) -> Result<()>
                 }
                 lines
             })
+            .chain(result["updateAvailable"].as_str().map(|version| {
+                format!(
+                    "{:<10} {:<18} {version} is available; run `rbx upd`",
+                    "info", "update"
+                )
+            }))
             .collect::<Vec<_>>()
             .join("\n");
         crate::emit_global_output(&result, &text)?;
@@ -651,13 +657,16 @@ pub(crate) fn doctor_result(
             .unwrap_or_default();
         checks.push(rbx_launcher_check(&stale_rbx_copies(directories, &current)));
     }
-    let result = json!({
+    let mut result = json!({
         "ok": checks.iter().all(|check| check.status != "error"),
         "version": crate::app::build::VERSION,
         "gitHash": crate::app::build::GIT_HASH,
         "root": root,
         "checks": checks,
     });
+    if let Some(version) = crate::app::update::cached_available_update() {
+        result["updateAvailable"] = json!(version);
+    }
     Ok((result, bundle_project))
 }
 
