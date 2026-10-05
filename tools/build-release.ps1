@@ -450,15 +450,17 @@ $releaseSupportFiles = @(
 $releaseSupportFiles += Get-ChildItem -LiteralPath $releaseAgentGuides -File | ForEach-Object FullName
 if ($env:OS -eq "Windows_NT") {
     $releaseRbx = Join-Path $releaseDirectory "rbx.cmd"
+    $releaseShellRbx = Join-Path $releaseDirectory "rbx"
     $releaseInstaller = Join-Path $releaseDirectory "install.ps1"
     $releaseInstallerLauncher = Join-Path $releaseDirectory "Install Renium.cmd"
     Copy-Item -LiteralPath (Join-Path $repositoryRoot "rbx.cmd") -Destination $releaseRbx
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot "rbx") -Destination $releaseShellRbx
     Copy-Item -LiteralPath (Join-Path $repositoryRoot "install.ps1") -Destination $releaseInstaller
     & (Join-Path $repositoryRoot "tools\build-windows-launcher.ps1") `
         -InstallerScript $releaseInstaller `
         -Version $cliVersion `
         -OutputPath $releaseInstallerLauncher
-    $releaseSupportFiles += @($releaseRbx, $releaseInstaller, $releaseInstallerLauncher)
+    $releaseSupportFiles += @($releaseRbx, $releaseShellRbx, $releaseInstaller, $releaseInstallerLauncher)
 }
 else {
     $releaseRbx = Join-Path $releaseDirectory "rbx"

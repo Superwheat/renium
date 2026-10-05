@@ -2115,9 +2115,11 @@ fn install_windows_rbx_aliases(target_root: &Path) -> Result<()> {
             fs::remove_file(stale)?;
         }
     }
-    let launcher = target_root.join("rbx.cmd");
-    if launcher.is_file() {
-        fs::copy(launcher, stable_root.join("rbx.cmd"))?;
+    for launcher in SHARED_CORE_LAUNCHERS {
+        let source = target_root.join(launcher);
+        if source.is_file() {
+            fs::copy(source, stable_root.join(launcher))?;
+        }
     }
     let agent_instructions = target_root.join(AGENT_INSTRUCTIONS_FILE);
     if agent_instructions.is_file() {

@@ -15,7 +15,7 @@ CLI=""
 if [ -n "${RENIUM_CLI:-}" ] && [ -f "$RENIUM_CLI" ] && [ -x "$RENIUM_CLI" ]; then
   CLI=$RENIUM_CLI
 fi
-for candidate in "$script_dir/renium" "$script_dir/bin/renium" "${XDG_DATA_HOME:-$HOME/.local/share}/renium/renium" "$script_dir/tools/renium/target/release/renium"; do
+for candidate in "$script_dir/renium" "$script_dir/renium.exe" "$script_dir/bin/renium" "$script_dir/bin/renium.exe" "${XDG_DATA_HOME:-$HOME/.local/share}/renium/renium" ${LOCALAPPDATA:+"$LOCALAPPDATA/Renium/bin/renium.exe"} "$script_dir/tools/renium/target/release/renium" "$script_dir/tools/renium/target/release/renium.exe"; do
   if [ -z "$CLI" ] && [ -f "$candidate" ] && [ -x "$candidate" ]; then
     CLI=$candidate
   fi

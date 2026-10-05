@@ -643,6 +643,14 @@ pub(crate) fn doctor_result(
         detail: format!("{live_count} running, {} discovery file(s)", daemons.len()),
         action: (live_count == 0).then(|| "Run `rbx bd` or start Renium in VS Code".to_string()),
     });
+    if cfg!(windows)
+        && let Ok(current) = crate::system::files::resolved_current_executable()
+    {
+        let directories = env::var_os("PATH")
+            .map(|path| env::split_paths(&path).collect::<Vec<_>>())
+            .unwrap_or_default();
+        checks.push(rbx_launcher_check(&stale_rbx_copies(directories, &current)));
+    }
     let result = json!({
         "ok": checks.iter().all(|check| check.status != "error"),
         "version": crate::app::build::VERSION,
@@ -651,6 +659,56 @@ pub(crate) fn doctor_result(
         "checks": checks,
     });
     Ok((result, bundle_project))
+}
+
+fn rbx_launcher_check(stale: &[PathBuf]) -> DoctorCheck {
+    if stale.is_empty() {
+        return DoctorCheck {
+            name: "rbxLauncher".to_string(),
+            status: "ok",
+            detail: "No stale rbx.exe on PATH".to_string(),
+            action: None,
+        };
+    }
+    DoctorCheck {
+        name: "rbxLauncher".to_string(),
+        status: "warn",
+        detail: format!(
+            "rbx.exe on PATH runs a different Renium build than this one: {}",
+            stale
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        action: Some(
+            "Delete the stale copies, then run `renium upd` or the installer to recreate rbx.exe"
+                .to_string(),
+        ),
+    }
+}
+
+fn stale_rbx_copies(directories: Vec<PathBuf>, current: &Path) -> Vec<PathBuf> {
+    let mut seen = BTreeSet::new();
+    let mut current_bytes = None;
+    directories
+        .into_iter()
+        .map(|directory| directory.join("rbx.exe"))
+        .filter(|candidate| {
+            candidate.is_file()
+                && seen.insert(fs::canonicalize(candidate).unwrap_or_else(|_| candidate.clone()))
+                && !same_file::is_same_file(candidate, current).unwrap_or(false)
+        })
+        .filter(|candidate| {
+            fs::read(candidate).is_ok_and(|bytes| {
+                memchr::memmem::find(&bytes, b"RENIUM_AGENT_CLI").is_some()
+                    && current_bytes
+                        .get_or_insert_with(|| fs::read(current).ok())
+                        .as_deref()
+                        != Some(bytes.as_slice())
+            })
+        })
+        .collect()
 }
 
 fn project_marker_exists_from(start: &Path) -> bool {
@@ -2083,6 +2141,30 @@ fn replace_file(source: &Path, target: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::tests::support::temp_dir;
+
+    #[test]
+    fn doctor_flags_only_rbx_copies_of_a_different_renium_build() {
+        let root = temp_dir("rbx-launchers");
+        let current = root.join("install/renium.exe");
+        let build = b"renium RENIUM_AGENT_CLI build 2".to_vec();
+        let directories =
+            ["install", "linked", "same", "old", "other", "empty"].map(|name| root.join(name));
+        for directory in &directories {
+            fs::create_dir_all(directory).unwrap();
+        }
+        fs::write(&current, &build).unwrap();
+        fs::hard_link(&current, root.join("linked/rbx.exe")).unwrap();
+        fs::write(root.join("same/rbx.exe"), &build).unwrap();
+        fs::write(root.join("old/rbx.exe"), b"renium RENIUM_AGENT_CLI build 1").unwrap();
+        fs::write(root.join("other/rbx.exe"), b"an unrelated rbx tool").unwrap();
+        let mut search = directories.to_vec();
+        search.push(root.join("old"));
+        let stale = stale_rbx_copies(search, &current);
+        assert_eq!(stale, [root.join("old/rbx.exe")]);
+        assert_eq!(rbx_launcher_check(&stale).status, "warn");
+        assert_eq!(rbx_launcher_check(&[]).status, "ok");
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn studio_discovery_includes_newer_system_installations() {
