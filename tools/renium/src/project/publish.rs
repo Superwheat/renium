@@ -331,7 +331,7 @@ fn publish_as(args: &PublishArgs, project: Option<&Path>) -> Result<Value> {
             .map_err(cloud::command::cloud_error)?;
     }
     let preflight = studio_preflight(args, project)?;
-    let previous_version = cloud::place_history(identity, key_env, target)
+    let previous_version = cloud::place_history_page(identity, key_env, target)
         .and_then(|history| cloud::place_versions(&history).first().map(|entry| entry.0));
     let file = std::env::temp_dir().join(format!(
         "renium-publish-as-{}-{}.rbxl",
@@ -802,7 +802,7 @@ fn upload(
         }
         let report = busy_upload_report(
             cloud::team_create_members(identity, key_env, place_id).as_ref(),
-            cloud::place_history(identity, key_env, place_id).as_ref(),
+            cloud::place_history_page(identity, key_env, place_id).as_ref(),
         );
         busy_upload_error(&error.to_string(), &detail["body"], report)
     })
