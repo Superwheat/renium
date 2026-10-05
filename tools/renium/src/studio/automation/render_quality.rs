@@ -148,6 +148,7 @@ pub(crate) fn command(args: RenderQualityArgs) -> Result<()> {
 
 // RenderSettings belong to a Studio process. A process that hosts several
 // play clients cannot carry a per-client value.
+#[cfg(any(windows, target_os = "macos", test))]
 fn verify_process_scope(clients: &[Value], runtime: &str, pid: u32) -> Result<()> {
     let shared = clients.iter().any(|entry| {
         entry["pid"].as_u64() == Some(u64::from(pid))
