@@ -29,7 +29,7 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ),
     (
         "ck",
-        "Examples:\n  rbx ck src/ServerScriptService/Main.server.luau src/ReplicatedStorage/Config.luau\n  Get-Content -Raw script.luau | rbx ck -",
+        "Examples:\n  rbx ck\n  rbx ck src/ServerScriptService\n  rbx ck src/ServerScriptService/Main.server.luau src/ReplicatedStorage/Config.luau\n  Get-Content -Raw script.luau | rbx ck -",
     ),
     ("fmt", "Examples:\n  rbx fmt ."),
     ("pv", "Examples:\n  rbx pv"),

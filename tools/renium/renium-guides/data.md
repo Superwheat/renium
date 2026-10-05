@@ -53,7 +53,7 @@ Without an ID, use `pathSegments` and `pathOrdinals`.
 Edit existing script files directly; no follow-up `bss` is needed.
 For a new script, create its entry with `ba`, then edit the file. `bss --str` or `--source-file` writes source through the store.
 
-Check changed scripts together with `rbx ck src/ReplicatedStorage/Config.luau src/ServerScriptService/Main.server.luau`. It parses Luau offline without executing it; use `rbx ck -` for UTF-8 source on stdin. Errors include the file and syntax location, and return a failing exit code. This is not type checking, lint, or a behavior test.
+Check changed scripts together with `rbx ck`, which takes the `.luau`/`.lua` files git reports as changed in the project; name files or folders (`rbx ck src/ServerScriptService`) otherwise. It parses Luau offline without executing it; use `rbx ck -` for UTF-8 source on stdin. Errors include the file and syntax location, and return a failing exit code. This is not type checking, lint, or a behavior test.
 
 `changedPaths` lists actual file changes; empty means no-op. Live Sync sends them automatically.
 Without Live Sync, push returned paths with their settings IDs, not an entire service.
