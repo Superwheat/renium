@@ -441,5 +441,10 @@ fn virtual_input_result(parameters: &Value, bridge: &BridgeServer) -> Result<Val
         "inputMethod": "virtual",
     });
     note_system_ui(&mut result, &response);
+    for key in ["heldKeys", "keysObserved", "verifiedClicks"] {
+        if let Some(value) = response.get(key).filter(|value| !value.is_null()) {
+            result[key] = value.clone();
+        }
+    }
     Ok(result)
 }

@@ -1241,7 +1241,13 @@ fn automation_dispatch_operation(
                 } else {
                     BridgeTarget::main_or_client(parsed.client)
                 };
-                bridge.wait_for_target(bridge_wait_seconds, target)?;
+                let waited = bridge.wait_for_target(bridge_wait_seconds, target);
+                if parsed.server && waited.is_err() {
+                    bail!(
+                        "No play server is connected: Play is stopped or still starting. Start it with rbx play -s, or drop --server to run in the Edit window"
+                    );
+                }
+                waited?;
             }
             execute_luau_result(parsed, bridge)
         }

@@ -277,10 +277,24 @@ pub(crate) fn ensure_luau_api_ok(result: &Value) -> Result<()> {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        if captured.is_empty() {
-            bail!("{message}");
+        let console = result
+            .get("consoleErrors")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut text = message.to_string();
+        if !captured.is_empty() {
+            text.push_str("\nCommand output:\n");
+            text.push_str(&captured);
         }
-        bail!("{message}\nCommand output:\n{captured}");
+        if !console.is_empty() {
+            text.push_str("\nStudio logged during the run:\n");
+            text.push_str(&console);
+        }
+        bail!("{text}");
     }
     Ok(())
 }

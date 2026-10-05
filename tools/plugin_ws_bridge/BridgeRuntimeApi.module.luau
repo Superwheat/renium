@@ -1548,7 +1548,7 @@ end
 			return { ok = false, error = "PlayerScripts is not available" }
 		end
 		local probe = playerScripts:FindFirstChild(MOUSE_PROBE_NAME)
-		if probe and probe:GetAttribute("ProbeVersion") ~= 3 then
+		if probe and probe:GetAttribute("ProbeVersion") ~= 4 then
 			probe:Destroy()
 			probe = nil
 		end
@@ -1560,11 +1560,17 @@ end
 				[==[
 local probe = script
 local UserInputService = game:GetService("UserInputService")
-probe:SetAttribute("ProbeVersion", 3)
+probe:SetAttribute("ProbeVersion", 4)
 local function updateMouse()
 	local location = UserInputService:GetMouseLocation()
 	probe:SetAttribute("MouseX", location.X)
 	probe:SetAttribute("MouseY", location.Y)
+	local held = {}
+	for _, input in UserInputService:GetKeysPressed() do
+		held[#held + 1] = input.KeyCode.Name
+	end
+	table.sort(held)
+	probe:SetAttribute("HeldKeys", table.concat(held, ","))
 	probe:SetAttribute("ResponseSeq", probe:GetAttribute("RequestSeq") or 0)
 end
 probe:GetAttributeChangedSignal("RequestSeq"):Connect(updateMouse)
@@ -1595,6 +1601,7 @@ updateMouse()
 			ok = true,
 			x = x,
 			y = y,
+			heldKeys = tostring(probe:GetAttribute("HeldKeys") or ""),
 			viewportWidth = viewport.X,
 			viewportHeight = viewport.Y,
 		}
@@ -1759,8 +1766,16 @@ updateMouse()
 			virtualInput:SendKey(down, keyCode, repeated)
 			heldKeys[keyCode] = if down then true else nil
 			RunService.Heartbeat:Wait()
-			local okRead, observed = pcall(UserInputService.IsKeyDown, UserInputService, keyCode)
-			keysObserved[keyCode.Name] = okRead and observed == down
+			local snapshot = api.getMouseLocation({})
+			if snapshot.ok == true then
+				local pressed = false
+				for name in string.gmatch(snapshot.heldKeys, "[^,]+") do
+					if name == keyCode.Name then
+						pressed = true
+					end
+				end
+				keysObserved[keyCode.Name] = pressed == down
+			end
 		end
 		local function sendMouseButton(position, button, down, repeatCount)
 			sendPointer(position, function()
