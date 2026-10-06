@@ -817,9 +817,9 @@ mod tests {
     fn votes_come_from_the_matching_game_only() {
         let page = json!({ "data": [
             { "id": 1, "upVotes": 10, "downVotes": 2 },
-            { "id": 8420907710, "upVotes": 51234, "downVotes": 3210 },
+            { "id": 8420907710_i64, "upVotes": 51234, "downVotes": 3210 },
         ]});
-        let votes = votes_from(&page, 8420907710);
+        let votes = votes_from(&page, 8420907710_i64);
         assert_eq!(votes["upVotes"], 51234);
         assert_eq!(votes["downVotes"], 3210);
         assert!(votes_from(&page, 5).is_empty());
