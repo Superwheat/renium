@@ -120,7 +120,7 @@ fn report_live(
     version: u64,
     wait_seconds: f64,
 ) {
-    let started = Instant::now();
+    let started = std::time::Instant::now();
     let mut status = None;
     loop {
         status = cloud::place_history_page(identity, key_env, place_id)
