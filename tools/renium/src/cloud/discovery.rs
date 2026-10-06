@@ -415,18 +415,37 @@ pub(crate) fn live_counts(universe_id: i64) -> Option<Map<String, Value>> {
         "cloud universe",
     )
     .ok()?;
-    let counts = counts_from(&page, universe_id);
+    let mut counts = counts_from(&page, universe_id);
+    if let Ok(votes) = fetch_public_json(
+        &format!("{GAMES_HOST}/v1/games/votes?universeIds={universe_id}"),
+        "cloud universe",
+    ) {
+        counts.extend(votes_from(&votes, universe_id));
+    }
     (!counts.is_empty()).then_some(counts)
 }
 
-fn counts_from(page: &Value, universe_id: i64) -> Map<String, Value> {
-    let game = page
-        .get("data")
+fn game_entry_for(page: &Value, universe_id: i64) -> Option<&Value> {
+    page.get("data")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .find(|game| game.get("id").and_then(Value::as_i64) == Some(universe_id));
+        .find(|game| game.get("id").and_then(Value::as_i64) == Some(universe_id))
+}
+
+fn counts_from(page: &Value, universe_id: i64) -> Map<String, Value> {
+    let game = game_entry_for(page, universe_id);
     ["playing", "visits"]
+        .into_iter()
+        .filter_map(|name| Some((name.to_string(), game?.get(name)?.clone())))
+        .collect()
+}
+
+/// Thumbs up and down from the public votes endpoint: the only player
+/// feedback Roblox exposes outside the Creator Hub.
+fn votes_from(page: &Value, universe_id: i64) -> Map<String, Value> {
+    let game = game_entry_for(page, universe_id);
+    ["upVotes", "downVotes"]
         .into_iter()
         .filter_map(|name| Some((name.to_string(), game?.get(name)?.clone())))
         .collect()
@@ -793,6 +812,18 @@ fn import_into(root: &Path, place: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn votes_come_from_the_matching_game_only() {
+        let page = json!({ "data": [
+            { "id": 1, "upVotes": 10, "downVotes": 2 },
+            { "id": 8420907710, "upVotes": 51234, "downVotes": 3210 },
+        ]});
+        let votes = votes_from(&page, 8420907710);
+        assert_eq!(votes["upVotes"], 51234);
+        assert_eq!(votes["downVotes"], 3210);
+        assert!(votes_from(&page, 5).is_empty());
+    }
 
     #[test]
     fn publish_status_is_read_for_the_requested_version() {
