@@ -189,6 +189,18 @@ pub(super) struct AppliedReadback {
     pub(super) priority: Option<Priority>,
     pub(super) assigned_processes: u32,
     pub(super) neutral: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) skipped_processes: Vec<SkippedProcess>,
+}
+
+/// A Studio child that could not join the performance job, such as a
+/// sandboxed WebView2 renderer that refuses job assignment; the rest of the
+/// tree is constrained without it.
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct SkippedProcess {
+    pub(super) pid: u32,
+    pub(super) error: String,
 }
 
 #[derive(Clone, Copy)]
@@ -935,6 +947,12 @@ impl Manager {
                     status.insert(
                         "processes".to_string(),
                         json!(entry.readback.assigned_processes),
+                    );
+                }
+                if !entry.readback.skipped_processes.is_empty() {
+                    status.insert(
+                        "skippedProcesses".to_string(),
+                        json!(entry.readback.skipped_processes),
                     );
                 }
                 if !entry.readback.neutral {

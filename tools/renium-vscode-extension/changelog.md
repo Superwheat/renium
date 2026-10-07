@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Bug fixes
+
+- `rbx pf use` and `rbx pf adv` no longer fail when one of Studio's child processes refuses to join the performance job. Studio's WebView2 renderers are sandboxed and answer `AssignProcessToJobObject` with access denied, which aborted the whole profile ("Could not assign process N to performance job (Windows error 5)") whenever a WebView2 panel was open. Such children are skipped and listed as `skippedProcesses` in `rbx pf show`; the Studio process and every child that accepts the job are constrained as before.
+
 ### Improvements
 
 - `rbx oc universe` adds the experience's `upVotes` and `downVotes` from the public votes endpoint next to `playing` and `visits`.

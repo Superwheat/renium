@@ -43,6 +43,7 @@ use windows_sys::Win32::System::Threading::{
 
 use super::{
     AppliedReadback, BenchmarkSample, CommitInfo, ControlPlan, OriginalControls, Priority,
+    SkippedProcess,
 };
 
 const PROCESS_JOB_RIGHTS: u32 =
@@ -331,31 +332,45 @@ fn apply_to_job(
     memory_cap: Option<u64>,
 ) -> Result<AppliedReadback> {
     let tree = process_tree(pid)?;
+    let mut skipped = Vec::new();
     let mut process_handles = Vec::with_capacity(tree.len());
     for member in tree {
         let process = match open_process(member, PROCESS_JOB_RIGHTS) {
             Ok(process) => process,
             Err(_) if member != pid && process_identity(member).is_none() => continue,
+            Err(error) if member != pid => {
+                skipped.push(SkippedProcess {
+                    pid: member,
+                    error: format!("{error:#}"),
+                });
+                continue;
+            }
             Err(error) => return Err(error),
         };
-        ensure_job_queryable(&process, job)?;
+        if let Err(error) = ensure_job_queryable(&process, job) {
+            if member == pid {
+                return Err(error);
+            }
+            skipped.push(SkippedProcess {
+                pid: member,
+                error: format!("{error:#}"),
+            });
+            continue;
+        }
         process_handles.push((member, process));
     }
     for (member, process) in &process_handles {
-        let mut already = 0;
-        // SAFETY: process and job are valid handles and already points to writable BOOL storage.
-        if unsafe { IsProcessInJob(process.0, job.0, &mut already) } == 0 {
-            return Err(last_error("IsProcessInJob failed"));
-        }
-        if already == 0 {
-            // SAFETY: both handles are valid and opened with the rights required by the API.
-            if unsafe { AssignProcessToJobObject(job.0, process.0) } == 0 {
-                if *member != pid && process_identity(*member).is_none() {
-                    continue;
-                }
-                return Err(last_error(&format!(
-                    "Could not assign process {member} to performance job"
+        if let Err(error) = assign_to_job(job, process) {
+            if *member == pid {
+                return Err(error.context(format!(
+                    "Could not assign Studio process {member} to performance job"
                 )));
+            }
+            if process_identity(*member).is_some() {
+                skipped.push(SkippedProcess {
+                    pid: *member,
+                    error: format!("{error:#}"),
+                });
             }
         }
     }
@@ -372,21 +387,14 @@ fn apply_to_job(
             Err(_) if process_identity(member).is_none() => continue,
             Err(error) => return Err(error),
         };
-        ensure_job_queryable(&process, job)?;
-        let mut already = 0;
-        // SAFETY: process and job are valid handles and already is writable BOOL storage.
-        if unsafe { IsProcessInJob(process.0, job.0, &mut already) } == 0 {
-            return Err(last_error("IsProcessInJob failed after Studio tree rescan"));
-        }
-        if already == 0 {
-            // SAFETY: both handles are valid and opened with the rights required by the API.
-            if unsafe { AssignProcessToJobObject(job.0, process.0) } == 0
-                && process_identity(member).is_some()
-            {
-                return Err(last_error(&format!(
-                    "Could not assign newly created process {member} to performance job"
-                )));
-            }
+        if let Err(error) =
+            ensure_job_queryable(&process, job).and_then(|()| assign_to_job(job, &process))
+            && process_identity(member).is_some()
+        {
+            skipped.push(SkippedProcess {
+                pid: member,
+                error: format!("{error:#}"),
+            });
         }
     }
     apply_job_controls(job, plan, memory_cap)?;
@@ -399,7 +407,26 @@ fn apply_to_job(
         let _ = neutralize_job(job);
         bail!("Studio PID {pid} was replaced during profile application");
     }
+    readback.skipped_processes = skipped;
     Ok(readback)
+}
+
+// A process already in the job stays; one that refuses assignment (a
+// sandboxed child answers ERROR_ACCESS_DENIED) is reported to the caller.
+fn assign_to_job(job: &OwnedHandle, process: &OwnedHandle) -> Result<()> {
+    let mut already = 0;
+    // SAFETY: process and job are valid handles and already points to writable BOOL storage.
+    if unsafe { IsProcessInJob(process.0, job.0, &mut already) } == 0 {
+        return Err(last_error("IsProcessInJob failed"));
+    }
+    if already != 0 {
+        return Ok(());
+    }
+    // SAFETY: both handles are valid and opened with the rights required by the API.
+    if unsafe { AssignProcessToJobObject(job.0, process.0) } == 0 {
+        return Err(last_error("AssignProcessToJobObject refused the process"));
+    }
+    Ok(())
 }
 
 pub(super) fn neutralize(
@@ -718,6 +745,7 @@ fn query_job(job: &OwnedHandle) -> Result<AppliedReadback> {
             .then_some(limits.JobMemoryLimit as u64),
         priority: None,
         assigned_processes: accounting.ActiveProcesses,
+        skipped_processes: Vec::new(),
         neutral: !cpu_enabled && flags == 0,
     })
 }
