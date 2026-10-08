@@ -74,6 +74,12 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::Update(args) => update::run_update(args),
         Commands::OpenCloud(args) => crate::cloud::command::run(args, project),
         Commands::UpdateHelper(args) => update::run_update_helper(args),
+        #[cfg(any(windows, target_os = "macos"))]
+        Commands::NativePackage(args) => {
+            crate::studio::native::serializer::native_package_command(args)
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        Commands::NativePackage(_) => anyhow::bail!("native package actions need Windows or macOS"),
         Commands::ImportPath(args) => import_path_command(args, project),
         Commands::ImportPlace(args) => crate::snapshot::place_import::import_place_file(args),
         Commands::Create(args) => create_instance_command(args, project),

@@ -109,7 +109,7 @@ fn voxel_playback(code: &[u8], address: usize) -> bool {
         })
 }
 
-fn function<'a>(image: &PeImage<'a>, address: usize) -> Option<&'a [u8]> {
+pub(super) fn function<'a>(image: &PeImage<'a>, address: usize) -> Option<&'a [u8]> {
     image.require_executable_rva(address).ok()?;
     let offset = image.rva_to_offset(address).ok()?;
     let (start, end) = image.function_bounds(offset).ok()?;

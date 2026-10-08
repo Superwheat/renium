@@ -89,6 +89,64 @@ pub(crate) fn trigger_studio_action(
     platform_trigger_studio_action(pid, studio_title, action)
 }
 
+/// Hidden diagnostic: runs one package action against a Studio process from
+/// this CLI process, without the daemon, naming the step that failed.
+pub(crate) fn native_package_command(args: crate::cli::NativePackageArgs) -> anyhow::Result<()> {
+    if args.action == "history-register" {
+        let title = target_name(args.pid, "")?;
+        let result = register_history_if_available(args.pid, &title, "renium-diagnostic", false);
+        println!(
+            "{}",
+            match result {
+                Ok(hooked) => serde_json::json!({ "ok": true, "hooked": hooked }),
+                Err(error) => serde_json::json!({ "ok": false, "error": format!("{error:#}") }),
+            }
+        );
+        return Ok(());
+    }
+    if args.action == "history" {
+        let title = target_name(args.pid, "")?;
+        match history_diagnostic(args.pid, &title) {
+            Ok(result) => println!("{result}"),
+            Err(error) => println!(
+                "{}",
+                serde_json::json!({ "ok": false, "error": format!("{error:#}") })
+            ),
+        }
+        return Ok(());
+    }
+    let action = match args.action.as_str() {
+        "status" | "desync" => PackageAction::Desync,
+        "restore" => PackageAction::Restore,
+        other => anyhow::bail!("unknown package action {other}"),
+    };
+    let title = target_name(args.pid, "")?;
+    let target = PackageTarget {
+        path_segments: args.path.split('.').map(str::to_owned).collect(),
+        path_ordinals: Vec::new(),
+        expected_version: args.version,
+    };
+    let result = if args.action == "status" {
+        platform_package_status(args.pid, &title, &target)
+    } else {
+        run_package_action(
+            args.pid,
+            &title,
+            &target,
+            action,
+            Duration::from_secs_f64(args.timeout_seconds),
+        )
+    };
+    match result {
+        Ok(result) => println!("{}", serde_json::to_string(&result)?),
+        Err(error) => println!(
+            "{}",
+            serde_json::json!({ "ok": false, "error": format!("{error:#}") })
+        ),
+    }
+    Ok(())
+}
+
 pub(crate) fn run_package_action(
     pid: u32,
     studio_title: &str,
@@ -153,13 +211,26 @@ impl std::error::Error for HistoryHookUnavailable {}
 static HISTORY_HOOK_WARNED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 
 #[cfg(any(windows, target_os = "macos"))]
+/// The newest Studio build on which the history hook is verified. Newer builds
+/// skip the hook, and cancellations restore Terrain explicitly, until it is
+/// verified again: Studio 0.742 exited with heap corruption on the first
+/// recording that passed through the hook verified on 0.741.
+const HISTORY_HOOK_VERIFIED_BUILD: u32 = 741;
+
 pub(crate) fn register_history_if_available(
     pid: u32,
     title: &str,
     token: &str,
     terrain: bool,
 ) -> anyhow::Result<bool> {
-    match register_history(pid, title, token) {
+    let result = match studio_build_number(pid) {
+        Ok(build) if build > HISTORY_HOOK_VERIFIED_BUILD => Err(HistoryHookUnavailable(format!(
+            "Studio 0.{build} is newer than build 0.{HISTORY_HOOK_VERIFIED_BUILD}, the last one the hook is verified on"
+        ))
+        .into()),
+        _ => register_history(pid, title, token),
+    };
+    match result {
         Ok(()) => Ok(true),
         Err(error) => {
             let Some(unavailable) = error.downcast_ref::<HistoryHookUnavailable>() else {

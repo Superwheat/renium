@@ -1260,6 +1260,64 @@ pub(super) fn parent_offset(memory: &ProcessMemory, model: &ActiveDataModel) -> 
     Ok(candidates[0])
 }
 
+/// Hidden diagnostic: dumps the FinishRecording descriptor's pointer slots so
+/// a Studio build that moved the member-function slot can be recognised
+/// without installing the history hook.
+pub(crate) fn history_diagnostic(pid: u32, title: &str) -> Result<serde_json::Value> {
+    let prepared = prepare_property(
+        pid,
+        title,
+        &["ChangeHistoryService".into()],
+        &[],
+        "Name",
+        Duration::from_secs(3),
+    )?;
+    let current_modules = modules(pid)?;
+    let studio = current_modules
+        .iter()
+        .find(|m| m.name.eq_ignore_ascii_case("RobloxStudioBeta.exe"))
+        .context("Missing Studio")?;
+    let layout = package_layout(&studio.path)?;
+    let model = active_data_model(pid, &prepared.memory, studio, layout.data, title)?;
+    let instance = read_u64(&prepared.parameters, 16)? as usize;
+    let descriptor =
+        find_class_member_descriptor(&prepared.memory, instance, model.layout, "FinishRecording")?;
+    let kind = read_rtti_type(&prepared.memory, descriptor, studio.base, studio.size);
+    let bytes = fs::read(&studio.path)?;
+    let image = PeImage::parse(&bytes)?;
+    let fields = prepared.memory.read_vec(descriptor, 512)?;
+    let mut slots = Vec::new();
+    for offset in (0..512).step_by(8) {
+        let value = read_u64(&fields, offset)? as usize;
+        let entry = match value.checked_sub(studio.base) {
+            Some(rva) if rva < studio.size => {
+                let function = history::function(&image, rva).map(|code| code.len());
+                let executable = image.require_executable_rva(rva).is_ok();
+                serde_json::json!({
+                    "offset": offset,
+                    "rva": format!("{rva:#x}"),
+                    "executable": executable,
+                    "functionLength": function,
+                    "nextI32": read_i32(&fields, offset + 8).ok(),
+                })
+            }
+            _ if likely_pointer(value) => serde_json::json!({
+                "offset": offset,
+                "pointer": format!("{value:#x}"),
+                "rtti": read_rtti_type(&prepared.memory, value, studio.base, studio.size),
+            }),
+            _ => continue,
+        };
+        slots.push(entry);
+    }
+    Ok(serde_json::json!({
+        "descriptor": format!("{descriptor:#x}"),
+        "studioBase": format!("{:#x}", studio.base),
+        "kind": kind,
+        "slots": slots,
+    }))
+}
+
 pub(crate) fn prepare_property(
     pid: u32,
     title: &str,

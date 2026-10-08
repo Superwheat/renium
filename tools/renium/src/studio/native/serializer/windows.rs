@@ -1767,8 +1767,41 @@ fn find_class_member_descriptor(
         .context("Class member descriptor was not found")
 }
 
+/// The descriptor slot that holds a property's GetSetImpl binding moved
+/// between Studio builds (0.742 relocated it), so the binding is found by its
+/// RTTI name instead of a fixed offset. A GetImpl binding serves read-only
+/// properties.
+fn property_binding(
+    memory: &ProcessMemory,
+    studio: &ModuleEntry,
+    descriptor: usize,
+) -> Result<usize> {
+    let bytes = memory.read_vec(descriptor, 0x200)?;
+    let mut read_only = None;
+    for offset in (0x40..0x200).step_by(8) {
+        let pointer = read_u64(&bytes, offset)? as usize;
+        if !likely_pointer(pointer) {
+            continue;
+        }
+        let Some(kind) = read_rtti_type(memory, pointer, studio.base, studio.size) else {
+            continue;
+        };
+        if !kind.contains("@?$PropDescriptor@") {
+            continue;
+        }
+        if kind.starts_with(".?AV?$GetSetImpl@") {
+            return Ok(pointer);
+        }
+        if kind.starts_with(".?AV?$GetImpl@") {
+            read_only.get_or_insert(pointer);
+        }
+    }
+    read_only.context("Property descriptor has no recognised binding")
+}
+
 fn property_class_adjustment(
     memory: &ProcessMemory,
+    studio: &ModuleEntry,
     instance: usize,
     layout: InstanceLayout,
     descriptor: usize,
@@ -1787,7 +1820,7 @@ fn property_class_adjustment(
                 find_class_member_descriptor(memory, instance, layout, "VersionNumber").ok()?;
             let declaring_class = memory.read_u64(descriptor + 0x30).ok()?;
             (memory.read_u64(fallback + 0x30).ok()? == declaring_class).then_some(())?;
-            let fallback_binding = memory.read_u64(fallback + 0x90).ok()? as usize;
+            let fallback_binding = property_binding(memory, studio, fallback).ok()?;
             read_adjustment(fallback_binding)
         })
         .with_context(|| format!("Property '{property_name}' cast has an unsupported layout"))?;
@@ -1812,12 +1845,14 @@ struct PackageStatusLayout {
 
 fn integer_property_layout(
     memory: &ProcessMemory,
+    studio: &ModuleEntry,
     instance: usize,
     layout: InstanceLayout,
     property_name: &str,
 ) -> Result<IntegerPropertyLayout> {
     let descriptor = find_class_member_descriptor(memory, instance, layout, property_name)?;
-    let binding = memory.read_u64(descriptor + 0x90)? as usize;
+    let binding = property_binding(memory, studio, descriptor)
+        .with_context(|| format!("Property '{property_name}' binding"))?;
     let getter = memory.read_u64(binding + 8)? as usize;
     let code = memory.read_vec(getter, 8)?;
     let (getter_offset, width) = if code[..3] == [0x48, 0x8b, 0x81] && code[7] == 0xc3 {
@@ -1841,8 +1876,15 @@ fn integer_property_layout(
     } else {
         bail!("Property '{property_name}' getter has an unsupported layout");
     };
-    let adjustment =
-        property_class_adjustment(memory, instance, layout, descriptor, binding, property_name)?;
+    let adjustment = property_class_adjustment(
+        memory,
+        studio,
+        instance,
+        layout,
+        descriptor,
+        binding,
+        property_name,
+    )?;
     let offset = getter_offset
         .checked_add(adjustment.unsigned_abs() as usize)
         .context("Property field offset overflowed")?;
@@ -1867,13 +1909,14 @@ fn read_integer_property(
 
 fn package_status_layout(
     memory: &ProcessMemory,
+    studio: &ModuleEntry,
     link: usize,
     layout: InstanceLayout,
 ) -> Result<PackageStatusLayout> {
     Ok(PackageStatusLayout {
-        modified: integer_property_layout(memory, link, layout, "ModifiedState")?,
-        has_new_version: integer_property_layout(memory, link, layout, "HasNewVersion")?,
-        version: integer_property_layout(memory, link, layout, "VersionNumber")?,
+        modified: integer_property_layout(memory, studio, link, layout, "ModifiedState")?,
+        has_new_version: integer_property_layout(memory, studio, link, layout, "HasNewVersion")?,
+        version: integer_property_layout(memory, studio, link, layout, "VersionNumber")?,
     })
 }
 
@@ -2128,6 +2171,89 @@ fn package_ui_binding(
     })
 }
 
+/// Roblox Studio's build number (742 for 0.742.x), read from the running
+/// module's version resource.
+pub(crate) fn studio_build_number(pid: u32) -> Result<u32> {
+    let current_modules = modules(pid)?;
+    let studio = current_modules
+        .iter()
+        .find(|module| module.name.eq_ignore_ascii_case("RobloxStudioBeta.exe"))
+        .context("Roblox Studio module was not found")?;
+    file_build_number(&studio.path)
+}
+
+fn file_build_number(path: &Path) -> Result<u32> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileVersionInfoSizeW, GetFileVersionInfoW, VS_FIXEDFILEINFO, VerQueryValueW,
+    };
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut handle = 0u32;
+    let size = unsafe { GetFileVersionInfoSizeW(wide.as_ptr(), &mut handle) };
+    if size == 0 {
+        bail!(
+            "Studio version resource is unavailable: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let mut data = vec![0u8; size as usize];
+    if unsafe { GetFileVersionInfoW(wide.as_ptr(), 0, size, data.as_mut_ptr().cast()) } == 0 {
+        bail!(
+            "Studio version resource could not be read: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let root: Vec<u16> = "\\".encode_utf16().chain(std::iter::once(0)).collect();
+    let mut info: *mut c_void = std::ptr::null_mut();
+    let mut length = 0u32;
+    let found =
+        unsafe { VerQueryValueW(data.as_ptr().cast(), root.as_ptr(), &mut info, &mut length) };
+    if found == 0 || info.is_null() || (length as usize) < size_of::<VS_FIXEDFILEINFO>() {
+        bail!("Studio version resource has no fixed file info");
+    }
+    let fixed = unsafe { std::ptr::read_unaligned(info as *const VS_FIXEDFILEINFO) };
+    Ok(fixed.dwFileVersionMS & 0xffff)
+}
+
+pub(crate) fn history_diagnostic(pid: u32, title: &str) -> Result<serde_json::Value> {
+    properties::history_diagnostic(pid, title)
+}
+
+/// Read-only: resolves a package root and reports its PackageLink status.
+pub(super) fn platform_package_status(
+    pid: u32,
+    studio_title: &str,
+    target: &super::PackageTarget,
+) -> Result<super::PackageActionResult> {
+    let current_modules = modules(pid)?;
+    let studio = current_modules
+        .iter()
+        .find(|module| module.name.eq_ignore_ascii_case("RobloxStudioBeta.exe"))
+        .context("Roblox Studio module was not found")?;
+    let layout = package_layout(&studio.path).context("Studio package layout")?;
+    let memory = ProcessMemory::open(pid)?;
+    verify_loaded_image(&memory, studio, layout.image_stamp).context("Studio image check")?;
+    let data_model = active_data_model(pid, &memory, studio, layout.data, studio_title)
+        .context("Studio DataModel lookup")?;
+    let package =
+        resolve_package_target(&memory, &data_model, target).context("package root lookup")?;
+    let status_layout =
+        package_status_layout(&memory, studio, package.link.instance, data_model.layout)
+            .context("PackageLink status layout")?;
+    let (status, version, _) = package_status(&memory, package.link.instance, status_layout)
+        .context("PackageLink status read")?;
+    Ok(super::PackageActionResult {
+        action: "status",
+        changed: false,
+        path: package.path,
+        status,
+        version,
+    })
+}
+
 pub(super) fn platform_package_action(
     pid: u32,
     studio_title: &str,
@@ -2141,14 +2267,19 @@ pub(super) fn platform_package_action(
         .iter()
         .find(|module| module.name.eq_ignore_ascii_case("RobloxStudioBeta.exe"))
         .context("Roblox Studio module was not found")?;
-    let layout = package_layout(&studio.path)?;
+    let layout = package_layout(&studio.path).context("Studio package layout")?;
     let memory = ProcessMemory::open(pid)?;
-    verify_loaded_image(&memory, studio, layout.image_stamp)?;
-    let data_model = active_data_model(pid, &memory, studio, layout.data, studio_title)?;
-    let package = resolve_package_target(&memory, &data_model, target)?;
-    let status_layout = package_status_layout(&memory, package.link.instance, data_model.layout)?;
+    verify_loaded_image(&memory, studio, layout.image_stamp).context("Studio image check")?;
+    let data_model = active_data_model(pid, &memory, studio, layout.data, studio_title)
+        .context("Studio DataModel lookup")?;
+    let package =
+        resolve_package_target(&memory, &data_model, target).context("package root lookup")?;
+    let status_layout =
+        package_status_layout(&memory, studio, package.link.instance, data_model.layout)
+            .context("PackageLink status layout")?;
     let (initial_status, initial_version, initial_modified) =
-        package_status(&memory, package.link.instance, status_layout)?;
+        package_status(&memory, package.link.instance, status_layout)
+            .context("PackageLink status read")?;
     if initial_version != target.expected_version {
         bail!(
             "Package '{}' changed while Renium was preparing the action; expected version {}, found {}",
@@ -2172,14 +2303,19 @@ pub(super) fn platform_package_action(
                     package.link.instance,
                     data_model.layout,
                     "ModifiedState",
-                )?;
-                let binding = memory.read_u64(descriptor + 0x90)? as usize;
-                let setter = memory.read_u64(binding + 16)? as usize;
+                )
+                .context("ModifiedState descriptor")?;
+                let binding = property_binding(&memory, studio, descriptor)
+                    .context("ModifiedState binding")?;
+                let setter = memory
+                    .read_u64(binding + 16)
+                    .context("ModifiedState setter")? as usize;
                 if !(studio.base..studio.base + studio.size).contains(&setter) {
                     bail!("PackageLink.ModifiedState setter is outside Studio");
                 }
                 let adjustment = property_class_adjustment(
                     &memory,
+                    studio,
                     package.link.instance,
                     data_model.layout,
                     descriptor,
@@ -2296,8 +2432,12 @@ pub(super) fn platform_package_action(
                 )?;
                 loop {
                     if let Ok(updated) = resolve_package_target(&memory, &data_model, target)
-                        && let Ok(updated_layout) =
-                            package_status_layout(&memory, updated.link.instance, data_model.layout)
+                        && let Ok(updated_layout) = package_status_layout(
+                            &memory,
+                            studio,
+                            updated.link.instance,
+                            data_model.layout,
+                        )
                         && let Ok((status, version, modified)) =
                             package_status(&memory, updated.link.instance, updated_layout)
                         && modified == PACKAGE_UNMODIFIED_STATE
@@ -2324,7 +2464,12 @@ pub(super) fn platform_package_action(
         package
     };
     let current_status_layout = if matches!(action, super::PackageAction::Update) {
-        package_status_layout(&memory, current_package.link.instance, data_model.layout)?
+        package_status_layout(
+            &memory,
+            studio,
+            current_package.link.instance,
+            data_model.layout,
+        )?
     } else {
         status_layout
     };

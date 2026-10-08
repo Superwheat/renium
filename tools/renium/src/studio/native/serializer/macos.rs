@@ -1149,6 +1149,29 @@ pub(super) fn platform_trigger_studio_action(
     anyhow::bail!("Triggering the Studio action {action} natively is only supported on Windows")
 }
 
+/// Roblox Studio's build number (742 for 0.742.x) from the running bundle.
+pub(crate) fn studio_build_number(pid: u32) -> Result<u32> {
+    let executable = process_executable_path(pid)?;
+    let bundle = executable
+        .ancestors()
+        .find(|path| path.extension().is_some_and(|extension| extension == "app"))
+        .context("Studio bundle was not found for the process")?;
+    let version = studio_bundle_version(bundle)?;
+    u32::try_from(version / 10_000).context("Studio bundle version is out of range")
+}
+
+pub(crate) fn history_diagnostic(_pid: u32, _title: &str) -> Result<serde_json::Value> {
+    anyhow::bail!("history diagnostics are not available on macOS")
+}
+
+pub(super) fn platform_package_status(
+    _pid: u32,
+    _studio_title: &str,
+    _target: &super::PackageTarget,
+) -> Result<super::PackageActionResult> {
+    anyhow::bail!("package status reads are not available on macOS")
+}
+
 pub(super) fn platform_package_action(
     pid: u32,
     studio_title: &str,

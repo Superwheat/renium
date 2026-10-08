@@ -318,6 +318,8 @@ pub(super) enum Commands {
     OpenCloud(crate::cloud::command::OpenCloudArgs),
     #[command(hide = true)]
     UpdateHelper(update::UpdateHelperArgs),
+    #[command(hide = true, name = "native-package")]
+    NativePackage(NativePackageArgs),
     #[command(
         name = "ip",
         alias = "import-path",
@@ -2192,6 +2194,20 @@ pub(super) struct StudioChangeStateArgs {
         value_name = "none|studio|editor"
     )]
     pub(super) initial_conflict_preference: Option<String>,
+}
+
+#[derive(Parser)]
+pub(crate) struct NativePackageArgs {
+    #[arg(long)]
+    pub(crate) pid: u32,
+    #[arg(long, value_name = "Service.Root")]
+    pub(crate) path: String,
+    #[arg(long, value_name = "N")]
+    pub(crate) version: i64,
+    #[arg(long, value_name = "status|desync|restore")]
+    pub(crate) action: String,
+    #[arg(long, default_value_t = 20.0)]
+    pub(crate) timeout_seconds: f64,
 }
 
 #[derive(Parser)]
