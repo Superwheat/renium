@@ -440,7 +440,9 @@ function BridgePluginRuntime.start(context)
 		runtimeId = Config.bridgeRuntimeId, client = Config.bridgeRole == "play-client",
 		edit = Config.bridgeRole == "edit",
 		newId = function() return HttpService:GenerateGUID(false) end,
-		delay = task.delay, cancel = task.cancel,
+		delay = task.delay, cancel = task.cancel, spawn = task.spawn, wait = task.wait,
+		heapProfiler = function() return game:GetService("HeapProfilerService") end,
+		localPlayer = function() return game:GetService("Players").LocalPlayer end,
 	})
 	local microProfiler = requireChildModule("BridgeMicroProfiler").create(function()
 		return game:GetService("MicroProfilerService")
@@ -4331,6 +4333,8 @@ function BridgePluginRuntime.start(context)
 			return microProfiler.read(function()
 				return performance.micro(p)
 			end)
+		elseif p.action == "heap" then
+			return performance.heap(p)
 		end
 		assert(p.action == "snapshot" or p.action == "start" or p.action == "stop" or p.action == "read", "Unknown performance action")
 		return performance[p.action](p)

@@ -24,6 +24,15 @@ The sampler records Heartbeat intervals, available CPU/physics timings, Edit/cli
 
 Engine timings overlap and may retain their last reported value during a stall. Heartbeat gaps measure scheduler stalls, not viewport FPS. Do not add timings or infer a cause from one counter. Captures stop at 120 seconds or 60,000 frames. A new capture replaces the previous completed capture; export it first if needed. Nothing is sampled while inactive.
 
+## Luau heap snapshots
+
+```powershell
+rbx perf heap --server --out reports/server-heap.json
+rbx perf heap --player 1 --out reports/client-heap.json
+```
+
+`heap` asks the play server or a play client for the report behind Studio's Luau Heap tool and saves it as JSON. The result summarises memory categories, object tags, the scripts holding the most, and `unparentedInstanceReferences`: Instances no longer in the DataModel that Luau still references, each with the paths (script, table, key) keeping it alive. That is how a departed Player, a destroyed car or a finished round stays in memory. Snapshot, drive the suspected leak (kick players, run rounds), snapshot again and compare the counts; the file holds the full per-script graph (`Report.Graph`) and every root (`Refs.Roots`). Edit mode has no heap report; the snapshot needs a running Play session.
+
 ## MicroProfiler scopes and spikes
 
 ```powershell

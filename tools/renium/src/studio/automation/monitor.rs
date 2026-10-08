@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Args)]
 pub(crate) struct MonitorArgs {
-    #[arg(default_value = "snapshot", value_parser = ["snapshot", "start", "stop", "read", "export", "micro", "micro-start", "micro-stop", "analyze"])]
+    #[arg(default_value = "snapshot", value_parser = ["snapshot", "start", "stop", "read", "export", "micro", "micro-start", "micro-stop", "heap", "analyze"])]
     action: String,
     #[arg(help = "Saved .gprx capture for offline analyze")]
     file: Option<PathBuf>,
@@ -41,7 +41,10 @@ pub(crate) struct MonitorArgs {
     player: Option<String>,
     #[arg(long, help = "Sample the play server; default is Edit mode")]
     server: bool,
-    #[arg(long, help = "Destination: JSON for export/analyze, .gprx for micro")]
+    #[arg(
+        long,
+        help = "Destination: JSON for export/analyze/heap, .gprx for micro"
+    )]
     out: Option<PathBuf>,
     #[command(flatten)]
     bridge: BridgeConnectionArgs,
@@ -59,17 +62,39 @@ struct Parameters {
     #[serde(default)]
     server: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     output_path: Option<PathBuf>,
 }
+
+/// Studio answers a heap request within HeapProfilerTimeoutSeconds (20 s)
+/// and the plugin gives up at 30 s; the bridge waits a little longer.
+const HEAP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(45);
 
 impl Parameters {
     fn validate(&self) -> Result<()> {
         if !matches!(
             self.action.as_str(),
-            "snapshot" | "start" | "stop" | "read" | "micro" | "micro-start" | "micro-stop"
+            "snapshot"
+                | "start"
+                | "stop"
+                | "read"
+                | "micro"
+                | "micro-start"
+                | "micro-stop"
+                | "heap"
         ) {
             bail!("Unknown performance action");
         }
+        if self.action == "heap" && self.player.is_none() && !self.server {
+            bail!(
+                "Luau heap snapshots come from a running Play session: pass --server or --player"
+            );
+        }
+        ensure!(
+            (self.action == "heap") == self.target.is_some(),
+            "Only heap carries a target"
+        );
         if self.frames.is_some_and(|n| !(1..=256).contains(&n))
             || self.frames.is_some() && self.action != "micro-start"
         {
@@ -105,8 +130,9 @@ impl Parameters {
         }
         if let Some(path) = &self.output_path {
             ensure!(
-                matches!(self.action.as_str(), "micro" | "micro-stop") && path.is_absolute(),
-                "Only MicroProfiler capture accepts an absolute output path"
+                matches!(self.action.as_str(), "micro" | "micro-stop" | "heap")
+                    && path.is_absolute(),
+                "Only MicroProfiler and heap captures accept an absolute output path"
             );
         }
         Ok(())
@@ -153,9 +179,10 @@ pub(crate) fn command(args: MonitorArgs) -> Result<()> {
         bail!("FILE, --frame, --top and analysis filters apply only to analyze");
     }
     let export = args.action == "export";
-    let micro = matches!(args.action.as_str(), "micro" | "micro-stop");
-    if (export || micro) != args.out.is_some() || export && args.page.is_some() {
-        bail!("export/micro require --out; export reads every frame");
+    let heap = args.action == "heap";
+    let saved = heap || matches!(args.action.as_str(), "micro" | "micro-stop");
+    if (export || saved) != args.out.is_some() || export && args.page.is_some() {
+        bail!("export/micro/heap require --out; export reads every frame");
     }
     let mut parameters = Parameters {
         frames: args.frames,
@@ -165,7 +192,8 @@ pub(crate) fn command(args: MonitorArgs) -> Result<()> {
         page: if export { Some(1) } else { args.page },
         player: args.player,
         server: args.server,
-        output_path: if micro {
+        target: heap.then(|| if args.server { "server" } else { "client" }.to_string()),
+        output_path: if saved {
             Some(std::path::absolute(args.out.as_ref().unwrap())?)
         } else {
             None
@@ -182,7 +210,7 @@ pub(crate) fn command(args: MonitorArgs) -> Result<()> {
         )
     };
     let mut result = call(&parameters)?;
-    if micro {
+    if saved {
         return print_json_output(&result, false);
     }
     if let Some(path) = args.out {
@@ -302,8 +330,9 @@ pub(crate) fn result(
     }
     let mut request = serde_json::to_value(&parameters)?;
     request["runtimeId"] = json!(runtime_id);
-    let micro = matches!(parameters.action.as_str(), "micro" | "micro-stop");
-    if micro {
+    let heap = parameters.action == "heap";
+    let micro = heap || matches!(parameters.action.as_str(), "micro" | "micro-stop");
+    if micro && !heap {
         request["chunked"] = json!(true);
     }
     let call = |request| -> Result<Value> {
@@ -313,7 +342,11 @@ pub(crate) fn result(
             target,
             parameters.player.as_deref(),
             Some(&runtime_id),
-            Some(Duration::from_secs(3)),
+            Some(if heap {
+                HEAP_RESPONSE_TIMEOUT
+            } else {
+                Duration::from_secs(3)
+            }),
         )?;
         ensure_plugin_api_ok(&result)?;
         ensure!(
@@ -372,6 +405,7 @@ pub(crate) fn result(
     }
     result["pid"] = json!(bridge.studio_pid_for_runtime(target, &runtime_id)?);
     match output_path {
+        Some(path) if heap => super::heap::save_report(&path, &result),
         Some(path) => super::microprofiler::save_capture(&path, &result),
         None => Ok(result),
     }
@@ -431,6 +465,7 @@ mod tests {
                     seconds,
                     page,
                     player: player.map(str::to_owned),
+                    target: None,
                     server,
                     output_path: None,
                 }

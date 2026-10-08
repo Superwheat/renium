@@ -114,4 +114,34 @@ assert(not pcall(micro.microRead, { captureId = first.captureId, page = 1 }))
 expire()
 assert(not pcall(micro.microRead, { captureId = replacement.captureId, page = 1 }))
 micro.cleanup()
+
+local heapJson = '{"Report":{"Version":1,"Graph":{"Name":"root","Size":1,"TotalSize":2,"Children":[]}},"Refs":{"Version":1,"Roots":[],"UnparentedReferences":[]}}'
+local heapCalls = {}
+local function heapContext(role)
+	return Performance.create({
+		runtimeId = role, newId = function() id += 1 return tostring(id) end,
+		timestamp = function() return "test-time" end,
+		delay = function(_, callback) return callback end,
+		cancel = function() end,
+		encodeBuffer = buffer.tostring,
+		spawn = function(callback) callback() end,
+		wait = function() end,
+		client = role == "client", edit = role == "edit",
+		localPlayer = function() return if role == "client" then { Name = "Player1" } else nil end,
+		heapProfiler = function() return {
+			ServerRequestDataAsync = function() heapCalls[#heapCalls + 1] = "server" return heapJson end,
+			ClientRequestDataAsync = function(_, player) heapCalls[#heapCalls + 1] = "client:" .. player.Name return heapJson end,
+		} end,
+	})
+end
+local serverHeap = heapContext("server").heap({ target = "server" })
+assert(serverHeap.format == "luau-heap-json" and serverHeap.target == "server", "Heap pages carry their format and target")
+assert(serverHeap.data == heapJson and serverHeap.bytes == #heapJson and serverHeap.nextPage == nil, "A small heap report fits one page")
+local clientHeap = heapContext("client").heap({ target = "client" })
+assert(clientHeap.data == heapJson and heapCalls[2] == "client:Player1", "Client snapshots ask for the local player")
+assert(heapContext("client").heap({ target = "server" }).target == "server", "A play client can ask the server for its heap")
+assert(not pcall(heapContext("server").heap, { target = "client" }), "The server cannot take a client snapshot")
+assert(not pcall(heapContext("edit").heap, { target = "server" }), "Edit mode has no heap report")
+assert(not pcall(heapContext("server").heap, { target = "edit" }), "Unknown heap targets are refused")
+assert(#heapCalls == 3 and heapCalls[1] == "server" and heapCalls[3] == "server", "Each snapshot asks Studio once")
 print("Renium performance capture workloads passed")

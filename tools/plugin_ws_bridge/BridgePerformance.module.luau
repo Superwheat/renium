@@ -15,6 +15,8 @@ local DRAW_FIELDS = {
 local MAX_FRAMES = 60000
 local PAGE_SIZE = 1000
 local MICRO_CHUNK_BYTES = 3 * 1024 * 1024
+local MAX_HEAP_BYTES = 128 * 1024 * 1024
+local HEAP_WAIT_SECONDS = 30
 
 function BridgePerformance.create(context)
 	local stats = context.stats
@@ -117,7 +119,51 @@ function BridgePerformance.create(context)
 		buffer.copy(part, 0, current.data, start, length)
 		return { ok = true, runtimeId = context.runtimeId, captureId = current.id, bytes = current.bytes,
 			data = context.encodeBuffer(part), page = page, nextPage = if page < pages then page + 1 else nil,
-			format = "gprx", metadata = current.metadata }
+			format = current.format or "gprx", target = current.target, metadata = current.metadata }
+	end
+
+	-- The report behind Studio's Luau Heap tool. HeapProfilerService answers
+	-- only inside a play DataModel: a play client reports itself or asks the
+	-- server over replication, the play server reports itself.
+	function api.heap(params)
+		local target = params.target
+		assert(target == "server" or target == "client", "Heap target must be server or client")
+		assert(not context.edit, "Luau heap snapshots need a running Play session; pass --server or --player")
+		local service = context.heapProfiler()
+		local request
+		if target == "client" then
+			assert(context.client, "Client heap snapshots come from a play client; pass --player")
+			local player = context.localPlayer()
+			assert(player, "The play client has no LocalPlayer yet")
+			request = function()
+				return service:ClientRequestDataAsync(player)
+			end
+		else
+			request = function()
+				return service:ServerRequestDataAsync()
+			end
+		end
+		local finished, ok, data = false, false, nil
+		context.spawn(function()
+			ok, data = pcall(request)
+			finished = true
+		end)
+		local deadline = clock() + HEAP_WAIT_SECONDS
+		while not finished and clock() < deadline do
+			context.wait()
+		end
+		assert(finished, `Studio did not answer the Luau heap request within {HEAP_WAIT_SECONDS} s`)
+		assert(ok, `Luau heap request failed: {data}`)
+		assert(type(data) == "string" and #data > 0, "Luau heap request returned no data")
+		assert(#data <= MAX_HEAP_BYTES, "Luau heap report exceeds 128 MiB")
+		clearMicro()
+		microCapture = { id = context.newId(), data = buffer.fromstring(data), bytes = #data,
+			metadata = metadata(), format = "luau-heap-json", target = target }
+		microTimer = context.delay(60, function()
+			microTimer = nil
+			microCapture = nil
+		end)
+		return api.microRead({ captureId = microCapture.id, page = 1 })
 	end
 
 	function api.micro(params)

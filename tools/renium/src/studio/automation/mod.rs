@@ -28,6 +28,7 @@ use crate::studio::bridge::{
 use crate::studio::input as input_inject;
 
 mod console;
+mod heap;
 mod input;
 mod microprofiler;
 pub(crate) mod monitor;
