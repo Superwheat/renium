@@ -63,7 +63,6 @@ use crate::settings::bytecode::{SettingsBytecode, is_reference_object, settings_
 use crate::settings::equivalence::drop_settings_document;
 use crate::settings::instance::remove_instances_at_indices;
 use crate::settings::tree::settings_children_by_parent;
-#[cfg(any(windows, target_os = "macos"))]
 use crate::studio::bridge::BridgeTarget;
 use crate::studio::bridge::{
     BridgeRequestTooLarge, BridgeServer, MAX_BRIDGE_CHUNK_BYTES, MAX_BRIDGE_REQUEST_BYTES,
@@ -324,7 +323,6 @@ fn editor_mutation_package_targets(
     targets
 }
 
-#[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn discover_editor_mutation_packages_with_timeout(
     bridge: &BridgeServer,
     targets: &[Value],
