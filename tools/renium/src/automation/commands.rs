@@ -295,8 +295,18 @@ fn action(name: &str) -> &'static str {
         "scroll-down" | "sd" => "scroll-down",
         "wait" => "wait",
         "hold" => "hold",
+        "dismiss" => "dismiss",
+        "press" => "press",
         _ => "",
     }
+}
+
+fn point(value: &str) -> Option<Map<String, Value>> {
+    let (x, y) = value.split_once(',')?;
+    let mut result = Map::new();
+    result.insert("x".to_string(), json!(x.trim().parse::<i32>().ok()?));
+    result.insert("y".to_string(), json!(y.trim().parse::<i32>().ok()?));
+    Some(result)
 }
 
 /// Milliseconds from `300`, `300ms`, `0.3s` or `1.5`; bare fractions are seconds.
@@ -333,6 +343,17 @@ fn input_actions(tokens: &[String]) -> Result<Vec<Value>> {
         if kind.is_empty() {
             bail!("Unknown input action '{command}'");
         }
+        if kind == "dismiss" {
+            let mut entry = Map::new();
+            entry.insert("action".to_string(), json!(kind));
+            index += 1;
+            if let Some(position) = tokens.get(index).and_then(|value| point(value)) {
+                entry.extend(position);
+                index += 1;
+            }
+            actions.push(Value::Object(entry));
+            continue;
+        }
         let value = tokens
             .get(index + 1)
             .with_context(|| format!("Input action '{command}' needs a value"))?;
@@ -359,6 +380,12 @@ fn input_actions(tokens: &[String]) -> Result<Vec<Value>> {
             "wait" => {
                 entry.insert("ms".to_string(), json!(wait_milliseconds(value)?));
             }
+            "press" => match point(value) {
+                Some(position) => entry.extend(position),
+                None => {
+                    entry.insert("text".to_string(), json!(value));
+                }
+            },
             _ => entry.extend(target(value)?),
         }
         if matches!(command, "right" | "right-click" | "right-down" | "right-up") {
@@ -480,5 +507,27 @@ mod input_action_tests {
         assert_eq!(actions[2], json!({ "action": "key-up", "key": "W" }));
         assert_eq!(actions[3], json!({ "action": "key-up", "key": "D" }));
         assert!(input_actions(&["hold".into(), "W".into()]).is_err());
+    }
+
+    #[test]
+    fn dismiss_takes_an_optional_point_and_press_a_label_or_point() {
+        let tokens = [
+            "dismiss", "key", "E", "dismiss", "40,700", "press", "No", "press", "545, 442",
+        ]
+        .map(String::from);
+        let actions = input_actions(&tokens).unwrap();
+        assert_eq!(actions[0], json!({ "action": "dismiss" }));
+        assert_eq!(actions[1], json!({ "action": "key-press", "key": "E" }));
+        assert_eq!(
+            actions[2],
+            json!({ "action": "dismiss", "x": 40, "y": 700 })
+        );
+        assert_eq!(actions[3], json!({ "action": "press", "text": "No" }));
+        assert_eq!(actions[4], json!({ "action": "press", "x": 545, "y": 442 }));
+        assert_eq!(
+            input_actions(&["dismiss".into()]).unwrap(),
+            vec![json!({ "action": "dismiss" })]
+        );
+        assert!(input_actions(&["press".into()]).is_err());
     }
 }

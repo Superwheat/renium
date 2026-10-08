@@ -9,6 +9,24 @@ local COMMAND_OUTPUT_MESSAGE_BYTE_LIMIT = 64 * 1024
 local CLIENT_RUNNER_NAME = "__ReniumClientRunner"
 local SERVER_RUNNER_NAME = "__ReniumServerRunner"
 local MOUSE_PROBE_NAME = "__ReniumMouseProbe"
+-- Labels of the buttons that close a Roblox prompt without accepting it,
+-- most preferred first.
+local CORE_GUI_DISMISS_LABELS = {
+	"cancel",
+	"no",
+	"not now",
+	"no thanks",
+	"maybe later",
+	"later",
+	"close",
+	"deny",
+	"decline",
+	"dismiss",
+	"skip",
+	"ok",
+	"okay",
+	"got it",
+}
 local PLAY_RESTART_SETTLE_SECONDS = 2
 local runnerSequence = 0
 
@@ -1775,8 +1793,20 @@ updateMouse()
 			end
 			return false
 		end
+		local function keyboardRefusal(message)
+			local text = tostring(message)
+			if string.find(text, "CoreGUI has keyboard focus", 1, true) then
+				return text .. " A Roblox prompt or menu holds the keyboard; `inp dismiss` answers or hides it."
+			elseif string.find(text, "permanently bound to a CoreGUI core action", 1, true) then
+				return text .. " Roblox keeps this key for its own menu; `inp dismiss` closes Roblox prompts."
+			end
+			return text
+		end
 		local function sendKey(down, keyCode, repeated)
-			virtualInput:SendKey(down, keyCode, repeated)
+			local okSend, sendError = pcall(virtualInput.SendKey, virtualInput, down, keyCode, repeated)
+			if not okSend then
+				error(keyboardRefusal(sendError), 0)
+			end
 			heldKeys[keyCode] = if down then true else nil
 			RunService.Heartbeat:Wait()
 			local pressed = gameHoldsKey(keyCode)
@@ -1852,6 +1882,264 @@ updateMouse()
 			end
 			verifiedClicks += 1
 		end
+		local GuiService = game:GetService("GuiService")
+		local coreGuiReport = nil
+		local function viewportCenter(): Vector2
+			local camera = game:GetService("Workspace").CurrentCamera
+			local size = if camera ~= nil then camera.ViewportSize else Vector2.new(0, 0)
+			return Vector2.new(math.floor(size.X / 2), math.floor(size.Y / 2))
+		end
+		-- Releasing a middle button that is not held fails after the engine's
+		-- CoreGui hit test ("duplicate button state"), so this asks the engine
+		-- whether Roblox UI takes a point without delivering anything.
+		local function coreGuiTakesPoint(position: Vector2): boolean
+			local okProbe, probeError = pcall(
+				virtualInput.SendMouseButton,
+				virtualInput,
+				position,
+				Enum.UserInputType.MouseButton3,
+				false,
+				0
+			)
+			return not okProbe and string.find(tostring(probeError), "hits CoreGUI", 1, true) ~= nil
+		end
+		-- A repeated key that is not a text-editing key fails after the
+		-- engine's CoreGui keyboard-focus check, so the probe never reaches the game.
+		local function coreGuiHoldsKeyboard(): boolean
+			local okProbe, probeError = pcall(virtualInput.SendKey, virtualInput, false, Enum.KeyCode.F15, true)
+			return not okProbe and string.find(tostring(probeError), "keyboard focus", 1, true) ~= nil
+		end
+		local function coreGuiObjectsAt(position: Vector2)
+			local inset = GuiService:GetGuiInset()
+			local okList, objects =
+				pcall(CoreGui.GetGuiObjectsAtPosition, CoreGui, position.X - inset.X, position.Y - inset.Y)
+			return if okList and type(objects) == "table" then objects else {}
+		end
+		local function buttonLabel(button): string
+			if button:IsA("TextButton") and button.ContentText ~= "" then
+				return button.ContentText
+			end
+			for _, descendant in button:GetDescendants() do
+				if
+					descendant:IsA("TextLabel")
+					and descendant.Visible
+					and descendant.ContentText ~= ""
+					and descendant:FindFirstAncestorWhichIsA("GuiButton") == button
+				then
+					return descendant.ContentText
+				end
+			end
+			return ""
+		end
+		local function normalizedLabel(text: string): string
+			return string.lower(string.match(text, "^%s*(.-)%s*$") or "")
+		end
+		-- A Roblox element belongs to a prompt of its own when its branch is
+		-- the only GUI in its ScreenGui; that ScreenGui is returned. Shared
+		-- ScreenGuis such as RobloxGui return only the branch.
+		local function coreGuiBranch(element)
+			local layer = element:FindFirstAncestorWhichIsA("LayerCollector")
+			if layer == nil then
+				return element, nil
+			end
+			local branch = element
+			local topGuiObject = element
+			while branch.Parent ~= layer do
+				branch = branch.Parent
+				if branch:IsA("GuiObject") then
+					topGuiObject = branch
+				end
+			end
+			if not layer:IsA("ScreenGui") or branch ~= topGuiObject then
+				return topGuiObject, nil
+			end
+			for _, child in layer:GetChildren() do
+				if child ~= branch and child:IsA("GuiObject") then
+					return topGuiObject, nil
+				end
+			end
+			return topGuiObject, layer
+		end
+		local function dismissButton(layer)
+			local best, bestRank, bestLabel = nil, math.huge, ""
+			for _, descendant in layer:GetDescendants() do
+				if descendant:IsA("GuiButton") and isEffectivelyVisible(descendant) then
+					local label = buttonLabel(descendant)
+					local rank = table.find(CORE_GUI_DISMISS_LABELS, normalizedLabel(label))
+					if rank ~= nil and rank < bestRank then
+						best, bestRank, bestLabel = descendant, rank, label
+					end
+				end
+			end
+			return best, bestLabel
+		end
+		-- Virtual input never reaches Roblox UI, so the prompt's ScreenGui moves
+		-- into PlayerGui for the click and the prompt handles it as a player's;
+		-- it goes back if it is still open afterwards.
+		local function pressCoreGuiButton(button, layer): (boolean, string?)
+			local localPlayer = game:GetService("Players").LocalPlayer
+			local playerGui = if localPlayer then localPlayer:FindFirstChildOfClass("PlayerGui") else nil
+			if playerGui == nil then
+				return false, "PlayerGui is not available"
+			end
+			local parent = layer.Parent
+			local displayOrder = layer.DisplayOrder
+			local topOrder = displayOrder
+			for _, child in playerGui:GetChildren() do
+				if child:IsA("ScreenGui") then
+					topOrder = math.max(topOrder, child.DisplayOrder + 1)
+				end
+			end
+			local moved = false
+			local okClick, clickError = pcall(function()
+				layer.Parent = playerGui
+				moved = true
+				layer.DisplayOrder = topOrder
+				sendVerifiedClick({ id = getInstanceDebugId(button), holdMs = 30 })
+			end)
+			if okClick then
+				local deadline = os.clock() + 1
+				while layer.Parent == playerGui and isEffectivelyVisible(button) and os.clock() < deadline do
+					RunService.Heartbeat:Wait()
+				end
+			end
+			local closed = moved and not (layer.Parent == playerGui and isEffectivelyVisible(button))
+			if layer.Parent == playerGui then
+				pcall(function()
+					layer.Parent = parent
+				end)
+			end
+			pcall(function()
+				layer.DisplayOrder = displayOrder
+			end)
+			assertOperationOwnership(operationGeneration)
+			if closed then
+				return true, nil
+			end
+			return false, if okClick then "the prompt stayed open after the click" else tostring(clickError)
+		end
+		local function coreGuiResult()
+			if coreGuiReport == nil then
+				coreGuiReport = {}
+			end
+			return coreGuiReport
+		end
+		local function appendReport(report, key, value)
+			report[key] = report[key] or {}
+			table.insert(report[key], value)
+		end
+		local function finishCoreGui(report)
+			local focused = UserInputService:GetFocusedTextBox()
+			if focused ~= nil and focused:IsDescendantOf(CoreGui) then
+				local path = focused:GetFullName()
+				local okRelease, releaseError = pcall(focused.ReleaseFocus, focused)
+				if not okRelease then
+					error(`Could not release keyboard focus from {path}: {tostring(releaseError)}`, 0)
+				end
+				report.focusReleased = path
+				RunService.Heartbeat:Wait()
+			end
+			report.holdsKeyboard = coreGuiHoldsKeyboard()
+			report.menuOpen = if report.holdsKeyboard and GuiService.MenuIsOpen then true else nil
+		end
+		local function dismissCoreGui(position: Vector2)
+			local report = coreGuiResult()
+			for _ = 1, 4 do
+				if not coreGuiTakesPoint(position) then
+					break
+				end
+				local element = nil
+				for _, object in coreGuiObjectsAt(position) do
+					if object:IsA("GuiButton") or (object:IsA("GuiObject") and object.Active) then
+						element = object
+						break
+					end
+					element = element or (if object:IsA("GuiObject") then object else nil)
+				end
+				if element == nil then
+					break
+				end
+				local branch, layer = coreGuiBranch(element)
+				local pressed = false
+				local button, label = nil, ""
+				if layer ~= nil then
+					button, label = dismissButton(layer)
+				end
+				if button ~= nil then
+					local path = button:GetFullName()
+					local pressError
+					pressed, pressError = pressCoreGuiButton(button, layer)
+					if pressed then
+						appendReport(report, "pressed", { button = path, label = label })
+					else
+						report.pressError = `{path}: {pressError}`
+					end
+				end
+				if not pressed then
+					local target = layer or branch
+					local path = target:GetFullName()
+					local okHide, hideError = pcall(function()
+						if layer ~= nil then
+							layer.Enabled = false
+						else
+							branch.Visible = false
+						end
+					end)
+					if not okHide then
+						error(`Could not hide {path}: {tostring(hideError)}`, 0)
+					end
+					appendReport(report, "hidden", path)
+				end
+				task.wait()
+				assertOperationOwnership(operationGeneration)
+			end
+			finishCoreGui(report)
+		end
+		local function pressCoreGui(label: string?, position: Vector2)
+			local button = nil
+			if label ~= nil then
+				local wanted = normalizedLabel(label)
+				local matches = {}
+				for _, descendant in CoreGui:GetDescendants() do
+					if
+						descendant:IsA("GuiButton")
+						and isEffectivelyVisible(descendant)
+						and (normalizedLabel(buttonLabel(descendant)) == wanted or string.lower(descendant.Name) == wanted)
+					then
+						matches[#matches + 1] = descendant:GetFullName()
+						button = descendant
+					end
+				end
+				if #matches == 0 then
+					error(`No visible Roblox button is labelled or named '{label}'`, 0)
+				elseif #matches > 1 then
+					error(`'{label}' matches {#matches} Roblox buttons: {table.concat(matches, "; ")}`, 0)
+				end
+			else
+				for _, object in coreGuiObjectsAt(position) do
+					if object:IsA("GuiButton") then
+						button = object
+						break
+					end
+				end
+				if button == nil then
+					error(`No Roblox button is at {position.X},{position.Y}`, 0)
+				end
+			end
+			local path = button:GetFullName()
+			local _, layer = coreGuiBranch(button)
+			if layer == nil then
+				error(`{path} shares its ScreenGui with other Roblox UI and cannot be pressed; dismiss hides it`, 0)
+			end
+			local buttonText = buttonLabel(button)
+			local pressed, pressError = pressCoreGuiButton(button, layer)
+			if not pressed then
+				error(`Could not press {path}: {pressError}`, 0)
+			end
+			local report = coreGuiResult()
+			appendReport(report, "pressed", { button = path, label = buttonText })
+			finishCoreGui(report)
+		end
 		local ok, result = xpcall(function()
 			for _, action in actions do
 				assertOperationOwnership(operationGeneration)
@@ -1866,7 +2154,19 @@ updateMouse()
 					end
 					sendKey(action.down == true, keyCode, action.repeated == true)
 				elseif actionType == "text" then
-					virtualInput:SendTextInput(tostring(action.text or ""))
+					local okSend, sendError = pcall(virtualInput.SendTextInput, virtualInput, tostring(action.text or ""))
+					if not okSend then
+						error(keyboardRefusal(sendError), 0)
+					end
+				elseif actionType == "dismiss" or actionType == "press" then
+					local position = if action.x ~= nil and action.y ~= nil
+						then Vector2.new(tonumber(action.x) or 0, tonumber(action.y) or 0)
+						else viewportCenter()
+					if actionType == "dismiss" then
+						dismissCoreGui(position)
+					else
+						pressCoreGui(if action.label ~= nil then tostring(action.label) else nil, position)
+					end
 				elseif actionType == "focus" then
 					local target = findGuiObjectById(tostring(action.id or ""), "TextBox")
 					if target == nil then
@@ -1932,6 +2232,7 @@ updateMouse()
 				activated = if activationId ~= "" then activationCount == 1 else nil,
 				clicked = if activationId ~= "" then clickCount == 1 else nil,
 				throughSystemUi = if #throughSystemUi > 0 then throughSystemUi else nil,
+				coreGui = coreGuiReport,
 			}
 		end, function(message)
 			return message

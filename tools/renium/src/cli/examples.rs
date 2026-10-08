@@ -152,7 +152,7 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ("sc", "Examples:\n  rbx sc --studio -o studio.png"),
     (
         "inp",
-        "Actions (name value): kd KEY, ku KEY, key KEY, hold KEY MS, text STRING, click PATH|X,Y, right PATH|X,Y, down/up PATH|X,Y, move X,Y, su/sd PATH|X,Y, wait MS (also 300ms or 0.3s). Keys stay held across calls until ku.\n\nExamples:\n  rbx inp -p 1 click \"Shop.BuyButton\" wait 100 key E\n  rbx inp -p 2 hold W 3000\n  rbx inp -p 2 kd W wait 1.5s kd D wait 800 ku D ku W",
+        "Actions (name value): kd KEY, ku KEY, key KEY, hold KEY MS, text STRING, click PATH|X,Y, right PATH|X,Y, down/up PATH|X,Y, move X,Y, su/sd PATH|X,Y, wait MS (also 300ms or 0.3s), dismiss [X,Y], press LABEL|X,Y. Keys stay held across calls until ku. dismiss closes the Roblox prompt at the screen center (or X,Y) with its own Cancel/No/Close/OK button, hides it when that fails, and releases Roblox keyboard focus; press presses one named Roblox prompt button.\n\nExamples:\n  rbx inp -p 1 click \"Shop.BuyButton\" wait 100 key E\n  rbx inp -p 2 hold W 3000\n  rbx inp -p 2 kd W wait 1.5s kd D wait 800 ku D ku W\n  rbx inp -p 1 dismiss key E",
     ),
     ("rs", "Examples:\n  rbx rs -o playtest.mp4"),
     ("re", "Examples:\n  rbx re"),
