@@ -5475,6 +5475,29 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 	end
 
 	local packageOwnershipCache: { [number]: any } = {}
+	local ownGroupsCache: { [number]: boolean }? = nil
+
+	-- Group ids this Studio account belongs to, fetched once: asking per
+	-- package trips Roblox's rate limit on places with many packages.
+	local function ownGroups(userId: number): { [number]: boolean }?
+		if ownGroupsCache ~= nil then
+			return ownGroupsCache
+		end
+		local okGroups, groups = pcall(function()
+			return game:GetService("GroupService"):GetGroupsAsync(userId)
+		end)
+		if not okGroups or type(groups) ~= "table" then
+			return nil
+		end
+		local ids = {}
+		for _, group in groups do
+			if type(group) == "table" and type(group.Id) == "number" then
+				ids[group.Id] = true
+			end
+		end
+		ownGroupsCache = ids
+		return ids
+	end
 
 	-- Who published the package behind a root, and whether this Studio account
 	-- can be its owner: the creator for a user package, group membership for a
@@ -5509,16 +5532,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			if creator.type == "User" then
 				owned = creator.id == userId
 			elseif creator.type == "Group" then
-				local okGroups, groups = pcall(function()
-					return game:GetService("GroupService"):GetGroupsAsync(userId)
-				end)
-				if okGroups and type(groups) == "table" then
-					owned = false
-					for _, group in groups do
-						if type(group) == "table" and group.Id == creator.id then
-							owned = true
-						end
-					end
+				local groups = ownGroups(userId)
+				if groups ~= nil then
+					owned = groups[creator.id] == true
 				end
 			end
 		end
