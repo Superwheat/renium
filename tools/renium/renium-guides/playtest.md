@@ -22,6 +22,8 @@ rbx cs
 rbx play -x
 ```
 
+Across add/leave cycles the play server's `Stats.InstanceCount` grows by about 300 per cycle while `#game:GetDescendants()` and memory stay flat (measured over three cycles): those are engine-side objects outside the DataModel that Studio's test server keeps per client that ever connected, not a game leak. Judge leaks by DataModel counts and `rbx perf heap`, not by InstanceCount.
+
 Play keeps the scripts it started with; after editing server or client code, `rbx play -r` restarts the session. `--until EXPR` returns once the server expression is true (`--until-timeout`, default 120 s), so no loop is needed before the first test step.
 
 Use ordinary Play for one-client checks. `--players 1` explicitly launches a separate server and client; `mode: "play"` means ordinary Play. Stop only a session you started or were asked to stop. `play -s`, `status` and `cs` give each runtime's Studio `pid`. File edits during Play can wait for Edit mode; that alone is not a sync failure.
