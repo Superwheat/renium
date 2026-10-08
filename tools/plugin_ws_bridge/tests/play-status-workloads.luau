@@ -80,6 +80,8 @@ assert(starts == 0 and stops == 0 and writes == 0, "mutations still require owne
 authorized = true
 status = api.startStopPlay({ start = true, launchNonce = "test-launch" })
 assert(status.ok and status.running and starts == 1)
+assert(status.engineRunning and status.engineStarted and status.executing, "Studio entered the test")
+assert(status.mode == "play" and status.players == nil)
 authorized = false
 local checksBefore, writesBefore = ownershipChecks, writes
 status = api.startStopPlay({})
@@ -91,4 +93,44 @@ status = api.startStopPlay({ stop = true })
 assert(status.ok and not status.running and stops == 1)
 assert(attributes.__ReniumLaunchNonce == nil and attributes.__ReniumEditRuntimeId == nil)
 api.cleanup()
+
+-- Studio can return from a start while the previous test is still ending, without
+-- ever opening the test; the status must tell that apart from a test still coming up.
+local launched
+function services.StudioTestService:ExecuteMultiplayerTestAsync(players, testArgs)
+	launched = { players = players, args = testArgs }
+end
+runtimeGame.Name = "scratch.rbxl"
+local multi = RuntimeApi.create({}, {
+	runtimeId = "test-runtime", bridgeRole = "edit",
+	assertRequestLeaseActive = function() end,
+	assertSessionOwnership = function() end,
+})
+status = multi.startStopPlay({ start = true, players = 2, launchNonce = "multi-launch" })
+assert(status.ok and status.mode == "multi" and status.players == 2 and status.launchNonce == "multi-launch")
+local renium = launched.args.__renium
+assert(launched.players == 2 and renium.nonce == "multi-launch" and renium.editRuntimeId == "test-runtime")
+assert(renium.placeName == "scratch.rbxl", "test DataModels learn the Edit place name")
+status = multi.startStopPlay({})
+assert(status.running and status.starting and not status.readyForStart)
+assert(status.engineRunning == false and status.engineStarted == false and status.executing == false,
+	"a start Studio returned from without a test is visible")
+status = multi.startStopPlay({ stop = true, launchNonce = "multi-launch" })
+assert(status.ok and not status.running and status.mode == nil and status.players == nil)
+assert(not status.readyForStart, "the controller settles before the next start")
+multi.cleanup()
+
+function services.StudioTestService:ExecuteRunModeAsync()
+	error("Studio is busy")
+end
+local refused = RuntimeApi.create({}, {
+	runtimeId = "test-runtime", bridgeRole = "edit",
+	assertRequestLeaseActive = function() end,
+	assertSessionOwnership = function() end,
+})
+status = refused.startStopPlay({ start = true, mode = "run", launchNonce = "run-launch" })
+assert(not status.running and not status.starting and status.launchNonce == nil)
+assert(string.find(status.lastError, "Studio is busy", 1, true), "a refused start keeps Studio's error for the daemon")
+assert(status.engineStarted == false and status.executing == false)
+refused.cleanup()
 print("Renium play observation and ownership tests passed")

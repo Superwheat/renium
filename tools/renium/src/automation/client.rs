@@ -51,6 +51,7 @@ fn send_on_stream(stream: &TcpStream, request: &super::Request) -> Result<super:
         {
             Duration::from_secs(30)
         }
+        op::STUDIOS if request.p["killOrphans"] == true => Duration::from_secs(60),
         op::CAP | op::BIND | op::STUDIOS | op::PROPERTY_ACCESS | op::PERFORMANCE_MONITOR => {
             Duration::from_secs(5)
         }

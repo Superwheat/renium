@@ -11,7 +11,7 @@ use crate::system::LockRecover;
 use anyhow::{Context, Result, anyhow, bail};
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_FILE_NOT_FOUND, FILETIME, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
-    WAIT_OBJECT_0,
+    UNICODE_STRING, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
@@ -25,6 +25,7 @@ use windows_sys::Win32::System::JobObjects::{
     JobObjectExtendedLimitInformation, OpenJobObjectW, QueryInformationJobObject,
     SetInformationJobObject,
 };
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
 use windows_sys::Win32::System::ProcessStatus::{
     GetPerformanceInfo, GetProcessMemoryInfo, PERFORMANCE_INFORMATION, PROCESS_MEMORY_COUNTERS,
@@ -870,7 +871,13 @@ fn ensure_job_queryable(process: &OwnedHandle, job: &OwnedHandle) -> Result<()> 
     Ok(())
 }
 
-pub(crate) fn studio_descendant_processes(root: u32) -> Result<Vec<u32>> {
+pub(crate) struct ProcessEntry {
+    pub(crate) pid: u32,
+    pub(crate) parent: u32,
+    pub(crate) studio: bool,
+}
+
+pub(crate) fn process_entries() -> Result<Vec<ProcessEntry>> {
     // SAFETY: CreateToolhelp32Snapshot returns a checked snapshot handle.
     let snapshot = OwnedHandle::new(
         unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) },
@@ -879,43 +886,93 @@ pub(crate) fn studio_descendant_processes(root: u32) -> Result<Vec<u32>> {
     // SAFETY: all-zero is a valid initial PROCESSENTRY32W before dwSize is set.
     let mut entry: PROCESSENTRY32W = unsafe { zeroed() };
     entry.dwSize = u32::try_from(size_of::<PROCESSENTRY32W>())?;
-    let mut children = HashMap::<u32, Vec<u32>>::new();
-    let mut studio = HashSet::new();
+    let mut entries = Vec::new();
     // SAFETY: snapshot and entry are valid for process enumeration.
     let mut has_entry = unsafe { Process32FirstW(snapshot.0, &mut entry) } != 0;
     while has_entry {
-        children
-            .entry(entry.th32ParentProcessID)
-            .or_default()
-            .push(entry.th32ProcessID);
         let length = entry
             .szExeFile
             .iter()
             .position(|unit| *unit == 0)
             .unwrap_or(entry.szExeFile.len());
-        if String::from_utf16_lossy(&entry.szExeFile[..length])
-            .eq_ignore_ascii_case("RobloxStudioBeta.exe")
-        {
-            studio.insert(entry.th32ProcessID);
-        }
+        entries.push(ProcessEntry {
+            pid: entry.th32ProcessID,
+            parent: entry.th32ParentProcessID,
+            studio: String::from_utf16_lossy(&entry.szExeFile[..length])
+                .eq_ignore_ascii_case("RobloxStudioBeta.exe"),
+        });
         // SAFETY: snapshot and entry remain valid for the next enumeration call.
         has_entry = unsafe { Process32NextW(snapshot.0, &mut entry) } != 0;
     }
-    let mut result = Vec::new();
-    let mut pending = vec![root];
-    let mut seen = HashSet::new();
-    while let Some(pid) = pending.pop() {
-        if !seen.insert(pid) {
-            continue;
+    Ok(entries)
+}
+
+type NtQueryInformationProcess =
+    unsafe extern "system" fn(HANDLE, u32, *mut c_void, u32, *mut u32) -> i32;
+
+const PROCESS_COMMAND_LINE_INFORMATION: u32 = 60;
+
+/// Another process's command line; needs only limited query access to it.
+pub(crate) fn process_command_line(pid: u32) -> Option<String> {
+    static QUERY: std::sync::OnceLock<Option<NtQueryInformationProcess>> =
+        std::sync::OnceLock::new();
+    let query = (*QUERY.get_or_init(|| {
+        let name = wide_null("ntdll.dll");
+        // SAFETY: ntdll is mapped into every Windows process; the name is NUL-terminated.
+        let module = unsafe { GetModuleHandleW(name.as_ptr()) };
+        if module.is_null() {
+            return None;
         }
-        if pid != root && studio.contains(&pid) {
-            result.push(pid);
+        // SAFETY: module is ntdll and the export name is NUL-terminated.
+        let address =
+            unsafe { GetProcAddress(module, c"NtQueryInformationProcess".as_ptr().cast()) }?;
+        // SAFETY: NtQueryInformationProcess has exactly this signature.
+        Some(unsafe {
+            std::mem::transmute::<unsafe extern "system" fn() -> isize, NtQueryInformationProcess>(
+                address,
+            )
+        })
+    }))?;
+    // SAFETY: OpenProcess returns a new handle or null, which OwnedHandle rejects.
+    let process = OwnedHandle::new(
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) },
+        "OpenProcess",
+    )
+    .ok()?;
+    // u64 elements keep the UNICODE_STRING header aligned.
+    let mut buffer = vec![0u64; 512];
+    loop {
+        let size = u32::try_from(buffer.len() * size_of::<u64>()).ok()?;
+        let mut needed = 0u32;
+        // SAFETY: buffer is writable for size bytes and needed is a valid out pointer.
+        let status = unsafe {
+            query(
+                process.0,
+                PROCESS_COMMAND_LINE_INFORMATION,
+                buffer.as_mut_ptr().cast(),
+                size,
+                &mut needed,
+            )
+        };
+        if status >= 0 {
+            break;
         }
-        if let Some(found) = children.get(&pid) {
-            pending.extend(found.iter().copied());
+        if needed <= size || needed > 1 << 20 {
+            return None;
         }
+        buffer = vec![0u64; (needed as usize).div_ceil(size_of::<u64>())];
     }
-    Ok(result)
+    // SAFETY: on success the buffer starts with a UNICODE_STRING.
+    let header = unsafe { &*buffer.as_ptr().cast::<UNICODE_STRING>() };
+    let units = usize::from(header.Length) / 2;
+    let start = buffer.as_ptr() as usize;
+    let text = header.Buffer as usize;
+    if units == 0 || text < start || text + units * 2 > start + buffer.len() * size_of::<u64>() {
+        return (units == 0).then(String::new);
+    }
+    // SAFETY: the characters lie inside buffer, as checked above.
+    let characters = unsafe { std::slice::from_raw_parts(header.Buffer, units) };
+    Some(String::from_utf16_lossy(characters))
 }
 
 fn process_tree(root: u32) -> Result<Vec<u32>> {

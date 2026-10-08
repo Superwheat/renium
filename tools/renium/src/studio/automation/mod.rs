@@ -22,8 +22,8 @@ use crate::cli::{
 use crate::daemon::{daemon_control_request, try_daemon_control_request};
 use crate::snapshot::import::parse_services;
 use crate::studio::bridge::{
-    BRIDGE_DEFAULT_RESPONSE_TIMEOUT, BRIDGE_ROLE_PLAY_CLIENT, BRIDGE_ROLE_PLAY_SERVER,
-    BridgeServer, BridgeTarget,
+    BRIDGE_DEFAULT_RESPONSE_TIMEOUT, BRIDGE_ROLE_EDIT, BRIDGE_ROLE_PLAY_CLIENT,
+    BRIDGE_ROLE_PLAY_SERVER, BridgeServer, BridgeTarget,
 };
 use crate::studio::input as input_inject;
 
@@ -39,6 +39,7 @@ pub(crate) mod property_access;
 mod recording;
 mod recording_review;
 pub(crate) mod render_quality;
+mod test_processes;
 
 pub(crate) use console::{get_console_output_command, get_console_output_result};
 pub(crate) use input::input_result;
@@ -483,6 +484,9 @@ fn wait_for_player_bridge(bridge: &BridgeServer, player: &str, wait_seconds: f64
 
 pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
     validate_play_args(&args)?;
+    if args.kill_orphans {
+        return kill_orphans_command(&args);
+    }
     let operation = if args.stop {
         op::PLAY_STOP
     } else {
@@ -493,41 +497,11 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
         "addPlayers": args.add_players,
         "leave": args.leave,
         "mode": args.mode,
+        "restart": args.restart,
         "bridgeWaitSeconds": args.bridge.wait_seconds,
         "bridgePorts": args.bridge.ports,
     });
-    let mut stopped = None;
-    if args.restart {
-        let status = daemon_control_request(
-            op::PLAY_START,
-            None,
-            json!({
-                "bridgeWaitSeconds": args.bridge.wait_seconds,
-                "bridgePorts": args.bridge.ports,
-            }),
-            false,
-        )?;
-        let running = status.get("running").and_then(Value::as_bool) == Some(true)
-            || status.get("starting").and_then(Value::as_bool) == Some(true);
-        if running {
-            let stop = daemon_control_request(
-                op::PLAY_STOP,
-                None,
-                json!({
-                    "bridgeWaitSeconds": args.bridge.wait_seconds,
-                    "bridgePorts": args.bridge.ports,
-                }),
-                false,
-            )?;
-            stopped = Some(stop.get("ok").and_then(Value::as_bool) == Some(true));
-        } else {
-            stopped = Some(false);
-        }
-    }
     let mut result = daemon_control_request(operation, None, parameters, false)?;
-    if let Some(stopped) = stopped {
-        result["restarted"] = json!(stopped);
-    }
     if let Some(condition) = args.until.as_deref()
         && result.get("ok").and_then(Value::as_bool) != Some(false)
     {
@@ -551,6 +525,31 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
         }
     }
     print_json_output(&result, false)
+}
+
+fn kill_orphans_command(args: &StartStopPlayArgs) -> Result<()> {
+    let result = daemon_control_request(
+        op::STUDIOS,
+        None,
+        json!({
+            "killOrphans": true,
+            "place": crate::studio::target::place_filter(),
+            "bridgeWaitSeconds": args.bridge.wait_seconds,
+            "bridgePorts": args.bridge.ports,
+        }),
+        false,
+    )?;
+    print_json_output(&result, false)?;
+    if let Some(failed) = result["failed"]
+        .as_array()
+        .filter(|failed| !failed.is_empty())
+    {
+        bail!(
+            "{} orphaned Studio test process(es) could not be closed",
+            failed.len()
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn studio_change_state_command(
@@ -895,19 +894,22 @@ pub(crate) fn start_stop_play_result(
     if args.stop {
         return stop_studio_play_with_bridge_result(bridge);
     }
+    if args.restart {
+        return restart_play_result(args, bridge);
+    }
     if let Some(count) = args.add_players {
         return add_test_players_result(bridge, count, args.bridge.wait_seconds);
     }
     if let Some(index) = args.players.filter(|_| args.leave) {
         return leave_test_result(bridge, index, args.bridge.wait_seconds);
     }
-    if let Some(players) = args.players {
-        let mut result = start_multiplayer_test_result(bridge, players)?;
-        result["serverReady"] = json!(server_answers_luau(bridge));
-        return Ok(result);
-    }
-    if args.start {
-        let mut result = start_single_play_result(bridge, mode)?;
+    if args.start || args.players.is_some() {
+        let plan = match args.players {
+            Some(players) => PlayLaunchPlan::Multi(players),
+            None if matches!(mode, "run" | "server") => PlayLaunchPlan::Run,
+            None => PlayLaunchPlan::Play,
+        };
+        let mut result = start_play_with_retries(bridge, plan)?;
         result["serverReady"] = json!(server_answers_luau(bridge));
         return Ok(result);
     }
@@ -1222,71 +1224,13 @@ fn multiplayer_start_deadline(started: Instant, last_progress: Instant) -> Insta
         .min(started + Duration::from_secs(240))
 }
 
-#[cfg(windows)]
 fn leftover_test_processes(edit_pid: u32) -> Vec<u32> {
-    crate::studio::performance::studio_descendant_processes(edit_pid).unwrap_or_default()
+    test_processes::test_descendants(&test_processes::studio_process_table(), edit_pid)
 }
 
-#[cfg(target_os = "macos")]
-fn leftover_test_processes(edit_pid: u32) -> Vec<u32> {
-    let Ok(output) = std::process::Command::new("ps")
-        .args(["-axo", "pid=,ppid=,comm="])
-        .output()
-    else {
-        return Vec::new();
-    };
-    let mut children = std::collections::HashMap::<u32, Vec<u32>>::new();
-    let mut studio = HashSet::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let mut parts = line.split_whitespace();
-        let (Some(pid), Some(parent)) = (
-            parts.next().and_then(|value| value.parse::<u32>().ok()),
-            parts.next().and_then(|value| value.parse::<u32>().ok()),
-        ) else {
-            continue;
-        };
-        children.entry(parent).or_default().push(pid);
-        if parts.collect::<Vec<_>>().join(" ").contains("RobloxStudio") {
-            studio.insert(pid);
-        }
-    }
-    let mut result = Vec::new();
-    let mut pending = vec![edit_pid];
-    let mut seen = HashSet::new();
-    while let Some(pid) = pending.pop() {
-        if !seen.insert(pid) {
-            continue;
-        }
-        if pid != edit_pid && studio.contains(&pid) {
-            result.push(pid);
-        }
-        if let Some(found) = children.get(&pid) {
-            pending.extend(found.iter().copied());
-        }
-    }
-    result
-}
-
-#[cfg(not(any(windows, target_os = "macos")))]
-fn leftover_test_processes(_edit_pid: u32) -> Vec<u32> {
-    Vec::new()
-}
-
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn terminate_test_process(pid: u32) -> Result<()> {
     crate::studio::input::terminate_studio_process(pid)
-}
-
-#[cfg(target_os = "macos")]
-fn terminate_test_process(pid: u32) -> Result<()> {
-    let status = std::process::Command::new("kill")
-        .args(["-9", &pid.to_string()])
-        .status()
-        .context("Could not signal the Studio test process")?;
-    if !status.success() {
-        bail!("Could not terminate Studio process {pid}");
-    }
-    Ok(())
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
@@ -1327,188 +1271,632 @@ fn close_leftover_test_processes(
     closed
 }
 
-fn start_single_play_result(bridge: &BridgeServer, mode: &str) -> Result<Value> {
-    let plugin_mode = if matches!(mode, "run" | "server") {
-        "run"
-    } else {
-        "play"
-    };
-    let launch = new_play_launch(bridge, "play")?;
-    let mut device_simulation = studio_device_status(bridge)?;
-    let mut existing = wait_for_studio_play_ready(bridge, &launch.edit_runtime_id)?;
-    if existing.get("running").and_then(Value::as_bool) == Some(true)
-        || existing.get("starting").and_then(Value::as_bool) == Some(true)
-    {
-        existing["deviceSimulation"] = device_simulation;
-        return Ok(existing);
+fn edit_client<'a>(clients: &'a [Value], runtime_id: &str) -> Option<&'a Value> {
+    clients.iter().find(|client| {
+        client["role"] == BRIDGE_ROLE_EDIT
+            && client.get("runtimeId").and_then(Value::as_str) == Some(runtime_id)
+    })
+}
+
+/// Orphaned Studio test processes for `rbx cs` and `rbx status`. Given an Edit
+/// runtime, connected orphans of other places are left out.
+pub(crate) fn orphan_summaries(clients: &[Value], edit_runtime_id: Option<&str>) -> Vec<Value> {
+    let edit = edit_runtime_id.and_then(|runtime_id| edit_client(clients, runtime_id));
+    test_processes::orphan_test_processes(&test_processes::studio_process_table(), clients)
+        .iter()
+        .filter(|orphan| match (&orphan.client, edit) {
+            (Some(client), Some(edit)) => test_processes::same_place(client, edit),
+            _ => true,
+        })
+        .map(test_processes::Orphan::summary)
+        .collect()
+}
+
+fn close_orphans(
+    bridge: &BridgeServer,
+    orphans: &[test_processes::Orphan],
+) -> (Vec<u32>, Vec<Value>) {
+    let mut closed = Vec::new();
+    let mut failed = Vec::new();
+    for orphan in orphans {
+        match terminate_test_process(orphan.pid) {
+            Ok(()) => {
+                closed.push(orphan.pid);
+                if let Some(runtime_id) = orphan.runtime_id() {
+                    bridge.retire_runtime(runtime_id);
+                }
+            }
+            Err(error) => {
+                failed.push(json!({ "pid": orphan.pid, "error": format!("{error:#}") }));
+            }
+        }
     }
-    let result = (|| -> Result<Value> {
-        let start_result = bridge.call_for_runtime_with_timeout(
-            "startStopPlay",
-            json!({
-                "start": true,
-                "mode": plugin_mode,
-                "launchNonce": launch.nonce,
-            }),
-            BridgeTarget::Edit,
-            &launch.edit_runtime_id,
-            None,
-        )?;
-        if start_result.get("launchNonce").and_then(Value::as_str) != Some(launch.nonce.as_str()) {
-            bail!("Studio started a different play session");
-        }
-        if start_result.get("ok").and_then(Value::as_bool) == Some(false)
-            && start_result.get("starting").and_then(Value::as_bool) != Some(true)
-        {
-            ensure_plugin_api_ok(&start_result)?;
-        }
-        let deadline = Instant::now() + Duration::from_secs(20);
-        let mut last_status = start_result;
-        loop {
-            let clients = test_launch_clients(bridge, &launch);
-            let server_ready = clients
-                .iter()
-                .any(|entry| entry["role"] == BRIDGE_ROLE_PLAY_SERVER);
-            let client_ready = clients
-                .iter()
-                .any(|entry| entry["role"] == BRIDGE_ROLE_PLAY_CLIENT);
-            if server_ready && (plugin_mode == "run" || client_ready) {
-                device_simulation["playRunning"] = Value::Bool(true);
-                return Ok(json!({
-                    "ok": true,
-                    "action": "start",
-                    "mode": plugin_mode,
-                    "launchNonce": launch.nonce,
-                    "editRuntimeId": launch.edit_runtime_id,
-                    "editPid": bridge.studio_pid_for_runtime(BridgeTarget::Edit, &launch.edit_runtime_id).ok(),
-                    "deviceSimulation": device_simulation,
-                    "clients": clients,
-                }));
-            }
-            if Instant::now() >= deadline {
-                bail!(
-                    "Timed out waiting for the play session to start; last status: {}, connected bridges: {}",
-                    serde_json::to_string(&last_status)?,
-                    serde_json::to_string(&bridge.list_bridge_clients())?
-                );
-            }
-            match studio_play_status_for_runtime(bridge, &launch.edit_runtime_id) {
-                Ok(status) => {
-                    if status.get("launchNonce").and_then(Value::as_str)
-                        != Some(launch.nonce.as_str())
-                    {
-                        bail!("Studio switched to a different play session while starting");
-                    }
-                    if let Some(error) = status
-                        .get("lastError")
-                        .and_then(Value::as_str)
-                        .filter(|error| !error.is_empty())
-                    {
-                        bail!("Studio could not start the play session: {error}");
-                    }
-                    ensure_plugin_api_ok(&status)?;
-                    last_status = status;
-                }
-                Err(err) => {
-                    last_status = json!({ "error": format!("{err:#}") });
-                }
-            }
-            thread::sleep(Duration::from_millis(250));
-        }
-    })();
-    if result.is_err() {
-        cancel_test_launch_best_effort(bridge, &launch);
+    if !closed.is_empty() {
+        log_global(
+            5,
+            format_args!("[renium] closed orphaned Studio test processes: {closed:?}"),
+        );
+    }
+    (closed, failed)
+}
+
+fn client_place_matches(client: &Value, selector: &str) -> bool {
+    crate::studio::target::place_matches(
+        &crate::studio::bridge::BridgeInfoPayload {
+            place_id: client.get("placeId").and_then(Value::as_i64),
+            game_id: client.get("gameId").and_then(Value::as_i64),
+            place_name: client
+                .get("placeName")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            ..Default::default()
+        },
+        selector,
+    )
+}
+
+/// `rbx play --kill-orphans`: closes every orphaned test process, or with a
+/// place selector the connected ones of matching places.
+pub(crate) fn kill_orphans_result(bridge: &BridgeServer, place: Option<&str>) -> Value {
+    let clients = bridge.list_bridge_clients();
+    let orphans =
+        test_processes::orphan_test_processes(&test_processes::studio_process_table(), &clients)
+            .into_iter()
+            .filter(|orphan| {
+                place.is_none_or(|selector| {
+                    orphan
+                        .client
+                        .as_ref()
+                        .is_some_and(|client| client_place_matches(client, selector))
+                })
+            })
+            .collect::<Vec<_>>();
+    let (closed, failed) = close_orphans(bridge, &orphans);
+    let mut result = json!({ "ok": failed.is_empty(), "action": "killOrphans", "closed": closed });
+    if !failed.is_empty() {
+        result["failed"] = json!(failed);
     }
     result
 }
 
-fn start_multiplayer_test_result(bridge: &BridgeServer, players: u32) -> Result<Value> {
-    if !(1..=8).contains(&players) {
+fn close_same_place_orphans(
+    bridge: &BridgeServer,
+    edit_runtime_id: &str,
+) -> (Vec<u32>, Vec<Value>) {
+    let clients = bridge.list_bridge_clients();
+    let Some(edit) = edit_client(&clients, edit_runtime_id) else {
+        return Default::default();
+    };
+    let orphans =
+        test_processes::orphan_test_processes(&test_processes::studio_process_table(), &clients)
+            .into_iter()
+            .filter(|orphan| {
+                orphan
+                    .client
+                    .as_ref()
+                    .is_some_and(|client| test_processes::same_place(client, edit))
+            })
+            .collect::<Vec<_>>();
+    close_orphans(bridge, &orphans)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlayLaunchPlan {
+    Play,
+    Run,
+    Multi(u32),
+}
+
+impl PlayLaunchPlan {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Multi(_) => "multi",
+            Self::Play | Self::Run => "play",
+        }
+    }
+
+    fn plugin_mode(self) -> &'static str {
+        match self {
+            Self::Play => "play",
+            Self::Run => "run",
+            Self::Multi(_) => "multi",
+        }
+    }
+
+    fn session_kind(self) -> &'static str {
+        match self {
+            Self::Multi(_) => "multiplayer",
+            Self::Play | Self::Run => "play",
+        }
+    }
+
+    fn players(self) -> Option<u32> {
+        match self {
+            Self::Multi(players) => Some(players),
+            Self::Play | Self::Run => None,
+        }
+    }
+
+    fn clients_needed(self) -> usize {
+        match self {
+            Self::Play => 1,
+            Self::Run => 0,
+            Self::Multi(players) => players as usize,
+        }
+    }
+
+    fn request(self, launch_nonce: &str) -> Value {
+        match self {
+            Self::Multi(players) => {
+                json!({ "start": true, "players": players, "launchNonce": launch_nonce })
+            }
+            Self::Play | Self::Run => {
+                json!({ "start": true, "mode": self.plugin_mode(), "launchNonce": launch_nonce })
+            }
+        }
+    }
+
+    fn start_deadline(self, started: Instant, last_progress: Instant) -> Instant {
+        match self {
+            Self::Multi(_) => multiplayer_start_deadline(started, last_progress),
+            Self::Play | Self::Run => started + SINGLE_START_TIMEOUT,
+        }
+    }
+
+    /// How long a start may show no sign of the test at all.
+    fn sign_timeout(self) -> Duration {
+        match self {
+            Self::Multi(_) => MULTI_START_SIGN_TIMEOUT,
+            Self::Play | Self::Run => SINGLE_START_TIMEOUT,
+        }
+    }
+
+    /// Whether Studio dropped the start: the call returned without the test
+    /// appearing, or nothing showed up at all.
+    fn start_was_ignored(self, elapsed: Duration, begun: bool, executing: Option<bool>) -> bool {
+        !begun
+            && (elapsed >= self.sign_timeout()
+                || executing == Some(false) && elapsed >= START_RETURN_GRACE)
+    }
+}
+
+// Studio drops a test start while the previous test is still ending or a place
+// it just opened is still settling: the start call returns at once, or no test
+// ever appears. Such a start is cancelled and requested again.
+const START_ATTEMPTS: u32 = 3;
+const START_RETRY_WINDOW: Duration = Duration::from_secs(60);
+const START_RETURN_GRACE: Duration = Duration::from_secs(5);
+const SINGLE_START_TIMEOUT: Duration = Duration::from_secs(20);
+const MULTI_START_SIGN_TIMEOUT: Duration = Duration::from_secs(30);
+const LEFTOVER_GRACE: Duration = Duration::from_secs(10);
+
+enum LaunchOutcome {
+    Started(Value),
+    Ignored(String),
+}
+
+enum AttemptOutcome {
+    AlreadyRunning(Value),
+    Started { result: Value, requested: Instant },
+    Ignored { reason: String, requested: Instant },
+}
+
+static LAUNCHED_PLANS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, PlayLaunchPlan>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn remember_launch(edit_runtime_id: &str, plan: PlayLaunchPlan) {
+    use crate::system::LockRecover;
+    LAUNCHED_PLANS
+        .lock_recover()
+        .insert(edit_runtime_id.to_string(), plan);
+}
+
+fn remembered_launch(edit_runtime_id: &str) -> Option<PlayLaunchPlan> {
+    use crate::system::LockRecover;
+    LAUNCHED_PLANS.lock_recover().get(edit_runtime_id).copied()
+}
+
+fn start_play_with_retries(bridge: &BridgeServer, plan: PlayLaunchPlan) -> Result<Value> {
+    if plan
+        .players()
+        .is_some_and(|players| !(1..=8).contains(&players))
+    {
         bail!("Multiplayer tests require between 1 and 8 players");
     }
-    let launch = new_play_launch(bridge, "multi")?;
-    let mut device_simulation = studio_device_status(bridge)?;
-    let existing = wait_for_studio_play_ready(bridge, &launch.edit_runtime_id)?;
-    if existing.get("running").and_then(Value::as_bool) == Some(true)
-        || existing.get("starting").and_then(Value::as_bool) == Some(true)
+    let edit_runtime_id = bridge
+        .runtime_pin_for_selector(BridgeTarget::Edit, None)?
+        .runtime_id;
+    let (closed_orphans, orphan_errors) = close_same_place_orphans(bridge, &edit_runtime_id);
+    let mut first_request: Option<Instant> = None;
+    let mut last_reason = String::new();
+    let mut attempts = 0;
+    while attempts < START_ATTEMPTS
+        && first_request.is_none_or(|first| first.elapsed() < START_RETRY_WINDOW)
     {
-        bail!("A Studio play session is already active in the selected window");
-    }
-    let result = (|| -> Result<Value> {
-        let start_result = bridge.call_for_runtime_with_timeout(
-            "startStopPlay",
-            json!({
-                "start": true,
-                "players": players,
-                "launchNonce": launch.nonce,
-            }),
-            BridgeTarget::Edit,
-            &launch.edit_runtime_id,
-            None,
-        )?;
-        if start_result.get("launchNonce").and_then(Value::as_str) != Some(launch.nonce.as_str()) {
-            bail!("Studio started a different multiplayer session");
+        attempts += 1;
+        if attempts > 1 {
+            thread::sleep(Duration::from_secs(u64::from(attempts - 1)));
         }
-        if start_result.get("ok").and_then(Value::as_bool) == Some(false)
-            && start_result.get("starting").and_then(Value::as_bool) != Some(true)
-        {
-            ensure_plugin_api_ok(&start_result)?;
-        }
-        let started = Instant::now();
-        let mut last_progress = started;
-        let mut last_seen = (false, 0usize);
-        loop {
-            if let Ok(status) = studio_play_status_for_runtime(bridge, &launch.edit_runtime_id) {
-                if status.get("launchNonce").and_then(Value::as_str) != Some(launch.nonce.as_str())
-                {
-                    bail!("Studio switched to a different multiplayer session while starting");
+        let outcome =
+            start_attempt(bridge, plan).map_err(|error| with_orphan_hint(bridge, error))?;
+        let mut result = match outcome {
+            AttemptOutcome::AlreadyRunning(existing) => existing,
+            AttemptOutcome::Started {
+                mut result,
+                requested,
+            } => {
+                if let Some(first) = first_request {
+                    result["retriedAfterMs"] = json!(requested.duration_since(first).as_millis());
+                    result["startAttempts"] = json!(attempts);
+                    result["retryReason"] = json!(last_reason);
                 }
-                if let Some(error) = status
-                    .get("lastError")
-                    .and_then(Value::as_str)
-                    .filter(|error| !error.is_empty())
-                {
-                    bail!("Studio could not start the multiplayer session: {error}");
-                }
+                result
             }
-            let clients = test_launch_clients(bridge, &launch);
-            let client_count = clients
-                .iter()
-                .filter(|entry| entry["role"] == "play-client")
-                .count();
-            let server_ready = clients.iter().any(|entry| entry["role"] == "play-server");
-            if server_ready && client_count >= players as usize {
-                device_simulation["playRunning"] = Value::Bool(true);
-                return Ok(json!({
-                    "ok": true,
-                    "action": "start",
-                    "mode": "multi",
-                    "players": players,
-                    "editRuntimeId": launch.edit_runtime_id,
-                    "editPid": bridge.studio_pid_for_runtime(BridgeTarget::Edit, &launch.edit_runtime_id).ok(),
-                    "deviceSimulation": device_simulation,
-                    "clients": clients,
-                }));
-            }
-            if (server_ready, client_count) != last_seen {
-                last_seen = (server_ready, client_count);
-                last_progress = Instant::now();
-            }
-            if Instant::now() >= multiplayer_start_deadline(started, last_progress) {
-                bail!(
-                    "Timed out waiting for the multiplayer test instances to connect \
-                     (server ready: {server_ready}, clients connected: {client_count}/{players}). \
-                     Start request result: {start_result}; connected bridges: {}",
-                    serde_json::to_string(&clients)?
+            AttemptOutcome::Ignored { reason, requested } => {
+                log_global(
+                    5,
+                    format_args!(
+                        "[renium] Studio did not start the test (attempt {attempts}): {reason}"
+                    ),
                 );
+                first_request.get_or_insert(requested);
+                last_reason = reason;
+                continue;
             }
-            thread::sleep(Duration::from_millis(250));
+        };
+        if !closed_orphans.is_empty() {
+            result["closedOrphans"] = json!(closed_orphans);
         }
-    })();
-    if result.is_err() {
-        cancel_test_launch_best_effort(bridge, &launch);
+        if !orphan_errors.is_empty() {
+            result["orphanErrors"] = json!(orphan_errors);
+        }
+        return Ok(result);
+    }
+    Err(with_orphan_hint(
+        bridge,
+        anyhow::anyhow!(
+            "Studio did not start the {} session after {attempts} attempts: {last_reason}. Check the Edit window for a dialog, or run rbx status",
+            plan.session_kind(),
+        ),
+    ))
+}
+
+fn with_orphan_hint(bridge: &BridgeServer, error: anyhow::Error) -> anyhow::Error {
+    let orphans = test_processes::orphan_test_processes(
+        &test_processes::studio_process_table(),
+        &bridge.list_bridge_clients(),
+    );
+    if orphans.is_empty() {
+        return error;
+    }
+    anyhow::anyhow!(
+        "{error:#}. {} orphaned Studio test window(s) whose Edit window has exited are still open; rbx play --kill-orphans closes them",
+        orphans.len()
+    )
+}
+
+fn start_attempt(bridge: &BridgeServer, plan: PlayLaunchPlan) -> Result<AttemptOutcome> {
+    let launch = new_play_launch(bridge, plan.label())?;
+    let mut device_simulation = studio_device_status(bridge)?;
+    let waited = Instant::now();
+    let mut existing = wait_for_studio_play_ready(bridge, &launch.edit_runtime_id)?;
+    if play_status_is_running(&existing) {
+        if plan.players().is_some() {
+            bail!("A Studio play session is already active in the selected window");
+        }
+        existing["deviceSimulation"] = device_simulation;
+        return Ok(AttemptOutcome::AlreadyRunning(existing));
+    }
+    let closed = close_leftover_test_processes(bridge, &launch.edit_runtime_id, LEFTOVER_GRACE);
+    let waited_ms = waited.elapsed().as_millis();
+    let requested = Instant::now();
+    match launch_play_session(bridge, &launch, plan) {
+        Ok(LaunchOutcome::Started(mut result)) => {
+            remember_launch(&launch.edit_runtime_id, plan);
+            device_simulation["playRunning"] = Value::Bool(true);
+            result["deviceSimulation"] = device_simulation;
+            if waited_ms >= 500 {
+                result["waitedForStudioMs"] = json!(waited_ms);
+            }
+            if !closed.is_empty() {
+                result["closedProcesses"] = json!(closed);
+            }
+            Ok(AttemptOutcome::Started { result, requested })
+        }
+        Ok(LaunchOutcome::Ignored(reason)) => {
+            cancel_test_launch_best_effort(bridge, &launch);
+            Ok(AttemptOutcome::Ignored { reason, requested })
+        }
+        Err(error) => {
+            cancel_test_launch_best_effort(bridge, &launch);
+            Err(error)
+        }
+    }
+}
+
+/// Watches for any sign that Studio took a start: the Edit controller entering
+/// the test, a new Studio process under the Edit window, or a test bridge.
+struct LaunchWatch {
+    edit_pid: Option<u32>,
+    baseline: HashSet<u32>,
+    begun: bool,
+}
+
+fn studio_child_pids(edit_pid: u32) -> HashSet<u32> {
+    test_processes::studio_descendants(&test_processes::studio_process_table(), edit_pid)
+        .iter()
+        .map(|process| process.pid)
+        .collect()
+}
+
+impl LaunchWatch {
+    fn new(bridge: &BridgeServer, launch: &TestLaunch) -> Self {
+        let edit_pid = bridge
+            .studio_pid_for_runtime(BridgeTarget::Edit, &launch.edit_runtime_id)
+            .ok();
+        Self {
+            edit_pid,
+            baseline: edit_pid.map(studio_child_pids).unwrap_or_default(),
+            begun: false,
+        }
+    }
+
+    fn observe(&mut self, status: Option<&Value>, clients: &[Value]) {
+        self.begun = self.begun
+            || !clients.is_empty()
+            || status.is_some_and(|status| {
+                status["engineRunning"] == true || status["engineStarted"] == true
+            })
+            || self
+                .edit_pid
+                .is_some_and(|pid| !studio_child_pids(pid).is_subset(&self.baseline));
+    }
+}
+
+fn launch_status_outcome(
+    status: &Value,
+    launch: &TestLaunch,
+    plan: PlayLaunchPlan,
+    begun: bool,
+) -> Result<Option<LaunchOutcome>> {
+    if let Some(error) = status
+        .get("lastError")
+        .and_then(Value::as_str)
+        .filter(|error| !error.is_empty())
+    {
+        if !begun {
+            return Ok(Some(LaunchOutcome::Ignored(format!(
+                "Studio refused the start: {error}"
+            ))));
+        }
+        bail!(
+            "Studio could not start the {} session: {error}",
+            plan.session_kind()
+        );
+    }
+    if status.get("launchNonce").and_then(Value::as_str) != Some(launch.nonce.as_str()) {
+        bail!(
+            "Studio switched to a different {} session while starting",
+            plan.session_kind()
+        );
+    }
+    ensure_plugin_api_ok(status)?;
+    Ok(None)
+}
+
+fn started_result(
+    bridge: &BridgeServer,
+    launch: &TestLaunch,
+    plan: PlayLaunchPlan,
+    clients: Vec<Value>,
+) -> Value {
+    let mut result = json!({
+        "ok": true,
+        "action": "start",
+        "mode": plan.plugin_mode(),
+        "launchNonce": launch.nonce,
+        "editRuntimeId": launch.edit_runtime_id,
+        "editPid": bridge.studio_pid_for_runtime(BridgeTarget::Edit, &launch.edit_runtime_id).ok(),
+        "clients": clients,
+    });
+    if let Some(players) = plan.players() {
+        result["players"] = json!(players);
     }
     result
+}
+
+fn start_timeout_error(
+    bridge: &BridgeServer,
+    plan: PlayLaunchPlan,
+    progress: (bool, usize),
+    start_result: &Value,
+    last_status: &Value,
+    clients: &[Value],
+) -> anyhow::Error {
+    let (server_ready, client_count) = progress;
+    let text = |value: &Value| serde_json::to_string(value).unwrap_or_default();
+    match plan {
+        PlayLaunchPlan::Multi(players) => anyhow::anyhow!(
+            "Timed out waiting for the multiplayer test instances to connect \
+             (server ready: {server_ready}, clients connected: {client_count}/{players}). \
+             Start request result: {start_result}; connected bridges: {}",
+            text(&json!(clients))
+        ),
+        PlayLaunchPlan::Play | PlayLaunchPlan::Run => anyhow::anyhow!(
+            "Timed out waiting for the play session to start; last status: {}, connected bridges: {}",
+            text(last_status),
+            text(&json!(bridge.list_bridge_clients()))
+        ),
+    }
+}
+
+fn launch_play_session(
+    bridge: &BridgeServer,
+    launch: &TestLaunch,
+    plan: PlayLaunchPlan,
+) -> Result<LaunchOutcome> {
+    let mut watch = LaunchWatch::new(bridge, launch);
+    let start_result = bridge.call_for_runtime_with_timeout(
+        "startStopPlay",
+        plan.request(&launch.nonce),
+        BridgeTarget::Edit,
+        &launch.edit_runtime_id,
+        None,
+    )?;
+    if start_result.get("launchNonce").and_then(Value::as_str) != Some(launch.nonce.as_str()) {
+        bail!("Studio started a different {} session", plan.session_kind());
+    }
+    if start_result.get("ok").and_then(Value::as_bool) == Some(false)
+        && start_result.get("starting").and_then(Value::as_bool) != Some(true)
+    {
+        ensure_plugin_api_ok(&start_result)?;
+    }
+    let started = Instant::now();
+    let mut last_progress = started;
+    let mut last_seen = (false, 0usize);
+    loop {
+        let status = studio_play_status_for_runtime(bridge, &launch.edit_runtime_id);
+        let last_status = match &status {
+            Ok(status) => {
+                if let Some(outcome) = launch_status_outcome(status, launch, plan, watch.begun)? {
+                    return Ok(outcome);
+                }
+                status.clone()
+            }
+            Err(error) => json!({ "error": format!("{error:#}") }),
+        };
+        let clients = test_launch_clients(bridge, launch);
+        let server_ready = clients
+            .iter()
+            .any(|entry| entry["role"] == BRIDGE_ROLE_PLAY_SERVER);
+        let client_count = clients
+            .iter()
+            .filter(|entry| entry["role"] == BRIDGE_ROLE_PLAY_CLIENT)
+            .count();
+        if server_ready && client_count >= plan.clients_needed() {
+            return Ok(LaunchOutcome::Started(started_result(
+                bridge, launch, plan, clients,
+            )));
+        }
+        watch.observe(status.as_ref().ok(), &clients);
+        let executing = status
+            .as_ref()
+            .ok()
+            .and_then(|status| status.get("executing"))
+            .and_then(Value::as_bool);
+        if plan.start_was_ignored(started.elapsed(), watch.begun, executing) {
+            return Ok(LaunchOutcome::Ignored(if executing == Some(false) {
+                "Studio returned from the start without opening the test".to_string()
+            } else {
+                format!(
+                    "no sign of the test {} s after the start request",
+                    plan.sign_timeout().as_secs()
+                )
+            }));
+        }
+        if (server_ready, client_count) != last_seen {
+            last_seen = (server_ready, client_count);
+            last_progress = Instant::now();
+        }
+        if Instant::now() >= plan.start_deadline(started, last_progress) {
+            return Err(start_timeout_error(
+                bridge,
+                plan,
+                last_seen,
+                &start_result,
+                &last_status,
+                &clients,
+            ));
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// The way a running session was launched, from the Edit window's play
+/// controller; None when Renium did not launch it.
+fn running_session_plan(
+    status: &Value,
+    clients: &[Value],
+    remembered: Option<PlayLaunchPlan>,
+) -> Option<PlayLaunchPlan> {
+    status
+        .get("launchNonce")
+        .and_then(Value::as_str)
+        .filter(|nonce| !nonce.is_empty())?;
+    match status.get("mode").and_then(Value::as_str)? {
+        "play" => Some(PlayLaunchPlan::Play),
+        "run" => Some(PlayLaunchPlan::Run),
+        "multi" => status
+            .get("players")
+            .and_then(Value::as_u64)
+            .and_then(|players| u32::try_from(players).ok())
+            .or_else(|| remembered.and_then(PlayLaunchPlan::players))
+            .or_else(|| {
+                let connected = clients
+                    .iter()
+                    .filter(|entry| entry["role"] == BRIDGE_ROLE_PLAY_CLIENT)
+                    .count();
+                u32::try_from(connected).ok().filter(|count| *count > 0)
+            })
+            .map(PlayLaunchPlan::Multi),
+        _ => None,
+    }
+}
+
+const RESTART_OUTSIDE_RENIUM: &str = "The running session was not started by Renium, so its mode and player count are unknown; it restarted as ordinary Play (add -p N or --mode to choose)";
+const RESTART_NOTHING_KNOWN: &str = "No session was running and none started by this Renium daemon is known for this Edit window; it started ordinary Play (add -p N or --mode to choose)";
+
+fn restart_plan(
+    args: &StartStopPlayArgs,
+    previous: Option<PlayLaunchPlan>,
+    running: bool,
+) -> (PlayLaunchPlan, Option<&'static str>) {
+    if let Some(players) = args.players {
+        return (PlayLaunchPlan::Multi(players), None);
+    }
+    if let Some(mode) = args.mode.as_deref() {
+        let plan = if matches!(mode, "run" | "server") {
+            PlayLaunchPlan::Run
+        } else {
+            PlayLaunchPlan::Play
+        };
+        return (plan, None);
+    }
+    match previous {
+        Some(plan) => (plan, None),
+        None if running => (PlayLaunchPlan::Play, Some(RESTART_OUTSIDE_RENIUM)),
+        None => (PlayLaunchPlan::Play, Some(RESTART_NOTHING_KNOWN)),
+    }
+}
+
+fn restart_play_result(args: StartStopPlayArgs, bridge: &BridgeServer) -> Result<Value> {
+    let edit_runtime_id = bridge
+        .runtime_pin_for_selector(BridgeTarget::Edit, None)?
+        .runtime_id;
+    let status = studio_play_status_for_runtime(bridge, &edit_runtime_id)?;
+    let (clients, _) = play_clients_by_state(bridge, &edit_runtime_id);
+    let running = play_status_is_running(&status) || !clients.is_empty();
+    let remembered = remembered_launch(&edit_runtime_id);
+    let previous = if running {
+        running_session_plan(&status, &clients, remembered)
+    } else {
+        remembered
+    };
+    let (plan, note) = restart_plan(&args, previous, running);
+    let restarted = running
+        && stop_studio_play_with_bridge_result(bridge)?
+            .get("ok")
+            .and_then(Value::as_bool)
+            == Some(true);
+    let mut result = start_play_with_retries(bridge, plan)?;
+    result["serverReady"] = json!(server_answers_luau(bridge));
+    result["restarted"] = json!(restarted);
+    if let Some(note) = note {
+        result["restartNote"] = json!(note);
+    }
+    Ok(result)
 }
 
 #[cfg(windows)]
@@ -2729,7 +3117,11 @@ pub(crate) fn list_clients_command(args: ListClientsArgs) -> Result<()> {
             client.remove("runtimeId");
         }
     }
-    print_json_output(&json!({ "clients": clients }), false)
+    let mut output = json!({ "clients": clients });
+    if let Some(orphans) = result.get("orphans") {
+        output["orphans"] = orphans.clone();
+    }
+    print_json_output(&output, false)
 }
 
 pub(crate) fn editor_review_decision_result(
@@ -2908,24 +3300,17 @@ fn request_play_runtimes_to_stop(
     }
 }
 
-pub(crate) fn active_studio_play_clients(
-    bridge: &BridgeServer,
-    edit_runtime_id: &str,
-) -> Vec<Value> {
+/// This Edit window's play runtimes, split into running ones and ones whose
+/// test has stopped while their DataModel is still open.
+fn play_clients_by_state(bridge: &BridgeServer, edit_runtime_id: &str) -> (Vec<Value>, Vec<Value>) {
     let clients = studio_play_clients(bridge, edit_runtime_id);
     if clients.is_empty() {
-        return clients;
+        return (clients, Vec::new());
     }
     let edit_stopped = runtime_stopped_state(bridge, BridgeTarget::Edit, edit_runtime_id);
-    let mut active = Vec::new();
-    for client in clients {
-        if play_runtime_is_active(edit_stopped, play_client_stopped_state(bridge, &client)) {
-            active.push(client);
-        } else if let Some(runtime_id) = client.get("runtimeId").and_then(Value::as_str) {
-            bridge.retire_runtime(runtime_id);
-        }
-    }
-    active
+    clients.into_iter().partition(|client| {
+        play_runtime_is_active(edit_stopped, play_client_stopped_state(bridge, client))
+    })
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -2950,15 +3335,89 @@ fn separate_play_processes(bridge: &BridgeServer, edit_runtime: &str) -> Vec<u32
 }
 
 #[cfg(any(windows, target_os = "macos"))]
-fn watch_play_processes(
-    bridge: &BridgeServer,
-    edit_runtime: &str,
-) -> Result<Vec<process_exit::ProcessExit>> {
+type PlayProcessExits = Vec<process_exit::ProcessExit>;
+#[cfg(not(any(windows, target_os = "macos")))]
+type PlayProcessExits = Vec<std::convert::Infallible>;
+
+#[cfg(any(windows, target_os = "macos"))]
+fn watch_play_processes(bridge: &BridgeServer, edit_runtime: &str) -> Result<PlayProcessExits> {
     separate_play_processes(bridge, edit_runtime)
         .into_iter()
         .map(process_exit::ProcessExit::watch)
         .filter_map(Result::transpose)
         .collect()
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn watch_play_processes(_bridge: &BridgeServer, _edit_runtime: &str) -> Result<PlayProcessExits> {
+    Ok(Vec::new())
+}
+
+// A stopped test DataModel closes its bridge channels when Studio tears it down
+// and its plugin unloads. A test started before that is dropped by Studio.
+const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Splits play runtimes into those hosted by the Edit window's own process,
+/// whose DataModels close without a process exit to wait for, and the rest.
+fn split_in_process(
+    bridge: &BridgeServer,
+    edit_runtime_id: &str,
+    clients: Vec<Value>,
+) -> (Vec<Value>, Vec<Value>) {
+    let Ok(edit_pid) = bridge.studio_pid_for_runtime(BridgeTarget::Edit, edit_runtime_id) else {
+        return (clients, Vec::new());
+    };
+    clients.into_iter().partition(|client| {
+        client
+            .get("pid")
+            .and_then(Value::as_u64)
+            .is_none_or(|pid| pid == u64::from(edit_pid))
+    })
+}
+
+fn wait_for_test_datamodels_to_close(
+    bridge: &BridgeServer,
+    edit_runtime_id: &str,
+    deadline: Instant,
+) -> Duration {
+    let started = Instant::now();
+    let deadline = deadline.min(started + TEARDOWN_TIMEOUT);
+    while Instant::now() < deadline
+        && !split_in_process(
+            bridge,
+            edit_runtime_id,
+            studio_play_clients(bridge, edit_runtime_id),
+        )
+        .0
+        .is_empty()
+    {
+        thread::sleep(Duration::from_millis(100));
+    }
+    started.elapsed()
+}
+
+fn finish_stop(
+    bridge: &BridgeServer,
+    edit_runtime_id: &str,
+    processes: &PlayProcessExits,
+    shutdown_deadline: Instant,
+    result: &mut Value,
+) -> Result<()> {
+    let teardown = wait_for_test_datamodels_to_close(bridge, edit_runtime_id, shutdown_deadline);
+    #[cfg(any(windows, target_os = "macos"))]
+    process_exit::wait(processes, shutdown_deadline)?;
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let _ = processes;
+    let closed = close_leftover_test_processes(bridge, edit_runtime_id, Duration::from_secs(5));
+    retire_play_clients(bridge, &studio_play_clients(bridge, edit_runtime_id));
+    bridge.clear_runtime_pins();
+    if teardown >= Duration::from_millis(250) {
+        result["waitedForTeardownMs"] = json!(teardown.as_millis());
+    }
+    if !closed.is_empty() {
+        result["closedProcesses"] = json!(closed);
+    }
+    Ok(())
 }
 
 fn stop_studio_play_with_bridge_result(bridge: &BridgeServer) -> Result<Value> {
@@ -2974,24 +3433,21 @@ fn stop_studio_play_with_bridge_result(bridge: &BridgeServer) -> Result<Value> {
     )?;
     // Closing a test DataModel precedes process exit on Windows and macOS. Its later exit
     // notification can end the next multiplayer launch if stop returns early.
-    #[cfg(any(windows, target_os = "macos"))]
     let processes = watch_play_processes(bridge, &edit_runtime_id)?;
     #[cfg(any(windows, target_os = "macos"))]
     let shutdown_deadline = Instant::now() + process_exit::STOP_TIMEOUT;
     #[cfg(not(any(windows, target_os = "macos")))]
     let shutdown_deadline = Instant::now() + Duration::from_secs(40);
-    let initial = studio_play_status_for_runtime(bridge, &edit_runtime_id)?;
-    let mut active_clients = active_studio_play_clients(bridge, &edit_runtime_id);
+    let mut initial = studio_play_status_for_runtime(bridge, &edit_runtime_id)?;
+    let (mut active_clients, _) = play_clients_by_state(bridge, &edit_runtime_id);
     if play_status_is_stopped(&initial) && active_clients.is_empty() {
-        #[cfg(any(windows, target_os = "macos"))]
-        process_exit::wait(&processes, shutdown_deadline)?;
-        let closed =
-            close_leftover_test_processes(bridge, &edit_runtime_id, Duration::from_secs(5));
-        bridge.clear_runtime_pins();
-        let mut initial = initial;
-        if !closed.is_empty() {
-            initial["closedProcesses"] = json!(closed);
-        }
+        finish_stop(
+            bridge,
+            &edit_runtime_id,
+            &processes,
+            shutdown_deadline,
+            &mut initial,
+        )?;
         return Ok(initial);
     }
     let launch_nonce = initial
@@ -3032,7 +3488,7 @@ fn stop_studio_play_with_bridge_result(bridge: &BridgeServer) -> Result<Value> {
             let status_stopped = match studio_play_status_for_runtime(bridge, &edit_runtime_id) {
                 Ok(status) => {
                     last_status = status.clone();
-                    active_clients = active_studio_play_clients(bridge, &edit_runtime_id);
+                    active_clients = play_clients_by_state(bridge, &edit_runtime_id).0;
                     play_status_is_stopped(&status) && active_clients.is_empty()
                 }
                 Err(err) => {
@@ -3047,12 +3503,6 @@ fn stop_studio_play_with_bridge_result(bridge: &BridgeServer) -> Result<Value> {
             thread::sleep(Duration::from_millis(100));
         }
         if stopped {
-            #[cfg(any(windows, target_os = "macos"))]
-            process_exit::wait(&processes, shutdown_deadline)?;
-            let closed =
-                close_leftover_test_processes(bridge, &edit_runtime_id, Duration::from_secs(5));
-            retire_play_clients(bridge, &studio_play_clients(bridge, &edit_runtime_id));
-            bridge.clear_runtime_pins();
             let mut result = json!({
                 "ok": true,
                 "action": "stop",
@@ -3060,9 +3510,13 @@ fn stop_studio_play_with_bridge_result(bridge: &BridgeServer) -> Result<Value> {
                 "attempts": attempt,
                 "status": last_status,
             });
-            if !closed.is_empty() {
-                result["closedProcesses"] = json!(closed);
-            }
+            finish_stop(
+                bridge,
+                &edit_runtime_id,
+                &processes,
+                shutdown_deadline,
+                &mut result,
+            )?;
             return Ok(result);
         }
         if Instant::now() >= shutdown_deadline {
@@ -3087,12 +3541,16 @@ fn studio_play_status_for_runtime(bridge: &BridgeServer, runtime_id: &str) -> Re
     Ok(status)
 }
 
+/// Waits until the Edit window can start a test: its controller is ready and
+/// the previous test's DataModels are gone. Returns the status, which reports
+/// a running session when one is still active.
 fn wait_for_studio_play_ready(bridge: &BridgeServer, runtime_id: &str) -> Result<Value> {
     let deadline = Instant::now() + BRIDGE_DEFAULT_RESPONSE_TIMEOUT;
     loop {
         let mut status = studio_play_status_for_runtime(bridge, runtime_id)?;
-        let clients = active_studio_play_clients(bridge, runtime_id);
+        let (clients, closing) = play_clients_by_state(bridge, runtime_id);
         if !clients.is_empty() {
+            retire_play_clients(bridge, &closing);
             let launch_nonce = single_play_launch_nonce(&clients);
             status["running"] = Value::Bool(true);
             status["starting"] = Value::Bool(false);
@@ -3102,13 +3560,20 @@ fn wait_for_studio_play_ready(bridge: &BridgeServer, runtime_id: &str) -> Result
             }
             return Ok(status);
         }
-        if status.get("running").and_then(Value::as_bool) == Some(true)
-            || status.get("starting").and_then(Value::as_bool) == Some(true)
-            || status.get("readyForStart").and_then(Value::as_bool) != Some(false)
-        {
+        let (closing, separate) = split_in_process(bridge, runtime_id, closing);
+        retire_play_clients(bridge, &separate);
+        if play_status_is_running(&status) {
+            return Ok(status);
+        }
+        let controller_ready = status.get("readyForStart").and_then(Value::as_bool) != Some(false);
+        if controller_ready && closing.is_empty() {
             return Ok(status);
         }
         if Instant::now() >= deadline {
+            if controller_ready {
+                retire_play_clients(bridge, &closing);
+                return Ok(status);
+            }
             bail!("Studio did not finish the previous play session before the next start");
         }
         thread::sleep(Duration::from_millis(100));
@@ -3238,5 +3703,185 @@ mod play_state_tests {
             "error": "DataModel stopped",
         })));
         assert!(play_status_is_running(&json!({ "running": true })));
+    }
+
+    #[test]
+    fn kill_orphans_parses_only_on_its_own() {
+        let args = play_args(&["rbx", "play", "--kill-orphans"]).unwrap();
+        assert!(args.kill_orphans && !args.start && !args.stop);
+        validate_play_args(&args).unwrap();
+        for parts in [
+            &["rbx", "play", "--kill-orphans", "-s"][..],
+            &["rbx", "play", "--kill-orphans", "-x"],
+            &["rbx", "play", "--kill-orphans", "-r"],
+            &["rbx", "play", "--kill-orphans", "-p", "2"],
+            &["rbx", "play", "--kill-orphans", "--add-players", "1"],
+            &["rbx", "play", "--kill-orphans", "--leave"],
+            &["rbx", "play", "--kill-orphans", "--mode", "run"],
+            &["rbx", "play", "--kill-orphans", "--until", "true"],
+        ] {
+            assert!(play_args(parts).is_err(), "{parts:?}");
+        }
+    }
+
+    #[test]
+    fn restart_reuses_the_launch_unless_flags_override_it() {
+        let restart = play_args(&["rbx", "play", "-r"]).unwrap();
+        assert!(restart.restart && restart.players.is_none());
+        assert!(play_args(&["rbx", "play", "-r", "-x"]).is_err());
+        let multi = Some(PlayLaunchPlan::Multi(2));
+        assert_eq!(
+            restart_plan(&restart, multi, true),
+            (PlayLaunchPlan::Multi(2), None)
+        );
+        assert_eq!(
+            restart_plan(&restart, Some(PlayLaunchPlan::Run), true),
+            (PlayLaunchPlan::Run, None)
+        );
+        assert_eq!(
+            restart_plan(&restart, multi, false),
+            (PlayLaunchPlan::Multi(2), None)
+        );
+        assert_eq!(
+            restart_plan(&restart, None, true),
+            (PlayLaunchPlan::Play, Some(RESTART_OUTSIDE_RENIUM))
+        );
+        assert_eq!(
+            restart_plan(&restart, None, false),
+            (PlayLaunchPlan::Play, Some(RESTART_NOTHING_KNOWN))
+        );
+        let three = play_args(&["rbx", "play", "-r", "-p", "3"]).unwrap();
+        assert_eq!(
+            restart_plan(&three, multi, true),
+            (PlayLaunchPlan::Multi(3), None)
+        );
+        let solo = play_args(&["rbx", "play", "-r", "--mode", "play"]).unwrap();
+        assert_eq!(
+            restart_plan(&solo, multi, true),
+            (PlayLaunchPlan::Play, None)
+        );
+        let server = play_args(&["rbx", "play", "-r", "--mode", "server"]).unwrap();
+        assert_eq!(
+            restart_plan(&server, None, true),
+            (PlayLaunchPlan::Run, None)
+        );
+    }
+
+    #[test]
+    fn the_edit_controller_names_how_its_session_was_launched() {
+        let status = |mode: &str, players: Value| json!({ "running": true, "launchNonce": "multi-1", "mode": mode, "players": players });
+        let clients = [
+            json!({ "role": BRIDGE_ROLE_PLAY_SERVER }),
+            json!({ "role": BRIDGE_ROLE_PLAY_CLIENT }),
+            json!({ "role": BRIDGE_ROLE_PLAY_CLIENT }),
+        ];
+        assert_eq!(
+            running_session_plan(&status("multi", json!(3)), &clients, None),
+            Some(PlayLaunchPlan::Multi(3))
+        );
+        assert_eq!(
+            running_session_plan(
+                &status("multi", Value::Null),
+                &clients,
+                Some(PlayLaunchPlan::Multi(4))
+            ),
+            Some(PlayLaunchPlan::Multi(4))
+        );
+        assert_eq!(
+            running_session_plan(&status("multi", Value::Null), &clients, None),
+            Some(PlayLaunchPlan::Multi(2))
+        );
+        assert_eq!(
+            running_session_plan(&status("multi", Value::Null), &[], None),
+            None
+        );
+        assert_eq!(
+            running_session_plan(&status("play", Value::Null), &[], None),
+            Some(PlayLaunchPlan::Play)
+        );
+        assert_eq!(
+            running_session_plan(&status("run", Value::Null), &[], None),
+            Some(PlayLaunchPlan::Run)
+        );
+        let manual = json!({ "running": true, "mode": Value::Null });
+        assert_eq!(
+            running_session_plan(&manual, &clients, Some(PlayLaunchPlan::Multi(2))),
+            None
+        );
+        let unowned = json!({ "running": true, "launchNonce": "", "mode": "play" });
+        assert_eq!(running_session_plan(&unowned, &[], None), None);
+    }
+
+    #[test]
+    fn an_ignored_start_is_told_apart_from_a_slow_one() {
+        let second = Duration::from_secs(1);
+        for plan in [PlayLaunchPlan::Play, PlayLaunchPlan::Multi(2)] {
+            let silent = plan.sign_timeout();
+            assert!(!plan.start_was_ignored(second, false, Some(true)));
+            assert!(!plan.start_was_ignored(second, false, Some(false)));
+            assert!(plan.start_was_ignored(START_RETURN_GRACE, false, Some(false)));
+            assert!(!plan.start_was_ignored(START_RETURN_GRACE, false, Some(true)));
+            assert!(!plan.start_was_ignored(START_RETURN_GRACE, false, None));
+            assert!(!plan.start_was_ignored(silent - second, false, Some(true)));
+            assert!(plan.start_was_ignored(silent, false, Some(true)));
+            assert!(plan.start_was_ignored(silent, false, None));
+            assert!(!plan.start_was_ignored(silent * 10, true, Some(false)));
+        }
+        assert_eq!(PlayLaunchPlan::Run.sign_timeout(), SINGLE_START_TIMEOUT);
+        assert!(PlayLaunchPlan::Multi(1).sign_timeout() > SINGLE_START_TIMEOUT);
+    }
+
+    #[test]
+    fn launch_plans_ask_studio_for_their_own_session() {
+        assert_eq!(
+            PlayLaunchPlan::Multi(2).request("n"),
+            json!({ "start": true, "players": 2, "launchNonce": "n" })
+        );
+        assert_eq!(
+            PlayLaunchPlan::Run.request("n"),
+            json!({ "start": true, "mode": "run", "launchNonce": "n" })
+        );
+        assert_eq!(PlayLaunchPlan::Play.clients_needed(), 1);
+        assert_eq!(PlayLaunchPlan::Run.clients_needed(), 0);
+        assert_eq!(PlayLaunchPlan::Multi(3).clients_needed(), 3);
+        let started = Instant::now();
+        assert_eq!(
+            PlayLaunchPlan::Play.start_deadline(started, started + Duration::from_secs(5)),
+            started + SINGLE_START_TIMEOUT
+        );
+        assert_eq!(
+            PlayLaunchPlan::Multi(2).start_deadline(started, started),
+            multiplayer_start_deadline(started, started)
+        );
+    }
+
+    #[test]
+    fn a_start_error_before_the_test_appears_is_retried() {
+        let launch = TestLaunch {
+            nonce: "multi-7".into(),
+            edit_runtime_id: "edit".into(),
+        };
+        let plan = PlayLaunchPlan::Multi(2);
+        let refused = json!({ "ok": true, "lastError": "Studio is busy" });
+        match launch_status_outcome(&refused, &launch, plan, false).unwrap() {
+            Some(LaunchOutcome::Ignored(reason)) => assert!(reason.contains("Studio is busy")),
+            _ => panic!("a refusal before the test began must be retried"),
+        }
+        let failed = launch_status_outcome(&refused, &launch, plan, true)
+            .err()
+            .unwrap();
+        assert!(
+            failed
+                .to_string()
+                .contains("could not start the multiplayer session")
+        );
+        let other = json!({ "ok": true, "launchNonce": "multi-8" });
+        assert!(launch_status_outcome(&other, &launch, plan, false).is_err());
+        let current = json!({ "ok": true, "launchNonce": "multi-7", "starting": true });
+        assert!(
+            launch_status_outcome(&current, &launch, plan, false)
+                .unwrap()
+                .is_none()
+        );
     }
 }

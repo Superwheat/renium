@@ -628,6 +628,7 @@ pub(crate) struct BridgeInfoPayload {
     pub(crate) runtime_id: String,
     pub(crate) launch_nonce: String,
     pub(crate) launch_edit_runtime_id: String,
+    pub(crate) launch_place_name: String,
     pub(crate) bridge_version: String,
     pub(crate) bridge_build_unix: i64,
     pub(crate) bridge_role: String,
@@ -3375,6 +3376,7 @@ impl BridgeServer {
             place_id: Option<i64>,
             game_id: Option<i64>,
             place_name: String,
+            launch_place_name: String,
             build_unix: i64,
             ports: Vec<u16>,
             pid: Option<u32>,
@@ -3481,6 +3483,7 @@ impl BridgeServer {
                         place_id: info.place_id,
                         game_id: info.game_id,
                         place_name: info.place_name.clone(),
+                        launch_place_name: info.launch_place_name.clone(),
                         build_unix: info.bridge_build_unix,
                         ports: vec![snapshot.port],
                         pid: snapshot.studio_pid,
@@ -3493,9 +3496,15 @@ impl BridgeServer {
             .filter(|entry| entry.role == BRIDGE_ROLE_EDIT && !entry.place_name.is_empty())
             .map(|entry| (entry.runtime_id.clone(), entry.place_name.clone()))
             .collect::<HashMap<_, _>>();
+        // Local test DataModels call themselves Place1 or Server; once their Edit
+        // window is gone, the name it stamped into the launch still identifies them.
         for entry in &mut entries {
-            if let Some(place_name) = edit_place_names.get(&entry.launch_edit_runtime_id) {
-                entry.place_name.clone_from(place_name);
+            match edit_place_names.get(&entry.launch_edit_runtime_id) {
+                Some(place_name) => entry.place_name.clone_from(place_name),
+                None if !entry.launch_place_name.is_empty() => {
+                    entry.place_name = std::mem::take(&mut entry.launch_place_name);
+                }
+                None => {}
             }
         }
         entries.sort_by(|a, b| {

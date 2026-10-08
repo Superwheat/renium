@@ -179,13 +179,14 @@ pub(super) fn play(operation: u16, parameters: &Value) -> Result<StartStopPlayAr
         bridge: bridge(object)?,
         start: operation == op::PLAY_START && add_players.is_none() && !leave,
         stop: operation == op::PLAY_STOP,
-        restart: false,
+        restart: operation == op::PLAY_START && boolean(object, "restart")?,
         players: optional_number(object, "players")?,
         add_players,
         leave,
         mode: string(object, "mode"),
         until: None,
         until_timeout: 120.0,
+        kill_orphans: false,
     })
 }
 
@@ -367,5 +368,18 @@ mod tests {
         assert!(leave.leave && !leave.start);
         let start = play(op::PLAY_START, &json!({"players": 2, "leave": false})).unwrap();
         assert!(start.start && start.add_players.is_none());
+    }
+
+    #[test]
+    fn restart_reaches_the_daemon_only_with_a_start() {
+        let restart = play(op::PLAY_START, &json!({"restart": true, "players": null})).unwrap();
+        assert!(restart.restart && restart.start && restart.players.is_none());
+        assert!(!play(op::PLAY_START, &json!({})).unwrap().restart);
+        assert!(
+            !play(op::PLAY_STOP, &json!({"restart": true}))
+                .unwrap()
+                .restart
+        );
+        assert!(play(op::PLAY_START, &json!({"restart": "yes"})).is_err());
     }
 }

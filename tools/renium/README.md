@@ -173,7 +173,9 @@ rbx lc "return game.Players.LocalPlayer.Name" 1
 
 `play -s` starts Play and `play -x` stops it; `--players 2` starts a local server
 with two clients. During such a test, `play --add-players N` adds clients and
-`play --leave -p N` kicks one from the server without ending the session. `l` runs Luau in Edit, or on the server during Play, and `lc`
+`play --leave -p N` kicks one from the server without ending the session. `play -r`
+restarts a session the way it was started, and `play --kill-orphans` closes test
+windows whose Edit window was closed. `l` runs Luau in Edit, or on the server during Play, and `lc`
 runs it on a client. `co` reads a console, `wait` waits for a Luau condition,
 `inp` sends keys and clicks to a client, and `sc` and `rs` capture screenshots and
 recordings, all without taking focus. Printed output comes back to you instead of
