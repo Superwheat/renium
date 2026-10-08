@@ -812,6 +812,56 @@ pub(super) enum Commands {
 mod tests {
     use super::*;
 
+    fn client_luau(arguments: &[&str]) -> anyhow::Result<ExecuteLuauArgs> {
+        let matches = command()
+            .try_get_matches_from(["rbx", "lc"].iter().chain(arguments))
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        match <Cli as clap::FromArgMatches>::from_arg_matches(&matches)?.command {
+            Commands::ExecuteClientLuau(args) => args.into_luau_args(),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn client_luau_reports_misplaced_positionals_with_a_corrected_command() {
+        let detached = client_luau(&["-t", "30", "--detach", "probe", "print(1)", "1"]).unwrap();
+        assert_eq!(detached.code.as_deref(), Some("print(1)"));
+        assert_eq!(detached.player.as_deref(), Some("1"));
+        assert_eq!(detached.timeout, 30.0);
+        let collected = client_luau(&["-t", "15", "--collect", "probe", "1", "--stop"]).unwrap();
+        assert_eq!(collected.code, None);
+        assert_eq!(collected.player.as_deref(), Some("1"));
+        assert!(collected.runner.stop);
+        assert!(client_luau(&["--collect", "probe"]).unwrap().client);
+
+        for (arguments, expected) in [
+            (
+                &["--detach", "probe", "-t", "30", "1", "print(1)"][..],
+                "lc takes the Luau code before the player: rbx lc --detach probe \"CODE\" 1",
+            ),
+            (
+                &["2", "print(1)"][..],
+                "lc takes the Luau code before the player: rbx lc \"CODE\" 2",
+            ),
+            (
+                &["-t", "15", "--collect", "probe", "1", "return state"][..],
+                "--collect takes no code, only NAME and an optional PLAYER: rbx lc --collect probe 1",
+            ),
+            (
+                &["--collect", "probe", "-t", "15", "2", "print(1)", "extra"][..],
+                "--collect takes no code, only NAME and an optional PLAYER: rbx lc --collect probe 2",
+            ),
+            (
+                &["--detach", "probe", "print(1)", "1", "extra"][..],
+                "unexpected extra argument \"extra\" (quote the whole code as one argument): rbx lc --detach probe \"CODE\" 1",
+            ),
+        ] {
+            let error = client_luau(arguments).err().unwrap().to_string();
+            assert!(error.ends_with(expected), "{arguments:?}: {error}");
+            assert!(!error.contains('\n'), "{arguments:?}: {error}");
+        }
+    }
+
     #[test]
     fn every_visible_command_has_a_short_example() {
         command().debug_assert();
@@ -1174,6 +1224,8 @@ pub(super) struct ExecuteClientLuauArgs {
     pub(super) code: Option<String>,
     #[arg(help = "Play client by name or index")]
     pub(super) player: Option<String>,
+    #[arg(hide = true)]
+    pub(super) unexpected: Vec<String>,
     #[arg(
         help = "Seconds before the run is cancelled",
         short,
@@ -1183,6 +1235,56 @@ pub(super) struct ExecuteClientLuauArgs {
     pub(super) timeout: f64,
     #[command(flatten)]
     pub(super) runner: LuauRunnerArgs,
+}
+
+impl ExecuteClientLuauArgs {
+    /// `lc` positionals are CODE then PLAYER, or PLAYER alone after
+    /// `--collect NAME`. Misplaced values are rejected with a corrected
+    /// command instead of running a player index as code.
+    pub(super) fn into_luau_args(mut self) -> anyhow::Result<ExecuteLuauArgs> {
+        let player_hint = [self.player.as_deref(), self.code.as_deref()]
+            .into_iter()
+            .flatten()
+            .find(|value| is_player_index(value))
+            .unwrap_or("1");
+        if let Some(name) = self.runner.collect.as_deref() {
+            if self.player.is_some() || !self.unexpected.is_empty() {
+                anyhow::bail!(
+                    "--collect takes no code, only NAME and an optional PLAYER: rbx lc --collect {name} {player_hint}"
+                );
+            }
+            self.player = self.code.take();
+        } else {
+            let example = match self.runner.detach.as_deref() {
+                Some(name) => format!("rbx lc --detach {name} \"CODE\" {player_hint}"),
+                None => format!("rbx lc \"CODE\" {player_hint}"),
+            };
+            if self.code.as_deref().is_some_and(is_player_index) {
+                anyhow::bail!("lc takes the Luau code before the player: {example}");
+            }
+            if let Some(extra) = self.unexpected.first() {
+                anyhow::bail!(
+                    "lc takes CODE and an optional PLAYER; unexpected extra argument {extra:?} (quote the whole code as one argument): {example}"
+                );
+            }
+        }
+        Ok(ExecuteLuauArgs {
+            bridge: self.bridge,
+            code: self.code,
+            inline_code: None,
+            file: None,
+            client: self.player.is_none(),
+            player: self.player,
+            server: false,
+            edit: false,
+            timeout: self.timeout,
+            runner: self.runner,
+        })
+    }
+}
+
+fn is_player_index(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 #[derive(Parser, Default)]

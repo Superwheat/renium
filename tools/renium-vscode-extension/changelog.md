@@ -4,6 +4,7 @@
 
 ### Bug fixes
 
+- `rbx lc` with its arguments in the wrong order now says what is wrong and prints the corrected command in one line, instead of a usage dump or sending the player index to Studio as the code: the player given before the code (`rbx lc --detach probe 1 CODE`), code passed to `--collect NAME PLAYER`, and code split into several unquoted arguments.
 - `rbx pf use` and `rbx pf adv` no longer fail when one of Studio's child processes refuses to join the performance job. Studio's WebView2 renderers are sandboxed and answer `AssignProcessToJobObject` with access denied, which aborted the whole profile ("Could not assign process N to performance job (Windows error 5)") whenever a WebView2 panel was open. Such children are skipped and listed as `skippedProcesses` in `rbx pf show`; the Studio process and every child that accepts the job are constrained as before.
 
 ### Improvements
