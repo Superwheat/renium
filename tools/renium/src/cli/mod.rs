@@ -2180,6 +2180,18 @@ pub(super) struct StudioChangeStateArgs {
         value_name = "studio|editor"
     )]
     pub(super) prefer: Option<String>,
+    #[arg(
+        help = "First-connection mode: reconcile applies the comparison, verify only reports differences (default: liveSync.initialSyncPriority)",
+        long,
+        value_name = "reconcile|verify"
+    )]
+    pub(super) initial_sync_priority: Option<String>,
+    #[arg(
+        help = "Side that wins first-connection conflicts (default: liveSync.initialConflictPreference)",
+        long,
+        value_name = "none|studio|editor"
+    )]
+    pub(super) initial_conflict_preference: Option<String>,
 }
 
 #[derive(Parser)]

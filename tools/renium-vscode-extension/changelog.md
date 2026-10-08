@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Bug fixes
+
+- `rbx lon`, `rbx lst` and the other Live Sync commands now honour `liveSync.initialSyncPriority` and `liveSync.initialConflictPreference` from the project configuration, and accept `--initial-sync-priority` and `--initial-conflict-preference` for one run. The CLI never sent these settings to the daemon, so `rbx cfg set liveSync.initialSyncPriority verify` had no effect from the terminal: the first connection still reconciled and pushed Studio-side differences into the place. Only the VS Code extension applied the setting.
+
 ## 0.4.8 - 2026-10-08
 
 ### Bug fixes

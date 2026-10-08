@@ -31,7 +31,7 @@ When no Studio runtime connects, the `no_studio` error and `rbx status` carry a 
 
 Live Sync compares each side with their last common Renium state. One-sided changes transfer; independent edits merge; conflicts wait without overwriting either side. Something you added that is now missing from both Studio and the files was deleted in Studio, and the deletion synced; ask before putting it back.
 
-A published place that closed without saving reopens older than the files, and its differences count as Studio edits. Before reopening one, run `rbx cfg set liveSync.initialSyncPriority verify`, then read `rbx lst --details`: no differences means Studio kept the work. Otherwise ask the user which side to keep and use the resolution commands the CLI returns.
+A published place that closed without saving reopens older than the files, and its differences count as Studio edits. Before reopening one, run `rbx cfg set liveSync.initialSyncPriority verify` (or start with `rbx lon --initial-sync-priority verify`), then read `rbx lst --details`: no differences means Studio kept the work. Otherwise ask the user which side to keep and use the resolution commands the CLI returns.
 
 The editor asks which version to keep, then resumes startup. The CLI returns the conflict and resolution commands; `rbx lst --details` lists every conflict with the properties that differ and both values. Choose only with user direction or an existing conflict preference.
 

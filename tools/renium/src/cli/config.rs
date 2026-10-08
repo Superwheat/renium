@@ -186,6 +186,31 @@ fn apply_command(
             apply_bridge(matches, object, &mut args.bridge);
         }
         Commands::BridgeDaemon(args) => apply_bridge(matches, object, &mut args.bridge),
+        Commands::StudioChangeState(args)
+        | Commands::LiveStart(args)
+        | Commands::LiveStop(args)
+        | Commands::LiveStatus(args)
+        | Commands::RetryPending(args) => {
+            let live = object.get("liveSync").and_then(Value::as_object);
+            let configured = |key: &str| {
+                live.and_then(|live| live.get(key))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            };
+            apply_default(
+                matches,
+                "initial_sync_priority",
+                &mut args.initial_sync_priority,
+                configured("initialSyncPriority").map(Some),
+            );
+            apply_default(
+                matches,
+                "initial_conflict_preference",
+                &mut args.initial_conflict_preference,
+                configured("initialConflictPreference").map(Some),
+            );
+            apply_bridge(matches, object, &mut args.bridge);
+        }
         Commands::PushEditorChanges(args) => {
             apply_default_path(
                 matches,

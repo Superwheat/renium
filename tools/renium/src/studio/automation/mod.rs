@@ -596,6 +596,8 @@ pub(crate) fn studio_change_state_operation_command(
         "settleWaitSeconds": args.settle_wait_seconds,
         "contextBound": args.context_bound,
         "resolveConflictPreference": args.prefer,
+        "initialSyncPriority": args.initial_sync_priority,
+        "initialConflictPreference": args.initial_conflict_preference,
         "compact": !args.details,
         "manageFiles": true,
         "bridgeWaitSeconds": args.bridge.wait_seconds,

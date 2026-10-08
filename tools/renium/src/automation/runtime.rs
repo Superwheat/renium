@@ -2451,7 +2451,11 @@ fn pair_configuration(
         .unwrap_or_default();
     let raw_mode = runtime_settings
         .get("initialSyncPriority")
-        .and_then(Value::as_str);
+        .and_then(Value::as_str)
+        .or_else(|| request.get("initialSyncPriority").and_then(Value::as_str));
+    if raw_mode.is_some_and(|value| !matches!(value, "reconcile" | "verify" | "none")) {
+        bail!("p.initialSyncPriority must be reconcile or verify");
+    }
     let resolution = request
         .get("resolveConflictPreference")
         .and_then(Value::as_str);
@@ -3551,6 +3555,31 @@ mod tests {
         let mut expected = package.clone();
         expected["verified"] = json!(false);
         assert_eq!(compact(package, false), expected);
+    }
+
+    #[test]
+    fn request_supplies_the_initial_mode_when_the_plugin_reports_no_setting() {
+        let plugin = json!({ "runtimeSettingChanges": {} });
+        let request = json!({
+            "initialSyncPriority": "verify",
+            "initialConflictPreference": "studio"
+        });
+        let configuration = pair_configuration(&plugin, request.as_object().unwrap()).unwrap();
+        assert_eq!(configuration.mode, automation::reconcile::PairMode::Verify);
+        assert_eq!(
+            configuration.conflict_preference,
+            automation::reconcile::ConflictPreference::Studio
+        );
+
+        let plugin = json!({ "runtimeSettingChanges": { "initialSyncPriority": "reconcile" } });
+        let configuration = pair_configuration(&plugin, request.as_object().unwrap()).unwrap();
+        assert_eq!(
+            configuration.mode,
+            automation::reconcile::PairMode::Reconcile
+        );
+
+        let request = json!({ "initialSyncPriority": "sideways" });
+        assert!(pair_configuration(&json!({}), request.as_object().unwrap()).is_err());
     }
 
     #[test]

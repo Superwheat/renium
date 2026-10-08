@@ -121,6 +121,8 @@ pub(super) fn live(operation: u16, parameters: &Value) -> Result<StudioChangeSta
         context_bound: boolean(object, "contextBound")?,
         details: object.get("compact").and_then(Value::as_bool) != Some(true),
         prefer: string(object, "resolveConflictPreference"),
+        initial_sync_priority: string(object, "initialSyncPriority"),
+        initial_conflict_preference: string(object, "initialConflictPreference"),
     })
 }
 
