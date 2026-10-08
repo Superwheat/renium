@@ -125,6 +125,55 @@ pub(crate) struct EditorPackageTarget {
     pub(crate) path_segments: Vec<String>,
     pub(crate) path_ordinals: Vec<usize>,
     pub(crate) expected_version: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) creator: Option<PackageCreator>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) owned: Option<bool>,
+}
+
+/// Who published a package, as the Studio plugin read it from the catalog.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PackageCreator {
+    #[serde(rename = "type")]
+    pub(crate) kind: String,
+    pub(crate) id: i64,
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) asset: String,
+}
+
+/// Refuses to touch packages this account does not own: Renium never desyncs
+/// or rewrites someone else's package on the user's behalf.
+pub(crate) fn ensure_packages_owned(packages: &[EditorPackageTarget]) -> Result<()> {
+    let foreign: Vec<String> = packages
+        .iter()
+        .filter(|package| package.owned == Some(false))
+        .map(|package| {
+            let path = package.path_segments.join(".");
+            match &package.creator {
+                Some(creator) if !creator.asset.is_empty() => format!(
+                    "{path} (package '{}' by {} {})",
+                    creator.asset,
+                    creator.kind.to_ascii_lowercase(),
+                    creator.name
+                ),
+                Some(creator) => format!(
+                    "{path} (by {} {})",
+                    creator.kind.to_ascii_lowercase(),
+                    creator.name
+                ),
+                None => path,
+            }
+        })
+        .collect();
+    if foreign.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "The change touches a Roblox package this account does not own: {}. Renium does not push into or desync packages owned by others; revert those files to the package's content, or unlink the package in Studio (right-click the root, Unlink from Package) and push again",
+        foreign.join(", ")
+    );
 }
 
 #[derive(Deserialize)]
@@ -304,6 +353,7 @@ pub(crate) fn discover_editor_mutation_packages_with_timeout(
         };
         let result: EditorMutationPackages = serde_json::from_value(value)
             .context("Studio returned invalid mutation package targets")?;
+        ensure_packages_owned(&result.packages)?;
         for package in result.packages {
             if package.expected_version <= 0 {
                 bail!("Studio returned an invalid package version");
@@ -769,6 +819,14 @@ impl<'a> EditorTransaction<'a> {
                 .unwrap_or_else(|| Value::Array(Vec::new())),
         }))
         .context("Studio returned invalid transaction package targets")?;
+        if let Err(error) = ensure_packages_owned(&packages.packages) {
+            if let Err(rollback_error) = transaction.rollback() {
+                return Err(error.context(format!(
+                    "Rollback after refusing a foreign package also failed: {rollback_error:#}"
+                )));
+            }
+            return Err(error);
+        }
         if global_log_enabled(5) {
             log_global(
                 5,
@@ -2467,6 +2525,17 @@ fn push_editor_changes_with_collected(
         0
     };
     log_timing("native editor unchanged source filter", phase_started);
+    let phase_started = Instant::now();
+    let ownership_targets = editor_mutation_package_targets(&changes, None);
+    if !ownership_targets.is_empty() {
+        discover_editor_mutation_packages_with_timeout(
+            bridge,
+            &ownership_targets,
+            None,
+            Some(Duration::from_secs(20)),
+        )?;
+    }
+    log_timing("native editor package ownership", phase_started);
     let review_skipped = !args.no_review
         && !args.yes
         && !global_yes()
@@ -5085,5 +5154,56 @@ mod sync_tests {
                 "pathOrdinals": [1,1],
             }])
         );
+    }
+}
+
+#[cfg(test)]
+mod package_ownership_tests {
+    use super::{EditorPackageTarget, PackageCreator, ensure_packages_owned};
+
+    fn target(owned: Option<bool>, creator: Option<PackageCreator>) -> EditorPackageTarget {
+        EditorPackageTarget {
+            path_segments: vec![
+                "ReplicatedStorage".into(),
+                "TopbarPlus".into(),
+                "Icon".into(),
+            ],
+            path_ordinals: vec![1, 1, 1],
+            expected_version: 15,
+            creator,
+            owned,
+        }
+    }
+
+    #[test]
+    fn foreign_packages_are_refused_with_their_creator() {
+        let group = PackageCreator {
+            kind: "Group".into(),
+            id: 4676369,
+            name: "HD Admin".into(),
+            asset: "Icon".into(),
+        };
+        let error = ensure_packages_owned(&[target(Some(false), Some(group.clone()))])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("ReplicatedStorage.TopbarPlus.Icon (package 'Icon' by group HD Admin)"),
+            "{error}"
+        );
+        assert!(error.contains("Unlink from Package"), "{error}");
+        assert!(ensure_packages_owned(&[target(Some(true), Some(group))]).is_ok());
+        assert!(ensure_packages_owned(&[target(None, None)]).is_ok());
+        assert!(ensure_packages_owned(&[]).is_ok());
+    }
+
+    #[test]
+    fn package_targets_without_ownership_fields_still_parse() {
+        let legacy: EditorPackageTarget = serde_json::from_value(serde_json::json!({
+            "pathSegments": ["Workspace", "Map"], "pathOrdinals": [1, 1], "expectedVersion": 3
+        }))
+        .unwrap();
+        assert_eq!(legacy.owned, None);
+        assert_eq!(legacy.creator, None);
+        assert!(ensure_packages_owned(&[legacy]).is_ok());
     }
 }

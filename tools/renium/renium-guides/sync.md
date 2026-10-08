@@ -60,3 +60,7 @@ Reconciled syncs save their pre-sync state in `.renium/editor-history/sync`.
 `rbx rev --sync latest` restores the last sync's affected files; use a returned `historyId` instead of `latest` to select one. It refuses to overwrite newer edits or restore an unconfirmed transaction. `rbx rev --path FILE --print` writes a file's saved copy to stdout instead of restoring it; pass a `.renium/editor-history/<id>` entry as `--path` to pick an older copy.
 
 Live Sync transfers restored files normally. Without Live Sync, add `--apply-studio`. Use `--details` only when you need every restored path. Don't delete history you still need.
+
+## Packages owned by others
+
+A push that changes files inside a Roblox package this account does not own (a package from the Creator Store or another creator's group, such as a TopbarPlus install) is refused before Studio is touched, naming the package and its creator. Revert those files to the package's content, or unlink the package in Studio (right-click the package root, Unlink from Package) when the project is meant to carry its own copy; Renium never desyncs or rewrites someone else's package on your behalf.

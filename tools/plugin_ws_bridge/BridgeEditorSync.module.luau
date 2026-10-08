@@ -5474,6 +5474,58 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		return instance:FindFirstChildWhichIsA("PackageLink") ~= nil
 	end
 
+	local packageOwnershipCache: { [number]: any } = {}
+
+	-- Who published the package behind a root, and whether this Studio account
+	-- can be its owner: the creator for a user package, group membership for a
+	-- group package. Unknown (nil) when Roblox could not be asked.
+	local function packageOwnership(packageLink: Instance): (any, boolean?)
+		local okId, packageId = readProperty(packageLink, "PackageId")
+		local assetId = okId and tonumber(string.match(tostring(packageId), "%d+")) or nil
+		if assetId == nil then
+			return nil, nil
+		end
+		local cached = packageOwnershipCache[assetId]
+		if cached ~= nil then
+			return cached.creator, cached.owned
+		end
+		local okInfo, info = pcall(function()
+			return game:GetService("MarketplaceService"):GetProductInfo(assetId)
+		end)
+		if not okInfo or type(info) ~= "table" or type(info.Creator) ~= "table" then
+			return nil, nil
+		end
+		local creator = {
+			type = tostring(info.Creator.CreatorType),
+			id = info.Creator.CreatorTargetId,
+			name = info.Creator.Name,
+			asset = info.Name,
+		}
+		local okUser, userId = pcall(function()
+			return game:GetService("StudioService"):GetUserId()
+		end)
+		local owned: boolean? = nil
+		if okUser and type(userId) == "number" then
+			if creator.type == "User" then
+				owned = creator.id == userId
+			elseif creator.type == "Group" then
+				local okGroups, groups = pcall(function()
+					return game:GetService("GroupService"):GetGroupsAsync(userId)
+				end)
+				if okGroups and type(groups) == "table" then
+					owned = false
+					for _, group in groups do
+						if type(group) == "table" and group.Id == creator.id then
+							owned = true
+						end
+					end
+				end
+			end
+		end
+		packageOwnershipCache[assetId] = { creator = creator, owned = owned }
+		return creator, owned
+	end
+
 	local function directPackageVersion(instance: Instance): number
 		local packageLink = instance:FindFirstChildWhichIsA("PackageLink")
 		if packageLink == nil then
@@ -5623,10 +5675,13 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					local key = pathCacheKey(packageSegments, packageOrdinals)
 					if not packageKeys[key] then
 						packageKeys[key] = true
+						local creator, owned = packageOwnership(instance:FindFirstChildWhichIsA("PackageLink") :: Instance)
 						packages[#packages + 1] = {
 							pathSegments = packageSegments,
 							pathOrdinals = packageOrdinals,
 							expectedVersion = directPackageVersion(instance),
+							creator = creator,
+							owned = owned,
 							_key = key,
 						}
 					end
