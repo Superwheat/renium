@@ -2430,6 +2430,9 @@ pub(super) fn run(
         None
     };
     let request = build_request(category, access.identity, args)?;
+    let publishes = route.category == "place"
+        && route.action == "publish"
+        && request["query"]["versionType"] != "Saved";
     let (mut body, more) = match (route.limit, route.cursor) {
         (Some(size), Some(token)) => {
             let pages = Pager { size, token, plan }.collect(
@@ -2452,6 +2455,19 @@ pub(super) fn run(
         && let Some(counts) = super::discovery::live_counts(universe)
     {
         object.extend(counts);
+    }
+    if publishes
+        && let Some(version) = body.get("versionNumber").and_then(Value::as_u64)
+        && let Some(place) = access.identity.place_id
+    {
+        super::discovery::report_live(
+            &mut body,
+            access.identity,
+            access.key_env,
+            place,
+            version,
+            super::discovery::LIVE_WAIT_DEFAULT_SECONDS,
+        );
     }
     shape(&mut body);
     match output {

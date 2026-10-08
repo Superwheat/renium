@@ -2,6 +2,7 @@
 //! experiences of its user and groups, found by name, and pulled into a
 //! project as a place file.
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
@@ -407,8 +408,9 @@ pub(crate) fn games_command(key_env: &str, query: Option<&str>) -> Result<Value>
     }))
 }
 
-/// Live player count and visits from the public games endpoint, which needs
-/// no key; None when it cannot be read.
+/// Live player count, visits and the `updated` stamp (last save or publish)
+/// from the public games endpoint, which needs no key; None when it cannot be
+/// read.
 pub(crate) fn live_counts(universe_id: i64) -> Option<Map<String, Value>> {
     let page = fetch_public_json(
         &format!("{GAMES_HOST}/v1/games?universeIds={universe_id}"),
@@ -435,7 +437,7 @@ fn game_entry_for(page: &Value, universe_id: i64) -> Option<&Value> {
 
 fn counts_from(page: &Value, universe_id: i64) -> Map<String, Value> {
     let game = game_entry_for(page, universe_id);
-    ["playing", "visits"]
+    ["playing", "visits", "updated"]
         .into_iter()
         .filter_map(|name| Some((name.to_string(), game?.get(name)?.clone())))
         .collect()
@@ -567,8 +569,10 @@ pub(crate) fn place_versions(body: &Value) -> Vec<(u64, bool)> {
 }
 
 /// Roblox's publish status for one version of a history page: 0 for a saved
-/// version, 1 while publishing is still processing, 2 once it is live.
-pub(crate) fn version_publish_status(body: &Value, version: u64) -> Option<u64> {
+/// version, 1 for the version players currently get, 2 for a published
+/// version that a later publish replaced. Only Open Cloud uploads carry it;
+/// a Studio publish shows 0 like a save.
+fn version_publish_status(body: &Value, version: u64) -> Option<u64> {
     body.get("placeVersions")?
         .as_array()?
         .iter()
@@ -580,6 +584,57 @@ pub(crate) fn version_publish_status(body: &Value, version: u64) -> Option<u64> 
         })?
         .get("publishStatus")?
         .as_u64()
+}
+
+pub(crate) const LIVE_WAIT_DEFAULT_SECONDS: f64 = 90.0;
+const LIVE_POLL: Duration = Duration::from_secs(5);
+
+/// Adds whether an uploaded version is the one players get, from the place's
+/// version history: `live: true` once Roblox lists it as the current
+/// published version (normally on the first read), `live: false` when it was
+/// stored as a save or a later publish already replaced it, null when the key
+/// cannot read the history. Waits up to `wait_seconds` for the listing.
+pub(crate) fn report_live(
+    result: &mut Value,
+    identity: CloudIdentity,
+    key_env: &str,
+    place_id: i64,
+    version: u64,
+    wait_seconds: f64,
+) {
+    let started = Instant::now();
+    let status = loop {
+        let Some(page) = place_history_page(identity, key_env, place_id) else {
+            break None;
+        };
+        let status = version_publish_status(&page, version);
+        if status.is_some() || started.elapsed().as_secs_f64() >= wait_seconds {
+            break status;
+        }
+        std::thread::sleep(LIVE_POLL);
+    };
+    result["waitedSeconds"] = json!((started.elapsed().as_secs_f64() * 10.0).round() / 10.0);
+    match status {
+        Some(1) => result["live"] = json!(true),
+        Some(2) => {
+            result["live"] = json!(false);
+            result["hint"] = json!(format!(
+                "A later publish already replaced version {version}; rbx oc place history lists the current one with publishStatus 1"
+            ));
+        }
+        Some(_) => {
+            result["live"] = json!(false);
+            result["hint"] = json!(format!(
+                "Roblox stored version {version} as a save, not a publish; players keep the previous published version"
+            ));
+        }
+        None => {
+            result["live"] = Value::Null;
+            result["hint"] = json!(format!(
+                "The place's version history did not list version {version} in time; rbx oc place history shows the current published version with publishStatus 1"
+            ));
+        }
+    }
 }
 
 /// The newest page of a place's version history, or None when the key cannot
@@ -823,6 +878,30 @@ mod tests {
         assert_eq!(votes["upVotes"], 51234);
         assert_eq!(votes["downVotes"], 3210);
         assert!(votes_from(&page, 5).is_empty());
+    }
+
+    #[test]
+    fn live_counts_include_the_update_stamp() {
+        let page = json!({ "data": [
+            { "id": 8420907710_i64, "playing": 3, "visits": 9, "updated": "2026-10-07T23:23:45.8411335Z" },
+        ]});
+        assert_eq!(
+            Value::Object(counts_from(&page, 8420907710)),
+            json!({"playing": 3, "visits": 9, "updated": "2026-10-07T23:23:45.8411335Z"})
+        );
+    }
+
+    #[test]
+    fn live_report_is_null_when_the_history_cannot_be_read() {
+        let identity = CloudIdentity {
+            game_id: Some(1),
+            place_id: Some(2),
+        };
+        let mut result = json!({});
+        report_live(&mut result, identity, "RENIUM_TEST_NO_SUCH_KEY", 2, 5, 0.0);
+        assert_eq!(result["live"], Value::Null);
+        assert!(result["hint"].as_str().unwrap().contains("version 5"));
+        assert!(result["waitedSeconds"].is_number());
     }
 
     #[test]

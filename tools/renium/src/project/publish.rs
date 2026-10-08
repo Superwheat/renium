@@ -99,50 +99,12 @@ pub(crate) struct PublishArgs {
         long,
         requires = "cloud_mode",
         value_name = "SECONDS",
-        default_value_t = 90.0,
-        help = "Seconds to wait for Roblox to make the uploaded version live (0 returns right after the upload)"
+        default_value_t = cloud::LIVE_WAIT_DEFAULT_SECONDS,
+        help = "Seconds to wait for the version history to list the upload as the current published version (0 checks once)"
     )]
     wait_live: f64,
     #[command(flatten)]
     bridge: BridgeConnectionArgs,
-}
-
-const LIVE_POLL: Duration = Duration::from_secs(5);
-
-/// Roblox processes an uploaded version before it goes live; a restart or a
-/// test before that serves the previous version. Reports what the version
-/// history says, so the caller knows whether the upload is live yet.
-fn report_live(
-    result: &mut Value,
-    identity: cloud::CloudIdentity,
-    key_env: &str,
-    place_id: i64,
-    version: u64,
-    wait_seconds: f64,
-) {
-    let started = std::time::Instant::now();
-    let mut status = None;
-    loop {
-        status = cloud::place_history_page(identity, key_env, place_id)
-            .and_then(|body| cloud::version_publish_status(&body, version))
-            .or(status);
-        if status == Some(2) || started.elapsed().as_secs_f64() >= wait_seconds {
-            break;
-        }
-        std::thread::sleep(LIVE_POLL);
-    }
-    result["waitedSeconds"] = json!((started.elapsed().as_secs_f64() * 10.0).round() / 10.0);
-    match status {
-        Some(2) => result["live"] = json!(true),
-        Some(code) => {
-            result["live"] = json!(false);
-            result["publishStatus"] = json!(code);
-            result["hint"] = json!(
-                "Roblox has not made this version live yet; players and restarted servers still get the previous version. Check rbx oc place history for publishStatus 2 before restarting servers"
-            );
-        }
-        None => result["live"] = Value::Null,
-    }
 }
 
 pub(crate) fn run(args: PublishArgs, project: Option<&Path>) -> Result<()> {
@@ -418,7 +380,7 @@ fn publish_as(args: &PublishArgs, project: Option<&Path>) -> Result<Value> {
             result["versionNumber"] = json!(version);
             result["published"] = json!(!args.saved);
             if !args.saved {
-                report_live(
+                cloud::report_live(
                     &mut result,
                     identity,
                     key_env,
@@ -761,7 +723,7 @@ fn open_cloud(args: &PublishArgs, project: Option<&Path>) -> Result<Value> {
             let version = published_version(&response)?;
             result["versionNumber"] = json!(version);
             result["published"] = json!(true);
-            report_live(
+            cloud::report_live(
                 &mut result,
                 identity,
                 key_env,

@@ -10,7 +10,7 @@ mod servers;
 mod transport;
 
 pub(crate) use discovery::{
-    place_history_page, place_versions, team_create_members, version_publish_status,
+    LIVE_WAIT_DEFAULT_SECONDS, place_history_page, place_versions, report_live, team_create_members,
 };
 pub(crate) use transport::{
     API_ROOT, CloudAuth, CloudIdentity, agent, execute_one, execute_with_identity, introspect_key,

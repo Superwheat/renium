@@ -59,7 +59,7 @@ Additional options include `--query`, `--filter`, `--cursor`, `--if-match`, `--f
 `rbx oc CATEGORY --help` lists that category's actions with their values, method and path, marks paged and destructive ones, and says which flag fills `{place}` (`--place-id`) or `{universe}`. An unknown action fails at once with the valid list. Actions that answer with an empty body (such as `universe restart`) return what ran. On paged actions `-l N` is a total fetched 100 per request, `--all` follows every page, `--pages N` stops after N, and `"more": true` says a page remains.
 
 ```powershell
-rbx oc universe                              # includes live playing and visits counts
+rbx oc universe                              # includes playing, visits, votes, updated (last save or publish)
 rbx oc server list                           # active servers of the newest versions, by version
 rbx oc server find JOB_ID
 rbx oc server logs VERSION JOB -l 1000 --severity error --grep "Ranked"
@@ -70,7 +70,7 @@ Use `oc request` for unlisted endpoints; pipe complex bodies through stdin.
 
 `team members` lists who is in a place's Team Create session. `team remove-members` is not "end their session": it revokes those users' collaborator access for the whole universe (`DELETE .../teamcreate/memberships`); only run it when the user asks for exactly that.
 
-After an upload, `publish` waits up to 90 s (`--wait-live SECONDS`, 0 to skip) for the version to go live and reports `live: true`. `live: false` with `publishStatus: 1` means Roblox is still processing it: players and restarted servers keep getting the previous version until `oc place history` shows status 2, so do not restart servers on the strength of `versionNumber` alone.
+After an upload, `publish` and `oc place publish` report `live: true` once the version history lists the version as the current published one, which is normally the first check (`--wait-live SECONDS` bounds it on `publish`); a restart right after that result lands on the new version. In `oc place history`, `publishStatus` 1 marks the version players currently get, 2 a published version a later publish replaced, 0 a save; Studio publishes show 0 like saves and only `isPublished` is true for Open Cloud uploads. The `updated` stamp from `oc universe` moves on saves as well as publishes, so it does not mean a publish went live.
 
 ## Publish while someone else is in the live place
 

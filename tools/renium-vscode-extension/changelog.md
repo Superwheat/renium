@@ -8,8 +8,8 @@
 
 ### Improvements
 
-- `rbx oc universe` adds the experience's `upVotes` and `downVotes` from the public votes endpoint next to `playing` and `visits`.
-- `rbx publish --as` and `rbx publish --open-cloud` wait up to 90 s after the upload for Roblox to make the version live (`--wait-live SECONDS`, 0 to skip) and report `live`, `publishStatus` and `waitedSeconds`. A version that Roblox is still processing used to be reported as a plain success, and servers restarted at that moment came back on the previous version.
+- `rbx oc universe` adds the experience's `upVotes` and `downVotes` from the public votes endpoint next to `playing` and `visits`, plus `updated`, the stamp of its last save or publish.
+- `rbx publish --as`, `rbx publish --open-cloud` and `rbx oc place publish` report `live: true` once the place's version history lists the upload as the current published version, which is normally the first check right after the upload (`--wait-live SECONDS` bounds the wait on `publish`). `live: false` comes with the reason: the upload was stored as a save, or a later publish already replaced it. The version history's `publishStatus` is 1 for the version players currently get and 2 for versions a later publish replaced; an earlier build and its guide read 1 as "still processing", which sent an agent polling for a status that never comes on a version that was already live.
 - "More than one Studio runtime matches this project" now lists the candidate Studios and says to pass `--place <placeId|window name>` before the command (`--runtime-id` never chose). The guides document the JSON shapes `l` returns (arrays, objects, `_truncated`, `_type` markers), the `--place` rule for two open Studios, `co --grep` being a regex, what `oc team remove-members` actually does (it revokes collaborator access for the whole universe), and the recipe for publishing while a collaborator occupies the live place.
 
 ## 0.4.7 - 2026-10-05
