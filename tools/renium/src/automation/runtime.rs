@@ -38,9 +38,10 @@ use crate::snapshot::export::{PublishedProjectChanges, export_snapshots_with_war
 use crate::snapshot::import::parse_services;
 use crate::studio::automation::{
     click_result, compact_live_status, editor_review_decision_result, execute_luau_result,
-    get_console_output_result, goto_result, input_result, key_result, press_result,
-    record_end_result, record_start_result, shot_result, start_stop_play_result,
-    studio_change_state_result, studio_device_result, type_result, ui_result, wait_until_result,
+    get_console_output_result, goto_result, input_result, key_result, kill_orphans_result,
+    orphan_summaries, press_result, record_end_result, record_start_result, shot_result,
+    start_stop_play_result, studio_change_state_result, studio_device_result, type_result,
+    ui_result, wait_until_result,
 };
 use crate::studio::bridge::{BridgeRequestLease, BridgeServer, BridgeTarget, RuntimeGateGuard};
 #[cfg(any(windows, target_os = "macos"))]
@@ -1110,6 +1111,10 @@ fn studio_status_result(
             }
         }
         result["studioState"] = state;
+    }
+    let orphans = orphan_summaries(&bridge.list_bridge_clients(), context.runtime_id.as_deref());
+    if !orphans.is_empty() {
+        result["orphans"] = json!(orphans);
     }
     result
 }
@@ -2779,6 +2784,9 @@ fn automation_execute_request_inner(
         | op::COLLAB_AWARENESS => {
             collab_operation(operation.id, state, &request.p).map_err(automation_failure)
         }
+        op::STUDIOS if request.p.get("killOrphans").and_then(Value::as_bool) == Some(true) => Ok(
+            kill_orphans_result(bridge, request.p.get("place").and_then(Value::as_str)),
+        ),
         op::STUDIOS => {
             let wait_seconds = request
                 .p
@@ -2793,11 +2801,16 @@ fn automation_execute_request_inner(
                 );
             }
             let clients = studio_clients(bridge);
-            Ok(json!({
+            let orphans = orphan_summaries(&clients, None);
+            let mut result = json!({
                 "studios": bound_context::studio_candidates_from(&clients, ""),
                 "clients": clients,
                 "selected": Value::Null,
-            }))
+            });
+            if !orphans.is_empty() {
+                result["orphans"] = json!(orphans);
+            }
+            Ok(result)
         }
         op::UPDATE_STUDIOS => {
             prepare_studios_for_update(&request.p, bridge).map_err(automation_failure)

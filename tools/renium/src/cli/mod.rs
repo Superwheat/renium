@@ -1465,7 +1465,7 @@ pub(super) struct StartStopPlayArgs {
     #[arg(help = "Stop the session", short = 'x', long)]
     pub(super) stop: bool,
     #[arg(
-        help = "Stop any running session first, then start (same players and mode)",
+        help = "Stop the running session, then start it again with the players and mode it was started with (-p/--mode override)",
         short,
         long,
         conflicts_with = "stop"
@@ -1510,6 +1510,12 @@ pub(super) struct StartStopPlayArgs {
         requires = "until"
     )]
     pub(super) until_timeout: f64,
+    #[arg(
+        help = "Close Studio test server/client windows whose Edit window has exited (with --place: that place's only)",
+        long,
+        conflicts_with_all = ["start", "stop", "restart", "players", "add_players", "leave", "mode", "until"]
+    )]
+    pub(super) kill_orphans: bool,
 }
 
 #[derive(Parser)]

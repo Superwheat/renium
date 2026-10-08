@@ -20,11 +20,14 @@ rbx play --add-players 2            # join churn: 2 more clients join the runnin
 rbx play --leave -p 2               # the server kicks client 2's player (PlayerRemoving fires) and closes its window
 rbx cs
 rbx play -x
+rbx play --kill-orphans             # close test windows whose Edit window was closed or restarted
 ```
 
 Across add/leave cycles the play server's `Stats.InstanceCount` grows by about 300 per cycle while `#game:GetDescendants()` and memory stay flat (measured over three cycles): those are engine-side objects outside the DataModel that Studio's test server keeps per client that ever connected, not a game leak. Judge leaks by DataModel counts and `rbx perf heap`, not by InstanceCount.
 
-Play keeps the scripts it started with; after editing server or client code, `rbx play -r` restarts the session. `--until EXPR` returns once the server expression is true (`--until-timeout`, default 120 s), so no loop is needed before the first test step.
+Play keeps the scripts it started with; after editing server or client code, `rbx play -r` restarts the session with the mode and player count it was started with (`-p N` or `--mode` override them; a session started from Studio's own buttons restarts as ordinary Play and `restartNote` says so). `--until EXPR` returns once the server expression is true (`--until-timeout`, default 120 s), so no loop is needed before the first test step.
+
+`play -x` returns once the test's DataModels and windows are gone, so `play -s` can follow at once. A start Studio drops because the previous test is still ending or the place is still opening is requested again; the result then carries `retriedAfterMs`. `status` and `cs` list `orphans`: test windows whose Edit window has exited, which can block the next multi-client start. `play -s` closes the ones of its own place first (`closedOrphans`); `play --kill-orphans` closes them all.
 
 Use ordinary Play for one-client checks. `--players 1` explicitly launches a separate server and client; `mode: "play"` means ordinary Play. Stop only a session you started or were asked to stop. `play -s`, `status` and `cs` give each runtime's Studio `pid`. File edits during Play can wait for Edit mode; that alone is not a sync failure.
 

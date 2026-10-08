@@ -3225,6 +3225,7 @@ function BridgePluginRuntime.start(context)
 			runtimeId = Config.bridgeRuntimeId,
 			launchNonce = if launch then launch.nonce else game:GetAttribute("__ReniumLaunchNonce"),
 			launchEditRuntimeId = if launch then launch.editRuntimeId else game:GetAttribute("__ReniumEditRuntimeId"),
+			launchPlaceName = if launch then launch.placeName else nil,
 			playerName = playerName,
 			playerUserId = playerUserId,
 			placeId = game.PlaceId,

@@ -505,6 +505,8 @@ function BridgeRuntimeApi.create(plugin, runtimeContext)
 		ownerGeneration = nil,
 		ownerRuntimeId = nil,
 		mode = nil,
+		players = nil,
+		engineStarted = false,
 		lastError = nil,
 		lastResult = nil,
 		lastStartedAt = 0,
@@ -3118,6 +3120,7 @@ updateMouse()
 			game:SetAttribute("__ReniumEditRuntimeId", nil)
 		end
 		playSession.mode = nil
+		playSession.players = nil
 		playSession.launchNonce = nil
 		playSession.owned = false
 		playSession.ownerGeneration = nil
@@ -3157,7 +3160,8 @@ updateMouse()
 	end
 
 	local function playStatus(action)
-		local running = api.isPlayModeRunning() or playSession.active
+		local engineRunning = api.isPlayModeRunning()
+		local running = engineRunning or playSession.active
 		return {
 			ok = true,
 			action = action,
@@ -3167,7 +3171,13 @@ updateMouse()
 				and not playSession.starting
 				and not playSession.executionPending
 				and os.clock() >= playSession.readyAt,
+			-- The daemon tells a start Studio ignored (the call returned or never
+			-- showed the test) from one that is still coming up.
+			engineRunning = engineRunning,
+			engineStarted = playSession.engineStarted,
+			executing = playSession.executionPending,
 			mode = playSession.mode,
+			players = playSession.players,
 			launchNonce = playSession.launchNonce,
 			lastError = playSession.lastError,
 			lastResult = playSession.lastResult,
@@ -3211,6 +3221,7 @@ updateMouse()
 		if playSession.token ~= token or not playSession.active then
 			return
 		end
+		playSession.engineStarted = true
 		playSession.starting = false
 		while playSession.token == token and api.isPlayModeRunning() do
 			task.wait(0.05)
@@ -3319,6 +3330,7 @@ updateMouse()
 			return leaveTest()
 		end
 		if playSession.active and api.isPlayModeRunning() then
+			playSession.engineStarted = true
 			playSession.starting = false
 		end
 		local shouldStart = params.start == true
@@ -3349,6 +3361,8 @@ updateMouse()
 				playSession.stopRequested = false
 				playSession.active = true
 				playSession.starting = true
+				playSession.engineStarted = false
+				playSession.players = numPlayers
 				if params.mode == "run" then
 					playSession.mode = "run"
 				elseif numPlayers then
@@ -3374,6 +3388,7 @@ updateMouse()
 					__renium = {
 						nonce = requestedLaunchNonce,
 						editRuntimeId = playSession.ownerRuntimeId,
+						placeName = game.Name,
 					},
 					value = params.args,
 				}

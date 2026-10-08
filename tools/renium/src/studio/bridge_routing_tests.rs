@@ -1630,6 +1630,40 @@ fn an_explicit_server_target_never_falls_back_to_the_edit_window() {
 }
 
 #[test]
+fn a_test_runtime_without_its_edit_window_keeps_the_launch_place_name() {
+    let bridge = fixture();
+    let mut orphan = client_info("orphan-server", "old-launch");
+    orphan.bridge_role = BRIDGE_ROLE_PLAY_SERVER.into();
+    orphan.launch_edit_runtime_id = "closed-edit".into();
+    orphan.place_id = Some(0);
+    orphan.place_name = "Server".into();
+    orphan.launch_place_name = "scratch.rbxl".into();
+    let _orphan = connect(&bridge, 0, orphan);
+    let mut live = client_info("live-client", "new-launch");
+    live.launch_edit_runtime_id = "open-edit".into();
+    live.place_id = Some(0);
+    live.place_name = "Place1".into();
+    live.launch_place_name = "renamed.rbxl".into();
+    let _live = connect(&bridge, 1, live);
+    let mut edit = client_info("open-edit", "");
+    edit.bridge_role = BRIDGE_ROLE_EDIT.into();
+    edit.launch_edit_runtime_id.clear();
+    edit.place_id = Some(0);
+    edit.place_name = "scratch-2.rbxl".into();
+    let _edit = connect(&bridge, 0, edit);
+    wait_for_client_count(&bridge, 3);
+    let clients = bridge.list_bridge_clients();
+    let place_name = |runtime: &str| {
+        clients
+            .iter()
+            .find(|client| client["runtimeId"] == runtime)
+            .map(|client| client["placeName"].clone())
+    };
+    assert_eq!(place_name("orphan-server"), Some(json!("scratch.rbxl")));
+    assert_eq!(place_name("live-client"), Some(json!("scratch-2.rbxl")));
+}
+
+#[test]
 fn edit_status_response_filters_a_reconnected_daemons_previously_captured_inventory() {
     let bridge = fixture();
     let mut info = client_info("edit-dte", "");
