@@ -1472,7 +1472,7 @@ pub(super) struct StartStopPlayArgs {
     )]
     pub(super) restart: bool,
     #[arg(
-        help = "Launch a server and N clients (with --leave: the client index to close)",
+        help = "Launch a server and N clients (with --leave: the client index to remove)",
         short,
         long,
         alias = "clients",
@@ -1489,7 +1489,7 @@ pub(super) struct StartStopPlayArgs {
     )]
     pub(super) add_players: Option<u32>,
     #[arg(
-        help = "Close play client -p N; the rest of the test keeps running",
+        help = "Kick play client -p N's player from the server and close its window; the rest keep running",
         long,
         conflicts_with_all = ["start", "stop", "restart", "mode", "until"]
     )]

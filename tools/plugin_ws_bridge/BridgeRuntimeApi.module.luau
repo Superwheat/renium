@@ -2942,7 +2942,7 @@ updateMouse()
 			return {
 				ok = false,
 				error = if #names >= 8
-					then "The test already has 8 clients, Studio's limit; close one first with rbx play --leave -p N"
+					then "The test already has 8 clients, Studio's limit; remove one first with rbx play --leave -p N"
 					else `The test has {#names} clients and Studio allows 8; add at most {8 - #names}`,
 				players = names,
 			}
@@ -2963,6 +2963,28 @@ updateMouse()
 			return { ok = false, error = `AddPlayers failed: {tostring(callError)}`, players = names }
 		end
 		return { ok = true, action = "addPlayers", requested = count, players = names }
+	end
+
+	local function kickTestPlayer(name, reason)
+		if runtimeContext.bridgeRole ~= "play-server" then
+			return { ok = false, error = "Players can only be kicked from the play server of a running test" }
+		end
+		if type(name) ~= "string" or name == "" then
+			return { ok = false, error = "kickPlayer must be a player name" }
+		end
+		for _, player in game:GetService("Players"):GetPlayers() do
+			if player.Name == name then
+				local kicked, kickError = pcall(player.Kick, player, if type(reason) == "string" then reason else nil)
+				return {
+					ok = true,
+					action = "kick",
+					player = name,
+					kicked = kicked,
+					kickError = if kicked then nil else tostring(kickError),
+				}
+			end
+		end
+		return { ok = true, action = "kick", player = name, kicked = false }
 	end
 
 	local function leaveTest()
@@ -2988,6 +3010,9 @@ updateMouse()
 		assertOperationOwnership(operationGeneration)
 		if params.addPlayers ~= nil then
 			return addTestPlayers(params.addPlayers)
+		end
+		if params.kickPlayer ~= nil then
+			return kickTestPlayer(params.kickPlayer, params.reason)
 		end
 		if params.leave == true then
 			return leaveTest()

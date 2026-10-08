@@ -870,7 +870,7 @@ fn validate_play_args(args: &StartStopPlayArgs) -> Result<()> {
     }
     if let Some(count) = args.add_players {
         if args.leave || args.players.is_some() {
-            bail!("Use --add-players N on its own; close a client separately with --leave -p N");
+            bail!("Use --add-players N on its own; remove a client separately with --leave -p N");
         }
         if !(1..=8).contains(&count) {
             bail!("--add-players takes 1 through 8; Studio runs at most 8 clients");
@@ -878,7 +878,7 @@ fn validate_play_args(args: &StartStopPlayArgs) -> Result<()> {
     }
     if args.leave {
         match args.players {
-            None => bail!("Name the client to close: rbx play --leave -p N (rbx cs lists them)"),
+            None => bail!("Name the client to remove: rbx play --leave -p N (rbx cs lists them)"),
             Some(0) => bail!("Client indexes start at 1: rbx play --leave -p 1"),
             Some(_) => {}
         }
@@ -916,7 +916,7 @@ pub(crate) fn start_stop_play_result(
     Ok(result)
 }
 
-const LEAVE_TIMEOUT: Duration = Duration::from_secs(20);
+const LEAVE_TIMEOUT: Duration = Duration::from_secs(10);
 const OLDER_PLUGIN: &str = "The Renium plugin in this test is older than rbx and cannot add or remove clients; update the plugin and restart Studio";
 
 fn session_play_clients(bridge: &BridgeServer, server_runtime_id: &str) -> Vec<Value> {
@@ -1002,7 +1002,7 @@ fn add_test_players_result(bridge: &BridgeServer, count: u32, wait_seconds: f64)
                 "ok": true,
                 "action": "addPlayers",
                 "added": names,
-                "clients": clients.len(),
+                "clients": server_player_names(bridge, &server).map_or(clients.len(), |names| names.len()),
             }));
         }
         if added.len() != last_seen {
@@ -1028,87 +1028,123 @@ fn leave_test_result(bridge: &BridgeServer, index: u32, wait_seconds: f64) -> Re
     let runtime_id = bridge
         .runtime_pin_for_selector(BridgeTarget::Client, Some(&selector))?
         .runtime_id;
-    let channel_name = bridge
-        .list_bridge_clients()
-        .into_iter()
-        .find(|entry| entry.get("runtimeId").and_then(Value::as_str) == Some(runtime_id.as_str()))
-        .and_then(|entry| {
-            entry
-                .get("playerName")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        });
-    let server = bridge.play_runtime_for_selector(BridgeTarget::Server, None);
-    let left = bridge.call_for_runtime_with_timeout(
+    let Some(server) = bridge.play_runtime_for_selector(BridgeTarget::Server, None) else {
+        bail!("No play server is connected; --leave needs a running test (rbx play -s -p N)");
+    };
+    let player = client_player_name(bridge, &runtime_id).with_context(|| {
+        format!("Client {index} has not reported its player name yet; retry in a moment")
+    })?;
+    let kick = bridge.call_for_runtime_with_timeout(
         "startStopPlay",
-        json!({ "leave": true }),
-        BridgeTarget::Client,
-        &runtime_id,
+        json!({ "kickPlayer": player, "reason": "rbx play --leave" }),
+        BridgeTarget::Server,
+        &server,
         Some(Duration::from_secs(2)),
     )?;
-    ensure_plugin_api_ok(&left)?;
-    if left["action"] != "leave" {
+    ensure_plugin_api_ok(&kick)?;
+    if kick["action"] != "kick" {
         bail!(OLDER_PLUGIN);
     }
-    let player = left
-        .get("player")
-        .and_then(Value::as_str)
+    let kicked = kick["kicked"].as_bool() == Some(true);
+    let leave_requested = bridge
+        .call_for_runtime_with_timeout(
+            "startStopPlay",
+            json!({ "leave": true }),
+            BridgeTarget::Client,
+            &runtime_id,
+            Some(Duration::from_secs(2)),
+        )
+        .is_ok_and(|reply| reply["ok"] == true && reply["action"] == "leave");
+    let remaining =
+        wait_for_server_to_drop(bridge, &server, &player).map_err(
+            |error| match kick["kickError"].as_str() {
+                Some(kick_error) => anyhow::anyhow!("{error} (Kick failed: {kick_error})"),
+                None => error,
+            },
+        )?;
+    let window_closed = leave_requested && wait_for_channel_to_close(bridge, &runtime_id);
+    Ok(json!({
+        "ok": true,
+        "action": "leave",
+        "player": player,
+        "kicked": kicked,
+        "serverListsPlayer": false,
+        "windowClosed": window_closed,
+        "clients": remaining.len(),
+    }))
+}
+
+fn client_player_name(bridge: &BridgeServer, runtime_id: &str) -> Option<String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let name = bridge
+            .list_bridge_clients()
+            .into_iter()
+            .find(|entry| entry.get("runtimeId").and_then(Value::as_str) == Some(runtime_id))
+            .and_then(|entry| {
+                entry
+                    .get("playerName")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+        if name.is_some() || Instant::now() >= deadline {
+            return name;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn server_player_names(bridge: &BridgeServer, server: &str) -> Result<Vec<String>> {
+    let listed = bridge.call_for_runtime_with_timeout(
+        "startStopPlay",
+        json!({ "listPlayers": true }),
+        BridgeTarget::Server,
+        server,
+        Some(Duration::from_secs(2)),
+    )?;
+    ensure_plugin_api_ok(&listed)?;
+    if listed["action"] != "players" {
+        bail!(OLDER_PLUGIN);
+    }
+    Ok(listed["players"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
         .map(str::to_string)
-        .or(channel_name)
-        .unwrap_or_default();
+        .collect())
+}
+
+fn wait_for_server_to_drop(
+    bridge: &BridgeServer,
+    server: &str,
+    player: &str,
+) -> Result<Vec<String>> {
     let deadline = Instant::now() + LEAVE_TIMEOUT;
-    while runtime_ids(&bridge.list_bridge_clients()).contains(&runtime_id) {
+    loop {
+        let names = server_player_names(bridge, server)?;
+        if !names.iter().any(|name| name == player) {
+            return Ok(names);
+        }
         if Instant::now() >= deadline {
             bail!(
-                "Client {index} was asked to leave but is still connected after {} s; end the whole test with rbx play -x",
+                "{player} is still in the server's Players {} s after the kick; end the test with rbx play -x",
                 LEAVE_TIMEOUT.as_secs()
             );
         }
         thread::sleep(Duration::from_millis(250));
     }
-    let mut result = json!({
-        "ok": true,
-        "action": "leave",
-        "player": player,
-        "channelClosed": true,
-    });
-    if let Some(server) = server {
-        result["clients"] = json!(session_play_clients(bridge, &server).len());
-        if let Some(listed) = server_lists_player(bridge, &server, &player) {
-            result["serverListsPlayer"] = json!(listed);
-        }
-    }
-    Ok(result)
 }
 
-// The server drops a departed Player on its own schedule; give it a few
-// seconds before reporting that it still lists the name.
-fn server_lists_player(bridge: &BridgeServer, server: &str, player: &str) -> Option<bool> {
-    if player.is_empty() {
-        return None;
-    }
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let listed = bridge
-            .call_for_runtime_with_timeout(
-                "startStopPlay",
-                json!({ "listPlayers": true }),
-                BridgeTarget::Server,
-                server,
-                Some(Duration::from_secs(2)),
-            )
-            .ok()?;
-        if listed["action"] != "players" {
-            return None;
-        }
-        let present = listed["players"]
-            .as_array()
-            .is_some_and(|names| names.iter().any(|name| name.as_str() == Some(player)));
-        if !present || Instant::now() >= deadline {
-            return Some(present);
+fn wait_for_channel_to_close(bridge: &BridgeServer, runtime_id: &str) -> bool {
+    let deadline = Instant::now() + LEAVE_TIMEOUT;
+    while runtime_ids(&bridge.list_bridge_clients()).contains(runtime_id) {
+        if Instant::now() >= deadline {
+            return false;
         }
         thread::sleep(Duration::from_millis(250));
     }
+    true
 }
 
 // A freshly launched server bridge connects before its scripts can run; the
