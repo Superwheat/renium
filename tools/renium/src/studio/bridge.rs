@@ -9,8 +9,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tungstenite::protocol::WebSocketConfig;
-use tungstenite::{Message, WebSocket, accept_with_config};
+use tungstenite::{Message, WebSocket, accept_hdr_with_config};
 
 use crate::app::timing::elapsed_ms;
 #[cfg(any(windows, target_os = "macos"))]
@@ -85,6 +86,21 @@ fn play_owner_runtime(
         process_owners
     };
     (owners.len() == 1).then(|| owners.into_iter().next().unwrap())
+}
+
+/// A browser always sends the page's origin on a WebSocket upgrade, so any
+/// web page could otherwise open a bridge channel on this machine and pose as
+/// Studio. Studio's own client sends no origin, or one from roblox.com.
+fn origin_is_studio(origin: &str) -> bool {
+    let origin = origin.trim().to_ascii_lowercase();
+    let Some(rest) = origin
+        .strip_prefix("https://")
+        .or_else(|| origin.strip_prefix("http://"))
+    else {
+        return origin != "null";
+    };
+    let host = rest.split(['/', ':']).next().unwrap_or("");
+    host == "roblox.com" || host.ends_with(".roblox.com")
 }
 
 struct HandshakePermit(Arc<AtomicUsize>);
@@ -288,6 +304,49 @@ mod request_cancellation_tests {
             play_owner_runtime(&client, Some(100), edits.into_iter()),
             None
         );
+    }
+
+    #[test]
+    fn browser_origins_are_refused_at_the_upgrade() {
+        assert!(super::origin_is_studio("https://www.roblox.com"));
+        assert!(super::origin_is_studio("https://create.roblox.com:443/x"));
+        assert!(super::origin_is_studio("rbx-studio://plugin"));
+        assert!(!super::origin_is_studio("https://evil.example"));
+        assert!(!super::origin_is_studio("http://localhost:8781"));
+        assert!(!super::origin_is_studio("https://notroblox.com"));
+        assert!(!super::origin_is_studio("null"));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, peer) = listener.accept().unwrap();
+            BridgeServer::accept_ready_socket(
+                "127.0.0.1",
+                address.port(),
+                stream,
+                peer.to_string(),
+                "origin-test",
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        use std::io::{Read, Write};
+        client
+            .write_all(
+                format!(
+                    "GET / HTTP/1.1\r\nHost: {address}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nOrigin: https://evil.example\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let mut response = Vec::new();
+        let _ = client.read_to_end(&mut response);
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert!(server.join().unwrap().is_err());
     }
 
     #[test]
@@ -1865,6 +1924,7 @@ impl BridgeServer {
         });
     }
 
+    #[allow(clippy::result_large_err)]
     pub(crate) fn accept_ready_socket(
         bind_host: &str,
         port: u16,
@@ -1885,8 +1945,42 @@ impl BridgeServer {
             .max_message_size(Some(MAX_BRIDGE_MESSAGE_BYTES))
             .max_frame_size(Some(MAX_BRIDGE_MESSAGE_BYTES))
             .accept_unmasked_frames(false);
-        let socket = accept_with_config(SharedTcpStream::from(stream), Some(socket_config))
-            .with_context(|| format!("WebSocket upgrade failed on {bind_host}:{port}"))?;
+        let seen_origin = Arc::new(Mutex::new(None::<String>));
+        let recorded_origin = Arc::clone(&seen_origin);
+        let socket = accept_hdr_with_config(
+            SharedTcpStream::from(stream),
+            move |request: &Request, response: Response| {
+                let origin = request
+                    .headers()
+                    .get("origin")
+                    .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned());
+                *recorded_origin
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = origin.clone();
+                match origin.as_deref() {
+                    Some(origin) if !origin_is_studio(origin) => {
+                        let mut refusal = ErrorResponse::new(Some(
+                            "Renium accepts Studio bridge connections only".to_string(),
+                        ));
+                        *refusal.status_mut() = tungstenite::http::StatusCode::FORBIDDEN;
+                        Err(refusal)
+                    }
+                    _ => Ok(response),
+                }
+            },
+            Some(socket_config),
+        )
+        .with_context(|| format!("WebSocket upgrade failed on {bind_host}:{port}"))?;
+        let origin = seen_origin
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(origin) = &origin {
+            crate::app::output::log_global(
+                3,
+                format_args!("[renium] bridge channel from {peer} sent origin {origin}"),
+            );
+        }
 
         let mut bridge_socket = BridgeSocket {
             port,
