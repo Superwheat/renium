@@ -44,17 +44,19 @@ use super::{
     GLOBAL_LINK_PREFIX, LinkEntry, LinkLockEntry, LinkManifest, LinkResolveOptions, LinkSource,
     LinkSourceMeta, LinkTargetRef, LinkTargetStorage, PackageMaterialization, RENIUM_DIR_GITIGNORE,
     RENIUM_STORE_EXTENSION, ResolvedLinkTarget, collect_project_settings_files,
-    ensure_settings_document, is_global_link_path, is_package_path, link_lock_path,
-    link_manifest_path, link_mirror_lock_key, link_slug, link_target_document_selector,
-    link_target_document_selector_parts, link_target_from_settings_id, link_target_key,
-    link_target_ordinals, link_target_ref_key, link_target_segments, load_settings_documents,
-    mark_manifest_target_broken, materialize_package_target, package_document_fingerprint,
-    package_lock_key, package_target_fingerprint, package_target_matches,
-    package_target_settings_ids, read_link_lock, read_link_manifest, read_link_source_meta,
-    referenced_settings_ids_outside, renium_global_packages_dir, resolve_link_cache_dir,
-    resolve_link_target_storage, resolve_link_targets, resolve_local_link_path,
-    selector_starts_with, serialize_link_lock, serialize_link_manifest,
-    stage_settings_document_writes, validate_link_target_ref, write_link_manifest,
+    ensure_settings_document, inline_target_sources, is_global_link_path, is_package_path,
+    link_lock_path, link_manifest_path, link_mirror_lock_key, link_slug,
+    link_target_document_selector, link_target_document_selector_parts,
+    link_target_from_settings_id, link_target_key, link_target_ordinals, link_target_ref_key,
+    link_target_segments, load_settings_documents, mark_manifest_target_broken,
+    materialize_package_target, package_document_fingerprint, package_lock_key,
+    package_target_fingerprint, package_target_fingerprint_with_external_sources,
+    package_target_matches, package_target_settings_ids, read_link_lock, read_link_manifest,
+    read_link_source_meta, referenced_settings_ids_outside, renium_global_packages_dir,
+    resolve_link_cache_dir, resolve_link_target_storage, resolve_link_targets,
+    resolve_local_link_path, selector_starts_with, serialize_link_lock, serialize_link_manifest,
+    stage_settings_document_writes, stray_target_files, validate_link_target_ref,
+    write_link_manifest,
 };
 
 pub(super) fn load_link_project(
@@ -224,9 +226,31 @@ struct LinkApplyChanges {
     transaction_removals: Vec<PathBuf>,
     transaction_prune_dirs: Vec<(PathBuf, PathBuf)>,
     mirror_permissions: BTreeMap<PathBuf, bool>,
+    replaced_files: Vec<String>,
 }
 
 impl LinkApplyChanges {
+    fn displace_files(
+        &mut self,
+        project_root: &Path,
+        source_root: &Path,
+        displaced: Vec<(PathBuf, PathBuf)>,
+    ) -> Result<()> {
+        for (file, destination) in displaced {
+            let bytes =
+                fs::read(&file).with_context(|| format!("Failed to read {}", file.display()))?;
+            self.transaction_writes.insert(destination, bytes);
+            self.replaced_files.push(
+                file.strip_prefix(project_root)
+                    .unwrap_or(&file)
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            );
+            self.remove_package_path(source_root, file);
+        }
+        Ok(())
+    }
+
     fn mark_path(&mut self, path: &Path) {
         if self.changed_seen.insert(path_key(path)) {
             self.changed_paths.push(path.to_string_lossy().into_owned());
@@ -279,8 +303,93 @@ impl LinkApplyChanges {
     }
 }
 
+fn compare_package_target(
+    document: &SettingsBytecode,
+    (service, segments, ordinals): &(String, Vec<String>, Vec<usize>),
+    service_dir: &Path,
+    (package, package_fingerprint): (&SettingsBytecode, &str),
+    shared: bool,
+) -> Result<(Option<String>, bool)> {
+    if resolve_editor_instance_by_path_ordinals(document, service, segments, ordinals).is_none() {
+        return Ok((None, false));
+    }
+    if !shared {
+        return Ok((
+            package_target_fingerprint(document, service, segments, ordinals)?,
+            package_target_matches(
+                document,
+                service,
+                segments,
+                ordinals,
+                package,
+                package_fingerprint,
+            )?,
+        ));
+    }
+    let inlined = inline_target_sources(document, service, service_dir, segments, ordinals)?;
+    let matches = package_target_matches(
+        &inlined,
+        service,
+        segments,
+        ordinals,
+        package,
+        package_fingerprint,
+    )? && stray_target_files(document, service, service_dir, segments, ordinals)?
+        .is_empty();
+    Ok((
+        package_target_fingerprint(&inlined, service, segments, ordinals)?,
+        matches,
+    ))
+}
+
+fn externalize_target_scripts(
+    document: &mut SettingsBytecode,
+    (service, segments, ordinals): &(String, Vec<String>, Vec<usize>),
+    service_dir: &Path,
+    changes: &mut LinkApplyChanges,
+) -> Result<bool> {
+    let Some(root) =
+        resolve_editor_instance_by_path_ordinals(document, service, segments, ordinals)
+    else {
+        return Ok(false);
+    };
+    let mut subtree = Vec::new();
+    collect_settings_subtree_preorder(&settings_children_by_parent(document), root, &mut subtree);
+    let source_paths = build_editor_source_paths_by_index(document, service, service_dir);
+    let mut externalized = false;
+    for index in subtree {
+        let (Some(Some(path)), Some(instance)) =
+            (source_paths.get(index), document.instances.get_mut(index))
+        else {
+            continue;
+        };
+        if !is_lua_source_class(&instance.class_name) {
+            continue;
+        }
+        let source = match instance.properties.get("Source") {
+            Some(Value::String(source)) if source == EXTERNAL_SOURCE_MARKER => continue,
+            Some(Value::String(source)) => source.clone(),
+            _ => String::new(),
+        };
+        ensure_existing_ancestor_inside(service_dir, path, "linked script file")?;
+        instance.properties.insert(
+            "Source".to_string(),
+            Value::String(EXTERNAL_SOURCE_MARKER.to_string()),
+        );
+        changes.mark_settings_ids(std::slice::from_ref(&instance.settings_id));
+        changes.mark_path(path);
+        changes.mirror_permissions.insert(path.clone(), true);
+        changes
+            .transaction_writes
+            .insert(path.clone(), source.into_bytes());
+        externalized = true;
+    }
+    Ok(externalized)
+}
+
 struct PackageLinkApply<'a> {
     args: &'a LinkApplyArgs,
+    project_root: &'a Path,
     target: &'a ResolvedLinkTarget,
     target_forced: bool,
     storage: &'a LinkTargetStorage,
@@ -297,6 +406,7 @@ impl PackageLinkApply<'_> {
     fn apply(self) -> Result<()> {
         let Self {
             args,
+            project_root,
             target,
             target_forced,
             storage,
@@ -328,6 +438,15 @@ impl PackageLinkApply<'_> {
         let package_doc = SettingsBytecode::read_file(package_path)?;
         let package_fingerprint = package_document_fingerprint(&package_doc)?;
         let package_hash = fs::read(package_path).map(|bytes| fnv1a_hex(&bytes)).ok();
+        let shared_replaced_dir = (args.shared_consumer
+            && shared::experience_package_path(project_root, &package_path.to_string_lossy())
+                .is_some())
+        .then(|| {
+            project_root
+                .join(".renium")
+                .join("link-replaced")
+                .join(&target.link_id)
+        });
         let target_exists = resolve_editor_instance_by_path_ordinals(
             document,
             document_service,
@@ -335,25 +454,13 @@ impl PackageLinkApply<'_> {
             document_ordinals,
         )
         .is_some();
-        let target_fingerprint = if target_exists {
-            package_target_fingerprint(
-                document,
-                document_service,
-                document_segments,
-                document_ordinals,
-            )?
-        } else {
-            None
-        };
-        let target_matches_package = target_exists
-            && package_target_matches(
-                document,
-                document_service,
-                document_segments,
-                document_ordinals,
-                &package_doc,
-                &package_fingerprint,
-            )?;
+        let (target_fingerprint, target_matches_package) = compare_package_target(
+            document,
+            document_selector,
+            &storage.source_root,
+            (&package_doc, &package_fingerprint),
+            shared_replaced_dir.is_some(),
+        )?;
         if !target_exists && lock_entry.files.contains_key(&lock_key) && !target_forced {
             changes.mark_deleted_target(manifest, target, args.check, true);
             return Ok(());
@@ -391,7 +498,7 @@ impl PackageLinkApply<'_> {
             }
         } else if !unchanged && (!preserved_target_edits || target_forced) {
             if !target_matches_package {
-                let (removals, settings_ids, _) = materialize_package_target(
+                let materialized = materialize_package_target(
                     document,
                     PackageMaterialization {
                         service_dir: &storage.source_root,
@@ -401,12 +508,18 @@ impl PackageLinkApply<'_> {
                         package_path,
                         filesystem_target: storage.filesystem_target,
                         external_references,
+                        displace_into: shared_replaced_dir.as_deref(),
                     },
                 )?;
-                for path in removals {
+                for path in materialized.removals {
                     changes.remove_package_path(&storage.source_root, path);
                 }
-                changes.mark_settings_ids(&settings_ids);
+                changes.displace_files(
+                    project_root,
+                    &storage.source_root,
+                    materialized.displaced,
+                )?;
+                changes.mark_settings_ids(&materialized.settings_ids);
                 changes.mark_path(settings_file);
                 changes.differences += 1;
             }
@@ -443,6 +556,17 @@ impl PackageLinkApply<'_> {
                     target.target_segments.join(".")
                 ));
             }
+        }
+        if shared_replaced_dir.is_some()
+            && !args.check
+            && externalize_target_scripts(
+                document,
+                document_selector,
+                &storage.source_root,
+                changes,
+            )?
+        {
+            changes.mark_path(settings_file);
         }
         changes.processed_targets += 1;
         let settings_ids = package_target_settings_ids(
@@ -702,6 +826,7 @@ pub(crate) fn link_apply(mut args: LinkApplyArgs) -> Result<()> {
         return Ok(());
     };
     let shared = shared::apply_place_shared_links(&project_root, args.link.as_deref(), args.check)?;
+    args.shared_consumer |= shared.is_some();
     let (mut result, warning_count) =
         apply_project_links(&args, &project_root, &src_root, &manifest_path, manifest)?;
     if let Some(shared) = shared {
@@ -870,6 +995,7 @@ pub(super) fn apply_project_links(
                 .context("Package link target settings were not loaded")?;
             PackageLinkApply {
                 args,
+                project_root: &project_root,
                 target,
                 target_forced,
                 storage,
@@ -923,6 +1049,14 @@ pub(super) fn apply_project_links(
                 .transaction_writes
                 .insert(gitignore, RENIUM_DIR_GITIGNORE.as_bytes().to_vec());
         }
+        let written = changes
+            .transaction_writes
+            .keys()
+            .map(|path| exact_path_key(path))
+            .collect::<HashSet<_>>();
+        changes
+            .transaction_removals
+            .retain(|path| !written.contains(&exact_path_key(path)));
         changes
             .transaction_removals
             .sort_by_key(|path| exact_path_key(path));
@@ -958,9 +1092,13 @@ pub(super) fn apply_project_links(
         "changedPaths": changes.changed_paths,
         "changedSettingsIds": changes.target_settings_ids,
         "links": changes.link_results,
+        "replacedFiles": changes.replaced_files,
         "warnings": changes.warnings,
     });
-    crate::app::output::drop_empty(&mut result, &["warnings", "links", "changedSettingsIds"]);
+    crate::app::output::drop_empty(
+        &mut result,
+        &["warnings", "links", "changedSettingsIds", "replacedFiles"],
+    );
     Ok((result, warning_count))
 }
 
@@ -1284,9 +1422,10 @@ fn project_link_status(
                 }
                 match (
                     expected_fingerprint,
-                    package_target_fingerprint(
+                    package_target_fingerprint_with_external_sources(
                         doc,
                         &document_service,
+                        &storage.source_root,
                         &document_segments,
                         &document_ordinals,
                     )

@@ -19,10 +19,12 @@ use crate::editor::paths::{
     build_editor_instance_path_parts, build_editor_instance_paths,
     build_editor_source_paths_by_index, infer_source_script,
 };
+use crate::editor::sync::is_lua_source_class;
 use crate::project::config;
 use crate::rbx::decode::rbx_reflection_class_is_a;
 use crate::rbx::encode::settings_root_indices;
 use crate::rbx::model::canonicalize_settings_reference_documents;
+use crate::settings::EXTERNAL_SOURCE_MARKER;
 use crate::settings::bytecode::{
     SETTINGS_BINARY_VERSION, SETTINGS_REFERENCE_SELECTOR_KEYS, SettingsBytecode,
     SettingsBytecodeInstance, encode_settings_bytecode, reindex_reference_indices,
@@ -1900,7 +1902,7 @@ fn materialize_package_root(
     service_dir: &Path,
     service: &str,
     package: &SettingsBytecode,
-) -> Result<(Vec<PathBuf>, Vec<String>, Value)> {
+) -> Result<MaterializedPackage> {
     let roots = settings_root_indices(package);
     if roots.len() != 1 {
         bail!("link package must contain exactly one root instance");
@@ -1915,16 +1917,6 @@ fn materialize_package_root(
     let removed = (0..document.instances.len()).collect::<Vec<_>>();
     let planned_removals =
         plan_editor_source_file_removals(service_dir, &source_paths_before, &removed)?;
-    let path = build_editor_instance_paths(document, service)
-        .get(document_root)
-        .and_then(Option::as_ref)
-        .cloned();
-    let removed_target = json!({
-        "settingsId": document.instances[document_root].settings_id,
-        "className": document.instances[document_root].class_name,
-        "pathSegments": path.as_ref().map(|path| path.path_segments.clone()).unwrap_or_default(),
-        "pathOrdinals": path.map(|path| path.path_ordinals).unwrap_or_default(),
-    });
     let root_name = document.instances[document_root].name.clone();
     let identity = package_identity_matches(document, document_root, package, package_root, true);
     let package_indices = (0..package.instances.len()).collect::<Vec<_>>();
@@ -1988,7 +1980,11 @@ fn materialize_package_root(
         remap_internal_clone_refs_in_record(&mut instance.attributes, &refs);
     }
     document.instances = instances;
-    Ok((planned_removals, new_settings_ids, removed_target))
+    Ok(MaterializedPackage {
+        removals: planned_removals,
+        settings_ids: new_settings_ids,
+        displaced: Vec::new(),
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -2000,12 +1996,21 @@ struct PackageMaterialization<'a> {
     package_path: &'a Path,
     filesystem_target: bool,
     external_references: &'a HashSet<String>,
+    /// Files under the target that no instance owns are moved here instead of
+    /// refusing the apply; only shared links set it, because their source wins.
+    displace_into: Option<&'a Path>,
+}
+
+struct MaterializedPackage {
+    removals: Vec<PathBuf>,
+    settings_ids: Vec<String>,
+    displaced: Vec<(PathBuf, PathBuf)>,
 }
 
 fn materialize_package_target(
     document: &mut SettingsBytecode,
     request: PackageMaterialization<'_>,
-) -> Result<(Vec<PathBuf>, Vec<String>, Value)> {
+) -> Result<MaterializedPackage> {
     let PackageMaterialization {
         service_dir,
         service,
@@ -2014,6 +2019,7 @@ fn materialize_package_target(
         package_path,
         filesystem_target,
         external_references,
+        displace_into,
     } = request;
     let package = SettingsBytecode::read_file(package_path)?;
     if package.instances.is_empty() {
@@ -2052,7 +2058,6 @@ fn materialize_package_target(
     let (package_path_segments, package_path_ordinals) =
         build_editor_instance_path_parts(&package, "");
 
-    let mut removed_target = Value::Null;
     let mut planned_removals = Vec::new();
     let mut identity = PackageIdentityMatches::default();
     let mut placement = None;
@@ -2083,18 +2088,6 @@ fn materialize_package_target(
         placement = model_placement_delta(document, existing, &package, package_root)?;
         let source_paths_before =
             build_editor_source_paths_by_index(document, service, service_dir);
-        let paths_by_index = build_editor_instance_paths(document, service);
-        if let Some(info) = paths_by_index
-            .get(existing)
-            .and_then(std::clone::Clone::clone)
-        {
-            removed_target = json!({
-                "settingsId": document.instances[existing].settings_id.clone(),
-                "className": document.instances[existing].class_name.clone(),
-                "pathSegments": info.path_segments,
-                "pathOrdinals": info.path_ordinals,
-            });
-        }
         let children = settings_children_by_parent(document);
         let mut subtree = Vec::new();
         collect_settings_subtree_preorder(&children, existing, &mut subtree);
@@ -2120,6 +2113,7 @@ fn materialize_package_target(
         leaf_dir.push(segment);
     }
     leaf_dir.push(&leaf);
+    let mut displaced = Vec::new();
     if filesystem_target && leaf_ordinal == 1 && leaf_dir.exists() {
         ensure_existing_ancestor_inside(service_dir, &leaf_dir, "package target directory")?;
         if fs::symlink_metadata(&leaf_dir)?.file_type().is_symlink() {
@@ -2128,26 +2122,19 @@ fn materialize_package_target(
                 leaf_dir.display()
             );
         }
-        let planned = planned_removals
-            .iter()
-            .map(|path| exact_path_key(path))
-            .collect::<HashSet<_>>();
-        for entry in WalkDir::new(&leaf_dir).follow_links(false).min_depth(1) {
-            let entry = entry.with_context(|| {
-                format!("Failed to inspect package target {}", leaf_dir.display())
-            })?;
-            if entry.file_type().is_symlink() {
-                bail!(
-                    "Refusing to replace package target containing symlink {}",
-                    entry.path().display()
-                );
+        let unowned = unowned_target_files(&leaf_dir, &planned_removals)?;
+        match (unowned.first(), displace_into) {
+            (Some(file), None) => bail!(
+                "Package target contains an unowned file that Renium will not delete: {}",
+                file.display()
+            ),
+            (_, Some(destination)) => {
+                for file in unowned {
+                    let relative = file.strip_prefix(&leaf_dir).unwrap_or(&file).to_path_buf();
+                    displaced.push((file, destination.join(relative)));
+                }
             }
-            if entry.file_type().is_file() && !planned.contains(&exact_path_key(entry.path())) {
-                bail!(
-                    "Package target contains an unowned file that Renium will not delete: {}",
-                    entry.path().display()
-                );
-            }
+            (None, None) => {}
         }
     }
 
@@ -2273,7 +2260,124 @@ fn materialize_package_target(
         }
     }
 
-    Ok((planned_removals, new_settings_ids, removed_target))
+    Ok(MaterializedPackage {
+        removals: planned_removals,
+        settings_ids: new_settings_ids,
+        displaced,
+    })
+}
+
+fn unowned_target_files(target_dir: &Path, owned: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let owned = owned
+        .iter()
+        .map(|path| exact_path_key(path))
+        .collect::<HashSet<_>>();
+    let mut unowned = Vec::new();
+    for entry in WalkDir::new(target_dir).follow_links(false).min_depth(1) {
+        let entry = entry.with_context(|| {
+            format!("Failed to inspect package target {}", target_dir.display())
+        })?;
+        if entry.file_type().is_symlink() {
+            bail!(
+                "Refusing to replace package target containing symlink {}",
+                entry.path().display()
+            );
+        }
+        if entry.file_type().is_file() && !owned.contains(&exact_path_key(entry.path())) {
+            unowned.push(entry.into_path());
+        }
+    }
+    Ok(unowned)
+}
+
+fn target_subtree(
+    document: &SettingsBytecode,
+    service: &str,
+    target_segments: &[String],
+    target_ordinals: &[usize],
+) -> Option<Vec<usize>> {
+    let root = resolve_editor_instance_by_path_ordinals(
+        document,
+        service,
+        target_segments,
+        target_ordinals,
+    )?;
+    let mut subtree = Vec::new();
+    collect_settings_subtree_preorder(&settings_children_by_parent(document), root, &mut subtree);
+    Some(subtree)
+}
+
+/// Files on disk are a script's source when they exist, so read-only checks
+/// compare the target with its script files read back into the store.
+fn inline_target_sources(
+    document: &SettingsBytecode,
+    service: &str,
+    service_dir: &Path,
+    target_segments: &[String],
+    target_ordinals: &[usize],
+) -> Result<SettingsBytecode> {
+    let mut normalized = document.clone();
+    let Some(subtree) = target_subtree(document, service, target_segments, target_ordinals) else {
+        return Ok(normalized);
+    };
+    let source_paths = build_editor_source_paths_by_index(document, service, service_dir);
+    for index in subtree {
+        let Some(Some(source_path)) = source_paths.get(index) else {
+            continue;
+        };
+        if !source_path.is_file() {
+            continue;
+        }
+        let source = fs::read_to_string(source_path)
+            .with_context(|| format!("Failed to read {}", source_path.display()))?;
+        normalized.instances[index]
+            .properties
+            .insert("Source".to_string(), Value::String(source));
+    }
+    Ok(normalized)
+}
+
+fn stray_target_files(
+    document: &SettingsBytecode,
+    service: &str,
+    service_dir: &Path,
+    target_segments: &[String],
+    target_ordinals: &[usize],
+) -> Result<Vec<PathBuf>> {
+    let target_dir = target_segments
+        .iter()
+        .fold(service_dir.to_path_buf(), |path, segment| {
+            path.join(segment)
+        });
+    if target_ordinals.iter().any(|ordinal| *ordinal != 1) || !target_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let Some(subtree) = target_subtree(document, service, target_segments, target_ordinals) else {
+        return Ok(Vec::new());
+    };
+    let source_paths = build_editor_source_paths_by_index(document, service, service_dir);
+    let owned = subtree
+        .into_iter()
+        .filter_map(|index| source_paths.get(index).cloned().flatten())
+        .collect::<Vec<_>>();
+    unowned_target_files(&target_dir, &owned)
+}
+
+fn target_has_inline_scripts(
+    document: &SettingsBytecode,
+    service: &str,
+    target_segments: &[String],
+    target_ordinals: &[usize],
+) -> bool {
+    target_subtree(document, service, target_segments, target_ordinals)
+        .into_iter()
+        .flatten()
+        .filter_map(|index| document.instances.get(index))
+        .any(|instance| {
+            is_lua_source_class(&instance.class_name)
+                && instance.properties.get("Source").and_then(Value::as_str)
+                    != Some(EXTERNAL_SOURCE_MARKER)
+        })
 }
 
 #[derive(Clone, Copy)]
@@ -2750,20 +2854,13 @@ pub(crate) fn package_target_fingerprint_with_external_sources(
     target_segments: &[String],
     target_ordinals: &[usize],
 ) -> Result<Option<String>> {
-    let mut normalized = document.clone();
-    let source_paths = build_editor_source_paths_by_index(&normalized, service, service_dir);
-    for (index, source_path) in source_paths.into_iter().enumerate() {
-        let Some(source_path) = source_path.filter(|path| path.is_file()) else {
-            continue;
-        };
-        let source = fs::read_to_string(&source_path)
-            .with_context(|| format!("Failed to read {}", source_path.display()))?;
-        if let Some(instance) = normalized.instances.get_mut(index) {
-            instance
-                .properties
-                .insert("Source".to_string(), Value::String(source));
-        }
-    }
+    let normalized = inline_target_sources(
+        document,
+        service,
+        service_dir,
+        target_segments,
+        target_ordinals,
+    )?;
     package_target_fingerprint(&normalized, service, target_segments, target_ordinals)
 }
 

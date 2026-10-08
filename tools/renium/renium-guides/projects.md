@@ -13,7 +13,7 @@ rbx cmp Before.rbxl After.rbxlx --full --all
 ```
 
 `bem`/`bim` copy model trees; use `mv --to-service` for an existing subtree.
-`bep` builds a place without Studio; `--base ORIGINAL.rbxl` keeps its unsynced services and root fields. `pi` imports a saved `.rbxl`/`.rbxlx` into the files without Studio; once Studio opens that place, run `pl` once before Live Sync or pushes so files adopt Studio's instance ids.
+`bep` builds a place without Studio; `--base ORIGINAL.rbxl` keeps its unsynced services and root fields. `pi` imports a saved `.rbxl`/`.rbxlx` into the files; once Studio opens that place, run `pl` once before Live Sync or pushes so files adopt Studio's ids.
 `q` searches a place file by name, class, or source without Studio. `--props A,B` (or `all`) adds saved values, NotScriptable ones included; enums print as `Enum.Type.Item`, references as paths. `defaulted` names were not in the file (class default shown), `notSaved` ones are derived (Position), `unknown` ones are not properties.
 To pull or import into another folder, pass `-r DIR` (`rbx -r DIR pi FILE`); an empty folder gets a project file. Create projects with `rbx init DIR`, never by writing `renium.project.jsonc` by hand.
 `cmp` compares scripts; `--full --all` adds instance/property/attribute changes, `--values` values and source. The input is before, the project (or a second file) after. See [comparison scope and output](data.md#inspect-files-without-importing).
@@ -67,8 +67,8 @@ rbx lk --experience
 rbx lks --experience
 ```
 
-`lkp --share` in the source place packs `links/ID.renium` at the experience root, records it in `renium.experience.json` (`sharedLinks`) and links each place with the same path read-only (`--all-places`: every place). Edit only the source, then `rbx lk` in any place (`--experience` from anywhere) re-packs and updates every copy; Live Sync in the source does it on its own and consumers' Live Sync pushes the copies.
-A PackageLink right under the root is left out (`strippedPackageLinks`) and dropped from the copies; `rbx upl` unlinks it in the source. Nested packages travel as they are: pushes into packages the account does not own are refused before Studio is touched, so consumers get those only unchanged. `lks --experience` shows `stale` packs and places as `ok`, `drift` or `missing`.
+`lkp --share` in the source place packs `links/ID.renium` at the experience root, records it in `renium.experience.json` (`sharedLinks`) and links each place with the same path read-only (`--all-places`: every place). Edit only the source, then `rbx lk` in any place (`--experience` from anywhere) re-packs and updates every copy; Live Sync does this itself and pushes each copy. Copies hold read-only script files; other files under their root move to `.renium/link-replaced/ID/`.
+A PackageLink right under the root is left out (`strippedPackageLinks`) and dropped from the copies; `rbx upl` unlinks it in the source. Nested packages travel as they are: pushes into packages the account does not own are refused before Studio is touched, so copies get those only unchanged. `lks --experience` shows `stale` packs and places as `ok`, `drift` or `missing`.
 
 ## Version control
 
@@ -88,4 +88,4 @@ rbx collab stop
 
 `start` shares the project's files as one live document and prints an invite; every participant's folder mirrors it. Without `--relay` the room runs on the host through a Cloudflare quick tunnel and dies with it; with `--relay` a relay keeps the room and its history, and its copy wins over a local folder on join. `relay deploy` publishes the relay to the user's free Cloudflare account once (needs Node.js; may open a browser sign-in) and makes it the default; `relay set URL` picks an existing one.
 `join` fills an empty folder from the room and overwrites an existing one. Only the host runs Live Sync; others edit files and see results through Team Create or the host.
-`status` lists participants with their open file and selection. Never start a second session for the same folder; stop the first.
+`status` lists participants, their open file and selection. Never start a second session for one folder; stop the first.

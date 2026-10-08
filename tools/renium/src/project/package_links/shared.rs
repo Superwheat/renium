@@ -7,7 +7,10 @@ use serde_json::{Map, Value, json};
 use crate::app::output::{drop_empty, print_json_output};
 use crate::bytecode::acquire_settings_file_lock;
 use crate::cli::{LinkApplyArgs, LinkPackArgs, ProjectSourceArgs};
-use crate::editor::paths::build_editor_source_paths_by_index;
+use crate::editor::document::ensure_editor_source_target_in_bytecode;
+use crate::editor::paths::{
+    build_editor_source_paths_by_index, infer_editor_source_path_spec_in_service,
+};
 use crate::project::config;
 use crate::project::experience::{
     EXPERIENCE_FILE, ExperienceLayout, ExperiencePlace, SharedLinkRecord, find_experience_root,
@@ -27,11 +30,12 @@ use super::commands::{
     parse_link_target, resolve_editor_instance_by_path_ordinals,
 };
 use super::{
-    LinkEntry, LinkManifest, LinkSource, LinkTargetRef, RENIUM_STORE_EXTENSION, is_package_path,
-    link_manifest_path, link_slug, link_target_document_selector_parts, link_target_ordinals,
-    link_target_ref_key, link_target_segments, package_document_fingerprint,
-    package_target_matches, read_link_manifest, resolve_link_target_storage, selector_starts_with,
-    validate_link_target_ref, write_link_manifest,
+    LinkEntry, LinkManifest, LinkSource, LinkTargetRef, RENIUM_STORE_EXTENSION,
+    inline_target_sources, is_package_path, link_manifest_path, link_slug,
+    link_target_document_selector_parts, link_target_ordinals, link_target_ref_key,
+    link_target_segments, package_document_fingerprint, package_target_matches, read_link_manifest,
+    resolve_link_target_storage, selector_starts_with, stray_target_files,
+    target_has_inline_scripts, validate_link_target_ref, write_link_manifest,
 };
 
 const SHARED_LINKS_KEY: &str = "sharedLinks";
@@ -72,8 +76,38 @@ impl ConsumerState {
 struct LinkedTarget {
     document: SettingsBytecode,
     service: String,
+    service_dir: PathBuf,
     segments: Vec<String>,
     ordinals: Vec<usize>,
+}
+
+impl LinkedTarget {
+    fn state(&self, package: &SettingsBytecode, fingerprint: &str) -> Result<ConsumerState> {
+        let (service, segments, ordinals) = (&self.service, &self.segments, &self.ordinals);
+        let inlined = inline_target_sources(
+            &self.document,
+            service,
+            &self.service_dir,
+            segments,
+            ordinals,
+        )?;
+        let current =
+            package_target_matches(&inlined, service, segments, ordinals, package, fingerprint)?
+                && !target_has_inline_scripts(&self.document, service, segments, ordinals)
+                && stray_target_files(
+                    &self.document,
+                    service,
+                    &self.service_dir,
+                    segments,
+                    ordinals,
+                )?
+                .is_empty();
+        Ok(if current {
+            ConsumerState::Current
+        } else {
+            ConsumerState::Drift
+        })
+    }
 }
 
 pub(crate) struct SharedPropagation {
@@ -231,6 +265,7 @@ fn read_linked_target(links: &PlaceLinks, target: &LinkTargetRef) -> Result<Opti
     Ok(Some(LinkedTarget {
         document,
         service,
+        service_dir: storage.source_root,
         segments,
         ordinals,
     }))
@@ -254,7 +289,7 @@ fn pack_shared_subtree(
         .as_ref()
         .with_context(|| format!("{label} has no Renium store"))?;
     let guard = acquire_settings_file_lock(settings_file)?;
-    let document = SettingsBytecode::read_file(settings_file)?;
+    let mut document = SettingsBytecode::read_file(settings_file)?;
     let (service, segments, ordinals) = link_target_document_selector_parts(
         &target.service,
         &link_target_segments(target),
@@ -264,6 +299,19 @@ fn pack_shared_subtree(
     )?;
     let root = resolve_editor_instance_by_path_ordinals(&document, &service, &segments, &ordinals)
         .with_context(|| format!("{label} was not found in {}", place.root.display()))?;
+    for file in stray_target_files(
+        &document,
+        &service,
+        &storage.source_root,
+        &segments,
+        &ordinals,
+    )? {
+        if let Some(spec) =
+            infer_editor_source_path_spec_in_service(&storage.source_root, &service, &file)
+        {
+            ensure_editor_source_target_in_bytecode(&mut document, &spec)?;
+        }
+    }
     let package_links = settings_children_by_parent(&document)
         .get(root)
         .map_or(&[][..], Vec::as_slice)
@@ -335,19 +383,7 @@ fn consumer_state(
     for target in &targets {
         let target_state = match read_linked_target(&links, target)? {
             None => ConsumerState::Missing,
-            Some(linked)
-                if package_target_matches(
-                    &linked.document,
-                    &linked.service,
-                    &linked.segments,
-                    &linked.ordinals,
-                    package,
-                    fingerprint,
-                )? =>
-            {
-                ConsumerState::Current
-            }
-            Some(_) => ConsumerState::Drift,
+            Some(linked) => linked.state(package, fingerprint)?,
         };
         state = Some(state.map_or(target_state, |state: ConsumerState| state.max(target_state)));
     }
@@ -371,11 +407,17 @@ fn consumer_apply_args(place_root: &Path, id: &str) -> LinkApplyArgs {
         wally_path: "wally".to_string(),
         cache_dir: None,
         experience: false,
+        shared_consumer: true,
         pretty: false,
     }
 }
 
-fn apply_consumer(links: PlaceLinks, id: &str) -> Result<&'static str> {
+struct ConsumerUpdate {
+    state: &'static str,
+    replaced: usize,
+}
+
+fn apply_consumer(links: PlaceLinks, id: &str) -> Result<ConsumerUpdate> {
     let args = consumer_apply_args(&links.root, id);
     let (result, _) = apply_project_links(
         &args,
@@ -400,7 +442,13 @@ fn apply_consumer(links: PlaceLinks, id: &str) -> Result<&'static str> {
         .into_iter()
         .flatten()
         .any(|link| link.get("deletedTarget") == Some(&Value::Bool(true)));
-    Ok(if detached { "detached" } else { "updated" })
+    Ok(ConsumerUpdate {
+        state: if detached { "detached" } else { "updated" },
+        replaced: result
+            .get("replacedFiles")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len),
+    })
 }
 
 fn update_consumer(
@@ -408,14 +456,17 @@ fn update_consumer(
     place: &ExperiencePlace,
     id: &str,
     packed: &PackedShare,
-) -> Result<Option<&'static str>> {
+) -> Result<Option<ConsumerUpdate>> {
     let Some((links, state)) =
         consumer_state(layout, place, id, &packed.package, &packed.fingerprint)?
     else {
         return Ok(None);
     };
     if state == ConsumerState::Current {
-        return Ok(Some(state.name()));
+        return Ok(Some(ConsumerUpdate {
+            state: state.name(),
+            replaced: 0,
+        }));
     }
     apply_consumer(links, id).map(Some)
 }
@@ -467,14 +518,18 @@ fn propagate_link_into(
         return Ok(());
     }
     let mut places = Map::new();
+    let mut replaced = Map::new();
     let mut errors = Map::new();
     for place in &layout.places {
         if place.alias == link.source || propagation.skip == Some(place.alias.as_str()) {
             continue;
         }
         match update_consumer(layout, place, &link.id, &packed) {
-            Ok(Some(state)) => {
-                places.insert(place.alias.clone(), json!(state));
+            Ok(Some(update)) => {
+                places.insert(place.alias.clone(), json!(update.state));
+                if update.replaced > 0 {
+                    replaced.insert(place.alias.clone(), json!(update.replaced));
+                }
             }
             Ok(None) => {}
             Err(error) => {
@@ -482,11 +537,14 @@ fn propagate_link_into(
             }
         }
     }
-    if !places.is_empty() {
-        entry.insert("places".to_string(), Value::Object(places));
-    }
-    if !errors.is_empty() {
-        entry.insert("errors".to_string(), Value::Object(errors));
+    for (key, map) in [
+        ("places", places),
+        ("replaced", replaced),
+        ("errors", errors),
+    ] {
+        if !map.is_empty() {
+            entry.insert(key.to_string(), Value::Object(map));
+        }
     }
     Ok(())
 }
@@ -770,7 +828,7 @@ fn link_consumer_place(
     place: &ExperiencePlace,
     record: &SharedLinkRecord,
     create: bool,
-) -> Result<std::result::Result<(), String>> {
+) -> Result<std::result::Result<usize, String>> {
     let target = shared_target(record);
     let label = target_label(&target);
     let key = link_target_ref_key(&target);
@@ -823,8 +881,7 @@ fn link_consumer_place(
         .broken
         .retain(|broken| link_target_ref_key(broken) != key);
     write_link_manifest(&links.manifest_path, &links.manifest)?;
-    apply_consumer(links, &record.id)?;
-    Ok(Ok(()))
+    Ok(Ok(apply_consumer(links, &record.id)?.replaced))
 }
 
 pub(super) fn share_link_pack(mut args: LinkPackArgs) -> Result<()> {
@@ -890,11 +947,17 @@ pub(super) fn share_link_pack(mut args: LinkPackArgs) -> Result<()> {
         )?;
     }
     let mut linked = Vec::new();
+    let mut replaced = Map::new();
     let mut skipped = Vec::new();
     let mut failed = Vec::new();
     for place in layout.places.iter().filter(|place| place.alias != source) {
         match link_consumer_place(&layout, place, &record, args.all_places) {
-            Ok(Ok(())) => linked.push(place.alias.clone()),
+            Ok(Ok(count)) => {
+                linked.push(place.alias.clone());
+                if count > 0 {
+                    replaced.insert(place.alias.clone(), json!(count));
+                }
+            }
             Ok(Err(reason)) => skipped.push(json!({ "place": place.alias, "reason": reason })),
             Err(error) => {
                 failed.push(json!({ "place": place.alias, "error": format!("{error:#}") }));
@@ -919,6 +982,9 @@ pub(super) fn share_link_pack(mut args: LinkPackArgs) -> Result<()> {
             "The Roblox PackageLink stays out of the package, so linked copies drop it. `rbx --place {source} upl {} -i {label}` unlinks the Roblox package in the source place; run it in any other place that still has it",
             target.service
         ));
+    }
+    if !replaced.is_empty() {
+        result["replaced"] = Value::Object(replaced);
     }
     drop_empty(&mut result, &["skipped", "failed", "strippedPackageLinks"]);
     print_json_output(&result, args.pretty)

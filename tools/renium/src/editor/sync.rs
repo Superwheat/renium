@@ -3672,28 +3672,25 @@ fn canonical_editor_changed_path(project_root: &Path, changed_path: &Path) -> Pa
     }
 }
 
-fn reject_read_only_changed_path(
+/// A path under a read-only package is checked by comparing the whole target
+/// with its package, so files a link apply wrote pass and other edits fail.
+fn read_only_changed_path(
     link_enforcement: &LinkEnforcement,
     service: &str,
     protected_path: Option<(&[String], &[usize])>,
-    absolute_path: &Path,
-    full_reconcile: bool,
-) -> Result<bool> {
-    let Some(target) = protected_path.and_then(|(path, ordinals)| {
-        link_enforcement.read_only_package_for_path(service, path, ordinals)
-    }) else {
-        return Ok(false);
-    };
-    if full_reconcile {
-        return Ok(true);
+    skip: bool,
+    changed_services: &mut EditorChangedServices,
+) -> bool {
+    if protected_path
+        .and_then(|(path, ordinals)| {
+            link_enforcement.read_only_package_for_path(service, path, ordinals)
+        })
+        .is_none()
+    {
+        return false;
     }
-    bail!(
-        "Cannot edit {} because it belongs to read-only link \"{}\" at {}.{}. Use --override-packages to replace it intentionally.",
-        absolute_path.display(),
-        target.link_id,
-        target.service,
-        target.target_segments.join(".")
-    )
+    changed_services.read_only.insert(service.to_string());
+    skip
 }
 
 #[derive(Default)]
@@ -3702,6 +3699,7 @@ struct EditorChangedServices {
     reconcile: HashSet<String>,
     target_upsert: HashSet<String>,
     dirty: HashSet<String>,
+    read_only: HashSet<String>,
 }
 
 fn settings_value_references_target(
@@ -3929,7 +3927,12 @@ fn finish_editor_change_collection(
     link_enforcement: &LinkEnforcement,
 ) -> Result<EditorChangeSet> {
     let phase_started = Instant::now();
-    validate_read_only_service_changes(link_enforcement, &services.settings, documents, src_root)?;
+    let validated = services
+        .settings
+        .union(&services.read_only)
+        .cloned()
+        .collect::<HashSet<_>>();
+    validate_read_only_service_changes(link_enforcement, &validated, documents, src_root)?;
     log_editor_collection_timing("package validation", phase_started);
     for service in sorted_services(services.dirty) {
         if let Some(document) = documents.get(&service).and_then(Option::as_ref) {
@@ -4192,13 +4195,13 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
                 &absolute_path,
             )
         {
-            if reject_read_only_changed_path(
+            if read_only_changed_path(
                 link_enforcement,
                 &service,
                 Some((&target.path_segments, &target.path_ordinals)),
-                &absolute_path,
                 full_reconcile,
-            )? {
+                &mut changed_services,
+            ) {
                 continue;
             }
             property_filter.settings_ids.extend(target.settings_ids);
@@ -4246,13 +4249,13 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
                     .as_ref()
                     .map(|spec| (spec.path_segments.as_slice(), &[][..]))
             });
-        if reject_read_only_changed_path(
+        if read_only_changed_path(
             link_enforcement,
             &service,
             protected_path,
-            &absolute_path,
-            full_reconcile,
-        )? {
+            full_reconcile && !(exists_as_file && mapped_target.is_some()),
+            &mut changed_services,
+        ) {
             continue;
         }
         if mapped_target.is_none()

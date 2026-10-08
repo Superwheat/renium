@@ -3116,6 +3116,12 @@ pub(super) struct LinkApplyArgs {
         long
     )]
     pub(super) experience: bool,
+    #[arg(
+        help = "Apply experience-shared packages as their source dictates: move files the package does not own to .renium/link-replaced and write read-only script files",
+        long,
+        hide = true
+    )]
+    pub(super) shared_consumer: bool,
     #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }
