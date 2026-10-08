@@ -47,7 +47,7 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ("build", "Examples:\n  rbx build"),
     (
         "q",
-        "Examples:\n  rbx q Place.rbxl -n Reward\n  rbx q Place.rbxl --source \"Free car\"",
+        "Examples:\n  rbx q Place.rbxl -n Reward\n  rbx q Place.rbxl --source \"Free car\"\n  rbx q Place.rbxl -c Workspace --props PlayerCharacterDestroyBehavior,Gravity",
     ),
     (
         "cmp",
@@ -116,7 +116,10 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ("ed", "Examples:\n  rbx ed"),
     ("co", "Examples:\n  rbx co --player 1 --limit 20"),
     ("l", "Examples:\n  rbx l \"return game.PlaceId\""),
-    ("lc", "Examples:\n  rbx lc \"return game.PlaceId\" 1"),
+    (
+        "lc",
+        "Examples:\n  rbx lc \"return game.PlaceId\" 1\n  rbx lc -t 30 --detach probe \"state.n = 0 while true do state.n += 1 task.wait(1) end\" 1\n  rbx lc --collect probe 1 --stop",
+    ),
     ("dev", "Examples:\n  rbx dev set \"iPhone 16 Pro\""),
     (
         "pf",

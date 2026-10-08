@@ -145,7 +145,7 @@ name), `-i ID`, `-n NAME` or `-c CLASS`. `in` inspects an instance, `bg` reads a
 property, `ba` adds an instance and `sg` searches script lines. `bb` answers many
 field queries in one JSON request.
 
-Place files need no Studio either: `rbx q Place.rbxl -n Door` searches one, `rbx cmp Before.rbxl --full` compares every saved instance and property with
+Place files need no Studio either: `rbx q Place.rbxl -n Door` searches one (`--props Anchored,Size` adds saved property values), `rbx cmp Before.rbxl --full` compares every saved instance and property with
 the project (or `--against` another file), `rbx bep -o place.rbxl` builds one and
 `rbx pi Place.rbxl` imports one into the project.
 

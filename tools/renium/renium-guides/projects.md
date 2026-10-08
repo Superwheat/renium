@@ -9,6 +9,7 @@ rbx bep -o place.rbxl
 rbx pi Place.rbxl
 rbx q Place.rbxl -n RewardHandler
 rbx q Place.rbxl --source "reward granted"
+rbx q Place.rbxl -c Workspace --props PlayerCharacterDestroyBehavior,Gravity
 rbx cmp Place.rbxl
 rbx cmp Before.rbxl --full --all
 rbx cmp Before.rbxl After.rbxlx --full --all
@@ -20,7 +21,7 @@ rbx bpack
 
 `bem`/`bim` copy model trees; use `mv --to-service` for an existing subtree.
 `bep` builds a place without opening or publishing it; `bep --base ORIGINAL.rbxl` keeps that file's unsynced services and engine root fields so the result is a complete place. `pi` does the reverse, importing a saved `.rbxl`/`.rbxlx` into the project files like a pull, without Studio. Once Studio has that place open, run `pl` once before Live Sync or pushes so the files adopt Studio's instance identities.
-`q` queries an RBXL/RBXLX without Studio or a project beside it. Filter by name, class, or source.
+`q` queries an RBXL/RBXLX without Studio or a project beside it. Filter by name, class, or source. `--props A,B` (or `all`) adds each match's saved values, NotScriptable ones included; enums print as `Enum.Type.Item`, references as paths. `defaulted` names were missing from the file and show the class default, `notSaved` ones are derived and never saved (Position), `unknown` ones are not properties of the class.
 To pull or import into a separate folder, pass `-r DIR` (`rbx pi FILE -r DIR`, or `rbx -r DIR pi FILE` to run any command from that folder); an empty folder gets its project file created. Create projects with `rbx init DIR`, never by writing `renium.project.jsonc` by hand.
 `cmp` is script-only by default. Add `--full --all` for all instance/property/attribute changes; `--values` includes values and source. The input is the older/before state; the project (or `--against` file) is after. `.rbxl` and `.rbxlx` work on either side without opening Studio. See [comparison scope and output](data.md#inspect-files-without-importing).
 

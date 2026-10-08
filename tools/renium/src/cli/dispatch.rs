@@ -18,7 +18,7 @@ use crate::bytecode::{
     bytecode_apply_property_batch, bytecode_get_property, bytecode_set_property,
     bytecode_set_source, find_command, inspect_command, tree_command,
 };
-use crate::cli::{Commands, ExecuteLuauArgs};
+use crate::cli::Commands;
 use crate::daemon::{bridge_daemon, cursor_poll};
 use crate::editor::history::editor_revert;
 use crate::editor::sync::{apply_editor_delete, apply_editor_property, push_editor_changes};
@@ -94,23 +94,7 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::ExplorerDaemon(args) => explorer_daemon(args),
         Commands::GetConsoleOutput(args) => get_console_output_command(args),
         Commands::ExecuteLuau(args) => execute_luau_command(args),
-        Commands::ExecuteClientLuau(mut args) => {
-            if args.runner.collect.is_some() && args.player.is_none() {
-                args.player = args.code.take();
-            }
-            execute_luau_command(ExecuteLuauArgs {
-                bridge: args.bridge,
-                code: args.code,
-                inline_code: None,
-                file: None,
-                client: args.player.is_none(),
-                player: args.player,
-                server: false,
-                edit: false,
-                timeout: args.timeout,
-                runner: args.runner,
-            })
-        }
+        Commands::ExecuteClientLuau(args) => execute_luau_command(args.into_luau_args()?),
         Commands::StudioDevice(args) => studio_device_command(args),
         Commands::NetworkSimulation(args) => crate::studio::automation::network::command(args),
         Commands::RenderQuality(args) => crate::studio::automation::render_quality::command(args),
