@@ -47,7 +47,7 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ("build", "Examples:\n  rbx build"),
     (
         "q",
-        "Examples:\n  rbx q Place.rbxl -n Reward\n  rbx q Place.rbxl --source \"Free car\"",
+        "Examples:\n  rbx q Place.rbxl -n Reward\n  rbx q Place.rbxl --source \"Free car\"\n  rbx q Place.rbxl -c Workspace --props PlayerCharacterDestroyBehavior,Gravity",
     ),
     (
         "cmp",

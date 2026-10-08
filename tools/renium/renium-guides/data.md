@@ -106,12 +106,13 @@ rbx v Place.rbxl --json
 rbx v Place.rbxlx --json
 rbx q Place.rbxl -n Door
 rbx q Place.rbxl --source "reward granted"
+rbx q Place.rbxl -c Workspace --props StreamingEnabled
 rbx cmp Place.rbxl
 rbx cmp Before.rbxl --full --all
 rbx cmp Before.rbxl After.rbxlx --full --all
 ```
 
-`v` accepts `.rbxl`/`.rbxlx` places, `.rbxm`/`.rbxmx` models and `.renium` stores; `--json` includes source, properties, attributes and references. It inspects one file; it does not compare two states.
+`v` accepts `.rbxl`/`.rbxlx` places, `.rbxm`/`.rbxmx` models and `.renium` stores; `--json` includes source, properties, attributes and references. It inspects one file; it does not compare two states. For a few saved values, use `q ... --props NAME,NAME` instead of a whole `v --json` dump.
 Use `v STORE.renium --json` to distinguish stored overrides from materialized defaults.
 For a full saved-place diff, use `cmp BEFORE --full` from the target project. Add `AFTER` (or `--against AFTER`) for two files; no project is required, and Studio session services such as `ConfigureServerService` are skipped. Both place formats work in either position. The direction is BEFORE → project/AFTER. Without `--full`, `cmp` is script-only. Counts cover the whole place; request `--all` or `--values` only when needed.
 

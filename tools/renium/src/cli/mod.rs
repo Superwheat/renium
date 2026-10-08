@@ -125,6 +125,13 @@ pub(super) struct QueryPlaceArgs {
         value_name = "TEXT"
     )]
     pub(super) source: Option<String>,
+    #[arg(
+        help = "Print these saved property values for each match (comma separated, or all)",
+        long,
+        value_name = "NAME,NAME|all",
+        value_delimiter = ','
+    )]
+    pub(super) props: Vec<String>,
     #[arg(help = "Maximum matches", long, default_value = "20")]
     pub(super) limit: NonZeroUsize,
     #[arg(help = "Return every match", short, long)]

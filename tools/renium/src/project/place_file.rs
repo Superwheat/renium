@@ -1,16 +1,24 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use anyhow::{Result, bail};
-use rbx_dom_weak::WeakDom as RbxWeakDom;
+use anyhow::{Context, Result, bail};
 use rbx_dom_weak::types::{Ref as RbxRef, Variant as RbxVariant};
+use rbx_dom_weak::{Instance as RbxInstance, Ustr, WeakDom as RbxWeakDom};
+use rbx_reflection::{DataType, PropertyKind, PropertySerialization, ReflectionDatabase};
 use serde_json::{Map, Value, json};
 
 use crate::app::output::print_json_output;
+use crate::bytecode::explorer::compact_path_string;
 use crate::cli::{ComparePlaceArgs, QueryPlaceArgs};
 use crate::editor::sync::is_lua_source_class;
 use crate::project::config;
-use crate::rbx::model::{RbxPlaceFormat, build_rbx_place, rbx_dom_instance_path_parts};
+use crate::rbx::decode::rbx_variant_to_settings_json;
+use crate::rbx::encode::{
+    enum_item_name_by_value, rbx_logical_property_name, rbx_property_descriptor, strip_enum_prefix,
+};
+use crate::rbx::model::{
+    BytecodeModelImportRefs, RbxPlaceFormat, build_rbx_place, rbx_dom_instance_path_parts,
+};
 use crate::system::text::normalized_source_bytes;
 
 #[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
@@ -88,6 +96,192 @@ fn query_result(dom: &RbxWeakDom, referent: RbxRef) -> Value {
     Value::Object(result)
 }
 
+enum PropertyRequest<'a> {
+    All,
+    Named(Vec<&'a str>),
+}
+
+impl<'a> PropertyRequest<'a> {
+    fn parse(raw: &'a [String]) -> Result<Option<Self>> {
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        let names = raw
+            .iter()
+            .map(|name| name.trim())
+            .filter(|name| !name.is_empty())
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            bail!("--props needs property names or all, for example --props Anchored,Size");
+        }
+        if names.iter().any(|name| name.eq_ignore_ascii_case("all")) {
+            return Ok(Some(Self::All));
+        }
+        Ok(Some(Self::Named(names)))
+    }
+}
+
+fn reference_value(dom: &RbxWeakDom, target: RbxRef) -> Value {
+    if target == dom.root_ref() || dom.get_by_ref(target).is_none() {
+        return Value::Null;
+    }
+    let (path, ordinals) = rbx_dom_instance_path_parts(dom, target);
+    compact_path_string(&path, Some(&ordinals)).map_or_else(
+        || json!({"path": path, "ordinals": ordinals}),
+        Value::String,
+    )
+}
+
+/// Values print in the settings-store shape, except enums (`Enum.Type.Item`)
+/// and references (the target's path), which read better by name.
+fn property_value(
+    dom: &RbxWeakDom,
+    class_name: &str,
+    property_name: &str,
+    value: &RbxVariant,
+    database: &ReflectionDatabase<'_>,
+) -> Value {
+    let descriptor = rbx_property_descriptor(database, class_name, property_name);
+    let enum_item = match value {
+        RbxVariant::Enum(item) => descriptor
+            .and_then(|descriptor| match &descriptor.data_type {
+                DataType::Enum(enum_name) => Some(*enum_name),
+                _ => None,
+            })
+            .map(|enum_name| (enum_name, item.to_u32())),
+        RbxVariant::EnumItem(item) => Some((item.ty.as_str(), item.value)),
+        RbxVariant::Ref(target) => return reference_value(dom, *target),
+        _ => None,
+    };
+    if let Some((enum_name, item_value)) = enum_item
+        && let Some(item_name) = enum_item_name_by_value(database, enum_name, item_value)
+    {
+        return json!(format!("Enum.{}.{item_name}", strip_enum_prefix(enum_name)));
+    }
+    rbx_variant_to_settings_json(
+        value,
+        descriptor,
+        database,
+        &BytecodeModelImportRefs::default(),
+    )
+    .or_else(|| serde_json::to_value(value).ok())
+    .unwrap_or(Value::Null)
+}
+
+fn saved_property<'a>(
+    instance: &'a RbxInstance,
+    logical: Option<&'a str>,
+    requested: &'a str,
+) -> Option<(&'a str, &'a RbxVariant)> {
+    [logical, Some(requested)]
+        .into_iter()
+        .flatten()
+        .find_map(|name| {
+            instance
+                .properties
+                .get(&Ustr::from(name))
+                .map(|value| (logical.unwrap_or(name), value))
+        })
+        .or_else(|| {
+            instance
+                .properties
+                .iter()
+                .find(|(name, _)| name.as_str().eq_ignore_ascii_case(requested))
+                .map(|(name, value)| (name.as_str(), value))
+        })
+}
+
+/// A serialized property missing from the file loads as the class default
+/// (`defaulted`, e.g. a place saved before the property existed). Properties
+/// Roblox derives from others instead of saving (Position, BrickColor) are
+/// `notSaved`; names the class does not have are `unknown`.
+fn insert_property_values(
+    result: &mut Value,
+    dom: &RbxWeakDom,
+    referent: RbxRef,
+    request: &PropertyRequest<'_>,
+    database: &ReflectionDatabase<'_>,
+) {
+    let Some(instance) = dom.get_by_ref(referent) else {
+        return;
+    };
+    let class_name = instance.class.as_str();
+    let mut values = Map::new();
+    let mut defaulted = Vec::new();
+    let mut not_saved = Vec::new();
+    let mut unknown = Vec::new();
+    match request {
+        PropertyRequest::All => {
+            let mut properties = instance.properties.iter().collect::<Vec<_>>();
+            properties.sort_unstable_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+            for (name, value) in properties {
+                values.insert(
+                    name.to_string(),
+                    property_value(dom, class_name, name.as_str(), value, database),
+                );
+            }
+        }
+        PropertyRequest::Named(names) => {
+            for requested in names {
+                let logical = rbx_logical_property_name(database, class_name, requested);
+                let intrinsic = match logical.unwrap_or(requested) {
+                    "Name" => Some(json!(instance.name)),
+                    "ClassName" => Some(json!(class_name)),
+                    "Parent" => Some(reference_value(dom, instance.parent())),
+                    _ => None,
+                };
+                if let Some(value) = intrinsic {
+                    values.insert(logical.unwrap_or(requested).to_string(), value);
+                    continue;
+                }
+                if let Some((name, value)) = saved_property(instance, logical, requested) {
+                    values.insert(
+                        name.to_string(),
+                        property_value(dom, class_name, name, value, database),
+                    );
+                    continue;
+                }
+                let Some(logical) = logical else {
+                    unknown.push(*requested);
+                    continue;
+                };
+                let serialized = !matches!(
+                    rbx_property_descriptor(database, class_name, logical)
+                        .map(|property| &property.kind),
+                    Some(PropertyKind::Canonical {
+                        serialization: PropertySerialization::DoesNotSerialize
+                    })
+                );
+                match database
+                    .classes
+                    .get(class_name)
+                    .filter(|_| serialized)
+                    .and_then(|class| database.find_default_property(class, logical))
+                {
+                    Some(value) => {
+                        values.insert(
+                            logical.to_string(),
+                            property_value(dom, class_name, logical, value, database),
+                        );
+                        defaulted.push(logical);
+                    }
+                    None => not_saved.push(logical),
+                }
+            }
+        }
+    }
+    result["props"] = Value::Object(values);
+    for (key, names) in [
+        ("defaulted", defaulted),
+        ("notSaved", not_saved),
+        ("unknown", unknown),
+    ] {
+        if !names.is_empty() {
+            result[key] = json!(names);
+        }
+    }
+}
+
 pub(crate) fn query_place(args: QueryPlaceArgs) -> Result<()> {
     let query = args
         .query
@@ -104,6 +298,13 @@ pub(crate) fn query_place(args: QueryPlaceArgs) -> Result<()> {
     if query.is_none() && name.is_none() && class_name.is_none() && source.is_none() {
         bail!("Provide a query, --name, --class, or --source");
     }
+    let properties = PropertyRequest::parse(&args.props)?;
+    let database = match properties {
+        Some(_) => {
+            Some(rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?)
+        }
+        None => None,
+    };
 
     let dom = place_dom(&args.input)?;
     let limit = if args.all {
@@ -135,7 +336,11 @@ pub(crate) fn query_place(args: QueryPlaceArgs) -> Result<()> {
             truncated = true;
             break;
         }
-        matches.push(query_result(&dom, referent));
+        let mut result = query_result(&dom, referent);
+        if let (Some(properties), Some(database)) = (&properties, database) {
+            insert_property_values(&mut result, &dom, referent, properties, database);
+        }
+        matches.push(result);
     }
 
     let mut result = json!({
@@ -476,6 +681,111 @@ mod tests {
         assert_eq!(remove_exact_matches(&mut left, &mut right), 2);
         assert!(left.is_empty());
         assert!(right.is_empty());
+    }
+
+    #[test]
+    fn place_query_prints_requested_saved_properties_from_both_formats() {
+        use clap::Parser;
+        let root = crate::system::files::create_unique_directory(
+            &std::env::temp_dir(),
+            "renium-place-query-",
+        )
+        .unwrap();
+        let _cleanup = crate::system::files::OnDrop::new(|| {
+            let _ = std::fs::remove_dir_all(&root);
+        });
+        let mut dom = RbxWeakDom::new(InstanceBuilder::new("DataModel"));
+        let workspace = dom.insert(
+            dom.root_ref(),
+            InstanceBuilder::new("Workspace")
+                .with_property(
+                    "PlayerCharacterDestroyBehavior",
+                    rbx_dom_weak::types::Enum::from_u32(2),
+                )
+                .with_property("Gravity", 50.0f32),
+        );
+        let camera = dom.insert(workspace, InstanceBuilder::new("Camera"));
+        dom.get_by_ref_mut(workspace)
+            .unwrap()
+            .properties
+            .insert("CurrentCamera".into(), RbxVariant::Ref(camera));
+        dom.insert(
+            workspace,
+            InstanceBuilder::new("Part")
+                .with_name("Door")
+                .with_property("Anchored", true),
+        );
+        for extension in ["rbxl", "rbxlx"] {
+            let file = root.join(format!("place.{extension}"));
+            RbxPlaceFormat::from_path(&file)
+                .unwrap()
+                .write(&file, &dom, dom.root().children())
+                .unwrap();
+            let query = |arguments: &[&str]| {
+                crate::app::output::capture_json_output(|| {
+                    query_place(
+                        QueryPlaceArgs::try_parse_from(
+                            ["q", file.to_str().unwrap()].iter().chain(arguments),
+                        )
+                        .unwrap(),
+                    )
+                })
+            };
+            let result = query(&[
+                "-c",
+                "Workspace",
+                "--props",
+                "playerCharacterDestroyBehavior,Gravity,CurrentCamera,Name,Position,Bogus",
+            ])
+            .unwrap();
+            let workspace = &result["matches"][0];
+            assert_eq!(
+                workspace["props"],
+                json!({
+                    "PlayerCharacterDestroyBehavior": "Enum.PlayerCharacterDestroyBehavior.Enabled",
+                    "Gravity": 50.0,
+                    "CurrentCamera": "Workspace.Camera",
+                    "Name": "Workspace",
+                }),
+                "{extension}: {result}"
+            );
+            assert_eq!(workspace["unknown"], json!(["Position", "Bogus"]));
+            let door = query(&[
+                "-n",
+                "Door",
+                "--props",
+                "Anchored,Position,StreamingEnabled",
+            ])
+            .unwrap();
+            assert_eq!(door["matches"][0]["props"], json!({"Anchored": true}));
+            assert_eq!(door["matches"][0]["notSaved"], json!(["Position"]));
+            assert_eq!(door["matches"][0]["unknown"], json!(["StreamingEnabled"]));
+            let all = query(&["-n", "Door", "--props", "all"]).unwrap();
+            assert_eq!(all["matches"][0]["props"]["Anchored"], true);
+            let plain = query(&["-n", "Door"]).unwrap();
+            assert!(plain["matches"][0].get("props").is_none());
+            assert!(query(&["-n", "Door", "--props", ","]).is_err());
+        }
+
+        let mut old = RbxWeakDom::new(InstanceBuilder::new("DataModel"));
+        let workspace = old.insert(old.root_ref(), InstanceBuilder::new("Workspace"));
+        let database = rbx_reflection_database::get().unwrap();
+        let mut result = json!({});
+        insert_property_values(
+            &mut result,
+            &old,
+            workspace,
+            &PropertyRequest::Named(vec!["PlayerCharacterDestroyBehavior"]),
+            database,
+        );
+        assert_eq!(
+            result["props"]["PlayerCharacterDestroyBehavior"],
+            "Enum.PlayerCharacterDestroyBehavior.Default"
+        );
+        assert_eq!(
+            result["defaulted"],
+            json!(["PlayerCharacterDestroyBehavior"])
+        );
     }
 
     #[test]
