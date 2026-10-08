@@ -16,6 +16,8 @@ rbx play -s                         # ordinary Play
 rbx play -s --players 2             # local server and two clients
 rbx play -s --players 2 --until 'shared.RoundHandler.GameState == "InRound"'
 rbx play -r                         # restart after a code change (stops, then starts the same way)
+rbx play --add-players 2            # join churn: 2 more clients join the running test (8 max); returns their names
+rbx play --leave -p 2               # client 2 leaves, the rest keep playing; reports serverListsPlayer
 rbx cs
 rbx play -x
 ```

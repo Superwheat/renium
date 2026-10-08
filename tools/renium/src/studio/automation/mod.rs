@@ -482,6 +482,7 @@ fn wait_for_player_bridge(bridge: &BridgeServer, player: &str, wait_seconds: f64
 }
 
 pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
+    validate_play_args(&args)?;
     let operation = if args.stop {
         op::PLAY_STOP
     } else {
@@ -489,6 +490,8 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
     };
     let parameters = json!({
         "players": args.players,
+        "addPlayers": args.add_players,
+        "leave": args.leave,
         "mode": args.mode,
         "bridgeWaitSeconds": args.bridge.wait_seconds,
         "bridgePorts": args.bridge.ports,
@@ -848,10 +851,7 @@ fn compact_live_daemon_status(value: &Value) -> Value {
     Value::Object(result)
 }
 
-pub(crate) fn start_stop_play_result(
-    args: StartStopPlayArgs,
-    bridge: &BridgeServer,
-) -> Result<Value> {
+fn validate_play_args(args: &StartStopPlayArgs) -> Result<()> {
     if args.start && args.stop {
         bail!("Use either --start or --stop, not both");
     }
@@ -865,8 +865,41 @@ pub(crate) fn start_stop_play_result(
     if args.players.is_some() && mode != "play" {
         bail!("--players can only be used with --mode play");
     }
+    if (args.add_players.is_some() || args.leave) && (args.start || args.stop) {
+        bail!("--add-players and --leave change a running test; drop --start and --stop");
+    }
+    if let Some(count) = args.add_players {
+        if args.leave || args.players.is_some() {
+            bail!("Use --add-players N on its own; close a client separately with --leave -p N");
+        }
+        if !(1..=8).contains(&count) {
+            bail!("--add-players takes 1 through 8; Studio runs at most 8 clients");
+        }
+    }
+    if args.leave {
+        match args.players {
+            None => bail!("Name the client to close: rbx play --leave -p N (rbx cs lists them)"),
+            Some(0) => bail!("Client indexes start at 1: rbx play --leave -p 1"),
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn start_stop_play_result(
+    args: StartStopPlayArgs,
+    bridge: &BridgeServer,
+) -> Result<Value> {
+    validate_play_args(&args)?;
+    let mode = args.mode.as_deref().unwrap_or("play");
     if args.stop {
         return stop_studio_play_with_bridge_result(bridge);
+    }
+    if let Some(count) = args.add_players {
+        return add_test_players_result(bridge, count, args.bridge.wait_seconds);
+    }
+    if let Some(index) = args.players.filter(|_| args.leave) {
+        return leave_test_result(bridge, index, args.bridge.wait_seconds);
     }
     if let Some(players) = args.players {
         let mut result = start_multiplayer_test_result(bridge, players)?;
@@ -881,6 +914,201 @@ pub(crate) fn start_stop_play_result(
     let result = bridge.call_for_target("startStopPlay", json!({}), BridgeTarget::Edit)?;
     ensure_plugin_api_ok(&result)?;
     Ok(result)
+}
+
+const LEAVE_TIMEOUT: Duration = Duration::from_secs(20);
+const OLDER_PLUGIN: &str = "The Renium plugin in this test is older than rbx and cannot add or remove clients; update the plugin and restart Studio";
+
+fn session_play_clients(bridge: &BridgeServer, server_runtime_id: &str) -> Vec<Value> {
+    let owner = bridge
+        .list_bridge_clients()
+        .into_iter()
+        .find(|entry| entry.get("runtimeId").and_then(Value::as_str) == Some(server_runtime_id))
+        .and_then(|entry| {
+            entry
+                .get("launchEditRuntimeId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            bridge
+                .runtime_pin_for_selector(BridgeTarget::Edit, None)
+                .ok()
+                .map(|pin| pin.runtime_id)
+        });
+    let Some(owner) = owner else {
+        return Vec::new();
+    };
+    studio_play_clients(bridge, &owner)
+        .into_iter()
+        .filter(|entry| entry["role"] == BRIDGE_ROLE_PLAY_CLIENT)
+        .collect()
+}
+
+fn runtime_ids(clients: &[Value]) -> HashSet<String> {
+    clients
+        .iter()
+        .filter_map(|entry| entry.get("runtimeId").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+fn added_clients_deadline(started: Instant, last_progress: Instant) -> Instant {
+    (last_progress + Duration::from_secs(30)).min(started + Duration::from_secs(120))
+}
+
+fn add_test_players_result(bridge: &BridgeServer, count: u32, wait_seconds: f64) -> Result<Value> {
+    if bridge
+        .wait_for_target(wait_seconds, BridgeTarget::Server)
+        .is_err()
+    {
+        bail!("No play test is running; start one with rbx play -s -p N, then add players");
+    }
+    let server = bridge
+        .runtime_pin_for_selector(BridgeTarget::Server, None)?
+        .runtime_id;
+    let before = runtime_ids(&session_play_clients(bridge, &server));
+    let requested = bridge.call_for_runtime_with_timeout(
+        "startStopPlay",
+        json!({ "addPlayers": count }),
+        BridgeTarget::Server,
+        &server,
+        None,
+    )?;
+    ensure_plugin_api_ok(&requested)?;
+    if requested["action"] != "addPlayers" {
+        bail!(OLDER_PLUGIN);
+    }
+    let started = Instant::now();
+    let mut last_progress = started;
+    let mut last_seen = 0;
+    loop {
+        let clients = session_play_clients(bridge, &server);
+        let added = clients
+            .iter()
+            .filter(|entry| {
+                entry
+                    .get("runtimeId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| !before.contains(id))
+            })
+            .collect::<Vec<_>>();
+        let names = added
+            .iter()
+            .filter_map(|entry| entry.get("playerName").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        if added.len() >= count as usize && names.len() == added.len() {
+            return Ok(json!({
+                "ok": true,
+                "action": "addPlayers",
+                "added": names,
+                "clients": clients.len(),
+            }));
+        }
+        if added.len() != last_seen {
+            last_seen = added.len();
+            last_progress = Instant::now();
+        }
+        if Instant::now() >= added_clients_deadline(started, last_progress) {
+            bail!(
+                "Studio accepted --add-players {count}, but {} new client(s) connected in {} s; the rest may still be joining (rbx cs lists them)",
+                added.len(),
+                started.elapsed().as_secs()
+            );
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn leave_test_result(bridge: &BridgeServer, index: u32, wait_seconds: f64) -> Result<Value> {
+    let selector = index.to_string();
+    if !bridge.wait_for_ready_player(&selector, Duration::from_secs_f64(wait_seconds.max(1.0))) {
+        bail!("No play client {index} is connected; rbx cs lists the clients of the running test");
+    }
+    let runtime_id = bridge
+        .runtime_pin_for_selector(BridgeTarget::Client, Some(&selector))?
+        .runtime_id;
+    let channel_name = bridge
+        .list_bridge_clients()
+        .into_iter()
+        .find(|entry| entry.get("runtimeId").and_then(Value::as_str) == Some(runtime_id.as_str()))
+        .and_then(|entry| {
+            entry
+                .get("playerName")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    let server = bridge.play_runtime_for_selector(BridgeTarget::Server, None);
+    let left = bridge.call_for_runtime_with_timeout(
+        "startStopPlay",
+        json!({ "leave": true }),
+        BridgeTarget::Client,
+        &runtime_id,
+        Some(Duration::from_secs(2)),
+    )?;
+    ensure_plugin_api_ok(&left)?;
+    if left["action"] != "leave" {
+        bail!(OLDER_PLUGIN);
+    }
+    let player = left
+        .get("player")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or(channel_name)
+        .unwrap_or_default();
+    let deadline = Instant::now() + LEAVE_TIMEOUT;
+    while runtime_ids(&bridge.list_bridge_clients()).contains(&runtime_id) {
+        if Instant::now() >= deadline {
+            bail!(
+                "Client {index} was asked to leave but is still connected after {} s; end the whole test with rbx play -x",
+                LEAVE_TIMEOUT.as_secs()
+            );
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    let mut result = json!({
+        "ok": true,
+        "action": "leave",
+        "player": player,
+        "channelClosed": true,
+    });
+    if let Some(server) = server {
+        result["clients"] = json!(session_play_clients(bridge, &server).len());
+        if let Some(listed) = server_lists_player(bridge, &server, &player) {
+            result["serverListsPlayer"] = json!(listed);
+        }
+    }
+    Ok(result)
+}
+
+// The server drops a departed Player on its own schedule; give it a few
+// seconds before reporting that it still lists the name.
+fn server_lists_player(bridge: &BridgeServer, server: &str, player: &str) -> Option<bool> {
+    if player.is_empty() {
+        return None;
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let listed = bridge
+            .call_for_runtime_with_timeout(
+                "startStopPlay",
+                json!({ "listPlayers": true }),
+                BridgeTarget::Server,
+                server,
+                Some(Duration::from_secs(2)),
+            )
+            .ok()?;
+        if listed["action"] != "players" {
+            return None;
+        }
+        let present = listed["players"]
+            .as_array()
+            .is_some_and(|names| names.iter().any(|name| name.as_str() == Some(player)));
+        if !present || Instant::now() >= deadline {
+            return Some(present);
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
 }
 
 // A freshly launched server bridge connects before its scripts can run; the
@@ -2866,6 +3094,70 @@ mod play_state_tests {
         assert!(runner_name("").is_err());
         assert!(runner_name("has space").is_err());
         assert!(runner_name(&"x".repeat(65)).is_err());
+    }
+
+    fn play_args(parts: &[&str]) -> std::result::Result<StartStopPlayArgs, clap::Error> {
+        use clap::Parser;
+        match crate::cli::Cli::try_parse_from(parts)?.command {
+            crate::cli::Commands::StartStopPlay(args) => Ok(args),
+            _ => panic!("expected play"),
+        }
+    }
+
+    #[test]
+    fn add_players_parses_a_count_from_one_to_eight_on_its_own() {
+        let args = play_args(&["rbx", "play", "--add-players", "2"]).unwrap();
+        assert_eq!(args.add_players, Some(2));
+        assert!(!args.start && !args.leave);
+        validate_play_args(&args).unwrap();
+        for parts in [
+            &["rbx", "play", "--add-players", "0"][..],
+            &["rbx", "play", "--add-players", "9"],
+            &["rbx", "play", "--add-players", "2", "-s"],
+            &["rbx", "play", "--add-players", "2", "-x"],
+            &["rbx", "play", "--add-players", "2", "-p", "3"],
+            &["rbx", "play", "--add-players", "2", "--leave"],
+            &["rbx", "play", "--add-players", "2", "--until", "true"],
+        ] {
+            assert!(play_args(parts).is_err(), "{parts:?}");
+        }
+    }
+
+    #[test]
+    fn leave_needs_a_client_index_and_no_session_flags() {
+        let args = play_args(&["rbx", "play", "--leave", "-p", "2"]).unwrap();
+        assert!(args.leave && !args.start);
+        assert_eq!(args.players, Some(2));
+        validate_play_args(&args).unwrap();
+        let missing = validate_play_args(&play_args(&["rbx", "play", "--leave"]).unwrap());
+        assert!(missing.unwrap_err().to_string().contains("--leave -p N"));
+        let zero = validate_play_args(&play_args(&["rbx", "play", "--leave", "-p", "0"]).unwrap());
+        assert!(zero.unwrap_err().to_string().contains("start at 1"));
+        for parts in [
+            &["rbx", "play", "--leave", "-p", "1", "-x"][..],
+            &["rbx", "play", "--leave", "-p", "1", "-s"],
+            &["rbx", "play", "--leave", "-p", "1", "-r"],
+            &["rbx", "play", "--leave", "-p", "1", "--mode", "run"],
+        ] {
+            assert!(play_args(parts).is_err(), "{parts:?}");
+        }
+    }
+
+    #[test]
+    fn added_clients_wait_while_new_clients_keep_arriving() {
+        let started = Instant::now();
+        assert_eq!(
+            added_clients_deadline(started, started),
+            started + Duration::from_secs(30)
+        );
+        assert_eq!(
+            added_clients_deadline(started, started + Duration::from_secs(25)),
+            started + Duration::from_secs(55)
+        );
+        assert_eq!(
+            added_clients_deadline(started, started + Duration::from_secs(110)),
+            started + Duration::from_secs(120)
+        );
     }
 
     #[test]

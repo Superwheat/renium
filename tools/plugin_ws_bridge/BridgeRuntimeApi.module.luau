@@ -2922,12 +2922,76 @@ updateMouse()
 		end
 	end
 
+	local function testPlayerNames()
+		local names = {}
+		for _, player in game:GetService("Players"):GetPlayers() do
+			names[#names + 1] = player.Name
+		end
+		return names
+	end
+
+	local function addTestPlayers(count)
+		if runtimeContext.bridgeRole ~= "play-server" then
+			return { ok = false, error = "Clients can only be added from the play server of a running test" }
+		end
+		if type(count) ~= "number" or count % 1 ~= 0 or count < 1 then
+			return { ok = false, error = "addPlayers must be a whole number of clients" }
+		end
+		local names = testPlayerNames()
+		if #names + count > 8 then
+			return {
+				ok = false,
+				error = if #names >= 8
+					then "The test already has 8 clients, Studio's limit; close one first with rbx play --leave -p N"
+					else `The test has {#names} clients and Studio allows 8; add at most {8 - #names}`,
+				players = names,
+			}
+		end
+		local finished, callOk, callError = false, nil, nil
+		task.spawn(function()
+			callOk, callError = pcall((StudioTestService :: any).AddPlayers, StudioTestService, count)
+			finished = true
+		end)
+		-- The daemon retries startStopPlay on another channel after two seconds without a
+		-- reply, which would add the clients twice. A slow AddPlayers keeps running after
+		-- this reply; only a prompt failure is reported here.
+		local deadline = os.clock() + 0.5
+		while not finished and os.clock() < deadline do
+			task.wait()
+		end
+		if finished and not callOk then
+			return { ok = false, error = `AddPlayers failed: {tostring(callError)}`, players = names }
+		end
+		return { ok = true, action = "addPlayers", requested = count, players = names }
+	end
+
+	local function leaveTest()
+		if runtimeContext.bridgeRole ~= "play-client" then
+			return { ok = false, error = "Only a play client can leave the test" }
+		end
+		local localPlayer = game:GetService("Players").LocalPlayer
+		-- LeaveTest closes this DataModel, so the reply has to go out first.
+		task.defer(function()
+			pcall((StudioTestService :: any).LeaveTest, StudioTestService)
+		end)
+		return { ok = true, action = "leave", player = if localPlayer then localPlayer.Name else nil }
+	end
+
 	function api.startStopPlay(params)
 		if next(params) == nil then
 			return playStatus("status")
 		end
+		if params.listPlayers == true then
+			return { ok = true, action = "players", players = testPlayerNames() }
+		end
 		local operationGeneration = cancellationGeneration
 		assertOperationOwnership(operationGeneration)
+		if params.addPlayers ~= nil then
+			return addTestPlayers(params.addPlayers)
+		end
+		if params.leave == true then
+			return leaveTest()
+		end
 		if playSession.active and api.isPlayModeRunning() then
 			playSession.starting = false
 		end

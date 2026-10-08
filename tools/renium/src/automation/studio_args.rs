@@ -173,12 +173,16 @@ pub(super) fn console(parameters: &Value) -> Result<PluginConsoleOutputArgs> {
 
 pub(super) fn play(operation: u16, parameters: &Value) -> Result<StartStopPlayArgs> {
     let object = object(parameters)?;
+    let add_players = optional_number(object, "addPlayers")?;
+    let leave = boolean(object, "leave")?;
     Ok(StartStopPlayArgs {
         bridge: bridge(object)?,
-        start: operation == op::PLAY_START,
+        start: operation == op::PLAY_START && add_players.is_none() && !leave,
         stop: operation == op::PLAY_STOP,
         restart: false,
         players: optional_number(object, "players")?,
+        add_players,
+        leave,
         mode: string(object, "mode"),
         until: None,
         until_timeout: 120.0,
@@ -342,4 +346,26 @@ pub(super) fn review(parameters: &Value) -> Result<EditorReviewDecisionArgs> {
         review_id: string(object, "reviewId"),
         bridge: bridge(object)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn add_players_and_leave_requests_do_not_start_a_session() {
+        let add = play(
+            op::PLAY_START,
+            &json!({"players": null, "addPlayers": 3, "leave": false}),
+        )
+        .unwrap();
+        assert_eq!(add.add_players, Some(3));
+        assert!(!add.start && !add.leave);
+        let leave = play(op::PLAY_START, &json!({"players": 2, "leave": true})).unwrap();
+        assert_eq!(leave.players, Some(2));
+        assert!(leave.leave && !leave.start);
+        let start = play(op::PLAY_START, &json!({"players": 2, "leave": false})).unwrap();
+        assert!(start.start && start.add_players.is_none());
+    }
 }

@@ -1363,7 +1363,7 @@ pub(super) struct StartStopPlayArgs {
     )]
     pub(super) restart: bool,
     #[arg(
-        help = "Launch a server and N clients",
+        help = "Launch a server and N clients (with --leave: the client index to close)",
         short,
         long,
         alias = "clients",
@@ -1371,6 +1371,20 @@ pub(super) struct StartStopPlayArgs {
         value_name = "N"
     )]
     pub(super) players: Option<u32>,
+    #[arg(
+        help = "Add N clients to the running multi-client test",
+        long,
+        value_name = "N",
+        value_parser = clap::value_parser!(u32).range(1..=8),
+        conflicts_with_all = ["start", "stop", "restart", "players", "mode", "until", "leave"]
+    )]
+    pub(super) add_players: Option<u32>,
+    #[arg(
+        help = "Close play client -p N; the rest of the test keeps running",
+        long,
+        conflicts_with_all = ["start", "stop", "restart", "mode", "until"]
+    )]
+    pub(super) leave: bool,
     #[arg(help = "Session kind", long, value_name = "play|run|server")]
     pub(super) mode: Option<String>,
     #[arg(
