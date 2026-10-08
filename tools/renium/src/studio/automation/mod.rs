@@ -1972,7 +1972,7 @@ pub(crate) fn key_result(args: &KeyArgs, bridge: &BridgeServer) -> Result<Value>
     let key = input_inject::resolve_key(&args.key)?;
     if key.name == "Escape" {
         bail!(
-            "Escape is reserved by Roblox CoreGui and cannot be injected; use the game's on-screen control or an alternate key"
+            "Escape is reserved by Roblox CoreGui and cannot be injected; use the game's on-screen control or an alternate key, and `rbx inp dismiss` to close a Roblox prompt"
         );
     }
     #[cfg(windows)]

@@ -69,6 +69,8 @@ enum InputActionKind {
     #[serde(alias = "scrollDown")]
     ScrollDown,
     Wait,
+    Dismiss,
+    Press,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -76,6 +78,28 @@ enum InputActionKind {
 enum MouseButton {
     Left,
     Right,
+}
+
+/// The plugin command that answers or hides the Roblox prompt at a point
+/// (the viewport center by default), or presses one Roblox button.
+fn core_gui_command(action: &InputAction) -> Result<Value> {
+    let press = matches!(action.action, InputActionKind::Press);
+    let mut command = json!({ "type": if press { "press" } else { "dismiss" } });
+    match (action.x, action.y) {
+        (Some(x), Some(y)) => {
+            command["x"] = json!(x);
+            command["y"] = json!(y);
+        }
+        (None, None) if press && action.text.is_none() => {
+            bail!("press needs a button label or x/y")
+        }
+        (None, None) => {}
+        _ => bail!("x and y must be supplied together"),
+    }
+    if press && let Some(label) = action.text.as_deref() {
+        command["label"] = json!(label);
+    }
+    Ok(command)
 }
 
 fn semantic_click_batch(request: &InputRequest) -> Option<Vec<Value>> {
@@ -196,6 +220,7 @@ fn os_input_result(parameters: &Value, bridge: &BridgeServer) -> Result<Value> {
     let mut calibration = None;
     let mut used_os = false;
     let mut used_virtual = false;
+    let mut core_gui = None;
 
     for action in &request.actions {
         match action.action {
@@ -314,6 +339,12 @@ fn os_input_result(parameters: &Value, bridge: &BridgeServer) -> Result<Value> {
             InputActionKind::Wait => {
                 thread::sleep(Duration::from_millis(action.ms.unwrap_or(0).min(10_000)));
             }
+            InputActionKind::Dismiss | InputActionKind::Press => {
+                let response =
+                    send_virtual_input(bridge, player, vec![core_gui_command(action)?], None)?;
+                core_gui = response.get("coreGui").cloned();
+                used_virtual = true;
+            }
         }
     }
     let input_method = match (used_os, used_virtual) {
@@ -321,13 +352,17 @@ fn os_input_result(parameters: &Value, bridge: &BridgeServer) -> Result<Value> {
         (false, true) => "virtual",
         _ => "os",
     };
-    Ok(json!({
+    let mut result = json!({
         "ok": true,
         "action": "input",
         "actions": request.actions.len(),
         "inputMethod": input_method,
         "window": window.label,
-    }))
+    });
+    if let Some(report) = core_gui {
+        result["coreGui"] = report;
+    }
+    Ok(result)
 }
 
 fn virtual_input_result(parameters: &Value, bridge: &BridgeServer) -> Result<Value> {
@@ -431,6 +466,9 @@ fn virtual_input_result(parameters: &Value, bridge: &BridgeServer) -> Result<Val
             InputActionKind::Wait => {
                 commands.push(json!({ "type": "wait", "ms": action.ms.unwrap_or(0).min(10_000) }));
             }
+            InputActionKind::Dismiss | InputActionKind::Press => {
+                commands.push(core_gui_command(action)?);
+            }
         }
     }
     let response = send_virtual_input(bridge, player, commands, None)?;
@@ -441,10 +479,41 @@ fn virtual_input_result(parameters: &Value, bridge: &BridgeServer) -> Result<Val
         "inputMethod": "virtual",
     });
     note_system_ui(&mut result, &response);
-    for key in ["heldKeys", "keysObserved", "verifiedClicks"] {
+    for key in ["heldKeys", "keysObserved", "verifiedClicks", "coreGui"] {
         if let Some(value) = response.get(key).filter(|value| !value.is_null()) {
             result[key] = value.clone();
         }
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn action(value: Value) -> InputAction {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn core_gui_commands_carry_the_point_and_label() {
+        assert_eq!(
+            core_gui_command(&action(json!({ "action": "dismiss" }))).unwrap(),
+            json!({ "type": "dismiss" })
+        );
+        assert_eq!(
+            core_gui_command(&action(json!({ "action": "dismiss", "x": 40, "y": 700 }))).unwrap(),
+            json!({ "type": "dismiss", "x": 40, "y": 700 })
+        );
+        assert_eq!(
+            core_gui_command(&action(json!({ "action": "press", "text": "No" }))).unwrap(),
+            json!({ "type": "press", "label": "No" })
+        );
+        assert_eq!(
+            core_gui_command(&action(json!({ "action": "press", "x": 545, "y": 442 }))).unwrap(),
+            json!({ "type": "press", "x": 545, "y": 442 })
+        );
+        assert!(core_gui_command(&action(json!({ "action": "press" }))).is_err());
+        assert!(core_gui_command(&action(json!({ "action": "dismiss", "x": 1 }))).is_err());
+    }
 }
