@@ -247,16 +247,16 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
         "Examples:\n  rbx bim ReplicatedStorage --model model.rbxm -I editor:parent",
     ),
     ("wally", "Examples:\n  rbx wally"),
-    ("lk", "Examples:\n  rbx lk"),
+    ("lk", "Examples:\n  rbx lk\n  rbx lk --experience"),
     ("lkb", "Examples:\n  rbx lkb --link shared-module"),
-    ("lks", "Examples:\n  rbx lks"),
+    ("lks", "Examples:\n  rbx lks\n  rbx lks --experience"),
     (
         "lka",
         "Examples:\n  rbx lka --service ReplicatedStorage --path '[\"Shared\"]' --source src/Shared.luau",
     ),
     (
         "lkp",
-        "Examples:\n  rbx lkp --service ReplicatedStorage --path '[\"Vehicles\",\"Car\"]'",
+        "Examples:\n  rbx lkp --service ReplicatedStorage --path '[\"Vehicles\",\"Car\"]'\n  rbx lkp --share --service ReplicatedStorage --path '[\"ReplicatedStorage\",\"Public\"]'",
     ),
     ("lkd", "Examples:\n  rbx lkd --id shared-module"),
     (

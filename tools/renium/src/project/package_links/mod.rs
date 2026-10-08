@@ -41,6 +41,7 @@ pub(crate) const RENIUM_STORE_EXTENSION: &str = "renium";
 pub(crate) const RENIUM_DIR_GITIGNORE: &str = "# Renium local state. Configuration and link.lock.json remain tracked.\ncache/\ndiagnostics/\neditor-history/\neditor-property-batches/\nimport-backups/\nsnapshots/\nsync-base/\nconflicts/\nbuild/\nbuild-staging/\nnested-syncback/\nadapter-baseline.json\nlink-cache/\nlive-watch-state.*\n";
 
 mod commands;
+mod shared;
 mod wally;
 #[cfg(test)]
 use commands::pack_subtree_to_bytecode;
@@ -48,6 +49,7 @@ use commands::resolve_editor_instance_by_path_ordinals;
 pub(crate) use commands::{
     link_add, link_apply, link_break, link_delete_package, link_move_target, link_pack, link_status,
 };
+pub(crate) use shared::{propagate_shared_links_from, shared_link_sources_touched};
 pub(crate) use wally::sync_wally_packages;
 pub(crate) use wally::sync_wally_packages_result;
 
@@ -367,7 +369,9 @@ pub(crate) fn local_project_package_paths(project_root: &Path) -> Result<Vec<Pat
         let LinkSource::Local { path } = &link.source else {
             continue;
         };
-        if is_global_link_path(path) {
+        if is_global_link_path(path)
+            || shared::experience_package_path(project_root, path).is_some()
+        {
             continue;
         }
         let package_path = resolve_local_link_path(project_root, path);

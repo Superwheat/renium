@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Features
+
+- Places of one experience can share a subtree. `rbx lkp --share` in the place that owns it packs the subtree, scripts, UI, models and attributes together, into `links/ID.renium` at the experience root, records it under `sharedLinks` in `renium.experience.json`, and links every other place that has the same path to it read-only. `--all-places` also creates it where it is missing; other places are listed as skipped. The source place stays editable, and the pack never rewrites its files.
+- After an edit in the source place, `rbx lk` in any place of the experience, or `rbx lk --experience` from anywhere inside it, re-packs each shared subtree whose source changed and updates every place that follows it. With Live Sync running in the source place this happens on its own once the edit settles, and each following place's Live Sync pushes the new copy to its Studio; a failure shows in the Live Sync status instead of stopping it.
+- `rbx lks --experience` lists every shared link with its source place, whether the package is `stale`, and each following place as `ok`, `drift` or `missing`; `rbx lks` inside an experience adds the same `shared` section.
+- A Roblox PackageLink directly under a shared root is left out of the package and reported as `strippedPackageLinks`, together with the `rbx upl` command that unlinks it in the source place. Packages nested deeper, such as TopbarPlus, travel unchanged.
+
 ### Bug fixes
 
 - Pushes no longer crash Studio 0.742 (Windows exception c0000374). Renium hooks Studio's change-history recording for Terrain cancellations and token-based recordings; that hook was verified on 0.741 and corrupts 0.742's heap on the first recording that passes through it. The hook is now installed only on builds it is verified on (0.741 and older); newer builds skip it and cancellations restore Terrain explicitly. The first symptom was a crash during the automatic package desync, because package pushes are the common case that registers a recording before writing.

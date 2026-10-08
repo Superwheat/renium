@@ -3111,6 +3111,11 @@ pub(super) struct LinkApplyArgs {
         value_name = "PATH"
     )]
     pub(super) cache_dir: Option<PathBuf>,
+    #[arg(
+        help = "Only re-pack and apply the experience's shared links; runs from anywhere inside the experience",
+        long
+    )]
+    pub(super) experience: bool,
     #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }
@@ -3176,6 +3181,11 @@ pub(super) struct LinkStatusArgs {
         value_name = "PATH"
     )]
     pub(super) cache_dir: Option<PathBuf>,
+    #[arg(
+        help = "Only report the experience's shared links; runs from anywhere inside the experience",
+        long
+    )]
+    pub(super) experience: bool,
     #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }
@@ -3338,6 +3348,18 @@ pub(super) struct LinkPackArgs {
     pub(super) id: Option<String>,
     #[command(flatten)]
     pub(super) target: LinkTargetArgs,
+    #[arg(
+        help = "Share the subtree from this place with the experience's other places: the package goes to <experience>/links, every place that has the same path follows it read-only, and this place stays editable",
+        long,
+        conflicts_with = "link_folder"
+    )]
+    pub(super) share: bool,
+    #[arg(
+        help = "With --share, also create the subtree in places that lack it",
+        long,
+        requires = "share"
+    )]
+    pub(super) all_places: bool,
     #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }
