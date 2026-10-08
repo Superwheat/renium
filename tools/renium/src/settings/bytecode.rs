@@ -1441,6 +1441,21 @@ fn decode_raw_value_payload(
                 ),
             )],
         )),
+        NESTED_ENUM_ITEM_KIND => {
+            let enum_type = reader
+                .read_string(strings, "nested enum type string id")?
+                .to_string();
+            let name = reader
+                .read_string(strings, "nested enum item string id")?
+                .to_string();
+            Ok(typed_object(
+                "EnumItem",
+                [
+                    ("enumType", Value::String(enum_type)),
+                    ("name", Value::String(name)),
+                ],
+            ))
+        }
         _ => bail!("Unknown settings bytecode value kind {kind}"),
     }
 }
@@ -3126,7 +3141,7 @@ fn collect_raw_value_strings<'a>(
                 .as_array()
                 .context("Expected array binary settings value")?;
             for item in items {
-                collect_raw_value_strings(item, lookup, out)?;
+                collect_nested_raw_value_strings(item, lookup, out)?;
             }
         }
         8 => collect_raw_object_strings(value, lookup, out)?,
@@ -3198,7 +3213,7 @@ fn collect_raw_object_strings<'a>(
     }
     for (key, child) in obj {
         add_count(out, key);
-        collect_raw_value_strings(child, lookup, out)?;
+        collect_nested_raw_value_strings(child, lookup, out)?;
     }
     Ok(())
 }
@@ -3262,6 +3277,50 @@ fn split_enum_tail(text: &str) -> &str {
     text.split('.').next_back().unwrap_or(text)
 }
 
+const NESTED_ENUM_ITEM_KIND: u8 = 22;
+
+/// An enum item nested inside an object or array value has no property
+/// descriptor to supply its enum type, so the type is stored with the name.
+fn nested_enum_item(value: &Value) -> Option<(&str, &str)> {
+    let obj = value.as_object()?;
+    if obj.get("_type").and_then(Value::as_str) != Some("EnumItem") {
+        return None;
+    }
+    let enum_type = obj
+        .get("enumType")
+        .and_then(Value::as_str)
+        .filter(|enum_type| !enum_type.is_empty())?;
+    let name = obj.get("name").and_then(Value::as_str)?;
+    Some((enum_type, name))
+}
+
+fn write_nested_raw_value<W: Write + ?Sized>(
+    value: &Value,
+    string_ids: &SettingsStringIdMap<'_>,
+    lookup: &SettingsBinaryInstanceLookup<'_>,
+    writer: &mut W,
+) -> Result<()> {
+    if let Some((enum_type, name)) = nested_enum_item(value) {
+        writer.write_all(&[NESTED_ENUM_ITEM_KIND])?;
+        write_binary_string_id(writer, string_ids, enum_type)?;
+        return write_binary_string_id(writer, string_ids, name);
+    }
+    write_raw_value(value, string_ids, lookup, writer)
+}
+
+fn collect_nested_raw_value_strings<'a>(
+    value: &'a Value,
+    lookup: &SettingsBinaryInstanceLookup<'_>,
+    out: &mut SettingsStringCounts<'a>,
+) -> Result<()> {
+    if let Some((enum_type, name)) = nested_enum_item(value) {
+        add_count(out, enum_type);
+        add_count(out, name);
+        return Ok(());
+    }
+    collect_raw_value_strings(value, lookup, out)
+}
+
 fn write_raw_value<W: Write + ?Sized>(
     value: &Value,
     string_ids: &SettingsStringIdMap<'_>,
@@ -3300,7 +3359,7 @@ fn write_raw_value_payload<W: Write + ?Sized>(
                 .context("Expected array binary settings value")?;
             write_var_u64(writer, items.len() as u64)?;
             for item in items {
-                write_raw_value(item, string_ids, lookup, writer)?;
+                write_nested_raw_value(item, string_ids, lookup, writer)?;
             }
         }
         8 => write_raw_object_payload(value, string_ids, lookup, writer)?,
@@ -3417,7 +3476,7 @@ fn write_raw_object_payload<W: Write + ?Sized>(
     write_var_u64(writer, fields.len() as u64)?;
     for (key, child) in fields {
         write_binary_string_id(writer, string_ids, key)?;
-        write_raw_value(child, string_ids, lookup, writer)?;
+        write_nested_raw_value(child, string_ids, lookup, writer)?;
     }
     Ok(())
 }
@@ -4292,6 +4351,48 @@ mod tests {
             decoded.instances[1].attributes["bc"],
             json!({"BrickColor": 1004})
         );
+    }
+
+    #[test]
+    fn settings_bytecode_roundtrips_style_rule_enum_properties() {
+        let mut rule = SettingsBytecodeInstance::new(
+            "UIListLayout".to_string(),
+            "StyleRule".to_string(),
+            "ReplicatedStorage/Design/BaseStyleSheet/UIListLayout".to_string(),
+            Some(0),
+        );
+        rule.properties.insert(
+            "Properties".to_string(),
+            json!({"SortOrder": {"_type":"EnumItem","enumType":"SortOrder","name":"LayoutOrder","value":2}}),
+        );
+        rule.properties.insert(
+            "Order".to_string(),
+            json!([{"_type":"EnumItem","enumType":"SortOrder","name":"Name"}, {"_type":"EnumItem","name":"Untyped"}]),
+        );
+        let document = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                SettingsBytecodeInstance::new(
+                    "ReplicatedStorage".to_string(),
+                    "ReplicatedStorage".to_string(),
+                    "ReplicatedStorage".to_string(),
+                    None,
+                ),
+                rule,
+            ],
+        };
+        let encoded = encode_settings_bytecode(&document).unwrap();
+        let decoded = decode_settings_bytecode(&encoded).unwrap();
+        assert_eq!(
+            decoded.instances[1].properties["Properties"],
+            json!({"SortOrder": {"_type":"EnumItem","enumType":"SortOrder","name":"LayoutOrder"}})
+        );
+        assert_eq!(
+            decoded.instances[1].properties["Order"],
+            json!([{"_type":"EnumItem","enumType":"SortOrder","name":"Name"}, {"_type":"EnumItem","name":"Untyped"}])
+        );
+        let reencoded = encode_settings_bytecode(&decoded).unwrap();
+        assert_eq!(reencoded, encoded);
     }
 
     #[test]

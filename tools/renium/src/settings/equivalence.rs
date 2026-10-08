@@ -128,6 +128,14 @@ pub(crate) fn align_settings_bytes_to_reference(
     let positionally_equivalent = settings_topology_matches(&reference, &observed)
         && positional_values_equivalent(&reference, &observed, None, false);
     if positionally_equivalent {
+        if document_adds_enum_types(&reference, &observed) {
+            if !align_settings_ids_to_reference(&reference, &mut observed) {
+                bail!("duplicate instance identity is ambiguous after comparing references");
+            }
+            let upgraded = encode_settings_bytecode(&observed)?;
+            drop_settings_documents(reference, observed);
+            return Ok(SettingsAlignment::Changed(upgraded));
+        }
         if let Some(key) = cache_key {
             cache_settings_alignment(key);
         }
@@ -154,7 +162,9 @@ pub(crate) fn align_settings_bytes_to_reference(
     let aligned = encode_settings_bytecode(&observed)?;
     canonicalize_settings_property_names(&mut reference)?;
     canonicalize_settings_property_names(&mut observed)?;
-    let result = if settings_documents_match(&reference, &observed, false) {
+    let result = if settings_documents_match(&reference, &observed, false)
+        && !document_adds_enum_types(&reference, &observed)
+    {
         if let Some(key) = cache_key {
             cache_settings_alignment(key);
         }
@@ -2959,9 +2969,81 @@ fn align_equivalent_property_map_values(
                 Some(reference_value),
                 Some(observed_value),
             )
+            && !reference_loses_enum_types(reference_value, observed_value)
         {
             observed_value.clone_from(reference_value);
         }
+    }
+}
+
+/// True when an equivalent observed document carries nested enum types that
+/// the stored reference lacks, so the store is worth rewriting.
+fn document_adds_enum_types(reference: &SettingsBytecode, observed: &SettingsBytecode) -> bool {
+    let observed_by_id = observed
+        .instances
+        .iter()
+        .map(|instance| (instance.settings_id.as_str(), instance))
+        .collect::<HashMap<_, _>>();
+    reference
+        .instances
+        .iter()
+        .enumerate()
+        .any(|(index, reference_instance)| {
+            let observed_instance = observed_by_id
+                .get(reference_instance.settings_id.as_str())
+                .copied()
+                .or_else(|| observed.instances.get(index));
+            let Some(observed_instance) = observed_instance else {
+                return false;
+            };
+            let adds = |reference: &Map<String, Value>, observed: &Map<String, Value>| {
+                observed.iter().any(|(name, observed_value)| {
+                    reference.get(name).is_some_and(|reference_value| {
+                        reference_loses_enum_types(reference_value, observed_value)
+                    })
+                })
+            };
+            adds(
+                &reference_instance.properties,
+                &observed_instance.properties,
+            ) || adds(
+                &reference_instance.attributes,
+                &observed_instance.attributes,
+            )
+        })
+}
+
+/// Stores written before nested enum items kept their enum type hold only
+/// the item name; adopting such a reference value would discard the type the
+/// observed value carries, so the observed value wins there.
+fn reference_loses_enum_types(reference: &Value, observed: &Value) -> bool {
+    match (reference, observed) {
+        (Value::Object(reference), Value::Object(observed)) => {
+            if observed.get("_type").and_then(Value::as_str) == Some("EnumItem")
+                && reference.get("_type").and_then(Value::as_str) == Some("EnumItem")
+            {
+                let has_type = |map: &Map<String, Value>| {
+                    map.get("enumType")
+                        .and_then(Value::as_str)
+                        .is_some_and(|enum_type| !enum_type.is_empty())
+                };
+                return has_type(observed) && !has_type(reference);
+            }
+            observed.iter().any(|(key, observed_value)| {
+                reference.get(key).is_some_and(|reference_value| {
+                    reference_loses_enum_types(reference_value, observed_value)
+                })
+            })
+        }
+        (Value::Array(reference), Value::Array(observed)) => {
+            reference
+                .iter()
+                .zip(observed)
+                .any(|(reference_value, observed_value)| {
+                    reference_loses_enum_types(reference_value, observed_value)
+                })
+        }
+        _ => false,
     }
 }
 
@@ -2972,6 +3054,7 @@ fn align_equivalent_map_values(reference: &Map<String, Value>, observed: &mut Ma
         };
         if reference_value != observed_value
             && reconciliation_values_equal(reference_value, observed_value, false)
+            && !reference_loses_enum_types(reference_value, observed_value)
         {
             observed_value.clone_from(reference_value);
         }
@@ -2983,6 +3066,75 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::settings::bytecode::SETTINGS_BINARY_VERSION;
+
+    #[test]
+    fn equivalent_store_is_rewritten_when_nested_enum_types_arrive() {
+        let mut rule = SettingsBytecodeInstance::new(
+            "UIListLayout".to_string(),
+            "StyleRule".to_string(),
+            "ReplicatedStorage/UIListLayout".to_string(),
+            Some(0),
+        );
+        let root = SettingsBytecodeInstance::new(
+            "ReplicatedStorage".to_string(),
+            "ReplicatedStorage".to_string(),
+            "ReplicatedStorage".to_string(),
+            None,
+        );
+        rule.properties.insert(
+            "Properties".to_string(),
+            json!({"SortOrder": {"_type":"EnumItem","name":"LayoutOrder"}}),
+        );
+        let reference = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![root.clone(), rule.clone()],
+        };
+        rule.properties.insert(
+            "Properties".to_string(),
+            json!({"SortOrder": {"_type":"EnumItem","enumType":"SortOrder","name":"LayoutOrder"}}),
+        );
+        let observed = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![root, rule],
+        };
+        let reference_bytes = encode_settings_bytecode(&reference).unwrap();
+        let observed_bytes = encode_settings_bytecode(&observed).unwrap();
+        let SettingsAlignment::Changed(upgraded) =
+            align_settings_bytes_to_reference(&reference_bytes, &observed_bytes).unwrap()
+        else {
+            panic!("typed nested enum must rewrite the store");
+        };
+        let decoded = decode_settings_bytecode(&upgraded).unwrap();
+        assert_eq!(
+            decoded.instances[1].properties["Properties"]["SortOrder"]["enumType"],
+            json!("SortOrder")
+        );
+        assert!(matches!(
+            align_settings_bytes_to_reference(&upgraded, &observed_bytes).unwrap(),
+            SettingsAlignment::Equivalent
+        ));
+        assert!(matches!(
+            align_settings_bytes_to_reference(&upgraded, &reference_bytes).unwrap(),
+            SettingsAlignment::Equivalent
+        ));
+    }
+
+    #[test]
+    fn alignment_keeps_nested_enum_types_the_reference_lacks() {
+        let reference = json!({"SortOrder": {"_type":"EnumItem","name":"LayoutOrder"}});
+        let typed =
+            json!({"SortOrder": {"_type":"EnumItem","enumType":"SortOrder","name":"LayoutOrder"}});
+        assert!(reference_loses_enum_types(&reference, &typed));
+        assert!(!reference_loses_enum_types(&typed, &reference));
+        assert!(!reference_loses_enum_types(&typed, &typed));
+        let mut observed = Map::new();
+        observed.insert("Properties".to_string(), typed.clone());
+        let mut reference_map = Map::new();
+        reference_map.insert("Properties".to_string(), reference);
+        align_equivalent_property_map_values("StyleRule", &reference_map, &mut observed);
+        assert_eq!(observed["Properties"], typed);
+    }
 
     #[test]
     fn exact_numeric_reconciliation_accepts_integer_float_encoding_without_rounding() {
