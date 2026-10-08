@@ -1,9 +1,12 @@
 use super::*;
+use crate::app::output::capture_json_output;
 use crate::cli::{
-    LinkAddArgs, LinkApplyArgs, LinkBreakArgs, LinkDeletePackageArgs, LinkMoveTargetArgs,
-    LinkPackArgs, LinkTargetArgs, ProjectSourceArgs,
+    BridgeConnectionArgs, LinkAddArgs, LinkApplyArgs, LinkBreakArgs, LinkDeletePackageArgs,
+    LinkMoveTargetArgs, LinkPackArgs, LinkStatusArgs, LinkTargetArgs, ProjectSourceArgs,
+    PushEditorChangesArgs,
 };
 use crate::editor::document::read_editor_service_settings;
+use crate::editor::sync::collect_editor_changes;
 use crate::tests::support::{settings_document, settings_instance, temp_dir};
 
 fn test_link_apply_args(dir: &Path) -> LinkApplyArgs {
@@ -22,6 +25,7 @@ fn test_link_apply_args(dir: &Path) -> LinkApplyArgs {
         git_path: "git".into(),
         wally_path: "wally".into(),
         cache_dir: None,
+        experience: false,
         pretty: false,
     }
 }
@@ -441,6 +445,8 @@ fn link_pack_resaves_existing_package_source_path() {
         link_folder: Some(PathBuf::from("links")),
         id: Some("country".into()),
         target: link_target_args("ReplicatedStorage", r#"["ReplicatedStorage","Pkg"]"#),
+        share: false,
+        all_places: false,
         pretty: false,
     })
     .unwrap();
@@ -483,6 +489,8 @@ fn link_pack_without_folder_saves_to_global_library() {
         link_folder: None,
         id: Some("pkg".into()),
         target: link_target_args("ReplicatedStorage", r#"["ReplicatedStorage","Pkg"]"#),
+        share: false,
+        all_places: false,
         pretty: false,
     })
     .unwrap();
@@ -542,6 +550,8 @@ fn link_pack_inlines_source_and_removes_disk_mirrors() {
         link_folder: Some(PathBuf::from("links")),
         id: None,
         target: link_target_args("ReplicatedStorage", r#"["ReplicatedStorage","Pkg"]"#),
+        share: false,
+        all_places: false,
         pretty: false,
     })
     .unwrap();
@@ -1378,7 +1388,8 @@ fn pack_then_materialize_round_trips_any_instance() {
     let widget_index =
         resolve_editor_instance_by_path(&source_doc, "ReplicatedStorage", &["Widget".to_string()])
             .unwrap();
-    let (package, _) = pack_subtree_to_bytecode(&source_doc, widget_index, &source_paths).unwrap();
+    let (package, _) =
+        pack_subtree_to_bytecode(&source_doc, widget_index, &source_paths, &[]).unwrap();
     assert_eq!(package.instances.len(), 3);
     let package_path = root.join("widget.renium");
     package.write_file(&package_path).unwrap();
@@ -1424,4 +1435,489 @@ fn pack_then_materialize_round_trips_any_instance() {
     assert_eq!(module.properties.get("Source"), Some(&json!("return 7")));
     assert!(changed.is_empty());
     let _ = fs::remove_dir_all(&root);
+}
+
+const SHARED_EXPERIENCE_MANIFEST: &str = r#"{
+  "version": 2,
+  "gameId": 7,
+  "startPlace": "lobby",
+  "placeOrder": [11, 22, 33],
+  "places": {
+    "lobby": { "placeId": 11, "name": "Lobby", "root": "places/lobby" },
+    "race": { "placeId": 22, "name": "Race", "root": "places/race" },
+    "menu": { "placeId": 33, "name": "Menu", "root": "places/menu" }
+  }
+}
+"#;
+
+struct SharedFixture {
+    root: PathBuf,
+    lobby: PathBuf,
+    race: PathBuf,
+    menu: PathBuf,
+    config_path: PathBuf,
+}
+
+impl SharedFixture {
+    fn store(place: &Path) -> PathBuf {
+        service_settings_path(&place.join("src").join("ReplicatedStorage"))
+    }
+
+    fn public(place: &Path) -> (SettingsBytecode, usize) {
+        let document = SettingsBytecode::read_file(&Self::store(place)).unwrap();
+        let index =
+            resolve_editor_instance_by_path(&document, "ReplicatedStorage", &["Public".into()])
+                .unwrap();
+        (document, index)
+    }
+
+    fn child_names(document: &SettingsBytecode, parent: usize) -> Vec<String> {
+        document
+            .instances
+            .iter()
+            .filter(|instance| instance.parent_index == Some(parent))
+            .map(|instance| instance.name.clone())
+            .collect()
+    }
+
+    fn child<'a>(
+        document: &'a SettingsBytecode,
+        parent: usize,
+        name: &str,
+    ) -> &'a SettingsBytecodeInstance {
+        document
+            .instances
+            .iter()
+            .find(|instance| instance.parent_index == Some(parent) && instance.name == name)
+            .unwrap()
+    }
+
+    fn edit_public_child(
+        place: &Path,
+        name: &str,
+        edit: impl FnOnce(&mut SettingsBytecodeInstance),
+    ) {
+        let (mut document, public) = Self::public(place);
+        let index = document
+            .instances
+            .iter()
+            .position(|instance| instance.parent_index == Some(public) && instance.name == name)
+            .unwrap();
+        edit(&mut document.instances[index]);
+        document.write_file(&Self::store(place)).unwrap();
+    }
+}
+
+fn shared_fixture(name: &str) -> SharedFixture {
+    let root = temp_dir(name);
+    fs::write(
+        root.join("renium.experience.json"),
+        SHARED_EXPERIENCE_MANIFEST,
+    )
+    .unwrap();
+    let place = |alias: &str| {
+        let dir = root.join("places").join(alias);
+        fs::create_dir_all(dir.join("src").join("ReplicatedStorage")).unwrap();
+        dir
+    };
+    let (lobby, race, menu) = (place("lobby"), place("race"), place("menu"));
+
+    let lobby_service = lobby.join("src").join("ReplicatedStorage");
+    let mut panel = settings_instance("panel", "Panel", "Frame", Some(1));
+    panel.attributes.insert("Theme".into(), json!("dark"));
+    let lobby_document = settings_document(vec![
+        settings_instance("root", "ReplicatedStorage", "ReplicatedStorage", None),
+        settings_instance("public", "Public", "Folder", Some(0)),
+        settings_instance("config", "Config", "ModuleScript", Some(1)),
+        panel,
+        settings_instance("link", "PackageLink", "PackageLink", Some(1)),
+        settings_instance("topbar", "TopbarPlus", "Folder", Some(1)),
+        settings_instance("topbar-link", "PackageLink", "PackageLink", Some(5)),
+    ]);
+    lobby_document
+        .write_file(&service_settings_path(&lobby_service))
+        .unwrap();
+    let config_path =
+        build_editor_source_paths_by_index(&lobby_document, "ReplicatedStorage", &lobby_service)[2]
+            .clone()
+            .unwrap();
+    fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    fs::write(&config_path, "return 1").unwrap();
+
+    settings_document(vec![
+        settings_instance("root", "ReplicatedStorage", "ReplicatedStorage", None),
+        settings_instance("race-public", "Public", "Folder", Some(0)),
+        settings_instance("old", "Old", "Folder", Some(1)),
+        settings_instance("race-link", "PackageLink", "PackageLink", Some(1)),
+    ])
+    .write_file(&SharedFixture::store(&race))
+    .unwrap();
+
+    write_link_test_service(&menu.join("src").join("ReplicatedStorage"));
+    SharedFixture {
+        root,
+        lobby,
+        race,
+        menu,
+        config_path,
+    }
+}
+
+fn share_public(fixture: &SharedFixture, all_places: bool) -> Value {
+    capture_json_output(|| {
+        link_pack(LinkPackArgs {
+            project: ProjectSourceArgs {
+                project_root: fixture.lobby.clone(),
+                src_root: PathBuf::from("src"),
+            },
+            manifest: PathBuf::from("renium-link.json"),
+            link_folder: None,
+            id: None,
+            target: link_target_args("ReplicatedStorage", r#"["ReplicatedStorage","Public"]"#),
+            share: true,
+            all_places,
+            pretty: false,
+        })
+    })
+    .unwrap()
+}
+
+fn shared_status(start: &Path) -> Value {
+    capture_json_output(|| {
+        link_status(LinkStatusArgs {
+            project: ProjectSourceArgs {
+                project_root: start.to_path_buf(),
+                src_root: PathBuf::from("src"),
+            },
+            manifest: PathBuf::from("renium-link.json"),
+            cache_dir: None,
+            experience: true,
+            pretty: false,
+        })
+    })
+    .unwrap()["shared"][0]
+        .clone()
+}
+
+fn apply_in(start: &Path, experience: bool) -> Value {
+    let mut args = test_link_apply_args(start);
+    args.experience = experience;
+    capture_json_output(|| link_apply(args)).unwrap()
+}
+
+#[test]
+fn shared_link_pack_links_consumers_and_strips_package_links() {
+    let fixture = shared_fixture("shared-link-pack");
+    let lobby_store_before = fs::read(SharedFixture::store(&fixture.lobby)).unwrap();
+
+    let result = share_public(&fixture, false);
+
+    assert_eq!(result["ok"], json!(true));
+    assert_eq!(result["id"], json!("public"));
+    assert_eq!(result["source"], json!("lobby"));
+    assert_eq!(result["linked"], json!(["race"]));
+    assert_eq!(result["skipped"][0]["place"], json!("menu"));
+    assert_eq!(
+        result["strippedPackageLinks"],
+        json!(["ReplicatedStorage.Public.PackageLink"])
+    );
+    assert!(
+        result["next"]
+            .as_str()
+            .unwrap()
+            .contains("upl ReplicatedStorage -i ReplicatedStorage.Public")
+    );
+
+    let package =
+        SettingsBytecode::read_file(&fixture.root.join("links").join("public.renium")).unwrap();
+    let package_root = package
+        .instances
+        .iter()
+        .position(|instance| instance.parent_index.is_none())
+        .unwrap();
+    assert_eq!(
+        SharedFixture::child_names(&package, package_root),
+        ["Config", "Panel", "TopbarPlus"]
+    );
+    let topbar = package
+        .instances
+        .iter()
+        .position(|instance| instance.name == "TopbarPlus")
+        .unwrap();
+    assert_eq!(
+        SharedFixture::child_names(&package, topbar),
+        ["PackageLink"]
+    );
+    assert_eq!(
+        SharedFixture::child(&package, package_root, "Config")
+            .properties
+            .get("Source"),
+        Some(&json!("return 1"))
+    );
+
+    let manifest_text = fs::read_to_string(fixture.root.join("renium.experience.json")).unwrap();
+    let original_members = SHARED_EXPERIENCE_MANIFEST
+        .trim_end()
+        .strip_suffix('}')
+        .unwrap()
+        .trim_end();
+    assert!(manifest_text.starts_with(original_members));
+    let manifest: Value = serde_json::from_str(&manifest_text).unwrap();
+    assert_eq!(
+        manifest["sharedLinks"],
+        json!([{
+            "id": "public",
+            "source": "lobby",
+            "service": "ReplicatedStorage",
+            "path": ["ReplicatedStorage", "Public"],
+        }])
+    );
+
+    assert_eq!(
+        fs::read(SharedFixture::store(&fixture.lobby)).unwrap(),
+        lobby_store_before
+    );
+    assert_eq!(
+        fs::read_to_string(&fixture.config_path).unwrap(),
+        "return 1"
+    );
+    assert!(!fixture.lobby.join("renium-link.json").exists());
+
+    let race_links = read_link_manifest(&fixture.race.join("renium-link.json")).unwrap();
+    assert_eq!(race_links.links[0].id, "public");
+    assert!(race_links.links[0].read_only);
+    match &race_links.links[0].source {
+        LinkSource::Local { path } => assert_eq!(path, "../../links/public.renium"),
+        _ => panic!("expected the shared package as a local source"),
+    }
+    let (race, public) = SharedFixture::public(&fixture.race);
+    assert_eq!(race.instances[public].settings_id, "race-public");
+    assert_eq!(
+        SharedFixture::child_names(&race, public),
+        ["Config", "Panel", "TopbarPlus"]
+    );
+    assert_eq!(
+        SharedFixture::child(&race, public, "Config")
+            .properties
+            .get("Source"),
+        Some(&json!("return 1"))
+    );
+    assert!(!fixture.menu.join("renium-link.json").exists());
+
+    let again = share_public(&fixture, false);
+    assert_eq!(again["linked"], json!(["race"]));
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("renium.experience.json")).unwrap(),
+        manifest_text
+    );
+    let _ = fs::remove_dir_all(&fixture.root);
+}
+
+#[test]
+fn shared_link_repacks_after_source_edits_and_reports_drift() {
+    let fixture = shared_fixture("shared-link-propagate");
+    share_public(&fixture, false);
+
+    let status = shared_status(&fixture.root);
+    assert_eq!(status["src"], json!("lobby"));
+    assert_eq!(status["stale"], json!(false));
+    assert_eq!(status["places"], json!({ "race": "ok" }));
+
+    fs::write(&fixture.config_path, "return 2").unwrap();
+    let status = shared_status(&fixture.race);
+    assert_eq!(status["stale"], json!(true));
+    assert_eq!(status["places"], json!({ "race": "ok" }));
+
+    let applied = apply_in(&fixture.root, true);
+    assert_eq!(applied["ok"], json!(true));
+    assert_eq!(applied["shared"][0]["repacked"], json!(true));
+    assert_eq!(applied["shared"][0]["places"], json!({ "race": "updated" }));
+    let (race, public) = SharedFixture::public(&fixture.race);
+    assert_eq!(
+        SharedFixture::child(&race, public, "Config")
+            .properties
+            .get("Source"),
+        Some(&json!("return 2"))
+    );
+    assert_eq!(
+        fs::read_to_string(&fixture.config_path).unwrap(),
+        "return 2"
+    );
+    let status = shared_status(&fixture.root);
+    assert_eq!(status["stale"], json!(false));
+    assert_eq!(status["places"], json!({ "race": "ok" }));
+
+    let idle = apply_in(&fixture.root, true);
+    assert!(idle["shared"][0].get("repacked").is_none());
+    assert_eq!(idle["shared"][0]["places"], json!({ "race": "ok" }));
+
+    SharedFixture::edit_public_child(&fixture.race, "Panel", |panel| {
+        panel.attributes.insert("Theme".into(), json!("light"));
+    });
+    assert_eq!(
+        shared_status(&fixture.root)["places"],
+        json!({ "race": "drift" })
+    );
+
+    let from_source = apply_in(&fixture.lobby, false);
+    assert_eq!(
+        from_source["shared"][0]["places"],
+        json!({ "race": "updated" })
+    );
+    let (race, public) = SharedFixture::public(&fixture.race);
+    assert_eq!(
+        SharedFixture::child(&race, public, "Panel")
+            .attributes
+            .get("Theme"),
+        Some(&json!("dark"))
+    );
+    assert_eq!(
+        shared_status(&fixture.root)["places"],
+        json!({ "race": "ok" })
+    );
+
+    let in_consumer = apply_in(&fixture.race, false);
+    assert!(in_consumer["shared"][0].get("places").is_none());
+
+    let mut race = SettingsBytecode::read_file(&SharedFixture::store(&fixture.race)).unwrap();
+    instance_api::remove_instance(&mut race, InstanceSelector::SettingsId("race-public"), true)
+        .unwrap();
+    race.write_file(&SharedFixture::store(&fixture.race))
+        .unwrap();
+    assert_eq!(
+        shared_status(&fixture.root)["places"],
+        json!({ "race": "missing" })
+    );
+    let detached = apply_in(&fixture.root, true);
+    assert_eq!(
+        detached["shared"][0]["places"],
+        json!({ "race": "detached" })
+    );
+    assert!(shared_status(&fixture.root).get("places").is_none());
+    let _ = fs::remove_dir_all(&fixture.root);
+}
+
+#[test]
+fn shared_link_all_places_creates_missing_roots() {
+    let fixture = shared_fixture("shared-link-all-places");
+    let result = share_public(&fixture, true);
+    assert_eq!(result["linked"], json!(["menu", "race"]));
+    assert!(result.get("skipped").is_none());
+    let (menu, public) = SharedFixture::public(&fixture.menu);
+    assert_eq!(
+        SharedFixture::child_names(&menu, public),
+        ["Config", "Panel", "TopbarPlus"]
+    );
+    assert_eq!(
+        shared_status(&fixture.root)["places"],
+        json!({ "menu": "ok", "race": "ok" })
+    );
+    let _ = fs::remove_dir_all(&fixture.root);
+}
+
+#[test]
+fn shared_link_live_sync_propagates_and_consumer_pushes_pass_enforcement() {
+    let fixture = shared_fixture("shared-link-live");
+    share_public(&fixture, false);
+    let lobby_store = SharedFixture::store(&fixture.lobby);
+    let race_store = SharedFixture::store(&fixture.race);
+
+    assert!(shared_link_sources_touched(&fixture.lobby, &[fixture.config_path.clone()]).unwrap());
+    assert!(
+        shared_link_sources_touched(&fixture.lobby, std::slice::from_ref(&lobby_store)).unwrap()
+    );
+    assert!(
+        !shared_link_sources_touched(
+            &fixture.lobby,
+            &[fixture
+                .lobby
+                .join("src")
+                .join("ServerScriptService")
+                .join("Main.server.luau")]
+        )
+        .unwrap()
+    );
+    assert!(
+        !shared_link_sources_touched(&fixture.race, std::slice::from_ref(&race_store)).unwrap()
+    );
+
+    let idle = propagate_shared_links_from(&fixture.lobby).unwrap();
+    assert!(idle.summary.is_none() && idle.failure.is_none());
+    fs::write(&fixture.config_path, "return 3").unwrap();
+    let outcome = propagate_shared_links_from(&fixture.lobby).unwrap();
+    assert_eq!(
+        outcome.summary.as_deref(),
+        Some("public repacked from lobby, applied to race")
+    );
+    assert!(outcome.failure.is_none());
+
+    let push = |changed: PathBuf| {
+        collect_editor_changes(&PushEditorChangesArgs {
+            changed_paths: vec![changed],
+            ..PushEditorChangesArgs::new(
+                ProjectSourceArgs {
+                    project_root: fixture.race.clone(),
+                    src_root: PathBuf::from("src"),
+                },
+                BridgeConnectionArgs::local(0.0),
+            )
+        })
+    };
+    let pushed = push(race_store.clone());
+    assert!(pushed.is_ok(), "{:#}", pushed.err().unwrap());
+
+    SharedFixture::edit_public_child(&fixture.race, "Config", |config| {
+        config
+            .properties
+            .insert("Source".into(), json!("return 'local edit'"));
+    });
+    let refused = push(race_store).err().unwrap();
+    assert!(format!("{refused:#}").contains("read-only link \"public\""));
+    let _ = fs::remove_dir_all(&fixture.root);
+}
+
+#[test]
+fn consumer_commands_leave_the_shared_package_alone() {
+    let fixture = shared_fixture("shared-link-consumer");
+    share_public(&fixture, false);
+    let package = fixture.root.join("links").join("public.renium");
+
+    assert!(
+        local_project_package_paths(&fixture.race)
+            .unwrap()
+            .is_empty()
+    );
+    let resave = link_pack(LinkPackArgs {
+        project: ProjectSourceArgs {
+            project_root: fixture.race.clone(),
+            src_root: PathBuf::from("src"),
+        },
+        manifest: PathBuf::from("renium-link.json"),
+        link_folder: None,
+        id: None,
+        target: link_target_args("ReplicatedStorage", r#"["ReplicatedStorage","Public"]"#),
+        share: false,
+        all_places: false,
+        pretty: false,
+    })
+    .unwrap_err();
+    assert!(format!("{resave:#}").contains("shared from another place"));
+
+    let deleted = capture_json_output(|| {
+        link_delete_package(LinkDeletePackageArgs {
+            project: ProjectSourceArgs {
+                project_root: fixture.race.clone(),
+                src_root: PathBuf::from("src"),
+            },
+            manifest: PathBuf::from("renium-link.json"),
+            id: "public".into(),
+            action: "unlink-uses".into(),
+            pretty: false,
+        })
+    })
+    .unwrap();
+    assert_eq!(deleted["deletedPackage"], Value::Null);
+    assert!(package.is_file());
+    assert!(shared_status(&fixture.root).get("places").is_none());
+    let _ = fs::remove_dir_all(&fixture.root);
 }

@@ -25,6 +25,7 @@ use crate::app::output::{ensure_plugin_api_ok, log_global};
 use crate::app::timing::{current_millis, elapsed_ms};
 use crate::editor::sync::{StudioChangeGuard, StudioChangedBeforePush};
 use crate::project::config;
+use crate::project::package_links::{propagate_shared_links_from, shared_link_sources_touched};
 use crate::snapshot::export::{
     PublishEntryState, PublishedProjectChanges, export_snapshots_with_warm_bridge,
 };
@@ -38,6 +39,7 @@ const SETTLE_QUIET_PERIOD: Duration = Duration::from_millis(100);
 const STUDIO_PULL_SETTLE_LIMIT: Duration = Duration::from_secs(2);
 const RESCAN_RETRY: Duration = Duration::from_millis(500);
 const MAX_PUSH_RETRY_DELAY: Duration = Duration::from_secs(5);
+const SHARED_LINK_SETTLE: Duration = Duration::from_millis(500);
 const ENABLED_FILE: &str = "live-watch-state.enabled";
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -632,6 +634,16 @@ impl Control {
         let mut status = self.status.lock_recover();
         status.error = None;
         status.conflicts = None;
+        drop(status);
+        self.notify_sync_state();
+    }
+
+    fn clear_error_if(&self, error: &str) {
+        let mut status = self.status.lock_recover();
+        if status.error.as_deref() != Some(error) {
+            return;
+        }
+        status.error = None;
         drop(status);
         self.notify_sync_state();
     }
@@ -2587,6 +2599,8 @@ struct LiveLoop {
     reconcile_retry: Option<Instant>,
     reconcile_retry_delay: Duration,
     concurrent_edit_retries: u32,
+    shared_links_due: Option<Instant>,
+    shared_links_error: Option<String>,
 }
 
 impl LiveLoop {
@@ -2634,7 +2648,54 @@ impl LiveLoop {
             reconcile_retry: None,
             reconcile_retry_delay: Duration::ZERO,
             concurrent_edit_retries: 0,
+            shared_links_due: None,
+            shared_links_error: None,
         })
+    }
+
+    fn note_shared_link_changes(&mut self, paths: &[PathBuf]) {
+        match shared_link_sources_touched(&self.project.root, paths) {
+            Ok(true) => self.shared_links_due = Some(Instant::now() + SHARED_LINK_SETTLE),
+            Ok(false) => {}
+            Err(error) => self
+                .control
+                .fail(format!("Shared link check failed: {error:#}")),
+        }
+    }
+
+    fn maybe_propagate_shared_links(&mut self) -> bool {
+        if self
+            .shared_links_due
+            .is_none_or(|due| Instant::now() < due || !self.pending.is_empty())
+        {
+            return false;
+        }
+        self.shared_links_due = None;
+        let started = Instant::now();
+        let outcome = propagate_shared_links_from(&self.project.root);
+        log_live_timing("shared link propagation", started);
+        let failure = match outcome {
+            Ok(outcome) => {
+                if let Some(summary) = outcome.summary {
+                    log_global(3, format_args!("[renium] shared links: {summary}"));
+                }
+                outcome.failure
+            }
+            Err(error) => Some(format!("{error:#}")),
+        };
+        match failure {
+            Some(failure) => {
+                let message = format!("Shared link propagation failed: {failure}");
+                self.control.fail(message.clone());
+                self.shared_links_error = Some(message);
+            }
+            None => {
+                if let Some(message) = self.shared_links_error.take() {
+                    self.control.clear_error_if(&message);
+                }
+            }
+        }
+        true
     }
 
     fn running(&self) -> bool {
@@ -3085,6 +3146,7 @@ impl LiveLoop {
             .any(|path| !self.blocked.contains_key(path));
         self.push_retry_delay = Duration::ZERO;
         self.last_event = Instant::now();
+        self.note_shared_link_changes(&push.paths);
         Ok(false)
     }
 
@@ -3251,6 +3313,13 @@ impl LiveLoop {
         self.studio.retry_delay = Duration::ZERO;
         self.acknowledge_pull(&pulled)?;
         self.finish_studio_wait();
+        let pulled_paths = pulled
+            .published
+            .expected
+            .keys()
+            .map(|path| self.project.root.join(path))
+            .collect::<Vec<_>>();
+        self.note_shared_link_changes(&pulled_paths);
         Ok(())
     }
 
@@ -3347,6 +3416,9 @@ impl LiveLoop {
                 continue;
             }
             if self.maybe_retry_reconcile()? {
+                continue;
+            }
+            if self.maybe_propagate_shared_links() {
                 continue;
             }
             self.maybe_pull()?;

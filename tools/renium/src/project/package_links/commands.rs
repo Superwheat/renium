@@ -24,6 +24,7 @@ use crate::editor::paths::{
     infer_editor_source_path_spec_in_service,
 };
 use crate::editor::sync::is_lua_source_class;
+use crate::project::experience::AmbiguousExperiencePlace;
 use crate::project::layout::apply_configured_project_layout;
 use crate::rbx::encode::bytecode_export_script_source;
 use crate::settings::EXTERNAL_SOURCE_MARKER;
@@ -38,6 +39,7 @@ use crate::system::files::{
     resolve_link_project_root, validate_filesystem_instance_name,
 };
 
+use super::shared;
 use super::{
     GLOBAL_LINK_PREFIX, LinkEntry, LinkLockEntry, LinkManifest, LinkResolveOptions, LinkSource,
     LinkSourceMeta, LinkTargetRef, LinkTargetStorage, PackageMaterialization, RENIUM_DIR_GITIGNORE,
@@ -55,7 +57,7 @@ use super::{
     stage_settings_document_writes, validate_link_target_ref, write_link_manifest,
 };
 
-fn load_link_project(
+pub(super) fn load_link_project(
     project: &mut ProjectSourceArgs,
     manifest: &Path,
 ) -> Result<(PathBuf, PathBuf, PathBuf, LinkManifest)> {
@@ -184,7 +186,11 @@ fn reconcile_package_target_names(
     Ok(changed)
 }
 
-fn parse_link_target(service: &str, path: &str, ordinals: &str) -> Result<LinkTargetRef> {
+pub(super) fn parse_link_target(
+    service: &str,
+    path: &str,
+    ordinals: &str,
+) -> Result<LinkTargetRef> {
     let target = LinkTargetRef {
         service: service.to_string(),
         path: serde_json::from_str(path).context("Failed to parse link target path JSON")?,
@@ -195,7 +201,7 @@ fn parse_link_target(service: &str, path: &str, ordinals: &str) -> Result<LinkTa
     Ok(target)
 }
 
-fn link_target_output_ordinals(ordinals: Vec<usize>) -> Vec<usize> {
+pub(super) fn link_target_output_ordinals(ordinals: Vec<usize>) -> Vec<usize> {
     if ordinals.iter().all(|ordinal| *ordinal == 1) {
         Vec::new()
     } else {
@@ -666,9 +672,58 @@ impl MirrorLinkApply<'_> {
     }
 }
 
+fn load_place_or_experience(
+    args: &mut ProjectSourceArgs,
+    manifest: &Path,
+    experience: bool,
+) -> Result<Option<(PathBuf, PathBuf, PathBuf, LinkManifest)>> {
+    if experience {
+        return Ok(None);
+    }
+    match load_link_project(args, manifest) {
+        Err(error) if error.downcast_ref::<AmbiguousExperiencePlace>().is_some() => Ok(None),
+        loaded => loaded.map(Some),
+    }
+}
+
 pub(crate) fn link_apply(mut args: LinkApplyArgs) -> Result<()> {
-    let (project_root, src_root, manifest_path, mut manifest) =
-        load_link_project(&mut args.project, &args.manifest)?;
+    let Some((project_root, src_root, manifest_path, manifest)) =
+        load_place_or_experience(&mut args.project, &args.manifest, args.experience)?
+    else {
+        let result = shared::experience_shared_links(
+            &args.project.project_root,
+            args.link.as_deref(),
+            args.check,
+        )?;
+        print_json_output(&result, args.pretty)?;
+        if result.get("ok") != Some(&Value::Bool(true)) {
+            bail!("Some shared links could not be applied; see shared[].error and errors");
+        }
+        return Ok(());
+    };
+    let shared = shared::apply_place_shared_links(&project_root, args.link.as_deref(), args.check)?;
+    let (mut result, warning_count) =
+        apply_project_links(&args, &project_root, &src_root, &manifest_path, manifest)?;
+    if let Some(shared) = shared {
+        result["shared"] = shared;
+    }
+    print_json_output(&result, args.pretty)?;
+    if args.strict && warning_count > 0 {
+        bail!("link-apply finished with {warning_count} warning(s) and --strict is set");
+    }
+    Ok(())
+}
+
+pub(super) fn apply_project_links(
+    args: &LinkApplyArgs,
+    project_root: &Path,
+    src_root: &Path,
+    manifest_path: &Path,
+    mut manifest: LinkManifest,
+) -> Result<(Value, usize)> {
+    let project_root = project_root.to_path_buf();
+    let src_root = src_root.to_path_buf();
+    let manifest_path = manifest_path.to_path_buf();
     let options = LinkResolveOptions {
         only_link: args.link.clone(),
         offline: args.offline || args.check,
@@ -814,7 +869,7 @@ pub(crate) fn link_apply(mut args: LinkApplyArgs) -> Result<()> {
                 .get_mut(settings_file)
                 .context("Package link target settings were not loaded")?;
             PackageLinkApply {
-                args: &args,
+                args,
                 target,
                 target_forced,
                 storage,
@@ -831,7 +886,7 @@ pub(crate) fn link_apply(mut args: LinkApplyArgs) -> Result<()> {
         }
 
         MirrorLinkApply {
-            args: &args,
+            args,
             project_root: &project_root,
             target,
             target_forced,
@@ -906,11 +961,7 @@ pub(crate) fn link_apply(mut args: LinkApplyArgs) -> Result<()> {
         "warnings": changes.warnings,
     });
     crate::app::output::drop_empty(&mut result, &["warnings", "links", "changedSettingsIds"]);
-    print_json_output(&result, args.pretty)?;
-    if strict_failure {
-        bail!("link-apply finished with {warning_count} warning(s) and --strict is set");
-    }
-    Ok(())
+    Ok((result, warning_count))
 }
 
 pub(crate) fn link_break(mut args: LinkBreakArgs) -> Result<()> {
@@ -1127,13 +1178,34 @@ fn link_target_source_instance_count(target: &ResolvedLinkTarget) -> usize {
 }
 
 pub(crate) fn link_status(mut args: LinkStatusArgs) -> Result<()> {
-    let (project_root, src_root, manifest_path, manifest) =
-        load_link_project(&mut args.project, &args.manifest)?;
+    let Some((project_root, src_root, manifest_path, manifest)) =
+        load_place_or_experience(&mut args.project, &args.manifest, args.experience)?
+    else {
+        let mut result = shared::experience_shared_links(&args.project.project_root, None, true)?;
+        crate::app::output::strip_empty(&mut result);
+        return print_json_output(&result, args.pretty);
+    };
+    let mut result =
+        project_link_status(&args, &project_root, &src_root, &manifest_path, &manifest);
+    if let Some(shared) = shared::shared_link_status(&project_root)? {
+        result["shared"] = shared;
+    }
+    crate::app::output::strip_empty(&mut result);
+    print_json_output(&result, args.pretty)
+}
+
+fn project_link_status(
+    args: &LinkStatusArgs,
+    project_root: &Path,
+    src_root: &Path,
+    manifest_path: &Path,
+    manifest: &LinkManifest,
+) -> Value {
     let options = LinkResolveOptions {
-        cache_dir: resolve_link_cache_dir(&project_root, &manifest, args.cache_dir.as_deref()),
+        cache_dir: resolve_link_cache_dir(project_root, manifest, args.cache_dir.as_deref()),
         ..LinkResolveOptions::default()
     };
-    let resolved = resolve_link_targets(&project_root, &src_root, &manifest, &options);
+    let resolved = resolve_link_targets(project_root, src_root, manifest, &options);
 
     let mut meta_by_link: HashMap<String, LinkSourceMeta> = HashMap::new();
     let mut source_instances_by_link: HashMap<String, usize> = HashMap::new();
@@ -1329,19 +1401,17 @@ pub(crate) fn link_status(mut args: LinkStatusArgs) -> Result<()> {
         })
         .collect();
 
-    let mut result = json!({
+    json!({
         "ok": true,
         "manifest": manifest_path,
         "manifestExists": manifest_path.exists(),
-        "lockExists": link_lock_path(&project_root).exists(),
+        "lockExists": link_lock_path(project_root).exists(),
         "linkCount": manifest.links.len(),
         "brokenTargets": broken,
         "driftedTargets": drifted,
         "links": links_out,
         "targets": targets_out,
-    });
-    crate::app::output::strip_empty(&mut result);
-    print_json_output(&result, args.pretty)
+    })
 }
 
 pub(crate) fn link_add(args: LinkAddArgs) -> Result<()> {
@@ -1637,6 +1707,7 @@ pub(super) fn pack_subtree_to_bytecode(
     document: &SettingsBytecode,
     root_index: usize,
     source_paths: &[Option<PathBuf>],
+    excluded_roots: &[usize],
 ) -> Result<(SettingsBytecode, HashMap<usize, String>)> {
     let children_by_parent = settings_children_by_parent(document);
     let service = document
@@ -1648,6 +1719,14 @@ pub(super) fn pack_subtree_to_bytecode(
         build_editor_instance_path_parts(document, service);
     let mut subtree = Vec::new();
     collect_settings_subtree_preorder(&children_by_parent, root_index, &mut subtree);
+    if !excluded_roots.is_empty() {
+        let mut excluded = Vec::new();
+        for root in excluded_roots {
+            collect_settings_subtree_preorder(&children_by_parent, *root, &mut excluded);
+        }
+        let excluded = excluded.into_iter().collect::<HashSet<_>>();
+        subtree.retain(|index| !excluded.contains(index));
+    }
     let mut package = SettingsBytecode {
         version: SETTINGS_BINARY_VERSION,
         instances: Vec::new(),
@@ -1770,6 +1849,9 @@ fn inline_editor_source_files_for_indexes(
 }
 
 pub(crate) fn link_pack(mut args: LinkPackArgs) -> Result<()> {
+    if args.share {
+        return shared::share_link_pack(args);
+    }
     let (project_root, src_root, manifest_path, mut manifest) =
         load_link_project(&mut args.project, &args.manifest)?;
 
@@ -1864,7 +1946,7 @@ pub(crate) fn link_pack(mut args: LinkPackArgs) -> Result<()> {
     let mut subtree = Vec::new();
     collect_settings_subtree_preorder(&children_by_parent, root_index, &mut subtree);
     let (package, source_by_index) =
-        pack_subtree_to_bytecode(&document, root_index, &source_paths)?;
+        pack_subtree_to_bytecode(&document, root_index, &source_paths, &[])?;
 
     let target_key = link_target_ref_key(&target);
     let existing_target_link_id = manifest
@@ -1930,6 +2012,13 @@ pub(crate) fn link_pack(mut args: LinkPackArgs) -> Result<()> {
     }
     let (package_file, source_rel) = if let Some(link) = existing_link {
         match &link.source {
+            LinkSource::Local { path }
+                if shared::experience_package_path(&project_root, path).is_some() =>
+            {
+                bail!(
+                    "Link {id} follows a package shared from another place of the experience; edit that place and run `rbx lk`"
+                )
+            }
             LinkSource::Local { path } if is_package_path(Path::new(path)) => {
                 let package_file = resolve_local_link_path(&project_root, path);
                 (package_file, path.replace('\\', "/"))
@@ -2278,7 +2367,7 @@ fn plan_unlink_link_target_instance(
     Ok((true, written_source_paths))
 }
 
-fn local_package_source_path(project_root: &Path, link: &LinkEntry) -> Result<PathBuf> {
+fn local_package_source_path(project_root: &Path, link: &LinkEntry) -> Result<Option<PathBuf>> {
     let LinkSource::Local { path } = &link.source else {
         bail!("Link {} is not a local package source.", link.id);
     };
@@ -2290,6 +2379,9 @@ fn local_package_source_path(project_root: &Path, link: &LinkEntry) -> Result<Pa
             package_path.display()
         );
     }
+    if shared::experience_package_path(project_root, path).is_some() {
+        return Ok(None);
+    }
     if is_global_link_path(path) {
         ensure_existing_ancestor_inside(
             &renium_global_packages_dir(),
@@ -2299,7 +2391,7 @@ fn local_package_source_path(project_root: &Path, link: &LinkEntry) -> Result<Pa
     } else {
         ensure_existing_ancestor_inside(project_root, &package_path, "link package source")?;
     }
-    Ok(package_path)
+    Ok(Some(package_path))
 }
 
 pub(crate) fn link_delete_package(mut args: LinkDeletePackageArgs) -> Result<()> {
@@ -2430,12 +2522,12 @@ pub(crate) fn link_delete_package(mut args: LinkDeletePackageArgs) -> Result<()>
     } else {
         transaction_writes.insert(lock_path, serialize_link_lock(&lock)?);
     }
-    let deleted_package_path = package_path.is_file().then(|| package_path.clone());
+    let deleted_package_path = package_path.filter(|path| path.is_file());
     let deleted_package_output = deleted_package_path.as_ref().map(|path| {
         path.to_string_lossy()
             .replace('/', std::path::MAIN_SEPARATOR_STR)
     });
-    if deleted_package_path.is_some() {
+    if let Some(package_path) = deleted_package_path {
         transaction_removals.push(package_path);
     }
     transaction_removals.retain(|path| {

@@ -443,6 +443,16 @@ pub(super) fn rename(context: &BoundContext, parameters: &Value) -> Result<Value
     if manifest.get("startPlace").and_then(Value::as_str) == Some(&current) {
         manifest["startPlace"] = Value::String(alias.clone());
     }
+    for link in manifest
+        .get_mut("sharedLinks")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        if link.get("source").and_then(Value::as_str) == Some(&current) {
+            link["source"] = Value::String(alias.clone());
+        }
+    }
     if let Err(error) = write(&path, &manifest) {
         if let Some((source, destination)) = renamed
             && let Err(rollback) = fs::rename(&destination, &source)
