@@ -63,10 +63,17 @@ local function runtime(role)
 		end,
 	})
 end
+local kicks = {}
+local function kick(player, reason)
+	if player.Name == "Locked" then
+		error("Kick is not permitted")
+	end
+	kicks[#kicks + 1] = `{player.Name}:{reason}`
+end
 local function named(count)
 	local list = {}
 	for index = 1, count do
-		list[index] = { Name = `Player{index}` }
+		list[index] = { Name = `Player{index}`, Kick = kick }
 	end
 	return list
 end
@@ -108,10 +115,25 @@ local ok, message = pcall(server.startStopPlay, { addPlayers = 1 })
 assert(not ok and string.find(tostring(message), "ownership was lost", 1, true), "adding requires ownership")
 ok, message = pcall(client.startStopPlay, { leave = true })
 assert(not ok and string.find(tostring(message), "ownership was lost", 1, true), "leaving requires ownership")
+ok, message = pcall(server.startStopPlay, { kickPlayer = "Player1" })
+assert(not ok and string.find(tostring(message), "ownership was lost", 1, true), "kicking requires ownership")
 players = named(3)
 result = server.startStopPlay({ listPlayers = true })
 assert(result.ok and result.action == "players" and #result.players == 3, "listing is read-only")
 authorized = true
+
+result = server.startStopPlay({ kickPlayer = "Player2", reason = "rbx play --leave" })
+assert(result.ok and result.action == "kick" and result.kicked == true, "the server kicks a listed player")
+assert(#kicks == 1 and kicks[1] == "Player2:rbx play --leave", "Kick receives the reason")
+result = server.startStopPlay({ kickPlayer = "Player9" })
+assert(result.ok and result.kicked == false and #kicks == 1, "an absent player is reported, not kicked")
+players[#players + 1] = { Name = "Locked", Kick = kick }
+result = server.startStopPlay({ kickPlayer = "Locked" })
+assert(result.ok and result.kicked == false and string.find(result.kickError, "not permitted", 1, true),
+	"a refused Kick is reported")
+result = client.startStopPlay({ kickPlayer = "Player2" })
+assert(not result.ok and string.find(result.error, "play server", 1, true), "a client cannot kick")
+assert(not server.startStopPlay({ kickPlayer = "" }).ok, "kicking needs a name")
 
 result = server.startStopPlay({ leave = true })
 assert(not result.ok and string.find(result.error, "play client", 1, true), "the server cannot leave")
