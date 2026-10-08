@@ -77,3 +77,4 @@ tools/**/.vscode-test/
 # OS/editor noise
 .DS_Store
 Thumbs.db
+!/SECURITY.md
