@@ -2331,8 +2331,13 @@ pub(super) struct PushEditorChangesArgs {
         alias = "upsert"
     )]
     pub(super) upsert_instances_only: bool,
-    #[arg(help = "Verify pushed script sources", long, alias = "verify")]
+    #[arg(help = "Push, then verify the pushed script sources", long)]
     pub(super) verify_sources: bool,
+    #[arg(
+        help = "Compare the selected script sources with Studio and push nothing",
+        long
+    )]
+    pub(super) verify: bool,
     #[arg(help = "Skip the Studio review", long)]
     pub(super) no_review: bool,
     #[arg(help = "Apply without confirmation", long, alias = "apply")]
@@ -2363,6 +2368,7 @@ impl PushEditorChangesArgs {
             target_properties: Vec::new(),
             upsert_instances_only: false,
             verify_sources: false,
+            verify: false,
             no_review: false,
             yes: false,
             link_cache_dir: None,

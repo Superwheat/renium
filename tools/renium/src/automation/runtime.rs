@@ -261,6 +261,7 @@ pub(super) fn automation_push_args(
         .collect();
     args.target_properties = automation_strings(object, "targetProperties");
     args.verify_sources = automation_bool(object, "verifySources", false)?;
+    args.verify = automation_bool(object, "verify", false)?;
     args.upsert_instances_only = automation_bool(object, "upsertInstancesOnly", false)?;
     args.override_packages = automation_bool(object, "overridePackages", false)?;
     args.link_cache_dir = automation_string(object, "linkCacheDir")
@@ -2470,8 +2471,13 @@ fn pair_configuration(
                 .get("initialConflictPreference")
                 .and_then(Value::as_str)
         });
+    let mode = if resolution.is_some() {
+        automation::reconcile::PairMode::Reconcile
+    } else {
+        automation::reconcile::PairMode::parse(raw_mode)
+    };
     Ok(automation::reconcile::PairConfiguration {
-        mode: automation::reconcile::PairMode::parse(raw_mode),
+        mode,
         conflict_preference: automation::reconcile::ConflictPreference::parse(raw_preference),
         resolution_preference: resolution
             .map(|value| automation::reconcile::ConflictPreference::parse(Some(value))),
@@ -3580,6 +3586,16 @@ mod tests {
 
         let request = json!({ "initialSyncPriority": "sideways" });
         assert!(pair_configuration(&json!({}), request.as_object().unwrap()).is_err());
+
+        let request = json!({
+            "initialSyncPriority": "verify",
+            "resolveConflictPreference": "editor"
+        });
+        let configuration = pair_configuration(&json!({}), request.as_object().unwrap()).unwrap();
+        assert_eq!(
+            configuration.mode,
+            automation::reconcile::PairMode::Reconcile
+        );
     }
 
     #[test]

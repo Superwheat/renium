@@ -463,9 +463,9 @@ impl Coordinator {
         }
 
         if setup.mode == PairMode::Verify {
-            record.conflicts = vec!["Studio and project files differ".to_string()];
+            record.conflicts = verify_difference_lines(&changes.studio, &changes.editor);
             record.resolution_required = false;
-            setup.error = Some(conflict_message(&record.conflicts));
+            setup.error = Some(conflict_message(&record.conflicts[..1]));
             record.note_setup(setup);
             write_record(context, &setup.key, &record)?;
             setup.resolution_required = false;
@@ -1126,4 +1126,27 @@ fn record_pushed_baseline(
     };
     baseline.replace_scopes(Path::new(&context.root), key, &scopes, &pushed_content)?;
     write_record(context, key, record)
+}
+
+/// Verify mode records what reconcile would do, path by path, so
+/// `lst --details` can show it: `push:` paths differ on the project side,
+/// `pull:` paths differ on the Studio side.
+pub(crate) fn verify_difference_lines(
+    push: &HashSet<PathBuf>,
+    pull: &HashSet<PathBuf>,
+) -> Vec<String> {
+    const LIMIT: usize = 60;
+    let mut lines = vec!["Studio and project files differ".to_string()];
+    let mut entries = push
+        .iter()
+        .map(|path| format!("push: {}", path.display()))
+        .chain(pull.iter().map(|path| format!("pull: {}", path.display())))
+        .collect::<Vec<_>>();
+    entries.sort();
+    let total = entries.len();
+    lines.extend(entries.into_iter().take(LIMIT));
+    if total > LIMIT {
+        lines.push(format!("{} more paths", total - LIMIT));
+    }
+    lines
 }

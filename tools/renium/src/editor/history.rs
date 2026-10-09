@@ -961,6 +961,7 @@ fn apply_reverted_paths(
         return push_editor_changes_result(PushEditorChangesArgs {
             changed_paths,
             verify_sources: true,
+            verify: false,
             ..PushEditorChangesArgs::new(
                 ProjectSourceArgs {
                     project_root,

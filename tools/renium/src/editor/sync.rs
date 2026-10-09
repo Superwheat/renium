@@ -1225,6 +1225,7 @@ pub(crate) fn push_editor_changes_result(mut args: PushEditorChangesArgs) -> Res
         "targetProperties": args.target_properties,
         "upsertInstancesOnly": args.upsert_instances_only,
         "verifySources": args.verify_sources,
+        "verify": args.verify,
         "overridePackages": args.override_packages,
         "allowProtectedWrites": !args.no_review,
         "linkCacheDir": args.link_cache_dir,
@@ -1292,6 +1293,11 @@ pub(crate) fn push_editor_changes_with_warm_bridge_guarded(
     guard: Option<&StudioChangeGuard>,
 ) -> Result<serde_json::Map<String, Value>> {
     let started = Instant::now();
+    if args.verify {
+        let (changes, _) = collect_project_editor_changes(&args)?;
+        validate_source_verification_selection(&args, &changes)?;
+        return verify_editor_sources_only(bridge, &changes);
+    }
     if native_editor_full_push_eligible(&args)? {
         bail!("A full push must use the managed replacement path; Studio was not changed");
     }
@@ -1312,11 +1318,48 @@ pub(crate) fn push_editor_changes_with_warm_bridge_guarded(
     )
 }
 
+/// `ps --verify`: compares the selected script sources with what Studio holds
+/// and reports the differences; nothing is pushed.
+fn verify_editor_sources_only(
+    bridge: &BridgeServer,
+    changes: &EditorChangeSet,
+) -> Result<serde_json::Map<String, Value>> {
+    let verification = verify_editor_source_changes(bridge, changes, None)?;
+    let mut summary = serde_json::Map::new();
+    summary.insert(
+        "ok".to_string(),
+        Value::Bool(verification.failed.is_empty()),
+    );
+    summary.insert("verifyOnly".to_string(), Value::Bool(true));
+    summary.insert("pushed".to_string(), Value::Bool(false));
+    summary.insert(
+        "sourceVerified".to_string(),
+        json!(verification.verified as u64),
+    );
+    summary.insert(
+        "sourceVerifyFailed".to_string(),
+        json!(verification.failed.len() as u64),
+    );
+    if !verification.failed.is_empty() {
+        summary.insert(
+            "sourceVerifyErrors".to_string(),
+            Value::Array(
+                verification
+                    .failed
+                    .iter()
+                    .map(|error| Value::String(error.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    Ok(summary)
+}
+
 fn validate_source_verification_selection(
     args: &PushEditorChangesArgs,
     changes: &EditorChangeSet,
 ) -> Result<()> {
-    if !args.verify_sources || !changes.source_changes.is_empty() {
+    if !(args.verify_sources || args.verify) || !changes.source_changes.is_empty() {
         return Ok(());
     }
     let selected_paths = expand_editor_changed_paths(args)?;

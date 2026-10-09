@@ -4180,3 +4180,25 @@ fn reconciliation_ignores_transient_instance_ids_and_script_guids() {
     assert_ne!(observed.instances[1].settings_id, "debug:0_reserved");
     encode_settings_bytecode(&observed).unwrap();
 }
+
+#[test]
+fn verify_mode_lists_the_paths_reconcile_would_move() {
+    let push = HashSet::from([PathBuf::from("src/A.luau"), PathBuf::from("src/B.luau")]);
+    let pull = HashSet::from([PathBuf::from("instances/Workspace.renium")]);
+    let lines = super::coordinator::verify_difference_lines(&push, &pull);
+    assert_eq!(lines[0], "Studio and project files differ");
+    assert_eq!(
+        &lines[1..],
+        [
+            "pull: instances/Workspace.renium",
+            "push: src/A.luau",
+            "push: src/B.luau"
+        ]
+    );
+    let many = (0..70)
+        .map(|index| PathBuf::from(format!("src/{index:03}.luau")))
+        .collect::<HashSet<_>>();
+    let lines = super::coordinator::verify_difference_lines(&many, &HashSet::new());
+    assert_eq!(lines.len(), 62);
+    assert_eq!(lines[61], "10 more paths");
+}

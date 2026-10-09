@@ -33,7 +33,7 @@ Live Sync compares each side with their last common Renium state. One-sided chan
 
 A published place that closed without saving reopens older than the files, and its differences count as Studio edits. Before reopening one, run `rbx cfg set liveSync.initialSyncPriority verify` (or start with `rbx lon --initial-sync-priority verify`), then read `rbx lst --details`: no differences means Studio kept the work. Otherwise ask the user which side to keep and use the resolution commands the CLI returns.
 
-The editor asks which version to keep, then resumes startup. The CLI returns the conflict and resolution commands; `rbx lst --details` lists every conflict with the properties that differ and both values. Choose only with user direction or an existing conflict preference.
+The editor asks which version to keep, then resumes startup. The CLI returns the conflict and resolution commands; `rbx lst --details` lists every conflict with the properties that differ and both values, and in verify mode every path as `push:` (files differ) or `pull:` (Studio differs). `rbx lon --prefer studio|editor` reconciles for that run even when the configured mode is verify. Choose only with user direction or an existing conflict preference.
 
 ```powershell
 rbx cfg get liveSync.initialSyncPriority
@@ -50,7 +50,7 @@ Without Live Sync, pass the files or directories to `ps`; Renium batches them by
 For store edits, use returned changed paths and settings IDs to keep the push scoped.
 An unfiltered push reconciles the entire place and can remove Studio-only content.
 
-`ps --verify` checks selected script sources. Don't substitute reads of `Instance.Source`: an open ScriptDocument can differ.
+`ps --verify` compares the selected script sources with Studio and pushes nothing (`sourceVerifyErrors` lists mismatches); `ps --verify-sources` pushes, then checks. Don't substitute reads of `Instance.Source`: an open ScriptDocument can differ.
 
 Player capacity (`Players.MaxPlayers` and `PreferredPlayers`) is managed through Roblox Game Settings, not push. Saved exports and file comparisons still preserve/report these values.
 
