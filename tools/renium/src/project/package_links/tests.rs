@@ -2201,7 +2201,15 @@ fn replacing_a_target_keeps_package_internal_references() {
         .get("PrimaryPart")
         .cloned()
         .unwrap();
-    assert_eq!(primary["settingsId"], json!(base_id));
+    let base_index = decoded
+        .instances
+        .iter()
+        .position(|instance| instance.name == "Base")
+        .unwrap();
+    assert_eq!(
+        crate::settings::bytecode::settings_reference_index(&primary["instanceIndex"]),
+        Some(base_index)
+    );
     let _ = fs::remove_dir_all(&root);
 }
 

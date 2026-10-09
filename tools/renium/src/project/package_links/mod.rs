@@ -2299,6 +2299,7 @@ fn pin_reference_indices_to_ids(document: &mut SettingsBytecode, indexes: &[usiz
                     .and_then(|index| ids.get(index))
                 {
                     object.insert("settingsId".to_string(), Value::String(id.clone()));
+                    object.remove("instanceIndex");
                 }
             });
         }
