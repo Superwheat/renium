@@ -670,6 +670,9 @@ fn finish_studio_change_state_command(
             })
             .unwrap_or_default();
         if differences.is_empty() {
+            if !details && error.ends_with("Studio and project files differ") {
+                bail!("{error}; `rbx lst --details` lists the paths as push:/pull:");
+            }
             bail!(error.to_string());
         }
         if details {
