@@ -2117,3 +2117,118 @@ fn consumer_commands_leave_the_shared_package_alone() {
     assert!(shared_status(&fixture.root).get("places").is_none());
     let _ = fs::remove_dir_all(&fixture.root);
 }
+
+#[test]
+fn replacing_a_target_keeps_package_internal_references() {
+    let root = temp_dir("link-replace-refs");
+    let src_root = root.join("src");
+    let svc_dir = src_root.join("ReplicatedStorage");
+    fs::create_dir_all(&svc_dir).unwrap();
+    let mk = |id: &str, name: &str, class: &str, parent: Option<usize>| {
+        settings_instance(id, name, class, parent)
+    };
+    let mut flag = mk("editor:1", "Flag", "Model", Some(0));
+    flag.properties.insert(
+        "PrimaryPart".to_string(),
+        json!({"_type":"Ref","settingsId":"editor:2"}),
+    );
+    let source_doc = settings_document(vec![
+        mk("editor:0", "ReplicatedStorage", "ReplicatedStorage", None),
+        flag,
+        mk("editor:2", "Base", "Part", Some(1)),
+        mk("editor:3", "Sign", "Part", Some(1)),
+    ]);
+    let source_paths =
+        build_editor_source_paths_by_index(&source_doc, "ReplicatedStorage", &svc_dir);
+    let flag_index =
+        resolve_editor_instance_by_path(&source_doc, "ReplicatedStorage", &["Flag".to_string()])
+            .unwrap();
+    let (package, _) =
+        pack_subtree_to_bytecode(&source_doc, flag_index, &source_paths, &[]).unwrap();
+    let package_path = root.join("flag.renium");
+    package.write_file(&package_path).unwrap();
+
+    let mut old_flag = mk("editor:1", "Flag", "Model", Some(0));
+    old_flag.properties.insert(
+        "PrimaryPart".to_string(),
+        json!({"_type":"Ref","settingsId":"editor:2"}),
+    );
+    let mut target_doc = settings_document(vec![
+        mk("editor:0", "ServerStorage", "ServerStorage", None),
+        old_flag,
+        mk("editor:2", "OldBase", "Part", Some(1)),
+        mk("editor:3", "Other", "Folder", Some(0)),
+    ]);
+    materialize_package_target(
+        &mut target_doc,
+        PackageMaterialization {
+            service_dir: &src_root.join("ServerStorage"),
+            service: "ServerStorage",
+            target_segments: &["Flag".to_string()],
+            target_ordinals: &[],
+            package_path: &package_path,
+            filesystem_target: true,
+            external_references: &HashSet::new(),
+            displace_into: None,
+        },
+    )
+    .unwrap();
+    let base_id = target_doc
+        .instances
+        .iter()
+        .find(|instance| instance.name == "Base")
+        .unwrap()
+        .settings_id
+        .clone();
+    let primary = target_doc
+        .instances
+        .iter()
+        .find(|instance| instance.name == "Flag")
+        .unwrap()
+        .properties
+        .get("PrimaryPart")
+        .cloned()
+        .unwrap();
+    assert_eq!(primary["settingsId"], json!(base_id));
+    let encoded = encode_settings_bytecode(&target_doc).unwrap();
+    let decoded = crate::settings::bytecode::decode_settings_bytecode(&encoded).unwrap();
+    let primary = decoded
+        .instances
+        .iter()
+        .find(|instance| instance.name == "Flag")
+        .unwrap()
+        .properties
+        .get("PrimaryPart")
+        .cloned()
+        .unwrap();
+    assert_eq!(primary["settingsId"], json!(base_id));
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn moved_model_fingerprints_match_within_float_noise() {
+    let left = concat!(
+        "path=[\"#root0\"];class=\"Model\";properties={\"WorldPivot\":{\"_type\":\"CFrame\",",
+        "\"components\":[1.0015,2.0,3.0,-0.9999,0.0,0.0123,0.0,1.0,0.0,-0.0123,0.0,-0.9999]}};attributes={}"
+    );
+    let right = concat!(
+        "path=[\"#root0\"];class=\"Model\";properties={\"WorldPivot\":{\"_type\":\"CFrame\",",
+        "\"components\":[1.0,2.0,3.0,-0.9999,0.0,0.0126,0.0,1.0,0.0,-0.0126,0.0,-0.9999]}};attributes={}"
+    );
+    assert!(fingerprint_texts_match(Some(left), right));
+    let far = right.replace("1.0,2.0,3.0", "1.05,2.0,3.0");
+    assert!(!fingerprint_texts_match(Some(left), &far));
+    let other_class = right.replace("class=\"Model\"", "class=\"Folder\"");
+    assert!(!fingerprint_texts_match(Some(left), &other_class));
+    let other_name = right.replace("attributes={}", "attributes={\"Tier\":2}");
+    assert!(!fingerprint_texts_match(Some(left), &other_name));
+    assert!(!fingerprint_texts_match(None, right));
+}
+
+#[test]
+fn real_moved_model_lines_match_within_tolerance() {
+    let left = r##"path=["#root0","Maxder R7"];class="Model";properties={"HistoryId":{"_type":"UniqueId","value":"48702fd061fb1a4d097ad89700015797"},"WorldPivot":{"_type":"CFrame","components":[4.1944,-0.8242,7.4088,0.7206,0.0,-0.6934,-0.0,1.0,-0.0,0.6934,0.0,0.7206]}};attributes={}"##;
+    let right = r##"path=["#root0","Maxder R7"];class="Model";properties={"HistoryId":{"_type":"UniqueId","value":"48702fd061fb1a4d097ad89700015797"},"WorldPivot":{"_type":"CFrame","components":[4.1943,-0.8242,7.4086,0.7206,0.0,-0.6934,-0.0,1.0,-0.0,0.6934,0.0,0.7206]}};attributes={}"##;
+    assert!(fingerprint_lines_match(left, right));
+    assert!(fingerprint_texts_match(Some(left), right));
+}

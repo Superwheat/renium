@@ -50,11 +50,12 @@ use super::{
     link_target_from_settings_id, link_target_key, link_target_ordinals, link_target_ref_key,
     link_target_segments, load_settings_documents, mark_manifest_target_broken,
     materialize_package_target, package_document_fingerprint, package_lock_key,
-    package_target_fingerprint, package_target_fingerprint_with_external_sources,
-    package_target_matches, package_target_settings_ids, read_link_lock, read_link_manifest,
-    read_link_source_meta, referenced_settings_ids_outside, renium_global_packages_dir,
-    resolve_link_cache_dir, resolve_link_target_storage, resolve_link_targets,
-    resolve_local_link_path, selector_starts_with, serialize_link_lock, serialize_link_manifest,
+    package_target_difference, package_target_fingerprint,
+    package_target_fingerprint_with_external_sources, package_target_matches,
+    package_target_settings_ids, read_link_lock, read_link_manifest, read_link_source_meta,
+    referenced_settings_ids_outside, renium_global_packages_dir, resolve_link_cache_dir,
+    resolve_link_target_storage, resolve_link_targets, resolve_local_link_path,
+    selector_starts_with, serialize_link_lock, serialize_link_manifest,
     stage_settings_document_writes, stray_target_files, validate_link_target_ref,
     write_link_manifest,
 };
@@ -309,24 +310,32 @@ fn compare_package_target(
     service_dir: &Path,
     (package, package_fingerprint): (&SettingsBytecode, &str),
     shared: bool,
-) -> Result<(Option<String>, bool)> {
+) -> Result<(Option<String>, bool, Option<String>)> {
     if resolve_editor_instance_by_path_ordinals(document, service, segments, ordinals).is_none() {
-        return Ok((None, false));
+        return Ok((None, false, None));
     }
     if !shared {
+        let matches = package_target_matches(
+            document,
+            service,
+            segments,
+            ordinals,
+            package,
+            package_fingerprint,
+        )?;
+        let detail = if matches {
+            None
+        } else {
+            package_target_difference(document, service, segments, ordinals, package)?
+        };
         return Ok((
             package_target_fingerprint(document, service, segments, ordinals)?,
-            package_target_matches(
-                document,
-                service,
-                segments,
-                ordinals,
-                package,
-                package_fingerprint,
-            )?,
+            matches,
+            detail,
         ));
     }
     let inlined = inline_target_sources(document, service, service_dir, segments, ordinals)?;
+    let stray = stray_target_files(document, service, service_dir, segments, ordinals)?;
     let matches = package_target_matches(
         &inlined,
         service,
@@ -334,11 +343,18 @@ fn compare_package_target(
         ordinals,
         package,
         package_fingerprint,
-    )? && stray_target_files(document, service, service_dir, segments, ordinals)?
-        .is_empty();
+    )? && stray.is_empty();
+    let detail = if matches {
+        None
+    } else if let Some(path) = stray.first() {
+        Some(format!("stray file {}", path.display()))
+    } else {
+        package_target_difference(&inlined, service, segments, ordinals, package)?
+    };
     Ok((
         package_target_fingerprint(&inlined, service, segments, ordinals)?,
         matches,
+        detail,
     ))
 }
 
@@ -454,7 +470,7 @@ impl PackageLinkApply<'_> {
             document_ordinals,
         )
         .is_some();
-        let (target_fingerprint, target_matches_package) = compare_package_target(
+        let (target_fingerprint, target_matches_package, drift_detail) = compare_package_target(
             document,
             document_selector,
             &storage.source_root,
@@ -598,6 +614,7 @@ impl PackageLinkApply<'_> {
             "skipped": unchanged || preserved_target_edits,
             "forced": target_forced && (unchanged || preserved_target_edits),
             "targetDrift": target_exists && !target_matches_package,
+            "drift": drift_detail,
             "preservedEdits": preserved_target_edits,
             "conflict": package_conflict,
         }));

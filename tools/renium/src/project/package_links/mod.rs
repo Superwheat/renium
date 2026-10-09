@@ -1980,6 +1980,8 @@ fn materialize_package_root(
         remap_internal_clone_refs_in_record(&mut instance.attributes, &refs);
     }
     document.instances = instances;
+    let all = (0..document.instances.len()).collect::<Vec<_>>();
+    pin_reference_indices_to_ids(document, &all);
     Ok(MaterializedPackage {
         removals: planned_removals,
         settings_ids: new_settings_ids,
@@ -2209,6 +2211,8 @@ fn materialize_package_target(
         remap_internal_clone_refs_in_record(&mut instance.properties, &refs);
         remap_internal_clone_refs_in_record(&mut instance.attributes, &refs);
     }
+    let inserted = new_index_by_pkg.values().copied().collect::<Vec<_>>();
+    pin_reference_indices_to_ids(document, &inserted);
     if let Some(placement) = placement {
         let indexes = new_index_by_pkg.values().copied().collect::<Vec<_>>();
         transform_linked_model(document, &indexes, placement, false)?;
@@ -2265,6 +2269,40 @@ fn materialize_package_target(
         settings_ids: new_settings_ids,
         displaced,
     })
+}
+
+/// Package-internal references come out of the clone remap as bare
+/// `instanceIndex` values. A later reorder of the document rewrites indices
+/// from settings ids and drops index-only references, so give each one its
+/// target's settings id while the indices are still current.
+fn pin_reference_indices_to_ids(document: &mut SettingsBytecode, indexes: &[usize]) {
+    let ids = document
+        .instances
+        .iter()
+        .map(|instance| instance.settings_id.clone())
+        .collect::<Vec<_>>();
+    for index in indexes {
+        let Some(instance) = document.instances.get_mut(*index) else {
+            continue;
+        };
+        for record in [&mut instance.properties, &mut instance.attributes] {
+            crate::settings::bytecode::visit_reference_objects_mut(record, |object| {
+                let has_text_id = ["settingsId", "instanceId"]
+                    .into_iter()
+                    .any(|key| object.get(key).and_then(Value::as_str).is_some());
+                if has_text_id {
+                    return;
+                }
+                if let Some(id) = object
+                    .get("instanceIndex")
+                    .and_then(crate::settings::bytecode::settings_reference_index)
+                    .and_then(|index| ids.get(index))
+                {
+                    object.insert("settingsId".to_string(), Value::String(id.clone()));
+                }
+            });
+        }
+    }
 }
 
 fn unowned_target_files(target_dir: &Path, owned: &[PathBuf]) -> Result<Vec<PathBuf>> {
@@ -2524,6 +2562,20 @@ fn model_placement_delta(
     package: &SettingsBytecode,
     package_root: usize,
 ) -> Result<Option<LinkCFrame>> {
+    Ok(
+        placement_anchors(document, existing_root, package, package_root)?
+            .map(|(existing, source)| existing.then(source.inverse())),
+    )
+}
+
+/// The pair of CFrames that place the same model part in the target and in
+/// the package: the roots' pivots, or the first shared descendant with one.
+fn placement_anchors(
+    document: &SettingsBytecode,
+    existing_root: usize,
+    package: &SettingsBytecode,
+    package_root: usize,
+) -> Result<Option<(LinkCFrame, LinkCFrame)>> {
     let database =
         rbx_reflection_database::get().context("Roblox reflection database is unavailable")?;
     if !rbx_reflection_class_is_a(
@@ -2560,7 +2612,7 @@ fn model_placement_delta(
                 )
         })
     };
-    Ok(anchors.map(|(existing, source)| existing.then(source.inverse())))
+    Ok(anchors)
 }
 
 fn transform_linked_model(
@@ -2591,14 +2643,6 @@ fn transform_linked_model(
     Ok(())
 }
 
-fn quantize_linked_model(document: &mut SettingsBytecode, indexes: &[usize]) -> Result<()> {
-    let identity = LinkCFrame {
-        position: [0.0; 3],
-        rotation: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-    };
-    transform_linked_model(document, indexes, identity, true)
-}
-
 fn package_target_matches(
     document: &SettingsBytecode,
     service: &str,
@@ -2612,24 +2656,148 @@ fn package_target_matches(
     {
         return Ok(true);
     }
+    let Some((normalized_target, normalized_package)) =
+        placement_normalized_pair(document, service, target_segments, target_ordinals, package)?
+    else {
+        return Ok(false);
+    };
+    let target_text = target_fingerprint_text(
+        &normalized_target,
+        service,
+        target_segments,
+        target_ordinals,
+    )?;
+    let package_text = package_fingerprint_text(&normalized_package)?;
+    Ok(fingerprint_texts_match(
+        target_text.as_deref(),
+        &package_text,
+    ))
+}
+
+/// Comparison of two fingerprint texts where CFrame values may differ by
+/// float noise: a model placed elsewhere comes back through rigid transforms
+/// built from float32 rotations at world coordinates of thousands of studs,
+/// which moves parts by a few millimetres.
+fn fingerprint_texts_match(target: Option<&str>, package: &str) -> bool {
+    let Some(target) = target else {
+        return false;
+    };
+    let target_lines = target.lines().collect::<Vec<_>>();
+    let mut remaining: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut package_count = 0usize;
+    for line in package.lines() {
+        package_count += 1;
+        remaining
+            .entry(fingerprint_line_head(line))
+            .or_default()
+            .push(line);
+    }
+    if target_lines.len() != package_count {
+        return false;
+    }
+    target_lines.iter().all(|line| {
+        let Some(candidates) = remaining.get_mut(fingerprint_line_head(line)) else {
+            return false;
+        };
+        let Some(position) = candidates
+            .iter()
+            .position(|candidate| candidate == line || fingerprint_lines_match(line, candidate))
+        else {
+            return false;
+        };
+        candidates.swap_remove(position);
+        true
+    })
+}
+
+fn fingerprint_line_head(line: &str) -> &str {
+    line.split(";properties=").next().unwrap_or(line)
+}
+
+fn fingerprint_lines_match(left: &str, right: &str) -> bool {
+    let Some((left_head, left_props, left_attrs)) = split_fingerprint_line(left) else {
+        return false;
+    };
+    let Some((right_head, right_props, right_attrs)) = split_fingerprint_line(right) else {
+        return false;
+    };
+    left_head == right_head
+        && json_values_close(&left_props, &right_props)
+        && json_values_close(&left_attrs, &right_attrs)
+}
+
+fn split_fingerprint_line(line: &str) -> Option<(&str, Value, Value)> {
+    let (head, rest) = line.split_once(";properties=")?;
+    let (properties, attributes) = rest.rsplit_once(";attributes=")?;
+    Some((
+        head,
+        serde_json::from_str(properties).ok()?,
+        serde_json::from_str(attributes).ok()?,
+    ))
+}
+
+fn json_values_close(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Object(left), Value::Object(right)) => {
+            if left.get("_type") == Some(&Value::String("CFrame".to_string()))
+                && right.get("_type") == Some(&Value::String("CFrame".to_string()))
+                && let (Some(Value::Array(a)), Some(Value::Array(b))) =
+                    (left.get("components"), right.get("components"))
+                && a.len() == 12
+                && b.len() == 12
+            {
+                return a.iter().zip(b).enumerate().all(|(index, (x, y))| {
+                    match (x.as_f64(), y.as_f64()) {
+                        (Some(x), Some(y)) => (x - y).abs() <= if index < 3 { 0.02 } else { 0.001 },
+                        _ => x == y,
+                    }
+                });
+            }
+            left.len() == right.len()
+                && left.iter().all(|(key, value)| {
+                    right
+                        .get(key)
+                        .is_some_and(|other| json_values_close(value, other))
+                })
+        }
+        (Value::Array(left), Value::Array(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(value, other)| json_values_close(value, other))
+        }
+        _ => left == right,
+    }
+}
+
+/// A linked model may sit elsewhere in the consumer place. Moves the target
+/// back onto the package's placement and quantizes both sides so they can be
+/// compared; None when the target is missing or is not a placed model.
+fn placement_normalized_pair(
+    document: &SettingsBytecode,
+    service: &str,
+    target_segments: &[String],
+    target_ordinals: &[usize],
+    package: &SettingsBytecode,
+) -> Result<Option<(SettingsBytecode, SettingsBytecode)>> {
     let Some(existing_root) = resolve_editor_instance_by_path_ordinals(
         document,
         service,
         target_segments,
         target_ordinals,
     ) else {
-        return Ok(false);
+        return Ok(None);
     };
     let package_roots = settings_root_indices(package);
     if package_roots.len() != 1 {
-        return Ok(false);
+        return Ok(None);
     }
-    let Some(placement) =
-        model_placement_delta(document, existing_root, package, package_roots[0])?
+    let Some((existing_anchor, package_anchor)) =
+        placement_anchors(document, existing_root, package, package_roots[0])?
     else {
-        return Ok(false);
+        return Ok(None);
     };
-
     let mut normalized_target = document.clone();
     let children = settings_children_by_parent(&normalized_target);
     let mut target_subtree = Vec::new();
@@ -2637,21 +2805,18 @@ fn package_target_matches(
     transform_linked_model(
         &mut normalized_target,
         &target_subtree,
-        placement.inverse(),
+        existing_anchor.inverse(),
         true,
     )?;
-
     let mut normalized_package = package.clone();
     let package_indexes = (0..normalized_package.instances.len()).collect::<Vec<_>>();
-    quantize_linked_model(&mut normalized_package, &package_indexes)?;
-    Ok(package_target_fingerprint(
-        &normalized_target,
-        service,
-        target_segments,
-        target_ordinals,
-    )?
-    .as_deref()
-        == Some(package_document_fingerprint(&normalized_package)?.as_str()))
+    transform_linked_model(
+        &mut normalized_package,
+        &package_indexes,
+        package_anchor.inverse(),
+        true,
+    )?;
+    Ok(Some((normalized_target, normalized_package)))
 }
 
 struct PackageFingerprintRefs {
@@ -2791,6 +2956,10 @@ fn push_instance_subtree_fingerprint(
 }
 
 fn package_document_fingerprint(package: &SettingsBytecode) -> Result<String> {
+    Ok(fnv1a_hex(package_fingerprint_text(package)?.as_bytes()))
+}
+
+fn package_fingerprint_text(package: &SettingsBytecode) -> Result<String> {
     let children_by_parent = settings_children_by_parent(package);
     let mut out = String::new();
     let roots = package
@@ -2814,10 +2983,132 @@ fn package_document_fingerprint(package: &SettingsBytecode) -> Result<String> {
             &mut out,
         )?;
     }
-    Ok(fnv1a_hex(out.as_bytes()))
+    Ok(out)
 }
 
-fn package_target_fingerprint(
+/// Names the first instance whose fingerprint line differs between a link
+/// target and its package: the relative path, the class, and the differing
+/// stretch of the two property blobs.
+pub(crate) fn package_target_difference(
+    document: &SettingsBytecode,
+    service: &str,
+    target_segments: &[String],
+    target_ordinals: &[usize],
+    package: &SettingsBytecode,
+) -> Result<Option<String>> {
+    let normalized =
+        placement_normalized_pair(document, service, target_segments, target_ordinals, package)?;
+    let (document, package) = match &normalized {
+        Some((target, package)) => (target, package),
+        None => (document, package),
+    };
+    let Some(target) =
+        target_fingerprint_text(document, service, target_segments, target_ordinals)?
+    else {
+        return Ok(Some("target is missing".to_string()));
+    };
+    let package_text = package_fingerprint_text(package)?;
+    if fingerprint_texts_match(Some(&target), &package_text) {
+        return Ok(None);
+    }
+    let target_lines = target.lines().collect::<Vec<_>>();
+    let package_lines = package_text.lines().collect::<Vec<_>>();
+    if target_lines.len() != package_lines.len() {
+        return Ok(Some(format!(
+            "target has {} instances, package {}",
+            target_lines.len(),
+            package_lines.len()
+        )));
+    }
+    let package_set = package_lines.iter().copied().collect::<HashSet<_>>();
+    let target_set = target_lines.iter().copied().collect::<HashSet<_>>();
+    let unmatched = target_lines
+        .iter()
+        .filter(|line| {
+            !package_set.contains(*line)
+                && !package_lines
+                    .iter()
+                    .any(|candidate| fingerprint_lines_match(line, candidate))
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    if let Some(line) = unmatched.first() {
+        return Ok(Some(format!(
+            "{} of {} instances differ; first: {}",
+            unmatched.len(),
+            target_lines.len(),
+            describe_fingerprint_difference(line, &package_lines, "target", "package")
+        )));
+    }
+    if let Some(line) = package_lines
+        .iter()
+        .find(|line| !target_set.contains(*line))
+    {
+        return Ok(Some(describe_fingerprint_difference(
+            line,
+            &target_lines,
+            "package",
+            "target",
+        )));
+    }
+    Ok(None)
+}
+
+fn describe_fingerprint_difference(
+    line: &str,
+    others: &[&str],
+    side: &str,
+    other_side: &str,
+) -> String {
+    let prefix = line.split(";properties=").next().unwrap_or(line);
+    let Some(other) = others.iter().find(|candidate| {
+        candidate.starts_with(prefix) && candidate[prefix.len()..].starts_with(';')
+    }) else {
+        return format!("{side} only: {prefix}");
+    };
+    let (Some((_, props, attrs)), Some((_, other_props, other_attrs))) =
+        (split_fingerprint_line(line), split_fingerprint_line(other))
+    else {
+        return format!("{prefix}: {side} and {other_side} differ");
+    };
+    let mut parts = Vec::new();
+    for (label, left, right) in [
+        ("property", &props, &other_props),
+        ("attribute", &attrs, &other_attrs),
+    ] {
+        let (Value::Object(left), Value::Object(right)) = (left, right) else {
+            continue;
+        };
+        let mut keys = left.keys().chain(right.keys()).collect::<Vec<_>>();
+        keys.sort_unstable();
+        keys.dedup();
+        for key in keys {
+            let (a, b) = (left.get(key), right.get(key));
+            if a != b {
+                let show = |value: Option<&Value>| {
+                    value.map_or("absent".to_string(), |value| {
+                        let text = value.to_string();
+                        text.chars().take(160).collect()
+                    })
+                };
+                parts.push(format!(
+                    "{label} {key}: {side} {} vs {other_side} {}",
+                    show(a),
+                    show(b)
+                ));
+            }
+            if parts.len() >= 3 {
+                break;
+            }
+        }
+    }
+    if parts.is_empty() {
+        return format!("{prefix}: {side} and {other_side} differ");
+    }
+    format!("{prefix}: {}", parts.join("; "))
+}
+
+fn target_fingerprint_text(
     document: &SettingsBytecode,
     service: &str,
     target_segments: &[String],
@@ -2844,7 +3135,19 @@ fn package_target_fingerprint(
         &refs,
         &mut out,
     )?;
-    Ok(Some(fnv1a_hex(out.as_bytes())))
+    Ok(Some(out))
+}
+
+fn package_target_fingerprint(
+    document: &SettingsBytecode,
+    service: &str,
+    target_segments: &[String],
+    target_ordinals: &[usize],
+) -> Result<Option<String>> {
+    Ok(
+        target_fingerprint_text(document, service, target_segments, target_ordinals)?
+            .map(|text| fnv1a_hex(text.as_bytes())),
+    )
 }
 
 pub(crate) fn package_target_fingerprint_with_external_sources(
