@@ -993,6 +993,10 @@ fn live_sync_summary(status: &Value) -> Option<Value> {
             summary[key] = json!(true);
         }
     }
+    if object.get("mode").and_then(Value::as_str) == Some("verify") {
+        summary["mode"] = json!("verify");
+        summary["pushesPaused"] = json!(true);
+    }
     for key in ["error", "lastError", "lastErrorAt"] {
         if let Some(value) = object.get(key).filter(|value| !value.is_null()) {
             summary[key] = value.clone();
@@ -3584,6 +3588,21 @@ mod tests {
         let mut expected = package.clone();
         expected["verified"] = json!(false);
         assert_eq!(compact(package, false), expected);
+    }
+
+    #[test]
+    fn live_sync_summary_says_when_verify_mode_holds_pushes() {
+        let verify = live_sync_summary(&json!({
+            "running": true, "mode": "verify", "pendingPaths": ["a"]
+        }))
+        .unwrap();
+        assert_eq!(verify["mode"], json!("verify"));
+        assert_eq!(verify["pushesPaused"], json!(true));
+        assert_eq!(verify["pending"], json!(1));
+        let reconcile =
+            live_sync_summary(&json!({ "running": true, "mode": "reconcile" })).unwrap();
+        assert!(reconcile.get("pushesPaused").is_none());
+        assert!(reconcile.get("mode").is_none());
     }
 
     #[test]

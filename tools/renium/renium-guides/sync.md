@@ -41,7 +41,7 @@ rbx cfg set liveSync.initialSyncPriority reconcile
 rbx cfg set liveSync.initialConflictPreference none
 ```
 
-Initial modes: `reconcile` applies the comparison; `verify` only reports differences.
+Initial modes: `reconcile` applies the comparison; `verify` only reports differences and holds pushes until a side is chosen (`rbx status` shows `pushesPaused`); when nothing differs the session continues in reconcile.
 Conflict preferences: `none`, `studio`, `editor` (project files). A preference resolves ordinary conflicts, never direct PackageLink edits.
 
 ## Manual sync

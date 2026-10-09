@@ -146,10 +146,12 @@ impl Coordinator {
         );
         let configuration_changed = record.identity.fingerprint != identity.fingerprint;
         let obsolete_head = record.head.take().is_some();
+        let mode_changed = record.mode != mode
+            && !(mode == PairMode::Verify && record.mode == PairMode::Reconcile);
         let record_changed = record_missing
             || obsolete_head
             || record.identity != identity
-            || record.mode != mode
+            || mode_changed
             || record.conflict_preference != conflict_preference
             || record.runtime_settings != runtime_settings
             || !runtime_replaced
@@ -157,7 +159,7 @@ impl Coordinator {
                     || record.local_file_digest != current_local_file_digest);
         let requires_reconcile = record_missing
             || configuration_changed
-            || record.mode != mode
+            || mode_changed
             || record.conflict_preference != conflict_preference
             || !record.conflicts.is_empty()
             || runtime_replaced;
@@ -287,6 +289,7 @@ impl Coordinator {
             };
             let confirmed = read_studio_change_state(context, bridge)?;
             if checkpoint.matches_state(context, &confirmed) && differences.is_empty() {
+                continue_clean_verify(setup, &mut record);
                 record.note_setup(setup);
                 write_record(context, &setup.key, &record)?;
                 setup.resolution_required = false;
@@ -367,6 +370,7 @@ impl Coordinator {
                 record.resolution_required = false;
                 log_reconcile_timing("baseline write", phase);
             }
+            continue_clean_verify(setup, &mut record);
             record.note_setup(setup);
             record.studio_checkpoint =
                 reconciled_studio_checkpoint(context, bridge, &studio_state, &studio_guard);
@@ -462,14 +466,7 @@ impl Coordinator {
             return Ok(());
         }
 
-        if setup.mode == PairMode::Verify {
-            record.conflicts = verify_difference_lines(&changes.studio, &changes.editor);
-            record.resolution_required = false;
-            setup.error = Some(conflict_message(&record.conflicts[..1]));
-            setup.conflicts = record.conflicts.clone();
-            record.note_setup(setup);
-            write_record(context, &setup.key, &record)?;
-            setup.resolution_required = false;
+        if verify_mode_holds(context, setup, &mut record, &changes)? {
             return Ok(());
         }
 
@@ -1127,6 +1124,42 @@ fn record_pushed_baseline(
     };
     baseline.replace_scopes(Path::new(&context.root), key, &scopes, &pushed_content)?;
     write_record(context, key, record)
+}
+
+/// Verify only guards the first comparison; once it is clean the session
+/// writes like any other.
+fn continue_clean_verify(setup: &mut PairSetup, record: &mut PairRecord) {
+    if setup.mode == PairMode::Verify {
+        setup.mode = PairMode::Reconcile;
+        setup.error = None;
+    }
+    record.mode = setup.mode;
+}
+
+/// A session that starts in verify mode continues as reconcile when the first
+/// comparison finds nothing; otherwise it records the differing paths, holds
+/// pushes, and reports them.
+fn verify_mode_holds(
+    context: &BoundContext,
+    setup: &mut PairSetup,
+    record: &mut PairRecord,
+    changes: &MergeChanges,
+) -> Result<bool> {
+    if setup.mode != PairMode::Verify {
+        return Ok(false);
+    }
+    if changes.studio.is_empty() && changes.editor.is_empty() {
+        continue_clean_verify(setup, record);
+        return Ok(false);
+    }
+    record.conflicts = verify_difference_lines(&changes.studio, &changes.editor);
+    record.resolution_required = false;
+    setup.error = Some(conflict_message(&record.conflicts[..1]));
+    setup.conflicts = record.conflicts.clone();
+    record.note_setup(setup);
+    write_record(context, &setup.key, record)?;
+    setup.resolution_required = false;
+    Ok(true)
 }
 
 /// Verify mode records what reconcile would do, path by path, so
