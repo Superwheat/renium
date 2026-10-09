@@ -498,6 +498,15 @@ fn compact_push_summary(
         "ok".to_string(),
         summary.get("ok").cloned().unwrap_or(Value::Bool(true)),
     );
+    if summary.get("verifyOnly") == Some(&Value::Bool(true)) {
+        result.insert("verifyOnly".to_string(), Value::Bool(true));
+        for key in ["sourceVerified", "sourceVerifyFailed", "sourceVerifyErrors"] {
+            if let Some(value) = summary.get(key) {
+                result.insert(key.to_string(), value.clone());
+            }
+        }
+        return result;
+    }
     for key in [
         "historyId",
         "skippedByReview",
@@ -3527,6 +3536,20 @@ mod tests {
                 false
             ),
             json!({ "ok": true, "scripts": {"updated": 1}, "verified": false })
+        );
+        assert_eq!(
+            compact(
+                json!({
+                    "ok": false, "verifyOnly": true, "pushed": false,
+                    "sourceVerified": 2, "sourceVerifyFailed": 1,
+                    "sourceVerifyErrors": ["A differs"]
+                }),
+                false
+            ),
+            json!({
+                "ok": false, "verifyOnly": true, "sourceVerified": 2,
+                "sourceVerifyFailed": 1, "sourceVerifyErrors": ["A differs"]
+            })
         );
         assert_eq!(
             compact(

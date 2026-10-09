@@ -657,7 +657,31 @@ fn finish_studio_change_state_command(
             .get("error")
             .and_then(Value::as_str)
             .unwrap_or("Live Sync could not complete the requested operation");
-        bail!(error.to_string());
+        let differences = result
+            .pointer("/daemon/conflicts")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter(|line| line.starts_with("push: ") || line.starts_with("pull: "))
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if differences.is_empty() {
+            bail!(error.to_string());
+        }
+        if details {
+            bail!(
+                "{error}\n{}\nStudio differs on pull: paths, the files on push: paths; `rbx lon --prefer studio` or `rbx lon --prefer editor` reconciles",
+                differences.join("\n")
+            );
+        }
+        bail!(
+            "{error} ({} paths; `rbx lst --details` lists them as push:/pull:)",
+            differences.len()
+        );
     }
     if !details {
         if let Some(map) = result.as_object_mut() {

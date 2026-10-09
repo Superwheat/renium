@@ -466,6 +466,7 @@ impl Coordinator {
             record.conflicts = verify_difference_lines(&changes.studio, &changes.editor);
             record.resolution_required = false;
             setup.error = Some(conflict_message(&record.conflicts[..1]));
+            setup.conflicts = record.conflicts.clone();
             record.note_setup(setup);
             write_record(context, &setup.key, &record)?;
             setup.resolution_required = false;
