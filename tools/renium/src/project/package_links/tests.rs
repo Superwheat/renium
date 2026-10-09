@@ -2240,3 +2240,51 @@ fn real_moved_model_lines_match_within_tolerance() {
     assert!(fingerprint_lines_match(left, right));
     assert!(fingerprint_texts_match(Some(left), right));
 }
+
+#[test]
+fn pruning_keeps_the_target_path_and_sibling_ordinals() {
+    let mk = |id: &str, name: &str, class: &str, parent: Option<usize>| {
+        settings_instance(id, name, class, parent)
+    };
+    let document = settings_document(vec![
+        mk("editor:0", "ReplicatedStorage", "ReplicatedStorage", None),
+        mk("editor:1", "Other", "Folder", Some(0)),
+        mk("editor:2", "Widget", "Folder", Some(0)),
+        mk("editor:3", "Widget", "Folder", Some(0)),
+        mk("editor:4", "Inner", "Part", Some(3)),
+        mk("editor:5", "Unrelated", "Part", Some(1)),
+    ]);
+    let pruned = prune_to_target(
+        &document,
+        "ReplicatedStorage",
+        &["Widget".to_string()],
+        &[2],
+    )
+    .unwrap();
+    let names = pruned
+        .instances
+        .iter()
+        .map(|instance| instance.settings_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["editor:0", "editor:2", "editor:3", "editor:4"]);
+    let root = resolve_editor_instance_by_path_ordinals(
+        &pruned,
+        "ReplicatedStorage",
+        &["Widget".to_string()],
+        &[2],
+    )
+    .unwrap();
+    assert_eq!(pruned.instances[root].settings_id, "editor:3");
+    assert_eq!(pruned.instances[3].parent_index, Some(root));
+    assert_eq!(
+        package_target_fingerprint(
+            &document,
+            "ReplicatedStorage",
+            &["Widget".to_string()],
+            &[2]
+        )
+        .unwrap(),
+        package_target_fingerprint(&pruned, "ReplicatedStorage", &["Widget".to_string()], &[2])
+            .unwrap()
+    );
+}

@@ -1941,15 +1941,17 @@ fn materialize_package_root(
                     .context("link package is not in preorder (child precedes parent)")?,
             )
         };
-        let settings_id =
-            if let Some(settings_id) = identity.by_package_index.get(&package_index).cloned() {
-                if !existing_ids.insert(settings_id.clone()) {
-                    bail!("Package identity mapping produced duplicate settings id {settings_id}");
-                }
-                settings_id
-            } else {
-                next_editor_settings_id_fast(&mut existing_ids, &mut seed)
-            };
+        let settings_id = if let Some(settings_id) = identity
+            .by_package_index
+            .get(&package_index)
+            .filter(|settings_id| !existing_ids.contains(*settings_id))
+            .cloned()
+        {
+            existing_ids.insert(settings_id.clone());
+            settings_id
+        } else {
+            next_editor_settings_id_fast(&mut existing_ids, &mut seed)
+        };
         let new_index = instances.len();
         instances.push(SettingsBytecodeInstance {
             settings_id: settings_id.clone(),
@@ -2175,15 +2177,17 @@ fn materialize_package_target(
         } else {
             instance.name.clone()
         };
-        let settings_id =
-            if let Some(settings_id) = identity.by_package_index.get(&pkg_index).cloned() {
-                if !existing_ids.insert(settings_id.clone()) {
-                    bail!("Package identity mapping produced duplicate settings id {settings_id}");
-                }
-                settings_id
-            } else {
-                next_editor_settings_id_fast(&mut existing_ids, &mut seed)
-            };
+        let settings_id = if let Some(settings_id) = identity
+            .by_package_index
+            .get(&pkg_index)
+            .filter(|settings_id| !existing_ids.contains(*settings_id))
+            .cloned()
+        {
+            existing_ids.insert(settings_id.clone());
+            settings_id
+        } else {
+            next_editor_settings_id_fast(&mut existing_ids, &mut seed)
+        };
         let new_index = document.instances.len();
         document.instances.push(SettingsBytecodeInstance {
             settings_id: settings_id.clone(),
@@ -2348,6 +2352,65 @@ fn target_subtree(
 
 /// Files on disk are a script's source when they exist, so read-only checks
 /// compare the target with its script files read back into the store.
+/// A copy of the document holding only what a link target comparison reads:
+/// the chain from the service root to the target, the same-named siblings on
+/// that chain (so ordinals still resolve), and the target's whole subtree.
+/// Comparisons used to clone whole stores, which cost gigabytes on large
+/// places.
+fn prune_to_target(
+    document: &SettingsBytecode,
+    service: &str,
+    target_segments: &[String],
+    target_ordinals: &[usize],
+) -> Option<SettingsBytecode> {
+    let root = resolve_editor_instance_by_path_ordinals(
+        document,
+        service,
+        target_segments,
+        target_ordinals,
+    )?;
+    let children = settings_children_by_parent(document);
+    let mut chain = Vec::new();
+    let mut current = Some(root);
+    while let Some(index) = current {
+        chain.push(index);
+        current = document.instances[index].parent_index;
+    }
+    chain.reverse();
+    let mut keep = HashSet::new();
+    for (depth, index) in chain.iter().enumerate() {
+        keep.insert(*index);
+        if let Some(next) = chain.get(depth + 1) {
+            let name = &document.instances[*next].name;
+            for sibling in &children[*index] {
+                if document.instances[*sibling].name == *name {
+                    keep.insert(*sibling);
+                }
+            }
+        }
+    }
+    let mut subtree = Vec::new();
+    collect_settings_subtree_preorder(&children, root, &mut subtree);
+    keep.extend(subtree);
+    let mut new_index = HashMap::with_capacity(keep.len());
+    let mut instances = Vec::with_capacity(keep.len());
+    for (index, instance) in document.instances.iter().enumerate() {
+        if !keep.contains(&index) {
+            continue;
+        }
+        new_index.insert(index, instances.len());
+        let mut instance = instance.clone();
+        instance.parent_index = instance
+            .parent_index
+            .and_then(|parent| new_index.get(&parent).copied());
+        instances.push(instance);
+    }
+    Some(SettingsBytecode {
+        version: document.version,
+        instances,
+    })
+}
+
 fn inline_target_sources(
     document: &SettingsBytecode,
     service: &str,
@@ -2355,7 +2418,14 @@ fn inline_target_sources(
     target_segments: &[String],
     target_ordinals: &[usize],
 ) -> Result<SettingsBytecode> {
-    let mut normalized = document.clone();
+    let Some(mut normalized) = prune_to_target(document, service, target_segments, target_ordinals)
+    else {
+        return Ok(SettingsBytecode {
+            version: document.version,
+            instances: Vec::new(),
+        });
+    };
+    let document = &normalized.clone();
     let Some(subtree) = target_subtree(document, service, target_segments, target_ordinals) else {
         return Ok(normalized);
     };
@@ -2652,6 +2722,10 @@ fn package_target_matches(
     package: &SettingsBytecode,
     package_fingerprint: &str,
 ) -> Result<bool> {
+    let Some(pruned) = prune_to_target(document, service, target_segments, target_ordinals) else {
+        return Ok(false);
+    };
+    let document = &pruned;
     if package_target_fingerprint(document, service, target_segments, target_ordinals)?.as_deref()
         == Some(package_fingerprint)
     {
@@ -2684,25 +2758,41 @@ fn fingerprint_texts_match(target: Option<&str>, package: &str) -> bool {
         return false;
     };
     let target_lines = target.lines().collect::<Vec<_>>();
-    let mut remaining: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut exact: HashMap<&str, usize> = HashMap::new();
     let mut package_count = 0usize;
     for line in package.lines() {
         package_count += 1;
-        remaining
-            .entry(fingerprint_line_head(line))
-            .or_default()
-            .push(line);
+        *exact.entry(line).or_default() += 1;
     }
     if target_lines.len() != package_count {
         return false;
     }
-    target_lines.iter().all(|line| {
+    let mut leftovers = Vec::new();
+    for line in &target_lines {
+        match exact.get_mut(line) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => leftovers.push(*line),
+        }
+    }
+    if leftovers.is_empty() {
+        return true;
+    }
+    let mut remaining: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (line, count) in exact {
+        if count > 0 {
+            remaining
+                .entry(fingerprint_line_head(line))
+                .or_default()
+                .extend(std::iter::repeat_n(line, count));
+        }
+    }
+    leftovers.iter().all(|line| {
         let Some(candidates) = remaining.get_mut(fingerprint_line_head(line)) else {
             return false;
         };
         let Some(position) = candidates
             .iter()
-            .position(|candidate| candidate == line || fingerprint_lines_match(line, candidate))
+            .position(|candidate| fingerprint_lines_match(line, candidate))
         else {
             return false;
         };
@@ -2942,7 +3032,7 @@ fn push_instance_subtree_fingerprint(
         out.push_str(";class=");
         out.push_str(&serde_json::to_string(&instance.class_name)?);
         out.push_str(";properties=");
-        push_package_fingerprint_map(&instance.properties, refs, out)?;
+        push_package_fingerprint_map(&fingerprint_relevant(&instance.properties), refs, out)?;
         out.push_str(";attributes=");
         push_package_fingerprint_map(&instance.attributes, refs, out)?;
         out.push('\n');
@@ -2954,6 +3044,20 @@ fn push_instance_subtree_fingerprint(
         }
     }
     Ok(())
+}
+
+/// An empty BinaryString is what the engine writes for an unset blob
+/// (SerializedOverrides on a Model); stores drop it on one side and keep it
+/// on the other, so it never counts as a difference.
+fn fingerprint_relevant(properties: &Map<String, Value>) -> Map<String, Value> {
+    properties
+        .iter()
+        .filter(|(_, value)| {
+            !(value.get("_type") == Some(&Value::String("BinaryString".to_string()))
+                && value.get("base64").and_then(Value::as_str) == Some(""))
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
 }
 
 fn package_document_fingerprint(package: &SettingsBytecode) -> Result<String> {
@@ -2997,6 +3101,10 @@ pub(crate) fn package_target_difference(
     target_ordinals: &[usize],
     package: &SettingsBytecode,
 ) -> Result<Option<String>> {
+    let Some(pruned) = prune_to_target(document, service, target_segments, target_ordinals) else {
+        return Ok(Some("target is missing".to_string()));
+    };
+    let document = &pruned;
     let normalized =
         placement_normalized_pair(document, service, target_segments, target_ordinals, package)?;
     let (document, package) = match &normalized {
@@ -3023,13 +3131,26 @@ pub(crate) fn package_target_difference(
     }
     let package_set = package_lines.iter().copied().collect::<HashSet<_>>();
     let target_set = target_lines.iter().copied().collect::<HashSet<_>>();
+    let mut package_by_head: HashMap<&str, Vec<&str>> = HashMap::new();
+    for line in &package_lines {
+        if !target_set.contains(line) {
+            package_by_head
+                .entry(fingerprint_line_head(line))
+                .or_default()
+                .push(line);
+        }
+    }
     let unmatched = target_lines
         .iter()
         .filter(|line| {
             !package_set.contains(*line)
-                && !package_lines
-                    .iter()
-                    .any(|candidate| fingerprint_lines_match(line, candidate))
+                && !package_by_head
+                    .get(fingerprint_line_head(line))
+                    .is_some_and(|candidates| {
+                        candidates
+                            .iter()
+                            .any(|candidate| fingerprint_lines_match(line, candidate))
+                    })
         })
         .copied()
         .collect::<Vec<_>>();

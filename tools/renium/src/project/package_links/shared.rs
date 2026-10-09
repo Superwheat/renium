@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -31,9 +31,10 @@ use super::commands::{
 };
 use super::{
     LinkEntry, LinkManifest, LinkSource, LinkTargetRef, RENIUM_STORE_EXTENSION,
-    inline_target_sources, is_package_path, link_manifest_path, link_slug,
-    link_target_document_selector_parts, link_target_ordinals, link_target_ref_key,
-    link_target_segments, package_document_fingerprint, package_target_matches, read_link_manifest,
+    canonicalize_loaded_settings_documents, inline_target_sources, is_package_path,
+    link_manifest_path, link_slug, link_target_document_selector_parts, link_target_ordinals,
+    link_target_ref_key, link_target_segments, package_document_fingerprint,
+    package_target_difference, package_target_matches, read_link_manifest,
     resolve_link_target_storage, selector_starts_with, stray_target_files,
     target_has_inline_scripts, validate_link_target_ref, write_link_manifest,
 };
@@ -82,6 +83,33 @@ struct LinkedTarget {
 }
 
 impl LinkedTarget {
+    fn drift_detail(&self, package: &SettingsBytecode) -> Result<Option<String>> {
+        let (service, segments, ordinals) = (&self.service, &self.segments, &self.ordinals);
+        let inlined = inline_target_sources(
+            &self.document,
+            service,
+            &self.service_dir,
+            segments,
+            ordinals,
+        )?;
+        if target_has_inline_scripts(&self.document, service, segments, ordinals) {
+            return Ok(Some(
+                "a script keeps its source inside the store".to_string(),
+            ));
+        }
+        let stray = stray_target_files(
+            &self.document,
+            service,
+            &self.service_dir,
+            segments,
+            ordinals,
+        )?;
+        if let Some(path) = stray.first() {
+            return Ok(Some(format!("stray file {}", path.display())));
+        }
+        package_target_difference(&inlined, service, segments, ordinals, package)
+    }
+
     fn state(&self, package: &SettingsBytecode, fingerprint: &str) -> Result<ConsumerState> {
         let (service, segments, ordinals) = (&self.service, &self.segments, &self.ordinals);
         let inlined = inline_target_sources(
@@ -250,7 +278,14 @@ fn read_linked_target(links: &PlaceLinks, target: &LinkTargetRef) -> Result<Opti
     let Some(settings_file) = storage.settings_file.as_ref().filter(|path| path.is_file()) else {
         return Ok(None);
     };
-    let document = SettingsBytecode::read_file(settings_file)?;
+    let mut documents = HashMap::from([(
+        settings_file.clone(),
+        SettingsBytecode::read_file(settings_file)?,
+    )]);
+    canonicalize_loaded_settings_documents(&mut documents)?;
+    let document = documents
+        .remove(settings_file)
+        .context("Settings store vanished while loading")?;
     let (service, segments, ordinals) = link_target_document_selector_parts(
         &target.service,
         &link_target_segments(target),
@@ -388,6 +423,29 @@ fn consumer_state(
         state = Some(state.map_or(target_state, |state: ConsumerState| state.max(target_state)));
     }
     Ok(state.map(|state| (links, state)))
+}
+
+/// What the status compares when it reports drift: the first differing
+/// instance of the first drifting target, computed on the same inlined copy.
+fn consumer_drift_detail(
+    links: &PlaceLinks,
+    layout: &ExperienceLayout,
+    place: &ExperiencePlace,
+    id: &str,
+    package: &SettingsBytecode,
+) -> Result<Option<String>> {
+    let Some(link) = consumer_link(layout, place, &links.manifest, id) else {
+        return Ok(None);
+    };
+    for target in &link.targets {
+        let Some(linked) = read_linked_target(links, target)? else {
+            return Ok(Some("target is missing".to_string()));
+        };
+        if let Some(detail) = linked.drift_detail(package)? {
+            return Ok(Some(detail));
+        }
+    }
+    Ok(None)
 }
 
 fn consumer_apply_args(place_root: &Path, id: &str) -> LinkApplyArgs {
@@ -578,13 +636,20 @@ fn status_entry(layout: &ExperienceLayout, link: &SharedLinkRecord, skip: Option
     };
     let mut places = Map::new();
     let mut errors = Map::new();
+    let mut drift = Map::new();
     for place in &layout.places {
         if place.alias == link.source || skip == Some(place.alias.as_str()) {
             continue;
         }
         match consumer_state(layout, place, &link.id, &package, &fingerprint) {
-            Ok(Some((_, state))) => {
+            Ok(Some((links, state))) => {
                 places.insert(place.alias.clone(), json!(state.name()));
+                if state == ConsumerState::Drift
+                    && let Ok(Some(detail)) =
+                        consumer_drift_detail(&links, layout, place, &link.id, &package)
+                {
+                    drift.insert(place.alias.clone(), json!(detail));
+                }
             }
             Ok(None) => {}
             Err(error) => {
@@ -593,6 +658,9 @@ fn status_entry(layout: &ExperienceLayout, link: &SharedLinkRecord, skip: Option
         }
     }
     entry.insert("places".to_string(), Value::Object(places));
+    if !drift.is_empty() {
+        entry.insert("drift".to_string(), Value::Object(drift));
+    }
     if !errors.is_empty() {
         entry.insert("errors".to_string(), Value::Object(errors));
     }

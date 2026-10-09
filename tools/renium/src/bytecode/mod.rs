@@ -3088,14 +3088,7 @@ pub(super) fn acquire_settings_file_lock(settings_file: &Path) -> Result<Setting
                 });
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                if attempt > 60
-                    && let Ok(metadata) = fs::metadata(&lock_path)
-                    && metadata
-                        .modified()
-                        .ok()
-                        .and_then(|modified| modified.elapsed().ok())
-                        .is_some_and(|age| age > Duration::from_secs(30))
-                {
+                if attempt > 10 {
                     let owner_alive = fs::read_to_string(&lock_path)
                         .ok()
                         .and_then(|content| {
