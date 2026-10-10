@@ -218,6 +218,15 @@ impl ProcessMemory {
         Self::open_with_access(pid, 0)
     }
 
+    /// The audio helper hooks the Windows audio render client's vtable and
+    /// touches no engine structure, so it stays available on builds the
+    /// engine-bound helpers are not verified on.
+    fn open_for_windows_audio(pid: u32) -> Result<Self> {
+        let mut memory = Self::open_with_access(pid, 0)?;
+        memory.verified = true;
+        Ok(memory)
+    }
+
     fn open_with_access(pid: u32, additional: u32) -> Result<Self> {
         let verified = native_writes_verified(pid);
         let access = PROCESS_CREATE_THREAD

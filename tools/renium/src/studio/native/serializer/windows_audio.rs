@@ -43,7 +43,7 @@ impl AudioOutputGate {
             FreeLibrary(local);
         }
         let entry = entry.context("Studio audio helper has no entry point")?;
-        let process = ProcessMemory::open(pid)?;
+        let process = ProcessMemory::open_for_windows_audio(pid)?;
         let base = ensure_library_loaded(pid, &process, &modules(pid)?, 5_000, &path)?;
         Ok(Self {
             process,
