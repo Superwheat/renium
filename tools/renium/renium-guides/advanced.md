@@ -58,7 +58,7 @@ output devices report an error instead of muting the system output.
 
 ## Save and publish state
 
-Synced work is in the project files and the open Studio session. `rbx status` reports `teamCreate` and `placeVersion` for the selected Edit place: with Team Create, Studio saves every edit to Roblox itself, scripts included, and other collaborators' Studios receive it; without it, only File > Save to Roblox or a publish does, and Renium cannot see whether that happened. Players get changes only from a publish. When a collaborator in Studio still sees old behaviour, the code is the suspect, not the sync: `rbx oc fetch` downloads the cloud copy to check what it holds. Report what is synced and whether you published; don't call the place saved or unsaved. Offer `rbx publish` when the user wants the changes live.
+Synced work is in the project files and the open Studio session. `rbx status` reports `teamCreate` and `placeVersion` for the selected Edit place: with Team Create, Studio saves every edit to Roblox itself, scripts included, and other collaborators' Studios receive it; without it, only File > Save to Roblox or a publish does, and Renium cannot see whether that happened. Team Create reverts a reparent out of Workspace.Terrain within a second (a pull then shows the old parent); move such instances with Clone to the new parent plus Destroy of the original. Players get changes only from a publish. When a collaborator in Studio still sees old behaviour, the code is the suspect, not the sync: `rbx oc fetch` downloads the cloud copy to check what it holds. Report what is synced and whether you published; don't call the place saved or unsaved. Offer `rbx publish` when the user wants the changes live.
 
 ## Publishing places
 

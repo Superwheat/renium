@@ -10,6 +10,10 @@
 - Places that follow a shared link get the scripts as read-only files under the shared root, as in the source place, and files there that the package does not contain are moved to `.renium/link-replaced/ID/` (listed as `replacedFiles`, counted per place as `replaced`) instead of stopping the update.
 - A Roblox PackageLink directly under a shared root is left out of the package and reported as `strippedPackageLinks`, together with the `rbx upl` command that unlinks it in the source place. Packages nested deeper, such as TopbarPlus, travel unchanged.
 
+### Notes
+
+- Team Create reverts a script reparent out of Workspace.Terrain within a second, so a pull right after shows the old parent; the guide now says to move such instances with Clone plus Destroy.
+
 ### Bug fixes
 
 - Pushes no longer crash Studio 0.742 (Windows exception c0000374). Renium hooks Studio's change-history recording for Terrain cancellations and token-based recordings; that hook was verified on 0.741 and corrupts 0.742's heap on the first recording that passes through it. The hook is now installed only on builds it is verified on (0.741 and older); newer builds skip it and cancellations restore Terrain explicitly. The first symptom was a crash during the automatic package desync, because package pushes are the common case that registers a recording before writing.
