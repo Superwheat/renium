@@ -108,7 +108,64 @@ fn native_snapshots_and_capture_reject_unknown_builds_before_discovery() {
 fn native_gate_preserves_the_windows_audio_exemption() -> Result<()> {
     let pid = std::process::id();
     assert!(!ProcessMemory::open(pid)?.verified);
-    ProcessMemory::open_for_windows_audio(pid)?.ensure_writes_verified()
+    let audio = ProcessMemory::open_for_windows_audio(pid)?;
+    audio.ensure_writes_verified()?;
+    // Keep the exempt handle alive while reopening for an engine operation.
+    // Neither the audio permission nor the once-per-PID warning grants access.
+    for _ in 0..2 {
+        assert!(!ProcessMemory::open(pid)?.verified);
+    }
+    Ok(())
+}
+
+/// Run only against an owned scratch Studio, never a working place:
+/// `RENIUM_PROBE_PID=PID RENIUM_PROBE_PLACE=PATH cargo test
+/// live_unverified_studio_snapshot_gate -- --ignored --nocapture`.
+#[test]
+#[ignore = "requires an explicitly selected scratch Studio on an unverified build"]
+fn live_unverified_studio_snapshot_gate() -> Result<()> {
+    let pid: u32 = std::env::var("RENIUM_PROBE_PID")?.parse()?;
+    let place = fs::canonicalize(std::env::var("RENIUM_PROBE_PLACE")?)?;
+    let title = crate::studio::input::studio_window_title(pid)?;
+    let title_place = title
+        .strip_suffix(" - Roblox Studio")
+        .context("Expected a local scratch place window")?;
+    assert_eq!(fs::canonicalize(title_place)?, place);
+    let build = studio_build_number(pid)?;
+    assert!(
+        !native_build_verified(build),
+        "Studio 0.{build} is verified"
+    );
+    let output = place.with_file_name("snapshot-gate-refused.rbxl");
+    assert!(!output.exists());
+    let helper_modules = || -> Result<Vec<PathBuf>> {
+        Ok(modules(pid)?
+            .into_iter()
+            .filter(|module| module.name.starts_with("renium-studio-helper-"))
+            .map(|module| module.path)
+            .collect())
+    };
+    assert!(helper_modules()?.is_empty(), "Use a fresh scratch Studio");
+    let before = fs::read(&place)?;
+    // Opening the audio-exempt handle does not invoke or install an audio hook.
+    let audio = ProcessMemory::open_for_windows_audio(pid)?;
+    audio.ensure_writes_verified()?;
+    for attempt in 1..=2 {
+        for result in [
+            write_live_place(pid, &title, &output),
+            write_live_service(pid, &title, "Workspace", &output),
+        ] {
+            assert_eq!(result.err().unwrap().to_string(), NATIVE_WRITES_DISABLED);
+        }
+        assert!(!output.exists());
+        assert!(helper_modules()?.is_empty());
+        println!(
+            "pid={pid} build=0.{build} attempt={attempt}: place/service snapshots refused, no helper loaded"
+        );
+    }
+    assert_eq!(fs::read(&place)?, before);
+    assert_eq!(crate::studio::input::studio_window_title(pid)?, title);
+    Ok(())
 }
 
 #[test]

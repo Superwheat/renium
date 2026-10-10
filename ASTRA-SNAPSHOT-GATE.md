@@ -6,7 +6,7 @@ Branch: `astra/snapshot-gate`, based on `main` at `48c63cd4`.
 
 The Windows mutation boundary is now shared by all remote-thread starts, including attribute observation. Place/service snapshots and native capture reject unverified builds before engine discovery. DLL loading checks compatibility before its resident-module fast path, and attribute observation checks before duplicating handles. The process handle is acquired before the build decision, preventing PID reuse between that decision and mutation. Read-only process inspection and the existing Windows audio exemption remain available.
 
-`write_editor_place_snapshot` already catches native errors and performs the plugin export, retaining the supplied base-place merge. No publishing or fallback serialization logic was replaced. Snapshot success/fallback logs now identify the target PID and title; gate warnings identify the PID.
+`write_editor_place_snapshot` already catches native errors and performs the plugin export, retaining the supplied base-place merge. No publishing or fallback serialization logic was replaced. Snapshot success/fallback logs now identify the target PID, resolved Studio build and title; gate warnings identify the PID.
 
 | Audited Windows surface | Result |
 | --- | --- |
@@ -21,11 +21,19 @@ The Windows mutation boundary is now shared by all remote-thread starts, includi
 
 Scope remains the existing Windows cutoff. The macOS files use a separate resident-helper socket protocol and were audited but not changed or tested here.
 
-**The incident's exact cause is not established.** At the supplied base revision, `write_live_snapshot` already allocated, wrote and ran through gated primitives. Attribute observation's direct thread call followed gated allocation/write; a cached DLL alone could not bypass the snapshot's later allocation gate. The two successful log entries at 10:18:58Z and 10:19:10Z contain neither PID nor executable identity. Both 0.741 and 0.742 Studio executables exist on disk; the 0.742 file's fixed minor version is correctly 742. These findings justify hardening the boundaries, but do not prove how those historical requests passed the gate. The running target and daemon image need correlation before calling this incident resolved.
+## Cause of the apparent gate bypass
+
+**The reported incident process was Studio 0.741, not 0.742.** Windows process metadata for PID `48516` identifies `C:\Users\Superwheat\AppData\Local\Roblox\Versions\version-76e1a02649ad4f35\RobloxStudioBeta.exe`, whose file/product version is `0, 741, 19, 7411056` and fixed minor version is `741`. Its creation time is `2026-10-10T08:57:39.1465690Z`, matching the incident transcript's `10:57:39` local start time. This is the same process, not a subsequently reused PID. Only WMI process metadata and the executable file were read for this identification; no Studio command, process-memory read, debugger attachment or mutation targeted DTE or Baseplate.
+
+The two requests at `10:18:58Z` and `10:19:10Z` were the recorded dry-run and actual Publish As for place `127769757912519`. Build `741` passes the existing `build <= 741` gate. The newer installed executable, `version-9b554450a0fc4e65`, is `0, 742, 0, 7421053`; its existence and other processes' unlabelled rejection warnings do not establish that the incident process ran it. `git=fa8a07de434e` identifies the daemon build, not the Studio build.
+
+The live daemon is PID `28920`, started at `08:51:22Z`. Read-only comparison of its loaded gate, process-open, build-reader and snapshot machine code against its installed executable found identical bytes. The installed code calls the gate from process-open, reads the selected process's executable version, and rejects build `742` and above. Its SHA-256 is `5AFBB1DDC9BBC8B60D62983F50F680364ED73271D2271B7342E63E0B9575B54A`.
+
+There is no demonstrated 0.742 bypass to repair or reason to change the cutoff. The earlier boundary hardening remains, and the follow-up adds the resolved build to diagnostics and a live regression covering repeated 0.742 snapshots with an audio-exempt handle alive. The historical snapshot lines contain no PID, so they cannot independently prove which process each call selected; they also cannot support the original claim that native serialization ran on 0.742.
 
 ## Could the snapshot explain the hang?
 
-Yes, plausibly; causation is unproven. `ReniumRun` in `native/renium_studio_helper.cpp` submits a task to Studio's DataModel queue, changes native owner reference counts, invokes Studio's serializer using discovered addresses/layouts, allocates streams/buffers, and writes the snapshot from inside Studio. Place mode skips the separate context-builder/root-collector calls, matching the zero context/root timings in the logs. ABI/layout errors can corrupt memory even when a valid file is produced; successful serialization does not validate subsequent heap integrity.
+Yes, plausibly; causation is unproven, including on the incident's actual 0.741 build. A compatibility cutoff is not proof that a snapshot cannot hang after Play stops. `ReniumRun` in `native/renium_studio_helper.cpp` submits a task to Studio's DataModel queue, changes native owner reference counts, invokes Studio's serializer using discovered addresses/layouts, allocates streams/buffers, and writes the snapshot from inside Studio. Place mode skips the separate context-builder/root-collector calls, matching the zero context/root timings in the logs. ABI/layout errors can corrupt memory even when a valid file is produced; successful serialization does not validate subsequent heap integrity. The hang itself was not investigated inside the protected Studio process.
 
 Normally the task, references, buffers, event and request allocation are released. The helper DLL remains loaded: this path never unloads it. Snapshot execution itself installs no persistent hook or observer. On timeout, cancellation cannot interrupt an engine call already running; queued/running work can outlive the caller. Pre-existing hooks from other helper operations are separate.
 
@@ -34,8 +42,12 @@ For the owner inspecting PID 48516: preserve a full dump and module identities, 
 ## Verification
 
 - `cargo fmt`: passed.
-- `cargo test`: 760 unit tests and 1 integration test passed; 16 existing tests ignored. Five new tests cover the build boundary, mutation/thread refusal, cold/resident loaders, snapshot/capture refusal for unknown builds, and the audio exemption.
+- `cargo build`: passed (development build; no installation).
+- `cargo test`: 760 unit tests and 1 integration test passed; 17 tests ignored by default. The audio exemption test now also checks repeated engine opens while the exempt handle remains alive.
 - `cargo clippy --all-targets -- -D warnings -D clippy::cognitive_complexity -D clippy::too_many_arguments`: passed.
-- Test fixtures ran under `E:\Documents\rblx\renium-cleanup-test\snapshot-gate-unit-tests`; owned artifacts were cleaned. An initial run under this checkout inherited its unrelated package-link configuration and failed two tests; the isolated full rerun passed.
+- The new ignored `live_unverified_studio_snapshot_gate` regression was explicitly run and passed against scratch PID `3260`, opened with `rbx so` from a copy of `E:\Documents\rblx\renium-cleanup-test\detach-test\detach.rbxl`. Its executable was `version-9b554450a0fc4e65\RobloxStudioBeta.exe`, version `0, 742, 0, 7421053`; the production build reader returned `742`.
+- Both `write_live_place` (the native Publish As snapshot path) and `write_live_service` returned the exact native-disabled error on two consecutive attempts while an audio-exempt process handle remained open. No engine helper DLL was loaded, no output snapshot was created, and the source place stayed byte-for-byte unchanged. Studio remained responsive and only scratch PID `3260` was closed afterward.
+- These live calls used the newly compiled test executable from this checkout. The installed executable and daemon remained unchanged. The complete daemon/plugin-export route was not exercised: the sandbox's Windows account cannot decrypt the shared daemon credential (`Private Renium credential protection failed: Key not valid for use in specified state`). No authentication workaround was used.
+- Follow-up artifacts used the dedicated `.snapshot-gate-checks` directory in this writable checkout, with an empty project boundary isolating unit fixtures from the parent project's package links. Owned scratch files and test artifacts were removed after verification.
 
-No Studio window was opened, inspected or closed. No live plugin-export/publish test was run. The installed executable and running daemon were left unchanged; no install scripts or push were performed.
+No installation, daemon restart, publishing or push was performed. DTE and Baseplate received no Studio operations.

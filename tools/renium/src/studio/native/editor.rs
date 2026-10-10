@@ -3504,10 +3504,13 @@ fn write_editor_place_snapshot(
     if try_native && path_extension_is(output_path, &["rbxl"]) {
         let pid = studio_pid_for_bridge(bridge)?;
         let title = studio_title_for_bridge(bridge, pid)?;
+        let build = serializer::studio_build_number(pid)
+            .map(|build| format!("0.{build}"))
+            .unwrap_or_else(|_| "unknown".into());
         match serializer::write_live_place(pid, &title, output_path) {
             Ok(snapshot) => {
                 eprintln!(
-                    "[renium] native snapshot: pid={pid} title={title:?} total={:.1}ms trace={:.1}ms discover={:.1}ms helper={:.1}ms invoke={:.1}ms validate={:.1}ms context={:.1}ms roots={:.1}ms serialize={:.1}ms write={:.1}ms bytes={}",
+                    "[renium] native snapshot: pid={pid} build={build} title={title:?} total={:.1}ms trace={:.1}ms discover={:.1}ms helper={:.1}ms invoke={:.1}ms validate={:.1}ms context={:.1}ms roots={:.1}ms serialize={:.1}ms write={:.1}ms bytes={}",
                     snapshot.elapsed_ms,
                     snapshot.trace_ms,
                     snapshot.discover_ms,
@@ -3524,7 +3527,7 @@ fn write_editor_place_snapshot(
             }
             Err(error) => {
                 eprintln!(
-                    "[renium] native snapshot unavailable for pid={pid} title={title:?}; using Studio export fallback: {error:#}"
+                    "[renium] native snapshot unavailable for pid={pid} build={build} title={title:?}; using Studio export fallback: {error:#}"
                 );
             }
         }
