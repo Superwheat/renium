@@ -3,6 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+
+use crate::automation::commands::daemon_result;
+use crate::automation::op;
 use serde_json::{Value, json};
 use walkdir::WalkDir;
 
@@ -473,12 +476,168 @@ pub(crate) fn desync_package_link_command(
     let target = args.target;
     let (settings_file, settings_id) =
         projected_instance_store(project, &target, args.override_packages)?;
+    let segments =
+        stored_instance_segments(&settings_file, &target.service, settings_id.as_deref())?;
+    let studio = unlink_package_in_studio(project, &target.service, &segments)?;
+    if let Some(studio) = &studio
+        && live_sync_running(project)?
+    {
+        return crate::app::output::print_json_output(
+            &json!({
+                "ok": true,
+                "studio": studio,
+                "files": "Live Sync pulls the unlinked package into the project",
+            }),
+            false,
+        );
+    }
+    if let Some(studio) = &studio {
+        crate::app::output::log_global(
+            3,
+            format_args!("[renium] package unlinked in Studio: {studio}"),
+        );
+        if !store_has_package_link(&settings_file, settings_id.as_deref())? {
+            return crate::app::output::print_json_output(
+                &json!({ "ok": true, "studio": studio, "files": "already unlinked" }),
+                false,
+            );
+        }
+    }
     bytecode_desync_package_link(BytecodeDesyncPackageLinkArgs {
         input: BytecodeFileArgs::settings_file(settings_file),
         service: target.service,
         selector: BytecodeInstanceSelectorArgs::by_settings_id(settings_id),
         pretty: false,
     })
+}
+
+fn store_has_package_link(settings_file: &Path, settings_id: Option<&str>) -> Result<bool> {
+    let document = SettingsBytecode::read_file(settings_file)?;
+    let Some(settings_id) = settings_id else {
+        return Ok(false);
+    };
+    let Some(index) = document
+        .instances
+        .iter()
+        .position(|instance| instance.settings_id == settings_id)
+    else {
+        return Ok(false);
+    };
+    Ok(document.instances.iter().any(|instance| {
+        instance.parent_index == Some(index) && instance.class_name == "PackageLink"
+    }))
+}
+
+fn stored_instance_segments(
+    settings_file: &Path,
+    service: &str,
+    settings_id: Option<&str>,
+) -> Result<Vec<String>> {
+    let document = SettingsBytecode::read_file(settings_file)?;
+    let Some(settings_id) = settings_id else {
+        return Ok(Vec::new());
+    };
+    let index = document
+        .instances
+        .iter()
+        .position(|instance| instance.settings_id == settings_id)
+        .with_context(|| format!("{settings_id} is not in the {service} store"))?;
+    let paths = build_editor_instance_paths(&document, service);
+    let mut segments = paths
+        .get(index)
+        .and_then(Option::as_ref)
+        .map(|path| path.path_segments.clone())
+        .unwrap_or_default();
+    if segments.first().is_some_and(|first| first == service) {
+        segments.remove(0);
+    }
+    Ok(segments)
+}
+
+/// Destroys the PackageLink under the target in the connected edit Studio;
+/// Studio does not let a plugin reparent a PackageLink, but destroying it is
+/// how Unlink from Package works. None when no Studio holds the place.
+fn unlink_package_in_studio(
+    project: Option<&Path>,
+    service: &str,
+    segments: &[String],
+) -> Result<Option<String>> {
+    let lua_strings = segments
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .join(", ");
+    let code = format!(
+        "local inst = game:GetService({service}) for _, name in ipairs({{{lua_strings}}}) do inst = inst:FindFirstChild(name) if not inst then return {{ found = false, missing = name }} end end local link = inst:FindFirstChildOfClass('PackageLink') if not link then return {{ found = true, link = false }} end link:Destroy() return {{ found = true, link = true, removed = inst:FindFirstChildOfClass('PackageLink') == nil, path = inst:GetFullName() }}",
+        service = serde_json::to_string(service)?,
+    );
+    let bridge = crate::cli::BridgeConnectionArgs::local(8.0);
+    let result = match daemon_result(
+        op::LUAU,
+        project,
+        json!({
+            "code": code,
+            "edit": true,
+            "timeout": 30.0,
+            "bridgeWaitSeconds": bridge.wait_seconds,
+            "bridgePorts": bridge.ports,
+        }),
+        false,
+        Some(&bridge),
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            let text = format!("{error:#}");
+            if text.contains("No Studio runtime") || text.contains("no_studio") {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+    };
+    let outcome = result
+        .get("results")
+        .and_then(Value::as_array)
+        .and_then(|results| results.first())
+        .cloned()
+        .unwrap_or(Value::Null);
+    if outcome.get("found") == Some(&Value::Bool(false)) {
+        bail!(
+            "Studio has no {service}.{} ({} is missing); the files and Studio differ, run `rbx lst --details`",
+            segments.join("."),
+            outcome
+                .get("missing")
+                .and_then(Value::as_str)
+                .unwrap_or("a segment")
+        );
+    }
+    if outcome.get("link") == Some(&Value::Bool(false)) {
+        return Ok(Some("already unlinked".to_string()));
+    }
+    if outcome.get("removed") == Some(&Value::Bool(true)) {
+        return Ok(Some(format!(
+            "unlinked {}",
+            outcome
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("the package")
+        )));
+    }
+    bail!("Studio kept the PackageLink after Destroy: {outcome}")
+}
+
+fn live_sync_running(project: Option<&Path>) -> Result<bool> {
+    let bridge = crate::cli::BridgeConnectionArgs::local(8.0);
+    let status = daemon_result(
+        op::STUDIO_STATUS,
+        project,
+        json!({ "all": false }),
+        false,
+        Some(&bridge),
+    )?;
+    Ok(status
+        .pointer("/liveSync/running")
+        .and_then(Value::as_bool)
+        .unwrap_or(false))
 }
 
 pub(crate) fn import_model_command(

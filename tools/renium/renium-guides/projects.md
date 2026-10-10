@@ -33,7 +33,7 @@ Files → Studio edits mark affected linked packages **Changed** before editing 
 - `pd`: mark Changed without editing contents.
 - `pp`: publish changes; requires user authorization.
 - `pu`: discard changes and fetch the latest published version.
-- `upl`: remove the PackageLink while keeping contents. This is unlinking, not desync.
+- `upl`: remove the PackageLink while keeping contents (unlinking, not desync). With the place open in Studio it unlinks there and Live Sync pulls the files; with Studio closed it edits the files only, and a later push of that edit is refused, so open the place first.
 
 On Windows/macOS, `pd`/`pp`/`pu` target the package root without selection, dialogs, or focus and wait up to two minutes (`--timeout` up to 600 s); a finished wait does not prove publishing succeeded.
 Use a JSON string array for names containing dots, `Name[2]` or `--ords` for duplicates, and `--pid PID` only when several processes match.
