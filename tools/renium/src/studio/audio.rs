@@ -70,6 +70,8 @@ pub(crate) struct Status {
     pub(super) suppressed_buffers: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) note: Option<String>,
 }
 
 fn is_zero(value: &u64) -> bool {

@@ -178,10 +178,17 @@ impl Backend {
             match AudioOutputGate::new(self.pid) {
                 Ok(gate) => self.gate = Some(gate),
                 Err(error) => {
-                    status.error = Some(format!("Could not gate Studio audio output: {error:#}"));
+                    status.note = Some(format!(
+                        "Studio output hooks unavailable, muting through Windows audio sessions: {error:#}"
+                    ));
                 }
             }
         }
+        // Without the hooks the Windows session mute does the muting; the
+        // journal owns those mutes so they are restored on unmute, restart or
+        // a lost controller, and a mute the user set themselves is left alone.
+        let session_mute =
+            self.gate.is_none() && (action == Action::Mute || action == Action::Auto && !focused);
         let mut suppressed = false;
         if let Some(gate) = &self.gate {
             let output = gate.step(action, self.gate_sessions != found)?;
@@ -200,19 +207,30 @@ impl Backend {
             let result = unsafe {
                 (|| -> Result<()> {
                     let expired = session.control.GetState()? == AudioSessionStateExpired;
-                    let current = session.volume.GetMute()?.as_bool();
-                    let unmute = action == Action::Unmute
-                        || action == Action::Auto && focused
-                        || self.journal.owned.contains(key);
+                    let mut current = session.volume.GetMute()?.as_bool();
+                    let live = !expired && found.contains(key);
+                    let unmute = !session_mute
+                        && (action == Action::Unmute
+                            || action == Action::Auto && focused
+                            || self.journal.owned.contains(key));
                     if current && unmute {
                         session.volume.SetMute(false, &CONTEXT)?;
                         anyhow::ensure!(
                             !session.volume.GetMute()?.as_bool(),
                             "Audio session did not clear its previous Windows mute"
                         );
+                        current = false;
                     }
-                    self.journal.set(key, false)?;
-                    if !expired && found.contains(key) {
+                    if session_mute && live {
+                        if !current {
+                            session.volume.SetMute(true, &CONTEXT)?;
+                            self.journal.set(key, true)?;
+                            current = true;
+                        }
+                    } else {
+                        self.journal.set(key, false)?;
+                    }
+                    if live {
                         status.sessions += 1;
                         status.muted_sessions += usize::from(suppressed || current && !unmute);
                     } else {
