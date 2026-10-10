@@ -487,9 +487,13 @@ fn execute_request(
             "cloud request {index} has more than one body type"
         )));
     }
-    if request.content_type.is_some() && request.raw_file.is_none() && request.body.is_none() {
+    if request.content_type.is_some()
+        && request.raw_file.is_none()
+        && request.body.is_none()
+        && request.files.is_empty()
+    {
         return Err(bad_request(format!(
-            "cloud request {index} uses contentType without a body"
+            "cloud request {index} uses contentType without a body or file"
         )));
     }
     let multipart =
@@ -497,8 +501,13 @@ fn execute_request(
             None
         } else {
             Some(
-                multipart_body(&request.form, &request.json_parts, &request.files)
-                    .map_err(|message| bad_request(format!("cloud request {index}: {message}")))?,
+                multipart_body(
+                    &request.form,
+                    &request.json_parts,
+                    &request.files,
+                    request.content_type.as_deref(),
+                )
+                .map_err(|message| bad_request(format!("cloud request {index}: {message}")))?,
             )
         };
     let url_encoded = if request.url_encoded.is_empty() {
@@ -760,6 +769,7 @@ fn multipart_body(
     fields: &Map<String, Value>,
     json_parts: &Map<String, Value>,
     files: &Map<String, Value>,
+    file_type: Option<&str>,
 ) -> Result<(String, Vec<u8>), String> {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -819,7 +829,7 @@ fn multipart_body(
                 &boundary,
                 name,
                 Some(filename),
-                Some(file_content_type(path)),
+                Some(file_type.unwrap_or_else(|| file_content_type(path))),
                 &bytes,
             );
         }
@@ -862,6 +872,10 @@ fn push_part(
     body.extend_from_slice(b"\r\n");
 }
 
+/// The media type an uploaded file is sent with. Open Cloud refuses an asset
+/// whose file part arrives as a plain octet stream ("Creating Model from a
+/// application/octet-stream file is not supported"), so the common asset
+/// formats are named; `--content-type` overrides the choice.
 fn file_content_type(path: &Path) -> &'static str {
     match path
         .extension()
@@ -872,9 +886,25 @@ fn file_content_type(path: &Path) -> &'static str {
         Some("png") => "image/png",
         Some("jpg" | "jpeg") => "image/jpeg",
         Some("bmp") => "image/bmp",
+        Some("tga") => "image/tga",
         Some("json") => "application/json",
         Some("rbxl") => "application/octet-stream",
         Some("rbxlx" | "xml") => "application/xml",
+        Some("rbxm") => "model/x-rbxm",
+        Some("rbxmx") => "model/x-rbxmx",
+        Some("fbx") => "model/fbx",
+        Some("glb") => "model/gltf-binary",
+        Some("gltf") => "model/gltf+json",
+        Some("obj") => "model/obj",
+        Some("mp3") => "audio/mpeg",
+        Some("ogg") => "audio/ogg",
+        Some("wav") => "audio/wav",
+        Some("flac") => "audio/flac",
+        Some("mp4") => "video/mp4",
+        Some("mov") => "video/quicktime",
+        Some("webm") => "video/webm",
+        Some("ttf") => "font/ttf",
+        Some("otf") => "font/otf",
         _ => "application/octet-stream",
     }
 }
@@ -1066,6 +1096,40 @@ fn bad_request(message: String) -> Failure {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn asset_files_are_sent_with_their_media_type() {
+        for (name, expected) in [
+            ("car.glb", "model/gltf-binary"),
+            ("car.GLTF", "model/gltf+json"),
+            ("car.fbx", "model/fbx"),
+            ("car.rbxm", "model/x-rbxm"),
+            ("car.rbxmx", "model/x-rbxmx"),
+            ("song.mp3", "audio/mpeg"),
+            ("thing.bin", "application/octet-stream"),
+        ] {
+            assert_eq!(
+                super::file_content_type(Path::new(name)),
+                expected,
+                "{name}"
+            );
+        }
+        let mut files = Map::new();
+        let dir = std::env::temp_dir().join(format!("renium-mime-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("car.glb");
+        std::fs::write(&file, b"glTF").unwrap();
+        files.insert(
+            "fileContent".into(),
+            Value::String(file.display().to_string()),
+        );
+        let (_, body) = super::multipart_body(&Map::new(), &Map::new(), &files, None).unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("Content-Type: model/gltf-binary\r\n"));
+        let (_, body) =
+            super::multipart_body(&Map::new(), &Map::new(), &files, Some("model/custom")).unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("Content-Type: model/custom\r\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_named_key_variable_never_falls_back_to_the_stored_default() {
         let failure = super::api_key_secret("RENIUM_TEST_UNSET_SANDBOX_KEY", "cloud").unwrap_err();
         assert!(
@@ -1155,7 +1219,7 @@ mod tests {
             json!([file.display().to_string(), file.display().to_string()]),
         )]);
 
-        let (_, body) = multipart_body(&fields, &Map::new(), &files).unwrap();
+        let (_, body) = multipart_body(&fields, &Map::new(), &files, None).unwrap();
         let body = String::from_utf8(body).unwrap();
 
         assert_eq!(body.matches("name=\"tag\"").count(), 2);

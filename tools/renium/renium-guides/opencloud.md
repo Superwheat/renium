@@ -120,6 +120,7 @@ rbx oc product update PRODUCT_ID --price 29 --regional-pricing=false
 rbx oc pass create "VIP" --form price=99 --form isForSale=true --file imageFile=vip.png
 rbx oc asset create Model "Street Lamp" "A lamp model" lamp.fbx --field creationContext.creator.userId=USER_ID
 rbx oc asset create Model "Street Lamp" "A lamp model" lamp.fbx --field creationContext.creator.groupId=GROUP_ID
+rbx oc asset create Model "Car" "Group car" car.glb --field creationContext.creator.groupId=GROUP_ID --content-type model/gltf-binary
 rbx iu reference.png --user USER_ID --name Reference
 rbx oc --anonymous asset search --limit 5 -q query=car -q searchCategoryType=Model
 ```
