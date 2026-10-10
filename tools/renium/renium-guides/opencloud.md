@@ -21,7 +21,7 @@ rbx oc place history
 rbx oc fetch --version 940 -o old.rbxl
 ```
 
-`games` lists what the key can reach: the universes it is scoped to plus the public experiences of the key's user and groups; a name matches ignoring case, emoji and punctuation. `fetch` downloads the experience's root place and, with `-r DIR`, imports it into that project (creating it) so the files are ready to open with `rbx so`. Private experiences the key is not scoped to need `--universe ID` or `--place-id ID`. Without `--version`, `fetch` downloads the newest published version by number (the result says which) rather than the delivery copy, which can lag a publish. Older versions of the bound place come from Roblox: `place history` lists its saved versions (newest first, with times and authors) and `fetch --version N` downloads one for `q`, `v` or `cmp`. Place files found elsewhere on the machine are not versions of the project unless the user says so.
+`games` lists what the key can reach: the universes it is scoped to plus the public experiences of the key's user and groups; a name matches ignoring case, emoji and punctuation. The experience's main icon and thumbnails have no API-key route (Open Cloud proxies only the badge icon of the legacy publish API); set them in Creator Hub. `fetch` downloads the experience's root place and, with `-r DIR`, imports it into that project (creating it) so the files are ready to open with `rbx so`. Private experiences the key is not scoped to need `--universe ID` or `--place-id ID`. Without `--version`, `fetch` downloads the newest published version by number (the result says which) rather than the delivery copy, which can lag a publish. Older versions of the bound place come from Roblox: `place history` lists its saved versions (newest first, with times and authors) and `fetch --version N` downloads one for `q`, `v` or `cmp`. Place files found elsewhere on the machine are not versions of the project unless the user says so.
 
 The project supplies universe/place IDs. Otherwise put `--universe ID` and `--place-id ID` before the resource.
 Public reads can explicitly use `--anonymous`; authenticated requests never fall back to anonymous access.
@@ -98,8 +98,6 @@ rbx oc experiment stats EXPERIMENT
 rbx oc experiment start EXPERIMENT
 rbx oc thumbnail personalization --limit 10
 rbx oc thumbnail personalization-create --field homepageThumbnailIds='["THUMBNAIL_1","THUMBNAIL_2"]'
-rbx oc universe icon icon.png
-rbx oc universe thumbnail-upload shot.png
 rbx oc thumbnail upload first.png --file files=second.png
 rbx oc thumbnail upload-status -q operationIds=OPERATION_1 -q operationIds=OPERATION_2
 ```

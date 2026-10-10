@@ -880,22 +880,6 @@ static ROUTES: &[Route] = &[
         multipart
     ),
     route!(
-        "universe",
-        "icon",
-        "POST",
-        "/legacy-publish/v1/games/{universe}/icon",
-        [file("FILE", "request.files")],
-        multipart
-    ),
-    route!(
-        "universe",
-        "thumbnail-upload",
-        "POST",
-        "/legacy-publish/v1/games/{universe}/thumbnail/image",
-        [file("FILE", "request.files")],
-        multipart
-    ),
-    route!(
         "experiment",
         "list",
         "GET",
