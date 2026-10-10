@@ -1538,6 +1538,7 @@ pub(crate) fn prepare_context(pid: u32, title: &str) -> Result<()> {
 // has no supported reader contract. Invocation still revalidates live code,
 // target identities and DataModel ownership under the transaction's guard.
 pub(crate) fn prepare_service_reader(pid: u32) -> Result<()> {
+    anyhow::ensure!(native_writes_verified(pid), NATIVE_WRITES_DISABLED);
     let current_modules = modules(pid)?;
     let studio = current_modules
         .iter()
