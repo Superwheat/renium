@@ -354,21 +354,23 @@ fn convert_service(
     })
 }
 
-/// Engine-built data stored as a SharedString (collision hulls, union meshes
-/// and trees, aero meshes) is part of the place even though Roblox hides it.
+/// Engine-built data stored as a SharedString or NetAssetRef (collision
+/// hulls, union meshes, trees and holders, aero meshes, terrain material
+/// tables) and the asset a part came from are part of the place even though
+/// Roblox hides them.
 fn is_engine_data_property(
     database: &ReflectionDatabase<'_>,
     class_name: &str,
     property_name: &str,
 ) -> bool {
-    crate::rbx::encode::rbx_property_descriptor(database, class_name, property_name).is_some_and(
-        |descriptor| {
-            matches!(
-                descriptor.data_type,
-                RbxDataType::Value(RbxVariantType::SharedString)
-            )
-        },
-    )
+    property_name == "SourceAssetId"
+        || crate::rbx::encode::rbx_property_descriptor(database, class_name, property_name)
+            .is_some_and(|descriptor| {
+                matches!(
+                    descriptor.data_type,
+                    RbxDataType::Value(RbxVariantType::SharedString | RbxVariantType::NetAssetRef)
+                )
+            })
 }
 
 #[cfg(test)]
@@ -417,7 +419,16 @@ mod tests {
             InstanceBuilder::new("UnionOperation")
                 .with_name("Track")
                 .with_property("ChildData2", data("tree"))
-                .with_property("MeshData2", data("mesh")),
+                .with_property("MeshData2", data("mesh"))
+                .with_property(
+                    "SolidMeshHolder",
+                    rbx_dom_weak::types::NetAssetRef::new(b"holder".to_vec()),
+                )
+                .with_property("SourceAssetId", 42i64),
+        );
+        dom.insert(
+            workspace,
+            InstanceBuilder::new("Terrain").with_property("Materials", data("colours")),
         );
         dom.insert(
             workspace,
@@ -449,6 +460,13 @@ mod tests {
         let union = keys("UnionOperation");
         assert!(union.iter().any(|key| key == "ChildData2"), "{union:?}");
         assert!(union.iter().any(|key| key == "MeshData2"), "{union:?}");
+        assert!(
+            union.iter().any(|key| key == "SolidMeshHolder"),
+            "{union:?}"
+        );
+        assert!(union.iter().any(|key| key == "SourceAssetId"), "{union:?}");
+        let terrain = keys("Terrain");
+        assert!(terrain.iter().any(|key| key == "Materials"), "{terrain:?}");
         let mesh = keys("MeshPart");
         assert!(
             mesh.iter().any(|key| key == "PhysicalConfigData"),

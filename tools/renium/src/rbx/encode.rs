@@ -754,14 +754,20 @@ fn neutral_export_variant(sample: &RbxVariant) -> Option<RbxVariant> {
 
 pub(crate) const COLLISION_HULL_PROPERTY: &str = "PhysicalConfigData";
 
-/// Engine-built geometry a part carries as opaque data: the collision hull
-/// of mesh parts and CSG parts, and the CSG tree and mesh of a union.
+/// Engine-built data a part carries opaquely: collision hulls and aero
+/// meshes, a union's CSG tree, mesh and older mesh holder, and the terrain's
+/// material table.
 fn engine_geometry_properties(class: &str) -> &'static [&'static str] {
     match class {
-        "MeshPart" => &[COLLISION_HULL_PROPERTY],
-        "UnionOperation" | "NegateOperation" | "IntersectOperation" => {
-            &["ChildData2", "MeshData2", COLLISION_HULL_PROPERTY]
-        }
+        "MeshPart" => &[COLLISION_HULL_PROPERTY, "AeroMeshData"],
+        "UnionOperation" | "NegateOperation" | "IntersectOperation" => &[
+            "ChildData2",
+            "MeshData2",
+            "SolidMeshHolder",
+            COLLISION_HULL_PROPERTY,
+            "AeroMeshData",
+        ],
+        "Terrain" => &["Materials"],
         _ => &[],
     }
 }
@@ -769,7 +775,9 @@ fn engine_geometry_properties(class: &str) -> &'static [&'static str] {
 fn has_data(instance: &rbx_dom_weak::Instance, name: &str) -> bool {
     matches!(
         instance.properties.get(&rbx_dom_weak::Ustr::from(name)),
-        Some(RbxVariant::SharedString(_) | RbxVariant::BinaryString(_))
+        Some(
+            RbxVariant::SharedString(_) | RbxVariant::BinaryString(_) | RbxVariant::NetAssetRef(_)
+        )
     )
 }
 
@@ -820,7 +828,7 @@ impl GeometrySources {
 }
 
 fn carries_collision_hull(class: &str) -> bool {
-    !engine_geometry_properties(class).is_empty()
+    engine_geometry_properties(class).contains(&COLLISION_HULL_PROPERTY)
 }
 
 /// The hull Studio stores for a part whose CollisionFidelity is Box.
@@ -2433,7 +2441,15 @@ mod tests {
                 .with_name("Track")
                 .with_property("ChildData2", data("tree"))
                 .with_property("MeshData2", data("mesh"))
+                .with_property(
+                    "SolidMeshHolder",
+                    RbxVariant::NetAssetRef(RbxNetAssetRef::new(b"holder".to_vec())),
+                )
                 .with_property("PhysicalConfigData", data("CSGPHS-hull")),
+        );
+        base.insert(
+            base_workspace,
+            RbxInstanceBuilder::new("Terrain").with_property("Materials", data("colours")),
         );
         base.insert(
             base_workspace,
@@ -2448,6 +2464,7 @@ mod tests {
             workspace,
             RbxInstanceBuilder::new("UnionOperation").with_name("Track"),
         );
+        let terrain = dom.insert(workspace, RbxInstanceBuilder::new("Terrain"));
         let own = dom.insert(
             workspace,
             RbxInstanceBuilder::new("UnionOperation")
@@ -2475,6 +2492,13 @@ mod tests {
             Some(data("CSGPHS-hull"))
         );
         assert_eq!(property(own, "MeshData2"), Some(data("own mesh")));
+        assert_eq!(
+            property(track, "SolidMeshHolder"),
+            Some(RbxVariant::NetAssetRef(RbxNetAssetRef::new(
+                b"holder".to_vec()
+            )))
+        );
+        assert_eq!(property(terrain, "Materials"), Some(data("colours")));
         assert_eq!(
             property(own, "ChildData2"),
             None,
