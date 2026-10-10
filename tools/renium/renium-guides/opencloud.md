@@ -19,6 +19,7 @@ rbx oc fetch "Brainrot Town" -r ./BrainrotTown
 rbx oc fetch --universe 8108639406 -o brainrot.rbxl
 rbx oc place history
 rbx oc fetch --version 940 -o old.rbxl
+rbx oc fetch 112966546347918 -o other.rbxl     # a place id or universe id; the positional wins over the bound place
 ```
 
 `games` lists what the key can reach: the universes it is scoped to plus the public experiences of the key's user and groups; a name matches ignoring case, emoji and punctuation. The experience's main icon and thumbnails have no API-key route (Open Cloud proxies only the badge icon of the legacy publish API); set them in Creator Hub. `fetch` downloads the experience's root place and, with `-r DIR`, imports it into that project (creating it) so the files are ready to open with `rbx so`. Private experiences the key is not scoped to need `--universe ID` or `--place-id ID`. Without `--version`, `fetch` downloads the newest published version by number (the result says which) rather than the delivery copy, which can lag a publish. Older versions of the bound place come from Roblox: `place history` lists its saved versions (newest first, with times and authors) and `fetch --version N` downloads one for `q`, `v` or `cmp`. Place files found elsewhere on the machine are not versions of the project unless the user says so.

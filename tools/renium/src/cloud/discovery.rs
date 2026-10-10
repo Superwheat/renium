@@ -696,29 +696,63 @@ fn file_name_for(name: &str, place_id: i64) -> String {
     format!("{stem}.rbxl")
 }
 
+/// What a fetch is for. A positional argument names the target and wins over
+/// the place the project is bound to; a number is a universe when one exists
+/// with that id, otherwise a place.
+#[derive(Debug, PartialEq, Eq)]
+enum FetchTarget {
+    Id(i64),
+    Name(String),
+    Place(i64),
+    Universe(i64),
+}
+
+fn fetch_target(identity: CloudIdentity, name: Option<&str>) -> Result<FetchTarget> {
+    let query = name.map(str::trim).filter(|value| !value.is_empty());
+    if let Some(query) = query {
+        return Ok(match query.parse::<i64>() {
+            Ok(id) if id > 0 => FetchTarget::Id(id),
+            _ => FetchTarget::Name(query.to_string()),
+        });
+    }
+    if let Some(place_id) = identity.place_id {
+        return Ok(FetchTarget::Place(place_id));
+    }
+    if let Some(universe_id) = identity.game_id {
+        return Ok(FetchTarget::Universe(universe_id));
+    }
+    bail!("Name the experience to fetch, or pass --universe ID or --place-id ID")
+}
+
+fn universe_root(universe_id: i64) -> Result<(i64, String)> {
+    let found = scoped_universes(&[universe_id])?;
+    let experience = found
+        .into_iter()
+        .next()
+        .with_context(|| format!("Universe {universe_id} was not found"))?;
+    let root = experience
+        .root_place_id
+        .with_context(|| format!("Universe {universe_id} reports no root place"))?;
+    Ok((root, experience.name))
+}
+
 fn resolve_place(
     key_env: &str,
     identity: CloudIdentity,
     name: Option<&str>,
 ) -> Result<(i64, String)> {
-    if let Some(place_id) = identity.place_id {
-        return Ok((place_id, format!("place-{place_id}")));
-    }
-    if let Some(universe_id) = identity.game_id {
-        let found = scoped_universes(&[universe_id])?;
-        let experience = found
-            .into_iter()
-            .next()
-            .with_context(|| format!("Universe {universe_id} was not found"))?;
-        let root = experience
-            .root_place_id
-            .with_context(|| format!("Universe {universe_id} reports no root place"))?;
-        return Ok((root, experience.name));
-    }
-    let query = name
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .context("Name the experience to fetch, or pass --universe ID or --place-id ID")?;
+    let query = match fetch_target(identity, name)? {
+        FetchTarget::Place(place_id) => return Ok((place_id, format!("place-{place_id}"))),
+        FetchTarget::Universe(universe_id) => return universe_root(universe_id),
+        FetchTarget::Id(id) => {
+            return Ok(match universe_root(id) {
+                Ok(root) => root,
+                Err(_) => (id, format!("place-{id}")),
+            });
+        }
+        FetchTarget::Name(query) => query,
+    };
+    let query = query.as_str();
     let all = experiences(key_env, Some(query))?;
     let found = matches(&all, query);
     match found.as_slice() {
@@ -805,7 +839,7 @@ pub(crate) fn fetch_command(
             );
         }
         bail!(
-            "Asset delivery for place {place_id} returned HTTP {status} without a download location: {}",
+            "Asset delivery for place {place_id} ({name}) returned HTTP {status} without a download location; the place or the requested version may not exist: {}",
             delivery
                 .get("body")
                 .map(Value::to_string)
@@ -866,6 +900,39 @@ fn import_into(root: &Path, place: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_positional_target_wins_over_the_bound_place() {
+        let bound = CloudIdentity {
+            game_id: Some(10770269346),
+            place_id: Some(125532626377090),
+        };
+        assert_eq!(
+            fetch_target(bound, Some("112966546347918")).unwrap(),
+            FetchTarget::Id(112966546347918)
+        );
+        assert_eq!(
+            fetch_target(bound, Some(" Drift Tag ")).unwrap(),
+            FetchTarget::Name("Drift Tag".into())
+        );
+        assert_eq!(
+            fetch_target(bound, Some("")).unwrap(),
+            FetchTarget::Place(125532626377090)
+        );
+        let universe = CloudIdentity {
+            game_id: Some(7),
+            place_id: None,
+        };
+        assert_eq!(
+            fetch_target(universe, None).unwrap(),
+            FetchTarget::Universe(7)
+        );
+        let none = CloudIdentity {
+            game_id: None,
+            place_id: None,
+        };
+        assert!(fetch_target(none, None).is_err());
+    }
+
     use super::*;
 
     #[test]
