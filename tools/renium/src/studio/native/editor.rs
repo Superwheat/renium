@@ -3463,8 +3463,16 @@ pub(crate) fn write_edit_place_snapshot(
     bridge: &BridgeServer,
     runtime_id: &str,
     output_path: &Path,
+    base_place: Option<&Path>,
 ) -> Result<usize> {
-    write_editor_place_snapshot(bridge, None, output_path, None, Some(runtime_id), true)
+    write_editor_place_snapshot(
+        bridge,
+        None,
+        output_path,
+        base_place,
+        Some(runtime_id),
+        true,
+    )
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -3610,7 +3618,7 @@ fn write_editor_place_snapshot(
         total_instances += 1;
         has_package_links |= instance.class.as_str() == "PackageLink";
     }
-    let build = RbxPlaceBuild {
+    let mut build = RbxPlaceBuild {
         dom,
         service_roots,
         total_instances,
@@ -3620,7 +3628,20 @@ fn write_editor_place_snapshot(
         unresolved_reference_properties_by_ref: HashMap::new(),
     };
     let format_path = existing_place.unwrap_or(output_path);
-    write_rbx_place_build(output_path, &build, RbxPlaceFormat::from_path(format_path)?)?;
+    let format = RbxPlaceFormat::from_path(format_path)?;
+    // Without Studio's own serializer the export carries only the tracked
+    // services; the base place supplies the rest and the root fields the
+    // plugin cannot read, with Studio's values on top.
+    if let Some(base) = existing_place {
+        let exported = std::mem::replace(
+            &mut build.dom,
+            rbx_dom_weak::WeakDom::new(rbx_dom_weak::InstanceBuilder::new("DataModel")),
+        );
+        let (merged, roots) = crate::rbx::model::merge_build_into_base(&build, exported, base)?;
+        format.write(output_path, &merged, &roots)?;
+        return Ok(merged.descendants().count());
+    }
+    write_rbx_place_build(output_path, &build, format)?;
     Ok(build.total_instances)
 }
 

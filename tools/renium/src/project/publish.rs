@@ -309,13 +309,23 @@ pub(crate) fn snapshot_result(
         output.is_absolute() && output.extension().is_some_and(|ext| ext == "rbxl"),
         "The snapshot output must be an absolute .rbxl path"
     );
-    let instances =
-        crate::studio::native::editor::write_edit_place_snapshot(bridge, runtime, &output)
-            .map_err(studio_failure)?;
+    let base = parameters
+        .get("base")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .filter(|base| base.is_file());
+    let instances = crate::studio::native::editor::write_edit_place_snapshot(
+        bridge,
+        runtime,
+        &output,
+        base.as_deref(),
+    )
+    .map_err(studio_failure)?;
     Ok(json!({
         "ok": true,
         "runtimeId": runtime,
         "file": output,
+        "base": base,
         "instances": instances,
         "gameId": context.game_id,
         "placeId": context.place_id,
@@ -346,11 +356,34 @@ fn publish_as(args: &PublishArgs, project: Option<&Path>) -> Result<Value> {
         std::process::id(),
         crate::app::timing::current_millis()
     ));
+    // The previous version of the target place carries the services the
+    // project does not track and the root fields Studio cannot hand the
+    // plugin; a snapshot that Studio does not serialize itself is built on it.
+    let base = previous_version.and_then(|version| {
+        let path = std::env::temp_dir().join(format!(
+            "renium-publish-base-{}-{}.rbxl",
+            std::process::id(),
+            crate::app::timing::current_millis()
+        ));
+        let request = cloud::FetchRequest {
+            name: None,
+            output: Some(path.clone()),
+            project_root: None,
+            version: Some(version),
+        };
+        match cloud::fetch_command(identity, key_env, None, request) {
+            Ok(_) => Some(path),
+            Err(error) => {
+                eprintln!("[renium] publishing without the previous version as base: {error:#}");
+                None
+            }
+        }
+    });
     let result = (|| -> Result<Value> {
         let snapshot = daemon_result(
             op::PLACE_SNAPSHOT,
             project,
-            json!({ "output": file }),
+            json!({ "output": file, "base": base }),
             false,
             Some(&args.bridge),
         )?;
@@ -368,7 +401,16 @@ fn publish_as(args: &PublishArgs, project: Option<&Path>) -> Result<Value> {
             "versionType": if args.saved { "Saved" } else { "Published" },
             "url": format!("https://www.roblox.com/games/{target}"),
             "previousVersion": previous_version, "liveSync": preflight.live_sync,
+            "base": snapshot["base"],
         });
+        if let Some(keep) = std::env::var_os("RENIUM_PUBLISH_SNAPSHOT") {
+            fs::copy(&file, &keep).with_context(|| {
+                format!(
+                    "Could not keep the snapshot at {}",
+                    Path::new(&keep).display()
+                )
+            })?;
+        }
         if !args.dry_run {
             let response = upload(
                 identity,
@@ -393,6 +435,9 @@ fn publish_as(args: &PublishArgs, project: Option<&Path>) -> Result<Value> {
         Ok(result)
     })();
     let _ = fs::remove_file(&file);
+    if let Some(base) = base {
+        let _ = fs::remove_file(base);
+    }
     result
 }
 
