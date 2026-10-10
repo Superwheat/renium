@@ -301,7 +301,7 @@ fn convert_service(
         });
         if local == 0 {
             properties.retain(|name, _| {
-                !crate::rbx::decode::is_unexposed_service_property(database, class_name, name)
+                !crate::rbx::decode::is_unsaved_service_property(database, class_name, name)
             });
             if class_name == "Lighting"
                 && !properties.contains_key("ClockTime")
@@ -313,7 +313,7 @@ fn convert_service(
                 properties.insert("ClockTime".to_string(), json!(clock_time));
             }
             native_properties.retain(|property| {
-                !crate::rbx::decode::is_unexposed_service_property(
+                !crate::rbx::decode::is_unsaved_service_property(
                     database,
                     class_name,
                     &property.name,
@@ -380,6 +380,49 @@ mod tests {
         assert_eq!(clock_time_from_time_of_day("14:00:00"), Some(14.0));
         assert_eq!(clock_time_from_time_of_day("00:30"), Some(0.5));
         assert_eq!(clock_time_from_time_of_day("noon"), None);
+    }
+
+    #[test]
+    fn place_import_keeps_saved_service_fields_the_plugin_cannot_read() {
+        let root = create_unique_directory(&std::env::temp_dir(), "renium-place-import-fields-")
+            .expect("temp project");
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        dom.insert(
+            dom.root_ref(),
+            InstanceBuilder::new("Workspace")
+                .with_property("SignalBehavior", rbx_dom_weak::types::Enum::from_u32(2)),
+        );
+        dom.insert(
+            dom.root_ref(),
+            InstanceBuilder::new("MaterialService").with_property("GrassName", "Racing_Sand_Grass"),
+        );
+        let mut bytes = Vec::new();
+        rbx_binary::to_writer(&mut bytes, &dom, dom.root().children()).expect("place bytes");
+        std::fs::write(root.join("place.rbxl"), bytes).expect("place file");
+        std::fs::write(
+            root.join("renium.project.jsonc"),
+            "{\n  \"schemaVersion\": 1\n}\n",
+        )
+        .expect("project file");
+        let result = run(&root);
+        assert_eq!(result["ok"], true, "{result}");
+        let root_record = |service: &str| {
+            SettingsBytecode::read_file(&root.join("instances").join(format!("{service}.renium")))
+                .expect(service)
+                .instances
+                .into_iter()
+                .find(|instance| instance.parent_index.is_none())
+                .expect("service root")
+        };
+        assert_eq!(
+            root_record("MaterialService").properties["GrassName"],
+            "Racing_Sand_Grass"
+        );
+        assert_eq!(
+            root_record("Workspace").properties["SignalBehavior"]["name"],
+            "Deferred"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -2509,11 +2509,11 @@ impl LinkCFrame {
             .collect::<Option<Vec<_>>>()?;
         Some(Self {
             position: [numbers[0], numbers[1], numbers[2]],
-            rotation: [
+            rotation: orthonormalized([
                 [numbers[3], numbers[4], numbers[5]],
                 [numbers[6], numbers[7], numbers[8]],
                 [numbers[9], numbers[10], numbers[11]],
-            ],
+            ]),
         })
     }
 
@@ -2581,6 +2581,44 @@ impl LinkCFrame {
             ],
         })
     }
+}
+
+/// Saved rotations drift from orthonormal by float32 noise, and a transform
+/// built from them by transposition spreads that drift to every part it
+/// moves, growing with each propagation. Rebuilds the matrix from its right
+/// vector so moved models are placed by proper rotations.
+fn orthonormalized(rotation: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    let column = |index: usize| [rotation[0][index], rotation[1][index], rotation[2][index]];
+    let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let normalized = |a: [f64; 3]| {
+        let length = dot(a, a).sqrt();
+        (length > 1e-12).then(|| [a[0] / length, a[1] / length, a[2] / length])
+    };
+    let Some(right) = normalized(column(0)) else {
+        return rotation;
+    };
+    let up = column(1);
+    let along = dot(up, right);
+    let Some(up) = normalized([
+        up[0] - along * right[0],
+        up[1] - along * right[1],
+        up[2] - along * right[2],
+    ]) else {
+        return rotation;
+    };
+    let back = [
+        right[1] * up[2] - right[2] * up[1],
+        right[2] * up[0] - right[0] * up[2],
+        right[0] * up[1] - right[1] * up[0],
+    ];
+    if dot(back, column(2)) < 0.0 {
+        return rotation;
+    }
+    [
+        [right[0], up[0], back[0]],
+        [right[1], up[1], back[1]],
+        [right[2], up[2], back[2]],
+    ]
 }
 
 fn multiply_vector(rotation: [[f64; 3]; 3], vector: [f64; 3]) -> [f64; 3] {

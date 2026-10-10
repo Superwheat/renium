@@ -123,6 +123,46 @@ fn write_script_package_settings(service_dir: &Path, source: &str) -> PathBuf {
     settings_path
 }
 
+#[test]
+fn link_rotations_are_read_as_proper_rotations() {
+    let skewed = test_cframe([
+        937.542,
+        29.079,
+        888.573,
+        0.99364716,
+        0.0,
+        -0.112649664,
+        0.0,
+        0.9999839,
+        0.0,
+        0.112649664,
+        0.0,
+        0.99364716,
+    ]);
+    let cframe = LinkCFrame::from_json(&skewed).unwrap();
+    let rotation = cframe.rotation;
+    for row in 0..3 {
+        for column in 0..3 {
+            let dot = (0..3)
+                .map(|index| rotation[index][row] * rotation[index][column])
+                .sum::<f64>();
+            let expected = if row == column { 1.0 } else { 0.0 };
+            assert!((dot - expected).abs() < 1e-9, "{row},{column}: {dot}");
+        }
+    }
+    assert!((rotation[0][0] - 0.99364716).abs() < 2e-5);
+    let round_trip = cframe.then(cframe.inverse());
+    for (index, value) in round_trip.position.iter().enumerate() {
+        assert!(value.abs() < 1e-6, "position {index}: {value}");
+    }
+    assert!((round_trip.rotation[1][1] - 1.0).abs() < 1e-9);
+    let identity = test_cframe([1.0, 2.0, 3.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+    assert_eq!(
+        LinkCFrame::from_json(&identity).unwrap().to_json(false),
+        identity
+    );
+}
+
 fn test_cframe(components: [f64; 12]) -> Value {
     json!({ "_type": "CFrame", "components": components })
 }

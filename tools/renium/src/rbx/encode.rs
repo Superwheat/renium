@@ -26,6 +26,7 @@ use rbx_reflection::{
     ClassDescriptor as RbxClassDescriptor, DataType as RbxDataType,
     PropertyDescriptor as RbxPropertyDescriptor, PropertyKind as RbxPropertyKind,
     PropertySerialization as RbxPropertySerialization, ReflectionDatabase,
+    Scriptability as RbxScriptability,
 };
 use serde_json::{Map, Value, json};
 
@@ -618,6 +619,136 @@ fn rbx_serialized_property_descriptor<'db>(
             .and_then(|canonical| rbx_serialized_property_descriptor(class, canonical)),
         _ => None,
     }
+}
+
+/// A saved place carries one value per class member for every instance of the
+/// class; Studio fills instances that lack a member with the engine default.
+/// The binary writer fills from the reflection database instead and, for a
+/// member it cannot default, from zero values, an invalid enum among them.
+/// Fill those from the values the stores carry so a saved field unknown to
+/// the database keeps the engine's value on every instance, and drop empty
+/// unscriptable blobs, which Studio leaves out of its own saves.
+pub(crate) fn normalize_export_dom(dom: &mut RbxWeakDom, database: &ReflectionDatabase<'_>) {
+    let mut by_class: HashMap<rbx_dom_weak::Ustr, Vec<RbxRef>> = HashMap::new();
+    for instance in dom.descendants() {
+        by_class
+            .entry(instance.class)
+            .or_default()
+            .push(instance.referent());
+    }
+    for (class_name, referents) in by_class {
+        let class = database.classes.get(class_name.as_str());
+        let mut presence: HashMap<rbx_dom_weak::Ustr, ExportPresence> = HashMap::new();
+        for referent in &referents {
+            let Some(instance) = dom.get_by_ref_mut(*referent) else {
+                continue;
+            };
+            instance.properties.retain(|name, value| {
+                !is_empty_unscriptable_blob(database, class_name.as_str(), name.as_str(), value)
+            });
+            for (name, value) in &instance.properties {
+                presence.entry(*name).or_default().record(value);
+            }
+        }
+        for (name, values) in presence {
+            if values.present >= referents.len()
+                || class.is_some_and(|class| {
+                    database
+                        .find_default_property(class, name.as_str())
+                        .is_some()
+                        || rbx_logical_property_name(database, class_name.as_str(), name.as_str())
+                            .is_some_and(|logical| {
+                                database.find_default_property(class, logical).is_some()
+                            })
+                })
+            {
+                continue;
+            }
+            let Some(fill) = values.fill() else {
+                continue;
+            };
+            for referent in &referents {
+                if let Some(instance) = dom.get_by_ref_mut(*referent) {
+                    instance
+                        .properties
+                        .entry(name)
+                        .or_insert_with(|| fill.clone());
+                }
+            }
+        }
+    }
+}
+
+const EXPORT_FILL_DISTINCT_LIMIT: usize = 64;
+
+#[derive(Default)]
+struct ExportPresence {
+    present: usize,
+    distinct: Vec<(RbxVariant, usize)>,
+    overflowed: bool,
+}
+
+impl ExportPresence {
+    fn record(&mut self, value: &RbxVariant) {
+        self.present += 1;
+        if let Some((_, count)) = self.distinct.iter_mut().find(|(seen, _)| seen == value) {
+            *count += 1;
+        } else if self.distinct.len() < EXPORT_FILL_DISTINCT_LIMIT {
+            self.distinct.push((value.clone(), 1));
+        } else {
+            self.overflowed = true;
+        }
+    }
+
+    fn fill(&self) -> Option<RbxVariant> {
+        let sample = &self.distinct.first()?.0;
+        let neutral = neutral_export_variant(sample)?;
+        if self.overflowed {
+            return Some(neutral);
+        }
+        self.distinct
+            .iter()
+            .max_by_key(|(_, count)| *count)
+            .map(|(value, _)| value.clone())
+    }
+}
+
+fn neutral_export_variant(sample: &RbxVariant) -> Option<RbxVariant> {
+    Some(match sample {
+        RbxVariant::Enum(_) => RbxVariant::Enum(RbxEnum::from_u32(0)),
+        RbxVariant::EnumItem(item) => RbxVariant::EnumItem(RbxEnumItem {
+            ty: item.ty.clone(),
+            value: 0,
+        }),
+        RbxVariant::Int32(_) => RbxVariant::Int32(0),
+        RbxVariant::Int64(_) => RbxVariant::Int64(0),
+        RbxVariant::Float32(_) => RbxVariant::Float32(0.0),
+        RbxVariant::Float64(_) => RbxVariant::Float64(0.0),
+        RbxVariant::Bool(_) => RbxVariant::Bool(false),
+        RbxVariant::String(_) => RbxVariant::String(String::new()),
+        _ => return None,
+    })
+}
+
+fn is_empty_unscriptable_blob(
+    database: &ReflectionDatabase<'_>,
+    class_name: &str,
+    name: &str,
+    value: &RbxVariant,
+) -> bool {
+    let RbxVariant::BinaryString(bytes) = value else {
+        return false;
+    };
+    if !<[u8]>::is_empty(bytes.as_ref())
+        || database
+            .classes
+            .get(class_name)
+            .is_some_and(|class| class.tags.contains(&rbx_reflection::ClassTag::Service))
+    {
+        return false;
+    }
+    rbx_property_descriptor(database, class_name, name)
+        .is_some_and(|descriptor| matches!(descriptor.scriptability, RbxScriptability::None))
 }
 
 pub(crate) fn json_to_rbx_property_variant(
@@ -1742,6 +1873,83 @@ pub(crate) fn settings_root_indices(document: &SettingsBytecode) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_fills_undefaulted_members_from_the_stores_and_drops_empty_blobs() {
+        let database = rbx_reflection_database::get().unwrap();
+        let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+        let workspace = dom.insert(dom.root_ref(), RbxInstanceBuilder::new("Workspace"));
+        let slotted = dom.insert(
+            workspace,
+            RbxInstanceBuilder::new("SurfaceAppearance")
+                .with_property("SurfaceSlot", RbxVariant::Int32(-1)),
+        );
+        let bare = dom.insert(workspace, RbxInstanceBuilder::new("SurfaceAppearance"));
+        dom.insert(
+            workspace,
+            RbxInstanceBuilder::new("Texture")
+                .with_property("ResampleMode", RbxVariant::Enum(RbxEnum::from_u32(0))),
+        );
+        let plain_texture = dom.insert(workspace, RbxInstanceBuilder::new("Texture"));
+        let model = dom.insert(
+            workspace,
+            RbxInstanceBuilder::new("Model").with_property(
+                "SerializedOverrides",
+                RbxVariant::BinaryString(RbxBinaryString::new()),
+            ),
+        );
+        let overridden = dom.insert(
+            workspace,
+            RbxInstanceBuilder::new("Model").with_property(
+                "SerializedOverrides",
+                RbxVariant::BinaryString(RbxBinaryString::from(vec![1u8])),
+            ),
+        );
+        let part = dom.insert(
+            workspace,
+            RbxInstanceBuilder::new("Part").with_property("Transparency", RbxVariant::Float32(0.5)),
+        );
+        dom.insert(workspace, RbxInstanceBuilder::new("Part"));
+        normalize_export_dom(&mut dom, database);
+        let property = |referent: RbxRef, name: &str| {
+            dom.get_by_ref(referent)
+                .unwrap()
+                .properties
+                .get(&rbx_dom_weak::Ustr::from(name))
+                .cloned()
+        };
+        assert_eq!(
+            property(slotted, "SurfaceSlot"),
+            Some(RbxVariant::Int32(-1))
+        );
+        assert_eq!(property(bare, "SurfaceSlot"), Some(RbxVariant::Int32(-1)));
+        assert_eq!(
+            property(plain_texture, "ResampleMode"),
+            Some(RbxVariant::Enum(RbxEnum::from_u32(0)))
+        );
+        assert_eq!(property(model, "SerializedOverrides"), None);
+        assert_eq!(
+            property(overridden, "SerializedOverrides"),
+            Some(RbxVariant::BinaryString(RbxBinaryString::from(vec![1u8])))
+        );
+        assert_eq!(
+            property(part, "Transparency"),
+            Some(RbxVariant::Float32(0.5))
+        );
+        let parts = dom
+            .descendants()
+            .filter(|instance| instance.class == "Part")
+            .filter(|instance| {
+                instance
+                    .properties
+                    .contains_key(&rbx_dom_weak::Ustr::from("Transparency"))
+            })
+            .count();
+        assert_eq!(
+            parts, 1,
+            "members the database defaults are left to the writer"
+        );
+    }
 
     #[test]
     fn typed_numbers_convert_with_a_descriptor() {

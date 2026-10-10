@@ -117,6 +117,28 @@ pub(crate) fn is_unexposed_service_property(
     }
 }
 
+/// A service field the plugin cannot read but Studio saves. An import from a
+/// file keeps it so a build without the original place still carries it.
+pub(crate) fn is_unsaved_service_property(
+    database: &ReflectionDatabase<'_>,
+    class_name: &str,
+    name: &str,
+) -> bool {
+    is_unexposed_service_property(database, class_name, name)
+        && (matches!(
+            name,
+            "Capabilities" | "HistoryId" | "SourceAssetId" | "UniqueId"
+        ) || match crate::rbx::encode::rbx_property_descriptor(database, class_name, name) {
+            Some(descriptor) => matches!(
+                descriptor.kind,
+                RbxPropertyKind::Canonical {
+                    serialization: RbxPropertySerialization::DoesNotSerialize
+                }
+            ),
+            None => true,
+        })
+}
+
 pub(crate) fn property_has_serialized_form(
     database: &ReflectionDatabase<'_>,
     class_name: &str,

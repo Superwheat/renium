@@ -1527,6 +1527,7 @@ pub(crate) fn build_rbx_place(
                 .iter()
                 .any(|instance| instance.class_name == "PackageLink")
         });
+    crate::rbx::encode::normalize_export_dom(&mut dom, database);
     log_timing("native editor place DOM assembly", phase_started);
     Ok(RbxPlaceBuild {
         dom,

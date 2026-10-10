@@ -28,6 +28,62 @@ fn changed_field_scan_preserves_names_values_and_presence() {
     assert_eq!(values[2]["afterPresent"], false);
 }
 
+#[test]
+fn changed_field_scan_ignores_empty_blobs_and_float_noise() {
+    let before = serde_json::from_value::<Map<String, Value>>(json!({
+        "CFrame": {"_type": "CFrame", "components": [937.5429, 26.621252, 888.5725, -0.363981, 0.0, -0.9314095, 0.0, 0.99999624, 0.0, 0.9314095, 0.0, -0.363981]},
+        "Size": {"_type": "Vector3", "x": 1.0, "y": 1.0, "z": 1.0},
+    }))
+    .unwrap();
+    let after = serde_json::from_value::<Map<String, Value>>(json!({
+        "CFrame": {"_type": "CFrame", "components": [937.5429, 26.621292, 888.5725, -0.363984, 0.0, -0.93141717, 0.0, 0.9999855, 0.0, 0.93141705, 0.0, -0.363984]},
+        "Size": {"_type": "Vector3", "x": 1.0, "y": 1.0, "z": 1.0},
+        "SerializedOverrides": {"_type": "BinaryString", "base64": ""},
+    }))
+    .unwrap();
+    assert!(changed_fields(&before, &after, true).is_empty());
+    let mut moved = after.clone();
+    moved["CFrame"]["components"][0] = json!(937.56);
+    assert_eq!(
+        changed_fields(&before, &moved, false),
+        json!([{"name":"CFrame"}]).as_array().unwrap().clone()
+    );
+    let mut overridden = after.clone();
+    overridden["SerializedOverrides"]["base64"] = json!("AQ==");
+    assert_eq!(
+        changed_fields(&before, &overridden, false),
+        json!([{"name":"SerializedOverrides"}])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+}
+
+#[test]
+fn members_saved_by_one_side_only_are_set_aside_per_class() {
+    use crate::tests::support::{settings_document, settings_instance};
+    let mut before = settings_document(vec![
+        settings_instance("w", "Workspace", "Workspace", None),
+        settings_instance("a", "Skin", "SurfaceAppearance", Some(0)),
+        settings_instance("p", "Part", "Part", Some(0)),
+    ]);
+    before.instances[2]
+        .properties
+        .insert("Anchored".into(), json!(true));
+    let mut after = before.clone();
+    after.instances[1]
+        .properties
+        .insert("SurfaceSlot".into(), json!(-1));
+    after.instances[2]
+        .properties
+        .insert("Anchored".into(), json!(false));
+    let database = rbx_reflection_database::get().unwrap();
+    let omitted = omit_one_sided_class_properties(&mut before, &mut after, database);
+    assert_eq!(omitted, BTreeMap::from([("SurfaceSlot".to_string(), 1)]));
+    assert!(after.instances[1].properties.is_empty());
+    assert_eq!(after.instances[2].properties["Anchored"], false);
+}
+
 fn fixture(reverse: bool, revision: f64) -> WeakDom {
     let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
     let root = dom.insert(dom.root_ref(), InstanceBuilder::new("Workspace"));

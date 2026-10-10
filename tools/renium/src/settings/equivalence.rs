@@ -746,7 +746,39 @@ struct IdentityAssignment<'a> {
     used_ids: HashSet<String>,
     generated: usize,
     remaining: usize,
+    shape_keys: Option<(Vec<u64>, Vec<u64>)>,
 }
+
+/// Hash of an instance's subtree by names and classes only, so same-named
+/// siblings that swapped places pair with the subtree they came from.
+fn subtree_shape_keys(document: &SettingsBytecode) -> Vec<u64> {
+    use std::hash::{Hash, Hasher};
+    let count = document.instances.len();
+    let mut children = vec![Vec::new(); count];
+    for (index, instance) in document.instances.iter().enumerate() {
+        if let Some(parent) = instance.parent_index
+            && parent < index
+        {
+            children[parent].push(index);
+        }
+    }
+    let mut keys = vec![0u64; count];
+    for index in (0..count).rev() {
+        let instance = &document.instances[index];
+        let mut child_keys = children[index]
+            .iter()
+            .map(|child| keys[*child])
+            .collect::<Vec<_>>();
+        child_keys.sort_unstable();
+        let mut hasher = ahash::AHasher::default();
+        instance.name.hash(&mut hasher);
+        instance.class_name.hash(&mut hasher);
+        child_keys.hash(&mut hasher);
+        keys[index] = hasher.finish();
+    }
+    keys
+}
+
 struct IdentityNumberField {
     attribute: bool,
     property: String,
@@ -899,6 +931,7 @@ impl<'a> IdentityAssignment<'a> {
             used_ids: HashSet::new(),
             generated: 0,
             remaining: observed.instances.len(),
+            shape_keys: None,
         }
     }
 
@@ -1198,6 +1231,12 @@ impl<'a> IdentityAssignment<'a> {
         reference_groups: &HashMap<IdentityGroupKey<'a>, Vec<usize>>,
     ) -> bool {
         let mut progressed = false;
+        let shapes = self.shape_keys.take().unwrap_or_else(|| {
+            (
+                subtree_shape_keys(self.reference),
+                subtree_shape_keys(self.observed),
+            )
+        });
         for (key, observed_group) in self.unassigned_groups() {
             let candidates = reference_groups
                 .get(&key)
@@ -1206,16 +1245,42 @@ impl<'a> IdentityAssignment<'a> {
                 .copied()
                 .filter(|candidate| !self.used_reference[*candidate])
                 .collect::<Vec<_>>();
-            let paired = observed_group.len().min(candidates.len());
-            for (index, candidate) in observed_group.iter().zip(&candidates) {
-                self.assign(*index, *candidate);
-                progressed = true;
+            let mut by_shape: HashMap<u64, std::collections::VecDeque<usize>> = HashMap::new();
+            for (position, candidate) in candidates.iter().enumerate() {
+                by_shape
+                    .entry(shapes.0[*candidate])
+                    .or_default()
+                    .push_back(position);
             }
-            for index in observed_group.into_iter().skip(paired) {
-                self.assign_fresh(index);
+            let mut taken = vec![false; candidates.len()];
+            let mut unpaired = Vec::new();
+            for index in observed_group {
+                match by_shape
+                    .get_mut(&shapes.1[index])
+                    .and_then(std::collections::VecDeque::pop_front)
+                {
+                    Some(position) => {
+                        taken[position] = true;
+                        self.assign(index, candidates[position]);
+                        progressed = true;
+                    }
+                    None => unpaired.push(index),
+                }
+            }
+            let mut leftovers = candidates
+                .iter()
+                .zip(&taken)
+                .filter(|(_, taken)| !**taken)
+                .map(|(candidate, _)| *candidate);
+            for index in unpaired {
+                match leftovers.next() {
+                    Some(candidate) => self.assign(index, candidate),
+                    None => self.assign_fresh(index),
+                }
                 progressed = true;
             }
         }
+        self.shape_keys = Some(shapes);
         progressed
     }
 }
@@ -4968,6 +5033,49 @@ mod tests {
         legacy.instances[1].settings_id = "different-camera-with-the-same-name".into();
         inherit_workspace_viewport_reference(&mut legacy, &reference);
         assert!(!legacy.instances[0].properties.contains_key("CurrentCamera"));
+    }
+
+    #[test]
+    fn swapped_same_named_siblings_pair_with_their_own_subtrees() {
+        let instance = |id: &str, name: &str, class: &str, parent: Option<usize>, pivot: f64| {
+            let mut instance =
+                SettingsBytecodeInstance::new(id.into(), name.into(), class.into(), parent);
+            instance.properties.insert(
+                "WorldPivot".into(),
+                json!({"_type": "CFrame", "components": [pivot, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]}),
+            );
+            instance
+        };
+        let reference = SettingsBytecode {
+            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
+            instances: vec![
+                instance("root", "GaragePlace", "Folder", None, 0.0),
+                instance("small", "Model", "Model", Some(0), 1.0),
+                instance("small-part", "Part", "Part", Some(1), 1.5),
+                instance("large", "Model", "Model", Some(0), 2.0),
+                instance("large-a", "Part", "Part", Some(3), 2.5),
+                instance("large-b", "Part", "Part", Some(3), 2.75),
+            ],
+        };
+        let mut observed = SettingsBytecode {
+            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
+            instances: vec![
+                instance("o0", "GaragePlace", "Folder", None, 0.0),
+                instance("o1", "Model", "Model", Some(0), 20.0),
+                instance("o2", "Part", "Part", Some(1), 25.0),
+                instance("o3", "Part", "Part", Some(1), 27.5),
+                instance("o4", "Model", "Model", Some(0), 10.0),
+                instance("o5", "Part", "Part", Some(4), 15.0),
+            ],
+        };
+        assert!(align_settings_ids_to_reference(&reference, &mut observed));
+        assert_eq!(observed.instances[1].settings_id, "large");
+        assert_eq!(observed.instances[4].settings_id, "small");
+        assert_eq!(observed.instances[5].settings_id, "small-part");
+        assert!(matches!(
+            observed.instances[2].settings_id.as_str(),
+            "large-a" | "large-b"
+        ));
     }
 
     #[test]

@@ -77,6 +77,78 @@ fn omit_engine_managed_properties(document: &mut SettingsBytecode) -> BTreeMap<S
     omitted
 }
 
+struct ClassMembers {
+    instances: usize,
+    carried: HashMap<String, usize>,
+}
+
+fn class_members(document: &SettingsBytecode) -> HashMap<String, ClassMembers> {
+    let mut classes = HashMap::<String, ClassMembers>::new();
+    for instance in &document.instances {
+        let members = classes
+            .entry(instance.class_name.clone())
+            .or_insert_with(|| ClassMembers {
+                instances: 0,
+                carried: HashMap::new(),
+            });
+        members.instances += 1;
+        for name in instance.properties.keys() {
+            *members.carried.entry(name.clone()).or_default() += 1;
+        }
+    }
+    classes
+}
+
+/// Studio saves a member on every instance of a class or on none, so a member
+/// without a reflection default (elision cannot have removed it) that every
+/// instance of a class carries on one side and none carries on the other came
+/// or went with a Studio version, not with an edit. Dropped before identities
+/// are matched so the instances still pair by content. Services stay: their
+/// single record cannot tell a version from an edit.
+fn omit_one_sided_class_properties(
+    before: &mut SettingsBytecode,
+    after: &mut SettingsBytecode,
+    database: &rbx_reflection::ReflectionDatabase<'_>,
+) -> BTreeMap<String, usize> {
+    let mut omitted = BTreeMap::new();
+    let before_members = class_members(before);
+    let after_members = class_members(after);
+    for (document, own, other) in [
+        (before, &before_members, &after_members),
+        (after, &after_members, &before_members),
+    ] {
+        for instance in &mut document.instances {
+            let class_name = instance.class_name.as_str();
+            let (Some(own), Some(other)) = (own.get(class_name), other.get(class_name)) else {
+                continue;
+            };
+            let Some(class) = database.classes.get(class_name) else {
+                continue;
+            };
+            if class.tags.contains(&rbx_reflection::ClassTag::Service) {
+                continue;
+            }
+            instance.properties.retain(|name, _| {
+                let one_sided = own.carried.get(name) == Some(&own.instances)
+                    && !other.carried.contains_key(name)
+                    && database.find_default_property(class, name).is_none()
+                    && rbx_logical_property_name(database, class_name, name).is_none_or(
+                        |logical| database.find_default_property(class, logical).is_none(),
+                    )
+                    && rbx_serialized_property_name_for_logical(database, class_name, name)
+                        .is_none_or(|serialized| {
+                            database.find_default_property(class, serialized).is_none()
+                        });
+                if one_sided {
+                    *omitted.entry(name.clone()).or_default() += 1;
+                }
+                !one_sided
+            });
+        }
+    }
+    omitted
+}
+
 /// A saved place never contains instances with Archivable off, so a project
 /// that carries them (Studio-only helpers, plugin state) cannot be compared on
 /// them.
@@ -437,9 +509,17 @@ fn changed_fields(
     }
     let mut names = before
         .iter()
-        .filter_map(|(name, value)| (after.get(name) != Some(value)).then_some(name))
+        .filter_map(|(name, value)| {
+            let other = after.get(name);
+            (other != Some(value) && !field_noise(Some(value), other)).then_some(name)
+        })
         .collect::<Vec<_>>();
-    names.extend(after.keys().filter(|name| !before.contains_key(*name)));
+    names.extend(
+        after
+            .iter()
+            .filter(|(name, value)| !before.contains_key(*name) && !field_noise(None, Some(value)))
+            .map(|(name, _)| name),
+    );
     names.sort_unstable();
     names.into_iter().map(|name| {
         if values {
@@ -448,6 +528,44 @@ fn changed_fields(
             json!({"name":name})
         }
     }).collect()
+}
+
+/// Differences no edit produced: an empty blob against none, which Studio
+/// versions save either way, and a CFrame moved by float noise, which a
+/// rigid transform through float32 leaves behind.
+fn field_noise(before: Option<&Value>, after: Option<&Value>) -> bool {
+    match (before, after) {
+        (None, Some(value)) | (Some(value), None) => {
+            value.get("_type").and_then(Value::as_str) == Some("BinaryString")
+                && value.get("base64").and_then(Value::as_str) == Some("")
+        }
+        (Some(before), Some(after)) => {
+            let components = |value: &Value| {
+                (value.get("_type").and_then(Value::as_str) == Some("CFrame"))
+                    .then(|| value.get("components")?.as_array())
+                    .flatten()
+                    .filter(|components| components.len() == 12)
+                    .map(|components| components.iter().map(Value::as_f64).collect::<Vec<_>>())
+            };
+            match (components(before), components(after)) {
+                (Some(before), Some(after)) => {
+                    before
+                        .iter()
+                        .zip(&after)
+                        .enumerate()
+                        .all(|(index, (a, b))| {
+                            let tolerance = if index < 3 { 1e-3 } else { 2e-5 };
+                            match (a, b) {
+                                (Some(a), Some(b)) => (a - b).abs() <= tolerance,
+                                _ => false,
+                            }
+                        })
+                }
+                _ => false,
+            }
+        }
+        (None, None) => true,
+    }
 }
 
 pub(super) fn compare(
@@ -467,6 +585,8 @@ pub(super) fn compare(
     for (name, count) in omit_engine_managed_properties(&mut after) {
         *engine_managed.entry(name).or_default() += count;
     }
+    let database = rbx_reflection_database::get()?;
+    let one_sided = omit_one_sided_class_properties(&mut before, &mut after, database);
     let mut not_captured = BTreeMap::new();
     log_global(
         4,
@@ -506,7 +626,6 @@ pub(super) fn compare(
     // Against a project, a saved field the project never captures says nothing
     // when the project lacks it.
     let project_target = args.against.is_none();
-    let database = rbx_reflection_database::get()?;
     let captured_by_class = if project_target {
         before
             .instances
@@ -636,6 +755,9 @@ pub(super) fn compare(
     crate::app::output::drop_false(&mut result, &["truncated"]);
     if !engine_managed.is_empty() {
         result["engineManagedProperties"] = json!(engine_managed);
+    }
+    if !one_sided.is_empty() {
+        result["oneSidedProperties"] = json!(one_sided);
     }
     if !not_captured.is_empty() {
         result["notCapturedProjectProperties"] = json!(not_captured);
