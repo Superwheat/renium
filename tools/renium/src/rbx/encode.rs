@@ -628,6 +628,10 @@ fn rbx_serialized_property_descriptor<'db>(
 /// Fill those from the values the stores carry so a saved field unknown to
 /// the database keeps the engine's value on every instance, and drop empty
 /// unscriptable blobs, which Studio leaves out of its own saves.
+/// Studio reads a StyleRule's property map strictly: an empty map must still
+/// carry its zero count (four bytes), where the attribute writer emits
+/// nothing and Studio then refuses the place ("Failed to read StyleRule
+/// properties: Unexpected end of file"). Ordinary attribute maps accept both.
 pub(crate) fn normalize_export_dom(dom: &mut RbxWeakDom, database: &ReflectionDatabase<'_>) {
     let mut by_class: HashMap<rbx_dom_weak::Ustr, Vec<RbxRef>> = HashMap::new();
     for instance in dom.descendants() {
@@ -635,6 +639,24 @@ pub(crate) fn normalize_export_dom(dom: &mut RbxWeakDom, database: &ReflectionDa
             .entry(instance.class)
             .or_default()
             .push(instance.referent());
+    }
+    if let Some(rules) = by_class.get(&rbx_dom_weak::Ustr::from("StyleRule")) {
+        let name = rbx_dom_weak::Ustr::from("Properties");
+        for referent in rules {
+            if let Some(instance) = dom.get_by_ref_mut(*referent) {
+                let empty = match instance.properties.get(&name) {
+                    None => true,
+                    Some(RbxVariant::Attributes(attributes)) => attributes.is_empty(),
+                    Some(_) => false,
+                };
+                if empty {
+                    instance.properties.insert(
+                        name,
+                        RbxVariant::BinaryString(RbxBinaryString::from(vec![0u8; 4])),
+                    );
+                }
+            }
+        }
     }
     for (class_name, referents) in by_class {
         let class = database.classes.get(class_name.as_str());
@@ -1959,6 +1981,60 @@ mod tests {
         assert_eq!(
             parts, 1,
             "members the database defaults are left to the writer"
+        );
+    }
+
+    #[test]
+    fn style_rules_keep_a_counted_empty_property_map() {
+        let database = rbx_reflection_database::get().unwrap();
+        let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+        let storage = dom.insert(dom.root_ref(), RbxInstanceBuilder::new("ReplicatedStorage"));
+        let bare = dom.insert(storage, RbxInstanceBuilder::new("StyleRule"));
+        let empty = dom.insert(
+            storage,
+            RbxInstanceBuilder::new("StyleRule")
+                .with_property("Properties", RbxVariant::Attributes(RbxAttributes::new())),
+        );
+        let mut filled = RbxAttributes::new();
+        filled.insert("Visible".to_string(), RbxVariant::Bool(false));
+        let set = dom.insert(
+            storage,
+            RbxInstanceBuilder::new("StyleRule")
+                .with_property("Properties", RbxVariant::Attributes(filled.clone())),
+        );
+        normalize_export_dom(&mut dom, database);
+        let property = |referent: RbxRef| {
+            dom.get_by_ref(referent)
+                .unwrap()
+                .properties
+                .get(&rbx_dom_weak::Ustr::from("Properties"))
+                .cloned()
+        };
+        let counted = Some(RbxVariant::BinaryString(RbxBinaryString::from(vec![
+            0u8;
+            4
+        ])));
+        assert_eq!(property(bare), counted);
+        assert_eq!(property(empty), counted);
+        assert_eq!(property(set), Some(RbxVariant::Attributes(filled)));
+        let mut bytes = Vec::new();
+        rbx_binary::to_writer(&mut bytes, &dom, &[storage]).unwrap();
+        let decoded = rbx_binary::from_reader(std::io::Cursor::new(bytes)).unwrap();
+        let rules = decoded
+            .descendants()
+            .filter(|instance| instance.class == "StyleRule")
+            .map(|instance| {
+                instance
+                    .properties
+                    .get(&rbx_dom_weak::Ustr::from("Properties"))
+                    .cloned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rules.len(), 3);
+        assert!(
+            rules
+                .iter()
+                .all(|value| matches!(value, Some(RbxVariant::Attributes(_))))
         );
     }
 
