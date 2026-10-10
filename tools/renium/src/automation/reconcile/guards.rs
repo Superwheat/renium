@@ -7,7 +7,6 @@ pub(crate) fn pin_edit_runtime(context: &BoundContext, bridge: &BridgeServer) ->
         .context("Live Sync context has no edit-mode Studio runtime")?;
     bridge.clear_runtime_pins();
     bridge.pin_runtime(BridgeTarget::Edit, runtime_id);
-    bridge.pin_runtime(BridgeTarget::Main, runtime_id);
     Ok(())
 }
 

@@ -1173,8 +1173,21 @@ pub(crate) fn select_bridge_context(
     context: &automation::BoundContext,
     bridge: &BridgeServer,
 ) -> bound_context::Selection {
+    select_bridge_context_for_request(context, bridge, false)
+}
+
+/// A request that works inside one play runtime holds only that runtime's
+/// gate, so it runs beside Live Sync and other play requests; clearing the
+/// shared pins from it would reroute their calls mid-flight.
+pub(crate) fn select_bridge_context_for_request(
+    context: &automation::BoundContext,
+    bridge: &BridgeServer,
+    keep_pins: bool,
+) -> bound_context::Selection {
     let selection = bound_context::select(context);
-    bridge.clear_runtime_pins();
+    if !keep_pins {
+        bridge.clear_runtime_pins();
+    }
     if let Some(runtime_id) = context.runtime_id.as_deref() {
         bridge.pin_runtime(BridgeTarget::Edit, runtime_id);
     }
@@ -1230,7 +1243,8 @@ fn automation_dispatch_operation(
             ),
         );
     }
-    let _selection = select_bridge_context(context, bridge);
+    let keep_pins = play_target_selector(operation, parameters).is_some();
+    let _selection = select_bridge_context_for_request(context, bridge, keep_pins);
     match operation {
         op::STUDIO_AUDIO => {
             let player = match parameters.get("player") {

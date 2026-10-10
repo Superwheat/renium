@@ -790,12 +790,16 @@ fn native_export_stays_in_edit_during_rapid_play_server_replacement() {
         );
         // Reproduce Live Sync's Edit pin while a higher-ranked server exists.
         bridge.clear_runtime_pins();
-        bridge.pin_runtime(BridgeTarget::Main, "export-edit");
         bridge.pin_runtime(BridgeTarget::Edit, "export-edit");
         for method in [
             "beginEditorBinaryExport",
             "awaitEditorBinaryExport",
             "finishEditorBinaryExport",
+            "beginEditorTransaction",
+            "commitEditorTransaction",
+            "rollbackEditorTransaction",
+            "getLiveSourceBatch",
+            "getStudioChangeState",
         ] {
             assert_eq!(
                 bridge.call(method, json!({})).unwrap()["runtime"],
@@ -823,11 +827,27 @@ fn native_export_stays_in_edit_during_rapid_play_server_replacement() {
                 .chunk,
             "edit"
         );
-        // A new runtime operation, without that binding, still chooses Play.
+        // A runtime command chooses Play even while the Edit pin stands.
+        assert_eq!(
+            bridge.call("getGuiBounds", json!({})).unwrap()["runtime"],
+            "play"
+        );
+        // A play-runtime request keeps the shared pins; a new runtime
+        // operation re-selects and still chooses Play.
+        let _play =
+            crate::automation::runtime::select_bridge_context_for_request(&context, &bridge, true);
+        assert_eq!(
+            bridge.call("commitEditorTransaction", json!({})).unwrap()["runtime"],
+            "export-edit"
+        );
         let _command = crate::automation::runtime::select_bridge_context(&context, &bridge);
         assert_eq!(
             bridge.call("getGuiBounds", json!({})).unwrap()["runtime"],
             "play"
+        );
+        assert_eq!(
+            bridge.call("commitEditorTransaction", json!({})).unwrap()["runtime"],
+            "export-edit"
         );
         let channel = &bridge.channels[1];
         let mut sockets = channel.sockets.lock().unwrap();

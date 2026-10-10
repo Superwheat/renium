@@ -1866,7 +1866,6 @@ fn push_full(
     let _selection = bound_context::select(context);
     bridge.clear_runtime_pins();
     if let Some(runtime_id) = context.runtime_id.as_deref() {
-        bridge.pin_runtime(BridgeTarget::Main, runtime_id);
         bridge.pin_runtime(BridgeTarget::Edit, runtime_id);
     }
     let services = super::reconcile::sync_services();
@@ -1936,7 +1935,6 @@ fn pull_studio_changes(
     let parameters = json!({ "services": &services });
     let _selection = bound_context::select(context);
     bridge.clear_runtime_pins();
-    bridge.pin_runtime(BridgeTarget::Main, runtime_id);
     bridge.pin_runtime(BridgeTarget::Edit, runtime_id);
     let info = bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?;
     let published = export_snapshots_with_warm_bridge(

@@ -156,18 +156,25 @@ fn is_status_observation(method: &str, params: &Value) -> bool {
         || method == "startStopPlay" && params.as_object().is_some_and(serde_json::Map::is_empty)
 }
 
+/// Editor methods describe or change saved Edit state, never a running
+/// simulation. Main intentionally prefers a play server for runtime commands,
+/// so an editor transaction routed there is not found on that side and the
+/// real one stays open in Edit.
+pub(crate) fn is_editor_method(method: &str) -> bool {
+    method.contains("Editor")
+        || method.starts_with("getLiveSource")
+        || method.starts_with("getSourceRange")
+        || matches!(
+            method,
+            "getStudioChangeState" | "verifyPushProof" | "requestProtectedWriteReview"
+        )
+}
+
 fn default_method_target(method: &str) -> BridgeTarget {
-    // Native exports describe saved Edit state, never a running simulation.
-    // Main intentionally prefers a play server for runtime commands; using it
-    // here can even replace an existing Edit pin when Play starts.
-    match method {
-        "beginEditorBinaryExport"
-        | "awaitEditorBinaryExport"
-        | "readEditorBinaryExport"
-        | "readEditorBinaryExportBatch"
-        | "getEditorBinaryOverlayChunk"
-        | "finishEditorBinaryExport" => BridgeTarget::Edit,
-        _ => BridgeTarget::Main,
+    if is_editor_method(method) {
+        BridgeTarget::Edit
+    } else {
+        BridgeTarget::Main
     }
 }
 
