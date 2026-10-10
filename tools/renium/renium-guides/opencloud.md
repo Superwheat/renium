@@ -98,6 +98,8 @@ rbx oc experiment stats EXPERIMENT
 rbx oc experiment start EXPERIMENT
 rbx oc thumbnail personalization --limit 10
 rbx oc thumbnail personalization-create --field homepageThumbnailIds='["THUMBNAIL_1","THUMBNAIL_2"]'
+rbx oc universe icon icon.png
+rbx oc universe thumbnail-upload shot.png
 rbx oc thumbnail upload first.png --file files=second.png
 rbx oc thumbnail upload-status -q operationIds=OPERATION_1 -q operationIds=OPERATION_2
 ```

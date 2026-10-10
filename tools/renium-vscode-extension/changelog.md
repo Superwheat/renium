@@ -10,6 +10,8 @@
 - Places that follow a shared link get the scripts as read-only files under the shared root, as in the source place, and files there that the package does not contain are moved to `.renium/link-replaced/ID/` (listed as `replacedFiles`, counted per place as `replaced`) instead of stopping the update.
 - A Roblox PackageLink directly under a shared root is left out of the package and reported as `strippedPackageLinks`, together with the `rbx upl` command that unlinks it in the source place. Packages nested deeper, such as TopbarPlus, travel unchanged.
 
+- `rbx oc universe icon FILE` sets the experience's main icon and `rbx oc universe thumbnail-upload FILE` adds a thumbnail, through the legacy publish API that Open Cloud exposes to API keys (the key needs the legacy publishing permission); `oc localization game-icon-set` keeps setting per-language icons.
+
 ### Bug fixes
 
 - Pushes no longer crash Studio 0.742 (Windows exception c0000374). Renium hooks Studio's change-history recording for Terrain cancellations and token-based recordings; that hook was verified on 0.741 and corrupts 0.742's heap on the first recording that passes through it. The hook is now installed only on builds it is verified on (0.741 and older); newer builds skip it and cancellations restore Terrain explicitly. The first symptom was a crash during the automatic package desync, because package pushes are the common case that registers a recording before writing.
