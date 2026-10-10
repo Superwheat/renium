@@ -174,12 +174,36 @@ struct ProcessMemory {
     handle: HANDLE,
 }
 
+/// The newest Studio build on which Renium's native operations (injected
+/// helpers, memory patches, the capture) are verified. Every native operation
+/// opens the process here, so a newer build gets none of them: Studio 0.742
+/// exited with heap corruption (0xc0000374) under the helpers verified on
+/// 0.741, during captures, at Live Sync start and after a plain connect.
+pub(super) const NATIVE_VERIFIED_BUILD: u32 = 741;
+
+pub(super) fn native_build_verified(build: u32) -> bool {
+    build <= NATIVE_VERIFIED_BUILD
+}
+
+fn ensure_native_verified(pid: u32) -> Result<()> {
+    match studio_build_number(pid) {
+        Ok(build) if native_build_verified(build) => Ok(()),
+        Ok(build) => bail!(
+            "Native Studio operations are disabled on Studio 0.{build}; the last verified build is 0.{NATIVE_VERIFIED_BUILD}"
+        ),
+        Err(error) => bail!(
+            "Native Studio operations are disabled because the Studio build could not be read: {error:#}"
+        ),
+    }
+}
+
 impl ProcessMemory {
     fn open(pid: u32) -> Result<Self> {
         Self::open_with_access(pid, 0)
     }
 
     fn open_with_access(pid: u32, additional: u32) -> Result<Self> {
+        ensure_native_verified(pid)?;
         let access = PROCESS_CREATE_THREAD
             | additional
             | PROCESS_QUERY_INFORMATION

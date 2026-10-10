@@ -1629,7 +1629,14 @@ mod platform {
         let setup = (|| -> Result<_> {
             crate::project::workflows::windows_launch::protect_process(pid)?;
             let (top, _, _) = main_studio_window(pid)?;
-            crate::studio::native::serializer::suppress_package_notices(pid)?;
+            if let Err(error) = crate::studio::native::serializer::suppress_package_notices(pid) {
+                crate::app::output::log_global(
+                    4,
+                    format_args!(
+                        "[renium] package notice patch unavailable, watching the dialog only: {error:#}"
+                    ),
+                );
+            }
             let com = ComGuard::initialize()?;
             let automation: IUIAutomation =
                 unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }

@@ -221,18 +221,14 @@ const HISTORY_HOOK_VERIFIED_BUILD: u32 = 741;
 static NATIVE_CAPTURE_WARNED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 
 #[cfg(windows)]
-/// The newest Studio build on which the native capture is verified. Studio
-/// 0.742 exited with heap corruption (0xc0000374) during captures that ran
-/// beside Team Create replication; newer builds serialize through the plugin
-/// until the capture is verified again.
-const NATIVE_CAPTURE_VERIFIED_BUILD: u32 = 741;
-
-#[cfg(windows)]
+/// Newer builds serialize through the plugin until the native capture is
+/// verified again; see `windows::NATIVE_VERIFIED_BUILD`.
 pub(crate) fn native_capture_verified(pid: u32) -> bool {
     let reason = match studio_build_number(pid) {
-        Ok(build) if build <= NATIVE_CAPTURE_VERIFIED_BUILD => return true,
+        Ok(build) if windows::native_build_verified(build) => return true,
         Ok(build) => format!(
-            "Studio 0.{build} is newer than build 0.{NATIVE_CAPTURE_VERIFIED_BUILD}, the last one the native capture is verified on"
+            "Studio 0.{build} is newer than build 0.{}, the last one the native capture is verified on",
+            windows::NATIVE_VERIFIED_BUILD
         ),
         Err(error) => format!("the Studio build could not be read: {error:#}"),
     };

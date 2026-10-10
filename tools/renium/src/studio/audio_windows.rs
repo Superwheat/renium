@@ -175,7 +175,12 @@ impl Backend {
             }
         };
         if self.gate.is_none() && matches!(action, Action::Mute | Action::Auto) {
-            self.gate = Some(AudioOutputGate::new(self.pid)?);
+            match AudioOutputGate::new(self.pid) {
+                Ok(gate) => self.gate = Some(gate),
+                Err(error) => {
+                    status.error = Some(format!("Could not gate Studio audio output: {error:#}"));
+                }
+            }
         }
         let mut suppressed = false;
         if let Some(gate) = &self.gate {
