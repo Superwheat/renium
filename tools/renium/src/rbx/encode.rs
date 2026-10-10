@@ -771,7 +771,18 @@ pub(crate) fn json_to_rbx_property_variant(
         Some(RbxDataType::Value(target_type)) => {
             json_to_rbx_variant_for_type(value, *target_type, database, refs)
         }
-        Some(_) | None => json_to_rbx_inferred_variant(value, database, refs),
+        // The stores keep integer and float values apart, and Studio refuses
+        // an integer member (SurfaceAppearance.SurfaceSlot) saved as a double.
+        Some(_) | None => match value {
+            Value::Number(number) if number.is_i64() || number.is_u64() => {
+                let value = json_i64(value)?;
+                Some(match i32::try_from(value) {
+                    Ok(value) => RbxVariant::Int32(value),
+                    Err(_) => RbxVariant::Int64(value),
+                })
+            }
+            _ => json_to_rbx_inferred_variant(value, database, refs),
+        },
     }
 }
 
@@ -1948,6 +1959,40 @@ mod tests {
         assert_eq!(
             parts, 1,
             "members the database defaults are left to the writer"
+        );
+    }
+
+    #[test]
+    fn untyped_integers_export_as_integers_and_load_back_as_such() {
+        let database = rbx_reflection_database::get().unwrap();
+        let refs = BytecodeModelExportRefs::default();
+        assert_eq!(
+            json_to_rbx_property_variant(&json!(-1), None, database, &refs),
+            Some(RbxVariant::Int32(-1))
+        );
+        assert_eq!(
+            json_to_rbx_property_variant(&json!(5_000_000_000i64), None, database, &refs),
+            Some(RbxVariant::Int64(5_000_000_000))
+        );
+        assert_eq!(
+            json_to_rbx_property_variant(&json!(1.5), None, database, &refs),
+            Some(RbxVariant::Float64(1.5))
+        );
+        let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+        let appearance = dom.insert(
+            dom.root_ref(),
+            RbxInstanceBuilder::new("SurfaceAppearance")
+                .with_property("SurfaceSlot", RbxVariant::Int32(-1)),
+        );
+        let mut bytes = Vec::new();
+        rbx_binary::to_writer(&mut bytes, &dom, &[appearance]).unwrap();
+        let decoded = rbx_binary::from_reader(std::io::Cursor::new(bytes)).unwrap();
+        let decoded = decoded.get_by_ref(decoded.root().children()[0]).unwrap();
+        assert_eq!(
+            decoded
+                .properties
+                .get(&rbx_dom_weak::Ustr::from("SurfaceSlot")),
+            Some(&RbxVariant::Int32(-1))
         );
     }
 
