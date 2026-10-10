@@ -172,6 +172,7 @@ struct ActiveDataModel {
 
 struct ProcessMemory {
     handle: HANDLE,
+    verified: bool,
 }
 
 /// The newest Studio build on which Renium's native operations (injected
@@ -185,17 +186,32 @@ pub(super) fn native_build_verified(build: u32) -> bool {
     build <= NATIVE_VERIFIED_BUILD
 }
 
-fn ensure_native_verified(pid: u32) -> Result<()> {
-    match studio_build_number(pid) {
-        Ok(build) if native_build_verified(build) => Ok(()),
-        Ok(build) => bail!(
-            "Native Studio operations are disabled on Studio 0.{build}; the last verified build is 0.{NATIVE_VERIFIED_BUILD}"
+static NATIVE_GATE_WARNED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// Reads stay available on every build: discovery, status and comparisons
+/// only look at Studio's memory. Writes, allocations and remote threads are
+/// what corrupt an unverified build, so those refuse.
+fn native_writes_verified(pid: u32) -> bool {
+    let reason = match studio_build_number(pid) {
+        Ok(build) if native_build_verified(build) => return true,
+        Ok(build) => format!(
+            "Studio 0.{build} is newer than build 0.{NATIVE_VERIFIED_BUILD}, the last one Renium's native operations are verified on"
         ),
-        Err(error) => bail!(
-            "Native Studio operations are disabled because the Studio build could not be read: {error:#}"
-        ),
+        Err(error) => format!("the Studio build could not be read: {error:#}"),
+    };
+    let mut warned = NATIVE_GATE_WARNED.lock().unwrap_or_else(|e| e.into_inner());
+    if !warned.contains(&pid) {
+        warned.push(pid);
+        crate::app::output::log_global(
+            3,
+            format_args!("[renium] native Studio writes are disabled for this Studio: {reason}"),
+        );
     }
+    false
 }
+
+const NATIVE_WRITES_DISABLED: &str =
+    "Native Studio operations are disabled on this Studio build; the last verified build is 0.741";
 
 impl ProcessMemory {
     fn open(pid: u32) -> Result<Self> {
@@ -203,7 +219,7 @@ impl ProcessMemory {
     }
 
     fn open_with_access(pid: u32, additional: u32) -> Result<Self> {
-        ensure_native_verified(pid)?;
+        let verified = native_writes_verified(pid);
         let access = PROCESS_CREATE_THREAD
             | additional
             | PROCESS_QUERY_INFORMATION
@@ -218,7 +234,7 @@ impl ProcessMemory {
                 std::io::Error::last_os_error()
             );
         }
-        Ok(Self { handle })
+        Ok(Self { handle, verified })
     }
 
     fn read(&self, address: usize, output: &mut [u8]) -> Result<()> {
@@ -260,6 +276,7 @@ impl ProcessMemory {
     }
 
     fn write(&self, address: usize, bytes: &[u8]) -> Result<()> {
+        anyhow::ensure!(self.verified, NATIVE_WRITES_DISABLED);
         let mut written = 0;
         let ok = unsafe {
             WriteProcessMemory(
@@ -280,6 +297,7 @@ impl ProcessMemory {
     }
 
     fn allocate(&self, size: usize) -> Result<RemoteAllocation<'_>> {
+        anyhow::ensure!(self.verified, NATIVE_WRITES_DISABLED);
         let address = unsafe {
             VirtualAllocEx(
                 self.handle,
@@ -319,6 +337,7 @@ impl RemoteAllocation<'_> {
         timeout: u32,
         helper_owned: bool,
     ) -> Result<u32> {
+        anyhow::ensure!(self.memory.verified, NATIVE_WRITES_DISABLED);
         let start = Some(unsafe {
             transmute::<usize, unsafe extern "system" fn(*mut c_void) -> u32>(address)
         });
