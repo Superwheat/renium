@@ -1553,6 +1553,7 @@ fn build_project_file(
             .map(|(_, referent)| *referent)
             .collect::<Vec<_>>()
     };
+    crate::rbx::encode::finish_place_dom(&mut dom);
     let instances = roots.iter().map(|root| rbx_subtree_size(&dom, *root)).sum();
     match format {
         "rbxl" | "rbxm" => rbx_binary::to_writer(&mut writer, &dom, &roots)?,

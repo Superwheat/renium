@@ -103,9 +103,10 @@ pub(crate) fn property_change_needs_post_native_apply(change: &EditorPropertyCha
 #[cfg(any(windows, target_os = "macos"))]
 fn write_rbx_place_build(
     output_path: &Path,
-    build: &RbxPlaceBuild,
+    build: &mut RbxPlaceBuild,
     format: RbxPlaceFormat,
 ) -> Result<()> {
+    crate::rbx::encode::finish_place_dom(&mut build.dom);
     let top_level_refs = build
         .service_roots
         .iter()
@@ -3644,7 +3645,7 @@ fn write_editor_place_snapshot(
         format.write(output_path, &merged, &roots)?;
         return Ok(merged.descendants().count());
     }
-    write_rbx_place_build(output_path, &build, format)?;
+    write_rbx_place_build(output_path, &mut build, format)?;
     Ok(build.total_instances)
 }
 

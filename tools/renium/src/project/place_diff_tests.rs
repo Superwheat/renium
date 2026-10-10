@@ -84,6 +84,36 @@ fn members_saved_by_one_side_only_are_set_aside_per_class() {
     assert_eq!(after.instances[2].properties["Anchored"], false);
 }
 
+#[test]
+fn block_physics_placeholders_are_reported_while_computed_hulls_are_not() {
+    use crate::tests::support::{settings_document, settings_instance};
+    let mut document = settings_document(vec![
+        settings_instance("w", "Workspace", "Workspace", None),
+        settings_instance("a", "Tent", "MeshPart", Some(0)),
+        settings_instance("b", "Cone", "MeshPart", Some(0)),
+    ]);
+    document.instances[1].properties.insert(
+        "PhysicalConfigData".into(),
+        json!({"_type": "SharedString", "base64": "Q1NHUEhTAAAAAEJMT0NL"}),
+    );
+    document.instances[2].properties.insert(
+        "PhysicalConfigData".into(),
+        json!({"_type": "SharedString", "base64": base64::encode(b"CSGPHS\x08\0\0\0\x02\0(hull bytes)")}),
+    );
+    let omitted = omit_engine_managed_properties(&mut document);
+    assert_eq!(omitted.get("PhysicalConfigData"), Some(&1));
+    assert!(
+        document.instances[1]
+            .properties
+            .contains_key("PhysicalConfigData")
+    );
+    assert!(
+        !document.instances[2]
+            .properties
+            .contains_key("PhysicalConfigData")
+    );
+}
+
 fn fixture(reverse: bool, revision: f64) -> WeakDom {
     let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
     let root = dom.insert(dom.root_ref(), InstanceBuilder::new("Workspace"));

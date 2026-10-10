@@ -300,6 +300,7 @@ fn convert_service(
         }
         properties.retain(|name, _| {
             name == "Capabilities"
+                || name == crate::rbx::encode::COLLISION_HULL_PROPERTY
                 || !crate::editor::review::is_engine_managed_editor_property(
                     class_name, name, database,
                 )

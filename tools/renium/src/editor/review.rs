@@ -1194,6 +1194,7 @@ pub(crate) fn patch_place_protected_writes(path: &Path, rows: &[Value]) -> Resul
         applied += 1;
     }
     let top_level_refs = rbx_model_top_level_refs(&dom);
+    crate::rbx::encode::finish_place_dom(&mut dom);
     format.write(path, &dom, &top_level_refs)?;
     Ok(applied)
 }

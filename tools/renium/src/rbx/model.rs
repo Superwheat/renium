@@ -1618,13 +1618,15 @@ pub(crate) fn recorded_import_base(root: &Path) -> Result<Option<ImportBase>> {
 }
 
 /// Moves the built service roots into the base place, keeping the base's
-/// other services and the root fields the build does not carry.
+/// other services and the root fields the build does not carry. Collision
+/// hulls the build lacks are taken from the same part in the base.
 pub(crate) fn merge_build_into_base(
     build: &RbxPlaceBuild,
     mut dom: RbxWeakDom,
     base: &Path,
 ) -> Result<(RbxWeakDom, Vec<RbxRef>)> {
     let mut base_dom = RbxPlaceFormat::from_path(base)?.read(base)?;
+    crate::rbx::encode::fill_collision_hulls_from(&mut dom, &base_dom);
     let base_root = base_dom.root_ref();
     for (service, referent) in &build.service_roots {
         let existing = base_dom.root().children().iter().copied().find(|child| {
@@ -1662,6 +1664,7 @@ pub(crate) fn merge_build_into_base(
     }
     let top_level_refs = base_dom.root().children().to_vec();
     coerce_numeric_property_widths(&mut base_dom);
+    crate::rbx::encode::finish_place_dom(&mut base_dom);
     Ok((base_dom, top_level_refs))
 }
 
@@ -1710,6 +1713,7 @@ pub(crate) fn bytecode_export_place(mut args: BytecodeExportPlaceArgs) -> Result
         dom = merged;
         top_level_refs = refs;
     }
+    crate::rbx::encode::finish_place_dom(&mut dom);
     format.write(&args.output, &dom, &top_level_refs)?;
     let exported_services = build
         .service_roots

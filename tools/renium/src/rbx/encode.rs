@@ -752,6 +752,209 @@ fn neutral_export_variant(sample: &RbxVariant) -> Option<RbxVariant> {
     })
 }
 
+pub(crate) const COLLISION_HULL_PROPERTY: &str = "PhysicalConfigData";
+
+/// The inputs a collision hull is computed from: the base's hull is reused
+/// for a build part only when both agree. A place read from disk carries no
+/// CollisionFidelity value, so fidelity counts only when both sides have one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CollisionHullSources {
+    mesh: Option<String>,
+    fidelity: Option<String>,
+}
+
+impl CollisionHullSources {
+    fn of(instance: &rbx_dom_weak::Instance) -> Self {
+        let text = |name: &str| {
+            instance
+                .properties
+                .get(&rbx_dom_weak::Ustr::from(name))
+                .map(|value| format!("{value:?}"))
+        };
+        Self {
+            mesh: text("MeshContent").or_else(|| text("MeshId")),
+            fidelity: text("CollisionFidelity"),
+        }
+    }
+
+    fn agrees_with(&self, other: &Self) -> bool {
+        self.mesh == other.mesh
+            && match (&self.fidelity, &other.fidelity) {
+                (Some(a), Some(b)) => a == b,
+                _ => true,
+            }
+    }
+}
+
+fn carries_collision_hull(class: &str) -> bool {
+    matches!(
+        class,
+        "MeshPart" | "UnionOperation" | "NegateOperation" | "IntersectOperation"
+    )
+}
+
+/// The hull Studio stores for a part whose CollisionFidelity is Box.
+const BOX_COLLISION_HULL: &[u8] = b"CSGPHS\0\0\0\0BLOCK";
+
+const COLLISION_FIDELITY_BOX: u32 = 2;
+
+fn collides_as_box(instance: &rbx_dom_weak::Instance) -> bool {
+    match instance
+        .properties
+        .get(&rbx_dom_weak::Ustr::from("CollisionFidelity"))
+    {
+        Some(RbxVariant::Enum(value)) => value.to_u32() == COLLISION_FIDELITY_BOX,
+        Some(RbxVariant::EnumItem(item)) => item.value == COLLISION_FIDELITY_BOX,
+        _ => false,
+    }
+}
+
+fn has_collision_hull(instance: &rbx_dom_weak::Instance) -> bool {
+    matches!(
+        instance
+            .properties
+            .get(&rbx_dom_weak::Ustr::from(COLLISION_HULL_PROPERTY)),
+        Some(RbxVariant::SharedString(_) | RbxVariant::BinaryString(_))
+    )
+}
+
+/// Gives every part the build has no hull for the hull of the part at the
+/// same path in the base when its mesh and fidelity agree, and otherwise the
+/// one hull the base holds for that mesh, if there is exactly one.
+pub(crate) fn fill_collision_hulls_from(dom: &mut RbxWeakDom, base: &RbxWeakDom) {
+    let key = rbx_dom_weak::Ustr::from(COLLISION_HULL_PROPERTY);
+    let mut by_path: HashMap<(Vec<String>, Vec<usize>), (RbxVariant, CollisionHullSources)> =
+        HashMap::new();
+    let mut by_mesh: HashMap<(rbx_dom_weak::Ustr, String), Option<RbxVariant>> = HashMap::new();
+    for instance in base.descendants() {
+        if !carries_collision_hull(instance.class.as_str()) || !has_collision_hull(instance) {
+            continue;
+        }
+        let hull = instance.properties.get(&key).cloned().unwrap();
+        let sources = CollisionHullSources::of(instance);
+        if let Some(mesh) = sources.mesh.clone() {
+            by_mesh
+                .entry((instance.class, mesh))
+                .and_modify(|known| {
+                    if known.as_ref() != Some(&hull) {
+                        *known = None;
+                    }
+                })
+                .or_insert(Some(hull.clone()));
+        }
+        let path = crate::rbx::model::rbx_dom_instance_path_parts(base, instance.referent());
+        by_path.insert(path, (hull, sources));
+    }
+    if by_path.is_empty() {
+        return;
+    }
+    let targets = dom
+        .descendants()
+        .filter(|instance| {
+            carries_collision_hull(instance.class.as_str()) && !has_collision_hull(instance)
+        })
+        .map(|instance| instance.referent())
+        .collect::<Vec<_>>();
+    let mut unmatched = 0usize;
+    let mut filled = 0usize;
+    for referent in targets {
+        let path = crate::rbx::model::rbx_dom_instance_path_parts(dom, referent);
+        let Some(instance) = dom.get_by_ref_mut(referent) else {
+            continue;
+        };
+        let sources = CollisionHullSources::of(instance);
+        let at_path = by_path.get(&path);
+        let hull = match at_path {
+            Some((hull, base_sources)) if base_sources.agrees_with(&sources) => Some(hull),
+            _ => sources
+                .mesh
+                .as_ref()
+                .and_then(|mesh| by_mesh.get(&(instance.class, mesh.clone())))
+                .and_then(Option::as_ref),
+        };
+        match hull {
+            Some(hull) => {
+                filled += 1;
+                instance.properties.insert(key, hull.clone());
+            }
+            None if unmatched < 20 => {
+                unmatched += 1;
+                let reason = match at_path {
+                    Some((_, base_sources)) => format!("base part has {base_sources:?}"),
+                    None => "no base part at this path".to_string(),
+                };
+                crate::app::output::log_global(
+                    4,
+                    format_args!(
+                        "[renium] no collision hull for {} with {sources:?}: {reason}",
+                        path.0.join(".")
+                    ),
+                );
+            }
+            None => unmatched += 1,
+        }
+    }
+    crate::app::output::log_global(
+        4,
+        format_args!(
+            "[renium] the base place supplied {filled} collision hulls; {unmatched} parts still lack one"
+        ),
+    );
+}
+
+/// The last step before a place or model is written. A file carries
+/// collision hulls for every part of a class or for none: the writer fills a
+/// missing one with the database default, the BLOCK placeholder, which makes
+/// the part collide as a box. Leaving the whole class without hulls lets
+/// Studio rebuild them from the meshes on load.
+pub(crate) fn finish_place_dom(dom: &mut RbxWeakDom) {
+    let key = rbx_dom_weak::Ustr::from(COLLISION_HULL_PROPERTY);
+    let boxed = dom
+        .descendants()
+        .filter(|instance| {
+            carries_collision_hull(instance.class.as_str())
+                && !has_collision_hull(instance)
+                && collides_as_box(instance)
+        })
+        .map(|instance| instance.referent())
+        .collect::<Vec<_>>();
+    for referent in boxed {
+        if let Some(instance) = dom.get_by_ref_mut(referent) {
+            instance.properties.insert(
+                key,
+                RbxVariant::SharedString(RbxSharedString::new(BOX_COLLISION_HULL.to_vec())),
+            );
+        }
+    }
+    let mut by_class: HashMap<rbx_dom_weak::Ustr, (Vec<RbxRef>, usize)> = HashMap::new();
+    for instance in dom.descendants() {
+        if !carries_collision_hull(instance.class.as_str()) {
+            continue;
+        }
+        let entry = by_class.entry(instance.class).or_default();
+        entry.0.push(instance.referent());
+        entry.1 += usize::from(has_collision_hull(instance));
+    }
+    for (class, (referents, with_hull)) in by_class {
+        if with_hull == 0 || with_hull == referents.len() {
+            continue;
+        }
+        crate::app::output::log_global(
+            3,
+            format_args!(
+                "[renium] {} of {} {class} parts carry no collision hull; the place leaves all of them for Studio to rebuild on load",
+                referents.len() - with_hull,
+                referents.len()
+            ),
+        );
+        for referent in referents {
+            if let Some(instance) = dom.get_by_ref_mut(referent) {
+                instance.properties.remove(&key);
+            }
+        }
+    }
+}
+
 fn is_empty_unscriptable_blob(
     database: &ReflectionDatabase<'_>,
     class_name: &str,
@@ -1982,6 +2185,221 @@ mod tests {
             parts, 1,
             "members the database defaults are left to the writer"
         );
+    }
+
+    #[test]
+    fn export_never_leaves_a_class_with_some_hulls_missing() {
+        let database = rbx_reflection_database::get().unwrap();
+        let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+        let workspace = dom.insert(dom.root_ref(), RbxInstanceBuilder::new("Workspace"));
+        let boxed = dom.insert(
+            workspace,
+            RbxInstanceBuilder::new("MeshPart").with_property(
+                "PhysicalConfigData",
+                RbxVariant::SharedString(RbxSharedString::new(b"CSGPHS\0\0\0\0BLOCK".to_vec())),
+            ),
+        );
+        let hull = dom.insert(
+            workspace,
+            RbxInstanceBuilder::new("MeshPart").with_property(
+                "PhysicalConfigData",
+                RbxVariant::SharedString(RbxSharedString::new(
+                    b"CSGPHS\x08\0\0\0\x02\0(hull bytes)".to_vec(),
+                )),
+            ),
+        );
+        let property = |dom: &RbxWeakDom, referent: RbxRef| {
+            dom.get_by_ref(referent)
+                .unwrap()
+                .properties
+                .get(&rbx_dom_weak::Ustr::from("PhysicalConfigData"))
+                .cloned()
+        };
+        normalize_export_dom(&mut dom, database);
+        finish_place_dom(&mut dom);
+        assert!(
+            matches!(property(&dom, boxed), Some(RbxVariant::SharedString(_))),
+            "a box hull is data like any other hull"
+        );
+        assert!(matches!(
+            property(&dom, hull),
+            Some(RbxVariant::SharedString(_))
+        ));
+        let bare = dom.insert(workspace, RbxInstanceBuilder::new("MeshPart"));
+        normalize_export_dom(&mut dom, database);
+        finish_place_dom(&mut dom);
+        assert_eq!(property(&dom, bare), None);
+        assert_eq!(
+            property(&dom, hull),
+            None,
+            "one part without a hull leaves the whole class for Studio to rebuild"
+        );
+        assert_eq!(property(&dom, boxed), None);
+    }
+
+    #[test]
+    fn export_fills_missing_hulls_from_the_base_place() {
+        let database = rbx_reflection_database::get().unwrap();
+        let hull = RbxVariant::SharedString(RbxSharedString::new(
+            b"CSGPHS\x08\0\0\0\x02\0(hull bytes)".to_vec(),
+        ));
+        let mesh = |id: &str| {
+            RbxInstanceBuilder::new("MeshPart")
+                .with_property("MeshId", RbxVariant::ContentId(id.into()))
+        };
+        let mut base = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+        let base_workspace = base.insert(base.root_ref(), RbxInstanceBuilder::new("Workspace"));
+        let base_map = base.insert(
+            base_workspace,
+            RbxInstanceBuilder::new("Folder").with_name("Map"),
+        );
+        for name in ["Tent", "Rock"] {
+            base.insert(
+                base_map,
+                mesh("rbxassetid://1")
+                    .with_name(name)
+                    .with_property("PhysicalConfigData", hull.clone()),
+            );
+        }
+        let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+        let workspace = dom.insert(dom.root_ref(), RbxInstanceBuilder::new("Workspace"));
+        let map = dom.insert(
+            workspace,
+            RbxInstanceBuilder::new("Folder").with_name("Map"),
+        );
+        let tent = dom.insert(map, mesh("rbxassetid://1").with_name("Tent"));
+        let rock = dom.insert(map, mesh("rbxassetid://2").with_name("Rock"));
+        let copy = dom.insert(map, mesh("rbxassetid://1").with_name("Copy"));
+        let other = dom.insert(
+            map,
+            mesh("rbxassetid://1")
+                .with_name("Other")
+                .with_property("PhysicalConfigData", hull.clone()),
+        );
+        fill_collision_hulls_from(&mut dom, &base);
+        let property = |dom: &RbxWeakDom, referent: RbxRef| {
+            dom.get_by_ref(referent)
+                .unwrap()
+                .properties
+                .get(&rbx_dom_weak::Ustr::from("PhysicalConfigData"))
+                .cloned()
+        };
+        assert_eq!(
+            property(&dom, tent),
+            Some(hull.clone()),
+            "same mesh at the same path"
+        );
+        assert_eq!(
+            property(&dom, rock),
+            None,
+            "a changed mesh takes no stale hull"
+        );
+        assert_eq!(
+            property(&dom, copy),
+            Some(hull.clone()),
+            "a new part takes the one hull the base holds for its mesh"
+        );
+        assert_eq!(property(&dom, other), Some(hull.clone()));
+        normalize_export_dom(&mut dom, database);
+        finish_place_dom(&mut dom);
+        assert_eq!(
+            property(&dom, tent),
+            None,
+            "one part without a hull clears the class"
+        );
+        assert_eq!(property(&dom, other), None);
+    }
+
+    #[test]
+    fn a_box_fidelity_part_takes_the_block_hull() {
+        let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+        let workspace = dom.insert(dom.root_ref(), RbxInstanceBuilder::new("Workspace"));
+        let hull = dom.insert(
+            workspace,
+            RbxInstanceBuilder::new("MeshPart").with_property(
+                "PhysicalConfigData",
+                RbxVariant::SharedString(RbxSharedString::new(b"CSGPHS-hull".to_vec())),
+            ),
+        );
+        let boxed = dom.insert(
+            workspace,
+            RbxInstanceBuilder::new("MeshPart").with_property(
+                "CollisionFidelity",
+                RbxVariant::EnumItem(rbx_dom_weak::types::EnumItem {
+                    ty: "CollisionFidelity".into(),
+                    value: 2,
+                }),
+            ),
+        );
+        finish_place_dom(&mut dom);
+        let property = |referent: RbxRef| {
+            dom.get_by_ref(referent)
+                .unwrap()
+                .properties
+                .get(&rbx_dom_weak::Ustr::from("PhysicalConfigData"))
+                .cloned()
+        };
+        assert_eq!(
+            property(boxed),
+            Some(RbxVariant::SharedString(RbxSharedString::new(
+                BOX_COLLISION_HULL.to_vec()
+            )))
+        );
+        assert!(property(hull).is_some(), "the class stays complete");
+    }
+
+    #[test]
+    fn a_mesh_with_two_hulls_in_the_base_fills_only_by_path() {
+        let hull = |byte: u8| {
+            RbxVariant::SharedString(RbxSharedString::new(vec![
+                b'C', b'S', b'G', b'P', b'H', b'S', byte,
+            ]))
+        };
+        let mesh = |name: &str| {
+            RbxInstanceBuilder::new("MeshPart")
+                .with_name(name)
+                .with_property("MeshId", RbxVariant::ContentId("rbxassetid://1".into()))
+        };
+        let mut base = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+        let base_workspace = base.insert(base.root_ref(), RbxInstanceBuilder::new("Workspace"));
+        base.insert(
+            base_workspace,
+            mesh("A").with_property("PhysicalConfigData", hull(1)),
+        );
+        base.insert(
+            base_workspace,
+            mesh("B").with_property("PhysicalConfigData", hull(2)),
+        );
+        let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+        let workspace = dom.insert(dom.root_ref(), RbxInstanceBuilder::new("Workspace"));
+        let fidelity = RbxVariant::EnumItem(rbx_dom_weak::types::EnumItem {
+            ty: "CollisionFidelity".into(),
+            value: 1,
+        });
+        let a = dom.insert(
+            workspace,
+            mesh("A").with_property("CollisionFidelity", fidelity.clone()),
+        );
+        let b = dom.insert(workspace, mesh("B"));
+        let c = dom.insert(
+            workspace,
+            mesh("C").with_property("CollisionFidelity", fidelity),
+        );
+        fill_collision_hulls_from(&mut dom, &base);
+        let property = |referent: RbxRef| {
+            dom.get_by_ref(referent)
+                .unwrap()
+                .properties
+                .get(&rbx_dom_weak::Ustr::from("PhysicalConfigData"))
+                .cloned()
+        };
+        assert_eq!(
+            property(a),
+            Some(hull(1)),
+            "a fidelity the base does not carry does not block the path match"
+        );
+        assert_eq!(property(b), Some(hull(2)));
+        assert_eq!(property(c), None, "two candidate hulls pick neither");
     }
 
     #[test]

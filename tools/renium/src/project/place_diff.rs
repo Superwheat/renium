@@ -62,12 +62,26 @@ fn engine_managed_property(class_name: &str, name: &str) -> bool {
         || class_name == "WeldConstraint" && name == "State"
 }
 
+/// A `CSGPHS ... BLOCK` PhysicalConfigData is a placeholder for a collision
+/// hull Studio has not computed; saved, it turns the part into a solid box.
+/// It is reported, where a computed hull is engine state and is not.
+fn is_block_physics_placeholder_json(value: &Value) -> bool {
+    value
+        .get("base64")
+        .and_then(Value::as_str)
+        .and_then(|encoded| base64::decode(encoded).ok())
+        .is_some_and(|bytes| {
+            bytes.len() <= 32 && bytes.starts_with(b"CSGPHS") && bytes.ends_with(b"BLOCK")
+        })
+}
+
 fn omit_engine_managed_properties(document: &mut SettingsBytecode) -> BTreeMap<String, usize> {
     let mut omitted = BTreeMap::new();
     for instance in &mut document.instances {
         let class_name = &instance.class_name;
-        instance.properties.retain(|name, _| {
-            let managed = engine_managed_property(class_name, name);
+        instance.properties.retain(|name, value| {
+            let managed = engine_managed_property(class_name, name)
+                && !(name == "PhysicalConfigData" && is_block_physics_placeholder_json(value));
             if managed {
                 *omitted.entry(name.clone()).or_default() += 1;
             }
