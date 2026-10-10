@@ -7,8 +7,8 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use rbx_binary::{FlatDom, FlatInstance};
-use rbx_dom_weak::types::Ref as RbxRef;
-use rbx_reflection::ReflectionDatabase;
+use rbx_dom_weak::types::{Ref as RbxRef, VariantType as RbxVariantType};
+use rbx_reflection::{DataType as RbxDataType, ReflectionDatabase};
 use serde_json::{Value, json};
 
 use crate::app::output::print_json_output;
@@ -300,7 +300,7 @@ fn convert_service(
         }
         properties.retain(|name, _| {
             name == "Capabilities"
-                || name == crate::rbx::encode::COLLISION_HULL_PROPERTY
+                || is_engine_data_property(database, class_name, name)
                 || !crate::editor::review::is_engine_managed_editor_property(
                     class_name, name, database,
                 )
@@ -354,6 +354,23 @@ fn convert_service(
     })
 }
 
+/// Engine-built data stored as a SharedString (collision hulls, union meshes
+/// and trees, aero meshes) is part of the place even though Roblox hides it.
+fn is_engine_data_property(
+    database: &ReflectionDatabase<'_>,
+    class_name: &str,
+    property_name: &str,
+) -> bool {
+    crate::rbx::encode::rbx_property_descriptor(database, class_name, property_name).is_some_and(
+        |descriptor| {
+            matches!(
+                descriptor.data_type,
+                RbxDataType::Value(RbxVariantType::SharedString)
+            )
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -386,6 +403,57 @@ mod tests {
         assert_eq!(clock_time_from_time_of_day("14:00:00"), Some(14.0));
         assert_eq!(clock_time_from_time_of_day("00:30"), Some(0.5));
         assert_eq!(clock_time_from_time_of_day("noon"), None);
+    }
+
+    #[test]
+    fn place_import_keeps_engine_geometry_data() {
+        let root = create_unique_directory(&std::env::temp_dir(), "renium-place-import-geometry-")
+            .expect("temp project");
+        let data = |text: &str| rbx_dom_weak::types::SharedString::new(text.as_bytes().to_vec());
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let workspace = dom.insert(dom.root_ref(), InstanceBuilder::new("Workspace"));
+        dom.insert(
+            workspace,
+            InstanceBuilder::new("UnionOperation")
+                .with_name("Track")
+                .with_property("ChildData2", data("tree"))
+                .with_property("MeshData2", data("mesh")),
+        );
+        dom.insert(
+            workspace,
+            InstanceBuilder::new("MeshPart")
+                .with_name("Rock")
+                .with_property("PhysicalConfigData", data("CSGPHS-hull")),
+        );
+        let mut bytes = Vec::new();
+        rbx_binary::to_writer(&mut bytes, &dom, dom.root().children()).expect("place bytes");
+        std::fs::write(root.join("place.rbxl"), bytes).expect("place file");
+        std::fs::write(
+            root.join("renium.project.jsonc"),
+            "{\n  \"schemaVersion\": 1\n}\n",
+        )
+        .expect("project file");
+        let result = run(&root);
+        assert_eq!(result["ok"], true, "{result}");
+        let instances =
+            SettingsBytecode::read_file(&root.join("instances").join("Workspace.renium"))
+                .expect("workspace store")
+                .instances;
+        let keys = |class: &str| {
+            instances
+                .iter()
+                .find(|instance| instance.class_name == class)
+                .map(|instance| instance.properties.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        let union = keys("UnionOperation");
+        assert!(union.iter().any(|key| key == "ChildData2"), "{union:?}");
+        assert!(union.iter().any(|key| key == "MeshData2"), "{union:?}");
+        let mesh = keys("MeshPart");
+        assert!(
+            mesh.iter().any(|key| key == "PhysicalConfigData"),
+            "{mesh:?}"
+        );
     }
 
     #[test]

@@ -1618,15 +1618,16 @@ pub(crate) fn recorded_import_base(root: &Path) -> Result<Option<ImportBase>> {
 }
 
 /// Moves the built service roots into the base place, keeping the base's
-/// other services and the root fields the build does not carry. Collision
-/// hulls the build lacks are taken from the same part in the base.
+/// other services and the root fields the build does not carry. Engine
+/// geometry the build lacks (collision hulls, union meshes) comes from the
+/// same part in the base.
 pub(crate) fn merge_build_into_base(
     build: &RbxPlaceBuild,
     mut dom: RbxWeakDom,
     base: &Path,
 ) -> Result<(RbxWeakDom, Vec<RbxRef>)> {
     let mut base_dom = RbxPlaceFormat::from_path(base)?.read(base)?;
-    crate::rbx::encode::fill_collision_hulls_from(&mut dom, &base_dom);
+    crate::rbx::encode::fill_engine_geometry_from(&mut dom, &base_dom);
     let base_root = base_dom.root_ref();
     for (service, referent) in &build.service_roots {
         let existing = base_dom.root().children().iter().copied().find(|child| {
