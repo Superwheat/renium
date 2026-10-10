@@ -201,6 +201,7 @@ struct RemoteHandles<'a> {
 }
 impl RemoteHandles<'_> {
     fn duplicate(&mut self, local: &Handle) -> Result<usize> {
+        self.memory.ensure_writes_verified()?;
         let mut target = null_mut();
         anyhow::ensure!(
             unsafe {
@@ -319,6 +320,7 @@ fn begin_observation(
     relay_path: Option<&[String]>,
 ) -> Result<AttributeGuard> {
     let memory = ProcessMemory::open_with_access(pid, PROCESS_DUP_HANDLE)?;
+    memory.ensure_writes_verified()?;
     let modules = modules(pid)?;
     let studio = modules.first().context("No Studio module")?;
     anyhow::ensure!(
@@ -466,25 +468,9 @@ fn begin_observation(
         capture_window(pid, title)? == window,
         "Studio window changed before attribute observation"
     );
-    let thread = unsafe {
-        CreateRemoteThread(
-            memory.handle,
-            null(),
-            0,
-            Some(transmute::<
-                usize,
-                unsafe extern "system" fn(*mut c_void) -> u32,
-            >(entry)),
-            remote.address as *const c_void,
-            0,
-            null_mut(),
-        )
-    };
-    anyhow::ensure!(
-        !thread.is_null(),
-        "Cannot start attribute observation: {}",
-        io::Error::last_os_error()
-    );
+    let thread = memory
+        .start_thread(entry, remote.address)
+        .context("Cannot start attribute observation")?;
     remote.address = 0;
     duplicates.values.clear(); // Worker owns both duplicates and its input.
     let mut guard = AttributeGuard {

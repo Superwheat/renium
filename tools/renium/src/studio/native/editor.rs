@@ -3507,7 +3507,7 @@ fn write_editor_place_snapshot(
         match serializer::write_live_place(pid, &title, output_path) {
             Ok(snapshot) => {
                 eprintln!(
-                    "[renium] native snapshot: total={:.1}ms trace={:.1}ms discover={:.1}ms helper={:.1}ms invoke={:.1}ms validate={:.1}ms context={:.1}ms roots={:.1}ms serialize={:.1}ms write={:.1}ms bytes={}",
+                    "[renium] native snapshot: pid={pid} title={title:?} total={:.1}ms trace={:.1}ms discover={:.1}ms helper={:.1}ms invoke={:.1}ms validate={:.1}ms context={:.1}ms roots={:.1}ms serialize={:.1}ms write={:.1}ms bytes={}",
                     snapshot.elapsed_ms,
                     snapshot.trace_ms,
                     snapshot.discover_ms,
@@ -3524,7 +3524,7 @@ fn write_editor_place_snapshot(
             }
             Err(error) => {
                 eprintln!(
-                    "[renium] native snapshot unavailable; using Studio export fallback: {error:#}"
+                    "[renium] native snapshot unavailable for pid={pid} title={title:?}; using Studio export fallback: {error:#}"
                 );
             }
         }

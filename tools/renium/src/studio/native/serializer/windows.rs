@@ -176,9 +176,9 @@ struct ProcessMemory {
 }
 
 /// The newest Studio build on which Renium's native operations (injected
-/// helpers, memory patches, the capture) are verified. Every native operation
-/// opens the process here, so a newer build gets none of them: Studio 0.742
-/// exited with heap corruption (0xc0000374) under the helpers verified on
+/// helpers, memory patches, the capture) are verified. Reads stay available;
+/// every write, allocation, helper load and thread start checks this gate.
+/// Studio 0.742 exited with heap corruption (0xc0000374) under the helpers verified on
 /// 0.741, during captures, at Live Sync start and after a plain connect.
 pub(super) const NATIVE_VERIFIED_BUILD: u32 = 741;
 
@@ -204,7 +204,9 @@ fn native_writes_verified(pid: u32) -> bool {
         warned.push(pid);
         crate::app::output::log_global(
             3,
-            format_args!("[renium] native Studio writes are disabled for this Studio: {reason}"),
+            format_args!(
+                "[renium] native Studio writes are disabled for Studio pid={pid}: {reason}"
+            ),
         );
     }
     false
@@ -228,7 +230,6 @@ impl ProcessMemory {
     }
 
     fn open_with_access(pid: u32, additional: u32) -> Result<Self> {
-        let verified = native_writes_verified(pid);
         let access = PROCESS_CREATE_THREAD
             | additional
             | PROCESS_QUERY_INFORMATION
@@ -243,6 +244,9 @@ impl ProcessMemory {
                 std::io::Error::last_os_error()
             );
         }
+        // Retain the process object before checking its build so the PID cannot
+        // be recycled between the decision and the handle used for mutations.
+        let verified = native_writes_verified(pid);
         Ok(Self { handle, verified })
     }
 
@@ -284,8 +288,13 @@ impl ProcessMemory {
         Ok(u64::from_le_bytes(bytes))
     }
 
-    fn write(&self, address: usize, bytes: &[u8]) -> Result<()> {
+    fn ensure_writes_verified(&self) -> Result<()> {
         anyhow::ensure!(self.verified, NATIVE_WRITES_DISABLED);
+        Ok(())
+    }
+
+    fn write(&self, address: usize, bytes: &[u8]) -> Result<()> {
+        self.ensure_writes_verified()?;
         let mut written = 0;
         let ok = unsafe {
             WriteProcessMemory(
@@ -306,7 +315,7 @@ impl ProcessMemory {
     }
 
     fn allocate(&self, size: usize) -> Result<RemoteAllocation<'_>> {
-        anyhow::ensure!(self.verified, NATIVE_WRITES_DISABLED);
+        self.ensure_writes_verified()?;
         let address = unsafe {
             VirtualAllocEx(
                 self.handle,
@@ -327,6 +336,30 @@ impl ProcessMemory {
             address: address as usize,
         })
     }
+
+    fn start_thread(&self, address: usize, input: usize) -> Result<HANDLE> {
+        self.ensure_writes_verified()?;
+        let start = Some(unsafe {
+            transmute::<usize, unsafe extern "system" fn(*mut c_void) -> u32>(address)
+        });
+        let thread = unsafe {
+            CreateRemoteThread(
+                self.handle,
+                null(),
+                0,
+                start,
+                input as *const c_void,
+                0,
+                null_mut(),
+            )
+        };
+        anyhow::ensure!(
+            !thread.is_null(),
+            "Could not start the Studio helper: {}",
+            std::io::Error::last_os_error()
+        );
+        Ok(thread)
+    }
 }
 
 impl RemoteAllocation<'_> {
@@ -346,27 +379,7 @@ impl RemoteAllocation<'_> {
         timeout: u32,
         helper_owned: bool,
     ) -> Result<u32> {
-        anyhow::ensure!(self.memory.verified, NATIVE_WRITES_DISABLED);
-        let start = Some(unsafe {
-            transmute::<usize, unsafe extern "system" fn(*mut c_void) -> u32>(address)
-        });
-        let thread = unsafe {
-            CreateRemoteThread(
-                self.memory.handle,
-                null(),
-                0,
-                start,
-                self.address as *const c_void,
-                0,
-                null_mut(),
-            )
-        };
-        if thread.is_null() {
-            bail!(
-                "Could not start the Studio helper: {}",
-                std::io::Error::last_os_error()
-            );
-        }
+        let thread = self.memory.start_thread(address, self.address)?;
         if helper_owned {
             self.address = 0;
         }
@@ -1657,6 +1670,7 @@ fn ensure_helper_loaded_with_timeout(
     current_modules: &[ModuleEntry],
     timeout: u32,
 ) -> Result<usize> {
+    memory.ensure_writes_verified()?;
     let path = helper_path()?;
     ensure_library_loaded(pid, memory, current_modules, timeout, &path)
 }
@@ -1668,6 +1682,8 @@ fn ensure_library_loaded(
     timeout: u32,
     path: &Path,
 ) -> Result<usize> {
+    // A resident DLL is not permission to invoke it on an unverified build.
+    memory.ensure_writes_verified()?;
     if let Some(module) = current_modules
         .iter()
         .find(|module| module_path_matches(module, path))
@@ -2839,6 +2855,7 @@ pub(crate) fn capture_live_services(
         "Native capture requires 1..={MAX_ROOTS} services"
     );
     let memory = ProcessMemory::open(pid)?; // Retains the process across PID reuse.
+    memory.ensure_writes_verified()?;
     let current_modules = modules(pid)?;
     let studio = current_modules
         .first()
@@ -2990,6 +3007,8 @@ fn write_live_snapshot(
         );
     }
     let started = Instant::now();
+    let memory = ProcessMemory::open(pid)?;
+    memory.ensure_writes_verified()?;
     let current_modules = modules(pid)?;
     let studio = current_modules
         .first()
@@ -2997,7 +3016,6 @@ fn write_live_snapshot(
     let trace_started = Instant::now();
     let (data, trace, image_stamp) = studio_layout(&studio.path)?;
     let trace_ms = trace_started.elapsed().as_secs_f64() * 1000.0;
-    let memory = ProcessMemory::open(pid)?;
     verify_loaded_image(&memory, studio, image_stamp)?;
     let discover_started = Instant::now();
     let mut data_model = active_data_model(pid, &memory, studio, data, studio_title)?;

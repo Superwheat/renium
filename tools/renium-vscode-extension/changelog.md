@@ -16,6 +16,7 @@
 
 ### Bug fixes
 
+- Place snapshots, including `rbx publish --as`, check Studio compatibility before native discovery and use the plugin export fallback on unverified builds. Native helper loads and attribute observation now check compatibility directly too; snapshot diagnostics identify the Studio window and process.
 - Pushes no longer crash Studio 0.742 (Windows exception c0000374). Renium hooks Studio's change-history recording for Terrain cancellations and token-based recordings; that hook was verified on 0.741 and corrupts 0.742's heap on the first recording that passes through it. The hook is now installed only on builds it is verified on (0.741 and older); newer builds skip it and cancellations restore Terrain explicitly. The first symptom was a crash during the automatic package desync, because package pushes are the common case that registers a recording before writing.
 - `rbx pd` and `rbx pu` no longer fail with "Could not read Studio memory" on Studio 0.742, and the automatic package desync works there. Studio 0.742 moved the slot that holds a property's native binding on its reflection descriptors; the package path read the old slot. The binding is now located by its runtime type name, as the protected-property path already did.
 - Package ownership checks ask Roblox for the account's group list once per Studio session instead of once per package. Places with many group packages tripped the rate limit, which left ownership unknown.
