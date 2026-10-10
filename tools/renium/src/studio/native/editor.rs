@@ -339,7 +339,7 @@ fn capture_native_service_root_properties(
     // whole-place export. The active export guard still fences outside edits.
     for group in groups {
         for &name in capture_properties(&group.service) {
-            let text = serializer::read_property(
+            let text = match serializer::read_property(
                 pid,
                 &title,
                 &group.target_path,
@@ -347,7 +347,18 @@ fn capture_native_service_root_properties(
                 &group.service,
                 name,
                 Duration::from_secs(2),
-            )?;
+            ) {
+                Ok(text) => text,
+                Err(error) => {
+                    // Without the native read these saved fields stay as the
+                    // files have them, as on a plugin-only capture.
+                    crate::app::output::log_global(
+                        3,
+                        format_args!("[renium] native service root capture skipped: {error:#}"),
+                    );
+                    return Ok(());
+                }
+            };
             let value = decode_service_property(&group.service, name, &text)?;
             group.root_properties.insert(name.into(), value);
         }
