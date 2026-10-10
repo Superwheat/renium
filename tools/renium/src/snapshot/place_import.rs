@@ -77,11 +77,13 @@ pub(crate) fn import_place_file(mut args: ImportPlaceArgs) -> Result<()> {
         || Ok(()),
         || Ok(()),
     )?;
+    crate::rbx::model::record_import_base(&project_root, &args.input)?;
     print_json_output(
         &json!({
             "ok": true,
             "services": export_services.len(),
             "instances": imported,
+            "importBase": true,
             "changedPaths": published
                 .changed_roots
                 .iter()
@@ -297,7 +299,10 @@ fn convert_service(
             properties.insert("Source".to_string(), Value::String(source));
         }
         properties.retain(|name, _| {
-            !crate::editor::review::is_engine_managed_editor_property(class_name, name, database)
+            name == "Capabilities"
+                || !crate::editor::review::is_engine_managed_editor_property(
+                    class_name, name, database,
+                )
         });
         if local == 0 {
             properties.retain(|name, _| {
@@ -406,6 +411,24 @@ mod tests {
         .expect("project file");
         let result = run(&root);
         assert_eq!(result["ok"], true, "{result}");
+        let recorded = crate::rbx::model::recorded_import_base(&root)
+            .expect("import base record")
+            .expect("import base recorded");
+        assert!(recorded.warning.is_none(), "{:?}", recorded.warning);
+        assert_eq!(
+            recorded.path.file_name().and_then(|name| name.to_str()),
+            Some("place.rbxl")
+        );
+        std::fs::write(root.join("place.rbxl"), b"changed").expect("overwrite place");
+        let stale = crate::rbx::model::recorded_import_base(&root)
+            .expect("import base record")
+            .expect("import base recorded");
+        assert!(
+            stale
+                .warning
+                .as_deref()
+                .is_some_and(|reason| reason.contains("changed"))
+        );
         let root_record = |service: &str| {
             SettingsBytecode::read_file(&root.join("instances").join(format!("{service}.renium")))
                 .expect(service)

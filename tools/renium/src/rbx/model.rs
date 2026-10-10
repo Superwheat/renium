@@ -1540,6 +1540,131 @@ pub(crate) fn build_rbx_place(
     })
 }
 
+const IMPORT_BASE_FILE: &str = "import-base.json";
+
+/// The place `rbx pi` imported, remembered under `.renium/` so a later build
+/// can take the services it does not track (HttpService, AvatarSettings,
+/// PhysicsService, ...) and the root fields it cannot read from that file.
+pub(crate) struct ImportBase {
+    pub(crate) path: PathBuf,
+    pub(crate) warning: Option<String>,
+}
+
+fn file_sha256(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).with_context(|| format!("Could not read {}", path.display()))?;
+    Ok(format!("{:x}", Sha256::digest(&bytes)))
+}
+
+pub(crate) fn record_import_base(root: &Path, place: &Path) -> Result<()> {
+    let place = place.canonicalize().unwrap_or_else(|_| place.to_path_buf());
+    let record = json!({
+        "path": place,
+        "sha256": file_sha256(&place)?,
+        "importedAt": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or_default(),
+    });
+    let dir = root.join(".renium");
+    fs::create_dir_all(&dir)?;
+    fs::write(
+        dir.join(IMPORT_BASE_FILE),
+        serde_json::to_vec_pretty(&record)?,
+    )?;
+    Ok(())
+}
+
+/// The recorded import base when the file is still the one that was
+/// imported; otherwise the record's path with the reason it is not used.
+pub(crate) fn recorded_import_base(root: &Path) -> Result<Option<ImportBase>> {
+    let path = root.join(".renium").join(IMPORT_BASE_FILE);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("Could not read {}", path.display()));
+        }
+    };
+    let record: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("{} is not valid JSON", path.display()))?;
+    let Some(place) = record
+        .get("path")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+    else {
+        return Ok(None);
+    };
+    let recorded = record
+        .get("sha256")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let warning = if !place.is_file() {
+        Some(format!(
+            "built without the imported place's unsynced services and root fields: {} is gone; pass --base",
+            place.display()
+        ))
+    } else if file_sha256(&place)? != recorded {
+        Some(format!(
+            "built without the imported place's unsynced services and root fields: {} changed since the import; pass --base",
+            place.display()
+        ))
+    } else {
+        None
+    };
+    Ok(Some(ImportBase {
+        path: place,
+        warning,
+    }))
+}
+
+/// Moves the built service roots into the base place, keeping the base's
+/// other services and the root fields the build does not carry.
+pub(crate) fn merge_build_into_base(
+    build: &RbxPlaceBuild,
+    mut dom: RbxWeakDom,
+    base: &Path,
+) -> Result<(RbxWeakDom, Vec<RbxRef>)> {
+    let mut base_dom = RbxPlaceFormat::from_path(base)?.read(base)?;
+    let base_root = base_dom.root_ref();
+    for (service, referent) in &build.service_roots {
+        let existing = base_dom.root().children().iter().copied().find(|child| {
+            base_dom
+                .get_by_ref(*child)
+                .is_some_and(|instance| instance.class.as_str() == service)
+        });
+        if let Some(existing) = existing {
+            let base_properties = base_dom
+                .get_by_ref(existing)
+                .map(|instance| instance.properties.clone())
+                .unwrap_or_default();
+            if let Some(built) = dom.get_by_ref_mut(*referent) {
+                for (name, value) in base_properties {
+                    match (name.as_str(), built.properties.get_mut(&name)) {
+                        ("Attributes", Some(RbxVariant::Attributes(attributes))) => {
+                            if let RbxVariant::Attributes(base_attributes) = value {
+                                for (key, attribute) in base_attributes.iter() {
+                                    if attributes.get(key.as_str()).is_none() {
+                                        attributes.insert(key.clone(), attribute.clone());
+                                    }
+                                }
+                            }
+                        }
+                        (_, Some(_)) => {}
+                        (_, None) => {
+                            built.properties.insert(name, value);
+                        }
+                    }
+                }
+            }
+            base_dom.destroy(existing);
+        }
+        dom.transfer(*referent, &mut base_dom, base_root);
+    }
+    let top_level_refs = base_dom.root().children().to_vec();
+    coerce_numeric_property_widths(&mut base_dom);
+    Ok((base_dom, top_level_refs))
+}
+
 pub(crate) fn bytecode_export_place(mut args: BytecodeExportPlaceArgs) -> Result<()> {
     set_quiet_timings(true);
     apply_configured_project_layout(&mut args.project.project_root, &mut args.project.src_root)?;
@@ -1566,46 +1691,24 @@ pub(crate) fn bytecode_export_place(mut args: BytecodeExportPlaceArgs) -> Result
         &mut build.dom,
         RbxWeakDom::new(RbxInstanceBuilder::new("DataModel")),
     );
-    if let Some(base) = args.base.as_deref() {
-        let mut base_dom = RbxPlaceFormat::from_path(base)?.read(base)?;
-        let base_root = base_dom.root_ref();
-        for (service, referent) in &build.service_roots {
-            let existing = base_dom.root().children().iter().copied().find(|child| {
-                base_dom
-                    .get_by_ref(*child)
-                    .is_some_and(|instance| instance.class.as_str() == service)
-            });
-            if let Some(existing) = existing {
-                let base_properties = base_dom
-                    .get_by_ref(existing)
-                    .map(|instance| instance.properties.clone())
-                    .unwrap_or_default();
-                if let Some(built) = dom.get_by_ref_mut(*referent) {
-                    for (name, value) in base_properties {
-                        match (name.as_str(), built.properties.get_mut(&name)) {
-                            ("Attributes", Some(RbxVariant::Attributes(attributes))) => {
-                                if let RbxVariant::Attributes(base_attributes) = value {
-                                    for (key, attribute) in base_attributes.iter() {
-                                        if attributes.get(key.as_str()).is_none() {
-                                            attributes.insert(key.clone(), attribute.clone());
-                                        }
-                                    }
-                                }
-                            }
-                            (_, Some(_)) => {}
-                            (_, None) => {
-                                built.properties.insert(name, value);
-                            }
-                        }
-                    }
-                }
-                base_dom.destroy(existing);
+    let mut base_source = args.base.is_some().then(|| "argument".to_string());
+    let mut warning = None;
+    let mut base = args.base.clone();
+    if base.is_none()
+        && let Some(recorded) = recorded_import_base(&project_root)?
+    {
+        match recorded.warning {
+            Some(reason) => warning = Some(reason),
+            None => {
+                base = Some(recorded.path);
+                base_source = Some("import".to_string());
             }
-            dom.transfer(*referent, &mut base_dom, base_root);
         }
-        dom = base_dom;
-        top_level_refs = dom.root().children().to_vec();
-        coerce_numeric_property_widths(&mut dom);
+    }
+    if let Some(base_path) = base.as_deref() {
+        let (merged, refs) = merge_build_into_base(&build, dom, base_path)?;
+        dom = merged;
+        top_level_refs = refs;
     }
     format.write(&args.output, &dom, &top_level_refs)?;
     let exported_services = build
@@ -1621,7 +1724,9 @@ pub(crate) fn bytecode_export_place(mut args: BytecodeExportPlaceArgs) -> Result
             "services": exported_services,
             "serviceCount": top_level_refs.len(),
             "instances": build.total_instances,
-            "base": args.base,
+            "base": base,
+            "baseSource": base_source,
+            "warning": warning,
         }),
         args.pretty,
     )

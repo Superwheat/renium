@@ -1455,9 +1455,13 @@ pub(super) fn build_once(
         bail!("buildTarget can only be used with .rbxm or .rbxmx output");
     }
     let instances = match extension.as_str() {
-        "rbxl" | "rbxlx" | "rbxm" | "rbxmx" => {
-            build_project_file(&source_root, &temporary, &extension, build_target)?
-        }
+        "rbxl" | "rbxlx" | "rbxm" | "rbxmx" => build_project_file(
+            &loaded.root,
+            &source_root,
+            &temporary,
+            &extension,
+            build_target,
+        )?,
         _ => bail!("Build output must end in .rbxl, .rbxlx, .rbxm, or .rbxmx"),
     };
     replace_file(&temporary, output)?;
@@ -1476,6 +1480,7 @@ pub(super) fn build_once(
 }
 
 fn build_project_file(
+    project_root: &Path,
     src_root: &Path,
     output: &Path,
     format: &str,
@@ -1497,7 +1502,26 @@ fn build_project_file(
         services
     };
     services.sort();
-    let build = crate::rbx::model::build_rbx_place(src_root, services, None, false, false, false)?;
+    let mut build =
+        crate::rbx::model::build_rbx_place(src_root, services, None, false, false, false)?;
+    let mut dom = std::mem::replace(
+        &mut build.dom,
+        rbx_dom_weak::WeakDom::new(rbx_dom_weak::InstanceBuilder::new("DataModel")),
+    );
+    let mut base_roots = None;
+    if target_segments.is_none()
+        && let Some(recorded) = crate::rbx::model::recorded_import_base(project_root)?
+    {
+        match recorded.warning {
+            Some(reason) => crate::log_global(2, format_args!("[renium] {reason}")),
+            None => {
+                let (merged, refs) =
+                    crate::rbx::model::merge_build_into_base(&build, dom, &recorded.path)?;
+                dom = merged;
+                base_roots = Some(refs);
+            }
+        }
+    }
     if let Some(parent) = output
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -1509,7 +1533,7 @@ fn build_project_file(
     let roots = if let Some(segments) = target_segments.as_ref() {
         vec![
             crate::rbx::model::rbx_dom_instance_by_path_unique(
-                &build.dom,
+                &dom,
                 segments,
                 target_ordinals.as_deref().unwrap_or_default(),
             )
@@ -1520,6 +1544,8 @@ fn build_project_file(
                 )
             })?,
         ]
+    } else if let Some(roots) = base_roots {
+        roots
     } else {
         build
             .service_roots
@@ -1527,13 +1553,10 @@ fn build_project_file(
             .map(|(_, referent)| *referent)
             .collect::<Vec<_>>()
     };
-    let instances = roots
-        .iter()
-        .map(|root| rbx_subtree_size(&build.dom, *root))
-        .sum();
+    let instances = roots.iter().map(|root| rbx_subtree_size(&dom, *root)).sum();
     match format {
-        "rbxl" | "rbxm" => rbx_binary::to_writer(&mut writer, &build.dom, &roots)?,
-        "rbxlx" | "rbxmx" => rbx_xml::to_writer_default(&mut writer, &build.dom, &roots)?,
+        "rbxl" | "rbxm" => rbx_binary::to_writer(&mut writer, &dom, &roots)?,
+        "rbxlx" | "rbxmx" => rbx_xml::to_writer_default(&mut writer, &dom, &roots)?,
         _ => unreachable!(),
     }
     writer.flush()?;
