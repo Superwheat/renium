@@ -1558,6 +1558,35 @@ fn reconciliation_treats_elided_class_defaults_as_equal() {
 }
 
 #[test]
+fn a_verified_pair_keeps_reconcile_on_a_verify_rerun() {
+    use super::coordinator::continued_pair_mode;
+    assert_eq!(
+        continued_pair_mode(PairMode::Verify, Some(PairMode::Reconcile), false, false),
+        PairMode::Reconcile
+    );
+    assert_eq!(
+        continued_pair_mode(PairMode::Verify, Some(PairMode::Reconcile), true, false),
+        PairMode::Verify
+    );
+    assert_eq!(
+        continued_pair_mode(PairMode::Verify, Some(PairMode::Reconcile), false, true),
+        PairMode::Verify
+    );
+    assert_eq!(
+        continued_pair_mode(PairMode::Verify, Some(PairMode::Verify), false, false),
+        PairMode::Verify
+    );
+    assert_eq!(
+        continued_pair_mode(PairMode::Verify, None, false, false),
+        PairMode::Verify
+    );
+    assert_eq!(
+        continued_pair_mode(PairMode::Reconcile, Some(PairMode::Verify), false, false),
+        PairMode::Reconcile
+    );
+}
+
+#[test]
 fn unchanged_local_file_bootstraps_a_replacement_runtime() {
     let digest = "same-digest";
 

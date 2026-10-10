@@ -217,6 +217,38 @@ static HISTORY_HOOK_WARNED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(V
 /// recording that passed through the hook verified on 0.741.
 const HISTORY_HOOK_VERIFIED_BUILD: u32 = 741;
 
+#[cfg(windows)]
+static NATIVE_CAPTURE_WARNED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(windows)]
+/// The newest Studio build on which the native capture is verified. Studio
+/// 0.742 exited with heap corruption (0xc0000374) during captures that ran
+/// beside Team Create replication; newer builds serialize through the plugin
+/// until the capture is verified again.
+const NATIVE_CAPTURE_VERIFIED_BUILD: u32 = 741;
+
+#[cfg(windows)]
+pub(crate) fn native_capture_verified(pid: u32) -> bool {
+    let reason = match studio_build_number(pid) {
+        Ok(build) if build <= NATIVE_CAPTURE_VERIFIED_BUILD => return true,
+        Ok(build) => format!(
+            "Studio 0.{build} is newer than build 0.{NATIVE_CAPTURE_VERIFIED_BUILD}, the last one the native capture is verified on"
+        ),
+        Err(error) => format!("the Studio build could not be read: {error:#}"),
+    };
+    let mut warned = NATIVE_CAPTURE_WARNED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if !warned.contains(&pid) {
+        warned.push(pid);
+        crate::app::output::log_global(
+            3,
+            format_args!("[renium] native capture skipped, plugin serialization is used: {reason}"),
+        );
+    }
+    false
+}
+
 pub(crate) fn register_history_if_available(
     pid: u32,
     title: &str,

@@ -169,6 +169,12 @@ impl Coordinator {
             record.conflicts.clear();
             record.resolution_required = false;
         }
+        let mode = continued_pair_mode(
+            mode,
+            (!record_missing).then_some(record.mode),
+            requires_reconcile,
+            unresolved_local || owner_conflict.is_some(),
+        );
         record.identity = identity.clone();
         record.mode = mode;
         record.conflict_preference = conflict_preference;
@@ -1136,9 +1142,31 @@ fn continue_clean_verify(setup: &mut PairSetup, record: &mut PairRecord) {
     record.mode = setup.mode;
 }
 
+/// A verify request on a pair whose record already continues in reconcile,
+/// with nothing that calls for a new comparison, keeps reconcile: the pair
+/// was verified when its session started, and a `lon` re-run or a daemon
+/// restart must not turn a running session read-only without a comparison.
+/// Forced verify (unproven local file, foreign owner) stays verify.
+pub(crate) fn continued_pair_mode(
+    requested: PairMode,
+    recorded: Option<PairMode>,
+    requires_reconcile: bool,
+    forced_verify: bool,
+) -> PairMode {
+    if requested == PairMode::Verify
+        && recorded == Some(PairMode::Reconcile)
+        && !requires_reconcile
+        && !forced_verify
+    {
+        PairMode::Reconcile
+    } else {
+        requested
+    }
+}
+
 /// A session that starts in verify mode continues as reconcile when the first
 /// comparison finds nothing; otherwise it records the differing paths, holds
-/// pushes, and reports them.
+/// pushes and pulls, and reports them.
 fn verify_mode_holds(
     context: &BoundContext,
     setup: &mut PairSetup,

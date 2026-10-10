@@ -134,6 +134,9 @@ fn begin_editor_binary_export_for_runtime(
     let request_native_capture =
         cfg!(windows) && partitioned && !metadata_only && !capture_root_properties;
     #[cfg(windows)]
+    let request_native_capture = request_native_capture
+        && studio_pid_for_bridge(bridge).is_ok_and(serializer::native_capture_verified);
+    #[cfg(windows)]
     let mut attribute_guard = if request_native_capture && runtime_id.is_none() {
         let prepared = (|| {
             let pid = studio_pid_for_bridge(bridge)?;
