@@ -10,9 +10,11 @@ Start Play for a concrete runtime question that those checks cannot answer: repl
 
 ## Sessions
 
+One-client checks (UI, HUD, menus, a single car) use ordinary Play: `rbx play -s`. `--players N` launches a separate local server plus N client windows, which costs memory and GPU the owner notices; use it only for a test that needs several players, and `rbx play -x` it as soon as that test ends (`play -r` restarts a session as it was started, clients included). `--players 1` is refused.
+
 ```powershell
 rbx status
-rbx play -s                         # ordinary Play
+rbx play -s                         # ordinary Play: one window
 rbx play -s --players 2             # local server and two clients
 rbx play -s --players 2 --until 'shared.RoundHandler.GameState == "InRound"'
 rbx play -r                         # restart after a code change (stops, then starts the same way)
@@ -29,7 +31,7 @@ Play keeps the scripts it started with; after editing server or client code, `rb
 
 `play -x` returns once the test's DataModels and windows are gone, so `play -s` can follow at once. A start Studio drops because the previous test is still ending or the place is still opening is requested again; the result then carries `retriedAfterMs`. `status` and `cs` list `orphans`: test windows whose Edit window has exited, which can block the next multi-client start. `play -s` closes the ones of its own place first (`closedOrphans`); `play --kill-orphans` closes them all.
 
-Use ordinary Play for one-client checks. `--players 1` explicitly launches a separate server and client; `mode: "play"` means ordinary Play. Stop only a session you started or were asked to stop. `play -s`, `status` and `cs` give each runtime's Studio `pid`. File edits during Play can wait for Edit mode; that alone is not a sync failure.
+`mode: "play"` means ordinary Play; a `note` in the result means a server plus client windows are running. Stop only a session you started or were asked to stop. `play -s`, `status` and `cs` give each runtime's Studio `pid`. File edits during Play can wait for Edit mode; that alone is not a sync failure.
 
 Play runs the game's real server code. With Studio API access enabled, its DataStore writes (currency, inventories, progress) change the signed-in account's live data, so don't spend or alter saved data without asking.
 

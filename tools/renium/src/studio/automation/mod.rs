@@ -893,6 +893,11 @@ fn validate_play_args(args: &StartStopPlayArgs) -> Result<()> {
     if args.players.is_some() && mode != "play" {
         bail!("--players can only be used with --mode play");
     }
+    if args.players == Some(1) && !args.leave && args.mode.is_none() {
+        bail!(
+            "--players 1 launches a separate local server plus one client window; a one-client check is ordinary Play: rbx play -s. If the test really needs a separate server with one client, pass --mode play as well"
+        );
+    }
     if (args.add_players.is_some() || args.leave) && (args.start || args.stop) {
         bail!("--add-players and --leave change a running test; drop --start and --stop");
     }
@@ -1732,8 +1737,15 @@ fn started_result(
     });
     if let Some(players) = plan.players() {
         result["players"] = json!(players);
+        result["note"] = json!(multi_client_note(players));
     }
     result
+}
+
+fn multi_client_note(players: u32) -> String {
+    format!(
+        "local server plus {players} client windows are running; one-client checks use ordinary Play (rbx play -s), and rbx play -x ends this session"
+    )
 }
 
 fn start_timeout_error(
@@ -1924,6 +1936,11 @@ fn restart_play_result(args: StartStopPlayArgs, bridge: &BridgeServer) -> Result
     result["restarted"] = json!(restarted);
     if let Some(note) = note {
         result["restartNote"] = json!(note);
+    } else if let Some(players) = plan.players() {
+        result["restartNote"] = json!(format!(
+            "restarted the {players}-client session: {}",
+            multi_client_note(players)
+        ));
     }
     Ok(result)
 }
