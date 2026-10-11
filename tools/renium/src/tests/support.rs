@@ -37,5 +37,7 @@ pub(crate) fn temp_dir(tag: &str) -> PathBuf {
         .as_nanos();
     let path = std::env::temp_dir().join(format!("renium-test-{tag}-{timestamp}-{sequence}"));
     fs::create_dir_all(&path).unwrap();
-    path
+    crate::system::files::canonical_path(&path)
+        .map(crate::system::files::strip_extended_prefix)
+        .unwrap_or(path)
 }

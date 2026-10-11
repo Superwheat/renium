@@ -49,7 +49,7 @@ Single-place projects use `src`; experiences use `places/<alias>/src`. A place f
 
 Edit scripts as files; use Renium for `.renium` stores and sourcemaps. `f`/`bg`/`bb` read saved data; `q` searches a closed place; `v` inspects a model/place; `l` reads Studio; `oc fetch --version` gets older saved places. Use `cmp BEFORE --full` (optionally `--against AFTER`) for a full comparison.
 
-Read targets once and reuse IDs; refresh after a pull. Run mutations sequentially and inspect results. After failure, check affected state before retrying. Fix malformed invocations and rerun. Quote JSON/code or pipe stdin. Keep queries bounded; `l` tables over 128 keys are cut with `_truncated`. `co --grep` is regex (`-F` for text). Write large captures to files.
+Read targets once and reuse IDs; refresh after a pull. Run mutations sequentially and inspect results. After failure, check affected state before retrying. A usage error (unknown flag, unexpected argument, missing selector) is a malformed invocation, not a Renium failure: fix it and rerun. Quote JSON/code or pipe stdin. Keep queries bounded; `l` tables over 128 keys are cut with `_truncated`. `co --grep` is regex (`-F` for text). Write large captures to files.
 
 Fix and verify defects found in requested work. Renium marks affected linked packages Changed before edits; report `autoDesyncedPackages`, including in failures. Publishing requires authorization and is separate from syncing. Say synced, not saved: `teamCreate: true` in `rbx status` means Studio saves to Roblox; otherwise the user saves or publishes.
 
