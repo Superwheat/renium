@@ -50,12 +50,11 @@ use super::{
     link_target_from_settings_id, link_target_key, link_target_ordinals, link_target_ref_key,
     link_target_segments, load_settings_documents, mark_manifest_target_broken,
     materialize_package_target, package_document_fingerprint, package_lock_key,
-    package_target_difference, package_target_fingerprint,
-    package_target_fingerprint_with_external_sources, package_target_matches,
+    package_target_difference, package_target_fingerprint, package_target_matches,
     package_target_settings_ids, read_link_lock, read_link_manifest, read_link_source_meta,
-    referenced_settings_ids_outside, renium_global_packages_dir, resolve_link_cache_dir,
-    resolve_link_target_storage, resolve_link_targets, resolve_local_link_path,
-    selector_starts_with, serialize_link_lock, serialize_link_manifest,
+    read_only_target_current, referenced_settings_ids_outside, renium_global_packages_dir,
+    resolve_link_cache_dir, resolve_link_target_storage, resolve_link_targets,
+    resolve_local_link_path, selector_starts_with, serialize_link_lock, serialize_link_manifest,
     stage_settings_document_writes, stray_target_files, validate_link_target_ref,
     write_link_manifest,
 };
@@ -1437,21 +1436,20 @@ fn project_link_status(
                         }));
                     }
                 }
-                match (
-                    expected_fingerprint,
-                    package_target_fingerprint_with_external_sources(
+                let current = expected_fingerprint.is_some_and(|expected| {
+                    read_only_target_current(
                         doc,
                         &document_service,
                         &storage.source_root,
                         &document_segments,
                         &document_ordinals,
+                        Some(package_path),
+                        expected,
                     )
-                    .ok()
-                    .flatten()
-                    .as_deref(),
-                ) {
-                    (Some(expected), Some(actual)) if expected == actual => {}
-                    _ => drift = true,
+                    .unwrap_or(false)
+                });
+                if !current {
+                    drift = true;
                 }
             }
             if !target.broken && !package_root_found {

@@ -963,6 +963,36 @@ fn source_only_push_skips_service_readback_only_after_exact_verification() {
 }
 
 #[test]
+fn an_omitted_property_at_its_default_counts_as_retained() {
+    let part = SettingsBytecodeInstance::new("part".into(), "Part".into(), "Part".into(), Some(0));
+    let reflectance = |value: f64| Map::from_iter([("Reflectance".to_string(), json!(value))]);
+    let before = reflectance(0.4);
+    let desired = Map::new();
+    assert_eq!(
+        changed_map_mismatch(&before, &desired, &reflectance(0.0), true, &part),
+        None,
+        "Studio holds the class default for the omitted property"
+    );
+    assert!(
+        changed_map_mismatch(&before, &desired, &reflectance(0.7), true, &part).is_some(),
+        "a non-default value is a real retention failure"
+    );
+    let workspace =
+        SettingsBytecodeInstance::new("ws".into(), "Workspace".into(), "Workspace".into(), None);
+    let point = |x: f64| {
+        Map::from_iter([(
+            "InsertPoint".to_string(),
+            json!({"_type": "Vector3", "x": x, "y": 0.0, "z": 0.0}),
+        )])
+    };
+    assert_eq!(
+        changed_map_mismatch(&point(4.0), &Map::new(), &point(7.0), true, &workspace),
+        None,
+        "Studio owns the insert point"
+    );
+}
+
+#[test]
 fn push_verification_distinguishes_engine_identity_from_authored_data() {
     let mut instance =
         SettingsBytecodeInstance::new("part".into(), "Part".into(), "Part".into(), None);

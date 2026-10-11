@@ -16,6 +16,8 @@
 
 ### Bug fixes
 
+- `rbx push --verify` never enters the review flow: without `--no-review` it prepared and applied a Studio review of the whole project instead of only comparing sources, and the apply could fail on a property the files omit (Workspace.InsertPoint) while Studio holds its default; such a property now counts as retained, and engine-owned properties the plugin cannot set are not reported as lost.
+- A push into a read-only link, and `lk` drift status, use the same comparison as `lk --check` (sources inlined, the target pruned to the package's shape), so a mirror the check reports current is no longer refused as edited.
 - Targeted pushes filter script creation, deletion and source updates before changing the store; unrelated scripts and read-only links remain outside the selection. Full-service selections still check every affected link.
 - Model exports and native insertions avoid accidental box collisions. Imported Box hulls survive without the original place, comparison reports them, and base geometry recovery checks class and collision fidelity.
 - Cloning scripts and importing models refuse to overwrite existing source files with different contents.

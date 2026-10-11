@@ -94,7 +94,7 @@ pub(crate) fn is_engine_managed_editor_property(
     property_name: &str,
     database: &ReflectionDatabase<'_>,
 ) -> bool {
-    if class_name == "Workspace" && property_name == "CurrentCamera" {
+    if class_name == "Workspace" && matches!(property_name, "CurrentCamera" | "InsertPoint") {
         return true;
     }
     // The engine clamps a scroll offset to the laid-out canvas, so a saved

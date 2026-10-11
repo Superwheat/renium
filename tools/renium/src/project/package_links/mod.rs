@@ -3310,23 +3310,6 @@ fn package_target_fingerprint(
     )
 }
 
-pub(crate) fn package_target_fingerprint_with_external_sources(
-    document: &SettingsBytecode,
-    service: &str,
-    service_dir: &Path,
-    target_segments: &[String],
-    target_ordinals: &[usize],
-) -> Result<Option<String>> {
-    let normalized = inline_target_sources(
-        document,
-        service,
-        service_dir,
-        target_segments,
-        target_ordinals,
-    )?;
-    package_target_fingerprint(&normalized, service, target_segments, target_ordinals)
-}
-
 fn package_target_settings_ids(
     document: &SettingsBytecode,
     service: &str,
@@ -3365,6 +3348,49 @@ pub(crate) struct ReadOnlyPackageEnforcement {
     pub(crate) target_segments: Vec<String>,
     pub(crate) target_ordinals: Vec<usize>,
     pub(crate) expected_fingerprint: String,
+    pub(crate) package_path: Option<PathBuf>,
+}
+
+/// Whether a read-only link target in the files still matches its package:
+/// the same comparison `lk --check` makes (sources inlined, the target
+/// pruned to the package's shape, placement normalized for placed models),
+/// so a push guard and a status never disagree. Without a readable package
+/// file the fingerprints are compared directly.
+pub(crate) fn read_only_target_current(
+    document: &SettingsBytecode,
+    service: &str,
+    service_dir: &Path,
+    target_segments: &[String],
+    target_ordinals: &[usize],
+    package_path: Option<&Path>,
+    expected_fingerprint: &str,
+) -> Result<bool> {
+    let mut documents = HashMap::from([(PathBuf::from(service), document.clone())]);
+    canonicalize_loaded_settings_documents(&mut documents)?;
+    let document = documents
+        .remove(Path::new(service))
+        .context("Canonical settings document disappeared")?;
+    let inlined = inline_target_sources(
+        &document,
+        service,
+        service_dir,
+        target_segments,
+        target_ordinals,
+    )?;
+    if let Some(package_path) = package_path
+        && let Ok(package) = SettingsBytecode::read_file(package_path)
+    {
+        return package_target_matches(
+            &inlined,
+            service,
+            target_segments,
+            target_ordinals,
+            &package,
+            expected_fingerprint,
+        );
+    }
+    let current = package_target_fingerprint(&inlined, service, target_segments, target_ordinals)?;
+    Ok(current.as_deref() == Some(expected_fingerprint))
 }
 
 impl LinkEnforcement {
@@ -3491,6 +3517,7 @@ pub(crate) fn build_link_enforcement(
                     target_segments: target.target_segments.clone(),
                     target_ordinals: target.target_ordinals.clone(),
                     expected_fingerprint: package_document_fingerprint(&package)?,
+                    package_path: Some(package_path.clone()),
                 });
         }
         for pair in &target.files {

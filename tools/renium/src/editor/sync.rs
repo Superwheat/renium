@@ -54,7 +54,7 @@ use crate::project::layout::apply_configured_project_layout;
 use crate::project::package_links::LinkEnforcement;
 use crate::project::package_links::{
     apply_link_enforcement_to_changed_paths, build_link_enforcement,
-    build_loaded_project_link_enforcement, package_target_fingerprint_with_external_sources,
+    build_loaded_project_link_enforcement,
 };
 use crate::rbx::decode::rbx_reflection_class_is_a;
 use crate::rbx::encode::rbx_model_property_descriptor;
@@ -4047,21 +4047,29 @@ fn validate_read_only_service_changes(
         {
             continue;
         }
-        let current = documents
-            .get(&target.service)
-            .and_then(Option::as_ref)
-            .map(|document| {
-                package_target_fingerprint_with_external_sources(
-                    document,
-                    &target.service,
-                    &src_root.join(&target.service),
-                    &target.target_segments,
-                    &target.target_ordinals,
-                )
-            })
-            .transpose()?
-            .flatten();
-        if current.as_deref() != Some(target.expected_fingerprint.as_str()) {
+        let current = match documents.get(&target.service).and_then(Option::as_ref) {
+            Some(document) => crate::project::package_links::read_only_target_current(
+                document,
+                &target.service,
+                &src_root.join(&target.service),
+                &target.target_segments,
+                &target.target_ordinals,
+                target.package_path.as_deref(),
+                &target.expected_fingerprint,
+            )?,
+            None => false,
+        };
+        crate::app::output::log_global(
+            4,
+            format_args!(
+                "[renium] read-only link {} at {}.{}: files {} the package",
+                target.link_id,
+                target.service,
+                target.target_segments.join("."),
+                if current { "match" } else { "differ from" }
+            ),
+        );
+        if !current {
             bail!(
                 "Cannot edit read-only link \"{}\" at {}.{}. Apply the link again or use --override-packages to replace it intentionally.",
                 target.link_id,
@@ -4736,6 +4744,7 @@ fn log_change_set_composition(
 
 #[cfg(test)]
 mod sync_tests {
+
     #[test]
     fn target_ids_filter_source_mutations_before_creating_or_deleting_instances() {
         use crate::cli::ProjectSourceArgs;
@@ -4773,6 +4782,7 @@ mod sync_tests {
                 target_segments: vec!["Outside".into()],
                 target_ordinals: vec![1],
                 expected_fingerprint: "unrelated-drift".into(),
+                package_path: None,
             });
         let changes =
             collect_editor_changes_with_link_enforcement(&args, &root, &src, &links).unwrap();
@@ -4836,6 +4846,7 @@ mod sync_tests {
                 target_segments: vec!["Public".into()],
                 target_ordinals: vec![1],
                 expected_fingerprint: "changed".into(),
+                package_path: None,
             });
         let error = finish_editor_change_collection(
             EditorChangeSet::default(),

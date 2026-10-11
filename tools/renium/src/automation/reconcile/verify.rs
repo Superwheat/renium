@@ -401,6 +401,26 @@ pub(crate) fn verification_values_equal(
     }
 }
 
+/// A property the files omit is retained when Studio holds the class
+/// default for it (Workspace.InsertPoint at 0,0,0) or when the engine owns
+/// the property and the plugin could not have changed it anyway.
+fn omitted_property_retained(class_name: &str, name: &str, observed: &Value) -> bool {
+    rbx_reflection_database::get().is_ok_and(|database| {
+        crate::editor::review::is_engine_managed_editor_property(class_name, name, database)
+            || crate::settings::equivalence::reflection_default_settings_value(
+                database, class_name, name,
+            )
+            .is_some_and(|default| {
+                reconciliation_property_values_equal(
+                    class_name,
+                    name,
+                    Some(&default),
+                    Some(observed),
+                )
+            })
+    })
+}
+
 pub(crate) fn verification_skips_property(
     instance: &SettingsBytecodeInstance,
     name: &str,
@@ -526,6 +546,13 @@ pub(crate) fn changed_map_mismatch(
         }
         let actual = verification_value(observed, name, properties);
         if properties && saved_field_without_plugin_api(class_name, name) {
+            return None;
+        }
+        if properties
+            && expected.is_none()
+            && let Some(actual) = actual
+            && omitted_property_retained(class_name, name, actual)
+        {
             return None;
         }
         (!verification_values_equal(properties, class_name, name, expected, actual))
