@@ -16,6 +16,7 @@
 
 ### Bug fixes
 
+- A push limited to one subtree (`ps -i ID`, `ps PATH`) no longer refuses with "Cannot edit read-only link" because a shared link elsewhere in the same service has drifted in the files; the read-only check now covers only links the push can reach (inside or above the pushed subtree). Full-service pushes check every link as before.
 - `rbx play -s --players 1` is refused with a pointer to ordinary Play (pass `--mode play` as well when a separate server with one client is really wanted); multi-client starts and restarts say in their result that a local server plus N client windows are running and how to end them. The playtest guide opens its Sessions section with the one-client rule.
 - `rbx oc fetch NAME` with a project bound to a place fetched the bound place and ignored the positional target; the positional now wins (a number is a universe when one exists with that id, otherwise a place id), and a delivery response without a download location names the place and says the place or version may not exist.
 - `rbx oc asset create` sends uploaded files with their media type (`.glb` model/gltf-binary, `.gltf` model/gltf+json, `.fbx` model/fbx, `.rbxm`/`.rbxmx`, audio, video and font formats) instead of application/octet-stream, which Open Cloud refused for Model assets; `--content-type MIME` overrides it for multipart files too.

@@ -565,7 +565,7 @@ fn link_target_ordinals(target: &LinkTargetRef) -> Vec<usize> {
     target.ords.clone()
 }
 
-fn selector_starts_with(
+pub(crate) fn selector_starts_with(
     path_segments: &[String],
     path_ordinals: &[usize],
     prefix_segments: &[String],

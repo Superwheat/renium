@@ -3743,6 +3743,61 @@ struct EditorChangedServices {
     target_upsert: HashSet<String>,
     dirty: HashSet<String>,
     read_only: HashSet<String>,
+    /// The subtrees a targeted push touches, per service; a full push
+    /// records none and every read-only package of its services is checked.
+    scopes: PushScopes,
+}
+
+/// A pushed subtree as a path relative to its service, with sibling ordinals.
+type PushScope = (Vec<String>, Vec<usize>);
+type PushScopes = HashMap<String, Vec<PushScope>>;
+
+impl EditorChangedServices {
+    /// Records a pushed subtree; a full push records nothing. Paths arrive
+    /// with or without the service as their first segment.
+    fn record_scope(
+        &mut self,
+        full_reconcile: bool,
+        service: &str,
+        path: Option<(&[String], &[usize])>,
+    ) {
+        let Some((segments, ordinals)) = path.filter(|_| !full_reconcile) else {
+            return;
+        };
+        let prefixed = segments.first().map(String::as_str) == Some(service);
+        let relative = if prefixed { &segments[1..] } else { segments };
+        let offset = usize::from(prefixed && ordinals.len() == segments.len());
+        let relative_ordinals = &ordinals[offset.min(ordinals.len())..];
+        self.scopes
+            .entry(service.to_string())
+            .or_default()
+            .push((relative.to_vec(), relative_ordinals.to_vec()));
+    }
+}
+
+/// A read-only package needs its fingerprint check only when the push can
+/// reach it: an unscoped push, or a scope inside the package or containing it.
+fn push_scope_touches(
+    scopes: Option<&Vec<PushScope>>,
+    target_segments: &[String],
+    target_ordinals: &[usize],
+) -> bool {
+    let Some(scopes) = scopes else {
+        return true;
+    };
+    scopes.iter().any(|(segments, ordinals)| {
+        crate::project::package_links::selector_starts_with(
+            segments,
+            ordinals,
+            target_segments,
+            target_ordinals,
+        ) || crate::project::package_links::selector_starts_with(
+            target_segments,
+            target_ordinals,
+            segments,
+            ordinals,
+        )
+    })
 }
 
 fn settings_value_references_target(
@@ -3927,11 +3982,18 @@ fn sorted_services(services: HashSet<String>) -> Vec<String> {
 fn validate_read_only_service_changes(
     link_enforcement: &LinkEnforcement,
     changed_services: &HashSet<String>,
+    scopes: &PushScopes,
     documents: &HashMap<String, Option<Arc<SettingsBytecode>>>,
     src_root: &Path,
 ) -> Result<()> {
     for target in &link_enforcement.read_only_packages {
-        if !changed_services.contains(&target.service) {
+        if !changed_services.contains(&target.service)
+            || !push_scope_touches(
+                scopes.get(&target.service),
+                &target.target_segments,
+                &target.target_ordinals,
+            )
+        {
             continue;
         }
         let current = documents
@@ -3975,7 +4037,13 @@ fn finish_editor_change_collection(
         .union(&services.read_only)
         .cloned()
         .collect::<HashSet<_>>();
-    validate_read_only_service_changes(link_enforcement, &validated, documents, src_root)?;
+    validate_read_only_service_changes(
+        link_enforcement,
+        &validated,
+        &services.scopes,
+        documents,
+        src_root,
+    )?;
     log_editor_collection_timing("package validation", phase_started);
     for service in sorted_services(services.dirty) {
         if let Some(document) = documents.get(&service).and_then(Option::as_ref) {
@@ -4247,6 +4315,11 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
             ) {
                 continue;
             }
+            changed_services.record_scope(
+                full_reconcile,
+                &service,
+                Some((&target.path_segments, &target.path_ordinals)),
+            );
             property_filter.settings_ids.extend(target.settings_ids);
             changed_services.settings.insert(service.clone());
             changed_services.target_upsert.insert(service);
@@ -4301,6 +4374,7 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
         ) {
             continue;
         }
+        changed_services.record_scope(full_reconcile, &service, protected_path);
         if mapped_target.is_none()
             && exists_as_file
             && let Some(spec) = inferred_spec.as_ref()
@@ -4601,6 +4675,29 @@ fn log_change_set_composition(
 
 #[cfg(test)]
 mod sync_tests {
+    #[test]
+    fn a_targeted_push_checks_only_the_read_only_packages_it_can_reach() {
+        let seg = |text: &str| text.split('.').map(str::to_string).collect::<Vec<_>>();
+        let public = seg("Public");
+        let scopes = vec![
+            (seg("RaceKits"), vec![1usize]),
+            (seg("RaceKits.Redline"), vec![1, 1]),
+        ];
+        assert!(!super::push_scope_touches(Some(&scopes), &public, &[1]));
+        let inside = vec![(seg("Public.Cars.Tyre"), vec![1, 1, 1])];
+        assert!(super::push_scope_touches(Some(&inside), &public, &[1]));
+        let above = vec![(Vec::new(), Vec::new())];
+        assert!(super::push_scope_touches(Some(&above), &public, &[1]));
+        assert!(super::push_scope_touches(None, &public, &[1]));
+        let mut services = super::EditorChangedServices::default();
+        let prefixed = seg("ReplicatedStorage.Public.Config");
+        services.record_scope(false, "ReplicatedStorage", Some((&prefixed, &[1, 1, 1])));
+        services.record_scope(true, "ReplicatedStorage", Some((&prefixed, &[1, 1, 1])));
+        let recorded = services.scopes.get("ReplicatedStorage").unwrap();
+        assert_eq!(recorded, &vec![(seg("Public.Config"), vec![1usize, 1])]);
+        assert!(super::push_scope_touches(Some(recorded), &public, &[1]));
+    }
+
     use super::*;
 
     #[test]
