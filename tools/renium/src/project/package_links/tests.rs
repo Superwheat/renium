@@ -1694,6 +1694,25 @@ impl SharedFixture {
     }
 }
 
+#[test]
+fn a_pull_that_overwrote_a_read_only_mirror_is_put_back_and_reported() {
+    let fixture = shared_fixture("pull-mirror-restore");
+    share_public(&fixture, false);
+    let config_mirror = SharedFixture::script_file(&fixture.race, "Config");
+    let package_source = fs::read_to_string(&config_mirror).unwrap();
+    set_path_readonly(&config_mirror, false).unwrap();
+    fs::write(&config_mirror, "return 'studio copy'").unwrap();
+    let restored =
+        restore_drifted_read_only_links(&fixture.race, &fixture.race.join("src")).unwrap();
+    assert_eq!(restored.len(), 1, "{restored:?}");
+    assert_eq!(restored[0]["link"], "public");
+    assert_eq!(restored[0]["restored"], true);
+    assert_eq!(fs::read_to_string(&config_mirror).unwrap(), package_source);
+    let again = restore_drifted_read_only_links(&fixture.race, &fixture.race.join("src")).unwrap();
+    assert!(again.is_empty(), "{again:?}");
+    let _ = fs::remove_dir_all(&fixture.root);
+}
+
 fn shared_fixture(name: &str) -> SharedFixture {
     let root = temp_dir(name);
     fs::write(

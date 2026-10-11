@@ -697,6 +697,36 @@ fn entries_ok(entries: &[Value]) -> bool {
         .all(|entry| entry.get("error").is_none() && entry.get("errors").is_none())
 }
 
+/// Re-applies one shared link into the place at `project_root` from its
+/// source place's current files. None when the place consumes no such link.
+pub(crate) fn restore_shared_consumer(
+    project_root: &Path,
+    link_id: &str,
+) -> Result<Option<(&'static str, usize)>> {
+    let Some(layout) = load_shared_experience(project_root)? else {
+        return Ok(None);
+    };
+    let Some(place) = layout.place_containing(project_root) else {
+        return Ok(None);
+    };
+    let Some(link) = layout.shared_links.iter().find(|link| link.id == link_id) else {
+        return Ok(None);
+    };
+    if link.source == place.alias {
+        return Ok(None);
+    }
+    let source = layout
+        .place(&link.source)
+        .with_context(|| format!("Source place {} is not in {EXPERIENCE_FILE}", link.source))?;
+    let packed = pack_shared_subtree(
+        &load_place_links(&source.root)?,
+        &shared_target(link),
+        false,
+    )?;
+    Ok(update_consumer(&layout, place, &link.id, &packed)?
+        .map(|update| (update.state, update.replaced)))
+}
+
 pub(super) fn apply_place_shared_links(
     project_root: &Path,
     only: Option<&str>,
