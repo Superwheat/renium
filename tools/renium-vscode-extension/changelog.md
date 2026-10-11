@@ -16,7 +16,7 @@
 
 ### Bug fixes
 
-- `rbx pull` no longer leaves Studio's copy of a read-only link mirror in the files. When Studio's copy differs from the link's package, the mirror is put back from the package after the pull and the result lists it under `readOnlyLinksRestored` with a note to apply the link in Studio or edit the source place, instead of `lk --experience` later reporting every mirror as updated.
+- Pulls restore ordinary and shared read-only package mirrors only in the selected services, and report them under `readOnlyLinksRestored`. Restoration is included in the pull's safe publication, sourcemap and Live Sync tracking; failures keep the original files and pending changes. Shared stray files are preserved without replacing earlier backups, and an intentional override push keeps its result.
 - `--place NAME` no longer fails for every Studio when one other Studio momentarily refuses its window-name query (a Studio busy with a heavy batch); the read is retried briefly before it counts as unavailable.
 - `rbx push --verify` only compares script sources, including with no paths or a whole service selected. It does not prepare a review, replace Studio content or acknowledge pending Live Sync changes. `--verify-sources` remains push-then-check, and publish dry runs also bypass review.
 - Package checks, status and read-only push guards agree on external script edits, references and model placement. Checking many links in one large service avoids repeatedly copying the whole store; shared-link status also reports stray files.

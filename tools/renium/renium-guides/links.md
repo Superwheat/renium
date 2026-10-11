@@ -13,6 +13,7 @@ rbx lkb --service ReplicatedStorage --path '["ReplicatedStorage","Shared","Logge
 
 `lka` adds a target, `lk` applies it, `lks` reports status, `lkb` detaches it (`--remove` also drops its record). Sources are project-relative; links are read-only unless `--writable`. Live Sync sends changed paths; otherwise push only when Studio needs them.
 `lk --check` compares without applying. Package checks, status and read-only push guards compare script files as well as stored data and allow a linked model's placement to differ. Edit the source and reapply a drifting read-only copy; `--override-packages` on a push deliberately bypasses that protection.
+Pulls keep read-only `.renium` mirrors at the saved package version, including ordinary local packages and missing targets. Only pulled services are restored; writable and broken links are left alone. Results list `readOnlyLinksRestored`. A difference does not tell which side is newer: shared source files may have changed since the package was saved. Run `lk` to repack from the source, or push the mirror path to apply the saved package in Studio. An override push keeps its own readback; a later pull restores the package again.
 Git sources use `--source-type git --source REPOSITORY --ref REF --subpath PATH`; `lk` refreshes the cached ref, `--offline` requires a cache.
 `lkp --link-folder packages --id ID` packages a subtree (same `--service`/`--path`) and registers its source; reuse the ID with `lka`. `lkd --id ID --action` deletes a package: `delete-unused` refuses active uses, `delete-uses` removes them, `unlink-uses` keeps editable copies.
 
@@ -25,6 +26,7 @@ rbx lks --experience
 ```
 
 `lkp --share` in the source place packs `links/ID.renium` at the experience root, records it in `renium.experience.json` (`sharedLinks`) and links each place with the same path read-only (`--all-places`: every place). Edit only the source, then `rbx lk` in any place (`--experience` from anywhere) re-packs and updates every copy; Live Sync does this itself and pushes each copy. Copies hold read-only script files; other files under their root move to `.renium/link-replaced/ID/`.
+Pull restoration also moves stray shared-copy files there, into separate folders so earlier replacements survive. Ordinary packages refuse unowned files; move those files outside the target and retry. Restore failures publish nothing and leave Studio changes pending. Successful restores refresh the sourcemap and Live Sync's file watcher while retaining Studio's exported version for later reconciliation.
 A PackageLink right under the root is left out (`strippedPackageLinks`) and dropped from the copies; `rbx upl` unlinks it in the source. Nested packages travel as they are: pushes into packages the account does not own are refused before Studio is touched, so copies get those only unchanged. `lks --experience` shows `stale` packs and places as `ok`, `drift` or `missing`.
 
 ## Version control

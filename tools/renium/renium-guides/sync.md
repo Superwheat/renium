@@ -15,14 +15,13 @@ Work in the place folder or add `--place <alias|placeId>`.
 
 ## Live Sync
 
-Start once for sustained editing. Saved files flow to Studio; Studio edits flow to files. Unsaved editor buffers do not sync. File edits during Play wait for Edit mode.
+Start once for sustained editing. Saved files and Studio edits sync both ways. Unsaved buffers do not sync; file edits during Play wait for Edit mode.
 
 Trust successful edits while Live Sync reports no problem. Don't poll, push, reread Studio, or launch Play after every save.
 Use `rbx lst --wait 10` only when the next operation needs completed sync, after a reported problem, or when asked.
 
-For a failure, inspect `rbx lst --details`, fix the cause, then retry with `rbx rp`.
-`rbx dp` discards pending work. Failed edits remain pending until resolved or discarded.
-`lst` also restores an enabled watcher after a daemon restart; `daemon.running: true` is not a reason to push manually.
+On failure, inspect `rbx lst --details`, fix the cause, then retry with `rbx rp`. Failed edits stay pending; `rbx dp` discards them.
+`lst` restores enabled watchers after a daemon restart; a running daemon alone is no reason to push.
 
 ## First connection and conflicts
 
@@ -30,9 +29,9 @@ For a failure, inspect `rbx lst --details`, fix the cause, then retry with `rbx 
 
 Live Sync compares each side with their last common Renium state. One-sided changes transfer; independent edits merge; conflicts wait without overwriting either side. Something you added that is now missing from both Studio and the files was deleted in Studio, and the deletion synced; ask before putting it back.
 
-A published place that closed without saving reopens older than the files, and its differences count as Studio edits. Before reopening one, run `rbx cfg set liveSync.initialSyncPriority verify` (or start with `rbx lon --initial-sync-priority verify`), then read `rbx lst --details`: no differences means Studio kept the work. Otherwise ask the user which side to keep and use the resolution commands the CLI returns.
+A place closed without saving can reopen older than the files. Before reopening, set `rbx cfg set liveSync.initialSyncPriority verify` or use `rbx lon --initial-sync-priority verify`. Read `rbx lst --details`; if versions differ, ask which to keep and use the returned resolution commands.
 
-The editor asks which version to keep; the CLI returns resolution commands. `rbx lst --details` lists conflicts with both values and verify paths as `push:` (files differ) or `pull:` (Studio differs). `rbx lon --prefer studio|editor` reconciles for that run even when the configured mode is verify. Choose only with user direction or an existing conflict preference.
+The editor asks which version to keep. `rbx lst --details` shows both values and verify paths as `push:` (files differ) or `pull:` (Studio differs). `rbx lon --prefer studio|editor` overrides verify for that run. Choose only with user direction or an existing conflict preference.
 
 ```powershell
 rbx cfg get liveSync.initialSyncPriority
@@ -49,17 +48,19 @@ Without Live Sync, pass the files or directories to `ps`; Renium batches them by
 For store edits, use returned changed paths and settings IDs to keep the push scoped.
 An unfiltered push reconciles the entire place and can remove Studio-only content.
 
+Pulls restore read-only `.renium` link mirrors from their saved packages within the selected services, including missing targets. `readOnlyLinksRestored` lists them; a difference does not establish which copy is newer. Push the link path to apply the package in Studio, or edit the source and run `lk`. Restore writes do not queue themselves as user edits in Live Sync. `ps --override-packages` deliberately bypasses push protection; its readback keeps that result, but a later pull restores the package again. See [links](links.md) for stray-file handling.
+
 `ps --verify` compares script sources and pushes nothing (`sourceVerifyErrors` lists mismatches); without paths it checks all scripts. It never applies stores or acknowledges a Live Sync push. `ps --verify-sources` pushes, then checks. Don't substitute reads of `Instance.Source`: an open ScriptDocument can differ.
 
-Player capacity (`Players.MaxPlayers` and `PreferredPlayers`) is managed through Roblox Game Settings, not push. Saved exports and file comparisons still preserve/report these values.
+Player capacity (`Players.MaxPlayers`, `PreferredPlayers`) uses Roblox Game Settings. Exports and comparisons preserve these values.
 
 ## File-backed undo
 
 Reconciled syncs save their pre-sync state in `.renium/editor-history/sync`.
-`rbx rev --sync latest` restores the last sync's affected files; use a returned `historyId` instead of `latest` to select one. It refuses to overwrite newer edits or restore an unconfirmed transaction. `rbx rev --path FILE --print` writes a file's saved copy to stdout instead of restoring it; pass a `.renium/editor-history/<id>` entry as `--path` to pick an older copy.
+`rbx rev --sync latest` restores the last sync's affected files; a returned `historyId` selects another. It refuses newer edits and unconfirmed transactions. `rbx rev --path FILE --print` prints a saved copy; a `.renium/editor-history/<id>` path selects an older one.
 
-Live Sync transfers restored files normally. Without Live Sync, add `--apply-studio`. Use `--details` only when you need every restored path. Don't delete history you still need.
+Live Sync transfers restored files. Otherwise add `--apply-studio`. `--details` lists every restored path. Keep needed history.
 
 ## Packages owned by others
 
-Pushes inside Roblox packages this account does not own are refused before Studio is touched, naming the package and creator. Revert those files to the package's content, or unlink the package in Studio (right-click the package root, Unlink from Package) when the project is meant to carry its own copy; Renium never desyncs or rewrites someone else's package on your behalf.
+Pushes into Roblox packages this account does not own are refused before Studio is touched. Revert to the package's content, or unlink it in Studio (right-click the root, Unlink from Package) to keep an editable copy. Renium never desyncs another creator's package on your behalf.

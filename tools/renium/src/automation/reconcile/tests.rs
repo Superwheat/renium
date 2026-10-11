@@ -1,6 +1,77 @@
 use super::*;
 
 #[test]
+fn pulled_baseline_records_studio_bytes_even_when_restoration_publishes_no_file_change()
+-> Result<()> {
+    let root = crate::tests::support::temp_dir("restored-pull-baseline");
+    let project = root.join("renium.project.jsonc");
+    fs::write(&project, br#"{"schemaVersion":1,"sourceRoot":"src"}"#)?;
+    fs::create_dir_all(root.join("src/ReplicatedStorage/Pkg"))?;
+    let source = PathBuf::from("src/ReplicatedStorage/Pkg/Config.luau");
+    let added = PathBuf::from("src/ReplicatedStorage/Pkg/Added.luau");
+    fs::write(root.join(&source), b"return 'package'")?;
+    fs::write(root.join(&added), b"return 'added by restore'")?;
+    let context = BoundContext {
+        id: 1,
+        initialized: true,
+        project: project.to_string_lossy().into_owned(),
+        root: root.to_string_lossy().into_owned(),
+        experience: String::new(),
+        source: root.join("src").to_string_lossy().into_owned(),
+        resource_lease: None,
+        place_id: None,
+        game_id: None,
+        selector: String::new(),
+        runtime_id: None,
+        plugin_build: None,
+        fingerprint: String::new(),
+    };
+    let initial = capture_snapshot(&root, &[PathBuf::from("src")])?;
+    let record = PairRecord {
+        version: RECORD_VERSION,
+        identity: PairIdentity {
+            experience: root.to_string_lossy().into_owned(),
+            project: project.to_string_lossy().into_owned(),
+            fingerprint: String::new(),
+            game_id: None,
+            place_id: None,
+            local_file: None,
+        },
+        mode: PairMode::Reconcile,
+        conflict_preference: ConflictPreference::None,
+        runtime_settings: Map::new(),
+        baseline: Some(store::StoredSnapshot::write(&root, "pull-test", &initial)?),
+        head: None,
+        conflicts: Vec::new(),
+        resolution_required: false,
+        last_runtime_id: None,
+        local_file_stamp: None,
+        local_file_digest: None,
+        studio_checkpoint: None,
+    };
+    write_record(&context, "pull-test", &record)?;
+    let studio = SnapshotEntry::File(b"return 'studio'".to_vec());
+    let overrides = BTreeMap::from([
+        (source.clone(), Some(studio.clone())),
+        (added.clone(), None),
+    ]);
+    // A no-op publication, or a user save before resume, does not make Studio
+    // have the restored package's bytes.
+    fs::write(root.join(&source), b"return 'later user edit'")?;
+    Coordinator::default().advance_pulled_baseline(&context, "pull-test", &[], &overrides)?;
+    let recorded = load_record(&context, "pull-test")?
+        .unwrap()
+        .baseline
+        .unwrap()
+        .load(&root, "pull-test")?;
+    assert!(recorded.entries[&source] == studio);
+    assert!(!recorded.entries.contains_key(&added));
+    assert_eq!(fs::read(root.join(source))?, b"return 'later user edit'");
+    let _ = fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[test]
 fn relocated_supporting_stores_use_relative_snapshot_keys() -> Result<()> {
     let root = crate::tests::support::temp_dir("supporting-store-scope");
     let _cleanup = crate::system::files::OnDrop::new(|| {
