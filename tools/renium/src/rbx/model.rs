@@ -257,6 +257,9 @@ impl RbxPlaceFormat {
         match format {
             Self::Binary => rbx_binary::Deserializer::new()
                 .elide_defaults(elide_defaults)
+                .retain_defaults_for_properties(HashSet::from([
+                    crate::rbx::encode::COLLISION_HULL_PROPERTY.to_string(),
+                ]))
                 .deserialize(reader)
                 .with_context(|| format!("Failed to read {}", path.display())),
             Self::Xml => rbx_xml::from_reader(
@@ -1087,6 +1090,8 @@ pub(crate) fn bytecode_export_model(args: BytecodeExportModelArgs) -> Result<()>
         dom.insert(parent_ref, builder);
     }
 
+    crate::rbx::encode::normalize_export_dom(&mut dom, database);
+    crate::rbx::encode::finish_place_dom(&mut dom);
     let writer = create_output_writer(&args.output)?;
     let root_ref = *export_refs
         .by_index
@@ -1164,6 +1169,8 @@ pub(crate) fn encode_settings_model(document: &SettingsBytecode, binary: bool) -
         .iter()
         .map(|index| refs.by_index[index])
         .collect::<Vec<_>>();
+    crate::rbx::encode::normalize_export_dom(&mut dom, database);
+    crate::rbx::encode::finish_place_dom(&mut dom);
     let mut output = Vec::new();
     if binary {
         rbx_binary::to_writer(&mut output, &dom, &roots)
@@ -1822,6 +1829,9 @@ pub(crate) fn bytecode_import_model(args: BytecodeImportModelArgs) -> Result<()>
     }
 
     let mut writes = outcome.source_files.clone();
+    for (path, bytes) in &writes {
+        crate::bytecode::check_new_source_file(path, bytes)?;
+    }
     let mut removals = Vec::new();
     collect_source_path_updates(
         &before_document,

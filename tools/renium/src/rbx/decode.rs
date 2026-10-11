@@ -1152,7 +1152,10 @@ pub(crate) fn rbx_properties_to_settings_records<'a>(
             continue;
         }
         let descriptor = enum_property_descriptor(variant, database, class_name, property_name);
-        if options.elide_defaults && !options.defaults_already_elided {
+        if options.elide_defaults
+            && !options.defaults_already_elided
+            && property_name != crate::rbx::encode::COLLISION_HULL_PROPERTY
+        {
             let default = database
                 .classes
                 .get(class_name)

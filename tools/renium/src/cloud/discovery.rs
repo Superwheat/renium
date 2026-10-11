@@ -724,16 +724,15 @@ fn fetch_target(identity: CloudIdentity, name: Option<&str>) -> Result<FetchTarg
     bail!("Name the experience to fetch, or pass --universe ID or --place-id ID")
 }
 
-fn universe_root(universe_id: i64) -> Result<(i64, String)> {
+fn find_universe_root(universe_id: i64) -> Result<Option<(i64, String)>> {
     let found = scoped_universes(&[universe_id])?;
-    let experience = found
-        .into_iter()
-        .next()
-        .with_context(|| format!("Universe {universe_id} was not found"))?;
+    let Some(experience) = found.into_iter().next() else {
+        return Ok(None);
+    };
     let root = experience
         .root_place_id
         .with_context(|| format!("Universe {universe_id} reports no root place"))?;
-    Ok((root, experience.name))
+    Ok(Some((root, experience.name)))
 }
 
 fn resolve_place(
@@ -743,12 +742,12 @@ fn resolve_place(
 ) -> Result<(i64, String)> {
     let query = match fetch_target(identity, name)? {
         FetchTarget::Place(place_id) => return Ok((place_id, format!("place-{place_id}"))),
-        FetchTarget::Universe(universe_id) => return universe_root(universe_id),
+        FetchTarget::Universe(universe_id) => {
+            return find_universe_root(universe_id)?
+                .with_context(|| format!("Universe {universe_id} was not found"));
+        }
         FetchTarget::Id(id) => {
-            return Ok(match universe_root(id) {
-                Ok(root) => root,
-                Err(_) => (id, format!("place-{id}")),
-            });
+            return Ok(find_universe_root(id)?.unwrap_or_else(|| (id, format!("place-{id}"))));
         }
         FetchTarget::Name(query) => query,
     };

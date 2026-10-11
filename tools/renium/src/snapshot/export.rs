@@ -1399,7 +1399,7 @@ fn prepare_export_bridge(
                 json!({ "exportAllProperties": export_all_properties }),
             )
             .context("Failed to apply plugin export options")?;
-        bridge.cache_export_options_for_target(BridgeTarget::Main, export_all_properties);
+        bridge.cache_export_options_for_target(BridgeTarget::Edit, export_all_properties);
     }
     let bridge_info_done_ms = elapsed_ms(total_started);
     let property_schema_by_class = load_rbx_dom_property_schema(project_root)?.unwrap_or_default();

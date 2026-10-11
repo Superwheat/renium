@@ -797,8 +797,9 @@ fn asset_identity(value: &RbxVariant) -> Option<String> {
 /// CollisionFidelity value, so fidelity counts only when both sides have one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct GeometrySources {
+    class: rbx_dom_weak::Ustr,
     identity: Option<String>,
-    fidelity: Option<String>,
+    fidelity: Option<u32>,
 }
 
 impl GeometrySources {
@@ -814,12 +815,21 @@ impl GeometrySources {
         let fidelity = instance
             .properties
             .get(&rbx_dom_weak::Ustr::from("CollisionFidelity"))
-            .map(|value| format!("{value:?}"));
-        Self { identity, fidelity }
+            .and_then(|value| match value {
+                RbxVariant::Enum(value) => Some(value.to_u32()),
+                RbxVariant::EnumItem(value) => Some(value.value),
+                _ => None,
+            });
+        Self {
+            class: instance.class,
+            identity,
+            fidelity,
+        }
     }
 
     fn agrees_with(&self, other: &Self) -> bool {
-        self.identity == other.identity
+        self.class == other.class
+            && self.identity == other.identity
             && match (&self.fidelity, &other.fidelity) {
                 (Some(a), Some(b)) => a == b,
                 _ => true,
@@ -852,6 +862,25 @@ fn has_collision_hull(instance: &rbx_dom_weak::Instance) -> bool {
 }
 
 type GeometryValues = Vec<(rbx_dom_weak::Ustr, RbxVariant)>;
+type GeometryCandidates = HashMap<Option<u32>, Option<RbxVariant>>;
+
+fn matching_geometry(
+    candidates: &GeometryCandidates,
+    fidelity: Option<u32>,
+) -> Option<&RbxVariant> {
+    let mut matched = None;
+    for (known_fidelity, value) in candidates {
+        if fidelity.zip(*known_fidelity).is_some_and(|(a, b)| a != b) {
+            continue;
+        }
+        let value = value.as_ref()?;
+        if matched.is_some_and(|known| known != value) {
+            return None;
+        }
+        matched = Some(value);
+    }
+    matched
+}
 
 /// Gives every part the build lacks engine geometry for the data of the part
 /// at the same path in the base when their sources agree, and otherwise the
@@ -861,7 +890,7 @@ pub(crate) fn fill_engine_geometry_from(dom: &mut RbxWeakDom, base: &RbxWeakDom)
         HashMap::new();
     let mut by_identity: HashMap<
         (rbx_dom_weak::Ustr, rbx_dom_weak::Ustr, String),
-        Option<RbxVariant>,
+        GeometryCandidates,
     > = HashMap::new();
     for instance in base.descendants() {
         let values = engine_geometry_properties(instance.class.as_str())
@@ -880,6 +909,8 @@ pub(crate) fn fill_engine_geometry_from(dom: &mut RbxWeakDom, base: &RbxWeakDom)
             for (key, value) in &values {
                 by_identity
                     .entry((instance.class, *key, identity.clone()))
+                    .or_default()
+                    .entry(sources.fidelity)
                     .and_modify(|known| {
                         if known.as_ref() != Some(value) {
                             *known = None;
@@ -915,7 +946,9 @@ pub(crate) fn fill_engine_geometry_from(dom: &mut RbxWeakDom, base: &RbxWeakDom)
         let at_path = by_path.get(&path);
         let agreed = at_path.filter(|(base_sources, _)| base_sources.agrees_with(&sources));
         for name in engine_geometry_properties(instance.class.as_str()) {
-            if has_data(instance, name) {
+            if has_data(instance, name)
+                || *name == COLLISION_HULL_PROPERTY && collides_as_box(instance)
+            {
                 continue;
             }
             let key = rbx_dom_weak::Ustr::from(name);
@@ -929,7 +962,7 @@ pub(crate) fn fill_engine_geometry_from(dom: &mut RbxWeakDom, base: &RbxWeakDom)
                         .and_then(|identity| {
                             by_identity.get(&(instance.class, key, identity.clone()))
                         })
-                        .and_then(Option::as_ref)
+                        .and_then(|values| matching_geometry(values, sources.fidelity))
                 });
             match value {
                 Some(value) => {
@@ -1001,7 +1034,7 @@ pub(crate) fn finish_place_dom(dom: &mut RbxWeakDom) {
         entry.1 += usize::from(has_collision_hull(instance));
     }
     for (class, (referents, with_hull)) in by_class {
-        if with_hull == 0 || with_hull == referents.len() {
+        if with_hull == referents.len() {
             continue;
         }
         crate::app::output::log_global(
@@ -2547,6 +2580,101 @@ mod tests {
         );
         assert_eq!(property(b), Some(hull(2)));
         assert_eq!(property(c), None, "two candidate hulls pick neither");
+    }
+
+    #[test]
+    fn geometry_recovery_respects_classes_and_fidelity_in_both_lookups() {
+        let hull = RbxSharedString::new(b"CSGPHS-computed".to_vec());
+        let mesh = |name: &str, fidelity: u32| {
+            RbxInstanceBuilder::new("MeshPart")
+                .with_name(name)
+                .with_property("MeshId", RbxContentId::from("rbxassetid://1"))
+                .with_property(
+                    "CollisionFidelity",
+                    rbx_dom_weak::types::Enum::from_u32(fidelity),
+                )
+        };
+        let mut base = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+        let workspace = base.insert(base.root_ref(), RbxInstanceBuilder::new("Workspace"));
+        base.insert(
+            workspace,
+            mesh("Changed", 0).with_property("PhysicalConfigData", hull.clone()),
+        );
+        base.insert(
+            workspace,
+            RbxInstanceBuilder::new("UnionOperation")
+                .with_name("Replaced")
+                .with_property("PhysicalConfigData", hull.clone()),
+        );
+        let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+        let workspace = dom.insert(dom.root_ref(), RbxInstanceBuilder::new("Workspace"));
+        let changed = dom.insert(workspace, mesh("Changed", 1));
+        let moved = dom.insert(workspace, mesh("Moved", 1));
+        let boxed = dom.insert(workspace, mesh("Box", 2));
+        let same = dom.insert(
+            workspace,
+            mesh("Same", 0).with_property(
+                "CollisionFidelity",
+                RbxVariant::EnumItem(rbx_dom_weak::types::EnumItem {
+                    ty: "CollisionFidelity".into(),
+                    value: 0,
+                }),
+            ),
+        );
+        let replaced = dom.insert(
+            workspace,
+            RbxInstanceBuilder::new("MeshPart").with_name("Replaced"),
+        );
+        fill_engine_geometry_from(&mut dom, &base);
+        let key = rbx_dom_weak::Ustr::from(COLLISION_HULL_PROPERTY);
+        for referent in [changed, moved, boxed, replaced] {
+            assert!(
+                !dom.get_by_ref(referent)
+                    .unwrap()
+                    .properties
+                    .contains_key(&key)
+            );
+        }
+        assert_eq!(
+            dom.get_by_ref(same).unwrap().properties.get(&key),
+            Some(&RbxVariant::SharedString(hull))
+        );
+        dom.destroy(changed);
+        dom.destroy(moved);
+        dom.destroy(replaced);
+        finish_place_dom(&mut dom);
+        assert_eq!(
+            dom.get_by_ref(boxed).unwrap().properties.get(&key),
+            Some(&RbxVariant::SharedString(RbxSharedString::new(
+                BOX_COLLISION_HULL.to_vec()
+            )))
+        );
+    }
+
+    #[test]
+    fn encoded_models_do_not_fill_missing_hulls_with_boxes() {
+        use crate::tests::support::{settings_document, settings_instance};
+        let mut document = settings_document(vec![
+            settings_instance("root", "Model", "Model", None),
+            settings_instance("mesh", "Computed", "MeshPart", Some(0)),
+            settings_instance("bare", "New", "MeshPart", Some(0)),
+        ]);
+        document.instances[1].properties.insert(
+            COLLISION_HULL_PROPERTY.into(),
+            json!({"_type":"SharedString", "base64":base64::encode(b"CSGPHS-hull")}),
+        );
+        let bytes = crate::rbx::model::encode_settings_model(&document, true).unwrap();
+        let dom = rbx_binary::from_reader(bytes.as_slice()).unwrap();
+        for instance in dom
+            .descendants()
+            .filter(|instance| instance.class.as_str() == "MeshPart")
+        {
+            assert!(
+                !instance
+                    .properties
+                    .contains_key(&rbx_dom_weak::Ustr::from(COLLISION_HULL_PROPERTY))
+            );
+        }
     }
 
     #[test]

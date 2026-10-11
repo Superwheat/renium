@@ -1187,9 +1187,9 @@ pub(crate) fn select_bridge_context_for_request(
     let selection = bound_context::select(context);
     if !keep_pins {
         bridge.clear_runtime_pins();
-    }
-    if let Some(runtime_id) = context.runtime_id.as_deref() {
-        bridge.pin_runtime(BridgeTarget::Edit, runtime_id);
+        if let Some(runtime_id) = context.runtime_id.as_deref() {
+            bridge.pin_runtime(BridgeTarget::Edit, runtime_id);
+        }
     }
     selection
 }

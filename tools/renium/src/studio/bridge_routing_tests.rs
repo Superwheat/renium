@@ -800,6 +800,9 @@ fn native_export_stays_in_edit_during_rapid_play_server_replacement() {
             "rollbackEditorTransaction",
             "getLiveSourceBatch",
             "getStudioChangeState",
+            "configurePropertyCandidates",
+            "setExportOptions",
+            "recordSyncCompletion",
         ] {
             assert_eq!(
                 bridge.call(method, json!({})).unwrap()["runtime"],
@@ -840,6 +843,24 @@ fn native_export_stays_in_edit_during_rapid_play_server_replacement() {
             bridge.call("commitEditorTransaction", json!({})).unwrap()["runtime"],
             "export-edit"
         );
+        {
+            let mut other = context.clone();
+            other.runtime_id = Some("other-place-edit".into());
+            let _other = crate::automation::runtime::select_bridge_context_for_request(
+                &other, &bridge, true,
+            );
+            assert_eq!(
+                bridge
+                    .runtime_pins
+                    .lock()
+                    .unwrap()
+                    .get(&BridgeServer::runtime_pin_key(BridgeTarget::Edit, None))
+                    .unwrap()
+                    .runtime_id,
+                "export-edit",
+                "a concurrent play request from another place must not replace the Edit pin"
+            );
+        }
         let _command = crate::automation::runtime::select_bridge_context(&context, &bridge);
         assert_eq!(
             bridge.call("getGuiBounds", json!({})).unwrap()["runtime"],

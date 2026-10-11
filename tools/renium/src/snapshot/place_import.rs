@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Cursor};
 use std::path::Path;
@@ -96,10 +96,11 @@ pub(crate) fn import_place_file(mut args: ImportPlaceArgs) -> Result<()> {
 
 fn read_place(path: &Path, services: &[String]) -> Result<FlatDom> {
     let format = RbxPlaceFormat::from_path(path)?;
-    let bytes = match format {
-        RbxPlaceFormat::Binary => {
-            std::fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?
-        }
+    let (bytes, xml_hulls) = match format {
+        RbxPlaceFormat::Binary => (
+            std::fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?,
+            None,
+        ),
         RbxPlaceFormat::Xml => {
             let file =
                 File::open(path).with_context(|| format!("Failed to read {}", path.display()))?;
@@ -109,17 +110,48 @@ fn read_place(path: &Path, services: &[String]) -> Result<FlatDom> {
                     .property_behavior(rbx_xml::DecodePropertyBehavior::ReadUnknown),
             )
             .with_context(|| format!("Failed to read {}", path.display()))?;
+            // The binary intermediate fills absent hulls with BLOCK defaults.
+            // Keep only values the XML actually carried, without discarding
+            // the computed hulls present on other instances of the same class.
+            let hulls = dom
+                .descendants()
+                .filter(|instance| {
+                    instance.properties.contains_key(&rbx_dom_weak::Ustr::from(
+                        crate::rbx::encode::COLLISION_HULL_PROPERTY,
+                    ))
+                })
+                .map(|instance| {
+                    crate::rbx::model::rbx_dom_instance_path_parts(&dom, instance.referent())
+                })
+                .collect::<HashSet<_>>();
             let mut bytes = Vec::new();
             rbx_binary::to_writer(&mut bytes, &dom, dom.root().children())
                 .with_context(|| format!("Failed to convert {}", path.display()))?;
-            bytes
+            (bytes, Some(hulls))
         }
     };
-    let flat = rbx_binary::Deserializer::new()
+    let mut flat = rbx_binary::Deserializer::new()
         .elide_defaults(true)
+        .retain_defaults_for_properties(std::collections::HashSet::from([
+            crate::rbx::encode::COLLISION_HULL_PROPERTY.to_string(),
+        ]))
         .retain_defaults_for_classes(services.iter().cloned().collect())
         .deserialize_flat(Cursor::new(bytes))
         .with_context(|| format!("{} is not a valid place file", path.display()))?;
+    if let Some(hulls) = xml_hulls {
+        let paths = PlacePaths::new(&flat);
+        for instance in &mut flat.instances {
+            let path = (
+                paths.segments[&instance.referent].clone(),
+                paths.ordinals[&instance.referent].clone(),
+            );
+            if !hulls.contains(&path) {
+                instance.properties.retain(|(name, _)| {
+                    name.as_str() != crate::rbx::encode::COLLISION_HULL_PROPERTY
+                });
+            }
+        }
+    }
     if flat.root_indices.is_empty() {
         bail!("{} contains no services", path.display());
     }
@@ -408,6 +440,45 @@ mod tests {
     }
 
     #[test]
+    fn xml_import_preserves_partial_hulls_without_inventing_boxes() {
+        let root = crate::tests::support::temp_dir("xml-partial-hulls");
+        let path = root.join("place.rbxlx");
+        let dom = WeakDom::new(
+            InstanceBuilder::new("DataModel").with_child(
+                InstanceBuilder::new("Workspace")
+                    .with_child(
+                        InstanceBuilder::new("MeshPart")
+                            .with_name("Computed")
+                            .with_property(
+                                "PhysicalConfigData",
+                                rbx_dom_weak::types::SharedString::new(b"CSGPHS-hull".to_vec()),
+                            ),
+                    )
+                    .with_child(InstanceBuilder::new("MeshPart").with_name("Missing")),
+            ),
+        );
+        rbx_xml::to_writer_default(File::create(&path).unwrap(), &dom, dom.root().children())
+            .unwrap();
+        let flat = read_place(&path, &["Workspace".into()]).unwrap();
+        for name in ["Computed", "Missing"] {
+            let instance = flat
+                .instances
+                .iter()
+                .find(|instance| instance.name == name)
+                .unwrap();
+            assert_eq!(
+                instance
+                    .properties
+                    .iter()
+                    .any(|(key, _)| key.as_str() == "PhysicalConfigData"),
+                name == "Computed",
+                "{name}"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn place_import_keeps_engine_geometry_data() {
         let root = create_unique_directory(&std::env::temp_dir(), "renium-place-import-geometry-")
             .expect("temp project");
@@ -435,6 +506,12 @@ mod tests {
             InstanceBuilder::new("MeshPart")
                 .with_name("Rock")
                 .with_property("PhysicalConfigData", data("CSGPHS-hull")),
+        );
+        dom.insert(
+            workspace,
+            InstanceBuilder::new("MeshPart")
+                .with_name("Box")
+                .with_property("PhysicalConfigData", data("CSGPHS\0\0\0\0BLOCK")),
         );
         let mut bytes = Vec::new();
         rbx_binary::to_writer(&mut bytes, &dom, dom.root().children()).expect("place bytes");
@@ -471,6 +548,14 @@ mod tests {
         assert!(
             mesh.iter().any(|key| key == "PhysicalConfigData"),
             "{mesh:?}"
+        );
+        let boxed = instances
+            .iter()
+            .find(|instance| instance.name == "Box")
+            .unwrap();
+        assert!(
+            boxed.properties.contains_key("PhysicalConfigData"),
+            "an explicitly saved Box hull must survive without its import base"
         );
     }
 

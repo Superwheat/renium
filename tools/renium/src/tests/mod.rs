@@ -389,6 +389,109 @@ fn set_property_rejects_class_name() {
 }
 
 #[test]
+fn negative_property_values_and_camera_coordinates_parse_without_equals() {
+    for option in ["--num", "--value-num", "--json", "--value", "-j"] {
+        let args = BytecodeSetPropertyArgs::try_parse_from([
+            "bs",
+            "Workspace",
+            "-n",
+            "Part",
+            "-p",
+            "Transparency",
+            option,
+            "-0.5",
+        ])
+        .unwrap();
+        assert!(args.value_num == Some(-0.5) || args.value_json.as_deref() == Some("-0.5"));
+    }
+    let args = crate::cli::Cli::try_parse_from([
+        "rbx",
+        "sc",
+        "--camera-position",
+        "-10,5,0",
+        "--look-at",
+        "-20,0,0",
+        "-o",
+        "test.png",
+    ])
+    .unwrap();
+    assert!(matches!(args.command, crate::cli::Commands::Shot(_)));
+}
+
+#[test]
+fn cloning_a_script_refuses_to_overwrite_an_untracked_destination() {
+    let root = temp_dir("clone-source-collision");
+    let dir = root.join("src/Workspace");
+    fs::create_dir_all(&dir).unwrap();
+    let store = service_settings_path(&dir);
+    settings_document(vec![
+        settings_instance("root", "Workspace", "Workspace", None),
+        settings_instance("script", "Script", "ModuleScript", Some(0)),
+    ])
+    .write_file(&store)
+    .unwrap();
+    fs::write(dir.join("Script.luau"), "return 1").unwrap();
+    let destination = dir.join("Script Copy.luau");
+    fs::write(&destination, "return 2").unwrap();
+    let before = fs::read(&store).unwrap();
+    let result = bytecode_clone_instance(BytecodeCloneInstanceArgs {
+        input: BytecodeFileArgs::settings_file(store.clone()),
+        service: "Workspace".into(),
+        selector: BytecodeInstanceSelectorArgs::by_settings_id(Some("script".into())),
+        parent_index: None,
+        parent_settings_id: None,
+        parent_name: None,
+        parent_class_name: None,
+        pretty: false,
+    });
+    assert!(result.unwrap_err().to_string().contains("already exists"));
+    assert_eq!(fs::read(&store).unwrap(), before);
+    assert_eq!(fs::read_to_string(destination).unwrap(), "return 2");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn importing_a_model_refuses_to_overwrite_an_untracked_script() {
+    let root = temp_dir("model-source-collision");
+    let dir = root.join("src/Workspace");
+    fs::create_dir_all(&dir).unwrap();
+    let store = service_settings_path(&dir);
+    settings_document(vec![settings_instance(
+        "root",
+        "Workspace",
+        "Workspace",
+        None,
+    )])
+    .write_file(&store)
+    .unwrap();
+    let model = root.join("model.rbxm");
+    let dom = RbxWeakDom::new(
+        RbxInstanceBuilder::new("DataModel").with_child(
+            RbxInstanceBuilder::new("ModuleScript")
+                .with_name("Existing")
+                .with_property("Source", "return 1"),
+        ),
+    );
+    rbx_binary::to_writer(File::create(&model).unwrap(), &dom, dom.root().children()).unwrap();
+    let source = dir.join("Existing.luau");
+    fs::write(&source, "return 2").unwrap();
+    let before = fs::read(&store).unwrap();
+    let args = crate::cli::BytecodeImportModelArgs::try_parse_from([
+        "bim",
+        "--settings-file",
+        store.to_str().unwrap(),
+        "--model",
+        model.to_str().unwrap(),
+    ])
+    .unwrap();
+    let result = crate::rbx::model::bytecode_import_model(args);
+    assert!(result.unwrap_err().to_string().contains("already exists"));
+    assert_eq!(fs::read(&store).unwrap(), before);
+    assert_eq!(fs::read_to_string(source).unwrap(), "return 2");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn get_property_source_falls_back_to_externalized_mirror() {
     let dir = temp_dir("get-source-mirror");
     let service_dir = dir.join("src").join("ReplicatedStorage");

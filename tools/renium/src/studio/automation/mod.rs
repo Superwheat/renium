@@ -2910,7 +2910,7 @@ pub(crate) fn shot_result(args: &ShotArgs, bridge: &BridgeServer) -> Result<Valu
     };
     let mut camera_report = None;
     let capture = (|| {
-        if let Some((position, _)) = camera {
+        if let Some((position, look_at)) = camera {
             // The camera setter acknowledges the property change before rendering.
             // Cross two real frame boundaries while the camera lease is still held,
             // and read the camera back so the result says whether Studio moved it.
@@ -2918,13 +2918,13 @@ pub(crate) fn shot_result(args: &ShotArgs, bridge: &BridgeServer) -> Result<Valu
                 bridge,
                 bridge_target,
                 player,
-                "local runService = game:GetService(\"RunService\")\nrunService.Heartbeat:Wait()\nrunService.Heartbeat:Wait()\nlocal camera = workspace.CurrentCamera\nlocal p = camera.CFrame.Position\nreturn { p.X, p.Y, p.Z, tostring(camera.CameraType) }",
+                "local runService = game:GetService(\"RunService\")\nrunService.Heartbeat:Wait()\nrunService.Heartbeat:Wait()\nlocal camera = workspace.CurrentCamera\nlocal p = camera.CFrame.Position\nlocal look = camera.CFrame.LookVector\nreturn { p.X, p.Y, p.Z, tostring(camera.CameraType), look.X, look.Y, look.Z }",
                 "ReniumCaptureFrame",
                 3.0,
                 1.0,
             )?;
             ensure_luau_api_ok(&result)?;
-            camera_report = Some(camera_readback(&result, position));
+            camera_report = Some(camera_readback(&result, position, look_at));
         }
         input_inject::capture_window_png(&window, &output)
     })();
@@ -2956,10 +2956,9 @@ pub(crate) fn shot_result(args: &ShotArgs, bridge: &BridgeServer) -> Result<Valu
     Ok(result)
 }
 
-/// What the camera held after the move: the requested position, the one
-/// Studio reports, and a note when they differ, since the capture then shows
-/// the old view (the 3D view not being the active tab is the usual cause).
-fn camera_readback(result: &Value, requested: [f64; 3]) -> Value {
+/// What the camera held after the move: position and direction are checked
+/// before capture while the temporary camera lease is still active.
+fn camera_readback(result: &Value, requested: [f64; 3], look_at: [f64; 3]) -> Value {
     let values = result
         .get("results")
         .and_then(Value::as_array)
@@ -2976,19 +2975,40 @@ fn camera_readback(result: &Value, requested: [f64; 3]) -> Value {
         .and_then(|values| values.get(3))
         .and_then(Value::as_str)
         .map(str::to_string);
-    let moved = actual.is_some_and(|actual| {
-        requested
-            .iter()
-            .zip(actual)
-            .all(|(wanted, got)| (wanted - got).abs() < 1.0)
+    let actual_look = values.and_then(|values| {
+        Some([
+            values.get(4)?.as_f64()?,
+            values.get(5)?.as_f64()?,
+            values.get(6)?.as_f64()?,
+        ])
     });
-    let mut report = json!({ "requested": requested, "actual": actual, "moved": moved });
+    let direction = std::array::from_fn::<_, 3, _>(|index| look_at[index] - requested[index]);
+    let length = direction
+        .iter()
+        .map(|value| value * value)
+        .sum::<f64>()
+        .sqrt();
+    let facing = actual_look.is_some_and(|actual| {
+        length > 0.0
+            && direction
+                .iter()
+                .zip(actual)
+                .all(|(wanted, got)| (wanted / length - got).abs() < 0.001)
+    });
+    let moved = facing
+        && actual.is_some_and(|actual| {
+            requested
+                .iter()
+                .zip(actual)
+                .all(|(wanted, got)| (wanted - got).abs() < 1.0)
+        });
+    let mut report = json!({ "requested": requested, "requestedLookAt": look_at, "actual": actual, "actualLookVector": actual_look, "moved": moved });
     if let Some(camera_type) = camera_type {
         report["cameraType"] = json!(camera_type);
     }
     if !moved {
         report["note"] = json!(
-            "Studio did not hold the requested camera; the capture shows the previous view. Make the 3D view the active tab and retry, or set workspace.CurrentCamera.CFrame with rbx l --edit and capture without camera flags"
+            "Studio did not hold the requested camera position and direction; inspect the capture before using it. Make the 3D view the active tab and retry"
         );
     }
     report
@@ -3681,6 +3701,26 @@ mod play_state_tests {
     use super::*;
 
     #[test]
+    fn camera_readback_checks_direction_as_well_as_position() {
+        let result = json!({"results":[[1.0,2.0,3.0,"Enum.CameraType.Scriptable",0.0,0.0,-1.0]]});
+        assert_eq!(
+            camera_readback(&result, [1.0, 2.0, 3.0], [1.0, 2.0, 0.0])["moved"],
+            true
+        );
+        let turned = camera_readback(&result, [1.0, 2.0, 3.0], [4.0, 2.0, 3.0]);
+        assert_eq!(turned["moved"], false);
+        assert!(turned["note"].is_string());
+        assert_eq!(
+            camera_readback(&result, [-10.0, 2.0, 3.0], [1.0, 2.0, 0.0])["moved"],
+            false
+        );
+        assert_eq!(
+            camera_readback(&json!({"results":[]}), [1.0, 2.0, 3.0], [1.0, 2.0, 0.0])["moved"],
+            false
+        );
+    }
+
+    #[test]
     fn runner_names_are_short_identifiers() {
         assert!(runner_name("jump-sampler_2").is_ok());
         assert!(runner_name("").is_err());
@@ -3694,6 +3734,24 @@ mod play_state_tests {
             crate::cli::Commands::StartStopPlay(args) => Ok(args),
             _ => panic!("expected play"),
         }
+    }
+
+    #[test]
+    fn one_client_requires_explicit_mode_except_when_leaving() {
+        for action in ["-s", "-r"] {
+            let args = play_args(&["rbx", "play", action, "--players", "1"]).unwrap();
+            assert!(
+                validate_play_args(&args)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("ordinary Play")
+            );
+            let args =
+                play_args(&["rbx", "play", action, "--players", "1", "--mode", "play"]).unwrap();
+            validate_play_args(&args).unwrap();
+        }
+        validate_play_args(&play_args(&["rbx", "play", "--leave", "-p", "1"]).unwrap()).unwrap();
+        validate_play_args(&play_args(&["rbx", "play", "-s", "--players", "2"]).unwrap()).unwrap();
     }
 
     #[test]

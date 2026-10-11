@@ -625,6 +625,10 @@ This may cause unexpected or broken behavior in your final results if you rely o
         if self.deserializer.elide_defaults
             && !self
                 .deserializer
+                .retain_defaults_for_properties
+                .contains(property.name.as_str())
+            && !self
+                .deserializer
                 .retain_defaults_for_classes
                 .contains(type_name.as_str())
         {

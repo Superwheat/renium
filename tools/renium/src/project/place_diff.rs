@@ -373,6 +373,7 @@ pub(super) fn document(
                     // tags and unknown-type normalization retain their full comparison.
                     if descriptor.is_some()
                         && key != "Source"
+                        && key != crate::rbx::encode::COLLISION_HULL_PROPERTY
                         && !matches!(value, Variant::Tags(_))
                         && *raw_default == Some(value)
                     {
@@ -415,7 +416,9 @@ pub(super) fn document(
                     } else {
                         variant_value(value, descriptor, database, &import_refs)?
                     };
-                    if default.as_ref() == Some(&value) {
+                    if key != crate::rbx::encode::COLLISION_HULL_PROPERTY
+                        && default.as_ref() == Some(&value)
+                    {
                         continue;
                     }
                     let output_name = if elide_defaults {
@@ -680,6 +683,7 @@ pub(super) fn compare(
                         return false;
                     }
                     if project_target
+                        && name != "PhysicalConfigData"
                         && !instance.properties.contains_key(name)
                         && captured_by_class
                             .get(instance.class_name.as_str())

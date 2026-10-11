@@ -114,6 +114,33 @@ fn block_physics_placeholders_are_reported_while_computed_hulls_are_not() {
     );
 }
 
+#[test]
+fn full_diff_reports_box_hulls_even_when_they_equal_the_reflection_default() {
+    let make = |bytes: &[u8]| {
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let workspace = dom.insert(dom.root_ref(), InstanceBuilder::new("Workspace"));
+        dom.insert(
+            workspace,
+            InstanceBuilder::new("MeshPart")
+                .with_name("Track")
+                .with_property(
+                    "PhysicalConfigData",
+                    rbx_dom_weak::types::SharedString::new(bytes.to_vec()),
+                ),
+        );
+        dom
+    };
+    let boxed = make(b"CSGPHS\0\0\0\0BLOCK");
+    let hull = make(b"CSGPHS-computed-hull");
+    let result = diff(&boxed, &hull, &["--all", "--values"]);
+    assert_eq!(result["changed"], 1, "{result}");
+    assert_eq!(
+        result["differences"][0]["properties"][0]["name"],
+        "PhysicalConfigData"
+    );
+    assert_eq!(diff(&boxed, &boxed, &[])["matches"], true);
+}
+
 fn fixture(reverse: bool, revision: f64) -> WeakDom {
     let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
     let root = dom.insert(dom.root_ref(), InstanceBuilder::new("Workspace"));

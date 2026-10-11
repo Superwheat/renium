@@ -1782,6 +1782,9 @@ fn decode_native_service_dom(
     let decode_started = Instant::now();
     let mut flat = rbx_binary::Deserializer::new()
         .elide_defaults(true)
+        .retain_defaults_for_properties(HashSet::from([
+            crate::rbx::encode::COLLISION_HULL_PROPERTY.to_string(),
+        ]))
         .retain_defaults_for_classes(HashSet::from([group.service.clone()]))
         .flat_property_filter(property_filter)
         .deserialize_flat(std::io::Cursor::new(bytes))
@@ -1884,6 +1887,9 @@ fn decode_native_serialization_batch(
     // for a stale file value to be corrected.
     let mut flat = match rbx_binary::Deserializer::new()
         .elide_defaults(true)
+        .retain_defaults_for_properties(HashSet::from([
+            crate::rbx::encode::COLLISION_HULL_PROPERTY.to_string(),
+        ]))
         .retain_defaults_for_classes(groups.iter().map(|group| group.service.clone()).collect())
         .flat_property_filter(property_filter)
         .deserialize_flat(std::io::Cursor::new(bytes))

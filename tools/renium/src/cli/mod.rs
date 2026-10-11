@@ -1474,7 +1474,7 @@ pub(super) struct StartStopPlayArgs {
     )]
     pub(super) restart: bool,
     #[arg(
-        help = "Launch a server and N clients (with --leave: the client index to remove)",
+        help = "Launch a server and N clients (N=1 requires --mode play; with --leave: client index)",
         short,
         long,
         alias = "clients",
@@ -2609,7 +2609,8 @@ pub(super) struct BytecodeSetPropertyArgs {
         long,
         alias = "value",
         alias = "json",
-        help = "JSON value, or - to read it from stdin"
+        help = "JSON value, or - to read it from stdin",
+        allow_hyphen_values = true
     )]
     pub(super) value_json: Option<String>,
     #[arg(
@@ -2619,7 +2620,12 @@ pub(super) struct BytecodeSetPropertyArgs {
         allow_hyphen_values = true
     )]
     pub(super) value_str: Option<String>,
-    #[arg(help = "Number value", long = "num", alias = "value-num")]
+    #[arg(
+        help = "Number value",
+        long = "num",
+        alias = "value-num",
+        allow_negative_numbers = true
+    )]
     pub(super) value_num: Option<f64>,
     #[arg(help = "Boolean value", long = "bool", alias = "value-bool")]
     pub(super) value_bool: Option<bool>,

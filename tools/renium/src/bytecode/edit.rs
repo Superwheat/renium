@@ -359,10 +359,9 @@ pub(crate) fn bytecode_clone_instance(args: BytecodeCloneInstanceArgs) -> Result
         if from == to || !from.exists() {
             continue;
         }
-        writes.insert(
-            to.clone(),
-            fs::read(from).with_context(|| format!("Failed to read {}", from.display()))?,
-        );
+        let bytes = fs::read(from).with_context(|| format!("Failed to read {}", from.display()))?;
+        super::check_new_source_file(to, &bytes)?;
+        writes.insert(to.clone(), bytes);
         source_copies.push(json!({
             "from": from,
             "to": to,

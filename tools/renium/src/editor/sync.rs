@@ -46,8 +46,8 @@ use crate::editor::review::{
 use crate::editor::types::{
     EditorBinaryImport, EditorChangeSet, EditorHistoryEntry, EditorInstanceChange,
     EditorInstanceDescriptor, EditorPreserveDescriptor, EditorPropertyChange, EditorPropertyFilter,
-    EditorSettingsWrite, EditorSourceChange, EditorSourcePathSpec, EditorSourceTarget,
-    PreparedEditorDocuments, take_pre_routed_protected_writes,
+    EditorSettingsWrite, EditorSourceChange, EditorSourceTarget, PreparedEditorDocuments,
+    take_pre_routed_protected_writes,
 };
 use crate::project::config;
 use crate::project::layout::apply_configured_project_layout;
@@ -3780,62 +3780,28 @@ fn push_scope(service: &str, segments: &[String], ordinals: &[usize]) -> PushSco
     (relative.to_vec(), relative_ordinals.to_vec())
 }
 
-/// Whether a script lies in a pushed subtree: its own instance or one of
-/// its ancestors carries a target id. A script without a store entry is
-/// outside every target.
-fn source_target_within_filter(
-    document: Option<&SettingsBytecode>,
-    target: &EditorSourceTarget,
-    settings_ids: &HashSet<String>,
-) -> bool {
-    let (Some(document), Some(settings_id)) = (document, target.settings_id.as_deref()) else {
-        return false;
-    };
-    let mut index = document_instance_index_by_settings_id(document, settings_id);
-    while let Some(current) = index {
-        let Some(instance) = document.instances.get(current) else {
-            return false;
-        };
-        if settings_ids.contains(&instance.settings_id) {
-            return true;
-        }
-        index = instance.parent_index;
-    }
-    false
+fn source_path_within_filter(scopes: &[PushScope], path: &PushScope) -> bool {
+    scopes.iter().any(|(segments, ordinals)| {
+        crate::project::package_links::selector_starts_with(&path.0, &path.1, segments, ordinals)
+    })
 }
 
-/// The instance a script file's source is pushed to: its store entry, or a
-/// target inferred from the path for a new file; none for a vanished file
-/// without an entry or for a script outside a push's target subtrees.
-fn pushed_source_target(
-    mapped_target: Option<EditorSourceTarget>,
-    exists_as_file: bool,
-    inferred_spec: Option<EditorSourcePathSpec>,
-    documents: &HashMap<String, Option<Arc<SettingsBytecode>>>,
+fn append_target_scopes(
+    scopes: &mut Vec<PushScope>,
     service: &str,
-    property_filter: &EditorPropertyFilter,
-) -> Option<EditorSourceTarget> {
-    let target = match (mapped_target, exists_as_file, inferred_spec) {
-        (Some(target), _, _) => target,
-        (None, true, Some(spec)) => EditorSourceTarget {
-            service: spec.service,
-            settings_id: None,
-            path_segments: spec.path_segments,
-            path_ordinals: Vec::new(),
-            class_name: spec.class_name,
-        },
-        _ => return None,
-    };
-    let outside = !property_filter.settings_ids.is_empty()
-        && !source_target_within_filter(
-            documents
-                .get(service)
-                .and_then(Option::as_ref)
-                .map(Arc::as_ref),
-            &target,
-            &property_filter.settings_ids,
-        );
-    (!outside).then_some(target)
+    document: &SettingsBytecode,
+    settings_ids: &HashSet<String>,
+) {
+    let (segments, ordinals) =
+        crate::editor::paths::build_editor_instance_path_parts(document, service);
+    for (index, instance) in document.instances.iter().enumerate() {
+        if settings_ids.contains(&instance.settings_id)
+            && let (Some(Some(segments)), Some(Some(ordinals))) =
+                (segments.get(index), ordinals.get(index))
+        {
+            scopes.push(push_scope(service, segments, ordinals));
+        }
+    }
 }
 
 /// The subtrees a push filtered by settings ids touches. Every loaded
@@ -3855,18 +3821,7 @@ fn target_filter_scopes(
         let Some(document) = document else {
             continue;
         };
-        let (segments, ordinals) =
-            crate::editor::paths::build_editor_instance_path_parts(document, service);
-        for (index, instance) in document.instances.iter().enumerate() {
-            if !settings_ids.contains(&instance.settings_id) {
-                continue;
-            }
-            if let (Some(Some(segments)), Some(Some(ordinals))) =
-                (segments.get(index), ordinals.get(index))
-            {
-                entry.push(push_scope(service, segments, ordinals));
-            }
-        }
+        append_target_scopes(entry, service, document, settings_ids);
     }
     scopes
 }
@@ -4133,11 +4088,14 @@ fn finish_editor_change_collection(
         .union(&services.read_only)
         .cloned()
         .collect::<HashSet<_>>();
-    let scopes = if property_filter.settings_ids.is_empty() {
+    let mut scopes = if property_filter.settings_ids.is_empty() {
         services.scopes.clone()
     } else {
         target_filter_scopes(documents, &property_filter.settings_ids, &services.scopes)
     };
+    for service in &services.reconcile {
+        scopes.insert(service.clone(), vec![(Vec::new(), Vec::new())]);
+    }
     validate_read_only_service_changes(link_enforcement, &validated, &scopes, documents, src_root)?;
     log_editor_collection_timing("package validation", phase_started);
     for service in sorted_services(services.dirty) {
@@ -4320,6 +4278,8 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
     prepared_documents: &mut PreparedEditorDocuments,
 ) -> Result<EditorChangeSet> {
     let mut property_filter = EditorPropertyFilter::from_args(args)?;
+    let explicit_target_ids = property_filter.settings_ids.clone();
+    let mut source_scopes = PushScopes::new();
     let mut changes = EditorChangeSet {
         native_property_documents: prepared_documents
             .native_services
@@ -4381,6 +4341,15 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
             &mut documents,
             &mut prepared_documents.documents,
         )?;
+        if !explicit_target_ids.is_empty() {
+            source_scopes.entry(service.clone()).or_insert_with(|| {
+                let mut scopes = Vec::new();
+                if let Some(Some(document)) = documents.get(&service) {
+                    append_target_scopes(&mut scopes, &service, document, &explicit_target_ids);
+                }
+                scopes
+            });
+        }
 
         if collect_settings_file_change(
             args,
@@ -4460,6 +4429,16 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
                     .as_ref()
                     .map(|spec| (spec.path_segments.as_slice(), &[][..]))
             });
+        if !explicit_target_ids.is_empty()
+            && !protected_path.is_some_and(|(segments, ordinals)| {
+                source_path_within_filter(
+                    source_scopes.get(&service).map_or(&[], Vec::as_slice),
+                    &push_scope(&service, segments, ordinals),
+                )
+            })
+        {
+            continue;
+        }
         if read_only_changed_path(
             link_enforcement,
             &service,
@@ -4637,14 +4616,7 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
             continue;
         }
 
-        let Some(target) = pushed_source_target(
-            mapped_target,
-            exists_as_file,
-            inferred_spec,
-            &documents,
-            &service,
-            &property_filter,
-        ) else {
+        let Some(target) = mapped_target else {
             continue;
         };
 
@@ -4765,47 +4737,119 @@ fn log_change_set_composition(
 #[cfg(test)]
 mod sync_tests {
     #[test]
-    fn a_push_by_target_id_skips_scripts_outside_the_targets() {
-        let document = crate::tests::support::settings_document(vec![
-            crate::tests::support::settings_instance("ws", "Workspace", "Workspace", None),
-            crate::tests::support::settings_instance(
-                "racing:racetracks",
-                "RaceTracks",
-                "Folder",
-                Some(0),
-            ),
-            crate::tests::support::settings_instance("t1", "Track1", "Script", Some(1)),
-            crate::tests::support::settings_instance("car", "Mercenne 63S", "Model", Some(0)),
-            crate::tests::support::settings_instance("seat", "Invisibility", "Script", Some(3)),
+    fn target_ids_filter_source_mutations_before_creating_or_deleting_instances() {
+        use crate::cli::ProjectSourceArgs;
+        use crate::tests::support::{settings_document, settings_instance, temp_dir};
+        let root = temp_dir("targeted-source-mutations");
+        let src = root.join("src");
+        let service_dir = src.join("Workspace");
+        fs::create_dir_all(service_dir.join("Selected")).unwrap();
+        let document = settings_document(vec![
+            settings_instance("ws", "Workspace", "Workspace", None),
+            settings_instance("selected", "Selected", "Folder", Some(0)),
+            settings_instance("removed", "Removed", "ModuleScript", Some(0)),
         ]);
-        let ids = HashSet::from(["racing:racetracks".to_string()]);
-        let target = |settings_id: Option<&str>| EditorSourceTarget {
-            service: "Workspace".into(),
-            settings_id: settings_id.map(str::to_string),
-            path_segments: Vec::new(),
-            path_ordinals: Vec::new(),
-            class_name: "Script".into(),
-        };
-        assert!(super::source_target_within_filter(
-            Some(&document),
-            &target(Some("t1")),
-            &ids
-        ));
-        assert!(super::source_target_within_filter(
-            Some(&document),
-            &target(Some("racing:racetracks")),
-            &ids
-        ));
-        assert!(!super::source_target_within_filter(
-            Some(&document),
-            &target(Some("seat")),
-            &ids
-        ));
-        assert!(!super::source_target_within_filter(
-            Some(&document),
-            &target(None),
-            &ids
-        ));
+        let store = crate::system::files::service_settings_path(&service_dir);
+        document.write_file(&store).unwrap();
+        let inside = service_dir.join("Selected/New.luau");
+        let outside = service_dir.join("Outside.luau");
+        fs::write(&inside, "return 1").unwrap();
+        fs::write(&outside, "return 2").unwrap();
+        let mut args = PushEditorChangesArgs::new(
+            ProjectSourceArgs {
+                project_root: root.clone(),
+                src_root: src.clone(),
+            },
+            BridgeConnectionArgs::local(0.1),
+        );
+        args.target_settings_ids.push("selected".into());
+        args.changed_paths = vec![outside, service_dir.join("Removed.luau"), inside];
+        let mut links = LinkEnforcement::default();
+        links
+            .read_only_packages
+            .push(crate::project::package_links::ReadOnlyPackageEnforcement {
+                link_id: "outside".into(),
+                service: "Workspace".into(),
+                target_segments: vec!["Outside".into()],
+                target_ordinals: vec![1],
+                expected_fingerprint: "unrelated-drift".into(),
+            });
+        let changes =
+            collect_editor_changes_with_link_enforcement(&args, &root, &src, &links).unwrap();
+        assert_eq!(changes.source_changes.len(), 1);
+        assert_eq!(
+            changes.source_changes[0].path_segments,
+            ["Workspace", "Selected", "New"]
+        );
+        assert!(changes.instance_changes.iter().all(|change| {
+            change.mode != "deleteInstances"
+                && change.instances.iter().all(|instance| {
+                    !instance
+                        .path_segments
+                        .last()
+                        .is_some_and(|name| matches!(name.as_str(), "Outside" | "Removed"))
+                })
+        }));
+        let written = changes
+            .settings_writes
+            .iter()
+            .find(|write| write.path == store)
+            .unwrap();
+        assert!(
+            written
+                .document
+                .instances
+                .iter()
+                .any(|instance| instance.settings_id == "removed")
+        );
+        assert!(
+            !written
+                .document
+                .instances
+                .iter()
+                .any(|instance| instance.name == "Outside")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_store_reconcile_does_not_inherit_a_narrow_script_scope() {
+        use crate::tests::support::{settings_document, settings_instance, temp_dir};
+        let root = temp_dir("full-store-read-only-scope");
+        let document = settings_document(vec![
+            settings_instance("ws", "Workspace", "Workspace", None),
+            settings_instance("public", "Public", "Folder", Some(0)),
+        ]);
+        let documents = HashMap::from([("Workspace".into(), Some(Arc::new(document)))]);
+        let mut services = EditorChangedServices::default();
+        services.settings.insert("Workspace".into());
+        services.reconcile.insert("Workspace".into());
+        services
+            .scopes
+            .insert("Workspace".into(), vec![(vec!["Other".into()], vec![1])]);
+        let mut links = LinkEnforcement::default();
+        links
+            .read_only_packages
+            .push(crate::project::package_links::ReadOnlyPackageEnforcement {
+                link_id: "public".into(),
+                service: "Workspace".into(),
+                target_segments: vec!["Public".into()],
+                target_ordinals: vec![1],
+                expected_fingerprint: "changed".into(),
+            });
+        let error = finish_editor_change_collection(
+            EditorChangeSet::default(),
+            &documents,
+            services,
+            &EditorPropertyFilter::default(),
+            &root,
+            &root.join("src"),
+            &links,
+        )
+        .err()
+        .expect("the full store reaches Public");
+        assert!(error.to_string().contains("read-only link"), "{error:#}");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

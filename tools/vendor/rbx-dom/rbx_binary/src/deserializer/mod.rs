@@ -75,6 +75,7 @@ pub struct Deserializer<'db> {
     database: &'db ReflectionDatabase<'db>,
     elide_defaults: bool,
     retain_defaults_for_classes: HashSet<String>,
+    retain_defaults_for_properties: HashSet<String>,
     flat_property_filter: Option<Arc<HashMap<String, HashSet<String>>>>,
 }
 
@@ -85,6 +86,7 @@ impl<'db> Deserializer<'db> {
             database: rbx_reflection_database::get().unwrap(),
             elide_defaults: false,
             retain_defaults_for_classes: HashSet::new(),
+            retain_defaults_for_properties: HashSet::new(),
             flat_property_filter: None,
         }
     }
@@ -108,6 +110,13 @@ impl<'db> Deserializer<'db> {
     /// without expanding defaults for the rest of a large snapshot.
     pub fn retain_defaults_for_classes(mut self, classes: HashSet<String>) -> Self {
         self.retain_defaults_for_classes = classes;
+        self
+    }
+
+    /// Keep explicitly serialized values for these canonical property names,
+    /// even when they equal reflection defaults.
+    pub fn retain_defaults_for_properties(mut self, properties: HashSet<String>) -> Self {
+        self.retain_defaults_for_properties = properties;
         self
     }
 

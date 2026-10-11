@@ -753,6 +753,13 @@ fn raw_body(path: &str, content_type: Option<&str>) -> Result<(String, Vec<u8>),
         ));
     }
     let content_type = content_type.unwrap_or_else(|| file_content_type(path));
+    validate_content_type(content_type)?;
+    let body =
+        fs::read(path).map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+    Ok((content_type.to_string(), body))
+}
+
+fn validate_content_type(content_type: &str) -> Result<(), String> {
     if content_type.is_empty()
         || content_type
             .chars()
@@ -760,9 +767,7 @@ fn raw_body(path: &str, content_type: Option<&str>) -> Result<(String, Vec<u8>),
     {
         return Err("contentType is invalid".to_string());
     }
-    let body =
-        fs::read(path).map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
-    Ok((content_type.to_string(), body))
+    Ok(())
 }
 
 fn multipart_body(
@@ -771,6 +776,9 @@ fn multipart_body(
     files: &Map<String, Value>,
     file_type: Option<&str>,
 ) -> Result<(String, Vec<u8>), String> {
+    if let Some(file_type) = file_type {
+        validate_content_type(file_type)?;
+    }
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1126,6 +1134,12 @@ mod tests {
         let (_, body) =
             super::multipart_body(&Map::new(), &Map::new(), &files, Some("model/custom")).unwrap();
         assert!(String::from_utf8_lossy(&body).contains("Content-Type: model/custom\r\n"));
+        for invalid in ["", "model/custom\r\nX-Injected: true"] {
+            assert!(
+                super::multipart_body(&Map::new(), &Map::new(), &files, Some(invalid)).is_err()
+            );
+            assert!(super::raw_body(file.to_str().unwrap(), Some(invalid)).is_err());
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

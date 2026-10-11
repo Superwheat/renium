@@ -407,14 +407,8 @@ pub(crate) fn run(args: OpenCloudArgs, project: Option<&Path>) -> Result<()> {
             if anonymous {
                 bail!("cloud fetch requires an API key");
             }
-            let identity = if fetch.name.is_some() {
-                CloudIdentity {
-                    game_id: universe,
-                    place_id,
-                }
-            } else {
-                identity()?
-            };
+            let identity =
+                fetch_identity(project, args.universe, args.place_id, fetch.name.as_deref())?;
             super::discovery::fetch_command(
                 identity,
                 &key_env,
@@ -536,6 +530,22 @@ fn selector_ids(selector: Option<&str>) -> (Option<i64>, Option<i64>) {
         },
         None => (None, positive(selector)),
     }
+}
+
+fn fetch_identity(
+    project: Option<&Path>,
+    universe: Option<i64>,
+    place_id: Option<i64>,
+    name: Option<&str>,
+) -> Result<CloudIdentity> {
+    if name.is_some() || universe.is_some() || place_id.is_some() {
+        return Ok(CloudIdentity {
+            game_id: universe,
+            place_id,
+        });
+    }
+    let (universe, place) = selector_ids(app::context::place_selector().as_deref());
+    discover_identity(project, universe, place)
 }
 
 pub(crate) fn discover_identity(
@@ -695,6 +705,30 @@ fn json_assignments(values: &[String]) -> Result<Map<String, Value>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_fetch_ids_do_not_inherit_a_bound_place() {
+        let root = crate::tests::support::temp_dir("fetch-explicit-universe");
+        fs::create_dir_all(root.join(".renium")).unwrap();
+        let project = root.join("renium.project.jsonc");
+        fs::write(&project, r#"{"schemaVersion":1}"#).unwrap();
+        fs::write(
+            root.join(".renium/studio-target.json"),
+            r#"{"gameId":10,"placeId":20}"#,
+        )
+        .unwrap();
+        let universe = fetch_identity(Some(&project), Some(30), None, None).unwrap();
+        assert_eq!(universe.game_id, Some(30));
+        assert_eq!(universe.place_id, None);
+        let place = fetch_identity(Some(&project), None, Some(40), None).unwrap();
+        assert_eq!(place.place_id, Some(40));
+        assert_eq!(place.game_id, None);
+        let named = fetch_identity(Some(&project), None, None, Some("Other")).unwrap();
+        assert_eq!(named.place_id, None);
+        let bound = discover_identity(Some(&project), None, None).unwrap();
+        assert_eq!(bound.place_id, Some(20));
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn a_bound_studio_target_supplies_the_universe_and_place() {

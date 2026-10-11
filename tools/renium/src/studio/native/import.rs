@@ -3262,6 +3262,7 @@ fn build_editor_binary_import_for_services(
     }
     log_timing("native editor import payload grouping", phase_started);
     let phase_started = Instant::now();
+    crate::rbx::encode::finish_place_dom(&mut build.dom);
     let mut bytes = Vec::new();
     rbx_binary::to_writer(&mut bytes, &build.dom, &top_level_refs)
         .context("Failed to encode native Studio import")?;

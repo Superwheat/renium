@@ -166,7 +166,12 @@ pub(crate) fn is_editor_method(method: &str) -> bool {
         || method.starts_with("getSourceRange")
         || matches!(
             method,
-            "getStudioChangeState" | "verifyPushProof" | "requestProtectedWriteReview"
+            "getStudioChangeState"
+                | "verifyPushProof"
+                | "requestProtectedWriteReview"
+                | "configurePropertyCandidates"
+                | "setExportOptions"
+                | "recordSyncCompletion"
         )
 }
 

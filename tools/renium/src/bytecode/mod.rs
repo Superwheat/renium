@@ -2644,6 +2644,18 @@ fn file_contents_differ(path: &Path, expected: &[u8]) -> Result<bool> {
     }
 }
 
+pub(crate) fn check_new_source_file(path: &Path, expected: &[u8]) -> Result<()> {
+    match fs::read(path) {
+        Ok(current) if current != expected => bail!(
+            "{} already exists with different contents; move or rename it before creating this script",
+            path.display()
+        ),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("Failed to read {}", path.display())),
+    }
+}
+
 fn collect_source_path_moves(
     before: &[Option<PathBuf>],
     after: &[Option<PathBuf>],

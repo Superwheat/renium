@@ -33,6 +33,12 @@ pub(super) struct RouteArgs {
     form: Vec<String>,
     #[arg(long, value_name = "NAME=PATH", help = "Attach a multipart file")]
     file: Vec<String>,
+    #[arg(
+        long,
+        value_name = "MIME",
+        help = "Override the body or multipart file media type"
+    )]
+    content_type: Option<String>,
     #[arg(long, help = "Data store scope (default global)")]
     scope: Option<String>,
     #[arg(
@@ -2732,7 +2738,7 @@ fn build_request(category: &str, identity: CloudIdentity, args: RouteArgs) -> Re
         "jsonParts": json_parts,
         "files": parts.files,
         "rawFile": raw_file,
-        "contentType": content_type,
+        "contentType": args.content_type.as_deref().or(content_type),
         "ifMatch": args.if_match,
         "outputFile": args.output.map(|path| absolute_path(Path::new(&path)).display().to_string()),
     }))
@@ -2893,6 +2899,7 @@ mod tests {
 
     fn args(action: &str, values: &[&str]) -> RouteArgs {
         RouteArgs {
+            content_type: None,
             action: Some(action.to_string()),
             values: values.iter().map(|value| (*value).to_string()).collect(),
             query: Vec::new(),
@@ -3365,5 +3372,44 @@ mod tests {
         ];
         let request = build_request("thumbnail", identity, status).unwrap();
         assert_eq!(request["query"]["operationIds"], json!(["first", "second"]));
+    }
+
+    #[test]
+    fn native_upload_commands_accept_and_forward_content_type() {
+        use clap::Parser;
+        assert!(
+            crate::cli::Cli::try_parse_from([
+                "rbx",
+                "oc",
+                "asset",
+                "create",
+                "Model",
+                "Car",
+                "A car",
+                "car.glb",
+                "--content-type",
+                "model/gltf-binary",
+            ])
+            .is_ok()
+        );
+        let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let file = file.to_str().unwrap();
+        for (category, action, values) in [
+            ("asset", "create", vec!["Model", "Car", "A car", file]),
+            ("place", "publish", vec![file]),
+        ] {
+            let mut args = args(action, &values);
+            args.content_type = Some("model/custom".into());
+            let request = build_request(
+                category,
+                CloudIdentity {
+                    game_id: Some(1),
+                    place_id: Some(2),
+                },
+                args,
+            )
+            .unwrap();
+            assert_eq!(request["contentType"], "model/custom");
+        }
     }
 }
