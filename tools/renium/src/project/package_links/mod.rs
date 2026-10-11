@@ -43,6 +43,7 @@ pub(crate) const RENIUM_STORE_EXTENSION: &str = "renium";
 pub(crate) const RENIUM_DIR_GITIGNORE: &str = "# Renium local state. Configuration and link.lock.json remain tracked.\ncache/\ndiagnostics/\neditor-history/\neditor-property-batches/\nimport-backups/\nsnapshots/\nsync-base/\nconflicts/\nbuild/\nbuild-staging/\nnested-syncback/\nadapter-baseline.json\nlink-cache/\nlive-watch-state.*\n";
 
 mod commands;
+mod pull;
 mod shared;
 mod wally;
 #[cfg(test)]
@@ -51,6 +52,7 @@ use commands::resolve_editor_instance_by_path_ordinals;
 pub(crate) use commands::{
     link_add, link_apply, link_break, link_delete_package, link_move_target, link_pack, link_status,
 };
+pub(crate) use pull::{PullLinkRestore, StudioOverrides};
 pub(crate) use shared::{propagate_shared_links_from, shared_link_sources_touched};
 pub(crate) use wally::sync_wally_packages;
 pub(crate) use wally::sync_wally_packages_result;
@@ -350,14 +352,16 @@ fn read_link_manifest(path: &Path) -> Result<LinkManifest> {
     }
     let raw = fs::read_to_string(path)
         .with_context(|| format!("Failed to read link manifest {}", path.display()))?;
+    parse_link_manifest(&raw).with_context(|| format!("Invalid link manifest {}", path.display()))
+}
+
+fn parse_link_manifest(raw: &str) -> Result<LinkManifest> {
     let raw = raw.trim_start_matches('\u{feff}');
     if raw.trim().is_empty() {
-        bail!("Link manifest {} is empty", path.display());
+        bail!("Link manifest is empty");
     }
-    let manifest: LinkManifest = serde_json::from_str(raw)
-        .with_context(|| format!("Failed to parse link manifest {}", path.display()))?;
-    validate_link_manifest(&manifest)
-        .with_context(|| format!("Invalid link manifest {}", path.display()))?;
+    let manifest: LinkManifest = serde_json::from_str(raw)?;
+    validate_link_manifest(&manifest)?;
     Ok(manifest)
 }
 
@@ -1717,6 +1721,7 @@ fn collect_project_settings_files(
     extras: impl IntoIterator<Item = PathBuf>,
 ) -> Result<Vec<PathBuf>> {
     let mut files = extras.into_iter().collect::<Vec<_>>();
+    files.extend(crate::project::structural::service_store_paths(src_root)?.into_values());
     if src_root.is_dir() {
         for entry in WalkDir::new(src_root).follow_links(false) {
             let entry = entry?;
@@ -3452,56 +3457,6 @@ pub(crate) fn build_loaded_project_link_enforcement(
 
 fn link_path_key(path: &Path) -> String {
     path_key(&strip_extended_prefix(path.to_path_buf()))
-}
-
-/// After a pull wrote Studio's copy of every service, puts each read-only
-/// link mirror back to its package when Studio's copy differed, and reports
-/// which links that touched so the caller can re-apply them in Studio.
-pub(crate) fn restore_drifted_read_only_links(
-    project_root: &Path,
-    src_root: &Path,
-) -> Result<Vec<Value>> {
-    let enforcement = build_link_enforcement(project_root, src_root, None)?;
-    let mut restored = Vec::new();
-    for target in &enforcement.read_only_packages {
-        let service_dir = src_root.join(&target.service);
-        let settings_file = crate::system::files::service_settings_path(&service_dir);
-        if !settings_file.is_file() {
-            continue;
-        }
-        let mut documents = HashMap::from([(
-            settings_file.clone(),
-            SettingsBytecode::read_file(&settings_file)?,
-        )]);
-        canonicalize_loaded_settings_documents(&mut documents)?;
-        let document = documents
-            .remove(&settings_file)
-            .context("Canonical settings document disappeared")?;
-        if read_only_target_current(
-            &document,
-            &target.service,
-            &service_dir,
-            &target.target_segments,
-            &target.target_ordinals,
-            target.package.as_deref(),
-            &target.expected_fingerprint,
-        )? {
-            continue;
-        }
-        let path = std::iter::once(target.service.as_str())
-            .chain(target.target_segments.iter().map(String::as_str))
-            .collect::<Vec<_>>()
-            .join(".");
-        let outcome = shared::restore_shared_consumer(project_root, &target.link_id)?;
-        restored.push(json!({
-            "link": target.link_id,
-            "path": path,
-            "restored": outcome.is_some(),
-            "state": outcome.map(|(state, _)| state),
-            "replaced": outcome.map(|(_, replaced)| replaced),
-        }));
-    }
-    Ok(restored)
 }
 
 pub(crate) fn build_link_enforcement(

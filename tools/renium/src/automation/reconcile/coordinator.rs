@@ -689,7 +689,28 @@ impl Coordinator {
         paths: &[PathBuf],
         side: BaselineSide,
     ) -> Result<()> {
-        if paths.is_empty() {
+        self.advance_baseline_inner(context, key, paths, side, &BTreeMap::new())
+    }
+
+    pub(crate) fn advance_pulled_baseline(
+        &self,
+        context: &BoundContext,
+        key: &str,
+        paths: &[PathBuf],
+        studio_overrides: &crate::project::package_links::StudioOverrides,
+    ) -> Result<()> {
+        self.advance_baseline_inner(context, key, paths, BaselineSide::Studio, studio_overrides)
+    }
+
+    fn advance_baseline_inner(
+        &self,
+        context: &BoundContext,
+        key: &str,
+        paths: &[PathBuf],
+        side: BaselineSide,
+        studio_overrides: &crate::project::package_links::StudioOverrides,
+    ) -> Result<()> {
+        if paths.is_empty() && studio_overrides.is_empty() {
             return Ok(());
         }
         let pair_lock = self.pair_lock(key);
@@ -705,12 +726,31 @@ impl Coordinator {
             .baseline
             .as_mut()
             .context("Reconciliation baseline is missing")?;
-        let scopes = baseline_scopes(context, paths)?;
+        let paths = paths
+            .iter()
+            .cloned()
+            .chain(studio_overrides.keys().cloned())
+            .collect::<Vec<_>>();
+        let scopes = baseline_scopes(context, &paths)?;
         if scopes.is_empty() {
             return Ok(());
         }
         let root = Path::new(&context.root);
-        let current = capture_snapshot(root, &scopes)?;
+        let mut current = capture_snapshot(root, &scopes)?;
+        let selected = ScopeSet::new(&scopes);
+        for (path, entry) in studio_overrides
+            .iter()
+            .filter(|(path, _)| selected.contains(path))
+        {
+            match entry {
+                Some(entry) => {
+                    current.entries.insert(path.clone(), entry.clone());
+                }
+                None => {
+                    current.entries.remove(path);
+                }
+            }
+        }
         if matches!(side, BaselineSide::Editor) {
             let previous = baseline.load_scopes(root, key, &scopes)?;
             validate_editor_package_links(&previous, &current, &scopes)?;

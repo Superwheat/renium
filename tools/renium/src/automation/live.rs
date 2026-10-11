@@ -27,7 +27,7 @@ use crate::editor::sync::{StudioChangeGuard, StudioChangedBeforePush};
 use crate::project::config;
 use crate::project::package_links::{propagate_shared_links_from, shared_link_sources_touched};
 use crate::snapshot::export::{
-    PublishEntryState, PublishedProjectChanges, export_snapshots_with_warm_bridge,
+    ExportPurpose, PublishEntryState, PublishedProjectChanges, export_snapshots_with_warm_bridge,
 };
 use crate::studio::bridge::{BridgeRequestLease, BridgeServer, BridgeTarget};
 use crate::system::LockRecover;
@@ -84,6 +84,8 @@ struct Status {
     auto_desynced_packages: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     auto_desynced_at_push: Option<u64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    read_only_links_restored: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1444,10 +1446,13 @@ impl Manager {
     pub(crate) fn reconcile_then_resume(
         &self,
         context: &BoundContext,
-        published: PublishedProjectChanges,
+        mut published: PublishedProjectChanges,
     ) -> Result<Value> {
         let paths = published.changed_roots.clone();
+        let studio_overrides = std::mem::take(&mut published.studio_overrides);
         if let Some(control) = self.control(context.id) {
+            control.status.lock_recover().read_only_links_restored =
+                published.read_only_links_restored.clone();
             if let Err(error) = control.rebase_without_resume(Rebase::Published(published)) {
                 control.set_mode(PairMode::Verify);
                 control.fail(format!(
@@ -1458,7 +1463,7 @@ impl Manager {
             }
             let result = if let Some(key) = self.session_key(context.id) {
                 self.coordinator
-                    .advance_baseline(context, &key, &paths, BaselineSide::Studio)
+                    .advance_pulled_baseline(context, &key, &paths, &studio_overrides)
             } else {
                 Ok(())
             };
@@ -1943,6 +1948,7 @@ fn pull_studio_changes(
         &info,
         0.0,
         state["referencePathsMayChange"].as_bool().unwrap_or(false),
+        ExportPurpose::Pull,
     )?;
     Ok(Some(PulledStudioChanges {
         published,
@@ -2260,6 +2266,13 @@ fn reconcile_published_changes(
         )
         .collect::<BTreeSet<_>>();
     for path in candidates {
+        // Publication also contains generated sourcemaps, link locks and
+        // displaced-file backups, which are not editor inputs to this watcher.
+        if !relevant(project, &path) {
+            baseline.remove(&path);
+            pending.remove(&path);
+            continue;
+        }
         let relative = path.strip_prefix(&project.root).unwrap_or(&path);
         if let Some(expected) = published.expected.get(relative) {
             record_accepted_stamp(
@@ -3232,11 +3245,11 @@ impl LiveLoop {
     }
 
     fn acknowledge_pull(&self, pulled: &PulledStudioChanges) -> Result<()> {
-        if let Err(error) = self.coordinator.advance_baseline(
+        if let Err(error) = self.coordinator.advance_pulled_baseline(
             &self.context,
             &self.pair_key,
             &pulled.published.changed_roots,
-            BaselineSide::Studio,
+            &pulled.published.studio_overrides,
         ) {
             self.control.set_mode(PairMode::Verify);
             self.control.fail(format!(
@@ -3304,6 +3317,7 @@ impl LiveLoop {
         );
         let mut status = self.control.status.lock_recover();
         status.pulls = status.pulls.saturating_add(1);
+        status.read_only_links_restored = pulled.published.read_only_links_restored.clone();
         status.error = None;
         drop(status);
         self.control.update_pending(&self.pending);
@@ -3843,6 +3857,87 @@ mod tests {
         let started = Instant::now();
         assert!(!control.wait_settled(Duration::from_secs(1)));
         assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn restored_pull_rebases_own_files_but_keeps_a_later_editor_save_pending() {
+        use crate::snapshot::export::{ExportProjectStage, finish_export_publication};
+        use crate::tests::support::{settings_document, settings_instance};
+        let root = crate::tests::support::temp_dir("live-restored-pull");
+        let source = root.join("src/ReplicatedStorage/Pkg/Config.luau");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::create_dir_all(root.join("links")).unwrap();
+        fs::write(
+            root.join("renium.project.jsonc"),
+            r#"{"schemaVersion":1,"sourceRoot":"src"}"#,
+        )
+        .unwrap();
+        config::load_project(Some(&root.join("renium.project.jsonc")), None).unwrap();
+        let mut script = settings_instance("config", "Config", "ModuleScript", Some(0));
+        script
+            .properties
+            .insert("Source".into(), json!("return 'package'"));
+        settings_document(vec![
+            settings_instance("pkg", "Pkg", "Folder", None),
+            script.clone(),
+        ])
+        .write_file(&root.join("links/pkg.renium"))
+        .unwrap();
+        script.parent_index = Some(1);
+        script.properties.insert(
+            "Source".into(),
+            json!(crate::settings::EXTERNAL_SOURCE_MARKER),
+        );
+        settings_document(vec![
+            settings_instance("service", "ReplicatedStorage", "ReplicatedStorage", None),
+            settings_instance("pkg", "Pkg", "Folder", Some(0)),
+            script,
+        ])
+        .write_file(&root.join("instances/ReplicatedStorage.renium"))
+        .unwrap();
+        fs::write(&source, "return 'before'").unwrap();
+        fs::write(root.join("renium-link.json"), r#"{"version":1,"links":[{"id":"pkg","source":{"type":"local","path":"links/pkg.renium"},"targets":[{"service":"ReplicatedStorage","path":["Pkg"]}]}],"broken":[]}"#).unwrap();
+        let project = WatchProject {
+            watcher: FileWatcher::new(8).unwrap(),
+            root: root.clone(),
+            roots: BTreeSet::from([root.join("src"), root.join("instances")]),
+            files: BTreeSet::new(),
+            full_push: BTreeSet::new(),
+        };
+        let mut baseline = scan(&project).unwrap();
+        let mut stage =
+            ExportProjectStage::create(&root, Path::new("src"), &["ReplicatedStorage".into()])
+                .unwrap();
+        stage
+            .prepare_read_only_links(&root, Path::new("src"), &["ReplicatedStorage".into()])
+            .unwrap();
+        fs::write(
+            stage.project_root.join(source.strip_prefix(&root).unwrap()),
+            "return 'studio'",
+        )
+        .unwrap();
+        let (published, _) =
+            finish_export_publication(Some(stage), &root, false, || Ok(()), || Ok(())).unwrap();
+        let mut pending = BTreeSet::new();
+        reconcile_published_changes(
+            &project,
+            &mut baseline,
+            &scan(&project).unwrap(),
+            &mut pending,
+            &published,
+        );
+        assert!(pending.is_empty(), "{pending:?}");
+        crate::system::files::set_path_readonly(&source, false).unwrap();
+        fs::write(&source, "return 'later user edit'").unwrap();
+        reconcile_published_changes(
+            &project,
+            &mut baseline,
+            &scan(&project).unwrap(),
+            &mut pending,
+            &published,
+        );
+        assert!(pending.contains(&source));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

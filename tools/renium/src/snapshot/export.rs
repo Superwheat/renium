@@ -22,6 +22,7 @@ use crate::cli::PullArgs;
 use crate::daemon::daemon_control_request;
 use crate::project::config;
 use crate::project::layout::apply_configured_project_layout;
+use crate::project::package_links::{PullLinkRestore, StudioOverrides};
 use crate::project::sourcemap::generate_project_sourcemap;
 use crate::project::structural::{
     moved_references_between_documents, rewrite_moved_references, service_store_paths,
@@ -179,6 +180,9 @@ pub(crate) struct ExportProjectStage {
     pub(crate) loaded: Option<config::LoadedProject>,
     pub(crate) projection: Option<config::ProjectionStage>,
     settings_already_aligned: bool,
+    link_restore: Option<PullLinkRestore>,
+    restored_links: Vec<Value>,
+    studio_overrides: StudioOverrides,
     active: bool,
 }
 
@@ -355,6 +359,9 @@ impl ExportProjectStage {
             loaded: staged_loaded,
             projection,
             settings_already_aligned: false,
+            link_restore: None,
+            restored_links: Vec::new(),
+            studio_overrides: BTreeMap::new(),
             active: true,
         };
         log_global(
@@ -377,6 +384,68 @@ impl ExportProjectStage {
                 .loaded
                 .as_ref()
                 .is_none_or(|loaded| loaded.project.adapters.is_empty());
+    }
+
+    pub(crate) fn prepare_read_only_links(
+        &mut self,
+        project_root: &Path,
+        src_dir: &Path,
+        services: &[String],
+    ) -> Result<()> {
+        let restore = PullLinkRestore::prepare(
+            project_root,
+            src_dir,
+            &self.project_root,
+            &self.container,
+            services,
+        )?;
+        if let Some(restore) = &restore {
+            let paths = restore.publish_paths();
+            self.publish_baseline
+                .extend(collect_publish_hashes(project_root, &paths)?);
+            self.publish_paths.extend(paths);
+            normalize_owned_paths(&mut self.publish_paths);
+        }
+        self.link_restore = restore;
+        Ok(())
+    }
+
+    fn restore_read_only_links(&mut self) -> Result<()> {
+        let Some(restore) = self.link_restore.take() else {
+            return Ok(());
+        };
+        let services = restore.services.clone();
+        (self.restored_links, self.studio_overrides) = restore.apply(&self.project_root)?;
+        if !self.studio_overrides.is_empty() {
+            // Restore rewrites stores and sources after the importer constructed
+            // its map. Keep service nodes that this partial pull did not include.
+            let mut nodes =
+                crate::project::sourcemap::load_existing_sourcemap_root(&self.project_root)?
+                    .map(|root| {
+                        root.children
+                            .into_iter()
+                            .map(|node| (node.name.clone(), node))
+                            .collect::<HashMap<_, _>>()
+                    })
+                    .unwrap_or_default();
+            let root = crate::project::sourcemap::build_project_sourcemap_with_loaded(
+                &self.project_root,
+                self.loaded.as_ref(),
+            )?;
+            nodes.retain(|service, _| !services.contains(service));
+            nodes.extend(
+                root.children
+                    .into_iter()
+                    .filter(|node| services.contains(&node.name))
+                    .map(|node| (node.name.clone(), node)),
+            );
+            crate::project::sourcemap::finalize_project_sourcemap_temp(
+                &self.project_root,
+                &nodes,
+                false,
+            )?;
+        }
+        Ok(())
     }
 
     pub(crate) fn finish_projection(&self, generate_sourcemap: bool) -> Result<()> {
@@ -791,6 +860,8 @@ impl ExportProjectStage {
         Ok(PublishedProjectChanges {
             changed_roots,
             expected,
+            read_only_links_restored: std::mem::take(&mut self.restored_links),
+            studio_overrides: std::mem::take(&mut self.studio_overrides),
         })
     }
 }
@@ -909,6 +980,14 @@ fn collect_nested_project_paths(
 pub(crate) struct PublishedProjectChanges {
     pub(crate) changed_roots: Vec<PathBuf>,
     pub(crate) expected: BTreeMap<PathBuf, Option<PublishEntryState>>,
+    pub(crate) read_only_links_restored: Vec<Value>,
+    pub(crate) studio_overrides: StudioOverrides,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ExportPurpose {
+    Pull,
+    Readback,
 }
 
 #[derive(Clone, PartialEq)]
@@ -1291,6 +1370,7 @@ pub(crate) fn export_snapshots_with_warm_bridge(
     bridge_info: &BridgeInfoPayload,
     bridge_info_refresh_ms: f64,
     repair_reference_paths: bool,
+    purpose: ExportPurpose,
 ) -> Result<PublishedProjectChanges> {
     let prelude = export_snapshots_prelude(&args)?;
     println!(
@@ -1307,6 +1387,7 @@ pub(crate) fn export_snapshots_with_warm_bridge(
         bridge_info,
         bridge_info_refresh_ms,
         repair_reference_paths,
+        purpose,
     )
 }
 
@@ -1583,6 +1664,9 @@ pub(crate) fn finish_export_publication(
     let started = Instant::now();
     finalize_native()?;
     let mut sync_completion_ms = elapsed_ms(started);
+    if let Some(stage) = stage.as_mut() {
+        stage.restore_read_only_links()?;
+    }
     let published = if let Some(stage) = stage {
         let started = Instant::now();
         let published = stage.publish(project_root, repair_reference_paths)?;
@@ -1610,6 +1694,7 @@ fn export_snapshots_core(
     bridge_info: &BridgeInfoPayload,
     all_channels_connected_to_bridge_info_ms: f64,
     repair_reference_paths: bool,
+    purpose: ExportPurpose,
 ) -> Result<PublishedProjectChanges> {
     let ExportPrelude {
         total_started,
@@ -1627,11 +1712,14 @@ fn export_snapshots_core(
         bridge_info_to_property_schema_ready_ms,
     } = prepare_export_bridge(args, bridge, bridge_info, &project_root, total_started)?;
     let ExportExecutionSetup {
-        project_stage,
+        mut project_stage,
         sourcemap_writer,
         direct_import_dispatcher,
         export_services,
     } = prepare_export_execution(&args.src_dir, &project_root, &services, total_started)?;
+    if matches!(purpose, ExportPurpose::Pull) {
+        project_stage.prepare_read_only_links(&project_root, &args.src_dir, &services)?;
+    }
     let ServiceExportRun {
         spans: service_export_spans,
         cumulative_latency_ms: cumulative_service_latency_ms,

@@ -39,7 +39,6 @@ use crate::system::files::{
     resolve_link_project_root, validate_filesystem_instance_name,
 };
 
-use super::shared;
 use super::{
     GLOBAL_LINK_PREFIX, LinkEntry, LinkLockEntry, LinkManifest, LinkResolveOptions, LinkSource,
     LinkSourceMeta, LinkTargetRef, LinkTargetStorage, PackageMaterialization, RENIUM_DIR_GITIGNORE,
@@ -58,6 +57,7 @@ use super::{
     stage_settings_document_writes, stray_target_files, validate_link_target_ref,
     write_link_manifest,
 };
+use super::{pull, shared};
 
 pub(super) fn load_link_project(
     project: &mut ProjectSourceArgs,
@@ -388,6 +388,7 @@ fn externalize_target_scripts(
 
 struct PackageLinkApply<'a> {
     args: &'a LinkApplyArgs,
+    restoring: Option<&'a pull::PullRestorePolicy>,
     project_root: &'a Path,
     target: &'a ResolvedLinkTarget,
     target_forced: bool,
@@ -405,6 +406,7 @@ impl PackageLinkApply<'_> {
     fn apply(self) -> Result<()> {
         let Self {
             args,
+            restoring,
             project_root,
             target,
             target_forced,
@@ -437,15 +439,22 @@ impl PackageLinkApply<'_> {
         let package_doc = SettingsBytecode::read_file(package_path)?;
         let package_fingerprint = package_document_fingerprint(&package_doc)?;
         let package_hash = fs::read(package_path).map(|bytes| fnv1a_hex(&bytes)).ok();
-        let shared_replaced_dir = (args.shared_consumer
-            && shared::experience_package_path(project_root, &package_path.to_string_lossy())
-                .is_some())
-        .then(|| {
-            project_root
-                .join(".renium")
-                .join("link-replaced")
-                .join(&target.link_id)
-        });
+        let shared_replaced_dir = if let Some(policy) = restoring {
+            policy
+                .displaced_directory(target)
+                .map(|path| project_root.join(path))
+        } else {
+            (args.shared_consumer
+                && shared::experience_package_path(project_root, &package_path.to_string_lossy())
+                    .is_some())
+            .then(|| {
+                project_root
+                    .join(".renium")
+                    .join("link-replaced")
+                    .join(&target.link_id)
+            })
+        };
+        let replaced_before = changes.replaced_files.len();
         let target_exists = resolve_editor_instance_by_path_ordinals(
             document,
             document_service,
@@ -497,6 +506,14 @@ impl PackageLinkApply<'_> {
             }
         } else if !unchanged && (!preserved_target_edits || target_forced) {
             if !target_matches_package {
+                let mut protected_references;
+                let external_references = if let Some(policy) = restoring {
+                    protected_references = external_references.clone();
+                    protected_references.extend(policy.outside_references()?.iter().cloned());
+                    &protected_references
+                } else {
+                    external_references
+                };
                 let materialized = materialize_package_target(
                     document,
                     PackageMaterialization {
@@ -556,7 +573,7 @@ impl PackageLinkApply<'_> {
                 ));
             }
         }
-        if shared_replaced_dir.is_some()
+        if (shared_replaced_dir.is_some() || restoring.is_some())
             && !args.check
             && externalize_target_scripts(
                 document,
@@ -585,7 +602,7 @@ impl PackageLinkApply<'_> {
             .or_default()
             .settings_id
             .clone_from(&root_settings_id);
-        changes.link_results.push(json!({
+        let mut result = json!({
             "id": target.link_id,
             "service": target.service,
             "path": target.target_segments,
@@ -600,7 +617,20 @@ impl PackageLinkApply<'_> {
             "drift": drift_detail,
             "preservedEdits": preserved_target_edits,
             "conflict": package_conflict,
-        }));
+        });
+        if restoring.is_some() && !target_matches_package {
+            result["pullRestore"] = json!({
+                "link": target.link_id,
+                "path": std::iter::once(target.service.as_str())
+                    .chain(target.target_segments.iter().map(String::as_str))
+                    .collect::<Vec<_>>().join("."),
+                "ords": target.target_ordinals,
+                "restored": true,
+                "state": "updated",
+                "replaced": changes.replaced_files.len() - replaced_before,
+            });
+        }
+        changes.link_results.push(result);
         Ok(())
     }
 }
@@ -844,8 +874,20 @@ pub(super) fn apply_project_links(
     project_root: &Path,
     src_root: &Path,
     manifest_path: &Path,
-    mut manifest: LinkManifest,
+    manifest: LinkManifest,
 ) -> Result<(Value, usize)> {
+    apply_project_links_inner(args, project_root, src_root, manifest_path, manifest, None)
+        .map(|(result, warnings, _)| (result, warnings))
+}
+
+pub(super) fn apply_project_links_inner(
+    args: &LinkApplyArgs,
+    project_root: &Path,
+    src_root: &Path,
+    manifest_path: &Path,
+    mut manifest: LinkManifest,
+    restoring: Option<&pull::PullRestorePolicy>,
+) -> Result<(Value, usize, pull::StudioOverrides)> {
     let project_root = project_root.to_path_buf();
     let src_root = src_root.to_path_buf();
     let manifest_path = manifest_path.to_path_buf();
@@ -896,14 +938,15 @@ pub(super) fn apply_project_links(
         );
     }
     let mut lock = read_link_lock(&project_root)?;
-    let manifest_changed = reconcile_package_target_names(
-        &project_root,
-        &src_root,
-        &mut targets,
-        &documents,
-        &mut manifest,
-        &mut lock,
-    )?;
+    let manifest_changed = restoring.is_none()
+        && reconcile_package_target_names(
+            &project_root,
+            &src_root,
+            &mut targets,
+            &documents,
+            &mut manifest,
+            &mut lock,
+        )?;
     let mut changes = LinkApplyChanges {
         manifest_changed,
         ..Default::default()
@@ -981,7 +1024,9 @@ pub(super) fn apply_project_links(
             None
         };
         let lock_entry = lock.entries.entry(target.link_id.clone()).or_default();
-        lock_entry.resolved_ref.clone_from(&target.resolved_ref);
+        if restoring.is_none() {
+            lock_entry.resolved_ref.clone_from(&target.resolved_ref);
+        }
 
         if target.package_source.is_some() {
             let settings_file = document_key
@@ -995,6 +1040,7 @@ pub(super) fn apply_project_links(
                 .context("Package link target settings were not loaded")?;
             PackageLinkApply {
                 args,
+                restoring,
                 project_root: &project_root,
                 target,
                 target_forced,
@@ -1027,6 +1073,7 @@ pub(super) fn apply_project_links(
         .apply()?;
     }
 
+    let mut studio_overrides = BTreeMap::new();
     if !args.check {
         stage_settings_document_writes(
             &documents,
@@ -1063,6 +1110,13 @@ pub(super) fn apply_project_links(
         changes
             .transaction_removals
             .dedup_by(|left, right| exact_path_key(left) == exact_path_key(right));
+        if restoring.is_some() {
+            studio_overrides = pull::capture_restore_baseline(
+                &project_root,
+                &changes.transaction_writes,
+                &changes.transaction_removals,
+            )?;
+        }
         apply_file_mutations_with_permissions(
             &changes.transaction_writes,
             &changes.transaction_removals,
@@ -1077,6 +1131,9 @@ pub(super) fn apply_project_links(
         });
         for (root, directory) in changes.transaction_prune_dirs.drain(..) {
             let _ = prune_empty_source_dirs(&root, &directory);
+        }
+        if restoring.is_some() {
+            studio_overrides = pull::changed_restore_baseline(&project_root, studio_overrides)?;
         }
         drop(settings_guards);
     }
@@ -1099,7 +1156,7 @@ pub(super) fn apply_project_links(
         &mut result,
         &["warnings", "links", "changedSettingsIds", "replacedFiles"],
     );
-    Ok((result, warning_count))
+    Ok((result, warning_count, studio_overrides))
 }
 
 pub(crate) fn link_break(mut args: LinkBreakArgs) -> Result<()> {

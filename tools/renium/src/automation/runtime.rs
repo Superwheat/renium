@@ -34,7 +34,9 @@ use crate::editor::sync::{
     push_editor_changes_with_warm_bridge,
 };
 use crate::project::workflows;
-use crate::snapshot::export::{PublishedProjectChanges, export_snapshots_with_warm_bridge};
+use crate::snapshot::export::{
+    ExportPurpose, PublishedProjectChanges, export_snapshots_with_warm_bridge,
+};
 use crate::snapshot::import::parse_services;
 use crate::studio::automation::{
     click_result, compact_live_status, editor_review_decision_result, execute_luau_result,
@@ -606,23 +608,20 @@ fn automation_pull_operation(
     let parsed_services = parse_services(&services)?;
     let pending_ack = pending_change_ack(bridge, &parsed_services)?;
     let acknowledged_pending = pending_ack.is_some();
-    let project_root = args.project_root.clone();
-    let src_root = crate::system::files::absolutize_under(&project_root, &args.src_dir);
-    let published = export_snapshots_with_warm_bridge(args, bridge, &info, 0.0, false)?;
+    let published =
+        export_snapshots_with_warm_bridge(args, bridge, &info, 0.0, false, ExportPurpose::Pull)?;
     if let Some((seq, runtime_id)) = pending_ack {
         acknowledge_pulled_changes(bridge, &parsed_services, seq, &runtime_id)?;
     }
-    let restored =
-        crate::project::package_links::restore_drifted_read_only_links(&project_root, &src_root)?;
     let mut result = json!({
         "ok": true,
         "services": parsed_services.len(),
         "pendingChangesAcknowledged": acknowledged_pending,
     });
-    if !restored.is_empty() {
-        result["readOnlyLinksRestored"] = Value::Array(restored);
+    if !published.read_only_links_restored.is_empty() {
+        result["readOnlyLinksRestored"] = json!(published.read_only_links_restored);
         result["note"] = json!(
-            "Studio's copy of these read-only link mirrors differed from their packages; the files keep the package. Apply the link in Studio with a push of the link path, or edit the source place"
+            "These read-only mirrors differ from their saved packages; the files keep the package. This does not establish which copy is newer. Push the link path to apply it in Studio, or edit the source and run lk to update the package and its copies"
         );
     }
     crate::app::output::drop_false(&mut result, &["pendingChangesAcknowledged"]);

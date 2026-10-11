@@ -596,7 +596,14 @@ pub(crate) fn import_studio_services_into_stage(
     args.project_root.clone_from(&stage.import_project_root);
     args.src_dir.clone_from(&stage.import_src_dir);
     let info = bridge.cached_bridge_info_for_target(BridgeTarget::Main)?;
-    export_snapshots_with_warm_bridge(args, bridge, &info, 0.0, false)?;
+    export_snapshots_with_warm_bridge(
+        args,
+        bridge,
+        &info,
+        0.0,
+        false,
+        crate::snapshot::export::ExportPurpose::Readback,
+    )?;
     let regenerate_sourcemap = generate_sourcemap && stage.capture_sourcemap_needs_regeneration();
     stage.finish_projection(regenerate_sourcemap)?;
     Ok(stage)
