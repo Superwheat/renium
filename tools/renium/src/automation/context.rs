@@ -240,7 +240,7 @@ fn studio_candidates(
                 if let Some(title) = titles.get(&pid) {
                     return Ok(Some(String::clone(title)));
                 }
-                let title = crate::studio::input::studio_window_title(pid)
+                let title = studio_window_title_with_retries(pid)
                     .with_context(|| format!("Could not read Studio {pid}'s window name"));
                 // The process can exit during the accessibility query too.
                 if title.is_err() && !crate::daemon::is_process_alive(pid) {
@@ -255,6 +255,27 @@ fn studio_candidates(
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     Ok(studio_candidates_from(&clients, selector))
+}
+
+/// A Studio busy with a heavy batch can refuse an accessibility query for a
+/// moment; one such refusal must not fail the selection of another place, so
+/// the read is retried briefly before it counts as unavailable.
+#[cfg(any(windows, target_os = "macos"))]
+fn studio_window_title_with_retries(pid: u32) -> Result<String> {
+    let mut last = None;
+    for attempt in 0..4u32 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(150 * u64::from(attempt)));
+        }
+        match crate::studio::input::studio_window_title(pid) {
+            Ok(title) => return Ok(title),
+            Err(error) => last = Some(error),
+        }
+        if !crate::daemon::is_process_alive(pid) {
+            break;
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("Studio exposed no window name")))
 }
 
 #[cfg(any(windows, target_os = "macos", test))]

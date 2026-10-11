@@ -16,6 +16,7 @@
 
 ### Bug fixes
 
+- `--place NAME` no longer fails for every Studio when one other Studio momentarily refuses its window-name query (a Studio busy with a heavy batch); the read is retried briefly before it counts as unavailable.
 - `rbx push --verify` only compares script sources, including with no paths or a whole service selected. It does not prepare a review, replace Studio content or acknowledge pending Live Sync changes. `--verify-sources` remains push-then-check, and publish dry runs also bypass review.
 - Package checks, status and read-only push guards agree on external script edits, references and model placement. Checking many links in one large service avoids repeatedly copying the whole store; shared-link status also reports stray files.
 - Push verification accepts omitted properties at their defaults and ignores Studio's insert point, computed layout/media readbacks and reserved engine attributes. Authored attribute changes and deletions still require exact retention.
