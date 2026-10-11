@@ -46,8 +46,8 @@ use crate::editor::review::{
 use crate::editor::types::{
     EditorBinaryImport, EditorChangeSet, EditorHistoryEntry, EditorInstanceChange,
     EditorInstanceDescriptor, EditorPreserveDescriptor, EditorPropertyChange, EditorPropertyFilter,
-    EditorSettingsWrite, EditorSourceChange, EditorSourceTarget, PreparedEditorDocuments,
-    take_pre_routed_protected_writes,
+    EditorSettingsWrite, EditorSourceChange, EditorSourcePathSpec, EditorSourceTarget,
+    PreparedEditorDocuments, take_pre_routed_protected_writes,
 };
 use crate::project::config;
 use crate::project::layout::apply_configured_project_layout;
@@ -3780,6 +3780,64 @@ fn push_scope(service: &str, segments: &[String], ordinals: &[usize]) -> PushSco
     (relative.to_vec(), relative_ordinals.to_vec())
 }
 
+/// Whether a script lies in a pushed subtree: its own instance or one of
+/// its ancestors carries a target id. A script without a store entry is
+/// outside every target.
+fn source_target_within_filter(
+    document: Option<&SettingsBytecode>,
+    target: &EditorSourceTarget,
+    settings_ids: &HashSet<String>,
+) -> bool {
+    let (Some(document), Some(settings_id)) = (document, target.settings_id.as_deref()) else {
+        return false;
+    };
+    let mut index = document_instance_index_by_settings_id(document, settings_id);
+    while let Some(current) = index {
+        let Some(instance) = document.instances.get(current) else {
+            return false;
+        };
+        if settings_ids.contains(&instance.settings_id) {
+            return true;
+        }
+        index = instance.parent_index;
+    }
+    false
+}
+
+/// The instance a script file's source is pushed to: its store entry, or a
+/// target inferred from the path for a new file; none for a vanished file
+/// without an entry or for a script outside a push's target subtrees.
+fn pushed_source_target(
+    mapped_target: Option<EditorSourceTarget>,
+    exists_as_file: bool,
+    inferred_spec: Option<EditorSourcePathSpec>,
+    documents: &HashMap<String, Option<Arc<SettingsBytecode>>>,
+    service: &str,
+    property_filter: &EditorPropertyFilter,
+) -> Option<EditorSourceTarget> {
+    let target = match (mapped_target, exists_as_file, inferred_spec) {
+        (Some(target), _, _) => target,
+        (None, true, Some(spec)) => EditorSourceTarget {
+            service: spec.service,
+            settings_id: None,
+            path_segments: spec.path_segments,
+            path_ordinals: Vec::new(),
+            class_name: spec.class_name,
+        },
+        _ => return None,
+    };
+    let outside = !property_filter.settings_ids.is_empty()
+        && !source_target_within_filter(
+            documents
+                .get(service)
+                .and_then(Option::as_ref)
+                .map(Arc::as_ref),
+            &target,
+            &property_filter.settings_ids,
+        );
+    (!outside).then_some(target)
+}
+
 /// The subtrees a push filtered by settings ids touches. Every loaded
 /// service gets an entry, so a service holding none of the targets carries
 /// an empty scope and its read-only packages are left alone.
@@ -4579,20 +4637,14 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
             continue;
         }
 
-        let target = if let Some(target) = mapped_target {
-            target
-        } else if exists_as_file {
-            let Some(spec) = inferred_spec else {
-                continue;
-            };
-            EditorSourceTarget {
-                service: spec.service,
-                settings_id: None,
-                path_segments: spec.path_segments,
-                path_ordinals: Vec::new(),
-                class_name: spec.class_name,
-            }
-        } else {
+        let Some(target) = pushed_source_target(
+            mapped_target,
+            exists_as_file,
+            inferred_spec,
+            &documents,
+            &service,
+            &property_filter,
+        ) else {
             continue;
         };
 
@@ -4712,6 +4764,50 @@ fn log_change_set_composition(
 
 #[cfg(test)]
 mod sync_tests {
+    #[test]
+    fn a_push_by_target_id_skips_scripts_outside_the_targets() {
+        let document = crate::tests::support::settings_document(vec![
+            crate::tests::support::settings_instance("ws", "Workspace", "Workspace", None),
+            crate::tests::support::settings_instance(
+                "racing:racetracks",
+                "RaceTracks",
+                "Folder",
+                Some(0),
+            ),
+            crate::tests::support::settings_instance("t1", "Track1", "Script", Some(1)),
+            crate::tests::support::settings_instance("car", "Mercenne 63S", "Model", Some(0)),
+            crate::tests::support::settings_instance("seat", "Invisibility", "Script", Some(3)),
+        ]);
+        let ids = HashSet::from(["racing:racetracks".to_string()]);
+        let target = |settings_id: Option<&str>| EditorSourceTarget {
+            service: "Workspace".into(),
+            settings_id: settings_id.map(str::to_string),
+            path_segments: Vec::new(),
+            path_ordinals: Vec::new(),
+            class_name: "Script".into(),
+        };
+        assert!(super::source_target_within_filter(
+            Some(&document),
+            &target(Some("t1")),
+            &ids
+        ));
+        assert!(super::source_target_within_filter(
+            Some(&document),
+            &target(Some("racing:racetracks")),
+            &ids
+        ));
+        assert!(!super::source_target_within_filter(
+            Some(&document),
+            &target(Some("seat")),
+            &ids
+        ));
+        assert!(!super::source_target_within_filter(
+            Some(&document),
+            &target(None),
+            &ids
+        ));
+    }
+
     #[test]
     fn a_targeted_push_checks_only_the_read_only_packages_it_can_reach() {
         let seg = |text: &str| text.split('.').map(str::to_string).collect::<Vec<_>>();

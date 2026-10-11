@@ -16,6 +16,7 @@
 
 ### Bug fixes
 
+- A push by target id (`ps -i ID`) skips script files outside the targets. It used to send every script file in the project, so a script whose instance had been deleted in Studio came back with stub parents even though the push was limited to another subtree.
 - `rbx ba` for a script class adopts a script file that already exists at the new instance's path (the result names it under `adoptedSource`) instead of truncating it to the empty source, and refuses a `Source` property that differs from that file; a missing file is created as before.
 - A push limited to one subtree (`ps -i ID`, `ps PATH`) no longer refuses with "Cannot edit read-only link" because a shared link elsewhere in the same service has drifted in the files; the read-only check now covers only links the push can reach (inside or above a pushed subtree), for pushes by path and by target id alike, so a link in another service never blocks a push. Full-service pushes check every link as before.
 - `rbx play -s --players 1` is refused with a pointer to ordinary Play (pass `--mode play` as well when a separate server with one client is really wanted); multi-client starts and restarts say in their result that a local server plus N client windows are running and how to end them. The playtest guide opens its Sessions section with the one-client rule.
