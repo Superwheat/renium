@@ -16,8 +16,8 @@ use crate::bytecode::edit::{
 };
 use crate::editor::document::editor_child_by_stem;
 use crate::editor::paths::{
-    build_editor_instance_path_parts, build_editor_instance_paths,
-    build_editor_source_paths_by_index, infer_source_script,
+    EditorPathOrdinals, EditorPathSegments, build_editor_instance_path_parts,
+    build_editor_instance_paths, build_editor_source_paths_by_index, infer_source_script,
 };
 use crate::editor::sync::is_lua_source_class;
 use crate::project::config;
@@ -2774,18 +2774,14 @@ fn package_target_matches(
     {
         return Ok(true);
     }
-    let Some((normalized_target, normalized_package)) =
-        placement_normalized_pair(document, service, target_segments, target_ordinals, package)?
-    else {
-        return Ok(false);
+    let normalized =
+        placement_normalized_pair(document, service, target_segments, target_ordinals, package)?;
+    let (document, package) = match &normalized {
+        Some((target, package)) => (target, package),
+        None => (document, package),
     };
-    let target_text = target_fingerprint_text(
-        &normalized_target,
-        service,
-        target_segments,
-        target_ordinals,
-    )?;
-    let package_text = package_fingerprint_text(&normalized_package)?;
+    let target_text = target_fingerprint_text(document, service, target_segments, target_ordinals)?;
+    let package_text = package_fingerprint_text(package)?;
     Ok(fingerprint_texts_match(
         target_text.as_deref(),
         &package_text,
@@ -2953,14 +2949,22 @@ fn placement_normalized_pair(
     Ok(Some((normalized_target, normalized_package)))
 }
 
+/// Instances inside the fingerprinted subtree, named by their path below the
+/// subtree root with sibling ordinals, so a reference keeps the same text when
+/// Studio hands children back in another order.
 struct PackageFingerprintRefs {
     lookup: BytecodeCloneRefMap,
+    path_by_index: HashMap<usize, String>,
     ordinal_by_index: HashMap<usize, usize>,
+    /// The fingerprint shape before `FINGERPRINT_VERSION`, kept so a lock
+    /// written by an earlier build can still say whether its target changed.
+    legacy: bool,
 }
 
 fn package_fingerprint_refs(
     document: &SettingsBytecode,
     subtree: &[usize],
+    legacy: bool,
 ) -> PackageFingerprintRefs {
     let all_indices = (0..document.instances.len()).collect::<Vec<_>>();
     let identity = all_indices
@@ -2979,13 +2983,46 @@ fn package_fingerprint_refs(
                 path_ordinals_before: &path_ordinals,
             },
         ),
+        path_by_index: relative_fingerprint_paths(subtree, &path_segments, &path_ordinals),
         ordinal_by_index: subtree
             .iter()
             .copied()
             .enumerate()
             .map(|(ordinal, index)| (index, ordinal))
             .collect(),
+        legacy,
     }
+}
+
+fn relative_fingerprint_paths(
+    subtree: &[usize],
+    path_segments: &EditorPathSegments,
+    path_ordinals: &EditorPathOrdinals,
+) -> HashMap<usize, String> {
+    let root_depth = subtree
+        .first()
+        .and_then(|root| path_segments.get(*root))
+        .and_then(Option::as_ref)
+        .map_or(0, Vec::len);
+    subtree
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(ordinal, index)| {
+            let segments = path_segments.get(index).and_then(Option::as_ref);
+            let ordinals = path_ordinals.get(index).and_then(Option::as_ref);
+            let path = match (segments, ordinals) {
+                (Some(segments), Some(ordinals))
+                    if segments.len() >= root_depth && ordinals.len() == segments.len() =>
+                {
+                    serde_json::to_string(&(&segments[root_depth..], &ordinals[root_depth..]))
+                        .unwrap_or_else(|_| format!("#{ordinal}"))
+                }
+                _ => format!("#{ordinal}"),
+            };
+            (index, path)
+        })
+        .collect()
 }
 
 fn push_package_fingerprint_json(
@@ -3017,11 +3054,8 @@ fn push_package_fingerprint_map(
 ) -> Result<()> {
     if map.get("_type").and_then(Value::as_str) == Some("Ref")
         && let Some(index) = ref_old_index(map, &refs.lookup)
-        && let Some(ordinal) = refs.ordinal_by_index.get(&index)
+        && refs.push_reference(index, out)?
     {
-        out.push_str("{\"_type\":\"Ref\",\"packageOrdinal\":");
-        out.push_str(&ordinal.to_string());
-        out.push('}');
         return Ok(());
     }
     out.push('{');
@@ -3037,14 +3071,11 @@ fn push_package_fingerprint_map(
         if key == "Ref"
             && let Value::Object(reference) = child
             && let Some(index) = ref_old_index(reference, &refs.lookup)
-            && let Some(ordinal) = refs.ordinal_by_index.get(&index)
+            && refs.push_reference(index, out)?
         {
-            out.push_str("{\"_type\":\"Ref\",\"packageOrdinal\":");
-            out.push_str(&ordinal.to_string());
-            out.push('}');
-        } else {
-            push_package_fingerprint_json(child, refs, out)?;
+            continue;
         }
+        push_package_fingerprint_json(child, refs, out)?;
     }
     out.push('}');
     Ok(())
@@ -3075,9 +3106,18 @@ fn push_instance_subtree_fingerprint(
         out.push_str(";class=");
         out.push_str(&serde_json::to_string(&instance.class_name)?);
         out.push_str(";properties=");
-        push_package_fingerprint_map(&fingerprint_relevant(&instance.properties), refs, out)?;
+        let properties = if refs.legacy {
+            legacy_fingerprint_relevant(&instance.properties)
+        } else {
+            fingerprint_relevant(&instance.class_name, &instance.properties)
+        };
+        push_package_fingerprint_map(&properties, refs, out)?;
         out.push_str(";attributes=");
-        push_package_fingerprint_map(&instance.attributes, refs, out)?;
+        if refs.legacy {
+            push_package_fingerprint_map(&instance.attributes, refs, out)?;
+        } else {
+            push_package_fingerprint_map(&fingerprint_attributes(&instance.attributes), refs, out)?;
+        }
         out.push('\n');
 
         if let Some(children) = children_by_parent.get(index) {
@@ -3091,8 +3131,59 @@ fn push_instance_subtree_fingerprint(
 
 /// An empty BinaryString is what the engine writes for an unset blob
 /// (SerializedOverrides on a Model); stores drop it on one side and keep it
-/// on the other, so it never counts as a difference.
-fn fingerprint_relevant(properties: &Map<String, Value>) -> Map<String, Value> {
+/// on the other, so it never counts as a difference. Engine identities
+/// (UniqueId, HistoryId, ScriptGuid), fields Studio recomputes after a load
+/// (migration flags, cached mesh bounds, collision hulls, aero data) and values
+/// at the class default belong to each copy; Studio hands script sources back
+/// with LF line endings and tags in collection order whatever the package used.
+fn fingerprint_ignored(class_name: &str, key: &str, value: &Value) -> bool {
+    if crate::settings::equivalence::reconciliation_property_is_metadata(key, value)
+        || crate::settings::equivalence::reconciliation_property_is_derived(key)
+        || matches!(
+            key,
+            "ScriptGuid" | crate::rbx::encode::COLLISION_HULL_PROPERTY | "AeroMeshData"
+        )
+    {
+        return true;
+    }
+    if value.get("_type") == Some(&Value::String("BinaryString".to_string()))
+        && value.get("base64").and_then(Value::as_str) == Some("")
+    {
+        return true;
+    }
+    if value
+        .as_object()
+        .is_some_and(|object| object.len() == 1 && object.get("_type") == Some(&json!("Ref")))
+    {
+        return true;
+    }
+    cached_reflection_default(class_name, key).is_some_and(|default| {
+        crate::settings::equivalence::reconciliation_values_equal(value, &default, false)
+            || json_values_close(value, &default)
+    })
+}
+
+impl PackageFingerprintRefs {
+    fn push_reference(&self, index: usize, out: &mut String) -> Result<bool> {
+        if self.legacy {
+            let Some(ordinal) = self.ordinal_by_index.get(&index) else {
+                return Ok(false);
+            };
+            out.push_str("{\"_type\":\"Ref\",\"packageOrdinal\":");
+            out.push_str(&ordinal.to_string());
+        } else {
+            let Some(path) = self.path_by_index.get(&index) else {
+                return Ok(false);
+            };
+            out.push_str("{\"_type\":\"Ref\",\"packagePath\":");
+            out.push_str(&serde_json::to_string(path)?);
+        }
+        out.push('}');
+        Ok(true)
+    }
+}
+
+fn legacy_fingerprint_relevant(properties: &Map<String, Value>) -> Map<String, Value> {
     properties
         .iter()
         .filter(|(_, value)| {
@@ -3103,8 +3194,78 @@ fn fingerprint_relevant(properties: &Map<String, Value>) -> Map<String, Value> {
         .collect()
 }
 
+fn cached_reflection_default(class_name: &str, key: &str) -> Option<Value> {
+    thread_local! {
+        static DEFAULTS: std::cell::RefCell<HashMap<(String, String), Option<Value>>> =
+            std::cell::RefCell::new(HashMap::new());
+    }
+    DEFAULTS.with(|defaults| {
+        defaults
+            .borrow_mut()
+            .entry((class_name.to_string(), key.to_string()))
+            .or_insert_with(|| {
+                let database = rbx_reflection_database::get().ok()?;
+                crate::settings::equivalence::reflection_default_settings_value(
+                    database, class_name, key,
+                )
+            })
+            .clone()
+    })
+}
+
+fn fingerprint_value(key: &str, value: &Value) -> Value {
+    match value {
+        Value::String(source) if key == "Source" && source.contains('\r') => {
+            Value::String(source.replace("\r\n", "\n"))
+        }
+        Value::Array(tags) if key == "Tags" && tags.iter().all(Value::is_string) => {
+            let mut tags = tags.clone();
+            tags.sort_unstable_by(|left, right| left.as_str().cmp(&right.as_str()));
+            tags.dedup();
+            Value::Array(tags)
+        }
+        Value::Object(object)
+            if matches!(
+                object.get("_type").and_then(Value::as_str),
+                Some("Int32" | "Int64" | "Float32" | "Float64")
+            ) && object.len() == 2
+                && object.get("value").is_some_and(Value::is_number) =>
+        {
+            object["value"].clone()
+        }
+        _ => value.clone(),
+    }
+}
+
+fn fingerprint_relevant(class_name: &str, properties: &Map<String, Value>) -> Map<String, Value> {
+    properties
+        .iter()
+        .map(|(key, value)| (key.clone(), fingerprint_value(key, value)))
+        .filter(|(key, value)| !fingerprint_ignored(class_name, key, value))
+        .collect()
+}
+
+fn fingerprint_attributes(attributes: &Map<String, Value>) -> Map<String, Value> {
+    attributes
+        .iter()
+        .filter(|(key, _)| !crate::settings::equivalence::is_engine_managed_attribute(key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+/// Fingerprints carry a format version so a lock written by an older build
+/// is not read as an edited target after an upgrade.
+const FINGERPRINT_VERSION: &str = "2:";
+
+pub(super) fn fingerprint_is_current(fingerprint: &str) -> bool {
+    fingerprint.starts_with(FINGERPRINT_VERSION)
+}
+
 fn package_document_fingerprint(package: &SettingsBytecode) -> Result<String> {
-    Ok(fnv1a_hex(package_fingerprint_text(package)?.as_bytes()))
+    Ok(format!(
+        "{FINGERPRINT_VERSION}{}",
+        fnv1a_hex(package_fingerprint_text(package)?.as_bytes())
+    ))
 }
 
 fn package_fingerprint_text(package: &SettingsBytecode) -> Result<String> {
@@ -3120,7 +3281,7 @@ fn package_fingerprint_text(package: &SettingsBytecode) -> Result<String> {
     for root_index in &roots {
         collect_settings_subtree_preorder(&children_by_parent, *root_index, &mut subtree);
     }
-    let refs = package_fingerprint_refs(package, &subtree);
+    let refs = package_fingerprint_refs(package, &subtree, false);
     for (ordinal, root_index) in roots.into_iter().enumerate() {
         push_instance_subtree_fingerprint(
             package,
@@ -3279,6 +3440,30 @@ fn target_fingerprint_text(
     target_segments: &[String],
     target_ordinals: &[usize],
 ) -> Result<Option<String>> {
+    target_fingerprint_text_with(document, service, target_segments, target_ordinals, false)
+}
+
+/// The fingerprint an earlier build stored in the link lock, without the
+/// version prefix, so an upgraded `lk` can still tell an edited target apart.
+pub(super) fn legacy_package_target_fingerprint(
+    document: &SettingsBytecode,
+    service: &str,
+    target_segments: &[String],
+    target_ordinals: &[usize],
+) -> Result<Option<String>> {
+    Ok(
+        target_fingerprint_text_with(document, service, target_segments, target_ordinals, true)?
+            .map(|text| fnv1a_hex(text.as_bytes())),
+    )
+}
+
+fn target_fingerprint_text_with(
+    document: &SettingsBytecode,
+    service: &str,
+    target_segments: &[String],
+    target_ordinals: &[usize],
+    legacy: bool,
+) -> Result<Option<String>> {
     let Some(root_index) = resolve_editor_instance_by_path_ordinals(
         document,
         service,
@@ -3290,7 +3475,7 @@ fn target_fingerprint_text(
     let children_by_parent = settings_children_by_parent(document);
     let mut subtree = Vec::new();
     collect_settings_subtree_preorder(&children_by_parent, root_index, &mut subtree);
-    let refs = package_fingerprint_refs(document, &subtree);
+    let refs = package_fingerprint_refs(document, &subtree, legacy);
     let mut out = String::new();
     push_instance_subtree_fingerprint(
         document,
@@ -3311,7 +3496,7 @@ fn package_target_fingerprint(
 ) -> Result<Option<String>> {
     Ok(
         target_fingerprint_text(document, service, target_segments, target_ordinals)?
-            .map(|text| fnv1a_hex(text.as_bytes())),
+            .map(|text| format!("{FINGERPRINT_VERSION}{}", fnv1a_hex(text.as_bytes()))),
     )
 }
 

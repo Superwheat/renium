@@ -1697,6 +1697,306 @@ impl SharedFixture {
     }
 }
 
+fn fingerprint_target(
+    document: &SettingsBytecode,
+    package: &SettingsBytecode,
+) -> (bool, Option<String>) {
+    let fingerprint = package_document_fingerprint(package).unwrap();
+    let segments = ["Pkg".to_string()];
+    let matches = package_target_matches(
+        document,
+        "ReplicatedStorage",
+        &segments,
+        &[1],
+        package,
+        &fingerprint,
+    )
+    .unwrap();
+    let difference =
+        package_target_difference(document, "ReplicatedStorage", &segments, &[1], package).unwrap();
+    (matches, difference)
+}
+
+#[test]
+fn engine_identities_and_line_endings_do_not_count_as_package_drift() {
+    let mut document = settings_document(vec![
+        settings_instance("editor:0", "ReplicatedStorage", "ReplicatedStorage", None),
+        settings_instance("editor:1", "Pkg", "Folder", Some(0)),
+        settings_instance("editor:2", "Run", "ModuleScript", Some(1)),
+    ]);
+    for (index, id) in [
+        (1, "6ce3c0b112376f0c0adcc0aa0000abf3"),
+        (2, "6ce3c0b112376f0c0adcc0aa0000abea"),
+    ] {
+        let properties = &mut document.instances[index].properties;
+        properties.insert("UniqueId".into(), json!({"_type":"UniqueId","value":id}));
+        properties.insert("HistoryId".into(), json!({"_type":"UniqueId","value":id}));
+    }
+    let script = &mut document.instances[2].properties;
+    script.insert(
+        "ScriptGuid".into(),
+        json!("{c2a1b727-ba4b-4adc-9053-3a217c47cd6e}"),
+    );
+    script.insert("Source".into(), json!("return 1\r\n\t+ 2\r\n"));
+    let mut package = settings_document(vec![
+        settings_instance("pkg:0", "Pkg", "Folder", None),
+        settings_instance("pkg:1", "Run", "ModuleScript", Some(0)),
+    ]);
+    package.instances[1]
+        .properties
+        .insert("Source".into(), json!("return 1\n\t+ 2\n"));
+    assert_eq!(fingerprint_target(&document, &package), (true, None));
+
+    document.instances[2]
+        .properties
+        .insert("Source".into(), json!("return 3\n"));
+    let (matches, difference) = fingerprint_target(&document, &package);
+    assert!(!matches);
+    assert!(
+        difference
+            .as_deref()
+            .is_some_and(|text| text.contains("property Source")),
+        "{difference:?}"
+    );
+}
+
+#[test]
+fn engine_recomputed_hull_data_does_not_count_as_package_drift() {
+    let mut document = settings_document(vec![
+        settings_instance("editor:0", "ReplicatedStorage", "ReplicatedStorage", None),
+        settings_instance("editor:1", "Pkg", "Folder", Some(0)),
+        settings_instance("editor:2", "Shell", "MeshPart", Some(1)),
+    ]);
+    document.instances[2].properties.insert(
+        "PhysicalConfigData".into(),
+        json!({"_type":"SharedString","base64":"Q1NHUEhTAAAAAEJMT0NL"}),
+    );
+    let mut package = settings_document(vec![
+        settings_instance("pkg:0", "Pkg", "Folder", None),
+        settings_instance("pkg:1", "Shell", "MeshPart", Some(0)),
+    ]);
+    package.instances[1].properties.insert(
+        "PhysicalConfigData".into(),
+        json!({"_type":"SharedString","base64":"Q1NHUEhTCAAAAAEAKLUv"}),
+    );
+    assert_eq!(fingerprint_target(&document, &package), (true, None));
+
+    package.instances[1].properties.insert(
+        "Size".into(),
+        json!({"_type":"Vector3","x":2.0,"y":1.0,"z":1.0}),
+    );
+    assert!(!fingerprint_target(&document, &package).0);
+}
+
+#[test]
+fn references_fingerprint_by_path_so_child_order_does_not_count_as_drift() {
+    let mut document = settings_document(vec![
+        settings_instance("editor:0", "ReplicatedStorage", "ReplicatedStorage", None),
+        settings_instance("editor:1", "Pkg", "Folder", Some(0)),
+        settings_instance("editor:2", "Front", "Attachment", Some(1)),
+        settings_instance("editor:3", "Rear", "Attachment", Some(1)),
+        settings_instance("editor:4", "Spring", "SpringConstraint", Some(1)),
+    ]);
+    document.instances[4].properties.insert(
+        "Attachment0".into(),
+        json!({"_type":"Ref","settingsId":"editor:3"}),
+    );
+    let mut package = settings_document(vec![
+        settings_instance("pkg:0", "Pkg", "Folder", None),
+        settings_instance("pkg:1", "Rear", "Attachment", Some(0)),
+        settings_instance("pkg:2", "Front", "Attachment", Some(0)),
+        settings_instance("pkg:3", "Spring", "SpringConstraint", Some(0)),
+    ]);
+    package.instances[3].properties.insert(
+        "Attachment0".into(),
+        json!({"_type":"Ref","settingsId":"pkg:1"}),
+    );
+    assert_eq!(fingerprint_target(&document, &package), (true, None));
+
+    document.instances[4].properties.insert(
+        "Attachment0".into(),
+        json!({"_type":"Ref","settingsId":"editor:2"}),
+    );
+    let (matches, difference) = fingerprint_target(&document, &package);
+    assert!(!matches);
+    assert!(
+        difference
+            .as_deref()
+            .is_some_and(|text| text.contains("Attachment0")),
+        "{difference:?}"
+    );
+}
+
+#[test]
+fn defaults_tags_order_typed_scalars_and_engine_attributes_do_not_count_as_drift() {
+    let mut document = settings_document(vec![
+        settings_instance("editor:0", "ReplicatedStorage", "ReplicatedStorage", None),
+        settings_instance("editor:1", "Pkg", "Folder", Some(0)),
+        settings_instance("editor:2", "Skin", "SurfaceAppearance", Some(1)),
+        settings_instance("editor:3", "Body", "MeshPart", Some(1)),
+    ]);
+    let skin = &mut document.instances[2].properties;
+    skin.insert("SurfaceSlot".into(), json!(-1));
+    skin.insert("Tags".into(), json!(["b", "a"]));
+    let body = &mut document.instances[3];
+    body.properties
+        .insert("InertiaMigrated".into(), json!(true));
+    body.properties.insert("Transparency".into(), json!(0.5));
+    body.attributes.insert(
+        "RBX_ImportGuid".into(),
+        json!("{11111111-2222-3333-4444-555555555555}"),
+    );
+    body.attributes.insert("Tier".into(), json!(2));
+    let mut package = settings_document(vec![
+        settings_instance("pkg:0", "Pkg", "Folder", None),
+        settings_instance("pkg:1", "Skin", "SurfaceAppearance", Some(0)),
+        settings_instance("pkg:2", "Body", "MeshPart", Some(0)),
+    ]);
+    package.instances[1]
+        .properties
+        .insert("Tags".into(), json!(["a", "b"]));
+    let body = &mut package.instances[2];
+    body.properties.insert(
+        "Transparency".into(),
+        json!({"_type":"Float32","value":0.5}),
+    );
+    body.attributes.insert("Tier".into(), json!(2));
+    assert_eq!(fingerprint_target(&document, &package), (true, None));
+
+    package.instances[2]
+        .attributes
+        .insert("Tier".into(), json!(3));
+    assert!(!fingerprint_target(&document, &package).0);
+}
+
+#[test]
+fn union_mesh_data_still_counts_as_package_drift() {
+    let mut document = settings_document(vec![
+        settings_instance("editor:0", "ReplicatedStorage", "ReplicatedStorage", None),
+        settings_instance("editor:1", "Pkg", "Folder", Some(0)),
+        settings_instance("editor:2", "Shape", "UnionOperation", Some(1)),
+    ]);
+    document.instances[2].properties.insert(
+        "MeshData2".into(),
+        json!({"_type":"SharedString","base64":"AQID"}),
+    );
+    let mut package = settings_document(vec![
+        settings_instance("pkg:0", "Pkg", "Folder", None),
+        settings_instance("pkg:1", "Shape", "UnionOperation", Some(0)),
+    ]);
+    package.instances[1].properties.insert(
+        "MeshData2".into(),
+        json!({"_type":"SharedString","base64":"AQIE"}),
+    );
+    let (matches, difference) = fingerprint_target(&document, &package);
+    assert!(!matches);
+    assert!(
+        difference
+            .as_deref()
+            .is_some_and(|text| text.contains("MeshData2")),
+        "{difference:?}"
+    );
+}
+
+#[test]
+fn fingerprints_from_an_older_lock_format_are_not_a_baseline() {
+    assert!(fingerprint_is_current("2:0123456789abcdef"));
+    assert!(!fingerprint_is_current("0123456789abcdef"));
+    let package = settings_document(vec![settings_instance("pkg:0", "Pkg", "Folder", None)]);
+    assert!(fingerprint_is_current(
+        &package_document_fingerprint(&package).unwrap()
+    ));
+}
+
+#[test]
+fn integral_defaults_and_empty_references_do_not_count_as_drift() {
+    let mut document = settings_document(vec![
+        settings_instance("editor:0", "ReplicatedStorage", "ReplicatedStorage", None),
+        settings_instance("editor:1", "Pkg", "Folder", Some(0)),
+        settings_instance("editor:2", "Body", "MeshPart", Some(1)),
+        settings_instance("editor:3", "Car", "Model", Some(1)),
+    ]);
+    document.instances[2]
+        .properties
+        .insert("Transparency".into(), json!(0));
+    document.instances[3]
+        .properties
+        .insert("PrimaryPart".into(), json!({"_type":"Ref"}));
+    let package = settings_document(vec![
+        settings_instance("pkg:0", "Pkg", "Folder", None),
+        settings_instance("pkg:1", "Body", "MeshPart", Some(0)),
+        settings_instance("pkg:2", "Car", "Model", Some(0)),
+    ]);
+    assert_eq!(fingerprint_target(&document, &package), (true, None));
+
+    document.instances[3].properties.insert(
+        "PrimaryPart".into(),
+        json!({"_type":"Ref","settingsId":"editor:2"}),
+    );
+    assert!(!fingerprint_target(&document, &package).0);
+}
+
+#[test]
+fn a_lock_written_by_an_earlier_build_still_updates_an_unedited_writable_target() {
+    let dir = temp_dir("legacy-lock-writable");
+    let service_dir = dir.join("src/ReplicatedStorage");
+    write_link_test_service(&service_dir);
+    fs::create_dir_all(dir.join("links")).unwrap();
+    let path = dir.join("links/pkg.renium");
+    let mut package = settings_document(vec![settings_instance("p", "Pkg", "Folder", None)]);
+    package.instances[0]
+        .attributes
+        .insert("Revision".into(), json!(1));
+    package.write_file(&path).unwrap();
+    write_package_link_manifest(&dir, "ReplicatedStorage", false, &["Pkg"]);
+    capture_json_output(|| link_apply(test_link_apply_args(&dir))).unwrap();
+
+    let mut lock = read_link_lock(&dir).unwrap();
+    let key = package_lock_key("package-target", "ReplicatedStorage", &["Pkg".into()], &[1]);
+    let stored = lock
+        .entries
+        .get_mut("pkg")
+        .unwrap()
+        .files
+        .get_mut(&key)
+        .unwrap();
+    assert!(fingerprint_is_current(stored));
+    let document = read_editor_service_settings(&dir.join("src"), "ReplicatedStorage")
+        .unwrap()
+        .unwrap();
+    *stored =
+        legacy_package_target_fingerprint(&document, "ReplicatedStorage", &["Pkg".into()], &[1])
+            .unwrap()
+            .unwrap();
+    assert!(!fingerprint_is_current(stored));
+    fs::write(
+        link_lock_path(&dir),
+        serde_json::to_vec_pretty(&lock).unwrap(),
+    )
+    .unwrap();
+
+    package.instances[0]
+        .attributes
+        .insert("Revision".into(), json!(2));
+    package.write_file(&path).unwrap();
+    let output = capture_json_output(|| link_apply(test_link_apply_args(&dir))).unwrap();
+    assert_eq!(output["links"][0]["preservedEdits"], false, "{output}");
+    assert_eq!(output["links"][0]["conflict"], false, "{output}");
+    let document = read_editor_service_settings(&dir.join("src"), "ReplicatedStorage")
+        .unwrap()
+        .unwrap();
+    let revision = &document
+        .instances
+        .iter()
+        .find(|instance| instance.name == "Pkg")
+        .unwrap()
+        .attributes["Revision"];
+    assert_eq!(revision, &json!(2));
+    let lock = read_link_lock(&dir).unwrap();
+    assert!(fingerprint_is_current(&lock.entries["pkg"].files[&key]));
+    let _ = fs::remove_dir_all(&dir);
+}
+
 fn shared_fixture(name: &str) -> SharedFixture {
     let root = temp_dir(name);
     fs::write(

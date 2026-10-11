@@ -303,6 +303,18 @@ impl LinkApplyChanges {
     }
 }
 
+fn legacy_target_fingerprint(
+    document: &SettingsBytecode,
+    (service, segments, ordinals): &(String, Vec<String>, Vec<usize>),
+    service_dir: &Path,
+) -> Result<Option<String>> {
+    if resolve_editor_instance_by_path_ordinals(document, service, segments, ordinals).is_none() {
+        return Ok(None);
+    }
+    let inlined = inline_target_sources(document, service, service_dir, segments, ordinals)?;
+    super::legacy_package_target_fingerprint(&inlined, service, segments, ordinals)
+}
+
 fn compare_package_target(
     document: &SettingsBytecode,
     (service, segments, ordinals): &(String, Vec<String>, Vec<usize>),
@@ -481,9 +493,17 @@ impl PackageLinkApply<'_> {
             .as_ref()
             .zip(package_hash.as_ref())
             .is_some_and(|(previous, current)| previous != current);
-        let target_changed_from_baseline = previous_target_fingerprint
-            .as_ref()
-            .is_some_and(|previous| target_fingerprint.as_ref() != Some(previous));
+        let target_changed_from_baseline = match previous_target_fingerprint.as_deref() {
+            None => false,
+            Some(previous) if super::fingerprint_is_current(previous) => {
+                target_fingerprint.as_deref() != Some(previous)
+            }
+            Some(previous) => {
+                legacy_target_fingerprint(document, document_selector, &storage.source_root)?
+                    .as_deref()
+                    != Some(previous)
+            }
+        };
         let unchanged = target_exists
             && target_matches_package
             && package_hash.is_some()
@@ -628,6 +648,8 @@ impl PackageLinkApply<'_> {
                 "restored": true,
                 "state": "updated",
                 "replaced": changes.replaced_files.len() - replaced_before,
+                "targetExists": target_exists,
+                "difference": drift_detail,
             });
         }
         changes.link_results.push(result);
