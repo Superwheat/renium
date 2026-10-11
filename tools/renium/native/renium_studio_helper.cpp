@@ -14,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include "renium_engine_allocator_windows.h"
 #include "renium_studio_history.h"
 #include "renium_studio_terrain.h"
 

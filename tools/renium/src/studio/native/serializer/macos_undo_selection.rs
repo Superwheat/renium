@@ -214,9 +214,15 @@ fn cached_sites(path: &Path) -> Result<SelectionSites> {
     Ok((sites, image.image_uuid))
 }
 
+pub(super) fn probe(pid: u32, title: &str) -> Result<serde_json::Value> {
+    let (sites, _) = cached_sites(&process_executable_path(pid)?)?;
+    super::properties::probe_image_instructions(pid, title, &sites)
+}
+
 // A process patch like the package notice flag: it survives reconnects and
 // daemon restarts until Studio exits, and is idempotent.
 pub(crate) fn keep_selection_across_undo(pid: u32) -> Result<()> {
+    super::super::probes::run(pid, "", super::NativeOperation::UndoSelection)?;
     let (sites, image_uuid) = cached_sites(&process_executable_path(pid)?)?;
     let socket_path = PathBuf::from(format!("/tmp/renium-studio-{pid}.sock"));
     // The helper answers one request per connection.

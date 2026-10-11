@@ -657,12 +657,39 @@ pub(crate) fn doctor_result(
             .unwrap_or_default();
         checks.push(rbx_launcher_check(&stale_rbx_copies(directories, &current)));
     }
+    let native = crate::daemon::try_scoped_daemon_control_request(
+        crate::automation::op::STUDIO_STATUS,
+        root,
+        json!({"bridgeWaitSeconds": 1.0}),
+    )
+    .ok()
+    .flatten()
+    .and_then(|status| status.get("nativeOperations").cloned());
+    if let Some(rows) = native
+        .as_ref()
+        .and_then(|report| report["operations"].as_array())
+    {
+        for row in rows {
+            checks.push(DoctorCheck {
+                name: format!("native:{}", row["operation"].as_str().unwrap_or("unknown")),
+                status: match row["verdict"].as_str() {
+                    Some("native") => "ok",
+                    Some("degraded") => "warn",
+                    _ => "optional",
+                },
+                detail: row["reason"].as_str().unwrap_or_default().to_string(),
+                action: (row["verdict"] != "native")
+                    .then(|| row["fallback"].as_str().unwrap_or_default().to_string()),
+            });
+        }
+    }
     let mut result = json!({
         "ok": checks.iter().all(|check| check.status != "error"),
         "version": crate::app::build::VERSION,
         "gitHash": crate::app::build::GIT_HASH,
         "root": root,
         "checks": checks,
+        "nativeOperations": native,
     });
     if let Some(version) = crate::app::update::cached_available_update() {
         result["updateAvailable"] = json!(version);
@@ -1268,6 +1295,10 @@ pub(crate) fn refresh_outdated_agent_instructions(project: Option<&Path>) -> Res
 
 const EMBEDDED_AGENT_INSTRUCTIONS: &str = include_str!("../../../renium-agents.md");
 const EMBEDDED_AGENT_GUIDES: &[(&str, &str)] = &[
+    (
+        "native-compatibility.md",
+        include_str!("../../../renium-guides/native-compatibility.md"),
+    ),
     (
         "advanced.md",
         include_str!("../../../renium-guides/advanced.md"),

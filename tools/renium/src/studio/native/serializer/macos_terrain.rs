@@ -66,11 +66,26 @@ pub(crate) fn prepare_terrain(
     ordinals: &[usize],
     timeout: Duration,
 ) -> Result<NativeTerrain> {
+    super::super::super::probes::run(pid, title, NativeOperation::Terrain)?;
     let property = prepare_property(pid, title, path, ordinals, "Name", timeout)?;
     anyhow::ensure!(
         property.class_name == "Terrain",
         "Native voxel target is not Terrain"
     );
+    let mut output = binding(&property)?;
+    let acquisition = prepare_property(pid, title, path, ordinals, "AcquisitionMethod", timeout)?;
+    acquisition.ensure_writable()?;
+    for offset in [24, 32, 48, 56, 104, 112] {
+        output.extend_from_slice(&acquisition.parameters[offset..offset + 8]);
+    }
+    Ok(NativeTerrain {
+        fingerprint: [0; 64],
+        property,
+        bindings: output,
+    })
+}
+
+pub(super) fn binding(property: &NativeProperty) -> Result<Vec<u8>> {
     let memory = &property.memory;
     let mut output = Vec::with_capacity(96);
     for name in ["SmoothGrid", "PhysicsGrid"] {
@@ -94,8 +109,7 @@ pub(crate) fn prepare_terrain(
         }
         let table = memory.pointer(descriptor)?;
         let mut found = HashSet::new();
-        for slot in (16..256).step_by(8) {
-            let target = memory.pointer(table + slot)?;
+        for target in memory.vtable_methods(table)? {
             if let Ok(code) = memory.code(target, 512)
                 && let Some(result) = copy_calls(&code, &fields)
             {
@@ -127,32 +141,11 @@ pub(crate) fn prepare_terrain(
             == "N3RBX10Reflection13BoundFuncDescINS_19MegaClusterInstanceEFvvELb0ELi0EEE",
         "Unsupported Terrain Clear ABI"
     );
-    let fields = memory.read(clear, 264)?;
-    let mut methods = Vec::new();
-    for offset in (64..256).step_by(8) {
-        let target = read_u64(&fields, offset).unwrap();
-        if read_u64(&fields, offset + 8) == Some(0) && memory.code(target, 64).is_ok() {
-            methods.push((offset, target));
-        }
-    }
-    anyhow::ensure!(
-        methods.len() == 1,
-        "Terrain Clear member is missing or ambiguous"
-    );
-    let (offset, target) = methods[0];
+    let (offset, target) = memory.function_binding(clear, memory.pointer(clear)?)?;
     for value in [clear, memory.pointer(clear)?, offset as u64, target] {
         output.extend_from_slice(&value.to_le_bytes());
     }
-    let acquisition = prepare_property(pid, title, path, ordinals, "AcquisitionMethod", timeout)?;
-    acquisition.ensure_writable()?;
-    for offset in [24, 32, 48, 56, 104, 112] {
-        output.extend_from_slice(&acquisition.parameters[offset..offset + 8]);
-    }
-    Ok(NativeTerrain {
-        fingerprint: [0; 64],
-        property,
-        bindings: output,
-    })
+    Ok(output)
 }
 
 impl NativeTerrain {

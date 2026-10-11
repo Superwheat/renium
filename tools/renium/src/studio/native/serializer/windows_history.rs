@@ -186,13 +186,26 @@ pub(super) fn binding(prepared: &NativeProperty, pid: u32, title: &str) -> Resul
         .context("Missing Studio")?;
     let layout = package_layout(&studio.path)?;
     let model = active_data_model(pid, &prepared.memory, studio, layout.data, title)?;
+    probe_binding(&prepared.memory, studio, &layout, &model)
+}
+
+pub(super) fn probe_binding(
+    memory: &ProcessMemory,
+    studio: &ModuleEntry,
+    layout: &PackageLayout,
+    model: &ActiveDataModel,
+) -> Result<Vec<u8>> {
+    let history = resolve_path(memory, model, &["ChangeHistoryService".into()], &[])?;
     let descriptor = find_class_member_descriptor(
-        &prepared.memory,
-        read_u64(&prepared.parameters, 16)? as usize,
+        memory,
+        history
+            .last()
+            .context("Missing ChangeHistoryService")?
+            .instance,
         model.layout,
         "FinishRecording",
     )?;
-    let kind = read_rtti_type(&prepared.memory, descriptor, studio.base, studio.size)
+    let kind = read_rtti_type(memory, descriptor, studio.base, studio.size)
         .context("Missing history descriptor type")?;
     anyhow::ensure!(
         kind == ".?AV?$BoundFuncDesc@VChangeHistoryService@RBX@@$$A6AXV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@W4FinishRecordingOperation@Enums@2@V?$optional@V?$shared_ptr@$$CBVValueTable@Reflection@RBX@@@std@@@4@@Z$0A@$02@Reflection@RBX@@",
@@ -200,57 +213,47 @@ pub(super) fn binding(prepared: &NativeProperty, pid: u32, title: &str) -> Resul
     );
     let bytes = fs::read(&studio.path)?;
     let image = PeImage::parse(&bytes)?;
-    let fields = prepared.memory.read_vec(descriptor, 256)?;
-    let candidates = (64..256)
-        .step_by(8)
-        .filter_map(|offset| {
-            let target = read_u64(&fields, offset).ok()? as usize;
-            let rva = target.checked_sub(studio.base)?;
-            function(&image, rva)?;
-            Some((offset, target))
-        })
-        .collect::<Vec<_>>();
+    let table = memory.read_u64(descriptor)? as usize;
+    let offset = functions::member_field(memory, studio, layout, descriptor, table)?;
     anyhow::ensure!(
-        candidates.len() == 1,
-        "History member function is missing or ambiguous"
+        memory.read_u32(descriptor + offset + 8)? == 0,
+        "Unsupported history receiver adjustment"
     );
-    let (offset, finish) = candidates[0];
-    anyhow::ensure!(
-        read_i32(&fields, offset + 8)? == 0,
-        "Unsupported history member adjustment"
-    );
-    let playback = match discover(&image, finish - studio.base) {
-        Ok(found) => Some(found),
-        Err(error) => {
-            crate::app::output::log_global(
-                2,
-                format_args!(
-                    "[renium] warning: Studio voxel playback hook unavailable on this build; cancellations restore Terrain explicitly ({error:#})"
-                ),
-            );
-            None
-        }
-    };
+    let finish = memory.read_u64(descriptor + offset)? as usize;
+    if !(studio.base..studio.base + studio.size).contains(&finish) {
+        return installed_binding(
+            memory,
+            studio,
+            layout,
+            (descriptor, table, offset, finish),
+            &image,
+        );
+    }
+    let playback = discover(&image, finish - studio.base).ok();
     if let Some((voxel, _)) = playback {
         verified_code(
-            &prepared.memory,
+            memory,
             studio,
-            &layout,
+            layout,
             studio.base + voxel,
-            function(&image, voxel).unwrap().len(),
+            function(&image, voxel)
+                .context("Missing verified voxel function")?
+                .len(),
         )?;
     }
     verified_code(
-        &prepared.memory,
+        memory,
         studio,
-        &layout,
+        layout,
         finish,
-        function(&image, finish - studio.base).unwrap().len(),
+        function(&image, finish - studio.base)
+            .context("Missing verified history function")?
+            .len(),
     )?;
     let mut binding = vec![0; 80];
     for (at, value) in [
         (0, descriptor),
-        (8, prepared.memory.read_u64(descriptor)? as usize),
+        (8, memory.read_u64(descriptor)? as usize),
         (16, offset),
         (24, finish),
         (32, playback.map_or(0, |(voxel, _)| studio.base + voxel)),
@@ -259,8 +262,95 @@ pub(super) fn binding(prepared: &NativeProperty, pid: u32, title: &str) -> Resul
     }
     if let Some((voxel, length)) = playback {
         put_u32(&mut binding, 40, length as u32);
-        binding[48..48 + length].copy_from_slice(&function(&image, voxel).unwrap()[..length]);
+        binding[48..48 + length].copy_from_slice(
+            &function(&image, voxel).context("Missing verified voxel function")?[..length],
+        );
     }
+    Ok(binding)
+}
+
+fn export(image: &PeImage<'_>, name: &[u8]) -> Result<usize> {
+    let bytes = image.bytes;
+    let pe = read_u32(bytes, 0x3c)? as usize;
+    let directory = image.rva_to_offset(read_u32(bytes, pe + 24 + 112)? as usize)?;
+    let names = image.rva_to_offset(read_u32(bytes, directory + 32)? as usize)?;
+    let ordinals = image.rva_to_offset(read_u32(bytes, directory + 36)? as usize)?;
+    let functions = image.rva_to_offset(read_u32(bytes, directory + 28)? as usize)?;
+    let count = read_u32(bytes, directory + 24)? as usize;
+    anyhow::ensure!(
+        count < 4096,
+        "Helper export table exceeds its validation budget"
+    );
+    for index in 0..count {
+        let at = image.rva_to_offset(read_u32(bytes, names + index * 4)? as usize)?;
+        if bytes.get(at..at + name.len()) == Some(name) && bytes.get(at + name.len()) == Some(&0) {
+            let ordinal = read_u16(bytes, ordinals + index * 2)? as usize;
+            return Ok(read_u32(bytes, functions + ordinal * 4)? as usize);
+        }
+    }
+    bail!(
+        "History helper generation lacks its allocator-safe ABI certificate; restart this Studio window"
+    )
+}
+
+fn installed_binding(
+    memory: &ProcessMemory,
+    studio: &ModuleEntry,
+    layout: &PackageLayout,
+    slot: (usize, usize, usize, usize),
+    engine: &PeImage<'_>,
+) -> Result<Vec<u8>> {
+    let (descriptor, table, field, hook) = slot;
+    let loaded = modules(memory.pid)?;
+    let helper = loaded
+        .iter()
+        .find(|module| (module.base..module.base + module.size).contains(&hook))
+        .context("History slot points outside a loaded helper")?;
+    let bytes = fs::read(&helper.path)?;
+    anyhow::ensure!(
+        helper
+            .name
+            .eq_ignore_ascii_case(&format!("renium-studio-helper-{:016x}.dll", fnv1a(&bytes))),
+        "History hook does not belong to a content-addressed helper"
+    );
+    let image = PeImage::parse(&bytes)?;
+    verify_loaded_image(memory, helper, image.image_stamp)?;
+    let version = export(&image, b"ReniumHistoryAbiVersion")?;
+    anyhow::ensure!(
+        read_u32(&bytes, image.rva_to_offset(version)?)? == 2
+            && memory.read_u32(helper.base + version)? == 2,
+        "History helper generation has an incompatible ownership ABI; restart this Studio window"
+    );
+    let entry = export(&image, b"ReniumHistoryFinish")?;
+    anyhow::ensure!(
+        hook == helper.base + entry,
+        "History slot is not the certified helper entry point"
+    );
+    let code = function(&image, entry)
+        .context("History helper entry has no verified function boundary")?;
+    anyhow::ensure!(
+        memory.read_vec(hook, code.len())? == code,
+        "History helper entry differs from its image"
+    );
+    let binding = memory.read_vec(helper.base + export(&image, b"ReniumHistoryBinding")?, 80)?;
+    anyhow::ensure!(
+        read_u64(&binding, 0)? as usize == descriptor
+            && read_u64(&binding, 8)? as usize == table
+            && read_u64(&binding, 16)? as usize == field,
+        "Installed history binding does not own this reflection slot"
+    );
+    let original = read_u64(&binding, 24)? as usize;
+    let code = original
+        .checked_sub(studio.base)
+        .and_then(|rva| function(engine, rva))
+        .context("Installed history original is outside Studio")?;
+    verified_code(memory, studio, layout, original, code.len())?;
+    // Voxel trampolines mutate engine code. Until their installed jump is
+    // independently certified, keep that optional optimization unavailable.
+    anyhow::ensure!(
+        read_u64(&binding, 32)? == 0,
+        "Installed voxel playback hook requires independent validation"
+    );
     Ok(binding)
 }
 

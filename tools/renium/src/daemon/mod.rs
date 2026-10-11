@@ -100,6 +100,16 @@ pub(super) fn cursor_poll(_args: CursorPollArgs) -> Result<()> {
 }
 
 pub(super) fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
+    let name = args
+        .name
+        .clone()
+        .or_else(|| std::env::var("RENIUM_DAEMON_NAME").ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "default".to_string());
+    // Resolve --name before discovery, including the editor proxy path. A
+    // missing named daemon must never connect to the default daemon instead.
+    unsafe { std::env::set_var("RENIUM_DAEMON_NAME", &name) };
     let editor_stdio = args.editor_stdio;
     crate::app::context::set_automation_stdio(editor_stdio);
     if editor_stdio {
@@ -117,12 +127,6 @@ pub(super) fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
         }
         return run_stdio_proxy(args.bridge.ports, args.bridge.wait_seconds);
     }
-    let name = args
-        .name
-        .or_else(|| std::env::var("RENIUM_DAEMON_NAME").ok())
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "default".to_string());
     let lifecycle_lock = update::acquire_lifecycle_lock()?;
     if shared_daemon_available() {
         drop(lifecycle_lock);
@@ -134,7 +138,9 @@ pub(super) fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
     crate::app::output::open_daemon_log();
     release_freed_memory_promptly();
     #[cfg(windows)]
-    crate::studio::input::watch_auto_recovery_dialogs();
+    if is_default_daemon() {
+        crate::studio::input::watch_auto_recovery_dialogs();
+    }
     let automation_state = Arc::new(automation::State::default());
     check_for_available_update(Arc::clone(&automation_state));
     let bridge_host = normalize_loopback_host(&args.host)?;
@@ -162,7 +168,7 @@ pub(super) fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
     );
     let mut audio_check = Instant::now();
     while bridge.alive.load(Ordering::Relaxed) {
-        if audio_check.elapsed() >= Duration::from_secs(2) {
+        if is_default_daemon() && audio_check.elapsed() >= Duration::from_secs(2) {
             let _ = crate::studio::audio::global::resume();
             audio_check = Instant::now();
         }
@@ -409,12 +415,26 @@ pub(super) fn daemon_control_endpoints() -> Vec<std::net::SocketAddr> {
         }
     }
 
-    push_daemon_endpoint(
-        &mut out,
-        &mut seen,
-        &host_port("127.0.0.1", DEFAULT_DAEMON_CONTROL_PORT),
-    );
+    if is_default_daemon() {
+        push_daemon_endpoint(
+            &mut out,
+            &mut seen,
+            &host_port("127.0.0.1", DEFAULT_DAEMON_CONTROL_PORT),
+        );
+    }
     out
+}
+
+pub(crate) fn is_default_daemon() -> bool {
+    default_daemon_selection(
+        std::env::var("RENIUM_DAEMON_NAME").ok().as_deref(),
+        std::env::var("RENIUM_DAEMON_FILE").ok().as_deref(),
+    )
+}
+
+fn default_daemon_selection(name: Option<&str>, file: Option<&str>) -> bool {
+    file.is_none_or(|file| file.trim().is_empty())
+        && name.is_none_or(|name| matches!(name.trim(), "" | "default"))
 }
 
 pub(super) fn daemon_discovery_paths() -> Vec<PathBuf> {
@@ -423,6 +443,7 @@ pub(super) fn daemon_discovery_paths() -> Vec<PathBuf> {
         let path = path.trim();
         if !path.is_empty() {
             paths.push(PathBuf::from(path));
+            return paths;
         }
     }
     if let Some(path) = local_app_data_daemon_path() {
@@ -718,6 +739,14 @@ pub(super) fn try_daemon_control_request(
     daemon_control_request_inner(operation, None, parameters, false, false)
 }
 
+pub(crate) fn try_scoped_daemon_control_request(
+    operation: u16,
+    root: &Path,
+    parameters: Value,
+) -> Result<Option<Value>> {
+    daemon_control_request_inner(operation, Some(root), parameters, false, false)
+}
+
 pub(crate) fn daemon_control_request(
     operation: u16,
     project_root: Option<&Path>,
@@ -907,4 +936,28 @@ fn daemon_control_request_inner(
         bail!("{}", error.m);
     }
     Ok(Some(response.r.unwrap_or_else(|| json!({}))))
+}
+
+#[cfg(test)]
+mod isolation_tests {
+    use super::default_daemon_selection;
+
+    #[test]
+    fn explicit_daemons_cannot_use_default_discovery_or_global_watchers() {
+        for (name, file) in [
+            (Some("canary"), None),
+            (Some(" astra "), None),
+            (None, Some("scratch/daemon.json")),
+            (Some("default"), Some("scratch/daemon.json")),
+        ] {
+            assert!(!default_daemon_selection(name, file));
+        }
+        for (name, file) in [
+            (None, None),
+            (Some(" default "), None),
+            (Some(""), Some(" ")),
+        ] {
+            assert!(default_daemon_selection(name, file));
+        }
+    }
 }

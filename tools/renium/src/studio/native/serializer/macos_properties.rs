@@ -16,7 +16,128 @@ pub(crate) use terrain::prepare_terrain;
 mod terrain_observation;
 pub(crate) use terrain_observation::observe_terrain;
 
+pub(super) fn probe_image_code(
+    pid: u32,
+    title: &str,
+    rvas: &[(u64, usize)],
+) -> Result<serde_json::Value> {
+    let mut memory = Memory::for_process(pid, Duration::from_secs(10))?;
+    let context = memory.request(0, &[0], title)?;
+    anyhow::ensure!(context.len() == 64, "Unsupported reflection context");
+    memory.base = read_u64(&context, 0).context("Missing image base")?;
+    for (rva, size) in rvas {
+        memory.code(memory.base + rva, *size)?;
+    }
+    Ok(
+        serde_json::json!({"imageBase":memory.base,"imageUuid":memory.trace.image_uuid,"validatedFunctions":rvas}),
+    )
+}
+
+pub(super) fn probe_image_instructions(
+    pid: u32,
+    title: &str,
+    sites: &[(u64, u32)],
+) -> Result<serde_json::Value> {
+    let mut memory = Memory::for_process(pid, Duration::from_secs(10))?;
+    let context = memory.request(0, &[0], title)?;
+    anyhow::ensure!(context.len() == 64, "Unsupported reflection context");
+    memory.base = read_u64(&context, 0).context("Missing image base")?;
+    for (rva, original) in sites {
+        let bytes = memory.read(memory.base + rva, 4)?;
+        let loaded = read_u32(&bytes, 0).context("Missing loaded instruction")?;
+        anyhow::ensure!(
+            loaded == *original || loaded == 0xd503201f,
+            "Undo selection instruction differs from the verified image"
+        );
+    }
+    Ok(
+        serde_json::json!({"imageBase":memory.base,"imageUuid":memory.trace.image_uuid,"sites":sites}),
+    )
+}
+
+pub(super) fn probe_image_value(pid: u32, title: &str, rva: u64) -> Result<u8> {
+    let mut memory = Memory::for_process(pid, Duration::from_secs(10))?;
+    let context = memory.request(0, &[0], title)?;
+    anyhow::ensure!(context.len() == 64, "Unsupported reflection context");
+    memory.base = read_u64(&context, 0).context("Missing image base")?;
+    Ok(memory.read(memory.base + rva, 1)?[0])
+}
+
+fn probe_task_context() -> Result<()> {
+    bail!("macOS DataModel queue context has no verified structural locator; use the plugin path")
+}
+
+pub(super) fn probe_operation(
+    pid: u32,
+    title: &str,
+    operation: super::super::probes::NativeOperation,
+) -> Result<serde_json::Value> {
+    use super::super::probes::NativeOperation;
+    // Reflection addresses alone do not prove the helper's task-queue ABI.
+    // Keep this check independent from discover_property to avoid probe recursion.
+    probe_task_context()?;
+    let path = match operation {
+        NativeOperation::History | NativeOperation::VoxelHistory => {
+            vec!["ChangeHistoryService".into()]
+        }
+        NativeOperation::Terrain | NativeOperation::TerrainObservation => {
+            vec!["Workspace".into(), "Terrain".into()]
+        }
+        NativeOperation::DescriptorBinding => vec!["Workspace".into()],
+        _ => bail!("This native operation has no macOS property probe"),
+    };
+    let property = discover_property(
+        pid,
+        title,
+        &path,
+        &[],
+        "Name",
+        Duration::from_secs(10),
+        None,
+        None,
+    )?;
+    match operation {
+        NativeOperation::History | NativeOperation::VoxelHistory => {
+            let bytes = history::binding(&property)?;
+            let voxel =
+                read_u64(&bytes, 32).context("History probe returned no playback binding")?;
+            anyhow::ensure!(
+                operation != NativeOperation::VoxelHistory || voxel != 0,
+                "Studio voxel playback is unavailable; cancellations restore Terrain explicitly"
+            );
+            Ok(serde_json::json!({"finish":read_u64(&bytes,24),"voxelPlayback":voxel}))
+        }
+        NativeOperation::TerrainObservation => {
+            let bytes = terrain_observation::binding(&property)?;
+            Ok(
+                serde_json::json!({"table":read_u64(&bytes,0),"listenerOffset":read_u64(&bytes,8),"slot":read_u64(&bytes,24)}),
+            )
+        }
+        NativeOperation::Terrain => {
+            let bytes = terrain::binding(&property)?;
+            let acquisition = discover_property(
+                pid,
+                title,
+                &path,
+                &[],
+                "AcquisitionMethod",
+                Duration::from_secs(10),
+                None,
+                None,
+            )?;
+            acquisition.ensure_writable()?;
+            Ok(
+                serde_json::json!({"bindingsBytes":bytes.len(),"acquisitionSetter":read_u64(&acquisition.parameters,56)}),
+            )
+        }
+        _ => Ok(
+            serde_json::json!({"descriptor":read_u64(&property.parameters,24),"getter":read_u64(&property.parameters,48),"setter":read_u64(&property.parameters,56),"identityGetter":read_u64(&property.parameters,72)}),
+        ),
+    }
+}
+
 pub(crate) fn register_history(pid: u32, title: &str, token: &str) -> Result<()> {
+    super::super::probes::run(pid, title, NativeOperation::History)?;
     anyhow::ensure!(
         !token.is_empty() && token.len() <= 256,
         "Invalid Studio recording token"
@@ -70,6 +191,38 @@ enum CallKind {
     Text,
     Identity,
     Setter,
+}
+
+fn referenced_fields(code: &[u8]) -> HashSet<usize> {
+    let mut registers = [None; 32];
+    registers[0] = Some(Argument::Descriptor);
+    registers[31] = Some(Argument::Scratch(0));
+    let mut vectors = [None; 32];
+    let mut copied = [None; 24];
+    let mut fields = HashSet::new();
+    for bytes in code.chunks_exact(4) {
+        let word = u32::from_le_bytes(bytes.try_into().unwrap());
+        let base = ((word >> 5) & 31) as usize;
+        if word & 0xffc00000 == 0xf9400000 && registers[base] == Some(Argument::Descriptor) {
+            let field = ((word >> 10) & 4095) as usize * 8;
+            if field != 0 {
+                fields.insert(field);
+            }
+        }
+        if data_instruction(word, &[], &mut registers, &mut vectors, &mut copied, None).is_some() {
+            continue;
+        }
+        if word & 0xfc000000 == 0x94000000 || word & 0xfffffc1f == 0xd63f0000 {
+            registers[..19].fill(None);
+        } else if word & 0x3b000000 != 0x29000000
+            && word & 0x3b000000 != 0x39000000
+            && word & 0x7c000000 != 0x14000000
+            && word & 0x7e000000 != 0x36000000
+        {
+            registers[(word & 31) as usize] = None;
+        }
+    }
+    fields
 }
 
 fn loaded_argument(base: Option<Argument>, offset: usize, bindings: &[usize]) -> Option<Argument> {
@@ -578,6 +731,10 @@ impl Memory {
     }
 
     fn function_binding(&self, descriptor: u64, table: u64) -> Result<(usize, u64)> {
+        self.resolve_function(descriptor, self.function_field(descriptor, table)?)
+    }
+
+    fn function_field(&self, descriptor: u64, table: u64) -> Result<usize> {
         let key = (self.trace.image_uuid, table);
         let cache = FUNCTION_BINDINGS.get_or_init(|| Mutex::new(HashMap::new()));
         let cached = cache.lock_recover().get(&key).cloned();
@@ -592,7 +749,7 @@ impl Memory {
                 .iter()
                 .all(|(field, value)| self.pointer(descriptor + *field as u64).ok() == Some(*value))
         {
-            return self.resolve_function(descriptor, binding.field);
+            return Ok(binding.field);
         }
         let start = self.base + self.trace.text.address - self.trace.image_base;
         let mut fields = HashSet::new();
@@ -645,7 +802,7 @@ impl Memory {
             fields.len()
         );
         let field = *fields.iter().next().unwrap();
-        let result = self.resolve_function(descriptor, field)?;
+
         let mut cache = cache.lock_recover();
         if cache.len() >= 128 {
             cache.clear();
@@ -659,7 +816,7 @@ impl Memory {
                 conditions: conditions.into_iter().collect(),
             },
         );
-        Ok(result)
+        Ok(field)
     }
 
     fn resolve_function(&self, descriptor: u64, field: usize) -> Result<(usize, u64)> {
@@ -672,16 +829,43 @@ impl Memory {
         Ok((field, function))
     }
 
+    fn vtable_methods(&self, table: u64) -> Result<Vec<u64>> {
+        let start = self.base + self.trace.text.address - self.trace.image_base;
+        let mut methods = Vec::new();
+        for slot in 0..256 {
+            let method = self.pointer(table + slot * 8)?;
+            if method
+                .checked_sub(start)
+                .is_none_or(|offset| offset >= self.trace.text.size)
+            {
+                return Ok(methods);
+            }
+            methods.push(method);
+        }
+        bail!("Reflection vtable exceeds its structural discovery budget")
+    }
+
     fn bindings(&self, descriptor: u64) -> Result<Vec<usize>> {
-        let bytes = self.read(descriptor, 0x200)?;
-        Ok((0x40..0x200)
-            .step_by(8)
+        let mut fields = HashSet::new();
+        for method in self.vtable_methods(self.pointer(descriptor)?)? {
+            fields.extend(referenced_fields(&self.dispatch_code(method)?));
+        }
+        Ok(fields
+            .into_iter()
             .filter(|offset| {
-                let ptr = read_u64(&bytes, *offset).unwrap();
-                self.rtti(ptr).is_ok_and(|kind| {
-                    kind.contains("PropDescriptor")
-                        && (kind.contains("10GetSetImplI") || kind.contains("7GetImplI"))
-                })
+                let Ok(ptr) = self.pointer(descriptor + *offset as u64) else {
+                    return false;
+                };
+                let complete = self
+                    .pointer(ptr)
+                    .and_then(|table| self.pointer(table - 16))
+                    .ok()
+                    == Some(0);
+                complete
+                    && self.rtti(ptr).is_ok_and(|kind| {
+                        kind.contains("PropDescriptor")
+                            && (kind.contains("10GetSetImplI") || kind.contains("7GetImplI"))
+                    })
             })
             .collect())
     }
@@ -692,17 +876,17 @@ impl Memory {
             return Ok((abi.field, abi.getter_slot, abi.setter_slot));
         }
         let offsets = self.bindings(descriptor)?;
-        let functions = self.read(vtable, 32 * 8)?;
+        let functions = self.vtable_methods(vtable)?;
         let mut matches = Vec::new();
-        for slot in 16..30 {
-            let capability = read_u64(&functions, slot * 8).unwrap();
+        for slot in 0..functions.len().saturating_sub(2) {
+            let capability = functions[slot];
             if self.code(capability, 8).ok().as_deref()
                 != Some(&[0x20, 0, 0x80, 0x52, 0xc0, 3, 0x5f, 0xd6])
             {
                 continue;
             }
-            let getter = read_u64(&functions, (slot + 1) * 8).unwrap();
-            let setter = read_u64(&functions, (slot + 2) * 8).unwrap();
+            let getter = functions[slot + 1];
+            let setter = functions[slot + 2];
             let getter_code = self.code(getter, 256)?;
             if let Some((field, _)) = binding_call(&getter_code, &offsets, CallKind::Text) {
                 let setter_code = self.code(setter, 512)?;
@@ -1300,8 +1484,7 @@ fn parent_offset(memory: &Memory, context: &[u8]) -> Result<u64> {
 fn discover_identity_abi(memory: &Memory, descriptor: u64, table: u64) -> Result<ValidatedAbi> {
     let offsets = memory.bindings(descriptor)?;
     let mut found = HashMap::new();
-    for slot in 12..24 {
-        let address = memory.pointer(table + slot * 8)?;
+    for (slot, address) in memory.vtable_methods(table)?.into_iter().enumerate() {
         if let Ok(code) = memory.code(address, 256)
             && let Some(result) = binding_call(&code, &offsets, CallKind::Identity)
         {
@@ -1357,6 +1540,11 @@ fn identity_function(
 }
 
 pub(crate) fn prepare_context(pid: u32, title: &str) -> Result<()> {
+    super::super::probes::run(
+        pid,
+        title,
+        super::super::probes::NativeOperation::DescriptorBinding,
+    )?;
     let memory = Memory::for_process(pid, Duration::from_secs(2))?;
     let context = memory.request(0, &[0], title)?;
     anyhow::ensure!(context.len() == 64, "Unsupported Studio reflection context");
@@ -1424,6 +1612,11 @@ fn prepare(
 ) -> Result<(NativeProperty, String)> {
     let mut prepared = discover_property(
         pid, title, segments, ordinals, property, timeout, read_class, context,
+    )?;
+    super::super::probes::run(
+        pid,
+        title,
+        super::super::probes::NativeOperation::DescriptorBinding,
     )?;
     let response = prepared.invoke(if read_class.is_some() { 3 } else { 0 })?;
     let identity = response

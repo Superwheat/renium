@@ -1,5 +1,9 @@
 pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     (
+        "native-probe",
+        "Examples:\n  rbx native-probe --pid 1234\n  rbx native-probe --pid 1234 --require-native",
+    ),
+    (
         "audio",
         "Examples:\n  rbx audio auto --global\n  rbx audio status --global\n  rbx audio off --global\n  rbx audio mute\n  rbx audio unmute\n  rbx audio auto\n  rbx audio off\n  rbx audio status",
     ),

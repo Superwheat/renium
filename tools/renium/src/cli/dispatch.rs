@@ -75,6 +75,10 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::OpenCloud(args) => crate::cloud::command::run(args, project),
         Commands::UpdateHelper(args) => update::run_update_helper(args),
         #[cfg(any(windows, target_os = "macos"))]
+        Commands::NativeProbe(args) => crate::studio::native::serializer::probes::command(args),
+        #[cfg(not(any(windows, target_os = "macos")))]
+        Commands::NativeProbe(_) => anyhow::bail!("native probes need Windows or macOS"),
+        #[cfg(any(windows, target_os = "macos"))]
         Commands::NativePackage(args) => {
             crate::studio::native::serializer::native_package_command(args)
         }

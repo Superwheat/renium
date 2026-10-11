@@ -15,14 +15,14 @@ use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcess, Set
 #[path = "windows_observation_signal.rs"]
 pub(super) mod signal;
 
-struct ImageView {
+pub(super) struct ImageView {
     view: MEMORY_MAPPED_VIEW_ADDRESS,
     _mapping: Handle,
     _file: fs::File,
     len: usize,
 }
 impl ImageView {
-    fn open(path: &Path) -> Result<Self> {
+    pub(super) fn open(path: &Path) -> Result<Self> {
         // Deny writes/deletion while slices exist. Only the PE headers, unwind
         // table and selected functions are touched, instead of copying 226 MB.
         let file = fs::OpenOptions::new().read(true).share_mode(1).open(path)?;
@@ -60,7 +60,7 @@ impl ImageView {
             len,
         })
     }
-    fn bytes(&self) -> &[u8] {
+    pub(super) fn bytes(&self) -> &[u8] {
         // The read-only mapping and write-denying file handle outlive this slice.
         unsafe { std::slice::from_raw_parts(self.view.Value.cast(), self.len) }
     }
@@ -119,25 +119,19 @@ fn prepared(
             ),
         "Studio SetEnabled signature changed"
     );
-    let members = memory.read_vec(descriptor + 0x50, 0x58)?;
+    let layout = package_layout(&studio.path)?;
+    let table = memory.read_u64(descriptor)? as usize;
+    let (_, address) = properties::function_binding(memory, studio, &layout, descriptor, table)?;
     let mapped = ImageView::open(&studio.path)?;
     let bytes = mapped.bytes();
     let result = (|| {
         let image = PeImage::parse(bytes)?;
-        let mut candidates = Vec::new();
-        for offset in (0..0x50).step_by(8) {
-            let address = read_u64(&members, offset)? as usize;
-            let Some(method) = address.checked_sub(studio.base) else {
-                continue;
-            };
-            if let Ok(trace) = signal::discover(&image, method) {
-                anyhow::ensure!(
-                    read_u32(&members, offset + 8)? == 0,
-                    "Signal method this-adjustment changed"
-                );
-                candidates.push(trace);
-            }
-        }
+        let mut candidates = vec![signal::discover(
+            &image,
+            address
+                .checked_sub(studio.base)
+                .context("Signal method is outside Studio")?,
+        )?];
         anyhow::ensure!(
             candidates.len() == 1,
             "Studio attribute signal layout is unrecognized; Renium's detector needs updating"
@@ -168,12 +162,21 @@ fn prepared(
     );
     result.map_err(anyhow::Error::msg)
 }
-pub(super) fn prepare(
+pub(super) fn probe(
     memory: &ProcessMemory,
     studio: &ModuleEntry,
     model: &ActiveDataModel,
-) -> Result<()> {
-    prepared(memory, studio, model).map(|_| ())
+) -> Result<serde_json::Value> {
+    let binding = prepared(memory, studio, model)?;
+    for (rva, code) in binding.code.iter() {
+        anyhow::ensure!(
+            memory.read_vec(studio.base + rva, code.len())? == *code,
+            "Loaded Studio attribute signal code changed"
+        );
+    }
+    Ok(
+        serde_json::json!({"validatedFunctions": binding.code.iter().map(|(rva, _)| *rva).collect::<Vec<_>>()}),
+    )
 }
 
 struct Handle(HANDLE);
@@ -320,7 +323,7 @@ fn begin_observation(
     relay_path: Option<&[String]>,
 ) -> Result<AttributeGuard> {
     let memory = ProcessMemory::open_with_access(pid, PROCESS_DUP_HANDLE)?;
-    memory.ensure_writes_verified()?;
+    memory.authorize(NativeOperation::AttributeObservation, title)?;
     let modules = modules(pid)?;
     let studio = modules.first().context("No Studio module")?;
     anyhow::ensure!(

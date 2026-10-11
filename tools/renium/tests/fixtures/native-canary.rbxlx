@@ -1,0 +1,12 @@
+<roblox version="4">
+  <External>null</External><External>nil</External>
+  <Item class="Workspace" referent="RBX0">
+    <Properties><string name="Name">Workspace</string></Properties>
+    <Item class="Terrain" referent="RBX1"><Properties><string name="Name">Terrain</string></Properties></Item>
+    <Item class="Part" referent="RBX2"><Properties><string name="Name">Canary</string><bool name="Anchored">true</bool></Properties></Item>
+  </Item>
+  <Item class="ServerScriptService" referent="RBX3">
+    <Properties><string name="Name">ServerScriptService</string></Properties>
+    <Item class="Script" referent="RBX4"><Properties><string name="Name">Canary</string><ProtectedString name="Source">return nil</ProtectedString><bool name="Disabled">true</bool></Properties></Item>
+  </Item>
+</roblox>

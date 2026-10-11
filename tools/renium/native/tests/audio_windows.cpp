@@ -5,6 +5,9 @@ namespace {
 IAudioRenderClient* received = nullptr;
 UINT32 frameCount = 0;
 DWORD receivedFlags = 0;
+HRESULT STDMETHODCALLTYPE Query(IAudioRenderClient*, REFIID, void**) { return E_NOINTERFACE; }
+ULONG STDMETHODCALLTYPE Reference(IAudioRenderClient*) { return 1; }
+HRESULT STDMETHODCALLTYPE Buffer(IAudioRenderClient*, UINT32, BYTE**) { return E_NOTIMPL; }
 HRESULT STDMETHODCALLTYPE Original(IAudioRenderClient* client, UINT32 frames, DWORD flags) {
     received = client;
     frameCount = frames;
@@ -22,6 +25,13 @@ int main() {
     IAudioRenderClientVtbl table{};
     table.ReleaseBuffer = Original;
     IAudioRenderClient client{&table};
+    bool rejected = false;
+    try { Probe(&client); } catch (const std::runtime_error&) { rejected = true; }
+    assert(rejected && GetState().count == 0);
+    table.QueryInterface = Query;
+    table.AddRef = Reference;
+    table.Release = Reference;
+    table.GetBuffer = Buffer;
     Install(&client);
     Install(&client);
     assert(GetState().count == 1);

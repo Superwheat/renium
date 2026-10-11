@@ -1,0 +1,33 @@
+name: Studio native canary
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '43 6 * * *'
+permissions:
+  contents: read
+concurrency:
+  group: studio-native-canary
+  cancel-in-progress: false
+jobs:
+  windows:
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          clean: false
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Build the candidate CLI and helpers
+        run: cargo build --locked --manifest-path tools/renium/Cargo.toml
+      - name: Probe current Studio deployment in a scratch installation
+        shell: pwsh
+        run: ./tools/renium/tests/native-canary.ps1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-canary-evidence
+          path: |
+            .native-canary/**/probes.json
+            .native-canary/**/summary.md
+            .native-canary/**/deployment.json
+            .native-canary/**/rbxPkgManifest.txt

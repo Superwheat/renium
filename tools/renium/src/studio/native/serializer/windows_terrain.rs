@@ -114,31 +114,42 @@ pub(crate) fn prepare_terrain(
         .context("Missing Studio")?;
     let layout = package_layout(&studio.path)?;
     let model = active_data_model(pid, &property.memory, studio, layout.data, title)?;
+    property.memory.authorize(NativeOperation::Terrain, title)?;
+    let instance = read_u64(&property.parameters, 16)? as usize;
+    let output = terrain_bindings(&property.memory, studio, &layout, &model, instance)?;
+    Ok(NativeTerrain {
+        fingerprint: [0; 64],
+        property,
+        bindings: output,
+    })
+}
+
+fn terrain_bindings(
+    memory: &ProcessMemory,
+    studio: &ModuleEntry,
+    layout: &PackageLayout,
+    model: &ActiveDataModel,
+    instance: usize,
+) -> Result<Vec<u8>> {
     let mut output = Vec::with_capacity(96);
     for name in ["SmoothGrid", "PhysicsGrid"] {
-        let descriptor = find_class_member_descriptor(
-            &property.memory,
-            read_u64(&property.parameters, 16)? as usize,
-            model.layout,
-            name,
-        )?;
+        let descriptor = find_class_member_descriptor(memory, instance, model.layout, name)?;
         anyhow::ensure!(
-            read_rtti_type(&property.memory, descriptor, studio.base, studio.size).as_deref()
+            read_rtti_type(memory, descriptor, studio.base, studio.size).as_deref()
                 == Some(
                     ".?AV?$PropDescriptor@VMegaClusterInstance@RBX@@VBinaryString@2@@Reflection@RBX@@"
                 ),
             "Unsupported Terrain property type"
         );
-        let candidates=bindings(&property.memory,studio,descriptor)?.into_iter().filter(|(_,binding)| read_rtti_type(&property.memory,*binding,studio.base,studio.size).as_deref()==Some(".?AV?$GetSetImpl@P8TerrainProp@RBX@@EBA?AVBinaryString@2@XZP812@EAAXV32@@Z@?$PropDescriptor@VMegaClusterInstance@RBX@@VBinaryString@2@@Reflection@RBX@@")).collect::<Vec<_>>();
+        let candidates=bindings(memory,studio,descriptor)?.into_iter().filter(|(_,binding)| read_rtti_type(memory,*binding,studio.base,studio.size).as_deref()==Some(".?AV?$GetSetImpl@P8TerrainProp@RBX@@EBA?AVBinaryString@2@XZP812@EAAXV32@@Z@?$PropDescriptor@VMegaClusterInstance@RBX@@VBinaryString@2@@Reflection@RBX@@")).collect::<Vec<_>>();
         let fields = candidates
             .iter()
             .map(|(field, _)| *field)
             .collect::<Vec<_>>();
-        let table = property.memory.read_u64(descriptor)? as usize;
+        let table = memory.read_u64(descriptor)? as usize;
         let mut found = HashSet::new();
-        for slot in (16..256).step_by(8) {
-            let target = property.memory.read_u64(table + slot)? as usize;
-            if let Ok(code) = verified_code(&property.memory, studio, &layout, target, 512)
+        for target in vtable_methods(memory, studio, layout, table)? {
+            if let Ok(code) = verified_code(memory, studio, layout, target, 512)
                 && let Some(result) = copy_calls(&code, &fields)
             {
                 found.insert(result);
@@ -154,82 +165,84 @@ pub(crate) fn prepare_terrain(
             .find(|(offset, _)| *offset == field)
             .unwrap()
             .1;
-        let table = property.memory.read_u64(binding)? as usize;
-        let get = property.memory.read_u64(table + get_slot)? as usize;
-        let set = property.memory.read_u64(table + set_slot)? as usize;
-        verified_code(&property.memory, studio, &layout, get, 128)?;
-        verified_code(&property.memory, studio, &layout, set, 256)?;
+        let table = memory.read_u64(binding)? as usize;
+        let get = memory.read_u64(table + get_slot)? as usize;
+        let set = memory.read_u64(table + set_slot)? as usize;
+        verified_code(memory, studio, layout, get, 128)?;
+        verified_code(memory, studio, layout, set, 256)?;
         for value in [binding, table, get, set, get_slot, set_slot] {
             output.extend_from_slice(&(value as u64).to_le_bytes());
         }
     }
-    let clear = find_class_member_descriptor(
-        &property.memory,
-        read_u64(&property.parameters, 16)? as usize,
-        model.layout,
-        "Clear",
-    )?;
+    let clear = find_class_member_descriptor(memory, instance, model.layout, "Clear")?;
     anyhow::ensure!(
-        read_rtti_type(&property.memory, clear, studio.base, studio.size).as_deref()
+        read_rtti_type(memory, clear, studio.base, studio.size).as_deref()
             == Some(
                 ".?AV?$BoundFuncDesc@VMegaClusterInstance@RBX@@$$A6AXXZ$0A@$0A@@Reflection@RBX@@"
             ),
         "Unsupported Terrain Clear ABI"
     );
-    let fields = property.memory.read_vec(clear, 264)?;
-    let mut methods = Vec::new();
-    for offset in (64..256).step_by(8) {
-        let target = read_u64(&fields, offset)? as usize;
-        if read_i32(&fields, offset + 8)? == 0
-            && verified_code(&property.memory, studio, &layout, target, 64).is_ok()
+    let clear_table = memory.read_u64(clear)? as usize;
+    let mut dispatchers = Vec::new();
+    for (slot, method) in vtable_methods(memory, studio, layout, clear_table)?
+        .into_iter()
+        .enumerate()
+    {
+        if let Ok(code) = functions::dispatch_code(memory, studio, layout, method)
+            && functions::void_dispatch_field(&code).is_some()
         {
-            methods.push((offset, target));
+            dispatchers.push((slot * 8, method));
         }
     }
     anyhow::ensure!(
-        methods.len() == 1,
-        "Terrain Clear member is missing or ambiguous"
+        dispatchers.len() == 1,
+        "Terrain Clear has no unique verified void dispatcher"
     );
-    let (offset, target) = methods[0];
-    for value in [
-        clear,
-        property.memory.read_u64(clear)? as usize,
-        offset,
-        target,
-    ] {
+    let (slot, target) = dispatchers[0];
+    // Low bit selects the engine dispatcher ABI; aligned legacy member offsets
+    // remain available on macOS, which uses a different member-pointer ABI.
+    let offset = slot | 1;
+    for value in [clear, memory.read_u64(clear)? as usize, offset, target] {
         output.extend_from_slice(&(value as u64).to_le_bytes());
     }
-    let acquisition = prepare_property(pid, title, path, ordinals, "AcquisitionMethod", timeout)?;
-    acquisition.ensure_writable()?;
-    let data = &acquisition.parameters;
-    let table = read_u64(data, 64)? as usize;
-    let get = read_u64(data, 48)? as usize;
-    let set = read_u64(data, 65904)? as usize;
+    let descriptor =
+        find_class_member_descriptor(memory, instance, model.layout, "AcquisitionMethod")?;
+    let (get, set) = reflection_functions(memory, studio, layout, descriptor)?;
+    anyhow::ensure!(
+        set != 0,
+        "Terrain acquisition metadata setter is unavailable"
+    );
+    let table = memory.read_u64(descriptor)? as usize;
+    let metadata_methods = vtable_methods(memory, studio, layout, table)?;
     let slot = |function| -> Result<usize> {
         let mut matches = Vec::new();
-        for offset in (16..256).step_by(8) {
-            if acquisition.memory.read_u64(table + offset)? as usize == function {
-                matches.push(offset);
+        for (index, method) in metadata_methods.iter().enumerate() {
+            if *method == function {
+                matches.push(index * 8);
             }
         }
         anyhow::ensure!(matches.len() == 1, "Ambiguous Terrain metadata binding");
         Ok(matches[0])
     };
-    for value in [
-        read_u64(data, 40)? as usize,
-        table,
-        get,
-        set,
-        slot(get)?,
-        slot(set)?,
-    ] {
+    for value in [descriptor, table, get, set, slot(get)?, slot(set)?] {
         output.extend_from_slice(&(value as u64).to_le_bytes());
     }
-    Ok(NativeTerrain {
-        fingerprint: [0; 64],
-        property,
-        bindings: output,
-    })
+    Ok(output)
+}
+
+pub(in super::super) fn probe(
+    memory: &ProcessMemory,
+    studio: &ModuleEntry,
+    layout: &PackageLayout,
+    model: &ActiveDataModel,
+) -> Result<serde_json::Value> {
+    let path = resolve_path(memory, model, &["Workspace".into(), "Terrain".into()], &[])?;
+    let instance = path.last().context("Terrain is missing")?.instance;
+    let bindings = terrain_bindings(memory, studio, layout, model, instance)?;
+    Ok(
+        serde_json::json!({"instance": instance, "bindings": bindings.chunks_exact(8)
+        .map(|word| u64::from_le_bytes(word.try_into().unwrap())).collect::<Vec<_>>()}),
+    )
 }
 
 impl NativeTerrain {

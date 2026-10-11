@@ -11,12 +11,70 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
 
+use super::probes::NativeOperation;
 use crate::app::timing::current_millis;
 use crate::studio::native::snapshot::{
     NativeSnapshot, NativeSnapshotRoots, finalize_native_snapshot, temporary_output_path,
 };
 use crate::system::LockRecover;
 use crate::system::files::{atomic_write_file, sha256_hex};
+
+pub(super) fn probe_operation(
+    pid: u32,
+    title: &str,
+    operation: NativeOperation,
+) -> Result<serde_json::Value> {
+    use serde_json::json;
+    match operation {
+        NativeOperation::DescriptorBinding
+        | NativeOperation::History
+        | NativeOperation::VoxelHistory
+        | NativeOperation::Terrain
+        | NativeOperation::TerrainObservation => properties::probe_operation(pid, title, operation),
+        NativeOperation::Snapshot | NativeOperation::Capture => {
+            let trace = trace_studio(&process_executable_path(pid)?)?;
+            let result = properties::probe_image_code(
+                pid,
+                title,
+                &[(trace.factory_rva, 64), (trace.execute_rva, 64)],
+            )?;
+            if operation == NativeOperation::Capture {
+                properties::probe_operation(pid, title, NativeOperation::DescriptorBinding)?;
+            }
+            Ok(result)
+        }
+        NativeOperation::PackageNotices => {
+            let (rva, uuid) = package_notice_flag(&process_executable_path(pid)?)?;
+            let value = properties::probe_image_value(pid, title, rva)?;
+            anyhow::ensure!(value <= 1, "Package notice flag is not boolean");
+            Ok(json!({"flagRva":rva,"imageUuid":uuid,"value":value}))
+        }
+        NativeOperation::AudioGate => {
+            let status = studio_audio(pid, crate::studio::audio::Action::Status)?;
+            if let Some(error) = status.error {
+                bail!("{error}");
+            }
+            Ok(json!({"contract":"process-local Core Audio interface","sessions":status.sessions}))
+        }
+        NativeOperation::Input | NativeOperation::ViewportCapture => {
+            let executable = process_executable_path(pid)?;
+            anyhow::ensure!(
+                executable.file_name().and_then(|name| name.to_str()) == Some("RobloxStudio"),
+                "Target is not Roblox Studio"
+            );
+            Ok(json!({"executable":executable,"contract":"PID-scoped macOS window APIs"}))
+        }
+        NativeOperation::StudioActions => {
+            bail!("Native Studio menu actions are unavailable on macOS")
+        }
+        NativeOperation::UndoSelection => undo_selection::probe(pid, title),
+        NativeOperation::ServiceReader
+        | NativeOperation::AttributeObservation
+        | NativeOperation::PackageActions => {
+            bail!("This macOS operation has no complete read-only compatibility probe")
+        }
+    }
+}
 
 #[path = "macos_properties.rs"]
 mod properties;
@@ -35,7 +93,7 @@ const LAUNCHER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-s
 const REQUEST_MAGIC: u32 = 0x4d4e4552;
 // Fence property-operation additions as well as the outer serializer header.
 // An already-open Studio can still have an older helper mapped after an update.
-const REQUEST_VERSION: u32 = 11;
+const REQUEST_VERSION: u32 = 12;
 
 fn native_helper_error(error: &str) -> String {
     if error.contains("invalid serializer request")
@@ -783,6 +841,7 @@ fn package_notice_flag(path: &Path) -> Result<(u64, [u8; 16])> {
 // Disable Studio's package-modification popup for the connected process
 // lifetime, like the Windows serializer does. Links and contents are untouched.
 pub(crate) fn suppress_package_notices(pid: u32) -> Result<()> {
+    super::probes::run(pid, "", NativeOperation::PackageNotices)?;
     let (rva, image_uuid) = package_notice_flag(&process_executable_path(pid)?)?;
     let socket_path = PathBuf::from(format!("/tmp/renium-studio-{pid}.sock"));
     let mut socket = UnixStream::connect(&socket_path).with_context(|| {
@@ -901,6 +960,9 @@ pub(crate) fn studio_audio(
     action: crate::studio::audio::Action,
 ) -> Result<crate::studio::audio::Status> {
     use crate::studio::audio::{Action, Status};
+    if action != Action::Status {
+        super::probes::run(pid, "", NativeOperation::AudioGate)?;
+    }
     let mut socket = UnixStream::connect(format!("/tmp/renium-studio-{pid}.sock")).context(
         "Audio control needs the current Renium helper; reopen this Studio window with `rbx ro`",
     )?;
@@ -1179,6 +1241,7 @@ pub(super) fn platform_package_action(
     action: super::PackageAction,
     timeout: Duration,
 ) -> Result<super::PackageActionResult> {
+    super::probes::run(pid, studio_title, NativeOperation::PackageActions)?;
     let started = Instant::now();
     let action_trace = trace_package_action(&process_executable_path(pid)?)?;
     let remaining = timeout
@@ -1206,6 +1269,7 @@ fn write_live_snapshot(
     output: &Path,
     service: Option<&str>,
 ) -> Result<NativeSnapshot> {
+    super::probes::run(pid, studio_title, NativeOperation::Snapshot)?;
     if output.exists() {
         bail!(
             "Refusing to overwrite existing native snapshot {}",

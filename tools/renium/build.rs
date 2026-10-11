@@ -135,6 +135,37 @@ fn build_windows(out_dir: &Path) {
         "Windows function ABI regression build",
     );
     println!("cargo:rerun-if-changed={}", function_test.display());
+    let allocator_engine = PathBuf::from("native/tests/allocator_engine_windows.cpp");
+    let allocator_test = PathBuf::from("native/tests/allocator_windows.cpp");
+    // A private fixture directory prevents the test allocator DLL from ever
+    // being found by the CLI/helper or other native regression executables.
+    let allocator_dir = out_dir.join("allocator-test");
+    std::fs::create_dir_all(&allocator_dir).expect("allocator fixture directory");
+    for (source, name, library) in [
+        (&allocator_engine, "mimalloc.dll", true),
+        (&allocator_test, "renium-allocator-test.exe", false),
+    ] {
+        let mut command = compiler.to_command();
+        command.args(["/nologo", "/O2", "/EHsc", "/std:c++20", "/MT"]);
+        if library {
+            command.arg("/LD");
+        }
+        command.arg(source);
+        command.arg(format!("/Fo{}\\", allocator_dir.display()));
+        command.arg(format!("/Fe{}", allocator_dir.join(name).display()));
+        command.args(["/link", "/INCREMENTAL:NO", "/Brepro"]);
+        if library {
+            command.arg(format!(
+                "/IMPLIB:{}",
+                allocator_dir.join("mimalloc.lib").display()
+            ));
+        } else {
+            command.arg(allocator_dir.join("mimalloc.lib"));
+        }
+        run(&mut command, "Windows allocator ownership regression build");
+        println!("cargo:rerun-if-changed={}", source.display());
+    }
+    println!("cargo:rerun-if-changed=native/renium_engine_allocator_windows.h");
     println!("cargo:rerun-if-changed={}", launch_source.display());
     println!("cargo:rerun-if-changed=native/renium_launch_windows_process.h");
     println!("cargo:rerun-if-changed={}", source.display());

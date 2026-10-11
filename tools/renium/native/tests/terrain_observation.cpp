@@ -65,6 +65,19 @@ int main() {
         };
         install();
         assert(relayCalls == index * 101);
+        // Old-generation callbacks can arrive after the instance's vptr was
+        // replaced. They must forward using the binding that installed them.
+        const auto installedTable = terrain[offsets[index] / 8];
+        terrain[offsets[index] / 8] = reinterpret_cast<std::uintptr_t>(oldGeneration.data() + 2);
+        const auto beforeForward = originalCalls;
+        { OwnWrite own(terrain.data()); Changed(terrain.data() + offsets[index] / 8, nullptr, 1); }
+        assert(originalCalls == beforeForward + 1);
+        oldGeneration[2] = reinterpret_cast<std::uintptr_t>(&Notify);
+        bool wrongInterface = false;
+        try { install(); } catch (const std::runtime_error&) { wrongInterface = true; }
+        assert(wrongInterface);
+        oldGeneration[2] = engine[2];
+        terrain[offsets[index] / 8] = installedTable;
         request.catchUp = 1;
         assert(GetBinding(terrain.data()).table == request.binding.table);
         assert(subscriptions.size() == 1);

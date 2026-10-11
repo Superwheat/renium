@@ -20,6 +20,7 @@
 #include <libkern/OSCacheControl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <dlfcn.h>
 #include "renium_signed_code_macos.h"
 #endif
 
@@ -31,7 +32,10 @@ struct Binding {
 };
 static_assert(sizeof(Binding) == 80);
 using Options = std::optional<std::shared_ptr<const void>>;
-using Finish = void (*)(void*, std::string, std::uint32_t, Options);
+// Nontrivial by-value arguments are indirect on the supported native ABIs.
+// Preserve those exact argument objects and their destruction responsibility:
+// making a new helper-owned string changes the allocator seen by Studio.
+using Finish = void (*)(void*, std::string*, std::uint32_t, Options*);
 using VoxelUndo = void (*)(void*, bool);
 
 // The engine uses MSVC/libc++ shared ownership on the respective platforms.
@@ -75,7 +79,16 @@ struct Registration {
 static std::mutex registrationsMutex;
 static std::mutex installationMutex;
 static std::unordered_map<std::string, Registration> registrations;
-static Binding installed{};
+#if defined(_WIN32)
+#define RENIUM_HISTORY_EXPORT __declspec(dllexport)
+#else
+#define RENIUM_HISTORY_EXPORT __attribute__((visibility("default")))
+#endif
+// Read-only host probes can certify the exact generation and original engine
+// binding even after the reflection slot points into this helper.
+extern "C" RENIUM_HISTORY_EXPORT const std::uint32_t ReniumHistoryAbiVersion = 2;
+extern "C" RENIUM_HISTORY_EXPORT Binding ReniumHistoryBinding{};
+static Binding& installed = ReniumHistoryBinding;
 static Finish originalFinish = nullptr;
 static VoxelUndo originalVoxelUndo = nullptr;
 static std::mutex playbackMutex;
@@ -109,6 +122,37 @@ static void Prune() {
     // Releasing an engine object can run callbacks; never do it under our lock.
 }
 
+extern "C" RENIUM_HISTORY_EXPORT bool ReniumHistoryHasRegistrations() {
+    Prune();
+    std::lock_guard lock(registrationsMutex);
+    return !registrations.empty();
+}
+
+static Finish CertifiedPredecessor(std::uintptr_t current, const Binding& binding) {
+#if defined(_WIN32)
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(current), &module)) return nullptr;
+    const auto symbol = [module](const char* name) { return reinterpret_cast<void*>(GetProcAddress(module, name)); };
+#else
+    Dl_info info{};
+    if (!dladdr(reinterpret_cast<void*>(current), &info) || !info.dli_fname) return nullptr;
+    void* module = dlopen(info.dli_fname, RTLD_LAZY | RTLD_NOLOAD);
+    if (!module) return nullptr;
+    struct Close { void* module; ~Close() { dlclose(module); } } close{module};
+    const auto symbol = [module](const char* name) { return dlsym(module, name); };
+#endif
+    const auto version = static_cast<const std::uint32_t*>(symbol("ReniumHistoryAbiVersion"));
+    const auto previous = static_cast<const Binding*>(symbol("ReniumHistoryBinding"));
+    const auto hook = symbol("ReniumHistoryFinish");
+    const auto active = reinterpret_cast<bool (*)()>(symbol("ReniumHistoryHasRegistrations"));
+    if (!version || *version != 2 || !previous || !active || reinterpret_cast<std::uintptr_t>(hook) != current
+        || std::memcmp(previous, &binding, sizeof(binding))) return nullptr;
+    // Preserve pending older-generation Terrain rollbacks. An idle predecessor
+    // can be bypassed immediately, so routine reconnects do not grow a chain.
+    return reinterpret_cast<Finish>(active() ? current : binding.finish);
+}
+
 static Binding GetBinding() {
     Prune();
     std::lock_guard lock(installationMutex);
@@ -125,7 +169,8 @@ static void UndoVoxels(void* entry, bool backwards) {
     originalVoxelUndo(entry, backwards);
 }
 
-static void FinishRecording(void* history, std::string token, std::uint32_t operation, Options options) {
+extern "C" RENIUM_HISTORY_EXPORT void ReniumHistoryFinish(void* history, std::string* engineToken, std::uint32_t operation, Options* options) {
+    const std::string token(*engineToken);
     std::optional<Registration> registration;
     {
         std::lock_guard lock(registrationsMutex);
@@ -148,7 +193,7 @@ static void FinishRecording(void* history, std::string token, std::uint32_t oper
         // Skipping the engine's voxel playback is only an optimization; the
         // explicit restoration below is the final voxel state either way.
         CancellationScope scope(registration && operation == 0 && originalVoxelUndo ? history : nullptr);
-        originalFinish(history, token, operation, std::move(options));
+        originalFinish(history, engineToken, operation, options);
     }
     if (registration && operation == 0 && registration->rollbackTerrain)
         registration->rollbackTerrain();
@@ -319,15 +364,17 @@ template<class Read>
 static void Register(const Binding& binding, void* history, std::uintptr_t model, void* modelOwner, std::string token, Read read) {
     Prune();
     std::lock_guard installationLock(installationMutex);
-    if (token.empty() || token.size() > 256 || binding.memberOffset < 64 || binding.memberOffset >= 256 ||
+    if (token.empty() || token.size() > 256 || binding.memberOffset < 8 || binding.memberOffset > 65520 ||
         binding.memberOffset % 8 ||
         (binding.voxelUndo && (binding.prefixSize < Jump(0).size() || binding.prefixSize > sizeof(binding.prefix))))
         throw std::runtime_error("Invalid Studio history binding");
     if (!originalFinish) {
         std::uintptr_t value = 0;
+        Finish forward = reinterpret_cast<Finish>(binding.finish);
         std::array<unsigned char, 32> prefix{};
         if (!read(binding.descriptor, &value, sizeof(value)) || value != binding.table ||
-            !read(binding.descriptor + binding.memberOffset, &value, sizeof(value)) || value != binding.finish ||
+            !read(binding.descriptor + binding.memberOffset, &value, sizeof(value)) ||
+            (value != binding.finish && !(forward = CertifiedPredecessor(value, binding))) ||
 #if !defined(_WIN32)
             !read(binding.descriptor + binding.memberOffset + 8, &value, sizeof(value)) || value != 0 ||
 #endif
@@ -342,9 +389,9 @@ static void Register(const Binding& binding, void* history, std::uintptr_t model
             originalVoxelUndo = reinterpret_cast<VoxelUndo>(Trampoline(binding));
             ReplaceCode(binding.voxelUndo, jump);
         }
-        originalFinish = reinterpret_cast<Finish>(binding.finish);
+        originalFinish = forward;
         std::atomic_ref<std::uintptr_t>(*reinterpret_cast<std::uintptr_t*>(binding.descriptor + binding.memberOffset))
-            .store(reinterpret_cast<std::uintptr_t>(&FinishRecording), std::memory_order_release);
+            .store(reinterpret_cast<std::uintptr_t>(&ReniumHistoryFinish), std::memory_order_release);
     } else if (binding.descriptor != installed.descriptor || binding.voxelUndo != installed.voxelUndo) {
         throw std::runtime_error("Studio history registration targets another engine binding");
     }

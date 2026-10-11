@@ -46,6 +46,9 @@ pub(crate) fn observe_terrain(
         property.class_name == "Terrain",
         "Voxel observer target is not Terrain"
     );
+    property
+        .memory
+        .authorize(NativeOperation::TerrainObservation, title)?;
     property.invoke(8)?;
     let mut bytes = property.parameters[96..128].to_vec();
     if bytes.iter().all(|v| *v == 0) {
@@ -83,6 +86,30 @@ fn binding(property: &NativeProperty, pid: u32) -> Result<Vec<u8>> {
     let layout = package_layout(&studio.path)?;
     let memory = &property.memory;
     let instance = read_u64(&property.parameters, 16)? as usize;
+    binding_for_instance(memory, studio, &layout, instance)
+}
+
+pub(super) fn probe_binding(
+    memory: &ProcessMemory,
+    studio: &ModuleEntry,
+    layout: &PackageLayout,
+    model: &ActiveDataModel,
+) -> Result<Vec<u8>> {
+    let terrain = resolve_path(memory, model, &["Workspace".into(), "Terrain".into()], &[])?;
+    binding_for_instance(
+        memory,
+        studio,
+        layout,
+        terrain.last().context("Missing Terrain")?.instance,
+    )
+}
+
+fn binding_for_instance(
+    memory: &ProcessMemory,
+    studio: &ModuleEntry,
+    layout: &PackageLayout,
+    instance: usize,
+) -> Result<Vec<u8>> {
     let primary = memory.read_u64(instance)? as usize;
     let locator = memory.read_u64(primary - 8)? as usize;
     anyhow::ensure!(memory.read_u32(locator)? == 1, "Unsupported Terrain RTTI");
@@ -112,7 +139,7 @@ fn binding(property: &NativeProperty, pid: u32) -> Result<Vec<u8>> {
     let table = original_listener_table(
         memory,
         studio,
-        &layout,
+        layout,
         memory.read_u64(instance + offset)? as usize,
     )?;
     let secondary = memory.read_u64(table - 8)? as usize;
@@ -125,7 +152,7 @@ fn binding(property: &NativeProperty, pid: u32) -> Result<Vec<u8>> {
     let mut slots = Vec::new();
     for slot in (0..128).step_by(8) {
         let target = memory.read_u64(table + slot)? as usize;
-        let Ok(code) = verified_code(memory, studio, &layout, target, 256) else {
+        let Ok(code) = verified_code(memory, studio, layout, target, 256) else {
             break;
         };
         count += 1;

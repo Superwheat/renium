@@ -321,6 +321,11 @@ pub(super) enum Commands {
     #[command(hide = true, name = "native-package")]
     NativePackage(NativePackageArgs),
     #[command(
+        name = "native-probe",
+        about = "Read-only compatibility probes for a selected Studio process"
+    )]
+    NativeProbe(NativeProbeArgs),
+    #[command(
         name = "ip",
         alias = "import-path",
         about = "Import a script file or directory into the project"
@@ -2196,6 +2201,24 @@ pub(super) struct StudioChangeStateArgs {
         value_name = "none|studio|editor"
     )]
     pub(super) initial_conflict_preference: Option<String>,
+}
+
+#[derive(Parser)]
+pub(crate) struct NativeProbeArgs {
+    #[arg(long, required_unless_present = "launch", conflicts_with = "launch")]
+    pub(crate) pid: Option<u32>,
+    #[arg(
+        long,
+        requires = "file",
+        help = "Launch this scratch Studio executable with the background launch guard"
+    )]
+    pub(crate) launch: Option<PathBuf>,
+    #[arg(long, requires = "launch", help = "Scratch place for --launch")]
+    pub(crate) file: Option<PathBuf>,
+    #[arg(long)]
+    pub(crate) title: Option<String>,
+    #[arg(long, help = "Exit with failure if any operation is degraded")]
+    pub(crate) require_native: bool,
 }
 
 #[derive(Parser)]

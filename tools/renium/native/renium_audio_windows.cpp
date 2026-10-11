@@ -72,7 +72,23 @@ void Check(HRESULT result, const char* operation) {
     }
 }
 
+// A COM interface is an OS ABI, independent of Studio's engine layout. Read
+// every declared entry before changing its ReleaseBuffer slot. Do not accept
+// heap pointers, unmapped pages, or an object from an unsupported driver ABI.
+void Probe(IAudioRenderClient* client) {
+    if (!client || !client->lpVtbl) throw std::runtime_error("Audio render interface is missing");
+    const auto entries = reinterpret_cast<const void* const*>(client->lpVtbl);
+    for (std::size_t index = 0; index < sizeof(IAudioRenderClientVtbl) / sizeof(void*); ++index) {
+        MEMORY_BASIC_INFORMATION page{};
+        if (!VirtualQuery(entries[index], &page, sizeof(page)) || page.State != MEM_COMMIT ||
+            (page.Protect & (PAGE_GUARD | PAGE_NOACCESS)) ||
+            !(page.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+            throw std::runtime_error("Audio render vtable failed its read-only executable-page probe");
+    }
+}
+
 void Install(IAudioRenderClient* client) {
+    Probe(client);
     auto& state = GetState();
     auto* slot = const_cast<decltype(IAudioRenderClientVtbl::ReleaseBuffer)*>(&client->lpVtbl->ReleaseBuffer);
     auto original = *slot;

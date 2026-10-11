@@ -1,21 +1,12 @@
 use super::*;
 
 #[test]
-fn native_build_gate_rejects_newer_studio_builds() {
-    for build in [740, 741] {
-        assert!(native_build_verified(build), "0.{build}");
-    }
-    for build in [742, 743, u32::MAX] {
-        assert!(!native_build_verified(build), "0.{build}");
-    }
-}
-
-#[test]
 fn native_gate_rejects_writes_allocations_and_both_thread_ownership_modes() {
     // Invalid handles/addresses must never reach a Windows mutation API.
     let memory = std::mem::ManuallyDrop::new(ProcessMemory {
         handle: null_mut(),
-        verified: false,
+        pid: 0,
+        verified: Cell::new(false),
     });
     assert_eq!(
         memory.write(0, &[1]).unwrap_err().to_string(),
@@ -48,7 +39,8 @@ fn native_gate_rejects_writes_allocations_and_both_thread_ownership_modes() {
 fn native_gate_rejects_new_and_resident_helpers() {
     let memory = std::mem::ManuallyDrop::new(ProcessMemory {
         handle: null_mut(),
-        verified: false,
+        pid: 0,
+        verified: Cell::new(false),
     });
     let path = Path::new("resident-helper.dll");
     let resident = [ModuleEntry {
@@ -73,7 +65,8 @@ fn native_gate_rejects_new_and_resident_helpers() {
     );
     let verified = std::mem::ManuallyDrop::new(ProcessMemory {
         handle: null_mut(),
-        verified: true,
+        pid: 0,
+        verified: Cell::new(true),
     });
     assert_eq!(
         ensure_library_loaded(0, &verified, &resident, 0, path).unwrap(),
@@ -82,89 +75,17 @@ fn native_gate_rejects_new_and_resident_helpers() {
 }
 
 #[test]
-fn native_snapshots_and_capture_reject_unknown_builds_before_discovery() {
-    // The test process has no Studio version. Exercise both public snapshot
-    // paths without opening or modifying any running Studio.
+fn read_only_probes_refuse_non_studio_processes_without_loading_a_helper() -> Result<()> {
     let pid = std::process::id();
-    let output = std::env::temp_dir().join(format!("renium-unverified-snapshot-{pid}.rbxl"));
-    assert!(!output.exists());
-    for result in [
-        write_live_place(pid, "", &output),
-        write_live_service(pid, "", "Workspace", &output),
-    ] {
-        assert_eq!(result.err().unwrap().to_string(), NATIVE_WRITES_DISABLED);
-    }
-    assert_eq!(
-        capture_live_services(pid, "", &["Workspace".into()], Duration::from_secs(1))
-            .err()
-            .unwrap()
-            .to_string(),
-        NATIVE_WRITES_DISABLED
-    );
-    assert!(!output.exists());
-}
-
-#[test]
-fn native_gate_preserves_the_windows_audio_exemption() -> Result<()> {
-    let pid = std::process::id();
-    assert!(!ProcessMemory::open(pid)?.verified);
-    let audio = ProcessMemory::open_for_windows_audio(pid)?;
-    audio.ensure_writes_verified()?;
-    // Keep the exempt handle alive while reopening for an engine operation.
-    // Neither the audio permission nor the once-per-PID warning grants access.
-    for _ in 0..2 {
-        assert!(!ProcessMemory::open(pid)?.verified);
-    }
-    Ok(())
-}
-
-/// Run only against an owned scratch Studio, never a working place:
-/// `RENIUM_PROBE_PID=PID RENIUM_PROBE_PLACE=PATH cargo test
-/// live_unverified_studio_snapshot_gate -- --ignored --nocapture`.
-#[test]
-#[ignore = "requires an explicitly selected scratch Studio on an unverified build"]
-fn live_unverified_studio_snapshot_gate() -> Result<()> {
-    let pid: u32 = std::env::var("RENIUM_PROBE_PID")?.parse()?;
-    let place = fs::canonicalize(std::env::var("RENIUM_PROBE_PLACE")?)?;
-    let title = crate::studio::input::studio_window_title(pid)?;
-    let title_place = title
-        .strip_suffix(" - Roblox Studio")
-        .context("Expected a local scratch place window")?;
-    assert_eq!(fs::canonicalize(title_place)?, place);
-    let build = studio_build_number(pid)?;
-    assert!(
-        !native_build_verified(build),
-        "Studio 0.{build} is verified"
-    );
-    let output = place.with_file_name("snapshot-gate-refused.rbxl");
-    assert!(!output.exists());
-    let helper_modules = || -> Result<Vec<PathBuf>> {
-        Ok(modules(pid)?
-            .into_iter()
-            .filter(|module| module.name.starts_with("renium-studio-helper-"))
-            .map(|module| module.path)
-            .collect())
-    };
-    assert!(helper_modules()?.is_empty(), "Use a fresh scratch Studio");
-    let before = fs::read(&place)?;
-    // Opening the audio-exempt handle does not invoke or install an audio hook.
-    let audio = ProcessMemory::open_for_windows_audio(pid)?;
-    audio.ensure_writes_verified()?;
-    for attempt in 1..=2 {
-        for result in [
-            write_live_place(pid, &title, &output),
-            write_live_service(pid, &title, "Workspace", &output),
-        ] {
-            assert_eq!(result.err().unwrap().to_string(), NATIVE_WRITES_DISABLED);
-        }
-        assert!(!output.exists());
-        assert!(helper_modules()?.is_empty());
-        println!(
-            "pid={pid} build=0.{build} attempt={attempt}: place/service snapshots refused, no helper loaded"
+    let before = modules(pid)?.len();
+    for operation in NativeOperation::ALL {
+        let error = probe_operation(pid, "", operation).unwrap_err().to_string();
+        assert!(
+            error.contains("not Roblox Studio"),
+            "{operation:?}: {error}"
         );
     }
-    assert_eq!(fs::read(&place)?, before);
-    assert_eq!(crate::studio::input::studio_window_title(pid)?, title);
+    assert_eq!(before, modules(pid)?.len());
     Ok(())
 }
 
@@ -264,6 +185,218 @@ fn probe_reflection_members() -> Result<()> {
                 Err(error) => println!("{class}.{name}: {error:#}"),
             }
         }
+    }
+    Ok(())
+}
+
+/// Explicitly opt into exercising only a dedicated scratch Studio.
+#[test]
+#[ignore]
+fn exercise_native_scratch_capture() -> Result<()> {
+    let pid: u32 = std::env::var("RENIUM_NATIVE_TARGET_PID")?.parse()?;
+    let title = crate::studio::input::studio_window_title(pid)?;
+    anyhow::ensure!(
+        title.contains("astra-native-") || title.contains("renium-native-canary-"),
+        "A dedicated scratch place is required"
+    );
+    let directory = PathBuf::from(std::env::var("RENIUM_NATIVE_ARTIFACTS")?);
+    fs::create_dir_all(&directory)?;
+    let start = Instant::now();
+    for index in 0..20 {
+        let capture = capture_live_services(
+            pid,
+            &title,
+            &["Workspace".into(), "ServerScriptService".into()],
+            Duration::from_secs(30),
+        )?;
+        assert!(!capture.identities.is_empty());
+        if index == 0 || index == 19 {
+            println!(
+                "capture {index}: {} rows",
+                capture.identities.len() / CAPTURE_ROW_SIZE
+            );
+        }
+    }
+    let output = directory.join(format!(
+        "native-{pid}-{}.rbxl",
+        crate::app::timing::current_millis()
+    ));
+    let result = write_live_place(pid, &title, &output)?;
+    assert!(result.instance_count > 0);
+    println!(
+        "snapshot: {} instances, {} bytes; 20 captures + snapshot {:.3}s; {}",
+        result.instance_count,
+        result.output_size,
+        start.elapsed().as_secs_f64(),
+        output.display()
+    );
+    Ok(())
+}
+
+/// Exercise engine-owned strings and the Terrain dispatcher only in a canary.
+#[test]
+#[ignore]
+fn exercise_native_scratch_properties_and_terrain() -> Result<()> {
+    use rbx_dom_weak::types::Variant;
+    let pid: u32 = std::env::var("RENIUM_NATIVE_TARGET_PID")?.parse()?;
+    let title = crate::studio::input::studio_window_title(pid)?;
+    anyhow::ensure!(
+        title.contains("astra-native-") || title.contains("renium-native-canary-"),
+        "A dedicated scratch place is required"
+    );
+    let directory = PathBuf::from(std::env::var("RENIUM_NATIVE_ARTIFACTS")?);
+    fs::create_dir_all(&directory)?;
+    let mut property = prepare_property(
+        pid,
+        &title,
+        &["ServerScriptService".into()],
+        &[],
+        "Name",
+        Duration::from_secs(60),
+    )?;
+    for _ in 0..100 {
+        assert_eq!(property.read()?, "ServerScriptService");
+    }
+    println!("100 engine-owned heap-string reads passed");
+
+    let snapshot = directory.join(format!(
+        "terrain-before-{pid}-{}.rbxl",
+        crate::app::timing::current_millis()
+    ));
+    write_live_place(pid, &title, &snapshot)?;
+    let dom = rbx_binary::from_reader(std::io::BufReader::new(fs::File::open(snapshot)?))?;
+    let original = dom
+        .descendants()
+        .find(|node| node.class == "Terrain")
+        .context("Scratch snapshot has no Terrain")?;
+    let bytes = |name: &str| -> Result<Vec<u8>> {
+        match original.properties.get(&name.into()) {
+            Some(Variant::BinaryString(value)) => {
+                let bytes: &[u8] = value.as_ref();
+                Ok(bytes.to_vec())
+            }
+            None => Ok(Vec::new()),
+            _ => bail!("Unexpected Terrain {name} representation"),
+        }
+    };
+    let smooth = bytes("SmoothGrid")?;
+    let physics = bytes("PhysicsGrid")?;
+    let token = format!(
+        "native-canary-terrain-{}",
+        crate::app::timing::current_millis()
+    );
+    register_history(pid, &title, &token)?;
+    let mut terrain = prepare_terrain(
+        pid,
+        &title,
+        &["Workspace".into(), "Terrain".into()],
+        &[],
+        Duration::from_secs(60),
+    )?;
+    assert!(!terrain.write(&token, None, None)?);
+    let fingerprint = terrain.fingerprint();
+    // One canonical v1 chunk, 128 runs of 256 solid material-1 cells.
+    let mut changed = vec![1, 5];
+    changed.extend_from_slice(&[0; 12]);
+    for _ in 0..128 {
+        changed.extend_from_slice(&[0x81, 255]);
+    }
+    if smooth == changed {
+        changed[13] = 1;
+    }
+    let result = terrain.write(&token, Some(&changed), None);
+    println!(
+        "Terrain mutation: {result:?}; saved grids {} / {} bytes",
+        smooth.len(),
+        physics.len()
+    );
+    // These are two standalone writes. Let deferred physics work settle, then
+    // give restoration its own guard instead of reusing the first write's state.
+    std::thread::sleep(Duration::from_millis(100));
+    let restore = format!("{token}-restore");
+    register_history(pid, &title, &restore)?;
+    terrain
+        .write(&restore, None, None)
+        .context("Read restoration baseline")?;
+    terrain
+        .write(&restore, Some(&smooth), Some(&physics))
+        .context("Restore saved Terrain grids")?;
+    assert_eq!(terrain.fingerprint(), fingerprint);
+    assert!(result?);
+    println!("Terrain Clear/replace/restore passed; original fingerprint {fingerprint}");
+    Ok(())
+}
+
+#[test]
+fn serializer_discovery_follows_relocated_calls_and_callback_slots() -> Result<()> {
+    for (call_at, lea_at, slot) in [(8usize, 16usize, 0usize), (64, 48, 32)] {
+        let mut bytes = vec![0; 768];
+        bytes[..512].fill(0x90);
+        let call = |bytes: &mut [u8], offset: usize, target: usize| {
+            bytes[offset] = 0xe8;
+            bytes[offset + 1..offset + 5]
+                .copy_from_slice(&((target as i32) - (0x1000 + offset + 5) as i32).to_le_bytes());
+        };
+        call(&mut bytes, call_at, 0x1080);
+        bytes[128..132].copy_from_slice(&[0x55, 0x48, 0x89, 0xe5]);
+        let lea = 128 + lea_at;
+        bytes[lea..lea + 3].copy_from_slice(&[0x48, 0x8d, 0x0d]);
+        bytes[lea + 3..lea + 7]
+            .copy_from_slice(&(0x2000_i32 - (0x1000 + lea + 7) as i32).to_le_bytes());
+        bytes[256..260].copy_from_slice(&[0x48, 0x83, 0xec, 0x68]);
+        call(&mut bytes, 280, 0x11f0);
+        for offset in (0..=slot).step_by(8) {
+            put_u64(&mut bytes, 512 + offset, 0x1011e0);
+        }
+        put_u64(&mut bytes, 512 + slot, 0x101100);
+        for (index, (start, end)) in [(0x1000, 0x1050), (0x1080, 0x10d0), (0x1100, 0x1130)]
+            .into_iter()
+            .enumerate()
+        {
+            put_u32(&mut bytes, 640 + index * 12, start);
+            put_u32(&mut bytes, 644 + index * 12, end);
+        }
+        let image = PeImage {
+            bytes: &bytes,
+            image_base: 0x100000,
+            image_stamp: [1, 2, 3],
+            sections: vec![
+                PeSection {
+                    name: *b".text\0\0\0",
+                    virtual_address: 0x1000,
+                    virtual_size: 512,
+                    raw_offset: 0,
+                    raw_size: 512,
+                    characteristics: 0x2000_0000,
+                },
+                PeSection {
+                    name: *b".rdata\0\0",
+                    virtual_address: 0x2000,
+                    virtual_size: 128,
+                    raw_offset: 512,
+                    raw_size: 128,
+                    characteristics: 0,
+                },
+                PeSection {
+                    name: *b".pdata\0\0",
+                    virtual_address: 0x3000,
+                    virtual_size: 36,
+                    raw_offset: 640,
+                    raw_size: 36,
+                    characteristics: 0,
+                },
+            ],
+        };
+        assert_eq!(
+            unique_function_call(&image, 0x1000, &[0x55, 0x48, 0x89, 0xe5])?,
+            0x1080
+        );
+        assert_eq!(
+            serializer_callback(&image, 0x1080, &[0x48, 0x83, 0xec, 0x68])?,
+            0x1100
+        );
+        assert_eq!(direct_calls(&image, 0x1100)?, vec![0x11f0]);
+        assert!(serializer_callback(&image, 0x1080, &[0x48, 0x83, 0xec, 0x70]).is_err());
     }
     Ok(())
 }

@@ -27,6 +27,10 @@ static std::mutex tablesMutex;
 // Immutable clones contain no instance owners: one per engine interface.
 static std::unordered_map<std::uintptr_t, std::unique_ptr<Table>> tables;
 static std::unordered_map<void*, std::shared_ptr<Subscription>> subscriptions;
+struct Listener { Binding binding; std::shared_ptr<renium_history::WeakOwner> owner; };
+// A callback already dispatched to this helper must retain its original
+// binding even if a newer helper replaces the instance's vptr meanwhile.
+static std::unordered_map<void*, Listener> listeners;
 static std::unordered_map<void*, std::size_t> ownWrites;
 struct OwnWrite {
     void* terrain;
@@ -48,7 +52,13 @@ static Table* Find(std::uintptr_t vtable) {
 }
 
 static void Changed(void* listener, const void* region, std::uint32_t flags) {
-    const auto& binding = Find(*reinterpret_cast<std::uintptr_t*>(listener))->binding;
+    Binding binding{};
+    {
+        std::lock_guard lock(tablesMutex);
+        const auto found = listeners.find(listener);
+        if (found == listeners.end()) return;
+        binding = found->second.binding;
+    }
     reinterpret_cast<void (*)(void*, const void*, std::uint32_t)>(
         *reinterpret_cast<std::uintptr_t*>(binding.table + binding.slot))(listener, region, flags);
     auto terrain = static_cast<unsigned char*>(listener) - binding.offset;
@@ -100,8 +110,16 @@ static void Install(void* terrain, void* terrainOwner, const Request& request,
     // and replaced by a copy of the engine table rather than hooked in turn.
     const auto sameInterface = [&](std::uintptr_t table) {
         std::uintptr_t current = 0, original = 0;
-        return read(table - 8, &current, sizeof(current)) && read(binding.table - 8, &original, sizeof(original)) &&
-            current == original;
+        if (!read(table - 8, &current, sizeof(current)) || !read(binding.table - 8, &original, sizeof(original)) ||
+            current != original) return false;
+        // Shared RTTI alone does not prove a compatible interface. Only the
+        // notification slot may have been replaced by an earlier generation.
+        for (std::uintptr_t slot = 0; slot < binding.count * sizeof(std::uintptr_t); slot += sizeof(std::uintptr_t)) {
+            if (slot == binding.slot) continue;
+            if (!read(table + slot, &current, sizeof(current)) || !read(binding.table + slot, &original, sizeof(original)) ||
+                current != original) return false;
+        }
+        return true;
     };
     if (!relay.setter || !equal(relay.descriptor, relay.descriptorTable) ||
         (*listener != binding.table && (!existing || existing->binding.table != binding.table) &&
@@ -134,6 +152,10 @@ static void Install(void* terrain, void* terrainOwner, const Request& request,
         if (!it->second->terrainOwner->Alive() || !it->second->relayOwner->Alive()) it = subscriptions.erase(it);
         else ++it;
     }
+    for (auto it = listeners.begin(); it != listeners.end();) {
+        if (!it->second.owner->Alive()) it = listeners.erase(it);
+        else ++it;
+    }
     auto& table = tables[binding.table];
     if (!table) {
         auto next = std::make_unique<Table>();
@@ -146,6 +168,7 @@ static void Install(void* terrain, void* terrainOwner, const Request& request,
     } else if (std::memcmp(&table->binding, &binding, sizeof(binding))) {
         throw std::runtime_error("Conflicting Terrain notification layout");
     }
+    listeners[listener] = Listener{binding, subscription->terrainOwner};
     subscriptions[terrain] = std::move(subscription);
     *listener = reinterpret_cast<std::uintptr_t>(table->entries.data() + 2);
     lock.unlock();

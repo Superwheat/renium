@@ -192,20 +192,31 @@ fn run_cli() -> Result<()> {
         refresh_agent_instructions(cli.project.as_deref());
     }
 
-    if !matches!(
-        &cli.command,
-        Commands::AudioWorker(_) | Commands::AudioGlobalWorker | Commands::UpdateHelper(_)
-    ) && let Err(error) = studio::audio::global::resume()
+    if daemon::is_default_daemon()
+        && resumes_global_audio(&cli.command)
+        && let Err(error) = studio::audio::global::resume()
     {
         eprintln!("[renium] Global Studio audio could not resume: {error:#}");
     }
     cli::dispatch::dispatch(cli.command, cli.project.as_deref())
 }
 
+fn resumes_global_audio(command: &Commands) -> bool {
+    !matches!(
+        command,
+        Commands::AudioWorker(_)
+            | Commands::AudioGlobalWorker
+            | Commands::UpdateHelper(_)
+            | Commands::NativeProbe(_)
+            | Commands::BridgeDaemon(_)
+    )
+}
+
 fn checks_agent_update(command: &Commands) -> bool {
     !matches!(
         command,
         Commands::UpdateHelper(_)
+            | Commands::NativeProbe(_)
             | Commands::Plugin(_)
             | Commands::External(_)
             | Commands::CheckLuau(_)
@@ -255,6 +266,7 @@ fn checks_agent_instructions(command: &Commands) -> bool {
     !matches!(
         command,
         Commands::Init(_)
+            | Commands::NativeProbe(_)
             | Commands::ImportRojo(_)
             | Commands::Report(_)
             | Commands::Plugin(_)
@@ -275,4 +287,29 @@ fn checks_agent_instructions(command: &Commands) -> bool {
             | Commands::PerformanceHolder(_)
             | Commands::CursorPoll(_)
     )
+}
+
+#[cfg(test)]
+mod startup_policy_tests {
+    use super::*;
+
+    #[test]
+    fn native_probe_has_no_background_startup_work() {
+        let matches = cli::command()
+            .try_get_matches_from(["rbx", "native-probe", "--pid", "123"])
+            .unwrap();
+        let cli = Cli::from_arg_matches(&matches).unwrap();
+        assert!(!resumes_global_audio(&cli.command));
+        assert!(!checks_agent_update(&cli.command));
+        assert!(!checks_agent_instructions(&cli.command));
+    }
+
+    #[test]
+    fn daemon_startup_owns_its_background_policy() {
+        let matches = cli::command()
+            .try_get_matches_from(["rbx", "bd", "--name", "astra"])
+            .unwrap();
+        let cli = Cli::from_arg_matches(&matches).unwrap();
+        assert!(!resumes_global_audio(&cli.command));
+    }
 }

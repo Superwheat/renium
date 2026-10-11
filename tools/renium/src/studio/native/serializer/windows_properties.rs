@@ -11,13 +11,68 @@ mod history;
 
 #[path = "windows_functions.rs"]
 mod functions;
+pub(super) use functions::binding as function_binding;
 
 #[path = "windows_terrain.rs"]
 mod terrain;
 pub(crate) use terrain::prepare_terrain;
+pub(super) use terrain::probe as probe_terrain;
 #[path = "windows_terrain_observation.rs"]
 mod terrain_observation;
 pub(crate) use terrain_observation::observe_terrain;
+
+pub(super) fn probe_binding(
+    memory: &ProcessMemory,
+    studio: &ModuleEntry,
+    layout: &PackageLayout,
+    model: &ActiveDataModel,
+) -> Result<serde_json::Value> {
+    let instance = model.outer + model.layout.data_model_instance;
+    let descriptor = find_class_member_descriptor(memory, instance, model.layout, "Name")?;
+    let (getter, setter) = reflection_functions(memory, studio, layout, descriptor)?;
+    let (identity, identity_getter) = identity_binding(memory, studio, layout, model, instance)?;
+    let parent = parent_offset(memory, model)?;
+    Ok(serde_json::json!({
+        "descriptor": descriptor, "getter": getter, "setter": setter,
+        "identityBinding": identity, "identityGetter": identity_getter,
+        "parentOffset": parent,
+    }))
+}
+
+pub(super) fn probe_history(
+    memory: &ProcessMemory,
+    studio: &ModuleEntry,
+    layout: &PackageLayout,
+    model: &ActiveDataModel,
+) -> Result<Vec<u8>> {
+    history::probe_binding(memory, studio, layout, model)
+}
+
+pub(super) fn probe_terrain_observation(
+    memory: &ProcessMemory,
+    studio: &ModuleEntry,
+    layout: &PackageLayout,
+    model: &ActiveDataModel,
+) -> Result<Vec<u8>> {
+    terrain_observation::probe_binding(memory, studio, layout, model)
+}
+
+pub(super) fn member_binding(
+    memory: &ProcessMemory,
+    studio: &ModuleEntry,
+    layout: &PackageLayout,
+    descriptor: usize,
+) -> Result<(usize, usize)> {
+    complete_reflection_type(memory, studio, descriptor)
+        .context("Member descriptor is not a complete reflection object")?;
+    functions::binding(
+        memory,
+        studio,
+        layout,
+        descriptor,
+        memory.read_u64(descriptor)? as usize,
+    )
+}
 
 pub(crate) fn register_history(pid: u32, title: &str, token: &str) -> Result<()> {
     anyhow::ensure!(
@@ -32,6 +87,7 @@ pub(crate) fn register_history(pid: u32, title: &str, token: &str) -> Result<()>
         "Name",
         Duration::from_secs(3),
     )?;
+    prepared.memory.authorize(NativeOperation::History, title)?;
     prepared.invoke(6)?;
     let mut binding = prepared.parameters[96..176].to_vec();
     if binding.iter().all(|byte| *byte == 0) {
@@ -586,19 +642,415 @@ fn true_return(mut code: &[u8]) -> bool {
     code.starts_with(&[0xb0, 1, 0xc3]) || code.starts_with(&[0xb8, 1, 0, 0, 0, 0xc3])
 }
 
-fn bindings(
+// Only fields referenced by the descriptor's executable virtual methods are
+// candidates. The subsequent RTTI and getter ABI checks establish which field
+// is the binding; adjacent allocations and arbitrary descriptor windows do not.
+pub(super) fn referenced_pointer_fields(code: &[u8]) -> HashSet<(usize, usize)> {
+    let mut aliases = HashSet::from([Register::RCX]);
+    let mut pointers = HashMap::<Register, (usize, usize)>::new();
+    let mut fields = HashSet::new();
+    for i in Decoder::new(64, code, DecoderOptions::NONE) {
+        if i.is_invalid() {
+            break;
+        }
+        let loaded = if i.mnemonic() == Mnemonic::Mov
+            && i.op0_kind() == OpKind::Register
+            && i.op1_kind() == OpKind::Memory
+            && i.memory_index() == Register::None
+            && aliases.contains(&i.memory_base().full_register())
+            && i.memory_size().size() == 8
+        {
+            let offset = i.memory_displacement64() as usize;
+            ((8..=65520).contains(&offset) && offset.is_multiple_of(8))
+                .then_some((offset, usize::MAX))
+        } else if i.mnemonic() == Mnemonic::Mov
+            && i.op0_kind() == OpKind::Register
+            && i.op0_register().size() == 8
+            && i.op1_kind() == OpKind::Register
+        {
+            pointers.get(&i.op1_register().full_register()).copied()
+        } else if i.mnemonic() == Mnemonic::And
+            && i.op0_kind() == OpKind::Register
+            && i.op0_register().size() == 8
+            && matches!(
+                i.op1_kind(),
+                OpKind::Immediate8to64 | OpKind::Immediate32to64
+            )
+        {
+            pointers
+                .get(&i.op0_register().full_register())
+                .map(|(offset, mask)| (*offset, *mask & i.immediate(1) as usize))
+        } else {
+            None
+        };
+        let copied = i.mnemonic() == Mnemonic::Mov
+            && i.op0_kind() == OpKind::Register
+            && i.op0_register().size() == 8
+            && i.op1_kind() == OpKind::Register
+            && aliases.contains(&i.op1_register().full_register());
+        let mut info = InstructionInfoFactory::new();
+        for used in info.info(&i).used_registers() {
+            if matches!(
+                used.access(),
+                OpAccess::Write
+                    | OpAccess::CondWrite
+                    | OpAccess::ReadWrite
+                    | OpAccess::ReadCondWrite
+            ) {
+                aliases.remove(&used.register().full_register());
+                pointers.remove(&used.register().full_register());
+            }
+        }
+        if copied {
+            aliases.insert(i.op0_register().full_register());
+        }
+        if let Some(field) = loaded {
+            fields.insert(field);
+            pointers.insert(i.op0_register().full_register(), field);
+        }
+        if i.mnemonic() == Mnemonic::Call {
+            for reg in [
+                Register::RAX,
+                Register::RCX,
+                Register::RDX,
+                Register::R8,
+                Register::R9,
+                Register::R10,
+                Register::R11,
+            ] {
+                aliases.remove(&reg);
+                pointers.remove(&reg);
+            }
+        }
+    }
+    fields
+}
+
+pub(super) fn referenced_fields(code: &[u8]) -> HashSet<usize> {
+    referenced_pointer_fields(code)
+        .into_iter()
+        .map(|(offset, _)| offset)
+        .collect()
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ScalarValue {
+    Binding,
+    Instance(i64),
+    Zero,
+    Integer(usize, usize),
+    Input,
+    Argument(usize),
+}
+
+fn scalar_flow(code: &[u8], dispatch: bool) -> Option<(usize, usize)> {
+    scalar_flow_mode(code, dispatch, None)
+}
+
+fn scalar_flow_mode(
+    code: &[u8],
+    dispatch: bool,
+    setter_width: Option<usize>,
+) -> Option<(usize, usize)> {
+    let mut registers = if dispatch {
+        HashMap::from([
+            (Register::RCX, ScalarValue::Binding),
+            (Register::RDX, ScalarValue::Instance(0)),
+        ])
+    } else {
+        HashMap::from([(Register::RCX, ScalarValue::Instance(0))])
+    };
+    if setter_width.is_some() {
+        registers.insert(Register::R8, ScalarValue::Input);
+    }
+    let mut nonnull = false;
+    for i in Decoder::new(64, code, DecoderOptions::NONE) {
+        let dst = i.op0_register().full_register();
+        let src = i.op1_register().full_register();
+        match i.mnemonic() {
+            Mnemonic::Mov | Mnemonic::Movzx if i.op0_kind() == OpKind::Register => {
+                let value = if i.op1_kind() == OpKind::Register {
+                    registers.get(&src).copied()
+                } else if setter_width.is_some()
+                    && i.op1_kind() == OpKind::Memory
+                    && i.memory_index() == Register::None
+                    && i.memory_displacement64() == 0
+                    && registers.get(&i.memory_base().full_register()) == Some(&ScalarValue::Input)
+                {
+                    let width = i.memory_size().size();
+                    if Some(width) != setter_width {
+                        return None;
+                    }
+                    Some(ScalarValue::Argument(width))
+                } else if !dispatch
+                    && i.op1_kind() == OpKind::Memory
+                    && i.memory_index() == Register::None
+                {
+                    let ScalarValue::Instance(base) =
+                        registers.get(&i.memory_base().full_register()).copied()?
+                    else {
+                        return None;
+                    };
+                    let offset = base.checked_add(i.memory_displacement64() as i64)?;
+                    let width = i.memory_size().size();
+                    if !matches!(width, 1 | 4 | 8) {
+                        return None;
+                    }
+                    Some(ScalarValue::Integer(usize::try_from(offset).ok()?, width))
+                } else {
+                    return None;
+                };
+                registers.remove(&dst);
+                if let Some(value) = value {
+                    registers.insert(dst, value);
+                }
+            }
+            Mnemonic::Lea
+                if i.op1_kind() == OpKind::Memory && i.memory_index() == Register::None =>
+            {
+                let ScalarValue::Instance(base) =
+                    registers.get(&i.memory_base().full_register()).copied()?
+                else {
+                    return None;
+                };
+                registers.insert(
+                    dst,
+                    ScalarValue::Instance(base.checked_add(i.memory_displacement64() as i64)?),
+                );
+            }
+            Mnemonic::Add | Mnemonic::Sub
+                if matches!(
+                    i.op1_kind(),
+                    OpKind::Immediate8to64 | OpKind::Immediate32to64
+                ) =>
+            {
+                let ScalarValue::Instance(base) = registers.get(&dst).copied()? else {
+                    return None;
+                };
+                let delta = i.immediate(1) as i64;
+                registers.insert(
+                    dst,
+                    ScalarValue::Instance(base.checked_add(if i.mnemonic() == Mnemonic::Add {
+                        delta
+                    } else {
+                        -delta
+                    })?),
+                );
+            }
+            Mnemonic::Xor
+                if i.op0_kind() == OpKind::Register
+                    && i.op1_kind() == OpKind::Register
+                    && dst == src =>
+            {
+                registers.insert(dst, ScalarValue::Zero);
+            }
+            Mnemonic::Test
+                if dst == src && registers.get(&dst) == Some(&ScalarValue::Instance(0)) =>
+            {
+                nonnull = true;
+            }
+            Mnemonic::Cmove
+                if nonnull
+                    && registers.get(&src) == Some(&ScalarValue::Zero)
+                    && matches!(registers.get(&dst), Some(ScalarValue::Instance(_))) => {}
+            Mnemonic::Jmp
+                if dispatch
+                    && i.op0_kind() == OpKind::Memory
+                    && i.memory_index() == Register::None
+                    && registers.get(&i.memory_base().full_register())
+                        == Some(&ScalarValue::Binding) =>
+            {
+                let ScalarValue::Instance(adjustment) = registers.get(&Register::RCX).copied()?
+                else {
+                    return None;
+                };
+                if let Some(width) = setter_width
+                    && registers.get(&Register::RDX) != Some(&ScalarValue::Argument(width))
+                {
+                    return None;
+                }
+                let field = usize::try_from(i.memory_displacement64()).ok()?;
+                if field < 8 || !field.is_multiple_of(8) {
+                    return None;
+                }
+                return Some((field, usize::try_from(adjustment).ok()?));
+            }
+            Mnemonic::Ret if !dispatch => {
+                let ScalarValue::Integer(offset, width) = registers.get(&Register::RAX).copied()?
+                else {
+                    return None;
+                };
+                return Some((offset, width));
+            }
+            Mnemonic::Nop => {}
+            _ => return None,
+        }
+    }
+    None
+}
+
+pub(super) fn integer_setter_binding(
+    memory: &ProcessMemory,
+    studio: &ModuleEntry,
+    binding: usize,
+    width: usize,
+) -> Result<(usize, usize)> {
+    let layout = package_layout(&studio.path)?;
+    let table = memory.read_u64(binding)? as usize;
+    let mut found = HashSet::new();
+    for method in vtable_methods(memory, studio, &layout, table)? {
+        let Ok(code) = functions::dispatch_code(memory, studio, &layout, method) else {
+            continue;
+        };
+        if let Some((field, adjustment)) = scalar_flow_mode(&code, true, Some(width)) {
+            let setter = memory.read_u64(binding + field)? as usize;
+            verified_code(memory, studio, &layout, setter, 64)?;
+            found.insert((setter, adjustment));
+        }
+    }
+    anyhow::ensure!(
+        found.len() == 1,
+        "Integer property has no unique verified scalar setter binding"
+    );
+    Ok(*found.iter().next().unwrap())
+}
+
+pub(super) fn integer_field_layout(
+    memory: &ProcessMemory,
+    studio: &ModuleEntry,
+    binding: usize,
+) -> Result<(usize, usize)> {
+    let layout = package_layout(&studio.path)?;
+    let table = memory.read_u64(binding)? as usize;
+    let mut found = HashSet::new();
+    for method in vtable_methods(memory, studio, &layout, table)? {
+        let Ok(code) = functions::dispatch_code(memory, studio, &layout, method) else {
+            continue;
+        };
+        let Some((field, adjustment)) = scalar_flow(&code, true) else {
+            continue;
+        };
+        let getter = memory.read_u64(binding + field)? as usize;
+        let Ok(code) = functions::dispatch_code(memory, studio, &layout, getter) else {
+            continue;
+        };
+        if let Some((offset, width)) = scalar_flow(&code, false)
+            && let Some(offset) = offset.checked_add(adjustment)
+        {
+            found.insert((offset, width));
+        }
+    }
+    anyhow::ensure!(
+        found.len() == 1,
+        "Integer property has no unique verified receiver/getter binding"
+    );
+    Ok(*found.iter().next().unwrap())
+}
+
+pub(super) fn object_pointer_fields(
+    memory: &ProcessMemory,
+    studio: &ModuleEntry,
+    layout: &PackageLayout,
+    object: usize,
+) -> Result<HashSet<(usize, usize)>> {
+    #[derive(Clone)]
+    struct Fields {
+        methods: Vec<usize>,
+        code: Vec<(usize, Vec<u8>)>,
+        fields: HashSet<(usize, usize)>,
+    }
+    static CACHE: OnceLock<Mutex<HashMap<AbiCacheKey, Fields>>> = OnceLock::new();
+    let table = memory.read_u64(object)? as usize;
+    let key = (
+        studio.path.clone(),
+        layout.image_stamp,
+        table
+            .checked_sub(studio.base)
+            .context("Object vtable is outside Studio")?,
+    );
+    let methods = vtable_methods(memory, studio, layout, table)?;
+    let cached = CACHE
+        .get_or_init(Default::default)
+        .lock_recover()
+        .get(&key)
+        .cloned();
+    if let Some(entry) = cached
+        && entry.methods == methods
+        && entry.code.iter().all(|(address, code)| {
+            memory.read_vec(*address, code.len()).ok().as_ref() == Some(code)
+        })
+    {
+        return Ok(entry.fields);
+    }
+    let mut fields = HashSet::new();
+    let mut code = Vec::new();
+    for method in &methods {
+        let Ok(bytes) = functions::dispatch_code(memory, studio, layout, *method) else {
+            // Unrelated leaf or control-flow methods need not expose object fields.
+            // Only complete, image-verified methods can contribute a candidate.
+            continue;
+        };
+        fields.extend(referenced_pointer_fields(&bytes));
+        code.push((*method, bytes));
+    }
+    let mut cache = CACHE.get().unwrap().lock_recover();
+    if cache.len() >= 128 {
+        cache.clear();
+    }
+    cache.insert(
+        key,
+        Fields {
+            methods,
+            code,
+            fields: fields.clone(),
+        },
+    );
+    Ok(fields)
+}
+
+pub(super) fn vtable_methods(
+    memory: &ProcessMemory,
+    studio: &ModuleEntry,
+    layout: &PackageLayout,
+    table: usize,
+) -> Result<Vec<usize>> {
+    let mut result = Vec::new();
+    for slot in 0..256 {
+        let method = memory.read_u64(table + slot * 8)? as usize;
+        if method
+            .checked_sub(studio.base + layout.text.virtual_address)
+            .is_none_or(|offset| offset >= layout.text.raw_size)
+        {
+            return Ok(result);
+        }
+        result.push(method);
+    }
+    bail!("Reflection vtable exceeds its structural discovery budget")
+}
+
+pub(super) fn bindings(
     memory: &ProcessMemory,
     studio: &ModuleEntry,
     descriptor: usize,
 ) -> Result<Vec<(usize, usize)>> {
-    let bytes = memory.read_vec(descriptor, 0x200)?;
+    let layout = package_layout(&studio.path)?;
+    let table = memory.read_u64(descriptor)? as usize;
+    let mut fields = HashSet::new();
+    for method in vtable_methods(memory, studio, &layout, table)? {
+        fields.extend(referenced_fields(&functions::dispatch_code(
+            memory, studio, &layout, method,
+        )?));
+    }
     let mut result = Vec::new();
-    for offset in (0x40..0x200).step_by(8) {
-        let pointer = read_u64(&bytes, offset)? as usize;
+    for offset in fields {
+        let Ok(pointer) = memory.read_u64(descriptor + offset) else {
+            continue;
+        };
+        let pointer = pointer as usize;
         if !likely_pointer(pointer) {
             continue;
         }
-        if read_rtti_type(memory, pointer, studio.base, studio.size).is_some_and(|kind| {
+        if complete_reflection_type(memory, studio, pointer).is_some_and(|kind| {
             (kind.starts_with(".?AV?$GetSetImpl@") || kind.starts_with(".?AV?$GetImpl@"))
                 && kind.contains("@?$PropDescriptor@")
         }) {
@@ -608,13 +1060,29 @@ fn bindings(
     Ok(result)
 }
 
+pub(super) fn complete_reflection_type(
+    memory: &ProcessMemory,
+    studio: &ModuleEntry,
+    object: usize,
+) -> Option<String> {
+    let kind = read_rtti_type(memory, object, studio.base, studio.size)?;
+    let table = memory.read_u64(object).ok()? as usize;
+    let locator = memory.read_u64(table.checked_sub(8)?).ok()? as usize;
+    (memory.read_u32(locator + 4).ok()? == 0
+        && studio
+            .base
+            .checked_add(memory.read_u32(locator + 20).ok()? as usize)
+            == Some(locator))
+    .then_some(kind)
+}
+
 fn reflection_functions(
     memory: &ProcessMemory,
     studio: &ModuleEntry,
     layout: &PackageLayout,
     descriptor: usize,
 ) -> Result<(usize, usize)> {
-    let kind = read_rtti_type(memory, descriptor, studio.base, studio.size)
+    let kind = complete_reflection_type(memory, studio, descriptor)
         .context("Property descriptor has no validated RTTI")?;
     if !kind.starts_with(".?AV?$PropDescriptor@") && !kind.starts_with(".?AV?$EnumPropDescriptor@")
     {
@@ -646,7 +1114,8 @@ fn reflection_functions(
     // Find the string-capability/get/set sequence by behavior rather than an
     // absolute address or a blindly assumed vtable index. Unknown layouts stop.
     let mut candidates = Vec::new();
-    for slot in 16..30 {
+    let methods = vtable_methods(memory, studio, layout, vtable)?;
+    for slot in 0..methods.len().saturating_sub(2) {
         let capability = memory.read_u64(vtable + slot * 8)? as usize;
         let Ok(code) = verified_code(memory, studio, layout, capability, 8) else {
             continue;
@@ -1131,7 +1600,7 @@ pub(super) fn identity_binding(
         .map(|(offset, _)| *offset)
         .collect::<Vec<_>>();
     let mut used = HashSet::new();
-    for slot in 12..24 {
+    for slot in 0..vtable_methods(memory, studio, layout, descriptor_vtable)?.len() {
         let function = memory.read_u64(descriptor_vtable + slot * 8)? as usize;
         let Ok(code) = verified_code(memory, studio, layout, function, 256) else {
             continue;
@@ -1158,7 +1627,7 @@ pub(super) fn identity_binding(
     }
     let vtable = memory.read_u64(binding)? as usize;
     let mut candidates = Vec::new();
-    for slot in 0..12 {
+    for slot in 0..vtable_methods(memory, studio, layout, vtable)?.len() {
         let getter = memory.read_u64(vtable + slot * 8)? as usize;
         let Ok(code) = verified_code(memory, studio, layout, getter, 128) else {
             continue;
@@ -1431,6 +1900,7 @@ fn prepare(
     let remaining = deadline
         .checked_duration_since(Instant::now())
         .context("Protected property discovery exceeded its deadline")?;
+    memory.authorize(NativeOperation::DescriptorBinding, title)?;
     let helper = ensure_helper_loaded_with_timeout(
         pid,
         &memory,
@@ -1463,7 +1933,51 @@ fn prepare(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scalar_property_flow_follows_relocated_member_and_receiver() {
+        // Zero-preserving receiver conversion, followed by the engine member.
+        for field in [8i32, 0x30, 0x200] {
+            for adjustment in [0xc8i32, 0x180, 0x300] {
+                let mut dispatch = vec![
+                    0x45, 0x33, 0xc0, 0x48, 0x8b, 0xc1, 0x48, 0x85, 0xd2, 0x48, 0x8d, 0x8a,
+                ];
+                dispatch.extend_from_slice(&adjustment.to_le_bytes());
+                dispatch.extend_from_slice(&[0x49, 0x0f, 0x44, 0xc8, 0xff, 0xa0]);
+                dispatch.extend_from_slice(&field.to_le_bytes());
+                assert_eq!(
+                    scalar_flow(&dispatch, true),
+                    Some((field as usize, adjustment as usize))
+                );
+                dispatch[1] = 0x8b; // extra incoming argument is no longer initialized to zero
+                assert_eq!(scalar_flow(&dispatch, true), None);
+            }
+        }
+        for (prefix, width) in [
+            (&[0x48, 0x8b, 0x81][..], 8),
+            (&[0x8b, 0x81][..], 4),
+            (&[0x0f, 0xb6, 0x81][..], 1),
+        ] {
+            let mut getter = prefix.to_vec();
+            getter.extend_from_slice(&0x456i32.to_le_bytes());
+            getter.push(0xc3);
+            assert_eq!(scalar_flow(&getter, false), Some((0x456, width)));
+        }
+    }
+
     use super::*;
+
+    #[test]
+    fn engine_allocator_preserves_history_strings_and_delayed_callbacks() {
+        let status = std::process::Command::new(
+            std::path::Path::new(env!("OUT_DIR")).join("allocator-test/renium-allocator-test.exe"),
+        )
+        .status()
+        .expect("run isolated allocator regression");
+        assert!(
+            status.success(),
+            "allocator ownership regression failed: {status}"
+        );
+    }
 
     #[test]
     #[ignore]
@@ -1796,7 +2310,7 @@ mod tests {
     #[test]
     fn getter_discovery_follows_relocated_fields_slots_and_registers() {
         for (save, restore) in [(0xda, 0xc3), (0xfa, 0xc7), (0xf2, 0xc6)] {
-            for offset in [0x80_i32, 0x90, 0x98, 0x150] {
+            for offset in [0x8_i32, 0x80, 0x90, 0x98, 0x150, 0x300, 0x2000] {
                 for slot in [0x18, 0x20, 0x28] {
                     let mut code = vec![0x48, 0x8b, save, 0x48, 0x8b, 0x89];
                     code.extend_from_slice(&offset.to_le_bytes());
@@ -1804,8 +2318,10 @@ mod tests {
                         0x49, 0x8b, 0xd0, 0x48, 0x8b, 0x01, 0xff, 0x50, slot, 0x48, 0x8b, restore,
                         0xc3,
                     ]);
+                    let fields = referenced_fields(&code).into_iter().collect::<Vec<_>>();
+                    assert_eq!(fields, vec![offset as usize]);
                     assert_eq!(
-                        getter_call(&code, &[offset as usize], GetterAbi::Text),
+                        getter_call(&code, &fields, GetterAbi::Text),
                         Some((offset as usize, slot as usize))
                     );
                     assert_eq!(
