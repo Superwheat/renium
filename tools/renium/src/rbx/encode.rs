@@ -974,22 +974,6 @@ pub(crate) fn fill_engine_geometry_from(dom: &mut RbxWeakDom, base: &RbxWeakDom)
 /// Studio rebuild them from the meshes on load.
 pub(crate) fn finish_place_dom(dom: &mut RbxWeakDom) {
     let key = rbx_dom_weak::Ustr::from(COLLISION_HULL_PROPERTY);
-    let mut hollow: HashMap<rbx_dom_weak::Ustr, usize> = HashMap::new();
-    for instance in dom.descendants() {
-        if engine_geometry_properties(instance.class.as_str()).contains(&"MeshData2")
-            && !(has_data(instance, "ChildData2") && has_data(instance, "MeshData2"))
-        {
-            *hollow.entry(instance.class).or_default() += 1;
-        }
-    }
-    for (class, count) in hollow {
-        crate::app::output::log_global(
-            2,
-            format_args!(
-                "[renium] {count} {class} parts carry no mesh data in the files and are empty in the place; build with --base from the version they came from"
-            ),
-        );
-    }
     let boxed = dom
         .descendants()
         .filter(|instance| {
@@ -1023,7 +1007,7 @@ pub(crate) fn finish_place_dom(dom: &mut RbxWeakDom) {
         crate::app::output::log_global(
             3,
             format_args!(
-                "[renium] {} of {} {class} parts carry no collision hull; the place leaves all of them for Studio to rebuild on load",
+                "[renium] {} of {} {class} parts have no collision hull in the files or the base; the file carries none for that class (a part without one would get the box placeholder) and Studio rebuilds them on load; rbx q lists such values under `defaulted`",
                 referents.len() - with_hull,
                 referents.len()
             ),
