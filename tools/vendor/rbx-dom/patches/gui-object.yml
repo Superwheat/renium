@@ -1,13 +1,7 @@
-Add:
-  GuiObject:
-    Sink:
-      DataType:
-        Enum: InputSink
-      Scriptability: None
-      AliasFor: InputSink
-
 Change:
   GuiObject:
+    Sink:
+      AliasFor: InputSink
     InputSink:
       Serialization:
         Type: SerializesAs

@@ -204,9 +204,15 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
             let property = property_metadata.property;
             let serialized_name = property_metadata.serialized_name.unwrap_or(name);
             let descriptor = property_metadata.descriptor;
+            // A bare number for a member the reflection database does not know
+            // (Camera.OrthographicSize before the database knew Studio 0.742)
+            // has no type to write; a guessed type makes Studio refuse to open
+            // the place, so the member is left out and named once in the log.
+            let unknown_number = property.is_none() && descriptor.is_none() && value.is_number();
             let unsupported = property.is_some()
                 && descriptor.is_none()
-                && !property_metadata.native_setter_property;
+                && !property_metadata.native_setter_property
+                || unknown_number;
             let compatibility_type = property
                 .is_none()
                 .then(|| flattened_decal_property_type(decal, name))
@@ -224,6 +230,9 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
                 )
             };
             let Some(variant) = variant else {
+                if unknown_number {
+                    report_unknown_numeric_member(&instance.class_name, name);
+                }
                 if !unsupported && options.omitted_properties_by_class.is_none() {
                     bail!(
                         "{} ({}) property {name} cannot be represented in a Roblox model",
@@ -757,7 +766,7 @@ pub(crate) const COLLISION_HULL_PROPERTY: &str = "PhysicalConfigData";
 /// Engine-built data a part carries opaquely: collision hulls and aero
 /// meshes, a union's CSG tree, mesh and older mesh holder, and the terrain's
 /// material table.
-fn engine_geometry_properties(class: &str) -> &'static [&'static str] {
+pub(crate) fn engine_geometry_properties(class: &str) -> &'static [&'static str] {
     match class {
         "MeshPart" => &[COLLISION_HULL_PROPERTY, "AeroMeshData"],
         "UnionOperation" | "NegateOperation" | "IntersectOperation" => &[
@@ -1072,6 +1081,24 @@ fn is_empty_unscriptable_blob(
     }
     rbx_property_descriptor(database, class_name, name)
         .is_some_and(|descriptor| matches!(descriptor.scriptability, RbxScriptability::None))
+}
+
+fn report_unknown_numeric_member(class_name: &str, name: &str) {
+    static REPORTED: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let member = format!("{class_name}.{name}");
+    let mut reported = REPORTED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if reported.insert(member.clone()) {
+        crate::app::output::log_global(
+            3,
+            format_args!(
+                "[renium] {member} is a numeric member this Renium's Roblox reflection data does not know; it was left out of the written place or model so Studio can open it. Update Renium to carry it"
+            ),
+        );
+    }
 }
 
 pub(crate) fn json_to_rbx_property_variant(
@@ -2216,13 +2243,13 @@ mod tests {
         let slotted = dom.insert(
             workspace,
             RbxInstanceBuilder::new("SurfaceAppearance")
-                .with_property("SurfaceSlot", RbxVariant::Int32(-1)),
+                .with_property("UndefaultedSlot", RbxVariant::Int32(-1)),
         );
         let bare = dom.insert(workspace, RbxInstanceBuilder::new("SurfaceAppearance"));
         dom.insert(
             workspace,
             RbxInstanceBuilder::new("Texture")
-                .with_property("ResampleMode", RbxVariant::Enum(RbxEnum::from_u32(0))),
+                .with_property("UndefaultedMode", RbxVariant::Enum(RbxEnum::from_u32(0))),
         );
         let plain_texture = dom.insert(workspace, RbxInstanceBuilder::new("Texture"));
         let model = dom.insert(
@@ -2253,12 +2280,15 @@ mod tests {
                 .cloned()
         };
         assert_eq!(
-            property(slotted, "SurfaceSlot"),
+            property(slotted, "UndefaultedSlot"),
             Some(RbxVariant::Int32(-1))
         );
-        assert_eq!(property(bare, "SurfaceSlot"), Some(RbxVariant::Int32(-1)));
         assert_eq!(
-            property(plain_texture, "ResampleMode"),
+            property(bare, "UndefaultedSlot"),
+            Some(RbxVariant::Int32(-1))
+        );
+        assert_eq!(
+            property(plain_texture, "UndefaultedMode"),
             Some(RbxVariant::Enum(RbxEnum::from_u32(0)))
         );
         assert_eq!(property(model, "SerializedOverrides"), None);

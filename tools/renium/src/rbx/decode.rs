@@ -478,6 +478,31 @@ pub(crate) fn native_overlay_property_schemas(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_records_keep_the_engine_type_of_numbers_the_database_does_not_know() {
+        let database = rbx_reflection_database::get().unwrap();
+        let refs = BytecodeModelImportRefs::default();
+        let properties = [
+            (
+                rbx_dom_weak::Ustr::from("FutureNumericProperty"),
+                RbxVariant::Float32(4.0),
+            ),
+            (
+                rbx_dom_weak::Ustr::from("FieldOfView"),
+                RbxVariant::Float32(55.0),
+            ),
+        ];
+        let (native, json, _, _) = rbx_properties_to_native_settings_records(
+            "Camera",
+            properties.iter().map(|(name, value)| (name, value)),
+            database,
+            &refs,
+            None,
+        );
+        assert_eq!(json["FutureNumericProperty"]["_type"], "Float32");
+        assert_eq!(json["FutureNumericProperty"]["value"], 4.0);
+    }
+
     use super::*;
     use crate::roblox::schema::{PropertySchemaEntry, TYPE_ID_CFRAME, TYPE_ID_REF};
 
@@ -1071,6 +1096,23 @@ pub(crate) fn rbx_properties_to_native_settings_records<'a>(
                 filter.reconstruct_decal_color_map && output_name == "TextureContent"
                     || filter.reconstruct_weld_enabled && output_name == "State"
             });
+        // A number for a member the reflection database does not know keeps
+        // its engine type in the store, so a later build writes it as the
+        // engine declared it instead of leaving it out.
+        if descriptor.is_none()
+            && matches!(
+                variant,
+                RbxVariant::Int32(_)
+                    | RbxVariant::Int64(_)
+                    | RbxVariant::Float32(_)
+                    | RbxVariant::Float64(_)
+            )
+            && let Some(value) =
+                rbx_variant_to_settings_json_inner(variant, None, database, refs, true)
+        {
+            properties.insert(output_name.to_string(), value);
+            continue;
+        }
         if !keep_json
             && let Some(value) =
                 rbx_variant_to_native_settings_value(variant, descriptor, database, refs)

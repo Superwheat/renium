@@ -73,13 +73,16 @@ fn members_saved_by_one_side_only_are_set_aside_per_class() {
     let mut after = before.clone();
     after.instances[1]
         .properties
-        .insert("SurfaceSlot".into(), json!(-1));
+        .insert("UndefaultedSlot".into(), json!(-1));
     after.instances[2]
         .properties
         .insert("Anchored".into(), json!(false));
     let database = rbx_reflection_database::get().unwrap();
     let omitted = omit_one_sided_class_properties(&mut before, &mut after, database);
-    assert_eq!(omitted, BTreeMap::from([("SurfaceSlot".to_string(), 1)]));
+    assert_eq!(
+        omitted,
+        BTreeMap::from([("UndefaultedSlot".to_string(), 1)])
+    );
     assert!(after.instances[1].properties.is_empty());
     assert_eq!(after.instances[2].properties["Anchored"], false);
 }
