@@ -1971,6 +1971,7 @@ pub(super) struct ShotArgs {
         help = "Move the camera here before capturing",
         long,
         value_name = "X,Y,Z",
+        allow_hyphen_values = true,
         requires = "look_at"
     )]
     pub(super) camera_position: Option<String>,
@@ -1978,6 +1979,7 @@ pub(super) struct ShotArgs {
         help = "Point the camera at this position",
         long,
         value_name = "X,Y,Z",
+        allow_hyphen_values = true,
         requires = "camera_position"
     )]
     pub(super) look_at: Option<String>,
