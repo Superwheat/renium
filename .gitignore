@@ -78,3 +78,8 @@ tools/**/.vscode-test/
 .DS_Store
 Thumbs.db
 !/SECURITY.md
+
+# Astra review clones and reports never ship
+.astra-*/
+.native-work/
+/ASTRA-*.md

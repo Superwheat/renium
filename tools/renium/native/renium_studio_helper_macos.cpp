@@ -170,11 +170,6 @@ static bool LoadInstanceNameLayout(InstanceNameLayout& layout)
     return true;
 }
 
-static void ResetInstanceNameLayout()
-{
-    CachedInstanceNameLayout.store(0, std::memory_order_relaxed);
-    CachedInstanceNameOffset.store(0, std::memory_order_relaxed);
-}
 static std::string CachedDataModelTitle;
 
 // Optional bounded diagnostics: offsets are microseconds from RPC handling,

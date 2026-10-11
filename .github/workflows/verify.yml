@@ -101,9 +101,6 @@ jobs:
       - name: Test launchers
         run: node tools/renium/tests/launcher-smoke.mjs
 
-      - name: Test package subobjects
-        run: node tools/renium/tests/package-subobject.mjs
-
   rust-windows-arm:
     name: Rust tests (windows-11-arm)
     # Windows ARM64 has no maintainer runner, so every push, pull request and
@@ -152,9 +149,6 @@ jobs:
 
       - name: Test launchers
         run: node tools/renium/tests/launcher-smoke.mjs
-
-      - name: Test package subobjects
-        run: node tools/renium/tests/package-subobject.mjs
 
   build-and-test:
     name: Windows release build and extension

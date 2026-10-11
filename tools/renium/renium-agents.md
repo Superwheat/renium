@@ -42,6 +42,7 @@ Read only relevant guides before using their commands, once per session; reread 
 | Studio lifecycle and audio | `RENIUM/advanced.md` |
 | Save, publish and diagnostics | `RENIUM/publishing.md` |
 | Installed plugins | `RENIUM/plugins.md` |
+| Native Studio access and probes | `RENIUM/native-compatibility.md` |
 
 ## Targeting and edits
 
