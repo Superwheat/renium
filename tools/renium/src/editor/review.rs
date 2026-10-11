@@ -94,12 +94,7 @@ pub(crate) fn is_engine_managed_editor_property(
     property_name: &str,
     database: &ReflectionDatabase<'_>,
 ) -> bool {
-    if class_name == "Workspace" && matches!(property_name, "CurrentCamera" | "InsertPoint") {
-        return true;
-    }
-    // The engine clamps a scroll offset to the laid-out canvas, so a saved
-    // CanvasPosition is runtime state that cannot be authored through a sync.
-    if class_name == "ScrollingFrame" && property_name == "CanvasPosition" {
+    if is_editor_view_state(class_name, property_name) {
         return true;
     }
     if property_name == "Tags"
@@ -147,6 +142,34 @@ pub(crate) fn is_engine_managed_editor_property(
                 | RbxPropertyTag::WriteOnly
         )
     })
+}
+
+fn is_editor_view_state(class_name: &str, property_name: &str) -> bool {
+    class_name == "Workspace" && matches!(property_name, "CurrentCamera" | "InsertPoint")
+        || class_name == "ScrollingFrame" && property_name == "CanvasPosition"
+}
+
+pub(crate) fn is_editor_state_property(
+    class_name: &str,
+    property_name: &str,
+    database: &ReflectionDatabase<'_>,
+) -> bool {
+    if is_editor_view_state(class_name, property_name) {
+        return true;
+    }
+    // Computed layout and media readbacks are not writes. Keep supplemental
+    // saved fields (notably MeshSize) under their ordinary fidelity checks.
+    !super::native_geometry::is_mesh_geometry_property(class_name, property_name)
+        && !super::native_roots::is_property(class_name, property_name)
+        && rbx_property_descriptor(database, class_name, property_name).is_some_and(|descriptor| {
+            descriptor.tags.contains(&RbxPropertyTag::ReadOnly)
+                && matches!(
+                    descriptor.kind,
+                    RbxPropertyKind::Canonical {
+                        serialization: RbxPropertySerialization::DoesNotSerialize
+                    }
+                )
+        })
 }
 
 pub(crate) fn is_externally_managed_protected_write(row: &Value) -> bool {

@@ -2493,6 +2493,7 @@ fn targeted_inline_source_changes_include_selected_package_scripts() {
 #[test]
 fn direct_editor_delete_change_does_not_require_existing_bytecode_match() {
     let root = temp_dir("direct-delete-missing-bytecode");
+    fs::write(root.join("renium.project.jsonc"), r#"{"schemaVersion":1}"#).unwrap();
     let changes = collect_direct_editor_delete_change(ApplyEditorDeleteArgs {
         target: EditorMutationArgs {
             project: ProjectSourceArgs {

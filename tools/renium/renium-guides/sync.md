@@ -4,7 +4,7 @@
 
 ```powershell
 rbx pl
-rbx ps src/ServerScriptService/Main.server.luau --verify
+rbx ps src/ServerScriptService/Main.server.luau --verify-sources
 rbx lon
 rbx lst
 rbx lof
@@ -49,7 +49,7 @@ Without Live Sync, pass the files or directories to `ps`; Renium batches them by
 For store edits, use returned changed paths and settings IDs to keep the push scoped.
 An unfiltered push reconciles the entire place and can remove Studio-only content.
 
-`ps --verify` compares the selected script sources with Studio and pushes nothing (`sourceVerifyErrors` lists mismatches); `ps --verify-sources` pushes, then checks. Don't substitute reads of `Instance.Source`: an open ScriptDocument can differ.
+`ps --verify` compares script sources and pushes nothing (`sourceVerifyErrors` lists mismatches); without paths it checks all scripts. It never applies stores or acknowledges a Live Sync push. `ps --verify-sources` pushes, then checks. Don't substitute reads of `Instance.Source`: an open ScriptDocument can differ.
 
 Player capacity (`Players.MaxPlayers` and `PreferredPlayers`) is managed through Roblox Game Settings, not push. Saved exports and file comparisons still preserve/report these values.
 

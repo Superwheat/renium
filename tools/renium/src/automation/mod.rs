@@ -39,6 +39,28 @@ pub struct Opcode {
     pub queued: bool,
 }
 
+impl Opcode {
+    pub(crate) fn read_only_request(&self, parameters: &Value) -> bool {
+        let flag = match self.id {
+            op::PUSH => "verify",
+            op::PLACE_PUBLISH => "dryRun",
+            _ => return false,
+        };
+        parameters.get(flag).and_then(Value::as_bool) == Some(true)
+    }
+
+    pub(crate) fn requires_review(&self, parameters: &Value, approved: bool) -> bool {
+        self.review
+            && !self.read_only_request(parameters)
+            && (approved
+                || matches!(
+                    self.id,
+                    op::STUDIO_OPEN | op::STUDIO_CLOSE | op::PLACE_PUBLISH
+                )
+                || parameters.get("destructive").and_then(Value::as_bool) == Some(true))
+    }
+}
+
 pub fn registry() -> &'static [Opcode] {
     op::REGISTRY
 }
@@ -532,6 +554,32 @@ pub fn capabilities() -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_only_review_exemptions_are_operation_specific() {
+        for approved in [false, true] {
+            for (operation, flag) in [(op::PUSH, "verify"), (op::PLACE_PUBLISH, "dryRun")] {
+                let opcode = opcode_by_id(operation).unwrap();
+                let mut parameters = json!({"destructive": true});
+                parameters[flag] = json!(true);
+                assert!(!opcode.requires_review(&parameters, approved));
+                for value in [json!(false), json!("true"), Value::Null] {
+                    parameters[flag] = value;
+                    assert!(opcode.requires_review(&parameters, approved));
+                }
+            }
+            for operation in [op::SET_PROPERTY, op::STUDIO_CLOSE, op::STUDIO_OPEN] {
+                assert!(opcode_by_id(operation).unwrap().requires_review(
+                    &json!({"destructive": true, "verify": true, "dryRun": true}),
+                    approved
+                ));
+            }
+            assert!(opcode_by_id(op::PUSH).unwrap().requires_review(
+                &json!({"destructive": true, "verifySources": true, "dryRun": true}),
+                approved
+            ));
+        }
+    }
 
     #[test]
     fn published_selectors_need_two_positive_ids() {

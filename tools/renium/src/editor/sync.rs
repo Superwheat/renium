@@ -4037,24 +4037,39 @@ fn validate_read_only_service_changes(
     documents: &HashMap<String, Option<Arc<SettingsBytecode>>>,
     src_root: &Path,
 ) -> Result<()> {
-    for target in &link_enforcement.read_only_packages {
-        if !changed_services.contains(&target.service)
-            || !push_scope_touches(
-                scopes.get(&target.service),
-                &target.target_segments,
-                &target.target_ordinals,
-            )
-        {
-            continue;
+    let targets = link_enforcement
+        .read_only_packages
+        .iter()
+        .filter(|target| {
+            changed_services.contains(&target.service)
+                && push_scope_touches(
+                    scopes.get(&target.service),
+                    &target.target_segments,
+                    &target.target_ordinals,
+                )
+        })
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let mut canonical = HashMap::new();
+    for target in &targets {
+        if let Some(document) = documents.get(&target.service).and_then(Option::as_ref) {
+            canonical
+                .entry(PathBuf::from(&target.service))
+                .or_insert_with(|| (**document).clone());
         }
-        let current = match documents.get(&target.service).and_then(Option::as_ref) {
+    }
+    crate::project::package_links::canonicalize_loaded_settings_documents(&mut canonical)?;
+    for target in targets {
+        let current = match canonical.get(Path::new(&target.service)) {
             Some(document) => crate::project::package_links::read_only_target_current(
                 document,
                 &target.service,
                 &src_root.join(&target.service),
                 &target.target_segments,
                 &target.target_ordinals,
-                target.package_path.as_deref(),
+                target.package.as_deref(),
                 &target.expected_fingerprint,
             )?,
             None => false,
@@ -4782,7 +4797,7 @@ mod sync_tests {
                 target_segments: vec!["Outside".into()],
                 target_ordinals: vec![1],
                 expected_fingerprint: "unrelated-drift".into(),
-                package_path: None,
+                package: None,
             });
         let changes =
             collect_editor_changes_with_link_enforcement(&args, &root, &src, &links).unwrap();
@@ -4846,7 +4861,7 @@ mod sync_tests {
                 target_segments: vec!["Public".into()],
                 target_ordinals: vec![1],
                 expected_fingerprint: "changed".into(),
-                package_path: None,
+                package: None,
             });
         let error = finish_editor_change_collection(
             EditorChangeSet::default(),
@@ -5033,6 +5048,7 @@ mod sync_tests {
         let second = place.join("src/ReplicatedStorage/Config.luau");
         fs::create_dir_all(first.parent().unwrap()).unwrap();
         fs::create_dir_all(second.parent().unwrap()).unwrap();
+        fs::write(place.join("renium.project.jsonc"), r#"{"schemaVersion":1}"#).unwrap();
         fs::write(&first, "local updated = true").unwrap();
         fs::write(&second, "return 42").unwrap();
         fs::write(

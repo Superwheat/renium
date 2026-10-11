@@ -1735,12 +1735,12 @@ fn collect_project_settings_files(
     Ok(files)
 }
 
-fn canonicalize_loaded_settings_documents(
+pub(crate) fn canonicalize_loaded_settings_documents(
     documents: &mut HashMap<PathBuf, SettingsBytecode>,
 ) -> Result<()> {
     let mut paths_by_service = BTreeMap::new();
     let mut by_service = BTreeMap::new();
-    for (path, document) in documents.iter() {
+    for (path, document) in documents.drain() {
         let service = document
             .instances
             .iter()
@@ -1754,7 +1754,7 @@ fn canonicalize_loaded_settings_documents(
                 path.display()
             );
         }
-        by_service.insert(service, document.clone());
+        by_service.insert(service, document);
     }
     canonicalize_settings_reference_documents(&mut by_service);
     for (service, document) in by_service {
@@ -3348,44 +3348,38 @@ pub(crate) struct ReadOnlyPackageEnforcement {
     pub(crate) target_segments: Vec<String>,
     pub(crate) target_ordinals: Vec<usize>,
     pub(crate) expected_fingerprint: String,
-    pub(crate) package_path: Option<PathBuf>,
+    pub(crate) package: Option<std::sync::Arc<SettingsBytecode>>,
 }
 
 /// Whether a read-only link target in the files still matches its package:
 /// the same comparison `lk --check` makes (sources inlined, the target
 /// pruned to the package's shape, placement normalized for placed models),
-/// so a push guard and a status never disagree. Without a readable package
-/// file the fingerprints are compared directly.
+/// so a push guard and a status never disagree. The caller canonicalizes its
+/// documents once before checking targets, and keeps the package snapshot that
+/// produced the expected fingerprint. Without a package, compare fingerprints.
 pub(crate) fn read_only_target_current(
     document: &SettingsBytecode,
     service: &str,
     service_dir: &Path,
     target_segments: &[String],
     target_ordinals: &[usize],
-    package_path: Option<&Path>,
+    package: Option<&SettingsBytecode>,
     expected_fingerprint: &str,
 ) -> Result<bool> {
-    let mut documents = HashMap::from([(PathBuf::from(service), document.clone())]);
-    canonicalize_loaded_settings_documents(&mut documents)?;
-    let document = documents
-        .remove(Path::new(service))
-        .context("Canonical settings document disappeared")?;
     let inlined = inline_target_sources(
-        &document,
+        document,
         service,
         service_dir,
         target_segments,
         target_ordinals,
     )?;
-    if let Some(package_path) = package_path
-        && let Ok(package) = SettingsBytecode::read_file(package_path)
-    {
+    if let Some(package) = package {
         return package_target_matches(
             &inlined,
             service,
             target_segments,
             target_ordinals,
-            &package,
+            package,
             expected_fingerprint,
         );
     }
@@ -3482,6 +3476,7 @@ pub(crate) fn build_link_enforcement(
         active: true,
         ..LinkEnforcement::default()
     };
+    let mut packages = HashMap::<PathBuf, (std::sync::Arc<SettingsBytecode>, String)>::new();
     for target in targets {
         if target.broken {
             continue;
@@ -3503,12 +3498,19 @@ pub(crate) fn build_link_enforcement(
         if target.read_only
             && let Some(package_path) = &target.package_source
         {
-            let package = SettingsBytecode::read_file(package_path).with_context(|| {
-                format!(
-                    "Failed to read read-only link package {}",
-                    package_path.display()
-                )
-            })?;
+            let (package, fingerprint) = match packages.entry(package_path.clone()) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let package = SettingsBytecode::read_file(package_path).with_context(|| {
+                        format!(
+                            "Failed to read read-only link package {}",
+                            package_path.display()
+                        )
+                    })?;
+                    let fingerprint = package_document_fingerprint(&package)?;
+                    entry.insert((std::sync::Arc::new(package), fingerprint))
+                }
+            };
             enforcement
                 .read_only_packages
                 .push(ReadOnlyPackageEnforcement {
@@ -3516,8 +3518,8 @@ pub(crate) fn build_link_enforcement(
                     service: target.service.clone(),
                     target_segments: target.target_segments.clone(),
                     target_ordinals: target.target_ordinals.clone(),
-                    expected_fingerprint: package_document_fingerprint(&package)?,
-                    package_path: Some(package_path.clone()),
+                    expected_fingerprint: fingerprint.clone(),
+                    package: Some(std::sync::Arc::clone(package)),
                 });
         }
         for pair in &target.files {

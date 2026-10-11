@@ -1268,6 +1268,12 @@ fn automation_dispatch_operation(
         op::PUSH => {
             bridge.wait_for_all_target(bridge_wait_seconds, BridgeTarget::Main)?;
             let args = automation_push_args(context, parameters, reviewed)?;
+            if args.verify {
+                let summary = push_editor_changes_with_warm_bridge(args, bridge)?;
+                return Ok(Value::Object(compact_push_summary(
+                    &summary, parameters, false,
+                )));
+            }
             if !push_is_filtered(parameters) {
                 let summary = push_project_replacement(context, bridge, &sync_services(), args)?;
                 return Ok(Value::Object(compact_push_summary(
@@ -1584,6 +1590,21 @@ fn automation_dispatch_managed(
     bridge_wait_seconds: f64,
     reviewed: bool,
 ) -> std::result::Result<Value, automation::Failure> {
+    // A source comparison must neither capture/acknowledge a push baseline nor
+    // settle file changes that it did not send to Studio.
+    if operation == op::PUSH
+        && automation::opcode_by_id(operation)
+            .is_ok_and(|opcode| opcode.read_only_request(parameters))
+    {
+        return automation_dispatch_with_retry(
+            operation,
+            context,
+            parameters,
+            bridge,
+            bridge_wait_seconds,
+            false,
+        );
+    }
     if operation == op::STUDIO_CLOSE {
         return close_studio(context, parameters, state, bridge, bridge_wait_seconds)
             .map_err(automation_failure);
@@ -2407,6 +2428,9 @@ fn restore_persisted_live_sync_for_request(
     let Ok(operation) = request.validate() else {
         return Ok(());
     };
+    if operation.read_only_request(&request.p) {
+        return Ok(());
+    }
     if matches!(
         operation.id,
         op::BIND
@@ -2898,11 +2922,7 @@ fn automation_execute_request_inner(
                     "bind",
                 ));
             }
-            let requires_review = operation.review
-                && (matches!(operation.id, op::STUDIO_OPEN | op::STUDIO_CLOSE)
-                    || operation.id == op::PLACE_PUBLISH
-                        && request.p.get("dryRun").and_then(Value::as_bool) != Some(true)
-                    || request.p.get("destructive").and_then(Value::as_bool) == Some(true));
+            let requires_review = operation.requires_review(&request.p, false);
             if requires_review {
                 return Err(automation::Failure::new(
                     "rejected",
@@ -3057,6 +3077,14 @@ fn automation_execute_request_inner(
                         "review-prepare p.p must be an object",
                         false,
                         "review-prepare",
+                    ));
+                }
+                if target_operation.read_only_request(&parameters) {
+                    return Err(automation::Failure::new(
+                        "bad_req",
+                        "Read-only requests run directly without review",
+                        false,
+                        target_operation.name,
                     ));
                 }
                 if target == op::PLACE_PUBLISH {

@@ -1029,3 +1029,54 @@ fn validate_wally_target_name(raw: &str, label: &str) -> Result<String> {
     validate_filesystem_instance_name(value, &format!("Wally {label}"))?;
     Ok(value.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::support::{settings_document, settings_instance, temp_dir};
+
+    #[test]
+    fn wally_freshness_checks_external_sources_and_authored_store_changes() {
+        let root = temp_dir("wally-freshness");
+        let src = root.join("src");
+        let service_dir = src.join("ReplicatedStorage");
+        fs::create_dir_all(&service_dir).unwrap();
+        let mut document = settings_document(vec![
+            settings_instance("root", "ReplicatedStorage", "ReplicatedStorage", None),
+            settings_instance("unrelated", "Other", "Folder", Some(0)),
+        ]);
+        document
+            .write_file(&service_settings_path(&service_dir))
+            .unwrap();
+        let realm = WallyRealm {
+            realm: "shared",
+            packages_dir: root.join("Packages"),
+            service: "ReplicatedStorage".into(),
+            target_name: "Packages".into(),
+            required: true,
+        };
+        fs::create_dir_all(&realm.packages_dir).unwrap();
+        fs::write(realm.packages_dir.join("Lib.luau"), "return 1").unwrap();
+        let storage =
+            resolve_link_target_storage(&root, &src, &wally_realm_target(&realm), true, true)
+                .unwrap();
+        let outcome =
+            import_wally_realm(&mut document, &realm, &storage, false, &HashSet::new()).unwrap();
+        apply_file_mutations(&outcome.writes, &outcome.removals).unwrap();
+        document = decode_settings_bytecode(&encode_settings_bytecode(&document).unwrap()).unwrap();
+        assert!(wally_realm_is_fresh(&document, &realm, &storage).unwrap());
+        let mirror = service_dir.join("Packages/Lib.luau");
+        fs::write(&mirror, "return 2").unwrap();
+        assert!(!wally_realm_is_fresh(&document, &realm, &storage).unwrap());
+        fs::write(&mirror, "return 1").unwrap();
+        document
+            .instances
+            .iter_mut()
+            .find(|instance| instance.name == "Lib")
+            .unwrap()
+            .attributes
+            .insert("Authored".into(), json!(false));
+        assert!(!wally_realm_is_fresh(&document, &realm, &storage).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+}

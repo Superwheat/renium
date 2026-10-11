@@ -228,6 +228,123 @@ fn connect(bridge: &BridgeServer, channel_index: usize, info: BridgeInfoPayload)
 }
 
 #[test]
+fn verify_push_dispatch_reads_sources_without_replacement_or_review() {
+    // Runtime selection is process-global; keep this wire test isolated.
+    if std::env::var_os("RENIUM_TEST_VERIFY_DISPATCH").is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "studio::bridge::routing_tests::verify_push_dispatch_reads_sources_without_replacement_or_review"])
+            .env("RENIUM_TEST_VERIFY_DISPATCH", "1").status().unwrap();
+        assert!(status.success());
+        return;
+    }
+    use crate::automation::authorization::signed_fixture_request;
+    use crate::automation::{State, op, runtime::automation_parse_response_with_lease};
+    use crate::tests::support::{settings_document, settings_instance, temp_dir};
+    let root = temp_dir("verify-dispatch");
+    let service = root.join("src/ReplicatedStorage");
+    std::fs::create_dir_all(&service).unwrap();
+    std::fs::write(
+        root.join("renium.project.jsonc"),
+        r#"{"schemaVersion":1,"sourceRoot":"src","tree":{}}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("instances")).unwrap();
+    let store = root.join("instances/ReplicatedStorage.renium");
+    settings_document(vec![
+        settings_instance("root", "ReplicatedStorage", "ReplicatedStorage", None),
+        settings_instance("code", "Code", "ModuleScript", Some(0)),
+    ])
+    .write_file(&store)
+    .unwrap();
+    let script = service.join("Code.luau");
+    std::fs::write(&script, "return 1").unwrap();
+    let before = std::fs::read(&store).unwrap();
+    let bridge = Arc::new(listening_fixture());
+    let methods = Arc::new(Mutex::new(Vec::new()));
+    let mut responders = Vec::new();
+    for channel in 0..2 {
+        let mut peer = handshake(&bridge, channel, &edit_info("verify-only", 20)).unwrap();
+        let received = Arc::clone(&methods);
+        responders.push(thread::spawn(move || {
+        while let Ok(message) = peer.read() {
+            let Message::Text(text) = message else { continue; };
+            let request: Value = serde_json::from_str(&text).unwrap();
+            let method = request["method"].as_str().unwrap().to_string();
+            received.lock().unwrap().push(method.clone());
+            let result = if method == "getLiveSourceBatch" {
+                json!({"rows": [{"index": 0, "source": "return 1", "className": "ModuleScript"}]})
+            } else {
+                json!({})
+            };
+            if peer
+                .send(Message::Text(
+                    json!({"id": request["id"], "ok": true, "result": result})
+                        .to_string()
+                        .into(),
+                ))
+                .is_err()
+            {
+                break;
+            }
+        }
+        }));
+    }
+    let state = State::default();
+    let request = |value| {
+        automation_parse_response_with_lease(
+            &signed_fixture_request(&state, value),
+            &state,
+            &bridge,
+            0.1,
+            None,
+        )
+    };
+    let bound =
+        request(json!({"v": 1, "id": 1, "op": op::BIND, "p": {"root": root, "place": "10:20"}}));
+    assert_eq!(bound.ok, 1, "{}", serde_json::to_string(&bound).unwrap());
+    assert_eq!(
+        bound.r.as_ref().unwrap()["runtimeId"],
+        "verify-only",
+        "{:?}",
+        methods.lock().unwrap()
+    );
+    let context = bound.r.unwrap()["id"].as_u64().unwrap();
+    for (index, paths) in [json!([]), json!([store]), json!([service]), json!([script])]
+        .into_iter()
+        .enumerate()
+    {
+        let response = request(
+            json!({"v": 1, "id": index + 2, "op": op::PUSH, "cx": context,
+            "p": {"verify": true, "destructive": true, "changedPaths": paths}}),
+        );
+        assert_eq!(
+            response.ok,
+            1,
+            "{}",
+            serde_json::to_string(&response).unwrap()
+        );
+        let result = response.r.unwrap();
+        assert_eq!(result["verifyOnly"], true);
+        // This store carries no inline sources; a store-only selection checks
+        // no scripts and must still never apply its instance/property changes.
+        assert_eq!(result["sourceVerified"], if index == 1 { 0 } else { 1 });
+    }
+    let response = request(
+        json!({"v": 1, "id": 6, "op": op::REVIEW_PREPARE, "cx": context,
+        "p": {"op": op::PUSH, "p": {"verify": true}}}),
+    );
+    assert_eq!(response.ok, 0);
+    assert_eq!(response.e.unwrap().c, "bad_req");
+    assert_eq!(std::fs::read(&store).unwrap(), before);
+    assert_eq!(*methods.lock().unwrap(), vec!["getLiveSourceBatch"; 3]);
+    drop(bridge);
+    for responder in responders {
+        responder.join().unwrap();
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn inventory_does_not_wait_for_an_unnamed_client_and_accepts_its_later_identity() {
     let bridge = Arc::new(fixture());
     let mut info = client_info("loading-client", "launch");

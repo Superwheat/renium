@@ -12,6 +12,7 @@ rbx lkb --service ReplicatedStorage --path '["ReplicatedStorage","Shared","Logge
 ```
 
 `lka` adds a target, `lk` applies it, `lks` reports status, `lkb` detaches it (`--remove` also drops its record). Sources are project-relative; links are read-only unless `--writable`. Live Sync sends changed paths; otherwise push only when Studio needs them.
+`lk --check` compares without applying. Package checks, status and read-only push guards compare script files as well as stored data and allow a linked model's placement to differ. Edit the source and reapply a drifting read-only copy; `--override-packages` on a push deliberately bypasses that protection.
 Git sources use `--source-type git --source REPOSITORY --ref REF --subpath PATH`; `lk` refreshes the cached ref, `--offline` requires a cache.
 `lkp --link-folder packages --id ID` packages a subtree (same `--service`/`--path`) and registers its source; reuse the ID with `lka`. `lkd --id ID --action` deletes a package: `delete-unused` refuses active uses, `delete-uses` removes them, `unlink-uses` keeps editable copies.
 

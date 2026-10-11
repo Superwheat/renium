@@ -76,12 +76,13 @@ first-connection conflicts toward that side.
 - While Live Sync reports no problem, there is no need to push, poll or playtest after each save.
 - After a failure, read `rbx lst --details`, fix the cause, then `rbx rp` to retry or `rbx dp` to discard.
 
-Without Live Sync, push only what you changed; `--verify` confirms the script
-source in Studio. A push with no paths reconciles the whole place and can remove
+Without Live Sync, push only what you changed; `--verify-sources` pushes and checks
+the script sources. `--verify` only compares sources and pushes nothing.
+A push with no paths reconciles the whole place and can remove
 content that exists only in Studio.
 
 ```powershell
-rbx ps src/ServerScriptService/Main.server.luau --verify
+rbx ps src/ServerScriptService/Main.server.luau --verify-sources
 rbx rev --sync latest
 ```
 

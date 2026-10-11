@@ -123,6 +123,103 @@ fn write_script_package_settings(service_dir: &Path, source: &str) -> PathBuf {
     settings_path
 }
 
+fn test_link_status(dir: &Path) -> Value {
+    capture_json_output(|| {
+        link_status(LinkStatusArgs {
+            project: ProjectSourceArgs {
+                project_root: dir.to_path_buf(),
+                src_root: "src".into(),
+            },
+            manifest: "renium-link.json".into(),
+            cache_dir: None,
+            experience: false,
+            pretty: false,
+        })
+    })
+    .unwrap()
+}
+
+#[test]
+fn package_check_status_and_push_agree_on_external_sources_and_references() {
+    let dir = temp_dir("link-comparison");
+    let src_root = dir.join("src");
+    let service_dir = src_root.join("ReplicatedStorage");
+    write_link_test_service(&service_dir);
+    let store = service_settings_path(&service_dir);
+    let mut document = SettingsBytecode::read_file(&store).unwrap();
+    document
+        .instances
+        .push(settings_instance("other", "Other", "Folder", Some(0)));
+    document.write_file(&store).unwrap();
+    fs::create_dir_all(dir.join("links")).unwrap();
+    let mut model = settings_instance("model", "Pkg", "Model", None);
+    model.properties.insert(
+        "PrimaryPart".into(),
+        json!({"_type": "Ref", "instanceIndex": 1}),
+    );
+    let mut script = settings_instance("script", "Code", "ModuleScript", Some(0));
+    script.properties.insert("Source".into(), json!("return 1"));
+    settings_document(vec![
+        model,
+        settings_instance("part", "Part", "Part", Some(0)),
+        script,
+    ])
+    .write_file(&dir.join("links/pkg.renium"))
+    .unwrap();
+    write_package_link_manifest(&dir, "ReplicatedStorage", true, &["First", "Second"]);
+    link_apply(test_link_apply_args(&dir)).unwrap();
+    let check = || {
+        let mut args = test_link_apply_args(&dir);
+        args.check = true;
+        capture_json_output(|| link_apply(args)).unwrap()
+    };
+    let push = || {
+        collect_editor_changes(&PushEditorChangesArgs {
+            changed_paths: vec![store.clone()],
+            ..PushEditorChangesArgs::new(
+                ProjectSourceArgs {
+                    project_root: dir.clone(),
+                    src_root: "src".into(),
+                },
+                BridgeConnectionArgs::local(0.0),
+            )
+        })
+    };
+    assert_eq!(check()["differenceCount"], json!(0));
+    assert_eq!(test_link_status(&dir)["driftedTargets"], json!(0));
+    push().unwrap();
+    let source = service_dir.join("First/Code.luau");
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    fs::write(&source, "return 1").unwrap();
+    document = SettingsBytecode::read_file(&store).unwrap();
+    let first = resolve_editor_instance_by_path_ordinals(
+        &document,
+        "ReplicatedStorage",
+        &["First".into()],
+        &[1],
+    )
+    .unwrap();
+    let code = document
+        .instances
+        .iter_mut()
+        .find(|instance| instance.parent_index == Some(first) && instance.name == "Code")
+        .unwrap();
+    code.properties
+        .insert("Source".into(), json!(EXTERNAL_SOURCE_MARKER));
+    document.write_file(&store).unwrap();
+    assert_eq!(check()["differenceCount"], json!(0));
+    assert_eq!(test_link_status(&dir)["driftedTargets"], json!(0));
+    push().unwrap();
+    fs::write(&source, "return 2").unwrap();
+    assert_eq!(check()["differenceCount"], json!(1));
+    assert_eq!(test_link_status(&dir)["driftedTargets"], json!(1));
+    assert!(push().is_err());
+    link_apply(test_link_apply_args(&dir)).unwrap();
+    assert_eq!(check()["differenceCount"], json!(0));
+    push().unwrap();
+    fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn link_rotations_are_read_as_proper_rotations() {
     let skewed = test_cframe([
@@ -929,6 +1026,18 @@ fn linked_model_keeps_renamed_root_and_world_transform() {
         link_target_segments(&manifest.links[0].targets[0]),
         ["Renamed"]
     );
+    assert_eq!(test_link_status(&dir)["driftedTargets"], json!(0));
+    collect_editor_changes(&PushEditorChangesArgs {
+        changed_paths: vec![settings_path],
+        ..PushEditorChangesArgs::new(
+            ProjectSourceArgs {
+                project_root: dir.clone(),
+                src_root: "src".into(),
+            },
+            BridgeConnectionArgs::local(0.0),
+        )
+    })
+    .unwrap();
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -2036,6 +2145,11 @@ fn shared_link_consumers_get_read_only_script_files_and_lose_stray_ones() {
     .unwrap();
     assert_eq!(status["driftedTargets"], json!(0));
     assert_eq!(status["shared"][0]["places"], json!({ "race": "ok" }));
+
+    let stray = fixture.race.join("src/ReplicatedStorage/Public/Stray.luau");
+    fs::write(&stray, "return false").unwrap();
+    assert_eq!(test_link_status(&fixture.race)["driftedTargets"], json!(1));
+    fs::remove_file(stray).unwrap();
 
     fs::remove_file(lobby_public.join("Extra.luau")).unwrap();
     let mut lobby = SettingsBytecode::read_file(&SharedFixture::store(&fixture.lobby)).unwrap();

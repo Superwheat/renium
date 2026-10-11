@@ -863,9 +863,7 @@ fn daemon_control_request_inner(
         .get("id")
         .and_then(Value::as_u64)
         .context("Daemon bind response omitted the context ID")?;
-    let verify_only = object.get("verify").and_then(Value::as_bool) == Some(true);
-    let requires_review = !verify_only
-        && (approved || object.get("destructive").and_then(Value::as_bool) == Some(true));
+    let requires_review = opcode.requires_review(&parameters, approved);
     let response = if requires_review {
         let prepare = send_request(&automation::Request {
             v: automation::PROTOCOL_VERSION,

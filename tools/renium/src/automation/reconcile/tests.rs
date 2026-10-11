@@ -993,6 +993,54 @@ fn an_omitted_property_at_its_default_counts_as_retained() {
 }
 
 #[test]
+fn retention_checks_distinguish_editor_state_and_authored_attributes() {
+    for (class, name) in [
+        ("Workspace", "InsertPoint"),
+        ("GuiObject", "AbsoluteSize"),
+        ("Sound", "TimeLength"),
+        ("ScrollingFrame", "CanvasPosition"),
+    ] {
+        let instance = SettingsBytecodeInstance::new("id".into(), class.into(), class.into(), None);
+        let values = |value| Map::from_iter([(name.to_string(), json!(value))]);
+        assert_eq!(
+            expected_map_mismatch(&values(1), &values(2), true, &instance),
+            None,
+            "{class}.{name}"
+        );
+        assert_eq!(
+            changed_map_mismatch(&values(0), &values(1), &values(2), true, &instance),
+            None,
+            "{class}.{name}"
+        );
+        assert!(expected_map_mismatch(&values(1), &values(2), false, &instance).is_some());
+        assert!(
+            changed_map_mismatch(&values(1), &Map::new(), &values(0), false, &instance).is_some()
+        );
+    }
+    let part = SettingsBytecodeInstance::new("id".into(), "Part".into(), "Part".into(), Some(0));
+    let reflectance = Map::from_iter([("Reflectance".into(), json!(0))]);
+    assert!(changed_map_mismatch(&reflectance, &Map::new(), &reflectance, false, &part).is_some());
+    for value in [json!(false), json!(0), json!("")] {
+        let attribute = Map::from_iter([("UserValue".into(), value)]);
+        assert!(expected_map_mismatch(&attribute, &Map::new(), false, &part).is_some());
+        assert!(changed_map_mismatch(&attribute, &Map::new(), &attribute, false, &part).is_some());
+        assert_eq!(
+            changed_map_mismatch(&attribute, &Map::new(), &Map::new(), false, &part),
+            None
+        );
+    }
+    let marker = Map::from_iter([("RBX_LightingTechnologyUnifiedMigration".into(), json!(true))]);
+    assert_eq!(
+        expected_map_mismatch(&marker, &Map::new(), false, &part),
+        None
+    );
+    assert_eq!(
+        changed_map_mismatch(&marker, &Map::new(), &marker, false, &part),
+        None
+    );
+}
+
+#[test]
 fn push_verification_distinguishes_engine_identity_from_authored_data() {
     let mut instance =
         SettingsBytecodeInstance::new("part".into(), "Part".into(), "Part".into(), None);

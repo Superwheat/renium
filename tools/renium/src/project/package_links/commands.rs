@@ -52,9 +52,9 @@ use super::{
     materialize_package_target, package_document_fingerprint, package_lock_key,
     package_target_difference, package_target_fingerprint, package_target_matches,
     package_target_settings_ids, read_link_lock, read_link_manifest, read_link_source_meta,
-    read_only_target_current, referenced_settings_ids_outside, renium_global_packages_dir,
-    resolve_link_cache_dir, resolve_link_target_storage, resolve_link_targets,
-    resolve_local_link_path, selector_starts_with, serialize_link_lock, serialize_link_manifest,
+    referenced_settings_ids_outside, renium_global_packages_dir, resolve_link_cache_dir,
+    resolve_link_target_storage, resolve_link_targets, resolve_local_link_path,
+    selector_starts_with, serialize_link_lock, serialize_link_manifest,
     stage_settings_document_writes, stray_target_files, validate_link_target_ref,
     write_link_manifest,
 };
@@ -313,28 +313,12 @@ fn compare_package_target(
     if resolve_editor_instance_by_path_ordinals(document, service, segments, ordinals).is_none() {
         return Ok((None, false, None));
     }
-    if !shared {
-        let matches = package_target_matches(
-            document,
-            service,
-            segments,
-            ordinals,
-            package,
-            package_fingerprint,
-        )?;
-        let detail = if matches {
-            None
-        } else {
-            package_target_difference(document, service, segments, ordinals, package)?
-        };
-        return Ok((
-            package_target_fingerprint(document, service, segments, ordinals)?,
-            matches,
-            detail,
-        ));
-    }
     let inlined = inline_target_sources(document, service, service_dir, segments, ordinals)?;
-    let stray = stray_target_files(document, service, service_dir, segments, ordinals)?;
+    let stray = if shared {
+        stray_target_files(document, service, service_dir, segments, ordinals)?
+    } else {
+        Vec::new()
+    };
     let matches = package_target_matches(
         &inlined,
         service,
@@ -1364,8 +1348,22 @@ fn project_link_status(
     let mut meta_by_link: HashMap<String, LinkSourceMeta> = HashMap::new();
     let mut source_instances_by_link: HashMap<String, usize> = HashMap::new();
     let mut source_path_by_link: HashMap<String, PathBuf> = HashMap::new();
-    let mut package_fingerprints = HashMap::<PathBuf, Option<String>>::new();
-    let mut settings_documents = HashMap::<PathBuf, Option<SettingsBytecode>>::new();
+    let mut packages = HashMap::<PathBuf, Option<(SettingsBytecode, String)>>::new();
+    let mut settings_documents = HashMap::new();
+    for target in &resolved {
+        if let Some(path) = target
+            .storage
+            .as_ref()
+            .and_then(|storage| storage.settings_file.as_ref())
+            && !settings_documents.contains_key(path)
+            && let Ok(document) = SettingsBytecode::read_file(path)
+        {
+            settings_documents.insert(path.clone(), document);
+        }
+    }
+    if let Err(error) = super::canonicalize_loaded_settings_documents(&mut settings_documents) {
+        return json!({"ok": false, "error": error.to_string()});
+    }
     let mut file_contents = HashMap::<PathBuf, Option<String>>::new();
     for target in &resolved {
         let source_instances = link_target_source_instance_count(target);
@@ -1394,21 +1392,21 @@ fn project_link_status(
         if let Some(package_path) = &target.package_source
             && target.resolved
         {
-            let expected_fingerprint = package_fingerprints
+            let package = packages
                 .entry(package_path.clone())
                 .or_insert_with(|| {
                     SettingsBytecode::read_file(package_path)
-                        .and_then(|package| package_document_fingerprint(&package))
+                        .and_then(|package| {
+                            let fingerprint = package_document_fingerprint(&package)?;
+                            Ok((package, fingerprint))
+                        })
                         .ok()
                 })
-                .as_deref();
+                .as_ref();
             let mut package_root_found = false;
             if let Some(storage) = target.storage.as_ref()
                 && let Some(settings_file) = storage.settings_file.as_ref()
-                && let Some(doc) = settings_documents
-                    .entry(settings_file.clone())
-                    .or_insert_with(|| SettingsBytecode::read_file(settings_file).ok())
-                    .as_ref()
+                && let Some(doc) = settings_documents.get(settings_file)
                 && let Ok((document_service, document_segments, document_ordinals)) =
                     link_target_document_selector(target, doc)
                 && let Some(root_index) = resolve_editor_instance_by_path_ordinals(
@@ -1436,17 +1434,23 @@ fn project_link_status(
                         }));
                     }
                 }
-                let current = expected_fingerprint.is_some_and(|expected| {
-                    read_only_target_current(
+                let current = package.is_some_and(|(package, fingerprint)| {
+                    compare_package_target(
                         doc,
-                        &document_service,
+                        &(
+                            document_service.clone(),
+                            document_segments.clone(),
+                            document_ordinals.clone(),
+                        ),
                         &storage.source_root,
-                        &document_segments,
-                        &document_ordinals,
-                        Some(package_path),
-                        expected,
+                        (package, fingerprint),
+                        shared::experience_package_path(
+                            project_root,
+                            &package_path.to_string_lossy(),
+                        )
+                        .is_some(),
                     )
-                    .unwrap_or(false)
+                    .is_ok_and(|(_, matches, _)| matches)
                 });
                 if !current {
                     drift = true;

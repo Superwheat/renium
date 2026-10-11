@@ -401,26 +401,6 @@ pub(crate) fn verification_values_equal(
     }
 }
 
-/// A property the files omit is retained when Studio holds the class
-/// default for it (Workspace.InsertPoint at 0,0,0) or when the engine owns
-/// the property and the plugin could not have changed it anyway.
-fn omitted_property_retained(class_name: &str, name: &str, observed: &Value) -> bool {
-    rbx_reflection_database::get().is_ok_and(|database| {
-        crate::editor::review::is_engine_managed_editor_property(class_name, name, database)
-            || crate::settings::equivalence::reflection_default_settings_value(
-                database, class_name, name,
-            )
-            .is_some_and(|default| {
-                reconciliation_property_values_equal(
-                    class_name,
-                    name,
-                    Some(&default),
-                    Some(observed),
-                )
-            })
-    })
-}
-
 pub(crate) fn verification_skips_property(
     instance: &SettingsBytecodeInstance,
     name: &str,
@@ -438,6 +418,9 @@ pub(crate) fn verification_skips_property(
             ))
         || reconciliation_property_is_derived(name)
         || crate::settings::equivalence::reconciliation_property_is_forced(name, forced)
+        || rbx_reflection_database::get().is_ok_and(|database| {
+            crate::editor::review::is_editor_state_property(class_name, name, database)
+        })
 }
 
 pub(crate) fn verification_value<'a>(
@@ -494,6 +477,9 @@ pub(crate) fn expected_map_mismatch(
 ) -> Option<String> {
     let class_name = &instance.class_name;
     expected.iter().find_map(|(name, value)| {
+        if !properties && crate::settings::equivalence::is_engine_managed_attribute(name) {
+            return None;
+        }
         if properties
             && (verification_skips_property(instance, name, expected)
                 || crate::settings::equivalence::reconciliation_property_is_metadata(name, value))
@@ -536,6 +522,9 @@ pub(crate) fn changed_map_mismatch(
     names.dedup();
     let class_name = &instance.class_name;
     names.into_iter().find_map(|name| {
+        if !properties && crate::settings::equivalence::is_engine_managed_attribute(name) {
+            return None;
+        }
         if properties && verification_skips_property(instance, name, desired) {
             return None;
         }
@@ -550,11 +539,14 @@ pub(crate) fn changed_map_mismatch(
         }
         if properties
             && expected.is_none()
-            && let Some(actual) = actual
-            && omitted_property_retained(class_name, name, actual)
+            && rbx_reflection_database::get().is_ok_and(|database| {
+                crate::editor::review::is_engine_managed_editor_property(class_name, name, database)
+            })
         {
             return None;
         }
+        // Property equivalence already accepts omitted class defaults.
+        // Attribute absence still means deletion, including false/zero values.
         (!verification_values_equal(properties, class_name, name, expected, actual))
             .then(|| retention_mismatch(name, expected, actual))
     })
