@@ -1,0 +1,9 @@
+# Native compatibility
+
+Studio updates do not disable native features by version. `rbx native-probe --pid PID` performs read-only structural checks and prints one verdict per operation. `--require-native` exits unsuccessfully if any operation is degraded. `rbx status` and `rbx dr` include the selected process's cached verdicts and reasons. A passing probe validates locators; it does not claim a runtime stress test passed.
+
+A failed operation uses its available plugin path. Source verification remains available. Protected values without a lossless bridge path remain pending with a precise error. Optional voxel-history acceleration can be degraded while ordinary history recording and explicit Terrain rollback work.
+
+Maintainers: `powershell -File tools/renium/tests/native-canary.ps1` downloads the current WindowsStudio64 deployment into a unique scratch directory, launches its scratch place without taking focus, probes it and writes a per-operation table. It stops only its own scratch window and leaves evidence. Use `-Studio PATH -Place FILE` to compare an installed build. The scheduled **Studio native canary** workflow runs on `self-hosted, Windows, X64` and fails visibly for degraded operations.
+
+When a probe fails, retain `probes.json` and the deployment manifest; compare executable code/RTTI and update the narrow locator in `src/studio/native/serializer`. Add a relocated-layout regression and rerun probes plus the affected operation on a scratch place, including reconnects. Never extend a build allowlist or relax allocator/ownership checks to make a probe pass. macOS uses the same verdict model. Its DataModel queue and package operations currently report degraded because their former fixed-field locators lack structural proof; snapshot and OS capabilities are checked separately. Windows CI does not verify macOS runtime behavior.

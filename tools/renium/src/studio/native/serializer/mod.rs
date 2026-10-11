@@ -4,6 +4,8 @@ mod arm64_functions;
 mod functions;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(any(windows, target_os = "macos", test))]
+pub(crate) mod probes;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
@@ -210,39 +212,11 @@ impl std::error::Error for HistoryHookUnavailable {}
 #[cfg(any(windows, target_os = "macos"))]
 static HISTORY_HOOK_WARNED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 
-#[cfg(any(windows, target_os = "macos"))]
-/// The newest Studio build on which the history hook is verified. Newer builds
-/// skip the hook, and cancellations restore Terrain explicitly, until it is
-/// verified again: Studio 0.742 exited with heap corruption on the first
-/// recording that passed through the hook verified on 0.741.
-const HISTORY_HOOK_VERIFIED_BUILD: u32 = 741;
-
 #[cfg(windows)]
-static NATIVE_CAPTURE_WARNED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
-
-#[cfg(windows)]
-/// Newer builds serialize through the plugin until the native capture is
-/// verified again; see `windows::NATIVE_VERIFIED_BUILD`.
 pub(crate) fn native_capture_verified(pid: u32) -> bool {
-    let reason = match studio_build_number(pid) {
-        Ok(build) if windows::native_build_verified(build) => return true,
-        Ok(build) => format!(
-            "Studio 0.{build} is newer than build 0.{}, the last one the native capture is verified on",
-            windows::NATIVE_VERIFIED_BUILD
-        ),
-        Err(error) => format!("the Studio build could not be read: {error:#}"),
-    };
-    let mut warned = NATIVE_CAPTURE_WARNED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if !warned.contains(&pid) {
-        warned.push(pid);
-        crate::app::output::log_global(
-            3,
-            format_args!("[renium] native capture skipped, plugin serialization is used: {reason}"),
-        );
-    }
-    false
+    target_name(pid, "")
+        .and_then(|title| probes::run(pid, &title, probes::NativeOperation::Capture))
+        .is_ok()
 }
 
 pub(crate) fn register_history_if_available(
@@ -251,13 +225,9 @@ pub(crate) fn register_history_if_available(
     token: &str,
     terrain: bool,
 ) -> anyhow::Result<bool> {
-    let result = match studio_build_number(pid) {
-        Ok(build) if build > HISTORY_HOOK_VERIFIED_BUILD => Err(HistoryHookUnavailable(format!(
-            "Studio 0.{build} is newer than build 0.{HISTORY_HOOK_VERIFIED_BUILD}, the last one the hook is verified on"
-        ))
-        .into()),
-        _ => register_history(pid, title, token),
-    };
+    let result = probes::run(pid, title, probes::NativeOperation::History)
+        .map_err(|error| anyhow::Error::new(HistoryHookUnavailable(format!("{error:#}"))))
+        .and_then(|_| register_history(pid, title, token));
     match result {
         Ok(()) => Ok(true),
         Err(error) => {
@@ -266,7 +236,7 @@ pub(crate) fn register_history_if_available(
             };
             if terrain {
                 anyhow::bail!(
-                    "Terrain sync needs the Studio history hook, which this Studio build does not support yet: {unavailable}"
+                    "Terrain sync needs the Studio history hook; its structural probe failed: {unavailable}"
                 );
             }
             let mut warned = crate::system::LockRecover::lock_recover(&HISTORY_HOOK_WARNED);
@@ -276,7 +246,7 @@ pub(crate) fn register_history_if_available(
                 crate::app::output::log_global(
                     2,
                     format_args!(
-                        "[renium] warning: Studio history hook unavailable on this Studio build; Terrain sync is disabled until Renium is updated ({unavailable})"
+                        "[renium] warning: Studio history hook unavailable; using explicit rollback where supported ({unavailable})"
                     ),
                 );
             }

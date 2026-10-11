@@ -66,6 +66,7 @@ pub(crate) fn read_service_payload(
         "Native import batches do not cover the payload"
     );
     let memory = ProcessMemory::open(pid)?;
+    memory.authorize(NativeOperation::ServiceReader, title)?;
     let current_modules = modules(pid)?;
     let studio = current_modules
         .first()

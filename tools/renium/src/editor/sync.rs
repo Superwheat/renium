@@ -1331,6 +1331,10 @@ fn verify_editor_sources_only(
         Value::Bool(verification.failed.is_empty()),
     );
     summary.insert("verifyOnly".to_string(), Value::Bool(true));
+    summary.insert(
+        "sourceVerification".to_string(),
+        json!("plugin ScriptDocument/source batch"),
+    );
     summary.insert("pushed".to_string(), Value::Bool(false));
     summary.insert(
         "sourceVerified".to_string(),

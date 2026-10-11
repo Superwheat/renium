@@ -500,7 +500,12 @@ fn compact_push_summary(
     );
     if summary.get("verifyOnly") == Some(&Value::Bool(true)) {
         result.insert("verifyOnly".to_string(), Value::Bool(true));
-        for key in ["sourceVerified", "sourceVerifyFailed", "sourceVerifyErrors"] {
+        for key in [
+            "sourceVerified",
+            "sourceVerifyFailed",
+            "sourceVerifyErrors",
+            "sourceVerification",
+        ] {
             if let Some(value) = summary.get(key) {
                 result.insert(key.to_string(), value.clone());
             }
@@ -1094,6 +1099,29 @@ fn studio_status_result(
     if controller_play_running == Some(false) && controller_play_starting == Some(false) {
         clients.retain(|client| client["role"] == "edit");
     }
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let mut pids = clients
+            .iter()
+            .filter(|client| client["role"] == "edit")
+            .filter_map(|client| {
+                client["pid"]
+                    .as_u64()
+                    .and_then(|pid| u32::try_from(pid).ok())
+            })
+            .collect::<Vec<_>>();
+        pids.sort_unstable();
+        pids.dedup();
+        if pids.len() == 1 {
+            result["nativeOperations"] = crate::studio::native::serializer::probes::cached(pids[0]);
+        } else if !pids.is_empty() {
+            result["nativeSessions"] = json!(
+                pids.into_iter()
+                    .map(crate::studio::native::serializer::probes::cached)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
     result["clients"] = json!(clients);
     let mut available = Vec::new();
     if has_edit {
@@ -1268,6 +1296,12 @@ fn automation_dispatch_operation(
         op::PUSH => {
             bridge.wait_for_all_target(bridge_wait_seconds, BridgeTarget::Main)?;
             let args = automation_push_args(context, parameters, reviewed)?;
+            if args.verify {
+                let summary = push_editor_changes_with_warm_bridge(args, bridge)?;
+                return Ok(Value::Object(compact_push_summary(
+                    &summary, parameters, false,
+                )));
+            }
             if !push_is_filtered(parameters) {
                 let summary = push_project_replacement(context, bridge, &sync_services(), args)?;
                 return Ok(Value::Object(compact_push_summary(
@@ -1622,6 +1656,18 @@ fn automation_dispatch_managed(
             bridge_wait_seconds,
         )
         .map_err(automation_failure);
+    }
+    // Source verification is observational. Do not capture/acknowledge a sync
+    // checkpoint or run a replacement transaction before reaching its bridge read.
+    if operation == op::PUSH && parameters.get("verify").and_then(Value::as_bool) == Some(true) {
+        return automation_dispatch_with_retry(
+            operation,
+            context,
+            parameters,
+            bridge,
+            bridge_wait_seconds,
+            reviewed,
+        );
     }
     let writes_project = matches!(
         operation,

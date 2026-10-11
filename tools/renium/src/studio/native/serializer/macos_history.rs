@@ -144,38 +144,45 @@ pub(super) fn binding(prepared: &NativeProperty) -> Result<Vec<u8>> {
         image.cpu == CPU_TYPE_ARM64,
         "Terrain history requires the native ARM64 engine ABI"
     );
-    let fields = prepared.memory.read(descriptor, 256)?;
-    let candidates = (64..256)
-        .step_by(8)
-        .filter_map(|offset| {
-            let target = read_u64(&fields, offset)?;
-            let native = target
-                .checked_sub(prepared.memory.base)?
-                .checked_add(image.image_base)?;
-            function(&image, native)?;
-            Some((offset, target, native))
-        })
-        .collect::<Vec<_>>();
+    let table = prepared.memory.pointer(descriptor)?;
+    let offset = prepared.memory.function_field(descriptor, table)?;
     anyhow::ensure!(
-        candidates.len() == 1,
-        "History member function is missing or ambiguous"
+        prepared.memory.pointer(descriptor + offset as u64 + 8)? == 0,
+        "Unsupported history receiver adjustment"
     );
-    let (offset, finish, native) = candidates[0];
-    anyhow::ensure!(
-        read_u64(&fields, offset + 8) == Some(0),
-        "Unsupported history member adjustment"
-    );
+    let finish = prepared.memory.pointer(descriptor + offset as u64)?;
+    if prepared.memory.code(finish, 64).is_err() {
+        // Protocol 12 certifies the ownership-safe helper and returns only its
+        // immutable installation state, without invoking or registering a hook.
+        let installed = prepared.memory.request(6, &[0], "")?;
+        anyhow::ensure!(
+            installed.len() == 88
+                && read_u64(&installed, 0) == Some(descriptor)
+                && read_u64(&installed, 8) == Some(table)
+                && read_u64(&installed, 16) == Some(offset as u64)
+                && read_u64(&installed, 80) == Some(finish),
+            "History slot does not belong to the certified helper generation"
+        );
+        let original = read_u64(&installed, 24).context("Missing original history function")?;
+        let native = original
+            .checked_sub(prepared.memory.base)
+            .and_then(|rva| rva.checked_add(image.image_base))
+            .context("Installed history original is outside Studio")?;
+        let code = function(&image, native).context("Missing verified history function")?;
+        prepared.memory.code(original, code.len())?;
+        anyhow::ensure!(
+            read_u64(&installed, 32) == Some(0),
+            "Installed voxel playback hook requires independent validation"
+        );
+        return Ok(installed[..80].to_vec());
+    }
+    let native = finish
+        .checked_sub(prepared.memory.base)
+        .and_then(|rva| rva.checked_add(image.image_base))
+        .context("History member is outside Studio")?;
     let playback = match discover(&image, native) {
         Ok(voxel) => Some(voxel),
-        Err(error) => {
-            crate::app::output::log_global(
-                2,
-                format_args!(
-                    "[renium] warning: Studio voxel playback hook unavailable on this build; cancellations restore Terrain explicitly ({error:#})"
-                ),
-            );
-            None
-        }
+        Err(_) => None,
     };
     let mut target = 0;
     if let Some(voxel) = playback {
@@ -183,9 +190,12 @@ pub(super) fn binding(prepared: &NativeProperty) -> Result<Vec<u8>> {
         target = prepared.memory.base + voxel - image.image_base;
         prepared.memory.code(target, code.len())?;
     }
-    prepared
-        .memory
-        .code(finish, function(&image, native).unwrap().len())?;
+    prepared.memory.code(
+        finish,
+        function(&image, native)
+            .context("Missing verified history function")?
+            .len(),
+    )?;
     let mut binding = vec![0; 80];
     for (at, value) in [
         (0, descriptor),

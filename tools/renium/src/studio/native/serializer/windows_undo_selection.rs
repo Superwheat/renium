@@ -223,6 +223,21 @@ fn layout(path: &Path) -> Result<Layout> {
     Ok(layout)
 }
 
+pub(super) fn probe(memory: &ProcessMemory, studio: &ModuleEntry) -> Result<serde_json::Value> {
+    let layout = layout(&studio.path)?;
+    verify_loaded_image(memory, studio, layout.image_stamp)?;
+    for (rva, original) in &layout.sites {
+        let current = memory.read_vec(studio.base + rva, 5)?;
+        anyhow::ensure!(
+            current == original || current == NOP5,
+            "Studio undo restore call site changed in memory"
+        );
+    }
+    Ok(
+        serde_json::json!({"callSites": layout.sites.iter().map(|(rva, _)| *rva).collect::<Vec<_>>() }),
+    )
+}
+
 // A process patch like the package notice flag: it survives reconnects and
 // daemon restarts until Studio exits, and is idempotent.
 pub(crate) fn keep_selection_across_undo(pid: u32) -> Result<()> {
@@ -233,6 +248,7 @@ pub(crate) fn keep_selection_across_undo(pid: u32) -> Result<()> {
         .context("Studio module was not found for the undo selection patch")?;
     let layout = layout(&studio.path)?;
     let memory = ProcessMemory::open(pid)?;
+    memory.authorize(NativeOperation::UndoSelection, "")?;
     verify_loaded_image(&memory, studio, layout.image_stamp)?;
     for (rva, original) in &layout.sites {
         let address = studio.base + rva;

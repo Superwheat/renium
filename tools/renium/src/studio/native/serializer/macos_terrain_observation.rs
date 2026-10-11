@@ -7,6 +7,7 @@ pub(crate) fn observe_terrain(
     relay_path: &[String],
     catch_up: bool,
 ) -> Result<()> {
+    super::super::super::probes::run(pid, title, NativeOperation::TerrainObservation)?;
     anyhow::ensure!(
         relay_path.len() == 2
             && relay_path[0] == "CoreGui"
@@ -85,7 +86,7 @@ pub(crate) fn observe_terrain(
     property.invoke(8).map(|_| ())
 }
 
-fn binding(property: &NativeProperty) -> Result<Vec<u8>> {
+pub(super) fn binding(property: &NativeProperty) -> Result<Vec<u8>> {
     let memory = &property.memory;
     let instance = read_u64(&property.parameters, 8).unwrap();
     let primary = memory.pointer(instance)?;

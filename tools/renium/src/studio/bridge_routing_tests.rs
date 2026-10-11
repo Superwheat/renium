@@ -27,6 +27,109 @@ fn fixture() -> BridgeServer {
 }
 
 #[test]
+fn unfiltered_verify_uses_only_plugin_sources_when_native_capture_is_unavailable() {
+    use crate::automation::authorization::signed_fixture_request;
+    use crate::automation::{State, op, runtime::automation_parse_response_with_lease};
+    // Isolate process-global project selection from the parallel test suite.
+    if std::env::var_os("RENIUM_TEST_VERIFY_FALLBACK").is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "studio::bridge::routing_tests::unfiltered_verify_uses_only_plugin_sources_when_native_capture_is_unavailable"])
+            .env("RENIUM_TEST_VERIFY_FALLBACK", "1").status().unwrap();
+        assert!(status.success());
+        return;
+    }
+    let root = crate::tests::support::temp_dir("verify-native-fallback");
+    std::fs::create_dir_all(root.join("src/ServerScriptService")).unwrap();
+    std::fs::write(
+        root.join("src/ServerScriptService/Canary.server.luau"),
+        "return 42\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("renium.project.jsonc"),
+        r#"{"schemaVersion":1,"sourceRoot":"src","tree":{}}"#,
+    )
+    .unwrap();
+    let mut bridge = fixture();
+    bridge.channels.truncate(1);
+    let bridge = Arc::new(bridge);
+    // The test process is deliberately not Studio: native capture cannot pass.
+    let stream = connect(&bridge, 0, edit_info("verify-edit", 20));
+    let worker = thread::spawn(move || {
+        let mut peer =
+            WebSocket::from_raw_socket(stream, tungstenite::protocol::Role::Client, None);
+        let mut methods = Vec::new();
+        while let Ok(message) = peer.read() {
+            let Message::Text(text) = message else {
+                if let Message::Ping(bytes) = message {
+                    peer.send(Message::Pong(bytes)).unwrap();
+                }
+                continue;
+            };
+            let request: Value = serde_json::from_str(&text).unwrap();
+            methods.push(request["method"].as_str().unwrap().to_string());
+            assert_eq!(
+                request["method"], "getLiveSourceBatch",
+                "unexpected mutation or capture: {request}"
+            );
+            assert!(request["params"]["transactionId"].is_null());
+            peer.send(Message::Text(
+                json!({"id":request["id"], "ok":true, "result":{
+                    "rows":[{"index":0,"source":"return 42\n","className":"Script"}]
+                }})
+                .to_string()
+                .into(),
+            ))
+            .unwrap();
+        }
+        methods
+    });
+    let state = State::default();
+    let bind = automation_parse_response_with_lease(
+        &signed_fixture_request(
+            &state,
+            json!({
+                "v":1,"id":1,"op":op::BIND,"p":{"root":root,"place":"10:20"}
+            }),
+        ),
+        &state,
+        &bridge,
+        0.1,
+        None,
+    );
+    assert_eq!(bind.ok, 1, "{}", serde_json::to_string(&bind).unwrap());
+    let context = bind.r.unwrap()["id"].as_u64().unwrap();
+    let response = automation_parse_response_with_lease(
+        &signed_fixture_request(
+            &state,
+            json!({
+                "v":1,"id":2,"op":op::PUSH,"cx":context,"p":{"verify":true,"compact":true}
+            }),
+        ),
+        &state,
+        &bridge,
+        0.1,
+        None,
+    );
+    assert_eq!(
+        response.ok,
+        1,
+        "{}",
+        serde_json::to_string(&response).unwrap()
+    );
+    let result = response.r.unwrap();
+    assert_eq!(result["verifyOnly"], true, "{result}");
+    assert_eq!(result["sourceVerified"], 1, "{result}");
+    assert_eq!(
+        result["sourceVerification"], "plugin ScriptDocument/source batch",
+        "{result}"
+    );
+    drop(bridge);
+    assert_eq!(worker.join().unwrap(), ["getLiveSourceBatch"]);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn parallel_transfer_workers_keep_parent_lease_ownership_and_cancellation() {
     let bridge = fixture();
     let lease = Arc::new(BridgeRequestLease::new("native-transfer".into()));

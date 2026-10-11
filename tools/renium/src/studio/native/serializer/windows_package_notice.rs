@@ -126,6 +126,23 @@ fn layout(path: &Path) -> Result<Layout> {
     Ok(layout)
 }
 
+pub(super) fn probe(memory: &ProcessMemory, studio: &ModuleEntry) -> Result<serde_json::Value> {
+    let layout = layout(&studio.path)?;
+    verify_loaded_image(memory, studio, layout.image_stamp)?;
+    anyhow::ensure!(
+        memory.read_vec(
+            studio.base + layout.registration,
+            layout.registration_bytes.len()
+        )? == layout.registration_bytes,
+        "Studio package popup registration changed in memory"
+    );
+    let value = memory.read_vec(studio.base + layout.flag, 1)?[0];
+    anyhow::ensure!(value <= 1, "Studio package popup flag is not boolean");
+    Ok(
+        serde_json::json!({"flagRva": layout.flag, "value": value, "registrationRva": layout.registration}),
+    )
+}
+
 // This is a process patch, not a transaction guard. Studio can enqueue package
 // notifications during load, raw Luau, commit, or delayed rollback. Restoring the
 // flag between requests re-enables those notices after the command has returned.
@@ -138,6 +155,7 @@ pub(crate) fn suppress_package_notices(pid: u32) -> Result<()> {
         .context("Studio module was not found for package popup suppression")?;
     let layout = layout(&studio.path)?;
     let memory = ProcessMemory::open(pid)?;
+    memory.authorize(NativeOperation::PackageNotices, "")?;
     verify_loaded_image(&memory, studio, layout.image_stamp)?;
     anyhow::ensure!(
         memory.read_vec(

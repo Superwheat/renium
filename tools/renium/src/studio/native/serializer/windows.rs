@@ -1,4 +1,9 @@
+use super::probes::NativeOperation;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+#[path = "windows_probes.rs"]
+mod probes;
+pub(super) use probes::probe_operation;
 use std::ffi::{OsStr, c_void};
 use std::fs;
 use std::io::Read;
@@ -172,61 +177,55 @@ struct ActiveDataModel {
 
 struct ProcessMemory {
     handle: HANDLE,
-    verified: bool,
-}
-
-/// The newest Studio build on which Renium's native operations (injected
-/// helpers, memory patches, the capture) are verified. Reads stay available;
-/// every write, allocation, helper load and thread start checks this gate.
-/// Studio 0.742 exited with heap corruption (0xc0000374) under the helpers verified on
-/// 0.741, during captures, at Live Sync start and after a plain connect.
-pub(super) const NATIVE_VERIFIED_BUILD: u32 = 741;
-
-pub(super) fn native_build_verified(build: u32) -> bool {
-    build <= NATIVE_VERIFIED_BUILD
-}
-
-static NATIVE_GATE_WARNED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
-
-/// Reads stay available on every build: discovery, status and comparisons
-/// only look at Studio's memory. Writes, allocations and remote threads are
-/// what corrupt an unverified build, so those refuse.
-fn native_writes_verified(pid: u32) -> bool {
-    let reason = match studio_build_number(pid) {
-        Ok(build) if native_build_verified(build) => return true,
-        Ok(build) => format!(
-            "Studio 0.{build} is newer than build 0.{NATIVE_VERIFIED_BUILD}, the last one Renium's native operations are verified on"
-        ),
-        Err(error) => format!("the Studio build could not be read: {error:#}"),
-    };
-    let mut warned = NATIVE_GATE_WARNED.lock().unwrap_or_else(|e| e.into_inner());
-    if !warned.contains(&pid) {
-        warned.push(pid);
-        crate::app::output::log_global(
-            3,
-            format_args!(
-                "[renium] native Studio writes are disabled for Studio pid={pid}: {reason}"
-            ),
-        );
-    }
-    false
+    pid: u32,
+    verified: Cell<bool>,
 }
 
 const NATIVE_WRITES_DISABLED: &str =
-    "Native Studio operations are disabled on this Studio build; the last verified build is 0.741";
+    "Native operation has no successful read-only compatibility probe";
 
 impl ProcessMemory {
     fn open(pid: u32) -> Result<Self> {
         Self::open_with_access(pid, 0)
     }
 
-    /// The audio helper hooks the Windows audio render client's vtable and
-    /// touches no engine structure, so it stays available on builds the
-    /// engine-bound helpers are not verified on.
     fn open_for_windows_audio(pid: u32) -> Result<Self> {
-        let mut memory = Self::open_with_access(pid, 0)?;
-        memory.verified = true;
+        let memory = Self::open_with_access(pid, 0)?;
+        memory.authorize(NativeOperation::AudioGate, "")?;
         Ok(memory)
+    }
+
+    fn open_read_only(pid: u32) -> Result<Self> {
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid) };
+        anyhow::ensure!(
+            !handle.is_null(),
+            "Could not open Studio process {pid} for read-only probes: {}",
+            std::io::Error::last_os_error()
+        );
+        Ok(Self {
+            handle,
+            pid,
+            verified: Cell::new(false),
+        })
+    }
+
+    fn authorize(&self, operation: NativeOperation, title: &str) -> Result<()> {
+        self.verified.set(false);
+        if let Some(target) = std::env::var_os("RENIUM_NATIVE_TARGET_PID") {
+            let target = target
+                .to_str()
+                .context("Invalid native canary PID")?
+                .parse::<u32>()?;
+            anyhow::ensure!(
+                target == self.pid,
+                "Studio is outside the native canary target"
+            );
+        }
+        let result = probes::check(self, self.pid, title, operation);
+        super::probes::record(self.pid, operation, &result);
+        result.with_context(|| format!("Native {operation:?} unavailable"))?;
+        self.verified.set(true);
+        Ok(())
     }
 
     fn open_with_access(pid: u32, additional: u32) -> Result<Self> {
@@ -244,10 +243,11 @@ impl ProcessMemory {
                 std::io::Error::last_os_error()
             );
         }
-        // Retain the process object before checking its build so the PID cannot
-        // be recycled between the decision and the handle used for mutations.
-        let verified = native_writes_verified(pid);
-        Ok(Self { handle, verified })
+        Ok(Self {
+            handle,
+            pid,
+            verified: Cell::new(false),
+        })
     }
 
     fn read(&self, address: usize, output: &mut [u8]) -> Result<()> {
@@ -289,7 +289,7 @@ impl ProcessMemory {
     }
 
     fn ensure_writes_verified(&self) -> Result<()> {
-        anyhow::ensure!(self.verified, NATIVE_WRITES_DISABLED);
+        anyhow::ensure!(self.verified.get(), NATIVE_WRITES_DISABLED);
         Ok(())
     }
 
@@ -558,14 +558,6 @@ impl<'a> PeImage<'a> {
         bail!("Studio RVA 0x{rva:X} is not mapped")
     }
 
-    fn va_to_offset(&self, address: usize) -> Result<usize> {
-        self.rva_to_offset(
-            address
-                .checked_sub(self.image_base)
-                .context("Studio address is below its image base")?,
-        )
-    }
-
     fn call_target(&self, offset: usize) -> Result<usize> {
         if self.bytes.get(offset) != Some(&0xE8) {
             bail!("Expected a direct Studio call at file offset 0x{offset:X}");
@@ -767,25 +759,17 @@ fn trace_serializer(path: &Path, bytes: &[u8]) -> Result<SerializerTrace> {
     if slice(bytes, wrapper_offset, wrapper_prefix.len())? != wrapper_prefix {
         bail!("Studio serializer wrapper changed");
     }
-    let async_wrapper = image.call_target(wrapper_offset + 0x52)?;
-    let async_offset = image.rva_to_offset(async_wrapper)?;
     let async_prefix = hex("4C8BDC534881ECD0000000")?;
-    if slice(bytes, async_offset, async_prefix.len())? != async_prefix {
-        bail!("Studio asynchronous serializer wrapper changed");
-    }
-    let vtable_lea = async_offset + 0x9c;
-    if slice(bytes, vtable_lea, 3)? != [0x48, 0x8D, 0x0D] {
-        bail!("Studio serializer callback moved");
-    }
-    let vtable = image.rip_target(vtable_lea, 7)?;
-    let vtable_offset = image.rva_to_offset(vtable)?;
-    let invoke_va = read_u64(bytes, vtable_offset + 16)? as usize;
-    let invoke_offset = image.va_to_offset(invoke_va)?;
+    let async_wrapper = unique_function_call(&image, wrapper, &async_prefix)?;
     let invoke_prefix = hex("4883EC68488B41504C8B49204C8B4118488B5110")?;
-    if slice(bytes, invoke_offset, invoke_prefix.len())? != invoke_prefix {
-        bail!("Studio serializer callback changed");
-    }
-    let serializer = image.call_target(invoke_offset + 0x51)?;
+    let invoke = serializer_callback(&image, async_wrapper, &invoke_prefix)?;
+    let calls = direct_calls(&image, invoke)?;
+    anyhow::ensure!(
+        calls.len() == 1,
+        "Studio serializer callback has {} direct calls",
+        calls.len()
+    );
+    let serializer = calls[0];
     let trace = SerializerTrace {
         serializer,
         context_builder,
@@ -802,6 +786,92 @@ fn trace_serializer(path: &Path, bytes: &[u8]) -> Result<SerializerTrace> {
         },
     );
     Ok(trace)
+}
+
+fn decoded_function(image: &PeImage<'_>, rva: usize) -> Result<Vec<iced_x86::Instruction>> {
+    let offset = image.rva_to_offset(rva)?;
+    let end = image.function_end(offset)?;
+    Ok(iced_x86::Decoder::with_ip(
+        64,
+        &image.bytes[offset..end],
+        rva as u64,
+        iced_x86::DecoderOptions::NONE,
+    )
+    .into_iter()
+    .collect())
+}
+
+fn direct_calls(image: &PeImage<'_>, rva: usize) -> Result<Vec<usize>> {
+    decoded_function(image, rva)?
+        .into_iter()
+        .filter(|i| {
+            i.mnemonic() == iced_x86::Mnemonic::Call
+                && i.op0_kind() == iced_x86::OpKind::NearBranch64
+        })
+        .map(|i| {
+            let target = i.near_branch_target() as usize;
+            image.require_executable_rva(target)?;
+            Ok(target)
+        })
+        .collect()
+}
+
+fn unique_function_call(image: &PeImage<'_>, caller: usize, prefix: &[u8]) -> Result<usize> {
+    let mut calls = direct_calls(image, caller)?
+        .into_iter()
+        .filter(|rva| {
+            image
+                .rva_to_offset(*rva)
+                .ok()
+                .and_then(|offset| image.bytes.get(offset..offset + prefix.len()))
+                == Some(prefix)
+        })
+        .collect::<Vec<_>>();
+    calls.sort_unstable();
+    calls.dedup();
+    anyhow::ensure!(
+        calls.len() == 1,
+        "Studio serializer wrapper resolved {} implementations",
+        calls.len()
+    );
+    Ok(calls[0])
+}
+
+fn serializer_callback(image: &PeImage<'_>, wrapper: usize, prefix: &[u8]) -> Result<usize> {
+    let mut candidates = HashSet::new();
+    for instruction in decoded_function(image, wrapper)? {
+        if instruction.mnemonic() != iced_x86::Mnemonic::Lea
+            || !instruction.is_ip_rel_memory_operand()
+        {
+            continue;
+        }
+        let Ok(table) = image.rva_to_offset(instruction.ip_rel_memory_address() as usize) else {
+            continue;
+        };
+        // A std::function implementation has executable virtual methods; the
+        // invoke method is identified by its argument marshalling, not its slot.
+        for slot in (0..128).step_by(8) {
+            let Ok(address) = read_u64(image.bytes, table + slot) else {
+                break;
+            };
+            let Some(rva) = (address as usize).checked_sub(image.image_base) else {
+                break;
+            };
+            if image.require_executable_rva(rva).is_err() {
+                break;
+            }
+            let offset = image.rva_to_offset(rva)?;
+            if image.bytes.get(offset..offset + prefix.len()) == Some(prefix) {
+                candidates.insert(rva);
+            }
+        }
+    }
+    anyhow::ensure!(
+        candidates.len() == 1,
+        "Studio serializer callback resolved {} implementations",
+        candidates.len()
+    );
+    Ok(*candidates.iter().next().unwrap())
 }
 
 fn serializer_operands_consistent(b: &[u8]) -> bool {
@@ -1509,40 +1579,10 @@ fn refresh_active_data_model(
 }
 
 pub(crate) fn prepare_context(pid: u32, title: &str) -> Result<()> {
-    let current_modules = modules(pid)?;
-    let studio = current_modules
-        .iter()
-        .find(|module| module.name.eq_ignore_ascii_case("RobloxStudioBeta.exe"))
-        .context("Roblox Studio module was not found")?;
-    let layout = package_layout(&studio.path)?;
-    let memory = ProcessMemory::open(pid)?;
-    verify_loaded_image(&memory, studio, layout.image_stamp)?;
-    let model = active_data_model(pid, &memory, studio, layout.data, title)?;
-    if let Err(error) = observation::prepare(&memory, studio, &model) {
-        crate::app::output::log_global(
-            5,
-            format_args!("[renium] native attribute observation unavailable: {error:#}"),
-        );
-    }
-    if let Err(error) = studio_layout(&studio.path) {
-        crate::app::output::log_global(
-            5,
-            format_args!("[renium] native capture unavailable: {error:#}"),
-        );
-    }
-    // Connection preparation runs in its existing background worker. Cache an
-    // unsupported loader too, without disabling independent property/package APIs.
-    if let Err(error) = loader::prepare(&studio.path).and_then(|trace| {
-        anyhow::ensure!(
-            trace.instance_offset == model.layout.data_model_instance,
-            "Native loader disagrees with Studio's DataModel layout"
-        );
-        Ok(())
-    }) {
-        crate::app::output::log_global(
-            5,
-            format_args!("[renium] native loader unavailable: {error:#}"),
-        );
+    // Existing background connection preparation records each independent result.
+    // Nothing in this sweep writes memory or loads a helper.
+    for operation in NativeOperation::ALL {
+        let _ = super::probes::run(pid, title, operation);
     }
     Ok(())
 }
@@ -1551,7 +1591,8 @@ pub(crate) fn prepare_context(pid: u32, title: &str) -> Result<()> {
 // has no supported reader contract. Invocation still revalidates live code,
 // target identities and DataModel ownership under the transaction's guard.
 pub(crate) fn prepare_service_reader(pid: u32) -> Result<()> {
-    anyhow::ensure!(native_writes_verified(pid), NATIVE_WRITES_DISABLED);
+    let title = crate::studio::input::studio_window_title(pid)?;
+    super::probes::run(pid, &title, NativeOperation::ServiceReader)?;
     let current_modules = modules(pid)?;
     let studio = current_modules
         .iter()
@@ -1845,58 +1886,18 @@ fn property_binding(
     studio: &ModuleEntry,
     descriptor: usize,
 ) -> Result<usize> {
-    let bytes = memory.read_vec(descriptor, 0x200)?;
-    let mut read_only = None;
-    for offset in (0x40..0x200).step_by(8) {
-        let pointer = read_u64(&bytes, offset)? as usize;
-        if !likely_pointer(pointer) {
-            continue;
-        }
-        let Some(kind) = read_rtti_type(memory, pointer, studio.base, studio.size) else {
-            continue;
-        };
-        if !kind.contains("@?$PropDescriptor@") {
-            continue;
-        }
-        if kind.starts_with(".?AV?$GetSetImpl@") {
-            return Ok(pointer);
-        }
-        if kind.starts_with(".?AV?$GetImpl@") {
-            read_only.get_or_insert(pointer);
-        }
-    }
-    read_only.context("Property descriptor has no recognised binding")
-}
-
-fn property_class_adjustment(
-    memory: &ProcessMemory,
-    studio: &ModuleEntry,
-    instance: usize,
-    layout: InstanceLayout,
-    descriptor: usize,
-    binding: usize,
-    property_name: &str,
-) -> Result<i32> {
-    let read_adjustment = |binding: usize| -> Option<i32> {
-        let cast = memory.read_u64(binding + 16).ok()? as usize;
-        let code = memory.read_vec(cast, 12).ok()?;
-        (code[..8] == [0x48, 0x8b, 0xc1, 0x33, 0xd2, 0x48, 0x81, 0xc1])
-            .then(|| i32::from_le_bytes([code[8], code[9], code[10], code[11]]))
-    };
-    let adjustment = read_adjustment(binding)
-        .or_else(|| {
-            let fallback =
-                find_class_member_descriptor(memory, instance, layout, "VersionNumber").ok()?;
-            let declaring_class = memory.read_u64(descriptor + 0x30).ok()?;
-            (memory.read_u64(fallback + 0x30).ok()? == declaring_class).then_some(())?;
-            let fallback_binding = property_binding(memory, studio, fallback).ok()?;
-            read_adjustment(fallback_binding)
-        })
-        .with_context(|| format!("Property '{property_name}' cast has an unsupported layout"))?;
-    if adjustment >= 0 {
-        bail!("Property '{property_name}' resolved an invalid class adjustment");
-    }
-    Ok(adjustment)
+    let mut candidates = properties::bindings(memory, studio, descriptor)?
+        .into_iter()
+        .map(|(_, binding)| binding)
+        .collect::<Vec<_>>();
+    candidates.sort_unstable();
+    candidates.dedup();
+    anyhow::ensure!(
+        candidates.len() == 1,
+        "Property descriptor has {} structurally valid bindings",
+        candidates.len()
+    );
+    Ok(candidates[0])
 }
 
 #[derive(Clone, Copy)]
@@ -1922,41 +1923,8 @@ fn integer_property_layout(
     let descriptor = find_class_member_descriptor(memory, instance, layout, property_name)?;
     let binding = property_binding(memory, studio, descriptor)
         .with_context(|| format!("Property '{property_name}' binding"))?;
-    let getter = memory.read_u64(binding + 8)? as usize;
-    let code = memory.read_vec(getter, 8)?;
-    let (getter_offset, width) = if code[..3] == [0x48, 0x8b, 0x81] && code[7] == 0xc3 {
-        (
-            u32::from_le_bytes(code[3..7].try_into().expect("getter offset is four bytes"))
-                as usize,
-            8,
-        )
-    } else if code[..2] == [0x8b, 0x81] && code[6] == 0xc3 {
-        (
-            u32::from_le_bytes(code[2..6].try_into().expect("getter offset is four bytes"))
-                as usize,
-            4,
-        )
-    } else if code[..3] == [0x0f, 0xb6, 0x81] && code[7] == 0xc3 {
-        (
-            u32::from_le_bytes(code[3..7].try_into().expect("getter offset is four bytes"))
-                as usize,
-            1,
-        )
-    } else {
-        bail!("Property '{property_name}' getter has an unsupported layout");
-    };
-    let adjustment = property_class_adjustment(
-        memory,
-        studio,
-        instance,
-        layout,
-        descriptor,
-        binding,
-        property_name,
-    )?;
-    let offset = getter_offset
-        .checked_add(adjustment.unsigned_abs() as usize)
-        .context("Property field offset overflowed")?;
+    let (offset, width) = properties::integer_field_layout(memory, studio, binding)
+        .with_context(|| format!("Property '{property_name}' scalar binding"))?;
     if offset >= 0x1000 {
         bail!("Property '{property_name}' resolved an invalid field offset");
     }
@@ -2150,28 +2118,32 @@ fn data_model_task_context(
         .outer
         .checked_add(data_model.layout.data_model_instance)
         .context("DataModel instance address overflowed")?;
-    let task_context = (memory.read_u64(data_model_instance + 0x58)? as usize) & !7;
-    if !likely_pointer(task_context) {
-        bail!("Studio DataModel task context is not ready");
+    let mut contexts = HashSet::new();
+    for (offset, mask) in
+        properties::object_pointer_fields(memory, studio, layout, data_model_instance)?
+    {
+        let Ok(value) = memory.read_u64(data_model_instance + offset) else {
+            continue;
+        };
+        let pointer = value as usize & mask;
+        if likely_pointer(pointer)
+            && properties::complete_reflection_type(memory, studio, pointer).as_deref()
+                == Some(".?AVEngineContext@RBX@@")
+        {
+            contexts.insert(pointer);
+        }
     }
+    anyhow::ensure!(
+        contexts.len() == 1,
+        "DataModel methods reference {} complete EngineContext objects; task context is missing or ambiguous",
+        contexts.len()
+    );
+    let task_context = *contexts.iter().next().unwrap();
     let submit = studio
         .base
         .checked_add(layout.submit_task)
         .context("Studio DataModel task submitter address overflowed")?;
-    let vtable = memory.read_u64(task_context)? as usize;
-    let valid = (0..16usize).any(|index| {
-        memory
-            .read_u64(vtable + index * 8)
-            .map(|value| value as usize)
-            .is_ok_and(|method| {
-                (studio.base..studio.base + studio.size).contains(&method)
-                    && submit >= method
-                    && submit - method <= 0x2000
-            })
-    });
-    if !valid {
-        bail!("Studio DataModel task submitter failed task-context validation");
-    }
+    properties::verified_code(memory, studio, layout, submit, 64)?;
     Ok(task_context)
 }
 
@@ -2212,28 +2184,11 @@ fn package_ui_binding(
     {
         bail!("PackageUIService.{member_name} has an unsupported reflection binding");
     }
-    let kind = memory.read_u64(descriptor + 0x28)? as usize;
-    if read_msvc_string(memory, kind).as_deref() != Some("YieldFunction") {
-        bail!("PackageUIService.{member_name} is not a yielding engine method");
-    }
-    let thunk = memory.read_u64(descriptor + 0x78)? as usize;
-    let code = memory.read_vec(thunk, 9)?;
-    if code[..5] != [0x48, 0x8b, 0x01, 0xff, 0xa0] {
-        bail!("PackageUIService.{member_name} dispatcher has an unsupported layout");
-    }
-    let slot = u32::from_le_bytes(
-        code[5..9]
-            .try_into()
-            .expect("virtual dispatch slot is four bytes"),
-    ) as usize;
-    if slot >= 0x1000 || !slot.is_multiple_of(8) {
-        bail!("PackageUIService.{member_name} resolved an invalid virtual slot");
-    }
-    let vtable = memory.read_u64(service)? as usize;
-    let operation = memory.read_u64(vtable + slot)? as usize;
-    if !(studio.base..studio.base + studio.size).contains(&operation) {
-        bail!("PackageUIService.{member_name} implementation is outside Studio");
-    }
+    let layout = package_layout(&studio.path)?;
+    // Follow the reflected member dispatch. A virtual member's engine thunk is
+    // itself the callable ABI; retaining it lets Studio perform its own virtual
+    // dispatch and avoids reconstructing that dispatch from a byte signature.
+    let (_, operation) = properties::member_binding(memory, studio, &layout, descriptor)?;
     Ok(PackageUiBinding {
         service,
         operation_rva: operation - studio.base,
@@ -2338,6 +2293,7 @@ pub(super) fn platform_package_action(
         .context("Roblox Studio module was not found")?;
     let layout = package_layout(&studio.path).context("Studio package layout")?;
     let memory = ProcessMemory::open(pid)?;
+    memory.authorize(NativeOperation::PackageActions, studio_title)?;
     verify_loaded_image(&memory, studio, layout.image_stamp).context("Studio image check")?;
     let data_model = active_data_model(pid, &memory, studio, layout.data, studio_title)
         .context("Studio DataModel lookup")?;
@@ -2376,25 +2332,17 @@ pub(super) fn platform_package_action(
                 .context("ModifiedState descriptor")?;
                 let binding = property_binding(&memory, studio, descriptor)
                     .context("ModifiedState binding")?;
-                let setter = memory
-                    .read_u64(binding + 16)
-                    .context("ModifiedState setter")? as usize;
-                if !(studio.base..studio.base + studio.size).contains(&setter) {
-                    bail!("PackageLink.ModifiedState setter is outside Studio");
-                }
-                let adjustment = property_class_adjustment(
+                let (setter, adjustment) = properties::integer_setter_binding(
                     &memory,
                     studio,
-                    package.link.instance,
-                    data_model.layout,
-                    descriptor,
                     binding,
-                    "ModifiedState",
-                )?;
+                    status_layout.modified.width,
+                )
+                .context("ModifiedState scalar setter")?;
                 let adjusted_link = package
                     .link
                     .instance
-                    .checked_add(adjustment.unsigned_abs() as usize)
+                    .checked_add(adjustment)
                     .context("Adjusted PackageLink address overflowed")?;
                 let task_context = data_model_task_context(&memory, studio, &layout, &data_model)?;
                 let mut parameters = vec![0; 688];
@@ -2717,6 +2665,7 @@ pub(super) fn platform_trigger_studio_action(
     let (window, window_title) = capture_window(pid, studio_title)?;
     let current_modules = modules(pid)?;
     let memory = ProcessMemory::open(pid)?;
+    memory.authorize(NativeOperation::StudioActions, studio_title)?;
     let helper = ensure_helper_loaded(pid, &memory, &current_modules)?;
     let run = helper
         .checked_add(helper_export_rva("ReniumTriggerStudioAction")?)
@@ -2855,7 +2804,7 @@ pub(crate) fn capture_live_services(
         "Native capture requires 1..={MAX_ROOTS} services"
     );
     let memory = ProcessMemory::open(pid)?; // Retains the process across PID reuse.
-    memory.ensure_writes_verified()?;
+    memory.authorize(NativeOperation::Capture, studio_title)?;
     let current_modules = modules(pid)?;
     let studio = current_modules
         .first()
@@ -3008,7 +2957,7 @@ fn write_live_snapshot(
     }
     let started = Instant::now();
     let memory = ProcessMemory::open(pid)?;
-    memory.ensure_writes_verified()?;
+    memory.authorize(NativeOperation::Snapshot, studio_title)?;
     let current_modules = modules(pid)?;
     let studio = current_modules
         .first()

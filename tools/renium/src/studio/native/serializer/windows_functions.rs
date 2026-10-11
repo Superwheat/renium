@@ -24,6 +24,10 @@ enum Value {
     Instance,
     Adjustment(i64),
     AdjustedInstance(i64),
+    VbTable(i64),
+    VirtualAdjustment(i64, i64),
+    VirtualInstance(i64, i64),
+    VbOffset(i64, i64),
 }
 
 impl Value {
@@ -66,6 +70,22 @@ impl State {
                 self.register(i.op_register(operand))?.slice(0, width)
             }
             OpKind::Memory => {
+                if i.memory_index() == Register::None
+                    && width == 8
+                    && self.register(i.memory_base()) == Some(Value::Instance)
+                {
+                    return Some(Value::VbTable(i.memory_displacement64() as i64));
+                }
+                if width == 4
+                    && i.memory_index_scale() == 1
+                    && i.memory_displacement64() == 0
+                    && let (Some(Value::Adjustment(field)), Some(Value::VbTable(offset))) = (
+                        self.register(i.memory_base()),
+                        self.register(i.memory_index()),
+                    )
+                {
+                    return Some(Value::VirtualAdjustment(field, offset));
+                }
                 let (storage, offset) = self.address(i)?;
                 match storage {
                     Storage::Descriptor if (8..=65520).contains(&offset) => {
@@ -149,6 +169,61 @@ impl State {
         }
     }
 
+    fn arithmetic_value(&self, i: &Instruction, dst: Register) -> Option<Value> {
+        let left = self.register(dst);
+        let right = self.read(i, 1, 8);
+        match (left, right, i.mnemonic()) {
+            (Some(Value::Adjustment(offset)), Some(Value::Instance), Mnemonic::Add)
+            | (Some(Value::Instance), Some(Value::Adjustment(offset)), Mnemonic::Add) => {
+                Some(Value::AdjustedInstance(offset))
+            }
+            (
+                Some(Value::VirtualAdjustment(field, offset)),
+                Some(Value::Instance),
+                Mnemonic::Add,
+            )
+            | (
+                Some(Value::Instance),
+                Some(Value::VirtualAdjustment(field, offset)),
+                Mnemonic::Add,
+            ) => Some(Value::VirtualInstance(field, offset)),
+            (
+                Some(Value::VbOffset(field, offset)),
+                Some(Value::VirtualInstance(high, base)),
+                Mnemonic::Add,
+            )
+            | (
+                Some(Value::VirtualInstance(high, base)),
+                Some(Value::VbOffset(field, offset)),
+                Mnemonic::Add,
+            ) if high == field + 4 && base == offset => Some(Value::AdjustedInstance(field)),
+            (Some(Value::Adjustment(field)), _, Mnemonic::Add)
+                if matches!(
+                    i.op1_kind(),
+                    OpKind::Immediate8to64 | OpKind::Immediate32to64
+                ) =>
+            {
+                Some(Value::VbOffset(field, i.immediate(1) as i64))
+            }
+            (Some(Value::Pointer(storage, offset)), _, _)
+                if matches!(
+                    i.op1_kind(),
+                    OpKind::Immediate8to64 | OpKind::Immediate32to64
+                ) =>
+            {
+                let delta = i.immediate(1) as i64;
+                offset
+                    .checked_add(if i.mnemonic() == Mnemonic::Add {
+                        delta
+                    } else {
+                        -delta
+                    })
+                    .map(|offset| Value::Pointer(storage, offset))
+            }
+            _ => None,
+        }
+    }
+
     fn step(&mut self, i: &Instruction) {
         let dst = i.op0_register().full_register();
         let width = if i.op0_kind() == OpKind::Memory {
@@ -193,30 +268,14 @@ impl State {
                 }
             }
             Mnemonic::Add | Mnemonic::Sub if i.op0_kind() == OpKind::Register && width == 8 => {
-                let left = self.register(dst);
-                let right = self.read(i, 1, 8);
-                let value = match (left, right, i.mnemonic()) {
-                    (Some(Value::Adjustment(offset)), Some(Value::Instance), Mnemonic::Add)
-                    | (Some(Value::Instance), Some(Value::Adjustment(offset)), Mnemonic::Add) => {
-                        Some(Value::AdjustedInstance(offset))
-                    }
-                    (Some(Value::Pointer(storage, offset)), _, _)
-                        if matches!(
-                            i.op1_kind(),
-                            OpKind::Immediate8to64 | OpKind::Immediate32to64
-                        ) =>
-                    {
-                        let delta = i.immediate(1) as i64;
-                        offset
-                            .checked_add(if i.mnemonic() == Mnemonic::Add {
-                                delta
-                            } else {
-                                -delta
-                            })
-                            .map(|offset| Value::Pointer(storage, offset))
-                    }
-                    _ => None,
-                };
+                let value = self.arithmetic_value(i, dst);
+                self.registers.remove(&dst);
+                if let Some(value) = value {
+                    self.registers.insert(dst, value);
+                }
+            }
+            Mnemonic::Shr if i.op1_kind() == OpKind::Immediate8 && i.immediate8() == 32 => {
+                let value = self.register(dst).and_then(|value| value.slice(4, 4));
                 self.registers.remove(&dst);
                 if let Some(value) = value {
                     self.registers.insert(dst, value);
@@ -393,13 +452,29 @@ fn dispatch_field(entry: u64, mut code: impl FnMut(u64) -> Option<Vec<u8>>) -> O
     (fields.len() == 1).then(|| *fields.iter().next().unwrap())
 }
 
-pub(super) fn binding(
+pub(in super::super) fn binding(
     memory: &ProcessMemory,
     studio: &ModuleEntry,
     layout: &PackageLayout,
     descriptor: usize,
     table: usize,
 ) -> Result<(usize, usize)> {
+    resolve(
+        memory,
+        studio,
+        layout,
+        descriptor,
+        member_field(memory, studio, layout, descriptor, table)?,
+    )
+}
+
+pub(super) fn member_field(
+    memory: &ProcessMemory,
+    studio: &ModuleEntry,
+    layout: &PackageLayout,
+    _descriptor: usize,
+    table: usize,
+) -> Result<usize> {
     let key = (layout.image_stamp, table.wrapping_sub(studio.base));
     let cached = BINDINGS
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -412,7 +487,7 @@ pub(super) fn binding(
             memory.read_vec(studio.base + rva, code.len()).ok().as_ref() == Some(code)
         })
     {
-        return resolve(memory, studio, layout, descriptor, binding.field);
+        return Ok(binding.field);
     }
     let mut candidates = HashSet::new();
     let mut methods = HashMap::new();
@@ -461,7 +536,7 @@ pub(super) fn binding(
             );
         }
         if let Some(field) = field {
-            candidates.insert(resolve(memory, studio, layout, descriptor, field)?);
+            candidates.insert(field);
         }
     }
     anyhow::ensure!(
@@ -477,7 +552,7 @@ pub(super) fn binding(
     cache.insert(
         key,
         Binding {
-            field: result.0,
+            field: result,
             table: table_bytes,
             code: methods.into_iter().collect(),
         },
@@ -485,7 +560,44 @@ pub(super) fn binding(
     Ok(result)
 }
 
-fn dispatch_code(
+pub(super) fn void_dispatch_field(code: &[u8]) -> Option<usize> {
+    let mut calls = 0;
+    let mut inputs = HashSet::from([Register::R8, Register::R9]);
+    for i in Decoder::new(64, code, DecoderOptions::NONE) {
+        if i.is_invalid() {
+            return None;
+        }
+        if i.flow_control() == FlowControl::IndirectCall {
+            calls += 1;
+        } else if !matches!(i.flow_control(), FlowControl::Next | FlowControl::Return) {
+            return None;
+        }
+        let mut info = InstructionInfoFactory::new();
+        for reg in info.info(&i).used_registers() {
+            let register = reg.register().full_register();
+            if inputs.contains(&register)
+                && matches!(
+                    reg.access(),
+                    OpAccess::Read
+                        | OpAccess::CondRead
+                        | OpAccess::ReadWrite
+                        | OpAccess::ReadCondWrite
+                )
+            {
+                return None;
+            }
+            if reg.access() == OpAccess::Write {
+                inputs.remove(&register);
+            }
+        }
+    }
+    if calls != 1 {
+        return None;
+    }
+    dispatch_field(0, |address| (address == 0).then(|| code.to_vec()))
+}
+
+pub(super) fn dispatch_code(
     memory: &ProcessMemory,
     studio: &ModuleEntry,
     layout: &PackageLayout,
@@ -543,6 +655,30 @@ fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn void_dispatch_preserves_virtual_base_adjustment() {
+        let template = vec![
+            0x48, 0x83, 0xec, 0x28, 0xf, 0x10, 0x89, 0x90, 0x0, 0x0, 0x0, 0x66, 0xf, 0x6f, 0xc1,
+            0x66, 0xf, 0x73, 0xd8, 0x8, 0x66, 0x49, 0xf, 0x7e, 0xc1, 0x49, 0x8b, 0xc1, 0x48, 0xc1,
+            0xe8, 0x20, 0x48, 0x63, 0xc8, 0x48, 0x8b, 0x82, 0xd0, 0x0, 0x0, 0x0, 0x48, 0x63, 0x4,
+            0x1, 0x48, 0x3, 0xc2, 0x49, 0x63, 0xc9, 0x48, 0x81, 0xc1, 0xd0, 0x0, 0x0, 0x0, 0x48,
+            0x3, 0xc8, 0x66, 0x48, 0xf, 0x7e, 0xc8, 0xff, 0xd0, 0x33, 0xc0, 0x48, 0x83, 0xc4, 0x28,
+            0xc3,
+        ];
+        for field in [0x90i32, 0x300, 0x2000] {
+            for vbtable in [0xd0i32, 0x180, 0x400] {
+                let mut code = template.clone();
+                code[7..11].copy_from_slice(&field.to_le_bytes());
+                code[38..42].copy_from_slice(&vbtable.to_le_bytes());
+                code[55..59].copy_from_slice(&vbtable.to_le_bytes());
+                assert_eq!(void_dispatch_field(&code), Some(field as usize));
+                // A mismatched adjustment must not certify an instance receiver.
+                code[55..59].copy_from_slice(&(vbtable + 8).to_le_bytes());
+                assert_eq!(void_dispatch_field(&code), None);
+            }
+        }
+    }
 
     fn scalar(field: i32, adjustment: i32) -> Vec<u8> {
         let mut code = vec![0x49, 0x89, 0xcb, 0x48, 0x63, 0x89];

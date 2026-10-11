@@ -49,7 +49,7 @@ Without Live Sync, pass the files or directories to `ps`; Renium batches them by
 For store edits, use returned changed paths and settings IDs to keep the push scoped.
 An unfiltered push reconciles the entire place and can remove Studio-only content.
 
-`ps --verify` compares the selected script sources with Studio and pushes nothing (`sourceVerifyErrors` lists mismatches); `ps --verify-sources` pushes, then checks. Don't substitute reads of `Instance.Source`: an open ScriptDocument can differ.
+`ps --verify` compares sources through plugin ScriptDocuments, even without native capture; `sourceVerifyErrors` lists mismatches. `ps --verify-sources` pushes, then checks. An open ScriptDocument can differ from `Instance.Source`.
 
 Player capacity (`Players.MaxPlayers` and `PreferredPlayers`) is managed through Roblox Game Settings, not push. Saved exports and file comparisons still preserve/report these values.
 

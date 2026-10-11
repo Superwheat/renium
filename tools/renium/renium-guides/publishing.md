@@ -64,3 +64,5 @@ rbx report -m "what went wrong"
 ```
 
 When Renium itself fails (an internal error, a crash, a sync that lost or mangled data), `report` writes `.renium/reports/<ID>/` and a zip beside it: the doctor checks, Studio status, the project file, the daemon log tail, recent crash reports, and the last `rbx` commands with their output from this project's Codex or Claude Code transcripts (`--since MINUTES`, default 120; `--no-transcript` leaves them out). Home paths and values after key, token or password words are masked. Tell the user the ID and path; they review the folder and attach the zip to the GitHub issue link the command prints.
+
+See [Native compatibility](native-compatibility.md) for per-operation probes and the Studio update canary.

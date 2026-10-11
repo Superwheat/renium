@@ -77,7 +77,10 @@ struct Write {
         // must preserve that separate saved field, including during rollback.
         const auto method = Get(acquisition, terrain);
         try {
-            reinterpret_cast<void (*)(void*)>(clear.function)(terrain);
+            if (clear.memberOffset & 1)
+                reinterpret_cast<void (*)(void*, void*)>(clear.function)(reinterpret_cast<void*>(clear.descriptor), terrain);
+            else
+                reinterpret_cast<void (*)(void*)>(clear.function)(terrain);
             Set(smooth, terrain, value);
         } catch (...) {
             RestoreAcquisition(method);
@@ -131,9 +134,11 @@ static Result Apply(void* terrain, std::shared_ptr<void> owner, std::uintptr_t m
     Validate(write->smooth, read); Validate(write->physics, read);
     Validate(write->acquisition, read, 256);
     std::uintptr_t member = 0;
-    if (write->clear.memberOffset < 64 || write->clear.memberOffset >= 256 || write->clear.memberOffset % 8 ||
+    const bool dispatcher = (write->clear.memberOffset & 1) != 0;
+    const auto offset = write->clear.memberOffset & ~std::uintptr_t{1};
+    if (offset > 65520 || offset % 8 ||
         !read(write->clear.descriptor, &member, sizeof(member)) || member != write->clear.table ||
-        !read(write->clear.descriptor + write->clear.memberOffset, &member, sizeof(member)) || member != write->clear.function)
+        !read((dispatcher ? write->clear.table : write->clear.descriptor) + offset, &member, sizeof(member)) || member != write->clear.function)
         throw std::runtime_error("Terrain Clear binding changed before execution");
     if (lengths[3] & 1) Index(smooth); // Reject malformed or unsupported formats before mutation.
     write->terrain = terrain; write->owner = std::move(owner);
