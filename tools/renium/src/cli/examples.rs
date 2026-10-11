@@ -296,6 +296,11 @@ mod tests {
         let mut examples = 0;
         for path in paths {
             let text = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                text.chars().count() <= 5_000,
+                "{} exceeds 5,000 characters",
+                path.display()
+            );
             for event in Parser::new(&text) {
                 let (Event::Code(code) | Event::Text(code)) = event else {
                     continue;

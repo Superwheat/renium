@@ -1280,11 +1280,36 @@ const EMBEDDED_AGENT_GUIDES: &[(&str, &str)] = &[
         "configuration.md",
         include_str!("../../../renium-guides/configuration.md"),
     ),
+    (
+        "data-inspect.md",
+        include_str!("../../../renium-guides/data-inspect.md"),
+    ),
+    (
+        "data-properties.md",
+        include_str!("../../../renium-guides/data-properties.md"),
+    ),
     ("data.md", include_str!("../../../renium-guides/data.md")),
     ("input.md", include_str!("../../../renium-guides/input.md")),
+    ("links.md", include_str!("../../../renium-guides/links.md")),
+    (
+        "network.md",
+        include_str!("../../../renium-guides/network.md"),
+    ),
+    (
+        "opencloud-assets.md",
+        include_str!("../../../renium-guides/opencloud-assets.md"),
+    ),
+    (
+        "opencloud-resources.md",
+        include_str!("../../../renium-guides/opencloud-resources.md"),
+    ),
     (
         "opencloud.md",
         include_str!("../../../renium-guides/opencloud.md"),
+    ),
+    (
+        "performance-profiler.md",
+        include_str!("../../../renium-guides/performance-profiler.md"),
     ),
     (
         "performance.md",
@@ -1301,6 +1326,14 @@ const EMBEDDED_AGENT_GUIDES: &[(&str, &str)] = &[
     (
         "projects.md",
         include_str!("../../../renium-guides/projects.md"),
+    ),
+    (
+        "publishing.md",
+        include_str!("../../../renium-guides/publishing.md"),
+    ),
+    (
+        "runtime.md",
+        include_str!("../../../renium-guides/runtime.md"),
     ),
     ("sync.md", include_str!("../../../renium-guides/sync.md")),
 ];

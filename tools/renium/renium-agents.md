@@ -5,57 +5,59 @@ Use `rbx` from the place's project folder.
 
 ## Choose the smallest sufficient check
 
-- **Saved code or data:** read the files; use focused assertions, the project's checks, or Renium's offline queries. Names, values, references, source edits, and pure logic usually need no Play session.
-- **Unsaved Studio state:** make one bounded live query. Don't scan Studio for data already saved locally.
-- **Runtime behavior:** use Play only for a specific unanswered question, such as input handling, replication, physics, or a runtime error. Identify the expected result first. A small edit is not itself a reason to playtest.
-- **Visual behavior:** numbers read by scripts show state, not what is on screen (a chase camera moves with the car, so a dip can be invisible). When the user reports what they saw, or you are judging whether something is visible, record the real client view with real input (`rs`, `inp`, `re`, then look at the `rf` frames) instead of re-measuring. A screenshot checks one state.
+- Saved code/data: read files, use focused assertions, project checks or offline queries. Small edits do not require Play.
+- Unsaved Studio state: make one bounded live query; do not scan for data already saved locally.
+- Runtime behavior: use Play for a specific unanswered question about input, replication, physics or errors. Identify the expected result first.
+- Visual behavior: capture the real client with real input (`rs`, `inp`, `re`), then inspect `rf` frames. Script measurements cannot establish what the player sees. A screenshot checks one state; use recordings for motion.
 
-Check Luau syntax offline with `rbx ck FILE...`, never with Studio `loadstring`, `LoadStringEnabled`, or by running scripts; project checks cover types, lint and behavior.
+Check Luau syntax offline with `rbx ck FILE...`, never Studio `loadstring`, `LoadStringEnabled`, or execution. Project checks cover types, lint and behavior.
 
-With healthy Live Sync, trust successful file edits: don't push, poll, or reread Studio after every save, and don't start Play to prove an edit synced. Use one `lst --wait` after a reported problem or when the next operation needs synchronization.
+With healthy Live Sync, trust file edits. Do not push, poll, reread Studio or start Play after each save. Use one `lst --wait` after a reported problem or when the next operation needs synchronization.
 
-When Play is needed, reuse a session, batch related checks with the fewest clients, and don't stop a user's session. Wait for runtime state with `rbx wait EXPR -t N`, never a shell loop of `l` calls.
+Reuse suitable Play sessions, batch related checks with the fewest clients, and do not stop a user's session. Wait with `rbx wait EXPR -t N`, never a shell loop of `l` calls.
 
 ## Read the relevant guide
 
+Read only relevant guides before using their commands, once per session; reread after `rbx upd`.
+
 | Task | Guide |
 |---|---|
-| Saved instances, scripts, properties, queries | `RENIUM/data.md` |
-| Configuration, adapters, filters, imports, validation | `RENIUM/configuration.md` |
-| Pull, push, Live Sync | `RENIUM/sync.md` |
-| Play, live Luau, clients, consoles, network simulation | `RENIUM/playtest.md` |
-| UI, input, movement | `RENIUM/input.md` |
-| Screenshots, recording review, device simulation | `RENIUM/capture-device.md` |
-| Lag spikes, MicroProfiler dumps, network traffic, resource limits | `RENIUM/performance.md` |
-| Models, places, packages, links, Git, live collaboration | `RENIUM/projects.md` |
-| Open Cloud and creator assets | `RENIUM/opencloud.md` |
-| Studio lifecycle and place management | `RENIUM/advanced.md` |
-| Installed plugins and their commands | `RENIUM/plugins.md` |
-
-Read only the guides the task needs, once per session, before using their commands; reread after `rbx upd`.
+| Saved instances and scripts | `RENIUM/data.md` |
+| Bulk and protected properties | `RENIUM/data-properties.md` |
+| File queries and comparisons | `RENIUM/data-inspect.md` |
+| Configuration and imports | `RENIUM/configuration.md` |
+| Pull, push, Live Sync and conflicts | `RENIUM/sync.md` |
+| Play sessions | `RENIUM/playtest.md` |
+| Live Luau and consoles | `RENIUM/runtime.md` |
+| Network simulation | `RENIUM/network.md` |
+| UI, input and movement | `RENIUM/input.md` |
+| Captures and device simulation | `RENIUM/capture-device.md` |
+| Performance and heap snapshots | `RENIUM/performance.md` |
+| MicroProfiler and resource limits | `RENIUM/performance-profiler.md` |
+| Models, places and packages | `RENIUM/projects.md` |
+| Links, Git and collaboration | `RENIUM/links.md` |
+| Open Cloud setup and fetch | `RENIUM/opencloud.md` |
+| Open Cloud resource operations | `RENIUM/opencloud-resources.md` |
+| Assets, products and analytics | `RENIUM/opencloud-assets.md` |
+| Studio lifecycle and audio | `RENIUM/advanced.md` |
+| Save, publish and diagnostics | `RENIUM/publishing.md` |
+| Installed plugins | `RENIUM/plugins.md` |
 
 ## Targeting and edits
 
-Single-place projects use `src`; experiences use `places/<alias>/src`.
-A place folder selects its target. At the experience root, add `--place <alias|placeId>` when needed.
-With two Studios open on one project, put `--place <placeId|window name>` before the command (or set `RENIUM_PLACE`); `--runtime-id` does not choose.
+Single-place projects use `src`; experiences use `places/<alias>/src`. A place folder selects its target. At the experience root, add `--place <alias|placeId>` when needed. With two Studios on one project, put `--place <placeId|window name>` before the command (or set `RENIUM_PLACE`); `--runtime-id` does not choose.
 
-Edit scripts as files; use Renium for generated `.renium` stores and sourcemaps.
-`f`/`bg`/`bb` read saved data; `q` searches a closed place; `v` inspects a model/place; `l` reads live Studio; `oc fetch --version` gets an older saved place. For a full place comparison, use `cmp BEFORE --full` (optionally `--against AFTER`).
+Edit scripts as files; use Renium for `.renium` stores and sourcemaps. `f`/`bg`/`bb` read saved data; `q` searches a closed place; `v` inspects a model/place; `l` reads Studio; `oc fetch --version` gets older saved places. Use `cmp BEFORE --full` (optionally `--against AFTER`) for a full comparison.
 
-Read a target once and reuse its ID; refresh after a pull.
-Run mutations one at a time and inspect each result; if one fails, check the affected state before retrying.
-A usage error (unknown flag, unexpected argument, missing selector) means the invocation was malformed, not that Renium failed: fix it and rerun. Quote code and JSON or pipe them on stdin.
-Keep query results small (counts, slices, specific fields); `l` tables over 128 keys are cut with `_truncated`. `co --grep` is a regex (`-F` for text). Write large captures to a file.
-When a check exposes a defect in what you were asked to deliver, fix and verify it. Never hand the user steps you could run yourself.
+Read targets once and reuse IDs; refresh after a pull. Run mutations sequentially and inspect results. After failure, check affected state before retrying. Fix malformed invocations and rerun. Quote JSON/code or pipe stdin. Keep queries bounded; `l` tables over 128 keys are cut with `_truncated`. `co --grep` is regex (`-F` for text). Write large captures to files.
 
-Renium marks affected linked packages Changed before edits. Report `autoDesyncedPackages`, including packages named in a failed edit. Publishing needs user authorization; it is not part of syncing. Say synced, not saved: with `teamCreate: true` in `rbx status` Studio saves to Roblox itself; otherwise only the user saves or publishes.
+Fix and verify defects found in requested work. Renium marks affected linked packages Changed before edits; report `autoDesyncedPackages`, including in failures. Publishing requires authorization and is separate from syncing. Say synced, not saved: `teamCreate: true` in `rbx status` means Studio saves to Roblox; otherwise the user saves or publishes.
 
 ## Tools and boundaries
 
-- Use project-declared tools through their normal commands; if one is unavailable, say so instead of hunting for executables.
-- Pass arguments or pipe JSON/code through stdin; don't create payload files.
-- Launch, close, or replace Studio only when the task needs it; `rbx ro` reopens a closed bound place. Never take focus or global input.
-- Don't back up the project: `rbx rev` restores files a sync changed and Studio undo covers pushed edits.
-- Update with `rbx upd` when asked or an update is reported, then reread these guides.
-- If Renium itself fails (internal error, crash, lost sync data), run `rbx report -m "what happened"` and give the user its ID and path.
+- Use project-declared tools normally; report unavailable tools instead of hunting for executables.
+- Pass arguments or pipe JSON/code; do not create payload files.
+- Launch, close or replace Studio only when needed; `rbx ro` reopens a closed bound place. Never take focus or global input.
+- Do not back up the project: `rbx rev` restores affected files; Studio undo covers pushes.
+- Update with `rbx upd` when asked or an update is reported, then reread the guides.
+- For internal errors, crashes or lost sync data, run `rbx report -m "what happened"` and return its ID and path.

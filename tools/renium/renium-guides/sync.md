@@ -10,9 +10,8 @@ rbx lst
 rbx lof
 ```
 
-`ps` pushes files or directories. For instance-store edits pass the store file, and add `-i ID` per instance (an id covers only that instance, not its descendants) or `-u` to create or update without deleting. Deletions need the store file pushed without `-i`.
-Work in the place folder, or put `--place <alias|placeId>` before the command.
-Renium manages the connection; no daemon setup is needed.
+`ps` pushes files or directories. For store edits pass the store file and `-i ID` per instance, or `-u` to upsert without deleting. An ID selects that instance for properties and its subtree for scripts. Deletions need the store file pushed without `-i`.
+Work in the place folder or add `--place <alias|placeId>`.
 
 ## Live Sync
 
@@ -27,13 +26,13 @@ For a failure, inspect `rbx lst --details`, fix the cause, then retry with `rbx 
 
 ## First connection and conflicts
 
-When no Studio runtime connects, the `no_studio` error and `rbx status` carry a `diagnosis.verdict` naming the cause: Studio closed, plugin missing, plugin needs a Studio restart, plugin not connecting, or another place open. If Studio is closed or another place is open and the task needs Studio, reopen the bound place with `rbx ro`; relay other verdicts as is. Don't guess why a place closed.
+`no_studio` and `rbx status` include `diagnosis.verdict`. If it says Studio is closed or another place is open and Studio is needed, run `rbx ro`; relay other verdicts unchanged. Do not guess why a place closed.
 
 Live Sync compares each side with their last common Renium state. One-sided changes transfer; independent edits merge; conflicts wait without overwriting either side. Something you added that is now missing from both Studio and the files was deleted in Studio, and the deletion synced; ask before putting it back.
 
 A published place that closed without saving reopens older than the files, and its differences count as Studio edits. Before reopening one, run `rbx cfg set liveSync.initialSyncPriority verify` (or start with `rbx lon --initial-sync-priority verify`), then read `rbx lst --details`: no differences means Studio kept the work. Otherwise ask the user which side to keep and use the resolution commands the CLI returns.
 
-The editor asks which version to keep, then resumes startup. The CLI returns the conflict and resolution commands; `rbx lst --details` lists every conflict with the properties that differ and both values, and in verify mode every path as `push:` (files differ) or `pull:` (Studio differs). `rbx lon --prefer studio|editor` reconciles for that run even when the configured mode is verify. Choose only with user direction or an existing conflict preference.
+The editor asks which version to keep; the CLI returns resolution commands. `rbx lst --details` lists conflicts with both values and verify paths as `push:` (files differ) or `pull:` (Studio differs). `rbx lon --prefer studio|editor` reconciles for that run even when the configured mode is verify. Choose only with user direction or an existing conflict preference.
 
 ```powershell
 rbx cfg get liveSync.initialSyncPriority
@@ -63,4 +62,4 @@ Live Sync transfers restored files normally. Without Live Sync, add `--apply-stu
 
 ## Packages owned by others
 
-A push that changes files inside a Roblox package this account does not own (a package from the Creator Store or another creator's group, such as a TopbarPlus install) is refused before Studio is touched, naming the package and its creator. Revert those files to the package's content, or unlink the package in Studio (right-click the package root, Unlink from Package) when the project is meant to carry its own copy; Renium never desyncs or rewrites someone else's package on your behalf.
+Pushes inside Roblox packages this account does not own are refused before Studio is touched, naming the package and creator. Revert those files to the package's content, or unlink the package in Studio (right-click the package root, Unlink from Package) when the project is meant to carry its own copy; Renium never desyncs or rewrites someone else's package on your behalf.

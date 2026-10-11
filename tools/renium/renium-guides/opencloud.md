@@ -24,119 +24,13 @@ rbx oc fetch 112966546347918 -o other.rbxl     # a place id or universe id; the 
 
 `games` lists what the key can reach: the universes it is scoped to plus the public experiences of the key's user and groups; a name matches ignoring case, emoji and punctuation. The experience's main icon and thumbnails have no API-key route (Open Cloud proxies only the badge icon of the legacy publish API); set them in Creator Hub. `fetch` downloads the experience's root place and, with `-r DIR`, imports it into that project (creating it) so the files are ready to open with `rbx so`. Private experiences the key is not scoped to need `--universe ID` or `--place-id ID`. Without `--version`, `fetch` downloads the newest published version by number (the result says which) rather than the delivery copy, which can lag a publish. Older versions of the bound place come from Roblox: `place history` lists its saved versions (newest first, with times and authors) and `fetch --version N` downloads one for `q`, `v` or `cmp`. Place files found elsewhere on the machine are not versions of the project unless the user says so.
 
-The project supplies universe/place IDs. Otherwise put `--universe ID` and `--place-id ID` before the resource.
+Explicit fetch names, `--universe`, and `--place-id` override the bound project. Numeric names try a universe first, then a place only when no universe exists; lookup errors are reported. Other commands use the project's universe/place IDs by default. Otherwise put `--universe ID` and `--place-id ID` before the resource.
 Public reads can explicitly use `--anonymous`; authenticated requests never fall back to anonymous access.
 
-## Resource commands
+## Open Cloud resource operations
 
-For place publishing, prefer `rbx publish --open-cloud`: it builds the selected
-project (or accepts `--file`) and checks Open Cloud's place-file fidelity limits.
-See `advanced.md` for Studio publishing, targeting, and dry runs.
+See [Open Cloud resource operations](opencloud-resources.md).
 
-Prefer a resource command over raw HTTP. Run writes only when requested.
+## Open Cloud assets and analytics
 
-```powershell
-rbx oc data stores --limit 25
-rbx oc data get PlayerData user-42
-rbx oc data upsert PlayerData user-42 '{"coins":100}'
-rbx oc data increment Counters visits 1
-rbx oc ordered list Wins --limit 20
-rbx oc memory queue-add Matchmaking '{"userId":42}' --field ttl=60s
-rbx oc universe message updates refresh
-rbx oc restriction ban 42 "Exploit abuse" --field gameJoinRestriction.duration=86400s
-rbx oc user inventory 42 --limit 25
-rbx oc group role-assign GROUP MEMBERSHIP groups/GROUP/roles/ROLE
-rbx oc place publish build.rbxl
-rbx oc localization game-info
-rbx oc localization product-name PRODUCT fr "Nom français"
-rbx oc ai speech "Welcome back" --field speechStyle.voiceId=VOICE
-```
-
-Data/ordered stores default to `global`; override with `--scope`.
-`update` requires an entry; `upsert` may create one.
-`--field a.b=value` sets nested JSON. JSON-like values retain their types; others are strings.
-Additional options include `--query`, `--filter`, `--cursor`, `--if-match`, `--form`, and `--file`. Repeated query/form/file names retain every value.
-
-`rbx oc CATEGORY --help` lists that category's actions with their values, method and path, marks paged and destructive ones, and says which flag fills `{place}` (`--place-id`) or `{universe}`. An unknown action fails at once with the valid list. Actions that answer with an empty body (such as `universe restart`) return what ran. On paged actions `-l N` is a total fetched 100 per request, `--all` follows every page, `--pages N` stops after N, and `"more": true` says a page remains.
-
-```powershell
-rbx oc universe                              # includes playing, visits, votes, updated (last save or publish)
-rbx oc server list                           # active servers of the newest versions, by version
-rbx oc server find JOB_ID
-rbx oc server logs VERSION JOB -l 1000 --severity error --grep "Ranked"
-```
-
-Categories include data, ordered, memory, universe, place, restriction, secret, notification, user, group, interaction, team, asset, creator-store, pass, localization, config, luau, server, advertising, analytics, avatar, badge, experiment, event, ai, matchmaking, and thumbnail.
-Use `oc request` for unlisted endpoints; pipe complex bodies through stdin.
-
-`team members` lists who is in a place's Team Create session. `team remove-members` is not "end their session": it revokes those users' collaborator access for the whole universe (`DELETE .../teamcreate/memberships`); only run it when the user asks for exactly that.
-
-After an upload, `publish` and `oc place publish` report `live: true` once the version history lists the version as the current published one, which is normally the first check (`--wait-live SECONDS` bounds it on `publish`); a restart right after that result lands on the new version. In `oc place history`, `publishStatus` 1 marks the version players currently get, 2 a published version a later publish replaced, 0 a save; Studio publishes show 0 like saves and only `isPublished` is true for Open Cloud uploads. The `updated` stamp from `oc universe` moves on saves as well as publishes, so it does not mean a publish went live.
-
-## Publish while someone else is in the live place
-
-An Open Cloud upload to a place that another collaborator has open in Team Create fails with HTTP 409; the error names the members and any newer unpublished saves. Publish from inside the session instead:
-
-```powershell
-rbx oc fetch --version N -r ./live             # the live place as a project
-rbx cmp ./live/place.rbxl --against dev.rbxl --full   # confirm their saves changed nothing you need
-rbx so ./live/place.rbxl                       # open the live place
-rbx cfg set liveSync.initialSyncPriority verify   # in ./live: first contact must not overwrite anything
-rbx --place LIVE_PLACE_ID ps src/Path/Changed.luau    # copy only the changed files in, then push them
-rbx --place LIVE_PLACE_ID ps --verify
-rbx --place LIVE_PLACE_ID publish              # Studio-side publish inside the session
-```
-
-## Analytics and media
-
-```powershell
-rbx oc analytics metrics --field metric=DailyActiveUsers --field granularity=OneDay --field startTime=2026-01-01T00:00:00Z --field endTime=2026-02-01T00:00:00Z
-rbx oc analytics metrics-operation OPERATION
-rbx oc event list --limit 10 -q fields=id,title,startTime,visibility
-rbx oc event get EVENT -q fields=id,title,userRsvpStatus
-rbx oc experiment list --limit 25 -q searchKey=BossHealth
-rbx oc experiment stats EXPERIMENT
-rbx oc experiment start EXPERIMENT
-rbx oc thumbnail personalization --limit 10
-rbx oc thumbnail personalization-create --field homepageThumbnailIds='["THUMBNAIL_1","THUMBNAIL_2"]'
-rbx oc thumbnail upload first.png --file files=second.png
-rbx oc thumbnail upload-status -q operationIds=OPERATION_1 -q operationIds=OPERATION_2
-```
-
-## Products, passes, and assets
-
-For creator inventory reads that need Studio's existing login, use
-`rbx access call HttpRbxApiService GetAsyncFullUrl '["https://apis.roblox.com/creator-inventory-api/v1/-/creator-inventory-items:search?maxPageSize=25&filter=assetTypes%3DModel%3Bsources%3DCreated"]'`,
-then `rbx access approve REQUEST_ID` for that exact call. The response is in `value`;
-pass each `nextPageToken` as `pageToken` until absent. Query asset types separately;
-add `;groupIds=GROUP_ID` inside the URL-encoded filter for group uploads.
-This does not change Roblox's owner permissions. Use `oc asset permissions` for
-authorized sharing; its key needs `asset-permissions:write`.
-
-```powershell
-rbx oc product list
-rbx oc product get PRODUCT_ID
-rbx oc product create "Refresh Daily Rewards" --price 27 --for-sale --regional-pricing
-rbx oc product update PRODUCT_ID --price 29 --regional-pricing=false
-rbx oc pass create "VIP" --form price=99 --form isForSale=true --file imageFile=vip.png
-rbx oc asset create Model "Street Lamp" "A lamp model" lamp.fbx --field creationContext.creator.userId=USER_ID
-rbx oc asset create Model "Street Lamp" "A lamp model" lamp.fbx --field creationContext.creator.groupId=GROUP_ID
-rbx oc asset create Model "Car" "Group car" car.glb --field creationContext.creator.groupId=GROUP_ID --content-type model/gltf-binary
-rbx iu reference.png --user USER_ID --name Reference
-rbx oc --anonymous asset search --limit 5 -q query=car -q searchCategoryType=Model
-```
-
-Pass images use `--file imageFile=PATH`. Asset creation takes metadata/file positionally and requires a creator owner.
-
-Creator Store search and Studio insertion/generation:
-
-```powershell
-rbx as "wooden crate" --limit 5
-rbx ai ASSET_ID --parent Workspace
-rbx gm "small wooden crate" --parent Workspace --name GeneratedCrate
-rbx js JOB_ID --wait-seconds 30
-```
-
-`as --details` returns the store's full records (asset, creator, voting) including `hasScripts`; check them before inserting. Live Sync writes inserted assets to the project like any Studio edit: take what you need from inspection-only inserts and delete them in the same step.
-
-Use normal web tools for Roblox documentation.
+See [Open Cloud assets and analytics](opencloud-assets.md).

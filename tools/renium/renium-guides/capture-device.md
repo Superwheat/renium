@@ -26,6 +26,8 @@ rbx re
 
 Render quality decides what a capture shows. `rbx gfx` reports Studio's edit and play levels (1-21, `0` = automatic) plus the in-game slider (1-10, read only). Before visual evidence of lighting, materials or effects, raise it: `rbx gfx max` for the Edit window, `rbx gfx max --player 1` for a client, or `rbx gfx set --play 21`. These are Studio-wide settings that persist after Studio closes, so run `rbx gfx restore` (with the same `--player`) once the capture is done; never leave an override behind. Leave quality alone when measuring performance unless the task asks for a specific level.
 
+`sc --camera-position -10,5,0 --look-at -20,0,0` accepts negative coordinates. `camera` reports the requested and actual position and direction; `moved: false` means the view was not held. Inspect the image itself. `--studio` captures the Studio window, including its play view during ordinary Play.
+
 Screenshots and silent H.264 MP4 recordings target one window, not the desktop.
 Recordings default to 12 FPS, 60 seconds maximum, and quality 80.
 `rs` accepts `--fps 1..30`, `--max-seconds 1..300`, and `--quality 0..100`.

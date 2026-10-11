@@ -19,6 +19,11 @@ if (JSON.stringify(routedGuideNames) !== JSON.stringify(guideNames)) {
   throw new Error(`Root agent guide routes ${routedGuideNames.join(", ")}; expected ${guideNames.join(", ")}`);
 }
 
+for (const name of guideNames) {
+  assert.ok(fs.readFileSync(path.join(guidesPath, name), "utf8").length <= 5_000,
+    `${name} exceeds 5,000 characters`);
+}
+
 const agents = [rootGuide, ...guideNames.map((name) => fs.readFileSync(path.join(guidesPath, name), "utf8"))].join("\n");
 for (const forbidden of ["rbx a ", "local.renium-", "extensions/local.renium", "extensions\\local.renium"]) {
   if (agents.includes(forbidden)) {
