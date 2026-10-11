@@ -1963,7 +1963,7 @@ pub(super) struct ShotArgs {
         value_name = "NAME|N"
     )]
     pub(super) player: Option<String>,
-    #[arg(help = "Capture the Studio Edit window", long, conflicts_with_all = ["client", "player"])]
+    #[arg(help = "Capture the Studio window (the Edit viewport; during Play, the play view)", long, conflicts_with_all = ["client", "player"])]
     pub(super) studio: bool,
     #[arg(help = "Capture a play client", long, conflicts_with = "studio")]
     pub(super) client: bool,

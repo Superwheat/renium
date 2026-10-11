@@ -2908,20 +2908,23 @@ pub(crate) fn shot_result(args: &ShotArgs, bridge: &BridgeServer) -> Result<Valu
     } else {
         None
     };
+    let mut camera_report = None;
     let capture = (|| {
-        if token.is_some() {
+        if let Some((position, _)) = camera {
             // The camera setter acknowledges the property change before rendering.
-            // Cross two real frame boundaries while the camera lease is still held.
+            // Cross two real frame boundaries while the camera lease is still held,
+            // and read the camera back so the result says whether Studio moved it.
             let result = call_execute_luau(
                 bridge,
                 bridge_target,
                 player,
-                "local runService = game:GetService(\"RunService\")\nrunService.Heartbeat:Wait()\nrunService.Heartbeat:Wait()",
+                "local runService = game:GetService(\"RunService\")\nrunService.Heartbeat:Wait()\nrunService.Heartbeat:Wait()\nlocal camera = workspace.CurrentCamera\nlocal p = camera.CFrame.Position\nreturn { p.X, p.Y, p.Z, tostring(camera.CameraType) }",
                 "ReniumCaptureFrame",
                 3.0,
                 1.0,
             )?;
             ensure_luau_api_ok(&result)?;
+            camera_report = Some(camera_readback(&result, position));
         }
         input_inject::capture_window_png(&window, &output)
     })();
@@ -2937,7 +2940,7 @@ pub(crate) fn shot_result(args: &ShotArgs, bridge: &BridgeServer) -> Result<Valu
     if let Some(result) = restore {
         ensure_plugin_api_ok(&result?)?;
     }
-    Ok(json!({
+    let mut result = json!({
         "ok": true,
         "action": "shot",
         "path": output.display().to_string(),
@@ -2946,7 +2949,49 @@ pub(crate) fn shot_result(args: &ShotArgs, bridge: &BridgeServer) -> Result<Valu
         "window": window.label,
         "target": target,
         "deviceSimulation": use_simulator,
-    }))
+    });
+    if let Some(report) = camera_report {
+        result["camera"] = report;
+    }
+    Ok(result)
+}
+
+/// What the camera held after the move: the requested position, the one
+/// Studio reports, and a note when they differ, since the capture then shows
+/// the old view (the 3D view not being the active tab is the usual cause).
+fn camera_readback(result: &Value, requested: [f64; 3]) -> Value {
+    let values = result
+        .get("results")
+        .and_then(Value::as_array)
+        .and_then(|results| results.first())
+        .and_then(Value::as_array);
+    let actual = values.and_then(|values| {
+        Some([
+            values.first()?.as_f64()?,
+            values.get(1)?.as_f64()?,
+            values.get(2)?.as_f64()?,
+        ])
+    });
+    let camera_type = values
+        .and_then(|values| values.get(3))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let moved = actual.is_some_and(|actual| {
+        requested
+            .iter()
+            .zip(actual)
+            .all(|(wanted, got)| (wanted - got).abs() < 1.0)
+    });
+    let mut report = json!({ "requested": requested, "actual": actual, "moved": moved });
+    if let Some(camera_type) = camera_type {
+        report["cameraType"] = json!(camera_type);
+    }
+    if !moved {
+        report["note"] = json!(
+            "Studio did not hold the requested camera; the capture shows the previous view. Make the 3D view the active tab and retry, or set workspace.CurrentCamera.CFrame with rbx l --edit and capture without camera flags"
+        );
+    }
+    report
 }
 
 fn test_launch_clients(bridge: &BridgeServer, launch: &TestLaunch) -> Vec<Value> {
