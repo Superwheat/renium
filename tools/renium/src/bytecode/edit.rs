@@ -97,14 +97,14 @@ pub(crate) fn bytecode_add_instance(args: BytecodeAddInstanceArgs) -> Result<()>
             *map = qualified;
         }
     }
-    let source = if is_lua_source_class(&class_name) {
+    let given_source = if is_lua_source_class(&class_name) {
         match properties.get("Source") {
-            Some(Value::String(source)) => source.clone(),
+            Some(Value::String(source)) => Some(source.clone()),
             Some(_) => bail!("Source must be a string"),
-            None => String::new(),
+            None => None,
         }
     } else {
-        String::new()
+        None
     };
     if is_lua_source_class(&class_name) {
         properties.insert(
@@ -135,10 +135,16 @@ pub(crate) fn bytecode_add_instance(args: BytecodeAddInstanceArgs) -> Result<()>
         &mut removals,
     )?;
     writes.insert(settings_file.clone(), encode_settings_bytecode(&document)?);
+    let mut adopted_source = None;
     if is_lua_source_class(&document.instances[added.index].class_name)
         && let Some(Some(source_path)) = source_paths.get(added.index)
     {
-        writes.insert(source_path.clone(), source.into_bytes());
+        match new_script_source(source_path, given_source.as_deref())? {
+            Some(bytes) => {
+                writes.insert(source_path.clone(), bytes);
+            }
+            None => adopted_source = Some(source_path.clone()),
+        }
     }
     let changed_paths = file_mutation_paths(&writes, &removals);
     let source_writes = changed_paths
@@ -158,9 +164,30 @@ pub(crate) fn bytecode_add_instance(args: BytecodeAddInstanceArgs) -> Result<()>
         "pathOrdinals": path_ordinals_by_index.get(added.index).and_then(std::clone::Clone::clone),
         "changedPaths": changed_paths,
         "sourceWrites": source_writes,
+        "adoptedSource": adopted_source,
     });
-    crate::app::output::drop_empty(&mut result, &["sourceWrites"]);
+    crate::app::output::drop_empty(&mut result, &["sourceWrites", "adoptedSource"]);
     print_json_output(&result, args.pretty)
+}
+
+/// The bytes a new script's file receives, or None when a file already at
+/// its path is adopted as the source. A file that exists is never replaced
+/// by an empty source, and a given source that differs from it is refused.
+fn new_script_source(source_path: &Path, given: Option<&str>) -> Result<Option<Vec<u8>>> {
+    let existing = source_path
+        .is_file()
+        .then(|| fs::read(source_path))
+        .transpose()
+        .with_context(|| format!("Failed to read {}", source_path.display()))?;
+    match (existing, given) {
+        (None, given) => Ok(Some(given.unwrap_or_default().as_bytes().to_vec())),
+        (Some(_), None) => Ok(None),
+        (Some(existing), Some(given)) if existing == given.as_bytes() => Ok(None),
+        (Some(_), Some(_)) => bail!(
+            "{} already exists with different contents; omit the Source property to adopt the file, or change the file first",
+            source_path.display()
+        ),
+    }
 }
 
 pub(crate) fn bytecode_clone_instance(args: BytecodeCloneInstanceArgs) -> Result<()> {
@@ -1102,4 +1129,77 @@ fn path_segments_for_error(document: &SettingsBytecode, index: usize) -> String 
     }
     names.reverse();
     names.join(".")
+}
+
+#[cfg(test)]
+mod add_instance_tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::cli::{BytecodeAddInstanceArgs, BytecodeFileArgs, BytecodeParentArgs};
+
+    fn add(root: &Path, name: &str, properties: Vec<String>) -> Result<Value> {
+        crate::app::output::capture_json_output(|| {
+            bytecode_add_instance(BytecodeAddInstanceArgs {
+                input: BytecodeFileArgs {
+                    service_or_file: None,
+                    settings_file: Some(root.join("instances").join("ServerScriptService.renium")),
+                },
+                service_hint: Some("ServerScriptService".into()),
+                name: name.into(),
+                class_name: "ModuleScript".into(),
+                settings_id: None,
+                parent: BytecodeParentArgs {
+                    parent_index: None,
+                    parent_settings_id: None,
+                    parent_name: None,
+                    parent_class_name: None,
+                    no_parent: true,
+                },
+                properties,
+                attributes: Vec::new(),
+                pretty: false,
+            })
+        })
+    }
+
+    #[test]
+    fn adding_a_script_adopts_an_existing_source_file() {
+        let root = crate::system::files::create_unique_directory(
+            &std::env::temp_dir(),
+            "renium-ba-adopt-",
+        )
+        .unwrap();
+        let service_dir = crate::project::storage::source_directory(
+            &root.join("instances").join("ServerScriptService.renium"),
+        );
+        fs::create_dir_all(&service_dir).unwrap();
+        let file = service_dir.join("RaceRounds.luau");
+        fs::write(&file, "return { rounds = 3 }\n").unwrap();
+        let result = add(&root, "RaceRounds", Vec::new()).unwrap();
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "return { rounds = 3 }\n"
+        );
+        assert!(
+            result["adoptedSource"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("RaceRounds.luau")),
+            "{result}"
+        );
+        let other = service_dir.join("Other.luau");
+        fs::write(&other, "return 9").unwrap();
+        let refused = add(&root, "Other", vec!["Source=\"return 1\"".into()]);
+        assert!(refused.is_err() || refused.unwrap()["ok"] == false);
+        assert_eq!(fs::read_to_string(&other).unwrap(), "return 9");
+        let created = add(&root, "Fresh", vec!["Source=\"return 2\"".into()]).unwrap();
+        assert_eq!(created["ok"], true, "{created}");
+        assert_eq!(
+            fs::read_to_string(service_dir.join("Fresh.luau")).unwrap(),
+            "return 2"
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = PathBuf::new();
+    }
 }
