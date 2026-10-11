@@ -3753,8 +3753,7 @@ type PushScope = (Vec<String>, Vec<usize>);
 type PushScopes = HashMap<String, Vec<PushScope>>;
 
 impl EditorChangedServices {
-    /// Records a pushed subtree; a full push records nothing. Paths arrive
-    /// with or without the service as their first segment.
+    /// Records a pushed subtree; a full push records nothing.
     fn record_scope(
         &mut self,
         full_reconcile: bool,
@@ -3764,15 +3763,54 @@ impl EditorChangedServices {
         let Some((segments, ordinals)) = path.filter(|_| !full_reconcile) else {
             return;
         };
-        let prefixed = segments.first().map(String::as_str) == Some(service);
-        let relative = if prefixed { &segments[1..] } else { segments };
-        let offset = usize::from(prefixed && ordinals.len() == segments.len());
-        let relative_ordinals = &ordinals[offset.min(ordinals.len())..];
         self.scopes
             .entry(service.to_string())
             .or_default()
-            .push((relative.to_vec(), relative_ordinals.to_vec()));
+            .push(push_scope(service, segments, ordinals));
     }
+}
+
+/// A pushed subtree relative to its service; paths arrive with or without
+/// the service as their first segment.
+fn push_scope(service: &str, segments: &[String], ordinals: &[usize]) -> PushScope {
+    let prefixed = segments.first().map(String::as_str) == Some(service);
+    let relative = if prefixed { &segments[1..] } else { segments };
+    let offset = usize::from(prefixed && ordinals.len() == segments.len());
+    let relative_ordinals = &ordinals[offset.min(ordinals.len())..];
+    (relative.to_vec(), relative_ordinals.to_vec())
+}
+
+/// The subtrees a push filtered by settings ids touches. Every loaded
+/// service gets an entry, so a service holding none of the targets carries
+/// an empty scope and its read-only packages are left alone.
+fn target_filter_scopes(
+    documents: &HashMap<String, Option<Arc<SettingsBytecode>>>,
+    settings_ids: &HashSet<String>,
+    recorded: &PushScopes,
+) -> PushScopes {
+    let mut scopes: PushScopes = HashMap::new();
+    for (service, document) in documents {
+        let entry = scopes.entry(service.clone()).or_default();
+        if let Some(paths) = recorded.get(service) {
+            entry.extend(paths.iter().cloned());
+        }
+        let Some(document) = document else {
+            continue;
+        };
+        let (segments, ordinals) =
+            crate::editor::paths::build_editor_instance_path_parts(document, service);
+        for (index, instance) in document.instances.iter().enumerate() {
+            if !settings_ids.contains(&instance.settings_id) {
+                continue;
+            }
+            if let (Some(Some(segments)), Some(Some(ordinals))) =
+                (segments.get(index), ordinals.get(index))
+            {
+                entry.push(push_scope(service, segments, ordinals));
+            }
+        }
+    }
+    scopes
 }
 
 /// A read-only package needs its fingerprint check only when the push can
@@ -4037,13 +4075,12 @@ fn finish_editor_change_collection(
         .union(&services.read_only)
         .cloned()
         .collect::<HashSet<_>>();
-    validate_read_only_service_changes(
-        link_enforcement,
-        &validated,
-        &services.scopes,
-        documents,
-        src_root,
-    )?;
+    let scopes = if property_filter.settings_ids.is_empty() {
+        services.scopes.clone()
+    } else {
+        target_filter_scopes(documents, &property_filter.settings_ids, &services.scopes)
+    };
+    validate_read_only_service_changes(link_enforcement, &validated, &scopes, documents, src_root)?;
     log_editor_collection_timing("package validation", phase_started);
     for service in sorted_services(services.dirty) {
         if let Some(document) = documents.get(&service).and_then(Option::as_ref) {
@@ -4689,6 +4726,34 @@ mod sync_tests {
         let above = vec![(Vec::new(), Vec::new())];
         assert!(super::push_scope_touches(Some(&above), &public, &[1]));
         assert!(super::push_scope_touches(None, &public, &[1]));
+        let workspace = crate::tests::support::settings_document(vec![
+            crate::tests::support::settings_instance("ws", "Workspace", "Workspace", None),
+            crate::tests::support::settings_instance(
+                "racing:racetracks",
+                "RaceTracks",
+                "Folder",
+                Some(0),
+            ),
+        ]);
+        let storage = crate::tests::support::settings_document(vec![
+            crate::tests::support::settings_instance("ss", "ServerStorage", "ServerStorage", None),
+            crate::tests::support::settings_instance("ss-public", "Public", "Folder", Some(0)),
+        ]);
+        let documents = HashMap::from([
+            ("Workspace".to_string(), Some(Arc::new(workspace))),
+            ("ServerStorage".to_string(), Some(Arc::new(storage))),
+        ]);
+        let ids = HashSet::from(["racing:racetracks".to_string()]);
+        let filtered = super::target_filter_scopes(&documents, &ids, &HashMap::new());
+        assert!(super::push_scope_touches(
+            filtered.get("Workspace"),
+            &seg("RaceTracks"),
+            &[1]
+        ));
+        assert!(
+            !super::push_scope_touches(filtered.get("ServerStorage"), &public, &[1]),
+            "a service holding no target is out of scope: {filtered:?}"
+        );
         let mut services = super::EditorChangedServices::default();
         let prefixed = seg("ReplicatedStorage.Public.Config");
         services.record_scope(false, "ReplicatedStorage", Some((&prefixed, &[1, 1, 1])));
