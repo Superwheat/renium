@@ -747,13 +747,7 @@ pub(super) fn upload_body(
     raw_file: Option<&str>,
     content_type: Option<&str>,
 ) -> Result<Option<(String, Vec<u8>)>, String> {
-    let segments = decoded_path_segments(path)?;
-    let segments: Vec<&str> = segments.iter().map(String::as_str).collect();
-    let place_upload = method == "POST"
-        && matches!(
-            segments.as_slice(),
-            ["universes", "v1", _, "places", _, "versions"]
-        );
+    let place_upload = method == "POST" && is_place_version_path(path);
     if !place_upload {
         return raw_file
             .map(|path| raw_body(path, content_type))
@@ -782,39 +776,39 @@ pub(super) fn upload_body(
 }
 
 /// Percent-encoded spellings name the same endpoint, so the place-version
-/// check matches decoded segments; an encoded separator is refused outright.
-fn decoded_path_segments(path: &str) -> Result<Vec<String>, String> {
-    path.trim_matches('/')
+/// check compares each segment after decoding it. Other routes keep their
+/// encoded parameters (a data-store key with `%2F`) untouched.
+fn is_place_version_path(path: &str) -> bool {
+    let segments: Vec<String> = path
+        .trim_matches('/')
         .split('/')
-        .map(|segment| {
-            let mut bytes = Vec::with_capacity(segment.len());
-            let mut rest = segment.as_bytes();
-            while let Some((&byte, tail)) = rest.split_first() {
-                if byte == b'%' {
-                    let hex = tail
-                        .get(..2)
-                        .and_then(|hex| std::str::from_utf8(hex).ok())
-                        .and_then(|hex| u8::from_str_radix(hex, 16).ok())
-                        .ok_or_else(|| {
-                            format!("Invalid percent-encoding in path segment {segment}")
-                        })?;
-                    bytes.push(hex);
-                    rest = &tail[2..];
-                } else {
-                    bytes.push(byte);
-                    rest = tail;
-                }
-            }
-            let decoded = String::from_utf8(bytes)
-                .map_err(|_| format!("Path segment {segment} is not UTF-8"))?;
-            if decoded.contains('/') || decoded.contains('\\') {
-                return Err(format!(
-                    "Path segment {segment} encodes a separator; spell the endpoint plainly"
-                ));
-            }
-            Ok(decoded)
-        })
-        .collect()
+        .map(|segment| decode_path_segment(segment).unwrap_or_else(|| segment.to_string()))
+        .collect();
+    let segments: Vec<&str> = segments.iter().map(String::as_str).collect();
+    matches!(
+        segments.as_slice(),
+        ["universes", "v1", _, "places", _, "versions"]
+    )
+}
+
+fn decode_path_segment(segment: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(segment.len());
+    let mut rest = segment.as_bytes();
+    while let Some((&byte, tail)) = rest.split_first() {
+        if byte == b'%' {
+            let hex = tail
+                .get(..2)
+                .filter(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+                .and_then(|hex| std::str::from_utf8(hex).ok())
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok())?;
+            bytes.push(hex);
+            rest = &tail[2..];
+        } else {
+            bytes.push(byte);
+            rest = tail;
+        }
+    }
+    String::from_utf8(bytes).ok()
 }
 
 fn raw_body(path: &str, content_type: Option<&str>) -> Result<(String, Vec<u8>), String> {
@@ -1262,32 +1256,41 @@ mod tests {
         // Asset uploads and other endpoints retain their ordinary raw body handling.
         assert!(upload_body("POST", "/assets/v1/assets", Some(file), None).is_ok());
         assert!(upload_body("GET", path, None, None).unwrap().is_none());
-        // Encoded spellings of the endpoint still validate; encoded separators are refused.
+        // Encoded spellings of the endpoint still validate.
         for encoded in [
             "/universes/v1/123/places/456/%76ersions",
             "/%75niverses/v1/123/%70laces/456/versions",
+            "/universes/v1/123/places/456/%56ERSIONS%2F",
         ] {
-            let error = upload_body("POST", encoded, Some(file), None).unwrap_err();
-            assert!(error.contains("Place validation failed"), "{error}");
+            let outcome = upload_body("POST", encoded, Some(file), None);
+            if encoded.ends_with("%2F") {
+                assert!(outcome.is_ok(), "{outcome:?}");
+            } else {
+                let error = outcome.unwrap_err();
+                assert!(error.contains("Place validation failed"), "{error}");
+            }
         }
-        assert!(
-            upload_body(
-                "POST",
-                "/universes/v1/123%2Fplaces/456/versions",
-                Some(file),
-                None
-            )
-            .is_err()
-        );
-        assert!(
-            upload_body(
-                "POST",
-                "/universes/v1/123/places/456/versions%ZZ",
-                Some(file),
-                None
-            )
-            .is_err()
-        );
+        // Other routes keep encoded parameters and their ordinary handling.
+        for (method, other) in [
+            (
+                "GET",
+                "/cloud/v2/universes/1/data-stores/PlayerData/scopes/global/entries/user%2F1",
+            ),
+            (
+                "PATCH",
+                "/cloud/v2/universes/1/data-stores/PlayerData/scopes/global/entries/user%5C1",
+            ),
+            ("POST", "/universes/v1/123/places/456/versions%ZZ"),
+            ("POST", "/universes/v1/123/places/456/versions%+0"),
+        ] {
+            assert!(
+                upload_body(method, other, None, None).unwrap().is_none(),
+                "{other}"
+            );
+        }
+        assert_eq!(decode_path_segment("%2B%2b+").as_deref(), Some("+++"));
+        assert!(decode_path_segment("%+0").is_none());
+        assert!(decode_path_segment("%F").is_none());
         fs::remove_dir_all(root).unwrap();
     }
 

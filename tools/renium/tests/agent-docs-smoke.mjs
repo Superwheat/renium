@@ -44,6 +44,9 @@ try {
   const generated = fs.readFileSync(path.join(root, "RENIUM.md"), "utf8");
   assert.ok(generated.length <= 5_000, `Generated root guide is too large: ${generated.length} characters`);
   assert.equal(generated.replace(/\n<!-- renium-instructions: [a-f0-9]+ -->\s*$/, "").trimEnd(), rootGuide.trimEnd());
+  const packagedRoot = fs.readFileSync(path.join(repository, "tools", "renium-vscode-extension", "resources", "RENIUM.md"), "utf8");
+  assert.ok(packagedRoot.length <= 5_000, `Extension root guide is too large: ${packagedRoot.length} characters`);
+  assert.equal(packagedRoot, generated, "Extension bundled a stale root guide; run sync-assets.mjs --docs-only");
   for (const name of guideNames) {
     const expected = fs.readFileSync(path.join(guidesPath, name), "utf8");
     assert.equal(fs.readFileSync(path.join(root, "RENIUM", name), "utf8"), expected,

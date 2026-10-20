@@ -812,10 +812,6 @@ fn open_cloud(args: &PublishArgs, project: Option<&Path>) -> Result<Value> {
     result
 }
 
-fn cloud_request(file: &Path) -> Value {
-    cloud_request_with_type(file, true)
-}
-
 fn cloud_request_with_type(file: &Path, published: bool) -> Value {
     json!({
         "method": "POST", "path": "/universes/v1/{universe}/places/{place}/versions",
@@ -1311,9 +1307,13 @@ mod tests {
     fn publish_upload_shape_and_completion_are_explicit() {
         for extension in ["rbxl", "rbxlx"] {
             let file = PathBuf::from(format!("place.{extension}"));
-            let request = cloud_request(&file);
+            let request = cloud_request_with_type(&file, true);
             assert_eq!(request["method"], "POST");
             assert_eq!(request["query"]["versionType"], "Published");
+            assert_eq!(
+                cloud_request_with_type(&file, false)["query"]["versionType"],
+                "Saved"
+            );
             assert_eq!(request["rawFile"], json!(file));
             // Transport chooses the MIME type from the validated bytes.
             assert!(request["contentType"].is_null());
