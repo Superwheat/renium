@@ -479,6 +479,32 @@ mod tests {
     }
 
     #[test]
+    fn place_import_preserves_saved_deprecated_properties() {
+        let root = crate::tests::support::temp_dir("saved-deprecated-property");
+        let dom = WeakDom::new(InstanceBuilder::new("DataModel").with_child(
+            InstanceBuilder::new("Workspace").with_child(
+                InstanceBuilder::new("MeshPart").with_child(
+                    InstanceBuilder::new("WrapTarget").with_property("Stiffness", 0.5f32),
+                ),
+            ),
+        ));
+        let mut bytes = Vec::new();
+        rbx_binary::to_writer(&mut bytes, &dom, dom.root().children()).unwrap();
+        std::fs::write(root.join("place.rbxl"), bytes).unwrap();
+        std::fs::write(root.join("renium.project.jsonc"), "{\"schemaVersion\":1}").unwrap();
+        let result = run(&root);
+        assert_eq!(result["ok"], true);
+        let stored = SettingsBytecode::read_file(&root.join("instances/Workspace.renium")).unwrap();
+        let target = stored
+            .instances
+            .iter()
+            .find(|instance| instance.class_name == "WrapTarget")
+            .unwrap();
+        assert_eq!(target.properties.get("Stiffness"), Some(&json!(0.5)));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn place_import_keeps_engine_geometry_data() {
         let root = create_unique_directory(&std::env::temp_dir(), "renium-place-import-geometry-")
             .expect("temp project");

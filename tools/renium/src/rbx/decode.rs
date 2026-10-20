@@ -501,6 +501,9 @@ mod tests {
         );
         assert_eq!(json["FutureNumericProperty"]["_type"], "Float32");
         assert_eq!(json["FutureNumericProperty"]["value"], 4.0);
+        assert_eq!(native.len(), 1);
+        assert_eq!(native[0].name, "FieldOfView");
+        assert!(!json.contains_key("FieldOfView"));
     }
 
     use super::*;
@@ -1107,6 +1110,7 @@ pub(crate) fn rbx_properties_to_native_settings_records<'a>(
                     | RbxVariant::Float32(_)
                     | RbxVariant::Float64(_)
             )
+            && rbx_property_descriptor(database, class_name, property_name).is_none()
             && let Some(value) =
                 rbx_variant_to_settings_json_inner(variant, None, database, refs, true)
         {
