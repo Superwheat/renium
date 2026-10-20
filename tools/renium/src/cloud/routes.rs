@@ -2396,7 +2396,7 @@ pub(super) fn category_help(category: &str) -> String {
     }
     if category == "place" {
         text.push_str(
-            "\nPublishing validates the exact file bytes before upload (also for versionType=Saved). EditableImage, EditableMesh, PartOperation/UnionOperation, SurfaceAppearance and BaseWrap subclasses require Studio publishing: rbx publish. Local checks do not prove engine loading or player joins. For a local dry run, use rbx publish --open-cloud --file FILE --universe ID --place-id ID --dry-run. See RENIUM/publishing.md.\n",
+            "\nPublishing validates the exact file bytes before upload (also for versionType=Saved). Before uploading, verify EditableImage, EditableMesh, PartOperation/UnionOperation, SurfaceAppearance and BaseWrap subclasses are unchanged from the destination. If changed or unverified, use Studio publishing: rbx publish. Renium does not perform that comparison or reject these types merely for being present. Local checks do not prove engine loading or player joins. For a local dry run, use rbx publish --open-cloud --file FILE --universe ID --place-id ID --dry-run. See RENIUM/publishing.md.\n",
         );
     }
     let mut aliases = vec!["camelCase names work too".to_string()];
@@ -3224,10 +3224,16 @@ mod tests {
                     .reflection_database(&old_database)
                     .serialize(&mut bytes, &dom, dom.root().children())
                     .unwrap();
-                std::fs::write(&file, bytes).unwrap();
-                let error = body().unwrap_err();
-                assert!(error.contains(class), "{error}");
-                assert!(error.contains("before upload"), "{error}");
+                std::fs::write(&file, &bytes).unwrap();
+                if class == "Camera" {
+                    let error = body().unwrap_err();
+                    assert!(error.contains(class), "{error}");
+                    assert!(error.contains("before upload"), "{error}");
+                } else {
+                    let (mime, checked) = body().unwrap().unwrap();
+                    assert_eq!(mime, "application/octet-stream");
+                    assert_eq!(checked, bytes);
+                }
             }
             std::fs::write(&file, b"<roblox!").unwrap();
             assert!(body().unwrap_err().contains("Invalid binary place file"));

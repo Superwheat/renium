@@ -1,7 +1,6 @@
 //! Local checks for bytes sent to the Open Cloud place-version endpoint.
 //! Parsing is not an engine-load test; keep that limitation in publishing docs.
 
-use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -48,7 +47,7 @@ pub(crate) fn validate_file(path: &Path) -> Result<u64> {
 pub(crate) fn validate(bytes: &[u8]) -> Result<RbxPlaceFormat> {
     validate_size(bytes.len() as u64)?;
     let format = RbxPlaceFormat::sniff(bytes).context("Not a Roblox binary or XML place file")?;
-    let dom = match format {
+    match format {
         RbxPlaceFormat::Binary => rbx_binary::Deserializer::new()
             .strict_float_types(true)
             .deserialize(bytes)
@@ -60,41 +59,8 @@ pub(crate) fn validate(bytes: &[u8]) -> Result<RbxPlaceFormat> {
         )
         .context("Invalid XML place file")?,
     };
-    let database = rbx_reflection_database::get()?;
-    let mut unsupported = BTreeMap::<String, usize>::new();
-    for instance in dom.descendants() {
-        let mut class = instance.class.as_str();
-        loop {
-            if matches!(
-                class,
-                "EditableImage"
-                    | "EditableMesh"
-                    | "PartOperation"
-                    | "SurfaceAppearance"
-                    | "BaseWrap"
-            ) {
-                *unsupported.entry(instance.class.to_string()).or_default() += 1;
-                break;
-            }
-            let Some(parent) = database
-                .classes
-                .get(class)
-                .and_then(|descriptor| descriptor.superclass)
-            else {
-                break;
-            };
-            class = parent;
-        }
-    }
-    ensure!(
-        unsupported.is_empty(),
-        "Open Cloud cannot reliably update these instances: {}. Publish from Studio with rbx publish instead",
-        unsupported
-            .iter()
-            .map(|(class, count)| format!("{class} ({count})"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+    // API-limited instance types may be present unchanged. Verifying that against
+    // the destination is the caller's responsibility; see publishing-validation.md.
     Ok(format)
 }
 
@@ -160,7 +126,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_types_and_subclasses_are_rejected_in_both_formats() {
+    fn api_limited_types_and_subclasses_pass_local_format_validation() {
         for class in [
             "EditableImage",
             "EditableMesh",
@@ -184,10 +150,9 @@ mod tests {
                 rbx_xml::EncodeOptions::new(),
             )
             .unwrap();
-            for bytes in [binary, xml] {
-                let error = format!("{:#}", validate(&bytes).unwrap_err());
-                assert!(error.contains(&format!("{class} (1)")), "{error}");
-                assert!(error.contains("rbx publish instead"), "{error}");
+            for (bytes, expected) in [(binary, RbxPlaceFormat::Binary), (xml, RbxPlaceFormat::Xml)]
+            {
+                assert_eq!(validate(&bytes).unwrap(), expected, "{class}");
             }
         }
     }

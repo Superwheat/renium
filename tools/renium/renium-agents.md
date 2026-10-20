@@ -54,6 +54,8 @@ Read targets once and reuse IDs; refresh after a pull. Run mutations sequentiall
 
 Fix and verify defects found in requested work. Renium marks affected linked packages Changed before edits; report `autoDesyncedPackages`, including in failures. Publishing requires authorization and is separate from syncing. Say synced, not saved: `teamCreate: true` in `rbx status` means Studio saves to Roblox; otherwise the user saves or publishes.
 
+Before any Open Cloud place upload, follow `RENIUM/publishing-validation.md`: verify that API-limited instances are unchanged from the destination. If changed or unverified, use Studio publishing. Local validation alone does not establish this.
+
 ## Tools and boundaries
 
 - Use project-declared tools normally; report unavailable tools instead of hunting for executables.

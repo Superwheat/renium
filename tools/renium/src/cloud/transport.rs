@@ -1211,7 +1211,7 @@ mod tests {
         let file = root.join("place.rbxlx");
         let file = file.to_str().unwrap();
         let path = "/universes/v1/123/places/456/versions";
-        let xml = b"<roblox version=\"4\"><Item class=\"Part\" referent=\"RBX1\"><Properties/></Item></roblox>";
+        let xml = b"<roblox version=\"4\"><Item class=\"UnionOperation\" referent=\"RBX1\"><Properties/></Item></roblox>";
         fs::write(file, xml).unwrap();
         assert!(upload_body("POST", path, None, None).is_err());
         assert!(upload_body("POST", path, Some(file), Some("application/octet-stream")).is_err());

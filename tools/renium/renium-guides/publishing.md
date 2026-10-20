@@ -34,20 +34,20 @@ the error names that session's members and unpublished newer saves when the key
 can read them.
 `--open-cloud` builds the selected place project, or uploads `--file` unchanged.
 Use `ROBLOX_API_KEY` / `--key-env ENV` with Universe Places Write. IDs come from the
-experience or explicit flags. Renium rejects instance types the API cannot update
-reliably; use Studio publishing for those (see below). `--dry-run` validates the input/target without an
+experience or explicit flags. Verify that instances the API cannot update are
+unchanged before uploading (see below). `--dry-run` validates the input/target without an
 upload or permission check (cloud mode still builds). Temporary builds are cleaned.
 Neither mode creates places, publishes packages, or restarts servers. An unconfirmed
 response is not success: inspect Version History before retrying.
 
 ### Open Cloud limitations and validation
 
-All Open Cloud uploads, including `--as` and `oc place publish`, check size,
-parsing and binary float widths. They reject `EditableImage`, `EditableMesh`,
-`PartOperation`/`UnionOperation`, `SurfaceAppearance` and `BaseWrap` subclasses;
-use `rbx publish` from the destination's Studio session for those. Passing these
-checks does not prove engine loading or player joins. See
-[validation and API limits](publishing-validation.md) for dry runs and exact scope.
+Before any Open Cloud upload (`--as` included), agents must verify the
+[API-limited instance types](publishing-validation.md) are unchanged from the
+destination, including additions/removals and serialized data. If changed or
+unverified, use Studio's `rbx publish`. Renium checks size, parsing and binary float
+widths; it does not compare destinations or reject these types for being present.
+Local checks do not satisfy this verification or prove engine loading/joins.
 
 ## Source edits and ordered input
 

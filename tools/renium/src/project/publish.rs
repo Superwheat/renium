@@ -28,7 +28,7 @@ const STUDIO_PUBLISH_WAIT: Duration = Duration::from_secs(600);
 #[derive(Args)]
 #[command(group = clap::ArgGroup::new("cloud_mode").args(["open_cloud", "publish_as"]))]
 #[command(
-    after_long_help = "Open Cloud uploads (--open-cloud and --as) validate the exact file before sending. Files containing EditableImage, EditableMesh, PartOperation/UnionOperation, SurfaceAppearance or BaseWrap subclasses require Studio publishing (rbx publish). Local validation checks size, parsing and binary float widths; it does not prove engine loading or player joins. Use --open-cloud --file FILE --dry-run for local checks. See RENIUM/publishing.md."
+    after_long_help = "Open Cloud uploads (--open-cloud and --as) validate the exact file before sending. Before uploading, verify EditableImage, EditableMesh, PartOperation/UnionOperation, SurfaceAppearance and BaseWrap subclasses are unchanged from the destination. If changed or unverified, use Studio publishing (rbx publish). Renium does not perform that comparison or reject these types merely for being present. Local validation checks size, parsing and binary float widths; it does not prove engine loading or player joins. Use --open-cloud --file FILE --dry-run for local checks. See RENIUM/publishing.md."
 )]
 pub(crate) struct PublishArgs {
     #[arg(
@@ -1340,7 +1340,7 @@ mod tests {
     }
 
     #[test]
-    fn publish_cloud_validates_binary_xml_and_unsupported_subclasses() {
+    fn publish_cloud_checks_format_without_rejecting_api_limited_types() {
         let root = crate::tests::support::temp_dir("publish-fidelity");
         for extension in ["rbxl", "rbxlx"] {
             let file = root.join(format!("place.{extension}"));
@@ -1353,8 +1353,7 @@ mod tests {
                 "WrapTarget",
             ] {
                 write_place(&file, &[class]);
-                let error = validate_file(&file).unwrap_err().to_string();
-                assert!(error.contains(class), "{error}");
+                assert!(validate_file(&file).is_ok(), "{class}");
             }
             fs::write(&file, "not a place").unwrap();
             assert!(validate_file(&file).is_err());
@@ -1401,11 +1400,9 @@ mod tests {
                 .unwrap()
         );
         write_place(&file, &["UnionOperation"]);
-        assert!(
-            open_cloud(&options, Some(&project))
-                .unwrap_err()
-                .to_string()
-                .contains("UnionOperation")
+        assert_eq!(
+            open_cloud(&options, Some(&project)).unwrap()["published"],
+            false
         );
         assert!(!fs::read_dir(root.join(".renium")).unwrap().any(|entry| {
             entry

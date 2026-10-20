@@ -207,12 +207,15 @@ changes are still pending (`--allow-pending` publishes Studio as it is). When th
 refuses the save API, Renium uses Studio's own Publish command. `--open-cloud`
 builds and uploads the project with an API key instead. Every Open Cloud place-file
 upload (including `oc place publish FILE` and `publish --as`) checks size, parsing,
-binary floating-point wire types and unsupported instances before sending the
+binary floating-point wire types before sending the
 validated bytes. Use `publish --open-cloud --file FILE --dry-run` with the target
 IDs to check locally. Open Cloud cannot update `EditableImage`, `EditableMesh`,
-`PartOperation`/`UnionOperation`, `SurfaceAppearance`, or `BaseWrap` subclasses;
-Renium refuses files containing them. Publish those through Studio. These checks
-do not prove engine loading, script correctness or player joins; see the
+`PartOperation`/`UnionOperation`, `SurfaceAppearance`, or `BaseWrap` subclasses.
+Before uploading, verify these instances are unchanged from the destination,
+including additions/removals and serialized data; use Studio if changed or
+unverified. Renium does not perform that comparison or reject a file merely for
+containing these types. Local checks do not satisfy this verification or prove
+engine loading, script correctness or player joins; see the
 [publishing guide](renium-guides/publishing-validation.md).
 If a publish is not
 confirmed, check Version History before retrying. Nothing is published as part of
