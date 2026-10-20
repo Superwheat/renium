@@ -42,6 +42,7 @@ try {
   childProcess.execFileSync(executable, ["pv"], { cwd: root, stdio: "pipe" });
   // Check the instructions agents actually receive, not only their source.
   const generated = fs.readFileSync(path.join(root, "RENIUM.md"), "utf8");
+  assert.ok(generated.length <= 5_000, `Generated root guide is too large: ${generated.length} characters`);
   assert.equal(generated.replace(/\n<!-- renium-instructions: [a-f0-9]+ -->\s*$/, "").trimEnd(), rootGuide.trimEnd());
   for (const name of guideNames) {
     const expected = fs.readFileSync(path.join(guidesPath, name), "utf8");

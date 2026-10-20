@@ -54,3 +54,38 @@ fn legacy_camera_doubles_keep_their_values_when_reflection_requires_floats() {
         );
     }
 }
+
+#[test]
+fn strict_width_checks_cover_filtered_and_nonserialized_float_properties() {
+    // DiagonalFieldOfView is a known Float32 member that does not serialize;
+    // an ordinary read drops it, so strict mode must check it beforehand.
+    for (property, filtered) in [("DiagonalFieldOfView", false), ("OrthographicSize", true)] {
+        let tree = WeakDom::new(
+            InstanceBuilder::new("DataModel")
+                .with_child(InstanceBuilder::new("Camera").with_property(property, 300.0f64)),
+        );
+        let old_database = ReflectionDatabase::new();
+        let mut bytes = Vec::new();
+        Serializer::new()
+            .reflection_database(&old_database)
+            .serialize(&mut bytes, &tree, tree.root().children())
+            .unwrap();
+        let strict = Deserializer::new().strict_float_types(true);
+        let error = strict
+            .deserialize(bytes.as_slice())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&format!("Camera.{property}")), "{error}");
+        if filtered {
+            let mut filter = std::collections::HashMap::new();
+            filter.insert(
+                "Camera".to_string(),
+                std::iter::once("Name".to_string()).collect::<std::collections::HashSet<_>>(),
+            );
+            let filtered = Deserializer::new()
+                .strict_float_types(true)
+                .flat_property_filter(std::sync::Arc::new(filter));
+            assert!(filtered.deserialize_flat(bytes.as_slice()).is_err());
+        }
+    }
+}

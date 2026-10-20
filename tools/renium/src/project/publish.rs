@@ -53,8 +53,8 @@ pub(crate) struct PublishArgs {
     publish_as: Option<i64>,
     #[arg(
         long,
-        requires = "publish_as",
-        help = "With --as, save a version without publishing it"
+        requires = "cloud_mode",
+        help = "With --as or --open-cloud, save a version without publishing it"
     )]
     saved: bool,
     #[arg(
@@ -772,12 +772,22 @@ fn open_cloud(args: &PublishArgs, project: Option<&Path>) -> Result<Value> {
             "placeId": place_id, "bytes": bytes,
             "url": format!("https://www.roblox.com/games/{place_id}"),
         });
+        result["versionType"] = json!(if args.saved { "Saved" } else { "Published" });
         if !args.dry_run {
             let key_env = args.key_env.as_deref().unwrap_or("ROBLOX_API_KEY");
-            let response = upload(identity, key_env, place_id, cloud_request(&file))?;
+            let response = upload(
+                identity,
+                key_env,
+                place_id,
+                cloud_request_with_type(&file, !args.saved),
+            )?;
             let version = published_version(&response)?;
             result["versionNumber"] = json!(version);
-            result["published"] = json!(true);
+            result["published"] = json!(!args.saved);
+        }
+        if !args.dry_run && !args.saved {
+            let key_env = args.key_env.as_deref().unwrap_or("ROBLOX_API_KEY");
+            let version = result["versionNumber"].as_u64().unwrap_or_default();
             cloud::report_live(
                 &mut result,
                 identity,
@@ -1099,6 +1109,17 @@ mod tests {
                 .is_err()
         );
         assert!(crate::cli::Cli::try_parse_from(["rbx", "publish", "--saved"]).is_err());
+        assert!(
+            crate::cli::Cli::try_parse_from([
+                "rbx",
+                "publish",
+                "--open-cloud",
+                "--file",
+                "place.rbxl",
+                "--saved"
+            ])
+            .is_ok()
+        );
         assert!(args(&["rbx", "publish", "--allow-pending"]).allow_pending);
         assert!(
             args(&[

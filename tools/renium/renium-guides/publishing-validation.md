@@ -53,8 +53,9 @@ loads a selected place version on Roblox's servers. To check a staged full place
    `bep` reports `baseSource: import`, or use `--base FILE`. This retains services
    and saved fields omitted from project files.
 2. Apply changes, build, compare and verify limited instances as above. Upload
-   with `publish --open-cloud --file FILE --saved` and explicit destination IDs.
-   Saved uploads require authorization and obey the same API limits.
+   with `publish --open-cloud --file FILE --saved` and explicit destination IDs;
+   the result shows `published: false`. Saved uploads require authorization and
+   obey the same API limits.
 3. Run `oc luau run-version VERSION` against the returned saved version. Assert
    the intended source, hierarchy, service settings, references and relevant data.
    Read the task result and logs; upload acceptance is not a passing check.

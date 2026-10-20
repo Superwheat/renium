@@ -747,7 +747,8 @@ pub(super) fn upload_body(
     raw_file: Option<&str>,
     content_type: Option<&str>,
 ) -> Result<Option<(String, Vec<u8>)>, String> {
-    let segments: Vec<_> = path.trim_matches('/').split('/').collect();
+    let segments = decoded_path_segments(path)?;
+    let segments: Vec<&str> = segments.iter().map(String::as_str).collect();
     let place_upload = method == "POST"
         && matches!(
             segments.as_slice(),
@@ -778,6 +779,42 @@ pub(super) fn upload_body(
         }
     }
     Ok(Some((expected.to_string(), bytes)))
+}
+
+/// Percent-encoded spellings name the same endpoint, so the place-version
+/// check matches decoded segments; an encoded separator is refused outright.
+fn decoded_path_segments(path: &str) -> Result<Vec<String>, String> {
+    path.trim_matches('/')
+        .split('/')
+        .map(|segment| {
+            let mut bytes = Vec::with_capacity(segment.len());
+            let mut rest = segment.as_bytes();
+            while let Some((&byte, tail)) = rest.split_first() {
+                if byte == b'%' {
+                    let hex = tail
+                        .get(..2)
+                        .and_then(|hex| std::str::from_utf8(hex).ok())
+                        .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+                        .ok_or_else(|| {
+                            format!("Invalid percent-encoding in path segment {segment}")
+                        })?;
+                    bytes.push(hex);
+                    rest = &tail[2..];
+                } else {
+                    bytes.push(byte);
+                    rest = tail;
+                }
+            }
+            let decoded = String::from_utf8(bytes)
+                .map_err(|_| format!("Path segment {segment} is not UTF-8"))?;
+            if decoded.contains('/') || decoded.contains('\\') {
+                return Err(format!(
+                    "Path segment {segment} encodes a separator; spell the endpoint plainly"
+                ));
+            }
+            Ok(decoded)
+        })
+        .collect()
 }
 
 fn raw_body(path: &str, content_type: Option<&str>) -> Result<(String, Vec<u8>), String> {
@@ -1225,6 +1262,32 @@ mod tests {
         // Asset uploads and other endpoints retain their ordinary raw body handling.
         assert!(upload_body("POST", "/assets/v1/assets", Some(file), None).is_ok());
         assert!(upload_body("GET", path, None, None).unwrap().is_none());
+        // Encoded spellings of the endpoint still validate; encoded separators are refused.
+        for encoded in [
+            "/universes/v1/123/places/456/%76ersions",
+            "/%75niverses/v1/123/%70laces/456/versions",
+        ] {
+            let error = upload_body("POST", encoded, Some(file), None).unwrap_err();
+            assert!(error.contains("Place validation failed"), "{error}");
+        }
+        assert!(
+            upload_body(
+                "POST",
+                "/universes/v1/123%2Fplaces/456/versions",
+                Some(file),
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            upload_body(
+                "POST",
+                "/universes/v1/123/places/456/versions%ZZ",
+                Some(file),
+                None
+            )
+            .is_err()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
