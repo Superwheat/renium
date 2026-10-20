@@ -641,6 +641,24 @@ This may cause unexpected or broken behavior in your final results if you rely o
 
         let canonical_type = property.ty;
 
+        if self.deserializer.strict_float_types {
+            let expected = match canonical_type {
+                VariantType::Float32 => Some((Type::Float32, "Float32")),
+                VariantType::Float64 => Some((Type::Float64, "Float64")),
+                _ => None,
+            };
+            if let Some((expected_type, expected_name)) = expected {
+                if binary_type != expected_type {
+                    return Err(InnerError::PropTypeMismatch {
+                        type_name: type_name.to_string(),
+                        prop_name,
+                        valid_type_names: expected_name,
+                        actual_type_name: format!("{binary_type:?}"),
+                    });
+                }
+            }
+        }
+
         match binary_type {
             Type::String => match canonical_type {
                 VariantType::String => {

@@ -4,9 +4,18 @@ See [opencloud](opencloud.md) for the main workflow.
 
 ## Resource commands
 
-For place publishing, prefer `rbx publish --open-cloud`: it builds the selected
-project (or accepts `--file`) and checks Open Cloud's place-file fidelity limits.
-See `publishing.md` for Studio publishing, targeting, and dry runs.
+`rbx publish --open-cloud` builds the project or accepts `--file`.
+It and `rbx oc place publish FILE` validate size, parsing, binary float widths
+and API instance limits before upload, including `versionType=Saved`. Check locally:
+`rbx publish --open-cloud --file FILE --universe ID --place-id ID --dry-run`.
+
+Open Cloud cannot update `EditableImage`, `EditableMesh`, `PartOperation`
+(including `UnionOperation`), `SurfaceAppearance`, or `BaseWrap` (including
+`WrapLayer` and `WrapTarget`). Renium refuses files containing these; publish from
+the destination's Studio session with `rbx publish`. `publish --as` also uses
+Open Cloud. Passing local validation or receiving a version number does not prove
+the engine can load the file or players can join.
+See [validation and API limits](publishing-validation.md).
 
 Prefer a resource command over raw HTTP. Run writes only when requested.
 

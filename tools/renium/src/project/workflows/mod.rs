@@ -1363,6 +1363,10 @@ const EMBEDDED_AGENT_GUIDES: &[(&str, &str)] = &[
         include_str!("../../../renium-guides/publishing.md"),
     ),
     (
+        "publishing-validation.md",
+        include_str!("../../../renium-guides/publishing-validation.md"),
+    ),
+    (
         "runtime.md",
         include_str!("../../../renium-guides/runtime.md"),
     ),

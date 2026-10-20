@@ -24,6 +24,21 @@ fn legacy_camera_doubles_keep_their_values_when_reflection_requires_floats() {
         .unwrap();
 
     let decoded = Deserializer::new().deserialize(bytes.as_slice()).unwrap();
+    let strict = Deserializer::new().strict_float_types(true);
+    let error = strict
+        .deserialize(bytes.as_slice())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("Camera.OrthographicSize"), "{error}");
+    assert!(
+        error.contains("should be Float32, but it was Float64"),
+        "{error}"
+    );
+    let flat_error = match strict.deserialize_flat(bytes.as_slice()) {
+        Ok(_) => panic!("flat decoder silently normalized legacy float widths"),
+        Err(error) => error.to_string(),
+    };
+    assert_eq!(error, flat_error);
     for (name, size, stretch) in [("First", 300.0f32, 1.0f32), ("Second", 615.25, 1.5)] {
         let camera = decoded
             .descendants()

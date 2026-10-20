@@ -475,7 +475,6 @@ fn execute_request(
             }
         }
     }
-    let url = url.to_string();
     let has_multipart =
         !request.form.is_empty() || !request.json_parts.is_empty() || !request.files.is_empty();
     let body_count = usize::from(request.body.is_some())
@@ -518,12 +517,14 @@ fn execute_request(
                 .map_err(|message| bad_request(format!("cloud request {index}: {message}")))?,
         )
     };
-    let raw = request
-        .raw_file
-        .as_deref()
-        .map(|path| raw_body(path, request.content_type.as_deref()))
-        .transpose()
-        .map_err(|message| bad_request(format!("cloud request {index}: {message}")))?;
+    let raw = upload_body(
+        &method,
+        url.path(),
+        request.raw_file.as_deref(),
+        request.content_type.as_deref(),
+    )
+    .map_err(|message| bad_request(format!("cloud request {index}: {message}")))?;
+    let url = url.to_string();
     let custom_json = request
         .body
         .as_ref()
@@ -736,6 +737,47 @@ fn url_encoded_body(fields: &Map<String, Value>) -> Result<Vec<u8>, String> {
         }
     }
     Ok(body.finish().into_bytes())
+}
+
+/// Shared by project publishing, resource commands and raw Open Cloud requests.
+/// Validate the actual buffer that send_bytes receives, for Saved and Published.
+pub(super) fn upload_body(
+    method: &str,
+    path: &str,
+    raw_file: Option<&str>,
+    content_type: Option<&str>,
+) -> Result<Option<(String, Vec<u8>)>, String> {
+    let segments: Vec<_> = path.trim_matches('/').split('/').collect();
+    let place_upload = method == "POST"
+        && matches!(
+            segments.as_slice(),
+            ["universes", "v1", _, "places", _, "versions"]
+        );
+    if !place_upload {
+        return raw_file
+            .map(|path| raw_body(path, content_type))
+            .transpose();
+    }
+    let file = raw_file.ok_or("Place uploads require a raw .rbxl or .rbxlx file")?;
+    let (format, bytes) = super::place_file::read_validated(Path::new(file))
+        .map_err(|error| format!("Place validation failed before upload: {error:#}"))?;
+    let expected = super::place_file::content_type(format);
+    if let Some(actual) = content_type {
+        validate_content_type(actual)?;
+        if !actual
+            .split(';')
+            .next()
+            .unwrap_or(actual)
+            .trim()
+            .eq_ignore_ascii_case(expected)
+        {
+            return Err(format!(
+                "Place file is {}; contentType must be {expected}, not {actual}",
+                format.label()
+            ));
+        }
+    }
+    Ok(Some((expected.to_string(), bytes)))
 }
 
 fn raw_body(path: &str, content_type: Option<&str>) -> Result<(String, Vec<u8>), String> {
@@ -1161,6 +1203,29 @@ mod tests {
             place_id: Some(456),
             game_id: Some(123),
         }
+    }
+
+    #[test]
+    fn place_upload_body_checks_raw_requests_and_holds_the_validated_bytes() {
+        let root = crate::tests::support::temp_dir("place-upload-buffer");
+        let file = root.join("place.rbxlx");
+        let file = file.to_str().unwrap();
+        let path = "/universes/v1/123/places/456/versions";
+        let xml = b"<roblox version=\"4\"><Item class=\"Part\" referent=\"RBX1\"><Properties/></Item></roblox>";
+        fs::write(file, xml).unwrap();
+        assert!(upload_body("POST", path, None, None).is_err());
+        assert!(upload_body("POST", path, Some(file), Some("application/octet-stream")).is_err());
+        let (mime, bytes) = upload_body("POST", path, Some(file), None)
+            .unwrap()
+            .unwrap();
+        fs::write(file, b"broken replacement").unwrap();
+        assert_eq!(mime, "application/xml");
+        assert_eq!(bytes, xml);
+        assert!(upload_body("POST", path, Some(file), None).is_err());
+        // Asset uploads and other endpoints retain their ordinary raw body handling.
+        assert!(upload_body("POST", "/assets/v1/assets", Some(file), None).is_ok());
+        assert!(upload_body("GET", path, None, None).unwrap().is_none());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

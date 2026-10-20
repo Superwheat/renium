@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -14,11 +13,11 @@ use crate::app;
 use crate::automation::{BoundContext, commands::daemon_result, live, op};
 use crate::cli::BridgeConnectionArgs;
 use crate::cloud;
+use crate::cloud::place_file::{validate_file, validate_size};
 use crate::rbx::model::RbxPlaceFormat;
 use crate::studio::bridge::{BridgeApplicationError, BridgeServer, BridgeTarget};
 use crate::system::files::{absolutize_for_daemon, create_unique_directory};
 
-const MAX_PLACE_BYTES: u64 = 100 * 1024 * 1024;
 const PUBLISH_SECONDS: u64 = 120;
 const LIVE_SYNC_SETTLE_SECONDS: f64 = 20.0;
 #[cfg(any(windows, target_os = "macos"))]
@@ -28,6 +27,9 @@ const STUDIO_PUBLISH_WAIT: Duration = Duration::from_secs(600);
 
 #[derive(Args)]
 #[command(group = clap::ArgGroup::new("cloud_mode").args(["open_cloud", "publish_as"]))]
+#[command(
+    after_long_help = "Open Cloud uploads (--open-cloud and --as) validate the exact file before sending. Files containing EditableImage, EditableMesh, PartOperation/UnionOperation, SurfaceAppearance or BaseWrap subclasses require Studio publishing (rbx publish). Local validation checks size, parsing and binary float widths; it does not prove engine loading or player joins. Use --open-cloud --file FILE --dry-run for local checks. See RENIUM/publishing.md."
+)]
 pub(crate) struct PublishArgs {
     #[arg(
         long,
@@ -387,12 +389,15 @@ fn publish_as(args: &PublishArgs, project: Option<&Path>) -> Result<Value> {
             false,
             Some(&args.bridge),
         )?;
-        // Studio serialized this place itself, so unions, appearances and every
-        // engine-owned field are intact; only the upload size limit applies.
+        // Studio's snapshot still goes through Open Cloud and its limitations.
+        // Live uploads validate the exact body in cloud::transport.
         let bytes = fs::metadata(&file)
             .with_context(|| format!("Snapshot {} was not written", file.display()))?
             .len();
         validate_size(bytes)?;
+        if args.dry_run {
+            validate_file(&file)?;
+        }
         let mut result = json!({
             "ok": true, "published": false, "dryRun": args.dry_run,
             "source": "studio", "sourcePlaceId": snapshot["placeId"],
@@ -755,7 +760,12 @@ fn open_cloud(args: &PublishArgs, project: Option<&Path>) -> Result<Value> {
             )?;
             (output, loaded.path.clone())
         };
-        let bytes = validate_file(&file)?;
+        let bytes = if args.dry_run {
+            validate_file(&file)?
+        } else {
+            // The transport reads and validates once, then sends that same buffer.
+            fs::metadata(&file)?.len()
+        };
         let mut result = json!({
             "ok": true, "published": false, "dryRun": args.dry_run,
             "source": "open-cloud", "input": source, "gameId": game_id,
@@ -792,56 +802,6 @@ fn open_cloud(args: &PublishArgs, project: Option<&Path>) -> Result<Value> {
     result
 }
 
-fn validate_size(bytes: u64) -> Result<()> {
-    ensure!(
-        bytes > 0 && bytes <= MAX_PLACE_BYTES,
-        "Place file must be nonempty and no larger than 100 MiB"
-    );
-    Ok(())
-}
-
-fn validate_file(path: &Path) -> Result<u64> {
-    let bytes = fs::metadata(path)?.len();
-    validate_size(bytes)?;
-    let dom = RbxPlaceFormat::from_path(path)?.read(path)?;
-    let database = rbx_reflection_database::get()?;
-    let mut unsupported = BTreeMap::<String, usize>::new();
-    for instance in dom.descendants() {
-        let mut class = instance.class.as_str();
-        loop {
-            if matches!(
-                class,
-                "EditableImage"
-                    | "EditableMesh"
-                    | "PartOperation"
-                    | "SurfaceAppearance"
-                    | "BaseWrap"
-            ) {
-                *unsupported.entry(instance.class.to_string()).or_default() += 1;
-                break;
-            }
-            let Some(parent) = database
-                .classes
-                .get(class)
-                .and_then(|descriptor| descriptor.superclass)
-            else {
-                break;
-            };
-            class = parent;
-        }
-    }
-    ensure!(
-        unsupported.is_empty(),
-        "Open Cloud cannot reliably update these instances: {}. Publish from Studio instead",
-        unsupported
-            .iter()
-            .map(|(class, count)| format!("{class} ({count})"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    Ok(bytes)
-}
-
 fn cloud_request(file: &Path) -> Value {
     cloud_request_with_type(file, true)
 }
@@ -850,7 +810,6 @@ fn cloud_request_with_type(file: &Path, published: bool) -> Value {
     json!({
         "method": "POST", "path": "/universes/v1/{universe}/places/{place}/versions",
         "query": { "versionType": if published { "Published" } else { "Saved" } }, "rawFile": file,
-        "contentType": if file.extension().is_some_and(|ext| ext == "rbxlx") { "application/xml" } else { "application/octet-stream" },
         "timeoutSeconds": PUBLISH_SECONDS,
     })
 }
@@ -868,8 +827,12 @@ fn upload(
     request: Value,
 ) -> Result<Value> {
     cloud::execute_one(identity, key_env, None, false, request).map_err(|failure| {
+        let local_rejection = failure.0.c == "bad_req";
         let detail = failure.0.d.clone().unwrap_or_default();
         let error = cloud::command::cloud_error(failure);
+        if local_rejection {
+            return error;
+        }
         if detail["status"].as_u64() != Some(409) {
             return error.context("Publish was not confirmed. Check Version History before retrying; the upload is not automatically repeated");
         }
@@ -1325,16 +1288,14 @@ mod tests {
 
     #[test]
     fn publish_upload_shape_and_completion_are_explicit() {
-        for (extension, mime) in [
-            ("rbxl", "application/octet-stream"),
-            ("rbxlx", "application/xml"),
-        ] {
+        for extension in ["rbxl", "rbxlx"] {
             let file = PathBuf::from(format!("place.{extension}"));
             let request = cloud_request(&file);
             assert_eq!(request["method"], "POST");
             assert_eq!(request["query"]["versionType"], "Published");
             assert_eq!(request["rawFile"], json!(file));
-            assert_eq!(request["contentType"], mime);
+            // Transport chooses the MIME type from the validated bytes.
+            assert!(request["contentType"].is_null());
         }
         assert_eq!(
             published_version(&json!({"body":{"versionNumber":12}})).unwrap(),
@@ -1351,6 +1312,7 @@ mod tests {
         ] {
             assert!(published_version(&response).is_err());
         }
+        use crate::cloud::place_file::MAX_PLACE_BYTES;
         assert!(validate_size(0).is_err());
         assert!(validate_size(MAX_PLACE_BYTES + 1).is_err());
         assert!(validate_size(MAX_PLACE_BYTES).is_ok());

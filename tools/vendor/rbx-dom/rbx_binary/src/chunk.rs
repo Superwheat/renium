@@ -27,16 +27,22 @@ impl Chunk {
 
         let data = if header.compressed_len == 0 {
             log::trace!("No compression");
-            let mut data = Vec::with_capacity(header.len as usize);
+            let mut data = Vec::new();
             reader.take(header.len as u64).read_to_end(&mut data)?;
             data
         } else {
-            let mut compressed_data = Vec::with_capacity(header.compressed_len as usize);
+            let mut compressed_data = Vec::new();
             reader
                 .take(header.compressed_len as u64)
                 .read_to_end(&mut compressed_data)?;
+            if compressed_data.len() != header.compressed_len as usize {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Truncated compressed chunk",
+                ));
+            }
 
-            if &compressed_data[0..4] == ZSTD_MAGIC_NUMBER {
+            if compressed_data.starts_with(ZSTD_MAGIC_NUMBER) {
                 log::trace!("ZSTD compression");
                 zstd::bulk::decompress(&compressed_data, header.len as usize)?
             } else {
@@ -46,12 +52,51 @@ impl Chunk {
             }
         };
 
-        assert_eq!(data.len(), header.len as usize);
+        if data.len() != header.len as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Chunk length mismatch: expected {} bytes, got {}",
+                    header.len,
+                    data.len()
+                ),
+            ));
+        }
 
         Ok(Chunk {
             name: header.name,
             data,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_chunk_lengths_return_errors_instead_of_panicking() {
+        for compression in [
+            CompressionType::None,
+            CompressionType::Lz4,
+            CompressionType::Zstd,
+        ] {
+            let mut chunk = ChunkBuilder::new(b"META", compression);
+            chunk.write_all(b"some test chunk data").unwrap();
+            let mut bytes = Vec::new();
+            chunk.dump(&mut bytes).unwrap();
+            assert!(Chunk::decode(bytes.as_slice()).is_ok());
+            assert!(Chunk::decode(&bytes[..bytes.len() - 1]).is_err());
+            bytes[8..12].copy_from_slice(&999u32.to_le_bytes());
+            assert!(Chunk::decode(bytes.as_slice()).is_err());
+        }
+        let mut short_compressed = Vec::new();
+        short_compressed.extend_from_slice(b"META");
+        short_compressed.extend_from_slice(&1u32.to_le_bytes());
+        short_compressed.extend_from_slice(&4u32.to_le_bytes());
+        short_compressed.extend_from_slice(&0u32.to_le_bytes());
+        short_compressed.push(0);
+        assert!(Chunk::decode(short_compressed.as_slice()).is_err());
     }
 }
 

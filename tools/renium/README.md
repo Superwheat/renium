@@ -205,7 +205,16 @@ minutes (`--timeout` up to 600 seconds).
 Studio login once Live Sync has settled; it refuses during Play or while file
 changes are still pending (`--allow-pending` publishes Studio as it is). When the place
 refuses the save API, Renium uses Studio's own Publish command. `--open-cloud`
-builds and uploads the project with an API key instead. If a publish is not
+builds and uploads the project with an API key instead. Every Open Cloud place-file
+upload (including `oc place publish FILE` and `publish --as`) checks size, parsing,
+binary floating-point wire types and unsupported instances before sending the
+validated bytes. Use `publish --open-cloud --file FILE --dry-run` with the target
+IDs to check locally. Open Cloud cannot update `EditableImage`, `EditableMesh`,
+`PartOperation`/`UnionOperation`, `SurfaceAppearance`, or `BaseWrap` subclasses;
+Renium refuses files containing them. Publish those through Studio. These checks
+do not prove engine loading, script correctness or player joins; see the
+[publishing guide](renium-guides/publishing-validation.md).
+If a publish is not
 confirmed, check Version History before retrying. Nothing is published as part of
 sync.
 

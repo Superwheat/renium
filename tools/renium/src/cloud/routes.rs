@@ -2394,6 +2394,11 @@ pub(super) fn category_help(category: &str) -> String {
             "Paged actions: -l N returns N items in total (100 per request), --all follows every page, --pages N stops after N; \"more\": true means another page exists.\n",
         );
     }
+    if category == "place" {
+        text.push_str(
+            "\nPublishing validates the exact file bytes before upload (also for versionType=Saved). EditableImage, EditableMesh, PartOperation/UnionOperation, SurfaceAppearance and BaseWrap subclasses require Studio publishing: rbx publish. Local checks do not prove engine loading or player joins. For a local dry run, use rbx publish --open-cloud --file FILE --universe ID --place-id ID --dry-run. See RENIUM/publishing.md.\n",
+        );
+    }
     let mut aliases = vec!["camelCase names work too".to_string()];
     if routes
         .iter()
@@ -2727,6 +2732,12 @@ fn build_request(category: &str, identity: CloudIdentity, args: RouteArgs) -> Re
             }
             (None, Map::new(), Some(content_type))
         }
+    };
+    // Place uploads derive the default MIME type from the validated file bytes.
+    let content_type = if route.category == "place" && route.action == "publish" {
+        None
+    } else {
+        content_type
     };
     Ok(json!({
         "method": route.method,
@@ -3155,6 +3166,76 @@ mod tests {
     }
 
     #[test]
+    fn place_publish_route_validates_saved_and_published_uploads_without_network() {
+        use rbx_dom_weak::{InstanceBuilder, WeakDom};
+        let root = crate::tests::support::temp_dir("place-route-validation");
+        // A misleading extension must not determine the outgoing MIME type.
+        let file = root.join("place.rbxl");
+        std::fs::write(&file, b"").unwrap();
+        let path = file.to_str().unwrap();
+        for saved in [false, true] {
+            let mut options = args("publish", &[path]);
+            if saved {
+                options.query.push("versionType=Saved".into());
+            }
+            let request = build_request(
+                "place",
+                CloudIdentity {
+                    game_id: Some(123),
+                    place_id: Some(456),
+                },
+                options,
+            )
+            .unwrap();
+            let body = || {
+                super::super::transport::upload_body(
+                    request["method"].as_str().unwrap(),
+                    request["path"].as_str().unwrap(),
+                    request["rawFile"].as_str(),
+                    request["contentType"].as_str(),
+                )
+            };
+            let dom = WeakDom::new(
+                InstanceBuilder::new("DataModel").with_child(InstanceBuilder::new("Part")),
+            );
+            let mut xml = Vec::new();
+            rbx_xml::to_writer(
+                &mut xml,
+                &dom,
+                dom.root().children(),
+                rbx_xml::EncodeOptions::new(),
+            )
+            .unwrap();
+            std::fs::write(&file, &xml).unwrap();
+            let (mime, checked) = body().unwrap().unwrap();
+            assert_eq!(mime, "application/xml");
+            assert_eq!(checked, xml);
+
+            for (class, property) in [("Camera", "ViewStretch"), ("UnionOperation", "Name")] {
+                let instance = if class == "Camera" {
+                    InstanceBuilder::new(class).with_property(property, 1.0f64)
+                } else {
+                    InstanceBuilder::new(class)
+                };
+                let dom = WeakDom::new(InstanceBuilder::new("DataModel").with_child(instance));
+                let old_database = rbx_reflection::ReflectionDatabase::new();
+                let mut bytes = Vec::new();
+                rbx_binary::Serializer::new()
+                    .reflection_database(&old_database)
+                    .serialize(&mut bytes, &dom, dom.root().children())
+                    .unwrap();
+                std::fs::write(&file, bytes).unwrap();
+                let error = body().unwrap_err();
+                assert!(error.contains(class), "{error}");
+                assert!(error.contains("before upload"), "{error}");
+            }
+            std::fs::write(&file, b"<roblox!").unwrap();
+            assert!(body().unwrap_err().contains("Invalid binary place file"));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn nested_fields_keep_json_types() {
         let mut value = Map::new();
         insert_nested(&mut value, "payload.parameters.level", json!(7)).unwrap();
@@ -3308,7 +3389,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(Path::new(request["rawFile"].as_str().unwrap()), file);
-        assert_eq!(request["contentType"], "application/octet-stream");
+        assert!(request["contentType"].is_null());
 
         let request = build_request(
             "localization",

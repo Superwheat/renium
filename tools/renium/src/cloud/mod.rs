@@ -4,6 +4,7 @@ mod discovery;
 pub(crate) mod keys;
 mod paging;
 mod parameters;
+pub(crate) mod place_file;
 pub(crate) mod products;
 mod routes;
 mod servers;

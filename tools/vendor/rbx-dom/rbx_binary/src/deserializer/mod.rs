@@ -74,6 +74,7 @@ pub struct FlatDom {
 pub struct Deserializer<'db> {
     database: &'db ReflectionDatabase<'db>,
     elide_defaults: bool,
+    strict_float_types: bool,
     retain_defaults_for_classes: HashSet<String>,
     retain_defaults_for_properties: HashSet<String>,
     flat_property_filter: Option<Arc<HashMap<String, HashSet<String>>>>,
@@ -85,6 +86,7 @@ impl<'db> Deserializer<'db> {
         Self {
             database: rbx_reflection_database::get().unwrap(),
             elide_defaults: false,
+            strict_float_types: false,
             retain_defaults_for_classes: HashSet::new(),
             retain_defaults_for_properties: HashSet::new(),
             flat_property_filter: None,
@@ -102,6 +104,16 @@ impl<'db> Deserializer<'db> {
     #[allow(missing_docs)]
     pub fn elide_defaults(mut self, enabled: bool) -> Self {
         self.elide_defaults = enabled;
+        self
+    }
+
+    /// Reject floating-point wire widths that disagree with known property
+    /// types. The default reader recovers legacy Float64 values for Float32
+    /// properties, which is useful for repair but unsafe as upload validation.
+    /// This checks the serialized data before that recovery can hide a mismatch;
+    /// it does not establish that Roblox's engine can load the entire file.
+    pub fn strict_float_types(mut self, enabled: bool) -> Self {
+        self.strict_float_types = enabled;
         self
     }
 
