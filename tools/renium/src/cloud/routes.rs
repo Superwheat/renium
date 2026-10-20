@@ -3296,7 +3296,10 @@ mod tests {
         .unwrap();
         assert_eq!(request["body"], Value::Null);
         assert_eq!(request["jsonParts"]["request"]["assetType"], "Model");
-        assert_eq!(request["files"]["fileContent"], file.display().to_string());
+        assert_eq!(
+            Path::new(request["files"]["fileContent"].as_str().unwrap()),
+            file
+        );
 
         let request = build_request(
             "place",
@@ -3304,7 +3307,7 @@ mod tests {
             args("publish", &[&file.display().to_string()]),
         )
         .unwrap();
-        assert_eq!(request["rawFile"], file.display().to_string());
+        assert_eq!(Path::new(request["rawFile"].as_str().unwrap()), file);
         assert_eq!(request["contentType"], "application/octet-stream");
 
         let request = build_request(
@@ -3360,10 +3363,11 @@ mod tests {
         let mut upload = args("upload", &[&file.display().to_string()]);
         upload.file = vec![format!("files={}", file.display())];
         let request = build_request("thumbnail", identity, upload).unwrap();
-        assert_eq!(
-            request["files"]["files"],
-            json!([file.display().to_string(), file.display().to_string()])
-        );
+        let files = request["files"]["files"].as_array().unwrap();
+        assert_eq!(files.len(), 2);
+        for value in files {
+            assert_eq!(Path::new(value.as_str().unwrap()), file);
+        }
 
         let mut status = args("upload-status", &[]);
         status.query = vec![

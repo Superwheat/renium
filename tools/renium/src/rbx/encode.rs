@@ -2812,4 +2812,63 @@ mod tests {
             Some(RbxVariant::Int64(7))
         );
     }
+
+    #[test]
+    fn camera_export_writes_float32_for_bare_and_legacy_typed_numbers() {
+        use crate::tests::support::{settings_document, settings_instance};
+
+        for (size, stretch) in [
+            (json!(300), json!(1)),
+            (json!(300.0), json!(1.0)),
+            (
+                json!({"_type": "Float64", "value": 300.0}),
+                json!({"_type": "Float64", "value": 1.0}),
+            ),
+        ] {
+            let mut camera = settings_instance("camera", "Camera", "Camera", None);
+            camera.properties.insert("OrthographicSize".into(), size);
+            camera.properties.insert("ViewStretch".into(), stretch);
+            let document = settings_document(vec![camera]);
+            let bytes = crate::rbx::model::encode_settings_model(&document, true).unwrap();
+            // An empty database exposes the actual serialized types without
+            // letting a reader's schema conversions hide incorrect wire widths.
+            let wire_database = ReflectionDatabase::new();
+            let decoded = rbx_binary::Deserializer::new()
+                .reflection_database(&wire_database)
+                .deserialize(bytes.as_slice())
+                .unwrap();
+            let camera = decoded.get_by_ref(decoded.root().children()[0]).unwrap();
+            assert_eq!(
+                camera.properties.get(&"OrthographicSize".into()),
+                Some(&RbxVariant::Float32(300.0)),
+            );
+            assert_eq!(
+                camera.properties.get(&"ViewStretch".into()),
+                Some(&RbxVariant::Float32(1.0)),
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_numeric_properties_export_only_with_an_explicit_type() {
+        use crate::tests::support::{settings_document, settings_instance};
+
+        let mut camera = settings_instance("camera", "Camera", "Camera", None);
+        camera.properties.insert("FutureInteger".into(), json!(300));
+        camera.properties.insert("FutureFloat".into(), json!(1.5));
+        camera.properties.insert(
+            "FutureTypedFloat".into(),
+            json!({"_type": "Float32", "value": 4.0}),
+        );
+        let document = settings_document(vec![camera]);
+        let bytes = crate::rbx::model::encode_settings_model(&document, true).unwrap();
+        let decoded = rbx_binary::from_reader(bytes.as_slice()).unwrap();
+        let camera = decoded.get_by_ref(decoded.root().children()[0]).unwrap();
+        assert!(!camera.properties.contains_key(&"FutureInteger".into()));
+        assert!(!camera.properties.contains_key(&"FutureFloat".into()));
+        assert_eq!(
+            camera.properties.get(&"FutureTypedFloat".into()),
+            Some(&RbxVariant::Float32(4.0)),
+        );
+    }
 }

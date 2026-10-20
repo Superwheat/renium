@@ -818,15 +818,13 @@ rbx-dom may require changes to fully support this property. Please open an issue
                         add_property(instance, &property, value.into());
                     }
                 }
-                // This branch allows values serialized as Float32 to be converted to Float64 when we expect a Float64
-                // Basically, we convert Float32 to Float64 when we expect a Float64 but read a Float32
-                // See: #301
+                // Older writers without reflection metadata may have emitted
+                // doubles for a float property. Read the actual wire width
+                // before converting to the type required by the current schema.
                 VariantType::Float32 => {
-                    let values = chunk.read_interleaved_f32_array(instances.len())?;
-
-                    for (value, instance) in values.zip(instances) {
-                        let converted_value = f64::from(value);
-                        add_property(instance, &property, converted_value.into());
+                    for instance in instances {
+                        let value = chunk.read_le_f64()?;
+                        add_property(instance, &property, (value as f32).into());
                     }
                 }
                 invalid_type => {
