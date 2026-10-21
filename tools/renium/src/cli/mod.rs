@@ -2005,7 +2005,7 @@ pub(super) struct RecordStartArgs {
     pub(super) studio: bool,
     #[arg(help = "Record a play client", long, conflicts_with = "studio")]
     pub(super) client: bool,
-    #[arg(help = "Frames per second (1-30)", long, default_value_t = 12.0)]
+    #[arg(help = "Frames per second (1-60)", long, default_value_t = 60.0)]
     pub(super) fps: f64,
     #[arg(
         help = "Stop after this many seconds (1-300)",

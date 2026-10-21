@@ -29,9 +29,8 @@ Render quality decides what a capture shows. `rbx gfx` reports Studio's edit and
 `sc --camera-position -10,5,0 --look-at -20,0,0` accepts negative coordinates. `camera` reports the requested and actual position and direction; `moved: false` means the view was not held. Inspect the image itself. `--studio` captures the Studio window, including its play view during ordinary Play.
 
 Screenshots and silent H.264 MP4 recordings target one window, not the desktop.
-Recordings default to 12 FPS, 60 seconds maximum, and quality 80.
-`rs` accepts `--fps 1..30`, `--max-seconds 1..300`, and `--quality 0..100`.
-Choose FPS for the event: quick transitions may need 30 FPS. Frames between captures cannot be recovered.
+Recordings default to 60 FPS (`--fps 1..60`), 60 seconds (`--max-seconds 1..300`), quality 80 (`--quality 0..100`). Keep 60 FPS for clips a person will watch; clips are temporary, size is irrelevant.
+Never minimize a window whose behaviour matters: the one you record, test or read from. Windows and Roblox throttle a minimized or fully covered window, so it stutters; only filler clients that merely need to exist may be minimized. Leave the windows that matter behind your other windows (`rbx so` opens it that way; `rs` restores a minimized one without focus). `re` reports `achievedFps`; `throttled: true` means the window was starved: fix it and record again.
 
 For an already running client:
 
@@ -41,9 +40,8 @@ rbx ky W --hold-ms 700 -p 1
 rbx re
 ```
 
-Start, perform the action, then end without unrelated checks or artificial pauses.
 `re` stops and finalizes the recording; call it even after the duration limit.
-An optional recording ID prevents stopping the wrong recording.
+A recording ID stops only that recording.
 
 ## Review what was recorded
 
@@ -65,10 +63,8 @@ rbx rf clips/movement.mp4 --frame 15
 Frame/page numbers start at 1. PNG labels show frame number and elapsed time; JSON lists exact `timestampMs`, dimensions, and total captured frames.
 Inspect relevant pages and full-size frames for small UI details. Use every page if the task requires checking the entire recording.
 
-Review is offline and needs no Studio, play session, FFmpeg, or custom contact-sheet script.
 Images go in `VIDEO.mp4.review/`; `-o IMAGE.png` overrides the output.
 `re --no-review` saves only the video. If overview generation fails, `reviewError` explains why and the saved MP4 remains usable with `rf`.
-Review supports Renium's H.264 MP4s, not arbitrary video codecs.
 
 ## Device simulation
 

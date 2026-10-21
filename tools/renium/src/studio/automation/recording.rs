@@ -60,8 +60,24 @@ struct ActiveRecording {
     output: PathBuf,
     target: &'static str,
     window: String,
+    fps: f64,
     stop: Arc<AtomicBool>,
     worker: JoinHandle<Result<FinishedRecording>>,
+}
+
+/// Frames per second the file actually holds, and whether the source fell
+/// well short of the request: Windows and Roblox throttle a minimized or
+/// fully covered window, so a clip then stutters however high `fps` was.
+fn capture_rate(requested_fps: f64, frames: usize, duration_ms: u64) -> (f64, bool) {
+    if duration_ms == 0 || frames < 2 {
+        return (0.0, false);
+    }
+    let achieved = frames as f64 * 1000.0 / duration_ms as f64;
+    let achieved = (achieved * 10.0).round() / 10.0;
+    (
+        achieved,
+        duration_ms >= 1000 && achieved < requested_fps * 0.75,
+    )
 }
 
 struct FinishedRecording {
@@ -86,7 +102,7 @@ struct EncodedFrame {
 }
 
 fn default_fps() -> f64 {
-    12.0
+    60.0
 }
 
 fn default_max_seconds() -> f64 {
@@ -407,8 +423,8 @@ pub(crate) fn start(
     if request.studio && (request.client || request.player.is_some()) {
         bail!("record-start studio cannot be combined with client or player");
     }
-    if !request.fps.is_finite() || !(1.0..=30.0).contains(&request.fps) {
-        bail!("Invalid record-start fps; expected a number from 1 through 30");
+    if !request.fps.is_finite() || !(1.0..=60.0).contains(&request.fps) {
+        bail!("Invalid record-start fps; expected a number from 1 through 60");
     }
     if !request.max_seconds.is_finite() || !(1.0..=300.0).contains(&request.max_seconds) {
         bail!("Invalid record-start maxSeconds; expected a number from 1 through 300");
@@ -500,6 +516,7 @@ pub(crate) fn start(
         output: output.clone(),
         target,
         window: window_label,
+        fps: request.fps,
         stop,
         worker,
     });
@@ -542,7 +559,8 @@ pub(crate) fn end(parameters: &Value) -> Result<Value> {
         .worker
         .join()
         .map_err(|_| anyhow!("Recording worker panicked"))??;
-    Ok(json!({
+    let (achieved_fps, throttled) = capture_rate(active.fps, finished.frames, finished.duration_ms);
+    let mut result = json!({
         "recordingId": active.id,
         "path": active.output.display().to_string(),
         "target": active.target,
@@ -551,13 +569,31 @@ pub(crate) fn end(parameters: &Value) -> Result<Value> {
         "height": finished.height,
         "frames": finished.frames,
         "durationMs": finished.duration_ms,
+        "requestedFps": active.fps,
+        "achievedFps": achieved_fps,
         "mimeType": "video/mp4",
         "audio": false,
-    }))
+    });
+    if throttled {
+        result["throttled"] = json!(true);
+        result["note"] = json!(format!(
+            "The window delivered {achieved_fps} frames per second against {} requested; a minimized or fully covered window is throttled by Windows and Roblox. Keep the recorded window restored behind your other windows, never minimized, and record again",
+            active.fps
+        ));
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn capture_rate_reports_the_file_rate_and_flags_a_throttled_source() {
+        assert_eq!(capture_rate(60.0, 600, 10_000), (60.0, false));
+        assert_eq!(capture_rate(24.0, 120, 10_000), (12.0, true));
+        assert_eq!(capture_rate(60.0, 20, 400), (50.0, false));
+        assert_eq!(capture_rate(60.0, 1, 1_000), (0.0, false));
+    }
+
     use super::*;
 
     #[test]
@@ -604,6 +640,7 @@ mod tests {
                 output: output.clone(),
                 target: "test",
                 window: "synthetic capture".into(),
+                fps: 30.0,
                 stop,
                 worker,
             });

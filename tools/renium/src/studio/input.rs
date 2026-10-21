@@ -1709,6 +1709,17 @@ mod platform {
         Ok(())
     }
 
+    /// A window Renium had to restore from the taskbar says so in its label:
+    /// a minimized window renders throttled, and the capture that follows
+    /// may still be catching up.
+    fn window_label(pid: u32, title: &str, restored: bool) -> String {
+        if restored {
+            format!("pid {pid}: {title} (restored from minimized, kept behind other windows)")
+        } else {
+            format!("pid {pid}: {title}")
+        }
+    }
+
     fn restore_window_at_bottom(hwnd: isize) -> Result<()> {
         if unsafe { IsIconic(hwnd as HWND) } != 0 {
             unsafe { ShowWindow(hwnd as HWND, SW_SHOWNOACTIVATE) };
@@ -1750,7 +1761,8 @@ mod platform {
                     .unwrap_or_default()
             })
             .with_context(|| format!("No visible window found for Studio process {pid}"))?;
-        if unsafe { IsIconic(hwnd as HWND) } != 0 {
+        let restored = unsafe { IsIconic(hwnd as HWND) } != 0;
+        if restored {
             restore_window_at_bottom(hwnd)?;
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
             loop {
@@ -1763,7 +1775,7 @@ mod platform {
         }
         let handle = viewport_child(hwnd, viewport)?;
         Ok(StudioWindow {
-            label: format!("pid {pid}: {title}"),
+            label: window_label(pid, &title, restored),
             handle,
         })
     }
@@ -1776,13 +1788,17 @@ mod platform {
         F: FnMut(u8, &[u32]) -> Result<()>,
     {
         let (hwnd, pid, title) = main_studio_window(pid)?;
-        if unsafe { IsIconic(hwnd as HWND) } != 0 {
+        let restored = unsafe { IsIconic(hwnd as HWND) } != 0;
+        if restored {
             restore_window_at_bottom(hwnd)?;
             std::thread::sleep(std::time::Duration::from_millis(400));
         }
         if let Some(candidate) = native_viewport_candidate(hwnd, pid)? {
             return Ok(StudioWindow {
-                label: format!("native engine viewport for pid {pid}: {title}"),
+                label: format!(
+                    "native engine viewport for {}",
+                    window_label(pid, &title, restored)
+                ),
                 handle: WindowHandle {
                     viewport: candidate.hwnd,
                     capture: candidate.hwnd,
