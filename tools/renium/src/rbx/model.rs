@@ -257,9 +257,12 @@ impl RbxPlaceFormat {
         match format {
             Self::Binary => rbx_binary::Deserializer::new()
                 .elide_defaults(elide_defaults)
-                .retain_defaults_for_properties(HashSet::from([
-                    crate::rbx::encode::COLLISION_HULL_PROPERTY.to_string(),
-                ]))
+                .retain_defaults_for_properties(
+                    crate::rbx::encode::RETAINED_DEFAULT_PROPERTIES
+                        .iter()
+                        .map(|name| name.to_string())
+                        .collect(),
+                )
                 .deserialize(reader)
                 .with_context(|| format!("Failed to read {}", path.display())),
             Self::Xml => rbx_xml::from_reader(

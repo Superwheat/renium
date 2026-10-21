@@ -59,12 +59,183 @@ fn canonical_new_instance_properties(
     Ok(out)
 }
 
+/// What a new store instance needs; the CLI and script imports both build it.
+pub(crate) struct StoreInstanceRequest {
+    pub(crate) settings_file: PathBuf,
+    pub(crate) service_hint: String,
+    pub(crate) name: String,
+    pub(crate) class_name: String,
+    pub(crate) settings_id: Option<String>,
+    pub(crate) parent: StoreParentSelector,
+    pub(crate) properties: Vec<String>,
+    pub(crate) attributes: Vec<String>,
+}
+
+#[derive(Default)]
+pub(crate) struct StoreParentSelector {
+    pub(crate) no_parent: bool,
+    pub(crate) parent_index: Option<usize>,
+    pub(crate) parent_settings_id: Option<String>,
+    pub(crate) parent_name: Option<String>,
+    pub(crate) parent_class_name: Option<String>,
+}
+
 pub(crate) fn bytecode_add_instance(args: BytecodeAddInstanceArgs) -> Result<()> {
     let (settings_file, service_hint) = resolve_bytecode_cli_settings_file(
         args.input.settings_file.as_deref(),
         args.input.service_or_file.as_deref(),
         args.service_hint.as_deref(),
     )?;
+    let result = add_store_instance(StoreInstanceRequest {
+        settings_file,
+        service_hint,
+        name: args.name,
+        class_name: args.class_name,
+        settings_id: args.settings_id,
+        parent: StoreParentSelector {
+            no_parent: args.parent.no_parent,
+            parent_index: args.parent.parent_index,
+            parent_settings_id: args.parent.parent_settings_id,
+            parent_name: args.parent.parent_name,
+            parent_class_name: args.parent.parent_class_name,
+        },
+        properties: args.properties,
+        attributes: args.attributes,
+    })?;
+    print_json_output(&result, args.pretty)
+}
+
+/// A script file imported with `--path-json` into a project whose service is
+/// store-backed gets its store instance too, so builds and pushes see it.
+pub(crate) fn register_imported_script(
+    loaded: &crate::project::config::LoadedProject,
+    path_json: &str,
+    destination: &Path,
+) -> Result<Option<Value>> {
+    let segments: Vec<String> =
+        serde_json::from_str(path_json).context("--path-json must be a JSON string array")?;
+    if segments.len() < 2 {
+        return Ok(None);
+    }
+    let src_root = loaded.root.join(&loaded.project.source_root);
+    let (settings_file, service_hint) = crate::bytecode::resolve_bytecode_settings_file(
+        None,
+        Some(&segments[0]),
+        None,
+        &loaded.root,
+        &src_root,
+    )?;
+    if !settings_file.is_file() {
+        return Ok(None);
+    }
+    crate::project::config::cache_script_naming(&loaded.root, &loaded.project);
+    let naming = crate::project::config::project_script_naming(&loaded.project);
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("Import destination has no file name")?;
+    let Some((class_name, stem, run_context)) =
+        crate::editor::paths::infer_source_script(file_name, &naming)
+    else {
+        return Ok(None);
+    };
+    if stem.is_none() {
+        bail!(
+            "{file_name} names its parent instance; register that instance with `rbx ba` and its class, then import the file"
+        );
+    }
+    let document = SettingsBytecode::read_file(&settings_file)?;
+    let parent_segments = &segments[1..segments.len() - 1];
+    let parent_index = store_index_at_segments(&document, parent_segments)?.with_context(|| {
+        format!(
+            "{} is not in the {} store",
+            parent_segments.join("."),
+            segments[0]
+        )
+    })?;
+    let name = &segments[segments.len() - 1];
+    let existing = document
+        .instances
+        .iter()
+        .filter(|instance| instance.parent_index == Some(parent_index) && instance.name == *name)
+        .collect::<Vec<_>>();
+    match existing.as_slice() {
+        [] => {}
+        [instance] if is_lua_source_class(&instance.class_name) => return Ok(None),
+        [instance] => bail!(
+            "{} already exists in the store as a {}; remove it with `rbx br` or choose another name",
+            segments.join("."),
+            instance.class_name
+        ),
+        _ => bail!("{} names several store instances", segments.join(".")),
+    }
+    let mut properties = Vec::new();
+    if class_name == "Script"
+        && let Some(context) = run_context
+        && context != "Legacy"
+    {
+        properties.push(format!("RunContext=\"{context}\""));
+    }
+    add_store_instance(StoreInstanceRequest {
+        settings_file,
+        service_hint,
+        name: name.clone(),
+        class_name: class_name.to_string(),
+        settings_id: None,
+        parent: StoreParentSelector {
+            parent_index: Some(parent_index),
+            ..StoreParentSelector::default()
+        },
+        properties,
+        attributes: Vec::new(),
+    })
+    .map(Some)
+}
+
+/// The store instance a path below the service root names, by exact name at
+/// each level; a level with several such instances is refused.
+fn store_index_at_segments(
+    document: &SettingsBytecode,
+    segments: &[String],
+) -> Result<Option<usize>> {
+    let mut current = document
+        .instances
+        .iter()
+        .position(|instance| instance.parent_index.is_none())
+        .context("Store has no root")?;
+    for segment in segments {
+        let matches = document
+            .instances
+            .iter()
+            .enumerate()
+            .filter(|(_, instance)| {
+                instance.parent_index == Some(current) && instance.name == *segment
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        current = match matches.as_slice() {
+            [] => return Ok(None),
+            [one] => *one,
+            _ => bail!(
+                "{segment} names {} instances in the store; register with `rbx ba -x INDEX`",
+                matches.len()
+            ),
+        };
+    }
+    Ok(Some(current))
+}
+
+pub(crate) fn add_store_instance(request: StoreInstanceRequest) -> Result<Value> {
+    let StoreInstanceRequest {
+        settings_file,
+        service_hint,
+        name,
+        class_name,
+        settings_id,
+        parent,
+        properties: raw_properties,
+        attributes: raw_attributes,
+    } = request;
     ensure_service_store_exists(&settings_file, &service_hint)?;
     let _lock = acquire_settings_file_lock(&settings_file)?;
     let mut document = SettingsBytecode::read_file(&settings_file)?;
@@ -75,21 +246,21 @@ pub(crate) fn bytecode_add_instance(args: BytecodeAddInstanceArgs) -> Result<()>
     let source_paths_before = build_editor_source_paths_by_index(&document, &service, service_dir);
     let parent_index = bytecode_parent_index(
         &document,
-        args.parent.no_parent,
-        args.parent.parent_index,
-        args.parent.parent_settings_id.as_deref(),
-        args.parent.parent_name.as_deref(),
-        args.parent.parent_class_name.as_deref(),
+        parent.no_parent,
+        parent.parent_index,
+        parent.parent_settings_id.as_deref(),
+        parent.parent_name.as_deref(),
+        parent.parent_class_name.as_deref(),
     )?;
-    let class_name = args.class_name.clone();
+    let class_name = class_name.clone();
     if class_name == "PackageLink" {
         bail!("PackageLink instances can only be created by Roblox package workflows");
     }
     let mut properties = canonical_new_instance_properties(
         &class_name,
-        parse_property_assignments(&args.properties)?,
+        parse_property_assignments(&raw_properties)?,
     )?;
-    let mut attributes = parse_property_assignments(&args.attributes)?;
+    let mut attributes = parse_property_assignments(&raw_attributes)?;
     for map in [&mut properties, &mut attributes] {
         let mut value = Value::Object(std::mem::take(map));
         crate::bytecode::qualify_value_references(&mut value, &settings_file, &document)?;
@@ -115,9 +286,9 @@ pub(crate) fn bytecode_add_instance(args: BytecodeAddInstanceArgs) -> Result<()>
     let added = instance_api::add_instance(
         &mut document,
         AddInstanceSpec {
-            settings_id: args.settings_id,
-            name: args.name,
-            class_name: args.class_name,
+            settings_id,
+            name,
+            class_name,
             parent_index,
             properties,
             attributes,
@@ -167,7 +338,7 @@ pub(crate) fn bytecode_add_instance(args: BytecodeAddInstanceArgs) -> Result<()>
         "adoptedSource": adopted_source,
     });
     crate::app::output::drop_empty(&mut result, &["sourceWrites", "adoptedSource"]);
-    print_json_output(&result, args.pretty)
+    Ok(result)
 }
 
 /// The bytes a new script's file receives, or None when a file already at

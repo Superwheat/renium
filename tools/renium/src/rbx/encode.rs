@@ -763,6 +763,11 @@ fn neutral_export_variant(sample: &RbxVariant) -> Option<RbxVariant> {
 
 pub(crate) const COLLISION_HULL_PROPERTY: &str = "PhysicalConfigData";
 
+/// Saved members an import keeps even at their reflection default: Studio
+/// always writes them, and Open Cloud treats SurfaceAppearance as a type that
+/// must round-trip byte for byte.
+pub(crate) const RETAINED_DEFAULT_PROPERTIES: [&str; 2] = [COLLISION_HULL_PROPERTY, "SurfaceSlot"];
+
 /// Engine-built data a part carries opaquely: collision hulls and aero
 /// meshes, a union's CSG tree, mesh and older mesh holder, and the terrain's
 /// material table.

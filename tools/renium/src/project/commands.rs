@@ -737,9 +737,9 @@ pub(crate) fn import_path_command(
     let PreparedImportPaths {
         writes,
         results: file_results,
-        changed_paths,
+        mut changed_paths,
     } = prepare_import_path_files(&root, &files)?;
-    let result = json!({
+    let mut result = json!({
         "ok": true,
         "source": source,
         "destination": destination,
@@ -750,6 +750,25 @@ pub(crate) fn import_path_command(
         return print_json_output(&result, false);
     }
     apply_file_mutations(&writes, &[])?;
+    if let (Some(path_json), Some(project)) = (args.path_json.as_deref(), loaded.as_ref()) {
+        match crate::bytecode::edit::register_imported_script(project, path_json, &destination) {
+            Ok(Some(instance)) => {
+                changed_paths.extend(
+                    instance["changedPaths"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(PathBuf::from),
+                );
+                changed_paths.sort();
+                changed_paths.dedup();
+                result["storeInstance"] = instance;
+            }
+            Ok(None) => {}
+            Err(error) => result["storeInstanceError"] = json!(format!("{error:#}")),
+        }
+    }
     if args.push && !changed_paths.is_empty() {
         push_editor_changes(PushEditorChangesArgs {
             changed_paths,

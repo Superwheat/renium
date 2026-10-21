@@ -1017,6 +1017,7 @@ fn encode_settings_bytecode_payload_with_reference_lookup(
         SettingsBinaryInstanceLookup {
             dense_instance_count: document.instances.len(),
             dense_instances: Some(&document.instances),
+            root_service: document_root_service(document),
             ..Default::default()
         }
     };
@@ -1138,11 +1139,20 @@ fn var_u64_len(mut value: u64) -> usize {
     len
 }
 
+fn document_root_service(document: &SettingsBytecode) -> Option<String> {
+    document
+        .instances
+        .iter()
+        .find(|instance| instance.parent_index.is_none())
+        .map(|instance| instance.name.clone())
+}
+
 fn build_bytecode_instance_lookup(document: &SettingsBytecode) -> SettingsBinaryInstanceLookup<'_> {
     let selectors = settings_document_reference_selectors(document);
     let mut lookup = SettingsBinaryInstanceLookup {
         dense_instance_count: document.instances.len(),
         dense_instances: Some(&document.instances),
+        root_service: document_root_service(document),
         by_settings_id: if selectors.settings_id {
             AHashMap::with_capacity(document.instances.len())
         } else {
@@ -1808,6 +1818,9 @@ enum SettingsBinaryValueSource<'a> {
 struct SettingsBinaryInstanceLookup<'a> {
     dense_instance_count: usize,
     dense_instances: Option<&'a [SettingsBytecodeInstance]>,
+    /// The service this store describes; a path into another service is an
+    /// outside reference whatever the other selectors say.
+    root_service: Option<String>,
     by_instance_index: SettingsIndexMap<usize>,
     by_settings_id: SettingsIndexMap<Cow<'a, str>>,
     by_instance_id: SettingsIndexMap<String>,
@@ -2180,9 +2193,14 @@ fn build_settings_binary_instance_lookup<'a>(
     state: &'a ServiceState,
     instances: &[SettingsBinaryInstance<'a>],
 ) -> SettingsBinaryInstanceLookup<'a> {
+    let root_service = state
+        .instances
+        .get(state.service_root_index)
+        .map(|instance| instance.name.clone());
     if state.dense_index_topology {
         return SettingsBinaryInstanceLookup {
             dense_instance_count: instances.len(),
+            root_service,
             ..Default::default()
         };
     }
@@ -2268,6 +2286,7 @@ fn build_settings_binary_instance_lookup<'a>(
     SettingsBinaryInstanceLookup {
         dense_instance_count: 0,
         dense_instances: None,
+        root_service,
         by_instance_index,
         by_settings_id,
         by_instance_id,
@@ -3013,6 +3032,16 @@ fn resolve_ref_index(
     ref_value: &Map<String, Value>,
     lookup: &SettingsBinaryInstanceLookup<'_>,
 ) -> Result<Option<usize>> {
+    // A path into another service names an outside instance; a settings id or
+    // index that happens to exist in this store must not capture it.
+    if let Some((segments, _)) = strict_reference_path(ref_value)?
+        && let Some(root_service) = lookup.root_service.as_deref()
+        && segments
+            .first()
+            .is_some_and(|service| service != root_service)
+    {
+        return Ok(None);
+    }
     let mut resolved = None;
     let mut unresolved = false;
     let mut explicit_instance_index = None;
@@ -3119,7 +3148,10 @@ fn resolve_ref_index(
         accept_stable("path", None)?;
     }
     if unresolved && resolved.is_some() {
-        bail!("Ref selectors mix local and nonlocal targets");
+        bail!(
+            "Ref selectors mix local and nonlocal targets: {}",
+            serde_json::to_string(ref_value).unwrap_or_default()
+        );
     }
     Ok(resolved)
 }
@@ -4239,6 +4271,46 @@ mod tests {
         assert_eq!(
             decoded.instances[0].properties["PrimaryPart"],
             json!({ "_type": "Ref", "instanceIndex": 2 })
+        );
+    }
+
+    #[test]
+    fn cross_service_path_reference_stays_external_despite_a_matching_id() {
+        let reference = json!({
+            "_type": "Ref",
+            "pathSegments": ["Workspace"],
+            "pathOrdinals": [1],
+            "settingsId": "1",
+        });
+        let document = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                SettingsBytecodeInstance::new(
+                    "root".to_string(),
+                    "ReplicatedStorage".to_string(),
+                    "ReplicatedStorage".to_string(),
+                    None,
+                ),
+                SettingsBytecodeInstance {
+                    settings_id: "1".to_string(),
+                    name: "Holder".to_string(),
+                    class_name: "ObjectValue".to_string(),
+                    parent_index: Some(0),
+                    properties: Map::from_iter([("Value".to_string(), reference.clone())]),
+                    attributes: Map::new(),
+                },
+            ],
+        };
+        let lookup = build_bytecode_instance_lookup(&document);
+        assert_eq!(
+            resolve_ref_index(ref_payload_object(&reference).unwrap(), &lookup).unwrap(),
+            None
+        );
+        let decoded =
+            decode_settings_bytecode(&encode_settings_bytecode(&document).unwrap()).unwrap();
+        assert_eq!(
+            decoded.instances[1].properties["Value"]["pathSegments"],
+            json!(["Workspace"])
         );
     }
 

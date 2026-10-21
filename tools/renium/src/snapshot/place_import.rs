@@ -132,9 +132,12 @@ fn read_place(path: &Path, services: &[String]) -> Result<FlatDom> {
     };
     let mut flat = rbx_binary::Deserializer::new()
         .elide_defaults(true)
-        .retain_defaults_for_properties(std::collections::HashSet::from([
-            crate::rbx::encode::COLLISION_HULL_PROPERTY.to_string(),
-        ]))
+        .retain_defaults_for_properties(
+            crate::rbx::encode::RETAINED_DEFAULT_PROPERTIES
+                .iter()
+                .map(|name| name.to_string())
+                .collect(),
+        )
         .retain_defaults_for_classes(services.iter().cloned().collect())
         .deserialize_flat(Cursor::new(bytes))
         .with_context(|| format!("{} is not a valid place file", path.display()))?;
@@ -501,6 +504,85 @@ mod tests {
             .find(|instance| instance.class_name == "WrapTarget")
             .unwrap();
         assert_eq!(target.properties.get("Stiffness"), Some(&json!(0.5)));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn place_import_keeps_surface_slot_at_its_default() {
+        let root = crate::tests::support::temp_dir("saved-surface-slot");
+        let dom = WeakDom::new(InstanceBuilder::new("DataModel").with_child(
+            InstanceBuilder::new("Workspace").with_child(
+                InstanceBuilder::new("MeshPart").with_child(
+                    InstanceBuilder::new("SurfaceAppearance").with_property("SurfaceSlot", -1i32),
+                ),
+            ),
+        ));
+        let mut bytes = Vec::new();
+        rbx_binary::to_writer(&mut bytes, &dom, dom.root().children()).unwrap();
+        std::fs::write(root.join("place.rbxl"), bytes).unwrap();
+        std::fs::write(root.join("renium.project.jsonc"), "{\"schemaVersion\":1}").unwrap();
+        let result = run(&root);
+        assert_eq!(result["ok"], true);
+        let stored = SettingsBytecode::read_file(&root.join("instances/Workspace.renium")).unwrap();
+        let appearance = stored
+            .instances
+            .iter()
+            .find(|instance| instance.class_name == "SurfaceAppearance")
+            .unwrap();
+        assert_eq!(appearance.properties.get("SurfaceSlot"), Some(&json!(-1)));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_script_imported_by_path_joins_the_service_store() {
+        let root = crate::tests::support::temp_dir("ip-registers-store");
+        let dom = WeakDom::new(
+            InstanceBuilder::new("DataModel").with_child(
+                InstanceBuilder::new("ServerScriptService")
+                    .with_child(InstanceBuilder::new("Folder").with_name("Public")),
+            ),
+        );
+        let mut bytes = Vec::new();
+        rbx_binary::to_writer(&mut bytes, &dom, dom.root().children()).unwrap();
+        std::fs::write(root.join("place.rbxl"), bytes).unwrap();
+        std::fs::write(root.join("renium.project.jsonc"), "{\"schemaVersion\":1}").unwrap();
+        assert_eq!(run(&root)["ok"], true);
+        let file = root.join("src/ServerScriptService/Public/SafeTeleport.luau");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "return {}").unwrap();
+        let loaded = crate::project::config::load_project(None, Some(&root)).unwrap();
+        let registered = crate::bytecode::edit::register_imported_script(
+            &loaded,
+            "[\"ServerScriptService\",\"Public\",\"SafeTeleport\"]",
+            &file,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            Path::new(registered["adoptedSource"].as_str().unwrap()),
+            file
+        );
+        let stored =
+            SettingsBytecode::read_file(&root.join("instances/ServerScriptService.renium"))
+                .unwrap();
+        let script = stored
+            .instances
+            .iter()
+            .find(|instance| instance.name == "SafeTeleport")
+            .unwrap();
+        assert_eq!(script.class_name, "ModuleScript");
+        assert_eq!(
+            stored.instances[script.parent_index.unwrap()].name,
+            "Public"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "return {}");
+        let again = crate::bytecode::edit::register_imported_script(
+            &loaded,
+            "[\"ServerScriptService\",\"Public\",\"SafeTeleport\"]",
+            &file,
+        )
+        .unwrap();
+        assert!(again.is_none());
         std::fs::remove_dir_all(root).unwrap();
     }
 
