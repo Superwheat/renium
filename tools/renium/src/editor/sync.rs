@@ -1318,6 +1318,43 @@ pub(crate) fn push_editor_changes_with_warm_bridge_guarded(
     )
 }
 
+/// An unreviewed full push removes whatever Studio holds and the files do not,
+/// including newer Team Create work; say so before it happens.
+fn announce_unreviewed_deletions(args: &PushEditorChangesArgs, changes: &EditorChangeSet) {
+    if !args.no_review || args.upsert_instances_only {
+        return;
+    }
+    let deletions = changes
+        .instance_changes
+        .iter()
+        .filter(|change| change.mode == "deleteInstances")
+        .map(|change| change.instances.len())
+        .sum::<usize>();
+    let reconciled = changes
+        .instance_changes
+        .iter()
+        .filter(|change| change.allow_deletes && change.mode != "deleteInstances")
+        .map(|change| change.service.as_str())
+        .collect::<BTreeSet<_>>();
+    if deletions > 0 {
+        log_global(
+            3,
+            format_args!(
+                "[renium] push deletes {deletions} instance(s) Studio has and the files do not, without review; pass -u to keep them, or pull first"
+            ),
+        );
+    }
+    if !reconciled.is_empty() {
+        log_global(
+            3,
+            format_args!(
+                "[renium] push reconciles {} without review and removes whatever Studio holds there that the files do not; pass -u to keep Studio-only instances, or pull first",
+                reconciled.into_iter().collect::<Vec<_>>().join(", ")
+            ),
+        );
+    }
+}
+
 /// `ps --verify`: compares the selected script sources with what Studio holds
 /// and reports the differences; nothing is pushed.
 fn verify_editor_sources_only(
@@ -2551,6 +2588,7 @@ fn push_editor_changes_with_collected(
     mut changes: EditorChangeSet,
     options: CollectedPushOptions<'_>,
 ) -> Result<serde_json::Map<String, Value>> {
+    announce_unreviewed_deletions(&args, &changes);
     let CollectedPushOptions {
         started,
         projection,

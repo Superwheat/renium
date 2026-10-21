@@ -1,5 +1,9 @@
 use super::*;
 
+/// A failed push can leave the pair record holding its conflicts; the next
+/// write names the ways out instead of stopping at the state.
+const UNRESOLVED_CHANGES: &str = "Reconciliation state has unresolved changes. `rbx lst --details` lists them; `rbx lon --prefer studio|editor` resolves them and also pushes the other side's one-sided edits; `rbx lof` then a scoped push (`-p`/`-f` with `-u`) leaves the rest of Studio untouched";
+
 #[derive(Default)]
 pub(crate) struct TargetOwners {
     pub(crate) by_target: HashMap<String, (String, String)>,
@@ -720,7 +724,7 @@ impl Coordinator {
             return Ok(());
         }
         if !record.conflicts.is_empty() {
-            bail!("Reconciliation state has unresolved changes");
+            bail!("{UNRESOLVED_CHANGES}");
         }
         let baseline = record
             .baseline
@@ -791,7 +795,7 @@ impl Coordinator {
             bail!("Live Sync is not allowed to write in verify mode");
         }
         if !record.conflicts.is_empty() {
-            bail!("Reconciliation state has unresolved changes");
+            bail!("{UNRESOLVED_CHANGES}");
         }
         let root = Path::new(&context.root);
         let stage = project_comparison_stage(context, &sync_services())?;
@@ -824,7 +828,7 @@ impl Coordinator {
             return Ok(());
         }
         if !record.conflicts.is_empty() {
-            bail!("Reconciliation state has unresolved changes");
+            bail!("{UNRESOLVED_CHANGES}");
         }
         let baseline = record
             .baseline
@@ -874,7 +878,7 @@ impl Coordinator {
             bail!("Live Sync is not allowed to write in verify mode");
         }
         if !record.conflicts.is_empty() {
-            bail!("Reconciliation state has unresolved changes");
+            bail!("{UNRESOLVED_CHANGES}");
         }
         let baseline = record
             .baseline

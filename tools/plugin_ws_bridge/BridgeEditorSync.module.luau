@@ -1406,6 +1406,24 @@ local function writeProperty(instance: Instance, propertyName: string, value: an
 	return false, writeErr
 end
 
+local function jointHoldingPart(part: Instance): Instance?
+	if not part:IsA("BasePart") then
+		return nil
+	end
+	local okJoints, joints = pcall(function()
+		return (part :: BasePart):GetJoints()
+	end)
+	if not okJoints or type(joints) ~= "table" then
+		return nil
+	end
+	for _, joint in ipairs(joints) do
+		if joint:IsA("JointInstance") or joint:IsA("WeldConstraint") then
+			return joint
+		end
+	end
+	return nil
+end
+
 local function writePropertyForSync(
 	instance: Instance,
 	propertyName: string,
@@ -1427,6 +1445,10 @@ local function writePropertyForSync(
 				return false, err
 			end
 		end
+	end
+	local okBefore, before = false, nil
+	if propertyName == "CFrame" then
+		okBefore, before = readProperty(instance, propertyName)
 	end
 	local token = if ctx ~= nil then ctx.expectPropertyEvent(instance, propertyName, value) else nil
 	local ok, result = writeProperty(instance, propertyName, value)
@@ -1454,6 +1476,13 @@ local function writePropertyForSync(
 	end
 	if not okRead or not propertyValuesEqual(instance, propertyName, current, value) then
 		cancelExpectedEvent(ctx, token)
+		if okBefore and okRead and propertyValuesEqual(instance, propertyName, current, before) then
+			local joint = jointHoldingPart(instance)
+			if joint ~= nil then
+				return false,
+					`Roblox did not retain CFrame; the part is held by {joint:GetFullName()}, so move the assembly root or recreate the model instead`
+			end
+		end
 		return false, `Roblox did not retain {propertyName}`
 	end
 	if propertyName == "CollisionFidelity" and instance:IsA("MeshPart") and ctx ~= nil then
@@ -3790,10 +3819,16 @@ function TransactionState.restoreMetadata(
 			then replacements[entry.value] or entry.value
 			else entry.value
 		local okRead, current = readProperty(instance, entry.name)
-		if typeof(value) == "Font" or not okRead or not exactValuesEqual(current, value) then
+		if typeof(value) == "Font" or not okRead or not propertyValuesEqual(instance, entry.name, current, value) then
 			local okWrite, writeError = writePropertyForSync(instance, entry.name, value, ctx)
 			if not okWrite then
-				error(`Could not restore {instance:GetFullName()}.{entry.name}: {writeError}`)
+				-- A weld-held part keeps the engine's value; when that already is
+				-- the journaled value within tolerance, the restore is complete.
+				local okAgain, after = readProperty(instance, entry.name)
+				if typeof(value) == "Font"
+					or not (okAgain and propertyValuesEqual(instance, entry.name, after, value)) then
+					error(`Could not restore {instance:GetFullName()}.{entry.name}: {writeError}`)
+				end
 			end
 		end
 	end

@@ -16,6 +16,13 @@
 
 ### Bug fixes
 
+- `ip --path-json` registers the script in the service store when the project is store-backed (a `pi` import), so `bep` and pushes include it; the result shows `storeInstance`. Before, the file was written and silently left out of builds.
+- `pi` and model imports keep `SurfaceAppearance.SurfaceSlot` even at its default, so a build round-trips the API-limited type byte for byte.
+- Applying a shared link into a place whose store happens to reuse a settings id no longer fails with "Ref selectors mix local and nonlocal targets"; a reference whose path names another service stays an outside reference, and the error names the reference when it does occur.
+- `cmp --full` pairs same-named siblings by content when their subtrees swapped places (two car models with one name, a folder of `Part`s), including models that reference their own parts, reporting `reorderedSiblings` instead of a changed entry per twin; groups above 512 twins keep positional pairing.
+- A push that cannot set a part's CFrame because a Weld, Motor6D or WeldConstraint holds it says which joint, and a rollback no longer fails on such a part when the engine already holds the journaled value.
+- "Reconciliation state has unresolved changes" now names the ways out: `lst --details`, `lon --prefer studio|editor` (which also pushes the other side's one-sided edits), or `lof` followed by a scoped push.
+- An unreviewed push logs the instances it deletes and the services it reconciles (where Studio-only instances are removed), with `-u` as the way to keep them.
 - Every Open Cloud place-version upload (`publish --open-cloud`, `publish --as`, `oc place publish FILE` and raw requests to that endpoint, Saved or Published) validates the exact bytes it sends first: nonempty, at most 100 MiB, parseable binary or XML, and no known floating-point member written with the wrong width. A place built with `Camera.OrthographicSize` saved as a double, which Roblox servers could not initialize, is now refused before upload with the member named. `publish --open-cloud --file FILE --dry-run` runs the same checks without credentials, and `--saved` now also works with `--open-cloud`.
 - Reading a place whose float members were written as doubles by an older build keeps their values instead of misreading the bytes.
 - Pulls store known numeric properties as native records again; an import followed by `bep` no longer resets saved values such as `WrapTarget.Stiffness`.

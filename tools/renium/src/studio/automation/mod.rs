@@ -649,7 +649,7 @@ fn finish_studio_change_state_command(
             String::new()
         };
         bail!(
-            "{error}{listing}\nResolve with one:\nrbx lon --prefer studio\nrbx lon --prefer editor"
+            "{error}{listing}\nResolve with one:\nrbx lon --prefer studio\nrbx lon --prefer editor\nrbx lof, then push only the paths you need (-p/-f with -u)"
         );
     }
     if failed {
