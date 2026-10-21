@@ -1304,6 +1304,10 @@ const EMBEDDED_AGENT_GUIDES: &[(&str, &str)] = &[
         include_str!("../../../renium-guides/advanced.md"),
     ),
     (
+        "bug-reports.md",
+        include_str!("../../../renium-guides/bug-reports.md"),
+    ),
+    (
         "capture-device.md",
         include_str!("../../../renium-guides/capture-device.md"),
     ),

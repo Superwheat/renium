@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### New
+
+- `rbx report --upload <ID>` re-zips a written report folder and sends it to the Renium developer's report store: a Cloudflare Worker that accepts only the archive shape `rbx report` writes (report files only, every entry inflated and checksummed under size caps, UTF-8 text, a `report.json` whose ID and file list match), stores it in R2 once per ID within per-address, global and daily budgets, and answers with the ID it was filed under, so "report RNM-20261021-AB12CD" is enough to find the bundle. The new `RENIUM/bug-reports.md` guide makes agents read every file in the folder and remove anything private before uploading; files outside the report layout are left behind, and a refused or failed upload keeps the zip for a manual attachment. `report.json` now carries the message.
+
 ### Improvements
 
 - The Studio lifecycle guide says to open Studio only with `rbx so` or `rbx ro`: Renium launches it behind the user's windows and blocks its self-activation, which a raw `Start-Process` or `Popen` launch cannot, so such a Studio takes the foreground after loading.

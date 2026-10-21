@@ -101,6 +101,9 @@ jobs:
       - name: Test launchers
         run: node tools/renium/tests/launcher-smoke.mjs
 
+      - name: Test the report store Worker
+        run: node --test tools/renium-reports/test/*.test.mjs
+
   rust-windows-arm:
     name: Rust tests (windows-11-arm)
     # Windows ARM64 has no maintainer runner, so every push, pull request and
@@ -149,6 +152,9 @@ jobs:
 
       - name: Test launchers
         run: node tools/renium/tests/launcher-smoke.mjs
+
+      - name: Test the report store Worker
+        run: node --test tools/renium-reports/test/*.test.mjs
 
   build-and-test:
     name: Windows release build and extension
@@ -217,6 +223,7 @@ jobs:
           node tools/renium-vscode-extension/scripts/sync-assets.mjs --docs-only
           node tools/renium/tests/agent-docs-smoke.mjs tools/renium/target/fast/renium.exe
           node tools/renium/tests/launcher-smoke.mjs
+          node --test tools/renium-reports/test/*.test.mjs
           "RENIUM_CLI_BUILD=$(Join-Path $PWD 'tools/renium/target/fast/renium.exe')" >> $env:GITHUB_ENV
 
       - name: Build both Studio plugin formats

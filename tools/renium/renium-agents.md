@@ -63,4 +63,4 @@ Before Open Cloud uploads, follow `RENIUM/publishing-validation.md`. Verify API-
 - Launch, close or replace Studio only when needed; `rbx ro` reopens a closed bound place. Never take focus or global input.
 - Do not back up the project: `rbx rev` restores affected files; Studio undo covers pushes.
 - Update with `rbx upd` when asked or an update is reported, then reread the guides.
-- For internal errors, crashes or lost sync data, run `rbx report -m "what happened"` and return its ID and path.
+- On a Renium failure follow `RENIUM/bug-reports.md`: write, review every file for private data, upload, return the ID.

@@ -1,0 +1,32 @@
+name = "renium-reports"
+main = "src/index.mjs"
+compatibility_date = "2026-09-01"
+
+[[r2_buckets]]
+binding = "REPORTS"
+bucket_name = "renium-reports"
+
+[[durable_objects.bindings]]
+name = "QUOTA"
+class_name = "Quota"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Quota"]
+
+[[unsafe.bindings]]
+name = "UPLOADS"
+type = "ratelimit"
+namespace_id = "2101"
+simple = { limit = 6, period = 60 }
+
+[[unsafe.bindings]]
+name = "GLOBAL"
+type = "ratelimit"
+namespace_id = "2102"
+simple = { limit = 30, period = 60 }
+
+[vars]
+MAX_UPLOAD_BYTES = "8388608"
+DAILY_UPLOADS = "200"
+DAILY_BYTES = "1073741824"

@@ -1,0 +1,16 @@
+{
+  "name": "renium-reports",
+  "version": "0.5.0",
+  "private": true,
+  "description": "Cloudflare Worker that validates Renium bug reports and stores them in R2",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --port 8788",
+    "deploy": "wrangler deploy",
+    "test": "node --test test/*.test.mjs",
+    "fetch": "node scripts/fetch.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

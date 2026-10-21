@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -18,6 +18,21 @@ const TRANSCRIPT_FILES: usize = 3;
 const LOG_TAIL_LINES: usize = 400;
 const CRASH_LIMIT: usize = 5;
 const CRASH_BYTES: usize = 64 * 1024;
+const UPLOAD_ENDPOINT: &str = "https://renium-reports.superwheat05.workers.dev";
+const UPLOAD_RESPONSE_LIMIT: u64 = 64 * 1024;
+
+/// Report entry names paired with their bytes, in zip order.
+type ReportFiles = Vec<(String, Vec<u8>)>;
+const REPORT_FILES: &[&str] = &[
+    "report.md",
+    "report.json",
+    "doctor.json",
+    "studio.json",
+    "daemon.log",
+    "transcript.md",
+    "renium.project.jsonc",
+    "renium.project.json",
+];
 
 #[derive(Args)]
 pub(crate) struct ReportArgs {
@@ -46,6 +61,14 @@ pub(crate) struct ReportArgs {
         help = "Folder to write the report into (default: the project's .renium/reports)"
     )]
     pub(crate) output: Option<PathBuf>,
+    #[arg(
+        short,
+        long,
+        value_name = "ID",
+        conflicts_with_all = ["message", "since", "no_transcript"],
+        help = "Re-zip a written report folder after reviewing it and send it to the Renium developer's report store, which files it under the same ID"
+    )]
+    pub(crate) upload: Option<String>,
 }
 
 struct TranscriptEntry {
@@ -70,18 +93,22 @@ pub(crate) fn run(args: ReportArgs, global_project: Option<&Path>) -> Result<()>
         .map_or_else(|| current.clone(), |project| project.root.clone());
     let home = home_directory();
     let since = SystemTime::now() - Duration::from_secs(args.since.max(1) * 60);
-    let id = report_id()?;
+    let custom_output = args.output.clone();
     let output_root = args.output.unwrap_or_else(|| {
         project.as_ref().map_or_else(
             || app_data_directory().join("reports"),
             |project| project.root.join(".renium").join("reports"),
         )
     });
+    if let Some(id) = args.upload.as_deref() {
+        return upload(&output_root, id);
+    }
+    let id = report_id()?;
     let directory = output_root.join(&id);
     fs::create_dir_all(&directory)
         .with_context(|| format!("Failed to create {}", directory.display()))?;
     let mut sections: Vec<String> = Vec::new();
-    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut files: ReportFiles = Vec::new();
     let redact_text = |text: &str| redact(text, home.as_deref());
 
     let now = SystemTime::now();
@@ -96,6 +123,12 @@ pub(crate) fn run(args: ReportArgs, global_project: Option<&Path>) -> Result<()>
         "projectRoot": redact_text(&root.display().to_string()),
         "sinceMinutes": args.since,
     });
+    let message = args
+        .message
+        .as_deref()
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(|message| redact_text(&message.chars().take(2000).collect::<String>()));
 
     let (doctor, project_path) =
         match crate::project::workflows::doctor_result(&root, global_project) {
@@ -142,7 +175,7 @@ pub(crate) fn run(args: ReportArgs, global_project: Option<&Path>) -> Result<()>
     crashes.truncate(CRASH_LIMIT);
     for (path, _) in &crashes {
         if let Ok(bytes) = fs::read(path) {
-            let text = String::from_utf8_lossy(&bytes[..bytes.len().min(CRASH_BYTES)]).into_owned();
+            let text = crash_report_text(&bytes);
             let name = path
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
@@ -238,6 +271,7 @@ pub(crate) fn run(args: ReportArgs, global_project: Option<&Path>) -> Result<()>
         "report.json".into(),
         (serde_json::to_string_pretty(&json!({
             "environment": environment,
+            "message": message,
             "files": files.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>(),
             "transcripts": transcripts.iter().map(|excerpt| json!({
                 "agent": excerpt.agent,
@@ -272,6 +306,7 @@ pub(crate) fn run(args: ReportArgs, global_project: Option<&Path>) -> Result<()>
                     .collect())
         ))
     );
+    let upload_command = upload_command(&id, custom_output.as_deref());
     crate::app::output::emit_global_output(
         &json!({
             "ok": true,
@@ -279,15 +314,278 @@ pub(crate) fn run(args: ReportArgs, global_project: Option<&Path>) -> Result<()>
             "directory": directory,
             "zip": zip_path,
             "issueUrl": issue_url,
+            "uploadCommand": upload_command,
             "files": files.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>(),
         }),
         &format!(
-            "Report {id} written to {}\nZip: {}\nReview it (project file, command outputs and log lines are inside; keys and home paths are masked), then open {} and attach the zip, or post it in the Discord server: https://discord.gg/wwTFHSSNn3",
+            "Report {id} written to {}\nRead every file in the folder (keys and home paths are masked, but check for anything private and remove it: delete lines or whole files, keep .json files valid JSON), then `{upload_command}` re-zips the folder and sends it to the Renium developer. The zip beside the folder is the unreviewed original until that command runs; if the upload fails, attach the refreshed zip to {} or post it in the Discord server: https://discord.gg/wwTFHSSNn3",
             directory.display(),
-            zip_path.display(),
             issue_url
         ),
     )
+}
+
+/// The command that sends a written report, repeating a custom output folder.
+fn upload_command(id: &str, output: Option<&Path>) -> String {
+    match output {
+        Some(path) => format!("rbx report --upload {id} -o \"{}\"", path.display()),
+        None => format!("rbx report --upload {id}"),
+    }
+}
+
+/// A crash report as it goes into the bundle: valid JSON even when the file
+/// is cut at the size limit, so the report store's content check accepts it.
+fn crash_report_text(bytes: &[u8]) -> String {
+    if bytes.len() <= CRASH_BYTES && serde_json::from_slice::<Value>(bytes).is_ok() {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let head = String::from_utf8_lossy(&bytes[..bytes.len().min(CRASH_BYTES)]).into_owned();
+    serde_json::to_string_pretty(&json!({
+        "truncated": bytes.len() > CRASH_BYTES,
+        "originalBytes": bytes.len(),
+        "head": head,
+    }))
+    .unwrap_or_else(|_| "{}".to_string())
+        + "\n"
+}
+
+/// Re-zips a reviewed report folder and sends it to the report store, which
+/// validates the bundle before keeping it and answers with the ID it is filed
+/// under; files outside the report layout stay behind.
+fn upload(output_root: &Path, id: &str) -> Result<()> {
+    if !valid_report_id(id) {
+        anyhow::bail!("{id} is not a report ID; expected RNM-YYYYMMDD-XXXXXX");
+    }
+    let directory = output_root.join(id);
+    if !directory.is_dir() {
+        anyhow::bail!(
+            "No report folder at {}; run `rbx report -m \"what went wrong\"` first",
+            directory.display()
+        );
+    }
+    if fs::symlink_metadata(&directory)?.file_type().is_symlink() {
+        anyhow::bail!("{} is a link, not the report folder", directory.display());
+    }
+    let (mut files, ignored) = collect_report_files(&directory)?;
+    let report_index = files
+        .iter()
+        .position(|(name, _)| name == "report.json")
+        .with_context(|| format!("{} has no report.json", directory.display()))?;
+    let mut parsed: Value = serde_json::from_slice(&files[report_index].1).with_context(|| {
+        format!(
+            "{} holds invalid JSON",
+            directory.join("report.json").display()
+        )
+    })?;
+    let written = parsed["environment"]["id"].as_str().unwrap_or_default();
+    if written != id {
+        anyhow::bail!(
+            "{} belongs to report {written:?}, not {id}",
+            directory.join("report.json").display()
+        );
+    }
+    if sync_listed_files(&mut parsed, &files) {
+        let bytes = (serde_json::to_string_pretty(&parsed)?
+            + "
+")
+        .into_bytes();
+        atomic_write_file(&directory.join("report.json"), &bytes)?;
+        files[report_index].1 = bytes;
+    }
+    let zip_path = output_root.join(format!("{id}.zip"));
+    write_zip(&zip_path, &files)?;
+    let bytes = fs::metadata(&zip_path).map_or(0, |metadata| metadata.len());
+    let receipt = upload_report(&zip_path, id).with_context(|| {
+        format!(
+            "Upload failed; the zip at {} is still here to attach to a GitHub issue or post in the Discord server",
+            zip_path.display()
+        )
+    })?;
+    let names: Vec<&String> = files.iter().map(|(name, _)| name).collect();
+    let mut text = format!(
+        "Report {id} uploaded ({} files, {bytes} bytes); give the user this ID.",
+        names.len()
+    );
+    if !ignored.is_empty() {
+        text.push_str(&format!(
+            "\nLeft behind (not part of a report): {}",
+            ignored.join(", ")
+        ));
+    }
+    crate::app::output::emit_global_output(
+        &json!({
+            "ok": true,
+            "id": id,
+            "zip": zip_path,
+            "bytes": bytes,
+            "files": names,
+            "ignored": ignored,
+            "upload": receipt,
+        }),
+        &text,
+    )
+}
+
+/// Makes report.json's `files` list name exactly the files being sent, so a
+/// file removed during review is no longer listed; says whether it changed.
+fn sync_listed_files(report: &mut Value, files: &[(String, Vec<u8>)]) -> bool {
+    let names: Vec<Value> = files
+        .iter()
+        .filter(|(name, _)| name != "report.json")
+        .map(|(name, _)| Value::String(name.clone()))
+        .collect();
+    let listed = Value::Array(names);
+    if report.get("files") == Some(&listed) {
+        return false;
+    }
+    if let Some(object) = report.as_object_mut() {
+        object.insert("files".to_string(), listed);
+        return true;
+    }
+    false
+}
+
+fn valid_report_id(id: &str) -> bool {
+    let Some(rest) = id.strip_prefix("RNM-") else {
+        return false;
+    };
+    let Some((day, suffix)) = rest.split_once('-') else {
+        return false;
+    };
+    day.len() == 8
+        && day.bytes().all(|byte| byte.is_ascii_digit())
+        && suffix.len() == 6
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte.is_ascii_uppercase())
+}
+
+/// The report files in a folder, in a fixed order, and the names of anything
+/// else found there.
+fn collect_report_files(directory: &Path) -> Result<(ReportFiles, Vec<String>)> {
+    let mut files = Vec::new();
+    let mut ignored = Vec::new();
+    let mut entries: Vec<_> = fs::read_dir(directory)
+        .with_context(|| format!("Failed to read {}", directory.display()))?
+        .collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        let kind = fs::symlink_metadata(&path)?.file_type();
+        if kind.is_symlink() {
+            ignored.push(format!("{name} (link)"));
+            continue;
+        }
+        if kind.is_dir() {
+            if name != "crashes" {
+                ignored.push(format!("{name}/"));
+                continue;
+            }
+            let mut crashes: Vec<_> = fs::read_dir(&path)?.collect::<std::io::Result<Vec<_>>>()?;
+            crashes.sort_by_key(std::fs::DirEntry::file_name);
+            for crash in crashes {
+                let crash_name = crash.file_name().to_string_lossy().into_owned();
+                let crash_path = crash.path();
+                let crash_kind = fs::symlink_metadata(&crash_path)?.file_type();
+                if crash_kind.is_file()
+                    && crash_name.ends_with(".json")
+                    && crash_name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+                {
+                    files.push((format!("crashes/{crash_name}"), fs::read(&crash_path)?));
+                } else {
+                    ignored.push(format!("crashes/{crash_name}"));
+                }
+            }
+        } else if REPORT_FILES.contains(&name.as_str()) {
+            files.push((name, fs::read(&path)?));
+        } else {
+            ignored.push(name);
+        }
+    }
+    Ok((files, ignored))
+}
+
+fn upload_report(zip_path: &Path, id: &str) -> Result<Value> {
+    let base = std::env::var("RENIUM_REPORT_ENDPOINT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| UPLOAD_ENDPOINT.to_string());
+    let url = format!("{}/v1/reports", base.trim_end_matches('/'));
+    let bytes =
+        fs::read(zip_path).with_context(|| format!("Failed to read {}", zip_path.display()))?;
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(60))
+        .timeout_write(Duration::from_secs(120))
+        .build();
+    let request = agent
+        .post(&url)
+        .set("User-Agent", concat!("Renium/", env!("CARGO_PKG_VERSION")))
+        .set("Content-Type", "application/zip")
+        .set("X-Renium-Report-Id", id)
+        .set("X-Renium-Version", crate::app::build::VERSION);
+    let response = match request.send_bytes(&bytes) {
+        Ok(response) => response,
+        Err(ureq::Error::Status(status, response)) => {
+            let body = read_upload_body(response).unwrap_or_default();
+            let detail = serde_json::from_slice::<Value>(&body)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| String::from_utf8_lossy(&body).trim().to_string());
+            anyhow::bail!("the report store answered HTTP {status}: {detail}");
+        }
+        Err(ureq::Error::Transport(error)) => {
+            anyhow::bail!("could not reach the report store at {url}: {error}");
+        }
+    };
+    upload_receipt(&read_upload_body(response)?, id)
+}
+
+fn read_upload_body(response: ureq::Response) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    response
+        .into_reader()
+        .take(UPLOAD_RESPONSE_LIMIT + 1)
+        .read_to_end(&mut body)
+        .context("the report store's answer could not be read")?;
+    if body.len() as u64 > UPLOAD_RESPONSE_LIMIT {
+        anyhow::bail!("the report store's answer exceeds {UPLOAD_RESPONSE_LIMIT} bytes");
+    }
+    Ok(body)
+}
+
+/// The store's answer, checked to name the report that was sent.
+fn upload_receipt(body: &[u8], id: &str) -> Result<Value> {
+    let value: Value =
+        serde_json::from_slice(body).context("the report store answered without a JSON receipt")?;
+    if value.get("ok") != Some(&Value::Bool(true)) {
+        anyhow::bail!(
+            "the report store refused the upload: {}",
+            value
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("no reason given")
+        );
+    }
+    let stored = value.get("id").and_then(Value::as_str).unwrap_or_default();
+    if stored != id {
+        anyhow::bail!("the report store filed the upload as {stored:?}, not {id}");
+    }
+    Ok(json!({
+        "id": id,
+        "key": value.get("key").cloned().unwrap_or(Value::Null),
+        "bytes": value.get("bytes").cloned().unwrap_or(Value::Null),
+        "sha256": value.get("sha256").cloned().unwrap_or(Value::Null),
+        "receivedAt": value.get("receivedAt").cloned().unwrap_or(Value::Null),
+    }))
 }
 
 fn studio_status(project: Option<&Path>) -> Value {
@@ -882,6 +1180,110 @@ pub(crate) fn civil_from_days(days: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upload_receipts_must_name_the_sent_report() {
+        let receipt = upload_receipt(
+            br#"{"ok":true,"id":"RNM-20261021-AB12CD","key":"reports/2026/10/21/RNM-20261021-AB12CD.zip","bytes":4096,"sha256":"00","receivedAt":"2026-10-21T03:00:00.000Z"}"#,
+            "RNM-20261021-AB12CD",
+        )
+        .unwrap();
+        assert_eq!(receipt["key"], "reports/2026/10/21/RNM-20261021-AB12CD.zip");
+        assert_eq!(receipt["bytes"], 4096);
+        let other = upload_receipt(
+            br#"{"ok":true,"id":"RNM-20261021-ZZZZZZ"}"#,
+            "RNM-20261021-AB12CD",
+        );
+        assert!(
+            other
+                .unwrap_err()
+                .to_string()
+                .contains("not RNM-20261021-AB12CD")
+        );
+        let refused = upload_receipt(
+            br#"{"ok":false,"error":"Report zip has no report.json"}"#,
+            "RNM-20261021-AB12CD",
+        );
+        assert!(refused.unwrap_err().to_string().contains("no report.json"));
+        assert!(upload_receipt(b"<html>", "RNM-20261021-AB12CD").is_err());
+    }
+
+    #[test]
+    fn uploads_list_only_the_files_that_remain_after_review() {
+        let files = vec![
+            ("daemon.log".to_string(), b"log".to_vec()),
+            ("report.json".to_string(), b"{}".to_vec()),
+            ("report.md".to_string(), b"# Report".to_vec()),
+        ];
+        let mut report = json!({
+            "environment": {"id": "RNM-20261021-AB12CD"},
+            "files": ["daemon.log", "report.md", "transcript.md"]
+        });
+        assert!(sync_listed_files(&mut report, &files));
+        assert_eq!(report["files"], json!(["daemon.log", "report.md"]));
+        assert!(!sync_listed_files(&mut report, &files));
+    }
+
+    #[test]
+    fn crash_reports_stay_valid_json_when_cut() {
+        assert_eq!(crash_report_text(b"{\"a\":1}"), "{\"a\":1}");
+        let long = format!("{{\"trace\":\"{}\"}}", "x".repeat(CRASH_BYTES));
+        let cut: Value = serde_json::from_str(&crash_report_text(long.as_bytes())).unwrap();
+        assert_eq!(cut["truncated"], true);
+        assert_eq!(cut["originalBytes"], long.len());
+        assert_eq!(cut["head"].as_str().unwrap().len(), CRASH_BYTES);
+        let broken: Value = serde_json::from_str(&crash_report_text(b"{not json")).unwrap();
+        assert_eq!(broken["truncated"], false);
+        assert_eq!(broken["head"], "{not json");
+    }
+
+    #[test]
+    fn upload_commands_repeat_a_custom_output_folder() {
+        assert_eq!(
+            upload_command("RNM-20261021-AB12CD", None),
+            "rbx report --upload RNM-20261021-AB12CD"
+        );
+        assert_eq!(
+            upload_command("RNM-20261021-AB12CD", Some(Path::new("my reports"))),
+            "rbx report --upload RNM-20261021-AB12CD -o \"my reports\""
+        );
+    }
+
+    #[test]
+    fn report_ids_follow_the_fixed_shape() {
+        assert!(valid_report_id("RNM-20261021-AB12CD"));
+        assert!(valid_report_id(&report_id().unwrap()));
+        assert!(!valid_report_id("RNM-20261021-ab12cd"));
+        assert!(!valid_report_id("RNM-2026102-AB12CDE"));
+        assert!(!valid_report_id("reports/RNM-20261021-AB12CD"));
+    }
+
+    #[test]
+    fn report_folders_upload_only_the_report_layout() {
+        let directory = std::env::temp_dir().join(format!(
+            "renium-report-upload-{}",
+            crate::automation::authorization::random_id().unwrap()
+        ));
+        fs::create_dir_all(directory.join("crashes")).unwrap();
+        fs::create_dir_all(directory.join("notes")).unwrap();
+        fs::write(directory.join("report.json"), b"{}").unwrap();
+        fs::write(directory.join("report.md"), b"# Report").unwrap();
+        fs::write(directory.join("daemon.log.bak"), b"old").unwrap();
+        fs::write(directory.join("crashes/2026-10-21T03-00-00.json"), b"{}").unwrap();
+        fs::write(directory.join("crashes/dump.dmp"), b"x").unwrap();
+        let (files, ignored) = collect_report_files(&directory).unwrap();
+        fs::remove_dir_all(&directory).unwrap();
+        let names: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "crashes/2026-10-21T03-00-00.json",
+                "report.json",
+                "report.md"
+            ]
+        );
+        assert_eq!(ignored, ["crashes/dump.dmp", "daemon.log.bak", "notes/"]);
+    }
 
     #[test]
     fn stamps_render_utc_dates() {
