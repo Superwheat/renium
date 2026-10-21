@@ -4,6 +4,7 @@
 
 ### Improvements
 
+- The Studio lifecycle guide says to open Studio only with `rbx so` or `rbx ro`: Renium launches it behind the user's windows and blocks its self-activation, which a raw `Start-Process` or `Popen` launch cannot, so such a Studio takes the foreground after loading.
 - Recordings default to 60 FPS and accept `--fps` up to 60. `re` reports `requestedFps` and `achievedFps`, and `throttled: true` with a note when the window delivered well under the requested rate, which a minimized or fully covered window does; a capture names a window it restored from the taskbar. The capture guide says to keep the recorded window restored behind other windows and never minimized.
 
 ## 0.4.9 - 2026-10-21
