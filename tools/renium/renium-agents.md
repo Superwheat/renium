@@ -1,4 +1,4 @@
-<!-- renium-version: 0.4.9 -->
+<!-- renium-version: 0.5.0 -->
 # Renium for agents
 
 Use `rbx` from the place's project folder.
