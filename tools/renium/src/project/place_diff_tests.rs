@@ -1,6 +1,9 @@
 use super::*;
 use clap::Parser;
-use rbx_dom_weak::{InstanceBuilder, types::Attributes};
+use rbx_dom_weak::{
+    InstanceBuilder,
+    types::{Attributes, CFrame, Matrix3, Vector3},
+};
 
 #[test]
 fn changed_field_scan_preserves_names_values_and_presence() {
@@ -750,4 +753,98 @@ fn project_diff_omits_unsaved_instances_and_fields_the_project_never_captures() 
         result["notCapturedProjectProperties"]["IsLegacyChatDisabled"],
         1
     );
+}
+
+#[test]
+fn full_diff_pairs_same_named_siblings_by_content_when_their_values_swap() {
+    let build = |swap: bool| {
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let workspace = dom.insert(dom.root_ref(), InstanceBuilder::new("Workspace"));
+        let boards = dom.insert(
+            workspace,
+            InstanceBuilder::new("Folder").with_name("Boards"),
+        );
+        let slots = [(1.0f32, 2.0f32), (3.0, 4.0), (5.0, 6.0), (7.0, 8.0)];
+        for index in 0..slots.len() {
+            let (position, size) = if swap {
+                slots[(index + 1) % slots.len()]
+            } else {
+                slots[index]
+            };
+            let position = if swap { position + 0.000_001 } else { position };
+            let car = dom.insert(boards, InstanceBuilder::new("Model").with_name("Koenra GX"));
+            dom.insert(
+                car,
+                InstanceBuilder::new("Part")
+                    .with_property("Size", Variant::Vector3(Vector3::new(size, size, size)))
+                    .with_property(
+                        "CFrame",
+                        Variant::CFrame(CFrame::new(
+                            Vector3::new(position, 0.0, 0.0),
+                            Matrix3::identity(),
+                        )),
+                    ),
+            );
+        }
+        dom
+    };
+    let result = diff(&build(false), &build(true), &[]);
+    assert_eq!(result["matches"], true, "{result}");
+    assert_eq!(result["reorderedSiblings"], 4, "{result}");
+
+    let mut changed = build(true);
+    let part = changed
+        .descendants()
+        .find(|instance| instance.class == "Part")
+        .map(|instance| instance.referent())
+        .unwrap();
+    changed
+        .get_by_ref_mut(part)
+        .unwrap()
+        .properties
+        .insert("Transparency".into(), Variant::Float32(0.5));
+    let result = diff(&build(false), &changed, &[]);
+    assert_eq!(result["matches"], false, "{result}");
+}
+
+#[test]
+fn full_diff_pairs_swapped_models_that_reference_their_own_parts() {
+    let build = |swap: bool| {
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let workspace = dom.insert(dom.root_ref(), InstanceBuilder::new("Workspace"));
+        let slots = [(1.0f32, 2.0f32), (3.0, 4.0), (5.0, 6.0)];
+        for index in 0..slots.len() {
+            let (position, size) = if swap {
+                slots[(index + 1) % slots.len()]
+            } else {
+                slots[index]
+            };
+            let position = if swap { position + 0.000_001 } else { position };
+            let car = dom.insert(
+                workspace,
+                InstanceBuilder::new("Model").with_name("Koenra GX"),
+            );
+            let part = dom.insert(
+                car,
+                InstanceBuilder::new("Part")
+                    .with_property("Size", Variant::Vector3(Vector3::new(size, size, size)))
+                    .with_property(
+                        "CFrame",
+                        Variant::CFrame(CFrame::new(
+                            Vector3::new(position, 0.0, 0.0),
+                            Matrix3::identity(),
+                        )),
+                    ),
+            );
+            dom.get_by_ref_mut(car)
+                .unwrap()
+                .properties
+                .insert("PrimaryPart".into(), Variant::Ref(part));
+        }
+        dom
+    };
+    let result = diff(&build(false), &build(true), &[]);
+    assert_eq!(result["matches"], true, "{result}");
+    assert_eq!(result["reorderedSiblings"], 3, "{result}");
+    assert_eq!(result["removed"], 0, "{result}");
 }

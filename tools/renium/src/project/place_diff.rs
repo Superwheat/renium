@@ -21,6 +21,7 @@ use crate::rbx::{
     decode::{native_property_filter, rbx_variant_to_settings_json},
     model::BytecodeModelImportRefs,
 };
+use crate::settings::tree::settings_children_by_parent;
 use crate::settings::{
     bytecode::{SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance},
     equivalence::{
@@ -28,6 +29,7 @@ use crate::settings::{
         stabilize_settings_reference_ids,
     },
 };
+use crate::snapshot::refs::remap_record_reference_ids;
 
 const UNIFIED_LIGHTING_MARKER: &str = "RBX_LightingTechnologyUnifiedMigration";
 const ENGINE_INTERNAL_SERVICES: [&str; 2] = ["ConfigureServerService", "FilteredSelection"];
@@ -516,6 +518,193 @@ fn location(document: &SettingsBytecode, index: usize) -> Value {
     json!({"path":path, "className":document.instances[index].class_name, "index":index + 1})
 }
 
+/// Same-named siblings whose contents swapped places (a Boards folder of
+/// `Part`s, two car models with one name) pair by position once their shapes
+/// agree, so each twin reads as changed. When every twin has an unchanged
+/// counterpart elsewhere in its group, pair them that way and count the
+/// reorder instead. Float noise is tolerated as in the field comparison.
+fn pair_duplicate_siblings_by_content(
+    before: &SettingsBytecode,
+    after: &mut SettingsBytecode,
+) -> usize {
+    let before_children = settings_children_by_parent(before);
+    let after_children = settings_children_by_parent(after);
+    let before_by_id = before
+        .instances
+        .iter()
+        .enumerate()
+        .map(|(index, instance)| (instance.settings_id.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let mut remap: Vec<Option<usize>> = vec![None; after.instances.len()];
+    let mut reordered = 0;
+    for (parent, children) in after_children.iter().enumerate() {
+        // A re-paired ancestor already carries its descendants with it.
+        if remap[parent].is_some() {
+            continue;
+        }
+        let mut groups: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
+        for &child in children {
+            let instance = &after.instances[child];
+            groups
+                .entry((instance.name.as_str(), instance.class_name.as_str()))
+                .or_default()
+                .push(child);
+        }
+        for members in groups
+            .into_values()
+            .filter(|members| members.len() > 1 && members.len() <= REPAIR_GROUP_LIMIT)
+        {
+            let paired = members
+                .iter()
+                .map(|&member| {
+                    before_by_id
+                        .get(after.instances[member].settings_id.as_str())
+                        .copied()
+                })
+                .collect::<Option<Vec<_>>>();
+            let Some(paired) = paired else {
+                continue;
+            };
+            let matches = |member: usize, candidate: usize| {
+                subtree_matches(
+                    (before, &before_children, candidate),
+                    (after, &after_children, member),
+                )
+            };
+            if members
+                .iter()
+                .zip(&paired)
+                .all(|(&member, &candidate)| matches(member, candidate))
+            {
+                continue;
+            }
+            let mut available = paired.clone();
+            let mut assignment = Vec::with_capacity(members.len());
+            for (&member, &current) in members.iter().zip(&paired) {
+                let position = available
+                    .iter()
+                    .position(|&candidate| candidate == current && matches(member, candidate))
+                    .or_else(|| {
+                        available
+                            .iter()
+                            .position(|&candidate| matches(member, candidate))
+                    });
+                let Some(position) = position else {
+                    break;
+                };
+                assignment.push(available.swap_remove(position));
+            }
+            if assignment.len() != members.len() {
+                continue;
+            }
+            for ((&member, &current), &target) in members.iter().zip(&paired).zip(&assignment) {
+                if current == target {
+                    continue;
+                }
+                reordered += 1;
+                let mut stack = vec![(member, target)];
+                while let Some((after_index, before_index)) = stack.pop() {
+                    remap[after_index] = Some(before_index);
+                    stack.extend(
+                        after_children[after_index]
+                            .iter()
+                            .copied()
+                            .zip(before_children[before_index].iter().copied()),
+                    );
+                }
+            }
+        }
+    }
+    if reordered == 0 {
+        return 0;
+    }
+    let id_map = remap
+        .iter()
+        .enumerate()
+        .filter_map(|(after_index, target)| {
+            target.map(|before_index| {
+                (
+                    after.instances[after_index].settings_id.clone(),
+                    before.instances[before_index].settings_id.clone(),
+                )
+            })
+        })
+        .collect::<HashMap<_, _>>();
+    for (after_index, target) in remap.iter().enumerate() {
+        if let Some(before_index) = target {
+            after.instances[after_index]
+                .settings_id
+                .clone_from(&before.instances[*before_index].settings_id);
+        }
+    }
+    for instance in &mut after.instances {
+        remap_record_reference_ids(&mut instance.properties, &id_map);
+        remap_record_reference_ids(&mut instance.attributes, &id_map);
+    }
+    reordered
+}
+
+/// Twin groups larger than this keep their positional pairing; the
+/// candidate search is quadratic in the group size.
+const REPAIR_GROUP_LIMIT: usize = 512;
+
+/// Two subtrees with the same shape and no changed fields at any node.
+/// References are compared by presence only: an internal reference keeps
+/// its old identity until the subtree remap below, and an external one is
+/// reported by the ordinary comparison afterwards.
+fn subtree_matches(
+    (before, before_children, before_root): (&SettingsBytecode, &[Vec<usize>], usize),
+    (after, after_children, after_root): (&SettingsBytecode, &[Vec<usize>], usize),
+) -> bool {
+    let mut stack = vec![(before_root, after_root)];
+    while let Some((before_index, after_index)) = stack.pop() {
+        let old = &before.instances[before_index];
+        let new = &after.instances[after_index];
+        if old.name != new.name
+            || old.class_name != new.class_name
+            || before_children[before_index].len() != after_children[after_index].len()
+            || !changed_fields(
+                &without_references(&old.properties),
+                &without_references(&new.properties),
+                false,
+            )
+            .is_empty()
+            || !changed_fields(
+                &without_references(&old.attributes),
+                &without_references(&new.attributes),
+                false,
+            )
+            .is_empty()
+        {
+            return false;
+        }
+        stack.extend(
+            before_children[before_index]
+                .iter()
+                .copied()
+                .zip(after_children[after_index].iter().copied()),
+        );
+    }
+    true
+}
+
+fn without_references(fields: &Map<String, Value>) -> Map<String, Value> {
+    fields
+        .iter()
+        .map(|(name, value)| {
+            let is_reference = value.get("_type").and_then(Value::as_str) == Some("Ref");
+            (
+                name.clone(),
+                if is_reference {
+                    json!({"_type":"Ref"})
+                } else {
+                    value.clone()
+                },
+            )
+        })
+        .collect()
+}
+
 fn changed_fields(
     before: &Map<String, Value>,
     after: &Map<String, Value>,
@@ -618,6 +807,7 @@ pub(super) fn compare(
             "Cannot match duplicate instance identities safely; inspect the ambiguous subtrees with `rbx v FILE --json`"
         );
     }
+    let reordered_siblings = pair_duplicate_siblings_by_content(&before, &mut after);
     log_global(
         4,
         format_args!(
@@ -773,6 +963,9 @@ pub(super) fn compare(
     crate::app::output::drop_false(&mut result, &["truncated"]);
     if !engine_managed.is_empty() {
         result["engineManagedProperties"] = json!(engine_managed);
+    }
+    if reordered_siblings > 0 {
+        result["reorderedSiblings"] = json!(reordered_siblings);
     }
     if !one_sided.is_empty() {
         result["oneSidedProperties"] = json!(one_sided);
