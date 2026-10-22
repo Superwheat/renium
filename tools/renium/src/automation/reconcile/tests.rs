@@ -2495,6 +2495,142 @@ fn staged_source_root_accepts_cli_relative_and_bound_absolute_paths() {
 }
 
 #[test]
+fn a_configuration_change_keeps_the_baseline_and_forces_a_full_capture() {
+    let root = crate::tests::support::temp_dir("configuration-change-baseline");
+    let snapshot = file_snapshot(&[("src/A.luau", b"return 1")]);
+    let mut record = PairRecord {
+        version: RECORD_VERSION,
+        identity: PairIdentity {
+            experience: canonical_string(&root).unwrap(),
+            project: canonical_string(&root).unwrap(),
+            fingerprint: "before-the-link".into(),
+            game_id: Some(10),
+            place_id: Some(20),
+            local_file: None,
+        },
+        mode: PairMode::Reconcile,
+        conflict_preference: ConflictPreference::None,
+        runtime_settings: Map::new(),
+        baseline: Some(StoredSnapshot::write(&root, "pair", &snapshot).unwrap()),
+        head: None,
+        conflicts: vec!["stale".into()],
+        resolution_required: true,
+        last_runtime_id: None,
+        local_file_stamp: None,
+        local_file_digest: None,
+        studio_checkpoint: Some(StudioCheckpoint {
+            runtime_id: "runtime".into(),
+            change_tracker_version: 4,
+            seq: 7,
+            service_generations: BTreeMap::new(),
+        }),
+    };
+    note_configuration_change(&mut record);
+    assert!(record.baseline.as_ref().unwrap().matches(&snapshot));
+    assert!(record.studio_checkpoint.is_none());
+    assert!(record.conflicts.is_empty());
+    assert!(!record.resolution_required);
+    fs::remove_dir_all(root).unwrap();
+}
+
+fn workspace_store_snapshot(document: SettingsBytecode) -> ProjectSnapshot {
+    file_snapshot(&[(
+        "instances/Workspace.renium",
+        &encode_settings_bytecode(&document).unwrap(),
+    )])
+}
+
+#[test]
+fn a_store_new_to_the_baseline_still_gets_first_pairing_review() {
+    let baseline = file_snapshot(&[("src/Other/Existing.luau", b"return 1")]);
+    let mut editor_doc = twin_document();
+    twin_add(&mut editor_doc, 0, "Thing", "Folder", json!({}));
+    editor_doc.instances[1]
+        .attributes
+        .insert("Author".into(), json!("files"));
+    let mut studio_doc = editor_doc.clone();
+    studio_doc.instances[1].attributes.clear();
+    let editor = workspace_store_snapshot(editor_doc);
+    let studio = workspace_store_snapshot(studio_doc);
+    let (_, fresh_conflicts) =
+        merge_snapshots(None, &editor, &studio, ConflictPreference::None).unwrap();
+    assert!(
+        !fresh_conflicts.is_empty(),
+        "control must require first-pairing review"
+    );
+    let (merged, retained_conflicts) =
+        merge_snapshots(Some(&baseline), &editor, &studio, ConflictPreference::None).unwrap();
+    let merged_doc = settings_document(merged.entries.values().next()).unwrap();
+    assert!(
+        !retained_conflicts.is_empty(),
+        "retained baseline accepted conflicting new scope without review: fresh={fresh_conflicts:?}, merged attributes={:?}",
+        merged_doc.instances[1].attributes
+    );
+}
+
+#[test]
+fn a_store_new_to_the_baseline_reports_class_mismatches() {
+    let baseline = file_snapshot(&[("src/Other/Existing.luau", b"return 1")]);
+    let mut editor_doc = twin_document();
+    twin_add(&mut editor_doc, 0, "Thing", "Folder", json!({}));
+    let mut studio_doc = twin_document();
+    twin_add(&mut studio_doc, 0, "Thing", "Part", json!({}));
+    studio_doc.instances[1].settings_id = "observed-thing".into();
+    let editor = workspace_store_snapshot(editor_doc);
+    let studio = workspace_store_snapshot(studio_doc);
+    let (_, fresh_conflicts) =
+        merge_snapshots(None, &editor, &studio, ConflictPreference::None).unwrap();
+    assert!(
+        !fresh_conflicts.is_empty(),
+        "control must require first-pairing review"
+    );
+    let (merged, retained_conflicts) =
+        merge_snapshots(Some(&baseline), &editor, &studio, ConflictPreference::None).unwrap();
+    let merged_doc = settings_document(merged.entries.values().next()).unwrap();
+    assert!(
+        !retained_conflicts.is_empty(),
+        "retained baseline silently merged class mismatch: fresh={fresh_conflicts:?}, classes={:?}",
+        merged_doc
+            .instances
+            .iter()
+            .map(|i| &i.class_name)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_scope_removed_from_publication_is_not_republished() {
+    let baseline = file_snapshot(&[
+        ("old/Workspace/Removed.luau", b"return 1"),
+        ("new/Workspace/Kept.luau", b"return 2"),
+    ]);
+    let editor = file_snapshot(&[("new/Workspace/Kept.luau", b"return 3")]);
+    let studio = file_snapshot(&[("new/Workspace/Kept.luau", b"return 2")]);
+    let differences = snapshot_differences(&editor, &studio).unwrap();
+    let (merged, conflicts, changes) = merge_snapshots_with_changes(
+        Some(&baseline),
+        &editor,
+        &studio,
+        ConflictPreference::None,
+        Some(&differences),
+    )
+    .unwrap();
+    assert!(conflicts.is_empty());
+    let old = PathBuf::from("old/Workspace/Removed.luau");
+    assert!(!merged.entries.contains_key(&old));
+    assert!(!changes.editor.contains(&old));
+    assert!(!changes.studio.contains(&old));
+    let root = crate::tests::support::temp_dir("removed-scopes");
+    let stored = StoredSnapshot::write(&root, "pair", &baseline).unwrap();
+    let selected = stored
+        .load_scopes(&root, "pair", &[PathBuf::from("new")])
+        .unwrap();
+    assert!(!selected.entries.contains_key(&old));
+    assert_eq!(selected.entries.len(), 1);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn target_ownership_ends_with_the_live_pair() {
     let coordinator = Coordinator::default();
     let first = PairIdentity {

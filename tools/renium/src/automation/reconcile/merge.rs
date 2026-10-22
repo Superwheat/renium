@@ -51,13 +51,7 @@ pub(crate) fn merge_snapshots_with_changes(
             .and_then(|name| name.to_str())
             .is_some_and(is_service_settings_file_name)
         {
-            merge_settings_entry(
-                &path,
-                &sides,
-                preference,
-                baseline.is_none(),
-                &mut conflicts,
-            )?
+            merge_settings_entry(&path, &sides, preference, base.is_none(), &mut conflicts)?
         } else {
             merge_entry(
                 &path,

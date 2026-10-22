@@ -168,10 +168,7 @@ impl Coordinator {
             || !record.conflicts.is_empty()
             || runtime_replaced;
         if configuration_changed {
-            record.baseline = None;
-            record.studio_checkpoint = None;
-            record.conflicts.clear();
-            record.resolution_required = false;
+            note_configuration_change(&mut record);
         }
         let mode = continued_pair_mode(
             mode,
@@ -1184,6 +1181,17 @@ fn continue_clean_verify(setup: &mut PairSetup, record: &mut PairRecord) {
         setup.error = None;
     }
     record.mode = setup.mode;
+}
+
+/// A changed project or experience manifest (a shared link applied, a place
+/// alias added) forces a full comparison but keeps the baseline: the files
+/// the configuration change wrote are one-sided edits against it, whereas a
+/// comparison without a baseline reports every such value as a conflict
+/// between both sides. The Studio checkpoint goes so no service is skipped.
+pub(crate) fn note_configuration_change(record: &mut PairRecord) {
+    record.studio_checkpoint = None;
+    record.conflicts.clear();
+    record.resolution_required = false;
 }
 
 /// A verify request on a pair whose record already continues in reconcile,

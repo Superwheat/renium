@@ -4,6 +4,7 @@
 
 ### Bug fixes
 
+- Live Sync keeps its baseline when the project or experience configuration changes (a shared link applied with `lkp --share` or `lk --experience`, a place alias added). The next comparison is still a full one, but the files that change wrote are edits against the baseline instead of conflicts between both sides, so a consumer no longer holds on every transform of a freshly applied copy.
 - Live Sync's first comparison no longer holds on Workspace's `InsertPoint`, transient editor state that Studio moves with the camera and never saves.
 - Offline commands (`ck`, `report`, plugin calls) no longer try to resume Studio audio, and a failed resume is logged at debug level instead of being printed into a command's output; a sandboxed `rbx ck` had printed "Global Studio audio could not resume: Access is denied".
 - Live Sync pairs reordered same-named siblings and their joints without losing additions or changing known instance identities, including unequal groups of reference-bearing twins that previously conflicted or stopped reconciliation. Renames, moves and references to changed twins remain conflicts; unchanged nested references and Studio package metadata updates no longer cause false conflicts, and repeated references stay fast in large places.
