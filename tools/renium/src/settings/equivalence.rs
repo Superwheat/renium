@@ -2865,6 +2865,9 @@ pub(crate) fn reconciliation_property_is_engine_state(
         // Workspace.InsertPoint is transient editor insertion state: reflection
         // marks it DoesNotSerialize and pushes already leave it alone.
         || class_name == "Workspace" && name == "InsertPoint"
+        // The deprecated numeric id is the engine's per-place index of the
+        // CollisionGroup name; a copy placed in another place gets another id.
+        || name == "CollisionGroupId"
         || database.is_some_and(|database| {
             reconciliation_property_is_engine_mirror(database, class_name, name)
         })
@@ -5627,6 +5630,18 @@ mod verify_noise_tests {
         studio.insert("State".into(), json!(3));
         assert!(reconciliation_maps_equal("WeldConstraint", &files, &studio));
         assert!(!reconciliation_maps_equal("Smoke", &files, &studio));
+    }
+
+    #[test]
+    fn collision_group_id_is_engine_state_but_the_group_name_is_not() {
+        let mut files = Map::new();
+        files.insert("CollisionGroupId".into(), json!(-1));
+        let mut studio = Map::new();
+        studio.insert("CollisionGroupId".into(), json!(3));
+        assert!(reconciliation_maps_equal("Part", &files, &studio));
+        files.insert("CollisionGroup".into(), json!("Cars"));
+        studio.insert("CollisionGroup".into(), json!("Default"));
+        assert!(!reconciliation_maps_equal("Part", &files, &studio));
     }
 
     #[test]

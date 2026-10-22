@@ -933,6 +933,83 @@ fn link_apply_writable_package_target_preserves_local_edits() {
 }
 
 #[test]
+fn externally_referenced_removal_names_the_link_instance_and_referrers() {
+    let mut mirror = settings_document(vec![
+        SettingsBytecodeInstance {
+            settings_id: "root".into(),
+            name: "Workspace".into(),
+            class_name: "Workspace".into(),
+            parent_index: None,
+            properties: Map::new(),
+            attributes: Map::new(),
+        },
+        SettingsBytecodeInstance {
+            settings_id: "garage".into(),
+            name: "Garage".into(),
+            class_name: "Model".into(),
+            parent_index: Some(0),
+            properties: Map::new(),
+            attributes: Map::new(),
+        },
+        SettingsBytecodeInstance {
+            settings_id: "debug:1_54224".into(),
+            name: "Stand".into(),
+            class_name: "Part".into(),
+            parent_index: Some(1),
+            properties: Map::new(),
+            attributes: Map::new(),
+        },
+    ]);
+    let referrer = settings_document(vec![
+        SettingsBytecodeInstance {
+            settings_id: "ss".into(),
+            name: "ServerStorage".into(),
+            class_name: "ServerStorage".into(),
+            parent_index: None,
+            properties: Map::new(),
+            attributes: Map::new(),
+        },
+        SettingsBytecodeInstance {
+            settings_id: "pointer".into(),
+            name: "StandPointer".into(),
+            class_name: "ObjectValue".into(),
+            parent_index: Some(0),
+            properties: Map::from_iter([(
+                "Value".into(),
+                json!({"_type":"Ref","settingsId":"debug:1_54224"}),
+            )]),
+            attributes: Map::new(),
+        },
+    ]);
+    let workspace_store = PathBuf::from("instances/Workspace.renium");
+    let documents = HashMap::from([
+        (workspace_store.clone(), mirror.clone()),
+        (PathBuf::from("instances/ServerStorage.renium"), referrer),
+    ]);
+    let external = referenced_settings_ids_outside(&documents, &workspace_store);
+    let error =
+        prepare_package_replacement(&mut mirror, &[1, 2], &HashMap::new(), &external, "Package")
+            .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Package replacement would remove Workspace.Garage.Stand (debug:1_54224), which another store still references"
+    );
+    let described =
+        describe_external_reference_refusal(error, &documents, &workspace_store, "garage");
+    assert_eq!(
+        described.to_string(),
+        "Link garage: applying the package would remove Workspace.Garage.Stand (debug:1_54224), which is still referenced by ServerStorage.renium: ServerStorage.StandPointer. Move those references off the linked copy, or unlink it, then pull again"
+    );
+    let unrelated = describe_external_reference_refusal(
+        anyhow::anyhow!("something else"),
+        &documents,
+        &workspace_store,
+        "garage",
+    );
+    assert_eq!(unrelated.to_string(), "something else");
+}
+
+#[test]
 fn linked_model_keeps_renamed_root_and_world_transform() {
     let dir = temp_dir("linked-model-placement");
     let src_root = dir.join("src");

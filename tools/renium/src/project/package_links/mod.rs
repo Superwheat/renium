@@ -1641,14 +1641,16 @@ fn prepare_package_replacement(
         .values()
         .map(String::as_str)
         .collect::<HashSet<_>>();
-    if let Some(removed_id) = subtree
-        .iter()
-        .map(|index| document.instances[*index].settings_id.as_str())
-        .find(|settings_id| {
-            !preserved_ids.contains(*settings_id) && external_references.contains(*settings_id)
-        })
-    {
-        bail!("{label} replacement would remove externally referenced instance {removed_id}");
+    if let Some(removed) = subtree.iter().copied().find(|index| {
+        let settings_id = document.instances[*index].settings_id.as_str();
+        !preserved_ids.contains(settings_id) && external_references.contains(settings_id)
+    }) {
+        return Err(ExternallyReferencedRemoval {
+            label: label.to_string(),
+            path: settings_instance_path(document, removed),
+            id: document.instances[removed].settings_id.clone(),
+        }
+        .into());
     }
     prepare_external_package_references(
         document,
@@ -1656,6 +1658,134 @@ fn prepare_package_replacement(
         preserved,
         label,
     )
+}
+
+/// A package or Wally replacement that would drop an instance another store
+/// still references; the apply names the link, the instance and the referrers.
+#[derive(Debug)]
+pub(crate) struct ExternallyReferencedRemoval {
+    pub(crate) label: String,
+    pub(crate) path: String,
+    pub(crate) id: String,
+}
+
+impl std::fmt::Display for ExternallyReferencedRemoval {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} replacement would remove {} ({}), which another store still references",
+            self.label, self.path, self.id
+        )
+    }
+}
+
+impl std::error::Error for ExternallyReferencedRemoval {}
+
+/// The dotted path of an instance inside its service store.
+pub(crate) fn settings_instance_path(document: &SettingsBytecode, index: usize) -> String {
+    let mut names = Vec::new();
+    let mut next = Some(index);
+    while let Some(current) = next {
+        let instance = &document.instances[current];
+        names.push(instance.name.as_str());
+        next = instance.parent_index;
+    }
+    names.reverse();
+    names.join(".")
+}
+
+/// Instances in the other stores that reference `id`, as `store: path`.
+pub(crate) fn external_reference_sources(
+    documents: &HashMap<PathBuf, SettingsBytecode>,
+    excluded: &Path,
+    id: &str,
+) -> Vec<String> {
+    let excluded = exact_path_key(excluded);
+    let mut sources = Vec::new();
+    for (path, document) in documents {
+        if exact_path_key(path) == excluded {
+            continue;
+        }
+        for (index, instance) in document.instances.iter().enumerate() {
+            let mut ids = HashSet::new();
+            for value in instance
+                .properties
+                .values()
+                .chain(instance.attributes.values())
+            {
+                collect_reference_ids(value, &mut ids);
+            }
+            if ids.contains(id) {
+                sources.push(format!(
+                    "{}: {}",
+                    path.file_name().map_or_else(
+                        || path.display().to_string(),
+                        |name| name.to_string_lossy().into_owned()
+                    ),
+                    settings_instance_path(document, index)
+                ));
+            }
+        }
+    }
+    sources.sort();
+    sources
+}
+
+/// Adds the link target and the referring instances to a refusal raised by
+/// `prepare_package_replacement`; other errors pass through unchanged.
+pub(crate) fn describe_external_reference_refusal(
+    error: anyhow::Error,
+    documents: &HashMap<PathBuf, SettingsBytecode>,
+    settings_file: &Path,
+    link_target: &str,
+) -> anyhow::Error {
+    let Some(removal) = error.downcast_ref::<ExternallyReferencedRemoval>() else {
+        return error;
+    };
+    let referrers = external_reference_sources(documents, settings_file, &removal.id);
+    let listed = if referrers.is_empty() {
+        "a store that is not loaded".to_string()
+    } else {
+        referrers.join(", ")
+    };
+    anyhow::anyhow!(
+        "Link {link_target}: applying the package would remove {} ({}), which is still referenced by {listed}. Move those references off the linked copy, or unlink it, then pull again",
+        removal.path,
+        removal.id
+    )
+}
+
+fn collect_reference_ids(value: &Value, output: &mut HashSet<String>) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_reference_ids(value, output);
+            }
+        }
+        Value::Object(object) => {
+            if object.get("_type").and_then(Value::as_str) == Some("Ref") {
+                for selector in ["settingsId", "instanceId"] {
+                    if let Some(value) = object.get(selector).and_then(Value::as_str) {
+                        output.insert(value.to_string());
+                    }
+                }
+                return;
+            }
+            if let Some(Value::Object(reference)) = object.get("Ref") {
+                for selector in ["settingsId", "instanceId"] {
+                    if let Some(value) = reference.get(selector).and_then(Value::as_str) {
+                        output.insert(value.to_string());
+                    }
+                }
+            }
+            for (key, value) in object {
+                if key != "Ref" {
+                    collect_reference_ids(value, output);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn referenced_settings_ids(document: &SettingsBytecode) -> HashSet<String> {

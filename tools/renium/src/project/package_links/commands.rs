@@ -43,9 +43,9 @@ use super::{
     GLOBAL_LINK_PREFIX, LinkEntry, LinkLockEntry, LinkManifest, LinkResolveOptions, LinkSource,
     LinkSourceMeta, LinkTargetRef, LinkTargetStorage, PackageMaterialization, RENIUM_DIR_GITIGNORE,
     RENIUM_STORE_EXTENSION, ResolvedLinkTarget, collect_project_settings_files,
-    ensure_settings_document, inline_target_sources, is_global_link_path, is_package_path,
-    link_lock_path, link_manifest_path, link_mirror_lock_key, link_slug,
-    link_target_document_selector, link_target_document_selector_parts,
+    describe_external_reference_refusal, ensure_settings_document, inline_target_sources,
+    is_global_link_path, is_package_path, link_lock_path, link_manifest_path, link_mirror_lock_key,
+    link_slug, link_target_document_selector, link_target_document_selector_parts,
     link_target_from_settings_id, link_target_key, link_target_ordinals, link_target_ref_key,
     link_target_segments, load_settings_documents, mark_manifest_target_broken,
     materialize_package_target, package_document_fingerprint, package_lock_key,
@@ -1060,7 +1060,7 @@ pub(super) fn apply_project_links_inner(
             let document = documents
                 .get_mut(settings_file)
                 .context("Package link target settings were not loaded")?;
-            PackageLinkApply {
+            let applied = PackageLinkApply {
                 args,
                 restoring,
                 project_root: &project_root,
@@ -1075,7 +1075,15 @@ pub(super) fn apply_project_links_inner(
                 manifest: &mut manifest,
                 changes: &mut changes,
             }
-            .apply()?;
+            .apply();
+            if let Err(error) = applied {
+                return Err(describe_external_reference_refusal(
+                    error,
+                    &documents,
+                    settings_file,
+                    &target.link_id,
+                ));
+            }
             continue;
         }
 
