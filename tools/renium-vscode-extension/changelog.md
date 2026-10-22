@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Bug fixes
+
+- Store IDs as `rbx find`, `bb` and `v` print them (plain hex such as `a8d7`) now work as parent selectors in `mip`, `ba`, `cr` and every other command that takes an ID or a path, including stores written by `pi`; before, only IDs containing a colon were tried as IDs and the rest were read as paths, which failed with "No matching instance path".
+
 ## 0.5.0 - 2026-10-21
 
 ### New

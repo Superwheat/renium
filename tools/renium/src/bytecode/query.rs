@@ -67,17 +67,23 @@ pub(crate) fn resolve_document_target(document: &SettingsBytecode, raw: &str) ->
 }
 
 /// A settings ID (`editor:5b78`) or any target form `resolve_document_target` takes.
+/// Resolves a store ID exactly as other commands print it, falling back to a
+/// name or dotted path; IDs are plain hex in stores written by `pi`, so the
+/// shape of the text cannot decide which it is.
 pub(crate) fn resolve_document_id_or_target(
     document: &SettingsBytecode,
     raw: &str,
 ) -> Result<usize> {
     let raw = raw.trim();
+    if let Some(index) = document
+        .instances
+        .iter()
+        .position(|instance| instance.settings_id == raw)
+    {
+        return Ok(index);
+    }
     if raw.contains(':') {
-        return document
-            .instances
-            .iter()
-            .position(|instance| instance.settings_id == raw)
-            .with_context(|| format!("No instance with id {raw}"));
+        bail!("No instance with id {raw}");
     }
     resolve_document_target(document, raw)
 }
@@ -173,29 +179,26 @@ pub(crate) fn bytecode_parent_index(
     name: Option<&str>,
     class_name: Option<&str>,
 ) -> Result<Option<usize>> {
-    let parent_target = settings_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty() && !value.contains(':'));
-    let resolved_parent = parent_target
-        .map(|raw| resolve_document_target(document, raw))
-        .transpose()?;
-    let (index, settings_id) = if resolved_parent.is_some() {
-        if index.is_some() {
-            bail!("Provide only one parent selector");
-        }
-        (resolved_parent, None)
-    } else {
-        (index, settings_id)
-    };
+    let parent_target = settings_id.map(str::trim).filter(|value| !value.is_empty());
     if no_parent {
-        let specified = bytecode_selector_specified(index, settings_id, name, class_name);
-        if specified {
+        if bytecode_selector_specified(index, parent_target, name, class_name) {
             bail!("--no-parent cannot be combined with a parent selector");
         }
         if document.instances.is_empty() {
             return Ok(None);
         }
     }
+    if parent_target.is_some() && index.is_some() {
+        bail!("Provide only one parent selector");
+    }
+    let resolved_parent = parent_target
+        .map(|raw| resolve_document_id_or_target(document, raw))
+        .transpose()?;
+    let (index, settings_id) = if resolved_parent.is_some() {
+        (resolved_parent, None)
+    } else {
+        (index, settings_id)
+    };
 
     let specified = bytecode_selector_specified(index, settings_id, name, class_name);
     if specified {
@@ -257,6 +260,93 @@ pub(crate) fn parse_property_assignments(raw: &[String]) -> Result<Map<String, V
 #[cfg(test)]
 mod selector_tests {
     use super::*;
+
+    fn store(ids: &[(&str, &str, Option<usize>)]) -> SettingsBytecode {
+        let mut document = SettingsBytecode {
+            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
+            instances: Vec::new(),
+        };
+        for (id, name, parent) in ids {
+            document
+                .instances
+                .push(crate::settings::bytecode::SettingsBytecodeInstance::new(
+                    (*id).into(),
+                    (*name).into(),
+                    "Folder".into(),
+                    *parent,
+                ));
+        }
+        document
+    }
+
+    #[test]
+    fn parent_ids_win_over_names_after_path_resolution() {
+        let document = store(&[
+            ("1", "ServerStorage", None),
+            ("2", "Public", Some(0)),
+            ("3", "Cars", Some(1)),
+            ("4", "3", Some(1)),
+        ]);
+        assert_eq!(resolve_document_id_or_target(&document, "3").unwrap(), 2);
+        assert_eq!(resolve_document_target(&document, "3").unwrap(), 3);
+        assert_eq!(
+            resolve_document_id_or_target(&document, "Public.3").unwrap(),
+            3
+        );
+        let parent = resolve_document_id_or_target(&document, "Public.Cars").unwrap();
+        let id = document.instances[parent].settings_id.clone();
+        assert_eq!(
+            bytecode_parent_index(&document, false, None, Some(&id), None, None).unwrap(),
+            Some(parent)
+        );
+        let conflict = bytecode_parent_index(
+            &document,
+            false,
+            Some(0),
+            Some("editor:missing"),
+            None,
+            None,
+        );
+        assert!(
+            conflict
+                .unwrap_err()
+                .to_string()
+                .contains("only one parent selector")
+        );
+        let no_parent =
+            bytecode_parent_index(&document, true, None, Some("editor:missing"), None, None);
+        assert!(no_parent.unwrap_err().to_string().contains("--no-parent"));
+    }
+
+    #[test]
+    fn ids_resolve_exactly_before_names_and_paths() {
+        let document = store(&[
+            ("1", "ServerStorage", None),
+            ("a8d7", "Cars", Some(0)),
+            ("10b76", "Public", Some(0)),
+            ("editor:3", "Cars", Some(2)),
+        ]);
+        assert_eq!(resolve_document_id_or_target(&document, "a8d7").unwrap(), 1);
+        assert_eq!(
+            resolve_document_id_or_target(&document, " 10b76 ").unwrap(),
+            2
+        );
+        assert_eq!(
+            resolve_document_id_or_target(&document, "editor:3").unwrap(),
+            3
+        );
+        assert_eq!(
+            resolve_document_id_or_target(&document, "Public").unwrap(),
+            2
+        );
+        assert_eq!(
+            resolve_document_id_or_target(&document, "Public.Cars").unwrap(),
+            3
+        );
+        assert!(resolve_document_id_or_target(&document, "Cars").is_err());
+        assert!(resolve_document_id_or_target(&document, "editor:9").is_err());
+        assert!(resolve_document_id_or_target(&document, "ffff").is_err());
+    }
 
     #[test]
     fn name_and_class_selectors_combine() {
