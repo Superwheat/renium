@@ -1287,6 +1287,33 @@ fn collect_units(
                 let sources = subtree_sources(matcher.studio, members);
                 let positional = positional_subtrees(matcher, positional);
                 bounded.spend(sources.len() + positional.len() + members.len() + targets.len());
+                // Sides that already agree positionally, the usual state right
+                // after a pull, need no candidate matrix: prove each positional
+                // root's subtree and accept that assignment outright.
+                // The probe may spend at most a slice of the allowance, so a group that
+                // needs the matrix (distinct twins, large records) keeps the rest.
+                let probe = search::Budget::new(search::WORK_LIMIT / 2);
+                let probing = Matcher {
+                    budget: Some(&probe),
+                    ..*matcher
+                };
+                let interchangeable = (members.len() == targets.len())
+                    .then(|| interchangeable_roots(&probing, members, targets))
+                    .flatten();
+                bounded.spend(probe.used(search::WORK_LIMIT / 2));
+                if let Some(roots) = interchangeable {
+                    apply(&roots, partners);
+                    units.push(Unit {
+                        studio: members.clone(),
+                        editor: targets.clone(),
+                        sources,
+                        positional,
+                        proposed: roots,
+                        spent: budget.used(search::WORK_LIMIT),
+                        fixed: false,
+                    });
+                    continue;
+                }
                 let proposed = bounded.group(members, targets, &Some);
                 if proposed.is_some() || budget.exhausted.get() {
                     let proposed = proposed.unwrap_or_default();
@@ -1359,6 +1386,44 @@ fn collect_units(
     // Proofs are published only after references and incoming constraints agree.
     proven.fill(false);
     units
+}
+
+/// The complete subtree assignment for a duplicate group whose members all
+/// have an equal counterpart, found without a candidate matrix: first by
+/// position (the usual state right after a pull), otherwise each member takes
+/// the first unclaimed counterpart whose record and subtree prove equal.
+/// Identical twins are interchangeable, so either bijection is as good as any
+/// the matrix finds; the proofs stay under the group's budget and respect
+/// identity locks, and the reference stage still validates the plan.
+fn interchangeable_roots(
+    matcher: &Matcher<'_, '_>,
+    members: &[usize],
+    targets: &[usize],
+) -> Option<Assignment> {
+    let positional = members
+        .iter()
+        .zip(targets)
+        .map(|(&source, &target)| matcher.subtree(source, target))
+        .collect::<Option<Vec<_>>>();
+    if let Some(plans) = positional {
+        return Some(plans.into_iter().flatten().collect());
+    }
+    let mut claimed = vec![false; targets.len()];
+    let mut plan = Vec::new();
+    for &source in members {
+        let found = targets.iter().enumerate().find_map(|(index, &target)| {
+            if claimed[index] || !matcher.spend(1) || !matcher.record(source, target) {
+                return None;
+            }
+            matcher
+                .subtree(source, target)
+                .map(|subtree| (index, subtree))
+        });
+        let (index, subtree) = found?;
+        claimed[index] = true;
+        plan.extend(subtree);
+    }
+    Some(plan)
 }
 
 fn apply(assignment: &Assignment, partners: &mut [Option<usize>]) {

@@ -4,6 +4,7 @@
 
 ### Bug fixes
 
+- Live Sync's first comparison no longer stops on a large group of identical same-named siblings (433 identical trees, or two garage models with large identical subtrees, right after a pull): twins whose counterparts prove equal by position or by first fit are accepted without the candidate matrix, so the comparison budget is spent only on groups that really differ.
 - Live Sync preserves completed commit/rollback results across retries and releases inactive failed transactions after bounded retries or Studio ownership changes. Recovery has at most eight scheduled opportunities under valid ownership; unresolved data is session-only, with cleanup scheduled 30 minutes after retirement once current work permits. Native preparations delayed 120 seconds are safely refused; authorized writes with unknown outcomes stay blocked until verified completion or Studio restart, which can lose retained data.
 - Live Sync keeps its baseline when the project or experience configuration changes (a shared link applied with `lkp --share` or `lk --experience`, a place alias added). The next comparison is still a full one, but the files that change wrote are edits against the baseline instead of conflicts between both sides, so a consumer no longer holds on every transform of a freshly applied copy.
 - Live Sync's first comparison no longer holds on Workspace's `InsertPoint`, transient editor state that Studio moves with the camera and never saves.
