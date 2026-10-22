@@ -19,13 +19,17 @@ local function content(uri)
 	return { __type = "Content", SourceType = if uri == "" then "None" else "Uri", Uri = uri }
 end
 
+local failDisconnect = false
 local function signal()
 	local callbacks = {}
 	return {
 		Count = function() local count = 0 for _ in callbacks do count += 1 end return count end,
 		Connect = function(_, callback)
 			callbacks[callback] = true
-			return { Disconnect = function() callbacks[callback] = nil end }
+			return { Disconnect = function()
+				if failDisconnect then error("injected observer cleanup failure", 0) end
+				callbacks[callback] = nil
+			end }
 		end,
 		Fire = function(_, ...)
 			for callback in table.clone(callbacks) do callback(...) end
@@ -141,7 +145,9 @@ local function flushDeferred()
 	end
 end
 local createdRelays = {}
-local trackerModule = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeStudioChanges.module.luau"), {
+local trackerSource = fs.readFile("tools/plugin_ws_bridge/BridgeStudioChanges.module.luau"):gsub("\r\n", "\n")
+trackerSource = trackerSource:gsub("\n\treturn api\nend", "\n\tapi.reviewState = state\n\tapi.reviewRetiring = retiringJournals\n\treturn api\nend")
+local trackerModule = luau.load(trackerSource, {
 	environment = {
 		game = testGame,
 		typeof = function(value) return if type(value) == "table" and value.__type then value.__type
@@ -172,6 +178,34 @@ local trackerConfig = {
 	loadPendingStudioChanges = function() end, savePendingStudioChanges = function() end,
 	shouldIgnoreInstance = function() return false end, invalidateRuntimeExportCache = function() end,
 }
+for _, finish in { "finishChangeJournal", "expireChangeJournal" } do
+	local observer = trackerModule.create(trackerConfig, { ReplicatedStorage = true })
+	local state = observer.reviewState
+	state.persistentTracking = true
+	state.itemChangedAvailable = true
+	state.serviceRoots.ReplicatedStorage = storage
+	local root = instance("Folder", "RetiringJournal", storage)
+	local changed = signal()
+	state.fallbackPropertyConnections[root] = { changed:Connect(function() end) }
+	state.connectionServiceByInstance[root] = "ReplicatedStorage"
+	observer.beginChangeJournal("old", { "ReplicatedStorage" })
+	local record = { instance = root, properties = { Name = {captured = true, value = "Outside"} } }
+	state.changeJournal.records = { record }
+	state.changeJournal.detachedInstances[root] = "ReplicatedStorage"
+	failDisconnect = true
+	assert(not pcall(observer.finishChangeJournal, "old"))
+	assert(state.changeJournal == nil and observer.reviewRetiring.old.records[1] == record)
+	assert(changed:Count() == 1, "failed cleanup must retain its observer")
+	observer.beginChangeJournal("new", { "ReplicatedStorage" })
+	state.changeJournal.detachedInstances[root] = "ReplicatedStorage"
+	failDisconnect = false
+	local records = observer[finish]("old")
+	if finish == "finishChangeJournal" then assert(records[1] == record) end
+	assert(observer.reviewRetiring.old == nil)
+	assert(state.changeJournal.id == "new" and changed:Count() == 1, "old cleanup must not release the new journal")
+	observer.finishChangeJournal("new")
+	assert(changed:Count() == 0)
+end
 local tracker = trackerModule.create(trackerConfig, { ReplicatedStorage = true, Workspace = true })
 local candidates = table.clone(names)
 table.insert(candidates, "CornerRadius")

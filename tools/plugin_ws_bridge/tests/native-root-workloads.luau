@@ -12,11 +12,12 @@ do
 		cleanupFailures = failures,
 		warn = function() error("Internal errors must not reach Studio Output") end,
 	}, "recordCleanupFailure")
-	local expire = extract("local function expireSession(", "local armSessionExpiry", {
+	local expire = extract("local function nativeWorkPending(", "local armSessionExpiry", {
 		recordCleanupFailure = diagnostic,
+		SESSION_TTL_SECONDS = 120,
 		warn = function() error("Internal errors must not reach Studio Output") end,
 	}, "expireSession")
-	local session = { onExpire = function() error("missing original parent", 0) end }
+	local session = { updatedAt = os.clock(), onExpire = function() error("missing original parent", 0) end }
 	local sessions = { owned = session }
 	assert(not expire(sessions, "owned", session))
 	assert(sessions.owned == session and session.rollbackFailed == "missing original parent")
@@ -161,6 +162,7 @@ local target = lighting
 local function cancel(_, token) if token then token.active = false end end
 local api = extract("\tfunction api.getTransactionState(", "\tfunction api.cancelRequestLease(", {
 	api = {}, editorTransactions = sessions,
+	nativeWorkPending = extract("local function nativeWorkPending(", "local function expireSession(", {}, "nativeWorkPending"),
 	transactionOutcomes = { get = function() return nil end },
 	assertTransactionLease = function() assert(leaseActive, "cancelled lease") end,
 	isNativeRootProperty = predicate,
@@ -184,6 +186,7 @@ local function call(finish, changed)
 		finishNativeRootWrite = finish, nativeRootChanged = changed })
 end
 local session = sessions.test
+session.scheduleExpiry = function(callback) callback() end
 assert(call(false).nativeRootWrite == 1 and operations == 1)
 assert(not pcall(call, false), "Do not invoke a setter twice")
 assert(call(true, true).state == "open" and operations == 0)
@@ -220,6 +223,7 @@ local attributes = { added = 29, changed = "after" }
 local instance = { Quality = true, GetAttributes = function() return attributes end }
 local tokens = {}
 local undoContext = {
+	assertSessionOwnership = function() end,
 	expectAttributeEvent = function(_, name, value)
 		local token = { active = true, name = name, value = value }
 		table.insert(tokens, token)
@@ -308,7 +312,7 @@ for _, retained in { false, true } do
 	}, "TransactionState.rollbackSession")
 	local pending = { snapshot = {}, mutated = true, historyRecording = "recording" }
 	if retained then pending.nativeUndo = { explicitRollback = true, prepared = {} } end
-	simpleRollback(pending, {})
+	simpleRollback(pending, { assertSessionOwnership = function() end })
 	assert(committed and pending.historyRecording == nil)
 end
 do
@@ -335,9 +339,9 @@ do
 	local ok, err = pcall(resolve, record, {})
 	assert(not ok and tostring(err):find("original parent ServerStorage.Public.Cars.Car.AntiRoll is missing", 1, true),
 		"A missing nested parent must not flatten AntiRollBarFL into ServerStorage")
-	assert(calls == 1, "Rollback must never search shorter ancestor paths")
+	assert(calls == 0, "Rollback must resolve parent identity without guessing a path")
 	available = true
-	assert(resolve(record, {}) == exact)
+	assert(not pcall(resolve, record, {}), "A same-path replacement is not proof of parent identity")
 	local moved = { Parent = exact }
 	assert(resolve(record, { [missing] = moved }) == moved, "Mapped identity must win over old paths")
 	record.parent = service
@@ -462,7 +466,7 @@ local commit = extract("local function commitTransactionUnsafe(", "function api.
 	cancelExpectedEvent = function() end,
 	finishHistoryRecording = function() finished += 1;if onFinish then onFinish() end end,
 	invalidateEditorService = function() end,
-	recordTransactionOutcome = function(_, state, result) result.state = state return result end,
+	finishTerminalTransaction = function(_, state, result) result.state = state return result end,
 }, "commitTransactionUnsafe")
 local function pending()
 	local value = {

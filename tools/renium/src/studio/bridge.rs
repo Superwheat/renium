@@ -242,7 +242,7 @@ fn bridge_request_allowed_after_cancel(method: &str, params: &Value) -> bool {
 
 #[cfg(test)]
 #[path = "bridge_routing_tests.rs"]
-mod routing_tests;
+pub(crate) mod routing_tests;
 
 #[cfg(test)]
 mod request_cancellation_tests {

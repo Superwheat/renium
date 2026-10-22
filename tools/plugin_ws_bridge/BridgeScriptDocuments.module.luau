@@ -78,7 +78,7 @@ local function restoreDocumentSelection(document: any, selection: { number }?)
 	pcall(document.ForceSetSelectionAsync, document, cursorLine, cursorCharacter, anchorLine, anchorCharacter)
 end
 
-local function setOpenDocumentSource(document: any, source: string): (boolean, any)
+local function setOpenDocumentSource(document: any, source: string, ctx: { [string]: any }?, beforeWrite: (() -> ())?): (boolean, any)
 	local okText, currentText = pcall(document.GetText, document)
 	if okText and currentText == source then
 		return true, nil
@@ -91,12 +91,21 @@ local function setOpenDocumentSource(document: any, source: string): (boolean, a
 
 	local selection = getDocumentSelection(document)
 	local endCharacter = documentLineEndCharacter(document, lineCount)
+	if ctx and ctx.assertSessionOwnership then
+		ctx.assertSessionOwnership()
+	end
+	if beforeWrite then
+		beforeWrite()
+	end
 	local okEdit, success, editErr = pcall(document.EditTextAsync, document, source, 1, 1, lineCount, endCharacter)
 	if not okEdit then
 		return false, success
 	end
 	if success == false then
 		return false, editErr or "EditTextAsync failed"
+	end
+	if ctx and ctx.assertSessionOwnership then
+		ctx.assertSessionOwnership()
 	end
 	restoreDocumentSelection(document, selection)
 	return true, nil
@@ -105,14 +114,18 @@ end
 function BridgeScriptDocuments.setSource(
 	instance: Instance,
 	source: string,
-	ctx: { [string]: any }?
+	ctx: { [string]: any }?,
+	beforeWrite: (() -> ())?
 ): (boolean, any)
+	if ctx and ctx.assertSessionOwnership then
+		ctx.assertSessionOwnership()
+	end
 	local document = findScriptDocument(instance)
 	local token = if instance:IsDescendantOf(game) and ctx ~= nil
 		then ctx.expectPropertyEvent(instance, "Source", source)
 		else nil
 	if document ~= nil then
-		local documentOk = setOpenDocumentSource(document, source)
+		local documentOk = setOpenDocumentSource(document, source, ctx, beforeWrite)
 		if documentOk then
 			return true, nil
 		end
@@ -121,6 +134,12 @@ function BridgeScriptDocuments.setSource(
 	local updateOk = pcall(function()
 		local scriptEditorService = ScriptEditorService :: any
 		scriptEditorService:UpdateSourceAsync(instance, function()
+			if ctx and ctx.assertSessionOwnership then
+				ctx.assertSessionOwnership()
+			end
+			if beforeWrite then
+				beforeWrite()
+			end
 			return source
 		end)
 	end)
@@ -128,6 +147,12 @@ function BridgeScriptDocuments.setSource(
 		return true, nil
 	end
 	local ok, err = pcall(function()
+		if ctx and ctx.assertSessionOwnership then
+			ctx.assertSessionOwnership()
+		end
+		if beforeWrite then
+			beforeWrite()
+		end
 		local writableInstance = instance :: any
 		writableInstance.Source = source
 	end)
@@ -248,9 +273,13 @@ function BridgeScriptDocuments.apply(
 	changedSourceKeys: { [string]: boolean }?,
 	replacements: { [Instance]: Instance }?,
 	resolveStagedPath: (({ string }, { number }?) -> Instance?)?,
-	allSourcesChanged: boolean?
+	allSourcesChanged: boolean?,
+	ctx: { [string]: any }?
 )
 	for _, entry in ipairs(entries) do
+		if ctx and ctx.assertSessionOwnership then
+			ctx.assertSessionOwnership()
+		end
 		local target = resolveEntryTarget(entry, replacements, resolveStagedPath)
 		if (target == nil or not target:IsA("LuaSourceContainer")) and allSourcesChanged then
 			closeDocument(entry.document, "Could not close removed script document")
@@ -262,13 +291,19 @@ function BridgeScriptDocuments.apply(
 		local sourceChanged, source, selection =
 			sourceState(entry, target, changedSourceInstances, changedSourceKeys, allSourcesChanged)
 		local targetDocument = openScriptDocument(target)
+		if ctx and ctx.assertSessionOwnership then
+			ctx.assertSessionOwnership()
+		end
 		if not sourceChanged and targetDocument ~= entry.document then
-			local okWrite, writeError = setOpenDocumentSource(targetDocument, source)
+			local okWrite, writeError = setOpenDocumentSource(targetDocument, source, ctx)
 			if not okWrite then
 				error(`Could not restore open script document {target:GetFullName()}: {writeError}`)
 			end
 		end
 		restoreDocumentSelection(targetDocument, selection)
+		if ctx and ctx.assertSessionOwnership then
+			ctx.assertSessionOwnership()
+		end
 		if entry.document ~= targetDocument then
 			closeDocument(entry.document, "Could not close replaced script document")
 		end

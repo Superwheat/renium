@@ -350,6 +350,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	}
 
 	local api = {}
+	local retiringJournals = {}
 	local nativeAttributeRelay = nil
 	local nativeTerrainRelay = nil
 	local rawTagGeneration = 0
@@ -1098,19 +1099,51 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	end
 
 	function api.finishChangeJournal(transactionId: string): { any }
-		-- An interrupted native import has no accepted creation receipt. Flush
-		-- its pending additions as outside edits, never silently discard them.
-		api.finishNativeImportObservations(transactionId, nil)
-		local records = api.drainChangeJournal(transactionId)
+		local retired = retiringJournals[transactionId]
+		if retired == nil then
+			-- Detach active ownership before fallible observer cleanup. A retry
+			-- owns the old records/observers without touching a newer journal.
+			api.finishNativeImportObservations(transactionId, nil)
+			retired = { records = api.drainChangeJournal(transactionId), journal = state.changeJournal }
+			retiringJournals[transactionId] = retired
+			state.changeJournal = nil
+		end
+		if retired.journal ~= nil then
+			releaseJournalObservers(retired.journal)
+			retired.journal = nil
+		end
+		if state.changeJournal == nil and not state.persistentTracking and next(state.trackingGuards) == nil then
+			stopTracking()
+		end
+		retiringJournals[transactionId] = nil
+		return retired.records
+	end
+
+	function api.retireChangeJournal(transactionId: string): { any }
+		-- Ownership changed. Hand off local records/observers without replay,
+		-- native receipt processing or touching a newer active journal.
 		local journal = state.changeJournal
-		state.changeJournal = nil
+		if journal ~= nil and journal.id == transactionId then
+			retiringJournals[transactionId] = { records = journal.records, journal = journal }
+			state.changeJournal = nil
+		end
+		local retired = retiringJournals[transactionId]
+		return if retired then retired.records else {}
+	end
+
+	function api.expireChangeJournal(transactionId: string)
+		-- Retention expiry relinquishes only this journal's local ownership.
+		-- A newer journal may already own some of its detached observers.
+		local retired = retiringJournals[transactionId]
+		local journal = if retired then retired.journal else nil
+		if state.changeJournal ~= nil and state.changeJournal.id == transactionId then
+			journal = state.changeJournal
+			state.changeJournal = nil
+		end
+		retiringJournals[transactionId] = nil
 		if journal ~= nil then
 			releaseJournalObservers(journal)
 		end
-		if not state.persistentTracking and next(state.trackingGuards) == nil then
-			stopTracking()
-		end
-		return records
 	end
 
 	local function clearPropertyChangesForService(serviceName: string)
@@ -3003,6 +3036,12 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 
 	releaseJournalObservers = function(journal)
 		for instance, serviceName in pairs(journal.detachedInstances) do
+			local current = state.changeJournal
+			if current ~= nil and current ~= journal and current.detachedInstances[instance] ~= nil then
+				-- A newer journal took ownership while the old cleanup was retained.
+				journal.detachedInstances[instance] = nil
+				continue
+			end
 			if state.connectionServiceByInstance[instance] == serviceName then
 				local service = state.serviceRoots[serviceName]
 				if service ~= nil and instance:IsDescendantOf(service) then
@@ -3011,6 +3050,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 					disconnectInstance(instance, serviceName)
 				end
 			end
+			journal.detachedInstances[instance] = nil
 		end
 	end
 

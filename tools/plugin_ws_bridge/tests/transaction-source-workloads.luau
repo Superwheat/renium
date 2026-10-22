@@ -19,6 +19,7 @@ local staged = scriptValue("new staged source", nil)
 local currentLease, cancelled = "owner", false
 local transaction = {
 	state = "prepared", leaseId = "owner",
+	assertOwnership = function() end,
 	studioGenerations = { ReplicatedFirst = 0 },
 	nativeImportServices = { ReplicatedFirst = true },
 	resolveStagedPath = function() return staged end,

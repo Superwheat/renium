@@ -80,6 +80,7 @@ use crate::system::text::normalized_source_bytes;
 struct EditorTransaction<'a> {
     bridge: &'a BridgeServer,
     id: String,
+    plugin_session_id: Option<String>,
     active: bool,
     package_mutation: bool,
     package_dialog: Option<crate::studio::input::PackageChangesDialogWatcher>,
@@ -205,8 +206,331 @@ fn property_change_can_modify_package_root(change: &EditorPropertyChange) -> boo
         .any(|name| !package_root_property_is_override(&change.class_name, name))
 }
 
+const ABANDONED_TRANSACTION: &str = "Studio released the failed transaction; unresolved Studio edits and rollback data are retained only in this plugin session and can be lost when the plugin reloads or Studio closes. Recovery has at most eight scheduled opportunities while the original Studio ownership remains valid. Local data release is scheduled 30 minutes after terminal transfer and waits for the exclusive gate. Package contents are not confirmed restored";
+const NATIVE_OUTCOME_UNKNOWN: &str = "Native work has an unknown terminal outcome; rollback remains blocked because a native write may still be running. Restart Studio to clear this operation";
+
+fn editor_transaction_begin_result(
+    direct: Result<Value>,
+    upload: impl FnOnce() -> Result<Value>,
+) -> Result<Value> {
+    let result = match direct {
+        Err(error) if error.is::<BridgeRequestTooLarge>() => upload(),
+        result => result,
+    };
+    result.map_err(|error| {
+        let message = format!("{error:#}");
+        if message.contains("Another editor transaction is already active")
+            || message.contains("An earlier editor transaction has a failed rollback")
+        {
+            error.context("Studio still has an active editor transaction; wait for it to finish. Failed rollback cleanup retries at two-minute idle intervals")
+        } else {
+            error
+        }
+    })
+}
+
 fn editor_transaction_state(result: &Value) -> Option<&str> {
     result.get("state").and_then(Value::as_str)
+}
+
+#[cfg(test)]
+mod transaction_recovery_tests {
+    use super::*;
+    use crate::studio::bridge::routing_tests::{connect, edit_info, fixture};
+    use std::thread::{self, JoinHandle};
+    use tungstenite::{Message, WebSocket, protocol::Role};
+
+    fn scripted_bridge(responses: Vec<(&'static str, Value)>) -> (BridgeServer, JoinHandle<()>) {
+        let bridge = fixture();
+        let stream = connect(&bridge, 0, edit_info("transaction-recovery", 19));
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let peer = thread::spawn(move || {
+            let mut socket = WebSocket::from_raw_socket(stream, Role::Client, None);
+            for (method, mut response) in responses {
+                let Message::Text(text) = socket.read().unwrap() else {
+                    panic!("expected request")
+                };
+                let request: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(request["method"], method);
+                response["id"] = request["id"].clone();
+                socket
+                    .send(Message::Text(response.to_string().into()))
+                    .unwrap();
+            }
+        });
+        (bridge, peer)
+    }
+
+    fn transaction(bridge: &BridgeServer) -> EditorTransaction<'_> {
+        EditorTransaction {
+            bridge,
+            id: "retained".into(),
+            plugin_session_id: Some("original-plugin-session".into()),
+            active: true,
+            package_mutation: true,
+            package_dialog: None,
+            auto_desynced_packages: vec!["Workspace.Package".into()],
+            auto_desynced_package_targets: vec![EditorPackageTarget {
+                path_segments: vec!["Workspace".into(), "Package".into()],
+                path_ordinals: vec![1, 1],
+                expected_version: 1,
+                creator: None,
+                owned: Some(true),
+            }],
+            // Any attempt to Restore fails before native execution. Terminal
+            // abandonment must never reach that attempt or clear Changed data.
+            package_runtime: None,
+            auto_desync_confirmed: true,
+        }
+    }
+
+    fn state_response(state: &str) -> Value {
+        json!({"ok": true, "result": {"state": state}})
+    }
+
+    #[test]
+    fn abandoned_is_terminal_in_direct_query_rollback_and_prepare_paths() {
+        for path in [
+            "commit",
+            "commit-query",
+            "rollback",
+            "rollback-query",
+            "prepare",
+        ] {
+            let method = if path.starts_with("rollback") {
+                "rollbackEditorTransaction"
+            } else {
+                "commitEditorTransaction"
+            };
+            let responses = if path.ends_with("query") {
+                vec![
+                    (
+                        method,
+                        json!({"ok": false, "error": "injected RPC failure"}),
+                    ),
+                    ("getEditorTransactionState", state_response("abandoned")),
+                ]
+            } else {
+                vec![(method, state_response("abandoned"))]
+            };
+            let (bridge, peer) = scripted_bridge(responses);
+            let mut tx = transaction(&bridge);
+            let result = match path {
+                "rollback" | "rollback-query" => tx.rollback(),
+                "prepare" => tx.prepare_snapshot(),
+                _ => tx.commit().map(|_| ()),
+            };
+            assert!(
+                format!("{:#}", result.unwrap_err()).contains(ABANDONED_TRANSACTION),
+                "{path}"
+            );
+            assert!(!tx.active && tx.package_dialog.is_none(), "{path}");
+            assert_eq!(tx.auto_desynced_package_targets.len(), 1, "{path}");
+            assert_eq!(tx.auto_desynced_packages, ["Workspace.Package"], "{path}");
+            drop(tx); // No Drop rollback/native restore after a terminal outcome.
+            peer.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn native_unknown_reports_restart_and_leaves_package_contents_unconfirmed() {
+        for path in [
+            "commit",
+            "commit-query",
+            "rollback",
+            "rollback-query",
+            "prepare",
+        ] {
+            let method = if path.starts_with("rollback") {
+                "rollbackEditorTransaction"
+            } else {
+                "commitEditorTransaction"
+            };
+            let state = json!({"ok": true, "result": {
+                "state": "nativeOutcomeUnknown", "nativeOperation": {"importId": "pending-native"}
+            }});
+            let responses = if path.ends_with("query") {
+                vec![
+                    (method, json!({"ok":false,"error":"native pending"})),
+                    ("getEditorTransactionState", state),
+                ]
+            } else {
+                vec![(method, state)]
+            };
+            let (bridge, peer) = scripted_bridge(responses);
+            let mut tx = transaction(&bridge);
+            let result = match path {
+                "rollback" | "rollback-query" => tx.rollback(),
+                "prepare" => tx.prepare_snapshot(),
+                _ => tx.commit().map(|_| ()),
+            };
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(
+                error.contains(NATIVE_OUTCOME_UNKNOWN) && error.contains("pending-native"),
+                "{path}: {error}"
+            );
+            assert!(!tx.active && tx.auto_desynced_package_targets.len() == 1);
+            drop(tx);
+            peer.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn abandoned_diagnostic_exposes_lifetime_and_unresolved_counts() {
+        let bridge = fixture();
+        let mut tx = transaction(&bridge);
+        let error = tx
+            .finish_abandoned(&json!({"recovery": {
+                "unreplayedEdits": 3, "unresolvedNativeRoots": 2, "detachedRoots": 1,
+                "pendingCleanup": 4, "state": "retained"
+            }}))
+            .to_string();
+        assert!(error.contains("plugin reloads or Studio closes") && error.contains("30 minutes"));
+        assert!(error.contains(
+            "unresolved edits: 3, native roots: 2, detached roots: 1, pending cleanup: 4"
+        ));
+        assert!(!tx.active && tx.auto_desynced_package_targets.len() == 1);
+    }
+
+    #[test]
+    fn abandoned_generation_change_reports_stopped_replay() {
+        let bridge = fixture();
+        let mut tx = transaction(&bridge);
+        let reason = "Studio ownership changed from generation 7 to 9; old rollback and cleanup will not be replayed";
+        let error = tx
+            .finish_abandoned(&json!({"recovery": {
+                "state": "stopped", "retryStopped": true, "retirementReason": reason,
+                "unreplayedEdits": 1, "unresolvedNativeRoots": 0, "detachedRoots": 0,
+                "pendingCleanup": 0
+            }}))
+            .to_string();
+        assert!(error.contains(reason) && error.contains("recovery: \"stopped\""));
+        assert!(!tx.active && tx.auto_desynced_package_targets.len() == 1);
+    }
+
+    #[test]
+    fn plugin_reload_is_distinct_from_an_expired_outcome() {
+        for current in ["original-plugin-session", "reloaded-plugin-session"] {
+            let bridge = fixture();
+            let mut tx = transaction(&bridge);
+            let error = tx.rollback_response(
+                json!({"state":"notFound","pluginSessionId":current,"recoveryDataMayBeLost":true}),
+                None,
+            ).unwrap_err().to_string();
+            assert_eq!(
+                error.contains("plugin session changed"),
+                current != "original-plugin-session"
+            );
+            assert!(error.contains("recovery data") && error.contains("lost"));
+            assert!(!tx.active && tx.auto_desynced_package_targets.len() == 1);
+        }
+        let error =
+            editor_transaction_begin_result(Err(anyhow::anyhow!(NATIVE_OUTCOME_UNKNOWN)), || {
+                panic!("unexpected upload")
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Restart Studio") && !error.contains("two-minute"));
+    }
+
+    #[test]
+    fn rollback_releases_terminal_ownership_before_package_restoration_failure() {
+        for path in ["rollback", "commit", "commit-query", "prepare"] {
+            let method = if path == "rollback" {
+                "rollbackEditorTransaction"
+            } else {
+                "commitEditorTransaction"
+            };
+            let mut responses = Vec::new();
+            if path == "commit-query" {
+                responses.push((
+                    method,
+                    json!({"ok": false, "error": "injected RPC failure"}),
+                ));
+                responses.push(("getEditorTransactionState", state_response("rolledBack")));
+            } else {
+                responses.push((method, state_response("rolledBack")));
+            }
+            let (bridge, peer) = scripted_bridge(responses);
+            let mut tx = transaction(&bridge);
+            let result = match path {
+                "rollback" => tx.rollback(),
+                "prepare" => tx.prepare_snapshot(),
+                _ => tx.commit().map(|_| ()),
+            };
+            #[cfg(any(windows, target_os = "macos"))]
+            assert!(
+                format!("{:#}", result.unwrap_err()).contains("package runtime was not retained")
+            );
+            #[cfg(not(any(windows, target_os = "macos")))]
+            let _ = result;
+            assert!(!tx.active && tx.package_dialog.is_none());
+            drop(tx);
+            peer.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn unconfirmed_rollback_never_restores_package_state() {
+        for state in [
+            "notFound",
+            "committed",
+            "rollbackFailed",
+            "open",
+            "prepared",
+            "invalid",
+        ] {
+            let bridge = fixture();
+            let mut tx = transaction(&bridge);
+            assert!(tx.rollback_response(json!({"state":state}), None).is_err());
+            assert_eq!(tx.auto_desynced_package_targets.len(), 1);
+            assert_eq!(tx.active, !matches!(state, "committed" | "notFound"));
+            tx.active = false;
+        }
+        let bridge = fixture();
+        let mut tx = transaction(&bridge);
+        assert!(tx.rollback_response(json!({"ok":true}), None).is_err());
+        assert!(!tx.active && tx.auto_desynced_package_targets.len() == 1);
+    }
+
+    #[test]
+    fn begin_hint_covers_direct_and_uploaded_refusals_without_diagnosing_failure() {
+        let refusal = "Another editor transaction is already active";
+        let error = editor_transaction_begin_result(Err(anyhow::anyhow!(refusal)), || {
+            panic!("unexpected upload")
+        })
+        .unwrap_err();
+        let hint = format!("{error:#}");
+        assert!(hint.contains("wait for it to finish") && !hint.contains("whose rollback failed"));
+        let (bridge, peer) = scripted_bridge(vec![(
+            "finishEditorTransactionUpload",
+            json!({"ok":false,"error":refusal}),
+        )]);
+        let oversized = bridge.call(
+            "beginEditorTransaction",
+            json!({"payload":"x".repeat(17 * 1024 * 1024)}),
+        );
+        assert!(
+            oversized
+                .as_ref()
+                .unwrap_err()
+                .is::<BridgeRequestTooLarge>()
+        );
+        let error = editor_transaction_begin_result(oversized, || {
+            bridge.call("finishEditorTransactionUpload", json!({}))
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("two-minute idle intervals"));
+        peer.join().unwrap();
+        let error = editor_transaction_begin_result(
+            Err(anyhow::anyhow!("unrelated error")),
+            || unreachable!(),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "unrelated error");
+    }
 }
 
 fn editor_mutation_package_targets(
@@ -683,15 +1007,16 @@ impl<'a> EditorTransaction<'a> {
         );
         let upload_services = services.clone();
         let parameters = Self::parameters(changes, binary_import, &id, services, guard);
-        let result = match bridge.call("beginEditorTransaction", parameters) {
-            Ok(result) => result,
-            Err(error) if error.is::<BridgeRequestTooLarge>() => Self::upload(
-                bridge,
-                &id,
-                Self::parameters(changes, binary_import, &id, upload_services, guard),
-            )?,
-            Err(error) => return Err(error),
-        };
+        let result = editor_transaction_begin_result(
+            bridge.call("beginEditorTransaction", parameters),
+            || {
+                Self::upload(
+                    bridge,
+                    &id,
+                    Self::parameters(changes, binary_import, &id, upload_services, guard),
+                )
+            },
+        )?;
         if result.get("studioChanged").and_then(Value::as_bool) == Some(true) {
             return Err(StudioChangedBeforePush.into());
         }
@@ -702,6 +1027,10 @@ impl<'a> EditorTransaction<'a> {
         let mut transaction = Self {
             bridge,
             id,
+            plugin_session_id: result
+                .get("pluginSessionId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             active: true,
             package_mutation,
             package_dialog: None,
@@ -938,15 +1267,77 @@ impl<'a> EditorTransaction<'a> {
         Ok(())
     }
 
-    fn finish_rollback(&mut self) -> Result<()> {
-        self.restore_auto_desynced_packages()?;
+    fn release_terminal_resources(&mut self) {
         self.active = false;
-        if let Some(watcher) = self.package_dialog.take() {
-            watcher
-                .finish()
-                .context("Studio did not finish accepting rollback package changes")?;
+        self.package_dialog.take();
+    }
+
+    fn finish_abandoned(&mut self, result: &Value) -> anyhow::Error {
+        self.release_terminal_resources();
+        // Restore marks a package Unmodified. Abandonment proves no such thing.
+        let Some(recovery) = result.get("recovery") else {
+            return anyhow::anyhow!("{ABANDONED_TRANSACTION}; unresolved counts unavailable");
+        };
+        let retirement = recovery["retirementReason"]
+            .as_str()
+            .map(|reason| format!("; {reason}"))
+            .unwrap_or_default();
+        anyhow::anyhow!(
+            "{ABANDONED_TRANSACTION}; unresolved edits: {}, native roots: {}, detached roots: {}, pending cleanup: {}; recovery: {}{retirement}",
+            recovery["unreplayedEdits"],
+            recovery["unresolvedNativeRoots"],
+            recovery["detachedRoots"],
+            recovery["pendingCleanup"],
+            recovery["state"],
+        )
+    }
+
+    fn finish_native_unknown(&mut self, result: &Value) -> anyhow::Error {
+        // End daemon retries, leaving Studio's operation fence and package
+        // state intact until a verified receipt or a Studio restart.
+        self.release_terminal_resources();
+        anyhow::anyhow!(
+            "{NATIVE_OUTCOME_UNKNOWN} (transaction {}, import {})",
+            self.id,
+            result["nativeOperation"]["importId"]
+        )
+    }
+
+    fn finish_missing_outcome(&mut self, result: &Value) -> anyhow::Error {
+        self.release_terminal_resources();
+        if let (Some(previous), Some(current)) = (
+            self.plugin_session_id.as_deref(),
+            result.get("pluginSessionId").and_then(Value::as_str),
+        ) && previous != current
+        {
+            return anyhow::anyhow!(
+                "Studio's plugin session changed ({previous} -> {current}); transaction {} and its session-only recovery data are unavailable and may have been lost. Package contents are not confirmed restored",
+                self.id
+            );
         }
-        Ok(())
+        anyhow::anyhow!(
+            "Studio did not retain this transaction outcome; commit and rollback are unconfirmed. Session-only recovery data may have expired or been lost on plugin reload or Studio close"
+        )
+    }
+
+    fn finish_rollback(&mut self) -> Result<()> {
+        self.active = false;
+        let watcher = self
+            .package_dialog
+            .take()
+            .map(|watcher| watcher.finish())
+            .transpose();
+        // Both resources are terminal even if either cleanup step fails.
+        let restored = self.restore_auto_desynced_packages();
+        match (restored, watcher) {
+            (Err(error), Err(watcher_error)) => Err(error.context(format!(
+                "Package dialog cleanup also failed: {watcher_error:#}"
+            ))),
+            (Err(error), _) => Err(error),
+            (Ok(()), watcher) => watcher
+                .context("Studio did not finish accepting rollback package changes")
+                .map(|_| ()),
+        }
     }
 
     fn commit(&mut self) -> Result<EditorCommitStatus> {
@@ -961,56 +1352,76 @@ impl<'a> EditorTransaction<'a> {
                     "getEditorTransactionState",
                     json!({ "transactionId": &self.id }),
                 );
-                match state_result {
-                    Ok(result) => match editor_transaction_state(&result) {
-                        Some("committed") => result,
-                        Some("rolledBack") => {
-                            self.finish_rollback().context(
-                                "Studio rolled the transaction back, but Renium could not restore its automatic package state changes",
-                            )?;
-                            return Err(commit_error.context(
-                                "Studio rolled the transaction back before its commit response was received",
-                            ));
-                        }
-                        Some("open" | "prepared") => {
-                            return Err(commit_error.context(
-                                "Studio did not commit the transaction; rollback is still available",
-                            ));
-                        }
-                        Some("rollbackFailed") => {
-                            return Err(commit_error.context(
-                                "Studio could not roll the transaction back; its recovery state was retained",
-                            ));
-                        }
-                        Some("notFound") | None => {
-                            self.active = false;
-                            self.package_dialog.take();
-                            return Err(commit_error.context(
-                                "Studio did not retain this transaction outcome; whether it committed is unknown",
-                            ));
-                        }
-                        Some(state) => {
-                            return Err(commit_error.context(format!(
-                                "Studio returned an invalid transaction state: {state}"
-                            )));
-                        }
-                    },
-                    Err(state_error) => {
-                        return Err(commit_error.context(format!(
-                            "Studio commit outcome could not be queried: {state_error:#}"
-                        )));
-                    }
-                }
+                return self.commit_after_error(commit_error, state_result);
             }
         };
+        self.commit_response(result)
+    }
+
+    fn commit_after_error(
+        &mut self,
+        commit_error: anyhow::Error,
+        state_result: Result<Value>,
+    ) -> Result<EditorCommitStatus> {
+        let result = match state_result {
+            Ok(result) => match editor_transaction_state(&result) {
+                Some("committed") => result,
+                Some("rolledBack") => {
+                    self.finish_rollback().context(
+                                "Studio rolled the transaction back, but Renium could not restore its automatic package state changes",
+                            )?;
+                    return Err(commit_error.context(
+                                "Studio rolled the transaction back before its commit response was received",
+                            ));
+                }
+                Some("open" | "prepared") => {
+                    return Err(commit_error.context(
+                        "Studio did not commit the transaction; rollback is still available",
+                    ));
+                }
+                Some("rollbackFailed") => {
+                    return Err(commit_error.context(
+                                "Studio could not roll the transaction back; its recovery state was retained",
+                            ));
+                }
+                Some("abandoned") => {
+                    return Err(commit_error.context(self.finish_abandoned(&result)));
+                }
+                Some("nativeOutcomeUnknown") => {
+                    return Err(commit_error.context(self.finish_native_unknown(&result)));
+                }
+                Some("notFound") | None => {
+                    return Err(commit_error.context(self.finish_missing_outcome(&result)));
+                }
+                Some(state) => {
+                    return Err(commit_error.context(format!(
+                        "Studio returned an invalid transaction state: {state}"
+                    )));
+                }
+            },
+            Err(state_error) => {
+                return Err(commit_error.context(format!(
+                    "Studio commit outcome could not be queried: {state_error:#}"
+                )));
+            }
+        };
+        self.commit_response(result)
+    }
+
+    fn commit_response(&mut self, result: Value) -> Result<EditorCommitStatus> {
         match editor_transaction_state(&result) {
+            Some("abandoned") => return Err(self.finish_abandoned(&result)),
+            Some("nativeOutcomeUnknown") => return Err(self.finish_native_unknown(&result)),
+            Some("notFound") => {
+                return Err(self.finish_missing_outcome(&result));
+            }
             Some("rolledBack") => {
                 self.finish_rollback().context(
                     "Studio rolled the transaction back, but Renium could not restore its automatic package state changes",
                 )?;
                 bail!("Studio rolled the transaction back instead of committing it");
             }
-            Some("open" | "prepared" | "notFound") => {
+            Some("open" | "prepared") => {
                 bail!("Studio did not confirm the editor transaction commit");
             }
             Some("rollbackFailed") => {
@@ -1057,7 +1468,8 @@ impl<'a> EditorTransaction<'a> {
         if !self.active {
             return Ok(());
         }
-        self.restore_auto_desynced_packages()?;
+        // Ask Studio first: a terminal transaction must release local resources
+        // even when a missing package target makes native restoration fail.
         let rollback_result = self.bridge.call(
             "rollbackEditorTransaction",
             json!({ "transactionId": &self.id }),
@@ -1079,16 +1491,23 @@ impl<'a> EditorTransaction<'a> {
                 }
             }
         };
+        self.rollback_response(result, rollback_error)
+    }
+
+    fn rollback_response(
+        &mut self,
+        result: Value,
+        rollback_error: Option<anyhow::Error>,
+    ) -> Result<()> {
         match editor_transaction_state(&result) {
-            Some("rolledBack") | None => self.finish_rollback(),
+            Some("rolledBack") => self.finish_rollback(),
+            Some("abandoned") => Err(self.finish_abandoned(&result)),
+            Some("nativeOutcomeUnknown") => Err(self.finish_native_unknown(&result)),
             Some("committed") => {
-                self.active = false;
+                self.release_terminal_resources();
                 bail!("Studio had already committed the transaction; rollback was not performed")
             }
-            Some("notFound") => {
-                self.active = false;
-                bail!("Studio did not retain this transaction outcome; rollback is unconfirmed")
-            }
+            Some("notFound") | None => Err(self.finish_missing_outcome(&result)),
             Some("open" | "prepared" | "rollbackFailed") => {
                 if let Some(error) = rollback_error {
                     return Err(error
@@ -1112,7 +1531,7 @@ impl<'a> EditorTransaction<'a> {
         })
     }
 
-    fn prepare_snapshot(&self) -> Result<()> {
+    fn prepare_snapshot(&mut self) -> Result<()> {
         let result = self.bridge.call(
             "commitEditorTransaction",
             json!({
@@ -1120,6 +1539,21 @@ impl<'a> EditorTransaction<'a> {
                 "prepareOnly": true,
             }),
         )?;
+        self.prepare_snapshot_response(result)
+    }
+
+    fn prepare_snapshot_response(&mut self, result: Value) -> Result<()> {
+        match editor_transaction_state(&result) {
+            Some("abandoned") => return Err(self.finish_abandoned(&result)),
+            Some("nativeOutcomeUnknown") => return Err(self.finish_native_unknown(&result)),
+            Some("rolledBack") => {
+                self.finish_rollback()?;
+                bail!("Studio rolled back instead of preparing the transaction");
+            }
+            Some("notFound") => return Err(self.finish_missing_outcome(&result)),
+            Some("committed") => self.release_terminal_resources(),
+            _ => {}
+        }
         anyhow::ensure!(
             result["state"] == "prepared" && result["committed"] == false,
             "Studio did not prepare the complete transaction for its place snapshot"

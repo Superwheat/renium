@@ -4,6 +4,7 @@
 
 ### Bug fixes
 
+- Live Sync preserves completed commit/rollback results across retries and releases inactive failed transactions after bounded retries or Studio ownership changes. Recovery has at most eight scheduled opportunities under valid ownership; unresolved data is session-only, with cleanup scheduled 30 minutes after retirement once current work permits. Native preparations delayed 120 seconds are safely refused; authorized writes with unknown outcomes stay blocked until verified completion or Studio restart, which can lose retained data.
 - Live Sync keeps its baseline when the project or experience configuration changes (a shared link applied with `lkp --share` or `lk --experience`, a place alias added). The next comparison is still a full one, but the files that change wrote are edits against the baseline instead of conflicts between both sides, so a consumer no longer holds on every transform of a freshly applied copy.
 - Live Sync's first comparison no longer holds on Workspace's `InsertPoint`, transient editor state that Studio moves with the camera and never saves.
 - Offline commands (`ck`, `report`, plugin calls) no longer try to resume Studio audio, and a failed resume is logged at debug level instead of being printed into a command's output; a sandboxed `rbx ck` had printed "Global Studio audio could not resume: Access is denied".

@@ -60,6 +60,13 @@ local binaryExports = {}
 local nativeSnapshotPools = {}
 local nativePayloadProofs = {}
 local editorTransactions = {}
+-- Recovery ownership outlives both the active lock and the bounded outcome cache.
+local transactionRecoveries = {}
+local recoveryDiagnostics = {}
+local RECOVERY_RETENTION_SECONDS = 30 * 60
+local MAX_RECOVERY_ATTEMPTS = 8
+local NATIVE_PREPARE_SECONDS = 120
+local NATIVE_UNKNOWN_REASON = "Native work was authorized but its terminal outcome is unknown; rollback is blocked because a native write may still be running. Restart Studio to clear this operation"
 local cleanupFailures = {}
 
 local function recordCleanupFailure(operation: string, detail: any)
@@ -174,32 +181,71 @@ local function countEntries(values: { [any]: any }): number
 	return count
 end
 
-local function expireSession(values: { [any]: any }, key: any, session: { [any]: any }): boolean
+local function nativeWorkPending(session): boolean
+	return session.pendingNativeRootWrite ~= nil
+		or (session.nativeServiceImport ~= nil and not session.nativeServiceImport.readerFinished)
+		or (session.nativeHeld ~= nil and session.nativeHeld.readerArmed and not session.nativeHeld.readerFinished)
+end
+
+local function expireOwnedSession(values: { [any]: any }, key: any, session: { [any]: any }): boolean
 	if values[key] ~= session then
 		return false
 	end
-	if (session.activeOperations or 0) > 0 then
+	if session.expiring or (session.activeOperations or 0) > 0 or nativeWorkPending(session) then
 		return false
 	end
-	local onExpire = session.onExpire
-	if type(onExpire) == "function" then
-		local okExpire, expireError = pcall(onExpire)
-		if not okExpire then
-			session.rollbackFailed = tostring(expireError)
-			session.updatedAt = os.clock()
-			recordCleanupFailure("session expiry", expireError)
-			return false
+	-- Only failures of attempts begun after 120 idle seconds count toward
+	-- release. Direct rollback/cancellation failures never consume this budget.
+	local idleAttempt = os.clock() - session.updatedAt >= SESSION_TTL_SECONDS
+	session.expiring = true
+	session.activeOperations = (session.activeOperations or 0) + 1
+	local okExpire, expireError = pcall(function()
+		if session.onExpire then
+			session.onExpire()
 		end
+	end)
+	if values[key] == session and not okExpire then
+		session.rollbackFailed = tostring(expireError)
+		session.updatedAt = os.clock()
+		recordCleanupFailure("session expiry", expireError)
+		if idleAttempt then
+			session.idleRollbackFailures = (session.idleRollbackFailures or 0) + 1
+		end
+		if (session.idleRollbackFailures or 0) >= 2 and session.retainRecovery then
+			local retained, retainError = pcall(session.retainRecovery)
+			if not retained then
+				recordCleanupFailure("transaction recovery transfer", retainError)
+			end
+		end
+	elseif values[key] == session and okExpire then
+		session.rollbackFailed = nil
+		session.onExpire = nil
+		values[key] = nil
 	end
-	session.rollbackFailed = nil
-	session.onExpire = nil
-	values[key] = nil
-	return true
+	session.activeOperations -= 1
+	session.expiring = nil
+	return values[key] ~= session
+end
+
+local function expireSession(values, key, session): boolean
+	if session.retireInvalidated and session.retireInvalidated() then return true end
+	if not session.withOwnership then return expireOwnedSession(values, key, session) end
+	local ok, result = pcall(session.withOwnership, function()
+		return expireOwnedSession(values, key, session)
+	end)
+	if not ok then
+		recordCleanupFailure("session ownership", result)
+		return false
+	end
+	return result
 end
 
 local armSessionExpiry
 
 local function beginSessionOperation(session: { [any]: any })
+	if session.expiring then
+		error("Editor transaction recovery is in progress")
+	end
 	session.activeOperations = (session.activeOperations or 0) + 1
 	session.updatedAt = os.clock()
 end
@@ -210,8 +256,15 @@ local function endSessionOperation(values: { [any]: any }, key: any, session: { 
 	if session.activeOperations == 0 and values[key] == session then
 		if session.expireRequested then
 			session.expireRequested = nil
-			if not expireSession(values, key, session) then
-				armSessionExpiry(values, key, session)
+			local function expireRequested()
+				if not expireSession(values, key, session) then
+					armSessionExpiry(values, key, session)
+				end
+			end
+			if session.scheduleExpiry then
+				session.scheduleExpiry(expireRequested)
+			else
+				expireRequested()
 			end
 		else
 			armSessionExpiry(values, key, session)
@@ -242,7 +295,7 @@ end
 local function pruneExpiredSessions(values: { [any]: any })
 	local now = os.clock()
 	for key, session in pairs(values) do
-		if now - session.updatedAt > SESSION_TTL_SECONDS then
+		if now - session.updatedAt >= SESSION_TTL_SECONDS then
 			expireSession(values, key, session)
 		end
 	end
@@ -288,7 +341,22 @@ armSessionExpiry = function(values: { [any]: any }, key: any, session: { [any]: 
 			return
 		end
 		session.expiryArmed = nil
-		expireSession(values, key, session)
+		local function expireIdle()
+			-- The exclusive queue may have waited behind a request that renewed
+			-- the lease. Recheck the idle deadline after acquiring the gate.
+			if values[key] ~= session then return end
+			if os.clock() - session.updatedAt >= SESSION_TTL_SECONDS then
+				expireSession(values, key, session)
+			end
+			if values[key] == session and not nativeWorkPending(session) then
+				armSessionExpiry(values, key, session)
+			end
+		end
+		if session.scheduleExpiry then
+			session.scheduleExpiry(expireIdle)
+		else
+			expireIdle()
+		end
 	end
 	task.delay(SESSION_TTL_SECONDS, expireWhenIdle)
 end
@@ -355,6 +423,9 @@ local function markLiveMutation(ctx: { [string]: any }?, instance: Instance?)
 end
 
 local function setParentForSync(instance: Instance, parent: Instance?, ctx: { [string]: any }?, serializedInsertion: boolean?)
+	if ctx and ctx.assertSessionOwnership then
+		ctx.assertSessionOwnership()
+	end
 	if instance.Parent == parent then
 		return
 	end
@@ -1430,6 +1501,9 @@ local function writePropertyForSync(
 	value: any,
 	ctx: { [string]: any }?
 ): (boolean, any)
+	if ctx and ctx.assertSessionOwnership then
+		ctx.assertSessionOwnership()
+	end
 	if instance:IsA("PackageLink") then
 		return false, "PackageLink properties are read-only"
 	end
@@ -1499,6 +1573,9 @@ local function setAttributeForSync(
 	value: any,
 	ctx: { [string]: any }?
 ): (boolean, any)
+	if ctx and ctx.assertSessionOwnership then
+		ctx.assertSessionOwnership()
+	end
 	if instance:IsA("PackageLink") then
 		return false, "PackageLink attributes are read-only"
 	end
@@ -1560,12 +1637,25 @@ local function cookMeshPart(instance: MeshPart, ctx): (boolean, any)
 	if not ok then
 		return false, donor
 	end
-	local okApply, err = restoreMeshGeometry(instance, donor, ctx)
+	-- Studio ownership can change while the asset service yields; a donor
+	-- built under a revoked owner is discarded, never applied.
+	local result = table.pack(pcall(function()
+		if ctx.assertSessionOwnership then
+			ctx.assertSessionOwnership()
+		end
+		return restoreMeshGeometry(instance, donor, ctx)
+	end))
 	donor:Destroy()
-	return okApply, err
+	if not result[1] then
+		error(result[2], 0)
+	end
+	return table.unpack(result, 2, result.n)
 end
 
 local function setTagForSync(instance: Instance, tag: string, added: boolean, ctx: { [string]: any })
+	if ctx.assertSessionOwnership then
+		ctx.assertSessionOwnership()
+	end
 	if instance:IsA("PackageLink") then
 		error("PackageLink tags are read-only")
 	end
@@ -3865,11 +3955,14 @@ function TransactionState.restoreSnapshotState(
 		end
 		setCurrentCameraForSync(replacements[snapshot.currentCamera] or snapshot.currentCamera, ctx)
 	end
-	ScriptDocumentState.apply(snapshot.scriptDocuments or {}, nil, nil, replacements)
+	ScriptDocumentState.apply(snapshot.scriptDocuments or {}, nil, nil, replacements, nil, nil, ctx)
 	ReferenceOverlay.apply(snapshot.referenceOverlay or {}, replacements, ctx)
 end
 
 function TransactionState.destroyOwned(instance: Instance, ctx: { [string]: any })
+	if ctx.assertSessionOwnership then
+		ctx.assertSessionOwnership()
+	end
 	local tokens = { ctx.expectParentChange(instance, nil) }
 	-- Destroy also unparents every child. Those inverse writes belong to the
 	-- transaction; they must not be replayed onto the restored originals.
@@ -3894,6 +3987,13 @@ function TransactionState.restoreSnapshot(
 	local roots = if snapshot.payload ~= nil
 		then SerializationService:DeserializeInstancesAsync(snapshot.payload)
 		else {}
+	snapshot.recoveryRoots = snapshot.recoveryRoots or {}
+	for _, root in ipairs(roots) do
+		snapshot.recoveryRoots[root] = true
+	end
+	if ctx.assertSessionOwnership then
+		ctx.assertSessionOwnership()
+	end
 	if #roots ~= snapshot.rootCount then
 		error("Editor rollback snapshot returned an unexpected root count")
 	end
@@ -3926,7 +4026,8 @@ function TransactionState.restoreSnapshot(
 	local removed = BridgeInstanceSwap.replaceChildren(snapshot.groups, incomingByGroup, function(instance, parent)
 		setParentForSync(instance, parent, ctx)
 	end)
-	local replacements = {}
+	local replacements = snapshot.recoveryReplacements or {}
+	snapshot.recoveryReplacements = replacements
 	for key, original in pairs(snapshot.originalByPath) do
 		local separator = string.find(key, PATH_SEPARATOR .. "ord" .. PATH_SEPARATOR, 1, true)
 		local pathText = if separator ~= nil then string.sub(key, 1, separator - 1) else key
@@ -3940,6 +4041,10 @@ function TransactionState.restoreSnapshot(
 		end
 		local replacement = resolvePathSegments(pathSegments, nil, pathOrdinals)
 		if replacement ~= nil then
+			local previous = replacements[original]
+			if previous ~= nil and previous ~= replacement then
+				replacements[previous] = replacement
+			end
 			replacements[original] = replacement
 		end
 	end
@@ -4018,6 +4123,16 @@ local function resolveReplacement(instance: Instance?, replacements: { [Instance
 end
 
 function TransactionState.appendJournalRecords(session: { [string]: any }, records: { any })
+	-- Retain drained records before resolving identities: a failed path read must
+	-- not drop outside edits whose observer has already handed them to us.
+	local journal = session.changeJournal
+	if journal == nil then
+		journal = {}
+		session.changeJournal = journal
+	end
+	if #records > 0 then
+		table.move(records, 1, #records, #journal + 1, journal)
+	end
 	for _, record in ipairs(records) do
 		local instance = resolveReplacement(record.instance, session.instanceReplacements) or record.instance
 		record.currentInstance = instance
@@ -4031,14 +4146,6 @@ function TransactionState.appendJournalRecords(session: { [string]: any }, recor
 				record.tags = tags
 			end
 		end
-	end
-	local journal = session.changeJournal
-	if journal == nil then
-		journal = {}
-		session.changeJournal = journal
-	end
-	if #records > 0 then
-		table.move(records, 1, #records, #journal + 1, journal)
 	end
 end
 
@@ -4140,13 +4247,8 @@ function TransactionState.resolveJournalParent(record: { [string]: any }, replac
 		return parent
 	end
 	local pathSegments = record.parentPathSegments
-	local pathOrdinals = record.parentPathOrdinals
-	if type(pathSegments) == "table" and #pathSegments > 0 then
-		local resolved = resolvePathSegments(pathSegments, nil, pathOrdinals)
-		if resolved ~= nil then
-			return resolved
-		end
-	end
+	-- A path can now name a different object. Only the original identity or a
+	-- replacement proven by this rollback is an acceptable parent.
 	-- Substituting a surviving ancestor flattens orphaned descendants into the
 	-- service root. Keep recovery pending instead of silently changing hierarchy.
 	local path = if type(pathSegments) == "table" then table.concat(pathSegments, ".") else record.parent.Name
@@ -4175,11 +4277,7 @@ function TransactionState.replayJournalPlacement(
 	end
 	local okParent, parent = pcall(TransactionState.resolveJournalParent, record, replacements)
 	if not okParent then
-		-- An edit recorded inside a tree that the rollback itself removed has
-		-- nothing left to preserve; only a surviving object keeps recovery pending.
-		if instance.Parent == nil and not instance:IsDescendantOf(game) then
-			return false
-		end
+		-- Detached roots may be the only surviving copy of an outside edit.
 		error(parent, 0)
 	end
 	if (record.structural or (instance.Parent == nil and parent ~= nil)) and instance.Parent ~= parent then
@@ -4205,7 +4303,8 @@ function TransactionState.replayJournalProperty(
 	instance: Instance,
 	propertyName: string,
 	value: any,
-	ctx: { [string]: any }
+	ctx: { [string]: any },
+	beforeWrite: (() -> ())?
 )
 	local sourceProperty = propertyName == "Source" and instance:IsA("LuaSourceContainer")
 	local okCurrent, current
@@ -4219,7 +4318,7 @@ function TransactionState.replayJournalProperty(
 	end
 	local okWrite, writeError
 	if sourceProperty then
-		okWrite, writeError = setSource(instance, value, ctx)
+		okWrite, writeError = setSource(instance, value, ctx, beforeWrite)
 	else
 		okWrite, writeError = writePropertyForSync(instance, propertyName, value, ctx)
 	end
@@ -4231,9 +4330,13 @@ end
 function TransactionState.replayJournalAttributes(
 	instance: Instance,
 	attributes: { [string]: any },
-	ctx: { [string]: any }
+	ctx: { [string]: any },
+	progress: any?
 )
 	for attributeName, entry in pairs(attributes) do
+		if progress then
+			progress.check()
+		end
 		if entry.captured and not exactValuesEqual(instance:GetAttribute(attributeName), entry.value) then
 			local okWrite, writeError = setAttributeForSync(instance, attributeName, entry.value, ctx)
 			if not okWrite then
@@ -4242,29 +4345,46 @@ function TransactionState.replayJournalAttributes(
 				)
 			end
 		end
+		if progress and entry.captured then
+			progress.guard.attributes[attributeName] = entry.value
+		end
 	end
 end
 
-function TransactionState.replayJournalTags(instance: Instance, tags: { string }, ctx: { [string]: any })
+function TransactionState.replayJournalTags(instance: Instance, tags: { string }, ctx: { [string]: any }, progress: any?)
 	local desired = {}
 	for _, tag in ipairs(tags) do
 		desired[tag] = true
 	end
 	for _, tag in ipairs(CollectionService:GetTags(instance)) do
 		if not desired[tag] then
+			if progress then
+				progress.check()
+			end
 			setTagForSync(instance, tag, false, ctx)
+			if progress then
+				table.remove(progress.guard.tags, table.find(progress.guard.tags, tag))
+			end
 		end
 		desired[tag] = nil
 	end
 	for tag in pairs(desired) do
+		if progress then
+			progress.check()
+		end
 		setTagForSync(instance, tag, true, ctx)
+		if progress then
+			table.insert(progress.guard.tags, tag)
+			table.sort(progress.guard.tags)
+		end
 	end
 end
 
 function TransactionState.replayJournalValues(
 	record: { [string]: any },
 	replacements: { [Instance]: Instance },
-	ctx: { [string]: any }
+	ctx: { [string]: any },
+	progress: any?
 )
 	local instance = resolveReplacement(record.currentInstance, replacements)
 	if instance == nil or (instance.Parent == nil and instance ~= game:GetService(record.service)) then
@@ -4272,12 +4392,30 @@ function TransactionState.replayJournalValues(
 	end
 	for propertyName, entry in pairs(record.properties) do
 		if entry.captured then
+			if progress then
+				progress.check()
+			end
+			ctx.assertSessionOwnership()
 			TransactionState.replayJournalProperty(
 				instance,
 				propertyName,
 				TransactionState.remapJournalValue(entry.value, replacements),
-				ctx
+				ctx,
+				if progress then progress.check else nil
 			)
+			if progress then
+				local ok, value
+				if propertyName == "Source" and instance:IsA("LuaSourceContainer") then
+					ok, value = readScriptSource(instance)
+				else
+					ok, value = readProperty(instance, propertyName)
+				end
+				if not ok or not propertyValuesEqual(instance, propertyName, value,
+					TransactionState.remapJournalValue(entry.value, replacements)) then
+					error("Recovery property readback did not match its write")
+				end
+				progress.guard.properties[propertyName] = { value = value }
+			end
 		end
 	end
 	if record.attributesSnapshot ~= nil then
@@ -4288,11 +4426,16 @@ function TransactionState.replayJournalValues(
 		for name, value in pairs(record.attributesSnapshot) do
 			snapshot[name] = { captured = true, value = value }
 		end
-		TransactionState.replayJournalAttributes(instance, snapshot, ctx)
+		-- The journal's individual edits supersede its earlier whole snapshot.
+		for name, entry in pairs(record.attributes) do
+			snapshot[name] = entry
+		end
+		TransactionState.replayJournalAttributes(instance, snapshot, ctx, progress)
+	else
+		TransactionState.replayJournalAttributes(instance, record.attributes, ctx, progress)
 	end
-	TransactionState.replayJournalAttributes(instance, record.attributes, ctx)
 	if record.tags ~= nil then
-		TransactionState.replayJournalTags(instance, record.tags, ctx)
+		TransactionState.replayJournalTags(instance, record.tags, ctx, progress)
 	end
 end
 
@@ -4319,7 +4462,8 @@ function TransactionState.rollback(
 	beforeReplace: (() -> ())?
 ): { [Instance]: Instance }
 	local incoming = {}
-	local replacements = {}
+	local replacements = session.rollbackReplacements or {}
+	session.rollbackReplacements = replacements
 	if session.nativeUndo ~= nil then
 		for original, replacement in pairs(session.nativeUndo.replacements) do
 			replacements[replacement] = original
@@ -4380,6 +4524,10 @@ function TransactionState.expectSnapshotUndo(snapshot: { [string]: any }, ctx: {
 end
 
 function TransactionState.rollbackSession(session: { [string]: any }, ctx: { [string]: any }): { [Instance]: Instance }
+	ctx.assertSessionOwnership(session.ownershipGeneration)
+	if session.commitFence then
+		error("Committed transaction cannot enter structural rollback")
+	end
 	if session.nativeServiceImport ~= nil and not session.nativeServiceImport.readerFinished then
 		error("Studio has not returned the native insertion result; old contents are still retained")
 	end
@@ -4423,23 +4571,30 @@ function TransactionState.rollbackSession(session: { [string]: any }, ctx: { [st
 			session.changeJournal = nil
 			if session.nativeUndo ~= nil then
 				local incoming = ReferenceOverlay.rollbackNative(session.nativeUndo, ctx)
-				session.nativeUndo = nil
 				for _, instance in ipairs(incoming) do
 					if instance.Parent == nil then
 						TransactionState.destroyOwned(instance, ctx)
 					end
 				end
+				session.nativeUndo = nil
 			end
 			return {}
 		end
+		ctx.assertSessionOwnership(session.ownershipGeneration)
 		local function preservePendingJournalChanges()
 			local records = TransactionState.drainJournal(session, ctx)
 			TransactionState.prepareJournalRollback(session, records, ctx)
 		end
 		local replacements = TransactionState.rollback(session, ctx, preservePendingJournalChanges)
+		ctx.assertSessionOwnership(session.ownershipGeneration)
+		-- A replay failure must not lose identities already restored by rollback.
+		session.rollbackReplacements = replacements
 		local records = TransactionState.finishJournal(session, ctx)
 		TransactionState.replayJournal(records, replacements, ctx)
 		if session.nativeUndo and session.nativeUndo.retainedParent then
+			if #session.nativeUndo.retainedParent:GetChildren() > 0 then
+				error("Rollback still owns roots in its holding folder")
+			end
 			session.nativeUndo.retainedParent:Destroy()
 			session.nativeUndo.retainedParent = nil
 		end
@@ -4453,6 +4608,7 @@ function TransactionState.rollbackSession(session: { [string]: any }, ctx: { [st
 			local firstError
 			for _ = 1, 4 do
 				RunService.Heartbeat:Wait()
+				ctx.assertSessionOwnership(session.ownershipGeneration)
 				local stable = true
 				for _, group in ipairs(session.nativeUndo.prepared) do
 					for _, instance in ipairs(group.outgoing) do
@@ -4501,12 +4657,264 @@ function TransactionState.rollbackSession(session: { [string]: any }, ctx: { [st
 	end
 	if not ok then
 		if session.journalActive then
-			pcall(ctx.finishStudioChangeJournal, session.transactionId)
-			session.journalActive = false
+			TransactionState.cleanupStep(session, "recovery journal finish", function()
+				TransactionState.finishJournal(session, ctx)
+			end)
 		end
 		error(result, 0)
 	end
 	return result
+end
+
+
+-- Retired transactions never run structural rollback again: it could undo a
+-- newer push. Only identity-owned roots and journal edits can be recovered.
+function TransactionState.cleanupStep(session, operation, callback): boolean
+	local ok, detail = pcall(function()
+		if session.assertOwnership then
+			session.assertOwnership()
+		end
+		callback()
+	end)
+	session.cleanupPending = session.cleanupPending or {}
+	session.cleanupPending[operation] = if ok then nil else callback
+	if not ok then
+		session.cleanupErrors = session.cleanupErrors or {}
+		local previous = session.cleanupErrors[operation]
+		session.cleanupErrors[operation] = {
+			error = tostring(detail), atUnix = os.time(),
+			attempts = if previous then previous.attempts + 1 else 1,
+		}
+		recordCleanupFailure(operation, detail)
+	end
+	return ok
+end
+
+function TransactionState.recoverySummary(session)
+	local holding = session.nativeUndo and session.nativeUndo.retainedParent
+	return {
+		transactionId = session.transactionId,
+		state = if session.recoveryStopped then "stopped" else "retained",
+		lifetime = "pluginSession",
+		pluginSessionId = session.pluginSessionId,
+		lossWarning = "Recovery data is retained only in this plugin session and can be lost on plugin reload or Studio close",
+		retentionSeconds = RECOVERY_RETENTION_SECONDS,
+		expiresAtUnix = session.recoveryExpiresAtUnix,
+		retryLimit = MAX_RECOVERY_ATTEMPTS,
+		retryStopped = session.recoveryStopped == true,
+		retirementReason = session.retirementReason,
+		ownershipGeneration = session.ownershipGeneration,
+		retiredUnderGeneration = session.retiredUnderGeneration,
+		attempts = session.recoveryAttempts or 0,
+		unreplayedEdits = #(session.changeJournal or {}),
+		detachedRoots = countEntries(session.preservedJournalRoots or {}),
+		retainedNativeRoots = if holding then #holding:GetChildren() else 0,
+		unresolvedNativeRoots = countEntries(session.pendingNativeRecovery or {}),
+		snapshotRetained = session.snapshot ~= nil,
+		replacementIdentities = countEntries(session.rollbackReplacements or {}),
+		holdingFolder = holding ~= nil,
+		historyPending = session.historyRecording ~= nil,
+		journalPending = session.journalActive == true,
+		expectationPending = session.expectationPending == true,
+		cleanupErrors = session.cleanupErrors or {},
+		pendingCleanup = countEntries(session.cleanupPending or {}),
+	}
+end
+
+function TransactionState.captureRecoveryGuard(record, replacements)
+	local instance = resolveReplacement(record.currentInstance, replacements)
+	if instance == nil then
+		error("Recovery edit has no original instance")
+	end
+	local guard = { instance = instance, parent = instance.Parent, properties = {} }
+	for name, entry in pairs(record.properties or {}) do
+		if entry.captured then
+			local ok, value
+			if name == "Source" and instance:IsA("LuaSourceContainer") then
+				ok, value = readScriptSource(instance)
+			else
+				ok, value = readProperty(instance, name)
+			end
+			if not ok then
+				error(`Cannot inspect retained edit property {name}: {value}`)
+			end
+			guard.properties[name] = { value = value }
+		end
+	end
+	if record.attributesSnapshot ~= nil or next(record.attributes or {}) ~= nil then
+		guard.attributes = instance:GetAttributes()
+	end
+	if record.tags ~= nil then
+		guard.tags = CollectionService:GetTags(instance)
+		table.sort(guard.tags)
+	end
+	return guard
+end
+
+function TransactionState.recoveryChildren(parent)
+	local children = {}
+	for _, child in ipairs(parent:GetChildren()) do
+		children[child] = child.Name
+	end
+	return children
+end
+
+function TransactionState.beginRecovery(session, ctx)
+	if session.recoveryInitialized then return end
+	session.recoveryExpiresAtUnix = os.time() + RECOVERY_RETENTION_SECONDS
+	session.pendingNativeRecovery = {}
+	session.recoveryGuards = {}
+	for _, record in ipairs(session.changeJournal or {}) do
+		session.recoveryGuards[record] = false
+		TransactionState.cleanupStep(session, "recovery guard " .. tostring(record.currentInstance), function()
+			session.recoveryGuards[record] = TransactionState.captureRecoveryGuard(record, session.rollbackReplacements or {})
+		end)
+	end
+	session.recoveryInitialized = true
+	local undo = session.nativeUndo
+	if not undo then return end
+	local targets = {}
+	local generations, exportGenerations, attributes = {}, {}, {}
+	for _, serviceName in ipairs(session.serviceNames) do
+		generations[serviceName] = ctx.studioChangeGeneration(serviceName)
+		exportGenerations[serviceName] = ctx.nativeExportGeneration(serviceName)
+		local observation = ctx.attributeObservation(serviceName)
+		attributes[serviceName] = if observation then { observation = observation, generation = observation.generation } else false
+	end
+	for _, groups in ipairs({undo.packageMerges or {}, undo.prepared or {}}) do
+		for _, group in ipairs(groups) do
+			local target = targets[group.target]
+			if not target then
+				target = { children = TransactionState.recoveryChildren(group.target),
+					generations = generations, exportGenerations = exportGenerations, attributes = attributes }
+				targets[group.target] = target
+			end
+			for _, root in ipairs(group.outgoing or {}) do
+				if root.Parent ~= group.target or not root:IsDescendantOf(game) then
+					session.pendingNativeRecovery[root] = { parent = group.target, target = target }
+				end
+			end
+		end
+	end
+end
+
+function TransactionState.recoverSession(session, ctx)
+	session.recoveryAttempts = (session.recoveryAttempts or 0) + 1
+	if session.finishUninvokedNative and not TransactionState.cleanupStep(session,
+		"uninvoked native observations", session.finishUninvokedNative) then return end
+	if session.journalActive then
+		TransactionState.cleanupStep(session, "recovery journal finish", function()
+			TransactionState.finishJournal(session, ctx)
+		end)
+	end
+	if session.historyRecording ~= nil then
+		TransactionState.cleanupStep(session, "recovery history finish", function()
+			-- Cancel may undo unrelated edits. Retire the recording without undo.
+			finishHistoryRecording(session.historyRecording)
+			session.historyRecording = nil
+		end)
+	end
+	local replacements = session.rollbackReplacements or {}
+	for original, restored in pairs(session.snapshot.recoveryReplacements or {}) do
+		replacements[original] = restored
+	end
+	local undo = session.nativeUndo
+	if undo then
+		for original, replacement in pairs(undo.replacements or {}) do
+			replacements[replacement] = replacements[original] or original
+		end
+		for root, pending in pairs(session.pendingNativeRecovery or {}) do
+			local recovered = TransactionState.cleanupStep(session, "recovery native root " .. tostring(root), function()
+				if root.Parent ~= nil and root.Parent ~= undo.retainedParent and root.Parent ~= pending.parent then
+					error("Retained root was moved outside recovery ownership")
+				end
+				local parent = resolveReplacement(pending.parent, replacements)
+				if parent ~= pending.parent or not parent:IsDescendantOf(game) then
+					error("Original native root parent is unavailable")
+				end
+				local children = TransactionState.recoveryChildren(parent)
+				if not exactValuesEqual(children, pending.target.children) then
+					error("Native recovery target has newer contents; retain both versions for reconciliation")
+				end
+				for serviceName, generation in pairs(pending.target.generations) do
+					local attributeGuard = pending.target.attributes[serviceName]
+					if ctx.studioChangeGeneration(serviceName) ~= generation
+						or ctx.nativeExportGeneration(serviceName) ~= pending.target.exportGenerations[serviceName]
+						or not attributeGuard or not attributeGuard.observation.active
+						or attributeGuard.observation.generation ~= attributeGuard.generation then
+						error("Native recovery target service changed; retain both versions for reconciliation")
+					end
+				end
+				setParentForSync(root, parent, ctx)
+				if root.Parent ~= parent then
+					error("Native recovery placement was not retained")
+				end
+				pending.target.children[root] = root.Name
+				-- Parenting does not yield. Advance the serialized-content counter for
+				-- this verified own insertion only; outside edits keep their old guard.
+				for serviceName, generation in pairs(pending.target.generations) do
+					local service = game:GetService(serviceName)
+					if (parent == service or parent:IsDescendantOf(service))
+						and ctx.studioChangeGeneration(serviceName) == generation
+						and exactValuesEqual(TransactionState.recoveryChildren(parent), pending.target.children) then
+						pending.target.exportGenerations[serviceName] = ctx.nativeExportGeneration(serviceName)
+					end
+				end
+			end)
+			if recovered then
+				session.pendingNativeRecovery[root] = nil
+			end
+		end
+	end
+	local remaining = {}
+	session.recoveryGuards = session.recoveryGuards or {}
+	for _, record in ipairs(session.changeJournal or {}) do
+		local recovered = TransactionState.cleanupStep(session, "recovery journal " .. tostring(record.currentInstance or record.instance), function()
+			if session.recoveryGuards[record] == false then
+				error("Initial recovery guard could not be captured; retain edit for reconciliation")
+			end
+			local current = TransactionState.captureRecoveryGuard(record, replacements)
+			local guard = session.recoveryGuards[record] or current
+			session.recoveryGuards[record] = guard
+			local function check()
+				session.assertOwnership()
+				if not exactValuesEqual(guard, TransactionState.captureRecoveryGuard(record, replacements)) then
+					error("Retained edit changed since recovery began; keep both versions for reconciliation")
+				end
+			end
+			check()
+			local parent = TransactionState.resolveJournalParent(record, replacements)
+			if parent ~= nil and not parent:IsDescendantOf(game) then
+				error("Original journal parent is outside the place")
+			end
+			if not TransactionState.replayJournalPlacement(record, replacements, ctx) then
+				error("Original journal instance is unavailable")
+			end
+			if current.instance.Parent ~= parent then
+				error("Recovery placement was not retained")
+			end
+			guard.parent = parent
+			TransactionState.replayJournalValues(record, replacements, ctx, { guard = guard, check = check })
+			check()
+		end)
+		if recovered then
+			session.recoveryGuards[record] = nil
+			if session.preservedJournalRoots then
+				session.preservedJournalRoots[record.currentInstance] = nil
+			end
+		else
+			remaining[#remaining + 1] = record
+		end
+	end
+	session.changeJournal = remaining
+	if undo and undo.retainedParent then
+		TransactionState.cleanupStep(session, "recovery holding folder", function()
+			if #undo.retainedParent:GetChildren() == 0 then
+				undo.retainedParent:Destroy()
+				undo.retainedParent = nil
+			end
+		end)
+	end
 end
 
 local NativeSerialization = {}
@@ -4955,6 +5363,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 	end
 	api.stats = ctx.stats
 	ctx.stats.cleanupFailures = cleanupFailures
+	ctx.stats.transactionRecoveries = {}
 
 	local function beginTrackedOperation(kind: string)
 		local now = os.clock()
@@ -5058,6 +5467,13 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 	end
 
 	local function transactionOutcomeOrNotFound(transactionId: string): { [string]: any }
+		local recovery = transactionRecoveries[transactionId]
+		if recovery ~= nil then
+			local outcome = table.clone(recovery.outcome)
+			outcome.recovery = TransactionState.recoverySummary(recovery.session)
+			return outcome
+		end
+		if recoveryDiagnostics[transactionId] then return recoveryDiagnostics[transactionId] end
 		local outcome = transactionOutcomes.get(transactionId)
 		if outcome ~= nil then
 			return outcome
@@ -5069,10 +5485,19 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			state = "notFound",
 			committed = false,
 			rolledBack = false,
+			pluginSessionId = ctx.runtimeId,
+			recoveryDataMayBeLost = true,
 		}
 	end
 
-	local function assertTransactionLease(session: { [string]: any })
+	local function assertTransactionLease(session: { [string]: any }, allowFailed: boolean?)
+		session.assertOwnership()
+		if session.expiring then
+			error("Editor transaction recovery is in progress")
+		end
+		if session.rollbackFailed ~= nil and not allowFailed then
+			error("Editor transaction has a failed rollback retained for recovery")
+		end
 		local leaseId = currentRequestLeaseId()
 		if session.leaseId ~= nil and session.leaseId ~= leaseId then
 			error("Editor transaction belongs to another request lease")
@@ -5081,13 +5506,355 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 	end
 
 	local function recordTransactionOutcome(
-		transactionId: string,
+		session,
 		state: string,
 		response: { [string]: any }
 	): { [string]: any }
-		local outcome = transactionOutcomes.record(transactionId, state, response)
-		ctx.finishEditorTransactionExpectation(transactionId)
+		local transactionId = session.transactionId
+		-- Publishing is irreversible. An older yielding cleanup cannot replace it.
+		local outcome = transactionOutcomes.get(transactionId)
+		if outcome == nil then
+			outcome = transactionOutcomes.record(transactionId, state, response)
+		end
+		local recovery = transactionRecoveries[transactionId]
+		if recovery then
+			recovery.outcome = outcome
+		end
+		-- Retain the retry callback and pending result until the cache accepts
+		-- publication. Release the active lock before expectation cleanup yields.
+		session.onExpire = nil
+		editorTransactions[transactionId] = nil
+		session.pendingTerminal = nil
+		local ok, detail = pcall(ctx.finishEditorTransactionExpectation, transactionId)
+		if not ok then
+			recordCleanupFailure("transaction expectation finish", detail)
+			outcome.cleanupError = tostring(detail)
+			if recovery then
+				recovery.session.expectationPending = true
+				recovery.session.cleanupErrors["transaction expectation finish"] = {
+					error = tostring(detail), atUnix = os.time(), attempts = 1,
+				}
+			end
+		end
 		return outcome
+	end
+
+	local retireInvalidatedTransaction
+	local function scheduleTransactionExpiry(session, callback)
+		-- Callers may already own the exclusive gate (prune/end operation).
+		-- Queue outside that stack rather than waiting on our own gate.
+		task.defer(function()
+			local ok, detail = pcall(ctx.afterBridgeExclusiveIdle, function()
+				local recovery = transactionRecoveries[session.transactionId]
+				if editorTransactions[session.transactionId] ~= session and (not recovery or recovery.session ~= session) then return end
+				if retireInvalidatedTransaction(session) then return end
+				return session.withOwnership(callback)
+			end)
+			if not ok then
+				recordCleanupFailure("background transaction ownership", detail)
+				-- A timer may run between release and reacquire. Keep a local
+				-- retirement opportunity without rebinding the old scene work.
+				if editorTransactions[session.transactionId] == session and (not nativeWorkPending(session)
+					or session.nativeServiceImport and not session.nativeServiceImport.invocationAuthorized) then
+					armSessionExpiry(editorTransactions, session.transactionId, session)
+				end
+			end
+		end)
+	end
+
+	local function expireRecoveryData(transactionId, recovery)
+		if transactionRecoveries[transactionId] ~= recovery then return end
+		local session = recovery.session
+		if (session.activeOperations or 0) > 0 or nativeWorkPending(session) then return end
+		for _, import in pairs(binaryImports) do
+			if import.transaction == session and ((import.activeOperations or 0) > 0 or nativeWorkPending(import)) then
+				return
+			end
+		end
+		-- This only drops local recovery ownership. Never destroy or reparent
+		-- retained instances when the retention limit or Studio ownership ends.
+		local summary = TransactionState.recoverySummary(recovery.session)
+		summary.finalCleanupErrors = {}
+		-- These release local observers/expectations only, never scene contents;
+		-- they remain safe when the captured Studio generation was revoked.
+		for operation, callback in pairs({
+			journal = ctx.expireStudioChangeJournal,
+			expectation = ctx.finishEditorTransactionExpectation,
+		}) do
+			local ok, detail = pcall(callback, transactionId)
+			if not ok then
+				summary.finalCleanupErrors[operation] = tostring(detail)
+			end
+		end
+		for importId, import in pairs(binaryImports) do
+			if import.transaction == session and binaryImports[importId] == import then
+				binaryImports[importId] = nil
+				-- Timers may still hold this import table. Relinquish payloads,
+				-- native graphs and transaction-bound callbacks immediately.
+				table.clear(import)
+			end
+		end
+		summary.state = "expired"
+		summary.recoveryDataMayBeLost = true
+		summary.snapshotRetained = false
+		local outcome = table.clone(recovery.outcome)
+		outcome.recovery = summary
+		recoveryDiagnostics[transactionId] = outcome
+		transactionRecoveries[transactionId] = nil
+		ctx.stats.transactionRecoveries[transactionId] = nil
+		-- A delayed callback may still own the session table after waiting for
+		-- the gate. Leave only scalar diagnostics, not its snapshot or closures.
+		for key, value in pairs(session) do
+			if type(value) ~= "string" and type(value) ~= "number" and type(value) ~= "boolean" then
+				session[key] = nil
+			end
+		end
+		recordCleanupFailure("recovery retention expired", `Transaction {transactionId}: {summary.unreplayedEdits} edits, {summary.unresolvedNativeRoots} native roots, {summary.detachedRoots} detached roots unresolved; recovery data released after 30 minutes`)
+		local ids = {}
+		for id, diagnostic in pairs(recoveryDiagnostics) do
+			table.insert(ids, { id = id, at = diagnostic.recovery.expiresAtUnix })
+		end
+		table.sort(ids, function(a, b)
+			return a.at < b.at
+		end)
+		for index = 1, math.max(0, #ids - 64) do
+			recoveryDiagnostics[ids[index].id] = nil
+		end
+	end
+
+	local function retryTransactionRecovery(transactionId, recovery)
+		if transactionRecoveries[transactionId] ~= recovery then return end
+		local session = recovery.session
+		session.assertOwnership()
+		if session.recoveryStopped then return end
+		session.recoveryTicks = (session.recoveryTicks or 0) + 1
+		if next(editorTransactions) == nil then
+			if recovery.outcome.state == "abandoned" then
+				TransactionState.cleanupStep(session, "transaction recovery", function()
+					runWithStudioChangeSuppression(ctx, function()
+						TransactionState.recoverSession(session, ctx)
+					end)
+				end)
+			else
+				for operation, callback in pairs(table.clone(session.cleanupPending or {})) do
+					TransactionState.cleanupStep(session, operation, callback)
+				end
+			end
+			if session.expectationPending then
+				TransactionState.cleanupStep(session, "recovery expectation finish", function()
+					ctx.finishEditorTransactionExpectation(transactionId)
+					session.expectationPending = nil
+				end)
+			end
+			for _, serviceName in ipairs(session.serviceNames) do
+				TransactionState.cleanupStep(session, "recovery invalidate " .. serviceName, function()
+					invalidateEditorService(serviceName)
+				end)
+			end
+			for importId, import in pairs(binaryImports) do
+				if import.transactionId == transactionId then
+					TransactionState.cleanupStep(session, "recovery import " .. importId, function()
+						if not expireSession(binaryImports, importId, import) then
+							error("Import resource remains retained")
+						end
+					end)
+				end
+			end
+			ctx.stats.transactionRecoveries[transactionId] = TransactionState.recoverySummary(session)
+		end
+		if recovery.outcome.state ~= "abandoned" and next(session.cleanupPending or {}) == nil and not session.expectationPending then
+			transactionRecoveries[transactionId] = nil
+			ctx.stats.transactionRecoveries[transactionId] = nil
+			return
+		end
+		if session.recoveryTicks >= MAX_RECOVERY_ATTEMPTS then
+			session.recoveryStopped = true
+			ctx.stats.transactionRecoveries[transactionId] = TransactionState.recoverySummary(session)
+			recordCleanupFailure("recovery retry limit", `Transaction {transactionId}: automatic recovery stopped after {MAX_RECOVERY_ATTEMPTS} attempts; session-only recovery data expires after 30 minutes`)
+			return
+		end
+		task.delay(SESSION_TTL_SECONDS, function()
+			scheduleTransactionExpiry(session, function()
+				retryTransactionRecovery(transactionId, recovery)
+			end)
+		end)
+	end
+
+	local function publishTerminalTransaction(session, state, response)
+		local transactionId = session.transactionId
+		local retentionToken = {}
+		local recovery = { session = session, retentionToken = retentionToken }
+		transactionRecoveries[transactionId] = recovery
+		session.recoveryExpiresAtUnix = session.recoveryExpiresAtUnix or os.time() + RECOVERY_RETENTION_SECONDS
+		-- Arm retention before any yielding publication/cleanup. Capture only
+		-- the id/token, so successful cleanup releases the large session immediately.
+		task.delay(RECOVERY_RETENTION_SECONDS, function()
+			ctx.afterBridgeExclusiveIdle(function()
+				local retained = transactionRecoveries[transactionId]
+				if retained and retained.retentionToken == retentionToken then
+					expireRecoveryData(transactionId, retained)
+				end
+			end)
+		end)
+		session.cleanupErrors = session.cleanupErrors or {}
+		response.cleanupErrors = session.cleanupErrors
+		recovery.outcome = recordTransactionOutcome(session, state, response)
+		return recovery
+	end
+
+	local function finishTerminalTransaction(session, state, response)
+		local transactionId = session.transactionId
+		if editorTransactions[transactionId] ~= session then return transactionOutcomeOrNotFound(transactionId) end
+		-- The first completed result wins, including when error handling tries
+		-- publication a second time after the commit boundary.
+		session.pendingTerminal = session.pendingTerminal or { state = state, response = response }
+		state, response = session.pendingTerminal.state, session.pendingTerminal.response
+		ctx.assertSessionOwnership(session.ownershipGeneration)
+		if state == "abandoned" then
+			TransactionState.beginRecovery(session, ctx)
+		end
+		local recovery = publishTerminalTransaction(session, state, response)
+		-- Publish before cleanup; keep failed resources reachable until released.
+		if state == "committed" and session.nativeUndo then
+			local undo = session.nativeUndo
+			local function retireRoot(instance, operation)
+				TransactionState.cleanupStep(session, operation, function()
+					if instance.Parent ~= nil and instance.Parent ~= undo.retainedParent then
+						error("Committed staging root moved outside cleanup ownership")
+					end
+					-- Detached staging trees have no active transaction journal.
+					-- Preserve the original constant-work destruction path.
+					instance:Destroy()
+				end)
+			end
+			for groupIndex, groups in ipairs({undo.packageMerges or {}, undo.prepared or {}}) do
+				for index, group in ipairs(groups) do
+					for rootIndex, instance in ipairs(group.outgoing) do
+						retireRoot(instance, `committed root {groupIndex}/{index}/{rootIndex}`)
+					end
+				end
+			end
+			for index, instance in ipairs(undo.retainedDuplicates or {}) do
+				retireRoot(instance, `committed duplicate {index}`)
+			end
+			if undo.retainedParent then
+				TransactionState.cleanupStep(session, "committed holding folder", function()
+					if #undo.retainedParent:GetChildren() > 0 then
+						error("Holding folder still owns retained roots")
+					end
+					undo.retainedParent:Destroy()
+					undo.retainedParent = nil
+				end)
+			end
+		end
+		for importId, import in pairs(binaryImports) do
+			if import.transactionId == transactionId then
+				TransactionState.cleanupStep(session, "recovery import " .. importId, function()
+					if not expireSession(binaryImports, importId, import) then
+						error("Import resource remains retained")
+					end
+				end)
+			end
+		end
+		for _, serviceName in ipairs(session.serviceNames) do
+			TransactionState.cleanupStep(session, "recovery invalidate " .. serviceName, function()
+				invalidateEditorService(serviceName)
+			end)
+		end
+		recovery.outcome.cleanupErrors = session.cleanupErrors
+		if state == "abandoned" then
+			local ok, detail = pcall(retryTransactionRecovery, transactionId, recovery)
+			if not ok then
+				recordCleanupFailure("transaction recovery ownership", detail)
+			end
+		elseif next(session.cleanupPending or {}) ~= nil or session.expectationPending then
+			ctx.stats.transactionRecoveries[transactionId] = TransactionState.recoverySummary(session)
+			task.delay(SESSION_TTL_SECONDS, function()
+				scheduleTransactionExpiry(session, function()
+					retryTransactionRecovery(transactionId, recovery)
+				end)
+			end)
+		else
+			transactionRecoveries[transactionId] = nil
+		end
+		if transactionRecoveries[transactionId] == recovery then
+			recovery.outcome.recovery = TransactionState.recoverySummary(session)
+		end
+		return recovery.outcome
+	end
+
+	local function resumeTerminalTransaction(session)
+		local pending = session.pendingTerminal
+		return finishTerminalTransaction(session, if pending then pending.state else "committed",
+			if pending then pending.response else { commitWarning = "Commit completed before terminal publication" })
+	end
+
+	local function retainTransactionRecovery(transactionId, session)
+		if editorTransactions[transactionId] ~= session then return end
+		if session.pendingTerminal or session.commitFence then return resumeTerminalTransaction(session) end
+		finishTerminalTransaction(session, "abandoned", {
+			rollbackError = session.rollbackFailed, idleRollbackFailures = session.idleRollbackFailures,
+		})
+	end
+
+	retireInvalidatedTransaction = function(session)
+		local transactionId = session.transactionId
+		if editorTransactions[transactionId] ~= session then return false end
+		local generation = ctx.currentSessionOwnership()
+		if generation == nil or generation == session.ownershipGeneration then return false end
+		-- The new owner can relinquish local bookkeeping, never replay the old
+		-- generation's rollback, history or retained scene cleanup.
+		return ctx.withSessionOwnership(generation, function()
+			local native = session.nativeServiceImport
+			local import = if native then binaryImports[native.importId] else nil
+			if not session.expiring and native and native.operationFence and not native.invocationAuthorized
+				and session.activeOperations == 1 and import and import.transaction == session and import.activeOperations == 1 then
+				-- The revoked generation can never grant invoke permission. Only
+				-- these two preparation fences are held; no native write can run.
+				native.readerFinished = true
+				native.operationFence = nil
+				session.activeOperations -= 1
+				import.activeOperations -= 1
+			end
+			if session.expiring or (session.activeOperations or 0) > 0 or nativeWorkPending(session) then
+				session.invalidatedGeneration = generation
+				return false
+			end
+			for _, retainedImport in pairs(binaryImports) do
+				if retainedImport.transaction == session and ((retainedImport.activeOperations or 0) > 0 or nativeWorkPending(retainedImport)) then
+					return false
+				end
+			end
+			if session.journalActive then
+				local records = ctx.retireStudioChangeJournal(transactionId)
+				session.changeJournal = session.changeJournal or {}
+				table.move(records, 1, #records, #session.changeJournal + 1, session.changeJournal)
+				session.journalActive = false
+			end
+			session.recoveryStopped = true
+			session.retiredUnderGeneration = generation
+			session.retirementReason = `Studio ownership changed from generation {session.ownershipGeneration} to {generation}; old rollback and cleanup will not be replayed. Unresolved contents are retained only in this plugin session until the recovery deadline`
+			local pending = session.pendingTerminal
+			local state = if pending then pending.state elseif session.commitFence then "committed" else "abandoned"
+			if state == "abandoned" and session.nativeUndo then
+				session.pendingNativeRecovery = {}
+				for _, groups in ipairs({ session.nativeUndo.packageMerges or {}, session.nativeUndo.prepared or {} }) do
+					for _, group in ipairs(groups) do
+						for _, root in ipairs(group.outgoing or {}) do
+							if root.Parent ~= group.target then
+								session.pendingNativeRecovery[root] = { parent = group.target }
+							end
+						end
+					end
+				end
+			end
+			local response = if pending then pending.response else { rollbackError = session.rollbackFailed }
+			response.retirementReason = session.retirementReason
+			local recovery = publishTerminalTransaction(session, state, response)
+			recovery.outcome.recovery = TransactionState.recoverySummary(session)
+			ctx.stats.transactionRecoveries[transactionId] = recovery.outcome.recovery
+			return true
+		end)
 	end
 
 	function api.getTransactionState(params: { [string]: any }): { [string]: any }
@@ -5097,7 +5864,11 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		end
 		local session = editorTransactions[transactionId]
 		if type(session) == "table" then
-			local state = if session.rollbackFailed ~= nil then "rollbackFailed" else tostring(session.state or "open")
+			local native = session.nativeServiceImport
+			local unknownNative = native ~= nil and native.invocationAuthorized and not native.readerFinished
+				or session.pendingNativeRootWrite ~= nil and session.invalidatedGeneration ~= nil
+			local state = if unknownNative then "nativeOutcomeUnknown"
+				elseif session.rollbackFailed ~= nil then "rollbackFailed" else tostring(session.state or "open")
 			if params.nativeRootWrite == nil and params.nativeTerrainBaseline == nil
 				and (state == "open" or state == "prepared") then
 				armSessionExpiry(editorTransactions, transactionId, session)
@@ -5146,9 +5917,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					if not write.finished or not write.instance:IsA("MeshPart") then
 						error("Native root write has not finished")
 					end
-					beginSessionOperation(session)
-					local cooked, cookError = cookMeshPart(write.instance :: MeshPart, ctx)
-					endSessionOperation(editorTransactions, transactionId, session)
+					local cooked, cookError = runSessionOperation(editorTransactions, transactionId, session, function()
+						return cookMeshPart(write.instance :: MeshPart, ctx)
+					end)
 					assertTransactionLease(session)
 					return {
 						transactionId = transactionId,
@@ -5191,14 +5962,16 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					-- The native call has a two-second budget. Keep rollback fenced
 					-- across that call, including a disconnected/killed daemon.
 					task.delay(5, function()
-						if session.pendingNativeRootWrite ~= write then return end
-						session.pendingNativeRootWrite = nil
-						if ctx.endNativeRootWindow then
-							ctx.endNativeRootWindow()
-						end
-						cancelExpectedEvent(ctx, write.token)
-						session.expireRequested = true
-						endSessionOperation(editorTransactions, transactionId, session)
+						session.scheduleExpiry(function()
+							if session.pendingNativeRootWrite ~= write then return end
+							session.pendingNativeRootWrite = nil
+							if ctx.endNativeRootWindow then
+								ctx.endNativeRootWindow()
+							end
+							cancelExpectedEvent(ctx, write.token)
+							session.expireRequested = true
+							endSessionOperation(editorTransactions, transactionId, session)
+						end)
 					end)
 				end
 			end
@@ -5231,6 +6004,15 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				committed = false,
 				rolledBack = false,
 				rollbackError = session.rollbackFailed,
+				idleRollbackFailures = session.idleRollbackFailures or 0,
+				nativePending = nativeWorkPending(session),
+				nativeOperation = if unknownNative or native and not native.readerFinished then {
+					state = if unknownNative then "invokedUnknown" else "preparedNotInvoked",
+					importId = if native then native.importId else nil,
+					reason = if unknownNative then NATIVE_UNKNOWN_REASON else "Native invocation has not been authorized; prepare expires after 120 seconds",
+				} else nil,
+				pendingTerminal = if session.pendingTerminal then session.pendingTerminal.state else nil,
+				pluginSessionId = ctx.runtimeId,
 				meshGeometry = geometry,
 				nativeRootWrite = params.nativeRootWrite,
 				needsMeshCook = needsMeshCook,
@@ -5303,31 +6085,32 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			end
 		end
 		for transactionId, session in pairs(editorTransactions) do
+			if session.leaseId == leaseId and retireInvalidatedTransaction(session) then
+				if transactionOutcomeOrNotFound(transactionId).rolledBack then
+					rolledBack += 1
+					transactionIds[#transactionIds + 1] = transactionId
+				end
+				continue
+			end
 			if
 				type(session) == "table"
 				and session.leaseId == leaseId
-				and not session.commitFence
 				and (session.activeOperations or 0) == 0
+				and not nativeWorkPending(session)
 			then
-				local ok, replacements = pcall(runWithStudioChangeSuppression, ctx, function()
-					return TransactionState.rollbackSession(session, ctx)
-				end)
-				if ok then
-					session.onExpire = nil
-					editorTransactions[transactionId] = nil
-					recordTransactionOutcome(transactionId, "rolledBack", {
-						replacements = countEntries(replacements),
-					})
-					for _, serviceName in ipairs(session.serviceNames) do
-						invalidateEditorService(serviceName)
-					end
+				beginSessionOperation(session)
+				-- The protected scope includes terminal publication and cleanup.
+				local ok, detail = pcall(session.withOwnership, session.onExpire)
+				endSessionOperation(editorTransactions, transactionId, session)
+				if ok and detail and detail.rolledBack then
 					rolledBack += 1
 					transactionIds[#transactionIds + 1] = transactionId
-				else
-					session.rollbackFailed = tostring(replacements)
-					armSessionExpiry(editorTransactions, transactionId, session)
-					recordCleanupFailure("request lease rollback", replacements)
+				elseif not ok then
+					session.rollbackFailed = tostring(detail)
+					recordCleanupFailure("request lease rollback", detail)
 				end
+			elseif session.leaseId == leaseId then
+				session.expireRequested = true
 			end
 		end
 		return {
@@ -6024,6 +6807,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 	end
 
 	function api.beginTransaction(params: { [string]: any }): { [string]: any }
+		for _, session in pairs(editorTransactions) do
+			retireInvalidatedTransaction(session)
+		end
 		pruneExpiredSessions(editorTransactions)
 		local operationCancellation = captureOperationCancellation()
 		assertSessionOwnership(operationCancellation)
@@ -6031,8 +6817,18 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		if transactionOutcomes.get(transactionId) ~= nil then
 			error("Editor transaction id was already completed")
 		end
-		if editorTransactions[transactionId] ~= nil or countEntries(editorTransactions) > 0 then
-			error("Another editor transaction is already active")
+		if transactionRecoveries[transactionId] ~= nil then
+			error("Editor transaction id still owns recovery data")
+		end
+		for _, active in pairs(editorTransactions) do
+			if active.pendingNativeRootWrite and active.invalidatedGeneration
+				or active.nativeServiceImport and active.nativeServiceImport.invocationAuthorized and not active.nativeServiceImport.readerFinished then
+				error(`{NATIVE_UNKNOWN_REASON} (transaction {active.transactionId})`)
+			end
+			if active.rollbackFailed ~= nil then
+				error("An earlier editor transaction has a failed rollback retained for recovery; cleanup retries at two-minute idle intervals")
+			end
+			error("Another editor transaction is already active; wait for its current operation to finish")
 		end
 		validateTransactionMetadata(params, includedServices)
 		local postCommitPropertyChanges =
@@ -6109,6 +6905,8 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		end
 		local session = {
 			transactionId = transactionId,
+			ownershipGeneration = ctx.captureSessionOwnership(),
+			pluginSessionId = ctx.runtimeId,
 			leaseId = currentRequestLeaseId(),
 			state = "open",
 			serviceNames = serviceNames,
@@ -6132,16 +6930,36 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			error(journalError, 0)
 		end
 		session.journalActive = true
+		session.assertOwnership = function()
+			ctx.assertSessionOwnership(session.ownershipGeneration)
+		end
+		session.withOwnership = function(callback)
+			return ctx.withSessionOwnership(session.ownershipGeneration, callback)
+		end
+		session.scheduleExpiry = function(callback)
+			scheduleTransactionExpiry(session, callback)
+		end
+		session.retireInvalidated = function()
+			return retireInvalidatedTransaction(session)
+		end
+		session.retainRecovery = function()
+			session.assertOwnership()
+			retainTransactionRecovery(transactionId, session)
+		end
 		session.onExpire = function()
+			session.assertOwnership()
+			if session.pendingTerminal or session.commitFence then return resumeTerminalTransaction(session) end
+			if session.finishUninvokedNative and not TransactionState.cleanupStep(session,
+				"uninvoked native observations", session.finishUninvokedNative) then
+				error("Uninvoked native observation cleanup failed; retain outside edits before rollback")
+			end
 			local ok, result = pcall(runWithStudioChangeSuppression, ctx, function()
 				return TransactionState.rollbackSession(session, ctx)
 			end)
 			if not ok then
 				error(result, 0)
 			end
-			recordTransactionOutcome(transactionId, "rolledBack", {
-				replacements = countEntries(result),
-			})
+			return finishTerminalTransaction(session, "rolledBack", { replacements = countEntries(result) })
 		end
 		editorTransactions[transactionId] = session
 		armSessionExpiry(editorTransactions, transactionId, session)
@@ -6151,6 +6969,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			transactionId = transactionId,
 			state = "open",
 			packageMutation = next(packageSnapshotRoots) ~= nil,
+			pluginSessionId = ctx.runtimeId,
 			mutationPackages = mutationPackageRoots,
 			historyRecording = session.historyRecording,
 		}
@@ -6161,8 +6980,8 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local transactionId = tostring(params.transactionId or "")
 		local session = editorTransactions[transactionId]
 		if type(session) ~= "table" then
-			local outcome = transactionOutcomes.get(transactionId)
-			if outcome ~= nil then
+			local outcome = transactionOutcomeOrNotFound(transactionId)
+			if outcome.found then
 				return outcome
 			end
 			error("Editor transaction was not found")
@@ -6354,61 +7173,22 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			ctx.stats.instanceCreated += session.nativeStats.instanceCreated
 			ctx.updateStatus()
 		end
-		session.onExpire = nil
 		session.changeJournal = nil
 		setTrackedOperationPhase(operation, "cleanup")
-		local nativeUndo = session.nativeUndo
-		session.nativeUndo = nil
-		session.resolveStagedPath = nil
-		if nativeUndo ~= nil then
-			local cleanupOk, cleanupError = pcall(function()
-				for _, merge in ipairs(nativeUndo.packageMerges or {}) do
-					for _, instance in ipairs(merge.outgoing) do
-						if instance.Parent == nil then
-							instance:Destroy()
-						end
-					end
-				end
-				for _, group in ipairs(nativeUndo.prepared) do
-					for _, instance in ipairs(group.outgoing) do
-						if instance.Parent == nil then
-							instance:Destroy()
-						end
-					end
-				end
-				if nativeUndo.retainedParent then
-					nativeUndo.retainedParent:Destroy()
-				end
-				for _, instance in ipairs(nativeUndo.retainedDuplicates or {}) do
-					instance:Destroy()
-				end
-			end)
-			if not cleanupOk then
-				recordCleanupFailure("committed transaction cleanup", cleanupError)
-			end
-		end
-		for _, serviceName in ipairs(session.serviceNames) do
-			invalidateEditorService(serviceName)
-		end
-		editorTransactions[transactionId] = nil
-		return recordTransactionOutcome(transactionId, "committed", {
+		return finishTerminalTransaction(session, "committed", {
 			verifiedPushProof = verifiedPushProof,
 			pushProofUnavailable = pushProofUnavailable,
 		})
 	end
 
-	local function expireTransactionBinaryImports(transactionId: string)
-		for importId, importSession in pairs(binaryImports) do
-			if type(importSession) == "table" and tostring(importSession.transactionId or "") == transactionId then
-				importSession.expireRequested = true
-				expireSession(binaryImports, importId, importSession)
-			end
-		end
-	end
-
 	function api.commitTransaction(params: { [string]: any }): { [string]: any }
 		local transactionId = tostring(params.transactionId or "")
 		local activeSession = editorTransactions[transactionId]
+		if type(activeSession) == "table" then
+			if retireInvalidatedTransaction(activeSession) then return transactionOutcomeOrNotFound(transactionId) end
+			assertTransactionLease(activeSession, true)
+			if activeSession.pendingTerminal or activeSession.commitFence then return resumeTerminalTransaction(activeSession) end
+		end
 		local operation = beginTrackedOperation("editorCommit")
 		if type(activeSession) == "table" then
 			beginSessionOperation(activeSession)
@@ -6424,25 +7204,26 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local session = editorTransactions[transactionId]
 		if type(session) == "table" then
 			if session.commitFence then
-				session.onExpire = nil
-				editorTransactions[transactionId] = nil
-				return recordTransactionOutcome(transactionId, "committed", {
+				return finishTerminalTransaction(session, "committed", {
 					commitWarning = tostring(result),
 				})
 			end
+			if nativeWorkPending(session) then
+				error(`{result}\nNative work is pending; rollback has not been attempted`, 0)
+			end
+			beginSessionOperation(session)
 			local rollbackOk, rollbackResult = pcall(runWithStudioChangeSuppression, ctx, function()
 				return TransactionState.rollbackSession(session, ctx)
 			end)
+			if not rollbackOk then
+				session.rollbackFailed = tostring(rollbackResult)
+			end
+			endSessionOperation(editorTransactions, transactionId, session)
+			if editorTransactions[transactionId] ~= session then
+				error(result, 0)
+			end
 			if rollbackOk then
-				session.onExpire = nil
-				editorTransactions[transactionId] = nil
-				expireTransactionBinaryImports(transactionId)
-				recordTransactionOutcome(transactionId, "rolledBack", {
-					replacements = countEntries(rollbackResult),
-				})
-				for _, serviceName in ipairs(session.serviceNames) do
-					invalidateEditorService(serviceName)
-				end
+				finishTerminalTransaction(session, "rolledBack", { replacements = countEntries(rollbackResult) })
 			else
 				armSessionExpiry(editorTransactions, transactionId, session)
 				error(`{result}\nEditor rollback also failed: {rollbackResult}`, 0)
@@ -6457,27 +7238,29 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		if type(session) ~= "table" then
 			return transactionOutcomeOrNotFound(transactionId)
 		end
-		assertTransactionLease(session)
+		if retireInvalidatedTransaction(session) then return transactionOutcomeOrNotFound(transactionId) end
+		assertTransactionLease(session, true)
+		if session.pendingTerminal or session.commitFence then return resumeTerminalTransaction(session) end
+		if nativeWorkPending(session) then
+			error("Native work is pending; rollback has not been attempted")
+		end
 		local operation = beginTrackedOperation("editorRollback")
 		beginSessionOperation(session)
 		local ok, replacements = pcall(runWithStudioChangeSuppression, ctx, function()
 			return TransactionState.rollbackSession(session, ctx)
 		end)
+		if not ok then
+			session.rollbackFailed = tostring(replacements)
+		end
 		endSessionOperation(editorTransactions, transactionId, session)
 		finishTrackedOperation(operation)
+		if editorTransactions[transactionId] ~= session then return transactionOutcomeOrNotFound(transactionId) end
 		if not ok then
+			recordCleanupFailure("direct rollback", replacements)
 			armSessionExpiry(editorTransactions, transactionId, session)
 			error(replacements, 0)
 		end
-		session.onExpire = nil
-		editorTransactions[transactionId] = nil
-		expireTransactionBinaryImports(transactionId)
-		for _, serviceName in ipairs(session.serviceNames) do
-			invalidateEditorService(serviceName)
-		end
-		return recordTransactionOutcome(transactionId, "rolledBack", {
-			replacements = countEntries(replacements),
-		})
+		return finishTerminalTransaction(session, "rolledBack", { replacements = countEntries(replacements) })
 	end
 
 	function api.beginBinaryExport(params: { [string]: any }): { [string]: any }
@@ -7740,6 +8523,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local instanceCount = validatedBinaryImportInstanceCount(params)
 		assertBinaryImportCapacity(importId, totalBytes)
 		local wholeServices = params.nativeReplacement ~= nil
+		if wholeServices and params.nativeHandoff ~= 1 then
+			error("Update the Renium CLI for the native invocation handoff")
+		end
 		if wholeServices and params.nativeReceiptFormat ~= 2 then
 			error("Update the Renium CLI to use compact native creation receipts")
 		end
@@ -7750,7 +8536,10 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			nativeHeld.containerSettings = validatedContainerSettings(params.containerSettings, transaction)
 		end
 		binaryImports[importId] = {
+			transaction = transaction,
 			leaseId = transaction.leaseId,
+			withOwnership = transaction.withOwnership,
+			scheduleExpiry = transaction.scheduleExpiry,
 			transactionId = transactionId,
 			totalBytes = totalBytes,
 			totalChunks = totalChunks,
@@ -7774,6 +8563,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			end
 		end
 		return { ok = true, importId = importId, nativeTargets = nativeTargets,
+			nativeHandoff = if wholeServices then 1 else nil,
 			nativeReceiptFormat = if wholeServices then 2 else nil,
 			nativeInlineReceipt = if wholeServices then true else nil }
 	end
@@ -7789,8 +8579,14 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		if type(transaction) ~= "table" then
 			error("Native import editor transaction was not found")
 		end
-		assertTransactionLease(transaction)
-		assertRequestLeaseActive(session.leaseId)
+		if params.nativeReceipt == true and session.nativeHeld and session.nativeHeld.invocationAuthorized then
+			-- A replacement daemon may deliver the authoritative receipt using a
+			-- new request lease, but must still own this exact Studio generation.
+			transaction.assertOwnership()
+		else
+			assertTransactionLease(transaction)
+			assertRequestLeaseActive(session.leaseId)
+		end
 		armSessionExpiry(editorTransactions, session.transactionId, transaction)
 		armSessionExpiry(binaryImports, importId, session)
 		local index = tonumber(params.index)
@@ -7876,6 +8672,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 	local function finishNativeServiceImport(session, transaction, params)
 		local native = session.nativeHeld
 		if params.nativePhase == "prepare" then
+			if params.nativeHandoff ~= 1 then
+				error("Native prepare requires the invocation handoff")
+			end
 			if native.readerArmed then
 				error("Native insertion is already armed; do not run it twice")
 			end
@@ -7949,12 +8748,48 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			expectContainerSettings(native.containerSettings, ctx, transaction.nativeSettingTokens)
 			ctx.beginNativeImportObservations(transaction.transactionId, native.untaggedClasses)
 			native.started = os.clock()
+			native.importId = params.importId
+			native.prepareDeadline = os.clock() + NATIVE_PREPARE_SECONDS
 			native.readerArmed = true
 			transaction.nativeServiceImport = native
-			return { ok = true, nativeReaderReady = true }
+			-- Hold both resources from prepare through a verified terminal receipt,
+			-- including the interval when no bridge request is running.
+			native.operationFence = true
+			beginSessionOperation(session)
+			beginSessionOperation(transaction)
+			task.delay(NATIVE_PREPARE_SECONDS, function()
+				transaction.scheduleExpiry(function()
+					if native.readerFinished or native.invocationAuthorized then return end
+					-- The invoke RPC is the only permission to run native code. At
+					-- this deadline there is proof no native write was authorized.
+					native.readerFinished = true
+					native.operationFence = nil
+					transaction.finishUninvokedNative = function()
+						ctx.finishNativeImportObservations(transaction.transactionId, {})
+						transaction.finishUninvokedNative = nil
+					end
+					TransactionState.cleanupStep(transaction, "uninvoked native observations", transaction.finishUninvokedNative)
+					transaction.expireRequested = true
+					session.expireRequested = true
+					endSessionOperation(binaryImports, native.importId, session)
+					endSessionOperation(editorTransactions, transaction.transactionId, transaction)
+				end)
+			end)
+			return { ok = true, nativeReaderReady = true, nativeHandoff = 1 }
+		end
+		if params.nativePhase == "invoke" then
+			if not native.readerArmed or native.readerFinished or native.invocationAuthorized
+				or os.clock() >= native.prepareDeadline then
+				error("Native invocation permission expired or was already consumed")
+			end
+			native.invocationAuthorized = true
+			return { ok = true, nativeInvocationAuthorized = true }
 		end
 		if params.nativePhase ~= "complete" or not native.readerArmed or native.readerFinished then
 			error("Native insertion is not waiting for this completion")
+		end
+		if not native.invocationAuthorized then
+			error("Native invocation was never authorized")
 		end
 		if type(params.nativeStatus) ~= "number" or type(params.nativeState) ~= "number"
 			or params.nativeState < 0 or params.nativeState > 15 or params.nativeState % 1 ~= 0
@@ -7963,6 +8798,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			error("Native insertion did not return a complete creation receipt")
 		end
 		local additions = ctx.finishNativeImportObservations(transaction.transactionId, native.createdById)
+		transaction.assertOwnership()
 		native.readerFinished = true
 		local undo = transaction.nativeUndo
 		local byTarget = {}
@@ -8054,8 +8890,12 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		if type(transaction) ~= "table" then
 			error("Native import editor transaction was not found")
 		end
-		assertTransactionLease(transaction)
-		assertRequestLeaseActive(session.leaseId)
+		if params.nativePhase == "complete" and session.nativeHeld and session.nativeHeld.invocationAuthorized then
+			transaction.assertOwnership()
+		else
+			assertTransactionLease(transaction)
+			assertRequestLeaseActive(session.leaseId)
+		end
 		local operationGeneration = captureOperationCancellation()
 		assertSessionOwnership(operationGeneration)
 		armSessionExpiry(binaryImports, importId, session)
@@ -8071,6 +8911,11 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			beginSessionOperation(session)
 			beginSessionOperation(transaction)
 			local ok, response = pcall(finishNativeServiceImport, session, transaction, params)
+			if session.nativeHeld.operationFence and session.nativeHeld.readerFinished then
+				session.nativeHeld.operationFence = nil
+				endSessionOperation(binaryImports, importId, session)
+				endSessionOperation(editorTransactions, transactionId, transaction)
+			end
 			endSessionOperation(binaryImports, importId, session)
 			endSessionOperation(editorTransactions, transactionId, transaction)
 			if not ok then
@@ -8079,7 +8924,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			if params.nativePhase == "complete" then
 				binaryImports[importId] = nil
 				completedBinaryImports[importId] = {
-					leaseId = session.leaseId, response = response, completedAt = os.clock(),
+					leaseId = currentRequestLeaseId(), response = response, completedAt = os.clock(),
 					expiresAt = os.clock() + COMPLETED_BINARY_IMPORT_TTL_SECONDS,
 				}
 			end
@@ -8761,19 +9606,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		end
 		for _, entry in ipairs(activeTransactions) do
 			local session = entry.session
-			local okRollback, rollbackError = pcall(runWithStudioChangeSuppression, ctx, function()
-				return TransactionState.rollbackSession(session, ctx)
-			end)
-			if not okRollback then
-				session.rollbackFailed = tostring(rollbackError)
-				session.updatedAt = os.clock()
-				recordCleanupFailure("transaction cleanup", rollbackError)
-			else
-				session.onExpire = nil
-				editorTransactions[entry.transactionId] = nil
-				recordTransactionOutcome(entry.transactionId, "rolledBack", {
-					replacements = countEntries(rollbackError),
-				})
+			session.expireRequested = true
+			if not expireSession(editorTransactions, entry.transactionId, session) then
+				armSessionExpiry(editorTransactions, entry.transactionId, session)
 			end
 		end
 		local activeReconciles = {}
@@ -8791,7 +9626,12 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				recordCleanupFailure("reconcile cleanup", rollbackError)
 			end
 		end
-		table.clear(binaryImports)
+		for importId, session in pairs(binaryImports) do
+			session.expireRequested = true
+			if not expireSession(binaryImports, importId, session) then
+				recordCleanupFailure("import cleanup", "Native import remains pending or retained: " .. importId)
+			end
+		end
 		table.clear(completedBinaryImports)
 		for exportId, session in pairs(binaryExports) do
 			if type(session) == "table" then

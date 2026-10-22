@@ -3938,12 +3938,17 @@ fn send_editor_service_replacement(
         "viewportReferencesPostApplied": import.viewport_references_post_applied,
         "nativeReplacement": plan, "containerSettings": container_settings,
         "nativeReceiptFormat": 2,
+        "nativeHandoff": 1,
     }))?;
     let mut invoked = false;
     let result = (|| {
         anyhow::ensure!(
             begin.get("nativeReceiptFormat").and_then(Value::as_u64) == Some(2),
             "Studio's Renium plugin needs updating for compact native receipts"
+        );
+        anyhow::ensure!(
+            begin.get("nativeHandoff").and_then(Value::as_u64) == Some(1),
+            "Studio's Renium plugin needs updating for the native invocation handoff"
         );
         let held = begin
             .get("nativeTargets")
@@ -3952,6 +3957,7 @@ fn send_editor_service_replacement(
             "finishEditorBinaryImport",
             json!({
                 "importId": &import_id, "nativePhase": "prepare",
+                "nativeHandoff": 1,
             }),
         )?;
         // Native code must not run merely because a target lookup succeeded.
@@ -3959,6 +3965,17 @@ fn send_editor_service_replacement(
         anyhow::ensure!(
             ready.get("nativeReaderReady").and_then(Value::as_bool) == Some(true),
             "Studio has not armed the native replacement transaction"
+        );
+        let permission = bridge.call(
+            "finishEditorBinaryImport",
+            json!({ "importId": &import_id, "nativePhase": "invoke" }),
+        )?;
+        anyhow::ensure!(
+            permission
+                .get("nativeInvocationAuthorized")
+                .and_then(Value::as_bool)
+                == Some(true),
+            "Studio did not authorize native invocation"
         );
         // Keep the binary batches, but share one native task and factory scope.
         // Its creation ordinals already match the transaction-wide identity plan.
@@ -3978,7 +3995,11 @@ fn send_editor_service_replacement(
             // Nothing ran: disarm the native phase so ordinary rollback can run.
             Err(error) if !invoked => (Vec::new(), (1, 8, error.to_string())),
             // An unknown native outcome must not be retried or blindly cancelled.
-            Err(error) => return Err(error),
+            Err(error) => {
+                return Err(error.context(format!(
+                    "Native insertion outcome is unknown (transaction {transaction_id}, import {import_id}); rollback remains blocked because a native write may still be running. Restart Studio to clear this operation"
+                )));
+            }
         };
         // The helper's fixed-width ABI is not the bridge's wire format. Keep
         // exact identities/ordinals, without transporting 48-byte padded strings.

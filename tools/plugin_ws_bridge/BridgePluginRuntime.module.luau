@@ -971,11 +971,34 @@ function BridgePluginRuntime.start(context)
 		captureRootProperties = function(serviceName: string)
 			return Config.captureEditorBinaryRootProperties(serviceName)
 		end,
-		assertSessionOwnership = function()
-			if not sessionLock.validate(activeExclusiveSessionGeneration) then
+		assertSessionOwnership = function(generation)
+			if not sessionLock.validate(activeExclusiveSessionGeneration)
+				or generation ~= nil and generation ~= activeExclusiveSessionGeneration then
 				error("Renium session ownership was lost")
 			end
 		end,
+		captureSessionOwnership = function()
+			if not sessionLock.validate(activeExclusiveSessionGeneration) then
+				error("Renium session ownership was lost")
+			end
+			return activeExclusiveSessionGeneration
+		end,
+		withSessionOwnership = function(generation, callback)
+			local previous = activeExclusiveSessionGeneration
+			activeExclusiveSessionGeneration = generation
+			local results = table.pack(pcall(function()
+				if not sessionLock.validate(generation) then
+					error("Renium session ownership was lost")
+				end
+				return callback()
+			end))
+			activeExclusiveSessionGeneration = previous
+			if not results[1] then
+				error(results[2], 0)
+			end
+			return table.unpack(results, 2, results.n)
+		end,
+		currentSessionOwnership = sessionLock.capture,
 		expectParentChange = Config.studioChanges.expectParentChange,
 		expectPropertyEvent = Config.studioChanges.expectPropertyEvent,
 		samplePropertyChange = Config.studioChanges.samplePropertyChange,
@@ -987,9 +1010,14 @@ function BridgePluginRuntime.start(context)
 		beginStudioChangeJournal = Config.studioChanges.beginChangeJournal,
 		drainStudioChangeJournal = Config.studioChanges.drainChangeJournal,
 		finishStudioChangeJournal = Config.studioChanges.finishChangeJournal,
+		expireStudioChangeJournal = Config.studioChanges.expireChangeJournal,
+		retireStudioChangeJournal = Config.studioChanges.retireChangeJournal,
 		beginNativeImportObservations = Config.studioChanges.beginNativeImportObservations,
 		finishNativeImportObservations = Config.studioChanges.finishNativeImportObservations,
 		finishEditorTransactionExpectation = finishEditorTransactionExpectation,
+		afterBridgeExclusiveIdle = function(callback)
+			return Config.afterBridgeExclusiveIdle(callback)
+		end,
 		studioChangeGeneration = Config.studioChanges.serviceGeneration,
 		describeJournalChange = Config.studioChanges.describeJournalChange,
 		isStudioChangeTracking = Config.studioChanges.isTracking,
@@ -4558,6 +4586,9 @@ function BridgePluginRuntime.start(context)
 		maxQueuedExclusiveRequests = 16,
 		allowedMethods = Config.bridgeMethodHandlers,
 		isExclusiveMethod = function(method, params)
+			if method == "getEditorTransactionState" then
+				return params.nativeRootWrite ~= nil or params.nativeTerrainBaseline ~= nil or params.meshGeometry ~= nil
+			end
 			return not not Config.bridgeExclusiveMethods[method]
 				and not (method == "startStopPlay" and next(params) == nil)
 		end,

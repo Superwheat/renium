@@ -1,6 +1,6 @@
 use super::*;
 
-fn fixture() -> BridgeServer {
+pub(crate) fn fixture() -> BridgeServer {
     BridgeServer {
         #[cfg(any(windows, target_os = "macos"))]
         verified_full_pushes: Default::default(),
@@ -299,7 +299,11 @@ fn staged_selection_restores_outer_place_and_project_after_success_or_error() {
 }
 
 // Only loopback sockets. No daemon, native watchers, Studio, or game mutations.
-fn connect(bridge: &BridgeServer, channel_index: usize, info: BridgeInfoPayload) -> TcpStream {
+pub(crate) fn connect(
+    bridge: &BridgeServer,
+    channel_index: usize,
+    info: BridgeInfoPayload,
+) -> TcpStream {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
     let (stream, address) = listener.accept().unwrap();
@@ -869,7 +873,7 @@ fn native_connection_preparation_does_not_block_registration_or_other_places() {
     responder.join().unwrap();
 }
 
-fn edit_info(runtime: &str, place: i64) -> BridgeInfoPayload {
+pub(crate) fn edit_info(runtime: &str, place: i64) -> BridgeInfoPayload {
     BridgeInfoPayload {
         runtime_id: runtime.into(),
         bridge_role: BRIDGE_ROLE_EDIT.into(),
