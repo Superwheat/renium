@@ -1457,7 +1457,10 @@ struct PackageIdentityMatches {
     by_existing_index: HashMap<usize, String>,
 }
 
-fn subtree_relative_indices(document: &SettingsBytecode, root: usize) -> HashMap<String, usize> {
+pub(super) fn subtree_relative_indices(
+    document: &SettingsBytecode,
+    root: usize,
+) -> HashMap<String, usize> {
     fn visit(
         document: &SettingsBytecode,
         children: &[Vec<usize>],

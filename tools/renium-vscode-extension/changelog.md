@@ -4,6 +4,7 @@
 
 ### Bug fixes
 
+- A pull's read-only link restore no longer writes empty `.luau` files over a consumer's shared scripts: a store record that carries no Source takes the package's text for that script, or keeps the file that is there (a pull keeps script sources aside, which emptied up to 489 files per place and shipped empty scripts in builds made right after a pull).
 - Live Sync no longer reports a copy's deprecated `CollisionGroupId` (the engine's per-place index of the collision group name, `-1` vs `3` on a shared-link copy) as a difference; the `CollisionGroup` name still compares.
 - When a pull or link apply refuses to replace a linked copy because another store still references an instance inside it, the error now names the link, the instance's path and the referring instances instead of a bare store ID.
 - Live Sync preserves completed commit/rollback results across retries and releases inactive failed transactions after bounded retries or Studio ownership changes. Recovery has at most eight scheduled opportunities under valid ownership; unresolved data is session-only, with cleanup scheduled 30 minutes after retirement once current work permits. Native preparations delayed 120 seconds are safely refused; authorized writes with unknown outcomes stay blocked until verified completion or Studio restart, which can lose retained data.

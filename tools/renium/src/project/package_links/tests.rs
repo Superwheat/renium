@@ -6,7 +6,9 @@ use crate::cli::{
     PushEditorChangesArgs,
 };
 use crate::editor::document::read_editor_service_settings;
+use crate::editor::paths::build_editor_source_paths_by_index;
 use crate::editor::sync::collect_editor_changes;
+use crate::settings::EXTERNAL_SOURCE_MARKER;
 use crate::tests::support::{settings_document, settings_instance, temp_dir};
 
 #[path = "pull_tests.rs"]
@@ -1007,6 +1009,117 @@ fn externally_referenced_removal_names_the_link_instance_and_referrers() {
         "garage",
     );
     assert_eq!(unrelated.to_string(), "something else");
+}
+
+#[test]
+fn restoring_a_link_never_writes_an_empty_script_over_a_consumer_file() {
+    let dir = temp_dir("externalize-missing-source");
+    let service_dir = dir.join("src").join("ServerScriptService");
+    fs::create_dir_all(&service_dir).unwrap();
+    let document = settings_document(vec![
+        SettingsBytecodeInstance {
+            settings_id: "root".into(),
+            name: "ServerScriptService".into(),
+            class_name: "ServerScriptService".into(),
+            parent_index: None,
+            properties: Map::new(),
+            attributes: Map::new(),
+        },
+        SettingsBytecodeInstance {
+            settings_id: "public".into(),
+            name: "Public".into(),
+            class_name: "Folder".into(),
+            parent_index: Some(0),
+            properties: Map::new(),
+            attributes: Map::new(),
+        },
+        SettingsBytecodeInstance {
+            settings_id: "kept".into(),
+            name: "SafeTeleport".into(),
+            class_name: "ModuleScript".into(),
+            parent_index: Some(1),
+            properties: Map::new(),
+            attributes: Map::new(),
+        },
+        SettingsBytecodeInstance {
+            settings_id: "written".into(),
+            name: "DataStore".into(),
+            class_name: "ModuleScript".into(),
+            parent_index: Some(1),
+            properties: Map::from_iter([("Source".into(), json!("return 2"))]),
+            attributes: Map::new(),
+        },
+    ]);
+    let paths = build_editor_source_paths_by_index(&document, "ServerScriptService", &service_dir);
+    let kept_path = paths[2].clone().unwrap();
+    let written_path = paths[3].clone().unwrap();
+    fs::create_dir_all(kept_path.parent().unwrap()).unwrap();
+    fs::write(&kept_path, "return 1").unwrap();
+    let mut package = settings_document(document.instances[1..].to_vec());
+    for instance in &mut package.instances {
+        instance.parent_index = instance
+            .parent_index
+            .and_then(|parent| parent.checked_sub(1));
+    }
+    package.instances[1]
+        .properties
+        .insert("Source".into(), json!("return 'from the package'"));
+    package.instances[2].properties.remove("Source");
+    let mut document = document;
+    let mut changes = commands::LinkApplyChanges::default();
+    let selector = (
+        "ServerScriptService".to_string(),
+        vec!["Public".to_string()],
+        vec![1usize],
+    );
+    let mut filled = document.clone();
+    let mut filled_changes = commands::LinkApplyChanges::default();
+    assert!(
+        commands::externalize_target_scripts(
+            &mut filled,
+            &selector,
+            &service_dir,
+            Some(&package),
+            &mut filled_changes
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        filled_changes
+            .transaction_writes
+            .get(&kept_path)
+            .map(|bytes| bytes.as_slice()),
+        Some(b"return 'from the package'".as_slice()),
+        "a record without Source takes the package's text for the same path"
+    );
+    assert!(
+        commands::externalize_target_scripts(
+            &mut document,
+            &selector,
+            &service_dir,
+            None,
+            &mut changes
+        )
+        .unwrap()
+    );
+    assert!(
+        !changes.transaction_writes.contains_key(&kept_path),
+        "a record without Source must not overwrite the consumer's file"
+    );
+    assert_eq!(fs::read_to_string(&kept_path).unwrap(), "return 1");
+    assert_eq!(
+        changes
+            .transaction_writes
+            .get(&written_path)
+            .map(|bytes| bytes.as_slice()),
+        Some(b"return 2".as_slice())
+    );
+    assert_eq!(
+        document.instances[2].properties["Source"],
+        json!(EXTERNAL_SOURCE_MARKER),
+        "an existing file keeps the record external"
+    );
+    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]

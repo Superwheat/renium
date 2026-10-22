@@ -26,7 +26,7 @@ use crate::editor::paths::{
 use crate::editor::sync::is_lua_source_class;
 use crate::project::experience::AmbiguousExperiencePlace;
 use crate::project::layout::apply_configured_project_layout;
-use crate::rbx::encode::bytecode_export_script_source;
+use crate::rbx::encode::{bytecode_export_script_source, settings_root_indices};
 use crate::settings::EXTERNAL_SOURCE_MARKER;
 use crate::settings::bytecode::{
     SETTINGS_BINARY_VERSION, SETTINGS_REFERENCE_SELECTOR_KEYS, SettingsBytecode,
@@ -54,8 +54,8 @@ use super::{
     referenced_settings_ids_outside, renium_global_packages_dir, resolve_link_cache_dir,
     resolve_link_target_storage, resolve_link_targets, resolve_local_link_path,
     selector_starts_with, serialize_link_lock, serialize_link_manifest,
-    stage_settings_document_writes, stray_target_files, validate_link_target_ref,
-    write_link_manifest,
+    stage_settings_document_writes, stray_target_files, subtree_relative_indices,
+    validate_link_target_ref, write_link_manifest,
 };
 use super::{pull, shared};
 
@@ -212,7 +212,7 @@ pub(super) fn link_target_output_ordinals(ordinals: Vec<usize>) -> Vec<usize> {
 }
 
 #[derive(Default)]
-struct LinkApplyChanges {
+pub(super) struct LinkApplyChanges {
     changed_paths: Vec<String>,
     changed_seen: HashSet<String>,
     target_settings_ids: Vec<String>,
@@ -222,7 +222,7 @@ struct LinkApplyChanges {
     processed_targets: usize,
     differences: usize,
     manifest_changed: bool,
-    transaction_writes: BTreeMap<PathBuf, Vec<u8>>,
+    pub(super) transaction_writes: BTreeMap<PathBuf, Vec<u8>>,
     transaction_removals: Vec<PathBuf>,
     transaction_prune_dirs: Vec<(PathBuf, PathBuf)>,
     mirror_permissions: BTreeMap<PathBuf, bool>,
@@ -353,10 +353,15 @@ fn compare_package_target(
     ))
 }
 
-fn externalize_target_scripts(
+/// Writes the restored target's scripts to their files. A record that
+/// carries no Source (a pull keeps its scripts' text aside) takes the text
+/// of the package record at the same path; without one, an existing file
+/// is kept and no file is created, so a restore can never truncate a script.
+pub(super) fn externalize_target_scripts(
     document: &mut SettingsBytecode,
     (service, segments, ordinals): &(String, Vec<String>, Vec<usize>),
     service_dir: &Path,
+    package: Option<&SettingsBytecode>,
     changes: &mut LinkApplyChanges,
 ) -> Result<bool> {
     let Some(root) =
@@ -367,6 +372,21 @@ fn externalize_target_scripts(
     let mut subtree = Vec::new();
     collect_settings_subtree_preorder(&settings_children_by_parent(document), root, &mut subtree);
     let source_paths = build_editor_source_paths_by_index(document, service, service_dir);
+    let package_sources = package
+        .and_then(|package| {
+            settings_root_indices(package)
+                .first()
+                .copied()
+                .map(|root| (package, root))
+        })
+        .map(|(package, package_root)| {
+            let keys = subtree_relative_indices(package, package_root);
+            let by_target = subtree_relative_indices(document, root)
+                .into_iter()
+                .map(|(key, index)| (index, key))
+                .collect::<HashMap<_, _>>();
+            (package, keys, by_target)
+        });
     let mut externalized = false;
     for index in subtree {
         let (Some(Some(path)), Some(instance)) =
@@ -379,10 +399,35 @@ fn externalize_target_scripts(
         }
         let source = match instance.properties.get("Source") {
             Some(Value::String(source)) if source == EXTERNAL_SOURCE_MARKER => continue,
-            Some(Value::String(source)) => source.clone(),
-            _ => String::new(),
+            Some(Value::String(source)) => Some(source.clone()),
+            _ => package_sources
+                .as_ref()
+                .and_then(|(package, keys, by_target)| {
+                    let key = by_target.get(&index)?;
+                    let record = &package.instances[*keys.get(key)?];
+                    match record.properties.get("Source") {
+                        Some(Value::String(source)) if source != EXTERNAL_SOURCE_MARKER => {
+                            Some(source.clone())
+                        }
+                        _ => None,
+                    }
+                }),
         };
         ensure_existing_ancestor_inside(service_dir, path, "linked script file")?;
+        let Some(source) = source else {
+            // A package that carries no source for this script says nothing
+            // about its text: keep the consumer's file rather than truncating
+            // it, and leave the record alone when there is no file either.
+            if fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0) {
+                instance.properties.insert(
+                    "Source".to_string(),
+                    Value::String(EXTERNAL_SOURCE_MARKER.to_string()),
+                );
+                changes.mirror_permissions.insert(path.clone(), true);
+                externalized = true;
+            }
+            continue;
+        };
         instance.properties.insert(
             "Source".to_string(),
             Value::String(EXTERNAL_SOURCE_MARKER.to_string()),
@@ -599,6 +644,7 @@ impl PackageLinkApply<'_> {
                 document,
                 document_selector,
                 &storage.source_root,
+                SettingsBytecode::read_file(package_path).ok().as_ref(),
                 changes,
             )?
         {
