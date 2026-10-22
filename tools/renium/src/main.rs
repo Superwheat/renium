@@ -196,11 +196,18 @@ fn run_cli() -> Result<()> {
         && resumes_global_audio(&cli.command)
         && let Err(error) = studio::audio::global::resume()
     {
-        eprintln!("[renium] Global Studio audio could not resume: {error:#}");
+        // Resuming is housekeeping for a Studio that may not be there; a
+        // sandboxed or Studio-less run must not see it in the output.
+        log_global(
+            5,
+            format_args!("[renium] Global Studio audio could not resume: {error:#}"),
+        );
     }
     cli::dispatch::dispatch(cli.command, cli.project.as_deref())
 }
 
+/// Offline commands never touch Studio audio: a syntax check, a bug report
+/// or a plugin call has no Studio to resume.
 fn resumes_global_audio(command: &Commands) -> bool {
     !matches!(
         command,
@@ -209,6 +216,10 @@ fn resumes_global_audio(command: &Commands) -> bool {
             | Commands::UpdateHelper(_)
             | Commands::NativeProbe(_)
             | Commands::BridgeDaemon(_)
+            | Commands::CheckLuau(_)
+            | Commands::Report(_)
+            | Commands::Plugin(_)
+            | Commands::External(_)
     )
 }
 
@@ -302,6 +313,18 @@ mod startup_policy_tests {
         assert!(!resumes_global_audio(&cli.command));
         assert!(!checks_agent_update(&cli.command));
         assert!(!checks_agent_instructions(&cli.command));
+    }
+
+    #[test]
+    fn offline_commands_leave_studio_audio_alone() {
+        for arguments in [
+            vec!["rbx", "ck", "src"],
+            vec!["rbx", "report", "-m", "what went wrong"],
+        ] {
+            let matches = cli::command().try_get_matches_from(arguments).unwrap();
+            let cli = Cli::from_arg_matches(&matches).unwrap();
+            assert!(!resumes_global_audio(&cli.command));
+        }
     }
 
     #[test]
