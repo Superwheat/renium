@@ -414,6 +414,7 @@ impl Coordinator {
                 MergeChanges {
                     editor: HashSet::new(),
                     studio: side_differences.clone(),
+                    aligned_studio: HashMap::new(),
                 },
             )
         } else {
@@ -482,7 +483,17 @@ impl Coordinator {
         let push_plan = if changes.studio.is_empty() {
             ReconcilePushPlan::default()
         } else {
-            reconciliation_push_plan_for_paths(&studio, &merged, &changes.studio)?
+            let prepared = prepared_studio_settings_changes(&merged, &mut changes)?;
+            let mut plan = reconciliation_push_plan_for_paths_with_prepared_settings(
+                &studio,
+                &merged,
+                &changes.studio,
+                &prepared,
+                false,
+                false,
+            )?;
+            attach_capture_identities(&mut plan, &studio, &prepared)?;
+            plan
         };
         log_reconcile_timing("push plan", phase);
         let readback = if push_plan.is_empty() {
@@ -1263,4 +1274,25 @@ pub(crate) fn verify_difference_lines(
         lines.push(format!("{} more paths", total - LIMIT));
     }
     lines
+}
+
+/// Pairs each changed Studio settings document, as the merge aligned it, with
+/// the merged document the push must produce. Studio locates the instances a
+/// push replaces by the paths they had in its own tree, so those paths have
+/// to come from the same pairing that decided which instances changed; a
+/// second, independent alignment paired identical same-named siblings across
+/// parents and handed Studio colliding previous locations.
+fn prepared_studio_settings_changes(
+    merged: &ProjectSnapshot,
+    changes: &mut MergeChanges,
+) -> Result<HashMap<PathBuf, PreparedEditorSettingsChange>> {
+    std::mem::take(&mut changes.aligned_studio)
+        .into_iter()
+        .filter(|(path, _)| changes.studio.contains(path))
+        .map(|(path, mut previous)| {
+            let current = settings_document(merged.entries.get(&path))?;
+            align_equivalent_values(&current, &mut previous);
+            Ok((path, PreparedEditorSettingsChange { previous, current }))
+        })
+        .collect()
 }

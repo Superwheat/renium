@@ -230,8 +230,10 @@ pub(crate) fn editor_instance_descriptor_from_path(
         previous_path_ordinals: Vec::new(),
         class_name: instance.class_name.clone(),
         previous_class_name: None,
+        previous_settings_id: None,
         ambiguous_siblings,
         anchor_only: false,
+        recreate: false,
         match_properties,
         match_attributes,
     })

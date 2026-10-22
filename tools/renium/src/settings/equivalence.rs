@@ -2299,6 +2299,10 @@ pub(crate) fn reconciliation_maps_equal_with_ids(
         }
         match right.get(name) {
             Some(other) if name == "Tags" && tags_equal(value, other) => {}
+            Some(other) if solid_fidelities_match(class_name, name, value, other) => {}
+            Some(other)
+                if hulls_match(name, value, other)
+                    && geometry_sources_equal(class_name, left, right) => {}
             Some(other)
                 if is_asset_reference_property(class_name, name)
                     && asset_texts_equal(value, other) => {}
@@ -2323,8 +2327,9 @@ pub(crate) fn reconciliation_maps_equal_with_ids(
 
 /// What a part's collision hull says about its authored fidelity: byte 10 of a
 /// version-8 `CSGPHS` blob, or Box for the old BLOCK placeholder. The hull
-/// bytes themselves are the engine's and differ run to run, so the first
-/// comparison judges hulls by this code; merges and pulls keep the bytes.
+/// bytes themselves are the engine's and differ from one cook to the next, so
+/// two hulls that encode one fidelity compare as equal and a pull keeps the
+/// bytes the files have; hulls without a readable code compare by bytes.
 pub(crate) fn hull_fidelity_code(value: &Value) -> Option<u8> {
     let bytes = base64::decode(value.get("base64")?.as_str()?).ok()?;
     if !bytes.starts_with(b"CSGPHS") || bytes.len() < 10 {
@@ -2335,6 +2340,69 @@ pub(crate) fn hull_fidelity_code(value: &Value) -> Option<u8> {
         return Some(2);
     }
     (version >= 8 && bytes.len() >= 12).then(|| bytes[10])
+}
+
+/// Hulls that say the same thing: both encode one fidelity, or one is the
+/// box placeholder Studio writes before a mesh has cooked, which the engine
+/// replaces by the cooked hull of that very mesh once it loads.
+fn hulls_match(name: &str, left: &Value, right: &Value) -> bool {
+    name == crate::rbx::encode::COLLISION_HULL_PROPERTY
+        && (hull_is_placeholder(left)
+            || hull_is_placeholder(right)
+            || hull_fidelity_code(left).is_some_and(|code| Some(code) == hull_fidelity_code(right)))
+}
+
+/// The engine reports a solid operation's fidelity as Box while its mesh is
+/// a placeholder and as Default once its hull is cooked, and honours neither
+/// write; the two are one authored value. Hull and PreciseConvexDecomposition
+/// stay real choices.
+fn solid_fidelities_match(class_name: &str, name: &str, left: &Value, right: &Value) -> bool {
+    fn box_or_default(value: &Value) -> bool {
+        match value.get("name").and_then(Value::as_str) {
+            Some(name) => matches!(name, "Box" | "Default"),
+            None => matches!(value.get("value").and_then(Value::as_u64), Some(0 | 2)),
+        }
+    }
+    name == "CollisionFidelity"
+        && crate::rbx::encode::is_solid_model_operation(class_name)
+        && box_or_default(left)
+        && box_or_default(right)
+}
+
+/// A hull is cooked from the mesh an instance names or carries; two hulls
+/// compare by fidelity only while both records hold the same mesh: the asset
+/// selectors and, for a solid operation, its CSG tree and mesh data.
+fn geometry_sources_equal(
+    class_name: &str,
+    left: &Map<String, Value>,
+    right: &Map<String, Value>,
+) -> bool {
+    let hull = crate::rbx::encode::COLLISION_HULL_PROPERTY;
+    ["MeshId", "MeshContent", "AssetId"]
+        .iter()
+        .copied()
+        .chain(
+            crate::rbx::encode::engine_geometry_properties(class_name)
+                .iter()
+                .copied()
+                .filter(|name| *name != hull && *name != "AeroMeshData"),
+        )
+        .all(|name| {
+            reconciliation_property_values_equal(class_name, name, left.get(name), right.get(name))
+        })
+}
+
+fn hull_is_placeholder(value: &Value) -> bool {
+    value
+        .get("base64")
+        .and_then(Value::as_str)
+        .and_then(|text| base64::decode(text).ok())
+        .is_some_and(|bytes| {
+            bytes.starts_with(b"CSGPHS")
+                && bytes.len() >= 10
+                && u32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]) == 0
+                && bytes.ends_with(b"BLOCK")
+        })
 }
 
 /// Tags are a set: Studio and the store may list them in any order.
@@ -3000,6 +3068,8 @@ pub(crate) fn reconciliation_property_values_equal(
     let right = right.filter(|value| !reconciliation_property_is_metadata(name, value));
     match (left, right) {
         (Some(left), Some(right)) if name == "Tags" && tags_equal(left, right) => true,
+        (Some(left), Some(right)) if solid_fidelities_match(class_name, name, left, right) => true,
+        (Some(left), Some(right)) if hulls_match(name, left, right) => true,
         (Some(left), Some(right))
             if is_asset_reference_property(class_name, name) && asset_texts_equal(left, right) =>
         {
@@ -3148,10 +3218,14 @@ fn align_equivalent_property_map_values(
     reference: &Map<String, Value>,
     observed: &mut Map<String, Value>,
 ) {
+    let geometry_same = geometry_sources_equal(class_name, reference, observed);
     for (name, reference_value) in reference {
         let Some(observed_value) = observed.get_mut(name) else {
             continue;
         };
+        if name == crate::rbx::encode::COLLISION_HULL_PROPERTY && !geometry_same {
+            continue;
+        }
         if reference_value != observed_value
             && reconciliation_property_values_equal(
                 class_name,
@@ -5472,6 +5546,100 @@ mod never_serialized_properties {
         assert!(!reconciliation_maps_equal("Lighting", &file, &studio));
         assert!(!reconciliation_maps_equal("Lighting", &studio, &file));
         assert!(reconciliation_maps_equal("Lighting", &Map::new(), &studio));
+    }
+
+    #[test]
+    fn a_placeholder_hull_matches_the_hull_cooked_from_it() {
+        let hull = |bytes: &[u8]| serde_json::json!({"_type": "SharedString", "base64": base64::encode(bytes)});
+        let placeholder = hull(b"CSGPHS    BLOCK");
+        let cooked = hull(b"CSGPHS     cooked default");
+        let cooked_hull = hull(b"CSGPHS    cooked hull");
+        let other_cook = hull(b"CSGPHS    another cook");
+        let equal = |left: &Value, right: &Value| {
+            reconciliation_property_values_equal(
+                "MeshPart",
+                "PhysicalConfigData",
+                Some(left),
+                Some(right),
+            )
+        };
+        assert!(equal(&placeholder, &cooked));
+        assert!(equal(&cooked, &placeholder));
+        assert!(equal(&cooked_hull, &other_cook));
+        assert!(!equal(&cooked, &cooked_hull));
+    }
+
+    #[test]
+    fn a_recut_solid_operation_keeps_its_new_hull() {
+        let hull = |bytes: &[u8]| serde_json::json!({"_type": "SharedString", "base64": base64::encode(bytes)});
+        let csg = |mesh: &str, hull_bytes: &[u8]| {
+            Map::from_iter([
+                (
+                    "MeshData2".to_string(),
+                    serde_json::json!({"_type": "SharedString", "base64": base64::encode(mesh)}),
+                ),
+                ("PhysicalConfigData".to_string(), hull(hull_bytes)),
+            ])
+        };
+        let union = csg("tree", b"CSGPHS\x08\0\0\0\x01\0union cook");
+        let recook = csg("tree", b"CSGPHS\x08\0\0\0\x01\0later cook");
+        let recut = csg("other tree", b"CSGPHS\x08\0\0\0\x01\0recut cook");
+        assert!(reconciliation_maps_equal("UnionOperation", &union, &recook));
+        assert!(!reconciliation_maps_equal("UnionOperation", &union, &recut));
+        let mut kept = recut.clone();
+        align_equivalent_property_map_values("UnionOperation", &union, &mut kept);
+        assert_eq!(kept["PhysicalConfigData"], recut["PhysicalConfigData"]);
+    }
+
+    #[test]
+    fn a_solid_model_operations_box_and_default_fidelity_are_one_value() {
+        let fidelity = |name: &str| serde_json::json!({"_type": "EnumItem", "name": name});
+        let equal = |class_name: &str, left: &str, right: &str| {
+            reconciliation_property_values_equal(
+                class_name,
+                "CollisionFidelity",
+                Some(&fidelity(left)),
+                Some(&fidelity(right)),
+            )
+        };
+        for class_name in ["UnionOperation", "NegateOperation", "IntersectOperation"] {
+            assert!(equal(class_name, "Default", "Box"));
+            assert!(equal(class_name, "Box", "Default"));
+            assert!(!equal(class_name, "Hull", "Default"));
+            assert!(!equal(class_name, "Hull", "PreciseConvexDecomposition"));
+        }
+        assert!(!equal("MeshPart", "Default", "Box"));
+    }
+
+    #[test]
+    fn a_hull_is_not_aligned_across_a_mesh_change() {
+        let hull = |bytes: &[u8]| serde_json::json!({"_type": "SharedString", "base64": base64::encode(bytes)});
+        let record = |mesh: &str, hull_bytes: &[u8]| {
+            Map::from_iter([
+                ("MeshId".to_string(), serde_json::json!(mesh)),
+                ("PhysicalConfigData".to_string(), hull(hull_bytes)),
+            ])
+        };
+        let reference = record("rbxassetid://1", b"CSGPHS\x08\0\0\0\x01\0first cook");
+        let same_mesh = record("rbxassetid://1", b"CSGPHS\x08\0\0\0\x01\0second cook");
+        let other_mesh = record("rbxassetid://2", b"CSGPHS\x08\0\0\0\x01\0other cook");
+        assert!(reconciliation_maps_equal(
+            "MeshPart", &reference, &same_mesh
+        ));
+        assert!(!reconciliation_maps_equal(
+            "MeshPart",
+            &reference,
+            &other_mesh
+        ));
+        let mut aligned = same_mesh.clone();
+        align_equivalent_property_map_values("MeshPart", &reference, &mut aligned);
+        assert_eq!(
+            aligned["PhysicalConfigData"],
+            reference["PhysicalConfigData"]
+        );
+        let mut kept = other_mesh.clone();
+        align_equivalent_property_map_values("MeshPart", &reference, &mut kept);
+        assert_eq!(kept["PhysicalConfigData"], other_mesh["PhysicalConfigData"]);
     }
 
     #[test]

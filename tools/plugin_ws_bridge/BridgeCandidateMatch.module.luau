@@ -53,7 +53,8 @@ function BridgeCandidateMatch.choose(
 	properties: any,
 	attributes: any,
 	compareProperty: (any, string, any) -> boolean,
-	compareAttribute: (any, string, any) -> boolean
+	compareAttribute: (any, string, any) -> boolean,
+	exactProperty: ((any, string, any) -> boolean)?
 ): any
 	if #candidates == 0 then
 		return nil
@@ -66,15 +67,35 @@ function BridgeCandidateMatch.choose(
 	local best = nil
 	local bestScore = 0
 	local tied = false
+	local complete = {}
 	for _, candidate in ipairs(candidates) do
 		local score = scoreValues(candidate, properties, compareProperty)
 			+ scoreValues(candidate, attributes, compareAttribute)
+		if score == comparable then
+			complete[#complete + 1] = candidate
+		end
 		if score > bestScore then
 			best = candidate
 			bestScore = score
 			tied = false
 		elseif score == bestScore and score > 0 then
 			tied = true
+		end
+	end
+	if tied and bestScore == comparable and exactProperty ~= nil then
+		-- Values compare within the engine's readback noise, so two siblings
+		-- a hair apart both match. Among the candidates that match every
+		-- value, the one matching the properties exactly is the one the
+		-- request described; identical twins keep the first.
+		local exact, exactMatches = nil, 0
+		for _, candidate in ipairs(complete) do
+			if scoreValues(candidate, properties, exactProperty) == comparableCount(properties) then
+				exactMatches += 1
+				exact = exact or candidate
+			end
+		end
+		if exactMatches == 1 then
+			return exact
 		end
 	end
 	if tied and bestScore < comparable then

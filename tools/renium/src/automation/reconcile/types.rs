@@ -234,8 +234,17 @@ pub(crate) struct ReconcilePushPlan {
     pub(crate) changed_paths: Vec<PathBuf>,
     pub(crate) target_settings_ids: Vec<String>,
     pub(crate) recreated_settings_ids: HashSet<String>,
+    /// The recreated identities by service: identities repeat across stores,
+    /// so an unchanged instance of another service that shares the string is
+    /// not created anew.
+    pub(crate) recreated_instances: HashSet<(String, String)>,
     pub(crate) previous_class_names: HashMap<(String, String), String>,
     pub(crate) previous_paths: HashMap<(String, String), EditorInstancePath>,
+    /// The identity Studio's capture gave each instance a previous path names,
+    /// by service and merged identity. Studio resolves it before the path, so
+    /// a sibling group whose capture order differs from Studio's child order
+    /// still finds the right instance.
+    pub(crate) previous_identities: HashMap<(String, String), String>,
     pub(crate) instance_deletes: Vec<EditorInstanceChange>,
     pub(crate) property_removals: Vec<EditorPropertyChange>,
     pub(crate) geometry_properties: HashMap<(String, String), Vec<String>>,
@@ -258,12 +267,17 @@ pub(crate) struct PreparedPushVerification {
 pub(crate) struct MergeChanges {
     pub(crate) editor: HashSet<PathBuf>,
     pub(crate) studio: HashSet<PathBuf>,
+    /// Studio's settings documents with the identities the merge paired them
+    /// to, for every path whose Studio side changed. The push plan compares
+    /// against these so its previous locations follow the merge's pairing.
+    pub(crate) aligned_studio: HashMap<PathBuf, SettingsBytecode>,
 }
 
 pub(crate) struct MergedEntry {
     pub(crate) value: Option<SnapshotEntry>,
     pub(crate) editor_changed: bool,
     pub(crate) studio_changed: bool,
+    pub(crate) aligned_studio: Option<SettingsBytecode>,
 }
 
 pub(crate) struct SnapshotSides<'a> {

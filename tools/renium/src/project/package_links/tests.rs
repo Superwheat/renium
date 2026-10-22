@@ -1123,6 +1123,69 @@ fn restoring_a_link_never_writes_an_empty_script_over_a_consumer_file() {
 }
 
 #[test]
+fn a_reference_that_resolves_inside_its_own_store_is_not_an_outside_reference() {
+    let weld_store = settings_document(vec![
+        SettingsBytecodeInstance {
+            settings_id: "ss".into(),
+            name: "ServerStorage".into(),
+            class_name: "ServerStorage".into(),
+            parent_index: None,
+            properties: Map::new(),
+            attributes: Map::new(),
+        },
+        SettingsBytecodeInstance {
+            settings_id: "reconcile:24".into(),
+            name: "Chassis".into(),
+            class_name: "Part".into(),
+            parent_index: Some(0),
+            properties: Map::new(),
+            attributes: Map::new(),
+        },
+        SettingsBytecodeInstance {
+            settings_id: "weld".into(),
+            name: "ChassisWeld".into(),
+            class_name: "WeldConstraint".into(),
+            parent_index: Some(0),
+            properties: Map::from_iter([(
+                "Part0".into(),
+                json!({"_type":"Ref","settingsId":"reconcile:24"}),
+            )]),
+            attributes: Map::new(),
+        },
+    ]);
+    let workspace_store = PathBuf::from("instances/Workspace.renium");
+    let documents = HashMap::from([
+        (workspace_store.clone(), settings_document(Vec::new())),
+        (PathBuf::from("instances/ServerStorage.renium"), weld_store),
+    ]);
+    assert!(
+        !referenced_settings_ids_outside(&documents, &workspace_store).contains("reconcile:24"),
+        "an ID the referring store defines itself is not a reference into another store"
+    );
+    assert!(external_reference_sources(&documents, &workspace_store, "reconcile:24").is_empty());
+
+    // A reference that names another service is a reference into that store
+    // even when the referring store defines the same id for its own instance.
+    let mut explicit = settings_document(Vec::new());
+    explicit.instances = documents[&PathBuf::from("instances/ServerStorage.renium")]
+        .instances
+        .clone();
+    explicit.instances[2].properties.insert(
+        "Part1".into(),
+        json!({"_type":"Ref","settingsId":"reconcile:24","pathSegments":["Workspace","Remote"]}),
+    );
+    let documents = HashMap::from([
+        (workspace_store.clone(), settings_document(Vec::new())),
+        (PathBuf::from("instances/ServerStorage.renium"), explicit),
+    ]);
+    assert!(referenced_settings_ids_outside(&documents, &workspace_store).contains("reconcile:24"));
+    assert_eq!(
+        external_reference_sources(&documents, &workspace_store, "reconcile:24"),
+        vec!["ServerStorage.renium: ServerStorage.ChassisWeld".to_string()]
+    );
+}
+
+#[test]
 fn linked_model_keeps_renamed_root_and_world_transform() {
     let dir = temp_dir("linked-model-placement");
     let src_root = dir.join("src");

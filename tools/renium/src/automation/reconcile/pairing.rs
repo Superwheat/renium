@@ -263,6 +263,65 @@ pub(crate) fn align_observation_ids_to_baseline(
     align_settings_ids_to_reference(baseline, observed);
 }
 
+/// A store can reuse an identity for another instance when a subtree is
+/// replaced, since fresh identities are numbered from the store's size. A
+/// Roblox instance never changes class, so an identity whose class differs
+/// between the files and the baseline denotes a new instance: it gets a fresh
+/// identity before pairing, and the baseline's instance of that identity is
+/// merged as removed instead of as replaced in place by a stranger.
+pub(crate) fn release_reassigned_editor_ids(
+    baseline: &SettingsBytecode,
+    editor: &mut SettingsBytecode,
+    studio: &SettingsBytecode,
+    referenced_elsewhere: &HashSet<String>,
+) {
+    let baseline_classes = baseline
+        .instances
+        .iter()
+        .map(|instance| (instance.settings_id.as_str(), instance.class_name.as_str()))
+        .collect::<HashMap<_, _>>();
+    // A reference from another store names the identity as the files author
+    // it; renaming it here would leave that reference behind, so such an
+    // identity keeps the alignment it had.
+    let reassigned = editor
+        .instances
+        .iter()
+        .filter(|instance| {
+            baseline_classes
+                .get(instance.settings_id.as_str())
+                .is_some_and(|class_name| *class_name != instance.class_name)
+                && !referenced_elsewhere.contains(&instance.settings_id)
+        })
+        .map(|instance| instance.settings_id.clone())
+        .collect::<Vec<_>>();
+    if reassigned.is_empty() {
+        return;
+    }
+    let mut all_ids = baseline
+        .instances
+        .iter()
+        .chain(&editor.instances)
+        .chain(&studio.instances)
+        .map(|instance| instance.settings_id.clone())
+        .collect::<HashSet<_>>();
+    let mut seed = all_ids.len();
+    let remap = reassigned
+        .into_iter()
+        .map(|id| {
+            let fresh =
+                crate::bytecode::edit::next_editor_settings_id_fast(&mut all_ids, &mut seed);
+            (id, fresh)
+        })
+        .collect::<HashMap<_, _>>();
+    for instance in &mut editor.instances {
+        if let Some(id) = remap.get(&instance.settings_id) {
+            instance.settings_id.clone_from(id);
+        }
+        remap_record_reference_ids(&mut instance.properties, &remap);
+        remap_record_reference_ids(&mut instance.attributes, &remap);
+    }
+}
+
 pub(crate) fn align_new_instance_ids(
     baseline: &SettingsBytecode,
     editor: &SettingsBytecode,
@@ -734,7 +793,11 @@ pub(crate) fn protect_package_links(
         .collect::<HashMap<_, _>>();
 
     for (id, (base_index, base_instance)) in &base_by_id {
+        // A PackageLink gone from both sides (unlinked in Studio by `upl` and
+        // stripped from the files by a shared link) is agreement, not a
+        // removal the merge would have to carry into Studio.
         if !studio_by_id.contains_key(id)
+            && editor_by_id.contains_key(id)
             && !base
                 .is_some_and(|document| package_parent_is_missing(document, *base_index, studio))
         {

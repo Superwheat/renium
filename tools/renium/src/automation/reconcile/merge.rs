@@ -45,6 +45,7 @@ pub(crate) fn merge_snapshots_with_changes(
                 value: editor_entry.cloned(),
                 editor_changed: false,
                 studio_changed: false,
+                aligned_studio: None,
             }
         } else if path
             .file_name()
@@ -68,6 +69,9 @@ pub(crate) fn merge_snapshots_with_changes(
         }
         if result.studio_changed {
             changes.studio.insert(path.clone());
+            if let Some(document) = result.aligned_studio {
+                changes.aligned_studio.insert(path.clone(), document);
+            }
         }
         if let Some(value) = result.value {
             merged.insert(path, value);
@@ -286,6 +290,7 @@ pub(crate) fn merge_entry(
         editor_changed: !entries_equivalent(path, editor, value.as_ref()),
         studio_changed: !entries_equivalent(path, studio, value.as_ref()),
         value,
+        aligned_studio: None,
     }
 }
 
@@ -511,6 +516,7 @@ pub(crate) fn merge_settings_entry(
             value: editor.cloned(),
             editor_changed: false,
             studio_changed: false,
+            aligned_studio: None,
         });
     }
     let mut editor_doc = settings_document(editor)?;
@@ -520,11 +526,12 @@ pub(crate) fn merge_settings_entry(
             value: editor.cloned(),
             editor_changed: false,
             studio_changed: false,
+            aligned_studio: None,
         });
     }
     remove_reconciliation_derived_properties(&mut editor_doc);
     remove_reconciliation_derived_properties(&mut studio_doc);
-    let (merged, editor_equivalent, studio_equivalent) = if first_pairing {
+    let (merged, editor_equivalent, studio_equivalent, aligned_studio) = if first_pairing {
         let previous_conflicts = conflicts.len();
         align_first_pairing(
             path,
@@ -540,7 +547,7 @@ pub(crate) fn merge_settings_entry(
         align_reconciliation_protected_workspace_cameras(&editor_doc, &mut studio_doc);
         if conflicts.len() > previous_conflicts {
             let studio_equivalent = settings_documents_equivalent(&studio_doc, &editor_doc);
-            (editor_doc, true, studio_equivalent)
+            (editor_doc, true, studio_equivalent, Some(studio_doc))
         } else {
             let no_source_changes = HashSet::new();
             let empty = SettingsBytecode {
@@ -560,11 +567,24 @@ pub(crate) fn merge_settings_entry(
             }));
             let editor_equivalent = settings_documents_equivalent(&editor_doc, &merged);
             let studio_equivalent = settings_documents_equivalent(&studio_doc, &merged);
-            (merged, editor_equivalent, studio_equivalent)
+            (
+                merged,
+                editor_equivalent,
+                studio_equivalent,
+                Some(studio_doc),
+            )
         }
     } else {
         let mut base_doc = settings_document(base)?;
         remove_reconciliation_derived_properties(&mut base_doc);
+        let referenced_elsewhere =
+            reassigned_ids_referenced_by_other_stores(path, sides.editor, &base_doc, &editor_doc)?;
+        release_reassigned_editor_ids(
+            &base_doc,
+            &mut editor_doc,
+            &studio_doc,
+            &referenced_elsewhere,
+        );
         align_observation_ids_to_baseline(&base_doc, &mut editor_doc);
         align_observation_ids_to_baseline(&base_doc, &mut studio_doc);
         align_new_instance_ids(&base_doc, &editor_doc, &mut studio_doc)?;
@@ -614,15 +634,15 @@ pub(crate) fn merge_settings_entry(
             &sides.studio.entries,
         )?;
         if settings_documents_equivalent(&editor_doc, &studio_doc) {
-            (editor_doc, true, true)
+            (editor_doc, true, true, None)
         } else if editor_source_changes.is_empty()
             && settings_documents_equivalent(&editor_doc, &base_doc)
         {
-            (studio_doc, false, true)
+            (studio_doc, false, true, None)
         } else if studio_source_changes.is_empty()
             && settings_documents_equivalent(&studio_doc, &base_doc)
         {
-            (editor_doc, true, false)
+            (editor_doc, true, false, Some(studio_doc))
         } else {
             let (merged, merge_conflicts) = merge_reconciliation_settings_documents(
                 &base_doc,
@@ -637,7 +657,12 @@ pub(crate) fn merge_settings_entry(
             }));
             let editor_equivalent = settings_documents_equivalent(&editor_doc, &merged);
             let studio_equivalent = settings_documents_equivalent(&studio_doc, &merged);
-            (merged, editor_equivalent, studio_equivalent)
+            (
+                merged,
+                editor_equivalent,
+                studio_equivalent,
+                Some(studio_doc),
+            )
         }
     };
     let value = if merged.instances.is_empty() && editor.is_none() && studio.is_none() {
@@ -656,11 +681,98 @@ pub(crate) fn merge_settings_entry(
         Some(_) => !studio_equivalent,
         None => value.is_some(),
     };
+    let aligned_studio = (studio_changed && studio.is_some())
+        .then_some(aligned_studio)
+        .flatten();
     Ok(MergedEntry {
         value,
         editor_changed,
         studio_changed,
+        aligned_studio,
     })
+}
+
+/// The identities this store reuses for another class that some other store
+/// of the same files references; those stores are decoded only when a reuse
+/// exists.
+fn reassigned_ids_referenced_by_other_stores(
+    path: &Path,
+    editor: &ProjectSnapshot,
+    base_doc: &SettingsBytecode,
+    editor_doc: &SettingsBytecode,
+) -> Result<HashSet<String>> {
+    let baseline_classes = base_doc
+        .instances
+        .iter()
+        .map(|instance| (instance.settings_id.as_str(), instance.class_name.as_str()))
+        .collect::<HashMap<_, _>>();
+    let reassigned = editor_doc
+        .instances
+        .iter()
+        .filter(|instance| {
+            baseline_classes
+                .get(instance.settings_id.as_str())
+                .is_some_and(|class_name| *class_name != instance.class_name)
+        })
+        .map(|instance| instance.settings_id.as_str())
+        .collect::<HashSet<_>>();
+    let mut referenced = HashSet::new();
+    if reassigned.is_empty() {
+        return Ok(referenced);
+    }
+    for (other_path, entry) in &editor.entries {
+        if other_path == path
+            || !other_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_service_settings_file_name)
+        {
+            continue;
+        }
+        let document = settings_document(Some(entry))?;
+        for instance in &document.instances {
+            for value in instance
+                .properties
+                .values()
+                .chain(instance.attributes.values())
+            {
+                collect_referenced_ids(value, &reassigned, &mut referenced);
+            }
+        }
+    }
+    Ok(referenced)
+}
+
+fn collect_referenced_ids(value: &Value, wanted: &HashSet<&str>, output: &mut HashSet<String>) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_referenced_ids(value, wanted, output);
+            }
+        }
+        Value::Object(object) => {
+            let reference = if object.get("_type").and_then(Value::as_str) == Some("Ref") {
+                Some(object)
+            } else {
+                object.get("Ref").and_then(Value::as_object)
+            };
+            if let Some(reference) = reference {
+                for selector in ["settingsId", "instanceId"] {
+                    if let Some(id) = reference.get(selector).and_then(Value::as_str)
+                        && wanted.contains(id)
+                    {
+                        output.insert(id.to_string());
+                    }
+                }
+            }
+            for (key, value) in object {
+                if key != "Ref" {
+                    collect_referenced_ids(value, wanted, output);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 pub(crate) fn merge_reconciliation_settings_documents(

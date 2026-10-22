@@ -384,6 +384,9 @@ do
 			return if ordinal == 1 then first else if ordinal == 2 then second else nil
 		end,
 		matchedSettingsInstance = function() end,
+		capturedIdentityInstance = function(_, settingsId)
+			return if settingsId == "debug:1_7" then first else nil
+		end,
 		candidateBucketsForParent = function(parent)
 			assert(parent == matchedParent)
 			return { Texture = { Texture = { first, second } } }
@@ -409,6 +412,22 @@ do
 	entry.previousPathOrdinals = { 1, 1, 1 }
 	assert(resolve(entry, "Workspace", {}, { parent = matchedParent }, {}) == wrong,
 		"A lookup-only ancestor must honor its established previous identity before its desired path")
+	entry.previousPathSegments = {}
+	entry.previousPathOrdinals = {}
+	entry.ambiguousSiblings = true
+	entry.anchorOnly = false
+	entry.recreate = true
+	assert(resolve(entry, "Workspace", {}, { parent = matchedParent }, {}) == nil,
+		"A recreated instance is created, never matched to a sibling nobody claimed")
+	entry.recreate = false
+	entry.pathOrdinals[3] = 2
+	entry.previousPathSegments = { "Workspace", "Part", "Texture" }
+	entry.previousPathOrdinals = { 1, 109, 2 }
+	entry.previousSettingsId = "debug:1_7"
+	assert(resolve(entry, "Workspace", {}, { parent = matchedParent }, {}) == first,
+		"The capture's identity for the instance outranks its previous path ordinal")
+	assert(resolve(entry, "Workspace", {}, { parent = matchedParent }, { [first] = true }) == wrong,
+		"A claimed identity falls back to the previous path")
 end
 do
 	local tokens = {}

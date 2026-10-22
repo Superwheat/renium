@@ -1298,13 +1298,57 @@ local function rememberEntryResolution(
 	entry: { [string]: any },
 	serviceName: string,
 	instance: Instance,
-	claimedInstances: { [Instance]: boolean },
+	claimedInstances: { [Instance]: any },
 	ctx: { [string]: any }
 )
-	claimedInstances[instance] = true
+	claimedInstances[instance] = entry.key or true
 	if entry.settingsId ~= nil then
 		rememberMatchedSettingsInstance(serviceName, entry.settingsId, instance, ctx)
 	end
+end
+
+-- The identity the reconciler's capture gave an instance: a matched identity,
+-- or the debug id of an instance no push has identified. Debug ids outside the
+-- plugin's own snapshot are indexed once per push.
+local function capturedIdentityInstance(serviceName: string, settingsId: string, ctx: { [string]: any }): Instance?
+	-- strongSettingsId is true for a debug id. A matched identity resolves
+	-- through the plugin's registry; a debug id through an index of the
+	-- service built once per push.
+	if not strongSettingsId(settingsId) then
+		return resolveInstanceBySettingsId(serviceName, settingsId, ctx)
+	end
+	local lookups = ctx.capturedIdentityLookups
+	if lookups == nil then
+		lookups = {}
+		ctx.capturedIdentityLookups = lookups
+	end
+	local lookup = lookups[serviceName]
+	if lookup == nil then
+		lookup = {}
+		for _, descendant in ipairs(game:GetService(serviceName):GetDescendants()) do
+			lookup["debug:" .. tostring(descendant:GetDebugId(32))] = descendant
+		end
+		lookups[serviceName] = lookup
+	end
+	return liveInstance(lookup[settingsId])
+end
+
+local function describeUnresolvedPrevious(entry: { [string]: any }, claimedInstances: { [Instance]: any }): string
+	local instance = resolvePathSegments(entry.previousPathSegments, nil, entry.previousPathOrdinals)
+	if instance == nil then
+		if entry.previousSettingsId ~= nil then
+			return `no instance at the previous path and identity {entry.previousSettingsId} is not in Studio`
+		end
+		return "no instance at the previous path"
+	end
+	if claimedInstances[instance] then
+		return `{instance:GetFullName()} is already claimed by entry {tostring(claimedInstances[instance])}`
+	end
+	local wanted = tostring(entry.className)
+	if entry.previousClassName ~= nil then
+		wanted ..= ` or {tostring(entry.previousClassName)}`
+	end
+	return `{instance:GetFullName()} is a {instance.ClassName}, not {wanted}`
 end
 
 local function resolveEntryInstance(
@@ -1312,12 +1356,18 @@ local function resolveEntryInstance(
 	serviceName: string,
 	ctx: { [string]: any },
 	resolvedEntries: { [string]: any },
-	claimedInstances: { [Instance]: boolean }
+	claimedInstances: { [Instance]: any }
 ): Instance?
 	local previousClassName = tostring(entry.previousClassName or "")
 	local function classCompatible(candidate: Instance): boolean
 		return candidate.ClassName == entry.className
 			or (previousClassName ~= "" and candidate.ClassName == previousClassName)
+	end
+	if entry.recreate then
+		-- The reconciler found no Studio counterpart for this identity. A
+		-- same-named sibling that no other entry claimed is another instance,
+		-- so this one is created rather than matched.
+		return nil
 	end
 	local parent = resolveEntryParent(entry, resolvedEntries)
 	-- A matched duplicate ancestor can have a different live ordinal. Resolve
@@ -1329,6 +1379,14 @@ local function resolveEntryInstance(
 	if persistent ~= nil and not claimedInstances[persistent]
 		and (not entry.anchorOnly or classCompatible(persistent)) then
 		return persistent
+	end
+	if entry.previousSettingsId ~= nil then
+		-- The capture's own identity for the instance outranks its path: the
+		-- capture can list same-named siblings in another order than Studio.
+		local captured = capturedIdentityInstance(serviceName, entry.previousSettingsId, ctx)
+		if captured ~= nil and not claimedInstances[captured] and classCompatible(captured) then
+			return captured
+		end
 	end
 
 	local previousPathInstance = if #entry.previousPathSegments > 0
@@ -1411,6 +1469,14 @@ local function resolveEntryInstance(
 		function(candidate, attributeName, rawValue)
 			local okDecode, decoded = decodeValue(rawValue, nil, ctx, serviceName)
 			return okDecode and exactValuesEqual(candidate:GetAttribute(attributeName), decoded)
+		end,
+		function(candidate, propertyName, rawValue)
+			if not classHasProperty(candidate, propertyName) then
+				return false
+			end
+			local okRead, current = readProperty(candidate, propertyName)
+			local okDecode, decoded = decodePropertyValue(candidate, propertyName, rawValue, ctx, serviceName)
+			return okRead and okDecode and exactValuesEqual(current, decoded)
 		end
 	)
 	if chosen == nil and pathInstance ~= nil and included[pathInstance] then
@@ -1424,7 +1490,35 @@ local function resolveEntryInstance(
 		chosen = candidates[1]
 	end
 	if chosen == nil and #candidates > 0 then
-		error(`Could not uniquely identify {table.concat(entry.pathSegments, ".")} ({#candidates} unmatched siblings); reconcile before retrying`)
+		-- Name the values that failed to single out a sibling; the daemon log
+		-- shows the reconciler's expectation against what Studio holds.
+		local details = {}
+		for index, candidate in ipairs(candidates) do
+			if index > 3 then
+				details[#details + 1] = `and {#candidates - 3} more`
+				break
+			end
+			local parts = {}
+			for propertyName, rawValue in pairs(entry.matchProperties or {}) do
+				local okRead, current = readProperty(candidate, propertyName)
+				local okDecode, decoded = decodePropertyValue(candidate, propertyName, rawValue, ctx, serviceName)
+				local same = okRead and okDecode and propertyValuesEqual(candidate, propertyName, current, decoded)
+				if not same then
+					parts[#parts + 1] = `{propertyName}={tostring(current)} vs {tostring(decoded)}`
+				end
+			end
+			for attributeName, rawValue in pairs(entry.matchAttributes or {}) do
+				local okDecode, decoded = decodeValue(rawValue, nil, ctx, serviceName)
+				local current = candidate:GetAttribute(attributeName)
+				if not (okDecode and exactValuesEqual(current, decoded)) then
+					parts[#parts + 1] = `@{attributeName}={tostring(current)} vs {tostring(decoded)}`
+				end
+			end
+			details[#details + 1] = `#{index} {candidate:GetFullName()}: {table.concat(parts, ", ")}`
+		end
+		error(
+			`Could not uniquely identify {table.concat(entry.pathSegments, ".")} ({#candidates} unmatched siblings: {table.concat(details, "; ")}); reconcile before retrying`
+		)
 	end
 	if chosen == nil and pathInstance ~= nil and not classCompatible(pathInstance) then
 		error(`Ambiguous class replacement at {entry.key}; reconcile before replacing it`)
@@ -1501,6 +1595,15 @@ local function writePropertyForSync(
 	value: any,
 	ctx: { [string]: any }?
 ): (boolean, any)
+	-- A solid operation reports Box while its mesh is a placeholder and Default
+	-- once cooked, and honours neither write; the CSG data decides.
+	local function solidFidelityAlias(current: any): boolean
+		return propertyName == "CollisionFidelity"
+			and instance:IsA("TriangleMeshPart")
+			and not instance:IsA("MeshPart")
+			and (current == Enum.CollisionFidelity.Box or current == Enum.CollisionFidelity.Default)
+			and (value == Enum.CollisionFidelity.Box or value == Enum.CollisionFidelity.Default)
+	end
 	if ctx and ctx.assertSessionOwnership then
 		ctx.assertSessionOwnership()
 	end
@@ -1532,11 +1635,18 @@ local function writePropertyForSync(
 	end
 	markLiveMutation(ctx, instance)
 	local okRead, current = readProperty(instance, propertyName)
-	if propertyName == "CollisionFidelity" and instance:IsA("MeshPart") then
-		-- Collision geometry is cooked asynchronously, even when assignment succeeds.
-		-- Keep its expected event alive until the engine exposes the requested value.
-		local deadline = os.clock() + 3
-		while okRead and not valuesEqual(current, value) and os.clock() < deadline do
+	if propertyName == "CollisionFidelity" and instance:IsA("TriangleMeshPart") then
+		-- Collision geometry is cooked asynchronously for MeshParts and Unions,
+		-- even when assignment succeeds, and a Union recook queues behind the
+		-- other cooks of a large push. Keep its expected event alive until the
+		-- engine exposes the requested value.
+		local deadline = os.clock() + 10
+		while
+			okRead
+			and not valuesEqual(current, value)
+			and not solidFidelityAlias(current)
+			and os.clock() < deadline
+		do
 			if ctx ~= nil then
 				ctx.assertSessionOwnership()
 			end
@@ -1549,6 +1659,9 @@ local function writePropertyForSync(
 		return true, result
 	end
 	if not okRead or not propertyValuesEqual(instance, propertyName, current, value) then
+		if okRead and solidFidelityAlias(current) then
+			return true, result
+		end
 		cancelExpectedEvent(ctx, token)
 		if okBefore and okRead and propertyValuesEqual(instance, propertyName, current, before) then
 			local joint = jointHoldingPart(instance)
@@ -1557,9 +1670,13 @@ local function writePropertyForSync(
 					`Roblox did not retain CFrame; the part is held by {joint:GetFullName()}, so move the assembly root or recreate the model instead`
 			end
 		end
-		return false, `Roblox did not retain {propertyName}`
+		local detail = `wanted {tostring(value)}; has {tostring(current)}`
+		if propertyName == "CFrame" then
+			detail ..= `; had {tostring(before)}; anchored {tostring((instance :: any).Anchored)}`
+		end
+		return false, `Roblox did not retain {propertyName} ({detail})`
 	end
-	if propertyName == "CollisionFidelity" and instance:IsA("MeshPart") and ctx ~= nil then
+	if propertyName == "CollisionFidelity" and instance:IsA("TriangleMeshPart") and ctx ~= nil then
 		-- Cooking may finish after the deferred pre-write signal, with no final
 		-- signal. Consume our exact expectation before its settle window expires.
 		ctx.samplePropertyChange(instance, propertyName)
@@ -2008,10 +2125,12 @@ local function sortedInstanceEntries(
 						key = pathCacheKey(pathSegments, raw.pathOrdinals),
 						className = className,
 						previousClassName = if type(raw.previousClassName) == "string" then raw.previousClassName else nil,
+						previousSettingsId = settingsIdText(raw.previousSettingsId),
 						settingsId = settingsIdText(raw.settingsId),
 						ambiguousSiblings = raw.ambiguousSiblings == true,
 						exactPathIdentity = change.mode == "deleteInstances",
 						anchorOnly = raw.anchorOnly == true,
+						recreate = raw.recreate == true,
 						matchProperties = if type(raw.matchProperties) == "table" then raw.matchProperties else {},
 						matchAttributes = if type(raw.matchAttributes) == "table" then raw.matchAttributes else {},
 					}
@@ -2035,7 +2154,7 @@ local function syncDesiredEntry(
 	ctx: { [string]: any },
 	stats: { [string]: any },
 	resolvedEntries: { [string]: any },
-	claimedInstances: { [Instance]: boolean },
+	claimedInstances: { [Instance]: any },
 	createMissing: boolean
 ): Instance?
 	local instance = liveInstance(resolvedEntries[entry.key])
@@ -2352,7 +2471,9 @@ local function applyInstanceUpserts(
 		if #entry.previousPathSegments > 0 then
 			local instance = resolveEntryInstance(entry, service.Name, ctx, resolvedEntries, claimedInstances)
 			if instance == nil then
-				error(`Could not identify the previous instance at {entry.key}; Studio was not changed`)
+				error(
+					`Could not identify the previous instance at {entry.key} ({describeUnresolvedPrevious(entry, claimedInstances)}); Studio was not changed`
+				)
 			end
 			resolvedEntries[entry.key] = instance
 			rememberEntryResolution(entry, service.Name, instance, claimedInstances, ctx)
@@ -2504,9 +2625,15 @@ local function changedPropertyNames(properties)
 	if properties.MeshSize ~= nil then
 		names[#names + 1] = "MeshSize"
 	end
+	-- A CFrame written to an unanchored part is re-solved through its joints,
+	-- which drags the part off the requested value; anchoring first keeps it.
+	if properties.Anchored ~= nil then
+		names[#names + 1] = "Anchored"
+	end
 	for propertyName in pairs(properties) do
 		propertyName = tostring(propertyName)
 		if propertyName ~= "MeshId" and propertyName ~= "MeshContent" and propertyName ~= "MeshSize"
+			and propertyName ~= "Anchored"
 			and (propertyName ~= "TextScaled" or properties.TextWrapped == nil) then
 			names[#names + 1] = propertyName
 		end
@@ -9372,6 +9499,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local previousResolveCache = ctx.resolveCache
 		local previousSettingsIdLookupByService = ctx.settingsIdLookupByService
 		local previousMatchCandidateBuckets = ctx.matchCandidateBuckets
+		local previousCapturedIdentityLookups = ctx.capturedIdentityLookups
 		local previousSelectionReplacements = ctx.selectionReplacements
 		local previousUnreadablePropertyNames = ctx.unreadablePropertyNames
 		local previousResolveStagedPath = ctx.resolveStagedPath
@@ -9382,6 +9510,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		ctx.resolveCache = {}
 		ctx.settingsIdLookupByService = {}
 		ctx.matchCandidateBuckets = {}
+		ctx.capturedIdentityLookups = {}
 		ctx.selectionReplacements = selectionReplacements
 		ctx.resolveStagedPath = if outerTransaction ~= nil then outerTransaction.resolveStagedPath else nil
 		ctx.editorTransaction = outerTransaction
@@ -9564,6 +9693,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		ctx.resolveCache = previousResolveCache
 		ctx.settingsIdLookupByService = previousSettingsIdLookupByService
 		ctx.matchCandidateBuckets = previousMatchCandidateBuckets
+		ctx.capturedIdentityLookups = previousCapturedIdentityLookups
 		ctx.selectionReplacements = previousSelectionReplacements
 		ctx.unreadablePropertyNames = previousUnreadablePropertyNames
 		ctx.resolveStagedPath = previousResolveStagedPath

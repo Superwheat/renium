@@ -306,6 +306,15 @@ pub(crate) fn amend_reconciled_changes(
                 // captured target. Keep its lookup anchor without an upsert.
                 instance.anchor_only = true;
             }
+            // Only an upsert creates; a removal of the same identity (a
+            // replaced solid operation) must still find the old instance.
+            if change.mode == "upsertInstances"
+                && plan
+                    .recreated_instances
+                    .contains(&(change.service.clone(), instance.settings_id.clone()))
+            {
+                instance.recreate = true;
+            }
             if let Some(previous) = plan
                 .previous_class_names
                 .get(&(change.service.clone(), instance.settings_id.clone()))
@@ -318,6 +327,12 @@ pub(crate) fn amend_reconciled_changes(
             {
                 instance.previous_path_segments = previous.path_segments.clone();
                 instance.previous_path_ordinals = previous.path_ordinals.clone();
+            }
+            if let Some(identity) = plan
+                .previous_identities
+                .get(&(change.service.clone(), instance.settings_id.clone()))
+            {
+                instance.previous_settings_id = Some(identity.clone());
             }
         }
     }
@@ -396,18 +411,10 @@ pub(crate) fn reconciliation_push_plan(
     paths.dedup();
 
     let paths = paths.into_iter().collect::<HashSet<_>>();
-    reconciliation_push_plan_for_paths(studio, merged, &paths)
-}
-
-pub(crate) fn reconciliation_push_plan_for_paths(
-    studio: &ProjectSnapshot,
-    merged: &ProjectSnapshot,
-    paths: &HashSet<PathBuf>,
-) -> Result<ReconcilePushPlan> {
     reconciliation_push_plan_for_paths_with_prepared_settings(
         studio,
         merged,
-        paths,
+        &paths,
         &HashMap::new(),
         false,
         false,
@@ -600,6 +607,36 @@ pub(crate) fn append_settings_push_plan(
     append_aligned_settings_push_plan(path, desired, &observed, plan)
 }
 
+/// A solid-model operation's geometry (its CSG tree, mesh, hull and the asset
+/// it was built from) is engine data the plugin cannot write, so an operation
+/// paired with one of different geometry cannot be edited into it in place.
+fn solid_geometry_replaced(
+    desired: &SettingsBytecode,
+    desired_index: usize,
+    observed: &SettingsBytecode,
+    observed_index: usize,
+) -> bool {
+    let instance = &desired.instances[desired_index];
+    let existing = &observed.instances[observed_index];
+    // A direct child of the service root is re-imported through the additive
+    // root path, which needs its name absent from Studio; such an operation
+    // keeps the in-place path until that import can replace by identity.
+    let nested = instance
+        .parent_index
+        .is_some_and(|parent| desired.instances[parent].parent_index.is_some());
+    if !nested
+        || instance.class_name != existing.class_name
+        || !crate::rbx::encode::is_solid_model_operation(&instance.class_name)
+    {
+        return false;
+    }
+    crate::rbx::encode::engine_geometry_properties(&instance.class_name)
+        .iter()
+        .copied()
+        .chain(["AssetId"])
+        .any(|name| instance.properties.get(name) != existing.properties.get(name))
+}
+
 pub(crate) fn settings_service_name(
     path: &Path,
     desired: &SettingsBytecode,
@@ -675,6 +712,17 @@ pub(crate) fn append_aligned_settings_push_plan(
             }) {
                 return None;
             }
+            if !bootstrap
+                && let Some(observed_index) = observed_index
+                && solid_geometry_replaced(desired, desired_index, observed, observed_index)
+            {
+                return Some(InstanceDelta {
+                    desired_index,
+                    observed_index: None,
+                    reset_properties: Vec::new(),
+                    deleted_attributes: Vec::new(),
+                });
+            }
             let Some(observed_index) = observed_index else {
                 if bootstrap {
                     return None;
@@ -731,6 +779,17 @@ pub(crate) fn append_aligned_settings_push_plan(
             })
         })
         .collect::<Vec<_>>();
+    // A solid-model operation whose geometry changed is imported anew: its
+    // Studio instance is removed below and the new one carries no previous
+    // location, so Studio creates it instead of editing the old one.
+    let replaced_geometry = instance_deltas
+        .iter()
+        .filter(|delta| delta.observed_index.is_none())
+        .filter_map(|delta| {
+            let id = desired.instances[delta.desired_index].settings_id.as_str();
+            observed_by_id.get(id).map(|index| (id, *index))
+        })
+        .collect::<HashMap<_, _>>();
     // The aligned identity can have a different ordinal, even when its own
     // name and parent identity are unchanged. Preserve the observed paths for
     // exactly the upsert selection, including lookup-only ancestors/siblings.
@@ -749,9 +808,11 @@ pub(crate) fn append_aligned_settings_push_plan(
         selected
             .iter()
             .filter_map(|index| {
-                observed_by_id
-                    .get(desired.instances[*index].settings_id.as_str())
-                    .copied()
+                let id = desired.instances[*index].settings_id.as_str();
+                if replaced_geometry.contains_key(id) {
+                    return None;
+                }
+                observed_by_id.get(id).copied()
             })
             .collect()
     };
@@ -761,6 +822,8 @@ pub(crate) fn append_aligned_settings_push_plan(
         let Some(observed_index) = delta.observed_index else {
             plan.recreated_settings_ids
                 .insert(instance.settings_id.clone());
+            plan.recreated_instances
+                .insert((service.clone(), instance.settings_id.clone()));
             continue;
         };
         let observed_instance = &observed.instances[observed_index];
@@ -871,13 +934,15 @@ pub(crate) fn append_aligned_settings_push_plan(
         }
     }
 
+    let replaced_observed = replaced_geometry.values().copied().collect::<HashSet<_>>();
     let removed = observed
         .instances
         .iter()
         .enumerate()
         .filter(|(index, instance)| {
             instance.parent_index.is_some()
-                && !desired_by_id.contains_key(instance.settings_id.as_str())
+                && (!desired_by_id.contains_key(instance.settings_id.as_str())
+                    || replaced_observed.contains(index))
                 && !is_reconciliation_protected_workspace_camera(observed, *index)
                 && !is_protected_engine_container(observed, *index)
         })
@@ -934,6 +999,84 @@ pub(crate) fn append_aligned_settings_push_plan(
     Ok(())
 }
 
+/// Records, for every previous path and every removal the plan names, the
+/// identity Studio's capture gave that instance. The merge renames the
+/// capture's identities to the files' but keeps its instance order, so the
+/// capture is read beside the aligned document index by index. A capture
+/// whose shape differs is skipped: the paths then stand alone.
+pub(crate) fn attach_capture_identities(
+    plan: &mut ReconcilePushPlan,
+    studio: &ProjectSnapshot,
+    prepared: &HashMap<PathBuf, PreparedEditorSettingsChange>,
+) -> Result<()> {
+    for (path, change) in prepared {
+        let Some(entry) = studio.entries.get(path) else {
+            continue;
+        };
+        let capture = settings_document(Some(entry))?;
+        let aligned = &change.previous;
+        let same_shape = capture.instances.len() == aligned.instances.len()
+            && capture
+                .instances
+                .iter()
+                .zip(&aligned.instances)
+                .all(|(captured, aligned)| {
+                    captured.class_name == aligned.class_name
+                        && captured.name == aligned.name
+                        && captured.parent_index == aligned.parent_index
+                });
+        if !same_shape {
+            crate::app::output::log_global(
+                3,
+                format_args!(
+                    "[renium] capture identities skipped for {}: capture shape differs from the aligned document",
+                    path.display()
+                ),
+            );
+            continue;
+        }
+        let service = settings_service_name(path, &change.current, aligned)?;
+        let index_by_id = aligned
+            .instances
+            .iter()
+            .enumerate()
+            .map(|(index, instance)| (instance.settings_id.as_str(), index))
+            .collect::<HashMap<_, _>>();
+        let identities = plan
+            .previous_paths
+            .keys()
+            .filter(|(path_service, _)| *path_service == service)
+            .filter_map(|key| {
+                index_by_id
+                    .get(key.1.as_str())
+                    .map(|index| (key.clone(), capture.instances[*index].settings_id.clone()))
+            })
+            .collect::<Vec<_>>();
+        crate::app::output::log_global(
+            4,
+            format_args!(
+                "[renium] capture identities for {}: {} previous locations",
+                path.display(),
+                identities.len()
+            ),
+        );
+        plan.previous_identities.extend(identities);
+        for delete in plan
+            .instance_deletes
+            .iter_mut()
+            .filter(|delete| delete.service == service)
+        {
+            for descriptor in &mut delete.instances {
+                if let Some(index) = index_by_id.get(descriptor.settings_id.as_str()) {
+                    descriptor.previous_settings_id =
+                        Some(capture.instances[*index].settings_id.clone());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A delete detaches the whole subtree, so an instance moving out of a
 /// deleted subtree must move first or Studio can no longer identify it.
 pub(crate) fn move_escaping_instances_before_deletes(
@@ -986,10 +1129,24 @@ pub(crate) fn move_escaping_instances_before_deletes(
             })
             .map(|ancestor| ancestor.settings_id.clone())
             .collect::<HashSet<_>>();
-        let (escaping, staying): (Vec<_>, Vec<_>) =
+        let (escaping, mut staying): (Vec<_>, Vec<_>) =
             change.instances.drain(..).partition(|instance| {
                 leaving.contains(&instance.settings_id) || ancestors.contains(&instance.settings_id)
             });
+        // The entries that stay still place their own children under those
+        // ancestors; a lookup-only copy keeps them resolvable by identity
+        // instead of by a desired ordinal Studio may not share.
+        staying.extend(
+            escaping
+                .iter()
+                .filter(|instance| !leaving.contains(&instance.settings_id))
+                .cloned()
+                .map(|mut anchor| {
+                    anchor.anchor_only = true;
+                    anchor.recreate = false;
+                    anchor
+                }),
+        );
         change.instances = staying;
         escapes.push(EditorInstanceChange {
             mode: "upsertInstances".to_string(),

@@ -34,7 +34,12 @@ fn plugin_preserves_small_edits_and_rejects_missing_writes() -> mlua::Result<()>
         local b = table.clone(a)
         assert(valuesEqual(frame(a), frame(b)), "nonfinite CFrame reflexivity")
         b[1] = 0.00001
+        assert(valuesEqual(frame(a), frame(b)), "the engine stores a written CFrame back within 2e-4 studs")
+        b[1] = 0.0005
         assert(not valuesEqual(frame(a), frame(b)), "position precision")
+        b[1] = 0
+        b[4] = 1 - 0.00002
+        assert(not valuesEqual(frame(a), frame(b)), "rotation precision")
         readProperty = function(instance, name) return true, instance[name] end
         writePropertyForSync = function(instance, name, value) instance[name] = value return true end
         decodeValue = function(value) return true, value end

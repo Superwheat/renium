@@ -2631,6 +2631,62 @@ fn a_scope_removed_from_publication_is_not_republished() {
 }
 
 #[test]
+fn a_package_link_both_sides_already_lack_is_not_a_removal_conflict() {
+    let link = |id: &str| SettingsBytecodeInstance {
+        settings_id: id.to_string(),
+        name: "PackageLink".to_string(),
+        class_name: "PackageLink".to_string(),
+        parent_index: Some(1),
+        properties: Map::new(),
+        attributes: Map::new(),
+    };
+    let root = SettingsBytecodeInstance {
+        settings_id: "ws".to_string(),
+        name: "Workspace".to_string(),
+        class_name: "Workspace".to_string(),
+        parent_index: None,
+        properties: Map::new(),
+        attributes: Map::new(),
+    };
+    let car = SettingsBytecodeInstance {
+        settings_id: "car".to_string(),
+        name: "Bavria".to_string(),
+        class_name: "Model".to_string(),
+        parent_index: Some(0),
+        properties: Map::new(),
+        attributes: Map::new(),
+    };
+    let base = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: vec![root.clone(), car.clone(), link("pl")],
+    };
+    let unlinked = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: vec![root.clone(), car.clone()],
+    };
+    let path = Path::new("instances/Workspace.renium");
+    let mut conflicts = Vec::new();
+    pairing::protect_package_links(
+        path,
+        Some(&base),
+        &mut unlinked.clone(),
+        &mut unlinked.clone(),
+        &mut conflicts,
+    );
+    assert!(conflicts.is_empty(), "{conflicts:?}");
+    let mut conflicts = Vec::new();
+    pairing::protect_package_links(
+        path,
+        Some(&base),
+        &mut base.clone(),
+        &mut unlinked.clone(),
+        &mut conflicts,
+    );
+    assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+    assert!(conflicts[0].contains("removes PackageLink"));
+}
+
+#[test]
 fn target_ownership_ends_with_the_live_pair() {
     let coordinator = Coordinator::default();
     let first = PairIdentity {
@@ -3899,7 +3955,15 @@ fn prepared_full_push_reuses_the_same_duplicate_and_reference_mapping() {
         change.previous.instances[3].properties["Value"]["settingsId"],
         "first"
     );
-    let expected = reconciliation_push_plan_for_paths(&studio, &project, &paths).unwrap();
+    let expected = reconciliation_push_plan_for_paths_with_prepared_settings(
+        &studio,
+        &project,
+        &paths,
+        &HashMap::new(),
+        false,
+        false,
+    )
+    .unwrap();
     let actual = reconciliation_push_plan_for_paths_with_prepared_settings(
         &studio, &project, &paths, &prepared, false, false,
     )
@@ -5248,3 +5312,358 @@ mod twins_review;
 mod twins_repro;
 
 mod twins_subsets;
+
+#[test]
+fn a_file_identity_reused_for_another_class_is_a_new_instance_not_a_replacement() {
+    let instance =
+        |id: &str, name: &str, class_name: &str, parent: Option<usize>| SettingsBytecodeInstance {
+            settings_id: id.to_string(),
+            name: name.to_string(),
+            class_name: class_name.to_string(),
+            parent_index: parent,
+            properties: Map::new(),
+            attributes: Map::new(),
+        };
+    let settings_path = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
+    let snapshot = |document: &SettingsBytecode| ProjectSnapshot {
+        entries: [(
+            settings_path.clone(),
+            SnapshotEntry::File(encode_settings_bytecode(document).unwrap()),
+        )]
+        .into_iter()
+        .collect(),
+    };
+    // The baseline and Studio agree: a Model holding a Part and a light.
+    let baseline = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: vec![
+            instance("ws", "Workspace", "Workspace", None),
+            instance("garage", "Garage", "Folder", Some(0)),
+            instance("a", "Model", "Model", Some(1)),
+            instance("b", "Part", "Part", Some(2)),
+            instance("c", "Light", "PointLight", Some(3)),
+        ],
+    };
+    // The files replaced the subtree with a revised copy; its new instances
+    // were numbered from the store's size and so reuse the old identities for
+    // other classes.
+    let revised = |id: &str, name: &str, class_name: &str, parent: Option<usize>| {
+        let mut revised = instance(id, name, class_name, parent);
+        revised.attributes = Map::from_iter([("Revision".to_string(), json!(2))]);
+        revised
+    };
+    let editor = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: vec![
+            instance("ws", "Workspace", "Workspace", None),
+            instance("garage", "Garage", "Folder", Some(0)),
+            revised("c", "Model", "Model", Some(1)),
+            revised("a", "Part", "Part", Some(2)),
+            revised("b", "Light", "PointLight", Some(3)),
+        ],
+    };
+    let mut released = editor.clone();
+    release_reassigned_editor_ids(&baseline, &mut released, &baseline, &HashSet::new());
+    let released_ids = released
+        .instances
+        .iter()
+        .map(|instance| instance.settings_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(&released_ids[..2], &["ws", "garage"]);
+    assert!(
+        released_ids[2..]
+            .iter()
+            .all(|id| !["a", "b", "c"].contains(id)),
+        "{released_ids:?}"
+    );
+    assert_eq!(released_ids.iter().collect::<HashSet<_>>().len(), 5);
+
+    let base = snapshot(&baseline);
+    let (merged, conflicts, changes) = merge_snapshots_with_changes(
+        Some(&base),
+        &snapshot(&editor),
+        &base,
+        ConflictPreference::None,
+        None,
+    )
+    .unwrap();
+    assert!(conflicts.is_empty(), "{conflicts:?}");
+    assert_eq!(changes.studio, HashSet::from([settings_path.clone()]));
+    let merged_doc = settings_document(merged.entries.get(&settings_path)).unwrap();
+    let classes = merged_doc
+        .instances
+        .iter()
+        .map(|instance| (instance.name.as_str(), instance.class_name.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        classes,
+        vec![
+            ("Workspace", "Workspace"),
+            ("Garage", "Folder"),
+            ("Model", "Model"),
+            ("Part", "Part"),
+            ("Light", "PointLight"),
+        ]
+    );
+    // Studio keeps every instance in place; nothing is replaced by a stranger.
+    let prepared = HashMap::from([(
+        settings_path.clone(),
+        PreparedEditorSettingsChange {
+            previous: changes.aligned_studio[&settings_path].clone(),
+            current: merged_doc,
+        },
+    )]);
+    let plan = reconciliation_push_plan_for_paths_with_prepared_settings(
+        &base,
+        &merged,
+        &changes.studio,
+        &prepared,
+        false,
+        false,
+    )
+    .unwrap();
+    assert!(
+        plan.previous_class_names.is_empty(),
+        "{:?}",
+        plan.previous_class_names
+    );
+    assert!(
+        plan.recreated_settings_ids.is_empty(),
+        "{:?}",
+        plan.recreated_settings_ids
+    );
+    assert_eq!(plan.target_settings_ids.len(), 3);
+    assert_eq!(plan.in_place_instances.len(), 3);
+}
+
+#[test]
+fn previous_paths_and_removals_carry_the_identity_studio_captured() {
+    let instance =
+        |id: &str, name: &str, class_name: &str, parent: Option<usize>| SettingsBytecodeInstance {
+            settings_id: id.to_string(),
+            name: name.to_string(),
+            class_name: class_name.to_string(),
+            parent_index: parent,
+            properties: Map::new(),
+            attributes: Map::new(),
+        };
+    let settings_path = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
+    // Studio captured three same-named Parts it never identified, plus one it
+    // had matched; the merge paired them to the files' identities and the
+    // files drop the last one.
+    let capture = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: vec![
+            instance("ws", "Workspace", "Workspace", None),
+            instance("debug:1_11", "Part", "Part", Some(0)),
+            instance("debug:1_12", "Part", "Part", Some(0)),
+            instance("part-c", "Part", "Part", Some(0)),
+            instance("debug:1_14", "Part", "Part", Some(0)),
+        ],
+    };
+    let aligned = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: vec![
+            instance("ws", "Workspace", "Workspace", None),
+            instance("part-b", "Part", "Part", Some(0)),
+            instance("part-a", "Part", "Part", Some(0)),
+            instance("part-c", "Part", "Part", Some(0)),
+            instance("part-d", "Part", "Part", Some(0)),
+        ],
+    };
+    let mut desired = aligned.clone();
+    desired.instances.truncate(4);
+    for part in &mut desired.instances[1..] {
+        part.attributes = Map::from_iter([("Moved".to_string(), json!(true))]);
+    }
+    let studio = ProjectSnapshot {
+        entries: [(
+            settings_path.clone(),
+            SnapshotEntry::File(encode_settings_bytecode(&capture).unwrap()),
+        )]
+        .into_iter()
+        .collect(),
+    };
+    let merged = ProjectSnapshot {
+        entries: [(
+            settings_path.clone(),
+            SnapshotEntry::File(encode_settings_bytecode(&desired).unwrap()),
+        )]
+        .into_iter()
+        .collect(),
+    };
+    let prepared = HashMap::from([(
+        settings_path.clone(),
+        PreparedEditorSettingsChange {
+            previous: aligned,
+            current: desired,
+        },
+    )]);
+    let mut plan = reconciliation_push_plan_for_paths_with_prepared_settings(
+        &studio,
+        &merged,
+        &HashSet::from([settings_path.clone()]),
+        &prepared,
+        false,
+        false,
+    )
+    .unwrap();
+    attach_capture_identities(&mut plan, &studio, &prepared).unwrap();
+    let identity = |id: &str| {
+        plan.previous_identities
+            .get(&("Workspace".to_string(), id.to_string()))
+            .map(String::as_str)
+    };
+    assert_eq!(identity("part-a"), Some("debug:1_12"));
+    assert_eq!(identity("part-b"), Some("debug:1_11"));
+    assert_eq!(identity("part-c"), Some("part-c"));
+    let removed = plan
+        .instance_deletes
+        .iter()
+        .flat_map(|change| &change.instances)
+        .find(|descriptor| descriptor.settings_id == "part-d")
+        .expect("the dropped Part is removed");
+    assert_eq!(removed.previous_settings_id.as_deref(), Some("debug:1_14"));
+
+    let mut changes = EditorChangeSet::default();
+    crate::editor::diff::push_editor_instance_change(
+        &mut changes,
+        "upsertInstances",
+        "Workspace",
+        false,
+        vec![
+            crate::editor::diff::editor_instance_descriptor_for_known_path(
+                &prepared[&settings_path].current,
+                2,
+                vec!["Workspace".to_string(), "Part".to_string()],
+                vec![1, 2],
+            )
+            .unwrap(),
+        ],
+    );
+    amend_reconciled_changes(&mut changes, plan).unwrap();
+    let upsert = changes
+        .instance_changes
+        .iter()
+        .find(|change| change.mode == "upsertInstances")
+        .unwrap();
+    assert_eq!(
+        upsert.instances[0].previous_settings_id.as_deref(),
+        Some("debug:1_12")
+    );
+}
+
+#[test]
+fn a_union_whose_geometry_changed_is_removed_and_imported_anew() {
+    let union = |id: &str, mesh: &str| SettingsBytecodeInstance {
+        settings_id: id.to_string(),
+        name: "Union".to_string(),
+        class_name: "UnionOperation".to_string(),
+        parent_index: Some(1),
+        properties: Map::from_iter([
+            (
+                "MeshData2".to_string(),
+                json!({"_type":"SharedString","base64":mesh}),
+            ),
+            ("Anchored".to_string(), json!(true)),
+        ]),
+        attributes: Map::new(),
+    };
+    let root = SettingsBytecodeInstance {
+        settings_id: "ws".to_string(),
+        name: "Workspace".to_string(),
+        class_name: "Workspace".to_string(),
+        parent_index: None,
+        properties: Map::new(),
+        attributes: Map::new(),
+    };
+    let settings_path = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
+    let snapshot = |document: &SettingsBytecode| ProjectSnapshot {
+        entries: [(
+            settings_path.clone(),
+            SnapshotEntry::File(encode_settings_bytecode(document).unwrap()),
+        )]
+        .into_iter()
+        .collect(),
+    };
+    let model = SettingsBytecodeInstance {
+        settings_id: "model".to_string(),
+        name: "Model".to_string(),
+        class_name: "Model".to_string(),
+        parent_index: Some(0),
+        properties: Map::new(),
+        attributes: Map::new(),
+    };
+    let observed = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: vec![root.clone(), model.clone(), union("u", "b2xk")],
+    };
+    let desired = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: vec![root, model, union("u", "bmV3")],
+    };
+    let prepared = HashMap::from([(
+        settings_path.clone(),
+        PreparedEditorSettingsChange {
+            previous: observed.clone(),
+            current: desired.clone(),
+        },
+    )]);
+    let plan = reconciliation_push_plan_for_paths_with_prepared_settings(
+        &snapshot(&observed),
+        &snapshot(&desired),
+        &HashSet::from([settings_path.clone()]),
+        &prepared,
+        false,
+        false,
+    )
+    .unwrap();
+    assert!(plan.recreated_settings_ids.contains("u"));
+    assert!(
+        !plan
+            .in_place_instances
+            .contains(&("Workspace".to_string(), "u".to_string()))
+    );
+    assert!(
+        !plan
+            .previous_paths
+            .contains_key(&("Workspace".to_string(), "u".to_string()))
+    );
+    let removed = plan
+        .instance_deletes
+        .iter()
+        .flat_map(|change| &change.instances)
+        .map(|descriptor| descriptor.settings_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(removed, vec!["u"]);
+
+    // The same union with the same geometry but another anchoring is edited
+    // in place.
+    let mut moved = desired.clone();
+    moved.instances[2].properties = observed.instances[2].properties.clone();
+    moved.instances[2]
+        .properties
+        .insert("Anchored".to_string(), json!(false));
+    let prepared = HashMap::from([(
+        settings_path.clone(),
+        PreparedEditorSettingsChange {
+            previous: observed.clone(),
+            current: moved.clone(),
+        },
+    )]);
+    let plan = reconciliation_push_plan_for_paths_with_prepared_settings(
+        &snapshot(&observed),
+        &snapshot(&moved),
+        &HashSet::from([settings_path.clone()]),
+        &prepared,
+        false,
+        false,
+    )
+    .unwrap();
+    assert!(plan.recreated_settings_ids.is_empty());
+    assert!(plan.instance_deletes.is_empty());
+    assert!(
+        plan.in_place_instances
+            .contains(&("Workspace".to_string(), "u".to_string()))
+    );
+}

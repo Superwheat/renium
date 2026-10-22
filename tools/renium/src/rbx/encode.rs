@@ -768,6 +768,15 @@ pub(crate) const COLLISION_HULL_PROPERTY: &str = "PhysicalConfigData";
 /// must round-trip byte for byte.
 pub(crate) const RETAINED_DEFAULT_PROPERTIES: [&str; 2] = [COLLISION_HULL_PROPERTY, "SurfaceSlot"];
 
+/// A union, negation or intersection: a part whose geometry is the result of
+/// a CSG operation the engine stores as opaque data.
+pub(crate) fn is_solid_model_operation(class: &str) -> bool {
+    matches!(
+        class,
+        "UnionOperation" | "NegateOperation" | "IntersectOperation"
+    )
+}
+
 /// Engine-built data a part carries opaquely: collision hulls and aero
 /// meshes, a union's CSG tree, mesh and older mesh holder, and the terrain's
 /// material table.

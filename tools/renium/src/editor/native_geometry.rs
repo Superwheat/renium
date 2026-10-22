@@ -30,9 +30,15 @@ pub(crate) fn generated_properties(
     {
         return Vec::new();
     }
+    // The hull compares by its fidelity elsewhere, so a saved state that
+    // supplies new hull bytes must keep them: only byte-identical hulls are
+    // engine-generated here.
     GENERATED_PROPERTIES
         .into_iter()
         .filter(|name| {
+            if *name == "PhysicalConfigData" {
+                return before.properties.get(*name) == desired.properties.get(*name);
+            }
             equal(
                 "MeshPart",
                 name,

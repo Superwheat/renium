@@ -127,7 +127,9 @@ do
 	} do
 		local waits, elapsed, cancelled, sampled = 0, 0, 0, 0
 		local current = "Box"
-		local instance = { IsA = function(_, class) return class == case.class end }
+		local instance = { IsA = function(_, class)
+			return class == case.class or class == "TriangleMeshPart" and case.class == "MeshPart"
+		end }
 		local write = luau.load(source, { environment = {
 			writeProperty = function()
 				if case.delay == 0 then current = "Hull" end
@@ -158,7 +160,7 @@ do
 		equal(ok, case.ok, "asynchronous collision write outcome")
 		equal(cancelled, if case.ok then 0 else 1, "expected event retained until confirmed")
 		equal(sampled, if case.ok then 1 else 0, "only completed writes update tracking")
-		equal(waits, if case.property == "CollisionFidelity" and case.class == "MeshPart" then math.min(case.delay, 3) else 0, "only asynchronous geometry waits, bounded")
+		equal(waits, if case.property == "CollisionFidelity" and case.class == "MeshPart" then math.min(case.delay, 10) else 0, "only asynchronous geometry waits, bounded")
 	end
 end
 do
@@ -573,7 +575,28 @@ equal(
 	false,
 	"Vector3 epsilon"
 )
-equal(ValueEquality.valuesEqual(roblox.CFrame.new(1, 2, 3), roblox.CFrame.new(1.00005, 2, 3)), false, "CFrame position changes")
+equal(ValueEquality.valuesEqual(roblox.CFrame.new(1, 2, 3), roblox.CFrame.new(1.0005, 2, 3)), false, "CFrame position changes")
+equal(
+	ValueEquality.valuesEqual(roblox.CFrame.new(1, 2, 3), roblox.CFrame.new(1.00005, 2, 3)),
+	true,
+	"CFrame position within the engine's readback noise"
+)
+equal(
+	ValueEquality.valuesEqual(
+		roblox.CFrame.new(1, 2, 3, 0, 0.9999992847442627, -0.001204185071401298, 1, 0, 0, 0, -0.001204185071401298, -0.9999992847442627),
+		roblox.CFrame.new(1, 2, 3, 5.5e-9, 0.9999992847442627, -0.0012041761, 1, -5.6e-9, -4.5e-8, -4.5e-8, -0.0012041761, -0.9999992847442627)
+	),
+	true,
+	"CFrame rotation within the engine's readback noise"
+)
+equal(
+	ValueEquality.valuesEqual(
+		roblox.CFrame.new(1, 2, 3, 0, 1, 0, 1, 0, 0, 0, 0, -1),
+		roblox.CFrame.new(1, 2, 3, 0, 0.99998, 0, 1, 0, 0, 0, 0, -1)
+	),
+	false,
+	"CFrame rotation changes"
+)
 equal(
 	ValueEquality.valuesEqual(roblox.Color3.new(0.5, 0.25, 0.75), roblox.Color3.new(0.50001, 0.25, 0.75)),
 	false,
@@ -671,6 +694,22 @@ local partialTie = CandidateMatch.choose(
 	end
 )
 equal(partialTie, nil, "partial ties stay ambiguous")
+
+local nearCandidates = {
+	{ Value = 1.00005, Marker = "a" },
+	{ Value = 1.00001, Marker = "b" },
+	{ Value = 1.00001, Marker = "a" },
+}
+local function tolerantNumber(candidate, name, value)
+	return math.abs(candidate[name] - value) < 1e-3
+end
+local function exactValue(candidate, name, value)
+	return candidate[name] == value
+end
+local nearest = CandidateMatch.choose(nearCandidates, { Value = 1.00001 }, { Marker = "a" }, tolerantNumber, exactValue, exactValue)
+equal(nearest, nearCandidates[3], "a within-noise tie is broken by the exact match among complete matches")
+local noExact = CandidateMatch.choose(nearCandidates, { Value = 1.00003 }, { Marker = "a" }, tolerantNumber, exactValue, exactValue)
+equal(noExact, nearCandidates[1], "identical-within-noise candidates keep the first")
 
 local oversizedCandidates = {}
 for index = 1, 33 do

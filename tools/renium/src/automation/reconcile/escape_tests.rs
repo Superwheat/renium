@@ -58,5 +58,14 @@ fn instances_leaving_a_deleted_subtree_move_before_the_delete() {
             .collect::<Vec<_>>()
     };
     assert_eq!(ids(0), ["lobby", "inside"]);
-    assert_eq!(ids(2), ["other"]);
+    assert!(
+        changes[0]
+            .instances
+            .iter()
+            .all(|instance| !instance.anchor_only)
+    );
+    // The entries that stay keep the moved ancestor as a lookup-only anchor.
+    assert_eq!(ids(2), ["other", "lobby"]);
+    assert!(!changes[2].instances[0].anchor_only);
+    assert!(changes[2].instances[1].anchor_only);
 }

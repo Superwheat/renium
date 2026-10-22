@@ -2,6 +2,11 @@ local BridgeValueEquality = {}
 
 -- Match the host's f32 readback bounds; never quantize float colors to bytes.
 local FLOAT32_EPSILON = 2 ^ -23
+-- The engine re-derives a written CFrame (orthonormalised rotation, f32
+-- position), so a CFrame compares within the host's reconciliation noise:
+-- 2e-4 studs per position component and 9e-6 per rotation component.
+local CFRAME_POSITION_NOISE = 2e-4
+local CFRAME_ROTATION_NOISE = 9e-6
 local VECTOR2_FIELDS = { "X", "Y" }
 local VECTOR3_FIELDS = { "X", "Y", "Z" }
 local PHYSICAL_PROPERTIES_FIELDS = {
@@ -139,10 +144,10 @@ valuesEqual = function(a: any, b: any, seen: { [any]: any }?): boolean
 		local right = { b:GetComponents() }
 		for index, value in ipairs(left) do
 			local other = right[index]
-			local equal = if index <= 3 then numbersEqual(value, other)
-				else value == other or value ~= value and other ~= other
-					or math.abs(value) < math.huge and math.abs(other) < math.huge
-						and math.abs(value - other) <= 16 * FLOAT32_EPSILON
+			local noise = if index <= 3 then CFRAME_POSITION_NOISE else CFRAME_ROTATION_NOISE
+			local equal = value == other or value ~= value and other ~= other
+				or math.abs(value) < math.huge and math.abs(other) < math.huge
+					and (math.abs(value - other) <= noise or index <= 3 and numbersEqual(value, other))
 			if not equal then
 				return false
 			end

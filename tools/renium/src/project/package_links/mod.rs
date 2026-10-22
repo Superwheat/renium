@@ -1709,16 +1709,23 @@ pub(crate) fn external_reference_sources(
         if exact_path_key(path) == excluded {
             continue;
         }
+        let service = document_service_name(document);
+        let defined_locally = document
+            .instances
+            .iter()
+            .any(|instance| instance.settings_id == id);
         for (index, instance) in document.instances.iter().enumerate() {
-            let mut ids = HashSet::new();
+            let mut targets = Vec::new();
             for value in instance
                 .properties
                 .values()
                 .chain(instance.attributes.values())
             {
-                collect_reference_ids(value, &mut ids);
+                collect_reference_targets(value, &mut targets);
             }
-            if ids.contains(id) {
+            if targets.iter().any(|(target, target_service)| {
+                target == id && reference_leaves_store(defined_locally, service, target_service)
+            }) {
                 sources.push(format!(
                     "{}: {}",
                     path.file_name().map_or_else(
@@ -1758,18 +1765,30 @@ pub(crate) fn describe_external_reference_refusal(
     )
 }
 
-fn collect_reference_ids(value: &Value, output: &mut HashSet<String>) {
+/// The service a reference names explicitly, if any: a `Ref` whose
+/// `pathSegments` start with a service points there even when the referring
+/// store defines the same id itself.
+fn reference_service(reference: &Map<String, Value>) -> Option<String> {
+    reference
+        .get("pathSegments")
+        .and_then(Value::as_array)
+        .and_then(|segments| segments.first())
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn collect_reference_targets(value: &Value, output: &mut Vec<(String, Option<String>)>) {
     match value {
         Value::Array(values) => {
             for value in values {
-                collect_reference_ids(value, output);
+                collect_reference_targets(value, output);
             }
         }
         Value::Object(object) => {
             if object.get("_type").and_then(Value::as_str) == Some("Ref") {
                 for selector in ["settingsId", "instanceId"] {
                     if let Some(value) = object.get(selector).and_then(Value::as_str) {
-                        output.insert(value.to_string());
+                        output.push((value.to_string(), reference_service(object)));
                     }
                 }
                 return;
@@ -1777,18 +1796,39 @@ fn collect_reference_ids(value: &Value, output: &mut HashSet<String>) {
             if let Some(Value::Object(reference)) = object.get("Ref") {
                 for selector in ["settingsId", "instanceId"] {
                     if let Some(value) = reference.get(selector).and_then(Value::as_str) {
-                        output.insert(value.to_string());
+                        output.push((value.to_string(), reference_service(reference)));
                     }
                 }
             }
             for (key, value) in object {
                 if key != "Ref" {
-                    collect_reference_ids(value, output);
+                    collect_reference_targets(value, output);
                 }
             }
         }
         _ => {}
     }
+}
+
+fn document_service_name(document: &SettingsBytecode) -> Option<&str> {
+    document
+        .instances
+        .iter()
+        .find(|instance| instance.parent_index.is_none())
+        .map(|instance| instance.name.as_str())
+}
+
+/// A reference stays inside its store when the store defines the id and the
+/// reference names no other service; observation ids repeat across stores.
+fn reference_leaves_store(
+    defined_locally: bool,
+    service: Option<&str>,
+    target_service: &Option<String>,
+) -> bool {
+    !defined_locally
+        || target_service
+            .as_deref()
+            .is_some_and(|target| service != Some(target))
 }
 
 fn referenced_settings_ids(document: &SettingsBytecode) -> HashSet<String> {
@@ -1837,6 +1877,9 @@ fn referenced_settings_ids(document: &SettingsBytecode) -> HashSet<String> {
     output
 }
 
+/// Settings IDs that other stores reference and do not define themselves:
+/// observation IDs such as `reconcile:24` repeat across stores, so a Ref that
+/// resolves inside its own store is not a reference into this one.
 fn referenced_settings_ids_outside(
     documents: &HashMap<PathBuf, SettingsBytecode>,
     excluded: &Path,
@@ -1845,7 +1888,30 @@ fn referenced_settings_ids_outside(
     documents
         .iter()
         .filter(|(path, _)| exact_path_key(path) != excluded)
-        .flat_map(|(_, document)| referenced_settings_ids(document))
+        .flat_map(|(_, document)| {
+            let local = document
+                .instances
+                .iter()
+                .map(|instance| instance.settings_id.clone())
+                .collect::<HashSet<_>>();
+            let service = document_service_name(document).map(str::to_string);
+            let mut targets = Vec::new();
+            for instance in &document.instances {
+                for value in instance
+                    .properties
+                    .values()
+                    .chain(instance.attributes.values())
+                {
+                    collect_reference_targets(value, &mut targets);
+                }
+            }
+            targets
+                .into_iter()
+                .filter(move |(id, target_service)| {
+                    reference_leaves_store(local.contains(id), service.as_deref(), target_service)
+                })
+                .map(|(id, _)| id)
+        })
         .collect()
 }
 

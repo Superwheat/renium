@@ -71,6 +71,8 @@ type ExpectedInstanceEvent = {
 	fingerprint: string?,
 	cameraFovProperty: string?,
 	cameraFovValue: number?,
+	tolerantProperty: string?,
+	tolerantValue: any,
 	matchParent: boolean?,
 	parent: Instance?,
 	parentUnchanged: boolean?,
@@ -783,6 +785,8 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			elseif
 				(if event.cameraFovProperty
 					then BridgeValueEquality.valuesEqual((instance :: any)[event.cameraFovProperty], event.cameraFovValue)
+					elseif event.tolerantProperty
+					then BridgeValueEquality.valuesEqual((instance :: any)[event.tolerantProperty], event.tolerantValue)
 					else event.fingerprint == nil or event.fingerprint == fingerprint)
 				and (not event.matchParent or event.parent == parent)
 			then
@@ -918,6 +922,16 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				tokens[#tokens + 1] = api.expectPropertyEvent(instance, name, value)
 			end
 			return { tokens = tokens }
+		end
+		if typeof(value) == "CFrame" then
+			-- The engine re-derives a written CFrame, so its change event carries
+			-- a value that differs from the request by f32 noise. Match the live
+			-- value with the same equality as write verification.
+			primeExpectedProperty(instance, propertyName)
+			local token = expectInstanceEvent(state.expectedInstanceProperties, instance, string.lower(propertyName), nil, false, nil)
+			token.tolerantProperty = propertyName
+			token.tolerantValue = value
+			return token
 		end
 		primeExpectedProperty(instance, propertyName)
 		return expectInstanceEvent(

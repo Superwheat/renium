@@ -4204,7 +4204,14 @@ pub(crate) fn send_editor_change_batches(
         && let Some(request) = combined_editor_change_batch(changes, transaction_id)?
     {
         let result = bridge.call("applyEditorChanges", request)?;
-        merge_editor_summary_checked(&mut summary, &result)?;
+        merge_editor_summary_checked(&mut summary, &result).inspect_err(|error| {
+            let entries = changes
+                .instance_changes
+                .iter()
+                .flat_map(|change| &change.instances)
+                .collect::<Vec<_>>();
+            log_rejected_entries(error, &entries);
+        })?;
         summary.insert(
             "sourceSent".to_string(),
             json!(changes.source_changes.len()),
@@ -4329,7 +4336,8 @@ pub(crate) fn send_editor_change_batches(
                         return Err(error);
                     }
                 };
-                merge_editor_summary_checked(&mut summary, &result)?;
+                merge_editor_summary_checked(&mut summary, &result)
+                    .inspect_err(|error| log_rejected_entries(error, instance_batch))?;
             }
         } else if instance_change.instances.len() > INSTANCE_BATCH_SIZE {
             for instance_batch in instance_change.instances.chunks(INSTANCE_BATCH_SIZE) {
@@ -4347,7 +4355,8 @@ pub(crate) fn send_editor_change_batches(
                         "transactionId": transaction_id,
                     }),
                 )?;
-                merge_editor_summary_checked(&mut summary, &result)?;
+                merge_editor_summary_checked(&mut summary, &result)
+                    .inspect_err(|error| log_rejected_entries(error, instance_batch))?;
             }
         } else {
             let result = bridge.call(
@@ -4359,7 +4368,8 @@ pub(crate) fn send_editor_change_batches(
                     "transactionId": transaction_id,
                 }),
             )?;
-            merge_editor_summary_checked(&mut summary, &result)?;
+            merge_editor_summary_checked(&mut summary, &result)
+                .inspect_err(|error| log_rejected_entries(error, &instance_change.instances))?;
         }
     }
 
@@ -4890,6 +4900,134 @@ fn merge_editor_summary(summary: &mut Map<String, Value>, result: &Value) {
         } else if key == "errors" {
             summary.insert(key.clone(), value.clone());
         }
+    }
+}
+
+/// When Studio cannot place an entry, the daemon log names the entries at
+/// that path: class, ordinals, previous path and the match values the plugin
+/// compared, so a refused twin push can be read without the plugin's state.
+fn log_rejected_entries<T: serde::Serialize>(error: &anyhow::Error, entries: &[T]) {
+    let text = format!("{error:#}");
+    let Some(path) = text
+        .split_once("Could not uniquely identify ")
+        .map(|(_, rest)| rest.split(" (").next().unwrap_or(rest).to_string())
+        .or_else(|| {
+            // The plugin's entry key joins segments with its path separator
+            // (NUL) and ends in "ord" plus the ordinals; keep the segments only.
+            text.split_once("Ambiguous class replacement at ")
+                .or_else(|| text.split_once("Could not identify the previous instance at "))
+                .or_else(|| text.split_once("parent path was not found: "))
+                .map(|(_, rest)| rest.split(';').next().unwrap_or(rest))
+                .map(|key| key.split(" (").next().unwrap_or(key))
+                .map(|key| {
+                    let parts = key.split(['\0', '\u{1}']).collect::<Vec<_>>();
+                    let end = parts
+                        .iter()
+                        .position(|part| *part == "ord")
+                        .unwrap_or(parts.len());
+                    parts[..end].join(".")
+                })
+        })
+    else {
+        return;
+    };
+    let mut shown = 0;
+    for entry in entries {
+        let Ok(entry) = serde_json::to_value(entry) else {
+            continue;
+        };
+        let segments = entry
+            .get("pathSegments")
+            .and_then(Value::as_array)
+            .map(|segments| {
+                segments
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(".")
+            })
+            .unwrap_or_default();
+        if !(segments == path
+            || segments.ends_with(&format!(".{path}"))
+            || path.ends_with(&format!(".{segments}")))
+        {
+            continue;
+        }
+        shown += 1;
+        if shown > 400 {
+            break;
+        }
+        let keys = |name: &str| {
+            entry
+                .get(name)
+                .and_then(Value::as_object)
+                .map(|map| map.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        crate::app::output::log_global(
+            3,
+            format_args!(
+                "[renium] rejected push entry {segments} class={} ordinals={} previous={}/{} identity={} id={} anchor={} recreate={} match={:?} properties={:?} attributes={:?}",
+                entry
+                    .get("className")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?"),
+                entry
+                    .get("pathOrdinals")
+                    .map(Value::to_string)
+                    .unwrap_or_default(),
+                entry
+                    .get("previousPathSegments")
+                    .map(Value::to_string)
+                    .unwrap_or_default(),
+                entry
+                    .get("previousPathOrdinals")
+                    .map(Value::to_string)
+                    .unwrap_or_default(),
+                entry
+                    .get("previousSettingsId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-"),
+                entry
+                    .get("settingsId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?"),
+                entry
+                    .get("anchorOnly")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                entry
+                    .get("recreate")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                entry
+                    .get("matchProperties")
+                    .map(Value::to_string)
+                    .unwrap_or_default(),
+                keys("properties"),
+                keys("attributes"),
+            ),
+        );
+    }
+    if shown == 0 {
+        let sample = entries
+            .iter()
+            .take(3)
+            .filter_map(|entry| serde_json::to_value(entry).ok())
+            .map(|entry| {
+                entry
+                    .get("pathSegments")
+                    .map(Value::to_string)
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        crate::app::output::log_global(
+            3,
+            format_args!(
+                "[renium] rejected push batch of {} entries had none at {path}; first paths {sample:?}",
+                entries.len()
+            ),
+        );
     }
 }
 

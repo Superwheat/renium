@@ -167,10 +167,21 @@ pub(crate) struct EditorInstanceDescriptor {
     pub(crate) class_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) previous_class_name: Option<String>,
+    /// The identity Studio's own capture gave the instance this entry
+    /// replaces or removes: a matched identity, or `debug:` plus the debug id
+    /// of an instance no push has identified. Studio resolves it before the
+    /// previous path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) previous_settings_id: Option<String>,
     #[serde(skip_serializing_if = "is_false")]
     pub(crate) ambiguous_siblings: bool,
     #[serde(skip_serializing_if = "is_false")]
     pub(crate) anchor_only: bool,
+    /// The reconciler found no Studio counterpart for this identity. Studio
+    /// creates the instance instead of adopting a same-named sibling that no
+    /// other entry claimed.
+    #[serde(skip_serializing_if = "is_false")]
+    pub(crate) recreate: bool,
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub(crate) match_properties: Map<String, Value>,
     #[serde(skip_serializing_if = "Map::is_empty")]
