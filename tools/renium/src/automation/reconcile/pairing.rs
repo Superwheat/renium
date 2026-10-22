@@ -9,12 +9,6 @@ pub(crate) struct StructuralPart {
     pub(crate) ordinal: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct PairingPart {
-    pub(crate) name: String,
-    pub(crate) ordinal: usize,
-}
-
 pub(crate) type PathId = usize;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -129,30 +123,9 @@ pub(crate) fn structural_path_ids(
     })
 }
 
-pub(crate) fn pairing_path_ids(
-    document: &SettingsBytecode,
-    interner: &mut PathInterner<PairingPart>,
-) -> Vec<PathId> {
-    let mut ordinals = Vec::with_capacity(document.instances.len());
-    let mut counts = HashMap::<(Option<usize>, &str), usize>::new();
-    for instance in &document.instances {
-        let ordinal = counts
-            .entry((instance.parent_index, instance.name.as_str()))
-            .and_modify(|value| *value += 1)
-            .or_insert(1);
-        ordinals.push(*ordinal);
-    }
-    intern_paths(document, &ordinals, interner, |instance, ordinal| {
-        PairingPart {
-            name: instance.name.clone(),
-            ordinal,
-        }
-    })
-}
-
 /// Re-key parents before descendants for both structural and class-check paths.
 /// Matched instances use the editor's actual key, including identity-locked twins.
-fn resolved_path_ids<P: Clone + Eq + std::hash::Hash>(
+pub(super) fn resolved_path_ids<P: Clone + Eq + std::hash::Hash>(
     document: &SettingsBytecode,
     original: &[PathId],
     editor: &[PathId],
@@ -541,6 +514,79 @@ pub(crate) fn align_new_instance_ids(
     Ok(())
 }
 
+/// Cancel already-paired identities and equal-class additions before comparing
+/// the residual members of each parent/name group. Synthetic ordinals must not
+/// hide a class change, nor consume an independently matched sibling.
+fn unmatched_class_conflicts(
+    path: &Path,
+    editor: (&SettingsBytecode, &[PathId]),
+    studio: (&SettingsBytecode, &[PathId]),
+    partners: &[Option<usize>],
+    budget: (&[bool], &[bool]),
+    interner: &PathInterner<StructuralPart>,
+    conflicts: &mut Vec<String>,
+) {
+    let matched = partners.iter().flatten().copied().collect::<HashSet<_>>();
+    let mut groups = HashMap::<_, (Vec<usize>, Vec<usize>)>::new();
+    for (index, instance) in editor.0.instances.iter().enumerate() {
+        if !matched.contains(&index) && !budget.0[index] {
+            let key = (
+                interner.node(editor.1[index]).parent,
+                instance.name.as_str(),
+            );
+            groups.entry(key).or_default().0.push(index);
+        }
+    }
+    for (index, instance) in studio.0.instances.iter().enumerate() {
+        if partners[index].is_none() && !budget.1[index] {
+            let key = (
+                interner.node(studio.1[index]).parent,
+                instance.name.as_str(),
+            );
+            if let Some((left, right)) = groups.get_mut(&key) {
+                if let Some(equal) = left.iter().position(|&target| {
+                    editor.0.instances[target].class_name == instance.class_name
+                }) {
+                    left.remove(equal);
+                } else {
+                    right.push(index);
+                }
+            }
+        }
+    }
+    for (left, right) in groups.values() {
+        for (&target, _) in left.iter().zip(right) {
+            conflicts.push(format!(
+                "{} has different classes for {}",
+                path.display(),
+                render_path(interner, editor.1[target], |part| {
+                    format!("{}<{}>[{}]", part.name, part.class_name, part.ordinal)
+                })
+            ));
+        }
+    }
+}
+
+fn budget_parent_path(
+    group: &twins::BudgetConflict,
+    keys: &[PathId],
+    interner: &PathInterner<StructuralPart>,
+) -> String {
+    let mut parent = interner.node(keys[group.roots[0]]).parent;
+    for &root in &group.roots[1..] {
+        let mut ancestors = HashSet::new();
+        let mut next = interner.node(keys[root]).parent;
+        while let Some(key) = next {
+            ancestors.insert(key);
+            next = interner.node(key).parent;
+        }
+        while parent.is_some_and(|key| !ancestors.contains(&key)) {
+            parent = interner.node(parent.unwrap()).parent;
+        }
+    }
+    parent.map_or_else(|| "game".into(), |key| render_structural_key(interner, key))
+}
+
 pub(crate) fn align_first_pairing(
     path: &Path,
     editor: &mut SettingsBytecode,
@@ -553,6 +599,15 @@ pub(crate) fn align_first_pairing(
     let editor_keys = structural_path_ids(editor, &mut structural_interner);
     let original_studio_keys = structural_path_ids(studio, &mut structural_interner);
     let resolved = twins::resolve(editor, studio);
+    if matches!(preference, ConflictPreference::None) {
+        for group in &resolved.budget_conflicts {
+            conflicts.push(format!(
+                "{} could not pair {} same-named siblings under {} within the comparison budget; reorder or rename them, or resolve with --prefer",
+                path.display(), group.count,
+                budget_parent_path(group, &editor_keys, &structural_interner)
+            ));
+        }
+    }
     let studio_keys = resolved_path_ids(
         studio,
         &original_studio_keys,
@@ -561,19 +616,7 @@ pub(crate) fn align_first_pairing(
         &mut structural_interner,
         |part, ordinal| part.ordinal = ordinal,
     );
-    let mut pairing_interner = PathInterner::new();
-    let editor_pairing_keys = pairing_path_ids(editor, &mut pairing_interner);
-    let original_pairing_keys = pairing_path_ids(studio, &mut pairing_interner);
-    let studio_pairing_keys = resolved_path_ids(
-        studio,
-        &original_pairing_keys,
-        &editor_pairing_keys,
-        &resolved.partners,
-        &mut pairing_interner,
-        |part, ordinal| part.ordinal = ordinal,
-    );
     assert_unique_path_ids(&editor_keys);
-    assert_unique_path_ids(&editor_pairing_keys);
     let editor_by_key = editor_keys
         .iter()
         .cloned()
@@ -597,24 +640,15 @@ pub(crate) fn align_first_pairing(
             })
         })
         .collect::<HashSet<_>>();
-    let editor_by_pairing_key = editor_pairing_keys
-        .iter()
-        .cloned()
-        .enumerate()
-        .map(|(index, key)| (key, index))
-        .collect::<HashMap<_, _>>();
-    for (studio_index, key) in studio_pairing_keys.iter().enumerate() {
-        if let Some(editor_index) = editor_by_pairing_key.get(key).copied()
-            && editor.instances[editor_index].class_name
-                != studio.instances[studio_index].class_name
-        {
-            conflicts.push(format!(
-                "{} has different classes for {}",
-                path.display(),
-                render_pairing_key(&pairing_interner, *key)
-            ));
-        }
-    }
+    unmatched_class_conflicts(
+        path,
+        (editor, &editor_keys),
+        (studio, &studio_keys),
+        &resolved.partners,
+        (&resolved.budget_targets, &resolved.budget_sources),
+        &structural_interner,
+        conflicts,
+    );
     let editor_key_by_id = editor
         .instances
         .iter()
@@ -636,6 +670,8 @@ pub(crate) fn align_first_pairing(
             // A validated assignment supersedes that guess even when it kept
             // the original ordinal. Persistent moves are checked above.
             || !resolved.proven[index]
+                && !resolved.rejected[index]
+                && !resolved.budget_sources[index]
                 && editor_key_by_id
                     .get(&instance.settings_id)
                     .is_some_and(|editor_key| *editor_key != key)
@@ -665,7 +701,18 @@ pub(crate) fn align_first_pairing(
         let Some(studio_index) = studio_by_key.get(key).copied() else {
             continue;
         };
-        if settings_instances_equal(editor, *editor_index, studio, studio_index) {
+        let budget_limited = resolved.budget_sources[studio_index];
+        if budget_limited && matches!(preference, ConflictPreference::None) {
+            continue;
+        }
+        // Content evidence is cached separately from identity locks. The final
+        // reference fence precedes these proofs; normalization only copies values
+        // accepted by the same comparison rules. Parent identity remains explicit.
+        let proven_record = resolved.unchanged[studio_index]
+            && resolved.partners[studio_index] == Some(*editor_index)
+            && settings_parent_id(editor, *editor_index)
+                == settings_parent_id(studio, studio_index);
+        if proven_record || settings_instances_equal(editor, *editor_index, studio, studio_index) {
             continue;
         }
         let node = structural_interner.node(*key);
@@ -680,7 +727,7 @@ pub(crate) fn align_first_pairing(
                     editor_by_key.contains_key(&second) || studio_by_key.contains_key(&second)
                 })
         };
-        if duplicate_slot && !stable_pairs.contains(key) {
+        if duplicate_slot && !stable_pairs.contains(key) && !budget_limited {
             conflicts.push(format!(
                 "{} has ambiguous duplicate instances at {}",
                 path.display(),
@@ -1019,16 +1066,6 @@ pub(crate) fn copy_settings_instance(
 }
 
 pub(crate) fn render_structural_key(interner: &PathInterner<StructuralPart>, id: PathId) -> String {
-    render_path(interner, id, |part| {
-        if part.ordinal == 1 {
-            part.name.clone()
-        } else {
-            format!("{}[{}]", part.name, part.ordinal)
-        }
-    })
-}
-
-pub(crate) fn render_pairing_key(interner: &PathInterner<PairingPart>, id: PathId) -> String {
     render_path(interner, id, |part| {
         if part.ordinal == 1 {
             part.name.clone()
