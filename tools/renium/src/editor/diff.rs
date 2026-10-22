@@ -671,6 +671,26 @@ fn append_editor_property_changes_with_paths(
             );
         }
 
+        // The store has no CollisionFidelity member (Roblox keeps it inside the
+        // cooked hull), yet the plugin cooks a recreated part at the fidelity it
+        // reads from the new instance. Hand it the saved one.
+        if filter.property_names.is_empty()
+            && import.is_none()
+            && !instance.properties.contains_key("CollisionFidelity")
+            && !properties.contains_key("CollisionFidelity")
+            && crate::rbx::decode::rbx_reflection_class_is_a(
+                database,
+                &instance.class_name,
+                "TriangleMeshPart",
+            )
+            && let Some(hull) = instance
+                .properties
+                .get(crate::rbx::encode::COLLISION_HULL_PROPERTY)
+            && let Some(fidelity) = crate::rbx::encode::collision_fidelity_from_hull(hull)
+        {
+            properties.insert("CollisionFidelity".to_string(), fidelity);
+        }
+
         let attributes_complete = filter.property_names.is_empty() && import.is_none();
         let attributes = if attributes_complete {
             normalized_editor_attributes(

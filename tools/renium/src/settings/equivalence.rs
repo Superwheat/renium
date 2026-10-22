@@ -42,6 +42,10 @@ const SETTINGS_PARALLEL_DECODE_MIN_BYTES: usize = 64 * 1024;
 // the rotation basis (observed drift: 1.67e-6). Keep this absolute allowance
 // confined to rotation; positions and other numbers retain their usual precision.
 const CFRAME_ROTATION_EPSILON: f64 = 16.0 * f32::EPSILON as f64;
+/// A rotation column stored as Float32 and re-orthonormalized by Studio
+/// comes back a few millionths away (a welded seat read -0.999991 against
+/// -0.99998707, 3.9e-6 apart); an edit of 1e-5 in a column still counts.
+const CFRAME_ROTATION_NOISE: f64 = 8e-6;
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 struct SettingsAlignmentCacheKey {
@@ -901,7 +905,7 @@ impl IdentityCandidateIndex {
         // tolerance and rounding at either boundary. identity_score remains authoritative.
         let epsilon = 4.0 * f64::from(f32::EPSILON);
         let radius = ((epsilon + 4.0 * f64::EPSILON) / (1.0 - epsilon) * value.abs().max(1.0))
-            .max(CFRAME_ROTATION_EPSILON + 4.0 * f64::EPSILON);
+            .max(CFRAME_ROTATION_EPSILON.max(CFRAME_ROTATION_NOISE) + 4.0 * f64::EPSILON);
         let start = self
             .values
             .partition_point(|(candidate, _)| *candidate < value - radius);
@@ -2286,6 +2290,10 @@ fn reconciliation_maps_equal_with_ids(
             continue;
         }
         match right.get(name) {
+            Some(other) if name == "Tags" && tags_equal(value, other) => {}
+            Some(other)
+                if is_asset_reference_property(class_name, name)
+                    && asset_texts_equal(value, other) => {}
             Some(other)
                 if reconciliation_values_equal_with_ids(
                     value,
@@ -2303,6 +2311,69 @@ fn reconciliation_maps_equal_with_ids(
             || left.contains_key(name)
             || reconciliation_property_value_is_default(class_name, name, value)
     })
+}
+
+/// Tags are a set: Studio and the store may list them in any order.
+fn tags_equal(left: &Value, right: &Value) -> bool {
+    let (Some(left), Some(right)) = (left.as_array(), right.as_array()) else {
+        return false;
+    };
+    let mut left: Vec<&str> = left.iter().filter_map(Value::as_str).collect();
+    let mut right: Vec<&str> = right.iter().filter_map(Value::as_str).collect();
+    left.sort_unstable();
+    left.dedup();
+    right.sort_unstable();
+    right.dedup();
+    left == right
+}
+
+/// Asset references spell one asset several ways (`rbxassetid://N`,
+/// `http://www.roblox.com/asset/?id=N`, `https://...`); Studio hands back the
+/// long form for a short one it was given. Only a whole reference in one of
+/// those exact forms is rewritten; anything else compares as written.
+fn canonical_asset_text(text: &str) -> std::borrow::Cow<'_, str> {
+    static FORMS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let forms = FORMS.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)^\s*(?:rbxassetid://|https?://(?:www\.)?roblox\.com/asset/?\?id=)(\d+)(\?.*|&.*)?\s*$",
+        )
+        .expect("asset reference pattern")
+    });
+    match forms.captures(text) {
+        Some(captures) => std::borrow::Cow::Owned(format!(
+            "rbxassetid://{}{}",
+            &captures[1],
+            captures
+                .get(2)
+                .map_or("", |suffix| suffix.as_str().trim_end())
+        )),
+        None => std::borrow::Cow::Borrowed(text),
+    }
+}
+
+/// Properties whose string value names an asset, by reflection type or by
+/// the names Studio uses for the Content mirrors the database may not know.
+fn is_asset_reference_property(class_name: &str, name: &str) -> bool {
+    if let Ok(database) = rbx_reflection_database::get()
+        && let Some(descriptor) =
+            crate::rbx::encode::rbx_property_descriptor(database, class_name, name)
+        && let rbx_reflection::DataType::Value(kind) = &descriptor.data_type
+    {
+        return matches!(kind, RbxVariantType::Content | RbxVariantType::ContentId);
+    }
+    name.ends_with("Content")
+        || matches!(
+            name,
+            "TextureId" | "TextureID" | "MeshId" | "SoundId" | "Image" | "Texture"
+        )
+}
+
+fn asset_texts_equal(left: &Value, right: &Value) -> bool {
+    let (left, right) = (typed_scalar(left), typed_scalar(right));
+    match (left.as_str(), right.as_str()) {
+        (Some(left), Some(right)) => canonical_asset_text(left) == canonical_asset_text(right),
+        _ => false,
+    }
 }
 
 pub(crate) fn reconciliation_values_map_equal(
@@ -2567,7 +2638,9 @@ fn reconciliation_values_equal_with_ids(
                                         && if index < 3 {
                                             reconciliation_values_equal(left, right, true)
                                         } else {
-                                            (a - b).abs() <= CFRAME_ROTATION_EPSILON
+                                            (a - b).abs()
+                                                <= CFRAME_ROTATION_EPSILON
+                                                    .max(CFRAME_ROTATION_NOISE)
                                         }
                                 });
                     }
@@ -2761,6 +2834,9 @@ pub(crate) fn reconciliation_property_is_engine_state(
     name == "ScriptGuid"
         || reconciliation_property_is_derived(name)
         || reconciliation_property_is_metadata(name, value)
+        // The engine sets a WeldConstraint's State from whether its parts are
+        // currently joined; a recreated weld settles to another value.
+        || class_name == "WeldConstraint" && name == "State"
         || database.is_some_and(|database| {
             reconciliation_property_is_engine_mirror(database, class_name, name)
         })
@@ -2807,6 +2883,15 @@ pub(crate) fn reconciliation_property_is_unknown_when_absent(
     name: &str,
 ) -> bool {
     matches!(name, "CollisionFidelity" | "ClockTime" | "MeshSize")
+        // A native capture of Studio 744 carries no InputSink although the
+        // saved place does, and reports ResetOnSpawn false for a gui that
+        // lives in the world while the saved place carries nothing; neither
+        // record says anything about the other's value.
+        || name == "InputSink"
+        || matches!(
+            (class_name, name),
+            ("BillboardGui" | "SurfaceGui", "ResetOnSpawn")
+        )
         || database.is_some_and(|database| {
             reconciliation_property_is_unreadable(database, class_name, name)
                 || crate::rbx::decode::is_unexposed_service_property(database, class_name, name)
@@ -2880,6 +2965,12 @@ pub(crate) fn reconciliation_property_values_equal(
     let left = left.filter(|value| !reconciliation_property_is_metadata(name, value));
     let right = right.filter(|value| !reconciliation_property_is_metadata(name, value));
     match (left, right) {
+        (Some(left), Some(right)) if name == "Tags" && tags_equal(left, right) => true,
+        (Some(left), Some(right))
+            if is_asset_reference_property(class_name, name) && asset_texts_equal(left, right) =>
+        {
+            true
+        }
         (Some(left), Some(right)) => reconciliation_values_equal(
             left,
             right,
@@ -5386,6 +5477,153 @@ mod never_serialized_properties {
             Some(database),
             "Part",
             "Anchored"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod verify_noise_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn tags_compare_as_a_set() {
+        let mut files = Map::new();
+        files.insert("Tags".into(), json!(["PassengerSeat", "invisibleseat"]));
+        let mut studio = Map::new();
+        studio.insert("Tags".into(), json!(["invisibleseat", "PassengerSeat"]));
+        assert!(reconciliation_maps_equal("Seat", &files, &studio));
+        studio.insert("Tags".into(), json!(["invisibleseat"]));
+        assert!(!reconciliation_maps_equal("Seat", &files, &studio));
+    }
+
+    #[test]
+    fn asset_references_match_across_spellings_only_for_asset_properties() {
+        let pair = |left: &str, right: &str| {
+            let mut files = Map::new();
+            files.insert("TextureContent".into(), json!(left));
+            let mut studio = Map::new();
+            studio.insert("TextureContent".into(), json!(right));
+            (files, studio)
+        };
+        let (files, studio) = pair(
+            "rbxassetid://2606198812",
+            "http://www.roblox.com/asset/?id=2606198812",
+        );
+        assert!(reconciliation_maps_equal("Decal", &files, &studio));
+        assert!(reconciliation_property_values_equal(
+            "Decal",
+            "TextureContent",
+            files.get("TextureContent"),
+            studio.get("TextureContent")
+        ));
+        let (files, studio) = pair("https://www.roblox.com/asset/?id=7", "RBXASSETID://7");
+        assert!(reconciliation_maps_equal("Decal", &files, &studio));
+        let (files, studio) = pair("rbxassetid://2606198812", "rbxassetid://2606198813");
+        assert!(!reconciliation_maps_equal("Decal", &files, &studio));
+        let (files, studio) = pair("rbxassetid://5", "rbxasset://5");
+        assert!(!reconciliation_maps_equal("Decal", &files, &studio));
+        let (files, studio) = pair("rbxassetid://7abc", "rbxassetid://7");
+        assert!(!reconciliation_maps_equal("Decal", &files, &studio));
+        let (files, studio) = pair("https://notroblox.com/asset/?id=7", "rbxassetid://7");
+        assert!(!reconciliation_maps_equal("Decal", &files, &studio));
+        let (files, studio) = pair("rbxassetid://7?x", "rbxassetid://7");
+        assert!(!reconciliation_maps_equal("Decal", &files, &studio));
+        let (files, studio) = pair("rbxassetid://7 ", "http://www.roblox.com/asset/?id=7 ");
+        assert!(reconciliation_maps_equal("Decal", &files, &studio));
+        // Ordinary strings keep exact comparison.
+        let mut files = Map::new();
+        files.insert("Value".into(), json!("old: rbxassetid://7"));
+        let mut studio = Map::new();
+        studio.insert("Value".into(), json!("new: rbxassetid://7"));
+        assert!(!reconciliation_maps_equal("StringValue", &files, &studio));
+        assert!(!reconciliation_values_equal(
+            &json!("rbxassetid://7"),
+            &json!("http://www.roblox.com/asset/?id=7"),
+            false
+        ));
+    }
+
+    #[test]
+    fn tag_order_does_not_count_in_the_shared_comparator_either() {
+        assert!(reconciliation_property_values_equal(
+            "Seat",
+            "Tags",
+            Some(&json!(["a", "b"])),
+            Some(&json!(["b", "a"]))
+        ));
+        assert!(!reconciliation_property_values_equal(
+            "Seat",
+            "Tags",
+            Some(&json!(["a", "b"])),
+            Some(&json!(["b"]))
+        ));
+    }
+
+    #[test]
+    fn settled_joint_cframes_are_not_differences() {
+        let saved = json!({"_type":"CFrame","components":[943.9832, 25.768948, -289.9822, -0.999991, 0.0, 0.0050982987, 0.0, 1.0, 0.0, -0.0050982987, 0.0, -0.999991]});
+        let settled = json!({"_type":"CFrame","components":[943.9832153320312, 25.76894760131836, -289.9822082519531, -0.9999870657920837, 0.0, 0.005098278634250164, 0.0, 1.0, 0.0, -0.005098278634250164, 0.0, -0.9999870657920837]});
+        assert!(reconciliation_values_equal(&saved, &settled, false));
+        let moved = json!({"_type":"CFrame","components":[943.99, 25.768948, -289.9822, -0.999991, 0.0, 0.0050982987, 0.0, 1.0, 0.0, -0.0050982987, 0.0, -0.999991]});
+        assert!(!reconciliation_values_equal(&saved, &moved, false));
+        let turned = json!({"_type":"CFrame","components":[943.9832, 25.768948, -289.9822, -0.9995, 0.0, 0.03, 0.0, 1.0, 0.0, -0.03, 0.0, -0.9995]});
+        assert!(!reconciliation_values_equal(&saved, &turned, false));
+    }
+
+    #[test]
+    fn weld_constraint_state_is_engine_state() {
+        let mut files = Map::new();
+        files.insert("State".into(), json!(1));
+        let mut studio = Map::new();
+        studio.insert("State".into(), json!(3));
+        assert!(reconciliation_maps_equal("WeldConstraint", &files, &studio));
+        assert!(!reconciliation_maps_equal("Smoke", &files, &studio));
+    }
+
+    #[test]
+    fn world_guis_reset_on_spawn_says_nothing_when_one_record_lacks_it() {
+        let mut explicit = Map::new();
+        explicit.insert("ResetOnSpawn".into(), json!(false));
+        let absent = Map::new();
+        assert!(reconciliation_maps_equal(
+            "BillboardGui",
+            &absent,
+            &explicit
+        ));
+        assert!(reconciliation_maps_equal("SurfaceGui", &explicit, &absent));
+        assert!(!reconciliation_maps_equal("ScreenGui", &absent, &explicit));
+        let mut other = Map::new();
+        other.insert("ResetOnSpawn".into(), json!(true));
+        assert!(!reconciliation_maps_equal(
+            "BillboardGui",
+            &explicit,
+            &other
+        ));
+    }
+
+    #[test]
+    fn input_sink_says_nothing_when_one_record_lacks_it() {
+        let absent = Map::new();
+        let mut none = Map::new();
+        none.insert(
+            "InputSink".into(),
+            json!({"_type":"EnumItem","name":"None"}),
+        );
+        let mut activate = Map::new();
+        activate.insert(
+            "InputSink".into(),
+            json!({"_type":"EnumItem","name":"Activate"}),
+        );
+        assert!(reconciliation_maps_equal("TextButton", &absent, &none));
+        assert!(reconciliation_maps_equal("TextButton", &none, &absent));
+        assert!(reconciliation_maps_equal("TextButton", &absent, &activate));
+        assert!(!reconciliation_maps_equal("TextButton", &none, &activate));
+        assert!(!reconciliation_property_values_equal(
+            "TextButton",
+            "InputSink",
+            none.get("InputSink"),
+            activate.get("InputSink")
         ));
     }
 }

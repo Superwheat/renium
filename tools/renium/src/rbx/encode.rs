@@ -858,6 +858,34 @@ fn carries_collision_hull(class: &str) -> bool {
 /// The hull Studio stores for a part whose CollisionFidelity is Box.
 const BOX_COLLISION_HULL: &[u8] = b"CSGPHS\0\0\0\0BLOCK";
 
+/// Roblox serializes a MeshPart's CollisionFidelity only inside its cooked
+/// hull: a version-8 `CSGPHS` blob carries the fidelity in byte 10 (1 Hull,
+/// 2 Box, 3 PreciseConvexDecomposition). A record that has the hull but no
+/// fidelity gets the enum back from here, so a part recreated through the
+/// plugin cooks at the fidelity it was saved with.
+pub(crate) fn collision_fidelity_from_hull(value: &Value) -> Option<Value> {
+    let bytes = base64::decode(value.get("base64")?.as_str()?).ok()?;
+    if bytes.len() < 12 || !bytes.starts_with(b"CSGPHS") {
+        return None;
+    }
+    let version = u32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]);
+    if version < 8 {
+        return None;
+    }
+    let name = match bytes[10] {
+        1 => "Hull",
+        2 => "Box",
+        3 => "PreciseConvexDecomposition",
+        _ => return None,
+    };
+    Some(serde_json::json!({
+        "_type": "EnumItem",
+        "enumType": "CollisionFidelity",
+        "name": name,
+        "value": bytes[10],
+    }))
+}
+
 const COLLISION_FIDELITY_BOX: u32 = 2;
 
 fn collides_as_box(instance: &rbx_dom_weak::Instance) -> bool {
@@ -2875,5 +2903,34 @@ mod tests {
             camera.properties.get(&"FutureTypedFloat".into()),
             Some(&RbxVariant::Float32(4.0)),
         );
+    }
+}
+
+#[cfg(test)]
+mod hull_fidelity_tests {
+    use super::*;
+
+    fn hull(bytes: &[u8]) -> Value {
+        serde_json::json!({"_type": "SharedString", "base64": base64::encode(bytes)})
+    }
+
+    #[test]
+    fn collision_fidelity_is_read_from_the_cooked_hull_header() {
+        assert_eq!(
+            collision_fidelity_from_hull(&hull(b"CSGPHS\x08\0\0\0\x01\0(hull bytes)")).unwrap()["name"],
+            "Hull"
+        );
+        assert_eq!(
+            collision_fidelity_from_hull(&hull(b"CSGPHS\x08\0\0\0\x02\0(hull bytes)")).unwrap()["name"],
+            "Box"
+        );
+        assert_eq!(
+            collision_fidelity_from_hull(&hull(b"CSGPHS\x08\0\0\0\x03\0(hull bytes)")).unwrap()["value"],
+            3
+        );
+        assert!(collision_fidelity_from_hull(&hull(b"CSGPHS\0\0\0\0BLOCK")).is_none());
+        assert!(collision_fidelity_from_hull(&hull(b"CSGPHS\x08\0\0\0\x09\0x")).is_none());
+        assert!(collision_fidelity_from_hull(&hull(b"short")).is_none());
+        assert!(collision_fidelity_from_hull(&serde_json::json!("not an object")).is_none());
     }
 }
