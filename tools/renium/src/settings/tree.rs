@@ -4,9 +4,6 @@ use crate::editor::types::EditorInstancePath;
 use crate::settings::bytecode::SettingsBytecode;
 use crate::system::files::unique_child_stem;
 
-/// Both offline comparison and Live Sync bound quadratic duplicate searches.
-pub(crate) const DUPLICATE_REPAIR_GROUP_LIMIT: usize = 512;
-
 pub(crate) fn assign_editor_instance_paths(
     document: &SettingsBytecode,
     children_by_parent: &[Vec<usize>],

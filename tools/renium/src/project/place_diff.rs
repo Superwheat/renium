@@ -21,7 +21,7 @@ use crate::rbx::{
     decode::{native_property_filter, rbx_variant_to_settings_json},
     model::BytecodeModelImportRefs,
 };
-use crate::settings::tree::{DUPLICATE_REPAIR_GROUP_LIMIT, settings_children_by_parent};
+use crate::settings::tree::settings_children_by_parent;
 use crate::settings::{
     bytecode::{SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance},
     equivalence::{
@@ -552,7 +552,7 @@ fn pair_duplicate_siblings_by_content(
         }
         for members in groups
             .into_values()
-            .filter(|members| members.len() > 1 && members.len() <= DUPLICATE_REPAIR_GROUP_LIMIT)
+            .filter(|members| members.len() > 1 && members.len() <= REPAIR_GROUP_LIMIT)
         {
             let paired = members
                 .iter()
@@ -643,6 +643,10 @@ fn pair_duplicate_siblings_by_content(
     }
     reordered
 }
+
+/// Twin groups larger than this keep their positional pairing; the
+/// candidate search is quadratic in the group size.
+const REPAIR_GROUP_LIMIT: usize = 512;
 
 /// Two subtrees with the same shape and no changed fields at any node.
 /// References are compared by presence only: an internal reference keeps
