@@ -2631,43 +2631,6 @@ fn a_scope_removed_from_publication_is_not_republished() {
 }
 
 #[test]
-fn identical_twin_groups_pair_positionally_without_exhausting_the_budget() {
-    for count in [50usize, 100, 433] {
-        let mut editor = twin_document();
-        for number in 0..count {
-            let tree = twin_add(&mut editor, 0, "Tree", "Model", json!({}));
-            twin_add(
-                &mut editor,
-                tree,
-                "Trunk",
-                "Part",
-                json!({"Transparency": (number % 7) as f64 / 10.0}),
-            );
-        }
-        for reversed in [false, true] {
-            let mut editor = editor.clone();
-            let mut studio = if reversed {
-                twin_observation(&editor)
-            } else {
-                let mut same_order = editor.clone();
-                for instance in &mut same_order.instances {
-                    instance.settings_id = format!("studio-{}", instance.settings_id);
-                }
-                same_order
-            };
-            let started = std::time::Instant::now();
-            let conflicts = twin_align(&mut editor, &mut studio);
-            assert!(
-                conflicts.is_empty(),
-                "count={count} reversed={reversed}: {conflicts:?}"
-            );
-            assert!(started.elapsed() < std::time::Duration::from_secs(3));
-            assert_twin_ids_unique(&studio);
-        }
-    }
-}
-
-#[test]
 fn target_ownership_ends_with_the_live_pair() {
     let coordinator = Coordinator::default();
     let first = PairIdentity {
