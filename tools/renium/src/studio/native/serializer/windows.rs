@@ -1,6 +1,9 @@
 use super::probes::NativeOperation;
+#[path = "windows_task_context.rs"]
+mod task_context;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use task_context::*;
 #[path = "windows_probes.rs"]
 mod probes;
 pub(super) use probes::probe_operation;
@@ -70,7 +73,7 @@ use crate::system::LockRecover;
 use crate::system::files::{atomic_write_file, fnv1a};
 
 const HELPER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-studio-helper.dll"));
-const PARAM_SIZE: usize = 5904;
+const PARAM_SIZE: usize = 5936;
 const PARAM_STATUS: usize = 68;
 const PARAM_OUTPUT_SIZE: usize = 72;
 const PARAM_CONTEXT_MICROS: usize = 80;
@@ -91,8 +94,8 @@ const PARAM_SELF_OFFSET: usize = 5816;
 const PARAM_IDENTITY_BINDING: usize = 5840;
 const PARAM_IDENTITY_GETTER: usize = 5848;
 const PARAM_DEBUG_ID_GETTER: usize = 5856;
-const CAPTURE_HEADER_SIZE: usize = 320;
-const CAPTURE_HEADER_MAGIC: u32 = 0x50414352; // RCAP, version 1.
+const CAPTURE_HEADER_SIZE: usize = 352;
+const CAPTURE_HEADER_MAGIC: u32 = 0x50414352; // RCAP; capture uses version 2.
 const PARAM_CAPTURE_MODE: usize = 5880;
 const PARAM_PARENT_OFFSET: usize = 5884;
 const PARAM_WINDOW: usize = 5888;
@@ -1713,7 +1716,13 @@ fn ensure_helper_loaded_with_timeout(
 ) -> Result<usize> {
     memory.ensure_writes_verified()?;
     let path = helper_path()?;
-    ensure_library_loaded(pid, memory, current_modules, timeout, &path)
+    let helper = ensure_library_loaded(pid, memory, current_modules, timeout, &path)?;
+    let version_rva = helper_export_rva("ReniumSerializerAbiVersion")?;
+    anyhow::ensure!(
+        memory.read_u32(helper + version_rva)? == SERIALIZER_VERSION,
+        "Incompatible native serializer helper protocol; restart Studio with the matching Renium build"
+    );
+    Ok(helper)
 }
 
 fn ensure_library_loaded(
@@ -2114,6 +2123,24 @@ fn data_model_task_context(
     layout: &PackageLayout,
     data_model: &ActiveDataModel,
 ) -> Result<usize> {
+    let contexts = data_model_context_fields(memory, studio, layout, data_model)?
+        .into_iter()
+        .map(|field| field.pointer)
+        .collect::<HashSet<_>>();
+    anyhow::ensure!(
+        contexts.len() == 1,
+        "DataModel methods reference {} complete EngineContext objects; task context is missing or ambiguous",
+        contexts.len()
+    );
+    Ok(*contexts.iter().next().unwrap())
+}
+
+fn data_model_context_fields(
+    memory: &ProcessMemory,
+    studio: &ModuleEntry,
+    layout: &PackageLayout,
+    data_model: &ActiveDataModel,
+) -> Result<HashSet<ContextField>> {
     let data_model_instance = data_model
         .outer
         .checked_add(data_model.layout.data_model_instance)
@@ -2130,21 +2157,19 @@ fn data_model_task_context(
             && properties::complete_reflection_type(memory, studio, pointer).as_deref()
                 == Some(".?AVEngineContext@RBX@@")
         {
-            contexts.insert(pointer);
+            contexts.insert(ContextField {
+                offset,
+                mask,
+                pointer,
+            });
         }
     }
-    anyhow::ensure!(
-        contexts.len() == 1,
-        "DataModel methods reference {} complete EngineContext objects; task context is missing or ambiguous",
-        contexts.len()
-    );
-    let task_context = *contexts.iter().next().unwrap();
     let submit = studio
         .base
         .checked_add(layout.submit_task)
         .context("Studio DataModel task submitter address overflowed")?;
     properties::verified_code(memory, studio, layout, submit, 64)?;
-    Ok(task_context)
+    Ok(contexts)
 }
 
 #[derive(Clone, Copy)]
@@ -2521,6 +2546,7 @@ fn build_parameters(
         "Native snapshot requires 1..={MAX_ROOTS} roots"
     );
     let mut bytes = vec![0; PARAM_SIZE];
+    put_u32(&mut bytes, PARAM_PROTOCOL_VERSION, SERIALIZER_VERSION);
     put_u64(&mut bytes, 0, module_base);
     put_u64(&mut bytes, 8, trace.serializer);
     put_u64(&mut bytes, 16, trace.context_builder);
@@ -2583,6 +2609,7 @@ fn error_text(bytes: &[u8]) -> String {
 /// transferred to the caller. The decoder must check the serialized UID/parent
 /// bijection before using this capture (flag 64 excludes non-Archivable trees).
 pub(crate) struct NativeCapture {
+    pub attempts: usize,
     pub bytes: Vec<u8>,
     /// Headerless 72-byte rows: native UniqueId[16], NUL/zero-padded debug ID[48],
     /// LE parent row u32, reserved zero u32. Selected roots come first in request
@@ -2757,20 +2784,28 @@ fn select_capture_roots(
         .collect()
 }
 
-fn capture_lengths(header: &[u8], root_count: usize, file_size: u64) -> Result<(usize, usize)> {
+fn validate_capture_header(header: &[u8]) -> Result<()> {
     anyhow::ensure!(
         header.len() == CAPTURE_HEADER_SIZE
             && read_u32(header, 0)? == CAPTURE_HEADER_MAGIC
-            && read_u32(header, 4)? == 1,
-        "Invalid native capture response header"
+            && read_u32(header, 4)? == SERIALIZER_VERSION,
+        "Invalid native capture response header or protocol version"
     );
+    Ok(())
+}
+
+fn capture_lengths(header: &[u8], root_count: usize, file_size: u64) -> Result<(usize, usize)> {
+    validate_capture_header(header)?;
     let status = read_u32(header, 8)?;
     let exit = read_u32(header, 12)?;
-    anyhow::ensure!(
-        status == 4 && exit == 0,
-        "Studio native capture failed with status 0x{status:X}, exit 0x{exit:X}: {}",
-        error_text_at(header, 64)
-    );
+    if status != 4 || exit != 0 {
+        return Err(crate::studio::native::capture::CaptureResponseError {
+            status,
+            exit,
+            message: error_text_at(&header[..320], 64),
+        }
+        .into());
+    }
     let bytes = usize::try_from(read_u64(header, 16)?)?;
     let identities = usize::try_from(read_u64(header, 24)?)?;
     anyhow::ensure!(
@@ -2790,12 +2825,55 @@ fn capture_lengths(header: &[u8], root_count: usize, file_size: u64) -> Result<(
 /// Read-only engine operation using the ordinary production DataModel queue.
 /// `timeout` covers host discovery, helper loading, native work and transport;
 /// the queued engine phase also has the existing 15-second ceiling. A timeout
-/// never terminates engine code or unloads the helper. No retry is implicit.
+/// never terminates engine code or unloads the helper. A completed task-context
+/// refusal is rediscovered/retried at most twice within that same deadline.
 pub(crate) fn capture_live_services(
     pid: u32,
     studio_title: &str,
     services: &[String],
     timeout: Duration,
+) -> Result<NativeCapture> {
+    use crate::studio::native::capture::{CaptureUnavailable, MAX_CAPTURE_ATTEMPTS, retry_capture};
+
+    let started = Instant::now();
+    // Retain one handle across all attempts: a closed Studio must not let a
+    // reused PID silently retarget a retry to a different process.
+    let memory = ProcessMemory::open(pid).map_err(|error| CaptureUnavailable {
+        attempts: 0,
+        reason: format!("{error:#}"),
+    })?;
+    let (mut captured, attempts) = retry_capture(
+        timeout.saturating_sub(started.elapsed()),
+        |remaining| capture_live_services_once(pid, studio_title, services, remaining, &memory),
+        |attempt, result, delay| {
+            let outcome = match result {
+                Ok(_) => "succeeded".to_owned(),
+                Err(error) => match delay {
+                    Some(delay) => format!(
+                        "unavailable; rediscovering in {}ms: {error:#}",
+                        delay.as_millis()
+                    ),
+                    None => format!("unavailable; no further native retry: {error:#}"),
+                },
+            };
+            crate::app::output::log_global(
+                3,
+                format_args!(
+                    "[renium] native capture: pid={pid} title={studio_title:?} attempt={attempt}/{MAX_CAPTURE_ATTEMPTS} {outcome}"
+                ),
+            );
+        },
+    )?;
+    captured.attempts = attempts;
+    Ok(captured)
+}
+
+fn capture_live_services_once(
+    pid: u32,
+    studio_title: &str,
+    services: &[String],
+    timeout: Duration,
+    memory: &ProcessMemory,
 ) -> Result<NativeCapture> {
     let started = Instant::now();
     capture_remaining_ms(started, timeout)?;
@@ -2803,7 +2881,6 @@ pub(crate) fn capture_live_services(
         !services.is_empty() && services.len() <= MAX_ROOTS,
         "Native capture requires 1..={MAX_ROOTS} services"
     );
-    let memory = ProcessMemory::open(pid)?; // Retains the process across PID reuse.
     memory.authorize(NativeOperation::Capture, studio_title)?;
     let current_modules = modules(pid)?;
     let studio = current_modules
@@ -2815,32 +2892,31 @@ pub(crate) fn capture_live_services(
     );
     let window = capture_window(pid, studio_title)?;
     let (data, trace, image_stamp) = studio_layout(&studio.path)?;
-    verify_loaded_image(&memory, studio, image_stamp)?;
-    let mut model = active_data_model(pid, &memory, studio, data, studio_title)?;
+    verify_loaded_image(memory, studio, image_stamp)?;
+    let mut model = active_data_model(pid, memory, studio, data, studio_title)?;
     let layout = package_layout(&studio.path)?;
-    let task_context = data_model_task_context(&memory, studio, &layout, &model)?;
     for rva in [trace.serializer, trace.deallocator, layout.submit_task] {
         let address = studio
             .base
             .checked_add(rva)
             .context("Capture entry address overflowed")?;
-        properties::verified_code(&memory, studio, &layout, address, 64)?;
+        properties::verified_code(memory, studio, &layout, address, 64)?;
     }
     let instance = model
         .outer
         .checked_add(model.layout.data_model_instance)
         .context("DataModel instance address overflowed")?;
-    let parent_offset = properties::parent_offset(&memory, &model)?;
+    let parent_offset = properties::parent_offset(memory, &model)?;
     let (identity_binding, identity_getter) =
-        properties::identity_binding(&memory, studio, &layout, &model, instance)?;
-    let debug_id = properties::debug_id_function(&memory, studio, &layout, &model, instance)?;
+        properties::identity_binding(memory, studio, &layout, &model, instance)?;
+    let debug_id = properties::debug_id_function(memory, studio, &layout, &model, instance)?;
     let roots = model
         .roots
         .iter()
         .map(|entry| {
             Ok((
                 *entry,
-                read_instance_class(&memory, entry.instance, model.layout)
+                read_instance_class(memory, entry.instance, model.layout)
                     .context("Studio service class changed during capture discovery")?,
             ))
         })
@@ -2848,7 +2924,7 @@ pub(crate) fn capture_live_services(
     model.roots = select_capture_roots(&roots, services)?;
     let helper = ensure_helper_loaded_with_timeout(
         pid,
-        &memory,
+        memory,
         &current_modules,
         capture_remaining_ms(started, timeout)?,
     )?;
@@ -2879,7 +2955,6 @@ pub(crate) fn capture_live_services(
     // The older file-snapshot path's deliberate 0x9fc0 override is unchanged.
     put_u32(&mut parameters, PARAM_REQUESTED_MXCSR, 0);
     for (offset, value) in [
-        (PARAM_TASK_CONTEXT, task_context),
         (
             PARAM_SUBMIT_TASK,
             studio
@@ -2908,6 +2983,10 @@ pub(crate) fn capture_live_services(
         capture_window(pid, studio_title)? == window,
         "Studio window changed during capture discovery"
     );
+    // Discover last, after bindings, helper loading and transport creation.
+    // The helper must still independently reject a changed context under lock.
+    let task_context = data_model_task_binding(memory, studio, &layout, &model)?;
+    task_context.encode(&mut parameters)?;
     let remaining = capture_remaining_ms(started, timeout)?;
     put_u32(&mut parameters, PARAM_TIMEOUT, remaining.min(15_000));
     let remote = memory.allocate(parameters.len())?;
@@ -2920,12 +2999,15 @@ pub(crate) fn capture_live_services(
         .context("Incomplete native capture response header")?;
     capture_remaining_ms(started, timeout)
         .context("Native capture expired after its helper returned")?;
-    let (byte_count, identity_count) =
-        capture_lengths(&header, services.len(), transport.metadata()?.len())?;
+    // Check the actual thread exit even for errors, before classifying a
+    // response as safe to retry. An inconsistent transport is never replayed.
     anyhow::ensure!(
         exit == read_u32(&header, 12)?,
         "Native capture response exit disagrees with helper exit"
     );
+    task_context.log_helper_reading(pid, &header)?;
+    let (byte_count, identity_count) =
+        capture_lengths(&header, services.len(), transport.metadata()?.len())?;
     let mut bytes = vec![0; byte_count];
     let mut identities = vec![0; identity_count];
     transport
@@ -2940,7 +3022,11 @@ pub(crate) fn capture_live_services(
         capture_window(pid, studio_title)? == window,
         "Studio window changed during native capture"
     );
-    Ok(NativeCapture { bytes, identities })
+    Ok(NativeCapture {
+        attempts: 1,
+        bytes,
+        identities,
+    })
 }
 
 fn write_live_snapshot(
@@ -3131,7 +3217,7 @@ mod capture_contract_tests {
     fn capture_transport_rejects_truncation_oversize_and_partial_identity_rows() {
         let mut params = vec![0; CAPTURE_HEADER_SIZE];
         put_u32(&mut params, 0, CAPTURE_HEADER_MAGIC);
-        put_u32(&mut params, 4, 1);
+        put_u32(&mut params, 4, SERIALIZER_VERSION);
         put_u32(&mut params, 8, 4);
         put_u64(&mut params, 16, 128);
         put_u64(&mut params, 24, 3 * CAPTURE_ROW_SIZE);
@@ -3141,9 +3227,9 @@ mod capture_contract_tests {
         assert!(capture_lengths(&params, 2, total - 1).is_err());
         assert!(capture_lengths(&params, 2, total + 1).is_err());
         assert!(capture_lengths(&params[..CAPTURE_HEADER_SIZE - 1], 2, total).is_err());
-        put_u32(&mut params, 4, 2);
-        assert!(capture_lengths(&params, 2, total).is_err());
         put_u32(&mut params, 4, 1);
+        assert!(capture_lengths(&params, 2, total).is_err());
+        put_u32(&mut params, 4, SERIALIZER_VERSION);
         put_u32(&mut params, 8, 0xE00A);
         params[64..71].copy_from_slice(b"expired");
         assert!(
@@ -3159,5 +3245,28 @@ mod capture_contract_tests {
         put_u64(&mut params, 16, CAPTURE_MAX_BYTES + 1);
         assert!(capture_lengths(&params, 2, total).is_err());
         assert!(capture_remaining_ms(Instant::now(), Duration::ZERO).is_err());
+    }
+
+    #[test]
+    fn capture_response_preserves_status_exit_and_exact_refusal_message() {
+        use crate::studio::native::capture::{CONTEXT_CHANGED, CaptureResponseError};
+
+        let mut header = vec![0; CAPTURE_HEADER_SIZE];
+        put_u32(&mut header, 0, CAPTURE_HEADER_MAGIC);
+        put_u32(&mut header, 4, SERIALIZER_VERSION);
+        put_u32(&mut header, 8, 0xE004);
+        put_u32(&mut header, 12, 0xE004);
+        header[64..64 + CONTEXT_CHANGED.len()].copy_from_slice(CONTEXT_CHANGED.as_bytes());
+        let error = capture_lengths(&header, 1, CAPTURE_HEADER_SIZE as u64).unwrap_err();
+        let response = error.downcast_ref::<CaptureResponseError>().unwrap();
+        assert_eq!((response.status, response.exit), (0xE004, 0xE004));
+        assert_eq!(response.message, CONTEXT_CHANGED);
+        put_u32(&mut header, 4, 1);
+        assert!(
+            capture_lengths(&header, 1, CAPTURE_HEADER_SIZE as u64)
+                .unwrap_err()
+                .downcast_ref::<CaptureResponseError>()
+                .is_none()
+        );
     }
 }

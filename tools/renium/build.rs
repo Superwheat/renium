@@ -120,6 +120,22 @@ fn build_windows(out_dir: &Path) {
         "Windows background launch regression build",
     );
     println!("cargo:rerun-if-changed={}", launch_test.display());
+    let capture_test = PathBuf::from("native/tests/capture_context_windows.cpp");
+    let mut capture_command = compiler.to_command();
+    capture_command.args(["/nologo", "/O2", "/EHsc", "/std:c++20", "/MT"]);
+    capture_command.arg(&capture_test);
+    capture_command.arg(format!("/Fo{}\\", out_dir.display()));
+    capture_command.arg(format!(
+        "/Fe{}",
+        out_dir.join("renium-capture-context-test.exe").display()
+    ));
+    capture_command.args(["/link", "/INCREMENTAL:NO"]);
+    run(
+        &mut capture_command,
+        "Windows capture context regression build",
+    );
+    println!("cargo:rerun-if-changed={}", capture_test.display());
+    println!("cargo:rerun-if-changed=native/renium_capture_context.h");
     let function_test = PathBuf::from("native/tests/functions_windows.cpp");
     let mut function_test_command = compiler.to_command();
     function_test_command.args(["/nologo", "/O2", "/EHsc", "/std:c++20", "/MT"]);

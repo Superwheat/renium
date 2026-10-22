@@ -4,6 +4,8 @@
 
 ### Bug fixes
 
+- Live Sync can start when Studio briefly changes context during a busy edit session. It retries briefly, then uses Studio's export fallback if native capture remains unavailable, and reports the attempt count and fallback in the startup result.
+- Live Sync and pulls keep using fast native capture after compatible Studio layout changes, preserving native identity and engine-only fields. Unsupported layouts now report a clear compatibility reason and use Studio's export fallback without repeated capture refusals.
 - Store IDs as `rbx find`, `bb` and `v` print them (plain hex such as `a8d7`) now work as parent selectors in `mip`, `ba`, `cr` and every other command that takes an ID or a path, including stores written by `pi`; before, only IDs containing a colon were tried as IDs and the rest were read as paths, which failed with "No matching instance path".
 
 ## 0.5.0 - 2026-10-21

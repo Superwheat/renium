@@ -38,7 +38,13 @@ pub(super) fn check(
     let layout = package_layout(&studio.path)?;
     verify_loaded_image(memory, studio, layout.image_stamp)?;
     let model = active_data_model(pid, memory, studio, layout.data, title)?;
-    let context = data_model_task_context(memory, studio, &layout, &model)?;
+    let capture_binding = (operation == NativeOperation::Capture)
+        .then(|| data_model_task_binding(memory, studio, &layout, &model))
+        .transpose()?;
+    let context = match capture_binding {
+        Some(binding) => binding.field.pointer,
+        None => data_model_task_context(memory, studio, &layout, &model)?,
+    };
     properties::verified_code(
         memory,
         studio,
@@ -54,6 +60,7 @@ pub(super) fn check(
         "instanceOffset": model.layout.data_model_instance,
         "childrenOffset": model.layout.children, "selfOffset": model.layout.self_pointer,
         "taskContext": context, "submitTaskRva": layout.submit_task,
+        "captureTaskContext": capture_binding.map(TaskContextBinding::readings),
         "binding": details, "allocator": allocator,
     }))
 }

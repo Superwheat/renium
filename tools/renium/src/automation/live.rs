@@ -954,14 +954,21 @@ impl Manager {
         log_live_timing("startup pair preparation", phase);
         let pair_key = setup.key.clone();
         let mut release_owner = OnDrop::new(|| self.coordinator.release_target(&pair_key));
-        let result = self.start_prepared(
-            context,
-            bridge,
-            pull_changes,
-            files_paused,
-            reset_files_paused,
-            setup,
-        );
+        let (mut result, captures) = crate::studio::native::capture::collect_reports(|| {
+            self.start_prepared(
+                context,
+                bridge,
+                pull_changes,
+                files_paused,
+                reset_files_paused,
+                setup,
+            )
+        });
+        if let Ok(started) = &mut result
+            && !captures.is_empty()
+        {
+            started.status["nativeCapture"] = json!(captures);
+        }
         if result.is_ok() {
             release_owner.disarm();
         }

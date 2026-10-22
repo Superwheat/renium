@@ -1,5 +1,7 @@
 //! Export-scoped attribute observation. One engine subscription, no Instance walk.
 use super::*;
+// Observation retains its v1 response; capture has a v2 context receipt.
+const OBSERVATION_HEADER_SIZE: usize = 320;
 use crate::system::LockRecover;
 use std::io::{self, Seek, SeekFrom};
 use std::os::windows::io::AsRawHandle;
@@ -255,9 +257,9 @@ pub(crate) struct AttributeGuard {
     transport: fs::File,
 }
 impl AttributeGuard {
-    fn header(&mut self) -> Result<[u8; CAPTURE_HEADER_SIZE]> {
+    fn header(&mut self) -> Result<[u8; OBSERVATION_HEADER_SIZE]> {
         self.transport.seek(SeekFrom::Start(0))?;
-        let mut header = [0; CAPTURE_HEADER_SIZE];
+        let mut header = [0; OBSERVATION_HEADER_SIZE];
         self.transport.read_exact(&mut header)?;
         anyhow::ensure!(
             read_u32(&header, 0)? == CAPTURE_HEADER_MAGIC && read_u32(&header, 4)? == 1,
@@ -430,13 +432,13 @@ fn begin_observation(
         values: Vec::new(),
     };
     let mut params = build_parameters(studio.base, serializer, &model, &path, true)?;
-    params.resize(6016, 0);
+    params.resize(PARAM_SIZE + 112, 0);
     if let Some((target, offset, fire)) = relay {
         for (field, value) in [
-            (5976, target.instance),
-            (5984, target.owner),
-            (5992, offset),
-            (6000, fire),
+            (PARAM_SIZE + 72, target.instance),
+            (PARAM_SIZE + 80, target.owner),
+            (PARAM_SIZE + 88, offset),
+            (PARAM_SIZE + 96, fire),
         ] {
             put_u64(&mut params, field, value);
         }
@@ -445,16 +447,16 @@ fn begin_observation(
         (PARAM_TASK_CONTEXT, context),
         (PARAM_SUBMIT_TASK, studio.base + layout.submit_task),
         (PARAM_WINDOW, window.0),
-        (5904, prepared.trace.signal_offset),
-        (5912, studio.base + prepared.trace.ensure),
-        (5920, studio.base + prepared.trace.allocate),
-        (5928, studio.base + prepared.trace.append),
-        (5936, studio.base + prepared.trace.disconnect),
-        (5944, studio.base + prepared.trace.assign),
-        (5952, descriptor),
-        (5960, duplicates.duplicate(&stop)?),
-        (5968, duplicates.duplicate(&ready)?),
-        (6008, duplicates.duplicate(&host)?),
+        (PARAM_SIZE, prepared.trace.signal_offset),
+        (PARAM_SIZE + 8, studio.base + prepared.trace.ensure),
+        (PARAM_SIZE + 16, studio.base + prepared.trace.allocate),
+        (PARAM_SIZE + 24, studio.base + prepared.trace.append),
+        (PARAM_SIZE + 32, studio.base + prepared.trace.disconnect),
+        (PARAM_SIZE + 40, studio.base + prepared.trace.assign),
+        (PARAM_SIZE + 48, descriptor),
+        (PARAM_SIZE + 56, duplicates.duplicate(&stop)?),
+        (PARAM_SIZE + 64, duplicates.duplicate(&ready)?),
+        (PARAM_SIZE + 104, duplicates.duplicate(&host)?),
     ] {
         put_u64(&mut params, offset, value);
     }

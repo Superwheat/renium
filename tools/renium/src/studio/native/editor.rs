@@ -88,8 +88,19 @@ use crate::app::timing::{
 use crate::studio::native::serializer;
 use crate::system::LockRecover;
 
+#[cfg(windows)]
+use super::capture::CaptureUnavailable;
+use super::capture::{CaptureReport, export_with_fallback, record_report};
+
 const NATIVE_SERIALIZATION_SERVICE_LIMIT: usize = 4_096;
 const NATIVE_SERIALIZATION_BATCH_LIMIT: usize = 8_192;
+
+#[derive(Clone, Copy, PartialEq)]
+enum BinaryExportMode {
+    Snapshot,
+    NativeCapture,
+    PluginSerialization,
+}
 
 pub(crate) fn property_change_needs_post_native_apply(change: &EditorPropertyChange) -> bool {
     change.path_segments.as_slice() == [change.service.as_str()]
@@ -119,7 +130,15 @@ pub(crate) fn begin_editor_binary_export(
     bridge: &BridgeServer,
     service_filter: Option<&[String]>,
 ) -> Result<EditorBinaryExport> {
-    begin_editor_binary_export_for_runtime(bridge, false, None, service_filter, false, None, true)
+    begin_editor_binary_export_for_runtime(
+        bridge,
+        false,
+        None,
+        service_filter,
+        false,
+        None,
+        BinaryExportMode::Snapshot,
+    )
 }
 
 fn begin_editor_binary_export_for_runtime(
@@ -129,11 +148,11 @@ fn begin_editor_binary_export_for_runtime(
     service_filter: Option<&[String]>,
     metadata_only: bool,
     runtime_id: Option<&str>,
-    capture_root_properties: bool,
+    mode: BinaryExportMode,
 ) -> Result<EditorBinaryExport> {
     let export_id = format!("{}-{}", current_millis(), std::process::id());
     let request_native_capture =
-        cfg!(windows) && partitioned && !metadata_only && !capture_root_properties;
+        cfg!(windows) && partitioned && !metadata_only && mode == BinaryExportMode::NativeCapture;
     #[cfg(windows)]
     let request_native_capture = request_native_capture
         && studio_pid_for_bridge(bridge).is_ok_and(serializer::native_capture_verified);
@@ -288,7 +307,7 @@ fn begin_editor_binary_export_for_runtime(
         #[cfg(any(windows, target_os = "macos"))]
         let groups = {
             let mut groups = groups;
-            if capture_root_properties {
+            if mode == BinaryExportMode::Snapshot {
                 capture_native_service_root_properties(bridge, runtime_id, &mut groups)?;
             }
             groups
@@ -887,7 +906,7 @@ fn receive_editor_binary_export_for_runtime(
         None,
         false,
         Some(runtime_id),
-        true,
+        BinaryExportMode::Snapshot,
     )?;
     let result = receive_editor_binary_export_bytes_for_runtime(
         bridge,
@@ -2577,6 +2596,53 @@ pub(crate) fn editor_binary_export_parts<'a>(
     on_output: &mut (impl FnMut(ServiceExportOutput) -> Result<()> + Send),
     on_serialization_complete: &mut (impl FnMut() -> Result<()> + Send),
 ) -> Result<EditorBinaryExportFinishGuard<'a>> {
+    let ((guard, mut report), unavailable) = export_with_fallback(
+        |native| {
+            editor_binary_export_parts_once(
+                bridge,
+                requested_services,
+                run_started,
+                on_output,
+                on_serialization_complete,
+                if native {
+                    BinaryExportMode::NativeCapture
+                } else {
+                    BinaryExportMode::PluginSerialization
+                },
+            )
+        },
+        |error| {
+            crate::app::output::log_global(
+                3,
+                format_args!(
+                    "[renium] native capture unavailable after {} attempt(s); using Studio export fallback: {}",
+                    error.attempts, error.reason
+                ),
+            )
+        },
+    )?;
+    if let Some(unavailable) = unavailable {
+        report = Some(CaptureReport {
+            attempts: unavailable.attempts,
+            verdict: "degraded",
+            fallback: Some("plugin-export"),
+            reason: Some(unavailable.reason),
+        });
+    }
+    if let Some(report) = report {
+        record_report(report);
+    }
+    Ok(guard)
+}
+
+fn editor_binary_export_parts_once<'a>(
+    bridge: &'a BridgeServer,
+    requested_services: &[String],
+    run_started: Instant,
+    on_output: &mut (impl FnMut(ServiceExportOutput) -> Result<()> + Send),
+    on_serialization_complete: &mut (impl FnMut() -> Result<()> + Send),
+    mode: BinaryExportMode,
+) -> Result<(EditorBinaryExportFinishGuard<'a>, Option<CaptureReport>)> {
     let export_started_ms = elapsed_ms(run_started);
     let begin_started = Instant::now();
     let export = begin_editor_binary_export_for_runtime(
@@ -2586,7 +2652,7 @@ pub(crate) fn editor_binary_export_parts<'a>(
         Some(requested_services),
         false,
         None,
-        false,
+        mode,
     )?;
     let finish_guard = EditorBinaryExportFinishGuard {
         bridge,
@@ -2677,7 +2743,9 @@ pub(crate) fn editor_binary_export_parts<'a>(
         .collect::<HashMap<_, _>>();
     #[cfg(windows)]
     let captured_native_services =
-        OnceLock::<Result<Mutex<HashMap<String, NativeServiceDom>>, String>>::new();
+        OnceLock::<Result<Mutex<HashMap<String, NativeServiceDom>>, Arc<anyhow::Error>>>::new();
+    #[cfg(windows)]
+    let capture_attempts = std::sync::atomic::AtomicUsize::new(0);
     let native_capture = export.native_capture;
     let fetch_overlay = |group: &EditorBinaryExportGroup| {
         let selective_refs = group.instance_count >= NATIVE_SERIALIZATION_SERVICE_LIMIT
@@ -2817,6 +2885,8 @@ pub(crate) fn editor_binary_export_parts<'a>(
         let native_serialization_batches = &native_serialization_batches;
         #[cfg(windows)]
         let captured_native_services = &captured_native_services;
+        #[cfg(windows)]
+        let capture_attempts = &capture_attempts;
         let serialization_complete_signal = &serialization_complete_signal;
         let service_groups = &export.groups;
         let finish_dependencies = &finish_dependencies;
@@ -2871,23 +2941,22 @@ pub(crate) fn editor_binary_export_parts<'a>(
                                     let (native, one_chunk) = if native_capture {
                                         #[cfg(windows)]
                                         {
-                                            let captured = captured_native_services.get_or_init(|| {
-                                            (|| -> Result<_> {
-                                                let info = bridge.cached_bridge_info_for_target(crate::studio::bridge::BridgeTarget::Edit)?;
-                                                let pid = bridge.studio_pid_for_runtime(crate::studio::bridge::BridgeTarget::Edit, &info.runtime_id)?;
-                                                let title = serializer::target_name(pid, &info.place_name)?;
-                                                let services = service_groups.iter().map(|group| group.service.clone()).collect::<Vec<_>>();
-                                                let captured = serializer::capture_live_services(pid,
-                                                    &title, &services, Duration::from_secs(15))?;
-                                                serialization_complete_signal.store(true, Ordering::Release);
-                                                let batch = EditorBinarySerializationBatch { id: "native-capture".into(), services };
-                                                decode_native_serialization_batch(&captured.bytes, &batch, service_groups,
-                                                    Arc::clone(native_decode_filter), Some(&captured.identities)).map(Mutex::new)
-                                            })().map_err(|error| format!("{error:#}"))
-                                        });
+                                            let captured =
+                                                captured_native_services.get_or_init(|| {
+                                                    capture_native_export(
+                                                        bridge,
+                                                        service_groups,
+                                                        Arc::clone(native_decode_filter),
+                                                        serialization_complete_signal,
+                                                        capture_attempts,
+                                                    )
+                                                    .map_err(Arc::new)
+                                                });
                                             let captured = match captured {
                                                 Ok(captured) => captured,
-                                                Err(error) => bail!("{error}"),
+                                                Err(error) => {
+                                                    return Err(shared_capture_error(error));
+                                                }
                                             };
                                             let native = captured
                                                 .lock_recover()
@@ -3169,7 +3238,61 @@ pub(crate) fn editor_binary_export_parts<'a>(
     log_chunk_fetch_metrics("native editor overlay payloads", metrics);
     log_timing_ms("native editor overlay compact expansion", compact_expand_ms);
     log_timing("native editor streaming export", stream_started);
-    Ok(finish_guard)
+    #[cfg(windows)]
+    let report = native_capture.then(|| CaptureReport {
+        attempts: capture_attempts.load(Ordering::Acquire),
+        verdict: "native",
+        fallback: None,
+        reason: None,
+    });
+    #[cfg(not(windows))]
+    let report = None;
+    Ok((finish_guard, report))
+}
+
+#[cfg(windows)]
+fn shared_capture_error(error: &anyhow::Error) -> anyhow::Error {
+    // OnceLock shares the one capture between services. Preserve the typed
+    // refusal through worker fanout; never classify decode/identity errors by
+    // their text or restart an export that could already have emitted output.
+    match error.downcast_ref::<CaptureUnavailable>() {
+        Some(unavailable) => unavailable.clone().into(),
+        None => anyhow::anyhow!("{error:#}"),
+    }
+}
+
+#[cfg(windows)]
+fn capture_native_export(
+    bridge: &BridgeServer,
+    groups: &[EditorBinaryExportGroup],
+    filter: Arc<HashMap<String, HashSet<String>>>,
+    serialization_complete: &AtomicBool,
+    attempts: &std::sync::atomic::AtomicUsize,
+) -> Result<Mutex<HashMap<String, NativeServiceDom>>> {
+    let info = bridge.cached_bridge_info_for_target(crate::studio::bridge::BridgeTarget::Edit)?;
+    let pid = bridge
+        .studio_pid_for_runtime(crate::studio::bridge::BridgeTarget::Edit, &info.runtime_id)?;
+    let title = serializer::target_name(pid, &info.place_name)?;
+    let services = groups
+        .iter()
+        .map(|group| group.service.clone())
+        .collect::<Vec<_>>();
+    let captured =
+        serializer::capture_live_services(pid, &title, &services, Duration::from_secs(15))?;
+    attempts.store(captured.attempts, Ordering::Release);
+    serialization_complete.store(true, Ordering::Release);
+    let batch = EditorBinarySerializationBatch {
+        id: "native-capture".into(),
+        services,
+    };
+    decode_native_serialization_batch(
+        &captured.bytes,
+        &batch,
+        groups,
+        filter,
+        Some(&captured.identities),
+    )
+    .map(Mutex::new)
 }
 
 pub(crate) fn run_workers_and_drain<T: Send, R>(

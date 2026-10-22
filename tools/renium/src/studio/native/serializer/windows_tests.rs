@@ -129,8 +129,23 @@ fn snapshot_parameters_use_discovered_layout_and_captured_roots() -> Result<()> 
             assert_eq!(read_u32(&params, PARAM_CHILDREN_OFFSET)?, 0x98);
             assert_eq!(read_u32(&params, PARAM_SELF_OFFSET)?, 8);
             assert_eq!(params.len(), PARAM_SIZE);
+            assert_eq!(
+                read_u32(&params, PARAM_PROTOCOL_VERSION)?,
+                SERIALIZER_VERSION
+            );
         }
     }
+    Ok(())
+}
+
+#[test]
+fn embedded_helper_exports_the_matching_serializer_protocol() -> Result<()> {
+    let image = PeImage::parse(HELPER_BYTES)?;
+    let rva = helper_export_rva("ReniumSerializerAbiVersion")?;
+    assert_eq!(
+        read_u32(HELPER_BYTES, image.rva_to_offset(rva)?)?,
+        SERIALIZER_VERSION
+    );
     Ok(())
 }
 

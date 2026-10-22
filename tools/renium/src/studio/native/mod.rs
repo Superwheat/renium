@@ -1,3 +1,4 @@
+pub(crate) mod capture;
 pub(crate) mod editor;
 pub(crate) mod import;
 #[cfg(any(windows, target_os = "macos"))]

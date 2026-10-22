@@ -22,79 +22,9 @@
 #include <immintrin.h>
 #endif
 
-struct SharedInstance
-{
-    void* instance;
-    void* owner;
-};
+#include "renium_capture_context.h"
 
-struct ReniumSerializerParams
-{
-    std::uint64_t moduleBase;
-    std::uint64_t serializerRva;
-    std::uint64_t contextBuilderRva;
-    std::uint64_t contextDestroyRva;
-    std::uint64_t rootCollectorRva;
-    std::uint64_t deallocatorRva;
-    std::uint64_t dataModel;
-    std::uint64_t dataModelOwner;
-    std::uint32_t count;
-    std::uint32_t status;
-    std::uint64_t outputSize;
-    std::uint64_t contextMicros;
-    std::uint64_t collectMicros;
-    std::uint64_t serializeMicros;
-    std::uint64_t writeMicros;
-    std::uint64_t collectedCount;
-    std::uint64_t collectedCapacityBytes;
-    std::uint32_t requestedMxcsr;
-    std::uint32_t initialMxcsr;
-    std::uint32_t placeMode;
-    std::uint32_t dataModelInstanceOffset;
-    SharedInstance roots[256];
-    wchar_t outputPath[520];
-    char error[512];
-    std::uint64_t taskContext;
-    std::uint64_t submitTask;
-    std::uint32_t timeoutMs;
-    std::uint32_t childrenOffset;
-    std::uint32_t selfOffset;
-    std::uint32_t reserved;
-    std::uint64_t deadlineTick;
-    std::uint64_t queueMicros;
-    std::uint64_t identityBinding;
-    std::uint64_t identityGetter;
-    std::uint64_t debugIdGetter;
-    std::uint64_t identitySize;
-    std::uint64_t identityMicros;
-    std::uint32_t captureMode;
-    std::uint32_t parentOffset;
-    std::uint64_t window;
-    std::uint32_t processId;
-    std::uint32_t captureReserved;
-};
-
-static_assert(sizeof(ReniumSerializerParams) == 5904);
-static_assert(offsetof(ReniumSerializerParams, status) == 68);
-static_assert(offsetof(ReniumSerializerParams, placeMode) == 136);
-static_assert(offsetof(ReniumSerializerParams, dataModelInstanceOffset) == 140);
-static_assert(offsetof(ReniumSerializerParams, roots) == 144);
-static_assert(offsetof(ReniumSerializerParams, outputPath) == 4240);
-static_assert(offsetof(ReniumSerializerParams, error) == 5280);
-static_assert(offsetof(ReniumSerializerParams, taskContext) == 5792);
-static_assert(offsetof(ReniumSerializerParams, queueMicros) == 5832);
-static_assert(offsetof(ReniumSerializerParams, identityBinding) == 5840);
-static_assert(offsetof(ReniumSerializerParams, captureMode) == 5880);
-static_assert(offsetof(ReniumSerializerParams, processId) == 5896);
-
-// RCAP v1. Transport contains this header, RBXL, then headerless identity rows.
-struct CaptureResponse
-{
-    std::uint32_t magic, version, status, exitCode;
-    std::uint64_t bytes, identities, queueMicros, serializeMicros, identityMicros, writeMicros;
-    char error[256];
-};
-static_assert(sizeof(CaptureResponse) == 320);
+extern "C" __declspec(dllexport) const std::uint32_t ReniumSerializerAbiVersion = ReniumSerializerVersion;
 
 struct CaptureIdentityRow
 {
@@ -383,9 +313,7 @@ static DWORD RunCore(RunState* state)
     if (identity->instance != reinterpret_cast<void*>(model) ||
         identity->owner != reinterpret_cast<void*>(params->dataModelOwner))
         throw std::runtime_error("DataModel identity changed before native snapshot");
-    if (params->captureMode &&
-        (*reinterpret_cast<const std::uintptr_t*>(model + 0x58) & ~std::uintptr_t(7)) != params->taskContext)
-        throw std::runtime_error("DataModel task context changed before capture");
+    if (params->captureMode) CheckCaptureContext(*params, reinterpret_cast<const void*>(model));
     const auto children = *reinterpret_cast<const SharedVector* const*>(model + params->childrenOffset);
     if (!children || !children->begin || children->end < children->begin ||
         children->end - children->begin > 256)
@@ -545,7 +473,7 @@ static DWORD RunCore(RunState* state)
     if (params->captureMode)
     {
         LARGE_INTEGER start{};
-        start.QuadPart = sizeof(CaptureResponse);
+        start.QuadPart = sizeof(CaptureContextResponse);
         if (!SetFilePointerEx(state->file, start, nullptr, FILE_BEGIN))
             throw std::runtime_error("Cannot position native capture transport");
     }
@@ -724,7 +652,7 @@ static DWORD RunSerializer(ReniumSerializerParams* params, const std::atomic<boo
         !params->outputPath[0] || params->outputPath[519] || params->captureMode > 1 ||
         (params->captureMode && (!params->placeMode || !params->identityBinding ||
             !params->identityGetter || !params->debugIdGetter || !params->window ||
-            !params->processId || params->captureReserved ||
+            !params->processId || params->contextReserved ||
             params->parentOffset > 0x200 || params->parentOffset % 8)))
     {
         params->status = 0xE001;
@@ -824,6 +752,8 @@ static DWORD QueueSerializer(ReniumSerializerParams* params)
     if (!params || !params->taskContext || !params->submitTask || !params->dataModelOwner ||
         !params->timeoutMs || params->timeoutMs > 15000)
         return 0xE008;
+    ValidateSerializerProtocol(*params);
+    if (params->captureMode) ValidateCaptureContextBinding(*params);
     auto owner = reinterpret_cast<void*>(params->dataModelOwner);
     if (!AddOwnerReference(owner)) throw std::runtime_error("DataModel owner expired");
     // Hold through submission/wait, not in the DataModel's own queue.
@@ -888,10 +818,8 @@ extern "C" __declspec(dllexport) DWORD WINAPI ReniumRun(ReniumSerializerParams* 
 
 static DWORD PublishCaptureResponse(ReniumSerializerParams* params, DWORD result)
 {
-    CaptureResponse response{0x50414352, 1, params->status, result,
-        params->outputSize, params->identitySize, params->queueMicros,
-        params->serializeMicros, params->identityMicros, params->writeMicros, {}};
-    strncpy_s(response.error, params->error, _TRUNCATE);
+    const auto response = MakeCaptureResponse(*params, result);
+    const auto responseSize = CaptureResponseSize(*params);
     // Also publish errors, but never recreate the host's cancelled transport.
     const auto file = CreateFileW(params->outputPath, GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
@@ -899,9 +827,9 @@ static DWORD PublishCaptureResponse(ReniumSerializerParams* params, DWORD result
     if (file == INVALID_HANDLE_VALUE) return 0xE00C;
     DWORD written = 0;
     BOOL ok = FALSE;
-    __try { ok = WriteFile(file, &response, sizeof(response), &written, nullptr); }
+    __try { ok = WriteFile(file, &response, responseSize, &written, nullptr); }
     __finally { CloseHandle(file); }
-    return ok && written == sizeof(response) ? result : 0xE00D;
+    return ok && written == responseSize ? result : 0xE00D;
 }
 
 extern "C" __declspec(dllexport) DWORD WINAPI ReniumCaptureRun(ReniumSerializerParams* params)
@@ -912,7 +840,14 @@ extern "C" __declspec(dllexport) DWORD WINAPI ReniumCaptureRun(ReniumSerializerP
     {
         __try
         {
-            if (params->captureMode == 1)
+            // Read only the legacy prefix until the request version is known.
+            if (params->protocolVersion != ReniumSerializerVersion)
+            {
+                params->status = 0xE00A;
+                SetError(params, "Incompatible native serializer protocol; use the matching Renium helper");
+                result = params->status;
+            }
+            else if (params->captureMode == 1)
                 result = PublishCaptureResponse(params, ReniumRun(params));
         }
         __except (RecordException(params, GetExceptionInformation())) { result = params->status; }

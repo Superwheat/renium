@@ -85,7 +85,7 @@ pub(crate) struct ProbeVerdict {
 }
 
 impl ProbeVerdict {
-    fn from_result(operation: NativeOperation, result: &Result<Value>) -> Self {
+    pub(super) fn from_result(operation: NativeOperation, result: &Result<Value>) -> Self {
         let (verdict, reason, readings) = match result {
             Ok(readings) => (
                 "native",

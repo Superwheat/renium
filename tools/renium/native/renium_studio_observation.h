@@ -30,7 +30,8 @@ struct Params {
     std::uintptr_t relayOffset, fireRelay;
     HANDLE host;
 };
-static_assert(sizeof(Params) == 6016);
+static_assert(sizeof(Params) == 6048);
+static_assert(offsetof(Params, signalOffset) == sizeof(ReniumSerializerParams));
 
 struct Task {
     Params params{};
@@ -257,6 +258,15 @@ static DWORD ObservationBoundary(renium_observation::Params* params) {
     }
 }
 extern "C" __declspec(dllexport) DWORD WINAPI ReniumObserveAttributes(renium_observation::Params* params) {
+    if (!params) return 0xE000;
+    if (params->base.protocolVersion != ReniumSerializerVersion) {
+        // The old request's extension starts earlier: never read its handles
+        // as v2 handles or copy the larger struct before validating the prefix.
+        params->base.status = 0xE00A;
+        SetError(&params->base, "Incompatible native serializer protocol; use the matching Renium helper");
+        VirtualFree(params, 0, MEM_RELEASE);
+        return 0xE00A;
+    }
     DWORD result = 0xE626;
     __try { result = ObservationBoundary(params); }
     __finally {

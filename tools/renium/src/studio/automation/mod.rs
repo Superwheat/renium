@@ -853,6 +853,7 @@ fn compact_live_daemon_status(value: &Value) -> Value {
         "error",
         "previousError",
         "terrainObservation",
+        "nativeCapture",
     ] {
         if let Some(value) = source.get(key) {
             result.insert(key.to_string(), value.clone());
