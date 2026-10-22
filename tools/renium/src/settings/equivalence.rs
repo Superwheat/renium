@@ -2862,6 +2862,9 @@ pub(crate) fn reconciliation_property_is_engine_state(
         // The engine sets a WeldConstraint's State from whether its parts are
         // currently joined; a recreated weld settles to another value.
         || class_name == "WeldConstraint" && name == "State"
+        // Workspace.InsertPoint is transient editor insertion state: reflection
+        // marks it DoesNotSerialize and pushes already leave it alone.
+        || class_name == "Workspace" && name == "InsertPoint"
         || database.is_some_and(|database| {
             reconciliation_property_is_engine_mirror(database, class_name, name)
         })
@@ -5624,6 +5627,22 @@ mod verify_noise_tests {
         studio.insert("State".into(), json!(3));
         assert!(reconciliation_maps_equal("WeldConstraint", &files, &studio));
         assert!(!reconciliation_maps_equal("Smoke", &files, &studio));
+    }
+
+    #[test]
+    fn workspace_insert_point_is_engine_state() {
+        let mut files = Map::new();
+        files.insert(
+            "InsertPoint".into(),
+            json!({"_type":"Vector3","x":0.0,"y":0.0,"z":0.0}),
+        );
+        let mut studio = Map::new();
+        studio.insert(
+            "InsertPoint".into(),
+            json!({"_type":"Vector3","x":839.25885,"y":28.756990,"z":-12.5}),
+        );
+        assert!(reconciliation_maps_equal("Workspace", &files, &studio));
+        assert!(!reconciliation_maps_equal("Model", &files, &studio));
     }
 
     #[test]
