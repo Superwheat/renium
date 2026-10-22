@@ -632,7 +632,10 @@ pub(crate) fn align_first_pairing(
                 }
         });
         if moved_identity
-            || !resolved.repaired[index]
+            // The preliminary ID aligner can choose another equivalent twin.
+            // A validated assignment supersedes that guess even when it kept
+            // the original ordinal. Persistent moves are checked above.
+            || !resolved.proven[index]
                 && editor_key_by_id
                     .get(&instance.settings_id)
                     .is_some_and(|editor_key| *editor_key != key)

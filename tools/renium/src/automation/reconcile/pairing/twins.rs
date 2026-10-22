@@ -1,5 +1,6 @@
 //! First-pairing evidence, kept separate from the mutable identity/reference remap.
-//! A candidate is a complete subtree. Only a full bijection may replace a group.
+//! Subtree candidates are complete. A group must cover its entire smaller side;
+//! distinct root records can pair parents before comparing changed descendants.
 use super::*;
 use ahash::AHashSet;
 use std::borrow::Cow;
@@ -267,6 +268,36 @@ impl Matcher<'_, '_> {
                 .is_none_or(|source| source == studio)
     }
 
+    /// Distinct root records can identify a complete sibling group even when
+    /// a descendant was added or removed. Equal roots still need subtree proof.
+    /// Reference-bearing roots require the candidate scopes used by `group`.
+    fn distinct_roots(&self, studio: &[usize], editor: &[usize]) -> Option<Assignment> {
+        if studio.len() != editor.len()
+            || studio
+                .iter()
+                .any(|&s| !self.studio.references[s].is_empty())
+            || editor
+                .iter()
+                .any(|&e| !self.editor.references[e].is_empty())
+        {
+            return None;
+        }
+        let mut result = Vec::with_capacity(studio.len());
+        let mut claimed = AHashSet::new();
+        for &source in studio {
+            let mut candidates = editor.iter().copied().filter(|&target| {
+                self.allowed(source, target)
+                    && records_match(self.editor, target, self.studio, source)
+            });
+            let target = candidates.next()?;
+            if candidates.next().is_some() || !claimed.insert(target) {
+                return None;
+            }
+            result.push((source, target));
+        }
+        Some(result)
+    }
+
     fn subtree(&self, studio: usize, editor: usize) -> Option<Assignment> {
         if !self.allowed(studio, editor)
             || !self.locked_pair(studio, editor)
@@ -280,6 +311,11 @@ impl Matcher<'_, '_> {
             let members = &self.studio.groups[*group];
             let first = &self.studio.document.instances[members[0]];
             let counterpart = self.editor.counterpart(Some(editor), first)?;
+            // Candidate subtrees remain complete. Unequal sibling groups are
+            // handled at their own boundary, after their parents have paired.
+            if members.len() != self.editor.groups[counterpart].len() {
+                return None;
+            }
             result.extend(self.group(members, &self.editor.groups[counterpart], &Some)?);
         }
         Some(result)
@@ -292,7 +328,7 @@ impl Matcher<'_, '_> {
         prepare: &impl Fn(Assignment) -> Option<Assignment>,
     ) -> Option<Assignment> {
         if studio.len() != editor.len() {
-            return None;
+            return self.subset_group(studio, editor, prepare);
         }
         // Positional complete subtrees are reserved before searching alternatives.
         let mut positional = Vec::new();
@@ -331,6 +367,51 @@ impl Matcher<'_, '_> {
         if (0..editor.len()).any(|e| candidates.iter().all(|row| row[e].is_none())) {
             return None;
         }
+        self.match_candidates(candidates)
+    }
+
+    /// A one-sided addition must not shift every following duplicate's slot.
+    /// Match every member of the smaller group to a complete unchanged subtree;
+    /// unmatched members of the larger group remain independent instances.
+    fn subset_group(
+        &self,
+        studio: &[usize],
+        editor: &[usize],
+        prepare: &impl Fn(Assignment) -> Option<Assignment>,
+    ) -> Option<Assignment> {
+        let larger = studio.len().max(editor.len());
+        if larger > GROUP_LIMIT {
+            return None;
+        }
+        let positional = studio
+            .iter()
+            .zip(editor)
+            .map(|(&s, &e)| self.subtree(s, e).and_then(prepare))
+            .collect::<Option<Vec<_>>>();
+        if let Some(positional) = positional {
+            return Some(positional.into_iter().flatten().collect());
+        }
+        let mut candidates = Vec::new();
+        for a in 0..studio.len().min(editor.len()) {
+            let row = (0..larger)
+                .map(|b| {
+                    let (s, e) = if studio.len() < editor.len() {
+                        (a, b)
+                    } else {
+                        (b, a)
+                    };
+                    self.subtree(studio[s], editor[e]).and_then(prepare)
+                })
+                .collect::<Vec<_>>();
+            if row.iter().all(Option::is_none) {
+                return None;
+            }
+            candidates.push(row);
+        }
+        self.match_candidates(candidates)
+    }
+
+    fn match_candidates(&self, candidates: Vec<Vec<Option<Assignment>>>) -> Option<Assignment> {
         let exact = candidates
             .iter()
             .map(|candidates| {
@@ -362,7 +443,7 @@ impl Matcher<'_, '_> {
                 edges
             })
             .collect::<Vec<_>>();
-        let assignment = perfect_matching(&edges, &exact)?;
+        let assignment = perfect_matching(&edges, &exact, candidates[0].len())?;
         Some(
             assignment
                 .into_iter()
@@ -384,7 +465,11 @@ impl Matcher<'_, '_> {
 
 /// Augmenting paths are necessary: tolerant equality is not an equivalence
 /// relation, so overlapping candidate sets cannot be consumed greedily.
-fn perfect_matching(edges: &[Vec<usize>], exact: &[Vec<usize>]) -> Option<Vec<usize>> {
+fn perfect_matching(
+    edges: &[Vec<usize>],
+    exact: &[Vec<usize>],
+    targets: usize,
+) -> Option<Vec<usize>> {
     fn augment(
         source: usize,
         edges: &[Vec<usize>],
@@ -403,11 +488,11 @@ fn perfect_matching(edges: &[Vec<usize>], exact: &[Vec<usize>]) -> Option<Vec<us
         }
         false
     }
-    let mut owner = vec![None; edges.len()];
+    let mut owner = vec![None; targets];
     let mut exact_order = (0..edges.len()).collect::<Vec<_>>();
     exact_order.sort_by_key(|&source| exact[source].len());
     for source in exact_order {
-        augment(source, exact, &mut vec![false; edges.len()], &mut owner);
+        augment(source, exact, &mut vec![false; targets], &mut owner);
     }
     let reserved = owner.iter().flatten().copied().collect::<AHashSet<_>>();
     // Constrained members (including identity locks) get first choice.
@@ -417,13 +502,15 @@ fn perfect_matching(edges: &[Vec<usize>], exact: &[Vec<usize>]) -> Option<Vec<us
         if reserved.contains(&source) {
             continue;
         }
-        if !augment(source, edges, &mut vec![false; edges.len()], &mut owner) {
+        if !augment(source, edges, &mut vec![false; targets], &mut owner) {
             return None;
         }
     }
     let mut assignment = vec![0; edges.len()];
     for (target, source) in owner.into_iter().enumerate() {
-        assignment[source?] = target;
+        if let Some(source) = source {
+            assignment[source] = target;
+        }
     }
     Some(assignment)
 }
@@ -431,14 +518,29 @@ fn perfect_matching(edges: &[Vec<usize>], exact: &[Vec<usize>]) -> Option<Vec<us
 struct Unit {
     studio: Vec<usize>,
     editor: Vec<usize>,
+    // Include unselected subtrees: refinement can choose any of these sources.
+    sources: Vec<usize>,
     positional: Assignment,
     proposed: Assignment,
+}
+
+fn subtree_sources(tree: &Tree<'_>, roots: &[usize]) -> Vec<usize> {
+    let mut sources = roots.to_vec();
+    let mut next = 0;
+    while next < sources.len() {
+        let source = sources[next];
+        next += 1;
+        for &group in &tree.children[source] {
+            sources.extend(&tree.groups[group]);
+        }
+    }
+    sources
 }
 
 pub(crate) struct Resolved {
     pub(crate) partners: Vec<Option<usize>>,
     pub(crate) locked: Vec<Option<usize>>,
-    pub(crate) repaired: Vec<bool>,
+    pub(crate) proven: Vec<bool>,
     reference_values: Vec<(usize, bool, String, Value)>,
     #[cfg(test)]
     pub(crate) reference_comparisons: usize,
@@ -476,8 +578,12 @@ pub(crate) fn resolve(editor: &SettingsBytecode, studio: &SettingsBytecode) -> R
     };
     // Identity is global: a rename or move does not release its target slot.
     let mut partners = locked.clone();
-    let units = collect_units(&matcher, &mut partners);
-    resolve_references(&matcher, &units, &mut partners);
+    let mut proven = vec![false; partners.len()];
+    let units = collect_units(&matcher, &mut partners, &mut proven);
+    resolve_references(&matcher, &units, &mut partners, &mut proven);
+    // Proof flags are tentative until checked against the complete final map.
+    // Accepted store input must never turn a failed proof into a reconcile panic.
+    validate_resolution(&matcher, &mut partners, &mut proven);
     assert_eq!(
         partners.iter().flatten().collect::<AHashSet<_>>().len(),
         partners.iter().flatten().count(),
@@ -490,21 +596,53 @@ pub(crate) fn resolve(editor: &SettingsBytecode, studio: &SettingsBytecode) -> R
             .all(|(source, target)| target.is_none() || partners[source] == *target),
         "persistent identity must stay locked"
     );
-    let mut repaired = vec![false; partners.len()];
-    for unit in &units {
-        let positional = unit.positional.iter().copied().collect::<AHashMap<_, _>>();
-        for &(source, _) in &unit.proposed {
-            repaired[source] = partners[source] != positional.get(&source).copied();
-        }
-    }
     let reference_values = equivalent_reference_values(&matcher, &partners);
     Resolved {
         partners,
         locked,
-        repaired,
+        proven,
         reference_values,
         #[cfg(test)]
         reference_comparisons: editor.reference_comparisons.get(),
+    }
+}
+
+fn validate_resolution(
+    matcher: &Matcher<'_, '_>,
+    partners: &mut [Option<usize>],
+    proven: &mut [bool],
+) {
+    let injective = partners.iter().flatten().collect::<AHashSet<_>>().len()
+        == partners.iter().flatten().count();
+    let locks_preserved = matcher
+        .locked
+        .iter()
+        .enumerate()
+        .all(|(source, target)| target.is_none() || partners[source] == *target);
+    let proof = partners
+        .iter()
+        .enumerate()
+        .filter_map(|(source, &target)| {
+            target
+                .filter(|_| proven[source])
+                .map(|target| (source, target))
+        })
+        .collect();
+    if injective && locks_preserved && References::new(matcher, partners).validates(&proof) {
+        return;
+    }
+    eprintln!(
+        "[renium] warning: first-pairing assignment failed final identity/reference validation; using locked positional pairing"
+    );
+    partners.copy_from_slice(matcher.locked);
+    proven.fill(false);
+    for &group in &matcher.studio.children[partners.len()] {
+        let sources = &matcher.studio.groups[group];
+        let first = &matcher.studio.document.instances[sources[0]];
+        if let Some(other) = matcher.editor.counterpart(None, first) {
+            let roots = positional_group(matcher, sources, &matcher.editor.groups[other]);
+            apply(&positional_subtrees(matcher, roots), partners);
+        }
     }
 }
 
@@ -565,7 +703,11 @@ fn positional_subtrees(matcher: &Matcher<'_, '_>, roots: Assignment) -> Assignme
     result
 }
 
-fn collect_units(matcher: &Matcher<'_, '_>, partners: &mut [Option<usize>]) -> Vec<Unit> {
+fn collect_units(
+    matcher: &Matcher<'_, '_>,
+    partners: &mut [Option<usize>],
+    proven: &mut [bool],
+) -> Vec<Unit> {
     let mut units = Vec::new();
     let mut pending = vec![(None, None)];
     while let Some((studio_parent, editor_parent)) = pending.pop() {
@@ -577,22 +719,32 @@ fn collect_units(matcher: &Matcher<'_, '_>, partners: &mut [Option<usize>]) -> V
             };
             let targets = &matcher.editor.groups[other];
             let positional = positional_group(matcher, members, targets);
-            if members.len() > 1
-                && members.len() <= GROUP_LIMIT
-                && let Some(proposed) = matcher.group(members, targets, &Some)
+            if members.len().max(targets.len()) > 1
+                && members.len().max(targets.len()) <= GROUP_LIMIT
             {
-                let positional = positional_subtrees(matcher, positional);
-                apply(&proposed, partners);
-                units.push(Unit {
-                    studio: members.clone(),
-                    editor: targets.clone(),
-                    positional,
-                    proposed,
-                });
-            } else {
-                apply(&positional, partners);
-                pending.extend(positional.into_iter().map(|(s, e)| (Some(s), Some(e))));
+                if let Some(proposed) = matcher.group(members, targets, &Some) {
+                    let positional = positional_subtrees(matcher, positional);
+                    apply(&proposed, partners);
+                    units.push(Unit {
+                        studio: members.clone(),
+                        editor: targets.clone(),
+                        sources: subtree_sources(matcher.studio, members),
+                        positional,
+                        proposed,
+                    });
+                    continue;
+                }
+                if let Some(roots) = matcher.distinct_roots(members, targets) {
+                    apply(&roots, partners);
+                    for (source, target) in roots {
+                        proven[source] = true;
+                        pending.push((Some(source), Some(target)));
+                    }
+                    continue;
+                }
             }
+            apply(&positional, partners);
+            pending.extend(positional.into_iter().map(|(s, e)| (Some(s), Some(e))));
         }
     }
     units
@@ -612,7 +764,7 @@ fn publish_unit(
 ) {
     // Positional fallback can have fewer paired descendants (different classes
     // or shapes). Clear the entire tentative subtree before restoring its slots.
-    for &(source, _) in &unit.proposed {
+    for &source in &unit.sources {
         partners[source] = locked[source];
     }
     apply(assignment, partners);
@@ -629,12 +781,22 @@ struct References<'a, 'd> {
 }
 
 struct ReferenceScope<'a> {
-    targets: AHashMap<usize, usize>,
+    // None shadows a displaced source; it must not use a stale outer partner.
+    targets: AHashMap<usize, Option<usize>>,
     parent: Option<&'a ReferenceScope<'a>>,
 }
 
 impl ReferenceScope<'_> {
-    fn target(&self, source: usize) -> Option<usize> {
+    fn replace(&mut self, unit: &Unit, assignment: &Assignment, locked: &[Option<usize>]) {
+        for &source in &unit.sources {
+            self.targets
+                .insert(source, locked.get(source).copied().flatten());
+        }
+        self.targets
+            .extend(assignment.iter().map(|&(s, e)| (s, Some(e))));
+    }
+
+    fn target(&self, source: usize) -> Option<Option<usize>> {
         self.targets
             .get(&source)
             .copied()
@@ -666,7 +828,7 @@ impl<'a, 'd> References<'a, 'd> {
     fn target(&self, source: usize) -> Option<usize> {
         self.scope
             .and_then(|scope| scope.target(source))
-            .or(self.partners[source])
+            .unwrap_or(self.partners[source])
     }
 
     /// Resolve descendants in a candidate-relative scope. In particular a model's
@@ -680,7 +842,7 @@ impl<'a, 'd> References<'a, 'd> {
         }
         let (source, target) = plan[0];
         let mut scope = ReferenceScope {
-            targets: plan.iter().copied().collect(),
+            targets: plan.iter().map(|&(s, e)| (s, Some(e))).collect(),
             parent: self.scope,
         };
         let mut units = Vec::new();
@@ -691,7 +853,7 @@ impl<'a, 'd> References<'a, 'd> {
             let mut pending = members.clone();
             let mut proposed = Vec::new();
             while let Some(source) = pending.pop() {
-                proposed.push((source, scope.targets[&source]));
+                proposed.push((source, scope.targets[&source]?));
                 for &group in &self.matcher.studio.children[source] {
                     pending.extend(&self.matcher.studio.groups[group]);
                 }
@@ -699,6 +861,7 @@ impl<'a, 'd> References<'a, 'd> {
             units.push(Unit {
                 studio: members.clone(),
                 editor: self.matcher.editor.groups[other].clone(),
+                sources: subtree_sources(self.matcher.studio, members),
                 positional: Vec::new(),
                 proposed,
             });
@@ -707,10 +870,12 @@ impl<'a, 'd> References<'a, 'd> {
             let children = self
                 .in_scope(&scope)
                 .resolve_component(&units, &component)?;
-            scope.targets.extend(children);
+            scope
+                .targets
+                .extend(children.into_iter().map(|(s, e)| (s, Some(e))));
         }
         for (source, target) in &mut plan {
-            *target = scope.targets[source];
+            *target = scope.targets[source]?;
         }
         self.validates(&plan).then_some(plan)
     }
@@ -718,21 +883,33 @@ impl<'a, 'd> References<'a, 'd> {
     /// Dependency components publish atomically. Cycles revisit tentative
     /// assignments until they validate or repeat; there is no fixed pass limit.
     fn resolve_component(&self, units: &[Unit], component: &[usize]) -> Option<Assignment> {
-        let mut plan = component
+        let mut assignments = component
             .iter()
-            .flat_map(|&index| units[index].proposed.iter().copied())
-            .collect::<Assignment>();
-        plan.sort_unstable();
-        if self.validates(&plan) {
-            return Some(plan);
-        }
+            .map(|&index| units[index].proposed.clone())
+            .collect::<Vec<_>>();
         let mut scope = ReferenceScope {
-            targets: plan.iter().copied().collect(),
+            targets: AHashMap::new(),
             parent: self.scope,
         };
         let mut seen = AHashSet::new();
-        while seen.insert(plan.clone()) {
-            for &index in component {
+        loop {
+            // Rebuild, never extend the old plan: subset membership can change.
+            let mut plan = assignments
+                .iter()
+                .flatten()
+                .copied()
+                .collect::<Assignment>();
+            plan.sort_unstable();
+            for (&index, assignment) in component.iter().zip(&assignments) {
+                scope.replace(&units[index], assignment, self.matcher.locked);
+            }
+            if self.in_scope(&scope).validates(&plan) {
+                return Some(plan);
+            }
+            if !seen.insert(plan) {
+                return None;
+            }
+            for (&index, assignment) in component.iter().zip(&mut assignments) {
                 let unit = &units[index];
                 let proposed = {
                     let references = self.in_scope(&scope);
@@ -740,17 +917,11 @@ impl<'a, 'd> References<'a, 'd> {
                         .group(&unit.studio, &unit.editor, &|plan| references.refine(plan))
                 };
                 if let Some(proposed) = proposed {
-                    scope.targets.extend(proposed);
+                    *assignment = proposed;
+                    scope.replace(unit, assignment, self.matcher.locked);
                 }
             }
-            for (source, target) in &mut plan {
-                *target = scope.targets[source];
-            }
-            if self.validates(&plan) {
-                return Some(plan);
-            }
         }
-        None
     }
 
     fn value_equal(&self, a: &Value, b: &Value) -> bool {
@@ -811,6 +982,13 @@ impl<'a, 'd> References<'a, 'd> {
     }
 
     fn validates(&self, assignment: &Assignment) -> bool {
+        let mut sources = AHashSet::with_capacity(assignment.len());
+        let mut targets = AHashSet::with_capacity(assignment.len());
+        if !assignment.iter().all(|&(source, target)| {
+            sources.insert(source) && targets.insert(target) && self.matcher.allowed(source, target)
+        }) {
+            return false;
+        }
         if assignment.iter().all(|&(source, target)| {
             self.matcher.studio.references[source].is_empty()
                 && self.matcher.editor.references[target].is_empty()
@@ -818,7 +996,7 @@ impl<'a, 'd> References<'a, 'd> {
             return true;
         }
         let scope = ReferenceScope {
-            targets: assignment.iter().copied().collect(),
+            targets: assignment.iter().map(|&(s, e)| (s, Some(e))).collect(),
             parent: self.scope,
         };
         let references = self.in_scope(&scope);
@@ -860,7 +1038,7 @@ fn reference_fields_equal(
 fn reference_components(matcher: &Matcher<'_, '_>, units: &[Unit]) -> Vec<Vec<usize>> {
     let mut owner = AHashMap::new();
     for (index, unit) in units.iter().enumerate() {
-        for &(source, _) in &unit.proposed {
+        for &source in &unit.sources {
             owner.insert(source, index);
         }
     }
@@ -868,9 +1046,9 @@ fn reference_components(matcher: &Matcher<'_, '_>, units: &[Unit]) -> Vec<Vec<us
     let mut dependencies = vec![Vec::new(); units.len()];
     for (index, unit) in units.iter().enumerate() {
         dependencies[index] = unit
-            .proposed
+            .sources
             .iter()
-            .flat_map(|&(source, _)| &matcher.studio.references[source])
+            .flat_map(|&source| &matcher.studio.references[source])
             .filter_map(|value| matcher.studio.target(value))
             .filter_map(|target| owner.get(&target).copied())
             .filter(|&target| target != index)
@@ -917,19 +1095,36 @@ fn reference_components(matcher: &Matcher<'_, '_>, units: &[Unit]) -> Vec<Vec<us
     components
 }
 
-fn resolve_references(matcher: &Matcher<'_, '_>, units: &[Unit], partners: &mut [Option<usize>]) {
+fn resolve_references(
+    matcher: &Matcher<'_, '_>,
+    units: &[Unit],
+    partners: &mut [Option<usize>],
+    proven: &mut [bool],
+) {
     if units.iter().all(|unit| {
         unit.proposed.iter().all(|&(source, target)| {
             matcher.studio.references[source].is_empty()
                 && matcher.editor.references[target].is_empty()
         })
     }) {
+        for unit in units {
+            for &(source, _) in &unit.proposed {
+                proven[source] = true;
+            }
+        }
         return;
     }
     for component in reference_components(matcher, units) {
         let proposal = References::new(matcher, partners).resolve_component(units, &component);
         if let Some(proposal) = proposal {
+            // Restore abandoned tentative partners before publishing new ones.
+            for &index in &component {
+                publish_unit(&units[index], &Vec::new(), partners, matcher.locked);
+            }
             apply(&proposal, partners);
+            for (source, _) in proposal {
+                proven[source] = true;
+            }
         } else {
             for index in component {
                 let unit = &units[index];
@@ -1022,7 +1217,7 @@ mod tests {
         assert_eq!(editor.reference_comparisons.get(), 1);
 
         let swapped = ReferenceScope {
-            targets: [(1, 2), (2, 1)].into_iter().collect(),
+            targets: [(1, Some(2)), (2, Some(1))].into_iter().collect(),
             parent: None,
         };
         let candidate = references.in_scope(&swapped);
@@ -1037,10 +1232,36 @@ mod tests {
         assert_eq!(editor.reference_comparisons.get(), 3);
 
         let restored = ReferenceScope {
-            targets: [(1, 1), (2, 2)].into_iter().collect(),
+            targets: [(1, Some(1)), (2, Some(2))].into_iter().collect(),
             parent: None,
         };
         assert!(!references.in_scope(&restored).indistinguishable(3, 4));
         assert_eq!(editor.reference_comparisons.get(), 4);
+
+        let displaced = ReferenceScope {
+            targets: [(1, None)].into_iter().collect(),
+            parent: Some(&swapped),
+        };
+        assert_eq!(references.in_scope(&displaced).target(1), None);
+        assert_eq!(references.in_scope(&displaced).target(2), Some(1));
+        assert_eq!(references.in_scope(&displaced).target(0), Some(0));
+
+        // Exercise the last publication fence independently of candidate search.
+        let locked = vec![None, Some(1), None, None, None];
+        let owners = vec![None, Some(1), None, None, None];
+        let matcher = Matcher {
+            locked: &locked,
+            owners: &owners,
+            ..matcher
+        };
+        for mut invalid in [
+            vec![Some(0), Some(1), Some(1), Some(3), Some(4)],
+            vec![Some(0), Some(1), Some(2), Some(4), Some(3)],
+        ] {
+            let mut proven = vec![true; 5];
+            validate_resolution(&matcher, &mut invalid, &mut proven);
+            assert_eq!(invalid, partners);
+            assert!(proven.iter().all(|&value| !value));
+        }
     }
 }

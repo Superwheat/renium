@@ -43,9 +43,9 @@ const SETTINGS_PARALLEL_DECODE_MIN_BYTES: usize = 64 * 1024;
 // confined to rotation; positions and other numbers retain their usual precision.
 const CFRAME_ROTATION_EPSILON: f64 = 16.0 * f32::EPSILON as f64;
 /// A rotation column stored as Float32 and re-orthonormalized by Studio
-/// comes back a few millionths away (a welded seat read -0.999991 against
-/// -0.99998707, 3.9e-6 apart); an edit of 1e-5 in a column still counts.
-const CFRAME_ROTATION_NOISE: f64 = 8e-6;
+/// comes back a few millionths away. Regenerated model pivots have shown
+/// 8.94e-6 drift; an edit of 1e-5 in a column still counts.
+const CFRAME_ROTATION_NOISE: f64 = 9e-6;
 /// Studio recomputes a model's WorldPivot and a welded part's CFrame after a
 /// load; the result lands within about 1e-4 studs of the saved value (a
 /// wheel pivot read 60.933189 against 60.933082). A 1e-3 edit still counts.
@@ -5256,7 +5256,11 @@ mod tests {
     fn cframe_rotation_roundtrip_preserves_position_and_real_edit_detection() {
         let expected = json!({"_type": "CFrame", "components":
             [0, 10, 500, 1, 0, 0, 0, 1, 0, 0, 0, 1]});
-        for drift in [1.1920928955078125e-6, 1.6689300537109375e-6] {
+        for drift in [
+            1.1920928955078125e-6,
+            1.6689300537109375e-6,
+            8.940696716308594e-6,
+        ] {
             let mut observed = expected.clone();
             observed["components"][3] = json!(1.0 + drift);
             observed["components"][11] = json!(1.0 + drift);
@@ -5668,3 +5672,6 @@ mod verify_noise_tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod rotation_tests;
