@@ -721,10 +721,33 @@ pub(crate) fn settings_instances_equal(
         && settings_parent_id(left, left_index) == settings_parent_id(right, right_index)
         && reconciliation_maps_equal(
             &left_instance.class_name,
-            &left_instance.properties,
-            &right_instance.properties,
+            &comparison_properties(left_instance),
+            &comparison_properties(right_instance),
         )
         && reconciliation_values_map_equal(&left_instance.attributes, &right_instance.attributes)
+}
+
+/// The properties the first comparison judges: a collision hull whose
+/// fidelity can be read stands in as that fidelity, because its bytes are
+/// the engine's and differ from one cook to the next while the merge still
+/// keeps whichever bytes Studio has.
+fn comparison_properties(instance: &SettingsBytecodeInstance) -> Map<String, Value> {
+    let hull = crate::rbx::encode::COLLISION_HULL_PROPERTY;
+    match instance
+        .properties
+        .get(hull)
+        .and_then(crate::settings::equivalence::hull_fidelity_code)
+    {
+        Some(code) => {
+            let mut properties = instance.properties.clone();
+            properties.insert(
+                hull.to_string(),
+                json!({"_type": "CollisionHullFidelity", "code": code}),
+            );
+            properties
+        }
+        None => instance.properties.clone(),
+    }
 }
 
 /// What differs between the two records of one instance, in the form the
@@ -763,18 +786,25 @@ pub(crate) fn describe_instance_differences(
             files_parent.unwrap_or("none")
         ));
     }
-    let mut names = live
-        .properties
+    let (live_properties, files_properties) =
+        (comparison_properties(live), comparison_properties(files));
+    let mut names = live_properties
         .keys()
-        .chain(files.properties.keys())
+        .chain(files_properties.keys())
         .collect::<Vec<_>>();
     names.sort();
     names.dedup();
     for name in names {
-        let (left, right) = (live.properties.get(name), files.properties.get(name));
-        if let (Some(left), Some(right)) = (left, right)
-            && crate::settings::equivalence::reconciliation_values_equal(left, right, false)
-        {
+        let (left, right) = (live_properties.get(name), files_properties.get(name));
+        // The same rules the comparison applies: a member at its default on one
+        // side, a tag order, an asset spelling or a hull at the same fidelity
+        // is not a difference and must not be listed as one.
+        if crate::settings::equivalence::reconciliation_property_values_equal(
+            &live.class_name,
+            name,
+            left,
+            right,
+        ) {
             continue;
         }
         if !crate::settings::equivalence::reconciliation_property_compares(

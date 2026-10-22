@@ -1950,6 +1950,60 @@ fn first_pairing_unions_separate_files_and_blocks_same_file_conflicts() {
             .any(|conflict| conflict.contains("ambiguous duplicate"))
     );
 
+    // A hull compares by the fidelity it encodes in the first comparison;
+    // the merge itself keeps whichever bytes Studio has.
+    let hull = |bytes: &[u8]| json!({"_type": "SharedString", "base64": base64::encode(bytes)});
+    let meshed = |id: &str, hull_value: Value| SettingsBytecodeInstance {
+        settings_id: id.to_string(),
+        name: "Mesh".to_string(),
+        class_name: "MeshPart".to_string(),
+        parent_index: Some(0),
+        properties: Map::from_iter([("PhysicalConfigData".to_string(), hull_value)]),
+        attributes: Map::new(),
+    };
+    let same_fidelity = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: vec![
+            service_root("root"),
+            meshed("files", hull(b"CSGPHS\x08\0\0\0\x01\0first cook")),
+            meshed("files", hull(b"CSGPHS\x08\0\0\0\x01\0second cook")),
+            meshed("files", hull(b"CSGPHS\x08\0\0\0\x02\0box")),
+            meshed("files", hull(b"CSGPHS\0\0\0\0BLOCK")),
+            meshed("files", hull(b"opaque legacy hull a")),
+            meshed("files", hull(b"opaque legacy hull b")),
+        ],
+    };
+    assert!(settings_instances_equal(
+        &same_fidelity,
+        1,
+        &same_fidelity,
+        2
+    ));
+    assert!(!settings_instances_equal(
+        &same_fidelity,
+        1,
+        &same_fidelity,
+        3
+    ));
+    assert!(settings_instances_equal(
+        &same_fidelity,
+        3,
+        &same_fidelity,
+        4
+    ));
+    assert!(!settings_instances_equal(
+        &same_fidelity,
+        5,
+        &same_fidelity,
+        6
+    ));
+    assert!(settings_instances_equal(
+        &same_fidelity,
+        5,
+        &same_fidelity,
+        5
+    ));
+
     let editor = settings_snapshot(SettingsBytecode {
         version: SETTINGS_BINARY_VERSION,
         instances: vec![service_root("editor-root"), child("editor-child", "Same")],

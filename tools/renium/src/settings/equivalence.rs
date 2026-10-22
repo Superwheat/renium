@@ -46,6 +46,10 @@ const CFRAME_ROTATION_EPSILON: f64 = 16.0 * f32::EPSILON as f64;
 /// comes back a few millionths away (a welded seat read -0.999991 against
 /// -0.99998707, 3.9e-6 apart); an edit of 1e-5 in a column still counts.
 const CFRAME_ROTATION_NOISE: f64 = 8e-6;
+/// Studio recomputes a model's WorldPivot and a welded part's CFrame after a
+/// load; the result lands within about 1e-4 studs of the saved value (a
+/// wheel pivot read 60.933189 against 60.933082). A 1e-3 edit still counts.
+const CFRAME_POSITION_NOISE: f64 = 2e-4;
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 struct SettingsAlignmentCacheKey {
@@ -904,8 +908,12 @@ impl IdentityCandidateIndex {
         // A conservative superset of the existing f32 comparison, including its relative
         // tolerance and rounding at either boundary. identity_score remains authoritative.
         let epsilon = 4.0 * f64::from(f32::EPSILON);
-        let radius = ((epsilon + 4.0 * f64::EPSILON) / (1.0 - epsilon) * value.abs().max(1.0))
-            .max(CFRAME_ROTATION_EPSILON.max(CFRAME_ROTATION_NOISE) + 4.0 * f64::EPSILON);
+        let radius = ((epsilon + 4.0 * f64::EPSILON) / (1.0 - epsilon) * value.abs().max(1.0)).max(
+            CFRAME_ROTATION_EPSILON
+                .max(CFRAME_ROTATION_NOISE)
+                .max(CFRAME_POSITION_NOISE)
+                + 4.0 * f64::EPSILON,
+        );
         let start = self
             .values
             .partition_point(|(candidate, _)| *candidate < value - radius);
@@ -2267,7 +2275,7 @@ pub(crate) fn reconciliation_maps_equal(
     reconciliation_maps_equal_with_ids(class_name, left, right, &AHashMap::new(), &AHashMap::new())
 }
 
-fn reconciliation_maps_equal_with_ids(
+pub(crate) fn reconciliation_maps_equal_with_ids(
     class_name: &str,
     left: &Map<String, Value>,
     right: &Map<String, Value>,
@@ -2311,6 +2319,22 @@ fn reconciliation_maps_equal_with_ids(
             || left.contains_key(name)
             || reconciliation_property_value_is_default(class_name, name, value)
     })
+}
+
+/// What a part's collision hull says about its authored fidelity: byte 10 of a
+/// version-8 `CSGPHS` blob, or Box for the old BLOCK placeholder. The hull
+/// bytes themselves are the engine's and differ run to run, so the first
+/// comparison judges hulls by this code; merges and pulls keep the bytes.
+pub(crate) fn hull_fidelity_code(value: &Value) -> Option<u8> {
+    let bytes = base64::decode(value.get("base64")?.as_str()?).ok()?;
+    if !bytes.starts_with(b"CSGPHS") || bytes.len() < 10 {
+        return None;
+    }
+    let version = u32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]);
+    if version == 0 && bytes.ends_with(b"BLOCK") {
+        return Some(2);
+    }
+    (version >= 8 && bytes.len() >= 12).then(|| bytes[10])
 }
 
 /// Tags are a set: Studio and the store may list them in any order.
@@ -2389,7 +2413,7 @@ pub(crate) fn is_engine_managed_attribute(name: &str) -> bool {
     name.starts_with("RBX_")
 }
 
-fn reconciliation_values_map_equal_with_ids(
+pub(crate) fn reconciliation_values_map_equal_with_ids(
     left: &Map<String, Value>,
     right: &Map<String, Value>,
     left_ids: &AHashMap<&str, usize>,
@@ -2637,6 +2661,7 @@ fn reconciliation_values_equal_with_ids(
                                         && b.is_finite()
                                         && if index < 3 {
                                             reconciliation_values_equal(left, right, true)
+                                                || (a - b).abs() <= CFRAME_POSITION_NOISE
                                         } else {
                                             (a - b).abs()
                                                 <= CFRAME_ROTATION_EPSILON
@@ -2882,7 +2907,10 @@ pub(crate) fn reconciliation_property_is_unknown_when_absent(
     class_name: &str,
     name: &str,
 ) -> bool {
-    matches!(name, "CollisionFidelity" | "ClockTime" | "MeshSize")
+    matches!(
+        name,
+        "CollisionFidelity" | "ClockTime" | "MeshSize" | "PhysicalConfigData"
+    )
         // A native capture of Studio 744 carries no InputSink although the
         // saved place does, and reports ResetOnSpawn false for a gui that
         // lives in the world while the saved place carries nothing; neither
@@ -5239,7 +5267,7 @@ mod tests {
                 Some(&observed),
             ));
             assert!(reconciliation_values_equal(&observed, &expected, false));
-            observed["components"][0] = json!(drift);
+            observed["components"][0] = json!(0.001);
             assert!(!reconciliation_values_equal(&expected, &observed, false));
             assert!(!reconciliation_values_equal(
                 &json!(1.0),
@@ -5567,6 +5595,19 @@ mod verify_noise_tests {
         assert!(reconciliation_values_equal(&saved, &settled, false));
         let moved = json!({"_type":"CFrame","components":[943.99, 25.768948, -289.9822, -0.999991, 0.0, 0.0050982987, 0.0, 1.0, 0.0, -0.0050982987, 0.0, -0.999991]});
         assert!(!reconciliation_values_equal(&saved, &moved, false));
+        let pivot_saved = json!({"_type":"CFrame","components":[899.7149658203125, 60.933189, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]});
+        let pivot_live = json!({"_type":"CFrame","components":[899.7149047851562, 60.933082, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]});
+        assert!(reconciliation_values_equal(
+            &pivot_saved,
+            &pivot_live,
+            false
+        ));
+        let pivot_moved = json!({"_type":"CFrame","components":[899.7149658203125, 60.9342, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]});
+        assert!(!reconciliation_values_equal(
+            &pivot_saved,
+            &pivot_moved,
+            false
+        ));
         let turned = json!({"_type":"CFrame","components":[943.9832, 25.768948, -289.9822, -0.9995, 0.0, 0.03, 0.0, 1.0, 0.0, -0.03, 0.0, -0.9995]});
         assert!(!reconciliation_values_equal(&saved, &turned, false));
     }
