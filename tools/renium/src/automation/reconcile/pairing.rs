@@ -1,5 +1,7 @@
 use super::*;
 
+pub(super) mod twins;
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct StructuralPart {
     pub(crate) name: String,
@@ -146,6 +148,112 @@ pub(crate) fn pairing_path_ids(
             ordinal,
         }
     })
+}
+
+/// Re-key parents before descendants for both structural and class-check paths.
+/// Matched instances use the editor's actual key, including identity-locked twins.
+fn resolved_path_ids<P: Clone + Eq + std::hash::Hash>(
+    document: &SettingsBytecode,
+    original: &[PathId],
+    editor: &[PathId],
+    partners: &[Option<usize>],
+    interner: &mut PathInterner<P>,
+    set_ordinal: impl Fn(&mut P, usize),
+) -> Vec<PathId> {
+    let mut keys = vec![None; original.len()];
+    // Reserve every published partner before assigning any unmatched sibling.
+    let mut occupied = partners
+        .iter()
+        .flatten()
+        .map(|&target| editor[target])
+        .collect::<HashSet<_>>();
+    let mut chain = Vec::new();
+    for start in 0..keys.len() {
+        let mut current = Some(start);
+        while let Some(index) = current {
+            if keys[index].is_some() {
+                break;
+            }
+            chain.push(index);
+            current = document.instances[index].parent_index;
+        }
+        while let Some(index) = chain.pop() {
+            let key = partners[index]
+                .map(|target| editor[target])
+                .unwrap_or_else(|| {
+                    let parent = document.instances[index]
+                        .parent_index
+                        .and_then(|parent| keys[parent]);
+                    let mut part = interner.node(original[index]).part.clone();
+                    let mut key = interner.intern(parent, part.clone());
+                    if occupied.contains(&key) {
+                        // All ordinary ordinals are bounded by document size.
+                        set_ordinal(&mut part, original.len() + editor.len() + index + 1);
+                        key = interner.intern(parent, part);
+                    }
+                    assert!(occupied.insert(key), "unmatched pairing key collision");
+                    key
+                });
+            keys[index] = Some(key);
+        }
+    }
+    let keys = keys.into_iter().map(Option::unwrap).collect::<Vec<_>>();
+    assert_unique_path_ids(&keys);
+    keys
+}
+
+fn assert_unique_path_ids(keys: &[PathId]) {
+    assert_eq!(
+        keys.iter().collect::<HashSet<_>>().len(),
+        keys.len(),
+        "first-pairing paths must be unique before indexing"
+    );
+}
+
+fn first_pairing_id_remap(
+    editor: &SettingsBytecode,
+    studio: &SettingsBytecode,
+    partners: &[Option<usize>],
+) -> HashMap<String, String> {
+    let mut remap = partners
+        .iter()
+        .enumerate()
+        .filter_map(|(source, target)| {
+            target.map(|target| {
+                (
+                    studio.instances[source].settings_id.clone(),
+                    editor.instances[target].settings_id.clone(),
+                )
+            })
+        })
+        .collect::<HashMap<_, _>>();
+    let editor_ids = editor
+        .instances
+        .iter()
+        .map(|instance| instance.settings_id.as_str())
+        .collect::<HashSet<_>>();
+    let mut all_ids = editor_ids
+        .iter()
+        .copied()
+        .chain(
+            studio
+                .instances
+                .iter()
+                .map(|instance| instance.settings_id.as_str()),
+        )
+        .map(str::to_owned)
+        .collect::<HashSet<_>>();
+    let mut seed = all_ids.len();
+    for (source, target) in partners.iter().enumerate() {
+        let id = &studio.instances[source].settings_id;
+        if target.is_none() && editor_ids.contains(id.as_str()) {
+            remap.insert(
+                id.clone(),
+                crate::bytecode::edit::next_editor_settings_id_fast(&mut all_ids, &mut seed),
+            );
+        }
+    }
+    remap
 }
 
 pub(crate) fn align_observation_ids_to_baseline(
@@ -443,37 +551,29 @@ pub(crate) fn align_first_pairing(
     align_settings_ids_to_reference(editor, studio);
     let mut structural_interner = PathInterner::new();
     let editor_keys = structural_path_ids(editor, &mut structural_interner);
-    let mut studio_keys = structural_path_ids(studio, &mut structural_interner);
-    // Sibling order is not identity. A proven engine identity can match a
-    // reordered duplicate even when its authored values have changed.
-    let editor_persistent = persistent_identity_index(editor);
-    let studio_persistent = persistent_identity_index(studio);
-    let mut identity_keys = studio_keys.clone();
-    for (index, instance) in studio.instances.iter().enumerate() {
-        let Some(id) = persistent_identity(instance) else {
-            continue;
-        };
-        if studio_persistent.get(id) != Some(&Some(index)) {
-            continue;
-        }
-        let Some(editor_index) = editor_persistent.get(id).copied().flatten() else {
-            continue;
-        };
-        let desired = structural_interner.node(editor_keys[editor_index]);
-        let observed = structural_interner.node(studio_keys[index]);
-        if desired.parent == observed.parent
-            && desired.part.name == observed.part.name
-            && desired.part.class_name == observed.part.class_name
-        {
-            identity_keys[index] = editor_keys[editor_index];
-        }
-    }
-    if identity_keys.iter().copied().collect::<HashSet<_>>().len() == identity_keys.len() {
-        studio_keys = identity_keys;
-    }
+    let original_studio_keys = structural_path_ids(studio, &mut structural_interner);
+    let resolved = twins::resolve(editor, studio);
+    let studio_keys = resolved_path_ids(
+        studio,
+        &original_studio_keys,
+        &editor_keys,
+        &resolved.partners,
+        &mut structural_interner,
+        |part, ordinal| part.ordinal = ordinal,
+    );
     let mut pairing_interner = PathInterner::new();
     let editor_pairing_keys = pairing_path_ids(editor, &mut pairing_interner);
-    let studio_pairing_keys = pairing_path_ids(studio, &mut pairing_interner);
+    let original_pairing_keys = pairing_path_ids(studio, &mut pairing_interner);
+    let studio_pairing_keys = resolved_path_ids(
+        studio,
+        &original_pairing_keys,
+        &editor_pairing_keys,
+        &resolved.partners,
+        &mut pairing_interner,
+        |part, ordinal| part.ordinal = ordinal,
+    );
+    assert_unique_path_ids(&editor_keys);
+    assert_unique_path_ids(&editor_pairing_keys);
     let editor_by_key = editor_keys
         .iter()
         .cloned()
@@ -491,8 +591,9 @@ pub(crate) fn align_first_pairing(
         .filter_map(|(key, editor_index)| {
             studio_by_key.get(key).and_then(|studio_index| {
                 (editor.instances[*editor_index].settings_id
-                    == studio.instances[*studio_index].settings_id)
-                    .then_some(*key)
+                    == studio.instances[*studio_index].settings_id
+                    || resolved.locked[*studio_index] == Some(*editor_index))
+                .then_some(*key)
             })
         })
         .collect::<HashSet<_>>();
@@ -520,10 +621,21 @@ pub(crate) fn align_first_pairing(
         .zip(&editor_keys)
         .map(|(instance, key)| (instance.settings_id.clone(), key))
         .collect::<HashMap<_, _>>();
-    for (instance, key) in studio.instances.iter().zip(&studio_keys) {
-        if editor_key_by_id
-            .get(&instance.settings_id)
-            .is_some_and(|editor_key| *editor_key != key)
+    for (index, (instance, key)) in studio.instances.iter().zip(&studio_keys).enumerate() {
+        let moved_identity = resolved.locked[index].is_some_and(|target| {
+            let expected = &editor.instances[target];
+            instance.name != expected.name
+                || match (instance.parent_index, expected.parent_index) {
+                    (Some(source), Some(target)) => resolved.partners[source] != Some(target),
+                    (None, None) => false,
+                    _ => true,
+                }
+        });
+        if moved_identity
+            || !resolved.repaired[index]
+                && editor_key_by_id
+                    .get(&instance.settings_id)
+                    .is_some_and(|editor_key| *editor_key != key)
         {
             conflicts.push(format!(
                 "{} has the same instance identity at different paths",
@@ -532,17 +644,7 @@ pub(crate) fn align_first_pairing(
         }
     }
 
-    let id_remap = editor_by_key
-        .iter()
-        .filter_map(|(key, editor_index)| {
-            studio_by_key.get(key).map(|studio_index| {
-                (
-                    studio.instances[*studio_index].settings_id.clone(),
-                    editor.instances[*editor_index].settings_id.clone(),
-                )
-            })
-        })
-        .collect::<HashMap<_, _>>();
+    let id_remap = first_pairing_id_remap(editor, studio, &resolved.partners);
     for instance in &mut studio.instances {
         if let Some(id) = id_remap.get(&instance.settings_id) {
             instance.settings_id.clone_from(id);
@@ -550,6 +652,7 @@ pub(crate) fn align_first_pairing(
         remap_record_reference_ids(&mut instance.properties, &id_remap);
         remap_record_reference_ids(&mut instance.attributes, &id_remap);
     }
+    resolved.align_references(studio);
     crate::settings::equivalence::inherit_workspace_viewport_reference(editor, studio);
     align_reconciliation_protected_workspace_cameras(editor, studio);
     align_equivalent_values(editor, studio);
@@ -731,7 +834,9 @@ pub(crate) fn settings_instances_equal(
 /// fidelity can be read stands in as that fidelity, because its bytes are
 /// the engine's and differ from one cook to the next while the merge still
 /// keeps whichever bytes Studio has.
-fn comparison_properties(instance: &SettingsBytecodeInstance) -> Map<String, Value> {
+fn comparison_properties(
+    instance: &SettingsBytecodeInstance,
+) -> std::borrow::Cow<'_, Map<String, Value>> {
     let hull = crate::rbx::encode::COLLISION_HULL_PROPERTY;
     match instance
         .properties
@@ -744,9 +849,9 @@ fn comparison_properties(instance: &SettingsBytecodeInstance) -> Map<String, Val
                 hull.to_string(),
                 json!({"_type": "CollisionHullFidelity", "code": code}),
             );
-            properties
+            std::borrow::Cow::Owned(properties)
         }
-        None => instance.properties.clone(),
+        None => std::borrow::Cow::Borrowed(&instance.properties),
     }
 }
 
