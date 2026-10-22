@@ -396,7 +396,10 @@ function BridgePluginRuntime.start(context)
 		runtimeId = Config.bridgeRuntimeId,
 		bridgeRole = Config.bridgeRole,
 		assertSessionOwnership = function(sessionGeneration)
-			if not sessionLock.validate(sessionGeneration or activeExclusiveSessionGeneration) then
+			-- Outside an exclusive request no generation is bound; the dispatcher
+			-- already validated the request, so only the lock itself is checked.
+			local expected = sessionGeneration or activeExclusiveSessionGeneration or sessionLock.capture()
+			if not sessionLock.validate(expected) then
 				error("Renium session ownership was lost")
 			end
 		end,
@@ -972,8 +975,13 @@ function BridgePluginRuntime.start(context)
 			return Config.captureEditorBinaryRootProperties(serviceName)
 		end,
 		assertSessionOwnership = function(generation)
-			if not sessionLock.validate(activeExclusiveSessionGeneration)
-				or generation ~= nil and generation ~= activeExclusiveSessionGeneration then
+			-- A plain source read runs outside the exclusive queue with no bound
+			-- generation; it only needs the plugin to still own the session lock.
+			local bound = activeExclusiveSessionGeneration
+			if generation ~= nil and bound ~= nil and generation ~= bound then
+				error("Renium session ownership was lost")
+			end
+			if not sessionLock.validate(generation or bound or sessionLock.capture()) then
 				error("Renium session ownership was lost")
 			end
 		end,
