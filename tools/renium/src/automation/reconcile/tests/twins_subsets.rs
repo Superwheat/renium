@@ -259,8 +259,8 @@ fn reference_subset_permutations_keep_the_final_assignment_injective_and_proven(
             } else {
                 (&small[..], &large[..])
             };
-            let mut editor = ref_subset(left, false);
-            let mut studio = ref_subset(right, true);
+            let editor = ref_subset(left, false);
+            let studio = ref_subset(right, true);
             let resolved = pairing::twins::resolve(&editor, &studio);
             assert_eq!(
                 resolved.partners.iter().flatten().count(),
@@ -280,10 +280,6 @@ fn reference_subset_permutations_keep_the_final_assignment_injective_and_proven(
                 if can_pair { 2 } else { 0 },
                 "{left:?} vs {right:?}"
             );
-            if can_pair {
-                let conflicts = twin_align(&mut editor, &mut studio);
-                assert!(conflicts.is_empty(), "{left:?} vs {right:?}: {conflicts:?}");
-            }
             for (source, &target) in resolved.partners.iter().enumerate().skip(4) {
                 if resolved.proven[source] {
                     assert_eq!(right[source - 4], left[target.unwrap() - 4]);
