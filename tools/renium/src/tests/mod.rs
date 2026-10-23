@@ -539,6 +539,37 @@ fn get_property_returns_the_nil_default_for_an_unset_reference() {
 }
 
 #[test]
+fn get_property_reads_a_migrated_property_by_its_legacy_name() {
+    let dir = temp_dir("get-migrated-property");
+    let service_dir = dir.join("src").join("StarterGui");
+    fs::create_dir_all(&service_dir).unwrap();
+    let settings_file = service_settings_path(&service_dir);
+    let mut button = settings_instance("editor:1", "Vote", "ImageButton", Some(0));
+    button.properties.insert(
+        "ImageContent".to_string(),
+        serde_json::json!("rbxassetid://129956776090795"),
+    );
+    settings_document(vec![
+        settings_instance("root", "StarterGui", "StarterGui", None),
+        button,
+    ])
+    .write_file(&settings_file)
+    .unwrap();
+    let args = BytecodeGetPropertyArgs::try_parse_from([
+        "bytecode-get-property",
+        settings_file.to_str().unwrap(),
+        "-i",
+        "editor:1",
+        "-p",
+        "Image",
+    ])
+    .unwrap();
+    let output = crate::app::output::capture_json_output(|| bytecode_get_property(args)).unwrap();
+    assert_eq!(output, serde_json::json!("rbxassetid://129956776090795"));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn set_property_qualifies_a_unique_cross_service_reference() {
     let dir = temp_dir("set-cross-service-reference");
     let src = dir.join("src");

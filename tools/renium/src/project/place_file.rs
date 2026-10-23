@@ -191,6 +191,26 @@ fn saved_property<'a>(
         })
 }
 
+fn migrated_property<'a>(
+    instance: &'a RbxInstance,
+    class_name: &str,
+    logical: &str,
+    database: &'a ReflectionDatabase<'a>,
+) -> Option<(&'a str, &'a RbxVariant)> {
+    let PropertyKind::Canonical {
+        serialization: PropertySerialization::Migrate(migration),
+    } = &rbx_property_descriptor(database, class_name, logical)?.kind
+    else {
+        return None;
+    };
+    migration.new_property_names().iter().find_map(|name| {
+        instance
+            .properties
+            .get(&Ustr::from(name))
+            .map(|value| (*name, value))
+    })
+}
+
 /// A serialized property missing from the file loads as the class default
 /// (`defaulted`, e.g. a place saved before the property existed). Properties
 /// Roblox derives from others instead of saving (Position, BrickColor) are
@@ -245,6 +265,18 @@ fn insert_property_values(
                     unknown.push(*requested);
                     continue;
                 };
+                // Studio saves a migrated property under its successor's name
+                // (ImageButton.Image as ImageContent); the value answers for
+                // the name that was asked.
+                if let Some((name, value)) =
+                    migrated_property(instance, class_name, logical, database)
+                {
+                    values.insert(
+                        logical.to_string(),
+                        property_value(dom, class_name, name, value, database),
+                    );
+                    continue;
+                }
                 let serialized = !matches!(
                     rbx_property_descriptor(database, class_name, logical)
                         .map(|property| &property.kind),
@@ -715,6 +747,16 @@ mod tests {
                 .with_name("Door")
                 .with_property("Anchored", true),
         );
+        let gui = dom.insert(dom.root_ref(), InstanceBuilder::new("StarterGui"));
+        dom.insert(
+            gui,
+            InstanceBuilder::new("ImageButton")
+                .with_name("Vote")
+                .with_property(
+                    "ImageContent",
+                    rbx_dom_weak::types::Content::from_uri("rbxassetid://129956776090795"),
+                ),
+        );
         for extension in ["rbxl", "rbxlx"] {
             let file = root.join(format!("place.{extension}"));
             RbxPlaceFormat::from_path(&file)
@@ -760,6 +802,14 @@ mod tests {
             assert_eq!(door["matches"][0]["props"], json!({"Anchored": true}));
             assert_eq!(door["matches"][0]["notSaved"], json!(["Position"]));
             assert_eq!(door["matches"][0]["unknown"], json!(["StreamingEnabled"]));
+            // A legacy name answers with the successor the file saved.
+            let vote = query(&["-n", "Vote", "--props", "Image"]).unwrap();
+            assert_eq!(
+                vote["matches"][0]["props"],
+                json!({"Image": "rbxassetid://129956776090795"}),
+                "{extension}: {vote}"
+            );
+            assert!(vote["matches"][0].get("notSaved").is_none());
             let all = query(&["-n", "Door", "--props", "all"]).unwrap();
             assert_eq!(all["matches"][0]["props"]["Anchored"], true);
             let plain = query(&["-n", "Door"]).unwrap();

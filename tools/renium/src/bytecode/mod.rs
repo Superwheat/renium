@@ -391,11 +391,22 @@ fn canonical_stored_property_name(
         return Ok(Some(existing.clone()));
     }
     let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
-    Ok(
-        rbx_logical_property_name(database, &instance.class_name, property)
-            .map(str::to_string)
-            .filter(|name| name != property),
-    )
+    let logical = rbx_logical_property_name(database, &instance.class_name, property);
+    // Studio stores a migrated property under its successor's name (an
+    // ImageButton's Image as ImageContent); a request by the old name reads it.
+    if let Some(descriptor) =
+        rbx_property_descriptor(database, &instance.class_name, logical.unwrap_or(property))
+        && let rbx_reflection::PropertyKind::Canonical {
+            serialization: rbx_reflection::PropertySerialization::Migrate(migration),
+        } = &descriptor.kind
+        && let Some(saved) = migration
+            .new_property_names()
+            .iter()
+            .find(|name| instance.properties.contains_key(**name))
+    {
+        return Ok(Some((*saved).to_string()));
+    }
+    Ok(logical.map(str::to_string).filter(|name| name != property))
 }
 
 struct HighLevelBytecodeContext {
