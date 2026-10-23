@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.5.1 - 2026-10-23
+
+### Improvements
+
+- When Studio cannot place a pushed instance, the error now names the candidates Studio compared and which values differed, or why the instance at the previous path could not be used (missing, claimed by another entry, or of another class), and the daemon log lists the entries at that path with their previous locations and identities.
+- When a pull or link apply refuses to replace a linked copy because another store still references an instance inside it, the error now names the link, the instance's path and the referring instances instead of a bare store ID.
 
 ### Bug fixes
 
@@ -12,10 +17,8 @@
 - Two collision hulls that encode the same fidelity for the same mesh compare as equal in every comparison, and the box placeholder Studio saves before a mesh has cooked matches the hull the engine later cooks from it, so a push that makes the engine cook hulls (a native import of a service) is no longer reported as not retained on an untouched MeshPart, and a pull keeps the files' hull bytes while the mesh and fidelity agree; a hull is never carried across a mesh change.
 - Live Sync no longer reports a PackageLink as removed when neither Studio nor the files hold it any more, which blocked a place that shared a copy whose link the consumer had dropped on purpose.
 - A pull or link apply no longer refuses to replace a linked copy because of a reference that resolves inside the referring store itself; observation identities repeat across stores, and the check read them as references to the copy. A reference that names another service explicitly still counts as reaching into it.
-- When Studio cannot place a pushed instance, the error now names the candidates Studio compared and which values differed, or why the instance at the previous path could not be used (missing, claimed by another entry, or of another class), and the daemon log lists the entries at that path with their previous locations and identities.
 - A pull's read-only link restore no longer writes empty `.luau` files over a consumer's shared scripts: a store record that carries no Source takes the package's text for that script, or keeps the file that is there (a pull keeps script sources aside, which emptied up to 489 files per place and shipped empty scripts in builds made right after a pull).
 - Live Sync no longer reports a copy's deprecated `CollisionGroupId` (the engine's per-place index of the collision group name, `-1` vs `3` on a shared-link copy) as a difference; the `CollisionGroup` name still compares.
-- When a pull or link apply refuses to replace a linked copy because another store still references an instance inside it, the error now names the link, the instance's path and the referring instances instead of a bare store ID.
 - Live Sync preserves completed commit/rollback results across retries and releases inactive failed transactions after bounded retries or Studio ownership changes. Recovery has at most eight scheduled opportunities under valid ownership; unresolved data is session-only, with cleanup scheduled 30 minutes after retirement once current work permits. Native preparations delayed 120 seconds are safely refused; authorized writes with unknown outcomes stay blocked until verified completion or Studio restart, which can lose retained data.
 - Live Sync keeps its baseline when the project or experience configuration changes (a shared link applied with `lkp --share` or `lk --experience`, a place alias added). The next comparison is still a full one, but the files that change wrote are edits against the baseline instead of conflicts between both sides, so a consumer no longer holds on every transform of a freshly applied copy.
 - Live Sync's first comparison no longer holds on Workspace's `InsertPoint`, transient editor state that Studio moves with the camera and never saves.
