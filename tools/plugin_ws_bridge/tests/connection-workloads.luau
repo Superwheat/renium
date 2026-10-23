@@ -249,7 +249,7 @@ assert(Status.view(state).mode == "connecting")
 state.channels[1].ready = true
 local status = Status.view(state)
 assert(status.mode == "connected" and status.subtitle == "42 Studio edits are waiting to sync.")
-assert(status.syncText == "Last synced at 12:00")
+assert(status.syncText == "Syncing, last synced at 12:00")
 state.pendingEditCount = 0
 assert(Status.view(state).syncText == "Synced at 12:00")
 state.editorSyncStats.liveSync = { running = true, resolutionRequired = true, error = "Conflicting Size" }

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Improvements
+
+- The Studio panel's sync line reads "Syncing, last synced at ..." while Studio edits wait for the daemon, instead of "Last synced at ...", which read like a different state from the "Synced at ..." it turns into a moment later.
+
 ## 0.5.1 - 2026-10-23
 
 ### Improvements
