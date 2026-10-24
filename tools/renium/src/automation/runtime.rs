@@ -947,6 +947,8 @@ fn open_studio(
         return workflows::launch_studio(None, Some(Path::new(&context.project)));
     };
     #[cfg(any(windows, target_os = "macos"))]
+    state.remember_studio_target(context, target.clone());
+    #[cfg(any(windows, target_os = "macos"))]
     if let Some(studio) = connected.iter().find(|studio| studio.target == target) {
         return Ok(json!({
             "ok": true,

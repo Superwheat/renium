@@ -17,7 +17,7 @@ Open Studio only with `rbx so FILE` or `rbx ro`. Renium starts it behind your wi
 
 `ro` confirms launch, not bridge readiness. Run the needed Studio command next; it waits for the connection. `status -w SECONDS` waits while Studio is still starting and otherwise reports at once.
 
-`--place DTE` matches the Studio window name, not `game.Name` (often `Place1`). Use a place ID or configured alias if the window title is unavailable. Duplicate window names require an unambiguous target.
+`--place DTE` matches the Studio window name, not `game.Name` (often `Place1`). Use a place ID or configured alias if the window title is unavailable. Duplicate window names require an unambiguous target. A project opened with `rbx so FILE` keeps selecting that Studio while others are open.
 
 Renium dismisses Auto-Recovery with **Ignore** (preserving recovery files) and Lighting Technology Migration with **Continue**. On macOS, it also dismisses the known `BulkPluginAssetDetailsFetcher::sendRequest()` HTTP 500 startup alert with **OK**. Other dialogs still require their normal decision. On macOS, this and window-name targeting require Accessibility permission for the app launching Renium (for SSH, `sshd-keygen-wrapper`/Remote Login).
 

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -241,9 +241,19 @@ pub struct BoundContext {
 }
 
 fn studio_target_path(context: &BoundContext) -> PathBuf {
-    PathBuf::from(&context.root)
-        .join(".renium")
-        .join("studio-target.json")
+    studio_target_path_for_root(Path::new(&context.root))
+}
+
+fn studio_target_path_for_root(root: &Path) -> PathBuf {
+    root.join(".renium").join("studio-target.json")
+}
+
+/// The place `rbx so` opened or `rbx sx` closed for this project, as written
+/// beside the project files; a project without a cloud place id selects its
+/// Studio by it when several are open.
+pub(crate) fn studio_target_for_root(root: &Path) -> Option<StudioReopenTarget> {
+    let bytes = std::fs::read(studio_target_path_for_root(root)).ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 pub(crate) fn published_selector(selector: &str) -> Option<(i64, i64)> {
@@ -417,8 +427,7 @@ impl State {
         {
             return Some(target);
         }
-        let bytes = std::fs::read(studio_target_path(context)).ok()?;
-        serde_json::from_slice(&bytes).ok()
+        studio_target_for_root(Path::new(&context.root))
     }
 
     pub fn recent_studio_launch(

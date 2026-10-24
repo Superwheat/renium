@@ -599,6 +599,24 @@ pub(super) fn bind(
     {
         candidates.retain(|entry| client_matches_saved_target(bridge, entry, target));
     }
+    // A project opened with `rbx so FILE` and never paired by Live Sync has
+    // only that launch to say which Studio is its own; use it to break a tie,
+    // never to turn a lone Studio away.
+    if candidates.len() > 1
+        && requested_runtime.is_none()
+        && requested_place.is_none()
+        && manifest_place_id.is_none()
+        && let Some(target) = super::studio_target_for_root(&project_root)
+    {
+        let own = candidates
+            .iter()
+            .filter(|entry| client_matches_saved_target(bridge, entry, &target))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !own.is_empty() {
+            candidates = own;
+        }
+    }
     if candidates.len() > 1 {
         return Err(ambiguous_studios(&candidates));
     }
