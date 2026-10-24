@@ -2216,6 +2216,9 @@ impl BridgeServer {
         if selector.is_empty() {
             return true;
         }
+        if info.runtime_id == selector {
+            return true;
+        }
         let name = info.player_name.trim();
         if !name.is_empty() && name.eq_ignore_ascii_case(selector) {
             return true;
@@ -2524,6 +2527,11 @@ impl BridgeServer {
                 }
             }
 
+            anyhow::ensure!(
+                target != BridgeTarget::Client || player.is_none() || candidates.len() <= 1,
+                "Multiple play clients match {}; use its numeric index or runtimeId from rbx cs",
+                player.unwrap_or_default()
+            );
             let candidate = candidates.into_iter().max_by(|(_, left), (_, right)| {
                 right
                     .role_rank
@@ -2625,6 +2633,14 @@ impl BridgeServer {
             return Ok(pin);
         }
         let existing = self.runtime_pins.lock_recover().get(&key).cloned();
+        // Test-player names repeat in different destination servers. Recheck
+        // named selectors even when a formerly unique match was cached.
+        if target == BridgeTarget::Client
+            && player.is_some()
+            && !existing.as_ref().is_some_and(|pin| pin.exact)
+        {
+            return self.choose_runtime_pin(target, player);
+        }
         if let Some(pin) = existing {
             if pin.exact {
                 return Ok(pin);

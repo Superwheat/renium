@@ -1155,7 +1155,7 @@ pub(super) struct PluginConsoleOutputArgs {
     #[arg(help = "Read the play server console", long, conflicts_with_all = ["client", "player"])]
     pub(super) server: bool,
     #[arg(
-        help = "Play client by name or index",
+        help = "Play client by name, index or runtimeId",
         short,
         long,
         value_name = "NAME|N"
@@ -1194,7 +1194,7 @@ pub(super) struct ExecuteLuauArgs {
     #[arg(help = "Run on a play client", short, long)]
     pub(super) client: bool,
     #[arg(
-        help = "Play client by name or index",
+        help = "Play client by name, index or runtimeId",
         short,
         long,
         value_name = "NAME|N"
@@ -1229,7 +1229,7 @@ pub(super) struct ExecuteClientLuauArgs {
     pub(super) bridge: BridgeConnectionArgs,
     #[arg(help = "Luau code (- for stdin)", required_unless_present = "collect")]
     pub(super) code: Option<String>,
-    #[arg(help = "Play client by name or index")]
+    #[arg(help = "Play client by name, index or runtimeId")]
     pub(super) player: Option<String>,
     #[arg(hide = true)]
     pub(super) unexpected: Vec<String>,
@@ -1757,7 +1757,7 @@ pub(super) struct PressArgs {
     #[arg(help = "GUI element ID from ui", short, long)]
     pub(super) id: Option<String>,
     #[arg(
-        help = "Play client by name or index",
+        help = "Play client by name, index or runtimeId",
         short,
         long,
         value_name = "NAME|N"
@@ -1786,7 +1786,7 @@ pub(super) struct ClickArgs {
     #[arg(help = "Viewport Y coordinate")]
     pub(super) y: i32,
     #[arg(
-        help = "Play client by name or index",
+        help = "Play client by name, index or runtimeId",
         short,
         long,
         value_name = "NAME|N"
@@ -1811,7 +1811,7 @@ pub(super) struct KeyArgs {
     #[arg(help = "Key code name, such as E or Space")]
     pub(super) key: String,
     #[arg(
-        help = "Play client by name or index",
+        help = "Play client by name, index or runtimeId",
         short,
         long,
         value_name = "NAME|N"
@@ -1831,7 +1831,7 @@ pub(super) struct UiArgs {
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
     #[arg(
-        help = "Play client by name or index",
+        help = "Play client by name, index or runtimeId",
         short,
         long,
         value_name = "NAME|N"
@@ -1878,7 +1878,7 @@ pub(super) struct TypeArgs {
     #[arg(help = "Text box path from ui", long, value_name = "GUI_PATH")]
     pub(super) path: Option<String>,
     #[arg(
-        help = "Play client by name or index",
+        help = "Play client by name, index or runtimeId",
         short,
         long,
         value_name = "NAME|N"
@@ -1898,7 +1898,7 @@ pub(super) struct WaitUntilArgs {
     )]
     pub(super) condition: String,
     #[arg(
-        help = "Play client by name or index",
+        help = "Play client by name, index or runtimeId",
         short,
         long,
         value_name = "NAME|N"
@@ -1935,7 +1935,7 @@ pub(super) struct GotoArgs {
     )]
     pub(super) pos: Option<String>,
     #[arg(
-        help = "Play client by name or index",
+        help = "Play client by name, index or runtimeId",
         short,
         long,
         value_name = "NAME|N"
@@ -1962,7 +1962,7 @@ pub(super) struct ShotArgs {
     )]
     pub(super) output: PathBuf,
     #[arg(
-        help = "Play client by name or index",
+        help = "Play client by name, index or runtimeId",
         short,
         long,
         value_name = "NAME|N"
@@ -1995,7 +1995,7 @@ pub(super) struct RecordStartArgs {
     #[arg(help = "MP4 path to write", short, long, value_name = "PATH")]
     pub(super) output: Option<PathBuf>,
     #[arg(
-        help = "Play client by name or index",
+        help = "Play client by name, index or runtimeId",
         short,
         long,
         value_name = "NAME|N"

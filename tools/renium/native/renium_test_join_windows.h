@@ -13,9 +13,12 @@ struct Request {
     std::uint64_t joinSlot, joinOriginal, joinField, localSlot, localOriginal, localField;
     std::uint64_t place, universe, hostCreation;
     std::uint32_t hostPid, reserved;
+    std::int64_t userId;
+    std::uint64_t identityCalls[3], identityWriters[3];
+    char name[64], displayName[128];
     char error[256];
 };
-static_assert(sizeof(Request) == 512);
+static_assert(sizeof(Request) == 760);
 using Join = int(*)(void*, void*);
 using Local = void*(*)(void*, void*);
 struct Lease {
@@ -25,6 +28,7 @@ struct Lease {
     void* selected = nullptr;
     void* local = nullptr;
     HANDLE host = nullptr;
+    unsigned identityInstalled = 0;
     std::uint64_t deadline = GetTickCount64() + 60000;
     ~Lease() { if (host) CloseHandle(host); }
     bool Alive() const { return GetTickCount64() < deadline && WaitForSingleObject(host, 0) == WAIT_TIMEOUT; }
@@ -33,6 +37,37 @@ inline std::mutex mutex;
 inline std::shared_ptr<Lease> current;
 inline std::atomic<Join> originalJoin{nullptr};
 inline std::atomic<Local> originalLocal{nullptr};
+// Roblox's JSON writer takes non-owning views. Preserve its allocator and
+// serialization, replacing only the three identity fields in the local join.
+struct TextView { const char* data; std::size_t size; };
+using WriteNumber = void(*)(void*, const TextView*, std::int64_t);
+using WriteText = void(*)(void*, const TextView*, const TextView*);
+inline std::atomic<WriteNumber> originalNumber{nullptr};
+inline std::atomic<WriteText> originalText{nullptr};
+// Reuse these process-lifetime jump islands. A watchdog may restore a call
+// while its thread is crossing the island; its executable bytes must survive.
+inline void* identityThunks[3]{};
+inline std::uint64_t identitySites[3]{};
+inline bool Key(const TextView* key, const char* text) {
+    return key && key->size == std::strlen(text) && std::memcmp(key->data, text, key->size) == 0;
+}
+inline void IdentityNumber(void* writer, const TextView* key, std::int64_t value) {
+    std::shared_ptr<Lease> lease;
+    { std::lock_guard lock(mutex); lease = current; }
+    if (lease && lease->request.client && lease->Alive() && Key(key, "UserId")) value = lease->request.userId;
+    originalNumber.load()(writer, key, value);
+}
+inline void IdentityText(void* writer, const TextView* key, const TextView* value) {
+    std::shared_ptr<Lease> lease;
+    { std::lock_guard lock(mutex); lease = current; }
+    TextView replacement{};
+    if (lease && lease->request.client && lease->Alive()) {
+        if (Key(key, "UserName")) replacement = { lease->request.name, std::strlen(lease->request.name) };
+        else if (Key(key, "DisplayName")) replacement = { lease->request.displayName, std::strlen(lease->request.displayName) };
+        if (replacement.data) value = &replacement;
+    }
+    originalText.load()(writer, key, value);
+}
 inline bool Owns(const Lease& lease, void* instance) {
     const auto& r = lease.request;
     const auto model = renium_play_owner::Model(instance, r.model);
@@ -77,10 +112,15 @@ inline void Restore(const std::shared_ptr<Lease>& lease) {
     const auto& r = lease->request;
     renium_play_loader::Exchange(r.joinSlot, reinterpret_cast<void*>(&GetJoin), reinterpret_cast<void*>(r.joinOriginal));
     if (r.client) renium_play_loader::Exchange(r.localSlot, reinterpret_cast<void*>(&GetLocal), reinterpret_cast<void*>(r.localOriginal));
+    while (lease->identityInstalled) {
+        const auto i = --lease->identityInstalled;
+        try { renium_test_client::Patches::Call(r.identityCalls[i], reinterpret_cast<std::uintptr_t>(identityThunks[i]), r.identityWriters[i]); }
+        catch (...) {} // A replacement owner must not be overwritten; the island remains callable.
+    }
     current.reset();
 }
 inline void Handle(Request& r) {
-    if (r.version != 1 || r.size != sizeof(r) || !r.token || r.reserved || r.client > 1)
+    if (r.version != 2 || r.size != sizeof(r) || !r.token || r.reserved || r.client > 1)
         throw std::runtime_error("Incompatible routed arrival binding");
     if (r.action == 2) {
         std::lock_guard lock(mutex);
@@ -91,6 +131,10 @@ inline void Handle(Request& r) {
         || !r.localSlot || !r.localOriginal || r.joinField >= 65536 || r.localField >= 65536)
         throw std::runtime_error("Incomplete routed arrival binding");
     auto lease = std::make_shared<Lease>();
+    if (r.client && (r.userId >= 0 || !r.name[0] || r.name[63] || !r.displayName[0] || r.displayName[127]
+        || !r.identityCalls[0] || !r.identityCalls[1] || !r.identityCalls[2]
+        || !r.identityWriters[0] || !r.identityWriters[1] || r.identityWriters[1] != r.identityWriters[2]))
+        throw std::runtime_error("Invalid routed test-player identity");
     lease->request = r;
     lease->host = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, r.hostPid);
     FILETIME created{}, exited{}, kernel{}, user{};
@@ -141,6 +185,20 @@ inline void Handle(Request& r) {
         originalLocal.store(reinterpret_cast<Local>(r.localOriginal));
         current = lease;
         try {
+            if (r.client) {
+                originalNumber.store(reinterpret_cast<WriteNumber>(r.identityWriters[0]));
+                originalText.store(reinterpret_cast<WriteText>(r.identityWriters[1]));
+                for (unsigned i = 0; i < 3; ++i) {
+                    if (identityThunks[i] && identitySites[i] != r.identityCalls[i]) throw std::runtime_error("Local-test identity writer moved");
+                    if (!identityThunks[i]) {
+                        identityThunks[i] = renium_test_client::Patches::Island(&r.identityCalls[i], 1,
+                            i == 0 ? reinterpret_cast<std::uintptr_t>(&IdentityNumber) : reinterpret_cast<std::uintptr_t>(&IdentityText));
+                        identitySites[i] = r.identityCalls[i];
+                    }
+                    renium_test_client::Patches::Call(r.identityCalls[i], r.identityWriters[i], reinterpret_cast<std::uintptr_t>(identityThunks[i]));
+                    ++lease->identityInstalled;
+                }
+            }
             if (!renium_play_loader::Exchange(r.joinSlot, reinterpret_cast<void*>(r.joinOriginal), reinterpret_cast<void*>(&GetJoin)))
                 throw std::runtime_error("Routed player getter changed");
             if (r.client && !renium_play_loader::Exchange(r.localSlot, reinterpret_cast<void*>(r.localOriginal), reinterpret_cast<void*>(&GetLocal)))

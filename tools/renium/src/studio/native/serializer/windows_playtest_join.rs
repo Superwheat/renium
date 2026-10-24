@@ -299,6 +299,7 @@ impl NativeTestJoin {
         place: i64,
         universe: i64,
         client: bool,
+        identity: &Value,
     ) -> Result<Self> {
         anyhow::ensure!(
             path == ["CoreGui", &format!("__ReniumRouteJoin_{runtime}")],
@@ -318,9 +319,9 @@ impl NativeTestJoin {
         let native = bindings(&memory, studio)?
             .into_iter()
             .collect::<HashMap<_, _>>();
-        let mut request = vec![0; 512];
-        put_u32(&mut request, 0, 1);
-        put_u32(&mut request, 4, 512);
+        let mut request = vec![0; 760];
+        put_u32(&mut request, 0, 2);
+        put_u32(&mut request, 4, 760);
         put_u32(&mut request, 12, u32::from(client));
         let mut token = [0; 8];
         getrandom::fill(&mut token)
@@ -352,6 +353,30 @@ impl NativeTestJoin {
             put_u64(&mut request, 152 + index * 8, value);
         }
         put_u32(&mut request, 248, std::process::id());
+        if client {
+            let user_id = identity["userId"]
+                .as_i64()
+                .filter(|id| *id < 0)
+                .context("Invalid original test-player UserId")?;
+            put_u64(&mut request, 256, user_id as usize);
+            for (i, (at, writer)) in super::identity::bindings(&memory, studio)?
+                .into_iter()
+                .enumerate()
+            {
+                put_u64(&mut request, 264 + i * 8, at);
+                put_u64(&mut request, 288 + i * 8, writer);
+            }
+            for (name, offset, size) in [("name", 312, 64), ("displayName", 376, 128)] {
+                let text = identity[name]
+                    .as_str()
+                    .context("Missing original test-player name")?;
+                anyhow::ensure!(
+                    !text.is_empty() && text.len() < size && !text.contains('\0'),
+                    "Invalid original test-player name"
+                );
+                request[offset..offset + text.len()].copy_from_slice(text.as_bytes());
+            }
+        }
         let helper = ensure_helper_loaded(pid, &memory, &loaded)?;
         let mut lease = Self {
             memory,
@@ -363,12 +388,12 @@ impl NativeTestJoin {
     }
     fn invoke(&mut self, action: u32) -> Result<()> {
         put_u32(&mut self.request, 8, action);
-        self.request[256..].fill(0);
+        self.request[504..].fill(0);
         let mut input = self.memory.allocate(self.request.len())?;
         self.memory.write(input.address, &self.request)?;
         let exit = input.run(self.entry, 5000)?;
         self.memory.read(input.address, &mut self.request)?;
-        let error = error_text_at(&self.request, 256);
+        let error = error_text_at(&self.request, 504);
         anyhow::ensure!(exit == 0 && error.is_empty(), "Routed arrival: {error}");
         Ok(())
     }

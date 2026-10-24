@@ -60,7 +60,7 @@ mod platform;
 mod unix_shield;
 
 #[cfg(windows)]
-struct ThreadDpiAwareness {
+pub(crate) struct ThreadDpiAwareness {
     previous: isize,
 }
 
@@ -72,7 +72,7 @@ unsafe extern "system" {
 
 #[cfg(windows)]
 impl ThreadDpiAwareness {
-    fn per_monitor_v2() -> Self {
+    pub(crate) fn per_monitor_v2() -> Self {
         let previous = unsafe { SetThreadDpiAwarenessContext(-4) };
         Self { previous }
     }

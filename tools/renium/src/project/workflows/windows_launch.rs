@@ -359,6 +359,68 @@ fn maximize_without_activation(pid: u32) {
     }
 }
 
+/// A destination shares StudioServer's saved dock layout, but the source's
+/// current window state may not have been saved yet. Match that live state
+/// once, after loading, without moving the source or activating either window.
+pub(crate) fn match_test_server_window(source: u32, destination: u32) -> Result<()> {
+    let _dpi = crate::studio::input::ThreadDpiAwareness::per_monitor_v2();
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowPlacement, GetWindowRect, RemovePropW, SetWindowPlacement, WINDOWPLACEMENT,
+        WS_MINIMIZE,
+    };
+    let source_window = crate::studio::input::teleport_caption_window(source)?.0 as _;
+    let destination_window = crate::studio::input::teleport_caption_window(destination)?.0 as _;
+    let mut placement: WINDOWPLACEMENT = unsafe { std::mem::zeroed() };
+    placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+    let mut rect: RECT = unsafe { std::mem::zeroed() };
+    anyhow::ensure!(
+        unsafe { GetWindowPlacement(source_window, &mut placement) } != 0
+            && unsafe { GetWindowRect(source_window, &mut rect) } != 0,
+        "Cannot read the source server's window configuration"
+    );
+    let source_style = unsafe { GetWindowLongPtrW(source_window, GWL_STYLE) };
+    if source_style & WS_MINIMIZE as isize != 0 {
+        rect = placement.rcNormalPosition;
+    }
+    // Clear a deferred maximize from the destination's startup; otherwise its
+    // first user activation would undo the copied normal window state.
+    let property: Vec<u16> = "Renium.BackgroundLaunch.ShowCommand\0"
+        .encode_utf16()
+        .collect();
+    unsafe { RemovePropW(destination_window, property.as_ptr()) };
+    placement.flags = 0;
+    placement.showCmd = SW_SHOWNOACTIVATE as u32;
+    anyhow::ensure!(
+        unsafe { SetWindowPlacement(destination_window, &placement) } != 0,
+        "Cannot restore the destination server's normal window placement"
+    );
+    let style = unsafe { GetWindowLongPtrW(destination_window, GWL_STYLE) };
+    unsafe {
+        SetWindowLongPtrW(
+            destination_window,
+            GWL_STYLE,
+            (style & !((WS_MAXIMIZE | WS_MINIMIZE) as isize))
+                | (source_style & WS_MAXIMIZE as isize),
+        );
+    }
+    anyhow::ensure!(
+        unsafe {
+            SetWindowPos(
+                destination_window,
+                std::ptr::null_mut(),
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOOWNERZORDER,
+            )
+        } != 0,
+        "Cannot match the source server's window size"
+    );
+    Ok(())
+}
+
 // Load into the exact Studio before resuming its first thread, or before
 // requesting Play in an existing Studio. Child process creation is guarded
 // inside Studio before the child's first instruction. No desktop hook, input

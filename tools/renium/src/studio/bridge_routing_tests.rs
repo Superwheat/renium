@@ -1861,6 +1861,49 @@ fn numeric_indices_use_current_sockets_not_removed_snapshot_entries() {
 }
 
 #[test]
+fn repeated_test_player_names_require_an_index_or_exact_runtime() {
+    let bridge = fixture();
+    let mut source = client_info("source-client", "multi");
+    source.player_name = "Player1".into();
+    let _source = connect(&bridge, 0, source.clone());
+    assert_eq!(
+        bridge
+            .runtime_pin_for_selector(BridgeTarget::Client, Some("Player1"))
+            .unwrap()
+            .runtime_id,
+        "source-client"
+    );
+    let mut destination = source.clone();
+    destination.runtime_id = "destination-client".into();
+    destination.place_id = Some(12345);
+    let _destination = connect(&bridge, 1, destination);
+    assert!(
+        bridge
+            .runtime_pin_for_selector(BridgeTarget::Client, Some("Player1"))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Multiple play clients")
+    );
+    for runtime in ["source-client", "destination-client"] {
+        assert_eq!(
+            bridge
+                .runtime_pin_for_selector(BridgeTarget::Client, Some(runtime))
+                .unwrap()
+                .runtime_id,
+            runtime
+        );
+    }
+    let first = bridge
+        .runtime_pin_for_selector(BridgeTarget::Client, Some("1"))
+        .unwrap();
+    let second = bridge
+        .runtime_pin_for_selector(BridgeTarget::Client, Some("2"))
+        .unwrap();
+    assert_ne!(first.runtime_id, second.runtime_id);
+}
+
+#[test]
 fn reconnect_replaces_one_channel_without_duplicating_multiplayer_indices() {
     let bridge = listening_fixture();
     let mut replies = Vec::new();

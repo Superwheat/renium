@@ -11,6 +11,7 @@ fn manual_play_control_for_teleport_regression() -> Result<()> {
             "simulationPlayAction"
                 | "simulationPlayFromCameraAction"
                 | "simulationResetAction"
+                | "launchTestModeAction"
                 | "startServerAction"
                 | "addClientsAction"
                 | "cleanupServersAndPlayersAction"

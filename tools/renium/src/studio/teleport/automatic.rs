@@ -147,6 +147,23 @@ fn connected_owner(context: &BoundContext, rows: &[Value]) -> Option<String> {
     matching.next().is_none().then_some(owner)
 }
 
+fn manual_nonce(info: &Value, rows: &[Value]) -> Option<String> {
+    info["launchNonce"]
+        .as_str()
+        .filter(|nonce| !nonce.is_empty())
+        .or_else(|| {
+            // An idle daemon restart loses PREPARED, but Edit still owns its
+            // prepared identity. Reuse it for its verified manual children;
+            // inventing another nonce makes the plugin reject adoption.
+            rows.iter().find(|row| {
+                row["role"] == "edit" && row["runtimeId"] == info["launchEditRuntimeId"]
+            })?["launchNonce"]
+                .as_str()
+                .filter(|nonce| nonce.starts_with("manual-"))
+        })
+        .map(str::to_owned)
+}
+
 pub(crate) fn start_manual(bridge: &Arc<BridgeServer>, state: &State) {
     let rows = bridge.list_bridge_clients();
     let contexts = state
@@ -388,17 +405,13 @@ fn adopt(bridge: &BridgeServer, info: &Value, root: &str) -> Result<()> {
     let runtime = text_field(info, "runtimeId")?;
     let gate = gate(&owner);
     let _guard = gate.lock_recover();
+    let rows = bridge.list_bridge_clients();
     let nonce = PREPARED
         .get_or_init(Default::default)
         .lock_recover()
         .get(&owner)
         .map(|prepared| prepared.nonce.clone())
-        .or_else(|| {
-            info["launchNonce"]
-                .as_str()
-                .filter(|nonce| !nonce.is_empty())
-                .map(str::to_owned)
-        })
+        .or_else(|| manual_nonce(info, &rows))
         .unwrap_or_else(|| format!("manual-{runtime}"));
     let edit_pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, &owner)?;
     let server_pid = bridge.studio_pid_for_runtime(BridgeTarget::Server, &runtime)?;
@@ -409,7 +422,6 @@ fn adopt(bridge: &BridgeServer, info: &Value, root: &str) -> Result<()> {
         !multiplayer || descendants.contains(&server_pid),
         "Manual Play server is not a test process of its Edit window"
     );
-    let rows = bridge.list_bridge_clients();
     ensure!(
         rows.iter()
             .filter(|row| row["role"] == "play-server" && row["launchEditRuntimeId"] == owner)
@@ -487,6 +499,33 @@ fn adopt(bridge: &BridgeServer, info: &Value, root: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manual_adoption_keeps_the_verified_edits_prepared_identity_after_daemon_restart() {
+        let mut info = json!({"launchEditRuntimeId":"edit-a"});
+        let rows = vec![
+            json!({"role":"edit","runtimeId":"edit-b","launchNonce":"manual-other"}),
+            json!({"role":"edit","runtimeId":"edit-a","launchNonce":"manual-prepared"}),
+        ];
+        assert_eq!(
+            manual_nonce(&info, &rows).as_deref(),
+            Some("manual-prepared")
+        );
+        info["launchNonce"] = json!("manual-current");
+        assert_eq!(
+            manual_nonce(&info, &rows).as_deref(),
+            Some("manual-current")
+        );
+        info["launchNonce"] = Value::Null;
+        assert!(manual_nonce(&info, &rows[..1]).is_none());
+        assert!(
+            manual_nonce(
+                &info,
+                &[json!({"role":"edit","runtimeId":"edit-a","launchNonce":"cli-owned"})]
+            )
+            .is_none()
+        );
+    }
 
     #[test]
     fn automatic_teleport_retries_failed_setup_without_overlapping_attempts() {

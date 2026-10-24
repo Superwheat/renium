@@ -523,6 +523,8 @@ fn travel(
     notify_clients(bridge, clients, "loading", &params)?;
     let destination = crate::cloud::teleport::resolve(session.universe, attempt.place_id)?;
     title.transition(Some(&destination.display_name))?;
+    params["displayName"] = json!(destination.display_name);
+    notify_clients(bridge, clients, "loading", &params)?;
     let selection = native::try_switch(
         bridge,
         session,

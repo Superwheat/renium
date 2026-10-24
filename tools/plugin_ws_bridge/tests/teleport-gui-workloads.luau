@@ -2,6 +2,13 @@ local fs = require("@lune/fs")
 local luau = require("@lune/luau")
 local created = {}
 local coreGui, scriptContext, replicatedFirst = {}, {}, {}
+local listeners = {}
+coreGui.DescendantAdded = { Connect = function(_, callback)
+	local connection = { callback = callback }
+	function connection:Disconnect() self.disconnected = true end
+	table.insert(listeners, connection)
+	return connection
+end }
 local module = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeTeleportGui.module.luau"), { environment = {
 	Instance = { new = function(class)
 		assert(class == "BindableFunction", "Roblox owns the loading UI; Renium must not create a replacement")
@@ -10,7 +17,7 @@ local module = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeTeleportGui.m
 		created[#created + 1] = object
 		return object
 	end },
-	game = { GetService = function(_, name)
+	game = { PlaceId = 11, GetService = function(_, name)
 		if name == "ScriptContext" then return scriptContext end
 		if name == "ReplicatedFirst" then return replicatedFirst end
 		assert(name == "CoreGui")
@@ -27,12 +34,34 @@ assert(args.n == 3 and args[1] == scriptContext and args[2] == coreGui and args[
 local notification = gui.native()
 assert(notification.show and notification.path[1] == "CoreGui" and notification.path[2] == relay.Name)
 assert(gui.native() == nil, "each notification is consumed once")
+local screen = { Name = "RobloxLoadingGUI", Parent = coreGui }
+local label = { Name = "PlaceLabel", Parent = screen, Text = "Source place" }
+function label:IsA(class) return class == "TextLabel" end
+function label:GetPropertyChangedSignal()
+	return { Connect = function(_, callback)
+		self.changed = { callback = callback, Disconnect = function(connection) connection.disconnected = true end }
+		return self.changed
+	end }
+end
+listeners[1].callback(label)
+assert(label.Text == "", "never briefly show the source title while resolving the destination")
+gui.show({ id = 1, placeId = 12, displayName = "Destination place" })
+assert(label.Text == "Destination place")
+label.Text = "Source place"
+label.changed.callback()
+assert(label.Text == "Destination place", "Roblox's asynchronous metadata response cannot restore the source name")
 gui.show({ id = 1, placeId = 12, version = 4 })
 assert(gui.native() == nil, "download progress must not restart the engine's loading screen")
 gui.fail("Download denied", false)
+assert(listeners[1].disconnected and label.changed.disconnected)
 assert(gui.native().show == false)
 gui.show({ id = 2, placeId = 13 })
 assert(#created == 1 and gui.native().show == true)
+local returned = table.clone(label)
+returned.Text = "Destination place"
+listeners[2].callback(returned)
+gui.show({ id = 2, placeId = 13, displayName = "Source place" })
+assert(returned.Text == "Source place" and label.Text == "Destination place", "return travel must have its own destination")
 args = table.pack(relay.OnInvoke())
 assert(args.n == 3 and args[1] == scriptContext and args[2] == coreGui and args[3] == replicatedFirst)
 gui.arrive()

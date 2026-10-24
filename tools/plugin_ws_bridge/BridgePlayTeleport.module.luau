@@ -282,6 +282,14 @@ function Teleport.create(context)
 		assert(params.runtimeId == context.runtimeId and active, "Teleport runtime changed")
 		assert(RunService:IsStudio() and not RunService:IsEdit(), "Teleport is only available in Play")
 		if params.action == "routeJoin" then
+			if context.role == "play-server" then
+				local identity = params.identity
+				assert(type(identity) == "table" and type(identity.userId) == "number" and identity.userId < 0
+					and identity.userId % 1 == 0 and type(identity.name) == "string" and type(identity.displayName) == "string",
+					"Invalid test-player identity")
+				local players = game:GetService("Players")
+				assert(not players:GetPlayerByUserId(identity.userId), "This test player is already in the destination")
+			end
 			if routeJoinRelay then
 				routeJoinRelay:Destroy()
 			end
@@ -293,11 +301,17 @@ function Teleport.create(context)
 			routeJoinRelay.Parent = game:GetService("CoreGui")
 			return { ok = true, path = { "CoreGui", routeJoinRelay.Name } }
 		end
+		if params.action == "routeIdentity" then
+			assert(context.role == "play-server", "Only the source server supplies player identity")
+			local player = assert(game:GetService("Players"):FindFirstChild(params.playerName), "Teleport player left")
+			return { ok = true, identity = { userId = player.UserId, name = player.Name, displayName = player.DisplayName } }
+		end
 		if params.action == "routeVerify" then
 			local player = if context.role == "play-client" then game:GetService("Players").LocalPlayer
 				else game:GetService("Players"):GetPlayerByUserId(params.userId)
 			assert(player, "Routed player did not arrive")
 			return { ok = true, join = player:GetJoinData(),
+				identity = { userId = player.UserId, name = player.Name, displayName = player.DisplayName },
 				data = if context.role == "play-client" then game:GetService("TeleportService"):GetLocalPlayerTeleportData() else nil }
 		end
 		if params.action == "routeArrival" then

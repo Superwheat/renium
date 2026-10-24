@@ -244,4 +244,16 @@ assert(send(collision, "play-server", "status").phase == "loading", "refuse comp
 send(collision, "play-server", "fail", { id = collisionId, error = "Fixture ended" })
 assert(not coroutine.resume(collisionCall))
 collision.cleanup(true)
+local routing = runtime("play-server")
+services.CoreGui = {}
+services.Players.GetPlayerByUserId = function() return nil end
+local identity = { userId = -2, name = "Player2", displayName = "Player2" }
+local join = { SourcePlaceId = 10, TeleportData = { marker = "return" } }
+send(routing, "play-server", "routeJoin", { join = join, identity = identity })
+local actualJoin, actualData = nativeRelay.OnInvoke()
+assert(actualJoin == join and actualData == join.TeleportData)
+services.Players.GetPlayerByUserId = function() return player end
+assert(not pcall(send, routing, "play-server", "routeJoin", { join = join, identity = identity }),
+	"duplicate test identities must fail before the client leaves its server")
+routing.cleanup(true)
 print("teleport lifecycle workloads passed")

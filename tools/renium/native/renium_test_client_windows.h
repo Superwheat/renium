@@ -54,18 +54,19 @@ struct Patches {
         FlushInstructionCache(GetCurrentProcess(), code, 5);
     }
     explicit Patches(const Request& r) : request(r) {}
-    void Arm() {
+    static void* Island(const std::uint64_t* calls, unsigned count, std::uintptr_t target) {
         // A near jump island preserves the native call ABI, including its
         // hidden return buffer, while letting the completion run in Tasks.
         SYSTEM_INFO system{};
         GetSystemInfo(&system);
         const auto granularity = static_cast<std::uintptr_t>(system.dwAllocationGranularity);
-        auto low = request.calls[0] > INT32_MAX ? request.calls[0] - INT32_MAX : granularity;
-        auto high = request.calls[0] + INT32_MAX;
-        for (unsigned i = 1; i < request.count; ++i) {
-            low = (std::max)(low, request.calls[i] > INT32_MAX ? request.calls[i] - INT32_MAX : granularity);
-            high = (std::min)(high, request.calls[i] + INT32_MAX);
+        auto low = calls[0] > INT32_MAX ? calls[0] - INT32_MAX : granularity;
+        auto high = calls[0] + INT32_MAX;
+        for (unsigned i = 1; i < count; ++i) {
+            low = (std::max)(low, calls[i] > INT32_MAX ? calls[i] - INT32_MAX : granularity);
+            high = (std::min)(high, calls[i] + INT32_MAX);
         }
+        void* continuation = nullptr;
         for (auto at = (low + granularity - 1) & ~(granularity - 1); at < high;) {
             MEMORY_BASIC_INFORMATION region{};
             if (!VirtualQuery(reinterpret_cast<void*>(at), &region, sizeof(region))) break;
@@ -79,13 +80,18 @@ struct Patches {
         }
         if (!continuation) throw std::runtime_error("Cannot allocate client continuation");
         unsigned char jump[14]{0xff, 0x25, 0, 0, 0, 0};
-        const auto target = reinterpret_cast<std::uintptr_t>(&StartClient);
         std::memcpy(jump + 6, &target, sizeof(target));
         std::memcpy(continuation, jump, sizeof(jump));
         DWORD protection = 0;
-        if (!VirtualProtect(continuation, granularity, PAGE_EXECUTE_READ, &protection))
+        if (!VirtualProtect(continuation, granularity, PAGE_EXECUTE_READ, &protection)) {
+            VirtualFree(continuation, 0, MEM_RELEASE);
             throw std::runtime_error("Cannot protect client continuation");
+        }
         FlushInstructionCache(GetCurrentProcess(), continuation, sizeof(jump));
+        return continuation;
+    }
+    void Arm() {
+        continuation = Island(request.calls, request.count, reinterpret_cast<std::uintptr_t>(&StartClient));
         const auto widgets = GetModuleHandleW(L"Qt5Widgets.dll");
         const auto find = reinterpret_cast<void*(*)(std::uintptr_t)>(GetProcAddress(widgets, "?find@QWidget@@SAPEAV1@_K@Z"));
         close = reinterpret_cast<void*>(GetProcAddress(widgets, "?close@QWidget@@QEAA_NXZ"));

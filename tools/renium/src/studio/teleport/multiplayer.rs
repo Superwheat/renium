@@ -3,13 +3,15 @@ use super::routing::{Place, Routes, Server, ServerState};
 use super::*;
 use crate::studio::automation::test_processes;
 use std::collections::BTreeMap;
-use std::collections::hash_map::Entry;
 use std::time::Instant;
 
 struct Endpoint {
     session: Session,
     dispatch: Dispatch,
     last: u64,
+    // Studio's local transport belongs to the server, not a player. Retain
+    // its native join configuration for the lifetime of this exact endpoint.
+    configuration: Option<Value>,
 }
 
 struct Test {
@@ -225,12 +227,17 @@ impl Test {
                             pid,
                             version: destination.saved.version,
                         };
+                        crate::project::workflows::windows_launch::match_test_server_window(
+                            self.source_pid,
+                            pid,
+                        )?;
                         self.endpoints.insert(
                             travel.to,
                             Endpoint {
                                 session,
                                 dispatch,
                                 last: 0,
+                                configuration: None,
                             },
                         );
                         self.routes.server_ready(travel, server.clone())?;
@@ -267,11 +274,6 @@ impl Test {
         let mut participants = Vec::new();
         for (name, runtime) in &selected {
             let pid = bridge.studio_pid_for_runtime(BridgeTarget::Client, runtime)?;
-            let caption = match self.captions.entry(pid) {
-                Entry::Occupied(entry) => entry.into_mut(),
-                Entry::Vacant(entry) => entry.insert(title::ClientCaption::start(pid)?),
-            };
-            caption.update(None, true)?;
             participants.push((name.clone(), runtime.clone(), pid));
         }
         let route = self.routes.reserve(
@@ -286,6 +288,27 @@ impl Test {
                 .collect::<Vec<_>>(),
         )?;
         let result = (|| -> Result<()> {
+            for (_, _, pid) in &participants {
+                if !self.captions.contains_key(pid) {
+                    self.captions
+                        .insert(*pid, title::ClientCaption::start(*pid)?);
+                }
+                self.captions.get_mut(pid).unwrap().update(None, true)?;
+            }
+            // Returning uses the source's existing native transport. Manual
+            // Add Clients would launch the entire player-count selection again.
+            if self.endpoints[&from].configuration.is_none() && from.place == self.root.source {
+                let command = crate::studio::performance::process_command_line(participants[0].2)
+                    .context("Cannot read the source client's test configuration")?;
+                self.endpoints.get_mut(&from).unwrap().configuration =
+                    Some(test_client_configuration(
+                        &command,
+                        self.edit_pid,
+                        self.source_pid,
+                        from.universe,
+                        from.place,
+                    )?);
+            }
             notify_clients(
                 bridge,
                 &selected,
@@ -293,6 +316,12 @@ impl Test {
                 &json!({"id":attempt.id,"placeId":attempt.place_id}),
             )?;
             let destination = crate::cloud::teleport::resolve(from.universe, attempt.place_id)?;
+            notify_clients(
+                bridge,
+                &selected,
+                "loading",
+                &json!({"id":attempt.id,"placeId":attempt.place_id,"displayName":destination.display_name}),
+            )?;
             let resolved = Instant::now();
             for (_, _, pid) in &participants {
                 self.captions
@@ -333,6 +362,14 @@ impl Test {
                 .collect::<Vec<_>>();
             for (name, runtime, pid) in &participants {
                 self.alive(bridge)?;
+                let identity = call(
+                    bridge,
+                    &self.endpoints[&from].session.server,
+                    BridgeTarget::Server,
+                    "routeIdentity",
+                    json!({"playerName":name}),
+                )?["identity"]
+                    .clone();
                 let join = json!({"SourcePlaceId":from.place,"SourceGameId":from.universe,
                     "TeleportData":attempt.data[name]["teleportData"],
                     "Members":members});
@@ -351,7 +388,7 @@ impl Test {
                         target_runtime,
                         role,
                         "routeJoin",
-                        json!({"join":join}),
+                        json!({"join":join,"identity":identity}),
                     )?;
                     let path = serde_json::from_value::<Vec<String>>(relay["path"].clone())?;
                     arrivals.push(crate::studio::native::serializer::NativeTestJoin::arm(
@@ -361,44 +398,54 @@ impl Test {
                         attempt.place_id,
                         from.universe,
                         client,
+                        &identity,
                     )?);
                 }
-                let mut capture = crate::project::workflows::windows_launch::TestClientRoute::arm(
-                    server.pid, *pid,
-                )?;
-                if self.root.nonce.starts_with("manual-") {
-                    // AddPlayers only accepts ExecuteMultiplayerTestAsync
-                    // sessions. Manual servers use Studio's Add Client action;
-                    // the same launch capture redirects it into this window.
-                    let title = crate::studio::input::studio_window_title(server.pid)?;
-                    crate::studio::native::serializer::trigger_studio_action(
-                        server.pid,
-                        &title,
-                        "addClientsAction",
-                    )?;
-                } else {
-                    call(
-                        bridge,
-                        &server.runtime,
-                        BridgeTarget::Server,
-                        "addRouteClient",
-                        json!({}),
-                    )?;
-                }
-                let deadline = Instant::now() + Duration::from_secs(15);
-                let command = loop {
-                    if let Some(command) = capture.command()? {
-                        break command;
-                    }
-                    self.wait(bridge, deadline)?;
-                };
-                let configuration = test_client_configuration(
-                    &command,
-                    self.edit_pid,
-                    server.pid,
-                    from.universe,
-                    attempt.place_id,
-                )?;
+                let configuration =
+                    if let Some(configuration) = &self.endpoints[&route.to].configuration {
+                        configuration.clone()
+                    } else {
+                        let mut capture =
+                            crate::project::workflows::windows_launch::TestClientRoute::arm(
+                                server.pid, *pid,
+                            )?;
+                        if self.root.nonce.starts_with("manual-") {
+                            // AddPlayers only accepts ExecuteMultiplayerTestAsync
+                            // sessions. Manual servers use Studio's Add Client action;
+                            // the same launch capture redirects it into this window.
+                            let title = crate::studio::input::studio_window_title(server.pid)?;
+                            crate::studio::native::serializer::trigger_studio_action(
+                                server.pid,
+                                &title,
+                                "addClientsAction",
+                            )?;
+                        } else {
+                            call(
+                                bridge,
+                                &server.runtime,
+                                BridgeTarget::Server,
+                                "addRouteClient",
+                                json!({}),
+                            )?;
+                        }
+                        let deadline = Instant::now() + Duration::from_secs(15);
+                        let command = loop {
+                            if let Some(command) = capture.command()? {
+                                break command;
+                            }
+                            self.wait(bridge, deadline)?;
+                        };
+                        let configuration = test_client_configuration(
+                            &command,
+                            self.edit_pid,
+                            server.pid,
+                            from.universe,
+                            attempt.place_id,
+                        )?;
+                        self.endpoints.get_mut(&route.to).unwrap().configuration =
+                            Some(configuration.clone());
+                        configuration
+                    };
                 let prepared = call(
                     bridge,
                     runtime,
@@ -409,7 +456,6 @@ impl Test {
                 let path: Vec<String> = serde_json::from_value(prepared["path"].clone())?;
                 rejoin_test_client(*pid, runtime, &path)?;
                 bridge.retire_runtime(runtime);
-                drop(capture);
                 let deadline = Instant::now() + Duration::from_secs(25);
                 loop {
                     let inventory = bridge.list_bridge_clients();
@@ -447,6 +493,7 @@ impl Test {
                                 actual["join"]["SourcePlaceId"] == from.place
                                     && actual["join"]["SourceGameId"] == from.universe
                                     && actual["join"]["TeleportData"] == join["TeleportData"]
+                                    && actual["identity"] == identity
                                     && (role != BridgeTarget::Client
                                         || actual["data"] == join["TeleportData"]),
                                 "Routed player arrival data did not match its teleport"
@@ -491,7 +538,9 @@ impl Test {
         if result.is_err() {
             self.routes.cancel(&route);
             for (_, _, pid) in &participants {
-                let _ = self.captions.get_mut(pid).unwrap().update(None, false);
+                if let Some(caption) = self.captions.get_mut(pid) {
+                    let _ = caption.update(None, false);
+                }
             }
         }
         result
@@ -529,6 +578,7 @@ pub(super) fn watch(
                 session: root.clone(),
                 dispatch: dispatch.unwrap_or_else(|| Dispatch::arm(bridge, root)),
                 last: 0,
+                configuration: None,
             },
         )]),
         captions: HashMap::new(),

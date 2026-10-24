@@ -14,6 +14,8 @@ pub(super) mod client;
 pub(super) mod dispatch;
 #[path = "windows_playtest_gui.rs"]
 pub(super) mod gui;
+#[path = "windows_playtest_identity.rs"]
+mod identity;
 #[path = "windows_playtest_image.rs"]
 mod image;
 #[cfg(test)]

@@ -469,6 +469,7 @@ pub(crate) fn prepare_test_client(pid: u32) -> Result<()> {
     let memory = ProcessMemory::open_read_only(pid)?;
     let binding = binding(&memory, studio)?;
     opener(&memory, studio, &binding)?;
+    super::identity::bindings(&memory, studio)?;
     Ok(())
 }
 
