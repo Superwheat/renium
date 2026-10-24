@@ -42,6 +42,8 @@ fn build_windows(out_dir: &Path) {
     ));
     run(&mut command, "Windows Studio helper build");
     let launch_source = PathBuf::from("native").join("renium_launch_windows.cpp");
+    println!("cargo:rerun-if-changed=native/renium_test_server_windows.h");
+    println!("cargo:rerun-if-changed=native/renium_test_route_windows.h");
     let mut launch_command = compiler.to_command();
     launch_command.args([
         "/nologo",
@@ -65,6 +67,7 @@ fn build_windows(out_dir: &Path) {
         "/Brepro",
         "user32.lib",
         "comctl32.lib",
+        "shell32.lib",
     ]);
     launch_command.arg(format!(
         "/IMPLIB:{}",
@@ -189,6 +192,8 @@ fn build_windows(out_dir: &Path) {
     println!("cargo:rerun-if-changed=native/renium_play_owner_windows.h");
     println!("cargo:rerun-if-changed=native/renium_play_caption_windows.h");
     println!("cargo:rerun-if-changed=native/renium_teleport_gui_windows.h");
+    println!("cargo:rerun-if-changed=native/renium_test_client_windows.h");
+    println!("cargo:rerun-if-changed=native/renium_test_join_windows.h");
     println!("cargo:rerun-if-changed={}", launch_source.display());
     println!("cargo:rerun-if-changed=native/renium_launch_windows_process.h");
     println!("cargo:rerun-if-changed={}", source.display());

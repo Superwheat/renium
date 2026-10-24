@@ -146,6 +146,10 @@ static BOOL WINAPI launchCreateProcessW(LPCWSTR executable, LPWSTR command, LPSE
     const bool protect = belongsToLaunch() && launchedStudio(executable, command);
     if (!protect) return CreateProcessW(executable, command, processAttributes, threadAttributes, inherit,
         flags, environment, directory, startup, process);
+    if (renium_test_route::Capture(command, process)) {
+        if (!process->hProcess) { SetLastError(ERROR_INVALID_STATE); return FALSE; }
+        return TRUE;
+    }
     STARTUPINFOEXW background{};
     background.StartupInfo = *startup;
     if (flags & EXTENDED_STARTUPINFO_PRESENT)

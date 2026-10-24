@@ -152,6 +152,8 @@ static void ReleaseOwnerReference(void* owner)
 #include "renium_play_teleport_windows.h"
 #include "renium_play_join_windows.h"
 #include "renium_teleport_gui_windows.h"
+#include "renium_test_client_windows.h"
+#include "renium_test_join_windows.h"
 #include "renium_play_caption_windows.h"
 
 static std::uint64_t ElapsedMicros(

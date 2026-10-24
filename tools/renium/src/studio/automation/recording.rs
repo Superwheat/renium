@@ -83,6 +83,7 @@ struct FinishedRecording {
     height: u32,
     frames: usize,
     duration_ms: u64,
+    resized_frames: usize,
 }
 
 struct RecordingOptions {
@@ -332,6 +333,7 @@ fn record_file(
     let mut next_frame = started + interval;
     let mut pending_at = 0u64;
     let mut frames = 1usize;
+    let mut resized_frames = 0usize;
     while !stop.load(Ordering::Relaxed) && started.elapsed() < limit {
         while !stop.load(Ordering::Relaxed) && started.elapsed() < limit {
             let now = Instant::now();
@@ -344,15 +346,32 @@ fn record_file(
             break;
         }
         let (frame_width, frame_height, pixels) = capture()?;
-        if (frame_width, frame_height) != (source_width, source_height) {
-            bail!(
-                "The recorded window changed from {source_width}x{source_height} to {frame_width}x{frame_height}"
-            );
-        }
         let (pixels, frame_width, frame_height) = even_rgba(&pixels, frame_width, frame_height)?;
-        if (frame_width, frame_height) != (usize::from(width), usize::from(height)) {
-            bail!("The encoded recording dimensions changed");
-        }
+        // A document replacement can change the viewport without changing the
+        // client window. Keep capturing live frames on the original canvas.
+        let pixels = if (frame_width, frame_height) == (usize::from(width), usize::from(height)) {
+            pixels
+        } else {
+            resized_frames += 1;
+            let (canvas_width, canvas_height) = (usize::from(width), usize::from(height));
+            let scale = (canvas_width as f64 / frame_width as f64)
+                .min(canvas_height as f64 / frame_height as f64);
+            let fitted_width = ((frame_width as f64 * scale) as usize).max(1);
+            let fitted_height = ((frame_height as f64 * scale) as usize).max(1);
+            let x = (canvas_width - fitted_width) / 2;
+            let y = (canvas_height - fitted_height) / 2;
+            let mut canvas = [0, 0, 0, 255].repeat(canvas_width * canvas_height);
+            for row in 0..fitted_height {
+                let source_row = row * frame_height / fitted_height;
+                for column in 0..fitted_width {
+                    let source =
+                        (source_row * frame_width + column * frame_width / fitted_width) * 4;
+                    let target = ((y + row) * canvas_width + x + column) * 4;
+                    canvas[target..target + 4].copy_from_slice(&pixels[source..source + 4]);
+                }
+            }
+            Cow::Owned(canvas)
+        };
         let timestamp = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         let next = encode_frame(&mut encoder, &mut yuv, &pixels)?;
         write_sample(&mut writer, pending, pending_at, timestamp)?;
@@ -382,6 +401,7 @@ fn record_file(
         height: u32::from(height),
         frames,
         duration_ms,
+        resized_frames,
     })
 }
 
@@ -565,6 +585,7 @@ pub(crate) fn end(parameters: &Value) -> Result<Value> {
         "height": finished.height,
         "frames": finished.frames,
         "durationMs": finished.duration_ms,
+        "resizedFrames": finished.resized_frames,
         "requestedFps": active.fps,
         "achievedFps": achieved_fps,
         "mimeType": "video/mp4",
@@ -622,7 +643,12 @@ mod tests {
                     if frames == 3 {
                         thread_stop.store(true, Ordering::Relaxed);
                     }
-                    Ok((65, 33, [20, 80, 200, 255].repeat(65 * 33)))
+                    let (width, height) = if frames == 2 { (97, 65) } else { (65, 33) };
+                    Ok((
+                        width,
+                        height,
+                        [20, 80, 200, 255].repeat((width * height) as usize),
+                    ))
                 };
                 let first = frame()?;
                 let temp = sibling_temp_path(&options.output);
@@ -648,6 +674,7 @@ mod tests {
             }
             assert_eq!(result["width"], 64);
             assert_eq!(result["height"], 32);
+            assert_eq!(result["resizedFrames"], 1);
             assert!(output.is_file());
             if review && !block_review {
                 assert_eq!(result["review"]["totalFrames"], result["frames"]);

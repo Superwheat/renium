@@ -12,13 +12,16 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_BINARY, RegGetValueW};
 use windows_sys::Win32::System::Threading::{
-    CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, CreateProcessW, PROCESS_INFORMATION, ResumeThread,
-    STARTF_USESHOWWINDOW, STARTUPINFOW, TerminateProcess,
+    CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, CreateProcessW, DeleteProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT, InitializeProcThreadAttributeList, OpenProcess,
+    PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, PROCESS_CREATE_PROCESS, PROCESS_INFORMATION,
+    ResumeThread, STARTF_USESHOWWINDOW, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
+    UpdateProcThreadAttribute,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GWL_STYLE, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, IsWindowVisible, SW_SHOWNA, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOOWNERZORDER, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, WS_MAXIMIZE,
+    GetWindowThreadProcessId, IsWindowVisible, SW_SHOWNA, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, WS_MAXIMIZE,
 };
 
 const LAUNCH_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-launch.dll"));
@@ -72,6 +75,23 @@ fn append_argument(output: &mut Vec<u16>, argument: &OsStr) -> Result<()> {
 }
 
 pub(super) fn spawn(executable: &Path, arguments: &[&OsStr]) -> Result<u32> {
+    let (pid, ()) = spawn_prepared(executable, arguments, None, |_| Ok(()))?;
+    // Only ordinary Edit launches restore the Edit window's maximized state.
+    // Test tasks restore their own instance-specific Studio layout.
+    if studio_remembers_maximized() {
+        maximize_without_activation(pid);
+    }
+    Ok(pid)
+}
+
+/// Prepare an owned test process before its main thread can load a place.
+/// Failure closes that exact process through its retained kernel handle.
+pub(crate) fn spawn_prepared<T>(
+    executable: &Path,
+    arguments: &[&OsStr],
+    parent: Option<u32>,
+    prepare: impl FnOnce(u32) -> Result<T>,
+) -> Result<(u32, T)> {
     let mut command_line = Vec::new();
     append_argument(&mut command_line, executable.as_os_str())?;
     for argument in arguments {
@@ -84,14 +104,79 @@ pub(super) fn spawn(executable: &Path, arguments: &[&OsStr]) -> Result<u32> {
         .encode_wide()
         .chain([0])
         .collect::<Vec<_>>();
-    // SW_SHOWNA keeps the size Studio restores for itself (maximized when
-    // it was maximized); SW_SHOWNOACTIVATE would force the normal size.
-    let startup = STARTUPINFOW {
-        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
-        dwFlags: STARTF_USESHOWWINDOW,
-        wShowWindow: SW_SHOWNA as u16,
-        ..unsafe { std::mem::zeroed() }
-    };
+    // Match the child-launch guard for test tasks. Their StudioServer layout
+    // must not inherit the ordinary Edit window's maximized state.
+    let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+    startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    startup.StartupInfo.dwFlags = STARTF_USESHOWWINDOW;
+    startup.StartupInfo.wShowWindow = if parent.is_some() {
+        SW_SHOWNOACTIVATE
+    } else {
+        SW_SHOWNA
+    } as u16;
+    // Destination tasks remain actual children of the Edit controller, so
+    // orphan detection and Stop retain ownership across daemon restarts.
+    let parent_handle = parent.map(|pid| unsafe { OpenProcess(PROCESS_CREATE_PROCESS, 0, pid) });
+    anyhow::ensure!(
+        parent_handle.is_none_or(|handle| !handle.is_null()),
+        "The root Edit process ended before server creation"
+    );
+    let _parent = crate::system::files::OnDrop::new(|| {
+        if let Some(handle) = parent_handle {
+            unsafe {
+                CloseHandle(handle);
+            }
+        }
+    });
+    let mut attribute_bytes = 0;
+    let mut attribute_storage = Vec::<usize>::new();
+    // UpdateProcThreadAttribute retains the address until CreateProcess.
+    let mut parent_value = parent_handle.unwrap_or(std::ptr::null_mut());
+    if parent.is_some() {
+        unsafe {
+            InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut attribute_bytes);
+        }
+        attribute_storage.resize(attribute_bytes.div_ceil(std::mem::size_of::<usize>()), 0);
+        startup.lpAttributeList = attribute_storage.as_mut_ptr().cast();
+        anyhow::ensure!(
+            unsafe {
+                InitializeProcThreadAttributeList(
+                    startup.lpAttributeList,
+                    1,
+                    0,
+                    &mut attribute_bytes,
+                )
+            } != 0,
+            "Cannot initialize destination parent: {}",
+            std::io::Error::last_os_error()
+        );
+        if unsafe {
+            UpdateProcThreadAttribute(
+                startup.lpAttributeList,
+                0,
+                PROC_THREAD_ATTRIBUTE_PARENT_PROCESS as usize,
+                (&mut parent_value as *mut windows_sys::Win32::Foundation::HANDLE).cast(),
+                std::mem::size_of_val(&parent_value),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        } == 0
+        {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                DeleteProcThreadAttributeList(startup.lpAttributeList);
+            }
+            return Err(error).context("Cannot retain the root Edit process parent");
+        }
+        startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    }
+    let _attributes = crate::system::files::OnDrop::new(|| {
+        if !startup.lpAttributeList.is_null() {
+            unsafe {
+                DeleteProcThreadAttributeList(startup.lpAttributeList);
+            }
+        }
+    });
     let mut process: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     // No shell, inherited handles, console, changed environment, or focus
     // restoration. The currently focused app keeps its activation.
@@ -102,10 +187,16 @@ pub(super) fn spawn(executable: &Path, arguments: &[&OsStr]) -> Result<u32> {
             std::ptr::null(),
             std::ptr::null(),
             0,
-            CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED,
+            CREATE_NEW_PROCESS_GROUP
+                | CREATE_SUSPENDED
+                | if parent.is_some() {
+                    EXTENDED_STARTUPINFO_PRESENT
+                } else {
+                    0
+                },
             std::ptr::null(),
             std::ptr::null(),
-            &startup,
+            &startup.StartupInfo,
             &mut process,
         )
     } == 0
@@ -118,15 +209,18 @@ pub(super) fn spawn(executable: &Path, arguments: &[&OsStr]) -> Result<u32> {
             )
         });
     }
-    let protection = protect_process(process.dwProcessId);
-    if let Err(error) = protection {
-        unsafe {
-            TerminateProcess(process.hProcess, 1);
-            CloseHandle(process.hThread);
-            CloseHandle(process.hProcess);
-        }
-        return Err(error);
-    }
+    let prepared =
+        match protect_process(process.dwProcessId).and_then(|()| prepare(process.dwProcessId)) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                unsafe {
+                    TerminateProcess(process.hProcess, 1);
+                    CloseHandle(process.hThread);
+                    CloseHandle(process.hProcess);
+                }
+                return Err(error);
+            }
+        };
     let resumed = unsafe { ResumeThread(process.hThread) };
     let error = std::io::Error::last_os_error();
     unsafe {
@@ -139,10 +233,7 @@ pub(super) fn spawn(executable: &Path, arguments: &[&OsStr]) -> Result<u32> {
     if resumed == u32::MAX {
         return Err(error).context("Could not resume Studio");
     }
-    if studio_remembers_maximized() {
-        maximize_without_activation(process.dwProcessId);
-    }
-    Ok(process.dwProcessId)
+    Ok((process.dwProcessId, prepared))
 }
 
 /// Studio saves its main window geometry the Qt way (`@ByteArray(...)` in
@@ -296,6 +387,145 @@ pub(crate) fn protect_process(pid: u32) -> Result<()> {
     })();
     unsafe { FreeLibrary(module) };
     result
+}
+
+/// The caller has structurally qualified these fields against the suspended
+/// process image. The launch helper uses Qt's own QString allocator.
+pub(crate) fn prepare_test_server(
+    pid: u32,
+    root_pid: u32,
+    fields: [u64; 4],
+    file: &Path,
+) -> Result<()> {
+    #[repr(C)]
+    struct Input {
+        version: u32,
+        size: u32,
+        fields: [u64; 4],
+        root_creation: u64,
+        root_pid: u32,
+        reserved: u32,
+        file: [u16; 32768],
+    }
+    let mut input = Box::new(Input {
+        version: 2,
+        size: std::mem::size_of::<Input>() as u32,
+        fields,
+        root_creation: crate::app::update::process_start_identity(root_pid)
+            .context("Root test server ended")?
+            .parse()?,
+        root_pid,
+        reserved: 0,
+        file: [0; 32768],
+    });
+    let path: Vec<_> = file.as_os_str().encode_wide().collect();
+    anyhow::ensure!(
+        !path.is_empty() && path.len() < input.file.len() && !path.contains(&0),
+        "Invalid destination test file path"
+    );
+    input.file[..path.len()].copy_from_slice(&path);
+    let module = launch_module()?;
+    let result = (|| -> Result<()> {
+        let entry = unsafe { GetProcAddress(module, c"ReniumPrepareTestServer".as_ptr().cast()) }
+            .context("Studio launch guard omitted destination loading")?;
+        let entry: unsafe extern "C" fn(u32, *const Input) -> u32 =
+            unsafe { std::mem::transmute(entry) };
+        let error = unsafe { entry(pid, input.as_ref()) };
+        anyhow::ensure!(
+            error == 0,
+            "Could not prepare destination server: {}",
+            std::io::Error::from_raw_os_error(error as i32)
+        );
+        Ok(())
+    })();
+    unsafe { FreeLibrary(module) };
+    result
+}
+
+#[repr(C)]
+struct TestRouteInput {
+    version: u32,
+    size: u32,
+    action: u32,
+    client_pid: u32,
+    client_creation: u64,
+    window: u64,
+    token: u64,
+    state: u32,
+    error: u32,
+    command: [u16; 32768],
+}
+
+pub(crate) struct TestClientRoute {
+    pid: u32,
+    input: Box<TestRouteInput>,
+}
+impl TestClientRoute {
+    pub(crate) fn arm(server: u32, client: u32) -> Result<Self> {
+        let mut token = [0; 8];
+        getrandom::fill(&mut token)
+            .map_err(|e| anyhow::anyhow!("Cannot create client route identity: {e}"))?;
+        let mut route = Self {
+            pid: server,
+            input: Box::new(TestRouteInput {
+                version: 1,
+                size: std::mem::size_of::<TestRouteInput>() as u32,
+                action: 0,
+                client_pid: client,
+                client_creation: crate::app::update::process_start_identity(client)
+                    .context("Teleport client ended")?
+                    .parse()?,
+                window: crate::studio::input::teleport_caption_window(client)?.0 as u64,
+                token: u64::from_le_bytes(token).max(1),
+                state: 0,
+                error: 0,
+                command: [0; 32768],
+            }),
+        };
+        route.invoke(1)?;
+        Ok(route)
+    }
+    fn invoke(&mut self, action: u32) -> Result<()> {
+        self.input.action = action;
+        let module = launch_module()?;
+        let result = (|| -> Result<()> {
+            let entry = unsafe { GetProcAddress(module, c"ReniumTestRoute".as_ptr().cast()) }
+                .context("Studio launch helper omitted client reuse")?;
+            let entry: unsafe extern "C" fn(u32, *mut TestRouteInput) -> u32 =
+                unsafe { std::mem::transmute(entry) };
+            let error = unsafe { entry(self.pid, self.input.as_mut()) };
+            anyhow::ensure!(
+                error == 0,
+                "Cannot bind destination client reuse: {}",
+                std::io::Error::from_raw_os_error(error as i32)
+            );
+            Ok(())
+        })();
+        unsafe { FreeLibrary(module) };
+        result
+    }
+    pub(crate) fn command(&mut self) -> Result<Option<String>> {
+        self.invoke(2)?;
+        anyhow::ensure!(
+            self.input.state != 3,
+            "The client process ended before its destination join"
+        );
+        if self.input.state != 2 {
+            return Ok(None);
+        }
+        let length = self
+            .input
+            .command
+            .iter()
+            .position(|c| *c == 0)
+            .context("Unterminated client route command")?;
+        Ok(Some(String::from_utf16(&self.input.command[..length])?))
+    }
+}
+impl Drop for TestClientRoute {
+    fn drop(&mut self) {
+        let _ = self.invoke(3);
+    }
 }
 
 #[cfg(test)]

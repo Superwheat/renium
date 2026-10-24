@@ -283,6 +283,101 @@ pub(crate) struct NativePlayJoin {
     request: Vec<u8>,
     armed: bool,
 }
+
+/// Each separate process must create its own native arrival values before its
+/// player callbacks run. Existing server players keep their original records.
+pub(crate) struct NativeTestJoin {
+    memory: ProcessMemory,
+    entry: usize,
+    request: Vec<u8>,
+}
+impl NativeTestJoin {
+    pub(crate) fn arm(
+        pid: u32,
+        runtime: &str,
+        path: &[String],
+        place: i64,
+        universe: i64,
+        client: bool,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            path == ["CoreGui", &format!("__ReniumRouteJoin_{runtime}")],
+            "Invalid routed arrival relay"
+        );
+        let loaded = modules(pid)?;
+        let studio = loaded.first().context("Routed arrival process ended")?;
+        let title = crate::studio::input::studio_window_title(pid)?;
+        let memory = ProcessMemory::open(pid)?;
+        memory.authorize(NativeOperation::PlayTeleportJoin, &title)?;
+        let layout = package_layout(&studio.path)?;
+        let model =
+            active_data_model_for_path(pid, &memory, studio, layout.data, &title, Some(path))?;
+        let relays = properties::resolve_path(&memory, &model, path, &[1, 1])?;
+        let relay = relays.last().context("Routed arrival relay ended")?;
+        let fields = owner::task_binding(&memory, studio, &model)?.0;
+        let native = bindings(&memory, studio)?
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        let mut request = vec![0; 512];
+        put_u32(&mut request, 0, 1);
+        put_u32(&mut request, 4, 512);
+        put_u32(&mut request, 12, u32::from(client));
+        let mut token = [0; 8];
+        getrandom::fill(&mut token)
+            .map_err(|error| anyhow::anyhow!("Cannot identify routed arrival: {error}"))?;
+        put_u64(&mut request, 16, u64::from_le_bytes(token).max(1) as usize);
+        for (index, field) in fields.into_iter().enumerate() {
+            put_u64(&mut request, 24 + index * 8, field);
+        }
+        const INVOKE: &str = ".?AV?$BoundYieldFuncDesc@VBindableFunction@RBX@@$$A6A?AV?$shared_ptr@$$CBUTuple@Reflection@RBX@@@std@@V34@@Z$0A@$00@Reflection@RBX@@";
+        for (index, value) in [
+            relay.instance,
+            relay.owner,
+            types::member(&memory, studio, INVOKE, "Invoke", false)?.1,
+            native[&96],
+            native[&104],
+            native[&112],
+            native[&120],
+            native[&128],
+            native[&136],
+            place as usize,
+            universe as usize,
+            crate::app::update::process_start_identity(std::process::id())
+                .context("Arrival host ended")?
+                .parse()?,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            put_u64(&mut request, 152 + index * 8, value);
+        }
+        put_u32(&mut request, 248, std::process::id());
+        let helper = ensure_helper_loaded(pid, &memory, &loaded)?;
+        let mut lease = Self {
+            memory,
+            entry: helper + helper_export_rva("ReniumTestJoin")?,
+            request,
+        };
+        lease.invoke(1)?;
+        Ok(lease)
+    }
+    fn invoke(&mut self, action: u32) -> Result<()> {
+        put_u32(&mut self.request, 8, action);
+        self.request[256..].fill(0);
+        let mut input = self.memory.allocate(self.request.len())?;
+        self.memory.write(input.address, &self.request)?;
+        let exit = input.run(self.entry, 5000)?;
+        self.memory.read(input.address, &mut self.request)?;
+        let error = error_text_at(&self.request, 256);
+        anyhow::ensure!(exit == 0 && error.is_empty(), "Routed arrival: {error}");
+        Ok(())
+    }
+}
+impl Drop for NativeTestJoin {
+    fn drop(&mut self) {
+        let _ = self.invoke(2);
+    }
+}
 impl NativePlayJoin {
     pub(crate) fn prepare(pid: u32, title: &str, shared_launch: bool) -> Result<Self> {
         let loaded = modules(pid)?;

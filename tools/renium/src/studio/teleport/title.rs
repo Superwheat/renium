@@ -108,6 +108,30 @@ pub(super) struct Lease {
     worker: Option<thread::JoinHandle<()>>,
 }
 
+#[cfg(windows)]
+pub(super) struct ClientCaption(Caption);
+#[cfg(windows)]
+impl ClientCaption {
+    pub(super) fn start(pid: u32) -> Result<Self> {
+        let identity =
+            crate::app::update::process_start_identity(pid).context("Teleport client ended")?;
+        let (hwnd, ordinary) = crate::studio::input::teleport_caption_window(pid)?;
+        let cleanup =
+            crate::studio::native::serializer::NativePlayCaption::arm(pid, &ordinary, hwnd)?;
+        Ok(Self(Caption {
+            pid,
+            identity,
+            hwnd,
+            ordinary,
+            written: None,
+            cleanup,
+        }))
+    }
+    pub(super) fn update(&mut self, name: Option<&str>, transitioning: bool) -> Result<()> {
+        self.0.update(name, transitioning)
+    }
+}
+
 impl Lease {
     pub(super) fn start(bridge: &Arc<BridgeServer>, session: &Session) -> Result<Self> {
         #[cfg(windows)]

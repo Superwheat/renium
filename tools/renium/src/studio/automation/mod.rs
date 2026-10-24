@@ -1237,6 +1237,7 @@ fn new_play_launch(bridge: &BridgeServer, label: &str) -> Result<TestLaunch> {
 fn cancel_test_launch_best_effort(bridge: &BridgeServer, launch: &TestLaunch) {
     request_play_runtimes_to_stop(
         bridge,
+        &launch.edit_runtime_id,
         &test_launch_clients(bridge, launch),
         Some(&launch.nonce),
     );
@@ -3412,8 +3413,38 @@ fn retire_play_clients(bridge: &BridgeServer, clients: &[Value]) {
     }
 }
 
+fn play_stop_runtimes<'a>(clients: &'a [Value], edit: Option<&Value>) -> Vec<&'a Value> {
+    let source = edit
+        .and_then(|edit| {
+            clients.iter().find(|client| {
+                client["role"] == BRIDGE_ROLE_PLAY_SERVER
+                    && client["placeId"] == edit["placeId"]
+                    && client["gameId"] == edit["gameId"]
+            })
+        })
+        .or_else(|| {
+            let mut servers = clients
+                .iter()
+                .filter(|client| client["role"] == BRIDGE_ROLE_PLAY_SERVER);
+            let only = servers.next()?;
+            servers.next().is_none().then_some(only)
+        });
+    // Destination servers share the root executor. Sending EndTest from each
+    // one concurrently completes that executor twice and can crash Edit.
+    // Their process lifetime is already bound to the source server's exit.
+    // A solo teleport has only its current server, which must still stop.
+    clients
+        .iter()
+        .filter(|client| {
+            client["role"] != BRIDGE_ROLE_PLAY_SERVER
+                || source.is_some_and(|source| std::ptr::eq(*client, source))
+        })
+        .collect()
+}
+
 fn request_play_runtimes_to_stop(
     bridge: &BridgeServer,
+    edit_runtime_id: &str,
     clients: &[Value],
     launch_nonce: Option<&str>,
 ) {
@@ -3426,7 +3457,11 @@ fn request_play_runtimes_to_stop(
             Value::String(launch_nonce.to_string()),
         );
     }
-    for client in clients {
+    let inventory = bridge.list_bridge_clients();
+    let edit = inventory.iter().find(|row| {
+        row["role"] == BRIDGE_ROLE_EDIT && row["runtimeId"] == edit_runtime_id
+    });
+    for client in play_stop_runtimes(clients, edit) {
         let target = match client.get("role").and_then(Value::as_str) {
             Some(BRIDGE_ROLE_PLAY_SERVER) => BridgeTarget::Main,
             Some(BRIDGE_ROLE_PLAY_CLIENT) => BridgeTarget::Client,
@@ -3612,7 +3647,12 @@ fn stop_studio_play_with_bridge_result(bridge: &BridgeServer) -> Result<Value> {
             );
         }
         params.insert("waitForStopped".to_string(), Value::Bool(false));
-        request_play_runtimes_to_stop(bridge, &active_clients, launch_nonce.as_deref());
+        request_play_runtimes_to_stop(
+            bridge,
+            &edit_runtime_id,
+            &active_clients,
+            launch_nonce.as_deref(),
+        );
         let stop_result = bridge.call_for_runtime_with_timeout(
             "startStopPlay",
             Value::Object(params),
@@ -3743,6 +3783,21 @@ pub(crate) struct TestLaunch {
 #[cfg(test)]
 mod play_state_tests {
     use super::*;
+
+    #[test]
+    fn teleport_stop_completes_only_the_source_executor_and_still_stops_solo_arrivals() {
+        let edit = json!({"placeId":11,"gameId":7});
+        let source = json!({"role":"play-server","placeId":11,"gameId":7});
+        let destination = json!({"role":"play-server","placeId":12,"gameId":7});
+        let client = json!({"role":"play-client","placeId":12,"gameId":7});
+        let multi = [destination.clone(), client.clone(), source.clone()];
+        assert_eq!(play_stop_runtimes(&multi, Some(&edit)), [&client, &source]);
+        let solo = [destination.clone(), client.clone()];
+        assert_eq!(play_stop_runtimes(&solo, Some(&edit)), [&destination, &client]);
+        let third = json!({"role":"play-server","placeId":13,"gameId":7});
+        let disconnected_source = [destination, client.clone(), third];
+        assert_eq!(play_stop_runtimes(&disconnected_source, Some(&edit)), [&client]);
+    }
 
     #[test]
     fn camera_readback_checks_direction_as_well_as_position() {

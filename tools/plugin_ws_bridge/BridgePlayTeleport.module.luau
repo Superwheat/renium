@@ -11,6 +11,8 @@ function Teleport.create(context)
 	local clientId, clientPhase, clientTouched = 0, "idle", os.clock()
 	local active, generation = true, 0
 	local nativeRelay
+	local routeRelay
+	local routeJoinRelay
 	local emulatedPlaceId
 	local nativeRequests = {}
 	local function finishNative(id, message)
@@ -239,6 +241,13 @@ function Teleport.create(context)
 				task.wait()
 			end
 		end,
+		completeRoute = function(params)
+			state.advance(params.id, "loading", "arriving")
+			state.complete(params.id)
+		end,
+		addRouteClient = function()
+			game:GetService("StudioTestService"):AddPlayers(1)
+		end,
 		arm = function()
 			state.arm()
 			armedOnce = true
@@ -272,6 +281,39 @@ function Teleport.create(context)
 	local function handle(params)
 		assert(params.runtimeId == context.runtimeId and active, "Teleport runtime changed")
 		assert(RunService:IsStudio() and not RunService:IsEdit(), "Teleport is only available in Play")
+		if params.action == "routeJoin" then
+			if routeJoinRelay then routeJoinRelay:Destroy() end
+			routeJoinRelay = Instance.new("BindableFunction")
+			routeJoinRelay.Name = "__ReniumRouteJoin_" .. context.runtimeId
+			routeJoinRelay.OnInvoke = function() return params.join, params.join.TeleportData end
+			routeJoinRelay.Parent = game:GetService("CoreGui")
+			return { ok = true, path = { "CoreGui", routeJoinRelay.Name } }
+		end
+		if params.action == "routeVerify" then
+			local player = if context.role == "play-client" then game:GetService("Players").LocalPlayer
+				else game:GetService("Players"):GetPlayerByUserId(params.userId)
+			assert(player, "Routed player did not arrive")
+			return { ok = true, join = player:GetJoinData(),
+				data = if context.role == "play-client" then game:GetService("TeleportService"):GetLocalPlayerTeleportData() else nil }
+		end
+		if params.action == "routeArrival" then
+			assert(context.role == "play-client", "Only a routed client can arrive")
+			game:SetAttribute("__ReniumLaunchNonce", params.nonce)
+			game:SetAttribute("__ReniumEditRuntimeId", params.owner)
+			return { ok = true }
+		end
+		if params.action == "clientRoute" then
+			assert(context.role == "play-client" and clientPhase == "loading" and params.id == clientId,
+				"Client is not preparing this teleport")
+			assert(type(params.configuration) == "table" and params.configuration.LaunchTask == "StartClient",
+				"Invalid client route configuration")
+			if routeRelay then routeRelay:Destroy() end
+			routeRelay = Instance.new("BindableFunction")
+			routeRelay.Name = "__ReniumTeleportRoute_" .. context.runtimeId
+			routeRelay.OnInvoke = function() return params.configuration end
+			routeRelay.Parent = game:GetService("CoreGui")
+			return { ok = true, path = { "CoreGui", routeRelay.Name } }
+		end
 		if params.action == "nativeArrival" then
 			local player = if context.role == "play-client" then game:GetService("Players").LocalPlayer
 				else game:GetService("Players"):GetPlayers()[1]
@@ -302,6 +344,14 @@ function Teleport.create(context)
 		if nativeRelay then
 			nativeRelay:Destroy()
 			nativeRelay = nil
+		end
+		if routeRelay then
+			routeRelay:Destroy()
+			routeRelay = nil
+		end
+		if routeJoinRelay then
+			routeJoinRelay:Destroy()
+			routeJoinRelay = nil
 		end
 		if unloading and shim then
 			shim:Destroy()

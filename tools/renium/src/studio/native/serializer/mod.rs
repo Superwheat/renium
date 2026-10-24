@@ -17,9 +17,15 @@ pub(crate) use windows::NativePlayLoad;
 #[cfg(windows)]
 pub(crate) use windows::NativeTeleportDispatch;
 #[cfg(windows)]
+pub(crate) use windows::NativeTestJoin;
+#[cfg(windows)]
 pub(crate) use windows::notify_teleport_gui;
 #[cfg(windows)]
 pub(crate) use windows::{AudioOutputGate, keep_selection_across_undo, suppress_package_notices};
+#[cfg(windows)]
+pub(crate) use windows::{
+    prepare_test_client, rejoin_test_client, start_destination_server, test_client_configuration,
+};
 
 use std::time::Duration;
 

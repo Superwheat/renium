@@ -534,4 +534,6 @@ extern "C" __declspec(dllexport) LRESULT CALLBACK ReniumLaunchHook(
     return CallNextHookEx(nullptr, code, wparam, lparam);
 }
 
+#include "renium_test_route_windows.h"
 #include "renium_launch_windows_process.h"
+#include "renium_test_server_windows.h"

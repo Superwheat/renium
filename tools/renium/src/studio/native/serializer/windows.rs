@@ -10,11 +10,16 @@ pub(super) use probes::probe_operation;
 #[path = "windows_playtest.rs"]
 mod playtest;
 pub(crate) use playtest::caption::NativePlayCaption;
+pub(crate) use playtest::client::{
+    prepare_test_client, rejoin_test_client, test_client_configuration,
+};
 pub(super) use playtest::discover as playtest_discovery;
 pub(crate) use playtest::dispatch::NativeTeleportDispatch;
 pub(crate) use playtest::gui::notify_teleport_gui;
 pub(crate) use playtest::join::NativePlayJoin;
+pub(crate) use playtest::join::NativeTestJoin;
 pub(crate) use playtest::loader::NativePlayLoad;
+pub(crate) use playtest::server::start_destination_server;
 use std::ffi::{OsStr, c_void};
 use std::fs;
 use std::io::Read;

@@ -1,6 +1,6 @@
 # Playtest teleport in Studio
 
-Start solo Play with `rbx play -s`. On Windows, Renium intercepts the owned server's `TeleportService:TeleportAsync(placeId, players, options)`, including startup PlayerAdded calls. The call returns a native TeleportAsyncResult. No game adapter is needed when `play -s` reports `trigger: "teleport-service"`.
+Start solo Play with `rbx play -s`, or Server & Clients with `rbx play -s --players 2`. On Windows, Renium intercepts the owned server's `TeleportService:TeleportAsync(placeId, players, options)`, including startup PlayerAdded calls. The call returns a native TeleportAsyncResult. No game adapter is needed when `play -s` reports `trigger: "teleport-service"`.
 
 Use published IDs and Open Cloud metadata, saved history and delivery read access: `RENIUM/opencloud.md`. Each attempt authorizes the destination and selects its newest **saved** version, including unpublished saves. Unreadable history or destinations fail before leaving. Cached bytes never replace authorization.
 
@@ -14,7 +14,11 @@ Stop preserves the original Edit model and its unsaved work. Further teleports u
 
 On Windows, the title shows `Teleporting...` immediately, then the resolved destination. Roblox's installed default loading screen runs in both directions. Arrival adds ` - Teleported to <destination displayName>`; return removes it. Stop, disconnect or daemon exit restores the title without focus or movement; a process-local lease covers abrupt exit. After daemon restart, `rbx play -s` rearms completed arrivals; interrupted ones return to Edit.
 
-The current executor supports solo Play/Play Here and same-universe destinations. Server & Clients routing, partial groups, reserved-server codes, ShouldReserveServer and JobId targeting are refused. Custom teleport GUIs are not transferred. TeleportOptions data must be JSON-compatible and at most 64 KiB for the group.
+The current executor supports solo Play/Play Here and Server & Clients with same-universe destinations. Reserved-server codes, ShouldReserveServer and JobId targeting are refused. Custom teleport GUIs are not transferred. TeleportOptions data must be JSON-compatible and at most 64 KiB for the group.
+
+In Server & Clients, only the selected clients travel, retaining their process and window. The first arrival starts one destination test server; later arrivals reuse it and its saved version, even after every player leaves. Back-teleports rejoin the original source server. Root Stop ends all source and destination test processes, including an interrupted arrival. The original Edit model stays intact. First travel includes Studio server startup; subsequent hops reuse the running server.
+
+Studio allocates fresh test-player names and negative UserIds when clients reconnect. The client window persists, but a return can change Player1 to Player3. Use the player names reported by `rbx cs` for later client commands. Native GetJoinData and local TeleportData carry the previous place and supplied data. Multiplayer recovery after a daemon restart is not currently supported; Stop and restart the test.
 
 ## Compatibility mode
 

@@ -1,7 +1,10 @@
 //! Studio teleport sessions rooted in the original Edit controller.
 mod cache;
+#[cfg(windows)]
+mod multiplayer;
 mod native;
 mod payload;
+mod routing;
 mod title;
 pub(crate) use native::Dispatch;
 
@@ -32,6 +35,7 @@ struct Session {
     logical_place: i64,
     root_nonce: String,
     prefer_native: bool,
+    multiplayer: bool,
 }
 
 #[derive(Default)]
@@ -161,6 +165,7 @@ impl Session {
             logical_place: source,
             root_nonce: text_field(info, "launchNonce")?,
             prefer_native: true,
+            multiplayer: false,
         })
     }
 
@@ -249,8 +254,10 @@ impl Attempt {
         );
         let players = self.players.iter().collect::<HashSet<_>>();
         ensure!(
-            players.len() == self.players.len() && players == clients.keys().collect(),
-            "Teleport emulation moves the whole session; teleport every connected player together"
+            !players.is_empty()
+                && players.len() == self.players.len()
+                && players.iter().all(|player| clients.contains_key(*player)),
+            "Teleport player group changed or contains duplicate players"
         );
         let data = self
             .data
@@ -326,7 +333,7 @@ pub(crate) fn enable(
     let runtime = bridge
         .play_runtime_for_selector(BridgeTarget::Server, None)
         .context("No play server for teleport emulation")?;
-    if mode != "play" {
+    if mode != "play" && !cfg!(windows) {
         let reason = "Server & Clients teleport requires destination server routing; teleport currently supports solo Play/Play Here only";
         let _ = call(
             bridge,
@@ -345,6 +352,12 @@ pub(crate) fn enable(
     let mut session = Session::from_info(info)?;
     session.retain_origin(&inventory)?;
     session.prefer_native = prefer_native;
+    session.multiplayer = bridge.studio_pid_for_runtime(BridgeTarget::Server, &runtime)?
+        != bridge.studio_pid_for_runtime(BridgeTarget::Edit, &session.owner)?;
+    ensure!(
+        !session.multiplayer || cfg!(windows) && prefer_native,
+        "Server & Clients travel requires native teleport on Windows"
+    );
     session.clients(&inventory)?;
     {
         let mut registry = SESSIONS.get_or_init(Default::default).lock_recover();
@@ -357,7 +370,7 @@ pub(crate) fn enable(
         }
     }
     let armed = (|| -> Result<Value> {
-        if dispatch.is_none() {
+        if dispatch.is_none() && !session.multiplayer {
             native::reconcile(bridge, &session)?;
         }
         let armed = call(bridge, &runtime, BridgeTarget::Server, "arm", json!({}))?;
@@ -471,6 +484,10 @@ fn travel(
     title: &title::Lease,
     dispatch: &mut native::Dispatch,
 ) -> Result<()> {
+    ensure!(
+        attempt.players.len() == clients.len(),
+        "Content emulation moves the whole session; teleport every connected player together"
+    );
     let started = std::time::Instant::now();
     title.transition(None)?;
     let mut params = json!({"id":attempt.id,"placeId":attempt.place_id,"sourcePlaceId":session.source,
@@ -659,6 +676,10 @@ fn watch(
     session: &mut Session,
     dispatch: Option<Dispatch>,
 ) -> Result<()> {
+    #[cfg(windows)]
+    if session.multiplayer {
+        return multiplayer::watch(bridge, session, dispatch);
+    }
     let title = title::Lease::start(bridge, session)?;
     if session.logical_place != session.source {
         let name = crate::cloud::teleport::display_name(session.universe, session.logical_place)?;

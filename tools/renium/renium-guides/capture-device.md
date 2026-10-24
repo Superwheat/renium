@@ -29,6 +29,7 @@ Render quality decides what a capture shows. `rbx gfx` reports Studio's edit and
 `sc --camera-position -10,5,0 --look-at -20,0,0` accepts negative coordinates. `camera` reports the requested and actual position and direction; `moved: false` means the view was not held. Inspect the image itself. `--studio` captures the Studio window, including its play view during ordinary Play.
 
 Screenshots and silent H.264 MP4 recordings target one window, not the desktop.
+If a teleport changes the viewport dimensions, recordings fit subsequent live frames into the original canvas and report `resizedFrames`.
 Recordings default to 60 FPS (`--fps 1..60`), 60 seconds (`--max-seconds 1..300`), quality 80 (`--quality 0..100`). Keep 60 FPS for clips a person will watch; clips are temporary, size is irrelevant.
 Never minimize a window whose behaviour matters: the one you record, test or read from. Windows and Roblox throttle a minimized or fully covered window, so it stutters; only filler clients that merely need to exist may be minimized. Leave the windows that matter behind your other windows (`rbx so` opens it that way; `rs` restores a minimized one without focus). `re` reports `achievedFps`; `throttled: true` means the window was starved: fix it and record again.
 

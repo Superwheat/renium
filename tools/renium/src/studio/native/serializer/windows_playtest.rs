@@ -7,6 +7,8 @@ use std::collections::{BTreeSet, VecDeque};
 
 #[path = "windows_playtest_caption.rs"]
 pub(super) mod caption;
+#[path = "windows_playtest_client.rs"]
+pub(super) mod client;
 
 #[path = "windows_playtest_dispatch.rs"]
 pub(super) mod dispatch;
@@ -25,6 +27,8 @@ mod live;
 pub(super) mod loader;
 #[path = "windows_playtest_owner.rs"]
 pub(super) mod owner;
+#[path = "windows_playtest_server.rs"]
+pub(super) mod server;
 #[cfg(test)]
 #[path = "windows_playtest_tests.rs"]
 mod tests;

@@ -1183,6 +1183,50 @@ impl BridgeServer {
             .insert(runtime_id.to_string(), team_create);
     }
 
+    /// A native client replacement retains the OS process but creates a new
+    /// bridge. Refresh its explicitly stamped root ownership on every channel.
+    #[cfg(windows)]
+    pub(crate) fn refresh_routed_client(&self, runtime: &str, pid: u32) -> Result<()> {
+        let value = self.call_for_runtime_with_timeout(
+            "getBridgeInfo",
+            json!({}),
+            BridgeTarget::Client,
+            runtime,
+            Some(Duration::from_secs(3)),
+        )?;
+        let info: BridgeInfoPayload = serde_json::from_value(value)?;
+        anyhow::ensure!(
+            info.runtime_id == runtime
+                && info.bridge_role == BRIDGE_ROLE_PLAY_CLIENT
+                && !info.launch_edit_runtime_id.is_empty()
+                && !info.launch_nonce.is_empty(),
+            "Routed client did not retain its root ownership"
+        );
+        for channel in &self.channels {
+            let connections = channel.sockets.lock_recover().clone();
+            for (key, connection) in connections.into_iter().filter(|(_, connection)| {
+                connection.studio_pid == Some(pid) && connection.bridge_info.runtime_id == runtime
+            }) {
+                {
+                    let mut socket = connection.io.lock_recover();
+                    anyhow::ensure!(
+                        socket.bridge_info.runtime_id == runtime,
+                        "Routed client changed"
+                    );
+                    socket.bridge_info = info.clone();
+                }
+                let mut sockets = channel.sockets.lock_recover();
+                if let Some(current) = sockets.get_mut(&key)
+                    && Arc::ptr_eq(&current.io, &connection.io)
+                {
+                    current.bridge_info = info.clone();
+                }
+                Self::refresh_channel_snapshots(channel, &sockets);
+            }
+        }
+        Ok(())
+    }
+
     fn runtime_role(&self, runtime_id: &str) -> Option<&'static str> {
         for channel in &self.channels {
             for snapshot in Self::cached_channel_snapshots(channel) {
