@@ -62,10 +62,13 @@ function BridgePluginRuntime.withSuppression(studioChanges, callback, params, sc
 end
 
 function BridgePluginRuntime.start(context)
+	local RunService = game:GetService("RunService")
 	-- Published places can still be streaming when plugins start. Local files
 	-- are deserialized before plugins run and do not set DataModel.IsLoaded,
 	-- and some sessions never raise Loaded, so a quiet DataModel also counts.
-	if game.PlaceId > 0 and not game:IsLoaded() then
+	-- Play servers have already loaded their place and may keep creating
+	-- descendants throughout the test; they must not wait for Edit to settle.
+	if RunService:IsEdit() and game.PlaceId > 0 and not game:IsLoaded() then
 		local settledSeconds = 3
 		local lastChange = os.clock()
 		local activity = game.DescendantAdded:Connect(function()
@@ -81,7 +84,6 @@ function BridgePluginRuntime.start(context)
 
 	local HttpService = game:GetService("HttpService")
 	local EncodingService = game:GetService("EncodingService")
-	local RunService = game:GetService("RunService")
 	local ScriptEditorService = game:GetService("ScriptEditorService")
 	local Selection = game:GetService("Selection")
 

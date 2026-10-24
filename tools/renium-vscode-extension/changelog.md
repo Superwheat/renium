@@ -8,6 +8,7 @@
 
 ### Improvements
 
+- Server & Clients tests connect even when the server never reports its place as loaded.
 - Studio recordings keep the whole window across Play and teleport transitions.
 - Commands that change the open Edit window (`rbx l` in Edit, `ps`, `prop`, `del`, `me` and `ai`) now answer with `persistence`: `teamCreate` when the place is in a Team Create session, which syncs the change to Roblox by itself, or `unsaved` when it stays in the Studio session until the user saves or publishes. `rbx status`, `lst` and `lon` report the same field, and every connected Edit window in `status` and `cs` carries `teamCreate`, so it no longer has to be inferred. A plugin that predates the field is asked once per Studio. An agent had added an anchored part to a Team Create place with `rbx l` and told the user to save the place; the guides now say never to ask for a save when `persistence` is `teamCreate`.
 - A project bound to a local place file now selects the Studio that `rbx so FILE` opened when several Studios are connected, instead of refusing with "More than one Studio runtime matches this project" until `--place` is passed. `rbx so` records the opened place beside the project files (as `rbx sx` already did), and that record only breaks ties: a lone Studio is still selected as before.
