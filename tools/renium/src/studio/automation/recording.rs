@@ -18,8 +18,6 @@ use openh264::formats::{RgbaSliceU8, YUVBuffer, YUVSource};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-#[cfg(windows)]
-use super::set_capture_probe_phase;
 use super::{BridgeServer, BridgeTarget, studio_capture_status, wait_for_player_bridge};
 #[cfg(any(windows, target_os = "macos"))]
 use super::{client_viewport_size, recover_client_viewport};
@@ -116,12 +114,10 @@ fn default_quality() -> f32 {
 #[cfg(windows)]
 fn edit_window(
     bridge: &BridgeServer,
-    probe_target: BridgeTarget,
+    _probe_target: BridgeTarget,
 ) -> Result<input_inject::StudioWindow> {
     let pid = bridge.studio_pid_for_selector(BridgeTarget::Edit, None)?;
-    input_inject::verified_studio_window_for_pid(pid, |phase, colors| {
-        set_capture_probe_phase(bridge, probe_target, phase, colors)
-    })
+    input_inject::studio_recording_window(pid)
 }
 
 #[cfg(target_os = "macos")]

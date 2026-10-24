@@ -30,6 +30,7 @@ pub(super) fn probe_operation(
         | NativeOperation::PlayTeleportLoad
         | NativeOperation::PlayTeleportDispatch
         | NativeOperation::PlayTeleportLaunch
+        | NativeOperation::PlayTeleportGui
         | NativeOperation::PlayTeleportJoin => {
             bail!(super::probes::PLAYTEST_UNAVAILABLE)
         }

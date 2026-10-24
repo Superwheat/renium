@@ -10,6 +10,8 @@ pub(super) mod caption;
 
 #[path = "windows_playtest_dispatch.rs"]
 pub(super) mod dispatch;
+#[path = "windows_playtest_gui.rs"]
+pub(super) mod gui;
 #[path = "windows_playtest_image.rs"]
 mod image;
 #[cfg(test)]
@@ -28,6 +30,21 @@ pub(super) mod owner;
 mod tests;
 #[path = "windows_playtest_types.rs"]
 mod types;
+
+#[cfg(test)]
+#[test]
+#[ignore = "requires the explicitly owned Studio process"]
+fn owned_teleport_gui_binding() -> Result<()> {
+    let pid = std::env::var("RENIUM_TELEPORT_TEST_PID")?.parse()?;
+    let memory = ProcessMemory::open_read_only(pid)?;
+    let loaded = modules(pid)?;
+    let studio = &loaded[0];
+    println!(
+        "{}",
+        json!({"base":studio.base,"binding":gui::probe(&memory, studio)?})
+    );
+    Ok(())
+}
 
 const TOTAL_CODE_BYTES: usize = 16 * 1024 * 1024;
 

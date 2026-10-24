@@ -327,6 +327,7 @@ impl NativePlayJoin {
         nonce: &str,
         dispatch: u64,
         attempt: u64,
+        root: Option<&dispatch::NativeTeleportDispatch>,
     ) -> Result<()> {
         anyhow::ensure!(
             !nonce.is_empty() && nonce.len() < 128,
@@ -335,13 +336,17 @@ impl NativePlayJoin {
         let loaded = modules(self.pid)?;
         let studio = loaded.first().context("Studio process ended")?;
         let title = crate::studio::input::studio_window_title(self.pid)?;
-        let model = active_data_model(
-            self.pid,
-            &self.memory,
-            studio,
-            package_layout(&studio.path)?.data,
-            &title,
-        )?;
+        let model = if let Some(root) = root {
+            root.root_model(studio)?
+        } else {
+            active_data_model(
+                self.pid,
+                &self.memory,
+                studio,
+                package_layout(&studio.path)?.data,
+                &title,
+            )?
+        };
         let instance = model.outer + model.layout.data_model_instance;
         let place =
             integer_property_layout(&self.memory, studio, instance, model.layout, "PlaceId")?;

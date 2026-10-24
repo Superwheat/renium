@@ -17,6 +17,8 @@ pub(crate) use windows::NativePlayLoad;
 #[cfg(windows)]
 pub(crate) use windows::NativeTeleportDispatch;
 #[cfg(windows)]
+pub(crate) use windows::notify_teleport_gui;
+#[cfg(windows)]
 pub(crate) use windows::{AudioOutputGate, keep_selection_across_undo, suppress_package_notices};
 
 use std::time::Duration;

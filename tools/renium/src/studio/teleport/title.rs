@@ -13,7 +13,7 @@ struct Caption {
 
 #[cfg(windows)]
 impl Caption {
-    fn update(&mut self, destination: Option<&str>) -> Result<()> {
+    fn update(&mut self, destination: Option<&str>, transitioning: bool) -> Result<()> {
         use crate::studio::input::{teleport_caption_update, teleport_caption_window};
         ensure!(
             crate::app::update::process_start_identity(self.pid).as_deref() == Some(&self.identity),
@@ -31,15 +31,30 @@ impl Caption {
             self.ordinary.clone_from(&current);
         }
         let next = destination.map_or_else(
-            || self.ordinary.clone(),
-            |name| format!("{} - Teleported to {name}", self.ordinary),
+            || {
+                if transitioning {
+                    format!("{} - Teleporting...", self.ordinary)
+                } else {
+                    self.ordinary.clone()
+                }
+            },
+            |name| {
+                let state = if transitioning {
+                    "Teleporting"
+                } else {
+                    "Teleported"
+                };
+                format!("{} - {state} to {name}", self.ordinary)
+            },
         );
         if next != current {
-            self.cleanup
-                .update(&self.ordinary, destination.map(|_| next.as_str()))?;
+            self.cleanup.update(
+                &self.ordinary,
+                (transitioning || destination.is_some()).then_some(next.as_str()),
+            )?;
             teleport_caption_update(self.pid, self.hwnd, &current, &next)?;
         }
-        self.written = destination.map(|_| next);
+        self.written = (transitioning || destination.is_some()).then_some(next);
         Ok(())
     }
 }
@@ -52,22 +67,30 @@ struct State {
     retired: bool,
     session: Option<Session>,
     transitioning: bool,
+    transition_name: Option<String>,
 }
 
 #[cfg(windows)]
 impl State {
     fn apply(&mut self) -> Result<()> {
         for caption in &mut self.captions {
-            caption.update(self.destination.as_deref())?;
+            let name = if self.transitioning {
+                &self.transition_name
+            } else {
+                &self.destination
+            };
+            caption.update(name.as_deref(), self.transitioning)?;
         }
         Ok(())
     }
 
     fn restore(&mut self) {
         self.destination = None;
+        self.transitioning = false;
+        self.transition_name = None;
         for caption in &mut self.captions {
             if caption.written.is_some()
-                && let Err(error) = caption.update(None)
+                && let Err(error) = caption.update(None, false)
             {
                 crate::app::output::log_global(
                     2,
@@ -153,7 +176,7 @@ impl Lease {
                             state.restore();
                             break;
                         }
-                        if state.destination.is_some()
+                        if (state.transitioning || state.destination.is_some())
                             && let Err(error) = state.apply()
                         {
                             crate::app::output::log_global(
@@ -186,6 +209,7 @@ impl Lease {
             let mut state = self.state.lock_recover();
             ensure!(!state.retired, "Teleport caption session ended");
             state.destination = (!at_source).then(|| name.to_owned());
+            state.transitioning = false;
             state.apply()
         }
         #[cfg(not(windows))]
@@ -195,14 +219,33 @@ impl Lease {
         }
     }
 
-    pub(super) fn transition(&self) -> Result<()> {
+    pub(super) fn transition(&self, name: Option<&str>) -> Result<()> {
         #[cfg(windows)]
         {
             let mut state = self.state.lock_recover();
             ensure!(!state.retired, "Teleport caption session ended");
             state.transitioning = true;
+            state.transition_name = name.map(str::to_owned);
+            state.apply()?;
         }
+        #[cfg(not(windows))]
+        let _ = name;
         Ok(())
+    }
+
+    pub(super) fn cancel_transition(&self) {
+        #[cfg(windows)]
+        {
+            let mut state = self.state.lock_recover();
+            state.transitioning = false;
+            state.transition_name = None;
+            if let Err(error) = state.apply() {
+                crate::app::output::log_global(
+                    2,
+                    format_args!("[renium] teleport caption restore: {error:#}"),
+                );
+            }
+        }
     }
 
     pub(super) fn rebind(&self, session: &Session, name: &str) -> Result<()> {

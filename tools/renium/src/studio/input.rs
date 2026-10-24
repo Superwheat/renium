@@ -116,6 +116,11 @@ where
 }
 
 #[cfg(windows)]
+pub(crate) fn studio_recording_window(pid: u32) -> Result<StudioWindow> {
+    platform::studio_recording_window(pid)
+}
+
+#[cfg(windows)]
 pub fn process_executable_path(pid: u32) -> Result<std::path::PathBuf> {
     platform::process_executable_path(pid)
 }
@@ -128,11 +133,16 @@ pub fn studio_window_title(pid: u32) -> Result<String> {
 // Keep routing/document identity independent of the transient Play caption.
 #[cfg(any(windows, test))]
 pub(crate) fn ordinary_studio_title(title: &str) -> &str {
-    title
-        .split_once(" - Roblox Studio - Teleported to ")
-        .map_or(title, |(prefix, _)| {
-            &title[..prefix.len() + " - Roblox Studio".len()]
-        })
+    [
+        " - Roblox Studio - Teleported to ",
+        " - Roblox Studio - Teleporting to ",
+        " - Roblox Studio - Teleporting...",
+    ]
+    .into_iter()
+    .find_map(|suffix| title.split_once(suffix))
+    .map_or(title, |(prefix, _)| {
+        &title[..prefix.len() + " - Roblox Studio".len()]
+    })
 }
 
 #[cfg(test)]
@@ -141,7 +151,15 @@ fn teleport_caption_keeps_document_routing_and_normal_title_form() {
     let ordinary = format!("{} - Roblox Studio", 11);
     let decorated = format!("{ordinary} - Teleported to {}", 12);
     assert_eq!(ordinary_studio_title(&decorated), ordinary);
+    assert_eq!(
+        ordinary_studio_title(&format!("{ordinary} - Teleporting to 12")),
+        ordinary
+    );
     assert_eq!(ordinary_studio_title(&ordinary), ordinary);
+    assert_eq!(
+        ordinary_studio_title(&format!("{ordinary} - Teleporting...")),
+        ordinary
+    );
     assert_eq!(
         ordinary_studio_title(" - Teleported to 12"),
         " - Teleported to 12"
@@ -542,6 +560,7 @@ mod platform {
         viewport: isize,
         capture: isize,
         capture_verified: bool,
+        recording_owner: Option<(u32, String)>,
         offset_x: i32,
         offset_y: i32,
         scale_x: f64,
@@ -929,6 +948,7 @@ mod platform {
             viewport: state.render,
             capture: state.render,
             capture_verified: false,
+            recording_owner: None,
             offset_x: 0,
             offset_y: 0,
             scale_x: render_width as f64 / viewport_width as f64,
@@ -1861,6 +1881,34 @@ mod platform {
         })
     }
 
+    // The document renderer is replaced during Play transitions. A Studio
+    // recording follows its owning window so it also captures the handoff and
+    // never follows a destroyed renderer HWND reused by another Qt widget.
+    pub fn studio_recording_window(pid: u32) -> Result<StudioWindow> {
+        let (hwnd, pid, title) = main_studio_window(pid)?;
+        let restored = unsafe { IsIconic(hwnd as HWND) } != 0;
+        if restored {
+            restore_window_at_bottom(hwnd)?;
+        }
+        Ok(StudioWindow {
+            label: window_label(pid, &title, restored),
+            handle: WindowHandle {
+                viewport: hwnd,
+                capture: hwnd,
+                capture_verified: true,
+                recording_owner: Some((
+                    pid,
+                    crate::app::update::process_start_identity(pid)
+                        .context("Studio recording owner ended")?,
+                )),
+                offset_x: 0,
+                offset_y: 0,
+                scale_x: 1.0,
+                scale_y: 1.0,
+            },
+        })
+    }
+
     pub fn verified_studio_window_for_pid<F>(
         pid: u32,
         set_probe_phase: &mut F,
@@ -1884,6 +1932,7 @@ mod platform {
                     viewport: candidate.hwnd,
                     capture: candidate.hwnd,
                     capture_verified: true,
+                    recording_owner: None,
                     offset_x: 0,
                     offset_y: 0,
                     scale_x: 1.0,
@@ -1962,6 +2011,7 @@ mod platform {
             viewport: candidate.hwnd,
             capture: candidate.hwnd,
             capture_verified: true,
+            recording_owner: None,
             offset_x: 0,
             offset_y: 0,
             scale_x: 1.0,
@@ -2112,8 +2162,18 @@ mod platform {
     }
 
     pub fn capture_window_rgba(handle: &WindowHandle) -> Result<(u32, u32, Vec<u8>)> {
+        if let Some((pid, identity)) = &handle.recording_owner {
+            let mut current = 0;
+            unsafe { GetWindowThreadProcessId(handle.capture as HWND, &mut current) };
+            if current != *pid
+                || crate::app::update::process_start_identity(*pid).as_ref() != Some(identity)
+            {
+                bail!("Studio recording owner ended");
+            }
+        }
         capture_hwnd_pixels(handle.capture, !handle.capture_verified)
     }
+
     #[cfg(test)]
     mod viewport_probe_tests {
         use super::*;

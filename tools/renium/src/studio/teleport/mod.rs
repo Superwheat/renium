@@ -268,6 +268,21 @@ impl Attempt {
     }
 }
 
+fn finish_call(result: Value, present: impl FnOnce(&Value) -> Result<()>) -> Result<Value> {
+    ensure_plugin_api_ok(&result)?;
+    // Presentation is independent of destination preparation/commit. A
+    // CoreScript change must never reject an otherwise valid teleport.
+    if let Err(error) = present(&result) {
+        crate::app::output::log_global(
+            2,
+            format_args!(
+                "[renium] teleport loading screen unavailable; travel continues: {error:#}"
+            ),
+        );
+    }
+    Ok(result)
+}
+
 fn call(
     bridge: &BridgeServer,
     runtime: &str,
@@ -284,8 +299,22 @@ fn call(
         runtime,
         Some(Duration::from_secs(60)),
     )?;
-    ensure_plugin_api_ok(&result)?;
-    Ok(result)
+    finish_call(result, |_result| {
+        #[cfg(windows)]
+        if target == BridgeTarget::Client && _result["nativeGui"].is_object() {
+            let result = _result;
+            let path: Vec<String> = serde_json::from_value(result["nativeGui"]["path"].clone())?;
+            let show = result["nativeGui"]["show"]
+                .as_bool()
+                .context("Invalid teleport GUI state")?;
+            let pid = bridge.studio_pid_for_runtime(target, runtime)?;
+            let title = crate::studio::input::studio_window_title(pid)?;
+            crate::studio::native::serializer::notify_teleport_gui(
+                pid, &title, runtime, &path, show,
+            )?;
+        }
+        Ok(())
+    })
 }
 
 pub(crate) fn enable(
@@ -442,6 +471,8 @@ fn travel(
     title: &title::Lease,
     dispatch: &mut native::Dispatch,
 ) -> Result<()> {
+    let started = std::time::Instant::now();
+    title.transition(None)?;
     let mut params = json!({"id":attempt.id,"placeId":attempt.place_id,"sourcePlaceId":session.source,
         "gameId":session.universe,"data":attempt.data});
     params["sourcePlaceId"] = json!(from_place);
@@ -453,6 +484,7 @@ fn travel(
     });
     notify_clients(bridge, clients, "loading", &params)?;
     let destination = crate::cloud::teleport::resolve(session.universe, attempt.place_id)?;
+    title.transition(Some(&destination.display_name))?;
     let selection = native::try_switch(
         bridge,
         session,
@@ -463,6 +495,13 @@ fn travel(
         dispatch,
     )?;
     if selection["mode"] == "native" {
+        crate::app::output::log_global(
+            3,
+            format_args!(
+                "[renium] teleport complete in {} ms",
+                started.elapsed().as_millis()
+            ),
+        );
         return Ok(());
     }
     for (key, value) in selection
@@ -662,6 +701,7 @@ fn watch(
             });
             last = last.max(attempt.id);
             if let Err(error) = result {
+                title.cancel_transition();
                 fail(bridge, session, &clients, &attempt, &error);
             } else {
                 logical_place = attempt.place_id;
@@ -692,6 +732,25 @@ fn watch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loading_screen_failure_cannot_abort_travel_or_hide_a_real_failure() {
+        let accepted = json!({"ok":true,"nativeGui":{"show":true}});
+        assert_eq!(
+            finish_call(accepted.clone(), |_| anyhow::bail!(
+                "Roblox LoadingScript did not initialize"
+            ))
+            .unwrap(),
+            accepted
+        );
+        assert!(
+            finish_call(
+                json!({"ok":false,"error":"Client teleport is busy"}),
+                |_| { panic!("A failed teleport operation must not change its GUI") }
+            )
+            .is_err()
+        );
+    }
 
     fn session() -> Session {
         Session::from_info(

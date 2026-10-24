@@ -16,6 +16,24 @@ pub(in super::super) fn resolve(
     studio: &ModuleEntry,
     model: &ActiveDataModel,
 ) -> Result<Binding> {
+    let execute = types::member(memory, studio, EXECUTE, "ExecutePlayModeAsync", false)?;
+    let (fields, place, universe) = task_binding(memory, studio, model)?;
+    Ok(Binding {
+        execute,
+        fields,
+        place,
+        universe,
+    })
+}
+
+/// Resolve the model's queue independently of the launch dispatch. During Play
+/// that dispatch is already owned by the teleport lease and is not callable
+/// through a fresh reflection binding.
+pub(super) fn task_binding(
+    memory: &ProcessMemory,
+    studio: &ModuleEntry,
+    model: &ActiveDataModel,
+) -> Result<([usize; 16], i64, i64)> {
     let layout = package_layout(&studio.path)?;
     let source = model.outer + model.layout.data_model_instance;
     let test = model
@@ -30,7 +48,6 @@ pub(in super::super) fn resolve(
         test.len() == 1,
         "The Edit model has no unique test controller"
     );
-    let execute = types::member(memory, studio, EXECUTE, "ExecutePlayModeAsync", false)?;
     let (_, args) = types::member(memory, studio, ARGS, "GetTestArgs", false)?;
     let place = integer_property_layout(memory, studio, source, model.layout, "PlaceId")?;
     let universe = integer_property_layout(memory, studio, source, model.layout, "GameId")?;
@@ -48,11 +65,8 @@ pub(in super::super) fn resolve(
     );
     let launch = loader::nonce_bindings(memory, studio, model)?;
     let context = data_model_task_binding(memory, studio, &layout, model)?.field;
-    Ok(Binding {
-        execute,
-        place: identity.0,
-        universe: identity.1,
-        fields: [
+    Ok((
+        [
             source,
             test[0].instance,
             args,
@@ -70,5 +84,7 @@ pub(in super::super) fn resolve(
             memory.read_u64(context.pointer)? as usize,
             studio.base + layout.submit_task,
         ],
-    })
+        identity.0,
+        identity.1,
+    ))
 }

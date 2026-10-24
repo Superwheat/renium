@@ -60,9 +60,30 @@ fn name_with(universe: i64, place: i64, send: impl Fn(Value) -> Result<Value>) -
 fn resolve_with(
     universe: i64,
     place: i64,
-    send: impl Fn(Value) -> Result<Value>,
+    send: impl Fn(Value) -> Result<Value> + Sync,
 ) -> Result<Destination> {
-    let display_name = name_with(universe, place, &send)?;
+    // Membership/name and saved-version authorization are independent reads.
+    // Join both before allowing any cached bytes or download to reach Studio.
+    std::thread::scope(|scope| {
+        let metadata = scope.spawn(|| name_with(universe, place, &send));
+        let saved = resolve_saved(universe, place, &send);
+        let display_name = metadata
+            .join()
+            .map_err(|_| anyhow::anyhow!("Destination metadata request failed"))??;
+        let (saved, location) = saved?;
+        Ok(Destination {
+            display_name,
+            saved,
+            location,
+        })
+    })
+}
+
+fn resolve_saved(
+    universe: i64,
+    place: i64,
+    send: &impl Fn(Value) -> Result<Value>,
+) -> Result<(SavedVersion, String)> {
     let history = place_history(
         |request| {
             send(request)
@@ -95,15 +116,14 @@ fn resolve_with(
         .filter(|value| !value.is_empty())
         .context("Saved-version delivery returned no download location")?
         .to_owned();
-    Ok(Destination {
-        display_name,
-        saved: SavedVersion {
+    Ok((
+        SavedVersion {
             universe,
             place,
             version,
         },
         location,
-    })
+    ))
 }
 
 pub(crate) fn resolve(universe: i64, place: i64) -> Result<Destination> {
@@ -151,7 +171,7 @@ impl Destination {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::sync::Mutex;
 
     #[test]
     fn teleport_download_chooses_saved_over_published_and_refuses_unknown() {
@@ -181,9 +201,9 @@ mod tests {
 
     #[test]
     fn teleport_resolves_any_readable_same_universe_place_and_pins_delivery() {
-        let requests = RefCell::new(Vec::new());
+        let requests = Mutex::new(Vec::new());
         let destination = resolve_with(7, 99, |request| {
-            requests.borrow_mut().push(request.clone());
+            requests.lock().unwrap().push(request.clone());
             Ok(match request["path"].as_str().unwrap() {
                 "/cloud/v2/universes/{universe}/places/{place}" => json!({"status":200,"body":{"path":"universes/7/places/99","displayName":"99"}}),
                 "/place-version-history-api/v1/{place}/history" => json!({"status":200,"body":{"placeVersions":[{"version":10,"isPublished":false},{"version":9,"isPublished":true}]}}),
@@ -194,7 +214,15 @@ mod tests {
         assert_eq!(destination.saved.version, 10);
         assert_eq!(destination.display_name, "99");
         assert_eq!(
-            requests.borrow().last().unwrap()["pathParams"]["versionNumber"],
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|request| request["path"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("/asset-delivery"))
+                .unwrap()["pathParams"]["versionNumber"],
             10
         );
     }
@@ -233,10 +261,15 @@ mod tests {
     #[test]
     fn teleport_rechecks_history_and_delivery_access_before_cached_content() {
         for denied in [1, 2] {
-            let requests = RefCell::new(0);
-            let result = resolve_with(7, 99, |_| {
-                let index = *requests.borrow();
-                *requests.borrow_mut() += 1;
+            let requests = Mutex::new(0);
+            let result = resolve_with(7, 99, |request| {
+                *requests.lock().unwrap() += 1;
+                let index = match request["path"].as_str().unwrap() {
+                    "/cloud/v2/universes/{universe}/places/{place}" => 0,
+                    "/place-version-history-api/v1/{place}/history" => 1,
+                    "/asset-delivery-api/v1/assetId/{assetId}/version/{versionNumber}" => 2,
+                    _ => panic!("Unexpected request: {request}"),
+                };
                 let mut response = match index {
                     0 => {
                         json!({"status":200,"body":{"path":"universes/7/places/99","displayName":"99"}})
@@ -251,7 +284,7 @@ mod tests {
                 Ok(response)
             });
             assert!(result.is_err());
-            assert_eq!(*requests.borrow(), denied + 1);
+            assert_eq!(*requests.lock().unwrap(), denied + 1);
         }
     }
 

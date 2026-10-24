@@ -69,11 +69,19 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 debug = false
 
+# iced-x86 computes instruction lengths with wrapping 32-bit pointer arithmetic.
+# A mapped Studio image can cross that boundary even in a debug build.
+[profile.dev.package.iced-x86]
+overflow-checks = false
+
 [profile.test]
 debug = "line-tables-only"
 
 [profile.test.package."*"]
 debug = false
+
+[profile.test.package.iced-x86]
+overflow-checks = false
 
 [profile.release]
 lto = "thin"

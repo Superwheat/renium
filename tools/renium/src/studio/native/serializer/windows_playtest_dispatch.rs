@@ -3,7 +3,8 @@ use super::*;
 
 const TELEPORT: &str = ".?AV?$BoundYieldFuncDesc@VTeleportService@RBX@@$$A6A?AV?$shared_ptr@VInstance@RBX@@@std@@_JV?$shared_ptr@$$CBV?$vector@V?$shared_ptr@VInstance@RBX@@@std@@V?$allocator@V?$shared_ptr@VInstance@RBX@@@std@@@2@@std@@@4@V34@@Z$0A@$02@Reflection@RBX@@";
 const INVOKE: &str = ".?AV?$BoundYieldFuncDesc@VBindableFunction@RBX@@$$A6A?AV?$shared_ptr@$$CBUTuple@Reflection@RBX@@@std@@V34@@Z$0A@$00@Reflection@RBX@@";
-const INSTANCE: &str = ".?AV?$TType@V?$shared_ptr@VInstance@RBX@@@std@@$0A@@Reflection@RBX@@";
+pub(super) const INSTANCE: &str =
+    ".?AV?$TType@V?$shared_ptr@VInstance@RBX@@@std@@$0A@@Reflection@RBX@@";
 const RESULT_CREATOR: &str = ".?AV?$NonCreatableCreator@VTeleportAsyncResult@RBX@@@RBX@@";
 pub(super) const TABLE: &str =
     ".?AV?$TType@V?$shared_ptr@$$CBVValueTable@Reflection@RBX@@@std@@$0A@@Reflection@RBX@@";
@@ -40,6 +41,7 @@ pub(crate) struct NativeTeleportDispatch {
     memory: ProcessMemory,
     entrypoint: usize,
     request: Vec<u8>,
+    root: Option<CachedDataModel>,
 }
 
 // The Windows process handle belongs to this lease and is valid on any host
@@ -150,6 +152,12 @@ impl NativeTeleportDispatch {
             memory,
             entrypoint: helper + helper_export_rva("ReniumPlayTeleport")?,
             request,
+            root: launch_nonce.map(|_| CachedDataModel {
+                title: title.to_owned(),
+                outer: model.outer,
+                owner: model.owner,
+                layout: model.layout,
+            }),
         };
         lease.invoke(1)?;
         Ok(lease)
@@ -179,6 +187,19 @@ impl NativeTeleportDispatch {
         self.request[624] != 0
     }
 
+    pub(crate) fn has_root(&self) -> bool {
+        self.root.is_some()
+    }
+
+    pub(super) fn root_model(&self, studio: &ModuleEntry) -> Result<ActiveDataModel> {
+        let root = self
+            .root
+            .as_ref()
+            .context("The teleport has no retained Edit controller")?;
+        refresh_active_data_model(&self.memory, studio, &root.title, root)
+            .context("The original teleport Edit controller ended")
+    }
+
     pub(crate) fn advance(&mut self, place: i64, nonce: &str) -> Result<()> {
         anyhow::ensure!(
             place > 0 && !nonce.is_empty() && nonce.len() < 128,
@@ -202,6 +223,12 @@ impl NativeTeleportDispatch {
             put_u64(&mut self.request, 592, owner.execute.0);
             put_u64(&mut self.request, 600, owner.execute.1);
             put_u64(&mut self.request, 616, owner.universe as usize);
+            self.root = Some(CachedDataModel {
+                title,
+                outer: model.outer,
+                owner: model.owner,
+                layout: model.layout,
+            });
         }
         put_u64(&mut self.request, 608, place as usize);
         self.request[624..752].fill(0);

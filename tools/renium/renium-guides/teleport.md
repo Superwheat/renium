@@ -2,7 +2,7 @@
 
 Start solo Play with `rbx play -s`. On Windows, Renium intercepts the owned server's `TeleportService:TeleportAsync(placeId, players, options)`, including startup PlayerAdded calls. The call returns a native TeleportAsyncResult. No game adapter is needed when `play -s` reports `trigger: "teleport-service"`.
 
-Use published source IDs and stored Open Cloud metadata, saved-version history and delivery read access: `RENIUM/opencloud.md`. Each attempt freshly authorizes the destination and selects its newest **saved** version, including unpublished saves. An unreadable history or destination fails before leaving the current test. Cached bytes never replace authorization.
+Use published IDs and Open Cloud metadata, saved history and delivery read access: `RENIUM/opencloud.md`. Each attempt authorizes the destination and selects its newest **saved** version, including unpublished saves. Unreadable history or destinations fail before leaving. Cached bytes never replace authorization.
 
 `playTeleportEnabled` and `playTeleportNative` default to true. `rbx cfg set playTeleportNative false --scope place` selects content emulation; `rbx cfg set playTeleportEnabled false --scope place` disables travel. Restart Play after changes.
 
@@ -12,7 +12,7 @@ The original Studio controller loads the destination's saved place into new serv
 
 Stop preserves the original Edit model and its unsaved work. Further teleports use that same controller. Preparation failures retain the current test; failures after switching starts return to Edit. Runtime identities and launch nonces reject late replies.
 
-On Windows, arrival appends ` - Teleported to <destination displayName>` to the ordinary Studio title. Returning to the source removes it. Stop, disconnect and daemon exit restore the title without activating or moving the window. A process-local cleanup lease also restores it after an abrupt daemon exit. A restarted daemon can rearm completed arrivals with `rbx play -s`; interrupted arrivals return to Edit.
+On Windows, the title shows `Teleporting...` immediately, then the resolved destination. Roblox's installed default loading screen runs in both directions. Arrival adds ` - Teleported to <destination displayName>`; return removes it. Stop, disconnect or daemon exit restores the title without focus or movement; a process-local lease covers abrupt exit. After daemon restart, `rbx play -s` rearms completed arrivals; interrupted ones return to Edit.
 
 The current executor supports solo Play/Play Here and same-universe destinations. Server & Clients routing, partial groups, reserved-server codes, ShouldReserveServer and JobId targeting are refused. Custom teleport GUIs are not transferred. TeleportOptions data must be JSON-compatible and at most 64 KiB for the group.
 

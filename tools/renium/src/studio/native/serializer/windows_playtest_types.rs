@@ -51,7 +51,9 @@ pub(super) fn singleton(
     }
     let mapped = observation::ImageView::open(&studio.path)?;
     let pe = PeImage::parse(mapped.bytes())?;
-    let anchors = image::anchors(&pe, &[kind.into()])?;
+    // Some typed event signatures exceed the diagnostic anchor limit. Match
+    // their bounded prefix here, then require the complete RTTI below.
+    let anchors = image::anchors(&pe, &[kind.chars().take(256).collect()])?;
     let tables = image::rtti(&pe, &anchors)?
         .into_iter()
         .filter(|row| row["type"] == kind && row["offsetToTop"] == 0)

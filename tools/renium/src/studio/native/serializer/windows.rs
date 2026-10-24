@@ -12,6 +12,7 @@ mod playtest;
 pub(crate) use playtest::caption::NativePlayCaption;
 pub(super) use playtest::discover as playtest_discovery;
 pub(crate) use playtest::dispatch::NativeTeleportDispatch;
+pub(crate) use playtest::gui::notify_teleport_gui;
 pub(crate) use playtest::join::NativePlayJoin;
 pub(crate) use playtest::loader::NativePlayLoad;
 use std::ffi::{OsStr, c_void};

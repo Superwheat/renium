@@ -6,7 +6,7 @@ function Teleport.create(context)
 	local HttpService = game:GetService("HttpService")
 	local EncodingService = game:GetService("EncodingService")
 	local state = context.state.create(os.clock)
-	local gui = if context.role == "play-client" then context.gui.create() else nil
+	local gui = if context.role == "play-client" then context.gui.create(context.runtimeId) else nil
 	local upload, roots, prepared, bundle, paused, shim, shimError, clientSettings
 	local clientId, clientPhase, clientTouched = 0, "idle", os.clock()
 	local active, generation = true, 0
@@ -89,11 +89,8 @@ function Teleport.create(context)
 			paused = nil
 		end
 		clientPhase = if stopRequired then "failed" else "idle"
-		if not gui.get() then
-			gui.show({ placeId = params.placeId or 0 })
-		end
 		gui.fail(params.error, stopRequired)
-		return { ok = true, stopRequired = stopRequired }
+		return { ok = true, stopRequired = stopRequired, nativeGui = gui.native() }
 	end
 	local function handleClient(params)
 		assert(type(params.id) == "number" and params.id % 1 == 0 and params.id >= clientId
@@ -133,7 +130,7 @@ function Teleport.create(context)
 		else
 			error("Unsupported client teleport operation")
 		end
-		return { ok = true }
+		return { ok = true, nativeGui = gui.native() }
 	end
 	local function begin(params)
 		state.expect(params.id, "loading")

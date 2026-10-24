@@ -80,6 +80,7 @@ fn engine_probe(
         })),
         NativeOperation::PlayTeleportDispatch => playtest::dispatch::probe(memory, studio, model),
         NativeOperation::PlayTeleportJoin => playtest::join::probe(memory, studio),
+        NativeOperation::PlayTeleportGui => playtest::gui::probe(memory, studio),
         NativeOperation::PlayTeleportLaunch => {
             let dispatch = playtest::dispatch::probe(memory, studio, model)?;
             let owner = playtest::owner::resolve(memory, studio, model)?;

@@ -478,6 +478,7 @@ impl NativePlayLoad {
         destination: (i64, i64),
         bytes: &[u8],
         launch_nonce: &str,
+        root: Option<&dispatch::NativeTeleportDispatch>,
     ) -> Result<Self> {
         anyhow::ensure!(
             source.0 > 0 && source.1 > 0 && destination.0 > 0 && destination.1 == source.1,
@@ -496,7 +497,11 @@ impl NativePlayLoad {
         let memory = ProcessMemory::open(pid)?;
         memory.authorize(NativeOperation::PlayTeleportLoad, title)?;
         let layout = package_layout(&studio.path)?;
-        let model = active_data_model(pid, &memory, studio, layout.data, title)?;
+        let model = if let Some(root) = root {
+            root.root_model(studio)?
+        } else {
+            active_data_model(pid, &memory, studio, layout.data, title)?
+        };
         for (name, expected) in [("PlaceId", source.0), ("GameId", source.1)] {
             let field = integer_property_layout(
                 &memory,
@@ -649,6 +654,7 @@ mod tests {
             (destination, universe),
             &bytes,
             &nonce,
+            None,
         )?;
         println!("PLAY_LOADER_ARMED pid={pid}");
         let deadline = Instant::now() + Duration::from_secs(25);

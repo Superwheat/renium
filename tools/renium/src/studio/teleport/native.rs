@@ -306,7 +306,23 @@ fn switch(
     let transition = format!("teleport-{:032x}", u128::from_le_bytes(random));
     let nonce = format!("{transition}-play");
     let clients = session.clients(&bridge.list_bridge_clients())?;
-    title.transition()?;
+    // Prepare the exact next launch while the source still renders its loading
+    // screen. The retained Edit owner and nonce prevent this input reaching the
+    // current test or another launch.
+    let root = dispatch.lease.as_ref().filter(|lease| lease.has_root());
+    let mut load = if root.is_some() {
+        Some(NativePlayLoad::arm(
+            prepared.pid,
+            &crate::studio::input::studio_window_title(prepared.pid)?,
+            (session.source, session.universe),
+            (attempt.place_id, session.universe),
+            &prepared.bytes.bytes,
+            &nonce,
+            root,
+        )?)
+    } else {
+        None
+    };
     // This is the commit boundary. Every error below escapes normally; no
     // transplant or second native launch may run over an uncertain transition.
     let result = (|| -> Result<()> {
@@ -359,16 +375,21 @@ fn switch(
                 &nonce,
                 prepared.dispatch,
                 attempt.id,
+                dispatch.lease.as_ref().filter(|lease| lease.has_root()),
             )?;
         }
-        let mut load = NativePlayLoad::arm(
-            prepared.pid,
-            &window_title,
-            (session.source, session.universe),
-            (attempt.place_id, session.universe),
-            &prepared.bytes.bytes,
-            &nonce,
-        )?;
+        if load.is_none() {
+            load = Some(NativePlayLoad::arm(
+                prepared.pid,
+                &window_title,
+                (session.source, session.universe),
+                (attempt.place_id, session.universe),
+                &prepared.bytes.bytes,
+                &nonce,
+                None,
+            )?);
+        }
+        let load = load.as_mut().expect("destination input is armed");
         SESSIONS
             .get()
             .context("Teleport root registry ended")?

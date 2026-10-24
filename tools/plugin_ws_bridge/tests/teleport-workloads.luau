@@ -110,6 +110,7 @@ local function runtime(role)
 			dismiss = function() table.insert(guiEvents, "dismiss") end,
 			arrive = function() table.insert(guiEvents, "arrive") end,
 			get = function() return {} end,
+			native = function() return nil end,
 		} end } })
 end
 local function send(api, role, action, values)

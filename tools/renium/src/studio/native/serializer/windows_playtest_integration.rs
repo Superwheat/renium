@@ -226,7 +226,14 @@ fn native_teleport_result_and_first_game_callbacks() -> Result<()> {
     );
     let mut arrival = join::NativePlayJoin::prepare(pid, &title, true)?;
     dispatch.advance(destination, &next)?;
-    arrival.arm(source, destination, &next, dispatch.token(), 1)?;
+    arrival.arm(
+        source,
+        destination,
+        &next,
+        dispatch.token(),
+        1,
+        Some(&dispatch),
+    )?;
     let mut load = loader::NativePlayLoad::arm(
         pid,
         &title,
@@ -234,6 +241,7 @@ fn native_teleport_result_and_first_game_callbacks() -> Result<()> {
         (destination, source.1),
         &arrival_fixture()?,
         &next,
+        Some(&dispatch),
     )?;
     println!("Native source result: {result}");
     let observations = driver.launch(owner, &next)?;

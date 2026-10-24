@@ -115,6 +115,7 @@ while stopped.running and os.clock() < stopDeadline do
 	stopped = api.startStopPlay({})
 end
 assert(stopped.ok and not stopped.running and stopped.teleportTransition == "hop-1")
+assert(stopped.readyForStart, "an owned teleport can restart once its previous executor has finished")
 local stopCount = stops
 assert(api.startStopPlay({ stop = true, launchNonce = "travel-source", teleportTransition = "hop-1" }).ok)
 assert(stops == stopCount, "a repeated transition stop must not stop another launch")

@@ -33,6 +33,7 @@ pub(crate) enum NativeOperation {
     PlayTeleportDispatch,
     PlayTeleportJoin,
     PlayTeleportLaunch,
+    PlayTeleportGui,
 }
 
 impl NativeOperation {
@@ -82,6 +83,7 @@ impl NativeOperation {
             Self::PlayTeleportDispatch => "explicit Play teleport API",
             Self::PlayTeleportJoin => "retain the current Play session",
             Self::PlayTeleportLaunch => "explicit Play teleport API",
+            Self::PlayTeleportGui => "default destination loading screen",
         }
     }
 }

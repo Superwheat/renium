@@ -3180,7 +3180,7 @@ updateMouse()
 			readyForStart = not running
 				and not playSession.starting
 				and not playSession.executionPending
-				and os.clock() >= playSession.readyAt,
+				and (teleportTransition ~= nil or os.clock() >= playSession.readyAt),
 			-- The daemon tells a start Studio ignored (the call returned or never
 			-- showed the test) from one that is still coming up.
 			engineRunning = engineRunning,
