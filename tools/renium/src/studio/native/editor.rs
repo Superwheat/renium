@@ -1822,10 +1822,11 @@ fn decode_native_service_dom(
     );
     if flat.root_indices.len() != native_serialized_root_count(group)? {
         bail!(
-            "Studio native {} snapshot contains {} roots; expected {}",
+            "Studio native {} snapshot contains {} roots; expected {}: Studio changed {} during native export; retry the sync",
             group.service,
             flat.root_indices.len(),
-            native_serialized_root_count(group)?
+            native_serialized_root_count(group)?,
+            group.service
         );
     }
     let marker_index = flat.root_indices[0];
@@ -1845,10 +1846,11 @@ fn decode_native_service_dom(
     let serialized_instance_count = native_serialized_instance_count(group)?;
     if flat.instances.len() != serialized_instance_count {
         bail!(
-            "Studio native {} snapshot contains {} instances; expected {}",
+            "Studio native {} snapshot contains {} instances; expected {}: Studio changed {} during native export; retry the sync",
             group.service,
             flat.instances.len(),
-            serialized_instance_count
+            serialized_instance_count,
+            group.service
         );
     }
     let identity = decode_native_identity(flat.instances, group, serialized_instance_count)?;
@@ -1932,7 +1934,7 @@ fn decode_native_serialization_batch(
     );
     if flat.root_indices.len() != expected_roots {
         bail!(
-            "Studio native serialization batch {} contains {} roots; expected {}",
+            "Studio native serialization batch {} contains {} roots; expected {}: Studio changed the place during native export; retry the sync",
             batch.id,
             flat.root_indices.len(),
             expected_roots
@@ -1940,7 +1942,7 @@ fn decode_native_serialization_batch(
     }
     if flat.instances.len() != expected_instances {
         bail!(
-            "Studio native serialization batch {} contains {} instances; expected {}",
+            "Studio native serialization batch {} contains {} instances; expected {}: Studio changed the place during native export; retry the sync",
             batch.id,
             flat.instances.len(),
             expected_instances

@@ -6,6 +6,10 @@
 
 - Windows solo Play supports TeleportService travel to saved destinations with native server/client models and join data. Travel uses Roblox's default loading screen, updates the window title immediately, and prepares the next launch before leaving the source. Stop restores the original unsaved Edit. A restricted compatibility adapter remains available when native switching is unavailable.
 
+### Bug fixes
+
+- A native capture that found one instance more or fewer than Studio had counted a moment earlier (a collaborator's edit replicating during the capture) is now retried like any other change that lands mid-capture, instead of failing the command that triggered it. An `rbx l --edit` on a Team Create place had been refused once with "Studio native Workspace snapshot contains 14632 instances; expected 14633" and worked on the next try.
+
 ### Improvements
 
 - Server & Clients tests connect even when the server never reports its place as loaded.

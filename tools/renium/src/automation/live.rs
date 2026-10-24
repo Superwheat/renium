@@ -3485,6 +3485,7 @@ mod tests {
             "Bridge method getEditorBinaryOverlayChunk failed: Studio changed Workspace while native sync was staged: Workspace.Car.Body (property CFrame); retry the sync",
             "Bridge method finishEditorBinaryExport failed: Studio changed Workspace during native export; retry the sync",
             "Studio structure changed during native export; retry the sync",
+            "Studio native Workspace snapshot contains 14632 instances; expected 14633: Studio changed Workspace during native export; retry the sync",
         ] {
             assert!(
                 is_concurrent_edit_failure(&anyhow::anyhow!(message)),
