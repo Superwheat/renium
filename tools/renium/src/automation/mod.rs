@@ -240,10 +240,6 @@ pub struct BoundContext {
     pub fingerprint: String,
 }
 
-fn studio_target_path(context: &BoundContext) -> PathBuf {
-    studio_target_path_for_root(Path::new(&context.root))
-}
-
 fn studio_target_path_for_root(root: &Path) -> PathBuf {
     root.join(".renium").join("studio-target.json")
 }
@@ -404,7 +400,7 @@ impl State {
 
     #[cfg(any(windows, target_os = "macos"))]
     pub fn remember_studio_target(&self, context: &BoundContext, target: StudioReopenTarget) {
-        let path = studio_target_path(context);
+        let path = studio_target_path_for_root(Path::new(&context.root));
         if crate::project::version_control::ensure_renium_local_state_ignored(std::path::Path::new(
             &context.root,
         ))
