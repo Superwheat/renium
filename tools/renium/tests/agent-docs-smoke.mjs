@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 
 const repository = path.resolve(import.meta.dirname, "..", "..", "..");
 const executable = path.resolve(process.argv[2] ?? path.join(repository, "tools", "renium", "target", "debug", process.platform === "win32" ? "renium.exe" : "renium"));
@@ -33,6 +34,25 @@ for (const forbidden of ["rbx a ", "local.renium-", "extensions/local.renium", "
 
 // Rust's agent_guide_examples_use_canonical_commands checks inline and fenced
 // examples against the actual CLI definitions, without executing commands.
+
+if (process.argv.includes("--offline")) {
+  const hash = createHash("sha256");
+  for (const file of [agentsPath, ...guideNames.map((name) => path.join(guidesPath, name))]) {
+    hash.update(path.relative(path.dirname(agentsPath), file).replaceAll(path.sep, "/"));
+    hash.update(Buffer.from([0]));
+    hash.update(fs.readFileSync(file));
+  }
+  const resources = path.join(repository, "tools", "renium-vscode-extension", "resources");
+  const expected = `${rootGuide.trimEnd()}\n<!-- renium-instructions: ${hash.digest("hex")} -->\n`;
+  assert.ok(expected.length <= 5_000, "Packaged root guide exceeds 5,000 characters");
+  assert.equal(fs.readFileSync(path.join(resources, "RENIUM.md"), "utf8"), expected);
+  for (const name of guideNames) {
+    assert.equal(fs.readFileSync(path.join(resources, "RENIUM", name), "utf8"),
+      fs.readFileSync(path.join(guidesPath, name), "utf8"));
+  }
+  console.log("Renium agent documentation offline checks passed (CLI generation not executed)");
+  process.exit(0);
+}
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "renium-agent-docs-"));
 try {

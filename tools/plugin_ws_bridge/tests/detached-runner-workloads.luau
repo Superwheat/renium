@@ -188,6 +188,9 @@ local failure = api.collectLuauRunner({ name = "failing" })
 assert(failure.ok and failure.done and failure.status == "error" and string.find(failure.results[1], "boom", 1, true), "collect reports the body's error")
 
 services.RunService.IsRunning = function() return false end
+local stopped = api.executeLuau({ code = "error('must not execute')", context = "plugin" })
+assert(not stopped.ok and stopped.context == "server" and string.find(stopped.error, "restarting", 1, true),
+	"a retiring Play model must not execute code through the Edit path")
 local edit = api.executeLuau({ code = "return 1", context = "plugin", detach = "edit" })
 assert(not edit.ok and string.find(edit.error, "Play", 1, true), "detaching needs Play")
 

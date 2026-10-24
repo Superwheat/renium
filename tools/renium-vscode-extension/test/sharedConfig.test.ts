@@ -28,6 +28,8 @@ test("shared config accepts comments and trailing commas without changing string
   fs.writeFileSync(path.join(projectRoot, "renium.project.jsonc"), `{
     // Line comments are accepted.
     "settings": {
+      "playTeleportEnabled": false,
+      "playTeleportNative": false,
       "services": [
         "Workspace",
         "ReplicatedStorage", // So are trailing array commas.
@@ -42,6 +44,8 @@ test("shared config accepts comments and trailing commas without changing string
 
   try {
     const config = loadSharedConfig(projectRoot, projectRoot);
+    assert.equal(sharedConfigValue(config, "playTeleportEnabled"), false);
+    assert.equal(sharedConfigValue(config, "playTeleportNative"), false);
     assert.deepEqual(sharedConfigValue(config, "services"), ["Workspace", "ReplicatedStorage"]);
     assert.equal(
       sharedConfigValue(config, "gitSync.commitMessageTemplate"),

@@ -12,6 +12,8 @@ mod history;
 #[path = "windows_functions.rs"]
 mod functions;
 pub(super) use functions::binding as function_binding;
+pub(super) use functions::dispatch_code;
+pub(super) use functions::lua_binding;
 
 #[path = "windows_terrain.rs"]
 mod terrain;
@@ -747,6 +749,44 @@ fn scalar_flow(code: &[u8], dispatch: bool) -> Option<(usize, usize)> {
     scalar_flow_mode(code, dispatch, None)
 }
 
+fn scalar_move(
+    i: &Instruction,
+    registers: &HashMap<Register, ScalarValue>,
+    dispatch: bool,
+    setter_width: Option<usize>,
+) -> Option<Option<ScalarValue>> {
+    let src = i.op1_register().full_register();
+    let value = if i.op1_kind() == OpKind::Register {
+        registers.get(&src).copied()
+    } else if setter_width.is_some()
+        && i.op1_kind() == OpKind::Memory
+        && i.memory_index() == Register::None
+        && i.memory_displacement64() == 0
+        && registers.get(&i.memory_base().full_register()) == Some(&ScalarValue::Input)
+    {
+        let width = i.memory_size().size();
+        if Some(width) != setter_width {
+            return None;
+        }
+        Some(ScalarValue::Argument(width))
+    } else if !dispatch && i.op1_kind() == OpKind::Memory && i.memory_index() == Register::None {
+        let ScalarValue::Instance(base) =
+            registers.get(&i.memory_base().full_register()).copied()?
+        else {
+            return None;
+        };
+        let offset = base.checked_add(i.memory_displacement64() as i64)?;
+        let width = i.memory_size().size();
+        if !matches!(width, 1 | 4 | 8) {
+            return None;
+        }
+        Some(ScalarValue::Integer(usize::try_from(offset).ok()?, width))
+    } else {
+        return None;
+    };
+    Some(value)
+}
+
 fn scalar_flow_mode(
     code: &[u8],
     dispatch: bool,
@@ -769,37 +809,7 @@ fn scalar_flow_mode(
         let src = i.op1_register().full_register();
         match i.mnemonic() {
             Mnemonic::Mov | Mnemonic::Movzx if i.op0_kind() == OpKind::Register => {
-                let value = if i.op1_kind() == OpKind::Register {
-                    registers.get(&src).copied()
-                } else if setter_width.is_some()
-                    && i.op1_kind() == OpKind::Memory
-                    && i.memory_index() == Register::None
-                    && i.memory_displacement64() == 0
-                    && registers.get(&i.memory_base().full_register()) == Some(&ScalarValue::Input)
-                {
-                    let width = i.memory_size().size();
-                    if Some(width) != setter_width {
-                        return None;
-                    }
-                    Some(ScalarValue::Argument(width))
-                } else if !dispatch
-                    && i.op1_kind() == OpKind::Memory
-                    && i.memory_index() == Register::None
-                {
-                    let ScalarValue::Instance(base) =
-                        registers.get(&i.memory_base().full_register()).copied()?
-                    else {
-                        return None;
-                    };
-                    let offset = base.checked_add(i.memory_displacement64() as i64)?;
-                    let width = i.memory_size().size();
-                    if !matches!(width, 1 | 4 | 8) {
-                        return None;
-                    }
-                    Some(ScalarValue::Integer(usize::try_from(offset).ok()?, width))
-                } else {
-                    return None;
-                };
+                let value = scalar_move(&i, &registers, dispatch, setter_width)?;
                 registers.remove(&dst);
                 if let Some(value) = value {
                     registers.insert(dst, value);
@@ -824,6 +834,7 @@ fn scalar_flow_mode(
                     OpKind::Immediate8to64 | OpKind::Immediate32to64
                 ) =>
             {
+                nonnull = false;
                 let ScalarValue::Instance(base) = registers.get(&dst).copied()? else {
                     return None;
                 };
@@ -842,10 +853,11 @@ fn scalar_flow_mode(
                     && i.op1_kind() == OpKind::Register
                     && dst == src =>
             {
+                nonnull = false;
                 registers.insert(dst, ScalarValue::Zero);
             }
             Mnemonic::Test
-                if dst == src && registers.get(&dst) == Some(&ScalarValue::Instance(0)) =>
+                if dst == src && matches!(registers.get(&dst), Some(ScalarValue::Instance(_))) =>
             {
                 nonnull = true;
             }
@@ -853,6 +865,16 @@ fn scalar_flow_mode(
                 if nonnull
                     && registers.get(&src) == Some(&ScalarValue::Zero)
                     && matches!(registers.get(&dst), Some(ScalarValue::Instance(_))) => {}
+            // Reflection receives a validated, non-null Instance. Multiple
+            // inheritance can first recover its complete object and then its
+            // property base, with a null guard around each conversion. Follow
+            // the non-null path; all offsets still come from the loaded code.
+            Mnemonic::Je
+                if dispatch
+                    && nonnull
+                    && i.op0_kind() == OpKind::NearBranch64
+                    && i.near_branch_target() > i.next_ip()
+                    && i.near_branch_target() < code.len() as u64 => {}
             Mnemonic::Jmp
                 if dispatch
                     && i.op0_kind() == OpKind::Memory
@@ -1934,6 +1956,40 @@ fn prepare(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn scalar_property_flow_follows_guarded_multiple_inheritance_conversion() {
+        for outer_adjustment in [-0x1f0i32, -0x288, -0x3a0] {
+            for property_base in [0x4c0i32, 0x620] {
+                for field in [8i32, 0x40] {
+                    // Save the binding, recover the outer object, preserve null,
+                    // then convert the non-null object to its property base.
+                    let mut code = vec![0x4c, 0x8b, 0xc1, 0x48, 0x8d, 0x82];
+                    code.extend_from_slice(&outer_adjustment.to_le_bytes());
+                    code.extend_from_slice(&[
+                        0x33, 0xc9, 0x48, 0x85, 0xd2, 0x48, 0x0f, 0x44, 0xc1, 0x48, 0x85, 0xc0,
+                        0x74, 0x07, 0x48, 0x8d, 0x88,
+                    ]);
+                    code.extend_from_slice(&property_base.to_le_bytes());
+                    code.extend_from_slice(&[0x41, 0xff, 0xa0]);
+                    code.extend_from_slice(&field.to_le_bytes());
+                    assert_eq!(
+                        scalar_flow(&code, true),
+                        Some((field as usize, (outer_adjustment + property_base) as usize))
+                    );
+                    let mut wrong_condition = code.clone();
+                    wrong_condition[22] = 0x75; // JNE must not skip the conversion.
+                    assert_eq!(scalar_flow(&wrong_condition, true), None);
+                    let mut clobbered_flags = code.clone();
+                    clobbered_flags.splice(22..22, [0x45, 0x33, 0xc9]);
+                    assert_eq!(scalar_flow(&clobbered_flags, true), None);
+                    let mut unknown_receiver = code;
+                    unknown_receiver[21] = 0xdb; // TEST RBX,RBX has no proven receiver.
+                    assert_eq!(scalar_flow(&unknown_receiver, true), None);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn scalar_property_flow_follows_relocated_member_and_receiver() {
         // Zero-preserving receiver conversion, followed by the engine member.
         for field in [8i32, 0x30, 0x200] {
@@ -1968,14 +2024,17 @@ mod tests {
 
     #[test]
     fn engine_allocator_preserves_history_strings_and_delayed_callbacks() {
-        let status = std::process::Command::new(
+        let result = std::process::Command::new(
             std::path::Path::new(env!("OUT_DIR")).join("allocator-test/renium-allocator-test.exe"),
         )
-        .status()
+        .output()
         .expect("run isolated allocator regression");
         assert!(
-            status.success(),
-            "allocator ownership regression failed: {status}"
+            result.status.success(),
+            "allocator ownership regression failed: {}\n{}\n{}",
+            result.status,
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
         );
     }
 

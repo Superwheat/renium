@@ -8,7 +8,7 @@ struct Binding {
     code: Vec<(usize, Vec<u8>)>,
 }
 
-type BindingKey = ([u32; 3], usize);
+type BindingKey = ([u32; 3], usize, bool);
 static BINDINGS: OnceLock<Mutex<HashMap<BindingKey, Binding>>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,6 +22,7 @@ enum Value {
     Pointer(Storage, i64),
     Bytes(Storage, i64, usize),
     Instance,
+    Lua,
     Adjustment(i64),
     AdjustedInstance(i64),
     VbTable(i64),
@@ -46,6 +47,7 @@ impl Value {
 struct State {
     registers: HashMap<Register, Value>,
     stack: BTreeMap<i64, (usize, Value)>,
+    lua_callback: bool,
 }
 
 impl State {
@@ -121,6 +123,9 @@ impl State {
         *self != before
     }
     fn called_field(&self, i: &Instruction) -> Option<usize> {
+        if self.lua_callback && self.register(Register::RDX) != Some(Value::Lua) {
+            return None;
+        }
         let Value::Bytes(Storage::Descriptor, field, 8) = self.read(i, 0, 8)? else {
             return None;
         };
@@ -440,13 +445,23 @@ fn dispatch_fields(
 }
 
 fn dispatch_field(entry: u64, mut code: impl FnMut(u64) -> Option<Vec<u8>>) -> Option<usize> {
+    dispatch_field_for(entry, &mut code, false)
+}
+
+fn dispatch_field_for(
+    entry: u64,
+    mut code: impl FnMut(u64) -> Option<Vec<u8>>,
+    lua_callback: bool,
+) -> Option<usize> {
     let initial = State {
         registers: HashMap::from([
             (Register::RCX, Value::Pointer(Storage::Descriptor, 0)),
             (Register::RDX, Value::Instance),
+            (Register::R8, Value::Lua),
             (Register::RSP, Value::Pointer(Storage::Stack, 0)),
         ]),
         stack: BTreeMap::new(),
+        lua_callback,
     };
     let fields = dispatch_fields(entry, initial, &mut code, &mut 32768, 0)?;
     (fields.len() == 1).then(|| *fields.iter().next().unwrap())
@@ -468,6 +483,24 @@ pub(in super::super) fn binding(
     )
 }
 
+/// CustomBoundFuncDesc's Lua callback receives the original Lua state as its
+/// second argument. Distinguish it from the ordinary aggregate-return binding.
+pub(in super::super) fn lua_binding(
+    memory: &ProcessMemory,
+    studio: &ModuleEntry,
+    layout: &PackageLayout,
+    descriptor: usize,
+) -> Result<(usize, usize)> {
+    let field = member_field_for(
+        memory,
+        studio,
+        layout,
+        memory.read_u64(descriptor)? as usize,
+        true,
+    )?;
+    resolve(memory, studio, layout, descriptor, field)
+}
+
 pub(super) fn member_field(
     memory: &ProcessMemory,
     studio: &ModuleEntry,
@@ -475,7 +508,21 @@ pub(super) fn member_field(
     _descriptor: usize,
     table: usize,
 ) -> Result<usize> {
-    let key = (layout.image_stamp, table.wrapping_sub(studio.base));
+    member_field_for(memory, studio, layout, table, false)
+}
+
+fn member_field_for(
+    memory: &ProcessMemory,
+    studio: &ModuleEntry,
+    layout: &PackageLayout,
+    table: usize,
+    lua_callback: bool,
+) -> Result<usize> {
+    let key = (
+        layout.image_stamp,
+        table.wrapping_sub(studio.base),
+        lua_callback,
+    );
     let cached = BINDINGS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock_recover()
@@ -505,23 +552,27 @@ pub(super) fn member_field(
             break;
         }
         let mut error = None;
-        let field = dispatch_field(method as u64, |address| {
-            let address = usize::try_from(address).ok()?;
-            let rva = address.checked_sub(studio.base)?;
-            if let Some(code) = methods.get(&rva) {
-                return Some(Vec::clone(code));
-            }
-            match dispatch_code(memory, studio, layout, address) {
-                Ok(code) => {
-                    methods.insert(rva, code.clone());
-                    Some(code)
+        let field = dispatch_field_for(
+            method as u64,
+            |address| {
+                let address = usize::try_from(address).ok()?;
+                let rva = address.checked_sub(studio.base)?;
+                if let Some(code) = methods.get(&rva) {
+                    return Some(Vec::clone(code));
                 }
-                Err(message) => {
-                    error = Some(format!("{message:#}"));
-                    None
+                match dispatch_code(memory, studio, layout, address) {
+                    Ok(code) => {
+                        methods.insert(rva, code.clone());
+                        Some(code)
+                    }
+                    Err(message) => {
+                        error = Some(format!("{message:#}"));
+                        None
+                    }
                 }
-            }
-        });
+            },
+            lua_callback,
+        );
         if let Some(error) = error {
             bail!("Could not verify reflection dispatch: {error}");
         }
@@ -597,7 +648,40 @@ pub(super) fn void_dispatch_field(code: &[u8]) -> Option<usize> {
     dispatch_field(0, |address| (address == 0).then(|| code.to_vec()))
 }
 
-pub(super) fn dispatch_code(
+fn leaf_dispatch_length(bytes: &[u8]) -> Option<usize> {
+    let mut boundaries = HashSet::new();
+    let mut branches = Vec::new();
+    for instruction in Decoder::new(64, bytes, DecoderOptions::NONE) {
+        if instruction.is_invalid() {
+            return None;
+        }
+        boundaries.insert(instruction.ip());
+        match instruction.flow_control() {
+            FlowControl::Return
+            | FlowControl::IndirectBranch
+            | FlowControl::UnconditionalBranch => {
+                // A leaf null guard may jump over a receiver conversion to
+                // this same tail dispatch. Do not cross the first terminal,
+                // accept backward edges, or admit a target inside an operand.
+                return branches
+                    .iter()
+                    .all(|target| boundaries.contains(target))
+                    .then_some(instruction.next_ip() as usize);
+            }
+            FlowControl::ConditionalBranch
+                if instruction.op0_kind() == OpKind::NearBranch64
+                    && instruction.near_branch_target() >= instruction.next_ip() =>
+            {
+                branches.push(instruction.near_branch_target());
+            }
+            FlowControl::Next => {}
+            _ => return None,
+        }
+    }
+    None
+}
+
+pub(in super::super) fn dispatch_code(
     memory: &ProcessMemory,
     studio: &ModuleEntry,
     layout: &PackageLayout,
@@ -622,16 +706,8 @@ pub(super) fn dispatch_code(
         return verified_code(memory, studio, layout, address, length);
     }
     let bytes = verified_code(memory, studio, layout, address, 256)?;
-    for instruction in Decoder::new(64, &bytes, DecoderOptions::NONE) {
-        match instruction.flow_control() {
-            FlowControl::Return
-            | FlowControl::IndirectBranch
-            | FlowControl::UnconditionalBranch => {
-                return Ok(bytes[..instruction.next_ip() as usize].to_vec());
-            }
-            FlowControl::Next => {}
-            _ => break,
-        }
+    if let Some(length) = leaf_dispatch_length(&bytes) {
+        return Ok(bytes[..length].to_vec());
     }
     bail!("Reflection dispatch has no verified function boundary")
 }
@@ -654,6 +730,44 @@ fn resolve(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn custom_lua_callback_requires_the_original_lua_state() {
+        for field in [0xa8i32, 0x300, 0x2000] {
+            let mut code = vec![0x48, 0x8b, 0x81];
+            code.extend(field.to_le_bytes());
+            code.extend([0x48, 0x63, 0x89]);
+            code.extend((field + 8).to_le_bytes());
+            code.extend([0x48, 0x01, 0xd1, 0x4c, 0x89, 0xc2, 0xff, 0xe0]);
+            assert_eq!(
+                dispatch_field_for(0, |_| Some(code.clone()), true),
+                Some(field as usize)
+            );
+            // An output buffer substituted for the Lua state must not bind.
+            let position = code.len() - 5;
+            code.splice(position..position + 3, [0x48, 0x89, 0xe2]);
+            assert_eq!(dispatch_field_for(0, |_| Some(code.clone()), true), None);
+        }
+    }
+    #[test]
+    fn leaf_dispatch_null_guards_stay_within_verified_instruction_boundaries() {
+        let code = [
+            0x48, 0x85, 0xc0, // TEST RAX,RAX
+            0x74, 0x07, // JE to the tail dispatch
+            0x48, 0x8d, 0x88, 0x20, 0x04, 0x00, 0x00, 0x41, 0xff, 0x60, 0x08, // JMP [R8+8]
+            0xcc,
+        ];
+        assert_eq!(leaf_dispatch_length(&code), Some(16));
+        for target in [0u8, 1, 6, 8, 0x7f, 0xfb] {
+            let mut broken = code;
+            broken[4] = target;
+            // A zero-length conditional edge remains a valid boundary.
+            assert_eq!(leaf_dispatch_length(&broken), (target == 0).then_some(16));
+        }
+        assert_eq!(leaf_dispatch_length(&[0xe8, 0, 0, 0, 0, 0xc3]), None);
+        assert_eq!(leaf_dispatch_length(&[0x90, 0x0f]), None);
+        assert_eq!(leaf_dispatch_length(&[0x74, 1, 0xc3, 0xc3]), None);
+    }
+
     use super::*;
 
     #[test]

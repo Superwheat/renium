@@ -7,6 +7,13 @@ use task_context::*;
 #[path = "windows_probes.rs"]
 mod probes;
 pub(super) use probes::probe_operation;
+#[path = "windows_playtest.rs"]
+mod playtest;
+pub(crate) use playtest::caption::NativePlayCaption;
+pub(super) use playtest::discover as playtest_discovery;
+pub(crate) use playtest::dispatch::NativeTeleportDispatch;
+pub(crate) use playtest::join::NativePlayJoin;
+pub(crate) use playtest::loader::NativePlayLoad;
 use std::ffi::{OsStr, c_void};
 use std::fs;
 use std::io::Read;
@@ -1326,6 +1333,7 @@ fn valid_owner(
 }
 
 fn expected_data_model_names(title: &str) -> Vec<String> {
+    let title = crate::studio::input::ordinary_studio_title(title);
     let title = title
         .strip_suffix(" - Roblox Studio")
         .unwrap_or(title)
@@ -2635,6 +2643,8 @@ struct CaptureWindowSearch<'a> {
 }
 
 fn capture_title_matches(title: &str, selector: &str) -> bool {
+    let title = crate::studio::input::ordinary_studio_title(title);
+    let selector = crate::studio::input::ordinary_studio_title(selector);
     if selector.trim().is_empty() || !title.ends_with(" - Roblox Studio") {
         return false;
     }

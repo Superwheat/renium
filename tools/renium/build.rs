@@ -177,11 +177,17 @@ fn build_windows(out_dir: &Path) {
             ));
         } else {
             command.arg(allocator_dir.join("mimalloc.lib"));
+            command.arg("user32.lib");
         }
         run(&mut command, "Windows allocator ownership regression build");
         println!("cargo:rerun-if-changed={}", source.display());
     }
     println!("cargo:rerun-if-changed=native/renium_engine_allocator_windows.h");
+    println!("cargo:rerun-if-changed=native/renium_play_loader_windows.h");
+    println!("cargo:rerun-if-changed=native/renium_play_teleport_windows.h");
+    println!("cargo:rerun-if-changed=native/renium_play_join_windows.h");
+    println!("cargo:rerun-if-changed=native/renium_play_owner_windows.h");
+    println!("cargo:rerun-if-changed=native/renium_play_caption_windows.h");
     println!("cargo:rerun-if-changed={}", launch_source.display());
     println!("cargo:rerun-if-changed=native/renium_launch_windows_process.h");
     println!("cargo:rerun-if-changed={}", source.display());
@@ -433,6 +439,18 @@ fn generate_config_settings(out_dir: &Path) {
         })
         .collect::<Vec<_>>();
     settings.extend([
+        (
+            "playTeleportNative".to_string(),
+            "boolean".to_string(),
+            Some("true".to_string()),
+            vec![],
+        ),
+        (
+            "playTeleportEnabled".to_string(),
+            "boolean".to_string(),
+            Some("true".to_string()),
+            vec![],
+        ),
         (
             "backtrace".to_string(),
             "boolean".to_string(),

@@ -1375,6 +1375,10 @@ const EMBEDDED_AGENT_GUIDES: &[(&str, &str)] = &[
         include_str!("../../../renium-guides/runtime.md"),
     ),
     ("sync.md", include_str!("../../../renium-guides/sync.md")),
+    (
+        "teleport.md",
+        include_str!("../../../renium-guides/teleport.md"),
+    ),
 ];
 
 fn agent_instructions() -> Result<Vec<u8>> {

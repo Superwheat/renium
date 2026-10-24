@@ -15,6 +15,7 @@
 #include <string_view>
 #include <vector>
 #include "renium_engine_allocator_windows.h"
+#include "renium_play_loader_windows.h"
 #include "renium_studio_history.h"
 #include "renium_studio_terrain.h"
 
@@ -147,6 +148,10 @@ static void ReleaseOwnerReference(void* owner)
     if (InterlockedDecrement(reinterpret_cast<volatile long*>(bytes + 12)) == 0)
         reinterpret_cast<void(__fastcall*)(void*)>(vtable[1])(owner);
 }
+
+#include "renium_play_teleport_windows.h"
+#include "renium_play_join_windows.h"
+#include "renium_play_caption_windows.h"
 
 static std::uint64_t ElapsedMicros(
     const LARGE_INTEGER& start,

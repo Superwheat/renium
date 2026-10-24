@@ -923,6 +923,7 @@ fn validate_play_args(args: &StartStopPlayArgs) -> Result<()> {
 pub(crate) fn start_stop_play_result(
     args: StartStopPlayArgs,
     bridge: &BridgeServer,
+    teleport: Option<bool>,
 ) -> Result<Value> {
     validate_play_args(&args)?;
     let mode = args.mode.as_deref().unwrap_or("play");
@@ -930,7 +931,7 @@ pub(crate) fn start_stop_play_result(
         return stop_studio_play_with_bridge_result(bridge);
     }
     if args.restart {
-        return restart_play_result(args, bridge);
+        return restart_play_result(args, bridge, teleport);
     }
     if let Some(count) = args.add_players {
         return add_test_players_result(bridge, count, args.bridge.wait_seconds);
@@ -944,7 +945,7 @@ pub(crate) fn start_stop_play_result(
             None if matches!(mode, "run" | "server") => PlayLaunchPlan::Run,
             None => PlayLaunchPlan::Play,
         };
-        let mut result = start_play_with_retries(bridge, plan)?;
+        let mut result = start_play_with_retries(bridge, plan, teleport)?;
         result["serverReady"] = json!(server_answers_luau(bridge));
         return Ok(result);
     }
@@ -1533,7 +1534,11 @@ fn remembered_launch(edit_runtime_id: &str) -> Option<PlayLaunchPlan> {
     LAUNCHED_PLANS.lock_recover().get(edit_runtime_id).copied()
 }
 
-fn start_play_with_retries(bridge: &BridgeServer, plan: PlayLaunchPlan) -> Result<Value> {
+fn start_play_with_retries(
+    bridge: &BridgeServer,
+    plan: PlayLaunchPlan,
+    teleport: Option<bool>,
+) -> Result<Value> {
     if plan
         .players()
         .is_some_and(|players| !(1..=8).contains(&players))
@@ -1554,8 +1559,8 @@ fn start_play_with_retries(bridge: &BridgeServer, plan: PlayLaunchPlan) -> Resul
         if attempts > 1 {
             thread::sleep(Duration::from_secs(u64::from(attempts - 1)));
         }
-        let outcome =
-            start_attempt(bridge, plan).map_err(|error| with_orphan_hint(bridge, error))?;
+        let outcome = start_attempt(bridge, plan, teleport)
+            .map_err(|error| with_orphan_hint(bridge, error))?;
         let mut result = match outcome {
             AttemptOutcome::AlreadyRunning(existing) => existing,
             AttemptOutcome::Started {
@@ -1612,7 +1617,11 @@ fn with_orphan_hint(bridge: &BridgeServer, error: anyhow::Error) -> anyhow::Erro
     )
 }
 
-fn start_attempt(bridge: &BridgeServer, plan: PlayLaunchPlan) -> Result<AttemptOutcome> {
+fn start_attempt(
+    bridge: &BridgeServer,
+    plan: PlayLaunchPlan,
+    teleport: Option<bool>,
+) -> Result<AttemptOutcome> {
     let launch = new_play_launch(bridge, plan.label())?;
     let mut device_simulation = studio_device_status(bridge)?;
     let waited = Instant::now();
@@ -1625,10 +1634,30 @@ fn start_attempt(bridge: &BridgeServer, plan: PlayLaunchPlan) -> Result<AttemptO
         return Ok(AttemptOutcome::AlreadyRunning(existing));
     }
     let closed = close_leftover_test_processes(bridge, &launch.edit_runtime_id, LEFTOVER_GRACE);
+    let dispatch = if teleport.is_some() && plan == PlayLaunchPlan::Play {
+        crate::studio::teleport::Dispatch::before_play(
+            bridge,
+            &launch.edit_runtime_id,
+            &launch.nonce,
+        )
+    } else {
+        None
+    };
     let waited_ms = waited.elapsed().as_millis();
     let requested = Instant::now();
     match launch_play_session(bridge, &launch, plan) {
         Ok(LaunchOutcome::Started(mut result)) => {
+            if let Some(prefer_native) = teleport.filter(|_| plan != PlayLaunchPlan::Run) {
+                result["teleport"] = crate::studio::teleport::enable(
+                    bridge,
+                    prefer_native,
+                    plan.plugin_mode(),
+                    dispatch,
+                )
+                .unwrap_or_else(
+                    |error| json!({"mode":"unavailable","reason":format!("{error:#}")}),
+                );
+            }
             remember_launch(&launch.edit_runtime_id, plan);
             device_simulation["playRunning"] = Value::Bool(true);
             result["deviceSimulation"] = device_simulation;
@@ -1913,7 +1942,11 @@ fn restart_plan(
     }
 }
 
-fn restart_play_result(args: StartStopPlayArgs, bridge: &BridgeServer) -> Result<Value> {
+fn restart_play_result(
+    args: StartStopPlayArgs,
+    bridge: &BridgeServer,
+    teleport: Option<bool>,
+) -> Result<Value> {
     let edit_runtime_id = bridge
         .runtime_pin_for_selector(BridgeTarget::Edit, None)?
         .runtime_id;
@@ -1932,7 +1965,7 @@ fn restart_play_result(args: StartStopPlayArgs, bridge: &BridgeServer) -> Result
             .get("ok")
             .and_then(Value::as_bool)
             == Some(true);
-    let mut result = start_play_with_retries(bridge, plan)?;
+    let mut result = start_play_with_retries(bridge, plan, teleport)?;
     result["serverReady"] = json!(server_answers_luau(bridge));
     result["restarted"] = json!(restarted);
     if let Some(note) = note {
@@ -3660,6 +3693,16 @@ fn wait_for_studio_play_ready(bridge: &BridgeServer, runtime_id: &str) -> Result
     let deadline = Instant::now() + BRIDGE_DEFAULT_RESPONSE_TIMEOUT;
     loop {
         let mut status = studio_play_status_for_runtime(bridge, runtime_id)?;
+        if crate::studio::teleport::owns_transition(runtime_id, &status) {
+            // The original controller owns the gap between native Play models.
+            // A repeated start must observe that launch rather than compete with it.
+            status["running"] = json!(true);
+            status["starting"] = json!(true);
+            status["readyForStart"] = json!(false);
+            status["mode"] = json!("play");
+            status["teleport"] = json!({"mode":"loading"});
+            return Ok(status);
+        }
         let (clients, closing) = play_clients_by_state(bridge, runtime_id);
         if !clients.is_empty() {
             retire_play_clients(bridge, &closing);

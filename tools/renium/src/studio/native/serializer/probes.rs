@@ -28,6 +28,11 @@ pub(crate) enum NativeOperation {
     AudioGate,
     Input,
     ViewportCapture,
+    PlayTeleport,
+    PlayTeleportLoad,
+    PlayTeleportDispatch,
+    PlayTeleportJoin,
+    PlayTeleportLaunch,
 }
 
 impl NativeOperation {
@@ -70,6 +75,13 @@ impl NativeOperation {
             Self::AudioGate => "audible output",
             Self::Input => "bridge input",
             Self::ViewportCapture => "bridge capture",
+            Self::PlayTeleport => {
+                "same-universe content emulation; engine services retain source identity"
+            }
+            Self::PlayTeleportLoad => "retain the original Edit document",
+            Self::PlayTeleportDispatch => "explicit Play teleport API",
+            Self::PlayTeleportJoin => "retain the current Play session",
+            Self::PlayTeleportLaunch => "explicit Play teleport API",
         }
     }
 }
@@ -145,6 +157,21 @@ pub(crate) fn cached(pid: u32) -> Value {
         .filter(|session| session.identity == identity.as_deref().unwrap_or_default());
     let operations = NativeOperation::ALL
         .into_iter()
+        // An unqualified optional feature must not break the existing native
+        // canary contract. Include its verdict in daemon status once requested.
+        .chain(
+            [
+                NativeOperation::PlayTeleport,
+                NativeOperation::PlayTeleportLoad,
+                NativeOperation::PlayTeleportDispatch,
+                NativeOperation::PlayTeleportJoin,
+                NativeOperation::PlayTeleportLaunch,
+            ]
+            .into_iter()
+            .filter(|operation| {
+                current.is_some_and(|session| session.verdicts.contains_key(operation))
+            }),
+        )
         .map(|operation| {
             current
                 .and_then(|session| session.verdicts.get(&operation))
@@ -167,6 +194,29 @@ pub(crate) fn run(pid: u32, title: &str, operation: NativeOperation) -> Result<V
 
 #[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn command(args: crate::cli::NativeProbeArgs) -> Result<()> {
+    if args.playtest_discovery {
+        #[cfg(windows)]
+        let result = super::windows::playtest_discovery(&args);
+        #[cfg(target_os = "macos")]
+        let result: Result<Value> = Err(anyhow::anyhow!(
+            "Playtest discovery currently requires Windows x64"
+        ));
+        let report = match result {
+            Ok(report) => report,
+            Err(error) => json!({"schemaVersion":1,"readOnly":true,"pid":args.pid,
+                "ok":false,"nativeSwitchReady":false,"error":format!("{error:#}")}),
+        };
+        crate::app::output::print_json_output(&report, false)?;
+        anyhow::ensure!(
+            report["ok"] == true,
+            "Playtest discovery failed; see JSON evidence"
+        );
+        anyhow::ensure!(
+            !args.require_native,
+            "Discovery is evidence, not native switch authorization"
+        );
+        return Ok(());
+    }
     let pid = if let Some(executable) = &args.launch {
         let file = args
             .file
@@ -218,6 +268,9 @@ pub(crate) fn command(args: crate::cli::NativeProbeArgs) -> Result<()> {
     );
     Ok(())
 }
+
+#[cfg(target_os = "macos")]
+pub(crate) const PLAYTEST_UNAVAILABLE: &str = "Native playtest teleport is unavailable on macOS; the explicit compatibility API supports content emulation";
 
 #[cfg(test)]
 mod tests {

@@ -26,6 +26,13 @@ pub(super) fn probe_operation(
 ) -> Result<serde_json::Value> {
     use serde_json::json;
     match operation {
+        NativeOperation::PlayTeleport
+        | NativeOperation::PlayTeleportLoad
+        | NativeOperation::PlayTeleportDispatch
+        | NativeOperation::PlayTeleportLaunch
+        | NativeOperation::PlayTeleportJoin => {
+            bail!(super::probes::PLAYTEST_UNAVAILABLE)
+        }
         NativeOperation::DescriptorBinding
         | NativeOperation::History
         | NativeOperation::VoxelHistory

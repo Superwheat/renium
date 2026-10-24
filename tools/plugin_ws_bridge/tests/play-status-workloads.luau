@@ -9,6 +9,7 @@ local stops = 0
 local writes = 0
 local ownershipChecks = 0
 local attributes = {}
+local execution
 local services = {
 	HttpService = { GenerateGUID = function() return "test-runtime" end },
 	LogService = {
@@ -29,11 +30,15 @@ local services = {
 function services.StudioTestService:ExecutePlayModeAsync()
 	starts += 1
 	running = true
+	execution = coroutine.running()
 	coroutine.yield()
 end
 function services.StudioTestService:EndTest()
 	stops += 1
 	running = false
+	if execution and coroutine.status(execution) == "suspended" then
+		assert(coroutine.resume(execution))
+	end
 end
 function services.RunService:Stop()
 	running = false
@@ -82,6 +87,9 @@ status = api.startStopPlay({ start = true, launchNonce = "test-launch" })
 assert(status.ok and status.running and starts == 1)
 assert(status.engineRunning and status.engineStarted and status.executing, "Studio entered the test")
 assert(status.mode == "play" and status.players == nil)
+assert(status.teleportJournal.nonce == "test-launch" and status.teleportJournal.ready)
+assert(api.startStopPlay({ resumeTeleport = true, launchNonce = "test-launch" }).ok,
+	"an idle reconnect can retain the same controller")
 authorized = false
 local checksBefore, writesBefore = ownershipChecks, writes
 status = api.startStopPlay({})
@@ -92,6 +100,41 @@ authorized = true
 status = api.startStopPlay({ stop = true })
 assert(status.ok and not status.running and stops == 1)
 assert(attributes.__ReniumLaunchNonce == nil and attributes.__ReniumEditRuntimeId == nil)
+
+-- A destination launch is owned by the original Edit controller while its
+-- source Play runtimes are gone. An ordinary Stop retires that permission.
+status = api.startStopPlay({ start = true, launchNonce = "travel-source" })
+assert(status.running)
+local reserved = api.startStopPlay({ stop = true, launchNonce = "travel-source", teleportTransition = "hop-1", prepareTeleport = true })
+assert(reserved.ok and reserved.running and reserved.teleportTransition == "hop-1", "reserving a transition must retain the source test")
+services.StudioTestService:EndTest()
+scheduler.wait(0.06)
+local stopped = api.startStopPlay({})
+assert(stopped.ok and not stopped.running and stopped.teleportTransition == "hop-1")
+local stopCount = stops
+assert(api.startStopPlay({ stop = true, launchNonce = "travel-source", teleportTransition = "hop-1" }).ok)
+assert(stops == stopCount, "a repeated transition stop must not stop another launch")
+status = api.startStopPlay({ start = true, launchNonce = "travel-destination", teleportTransition = "hop-1" })
+assert(status.ok and status.running and status.launchNonce == "travel-destination")
+assert(not status.teleportJournal.ready, "starting a destination is not an arrival receipt")
+assert(not api.startStopPlay({ resumeTeleport = true, launchNonce = "travel-destination" }).ok,
+	"reconnect must not adopt an unacknowledged destination")
+assert(not api.startStopPlay({ completeTeleport = true, launchNonce = "travel-destination", teleportTransition = "stale" }).ok)
+assert(api.startStopPlay({ completeTeleport = true, launchNonce = "travel-destination", teleportTransition = "hop-1" }).ok)
+api.requestCancellation()
+assert(api.startStopPlay({}).teleportJournal.ready, "the Edit receipt survives a daemon connection")
+assert(not api.startStopPlay({ resumeTeleport = true, launchNonce = "replaced" }).ok)
+assert(api.startStopPlay({ resumeTeleport = true, launchNonce = "travel-destination" }).ok,
+	"a replacement daemon can reclaim only the completed recorded launch")
+local stale = api.startStopPlay({ stop = true, launchNonce = "travel-source", teleportTransition = "hop-1" })
+assert(not stale.ok and api.startStopPlay({}).running, "old source replies cannot stop the destination")
+stopped = api.startStopPlay({ stop = true, launchNonce = "travel-destination", teleportTransition = "hop-2" })
+assert(stopped.ok and stopped.teleportTransition == "hop-2")
+assert(api.startStopPlay({ stop = true }).ok)
+assert(api.startStopPlay({}).teleportJournal == nil, "ordinary Stop retires the controller receipt")
+local startsBefore = starts
+status = api.startStopPlay({ start = true, launchNonce = "late-destination", teleportTransition = "hop-2" })
+assert(not status.ok and starts == startsBefore and not running, "Stop cancels a delayed destination start")
 api.cleanup()
 
 -- Studio can return from a start while the previous test is still ending, without

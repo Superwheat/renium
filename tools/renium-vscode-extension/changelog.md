@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### New
+
+- Windows solo Play supports TeleportService travel to saved destinations with native server/client models and join data. The window shows the destination name; Stop restores the original unsaved Edit. A restricted compatibility adapter remains available when native switching is unavailable.
+
 ### Improvements
 
 - Commands that change the open Edit window (`rbx l` in Edit, `ps`, `prop`, `del`, `me` and `ai`) now answer with `persistence`: `teamCreate` when the place is in a Team Create session, which syncs the change to Roblox by itself, or `unsaved` when it stays in the Studio session until the user saves or publishes. `rbx status`, `lst` and `lon` report the same field, and every connected Edit window in `status` and `cs` carries `teamCreate`, so it no longer has to be inferred. A plugin that predates the field is asked once per Studio. An agent had added an anchored part to a Team Create place with `rbx l` and told the user to save the place; the guides now say never to ask for a save when `persistence` is `teamCreate`.

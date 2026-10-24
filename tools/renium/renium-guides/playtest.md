@@ -10,6 +10,8 @@ Start Play for a concrete runtime question that those checks cannot answer: repl
 
 ## Sessions
 
+Solo Play supports TeleportService travel to readable saved places on Windows, with native destination models and return to the original Edit on Stop. See [Playtest teleport](teleport.md) for compatibility mode and supported sessions.
+
 One-client checks (UI, HUD, menus, a single car) use ordinary Play: `rbx play -s`. `--players N` launches a separate local server plus N client windows, which costs memory and GPU the owner notices; use it only for a test that needs several players, and `rbx play -x` it as soon as that test ends (`play -r` restarts a session as it was started, clients included). `--players 1` requires explicit `--mode play` when a separate server and one client are needed.
 
 ```powershell

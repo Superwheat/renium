@@ -9,6 +9,14 @@ pub(crate) mod probes;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
+pub(crate) use windows::NativePlayCaption;
+#[cfg(windows)]
+pub(crate) use windows::NativePlayJoin;
+#[cfg(windows)]
+pub(crate) use windows::NativePlayLoad;
+#[cfg(windows)]
+pub(crate) use windows::NativeTeleportDispatch;
+#[cfg(windows)]
 pub(crate) use windows::{AudioOutputGate, keep_selection_across_undo, suppress_package_notices};
 
 use std::time::Duration;

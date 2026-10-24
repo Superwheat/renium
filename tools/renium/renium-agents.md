@@ -18,7 +18,7 @@ Reuse suitable Play sessions, batch related checks with the fewest clients, and 
 
 ## Read the relevant guide
 
-Read only relevant guides before using their commands, once per session; reread after `rbx upd`.
+Read relevant guides once per session; reread after `rbx upd`.
 
 | Task | Guide |
 |---|---|
@@ -28,6 +28,7 @@ Read only relevant guides before using their commands, once per session; reread 
 | Configuration and imports | `RENIUM/configuration.md` |
 | Pull, push, Live Sync and conflicts | `RENIUM/sync.md` |
 | Play sessions | `RENIUM/playtest.md` |
+| Playtest teleport | `RENIUM/teleport.md` |
 | Live Luau and consoles | `RENIUM/runtime.md` |
 | Network simulation | `RENIUM/network.md` |
 | UI, input and movement | `RENIUM/input.md` |
@@ -58,7 +59,7 @@ Before Open Cloud uploads, follow `RENIUM/publishing-validation.md`: verify API-
 
 ## Tools and boundaries
 
-- Use project-declared tools normally; report unavailable tools instead of hunting for executables.
+- Use project tools; report unavailable tools without hunting for executables.
 - Pass arguments or pipe JSON/code; do not create payload files.
 - Launch, close or replace Studio only when needed; `rbx ro` reopens a closed bound place. Never take focus or global input.
 - Do not back up the project: `rbx rev` restores affected files; Studio undo covers pushes.

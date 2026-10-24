@@ -73,6 +73,28 @@ fn engine_probe(
     operation: NativeOperation,
 ) -> Result<Value> {
     match operation {
+        NativeOperation::PlayTeleport => Ok(json!({
+            "launch": engine_probe(memory, studio, layout, model, NativeOperation::PlayTeleportLaunch)?,
+            "load": engine_probe(memory, studio, layout, model, NativeOperation::PlayTeleportLoad)?,
+            "arrival": playtest::join::probe(memory, studio)?,
+        })),
+        NativeOperation::PlayTeleportDispatch => playtest::dispatch::probe(memory, studio, model),
+        NativeOperation::PlayTeleportJoin => playtest::join::probe(memory, studio),
+        NativeOperation::PlayTeleportLaunch => {
+            let dispatch = playtest::dispatch::probe(memory, studio, model)?;
+            let owner = playtest::owner::resolve(memory, studio, model)?;
+            Ok(json!({"dispatch":dispatch,"launch":owner.fields,"execute":owner.execute}))
+        }
+        NativeOperation::PlayTeleportLoad => {
+            let binding = playtest::loader::resolve(memory, studio, model)?;
+            let nonce = playtest::loader::nonce_bindings(memory, studio, model)?;
+            Ok(
+                json!({"callbackSlotRva":binding.slot,"callbackRva":binding.function,
+                "captureField":binding.fields.capture,"stringField":binding.fields.string,
+                "placeField":binding.fields.place,"universeField":binding.fields.universe,
+                "launchCheck":nonce}),
+            )
+        }
         NativeOperation::Snapshot => snapshot_probe(memory, studio, layout),
         NativeOperation::Capture => {
             let serializer = snapshot_probe(memory, studio, layout)?;
@@ -222,7 +244,7 @@ fn action_probe(
     )
 }
 
-fn image_string<'a>(image: &PeImage<'a>, rva: usize) -> Result<&'a str> {
+pub(super) fn image_string<'a>(image: &PeImage<'a>, rva: usize) -> Result<&'a str> {
     let start = image.rva_to_offset(rva)?;
     let bytes = &image.bytes[start..];
     let len = bytes
@@ -233,7 +255,7 @@ fn image_string<'a>(image: &PeImage<'a>, rva: usize) -> Result<&'a str> {
     std::str::from_utf8(&bytes[..len]).context("PE name is not UTF-8")
 }
 
-fn directory(image: &PeImage<'_>, index: usize) -> Result<(usize, usize)> {
+pub(super) fn directory(image: &PeImage<'_>, index: usize) -> Result<(usize, usize)> {
     let optional = read_u32(image.bytes, 0x3c)? as usize + 24;
     anyhow::ensure!(
         index < read_u32(image.bytes, optional + 108)? as usize,

@@ -304,9 +304,13 @@ fn studio_bridge_modules_parse_as_luau() {
     let mut paths = fs::read_dir(&root)
         .unwrap()
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.extension().is_some_and(|extension| extension == "lua"))
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "lua" || extension == "luau")
+        })
         .collect::<Vec<_>>();
     paths.sort();
+    assert!(!paths.is_empty(), "No Studio plugin modules were checked");
     for path in paths {
         let source = fs::read_to_string(&path).unwrap();
         let result = validate_luau_syntax(&source);

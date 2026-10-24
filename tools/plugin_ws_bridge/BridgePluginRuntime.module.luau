@@ -270,6 +270,13 @@ function BridgePluginRuntime.start(context)
 	local EditorSyncModule = requireChildModule("BridgeEditorSync")
 	local TransactionUploadModule = requireChildModule("BridgeTransactionUpload")
 	local initialRuntimeSettings = SettingsModule.loadRuntimeSettings(plugin, SETTINGS_PREFIX)
+	local playTeleport = requireChildModule("BridgePlayTeleport").create({
+		runtimeId = Config.bridgeRuntimeId, role = Config.bridgeRole,
+		state = requireChildModule("BridgeTeleportState"), gui = requireChildModule("BridgeTeleportGui"),
+		content = requireChildModule("BridgeTeleportContent"), codec = ValueCodecModule,
+		collisionGroups = CollisionGroupsModule,
+		shimTemplate = rootScript:FindFirstChild("TeleportShim"),
+	})
 	local activeExclusiveSessionGeneration = nil
 	local editorSync
 	local sessionLock
@@ -4381,6 +4388,7 @@ function BridgePluginRuntime.start(context)
 	Config.bridgeMethodHandlers.executeLuau = RuntimeApi.executeLuau
 	Config.bridgeMethodHandlers.collectLuauRunner = RuntimeApi.collectLuauRunner
 	Config.bridgeMethodHandlers.startStopPlay = RuntimeApi.startStopPlay
+	Config.bridgeMethodHandlers.playTeleport = playTeleport.handle
 	Config.bridgeMethodHandlers.getStudioState = RuntimeApi.studioState
 	Config.bridgeMethodHandlers.getCreatorContext = Config.creatorApi.creatorContext
 	Config.bridgeMethodHandlers.cameraCapture = Config.creatorApi.cameraCapture
@@ -4523,6 +4531,7 @@ function BridgePluginRuntime.start(context)
 		getEditorBinaryOverlayChunk = true,
 	}
 	Config.bridgeReplayProtectedMethods = {
+		playTeleport = true,
 		configurePropertyCandidates = true,
 		setExportOptions = true,
 		applyEditorChanges = true,
@@ -4595,6 +4604,7 @@ function BridgePluginRuntime.start(context)
 		maxQueuedExclusiveRequests = 16,
 		allowedMethods = Config.bridgeMethodHandlers,
 		isExclusiveMethod = function(method, params)
+			if method == "playTeleport" then return params.action ~= "status" end
 			if method == "getEditorTransactionState" then
 				return params.nativeRootWrite ~= nil or params.nativeTerrainBaseline ~= nil or params.meshGeometry ~= nil
 			end
@@ -4620,6 +4630,7 @@ function BridgePluginRuntime.start(context)
 			activeExclusiveSessionGeneration = generation
 		end,
 		requestShutdown = function(unloading: boolean)
+			playTeleport.cleanup(unloading)
 			editorSync.requestCancellation()
 			local runtimeCleanupGeneration = RuntimeApi.requestCancellation()
 			return function()

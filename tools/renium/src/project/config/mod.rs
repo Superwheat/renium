@@ -2646,6 +2646,8 @@ fn validate_merged_config(value: &Value) -> Result<()> {
                 }
                 "yes"
                 | "backtrace"
+                | "playTeleportEnabled"
+                | "playTeleportNative"
                 | "verifyEditorPushSources"
                 | "autoSyncOnSave"
                 | "editorLiveSyncEnabled"
@@ -3734,6 +3736,23 @@ mod tests {
             }
         }
         validate_merged_config(&values).unwrap();
+    }
+
+    #[test]
+    fn play_teleport_setting_defaults_on_and_allows_project_disable() {
+        for key in ["playTeleportEnabled", "playTeleportNative"] {
+            let setting = CONFIG_SETTING_SPECS
+                .iter()
+                .find(|setting| setting.key == key)
+                .unwrap();
+            assert_eq!(setting.default_json, Some("true"));
+            for enabled in [true, false] {
+                let value = json!({key: enabled});
+                validate_merged_config(&value).unwrap();
+                validate_audio_scope(ConfigScope::Place, &value).unwrap();
+            }
+            assert!(validate_merged_config(&json!({key: "false"})).is_err());
+        }
     }
 
     #[test]

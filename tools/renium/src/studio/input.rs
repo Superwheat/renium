@@ -125,6 +125,44 @@ pub fn studio_window_title(pid: u32) -> Result<String> {
     platform::studio_window_title(pid)
 }
 
+// Keep routing/document identity independent of the transient Play caption.
+#[cfg(any(windows, test))]
+pub(crate) fn ordinary_studio_title(title: &str) -> &str {
+    title
+        .split_once(" - Roblox Studio - Teleported to ")
+        .map_or(title, |(prefix, _)| {
+            &title[..prefix.len() + " - Roblox Studio".len()]
+        })
+}
+
+#[cfg(test)]
+#[test]
+fn teleport_caption_keeps_document_routing_and_normal_title_form() {
+    let ordinary = format!("{} - Roblox Studio", 11);
+    let decorated = format!("{ordinary} - Teleported to {}", 12);
+    assert_eq!(ordinary_studio_title(&decorated), ordinary);
+    assert_eq!(ordinary_studio_title(&ordinary), ordinary);
+    assert_eq!(
+        ordinary_studio_title(" - Teleported to 12"),
+        " - Teleported to 12"
+    );
+}
+
+#[cfg(windows)]
+pub(crate) fn teleport_caption_window(pid: u32) -> Result<(isize, String)> {
+    platform::teleport_caption_window(pid)
+}
+
+#[cfg(windows)]
+pub(crate) fn teleport_caption_update(
+    pid: u32,
+    hwnd: isize,
+    previous: &str,
+    next: &str,
+) -> Result<()> {
+    platform::teleport_caption_update(pid, hwnd, previous, next)
+}
+
 #[cfg(target_os = "macos")]
 pub fn studio_document_path(pid: u32) -> Result<std::path::PathBuf> {
     platform::studio_document_path(pid)
@@ -459,8 +497,8 @@ fn write_png(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) -> Re
 mod platform {
     use super::background_dialog::BackgroundDialogGuard;
     use super::{
-        PACKAGE_CHANGES_MESSAGE, StudioWindow, ThreadDpiAwareness, startup_dialog_button,
-        windows_shield,
+        PACKAGE_CHANGES_MESSAGE, StudioWindow, ThreadDpiAwareness, ordinary_studio_title,
+        startup_dialog_button, windows_shield,
     };
     use crate::system::LockRecover;
     use anyhow::{Context, Result, bail};
@@ -531,7 +569,7 @@ mod platform {
         if !state.pids.contains(&pid) {
             return 1;
         }
-        let mut title = [0u16; 256];
+        let mut title = [0u16; 32768];
         let len = unsafe { GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32) };
         if len <= 0 {
             return 1;
@@ -1417,12 +1455,17 @@ mod platform {
     }
 
     pub fn studio_window_title(pid: u32) -> Result<String> {
+        teleport_caption_window(pid).map(|(_, title)| ordinary_studio_title(&title).to_owned())
+    }
+
+    pub fn teleport_caption_window(pid: u32) -> Result<(isize, String)> {
         let titles = windows_for_pid(pid)
             .into_iter()
             .filter(|(hwnd, _, title)| {
-                window_class(*hwnd).starts_with("Qt") && title.ends_with(" - Roblox Studio")
+                window_class(*hwnd).starts_with("Qt")
+                    && ordinary_studio_title(title).ends_with(" - Roblox Studio")
             })
-            .map(|(_, _, title)| title)
+            .map(|(hwnd, _, title)| (hwnd, title))
             .collect::<Vec<_>>();
         if titles.len() != 1 {
             bail!("Studio process exposed {} document windows", titles.len());
@@ -1430,11 +1473,49 @@ mod platform {
         Ok(titles.into_iter().next().unwrap())
     }
 
+    pub fn teleport_caption_update(
+        pid: u32,
+        hwnd: isize,
+        previous: &str,
+        next: &str,
+    ) -> Result<()> {
+        let current = teleport_caption_window(pid)?;
+        anyhow::ensure!(
+            current.0 == hwnd && current.1 == previous,
+            "Studio caption changed before update"
+        );
+        anyhow::ensure!(
+            !next.contains('\0') && next.encode_utf16().count() < 32767,
+            "Invalid Studio caption"
+        );
+        let wide = next.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+        let mut result = 0usize;
+        // WM_SETTEXT is the SetWindowTextW operation, with a bound on a busy UI
+        // thread. No focus, activation, input injection or window movement.
+        let sent = unsafe {
+            SendMessageTimeoutW(
+                hwnd as HWND,
+                windows_sys::Win32::UI::WindowsAndMessaging::WM_SETTEXT,
+                0,
+                wide.as_ptr() as LPARAM,
+                SMTO_ABORTIFHUNG,
+                250,
+                &mut result,
+            )
+        };
+        anyhow::ensure!(
+            sent != 0 && result != 0,
+            "Studio caption update did not complete"
+        );
+        Ok(())
+    }
+
     fn main_studio_window(pid: u32) -> Result<(isize, u32, String)> {
         windows_for_pid(pid)
             .into_iter()
             .find(|(hwnd, _, title)| {
-                window_class(*hwnd).starts_with("Qt") && title.ends_with(" - Roblox Studio")
+                window_class(*hwnd).starts_with("Qt")
+                    && ordinary_studio_title(title).ends_with(" - Roblox Studio")
             })
             .or_else(|| {
                 windows_for_pid(pid)

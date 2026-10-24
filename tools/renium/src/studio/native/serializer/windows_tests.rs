@@ -78,7 +78,13 @@ fn native_gate_rejects_new_and_resident_helpers() {
 fn read_only_probes_refuse_non_studio_processes_without_loading_a_helper() -> Result<()> {
     let pid = std::process::id();
     let before = modules(pid)?.len();
-    for operation in NativeOperation::ALL {
+    for operation in NativeOperation::ALL.into_iter().chain([
+        NativeOperation::PlayTeleport,
+        NativeOperation::PlayTeleportLoad,
+        NativeOperation::PlayTeleportDispatch,
+        NativeOperation::PlayTeleportLaunch,
+        NativeOperation::PlayTeleportJoin,
+    ]) {
         let error = probe_operation(pid, "", operation).unwrap_err().to_string();
         assert!(
             error.contains("not Roblox Studio"),
