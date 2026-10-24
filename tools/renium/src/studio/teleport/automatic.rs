@@ -127,13 +127,12 @@ fn manual_server<'a>(row: &Value, contexts: &'a [BoundContext]) -> Option<&'a Bo
 }
 
 fn connected_owner(context: &BoundContext, rows: &[Value]) -> Option<String> {
-    if let Some(runtime) = &context.runtime_id {
-        if rows
+    if let Some(runtime) = &context.runtime_id
+        && rows
             .iter()
             .any(|row| row["role"] == "edit" && row["runtimeId"] == *runtime)
-        {
-            return Some(runtime.clone());
-        }
+    {
+        return Some(runtime.clone());
     }
     // Opening Studio binds the project before its bridge exists. Recover that
     // binding by published identity without requiring another CLI command.
@@ -532,7 +531,7 @@ mod tests {
         let mut opening = contexts[0].clone();
         opening.runtime_id = None;
         assert_eq!(
-            connected_owner(&opening, &[edit.clone()]).as_deref(),
+            connected_owner(&opening, std::slice::from_ref(&edit)).as_deref(),
             Some("edit-a")
         );
         let mut duplicate = edit.clone();

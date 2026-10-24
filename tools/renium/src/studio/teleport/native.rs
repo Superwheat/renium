@@ -10,6 +10,9 @@ pub(crate) struct Dispatch {
 }
 
 impl Dispatch {
+    /// Ends this dispatch before a replacement is armed for the same owner.
+    pub(super) fn release(self) {}
+
     pub(super) fn ready(&self) -> bool {
         #[cfg(windows)]
         {
@@ -25,8 +28,8 @@ impl Dispatch {
         {
             let gate = super::automatic::gate(owner);
             let _guard = gate.lock_recover();
-            if let Some(mut prepared) = super::automatic::take_prepared(owner) {
-                if prepared
+            if let Some(mut prepared) = super::automatic::take_prepared(owner)
+                && prepared
                     .lease
                     .as_mut()?
                     .advance(
@@ -38,9 +41,8 @@ impl Dispatch {
                         nonce,
                     )
                     .is_ok()
-                {
-                    return Some(prepared);
-                }
+            {
+                return Some(prepared);
             }
             Self::install_before_play(bridge, owner, nonce)
         }

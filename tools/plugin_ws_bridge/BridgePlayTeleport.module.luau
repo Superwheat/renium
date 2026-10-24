@@ -282,10 +282,14 @@ function Teleport.create(context)
 		assert(params.runtimeId == context.runtimeId and active, "Teleport runtime changed")
 		assert(RunService:IsStudio() and not RunService:IsEdit(), "Teleport is only available in Play")
 		if params.action == "routeJoin" then
-			if routeJoinRelay then routeJoinRelay:Destroy() end
+			if routeJoinRelay then
+				routeJoinRelay:Destroy()
+			end
 			routeJoinRelay = Instance.new("BindableFunction")
 			routeJoinRelay.Name = "__ReniumRouteJoin_" .. context.runtimeId
-			routeJoinRelay.OnInvoke = function() return params.join, params.join.TeleportData end
+			routeJoinRelay.OnInvoke = function()
+				return params.join, params.join.TeleportData
+			end
 			routeJoinRelay.Parent = game:GetService("CoreGui")
 			return { ok = true, path = { "CoreGui", routeJoinRelay.Name } }
 		end
@@ -307,10 +311,14 @@ function Teleport.create(context)
 				"Client is not preparing this teleport")
 			assert(type(params.configuration) == "table" and params.configuration.LaunchTask == "StartClient",
 				"Invalid client route configuration")
-			if routeRelay then routeRelay:Destroy() end
+			if routeRelay then
+				routeRelay:Destroy()
+			end
 			routeRelay = Instance.new("BindableFunction")
 			routeRelay.Name = "__ReniumTeleportRoute_" .. context.runtimeId
-			routeRelay.OnInvoke = function() return params.configuration end
+			routeRelay.OnInvoke = function()
+				return params.configuration
+			end
 			routeRelay.Parent = game:GetService("CoreGui")
 			return { ok = true, path = { "CoreGui", routeRelay.Name } }
 		end

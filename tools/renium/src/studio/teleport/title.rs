@@ -272,6 +272,7 @@ impl Lease {
         }
     }
 
+    #[cfg(windows)]
     pub(super) fn rebind(&self, session: &Session, name: &str) -> Result<()> {
         #[cfg(windows)]
         {
@@ -285,6 +286,7 @@ impl Lease {
         self.arrived(name, session.current_place == session.source)
     }
 
+    #[cfg(windows)]
     pub(super) fn restore(&self) {
         #[cfg(windows)]
         self.state.lock_recover().restore();

@@ -1,7 +1,9 @@
 //! Immutable saved bytes and reusable preparation; authorization precedes lookup.
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+#[cfg(any(windows, test))]
+use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::SystemTime;
 
 use anyhow::{Context, Result, ensure};
@@ -40,6 +42,7 @@ pub(super) struct CachedPayload {
 
 /// The engine may retain its input after the initiating request has returned.
 /// Own the bytes, rather than lending it an evictable cache filename.
+#[cfg(any(windows, test))]
 pub(super) struct SavedPlace {
     pub bytes: Arc<[u8]>,
     pub downloaded: bool,
@@ -149,6 +152,7 @@ impl Cache {
         )
     }
 
+    #[cfg(any(windows, test))]
     fn raw(
         &self,
         saved: SavedVersion,
@@ -265,6 +269,7 @@ impl Cache {
     }
 }
 
+#[cfg(windows)]
 pub(super) fn saved_place(destination: &Destination) -> Result<SavedPlace> {
     Cache {
         root: crate::app::update::user_data_dir()?

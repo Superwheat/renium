@@ -6,6 +6,7 @@ mod cache;
 mod multiplayer;
 mod native;
 mod payload;
+#[cfg(windows)]
 mod routing;
 mod title;
 #[cfg(windows)]
@@ -235,6 +236,7 @@ struct Attempt {
     data: Value,
     reserved: bool,
     #[serde(default)]
+    #[cfg_attr(not(windows), allow(dead_code))]
     native: bool,
     error: Option<String>,
 }
@@ -749,7 +751,7 @@ fn watch(
                 if session.nonce != previous_nonce {
                     last = 0;
                     if !dispatch.has_launch_scope() {
-                        drop(dispatch);
+                        dispatch.release();
                         dispatch = native::Dispatch::arm(bridge, session);
                     }
                 } else {

@@ -3,6 +3,7 @@ use super::routing::{Place, Routes, Server, ServerState};
 use super::*;
 use crate::studio::automation::test_processes;
 use std::collections::BTreeMap;
+use std::collections::hash_map::Entry;
 use std::time::Instant;
 
 struct Endpoint {
@@ -266,10 +267,11 @@ impl Test {
         let mut participants = Vec::new();
         for (name, runtime) in &selected {
             let pid = bridge.studio_pid_for_runtime(BridgeTarget::Client, runtime)?;
-            if !self.captions.contains_key(&pid) {
-                self.captions.insert(pid, title::ClientCaption::start(pid)?);
-            }
-            self.captions.get_mut(&pid).unwrap().update(None, true)?;
+            let caption = match self.captions.entry(pid) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => entry.insert(title::ClientCaption::start(pid)?),
+            };
+            caption.update(None, true)?;
             participants.push((name.clone(), runtime.clone(), pid));
         }
         let route = self.routes.reserve(
