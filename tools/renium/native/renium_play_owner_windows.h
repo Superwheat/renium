@@ -50,7 +50,7 @@ inline void* Model(void* instance, const Binding& binding) {
 }
 inline void* Owns(const Scope& scope, void* instance, bool client = false) {
     const auto arguments = scope.arguments.load();
-    if (!scope.active.load() || !arguments) return nullptr;
+    if (!scope.active.load()) return nullptr;
     const auto& binding = scope.binding;
     auto model = Model(instance, binding);
     if (!model || model == reinterpret_cast<void*>(binding.sourceModel)
@@ -65,6 +65,19 @@ inline void* Owns(const Scope& scope, void* instance, bool client = false) {
         if (Class(child.get(), binding.classOffset, "NetworkClient")) networkClient = true;
     }
     if (!test || (client && !networkClient)) return nullptr;
+    if (!arguments) {
+        // Studio's own Play controls bypass ExecutePlayModeAsync and do not
+        // copy DataModel attributes. Hold a same-process source-server call
+        // until the daemon binds its OS-verified runtime relay. The relay's
+        // nonce is still mandatory before anything can be accepted.
+        if (networkClient) return nullptr;
+        renium_play_loader::Request launch{};
+        launch.getAttribute = binding.getAttribute;
+        launch.sourceInstance = binding.sourceModel;
+        launch.stringTypeTable = binding.stringTypeTable;
+        strcpy_s(launch.launchNonce, scope.nonce.c_str());
+        return renium_play_loader::MatchesLaunch(launch) ? model : nullptr;
+    }
     Variant actual;
     reinterpret_cast<void*(*)(void*, void*)>(binding.getArgs)(test, &actual);
     return actual.type == binding.tableType && arguments->type == binding.tableType

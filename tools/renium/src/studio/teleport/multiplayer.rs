@@ -1,6 +1,7 @@
 //! One server per destination and one native document per traveling client.
 use super::routing::{Place, Routes, Server, ServerState};
 use super::*;
+use crate::studio::automation::test_processes;
 use std::collections::BTreeMap;
 use std::time::Instant;
 
@@ -36,7 +37,7 @@ impl Test {
         self.alive(bridge)?;
         ensure!(
             Instant::now() < deadline,
-            "Destination client did not become ready"
+            "Play client did not become ready"
         );
         thread::sleep(Duration::from_millis(50));
         Ok(())
@@ -66,7 +67,46 @@ impl Test {
     }
 
     fn refresh_members(&mut self, bridge: &BridgeServer) -> Result<()> {
-        let rows = bridge.list_bridge_clients();
+        let mut rows = bridge.list_bridge_clients();
+        // Studio's manual Add Players path does not inherit Renium test args.
+        // Accept new source clients only after proving process ancestry, then
+        // publish the same launch identity to every channel before routing.
+        if self.root.nonce.starts_with("manual-") {
+            let pending = rows
+                .iter()
+                .filter(|row| {
+                    row["role"] == "play-client"
+                        && row["launchEditRuntimeId"] == self.root.owner
+                        && row["launchNonce"].as_str().is_none_or(str::is_empty)
+                        && row["placeId"] == self.root.source
+                        && row["gameId"] == self.root.universe
+                })
+                .collect::<Vec<_>>();
+            if !pending.is_empty() {
+                let descendants = test_processes::test_descendants(
+                    &test_processes::studio_process_table(),
+                    self.edit_pid,
+                );
+                for row in pending {
+                    let runtime = text_field(row, "runtimeId")?;
+                    let pid = bridge.studio_pid_for_runtime(BridgeTarget::Client, &runtime)?;
+                    ensure!(
+                        descendants.contains(&pid),
+                        "Manual client is not a test process of its Edit window"
+                    );
+                    automatic::adopt_runtime(
+                        bridge,
+                        BridgeTarget::Client,
+                        &runtime,
+                        &self.root.owner,
+                        &self.root.nonce,
+                        "multi",
+                    )?;
+                    bridge.refresh_launch_runtime(&runtime, BridgeTarget::Client, pid)?;
+                }
+                rows = bridge.list_bridge_clients();
+            }
+        }
         let places = self.endpoints.keys().copied().collect::<Vec<_>>();
         let mut all = HashMap::new();
         for place in places {
@@ -140,9 +180,28 @@ impl Test {
                             && row["role"] == "play-server"
                             && row["placeId"] == travel.to.place
                             && row["gameId"] == travel.to.universe
-                            && row["launchEditRuntimeId"] == self.root.owner
-                            && row["launchNonce"] == self.root.nonce
                     }) {
+                        if info["launchNonce"].as_str().is_none_or(str::is_empty) {
+                            // Manual Server & Clients has no __renium test args
+                            // to inherit. Bind only the exact process returned
+                            // by our owned destination launch before using it.
+                            let runtime = text_field(info, "runtimeId")?;
+                            automatic::adopt_runtime(
+                                bridge,
+                                BridgeTarget::Server,
+                                &runtime,
+                                &self.root.owner,
+                                &self.root.nonce,
+                                "multi",
+                            )?;
+                            bridge.refresh_launch_runtime(&runtime, BridgeTarget::Server, pid)?;
+                            continue;
+                        }
+                        ensure!(
+                            info["launchEditRuntimeId"] == self.root.owner
+                                && info["launchNonce"] == self.root.nonce,
+                            "Destination test server belongs to another root launch"
+                        );
                         let mut session = Session::from_info(info)?;
                         session.source = self.root.source;
                         session.root_nonce.clone_from(&self.root.root_nonce);
@@ -305,13 +364,25 @@ impl Test {
                 let mut capture = crate::project::workflows::windows_launch::TestClientRoute::arm(
                     server.pid, *pid,
                 )?;
-                call(
-                    bridge,
-                    &server.runtime,
-                    BridgeTarget::Server,
-                    "addRouteClient",
-                    json!({}),
-                )?;
+                if self.root.nonce.starts_with("manual-") {
+                    // AddPlayers only accepts ExecuteMultiplayerTestAsync
+                    // sessions. Manual servers use Studio's Add Client action;
+                    // the same launch capture redirects it into this window.
+                    let title = crate::studio::input::studio_window_title(server.pid)?;
+                    crate::studio::native::serializer::trigger_studio_action(
+                        server.pid,
+                        &title,
+                        "addClientsAction",
+                    )?;
+                } else {
+                    call(
+                        bridge,
+                        &server.runtime,
+                        BridgeTarget::Server,
+                        "addRouteClient",
+                        json!({}),
+                    )?;
+                }
                 let deadline = Instant::now() + Duration::from_secs(15);
                 let command = loop {
                     if let Some(command) = capture.command()? {
@@ -482,10 +553,25 @@ pub(super) fn watch(
                 if !status["pending"].is_null() {
                     let attempt: Attempt = serde_json::from_value(status["pending"].clone())?;
                     let last = endpoint.last;
-                    let clients = test.clients(bridge, place)?;
-                    let result = attempt
-                        .validate(&clients, last)
-                        .and_then(|()| test.travel(bridge, place, &attempt, &clients));
+                    let mut clients = test.clients(bridge, place)?;
+                    let result = (|| -> Result<()> {
+                        // PlayerAdded can teleport before that player's plugin
+                        // registers. Retain this exact pending request while
+                        // its real client bridge catches up; do not reject the
+                        // player or replay TeleportAsync with another request.
+                        let deadline = Instant::now() + Duration::from_secs(15);
+                        while attempt
+                            .players
+                            .iter()
+                            .any(|name| !clients.contains_key(name))
+                        {
+                            test.wait(bridge, deadline)?;
+                            test.refresh_members(bridge)?;
+                            clients = test.clients(bridge, place)?;
+                        }
+                        attempt.validate(&clients, last)?;
+                        test.travel(bridge, place, &attempt, &clients)
+                    })();
                     let endpoint = test.endpoints.get_mut(&place).unwrap();
                     endpoint.last = endpoint.last.max(attempt.id);
                     if let Err(error) = result {
@@ -501,5 +587,14 @@ pub(super) fn watch(
         }
     })();
     test.routes.stop();
+    let _ = bridge.call_for_runtime_with_timeout(
+        "startStopPlay",
+        json!({
+            "finishManualTeleport":true,"launchNonce":root.nonce
+        }),
+        BridgeTarget::Edit,
+        &root.owner,
+        Some(Duration::from_secs(3)),
+    );
     result
 }

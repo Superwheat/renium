@@ -516,12 +516,15 @@ function BridgeRuntimeApi.create(plugin, runtimeContext)
 		executionToken = nil,
 		executionThread = nil,
 		stopRequested = false,
+		external = false,
 		readyAt = 0,
 	}
 	local teleportTransition = nil
 	-- The original Edit controller outlives daemon connections and Play models.
 	-- Keep its last owned launch receipt until that test actually ends.
 	local playJournal = nil
+	local manualPlayEpoch = 0
+	local manualPlayConnection = nil
 	local deviceSimulatorReadyAt = os.clock() + 4
 	local deviceSimulatorStatusCache = nil
 	local captureProbeGui = nil
@@ -3129,6 +3132,7 @@ updateMouse()
 			game:SetAttribute("__ReniumEditRuntimeId", nil)
 		end
 		playSession.mode = nil
+		playSession.external = false
 		playSession.players = nil
 		playSession.launchNonce = nil
 		playSession.owned = false
@@ -3196,6 +3200,9 @@ updateMouse()
 			teleportTransition = if teleportTransition then teleportTransition.id else nil,
 			teleportJournal = playJournal,
 			teleportLoadProtocol = 2,
+			teleportManualProtocol = 1,
+			teleportStartProtocol = 1,
+			manualPlayEpoch = manualPlayEpoch,
 		}
 	end
 
@@ -3333,6 +3340,68 @@ updateMouse()
 		end
 		local operationGeneration = cancellationGeneration
 		assertOperationOwnership(operationGeneration)
+		if params.prepareManualTeleport == true then
+			if runtimeContext.bridgeRole ~= "edit" or params.runtimeId ~= runtimeContext.runtimeId
+				or api.isPlayModeRunning() or playSession.active or playSession.starting
+				or playSession.executionPending or teleportTransition ~= nil then
+				local result = playStatus("prepareManual")
+				result.prepared = false
+				return result
+			end
+			if type(params.launchNonce) ~= "string" or params.launchNonce == "" then
+				return { ok = false, error = "Missing manual Play launch identity" }
+			end
+			game:SetAttribute("__ReniumLaunchNonce", params.launchNonce)
+			game:SetAttribute("__ReniumEditRuntimeId", runtimeContext.runtimeId)
+			if not manualPlayConnection then
+				manualPlayConnection = StudioTestService:GetPropertyChangedSignal("EditModeActive"):Connect(function()
+					manualPlayEpoch += 1
+				end)
+			end
+			local result = playStatus("prepareManual")
+			result.prepared = true
+			return result
+		end
+		if params.finishManualTeleport == true then
+			if runtimeContext.bridgeRole == "edit" and playSession.external
+				and playSession.launchNonce == params.launchNonce then
+				markPlayStopped()
+			end
+			return playStatus("finishManual")
+		end
+		if params.adoptTeleport == true then
+			local nonce, owner = params.launchNonce, params.editRuntimeId
+			local external = runtimeContext.bridgeRole == "edit" and params.mode == "multi" and not api.isPlayModeRunning()
+			if params.runtimeId ~= runtimeContext.runtimeId or type(nonce) ~= "string" or nonce == ""
+				or type(owner) ~= "string" or owner == "" or not (external or api.isPlayModeRunning()) then
+				return { ok = false, error = "The manual Play runtime ended or changed" }
+			end
+			local existingNonce = game:GetAttribute("__ReniumLaunchNonce")
+			local existingOwner = game:GetAttribute("__ReniumEditRuntimeId")
+			if (existingNonce ~= nil and existingNonce ~= nonce)
+				or (existingOwner ~= nil and existingOwner ~= owner) then
+				return { ok = false, error = "The manual Play runtime already belongs to another launch" }
+			end
+			if runtimeContext.bridgeRole == "edit" then
+				if owner ~= runtimeContext.runtimeId or playSession.owned or teleportTransition ~= nil
+					or (params.mode ~= "play" and params.mode ~= "multi") then
+					return { ok = false, error = "The Edit controller already owns a different launch" }
+				end
+				playSession.token += 1
+				playSession.active, playSession.starting, playSession.engineStarted = true, false, true
+				playSession.mode, playSession.launchNonce = params.mode, nonce
+				playSession.owned, playSession.ownerGeneration = true, operationGeneration
+				playSession.ownerRuntimeId = owner
+				playSession.external = external
+				playJournal = { nonce = nonce, mode = params.mode, ready = true }
+				if not external then
+					task.spawn(monitorStudioTest, playSession.token)
+				end
+			end
+			game:SetAttribute("__ReniumLaunchNonce", nonce)
+			game:SetAttribute("__ReniumEditRuntimeId", owner)
+			return playStatus("adopt")
+		end
 		if params.resumeTeleport == true or params.completeTeleport == true then
 			if runtimeContext.bridgeRole ~= "edit" or not playJournal
 				or playJournal.nonce ~= params.launchNonce or not api.isPlayModeRunning() then
@@ -3464,7 +3533,10 @@ updateMouse()
 					value = params.args,
 				}
 				playSession.executionThread = task.spawn(function()
-					executeStudioTest(token, mode, testArgs, numPlayers)
+					-- Let the host arm the standalone server before PlayerAdded can
+					-- teleport. The requested count remains in the launch journal.
+					local initialPlayers = if params.deferPlayers == true and mode == "multi" then 0 else numPlayers
+					executeStudioTest(token, mode, testArgs, initialPlayers)
 				end)
 				task.spawn(monitorStudioTest, token)
 			end
@@ -3607,6 +3679,10 @@ updateMouse()
 
 	function api.cleanup(ownerGeneration)
 		teleportTransition = nil
+		if manualPlayConnection then
+			manualPlayConnection:Disconnect()
+			manualPlayConnection = nil
+		end
 		local cleanupGeneration = ownerGeneration or api.requestCancellation()
 		if captureProbeGui ~= nil then
 			captureProbeGui:Destroy()

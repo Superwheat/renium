@@ -1,28 +1,28 @@
 # Playtest teleport in Studio
 
-Start solo Play with `rbx play -s`, or Server & Clients with `rbx play -s --players 2`. On Windows, Renium intercepts the owned server's `TeleportService:TeleportAsync(placeId, players, options)`, including startup PlayerAdded calls. The call returns a native TeleportAsyncResult. No game adapter is needed when `play -s` reports `trigger: "teleport-service"`.
+Start with Studio's Play/Play Here or Server & Clients, `rbx play -s`, or `rbx play -s --players 2`. On Windows, Renium prearms Edit, adopts manual tests, and intercepts `TeleportService:TeleportAsync(placeId, players, options)`. CLI multiplayer arms its server before adding clients; early PlayerAdded calls wait for matching bridges. Calls return native TeleportAsyncResult; no adapter is needed with the `teleport-service` trigger. Setup failures retry with bounded backoff; Stop rearms the next launch.
 
-Use published IDs and Open Cloud metadata, saved history and delivery read access: `RENIUM/opencloud.md`. Each attempt authorizes the destination and selects its newest **saved** version, including unpublished saves. Unreadable history or destinations fail before leaving. Cached bytes never replace authorization.
+Use published IDs and Open Cloud read access: `RENIUM/opencloud.md`. Every attempt authorizes the destination and selects its newest **saved** version, including unpublished saves. Unreadable history/destinations fail before leaving; caching never bypasses authorization.
 
 `playTeleportEnabled` and `playTeleportNative` default to true. `rbx cfg set playTeleportNative false --scope place` selects content emulation; `rbx cfg set playTeleportEnabled false --scope place` disables travel. Restart Play after changes.
 
 ## Native arrival
 
-The original Studio controller loads the destination's saved place into new server and client Play DataModels in the same window. Native PlaceId and GameId are set during construction. Destination scripts, properties, hierarchy, Terrain and packages use Studio's place loader. Native Player:GetJoinData and TeleportService:GetLocalPlayerTeleportData receive TeleportOptions data. Studio's API access settings still apply; this does not create a production server, reservation or JobId.
+Studio's place loader creates destination Play DataModels with native PlaceId/GameId, scripts, hierarchy, properties, Terrain and packages. Player:GetJoinData and TeleportService:GetLocalPlayerTeleportData receive TeleportOptions data. Studio API settings still apply; no production server, reservation or JobId is created.
 
-Stop preserves the original Edit model and its unsaved work. Further teleports use that same controller. Preparation failures retain the current test; failures after switching starts return to Edit. Runtime identities and launch nonces reject late replies.
+Stop preserves the original Edit model and unsaved work. Further hops retain that controller. Preparation failures keep the current test; failures after switching return to Edit. Runtime identities and launch nonces reject late replies.
 
-On Windows, the title shows `Teleporting...` immediately, then the resolved destination. Roblox's installed default loading screen runs in both directions. Arrival adds ` - Teleported to <destination displayName>`; return removes it. Stop, disconnect or daemon exit restores the title without focus or movement; a process-local lease covers abrupt exit. After daemon restart, `rbx play -s` rearms completed arrivals; interrupted ones return to Edit.
+The title shows `Teleporting...`, then ` - Teleported to <destination displayName>` on arrival; return removes it. Roblox's default loading screen runs both ways. Stop/disconnect restores the title without focus or movement; a lease covers daemon exit. After daemon restart, `rbx play -s` rearms completed solo arrivals; interrupted ones return to Edit.
 
-The current executor supports solo Play/Play Here and Server & Clients with same-universe destinations. Reserved-server codes, ShouldReserveServer and JobId targeting are refused. Custom teleport GUIs are not transferred. TeleportOptions data must be JSON-compatible and at most 64 KiB for the group.
+Native travel supports same-universe destinations. Reserved-server codes, ShouldReserveServer and JobId targeting are refused. Custom GUIs are not transferred. TeleportOptions data must be JSON-compatible, at most 64 KiB for the group.
 
-In Server & Clients, only the selected clients travel, retaining their process and window. The first arrival starts one destination test server; later arrivals reuse it and its saved version, even after every player leaves. Back-teleports rejoin the original source server. Root Stop ends all source and destination test processes, including an interrupted arrival. The original Edit model stays intact. First travel includes Studio server startup; subsequent hops reuse the running server.
+In Server & Clients, selected clients retain their process/window; others stay on source. First travel starts one destination server; later arrivals reuse it and its saved version, even after it empties. Return rejoins source. Root Stop closes all owned test processes, including interrupted arrivals. First travel includes server startup; later hops reuse it.
 
-Studio allocates fresh test-player names and negative UserIds when clients reconnect. The client window persists, but a return can change Player1 to Player3. Use the player names reported by `rbx cs` for later client commands. Native GetJoinData and local TeleportData carry the previous place and supplied data. Multiplayer recovery after a daemon restart is not currently supported; Stop and restart the test.
+Studio assigns fresh test-player names/negative UserIds on rejoin. Use `rbx cs` names for later commands. JoinData and local TeleportData carry the previous place and supplied data. Multiplayer daemon-restart recovery is unsupported; Stop and restart.
 
 ## Compatibility mode
 
-When native destination loading cannot be qualified, Renium can import supported content into the existing Play models. The result/log identifies `mode: "emulated"`; engine identity and backend context remain the source's. Further hops stay in this mode until Stop, including after reconnecting. If raw interception is unavailable, including on macOS, the optional server adapter is:
+If native loading is unavailable, compatibility mode imports content into existing Play models. Logs report `mode: "emulated"`; engine/backend identity remains source. Hops stay emulated until Stop. If interception is unavailable, including on macOS, use this server adapter:
 
 ```lua
 if game:GetService("RunService"):IsStudio() then
@@ -32,16 +32,16 @@ else
 end
 ```
 
-The adapter returns a queued receipt. Pass connected Players and optional TeleportOptions. WaitForChild handles plugin startup; early calls wait up to 30 seconds for arming. Disabled, disconnected or busy sessions reject requests. Keep the game's server validation. A game module already named ReniumTeleport is preserved and disables the adapter.
+The adapter returns a queued receipt. Pass connected Players and optional TeleportOptions. Early calls wait up to 30 seconds for arming. Disabled/disconnected/busy sessions reject requests. Keep server validation. An existing game module named ReniumTeleport is preserved and disables the adapter.
 
-Emulation supports Workspace, Lighting, ReplicatedFirst, ReplicatedStorage, ServerScriptService, ServerStorage, StarterGui, StarterPack, StarterPlayer, Teams and SoundService. Unsupported containers, Terrain voxels, PackageLinks and incompatible protected settings fail preflight. Source overrides of default player controllers require destination replacements. Client-created source children are cleared before commit. Failure after clearing requires Stop.
+Emulation supports Workspace, Lighting, ReplicatedFirst, ReplicatedStorage, ServerScriptService, ServerStorage, StarterGui, StarterPack, StarterPlayer, Teams and SoundService. Unsupported containers, Terrain voxels, PackageLinks and incompatible protected settings fail preflight. Custom player controllers need destination replacements. Client-created source children are cleared; failure afterward requires Stop.
 
-`ReniumTeleport.GetContext()` reports `mode` (`source`, `native` or `emulated`), destination `placeId`, previous `sourcePlaceId`, original Edit `originPlaceId`, `gameId`, saved `version`, `contentSource` (`cache`/`download`) and attempt `id`. In emulation, use its GetJoinData(player), GetLocalPlayerTeleportData() and GetArrivingTeleportGui() methods. Existing Players remain, so enumerate GetPlayers as well as subscribing to PlayerAdded. Old callbacks, globals and module caches cannot all be reset by content replacement.
+`ReniumTeleport.GetContext()` reports mode, placeId, sourcePlaceId, originPlaceId, gameId, saved version, contentSource and attempt id. In emulation, use its GetJoinData(player), GetLocalPlayerTeleportData() and GetArrivingTeleportGui(). Existing Players remain: enumerate GetPlayers and subscribe to PlayerAdded. Content replacement cannot reset all callbacks, globals or module caches.
 
 macOS currently uses compatibility mode and reports native switching and title support unavailable.
 
 ## Cache and diagnostics
 
-Renium's 1 GiB `cache/play-teleport` cache keys saved bytes by universe/place/version and pins active entries. Downloads and prepared payloads are limited to 128 MiB; compatibility staging is limited to 250,000 instances. Daemon logs report mode, destination IDs, saved version and cache use.
+The 1 GiB `cache/play-teleport` cache keys bytes by universe/place/version and pins active entries. Downloads/payloads are limited to 128 MiB; emulation to 250,000 instances. Logs report mode, destination IDs, version and cache use.
 
 `rbx status` reports native qualification. Read-only discovery is documented in `RENIUM/native-compatibility.md`.

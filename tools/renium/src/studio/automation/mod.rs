@@ -39,7 +39,7 @@ pub(crate) mod property_access;
 mod recording;
 mod recording_review;
 pub(crate) mod render_quality;
-mod test_processes;
+pub(crate) mod test_processes;
 
 pub(crate) use console::{get_console_output_command, get_console_output_result};
 pub(crate) use input::input_result;
@@ -1635,6 +1635,18 @@ fn start_attempt(
         return Ok(AttemptOutcome::AlreadyRunning(existing));
     }
     let closed = close_leftover_test_processes(bridge, &launch.edit_runtime_id, LEFTOVER_GRACE);
+    if cfg!(windows) && teleport.is_some() && plan.players().is_some() {
+        anyhow::ensure!(
+            existing["teleportStartProtocol"] == 1,
+            "Reopen this Studio with the updated plugin to arm teleport before multiplayer clients start"
+        );
+    }
+    #[cfg(windows)]
+    let _idle_dispatch = if plan != PlayLaunchPlan::Play || teleport.is_none() {
+        crate::studio::teleport::take_prepared(&launch.edit_runtime_id)
+    } else {
+        None
+    };
     let dispatch = if teleport.is_some() && plan == PlayLaunchPlan::Play {
         crate::studio::teleport::Dispatch::before_play(
             bridge,
@@ -1646,7 +1658,7 @@ fn start_attempt(
     };
     let waited_ms = waited.elapsed().as_millis();
     let requested = Instant::now();
-    match launch_play_session(bridge, &launch, plan) {
+    match launch_play_session(bridge, &launch, plan, teleport) {
         Ok(LaunchOutcome::Started(mut result)) => {
             if let Some(prefer_native) = teleport.filter(|_| plan != PlayLaunchPlan::Run) {
                 result["teleport"] = crate::studio::teleport::enable(
@@ -1808,11 +1820,17 @@ fn launch_play_session(
     bridge: &BridgeServer,
     launch: &TestLaunch,
     plan: PlayLaunchPlan,
+    teleport: Option<bool>,
 ) -> Result<LaunchOutcome> {
     let mut watch = LaunchWatch::new(bridge, launch);
+    let defer_players = cfg!(windows) && teleport.is_some() && plan.players().is_some();
+    let mut request = plan.request(&launch.nonce);
+    if defer_players {
+        request["deferPlayers"] = json!(true);
+    }
     let start_result = bridge.call_for_runtime_with_timeout(
         "startStopPlay",
-        plan.request(&launch.nonce),
+        request,
         BridgeTarget::Edit,
         &launch.edit_runtime_id,
         None,
@@ -1828,6 +1846,7 @@ fn launch_play_session(
     let started = Instant::now();
     let mut last_progress = started;
     let mut last_seen = (false, 0usize);
+    let mut players_released = !defer_players;
     loop {
         let status = studio_play_status_for_runtime(bridge, &launch.edit_runtime_id);
         let last_status = match &status {
@@ -1843,6 +1862,30 @@ fn launch_play_session(
         let server_ready = clients
             .iter()
             .any(|entry| entry["role"] == BRIDGE_ROLE_PLAY_SERVER);
+        if !players_released && server_ready {
+            let server = clients
+                .iter()
+                .find(|row| row["role"] == BRIDGE_ROLE_PLAY_SERVER)
+                .and_then(|row| row["runtimeId"].as_str())
+                .context("Missing startup server runtime")?;
+            crate::studio::teleport::enable_runtime(
+                bridge,
+                server,
+                teleport.unwrap(),
+                "multi",
+                None,
+                true,
+            )?;
+            let result = bridge.call_for_runtime_with_timeout(
+                "startStopPlay",
+                json!({"addPlayers":plan.players().unwrap()}),
+                BridgeTarget::Server,
+                server,
+                Some(Duration::from_secs(5)),
+            )?;
+            ensure_plugin_api_ok(&result)?;
+            players_released = true;
+        }
         let client_count = clients
             .iter()
             .filter(|entry| entry["role"] == BRIDGE_ROLE_PLAY_CLIENT)
@@ -3458,9 +3501,9 @@ fn request_play_runtimes_to_stop(
         );
     }
     let inventory = bridge.list_bridge_clients();
-    let edit = inventory.iter().find(|row| {
-        row["role"] == BRIDGE_ROLE_EDIT && row["runtimeId"] == edit_runtime_id
-    });
+    let edit = inventory
+        .iter()
+        .find(|row| row["role"] == BRIDGE_ROLE_EDIT && row["runtimeId"] == edit_runtime_id);
     for client in play_stop_runtimes(clients, edit) {
         let target = match client.get("role").and_then(Value::as_str) {
             Some(BRIDGE_ROLE_PLAY_SERVER) => BridgeTarget::Main,
@@ -3793,10 +3836,16 @@ mod play_state_tests {
         let multi = [destination.clone(), client.clone(), source.clone()];
         assert_eq!(play_stop_runtimes(&multi, Some(&edit)), [&client, &source]);
         let solo = [destination.clone(), client.clone()];
-        assert_eq!(play_stop_runtimes(&solo, Some(&edit)), [&destination, &client]);
+        assert_eq!(
+            play_stop_runtimes(&solo, Some(&edit)),
+            [&destination, &client]
+        );
         let third = json!({"role":"play-server","placeId":13,"gameId":7});
         let disconnected_source = [destination, client.clone(), third];
-        assert_eq!(play_stop_runtimes(&disconnected_source, Some(&edit)), [&client]);
+        assert_eq!(
+            play_stop_runtimes(&disconnected_source, Some(&edit)),
+            [&client]
+        );
     }
 
     #[test]

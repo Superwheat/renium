@@ -1,4 +1,6 @@
 //! Studio teleport sessions rooted in the original Edit controller.
+#[cfg(windows)]
+mod automatic;
 mod cache;
 #[cfg(windows)]
 mod multiplayer;
@@ -6,6 +8,8 @@ mod native;
 mod payload;
 mod routing;
 mod title;
+#[cfg(windows)]
+pub(crate) use automatic::{start_manual, take_prepared};
 pub(crate) use native::Dispatch;
 
 use std::collections::{HashMap, HashSet};
@@ -215,7 +219,7 @@ impl Session {
             );
         }
         ensure!(
-            !clients.is_empty() && clients.len() <= 8,
+            (self.multiplayer || !clients.is_empty()) && clients.len() <= 8,
             "Teleport needs 1 through 8 connected play clients"
         );
         Ok(clients)
@@ -333,11 +337,22 @@ pub(crate) fn enable(
     let runtime = bridge
         .play_runtime_for_selector(BridgeTarget::Server, None)
         .context("No play server for teleport emulation")?;
+    enable_runtime(bridge, &runtime, prefer_native, mode, dispatch, false)
+}
+
+pub(crate) fn enable_runtime(
+    bridge: &BridgeServer,
+    runtime: &str,
+    prefer_native: bool,
+    mode: &str,
+    dispatch: Option<Dispatch>,
+    require_native_trigger: bool,
+) -> Result<Value> {
     if mode != "play" && !cfg!(windows) {
         let reason = "Server & Clients teleport requires destination server routing; teleport currently supports solo Play/Play Here only";
         let _ = call(
             bridge,
-            &runtime,
+            runtime,
             BridgeTarget::Server,
             "disarm",
             json!({"reason":reason}),
@@ -352,7 +367,7 @@ pub(crate) fn enable(
     let mut session = Session::from_info(info)?;
     session.retain_origin(&inventory)?;
     session.prefer_native = prefer_native;
-    session.multiplayer = bridge.studio_pid_for_runtime(BridgeTarget::Server, &runtime)?
+    session.multiplayer = bridge.studio_pid_for_runtime(BridgeTarget::Server, runtime)?
         != bridge.studio_pid_for_runtime(BridgeTarget::Edit, &session.owner)?;
     ensure!(
         !session.multiplayer || cfg!(windows) && prefer_native,
@@ -373,7 +388,7 @@ pub(crate) fn enable(
         if dispatch.is_none() && !session.multiplayer {
             native::reconcile(bridge, &session)?;
         }
-        let armed = call(bridge, &runtime, BridgeTarget::Server, "arm", json!({}))?;
+        let armed = call(bridge, runtime, BridgeTarget::Server, "arm", json!({}))?;
         dispatch
             .as_ref()
             .map_or(Ok(()), |dispatch| dispatch.bind(bridge, &session))?;
@@ -399,8 +414,12 @@ pub(crate) fn enable(
     }
     let prefer_native = session.prefer_native;
     let mut registry = SESSIONS.get().unwrap().lock_recover();
-    if !native && !compatibility {
+    if !native && (require_native_trigger || !compatibility) {
         registry.retire(&session.owner, &session.root_nonce);
+        ensure!(
+            !require_native_trigger,
+            "The native teleport hook is unavailable; automatic setup will retry"
+        );
         anyhow::bail!(
             "{}",
             armed["compatibilityError"]

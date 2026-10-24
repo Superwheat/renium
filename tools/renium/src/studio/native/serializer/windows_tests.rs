@@ -1,6 +1,37 @@
 use super::*;
 
 #[test]
+#[ignore = "requires an explicitly owned Studio PID; invokes its real Play/Stop control"]
+fn manual_play_control_for_teleport_regression() -> Result<()> {
+    let pid: u32 = std::env::var("RENIUM_TELEPORT_TEST_PID")?.parse()?;
+    let action = std::env::var("RENIUM_TELEPORT_TEST_ACTION")?;
+    anyhow::ensure!(
+        matches!(
+            action.as_str(),
+            "simulationPlayAction"
+                | "simulationPlayFromCameraAction"
+                | "simulationResetAction"
+                | "startServerAction"
+                | "addClientsAction"
+                | "cleanupServersAndPlayersAction"
+        ),
+        "Not a playtest control"
+    );
+    let title = crate::studio::input::studio_window_title(pid)?;
+    let foreground = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
+    let result = platform_trigger_studio_action(pid, &title, &action)?;
+    anyhow::ensure!(
+        foreground == unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow() },
+        "Play control changed keyboard focus"
+    );
+    println!(
+        "Studio control {action}: {} matching action(s)",
+        result.found
+    );
+    Ok(())
+}
+
+#[test]
 fn native_gate_rejects_writes_allocations_and_both_thread_ownership_modes() {
     // Invalid handles/addresses must never reach a Windows mutation API.
     let memory = std::mem::ManuallyDrop::new(ProcessMemory {

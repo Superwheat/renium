@@ -5,6 +5,8 @@ use super::*;
 pub(crate) struct Dispatch {
     #[cfg(windows)]
     lease: Option<crate::studio::native::serializer::NativeTeleportDispatch>,
+    #[cfg(windows)]
+    _ownership: Option<super::automatic::Ownership>,
 }
 
 impl Dispatch {
@@ -21,6 +23,42 @@ impl Dispatch {
     pub(crate) fn before_play(bridge: &BridgeServer, owner: &str, nonce: &str) -> Option<Self> {
         #[cfg(windows)]
         {
+            let gate = super::automatic::gate(owner);
+            let _guard = gate.lock_recover();
+            if let Some(mut prepared) = super::automatic::take_prepared(owner) {
+                if prepared
+                    .lease
+                    .as_mut()?
+                    .advance(
+                        bridge
+                            .list_bridge_clients()
+                            .iter()
+                            .find(|row| row["runtimeId"] == owner)?["placeId"]
+                            .as_i64()?,
+                        nonce,
+                    )
+                    .is_ok()
+                {
+                    return Some(prepared);
+                }
+            }
+            Self::install_before_play(bridge, owner, nonce)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (bridge, owner, nonce);
+            None
+        }
+    }
+
+    #[cfg(windows)]
+    pub(super) fn install_before_play(
+        bridge: &BridgeServer,
+        owner: &str,
+        nonce: &str,
+    ) -> Option<Self> {
+        #[cfg(windows)]
+        {
             let result = (|| -> Result<_> {
                 let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, owner)?;
                 let title = crate::studio::input::studio_window_title(pid)?;
@@ -29,7 +67,10 @@ impl Dispatch {
                 )
             })();
             match result {
-                Ok(lease) => Some(Self { lease: Some(lease) }),
+                Ok(lease) => Some(Self {
+                    lease: Some(lease),
+                    _ownership: Some(super::automatic::Ownership::claim(owner)),
+                }),
                 Err(error) => {
                     crate::app::output::log_global(
                         2,
@@ -97,14 +138,20 @@ impl Dispatch {
                             session.server
                         ),
                     );
-                    Self { lease: Some(lease) }
+                    Self {
+                        lease: Some(lease),
+                        _ownership: Some(super::automatic::Ownership::claim(&session.owner)),
+                    }
                 }
                 Err(error) => {
                     crate::app::output::log_global(
                         2,
                         format_args!("[renium] native teleport trigger unavailable: {error:#}"),
                     );
-                    Self { lease: None }
+                    Self {
+                        lease: None,
+                        _ownership: None,
+                    }
                 }
             }
         }

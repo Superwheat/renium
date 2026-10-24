@@ -168,6 +168,18 @@ assert(status.ok and not status.running and status.mode == nil and status.player
 assert(not status.readyForStart, "the controller settles before the next start")
 multi.cleanup()
 
+local deferred = RuntimeApi.create({}, {
+	runtimeId = "test-runtime", bridgeRole = "edit",
+	assertRequestLeaseActive = function() end,
+	assertSessionOwnership = function() end,
+})
+status = deferred.startStopPlay({ start = true, players = 2, deferPlayers = true, launchNonce = "deferred-launch" })
+assert(status.teleportStartProtocol == 1 and status.players == 2 and launched.players == 0,
+	"a teleport-enabled multiplayer launch must expose its server before adding the requested players")
+assert(launched.args.__renium.nonce == "deferred-launch")
+assert(deferred.startStopPlay({ stop = true }).ok)
+deferred.cleanup()
+
 function services.StudioTestService:ExecuteRunModeAsync()
 	error("Studio is busy")
 end
@@ -181,4 +193,52 @@ assert(not status.running and not status.starting and status.launchNonce == nil)
 assert(string.find(status.lastError, "Studio is busy", 1, true), "a refused start keeps Studio's error for the daemon")
 assert(status.engineStarted == false and status.executing == false)
 refused.cleanup()
+
+-- Manual Play bypasses ExecutePlayModeAsync. Preparation must be idle-only,
+-- while adoption/cleanup must reject delayed requests from a different test.
+local manualChanged
+function services.StudioTestService:GetPropertyChangedSignal(property)
+	assert(property == "EditModeActive")
+	return { Connect = function(_, callback)
+		manualChanged = callback
+		return { Disconnect = function() manualChanged = nil end }
+	end }
+end
+local manual = RuntimeApi.create({}, {
+	runtimeId = "manual-edit", bridgeRole = "edit",
+	assertRequestLeaseActive = function() end,
+	assertSessionOwnership = function() end,
+})
+local prepare = { prepareManualTeleport = true, runtimeId = "manual-edit", launchNonce = "manual-one" }
+status = manual.startStopPlay(prepare)
+assert(status.prepared and status.teleportManualProtocol == 1 and status.manualPlayEpoch == 0)
+assert(attributes.__ReniumLaunchNonce == "manual-one" and attributes.__ReniumEditRuntimeId == "manual-edit")
+running = true
+manualChanged()
+assert(not manual.startStopPlay(prepare).prepared, "preparation must not replace an active launch")
+local adopt = { adoptTeleport = true, runtimeId = "manual-edit", editRuntimeId = "manual-edit", launchNonce = "manual-one", mode = "play" }
+status = manual.startStopPlay(adopt)
+assert(status.ok and status.running and status.teleportJournal.ready and status.manualPlayEpoch == 1)
+assert(manual.startStopPlay({ stop = true }).ok)
+manualChanged()
+assert(manual.startStopPlay({}).manualPlayEpoch == 2, "early Start/Stop remains visible between polls")
+assert(not manual.startStopPlay(adopt).ok, "a delayed adoption must not revive stopped solo Play")
+
+-- The Edit RunService stays stopped for manual Server & Clients. The external
+-- server lifetime owns the journal until the exact launch finishes.
+prepare.launchNonce = "manual-two"
+assert(manual.startStopPlay(prepare).prepared)
+assert(not manual.startStopPlay(adopt).ok, "an old nonce must not adopt the next launch")
+adopt.launchNonce, adopt.mode = "manual-two", "multi"
+status = manual.startStopPlay(adopt)
+assert(status.ok and status.running and not status.engineRunning and status.teleportJournal.ready)
+scheduler.wait(0.15)
+assert(manual.startStopPlay({}).running, "external Play must not expire because Edit RunService is stopped")
+status = manual.startStopPlay({ finishManualTeleport = true, launchNonce = "manual-one" })
+assert(status.running and status.teleportJournal.nonce == "manual-two")
+status = manual.startStopPlay({ finishManualTeleport = true, launchNonce = "manual-two" })
+assert(not status.running and status.teleportJournal == nil and attributes.__ReniumLaunchNonce == nil)
+assert(manual.startStopPlay(prepare).prepared, "manual Stop must permit prearming the next launch")
+manual.cleanup()
+assert(manualChanged == nil)
 print("Renium play observation and ownership tests passed")

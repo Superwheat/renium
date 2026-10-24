@@ -1187,20 +1187,35 @@ impl BridgeServer {
     /// bridge. Refresh its explicitly stamped root ownership on every channel.
     #[cfg(windows)]
     pub(crate) fn refresh_routed_client(&self, runtime: &str, pid: u32) -> Result<()> {
+        self.refresh_launch_runtime(runtime, BridgeTarget::Client, pid)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn refresh_launch_runtime(
+        &self,
+        runtime: &str,
+        target: BridgeTarget,
+        pid: u32,
+    ) -> Result<()> {
         let value = self.call_for_runtime_with_timeout(
             "getBridgeInfo",
             json!({}),
-            BridgeTarget::Client,
+            target,
             runtime,
             Some(Duration::from_secs(3)),
         )?;
         let info: BridgeInfoPayload = serde_json::from_value(value)?;
         anyhow::ensure!(
             info.runtime_id == runtime
-                && info.bridge_role == BRIDGE_ROLE_PLAY_CLIENT
+                && info.bridge_role
+                    == match target {
+                        BridgeTarget::Server => BRIDGE_ROLE_PLAY_SERVER,
+                        BridgeTarget::Client => BRIDGE_ROLE_PLAY_CLIENT,
+                        _ => anyhow::bail!("Only Play runtimes can acquire launch ownership"),
+                    }
                 && !info.launch_edit_runtime_id.is_empty()
                 && !info.launch_nonce.is_empty(),
-            "Routed client did not retain its root ownership"
+            "Play runtime did not retain its root ownership"
         );
         for channel in &self.channels {
             let connections = channel.sockets.lock_recover().clone();

@@ -381,9 +381,17 @@ inline void Handle(Request& r) {
         r.reserved = current && current->request.token == r.token && current->Alive() && current->arrival
             && current->arrival->id == r.slot && current->arrival->place == static_cast<std::int64_t>(r.original);
     } else if (r.action == 2 || r.action == 3) {
-        if (!current || current->request.token != r.token) return;
+        if (!current || current->request.token != r.token) {
+            if (r.action == 3) throw std::runtime_error("Owned teleport dispatch was replaced");
+            return;
+        }
         if (r.action == 2) Restore(current);
-        else if (current->Alive()) current->deadline.store(GetTickCount64() + current->request.lifetimeMs);
+        else if (current->Alive()) {
+            if (*reinterpret_cast<void**>(current->request.slot) != reinterpret_cast<void*>(&Entry)
+                || (current->request.executeSlot && *reinterpret_cast<void**>(current->request.executeSlot) != reinterpret_cast<void*>(&ExecuteEntry)))
+                throw std::runtime_error("Owned teleport dispatch is no longer installed");
+            current->deadline.store(GetTickCount64() + current->request.lifetimeMs);
+        }
         else throw std::runtime_error("Owned teleport dispatch expired");
     } else throw std::runtime_error("Unknown teleport dispatch operation");
 }

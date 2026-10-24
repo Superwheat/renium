@@ -387,13 +387,16 @@ static void Early(Request r, Players peers, Instance options, Values reply) {
     auto success = [&](Instance value) { assert(value); ++accepted; };
     auto error = [&](std::string) { ++failed; };
     // Unowned receivers and a replaced Edit nonce still take the engine path.
+    model.universe = 8;
     execute(&model, *arrival_test::arguments, [](Variant) {}, {});
     slot(&service, 12, peers, options, success, error); assert(accepted == 1);
+    model.universe = 7;
     play_loader_test::currentNonce = "replacement";
     execute(&edit, *arrival_test::arguments, [](Variant) {}, {});
     slot(&service, 12, peers, options, success, error); assert(accepted == 2);
     play_loader_test::currentNonce = "owned-test-launch";
-    execute(&edit, *arrival_test::arguments, [](Variant) {}, {});
+    // Manual Play omits ExecutePlayModeAsync. Verified source ownership must
+    // hold its early call until the matching runtime relay appears anyway.
     slot(&service, 12, peers, options, success, error);
     assert(accepted == 2 && failed == 0 && owner.uses == 2); // Queued before plugin startup.
     children.push_back(relay);
@@ -403,6 +406,7 @@ static void Early(Request r, Players peers, Instance options, Values reply) {
     Pump(lease); Drain(context);
     assert(accepted == 3 && failed == 0 && owner.uses == 1);
     // Scope advancement cancels a pending old-server call exactly once.
+    execute(&edit, *arrival_test::arguments, [](Variant) {}, {});
     children.clear();
     slot(&service, 12, peers, options, success, error);
     r.action = 5; strcpy_s(r.launchNonce, "next-launch"); Handle(r);
