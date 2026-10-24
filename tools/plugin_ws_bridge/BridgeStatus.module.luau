@@ -73,7 +73,7 @@ function BridgeStatus.view(state)
 	local syncText = if lastSyncUnix > 0
 		then if editor.lastOk == false
 			then "Last sync failed at " .. formatClock(lastSyncUnix)
-			elseif pendingEditCount > 0 then "Syncing, last synced at " .. formatClock(lastSyncUnix)
+			elseif pendingEditCount > 0 then "Syncing"
 			else "Synced at " .. formatClock(lastSyncUnix)
 		elseif mode == "disconnected" then ""
 		else "Waiting for sync"
