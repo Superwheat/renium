@@ -15,6 +15,7 @@ function Teleport.create(context)
 	local routeJoinRelay
 	local emulatedPlaceId
 	local nativeRequests = {}
+	local requestQueue, queuedPlayers = {}, {}
 	local function finishNative(id, message)
 		local pending = nativeRequests[id]
 		if pending then
@@ -50,7 +51,8 @@ function Teleport.create(context)
 			assert(os.clock() < deadline, "Renium teleport is not armed; start Play with teleport enabled")
 			task.wait()
 		end
-		assert(active and not RunService:IsEdit() and state.phase == "idle", unavailableReason or "Renium teleport is unavailable or busy")
+		assert(active and not RunService:IsEdit() and state.phase ~= "off" and state.phase ~= "failed",
+			unavailableReason or "Renium teleport is unavailable")
 		assert(type(place) == "number" and place > 0 and place % 1 == 0 and place <= 9007199254740991, "Invalid destination ID")
 		assert(type(players) == "table" and #players > 0 and #players <= 8, "Teleport requires a player array")
 		assert(options == nil or typeof(options) == "Instance" and options:IsA("TeleportOptions"), "Invalid TeleportOptions")
@@ -59,16 +61,64 @@ function Teleport.create(context)
 			assert(type(key) == "number" and key % 1 == 0 and key >= 1 and key <= #players, "Teleport requires a player array")
 			assert(typeof(player) == "Instance" and player:IsA("Player") and player.Parent == game:GetService("Players"), "Player is not connected to this server")
 			assert(not seen[player], "Duplicate teleport player")
+			assert(not queuedPlayers[player] and not (state.pending and state.pending.data[player.Name]),
+				"This player already has a pending teleport")
 			seen[player] = true
 			table.insert(names, player.Name)
 		end
 		assert(#names == #players, "Teleport requires a dense player array")
 		local data, reserved = captureOptions(options)
+		-- Keep independent callers in order while the current group travels.
+		-- A second player's click must not overwrite or fail the first attempt.
+		local entry, started = {}, generation
+		table.insert(requestQueue, entry)
+		for player in seen do
+			queuedPlayers[player] = entry
+		end
+		deadline = os.clock() + 180
+		while active and generation == started and not RunService:IsEdit()
+			and state.phase ~= "off" and state.phase ~= "failed" and os.clock() < deadline
+			and (requestQueue[1] ~= entry or state.phase ~= "idle") do
+			task.wait()
+		end
+		table.remove(requestQueue, table.find(requestQueue, entry))
+		for player in seen do
+			queuedPlayers[player] = nil
+		end
+		assert(active and generation == started and not RunService:IsEdit() and state.phase == "idle",
+			unavailableReason or "The queued teleport session ended")
+		assert(os.clock() < deadline, "Queued teleport timed out")
+		for player in seen do
+			assert(player.Parent == game:GetService("Players"), "Player left while waiting to teleport")
+		end
 		for _, name in names do
 			state.observe(place, name, data, reserved)
 		end
 		state.phase = "loading"
 		return { id = state.id, status = "queued", trigger = "interim-api" }
+	end
+	local function nativeRequest(place, options, players)
+		local queued = request(tonumber(place), players, options)
+		state.pending.native = true
+		local snapshot = state.pending
+		local data = snapshot.data[snapshot.players[1]].teleportData
+		local members = {}
+		for _, player in players do
+			table.insert(members, player.UserId)
+		end
+		local join = { SourcePlaceId = game.PlaceId, SourceGameId = game.GameId,
+			TeleportData = data, Members = members }
+		local pending = { done = false, completed = false }
+		nativeRequests[queued.id] = pending
+		local deadline = os.clock() + 180
+		while active and not pending.done and os.clock() < deadline do
+			task.wait()
+		end
+		nativeRequests[queued.id] = nil
+		pending.completed = true
+		assert(active and pending.done, "The owned Studio teleport session ended")
+		assert(not pending.error, pending.error)
+		return join, data, tostring(queued.id)
 	end
 	if context.role == "play-server" then
 		-- Compatibility is optional: a game's module with this name must not
@@ -206,27 +256,17 @@ function Teleport.create(context)
 				nativeRelay.Name = "__ReniumTeleportNative_" .. context.runtimeId
 				nativeRelay:SetAttribute("__ReniumNative", params.scope or context.runtimeId)
 				nativeRelay.OnInvoke = function(place, options, ...)
-					local queued = request(tonumber(place), { ... }, options)
-					state.pending.native = true
-					local snapshot = state.pending
-					local data = snapshot.data[snapshot.players[1]].teleportData
-					local members = {}
-					for _, player in { ... } do
-						table.insert(members, player.UserId)
-					end
-					local join = { SourcePlaceId = game.PlaceId, SourceGameId = game.GameId,
-						TeleportData = data, Members = members }
-					local pending = { done = false, completed = false }
-					nativeRequests[queued.id] = pending
-					local deadline = os.clock() + 180
-					while active and not pending.done and os.clock() < deadline do
+					-- A thrown OnInvoke error is logged by Studio without resuming
+					-- this native caller. Return it so the hook completes TeleportAsync.
+					local ok, join, data, id = pcall(nativeRequest, place, options, { ... })
+					if not ok then
+						-- Let TeleportAsync finish yielding before its error continuation
+						-- runs. Immediate failures otherwise throw into BindableFunction's
+						-- nested invocation instead of returning to the teleport caller.
 						task.wait()
+						return tostring(join)
 					end
-					nativeRequests[queued.id] = nil
-					pending.completed = true
-					assert(active and pending.done, "The owned Studio teleport session ended")
-					assert(not pending.error, pending.error)
-					return join, data, tostring(queued.id)
+					return join, data, id
 				end
 				nativeRelay.Parent = game:GetService("ServerStorage")
 			end

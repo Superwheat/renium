@@ -16,7 +16,7 @@ The title shows `Teleporting...`, then ` - Teleported to <destination displayNam
 
 Native travel supports same-universe destinations. Reserved-server codes, ShouldReserveServer and JobId targeting are refused. Custom GUIs are not transferred. TeleportOptions data must be JSON-compatible, at most 64 KiB for the group.
 
-In Server & Clients, selected clients retain their process/window; others stay on source. First travel starts one destination server; later arrivals reuse it and its saved version, even after it empties. Return rejoins source. Root Stop closes all owned test processes, including interrupted arrivals. First travel includes server startup; later hops reuse it.
+In Server & Clients, selected clients keep their windows; others stay on source. Different players' requests queue in order. First travel starts one destination server; later arrivals reuse it and its saved version, even when empty. Return rejoins the original source server. Root Stop closes all owned tests, including interrupted arrivals. Rejected requests return an error to TeleportAsync.
 
 Test-player names and UserIds stay with their client across hops. Use the client's `runtimeId` from `rbx cs` with `-p` for exact targeting; ambiguous names are rejected. JoinData and local TeleportData carry the previous place and supplied data. Multiplayer daemon-restart recovery is unsupported; Stop and restart.
 
@@ -32,7 +32,7 @@ else
 end
 ```
 
-The adapter returns a queued receipt. Pass connected Players and optional TeleportOptions. Early calls wait up to 30 seconds for arming. Disabled/disconnected/busy sessions reject requests. Keep server validation. An existing game module named ReniumTeleport is preserved and disables the adapter.
+The adapter returns a queued receipt. Pass connected Players and optional TeleportOptions. Early calls wait up to 30 seconds for arming. Disabled/disconnected sessions reject requests. Keep server validation. An existing game module named ReniumTeleport is preserved and disables the adapter.
 
 Emulation supports Workspace, Lighting, ReplicatedFirst, ReplicatedStorage, ServerScriptService, ServerStorage, StarterGui, StarterPack, StarterPlayer, Teams and SoundService. Unsupported containers, Terrain voxels, PackageLinks and incompatible protected settings fail preflight. Custom player controllers need destination replacements. Client-created source children are cleared; failure afterward requires Stop.
 

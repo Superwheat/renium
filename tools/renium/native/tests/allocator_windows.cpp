@@ -225,6 +225,24 @@ static void Run() {
     arrival_test::Run(r.token, r.tableType);
     slot(source.get(), 12, {}, options, [&](Instance) { ++accepted; }, [&](std::string) { ++failed; });
     assert(failed == 1);
+    // Studio throws from a synchronous error continuation. Dispatch must not
+    // consume that exception and strand the original Luau caller.
+    bool synchronousError = false;
+    try {
+        slot(source.get(), 12, {}, options, [](Instance) { assert(false); },
+            [](std::string message) { throw std::runtime_error(message); });
+    } catch (const std::runtime_error& error) {
+        synchronousError = std::string(error.what()).find("connected players") != std::string::npos;
+    }
+    assert(synchronousError);
+    std::string rejected;
+    slot(source.get(), 12, peers, options, [](Instance) { assert(false); },
+        [&](std::string message) { rejected = std::move(message); });
+    auto rejection = std::make_shared<Tuple>();
+    rejection->values.push_back(sequence);
+    *reinterpret_cast<std::string*>(rejection->values[0].payload) = "Player already has a pending teleport";
+    completion(rejection); completion = {}; failure = {};
+    assert(rejected == "Player already has a pending teleport");
     r.action = 2; Handle(r);
     assert(slot == &Forward);
     r.action = 1; r.token = 2; Handle(r);

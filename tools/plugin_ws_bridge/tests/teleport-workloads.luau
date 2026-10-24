@@ -69,8 +69,11 @@ services.HttpService = { JSONEncode = function(_, value) return serde.encode("js
 	JSONDecode = function(_, value) return serde.decode("json", value) end }
 services.EncodingService = { Base64Decode = function(_, value) return buffer.fromstring(base64.decode(buffer.tostring(value))) end }
 local player = { Name = "Player1", IsA = function(_, class) return class == "Player" end }
+local player2 = { Name = "Player2", IsA = player.IsA }
+local player3 = { Name = "Player3", IsA = player.IsA }
 services.Players = { GetPlayers = function() return { player } end }
 player.Parent = services.Players
+player2.Parent, player3.Parent = services.Players, services.Players
 services.SerializationService = { DeserializeInstancesAsync = function()
 	if yieldDeserialize then coroutine.yield() end
 	return { { Destroy = function() destroyed += 1 end } }
@@ -83,7 +86,7 @@ local module = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgePlayTeleport.
 		nativeRelay = { SetAttribute = function(self, key, value) self[key] = value end, Destroy = function(self) self.destroyed = true end }
 		return nativeRelay
 	end },
-	typeof = function(value) return if value == player then "Instance" else typeof(value) end,
+	typeof = function(value) return if value == player or value == player2 or value == player3 then "Instance" else typeof(value) end,
 } })()
 local guiEvents = {}
 local content = {
@@ -143,12 +146,60 @@ assert(coroutine.resume(accept))
 assert(coroutine.resume(nativeCall) and coroutine.status(nativeCall) == "dead")
 assert(coroutine.resume(accept) and coroutine.status(accept) == "dead")
 send(server, "play-server", "fail", { id = nativeId })
-nativeCall = coroutine.create(function() nativeRelay.OnInvoke("12", nil, player) end)
+nativeCall = coroutine.create(function() return nativeRelay.OnInvoke("12", nil, player) end)
 assert(coroutine.resume(nativeCall))
 nativeId = send(server, "play-server", "status").pending.id
 send(server, "play-server", "fail", { id = nativeId, error = "Destination permission denied" })
-local nativeOk, nativeError = coroutine.resume(nativeCall)
-assert(not nativeOk and string.find(tostring(nativeError), "Destination permission denied", 1, true))
+local function nativeFailure(thread)
+	assert(coroutine.resume(thread) and coroutine.status(thread) == "suspended",
+		"native rejections must yield before invoking the engine's error continuation")
+	local ok, message = coroutine.resume(thread)
+	assert(ok and coroutine.status(thread) == "dead")
+	return message
+end
+local nativeError = nativeFailure(nativeCall)
+assert(string.find(nativeError, "Destination permission denied", 1, true),
+	"the native callback must receive an error value instead of an unhandled OnInvoke exception")
+assert(string.find(nativeFailure(coroutine.create(function() return nativeRelay.OnInvoke("0", nil, player) end)),
+	"Invalid destination ID", 1, true))
+
+-- Overlapping button clicks retain independent callers and destination data.
+local first = request(12, { player })
+local second = coroutine.create(function() return request(13, { player2 }) end)
+local third = coroutine.create(function() return request(14, { player3 }) end)
+assert(coroutine.resume(second) and coroutine.status(second) == "suspended")
+assert(coroutine.resume(third) and coroutine.status(third) == "suspended")
+assert(not pcall(request, 15, { player2 }), "a queued player cannot acquire another request")
+assert(send(server, "play-server", "status").pending.id == first.id)
+send(server, "play-server", "completeRoute", { id = first.id })
+assert(coroutine.resume(third) and coroutine.status(third) == "suspended", "call order must survive scheduler order")
+local secondOk, secondReceipt = coroutine.resume(second)
+assert(secondOk and coroutine.status(second) == "dead")
+local secondAttempt = send(server, "play-server", "status").pending
+assert(secondAttempt.id == secondReceipt.id and secondAttempt.placeId == 13 and secondAttempt.players[1] == "Player2")
+send(server, "play-server", "fail", { id = secondReceipt.id })
+assert(coroutine.resume(third) and coroutine.status(third) == "dead", "a failed route releases the next caller")
+local thirdAttempt = send(server, "play-server", "status").pending
+assert(thirdAttempt.placeId == 14 and thirdAttempt.players[1] == "Player3")
+send(server, "play-server", "completeRoute", { id = thirdAttempt.id })
+
+first = request(12, { player })
+second = coroutine.create(function() return nativeRelay.OnInvoke("12", nil, player2) end)
+assert(coroutine.resume(second) and coroutine.status(second) == "suspended")
+server.cleanup(false)
+send(server, "play-server", "arm")
+assert(string.find(nativeFailure(second), "session ended", 1, true))
+assert(send(server, "play-server", "status").pending == nil, "a stale queued call cannot run after reconnect")
+send(server, "play-server", "nativeBridge")
+
+first = request(12, { player })
+second = coroutine.create(function() return nativeRelay.OnInvoke("12", nil, player2) end)
+assert(coroutine.resume(second) and coroutine.status(second) == "suspended")
+player2.Parent = nil
+send(server, "play-server", "completeRoute", { id = first.id })
+assert(string.find(nativeFailure(second), "Player left while waiting", 1, true))
+assert(send(server, "play-server", "status").pending == nil)
+player2.Parent = services.Players
 for _, args in { { 0, { player } }, { 12, {} }, { 12, { player, player } }, { 12, { {} } }, { 12, { player }, {} } } do
 	assert(not pcall(request, table.unpack(args)), "invalid API input must not create a pending attempt")
 	assert(send(server, "play-server", "status").pending == nil)
@@ -233,7 +284,7 @@ content.installShim = installShim
 local collisionStatus = send(collision, "play-server", "arm")
 assert(not collisionStatus.compatibility and collisionStatus.compatibilityError)
 send(collision, "play-server", "nativeBridge")
-local collisionCall = coroutine.create(function() nativeRelay.OnInvoke("12", nil, player) end)
+local collisionCall = coroutine.create(function() return nativeRelay.OnInvoke("12", nil, player) end)
 assert(coroutine.resume(collisionCall), "a compatibility name collision must preserve native teleport")
 local collisionId = send(collision, "play-server", "status").pending.id
 local staged, collisionError = pcall(send, collision, "play-server", "begin", {
@@ -242,7 +293,7 @@ local staged, collisionError = pcall(send, collision, "play-server", "begin", {
 assert(not staged and string.find(tostring(collisionError), "game already owns", 1, true))
 assert(send(collision, "play-server", "status").phase == "loading", "refuse compatibility before staging or clearing content")
 send(collision, "play-server", "fail", { id = collisionId, error = "Fixture ended" })
-assert(not coroutine.resume(collisionCall))
+assert(string.find(nativeFailure(collisionCall), "Fixture ended", 1, true))
 collision.cleanup(true)
 local routing = runtime("play-server")
 services.CoreGui = {}

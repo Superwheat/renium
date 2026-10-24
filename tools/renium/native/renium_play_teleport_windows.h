@@ -159,51 +159,51 @@ inline Instance ResultInstance(const Request& r) {
 
 inline void InvokeRelay(const std::shared_ptr<Lease>& lease, Instance relay, std::int64_t place,
     Players players, Instance options, Success success, Failure failure) {
-    try {
-        if (!players || players->empty() || players->size() > 8) throw std::runtime_error("Teleport requires 1 through 8 connected players");
-        auto result = options ? ResultInstance(lease->request) : Instance{};
-        auto tuple = std::make_shared<Tuple>();
-        tuple->values.reserve(players->size() + 2);
-        // Use an engine-created string Variant as the transport template.
-        // The plugin created this attribute on this private server relay.
-        auto& destination = tuple->values.emplace_back();
-        using Attribute = void*(*)(void*, void*, renium_play_loader::StringView);
-        constexpr char key[] = "__ReniumNative";
-        reinterpret_cast<Attribute>(lease->request.getAttribute)(relay.get(), &destination, {key, sizeof(key) - 1});
-        if (!destination.operations || !destination.type
-            || renium_play_loader::Word(reinterpret_cast<void*>(destination.type), 0) != lease->request.stringTypeTable)
-            throw std::runtime_error("Teleport relay has no string transport template");
-        *reinterpret_cast<std::string*>(destination.payload) = std::to_string(place);
-        AppendInstance(*tuple, options, lease->request.instanceType);
-        for (const auto& player : *players) AppendInstance(*tuple, player, lease->request.instanceType);
-        // BindableFunction preserves the caller's async engine lifecycle. Its
-        // plugin handler validates live players/options and waits for host
-        // acceptance before allowing the original TeleportAsync to complete.
-        std::function<void(Values)> accepted{[lease, scope = lease->scope.load(), place, result = std::move(result), success = std::move(success), error = failure](Values values) {
-            try {
-                if (!values || values->values.size() != 3 || values->values[0].type != lease->request.tableType
-                    || !values->values[2].type || renium_play_loader::Word(reinterpret_cast<void*>(values->values[2].type), 0) != lease->request.stringTypeTable)
-                    throw std::runtime_error("Native teleport arrival data has an incompatible value type");
-                const auto& id = *reinterpret_cast<const std::string*>(values->values[2].payload);
-                std::size_t used = 0;
-                const auto sequence = std::stoull(id, &used);
-                if (used != id.size() || !sequence || sequence > 9007199254740991ull)
-                    throw std::runtime_error("Native teleport arrival sequence is invalid");
-                auto record = std::make_shared<JoinRecord>(sequence, place, values->values[0], values->values[1]);
-                {
-                    std::lock_guard lock(mutex);
-                    if (current != lease || !lease->Alive() || lease->scope.load() != scope)
-                        throw std::runtime_error("Native teleport ended before acceptance");
-                    lease->arrival = std::move(record);
-                }
-                success(result);
-            } catch (const std::exception& message) { error(message.what()); }
-        }};
-        reinterpret_cast<Invoke>(lease->request.invoke)(relay.get(), std::move(tuple), std::move(accepted), failure);
-    } catch (const std::exception& error) {
-        if (failure) failure(error.what());
-        else throw;
-    }
+    if (!players || players->empty() || players->size() > 8) throw std::runtime_error("Teleport requires 1 through 8 connected players");
+    auto result = options ? ResultInstance(lease->request) : Instance{};
+    auto tuple = std::make_shared<Tuple>();
+    tuple->values.reserve(players->size() + 2);
+    // Use an engine-created string Variant as the transport template.
+    // The plugin created this attribute on this private server relay.
+    auto& destination = tuple->values.emplace_back();
+    using Attribute = void*(*)(void*, void*, renium_play_loader::StringView);
+    constexpr char key[] = "__ReniumNative";
+    reinterpret_cast<Attribute>(lease->request.getAttribute)(relay.get(), &destination, {key, sizeof(key) - 1});
+    if (!destination.operations || !destination.type
+        || renium_play_loader::Word(reinterpret_cast<void*>(destination.type), 0) != lease->request.stringTypeTable)
+        throw std::runtime_error("Teleport relay has no string transport template");
+    *reinterpret_cast<std::string*>(destination.payload) = std::to_string(place);
+    AppendInstance(*tuple, options, lease->request.instanceType);
+    for (const auto& player : *players) AppendInstance(*tuple, player, lease->request.instanceType);
+    // BindableFunction preserves the caller's async engine lifecycle. Its
+    // plugin handler validates live players/options and waits for host
+    // acceptance before allowing the original TeleportAsync to complete.
+    std::function<void(Values)> accepted{[lease, scope = lease->scope.load(), place, result = std::move(result), success = std::move(success), error = failure](Values values) {
+        try {
+            // OnInvoke exceptions can leave native callers suspended. The
+            // private relay returns failures as one engine-owned string.
+            if (values && values->values.size() == 1 && values->values[0].type
+                && renium_play_loader::Word(reinterpret_cast<void*>(values->values[0].type), 0) == lease->request.stringTypeTable)
+                throw std::runtime_error(*reinterpret_cast<const std::string*>(values->values[0].payload));
+            if (!values || values->values.size() != 3 || values->values[0].type != lease->request.tableType
+                || !values->values[2].type || renium_play_loader::Word(reinterpret_cast<void*>(values->values[2].type), 0) != lease->request.stringTypeTable)
+                throw std::runtime_error("Native teleport arrival data has an incompatible value type");
+            const auto& id = *reinterpret_cast<const std::string*>(values->values[2].payload);
+            std::size_t used = 0;
+            const auto sequence = std::stoull(id, &used);
+            if (used != id.size() || !sequence || sequence > 9007199254740991ull)
+                throw std::runtime_error("Native teleport arrival sequence is invalid");
+            auto record = std::make_shared<JoinRecord>(sequence, place, values->values[0], values->values[1]);
+            {
+                std::lock_guard lock(mutex);
+                if (current != lease || !lease->Alive() || lease->scope.load() != scope)
+                    throw std::runtime_error("Native teleport ended before acceptance");
+                lease->arrival = std::move(record);
+            }
+            success(result);
+        } catch (const std::exception& message) { error(message.what()); }
+    }};
+    reinterpret_cast<Invoke>(lease->request.invoke)(relay.get(), std::move(tuple), std::move(accepted), failure);
 }
 
 struct Pending {
@@ -288,8 +288,8 @@ inline void Entry(void* service, std::int64_t place, Players players, Instance o
                         request->deadline = GetTickCount64() + 180000;
                         {
                             std::lock_guard lock(lease->requestsMutex);
-                            if (std::any_of(lease->requests.begin(), lease->requests.end(), [](const auto& pending) { return pending->state.load() != 2; }))
-                                throw std::runtime_error("A Studio teleport is already pending");
+                            if (std::count_if(lease->requests.begin(), lease->requests.end(), [](const auto& pending) { return pending->state.load() != 2; }) >= 8)
+                                throw std::runtime_error("The Studio teleport request queue is full");
                             lease->requests.push_back(request);
                         }
                         Poll(request);
@@ -297,7 +297,9 @@ inline void Entry(void* service, std::int64_t place, Players players, Instance o
                     }
                 }
             } else if (auto relay = Relay(service, lease->request)) {
-                InvokeRelay(lease, std::move(relay), place, std::move(players), std::move(options), std::move(success), std::move(failure));
+                // Keep the original error continuation available to the outer
+                // dispatch catch: synchronous engine failures throw through it.
+                InvokeRelay(lease, std::move(relay), place, std::move(players), std::move(options), std::move(success), failure);
                 return;
             }
         } catch (const std::exception& error) { if (failure) failure(error.what()); return; }
