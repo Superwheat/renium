@@ -108,8 +108,12 @@ assert(status.running)
 local reserved = api.startStopPlay({ stop = true, launchNonce = "travel-source", teleportTransition = "hop-1", prepareTeleport = true })
 assert(reserved.ok and reserved.running and reserved.teleportTransition == "hop-1", "reserving a transition must retain the source test")
 services.StudioTestService:EndTest()
-scheduler.wait(0.06)
 local stopped = api.startStopPlay({})
+local stopDeadline = os.clock() + 1
+while stopped.running and os.clock() < stopDeadline do
+	scheduler.wait()
+	stopped = api.startStopPlay({})
+end
 assert(stopped.ok and not stopped.running and stopped.teleportTransition == "hop-1")
 local stopCount = stops
 assert(api.startStopPlay({ stop = true, launchNonce = "travel-source", teleportTransition = "hop-1" }).ok)
