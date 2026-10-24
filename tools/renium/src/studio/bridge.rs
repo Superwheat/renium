@@ -504,6 +504,7 @@ mod request_cancellation_tests {
             desired_device_request: Arc::new(Mutex::new(Value::Null)),
             routing: Default::default(),
             performance_manager: None,
+            team_create: Mutex::new(HashMap::new()),
         };
         let result = bridge.call_for_runtime_with_timeout(
             "getStudioState",
@@ -649,10 +650,19 @@ pub(crate) struct BridgeInfoPayload {
     pub(crate) place_id: Option<i64>,
     pub(crate) game_id: Option<i64>,
     pub(crate) place_name: String,
+    /// Whether the Edit place is in a Team Create session, where Studio saves
+    /// every edit to Roblox itself. Play runtimes and old plugins send nothing.
+    pub(crate) team_create: Option<bool>,
     pub(crate) protocol_version: String,
     pub(crate) codec_version: String,
     pub(crate) export_all_properties: bool,
     pub(crate) registration_ack: bool,
+}
+
+/// One Studio registers once per bridge channel; a registration made before
+/// collaborators had joined says false where a later one says true.
+pub(crate) fn merge_team_create(values: impl Iterator<Item = Option<bool>>) -> Option<bool> {
+    values.flatten().max()
 }
 
 #[derive(Default)]
@@ -855,6 +865,9 @@ pub(crate) struct BridgeServer {
     routing: Arc<Mutex<RuntimeRouting>>,
     desired_device_request: Arc<Mutex<Value>>,
     performance_manager: Option<Arc<crate::studio::performance::Manager>>,
+    /// Team Create state per Edit runtime as Studio last reported it, which
+    /// outranks the value the plugin registered with.
+    team_create: Mutex<HashMap<String, bool>>,
 }
 
 pub(crate) struct BridgeRequestLease {
@@ -1122,6 +1135,54 @@ impl BridgeServer {
         }
     }
 
+    fn edit_snapshots(&self, runtime_id: Option<&str>) -> Vec<BridgeSocketSnapshot> {
+        self.channels
+            .iter()
+            .flat_map(|channel| Self::cached_channel_snapshots(channel))
+            .filter(|snapshot| {
+                normalize_bridge_role(Self::bridge_role_key_base(&snapshot.role_key))
+                    == BRIDGE_ROLE_EDIT
+                    && runtime_id.is_none_or(|id| snapshot.bridge_info.runtime_id == id)
+            })
+            .collect()
+    }
+
+    /// The Edit runtime a command addresses: the pinned one, or the only
+    /// connected Edit window when none is pinned.
+    pub(crate) fn edit_runtime(&self, runtime_id: Option<&str>) -> Option<String> {
+        let mut runtimes = self
+            .edit_snapshots(runtime_id)
+            .into_iter()
+            .map(|snapshot| snapshot.bridge_info.runtime_id)
+            .collect::<Vec<_>>();
+        runtimes.sort();
+        runtimes.dedup();
+        match runtimes.as_slice() {
+            [runtime] => Some(runtime.clone()),
+            _ => None,
+        }
+    }
+
+    /// Whether the Edit place a command wrote to is in a Team Create session:
+    /// Studio's latest report for that runtime, else what its plugin registered.
+    pub(crate) fn edit_team_create(&self, runtime_id: Option<&str>) -> Option<bool> {
+        let runtime = self.edit_runtime(runtime_id)?;
+        if let Some(known) = self.team_create.lock_recover().get(&runtime) {
+            return Some(*known);
+        }
+        merge_team_create(
+            self.edit_snapshots(Some(&runtime))
+                .iter()
+                .map(|snapshot| snapshot.bridge_info.team_create),
+        )
+    }
+
+    pub(crate) fn remember_team_create(&self, runtime_id: &str, team_create: bool) {
+        self.team_create
+            .lock_recover()
+            .insert(runtime_id.to_string(), team_create);
+    }
+
     fn runtime_role(&self, runtime_id: &str) -> Option<&'static str> {
         for channel in &self.channels {
             for snapshot in Self::cached_channel_snapshots(channel) {
@@ -1340,6 +1401,7 @@ impl BridgeServer {
             routing: Arc::clone(&accept_state.routing),
             desired_device_request,
             performance_manager,
+            team_create: Mutex::new(HashMap::new()),
         };
 
         let required_channels = server.channels.len();
@@ -2313,6 +2375,7 @@ impl BridgeServer {
             let cached = self.verified_full_pushes.lock_recover().remove(runtime_id);
             drop(cached);
         }
+        self.team_create.lock_recover().remove(runtime_id);
         // Retire before best-effort cleanup: neither a busy channel nor an
         // in-flight handshake may resurrect this runtime.
         self.routing
@@ -3389,6 +3452,7 @@ impl BridgeServer {
             game_id: Option<i64>,
             place_name: String,
             launch_place_name: String,
+            team_create: Option<bool>,
             build_unix: i64,
             ports: Vec<u16>,
             pid: Option<u32>,
@@ -3480,6 +3544,7 @@ impl BridgeServer {
                         if entry.place_name.is_empty() {
                             entry.place_name.clone_from(&info.place_name);
                         }
+                        entry.team_create = entry.team_create.or(info.team_create);
                         entry.build_unix = entry.build_unix.max(info.bridge_build_unix);
                         entry.pid = entry.pid.or(snapshot.studio_pid);
                     }
@@ -3496,6 +3561,7 @@ impl BridgeServer {
                         game_id: info.game_id,
                         place_name: info.place_name.clone(),
                         launch_place_name: info.launch_place_name.clone(),
+                        team_create: info.team_create,
                         build_unix: info.bridge_build_unix,
                         ports: vec![snapshot.port],
                         pid: snapshot.studio_pid,
@@ -3559,6 +3625,15 @@ impl BridgeServer {
                 }
                 if let Some(game_id) = entry.game_id {
                     object.insert("gameId".to_string(), json!(game_id));
+                }
+                let team_create = self
+                    .team_create
+                    .lock_recover()
+                    .get(&entry.runtime_id)
+                    .copied()
+                    .or(entry.team_create);
+                if let Some(team_create) = team_create.filter(|_| entry.role == BRIDGE_ROLE_EDIT) {
+                    object.insert("teamCreate".to_string(), json!(team_create));
                 }
                 if let Some(pid) = entry.pid {
                     object.insert("pid".to_string(), json!(pid));

@@ -53,7 +53,10 @@ back as files. The extension has the same controls.
 For an existing project, run only `rbx lon`; a pull would replace your files with
 Studio's copy. To start from a place file, run `rbx init` in its folder, open the
 file with `rbx so Place.rbxl`, then pull. `rbx status` shows the connection,
-`rbx lst` shows Live Sync and `rbx lof` stops it.
+`rbx lst` shows Live Sync and `rbx lof` stops it. Both report `persistence`:
+`teamCreate` when the open place is in a Team Create session, which syncs every
+edit to Roblox by itself, or `unsaved` when the edits stay in Studio until you
+save or publish.
 
 There is no server to start. The first `rbx` command starts Renium's background
 process (the daemon), and the Studio plugin connects to it by itself. The daemon

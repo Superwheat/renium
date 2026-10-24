@@ -1161,7 +1161,16 @@ fn studio_status_result(
                 result[key] = value.clone();
             }
         }
+        if let (Some(team_create), Some(runtime_id)) = (
+            state.get("teamCreate").and_then(Value::as_bool),
+            context.runtime_id.as_deref(),
+        ) {
+            bridge.remember_team_create(runtime_id, team_create);
+        }
         result["studioState"] = state;
+    }
+    if has_edit && let Some(team_create) = bridge.edit_team_create(context.runtime_id.as_deref()) {
+        result["persistence"] = json!(persistence_label(team_create));
     }
     let orphans = orphan_summaries(&bridge.list_bridge_clients(), context.runtime_id.as_deref());
     if !orphans.is_empty() {
@@ -1845,7 +1854,76 @@ fn automation_dispatch_managed(
             .live_sync()
             .resume(context.id, std::iter::empty::<PathBuf>());
     }
+    let mut result = result;
+    if studio_edit_persists(operation, writes_studio_directly, &result) {
+        attach_persistence(
+            &mut result,
+            edit_persistence(bridge, context.runtime_id.as_deref()),
+        );
+    }
     Ok(result)
+}
+
+/// Where an edit the command made in the Edit window now lives: `teamCreate`
+/// means Team Create syncs it to Roblox by itself, `unsaved` that it stays in
+/// the Studio session until the user saves or publishes.
+fn persistence_label(team_create: bool) -> &'static str {
+    if team_create { "teamCreate" } else { "unsaved" }
+}
+
+/// Team Create state of the Edit place a command wrote to: what its plugin
+/// registered or Studio reported since, else one state query for a plugin that
+/// predates the registration field.
+fn edit_persistence(bridge: &BridgeServer, runtime_id: Option<&str>) -> Option<bool> {
+    let runtime = bridge.edit_runtime(runtime_id)?;
+    if let Some(known) = bridge.edit_team_create(Some(&runtime)) {
+        return Some(known);
+    }
+    let state = bridge
+        .call_for_runtime_with_timeout(
+            "getStudioState",
+            json!({}),
+            BridgeTarget::Edit,
+            &runtime,
+            Some(Duration::from_secs(2)),
+        )
+        .ok()?;
+    let team_create = state.get("teamCreate").and_then(Value::as_bool)?;
+    bridge.remember_team_create(&runtime, team_create);
+    Some(team_create)
+}
+
+fn attach_persistence(result: &mut Value, team_create: Option<bool>) {
+    if let (Some(object), Some(team_create)) = (result.as_object_mut(), team_create) {
+        object.insert(
+            "persistence".to_string(),
+            json!(persistence_label(team_create)),
+        );
+    }
+}
+
+/// True for a successful result of an operation that changed the Edit window
+/// itself in this command: Luau in Edit, a push, a multi-edit, an asset insert,
+/// or a direct property write or delete. Reads, play-time Luau, pushes that sent
+/// nothing and edits the push review declined carry no persistence note.
+fn studio_edit_persists(operation: u16, writes_studio_directly: bool, result: &Value) -> bool {
+    let Some(object) = result.as_object() else {
+        return false;
+    };
+    if object.get("ok").and_then(Value::as_bool) == Some(false)
+        || object.contains_key("skippedByReview")
+    {
+        return false;
+    }
+    match operation {
+        op::LUAU => object.get("context").and_then(Value::as_str) == Some("edit"),
+        op::PUSH => !["verifyOnly", "unchanged"]
+            .iter()
+            .any(|key| object.contains_key(*key)),
+        op::MULTI_EDIT | op::ASSET_INSERT => true,
+        op::SET_PROPERTY | op::REMOVE => writes_studio_directly,
+        _ => false,
+    }
 }
 
 struct LiveOperationOptions {
@@ -2126,7 +2204,36 @@ fn start_managed_live_operation(
     Ok(merge_live_status(plugin, daemon, options.compact))
 }
 
+/// Live Sync results say where the edits it pushes live, from what is already
+/// known about the Edit window; a status call never queries Studio for it.
 fn automation_live_operation(
+    operation: u16,
+    context: &automation::BoundContext,
+    parameters: &Value,
+    state: &automation::State,
+    bridge: &Arc<BridgeServer>,
+    bridge_wait_seconds: f64,
+) -> std::result::Result<Value, automation::Failure> {
+    let mut result = automation_live_operation_result(
+        operation,
+        context,
+        parameters,
+        state,
+        bridge,
+        bridge_wait_seconds,
+    )?;
+    if matches!(operation, op::LIVE_START | op::LIVE_STATUS)
+        && result.get("ok").and_then(Value::as_bool) != Some(false)
+    {
+        attach_persistence(
+            &mut result,
+            bridge.edit_team_create(context.runtime_id.as_deref()),
+        );
+    }
+    Ok(result)
+}
+
+fn automation_live_operation_result(
     operation: u16,
     context: &automation::BoundContext,
     parameters: &Value,
@@ -3426,6 +3533,62 @@ mod tests {
             assert!(!automation_retry_is_safe(operation, &json!({}), &ended));
             assert!(!automation_retry_is_safe(operation, &json!({}), &busy));
         }
+    }
+
+    #[test]
+    fn edits_made_in_studio_say_where_they_persist() {
+        let edit = json!({ "ok": true, "context": "edit", "results": [1] });
+        assert!(studio_edit_persists(op::LUAU, false, &edit));
+        let server = json!({ "ok": true, "context": "server", "results": [1] });
+        assert!(!studio_edit_persists(op::LUAU, false, &server));
+        let failed = json!({ "ok": false, "context": "edit", "error": "x" });
+        assert!(!studio_edit_persists(op::LUAU, false, &failed));
+        assert!(studio_edit_persists(
+            op::PUSH,
+            false,
+            &json!({ "ok": true, "instances": 2 })
+        ));
+        for key in ["verifyOnly", "unchanged", "skippedByReview"] {
+            assert!(!studio_edit_persists(
+                op::PUSH,
+                false,
+                &json!({ "ok": true, key: true })
+            ));
+        }
+        assert!(studio_edit_persists(
+            op::SET_PROPERTY,
+            true,
+            &json!({ "ok": true })
+        ));
+        assert!(!studio_edit_persists(
+            op::REMOVE,
+            true,
+            &json!({ "ok": true, "skippedByReview": true })
+        ));
+        assert!(studio_edit_persists(
+            op::ASSET_INSERT,
+            false,
+            &json!({ "ok": true, "instances": 1 })
+        ));
+        assert!(!studio_edit_persists(
+            op::SET_PROPERTY,
+            false,
+            &json!({ "ok": true })
+        ));
+        assert!(!studio_edit_persists(
+            op::FIND,
+            false,
+            &json!({ "ok": true })
+        ));
+
+        let mut result = edit.clone();
+        attach_persistence(&mut result, Some(true));
+        assert_eq!(result["persistence"], json!("teamCreate"));
+        attach_persistence(&mut result, Some(false));
+        assert_eq!(result["persistence"], json!("unsaved"));
+        let mut unknown = edit;
+        attach_persistence(&mut unknown, None);
+        assert!(unknown.get("persistence").is_none());
     }
 
     #[test]

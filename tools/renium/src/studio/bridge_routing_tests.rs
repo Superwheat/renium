@@ -23,7 +23,53 @@ pub(crate) fn fixture() -> BridgeServer {
         routing: Default::default(),
         desired_device_request: Default::default(),
         performance_manager: None,
+        team_create: Mutex::new(HashMap::new()),
     }
+}
+
+#[test]
+fn team_create_follows_the_addressed_edit_window_and_studios_latest_report() {
+    let bridge = fixture();
+    let edit = |runtime: &str, place: i64, team_create: Option<bool>| BridgeInfoPayload {
+        runtime_id: runtime.into(),
+        bridge_role: BRIDGE_ROLE_EDIT.into(),
+        game_id: Some(10),
+        place_id: Some(place),
+        place_name: format!("Place{place}"),
+        team_create,
+        ..BridgeInfoPayload::default()
+    };
+    // Studio A registered its first channel before its collaborators had joined.
+    let _a0 = connect(&bridge, 0, edit("a", 20, Some(false)));
+    let _a1 = connect(&bridge, 1, edit("a", 20, Some(true)));
+    let _b0 = connect(&bridge, 0, edit("b", 30, Some(false)));
+    assert_eq!(bridge.edit_team_create(Some("a")), Some(true));
+    assert_eq!(bridge.edit_team_create(Some("b")), Some(false));
+    assert_eq!(bridge.edit_team_create(None), None, "two Edit windows");
+    assert_eq!(bridge.edit_runtime(Some("a")).as_deref(), Some("a"));
+    assert_eq!(bridge.edit_team_create(Some("missing")), None);
+
+    bridge.remember_team_create("b", true);
+    assert_eq!(bridge.edit_team_create(Some("b")), Some(true));
+    bridge.retire_runtime("b");
+    assert_eq!(bridge.edit_team_create(Some("b")), None);
+    assert_eq!(bridge.edit_team_create(None), Some(true), "only A remains");
+
+    let old_plugin = fixture();
+    let _c = connect(&old_plugin, 0, edit("c", 40, None));
+    assert_eq!(old_plugin.edit_runtime(None).as_deref(), Some("c"));
+    assert_eq!(old_plugin.edit_team_create(None), None);
+    let listed = old_plugin.list_bridge_clients();
+    assert!(
+        listed
+            .iter()
+            .all(|client| client.get("teamCreate").is_none())
+    );
+    assert_eq!(
+        merge_team_create([None, Some(false), None].into_iter()),
+        Some(false)
+    );
+    assert_eq!(merge_team_create([].into_iter()), None);
 }
 
 #[test]

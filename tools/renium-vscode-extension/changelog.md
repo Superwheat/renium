@@ -4,6 +4,7 @@
 
 ### Improvements
 
+- Commands that change the open Edit window (`rbx l` in Edit, `ps`, `prop`, `del`, `me` and `ai`) now answer with `persistence`: `teamCreate` when the place is in a Team Create session, which syncs the change to Roblox by itself, or `unsaved` when it stays in the Studio session until the user saves or publishes. `rbx status`, `lst` and `lon` report the same field, and every connected Edit window in `status` and `cs` carries `teamCreate`, so it no longer has to be inferred. A plugin that predates the field is asked once per Studio. An agent had added an anchored part to a Team Create place with `rbx l` and told the user to save the place; the guides now say never to ask for a save when `persistence` is `teamCreate`.
 - `rbx q --props` and `rbx bg` answer a legacy property name with the value Studio saved under its successor: `Image` on an ImageButton or ImageLabel returns the `ImageContent` asset instead of "not saved" or "Property not found", which sent an agent off grepping compressed files for asset ids.
 - The Studio panel's sync line reads "Syncing, last synced at ..." while Studio edits wait for the daemon, instead of "Last synced at ...", which read like a different state from the "Synced at ..." it turns into a moment later.
 

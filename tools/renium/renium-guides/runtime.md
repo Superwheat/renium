@@ -14,7 +14,7 @@ rbx co --server --level error -n 20
 rbx co -p 1 --grep "round|tag" -n 20
 ```
 
-`l` targets Edit when stopped and the server during Play; `--server` and `--edit` pin it, and an error names where it ran (`[Edit window]`, `[play server]`, `[client 1]`). `lc CODE PLAYER` targets a client by name or index. Edit has no `LocalPlayer` or `PlayerGui`.
+`l` targets Edit when stopped and the server during Play; `--server` and `--edit` pin it, and an error names where it ran (`[Edit window]`, `[play server]`, `[client 1]`). `lc CODE PLAYER` targets a client by name or index. Edit has no `LocalPlayer` or `PlayerGui`. An Edit result carries `persistence`: `teamCreate` means Team Create syncs what the code changed to Roblox by itself, with no save step; `unsaved` means it stays in the Studio session until the user saves or publishes (see `RENIUM/publishing.md`).
 
 `l` and `lc` read state. They cannot tell you what a player sees; when visibility is the question, record the client and look at the frames (`RENIUM/capture-device.md`), driven by `rbx inp` rather than by calling the game's functions.
 

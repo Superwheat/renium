@@ -3267,6 +3267,7 @@ function BridgePluginRuntime.start(context)
 			placeId = game.PlaceId,
 			gameId = game.GameId,
 			placeName = game.Name,
+			teamCreate = if RunService:IsEdit() then #game:GetService("Players"):GetPlayers() > 0 else nil,
 			bridgeVersion = BRIDGE_VERSION,
 			bridgeBuildUnix = BRIDGE_BUILD_UNIX,
 			protocolVersion = BRIDGE_PROTOCOL_VERSION,
