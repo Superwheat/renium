@@ -14,6 +14,58 @@ enum Origin {
     Number(u64),
 }
 
+// The value an instruction leaves in its destination, as far as the walk
+// tracks it: a key address, a stack slot, a copied slot run or an immediate.
+fn tracked_value(
+    i: &iced_x86::Instruction,
+    address: Option<i64>,
+    registers: &HashMap<Register, Vec<Origin>>,
+    stack: &HashMap<i64, Origin>,
+    keys: &HashMap<usize, usize>,
+) -> Option<Vec<Origin>> {
+    match i.mnemonic() {
+        Mnemonic::Lea if i.is_ip_rel_memory_operand() => keys
+            .get(&(i.ip_rel_memory_address() as usize))
+            .map(|key| vec![Origin::Key(*key)]),
+        Mnemonic::Lea => address.map(|at| vec![Origin::Stack(at)]),
+        Mnemonic::Mov
+        | Mnemonic::Movaps
+        | Mnemonic::Movups
+        | Mnemonic::Movdqa
+        | Mnemonic::Movdqu => match i.op1_kind() {
+            OpKind::Register => registers.get(&i.op1_register().full_register()).cloned(),
+            OpKind::Memory => address.and_then(|at| {
+                (0..i.memory_size().size())
+                    .step_by(8)
+                    .map(|n| stack.get(&(at + n as i64)).copied())
+                    .collect::<Option<Vec<_>>>()
+            }),
+            OpKind::Immediate32 | OpKind::Immediate32to64 | OpKind::Immediate64 => {
+                Some(vec![Origin::Number(i.immediate(1))])
+            }
+            _ => None,
+        },
+        Mnemonic::Add | Mnemonic::Sub
+            if i.op0_kind() == OpKind::Register
+                && matches!(
+                    i.op1_kind(),
+                    OpKind::Immediate8to64 | OpKind::Immediate32to64
+                ) =>
+        {
+            match registers
+                .get(&i.op0_register().full_register())
+                .and_then(|v| v.first())
+            {
+                Some(Origin::Stack(at)) => Some(vec![Origin::Stack(
+                    at + i.immediate(1) as i64 * if i.mnemonic() == Mnemonic::Sub { -1 } else { 1 },
+                )]),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 // Follow the string_view key through scalar/SIMD copies to the writer's RDX.
 // This does not depend on registers, stack offsets or instruction distances.
 fn writers(code: &[u8], entry: usize, keys: &HashMap<usize, usize>) -> Result<[(usize, usize); 3]> {
@@ -65,48 +117,7 @@ fn writers(code: &[u8], entry: usize, keys: &HashMap<usize, usize>) -> Result<[(
             }
             continue;
         }
-        let value = match i.mnemonic() {
-            Mnemonic::Lea if i.is_ip_rel_memory_operand() => keys
-                .get(&(i.ip_rel_memory_address() as usize))
-                .map(|key| vec![Origin::Key(*key)]),
-            Mnemonic::Lea => address.map(|at| vec![Origin::Stack(at)]),
-            Mnemonic::Mov
-            | Mnemonic::Movaps
-            | Mnemonic::Movups
-            | Mnemonic::Movdqa
-            | Mnemonic::Movdqu => match i.op1_kind() {
-                OpKind::Register => registers.get(&i.op1_register().full_register()).cloned(),
-                OpKind::Memory => address.and_then(|at| {
-                    (0..i.memory_size().size())
-                        .step_by(8)
-                        .map(|n| stack.get(&(at + n as i64)).copied())
-                        .collect::<Option<Vec<_>>>()
-                }),
-                OpKind::Immediate32 | OpKind::Immediate32to64 | OpKind::Immediate64 => {
-                    Some(vec![Origin::Number(i.immediate(1))])
-                }
-                _ => None,
-            },
-            Mnemonic::Add | Mnemonic::Sub
-                if i.op0_kind() == OpKind::Register
-                    && matches!(
-                        i.op1_kind(),
-                        OpKind::Immediate8to64 | OpKind::Immediate32to64
-                    ) =>
-            {
-                match registers
-                    .get(&i.op0_register().full_register())
-                    .and_then(|v| v.first())
-                {
-                    Some(Origin::Stack(at)) => Some(vec![Origin::Stack(
-                        at + i.immediate(1) as i64
-                            * if i.mnemonic() == Mnemonic::Sub { -1 } else { 1 },
-                    )]),
-                    _ => None,
-                }
-            }
-            _ => None,
-        };
+        let value = tracked_value(&i, address, &registers, &stack, keys);
         let sp = registers.get(&Register::RSP).cloned();
         for register in factory.info(&i).used_registers() {
             if matches!(
