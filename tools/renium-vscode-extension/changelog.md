@@ -1,14 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.5.2 - 2026-10-25
 
 ### New
 
 - Solo Play on Windows and on Apple silicon macOS supports TeleportService travel to saved destinations with native server/client models and join data. Travel uses Roblox's default loading screen, updates the window title immediately, and prepares the next launch before leaving the source. Stop restores the original unsaved Edit. A restricted compatibility adapter remains available when native switching is unavailable.
-
-### Bug fixes
-
-- A native capture that found one instance more or fewer than Studio had counted a moment earlier (a collaborator's edit replicating during the capture) is now retried like any other change that lands mid-capture, instead of failing the command that triggered it. An `rbx l --edit` on a Team Create place had been refused once with "Studio native Workspace snapshot contains 14632 instances; expected 14633" and worked on the next try.
 
 ### Improvements
 
@@ -18,6 +14,10 @@
 - A project bound to a local place file now selects the Studio that `rbx so FILE` opened when several Studios are connected, instead of refusing with "More than one Studio runtime matches this project" until `--place` is passed. `rbx so` records the opened place beside the project files (as `rbx sx` already did), and that record only breaks ties: a lone Studio is still selected as before.
 - `rbx q --props` and `rbx bg` answer a legacy property name with the value Studio saved under its successor: `Image` on an ImageButton or ImageLabel returns the `ImageContent` asset instead of "not saved" or "Property not found", which sent an agent off grepping compressed files for asset ids.
 - The Studio panel's sync line reads "Syncing" while Studio edits wait for the daemon, instead of "Last synced at ...", which read like a different state from the "Synced at ..." it turns into a moment later.
+
+### Bug fixes
+
+- A native capture that found one instance more or fewer than Studio had counted a moment earlier (a collaborator's edit replicating during the capture) is now retried like any other change that lands mid-capture, instead of failing the command that triggered it. An `rbx l --edit` on a Team Create place had been refused once with "Studio native Workspace snapshot contains 14632 instances; expected 14633" and worked on the next try.
 
 ## 0.5.1 - 2026-10-23
 
