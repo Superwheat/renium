@@ -1,6 +1,6 @@
 # Playtest teleport in Studio
 
-Start with Studio's Play/Play Here or Server & Clients, `rbx play -s`, or `rbx play -s --players 2`. Windows prearms Edit and intercepts `TeleportService:TeleportAsync(placeId, players, options)`. CLI multiplayer arms before adding clients; early PlayerAdded calls wait for their bridges. Calls return native TeleportAsyncResult; the `teleport-service` trigger needs no adapter. Transient setup failures retry; Stop rearms the next launch.
+Start with Studio's Play/Play Here or Server & Clients, `rbx play -s`, or `rbx play -s --players 2`. Windows and Apple silicon macOS prearm Edit and intercepts `TeleportService:TeleportAsync(placeId, players, options)`. CLI multiplayer arms before adding clients; early PlayerAdded calls wait for their bridges. Calls return native TeleportAsyncResult; the `teleport-service` trigger needs no adapter. Transient setup failures retry; Stop rearms the next launch.
 
 Use published IDs and Open Cloud read access: `RENIUM/opencloud.md`. Every attempt authorizes the destination and selects its newest **saved** version, including unpublished saves. Unreadable history/destinations fail before leaving; caching never bypasses authorization.
 
@@ -22,7 +22,7 @@ Test-player names and UserIds stay with their client across hops. Use the client
 
 ## Compatibility mode
 
-If native loading is unavailable, compatibility mode imports content into existing Play models. Logs report `mode: "emulated"`; engine/backend identity remains source. Hops stay emulated until Stop. If interception is unavailable, including on macOS, use this server adapter:
+If native loading is unavailable, compatibility mode imports content into existing Play models. Logs report `mode: "emulated"`; engine/backend identity remains source. Hops stay emulated until Stop. If interception is unavailable, use this server adapter:
 
 ```lua
 if game:GetService("RunService"):IsStudio() then
@@ -38,7 +38,7 @@ Emulation supports Workspace, Lighting, ReplicatedFirst, ReplicatedStorage, Serv
 
 `ReniumTeleport.GetContext()` reports mode, placeId, sourcePlaceId, originPlaceId, gameId, saved version, contentSource and attempt id. In emulation, use its GetJoinData(player), GetLocalPlayerTeleportData() and GetArrivingTeleportGui(). Existing Players remain: enumerate GetPlayers and subscribe to PlayerAdded. Content replacement cannot reset all callbacks, globals or module caches.
 
-macOS currently uses compatibility mode and reports native switching and title support unavailable.
+Native switching, default loading CoreGui, titles, and same-window multiplayer travel are available on Windows and Apple silicon macOS. The native contracts are discovered and verified against the running Studio executable; unsupported contracts fail before departure. Intel macOS native travel is not qualified.
 
 ## Cache and diagnostics
 

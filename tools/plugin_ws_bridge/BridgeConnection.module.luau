@@ -108,6 +108,14 @@ function BridgeConnection.create(context)
 		end
 	end
 	local channels = {}
+	function Config.notifyBridgeInfoChanged()
+		local info = Config.getBridgeInfo()
+		for _, channel in ipairs(channels) do
+			if channel.open and channel.client then
+				TransportModule.sendEnvelope(channel.client, { event = "bridgeInfoChanged", result = info })
+			end
+		end
+	end
 	local connectChannel
 	local releaseClient
 	local recoverClient

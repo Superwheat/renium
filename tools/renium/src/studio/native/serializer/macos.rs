@@ -26,8 +26,8 @@ pub(super) fn probe_operation(
 ) -> Result<serde_json::Value> {
     use serde_json::json;
     match operation {
+        NativeOperation::PlayTeleportLoad => properties::playtest::probe_load(pid, title),
         NativeOperation::PlayTeleport
-        | NativeOperation::PlayTeleportLoad
         | NativeOperation::PlayTeleportDispatch
         | NativeOperation::PlayTeleportLaunch
         | NativeOperation::PlayTeleportGui
@@ -90,11 +90,27 @@ mod properties;
 mod undo_selection;
 #[cfg(target_arch = "aarch64")]
 pub(crate) use properties::capture_identities;
+pub(crate) use properties::playtest::NativeMacPlayCaption as NativePlayCaption;
+pub(crate) use properties::playtest::NativeMacPlayJoin as NativePlayJoin;
+pub(crate) use properties::playtest::NativeMacPlayLoad as NativePlayLoad;
+pub(crate) use properties::playtest::NativeMacTeleportDispatch as NativeTeleportDispatch;
+pub(crate) use properties::playtest::NativeMacTeleportGui;
+pub(crate) use properties::playtest::{
+    NativeMacTestClient, NativeMacTestJoin as NativeTestJoin, TestClientRoute, prepare_test_client,
+    process_arguments, start_destination_server, test_client_configuration,
+};
 pub(crate) use properties::{
     observe_terrain, prepare_context, prepare_property, prepare_terrain, read_property,
     register_history,
 };
 pub(crate) use undo_selection::keep_selection_across_undo;
+
+pub(crate) fn playtest_discovery(args: &crate::cli::NativeProbeArgs) -> Result<serde_json::Value> {
+    let pid = args
+        .pid
+        .context("Playtest discovery requires an existing Studio process")?;
+    properties::playtest::discover(pid, args.title.as_deref().unwrap_or_default())
+}
 
 const HELPER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-studio-helper.dylib"));
 const LAUNCHER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-studio-launcher"));
@@ -102,6 +118,7 @@ const REQUEST_MAGIC: u32 = 0x4d4e4552;
 // Fence property-operation additions as well as the outer serializer header.
 // An already-open Studio can still have an older helper mapped after an update.
 const REQUEST_VERSION: u32 = 12;
+const PLAYTEST_REQUEST_VERSION: u32 = 19;
 
 fn native_helper_error(error: &str) -> String {
     if error.contains("invalid serializer request")
@@ -146,6 +163,7 @@ struct PackageActionTrace {
     image_base: u64,
     text: MachSection,
     function_starts: std::sync::Arc<[u64]>,
+    stubs: Vec<MachSection>,
 }
 
 struct CachedPackageActionTrace {
@@ -159,6 +177,7 @@ struct MachSection {
     address: u64,
     size: u64,
     offset: usize,
+    stub_size: usize,
 }
 
 struct MachImage<'a> {
@@ -291,6 +310,12 @@ impl<'a> MachImage<'a> {
                         address,
                         size,
                         offset,
+                        stub_size: if read_u32(bytes, section_offset + 64).unwrap_or(0) & 0xff == 8
+                        {
+                            read_u32(bytes, section_offset + 72).unwrap_or(0) as usize
+                        } else {
+                            0
+                        },
                     };
                     if segment_name == "__TEXT" && section_name == "__text" {
                         text = Some(section);
@@ -915,6 +940,12 @@ fn trace_package_action(path: &Path) -> Result<PackageActionTrace> {
         image_base: image.image_base,
         text: image.text,
         function_starts: image.function_starts.clone().into(),
+        stubs: image
+            .sections
+            .iter()
+            .copied()
+            .filter(|section| section.stub_size > 0)
+            .collect(),
     };
     trace.submit_rva = match image.cpu {
         CPU_TYPE_ARM64 => trace_arm64_task_submitter(&image)?,
@@ -1212,11 +1243,11 @@ fn invoke_package_helper(
 }
 
 pub(super) fn platform_trigger_studio_action(
-    _pid: u32,
+    pid: u32,
     _studio_title: &str,
     action: &str,
 ) -> Result<super::StudioActionOutcome> {
-    anyhow::bail!("Triggering the Studio action {action} natively is only supported on Windows")
+    properties::playtest::NativeMacPlayCaption::trigger_action(pid, action)
 }
 
 /// Roblox Studio's build number (742 for 0.742.x) from the running bundle.

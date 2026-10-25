@@ -46,14 +46,14 @@ struct WeakOwner {
 #if defined(_WIN32)
         InterlockedIncrement(reinterpret_cast<volatile long*>(static_cast<unsigned char*>(owner) + 12));
 #else
-        reinterpret_cast<std::atomic<std::int64_t>*>(static_cast<unsigned char*>(owner) + 16)->fetch_add(1, std::memory_order_relaxed);
+        static_cast<std::__shared_weak_count*>(owner)->__add_weak();
 #endif
     }
     bool Alive() const {
 #if defined(_WIN32)
         return InterlockedCompareExchange(reinterpret_cast<volatile long*>(static_cast<unsigned char*>(owner) + 8), 0, 0) > 0;
 #else
-        return reinterpret_cast<std::atomic<std::int64_t>*>(static_cast<unsigned char*>(owner) + 8)->load(std::memory_order_acquire) >= 0;
+        return static_cast<std::__shared_weak_count*>(owner)->use_count() > 0;
 #endif
     }
     ~WeakOwner() {
@@ -61,8 +61,9 @@ struct WeakOwner {
         if (InterlockedDecrement(reinterpret_cast<volatile long*>(static_cast<unsigned char*>(owner) + 12)) == 0)
             reinterpret_cast<void (*)(void*)>((*reinterpret_cast<void***>(owner))[1])(owner);
 #else
-        if (reinterpret_cast<std::atomic<std::int64_t>*>(static_cast<unsigned char*>(owner) + 16)->fetch_sub(1, std::memory_order_acq_rel) == 0)
-            reinterpret_cast<void (*)(void*)>((*reinterpret_cast<void***>(owner))[3])(owner);
+        // libc++ also has a virtual deleter lookup. Use its release operation
+        // instead of assuming a vtable slot for control-block destruction.
+        static_cast<std::__shared_weak_count*>(owner)->__release_weak();
 #endif
     }
 };

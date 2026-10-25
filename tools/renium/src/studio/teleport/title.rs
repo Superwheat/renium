@@ -2,6 +2,13 @@
 use super::*;
 
 #[cfg(windows)]
+use crate::studio::input::teleport_caption_window;
+#[cfg(target_os = "macos")]
+fn teleport_caption_window(pid: u32) -> Result<(isize, String)> {
+    crate::studio::native::serializer::NativePlayCaption::window(pid)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
 struct Caption {
     pid: u32,
     identity: String,
@@ -11,21 +18,28 @@ struct Caption {
     cleanup: crate::studio::native::serializer::NativePlayCaption,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 impl Caption {
     fn update(&mut self, destination: Option<&str>, transitioning: bool) -> Result<()> {
-        use crate::studio::input::{teleport_caption_update, teleport_caption_window};
         ensure!(
             crate::app::update::process_start_identity(self.pid).as_deref() == Some(&self.identity),
             "Teleport caption process ended"
         );
+        #[cfg(windows)]
         let (hwnd, current) = teleport_caption_window(self.pid)?;
+        // AppKit maintains ordinary-title changes in process. Reading its UI
+        // queue during a document handoff would stall travel behind the loader.
+        #[cfg(target_os = "macos")]
+        let (hwnd, current) = (
+            self.hwnd,
+            self.written.as_ref().unwrap_or(&self.ordinary).clone(),
+        );
         ensure!(hwnd == self.hwnd, "Teleport caption window changed");
         // Accept Studio's normal caption rewrites, never strip a substring from
         // an unrelated window or restore over a new document's ordinary title.
         if self.written.as_deref() != Some(&current) {
             ensure!(
-                current.ends_with(" - Roblox Studio"),
+                !current.is_empty() && (!cfg!(windows) || current.ends_with(" - Roblox Studio")),
                 "Studio caption ownership changed"
             );
             self.ordinary.clone_from(&current);
@@ -52,14 +66,15 @@ impl Caption {
                 &self.ordinary,
                 (transitioning || destination.is_some()).then_some(next.as_str()),
             )?;
-            teleport_caption_update(self.pid, self.hwnd, &current, &next)?;
+            #[cfg(windows)]
+            crate::studio::input::teleport_caption_update(self.pid, self.hwnd, &current, &next)?;
         }
         self.written = (transitioning || destination.is_some()).then_some(next);
         Ok(())
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 #[derive(Default)]
 struct State {
     captions: Vec<Caption>,
@@ -70,7 +85,7 @@ struct State {
     transition_name: Option<String>,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 impl State {
     fn apply(&mut self) -> Result<()> {
         for caption in &mut self.captions {
@@ -102,20 +117,25 @@ impl State {
 }
 
 pub(super) struct Lease {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     state: Arc<Mutex<State>>,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     worker: Option<thread::JoinHandle<()>>,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub(super) struct ClientCaption(Caption);
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 impl ClientCaption {
+    #[cfg(target_os = "macos")]
+    pub(super) fn window(&self) -> isize {
+        self.0.hwnd
+    }
+
     pub(super) fn start(pid: u32) -> Result<Self> {
         let identity =
             crate::app::update::process_start_identity(pid).context("Teleport client ended")?;
-        let (hwnd, ordinary) = crate::studio::input::teleport_caption_window(pid)?;
+        let (hwnd, ordinary) = teleport_caption_window(pid)?;
         let cleanup =
             crate::studio::native::serializer::NativePlayCaption::arm(pid, &ordinary, hwnd)?;
         Ok(Self(Caption {
@@ -134,7 +154,7 @@ impl ClientCaption {
 
 impl Lease {
     pub(super) fn start(bridge: &Arc<BridgeServer>, session: &Session) -> Result<Self> {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             let mut runtimes = session
                 .clients(&bridge.list_bridge_clients())?
@@ -155,9 +175,10 @@ impl Lease {
                 if pids.insert(pid) {
                     let identity = crate::app::update::process_start_identity(pid)
                         .context("Teleport window process ended")?;
-                    let (hwnd, ordinary) = crate::studio::input::teleport_caption_window(pid)?;
+                    let (hwnd, ordinary) = teleport_caption_window(pid)?;
                     ensure!(
-                        ordinary.ends_with(" - Roblox Studio"),
+                        !ordinary.is_empty()
+                            && (!cfg!(windows) || ordinary.ends_with(" - Roblox Studio")),
                         "Teleport window already has a caption owner"
                     );
                     let cleanup = crate::studio::native::serializer::NativePlayCaption::arm(
@@ -200,6 +221,7 @@ impl Lease {
                             state.restore();
                             break;
                         }
+                        #[cfg(windows)]
                         if (state.transitioning || state.destination.is_some())
                             && let Err(error) = state.apply()
                         {
@@ -220,7 +242,7 @@ impl Lease {
                 worker: Some(worker),
             })
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             let _ = (bridge, session);
             Ok(Self {})
@@ -228,7 +250,7 @@ impl Lease {
     }
 
     pub(super) fn arrived(&self, name: &str, at_source: bool) -> Result<()> {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             let mut state = self.state.lock_recover();
             ensure!(!state.retired, "Teleport caption session ended");
@@ -236,7 +258,7 @@ impl Lease {
             state.transitioning = false;
             state.apply()
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             let _ = (name, at_source);
             Ok(())
@@ -244,7 +266,7 @@ impl Lease {
     }
 
     pub(super) fn transition(&self, name: Option<&str>) -> Result<()> {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             let mut state = self.state.lock_recover();
             ensure!(!state.retired, "Teleport caption session ended");
@@ -252,13 +274,13 @@ impl Lease {
             state.transition_name = name.map(str::to_owned);
             state.apply()?;
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         let _ = name;
         Ok(())
     }
 
     pub(super) fn cancel_transition(&self) {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             let mut state = self.state.lock_recover();
             state.transitioning = false;
@@ -272,30 +294,28 @@ impl Lease {
         }
     }
 
-    #[cfg(windows)]
     pub(super) fn rebind(&self, session: &Session, name: &str) -> Result<()> {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             let mut state = self.state.lock_recover();
             ensure!(!state.retired, "Teleport caption session ended");
             state.session = Some(session.clone());
             state.transitioning = false;
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         let _ = session;
         self.arrived(name, session.current_place == session.source)
     }
 
-    #[cfg(windows)]
     pub(super) fn restore(&self) {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         self.state.lock_recover().restore();
     }
 }
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             self.state.lock_recover().retired = true;
             if let Some(worker) = self.worker.take() {

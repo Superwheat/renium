@@ -3,9 +3,9 @@
 use super::*;
 
 pub(crate) struct Dispatch {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     lease: Option<crate::studio::native::serializer::NativeTeleportDispatch>,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     _ownership: Option<super::automatic::Ownership>,
 }
 
@@ -14,17 +14,17 @@ impl Dispatch {
     pub(super) fn release(self) {}
 
     pub(super) fn ready(&self) -> bool {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             self.lease.is_some()
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             false
         }
     }
     pub(crate) fn before_play(bridge: &BridgeServer, owner: &str, nonce: &str) -> Option<Self> {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             let gate = super::automatic::gate(owner);
             let _guard = gate.lock_recover();
@@ -46,24 +46,24 @@ impl Dispatch {
             }
             Self::install_before_play(bridge, owner, nonce)
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             let _ = (bridge, owner, nonce);
             None
         }
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     pub(super) fn install_before_play(
         bridge: &BridgeServer,
         owner: &str,
         nonce: &str,
     ) -> Option<Self> {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             let result = (|| -> Result<_> {
                 let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, owner)?;
-                let title = crate::studio::input::studio_window_title(pid)?;
+                let title = crate::studio::native::serializer::target_name(pid, "")?;
                 crate::studio::native::serializer::NativeTeleportDispatch::before_play(
                     pid, &title, nonce,
                 )
@@ -82,7 +82,7 @@ impl Dispatch {
                 }
             }
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             let _ = (bridge, owner, nonce);
             None
@@ -90,13 +90,13 @@ impl Dispatch {
     }
 
     pub(super) fn has_launch_scope(&self) -> bool {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             self.lease
                 .as_ref()
                 .is_some_and(|lease| lease.has_launch_scope())
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             false
         }
@@ -116,7 +116,7 @@ impl Dispatch {
     }
 
     pub(super) fn arm(bridge: &BridgeServer, session: &Session) -> Self {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             let result = (|| -> Result<_> {
                 let relay = call(
@@ -128,7 +128,10 @@ impl Dispatch {
                 )?;
                 let path: Vec<String> = serde_json::from_value(relay["path"].clone())?;
                 let pid = bridge.studio_pid_for_runtime(BridgeTarget::Server, &session.server)?;
-                let title = crate::studio::input::studio_window_title(pid)?;
+                let title = crate::studio::native::serializer::target_name(
+                    pid,
+                    relay["modelName"].as_str().unwrap_or_default(),
+                )?;
                 crate::studio::native::serializer::NativeTeleportDispatch::arm(pid, &title, &path)
             })();
             match result {
@@ -157,7 +160,7 @@ impl Dispatch {
                 }
             }
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             let _ = (bridge, session);
             Self {}
@@ -165,7 +168,7 @@ impl Dispatch {
     }
 
     pub(super) fn renew(&mut self) -> Result<()> {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         if let Some(lease) = &mut self.lease {
             lease.renew()?;
         }
@@ -173,7 +176,7 @@ impl Dispatch {
     }
 
     pub(super) fn wait_accepted(&self, bridge: &BridgeServer, attempt: &Attempt) -> Result<()> {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         if attempt.native {
             let trigger = self
                 .lease
@@ -184,13 +187,13 @@ impl Dispatch {
                 waiting(bridge, deadline)?;
             }
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         let _ = (bridge, attempt);
         Ok(())
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn controller(bridge: &BridgeServer, session: &Session, params: Value) -> Result<Value> {
     let result = bridge.call_for_runtime_with_timeout(
         "startStopPlay",
@@ -206,7 +209,7 @@ fn controller(bridge: &BridgeServer, session: &Session, params: Value) -> Result
 /// Reconcile with the surviving Edit controller before a replacement daemon
 /// accepts travel. An unacknowledged arrival is stopped, never adopted as ready.
 pub(super) fn reconcile(bridge: &BridgeServer, session: &Session) -> Result<()> {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     {
         let status = controller(bridge, session, json!({}))?;
         ensure!(
@@ -241,12 +244,12 @@ pub(super) fn reconcile(bridge: &BridgeServer, session: &Session) -> Result<()> 
             json!({"resumeTeleport":true,"launchNonce":session.nonce}),
         )?;
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     let _ = (bridge, session);
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn waiting(bridge: &BridgeServer, deadline: std::time::Instant) -> Result<()> {
     ensure!(
         bridge.alive.load(Ordering::Relaxed),
@@ -260,7 +263,7 @@ fn waiting(bridge: &BridgeServer, deadline: std::time::Instant) -> Result<()> {
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 struct Prepared {
     pid: u32,
     bytes: cache::SavedPlace,
@@ -268,7 +271,7 @@ struct Prepared {
     dispatch: u64,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn prepare(
     bridge: &BridgeServer,
     session: &Session,
@@ -301,7 +304,7 @@ fn prepare(
             "Teleport client belongs to another Studio process"
         );
     }
-    let title = crate::studio::input::studio_window_title(pid)?;
+    let title = crate::studio::native::serializer::target_name(pid, "")?;
     probes::run(pid, &title, NativeOperation::PlayTeleportLoad)?;
     let (arrival, dispatch) = if attempt.native {
         let token = dispatch
@@ -338,7 +341,7 @@ fn prepare(
     })
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn switch(
     bridge: &BridgeServer,
     session: &mut Session,
@@ -362,7 +365,7 @@ fn switch(
     let mut load = if root.is_some() {
         Some(NativePlayLoad::arm(
             prepared.pid,
-            &crate::studio::input::studio_window_title(prepared.pid)?,
+            &crate::studio::native::serializer::target_name(prepared.pid, "")?,
             (session.source, session.universe),
             (attempt.place_id, session.universe),
             &prepared.bytes.bytes,
@@ -413,7 +416,7 @@ fn switch(
         for runtime in clients.values() {
             bridge.retire_runtime(runtime);
         }
-        let window_title = crate::studio::input::studio_window_title(prepared.pid)?;
+        let window_title = crate::studio::native::serializer::target_name(prepared.pid, "")?;
         if let Some(lease) = &mut dispatch.lease {
             lease.advance(attempt.place_id, &nonce)?;
         }
@@ -641,7 +644,7 @@ pub(super) fn try_switch(
     if !session.prefer_native {
         return Ok(json!({"mode":"emulated","nativeRequested":false}));
     }
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     let unavailable = match prepare(bridge, session, clients, destination, attempt, dispatch) {
         Ok(prepared) => {
             switch(
@@ -657,7 +660,7 @@ pub(super) fn try_switch(
         }
         Err(error) => format!("{error:#}"),
     };
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     let unavailable = {
         let _ = (
             bridge,

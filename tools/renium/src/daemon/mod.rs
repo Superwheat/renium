@@ -168,7 +168,7 @@ pub(super) fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
     );
     let mut audio_check = Instant::now();
     while bridge.alive.load(Ordering::Relaxed) {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         crate::studio::teleport::start_manual(&bridge, &automation_state);
         crate::studio::teleport::start_pending(&bridge);
         if is_default_daemon() && audio_check.elapsed() >= Duration::from_secs(2) {

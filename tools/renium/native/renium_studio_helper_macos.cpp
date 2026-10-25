@@ -43,8 +43,18 @@
 #include <vector>
 #include "renium_studio_history.h"
 #include "renium_studio_terrain.h"
+#include "renium_playtest_macos.h"
+#include "renium_test_server_macos.h"
+#include "renium_teleport_dispatch_macos.h"
+#include "renium_play_join_macos.h"
+#include "renium_teleport_gui_macos.h"
+#include "renium_test_client_macos.h"
+#include "renium_route_launch_macos.h"
+#include "renium_test_join_macos.h"
 
 extern "C" bool ReniumArmLaunchGuard();
+void ReniumTeleportCaption(const std::string&, std::vector<unsigned char>&);
+void ReniumStudioAction(const std::string&, std::vector<unsigned char>&);
 extern "C" void ReniumInitializeLaunchGuard();
 extern "C" bool ReniumStudioAudio(unsigned, unsigned*, unsigned*, unsigned*, bool*, char*, std::size_t);
 
@@ -116,7 +126,7 @@ struct DataModelScanStats
 };
 
 static constexpr std::uint32_t Magic = 0x4d4e4552;
-static constexpr std::uint32_t Version = 12;
+static constexpr std::uint32_t Version = 19;
 // Command 3 does not use factoryRva as a function address. Its top bit opts in
 // to per-candidate clocks; older helpers ignore it and keep the same payloads.
 static constexpr std::uint64_t PropertyPhaseTimingFlag = std::uint64_t{1} << 63;
@@ -1665,6 +1675,51 @@ static Response PropertyTransport(
         std::memcpy(output.data(), &binding, sizeof(binding));
         std::memcpy(output.data() + sizeof(binding), &hook, sizeof(hook));
     }
+    else if (request.reserved == 7)
+    {
+        try { renium_mac_playtest::Load(payload, output); }
+        catch (const std::exception& error) { SetError(response, error.what()); return response; }
+    }
+    else if (request.reserved == 8)
+    {
+        try { renium_mac_teleport::Handle(payload, output); }
+        catch (const std::exception& error) { SetError(response, error.what()); return response; }
+    }
+    else if (request.reserved == 9)
+    {
+        try { renium_mac_join::Handle(payload, output); }
+        catch (const std::exception& error) { SetError(response, error.what()); return response; }
+    }
+    else if (request.reserved == 10)
+    {
+        try { renium_mac_gui::Handle(payload, output); }
+        catch (const std::exception& error) { SetError(response, error.what()); return response; }
+    }
+    else if (request.reserved == 11)
+    {
+        try { ReniumTeleportCaption(payload, output); }
+        catch (const std::exception& error) { SetError(response, error.what()); return response; }
+    }
+    else if (request.reserved == 12)
+    {
+        try { renium_mac_test_client::Handle(payload, output); }
+        catch (const std::exception& error) { SetError(response, error.what()); return response; }
+    }
+    else if (request.reserved == 14)
+    {
+        try { renium_mac_route_launch::Handle(payload, output); }
+        catch (const std::exception& error) { SetError(response, error.what()); return response; }
+    }
+    else if (request.reserved == 13)
+    {
+        try { renium_mac_test_join::Handle(payload, output); }
+        catch (const std::exception& error) { SetError(response, error.what()); return response; }
+    }
+    else if (request.reserved == 15)
+    {
+        try { ReniumStudioAction(payload, output); }
+        catch (const std::exception& error) { SetError(response, error.what()); return response; }
+    }
     else if (request.reserved == 1 && payload.size() == 12)
     {
         std::uint64_t address = 0;
@@ -1970,7 +2025,9 @@ static bool HandleClient(int client)
         WriteExact(client, &response, sizeof(response));
         return false;
     }
-    if (request.version != Version)
+    // Existing operation layouts are unchanged. Older clients can keep using
+    // unrelated open places; playtest operations require the current generation.
+    if (request.version != Version && !(request.version == 12 && !(request.command == 3 && request.reserved >= 7)))
     {
         SetError(response, "incompatible native helper protocol; restart Studio with the matching Renium build");
         WriteExact(client, &response, sizeof(response));
@@ -2171,6 +2228,14 @@ __attribute__((constructor)) static void StartReniumHelper()
 {
     unsetenv("DYLD_INSERT_LIBRARIES");
     ReniumInitializeLaunchGuard();
+    try {
+        std::intptr_t slide = 0;
+        const auto image = MainStudioImage(slide);
+        renium_mac_test_server::Install(image, slide);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "Renium destination server: %s\n", error.what());
+        _exit(78);
+    }
     pthread_t thread;
     if (pthread_create(&thread, nullptr, RunServer, nullptr) == 0)
         pthread_detach(thread);

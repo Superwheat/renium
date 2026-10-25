@@ -10,15 +10,17 @@ enum Base {
 enum Value {
     Address(Base, i64),
     Field(i64, usize),
-    Instance,
+    Instance(i64),
     Adjustment(i64),
-    Receiver(i64),
+    Receiver(i64, i64),
+    Argument(usize),
 }
 
 impl Value {
     fn offset(self, offset: i64) -> Option<Self> {
         match self {
             Self::Address(base, start) => Some(Self::Address(base, start.checked_add(offset)?)),
+            Self::Instance(start) => Some(Self::Instance(start.checked_add(offset)?)),
             _ => None,
         }
     }
@@ -37,6 +39,7 @@ impl Value {
 struct State {
     registers: [Option<Value>; 32],
     stack: BTreeMap<i64, (usize, Value)>,
+    null_comparison: Option<Value>,
 }
 
 impl State {
@@ -80,6 +83,9 @@ impl State {
         }
         self.stack
             .retain(|key, value| other.stack.get(key) == Some(value));
+        if self.null_comparison != other.null_comparison {
+            self.null_comparison = None;
+        }
         *self != before
     }
     fn passed_origins(&self) -> bool {
@@ -91,7 +97,9 @@ impl State {
                 values.extend(self.load(value.offset(8), 8));
             }
         }
-        values.contains(&Value::Instance)
+        values
+            .iter()
+            .any(|value| matches!(value, Value::Instance(_)))
             && values.iter().any(|value| {
                 matches!(
                     value,
@@ -99,12 +107,15 @@ impl State {
                 )
             })
     }
-    fn called_field(&self, register: usize) -> Option<usize> {
+    fn called_field(&self, register: usize) -> Option<(usize, i64)> {
         let Value::Field(field, 8) = self.reg(register)? else {
             return None;
         };
-        (field % 8 == 0 && self.registers[0] == Some(Value::Receiver(field + 8)))
-            .then(|| usize::try_from(field).ok())
+        let Value::Receiver(adjustment, instance) = self.registers[0]? else {
+            return None;
+        };
+        (field % 8 == 0 && adjustment == field + 8)
+            .then(|| usize::try_from(field).ok().map(|field| (field, instance)))
             .flatten()
     }
     fn single_memory(&mut self, word: u32) {
@@ -205,6 +216,12 @@ impl State {
         if word & 0xffe0ffe0 == 0xaa0003e0 {
             self.registers[dst] = self.reg(other);
         } else if word & 0x1f000000 == 0x11000000 {
+            if word & (1 << 29) != 0 {
+                self.null_comparison =
+                    (dst == 31 && (word >> 10) & 4095 == 0 && word & (1 << 30) != 0)
+                        .then(|| self.reg(base))
+                        .flatten();
+            }
             if word & (1 << 29) != 0 && dst == 31 {
                 return;
             }
@@ -225,12 +242,12 @@ impl State {
             let shift = (word >> 10) & 63;
             let kind = (word >> 22) & 3;
             self.registers[dst] = match (self.reg(base), self.reg(other), kind, shift) {
-                (Some(Value::Instance), Some(Value::Field(field, 8)), 2, 1) => {
-                    Some(Value::Receiver(field))
+                (Some(Value::Instance(at)), Some(Value::Field(field, 8)), 2, 1) => {
+                    Some(Value::Receiver(field, at))
                 }
-                (Some(Value::Instance), Some(Value::Adjustment(field)), 0, 0)
-                | (Some(Value::Adjustment(field)), Some(Value::Instance), 0, 0) => {
-                    Some(Value::Receiver(field))
+                (Some(Value::Instance(at)), Some(Value::Adjustment(field)), 0, 0)
+                | (Some(Value::Adjustment(field)), Some(Value::Instance(at)), 0, 0) => {
+                    Some(Value::Receiver(field, at))
                 }
                 _ => None,
             };
@@ -249,6 +266,14 @@ impl State {
         } else if word & 0xffe00c00 == 0x9a800000 {
             self.registers[dst] = if self.reg(base) == self.reg(other) {
                 self.reg(base)
+            } else if base == 31
+                && (word >> 12) & 15 == 0
+                && self.null_comparison == Some(Value::Instance(0))
+                && matches!(self.reg(other), Some(Value::Instance(_)))
+            {
+                // C++ base adjustment preserves null; the bound live instance
+                // is non-null, so retain its adjusted receiver provenance.
+                self.reg(other)
             } else {
                 None
             };
@@ -256,6 +281,9 @@ impl State {
             || word & 0x1f00001f == 0x0b00001f && word & (1 << 29) != 0
             || matches!(word, 0xd503201f | 0xd503233f | 0xd50323bf | 0xd503245f)
         {
+            if word & (1 << 29) != 0 {
+                self.null_comparison = None;
+            }
         } else if word & 0x1e000000 != 0x0e000000 && dst != 31 {
             self.registers[dst] = None;
         } else if dst == 31
@@ -276,10 +304,11 @@ struct Analysis<'a, C, D> {
     code: &'a mut C,
     descriptor: &'a mut D,
     budget: usize,
+    custom_lua: bool,
 }
 
 impl<C: FnMut(u64) -> Option<Vec<u8>>, D: FnMut(usize) -> Option<u64>> Analysis<'_, C, D> {
-    fn run(&mut self, entry: u64, initial: State, depth: usize) -> Option<HashSet<usize>> {
+    fn run(&mut self, entry: u64, initial: State, depth: usize) -> Option<HashSet<(usize, i64)>> {
         if depth > 8 {
             return None;
         }
@@ -318,6 +347,13 @@ impl<C: FnMut(u64) -> Option<Vec<u8>>, D: FnMut(usize) -> Option<u64>> Analysis<
                 };
             } else if word & 0xfc000000 == 0x94000000 || word & 0xfffffc1f == 0xd63f0000 {
                 state.registers[..19].fill(None);
+                state.null_comparison = None;
+                // Mach-O function boundaries include exception cleanup. Clang
+                // can end that region with a non-returning unwind call, with
+                // no RET instruction. Never continue into the adjacent function.
+                if pc + 4 == entry + bytes.len() as u64 {
+                    next.clear();
+                }
             } else if word & 0xff000010 == 0x54000000
                 || word & 0x7e000000 == 0x34000000
                 || word & 0x7e000000 == 0x36000000
@@ -353,7 +389,9 @@ impl<C: FnMut(u64) -> Option<Vec<u8>>, D: FnMut(usize) -> Option<u64>> Analysis<
         for (pc, state) in states {
             let word = words[index(pc)?];
             if word & 0xfffffc1f == 0xd63f0000 || word & 0xfffffc1f == 0xd61f0000 {
-                fields.extend(state.called_field(((word >> 5) & 31) as usize));
+                if !self.custom_lua || state.reg(1) == Some(Value::Argument(2)) {
+                    fields.extend(state.called_field(((word >> 5) & 31) as usize));
+                }
             } else if (word & 0xfc000000 == 0x94000000
                 || word & 0xfc000000 == 0x14000000
                     && index(branch_target(pc, word, 26, 0)?).is_none())
@@ -370,28 +408,58 @@ impl<C: FnMut(u64) -> Option<Vec<u8>>, D: FnMut(usize) -> Option<u64>> Analysis<
 
 pub(super) fn dispatch_field(
     entry: u64,
+    code: impl FnMut(u64) -> Option<Vec<u8>>,
+    descriptor: impl FnMut(usize) -> Option<u64>,
+) -> Option<usize> {
+    let (field, adjustment) = adjusted_dispatch_field(entry, code, descriptor)?;
+    (adjustment == 0).then_some(field)
+}
+
+pub(super) fn adjusted_dispatch_field(
+    entry: u64,
+    code: impl FnMut(u64) -> Option<Vec<u8>>,
+    descriptor: impl FnMut(usize) -> Option<u64>,
+) -> Option<(usize, i64)> {
+    analyze_dispatch(entry, code, descriptor, false)
+}
+
+pub(super) fn custom_dispatch_field(
+    entry: u64,
+    code: impl FnMut(u64) -> Option<Vec<u8>>,
+    descriptor: impl FnMut(usize) -> Option<u64>,
+) -> Option<usize> {
+    let (field, adjustment) = analyze_dispatch(entry, code, descriptor, true)?;
+    (adjustment == 0).then_some(field)
+}
+
+fn analyze_dispatch(
+    entry: u64,
     mut code: impl FnMut(u64) -> Option<Vec<u8>>,
     mut descriptor: impl FnMut(usize) -> Option<u64>,
-) -> Option<usize> {
+    custom_lua: bool,
+) -> Option<(usize, i64)> {
     let mut registers = [None; 32];
     registers[0] = Some(Value::Address(Base::Descriptor, 0));
-    registers[1] = Some(Value::Instance);
+    registers[1] = Some(Value::Instance(0));
+    registers[2] = Some(Value::Argument(2));
     registers[31] = Some(Value::Address(Base::Stack, 0));
     let fields = Analysis {
         code: &mut code,
         descriptor: &mut descriptor,
         budget: 32768,
+        custom_lua,
     }
     .run(
         entry,
         State {
             registers,
             stack: BTreeMap::new(),
+            null_comparison: None,
         },
         0,
     )?;
-    let field = (fields.len() == 1).then(|| *fields.iter().next().unwrap())?;
-    (descriptor(field + 8) == Some(0)).then_some(field)
+    let (field, adjustment) = (fields.len() == 1).then(|| *fields.iter().next().unwrap())?;
+    (descriptor(field + 8) == Some(0)).then_some((field, adjustment))
 }
 
 #[cfg(test)]
@@ -498,6 +566,98 @@ mod tests {
         assert_eq!(fixture(&[0x14000000], &member_call(), 0), None);
         assert_eq!(fixture(&[0x94000000, 0xd65f03c0], &member_call(), 0), None);
         assert_eq!(fixture(&[0x5400ffe0, 0xd65f03c0], &member_call(), 0), None);
+    }
+
+    #[test]
+    fn adjusted_property_getter_retains_its_complete_receiver() {
+        let getter = [
+            0xd107c028, 0xf100003f, 0x9a8803e8, 0x910c0108, 0x9a8803e8, 0xa940a401, 0x8b890500,
+            0x36000069, 0xf9400008, 0xf8614901, 0xd61f0020,
+        ];
+        assert_eq!(
+            adjusted_dispatch_field(0, |at| (at == 0).then(|| bytes(&getter)), |_| Some(0)),
+            Some((8, 0x110))
+        );
+        assert_eq!(
+            dispatch_field(0, |at| (at == 0).then(|| bytes(&getter)), |_| Some(0)),
+            None
+        );
+        let mut moved = getter;
+        moved[0] = 0xd1088028;
+        moved[3] = 0x910c8108;
+        assert_eq!(
+            adjusted_dispatch_field(0, |at| (at == 0).then(|| bytes(&moved)), |_| Some(0)),
+            Some((8, 0x100))
+        );
+        assert_eq!(
+            adjusted_dispatch_field(0, |at| (at == 0).then(|| bytes(&getter)), |_| Some(2)),
+            None
+        );
+    }
+
+    #[test]
+    fn custom_getter_selects_the_lua_dispatch_and_rejects_wrong_arguments() {
+        let records: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../native/tests/arm64-value-dispatch.json"
+        ))
+        .unwrap();
+        let code = |address| -> Option<Vec<u8>> {
+            records
+                .as_array()?
+                .iter()
+                .find(|row| row["entry"].as_u64() == Some(address))?["code"]
+                .as_array()?
+                .iter()
+                .map(|b| b.as_u64().map(|b| b as u8))
+                .collect()
+        };
+        assert_eq!(
+            custom_dispatch_field(0x1008d4518, code, |_| Some(0)),
+            Some(0x98)
+        );
+        assert_eq!(dispatch_field(0x107d9daec, code, |_| Some(0)), Some(0x88));
+        assert_eq!(custom_dispatch_field(0x107d9daec, code, |_| Some(0)), None);
+        assert_eq!(dispatch_field(0x1008bc300, code, |_| Some(0)), None);
+        let mut moved = code(0x1008d4518).unwrap();
+        let first = u32::from_le_bytes(moved[..4].try_into().unwrap());
+        moved[..4].copy_from_slice(&((first & !(127 << 15)) | (40 << 15)).to_le_bytes());
+        assert_eq!(
+            custom_dispatch_field(0, |at| (at == 0).then(|| moved.clone()), |_| Some(0)),
+            Some(0x140)
+        );
+        let at = moved
+            .chunks_exact(4)
+            .position(|b| b == 0xaa0203e1u32.to_le_bytes())
+            .unwrap()
+            * 4;
+        moved[at..at + 4].copy_from_slice(&0xaa0303e1u32.to_le_bytes());
+        assert_eq!(
+            custom_dispatch_field(0, |at| (at == 0).then(|| moved.clone()), |_| Some(0)),
+            None
+        );
+    }
+
+    #[test]
+    fn installed_teleport_yield_dispatch() {
+        let records: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../native/tests/arm64-teleport-dispatch.json"
+        ))
+        .unwrap();
+        let result = dispatch_field(
+            0x100c6999c,
+            |address| {
+                records
+                    .as_array()?
+                    .iter()
+                    .find(|row| row["entry"].as_u64() == Some(address))?["code"]
+                    .as_array()?
+                    .iter()
+                    .map(|v| v.as_u64().map(|b| b as u8))
+                    .collect()
+            },
+            |_| Some(0),
+        );
+        assert_eq!(result, Some(0x80));
     }
 
     #[test]

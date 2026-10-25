@@ -148,6 +148,11 @@ function Teleport.create(context)
 		assert(type(params.id) == "number" and params.id % 1 == 0 and params.id >= clientId
 			and params.id <= 9007199254740991, "Stale client teleport")
 		clientTouched = os.clock()
+		if params.action == "nativeGui" then
+			assert(params.id == clientId, "Stale teleport GUI notification")
+			gui.invokeNative()
+			return { ok = true }
+		end
 		if params.action == "fail" then
 			return clientFailure(params)
 		end
@@ -256,6 +261,9 @@ function Teleport.create(context)
 				nativeRelay.Name = "__ReniumTeleportNative_" .. context.runtimeId
 				nativeRelay:SetAttribute("__ReniumNative", params.scope or context.runtimeId)
 				nativeRelay.OnInvoke = function(place, options, ...)
+					if place == nil then
+						return
+					end
 					-- A thrown OnInvoke error is logged by Studio without resuming
 					-- this native caller. Return it so the hook completes TeleportAsync.
 					local ok, join, data, id = pcall(nativeRequest, place, options, { ... })
@@ -271,7 +279,18 @@ function Teleport.create(context)
 				nativeRelay.Parent = game:GetService("ServerStorage")
 			end
 			nativeRelay:SetAttribute("__ReniumNative", params.scope or context.runtimeId)
-			return { ok = true, path = { "ServerStorage", nativeRelay.Name } }
+			nativeRelay:SetAttribute("__ReniumNativePump", params.scope)
+			if params.scope then
+				-- Wake launch-time native callers on this model's own scheduler.
+				-- The relay is ready before this deferred invocation can run.
+				local relay = nativeRelay
+				task.defer(function()
+					if relay.Parent then
+						relay:Invoke()
+					end
+				end)
+			end
+			return { ok = true, path = { "ServerStorage", nativeRelay.Name }, modelName = game.Name }
 		end,
 		acceptNative = function(params)
 			local pending = finishNative(params.id, nil)
@@ -339,7 +358,7 @@ function Teleport.create(context)
 				return params.join, params.join.TeleportData
 			end
 			routeJoinRelay.Parent = game:GetService("CoreGui")
-			return { ok = true, path = { "CoreGui", routeJoinRelay.Name } }
+			return { ok = true, path = { "CoreGui", routeJoinRelay.Name }, modelName = game.Name }
 		end
 		if params.action == "routeIdentity" then
 			assert(context.role == "play-server", "Only the source server supplies player identity")
@@ -374,7 +393,14 @@ function Teleport.create(context)
 				return params.configuration
 			end
 			routeRelay.Parent = game:GetService("CoreGui")
-			return { ok = true, path = { "CoreGui", routeRelay.Name } }
+			return { ok = true, path = { "CoreGui", routeRelay.Name }, modelName = game.Name }
+		end
+		if params.action == "invokeRoute" then
+			assert(params.kind == "client" or params.kind == "join", "Invalid route invocation")
+			local relay = if params.kind == "client" then routeRelay else routeJoinRelay
+			assert(relay and relay.Parent == game:GetService("CoreGui"), "Route relay ended")
+			relay:GetAttribute("__ReniumRouteInvoke")
+			return { ok = true }
 		end
 		if params.action == "nativeArrival" then
 			local player = if context.role == "play-client" then game:GetService("Players").LocalPlayer

@@ -51,7 +51,7 @@ function Gui.create(runtimeId)
 		relay.OnInvoke = function()
 			return game:GetService("ScriptContext"), game:GetService("CoreGui"), game:GetService("ReplicatedFirst")
 		end
-		pending = { path = { "CoreGui", relay.Name }, show = show }
+		pending = { path = { "CoreGui", relay.Name }, show = show, modelName = game.Name }
 	end
 	local function dismiss()
 		disconnect()
@@ -86,6 +86,10 @@ function Gui.create(runtimeId)
 		fail = finish,
 		arrive = finish,
 		dismiss = dismiss,
+		invokeNative = function()
+			assert(relay and relay.Parent == core, "Teleport GUI notification ended")
+			relay:GetAttribute("__ReniumNativeGuiInvoke")
+		end,
 		get = function() return nil end,
 		native = function()
 			if pending then

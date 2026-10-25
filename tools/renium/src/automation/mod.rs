@@ -377,7 +377,7 @@ impl State {
         self.contexts.lock_recover().get(&id).cloned()
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     pub(crate) fn bound_contexts(&self) -> Vec<BoundContext> {
         self.contexts.lock_recover().values().cloned().collect()
     }

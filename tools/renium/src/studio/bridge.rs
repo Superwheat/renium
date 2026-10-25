@@ -1185,12 +1185,12 @@ impl BridgeServer {
 
     /// A native client replacement retains the OS process but creates a new
     /// bridge. Refresh its explicitly stamped root ownership on every channel.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     pub(crate) fn refresh_routed_client(&self, runtime: &str, pid: u32) -> Result<()> {
         self.refresh_launch_runtime(runtime, BridgeTarget::Client, pid)
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     pub(crate) fn refresh_launch_runtime(
         &self,
         runtime: &str,
@@ -3383,6 +3383,24 @@ impl BridgeServer {
     }
 
     fn capture_socket_notification(socket: &mut BridgeSocket, value: &Value) -> bool {
+        if value["event"] == "bridgeInfoChanged" {
+            let info = &mut socket.bridge_info;
+            let result = &value["result"];
+            // The mutable DataModel name is native lookup metadata, never authority
+            // to select another process, document, role or Play launch.
+            if result["runtimeId"].as_str() == Some(info.runtime_id.as_str())
+                && result["bridgeRole"].as_str() == Some(info.bridge_role.as_str())
+                && result["placeId"].as_i64() == info.place_id
+                && result["gameId"].as_i64() == info.game_id
+                && result["launchNonce"].as_str().unwrap_or_default() == info.launch_nonce
+                && result["launchEditRuntimeId"].as_str().unwrap_or_default()
+                    == info.launch_edit_runtime_id
+                && let Some(name) = result["placeName"].as_str()
+            {
+                info.place_name = name.to_owned();
+            }
+            return true;
+        }
         if socket
             .pending_player_identity
             .is_some_and(|(id, _)| value["id"].as_u64() == Some(id))

@@ -168,6 +168,7 @@ pub(crate) fn cached(pid: u32) -> Value {
                 NativeOperation::PlayTeleportDispatch,
                 NativeOperation::PlayTeleportJoin,
                 NativeOperation::PlayTeleportLaunch,
+                NativeOperation::PlayTeleportGui,
             ]
             .into_iter()
             .filter(|operation| {
@@ -200,9 +201,7 @@ pub(crate) fn command(args: crate::cli::NativeProbeArgs) -> Result<()> {
         #[cfg(windows)]
         let result = super::windows::playtest_discovery(&args);
         #[cfg(target_os = "macos")]
-        let result: Result<Value> = Err(anyhow::anyhow!(
-            "Playtest discovery currently requires Windows x64"
-        ));
+        let result = super::macos::playtest_discovery(&args);
         let report = match result {
             Ok(report) => report,
             Err(error) => json!({"schemaVersion":1,"readOnly":true,"pid":args.pid,

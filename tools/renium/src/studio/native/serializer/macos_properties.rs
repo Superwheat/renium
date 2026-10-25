@@ -6,6 +6,9 @@ use std::collections::HashSet;
 use std::io::{Seek, SeekFrom};
 use std::sync::Arc;
 
+#[path = "macos_playtest.rs"]
+pub(super) mod playtest;
+
 #[path = "macos_history.rs"]
 mod history;
 
@@ -708,11 +711,39 @@ impl Memory {
             .checked_sub(self.base)
             .and_then(|rva| rva.checked_add(self.trace.image_base))
             .context("Invalid reflection dispatch address")?;
-        let index = self
-            .trace
-            .function_starts
-            .binary_search(&original)
-            .map_err(|_| anyhow::anyhow!("Reflection dispatch has no Mach-O function boundary"))?;
+        let index = match self.trace.function_starts.binary_search(&original) {
+            Ok(index) => index,
+            Err(_) => {
+                // Imported-symbol stubs have section-defined boundaries, not
+                // LC_FUNCTION_STARTS entries. Analyze their verified forwarding
+                // code too; a destructor reaching delete is not a dispatch.
+                let stub = self
+                    .trace
+                    .stubs
+                    .iter()
+                    .find(|section| {
+                        (4..=64).contains(&section.stub_size)
+                            && section.stub_size.is_multiple_of(4)
+                            && original.checked_sub(section.address).is_some_and(|offset| {
+                                offset.is_multiple_of(section.stub_size as u64)
+                                    && offset + section.stub_size as u64 <= section.size
+                            })
+                    })
+                    .context(
+                        "Reflection dispatch has no Mach-O function or import-stub boundary",
+                    )?;
+                let offset = stub.offset as u64 + original - stub.address;
+                let mut file = File::open(&self.executable)?;
+                file.seek(SeekFrom::Start(offset))?;
+                let mut expected = vec![0; stub.stub_size];
+                file.read_exact(&mut expected)?;
+                anyhow::ensure!(
+                    self.read(address, expected.len())? == expected,
+                    "Studio import stub differs from its executable"
+                );
+                return Ok(expected);
+            }
+        };
         let end = self
             .trace
             .function_starts
@@ -757,6 +788,9 @@ impl Memory {
         let mut methods = HashMap::new();
         let mut conditions = HashMap::new();
         let mut terminated = false;
+        let custom_lua = self
+            .rtti(descriptor)?
+            .starts_with("N3RBX10Reflection19CustomBoundFuncDesc");
         for slot in (0..2048).step_by(8) {
             let method = self.pointer(table + slot)?;
             table_bytes.extend_from_slice(&method.to_le_bytes());
@@ -768,29 +802,31 @@ impl Memory {
                 break;
             }
             let mut error = None;
-            let field = super::super::arm64_functions::dispatch_field(
-                method,
-                |address| {
-                    if let Some(code) = methods.get(&address) {
-                        return Some(Vec::clone(code));
+            let code = |address| {
+                if let Some(code) = methods.get(&address) {
+                    return Some(Vec::clone(code));
+                }
+                match self.dispatch_code(address) {
+                    Ok(code) => {
+                        methods.insert(address, code.clone());
+                        Some(code)
                     }
-                    match self.dispatch_code(address) {
-                        Ok(code) => {
-                            methods.insert(address, code.clone());
-                            Some(code)
-                        }
-                        Err(message) => {
-                            error = Some(format!("{message:#}"));
-                            None
-                        }
+                    Err(message) => {
+                        error = Some(format!("{message:#}"));
+                        None
                     }
-                },
-                |field| {
-                    let value = self.pointer(descriptor + field as u64).ok()?;
-                    conditions.insert(field, value);
-                    Some(value)
-                },
-            );
+                }
+            };
+            let value = |field| {
+                let value = self.pointer(descriptor + field as u64).ok()?;
+                conditions.insert(field, value);
+                Some(value)
+            };
+            let field = if custom_lua {
+                super::super::arm64_functions::custom_dispatch_field(method, code, value)
+            } else {
+                super::super::arm64_functions::dispatch_field(method, code, value)
+            };
             if let Some(error) = error {
                 bail!("Could not verify reflection dispatch: {error}");
             }
@@ -933,7 +969,11 @@ impl Memory {
         let mut request = Vec::with_capacity(56 + payload.len() + title.len());
         for value in [
             REQUEST_MAGIC,
-            REQUEST_VERSION,
+            if operation >= 7 {
+                PLAYTEST_REQUEST_VERSION
+            } else {
+                REQUEST_VERSION
+            },
             3,
             payload.len() as u32,
             title.len() as u32,

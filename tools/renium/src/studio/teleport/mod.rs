@@ -1,15 +1,15 @@
 //! Studio teleport sessions rooted in the original Edit controller.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 mod automatic;
 mod cache;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 mod multiplayer;
 mod native;
 mod payload;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 mod routing;
 mod title;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub(crate) use automatic::{start_manual, take_prepared};
 pub(crate) use native::Dispatch;
 
@@ -101,7 +101,7 @@ impl Registry {
         Ok(())
     }
 
-    #[cfg(any(windows, test))]
+    #[cfg(any(windows, target_os = "macos", test))]
     fn arriving(&mut self, session: &Session, nonce: &str) -> Result<()> {
         let active = self
             .active
@@ -305,6 +305,8 @@ fn call(
 ) -> Result<Value> {
     params["runtimeId"] = json!(runtime);
     params["action"] = json!(action);
+    #[cfg(target_os = "macos")]
+    let attempt = params["id"].clone();
     let result = bridge.call_for_runtime_with_timeout(
         "playTeleport",
         params,
@@ -325,6 +327,30 @@ fn call(
             crate::studio::native::serializer::notify_teleport_gui(
                 pid, &title, runtime, &path, show,
             )?;
+        }
+        #[cfg(target_os = "macos")]
+        if target == BridgeTarget::Client && _result["nativeGui"].is_object() {
+            let path: Vec<String> = serde_json::from_value(_result["nativeGui"]["path"].clone())?;
+            let show = _result["nativeGui"]["show"]
+                .as_bool()
+                .context("Invalid teleport GUI state")?;
+            let pid = bridge.studio_pid_for_runtime(target, runtime)?;
+            let model_name = _result["nativeGui"]["modelName"]
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .context("Missing teleport GUI model name")?;
+            let mut gui = crate::studio::native::serializer::NativeMacTeleportGui::arm(
+                pid, runtime, model_name, &path, show,
+            )?;
+            let result = bridge.call_for_runtime_with_timeout(
+                "playTeleport",
+                json!({"action":"nativeGui","runtimeId":runtime,"id":attempt}),
+                target,
+                runtime,
+                Some(Duration::from_secs(3)),
+            )?;
+            ensure_plugin_api_ok(&result)?;
+            gui.complete()?;
         }
         Ok(())
     })
@@ -350,7 +376,7 @@ pub(crate) fn enable_runtime(
     dispatch: Option<Dispatch>,
     require_native_trigger: bool,
 ) -> Result<Value> {
-    if mode != "play" && !cfg!(windows) {
+    if mode != "play" && !cfg!(any(windows, target_os = "macos")) {
         let reason = "Server & Clients teleport requires destination server routing; teleport currently supports solo Play/Play Here only";
         let _ = call(
             bridge,
@@ -372,8 +398,8 @@ pub(crate) fn enable_runtime(
     session.multiplayer = bridge.studio_pid_for_runtime(BridgeTarget::Server, runtime)?
         != bridge.studio_pid_for_runtime(BridgeTarget::Edit, &session.owner)?;
     ensure!(
-        !session.multiplayer || cfg!(windows) && prefer_native,
-        "Server & Clients travel requires native teleport on Windows"
+        !session.multiplayer || cfg!(any(windows, target_os = "macos")) && prefer_native,
+        "Server & Clients travel requires native teleport on Windows or macOS"
     );
     session.clients(&inventory)?;
     {
@@ -445,7 +471,7 @@ fn policy(prefer_native: bool, native: bool, compatibility: bool) -> Value {
     json!({"mode":"armed","nativePreferred":prefer_native,"fallback":if compatibility {"emulated"} else {"unavailable"},"access":"stored-key",
         "trigger":if native { "teleport-service" } else { "compatibility-api" },
         "api":if native { "TeleportService:TeleportAsync" } else { "ReplicatedStorage.ReniumTeleport.Teleport" },
-        "windowTitle":if cfg!(windows) {"windows"} else {"unavailable"},"fallbackNote":NOTICE})
+        "windowTitle":if cfg!(windows) {"windows"} else if cfg!(target_os = "macos") {"macos"} else {"unavailable"},"fallbackNote":NOTICE})
 }
 
 pub(crate) fn start_pending(bridge: &Arc<BridgeServer>) {
@@ -699,7 +725,7 @@ fn watch(
     session: &mut Session,
     dispatch: Option<Dispatch>,
 ) -> Result<()> {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     if session.multiplayer {
         return multiplayer::watch(bridge, session, dispatch);
     }

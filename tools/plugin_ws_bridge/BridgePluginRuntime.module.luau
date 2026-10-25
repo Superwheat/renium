@@ -4664,6 +4664,11 @@ function BridgePluginRuntime.start(context)
 			end
 		end,
 	})
+	for _, property in { "Name", "PlaceId", "GameId" } do
+		lifetimeConnections[#lifetimeConnections + 1] = game:GetPropertyChangedSignal(property):Connect(function()
+			Config.notifyBridgeInfoChanged()
+		end)
+	end
 	local studioChangeStatusUpdatePending = false
 	Config.studioChangeNotificationConnection = Config.studioChanges.onChanged(function()
 		if studioChangeStatusUpdatePending then

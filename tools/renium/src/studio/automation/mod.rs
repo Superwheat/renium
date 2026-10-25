@@ -1641,7 +1641,7 @@ fn start_attempt(
             "Reopen this Studio with the updated plugin to arm teleport before multiplayer clients start"
         );
     }
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     let _idle_dispatch = if plan != PlayLaunchPlan::Play || teleport.is_none() {
         crate::studio::teleport::take_prepared(&launch.edit_runtime_id)
     } else {

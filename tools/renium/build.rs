@@ -252,6 +252,7 @@ fn build_macos(out_dir: &Path) {
         .arg(&helper)
         .arg(&helper_source)
         .arg(&launch_guard_source)
+        .arg("native/renium_play_caption_macos.mm")
         .arg("native/renium_audio_macos.mm");
     run(&mut helper_command, "macOS Studio helper build");
     let mut launcher_command = Command::new("clang");
@@ -282,8 +283,30 @@ fn build_macos(out_dir: &Path) {
     ]);
     shield_command.arg(&shield).arg(&shield_source);
     run(&mut shield_command, "macOS input shield build");
+    for name in ["teleport_dispatch", "playtest", "play_join", "teleport_gui"] {
+        let source = format!("native/tests/{name}_macos.cpp");
+        let mut command = Command::new("clang++");
+        command
+            .args(&arch)
+            .args(["-std=c++20", "-O1", "-pthread", "-o"])
+            .arg(out_dir.join(format!("renium-{name}-test")))
+            .arg(&source);
+        run(&mut command, "macOS teleport regression build");
+        println!("cargo:rerun-if-changed={source}");
+    }
     println!("cargo:rerun-if-changed={}", helper_source.display());
     println!("cargo:rerun-if-changed=native/renium_audio_macos.mm");
+    println!("cargo:rerun-if-changed=native/renium_playtest_macos.h");
+    println!("cargo:rerun-if-changed=native/renium_test_server_macos.h");
+    println!("cargo:rerun-if-changed=native/renium_test_client_macos.h");
+    println!("cargo:rerun-if-changed=native/renium_test_join_macos.h");
+    println!("cargo:rerun-if-changed=native/renium_relay_macos.h");
+    println!("cargo:rerun-if-changed=native/renium_route_code_macos.h");
+    println!("cargo:rerun-if-changed=native/renium_route_launch_macos.h");
+    println!("cargo:rerun-if-changed=native/renium_teleport_dispatch_macos.h");
+    println!("cargo:rerun-if-changed=native/renium_play_join_macos.h");
+    println!("cargo:rerun-if-changed=native/renium_teleport_gui_macos.h");
+    println!("cargo:rerun-if-changed=native/renium_play_caption_macos.mm");
     println!("cargo:rerun-if-changed={}", launch_guard_source.display());
     println!("cargo:rerun-if-changed={}", launcher_source.display());
     println!("cargo:rerun-if-changed={}", shield_source.display());

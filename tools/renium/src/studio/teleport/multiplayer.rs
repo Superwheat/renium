@@ -227,6 +227,7 @@ impl Test {
                             pid,
                             version: destination.saved.version,
                         };
+                        #[cfg(windows)]
                         crate::project::workflows::windows_launch::match_test_server_window(
                             self.source_pid,
                             pid,
@@ -264,7 +265,7 @@ impl Test {
         attempt: &Attempt,
         clients: &HashMap<String, String>,
     ) -> Result<()> {
-        use crate::studio::native::serializer::{rejoin_test_client, test_client_configuration};
+        use crate::studio::native::serializer::test_client_configuration;
         let started = Instant::now();
         let selected: HashMap<_, _> = attempt
             .players
@@ -298,8 +299,12 @@ impl Test {
             // Returning uses the source's existing native transport. Manual
             // Add Clients would launch the entire player-count selection again.
             if self.endpoints[&from].configuration.is_none() && from.place == self.root.source {
+                #[cfg(windows)]
                 let command = crate::studio::performance::process_command_line(participants[0].2)
                     .context("Cannot read the source client's test configuration")?;
+                #[cfg(target_os = "macos")]
+                let command =
+                    crate::studio::native::serializer::process_arguments(participants[0].2)?;
                 self.endpoints.get_mut(&from).unwrap().configuration =
                     Some(test_client_configuration(
                         &command,
@@ -391,7 +396,8 @@ impl Test {
                         json!({"join":join,"identity":identity}),
                     )?;
                     let path = serde_json::from_value::<Vec<String>>(relay["path"].clone())?;
-                    arrivals.push(crate::studio::native::serializer::NativeTestJoin::arm(
+                    #[cfg(windows)]
+                    let arrival = crate::studio::native::serializer::NativeTestJoin::arm(
                         target_pid,
                         target_runtime,
                         &path,
@@ -399,53 +405,83 @@ impl Test {
                         from.universe,
                         client,
                         &identity,
-                    )?);
-                }
-                let configuration =
-                    if let Some(configuration) = &self.endpoints[&route.to].configuration {
-                        configuration.clone()
-                    } else {
-                        let mut capture =
-                            crate::project::workflows::windows_launch::TestClientRoute::arm(
-                                server.pid, *pid,
-                            )?;
-                        if self.root.nonce.starts_with("manual-") {
-                            // AddPlayers only accepts ExecuteMultiplayerTestAsync
-                            // sessions. Manual servers use Studio's Add Client action;
-                            // the same launch capture redirects it into this window.
-                            let title = crate::studio::input::studio_window_title(server.pid)?;
-                            crate::studio::native::serializer::trigger_studio_action(
-                                server.pid,
-                                &title,
-                                "addClientsAction",
-                            )?;
-                        } else {
-                            call(
-                                bridge,
-                                &server.runtime,
-                                BridgeTarget::Server,
-                                "addRouteClient",
-                                json!({}),
-                            )?;
-                        }
-                        let deadline = Instant::now() + Duration::from_secs(15);
-                        let command = loop {
-                            if let Some(command) = capture.command()? {
-                                break command;
-                            }
-                            self.wait(bridge, deadline)?;
-                        };
-                        let configuration = test_client_configuration(
-                            &command,
-                            self.edit_pid,
-                            server.pid,
-                            from.universe,
+                    )?;
+                    #[cfg(target_os = "macos")]
+                    let arrival = {
+                        let mut arrival = crate::studio::native::serializer::NativeTestJoin::arm(
+                            target_pid,
+                            target_runtime,
+                            &path,
                             attempt.place_id,
+                            from.universe,
+                            client,
+                            &identity,
+                            relay["modelName"]
+                                .as_str()
+                                .context("Routed model has no name")?,
                         )?;
-                        self.endpoints.get_mut(&route.to).unwrap().configuration =
-                            Some(configuration.clone());
-                        configuration
+                        call(
+                            bridge,
+                            target_runtime,
+                            role,
+                            "invokeRoute",
+                            json!({"kind":"join"}),
+                        )?;
+                        arrival.complete()?;
+                        arrival
                     };
+                    arrivals.push(arrival);
+                }
+                let configuration = if let Some(configuration) =
+                    &self.endpoints[&route.to].configuration
+                {
+                    configuration.clone()
+                } else {
+                    #[cfg(windows)]
+                    let mut capture =
+                        crate::project::workflows::windows_launch::TestClientRoute::arm(
+                            server.pid, *pid,
+                        )?;
+                    #[cfg(target_os = "macos")]
+                    let mut capture =
+                        crate::studio::native::serializer::TestClientRoute::arm(server.pid, *pid)?;
+                    if self.root.nonce.starts_with("manual-") {
+                        // AddPlayers only accepts ExecuteMultiplayerTestAsync
+                        // sessions. Manual servers use Studio's Add Client action;
+                        // the same launch capture redirects it into this window.
+                        let title = crate::studio::input::studio_window_title(server.pid)?;
+                        crate::studio::native::serializer::trigger_studio_action(
+                            server.pid,
+                            &title,
+                            "addClientsAction",
+                        )?;
+                    } else {
+                        call(
+                            bridge,
+                            &server.runtime,
+                            BridgeTarget::Server,
+                            "addRouteClient",
+                            json!({}),
+                        )?;
+                    }
+                    let deadline = Instant::now() + Duration::from_secs(15);
+                    let command = loop {
+                        if let Some(command) = capture.command()? {
+                            break command;
+                        }
+                        self.wait(bridge, deadline)?;
+                    };
+                    let configuration = test_client_configuration(
+                        &command,
+                        self.edit_pid,
+                        server.pid,
+                        from.universe,
+                        attempt.place_id,
+                    )?;
+                    self.endpoints.get_mut(&route.to).unwrap().configuration =
+                        Some(configuration.clone());
+                    configuration
+                };
                 let prepared = call(
                     bridge,
                     runtime,
@@ -454,7 +490,34 @@ impl Test {
                     json!({"id":attempt.id,"configuration":configuration}),
                 )?;
                 let path: Vec<String> = serde_json::from_value(prepared["path"].clone())?;
-                rejoin_test_client(*pid, runtime, &path)?;
+                #[cfg(windows)]
+                crate::studio::native::serializer::rejoin_test_client(*pid, runtime, &path)?;
+                #[cfg(target_os = "macos")]
+                let _transition = {
+                    let mut transition =
+                        crate::studio::native::serializer::NativeMacTestClient::arm(
+                            *pid,
+                            runtime,
+                            &path,
+                            prepared["modelName"]
+                                .as_str()
+                                .context("Client model has no name")?,
+                            self.captions[pid].window(),
+                        )?;
+                    let invoked = call(
+                        bridge,
+                        runtime,
+                        BridgeTarget::Client,
+                        "invokeRoute",
+                        json!({"kind":"client"}),
+                    );
+                    // A departing model may close its channel after consuming
+                    // the command. The native receipt resolves that ambiguity.
+                    transition
+                        .complete()
+                        .or_else(|error| invoked.map(|_| ()).and(Err(error)))?;
+                    transition
+                };
                 bridge.retire_runtime(runtime);
                 let deadline = Instant::now() + Duration::from_secs(25);
                 loop {

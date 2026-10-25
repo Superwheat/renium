@@ -62,6 +62,7 @@ assert(completed.fail(completed.id), "an uncertain completion cannot claim the s
 
 local services, request, destroyed, preparedCount, committed, arrivals, resumed = {}, nil, 0, 0, 0, 0, 0
 local nativeRelay
+local deferred = {}
 services.ServerStorage = {}
 local isEdit, yieldDeserialize, yieldArrival = false, false, false
 services.RunService = { IsStudio = function() return true end, IsEdit = function() return isEdit end }
@@ -80,10 +81,15 @@ services.SerializationService = { DeserializeInstancesAsync = function()
 end }
 local module = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgePlayTeleport.module.luau"), { environment = {
 	game = { GetService = function(_, name) return assert(services[name], name) end },
-	os = { clock = function() return now end }, task = { spawn = function() end, wait = coroutine.yield },
+	os = { clock = function() return now end }, task = {
+		spawn = function() end, wait = coroutine.yield,
+		defer = function(callback) table.insert(deferred, callback) end,
+	},
 	Instance = { new = function(class)
 		assert(class == "BindableFunction")
-		nativeRelay = { SetAttribute = function(self, key, value) self[key] = value end, Destroy = function(self) self.destroyed = true end }
+		nativeRelay = { SetAttribute = function(self, key, value) self[key] = value end,
+			Destroy = function(self) self.destroyed = true end,
+			Invoke = function(self, ...) return self.OnInvoke(...) end }
 		return nativeRelay
 	end },
 	typeof = function(value) return if value == player or value == player2 or value == player3 then "Instance" else typeof(value) end,
@@ -114,6 +120,7 @@ local function runtime(role)
 			arrive = function() table.insert(guiEvents, "arrive") end,
 			get = function() return {} end,
 			native = function() return nil end,
+			invokeNative = function() table.insert(guiEvents, "native") end,
 		} end } })
 end
 local function send(api, role, action, values)
@@ -135,8 +142,12 @@ local relayPath = send(server, "play-server", "nativeBridge").path
 assert(relayPath[1] == "ServerStorage" and nativeRelay.Parent == services.ServerStorage)
 send(server, "play-server", "nativeBridge", { scope = "owned-launch" })
 assert(nativeRelay.__ReniumNative == "owned-launch")
+assert(nativeRelay.__ReniumNativePump == "owned-launch" and #deferred == 1)
+deferred[1]()
+assert(send(server, "play-server", "status").pending == nil, "the native launch pump must not enqueue a teleport")
 send(server, "play-server", "nativeBridge")
 assert(nativeRelay.__ReniumNative == "play-server", "reconnection must bind the existing relay to its new native owner")
+assert(nativeRelay.__ReniumNativePump == nil, "reconnection must clear the previous launch pump ownership")
 local nativeCall = coroutine.create(function() nativeRelay.OnInvoke("12", nil, player) end)
 assert(coroutine.resume(nativeCall))
 assert(coroutine.status(nativeCall) == "suspended")
@@ -247,6 +258,12 @@ assert(send(server, "play-server", "arm", {}).emulatedPlaceId == 12,
 	"a replacement daemon must recover the committed compatibility destination")
 assert(not pcall(send, client, "play-client", "arm", {}))
 send(client, "play-client", "loading", { id = 1 })
+send(client, "play-client", "nativeGui", { id = 1 })
+assert(guiEvents[#guiEvents] == "native", "the loading-screen notification must reach the current client")
+for _, staleId in { 0, 2 } do
+	assert(not pcall(send, client, "play-client", "nativeGui", { id = staleId }),
+		"a loading-screen notification must belong to the current attempt")
+end
 assert(not pcall(send, client, "play-client", "arrive", { id = 1 }))
 send(client, "play-client", "pause", { id = 1 })
 send(client, "play-client", "fail", { id = 1, stopRequired = false })
@@ -260,6 +277,8 @@ send(client, "play-client", "loading", { id = 3 })
 send(client, "play-client", "pause", { id = 3 })
 send(client, "play-client", "fail", { id = 3, stopRequired = true })
 assert(guiEvents[#guiEvents] == "stop" and resumed == 2)
+send(client, "play-client", "nativeGui", { id = 3 })
+assert(guiEvents[#guiEvents] == "native", "failed travel must still dismiss the native loading screen")
 assert(not pcall(send, client, "play-client", "loading", { id = 4 }))
 local reconnecting = runtime("play-client")
 send(reconnecting, "play-client", "loading", { id = 1 })
