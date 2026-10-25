@@ -420,7 +420,8 @@ impl Drop for EchoOff {
     }
 }
 
-#[cfg(test)]
+// The key store is a macOS keychain item there, so the file-store tests run elsewhere.
+#[cfg(all(test, not(target_os = "macos")))]
 mod tests {
     use super::*;
 
@@ -433,7 +434,6 @@ mod tests {
         (dir.clone(), dir.join("api-keys.json"))
     }
 
-    #[cfg(not(target_os = "macos"))]
     #[test]
     fn keys_round_trip_without_the_secret_in_the_listing() -> Result<()> {
         let (dir, path) = scratch_store();

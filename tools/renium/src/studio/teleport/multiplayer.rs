@@ -412,9 +412,11 @@ impl Test {
                             target_pid,
                             target_runtime,
                             &path,
-                            attempt.place_id,
-                            from.universe,
-                            client,
+                            crate::studio::native::serializer::TestJoinTarget {
+                                place: attempt.place_id,
+                                universe: from.universe,
+                                client,
+                            },
                             &identity,
                             relay["modelName"]
                                 .as_str()

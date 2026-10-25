@@ -180,10 +180,7 @@ pub(super) fn binding(prepared: &NativeProperty) -> Result<Vec<u8>> {
         .checked_sub(prepared.memory.base)
         .and_then(|rva| rva.checked_add(image.image_base))
         .context("History member is outside Studio")?;
-    let playback = match discover(&image, native) {
-        Ok(voxel) => Some(voxel),
-        Err(_) => None,
-    };
+    let playback = discover(&image, native).ok();
     let mut target = 0;
     if let Some(voxel) = playback {
         let code = function(&image, voxel).unwrap();

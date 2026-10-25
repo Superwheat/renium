@@ -1529,7 +1529,7 @@ fn discover_identity_abi(memory: &Memory, descriptor: u64, table: u64) -> Result
             && let Some(result) = binding_call(&code, &offsets, CallKind::Identity)
         {
             found.entry(result).or_insert_with(Vec::new).push((
-                slot as usize * 8,
+                slot * 8,
                 address - memory.base,
                 code,
             ));

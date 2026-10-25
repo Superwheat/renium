@@ -10,8 +10,8 @@ mod functions;
 mod macos;
 #[cfg(target_os = "macos")]
 pub(crate) use macos::{
-    NativeMacTestClient, NativeTestJoin, TestClientRoute, prepare_test_client, process_arguments,
-    start_destination_server, test_client_configuration,
+    NativeMacTestClient, NativeTestJoin, TestClientRoute, TestJoinTarget, prepare_test_client,
+    process_arguments, start_destination_server, test_client_configuration,
 };
 #[cfg(any(windows, target_os = "macos", test))]
 pub(crate) mod probes;

@@ -36,12 +36,6 @@ pub(super) fn walk(
     regs[0] = Some(Value::Input(0));
     regs[31] = Some(Value::Stack(0));
     let mut stack = BTreeMap::new();
-    let load = |address, width, stack: &BTreeMap<i64, Value>| match (address, width) {
-        (Some(Value::Stack(at)), 8) => stack.get(&at).copied(),
-        (Some(Value::Input(at)), 8) => Some(Value::Payload(at, 0)),
-        (Some(Value::Payload(at, field)), 8) => Some(Value::Field(at, field)),
-        _ => None,
-    };
     for (index, bytes) in bytes.chunks_exact(4).enumerate() {
         let word = u32::from_le_bytes(bytes.try_into().unwrap());
         let pc = entry + index as u64 * 4;
@@ -79,78 +73,9 @@ pub(super) fn walk(
                 ));
             }
         } else if word & 0x3b000000 == 0x39000000 || word & 0x3b200000 == 0x38000000 {
-            let vector = word & (1 << 26) != 0;
-            let opc = (word >> 22) & 3;
-            let width = if vector && opc & 2 != 0 {
-                16
-            } else {
-                1 << (word >> 30)
-            };
-            let unsigned = word & 0x3b000000 == 0x39000000;
-            let mode = (word >> 10) & 3;
-            let offset = if unsigned {
-                ((word >> 10) & 4095) as i64 * width
-            } else {
-                ((word << 11) as i32 >> 23) as i64
-            };
-            let address =
-                regs[base].and_then(|v| v.offset(if !unsigned && mode == 1 { 0 } else { offset }));
-            if opc & 1 != 0 || !vector && opc != 0 {
-                if !vector && dst != 31 {
-                    regs[dst] = load(address, width, &stack);
-                }
-            } else if let Some(Value::Stack(at)) = address {
-                stack.retain(|key, _| *key + 8 <= at || *key >= at + width);
-                if !vector
-                    && width == 8
-                    && let Some(value) = if dst == 31 {
-                        Some(Value::Address(0))
-                    } else {
-                        regs[dst]
-                    }
-                {
-                    stack.insert(at, value);
-                }
-            }
-            if !unsigned && (mode == 1 || mode == 3) {
-                regs[base] = regs[base].and_then(|v| v.offset(offset));
-            }
+            single_access(word, &mut regs, &mut stack);
         } else if word & 0x3a000000 == 0x28000000 {
-            let vector = word & (1 << 26) != 0;
-            let width = if vector {
-                4 << (word >> 30)
-            } else if word >> 31 != 0 {
-                8
-            } else {
-                4
-            };
-            let offset = ((word << 10) as i32 >> 25) as i64 * width;
-            let mode = (word >> 23) & 3;
-            let address = regs[base].and_then(|v| v.offset(if mode == 1 { 0 } else { offset }));
-            let second = ((word >> 10) & 31) as usize;
-            for (lane, register) in [dst, second].into_iter().enumerate() {
-                let address = address.and_then(|v| v.offset(lane as i64 * width));
-                if word & (1 << 22) != 0 {
-                    if !vector && register != 31 {
-                        regs[register] = load(address, width, &stack);
-                    }
-                } else if let Some(Value::Stack(at)) = address {
-                    stack.retain(|key, _| *key + 8 <= at || *key >= at + width);
-                    if !vector
-                        && width == 8
-                        && let Some(value) = if register == 31 {
-                            Some(Value::Address(0))
-                        } else {
-                            regs[register]
-                        }
-                    {
-                        stack.insert(at, value);
-                    }
-                }
-            }
-            if mode == 1 || mode == 3 {
-                regs[base] = regs[base].and_then(|v| v.offset(offset));
-            }
+            pair_access(word, &mut regs, &mut stack);
         } else if word & 0x7c000000 == 0x14000000
             || word & 0xff000010 == 0x54000000
             || word & 0x7e000000 == 0x34000000
@@ -162,6 +87,96 @@ pub(super) fn walk(
         } else if dst != 31 {
             regs[dst] = None;
         }
+    }
+}
+
+fn load(address: Option<Value>, width: i64, stack: &BTreeMap<i64, Value>) -> Option<Value> {
+    match (address, width) {
+        (Some(Value::Stack(at)), 8) => stack.get(&at).copied(),
+        (Some(Value::Input(at)), 8) => Some(Value::Payload(at, 0)),
+        (Some(Value::Payload(at, field)), 8) => Some(Value::Field(at, field)),
+        _ => None,
+    }
+}
+
+// A register moving through a stack slot keeps its provenance; a vector or
+// an unknown address only clears what it overlaps.
+fn access(
+    register: usize,
+    vector: bool,
+    load_access: bool,
+    width: i64,
+    address: Option<Value>,
+    regs: &mut [Option<Value>; 32],
+    stack: &mut BTreeMap<i64, Value>,
+) {
+    if load_access {
+        if !vector && register != 31 {
+            regs[register] = load(address, width, stack);
+        }
+    } else if let Some(Value::Stack(at)) = address {
+        stack.retain(|key, _| *key + 8 <= at || *key >= at + width);
+        if !vector
+            && width == 8
+            && let Some(value) = if register == 31 {
+                Some(Value::Address(0))
+            } else {
+                regs[register]
+            }
+        {
+            stack.insert(at, value);
+        }
+    }
+}
+
+fn single_access(word: u32, regs: &mut [Option<Value>; 32], stack: &mut BTreeMap<i64, Value>) {
+    let dst = (word & 31) as usize;
+    let base = ((word >> 5) & 31) as usize;
+    let vector = word & (1 << 26) != 0;
+    let opc = (word >> 22) & 3;
+    let width = if vector && opc & 2 != 0 {
+        16
+    } else {
+        1 << (word >> 30)
+    };
+    let unsigned = word & 0x3b000000 == 0x39000000;
+    let mode = (word >> 10) & 3;
+    let offset = if unsigned {
+        ((word >> 10) & 4095) as i64 * width
+    } else {
+        ((word << 11) as i32 >> 23) as i64
+    };
+    let address =
+        regs[base].and_then(|v| v.offset(if !unsigned && mode == 1 { 0 } else { offset }));
+    let load_access = opc & 1 != 0 || !vector && opc != 0;
+    access(dst, vector, load_access, width, address, regs, stack);
+    if !unsigned && (mode == 1 || mode == 3) {
+        regs[base] = regs[base].and_then(|v| v.offset(offset));
+    }
+}
+
+fn pair_access(word: u32, regs: &mut [Option<Value>; 32], stack: &mut BTreeMap<i64, Value>) {
+    let dst = (word & 31) as usize;
+    let base = ((word >> 5) & 31) as usize;
+    let vector = word & (1 << 26) != 0;
+    let width = if vector {
+        4 << (word >> 30)
+    } else if word >> 31 != 0 {
+        8
+    } else {
+        4
+    };
+    let offset = ((word << 10) as i32 >> 25) as i64 * width;
+    let mode = (word >> 23) & 3;
+    let address = regs[base].and_then(|v| v.offset(if mode == 1 { 0 } else { offset }));
+    let second = ((word >> 10) & 31) as usize;
+    let load_access = word & (1 << 22) != 0;
+    for (lane, register) in [dst, second].into_iter().enumerate() {
+        let address = address.and_then(|v| v.offset(lane as i64 * width));
+        access(register, vector, load_access, width, address, regs, stack);
+    }
+    if mode == 1 || mode == 3 {
+        regs[base] = regs[base].and_then(|v| v.offset(offset));
     }
 }
 

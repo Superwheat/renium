@@ -598,6 +598,14 @@ pub(crate) fn test_client_configuration(
     )
 }
 
+/// Where a routed test player arrives and whether it joins as a client.
+#[derive(Clone, Copy)]
+pub(crate) struct TestJoinTarget {
+    pub place: i64,
+    pub universe: i64,
+    pub client: bool,
+}
+
 pub(crate) struct NativeMacTestJoin {
     memory: Memory,
     request: Vec<u8>,
@@ -607,12 +615,15 @@ impl NativeMacTestJoin {
         pid: u32,
         runtime: &str,
         path: &[String],
-        place: i64,
-        universe: i64,
-        client: bool,
+        target: TestJoinTarget,
         identity: &Value,
         model_name: &str,
     ) -> Result<Self> {
+        let TestJoinTarget {
+            place,
+            universe,
+            client,
+        } = target;
         anyhow::ensure!(
             path == ["CoreGui", &format!("__ReniumRouteJoin_{runtime}")],
             "Invalid routed arrival relay"
@@ -723,20 +734,6 @@ pub(super) fn discover_client(pid: u32) -> Result<Value> {
     let contexts = memory.request(5, &[0], "")?;
     memory.base = read_u64(&contexts, 0).context("Client has no model")?;
     Ok(serde_json::to_value(client_binding(&memory)?)?)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    #[ignore = "requires an explicitly owned Studio process"]
-    fn installed_mac_client_routing() -> Result<()> {
-        let pid = std::env::var("RENIUM_TELEPORT_TEST_PID")?.parse()?;
-        let started = Instant::now();
-        println!("{}", discover_client(pid)?);
-        println!("Client discovery: {:?}", started.elapsed());
-        Ok(())
-    }
 }
 
 fn process_identity(pid: u32) -> Result<(u64, u64)> {
@@ -943,4 +940,18 @@ pub(crate) fn start_destination_server(
         std::thread::sleep(Duration::from_millis(25));
     }
     bail!("Destination server did not start")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    #[ignore = "requires an explicitly owned Studio process"]
+    fn installed_mac_client_routing() -> Result<()> {
+        let pid = std::env::var("RENIUM_TELEPORT_TEST_PID")?.parse()?;
+        let started = Instant::now();
+        println!("{}", discover_client(pid)?);
+        println!("Client discovery: {:?}", started.elapsed());
+        Ok(())
+    }
 }

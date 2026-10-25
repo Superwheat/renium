@@ -96,8 +96,8 @@ pub(crate) use properties::playtest::NativeMacPlayLoad as NativePlayLoad;
 pub(crate) use properties::playtest::NativeMacTeleportDispatch as NativeTeleportDispatch;
 pub(crate) use properties::playtest::NativeMacTeleportGui;
 pub(crate) use properties::playtest::{
-    NativeMacTestClient, NativeMacTestJoin as NativeTestJoin, TestClientRoute, prepare_test_client,
-    process_arguments, start_destination_server, test_client_configuration,
+    NativeMacTestClient, NativeMacTestJoin as NativeTestJoin, TestClientRoute, TestJoinTarget,
+    prepare_test_client, process_arguments, start_destination_server, test_client_configuration,
 };
 pub(crate) use properties::{
     observe_terrain, prepare_context, prepare_property, prepare_terrain, read_property,

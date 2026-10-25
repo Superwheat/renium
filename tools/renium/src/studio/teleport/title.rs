@@ -294,6 +294,7 @@ impl Lease {
         }
     }
 
+    #[cfg(any(windows, target_os = "macos"))]
     pub(super) fn rebind(&self, session: &Session, name: &str) -> Result<()> {
         #[cfg(any(windows, target_os = "macos"))]
         {
@@ -307,6 +308,7 @@ impl Lease {
         self.arrived(name, session.current_place == session.source)
     }
 
+    #[cfg(any(windows, target_os = "macos"))]
     pub(super) fn restore(&self) {
         #[cfg(any(windows, target_os = "macos"))]
         self.state.lock_recover().restore();

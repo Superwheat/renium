@@ -27,7 +27,7 @@ pub(crate) use caption::NativeMacPlayCaption;
 #[path = "macos_play_routing.rs"]
 mod routing;
 pub(crate) use routing::{
-    NativeMacTestClient, NativeMacTestJoin, TestClientRoute, prepare_test_client,
+    NativeMacTestClient, NativeMacTestJoin, TestClientRoute, TestJoinTarget, prepare_test_client,
     process_arguments, start_destination_server, test_client_configuration,
 };
 

@@ -31,6 +31,13 @@ impl Value {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Transfer {
+    vector: bool,
+    load: bool,
+    size: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct State {
     registers: [Option<Value>; 32],
@@ -107,9 +114,7 @@ impl State {
         &mut self,
         address: Option<Value>,
         register: usize,
-        vector: bool,
-        load: bool,
-        size: usize,
+        Transfer { vector, load, size }: Transfer,
         identities: [usize; 2],
         stores: &mut [HashSet<(i64, i64)>; 2],
     ) {
@@ -141,6 +146,80 @@ impl State {
             }
         } else {
             self.store(address, size, self.reg(register), stores);
+        }
+    }
+
+    // Load/store pair: both registers move through one address with a stride.
+    fn pair(&mut self, word: u32, identities: [usize; 2], stores: &mut [HashSet<(i64, i64)>; 2]) {
+        let dst = (word & 31) as usize;
+        let base = ((word >> 5) & 31) as usize;
+        let vector = word & (1 << 26) != 0;
+        let size = if vector {
+            4 << (word >> 30)
+        } else if word >> 31 != 0 {
+            8
+        } else {
+            4
+        };
+        let offset = (((word << 10) as i32 >> 25) as i64) * size as i64;
+        let mode = (word >> 23) & 3;
+        let address =
+            self.registers[base].and_then(|v| v.offset(if mode == 1 { 0 } else { offset }));
+        let second = ((word >> 10) & 31) as usize;
+        let transfer = Transfer {
+            vector,
+            load: word & (1 << 22) != 0,
+            size,
+        };
+        self.transfer(address, dst, transfer, identities, stores);
+        self.transfer(
+            address.and_then(|a| a.offset(size as i64)),
+            second,
+            transfer,
+            identities,
+            stores,
+        );
+        if mode == 1 || mode == 3 {
+            self.registers[base] = self.registers[base].and_then(|v| v.offset(offset));
+        }
+    }
+
+    // Single register load/store with an unsigned or pre/post-indexed offset.
+    fn single(&mut self, word: u32, identities: [usize; 2], stores: &mut [HashSet<(i64, i64)>; 2]) {
+        let dst = (word & 31) as usize;
+        let base = ((word >> 5) & 31) as usize;
+        let vector = word & (1 << 26) != 0;
+        let opc = (word >> 22) & 3;
+        let size = if vector && opc & 2 != 0 {
+            16
+        } else {
+            1 << (word >> 30)
+        };
+        let unsigned = word & 0x3b000000 == 0x39000000;
+        let mode = (word >> 10) & 3;
+        let offset = if unsigned {
+            ((word >> 10) & 4095) as i64 * size as i64
+        } else {
+            ((word << 11) as i32 >> 23) as i64
+        };
+        let address = self.registers[base]
+            .and_then(|v| v.offset(if !unsigned && mode == 1 { 0 } else { offset }));
+        let load = opc & 1 != 0 || !vector && opc != 0;
+        if load && !vector && opc != 1 {
+            if dst != 31 {
+                self.registers[dst] = None;
+            }
+        } else {
+            self.transfer(
+                address,
+                dst,
+                Transfer { vector, load, size },
+                identities,
+                stores,
+            );
+        }
+        if !unsigned && (mode == 1 || mode == 3) {
+            self.registers[base] = self.registers[base].and_then(|v| v.offset(offset));
         }
     }
 
@@ -180,61 +259,9 @@ impl State {
                 None
             };
         } else if word & 0x3a000000 == 0x28000000 {
-            let vector = word & (1 << 26) != 0;
-            let size = if vector {
-                4 << (word >> 30)
-            } else if word >> 31 != 0 {
-                8
-            } else {
-                4
-            };
-            let offset = (((word << 10) as i32 >> 25) as i64) * size as i64;
-            let mode = (word >> 23) & 3;
-            let address =
-                self.registers[base].and_then(|v| v.offset(if mode == 1 { 0 } else { offset }));
-            let second = ((word >> 10) & 31) as usize;
-            let load = word & (1 << 22) != 0;
-            self.transfer(address, dst, vector, load, size, identities, stores);
-            self.transfer(
-                address.and_then(|a| a.offset(size as i64)),
-                second,
-                vector,
-                load,
-                size,
-                identities,
-                stores,
-            );
-            if mode == 1 || mode == 3 {
-                self.registers[base] = self.registers[base].and_then(|v| v.offset(offset));
-            }
+            self.pair(word, identities, stores);
         } else if word & 0x3b000000 == 0x39000000 || word & 0x3b200000 == 0x38000000 {
-            let vector = word & (1 << 26) != 0;
-            let opc = (word >> 22) & 3;
-            let size = if vector && opc & 2 != 0 {
-                16
-            } else {
-                1 << (word >> 30)
-            };
-            let unsigned = word & 0x3b000000 == 0x39000000;
-            let mode = (word >> 10) & 3;
-            let offset = if unsigned {
-                ((word >> 10) & 4095) as i64 * size as i64
-            } else {
-                ((word << 11) as i32 >> 23) as i64
-            };
-            let address = self.registers[base]
-                .and_then(|v| v.offset(if !unsigned && mode == 1 { 0 } else { offset }));
-            let load = opc & 1 != 0 || !vector && opc != 0;
-            if load && !vector && opc != 1 {
-                if dst != 31 {
-                    self.registers[dst] = None;
-                }
-            } else {
-                self.transfer(address, dst, vector, load, size, identities, stores);
-            }
-            if !unsigned && (mode == 1 || mode == 3) {
-                self.registers[base] = self.registers[base].and_then(|v| v.offset(offset));
-            }
+            self.single(word, identities, stores);
         } else if word & 0xbfe08400 == 0x2e000000 {
             // EXT's byte shift can rotate the two identity lanes together.
             let shift = ((word >> 11) & 15) as usize;
