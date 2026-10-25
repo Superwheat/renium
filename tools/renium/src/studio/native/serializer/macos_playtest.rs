@@ -54,8 +54,15 @@ fn host_identity() -> Result<(u64, u64)> {
 }
 
 struct Catalog {
-    bytes: Vec<u8>,
+    executable: PathBuf,
+    uuid: [u8; 16],
+    bytes: OnceLock<Vec<u8>>,
 }
+
+type TypeKey = ([u8; 16], String);
+type SingletonKey = ([u8; 16], String, Option<String>);
+static TABLES: OnceLock<Mutex<HashMap<TypeKey, u64>>> = OnceLock::new();
+static SINGLETONS: OnceLock<Mutex<HashMap<SingletonKey, u64>>> = OnceLock::new();
 
 struct LoaderBinding {
     slot: u64,
@@ -67,16 +74,23 @@ struct LoaderBinding {
 
 impl Catalog {
     fn open(memory: &Memory) -> Result<Self> {
-        let bytes = fs::read(&memory.executable)?;
-        anyhow::ensure!(
-            MachImage::parse(&bytes)?.image_uuid == memory.trace.image_uuid,
-            "Studio executable changed during teleport discovery"
-        );
-        Ok(Self { bytes })
+        Ok(Self {
+            executable: memory.executable.clone(),
+            uuid: memory.trace.image_uuid,
+            bytes: OnceLock::new(),
+        })
     }
 
     fn image(&self) -> Result<MachImage<'_>> {
-        MachImage::parse(&self.bytes)
+        if self.bytes.get().is_none() {
+            let bytes = fs::read(&self.executable)?;
+            anyhow::ensure!(
+                MachImage::parse(&bytes)?.image_uuid == self.uuid,
+                "Studio executable changed during teleport discovery"
+            );
+            let _ = self.bytes.set(bytes);
+        }
+        MachImage::parse(self.bytes.get().unwrap())
     }
 
     fn pointers(image: &MachImage<'_>, target: u64) -> Vec<u64> {
@@ -113,6 +127,11 @@ impl Catalog {
     }
 
     fn table(&self, kind: &str) -> Result<u64> {
+        let key = (self.uuid, kind.to_owned());
+        let cache = TABLES.get_or_init(Default::default);
+        if let Some(table) = cache.lock_recover().get(&key).copied() {
+            return Ok(table);
+        }
         let image = self.image()?;
         let needle = format!("{kind}\0");
         let mut matches = BTreeSet::new();
@@ -148,7 +167,9 @@ impl Catalog {
             "Native macOS type {kind} has {} complete vtables",
             matches.len()
         );
-        Ok(*matches.first().unwrap())
+        let table = *matches.first().unwrap();
+        cache.lock_recover().insert(key, table);
+        Ok(table)
     }
 
     fn callback_type(&self, owner: &str) -> Result<String> {
@@ -183,7 +204,29 @@ impl Catalog {
     }
 
     fn singleton(&self, memory: &Memory, kind: &str, name: Option<&str>) -> Result<u64> {
+        let key = (self.uuid, kind.to_owned(), name.map(str::to_owned));
+        let cache = SINGLETONS.get_or_init(Default::default);
         let table = memory.base + self.table(kind)?;
+        // Reflection singletons live in the executable's static data. Cache
+        // their RVA, never a process address, and revalidate the type and name
+        // in every receiver before using its binding.
+        let cached = cache.lock_recover().get(&key).copied();
+        if let Some(rva) = cached {
+            let object = memory.base + rva;
+            if memory.pointer(object).ok() == Some(table)
+                && name.is_none_or(|name| {
+                    memory
+                        .pointer(object + 8)
+                        .and_then(|at| memory.name(at))
+                        .ok()
+                        .as_deref()
+                        == Some(name)
+                })
+            {
+                return Ok(object);
+            }
+            cache.lock_recover().remove(&key);
+        }
         let image = self.image()?;
         let mut matches = Vec::new();
         let mut remaining = 256 * 1024 * 1024_u64;
@@ -217,6 +260,7 @@ impl Catalog {
             "Native macOS type {kind} ({name:?}) has {} singleton candidates",
             matches.len()
         );
+        cache.lock_recover().insert(key, matches[0] - memory.base);
         Ok(matches[0])
     }
 
@@ -565,7 +609,13 @@ mod tests {
 
     #[test]
     fn mac_native_teleport_contracts() {
-        for name in ["teleport_dispatch", "playtest", "play_join", "teleport_gui"] {
+        for name in [
+            "teleport_dispatch",
+            "playtest",
+            "play_join",
+            "teleport_gui",
+            "test_client",
+        ] {
             assert!(
                 std::process::Command::new(
                     std::path::Path::new(env!("OUT_DIR")).join(format!("renium-{name}-test"))

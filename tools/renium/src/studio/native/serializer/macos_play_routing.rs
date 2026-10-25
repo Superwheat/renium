@@ -198,34 +198,35 @@ impl Catalog {
     /// Imported symbol identity, not the current import-table position.
     fn imports(&self, wanted: &str) -> Result<Vec<(u64, u64)>> {
         let image = self.image()?;
+        let bytes = image.bytes;
         let mut cursor = 32;
         let (mut symbols, mut strings, mut indirect) = (None, None, None);
         let mut sections = Vec::new();
-        for _ in 0..read_u32(&self.bytes, 16).context("Missing Mach commands")? {
-            let command = read_u32(&self.bytes, cursor).context("Missing Mach command")?;
-            let size = read_u32(&self.bytes, cursor + 4).context("Missing command size")? as usize;
+        for _ in 0..read_u32(bytes, 16).context("Missing Mach commands")? {
+            let command = read_u32(bytes, cursor).context("Missing Mach command")?;
+            let size = read_u32(bytes, cursor + 4).context("Missing command size")? as usize;
             anyhow::ensure!(
-                size >= 8 && cursor + size <= self.bytes.len(),
+                size >= 8 && cursor + size <= bytes.len(),
                 "Invalid Mach command"
             );
             if command == 2 {
-                symbols = read_u32(&self.bytes, cursor + 8).map(|v| v as usize);
-                strings = read_u32(&self.bytes, cursor + 16).map(|v| v as usize);
+                symbols = read_u32(bytes, cursor + 8).map(|v| v as usize);
+                strings = read_u32(bytes, cursor + 16).map(|v| v as usize);
             } else if command == 11 {
-                indirect = read_u32(&self.bytes, cursor + 56).map(|v| v as usize);
+                indirect = read_u32(bytes, cursor + 56).map(|v| v as usize);
             } else if command == 0x19 {
-                for i in 0..read_u32(&self.bytes, cursor + 64).unwrap_or(0) as usize {
+                for i in 0..read_u32(bytes, cursor + 64).unwrap_or(0) as usize {
                     let at = cursor + 72 + i * 80;
                     anyhow::ensure!(at + 80 <= cursor + size, "Invalid Mach import section");
-                    let kind = read_u32(&self.bytes, at + 64).unwrap() & 255;
+                    let kind = read_u32(bytes, at + 64).unwrap() & 255;
                     if [6, 7, 8].contains(&kind) {
                         sections.push((
-                            read_u64(&self.bytes, at + 32).unwrap(),
-                            read_u64(&self.bytes, at + 40).unwrap(),
+                            read_u64(bytes, at + 32).unwrap(),
+                            read_u64(bytes, at + 40).unwrap(),
                             kind,
-                            read_u32(&self.bytes, at + 68).unwrap(),
+                            read_u32(bytes, at + 68).unwrap(),
                             if kind == 8 {
-                                read_u32(&self.bytes, at + 72).unwrap()
+                                read_u32(bytes, at + 72).unwrap()
                             } else {
                                 8
                             },
@@ -245,15 +246,14 @@ impl Catalog {
                 "Invalid Mach stub stride"
             );
             for i in 0..size / stride as u64 {
-                let symbol = read_u32(&self.bytes, indirect + (first as usize + i as usize) * 4)
+                let symbol = read_u32(bytes, indirect + (first as usize + i as usize) * 4)
                     .context("Invalid indirect symbol")?;
                 if symbol & 0xc0000000 != 0 {
                     continue;
                 }
-                let string = read_u32(&self.bytes, symbols + symbol as usize * 16)
+                let string = read_u32(bytes, symbols + symbol as usize * 16)
                     .context("Invalid import symbol")? as usize;
-                let text = self
-                    .bytes
+                let text = bytes
                     .get(strings + string..)
                     .context("Invalid import string")?;
                 if text.starts_with(wanted.as_bytes()) && text.get(wanted.len()) == Some(&0) {
@@ -262,6 +262,44 @@ impl Catalog {
             }
         }
         Ok(found)
+    }
+
+    fn identity_writers(&self) -> Result<Vec<(u64, u64)>> {
+        type Writers = HashMap<[u8; 16], Vec<(u64, u64)>>;
+        static CACHE: OnceLock<Mutex<Writers>> = OnceLock::new();
+        let cache = CACHE.get_or_init(Default::default);
+        if let Some(writers) = cache.lock_recover().get(&self.uuid).cloned() {
+            return Ok(writers);
+        }
+        let image = self.image()?;
+        let candidates = self.functions_referencing("GenerateTeleportJoin")?;
+        let keys = [
+            self.strings("UserId")?,
+            self.strings("UserName")?,
+            self.strings("DisplayName")?,
+        ];
+        let found = candidates
+            .into_iter()
+            .filter_map(|entry| {
+                arm64_routing::writers(
+                    image.image_base + entry,
+                    Catalog::function_bytes(&image, image.image_base + entry).ok()?,
+                    &keys,
+                )
+            })
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            found.len() == 1,
+            "Local test identity has {} writers",
+            found.len()
+        );
+
+        let writers = found[0]
+            .iter()
+            .map(|(call, writer)| (call - image.image_base, writer - image.image_base))
+            .collect::<Vec<_>>();
+        cache.lock_recover().insert(self.uuid, writers.clone());
+        Ok(writers)
     }
 
     pub(super) fn server_loader(&self) -> Result<[u64; 4]> {
@@ -622,45 +660,15 @@ impl NativeMacTestJoin {
             put64(&mut request, at, value);
         }
         if client {
-            let image = catalog.image()?;
-            let candidates = catalog.functions_referencing("GenerateTeleportJoin")?;
-            let keys = [
-                catalog.strings("UserId")?,
-                catalog.strings("UserName")?,
-                catalog.strings("DisplayName")?,
-            ];
-            let found = candidates
-                .into_iter()
-                .filter_map(|entry| {
-                    arm64_routing::writers(
-                        image.image_base + entry,
-                        Catalog::function_bytes(&image, image.image_base + entry).ok()?,
-                        &keys,
-                    )
-                })
-                .collect::<Vec<_>>();
-            anyhow::ensure!(
-                found.len() == 1,
-                "Local test identity has {} writers",
-                found.len()
-            );
-            for (i, (call, writer)) in found[0].iter().enumerate() {
-                put64(
-                    &mut request,
-                    224 + i * 8,
-                    memory.base + call - image.image_base,
-                );
-                put64(
-                    &mut request,
-                    248 + i * 8,
-                    memory.base + writer - image.image_base,
-                );
-                memory.code(memory.base + call - image.image_base, 4)?;
-                memory.dispatch_code(memory.base + writer - image.image_base)?;
+            let writers = catalog.identity_writers()?;
+            for (i, (call, writer)) in writers.iter().enumerate() {
+                put64(&mut request, 224 + i * 8, memory.base + call);
+                put64(&mut request, 248 + i * 8, memory.base + writer);
+                memory.code(memory.base + call, 4)?;
+                memory.dispatch_code(memory.base + writer)?;
                 if i < 2 {
-                    request[480 + i * 16..496 + i * 16].copy_from_slice(
-                        &memory.code(memory.base + writer - image.image_base, 16)?,
-                    );
+                    request[480 + i * 16..496 + i * 16]
+                        .copy_from_slice(&memory.code(memory.base + writer, 16)?);
                 }
             }
             let user = identity["userId"]
@@ -709,7 +717,9 @@ impl Drop for NativeMacTestJoin {
 
 #[cfg(test)]
 pub(super) fn discover_client(pid: u32) -> Result<Value> {
-    let mut memory = Memory::for_process(pid, Duration::from_secs(20))?;
+    // This diagnostic also runs without optimization; its full image scan is
+    // intentionally outside the production handoff's deadline.
+    let mut memory = Memory::for_process(pid, Duration::from_secs(120))?;
     let contexts = memory.request(5, &[0], "")?;
     memory.base = read_u64(&contexts, 0).context("Client has no model")?;
     Ok(serde_json::to_value(client_binding(&memory)?)?)

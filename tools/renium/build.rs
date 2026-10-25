@@ -283,7 +283,13 @@ fn build_macos(out_dir: &Path) {
     ]);
     shield_command.arg(&shield).arg(&shield_source);
     run(&mut shield_command, "macOS input shield build");
-    for name in ["teleport_dispatch", "playtest", "play_join", "teleport_gui"] {
+    for name in [
+        "teleport_dispatch",
+        "playtest",
+        "play_join",
+        "teleport_gui",
+        "test_client",
+    ] {
         let source = format!("native/tests/{name}_macos.cpp");
         let mut command = Command::new("clang++");
         command

@@ -80,6 +80,22 @@ LoadRequest Send(LoadRequest request, const std::string& content = {}) {
 }
 
 int main() {
+    // Startup workers can exit between the thread snapshot and hook install.
+    // Their dead Mach ports must not reject an otherwise safe code patch.
+    for (unsigned i = 0; i < 8; ++i) {
+        std::atomic_bool ready = false, leave = false;
+        std::thread worker([&] {
+            ready.store(true);
+            while (!leave.load()) std::this_thread::yield();
+        });
+        while (!ready.load()) std::this_thread::yield();
+        renium_history::PausedThreads threads;
+        leave.store(true);
+        worker.join();
+        const bool paused = threads.Pause(0, 1);
+        threads.Resume();
+        assert(paused && "an exited thread cannot execute the patch site");
+    }
     const std::uint32_t instructions[] = {0xa9bf7bfd, 0x910003fd, 0xaa0003e9, 0xd503201f,
         0x11000400, 0xa8c17bfd, 0xd65f03c0};
     std::vector<unsigned char> code(sizeof(instructions));

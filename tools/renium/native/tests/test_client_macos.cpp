@@ -42,6 +42,19 @@ int main() {
     std::memcpy(shared, &r.table, 8);
     std::memcpy(static_cast<unsigned char*>(shared) + r.baseOffset, &r.baseTable, 8);
     assert(Opener(r) == shared);
+    OpenerCache cache;
+    assert(cache.Resolve(r) == shared);
+    assert(cache.Resolve(r) == shared);
+    std::uint64_t invalid = 0;
+    std::memcpy(static_cast<unsigned char*>(shared) + r.baseOffset, &invalid, 8);
+    rejected = false;
+    try { cache.Resolve(r); } catch (const std::runtime_error&) { rejected = true; }
+    assert(rejected && !cache.address);
+    std::memcpy(static_cast<unsigned char*>(shared) + r.baseOffset, &r.baseTable, 8);
+    assert(cache.Resolve(r) == shared);
     assert(munmap(shared, 65536) == 0);
-    std::puts("Mac client owner: sparse VM, shared mappings, custom allocator, boundary, ambiguity and unmapped owner passed");
+    rejected = false;
+    try { cache.Resolve(r); } catch (const std::runtime_error&) { rejected = true; }
+    assert(rejected && !cache.address);
+    std::puts("Mac client owner: sparse/shared mappings, boundary, ambiguity and stale cached owner passed");
 }

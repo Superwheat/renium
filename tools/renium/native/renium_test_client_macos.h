@@ -148,6 +148,30 @@ inline void* Opener(const Request& r) {
     if (!search.found) throw std::runtime_error("Client PlaceOpener owner was not found");
     return reinterpret_cast<void*>(search.found);
 }
+// PlaceOpener belongs to the Studio process, not its replaceable DataModel.
+// As on Windows, reuse the discovered complete component only while both its
+// primary and component-base vtables still match. Read through Mach so an
+// ended/unmapped owner cannot be dereferenced during validation.
+struct OpenerCache {
+    std::uint64_t address = 0, table = 0, offset = 0, base = 0;
+    void* Resolve(const Request& r) {
+        auto word = [](std::uint64_t at, std::uint64_t expected) {
+            std::uint64_t value = 0; mach_vm_size_t read = 0;
+            return mach_vm_read_overwrite(mach_task_self(), at, sizeof(value),
+                reinterpret_cast<mach_vm_address_t>(&value), &read) == KERN_SUCCESS
+                && read == sizeof(value) && value == expected;
+        };
+        if (address && table == r.table && offset == r.baseOffset && base == r.baseTable
+            && word(address, table) && word(address + offset, base))
+            return reinterpret_cast<void*>(address);
+        address = 0;
+        auto owner = Opener(r);
+        table = r.table; offset = r.baseOffset; base = r.baseTable;
+        address = reinterpret_cast<std::uint64_t>(owner);
+        return owner;
+    }
+};
+inline OpenerCache openerCache; // protected by transitionMutex
 struct Configuration { alignas(16) unsigned char bytes[65536]{}; ~Configuration() {} };
 inline void Handle(const std::string& payload, std::vector<unsigned char>& output) {
     Request r{};
@@ -162,7 +186,7 @@ inline void Handle(const std::string& payload, std::vector<unsigned char>& outpu
             || r.reserved || !r.window || !r.count || r.count > 8)
             throw std::runtime_error("Invalid Mac client route ownership");
         auto transition = std::make_shared<Transition>(); transition->request = r;
-        auto opener = Opener(r);
+        auto opener = openerCache.Resolve(r);
         auto widget = ReniumTeleportClientWidget(r.window);
         const auto close = dlsym(RTLD_DEFAULT, "_ZN7QWidget5closeEv");
         if (!widget || !close) throw std::runtime_error("Client main window ended");

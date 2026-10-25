@@ -209,6 +209,18 @@ class PausedThreads {
     thread_act_array_t threads = nullptr;
     mach_msg_type_number_t count = 0;
     thread_t current = pthread_mach_thread_np(pthread_self());
+    static bool RetireEnded(thread_t& thread, kern_return_t result) {
+        mach_port_type_t type = 0;
+        // These retained rights came from task_threads for our own task.
+        // XNU returns INVALID_ARGUMENT once an ended pthread's control port
+        // no longer converts to a thread, before it becomes a dead name.
+        if (result != KERN_TERMINATED && result != KERN_INVALID_ARGUMENT
+            && (mach_port_type(mach_task_self(), thread, &type) != KERN_SUCCESS
+                || !(type & MACH_PORT_TYPE_DEAD_NAME))) return false;
+        mach_port_deallocate(mach_task_self(), thread);
+        thread = MACH_PORT_NULL;
+        return true;
+    }
 #endif
     std::size_t paused = 0;
     bool inspectable = true;
@@ -238,8 +250,13 @@ public:
         for (; paused < threads.size(); ++paused)
             if (SuspendThread(threads[paused]) == static_cast<DWORD>(-1)) return false;
 #else
-        for (; paused < count; ++paused)
-            if (threads[paused] != current && thread_suspend(threads[paused]) != KERN_SUCCESS) return false;
+        for (; paused < count; ++paused) {
+            if (!threads[paused] || threads[paused] == current) continue;
+            const auto result = thread_suspend(threads[paused]);
+            // A worker can finish after task_threads retained its port. Only
+            // a kernel-confirmed ended thread may be omitted from the pause.
+            if (result != KERN_SUCCESS && !RetireEnded(threads[paused], result)) return false;
+        }
 #endif
         for (std::size_t i = 0; i < paused; ++i) {
             std::uintptr_t pc = 0;
@@ -253,16 +270,24 @@ public:
             pc = context.Rip;
 #endif
 #elif defined(__aarch64__)
-            if (threads[i] == current) continue;
+            if (!threads[i] || threads[i] == current) continue;
             arm_thread_state64_t context{};
             mach_msg_type_number_t words = ARM_THREAD_STATE64_COUNT;
-            if (thread_get_state(threads[i], ARM_THREAD_STATE64, reinterpret_cast<thread_state_t>(&context), &words) != KERN_SUCCESS) return false;
+            const auto result = thread_get_state(threads[i], ARM_THREAD_STATE64, reinterpret_cast<thread_state_t>(&context), &words);
+            if (result != KERN_SUCCESS) {
+                if (RetireEnded(threads[i], result)) continue;
+                return false;
+            }
             pc = arm_thread_state64_get_pc(context);
 #else
-            if (threads[i] == current) continue;
+            if (!threads[i] || threads[i] == current) continue;
             x86_thread_state64_t context{};
             mach_msg_type_number_t words = x86_THREAD_STATE64_COUNT;
-            if (thread_get_state(threads[i], x86_THREAD_STATE64, reinterpret_cast<thread_state_t>(&context), &words) != KERN_SUCCESS) return false;
+            const auto result = thread_get_state(threads[i], x86_THREAD_STATE64, reinterpret_cast<thread_state_t>(&context), &words);
+            if (result != KERN_SUCCESS) {
+                if (RetireEnded(threads[i], result)) continue;
+                return false;
+            }
             pc = context.__rip;
 #endif
             if (pc >= address && pc - address < size) return false;
@@ -275,7 +300,7 @@ public:
 #if defined(_WIN32)
             ResumeThread(threads[paused]);
 #else
-            if (threads[paused] != current) thread_resume(threads[paused]);
+            if (threads[paused] && threads[paused] != current) thread_resume(threads[paused]);
 #endif
         }
     }
@@ -284,7 +309,8 @@ public:
 #if defined(_WIN32)
         for (auto thread : threads) CloseHandle(thread);
 #else
-        for (mach_msg_type_number_t i = 0; i < count; ++i) mach_port_deallocate(mach_task_self(), threads[i]);
+        for (mach_msg_type_number_t i = 0; i < count; ++i)
+            if (threads[i]) mach_port_deallocate(mach_task_self(), threads[i]);
         if (threads) vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(threads), count * sizeof(thread_t));
 #endif
     }
@@ -330,8 +356,8 @@ static void* Trampoline(const Binding& binding) {
 }
 
 static void ReplaceCode(std::uintptr_t address, const std::vector<unsigned char>& bytes) {
-    PausedThreads threads;
 #if defined(_WIN32)
+    PausedThreads threads;
     const auto destination = reinterpret_cast<void*>(address);
     DWORD previous = 0, ignored = 0;
     bool wrote = false, restored = false;
@@ -349,13 +375,19 @@ static void ReplaceCode(std::uintptr_t address, const std::vector<unsigned char>
     std::memcpy(replacement.data(), reinterpret_cast<const void*>(page), size);
     std::memcpy(replacement.data() + address - page, bytes.data(), bytes.size());
     ReniumSignedCode signedCode(replacement);
+    PausedThreads threads;
     bool wrote = false;
-    if (threads.Pause(address, bytes.size())) {
+    const bool paused = threads.Pause(address, bytes.size());
+    int mappingError = 0;
+    if (paused) {
         wrote = signedCode.Map(reinterpret_cast<void*>(page)) != MAP_FAILED;
+        if (!wrote) mappingError = errno;
         if (wrote) sys_icache_invalidate(reinterpret_cast<void*>(page), size);
     }
     const bool restored = wrote;
     threads.Resume();
+    if (!paused) throw std::runtime_error("Cannot pause live Studio threads for native code replacement");
+    if (!wrote) throw std::runtime_error("Cannot map signed Studio code page: " + std::to_string(mappingError));
 #endif
     threads.Resume();
     if (!wrote || !restored) throw std::runtime_error("Cannot install Studio Terrain history playback hook");

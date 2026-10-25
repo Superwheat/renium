@@ -147,7 +147,7 @@ fn connected_owner(context: &BoundContext, rows: &[Value]) -> Option<String> {
     matching.next().is_none().then_some(owner)
 }
 
-fn manual_nonce(info: &Value, rows: &[Value]) -> Option<String> {
+fn manual_nonce(info: &Value, edit: &Value) -> Option<String> {
     info["launchNonce"]
         .as_str()
         .filter(|nonce| !nonce.is_empty())
@@ -155,9 +155,8 @@ fn manual_nonce(info: &Value, rows: &[Value]) -> Option<String> {
             // An idle daemon restart loses PREPARED, but Edit still owns its
             // prepared identity. Reuse it for its verified manual children;
             // inventing another nonce makes the plugin reject adoption.
-            rows.iter().find(|row| {
-                row["role"] == "edit" && row["runtimeId"] == info["launchEditRuntimeId"]
-            })?["launchNonce"]
+            (edit["bridgeRole"] == "edit" && edit["runtimeId"] == info["launchEditRuntimeId"])
+                .then_some(&edit["launchNonce"])?
                 .as_str()
                 .filter(|nonce| nonce.starts_with("manual-"))
         })
@@ -406,12 +405,22 @@ fn adopt(bridge: &BridgeServer, info: &Value, root: &str) -> Result<()> {
     let gate = gate(&owner);
     let _guard = gate.lock_recover();
     let rows = bridge.list_bridge_clients();
+    // Edit's handshake can predate preparation or a completed test. Read its
+    // current attributes before adopting a toolbar launch; cached inventory
+    // can omit its prepared nonce after Stop or a daemon reconnect.
+    let edit = bridge.call_for_runtime_with_timeout(
+        "getBridgeInfo",
+        json!({}),
+        BridgeTarget::Edit,
+        &owner,
+        Some(Duration::from_secs(3)),
+    )?;
     let nonce = PREPARED
         .get_or_init(Default::default)
         .lock_recover()
         .get(&owner)
         .map(|prepared| prepared.nonce.clone())
-        .or_else(|| manual_nonce(info, &rows))
+        .or_else(|| manual_nonce(info, &edit))
         .unwrap_or_else(|| format!("manual-{runtime}"));
     let edit_pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, &owner)?;
     let server_pid = bridge.studio_pid_for_runtime(BridgeTarget::Server, &runtime)?;
@@ -472,7 +481,8 @@ fn adopt(bridge: &BridgeServer, info: &Value, root: &str) -> Result<()> {
         .filter(|_| !resumed)
         .chain(peers.iter().map(|(runtime, target, _)| (runtime, *target)))
     {
-        adopt_runtime(bridge, target, runtime, &owner, &nonce, mode)?;
+        adopt_runtime(bridge, target, runtime, &owner, &nonce, mode)
+            .with_context(|| format!("Cannot adopt {target:?} runtime {runtime}"))?;
     }
     for (runtime, target, pid) in &peers {
         bridge.refresh_launch_runtime(runtime, *target, *pid)?;
@@ -503,25 +513,29 @@ mod tests {
     #[test]
     fn manual_adoption_keeps_the_verified_edits_prepared_identity_after_daemon_restart() {
         let mut info = json!({"launchEditRuntimeId":"edit-a"});
-        let rows = vec![
-            json!({"role":"edit","runtimeId":"edit-b","launchNonce":"manual-other"}),
-            json!({"role":"edit","runtimeId":"edit-a","launchNonce":"manual-prepared"}),
-        ];
+        let edit =
+            json!({"bridgeRole":"edit","runtimeId":"edit-a","launchNonce":"manual-prepared"});
         assert_eq!(
-            manual_nonce(&info, &rows).as_deref(),
+            manual_nonce(&info, &edit).as_deref(),
             Some("manual-prepared")
         );
         info["launchNonce"] = json!("manual-current");
         assert_eq!(
-            manual_nonce(&info, &rows).as_deref(),
+            manual_nonce(&info, &edit).as_deref(),
             Some("manual-current")
         );
         info["launchNonce"] = Value::Null;
-        assert!(manual_nonce(&info, &rows[..1]).is_none());
         assert!(
             manual_nonce(
                 &info,
-                &[json!({"role":"edit","runtimeId":"edit-a","launchNonce":"cli-owned"})]
+                &json!({"bridgeRole":"edit","runtimeId":"edit-b","launchNonce":"manual-other"})
+            )
+            .is_none()
+        );
+        assert!(
+            manual_nonce(
+                &info,
+                &json!({"bridgeRole":"edit","runtimeId":"edit-a","launchNonce":"cli-owned"})
             )
             .is_none()
         );
