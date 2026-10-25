@@ -4,7 +4,7 @@
 
 ### New
 
-- Windows solo Play supports TeleportService travel to saved destinations with native server/client models and join data. Travel uses Roblox's default loading screen, updates the window title immediately, and prepares the next launch before leaving the source. Stop restores the original unsaved Edit. A restricted compatibility adapter remains available when native switching is unavailable.
+- Solo Play on Windows and on Apple silicon macOS supports TeleportService travel to saved destinations with native server/client models and join data. Travel uses Roblox's default loading screen, updates the window title immediately, and prepares the next launch before leaving the source. Stop restores the original unsaved Edit. A restricted compatibility adapter remains available when native switching is unavailable.
 
 ### Bug fixes
 
