@@ -211,7 +211,13 @@ try {
       throw new Error(`Could not stop replay daemon: ${stopped.stderr || stopped.stdout}`);
     }
   }
-  fs.rmSync(root, { recursive: true, force: true, maxRetries: 60, retryDelay: 100 });
+  // A killed daemon releases its working directory a moment later, longer on a
+  // starved disk; a leftover temp folder is not a replay failure.
+  try {
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 300, retryDelay: 100 });
+  } catch (error) {
+    console.warn(`Replay temp directory stays behind: ${root} (${error.code ?? error.message})`);
+  }
 }
 
 console.log("Renium automation replay passed");
