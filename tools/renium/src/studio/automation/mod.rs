@@ -91,6 +91,9 @@ pub(crate) fn execute_luau_command(mut args: ExecuteLuauArgs) -> Result<()> {
         if map.get("ok") == Some(&Value::Bool(true)) {
             map.remove("path");
             map.remove("runner");
+            if args.edit || args.server || args.client {
+                map.remove("context");
+            }
         }
         for key in ["output", "results"] {
             if map
@@ -476,10 +479,24 @@ fn wait_for_player_bridge(bridge: &BridgeServer, player: &str, wait_seconds: f64
     if bridge.wait_for_ready_player(player, Duration::from_secs_f64(wait_seconds.max(1.0))) {
         return Ok(());
     }
-    bail!(
-        "No connected play client matches player selector '{player}'. Connected bridges: {}",
-        serde_json::to_string(&bridge.list_bridge_clients())?
-    )
+    let connected = bridge
+        .list_bridge_clients()
+        .iter()
+        .map(|entry| {
+            format!(
+                "{} {} pid {}",
+                entry["role"].as_str().unwrap_or("?"),
+                entry
+                    .get("playerName")
+                    .or_else(|| entry.get("placeName"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("?"),
+                entry["pid"]
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    bail!("No connected play client matches player selector '{player}'. Connected: {connected}")
 }
 
 pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {

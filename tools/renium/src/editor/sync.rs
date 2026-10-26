@@ -3887,28 +3887,21 @@ fn verify_editor_source_changes(
         pending.retain(|index| {
             let change = &changes.source_changes[*index];
             let expected = change.source.as_deref().unwrap_or_default();
-            let source_key = editor_source_key(change);
             let failure = match sources.get(index) {
                 Some(Ok(live)) if editor_sources_match(expected, &live.source) => None,
                 Some(Ok(live)) => Some(format!(
-                    "{} source mismatch: editor_len={} studio_len={} editor_hash={} studio_hash={} key={}",
+                    "{} source mismatch ({} vs {} bytes in Studio)",
                     change.path_segments.join("."),
                     expected.len(),
                     live.source.len(),
-                    fnv1a_hex(expected.as_bytes()),
-                    fnv1a_hex(live.source.as_bytes()),
-                    source_key,
                 )),
                 Some(Err(error)) => Some(format!(
-                    "{} source could not be read: {} key={}",
+                    "{} source could not be read: {error}",
                     change.path_segments.join("."),
-                    error,
-                    source_key,
                 )),
                 None => Some(format!(
-                    "{} source was omitted by Studio: key={}",
+                    "{} source was omitted by Studio",
                     change.path_segments.join("."),
-                    source_key,
                 )),
             };
             if let Some(failure) = failure {

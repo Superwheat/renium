@@ -51,7 +51,7 @@ Single-place projects use `src`; experiences use `places/<alias>/src`. A place f
 
 Edit scripts as files; stores/places are compressed so grep fails. `f`/`bg`/`bb` read saved data; `q` searches a closed place; `v` inspects a model/place; `l` reads Studio; `oc fetch --version` gets older saved places. `cmp BEFORE --full` (optionally `--against AFTER`) compares fully.
 
-Read targets once and reuse IDs; refresh after a pull. Run mutations sequentially and inspect results. After failure, check affected state before retrying. A usage error (unknown flag, unexpected argument, missing selector) is a malformed invocation, not a Renium failure: fix it and rerun. Quote JSON/code or pipe stdin. Keep queries bounded; `l` tables over 128 keys are cut with `_truncated`. `co --grep` is regex (`-F` for text). Write large captures to files.
+Read targets once and reuse IDs; refresh after a pull. Run mutations sequentially and inspect results. After a failure, check state before retrying. A usage error (unknown flag, missing selector) is a malformed invocation, not a Renium failure: fix it and rerun. Quote JSON/code or pipe stdin. Keep queries bounded; `l` tables over 128 keys are cut. `co --grep` is regex (`-F` for text). Results are one JSON line on stdout, errors on stderr: skip `2>&1`; read it, don't grep it.
 
 Fix and verify defects found in requested work. Renium marks affected linked packages Changed before edits; report `autoDesyncedPackages`, including in failures. Publishing needs authorization; it is not syncing. Say synced, not saved. `persistence: teamCreate` (status, edit results): Team Create synced it to Roblox, never ask for a save; `unsaved`: the user saves or publishes.
 

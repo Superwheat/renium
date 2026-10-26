@@ -2762,6 +2762,17 @@ pub(super) fn list(args: RoutesArgs) -> Result<Value> {
         bail!("Unknown Open Cloud category '{category}'");
     }
     let mut result = Map::new();
+    if args.category.is_none() && crate::app::output::compact_text_output() {
+        // The whole catalog is a reference dump; the category list is the
+        // index agents need before `rbx oc CATEGORY --help`.
+        for route in ROUTES.iter() {
+            let count = result
+                .entry(route.category.to_string())
+                .or_insert_with(|| json!(0));
+            *count = json!(count.as_u64().unwrap_or(0) + 1);
+        }
+        return Ok(Value::Object(result));
+    }
     for route in ROUTES.iter().filter(|route| {
         args.category
             .as_deref()
@@ -2896,10 +2907,7 @@ fn insert_nested(map: &mut Map<String, Value>, path: &str, value: Value) -> Resu
 }
 
 fn cloud_error(failure: Failure) -> anyhow::Error {
-    match failure.0.d {
-        Some(detail) => anyhow::anyhow!("{}\n{}", failure.0.m, detail),
-        None => anyhow::anyhow!(failure.0.m),
-    }
+    super::transport::cloud_failure_error(failure)
 }
 
 #[cfg(test)]

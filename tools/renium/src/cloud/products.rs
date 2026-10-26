@@ -244,8 +244,5 @@ fn request(
 }
 
 fn cloud_error(failure: Failure) -> anyhow::Error {
-    match failure.0.d {
-        Some(detail) => anyhow::anyhow!("{}\n{}", failure.0.m, detail),
-        None => anyhow::anyhow!(failure.0.m),
-    }
+    super::transport::cloud_failure_error(failure)
 }

@@ -506,6 +506,65 @@ fn variant_value(
     }
 }
 
+/// Text mode prints one line per difference: kind, class and dotted path,
+/// then the changed property names and `@attribute` names.
+fn difference_lines(result: &mut Value) {
+    let Some(differences) = result.get_mut("differences").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for difference in differences.iter_mut() {
+        let kind = difference["kind"].as_str().unwrap_or_default();
+        let after = location_text(&difference["after"]);
+        let before = location_text(&difference["before"]);
+        let (class, path) = after
+            .as_ref()
+            .or(before.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        let mut line = format!("{kind} {class} {path}");
+        if let (Some((before_class, before_path)), Some(_)) = (&before, &after) {
+            if *before_path != path {
+                line.push_str(&format!(" (from {before_path})"));
+            }
+            if *before_class != class {
+                line.push_str(&format!(" (was {before_class})"));
+            }
+        }
+        let names = difference["properties"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry["name"].as_str().map(str::to_string))
+            .chain(
+                difference["attributes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|entry| entry["name"].as_str().map(|name| format!("@{name}"))),
+            )
+            .collect::<Vec<_>>();
+        if !names.is_empty() {
+            line.push_str(": ");
+            line.push_str(&names.join(", "));
+        }
+        *difference = Value::String(line);
+    }
+}
+
+fn location_text(value: &Value) -> Option<(String, String)> {
+    let class = value.get("className")?.as_str()?.to_string();
+    let segments = value
+        .get("path")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let path = crate::bytecode::explorer::compact_path_string(&segments, None)
+        .unwrap_or_else(|| segments.join("."));
+    Some((class, path))
+}
+
 fn location(document: &SettingsBytecode, index: usize) -> Value {
     let mut path = Vec::new();
     let mut current = Some(index);
@@ -957,6 +1016,9 @@ pub(super) fn compare(
     );
     let mut result = json!({"ok":true,"scope":"full","direction":"input -> target","services":services,"matches":added+removed+changed == 0,"beforeInstances":before.instances.len(),"afterInstances":after.instances.len(),"added":added,"removed":removed,"changed":changed,"unchanged":unchanged,"differenceCount":added+removed+changed,"truncated":added+removed+changed > differences.len(),"differences":differences});
     crate::app::output::drop_false(&mut result, &["truncated"]);
+    if !args.values && crate::app::output::compact_text_output() {
+        difference_lines(&mut result);
+    }
     if !engine_managed.is_empty() {
         result["engineManagedProperties"] = json!(engine_managed);
     }
@@ -984,4 +1046,33 @@ pub(super) fn compare(
         ),
     );
     Ok(result)
+}
+
+#[cfg(test)]
+mod text_line_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn differences_become_one_line_each() {
+        let mut result = json!({"differences": [
+            {"kind": "changed", "before": {"className": "Script", "index": 7, "path": ["ServerScriptService", "DataHandler"]},
+             "after": {"className": "Script", "index": 7, "path": ["ServerScriptService", "DataHandler"]},
+             "properties": [{"name": "Source"}], "attributes": [{"name": "Tag"}]},
+            {"kind": "added", "after": {"className": "Part", "index": 9, "path": ["Workspace", "New"]}},
+            {"kind": "removed", "before": {"className": "Folder", "index": 2, "path": ["Workspace", "Old", "Sub"]}},
+            {"kind": "changed", "before": {"className": "Model", "index": 3, "path": ["Workspace", "A"]},
+             "after": {"className": "Part", "index": 3, "path": ["Workspace", "B"]}, "properties": [{"name": "Name"}], "attributes": []}
+        ]});
+        difference_lines(&mut result);
+        assert_eq!(
+            result["differences"],
+            json!([
+                "changed Script ServerScriptService.DataHandler: Source, @Tag",
+                "added Part Workspace.New",
+                "removed Folder Workspace.Old.Sub",
+                "changed Part Workspace.B (from Workspace.A) (was Model): Name"
+            ])
+        );
+    }
 }

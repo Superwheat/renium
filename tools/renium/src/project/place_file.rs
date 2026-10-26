@@ -387,8 +387,56 @@ pub(crate) fn query_place(args: QueryPlaceArgs) -> Result<()> {
             "A query matches instance names and classes only; use -s TEXT to search script source"
         );
     }
+    if crate::app::output::compact_text_output() {
+        compact_query_text(&mut result);
+    }
     crate::app::output::drop_false(&mut result, &["truncated"]);
     print_json_output(&result, args.pretty)
+}
+
+/// Text mode prints each match as the dotted path every other command prints:
+/// `name` repeats the last segment and the input path was the caller's own.
+fn compact_query_text(result: &mut Value) {
+    if let Some(map) = result.as_object_mut() {
+        map.remove("input");
+    }
+    let Some(matches) = result.get_mut("matches").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for entry in matches {
+        let Some(map) = entry.as_object_mut() else {
+            continue;
+        };
+        let segments = map
+            .get("path")
+            .and_then(Value::as_array)
+            .map(|path| {
+                path.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let ordinals = map
+            .get("ordinals")
+            .and_then(Value::as_array)
+            .map(|ordinals| {
+                ordinals
+                    .iter()
+                    .filter_map(Value::as_u64)
+                    .map(|ordinal| ordinal as usize)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if let Some(path) = crate::bytecode::explorer::compact_path_string(
+            &segments,
+            (!ordinals.is_empty()).then_some(ordinals.as_slice()),
+        ) {
+            map.insert("path".to_string(), Value::String(path));
+            map.remove("ordinals");
+        }
+        map.remove("name");
+    }
 }
 
 fn projected_services(root: &Path) -> Result<Vec<String>> {
@@ -713,6 +761,29 @@ mod tests {
         assert_eq!(remove_exact_matches(&mut left, &mut right), 2);
         assert!(left.is_empty());
         assert!(right.is_empty());
+    }
+
+    #[test]
+    fn query_text_mode_prints_dotted_paths_without_the_duplicate_name() {
+        let mut result = json!({
+            "ok": true,
+            "input": "C:/somewhere/place.rbxl",
+            "matches": [
+                {"className": "Part", "name": "Pad", "path": ["Workspace", "Map", "Pad"], "ordinals": [1, 1, 3]},
+                {"className": "Folder", "name": "a.b", "path": ["Workspace", "a.b"]}
+            ],
+            "searched": 5
+        });
+        compact_query_text(&mut result);
+        assert!(result.get("input").is_none());
+        assert_eq!(
+            result["matches"][0],
+            json!({"className": "Part", "path": "Workspace.Map.Pad[3]"})
+        );
+        assert_eq!(
+            result["matches"][1],
+            json!({"className": "Folder", "path": ["Workspace", "a.b"]})
+        );
     }
 
     #[test]

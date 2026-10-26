@@ -1010,6 +1010,93 @@ pub(crate) fn read_response(response: ureq::Response) -> Result<CloudResponse, S
     })
 }
 
+/// Turns a cloud failure into the error the CLI prints. Text mode keeps the
+/// status, the server's title or message and its field errors; json mode
+/// carries the whole response detail.
+pub(crate) fn cloud_failure_error(failure: crate::automation::Failure) -> anyhow::Error {
+    let crate::automation::Failure(error) = failure;
+    let Some(detail) = error.d else {
+        return anyhow::anyhow!("{}", error.m);
+    };
+    if !crate::app::output::compact_text_output() {
+        return anyhow::anyhow!(
+            "{}
+{}", error.m, detail
+        );
+    }
+    match compact_cloud_detail(&detail) {
+        Some(summary) => anyhow::anyhow!("{}: {summary}", error.m),
+        None => anyhow::anyhow!(
+            "{}
+{}", error.m, detail
+        ),
+    }
+}
+
+fn compact_cloud_detail(detail: &Value) -> Option<String> {
+    let body = detail.get("body")?;
+    let mut parts = Vec::new();
+    if let Some(body) = body.as_object() {
+        for key in ["title", "message", "error", "detail"] {
+            if let Some(text) = body.get(key).and_then(Value::as_str)
+                && !text.is_empty()
+            {
+                parts.push(text.trim_end_matches('.').to_string());
+                break;
+            }
+        }
+        for (field, messages) in body
+            .get("errors")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+        {
+            let messages = match messages {
+                Value::Array(items) => items
+                    .iter()
+                    .map(|item| {
+                        item.as_str()
+                            .map_or_else(|| item.to_string(), str::to_string)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                other => other
+                    .as_str()
+                    .map_or_else(|| other.to_string(), str::to_string),
+            };
+            parts.push(format!("{field}: {messages}"));
+        }
+        for item in body
+            .get("errorDetails")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(text) = item.get("message").and_then(Value::as_str) {
+                parts.push(text.to_string());
+            }
+        }
+    } else if let Some(text) = body.as_str() {
+        parts.push(text.chars().take(200).collect());
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    if let Some(retry) = detail
+        .get("headers")
+        .and_then(|headers| headers.get("retry-after"))
+        .and_then(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| value.as_u64().map(|seconds| seconds.to_string()))
+        })
+    {
+        parts.push(format!("retry after {retry}s"));
+    }
+    Some(parts.join("; "))
+}
+
 fn write_response(response: ureq::Response, path: &Path) -> Result<CloudResponse, String> {
     let status = response.status();
     let headers = response_headers(&response);
@@ -1370,5 +1457,30 @@ mod tests {
         assert_eq!(body.matches("name=\"tag\"").count(), 2);
         assert_eq!(body.matches("name=\"files\"").count(), 2);
         assert_eq!(body.matches("filename=\"Cargo.toml\"").count(), 2);
+    }
+}
+
+#[cfg(test)]
+mod cloud_error_tests {
+    use super::*;
+
+    #[test]
+    fn cloud_errors_keep_the_title_and_field_messages_only() {
+        let detail = json!({
+            "index": 0, "status": 400,
+            "headers": {"x-ratelimit-limit": "60", "retry-after": "7"},
+            "body": {"errors": {"repository": ["The value 'default' is not valid."]},
+                     "status": 400, "title": "One or more validation errors occurred.",
+                     "traceId": "00-f5a3", "type": "https://tools.ietf.org/html/rfc9110#section-15.5.1"}
+        });
+        assert_eq!(
+            compact_cloud_detail(&detail).unwrap(),
+            "One or more validation errors occurred; repository: The value 'default' is not valid.; retry after 7s"
+        );
+        assert_eq!(
+            compact_cloud_detail(&json!({"status": 500, "body": "<html>upstream</html>"})).unwrap(),
+            "<html>upstream</html>"
+        );
+        assert!(compact_cloud_detail(&json!({"status": 404})).is_none());
     }
 }

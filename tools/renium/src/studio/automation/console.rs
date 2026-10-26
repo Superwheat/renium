@@ -28,6 +28,18 @@ pub(crate) fn get_console_output_command(args: PluginConsoleOutputArgs) -> Resul
     }
     crate::app::output::drop_false(&mut result, &["hasMore", "truncated"]);
     compact_console_entries(&mut result);
+    if args.since_seq == 0 && crate::app::output::compact_text_output() {
+        // One-shot reads only need `nextSeq` to continue; the epoch and the
+        // per-line sequence numbers serve `--follow` and `--since-seq`.
+        if let Some(map) = result.as_object_mut() {
+            map.remove("epoch");
+        }
+        for entry in result["entries"].as_array_mut().into_iter().flatten() {
+            if let Some(map) = entry.as_object_mut() {
+                map.remove("seq");
+            }
+        }
+    }
     print_json_output(&result, false)
 }
 

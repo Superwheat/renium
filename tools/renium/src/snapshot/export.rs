@@ -2457,7 +2457,13 @@ mod publication_tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             drop(self.stage.take());
-            let _ = fs::remove_dir_all(&self.container);
+            // Windows keeps a just-closed file undeletable for a moment.
+            for _ in 0..20 {
+                if fs::remove_dir_all(&self.container).is_ok() || !self.container.exists() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
         }
     }
 

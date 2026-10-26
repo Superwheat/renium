@@ -1234,6 +1234,14 @@ pub(super) fn apply_project_links_inner(
         &mut result,
         &["warnings", "links", "changedSettingsIds", "replacedFiles"],
     );
+    if crate::app::output::compact_text_output() {
+        // The per-link id list repeats `changedSettingsIds`; `-I` takes that one.
+        for link in result["links"].as_array_mut().into_iter().flatten() {
+            if let Some(map) = link.as_object_mut() {
+                map.remove("settingsIds");
+            }
+        }
+    }
     Ok((result, warning_count, studio_overrides))
 }
 
@@ -1456,6 +1464,7 @@ pub(crate) fn link_status(mut args: LinkStatusArgs) -> Result<()> {
     else {
         let mut result = shared::experience_shared_links(&args.project.project_root, None, true)?;
         crate::app::output::strip_empty(&mut result);
+        compact_link_status_text(&mut result);
         return print_json_output(&result, args.pretty);
     };
     let mut result =
@@ -1464,7 +1473,129 @@ pub(crate) fn link_status(mut args: LinkStatusArgs) -> Result<()> {
         result["shared"] = shared;
     }
     crate::app::output::strip_empty(&mut result);
+    compact_link_status_text(&mut result);
     print_json_output(&result, args.pretty)
+}
+
+/// Text mode prints each shared link as one line: target, source place and the
+/// consuming places grouped by state. Json mode keeps the per-place maps.
+fn compact_link_status_text(result: &mut Value) {
+    if !crate::app::output::compact_text_output() {
+        return;
+    }
+    fn visit(value: &mut Value) {
+        match value {
+            Value::Array(items) => {
+                for item in items {
+                    if let Some(line) = shared_link_line(item) {
+                        *item = Value::String(line);
+                    } else {
+                        visit(item);
+                    }
+                }
+            }
+            Value::Object(map) => {
+                for item in map.values_mut() {
+                    visit(item);
+                }
+            }
+            _ => {}
+        }
+    }
+    visit(result);
+}
+
+fn shared_link_line(entry: &Value) -> Option<String> {
+    let map = entry.as_object()?;
+    let id = map.get("id")?.as_str()?;
+    let src = map.get("src")?.as_str()?;
+    let mut line = id.to_string();
+    if let Some(service) = map.get("service").and_then(Value::as_str) {
+        line.push(' ');
+        line.push_str(service);
+        let segments = map
+            .get("path")
+            .and_then(Value::as_array)
+            .map(|path| {
+                path.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(".")
+            })
+            .unwrap_or_default();
+        if !segments.is_empty() {
+            line.push('.');
+            line.push_str(&segments);
+        }
+    }
+    line.push_str(" from ");
+    line.push_str(src);
+    if map.get("stale") == Some(&Value::Bool(true)) {
+        line.push_str(" STALE");
+    }
+    if let Some(package) = map.get("package").and_then(Value::as_str) {
+        line.push_str(" package ");
+        line.push_str(package);
+    }
+    let mut by_state = std::collections::BTreeMap::<&str, Vec<&str>>::new();
+    for (alias, state) in map
+        .get("places")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+    {
+        by_state
+            .entry(state.as_str().unwrap_or("?"))
+            .or_default()
+            .push(alias);
+    }
+    if !by_state.is_empty() {
+        line.push(':');
+        for (state, aliases) in &by_state {
+            if *state == "ok" {
+                line.push_str(&format!(" ok {}", aliases.len()));
+            } else {
+                line.push_str(&format!(" {state} {}", aliases.join(",")));
+            }
+        }
+    }
+    let mut details = Vec::new();
+    for detail in map
+        .get("drift")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .map(|(_, detail)| detail)
+    {
+        let text = match detail {
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+        let text = text.chars().take(160).collect::<String>();
+        if !details.contains(&text) {
+            details.push(text);
+        }
+    }
+    for detail in details {
+        line.push_str("; drift: ");
+        line.push_str(&detail);
+    }
+    for (alias, error) in map
+        .get("errors")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+    {
+        line.push_str(&format!(
+            "; {alias}: {}",
+            error.as_str().unwrap_or_default()
+        ));
+    }
+    if let Some(error) = map.get("error").and_then(Value::as_str) {
+        line.push_str("; error: ");
+        line.push_str(error);
+    }
+    Some(line)
 }
 
 fn project_link_status(
@@ -2858,4 +2989,26 @@ pub(crate) fn link_delete_package(mut args: LinkDeletePackageArgs) -> Result<()>
         }),
         args.pretty,
     )
+}
+
+#[cfg(test)]
+mod line_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn shared_link_lines_group_places_by_state_and_merge_drift_details() {
+        let entry = json!({
+            "id": "public", "src": "baseplate", "service": "ReplicatedStorage", "path": ["Public"],
+            "stale": true,
+            "places": {"a": "ok", "b": "ok", "racing": "drift", "menu": "drift", "lobby": "missing"},
+            "drift": {"racing": "target has 44 of 45 instances", "menu": "target has 44 of 45 instances"},
+            "errors": {"old": "place is not in the layout"}
+        });
+        assert_eq!(
+            shared_link_line(&entry).unwrap(),
+            "public ReplicatedStorage.Public from baseplate STALE: drift menu,racing missing lobby ok 2; drift: target has 44 of 45 instances; old: place is not in the layout"
+        );
+        assert!(shared_link_line(&json!({"id": "x", "path": ["P"]})).is_none());
+    }
 }

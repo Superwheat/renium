@@ -232,6 +232,13 @@ pub(crate) fn global_json_output() -> bool {
     MODE.load(Ordering::Relaxed) != 0
 }
 
+/// Text mode for a reader at a terminal or an agent: compact shapes apply.
+/// Captured output (tests, the extension's in-process calls) keeps the
+/// structured value, like `--output-mode json`.
+pub(crate) fn compact_text_output() -> bool {
+    !CAPTURED_OUTPUT.with_borrow(Result::is_ok) && !global_json_output()
+}
+
 pub(crate) fn set_global_stream_output(enabled: bool) {
     STREAM.store(enabled, Ordering::Relaxed);
 }
