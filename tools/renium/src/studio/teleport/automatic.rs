@@ -164,6 +164,11 @@ fn manual_nonce(info: &Value, edit: &Value) -> Option<String> {
 }
 
 pub(crate) fn start_manual(bridge: &Arc<BridgeServer>, state: &State) {
+    // Defer discovery while a user request owns the bridge. Workers acquire
+    // their own guard below so a request starting after this check wins too.
+    if bridge.try_acquire_request_gate().is_none() {
+        return;
+    }
     let rows = bridge.list_bridge_clients();
     let contexts = state
         .bound_contexts()
@@ -264,6 +269,9 @@ fn prepare_idle(bridge: &Arc<BridgeServer>, rows: &[Value], contexts: &[BoundCon
 fn prepare(bridge: &BridgeServer, owner: &str, root: &str) -> Result<()> {
     let gate = gate(owner);
     let _guard = gate.lock_recover();
+    let Some(request_guard) = bridge.try_acquire_request_gate() else {
+        return Ok(());
+    };
     if OWNED
         .get_or_init(Default::default)
         .lock_recover()
@@ -323,6 +331,7 @@ fn prepare(bridge: &BridgeServer, owner: &str, root: &str) -> Result<()> {
         3,
         format_args!("[renium] manual Play teleport ready before launch for {owner}"),
     );
+    drop(request_guard);
     drop(_guard);
     let result = monitor_prepared(bridge, owner, &nonce, &result["manualPlayEpoch"]);
     let mut prepared = PREPARED.get().unwrap().lock_recover();
@@ -351,24 +360,30 @@ fn monitor_prepared(bridge: &BridgeServer, owner: &str, nonce: &str, epoch: &Val
                 renewed = std::time::Instant::now();
             }
         }
-        let status = bridge.call_for_runtime_with_timeout(
-            "startStopPlay",
-            json!({}),
-            BridgeTarget::Edit,
-            owner,
-            Some(Duration::from_secs(5)),
-        )?;
-        ensure_plugin_api_ok(&status)?;
-        // The epoch records both edges, even if Start and early Stop occurred
-        // between polls and no Play bridge ever registered.
-        if status["manualPlayEpoch"] != *epoch
-            && status["running"] == false
-            && status["starting"] == false
-        {
+        if prepared_stopped(bridge, owner, epoch)? {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(250));
     }
+}
+
+fn prepared_stopped(bridge: &BridgeServer, owner: &str, epoch: &Value) -> Result<bool> {
+    let Some(_request_guard) = bridge.try_acquire_request_gate() else {
+        return Ok(false);
+    };
+    let status = bridge.call_for_runtime_with_timeout(
+        "startStopPlay",
+        json!({}),
+        BridgeTarget::Edit,
+        owner,
+        Some(Duration::from_secs(5)),
+    )?;
+    ensure_plugin_api_ok(&status)?;
+    // The epoch records both edges, even if Start and early Stop occurred
+    // between polls and no Play bridge ever registered.
+    Ok(status["manualPlayEpoch"] != *epoch
+        && status["running"] == false
+        && status["starting"] == false)
 }
 
 pub(super) fn adopt_runtime(
@@ -393,6 +408,13 @@ pub(super) fn adopt_runtime(
 }
 
 fn adopt(bridge: &BridgeServer, info: &Value, root: &str) -> Result<()> {
+    let owner = text_field(info, "launchEditRuntimeId")?;
+    let runtime = text_field(info, "runtimeId")?;
+    let gate = gate(&owner);
+    let _guard = gate.lock_recover();
+    let Some(_request_guard) = bridge.try_acquire_request_gate() else {
+        return Ok(());
+    };
     let config = crate::project::config::load_merged_config(std::path::Path::new(root))?;
     if config["playTeleportEnabled"] == false {
         if let Some(owner) = info["launchEditRuntimeId"].as_str() {
@@ -400,10 +422,6 @@ fn adopt(bridge: &BridgeServer, info: &Value, root: &str) -> Result<()> {
         }
         return Ok(());
     }
-    let owner = text_field(info, "launchEditRuntimeId")?;
-    let runtime = text_field(info, "runtimeId")?;
-    let gate = gate(&owner);
-    let _guard = gate.lock_recover();
     let rows = bridge.list_bridge_clients();
     // Edit's handshake can predate preparation or a completed test. Read its
     // current attributes before adopting a toolbar launch; cached inventory
@@ -509,6 +527,21 @@ fn adopt(bridge: &BridgeServer, info: &Value, root: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_setup_and_monitoring_defer_to_an_active_request() {
+        let bridge = crate::studio::bridge::routing_tests::fixture();
+        let request = bridge.acquire_request_gate();
+        let info = json!({"runtimeId":"gate-test-server","launchEditRuntimeId":"gate-test-edit"});
+        // No Studio is connected: these succeed only if they defer before I/O,
+        // including workers already spawned when the user request took the gate.
+        prepare(&bridge, "gate-test-edit", ".").unwrap();
+        adopt(&bridge, &info, ".").unwrap();
+        assert!(!prepared_stopped(&bridge, "gate-test-edit", &json!(0)).unwrap());
+        drop(request);
+        assert!(prepared_stopped(&bridge, "gate-test-edit", &json!(0)).is_err());
+        assert!(bridge.try_acquire_request_gate().is_some());
+    }
 
     #[test]
     fn manual_adoption_keeps_the_verified_edits_prepared_identity_after_daemon_restart() {

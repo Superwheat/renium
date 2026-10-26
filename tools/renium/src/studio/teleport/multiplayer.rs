@@ -704,6 +704,7 @@ pub(super) fn watch(
         }
     })();
     test.routes.stop();
+    let _request_guard = bridge.acquire_request_gate();
     let _ = bridge.call_for_runtime_with_timeout(
         "startStopPlay",
         json!({

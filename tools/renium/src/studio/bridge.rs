@@ -151,11 +151,6 @@ impl std::fmt::Display for BridgeResponseTimeout {
 
 impl std::error::Error for BridgeResponseTimeout {}
 
-fn is_status_observation(method: &str, params: &Value) -> bool {
-    method == "getStudioState"
-        || method == "startStopPlay" && params.as_object().is_some_and(serde_json::Map::is_empty)
-}
-
 /// Editor methods describe or change saved Edit state, never a running
 /// simulation. Main intentionally prefers a play server for runtime commands,
 /// so an editor transaction routed there is not found on that side and the
@@ -433,7 +428,7 @@ mod request_cancellation_tests {
     }
 
     #[test]
-    fn slow_status_keeps_connection_and_ignores_its_late_reply() {
+    fn slow_call_keeps_connection_and_ignores_its_late_reply() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let client = TcpStream::connect(address).unwrap();
@@ -507,8 +502,8 @@ mod request_cancellation_tests {
             team_create: Mutex::new(HashMap::new()),
         };
         let result = bridge.call_for_runtime_with_timeout(
-            "getStudioState",
-            json!({}),
+            "startStopPlay",
+            json!({"prepareManualTeleport": true, "runtimeId": "test-runtime"}),
             BridgeTarget::Edit,
             "test-runtime",
             Some(Duration::from_millis(10)),
@@ -519,7 +514,11 @@ mod request_cancellation_tests {
                 .downcast_ref::<BridgeResponseTimeout>()
                 .is_some()
         );
-        assert_eq!(channel.sockets.lock().unwrap().len(), 1);
+        assert_eq!(
+            channel.sockets.lock().unwrap().len(),
+            1,
+            "a slow ordinary call must not disconnect an upload's channel"
+        );
         resume.send(()).unwrap();
         let result = bridge
             .call_for_runtime_with_timeout(
@@ -533,16 +532,12 @@ mod request_cancellation_tests {
         assert_eq!(result, json!({"late": false}));
         assert_eq!(channel.sockets.lock().unwrap().len(), 1);
         worker.join().unwrap();
-        assert!(is_status_observation("startStopPlay", &json!({})));
-        assert!(!is_status_observation(
-            "startStopPlay",
-            &json!({"start": true})
+        assert!(!BridgeServer::is_transport_error_text(
+            "Bridge response timed out awaiting startStopPlay on port 8781 after 0.7s"
         ));
-        assert!(!is_status_observation(
-            "startStopPlay",
-            &json!({"stop": true})
+        assert!(BridgeServer::is_transport_error_text(
+            "Bridge read failed for method startStopPlay on port 8781: Connection reset"
         ));
-        assert!(!is_status_observation("applyEditorChanges", &json!({})));
     }
 
     #[test]
@@ -2973,7 +2968,6 @@ impl BridgeServer {
             || text.contains("broken pipe")
             || text.contains("WouldBlock")
             || text.contains("TimedOut")
-            || text.contains("Bridge response timed out")
     }
 
     fn retire_failed_socket(
@@ -2984,7 +2978,11 @@ impl BridgeServer {
         role: &str,
         error: anyhow::Error,
     ) -> Result<String> {
-        if error.downcast_ref::<BridgeApplicationError>().is_some() {
+        // A slow reply does not mean the connection died. Its ID lets the next
+        // read skip it; closing the channel would cancel unrelated upload leases.
+        if error.downcast_ref::<BridgeApplicationError>().is_some()
+            || error.downcast_ref::<BridgeResponseTimeout>().is_some()
+        {
             return Err(error);
         }
         let error_text = format!("{error:#}");
@@ -3084,13 +3082,6 @@ impl BridgeServer {
             match result {
                 Ok(result) => return Ok((Some(result), true)),
                 Err(error) => {
-                    // A queued/slow observation doesn't prove that its socket is dead.
-                    // Late replies carry IDs and read_response skips them on the next call.
-                    if is_status_observation(context.method, context.params)
-                        && error.downcast_ref::<BridgeResponseTimeout>().is_some()
-                    {
-                        return Err(error);
-                    }
                     *last_error = Some(Self::retire_failed_socket(
                         channel,
                         &connection,

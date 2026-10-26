@@ -195,6 +195,14 @@ impl Dispatch {
 
 #[cfg(any(windows, target_os = "macos"))]
 fn controller(bridge: &BridgeServer, session: &Session, params: Value) -> Result<Value> {
+    // Travel runs in a background worker. Wait outside the socket queue so a
+    // foreground upload cannot consume this controller call's response budget.
+    let _request_guard = bridge.acquire_request_gate();
+    call_controller(bridge, session, params)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn call_controller(bridge: &BridgeServer, session: &Session, params: Value) -> Result<Value> {
     let result = bridge.call_for_runtime_with_timeout(
         "startStopPlay",
         params,
@@ -211,7 +219,8 @@ fn controller(bridge: &BridgeServer, session: &Session, params: Value) -> Result
 pub(super) fn reconcile(bridge: &BridgeServer, session: &Session) -> Result<()> {
     #[cfg(any(windows, target_os = "macos"))]
     {
-        let status = controller(bridge, session, json!({}))?;
+        // The enabling request (or automatic adoption) already owns the gate.
+        let status = call_controller(bridge, session, json!({}))?;
         ensure!(
             status["teleportLoadProtocol"] == 2,
             "Update the Studio plugin and reopen this window for teleport recovery"
@@ -231,14 +240,14 @@ pub(super) fn reconcile(bridge: &BridgeServer, session: &Session) -> Result<()> 
             )?;
             ensure_plugin_api_ok(&result)?;
             let deadline = std::time::Instant::now() + Duration::from_secs(15);
-            while controller(bridge, session, json!({}))?["running"] == true {
+            while call_controller(bridge, session, json!({}))?["running"] == true {
                 waiting(bridge, deadline)?;
             }
             anyhow::bail!(
                 "The previous teleport was interrupted; the original Edit was restored. Start Play again"
             );
         }
-        controller(
+        call_controller(
             bridge,
             session,
             json!({"resumeTeleport":true,"launchNonce":session.nonce}),

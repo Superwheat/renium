@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Bug fixes
+
+- Large pushes no longer fail with "Renium request lease was cancelled" while automatic playtest teleport setup runs.
+
 ## 0.5.2 - 2026-10-25
 
 ### New
