@@ -117,7 +117,41 @@ pub(crate) fn run(args: PublishArgs, project: Option<&Path>) -> Result<()> {
     } else {
         publish_from_studio(&args, project)?
     };
+    let mut result = result;
+    if app::output::compact_text_output() {
+        compact_publish_result(&mut result);
+    }
     app::output::print_json_output(&result, false)
+}
+
+/// Text mode reports a successful publish by what changed: the version
+/// numbers, whether players get it, and the Live Sync state it waited for.
+fn compact_publish_result(result: &mut Value) {
+    let Some(map) = result.as_object_mut() else {
+        return;
+    };
+    if map.get("ok") != Some(&Value::Bool(true)) {
+        return;
+    }
+    const KEPT: [&str; 12] = [
+        "ok",
+        "published",
+        "dryRun",
+        "versionNumber",
+        "previousVersion",
+        "liveSync",
+        "live",
+        "placeId",
+        "versionType",
+        "note",
+        "warning",
+        "hint",
+    ];
+    map.retain(|key, value| {
+        KEPT.contains(&key.as_str())
+            && !(key == "dryRun" && value == &Value::Bool(false))
+            && !(key == "versionType" && value == "Published")
+    });
 }
 
 struct StudioPreflight {
@@ -1467,5 +1501,26 @@ mod tests {
             Some("race")
         );
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod compact_result_tests {
+    use super::*;
+
+    #[test]
+    fn text_mode_keeps_the_version_fields() {
+        let mut result = json!({"ok": true, "published": true, "dryRun": false, "versionType": "Published",
+            "actionMatches": true, "gameId": 1, "method": "command", "runtimeId": "r", "source": "studio",
+            "url": "https://www.roblox.com/games/1", "window": "w", "liveSync": {"state": "idle"},
+            "previousVersion": 91, "versionNumber": 94});
+        compact_publish_result(&mut result);
+        assert_eq!(
+            result,
+            json!({"ok": true, "published": true, "liveSync": {"state": "idle"}, "previousVersion": 91, "versionNumber": 94})
+        );
+        let mut failed = json!({"ok": false, "error": "refused", "window": "w"});
+        compact_publish_result(&mut failed);
+        assert_eq!(failed["window"], json!("w"));
     }
 }

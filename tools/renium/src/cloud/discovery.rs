@@ -874,6 +874,14 @@ pub(crate) fn fetch_command(
         "bytes": bytes,
         "version": version,
     });
+    if crate::app::output::compact_text_output() {
+        // The caller named the file; the place name and byte count are not
+        // decisions.
+        result.as_object_mut().map(|map| {
+            map.remove("name");
+            map.remove("bytes")
+        });
+    }
     if version.is_none() {
         result["versionNote"] = json!(
             "this key cannot read the place's version history, so the number of the current version it downloaded is unknown"

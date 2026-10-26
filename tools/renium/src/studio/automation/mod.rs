@@ -541,7 +541,61 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
             }
         }
     }
+    if crate::app::output::compact_text_output() {
+        compact_play_result(&mut result, args.players.is_some());
+    }
     print_json_output(&result, false)
+}
+
+/// Text mode answers a Play start with the decision fields: whether the
+/// server is ready, how many clients joined and what `--until` returned. The
+/// launch identifiers and per-client bridge records stay in json mode.
+fn compact_play_result(result: &mut Value, named_players: bool) {
+    let Some(map) = result.as_object_mut() else {
+        return;
+    };
+    if map.get("ok") != Some(&Value::Bool(true)) {
+        return;
+    }
+    if let Some(clients) = map.get("clients").and_then(Value::as_array) {
+        let value = if named_players {
+            json!(
+                clients
+                    .iter()
+                    .filter_map(|client| client.get("playerName").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+            )
+        } else {
+            json!(clients.len())
+        };
+        map.insert("clients".to_string(), value);
+    }
+    for key in [
+        "action",
+        "editPid",
+        "editRuntimeId",
+        "launchNonce",
+        "deviceSimulation",
+    ] {
+        map.remove(key);
+    }
+    if let Some(mode) = map
+        .get("teleport")
+        .and_then(|teleport| teleport.get("mode"))
+        .cloned()
+    {
+        map.insert("teleport".to_string(), mode);
+    }
+    if let Some(until) = map.get("until")
+        && until.get("ok") == Some(&Value::Bool(true))
+        && let Some(value) = until.get("value").cloned()
+    {
+        map.insert("until".to_string(), value);
+    }
+    if let Some(status) = map.get_mut("status").and_then(Value::as_object_mut) {
+        status.remove("lastResult");
+        status.remove("studioTest");
+    }
 }
 
 fn kill_orphans_command(args: &StartStopPlayArgs) -> Result<()> {
@@ -3159,13 +3213,51 @@ fn run_input_command(
         json!(bridge_args.wait_seconds),
     );
     object.insert("bridgePorts".to_string(), json!(bridge_args.ports));
+    let requested_output = parameters.get("output").cloned();
     let result = daemon_control_request(operation, None, parameters, false)?;
-    let result = if compact {
+    let mut result = if compact {
         compact_json(result)
     } else {
         result
     };
+    if crate::app::output::compact_text_output() {
+        compact_input_result(operation, &mut result, requested_output.as_ref());
+    }
     print_json_output(&result, false)
+}
+
+/// Text mode keeps a capture's verdict (`moved`, a note when the camera did
+/// not hold) and a wait's value; the window, device and echoed arguments stay
+/// in json mode.
+fn compact_input_result(operation: u16, result: &mut Value, requested_output: Option<&Value>) {
+    let Some(map) = result.as_object_mut() else {
+        return;
+    };
+    if map.get("ok") == Some(&Value::Bool(false)) {
+        return;
+    }
+    match operation {
+        op::SHOT => {
+            if let Some(camera) = map.remove("camera") {
+                if let Some(moved) = camera.get("moved").cloned() {
+                    map.insert("moved".to_string(), moved);
+                }
+                if let Some(note) = camera.get("note").cloned() {
+                    map.insert("note".to_string(), note);
+                }
+            }
+            map.remove("window");
+            map.remove("deviceSimulation");
+            if requested_output.is_some_and(|output| map.get("path") == Some(output)) {
+                map.remove("path");
+            }
+        }
+        op::WAIT => {
+            map.remove("condition");
+            map.remove("action");
+        }
+        _ => {}
+    }
 }
 
 pub(crate) fn press_command(args: PressArgs) -> Result<()> {
@@ -4196,6 +4288,54 @@ mod play_state_tests {
             launch_status_outcome(&current, &launch, plan, false)
                 .unwrap()
                 .is_none()
+        );
+    }
+}
+
+#[cfg(test)]
+mod compact_result_tests {
+    use super::*;
+
+    #[test]
+    fn play_start_keeps_the_decision_fields() {
+        let mut result = json!({
+            "ok": true, "action": "start", "mode": "play", "serverReady": true,
+            "clients": [{"playerName": "A", "pid": 1, "runtimeId": "x"}, {"playerName": "B", "pid": 2}],
+            "editPid": 7, "editRuntimeId": "e", "launchNonce": "n", "deviceSimulation": {"ok": true},
+            "teleport": {"mode": "native", "detail": "..."},
+            "until": {"action": "wait", "condition": "return true", "ok": true, "value": "true", "elapsedSeconds": 1.5}
+        });
+        compact_play_result(&mut result, false);
+        assert_eq!(
+            result,
+            json!({"ok": true, "mode": "play", "serverReady": true, "clients": 2, "teleport": "native", "until": "true"})
+        );
+        let mut named = json!({"ok": true, "clients": [{"playerName": "A"}, {"playerName": "B"}]});
+        compact_play_result(&mut named, true);
+        assert_eq!(named["clients"], json!(["A", "B"]));
+        let mut failed = json!({"ok": false, "error": "no", "clients": []});
+        compact_play_result(&mut failed, false);
+        assert_eq!(failed["clients"], json!([]));
+    }
+
+    #[test]
+    fn capture_and_wait_results_drop_their_echoes() {
+        let output = json!("C:/shots/a.png");
+        let mut shot = json!({"ok": true, "path": output, "width": 10, "height": 5, "window": "Studio",
+            "deviceSimulation": {"ok": true}, "camera": {"moved": false, "note": "did not hold", "actual": [1, 2, 3]}});
+        compact_input_result(op::SHOT, &mut shot, Some(&output));
+        assert_eq!(
+            shot,
+            json!({"ok": true, "width": 10, "height": 5, "moved": false, "note": "did not hold"})
+        );
+        let mut elsewhere = json!({"ok": true, "path": "C:/other.png"});
+        compact_input_result(op::SHOT, &mut elsewhere, Some(&output));
+        assert_eq!(elsewhere["path"], json!("C:/other.png"));
+        let mut wait = json!({"ok": true, "action": "wait", "condition": "x", "value": "true", "elapsedSeconds": 0.2});
+        compact_input_result(op::WAIT, &mut wait, None);
+        assert_eq!(
+            wait,
+            json!({"ok": true, "value": "true", "elapsedSeconds": 0.2})
         );
     }
 }

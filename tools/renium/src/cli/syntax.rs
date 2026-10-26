@@ -25,7 +25,11 @@ pub(crate) fn run(args: CheckArgs, project: Option<&Path>) -> Result<()> {
         expand_folders(args.files)?
     };
     let result = check(&files, &mut io::stdin().lock())?;
-    print_json_output(&result, false)?;
+    let mut printed = result.clone();
+    if crate::app::output::compact_text_output() {
+        compact_check_result(&mut printed);
+    }
+    print_json_output(&printed, false)?;
     if result["ok"] == false {
         return Err(ReportedFailure.into());
     }
@@ -155,6 +159,24 @@ fn check(files: &[PathBuf], stdin: &mut impl Read) -> Result<Value> {
         })
         .collect();
     Ok(json!({"ok": results.iter().all(|item| item["ok"] == true), "files": results}))
+}
+
+/// Text mode counts the files that passed and lists only the failing ones.
+fn compact_check_result(result: &mut Value) {
+    let Some(files) = result.get("files").and_then(Value::as_array).cloned() else {
+        return;
+    };
+    let failing = files
+        .iter()
+        .filter(|file| file["ok"] != true)
+        .cloned()
+        .collect::<Vec<_>>();
+    result["checked"] = json!(files.len());
+    if failing.is_empty() {
+        result.as_object_mut().map(|map| map.remove("files"));
+    } else {
+        result["files"] = json!(failing);
+    }
 }
 
 #[cfg(test)]
@@ -292,5 +314,23 @@ mod tests {
         assert_eq!(check(&[valid], &mut io::empty()).unwrap()["ok"], true);
         assert!(check(&["-".into(), "-".into()], &mut io::empty()).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod compact_tests {
+    use super::*;
+
+    #[test]
+    fn text_mode_lists_only_failing_files() {
+        let mut passing = json!({"ok": true, "files": [{"file": "a.luau", "ok": true}, {"file": "b.luau", "ok": true}]});
+        compact_check_result(&mut passing);
+        assert_eq!(passing, json!({"ok": true, "checked": 2}));
+        let mut failing = json!({"ok": false, "files": [{"file": "a.luau", "ok": true}, {"file": "b.luau", "ok": false, "error": "x"}]});
+        compact_check_result(&mut failing);
+        assert_eq!(
+            failing,
+            json!({"ok": false, "checked": 2, "files": [{"file": "b.luau", "ok": false, "error": "x"}]})
+        );
     }
 }
