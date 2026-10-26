@@ -14,7 +14,7 @@ Before any Open Cloud upload (`--as` included), agents must verify `EditableImag
 subclasses are unchanged from the destination, including additions/removals and
 serialized data. If changed or unverified, use Studio's `rbx publish`. Renium does
 not compare destinations or reject these types for being present. Local checks
-do not satisfy this verification or prove engine loading/joins; see
+do not satisfy this verification; see
 [validation and API limits](publishing-validation.md).
 
 Prefer a resource command over raw HTTP. Run writes only when requested.
@@ -39,7 +39,7 @@ rbx oc ai speech "Welcome back" --field speechStyle.voiceId=VOICE
 Data/ordered stores default to `global`; override with `--scope`.
 `update` requires an entry; `upsert` may create one.
 `--field a.b=value` sets nested JSON. JSON-like values retain their types; others are strings.
-Additional options include `--query`, `--filter`, `--cursor`, `--if-match`, `--form`, and `--file`. Repeated query/form/file names retain every value.
+Other options: `--query`, `--filter`, `--cursor`, `--if-match`, `--form`, `--file`; repeated names keep every value.
 
 `rbx oc CATEGORY --help` lists that category's actions with their values, method and path, marks paged and destructive ones, and says which flag fills `{place}` (`--place-id`) or `{universe}`. An unknown action fails at once with the valid list. Actions that answer with an empty body (such as `universe restart`) return what ran. On paged actions `-l N` is a total fetched 100 per request, `--all` follows every page, `--pages N` stops after N, and `"more": true` says a page remains.
 
@@ -53,7 +53,7 @@ rbx oc server logs VERSION JOB -l 1000 --severity error --grep "Ranked"
 Categories include data, ordered, memory, universe, place, restriction, secret, notification, user, group, interaction, team, asset, creator-store, pass, localization, config, luau, server, advertising, analytics, avatar, badge, experiment, event, ai, matchmaking, and thumbnail.
 Use `oc request` for unlisted endpoints; pipe complex bodies through stdin.
 
-`team members` lists who is in a place's Team Create session. `team remove-members` is not "end their session": it revokes those users' collaborator access for the whole universe (`DELETE .../teamcreate/memberships`); only run it when the user asks for exactly that.
+`team members` lists who is in a place's Team Create session now; version-history saves only show who was there then, and neither blocks `rbx publish` from Studio. `team remove-members` does not end a session: it revokes their collaborator access for the whole universe; only run it when the user asks for exactly that.
 
 After an upload, `publish` and `oc place publish` report `live: true` once the version history lists the version as the current published one, which is normally the first check (`--wait-live SECONDS` bounds it on `publish`); a restart right after that result lands on the new version. In `oc place history`, `publishStatus` 1 marks the version players currently get, 2 a published version a later publish replaced, 0 a save; Studio publishes show 0 like saves and only `isPublished` is true for Open Cloud uploads. The `updated` stamp from `oc universe` moves on saves as well as publishes, so it does not mean a publish went live.
 
