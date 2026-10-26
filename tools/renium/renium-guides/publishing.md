@@ -4,7 +4,7 @@ See [advanced](advanced.md) for the main workflow.
 
 ## Save and publish state
 
-Synced work is in the project files and the open Studio session. `rbx status` reports `teamCreate`, `persistence` and `placeVersion` for the selected Edit place, and every connected Edit window in `status` and `cs` carries `teamCreate`. A command that changes the Edit window (`l` in Edit, `ps`, `prop`, `del`, `me`, `ai`) and `lst` answer with `persistence` too. `persistence: teamCreate`: Team Create syncs every edit to Roblox by itself, scripts included, and other collaborators' Studios receive it; there is no manual save step, so never tell the user to save the place (publishing stays separate). `persistence: unsaved`: the edit lives in the Studio session until the user saves (File > Save for a local file, Save to Roblox for a cloud place) or publishes, and Renium cannot see whether that happened. Team Create reverts a reparent out of Workspace.Terrain within a second (a pull then shows the old parent); move such instances with Clone to the new parent plus Destroy of the original. Players get changes only from a publish. When a collaborator in Studio still sees old behaviour, the code is the suspect, not the sync: `rbx oc fetch` downloads the cloud copy to check what it holds. Report what is synced and whether you published; don't call the place saved or unsaved. Offer `rbx publish` when the user wants the changes live.
+Synced work is in the project files and the open Studio session. `rbx status` reports `teamCreate`, `persistence` and `placeVersion` for the selected Edit place, and every connected Edit window in `status` and `cs` carries `teamCreate`. A command that changes the Edit window (`l` in Edit, `ps`, `prop`, `del`, `me`, `ai`) and `lst` answer with `persistence` too. `persistence: teamCreate`: Team Create syncs every edit to Roblox by itself, scripts included, and other collaborators' Studios receive it; there is no manual save step, so never tell the user to save the place (publishing stays separate). Every collaborator sees that draft, and `rbx publish` from Studio ships it with their work; a collaborator in the session, or their saves, is no reason to wait or hand the publish to the user: open the place (`rbx so`) and publish. `persistence: unsaved`: the edit lives in the Studio session until the user saves (File > Save for a local file, Save to Roblox for a cloud place) or publishes, and Renium cannot see whether that happened. Team Create reverts a reparent out of Workspace.Terrain within a second (a pull then shows the old parent); move such instances with Clone to the new parent plus Destroy of the original. Players get changes only from a publish. If a collaborator still sees old behavior, suspect the code, not the sync; `rbx oc fetch` shows the cloud copy. Report what is synced and whether you published; don't call the place saved or unsaved. Offer `rbx publish` when the user wants the changes live.
 
 ## Publishing places
 
@@ -35,8 +35,7 @@ can read them.
 `--open-cloud` builds the selected place project, or uploads `--file` unchanged.
 Use `ROBLOX_API_KEY` / `--key-env ENV` with Universe Places Write. IDs come from the
 experience or explicit flags. Verify that instances the API cannot update are
-unchanged before uploading (see below). `--dry-run` validates the input/target without an
-upload or permission check (cloud mode still builds). Temporary builds are cleaned.
+unchanged before uploading (see below). `--dry-run` validates without uploading (cloud mode still builds).
 Neither mode creates places, publishes packages, or restarts servers. An unconfirmed
 response is not success: inspect Version History before retrying.
 

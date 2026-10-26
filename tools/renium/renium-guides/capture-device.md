@@ -31,7 +31,7 @@ Render quality decides what a capture shows. `rbx gfx` reports Studio's edit and
 Captures target one window, not the desktop.
 After a teleport resizes the viewport, a recording fits later frames into its original canvas and reports `resizedFrames`.
 Recordings default to 60 FPS (`--fps 1..60`), 60 seconds (`--max-seconds 1..300`), quality 80 (`--quality 0..100`). Keep 60 FPS for clips a person will watch; size is irrelevant.
-Never minimize a window whose behaviour matters: the one you record, test or read from. Windows and Roblox throttle a minimized or fully covered window, so it stutters; only filler clients that merely need to exist may be minimized. Leave the windows that matter behind your other windows (`rbx so` opens it that way; `rs` restores a minimized one without focus). `re` reports `achievedFps`; `throttled: true` means the window was starved: fix it and record again.
+Never minimize a window whose behavior matters: the one you record, test or read from. Windows and Roblox throttle a minimized or fully covered window, so it stutters; only filler clients that merely need to exist may be minimized. Leave the windows that matter behind your other windows (`rbx so` opens it that way; `rs` restores a minimized one without focus). `re` reports `achievedFps`; `throttled: true` means the window was starved: fix it and record again.
 
 For an already running client:
 
