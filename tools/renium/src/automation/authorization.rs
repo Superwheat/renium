@@ -115,6 +115,7 @@ impl Authority {
             fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
         }
         crate::system::files::atomic_write_file(&path, &protect(&seed)?)?;
+        prune_stale_keys(directory, port);
         Ok(Self::new(SigningKey::from_bytes(&seed).verifying_key()))
     }
 
@@ -214,6 +215,40 @@ pub(crate) fn crypt(bytes: &[u8], encrypt: bool) -> Result<Vec<u8>> {
     Ok(result)
 }
 
+/// Removes the keys of daemons that no longer listen on their control port.
+/// A daemon binds its port before writing its key, so a key whose port
+/// refuses connections belongs to a daemon that has exited.
+fn prune_stale_keys(directory: &std::path::Path, keep_port: u16) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(port) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("control-"))
+            .and_then(|rest| rest.strip_suffix(".key"))
+            .and_then(|port| port.parse::<u16>().ok())
+        else {
+            continue;
+        };
+        if port != keep_port && !control_port_listens(port) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn control_port_listens(port: u16) -> bool {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
+    let timeout = Duration::from_millis(200);
+    [
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+    ]
+    .into_iter()
+    .any(|ip| TcpStream::connect_timeout(&SocketAddr::new(ip, port), timeout).is_ok())
+}
+
 fn protect(bytes: &[u8]) -> Result<Vec<u8>> {
     #[cfg(windows)]
     {
@@ -287,6 +322,51 @@ mod tests {
                 .verify(&mut serde_json::from_value(wire).unwrap())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn stale_control_keys_are_pruned_while_live_and_own_keys_stay() {
+        let directory = std::env::temp_dir().join(format!(
+            "renium-control-keys-{}-{}",
+            std::process::id(),
+            crate::app::timing::current_millis()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let live = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let live_port = live.local_addr().unwrap().port();
+        let dead_port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let own_port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        for name in [
+            format!("control-{live_port}.key"),
+            format!("control-{dead_port}.key"),
+            format!("control-{own_port}.key"),
+            "api-keys.json".to_string(),
+            "control-x.key".to_string(),
+        ] {
+            fs::write(directory.join(name), b"k").unwrap();
+        }
+        prune_stale_keys(&directory, own_port);
+        let mut names = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        names.sort();
+        let mut expected = vec![
+            "api-keys.json".to_string(),
+            "control-x.key".to_string(),
+            format!("control-{live_port}.key"),
+            format!("control-{own_port}.key"),
+        ];
+        expected.sort();
+        drop(live);
+        fs::remove_dir_all(&directory).unwrap();
+        assert_eq!(names, expected);
     }
 
     #[test]
