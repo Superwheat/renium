@@ -46,7 +46,7 @@ Before any Open Cloud upload (`--as` included), agents must verify the
 destination, including additions/removals and serialized data. If changed or
 unverified, use Studio's `rbx publish`. Renium checks size, parsing and binary float
 widths; it does not compare destinations or reject these types for being present.
-Local checks do not satisfy this verification or prove engine loading/joins.
+Local checks do not satisfy this verification or prove joins.
 
 ## Source edits and ordered input
 

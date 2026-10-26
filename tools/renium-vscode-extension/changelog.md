@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Improvements
+
+- The publishing guide says that a collaborator in Team Create is no reason to stop a Studio publish: the open draft is shared, and `rbx publish` ships it with their work.
+
 ### Bug fixes
 
 - `rbx lk` and `rbx wally` report changed settings ids as `Service/ID`, and `rbx push -I` keeps such an id to that service; a bare id still selects that instance in every store. Ids are numbered per store, so a push given the 70,000 ids of thirteen links also matched same-numbered instances in other services, pushed instances outside every link target, and failed on a Wire whose SourceInstance pointed at an instance that is not in Studio.
