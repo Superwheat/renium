@@ -4266,8 +4266,9 @@ fn append_target_scopes(
     scopes: &mut Vec<PushScope>,
     service: &str,
     document: &SettingsBytecode,
-    settings_ids: &HashSet<String>,
+    filter: &EditorPropertyFilter,
 ) {
+    let settings_ids = filter.ids_for_service(service);
     let (segments, ordinals) =
         crate::editor::paths::build_editor_instance_path_parts(document, service);
     for (index, instance) in document.instances.iter().enumerate() {
@@ -4285,7 +4286,7 @@ fn append_target_scopes(
 /// an empty scope and its read-only packages are left alone.
 fn target_filter_scopes(
     documents: &HashMap<String, Option<Arc<SettingsBytecode>>>,
-    settings_ids: &HashSet<String>,
+    filter: &EditorPropertyFilter,
     recorded: &PushScopes,
 ) -> PushScopes {
     let mut scopes: PushScopes = HashMap::new();
@@ -4297,7 +4298,7 @@ fn target_filter_scopes(
         let Some(document) = document else {
             continue;
         };
-        append_target_scopes(entry, service, document, settings_ids);
+        append_target_scopes(entry, service, document, filter);
     }
     scopes
 }
@@ -4587,10 +4588,10 @@ fn finish_editor_change_collection(
         .union(&services.read_only)
         .cloned()
         .collect::<HashSet<_>>();
-    let mut scopes = if property_filter.settings_ids.is_empty() {
+    let mut scopes = if !property_filter.has_target_ids() {
         services.scopes.clone()
     } else {
-        target_filter_scopes(documents, &property_filter.settings_ids, &services.scopes)
+        target_filter_scopes(documents, property_filter, &services.scopes)
     };
     for service in &services.reconcile {
         scopes.insert(service.clone(), vec![(Vec::new(), Vec::new())]);
@@ -4716,7 +4717,7 @@ fn collect_settings_file_change(
         changed_services.settings.insert(service.to_string());
         if !property_filter.is_active() {
             changed_services.reconcile.insert(service.to_string());
-        } else if !property_filter.settings_ids.is_empty() {
+        } else if property_filter.has_target_ids() {
             changed_services.target_upsert.insert(service.to_string());
         }
     }
@@ -4777,7 +4778,7 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
     prepared_documents: &mut PreparedEditorDocuments,
 ) -> Result<EditorChangeSet> {
     let mut property_filter = EditorPropertyFilter::from_args(args)?;
-    let explicit_target_ids = property_filter.settings_ids.clone();
+    let explicit_targets = property_filter.clone();
     let mut source_scopes = PushScopes::new();
     let mut changes = EditorChangeSet {
         native_property_documents: prepared_documents
@@ -4840,11 +4841,11 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
             &mut documents,
             &mut prepared_documents.documents,
         )?;
-        if !explicit_target_ids.is_empty() {
+        if explicit_targets.has_target_ids() {
             source_scopes.entry(service.clone()).or_insert_with(|| {
                 let mut scopes = Vec::new();
                 if let Some(Some(document)) = documents.get(&service) {
-                    append_target_scopes(&mut scopes, &service, document, &explicit_target_ids);
+                    append_target_scopes(&mut scopes, &service, document, &explicit_targets);
                 }
                 scopes
             });
@@ -4883,7 +4884,7 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
                 &service,
                 Some((&target.path_segments, &target.path_ordinals)),
             );
-            property_filter.settings_ids.extend(target.settings_ids);
+            property_filter.add_service_ids(&service, target.settings_ids);
             changed_services.settings.insert(service.clone());
             changed_services.target_upsert.insert(service);
             continue;
@@ -4928,7 +4929,7 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
                     .as_ref()
                     .map(|spec| (spec.path_segments.as_slice(), &[][..]))
             });
-        if !explicit_target_ids.is_empty()
+        if explicit_targets.has_target_ids()
             && !protected_path.is_some_and(|(segments, ordinals)| {
                 source_path_within_filter(
                     source_scopes.get(&service).map_or(&[], Vec::as_slice),
@@ -5237,6 +5238,32 @@ fn log_change_set_composition(
 mod sync_tests {
 
     #[test]
+    fn qualified_target_ids_scope_only_their_service() {
+        use crate::tests::support::{settings_document, settings_instance};
+        let documents: HashMap<String, Option<Arc<SettingsBytecode>>> =
+            ["Workspace", "ServerStorage"]
+                .into_iter()
+                .map(|service| {
+                    let document = settings_document(vec![
+                        settings_instance("root", service, service, None),
+                        settings_instance("editor:7", "Twin", "Folder", Some(0)),
+                    ]);
+                    (service.to_string(), Some(Arc::new(document)))
+                })
+                .collect();
+        let mut filter = EditorPropertyFilter::default();
+        filter.add_service_ids("ServerStorage", ["editor:7".to_string()]);
+        let scopes = target_filter_scopes(&documents, &filter, &HashMap::new());
+        assert_eq!(scopes["ServerStorage"].len(), 1);
+        assert!(scopes["Workspace"].is_empty());
+        let mut bare = EditorPropertyFilter::default();
+        bare.settings_ids.insert("editor:7".to_string());
+        let scopes = target_filter_scopes(&documents, &bare, &HashMap::new());
+        assert_eq!(scopes["ServerStorage"].len(), 1);
+        assert_eq!(scopes["Workspace"].len(), 1);
+    }
+
+    #[test]
     fn target_ids_filter_source_mutations_before_creating_or_deleting_instances() {
         use crate::cli::ProjectSourceArgs;
         use crate::tests::support::{settings_document, settings_instance, temp_dir};
@@ -5385,8 +5412,11 @@ mod sync_tests {
             ("Workspace".to_string(), Some(Arc::new(workspace))),
             ("ServerStorage".to_string(), Some(Arc::new(storage))),
         ]);
-        let ids = HashSet::from(["racing:racetracks".to_string()]);
-        let filtered = super::target_filter_scopes(&documents, &ids, &HashMap::new());
+        let filter = EditorPropertyFilter {
+            settings_ids: HashSet::from(["racing:racetracks".to_string()]),
+            ..Default::default()
+        };
+        let filtered = super::target_filter_scopes(&documents, &filter, &HashMap::new());
         assert!(super::push_scope_touches(
             filtered.get("Workspace"),
             &seg("RaceTracks"),

@@ -971,8 +971,9 @@ pub(crate) fn sync_wally_packages_result(mut args: SyncWallyPackagesArgs) -> Res
             }
         }
         for id in &outcome.settings_ids {
-            if settings_seen.insert(id.clone()) {
-                target_settings_ids.push(id.clone());
+            let qualified = format!("{}/{id}", realm.service);
+            if settings_seen.insert(qualified.clone()) {
+                target_settings_ids.push(qualified);
             }
         }
         if !outcome.removed_target.is_null() {

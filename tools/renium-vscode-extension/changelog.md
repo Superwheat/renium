@@ -4,6 +4,7 @@
 
 ### Bug fixes
 
+- `rbx lk` and `rbx wally` report changed settings ids as `Service/ID`, and `rbx push -I` keeps such an id to that service; a bare id still selects that instance in every store. Ids are numbered per store, so a push given the 70,000 ids of thirteen links also matched same-numbered instances in other services, pushed instances outside every link target, and failed on a Wire whose SourceInstance pointed at an instance that is not in Studio.
 - Large pushes no longer fail with "Renium request lease was cancelled" while automatic playtest teleport setup runs.
 
 ## 0.5.2 - 2026-10-25

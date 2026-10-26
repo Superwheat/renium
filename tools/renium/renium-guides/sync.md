@@ -45,7 +45,7 @@ Conflict preferences: `none`, `studio`, `editor` (project files). A preference r
 ## Manual sync
 
 Without Live Sync, pass the files or directories to `ps`; Renium batches them by service.
-For store edits, use returned changed paths and settings IDs to keep the push scoped.
+For store edits, use returned changed paths and settings IDs (`Service/ID`, since IDs repeat per store) to keep the push scoped.
 An unfiltered push reconciles the entire place and can remove Studio-only content.
 
 Pulls restore read-only `.renium` link mirrors from their saved packages within the selected services, including missing targets. `readOnlyLinksRestored` lists them; a difference does not establish which copy is newer. Push the link path to apply the package in Studio, or edit the source and run `lk`. Restore writes do not queue themselves as user edits in Live Sync. `ps --override-packages` deliberately bypasses push protection; its readback keeps that result, but a later pull restores the package again. See [links](links.md) for stray-file handling.

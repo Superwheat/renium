@@ -230,9 +230,13 @@ impl EditorInstancePath {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct EditorPropertyFilter {
+    /// Ids given without a service; they select that instance in every store.
     pub(crate) settings_ids: HashSet<String>,
+    /// Ids given as `Service/ID`; stores number instances from their own
+    /// size, so the same id names unrelated instances in other services.
+    pub(crate) service_settings_ids: std::collections::HashMap<String, HashSet<String>>,
     pub(crate) property_names: HashSet<String>,
     /// An upsert of a whole service sends values only for instances the
     /// project created; pulled instances already carry theirs in Studio.
@@ -241,10 +245,11 @@ pub(crate) struct EditorPropertyFilter {
 
 impl EditorPropertyFilter {
     pub(crate) fn from_args(args: &PushEditorChangesArgs) -> Result<Self> {
-        let settings_ids = expand_editor_target_settings_ids(args)?;
+        let targets = expand_editor_target_settings_ids(args)?;
         Ok(Self {
-            local_values_only: args.upsert_instances_only && settings_ids.is_empty(),
-            settings_ids,
+            local_values_only: args.upsert_instances_only && !targets.has_ids(),
+            settings_ids: targets.any,
+            service_settings_ids: targets.by_service,
             property_names: args
                 .target_properties
                 .iter()
@@ -255,11 +260,36 @@ impl EditorPropertyFilter {
     }
 
     pub(crate) fn is_active(&self) -> bool {
-        !self.settings_ids.is_empty() || !self.property_names.is_empty()
+        self.has_target_ids() || !self.property_names.is_empty()
     }
 
-    pub(crate) fn includes_instance(&self, settings_id: &str) -> bool {
-        self.settings_ids.is_empty() || self.settings_ids.contains(settings_id)
+    pub(crate) fn has_target_ids(&self) -> bool {
+        !self.settings_ids.is_empty() || !self.service_settings_ids.is_empty()
+    }
+
+    pub(crate) fn includes_instance_in(&self, service: &str, settings_id: &str) -> bool {
+        !self.has_target_ids()
+            || self.settings_ids.contains(settings_id)
+            || self
+                .service_settings_ids
+                .get(service)
+                .is_some_and(|ids| ids.contains(settings_id))
+    }
+
+    /// Every id that selects instances of this service.
+    pub(crate) fn ids_for_service(&self, service: &str) -> HashSet<String> {
+        let mut ids = self.settings_ids.clone();
+        if let Some(scoped) = self.service_settings_ids.get(service) {
+            ids.extend(scoped.iter().cloned());
+        }
+        ids
+    }
+
+    pub(crate) fn add_service_ids(&mut self, service: &str, ids: impl IntoIterator<Item = String>) {
+        self.service_settings_ids
+            .entry(service.to_string())
+            .or_default()
+            .extend(ids);
     }
 
     pub(crate) fn includes_property(&self, property_name: &str) -> bool {
@@ -270,14 +300,41 @@ impl EditorPropertyFilter {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct EditorTargetIds {
+    pub(crate) any: HashSet<String>,
+    pub(crate) by_service: std::collections::HashMap<String, HashSet<String>>,
+}
+
+impl EditorTargetIds {
+    pub(crate) fn has_ids(&self) -> bool {
+        !self.any.is_empty() || !self.by_service.is_empty()
+    }
+
+    /// `Service/ID` binds the id to one store; a bare id applies everywhere.
+    fn insert(&mut self, entry: &str) {
+        match entry.split_once('/') {
+            Some((service, id)) if !service.is_empty() && !id.is_empty() => {
+                self.by_service
+                    .entry(service.to_string())
+                    .or_default()
+                    .insert(id.to_string());
+            }
+            _ => {
+                self.any.insert(entry.to_string());
+            }
+        }
+    }
+}
+
 pub(crate) fn expand_editor_target_settings_ids(
     args: &PushEditorChangesArgs,
-) -> Result<HashSet<String>> {
-    let mut ids = HashSet::new();
+) -> Result<EditorTargetIds> {
+    let mut ids = EditorTargetIds::default();
     for value in &args.target_settings_ids {
         let trimmed = value.trim();
         if !trimmed.is_empty() {
-            ids.insert(trimmed.to_string());
+            ids.insert(trimmed);
         }
     }
     for list_path in &args.target_settings_id_files {
@@ -292,10 +349,37 @@ pub(crate) fn expand_editor_target_settings_ids(
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
             }
-            ids.insert(trimmed.to_string());
+            ids.insert(trimmed);
         }
     }
     Ok(ids)
+}
+
+#[cfg(test)]
+mod target_id_tests {
+    use super::*;
+
+    #[test]
+    fn qualified_ids_select_only_their_service() {
+        let mut ids = EditorTargetIds::default();
+        for entry in ["editor:1f", "ServerStorage/editor:2a", "/odd", "odd/"] {
+            ids.insert(entry);
+        }
+        let filter = EditorPropertyFilter {
+            settings_ids: ids.any,
+            service_settings_ids: ids.by_service,
+            ..Default::default()
+        };
+        assert!(filter.includes_instance_in("Workspace", "editor:1f"));
+        assert!(filter.includes_instance_in("ServerStorage", "editor:2a"));
+        assert!(!filter.includes_instance_in("Workspace", "editor:2a"));
+        assert!(filter.includes_instance_in("Workspace", "/odd"));
+        assert!(filter.includes_instance_in("Workspace", "odd/"));
+        assert_eq!(filter.ids_for_service("ServerStorage").len(), 4);
+        assert_eq!(filter.ids_for_service("Workspace").len(), 3);
+        assert!(!EditorPropertyFilter::default().has_target_ids());
+        assert!(EditorPropertyFilter::default().includes_instance_in("Workspace", "editor:9"));
+    }
 }
 
 pub(crate) struct EditorSourceEnsureResult {

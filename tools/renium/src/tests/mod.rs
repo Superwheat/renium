@@ -2375,8 +2375,7 @@ fn targeted_instance_upserts_include_ancestors_but_not_root() {
     ]);
     let filter = EditorPropertyFilter {
         settings_ids: HashSet::from(["editor:2".to_string()]),
-        property_names: HashSet::new(),
-        local_values_only: false,
+        ..Default::default()
     };
     let mut changes = EditorChangeSet::default();
 
@@ -2415,8 +2414,7 @@ fn targeted_instance_upserts_include_duplicate_identity_group() {
     ]);
     let filter = EditorPropertyFilter {
         settings_ids: HashSet::from(["editor:4".to_string()]),
-        property_names: HashSet::new(),
-        local_values_only: false,
+        ..Default::default()
     };
     let mut changes = EditorChangeSet::default();
 
@@ -2461,8 +2459,7 @@ fn targeted_instance_upserts_share_deep_ancestors_without_losing_targets() {
         settings_ids: std::iter::once("parent:16".to_string())
             .chain((0..2400).step_by(4).map(|child| format!("child:{child}")))
             .collect(),
-        property_names: HashSet::new(),
-        local_values_only: false,
+        ..Default::default()
     };
     let mut changes = EditorChangeSet::default();
     append_editor_target_instance_upserts(&mut changes, &document, "Workspace", &filter);
@@ -2503,8 +2500,7 @@ fn targeted_inline_source_changes_include_selected_package_scripts() {
     ]);
     let filter = EditorPropertyFilter {
         settings_ids: HashSet::from(["editor:2".to_string()]),
-        property_names: HashSet::new(),
-        local_values_only: false,
+        ..Default::default()
     };
     let mut changes = EditorChangeSet::default();
 
@@ -3961,8 +3957,7 @@ fn targeted_service_root_properties_survive_descendant_only_upsert_selection() {
         "Lighting",
         &EditorPropertyFilter {
             settings_ids: HashSet::from(["root".into()]),
-            property_names: HashSet::new(),
-            local_values_only: false,
+            ..Default::default()
         },
         crate::editor::diff::EditorTargetChangeOptions {
             upsert_instances: true,

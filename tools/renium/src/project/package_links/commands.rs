@@ -257,10 +257,12 @@ impl LinkApplyChanges {
         }
     }
 
-    fn mark_settings_ids(&mut self, ids: &[String]) {
+    /// Ids are per store, so the service travels with them.
+    fn mark_settings_ids(&mut self, service: &str, ids: &[String]) {
         for id in ids {
-            if self.settings_seen.insert(id.clone()) {
-                self.target_settings_ids.push(id.clone());
+            let qualified = format!("{service}/{id}");
+            if self.settings_seen.insert(qualified.clone()) {
+                self.target_settings_ids.push(qualified);
             }
         }
     }
@@ -432,7 +434,7 @@ pub(super) fn externalize_target_scripts(
             "Source".to_string(),
             Value::String(EXTERNAL_SOURCE_MARKER.to_string()),
         );
-        changes.mark_settings_ids(std::slice::from_ref(&instance.settings_id));
+        changes.mark_settings_ids(service, std::slice::from_ref(&instance.settings_id));
         changes.mark_path(path);
         changes.mirror_permissions.insert(path.clone(), true);
         changes
@@ -600,7 +602,7 @@ impl PackageLinkApply<'_> {
                     &storage.source_root,
                     materialized.displaced,
                 )?;
-                changes.mark_settings_ids(&materialized.settings_ids);
+                changes.mark_settings_ids(document_service, &materialized.settings_ids);
                 changes.mark_path(settings_file);
                 changes.differences += 1;
             }
@@ -617,7 +619,7 @@ impl PackageLinkApply<'_> {
                 document_segments,
                 document_ordinals,
             );
-            changes.mark_settings_ids(&settings_ids);
+            changes.mark_settings_ids(document_service, &settings_ids);
             if !settings_ids.is_empty() {
                 changes.mark_path(settings_file);
             }
@@ -819,7 +821,7 @@ impl MirrorLinkApply<'_> {
             let target_changed = structure_changed || mirror_changed && !locally_edited;
             if target_changed {
                 if let Some(id) = target_settings_id {
-                    changes.mark_settings_ids(&[id]);
+                    changes.mark_settings_ids(&target.service, &[id]);
                 }
                 changes.mark_path(&pair.mirror);
                 source_writes.push(json!({

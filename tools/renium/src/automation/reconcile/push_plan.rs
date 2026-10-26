@@ -803,7 +803,8 @@ pub(crate) fn append_aligned_settings_push_plan(
                 .collect(),
             ..Default::default()
         };
-        let (_, mut selected) = crate::editor::diff::editor_target_indices(desired, &filter);
+        let (_, mut selected) =
+            crate::editor::diff::editor_target_indices(desired, &service, &filter);
         crate::editor::diff::expand_ambiguous_editor_siblings(desired, &mut selected);
         selected
             .iter()

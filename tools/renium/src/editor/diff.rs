@@ -377,7 +377,7 @@ fn append_editor_target_instance_upserts_with_paths(
     filter: &EditorPropertyFilter,
     paths_by_index: &[Option<EditorInstancePath>],
 ) {
-    let (target_indices, mut selected_indices) = editor_target_indices(document, filter);
+    let (target_indices, mut selected_indices) = editor_target_indices(document, service, filter);
     let sibling_counts = expand_ambiguous_editor_siblings(document, &mut selected_indices);
     append_editor_target_instance_upserts_for_indices(
         changes,
@@ -392,12 +392,13 @@ fn append_editor_target_instance_upserts_with_paths(
 
 pub(crate) fn editor_target_indices(
     document: &SettingsBytecode,
+    service: &str,
     filter: &EditorPropertyFilter,
 ) -> (HashSet<usize>, HashSet<usize>) {
     let mut target_indices = HashSet::new();
     let mut selected_indices = HashSet::new();
     for (index, instance) in document.instances.iter().enumerate() {
-        if !filter.includes_instance(&instance.settings_id) {
+        if !filter.includes_instance_in(service, &instance.settings_id) {
             continue;
         }
         if instance.class_name == "PackageLink" {
@@ -506,7 +507,7 @@ fn append_editor_target_inline_source_changes_with_paths(
     paths_by_index: &[Option<EditorInstancePath>],
 ) {
     for (index, instance) in document.instances.iter().enumerate() {
-        if !filter.includes_instance(&instance.settings_id)
+        if !filter.includes_instance_in(service, &instance.settings_id)
             || !is_lua_source_class(&instance.class_name)
         {
             continue;
@@ -587,7 +588,7 @@ fn append_editor_property_changes_with_paths(
         if instance.class_name == "PackageLink" {
             continue;
         }
-        if !filter.includes_instance(&instance.settings_id) {
+        if !filter.includes_instance_in(service, &instance.settings_id) {
             continue;
         }
         if filter.local_values_only && !instance.settings_id.starts_with("editor:") {
@@ -706,7 +707,7 @@ fn append_editor_property_changes_with_paths(
 
         // A targeted push names its instances, so an empty complete map is
         // still worth sending: it removes attributes Studio still holds.
-        let targeted = !filter.settings_ids.is_empty();
+        let targeted = filter.has_target_ids();
         if !properties.is_empty() || !attributes.is_empty() || (attributes_complete && targeted) {
             append_editor_property_change(
                 changes,
@@ -768,7 +769,7 @@ fn native_target_path_indices(
         .collect::<HashSet<_>>();
     let mut property_candidates: HashMap<&str, HashMap<&str, bool>> = HashMap::new();
     for (index, instance) in document.instances.iter().enumerate() {
-        if !filter.includes_instance(&instance.settings_id) {
+        if !filter.includes_instance_in(service, &instance.settings_id) {
             continue;
         }
         if options.upsert_instances
@@ -845,8 +846,9 @@ pub(crate) fn append_editor_target_changes(
     let settings_ids_by_index = editor_settings_ids(document);
     let native_indices =
         native_target_path_indices(document, service, filter, &options, &settings_ids_by_index);
-    if !filter.settings_ids.is_empty() && native_indices.is_none() {
-        let (target_indices, mut selected_indices) = editor_target_indices(document, filter);
+    if filter.has_target_ids() && native_indices.is_none() {
+        let (target_indices, mut selected_indices) =
+            editor_target_indices(document, service, filter);
         let upsert_descriptors = options.upsert_instances
             && !matches!(
                 options.property_scope,
