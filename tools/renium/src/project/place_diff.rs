@@ -77,12 +77,18 @@ fn is_block_physics_placeholder_json(value: &Value) -> bool {
         })
 }
 
-fn omit_engine_managed_properties(document: &mut SettingsBytecode) -> BTreeMap<String, usize> {
+/// Properties named in `keep` stay even when the engine manages them, so an
+/// explicit `--props PhysicalConfigData` compares the cached physics data.
+fn omit_engine_managed_properties(
+    document: &mut SettingsBytecode,
+    keep: &[String],
+) -> BTreeMap<String, usize> {
     let mut omitted = BTreeMap::new();
     for instance in &mut document.instances {
         let class_name = &instance.class_name;
         instance.properties.retain(|name, value| {
-            let managed = engine_managed_property(class_name, name)
+            let managed = !keep.iter().any(|kept| kept == name)
+                && engine_managed_property(class_name, name)
                 && !(name == "PhysicalConfigData" && is_block_physics_placeholder_json(value));
             if managed {
                 *omitted.entry(name.clone()).or_default() += 1;
@@ -842,8 +848,8 @@ pub(super) fn compare(
     );
     let mut before = before?;
     let mut after = after?;
-    let mut engine_managed = omit_engine_managed_properties(&mut before);
-    for (name, count) in omit_engine_managed_properties(&mut after) {
+    let mut engine_managed = omit_engine_managed_properties(&mut before, &args.props);
+    for (name, count) in omit_engine_managed_properties(&mut after, &args.props) {
         *engine_managed.entry(name).or_default() += count;
     }
     let database = rbx_reflection_database::get()?;
@@ -917,6 +923,14 @@ pub(super) fn compare(
                     changed_fields(&old.properties, &instance.properties, args.values);
                 let mut attributes =
                     changed_fields(&old.attributes, &instance.attributes, args.values);
+                if !args.props.is_empty() {
+                    properties.retain(|entry| {
+                        entry["name"]
+                            .as_str()
+                            .is_some_and(|name| args.props.iter().any(|wanted| wanted == name))
+                    });
+                    attributes.clear();
+                }
                 // Once a place is on Unified lighting, Studio keeps the saved
                 // Technology only for rollback and shows Unified regardless.
                 let unified = old.attributes.contains_key(UNIFIED_LIGHTING_MARKER)
@@ -964,7 +978,14 @@ pub(super) fn compare(
             .map(compare_record)
             .collect::<Vec<_>>()
     };
+    let class_filter = args.class.as_deref();
     for (index, (instance, record)) in after.instances.iter().zip(records).enumerate() {
+        if class_filter.is_some_and(|class| instance.class_name != class) {
+            if let Some((previous, ..)) = &record {
+                matched[*previous] = true;
+            }
+            continue;
+        }
         let Some((previous, properties, attributes, skipped)) = record else {
             added += 1;
             if differences.len() < limit {
@@ -996,6 +1017,9 @@ pub(super) fn compare(
     }
     for (index, was_matched) in matched.into_iter().enumerate() {
         if !was_matched {
+            if class_filter.is_some_and(|class| before.instances[index].class_name != class) {
+                continue;
+            }
             removed += 1;
             if differences.len() < limit {
                 let mut entry = json!({"kind":"removed","before":location(&before,index)});

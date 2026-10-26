@@ -155,6 +155,7 @@ fn run_cli() -> Result<()> {
     }
     let mut cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
     app::output::prime_mode(&cli.output_mode);
+    app::output::prime_fields(&cli.fields);
     if cli.backtrace {
         unsafe {
             std::env::set_var("RUST_BACKTRACE", "1");

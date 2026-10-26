@@ -106,7 +106,7 @@ fn block_physics_placeholders_are_reported_while_computed_hulls_are_not() {
         "PhysicalConfigData".into(),
         json!({"_type": "SharedString", "base64": base64::encode(b"CSGPHS\x08\0\0\0\x02\0(hull bytes)")}),
     );
-    let omitted = omit_engine_managed_properties(&mut document);
+    let omitted = omit_engine_managed_properties(&mut document, &[]);
     assert_eq!(omitted.get("PhysicalConfigData"), Some(&1));
     assert!(
         document.instances[1]

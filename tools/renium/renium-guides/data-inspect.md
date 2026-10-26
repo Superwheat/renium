@@ -15,11 +15,12 @@ rbx q Place.rbxl -c Workspace --props StreamingEnabled
 rbx cmp Place.rbxl
 rbx cmp Before.rbxl --full
 rbx cmp Before.rbxl After.rbxlx --full
+rbx cmp live.rbxl build.rbxl --full --class MeshPart --props PhysicalConfigData,CollisionFidelity
 ```
 
 `v` accepts `.rbxl`/`.rbxlx` places, `.rbxm`/`.rbxmx` models and `.renium` stores; `--json` includes source, properties, attributes and references. It inspects one file; it does not compare two states. For a few saved values, use `q ... --props NAME,NAME` instead of a whole `v --json` dump. `q` prints `matches` as `{path, className, props}` with a dotted path (`Workspace.Map.Pad[3]`); read it, don't re-parse it.
 Use `v STORE.renium --json` to distinguish stored overrides from materialized defaults.
-For a full saved-place diff, use `cmp BEFORE --full` from the target project. Add `AFTER` (or `--against AFTER`) for two files; no project is required, and Studio session services such as `ConfigureServerService` are skipped. Both place formats work in either position. The direction is BEFORE → project/AFTER. Without `--full`, `cmp` is script-only. Counts cover the whole place; request `--all` or `--values` only when needed. Float noise in CFrames, empty blobs against none and same-named siblings that swapped places are not differences; a member without a known default that every instance of a class carries on one side and none on the other is counted under `oneSidedProperties` instead.
+For a full saved-place diff, use `cmp BEFORE --full` from the target project. Add `AFTER` (or `--against AFTER`) for two files; no project is required, and Studio session services such as `ConfigureServerService` are skipped. Both place formats work in either position. The direction is BEFORE → project/AFTER. Without `--full`, `cmp` is script-only. Counts cover the whole place; request `--all` or `--values` only when needed. `--class C` compares only that class and `--props A,B` only those properties, engine-managed ones included, so a post-build collision check is one command. Float noise in CFrames, empty blobs against none and same-named siblings that swapped places are not differences; a member without a known default that every instance of a class carries on one side and none on the other is counted under `oneSidedProperties` instead.
 
 The full report prints one line per difference (`changed Script ServerScriptService.Main: Source, @Tag`, `added Part Workspace.New`), including references, packages and serialized Terrain data; `--output-mode json` keeps the records. `--values` includes before/after values and source; these may contain credentials, so redact them before sharing. `--limit` caps entries, not counts; `--all` returns every difference.
 

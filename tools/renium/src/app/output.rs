@@ -125,6 +125,62 @@ thread_local! {
     static CAPTURED_OUTPUT: RefCell<Result<Option<Value>, ()>> = const { RefCell::new(Err(())) };
 }
 
+static FIELDS: OnceLock<Vec<String>> = OnceLock::new();
+
+/// `--fields KEY,KEY` keeps only those keys of a printed result and of each
+/// record inside it; `error` always stays.
+pub(crate) fn prime_fields(fields: &[String]) {
+    let fields = fields
+        .iter()
+        .map(|field| field.trim().to_string())
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    if !fields.is_empty() {
+        let _ = FIELDS.set(fields);
+    }
+}
+
+fn project_record(value: &Value, fields: &[String]) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(key, _)| fields.iter().any(|field| field == *key) || *key == "error")
+                .map(|(key, inner)| (key.clone(), inner.clone()))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+pub(crate) fn project_fields(value: &Value, fields: &[String]) -> Value {
+    let Value::Object(map) = value else {
+        return value.clone();
+    };
+    let mut out = serde_json::Map::new();
+    for (key, inner) in map {
+        if fields.iter().any(|field| field == key) || key == "error" {
+            out.insert(key.clone(), inner.clone());
+            continue;
+        }
+        if let Value::Array(items) = inner
+            && !items.is_empty()
+            && items.iter().all(Value::is_object)
+        {
+            let projected = items
+                .iter()
+                .map(|item| project_record(item, fields))
+                .collect::<Vec<_>>();
+            if projected
+                .iter()
+                .any(|item| item.as_object().is_some_and(|member| !member.is_empty()))
+            {
+                out.insert(key.clone(), Value::Array(projected));
+            }
+        }
+    }
+    Value::Object(out)
+}
+
 pub(crate) fn prime_mode(mode: &str) {
     MODE.store(
         match mode {
@@ -176,6 +232,7 @@ pub(crate) fn configure(cli: &Cli) {
     );
     YES.store(cli.yes, Ordering::Relaxed);
     prime_mode(&cli.output_mode);
+    prime_fields(&cli.fields);
     unsafe {
         match cli.color.as_str() {
             "always" => {
@@ -359,6 +416,13 @@ pub(crate) fn print_json_output(value: &Value, pretty: bool) -> Result<()> {
         shorten_single_precision_floats(&mut text);
         relative = text;
         &relative
+    } else {
+        value
+    };
+    let projected;
+    let value = if let Some(fields) = FIELDS.get() {
+        projected = project_fields(value, fields);
+        &projected
     } else {
         value
     };
@@ -601,5 +665,26 @@ mod float_output_tests {
         let before = serde_json::to_string(&value).unwrap();
         shorten_single_precision_floats(&mut value);
         assert_eq!(serde_json::to_string(&value).unwrap(), before);
+    }
+}
+
+#[cfg(test)]
+mod field_projection_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn fields_keep_listed_keys_at_the_top_and_in_records() {
+        let value = json!({
+            "ok": true, "count": 2, "error": "none",
+            "versions": [{"version": 3, "createdBy": 1, "title": null}, {"version": 2, "createdBy": 1}],
+            "flat": [1, 2], "meta": {"version": 9}
+        });
+        let fields = ["version".to_string(), "count".to_string()];
+        assert_eq!(
+            project_fields(&value, &fields),
+            json!({"count": 2, "error": "none", "versions": [{"version": 3}, {"version": 2}]})
+        );
+        assert_eq!(project_fields(&json!([1]), &fields), json!([1]));
     }
 }

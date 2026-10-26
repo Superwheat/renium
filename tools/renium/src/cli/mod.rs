@@ -35,7 +35,7 @@ pub(crate) fn command() -> clap::Command {
     command.term_width(0).before_help(
         "New here? In a Roblox project folder run `rbx init` once, then read the RENIUM.md it creates.",
     ).after_help(
-        "Global options (any command):\n  --place <NAME|ID|GAME:PLACE>  Pin to one Studio place (env: RENIUM_PLACE)\n  --project <PATH>              Use this renium.project.jsonc\n  --output-mode text|json|pretty  --log-level off|error|warn|info|debug|trace  -v\n  --color auto|always|never  --yes  --backtrace  --daemon <NAME>\n\nExamples:\n  rbx f Workspace -n Door\n  rbx pl\n  rbx ps src/StarterGui/Menu.client.luau\n  rbx l \"return game.PlaceId\"\n  rbx sc --studio -o studio.png",
+        "Global options (any command):\n  --place <NAME|ID|GAME:PLACE>  Pin to one Studio place (env: RENIUM_PLACE)\n  --project <PATH>              Use this renium.project.jsonc\n  --output-mode text|json|pretty  --fields KEY,KEY  --log-level off|error|warn|info|debug|trace  -v\n  --color auto|always|never  --yes  --backtrace  --daemon <NAME>\n\nExamples:\n  rbx f Workspace -n Door\n  rbx pl\n  rbx ps src/StarterGui/Menu.client.luau\n  rbx l \"return game.PlaceId\"\n  rbx sc --studio -o studio.png",
     )
 }
 
@@ -96,6 +96,15 @@ pub(super) struct Cli {
         default_value = "text"
     )]
     pub(super) output_mode: String,
+    #[arg(
+        long,
+        global = true,
+        hide = true,
+        value_name = "KEY,KEY",
+        value_delimiter = ',',
+        help = "Print only these keys of the result and of each record in it"
+    )]
+    pub(super) fields: Vec<String>,
     #[arg(
         long,
         global = true,
@@ -170,6 +179,21 @@ pub(super) struct ComparePlaceArgs {
         help = "Include before/after values and source (may contain secrets)"
     )]
     pub(super) values: bool,
+    #[arg(
+        long,
+        requires = "full",
+        value_name = "CLASS",
+        help = "Compare only instances of this class"
+    )]
+    pub(super) class: Option<String>,
+    #[arg(
+        long,
+        requires = "full",
+        value_name = "NAME,NAME",
+        value_delimiter = ',',
+        help = "Compare only these properties, engine-managed ones such as PhysicalConfigData included"
+    )]
+    pub(super) props: Vec<String>,
     #[arg(help = "Maximum differences to return", long, default_value = "50")]
     pub(super) limit: NonZeroUsize,
     #[arg(help = "Return every difference", short, long)]

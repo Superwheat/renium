@@ -74,143 +74,143 @@ enum OpenCloudCommand {
     Routes(super::routes::RoutesArgs),
     #[command(
         about = "Manage persistent data stores",
-        after_help = super::routes::category_help("data")
+        before_help = super::routes::category_help("data")
     )]
     Data(super::routes::RouteArgs),
     #[command(
         about = "Manage ordered data stores",
-        after_help = super::routes::category_help("ordered")
+        before_help = super::routes::category_help("ordered")
     )]
     Ordered(super::routes::RouteArgs),
     #[command(
         about = "Manage queues and sorted memory maps",
-        after_help = super::routes::category_help("memory")
+        before_help = super::routes::category_help("memory")
     )]
     Memory(super::routes::RouteArgs),
     #[command(
         about = "Read or update the current universe",
-        after_help = super::routes::category_help("universe")
+        before_help = super::routes::category_help("universe")
     )]
     Universe(super::routes::RouteArgs),
     #[command(
         about = "Read or update the current place",
-        after_help = super::routes::category_help("place")
+        before_help = super::routes::category_help("place")
     )]
     Place(super::routes::RouteArgs),
     #[command(
         about = "Manage user restrictions",
-        after_help = super::routes::category_help("restriction")
+        before_help = super::routes::category_help("restriction")
     )]
     Restriction(super::routes::RouteArgs),
     #[command(
         about = "Manage universe secrets",
-        after_help = super::routes::category_help("secret")
+        before_help = super::routes::category_help("secret")
     )]
     Secret(super::routes::RouteArgs),
     #[command(
         about = "Send experience notifications",
-        after_help = super::routes::category_help("notification")
+        before_help = super::routes::category_help("notification")
     )]
     Notification(super::routes::RouteArgs),
     #[command(
         about = "Manage advertising campaigns",
-        after_help = super::routes::category_help("advertising")
+        before_help = super::routes::category_help("advertising")
     )]
     Advertising(super::routes::RouteArgs),
     #[command(
         about = "Query experience analytics",
-        after_help = super::routes::category_help("analytics")
+        before_help = super::routes::category_help("analytics")
     )]
     Analytics(super::routes::RouteArgs),
     #[command(
         about = "Generate user avatar thumbnails",
-        after_help = super::routes::category_help("avatar")
+        before_help = super::routes::category_help("avatar")
     )]
     Avatar(super::routes::RouteArgs),
     #[command(
         about = "Manage experience badges",
-        after_help = super::routes::category_help("badge")
+        before_help = super::routes::category_help("badge")
     )]
     Badge(super::routes::RouteArgs),
     #[command(
         about = "Manage experience experiments",
-        after_help = super::routes::category_help("experiment")
+        before_help = super::routes::category_help("experiment")
     )]
     Experiment(super::routes::RouteArgs),
     #[command(
         about = "Manage experience events",
-        after_help = super::routes::category_help("event")
+        before_help = super::routes::category_help("event")
     )]
     Event(super::routes::RouteArgs),
     #[command(
         about = "Use Roblox generative services",
-        after_help = super::routes::category_help("ai")
+        before_help = super::routes::category_help("ai")
     )]
     Ai(super::routes::RouteArgs),
     #[command(
         about = "Manage matchmaking configuration",
-        after_help = super::routes::category_help("matchmaking")
+        before_help = super::routes::category_help("matchmaking")
     )]
     Matchmaking(super::routes::RouteArgs),
     #[command(
         about = "Manage personalized thumbnails",
-        after_help = super::routes::category_help("thumbnail")
+        before_help = super::routes::category_help("thumbnail")
     )]
     Thumbnail(super::routes::RouteArgs),
     #[command(
         about = "Read users, inventories, and subscriptions",
-        after_help = super::routes::category_help("user")
+        before_help = super::routes::category_help("user")
     )]
     User(super::routes::RouteArgs),
     #[command(
         about = "Manage groups and memberships",
-        after_help = super::routes::category_help("group")
+        before_help = super::routes::category_help("group")
     )]
     Group(super::routes::RouteArgs),
     #[command(
         about = "Manage localized experience content",
-        after_help = super::routes::category_help("localization")
+        before_help = super::routes::category_help("localization")
     )]
     Localization(super::routes::RouteArgs),
     #[command(
         about = "Manage followed experiences",
-        after_help = super::routes::category_help("interaction")
+        before_help = super::routes::category_help("interaction")
     )]
     Interaction(super::routes::RouteArgs),
     #[command(
         about = "Manage Team Create",
-        after_help = super::routes::category_help("team")
+        before_help = super::routes::category_help("team")
     )]
     Team(super::routes::RouteArgs),
     #[command(
         about = "Manage uploaded assets",
-        after_help = super::routes::category_help("asset")
+        before_help = super::routes::category_help("asset")
     )]
     Asset(super::routes::RouteArgs),
     #[command(
         name = "creator-store",
         about = "Manage Creator Store products",
-        after_help = super::routes::category_help("creator-store")
+        before_help = super::routes::category_help("creator-store")
     )]
     CreatorStore(super::routes::RouteArgs),
     #[command(
         about = "Manage game passes",
-        after_help = super::routes::category_help("pass")
+        before_help = super::routes::category_help("pass")
     )]
     Pass(super::routes::RouteArgs),
     #[command(
         about = "Manage experience configuration repositories",
-        after_help = super::routes::category_help("config")
+        before_help = super::routes::category_help("config")
     )]
     Config(super::routes::RouteArgs),
     #[command(
         about = "Run Open Cloud Luau tasks",
-        after_help = super::routes::category_help("luau")
+        before_help = super::routes::category_help("luau")
     )]
     Luau(super::routes::RouteArgs),
     #[command(
         about = "Manage live experience servers",
-        after_help = super::routes::category_help("server")
+        before_help = super::routes::category_help("server")
     )]
     Server(super::servers::ServerArgs),
     #[command(about = "Call any Roblox Open Cloud endpoint")]
@@ -512,6 +512,11 @@ pub(crate) fn run(args: OpenCloudArgs, project: Option<&Path>) -> Result<()> {
             .map_err(cloud_error)?
         }
     };
+    let mut result = result;
+    if app::output::compact_text_output() {
+        // Open Cloud bodies carry null and empty members on every record.
+        app::output::strip_empty(&mut result);
+    }
     app::output::print_json_output(&result, false)
 }
 
