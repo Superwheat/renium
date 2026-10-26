@@ -162,7 +162,45 @@ pub(crate) fn studio_status(args: StudioStatusArgs, project: Option<&Path>) -> R
     {
         map.insert("updateAvailable".to_string(), json!(version));
     }
+    if app::output::compact_text_output() {
+        summarize_native_operations(&mut result);
+    }
     app::output::print_json_output(&result, false)
+}
+
+/// Text mode reports the native probe as verdict counts plus the operations
+/// that are not native; the per-operation readings (addresses, RVAs) stay in
+/// json mode and `rbx native-probe`.
+fn summarize_native_operations(result: &mut Value) {
+    let Some(report) = result
+        .as_object_mut()
+        .and_then(|map| map.remove("nativeOperations"))
+    else {
+        return;
+    };
+    let Some(operations) = report.get("operations").and_then(Value::as_array) else {
+        return;
+    };
+    let mut counts = serde_json::Map::new();
+    let mut fallbacks = Vec::new();
+    for operation in operations {
+        let verdict = operation["verdict"].as_str().unwrap_or("unknown");
+        let count = counts.entry(verdict.to_string()).or_insert(json!(0));
+        *count = json!(count.as_u64().unwrap_or(0) + 1);
+        if verdict != "native" {
+            fallbacks.push(json!({
+                "operation": operation["operation"],
+                "verdict": verdict,
+                "reason": operation["reason"],
+                "fallback": operation["fallback"],
+            }));
+        }
+    }
+    let mut native = Value::Object(counts);
+    if !fallbacks.is_empty() {
+        native["fallbacks"] = Value::Array(fallbacks);
+    }
+    result["native"] = native;
 }
 
 fn studio_status_result(args: &StudioStatusArgs, project: Option<&Path>) -> Result<Value> {
@@ -529,5 +567,26 @@ mod input_action_tests {
             vec![json!({ "action": "dismiss" })]
         );
         assert!(input_actions(&["press".into()]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod native_summary_tests {
+    use super::*;
+
+    #[test]
+    fn status_text_mode_keeps_verdict_counts_and_fallbacks_only() {
+        let mut result = json!({"ok": true, "nativeOperations": {"pid": 5, "readOnly": true, "operations": [
+            {"operation": "snapshot", "verdict": "native", "reason": "ok", "fallback": "plugin", "readings": {"base": 1}},
+            {"operation": "upload", "verdict": "degraded", "reason": "layout moved", "fallback": "plugin upload", "readings": {"base": 2}}
+        ]}});
+        summarize_native_operations(&mut result);
+        assert!(result.get("nativeOperations").is_none());
+        assert_eq!(
+            result["native"],
+            json!({"native": 1, "degraded": 1, "fallbacks": [
+                {"operation": "upload", "verdict": "degraded", "reason": "layout moved", "fallback": "plugin upload"}
+            ]})
+        );
     }
 }
