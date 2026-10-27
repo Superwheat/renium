@@ -151,6 +151,10 @@ impl std::fmt::Display for BridgeResponseTimeout {
 
 impl std::error::Error for BridgeResponseTimeout {}
 
+pub(crate) fn is_response_timeout(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<BridgeResponseTimeout>().is_some()
+}
+
 /// Editor methods describe or change saved Edit state, never a running
 /// simulation. Main intentionally prefers a play server for runtime commands,
 /// so an editor transaction routed there is not found on that side and the
@@ -2980,9 +2984,7 @@ impl BridgeServer {
     ) -> Result<String> {
         // A slow reply does not mean the connection died. Its ID lets the next
         // read skip it; closing the channel would cancel unrelated upload leases.
-        if error.downcast_ref::<BridgeApplicationError>().is_some()
-            || error.downcast_ref::<BridgeResponseTimeout>().is_some()
-        {
+        if error.downcast_ref::<BridgeApplicationError>().is_some() || is_response_timeout(&error) {
             return Err(error);
         }
         let error_text = format!("{error:#}");

@@ -14,40 +14,82 @@ struct SetupAttempt {
     running: bool,
     failures: u32,
     retry_at: Option<Instant>,
+    degraded_reason: Option<String>,
 }
 
 impl SetupAttempt {
     fn begin(&mut self, now: Instant) -> bool {
-        if self.running || self.retry_at.is_some_and(|at| now < at) {
+        if self.running
+            || self.degraded_reason.is_some()
+            || self.retry_at.is_some_and(|at| now < at)
+        {
             return false;
         }
         self.running = true;
         true
     }
 
-    fn failed(&mut self, now: Instant) {
+    fn failed(&mut self, now: Instant, stalled: bool) {
         self.running = false;
         self.failures = (self.failures + 1).min(6);
-        self.retry_at = Some(now + Duration::from_millis(500 << (self.failures - 1)));
+        let delay = if stalled {
+            Duration::from_secs((120 << (self.failures - 1).min(3)).min(900))
+        } else {
+            Duration::from_millis(500 << (self.failures - 1))
+        };
+        self.retry_at = Some(now + delay);
+    }
+
+    fn observe_probe(&mut self, report: &Value) -> Option<String> {
+        let reason = report["operations"].as_array().and_then(|rows| {
+            rows.iter()
+                .find(|row| {
+                    row["operation"] == "playTeleportLaunch" && row["verdict"] == "degraded"
+                })
+                .map(|row| {
+                    row["reason"]
+                        .as_str()
+                        .unwrap_or("Native launch is unavailable")
+                        .to_owned()
+                })
+        });
+        if reason == self.degraded_reason {
+            return None;
+        }
+        if self.degraded_reason.is_some() && reason.is_none() {
+            self.failures = 0;
+            self.retry_at = None;
+        }
+        self.degraded_reason = reason.clone();
+        reason
     }
 }
 
-fn begin_setup(runtime: &str) -> bool {
-    ATTEMPTS
-        .get_or_init(Default::default)
-        .lock_recover()
-        .entry(runtime.to_owned())
-        .or_default()
-        .begin(Instant::now())
+fn begin_setup(runtime: &str, pid: Option<u64>) -> bool {
+    let report = pid
+        .and_then(|pid| u32::try_from(pid).ok())
+        .map(crate::studio::native::serializer::probes::cached)
+        .unwrap_or(Value::Null);
+    let mut attempts = ATTEMPTS.get_or_init(Default::default).lock_recover();
+    let attempt = attempts.entry(runtime.to_owned()).or_default();
+    if let Some(reason) = attempt.observe_probe(&report) {
+        crate::app::output::log_global(
+            3,
+            format_args!(
+                "[renium] automatic teleport setup skipped for {runtime}: {reason}; waiting for the native probe to change"
+            ),
+        );
+    }
+    attempt.begin(Instant::now())
 }
 
 fn finish_setup(runtime: &str, result: Result<()>) {
     let mut attempts = ATTEMPTS.get().unwrap().lock_recover();
     if let Err(error) = result {
-        attempts
-            .entry(runtime.to_owned())
-            .or_default()
-            .failed(Instant::now());
+        attempts.entry(runtime.to_owned()).or_default().failed(
+            Instant::now(),
+            crate::studio::bridge::is_response_timeout(&error),
+        );
         crate::app::output::log_global(
             2,
             format_args!("[renium] automatic teleport setup will retry for {runtime}: {error:#}"),
@@ -214,7 +256,7 @@ pub(crate) fn start_manual(bridge: &Arc<BridgeServer>, state: &State) {
                     && peer["placeId"] == row["placeId"]
                     && peer["gameId"] == row["gameId"]
             }))
-            || !begin_setup(runtime)
+            || !begin_setup(runtime, row["pid"].as_u64())
         {
             continue;
         }
@@ -240,12 +282,15 @@ fn prepare_idle(bridge: &Arc<BridgeServer>, rows: &[Value], contexts: &[BoundCon
         let Some(owner) = context.runtime_id.as_deref() else {
             continue;
         };
-        if !rows.iter().any(|row| {
+        let Some(edit) = rows.iter().find(|row| {
             row["role"] == "edit"
                 && row["runtimeId"] == owner
                 && row["placeId"].as_i64().is_some_and(|id| id > 0)
                 && row["gameId"].as_i64().is_some_and(|id| id > 0)
-        }) || rows
+        }) else {
+            continue;
+        };
+        if rows
             .iter()
             .any(|row| row["role"] == "play-server" && row["launchEditRuntimeId"] == owner)
             || registered(owner)
@@ -253,7 +298,7 @@ fn prepare_idle(bridge: &Arc<BridgeServer>, rows: &[Value], contexts: &[BoundCon
                 .get_or_init(Default::default)
                 .lock_recover()
                 .contains_key(owner)
-            || !begin_setup(owner)
+            || !begin_setup(owner, edit["pid"].as_u64())
         {
             continue;
         }
@@ -581,7 +626,7 @@ mod tests {
         for failure in 0..20 {
             assert!(attempt.begin(now));
             assert!(!attempt.begin(now + Duration::from_secs(60)));
-            attempt.failed(now);
+            attempt.failed(now, false);
             let delay = Duration::from_millis(500 << failure.min(5));
             assert!(!attempt.begin(now + delay - Duration::from_millis(1)));
             now += delay;
@@ -590,6 +635,41 @@ mod tests {
             attempt.begin(now),
             "a transient error must never permanently disable setup"
         );
+    }
+
+    #[test]
+    fn automatic_teleport_waits_for_a_changed_probe_or_new_runtime() {
+        let now = Instant::now();
+        let degraded = json!({"operations":[{"operation":"playTeleportLaunch", "verdict":"degraded", "reason":"serializer unavailable"}]});
+        let mut attempt = SetupAttempt::default();
+        assert_eq!(
+            attempt.observe_probe(&degraded).as_deref(),
+            Some("serializer unavailable")
+        );
+        for seconds in [0, 16, 120, 3600] {
+            assert!(attempt.observe_probe(&degraded).is_none(), "log only once");
+            assert!(!attempt.begin(now + Duration::from_secs(seconds)));
+        }
+        let native = json!({"operations":[{"operation":"playTeleportLaunch", "verdict":"native"}]});
+        assert!(attempt.observe_probe(&native).is_none());
+        assert!(attempt.begin(now));
+        assert!(
+            SetupAttempt::default().begin(now),
+            "a restarted runtime gets a fresh attempt"
+        );
+    }
+
+    #[test]
+    fn automatic_teleport_backs_off_stalled_studios_for_minutes() {
+        let mut attempt = SetupAttempt::default();
+        let mut now = Instant::now();
+        for delay in [120, 240, 480, 900, 900] {
+            assert!(attempt.begin(now));
+            attempt.failed(now, true);
+            assert!(!attempt.begin(now + Duration::from_secs(delay - 1)));
+            now += Duration::from_secs(delay);
+        }
+        assert!(attempt.begin(now));
     }
 
     #[test]

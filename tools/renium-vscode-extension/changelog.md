@@ -15,6 +15,7 @@
 
 ### Bug fixes
 
+- Automatic Play teleport setup stops retrying a known unavailable native hook and gives stalled Studios several minutes to recover after a timeout.
 - Restore native serialization on Studio 0.745 so Live Sync and multi-client playtest setup can use the native path again.
 - The daemon removes the control key files of daemons that have exited, instead of leaving one `control-PORT.key` behind in the private folder for every port it ever used.
 - `rbx lk` and `rbx wally` report changed settings ids as `Service/ID`, and `rbx push -I` keeps such an id to that service; a bare id still selects that instance in every store. Ids are numbered per store, so a push given the 70,000 ids of thirteen links also matched same-numbered instances in other services, pushed instances outside every link target, and failed on a Wire whose SourceInstance pointed at an instance that is not in Studio.
