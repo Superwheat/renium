@@ -28,6 +28,38 @@ use crate::system::LockRecover;
 use crate::system::files::OnDrop;
 
 const NOTICE: &str = "Content emulation retains the source engine context; use ReniumTeleport for emulated destination data. Stop Play returns to the original Edit document.";
+const MULTIPLAYER_NATIVE_REQUIRED: &str = "Server & Clients teleport requires a verified native hook on Windows or macOS; the compatibility adapter supports solo Play only";
+
+fn require_multiplayer_native(available: bool) -> Result<()> {
+    ensure!(available, "{MULTIPLAYER_NATIVE_REQUIRED}");
+    Ok(())
+}
+
+pub(crate) fn preflight_multiplayer(
+    bridge: &BridgeServer,
+    owner: &str,
+    prefer_native: bool,
+) -> Result<()> {
+    require_multiplayer_native(prefer_native && cfg!(any(windows, target_os = "macos")))?;
+    // Windows exposes the read-only launch probe. macOS validates dispatch at
+    // installation; its public PlayTeleportLaunch probe is not implemented.
+    #[cfg(windows)]
+    {
+        use crate::studio::native::serializer::{probes, target_name};
+        let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, owner)?;
+        let title = target_name(pid, "")?;
+        if let Err(error) = probes::run(pid, &title, probes::NativeOperation::PlayTeleportLaunch) {
+            crate::app::output::log_global(
+                3,
+                format_args!("[renium] multiplayer native preflight failed: {error:#}"),
+            );
+            require_multiplayer_native(false)?;
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (bridge, owner);
+    Ok(())
+}
 
 #[derive(Clone)]
 struct Session {
@@ -397,10 +429,9 @@ pub(crate) fn enable_runtime(
     session.prefer_native = prefer_native;
     session.multiplayer = bridge.studio_pid_for_runtime(BridgeTarget::Server, runtime)?
         != bridge.studio_pid_for_runtime(BridgeTarget::Edit, &session.owner)?;
-    ensure!(
-        !session.multiplayer || cfg!(any(windows, target_os = "macos")) && prefer_native,
-        "Server & Clients travel requires native teleport on Windows or macOS"
-    );
+    if session.multiplayer {
+        require_multiplayer_native(cfg!(any(windows, target_os = "macos")) && prefer_native)?;
+    }
     session.clients(&inventory)?;
     {
         let mut registry = SESSIONS.get_or_init(Default::default).lock_recover();
@@ -442,11 +473,14 @@ pub(crate) fn enable_runtime(
     }
     let prefer_native = session.prefer_native;
     let mut registry = SESSIONS.get().unwrap().lock_recover();
-    if !native && (require_native_trigger || !compatibility) {
+    if !native && (session.multiplayer || require_native_trigger || !compatibility) {
         registry.retire(&session.owner, &session.root_nonce);
+        if session.multiplayer {
+            require_multiplayer_native(false)?;
+        }
         ensure!(
             !require_native_trigger,
-            "The native teleport hook is unavailable; automatic setup will retry"
+            "Native teleport is unavailable; automatic setup waits for a successful native probe"
         );
         anyhow::bail!(
             "{}",
@@ -802,6 +836,19 @@ fn watch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multiplayer_rejects_compatibility_before_contacting_studio() {
+        let bridge = crate::studio::bridge::routing_tests::fixture();
+        let error = preflight_multiplayer(&bridge, "unconnected-edit", false).unwrap_err();
+        assert_eq!(error.to_string(), MULTIPLAYER_NATIVE_REQUIRED);
+        assert_eq!(
+            require_multiplayer_native(false).unwrap_err().to_string(),
+            error.to_string(),
+            "a degraded dispatch has the same actionable error as disabled native travel"
+        );
+        require_multiplayer_native(true).unwrap();
+    }
 
     #[test]
     fn loading_screen_failure_cannot_abort_travel_or_hide_a_real_failure() {

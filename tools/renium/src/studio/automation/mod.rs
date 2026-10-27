@@ -1695,6 +1695,15 @@ fn start_attempt(
     teleport: Option<bool>,
 ) -> Result<AttemptOutcome> {
     let launch = new_play_launch(bridge, plan.label())?;
+    if plan.players().is_some()
+        && let Some(prefer_native) = teleport
+    {
+        crate::studio::teleport::preflight_multiplayer(
+            bridge,
+            &launch.edit_runtime_id,
+            prefer_native,
+        )?;
+    }
     let mut device_simulation = studio_device_status(bridge)?;
     let waited = Instant::now();
     let mut existing = wait_for_studio_play_ready(bridge, &launch.edit_runtime_id)?;

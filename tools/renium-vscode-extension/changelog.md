@@ -15,6 +15,7 @@
 
 ### Bug fixes
 
+- Server & Clients teleport now reports an unavailable native hook before starting the test and explains that compatibility travel supports solo Play only.
 - Device simulation reports stalled Studio service calls promptly, so a failed device change does not leave later bridge requests waiting indefinitely.
 - Automatic Play teleport setup stops retrying a known unavailable native hook and gives stalled Studios several minutes to recover after a timeout.
 - Restore native serialization on Studio 0.745 so Live Sync and multi-client playtest setup can use the native path again.
