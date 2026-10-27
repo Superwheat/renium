@@ -15,6 +15,7 @@
 
 ### Bug fixes
 
+- Large plugin fallback exports and sync batches yield regularly to keep Studio's controls and built-in plugins responsive.
 - Server & Clients teleport now reports an unavailable native hook before starting the test and explains that compatibility travel supports solo Play only.
 - Device simulation reports stalled Studio service calls promptly, so a failed device change does not leave later bridge requests waiting indefinitely.
 - Automatic Play teleport setup stops retrying a known unavailable native hook and gives stalled Studios several minutes to recover after a timeout.

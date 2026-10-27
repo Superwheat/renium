@@ -3,6 +3,7 @@ local BridgeEditorSync = {}
 local BridgeCandidateMatch = require(script.Parent.BridgeCandidateMatch)
 local BridgeConnection = require(script.Parent.BridgeConnection)
 local BridgeIdentity = require(script.Parent.BridgeIdentity)
+local BridgeParallel = require(script.Parent.BridgeParallel)
 
 -- Attributes Studio writes for itself (reimport tracking, migrations) are neither
 -- authored nor retained through a sync.
@@ -2222,6 +2223,9 @@ local function removeUnknownInstances(
 	local removedCount = 0
 	local pathSnapshot = BridgeIdentity.newPathSnapshot()
 	for _, instance in descendants do
+		if ctx.yieldForBudget and ctx.yieldForBudget() then
+			pathSnapshot = BridgeIdentity.newPathSnapshot()
+		end
 		local pathSegments, pathOrdinals = BridgeIdentity.getRefPathParts(instance, pathSnapshot)
 		local key = if pathSegments then pathCacheKey(pathSegments, pathOrdinals) else ""
 		if
@@ -2247,6 +2251,7 @@ local function removeUnknownInstances(
 		end
 	end
 	for instance in unknown do
+		if ctx.yieldForBudget then ctx.yieldForBudget() end
 		if not unknown[instance.Parent] then
 			removeInstanceForUndo(instance, ctx)
 		end
@@ -2291,6 +2296,7 @@ local function applyInstanceReconcile(
 	local resolvedEntries = {}
 	local claimedInstances = {}
 	for _, entry in ipairs(desiredEntries) do
+		if ctx.yieldForBudget then ctx.yieldForBudget() end
 		desiredKeys[entry.key] = true
 		local instance = syncDesiredEntry(entry, service.Name, ctx, stats, resolvedEntries, claimedInstances, true)
 		if instance ~= nil then
@@ -2392,6 +2398,7 @@ local function applyInstanceReconcileChunk(
 	local entries = sortedInstanceEntries(change, service.Name)
 	local newEntries = 0
 	for _, entry in ipairs(entries) do
+		if ctx.yieldForBudget then ctx.yieldForBudget() end
 		if not session.desiredKeys[entry.key] then
 			newEntries += 1
 		end
@@ -2402,6 +2409,7 @@ local function applyInstanceReconcileChunk(
 	end
 	session.entryCount += newEntries
 	for _, entry in ipairs(entries) do
+		if ctx.yieldForBudget then ctx.yieldForBudget() end
 		session.desiredKeys[entry.key] = true
 		local instance = syncDesiredEntry(
 			entry,
@@ -2468,6 +2476,7 @@ local function applyInstanceUpserts(
 	local createMissing = liveHydrateEnabled(ctx)
 	local verified = 0
 	for _, entry in ipairs(entries) do
+		if ctx.yieldForBudget then ctx.yieldForBudget() end
 		if #entry.previousPathSegments > 0 then
 			local instance = resolveEntryInstance(entry, service.Name, ctx, resolvedEntries, claimedInstances)
 			if instance == nil then
@@ -2480,6 +2489,7 @@ local function applyInstanceUpserts(
 		end
 	end
 	for _, entry in ipairs(entries) do
+		if ctx.yieldForBudget then ctx.yieldForBudget() end
 		local instance = syncDesiredEntry(entry, service.Name, ctx, stats, resolvedEntries, claimedInstances, createMissing)
 		if instance ~= nil and instance.ClassName == entry.className
 			and instance.Name == entry.pathSegments[#entry.pathSegments]
@@ -2515,6 +2525,7 @@ local function applyInstanceDeletes(
 	local resolvedEntries = {}
 	local claimedInstances = {}
 	for _, entry in ipairs(sortedInstanceEntries(change, service.Name)) do
+		if ctx.yieldForBudget then ctx.yieldForBudget() end
 		if #entry.pathSegments <= 1 then
 			error("Refusing to delete service root: " .. entry.key)
 		end
@@ -2538,6 +2549,7 @@ local function applyInstanceDeletes(
 		end
 	end
 	for _, instance in ipairs(targets) do
+		if ctx.yieldForBudget then ctx.yieldForBudget() end
 		removeInstanceForUndo(instance, ctx)
 		if instance.Parent ~= nil then
 			error(`Studio did not remove {instance:GetFullName()}`)
@@ -3678,19 +3690,24 @@ local function mutationNeedsStructuralSnapshot(params: { [string]: any }, ctx: {
 end
 
 local function captureSnapshotRoots(groups: { any }): ({ [string]: Instance }, { Instance }, { Instance }, number)
+	local yieldForBudget = BridgeParallel.newWorkBudget()
 	local originalByPath = {}
 	local originalRoots = {}
 	local nonArchivable = {}
 	local instanceCount = 0
 	for _, group in ipairs(groups) do
+		yieldForBudget()
 		for _, child in ipairs(group.target:GetChildren()) do
+			yieldForBudget()
 			if not group.preserved[child] then
 				originalRoots[#originalRoots + 1] = child
 				local instances = { child }
 				for _, descendant in ipairs(child:GetDescendants()) do
+					yieldForBudget()
 					instances[#instances + 1] = descendant
 				end
 				for _, instance in ipairs(instances) do
+					yieldForBudget()
 					instanceCount += 1
 					if not instance.Archivable then
 						nonArchivable[#nonArchivable + 1] = instance
@@ -3707,8 +3724,10 @@ local function captureSnapshotRoots(groups: { any }): ({ [string]: Instance }, {
 end
 
 local function captureMutationFingerprints(groups: { any }): { [string]: any }
+	local yieldForBudget = BridgeParallel.newWorkBudget()
 	local fingerprints = {}
 	for _, group in ipairs(groups) do
+		yieldForBudget()
 		local fingerprint = fingerprints[group.serviceName]
 		if fingerprint == nil then
 			fingerprint = { count = 0, entries = {} }
@@ -3722,9 +3741,11 @@ local function captureMutationFingerprints(groups: { any }): { [string]: any }
 		end
 		record(group.target)
 		for _, child in ipairs(group.target:GetChildren()) do
+			yieldForBudget()
 			if not group.preserved[child] then
 				record(child)
 				for _, descendant in ipairs(child:GetDescendants()) do
+					yieldForBudget()
 					record(descendant)
 				end
 			end
@@ -6325,6 +6346,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 	end
 
 	local function runWithSessionOwnership(operationGeneration, cancellationCheck, operation, ...)
+		if ctx.yieldForBudget then ctx.yieldForBudget() end
 		assertSessionOwnership(operationGeneration)
 		cancellationCheck()
 		local results = table.pack(pcall(operation, ...))
@@ -9505,6 +9527,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local previousResolveStagedPath = ctx.resolveStagedPath
 		local previousEditorTransaction = ctx.editorTransaction
 		local previousAssertEditorMutationActive = ctx.assertEditorMutationActive
+		local previousYieldForBudget = ctx.yieldForBudget
 		local explorerSelection = captureExplorerSelection()
 		local selectionReplacements = {}
 		ctx.resolveCache = {}
@@ -9524,6 +9547,12 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					error("Editor transaction is no longer active")
 				end
 			end
+		end
+		local yieldForBudget = BridgeParallel.newWorkBudget()
+		ctx.yieldForBudget = function()
+			local yielded = yieldForBudget()
+			if yielded then ctx.assertEditorMutationActive() end
+			return yielded
 		end
 		local activeSnapshot = if outerTransaction ~= nil then outerTransaction.snapshot else transactionSnapshot
 		ctx.unreadablePropertyNames = if activeSnapshot ~= nil then activeSnapshot.unreadablePropertyNames else nil
@@ -9606,16 +9635,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local propertyChanges = params.propertyChanges
 		if not aborted and type(propertyChanges) == "table" then
 			if not aborted then
-				local sliceStarted = os.clock()
 				for _, change in ipairs(propertyChanges) do
 					if not runStep(applyPropertyChange, change, ctx, stats, touchedServices) then
 						break
-					end
-					if os.clock() - sliceStarted >= 0.008 then
-						task.wait()
-						assertSessionOwnership(operationGeneration)
-						assertReconcileActive()
-						sliceStarted = os.clock()
 					end
 				end
 			end
@@ -9699,6 +9721,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		ctx.resolveStagedPath = previousResolveStagedPath
 		ctx.editorTransaction = previousEditorTransaction
 		ctx.assertEditorMutationActive = previousAssertEditorMutationActive
+		ctx.yieldForBudget = previousYieldForBudget
 		ctx.stats.requests += 1
 		ctx.stats.lastMs = stats.lastMs
 		ctx.stats.lastAtUnix = os.time()

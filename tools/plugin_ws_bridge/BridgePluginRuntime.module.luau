@@ -3003,12 +3003,14 @@ function BridgePluginRuntime.start(context)
 		nativeScriptSourcesOverride: { [Instance]: string }?,
 		nativeInstancesOverride: { Instance }?
 	): ({ [string]: any }?, ServiceState)
+		local yieldForBudget = ParallelModule.newWorkBudget()
 		if not ALLOWED_SERVICES[serviceName] then
 			error("Unsupported service: " .. tostring(serviceName))
 		end
 		local service = game:GetService(serviceName)
 
 		local nativeExport = nativeExportOnly == true
+		local generation = Config.studioChanges.serviceGeneration(serviceName)
 		local snapshotInstances = if nativeExport and nativeSnapshot then nativeSnapshot.instances else nil
 		local providedInstances = snapshotInstances
 		if providedInstances == nil and nativeExport and nativeInstancesOverride and nativeInstancesOverride[1] == service then
@@ -3021,6 +3023,7 @@ function BridgePluginRuntime.start(context)
 			local includedCount = 0
 			if #excludedRoots == 0 then
 				for index = 1, descendantCount do
+					yieldForBudget()
 					local instance = descendants[index]
 					if not isNeverSerialized(instance) then
 						includedCount += 1
@@ -3030,9 +3033,11 @@ function BridgePluginRuntime.start(context)
 			else
 				local excludedByInstance = {}
 				for _, root in ipairs(excludedRoots) do
+					yieldForBudget()
 					excludedByInstance[root] = true
 				end
 				for index = 1, descendantCount do
+					yieldForBudget()
 					local instance = descendants[index]
 					local excluded = excludedByInstance[instance] == true
 						or excludedByInstance[instance.Parent] == true
@@ -3045,6 +3050,7 @@ function BridgePluginRuntime.start(context)
 				end
 			end
 			for index = includedCount + 1, descendantCount do
+				yieldForBudget()
 				descendants[index] = nil
 			end
 		end
@@ -3117,6 +3123,7 @@ function BridgePluginRuntime.start(context)
 
 		local firstDescendant = if providedInstances then 2 else 1
 		for descendantIndex = firstDescendant, #descendants do
+			yieldForBudget()
 			local inst = descendants[descendantIndex]
 			instanceCount += 1
 			instances[instanceCount] = inst
@@ -3179,6 +3186,7 @@ function BridgePluginRuntime.start(context)
 		local nativeDebugIds = if nativeSnapshot then nativeSnapshot.debugIds else nil
 		if nativeDebugIds ~= nil and #instances > 0 then
 			for _, sampleIndex in ipairs({ 1, math.max(1, math.floor(#instances / 2)), #instances }) do
+				yieldForBudget()
 				local sampled = instances[sampleIndex]
 				if sampled ~= nil and nativeDebugIds[sampleIndex] ~= sampled:GetDebugId(32) then
 					warn("[renium] native debug ids do not match the exported tree; reading them directly")
@@ -3236,8 +3244,8 @@ function BridgePluginRuntime.start(context)
 			return nil, state
 		end
 
-		stateByService[serviceName] = state
 		for _, index in ipairs(unresolvedParentIndices) do
+			yieldForBudget()
 			local parent = instances[index].Parent
 			if parent ~= nil and parent ~= game then
 				parentIndexByIndex[index] = instanceIdByInstance[parent] or false
@@ -3246,8 +3254,13 @@ function BridgePluginRuntime.start(context)
 			end
 		end
 		for _, inst in ipairs(scriptObjects) do
+			yieldForBudget()
 			IdentityModule.getCachedScriptSourceKey(state, inst)
 		end
+		if Config.studioChanges.serviceGeneration(serviceName) ~= generation then
+			error(`Studio changed {serviceName} while preparing the export; retry the sync`)
+		end
+		stateByService[serviceName] = state
 		return {
 			instanceCount = instanceCount,
 			scriptCount = scriptCount,
@@ -3545,6 +3558,8 @@ function BridgePluginRuntime.start(context)
 		overlayCacheKey: string?,
 		stateOverride: ServiceState?
 	): (string, number)
+		local yieldForBudget = ParallelModule.newWorkBudget()
+		local generation = Config.studioChanges.serviceGeneration(serviceName)
 		local state = stateOverride or getState(serviceName)
 		local includeStableIds = not not stableIdsEnabled
 		if refreshMatchedSettingsIds(state) then
@@ -3598,6 +3613,7 @@ function BridgePluginRuntime.start(context)
 				local candidateCount = 0
 				local selectionOnly = true
 				for _, className in ipairs(state.classNames) do
+					yieldForBudget()
 					local hotSchema =
 						Config.getNativeOverlayHotSchema(state, className, overlayPropertiesByClass[className])
 					overlayHotSchemaByClass[className] = hotSchema
@@ -3632,18 +3648,22 @@ function BridgePluginRuntime.start(context)
 			local debugIds = if includeStableIds and not nativeDebugIdData then table.create(count) else nil
 			if snapshotDebugIds then
 				for offset = 1, count do
+					yieldForBudget()
 					nativeDebugIdData[offset] = snapshotDebugIds[startPos + offset - 1] or ""
 				end
 			elseif nativeDebugIdData and not precomputedNativeDebugIds then
 				for offset = 1, count do
+					yieldForBudget()
 					Config.writeNativeOverlayDebugId(instances[startPos + offset - 1], nativeDebugIdData, offset)
 				end
 			end
 			if nativeRefCandidateSchemas then
 				for _, candidateSchema in ipairs(nativeRefCandidateSchemas) do
+					yieldForBudget()
 					local className = candidateSchema.className
 					local hotSchema = candidateSchema.hotSchema
 					for _, i in ipairs(hotSchema.nativeRefCandidateIndices) do
+						yieldForBudget()
 						if state.nativeSnapshotRoot and i == 1 then
 							continue
 						end
@@ -3679,6 +3699,7 @@ function BridgePluginRuntime.start(context)
 					local lastClassName = nil
 					local lastHotSchema = nil
 					for offset = startOffset, endOffset do
+						yieldForBudget()
 						local i = startPos + offset - 1
 						if state.nativeSnapshotRoot and i == 1 then
 							continue
@@ -3752,6 +3773,9 @@ function BridgePluginRuntime.start(context)
 		end
 		if not ok then
 			error(payload, 0)
+		end
+		if not state.nativeExportOnly and Config.studioChanges.serviceGeneration(serviceName) ~= generation then
+			error(`Studio changed {serviceName} while serializing the export; retry the sync`)
 		end
 		local encoded, encodeMs = ChunkingModule.jsonEncodeTimed(payload)
 
