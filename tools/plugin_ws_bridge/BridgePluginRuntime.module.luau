@@ -421,8 +421,8 @@ function BridgePluginRuntime.start(context)
 		cancelExpectedEvent = Config.studioChanges.cancelExpectedEvent,
 		studioChangeGeneration = Config.studioChanges.serviceGeneration,
 		describeJournalChange = Config.studioChanges.describeJournalChange,
-		assertRequestLeaseActive = function()
-			editorSync.assertCurrentRequestLeaseActive()
+		assertRequestLeaseActive = function(requestThread)
+			editorSync.assertCurrentRequestLeaseActive(requestThread)
 		end,
 	})
 	Config.creatorApi = requireChildModule("BridgeCreatorApi").create({

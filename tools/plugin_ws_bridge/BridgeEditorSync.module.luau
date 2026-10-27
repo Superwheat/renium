@@ -5540,8 +5540,8 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		end
 	end
 
-	local function currentRequestLeaseId(): string?
-		return currentRequestLeaseByThread[coroutine.running()]
+	local function currentRequestLeaseId(requestThread: thread?): string?
+		return currentRequestLeaseByThread[requestThread or coroutine.running()]
 	end
 
 	local function assertRequestLeaseActive(leaseId: string?)
@@ -5556,8 +5556,8 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		end
 	end
 
-	function api.assertCurrentRequestLeaseActive()
-		assertRequestLeaseActive(currentRequestLeaseId())
+	function api.assertCurrentRequestLeaseActive(requestThread: thread?)
+		assertRequestLeaseActive(currentRequestLeaseId(requestThread))
 	end
 
 	function api.withRequestLease(leaseId: string?, allowCancelled: boolean, operation, ...)

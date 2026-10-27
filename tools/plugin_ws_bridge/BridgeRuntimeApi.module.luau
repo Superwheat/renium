@@ -548,11 +548,11 @@ function BridgeRuntimeApi.create(plugin, runtimeContext)
 		table.clear(sharedHeldKeys)
 	end
 
-	local function assertOperationOwnership(operationGeneration, sessionGeneration)
+	local function assertOperationOwnership(operationGeneration, sessionGeneration, requestThread)
 		if operationGeneration ~= cancellationGeneration then
 			error("Renium operation was cancelled")
 		end
-		runtimeContext.assertRequestLeaseActive()
+		runtimeContext.assertRequestLeaseActive(requestThread)
 		runtimeContext.assertSessionOwnership(sessionGeneration)
 	end
 
@@ -2438,18 +2438,32 @@ updateMouse()
 		return { ok = true, action = action }
 	end
 
-	function api.deviceSimulator(params)
+	local function runDeviceSimulator(params, requestThread, operation)
 		local operationGeneration = cancellationGeneration
-		assertOperationOwnership(operationGeneration)
+		local function assertDeviceActive()
+			assert(not operation.cancelled, "Device simulation request expired")
+			assertOperationOwnership(operationGeneration, nil, requestThread)
+		end
+		assertDeviceActive()
 		local action = string.lower(tostring(params.action or "status"))
-		local service = game:GetService("StudioDeviceSimulatorService")
+		local engineService = game:GetService("StudioDeviceSimulatorService")
+		-- Even if Studio refuses coroutine cancellation while an Async call is
+		-- suspended, its eventual return cannot start another setter or rollback.
+		local service = setmetatable({}, { __index = function(_, method)
+			return function(_, ...)
+				assertDeviceActive()
+				local values = table.pack(engineService[method](engineService, ...))
+				assertDeviceActive()
+				return table.unpack(values, 1, values.n)
+			end
+		end })
 		if action ~= "list" and action ~= "capture-status" and api.isPlayModeRunning() then
 			return { ok = false, error = "Stop Play before reading or changing device simulation" }
 		end
 		if params.waitForStartup == true then
 			while os.clock() < deviceSimulatorReadyAt do
 				RunService.Heartbeat:Wait()
-				assertOperationOwnership(operationGeneration)
+				assertDeviceActive()
 			end
 		end
 
@@ -2490,6 +2504,7 @@ updateMouse()
 
 		local function status()
 			local function remember(result)
+				assertDeviceActive()
 				deviceSimulatorStatusCache = table.clone(result)
 				return result
 			end
@@ -2651,14 +2666,14 @@ updateMouse()
 				}
 			end
 			local okStop, resultOrError = xpcall(function()
-				assertOperationOwnership(operationGeneration)
+				assertDeviceActive()
 				service:StopSimulationAsync()
-				assertOperationOwnership(operationGeneration)
+				assertDeviceActive()
 				local after = status()
 				local deadline = os.clock() + 1
 				while after.ok and after.simulating and os.clock() < deadline do
 					RunService.Heartbeat:Wait()
-					assertOperationOwnership(operationGeneration)
+					assertDeviceActive()
 					after = status()
 				end
 				if not after.ok then
@@ -2673,6 +2688,7 @@ updateMouse()
 			if okStop then
 				return resultOrError
 			end
+			assertDeviceActive()
 			local okRestore, restoreError = pcall(function()
 				if configurationBefore ~= nil then
 					service:SetDeviceAsync(configurationBefore.deviceId)
@@ -2682,6 +2698,7 @@ updateMouse()
 					service:SetPixelDensityAsync(configurationBefore.pixelDensity)
 				end
 			end)
+			assertDeviceActive()
 			deviceSimulatorReadyAt = readyAtBefore
 			status()
 			if not okRestore then
@@ -2782,33 +2799,33 @@ updateMouse()
 		local changed = {}
 		local okApply, resultOrError = xpcall(function()
 			if selectedDevice ~= nil then
-				assertOperationOwnership(operationGeneration)
+				assertDeviceActive()
 				service:SetDeviceAsync(selectedDevice.id)
-				assertOperationOwnership(operationGeneration)
+				assertDeviceActive()
 				changed[#changed + 1] = "device"
 			end
 			if orientation ~= nil then
-				assertOperationOwnership(operationGeneration)
+				assertDeviceActive()
 				service:SetOrientationAsync(orientation)
-				assertOperationOwnership(operationGeneration)
+				assertDeviceActive()
 				changed[#changed + 1] = "orientation"
 			end
 			if scalingMode ~= nil then
-				assertOperationOwnership(operationGeneration)
+				assertDeviceActive()
 				service:SetScalingModeAsync(scalingMode)
-				assertOperationOwnership(operationGeneration)
+				assertDeviceActive()
 				changed[#changed + 1] = "scalingMode"
 			end
 			if width then
-				assertOperationOwnership(operationGeneration)
+				assertDeviceActive()
 				service:SetResolutionAsync(math.floor(width), math.floor(height))
-				assertOperationOwnership(operationGeneration)
+				assertDeviceActive()
 				changed[#changed + 1] = "resolution"
 			end
 			if density then
-				assertOperationOwnership(operationGeneration)
+				assertDeviceActive()
 				service:SetPixelDensityAsync(density)
-				assertOperationOwnership(operationGeneration)
+				assertDeviceActive()
 				changed[#changed + 1] = "pixelDensity"
 			end
 
@@ -2827,13 +2844,13 @@ updateMouse()
 						break
 					end
 					RunService.Heartbeat:Wait()
-					assertOperationOwnership(operationGeneration)
+					assertDeviceActive()
 				end
 			end
 			deviceSimulatorReadyAt = os.clock() + 4
 
 			local result = status()
-			assertOperationOwnership(operationGeneration)
+			assertDeviceActive()
 			result.action = "set"
 			result.changed = changed
 			return result
@@ -2842,6 +2859,7 @@ updateMouse()
 			return resultOrError
 		end
 
+		assertDeviceActive()
 		local okRestore, restoreError = pcall(function()
 			if configurationBefore == nil then
 				if selectedDevice ~= nil then
@@ -2855,12 +2873,57 @@ updateMouse()
 				service:SetPixelDensityAsync(configurationBefore.pixelDensity)
 			end
 		end)
+		assertDeviceActive()
 		deviceSimulatorReadyAt = readyAtBefore
 		status()
 		if not okRestore then
 			error(tostring(resultOrError) .. "; device simulator rollback failed: " .. tostring(restoreError), 0)
 		end
 		error(resultOrError, 0)
+	end
+
+	function api.deviceSimulator(params)
+		-- Studio's device service can leave an Async call suspended indefinitely.
+		-- Reply before the bridge's two-second timeout and retire the worker so
+		-- it cannot resume the remaining setters or rollback after a later call.
+		local deadline = os.clock() + 1.5
+		local operationGeneration = cancellationGeneration
+		assertOperationOwnership(operationGeneration)
+		local result = nil
+		local finishedAt = nil
+		local requestThread = coroutine.running()
+		local operation = { cancelled = false }
+		local worker = task.spawn(function()
+			result = table.pack(pcall(runDeviceSimulator, params, requestThread, operation))
+			finishedAt = os.clock()
+		end)
+		local cancellationError = nil
+		while result == nil and os.clock() < deadline do
+			RunService.Heartbeat:Wait()
+			local owned, message = pcall(assertOperationOwnership, operationGeneration)
+			if not owned then
+				cancellationError = tostring(message)
+				break
+			end
+		end
+		if result == nil or finishedAt > deadline or cancellationError ~= nil then
+			operation.cancelled = true
+			if coroutine.status(worker) ~= "dead" then
+				pcall(task.cancel, worker)
+			end
+			deviceSimulatorReadyAt = 0
+			deviceSimulatorStatusCache = nil
+			return {
+				ok = false,
+				error = cancellationError or "Studio device simulation timed out after 1.5s; its state may have changed",
+				timedOut = cancellationError == nil,
+			}
+		end
+		if not result[1] then
+			deviceSimulatorReadyAt = 0
+			return { ok = false, error = tostring(result[2]) }
+		end
+		return result[2]
 	end
 
 	function api.executeLuau(params)

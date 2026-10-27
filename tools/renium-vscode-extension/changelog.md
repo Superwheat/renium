@@ -15,6 +15,7 @@
 
 ### Bug fixes
 
+- Device simulation reports stalled Studio service calls promptly, so a failed device change does not leave later bridge requests waiting indefinitely.
 - Automatic Play teleport setup stops retrying a known unavailable native hook and gives stalled Studios several minutes to recover after a timeout.
 - Restore native serialization on Studio 0.745 so Live Sync and multi-client playtest setup can use the native path again.
 - The daemon removes the control key files of daemons that have exited, instead of leaving one `control-PORT.key` behind in the private folder for every port it ever used.
