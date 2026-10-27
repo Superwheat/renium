@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Bug fixes
+
+- `rbx play -s -p N` refuses Server & Clients travel on Studio 0.745 with a one-line reason instead of launching: the native launch passes every read-only probe on that build and still closes Studio. Solo Play and Studio's own Test tab keep working; the launch is re-enabled once it is verified on 0.745.
+- The Server & Clients preflight error names the native probe's reason (an unpublished place, a failed structural check) instead of the generic native-hook sentence.
+
 ## 0.5.3 - 2026-10-27
 
 ### Improvements

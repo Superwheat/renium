@@ -35,6 +35,19 @@ fn require_multiplayer_native(available: bool) -> Result<()> {
     Ok(())
 }
 
+/// Newest Studio build whose native Server & Clients launch is verified. Studio
+/// 0.745 passes every read-only probe and still exits during the launch, so
+/// newer builds refuse multiplayer travel until the launch is verified again.
+const MULTIPLAYER_LAUNCH_VERIFIED_BUILD: u32 = 744;
+
+fn require_verified_launch_build(build: u32) -> Result<()> {
+    ensure!(
+        build <= MULTIPLAYER_LAUNCH_VERIFIED_BUILD,
+        "Server & Clients teleport is not verified on Studio 0.{build} and is disabled because the native launch closes Studio; use solo Play, or start a local server from Studio's Test tab until Renium verifies this build"
+    );
+    Ok(())
+}
+
 pub(crate) fn preflight_multiplayer(
     bridge: &BridgeServer,
     owner: &str,
@@ -47,13 +60,16 @@ pub(crate) fn preflight_multiplayer(
     {
         use crate::studio::native::serializer::{probes, target_name};
         let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, owner)?;
+        require_verified_launch_build(crate::studio::native::serializer::studio_build_number(
+            pid,
+        )?)?;
         let title = target_name(pid, "")?;
         if let Err(error) = probes::run(pid, &title, probes::NativeOperation::PlayTeleportLaunch) {
             crate::app::output::log_global(
                 3,
                 format_args!("[renium] multiplayer native preflight failed: {error:#}"),
             );
-            require_multiplayer_native(false)?;
+            anyhow::bail!("{MULTIPLAYER_NATIVE_REQUIRED}. Native probe: {error:#}");
         }
     }
     #[cfg(not(windows))]
@@ -848,6 +864,15 @@ mod tests {
             "a degraded dispatch has the same actionable error as disabled native travel"
         );
         require_multiplayer_native(true).unwrap();
+    }
+
+    #[test]
+    fn multiplayer_refuses_unverified_studio_builds() {
+        require_verified_launch_build(MULTIPLAYER_LAUNCH_VERIFIED_BUILD).unwrap();
+        require_verified_launch_build(741).unwrap();
+        let error = require_verified_launch_build(745).unwrap_err().to_string();
+        assert!(error.contains("Studio 0.745"), "{error}");
+        assert!(error.contains("solo Play"), "{error}");
     }
 
     #[test]
