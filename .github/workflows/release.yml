@@ -169,7 +169,7 @@ jobs:
           if ("${{ matrix.target }}" -eq "aarch64-pc-windows-msvc") {
             $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
             $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath
-            if (-not $vs) { throw "No Visual Studio instance with the MSVC ARM64 build tools was found" }
+            if (-not $vs) { throw "No Visual Studio instance with the MSVC ARM64 build tools was found; add it with: setup.exe modify --installPath <VS> --add Microsoft.VisualStudio.Component.VC.Tools.ARM64" }
             $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvarsall.bat"
             $lines = cmd /c "`"$vcvars`" x64_arm64 >nul 2>&1 && set"
             foreach ($line in $lines) {
