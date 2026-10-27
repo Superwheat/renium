@@ -15,6 +15,7 @@
 
 ### Bug fixes
 
+- Commands keep local Studio projects and explicit `--place` selections separate, including projects whose files share the same name.
 - Large plugin fallback exports and sync batches yield regularly to keep Studio's controls and built-in plugins responsive.
 - Server & Clients teleport now reports an unavailable native hook before starting the test and explains that compatibility travel supports solo Play only.
 - Device simulation reports stalled Studio service calls promptly, so a failed device change does not leave later bridge requests waiting indefinitely.

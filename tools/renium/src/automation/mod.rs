@@ -286,6 +286,7 @@ impl BoundContext {
             && self.resource_lease == other.resource_lease
             && self.place_id == other.place_id
             && self.game_id == other.game_id
+            && self.selector == other.selector
             && self.fingerprint == other.fingerprint
     }
 }
@@ -420,15 +421,23 @@ impl State {
     }
 
     pub fn studio_target(&self, context: &BoundContext) -> Option<StudioReopenTarget> {
+        self.studio_target_for_project(Path::new(&context.project), Path::new(&context.root))
+    }
+
+    pub(super) fn studio_target_for_project(
+        &self,
+        project: &Path,
+        root: &Path,
+    ) -> Option<StudioReopenTarget> {
         if let Some(target) = self
             .studio_reopen_targets
             .lock_recover()
-            .get(&context.project)
+            .get(project.to_string_lossy().as_ref())
             .cloned()
         {
             return Some(target);
         }
-        studio_target_for_root(Path::new(&context.root))
+        studio_target_for_root(root)
     }
 
     pub fn recent_studio_launch(
@@ -758,6 +767,53 @@ mod tests {
             !serde_json::to_string(&owned)
                 .unwrap()
                 .contains("private-owner-token")
+        );
+    }
+
+    #[test]
+    fn local_place_selectors_keep_independent_contexts_and_launch_pairings() {
+        let state = State::default();
+        let first = state.insert_context(BoundContext {
+            id: 0,
+            initialized: true,
+            project: "project".into(),
+            root: "root".into(),
+            experience: "root".into(),
+            source: "src".into(),
+            resource_lease: None,
+            place_id: Some(0),
+            game_id: Some(0),
+            selector: "place.rbxl".into(),
+            runtime_id: Some("first".into()),
+            plugin_build: Some(1),
+            fingerprint: "same".into(),
+        });
+        let second = state.insert_context(BoundContext {
+            selector: "place2.rbxl".into(),
+            runtime_id: Some("second".into()),
+            ..first.clone()
+        });
+        assert_ne!(first.id, second.id);
+        assert_eq!(
+            state.context(first.id).unwrap().runtime_id.as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            state.context(second.id).unwrap().runtime_id.as_deref(),
+            Some("second")
+        );
+        let target = StudioReopenTarget {
+            file: Some("place2.rbxl".into()),
+            place_id: None,
+            game_id: None,
+        };
+        state
+            .studio_reopen_targets
+            .lock_recover()
+            .insert(first.project.clone(), target.clone());
+        assert_eq!(
+            state.studio_target_for_project(Path::new("project"), Path::new("root")),
+            Some(target)
         );
     }
 

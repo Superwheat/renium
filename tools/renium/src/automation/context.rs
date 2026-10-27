@@ -157,10 +157,15 @@ fn runtime_selector(
         (Some(game_id), Some(place_id)) => format!("{game_id}:{place_id}"),
         (_, Some(place_id)) => place_id.to_string(),
         _ => saved_target
-            .and_then(|target| match (target.game_id, target.place_id) {
-                (Some(game_id), Some(place_id)) => Some(format!("{game_id}:{place_id}")),
-                (_, Some(place_id)) => Some(place_id.to_string()),
-                _ => None,
+            .and_then(|target| {
+                match (
+                    target.game_id.filter(|id| *id > 0),
+                    target.place_id.filter(|id| *id > 0),
+                ) {
+                    (Some(game_id), Some(place_id)) => Some(format!("{game_id}:{place_id}")),
+                    (_, Some(place_id)) => Some(place_id.to_string()),
+                    _ => target.file.as_ref().map(|file| file.display().to_string()),
+                }
             })
             .or_else(|| requested.map(str::to_string))
             .or_else(|| identity.map(|place| place.alias.clone()))
@@ -173,33 +178,51 @@ fn client_matches_saved_target(
     entry: &Value,
     target: &StudioReopenTarget,
 ) -> bool {
-    if let Some(place_id) = target.place_id {
+    if let Some(place_id) = target.place_id.filter(|id| *id > 0) {
         return entry.get("placeId").and_then(Value::as_i64) == Some(place_id)
-            && target.game_id.is_none_or(|game_id| {
+            && target.game_id.filter(|id| *id > 0).is_none_or(|game_id| {
                 entry.get("gameId").and_then(Value::as_i64) == Some(game_id)
             });
     }
     let Some(expected_file) = target.file.as_deref() else {
         return false;
     };
-    #[cfg(not(any(windows, target_os = "macos")))]
-    {
-        let _ = (bridge, entry, expected_file);
-        false
-    }
+    client_local_file(bridge, entry).is_some_and(|file| {
+        canonical_path(&file).unwrap_or(file)
+            == canonical_path(expected_file).unwrap_or_else(|_| expected_file.to_path_buf())
+    })
+}
+
+fn client_local_file(bridge: &BridgeServer, entry: &Value) -> Option<PathBuf> {
     #[cfg(any(windows, target_os = "macos"))]
     {
-        let Some(runtime_id) = entry.get("runtimeId").and_then(Value::as_str) else {
-            return false;
-        };
-        let Ok(pid) = bridge.studio_pid_for_runtime(BridgeTarget::Edit, runtime_id) else {
-            return false;
-        };
-        local_place_path_for_pid(pid).is_some_and(|file| {
-            canonical_path(&file).unwrap_or(file)
-                == canonical_path(expected_file).unwrap_or_else(|_| expected_file.to_path_buf())
-        })
+        let runtime = entry["runtimeId"].as_str()?;
+        let pid = bridge
+            .studio_pid_for_runtime(BridgeTarget::Edit, runtime)
+            .ok()?;
+        local_place_path_for_pid(pid)
     }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = (bridge, entry);
+        None
+    }
+}
+
+fn prefer_project_local_file(
+    candidates: Vec<Value>,
+    root: &Path,
+    mut local_file: impl FnMut(&Value) -> Option<PathBuf>,
+) -> Vec<Value> {
+    let own = candidates
+        .iter()
+        .filter(|entry| {
+            local_file(entry)
+                .is_some_and(|file| canonical_path(&file).unwrap_or(file).parent() == Some(root))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if own.is_empty() { candidates } else { own }
 }
 
 pub(super) fn studio_candidates_from(clients: &[Value], selector: &str) -> Vec<Value> {
@@ -565,6 +588,11 @@ pub(super) fn bind(
     let manifest_game_id = identity.as_ref().and_then(|place| place.game_id);
     let manifest_place_id = identity.as_ref().and_then(|place| place.place_id);
     let saved_target = (|| -> Result<Option<StudioReopenTarget>> {
+        if manifest_place_id.is_none()
+            && let Some(opened) = state.studio_target_for_project(&project_path, &project_root)
+        {
+            return Ok(Some(opened));
+        }
         let enabled_target = super::live::saved_studio_target_for_root(&project_root)?;
         if enabled_target.is_some() || manifest_place_id.is_some() {
             return Ok(enabled_target);
@@ -599,33 +627,30 @@ pub(super) fn bind(
     {
         candidates.retain(|entry| client_matches_saved_target(bridge, entry, target));
     }
-    // A project opened with `rbx so FILE` and never paired by Live Sync has
-    // only that launch to say which Studio is its own; use it to break a tie,
-    // never to turn a lone Studio away.
+    // Older sessions may predate the persisted `rbx so` target. An OS-reported
+    // absolute document path in this root still identifies its local project.
     if candidates.len() > 1
         && requested_runtime.is_none()
         && requested_place.is_none()
         && manifest_place_id.is_none()
-        && let Some(target) = super::studio_target_for_root(&project_root)
+        && saved_target.is_none()
     {
-        let own = candidates
-            .iter()
-            .filter(|entry| client_matches_saved_target(bridge, entry, &target))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !own.is_empty() {
-            candidates = own;
-        }
+        candidates = prefer_project_local_file(candidates, &project_root, |entry| {
+            client_local_file(bridge, entry)
+        });
     }
     if candidates.len() > 1 {
         return Err(ambiguous_studios(&candidates));
     }
     let candidate = candidates.first();
-    // Names select a runtime once. Keep subsequent bridge calls/reconnects
-    // on its published identity, not the mutable title or DataModel name.
+    // Pin reconnects to the published identity or absolute local document.
     let selector = candidate
         .and_then(client_selector)
-        .filter(|_| !selector.is_empty())
+        .or_else(|| {
+            candidate
+                .and_then(|entry| client_local_file(bridge, entry))
+                .map(|file| file.display().to_string())
+        })
         .unwrap_or(selector);
     let runtime_id = candidate
         .and_then(|entry| entry.get("runtimeId"))
@@ -816,6 +841,61 @@ pub(super) fn path(context: &BoundContext, path: PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_local_names_use_the_project_document_path() {
+        let root = crate::tests::support::temp_dir("local-project-selection");
+        for name in ["one", "two"] {
+            fs::create_dir(root.join(name)).unwrap();
+            fs::write(root.join(name).join("place.rbxl"), []).unwrap();
+        }
+        let clients = vec![json!({"runtimeId":"one"}), json!({"runtimeId":"two"})];
+        let project = canonical_path(&root.join("two")).unwrap();
+        let selected = prefer_project_local_file(clients.clone(), &project, |entry| {
+            Some(
+                root.join(entry["runtimeId"].as_str().unwrap())
+                    .join("place.rbxl"),
+            )
+        });
+        assert_eq!(selected, vec![clients[1].clone()]);
+        assert_eq!(
+            prefer_project_local_file(clients.clone(), &project, |_| None),
+            clients
+        );
+        let target = StudioReopenTarget {
+            file: Some(project.join("place.rbxl")),
+            game_id: Some(0),
+            place_id: Some(0),
+        };
+        assert_eq!(
+            runtime_selector(None, None, Some(&target)),
+            target.file.unwrap().display().to_string()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    #[ignore = "read-only inspection of explicitly supplied running Studio PIDs"]
+    fn manual_local_studio_selection() {
+        let pids =
+            std::env::var("RENIUM_SELECTION_PIDS").expect("set RENIUM_SELECTION_PIDS=pid,pid");
+        let wanted = std::env::var("RENIUM_SELECTION_FILE").expect("set RENIUM_SELECTION_FILE");
+        let expected = std::env::var("RENIUM_SELECTION_EXPECTED_PID").expect("set expected PID");
+        let clients = pids
+            .split(',')
+            .map(|pid| json!({"role":"edit", "runtimeId":pid, "placeId":0, "placeName":"Place1"}))
+            .collect::<Vec<_>>();
+        let selected = studio_candidates_with_titles(&clients, &wanted, |runtime| {
+            crate::studio::input::studio_window_title(runtime.parse().unwrap()).ok()
+        });
+        println!(
+            "{}",
+            json!({"readOnly":true,"selector":wanted,"selected":selected})
+        );
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0]["runtimeId"], expected);
+    }
 
     #[test]
     fn experience_place_registration_does_not_select_or_initialize_a_place() {
