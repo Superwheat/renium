@@ -2251,7 +2251,9 @@ local function removeUnknownInstances(
 		end
 	end
 	for instance in unknown do
-		if ctx.yieldForBudget then ctx.yieldForBudget() end
+		if ctx.yieldForBudget then
+			ctx.yieldForBudget()
+		end
 		if not unknown[instance.Parent] then
 			removeInstanceForUndo(instance, ctx)
 		end
@@ -2296,7 +2298,9 @@ local function applyInstanceReconcile(
 	local resolvedEntries = {}
 	local claimedInstances = {}
 	for _, entry in ipairs(desiredEntries) do
-		if ctx.yieldForBudget then ctx.yieldForBudget() end
+		if ctx.yieldForBudget then
+			ctx.yieldForBudget()
+		end
 		desiredKeys[entry.key] = true
 		local instance = syncDesiredEntry(entry, service.Name, ctx, stats, resolvedEntries, claimedInstances, true)
 		if instance ~= nil then
@@ -2398,7 +2402,9 @@ local function applyInstanceReconcileChunk(
 	local entries = sortedInstanceEntries(change, service.Name)
 	local newEntries = 0
 	for _, entry in ipairs(entries) do
-		if ctx.yieldForBudget then ctx.yieldForBudget() end
+		if ctx.yieldForBudget then
+			ctx.yieldForBudget()
+		end
 		if not session.desiredKeys[entry.key] then
 			newEntries += 1
 		end
@@ -2409,7 +2415,9 @@ local function applyInstanceReconcileChunk(
 	end
 	session.entryCount += newEntries
 	for _, entry in ipairs(entries) do
-		if ctx.yieldForBudget then ctx.yieldForBudget() end
+		if ctx.yieldForBudget then
+			ctx.yieldForBudget()
+		end
 		session.desiredKeys[entry.key] = true
 		local instance = syncDesiredEntry(
 			entry,
@@ -2476,7 +2484,9 @@ local function applyInstanceUpserts(
 	local createMissing = liveHydrateEnabled(ctx)
 	local verified = 0
 	for _, entry in ipairs(entries) do
-		if ctx.yieldForBudget then ctx.yieldForBudget() end
+		if ctx.yieldForBudget then
+			ctx.yieldForBudget()
+		end
 		if #entry.previousPathSegments > 0 then
 			local instance = resolveEntryInstance(entry, service.Name, ctx, resolvedEntries, claimedInstances)
 			if instance == nil then
@@ -2489,7 +2499,9 @@ local function applyInstanceUpserts(
 		end
 	end
 	for _, entry in ipairs(entries) do
-		if ctx.yieldForBudget then ctx.yieldForBudget() end
+		if ctx.yieldForBudget then
+			ctx.yieldForBudget()
+		end
 		local instance = syncDesiredEntry(entry, service.Name, ctx, stats, resolvedEntries, claimedInstances, createMissing)
 		if instance ~= nil and instance.ClassName == entry.className
 			and instance.Name == entry.pathSegments[#entry.pathSegments]
@@ -2525,7 +2537,9 @@ local function applyInstanceDeletes(
 	local resolvedEntries = {}
 	local claimedInstances = {}
 	for _, entry in ipairs(sortedInstanceEntries(change, service.Name)) do
-		if ctx.yieldForBudget then ctx.yieldForBudget() end
+		if ctx.yieldForBudget then
+			ctx.yieldForBudget()
+		end
 		if #entry.pathSegments <= 1 then
 			error("Refusing to delete service root: " .. entry.key)
 		end
@@ -2549,7 +2563,9 @@ local function applyInstanceDeletes(
 		end
 	end
 	for _, instance in ipairs(targets) do
-		if ctx.yieldForBudget then ctx.yieldForBudget() end
+		if ctx.yieldForBudget then
+			ctx.yieldForBudget()
+		end
 		removeInstanceForUndo(instance, ctx)
 		if instance.Parent ~= nil then
 			error(`Studio did not remove {instance:GetFullName()}`)
@@ -6346,7 +6362,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 	end
 
 	local function runWithSessionOwnership(operationGeneration, cancellationCheck, operation, ...)
-		if ctx.yieldForBudget then ctx.yieldForBudget() end
+		if ctx.yieldForBudget then
+			ctx.yieldForBudget()
+		end
 		assertSessionOwnership(operationGeneration)
 		cancellationCheck()
 		local results = table.pack(pcall(operation, ...))
@@ -9551,7 +9569,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local yieldForBudget = BridgeParallel.newWorkBudget()
 		ctx.yieldForBudget = function()
 			local yielded = yieldForBudget()
-			if yielded then ctx.assertEditorMutationActive() end
+			if yielded then
+				ctx.assertEditorMutationActive()
+			end
 			return yielded
 		end
 		local activeSnapshot = if outerTransaction ~= nil then outerTransaction.snapshot else transactionSnapshot
