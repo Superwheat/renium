@@ -50,6 +50,15 @@ inline void Run() {
     try { SubmitTask(reinterpret_cast<std::uintptr_t>(&Submit), nullptr, &work, 1); }
     catch (const std::runtime_error&) { refused = true; }
     assert(refused && !queued.operations);
+    // A forged heap tag must fail before reading its pointer or size.
+    Function<void()> heap;
+    Raw raw{}; raw.operations = reinterpret_cast<std::uintptr_t>(&queued) | 4;
+    std::memset(raw.capture, 0xff, sizeof(raw.capture));
+    std::memcpy(&heap, &raw, sizeof(raw));
+    refused = false;
+    try { auto copy = heap; } catch (const std::runtime_error&) { refused = true; }
+    std::memset(&heap, 0, sizeof(heap));
+    assert(refused);
     taskAbi.store(Abi::Msvc);
 }
 }

@@ -512,7 +512,7 @@ pub(crate) fn rejoin_test_client(pid: u32, runtime: &str, path: &[String]) -> Re
     for (index, value) in [
         relay.instance,
         relay.owner,
-        types::yield_member(&memory, studio, INVOKE, "Invoke", 1)?.1,
+        types::yield_member(&memory, studio, INVOKE, "Invoke", 1)?.function,
         types::singleton(&memory, studio, dispatch::TABLE, None)?,
         window,
         opener,

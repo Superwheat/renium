@@ -5,7 +5,7 @@ pub(super) const EXECUTE: &str = ".?AV?$BoundYieldFuncDesc@VStudioTestService@St
 pub(super) const ARGS: &str = ".?AV?$BoundFuncDesc@VStudioTestService@Studio@RBX@@$$A6A?AVVariant@Reflection@3@XZ$0A@$0A@@Reflection@RBX@@";
 
 pub(in super::super) struct Binding {
-    pub execute: (usize, usize),
+    pub execute: types::YieldBinding,
     pub fields: [usize; 16],
     pub place: i64,
     pub universe: i64,
@@ -16,12 +16,8 @@ pub(in super::super) fn resolve(
     studio: &ModuleEntry,
     model: &ActiveDataModel,
 ) -> Result<Binding> {
-    anyhow::ensure!(
-        types::yield_abi(memory, studio, EXECUTE, "ExecutePlayModeAsync", 1)?
-            == types::yield_abi(memory, studio, dispatch::INVOKE, "Invoke", 1)?,
-        "Native launch continuation ABIs disagree"
-    );
     let execute = types::yield_member(memory, studio, EXECUTE, "ExecutePlayModeAsync", 1)?;
+    types::yield_member(memory, studio, dispatch::INVOKE, "Invoke", 1)?;
     let (fields, place, universe) = task_binding(memory, studio, model)?;
     Ok(Binding {
         execute,

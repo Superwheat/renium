@@ -3,6 +3,41 @@ use super::*;
 use crate::system::LockRecover;
 type Key = ([u32; 3], String, Option<String>);
 static TYPES: OnceLock<Mutex<HashMap<Key, usize>>> = OnceLock::new();
+
+#[derive(Clone, Copy, serde::Serialize)]
+pub(in super::super) struct YieldBinding {
+    pub slot: usize,
+    pub function: usize,
+    pub abi: properties::ContinuationAbi,
+}
+
+fn record_abi(memory: &ProcessMemory, abi: properties::ContinuationAbi) -> Result<()> {
+    anyhow::ensure!(
+        memory.play_abi.get().is_none_or(|previous| previous == abi),
+        "Native continuation bindings disagree with the helper ABI"
+    );
+    memory.play_abi.set(Some(abi));
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn yielding_bindings_cannot_reconfigure_a_prepared_helper() {
+    use properties::ContinuationAbi::{Msvc, Tagged};
+    for (first, second) in [(Msvc, Tagged), (Tagged, Msvc)] {
+        let memory = std::mem::ManuallyDrop::new(ProcessMemory {
+            handle: null_mut(),
+            pid: 0,
+            verified: Cell::new(false),
+            task_abi: Cell::new(None),
+            play_abi: Cell::new(None),
+        });
+        record_abi(&memory, first).unwrap();
+        record_abi(&memory, first).unwrap();
+        assert!(record_abi(&memory, second).is_err());
+        assert_eq!(memory.play_abi.get(), Some(first));
+    }
+}
 fn descriptor_name(memory: &ProcessMemory, object: usize) -> Option<String> {
     read_msvc_string(memory, memory.read_u64(object + 8).ok()? as usize)
 }
@@ -34,29 +69,20 @@ pub(super) fn yield_member(
     kind: &str,
     name: &str,
     arguments: usize,
-) -> Result<(usize, usize)> {
+) -> Result<YieldBinding> {
     let descriptor = singleton(memory, studio, kind, Some(name))?;
     let layout = package_layout(&studio.path)?;
     let (field, function) = properties::member_binding(memory, studio, &layout, descriptor)?;
     // Receiver, public arguments, success continuation, error continuation.
-    properties::continuation_abi(memory, studio, &layout, descriptor, field, arguments + 2)
-        .with_context(|| format!("Native {name} is unavailable"))?;
-    Ok((descriptor + field, function))
-}
-
-pub(super) fn yield_abi(
-    memory: &ProcessMemory,
-    studio: &ModuleEntry,
-    kind: &str,
-    name: &str,
-    arguments: usize,
-) -> Result<properties::ContinuationAbi> {
-    let descriptor = singleton(memory, studio, kind, Some(name))?;
-    let layout = package_layout(&studio.path)?;
-    let table = memory.read_u64(descriptor)? as usize;
-    let field = properties::function_member_field(memory, studio, &layout, descriptor, table)?;
-    properties::continuation_abi(memory, studio, &layout, descriptor, field, arguments + 2)
-        .with_context(|| format!("Native {name} is unavailable"))
+    let abi =
+        properties::continuation_abi(memory, studio, &layout, descriptor, field, arguments + 2)
+            .with_context(|| format!("Native {name} is unavailable"))?;
+    record_abi(memory, abi)?;
+    Ok(YieldBinding {
+        slot: descriptor + field,
+        function,
+        abi,
+    })
 }
 
 pub(super) fn singleton(

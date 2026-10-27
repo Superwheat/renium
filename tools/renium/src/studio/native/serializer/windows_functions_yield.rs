@@ -3,6 +3,8 @@
 //! The native adapter supports MSVC std::function and the inline tagged
 //! callable; descriptor RTTI alone cannot distinguish these incompatible ABIs.
 use super::*;
+#[path = "windows_functions_continuation.rs"]
+mod consumer;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
 #[repr(u32)]
@@ -190,7 +192,19 @@ fn verify_callback(
                 function.checked_sub(studio.base) == expected.checked_sub(pe.image_base),
                 "Native continuation operations changed in memory"
             );
-            dispatch_code(memory, studio, layout, function)?;
+            let code = dispatch_code(memory, studio, layout, function)?;
+            if slot == 2 {
+                anyhow::ensure!(
+                    consumer::capture_move(&code),
+                    "Native continuation move entry does not transfer its capture ownership"
+                );
+            }
+            if error && slot == 0 {
+                anyhow::ensure!(
+                    consumer::error_invocation(&code),
+                    "Native error continuation does not move a verified string argument"
+                );
+            }
         }
     }
     Ok(())
@@ -208,10 +222,11 @@ pub(in super::super::super) fn continuation_abi(
     let mut found = false;
     let mut rejected = false;
     let mut resolved = None;
+    let mut failure = None;
     for method in vtable_methods(memory, studio, layout, table)? {
-        let checked = dispatch_field_checked(
+        let checked = dispatch_analysis(
             method as u64,
-            &mut |address| dispatch_code(memory, studio, layout, address as usize).ok(),
+            &mut |address, _| dispatch_code(memory, studio, layout, address as usize).ok(),
             false,
             &mut |called, state| {
                 let callbacks =
@@ -221,9 +236,10 @@ pub(in super::super::super) fn continuation_abi(
                         if success.0 != error.0 || resolved.is_some_and(|abi| abi != success.0) {
                             return false;
                         }
-                        if verify_callback(memory, studio, layout, success, false).is_err()
-                            || verify_callback(memory, studio, layout, error, true).is_err()
+                        if let Err(error) = verify_callback(memory, studio, layout, success, false)
+                            .and_then(|()| verify_callback(memory, studio, layout, error, true))
                         {
+                            failure = Some(error);
                             return false;
                         }
                         resolved = Some(success.0);
@@ -233,13 +249,29 @@ pub(in super::super::super) fn continuation_abi(
                 compatible
             },
         );
-        found |= checked == Some(field);
+        if let Some(error) = failure.take() {
+            return Err(error);
+        }
+        let fields = checked.context("Native continuation dispatcher analysis is incomplete")?;
+        anyhow::ensure!(
+            fields.is_empty() || fields == HashSet::from([field]),
+            "Native continuation dispatcher is ambiguous"
+        );
+        found |= fields.contains(&field);
     }
     anyhow::ensure!(
         found && !rejected,
         "Studio's native continuation layout could not be verified for Play"
     );
-    resolved.context("Studio's native continuation ABI is ambiguous")
+    let abi = resolved.context("Studio's native continuation ABI is ambiguous")?;
+    if abi == ContinuationAbi::Tagged {
+        let member = memory.read_u64(descriptor + field)?;
+        consumer::member_moves(member, argument, &mut |address| {
+            dispatch_code(memory, studio, layout, address as usize).ok()
+        })
+        .context("Native continuation move/destroy contract could not be verified")?;
+    }
+    Ok(abi)
 }
 
 fn rtti_type_for_vtable(

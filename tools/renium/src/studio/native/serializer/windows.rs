@@ -198,6 +198,7 @@ struct ProcessMemory {
     pid: u32,
     verified: Cell<bool>,
     task_abi: Cell<Option<u32>>,
+    play_abi: Cell<Option<properties::ContinuationAbi>>,
 }
 
 const NATIVE_WRITES_DISABLED: &str =
@@ -226,6 +227,7 @@ impl ProcessMemory {
             pid,
             verified: Cell::new(false),
             task_abi: Cell::new(None),
+            play_abi: Cell::new(None),
         })
     }
 
@@ -242,14 +244,13 @@ impl ProcessMemory {
                 "Studio is outside the native canary target"
             );
         }
-        let result = probes::check(self, self.pid, title, operation);
+        let result = probes::check(self, self.pid, title, operation).and_then(|report| {
+            self.task_abi
+                .set(task_abi::from_report(operation, &report)?);
+            Ok(report)
+        });
         super::probes::record(self.pid, operation, &result);
-        let report = result.with_context(|| format!("Native {operation:?} unavailable"))?;
-        self.task_abi.set(
-            report["taskContinuationAbi"]
-                .as_u64()
-                .map(|value| value as u32),
-        );
+        result.with_context(|| format!("Native {operation:?} unavailable"))?;
         self.verified.set(true);
         Ok(())
     }
@@ -274,6 +275,7 @@ impl ProcessMemory {
             pid,
             verified: Cell::new(false),
             task_abi: Cell::new(None),
+            play_abi: Cell::new(None),
         })
     }
 

@@ -8,7 +8,7 @@ const REMOVE: &str = ".?AV?$BoundFuncDesc@VReplicatedFirst@RBX@@$$A6AXXZ$0A@$0A@
 
 fn bindings(memory: &ProcessMemory, studio: &ModuleEntry) -> Result<[usize; 3]> {
     Ok([
-        types::yield_member(memory, studio, INVOKE, "Invoke", 1)?.1,
+        types::yield_member(memory, studio, INVOKE, "Invoke", 1)?.function,
         types::member(memory, studio, ADD, "AddCoreScriptLocal", false)?.1,
         types::member(memory, studio, REMOVE, "RemoveDefaultLoadingScreen", false)?.1,
     ])

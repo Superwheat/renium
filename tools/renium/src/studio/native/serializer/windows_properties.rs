@@ -15,7 +15,6 @@ pub(super) use functions::binding as function_binding;
 pub(super) use functions::dispatch_code;
 pub(super) use functions::inline_callback_tables;
 pub(super) use functions::lua_binding;
-pub(super) use functions::member_field as function_member_field;
 pub(super) use functions::{ContinuationAbi, continuation_abi};
 
 #[path = "windows_terrain.rs"]
@@ -2030,6 +2029,7 @@ mod tests {
         let result = std::process::Command::new(
             std::path::Path::new(env!("OUT_DIR")).join("allocator-test/renium-allocator-test.exe"),
         )
+        .arg(std::path::Path::new(env!("OUT_DIR")).join("renium-studio-helper.dll"))
         .output()
         .expect("run isolated allocator regression");
         assert!(

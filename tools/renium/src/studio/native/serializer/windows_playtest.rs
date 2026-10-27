@@ -44,7 +44,9 @@ fn ensure_play_helper_loaded(
     loaded: &[ModuleEntry],
 ) -> Result<usize> {
     let studio = loaded.first().context("Studio process ended")?;
-    let abi = types::yield_abi(memory, studio, dispatch::INVOKE, "Invoke", 1)?;
+    // This lookup must agree with every yielding binding collected on this
+    // process handle, including Execute hooks prepared under the Join permit.
+    let abi = types::yield_member(memory, studio, dispatch::INVOKE, "Invoke", 1)?.abi;
     let entry = helper_export_rva("ReniumPlayContinuations")?;
     let helper = ensure_helper_loaded(pid, memory, loaded)?;
     let mut input = memory.allocate(4)?;

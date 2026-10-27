@@ -267,4 +267,5 @@ extern "C" __declspec(dllexport) DWORD WINAPI ReniumPlayLoader(void* input) {
         strncpy_s(request.error, error.what(), _TRUNCATE);
         return 1;
     }
+    catch (...) { strcpy_s(request.error, "Unknown native loader failure"); return 1; }
 }

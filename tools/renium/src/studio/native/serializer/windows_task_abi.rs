@@ -3,6 +3,27 @@ use super::*;
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Mnemonic, OpKind, Register};
 use properties::ContinuationAbi;
 
+pub(super) fn from_report(
+    operation: NativeOperation,
+    report: &serde_json::Value,
+) -> Result<Option<u32>> {
+    if matches!(
+        operation,
+        NativeOperation::UndoSelection
+            | NativeOperation::PackageNotices
+            | NativeOperation::AudioGate
+            | NativeOperation::StudioActions
+            | NativeOperation::Input
+            | NativeOperation::ViewportCapture
+    ) {
+        return Ok(None);
+    }
+    match report["taskContinuationAbi"].as_u64() {
+        Some(value @ (1 | 2)) => Ok(Some(value as u32)),
+        _ => bail!("Native task continuation ABI is missing or unsupported"),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Origin {
     Context,
@@ -256,6 +277,37 @@ pub(super) fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn task_authorization_requires_explicit_supported_abi_evidence() {
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!(0),
+            serde_json::json!(3),
+            serde_json::json!(4294967297u64),
+        ] {
+            assert!(
+                from_report(
+                    NativeOperation::PlayTeleportJoin,
+                    &serde_json::json!({"taskContinuationAbi": value})
+                )
+                .is_err()
+            );
+        }
+        for value in [1, 2] {
+            assert_eq!(
+                from_report(
+                    NativeOperation::PackageActions,
+                    &serde_json::json!({"taskContinuationAbi": value})
+                )
+                .unwrap(),
+                Some(value)
+            );
+        }
+        assert_eq!(
+            from_report(NativeOperation::Input, &serde_json::Value::Null).unwrap(),
+            None
+        );
+    }
     #[test]
     fn task_consumer_distinguishes_callback_ownership_and_rejects_wrong_fields() {
         let fixtures: serde_json::Value = serde_json::from_str(include_str!(

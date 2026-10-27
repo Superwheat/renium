@@ -189,6 +189,90 @@ fn yield_error_callback_requires_the_exact_msvc_signature() {
 }
 
 #[test]
+fn optional_constructor_fetch_does_not_poison_a_reflection_binding() {
+    let mut code = dispatcher(0xa8, 0x40, 3);
+    // An unrelated call with two stack addresses is only a constructor
+    // candidate. Its absent/unverifiable code is not a binding dependency.
+    code.splice(
+        13..13,
+        [
+            0x48, 0x8d, 0x4c, 0x24, 0x20, 0x48, 0x8d, 0x54, 0x24, 0x28, 0xe8, 0, 0x10, 0, 0,
+        ],
+    );
+    let mut required_error = false;
+    let mut optional_fetches = 0;
+    let field = dispatch_field_fetch(
+        0,
+        &mut |at, required| {
+            if at == 0 {
+                return Some(code.clone());
+            }
+            required_error |= required;
+            optional_fetches += usize::from(!required);
+            None
+        },
+        false,
+        &mut |_, _| true,
+    );
+    assert_eq!(field, Some(0xa8));
+    assert!(!required_error);
+    assert!(optional_fetches > 0);
+}
+
+#[test]
+fn continuation_analysis_distinguishes_incomplete_methods_and_interior_aliases() {
+    let analyze = |code: Vec<u8>| {
+        dispatch_analysis(
+            0,
+            &mut |at, _| (at == 0).then(|| code.clone()),
+            false,
+            &mut |_, _| true,
+        )
+    };
+    assert_eq!(analyze(vec![0xc3]), Some(HashSet::new()));
+    assert_eq!(analyze(vec![0xeb, 0xff]), None);
+    for offset in [0, 8, 24, 56] {
+        let mut code = dispatcher(0xa8, 0x40, 3);
+        code.splice(
+            35..35,
+            [
+                0x49, 0x8d, 0x49, offset, // lea rcx,[r9+offset]
+                0xe8, 0, 0x10, 0, 0, // unknown call
+                0x4c, 0x8d, 0x4c, 0x24, 0x40,
+            ],
+        ); // restore callback argument
+        assert_eq!(checked(&code, 0, 3, 0x1000), None);
+    }
+}
+
+#[test]
+fn continuation_analysis_follows_verified_unwind_fragments_and_refuses_missing_ones() {
+    let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+        "../../../../native/tests/windows-yield-fragments.json"
+    ))
+    .unwrap();
+    for slide in [0, 0x40000000] {
+        let entry = 0xfcc640 + slide;
+        let analyze = |missing: bool| {
+            dispatch_analysis(
+                entry,
+                &mut |at, _| {
+                    rows.iter().find_map(|row| {
+                        let rva = row["entry"].as_u64().unwrap();
+                        (at == rva + slide && !(missing && rva == 0x7a45df))
+                            .then(|| hex(row["hex"].as_str().unwrap()).unwrap())
+                    })
+                },
+                false,
+                &mut |_, _| true,
+            )
+        };
+        assert_eq!(analyze(false), Some(HashSet::new()));
+        assert_eq!(analyze(true), None);
+    }
+}
+
+#[test]
 fn loader_callback_uses_the_constructed_table_and_actual_argument() {
     let row: serde_json::Value = serde_json::from_str(include_str!(
         "../../../../native/tests/windows-loader-dispatch.json"

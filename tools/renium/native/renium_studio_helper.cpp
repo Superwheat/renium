@@ -959,15 +959,24 @@ static void RunPackageModifiedStateTask(PackageActionParams* params)
         return;
     }
 
-    std::function<void()> writeTask{[task]() {
-        SetPackageModifiedStateCaught(task);
+    bool submitted = false;
+    try {
+        std::function<void()> writeTask{[task]() {
+            SetPackageModifiedStateCaught(task);
+            ReleaseOwnerReference(task->owner);
+            SetEvent(task->completed);
+            ReleasePackageModifiedStateTask(task);
+        }};
+        auto submit = SubmitDataModelTask(
+            params->moduleBase + params->submitTaskRva);
+        submitted = submit(reinterpret_cast<void*>(params->taskContext), &writeTask, 1);
+    } catch (...) {
         ReleaseOwnerReference(task->owner);
-        SetEvent(task->completed);
         ReleasePackageModifiedStateTask(task);
-    }};
-    auto submit = SubmitDataModelTask(
-        params->moduleBase + params->submitTaskRva);
-    if (!submit(reinterpret_cast<void*>(params->taskContext), &writeTask, 1))
+        ReleasePackageModifiedStateTask(task);
+        throw;
+    }
+    if (!submitted)
     {
         params->status = 0xE30E;
         SetPackageActionError(params, "Studio rejected the package DataModel write task");
@@ -1189,15 +1198,24 @@ static void RunPackageOperationTask(PackageActionParams* params)
         return;
     }
 
-    std::function<void()> operationTask{[task]() {
-        CallPackageOperationCaught(task);
+    bool submitted = false;
+    try {
+        std::function<void()> operationTask{[task]() {
+            CallPackageOperationCaught(task);
+            ReleaseOwnerReference(task->root.owner);
+            SetEvent(task->dispatched);
+            ReleasePackageOperationTask(task);
+        }};
+        auto submit = SubmitDataModelTask(
+            params->moduleBase + params->submitTaskRva);
+        submitted = submit(reinterpret_cast<void*>(params->taskContext), &operationTask, 1);
+    } catch (...) {
         ReleaseOwnerReference(task->root.owner);
-        SetEvent(task->dispatched);
         ReleasePackageOperationTask(task);
-    }};
-    auto submit = SubmitDataModelTask(
-        params->moduleBase + params->submitTaskRva);
-    if (!submit(reinterpret_cast<void*>(params->taskContext), &operationTask, 1))
+        ReleasePackageOperationTask(task);
+        throw;
+    }
+    if (!submitted)
     {
         params->status = 0xE30E;
         SetPackageActionError(params, "Studio rejected the package operation task");
@@ -1252,7 +1270,7 @@ static void RunPackageOperationTask(PackageActionParams* params)
     params->resultValid = 1;
 }
 
-extern "C" __declspec(dllexport) DWORD WINAPI ReniumPackageAction(
+static DWORD RunPackageAction(
     PackageActionParams* params)
 {
     if (!params)
@@ -1284,6 +1302,19 @@ extern "C" __declspec(dllexport) DWORD WINAPI ReniumPackageAction(
     else
         RunPackageOperationTask(params);
     return params->status == 4 ? 0 : params->status;
+}
+
+extern "C" __declspec(dllexport) DWORD WINAPI ReniumPackageAction(PackageActionParams* params)
+{
+    try { return RunPackageAction(params); }
+    catch (const std::exception& error) {
+        if (params) { params->status = 0xE311; SetPackageActionError(params, error.what()); }
+        return 0xE311;
+    }
+    catch (...) {
+        if (params) { params->status = 0xE312; SetPackageActionError(params, "Unknown native package submission failure"); }
+        return 0xE312;
+    }
 }
 
 // C++ ABI boundary only: the host resolves/validates reflection descriptors and

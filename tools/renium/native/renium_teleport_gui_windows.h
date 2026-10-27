@@ -145,4 +145,5 @@ extern "C" __declspec(dllexport) DWORD WINAPI ReniumTeleportGui(void* input) {
     auto& request = *static_cast<renium_teleport_gui::Request*>(input);
     try { renium_teleport_gui::Handle(request); return 0; }
     catch (const std::exception& error) { strncpy_s(request.error, error.what(), _TRUNCATE); return 1; }
+    catch (...) { strcpy_s(request.error, "Unknown native entry-point failure"); return 1; }
 }

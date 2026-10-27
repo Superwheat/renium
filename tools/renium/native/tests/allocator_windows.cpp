@@ -491,13 +491,43 @@ static void CaptionCleanup() {
 }
 
 #include "continuation_windows.h"
-int main() {
+static bool ThrowingSubmit(void*, void*, std::uint32_t mode) {
+    if (mode == 1) throw std::bad_alloc();
+    throw 42;
+}
+static bool UnknownThrowingSubmit(void*, void*, std::uint32_t) { throw 42; }
+static void PackageBoundary(const char* path) {
+    const auto helper = LoadLibraryA(path);
+    assert(helper);
+    const auto call = reinterpret_cast<DWORD(WINAPI*)(void*)>(GetProcAddress(helper, "ReniumPackageAction"));
+    const auto configure = reinterpret_cast<DWORD(WINAPI*)(void*)>(GetProcAddress(helper, "ReniumTaskContinuations"));
+    assert(call && configure);
+    // Exercise the real exported remote-thread entry in this disposable host.
+    // A valid owner remains retained by the test, and no engine task runs.
+    alignas(8) std::uint64_t owner[2]{0, 2};
+    for (const auto failure : {0, 1, 2}) for (const auto mode : {6, 7, 8}) {
+        alignas(8) unsigned char params[688]{};
+        const auto put64 = [&](unsigned at, std::uint64_t value) { std::memcpy(params + at, &value, 8); };
+        const auto put32 = [&](unsigned at, std::uint32_t value) { std::memcpy(params + at, &value, 4); };
+        put64(0, 1); put64(8, 1); put64(16, reinterpret_cast<std::uintptr_t>(owner));
+        put32(40, 1000); put64(432, 1); put64(440, 1); put64(448, 1); put64(480, 1); put32(488, mode);
+        put64(456, reinterpret_cast<std::uintptr_t>(failure == 2 ? &UnknownThrowingSubmit : &ThrowingSubmit) - 1);
+        if (failure) { std::uint32_t abi = 2; assert(configure(&abi) == 0); }
+        const auto result = call(params);
+        assert(result == (failure == 2 ? 0xE312 : 0xE311));
+        assert(*reinterpret_cast<std::uint32_t*>(params + 44) == result && params[160]);
+        assert(owner[1] == 2);
+    }
+    FreeLibrary(helper);
+}
+int main(int argc, char** argv) {
     renium_continuation::abi.store(renium_continuation::Abi::Msvc);
     renium_continuation::taskAbi.store(renium_continuation::Abi::Msvc);
     assert(initial.size() == 512);
     const auto& allocator = renium_allocator::Engine();
     assert(allocator.allocate == &mi_malloc && allocator.release == &mi_free && allocator.aligned == &mi_malloc_aligned);
     continuation_test::Run();
+    assert(argc == 2); PackageBoundary(argv[1]);
     play_loader_test::Run();
     teleport_dispatch_test::Run();
     CaptionCleanup();

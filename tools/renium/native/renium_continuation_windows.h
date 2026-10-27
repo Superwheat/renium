@@ -70,14 +70,7 @@ public:
             if (other.tagged & 4) other.Table()->copy(storage, other.storage);
             else std::memcpy(storage, other.storage, sizeof(storage));
         } else {
-            const auto size = reinterpret_cast<const std::size_t*>(other.storage)[2];
-            auto data = ::operator new(size);
-            try {
-                if (other.tagged & 4) other.Table()->copy(data, other.Data());
-                else std::memcpy(data, other.Data(), size);
-            } catch (...) { ::operator delete(data); throw; }
-            std::memcpy(storage, other.storage, sizeof(storage));
-            *reinterpret_cast<void**>(storage) = data;
+            throw std::runtime_error("Heap-stored native continuations were not verified");
         }
         tagged = other.tagged;
     }

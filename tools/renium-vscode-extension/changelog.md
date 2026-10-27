@@ -4,7 +4,7 @@
 
 ### Bug fixes
 
-- Native Play verifies its callback bindings before arming and supports Studio's compact continuation layout, preventing crashes when starting solo or Server & Clients tests.
+- Native Play verifies callback layout and ownership before arming, supports Studio's compact continuations, and preserves running tests when a new multiplayer launch is refused.
 - `rbx dev` and the Play start no longer cancel a device-simulator worker that Studio 0.745 has left suspended inside an engine call; cancelling it closed Studio. The call still answers within 1.5 s and the late return is ignored.
 - The daemon no longer sends a device-simulator stop to every Studio that connects; device state is applied only after `rbx dev set` or `rbx dev stop` asked for it in this daemon session. On Studio 0.745 that unrequested call closed Studio whenever a device was active.
 - `rbx play` starts even when the device-simulator status call stalls; the result carries the error instead of the device fields.

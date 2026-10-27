@@ -1695,15 +1695,6 @@ fn start_attempt(
     teleport: Option<bool>,
 ) -> Result<AttemptOutcome> {
     let launch = new_play_launch(bridge, plan.label())?;
-    if plan.players().is_some()
-        && let Some(prefer_native) = teleport
-    {
-        crate::studio::teleport::preflight_multiplayer(
-            bridge,
-            &launch.edit_runtime_id,
-            prefer_native,
-        )?;
-    }
     // Device status decorates the result; a stalled device service must not
     // stop Play from starting.
     let mut device_simulation = studio_device_status(bridge)
@@ -1716,6 +1707,15 @@ fn start_attempt(
         }
         existing["deviceSimulation"] = device_simulation;
         return Ok(AttemptOutcome::AlreadyRunning(existing));
+    }
+    if plan.players().is_some()
+        && let Some(prefer_native) = teleport
+    {
+        crate::studio::teleport::preflight_multiplayer(
+            bridge,
+            &launch.edit_runtime_id,
+            prefer_native,
+        )?;
     }
     let closed = close_leftover_test_processes(bridge, &launch.edit_runtime_id, LEFTOVER_GRACE);
     if cfg!(windows) && teleport.is_some() && plan.players().is_some() {
@@ -3888,6 +3888,21 @@ fn studio_play_status_for_runtime(bridge: &BridgeServer, runtime_id: &str) -> Re
     )?;
     ensure_plugin_api_ok(&status)?;
     Ok(status)
+}
+
+#[cfg(windows)]
+pub(crate) fn require_stopped_for_native_preflight(
+    bridge: &BridgeServer,
+    runtime_id: &str,
+) -> Result<()> {
+    let status = studio_play_status_for_runtime(bridge, runtime_id)?;
+    anyhow::ensure!(
+        play_status_is_stopped(&status)
+            && status["readyForStart"] != false
+            && !crate::studio::teleport::owns_transition(runtime_id, &status),
+        "A Studio play session is already active or starting in the selected window"
+    );
+    Ok(())
 }
 
 /// Waits until the Edit window can start a test: its controller is ready and

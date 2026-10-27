@@ -256,6 +256,11 @@ static DWORD ObservationBoundary(renium_observation::Params* params) {
         SetError(&params->base, error.what());
         return PublishCaptureResponse(&params->base, params->base.status);
     }
+    catch (...) {
+        params->base.status = 0xE626;
+        SetError(&params->base, "Unknown native observation submission failure");
+        return PublishCaptureResponse(&params->base, params->base.status);
+    }
 }
 extern "C" __declspec(dllexport) DWORD WINAPI ReniumObserveAttributes(renium_observation::Params* params) {
     if (!params) return 0xE000;

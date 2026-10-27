@@ -26,13 +26,12 @@ pub(in super::super) fn probe(
     studio: &ModuleEntry,
     model: &ActiveDataModel,
 ) -> Result<Value> {
-    let abi = types::yield_abi(memory, studio, TELEPORT, "TeleportAsync", 3)?;
-    anyhow::ensure!(
-        abi == types::yield_abi(memory, studio, INVOKE, "Invoke", 1)?,
-        "Native teleport continuation ABIs disagree"
-    );
-    let (slot, function) = types::yield_member(memory, studio, TELEPORT, "TeleportAsync", 3)?;
-    let (_, invoke) = types::yield_member(memory, studio, INVOKE, "Invoke", 1)?;
+    let types::YieldBinding {
+        slot,
+        function,
+        abi,
+    } = types::yield_member(memory, studio, TELEPORT, "TeleportAsync", 3)?;
+    let invoke = types::yield_member(memory, studio, INVOKE, "Invoke", 1)?.function;
     let launch = loader::nonce_bindings(memory, studio, model)?;
     let (factory, create) = result_factory(memory, studio)?;
 
@@ -89,8 +88,11 @@ impl NativeTeleportDispatch {
         )?;
         let layout = package_layout(&studio.path)?;
         let model = active_data_model(pid, &memory, studio, layout.data, title)?;
-        let (slot, function) = types::yield_member(&memory, studio, TELEPORT, "TeleportAsync", 3)?;
-        let (_, invoke) = types::yield_member(&memory, studio, INVOKE, "Invoke", 1)?;
+        let types::YieldBinding { slot, function, .. } =
+            types::yield_member(&memory, studio, TELEPORT, "TeleportAsync", 3)?;
+        let types::YieldBinding {
+            function: invoke, ..
+        } = types::yield_member(&memory, studio, INVOKE, "Invoke", 1)?;
         let runtime = path.and_then(|path| {
             path.last()
                 .and_then(|name| name.strip_prefix("__ReniumTeleportNative_"))
@@ -115,8 +117,8 @@ impl NativeTeleportDispatch {
                 put_u64(&mut request, 464 + index * 8, value);
             }
             for (at, value) in [
-                (592, owner.execute.0),
-                (600, owner.execute.1),
+                (592, owner.execute.slot),
+                (600, owner.execute.function),
                 (608, owner.place as usize),
                 (616, owner.universe as usize),
             ] {
@@ -226,8 +228,8 @@ impl NativeTeleportDispatch {
             for (index, value) in owner.fields.into_iter().enumerate() {
                 put_u64(&mut self.request, 464 + index * 8, value);
             }
-            put_u64(&mut self.request, 592, owner.execute.0);
-            put_u64(&mut self.request, 600, owner.execute.1);
+            put_u64(&mut self.request, 592, owner.execute.slot);
+            put_u64(&mut self.request, 600, owner.execute.function);
             put_u64(&mut self.request, 616, owner.universe as usize);
             self.root = Some(CachedDataModel {
                 title,

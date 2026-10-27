@@ -334,7 +334,7 @@ impl NativeTestJoin {
         for (index, value) in [
             relay.instance,
             relay.owner,
-            types::yield_member(&memory, studio, INVOKE, "Invoke", 1)?.1,
+            types::yield_member(&memory, studio, INVOKE, "Invoke", 1)?.function,
             native[&96],
             native[&104],
             native[&112],
@@ -417,8 +417,8 @@ impl NativePlayJoin {
         }
         if !shared_launch {
             let execute = types::yield_member(&memory, studio, EXECUTE, "ExecutePlayModeAsync", 1)?;
-            put_u64(&mut request, 72, execute.0);
-            put_u64(&mut request, 80, execute.1);
+            put_u64(&mut request, 72, execute.slot);
+            put_u64(&mut request, 80, execute.function);
         }
         let mut token = [0; 8];
         getrandom::fill(&mut token)

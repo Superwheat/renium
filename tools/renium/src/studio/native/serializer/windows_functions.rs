@@ -381,17 +381,30 @@ impl State {
     }
 
     fn invalidate_call_arguments(&mut self) {
-        // Unmodelled calls may mutate a callable passed by address.
-        for reg in [Register::RCX, Register::RDX, Register::R8, Register::R9] {
-            if let Some(Value::Pointer(Storage::Stack, at)) = self.register(reg) {
-                if matches!(self.stack.get(&at), Some((8, Value::ImagePointer(_)))) {
-                    self.store(at, 64, None);
-                } else if matches!(
-                    self.stack.get(&(at + 24)),
-                    Some((8, Value::TaggedPointer(..)))
-                ) {
-                    self.store(at, 32, None);
+        // A pointer into the capture is just as capable of mutating ownership
+        // as one to the callable's start. Outgoing stack slots are not arguments
+        // unless the callee's arity is known; they can contain stale pointers.
+        let passed = [Register::RCX, Register::RDX, Register::R8, Register::R9]
+            .iter()
+            .filter_map(|reg| self.register(*reg))
+            .collect::<Vec<_>>();
+        let ranges = self
+            .stack
+            .iter()
+            .filter_map(|(at, (_, value))| match value {
+                Value::ImagePointer(_)
+                    if self.stack.get(&(at + 56))
+                        == Some(&(8, Value::Pointer(Storage::Stack, *at))) =>
+                {
+                    Some((*at, 64))
                 }
+                Value::TaggedPointer(..) => Some((*at - 24, 32)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for (start, size) in ranges {
+            if passed.iter().any(|value| matches!(value, Value::Pointer(Storage::Stack, at) if *at >= start && *at < start + size as i64)) {
+                self.store(start, size, None);
             }
         }
     }
@@ -405,14 +418,15 @@ struct Flow {
 fn flow(
     entry: u64,
     initial: State,
-    code: &mut impl FnMut(u64) -> Option<Vec<u8>>,
+    code: &mut impl FnMut(u64, bool) -> Option<Vec<u8>>,
     budget: &mut usize,
 ) -> Option<Flow> {
-    let bytes = code(entry)?;
+    let bytes = code(entry, true)?;
     if bytes.len() > 65536 {
         return None;
     }
-    let instructions = Decoder::with_ip(64, &bytes, entry, DecoderOptions::NONE)
+    let mut code_budget = 65536usize.checked_sub(bytes.len())?;
+    let mut instructions = Decoder::with_ip(64, &bytes, entry, DecoderOptions::NONE)
         .into_iter()
         .map(|i| (i.ip(), i))
         .collect::<HashMap<_, _>>();
@@ -420,13 +434,27 @@ fn flow(
     let mut queue = VecDeque::from([entry]);
     while let Some(pc) = queue.pop_front() {
         *budget = budget.checked_sub(1)?;
+        if !instructions.contains_key(&pc) {
+            // MSVC can split a single control-flow graph into several unwind
+            // ranges. Verify every reached fragment instead of either skipping
+            // the method or assuming adjacent executable bytes belong to it.
+            let bytes = code(pc, true)?;
+            code_budget = code_budget.checked_sub(bytes.len())?;
+            for instruction in Decoder::with_ip(64, &bytes, pc, DecoderOptions::NONE) {
+                if let Some(previous) = instructions.insert(instruction.ip(), instruction)
+                    && previous != instruction
+                {
+                    return None;
+                }
+            }
+        }
         let i = instructions.get(&pc)?;
         if i.is_invalid() {
             return None;
         }
         let mut state = states[&pc].clone();
         let constructed = if i.flow_control() == FlowControl::Call {
-            yield_abi::constructor(&state, i.near_branch_target(), code)
+            yield_abi::constructor(&state, i.near_branch_target(), &mut |at| code(at, false))
         } else {
             None
         };
@@ -452,9 +480,6 @@ fn flow(
             _ => vec![i.next_ip()],
         };
         for next in successors {
-            if !instructions.contains_key(&next) {
-                return None;
-            }
             let changed = if let Some(existing) = states.get_mut(&next) {
                 existing.merge(&state)
             } else {
@@ -485,7 +510,7 @@ pub(in super::super) fn inline_callback_tables(
     let Flow {
         instructions,
         states,
-    } = flow(entry, initial, &mut code, &mut 32768)?;
+    } = flow(entry, initial, &mut |at, _| code(at), &mut 32768)?;
     let mut tables = HashSet::new();
     for (pc, state) in states {
         if instructions[&pc].flow_control() == FlowControl::Call
@@ -501,7 +526,7 @@ pub(in super::super) fn inline_callback_tables(
 fn dispatch_fields(
     entry: u64,
     initial: State,
-    code: &mut impl FnMut(u64) -> Option<Vec<u8>>,
+    code: &mut impl FnMut(u64, bool) -> Option<Vec<u8>>,
     budget: &mut usize,
     depth: usize,
     accept: &mut impl FnMut(usize, &State) -> bool,
@@ -576,6 +601,25 @@ fn dispatch_field_checked(
     lua_callback: bool,
     accept: &mut impl FnMut(usize, &State) -> bool,
 ) -> Option<usize> {
+    dispatch_field_fetch(entry, &mut |at, _| code(at), lua_callback, accept)
+}
+
+fn dispatch_field_fetch(
+    entry: u64,
+    code: &mut impl FnMut(u64, bool) -> Option<Vec<u8>>,
+    lua_callback: bool,
+    accept: &mut impl FnMut(usize, &State) -> bool,
+) -> Option<usize> {
+    let fields = dispatch_analysis(entry, code, lua_callback, accept)?;
+    (fields.len() == 1).then(|| *fields.iter().next().unwrap())
+}
+
+fn dispatch_analysis(
+    entry: u64,
+    code: &mut impl FnMut(u64, bool) -> Option<Vec<u8>>,
+    lua_callback: bool,
+    accept: &mut impl FnMut(usize, &State) -> bool,
+) -> Option<HashSet<usize>> {
     let initial = State {
         registers: HashMap::from([
             (Register::RCX, Value::Pointer(Storage::Descriptor, 0)),
@@ -586,8 +630,7 @@ fn dispatch_field_checked(
         stack: BTreeMap::new(),
         lua_callback,
     };
-    let fields = dispatch_fields(entry, initial, code, &mut 32768, 0, accept)?;
-    (fields.len() == 1).then(|| *fields.iter().next().unwrap())
+    dispatch_fields(entry, initial, code, &mut 32768, 0, accept)
 }
 
 pub(in super::super) fn binding(
@@ -675,9 +718,9 @@ fn member_field_for(
             break;
         }
         let mut error = None;
-        let field = dispatch_field_for(
+        let field = dispatch_field_fetch(
             method as u64,
-            |address| {
+            &mut |address, required| {
                 let address = usize::try_from(address).ok()?;
                 let rva = address.checked_sub(studio.base)?;
                 if let Some(code) = methods.get(&rva) {
@@ -689,12 +732,15 @@ fn member_field_for(
                         Some(code)
                     }
                     Err(message) => {
-                        error = Some(format!("{message:#}"));
+                        if required {
+                            error = Some(format!("{message:#}"));
+                        }
                         None
                     }
                 }
             },
             lua_callback,
+            &mut |_, _| true,
         );
         if let Some(error) = error {
             bail!("Could not verify reflection dispatch: {error}");
