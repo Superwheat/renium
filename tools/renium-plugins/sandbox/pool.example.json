@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "userId": 0,
+  "keyName": "sandbox",
+  "dedicatedSingleHostPool": true,
+  "orderedInventoryComplete": false,
+  "slots": [
+    {"name": "slot-1", "universeId": 0, "placeId": 0, "orderedStores": []}
+  ]
+}

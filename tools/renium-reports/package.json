@@ -1,6 +1,6 @@
 {
   "name": "renium-reports",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "private": true,
   "description": "Cloudflare Worker that validates Renium bug reports and stores them in R2",
   "type": "module",
