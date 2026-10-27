@@ -28,19 +28,50 @@ pub(crate) fn get_console_output_command(args: PluginConsoleOutputArgs) -> Resul
     }
     crate::app::output::drop_false(&mut result, &["hasMore", "truncated"]);
     compact_console_entries(&mut result);
-    if args.since_seq == 0 && crate::app::output::compact_text_output() {
-        // One-shot reads only need `nextSeq` to continue; the epoch and the
-        // per-line sequence numbers serve `--follow` and `--since-seq`.
-        if let Some(map) = result.as_object_mut() {
-            map.remove("epoch");
-        }
-        for entry in result["entries"].as_array_mut().into_iter().flatten() {
-            if let Some(map) = entry.as_object_mut() {
-                map.remove("seq");
-            }
-        }
+    if crate::app::output::compact_text_output() {
+        return print_console_text(&result, args.since_seq);
     }
     print_json_output(&result, false)
+}
+
+/// Text mode prints one header line (counts and `nextSeq`, which `--since-seq`
+/// continues from) and then each entry as `[level] message`, the shape
+/// `--follow` prints; json mode keeps the entry objects with `seq` and `time`.
+fn print_console_text(result: &Value, since_seq: u64) -> Result<()> {
+    let mut header = result.clone();
+    if let Some(map) = header.as_object_mut() {
+        map.remove("entries");
+        if since_seq == 0 {
+            map.remove("epoch");
+        }
+    }
+    print_json_output(&header, false)?;
+    for entry in result
+        .get("entries")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        println!("{}", console_entry_line(entry));
+    }
+    io::stdout().flush()?;
+    Ok(())
+}
+
+/// `[level] message`, with a repeat count when consecutive lines were folded
+/// and continuation lines indented so one entry stays one block.
+fn console_entry_line(entry: &Value) -> String {
+    let level = console_entry_level(entry);
+    let message = entry
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim_end()
+        .replace('\n', "\n  ");
+    match entry.get("repeat").and_then(Value::as_u64) {
+        Some(repeat) if repeat > 1 => format!("[{level}] {message} (x{repeat})"),
+        _ => format!("[{level}] {message}"),
+    }
 }
 
 /// Studio's MessageType names and a wall-clock stamp repeat on every line;
@@ -349,12 +380,7 @@ fn print_followed_console_entries(args: &PluginConsoleOutputArgs, result: &Value
     let matcher = ConsoleMatcher::new(args)?;
     if let Some(entries) = result.get("entries").and_then(Value::as_array) {
         for entry in entries.iter().filter(|entry| matcher.matches(entry)) {
-            let level = console_entry_level(entry);
-            let message = entry
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            println!("[{level}] {message}");
+            println!("{}", console_entry_line(entry));
         }
     }
     io::stdout().flush()?;
@@ -460,5 +486,25 @@ mod filter_tests {
         assert_eq!(kept[0]["seq"], 3);
         assert_eq!(result["folded"], 2);
         assert!(result.get("scanned").is_none());
+    }
+}
+
+#[cfg(test)]
+mod line_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn console_lines_carry_level_message_and_repeats() {
+        assert_eq!(
+            console_entry_line(
+                &json!({"message": "Requiring asset 1.\nCallstack:\nMain, line 5\n", "type": "print", "time": 6.7, "seq": 3})
+            ),
+            "[print] Requiring asset 1.\n  Callstack:\n  Main, line 5"
+        );
+        assert_eq!(
+            console_entry_line(&json!({"message": "same", "type": "warn", "repeat": 4})),
+            "[warn] same (x4)"
+        );
     }
 }
