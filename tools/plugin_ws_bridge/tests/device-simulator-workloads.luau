@@ -72,12 +72,17 @@ function runDeviceSimulatorWorkloads(RuntimeApi)
 		local started = now
 		local result = api.deviceSimulator({ action = scenario[2], device = "iPhone 16 Pro" })
 		assert(not result.ok and result.timedOut and now - started < 1.7, `{scenario[1]}: {result.error}`)
-		local retired = threads[#threads]
-		assert(coroutine.status(retired) == "dead", "timed-out workers must not run later setters or rollback")
+		-- The worker stays suspended inside the engine call (cancelling that
+		-- suspension can close Studio); its late return must stay inert.
+		local expiredWorker = threads[#threads]
 		stalledMethod = nil
 		local recovered = api.deviceSimulator({ action = "status", waitForStartup = true, includeSettle = true })
 		assert(recovered.ok and recovered.simulating and recovered.settleSeconds == 0,
 			"a timeout must release startup settling and allow the next request")
+		local callsBeforeResume = #calls
+		assert(coroutine.resume(expiredWorker))
+		assert(#calls == callsBeforeResume, "timed-out workers must not run later setters or rollback")
+		assert(coroutine.status(expiredWorker) == "dead", "a resumed expired worker finishes without further engine calls")
 	end
 	assert(api.deviceSimulator({ action = "set", device = "iPhone 16 Pro" }).ok)
 	assert(api.deviceSimulator({ action = "stop" }).ok)
@@ -102,6 +107,11 @@ function runDeviceSimulatorWorkloads(RuntimeApi)
 	heartbeat.Wait = function() wait(); authorized = false end
 	local result = api.deviceSimulator({ action = "status" })
 	assert(not result.ok and not result.timedOut and string.find(result.error, "cancelled lease", 1, true))
-	assert(coroutine.status(threads[#threads]) == "dead", "cancellation must retire the worker")
+	local cancelledWorker = threads[#threads]
+	stalledMethod = nil
+	local callsAfterCancel = #calls
+	assert(coroutine.resume(cancelledWorker))
+	assert(#calls == callsAfterCancel, "a cancelled worker must not call the engine after its lease ended")
+	assert(coroutine.status(cancelledWorker) == "dead", "a resumed cancelled worker finishes")
 	os.clock = originalClock
 end
