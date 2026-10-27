@@ -118,6 +118,19 @@ impl StoredSnapshot {
         Ok(())
     }
 
+    pub(super) fn packs_present(&self, root: &Path, key: &str) -> bool {
+        let directory = pack_directory(root, key);
+        self.entries
+            .values()
+            .filter_map(|entry| match entry {
+                StoredEntry::File(file) => Some(file.pack.as_str()),
+                _ => None,
+            })
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .all(|name| directory.join(format!("{name}.bin")).is_file())
+    }
+
     pub(super) fn prune(&self, root: &Path, key: &str) -> Result<()> {
         let directory = pack_directory(root, key);
         let used = self

@@ -374,6 +374,19 @@ pub(crate) fn load_record(context: &BoundContext, key: &str) -> Result<Option<Pa
         record.local_file_digest = None;
         write_record(context, key, &record)?;
     }
+    if let Some(baseline) = record.baseline.as_ref()
+        && !baseline.packs_present(Path::new(&context.root), key)
+    {
+        log_global(
+            1,
+            format_args!(
+                "[renium] reconciliation baseline packs are missing for {key}; the next pairing rebuilds the baseline"
+            ),
+        );
+        record.baseline = None;
+        record.studio_checkpoint = None;
+        write_record(context, key, &record)?;
+    }
     Ok(Some(record))
 }
 

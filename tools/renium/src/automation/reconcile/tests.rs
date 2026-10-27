@@ -670,6 +670,76 @@ fn first_pairing_twins_use_first_comparison_noise_rules() {
 }
 
 #[test]
+fn load_record_drops_a_baseline_whose_packs_are_missing() -> Result<()> {
+    let root = crate::tests::support::temp_dir("missing-packs");
+    fs::create_dir_all(root.join("src"))?;
+    fs::write(root.join("src/A.luau"), b"return 1")?;
+    let context = BoundContext {
+        id: 1,
+        initialized: true,
+        project: root
+            .join("renium.project.jsonc")
+            .to_string_lossy()
+            .into_owned(),
+        root: root.to_string_lossy().into_owned(),
+        experience: String::new(),
+        source: root.join("src").to_string_lossy().into_owned(),
+        resource_lease: None,
+        place_id: None,
+        game_id: None,
+        selector: String::new(),
+        runtime_id: None,
+        plugin_build: None,
+        fingerprint: String::new(),
+    };
+    let snapshot = capture_snapshot(&root, &[PathBuf::from("src")])?;
+    let record = PairRecord {
+        version: RECORD_VERSION,
+        identity: PairIdentity {
+            experience: root.to_string_lossy().into_owned(),
+            project: root.to_string_lossy().into_owned(),
+            fingerprint: String::new(),
+            game_id: None,
+            place_id: None,
+            local_file: None,
+        },
+        mode: PairMode::Reconcile,
+        conflict_preference: ConflictPreference::None,
+        runtime_settings: Map::new(),
+        baseline: Some(store::StoredSnapshot::write(&root, "pair", &snapshot)?),
+        head: None,
+        conflicts: Vec::new(),
+        resolution_required: false,
+        last_runtime_id: None,
+        local_file_stamp: None,
+        local_file_digest: None,
+        studio_checkpoint: Some(StudioCheckpoint {
+            runtime_id: "runtime".into(),
+            change_tracker_version: 4,
+            seq: 7,
+            service_generations: BTreeMap::new(),
+        }),
+    };
+    write_record(&context, "pair", &record)?;
+    let intact = load_record(&context, "pair")?.unwrap();
+    assert!(intact.baseline.is_some());
+    assert!(intact.studio_checkpoint.is_some());
+    let packs = root.join(".renium/reconcile/pair/packs");
+    for entry in fs::read_dir(&packs)? {
+        fs::remove_file(entry?.path())?;
+    }
+    let healed = load_record(&context, "pair")?.unwrap();
+    assert!(healed.baseline.is_none());
+    assert!(healed.studio_checkpoint.is_none());
+    assert!(!root.join(".renium/reconcile/pair").exists());
+    let bytes = fs::read(record_path(&context, "pair"))?;
+    let persisted: PairRecord = rmp_serde::from_slice(&bytes)?;
+    assert!(persisted.baseline.is_none());
+    let _ = fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[test]
 fn pulled_baseline_records_studio_bytes_even_when_restoration_publishes_no_file_change()
 -> Result<()> {
     let root = crate::tests::support::temp_dir("restored-pull-baseline");
