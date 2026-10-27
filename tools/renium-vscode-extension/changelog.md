@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Bug fixes
+
+- A pairing whose stored baseline points at deleted reconciliation packs no longer fails Play or Live Sync with `Failed to read reconciliation pack`; Renium drops the stale baseline, logs it, and the next pairing rebuilds it.
+
 ## 0.5.3 - 2026-10-27
 
 ### Improvements
