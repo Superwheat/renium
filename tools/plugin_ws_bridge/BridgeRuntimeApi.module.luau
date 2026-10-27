@@ -2893,7 +2893,7 @@ updateMouse()
 		local finishedAt = nil
 		local requestThread = coroutine.running()
 		local operation = { cancelled = false }
-		local worker = task.spawn(function()
+		task.spawn(function()
 			result = table.pack(pcall(runDeviceSimulator, params, requestThread, operation))
 			finishedAt = os.clock()
 		end)
@@ -2907,10 +2907,10 @@ updateMouse()
 			end
 		end
 		if result == nil or finishedAt > deadline or cancellationError ~= nil then
+			-- A worker suspended inside an engine Async call is left to finish on
+			-- its own: cancelling that suspension can take Studio down, and the
+			-- cancelled flag already turns its late return into a no-op.
 			operation.cancelled = true
-			if coroutine.status(worker) ~= "dead" then
-				pcall(task.cancel, worker)
-			end
 			deviceSimulatorReadyAt = 0
 			deviceSimulatorStatusCache = nil
 			return {

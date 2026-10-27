@@ -5,6 +5,8 @@
 ### Bug fixes
 
 - `rbx play -s -p N` refuses Server & Clients travel on Studio 0.745 with a one-line reason instead of launching: the native launch passes every read-only probe on that build and still closes Studio. Solo Play and Studio's own Test tab keep working; the launch is re-enabled once it is verified on 0.745.
+- `rbx dev` and the Play start no longer cancel a device-simulator worker that Studio 0.745 has left suspended inside an engine call; cancelling it closed Studio. The call still answers within 1.5 s and the late return is ignored.
+- `rbx play` starts even when the device-simulator status call stalls; the result carries the error instead of the device fields.
 - The Server & Clients preflight error names the native probe's reason (an unpublished place, a failed structural check) instead of the generic native-hook sentence.
 
 ## 0.5.3 - 2026-10-27

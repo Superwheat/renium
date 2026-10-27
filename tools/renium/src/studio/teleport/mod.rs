@@ -38,8 +38,10 @@ fn require_multiplayer_native(available: bool) -> Result<()> {
 /// Newest Studio build whose native Server & Clients launch is verified. Studio
 /// 0.745 passes every read-only probe and still exits during the launch, so
 /// newer builds refuse multiplayer travel until the launch is verified again.
+#[cfg_attr(not(windows), allow(dead_code))]
 const MULTIPLAYER_LAUNCH_VERIFIED_BUILD: u32 = 744;
 
+#[cfg_attr(not(windows), allow(dead_code))]
 fn require_verified_launch_build(build: u32) -> Result<()> {
     ensure!(
         build <= MULTIPLAYER_LAUNCH_VERIFIED_BUILD,

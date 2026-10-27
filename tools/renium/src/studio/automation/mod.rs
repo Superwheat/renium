@@ -1704,7 +1704,10 @@ fn start_attempt(
             prefer_native,
         )?;
     }
-    let mut device_simulation = studio_device_status(bridge)?;
+    // Device status decorates the result; a stalled device service must not
+    // stop Play from starting.
+    let mut device_simulation = studio_device_status(bridge)
+        .unwrap_or_else(|error| json!({ "error": format!("{error:#}") }));
     let waited = Instant::now();
     let mut existing = wait_for_studio_play_ready(bridge, &launch.edit_runtime_id)?;
     if play_status_is_running(&existing) {
