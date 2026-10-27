@@ -770,22 +770,7 @@ fn trace_serializer(path: &Path, bytes: &[u8]) -> Result<SerializerTrace> {
     }
     let deallocator =
         image.call_target(deallocator_call.expect("deallocator signature count was validated"))?;
-    let wrapper_offset = image.rva_to_offset(wrapper)?;
-    let wrapper_prefix = hex("40534883EC6033C0488BD9")?;
-    if slice(bytes, wrapper_offset, wrapper_prefix.len())? != wrapper_prefix {
-        bail!("Studio serializer wrapper changed");
-    }
-    let async_prefix = hex("4C8BDC534881ECD0000000")?;
-    let async_wrapper = unique_function_call(&image, wrapper, &async_prefix)?;
-    let invoke_prefix = hex("4883EC68488B41504C8B49204C8B4118488B5110")?;
-    let invoke = serializer_callback(&image, async_wrapper, &invoke_prefix)?;
-    let calls = direct_calls(&image, invoke)?;
-    anyhow::ensure!(
-        calls.len() == 1,
-        "Studio serializer callback has {} direct calls",
-        calls.len()
-    );
-    let serializer = calls[0];
+    let serializer = serializer_implementation(&image, wrapper)?;
     let trace = SerializerTrace {
         serializer,
         context_builder,
@@ -832,28 +817,27 @@ fn direct_calls(image: &PeImage<'_>, rva: usize) -> Result<Vec<usize>> {
         .collect()
 }
 
-fn unique_function_call(image: &PeImage<'_>, caller: usize, prefix: &[u8]) -> Result<usize> {
-    let mut calls = direct_calls(image, caller)?
-        .into_iter()
-        .filter(|rva| {
-            image
-                .rva_to_offset(*rva)
-                .ok()
-                .and_then(|offset| image.bytes.get(offset..offset + prefix.len()))
-                == Some(prefix)
-        })
-        .collect::<Vec<_>>();
-    calls.sort_unstable();
-    calls.dedup();
+fn serializer_implementation(image: &PeImage<'_>, wrapper: usize) -> Result<usize> {
+    let stream_write = serializer_stream_write(image)?;
+    let mut candidates = HashSet::new();
+    for callee in direct_calls(image, wrapper)? {
+        for callback in serializer_callback_methods(image, callee)? {
+            if let Some(target) = serializer_callback_target(image, callback)
+                && serializer_stream_contract(image, target, stream_write)?
+            {
+                candidates.insert(target);
+            }
+        }
+    }
     anyhow::ensure!(
-        calls.len() == 1,
+        candidates.len() == 1,
         "Studio serializer wrapper resolved {} implementations",
-        calls.len()
+        candidates.len()
     );
-    Ok(calls[0])
+    Ok(*candidates.iter().next().unwrap())
 }
 
-fn serializer_callback(image: &PeImage<'_>, wrapper: usize, prefix: &[u8]) -> Result<usize> {
+fn serializer_callback_methods(image: &PeImage<'_>, wrapper: usize) -> Result<HashSet<usize>> {
     let mut candidates = HashSet::new();
     for instruction in decoded_function(image, wrapper)? {
         if instruction.mnemonic() != iced_x86::Mnemonic::Lea
@@ -864,8 +848,9 @@ fn serializer_callback(image: &PeImage<'_>, wrapper: usize, prefix: &[u8]) -> Re
         let Ok(table) = image.rva_to_offset(instruction.ip_rel_memory_address() as usize) else {
             continue;
         };
-        // A std::function implementation has executable virtual methods; the
-        // invoke method is identified by its argument marshalling, not its slot.
+        // Follow the referenced callable table, independent of its method slots
+        // or the compiler's wrapper prologue. In 0.745 the std::function vtable
+        // became a table with both ostream and string-buffer invoke methods.
         for slot in (0..128).step_by(8) {
             let Ok(address) = read_u64(image.bytes, table + slot) else {
                 break;
@@ -876,18 +861,136 @@ fn serializer_callback(image: &PeImage<'_>, wrapper: usize, prefix: &[u8]) -> Re
             if image.require_executable_rva(rva).is_err() {
                 break;
             }
-            let offset = image.rva_to_offset(rva)?;
-            if image.bytes.get(offset..offset + prefix.len()) == Some(prefix) {
-                candidates.insert(rva);
+            candidates.insert(rva);
+        }
+    }
+    Ok(candidates)
+}
+
+fn serializer_callback_target(image: &PeImage<'_>, callback: usize) -> Option<usize> {
+    use iced_x86::{Mnemonic, OpKind, Register};
+    // Track the captured fields forwarded to the helper's eleven-argument ABI.
+    // Field positions are relative to the first capture: a callable may have a
+    // vptr header (0.744), no header (0.745), or move the captures together.
+    let mut registers = HashMap::new();
+    let mut stack = HashMap::new();
+    let mut frame = None;
+    for i in decoded_function(image, callback).ok()? {
+        match i.mnemonic() {
+            Mnemonic::Sub
+                if i.op0_register() == Register::RSP
+                    && matches!(
+                        i.op1_kind(),
+                        OpKind::Immediate8to64 | OpKind::Immediate32to64
+                    )
+                    && frame.is_none() =>
+            {
+                frame = Some(i.immediate(1));
             }
+            Mnemonic::Mov
+                if i.op0_kind() == OpKind::Register
+                    && i.op1_kind() == OpKind::Memory
+                    && i.memory_base() == Register::RCX
+                    && i.memory_index() == Register::None
+                    && !registers.contains_key(&Register::RCX) =>
+            {
+                registers.insert(
+                    i.op0_register().full_register(),
+                    (i.memory_displacement64(), i.memory_size().size()),
+                );
+            }
+            Mnemonic::Mov
+                if i.op0_kind() == OpKind::Memory
+                    && i.memory_base() == Register::RSP
+                    && i.memory_index() == Register::None =>
+            {
+                let value = match i.op1_kind() {
+                    OpKind::Register => {
+                        let field = *registers.get(&i.op1_register().full_register())?;
+                        (field.1 == i.memory_size().size()).then_some(Some(field))?
+                    }
+                    OpKind::Immediate32to64 if i.immediate32to64() == 0 => None,
+                    _ => return None,
+                };
+                stack.insert(i.memory_displacement64(), value);
+            }
+            Mnemonic::Call if i.op0_kind() == OpKind::NearBranch64 => {
+                let &(base, width) = registers.get(&Register::RCX)?;
+                base.checked_add(0x48)?;
+                let register_args = [Register::RCX, Register::RDX, Register::R8, Register::R9];
+                let valid_registers = register_args
+                    .iter()
+                    .enumerate()
+                    .all(|(n, reg)| registers.get(reg) == Some(&(base + n as u64 * 8, 8)));
+                let valid_stack = (0..6).all(|n| {
+                    stack.get(&(0x20 + n * 8))
+                        == Some(&Some((base + 0x20 + n * 8, if n == 0 { 4 } else { 8 })))
+                });
+                let target = i.near_branch_target() as usize;
+                return (width == 8
+                    && frame.is_some_and(|size| size >= 0x58 && size % 16 == 8)
+                    && valid_registers
+                    && valid_stack
+                    && stack.get(&0x50) == Some(&None)
+                    && image.require_executable_rva(target).is_ok())
+                .then_some(target);
+            }
+            Mnemonic::Nop => {}
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn serializer_stream_write(image: &PeImage<'_>) -> Result<usize> {
+    const WRITE: &str = "?write@?$basic_ostream@DU?$char_traits@D@std@@@std@@QEAAAEAV12@PEBD_J@Z";
+    // The on-disk IAT contains import-by-name RVAs, not loaded function pointers.
+    let (rva, size) = probes::directory(image, 12)?;
+    let table = image.rva_to_offset(rva)?;
+    let mut slots = Vec::new();
+    for slot in (0..size).step_by(8) {
+        let name = read_u64(image.bytes, table + slot)?;
+        if name != 0
+            && name < u32::MAX as u64
+            && probes::image_string(image, name as usize + 2).ok() == Some(WRITE)
+        {
+            slots.push(rva + slot);
         }
     }
     anyhow::ensure!(
-        candidates.len() == 1,
-        "Studio serializer callback resolved {} implementations",
-        candidates.len()
+        slots.len() == 1,
+        "Studio ostream write import is not unique"
     );
-    Ok(*candidates.iter().next().unwrap())
+    Ok(slots[0])
+}
+
+fn serializer_stream_contract(
+    image: &PeImage<'_>,
+    target: usize,
+    stream_write: usize,
+) -> Result<bool> {
+    use iced_x86::{Mnemonic, OpKind};
+    let mut header = false;
+    let mut writes_stream = false;
+    let mut chunks = HashSet::new();
+    for i in decoded_function(image, target)? {
+        header |= i.mnemonic() == Mnemonic::Mov
+            && i.op1_kind() == OpKind::Immediate64
+            && i.immediate64() == u64::from_le_bytes(*b"<roblox!");
+        writes_stream |= i.mnemonic() == Mnemonic::Call
+            && i.is_ip_rel_memory_operand()
+            && i.ip_rel_memory_address() as usize == stream_write;
+        if i.mnemonic() == Mnemonic::Lea
+            && i.is_ip_rel_memory_operand()
+            && let Ok(name) = probes::image_string(image, i.ip_rel_memory_address() as usize)
+            && matches!(name, "INST" | "PROP" | "PRNT" | "END")
+        {
+            chunks.insert(name);
+        }
+    }
+    // Both 0.745 invoke methods write binary chunks. Only this one accepts the
+    // std::ostream supplied by Renium's helper; the string-buffer ABI is unsafe.
+    Ok(header && writes_stream && chunks.len() == 4)
 }
 
 fn serializer_operands_consistent(b: &[u8]) -> bool {
