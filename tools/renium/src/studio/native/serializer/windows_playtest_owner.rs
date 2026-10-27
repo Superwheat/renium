@@ -16,9 +16,11 @@ pub(in super::super) fn resolve(
     studio: &ModuleEntry,
     model: &ActiveDataModel,
 ) -> Result<Binding> {
-    anyhow::ensure!(types::yield_abi(memory, studio, EXECUTE, "ExecutePlayModeAsync", 1)?
-        == types::yield_abi(memory, studio, dispatch::INVOKE, "Invoke", 1)?,
-        "Native launch continuation ABIs disagree");
+    anyhow::ensure!(
+        types::yield_abi(memory, studio, EXECUTE, "ExecutePlayModeAsync", 1)?
+            == types::yield_abi(memory, studio, dispatch::INVOKE, "Invoke", 1)?,
+        "Native launch continuation ABIs disagree"
+    );
     let execute = types::yield_member(memory, studio, EXECUTE, "ExecutePlayModeAsync", 1)?;
     let (fields, place, universe) = task_binding(memory, studio, model)?;
     Ok(Binding {

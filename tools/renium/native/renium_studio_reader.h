@@ -834,7 +834,7 @@ inline DWORD Queue(Parameters* parameters)
             SetEvent(task->completed);
         }};
         task->clock.Next(ReaderPhase::DispatchQueue);
-        if (!reinterpret_cast<SubmitDataModelTask>(parameters->submit)(reinterpret_cast<void*>(parameters->taskContext), &work, 1))
+        if (!SubmitDataModelTask(parameters->submit)(reinterpret_cast<void*>(parameters->taskContext), &work, 1))
             throw std::runtime_error("Studio rejected the native import task");
         const auto remaining = RemainingMilliseconds(task->deadline);
         if (!remaining || WaitForSingleObject(task->completed, remaining) != WAIT_OBJECT_0)

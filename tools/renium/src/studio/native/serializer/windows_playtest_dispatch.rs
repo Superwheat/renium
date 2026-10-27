@@ -27,7 +27,10 @@ pub(in super::super) fn probe(
     model: &ActiveDataModel,
 ) -> Result<Value> {
     let abi = types::yield_abi(memory, studio, TELEPORT, "TeleportAsync", 3)?;
-    anyhow::ensure!(abi == types::yield_abi(memory, studio, INVOKE, "Invoke", 1)?, "Native teleport continuation ABIs disagree");
+    anyhow::ensure!(
+        abi == types::yield_abi(memory, studio, INVOKE, "Invoke", 1)?,
+        "Native teleport continuation ABIs disagree"
+    );
     let (slot, function) = types::yield_member(memory, studio, TELEPORT, "TeleportAsync", 3)?;
     let (_, invoke) = types::yield_member(memory, studio, INVOKE, "Invoke", 1)?;
     let launch = loader::nonce_bindings(memory, studio, model)?;

@@ -11,7 +11,7 @@
 #include <unordered_set>
 
 namespace renium_play_loader {
-constexpr std::uint32_t Protocol = 3;
+constexpr std::uint32_t Protocol = 4;
 constexpr std::uint64_t MaxBytes = 128ull * 1024 * 1024;
 enum Phase : std::uint32_t { Armed = 1, Serializing = 2, Consumed = 3, Cancelled = 4, Failed = 5 };
 
@@ -25,11 +25,11 @@ struct Request {
     std::uint64_t bytes, length, hostCreation;
     std::uint32_t hostPid, lifetimeMs;
     char error[256];
-    std::uint64_t getAttribute, stringTypeTable, reserved, sourceInstance;
+    std::uint64_t getAttribute, stringTypeTable, directModel, sourceInstance;
     char launchNonce[128];
 };
 static_assert(sizeof(Request) == 560);
-using Callback = void(*)(void*, void**);
+using Callback = void(*)(void*, void*);
 
 struct Lease {
     Request request{};
@@ -63,7 +63,7 @@ inline bool Exchange(std::uint64_t slot, void* expected, void* replacement) {
     return exchanged;
 }
 
-inline void CallbackEntry(void* capture, void** model);
+inline void CallbackEntry(void* capture, void* argument);
 
 inline void Restore(const Lease& lease) {
     if (current && current.get() != &lease) return;
@@ -121,19 +121,21 @@ inline bool MatchesLaunch(const Request& r) {
     return *reinterpret_cast<const std::string*>(value.payload) == r.launchNonce;
 }
 
-inline void CallbackEntry(void* capture, void** model) {
+inline void CallbackEntry(void* capture, void* argument) {
     std::shared_ptr<Lease> lease;
     const auto forward = original.load(std::memory_order_acquire);
     {
         std::lock_guard lock(mutex);
-        if (current && current->phase == Armed && model && *model == reinterpret_cast<void*>(current->request.sourceModel)) {
+        const auto model = !current || !argument ? nullptr : current->request.directModel
+            ? argument : *static_cast<void**>(argument);
+        if (current && current->phase == Armed && model == reinterpret_cast<void*>(current->request.sourceModel)) {
             lease = current;
             lease->phase = lease->Alive() ? Serializing : Cancelled;
         }
     }
-    // Forward every invocation with the complete reflected std::function ABI.
+    // Preserve the verified pointer/reference argument when forwarding.
     // No host lock or thread-local ownership spans an engine call/fiber yield.
-    try { forward(capture, model); }
+    try { forward(capture, argument); }
     catch (...) {
         if (lease) {
             std::lock_guard lock(mutex);
@@ -185,7 +187,7 @@ inline void Handle(Request& request) {
     if (request.action == 1) {
         const auto& f = request.fields;
         if (!request.slot || request.slot % 8 || !request.original || !request.sourceModel
-            || !request.getAttribute || !request.stringTypeTable || request.reserved || !request.sourceInstance
+            || !request.getAttribute || !request.stringTypeTable || request.directModel > 1 || !request.sourceInstance
             || !request.launchNonce[0] || request.launchNonce[127]
             || !request.sourcePlace || !request.sourceUniverse || !request.destinationPlace
             || request.sourceUniverse != request.destinationUniverse

@@ -55,6 +55,7 @@ fn native_gate_rejects_writes_allocations_and_both_thread_ownership_modes() {
         handle: null_mut(),
         pid: 0,
         verified: Cell::new(false),
+        task_abi: Cell::new(None),
     });
     assert_eq!(
         memory.write(0, &[1]).unwrap_err().to_string(),
@@ -89,6 +90,7 @@ fn native_gate_rejects_new_and_resident_helpers() {
         handle: null_mut(),
         pid: 0,
         verified: Cell::new(false),
+        task_abi: Cell::new(None),
     });
     let path = Path::new("resident-helper.dll");
     let resident = [ModuleEntry {
@@ -115,6 +117,7 @@ fn native_gate_rejects_new_and_resident_helpers() {
         handle: null_mut(),
         pid: 0,
         verified: Cell::new(true),
+        task_abi: Cell::new(None),
     });
     assert_eq!(
         ensure_library_loaded(0, &verified, &resident, 0, path).unwrap(),

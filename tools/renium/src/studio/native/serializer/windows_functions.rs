@@ -235,6 +235,25 @@ impl State {
         }
     }
 
+    fn move_instruction(&mut self, i: &Instruction, width: usize, dst: Register) {
+        let width = if matches!(i.mnemonic(), Mnemonic::Movd | Mnemonic::Movsxd) {
+            4
+        } else if i.mnemonic() == Mnemonic::Movq {
+            8
+        } else {
+            width
+        };
+        let value = self.moved_value(i, width);
+        if i.op0_kind() == OpKind::Register {
+            self.registers.remove(&dst);
+            if let Some(value) = value {
+                self.registers.insert(dst, value);
+            }
+        } else if let Some((Storage::Stack, offset)) = self.address(i) {
+            self.store(offset, width, value);
+        }
+    }
+
     fn step(&mut self, i: &Instruction) {
         let dst = i.op0_register().full_register();
         let width = if i.op0_kind() == OpKind::Memory {
@@ -251,22 +270,7 @@ impl State {
             | Mnemonic::Movd
             | Mnemonic::Movq
             | Mnemonic::Movsxd => {
-                let width = if matches!(i.mnemonic(), Mnemonic::Movd | Mnemonic::Movsxd) {
-                    4
-                } else if i.mnemonic() == Mnemonic::Movq {
-                    8
-                } else {
-                    width
-                };
-                let value = self.moved_value(i, width);
-                if i.op0_kind() == OpKind::Register {
-                    self.registers.remove(&dst);
-                    if let Some(value) = value {
-                        self.registers.insert(dst, value);
-                    }
-                } else if let Some((Storage::Stack, offset)) = self.address(i) {
-                    self.store(offset, width, value);
-                }
+                self.move_instruction(i, width, dst);
             }
             Mnemonic::Lea => {
                 let value = if width == 8 && i.is_ip_rel_memory_operand() {
@@ -281,12 +285,17 @@ impl State {
                     self.registers.insert(dst, value);
                 }
             }
-            Mnemonic::Or if i.op0_kind() == OpKind::Register && width == 8 => {
-                let value = match (self.register(dst), i.op1_kind()) {
-                    (Some(Value::ImagePointer(at)), OpKind::Immediate8to64)
-                        if i.immediate8to64() == 6 =>
+            Mnemonic::Or | Mnemonic::And if i.op0_kind() == OpKind::Register && width == 8 => {
+                let value = match (self.register(dst), i.op1_kind(), i.mnemonic()) {
+                    (Some(Value::ImagePointer(at)), OpKind::Immediate8to64, Mnemonic::Or)
+                        if matches!(i.immediate8to64(), 2 | 6) && at % 8 == 0 =>
                     {
-                        Some(Value::TaggedPointer(at, 6))
+                        Some(Value::TaggedPointer(at, i.immediate8to64() as u8))
+                    }
+                    (Some(Value::ImagePointer(at)), OpKind::Immediate8to64, Mnemonic::And)
+                        if i.immediate8to64() == -5 && at % 8 == 0 =>
+                    {
+                        Some(Value::ImagePointer(at))
                     }
                     _ => None,
                 };
@@ -388,17 +397,17 @@ impl State {
     }
 }
 
-fn dispatch_fields(
+struct Flow {
+    instructions: HashMap<u64, Instruction>,
+    states: HashMap<u64, State>,
+}
+
+fn flow(
     entry: u64,
     initial: State,
     code: &mut impl FnMut(u64) -> Option<Vec<u8>>,
     budget: &mut usize,
-    depth: usize,
-    accept: &mut impl FnMut(usize, &State) -> bool,
-) -> Option<HashSet<usize>> {
-    if depth > 8 {
-        return None;
-    }
+) -> Option<Flow> {
     let bytes = code(entry)?;
     if bytes.len() > 65536 {
         return None;
@@ -416,7 +425,18 @@ fn dispatch_fields(
             return None;
         }
         let mut state = states[&pc].clone();
+        let constructed = if i.flow_control() == FlowControl::Call {
+            yield_abi::constructor(&state, i.near_branch_target(), code)
+        } else {
+            None
+        };
         state.step(i);
+        if let Some((object, table)) = constructed {
+            let value = Value::Pointer(Storage::Stack, object);
+            state.store(object, 8, Some(Value::ImagePointer(table)));
+            state.store(object + 56, 8, Some(value));
+            state.registers.insert(Register::RAX, value);
+        }
         let successors = match i.flow_control() {
             FlowControl::Return
             | FlowControl::Exception
@@ -446,6 +466,53 @@ fn dispatch_fields(
             }
         }
     }
+    Some(Flow {
+        instructions,
+        states,
+    })
+}
+
+pub(in super::super) fn inline_callback_tables(
+    entry: u64,
+    mut code: impl FnMut(u64) -> Option<Vec<u8>>,
+    argument: usize,
+) -> Option<Vec<usize>> {
+    let initial = State {
+        registers: HashMap::from([(Register::RSP, Value::Pointer(Storage::Stack, 0))]),
+        stack: BTreeMap::new(),
+        lua_callback: false,
+    };
+    let Flow {
+        instructions,
+        states,
+    } = flow(entry, initial, &mut code, &mut 32768)?;
+    let mut tables = HashSet::new();
+    for (pc, state) in states {
+        if instructions[&pc].flow_control() == FlowControl::Call
+            && let Some(object) = yield_abi::callback_object(&state, argument)
+            && let Some((8, Value::TaggedPointer(table, 2))) = state.stack.get(&(object + 24))
+        {
+            tables.insert(*table as usize);
+        }
+    }
+    Some(tables.into_iter().collect())
+}
+
+fn dispatch_fields(
+    entry: u64,
+    initial: State,
+    code: &mut impl FnMut(u64) -> Option<Vec<u8>>,
+    budget: &mut usize,
+    depth: usize,
+    accept: &mut impl FnMut(usize, &State) -> bool,
+) -> Option<HashSet<usize>> {
+    if depth > 8 {
+        return None;
+    }
+    let Flow {
+        instructions,
+        states,
+    } = flow(entry, initial, code, budget)?;
     let mut fields = HashSet::new();
     for (pc, mut state) in states {
         let i = &instructions[&pc];

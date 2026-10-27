@@ -52,6 +52,7 @@ pub(super) fn check(
         studio.base + layout.submit_task,
         64,
     )?;
+    let task_abi = task_abi::resolve(memory, studio, &layout, context)?;
     let allocator = allocator_probe(memory, studio, &loaded)?;
     let details = engine_probe(memory, studio, &layout, &model, operation)?;
     Ok(json!({
@@ -60,6 +61,7 @@ pub(super) fn check(
         "instanceOffset": model.layout.data_model_instance,
         "childrenOffset": model.layout.children, "selfOffset": model.layout.self_pointer,
         "taskContext": context, "submitTaskRva": layout.submit_task,
+        "taskContinuationAbi": task_abi as u32,
         "captureTaskContext": capture_binding.map(TaskContextBinding::readings),
         "binding": details, "allocator": allocator,
     }))
@@ -87,8 +89,11 @@ fn engine_probe(
             let loader = playtest::loader::resolve(memory, studio, model)?;
             helper_export_rva("ReniumPlayTeleport")?;
             helper_export_rva("ReniumPlayContinuations")?;
-            Ok(json!({"dispatch":dispatch,"launch":owner.fields,"execute":owner.execute,
-                "loaderSlot":loader.slot,"loaderFunction":loader.function}))
+            Ok(
+                json!({"dispatch":dispatch,"launch":owner.fields,"execute":owner.execute,
+                "loaderSlot":loader.slot,"loaderFunction":loader.function,
+                "loaderDirectModel":loader.direct_model}),
+            )
         }
         NativeOperation::PlayTeleportLoad => {
             let binding = playtest::loader::resolve(memory, studio, model)?;

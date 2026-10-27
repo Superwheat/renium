@@ -1,4 +1,6 @@
 use super::probes::NativeOperation;
+#[path = "windows_task_abi.rs"]
+mod task_abi;
 #[path = "windows_task_context.rs"]
 mod task_context;
 use std::cell::Cell;
@@ -195,6 +197,7 @@ struct ProcessMemory {
     handle: HANDLE,
     pid: u32,
     verified: Cell<bool>,
+    task_abi: Cell<Option<u32>>,
 }
 
 const NATIVE_WRITES_DISABLED: &str =
@@ -222,11 +225,13 @@ impl ProcessMemory {
             handle,
             pid,
             verified: Cell::new(false),
+            task_abi: Cell::new(None),
         })
     }
 
     fn authorize(&self, operation: NativeOperation, title: &str) -> Result<()> {
         self.verified.set(false);
+        self.task_abi.set(None);
         if let Some(target) = std::env::var_os("RENIUM_NATIVE_TARGET_PID") {
             let target = target
                 .to_str()
@@ -239,7 +244,12 @@ impl ProcessMemory {
         }
         let result = probes::check(self, self.pid, title, operation);
         super::probes::record(self.pid, operation, &result);
-        result.with_context(|| format!("Native {operation:?} unavailable"))?;
+        let report = result.with_context(|| format!("Native {operation:?} unavailable"))?;
+        self.task_abi.set(
+            report["taskContinuationAbi"]
+                .as_u64()
+                .map(|value| value as u32),
+        );
         self.verified.set(true);
         Ok(())
     }
@@ -263,6 +273,7 @@ impl ProcessMemory {
             handle,
             pid,
             verified: Cell::new(false),
+            task_abi: Cell::new(None),
         })
     }
 
@@ -1839,6 +1850,15 @@ fn ensure_helper_loaded_with_timeout(
         memory.read_u32(helper + version_rva)? == SERIALIZER_VERSION,
         "Incompatible native serializer helper protocol; restart Studio with the matching Renium build"
     );
+    if let Some(abi) = memory.task_abi.get() {
+        let entry = helper_export_rva("ReniumTaskContinuations")?;
+        let mut input = memory.allocate(4)?;
+        memory.write(input.address, &abi.to_le_bytes())?;
+        anyhow::ensure!(
+            input.run(helper + entry, timeout)? == 0,
+            "Native task continuation binding changed"
+        );
+    }
     Ok(helper)
 }
 

@@ -169,6 +169,7 @@ fn producer_fields(
     start: usize,
     identity: [usize; 2],
     instance: usize,
+    direct_model: bool,
     mut code: impl FnMut(usize) -> Option<Vec<u8>>,
 ) -> Option<Fields> {
     let mut pending = vec![(
@@ -176,7 +177,14 @@ fn producer_fields(
         Flow {
             registers: HashMap::from([
                 (Register::RCX, Origin::Capture(0)),
-                (Register::RDX, Origin::ModelReference),
+                (
+                    Register::RDX,
+                    if direct_model {
+                        Origin::Model(0)
+                    } else {
+                        Origin::ModelReference
+                    },
+                ),
                 (Register::RSP, Origin::Stack(0)),
             ]),
             ..Flow::default()
@@ -291,6 +299,7 @@ pub(in super::super) struct Binding {
     pub(in super::super) slot: usize,
     pub(in super::super) function: usize,
     pub(in super::super) fields: Fields,
+    pub(in super::super) direct_model: bool,
     code: Vec<(usize, Vec<u8>)>,
 }
 
@@ -372,7 +381,36 @@ pub(in super::super) fn resolve(
         loaders.len() == 1,
         "Solo loader has no unique structural owner"
     );
-    let mut found = Vec::new();
+    let mut candidates = Vec::new();
+    let mut owner_code = Vec::new();
+    for &owner in &loaders {
+        // The compact callable has no RTTI. Follow its actual construction
+        // and third-argument use in the source loader, then qualify the
+        // invoker's serialization and identity stores exactly as below.
+        let tables = properties::inline_callback_tables(
+            owner as u64,
+            |at| {
+                let at = usize::try_from(at).ok()?;
+                let (begin, end) = image::code_range(&pe, &index, at).ok()?;
+                if begin != at {
+                    return None;
+                }
+                let bytes = slice(pe.bytes, pe.rva_to_offset(begin).ok()?, end - begin)
+                    .ok()?
+                    .to_vec();
+                owner_code.push((begin, bytes.clone()));
+                Some(bytes)
+            },
+            2,
+        )
+        .unwrap_or_default();
+        for table in tables {
+            let function = read_u64(pe.bytes, pe.rva_to_offset(table)?)? as usize;
+            if let Some(function) = function.checked_sub(pe.image_base) {
+                candidates.push((table, function, true));
+            }
+        }
+    }
     for table in tables {
         let kind = table["type"].as_str().unwrap_or_default();
         let rva = table["vtableRva"]
@@ -395,33 +433,43 @@ pub(in super::super) fn resolve(
             let function = slot["targetRva"]
                 .as_u64()
                 .context("Missing callback method")? as usize;
-            let mut evidence = Vec::new();
-            if let Some(fields) = producer_fields(
+            candidates.push((
+                rva + slot["byteOffset"]
+                    .as_u64()
+                    .context("Missing callback slot")? as usize,
                 function,
-                identity,
-                model.layout.data_model_instance,
-                |address| {
-                    let (begin, end) = image::code_range(&pe, &index, address).ok()?;
-                    if begin != address {
-                        return None;
-                    }
-                    let bytes = slice(pe.bytes, pe.rva_to_offset(begin).ok()?, end - begin)
-                        .ok()?
-                        .to_vec();
-                    evidence.push((address, bytes.clone()));
-                    Some(bytes)
-                },
-            ) {
-                found.push(Binding {
-                    slot: rva
-                        + slot["byteOffset"]
-                            .as_u64()
-                            .context("Missing callback slot")? as usize,
-                    function,
-                    fields,
-                    code: evidence,
-                });
-            }
+                false,
+            ));
+        }
+    }
+    let mut found = Vec::new();
+    for (slot, function, direct_model) in candidates {
+        let mut evidence = Vec::new();
+        if let Some(fields) = producer_fields(
+            function,
+            identity,
+            model.layout.data_model_instance,
+            direct_model,
+            |address| {
+                let (begin, end) = image::code_range(&pe, &index, address).ok()?;
+                if begin != address {
+                    return None;
+                }
+                let bytes = slice(pe.bytes, pe.rva_to_offset(begin).ok()?, end - begin)
+                    .ok()?
+                    .to_vec();
+                evidence.push((address, bytes.clone()));
+                Some(bytes)
+            },
+        ) {
+            evidence.extend(owner_code.clone());
+            found.push(Binding {
+                slot,
+                function,
+                fields,
+                direct_model,
+                code: evidence,
+            });
         }
     }
     anyhow::ensure!(
@@ -527,11 +575,12 @@ impl NativePlayLoad {
         getrandom::fill(&mut nonce)
             .map_err(|error| anyhow::anyhow!("Cannot create Play loader lease: {error}"))?;
         let mut request = vec![0; 560];
-        put_u32(&mut request, 0, 3);
+        put_u32(&mut request, 0, 4);
         put_u32(&mut request, 4, 560);
         for (index, value) in nonce_bindings.into_iter().enumerate() {
             put_u64(&mut request, 400 + index * 8, value);
         }
+        put_u64(&mut request, 416, usize::from(binding.direct_model));
         request[432..432 + launch_nonce.len()].copy_from_slice(launch_nonce.as_bytes());
         for (offset, value) in [
             (16, u64::from_le_bytes(nonce).max(1) as usize),
@@ -697,10 +746,13 @@ mod tests {
                 let universe = place + 0x20;
                 for fields in [[32, 40], [88, 64]] {
                     let code = fixture(capture, place, universe, 0x1f0, fields);
-                    let actual =
-                        producer_fields(0, [place as usize, universe as usize], 0x1f0, |at| {
-                            (at == 0).then(|| code.clone())
-                        });
+                    let actual = producer_fields(
+                        0,
+                        [place as usize, universe as usize],
+                        0x1f0,
+                        false,
+                        |at| (at == 0).then(|| code.clone()),
+                    );
                     assert_eq!(
                         actual,
                         Some(Fields {
@@ -719,27 +771,75 @@ mod tests {
     fn loader_rejects_wrong_receiver_clobbered_fields_and_ambiguous_outputs() {
         let code = fixture(16, 0x398, 0x390, 0x1f0, [32, 40]);
         assert!(
-            producer_fields(0, [0x398, 0x390], 0x200, |at| (at == 0)
+            producer_fields(0, [0x398, 0x390], 0x200, false, |at| (at == 0)
                 .then(|| code.clone()))
             .is_none()
         );
         assert!(
-            producer_fields(0, [0x398, 0x400], 0x1f0, |at| (at == 0)
+            producer_fields(0, [0x398, 0x400], 0x1f0, false, |at| (at == 0)
                 .then(|| code.clone()))
             .is_none()
         );
         let duplicate = fixture(16, 0x398, 0x390, 0x1f0, [32, 32]);
         assert!(
-            producer_fields(0, [0x398, 0x390], 0x1f0, |at| (at == 0)
+            producer_fields(0, [0x398, 0x390], 0x1f0, false, |at| (at == 0)
                 .then(|| duplicate.clone()))
             .is_none()
         );
         let mut clobbered = code.clone();
         clobbered.splice(28..28, [0x31, 0xf6]); // lose the model receiver after serialization
         assert!(
-            producer_fields(0, [0x398, 0x390], 0x1f0, |at| (at == 0)
+            producer_fields(0, [0x398, 0x390], 0x1f0, false, |at| (at == 0)
                 .then(|| clobbered.clone()))
             .is_none()
         );
+    }
+
+    #[test]
+    fn loader_distinguishes_pointer_and_reference_callback_arguments() {
+        let reference = fixture(8, 0x398, 0x390, 0x1f0, [32, 40]);
+        let mut pointer = reference.clone();
+        pointer[6..9].copy_from_slice(&[0x48, 0x89, 0xd6]); // RSI = model, not *model
+        for (bytes, direct) in [(&reference, false), (&pointer, true)] {
+            assert!(
+                producer_fields(0, [0x398, 0x390], 0x1f0, direct, |at| (at == 0)
+                    .then(|| bytes.clone()))
+                .is_some()
+            );
+            assert!(
+                producer_fields(0, [0x398, 0x390], 0x1f0, !direct, |at| (at == 0)
+                    .then(|| bytes.clone()))
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn compact_loader_producer_proves_the_model_argument_and_serialized_identity() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../native/tests/windows-loader-dispatch.json"
+        ))
+        .unwrap();
+        let rows = fixture["producer"].as_array().unwrap();
+        for slide in [0, 0x40000000] {
+            let entry = rows[0]["entry"].as_u64().unwrap() as usize + slide;
+            for direct in [false, true] {
+                let actual = producer_fields(entry, [0x398, 0x390], 0x1f0, direct, |at| {
+                    rows.iter().find_map(|row| {
+                        (row["entry"].as_u64()? as usize + slide == at)
+                            .then(|| hex(row["hex"].as_str().unwrap()).unwrap())
+                    })
+                });
+                assert_eq!(
+                    actual,
+                    direct.then_some(Fields {
+                        capture: 8,
+                        string: 0,
+                        place: 32,
+                        universe: 40
+                    })
+                );
+            }
+        }
     }
 }

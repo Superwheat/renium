@@ -45,7 +45,7 @@ struct Capture { std::uint64_t padding[5]{}; Config* config; };
 static HANDLE entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 static HANDLE release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 static std::atomic<bool> delay{false};
-static void Producer(void* opaque, void**) {
+static void Producer(void* opaque, void*) {
     auto& config = *static_cast<Capture*>(opaque)->config;
     config.bytes.~basic_string();
     EngineGetString(&config.bytes); // engine allocation destroyed by the helper
@@ -88,16 +88,17 @@ static renium_play_loader::Request Request(std::uint64_t token, const std::strin
 static void Run() {
     using namespace renium_play_loader;
     std::uint64_t token = 1;
-    for (const auto size : {32, 8192, 131072, 2097152}) {
+    for (const auto direct : {false, true}) for (const auto size : {32, 8192, 131072, 2097152}) {
         std::string payload(size, 'd'); payload.replace(0, 7, "<roblox");
         auto r = Request(token++, payload);
+        r.directModel = direct;
         Handle(r);
         Config config; Capture capture{{}, &config};
         void* unrelated = reinterpret_cast<void*>(0x5678);
-        callback(&capture, &unrelated);
+        callback(&capture, direct ? unrelated : &unrelated);
         assert(current->phase == Armed && config.place == 11);
         void* model = reinterpret_cast<void*>(0x1234);
-        callback(&capture, &model);
+        callback(&capture, direct ? model : &model);
         assert(current->phase == Consumed && config.bytes == payload && config.place == 12 && config.universe == 7);
         assert(callback == &Producer);
     }
@@ -489,11 +490,14 @@ static void CaptionCleanup() {
     DestroyWindow(window);
 }
 
+#include "continuation_windows.h"
 int main() {
     renium_continuation::abi.store(renium_continuation::Abi::Msvc);
+    renium_continuation::taskAbi.store(renium_continuation::Abi::Msvc);
     assert(initial.size() == 512);
     const auto& allocator = renium_allocator::Engine();
     assert(allocator.allocate == &mi_malloc && allocator.release == &mi_free && allocator.aligned == &mi_malloc_aligned);
+    continuation_test::Run();
     play_loader_test::Run();
     teleport_dispatch_test::Run();
     CaptionCleanup();

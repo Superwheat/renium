@@ -46,6 +46,11 @@ pub(crate) fn preflight_multiplayer(
     #[cfg(windows)]
     {
         use crate::studio::native::serializer::{probes, target_name};
+        // Restore our idle manual-Play hook before inspecting the original
+        // engine bindings. Multiplayer arms its own server after startup.
+        let gate = automatic::gate(owner);
+        let _guard = gate.lock_recover();
+        drop(take_prepared(owner));
         let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, owner)?;
         let title = target_name(pid, "")?;
         if let Err(error) = probes::run(pid, &title, probes::NativeOperation::PlayTeleportLaunch) {

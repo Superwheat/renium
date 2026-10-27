@@ -95,6 +95,6 @@ inline bool Submit(void* model, const Binding& binding, std::function<void()> wo
     const auto context = renium_play_loader::Word(model, binding.contextField) & binding.contextMask;
     if (!context || renium_play_loader::Word(reinterpret_cast<void*>(context), 0) != binding.contextTable)
         throw std::runtime_error("Teleport model has an incompatible task context");
-    return reinterpret_cast<bool(*)(void*, std::function<void()>*, std::uint32_t)>(binding.submitTask)(reinterpret_cast<void*>(context), &work, 1);
+    return renium_continuation::SubmitTask(binding.submitTask, reinterpret_cast<void*>(context), &work, 1);
 }
 }

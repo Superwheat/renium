@@ -187,7 +187,7 @@ static bool Dispatch(const std::shared_ptr<Task>& task, bool begin) {
         SetEvent(completed.get());
     }};
     const auto& p = task->params.base;
-    if (!reinterpret_cast<SubmitDataModelTask>(p.submitTask)(reinterpret_cast<void*>(p.taskContext), &work, 1))
+    if (!SubmitDataModelTask(p.submitTask)(reinterpret_cast<void*>(p.taskContext), &work, 1))
         return false;
     if (WaitForSingleObject(completed.get(), 2000) == WAIT_OBJECT_0) return true;
     task->cancelled.store(true);

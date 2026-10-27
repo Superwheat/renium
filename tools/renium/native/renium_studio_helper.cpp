@@ -710,10 +710,7 @@ struct PackageActionParams
 
 static_assert(sizeof(PackageActionParams) == 688);
 
-using SubmitDataModelTask = bool(__fastcall*)(
-    void*,
-    std::function<void()>*,
-    std::uint32_t);
+using SubmitDataModelTask = renium_continuation::SubmitDataModelTask;
 using SetPackageModifiedState = void(__fastcall*)(void*, std::uint32_t);
 using PublishPackage = void(__fastcall*)(
     void*,
@@ -786,7 +783,7 @@ static DWORD QueueSerializer(ReniumSerializerParams* params)
         else RunSerializer(&task->result, &task->cancelled);
         SetEvent(task->completed);
     }};
-    auto submit = reinterpret_cast<SubmitDataModelTask>(params->submitTask);
+    auto submit = SubmitDataModelTask(params->submitTask);
     if (!submit(reinterpret_cast<void*>(params->taskContext), &work, 1))
         throw std::runtime_error("Studio rejected the native snapshot task");
     const auto remaining = RemainingMilliseconds(task->result.deadlineTick);
@@ -968,7 +965,7 @@ static void RunPackageModifiedStateTask(PackageActionParams* params)
         SetEvent(task->completed);
         ReleasePackageModifiedStateTask(task);
     }};
-    auto submit = reinterpret_cast<SubmitDataModelTask>(
+    auto submit = SubmitDataModelTask(
         params->moduleBase + params->submitTaskRva);
     if (!submit(reinterpret_cast<void*>(params->taskContext), &writeTask, 1))
     {
@@ -1198,7 +1195,7 @@ static void RunPackageOperationTask(PackageActionParams* params)
         SetEvent(task->dispatched);
         ReleasePackageOperationTask(task);
     }};
-    auto submit = reinterpret_cast<SubmitDataModelTask>(
+    auto submit = SubmitDataModelTask(
         params->moduleBase + params->submitTaskRva);
     if (!submit(reinterpret_cast<void*>(params->taskContext), &operationTask, 1))
     {
@@ -1517,7 +1514,7 @@ static DWORD RunPropertyRead(PropertyReadParams* params)
         ReadPropertyCaught(task.get());
         SetEvent(task->completed);
     }};
-    auto submit = reinterpret_cast<SubmitDataModelTask>(params->submitTask);
+    auto submit = SubmitDataModelTask(params->submitTask);
     if (!submit(reinterpret_cast<void*>(params->taskContext), &readTask, 1)) return 0xE407;
     const auto remaining = RemainingMilliseconds(task->deadline);
     if (!remaining || WaitForSingleObject(task->completed, remaining) != WAIT_OBJECT_0)

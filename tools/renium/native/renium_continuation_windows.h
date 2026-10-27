@@ -11,7 +11,7 @@
 // this helper. The selection is process-scoped and cannot change under hooks.
 namespace renium_continuation {
 enum class Abi : std::uint32_t { Unknown, Msvc, Tagged };
-inline std::atomic<Abi> abi{Abi::Unknown};
+inline std::atomic<Abi> abi{Abi::Unknown}, taskAbi{Abi::Unknown};
 inline bool Tagged() {
     const auto value = abi.load();
     if (value == Abi::Unknown) throw std::runtime_error("Native continuations were not verified");
@@ -87,10 +87,22 @@ public:
     explicit operator bool() const { return (tagged & ~std::uintptr_t{7}) != 0; }
     void operator()(Args... args) const {
         if (!*this) throw std::bad_function_call();
-        const auto invoke = tagged & 4 ? Table()->invoke
-            : reinterpret_cast<void(*)(void*, Args*...)>(tagged & ~std::uintptr_t{7});
+        const auto invoke = Table()->invoke;
         invoke(Data(), &args...);
     }
+};
+inline bool SubmitTask(std::uintptr_t address, void* context, std::function<void()>* work, std::uint32_t mode) {
+    if (taskAbi.load() == Abi::Tagged) {
+        Function<void()> callback(std::move(*work));
+        return reinterpret_cast<bool(*)(void*, Function<void()>*, std::uint32_t)>(address)(context, &callback, mode);
+    }
+    if (taskAbi.load() != Abi::Msvc) throw std::runtime_error("Native task continuations were not verified");
+    return reinterpret_cast<bool(*)(void*, std::function<void()>*, std::uint32_t)>(address)(context, work, mode);
+}
+struct SubmitDataModelTask {
+    std::uintptr_t address;
+    explicit SubmitDataModelTask(std::uintptr_t address) : address(address) {}
+    bool operator()(void* context, std::function<void()>* work, std::uint32_t mode) const { return SubmitTask(address, context, work, mode); }
 };
 static_assert(sizeof(Function<void(std::string)>) == 32);
 static_assert(sizeof(std::function<void(std::string)>) == 64);
@@ -102,4 +114,12 @@ extern "C" __declspec(dllexport) DWORD WINAPI ReniumPlayContinuations(void* inpu
     auto expected = renium_continuation::Abi::Unknown;
     const auto selected = static_cast<renium_continuation::Abi>(value);
     return renium_continuation::abi.compare_exchange_strong(expected, selected) || expected == selected ? 0 : 2;
+}
+
+extern "C" __declspec(dllexport) DWORD WINAPI ReniumTaskContinuations(void* input) {
+    const auto value = *static_cast<const std::uint32_t*>(input);
+    if (value != 1 && value != 2) return 1;
+    auto expected = renium_continuation::Abi::Unknown;
+    const auto selected = static_cast<renium_continuation::Abi>(value);
+    return renium_continuation::taskAbi.compare_exchange_strong(expected, selected) || expected == selected ? 0 : 2;
 }
