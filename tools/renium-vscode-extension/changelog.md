@@ -1,15 +1,5 @@
 # Changelog
 
-## Unreleased
-
-### Bug fixes
-
-- Native Play verifies callback layout and ownership before arming, supports Studio's compact continuations, and preserves running tests when a new multiplayer launch is refused.
-- `rbx dev` and the Play start no longer cancel a device-simulator worker that Studio 0.745 has left suspended inside an engine call; cancelling it closed Studio. The call still answers within 1.5 s and the late return is ignored.
-- The daemon no longer sends a device-simulator stop to every Studio that connects; device state is applied only after `rbx dev set` or `rbx dev stop` asked for it in this daemon session. On Studio 0.745 that unrequested call closed Studio whenever a device was active.
-- `rbx play` starts even when the device-simulator status call stalls; the result carries the error instead of the device fields.
-- The Server & Clients preflight error names the native probe's reason (an unpublished place, a failed structural check) instead of the generic native-hook sentence.
-
 ## 0.5.3 - 2026-10-27
 
 ### Improvements
@@ -25,6 +15,11 @@
 
 ### Bug fixes
 
+- Native Play verifies callback layout and ownership before arming, supports Studio's compact continuations, and preserves running tests when a new multiplayer launch is refused.
+- `rbx dev` and the Play start no longer cancel a device-simulator worker that Studio 0.745 has left suspended inside an engine call; cancelling it closed Studio. The call still answers within 1.5 s and the late return is ignored.
+- The daemon no longer sends a device-simulator stop to every Studio that connects; device state is applied only after `rbx dev set` or `rbx dev stop` asked for it in this daemon session. On Studio 0.745 that unrequested call closed Studio whenever a device was active.
+- `rbx play` starts even when the device-simulator status call stalls; the result carries the error instead of the device fields.
+- The Server & Clients preflight error names the native probe's reason (an unpublished place, a failed structural check) instead of the generic native-hook sentence.
 - Commands keep local Studio projects and explicit `--place` selections separate, including projects whose files share the same name.
 - Large plugin fallback exports and sync batches yield regularly to keep Studio's controls and built-in plugins responsive.
 - Server & Clients teleport now reports an unavailable native hook before starting the test and explains that compatibility travel supports solo Play only.
