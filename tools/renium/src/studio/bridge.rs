@@ -1358,7 +1358,11 @@ impl BridgeServer {
         let bind_started = Instant::now();
         let alive = Arc::new(AtomicBool::new(true));
         let next_id = Arc::new(std::sync::atomic::AtomicU64::new(21335));
-        let desired_device_request = Arc::new(Mutex::new(json!({ "action": "stop" })));
+        // Device simulation is only reconciled once a command has asked for a
+        // device state in this daemon; touching the simulator service on a
+        // Studio nobody configured is both unnecessary and, on some builds,
+        // fatal for Studio.
+        let desired_device_request = Arc::new(Mutex::new(Value::Null));
         let device_reconciled_runtimes = Arc::new(Mutex::new(HashSet::new()));
         let performance_manager =
             check_updates_on_connect.then(crate::studio::performance::Manager::load);
@@ -1724,6 +1728,7 @@ impl BridgeServer {
                                             })
                                             .count();
                                         if ready >= expected_channels
+                                            && !desired_device_request.lock_recover().is_null()
                                             && device_reconciled_runtimes
                                                 .lock_recover()
                                                 .insert(runtime_id.clone())
