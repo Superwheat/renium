@@ -14,6 +14,10 @@ pub(super) fn member(
     name: &str,
     lua: bool,
 ) -> Result<(usize, usize)> {
+    anyhow::ensure!(
+        !kind.starts_with(".?AV?$BoundYieldFuncDesc@"),
+        "Native yielding members require continuation ABI validation"
+    );
     let descriptor = singleton(memory, studio, kind, Some(name))?;
     let layout = package_layout(&studio.path)?;
     let (field, function) = if lua {
@@ -22,6 +26,37 @@ pub(super) fn member(
         properties::member_binding(memory, studio, &layout, descriptor)?
     };
     Ok((descriptor + field, function))
+}
+
+pub(super) fn yield_member(
+    memory: &ProcessMemory,
+    studio: &ModuleEntry,
+    kind: &str,
+    name: &str,
+    arguments: usize,
+) -> Result<(usize, usize)> {
+    let descriptor = singleton(memory, studio, kind, Some(name))?;
+    let layout = package_layout(&studio.path)?;
+    let (field, function) = properties::member_binding(memory, studio, &layout, descriptor)?;
+    // Receiver, public arguments, success continuation, error continuation.
+    properties::continuation_abi(memory, studio, &layout, descriptor, field, arguments + 2)
+        .with_context(|| format!("Native {name} is unavailable"))?;
+    Ok((descriptor + field, function))
+}
+
+pub(super) fn yield_abi(
+    memory: &ProcessMemory,
+    studio: &ModuleEntry,
+    kind: &str,
+    name: &str,
+    arguments: usize,
+) -> Result<properties::ContinuationAbi> {
+    let descriptor = singleton(memory, studio, kind, Some(name))?;
+    let layout = package_layout(&studio.path)?;
+    let table = memory.read_u64(descriptor)? as usize;
+    let field = properties::function_member_field(memory, studio, &layout, descriptor, table)?;
+    properties::continuation_abi(memory, studio, &layout, descriptor, field, arguments + 2)
+        .with_context(|| format!("Native {name} is unavailable"))
 }
 
 pub(super) fn singleton(

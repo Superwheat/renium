@@ -37,6 +37,25 @@ mod tests;
 #[path = "windows_playtest_types.rs"]
 mod types;
 
+/// The read-only ABI proof must precede helper injection and configuration.
+fn ensure_play_helper_loaded(
+    pid: u32,
+    memory: &ProcessMemory,
+    loaded: &[ModuleEntry],
+) -> Result<usize> {
+    let studio = loaded.first().context("Studio process ended")?;
+    let abi = types::yield_abi(memory, studio, dispatch::INVOKE, "Invoke", 1)?;
+    let entry = helper_export_rva("ReniumPlayContinuations")?;
+    let helper = ensure_helper_loaded(pid, memory, loaded)?;
+    let mut input = memory.allocate(4)?;
+    memory.write(input.address, &(abi as u32).to_le_bytes())?;
+    anyhow::ensure!(
+        input.run(helper + entry, 3000)? == 0,
+        "Studio's native continuation binding changed before launch"
+    );
+    Ok(helper)
+}
+
 #[cfg(test)]
 #[test]
 #[ignore = "requires the explicitly owned Studio process"]

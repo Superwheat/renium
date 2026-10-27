@@ -334,7 +334,7 @@ impl NativeTestJoin {
         for (index, value) in [
             relay.instance,
             relay.owner,
-            types::member(&memory, studio, INVOKE, "Invoke", false)?.1,
+            types::yield_member(&memory, studio, INVOKE, "Invoke", 1)?.1,
             native[&96],
             native[&104],
             native[&112],
@@ -377,7 +377,7 @@ impl NativeTestJoin {
                 request[offset..offset + text.len()].copy_from_slice(text.as_bytes());
             }
         }
-        let helper = ensure_helper_loaded(pid, &memory, &loaded)?;
+        let helper = ensure_play_helper_loaded(pid, &memory, &loaded)?;
         let mut lease = Self {
             memory,
             entry: helper + helper_export_rva("ReniumTestJoin")?,
@@ -416,7 +416,7 @@ impl NativePlayJoin {
             put_u64(&mut request, at, value);
         }
         if !shared_launch {
-            let execute = types::member(&memory, studio, EXECUTE, "ExecutePlayModeAsync", false)?;
+            let execute = types::yield_member(&memory, studio, EXECUTE, "ExecutePlayModeAsync", 1)?;
             put_u64(&mut request, 72, execute.0);
             put_u64(&mut request, 80, execute.1);
         }
@@ -431,7 +431,7 @@ impl NativePlayJoin {
         put_u64(&mut request, 208, created);
         put_u32(&mut request, 216, host);
         put_u32(&mut request, 220, 90000);
-        let helper = ensure_helper_loaded(pid, &memory, &loaded)?;
+        let helper = ensure_play_helper_loaded(pid, &memory, &loaded)?;
         Ok(Self {
             pid,
             memory,

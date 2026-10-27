@@ -8,7 +8,7 @@ const REMOVE: &str = ".?AV?$BoundFuncDesc@VReplicatedFirst@RBX@@$$A6AXXZ$0A@$0A@
 
 fn bindings(memory: &ProcessMemory, studio: &ModuleEntry) -> Result<[usize; 3]> {
     Ok([
-        types::member(memory, studio, INVOKE, "Invoke", false)?.1,
+        types::yield_member(memory, studio, INVOKE, "Invoke", 1)?.1,
         types::member(memory, studio, ADD, "AddCoreScriptLocal", false)?.1,
         types::member(memory, studio, REMOVE, "RemoveDefaultLoadingScreen", false)?.1,
     ])
@@ -52,7 +52,6 @@ pub(crate) fn notify_teleport_gui(
     } else {
         [(0, 0); 2]
     };
-    let helper = ensure_helper_loaded(pid, &memory, &loaded)?;
     let mut request = vec![0; 488];
     put_u32(&mut request, 0, 6);
     put_u32(&mut request, 4, 488);
@@ -83,6 +82,7 @@ pub(crate) fn notify_teleport_gui(
         .context("Teleport GUI host ended")?
         .parse::<usize>()?;
     put_u64(&mut request, 224, creation);
+    let helper = ensure_play_helper_loaded(pid, &memory, &loaded)?;
     let mut input = memory.allocate(request.len())?;
     memory.write(input.address, &request)?;
     let exit = input.run(helper + helper_export_rva("ReniumTeleportGui")?, 5000)?;

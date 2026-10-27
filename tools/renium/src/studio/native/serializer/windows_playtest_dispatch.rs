@@ -2,7 +2,7 @@
 use super::*;
 
 const TELEPORT: &str = ".?AV?$BoundYieldFuncDesc@VTeleportService@RBX@@$$A6A?AV?$shared_ptr@VInstance@RBX@@@std@@_JV?$shared_ptr@$$CBV?$vector@V?$shared_ptr@VInstance@RBX@@@std@@V?$allocator@V?$shared_ptr@VInstance@RBX@@@std@@@2@@std@@@4@V34@@Z$0A@$02@Reflection@RBX@@";
-const INVOKE: &str = ".?AV?$BoundYieldFuncDesc@VBindableFunction@RBX@@$$A6A?AV?$shared_ptr@$$CBUTuple@Reflection@RBX@@@std@@V34@@Z$0A@$00@Reflection@RBX@@";
+pub(super) const INVOKE: &str = ".?AV?$BoundYieldFuncDesc@VBindableFunction@RBX@@$$A6A?AV?$shared_ptr@$$CBUTuple@Reflection@RBX@@@std@@V34@@Z$0A@$00@Reflection@RBX@@";
 pub(super) const INSTANCE: &str =
     ".?AV?$TType@V?$shared_ptr@VInstance@RBX@@@std@@$0A@@Reflection@RBX@@";
 const RESULT_CREATOR: &str = ".?AV?$NonCreatableCreator@VTeleportAsyncResult@RBX@@@RBX@@";
@@ -26,13 +26,15 @@ pub(in super::super) fn probe(
     studio: &ModuleEntry,
     model: &ActiveDataModel,
 ) -> Result<Value> {
-    let (slot, function) = types::member(memory, studio, TELEPORT, "TeleportAsync", false)?;
-    let (_, invoke) = types::member(memory, studio, INVOKE, "Invoke", false)?;
+    let abi = types::yield_abi(memory, studio, TELEPORT, "TeleportAsync", 3)?;
+    anyhow::ensure!(abi == types::yield_abi(memory, studio, INVOKE, "Invoke", 1)?, "Native teleport continuation ABIs disagree");
+    let (slot, function) = types::yield_member(memory, studio, TELEPORT, "TeleportAsync", 3)?;
+    let (_, invoke) = types::yield_member(memory, studio, INVOKE, "Invoke", 1)?;
     let launch = loader::nonce_bindings(memory, studio, model)?;
     let (factory, create) = result_factory(memory, studio)?;
 
     Ok(
-        json!({"slot":slot,"function":function,"instanceType":types::singleton(memory, studio, INSTANCE, None)?, "tableType":types::singleton(memory, studio, TABLE, None)?, "invoke":invoke, "launch":launch,
+        json!({"continuationAbi":abi,"slot":slot,"function":function,"instanceType":types::singleton(memory, studio, INSTANCE, None)?, "tableType":types::singleton(memory, studio, TABLE, None)?, "invoke":invoke, "launch":launch,
             "resultFactory":factory,"resultCreate":create}),
     )
 }
@@ -84,8 +86,8 @@ impl NativeTeleportDispatch {
         )?;
         let layout = package_layout(&studio.path)?;
         let model = active_data_model(pid, &memory, studio, layout.data, title)?;
-        let (slot, function) = types::member(&memory, studio, TELEPORT, "TeleportAsync", false)?;
-        let (_, invoke) = types::member(&memory, studio, INVOKE, "Invoke", false)?;
+        let (slot, function) = types::yield_member(&memory, studio, TELEPORT, "TeleportAsync", 3)?;
+        let (_, invoke) = types::yield_member(&memory, studio, INVOKE, "Invoke", 1)?;
         let runtime = path.and_then(|path| {
             path.last()
                 .and_then(|name| name.strip_prefix("__ReniumTeleportNative_"))
@@ -98,7 +100,6 @@ impl NativeTeleportDispatch {
         let nonce = loader::nonce_bindings(&memory, studio, &model)?;
         let instance_type = types::singleton(&memory, studio, INSTANCE, None)?;
         let (factory, create) = result_factory(&memory, studio)?;
-        let helper = ensure_helper_loaded(pid, &memory, &loaded)?;
         let mut request = vec![0; 752];
         put_u32(&mut request, 0, 6);
         put_u32(&mut request, 4, 752);
@@ -148,9 +149,11 @@ impl NativeTeleportDispatch {
         }
         put_u32(&mut request, 112, host);
         put_u32(&mut request, 116, 180000);
+        let entry = helper_export_rva("ReniumPlayTeleport")?;
+        let helper = ensure_play_helper_loaded(pid, &memory, &loaded)?;
         let mut lease = Self {
             memory,
-            entrypoint: helper + helper_export_rva("ReniumPlayTeleport")?,
+            entrypoint: helper + entry,
             request,
             root: launch_nonce.map(|_| CachedDataModel {
                 title: title.to_owned(),

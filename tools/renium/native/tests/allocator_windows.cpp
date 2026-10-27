@@ -490,6 +490,7 @@ static void CaptionCleanup() {
 }
 
 int main() {
+    renium_continuation::abi.store(renium_continuation::Abi::Msvc);
     assert(initial.size() == 512);
     const auto& allocator = renium_allocator::Engine();
     assert(allocator.allocate == &mi_malloc && allocator.release == &mi_free && allocator.aligned == &mi_malloc_aligned);

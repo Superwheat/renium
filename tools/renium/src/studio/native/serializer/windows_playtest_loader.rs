@@ -521,7 +521,7 @@ impl NativePlayLoad {
         }
         let binding = resolve(&memory, studio, &model)?;
         let nonce_bindings = nonce_bindings(&memory, studio, &model)?;
-        let helper = ensure_helper_loaded(pid, &memory, &loaded)?;
+        let helper = ensure_play_helper_loaded(pid, &memory, &loaded)?;
         let entrypoint = helper + helper_export_rva("ReniumPlayLoader")?;
         let mut nonce = [0; 8];
         getrandom::fill(&mut nonce)

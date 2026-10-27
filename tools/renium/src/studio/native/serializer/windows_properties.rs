@@ -14,6 +14,8 @@ mod functions;
 pub(super) use functions::binding as function_binding;
 pub(super) use functions::dispatch_code;
 pub(super) use functions::lua_binding;
+pub(super) use functions::member_field as function_member_field;
+pub(super) use functions::{ContinuationAbi, continuation_abi};
 
 #[path = "windows_terrain.rs"]
 mod terrain;

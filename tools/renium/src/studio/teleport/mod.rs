@@ -53,7 +53,7 @@ pub(crate) fn preflight_multiplayer(
                 3,
                 format_args!("[renium] multiplayer native preflight failed: {error:#}"),
             );
-            anyhow::bail!("{MULTIPLAYER_NATIVE_REQUIRED}. Native probe: {error:#}");
+            anyhow::bail!("Server & Clients cannot start safely: {error:#}");
         }
     }
     #[cfg(not(windows))]

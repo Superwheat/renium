@@ -2,6 +2,7 @@
 #include <functional>
 #include <vector>
 #include "renium_play_loader_windows.h"
+#include "renium_continuation_windows.h"
 
 // One immutable launch scope is shared by request dispatch and arrival. It is
 // captured at the original Edit controller before the new model runs scripts.
@@ -9,6 +10,8 @@ namespace renium_play_owner {
 using Variant = renium_play_loader::VariantBuffer;
 using Instance = std::shared_ptr<void>;
 using Execute = void(*)(void*, Variant, std::function<void(Variant)>, std::function<void(std::string)>);
+// Rust qualifies this ABI at the reflected dispatch before installing hooks.
+using TaggedExecute = void(*)(void*, Variant, renium_continuation::Function<void(Variant)>, renium_continuation::Function<void(std::string)>);
 struct Binding {
     std::uint64_t sourceModel, sourceTest, getArgs, parentOffset, childrenOffset, classOffset;
     std::uint64_t placeField, universeField, tableType, getAttribute, stringTypeTable, selfOffset;

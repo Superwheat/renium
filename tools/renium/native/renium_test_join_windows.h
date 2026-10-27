@@ -162,7 +162,7 @@ inline void Handle(Request& r) {
                             lease->existing.push_back(player);
                 }
             }
-            reinterpret_cast<Invoke>(r.invoke)(reinterpret_cast<void*>(r.relay), std::make_shared<Tuple>(),
+            InvokeNative(r.invoke, reinterpret_cast<void*>(r.relay), std::make_shared<Tuple>(),
                 [lease, task](Values values) {
                     if (!task->active.load()) { task->Finish(); return; }
                     if (!values || values->values.size() != 2 || values->values[0].type != lease->request.model.tableType) {

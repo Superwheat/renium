@@ -60,11 +60,25 @@ inline std::shared_ptr<Lease> current;
 inline std::atomic<Teleport> original{nullptr};
 inline std::atomic<renium_play_owner::Execute> executeOriginal{nullptr};
 
-inline void ExecuteEntry(void* receiver, Variant input, std::function<void(Variant)> success, Failure failure) {
+template<class S, class F> inline void ExecuteCallback(void* receiver, Variant input, S success, F failure) {
     std::shared_ptr<Lease> lease;
     { std::lock_guard lock(mutex); if (current && current->Alive()) lease = current; }
     if (lease) renium_play_owner::Capture(lease->scope.load(), receiver, input);
-    executeOriginal.load()(receiver, std::move(input), std::move(success), std::move(failure));
+    reinterpret_cast<void(*)(void*, Variant, S, F)>(executeOriginal.load())(receiver, std::move(input), std::move(success), std::move(failure));
+}
+
+inline void ExecuteEntry(void* receiver, Variant input, std::function<void(Variant)> success, Failure failure) {
+    ExecuteCallback(receiver, std::move(input), std::move(success), std::move(failure));
+}
+inline void TaggedExecuteEntry(void* receiver, Variant input, renium_continuation::Function<void(Variant)> success, renium_continuation::Function<void(std::string)> failure) {
+    ExecuteCallback(receiver, std::move(input), std::move(success), std::move(failure));
+}
+inline void* ExecuteHook() { return renium_continuation::Tagged() ? reinterpret_cast<void*>(&TaggedExecuteEntry) : reinterpret_cast<void*>(&ExecuteEntry); }
+inline void InvokeNative(std::uint64_t address, void* receiver, Values input, std::function<void(Values)> success, Failure failure) {
+    if (renium_continuation::Tagged()) {
+        using Native = void(*)(void*, Values, renium_continuation::Function<void(Values)>, renium_continuation::Function<void(std::string)>);
+        reinterpret_cast<Native>(address)(receiver, std::move(input), renium_continuation::Function<void(Values)>(std::move(success)), renium_continuation::Function<void(std::string)>(std::move(failure)));
+    } else reinterpret_cast<Invoke>(address)(receiver, std::move(input), std::move(success), std::move(failure));
 }
 
 inline std::shared_ptr<renium_play_owner::Scope> NewScope(const Request& r) {
@@ -203,7 +217,7 @@ inline void InvokeRelay(const std::shared_ptr<Lease>& lease, Instance relay, std
             success(result);
         } catch (const std::exception& message) { error(message.what()); }
     }};
-    reinterpret_cast<Invoke>(lease->request.invoke)(relay.get(), std::move(tuple), std::move(accepted), failure);
+    InvokeNative(lease->request.invoke, relay.get(), std::move(tuple), std::move(accepted), failure);
 }
 
 struct Pending {
@@ -264,7 +278,7 @@ inline void Pump(const std::shared_ptr<Lease>& lease) {
     }
 }
 
-inline void Entry(void* service, std::int64_t place, Players players, Instance options, Success success, Failure failure) {
+template<class S, class F> inline void EntryCallback(void* service, std::int64_t place, Players players, Instance options, S success, F failure) {
     std::shared_ptr<Lease> lease;
     { std::lock_guard lock(mutex); if (current && current->Alive()) lease = current; }
     if (lease) {
@@ -304,17 +318,25 @@ inline void Entry(void* service, std::int64_t place, Players players, Instance o
             }
         } catch (const std::exception& error) { if (failure) failure(error.what()); return; }
     }
-    original.load()(service, place, std::move(players), std::move(options), std::move(success), std::move(failure));
+    reinterpret_cast<void(*)(void*, std::int64_t, Players, Instance, S, F)>(original.load())(service, place, std::move(players), std::move(options), std::move(success), std::move(failure));
 }
+
+inline void Entry(void* service, std::int64_t place, Players players, Instance options, Success success, Failure failure) {
+    EntryCallback(service, place, std::move(players), std::move(options), std::move(success), std::move(failure));
+}
+inline void TaggedEntry(void* service, std::int64_t place, Players players, Instance options, renium_continuation::Function<void(Instance)> success, renium_continuation::Function<void(std::string)> failure) {
+    EntryCallback(service, place, std::move(players), std::move(options), std::move(success), std::move(failure));
+}
+inline void* DispatchHook() { return renium_continuation::Tagged() ? reinterpret_cast<void*>(&TaggedEntry) : reinterpret_cast<void*>(&Entry); }
 
 inline void Restore(const std::shared_ptr<Lease>& lease) {
     if (current != lease || !lease->active.exchange(false)) return;
     if (auto scope = lease->scope.load()) scope->active.store(false);
     const auto slot = reinterpret_cast<void**>(lease->request.slot);
-    if (*slot == reinterpret_cast<void*>(&Entry))
-        renium_play_loader::Exchange(lease->request.slot, reinterpret_cast<void*>(&Entry), reinterpret_cast<void*>(lease->request.original));
-    if (lease->request.executeSlot && *reinterpret_cast<void**>(lease->request.executeSlot) == reinterpret_cast<void*>(&ExecuteEntry))
-        renium_play_loader::Exchange(lease->request.executeSlot, reinterpret_cast<void*>(&ExecuteEntry), reinterpret_cast<void*>(lease->request.executeOriginal));
+    if (*slot == DispatchHook())
+        renium_play_loader::Exchange(lease->request.slot, DispatchHook(), reinterpret_cast<void*>(lease->request.original));
+    if (lease->request.executeSlot && *reinterpret_cast<void**>(lease->request.executeSlot) == ExecuteHook())
+        renium_play_loader::Exchange(lease->request.executeSlot, ExecuteHook(), reinterpret_cast<void*>(lease->request.executeOriginal));
 }
 
 inline void Handle(Request& r) {
@@ -345,11 +367,11 @@ inline void Handle(Request& r) {
         original.store(reinterpret_cast<Teleport>(r.original));
         current = lease;
         try {
-            if (!renium_play_loader::Exchange(r.slot, reinterpret_cast<void*>(r.original), reinterpret_cast<void*>(&Entry)))
+            if (!renium_play_loader::Exchange(r.slot, reinterpret_cast<void*>(r.original), DispatchHook()))
                 throw std::runtime_error("Teleport dispatch was replaced before arming");
             if (lease->scope.load()) {
                 executeOriginal.store(reinterpret_cast<renium_play_owner::Execute>(r.executeOriginal));
-                if (!renium_play_loader::Exchange(r.executeSlot, reinterpret_cast<void*>(r.executeOriginal), reinterpret_cast<void*>(&ExecuteEntry)))
+                if (!renium_play_loader::Exchange(r.executeSlot, reinterpret_cast<void*>(r.executeOriginal), ExecuteHook()))
                     throw std::runtime_error("Play launch binding was replaced before arming");
             }
             std::thread([lease] {
@@ -371,7 +393,7 @@ inline void Handle(Request& r) {
         auto scope = NewScope(next);
         if (!current->scope.load()) {
             executeOriginal.store(reinterpret_cast<renium_play_owner::Execute>(next.executeOriginal));
-            if (!renium_play_loader::Exchange(next.executeSlot, reinterpret_cast<void*>(next.executeOriginal), reinterpret_cast<void*>(&ExecuteEntry)))
+            if (!renium_play_loader::Exchange(next.executeSlot, reinterpret_cast<void*>(next.executeOriginal), ExecuteHook()))
                 throw std::runtime_error("Play launch binding changed during reconnection");
             current->request.launch = next.launch;
             current->request.executeSlot = next.executeSlot;
@@ -389,8 +411,8 @@ inline void Handle(Request& r) {
         }
         if (r.action == 2) Restore(current);
         else if (current->Alive()) {
-            if (*reinterpret_cast<void**>(current->request.slot) != reinterpret_cast<void*>(&Entry)
-                || (current->request.executeSlot && *reinterpret_cast<void**>(current->request.executeSlot) != reinterpret_cast<void*>(&ExecuteEntry)))
+            if (*reinterpret_cast<void**>(current->request.slot) != DispatchHook()
+                || (current->request.executeSlot && *reinterpret_cast<void**>(current->request.executeSlot) != ExecuteHook()))
                 throw std::runtime_error("Owned teleport dispatch is no longer installed");
             current->deadline.store(GetTickCount64() + current->request.lifetimeMs);
         }

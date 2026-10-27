@@ -190,6 +190,7 @@ fn build_windows(out_dir: &Path) {
     println!("cargo:rerun-if-changed=native/renium_play_teleport_windows.h");
     println!("cargo:rerun-if-changed=native/renium_play_join_windows.h");
     println!("cargo:rerun-if-changed=native/renium_play_owner_windows.h");
+    println!("cargo:rerun-if-changed=native/renium_continuation_windows.h");
     println!("cargo:rerun-if-changed=native/renium_play_caption_windows.h");
     println!("cargo:rerun-if-changed=native/renium_teleport_gui_windows.h");
     println!("cargo:rerun-if-changed=native/renium_test_client_windows.h");

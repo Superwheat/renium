@@ -177,7 +177,7 @@ inline void Handle(Request& request) {
     if (!renium_play_owner::Submit(model, request.model, [task, configuration, input] {
         if (!task->active.load()) { task->Finish(); return; }
         try {
-            reinterpret_cast<Invoke>(input.invoke)(reinterpret_cast<void*>(input.relay), std::make_shared<Tuple>(),
+            InvokeNative(input.invoke, reinterpret_cast<void*>(input.relay), std::make_shared<Tuple>(),
                 [task, configuration, input](Values values) {
                     try {
                         if (!task->active.load()) { task->Finish(); return; }

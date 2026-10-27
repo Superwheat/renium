@@ -40,7 +40,7 @@ inline std::shared_ptr<Lease> Active() {
     return current && current->Alive() ? current : nullptr;
 }
 
-inline void ExecuteEntry(void* receiver, Variant input, std::function<void(Variant)> success, std::function<void(std::string)> failure) {
+template<class S, class F> inline void ExecuteCallback(void* receiver, Variant input, S success, F failure) {
     auto lease = Active();
     if (lease) lease->receipt.fetch_or(1);
     if (lease && receiver == reinterpret_cast<void*>(lease->request.sourceTest) && input.type == lease->request.tableType) {
@@ -54,8 +54,16 @@ inline void ExecuteEntry(void* receiver, Variant input, std::function<void(Varia
             lease->arguments.store(std::make_shared<Variant>(input));
         }
     }
-    executeOriginal.load()(receiver, std::move(input), std::move(success), std::move(failure));
+    reinterpret_cast<void(*)(void*, Variant, S, F)>(executeOriginal.load())(receiver, std::move(input), std::move(success), std::move(failure));
 }
+
+inline void ExecuteEntry(void* receiver, Variant input, std::function<void(Variant)> success, std::function<void(std::string)> failure) {
+    ExecuteCallback(receiver, std::move(input), std::move(success), std::move(failure));
+}
+inline void TaggedExecuteEntry(void* receiver, Variant input, renium_continuation::Function<void(Variant)> success, renium_continuation::Function<void(std::string)> failure) {
+    ExecuteCallback(receiver, std::move(input), std::move(success), std::move(failure));
+}
+inline void* ExecuteHook() { return renium_continuation::Tagged() ? reinterpret_cast<void*>(&TaggedExecuteEntry) : reinterpret_cast<void*>(&ExecuteEntry); }
 
 inline void* Model(void* instance, const Request& r) {
     for (unsigned depth = 0; instance && depth < 4; ++depth) {
@@ -137,7 +145,7 @@ inline void Restore(const std::shared_ptr<Lease>& lease) {
     const auto& r = lease->request;
     const std::uint64_t slots[]{r.executeSlot, r.joinSlot, r.localSlot};
     const std::uint64_t originals[]{r.executeOriginal, r.joinOriginal, r.localOriginal};
-    void* wrappers[]{reinterpret_cast<void*>(&ExecuteEntry), reinterpret_cast<void*>(&JoinEntry), reinterpret_cast<void*>(&LocalEntry)};
+    void* wrappers[]{ExecuteHook(), reinterpret_cast<void*>(&JoinEntry), reinterpret_cast<void*>(&LocalEntry)};
     for (unsigned i = 0; i < 3; ++i) {
         if (slots[i] && *reinterpret_cast<void**>(slots[i]) == wrappers[i])
             renium_play_loader::Exchange(slots[i], wrappers[i], reinterpret_cast<void*>(originals[i]));
@@ -182,7 +190,7 @@ inline void Handle(Request& r) {
         try {
             const std::uint64_t slots[]{r.executeSlot, r.joinSlot, r.localSlot};
             const std::uint64_t originals[]{r.executeOriginal, r.joinOriginal, r.localOriginal};
-            void* wrappers[]{reinterpret_cast<void*>(&ExecuteEntry), reinterpret_cast<void*>(&JoinEntry), reinterpret_cast<void*>(&LocalEntry)};
+            void* wrappers[]{ExecuteHook(), reinterpret_cast<void*>(&JoinEntry), reinterpret_cast<void*>(&LocalEntry)};
             for (unsigned i = 0; i < 3; ++i)
                 if (slots[i] && !renium_play_loader::Exchange(slots[i], reinterpret_cast<void*>(originals[i]), wrappers[i]))
                     throw std::runtime_error("Native arrival binding changed before arming");

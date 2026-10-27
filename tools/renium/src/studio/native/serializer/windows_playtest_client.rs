@@ -502,7 +502,6 @@ pub(crate) fn rejoin_test_client(pid: u32, runtime: &str, path: &[String]) -> Re
     let (fields, _, _) = owner::task_binding(&memory, studio, &model)?;
     let table = studio.base + binding.table;
     let opener = opener(&memory, studio, &binding)?;
-    let helper = ensure_helper_loaded(pid, &memory, &loaded)?;
     let mut request = vec![0; 600];
     put_u32(&mut request, 0, 2);
     put_u32(&mut request, 4, 600);
@@ -513,7 +512,7 @@ pub(crate) fn rejoin_test_client(pid: u32, runtime: &str, path: &[String]) -> Re
     for (index, value) in [
         relay.instance,
         relay.owner,
-        types::member(&memory, studio, INVOKE, "Invoke", false)?.1,
+        types::yield_member(&memory, studio, INVOKE, "Invoke", 1)?.1,
         types::singleton(&memory, studio, dispatch::TABLE, None)?,
         window,
         opener,
@@ -545,6 +544,7 @@ pub(crate) fn rejoin_test_client(pid: u32, runtime: &str, path: &[String]) -> Re
     {
         put_u64(&mut request, 304 + index * 8, value);
     }
+    let helper = ensure_play_helper_loaded(pid, &memory, &loaded)?;
     let mut input = memory.allocate(request.len())?;
     memory.write(input.address, &request)?;
     let exit = input.run(helper + helper_export_rva("ReniumTestClient")?, 30000)?;

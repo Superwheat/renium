@@ -110,7 +110,7 @@ inline void Handle(Request& request) {
         if (!task->active.load()) { task->Finish(); return; }
         try {
             auto arguments = std::make_shared<Tuple>();
-            reinterpret_cast<Invoke>(task->request.invoke)(reinterpret_cast<void*>(task->request.relay), arguments,
+            InvokeNative(task->request.invoke, reinterpret_cast<void*>(task->request.relay), arguments,
                 [task](Values values) {
                     try {
                         if (!task->active.load()) { task->Finish(); return; }

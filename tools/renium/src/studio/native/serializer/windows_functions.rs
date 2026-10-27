@@ -11,6 +11,10 @@ struct Binding {
 type BindingKey = ([u32; 3], usize, bool);
 static BINDINGS: OnceLock<Mutex<HashMap<BindingKey, Binding>>> = OnceLock::new();
 
+#[path = "windows_functions_yield.rs"]
+mod yield_abi;
+pub(in super::super) use yield_abi::{ContinuationAbi, continuation_abi};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Storage {
     Descriptor,
@@ -19,6 +23,8 @@ enum Storage {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Value {
+    ImagePointer(u64),
+    TaggedPointer(u64, u8),
     Pointer(Storage, i64),
     Bytes(Storage, i64, usize),
     Instance,
@@ -263,10 +269,27 @@ impl State {
                 }
             }
             Mnemonic::Lea => {
-                let value = self
-                    .address(i)
-                    .filter(|_| width == 8)
-                    .map(|(storage, offset)| Value::Pointer(storage, offset));
+                let value = if width == 8 && i.is_ip_rel_memory_operand() {
+                    Some(Value::ImagePointer(i.ip_rel_memory_address()))
+                } else {
+                    self.address(i)
+                        .filter(|_| width == 8)
+                        .map(|(storage, offset)| Value::Pointer(storage, offset))
+                };
+                self.registers.remove(&dst);
+                if let Some(value) = value {
+                    self.registers.insert(dst, value);
+                }
+            }
+            Mnemonic::Or if i.op0_kind() == OpKind::Register && width == 8 => {
+                let value = match (self.register(dst), i.op1_kind()) {
+                    (Some(Value::ImagePointer(at)), OpKind::Immediate8to64)
+                        if i.immediate8to64() == 6 =>
+                    {
+                        Some(Value::TaggedPointer(at, 6))
+                    }
+                    _ => None,
+                };
                 self.registers.remove(&dst);
                 if let Some(value) = value {
                     self.registers.insert(dst, value);
@@ -307,6 +330,7 @@ impl State {
             }
             Mnemonic::Pop => self.pop(dst),
             Mnemonic::Call => {
+                self.invalidate_call_arguments();
                 for reg in [
                     Register::RAX,
                     Register::RCX,
@@ -346,6 +370,22 @@ impl State {
             }
         }
     }
+
+    fn invalidate_call_arguments(&mut self) {
+        // Unmodelled calls may mutate a callable passed by address.
+        for reg in [Register::RCX, Register::RDX, Register::R8, Register::R9] {
+            if let Some(Value::Pointer(Storage::Stack, at)) = self.register(reg) {
+                if matches!(self.stack.get(&at), Some((8, Value::ImagePointer(_)))) {
+                    self.store(at, 64, None);
+                } else if matches!(
+                    self.stack.get(&(at + 24)),
+                    Some((8, Value::TaggedPointer(..)))
+                ) {
+                    self.store(at, 32, None);
+                }
+            }
+        }
+    }
 }
 
 fn dispatch_fields(
@@ -354,6 +394,7 @@ fn dispatch_fields(
     code: &mut impl FnMut(u64) -> Option<Vec<u8>>,
     budget: &mut usize,
     depth: usize,
+    accept: &mut impl FnMut(usize, &State) -> bool,
 ) -> Option<HashSet<usize>> {
     if depth > 8 {
         return None;
@@ -412,7 +453,12 @@ fn dispatch_fields(
             i.flow_control(),
             FlowControl::IndirectCall | FlowControl::IndirectBranch
         ) {
-            fields.extend(state.called_field(i));
+            if let Some(field) = state.called_field(i) {
+                if !accept(field, &state) {
+                    return None;
+                }
+                fields.insert(field);
+            }
         } else if (i.flow_control() == FlowControl::Call
             || i.flow_control() == FlowControl::UnconditionalBranch
                 && !instructions.contains_key(&i.near_branch_target()))
@@ -438,6 +484,7 @@ fn dispatch_fields(
                 code,
                 budget,
                 depth + 1,
+                accept,
             )?);
         }
     }
@@ -453,6 +500,15 @@ fn dispatch_field_for(
     mut code: impl FnMut(u64) -> Option<Vec<u8>>,
     lua_callback: bool,
 ) -> Option<usize> {
+    dispatch_field_checked(entry, &mut code, lua_callback, &mut |_, _| true)
+}
+
+fn dispatch_field_checked(
+    entry: u64,
+    code: &mut impl FnMut(u64) -> Option<Vec<u8>>,
+    lua_callback: bool,
+    accept: &mut impl FnMut(usize, &State) -> bool,
+) -> Option<usize> {
     let initial = State {
         registers: HashMap::from([
             (Register::RCX, Value::Pointer(Storage::Descriptor, 0)),
@@ -463,7 +519,7 @@ fn dispatch_field_for(
         stack: BTreeMap::new(),
         lua_callback,
     };
-    let fields = dispatch_fields(entry, initial, &mut code, &mut 32768, 0)?;
+    let fields = dispatch_fields(entry, initial, code, &mut 32768, 0, accept)?;
     (fields.len() == 1).then(|| *fields.iter().next().unwrap())
 }
 
@@ -501,7 +557,7 @@ pub(in super::super) fn lua_binding(
     resolve(memory, studio, layout, descriptor, field)
 }
 
-pub(super) fn member_field(
+pub(in super::super) fn member_field(
     memory: &ProcessMemory,
     studio: &ModuleEntry,
     layout: &PackageLayout,

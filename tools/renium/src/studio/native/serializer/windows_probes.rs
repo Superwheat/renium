@@ -84,7 +84,11 @@ fn engine_probe(
         NativeOperation::PlayTeleportLaunch => {
             let dispatch = playtest::dispatch::probe(memory, studio, model)?;
             let owner = playtest::owner::resolve(memory, studio, model)?;
-            Ok(json!({"dispatch":dispatch,"launch":owner.fields,"execute":owner.execute}))
+            let loader = playtest::loader::resolve(memory, studio, model)?;
+            helper_export_rva("ReniumPlayTeleport")?;
+            helper_export_rva("ReniumPlayContinuations")?;
+            Ok(json!({"dispatch":dispatch,"launch":owner.fields,"execute":owner.execute,
+                "loaderSlot":loader.slot,"loaderFunction":loader.function}))
         }
         NativeOperation::PlayTeleportLoad => {
             let binding = playtest::loader::resolve(memory, studio, model)?;
