@@ -4,6 +4,8 @@
 
 ### Bug fixes
 
+- `rbx lon --prefer studio` on a first pairing (no stored baseline) left the project's instance files unchanged while the new baseline took Studio's values, so the next Live Sync pass pushed the stale files into Studio and reverted Studio edits; the losing side is now written, and `--prefer editor` pushes from the document Studio actually holds.
+- Every successful command on a place whose Live Sync is waiting for a decision now carries a `syncReview` line naming `rbx lst --details` and `rbx lon --prefer studio|editor`; before, the pending review showed only in the Studio widget.
 - A pairing whose stored baseline points at deleted reconciliation packs no longer fails Play or Live Sync with `Failed to read reconciliation pack`; Renium drops the stale baseline, logs it, and the next pairing rebuilds it.
 
 ## 0.5.3 - 2026-10-27

@@ -533,7 +533,7 @@ pub(crate) fn merge_settings_entry(
     remove_reconciliation_derived_properties(&mut studio_doc);
     let (merged, editor_equivalent, studio_equivalent, aligned_studio) = if first_pairing {
         let previous_conflicts = conflicts.len();
-        align_first_pairing(
+        let alignment = align_first_pairing(
             path,
             &mut editor_doc,
             &mut studio_doc,
@@ -565,13 +565,15 @@ pub(crate) fn merge_settings_entry(
             conflicts.extend(merge_conflicts.into_iter().map(|conflict| {
                 format!("{}: {}: {}", path.display(), conflict.path, conflict.detail)
             }));
-            let editor_equivalent = settings_documents_equivalent(&editor_doc, &merged);
-            let studio_equivalent = settings_documents_equivalent(&studio_doc, &merged);
+            let editor_equivalent = !alignment.editor_overwritten
+                && settings_documents_equivalent(&editor_doc, &merged);
+            let studio_equivalent = alignment.studio_before.is_none()
+                && settings_documents_equivalent(&studio_doc, &merged);
             (
                 merged,
                 editor_equivalent,
                 studio_equivalent,
-                Some(studio_doc),
+                Some(alignment.studio_before.unwrap_or(studio_doc)),
             )
         }
     } else {

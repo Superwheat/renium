@@ -600,13 +600,24 @@ pub(crate) fn align_new_instance_ids(
     Ok(())
 }
 
+/// What a preference overwrote while aligning a first pairing. The merge
+/// compares the aligned documents, so an overwritten side still has to be
+/// written out, and a push into Studio needs the document Studio actually
+/// holds rather than the overwritten copy.
+#[derive(Default)]
+pub(crate) struct FirstPairingAlignment {
+    pub(crate) editor_overwritten: bool,
+    pub(crate) studio_before: Option<SettingsBytecode>,
+}
+
 pub(crate) fn align_first_pairing(
     path: &Path,
     editor: &mut SettingsBytecode,
     studio: &mut SettingsBytecode,
     preference: ConflictPreference,
     conflicts: &mut Vec<String>,
-) {
+) -> FirstPairingAlignment {
+    let mut alignment = FirstPairingAlignment::default();
     align_settings_ids_to_reference(editor, studio);
     let mut structural_interner = PathInterner::new();
     let editor_keys = structural_path_ids(editor, &mut structural_interner);
@@ -755,13 +766,18 @@ pub(crate) fn align_first_pairing(
                 describe_instance_differences(editor, *editor_index, studio, studio_index)
             )),
             ConflictPreference::Editor => {
+                if alignment.studio_before.is_none() {
+                    alignment.studio_before = Some(studio.clone());
+                }
                 copy_settings_instance(editor, *editor_index, studio, studio_index)
             }
             ConflictPreference::Studio => {
+                alignment.editor_overwritten = true;
                 copy_settings_instance(studio, studio_index, editor, *editor_index)
             }
         }
     }
+    alignment
 }
 
 pub(crate) fn protect_package_links(

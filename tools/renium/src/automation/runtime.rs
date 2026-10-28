@@ -3439,7 +3439,14 @@ fn automation_response(
         result
     })();
     let response = match result {
-        Ok(result) => automation::Response::success(request.id, started, result),
+        Ok(mut result) => {
+            if let Some(context_id) = request.cx
+                && sync_review_pending(request.op, &state.live_sync().status(context_id), &result)
+            {
+                result["syncReview"] = json!(SYNC_REVIEW_NOTICE);
+            }
+            automation::Response::success(request.id, started, result)
+        }
         Err(failure) => {
             let response = automation::Response::failure(request.id, started, failure);
             if let Some(error) = response.e.as_ref() {
@@ -3452,6 +3459,33 @@ fn automation_response(
         }
     };
     response.with_update(state.available_update())
+}
+
+const SYNC_REVIEW_NOTICE: &str = "Live Sync is waiting for a decision and is not writing; `rbx lst --details` lists the differences and `rbx lon --prefer studio|editor` resolves them";
+
+/// A Live Sync review used to show only in the Studio widget. Every successful
+/// command on that place reports it until the review is resolved; the Live
+/// Sync and status operations already carry the state.
+fn sync_review_pending(operation: u16, live_status: &Value, result: &Value) -> bool {
+    if matches!(
+        operation,
+        op::LIVE_START
+            | op::LIVE_STOP
+            | op::LIVE_STATUS
+            | op::STUDIO_STATUS
+            | op::BIND
+            | op::UNBIND
+            | op::CONTEXT
+            | op::STUDIOS
+    ) {
+        return false;
+    }
+    let Some(object) = result.as_object() else {
+        return false;
+    };
+    object.get("ok").and_then(Value::as_bool) != Some(false)
+        && !object.contains_key("syncReview")
+        && live_status["resolutionRequired"].as_bool() == Some(true)
 }
 
 enum RequestGuard<'a> {
@@ -3571,6 +3605,36 @@ mod tests {
             assert!(!automation_retry_is_safe(operation, &json!({}), &ended));
             assert!(!automation_retry_is_safe(operation, &json!({}), &busy));
         }
+    }
+
+    #[test]
+    fn sync_review_notice_marks_successful_commands_while_a_review_waits() {
+        let waiting = json!({ "running": true, "resolutionRequired": true });
+        let ok = json!({ "ok": true, "results": [1] });
+        assert!(sync_review_pending(op::LUAU, &waiting, &ok));
+        assert!(sync_review_pending(
+            op::PUSH,
+            &waiting,
+            &json!({ "pushed": 3 })
+        ));
+        assert!(!sync_review_pending(
+            op::LUAU,
+            &json!({ "running": true }),
+            &ok
+        ));
+        assert!(!sync_review_pending(
+            op::LUAU,
+            &json!({ "running": false }),
+            &ok
+        ));
+        assert!(!sync_review_pending(op::LIVE_STATUS, &waiting, &ok));
+        assert!(!sync_review_pending(op::STUDIO_STATUS, &waiting, &ok));
+        assert!(!sync_review_pending(
+            op::LUAU,
+            &waiting,
+            &json!({ "ok": false })
+        ));
+        assert!(!sync_review_pending(op::LUAU, &waiting, &json!([1])));
     }
 
     #[test]

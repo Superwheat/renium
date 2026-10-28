@@ -76,7 +76,7 @@ fn twin_observation(editor: &SettingsBytecode) -> SettingsBytecode {
 
 fn twin_align(editor: &mut SettingsBytecode, studio: &mut SettingsBytecode) -> Vec<String> {
     let mut conflicts = Vec::new();
-    align_first_pairing(
+    let _ = align_first_pairing(
         Path::new("instances/Workspace.renium"),
         editor,
         studio,
@@ -666,6 +666,87 @@ fn first_pairing_twins_use_first_comparison_noise_rules() {
             .position(|instance| instance.settings_id == studio.instances[source].settings_id)
             .unwrap();
         assert!(settings_instances_equal(&editor, target, &studio, source));
+    }
+}
+
+fn lighting_settings_entry(clock_time: f64, visible: bool) -> SnapshotEntry {
+    let mut document = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: vec![SettingsBytecodeInstance::new(
+            "lighting".into(),
+            "Lighting".into(),
+            "Lighting".into(),
+            None,
+        )],
+    };
+    document.instances[0].properties = json!({ "ClockTime": clock_time })
+        .as_object()
+        .unwrap()
+        .clone();
+    let mut sky = SettingsBytecodeInstance::new("sky".into(), "Sky".into(), "Sky".into(), Some(0));
+    sky.properties = json!({ "CelestialBodiesShown": visible })
+        .as_object()
+        .unwrap()
+        .clone();
+    document.instances.push(sky);
+    SnapshotEntry::File(encode_settings_bytecode(&document).unwrap())
+}
+
+#[test]
+fn first_pairing_prefer_studio_keeps_studio_settings_values() {
+    let path = PathBuf::from("instances/Lighting.renium");
+    let editor = ProjectSnapshot {
+        entries: [(path.clone(), lighting_settings_entry(17.7, false))]
+            .into_iter()
+            .collect(),
+    };
+    let studio = ProjectSnapshot {
+        entries: [(path.clone(), lighting_settings_entry(10.3, true))]
+            .into_iter()
+            .collect(),
+    };
+    let (_, conflicts, _) =
+        merge_snapshots_with_changes(None, &editor, &studio, ConflictPreference::None, None)
+            .unwrap();
+    assert_eq!(conflicts.len(), 2, "{conflicts:?}");
+    for preference in [ConflictPreference::Studio, ConflictPreference::Editor] {
+        let (merged, conflicts, changes) =
+            merge_snapshots_with_changes(None, &editor, &studio, preference, None).unwrap();
+        assert!(conflicts.is_empty(), "{preference:?}: {conflicts:?}");
+        let winner = if preference == ConflictPreference::Studio {
+            &studio
+        } else {
+            &editor
+        };
+        let merged_doc = settings_document(merged.entries.get(&path)).unwrap();
+        let winner_doc = settings_document(winner.entries.get(&path)).unwrap();
+        assert!(
+            settings_documents_equivalent(&merged_doc, &winner_doc),
+            "{preference:?} merged {merged_doc:?}"
+        );
+        if preference == ConflictPreference::Studio {
+            assert!(
+                !changes.studio.contains(&path),
+                "{preference:?} pushes into Studio"
+            );
+            assert!(
+                changes.editor.contains(&path),
+                "{preference:?} leaves the file stale"
+            );
+            assert!(!changes.aligned_studio.contains_key(&path));
+        } else {
+            assert!(
+                changes.studio.contains(&path),
+                "{preference:?} leaves Studio stale"
+            );
+            assert!(!changes.editor.contains(&path));
+            let previous = &changes.aligned_studio[&path];
+            let studio_doc = settings_document(studio.entries.get(&path)).unwrap();
+            assert!(
+                settings_documents_equivalent(previous, &studio_doc),
+                "the push must start from what Studio holds"
+            );
+        }
     }
 }
 
