@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Removed
+
+- The Playtest teleport feature: Renium no longer intercepts `TeleportService:TeleportAsync` in Studio Play, loads destination places, hooks Studio's play launch or test clients, or ships the `ReniumTeleport` adapter. `rbx play` results no longer carry `teleport`, the `playTeleportEnabled` and `playTeleportNative` settings are gone, `rbx native-probe` lost its `--playtest-*` flags, and the `RENIUM/teleport.md` guide is removed. Play, Play Here and Server & Clients are unchanged.
+
 ### Bug fixes
 
 - `rbx lon --prefer studio` on a first pairing (no stored baseline) left the project's instance files unchanged while the new baseline took Studio's values, so the next Live Sync pass pushed the stale files into Studio and reverted Studio edits; the losing side is now written, and `--prefer editor` pushes from the document Studio actually holds.

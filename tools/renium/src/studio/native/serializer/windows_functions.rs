@@ -13,7 +13,7 @@ static BINDINGS: OnceLock<Mutex<HashMap<BindingKey, Binding>>> = OnceLock::new()
 
 #[path = "windows_functions_yield.rs"]
 mod yield_abi;
-pub(in super::super) use yield_abi::{ContinuationAbi, continuation_abi};
+pub(in super::super) use yield_abi::ContinuationAbi;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Storage {
@@ -497,32 +497,6 @@ fn flow(
     })
 }
 
-pub(in super::super) fn inline_callback_tables(
-    entry: u64,
-    mut code: impl FnMut(u64) -> Option<Vec<u8>>,
-    argument: usize,
-) -> Option<Vec<usize>> {
-    let initial = State {
-        registers: HashMap::from([(Register::RSP, Value::Pointer(Storage::Stack, 0))]),
-        stack: BTreeMap::new(),
-        lua_callback: false,
-    };
-    let Flow {
-        instructions,
-        states,
-    } = flow(entry, initial, &mut |at, _| code(at), &mut 32768)?;
-    let mut tables = HashSet::new();
-    for (pc, state) in states {
-        if instructions[&pc].flow_control() == FlowControl::Call
-            && let Some(object) = yield_abi::callback_object(&state, argument)
-            && let Some((8, Value::TaggedPointer(table, 2))) = state.stack.get(&(object + 24))
-        {
-            tables.insert(*table as usize);
-        }
-    }
-    Some(tables.into_iter().collect())
-}
-
 fn dispatch_fields(
     entry: u64,
     initial: State,
@@ -647,24 +621,6 @@ pub(in super::super) fn binding(
         descriptor,
         member_field(memory, studio, layout, descriptor, table)?,
     )
-}
-
-/// CustomBoundFuncDesc's Lua callback receives the original Lua state as its
-/// second argument. Distinguish it from the ordinary aggregate-return binding.
-pub(in super::super) fn lua_binding(
-    memory: &ProcessMemory,
-    studio: &ModuleEntry,
-    layout: &PackageLayout,
-    descriptor: usize,
-) -> Result<(usize, usize)> {
-    let field = member_field_for(
-        memory,
-        studio,
-        layout,
-        memory.read_u64(descriptor)? as usize,
-        true,
-    )?;
-    resolve(memory, studio, layout, descriptor, field)
 }
 
 pub(in super::super) fn member_field(

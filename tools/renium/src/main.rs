@@ -307,17 +307,12 @@ mod startup_policy_tests {
 
     #[test]
     fn native_probe_has_no_background_startup_work() {
-        for discovery in [false, true] {
-            let mut args = vec!["rbx", "native-probe", "--pid", "123"];
-            if discovery {
-                args.push("--playtest-discovery");
-            }
-            let matches = cli::command().try_get_matches_from(args).unwrap();
-            let cli = Cli::from_arg_matches(&matches).unwrap();
-            assert!(!resumes_global_audio(&cli.command));
-            assert!(!checks_agent_update(&cli.command));
-            assert!(!checks_agent_instructions(&cli.command));
-        }
+        let args = ["rbx", "native-probe", "--pid", "123"];
+        let matches = cli::command().try_get_matches_from(args).unwrap();
+        let cli = Cli::from_arg_matches(&matches).unwrap();
+        assert!(!resumes_global_audio(&cli.command));
+        assert!(!checks_agent_update(&cli.command));
+        assert!(!checks_agent_instructions(&cli.command));
     }
 
     #[test]

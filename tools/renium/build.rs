@@ -42,8 +42,6 @@ fn build_windows(out_dir: &Path) {
     ));
     run(&mut command, "Windows Studio helper build");
     let launch_source = PathBuf::from("native").join("renium_launch_windows.cpp");
-    println!("cargo:rerun-if-changed=native/renium_test_server_windows.h");
-    println!("cargo:rerun-if-changed=native/renium_test_route_windows.h");
     let mut launch_command = compiler.to_command();
     launch_command.args([
         "/nologo",
@@ -186,16 +184,8 @@ fn build_windows(out_dir: &Path) {
         println!("cargo:rerun-if-changed={}", source.display());
     }
     println!("cargo:rerun-if-changed=native/renium_engine_allocator_windows.h");
-    println!("cargo:rerun-if-changed=native/renium_play_loader_windows.h");
-    println!("cargo:rerun-if-changed=native/renium_play_teleport_windows.h");
-    println!("cargo:rerun-if-changed=native/renium_play_join_windows.h");
-    println!("cargo:rerun-if-changed=native/renium_play_owner_windows.h");
     println!("cargo:rerun-if-changed=native/renium_continuation_windows.h");
     println!("cargo:rerun-if-changed=native/tests/continuation_windows.h");
-    println!("cargo:rerun-if-changed=native/renium_play_caption_windows.h");
-    println!("cargo:rerun-if-changed=native/renium_teleport_gui_windows.h");
-    println!("cargo:rerun-if-changed=native/renium_test_client_windows.h");
-    println!("cargo:rerun-if-changed=native/renium_test_join_windows.h");
     println!("cargo:rerun-if-changed={}", launch_source.display());
     println!("cargo:rerun-if-changed=native/renium_launch_windows_process.h");
     println!("cargo:rerun-if-changed={}", source.display());
@@ -285,35 +275,8 @@ fn build_macos(out_dir: &Path) {
     ]);
     shield_command.arg(&shield).arg(&shield_source);
     run(&mut shield_command, "macOS input shield build");
-    for name in [
-        "teleport_dispatch",
-        "playtest",
-        "play_join",
-        "teleport_gui",
-        "test_client",
-    ] {
-        let source = format!("native/tests/{name}_macos.cpp");
-        let mut command = Command::new("clang++");
-        command
-            .args(&arch)
-            .args(["-std=c++20", "-O1", "-pthread", "-o"])
-            .arg(out_dir.join(format!("renium-{name}-test")))
-            .arg(&source);
-        run(&mut command, "macOS teleport regression build");
-        println!("cargo:rerun-if-changed={source}");
-    }
     println!("cargo:rerun-if-changed={}", helper_source.display());
     println!("cargo:rerun-if-changed=native/renium_audio_macos.mm");
-    println!("cargo:rerun-if-changed=native/renium_playtest_macos.h");
-    println!("cargo:rerun-if-changed=native/renium_test_server_macos.h");
-    println!("cargo:rerun-if-changed=native/renium_test_client_macos.h");
-    println!("cargo:rerun-if-changed=native/renium_test_join_macos.h");
-    println!("cargo:rerun-if-changed=native/renium_relay_macos.h");
-    println!("cargo:rerun-if-changed=native/renium_route_code_macos.h");
-    println!("cargo:rerun-if-changed=native/renium_route_launch_macos.h");
-    println!("cargo:rerun-if-changed=native/renium_teleport_dispatch_macos.h");
-    println!("cargo:rerun-if-changed=native/renium_play_join_macos.h");
-    println!("cargo:rerun-if-changed=native/renium_teleport_gui_macos.h");
     println!("cargo:rerun-if-changed=native/renium_play_caption_macos.mm");
     println!("cargo:rerun-if-changed={}", launch_guard_source.display());
     println!("cargo:rerun-if-changed={}", launcher_source.display());
@@ -476,18 +439,6 @@ fn generate_config_settings(out_dir: &Path) {
         })
         .collect::<Vec<_>>();
     settings.extend([
-        (
-            "playTeleportNative".to_string(),
-            "boolean".to_string(),
-            Some("true".to_string()),
-            vec![],
-        ),
-        (
-            "playTeleportEnabled".to_string(),
-            "boolean".to_string(),
-            Some("true".to_string()),
-            vec![],
-        ),
         (
             "backtrace".to_string(),
             "boolean".to_string(),

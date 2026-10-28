@@ -507,7 +507,7 @@ mod request_cancellation_tests {
         };
         let result = bridge.call_for_runtime_with_timeout(
             "startStopPlay",
-            json!({"prepareManualTeleport": true, "runtimeId": "test-runtime"}),
+            json!({"runtimeId": "test-runtime"}),
             BridgeTarget::Edit,
             "test-runtime",
             Some(Duration::from_millis(10)),
@@ -1180,65 +1180,6 @@ impl BridgeServer {
         self.team_create
             .lock_recover()
             .insert(runtime_id.to_string(), team_create);
-    }
-
-    /// A native client replacement retains the OS process but creates a new
-    /// bridge. Refresh its explicitly stamped root ownership on every channel.
-    #[cfg(any(windows, target_os = "macos"))]
-    pub(crate) fn refresh_routed_client(&self, runtime: &str, pid: u32) -> Result<()> {
-        self.refresh_launch_runtime(runtime, BridgeTarget::Client, pid)
-    }
-
-    #[cfg(any(windows, target_os = "macos"))]
-    pub(crate) fn refresh_launch_runtime(
-        &self,
-        runtime: &str,
-        target: BridgeTarget,
-        pid: u32,
-    ) -> Result<()> {
-        let value = self.call_for_runtime_with_timeout(
-            "getBridgeInfo",
-            json!({}),
-            target,
-            runtime,
-            Some(Duration::from_secs(3)),
-        )?;
-        let info: BridgeInfoPayload = serde_json::from_value(value)?;
-        anyhow::ensure!(
-            info.runtime_id == runtime
-                && info.bridge_role
-                    == match target {
-                        BridgeTarget::Server => BRIDGE_ROLE_PLAY_SERVER,
-                        BridgeTarget::Client => BRIDGE_ROLE_PLAY_CLIENT,
-                        _ => anyhow::bail!("Only Play runtimes can acquire launch ownership"),
-                    }
-                && !info.launch_edit_runtime_id.is_empty()
-                && !info.launch_nonce.is_empty(),
-            "Play runtime did not retain its root ownership"
-        );
-        for channel in &self.channels {
-            let connections = channel.sockets.lock_recover().clone();
-            for (key, connection) in connections.into_iter().filter(|(_, connection)| {
-                connection.studio_pid == Some(pid) && connection.bridge_info.runtime_id == runtime
-            }) {
-                {
-                    let mut socket = connection.io.lock_recover();
-                    anyhow::ensure!(
-                        socket.bridge_info.runtime_id == runtime,
-                        "Routed client changed"
-                    );
-                    socket.bridge_info = info.clone();
-                }
-                let mut sockets = channel.sockets.lock_recover();
-                if let Some(current) = sockets.get_mut(&key)
-                    && Arc::ptr_eq(&current.io, &connection.io)
-                {
-                    current.bridge_info = info.clone();
-                }
-                Self::refresh_channel_snapshots(channel, &sockets);
-            }
-        }
-        Ok(())
     }
 
     fn runtime_role(&self, runtime_id: &str) -> Option<&'static str> {

@@ -579,13 +579,6 @@ fn compact_play_result(result: &mut Value, named_players: bool) {
     ] {
         map.remove(key);
     }
-    if let Some(mode) = map
-        .get("teleport")
-        .and_then(|teleport| teleport.get("mode"))
-        .cloned()
-    {
-        map.insert("teleport".to_string(), mode);
-    }
     if let Some(until) = map.get("until")
         && until.get("ok") == Some(&Value::Bool(true))
         && let Some(value) = until.get("value").cloned()
@@ -994,7 +987,6 @@ fn validate_play_args(args: &StartStopPlayArgs) -> Result<()> {
 pub(crate) fn start_stop_play_result(
     args: StartStopPlayArgs,
     bridge: &BridgeServer,
-    teleport: Option<bool>,
 ) -> Result<Value> {
     validate_play_args(&args)?;
     let mode = args.mode.as_deref().unwrap_or("play");
@@ -1002,7 +994,7 @@ pub(crate) fn start_stop_play_result(
         return stop_studio_play_with_bridge_result(bridge);
     }
     if args.restart {
-        return restart_play_result(args, bridge, teleport);
+        return restart_play_result(args, bridge);
     }
     if let Some(count) = args.add_players {
         return add_test_players_result(bridge, count, args.bridge.wait_seconds);
@@ -1016,7 +1008,7 @@ pub(crate) fn start_stop_play_result(
             None if matches!(mode, "run" | "server") => PlayLaunchPlan::Run,
             None => PlayLaunchPlan::Play,
         };
-        let mut result = start_play_with_retries(bridge, plan, teleport)?;
+        let mut result = start_play_with_retries(bridge, plan)?;
         result["serverReady"] = json!(server_answers_luau(bridge));
         return Ok(result);
     }
@@ -1606,11 +1598,7 @@ fn remembered_launch(edit_runtime_id: &str) -> Option<PlayLaunchPlan> {
     LAUNCHED_PLANS.lock_recover().get(edit_runtime_id).copied()
 }
 
-fn start_play_with_retries(
-    bridge: &BridgeServer,
-    plan: PlayLaunchPlan,
-    teleport: Option<bool>,
-) -> Result<Value> {
+fn start_play_with_retries(bridge: &BridgeServer, plan: PlayLaunchPlan) -> Result<Value> {
     if plan
         .players()
         .is_some_and(|players| !(1..=8).contains(&players))
@@ -1631,8 +1619,8 @@ fn start_play_with_retries(
         if attempts > 1 {
             thread::sleep(Duration::from_secs(u64::from(attempts - 1)));
         }
-        let outcome = start_attempt(bridge, plan, teleport)
-            .map_err(|error| with_orphan_hint(bridge, error))?;
+        let outcome =
+            start_attempt(bridge, plan).map_err(|error| with_orphan_hint(bridge, error))?;
         let mut result = match outcome {
             AttemptOutcome::AlreadyRunning(existing) => existing,
             AttemptOutcome::Started {
@@ -1689,11 +1677,7 @@ fn with_orphan_hint(bridge: &BridgeServer, error: anyhow::Error) -> anyhow::Erro
     )
 }
 
-fn start_attempt(
-    bridge: &BridgeServer,
-    plan: PlayLaunchPlan,
-    teleport: Option<bool>,
-) -> Result<AttemptOutcome> {
+fn start_attempt(bridge: &BridgeServer, plan: PlayLaunchPlan) -> Result<AttemptOutcome> {
     let launch = new_play_launch(bridge, plan.label())?;
     // Device status decorates the result; a stalled device service must not
     // stop Play from starting.
@@ -1708,52 +1692,11 @@ fn start_attempt(
         existing["deviceSimulation"] = device_simulation;
         return Ok(AttemptOutcome::AlreadyRunning(existing));
     }
-    if plan.players().is_some()
-        && let Some(prefer_native) = teleport
-    {
-        crate::studio::teleport::preflight_multiplayer(
-            bridge,
-            &launch.edit_runtime_id,
-            prefer_native,
-        )?;
-    }
     let closed = close_leftover_test_processes(bridge, &launch.edit_runtime_id, LEFTOVER_GRACE);
-    if cfg!(windows) && teleport.is_some() && plan.players().is_some() {
-        anyhow::ensure!(
-            existing["teleportStartProtocol"] == 1,
-            "Reopen this Studio with the updated plugin to arm teleport before multiplayer clients start"
-        );
-    }
-    #[cfg(any(windows, target_os = "macos"))]
-    let _idle_dispatch = if plan != PlayLaunchPlan::Play || teleport.is_none() {
-        crate::studio::teleport::take_prepared(&launch.edit_runtime_id)
-    } else {
-        None
-    };
-    let dispatch = if teleport.is_some() && plan == PlayLaunchPlan::Play {
-        crate::studio::teleport::Dispatch::before_play(
-            bridge,
-            &launch.edit_runtime_id,
-            &launch.nonce,
-        )
-    } else {
-        None
-    };
     let waited_ms = waited.elapsed().as_millis();
     let requested = Instant::now();
-    match launch_play_session(bridge, &launch, plan, teleport) {
+    match launch_play_session(bridge, &launch, plan) {
         Ok(LaunchOutcome::Started(mut result)) => {
-            if let Some(prefer_native) = teleport.filter(|_| plan != PlayLaunchPlan::Run) {
-                result["teleport"] = crate::studio::teleport::enable(
-                    bridge,
-                    prefer_native,
-                    plan.plugin_mode(),
-                    dispatch,
-                )
-                .unwrap_or_else(
-                    |error| json!({"mode":"unavailable","reason":format!("{error:#}")}),
-                );
-            }
             remember_launch(&launch.edit_runtime_id, plan);
             device_simulation["playRunning"] = Value::Bool(true);
             result["deviceSimulation"] = device_simulation;
@@ -1903,17 +1846,11 @@ fn launch_play_session(
     bridge: &BridgeServer,
     launch: &TestLaunch,
     plan: PlayLaunchPlan,
-    teleport: Option<bool>,
 ) -> Result<LaunchOutcome> {
     let mut watch = LaunchWatch::new(bridge, launch);
-    let defer_players = cfg!(windows) && teleport.is_some() && plan.players().is_some();
-    let mut request = plan.request(&launch.nonce);
-    if defer_players {
-        request["deferPlayers"] = json!(true);
-    }
     let start_result = bridge.call_for_runtime_with_timeout(
         "startStopPlay",
-        request,
+        plan.request(&launch.nonce),
         BridgeTarget::Edit,
         &launch.edit_runtime_id,
         None,
@@ -1929,7 +1866,6 @@ fn launch_play_session(
     let started = Instant::now();
     let mut last_progress = started;
     let mut last_seen = (false, 0usize);
-    let mut players_released = !defer_players;
     loop {
         let status = studio_play_status_for_runtime(bridge, &launch.edit_runtime_id);
         let last_status = match &status {
@@ -1945,30 +1881,6 @@ fn launch_play_session(
         let server_ready = clients
             .iter()
             .any(|entry| entry["role"] == BRIDGE_ROLE_PLAY_SERVER);
-        if !players_released && server_ready {
-            let server = clients
-                .iter()
-                .find(|row| row["role"] == BRIDGE_ROLE_PLAY_SERVER)
-                .and_then(|row| row["runtimeId"].as_str())
-                .context("Missing startup server runtime")?;
-            crate::studio::teleport::enable_runtime(
-                bridge,
-                server,
-                teleport.unwrap(),
-                "multi",
-                None,
-                true,
-            )?;
-            let result = bridge.call_for_runtime_with_timeout(
-                "startStopPlay",
-                json!({"addPlayers":plan.players().unwrap()}),
-                BridgeTarget::Server,
-                server,
-                Some(Duration::from_secs(5)),
-            )?;
-            ensure_plugin_api_ok(&result)?;
-            players_released = true;
-        }
         let client_count = clients
             .iter()
             .filter(|entry| entry["role"] == BRIDGE_ROLE_PLAY_CLIENT)
@@ -2069,11 +1981,7 @@ fn restart_plan(
     }
 }
 
-fn restart_play_result(
-    args: StartStopPlayArgs,
-    bridge: &BridgeServer,
-    teleport: Option<bool>,
-) -> Result<Value> {
+fn restart_play_result(args: StartStopPlayArgs, bridge: &BridgeServer) -> Result<Value> {
     let edit_runtime_id = bridge
         .runtime_pin_for_selector(BridgeTarget::Edit, None)?
         .runtime_id;
@@ -2092,7 +2000,7 @@ fn restart_play_result(
             .get("ok")
             .and_then(Value::as_bool)
             == Some(true);
-    let mut result = start_play_with_retries(bridge, plan, teleport)?;
+    let mut result = start_play_with_retries(bridge, plan)?;
     result["serverReady"] = json!(server_answers_luau(bridge));
     result["restarted"] = json!(restarted);
     if let Some(note) = note {
@@ -3593,10 +3501,9 @@ fn play_stop_runtimes<'a>(clients: &'a [Value], edit: Option<&Value>) -> Vec<&'a
             let only = servers.next()?;
             servers.next().is_none().then_some(only)
         });
-    // Destination servers share the root executor. Sending EndTest from each
-    // one concurrently completes that executor twice and can crash Edit.
-    // Their process lifetime is already bound to the source server's exit.
-    // A solo teleport has only its current server, which must still stop.
+    // Only the source server receives EndTest. Sending it from several servers
+    // concurrently completes the shared executor twice and can crash Edit, and
+    // any other server's process lifetime is bound to the source's exit.
     clients
         .iter()
         .filter(|client| {
@@ -3890,21 +3797,6 @@ fn studio_play_status_for_runtime(bridge: &BridgeServer, runtime_id: &str) -> Re
     Ok(status)
 }
 
-#[cfg(windows)]
-pub(crate) fn require_stopped_for_native_preflight(
-    bridge: &BridgeServer,
-    runtime_id: &str,
-) -> Result<()> {
-    let status = studio_play_status_for_runtime(bridge, runtime_id)?;
-    anyhow::ensure!(
-        play_status_is_stopped(&status)
-            && status["readyForStart"] != false
-            && !crate::studio::teleport::owns_transition(runtime_id, &status),
-        "A Studio play session is already active or starting in the selected window"
-    );
-    Ok(())
-}
-
 /// Waits until the Edit window can start a test: its controller is ready and
 /// the previous test's DataModels are gone. Returns the status, which reports
 /// a running session when one is still active.
@@ -3912,16 +3804,6 @@ fn wait_for_studio_play_ready(bridge: &BridgeServer, runtime_id: &str) -> Result
     let deadline = Instant::now() + BRIDGE_DEFAULT_RESPONSE_TIMEOUT;
     loop {
         let mut status = studio_play_status_for_runtime(bridge, runtime_id)?;
-        if crate::studio::teleport::owns_transition(runtime_id, &status) {
-            // The original controller owns the gap between native Play models.
-            // A repeated start must observe that launch rather than compete with it.
-            status["running"] = json!(true);
-            status["starting"] = json!(true);
-            status["readyForStart"] = json!(false);
-            status["mode"] = json!("play");
-            status["teleport"] = json!({"mode":"loading"});
-            return Ok(status);
-        }
         let (clients, closing) = play_clients_by_state(bridge, runtime_id);
         if !clients.is_empty() {
             retire_play_clients(bridge, &closing);
@@ -3964,7 +3846,7 @@ mod play_state_tests {
     use super::*;
 
     #[test]
-    fn teleport_stop_completes_only_the_source_executor_and_still_stops_solo_arrivals() {
+    fn play_stop_completes_only_the_source_executor_and_still_stops_orphaned_servers() {
         let edit = json!({"placeId":11,"gameId":7});
         let source = json!({"role":"play-server","placeId":11,"gameId":7});
         let destination = json!({"role":"play-server","placeId":12,"gameId":7});
@@ -4329,13 +4211,12 @@ mod compact_result_tests {
             "ok": true, "action": "start", "mode": "play", "serverReady": true,
             "clients": [{"playerName": "A", "pid": 1, "runtimeId": "x"}, {"playerName": "B", "pid": 2}],
             "editPid": 7, "editRuntimeId": "e", "launchNonce": "n", "deviceSimulation": {"ok": true},
-            "teleport": {"mode": "native", "detail": "..."},
             "until": {"action": "wait", "condition": "return true", "ok": true, "value": "true", "elapsedSeconds": 1.5}
         });
         compact_play_result(&mut result, false);
         assert_eq!(
             result,
-            json!({"ok": true, "mode": "play", "serverReady": true, "clients": 2, "teleport": "native", "until": "true"})
+            json!({"ok": true, "mode": "play", "serverReady": true, "clients": 2, "until": "true"})
         );
         let mut named = json!({"ok": true, "clients": [{"playerName": "A"}, {"playerName": "B"}]});
         compact_play_result(&mut named, true);

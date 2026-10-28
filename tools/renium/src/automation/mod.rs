@@ -379,11 +379,6 @@ impl State {
     }
 
     #[cfg(any(windows, target_os = "macos"))]
-    pub(crate) fn bound_contexts(&self) -> Vec<BoundContext> {
-        self.contexts.lock_recover().values().cloned().collect()
-    }
-
-    #[cfg(any(windows, target_os = "macos"))]
     pub fn clear_context_runtime(&self, id: u64) {
         if let Some(context) = self.contexts.lock_recover().get_mut(&id) {
             context.runtime_id = None;

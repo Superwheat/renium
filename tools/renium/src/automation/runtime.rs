@@ -1418,42 +1418,7 @@ fn automation_dispatch_operation(
         }
         op::PLAY_START | op::PLAY_STOP => {
             let parsed = studio_args::play(operation, parameters)?;
-            let started = parsed.start && !parsed.stop;
-            let root = Path::new(&context.root);
-            let config = started
-                .then(|| crate::project::config::load_merged_config(root))
-                .transpose()?
-                .unwrap_or(Value::Null);
-            let enabled = config
-                .get("playTeleportEnabled")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
-            let prefer_native = config
-                .get("playTeleportNative")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
-            let mut result = start_stop_play_result(
-                parsed,
-                bridge,
-                (started && enabled).then_some(prefer_native),
-            )?;
-            if started && result["mode"] != "run" && result["teleport"].is_null() {
-                result["teleport"] = if enabled {
-                    // Teleport availability must not turn a successful Play start into a failure.
-                    crate::studio::teleport::enable(
-                        bridge,
-                        prefer_native,
-                        result["mode"].as_str().unwrap_or_default(),
-                        None,
-                    )
-                    .unwrap_or_else(
-                        |error| json!({"mode":"unavailable","reason":format!("{error:#}")}),
-                    )
-                } else {
-                    json!({"mode":"disabled","setting":"playTeleportEnabled"})
-                };
-            }
-            Ok(result)
+            start_stop_play_result(parsed, bridge)
         }
         op::SHOT => {
             let parsed = studio_args::shot(Path::new(&context.root), parameters)?;

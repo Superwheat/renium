@@ -516,15 +516,8 @@ function BridgeRuntimeApi.create(plugin, runtimeContext)
 		executionToken = nil,
 		executionThread = nil,
 		stopRequested = false,
-		external = false,
 		readyAt = 0,
 	}
-	local teleportTransition = nil
-	-- The original Edit controller outlives daemon connections and Play models.
-	-- Keep its last owned launch receipt until that test actually ends.
-	local playJournal = nil
-	local manualPlayEpoch = 0
-	local manualPlayConnection = nil
 	local deviceSimulatorReadyAt = os.clock() + 4
 	local deviceSimulatorStatusCache = nil
 	local captureProbeGui = nil
@@ -3195,7 +3188,6 @@ updateMouse()
 			game:SetAttribute("__ReniumEditRuntimeId", nil)
 		end
 		playSession.mode = nil
-		playSession.external = false
 		playSession.players = nil
 		playSession.launchNonce = nil
 		playSession.owned = false
@@ -3208,7 +3200,6 @@ updateMouse()
 		playSession.starting = false
 		playSession.stopRequested = false
 		playSession.lastStoppedAt = os.clock()
-		playJournal = nil
 		releasePlayOwnership()
 	end
 
@@ -3247,7 +3238,7 @@ updateMouse()
 			readyForStart = not running
 				and not playSession.starting
 				and not playSession.executionPending
-				and (teleportTransition ~= nil or os.clock() >= playSession.readyAt),
+				and os.clock() >= playSession.readyAt,
 			-- The daemon tells a start Studio ignored (the call returned or never
 			-- showed the test) from one that is still coming up.
 			engineRunning = engineRunning,
@@ -3260,12 +3251,6 @@ updateMouse()
 			lastResult = playSession.lastResult,
 			runState = currentRunStateText(),
 			studioTest = currentStudioTestState(),
-			teleportTransition = if teleportTransition then teleportTransition.id else nil,
-			teleportJournal = playJournal,
-			teleportLoadProtocol = 2,
-			teleportManualProtocol = 1,
-			teleportStartProtocol = 1,
-			manualPlayEpoch = manualPlayEpoch,
 		}
 	end
 
@@ -3403,93 +3388,6 @@ updateMouse()
 		end
 		local operationGeneration = cancellationGeneration
 		assertOperationOwnership(operationGeneration)
-		if params.prepareManualTeleport == true then
-			if runtimeContext.bridgeRole ~= "edit" or params.runtimeId ~= runtimeContext.runtimeId
-				or api.isPlayModeRunning() or playSession.active or playSession.starting
-				or playSession.executionPending or teleportTransition ~= nil then
-				local result = playStatus("prepareManual")
-				result.prepared = false
-				return result
-			end
-			if type(params.launchNonce) ~= "string" or params.launchNonce == "" then
-				return { ok = false, error = "Missing manual Play launch identity" }
-			end
-			game:SetAttribute("__ReniumLaunchNonce", params.launchNonce)
-			game:SetAttribute("__ReniumEditRuntimeId", runtimeContext.runtimeId)
-			if not manualPlayConnection then
-				manualPlayConnection = StudioTestService:GetPropertyChangedSignal("EditModeActive"):Connect(function()
-					manualPlayEpoch += 1
-				end)
-			end
-			local result = playStatus("prepareManual")
-			result.prepared = true
-			return result
-		end
-		if params.finishManualTeleport == true then
-			if runtimeContext.bridgeRole == "edit" and playSession.external
-				and playSession.launchNonce == params.launchNonce then
-				markPlayStopped()
-			end
-			return playStatus("finishManual")
-		end
-		if params.adoptTeleport == true then
-			local nonce, owner = params.launchNonce, params.editRuntimeId
-			local external = runtimeContext.bridgeRole == "edit" and params.mode == "multi" and not api.isPlayModeRunning()
-			if params.runtimeId ~= runtimeContext.runtimeId or type(nonce) ~= "string" or nonce == ""
-				or type(owner) ~= "string" or owner == "" or not (external or api.isPlayModeRunning()) then
-				return { ok = false, error = "The manual Play runtime ended or changed" }
-			end
-			local existingNonce = game:GetAttribute("__ReniumLaunchNonce")
-			local existingOwner = game:GetAttribute("__ReniumEditRuntimeId")
-			if (existingNonce ~= nil and existingNonce ~= nonce)
-				or (existingOwner ~= nil and existingOwner ~= owner) then
-				return { ok = false, error = "The manual Play runtime already belongs to another launch" }
-			end
-			if runtimeContext.bridgeRole == "edit" then
-				if owner ~= runtimeContext.runtimeId or playSession.owned or teleportTransition ~= nil
-					or (params.mode ~= "play" and params.mode ~= "multi") then
-					return { ok = false, error = "The Edit controller already owns a different launch" }
-				end
-				playSession.token += 1
-				playSession.active, playSession.starting, playSession.engineStarted = true, false, true
-				playSession.mode, playSession.launchNonce = params.mode, nonce
-				playSession.owned, playSession.ownerGeneration = true, operationGeneration
-				playSession.ownerRuntimeId = owner
-				playSession.external = external
-				playJournal = { nonce = nonce, mode = params.mode, ready = true }
-				if not external then
-					task.spawn(monitorStudioTest, playSession.token)
-				end
-			end
-			game:SetAttribute("__ReniumLaunchNonce", nonce)
-			game:SetAttribute("__ReniumEditRuntimeId", owner)
-			return playStatus("adopt")
-		end
-		if params.resumeTeleport == true or params.completeTeleport == true then
-			if runtimeContext.bridgeRole ~= "edit" or not playJournal
-				or playJournal.nonce ~= params.launchNonce or not api.isPlayModeRunning() then
-				return { ok = false, error = "The recorded teleport launch ended or changed" }
-			end
-			if params.completeTeleport == true then
-				if not playJournal.transition or playJournal.transition ~= params.teleportTransition or not matchingOwnedPlayLaunch(operationGeneration)
-					or playSession.launchNonce ~= params.launchNonce then
-					return { ok = false, error = "The destination completion does not own this launch" }
-				end
-				playJournal.ready = true
-			elseif not playJournal.ready then
-				return { ok = false, error = "The previous teleport was interrupted before arrival completed" }
-			elseif not matchingOwnedPlayLaunch(operationGeneration) then
-				playSession.token += 1
-				playSession.active, playSession.starting, playSession.engineStarted = true, false, true
-				playSession.mode, playSession.launchNonce = playJournal.mode, playJournal.nonce
-				playSession.owned, playSession.ownerGeneration = true, operationGeneration
-				playSession.ownerRuntimeId = runtimeContext.runtimeId
-				game:SetAttribute("__ReniumLaunchNonce", playJournal.nonce)
-				game:SetAttribute("__ReniumEditRuntimeId", runtimeContext.runtimeId)
-				task.spawn(monitorStudioTest, playSession.token)
-			end
-			return playStatus("resume")
-		end
 		if params.addPlayers ~= nil then
 			return addTestPlayers(params.addPlayers)
 		end
@@ -3508,36 +3406,6 @@ updateMouse()
 		if shouldStart and shouldStop then
 			return { ok = false, error = "Conflicting play state request" }
 		end
-		local transitionId = params.teleportTransition
-		if transitionId ~= nil then
-			if runtimeContext.bridgeRole ~= "edit" or type(transitionId) ~= "string" or #transitionId == 0 or #transitionId > 128 then
-				return { ok = false, error = "Invalid teleport controller transition" }
-			end
-			if shouldStop then
-				if teleportTransition and teleportTransition.id == transitionId and teleportTransition.nonce == params.launchNonce then
-					return playStatus("stop")
-				end
-				if not playSession.owned or playSession.mode ~= "play" or playSession.launchNonce ~= params.launchNonce then
-					return { ok = false, error = "Teleport source launch changed" }
-				end
-				teleportTransition = { id = transitionId, nonce = params.launchNonce, generation = operationGeneration, expires = os.clock() + 45 }
-				-- End the test from its server so ExecutePlayModeAsync completes.
-				-- Stopping only the Edit RunService leaves that executor in progress.
-				if params.prepareTeleport == true then
-					return playStatus("stop")
-				end
-			elseif shouldStart then
-				if not teleportTransition or teleportTransition.id ~= transitionId
-					or teleportTransition.generation ~= operationGeneration or os.clock() >= teleportTransition.expires then
-					return { ok = false, error = "Teleport was cancelled; the source Edit document was retained" }
-				end
-				if api.isPlayModeRunning() or playSession.starting or playSession.executionPending then
-					return { ok = false, error = "Teleport source test is still stopping" }
-				end
-			else
-				return { ok = false, error = "Teleport transition requires start or stop" }
-			end
-		end
 
 		local action = "status"
 		if shouldStart then
@@ -3555,7 +3423,6 @@ updateMouse()
 				if numPlayers and (numPlayers % 1 ~= 0 or numPlayers < 1 or numPlayers > 8) then
 					return { ok = false, error = "Multiplayer tests require an integer from 1 through 8" }
 				end
-				teleportTransition = nil
 				playSession.token += 1
 				playSession.executionPending = true
 				playSession.executionToken = playSession.token
@@ -3581,8 +3448,6 @@ updateMouse()
 				playSession.ownerRuntimeId = tostring(runtimeContext.runtimeId or "")
 				playSession.owned = true
 				playSession.ownerGeneration = operationGeneration
-				playJournal = { nonce = requestedLaunchNonce, mode = playSession.mode,
-					ready = transitionId == nil, transition = transitionId }
 				game:SetAttribute("__ReniumLaunchNonce", requestedLaunchNonce)
 				game:SetAttribute("__ReniumEditRuntimeId", playSession.ownerRuntimeId)
 				local token = playSession.token
@@ -3596,10 +3461,7 @@ updateMouse()
 					value = params.args,
 				}
 				playSession.executionThread = task.spawn(function()
-					-- Let the host arm the standalone server before PlayerAdded can
-					-- teleport. The requested count remains in the launch journal.
-					local initialPlayers = if params.deferPlayers == true and mode == "multi" then 0 else numPlayers
-					executeStudioTest(token, mode, testArgs, initialPlayers)
+					executeStudioTest(token, mode, testArgs, numPlayers)
 				end)
 				task.spawn(monitorStudioTest, token)
 			end
@@ -3614,10 +3476,6 @@ updateMouse()
 				return { ok = false, error = "The active Studio test does not match this Renium launch" }
 			end
 			playSession.stopRequested = true
-			if transitionId == nil then
-				teleportTransition = nil
-				playJournal = nil
-			end
 			local attempts = {}
 			local function attempt(label, callback)
 				local attemptOk, attemptErr = pcall(callback)
@@ -3712,7 +3570,6 @@ updateMouse()
 	end
 
 	function api.requestCancellation()
-		teleportTransition = nil
 		local cancelledGeneration = cancellationGeneration
 		cancellationGeneration += 1
 		editExecutionToken += 1
@@ -3741,11 +3598,6 @@ updateMouse()
 	end
 
 	function api.cleanup(ownerGeneration)
-		teleportTransition = nil
-		if manualPlayConnection then
-			manualPlayConnection:Disconnect()
-			manualPlayConnection = nil
-		end
 		local cleanupGeneration = ownerGeneration or api.requestCancellation()
 		if captureProbeGui ~= nil then
 			captureProbeGui:Destroy()

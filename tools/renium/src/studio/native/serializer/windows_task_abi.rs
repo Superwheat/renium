@@ -287,7 +287,7 @@ mod tests {
         ] {
             assert!(
                 from_report(
-                    NativeOperation::PlayTeleportJoin,
+                    NativeOperation::PackageActions,
                     &serde_json::json!({"taskContinuationAbi": value})
                 )
                 .is_err()

@@ -26,14 +26,6 @@ pub(super) fn probe_operation(
 ) -> Result<serde_json::Value> {
     use serde_json::json;
     match operation {
-        NativeOperation::PlayTeleportLoad => properties::playtest::probe_load(pid, title),
-        NativeOperation::PlayTeleport
-        | NativeOperation::PlayTeleportDispatch
-        | NativeOperation::PlayTeleportLaunch
-        | NativeOperation::PlayTeleportGui
-        | NativeOperation::PlayTeleportJoin => {
-            bail!(super::probes::PLAYTEST_UNAVAILABLE)
-        }
         NativeOperation::DescriptorBinding
         | NativeOperation::History
         | NativeOperation::VoxelHistory
@@ -90,27 +82,11 @@ mod properties;
 mod undo_selection;
 #[cfg(target_arch = "aarch64")]
 pub(crate) use properties::capture_identities;
-pub(crate) use properties::playtest::NativeMacPlayCaption as NativePlayCaption;
-pub(crate) use properties::playtest::NativeMacPlayJoin as NativePlayJoin;
-pub(crate) use properties::playtest::NativeMacPlayLoad as NativePlayLoad;
-pub(crate) use properties::playtest::NativeMacTeleportDispatch as NativeTeleportDispatch;
-pub(crate) use properties::playtest::NativeMacTeleportGui;
-pub(crate) use properties::playtest::{
-    NativeMacTestClient, NativeMacTestJoin as NativeTestJoin, TestClientRoute, TestJoinTarget,
-    prepare_test_client, process_arguments, start_destination_server, test_client_configuration,
-};
 pub(crate) use properties::{
     observe_terrain, prepare_context, prepare_property, prepare_terrain, read_property,
     register_history,
 };
 pub(crate) use undo_selection::keep_selection_across_undo;
-
-pub(crate) fn playtest_discovery(args: &crate::cli::NativeProbeArgs) -> Result<serde_json::Value> {
-    let pid = args
-        .pid
-        .context("Playtest discovery requires an existing Studio process")?;
-    properties::playtest::discover(pid, args.title.as_deref().unwrap_or_default())
-}
 
 const HELPER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-studio-helper.dylib"));
 const LAUNCHER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-studio-launcher"));
@@ -1247,7 +1223,7 @@ pub(super) fn platform_trigger_studio_action(
     _studio_title: &str,
     action: &str,
 ) -> Result<super::StudioActionOutcome> {
-    properties::playtest::NativeMacPlayCaption::trigger_action(pid, action)
+    properties::studio_action::NativeMacStudioAction::trigger_action(pid, action)
 }
 
 /// Roblox Studio's build number (742 for 0.742.x) from the running bundle.

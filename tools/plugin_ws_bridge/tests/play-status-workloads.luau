@@ -87,9 +87,6 @@ status = api.startStopPlay({ start = true, launchNonce = "test-launch" })
 assert(status.ok and status.running and starts == 1)
 assert(status.engineRunning and status.engineStarted and status.executing, "Studio entered the test")
 assert(status.mode == "play" and status.players == nil)
-assert(status.teleportJournal.nonce == "test-launch" and status.teleportJournal.ready)
-assert(api.startStopPlay({ resumeTeleport = true, launchNonce = "test-launch" }).ok,
-	"an idle reconnect can retain the same controller")
 authorized = false
 local checksBefore, writesBefore = ownershipChecks, writes
 status = api.startStopPlay({})
@@ -100,46 +97,6 @@ authorized = true
 status = api.startStopPlay({ stop = true })
 assert(status.ok and not status.running and stops == 1)
 assert(attributes.__ReniumLaunchNonce == nil and attributes.__ReniumEditRuntimeId == nil)
-
--- A destination launch is owned by the original Edit controller while its
--- source Play runtimes are gone. An ordinary Stop retires that permission.
-status = api.startStopPlay({ start = true, launchNonce = "travel-source" })
-assert(status.running)
-local reserved = api.startStopPlay({ stop = true, launchNonce = "travel-source", teleportTransition = "hop-1", prepareTeleport = true })
-assert(reserved.ok and reserved.running and reserved.teleportTransition == "hop-1", "reserving a transition must retain the source test")
-services.StudioTestService:EndTest()
-local stopped = api.startStopPlay({})
-local stopDeadline = os.clock() + 1
-while stopped.running and os.clock() < stopDeadline do
-	scheduler.wait()
-	stopped = api.startStopPlay({})
-end
-assert(stopped.ok and not stopped.running and stopped.teleportTransition == "hop-1")
-assert(stopped.readyForStart, "an owned teleport can restart once its previous executor has finished")
-local stopCount = stops
-assert(api.startStopPlay({ stop = true, launchNonce = "travel-source", teleportTransition = "hop-1" }).ok)
-assert(stops == stopCount, "a repeated transition stop must not stop another launch")
-status = api.startStopPlay({ start = true, launchNonce = "travel-destination", teleportTransition = "hop-1" })
-assert(status.ok and status.running and status.launchNonce == "travel-destination")
-assert(not status.teleportJournal.ready, "starting a destination is not an arrival receipt")
-assert(not api.startStopPlay({ resumeTeleport = true, launchNonce = "travel-destination" }).ok,
-	"reconnect must not adopt an unacknowledged destination")
-assert(not api.startStopPlay({ completeTeleport = true, launchNonce = "travel-destination", teleportTransition = "stale" }).ok)
-assert(api.startStopPlay({ completeTeleport = true, launchNonce = "travel-destination", teleportTransition = "hop-1" }).ok)
-api.requestCancellation()
-assert(api.startStopPlay({}).teleportJournal.ready, "the Edit receipt survives a daemon connection")
-assert(not api.startStopPlay({ resumeTeleport = true, launchNonce = "replaced" }).ok)
-assert(api.startStopPlay({ resumeTeleport = true, launchNonce = "travel-destination" }).ok,
-	"a replacement daemon can reclaim only the completed recorded launch")
-local stale = api.startStopPlay({ stop = true, launchNonce = "travel-source", teleportTransition = "hop-1" })
-assert(not stale.ok and api.startStopPlay({}).running, "old source replies cannot stop the destination")
-stopped = api.startStopPlay({ stop = true, launchNonce = "travel-destination", teleportTransition = "hop-2" })
-assert(stopped.ok and stopped.teleportTransition == "hop-2")
-assert(api.startStopPlay({ stop = true }).ok)
-assert(api.startStopPlay({}).teleportJournal == nil, "ordinary Stop retires the controller receipt")
-local startsBefore = starts
-status = api.startStopPlay({ start = true, launchNonce = "late-destination", teleportTransition = "hop-2" })
-assert(not status.ok and starts == startsBefore and not running, "Stop cancels a delayed destination start")
 api.cleanup()
 
 -- Studio can return from a start while the previous test is still ending, without
@@ -168,18 +125,6 @@ assert(status.ok and not status.running and status.mode == nil and status.player
 assert(not status.readyForStart, "the controller settles before the next start")
 multi.cleanup()
 
-local deferred = RuntimeApi.create({}, {
-	runtimeId = "test-runtime", bridgeRole = "edit",
-	assertRequestLeaseActive = function() end,
-	assertSessionOwnership = function() end,
-})
-status = deferred.startStopPlay({ start = true, players = 2, deferPlayers = true, launchNonce = "deferred-launch" })
-assert(status.teleportStartProtocol == 1 and status.players == 2 and launched.players == 0,
-	"a teleport-enabled multiplayer launch must expose its server before adding the requested players")
-assert(launched.args.__renium.nonce == "deferred-launch")
-assert(deferred.startStopPlay({ stop = true }).ok)
-deferred.cleanup()
-
 function services.StudioTestService:ExecuteRunModeAsync()
 	error("Studio is busy")
 end
@@ -194,51 +139,4 @@ assert(string.find(status.lastError, "Studio is busy", 1, true), "a refused star
 assert(status.engineStarted == false and status.executing == false)
 refused.cleanup()
 
--- Manual Play bypasses ExecutePlayModeAsync. Preparation must be idle-only,
--- while adoption/cleanup must reject delayed requests from a different test.
-local manualChanged
-function services.StudioTestService:GetPropertyChangedSignal(property)
-	assert(property == "EditModeActive")
-	return { Connect = function(_, callback)
-		manualChanged = callback
-		return { Disconnect = function() manualChanged = nil end }
-	end }
-end
-local manual = RuntimeApi.create({}, {
-	runtimeId = "manual-edit", bridgeRole = "edit",
-	assertRequestLeaseActive = function() end,
-	assertSessionOwnership = function() end,
-})
-local prepare = { prepareManualTeleport = true, runtimeId = "manual-edit", launchNonce = "manual-one" }
-status = manual.startStopPlay(prepare)
-assert(status.prepared and status.teleportManualProtocol == 1 and status.manualPlayEpoch == 0)
-assert(attributes.__ReniumLaunchNonce == "manual-one" and attributes.__ReniumEditRuntimeId == "manual-edit")
-running = true
-manualChanged()
-assert(not manual.startStopPlay(prepare).prepared, "preparation must not replace an active launch")
-local adopt = { adoptTeleport = true, runtimeId = "manual-edit", editRuntimeId = "manual-edit", launchNonce = "manual-one", mode = "play" }
-status = manual.startStopPlay(adopt)
-assert(status.ok and status.running and status.teleportJournal.ready and status.manualPlayEpoch == 1)
-assert(manual.startStopPlay({ stop = true }).ok)
-manualChanged()
-assert(manual.startStopPlay({}).manualPlayEpoch == 2, "early Start/Stop remains visible between polls")
-assert(not manual.startStopPlay(adopt).ok, "a delayed adoption must not revive stopped solo Play")
-
--- The Edit RunService stays stopped for manual Server & Clients. The external
--- server lifetime owns the journal until the exact launch finishes.
-prepare.launchNonce = "manual-two"
-assert(manual.startStopPlay(prepare).prepared)
-assert(not manual.startStopPlay(adopt).ok, "an old nonce must not adopt the next launch")
-adopt.launchNonce, adopt.mode = "manual-two", "multi"
-status = manual.startStopPlay(adopt)
-assert(status.ok and status.running and not status.engineRunning and status.teleportJournal.ready)
-scheduler.wait(0.15)
-assert(manual.startStopPlay({}).running, "external Play must not expire because Edit RunService is stopped")
-status = manual.startStopPlay({ finishManualTeleport = true, launchNonce = "manual-one" })
-assert(status.running and status.teleportJournal.nonce == "manual-two")
-status = manual.startStopPlay({ finishManualTeleport = true, launchNonce = "manual-two" })
-assert(not status.running and status.teleportJournal == nil and attributes.__ReniumLaunchNonce == nil)
-assert(manual.startStopPlay(prepare).prepared, "manual Stop must permit prearming the next launch")
-manual.cleanup()
-assert(manualChanged == nil)
 print("Renium play observation and ownership tests passed")

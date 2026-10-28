@@ -75,36 +75,6 @@ fn engine_probe(
     operation: NativeOperation,
 ) -> Result<Value> {
     match operation {
-        NativeOperation::PlayTeleport => Ok(json!({
-            "launch": engine_probe(memory, studio, layout, model, NativeOperation::PlayTeleportLaunch)?,
-            "load": engine_probe(memory, studio, layout, model, NativeOperation::PlayTeleportLoad)?,
-            "arrival": playtest::join::probe(memory, studio)?,
-        })),
-        NativeOperation::PlayTeleportDispatch => playtest::dispatch::probe(memory, studio, model),
-        NativeOperation::PlayTeleportJoin => playtest::join::probe(memory, studio),
-        NativeOperation::PlayTeleportGui => playtest::gui::probe(memory, studio),
-        NativeOperation::PlayTeleportLaunch => {
-            let dispatch = playtest::dispatch::probe(memory, studio, model)?;
-            let owner = playtest::owner::resolve(memory, studio, model)?;
-            let loader = playtest::loader::resolve(memory, studio, model)?;
-            helper_export_rva("ReniumPlayTeleport")?;
-            helper_export_rva("ReniumPlayContinuations")?;
-            Ok(
-                json!({"dispatch":dispatch,"launch":owner.fields,"execute":owner.execute,
-                "loaderSlot":loader.slot,"loaderFunction":loader.function,
-                "loaderDirectModel":loader.direct_model}),
-            )
-        }
-        NativeOperation::PlayTeleportLoad => {
-            let binding = playtest::loader::resolve(memory, studio, model)?;
-            let nonce = playtest::loader::nonce_bindings(memory, studio, model)?;
-            Ok(
-                json!({"callbackSlotRva":binding.slot,"callbackRva":binding.function,
-                "captureField":binding.fields.capture,"stringField":binding.fields.string,
-                "placeField":binding.fields.place,"universeField":binding.fields.universe,
-                "launchCheck":nonce}),
-            )
-        }
         NativeOperation::Snapshot => snapshot_probe(memory, studio, layout),
         NativeOperation::Capture => {
             let serializer = snapshot_probe(memory, studio, layout)?;

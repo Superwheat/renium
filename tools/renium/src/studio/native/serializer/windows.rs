@@ -9,19 +9,6 @@ use task_context::*;
 #[path = "windows_probes.rs"]
 mod probes;
 pub(super) use probes::probe_operation;
-#[path = "windows_playtest.rs"]
-mod playtest;
-pub(crate) use playtest::caption::NativePlayCaption;
-pub(crate) use playtest::client::{
-    prepare_test_client, rejoin_test_client, test_client_configuration,
-};
-pub(super) use playtest::discover as playtest_discovery;
-pub(crate) use playtest::dispatch::NativeTeleportDispatch;
-pub(crate) use playtest::gui::notify_teleport_gui;
-pub(crate) use playtest::join::NativePlayJoin;
-pub(crate) use playtest::join::NativeTestJoin;
-pub(crate) use playtest::loader::NativePlayLoad;
-pub(crate) use playtest::server::start_destination_server;
 use std::ffi::{OsStr, c_void};
 use std::fs;
 use std::io::Read;
@@ -198,7 +185,6 @@ struct ProcessMemory {
     pid: u32,
     verified: Cell<bool>,
     task_abi: Cell<Option<u32>>,
-    play_abi: Cell<Option<properties::ContinuationAbi>>,
 }
 
 const NATIVE_WRITES_DISABLED: &str =
@@ -227,7 +213,6 @@ impl ProcessMemory {
             pid,
             verified: Cell::new(false),
             task_abi: Cell::new(None),
-            play_abi: Cell::new(None),
         })
     }
 
@@ -275,7 +260,6 @@ impl ProcessMemory {
             pid,
             verified: Cell::new(false),
             task_abi: Cell::new(None),
-            play_abi: Cell::new(None),
         })
     }
 
@@ -1455,7 +1439,6 @@ fn valid_owner(
 }
 
 fn expected_data_model_names(title: &str) -> Vec<String> {
-    let title = crate::studio::input::ordinary_studio_title(title);
     let title = title
         .strip_suffix(" - Roblox Studio")
         .unwrap_or(title)
@@ -2774,8 +2757,6 @@ struct CaptureWindowSearch<'a> {
 }
 
 fn capture_title_matches(title: &str, selector: &str) -> bool {
-    let title = crate::studio::input::ordinary_studio_title(title);
-    let selector = crate::studio::input::ordinary_studio_title(selector);
     if selector.trim().is_empty() || !title.ends_with(" - Roblox Studio") {
         return false;
     }

@@ -20,7 +20,7 @@ const STRING_CONFIG_KEYS = new Set([
   "link.manifest", "link.folder", "link.cacheDir", "link.gitPath",
 ]);
 const BOOLEAN_CONFIG_KEYS = new Set([
-  "yes", "backtrace", "verifyEditorPushSources", "playTeleportEnabled", "playTeleportNative",
+  "yes", "backtrace", "verifyEditorPushSources",
   "autoSyncOnSave", "editorLiveSyncEnabled",
   "studioLiveSyncEnabled", "liveSync.overridePackages",
   "gitSync.autoFetch", "gitSync.includeUntracked", "gitSync.confirmBeforePush",

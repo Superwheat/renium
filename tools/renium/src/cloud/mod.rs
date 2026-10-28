@@ -8,7 +8,6 @@ pub(crate) mod place_file;
 pub(crate) mod products;
 mod routes;
 mod servers;
-pub(crate) mod teleport;
 mod transport;
 
 pub(crate) use discovery::{

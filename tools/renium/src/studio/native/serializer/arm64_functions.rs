@@ -638,29 +638,6 @@ mod tests {
     }
 
     #[test]
-    fn installed_teleport_yield_dispatch() {
-        let records: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../../native/tests/arm64-teleport-dispatch.json"
-        ))
-        .unwrap();
-        let result = dispatch_field(
-            0x100c6999c,
-            |address| {
-                records
-                    .as_array()?
-                    .iter()
-                    .find(|row| row["entry"].as_u64() == Some(address))?["code"]
-                    .as_array()?
-                    .iter()
-                    .map(|v| v.as_u64().map(|b| b as u8))
-                    .collect()
-            },
-            |_| Some(0),
-        );
-        assert_eq!(result, Some(0x80));
-    }
-
-    #[test]
     #[ignore]
     fn captured_arm64_dispatch() {
         let records: serde_json::Value = serde_json::from_slice(

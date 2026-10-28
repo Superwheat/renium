@@ -28,7 +28,6 @@ Read relevant guides once per session; reread after `rbx upd`.
 | Configuration and imports | `RENIUM/configuration.md` |
 | Pull, push, Live Sync and conflicts | `RENIUM/sync.md` |
 | Play sessions | `RENIUM/playtest.md` |
-| Playtest teleport | `RENIUM/teleport.md` |
 | Live Luau and consoles | `RENIUM/runtime.md` |
 | Network simulation | `RENIUM/network.md` |
 | UI, input and movement | `RENIUM/input.md` |

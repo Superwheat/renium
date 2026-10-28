@@ -2243,45 +2243,6 @@ pub(crate) struct NativeProbeArgs {
     pub(crate) title: Option<String>,
     #[arg(long, help = "Exit with failure if any operation is degraded")]
     pub(crate) require_native: bool,
-    #[arg(
-        long,
-        conflicts_with = "launch",
-        help = "Read-only Windows playtest discovery JSON; never grants native switch permission"
-    )]
-    pub(crate) playtest_discovery: bool,
-    #[arg(
-        long,
-        requires = "playtest_discovery",
-        help = "Focus read-only discovery on teleport HTTP, join/placelauncher, delivery and response consumers"
-    )]
-    pub(crate) playtest_http: bool,
-    #[arg(
-        long,
-        requires = "playtest_discovery",
-        value_name = "TEXT",
-        help = "Select string/RTTI anchors instead of defaults (repeatable, case-insensitive substring)"
-    )]
-    pub(crate) playtest_anchor: Vec<String>,
-    #[arg(long, requires = "playtest_discovery", value_name = "RVA", value_parser = parse_probe_rva, help = "Expand a reported function RVA, decimal or 0x hex (repeatable)")]
-    pub(crate) playtest_rva: Vec<usize>,
-    #[arg(long, requires = "playtest_discovery", value_name = "ADDRESS", value_parser = parse_probe_rva, help = "Read RTTI and code-referenced pointer fields of a reported live object (repeatable)")]
-    pub(crate) playtest_object: Vec<usize>,
-    #[arg(long, requires = "playtest_discovery", default_value = "1", value_parser = clap::value_parser!(u8).range(0..=3))]
-    pub(crate) playtest_depth: u8,
-    #[arg(long, requires = "playtest_discovery", default_value = "256", value_parser = clap::value_parser!(u16).range(1..=2048))]
-    pub(crate) playtest_max_functions: u16,
-}
-
-fn parse_probe_rva(value: &str) -> std::result::Result<usize, String> {
-    let parsed = if let Some(hex) = value
-        .strip_prefix("0x")
-        .or_else(|| value.strip_prefix("0X"))
-    {
-        usize::from_str_radix(hex, 16)
-    } else {
-        value.parse()
-    };
-    parsed.map_err(|_| "Expected a decimal or 0x hexadecimal image-relative address".into())
 }
 
 #[derive(Parser)]

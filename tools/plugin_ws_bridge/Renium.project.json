@@ -31,11 +31,6 @@
       "BridgePluginRuntime": {
         "$path": "BridgePluginRuntime.module.luau"
       },
-      "BridgePlayTeleport": { "$path": "BridgePlayTeleport.module.luau" },
-      "BridgeTeleportState": { "$path": "BridgeTeleportState.module.luau" },
-      "BridgeTeleportGui": { "$path": "BridgeTeleportGui.module.luau" },
-      "BridgeTeleportContent": { "$path": "BridgeTeleportContent.module.luau" },
-      "TeleportShim": { "$path": "TeleportShim.module.luau" },
       "BridgeIdentity": {
         "$path": "BridgeIdentity.module.luau"
       },

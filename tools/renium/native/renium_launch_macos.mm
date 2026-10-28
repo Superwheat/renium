@@ -9,7 +9,6 @@
 #include <mach-o/dyld.h>
 #include <spawn.h>
 #include <unistd.h>
-extern "C" bool ReniumCaptureTestClient(char* const[], pid_t*);
 
 namespace {
 std::atomic<bool> guarded{false};
@@ -269,18 +268,15 @@ extern "C" void ReniumInitializeLaunchGuard()
 
 static int launchExecv(const char* path, char* const args[])
 {
-    if (ReniumCaptureTestClient(args, nullptr)) _exit(0);
     return execv(childExecutable(path), args);
 }
 static int launchExecve(const char* path, char* const args[], char* const environment[])
 {
-    if (ReniumCaptureTestClient(args, nullptr)) _exit(0);
     return execve(childExecutable(path), args, environment);
 }
 static int launchSpawn(pid_t* pid, const char* path, const posix_spawn_file_actions_t* actions,
     const posix_spawnattr_t* attributes, char* const args[], char* const environment[])
 {
-    if (ReniumCaptureTestClient(args, pid)) return 0;
     return posix_spawn(pid, childExecutable(path), actions, attributes, args, environment);
 }
 

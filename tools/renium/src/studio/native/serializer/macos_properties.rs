@@ -6,8 +6,8 @@ use std::collections::HashSet;
 use std::io::{Seek, SeekFrom};
 use std::sync::Arc;
 
-#[path = "macos_playtest.rs"]
-pub(super) mod playtest;
+#[path = "macos_studio_action.rs"]
+pub(super) mod studio_action;
 
 #[path = "macos_history.rs"]
 mod history;

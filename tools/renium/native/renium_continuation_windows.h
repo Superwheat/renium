@@ -11,12 +11,7 @@
 // this helper. The selection is process-scoped and cannot change under hooks.
 namespace renium_continuation {
 enum class Abi : std::uint32_t { Unknown, Msvc, Tagged };
-inline std::atomic<Abi> abi{Abi::Unknown}, taskAbi{Abi::Unknown};
-inline bool Tagged() {
-    const auto value = abi.load();
-    if (value == Abi::Unknown) throw std::runtime_error("Native continuations were not verified");
-    return value == Abi::Tagged;
-}
+inline std::atomic<Abi> taskAbi{Abi::Unknown};
 
 // Inline storage plus a tagged operations pointer. Bit 1 denotes inline
 // storage, bit 2 a nontrivial callable with invoke/copy/move/destroy entries.
@@ -99,14 +94,6 @@ struct SubmitDataModelTask {
 };
 static_assert(sizeof(Function<void(std::string)>) == 32);
 static_assert(sizeof(std::function<void(std::string)>) == 64);
-}
-
-extern "C" __declspec(dllexport) DWORD WINAPI ReniumPlayContinuations(void* input) {
-    const auto value = *static_cast<const std::uint32_t*>(input);
-    if (value != 1 && value != 2) return 1;
-    auto expected = renium_continuation::Abi::Unknown;
-    const auto selected = static_cast<renium_continuation::Abi>(value);
-    return renium_continuation::abi.compare_exchange_strong(expected, selected) || expected == selected ? 0 : 2;
 }
 
 extern "C" __declspec(dllexport) DWORD WINAPI ReniumTaskContinuations(void* input) {

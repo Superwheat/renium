@@ -1,54 +1,6 @@
 use super::*;
 
 #[test]
-#[ignore = "requires RENIUM_PROBE_PID; only reads the selected Studio process"]
-fn manual_play_teleport_launch_probe() -> Result<()> {
-    let pid: u32 = std::env::var("RENIUM_PROBE_PID")?.parse()?;
-    let title = crate::studio::input::studio_window_title(pid)?;
-    let result = probe_operation(pid, &title, NativeOperation::PlayTeleportLaunch);
-    println!(
-        "{}",
-        serde_json::to_string(&super::super::probes::ProbeVerdict::from_result(
-            NativeOperation::PlayTeleportLaunch,
-            &result,
-        ))?
-    );
-    result.map(|_| ())
-}
-
-#[test]
-#[ignore = "requires an explicitly owned Studio PID; invokes its real Play/Stop control"]
-fn manual_play_control_for_teleport_regression() -> Result<()> {
-    let pid: u32 = std::env::var("RENIUM_TELEPORT_TEST_PID")?.parse()?;
-    let action = std::env::var("RENIUM_TELEPORT_TEST_ACTION")?;
-    anyhow::ensure!(
-        matches!(
-            action.as_str(),
-            "simulationPlayAction"
-                | "simulationPlayFromCameraAction"
-                | "simulationResetAction"
-                | "launchTestModeAction"
-                | "startServerAction"
-                | "addClientsAction"
-                | "cleanupServersAndPlayersAction"
-        ),
-        "Not a playtest control"
-    );
-    let title = crate::studio::input::studio_window_title(pid)?;
-    let foreground = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
-    let result = platform_trigger_studio_action(pid, &title, &action)?;
-    anyhow::ensure!(
-        foreground == unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow() },
-        "Play control changed keyboard focus"
-    );
-    println!(
-        "Studio control {action}: {} matching action(s)",
-        result.found
-    );
-    Ok(())
-}
-
-#[test]
 fn native_gate_rejects_writes_allocations_and_both_thread_ownership_modes() {
     // Invalid handles/addresses must never reach a Windows mutation API.
     let memory = std::mem::ManuallyDrop::new(ProcessMemory {
@@ -56,7 +8,6 @@ fn native_gate_rejects_writes_allocations_and_both_thread_ownership_modes() {
         pid: 0,
         verified: Cell::new(false),
         task_abi: Cell::new(None),
-        play_abi: Cell::new(None),
     });
     assert_eq!(
         memory.write(0, &[1]).unwrap_err().to_string(),
@@ -92,7 +43,6 @@ fn native_gate_rejects_new_and_resident_helpers() {
         pid: 0,
         verified: Cell::new(false),
         task_abi: Cell::new(None),
-        play_abi: Cell::new(None),
     });
     let path = Path::new("resident-helper.dll");
     let resident = [ModuleEntry {
@@ -120,7 +70,6 @@ fn native_gate_rejects_new_and_resident_helpers() {
         pid: 0,
         verified: Cell::new(true),
         task_abi: Cell::new(None),
-        play_abi: Cell::new(None),
     });
     assert_eq!(
         ensure_library_loaded(0, &verified, &resident, 0, path).unwrap(),
@@ -132,13 +81,7 @@ fn native_gate_rejects_new_and_resident_helpers() {
 fn read_only_probes_refuse_non_studio_processes_without_loading_a_helper() -> Result<()> {
     let pid = std::process::id();
     let before = modules(pid)?.len();
-    for operation in NativeOperation::ALL.into_iter().chain([
-        NativeOperation::PlayTeleport,
-        NativeOperation::PlayTeleportLoad,
-        NativeOperation::PlayTeleportDispatch,
-        NativeOperation::PlayTeleportLaunch,
-        NativeOperation::PlayTeleportJoin,
-    ]) {
+    for operation in NativeOperation::ALL {
         let error = probe_operation(pid, "", operation).unwrap_err().to_string();
         assert!(
             error.contains("not Roblox Studio"),

@@ -1,40 +1,15 @@
 #[cfg(any(target_os = "macos", test))]
 mod arm64_functions;
-#[cfg(any(target_os = "macos", test))]
-mod arm64_playtest;
-#[cfg(any(target_os = "macos", test))]
-mod arm64_routing;
 #[cfg(any(windows, target_os = "macos", test))]
 mod functions;
 #[cfg(target_os = "macos")]
 mod macos;
-#[cfg(target_os = "macos")]
-pub(crate) use macos::{
-    NativeMacTestClient, NativeTestJoin, TestClientRoute, TestJoinTarget, prepare_test_client,
-    process_arguments, start_destination_server, test_client_configuration,
-};
 #[cfg(any(windows, target_os = "macos", test))]
 pub(crate) mod probes;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub(crate) use windows::NativePlayCaption;
-#[cfg(windows)]
-pub(crate) use windows::NativePlayJoin;
-#[cfg(windows)]
-pub(crate) use windows::NativePlayLoad;
-#[cfg(windows)]
-pub(crate) use windows::NativeTeleportDispatch;
-#[cfg(windows)]
-pub(crate) use windows::NativeTestJoin;
-#[cfg(windows)]
-pub(crate) use windows::notify_teleport_gui;
-#[cfg(windows)]
 pub(crate) use windows::{AudioOutputGate, keep_selection_across_undo, suppress_package_notices};
-#[cfg(windows)]
-pub(crate) use windows::{
-    prepare_test_client, rejoin_test_client, start_destination_server, test_client_configuration,
-};
 
 use std::time::Duration;
 
