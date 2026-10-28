@@ -166,6 +166,9 @@ pub(super) fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
         listen_metrics.bind_ms,
         listen_metrics.wait_for_channels_ms
     );
+    if let Ok(dir) = crate::app::update::user_data_dir() {
+        let _ = std::fs::remove_dir_all(dir.join("cache").join("play-teleport"));
+    }
     let mut audio_check = Instant::now();
     while bridge.alive.load(Ordering::Relaxed) {
         if is_default_daemon() && audio_check.elapsed() >= Duration::from_secs(2) {

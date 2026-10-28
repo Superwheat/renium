@@ -593,6 +593,8 @@ function validateSharedConfig(config: SharedConfig): void {
         if (typeof item !== "string" || !enumValues.includes(item)) {
           throw new Error(`Renium configuration key '${dotted}' has an unsupported value`);
         }
+      } else if (dotted === "playTeleportEnabled" || dotted === "playTeleportNative") {
+        continue;
       } else {
         throw new Error(`Unknown Renium configuration key '${dotted}'`);
       }

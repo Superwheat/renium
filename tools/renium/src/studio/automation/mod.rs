@@ -3501,9 +3501,9 @@ fn play_stop_runtimes<'a>(clients: &'a [Value], edit: Option<&Value>) -> Vec<&'a
             let only = servers.next()?;
             servers.next().is_none().then_some(only)
         });
-    // Only the source server receives EndTest. Sending it from several servers
-    // concurrently completes the shared executor twice and can crash Edit, and
-    // any other server's process lifetime is bound to the source's exit.
+    // Only the server that matches the Edit place receives EndTest. Sending it
+    // from several servers concurrently completes the shared executor twice
+    // and can crash Edit; a server that does not match is not this session's.
     clients
         .iter()
         .filter(|client| {

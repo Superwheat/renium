@@ -2746,6 +2746,7 @@ fn validate_merged_config(value: &Value) -> Result<()> {
                 | "link.folder"
                 | "link.cacheDir"
                 | "link.gitPath" => require_kind(&path, "a string", value.is_string())?,
+                "playTeleportEnabled" | "playTeleportNative" => {}
                 _ => bail!("Unknown Renium configuration key '{path}'"),
             }
         }
@@ -3734,6 +3735,19 @@ mod tests {
             }
         }
         validate_merged_config(&values).unwrap();
+    }
+
+    #[test]
+    fn retired_play_teleport_keys_are_accepted_and_ignored() {
+        for key in ["playTeleportEnabled", "playTeleportNative"] {
+            validate_merged_config(&json!({key: false})).unwrap();
+            validate_merged_config(&json!({key: "false"})).unwrap();
+            assert!(
+                !CONFIG_SETTING_SPECS
+                    .iter()
+                    .any(|setting| setting.key == key)
+            );
+        }
     }
 
     #[test]
