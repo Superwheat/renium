@@ -46,7 +46,7 @@ impl NativeMacStudioAction {
         let response = self.memory.request(11, &self.request, "")?;
         anyhow::ensure!(
             response.len() == self.request.len(),
-            "Invalid Mac caption receipt"
+            "Invalid Mac Studio window receipt"
         );
         Ok(response)
     }
@@ -58,7 +58,7 @@ impl NativeMacStudioAction {
         let length = title
             .iter()
             .position(|b| *b == 0)
-            .context("Unterminated Mac caption")?;
+            .context("Unterminated Mac Studio title")?;
         Ok((
             read_u32(&response, 12).unwrap() as isize,
             std::str::from_utf8(&title[..length])?.to_owned(),

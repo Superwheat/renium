@@ -49,124 +49,34 @@ struct Request {
     char ordinary[1024], next[1024];
 };
 static_assert(sizeof(Request) == 2096);
-struct Caption {
-    Request request{};
-    NSWindow* window = nil;
-    NSString* ordinary = nil;
-    NSString* written = nil;
-    NSString* suffix = nil;
-    ~Caption() { [window release]; [ordinary release]; [written release]; [suffix release]; }
-};
-std::shared_ptr<Caption> current;
-std::mutex pendingMutex;
-std::optional<Request> pending;
-std::uint64_t ownerToken = 0;
-bool hostAlive(const Request& r) {
-    proc_bsdinfo info{};
-    return proc_pidinfo(r.hostPid, PROC_PIDTBSDINFO, 0, &info, sizeof(info)) == sizeof(info)
-        && info.pbi_uid == getuid() && info.pbi_start_tvsec == r.hostSeconds && info.pbi_start_tvusec == r.hostMicros;
-}
-void restore(const std::shared_ptr<Caption>& caption) {
-    if (caption->written && [caption->window.title isEqualToString:caption->written])
-        caption->window.title = caption->ordinary;
-    if (current == caption) current.reset();
-    std::lock_guard lock(pendingMutex);
-    if (ownerToken == caption->request.token) {
-        ownerToken = 0;
-        pending.reset();
-    }
-}
-void apply(const std::shared_ptr<Caption>& caption) {
-    NSString* actual = caption->window.title;
-    if (!actual.length) return;
-    if (![actual isEqualToString:caption->written]) {
-        [caption->ordinary release]; caption->ordinary = [actual copy];
-    }
-    NSString* next = [caption->ordinary stringByAppendingString:caption->suffix ?: @""];
-    if (![actual isEqualToString:next]) caption->window.title = next;
-    [caption->written release]; caption->written = [next copy];
-}
-void watch(const std::shared_ptr<Caption>& caption) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-        if (current != caption) return;
-        if (!hostAlive(caption->request) || ![NSApp.windows containsObject:caption->window]) restore(caption);
-        else { apply(caption); watch(caption); }
-    });
-}
 NSWindow* window(std::uint32_t number) {
-    if (!number && current) number = current->request.window;
     NSWindow* result = nil;
     for (NSWindow* candidate in NSApp.windows) {
         if (number ? candidate.windowNumber != number :
             (!candidate.visible || candidate.level != NSNormalWindowLevel || [candidate isKindOfClass:NSPanel.class]
                 || !(candidate.styleMask & NSWindowStyleMaskTitled) || !(candidate.styleMask & NSWindowStyleMaskResizable)
                 || !candidate.title.length)) continue;
-        if (result) throw std::runtime_error("Teleport caption has multiple Studio windows");
+        if (result) throw std::runtime_error("Studio has multiple document windows");
         result = candidate;
     }
-    if (!result) throw std::runtime_error("Teleport caption window ended");
+    if (!result) throw std::runtime_error("Studio document window ended");
     return result;
 }
 void handle(Request& r) {
-    if (r.version != 1 || r.size != sizeof(r) || r.action < 1 || r.action > 4 || r.reserved)
-        throw std::runtime_error("Incompatible Mac teleport caption request");
-    if (r.action == 1) {
-        const auto selected = window(r.window);
-        const char* title = selected.title.UTF8String;
-        if (!title || std::strlen(title) >= sizeof(r.ordinary)) throw std::runtime_error("Studio title exceeds caption bound");
-        r.window = static_cast<std::uint32_t>(selected.windowNumber);
-        std::strcpy(r.ordinary, title);
-        return;
-    }
-    if (!r.token || !r.window || !hostAlive(r) || r.ordinary[1023] || r.next[1023])
-        throw std::runtime_error("Invalid Mac teleport caption ownership");
-    if (r.action == 2) {
-        if (current) throw std::runtime_error("Studio caption already has an owner");
-        auto caption = std::make_shared<Caption>();
-        caption->window = [window(r.window) retain];
-        caption->ordinary = [[NSString alloc] initWithUTF8String:r.ordinary];
-        if (!caption->ordinary || ![caption->window.title isEqualToString:caption->ordinary])
-            throw std::runtime_error("Studio title changed before caption ownership");
-        caption->request = r;
-        {
-            std::lock_guard lock(pendingMutex);
-            ownerToken = r.token;
-        }
-        current = caption;
-        watch(caption);
-        return;
-    }
-    const auto caption = current;
-    if (!caption || caption->request.token != r.token || caption->request.window != r.window)
-        throw std::runtime_error("Mac teleport caption owner changed");
-    if (r.action == 4) { restore(caption); return; }
-    NSString* ordinary = [NSString stringWithUTF8String:r.ordinary];
-    NSString* next = r.next[0] ? [NSString stringWithUTF8String:r.next] : ordinary;
-    if (!ordinary || !next || ![next hasPrefix:ordinary])
-        throw std::runtime_error("Invalid Studio caption suffix");
-    [caption->suffix release]; caption->suffix = [[next substringFromIndex:ordinary.length] copy];
-    apply(caption);
+    if (r.version != 1 || r.size != sizeof(r) || r.action != 1 || r.reserved)
+        throw std::runtime_error("Incompatible Mac Studio window request");
+    const auto selected = window(r.window);
+    const char* title = selected.title.UTF8String;
+    if (!title || std::strlen(title) >= sizeof(r.ordinary)) throw std::runtime_error("Studio title exceeds its bound");
+    r.window = static_cast<std::uint32_t>(selected.windowNumber);
+    std::strcpy(r.ordinary, title);
+}
 }
 
-void drain() {
-    std::optional<Request> request;
-    {
-        std::lock_guard lock(pendingMutex);
-        request.swap(pending);
-    }
-    if (!request) return;
-    @autoreleasepool {
-        try { handle(*request); }
-        catch (const std::exception& error) {
-            NSLog(@"Renium teleport caption: %s", error.what());
-        }
-    }
-}
-}
 
 // Resolve Qt's existing top-level widget to the Cocoa window already owned by
-// the caption lease. Qt 5's public list/QString ABI is independent of Studio.
-void* ReniumTeleportClientWidget(std::uint32_t number) {
+// the daemon. Qt 5's public list/QString ABI is independent of Studio.
+void* ReniumStudioWindowWidget(std::uint32_t number) {
     __block void* selected = nullptr;
     __block std::string error;
     auto find = ^{
@@ -202,7 +112,7 @@ void ReniumStudioAction(const std::string& payload, std::vector<unsigned char>& 
     __block std::string error;
     dispatch_sync(dispatch_get_main_queue(), ^{
         try {
-            auto root = ReniumTeleportClientWidget(r.window);
+            auto root = ReniumStudioWindowWidget(r.window);
             auto text = reinterpret_cast<QtText(*)(const char*, int)>(dlsym(RTLD_DEFAULT, "_ZN7QString15fromUtf8_helperEPKci"));
             auto find = reinterpret_cast<void(*)(const void*, const QtText&, const void*, QtObjects*, int)>(
                 dlsym(RTLD_DEFAULT, "_Z23qt_qFindChildren_helperPK7QObjectRK7QStringRK11QMetaObjectP5QListIPvE6QFlagsIN2Qt15FindChildOptionEE"));
@@ -226,29 +136,12 @@ void ReniumStudioAction(const std::string& payload, std::vector<unsigned char>& 
     output.resize(sizeof(r)); std::memcpy(output.data(), &r, sizeof(r));
 }
 
-// AppKit work is restricted to this process's existing window on its UI thread.
-// No activation, ordering, resizing, or Accessibility permission is involved.
-void ReniumTeleportCaption(const std::string& payload, std::vector<unsigned char>& output) {
-    if (payload.size() != sizeof(Request)) throw std::runtime_error("Truncated Mac caption request");
+// AppKit work is restricted to reading this process's existing window on its
+// UI thread. No activation, ordering, resizing, or Accessibility permission is involved.
+void ReniumStudioWindow(const std::string& payload, std::vector<unsigned char>& output) {
+    if (payload.size() != sizeof(Request)) throw std::runtime_error("Truncated Mac Studio window request");
     __block Request r{};
     std::memcpy(&r, payload.data(), sizeof(r));
-    if (r.action == 3 || r.action == 4) {
-        if (r.version != 1 || r.size != sizeof(r) || r.reserved || !r.token || !r.window
-            || !hostAlive(r) || r.ordinary[1023] || r.next[1023])
-            throw std::runtime_error("Invalid Mac teleport caption ownership");
-        {
-            std::lock_guard lock(pendingMutex);
-            if (ownerToken != r.token) throw std::runtime_error("Mac teleport caption owner changed");
-            pending = r;
-            if (r.action == 4) ownerToken = 0;
-        }
-        // Coalesce title changes without waiting behind Studio's document load.
-        // Stop is ordered on the same UI queue and invalidates further writes.
-        dispatch_async(dispatch_get_main_queue(), ^{ drain(); });
-        output.resize(sizeof(r));
-        std::memcpy(output.data(), &r, sizeof(r));
-        return;
-    }
     __block std::string error;
     dispatch_sync(dispatch_get_main_queue(), ^{
         @autoreleasepool {

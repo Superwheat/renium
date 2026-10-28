@@ -45,7 +45,7 @@
 #include "renium_studio_terrain.h"
 
 extern "C" bool ReniumArmLaunchGuard();
-void ReniumTeleportCaption(const std::string&, std::vector<unsigned char>&);
+void ReniumStudioWindow(const std::string&, std::vector<unsigned char>&);
 void ReniumStudioAction(const std::string&, std::vector<unsigned char>&);
 extern "C" void ReniumInitializeLaunchGuard();
 extern "C" bool ReniumStudioAudio(unsigned, unsigned*, unsigned*, unsigned*, bool*, char*, std::size_t);
@@ -1669,7 +1669,7 @@ static Response PropertyTransport(
     }
     else if (request.reserved == 11)
     {
-        try { ReniumTeleportCaption(payload, output); }
+        try { ReniumStudioWindow(payload, output); }
         catch (const std::exception& error) { SetError(response, error.what()); return response; }
     }
     else if (request.reserved == 15)
