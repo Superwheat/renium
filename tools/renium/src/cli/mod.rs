@@ -2200,7 +2200,7 @@ pub(super) struct StudioChangeStateArgs {
         value_name = "SECONDS",
         num_args = 0..=1,
         default_missing_value = "10",
-        help = "Wait for watched file changes to finish syncing"
+        help = "Wait up to SECONDS (at most 120) for watched file changes to finish syncing"
     )]
     pub(super) settle_wait_seconds: Option<f64>,
     #[arg(help = "Bind tracking to the current project context", long)]

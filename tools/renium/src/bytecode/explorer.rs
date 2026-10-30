@@ -2384,11 +2384,16 @@ impl ExplorerDaemonState {
             .copied()
             .unwrap_or(false);
         let disabled = matches!(instance.class_name.as_str(), "Script" | "LocalScript")
-            && instance
+            && (instance
                 .properties
-                .get("Disabled")
+                .get("Enabled")
                 .and_then(Value::as_bool)
-                .unwrap_or(false);
+                .is_some_and(|enabled| !enabled)
+                || instance
+                    .properties
+                    .get("Disabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false));
         let parent_id = explorer_parent_tree_id(&state.service, document, state.root_index, index);
         let has_package_link =
             has_direct_package_link_child(document, &state.children_by_parent, index);

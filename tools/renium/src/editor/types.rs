@@ -693,6 +693,18 @@ impl EditorBinaryImport {
             })
     }
 
+    /// Whether the path lies in a package root the import creates or retains.
+    pub(crate) fn imports_package_path(&self, service: &str, segments: &[String]) -> bool {
+        self.groups.iter().any(|group| {
+            group.service == service
+                && group
+                    .package_roots
+                    .iter()
+                    .chain(&group.mutation_package_roots)
+                    .any(|root| segments.starts_with(&root.path_segments))
+        })
+    }
+
     pub(crate) fn imports_service(&self, service: &str) -> bool {
         self.groups
             .iter()

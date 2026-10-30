@@ -1124,7 +1124,7 @@ local function decodeRefValue(raw: { [string]: any }, ctx: { [string]: any }?, s
 			or raw.instanceId
 			or (if type(raw.debugId) == "string" and raw.debugId ~= "" then "debug:" .. raw.debugId else nil)
 		local persistent = matchedSettingsInstance(targetServiceName, settingsId, ctx)
-		if persistent ~= nil then
+		if persistent ~= nil and persistent:IsDescendantOf(game:GetService(targetServiceName)) then
 			return persistent
 		end
 		settingsInstance = resolveInstanceBySettingsId(targetServiceName, settingsId, ctx)

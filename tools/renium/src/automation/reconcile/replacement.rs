@@ -1,4 +1,5 @@
 use super::*;
+use crate::settings::tree::settings_children_by_parent;
 
 pub(crate) fn project_replacement_paths(
     desired: &ProjectSnapshot,
@@ -224,42 +225,41 @@ pub(crate) fn stage_snapshot_paths(
 const HEAVY_DELTA_NATIVE_WRITES: usize = 64;
 const HEAVY_DELTA_NEW_INSTANCES: usize = 2000;
 
+// A replacement grows with the service: its serialize, import and reference
+// scan touch every instance, so a few dozen writes in a huge service stay
+// incremental unless they are at least this share of it.
+const HEAVY_DELTA_SERVICE_RATIO: usize = 100;
+
 #[derive(Debug, Default, PartialEq, Eq)]
 struct DeltaWeight {
     new_instances: usize,
     native_writes: usize,
+    /// Engine-set fields the replacement itself must write afterwards, because
+    /// Studio's reader does not take them from the payload.
+    replacement_writes: usize,
+    service_instances: usize,
     fields: BTreeMap<String, usize>,
 }
 
 impl DeltaWeight {
     fn heavy(&self) -> bool {
-        self.native_writes >= HEAVY_DELTA_NATIVE_WRITES
-            || self.new_instances >= HEAVY_DELTA_NEW_INSTANCES
+        self.new_instances >= HEAVY_DELTA_NEW_INSTANCES
+            || (self.native_writes >= HEAVY_DELTA_NATIVE_WRITES
+                && self.native_writes > self.replacement_writes
+                && self.native_writes * HEAVY_DELTA_SERVICE_RATIO >= self.service_instances)
     }
 }
 
+/// Returns the services it promoted.
 pub(crate) fn promote_heavy_deltas_to_replacement(
     context: &BoundContext,
     desired: &ProjectSnapshot,
     observed: &ProjectSnapshot,
     differences: &mut HashSet<PathBuf>,
     prepared: &mut HashMap<PathBuf, PreparedEditorSettingsChange>,
-) -> Result<()> {
-    // Files-to-Studio rules, mounts that need a stage and linked packages all
-    // keep the native import off, and a bootstrap row without one fails the
-    // push; those projects keep the incremental path.
-    let root = Path::new(&context.root);
-    if crate::editor::sync::files_to_studio_filter_rules(root)?.is_some()
-        || root.join("renium-link.json").exists()
-        || config::try_load_project(None, Some(root))?
-            .as_ref()
-            .map(config::project_requires_temporary_stage)
-            .transpose()?
-            .unwrap_or(false)
-    {
-        return Ok(());
-    }
-    let mut promoted = Vec::new();
+) -> Result<HashSet<String>> {
+    let mut promoted = HashSet::new();
+    let mut eligible = None;
     for (path, change) in prepared.iter_mut() {
         if change.current.instances.is_empty()
             || service_has_only_native_containers(&change.previous)
@@ -268,6 +268,25 @@ pub(crate) fn promote_heavy_deltas_to_replacement(
         }
         let weight = delta_weight(&change.current, &change.previous);
         if !weight.heavy() {
+            continue;
+        }
+        let allowed = match eligible {
+            Some(allowed) => allowed,
+            None => {
+                let allowed = native_replacement_eligible(context)?;
+                eligible = Some(allowed);
+                allowed
+            }
+        };
+        if !allowed {
+            break;
+        }
+        // Package roots at the top of a service are matched by name during the
+        // import, which two same-named roots defeat; the incremental path never
+        // touches roots it does not change.
+        if same_named_roots_share_a_package(&change.current)
+            || same_named_roots_share_a_package(&change.previous)
+        {
             continue;
         }
         // The retained document keeps the active camera's authored ancestors;
@@ -298,31 +317,109 @@ pub(crate) fn promote_heavy_deltas_to_replacement(
             &mut change.current,
             &change.previous,
         );
-        promoted.push(service);
+        promoted.insert(service);
     }
     if promoted.is_empty() {
-        return Ok(());
+        return Ok(promoted);
     }
-    promoted.sort();
     // Unchanged script files accompany a native replacement so their external
     // Source markers resolve, as in a full replacement push.
+    let root = Path::new(&context.root);
+    let source = Path::new(&context.source)
+        .strip_prefix(root)
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
     for path in project_replacement_paths(desired, observed) {
-        if services_for_snapshot_paths(context, &HashSet::from([path.clone()]))
-            .iter()
-            .any(|service| promoted.contains(service))
-        {
+        let service = crate::project::storage::service_for_store(
+            Path::new(&context.source),
+            &root.join(&path),
+        )
+        .or_else(|| {
+            path.strip_prefix(&source).ok().and_then(|relative| {
+                relative
+                    .components()
+                    .next()
+                    .and_then(|component| match component {
+                        Component::Normal(name) => name.to_str().map(str::to_string),
+                        _ => None,
+                    })
+            })
+        });
+        let in_promoted = match service {
+            Some(service) => promoted.contains(&service),
+            None => services_for_snapshot_paths(context, &HashSet::from([path.clone()]))
+                .iter()
+                .any(|service| promoted.contains(service)),
+        };
+        if in_promoted {
             differences.insert(path);
         }
     }
-    Ok(())
+    Ok(promoted)
 }
 
-fn native_writes_for_new_instance(class_name: &str) -> usize {
-    match class_name {
+/// Two top-level roots of one name and class where one holds a package link.
+fn same_named_roots_share_a_package(document: &SettingsBytecode) -> bool {
+    let Some(root) = document
+        .instances
+        .iter()
+        .position(|instance| instance.parent_index.is_none())
+    else {
+        return false;
+    };
+    let children = settings_children_by_parent(document);
+    let mut groups: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
+    for &index in children.get(root).map(Vec::as_slice).unwrap_or_default() {
+        let instance = &document.instances[index];
+        groups
+            .entry((instance.name.as_str(), instance.class_name.as_str()))
+            .or_default()
+            .push(index);
+    }
+    groups.values().any(|members| {
+        members.len() > 1
+            && members.iter().any(|&member| {
+                children.get(member).is_some_and(|kids| {
+                    kids.iter()
+                        .any(|&kid| document.instances[kid].class_name == "PackageLink")
+                })
+            })
+    })
+}
+
+/// Files-to-Studio rules, a root `$ignoreUnknownInstances`, mounts that need
+/// a stage and linked packages all keep the native import off, and a
+/// bootstrap row without one fails the push; those projects stay incremental.
+fn native_replacement_eligible(context: &BoundContext) -> Result<bool> {
+    let root = Path::new(&context.root);
+    if crate::editor::sync::files_to_studio_filter_rules(root)?.is_some()
+        || root.join("renium-link.json").exists()
+    {
+        return Ok(false);
+    }
+    let Some(project) = config::try_load_project(None, Some(root))? else {
+        return Ok(true);
+    };
+    Ok(!project
+        .project
+        .root
+        .ignore_unknown_instances
+        .unwrap_or(false)
+        && !config::project_requires_temporary_stage(&project)?)
+}
+
+fn native_writes_for_new_instance(instance: &SettingsBytecodeInstance) -> usize {
+    let saved = instance
+        .properties
+        .keys()
+        .filter(|name| crate::editor::native_roots::is_property(&instance.class_name, name))
+        .count();
+    let class = match instance.class_name.as_str() {
         "MeshPart" => 3,
         "SurfaceAppearance" => 1,
         _ => 0,
-    }
+    };
+    saved.max(class)
 }
 
 fn delta_weight(current: &SettingsBytecode, previous: &SettingsBytecode) -> DeltaWeight {
@@ -337,9 +434,17 @@ fn delta_weight(current: &SettingsBytecode, previous: &SettingsBytecode) -> Delt
         if instance.parent_index.is_none() {
             continue;
         }
+        weight.service_instances += 1;
+        if instance.class_name == "SurfaceAppearance"
+            && instance
+                .properties
+                .contains_key(crate::roblox::schema::TEXTURE_PACK_PROPERTY)
+        {
+            weight.replacement_writes += 1;
+        }
         let Some(&other) = previous_by_id.get(instance.settings_id.as_str()) else {
             weight.new_instances += 1;
-            let writes = native_writes_for_new_instance(&instance.class_name);
+            let writes = native_writes_for_new_instance(instance);
             if writes > 0 {
                 weight.native_writes += writes;
                 *weight
@@ -485,6 +590,22 @@ mod heavy_delta_tests {
     }
 
     #[test]
+    fn only_same_named_package_roots_block_a_promotion() {
+        let mut document = document(3, "Model");
+        document.instances.push(SettingsBytecodeInstance::new(
+            "editor:link".into(),
+            "PackageLink".into(),
+            "PackageLink".into(),
+            Some(2),
+        ));
+        assert!(!same_named_roots_share_a_package(&document));
+        document.instances[3].name = "Item1".into();
+        assert!(same_named_roots_share_a_package(&document));
+        document.instances.pop();
+        assert!(!same_named_roots_share_a_package(&document));
+    }
+
+    #[test]
     fn new_mesh_parts_or_many_new_instances_promote_a_service() {
         let previous = document(10, "MeshPart");
         assert!(!delta_weight(&document(10, "MeshPart"), &previous).heavy());
@@ -507,7 +628,7 @@ mod heavy_delta_tests {
                 .properties
                 .insert("Anchored".into(), serde_json::Value::Bool(true));
         }
-        assert_eq!(delta_weight(&current, &previous), DeltaWeight::default());
+        assert_eq!(delta_weight(&current, &previous).native_writes, 0);
         for instance in current.instances.iter_mut().skip(1).take(64) {
             instance.properties.insert(
                 "CollisionFidelity".into(),
@@ -515,7 +636,7 @@ mod heavy_delta_tests {
             );
         }
         // A fidelity the capture does not carry says nothing about Studio.
-        assert_eq!(delta_weight(&current, &previous), DeltaWeight::default());
+        assert_eq!(delta_weight(&current, &previous).native_writes, 0);
         let mut previous = previous;
         for instance in previous.instances.iter_mut().skip(1).take(64) {
             instance.properties.insert(
@@ -555,7 +676,7 @@ mod heavy_delta_tests {
                 .properties
                 .insert("TexturePack".into(), serde_json::json!("rbxassetid://1"));
         }
-        assert_eq!(delta_weight(&current, &previous), DeltaWeight::default());
+        assert_eq!(delta_weight(&current, &previous).native_writes, 0);
         for instance in previous.instances.iter_mut().skip(1) {
             instance
                 .properties
@@ -563,7 +684,9 @@ mod heavy_delta_tests {
         }
         let weight = delta_weight(&current, &previous);
         assert_eq!(weight.native_writes, 70);
-        assert!(weight.heavy());
+        // A replacement would write the same 70 packs afterwards, so it buys nothing.
+        assert_eq!(weight.replacement_writes, 70);
+        assert!(!weight.heavy());
         // The same asset in another spelling is no write.
         let mut current = document(1, "MeshPart");
         let mut previous = document(1, "MeshPart");
@@ -574,6 +697,6 @@ mod heavy_delta_tests {
             "MeshId".into(),
             serde_json::json!("http://www.roblox.com/asset/?id=12345"),
         );
-        assert_eq!(delta_weight(&current, &previous), DeltaWeight::default());
+        assert_eq!(delta_weight(&current, &previous).native_writes, 0);
     }
 }

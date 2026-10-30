@@ -187,6 +187,7 @@ pub(crate) fn push_project(
     log_reconcile_timing("full push capture", phase);
     let phase = Instant::now();
     let mut prepared_settings = HashMap::new();
+    let mut promoted_services = HashSet::new();
     let differences = if replace {
         let paths = project_replacement_paths(&project, &studio);
         // Replacement writes the complete captured snapshot. Its private staging
@@ -234,7 +235,7 @@ pub(crate) fn push_project(
     } else {
         let mut differences =
             snapshot_differences_prepared(&project, &studio, Some(&mut prepared_settings))?;
-        promote_heavy_deltas_to_replacement(
+        promoted_services = promote_heavy_deltas_to_replacement(
             context,
             &project,
             &studio,
@@ -277,7 +278,7 @@ pub(crate) fn push_project(
         return Ok(Map::from_iter([("ok".to_string(), Value::Bool(true))]));
     }
     let phase = Instant::now();
-    let plan = reconciliation_push_plan_for_paths_with_prepared_settings(
+    let mut plan = reconciliation_push_plan_for_paths_with_prepared_settings(
         &studio,
         &project,
         &differences,
@@ -285,6 +286,32 @@ pub(crate) fn push_project(
         true,
         false,
     )?;
+    if !promoted_services.is_empty() {
+        // Every instance of a replaced service is a new object, so references
+        // from other services into it must be written again, as after any
+        // recreation.
+        for (path, change) in &prepared_settings {
+            if promoted_services.contains(&settings_service_name(
+                path,
+                &change.current,
+                &change.previous,
+            )?) {
+                plan.recreated_settings_ids.extend(
+                    change
+                        .current
+                        .instances
+                        .iter()
+                        .filter(|instance| instance.parent_index.is_some())
+                        .map(|instance| instance.settings_id.clone()),
+                );
+            }
+        }
+        append_recreated_reference_pushes(&project, &prepared_settings, &mut plan)?;
+        plan.changed_paths.sort();
+        plan.changed_paths.dedup();
+        plan.target_settings_ids.sort();
+        plan.target_settings_ids.dedup();
+    }
     log_reconcile_timing("full push plan", phase);
     if plan.is_empty() {
         tracking_release.proof = capture_push_proof(bridge, &guard)?;

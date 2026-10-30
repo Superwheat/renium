@@ -3160,8 +3160,16 @@ fn push_editor_changes_with_collected(
             }
         }
         let phase_started = Instant::now();
-        let protected =
+        let mut protected =
             prepare_protected_writes(&args, bridge, &mut summary, pre_routed_protected_writes)?;
+        if protected.apply_offline && !changes.deferred_native_rows.is_empty() {
+            // The offline apply reopens Studio after the commit, so the
+            // follow-up transaction has no runtime to run in; the saved place
+            // takes the imported instances' engine-set fields instead.
+            protected
+                .writes
+                .extend(protected_write_rows(&changes.deferred_native_rows));
+        }
         log_timing("native editor protected write preparation", phase_started);
         let phase_started = Instant::now();
         if !review_skipped && let Some(validate_project) = validate_project {
@@ -3225,11 +3233,6 @@ fn push_editor_changes_with_collected(
         if let Some(status) = commit_status {
             add_editor_commit_status(&mut summary, status);
         }
-        if !review_skipped && !changes.deferred_native_rows.is_empty() {
-            let phase_started = Instant::now();
-            apply_deferred_native_rows(bridge, guard, &changes.deferred_native_rows, &mut summary)?;
-            log_timing("native editor imported engine fields", phase_started);
-        }
         if protected.apply_offline {
             summary.remove("verifiedPushProof");
         }
@@ -3245,6 +3248,13 @@ fn push_editor_changes_with_collected(
         }
         if let Some(history_transaction) = history_transaction {
             history_transaction.commit();
+        }
+        // The files above record what Studio committed; a failure here leaves
+        // both in step and reports the fields that still need a push.
+        if !review_skipped && !protected.apply_offline && !changes.deferred_native_rows.is_empty() {
+            let phase_started = Instant::now();
+            apply_deferred_native_rows(bridge, guard, &changes.deferred_native_rows, &mut summary)?;
+            log_timing("native editor imported engine fields", phase_started);
         }
         log_global(
             5,
@@ -3302,6 +3312,16 @@ fn defer_imported_native_root_rows(
         if names.is_empty() {
             return true;
         }
+        // A follow-up write inside an imported package would trip the package
+        // ownership check after the import has landed; the payload's values
+        // stand for those instances, as they did before the follow-up existed.
+        if import.imports_package_path(&change.service, &change.path_segments) {
+            change.properties.retain(|name, _| !names.contains(name));
+            return !change.properties.is_empty()
+                || !change.reset_properties.is_empty()
+                || !change.attributes.is_empty()
+                || !change.deleted_attributes.is_empty();
+        }
         let mut held = change.clone();
         held.properties.retain(|name, _| names.contains(name));
         held.reset_properties.clear();
@@ -3318,18 +3338,39 @@ fn defer_imported_native_root_rows(
     changes.deferred_native_rows = deferred;
 }
 
+fn protected_write_rows(rows: &[EditorPropertyChange]) -> Vec<Value> {
+    rows.iter()
+        .flat_map(|change| {
+            change.properties.iter().map(move |(name, value)| {
+                json!({
+                    "kind": "property",
+                    "service": &change.service,
+                    "settingsId": &change.settings_id,
+                    "pathSegments": &change.path_segments,
+                    "pathOrdinals": &change.path_ordinals,
+                    "className": &change.class_name,
+                    "name": name,
+                    "value": value,
+                })
+            })
+        })
+        .collect()
+}
+
 fn apply_deferred_native_rows(
     bridge: &BridgeServer,
     guard: Option<&StudioChangeGuard>,
     rows: &[EditorPropertyChange],
     summary: &mut Map<String, Value>,
 ) -> Result<()> {
+    let fields = rows.iter().map(|row| row.properties.len()).sum::<usize>();
     let changes = EditorChangeSet {
         property_changes: rows.to_vec(),
         ..EditorChangeSet::default()
     };
-    let mut transaction = EditorTransaction::begin(bridge, &changes, None, guard)?;
+    let mut transaction = None;
     let result: Result<()> = (|| {
+        transaction = EditorTransaction::begin(bridge, &changes, None, guard)?;
         let transaction_id = transaction.as_ref().map(|value| value.id.as_str());
         let follow_up = send_editor_change_batches(bridge, &changes, None, transaction_id)?;
         let errors = follow_up
@@ -3340,7 +3381,28 @@ fn apply_deferred_native_rows(
             bail!("Studio rejected or failed an engine-set field of an imported instance");
         }
         if let Some(transaction) = transaction.as_mut() {
-            transaction.commit()?;
+            // The second commit retires the first one's push proof.
+            let status = transaction.commit()?;
+            summary.remove("verifiedPushProof");
+            add_editor_commit_status(summary, status);
+        }
+        // The import transaction listed these services as field-verified
+        // without the rows held back from it; only the follow-up's own
+        // readback can vouch for them now.
+        let verified = follow_up
+            .get("fieldVerifiedServices")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for key in ["fieldVerifiedServices", "nativeVerifiedServices"] {
+            if let Some(Value::Array(services)) = summary.get_mut(key) {
+                services.retain(|service| {
+                    !rows
+                        .iter()
+                        .any(|row| Value::String(row.service.clone()) == *service)
+                        || verified.contains(service)
+                });
+            }
         }
         let updated = follow_up
             .get("propertyUpdated")
@@ -3351,13 +3413,12 @@ fn apply_deferred_native_rows(
             .and_then(Value::as_f64)
             .unwrap_or(0.0);
         summary.insert("propertyUpdated".into(), json!(previous + updated));
-        summary.insert("importedEngineFields".into(), json!(rows.len() as u64));
+        summary.insert("importedEngineFields".into(), json!(fields as u64));
         Ok(())
     })();
     EditorTransaction::finish(transaction.as_mut(), result).with_context(|| {
         format!(
-            "Studio applied the import, but {} engine-set field row(s) on imported instances failed afterwards; push the store again to retry them",
-            rows.len()
+            "Studio applied the import and the files record it, but {fields} engine-set field(s) of imported instances were not written afterwards; push the store again to write them"
         )
     })
 }
@@ -5279,7 +5340,8 @@ fn widen_target_ids_to_subtrees(
     documents: &HashMap<String, Option<Arc<SettingsBytecode>>>,
     exact: bool,
 ) {
-    if exact || !filter.has_target_ids() {
+    // A push that names properties edits the targeted instances alone.
+    if exact || !filter.has_target_ids() || !filter.property_names.is_empty() {
         return;
     }
     for (service, document) in documents {

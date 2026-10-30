@@ -560,12 +560,15 @@ fn apply_write(
         // The plugin cancels the recording when the fence outlives
         // NATIVE_WRITE_FENCE; every engine call and retry stays inside it.
         let fence_deadline = fenced + NATIVE_WRITE_FENCE;
-        let budget = |floor: std::time::Duration| {
-            fence_deadline
-                .saturating_duration_since(std::time::Instant::now())
-                .max(floor)
-        };
-        property.restart_deadline(budget(std::time::Duration::from_millis(500)));
+        let remaining = fence_deadline.saturating_duration_since(std::time::Instant::now());
+        ensure!(
+            remaining >= std::time::Duration::from_millis(500),
+            "Studio was too busy to start the native write of {}.{} inside its fence",
+            path_segments.join("."),
+            write.name
+        );
+        property.restart_deadline(remaining);
+        let target_id = property.instance_id.clone();
         let mut skipped = 0;
         loop {
             let error =
@@ -602,8 +605,8 @@ fn apply_write(
                 )
             })?;
             ensure!(
-                property.class_name == write.class_name,
-                "Native root target changed class"
+                property.class_name == write.class_name && property.instance_id == target_id,
+                "Native root target was replaced before the retry"
             );
             property.ensure_writable()?;
         }
@@ -634,6 +637,12 @@ fn apply_write(
     );
     result?;
     let finish = finish?;
+    ensure!(
+        finish["nativeRootWrite"] == write.index,
+        "Studio dropped the native write of {}.{} before it finished",
+        path_segments.join("."),
+        write.name
+    );
     // A natively written MeshId skips the engine's mesh load; Studio loads the
     // asset and applies it so the part stops rendering at its native scale.
     if finish["needsMeshCook"] == true {

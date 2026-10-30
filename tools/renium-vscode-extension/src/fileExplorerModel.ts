@@ -646,7 +646,7 @@ export class FileExplorerModel {
       throw new Error(`${loaded.name} metadata is read-only.`);
     }
     const config = getExplorerConfig();
-    let propertyName = name;
+    const propertyName = name;
     let parsedValue = scope === "metadata" && name === "Parent"
       ? this.resolveParentValue(loaded, parseJsonValue(valueText))
       : parseJsonValue(valueText);
@@ -654,8 +654,7 @@ export class FileExplorerModel {
     const newParentSettingsId =
       scope === "metadata" && name === "Parent" && typeof parsedValue === "string" ? parsedValue : undefined;
     if (scope === "property" && usesDisabledProperty(loaded.className) && name === "Enabled") {
-      propertyName = "Disabled";
-      parsedValue = !(parsedValue === true);
+      parsedValue = parsedValue === true;
     }
     return this.withPausedProjectWrite(async () => {
       const batchDir = path.join(config.projectRoot, ".renium", "editor-property-batches");

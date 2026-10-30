@@ -759,6 +759,10 @@ pub(crate) fn append_aligned_settings_push_plan(
                                         &instance.class_name, name, database,
                                     )
                                     && !instance.properties.contains_key(*name)
+                                    // A store written with the legacy spelling
+                                    // still states the script's enabled flag.
+                                    && !(name.as_str() == "Enabled"
+                                        && instance.properties.contains_key("Disabled"))
                             })
                             .cloned()
                             .collect(),
