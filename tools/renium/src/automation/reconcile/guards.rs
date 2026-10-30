@@ -395,9 +395,21 @@ pub(crate) fn publish_studio_paths(
     stage.restrict_publish_paths(studio_paths);
     carry_project_edits_into_stage(context, &mut stage, studio_paths, captured_project)?;
     let root = Path::new(&context.root);
-    let published = stage.publish(root, false)?;
-    history::record_published_files(root, &bound_context::source_dir(context)?, &published)
-        .context("Studio's changes were written to the project files, but undo history could not be recorded")?;
+    let mut published = stage.publish(root, false)?;
+    if let Err(error) =
+        history::record_published_files(root, &bound_context::source_dir(context)?, &published)
+    {
+        let retained = published
+            .previous
+            .take()
+            .map(crate::snapshot::export::PublishBackups::retain);
+        bail!(
+            "Studio's changes were written to the project files, but undo history could not be recorded{}: {error:#}",
+            retained
+                .map(|kept| format!("; the replaced files are kept in {}", kept.display()))
+                .unwrap_or_default()
+        );
+    }
     Ok(())
 }
 

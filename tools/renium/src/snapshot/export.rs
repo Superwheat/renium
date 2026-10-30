@@ -740,6 +740,8 @@ impl ExportProjectStage {
         let (operation_paths, preserved) = split_preserved_paths(
             publish_operation_paths(&current, &staged),
             &self.preserve_paths,
+            &current,
+            &staged,
         );
         let directory_swaps = publish_directory_swaps(
             project_root,
@@ -866,11 +868,20 @@ impl ExportProjectStage {
                 .is_none_or(|backup| backup.starts_with(&self.container))
         }));
         log_timing_ms("export project stage publish", elapsed_ms(started));
+        // A kept-back store was not written, so its Studio override must not
+        // advance the reconciliation baseline either.
+        let mut studio_overrides = std::mem::take(&mut self.studio_overrides);
+        studio_overrides.retain(|path, _| {
+            !self
+                .preserve_paths
+                .iter()
+                .any(|kept| path.starts_with(kept) || kept.starts_with(path))
+        });
         Ok(PublishedProjectChanges {
             changed_roots,
             expected,
             read_only_links_restored: std::mem::take(&mut self.restored_links),
-            studio_overrides: std::mem::take(&mut self.studio_overrides),
+            studio_overrides,
             preserved,
             previous: Some(PublishBackups {
                 root: backup_root,
@@ -880,17 +891,59 @@ impl ExportProjectStage {
     }
 }
 
-/// Operations that touch a preserved path, or that would replace a directory
-/// holding one, stay out of the publish; the caller learns which ones.
+/// Operations on a preserved path stay out of the publish. An operation that
+/// would replace a directory holding one is published entry by entry instead,
+/// so the directory's other changes still land. The caller learns which paths
+/// were kept back.
 fn split_preserved_paths(
     operations: Vec<PathBuf>,
     preserved: &[PathBuf],
+    current: &BTreeMap<PathBuf, PublishEntryState>,
+    staged: &BTreeMap<PathBuf, PublishEntryState>,
 ) -> (Vec<PathBuf>, Vec<PathBuf>) {
-    operations.into_iter().partition(|operation| {
-        !preserved
-            .iter()
-            .any(|path| operation.starts_with(path) || path.starts_with(operation))
-    })
+    let kept_back = |path: &Path| preserved.iter().any(|kept| path.starts_with(kept));
+    let holds_preserved = |path: &Path| preserved.iter().any(|kept| kept.starts_with(path));
+    let mut kept = Vec::new();
+    let mut dropped = Vec::new();
+    for operation in operations {
+        if kept_back(&operation) {
+            dropped.push(operation);
+            continue;
+        }
+        if !holds_preserved(&operation) {
+            kept.push(operation);
+            continue;
+        }
+        let mut entries = current
+            .keys()
+            .chain(staged.keys())
+            .filter(|path| {
+                path.starts_with(&operation)
+                    && **path != operation
+                    && current.get(*path) != staged.get(*path)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| {
+            left.components()
+                .count()
+                .cmp(&right.components().count())
+                .then_with(|| left.cmp(right))
+        });
+        entries.dedup();
+        for entry in entries {
+            if kept_back(&entry) {
+                dropped.push(entry);
+            } else if !holds_preserved(&entry)
+                && !kept.iter().any(|parent| entry.starts_with(parent))
+            {
+                kept.push(entry);
+            }
+        }
+    }
+    dropped.sort();
+    dropped.dedup();
+    (kept, dropped)
 }
 
 /// The files a publish replaced, kept until the caller has recorded them as
@@ -903,6 +956,13 @@ pub(crate) struct PublishBackups {
 impl PublishBackups {
     pub(crate) fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Keeps the replaced files on disk for manual recovery and names where.
+    pub(crate) fn retain(self) -> PathBuf {
+        let root = self.root.clone();
+        std::mem::forget(self);
+        root
     }
 }
 
@@ -1691,10 +1751,14 @@ fn finish_native_export(guard: &mut EditorBinaryExportFinishGuard<'_>) -> Result
     result.map(|_| ())
 }
 
+/// `undo_source` names the script source directory of a pull whose replaced
+/// files get a sync history entry, written before the completion report so a
+/// failed report never loses the undo data.
 pub(crate) fn finish_export_publication(
     mut stage: Option<ExportProjectStage>,
     project_root: &Path,
     repair_reference_paths: bool,
+    undo_source: Option<&Path>,
     finalize_native: impl FnOnce() -> Result<()>,
     record_completion: impl FnOnce() -> Result<()>,
 ) -> Result<(PublishedProjectChanges, f64)> {
@@ -1718,7 +1782,7 @@ pub(crate) fn finish_export_publication(
     }
     let published = if let Some(stage) = stage {
         let started = Instant::now();
-        let published = stage.publish(project_root, repair_reference_paths)?;
+        let mut published = stage.publish(project_root, repair_reference_paths)?;
         log_global(
             5,
             format_args!(
@@ -1726,6 +1790,9 @@ pub(crate) fn finish_export_publication(
                 elapsed_ms(started)
             ),
         );
+        if let Some(source) = undo_source {
+            record_pull_undo_history(project_root, source, &mut published);
+        }
         published
     } else {
         PublishedProjectChanges::default()
@@ -1814,6 +1881,7 @@ fn export_snapshots_core(
         Some(project_stage),
         &project_root,
         repair_reference_paths,
+        matches!(purpose, ExportPurpose::Pull).then_some(args.src_dir.as_path()),
         move || {
             if let Some(mut guard) = native_finish_guard.take() {
                 finish_native_export(&mut guard)?;
@@ -1857,19 +1925,33 @@ fn export_snapshots_core(
     );
     log_timing_ms("full export-snapshots run", total_run_ms);
     println!("[renium] export done");
-    if matches!(purpose, ExportPurpose::Pull)
-        && let Err(error) = crate::automation::reconcile::history::record_published_files(
-            &project_root,
-            &args.src_dir,
-            &published,
-        )
-    {
-        log_global(
-            1,
-            format_args!("[renium] pull undo history was not recorded: {error:#}"),
-        );
-    }
     Ok(published)
+}
+
+/// A pull that cannot record its undo entry keeps the replaced files in the
+/// export's recovery folder and says so, instead of failing after the write.
+fn record_pull_undo_history(
+    project_root: &Path,
+    source: &Path,
+    published: &mut PublishedProjectChanges,
+) {
+    let Err(error) = crate::automation::reconcile::history::record_published_files(
+        project_root,
+        source,
+        published,
+    ) else {
+        return;
+    };
+    let retained = published.previous.take().map(PublishBackups::retain);
+    log_global(
+        1,
+        format_args!(
+            "[renium] pull undo history was not recorded: {error:#}{}",
+            retained
+                .map(|root| format!("; the replaced files are kept in {}", root.display()))
+                .unwrap_or_default()
+        ),
+    );
 }
 
 pub(crate) fn parse_bridge_ports(raw: &str) -> Result<Vec<u16>> {
@@ -2841,6 +2923,7 @@ mod publication_tests {
             Some(stage),
             &fixture.root,
             false,
+            None,
             || {
                 assert_eq!(calls.replace(1), 0);
                 assert_eq!(
@@ -2903,6 +2986,70 @@ mod publication_tests {
     }
 
     #[test]
+    fn export_publication_writes_a_swapped_directory_entry_by_entry_around_a_kept_file() {
+        let mut fixture = Fixture::new();
+        drop(fixture.stage.take());
+        let nested = PathBuf::from("src/ReplicatedStorage/Nested");
+        let kept = nested.join("Keep.luau");
+        let child = nested.join("Child.luau");
+        fs::create_dir_all(fixture.root.join(&nested)).unwrap();
+        fs::write(fixture.root.join(&kept), "return 'kept edit'\n").unwrap();
+        let mut stage = ExportProjectStage::create(
+            &fixture.root,
+            Path::new("src"),
+            &["ReplicatedStorage".into()],
+        )
+        .unwrap();
+        fs::remove_file(stage.project_root.join(&kept)).unwrap();
+        fs::write(stage.project_root.join(&child), "return 'child'\n").unwrap();
+        fs::write(stage.project_root.join(SOURCE), "return 'captured'\n").unwrap();
+        stage.preserve_project_paths(vec![kept.clone()]);
+        let published = stage.publish(&fixture.root, false).unwrap();
+        assert_eq!(published.preserved, std::slice::from_ref(&kept));
+        assert!(published.changed_roots.contains(&child));
+        assert!(
+            !published
+                .changed_roots
+                .iter()
+                .any(|root| kept.starts_with(root))
+        );
+        assert!(!published.expected.contains_key(&kept));
+        assert_eq!(
+            fs::read_to_string(fixture.root.join(&kept)).unwrap(),
+            "return 'kept edit'\n"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.root.join(&child)).unwrap(),
+            "return 'child'\n"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.root.join(SOURCE)).unwrap(),
+            "return 'captured'\n"
+        );
+    }
+
+    #[test]
+    fn export_publication_undo_history_refuses_a_file_saved_after_the_write() {
+        let mut fixture = Fixture::new();
+        fs::create_dir_all(fixture.root.join(".renium")).unwrap();
+        let stage = fixture.stage.take().unwrap();
+        let published = stage.publish(&fixture.root, false).unwrap();
+        fs::write(fixture.root.join(SOURCE), "return 'saved again'\n").unwrap();
+        let error = crate::automation::reconcile::history::record_published_files(
+            &fixture.root,
+            Path::new("src"),
+            &published,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("changed after the pull wrote it")
+        );
+        assert!(!fixture.root.join(".renium/editor-history/sync").exists());
+    }
+
+    #[test]
     fn export_publication_undo_history_restores_the_replaced_files() {
         let mut fixture = Fixture::new();
         fs::create_dir_all(fixture.root.join(".renium")).unwrap();
@@ -2943,6 +3090,7 @@ mod publication_tests {
             Some(stage),
             &fixture.root,
             false,
+            None,
             || {
                 calls.set(calls.get() + 1);
                 fs::write(fixture.root.join(SOURCE), "return 'outside'\n")?;
@@ -2978,6 +3126,7 @@ mod publication_tests {
             Some(stage),
             &fixture.root,
             false,
+            None,
             || {
                 calls.set(calls.get() + 1);
                 fs::write(fixture.root.join(SOURCE), "return 'outside'\n")?;
@@ -3003,6 +3152,7 @@ mod publication_tests {
     #[test]
     fn export_publication_completion_failure_is_not_retried_or_rolled_back() {
         let mut fixture = Fixture::new();
+        fs::create_dir_all(fixture.root.join(".renium")).unwrap();
         let stage = fixture.stage.take().unwrap();
         let stage_container = stage.container.clone();
         let calls = Cell::new(0);
@@ -3010,6 +3160,7 @@ mod publication_tests {
             Some(stage),
             &fixture.root,
             false,
+            Some(Path::new("src")),
             || {
                 assert_eq!(calls.replace(1), 0);
                 Ok(())
@@ -3036,6 +3187,13 @@ mod publication_tests {
             "return 'outside after publish'\n"
         );
         assert!(!stage_container.exists());
+        // The undo entry was written before the completion report ran.
+        let entries = fs::read_dir(fixture.root.join(".renium/editor-history/sync"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().join("sync.rmp").is_file())
+            .count();
+        assert_eq!(entries, 1);
     }
 
     #[test]

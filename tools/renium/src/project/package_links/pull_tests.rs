@@ -20,7 +20,7 @@ fn prepare_pull(root: &Path, services: &[&str]) -> ExportProjectStage {
 }
 
 fn finish_pull(root: &Path, stage: ExportProjectStage) -> Result<PublishedProjectChanges> {
-    finish_export_publication(Some(stage), root, false, || Ok(()), || Ok(()))
+    finish_export_publication(Some(stage), root, false, None, || Ok(()), || Ok(()))
         .map(|(published, _)| published)
 }
 
@@ -261,6 +261,7 @@ fn pull_refuses_ordinary_unowned_files_before_publication_or_acknowledgement() {
         Some(stage),
         &root,
         false,
+        None,
         || Ok(()),
         || panic!("failed restore must not acknowledge the pull"),
     )

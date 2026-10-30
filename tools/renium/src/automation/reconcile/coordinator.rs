@@ -897,36 +897,37 @@ impl Coordinator {
             return Ok(AppliedEditorChanges::default());
         }
         let root = Path::new(&context.root);
-        let phase = Instant::now();
-        let previous = baseline.load_scopes(root, key, &scopes)?;
-        log_reconcile_timing("incremental baseline load", phase);
-        let phase = Instant::now();
-        let current = capture_snapshot(root, &scopes)?;
-        log_reconcile_timing("incremental project capture", phase);
-        let phase = Instant::now();
-        let mut prepared_settings = prepare_editor_settings_changes(&previous, &current, &scopes)?;
-        log_reconcile_timing("incremental settings preparation", phase);
-        let phase = Instant::now();
-        let mut changed = previous
-            .entries
-            .keys()
-            .chain(current.entries.keys())
-            .filter(|path| {
-                !entries_equivalent(
-                    path,
-                    previous.entries.get(*path),
-                    current.entries.get(*path),
-                )
-            })
-            .cloned()
-            .collect::<HashSet<_>>();
-        let promoted_services = promote_heavy_deltas_to_replacement(
+        let mut inputs = incremental_push_inputs(root, baseline, key, &scopes)?;
+        let mut promoted_services = promote_heavy_deltas_to_replacement(
             context,
-            &current,
-            &previous,
-            &mut changed,
-            &mut prepared_settings,
+            &inputs.current,
+            &inputs.previous,
+            &mut inputs.changed,
+            &mut inputs.prepared,
         )?;
+        if !promoted_services.is_empty() {
+            // A replacement sends the service's unchanged scripts too and
+            // rewrites every reference into it from any service, so it plans
+            // against the whole project, not the pending scopes alone.
+            let stage = project_comparison_stage(context, &sync_services())?;
+            let full = stage.publish_paths().to_vec();
+            drop(stage);
+            inputs = incremental_push_inputs(root, baseline, key, &full)?;
+            promoted_services = promote_heavy_deltas_to_replacement(
+                context,
+                &inputs.current,
+                &inputs.previous,
+                &mut inputs.changed,
+                &mut inputs.prepared,
+            )?;
+        }
+        let IncrementalPushInputs {
+            previous,
+            current,
+            prepared: prepared_settings,
+            changed,
+        } = inputs;
+        let phase = Instant::now();
         let mut plan = reconciliation_push_plan_for_paths_with_prepared_settings(
             &previous,
             &current,
@@ -1195,6 +1196,49 @@ fn record_pushed_baseline(
     };
     baseline.replace_scopes(Path::new(&context.root), key, &scopes, &pushed_content)?;
     write_record(context, key, record)
+}
+
+struct IncrementalPushInputs {
+    previous: ProjectSnapshot,
+    current: ProjectSnapshot,
+    prepared: HashMap<PathBuf, PreparedEditorSettingsChange>,
+    changed: HashSet<PathBuf>,
+}
+
+fn incremental_push_inputs(
+    root: &Path,
+    baseline: &StoredSnapshot,
+    key: &str,
+    scopes: &[PathBuf],
+) -> Result<IncrementalPushInputs> {
+    let phase = Instant::now();
+    let previous = baseline.load_scopes(root, key, scopes)?;
+    log_reconcile_timing("incremental baseline load", phase);
+    let phase = Instant::now();
+    let current = capture_snapshot(root, scopes)?;
+    log_reconcile_timing("incremental project capture", phase);
+    let phase = Instant::now();
+    let prepared = prepare_editor_settings_changes(&previous, &current, scopes)?;
+    log_reconcile_timing("incremental settings preparation", phase);
+    let changed = previous
+        .entries
+        .keys()
+        .chain(current.entries.keys())
+        .filter(|path| {
+            !entries_equivalent(
+                path,
+                previous.entries.get(*path),
+                current.entries.get(*path),
+            )
+        })
+        .cloned()
+        .collect();
+    Ok(IncrementalPushInputs {
+        previous,
+        current,
+        prepared,
+        changed,
+    })
 }
 
 /// Verify only guards the first comparison; once it is clean the session

@@ -1457,6 +1457,7 @@ impl Manager {
     ) -> Result<Value> {
         let paths = published.changed_roots.clone();
         let studio_overrides = std::mem::take(&mut published.studio_overrides);
+        published.previous = None;
         if let Some(control) = self.control(context.id) {
             control.status.lock_recover().read_only_links_restored =
                 published.read_only_links_restored.clone();
@@ -2641,6 +2642,9 @@ struct LiveLoop {
     reconcile_retry: Option<Instant>,
     reconcile_retry_delay: Duration,
     concurrent_edit_retries: u32,
+    // Files a pull kept back while Studio also changed them: their next
+    // push goes through the three-way comparison instead of overwriting.
+    studio_conflicts: BTreeSet<PathBuf>,
     shared_links_due: Option<Instant>,
     shared_links_error: Option<String>,
 }
@@ -2690,6 +2694,7 @@ impl LiveLoop {
             reconcile_retry: None,
             reconcile_retry_delay: Duration::ZERO,
             concurrent_edit_retries: 0,
+            studio_conflicts: BTreeSet::new(),
             shared_links_due: None,
             shared_links_error: None,
         })
@@ -3224,10 +3229,19 @@ impl LiveLoop {
         if !self.push_due() {
             return Ok(false);
         }
-        let Some(guard) = self.push_guard()? else {
+        let paths = self.pending_push_paths();
+        let guard = if paths
+            .iter()
+            .any(|path| self.studio_conflicts.contains(path))
+        {
+            self.studio_conflicts.clear();
+            self.reconcile_concurrent_changes()?
+        } else {
+            self.push_guard()?
+        };
+        let Some(guard) = guard else {
             return Ok(true);
         };
-        let paths = self.pending_push_paths();
         let push = match self.prepare_push(guard) {
             Ok(push) => push,
             Err(error) => {
@@ -3334,7 +3348,7 @@ impl LiveLoop {
         }
     }
 
-    fn record_pull(&mut self, pulled: PulledStudioChanges) -> Result<()> {
+    fn record_pull(&mut self, mut pulled: PulledStudioChanges) -> Result<()> {
         let current = scan(&self.project)?;
         log_global(
             5,
@@ -3358,10 +3372,17 @@ impl LiveLoop {
                 self.pending.len()
             ),
         );
+        for path in &pulled.published.preserved {
+            self.studio_conflicts.insert(self.project.root.join(path));
+        }
+        // The undo entry is written; the replaced files need not outlive it.
+        pulled.published.previous = None;
         let mut status = self.control.status.lock_recover();
         status.pulls = status.pulls.saturating_add(1);
         status.read_only_links_restored = pulled.published.read_only_links_restored.clone();
-        status.error = None;
+        if self.blocked.is_empty() {
+            status.error = None;
+        }
         drop(status);
         self.control.update_pending(&self.pending);
         self.push_ready = !self.pending.is_empty();
@@ -3402,9 +3423,14 @@ impl LiveLoop {
         let retry = failure.0.rt == 1;
         self.control
             .fail(format!("Studio live sync failed: {}", failure.0.m));
-        self.studio.pull_ready = retry;
+        // Observation resumes either way, with backoff: a pull that fails on
+        // the current files (a store the daemon cannot decode) is tried again
+        // once Studio reports a change, not parked until the session restarts.
+        self.studio.retry_delay = next_retry_delay(self.studio.retry_delay);
         if retry {
-            self.studio.retry_delay = next_retry_delay(self.studio.retry_delay);
+            self.studio.pull_ready = true;
+        } else {
+            self.finish_studio_wait();
         }
         Ok(())
     }
@@ -3961,7 +3987,8 @@ mod tests {
         )
         .unwrap();
         let (published, _) =
-            finish_export_publication(Some(stage), &root, false, || Ok(()), || Ok(())).unwrap();
+            finish_export_publication(Some(stage), &root, false, None, || Ok(()), || Ok(()))
+                .unwrap();
         let mut pending = BTreeSet::new();
         reconcile_published_changes(
             &project,

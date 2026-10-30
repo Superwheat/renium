@@ -32,9 +32,41 @@ pub(crate) fn record_published_files(
     }
     let roots = scopes.iter().cloned().collect::<Vec<_>>();
     let before = capture_snapshot(backups.root(), &roots)?;
-    let history = SyncHistory::begin(root, source, &before, &scopes)?;
     let after = capture_snapshot(root, &roots)?;
+    ensure_published_state(published, &after)?;
+    let history = SyncHistory::begin(root, source, &before, &scopes)?;
     Ok(Some(history.commit(&after, &ProjectSnapshot::default())?))
+}
+
+/// The after-state the entry blesses must be what the publish wrote. A save
+/// that landed in between is the editor's newer work; an entry built on it
+/// would let the undo replace that work with the backup.
+fn ensure_published_state(
+    published: &crate::snapshot::export::PublishedProjectChanges,
+    after: &ProjectSnapshot,
+) -> Result<()> {
+    use crate::snapshot::export::PublishEntryState;
+    for (path, expected) in &published.expected {
+        if derived_project_path(path) {
+            continue;
+        }
+        let matches = match (expected, after.entries.get(path)) {
+            (None, None) => true,
+            (Some(PublishEntryState::Directory), Some(SnapshotEntry::Directory)) => true,
+            (Some(PublishEntryState::File { sha256, .. }), Some(SnapshotEntry::File(bytes))) => {
+                *sha256 == format!("{:x}", Sha256::digest(bytes))
+            }
+            (Some(PublishEntryState::Symlink(_)), Some(SnapshotEntry::Symlink { .. })) => true,
+            _ => false,
+        };
+        if !matches {
+            bail!(
+                "{} changed after the pull wrote it; no undo entry covers the newer content",
+                path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize)]
