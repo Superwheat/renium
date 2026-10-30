@@ -794,7 +794,10 @@ local function resolveInstance(
 		change,
 		allowClassMismatch
 	)
-	if persistent ~= nil then
+	-- A replaced service parks its outgoing children in the transaction's
+	-- staging folder. An identity that now points there names the old copy;
+	-- the path below finds the imported one.
+	if persistent ~= nil and persistent:IsDescendantOf(game:GetService(serviceName)) then
 		return persistent
 	end
 	if type(pathSegments) == "table" and #pathSegments > 0 then

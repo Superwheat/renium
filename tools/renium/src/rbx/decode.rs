@@ -144,6 +144,11 @@ pub(crate) fn property_has_serialized_form(
     class_name: &str,
     property_name: &str,
 ) -> bool {
+    // A script's Enabled is the saved Disabled flag under Renium's canonical
+    // name; reflection knows only the legacy spelling as serialized.
+    if property_name == "Enabled" && rbx_reflection_class_is_a(database, class_name, "BaseScript") {
+        return true;
+    }
     match crate::rbx::encode::rbx_property_descriptor(database, class_name, property_name) {
         Some(descriptor) => !matches!(
             descriptor.kind,

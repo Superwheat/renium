@@ -526,6 +526,13 @@ impl NativeProperty {
         );
         Ok(())
     }
+
+    /// Discovery, fencing and history registration spend the budget set at
+    /// preparation; the engine calls that follow get their own.
+    pub(crate) fn restart_deadline(&mut self, timeout: Duration) {
+        self.deadline = Instant::now() + timeout.min(Duration::from_secs(30));
+    }
+
     pub(crate) fn remaining(&self) -> Result<Duration> {
         self.deadline
             .checked_duration_since(Instant::now())

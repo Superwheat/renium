@@ -2149,7 +2149,9 @@ fn canonical_filter_settings_id(
         )
 }
 
-fn files_to_studio_filter_rules(project_root: &Path) -> Result<Option<Vec<config::FilterRule>>> {
+pub(crate) fn files_to_studio_filter_rules(
+    project_root: &Path,
+) -> Result<Option<Vec<config::FilterRule>>> {
     let Some(loaded) = config::try_load_project(None, Some(project_root))? else {
         return Ok(None);
     };
@@ -5147,6 +5149,7 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
         });
     }
 
+    widen_target_ids_to_subtrees(&mut property_filter, &documents, args.exact_target_ids);
     let changes = finish_editor_change_collection(
         changes,
         &documents,
@@ -5162,6 +5165,51 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
         }
     }
     Ok(changes)
+}
+
+/// A targeted id names one instance. A script keeps that meaning (its child
+/// scripts arrive through the source scopes), but a model or folder carries
+/// its whole subtree, so a newly added model is pushed complete rather than
+/// as an empty root.
+fn widen_target_ids_to_subtrees(
+    filter: &mut EditorPropertyFilter,
+    documents: &HashMap<String, Option<Arc<SettingsBytecode>>>,
+    exact: bool,
+) {
+    if exact || !filter.has_target_ids() {
+        return;
+    }
+    for (service, document) in documents {
+        let Some(document) = document else {
+            continue;
+        };
+        let ids = filter.ids_for_service(service);
+        let children = settings_children_by_parent(document);
+        let mut widened = Vec::new();
+        for (index, instance) in document.instances.iter().enumerate() {
+            if instance.parent_index.is_none()
+                || is_lua_source_class(&instance.class_name)
+                || !ids.contains(&instance.settings_id)
+            {
+                continue;
+            }
+            let mut subtree = Vec::new();
+            crate::bytecode::edit::collect_settings_subtree_preorder(
+                &children,
+                index,
+                &mut subtree,
+            );
+            widened.extend(
+                subtree
+                    .into_iter()
+                    .skip(1)
+                    .map(|child| document.instances[child].settings_id.clone()),
+            );
+        }
+        if !widened.is_empty() {
+            filter.add_service_ids(service, widened);
+        }
+    }
 }
 
 fn log_change_set_composition(
@@ -5229,6 +5277,42 @@ fn log_change_set_composition(
 
 #[cfg(test)]
 mod sync_tests {
+
+    #[test]
+    fn targeted_model_ids_carry_their_subtree_but_scripts_do_not() {
+        use crate::tests::support::{settings_document, settings_instance};
+        let document = settings_document(vec![
+            settings_instance("root", "ReplicatedStorage", "ReplicatedStorage", None),
+            settings_instance("editor:car", "Car", "Model", Some(0)),
+            settings_instance("editor:body", "Body", "MeshPart", Some(1)),
+            settings_instance("editor:weld", "Weld", "WeldConstraint", Some(2)),
+            settings_instance("editor:ctl", "Controller", "ModuleScript", Some(0)),
+            settings_instance("editor:sub", "Helper", "ModuleScript", Some(4)),
+            settings_instance("editor:other", "Other", "Model", Some(0)),
+        ]);
+        let documents: HashMap<String, Option<Arc<SettingsBytecode>>> =
+            HashMap::from([("ReplicatedStorage".to_string(), Some(Arc::new(document)))]);
+        let mut filter = EditorPropertyFilter::default();
+        filter.settings_ids.insert("editor:car".to_string());
+        filter.settings_ids.insert("editor:ctl".to_string());
+        widen_target_ids_to_subtrees(&mut filter, &documents, false);
+        for id in ["editor:car", "editor:body", "editor:weld", "editor:ctl"] {
+            assert!(filter.includes_instance_in("ReplicatedStorage", id), "{id}");
+        }
+        for id in ["editor:sub", "editor:other", "root"] {
+            assert!(
+                !filter.includes_instance_in("ReplicatedStorage", id),
+                "{id}"
+            );
+        }
+        let mut empty = EditorPropertyFilter::default();
+        widen_target_ids_to_subtrees(&mut empty, &documents, false);
+        assert!(!empty.has_target_ids());
+        let mut exact = EditorPropertyFilter::default();
+        exact.settings_ids.insert("editor:car".to_string());
+        widen_target_ids_to_subtrees(&mut exact, &documents, true);
+        assert!(!exact.includes_instance_in("ReplicatedStorage", "editor:body"));
+    }
 
     #[test]
     fn qualified_target_ids_scope_only_their_service() {

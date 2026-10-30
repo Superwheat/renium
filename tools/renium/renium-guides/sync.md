@@ -10,7 +10,7 @@ rbx lst
 rbx lof
 ```
 
-`ps` pushes files or directories. For store edits pass the store file and `-i ID` per instance, or `-u` to upsert without deleting. An ID selects that instance for properties and its subtree for scripts. Deletions need the store file pushed without `-i`.
+`ps` pushes files or directories. For store edits pass the store file and `-i ID` per instance, or `-u` to upsert without deleting. An ID selects that instance and its subtree (a script: itself). Deletions need the store file pushed without `-i`.
 Work in the place folder or add `--place <alias|placeId>`.
 
 ## Live Sync

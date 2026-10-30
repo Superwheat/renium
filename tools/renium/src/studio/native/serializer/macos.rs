@@ -83,8 +83,8 @@ mod undo_selection;
 #[cfg(target_arch = "aarch64")]
 pub(crate) use properties::capture_identities;
 pub(crate) use properties::{
-    observe_terrain, prepare_context, prepare_property, prepare_terrain, read_property,
-    register_history,
+    NativeProperty, observe_terrain, prepare_context, prepare_property, prepare_terrain,
+    read_property, register_history,
 };
 pub(crate) use undo_selection::keep_selection_across_undo;
 

@@ -219,17 +219,35 @@ pub(crate) fn native_capture_verified(pid: u32) -> bool {
         .is_ok()
 }
 
+static REGISTERED_HISTORY_TOKENS: std::sync::Mutex<Vec<(u32, String)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Registration is idempotent per recording token, and every native write of
+/// one transaction shares the token, so Studio only runs its two history tasks
+/// for the first write.
 pub(crate) fn register_history_if_available(
     pid: u32,
     title: &str,
     token: &str,
     terrain: bool,
 ) -> anyhow::Result<bool> {
+    let key = (pid, token.to_string());
+    if crate::system::LockRecover::lock_recover(&REGISTERED_HISTORY_TOKENS).contains(&key) {
+        return Ok(true);
+    }
     let result = probes::run(pid, title, probes::NativeOperation::History)
         .map_err(|error| anyhow::Error::new(HistoryHookUnavailable(format!("{error:#}"))))
         .and_then(|_| register_history(pid, title, token));
     match result {
-        Ok(()) => Ok(true),
+        Ok(()) => {
+            let mut registered =
+                crate::system::LockRecover::lock_recover(&REGISTERED_HISTORY_TOKENS);
+            if registered.len() >= 64 {
+                registered.remove(0);
+            }
+            registered.push(key);
+            Ok(true)
+        }
         Err(error) => {
             let Some(unavailable) = error.downcast_ref::<HistoryHookUnavailable>() else {
                 return Err(error);

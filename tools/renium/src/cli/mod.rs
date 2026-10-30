@@ -397,7 +397,7 @@ pub(super) enum Commands {
     #[command(
         name = "mip",
         alias = "import-model",
-        about = "Import a model file under a parent"
+        about = "Import a model file into the project store under a parent (files only; push to apply it in Studio)"
     )]
     ImportModel(ImportModelCommandArgs),
     #[command(
@@ -2366,6 +2366,10 @@ pub(super) struct PushEditorChangesArgs {
         value_name = "PATH"
     )]
     pub(super) target_settings_id_files: Vec<PathBuf>,
+    /// The delta planner names exactly the instances it compared; a user's
+    /// `-i` names an instance whose subtree comes along.
+    #[arg(skip)]
+    pub(crate) exact_target_ids: bool,
     #[arg(
         help = "Only push these properties",
         short,
@@ -2414,6 +2418,7 @@ impl PushEditorChangesArgs {
             changed_paths_files: Vec::new(),
             target_settings_ids: Vec::new(),
             target_settings_id_files: Vec::new(),
+            exact_target_ids: false,
             target_properties: Vec::new(),
             upsert_instances_only: false,
             verify_sources: false,

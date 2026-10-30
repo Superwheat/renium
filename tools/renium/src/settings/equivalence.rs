@@ -2981,6 +2981,16 @@ pub(crate) fn reconciliation_property_is_unknown_when_absent(
     class_name: &str,
     name: &str,
 ) -> bool {
+    // Every capture and store spells a script's Disabled flag as Enabled and
+    // carries it only for a disabled script, so a record without it says the
+    // script is enabled; reflection alone would call the field unserialized.
+    if name == "Enabled"
+        && database.is_some_and(|database| {
+            crate::rbx::decode::rbx_reflection_class_is_a(database, class_name, "BaseScript")
+        })
+    {
+        return false;
+    }
     matches!(
         name,
         "CollisionFidelity" | "ClockTime" | "MeshSize" | "PhysicalConfigData"
@@ -3026,6 +3036,15 @@ pub(crate) fn reconciliation_property_value_is_default(
     let Ok(database) = rbx_reflection_database::get() else {
         return false;
     };
+    // Reflection knows the legacy Disabled=false default, not the canonical
+    // Enabled spelling; a legacy store that said Disabled=false arrives here
+    // as Enabled=true.
+    if name == "Enabled"
+        && value == &Value::Bool(true)
+        && crate::rbx::decode::rbx_reflection_class_is_a(database, class_name, "BaseScript")
+    {
+        return true;
+    }
     let Some(default) = reflection_default_settings_value(database, class_name, name) else {
         return false;
     };
@@ -3331,6 +3350,39 @@ mod tests {
 
     use super::*;
     use crate::settings::bytecode::SETTINGS_BINARY_VERSION;
+
+    #[test]
+    fn a_script_record_without_enabled_means_enabled() {
+        let database = rbx_reflection_database::get().unwrap();
+        for class_name in ["Script", "LocalScript"] {
+            assert!(!reconciliation_property_is_unknown_when_absent(
+                Some(database),
+                class_name,
+                "Enabled"
+            ));
+        }
+        let disabled = Map::from_iter([("Enabled".to_string(), json!(false))]);
+        assert!(!reconciliation_maps_equal("Script", &Map::new(), &disabled));
+        assert!(!reconciliation_maps_equal("Script", &disabled, &Map::new()));
+        let enabled = Map::from_iter([("Enabled".to_string(), json!(true))]);
+        assert!(reconciliation_maps_equal("Script", &Map::new(), &enabled));
+        assert!(reconciliation_maps_equal(
+            "LocalScript",
+            &enabled,
+            &Map::new()
+        ));
+        assert!(!reconciliation_maps_equal("Script", &enabled, &disabled));
+        // The delta planner resets only serialized fields; a push must be able
+        // to re-enable a script the files no longer mark disabled.
+        assert!(crate::rbx::decode::property_has_serialized_form(
+            database, "Script", "Enabled"
+        ));
+        assert!(crate::rbx::decode::property_has_serialized_form(
+            database,
+            "LocalScript",
+            "Enabled"
+        ));
+    }
 
     #[test]
     fn equivalent_store_is_rewritten_when_nested_enum_types_arrive() {

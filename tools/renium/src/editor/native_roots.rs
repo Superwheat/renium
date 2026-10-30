@@ -557,28 +557,56 @@ fn apply_write(
             return Ok(());
         }
         let property = property.as_mut().unwrap();
-        let current = property.read()?;
-        if !crate::automation::property_access::property_text_matches(
-            &write.class_name,
-            property_name,
-            text,
-            &current,
-        ) {
-            property.write(text)?;
-            changed = true;
+        // The plugin cancels the recording when the fence outlives
+        // NATIVE_WRITE_FENCE; every engine call and retry stays inside it.
+        let fence_deadline = fenced + NATIVE_WRITE_FENCE;
+        let budget = |floor: std::time::Duration| {
+            fence_deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .max(floor)
+        };
+        property.restart_deadline(budget(std::time::Duration::from_millis(500)));
+        let mut skipped = 0;
+        loop {
+            let error =
+                match write_native_property(property, write, property_name, text, &mut changed) {
+                    Ok(()) => return Ok(()),
+                    Err(error) => error,
+                };
+            // A busy Studio main thread can leave the queued engine task unrun
+            // past its deadline. The helper refuses a late task before it touches
+            // the target, and a task that squeezed in just before the deadline
+            // wrote the same value the retry reads back, so one retry with a
+            // fresh target lookup is safe while the fence still has time.
+            let remaining = fence_deadline.saturating_duration_since(std::time::Instant::now());
+            if skipped >= SKIPPED_NATIVE_TASK_RETRIES
+                || remaining < std::time::Duration::from_millis(1200)
+                || !studio_skipped_native_task(&error)
+            {
+                return Err(error);
+            }
+            skipped += 1;
+            *property = crate::studio::native::serializer::prepare_property(
+                pid,
+                &title,
+                &path_segments,
+                &path_ordinals,
+                property_name,
+                remaining,
+            )
+            .with_context(|| {
+                format!(
+                    "Retrying native sync of {}.{}",
+                    path_segments.join("."),
+                    write.name
+                )
+            })?;
             ensure!(
-                crate::automation::property_access::property_text_matches(
-                    &write.class_name,
-                    property_name,
-                    text,
-                    &property.read()?,
-                ),
-                "Studio did not retain {}.{} before commit",
-                write.path_segments.join("."),
-                write.name,
+                property.class_name == write.class_name,
+                "Native root target changed class"
             );
+            property.ensure_writable()?;
         }
-        Ok(())
     })();
     let mutated = std::time::Instant::now();
     // Release the plugin's operation fence even after a failed read/write. If
@@ -625,6 +653,47 @@ fn apply_write(
         );
     }
     Ok(())
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+const SKIPPED_NATIVE_TASK_RETRIES: usize = 1;
+
+// The plugin's rollback fence around one native write (BridgeEditorSync
+// task.delay(5, ...)), less the time its expiry callback needs.
+#[cfg(any(windows, target_os = "macos"))]
+const NATIVE_WRITE_FENCE: std::time::Duration = std::time::Duration::from_millis(4500);
+
+#[cfg(any(windows, target_os = "macos"))]
+fn write_native_property(
+    property: &mut crate::studio::native::serializer::NativeProperty,
+    write: &RootWrite,
+    property_name: &str,
+    text: &str,
+    changed: &mut bool,
+) -> Result<()> {
+    use crate::automation::property_access::property_text_matches;
+    let current = property.read()?;
+    if property_text_matches(&write.class_name, property_name, text, &current) {
+        return Ok(());
+    }
+    *changed = true;
+    property.write(text)?;
+    ensure!(
+        property_text_matches(&write.class_name, property_name, text, &property.read()?),
+        "Studio did not retain {}.{} before commit",
+        write.path_segments.join("."),
+        write.name,
+    );
+    Ok(())
+}
+
+/// The helper reports 0xE40F when Studio never ran the queued task before its
+/// deadline, as the status of a discarded task or as the wait's own exit code.
+#[cfg(any(windows, target_os = "macos"))]
+fn studio_skipped_native_task(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains("0xE40F"))
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]

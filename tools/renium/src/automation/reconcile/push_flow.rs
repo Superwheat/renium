@@ -232,7 +232,16 @@ pub(crate) fn push_project(
         prepared_settings.retain(|path, _| paths.contains(path));
         paths
     } else {
-        snapshot_differences_prepared(&project, &studio, Some(&mut prepared_settings))?
+        let mut differences =
+            snapshot_differences_prepared(&project, &studio, Some(&mut prepared_settings))?;
+        promote_heavy_deltas_to_replacement(
+            context,
+            &project,
+            &studio,
+            &mut differences,
+            &mut prepared_settings,
+        )?;
+        differences
     };
     log_reconcile_timing(
         if replace {

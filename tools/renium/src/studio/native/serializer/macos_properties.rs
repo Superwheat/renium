@@ -1347,6 +1347,12 @@ impl NativeProperty {
         Ok(())
     }
 
+    /// Discovery, fencing and history registration spend the budget set at
+    /// preparation; the engine calls that follow get their own.
+    pub(crate) fn restart_deadline(&mut self, timeout: Duration) {
+        self.memory.deadline = Instant::now() + timeout.min(Duration::from_secs(30));
+    }
+
     pub(crate) fn call_function(&mut self, timeout: Duration) -> Result<String> {
         self.memory.deadline = Instant::now() + timeout.min(Duration::from_secs(30));
         String::from_utf8(self.invoke(9)?[16..].to_vec()).context("Function response is not UTF-8")

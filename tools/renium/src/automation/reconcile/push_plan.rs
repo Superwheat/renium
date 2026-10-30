@@ -170,6 +170,7 @@ pub(crate) fn push_staged_project(
     push_args
         .target_settings_ids
         .clone_from(&plan.target_settings_ids);
+    push_args.exact_target_ids = true;
     push_args.target_settings_id_files.clear();
     push_args.target_properties.clear();
     push_args.verify_sources = true;

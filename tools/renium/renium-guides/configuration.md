@@ -62,7 +62,7 @@ rbx ip ./SharedFolder --destination src/ReplicatedStorage/Shared --dry-run
 
 `ad build` maps source files to instances; `syncback` writes supported instance edits to adapter sources. Use checks/previews for validation, not a persistent watcher.
 `ir` converts one Rojo project to `renium.project.jsonc`: give it the file or the folder, `--preview` prints the result, `--apply` writes it beside the Rojo file together with the agent guides, and `--force` replaces a differing file. `rbx init` in a folder that holds a Rojo project performs the same conversion.
-`ip` imports a script file (`--path-json` Roblox path) or a directory (`--destination` project path) into the project. It does not take `.rbxl`/`.rbxm` files: `pi` imports a place into the project, `bim`/`mip` import a model, `so` opens a place in Studio. Preview with `--dry-run`; drop it to apply.
+`ip` imports a script file (`--path-json` Roblox path) or a directory (`--destination` project path) into the project. It does not take `.rbxl`/`.rbxm` files: `pi` imports a place into the project, `bim`/`mip` import a model into the project store (files only; `ps` the store with `-i` the new root to apply it in Studio), `so` opens a place in Studio. Preview with `--dry-run`; drop it to apply.
 
 ## Mounts and rules
 
