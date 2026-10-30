@@ -394,7 +394,10 @@ pub(crate) fn publish_studio_paths(
 ) -> Result<()> {
     stage.restrict_publish_paths(studio_paths);
     carry_project_edits_into_stage(context, &mut stage, studio_paths, captured_project)?;
-    stage.publish(Path::new(&context.root), false)?;
+    let root = Path::new(&context.root);
+    let published = stage.publish(root, false)?;
+    history::record_published_files(root, &bound_context::source_dir(context)?, &published)
+        .context("Studio's changes were written to the project files, but undo history could not be recorded")?;
     Ok(())
 }
 

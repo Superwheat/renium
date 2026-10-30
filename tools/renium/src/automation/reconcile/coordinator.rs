@@ -904,10 +904,10 @@ impl Coordinator {
         let current = capture_snapshot(root, &scopes)?;
         log_reconcile_timing("incremental project capture", phase);
         let phase = Instant::now();
-        let prepared_settings = prepare_editor_settings_changes(&previous, &current, &scopes)?;
+        let mut prepared_settings = prepare_editor_settings_changes(&previous, &current, &scopes)?;
         log_reconcile_timing("incremental settings preparation", phase);
         let phase = Instant::now();
-        let changed = previous
+        let mut changed = previous
             .entries
             .keys()
             .chain(current.entries.keys())
@@ -920,13 +920,26 @@ impl Coordinator {
             })
             .cloned()
             .collect::<HashSet<_>>();
-        let plan = reconciliation_push_plan_for_paths_with_prepared_settings(
+        let promoted_services = promote_heavy_deltas_to_replacement(
+            context,
+            &current,
+            &previous,
+            &mut changed,
+            &mut prepared_settings,
+        )?;
+        let mut plan = reconciliation_push_plan_for_paths_with_prepared_settings(
             &previous,
             &current,
             &changed,
             &prepared_settings,
+            !promoted_services.is_empty(),
             false,
-            false,
+        )?;
+        extend_replaced_service_references(
+            &current,
+            &prepared_settings,
+            &promoted_services,
+            &mut plan,
         )?;
         log_reconcile_timing("incremental push plan", phase);
         let phase = Instant::now();

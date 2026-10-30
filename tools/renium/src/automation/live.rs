@@ -1909,6 +1909,7 @@ fn pull_studio_changes(
     bridge: &BridgeServer,
     control: &Control,
     pending_state: Option<Value>,
+    unsynced: &BTreeSet<PathBuf>,
 ) -> Result<Option<PulledStudioChanges>> {
     let runtime_id = context
         .runtime_id
@@ -1949,14 +1950,37 @@ fn pull_studio_changes(
     bridge.clear_runtime_pins();
     bridge.pin_runtime(BridgeTarget::Edit, runtime_id);
     let info = bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?;
+    let mut args = automation_pull_args(context, &parameters)?;
+    // File edits Studio has not received yet (pending, or blocked by a failed
+    // push) are not Studio's to overwrite; they stay pending.
+    let root = Path::new(&context.root);
+    args.preserve_paths = unsynced
+        .iter()
+        .filter_map(|path| path.strip_prefix(root).ok().map(Path::to_path_buf))
+        .collect();
     let published = export_snapshots_with_warm_bridge(
-        automation_pull_args(context, &parameters)?,
+        args,
         bridge,
         &info,
         0.0,
         state["referencePathsMayChange"].as_bool().unwrap_or(false),
         ExportPurpose::Pull,
     )?;
+    if !published.preserved.is_empty() {
+        let mut kept = published
+            .preserved
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>();
+        kept.sort();
+        log_global(
+            3,
+            format_args!(
+                "[renium] live pull left unsynced file edits in place: {}",
+                kept.join(", ")
+            ),
+        );
+    }
     Ok(Some(PulledStudioChanges {
         published,
         services,
@@ -3236,10 +3260,22 @@ impl LiveLoop {
 
     fn pull_studio(&mut self) -> Result<Option<PulledStudioChanges>> {
         let payload = self.studio.pending_payload.take();
-        match pull_studio_changes(&self.context, &self.bridge, &self.control, payload) {
+        let unsynced = self
+            .pending
+            .iter()
+            .chain(self.blocked.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        match pull_studio_changes(
+            &self.context,
+            &self.bridge,
+            &self.control,
+            payload,
+            &unsynced,
+        ) {
             Err(error) if automation_failure_ref(&error).0.rt == 1 => {
                 thread::sleep(Duration::from_millis(100));
-                pull_studio_changes(&self.context, &self.bridge, &self.control, None)
+                pull_studio_changes(&self.context, &self.bridge, &self.control, None, &unsynced)
             }
             result => result,
         }

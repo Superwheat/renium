@@ -228,6 +228,7 @@ pub(super) fn automation_pull_args(
         bridge: automation_bridge(object, 2.0)?,
         export_all_properties: automation_bool(object, "exportAllProperties", false)?,
         quiet_timings: std::env::var_os("RENIUM_PROFILE_PULL").is_none(),
+        preserve_paths: Vec::new(),
     })
 }
 

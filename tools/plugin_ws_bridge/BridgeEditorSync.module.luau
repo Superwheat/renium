@@ -2093,6 +2093,28 @@ end
 
 local appendPreserveKeys
 
+-- Parents first, then same-named siblings by numeric ordinal, so the live
+-- sibling order matches the ordinals once a batch has created them: a later
+-- batch of the same push resolves its parents live by those ordinals.
+local function entryApplyOrder(a: { [string]: any }, b: { [string]: any }): boolean
+	if #a.pathSegments ~= #b.pathSegments then
+		return #a.pathSegments < #b.pathSegments
+	end
+	for i = 1, #a.pathSegments do
+		local left, right = tostring(a.pathSegments[i]), tostring(b.pathSegments[i])
+		if left ~= right then
+			return left < right
+		end
+	end
+	for i = 1, #a.pathSegments do
+		local left, right = tonumber(a.pathOrdinals[i]) or 1, tonumber(b.pathOrdinals[i]) or 1
+		if left ~= right then
+			return left < right
+		end
+	end
+	return a.key < b.key
+end
+
 local function sortedInstanceEntries(
 	change: { [string]: any },
 	serviceName: string,
@@ -2143,12 +2165,7 @@ local function sortedInstanceEntries(
 		end
 	end
 
-	table.sort(entries, function(a, b)
-		if #a.pathSegments == #b.pathSegments then
-			return a.key < b.key
-		end
-		return #a.pathSegments < #b.pathSegments
-	end)
+	table.sort(entries, entryApplyOrder)
 	return entries
 end
 

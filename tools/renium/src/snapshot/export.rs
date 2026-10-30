@@ -183,10 +183,18 @@ pub(crate) struct ExportProjectStage {
     link_restore: Option<PullLinkRestore>,
     restored_links: Vec<Value>,
     studio_overrides: StudioOverrides,
+    preserve_paths: Vec<PathBuf>,
     active: bool,
 }
 
 impl ExportProjectStage {
+    /// Project paths whose current content the publish leaves untouched: edits
+    /// Live Sync has not delivered to Studio yet must not be replaced by the
+    /// Studio copy they are waiting to overwrite.
+    pub(crate) fn preserve_project_paths(&mut self, paths: Vec<PathBuf>) {
+        self.preserve_paths = paths;
+    }
+
     pub(crate) fn create(project_root: &Path, src_dir: &Path, services: &[String]) -> Result<Self> {
         Self::create_inner(project_root, src_dir, services, true, false)
     }
@@ -362,6 +370,7 @@ impl ExportProjectStage {
             link_restore: None,
             restored_links: Vec::new(),
             studio_overrides: BTreeMap::new(),
+            preserve_paths: Vec::new(),
             active: true,
         };
         log_global(
@@ -728,7 +737,10 @@ impl ExportProjectStage {
         let mut refreshed = settings_candidates;
         refreshed.extend(repaired);
         refresh_publish_hashes(&self.project_root, &mut staged, &refreshed)?;
-        let operation_paths = publish_operation_paths(&current, &staged);
+        let (operation_paths, preserved) = split_preserved_paths(
+            publish_operation_paths(&current, &staged),
+            &self.preserve_paths,
+        );
         let directory_swaps = publish_directory_swaps(
             project_root,
             &self.project_root,
@@ -847,22 +859,56 @@ impl ExportProjectStage {
         }
         log_phase("file swaps", phase);
         self.active = false;
-        let phase = Instant::now();
         // Backups live under the container, so discarding it removes them too.
         debug_assert!(published.iter().all(|(_, backup)| {
             backup
                 .as_ref()
                 .is_none_or(|backup| backup.starts_with(&self.container))
         }));
-        crate::system::files::discard_directory(&self.container);
-        log_phase("cleanup", phase);
         log_timing_ms("export project stage publish", elapsed_ms(started));
         Ok(PublishedProjectChanges {
             changed_roots,
             expected,
             read_only_links_restored: std::mem::take(&mut self.restored_links),
             studio_overrides: std::mem::take(&mut self.studio_overrides),
+            preserved,
+            previous: Some(PublishBackups {
+                root: backup_root,
+                container: self.container.clone(),
+            }),
         })
+    }
+}
+
+/// Operations that touch a preserved path, or that would replace a directory
+/// holding one, stay out of the publish; the caller learns which ones.
+fn split_preserved_paths(
+    operations: Vec<PathBuf>,
+    preserved: &[PathBuf],
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    operations.into_iter().partition(|operation| {
+        !preserved
+            .iter()
+            .any(|path| operation.starts_with(path) || path.starts_with(operation))
+    })
+}
+
+/// The files a publish replaced, kept until the caller has recorded them as
+/// undo data. Dropping the handle discards the stage container they live in.
+pub(crate) struct PublishBackups {
+    root: PathBuf,
+    container: PathBuf,
+}
+
+impl PublishBackups {
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+}
+
+impl Drop for PublishBackups {
+    fn drop(&mut self) {
+        crate::system::files::discard_directory(&self.container);
     }
 }
 
@@ -982,6 +1028,9 @@ pub(crate) struct PublishedProjectChanges {
     pub(crate) expected: BTreeMap<PathBuf, Option<PublishEntryState>>,
     pub(crate) read_only_links_restored: Vec<Value>,
     pub(crate) studio_overrides: StudioOverrides,
+    /// Project paths the publish left alone because their edits are unsynced.
+    pub(crate) preserved: Vec<PathBuf>,
+    pub(crate) previous: Option<PublishBackups>,
 }
 
 #[derive(Clone, Copy)]
@@ -1719,6 +1768,7 @@ fn export_snapshots_core(
     } = prepare_export_execution(&args.src_dir, &project_root, &services, total_started)?;
     if matches!(purpose, ExportPurpose::Pull) {
         project_stage.prepare_read_only_links(&project_root, &args.src_dir, &services)?;
+        project_stage.preserve_project_paths(args.preserve_paths.clone());
     }
     let ServiceExportRun {
         spans: service_export_spans,
@@ -1807,6 +1857,18 @@ fn export_snapshots_core(
     );
     log_timing_ms("full export-snapshots run", total_run_ms);
     println!("[renium] export done");
+    if matches!(purpose, ExportPurpose::Pull)
+        && let Err(error) = crate::automation::reconcile::history::record_published_files(
+            &project_root,
+            &args.src_dir,
+            &published,
+        )
+    {
+        log_global(
+            1,
+            format_args!("[renium] pull undo history was not recorded: {error:#}"),
+        );
+    }
     Ok(published)
 }
 
@@ -2505,7 +2567,7 @@ mod publication_tests {
             let staged_file_link = fixture.container.join("staged-file-link");
             fs::hard_link(stage.project_root.join(SOURCE), &staged_file_link).unwrap();
             let stage_container = stage.container.clone();
-            let published = stage.publish(&fixture.root, false).unwrap();
+            let mut published = stage.publish(&fixture.root, false).unwrap();
             assert_eq!(published.changed_roots, logical_paths);
             assert!(published.expected == expected);
             assert!(
@@ -2518,6 +2580,8 @@ mod publication_tests {
                 fs::read_to_string(fixture.root.join(SOURCE)).unwrap(),
                 "return 'captured'\n"
             );
+            assert!(stage_container.exists());
+            drop(published.previous.take());
             assert!(!stage_container.exists());
             fs::write(staged_file_link, "same file, not a copy").unwrap();
             assert_eq!(
@@ -2773,7 +2837,7 @@ mod publication_tests {
         let stage = fixture.stage.take().unwrap();
         let stage_container = stage.container.clone();
         let calls = Cell::new(0);
-        let (published, _) = finish_export_publication(
+        let (mut published, _) = finish_export_publication(
             Some(stage),
             &fixture.root,
             false,
@@ -2810,7 +2874,63 @@ mod publication_tests {
             fs::read_to_string(fixture.root.join("outside.txt")).unwrap(),
             "outside edit"
         );
+        let backups = published.previous.take().unwrap();
+        assert_eq!(
+            fs::read_to_string(backups.root().join(SOURCE)).unwrap(),
+            "return 'original'\n"
+        );
+        drop(backups);
         assert!(!stage_container.exists());
+    }
+
+    #[test]
+    fn export_publication_keeps_unsynced_files_in_place() {
+        let mut fixture = Fixture::new();
+        let mut stage = fixture.stage.take().unwrap();
+        stage.preserve_project_paths(vec![PathBuf::from(SOURCE)]);
+        let published = stage.publish(&fixture.root, false).unwrap();
+        assert_eq!(published.preserved, [PathBuf::from(SOURCE)]);
+        assert!(!published.changed_roots.contains(&PathBuf::from(SOURCE)));
+        assert!(!published.expected.contains_key(Path::new(SOURCE)));
+        assert_eq!(
+            fs::read_to_string(fixture.root.join(SOURCE)).unwrap(),
+            "return 'original'\n"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("sourcemap.json")).unwrap(),
+            "{\"name\":\"Captured\"}"
+        );
+    }
+
+    #[test]
+    fn export_publication_undo_history_restores_the_replaced_files() {
+        let mut fixture = Fixture::new();
+        fs::create_dir_all(fixture.root.join(".renium")).unwrap();
+        let stage = fixture.stage.take().unwrap();
+        let published = stage.publish(&fixture.root, false).unwrap();
+        let id = crate::automation::reconcile::history::record_published_files(
+            &fixture.root,
+            Path::new("src"),
+            &published,
+        )
+        .unwrap()
+        .unwrap();
+        drop(published);
+        assert_eq!(
+            fs::read_to_string(fixture.root.join(SOURCE)).unwrap(),
+            "return 'captured'\n"
+        );
+        let restored = crate::automation::reconcile::history::revert_sync(
+            &fixture.root,
+            Path::new("src"),
+            &id,
+        )
+        .unwrap();
+        assert!(!restored.paths.is_empty());
+        assert_eq!(
+            fs::read_to_string(fixture.root.join(SOURCE)).unwrap(),
+            "return 'original'\n"
+        );
     }
 
     #[test]

@@ -251,6 +251,41 @@ impl DeltaWeight {
 }
 
 /// Returns the services it promoted.
+/// Every instance of a replaced service is a new object, so references from
+/// other services into it must be written again, as after any recreation.
+pub(crate) fn extend_replaced_service_references(
+    desired: &ProjectSnapshot,
+    prepared: &HashMap<PathBuf, PreparedEditorSettingsChange>,
+    promoted: &HashSet<String>,
+    plan: &mut ReconcilePushPlan,
+) -> Result<()> {
+    if promoted.is_empty() {
+        return Ok(());
+    }
+    for (path, change) in prepared {
+        if promoted.contains(&settings_service_name(
+            path,
+            &change.current,
+            &change.previous,
+        )?) {
+            plan.recreated_settings_ids.extend(
+                change
+                    .current
+                    .instances
+                    .iter()
+                    .filter(|instance| instance.parent_index.is_some())
+                    .map(|instance| instance.settings_id.clone()),
+            );
+        }
+    }
+    append_recreated_reference_pushes(desired, prepared, plan)?;
+    plan.changed_paths.sort();
+    plan.changed_paths.dedup();
+    plan.target_settings_ids.sort();
+    plan.target_settings_ids.dedup();
+    Ok(())
+}
+
 pub(crate) fn promote_heavy_deltas_to_replacement(
     context: &BoundContext,
     desired: &ProjectSnapshot,

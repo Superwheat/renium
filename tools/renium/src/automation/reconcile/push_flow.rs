@@ -286,32 +286,12 @@ pub(crate) fn push_project(
         true,
         false,
     )?;
-    if !promoted_services.is_empty() {
-        // Every instance of a replaced service is a new object, so references
-        // from other services into it must be written again, as after any
-        // recreation.
-        for (path, change) in &prepared_settings {
-            if promoted_services.contains(&settings_service_name(
-                path,
-                &change.current,
-                &change.previous,
-            )?) {
-                plan.recreated_settings_ids.extend(
-                    change
-                        .current
-                        .instances
-                        .iter()
-                        .filter(|instance| instance.parent_index.is_some())
-                        .map(|instance| instance.settings_id.clone()),
-                );
-            }
-        }
-        append_recreated_reference_pushes(&project, &prepared_settings, &mut plan)?;
-        plan.changed_paths.sort();
-        plan.changed_paths.dedup();
-        plan.target_settings_ids.sort();
-        plan.target_settings_ids.dedup();
-    }
+    extend_replaced_service_references(
+        &project,
+        &prepared_settings,
+        &promoted_services,
+        &mut plan,
+    )?;
     log_reconcile_timing("full push plan", phase);
     if plan.is_empty() {
         tracking_release.proof = capture_push_proof(bridge, &guard)?;

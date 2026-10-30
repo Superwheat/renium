@@ -5827,6 +5827,82 @@ mod sync_tests {
     }
 
     #[test]
+    fn service_upserts_order_same_named_siblings_by_numeric_ordinal_after_their_parents() {
+        let props = ["ServerStorage", "Maps", "Village", "Props"];
+        let descriptor = |tail: &[&str], ordinals: &[usize], class: &str| {
+            crate::editor::types::EditorInstanceDescriptor {
+                settings_id: format!("{}@{ordinals:?}", tail.join(".")),
+                path_segments: props
+                    .iter()
+                    .chain(tail)
+                    .map(|segment| segment.to_string())
+                    .collect(),
+                path_ordinals: [1, 1, 1, 1].iter().chain(ordinals).copied().collect(),
+                class_name: class.into(),
+                ..Default::default()
+            }
+        };
+        let mut instances = vec![descriptor(&[], &[], "Model")];
+        for model in 1..=12 {
+            instances.push(descriptor(&["Model"], &[model], "Model"));
+            for part in 1..=(model % 3) + 1 {
+                instances.push(descriptor(&["Model", "Part"], &[model, part], "Part"));
+                instances.push(descriptor(
+                    &["Model", "Part", "Texture"],
+                    &[model, part, 1],
+                    "Texture",
+                ));
+            }
+            instances.push(descriptor(&["Model", "Model"], &[model, 1], "Model"));
+        }
+        let total = instances.len();
+        for index in (1..total).rev() {
+            instances.swap(index, (index * 7919) % index);
+        }
+        let mut changes = EditorChangeSet::default();
+        crate::editor::diff::push_editor_instance_change(
+            &mut changes,
+            "upsertInstances",
+            "ServerStorage",
+            false,
+            instances,
+        );
+        let sorted = &changes.instance_changes[0].instances;
+        assert_eq!(sorted.len(), total);
+        let mut seen = std::collections::HashSet::new();
+        for (index, instance) in sorted.iter().enumerate() {
+            let depth = instance.path_segments.len();
+            let parent = (
+                &instance.path_segments[..depth - 1],
+                &instance.path_ordinals[..depth - 1],
+            );
+            assert!(
+                depth == props.len() || seen.contains(&parent),
+                "{} {:?} arrived before its parent",
+                instance.path_segments.join("."),
+                instance.path_ordinals
+            );
+            if let Some(previous) = index.checked_sub(1).map(|index| &sorted[index])
+                && previous.path_segments == instance.path_segments
+            {
+                assert!(
+                    previous.path_ordinals < instance.path_ordinals,
+                    "{:?} sorted before {:?}",
+                    previous.path_ordinals,
+                    instance.path_ordinals
+                );
+            }
+            seen.insert((&instance.path_segments[..], &instance.path_ordinals[..]));
+        }
+        let models = sorted
+            .iter()
+            .filter(|instance| instance.path_segments.len() == props.len() + 1)
+            .map(|instance| instance.path_ordinals[props.len()])
+            .collect::<Vec<_>>();
+        assert_eq!(models, (1..=12).collect::<Vec<_>>());
+    }
+
+    #[test]
     fn transaction_upload_chunks_package_targets_without_losing_guards() {
         let target = json!({"pathSegments": ["Workspace", "x".repeat(2048)], "includeSelf": true});
         let targets = vec![target.clone(); 10_000];

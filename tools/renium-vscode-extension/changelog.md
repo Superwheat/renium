@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- A Live Sync pull no longer overwrites a project file whose edits Studio has not received: files pending a push, or blocked by a failed push, keep their content and stay pending, and the daemon log names them. Before, a push batch that Studio rejected was followed by a pull that replaced the edited store with Studio's copy, so a model imported with `rbx mip` vanished from the files with nothing to undo.
+- Every write of Studio content into the project files now leaves a sync history entry: Live Sync pulls, `rbx pull`, and the files a reconcile (`rbx lon`, including `--prefer studio`) resolves toward Studio. `rbx rev --sync latest` restores the previous file content, as it already did for pushes.
+- Live Sync's incremental pushes promote a heavy delta (2,000 or more new instances, or 64 or more engine-set field writes in one service) to a native service replacement, as `rbx ps` has since 0.5.4. Before, importing a 10,000-instance model into a store while Live Sync ran applied it instance by instance.
+- The Studio plugin creates same-named siblings in the order of their store ordinals. Before, it sorted them as text (ordinal 11 before 2), so a push of more than 5,000 new instances whose parents hold many same-named children (a props folder of `Model`s) failed its second batch with `Cannot create instance; parent path was not found`, and the surviving siblings sat in another order than the store's.
+
 ## 0.5.4 - 2026-10-30
 
 ### Removed

@@ -2325,6 +2325,9 @@ pub(super) struct PullArgs {
     pub(super) export_all_properties: bool,
     #[arg(help = "Hide timing output", short, long)]
     pub(super) quiet_timings: bool,
+    /// Project paths whose unsynced edits the publish leaves in place.
+    #[arg(skip)]
+    pub(crate) preserve_paths: Vec<PathBuf>,
 }
 
 #[derive(Clone, Parser)]

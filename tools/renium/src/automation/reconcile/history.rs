@@ -5,9 +5,36 @@ use crate::project::sourcemap::generate_project_sourcemap_at;
 
 /// File-backed undo for a sync, independent of Studio's change-history service.
 /// The pre-state comes from reconciliation's existing capture; never recapture it.
-pub(super) struct SyncHistory {
+pub(crate) struct SyncHistory {
     directory: PathBuf,
     record: SyncHistoryRecord,
+}
+
+/// Undo data for project files a Studio export replaced: the backups the
+/// publish kept are the state before, the project as published the state
+/// after. A pull that changed nothing leaves no entry.
+pub(crate) fn record_published_files(
+    root: &Path,
+    source: &Path,
+    published: &crate::snapshot::export::PublishedProjectChanges,
+) -> Result<Option<String>> {
+    let Some(backups) = published.previous.as_ref() else {
+        return Ok(None);
+    };
+    let scopes = published
+        .changed_roots
+        .iter()
+        .filter(|path| !derived_project_path(path))
+        .cloned()
+        .collect::<HashSet<_>>();
+    if scopes.is_empty() {
+        return Ok(None);
+    }
+    let roots = scopes.iter().cloned().collect::<Vec<_>>();
+    let before = capture_snapshot(backups.root(), &roots)?;
+    let history = SyncHistory::begin(root, source, &before, &scopes)?;
+    let after = capture_snapshot(root, &roots)?;
+    Ok(Some(history.commit(&after, &ProjectSnapshot::default())?))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -24,7 +51,7 @@ struct SyncHistoryRecord {
 }
 
 impl SyncHistory {
-    pub(super) fn begin(
+    pub(crate) fn begin(
         root: &Path,
         source: &Path,
         before: &ProjectSnapshot,
@@ -74,7 +101,7 @@ impl SyncHistory {
         Ok(history)
     }
 
-    pub(super) fn commit(
+    pub(crate) fn commit(
         mut self,
         after: &ProjectSnapshot,
         generated: &ProjectSnapshot,
