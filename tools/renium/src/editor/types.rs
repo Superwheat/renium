@@ -418,6 +418,9 @@ pub(crate) struct EditorChangeSet {
     // Full native replacements need only serializer omissions as property
     // edits. Keep the accepted document until the binary plan identifies them.
     pub(crate) native_property_documents: HashMap<String, Arc<SettingsBytecode>>,
+    /// Engine-set fields of imported instances, written in a follow-up
+    /// transaction of the same push once the import has joined its service.
+    pub(crate) deferred_native_rows: Vec<EditorPropertyChange>,
 }
 
 impl EditorChangeSet {

@@ -8,6 +8,7 @@
 
 ### Improvements
 
+- A native service import now writes the engine-set fields of the imported instances (a SurfaceAppearance TexturePack, a mesh id Studio's reader dropped) in the same push, in a short follow-up transaction once the import has joined its service; before, the packs kept their old values while the push reported verified, so a second push was needed. The result carries `importedEngineFields` with the row count.
 - A store push whose delta is heavy (64 or more engine-set field writes in one service, counting a new MeshPart as three, a new SurfaceAppearance as one and a changed mesh field on an existing part as one, or 2,000 or more new instances) now replaces that service's authored contents through one native import instead of applying the change instance by instance. Before, a six-service push of a cloned game (about 4,000 new instances, mostly car meshes) queued about 2,000 native property writes one at a time, hitched Studio for two minutes and then failed; the same end state now lands in one deserialize. Instances of a replaced service get fresh engine identities, as in a full replacement push.
 - `rbx ps STORE -i ID` now pushes the targeted instance with its whole subtree, so a newly added model arrives complete instead of as an empty root; a script ID still selects the script and the scripts under it.
 - `rbx mip` says in its help that it writes the project store only, and the configuration guide names the push that applies the import in Studio.

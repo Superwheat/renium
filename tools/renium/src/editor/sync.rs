@@ -3079,6 +3079,7 @@ fn push_editor_changes_with_collected(
         binary_import.as_ref(),
         &args.project.project_root,
     )?;
+    defer_imported_native_root_rows(&mut changes, binary_import.as_ref());
     if global_log_enabled(5) {
         log_change_set_composition(&changes, binary_import.as_ref());
     }
@@ -3224,6 +3225,11 @@ fn push_editor_changes_with_collected(
         if let Some(status) = commit_status {
             add_editor_commit_status(&mut summary, status);
         }
+        if !review_skipped && !changes.deferred_native_rows.is_empty() {
+            let phase_started = Instant::now();
+            apply_deferred_native_rows(bridge, guard, &changes.deferred_native_rows, &mut summary)?;
+            log_timing("native editor imported engine fields", phase_started);
+        }
         if protected.apply_offline {
             summary.remove("verifiedPushProof");
         }
@@ -3257,6 +3263,103 @@ fn push_editor_changes_with_collected(
         Ok(summary)
     })();
     EditorTransaction::finish(transaction.as_mut(), result)
+}
+
+/// The native setter finds its target by path from the service root, and an
+/// import's incoming roots join the service only at commit. Engine-set fields
+/// of imported instances (a texture pack, a mesh id the reader dropped) are
+/// held back here and written by `apply_deferred_native_rows` afterwards.
+fn defer_imported_native_root_rows(
+    changes: &mut EditorChangeSet,
+    import: Option<&EditorBinaryImport>,
+) {
+    let Some(import) = import else {
+        return;
+    };
+    let mut deferred = Vec::new();
+    changes.property_changes.retain_mut(|change| {
+        if property_change_needs_post_native_apply(change)
+            || !import.imports_path(
+                &change.service,
+                &change.path_segments,
+                &change.path_ordinals,
+            )
+            || import.retains_path(
+                &change.service,
+                &change.path_segments,
+                &change.path_ordinals,
+            )
+            || import.carries_container_settings(&change.service, &change.path_segments)
+        {
+            return true;
+        }
+        let names = change
+            .properties
+            .keys()
+            .filter(|name| super::native_roots::is_property(&change.class_name, name))
+            .cloned()
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            return true;
+        }
+        let mut held = change.clone();
+        held.properties.retain(|name, _| names.contains(name));
+        held.reset_properties.clear();
+        held.attributes.clear();
+        held.deleted_attributes.clear();
+        held.attributes_complete = false;
+        deferred.push(held);
+        change.properties.retain(|name, _| !names.contains(name));
+        !change.properties.is_empty()
+            || !change.reset_properties.is_empty()
+            || !change.attributes.is_empty()
+            || !change.deleted_attributes.is_empty()
+    });
+    changes.deferred_native_rows = deferred;
+}
+
+fn apply_deferred_native_rows(
+    bridge: &BridgeServer,
+    guard: Option<&StudioChangeGuard>,
+    rows: &[EditorPropertyChange],
+    summary: &mut Map<String, Value>,
+) -> Result<()> {
+    let changes = EditorChangeSet {
+        property_changes: rows.to_vec(),
+        ..EditorChangeSet::default()
+    };
+    let mut transaction = EditorTransaction::begin(bridge, &changes, None, guard)?;
+    let result: Result<()> = (|| {
+        let transaction_id = transaction.as_ref().map(|value| value.id.as_str());
+        let follow_up = send_editor_change_batches(bridge, &changes, None, transaction_id)?;
+        let errors = follow_up
+            .get("errors")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        if follow_up.get("ok").and_then(Value::as_bool) == Some(false) || errors > 0.0 {
+            bail!("Studio rejected or failed an engine-set field of an imported instance");
+        }
+        if let Some(transaction) = transaction.as_mut() {
+            transaction.commit()?;
+        }
+        let updated = follow_up
+            .get("propertyUpdated")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let previous = summary
+            .get("propertyUpdated")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        summary.insert("propertyUpdated".into(), json!(previous + updated));
+        summary.insert("importedEngineFields".into(), json!(rows.len() as u64));
+        Ok(())
+    })();
+    EditorTransaction::finish(transaction.as_mut(), result).with_context(|| {
+        format!(
+            "Studio applied the import, but {} engine-set field row(s) on imported instances failed afterwards; push the store again to retry them",
+            rows.len()
+        )
+    })
 }
 
 fn apply_editor_change_with_warm_bridge(
@@ -5312,6 +5415,111 @@ mod sync_tests {
         exact.settings_ids.insert("editor:car".to_string());
         widen_target_ids_to_subtrees(&mut exact, &documents, true);
         assert!(!exact.includes_instance_in("ReplicatedStorage", "editor:body"));
+    }
+
+    #[test]
+    fn imported_engine_fields_wait_for_the_import_to_land() {
+        use crate::editor::types::{EditorBinaryImportGroup, EditorPropertyChange};
+        let import = EditorBinaryImport {
+            bytes: Vec::new(),
+            native_replacement: None,
+            groups: vec![EditorBinaryImportGroup {
+                additive: false,
+                service: "ReplicatedStorage".to_string(),
+                target_path: vec!["ReplicatedStorage".to_string()],
+                count: 1,
+                payload_root_name: "payload".to_string(),
+                expected_structure: None,
+                root_paths: Vec::new(),
+                root_settings_ids: Vec::new(),
+                viewport_camera: None,
+                retained_roots: Vec::new(),
+                package_roots: Vec::new(),
+                mutation_package_roots: Vec::new(),
+                change_generation: None,
+            }],
+            instance_count: 0,
+            post_apply_properties_by_class: HashMap::new(),
+            post_apply_properties_by_path: HashMap::new(),
+            external_references_post_applied: false,
+            viewport_references_post_applied: false,
+        };
+        let row = |segments: &[&str], class_name: &str, properties: &[(&str, Value)]| {
+            EditorPropertyChange {
+                service: "ReplicatedStorage".into(),
+                settings_id: None,
+                path_segments: segments.iter().map(|s| s.to_string()).collect(),
+                path_ordinals: vec![1; segments.len()],
+                class_name: class_name.into(),
+                properties: properties
+                    .iter()
+                    .map(|(name, value)| (name.to_string(), value.clone()))
+                    .collect(),
+                reset_properties: Vec::new(),
+                attributes: Map::new(),
+                deleted_attributes: Vec::new(),
+                attributes_complete: false,
+            }
+        };
+        let mut changes = EditorChangeSet {
+            property_changes: vec![
+                row(
+                    &["ReplicatedStorage"],
+                    "ReplicatedStorage",
+                    &[("SourceAssetId", json!(7))],
+                ),
+                row(
+                    &["ReplicatedStorage", "Car", "Body", "SurfaceAppearance"],
+                    "SurfaceAppearance",
+                    &[
+                        ("TexturePack", json!("rbxassetid://1")),
+                        ("Color", json!({"_type": "Color3", "r": 1, "g": 1, "b": 1})),
+                    ],
+                ),
+                row(
+                    &["ReplicatedStorage", "Car", "Body", "Mesh"],
+                    "MeshPart",
+                    &[("MeshId", json!("rbxassetid://2"))],
+                ),
+            ],
+            ..EditorChangeSet::default()
+        };
+        defer_imported_native_root_rows(&mut changes, Some(&import));
+        assert_eq!(changes.deferred_native_rows.len(), 2);
+        assert_eq!(changes.property_changes.len(), 2);
+        assert!(
+            changes.property_changes[0]
+                .properties
+                .contains_key("SourceAssetId")
+        );
+        assert_eq!(
+            changes.property_changes[1]
+                .properties
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["Color"]
+        );
+        assert!(
+            changes.deferred_native_rows[0]
+                .properties
+                .contains_key("TexturePack")
+        );
+        assert!(
+            changes.deferred_native_rows[1]
+                .properties
+                .contains_key("MeshId")
+        );
+        let mut untouched = EditorChangeSet {
+            property_changes: vec![row(
+                &["ReplicatedStorage", "Car"],
+                "Model",
+                &[("Scale", json!(2.0))],
+            )],
+            ..EditorChangeSet::default()
+        };
+        defer_imported_native_root_rows(&mut untouched, None);
+        assert!(untouched.deferred_native_rows.is_empty());
+        assert_eq!(untouched.property_changes.len(), 1);
     }
 
     #[test]

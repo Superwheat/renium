@@ -350,13 +350,6 @@ fn delta_weight(current: &SettingsBytecode, previous: &SettingsBytecode) -> Delt
             continue;
         };
         let other = &previous.instances[other];
-        // The native import does not carry TexturePack, so after a replacement
-        // every existing surface differs until the incremental pass writes it.
-        // Counting those would replace the service again on each push instead
-        // of letting the writes land; only a new surface counts.
-        if instance.class_name == "SurfaceAppearance" {
-            continue;
-        }
         // The same rules as the comparison: an asset id in another spelling, a
         // hull that encodes the same fidelity or a field the capture cannot
         // know is no write. A saved override that the files dropped is reset
@@ -553,15 +546,24 @@ mod heavy_delta_tests {
             .properties
             .insert("RenderFidelity".into(), precise);
         assert_eq!(delta_weight(&current, &previous).native_writes, 63);
-        // A texture pack on an existing surface is written by the incremental pass.
+        // A changed texture pack on an existing surface is one native write; a
+        // capture without the field says nothing about it.
         let mut current = document(70, "SurfaceAppearance");
-        let previous = document(70, "SurfaceAppearance");
+        let mut previous = document(70, "SurfaceAppearance");
         for instance in current.instances.iter_mut().skip(1) {
             instance
                 .properties
                 .insert("TexturePack".into(), serde_json::json!("rbxassetid://1"));
         }
         assert_eq!(delta_weight(&current, &previous), DeltaWeight::default());
+        for instance in previous.instances.iter_mut().skip(1) {
+            instance
+                .properties
+                .insert("TexturePack".into(), serde_json::json!("rbxassetid://2"));
+        }
+        let weight = delta_weight(&current, &previous);
+        assert_eq!(weight.native_writes, 70);
+        assert!(weight.heavy());
         // The same asset in another spelling is no write.
         let mut current = document(1, "MeshPart");
         let mut previous = document(1, "MeshPart");

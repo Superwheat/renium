@@ -3018,6 +3018,14 @@ fn build_editor_binary_import_for_services(
         .entry("Model".to_string())
         .or_default()
         .insert("WorldPivot".to_string());
+    // Studio's reader does not take a texture pack from the payload (the
+    // property is RobloxSecurity); the native setter applies it afterwards,
+    // in the same transaction, like a pivot.
+    build
+        .omitted_properties_by_class
+        .entry("SurfaceAppearance".to_string())
+        .or_default()
+        .insert(crate::roblox::schema::TEXTURE_PACK_PROPERTY.to_string());
     log_timing("native editor import group preparation", phase_started);
     let replacement_groups = pending_groups
         .iter()

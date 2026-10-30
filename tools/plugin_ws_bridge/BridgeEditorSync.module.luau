@@ -6055,8 +6055,11 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					error("Native root sync requires an active undo recording")
 				end
 				local write = if session.nativeRootWrites then session.nativeRootWrites[params.nativeRootWrite] else nil
-				if write == nil or not isNativeRootProperty(write.instance, write.name) then
-					error("Native root write target is no longer valid")
+				if write == nil then
+					error(`Native root write {params.nativeRootWrite} is no longer queued`)
+				end
+				if not isNativeRootProperty(write.instance, write.name) then
+					error(`Native root write target is no longer valid: {write.name} on {typeof(write.instance) == "Instance" and write.instance.ClassName or typeof(write.instance)}`)
 				end
 				-- Earlier changes in this batch can shift sibling ordinals, so the path
 				-- the native writer uses is taken from the live instance, not the plan.
@@ -6064,9 +6067,12 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				if typeof(write.instance) == "Instance" then
 					livePathSegments, livePathOrdinals = BridgeIdentity.getRefPathParts(write.instance)
 				end
-				if livePathSegments == nil
-					or resolvePathSegments(livePathSegments, nil, livePathOrdinals) ~= write.instance then
-					error("Native root write target is no longer valid")
+				if livePathSegments == nil then
+					error(`Native root write target left the place: {write.name} on {write.instance:GetFullName()} (parent {tostring(write.instance.Parent)})`)
+				end
+				local resolved = resolvePathSegments(livePathSegments, nil, livePathOrdinals)
+				if resolved ~= write.instance then
+					error(`Native root write target moved: {write.instance:GetFullName()} resolves to {resolved and resolved:GetFullName() or "nothing"}`)
 				end
 				if params.describeNativeRootWrite == true then
 					return {
