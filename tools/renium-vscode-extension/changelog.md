@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.5.5 - 2026-10-30
 
-### Fixes
+### Bug fixes
 
 - A Live Sync pull no longer overwrites a project file whose edits Studio has not received: files pending a push, or blocked by a failed push, keep their content and stay pending, and the daemon log names them. Before, a push batch that Studio rejected was followed by a pull that replaced the edited store with Studio's copy, so a model imported with `rbx mip` vanished from the files with nothing to undo.
 - A write of Studio content into the project files now leaves a sync history entry: Live Sync pulls, `rbx pull`, and the files a reconcile (`rbx lon`, including `--prefer studio`) resolves toward Studio. `rbx rev --sync latest` restores the previous file content, as it already did for pushes. The entry is written before the pull reports completion; when it cannot be written, or a file was saved again in between, the replaced files stay in the export's recovery folder and the daemon log names it.
