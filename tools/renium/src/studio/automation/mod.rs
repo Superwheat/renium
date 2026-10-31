@@ -657,7 +657,7 @@ pub(crate) fn studio_change_state_operation_command(
         "runtimeId": args.runtime_id,
         "suppressSeconds": args.suppress_seconds,
         "eventWaitSeconds": args.event_wait_seconds,
-        "settleWaitSeconds": args.settle_wait_seconds,
+        "settleWaitSeconds": args.settle_wait_seconds.map(|seconds| seconds.clamp(0.0, 120.0)),
         "contextBound": args.context_bound,
         "resolveConflictPreference": args.prefer,
         "initialSyncPriority": args.initial_sync_priority,
@@ -740,9 +740,14 @@ fn finish_studio_change_state_command(
             bail!(error.to_string());
         }
         if details {
+            let pulls = differences
+                .iter()
+                .filter(|line| line.starts_with("pull: "))
+                .count();
             bail!(
-                "{error}\n{}\nStudio differs on pull: paths, the files on push: paths; `rbx lon --prefer studio` or `rbx lon --prefer editor` reconciles",
-                differences.join("\n")
+                "{error}\n{}\nStudio differs on {pulls} pull: path(s), the files on {} push: path(s); `rbx lon --prefer studio` keeps Studio's version, `rbx lon --prefer editor` keeps the files",
+                differences.join("\n"),
+                differences.len() - pulls
             );
         }
         bail!(

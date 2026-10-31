@@ -1034,7 +1034,7 @@ try {
     }
     New-Item -ItemType Directory -Path $stagedInstall | Out-Null
     Copy-Item -LiteralPath $cli.FullName -Destination (Join-Path $stagedInstall "renium.exe")
-    foreach ($supportFile in @("rbx.cmd", "rbx", "renium-agents.md")) {
+    foreach ($supportFile in @("rbx.cmd", "renium-agents.md")) {
         $supportPath = Join-Path $cli.DirectoryName $supportFile
         if (Test-Path -LiteralPath $supportPath -PathType Leaf) {
             Copy-Item -LiteralPath $supportPath -Destination $stagedInstall

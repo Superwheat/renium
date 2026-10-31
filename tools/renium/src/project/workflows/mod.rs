@@ -41,11 +41,16 @@ const AGENT_VERSION_SUFFIX: &str = " -->";
 
 #[derive(Args)]
 pub struct InitArgs {
-    #[arg(default_value = ".")]
+    #[arg(help = "Project folder (created when missing)", default_value = ".")]
     pub path: PathBuf,
-    #[arg(long, value_delimiter = ',', value_name = "FEATURE")]
+    #[arg(
+        help = "Also set up these features, comma-separated",
+        long,
+        value_delimiter = ',',
+        value_name = "FEATURE"
+    )]
     pub with: Vec<InitFeature>,
-    #[arg(long)]
+    #[arg(help = "Print the plan without writing files", long)]
     pub preview: bool,
 }
 
@@ -87,22 +92,36 @@ pub enum ToolPolicy {
 
 #[derive(Args)]
 pub struct DoctorArgs {
-    #[arg(long, default_value = ".")]
+    #[arg(help = "Folder to check", long, default_value = ".")]
     pub root: PathBuf,
-    #[arg(long)]
+    #[arg(help = "Project file to check instead of the nearest one", long)]
     pub project: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(help = "Print the checks as JSON", long)]
     pub json: bool,
-    #[arg(long, value_name = "PATH")]
+    #[arg(
+        help = "Write a diagnostics zip to this path",
+        long,
+        value_name = "PATH"
+    )]
     pub bundle: Option<PathBuf>,
 }
 
 #[derive(Args)]
 pub struct DocsArgs {
+    #[arg(
+        help = "Guide name (sync, playtest, runtime, data, projects, ...) or a README heading; none prints the README"
+    )]
     pub topic: Option<String>,
-    #[arg(long)]
+    #[arg(
+        help = "Serve the text on a local HTTP port instead of printing it",
+        long
+    )]
     pub serve: bool,
-    #[arg(long, default_value_t = 0)]
+    #[arg(
+        help = "Port for --serve (0 picks a free one)",
+        long,
+        default_value_t = 0
+    )]
     pub port: u16,
 }
 
@@ -132,11 +151,20 @@ pub struct DaemonTargetArgs {
 
 #[derive(Args)]
 pub struct StudioArgs {
+    #[arg(help = "Place file to open; the project's place when omitted")]
     pub file: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(help = "Project file that owns the place", long)]
     pub project: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(
+        help = "Report the Studio executable and the resolved file without launching",
+        long
+    )]
     pub check: bool,
+    #[arg(
+        help = "Return right after the launch instead of waiting for the place to connect",
+        long
+    )]
+    pub no_wait: bool,
 }
 
 #[derive(Serialize)]
@@ -889,12 +917,21 @@ fn daemon_status_text(values: &[Value]) -> String {
 pub fn run_studio(args: StudioArgs, global_project: Option<&Path>) -> Result<()> {
     let project = args.project.as_deref().or(global_project);
     if !args.check {
-        let result = launch_studio(args.file.as_deref(), project)?;
+        let mut result = launch_studio(args.file.as_deref(), project)?;
+        let already_open = result.get("alreadyOpen").and_then(Value::as_bool) == Some(true);
+        if !args.no_wait {
+            crate::automation::commands::wait_for_launched_studio(project, &mut result, 0.0)?;
+        }
         let file = result
             .get("file")
             .and_then(Value::as_str)
             .context("Studio launch result omitted the file")?;
-        return crate::emit_global_output(&result, &format!("Opened {file} in Studio"));
+        let text = if already_open {
+            format!("Studio already has {file} open")
+        } else {
+            format!("Opened {file} in Studio")
+        };
+        return crate::emit_global_output(&result, &text);
     }
     let executable = studio_executable()?;
     let file = resolve_studio_file(args.file.as_deref(), project, false)?;
@@ -927,6 +964,17 @@ pub fn launch_studio(file: Option<&Path>, project: Option<&Path>) -> Result<Valu
     let executable = studio_executable()?;
     let file = resolve_studio_file(file, project, true)?
         .context("No Studio file exists and one could not be built")?;
+    #[cfg(any(windows, target_os = "macos"))]
+    if let Some(pid) = studio_pid_with_file_open(&file) {
+        return Ok(json!({
+            "ok": true,
+            "alreadyOpen": true,
+            "pid": pid,
+            "executable": executable,
+            "file": file,
+            "exists": file.is_file(),
+        }));
+    }
     if let Some(name) = file.file_stem().and_then(OsStr::to_str) {
         set_aside_recovery_files(name);
     }
@@ -938,6 +986,19 @@ pub fn launch_studio(file: Option<&Path>, project: Option<&Path>) -> Result<Valu
         "file": file,
         "exists": file.is_file(),
     }))
+}
+
+/// The Studio process that already has this place file open, so a repeated
+/// `so` reuses it instead of opening a second window on the same file.
+#[cfg(any(windows, target_os = "macos"))]
+fn studio_pid_with_file_open(file: &Path) -> Option<u32> {
+    let target = fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+    crate::studio::diagnosis::studio_process_ids()
+        .into_iter()
+        .find(|pid| {
+            crate::editor::review::local_place_path_for_pid(*pid)
+                .is_some_and(|open| fs::canonicalize(&open).unwrap_or(open) == target)
+        })
 }
 
 pub fn launch_published_studio(game_id: i64, place_id: i64) -> Result<Value> {
@@ -1272,25 +1333,50 @@ pub(crate) fn ensure_agent_instructions(root: &Path) -> Result<()> {
     refresh_agent_instructions(root)
 }
 
-pub(crate) fn refresh_outdated_agent_instructions(project: Option<&Path>) -> Result<bool> {
+/// Rewrites the project's guide copies when their text differs from this
+/// build's and returns the names of the files whose text changed; a copy
+/// that differs only in line endings (a CRLF checkout) counts as current.
+pub(crate) fn refresh_outdated_agent_instructions(project: Option<&Path>) -> Result<Vec<String>> {
     let current = env::current_dir().context("Failed to locate the current directory")?;
     let Some(loaded) = config::try_load_project(project, Some(&current))? else {
-        return Ok(false);
+        return Ok(Vec::new());
     };
     let root = resolve_experience_place(&loaded.root, None)?
         .map_or(loaded.root, |place| place.experience_root);
-    let expected_instructions = agent_instructions()?;
-    let instructions_match = fs::read(root.join(PROJECT_INSTRUCTIONS_FILE))
-        .is_ok_and(|contents| contents == expected_instructions);
-    let guides_match = agent_guides()?.into_iter().all(|(name, contents)| {
-        fs::read(root.join(PROJECT_GUIDES_DIRECTORY).join(name))
-            .is_ok_and(|current| current == contents)
-    });
-    if instructions_match && guides_match {
-        return Ok(false);
+    let same_text = |path: &Path, expected: &[u8]| {
+        fs::read(path).is_ok_and(|contents| without_carriage_returns(&contents) == expected)
+    };
+    let mut changed = Vec::new();
+    if !same_text(
+        &root.join(PROJECT_INSTRUCTIONS_FILE),
+        &without_carriage_returns(&agent_instructions()?),
+    ) {
+        changed.push(PROJECT_INSTRUCTIONS_FILE.to_string());
+    }
+    for (name, contents) in agent_guides()? {
+        if !same_text(
+            &root.join(PROJECT_GUIDES_DIRECTORY).join(&name),
+            &without_carriage_returns(&contents),
+        ) {
+            changed.push(format!(
+                "{PROJECT_GUIDES_DIRECTORY}/{}",
+                name.to_string_lossy()
+            ));
+        }
+    }
+    if changed.is_empty() {
+        return Ok(changed);
     }
     refresh_agent_instructions(&root)?;
-    Ok(true)
+    Ok(changed)
+}
+
+fn without_carriage_returns(bytes: &[u8]) -> Vec<u8> {
+    bytes
+        .iter()
+        .copied()
+        .filter(|byte| *byte != b'\r')
+        .collect()
 }
 
 const EMBEDDED_AGENT_INSTRUCTIONS: &str = include_str!("../../../renium-agents.md");
@@ -1406,6 +1492,13 @@ fn agent_instruction_version(contents: &str) -> Option<&str> {
         .next()?
         .strip_prefix(AGENT_VERSION_PREFIX)?
         .strip_suffix(AGENT_VERSION_SUFFIX)
+}
+
+fn embedded_guide_names() -> Vec<&'static str> {
+    EMBEDDED_AGENT_GUIDES
+        .iter()
+        .map(|(name, _)| name.trim_end_matches(".md"))
+        .collect()
 }
 
 fn agent_guides() -> Result<Vec<(PathBuf, Vec<u8>)>> {
@@ -1733,16 +1826,30 @@ fn docs_topic(topic: Option<&str>) -> Result<String> {
         return Ok(CLI_DOCS.to_string());
     };
     let needle = topic.to_ascii_lowercase();
+    let guide = format!("{}.md", needle.trim_end_matches(".md"));
+    if let Some((_, contents)) = EMBEDDED_AGENT_GUIDES
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(&guide))
+    {
+        return Ok((*contents).to_string());
+    }
     let lines = CLI_DOCS.lines().collect::<Vec<_>>();
     let start = lines
         .iter()
         .position(|line| {
-            line.trim_start_matches('#')
-                .trim()
-                .to_ascii_lowercase()
-                .contains(&needle)
+            line.starts_with('#')
+                && line
+                    .trim_start_matches('#')
+                    .trim()
+                    .to_ascii_lowercase()
+                    .contains(&needle)
         })
-        .with_context(|| format!("No bundled documentation topic matches '{topic}'"))?;
+        .with_context(|| {
+            format!(
+                "No documentation topic matches '{topic}'. Guides: {}; README sections match by heading",
+                embedded_guide_names().join(", ")
+            )
+        })?;
     let level = lines[start].chars().take_while(|ch| *ch == '#').count();
     let end = lines
         .iter()
@@ -2331,9 +2438,9 @@ mod tests {
         );
         assert_eq!(value["tree"]["ReplicatedStorage"]["$path"], "src/shared");
         assert!(root.join(PROJECT_INSTRUCTIONS_FILE).is_file());
-        assert!(!refresh_outdated_agent_instructions(Some(
-            &root.join(PROJECT_FILE_NAME)
-        ))?);
+        assert!(
+            refresh_outdated_agent_instructions(Some(&root.join(PROJECT_FILE_NAME)))?.is_empty()
+        );
         let _ = fs::remove_dir_all(&root);
         Ok(())
     }
@@ -2382,7 +2489,9 @@ mod tests {
         .unwrap();
         let removed = root.join(PROJECT_GUIDES_DIRECTORY).join("removed.md");
         fs::write(&removed, "old guide").unwrap();
-        assert!(refresh_outdated_agent_instructions(Some(&root.join(PROJECT_FILE_NAME))).unwrap());
+        let changed =
+            refresh_outdated_agent_instructions(Some(&root.join(PROJECT_FILE_NAME))).unwrap();
+        assert!(changed.contains(&PROJECT_INSTRUCTIONS_FILE.to_string()));
         assert_eq!(
             fs::read(root.join(PROJECT_INSTRUCTIONS_FILE)).unwrap(),
             agent_instructions().unwrap()
@@ -2394,7 +2503,24 @@ mod tests {
             );
         }
         assert!(!removed.exists());
-        assert!(!refresh_outdated_agent_instructions(Some(&root.join(PROJECT_FILE_NAME))).unwrap());
+        assert!(
+            refresh_outdated_agent_instructions(Some(&root.join(PROJECT_FILE_NAME)))
+                .unwrap()
+                .is_empty()
+        );
+        let crlf = String::from_utf8(agent_instructions().unwrap())
+            .unwrap()
+            .replace('\n', "\r\n");
+        fs::write(root.join(PROJECT_INSTRUCTIONS_FILE), &crlf).unwrap();
+        assert!(
+            refresh_outdated_agent_instructions(Some(&root.join(PROJECT_FILE_NAME)))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            fs::read_to_string(root.join(PROJECT_INSTRUCTIONS_FILE)).unwrap(),
+            crlf
+        );
 
         fs::write(&agents, "# Project rules\n\nKeep this.\n").unwrap();
         fs::write(&claude, "# Claude rules\n").unwrap();

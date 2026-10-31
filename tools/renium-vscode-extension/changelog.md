@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Bug fixes
+
+- `rbx in` printed `{}` for every instance, and `rbx bb -F a,b` dropped its results: the global `--fields` option shares its name with the per-command `-F` of `in`, `tr`, `f` and `bb`, so clap handed those commands' field lists (presets included) to the global projection, which kept no key. A command with its own `-F` now renders its own fields.
+- `rbx docs TOPIC` printed the README from the first line containing the word instead of the guide: `rbx docs sync` now prints `RENIUM/sync.md`; a README section still prints when its heading matches, and the error lists the guide names.
+- `rbx ck` with no changed files reports `ok: true, checked: 0` instead of failing.
+- The "RENIUM.md was updated" notice fired after every checkout on Windows, because the comparison counted line endings; it now ignores them and names the guide files whose text changed.
+- `rbx lst --details` printed the placeholder "paths" instead of the counts, and `rbx lst --wait 240` failed instead of waiting the 120 s maximum.
+- Store commands run outside a project (`rbx f`, `rbx tr`, `rbx in`) said the service had no store at a `src/<Service>` path; they now say there is no Renium project here and how to point at one.
+
+### Improvements
+
+- `rbx so FILE` and `rbx ro` wait until the place is connected (120 s, or `-w` when larger) before returning, report `connected` and `connectSeconds`, and fail with the diagnosis when the process exits or cannot open the place; `--no-wait` returns after the launch. A second `rbx so FILE` reuses the Studio that already has the place file open instead of opening a duplicate, and waits for its connection the same way.
+- A Studio command with no Studio process running fails within a second with the diagnosis instead of after its connection wait, both in the CLI and in the daemon; a launch in progress keeps the wait.
+- Windows installs and the Windows release bundle no longer carry the POSIX `rbx` launcher script: Git Bash resolves `rbx` to `rbx.exe` by itself, and the script doubled the cost of every call (about 100 ms instead of 55 ms). `rbx.cmd` stays for cmd.exe. A caller that ran the script by path uses `rbx.exe` or `renium.exe` instead.
+- The CLI's connection wait rebinds with backoff (50 ms to 400 ms) instead of every 50 ms, and the daemon logs binds at level 4; a wait used to add up to 500 bind lines and could hold the daemon's connection limit.
+- The daemon keeps its decoded store cache (bounded by its own entry, instance and byte limits) across idle periods and drops only payload and projection caches after 5 minutes, so the first export after a pause stays warm.
+- A push held for review in Studio says so on stderr, names `rbx rv apply`, `rbx rv skip` and `--yes`, says that an unanswered review is skipped after 90 s, and the `ps --help` text explains `--yes` against `--no-review`, which also disables protected writes.
+- Rejected push entries log the first three at the normal level and the rest at level 5.
+- The guides state the first-connection rule (pull once for a new or imported project, `lon` only for an existing one), the Studio push review, that `lon` returns before the first comparison settles, the import sequence under Live Sync, and the `so`/`ro` connection wait; `init`, `dr`, `docs`, `so`, `ro`, `status` and `sx` gained their missing flag help, and `rbx ip --help` shows script imports instead of a model file.
+
 ## 0.5.5 - 2026-10-30
 
 ### Bug fixes

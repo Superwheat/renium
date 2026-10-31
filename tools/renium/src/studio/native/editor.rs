@@ -3802,8 +3802,10 @@ pub(crate) fn wait_for_editor_review_decision(
     else {
         bail!("Studio required a review but did not return a review id");
     };
-    println!("[renium] {label} held for review in Studio: id={review_id}, changes={change_count}");
-    let _ = io::stdout().flush();
+    eprintln!(
+        "[renium] {label} held for review in Studio (id={review_id}, changes={change_count}); `rbx rv apply` or `rbx rv skip` decides, an unanswered review is skipped after 90 s (a protected-write review applies), `--yes` skips the review"
+    );
+    let _ = io::stderr().flush();
     let deadline = Instant::now() + Duration::from_secs(610);
     let mut consecutive_errors = 0u32;
     while Instant::now() < deadline {
@@ -4959,6 +4961,7 @@ fn log_rejected_entries<T: serde::Serialize>(error: &anyhow::Error, entries: &[T
         if shown > 400 {
             break;
         }
+        let level = if shown > 3 { 5 } else { 3 };
         let keys = |name: &str| {
             entry
                 .get(name)
@@ -4967,7 +4970,7 @@ fn log_rejected_entries<T: serde::Serialize>(error: &anyhow::Error, entries: &[T
                 .unwrap_or_default()
         };
         crate::app::output::log_global(
-            3,
+            level,
             format_args!(
                 "[renium] rejected push entry {segments} class={} ordinals={} previous={}/{} identity={} id={} anchor={} recreate={} match={:?} properties={:?} attributes={:?}",
                 entry

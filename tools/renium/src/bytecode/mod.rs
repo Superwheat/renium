@@ -469,6 +469,11 @@ fn high_level_context(
             &config::project_script_naming(&loaded.project),
             &[],
         )?
+    } else if loaded.is_none() {
+        bail!(
+            "No Renium project in {} or its parents; run the command from the project folder, pass -r DIR, or create one with `rbx init`",
+            project_root.display()
+        );
     } else {
         return Err(missing_service_store_error(&settings_file));
     };

@@ -1,5 +1,5 @@
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::app::output::log_global;
@@ -80,22 +80,34 @@ pub(crate) fn release_when_idle() {
     }
     if PAYLOAD_CACHES_HELD.load(Ordering::Relaxed) && idle_for >= PAYLOAD_CACHE_IDLE_LIMIT {
         PAYLOAD_CACHES_HELD.store(false, Ordering::Relaxed);
+        // Decoded stores stay (their own entry, instance and byte limits bound
+        // them); projections are keyed by project and have no limit of their own.
         let payload_bytes = crate::snapshot::export::drop_bridge_text_payload_cache()
             + crate::studio::native::editor::drop_native_payload_cache();
-        let (store_bytes, store_instances) =
-            crate::settings::bytecode::drop_settings_document_cache();
         let projections = crate::project::config::drop_projection_cache();
         release_now();
         log_global(
             3,
             format_args!(
-                "[renium] dropped idle caches after {} minutes: payloads {:.1} MB, stores {:.1} MB ({store_instances} instances), {projections} projections",
+                "[renium] dropped idle caches after {} minutes: payloads {:.1} MB, {projections} projections",
                 PAYLOAD_CACHE_IDLE_LIMIT.as_secs() / 60,
-                payload_bytes as f64 / (1024.0 * 1024.0),
-                store_bytes as f64 / (1024.0 * 1024.0)
+                payload_bytes as f64 / (1024.0 * 1024.0)
             ),
         );
     }
+}
+
+static STARTED: OnceLock<Instant> = OnceLock::new();
+
+/// Records the daemon's start; `uptime` measures from it.
+pub(crate) fn mark_started() {
+    let _ = STARTED.set(Instant::now());
+}
+
+/// Time since `mark_started`; a daemon that has not marked its start yet
+/// counts as just started.
+pub(crate) fn uptime() -> Duration {
+    STARTED.get().map_or(Duration::ZERO, Instant::elapsed)
 }
 
 fn release_now() {

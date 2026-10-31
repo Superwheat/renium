@@ -148,6 +148,7 @@ pub(super) fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
     let (bridge, listen_metrics) =
         BridgeServer::listen_daemon(&bridge_host, &ports, args.bridge.wait_seconds)?;
     let bridge = Arc::new(bridge);
+    memory::mark_started();
     spawn_daemon_control_server(
         &bridge_host,
         args.control_port,
@@ -863,14 +864,35 @@ fn daemon_control_request_inner(
         let wait = Duration::from_secs_f64(bridge_wait_seconds) + reconnect_grace;
         let deadline = Instant::now() + wait;
         let mut bind_error = None;
+        let mut delay = Duration::from_millis(50);
+        let mut next_process_check = Instant::now() + reconnect_grace;
+        let mut empty_probes = 0;
+        let mut no_studio = false;
         while !ready(&context) && Instant::now() < deadline {
             match try_bind_daemon_context(project_root, project_only, experience_only) {
                 Ok(bound) => context = bound,
                 Err(error) => bind_error = Some(error),
             }
-            if !ready(&context) {
-                thread::sleep(Duration::from_millis(50));
+            if ready(&context) {
+                break;
             }
+            // A Studio that is not running cannot connect within the wait; two
+            // empty probes in a row (not one failed listing) end it early, and
+            // a recent launch shows up as a process by the first check.
+            if Instant::now() >= next_process_check {
+                next_process_check = Instant::now() + Duration::from_millis(400);
+                if crate::studio::diagnosis::studio_process_ids().is_empty() {
+                    empty_probes += 1;
+                    if empty_probes >= 2 {
+                        no_studio = true;
+                        break;
+                    }
+                } else {
+                    empty_probes = 0;
+                }
+            }
+            thread::sleep(delay);
+            delay = (delay * 2).min(Duration::from_millis(400));
         }
         if !ready(&context) {
             if let Some(error) = bind_error {
@@ -881,10 +903,13 @@ fn daemon_control_request_inner(
                 .flatten()
                 .and_then(|result| result.get("clients")?.as_array().cloned())
                 .unwrap_or_default();
+            let verdict = crate::studio::diagnosis::verdict(&clients, project_root);
+            if no_studio {
+                bail!("No Studio runtime connected to this project. {verdict}");
+            }
             bail!(
-                "No Studio runtime connected to this project within {:.1}s. {}",
-                wait.as_secs_f64(),
-                crate::studio::diagnosis::verdict(&clients, project_root)
+                "No Studio runtime connected to this project within {:.1}s. {verdict}",
+                wait.as_secs_f64()
             );
         }
     }

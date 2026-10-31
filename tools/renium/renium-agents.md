@@ -8,17 +8,17 @@ Use `rbx` from the place's project folder.
 - Saved code/data: read files, use focused assertions, project checks or offline queries. Small edits do not require Play.
 - Unsaved Studio state: make one bounded live query; do not scan for data already saved locally.
 - Runtime behavior: use Play for a specific unanswered question about input, replication, physics or errors. Identify the expected result first.
-- Visual behavior: capture the real client with real input (`rs`, `inp`, `re`), then inspect `rf` frames. Script measurements cannot establish what the player sees. A screenshot checks one state; use recordings for motion.
+- Visual behavior: capture the real client with real input (`rs`, `inp`, `re`), then inspect `rf` frames. Script measurements cannot establish what the player sees.
 
 Check Luau syntax offline with `rbx ck FILE...`, never Studio `loadstring` or `LoadStringEnabled`. Project checks cover types, lint and behavior.
 
-With healthy Live Sync, trust file edits. Do not push, poll, reread Studio or start Play after each save. Use one `lst --wait` after a reported problem or when the next operation needs synchronization.
+With healthy Live Sync, trust file edits. Do not push, poll, reread Studio or start Play after each save. Use one `lst --wait` after a reported problem or when the next operation needs synchronization. A `ps` of more than 5 changes (default threshold) waits for a Studio review, skipped after 90 s unanswered; pass `--yes`.
 
 Reuse suitable Play sessions, batch related checks with the fewest clients, and do not stop a user's session. Wait with `rbx wait EXPR -t N`, never a shell loop of `l` calls.
 
 ## Read the relevant guide
 
-Read relevant guides once per session; reread after `rbx upd`.
+Read relevant guides once per session; reread one when a command reports it updated.
 
 | Task | Guide |
 |---|---|
@@ -58,9 +58,8 @@ Before Open Cloud uploads, follow `RENIUM/publishing-validation.md`: verify API-
 
 ## Tools and boundaries
 
-- Use project tools; report unavailable tools without hunting for executables.
 - Pass arguments or pipe JSON/code; do not create payload files.
-- Launch, close or replace Studio only when needed; `rbx ro` reopens a closed bound place. Never take focus or global input.
+- Open a place once with `rbx so FILE`; afterwards `rbx ro` reopens it. Both return once the place is connected. Never take focus or global input.
 - Do not back up the project: `rbx rev` restores affected files; Studio undo covers pushes.
 - Update with `rbx upd` when asked or an update is reported, then reread the guides.
 - On a Renium failure follow `RENIUM/bug-reports.md`: write, review every file for private data, upload, return the ID.

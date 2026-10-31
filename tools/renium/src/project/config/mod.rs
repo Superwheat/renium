@@ -75,6 +75,7 @@ pub(crate) fn drop_projection_cache() -> usize {
     cache.clear();
     entries
 }
+
 thread_local! {
     static NESTED_STAGE_STACK: RefCell<HashSet<PathBuf>> = RefCell::new(HashSet::new());
     static PROJECTION_TRANSFORM_STACK: RefCell<Vec<Vec<ProjectionTransform>>> = const { RefCell::new(Vec::new()) };

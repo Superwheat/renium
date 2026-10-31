@@ -2394,9 +2394,16 @@ pub(super) struct PushEditorChangesArgs {
         long
     )]
     pub(super) verify: bool,
-    #[arg(help = "Skip the Studio review", long)]
+    #[arg(
+        help = "Skip the Studio review and protected property writes (prefer --yes)",
+        long
+    )]
     pub(super) no_review: bool,
-    #[arg(help = "Apply without confirmation", long, alias = "apply")]
+    #[arg(
+        help = "Apply without the Studio review (a push of more than 5 changes opens one)",
+        long,
+        alias = "apply"
+    )]
     pub(super) yes: bool,
     #[arg(
         help = "Cache dir for renium-link git/wally sources, used when enforcing read-only link mirrors during a push. Overrides the manifest cacheDir",
@@ -2495,9 +2502,16 @@ pub(super) struct ApplyEditorPropertyArgs {
     pub(super) value_json: Option<String>,
     #[arg(help = "Read the value from this file", long, value_name = "PATH")]
     pub(super) source_file: Option<PathBuf>,
-    #[arg(help = "Skip the Studio review", long)]
+    #[arg(
+        help = "Skip the Studio review and protected property writes (prefer --yes)",
+        long
+    )]
     pub(super) no_review: bool,
-    #[arg(help = "Apply without confirmation", long, alias = "apply")]
+    #[arg(
+        help = "Apply without the Studio review (a push of more than 5 changes opens one)",
+        long,
+        alias = "apply"
+    )]
     pub(super) yes: bool,
 }
 

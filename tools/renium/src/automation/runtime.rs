@@ -1046,7 +1046,9 @@ fn studio_status_result(
     if !has_edit_client(&clients) {
         // A plugin reconnects within a second of the daemon starting; report it
         // rather than a transient gap.
-        if bridge.list_bridge_clients().is_empty() {
+        if bridge.list_bridge_clients().is_empty()
+            && crate::daemon::memory::uptime() < Duration::from_secs(3)
+        {
             bridge.wait_for_ready_channels_for_target(
                 1,
                 Duration::from_secs(2),
@@ -2760,6 +2762,8 @@ fn resolve_connected_context(
 ) -> std::result::Result<automation::BoundContext, automation::Failure> {
     let wait_seconds = connected_runtime_wait_seconds(state, context_id, wait_seconds);
     let deadline = Instant::now() + Duration::from_secs_f64(wait_seconds);
+    let mut next_process_check = Instant::now();
+    let mut empty_probes = 0;
     loop {
         match bound_context::resolve(state, bridge, context_id) {
             Ok(context) if context.runtime_id.is_some() => return Ok(context),
@@ -2767,7 +2771,22 @@ fn resolve_connected_context(
             Err(failure) if failure.0.rt == 1 => {}
             Err(failure) => return Err(failure),
         }
-        if Instant::now() >= deadline {
+        // With no Studio process and no launch under way nothing can connect;
+        // two empty probes a second apart answer now instead of at the deadline.
+        let mut no_studio = false;
+        if Instant::now() >= next_process_check {
+            next_process_check = Instant::now() + Duration::from_secs(1);
+            let launch_in_progress = state
+                .context(context_id)
+                .is_some_and(|context| state.studio_launch_in_progress(&context));
+            if !launch_in_progress && crate::studio::diagnosis::studio_process_ids().is_empty() {
+                empty_probes += 1;
+                no_studio = empty_probes >= 2;
+            } else {
+                empty_probes = 0;
+            }
+        }
+        if no_studio || Instant::now() >= deadline {
             let root = state
                 .context(context_id)
                 .map(|context| PathBuf::from(&context.root));
@@ -2926,8 +2945,9 @@ fn automation_execute_request(
         |operation| operation.name.to_string(),
     );
     let elapsed = started.elapsed().as_millis();
+    let level = if request.op == op::BIND { 4 } else { 3 };
     match &result {
-        Ok(_) => log_global(3, format_args!("[renium] {name} ok in {elapsed} ms")),
+        Ok(_) => log_global(level, format_args!("[renium] {name} ok in {elapsed} ms")),
         Err(failure) => log_global(
             3,
             format_args!(

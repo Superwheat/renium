@@ -2143,9 +2143,16 @@ fn install_windows_rbx_aliases(target_root: &Path) -> Result<()> {
             fs::remove_file(stale)?;
         }
     }
+    // Git Bash resolves `rbx` to rbx.exe by itself; the POSIX launcher only
+    // doubled the cost of every call, so neither root keeps one.
+    for stale in [target_root.join("rbx"), stable_root.join("rbx")] {
+        if stale.is_file() && is_renium_launcher(&stale) {
+            fs::remove_file(stale)?;
+        }
+    }
     for launcher in SHARED_CORE_LAUNCHERS {
         let source = target_root.join(launcher);
-        if source.is_file() {
+        if launcher != "rbx" && source.is_file() {
             fs::copy(source, stable_root.join(launcher))?;
         }
     }

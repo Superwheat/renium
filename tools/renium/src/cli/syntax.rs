@@ -20,7 +20,18 @@ pub(crate) struct CheckArgs {
 
 pub(crate) fn run(args: CheckArgs, project: Option<&Path>) -> Result<()> {
     let files = if args.files.is_empty() {
-        changed_luau_files(project)?
+        let files = changed_luau_files(project)?;
+        if files.is_empty() {
+            return print_json_output(
+                &json!({
+                    "ok": true,
+                    "checked": 0,
+                    "note": "git reports no changed .luau or .lua files; pass files or folders to check specific ones",
+                }),
+                false,
+            );
+        }
+        files
     } else {
         expand_folders(args.files)?
     };
@@ -101,14 +112,7 @@ fn changed_luau_files(project: Option<&Path>) -> Result<Vec<PathBuf>> {
         ".",
     ])
     .context("git status failed; pass the files or folders to check")?;
-    let files = changed_luau_paths(&listing, &top);
-    if files.is_empty() {
-        bail!(
-            "git reports no changed .luau or .lua files under {}; pass the files or folders to check",
-            scope.display()
-        );
-    }
-    Ok(files)
+    Ok(changed_luau_paths(&listing, &top))
 }
 
 fn changed_luau_paths(listing: &[u8], top: &Path) -> Vec<PathBuf> {

@@ -15,7 +15,7 @@ rbx po <PLACE_ID> <OTHER_PLACE_ID>
 
 Open Studio only with `rbx so FILE` or `rbx ro`. Renium starts it behind your windows without activation and blocks Studio's own foreground and focus calls while it loads and later (dialogs, Play windows), until the user selects it. A Studio started any other way (`Start-Process`, `Popen`, a double-click) is a child of the foreground app, so its self-activation after loading takes the foreground from the user; Renium cannot protect it. Keep the windows that matter restored, never minimized (capture guide).
 
-`ro` confirms launch, not bridge readiness. Run the needed Studio command next; it waits for the connection. `status -w SECONDS` waits while Studio is still starting and otherwise reports at once.
+`so` and `ro` return once the place is connected (120 s, or `-w` when larger; `--no-wait` returns after the launch), and a repeated `so FILE` reuses the Studio that has the place file open. With no Studio process, `status` and every Studio command answer at once; while one is starting, commands wait `-w` seconds (default 8, 30 after a launch).
 
 `--place DTE` matches the Studio window name, not `game.Name` (often `Place1`). Use a place ID or configured alias if the window title is unavailable. Duplicate window names require an unambiguous target. A project opened with `rbx so FILE` keeps selecting that Studio while others are open.
 

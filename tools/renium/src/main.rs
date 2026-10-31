@@ -154,6 +154,9 @@ fn run_cli() -> Result<()> {
         }
     }
     let mut cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+    if command_projects_its_own_fields(&matches) {
+        cli.fields.clear();
+    }
     app::output::prime_mode(&cli.output_mode);
     app::output::prime_fields(&cli.fields);
     if cli.backtrace {
@@ -246,8 +249,11 @@ fn checks_agent_update(command: &Commands) -> bool {
 
 fn refresh_agent_instructions(project: Option<&Path>) {
     match project::workflows::refresh_outdated_agent_instructions(project) {
-        Ok(true) => eprintln!("[renium] RENIUM.md was updated; reread it when convenient"),
-        Ok(false) => {}
+        Ok(changed) if !changed.is_empty() => eprintln!(
+            "[renium] updated {}; reread before the next Renium step",
+            changed.join(", ")
+        ),
+        Ok(_) => {}
         Err(error) => log_global(
             4,
             format_args!("[renium] agent instructions were not refreshed: {error:#}"),
@@ -301,9 +307,53 @@ fn checks_agent_instructions(command: &Commands) -> bool {
     )
 }
 
+/// A subcommand with its own `--fields` argument (`in`, `tr`, `f`, `bb`) shares
+/// the global option's id, so clap propagates its value, presets included, into
+/// the global projection; such a command renders its own fields instead.
+fn command_projects_its_own_fields(matches: &clap::ArgMatches) -> bool {
+    let mut command = cli::command();
+    let mut matches = matches;
+    while let Some((name, sub_matches)) = matches.subcommand() {
+        let Some(sub_command) = command.find_subcommand(name) else {
+            return false;
+        };
+        if sub_command
+            .get_arguments()
+            .any(|arg| arg.get_id() == "fields" && !arg.is_global_set())
+        {
+            return true;
+        }
+        command = sub_command.clone();
+        matches = sub_matches;
+    }
+    false
+}
+
 #[cfg(test)]
 mod startup_policy_tests {
     use super::*;
+
+    #[test]
+    fn a_command_with_its_own_fields_argument_keeps_the_global_projection_off() {
+        for arguments in [
+            vec!["rbx", "in", "Workspace", "Baseplate"],
+            vec!["rbx", "in", "Workspace", "Baseplate", "-F", "id,n,c"],
+            vec!["rbx", "tr", "Workspace", "-F", "all"],
+            vec!["rbx", "f", "Workspace", "-n", "Door"],
+            vec!["rbx", "bb", "Workspace", "-F", "id,n"],
+        ] {
+            let matches = cli::command().try_get_matches_from(arguments).unwrap();
+            assert!(command_projects_its_own_fields(&matches));
+        }
+        for arguments in [
+            vec!["rbx", "--fields", "ok", "dr"],
+            vec!["rbx", "status", "--fields", "ok,playState"],
+            vec!["rbx", "lst"],
+        ] {
+            let matches = cli::command().try_get_matches_from(arguments).unwrap();
+            assert!(!command_projects_its_own_fields(&matches));
+        }
+    }
 
     #[test]
     fn native_probe_has_no_background_startup_work() {

@@ -62,7 +62,10 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
         "report",
         "Examples:\n  rbx report -m \"lon dropped my Lighting edit after the pull\"\n  rbx report --since 30 --no-transcript",
     ),
-    ("docs", "Examples:\n  rbx docs sync"),
+    (
+        "docs",
+        "Examples:\n  rbx docs sync\n  rbx docs playtest\n  rbx docs",
+    ),
     ("dm", "Examples:\n  rbx dm list"),
     ("so", "Examples:\n  rbx so Place.rbxl"),
     ("ro", "Examples:\n  rbx ro Place.rbxl"),
@@ -75,7 +78,7 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ),
     (
         "ip",
-        "Examples:\n  rbx ip car.rbxm --destination ServerStorage.Cars",
+        "Examples:\n  rbx ip ./Shared.server.luau --path-json '[\"ServerScriptService\",\"Shared\"]'\n  rbx ip ./SharedFolder --destination src/ReplicatedStorage/Shared --dry-run\n  rbx mip ServerStorage -I editor:parent -m car.rbxm   # model files",
     ),
     (
         "cr",

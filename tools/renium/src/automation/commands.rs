@@ -15,10 +15,83 @@ use crate::daemon::{daemon_control_request, daemon_project_root};
 use crate::project::config;
 
 const STATUS_DEADLINE: Duration = Duration::from_secs(10);
+const STUDIO_CONNECT_WAIT_SECONDS: f64 = 120.0;
+
+/// After a launch (or the reuse of an open Studio), waits until that process
+/// is connected as an Edit client or gives up, so the next command finds a
+/// connected runtime. `so` and `ro` return at once with `--no-wait`.
+pub(crate) fn wait_for_launched_studio(
+    project: Option<&Path>,
+    result: &mut Value,
+    wait_seconds: f64,
+) -> Result<()> {
+    let Some(pid) = result
+        .get("pid")
+        .and_then(Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+    else {
+        return Ok(());
+    };
+    let root = daemon_project_root(project);
+    let started = Instant::now();
+    let wait = if wait_seconds.is_finite() {
+        wait_seconds.clamp(STUDIO_CONNECT_WAIT_SECONDS, 3600.0)
+    } else {
+        STUDIO_CONNECT_WAIT_SECONDS
+    };
+    let deadline = started + Duration::from_secs_f64(wait);
+    let mut delay = Duration::from_millis(250);
+    let mut empty_probes = 0;
+    loop {
+        let clients = daemon_control_request(op::STUDIOS, root, json!({}), false)?
+            .get("clients")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if clients.iter().any(|client| {
+            client["pid"].as_u64() == Some(u64::from(pid)) && client["role"] == "edit"
+        }) {
+            let object = result
+                .as_object_mut()
+                .context("Studio launch result must be an object")?;
+            object.insert("connected".to_string(), json!(true));
+            object.insert(
+                "connectSeconds".to_string(),
+                json!((started.elapsed().as_secs_f64() * 10.0).round() / 10.0),
+            );
+            return Ok(());
+        }
+        let diagnosis = crate::studio::diagnosis::diagnose(&clients, root);
+        let verdict = diagnosis["verdict"].as_str().unwrap_or_default();
+        let listed = |key: &str| {
+            diagnosis[key]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item["pid"] == json!(pid)))
+        };
+        // Two empty probes in a row distinguish an exited Studio from a
+        // process listing that failed once.
+        if crate::studio::diagnosis::studio_process_ids().contains(&pid) {
+            empty_probes = 0;
+        } else {
+            empty_probes += 1;
+            if empty_probes >= 2 {
+                bail!("Studio (pid {pid}) exited before it connected. {verdict}");
+            }
+        }
+        if listed("openFailures") || listed("startupHangs") {
+            bail!("Studio (pid {pid}) could not open the place. {verdict}");
+        }
+        if Instant::now() >= deadline {
+            bail!("Studio (pid {pid}) has not connected within {wait:.0}s. {verdict}");
+        }
+        thread::sleep(delay);
+        delay = (delay * 2).min(Duration::from_secs(1));
+    }
+}
 
 #[derive(Args)]
 pub(crate) struct StudioStatusArgs {
-    #[arg(long)]
+    #[arg(help = "Include Studios bound to other projects", long)]
     all: bool,
     #[command(flatten)]
     bridge: BridgeConnectionArgs,
@@ -26,16 +99,30 @@ pub(crate) struct StudioStatusArgs {
 
 #[derive(Args)]
 pub(crate) struct StudioReopenArgs {
+    #[arg(help = "Place file to open instead of the remembered one")]
     file: Option<PathBuf>,
+    #[arg(
+        help = "Return right after the launch instead of waiting for the place to connect",
+        long
+    )]
+    no_wait: bool,
     #[command(flatten)]
     bridge: BridgeConnectionArgs,
 }
 
 #[derive(Args)]
 pub(crate) struct StudioCloseArgs {
-    #[arg(long, conflicts_with = "terminate")]
+    #[arg(
+        help = "Save a local place file, then close",
+        long,
+        conflicts_with = "terminate"
+    )]
     save: bool,
-    #[arg(long, conflicts_with = "save")]
+    #[arg(
+        help = "Close without saving (unsaved local edits are lost)",
+        long,
+        conflicts_with = "save"
+    )]
     terminate: bool,
     #[command(flatten)]
     bridge: BridgeConnectionArgs,
@@ -253,13 +340,17 @@ fn studio_status_result(args: &StudioStatusArgs, project: Option<&Path>) -> Resu
 }
 
 pub(crate) fn studio_reopen(args: StudioReopenArgs, project: Option<&Path>) -> Result<()> {
-    run_daemon(
+    let mut result = daemon_result(
         op::STUDIO_OPEN,
         project,
         json!({ "file": args.file }),
         true,
         Some(&args.bridge),
-    )
+    )?;
+    if !args.no_wait {
+        wait_for_launched_studio(project, &mut result, args.bridge.wait_seconds)?;
+    }
+    app::output::print_json_output(&result, false)
 }
 
 pub(crate) fn studio_close(args: StudioCloseArgs, project: Option<&Path>) -> Result<()> {
