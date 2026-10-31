@@ -551,12 +551,20 @@ pub(crate) fn stabilize_reference_output(
     });
 }
 
+struct HighLevelSelection {
+    service: String,
+    value: Option<String>,
+    /// The value is the dotted path that followed the service in one positional.
+    path_from_service: bool,
+}
+
 fn high_level_service_and_value(
     explicit_service: Option<&str>,
     first: Option<&str>,
     second: Option<&str>,
     command: &str,
-) -> Result<(String, Option<String>)> {
+    known_service: impl Fn(&str) -> bool,
+) -> Result<HighLevelSelection> {
     if let Some(service) = explicit_service.filter(|value| !value.trim().is_empty()) {
         let value = match (first, second) {
             (Some(first), Some(second))
@@ -568,7 +576,11 @@ fn high_level_service_and_value(
             (_, Some(second)) if !second.trim().is_empty() => Some(second.to_string()),
             _ => None,
         };
-        return Ok((service.to_string(), value));
+        return Ok(HighLevelSelection {
+            service: service.to_string(),
+            value,
+            path_from_service: false,
+        });
     }
 
     let service = first
@@ -577,7 +589,49 @@ fn high_level_service_and_value(
     let value = second
         .filter(|value| !value.trim().is_empty())
         .map(ToString::to_string);
-    Ok((service.to_string(), value))
+    if value.is_none()
+        && let Some((service, path)) = split_leading_service(service, known_service)
+    {
+        return Ok(HighLevelSelection {
+            service,
+            value: Some(path),
+            path_from_service: true,
+        });
+    }
+    Ok(HighLevelSelection {
+        service: service.to_string(),
+        value,
+        path_from_service: false,
+    })
+}
+
+/// `StarterGui.Main.HUD.Timer` given as the only positional names the service
+/// first; the rest is the dotted path inside it.
+fn split_leading_service(
+    raw: &str,
+    known_service: impl Fn(&str) -> bool,
+) -> Option<(String, String)> {
+    let (service, path) = raw.trim().split_once(['.', '/', '\\'])?;
+    let service = service.trim();
+    let path = path.trim();
+    if service.is_empty() || path.is_empty() || !known_service(service) {
+        return None;
+    }
+    Some((service.to_string(), path.to_string()))
+}
+
+/// A sync service class, or any service whose store the project holds.
+fn project_knows_service(project_root: &Path, src_root: &Path, name: &str) -> bool {
+    if crate::roblox::services::DEFAULT_SYNC_SERVICES.contains(&name) {
+        return true;
+    }
+    if validate_filesystem_instance_name(name, "service").is_err() {
+        return false;
+    }
+    let Ok((project_root, src_root)) = configured_project_layout(project_root, src_root) else {
+        return false;
+    };
+    service_settings_path(&absolutize_under(&project_root, &src_root).join(name)).is_file()
 }
 
 pub(super) fn high_level_split_path(raw: &str) -> Vec<String> {
@@ -1302,12 +1356,19 @@ fn high_level_response(ctx: HighLevelBytecodeContext, mode: OutputMode) -> Map<S
 }
 
 pub(super) fn find_command(args: FindArgs) -> Result<()> {
-    let (service, query_text) = high_level_service_and_value(
+    let selection = high_level_service_and_value(
         args.service.as_deref(),
         args.query_or_service.as_deref(),
         args.query.as_deref(),
         "find",
+        |name| project_knows_service(&args.project.project_root, &args.project.src_root, name),
     )?;
+    let service = selection.service;
+    let (query_text, path_from_service) = if selection.path_from_service {
+        (None, selection.value)
+    } else {
+        (selection.value, None)
+    };
     let ctx = high_level_context(&args.project.project_root, &args.project.src_root, &service)?;
     let mode = OutputMode::parse(&args.output)?;
     let fields = parse_requested_fields(Some(args.fields.as_str()));
@@ -1316,7 +1377,8 @@ pub(super) fn find_command(args: FindArgs) -> Result<()> {
     let scope_path = args
         .path
         .as_deref()
-        .filter(|value| !value.trim().is_empty());
+        .filter(|value| !value.trim().is_empty())
+        .or(path_from_service.as_deref());
     let has_structured_filters = args.name.as_deref().is_some_and(|value| !value.is_empty())
         || args
             .class_name
@@ -1438,11 +1500,16 @@ pub(super) fn find_command(args: FindArgs) -> Result<()> {
 }
 
 pub(super) fn tree_command(args: TreeArgs) -> Result<()> {
-    let (service, positional) = high_level_service_and_value(
+    let HighLevelSelection {
+        service,
+        value: positional,
+        ..
+    } = high_level_service_and_value(
         args.target.service.as_deref(),
         args.target.service_or_target.as_deref(),
         args.target.target.as_deref(),
         "tree",
+        |name| project_knows_service(&args.project.project_root, &args.project.src_root, name),
     )?;
     let ctx = high_level_context(&args.project.project_root, &args.project.src_root, &service)?;
     let mode = OutputMode::parse(&args.output)?;
@@ -1485,11 +1552,16 @@ pub(super) fn tree_command(args: TreeArgs) -> Result<()> {
 }
 
 pub(super) fn inspect_command(args: InspectArgs) -> Result<()> {
-    let (service, positional) = high_level_service_and_value(
+    let HighLevelSelection {
+        service,
+        value: positional,
+        ..
+    } = high_level_service_and_value(
         args.target.service.as_deref(),
         args.target.service_or_target.as_deref(),
         args.target.target.as_deref(),
         "inspect",
+        |name| project_knows_service(&args.project.project_root, &args.project.src_root, name),
     )?;
     let ctx = high_level_context(&args.project.project_root, &args.project.src_root, &service)?;
     let mode = OutputMode::parse(&args.output)?;
@@ -1601,7 +1673,138 @@ pub(super) fn bytecode_get_property(mut args: BytecodeGetPropertyArgs) -> Result
     {
         return print_json_output(&value, args.pretty);
     }
-    bail!("Property not found: {property}")
+    bail!(
+        "{}",
+        property_not_found_message(&document.instances[index], &service, &property, scope)
+    )
+}
+
+const PROPERTY_CANDIDATE_LIMIT: usize = 5;
+
+fn property_not_found_message(
+    instance: &SettingsBytecodeInstance,
+    service: &str,
+    property: &str,
+    scope: PropertyScope,
+) -> String {
+    let (label, stored): (&str, Vec<&str>) = match scope {
+        PropertyScope::Attribute => (
+            "stored attributes include",
+            instance.attributes.keys().map(String::as_str).collect(),
+        ),
+        PropertyScope::Auto => (
+            "stored properties include",
+            instance
+                .properties
+                .keys()
+                .chain(instance.attributes.keys())
+                .map(String::as_str)
+                .collect(),
+        ),
+        _ => (
+            "stored properties include",
+            instance.properties.keys().map(String::as_str).collect(),
+        ),
+    };
+    let stored = closest_property_names(property, stored);
+    let known = if matches!(scope, PropertyScope::Auto | PropertyScope::Property) {
+        closest_property_names(property, reflected_property_names(&instance.class_name))
+            .into_iter()
+            .filter(|name| !stored.iter().any(|seen| seen.eq_ignore_ascii_case(name)))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let mut message = format!("Property not found: {property}");
+    if !stored.is_empty() {
+        message.push_str(&format!("; {label} {}", stored.join(", ")));
+    }
+    if !known.is_empty() {
+        message.push_str(&format!(
+            "; {} properties include {}",
+            instance.class_name,
+            known.join(", ")
+        ));
+    }
+    message.push_str(&format!(
+        " (rbx in {service} {} -F props lists all)",
+        instance.name
+    ));
+    message
+}
+
+fn reflected_property_names(class_name: &str) -> Vec<&'static str> {
+    let Ok(database) = rbx_reflection_database::get() else {
+        return Vec::new();
+    };
+    let Some(class) = database.classes.get(class_name) else {
+        return Vec::new();
+    };
+    database
+        .superclasses_iter(class)
+        .flat_map(|class| class.properties.values())
+        .filter(|property| {
+            matches!(
+                property.kind,
+                rbx_reflection::PropertyKind::Canonical { .. }
+            )
+        })
+        .map(|property| property.name)
+        .collect()
+}
+
+/// Up to five names close to `wanted`: case-insensitive substring matches
+/// first, then the smallest edit distance, ties by name. A name that shares
+/// a long prefix (AssetType for AssetId) counts as well.
+fn closest_property_names<'a>(
+    wanted: &str,
+    names: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let wanted_lower = wanted.to_ascii_lowercase();
+    let distance_limit = (wanted_lower.len() / 2).max(2);
+    let prefix_limit = (wanted_lower.len() / 2).max(3);
+    let mut seen = HashSet::new();
+    let mut ranked = Vec::new();
+    for name in names {
+        let lower = name.to_ascii_lowercase();
+        if !seen.insert(lower.clone()) {
+            continue;
+        }
+        let substring = lower.contains(&wanted_lower) || wanted_lower.contains(&lower);
+        let distance = edit_distance(&wanted_lower, &lower);
+        let shared_prefix = wanted_lower
+            .bytes()
+            .zip(lower.bytes())
+            .take_while(|(left, right)| left == right)
+            .count();
+        if substring || distance <= distance_limit || shared_prefix >= prefix_limit {
+            ranked.push((!substring, distance, name));
+        }
+    }
+    ranked.sort_unstable();
+    ranked
+        .into_iter()
+        .take(PROPERTY_CANDIDATE_LIMIT)
+        .map(|(_, _, name)| name.to_string())
+        .collect()
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let left = left.chars().collect::<Vec<_>>();
+    let right = right.chars().collect::<Vec<_>>();
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    let mut current = vec![0; right.len() + 1];
+    for (row, left_char) in left.iter().enumerate() {
+        current[0] = row + 1;
+        for (column, right_char) in right.iter().enumerate() {
+            let substitution = previous[column] + usize::from(left_char != right_char);
+            current[column + 1] = substitution
+                .min(previous[column + 1] + 1)
+                .min(current[column] + 1);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
 }
 
 pub(crate) fn get_property_name(args: &mut BytecodeGetPropertyArgs) -> Result<String> {
@@ -3142,6 +3345,107 @@ pub(super) fn acquire_settings_file_lock(settings_file: &Path) -> Result<Setting
         "Timed out waiting for settings file lock: {}",
         settings_file.display()
     )
+}
+
+#[cfg(test)]
+mod service_split_tests {
+    use super::{high_level_service_and_value, split_leading_service};
+
+    fn known(name: &str) -> bool {
+        matches!(name, "StarterGui" | "Workspace" | "Chat")
+    }
+
+    #[test]
+    fn one_dotted_positional_starting_with_a_service_splits_there() {
+        assert_eq!(
+            split_leading_service("StarterGui.Main.HUD.Timer", known),
+            Some(("StarterGui".to_string(), "Main.HUD.Timer".to_string()))
+        );
+        assert_eq!(
+            split_leading_service("Chat/Channels", known),
+            Some(("Chat".to_string(), "Channels".to_string()))
+        );
+        assert_eq!(split_leading_service("Lobby.Door", known), None);
+        assert_eq!(split_leading_service("Workspace", known), None);
+        assert_eq!(split_leading_service("Workspace.", known), None);
+
+        let selection = high_level_service_and_value(
+            None,
+            Some("StarterGui.Main.HUD.Timer"),
+            None,
+            "tree",
+            known,
+        )
+        .unwrap();
+        assert_eq!(selection.service, "StarterGui");
+        assert_eq!(selection.value.as_deref(), Some("Main.HUD.Timer"));
+        assert!(selection.path_from_service);
+
+        let explicit = high_level_service_and_value(
+            None,
+            Some("StarterGui"),
+            Some("Main.HUD.Timer"),
+            "tree",
+            known,
+        )
+        .unwrap();
+        assert_eq!(explicit.service, "StarterGui");
+        assert_eq!(explicit.value.as_deref(), Some("Main.HUD.Timer"));
+        assert!(!explicit.path_from_service);
+
+        let flagged = high_level_service_and_value(
+            Some("StarterGui"),
+            Some("Main.HUD.Timer"),
+            None,
+            "tree",
+            known,
+        )
+        .unwrap();
+        assert_eq!(flagged.service, "StarterGui");
+        assert_eq!(flagged.value.as_deref(), Some("Main.HUD.Timer"));
+        assert!(!flagged.path_from_service);
+
+        let unknown =
+            high_level_service_and_value(None, Some("Lobby.Door"), None, "tree", known).unwrap();
+        assert_eq!(unknown.service, "Lobby.Door");
+        assert_eq!(unknown.value, None);
+    }
+}
+
+#[cfg(test)]
+mod property_candidate_tests {
+    use super::{closest_property_names, edit_distance};
+
+    #[test]
+    fn candidates_rank_substrings_before_near_misses_and_stop_at_five() {
+        assert_eq!(edit_distance("assetid", "asset"), 2);
+        assert_eq!(edit_distance("", "abc"), 3);
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
+        assert_eq!(
+            closest_property_names(
+                "AssetId",
+                ["Transparency", "AssetType", "Asset", "MeshId", "asset"]
+            ),
+            ["Asset", "AssetType"]
+        );
+        let names = [
+            "AssetType",
+            "Asset",
+            "AssetIds",
+            "AssetIdx",
+            "AssetIdy",
+            "AssetIdz",
+        ];
+        assert_eq!(
+            closest_property_names("AssetId", names),
+            ["AssetIds", "AssetIdx", "AssetIdy", "AssetIdz", "Asset"]
+        );
+        assert_eq!(
+            closest_property_names("Colour", ["Color", "Size", "Anchored"]),
+            ["Color"]
+        );
+        assert!(closest_property_names("Velocity", ["Size", "Anchored"]).is_empty());
+    }
 }
 
 #[cfg(test)]

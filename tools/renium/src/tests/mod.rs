@@ -517,6 +517,56 @@ fn get_property_source_falls_back_to_externalized_mirror() {
 }
 
 #[test]
+fn missing_property_error_names_the_closest_stored_and_class_properties() {
+    let dir = temp_dir("get-property-candidates");
+    let service_dir = dir.join("src").join("Workspace");
+    fs::create_dir_all(&service_dir).unwrap();
+    let settings_file = service_settings_path(&service_dir);
+    let mut thing = settings_instance("editor:1", "Thing", "Model", Some(0));
+    for (name, value) in [
+        ("Asset", Value::String("rbxassetid://1".to_string())),
+        ("AssetType", Value::String("Mesh".to_string())),
+        ("Transparency", Value::from(0.0)),
+    ] {
+        thing.properties.insert(name.to_string(), value);
+    }
+    settings_document(vec![
+        settings_instance("root", "Workspace", "Workspace", None),
+        thing,
+    ])
+    .write_file(&settings_file)
+    .unwrap();
+    let property = |name: &str| {
+        BytecodeGetPropertyArgs::try_parse_from([
+            "bytecode-get-property",
+            "-f",
+            settings_file.to_string_lossy().as_ref(),
+            "-n",
+            "Thing",
+            "-p",
+            name,
+        ])
+        .unwrap()
+    };
+    let err = bytecode_get_property(property("AssetId"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.starts_with("Property not found: AssetId; stored properties include Asset, AssetType"),
+        "{err}"
+    );
+    assert!(
+        err.ends_with("(rbx in Workspace Thing -F props lists all)"),
+        "{err}"
+    );
+    let err = bytecode_get_property(property("WorldPivo"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("Model properties include WorldPivot"), "{err}");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn get_property_returns_the_nil_default_for_an_unset_reference() {
     let dir = temp_dir("get-unset-reference");
     let service_dir = dir.join("src").join("Workspace");

@@ -11,7 +11,9 @@ use full_moon::node::Node;
 use full_moon::visitors::Visitor;
 use serde_json::{Map, Value, json};
 
-use crate::app::output::{ensure_luau_api_ok, ensure_plugin_api_ok, log_global, print_json_output};
+use crate::app::output::{
+    ReportedFailure, ensure_luau_api_ok, ensure_plugin_api_ok, log_global, print_json_output,
+};
 use crate::app::timing::current_millis;
 use crate::automation::{commands::daemon_result, op};
 use crate::cli::{
@@ -534,7 +536,14 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
             false,
         );
         match wait {
-            Ok(wait) => result["until"] = wait,
+            Ok(wait) => {
+                let timed_out = wait.get("ok") == Some(&Value::Bool(false));
+                result["until"] = wait;
+                if timed_out {
+                    print_json_output(&result, false)?;
+                    return Err(ReportedFailure.into());
+                }
+            }
             Err(error) => {
                 print_json_output(&result, false)?;
                 return Err(error);
@@ -2644,6 +2653,23 @@ pub(crate) fn type_result(args: &TypeArgs, bridge: &BridgeServer) -> Result<Valu
     }))
 }
 
+/// The body of the probe function a wait runs each check: a single expression
+/// is returned from it, and a chunk (statements with their own `return`) runs
+/// as is.
+fn wait_condition_body(condition: &str) -> Result<String> {
+    let expression = format!("return ({condition}\n)");
+    match validate_luau_syntax(&expression) {
+        Ok(()) => Ok(expression),
+        Err(expression_error) => {
+            if validate_luau_syntax(condition).is_ok() {
+                return Ok(condition.to_string());
+            }
+            Err(expression_error
+                .context("The condition is neither a Luau expression nor a chunk that returns one"))
+        }
+    }
+}
+
 pub(crate) fn wait_until_result(args: &WaitUntilArgs, bridge: &BridgeServer) -> Result<Value> {
     let client = args.client || args.player.is_some();
     let player = args.player.as_deref();
@@ -2654,6 +2680,7 @@ pub(crate) fn wait_until_result(args: &WaitUntilArgs, bridge: &BridgeServer) -> 
     if !args.timeout.is_finite() || !args.interval.is_finite() {
         bail!("--timeout and --interval must be finite numbers");
     }
+    let body = wait_condition_body(&args.condition)?;
     let timeout = args.timeout.clamp(0.1, 3600.0);
     let interval = args.interval.clamp(0.05, 10.0);
     let started = Instant::now();
@@ -2661,23 +2688,32 @@ pub(crate) fn wait_until_result(args: &WaitUntilArgs, bridge: &BridgeServer) -> 
     loop {
         let remaining = timeout - started.elapsed().as_secs_f64();
         if remaining <= 0.0 {
-            bail!(
-                "Timed out after {timeout}s waiting for condition (last value: {detail}); \
-                 raise -t, or use rbx l --detach for a sampler"
-            );
+            return Ok(json!({
+                "ok": false,
+                "action": "wait",
+                "condition": args.condition,
+                "timedOut": true,
+                "value": detail,
+                "elapsedSeconds": started.elapsed().as_secs_f64(),
+                "error": format!(
+                    "Timed out after {timeout}s waiting for condition (last value: {detail}); \
+                     raise -t, or use rbx l --detach for a sampler"
+                ),
+            }));
         }
         let slice = remaining.min(WAIT_RUNNER_SLICE_SECONDS);
         let code = format!(
             "local deadline = os.clock() + {slice}\n\
              local detail = nil\n\
              \twhile true do\n\
-             \t\tlocal ok, value = pcall(function() return ({condition}) end)\n\
+             \t\tlocal ok, value = pcall(function()\n\
+             {body}\n\
+             \t\tend)\n\
              \t\tdetail = value\n\
              \t\tif ok and value then return true, tostring(value) end\n\
              \t\tif os.clock() >= deadline then return false, tostring(detail) end\n\
              \t\ttask.wait({interval})\n\
              \tend",
-            condition = args.condition,
         );
         let outcome = run_luau_task(bridge, target, player, &code, slice + 5.0)?;
         if outcome.success {
@@ -3148,7 +3184,11 @@ fn run_input_command(
     if crate::app::output::compact_text_output() {
         compact_input_result(operation, &mut result, requested_output.as_ref());
     }
-    print_json_output(&result, false)
+    print_json_output(&result, false)?;
+    if result.get("ok") == Some(&Value::Bool(false)) {
+        return Err(ReportedFailure.into());
+    }
+    Ok(())
 }
 
 /// Text mode keeps a capture's verdict (`moved`, a note when the camera did
@@ -4249,6 +4289,34 @@ mod compact_result_tests {
         assert_eq!(
             wait,
             json!({"ok": true, "value": "true", "elapsedSeconds": 0.2})
+        );
+    }
+}
+
+#[cfg(test)]
+mod wait_condition_tests {
+    use super::wait_condition_body;
+
+    #[test]
+    fn single_expressions_are_returned_and_chunks_run_as_written() {
+        let expression = wait_condition_body("workspace:FindFirstChild('P') ~= nil").unwrap();
+        assert_eq!(
+            expression,
+            "return (workspace:FindFirstChild('P') ~= nil\n)"
+        );
+        assert_eq!(
+            wait_condition_body("#game.Players:GetPlayers() == 2 -- both joined").unwrap(),
+            "return (#game.Players:GetPlayers() == 2 -- both joined\n)"
+        );
+        let chunk = "local p = workspace:FindFirstChild('P'); return p ~= nil";
+        assert_eq!(wait_condition_body(chunk).unwrap(), chunk);
+        let looped = "for _, part in workspace:GetChildren() do\n\tif part.Name == 'P' then return true end\nend\nreturn false";
+        assert_eq!(wait_condition_body(looped).unwrap(), looped);
+        assert_eq!(wait_condition_body("return true").unwrap(), "return true");
+        let error = format!("{:#}", wait_condition_body("workspace.P ==").unwrap_err());
+        assert!(
+            error.starts_with("The condition is neither a Luau expression nor a chunk"),
+            "{error}"
         );
     }
 }

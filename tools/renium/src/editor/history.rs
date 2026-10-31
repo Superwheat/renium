@@ -10,6 +10,7 @@ use walkdir::WalkDir;
 
 use crate::app::output::{log_global, print_json_output};
 use crate::app::timing::current_millis;
+use crate::automation::reconcile::history as sync_history;
 use crate::bytecode::{
     acquire_settings_file_lock, apply_file_mutations, collect_source_path_updates,
     file_mutation_paths,
@@ -324,9 +325,17 @@ pub(crate) fn editor_revert(mut args: EditorRevertArgs) -> Result<()> {
     apply_configured_project_layout(&mut args.project_root, &mut args.src_dir)?;
     let project_root = resolve_project_root_if_present(&args.project_root)?;
     let src_root = absolutize_under(&project_root, &args.src_dir);
+    let requested_path = args
+        .path
+        .as_ref()
+        .map(|path| absolutize_under(&project_root, path));
     if let Some(id) = &args.sync {
-        let restored =
-            crate::automation::reconcile::history::revert_sync(&project_root, &src_root, id)?;
+        if let Some(path) = requested_path.as_deref() {
+            let relative = project_relative_path(&project_root, path)?;
+            let file = sync_history::sync_entry_file(&project_root, &src_root, id, &relative)?;
+            return revert_sync_entry_file(args, project_root, file);
+        }
+        let restored = sync_history::revert_sync(&project_root, &src_root, id)?;
         let mut output = json!({
             "ok": true,
             "historyId": restored.id,
@@ -346,20 +355,16 @@ pub(crate) fn editor_revert(mut args: EditorRevertArgs) -> Result<()> {
         }
         return print_json_output(&output, false);
     }
-    let requested_path = args
-        .path
-        .as_ref()
-        .map(|path| absolutize_under(&project_root, path));
     if requested_path.is_none() && args.settings_id.is_none() {
         bail!("Provide --path, --settings-id, or --sync ID|latest");
     }
 
     let history_root = project_root.join(".renium").join("editor-history");
-    let manifest_path = match requested_path
+    let newest_manifest = match requested_path
         .as_ref()
         .and_then(|path| history_manifest_from_request(&history_root, path))
     {
-        Some(path) => path,
+        Some(path) => Some(path),
         None => find_newest_history_manifest(
             &project_root,
             &history_root,
@@ -367,6 +372,14 @@ pub(crate) fn editor_revert(mut args: EditorRevertArgs) -> Result<()> {
             args.settings_id.as_deref(),
             requested_path.as_deref().map(path_key).as_deref(),
         )?,
+    };
+    let manifest_path = match (newest_manifest, requested_path.as_deref()) {
+        (Some(path), _) => path,
+        (None, Some(path)) => {
+            let file = newest_history_file(&project_root, path)?;
+            return revert_sync_entry_file(args, project_root, file);
+        }
+        (None, None) => bail!("No editor revert history found for the requested item"),
     };
     if args.print {
         let source = history_source_backup(&manifest_path)?;
@@ -378,6 +391,57 @@ pub(crate) fn editor_revert(mut args: EditorRevertArgs) -> Result<()> {
     let (mut output, changed_paths) =
         revert_history_manifest(&project_root, &src_root, &manifest_path)?;
     if let Some(studio) = apply_reverted_paths(args, project_root, changed_paths)? {
+        output["studio"] = studio;
+    }
+    print_json_output(&output, false)
+}
+
+fn project_relative_path(project_root: &Path, path: &Path) -> Result<PathBuf> {
+    let relative = path.strip_prefix(project_root).with_context(|| {
+        format!(
+            "{} is outside the project {}",
+            path.display(),
+            project_root.display()
+        )
+    })?;
+    Ok(relative
+        .components()
+        .filter(|component| !matches!(component, std::path::Component::CurDir))
+        .collect())
+}
+
+/// The newest sync history entry that saved `path`, for a file the editor
+/// history never recorded.
+fn newest_history_file(project_root: &Path, path: &Path) -> Result<sync_history::SyncEntryFile> {
+    let relative = project_relative_path(project_root, path)?;
+    sync_history::newest_sync_entry_holding(project_root, &relative)?.with_context(|| {
+        format!(
+            "No editor revert history (.renium/editor-history) or sync history (.renium/editor-history/sync) holds {}; rbx rev --sync latest restores the newest sync",
+            relative.display()
+        )
+    })
+}
+
+fn revert_sync_entry_file(
+    args: EditorRevertArgs,
+    project_root: PathBuf,
+    file: sync_history::SyncEntryFile,
+) -> Result<()> {
+    if args.print {
+        std::io::stdout()
+            .write_all(&file.bytes)
+            .context("Failed to write the saved file content")?;
+        return Ok(());
+    }
+    let restored = sync_history::restore_sync_entry_file(&project_root, &file)?;
+    let mut output = json!({
+        "ok": true,
+        "historyId": file.id,
+        "sync": true,
+        "sourcePath": path_to_sourcemap_relative(&project_root, &restored),
+        "changedPathCount": 1,
+    });
+    if let Some(studio) = apply_reverted_paths(args, project_root, vec![restored])? {
         output["studio"] = studio;
     }
     print_json_output(&output, false)
@@ -417,7 +481,7 @@ fn find_newest_history_manifest(
     service: Option<&str>,
     settings_id: Option<&str>,
     requested_path_key: Option<&str>,
-) -> Result<PathBuf> {
+) -> Result<Option<PathBuf>> {
     let mut candidates = Vec::new();
     if history_root.exists() {
         for entry in WalkDir::new(history_root) {
@@ -449,11 +513,7 @@ fn find_newest_history_manifest(
         }
     }
     candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
-    candidates
-        .into_iter()
-        .next()
-        .map(|(_, path)| path)
-        .context("No editor revert history found for requested path/item")
+    Ok(candidates.into_iter().next().map(|(_, path)| path))
 }
 
 #[derive(Deserialize)]
@@ -1340,6 +1400,66 @@ mod tests {
         );
         let without_source = project.write_entry("2-0-Workspace-a", Some(&backup), None, &[]);
         assert!(history_source_backup(&without_source).is_err());
+    }
+
+    #[test]
+    fn a_file_without_editor_history_falls_back_to_sync_history_or_names_both_stores() {
+        let (_, current) = deleted_script_fixture();
+        let project = HistoryProject::new(&current);
+        let history_root = project.root.join(".renium").join("editor-history");
+        let requested = project.root.join("src").join("Workspace").join("A.luau");
+        assert!(
+            find_newest_history_manifest(
+                &project.root,
+                &history_root,
+                None,
+                None,
+                Some(&path_key(&requested)),
+            )
+            .expect("empty history reads")
+            .is_none()
+        );
+        let error = format!(
+            "{:#}",
+            newest_history_file(&project.root, &requested).expect_err("no history at all")
+        );
+        assert!(error.contains("No editor revert history"), "{error}");
+        assert!(error.contains("sync history"), "{error}");
+        assert!(error.contains("rbx rev --sync latest"), "{error}");
+        assert!(newest_history_file(&project.root, Path::new("/elsewhere/A.luau")).is_err());
+
+        let relative = PathBuf::from("src/Workspace/A.luau");
+        let paths = HashSet::from([relative.clone()]);
+        let before = crate::automation::reconcile::ProjectSnapshot {
+            entries: BTreeMap::from([(
+                relative.clone(),
+                crate::automation::reconcile::SnapshotEntry::File(b"return 'synced'".to_vec()),
+            )]),
+        };
+        let after = crate::automation::reconcile::ProjectSnapshot {
+            entries: BTreeMap::from([(
+                relative,
+                crate::automation::reconcile::SnapshotEntry::File(b"return 'after'".to_vec()),
+            )]),
+        };
+        let id = sync_history::SyncHistory::begin(&project.root, Path::new("src"), &before, &paths)
+            .expect("begin sync history")
+            .commit(
+                &after,
+                &crate::automation::reconcile::ProjectSnapshot::default(),
+            )
+            .expect("commit sync history");
+        let file = newest_history_file(&project.root, &requested).expect("sync entry holds it");
+        assert_eq!(file.id, id);
+        assert_eq!(file.bytes, b"return 'synced'");
+        assert_eq!(
+            project_relative_path(
+                &project.root,
+                &project.root.join("./src/./Workspace/A.luau")
+            )
+            .expect("inside"),
+            PathBuf::from("src/Workspace/A.luau")
+        );
     }
 
     #[test]

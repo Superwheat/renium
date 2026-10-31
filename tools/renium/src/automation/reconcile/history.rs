@@ -252,48 +252,161 @@ pub(crate) struct RevertedSync {
     pub(crate) paths: Vec<PathBuf>,
 }
 
-pub(crate) fn revert_sync(root: &Path, source: &Path, id: &str) -> Result<RevertedSync> {
+/// Every committed sync entry under the project, newest first.
+fn committed_sync_entries(root: &Path) -> Result<Vec<(PathBuf, SyncHistoryRecord)>> {
     let history_root = root.join(".renium/editor-history/sync");
-    let directory = if id == "latest" {
-        let entries = fs::read_dir(&history_root)
-            .context("No sync history found")?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+    let entries = match fs::read_dir(&history_root) {
+        Ok(entries) => entries.collect::<std::result::Result<Vec<_>, _>>()?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to read {}", history_root.display()));
+        }
+    };
+    let mut records = Vec::new();
+    for entry in entries {
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let record_path = entry.path().join("sync.rmp");
+        if !record_path.is_file() {
+            continue;
+        }
+        let record: SyncHistoryRecord = rmp_serde::from_slice(&fs::read(record_path)?)?;
+        if record.expected.is_some() {
+            records.push((entry.path(), record));
+        }
+    }
+    records.sort_by_key(|(_, record)| std::cmp::Reverse(record.committed_at));
+    Ok(records)
+}
+
+fn sync_entry_directory(root: &Path, source: &Path, id: &str) -> Result<PathBuf> {
+    let history_root = root.join(".renium/editor-history/sync");
+    if id == "latest" {
+        if !history_root.is_dir() {
+            bail!("No sync history found");
+        }
         let source = absolutize_under(root, source)
             .strip_prefix(root)?
             .to_path_buf();
-        let mut found: Option<(u64, PathBuf)> = None;
-        for entry in entries {
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            let record_path = entry.path().join("sync.rmp");
-            if !record_path.is_file() {
-                continue;
-            }
-            let record: SyncHistoryRecord = rmp_serde::from_slice(&fs::read(record_path)?)?;
-            if record.source == source
-                && record.expected.is_some()
-                && !record.reverted
-                && found
-                    .as_ref()
-                    .is_none_or(|(stamp, _)| record.committed_at > *stamp)
-            {
-                found = Some((record.committed_at, entry.path()));
-            }
+        return committed_sync_entries(root)?
+            .into_iter()
+            .find(|(_, record)| record.source == source && !record.reverted)
+            .map(|(directory, _)| directory)
+            .context("No completed sync history found for this source root");
+    }
+    if id.is_empty()
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        bail!("Invalid sync history ID");
+    }
+    Ok(history_root.join(id))
+}
+
+/// One project file as a sync entry saved it before that sync.
+#[derive(Debug)]
+pub(crate) struct SyncEntryFile {
+    pub(crate) id: String,
+    pub(crate) path: PathBuf,
+    pub(crate) bytes: Vec<u8>,
+}
+
+fn sync_entry_file_bytes(
+    root: &Path,
+    directory: &Path,
+    record: &SyncHistoryRecord,
+    relative: &Path,
+) -> Result<Option<Vec<u8>>> {
+    if !record.before.contains(relative) {
+        return Ok(None);
+    }
+    validate_paths(root, &[relative.to_path_buf()])?;
+    let before = record
+        .before
+        .load_at(&directory.join("packs"), |path| path == relative)?;
+    match before.entries.get(relative) {
+        Some(SnapshotEntry::File(bytes)) => Ok(Some(bytes.clone())),
+        Some(_) => bail!(
+            "{} is a directory or link in sync history entry {}",
+            relative.display(),
+            directory.file_name().unwrap_or_default().to_string_lossy()
+        ),
+        None => Ok(None),
+    }
+}
+
+fn entry_id(directory: &Path) -> String {
+    directory
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// The saved content of `relative` (project-relative) in the sync entry `id`
+/// (`latest` picks the newest completed entry for `source`).
+pub(crate) fn sync_entry_file(
+    root: &Path,
+    source: &Path,
+    id: &str,
+    relative: &Path,
+) -> Result<SyncEntryFile> {
+    let directory = sync_entry_directory(root, source, id)?;
+    let record: SyncHistoryRecord = rmp_serde::from_slice(
+        &fs::read(directory.join("sync.rmp"))
+            .with_context(|| format!("No sync history entry {id}"))?,
+    )?;
+    if record.version != 1 {
+        bail!("Sync history is unsupported");
+    }
+    let bytes = sync_entry_file_bytes(root, &directory, &record, relative)?.with_context(|| {
+        format!(
+            "Sync history entry {} does not hold {}",
+            entry_id(&directory),
+            relative.display()
+        )
+    })?;
+    Ok(SyncEntryFile {
+        id: entry_id(&directory),
+        path: relative.to_path_buf(),
+        bytes,
+    })
+}
+
+/// The newest completed sync entry that saved `relative`, from any source
+/// root, with the content it held before that sync.
+pub(crate) fn newest_sync_entry_holding(
+    root: &Path,
+    relative: &Path,
+) -> Result<Option<SyncEntryFile>> {
+    for (directory, record) in committed_sync_entries(root)? {
+        if record.version != 1 {
+            continue;
         }
-        found
-            .context("No completed sync history found for this source root")?
-            .1
-    } else {
-        if id.is_empty()
-            || !id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        {
-            bail!("Invalid sync history ID");
+        if let Some(bytes) = sync_entry_file_bytes(root, &directory, &record, relative)? {
+            return Ok(Some(SyncEntryFile {
+                id: entry_id(&directory),
+                path: relative.to_path_buf(),
+                bytes,
+            }));
         }
-        history_root.join(id)
-    };
+    }
+    Ok(None)
+}
+
+/// Writes one file back from a sync entry without reverting the whole entry.
+pub(crate) fn restore_sync_entry_file(root: &Path, file: &SyncEntryFile) -> Result<PathBuf> {
+    validate_paths(root, std::slice::from_ref(&file.path))?;
+    let path = root.join(&file.path);
+    atomic_write_file(&path, &file.bytes)?;
+    Ok(path)
+}
+
+pub(crate) fn revert_sync(root: &Path, source: &Path, id: &str) -> Result<RevertedSync> {
+    let directory = sync_entry_directory(root, source, id)?;
     let mut history = SyncHistory {
         record: rmp_serde::from_slice(&fs::read(directory.join("sync.rmp"))?)?,
         directory,
@@ -489,13 +602,96 @@ mod tests {
             EditorRevertArgs::try_parse_from(["rev", "--sync", "latest", "--details"]).unwrap();
         assert!(args.details);
         assert_eq!(args.sync.as_deref(), Some("latest"));
+        let one_file = EditorRevertArgs::try_parse_from([
+            "rev",
+            "--sync",
+            "latest",
+            "--path",
+            "src/Workspace/A.luau",
+            "--print",
+        ])
+        .unwrap();
+        assert!(one_file.print && one_file.path.is_some());
+        assert_eq!(one_file.sync.as_deref(), Some("latest"));
         for args in [
             vec!["rev", "--details"],
-            vec!["rev", "--sync", "latest", "--path", "src/Workspace/A.luau"],
+            vec!["rev", "--print"],
+            vec!["rev", "--sync", "latest", "--print"],
+            vec![
+                "rev",
+                "--sync",
+                "latest",
+                "--path",
+                "src/Workspace/A.luau",
+                "--details",
+            ],
             vec!["rev", "--sync", "latest", "--settings-id", "editor:1"],
+            vec!["rev", "--sync", "latest", "--service", "Workspace"],
         ] {
             assert!(EditorRevertArgs::try_parse_from(args).is_err());
         }
+    }
+
+    #[test]
+    fn one_file_reads_from_a_named_entry_or_the_newest_entry_holding_it() {
+        let root = temp_dir("sync-history-file");
+        let path = PathBuf::from("src/Workspace/A.luau");
+        let paths = HashSet::from([path.clone()]);
+        let first = snapshot(&[("src/Workspace/A.luau", b"return 1")]);
+        let second = snapshot(&[("src/Workspace/A.luau", b"return 2")]);
+        let third = snapshot(&[("src/Workspace/A.luau", b"return 3")]);
+        let older = SyncHistory::begin(&root, Path::new("src"), &first, &paths)
+            .unwrap()
+            .commit(&second, &ProjectSnapshot::default())
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        let newer = SyncHistory::begin(&root, Path::new("src"), &second, &paths)
+            .unwrap()
+            .commit(&third, &ProjectSnapshot::default())
+            .unwrap();
+        apply_snapshot_paths(&root, &paths, &third).unwrap();
+        SyncHistory::begin(&root, Path::new("src"), &third, &paths).unwrap();
+
+        let held = newest_sync_entry_holding(&root, &path).unwrap().unwrap();
+        assert_eq!(held.id, newer);
+        assert_eq!(held.bytes, b"return 2");
+        assert!(
+            newest_sync_entry_holding(&root, Path::new("src/Workspace/B.luau"))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            sync_entry_file(&root, Path::new("src"), &older, &path)
+                .unwrap()
+                .bytes,
+            b"return 1"
+        );
+        assert_eq!(
+            sync_entry_file(&root, Path::new("src"), "latest", &path)
+                .unwrap()
+                .id,
+            newer
+        );
+        let missing = sync_entry_file(&root, Path::new("src"), &newer, Path::new("src/B.luau"))
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("does not hold"), "{missing}");
+
+        let restored = restore_sync_entry_file(&root, &held).unwrap();
+        assert_eq!(restored, root.join(&path));
+        assert_eq!(fs::read(root.join(&path)).unwrap(), b"return 2");
+        assert!(
+            restore_sync_entry_file(
+                &root,
+                &SyncEntryFile {
+                    id: newer,
+                    path: PathBuf::from("../outside"),
+                    bytes: Vec::new(),
+                }
+            )
+            .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
