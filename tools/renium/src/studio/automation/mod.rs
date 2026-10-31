@@ -646,7 +646,33 @@ pub(crate) fn studio_change_state_operation_command(
     }
     let has_preference = args.prefer.is_some();
     let details = args.details;
-    let parameters = json!({
+    let settle_after_start = args
+        .settle_wait_seconds
+        .filter(|seconds| operation == op::LIVE_START && *seconds > 0.0);
+    let parameters = live_operation_parameters(&args);
+    let mut result = daemon_result(operation, project, parameters, false, Some(&args.bridge))?;
+    if let Some(seconds) = settle_after_start
+        && result.get("ok").and_then(Value::as_bool) != Some(false)
+    {
+        let status = StudioChangeStateArgs {
+            no_start: true,
+            settle_wait_seconds: Some(seconds),
+            ..StudioChangeStateArgs::plain(args.bridge.clone(), details)
+        };
+        let settled = daemon_result(
+            op::LIVE_STATUS,
+            project,
+            live_operation_parameters(&status),
+            false,
+            Some(&status.bridge),
+        )?;
+        merge_settled_status(&mut result, settled);
+    }
+    finish_studio_change_state_command(operation, has_preference, result, details)
+}
+
+fn live_operation_parameters(args: &StudioChangeStateArgs) -> Value {
+    json!({
         "services": args.services,
         "reset": args.reset,
         "replaceServices": args.replace_services,
@@ -666,9 +692,24 @@ pub(crate) fn studio_change_state_operation_command(
         "manageFiles": true,
         "bridgeWaitSeconds": args.bridge.wait_seconds,
         "bridgePorts": args.bridge.ports,
-    });
-    let result = daemon_result(operation, project, parameters, false, Some(&args.bridge))?;
-    finish_studio_change_state_command(operation, has_preference, result, details)
+    })
+}
+
+/// A `lon --wait` result carries the daemon status observed after the settle
+/// wait, and fails the way `lst --wait` does when the sync did not settle.
+fn merge_settled_status(result: &mut Value, settled: Value) {
+    let Some(target) = result.as_object_mut() else {
+        return;
+    };
+    if let Some(daemon) = settled.get("daemon") {
+        target.insert("daemon".to_string(), daemon.clone());
+    }
+    if settled.get("ok") == Some(&Value::Bool(false)) {
+        target.insert("ok".to_string(), Value::Bool(false));
+        if let Some(error) = settled.get("error") {
+            target.insert("error".to_string(), error.clone());
+        }
+    }
 }
 
 fn finish_studio_change_state_command(
@@ -4203,6 +4244,55 @@ mod play_state_tests {
                 .unwrap()
                 .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod settled_start_tests {
+    use super::*;
+
+    #[test]
+    fn live_start_with_wait_reports_the_settled_daemon_status() {
+        let mut result =
+            json!({"ok": true, "tracking": true, "daemon": {"running": true, "settled": false}});
+        merge_settled_status(
+            &mut result,
+            json!({"ok": true, "daemon": {"running": true, "settled": true, "pushes": 2}}),
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["tracking"], true);
+        assert_eq!(
+            result["daemon"],
+            json!({"running": true, "settled": true, "pushes": 2})
+        );
+
+        let mut result = json!({"ok": true, "daemon": {"running": true}});
+        merge_settled_status(
+            &mut result,
+            json!({"ok": false, "error": "Live Sync did not settle before the wait ended: a sync pass is still running", "daemon": {"running": true, "settled": false}}),
+        );
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["daemon"]["settled"], false);
+        assert_eq!(
+            result["error"],
+            "Live Sync did not settle before the wait ended: a sync pass is still running"
+        );
+    }
+
+    #[test]
+    fn live_status_parameters_only_carry_the_plain_status_fields() {
+        let status = StudioChangeStateArgs {
+            no_start: true,
+            settle_wait_seconds: Some(200.0),
+            ..StudioChangeStateArgs::plain(BridgeConnectionArgs::local(3.0), false)
+        };
+        let parameters = live_operation_parameters(&status);
+        assert_eq!(parameters["settleWaitSeconds"], 120.0);
+        assert_eq!(parameters["compact"], true);
+        assert_eq!(parameters["manageFiles"], true);
+        assert_eq!(parameters["bridgeWaitSeconds"], 3.0);
+        assert_eq!(parameters["reset"], false);
+        assert!(parameters["resolveConflictPreference"].is_null());
     }
 }
 
