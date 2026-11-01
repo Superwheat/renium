@@ -81,6 +81,12 @@ pub(crate) struct StoreParentSelector {
 }
 
 pub(crate) fn bytecode_add_instance(args: BytecodeAddInstanceArgs) -> Result<()> {
+    if let Some(batch) = args.batch.as_deref() {
+        return crate::bytecode::add_batch::bytecode_add_batch(batch, args.pretty);
+    }
+    let (Some(name), Some(class_name)) = (args.name, args.class_name) else {
+        bail!("Give -n NAME and -c CLASS, or --batch with JSON ops");
+    };
     let (settings_file, service_hint) = resolve_bytecode_cli_settings_file(
         args.input.settings_file.as_deref(),
         args.input.service_or_file.as_deref(),
@@ -89,8 +95,8 @@ pub(crate) fn bytecode_add_instance(args: BytecodeAddInstanceArgs) -> Result<()>
     let result = add_store_instance(StoreInstanceRequest {
         settings_file,
         service_hint,
-        name: args.name,
-        class_name: args.class_name,
+        name,
+        class_name,
         settings_id: args.settings_id,
         parent: StoreParentSelector {
             no_parent: args.parent.no_parent,
@@ -225,6 +231,58 @@ fn store_index_at_segments(
     Ok(Some(current))
 }
 
+/// The property and attribute maps a new instance is stored with, and the
+/// script source its file receives when one was given.
+pub(crate) struct NewInstanceValues {
+    pub(crate) properties: Map<String, Value>,
+    pub(crate) attributes: Map<String, Value>,
+    pub(crate) given_source: Option<String>,
+}
+
+/// Validates and canonicalizes the values a new instance is created with.
+/// A script stores the external-source marker and keeps the given source for
+/// its file.
+pub(crate) fn prepare_new_instance_values(
+    document: &SettingsBytecode,
+    settings_file: &Path,
+    class_name: &str,
+    properties: Map<String, Value>,
+    attributes: Map<String, Value>,
+) -> Result<NewInstanceValues> {
+    if class_name == "PackageLink" {
+        bail!("PackageLink instances can only be created by Roblox package workflows");
+    }
+    let mut properties = canonical_new_instance_properties(class_name, properties)?;
+    let mut attributes = attributes;
+    for map in [&mut properties, &mut attributes] {
+        let mut value = Value::Object(std::mem::take(map));
+        crate::bytecode::qualify_value_references(&mut value, settings_file, document)?;
+        if let Value::Object(qualified) = value {
+            *map = qualified;
+        }
+    }
+    let given_source = if is_lua_source_class(class_name) {
+        match properties.get("Source") {
+            Some(Value::String(source)) => Some(source.clone()),
+            Some(_) => bail!("Source must be a string"),
+            None => None,
+        }
+    } else {
+        None
+    };
+    if is_lua_source_class(class_name) {
+        properties.insert(
+            "Source".to_string(),
+            Value::String(EXTERNAL_SOURCE_MARKER.to_string()),
+        );
+    }
+    Ok(NewInstanceValues {
+        properties,
+        attributes,
+        given_source,
+    })
+}
+
 pub(crate) fn add_store_instance(request: StoreInstanceRequest) -> Result<Value> {
     let StoreInstanceRequest {
         settings_file,
@@ -252,37 +310,17 @@ pub(crate) fn add_store_instance(request: StoreInstanceRequest) -> Result<Value>
         parent.parent_name.as_deref(),
         parent.parent_class_name.as_deref(),
     )?;
-    let class_name = class_name.clone();
-    if class_name == "PackageLink" {
-        bail!("PackageLink instances can only be created by Roblox package workflows");
-    }
-    let mut properties = canonical_new_instance_properties(
+    let NewInstanceValues {
+        properties,
+        attributes,
+        given_source,
+    } = prepare_new_instance_values(
+        &document,
+        &settings_file,
         &class_name,
         parse_property_assignments(&raw_properties)?,
+        parse_property_assignments(&raw_attributes)?,
     )?;
-    let mut attributes = parse_property_assignments(&raw_attributes)?;
-    for map in [&mut properties, &mut attributes] {
-        let mut value = Value::Object(std::mem::take(map));
-        crate::bytecode::qualify_value_references(&mut value, &settings_file, &document)?;
-        if let Value::Object(qualified) = value {
-            *map = qualified;
-        }
-    }
-    let given_source = if is_lua_source_class(&class_name) {
-        match properties.get("Source") {
-            Some(Value::String(source)) => Some(source.clone()),
-            Some(_) => bail!("Source must be a string"),
-            None => None,
-        }
-    } else {
-        None
-    };
-    if is_lua_source_class(&class_name) {
-        properties.insert(
-            "Source".to_string(),
-            Value::String(EXTERNAL_SOURCE_MARKER.to_string()),
-        );
-    }
     let added = instance_api::add_instance(
         &mut document,
         AddInstanceSpec {
@@ -344,7 +382,10 @@ pub(crate) fn add_store_instance(request: StoreInstanceRequest) -> Result<Value>
 /// The bytes a new script's file receives, or None when a file already at
 /// its path is adopted as the source. A file that exists is never replaced
 /// by an empty source, and a given source that differs from it is refused.
-fn new_script_source(source_path: &Path, given: Option<&str>) -> Result<Option<Vec<u8>>> {
+pub(crate) fn new_script_source(
+    source_path: &Path,
+    given: Option<&str>,
+) -> Result<Option<Vec<u8>>> {
     let existing = source_path
         .is_file()
         .then(|| fs::read(source_path))
@@ -1316,9 +1357,10 @@ mod add_instance_tests {
                     settings_file: Some(root.join("instances").join("ServerScriptService.renium")),
                 },
                 service_hint: Some("ServerScriptService".into()),
-                name: name.into(),
-                class_name: "ModuleScript".into(),
+                name: Some(name.into()),
+                class_name: Some("ModuleScript".into()),
                 settings_id: None,
+                batch: None,
                 parent: BytecodeParentArgs {
                     parent_index: None,
                     parent_settings_id: None,
