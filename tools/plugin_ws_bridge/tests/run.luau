@@ -55,6 +55,7 @@ require("./microprofiler-analysis-workloads")
 require("./detached-runner-workloads")
 require("./coregui-dismiss-workloads")
 require("./sibling-order-workloads")
+require("./path-snapshot-workloads")
 
 local function equal(actual, expected, label)
 	if actual ~= expected then
