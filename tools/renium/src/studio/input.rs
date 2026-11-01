@@ -408,7 +408,9 @@ pub fn resolve_key(name: &str) -> Result<KeySpec> {
             platform_code: _windows_vk,
             name: canonical,
         }),
-        None => bail!("Unsupported keyboard key '{trimmed}'"),
+        None => bail!(
+            "Unsupported keyboard key '{trimmed}'; keys are Enum.KeyCode names (W, Space, LeftShift, Return); gamepad buttons are not supported"
+        ),
     }
 }
 

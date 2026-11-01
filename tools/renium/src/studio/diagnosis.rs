@@ -362,7 +362,7 @@ fn verdict_text(observation: &Observation<'_>) -> String {
     }
     if let Some((pid, reason)) = open_failures.first() {
         return format!(
-            "Studio (pid {pid}) could not open its place: {}. It is left at its start page; close it, and check that the signed-in Studio account can edit the place.",
+            "Studio (pid {pid}) could not open its place: {}. It is left at its start page; `rbx sx --terminate` closes it, then check that the signed-in Studio account can edit the place and run `rbx so FILE` or `rbx ro` again.",
             reason.trim_end_matches('.')
         );
     }

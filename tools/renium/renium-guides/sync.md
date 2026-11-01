@@ -17,7 +17,7 @@ Work in the place folder or add `--place <alias|placeId>`.
 ## Live Sync
 
 Start once for sustained editing. Saved files and Studio edits sync both ways. Unsaved buffers do not sync; file edits during Play wait for Edit mode.
-`lon` returns while the first comparison still runs (`daemon.settled: false`); on a large place run `rbx lst --wait 120` before the next Studio step.
+`lon` returns while the first comparison still runs (`daemon.settled: false`); `rbx lon --wait 120` returns once it has settled, or run `rbx lst --wait 120` later.
 
 Trust successful edits while Live Sync reports no problem. Don't poll, push, reread Studio, or launch Play after every save.
 Use `rbx lst --wait` (10 s, or a number up to 120) only when the next step needs completed sync, after a reported problem, or when asked.
@@ -27,7 +27,7 @@ On failure, inspect `rbx lst --details`, fix the cause, then retry with `rbx rp`
 
 ## First connection and conflicts
 
-`no_studio` and `rbx status` carry `diagnosis.verdict`: Studio closed or another place open means `rbx ro`; relay other verdicts unchanged and never guess why a place closed.
+`no_studio` and `rbx status` carry `diagnosis.verdict`: Studio closed or another place open means `rbx ro`; relay other verdicts unchanged.
 
 Live Sync compares each side with their last common Renium state: one-sided changes transfer, independent edits merge, conflicts wait without overwriting either side. Something you added that is missing from both sides was deleted in Studio and synced; ask before restoring it.
 
@@ -58,10 +58,10 @@ Player capacity (`Players.MaxPlayers`, `PreferredPlayers`) comes from Roblox Gam
 
 ## File-backed undo
 
-Syncs save their pre-sync files in `.renium/editor-history/sync`. `rbx rev --sync latest` restores the last sync's files (a returned `historyId` selects another); it refuses newer edits and unconfirmed transactions. `rbx rev --path FILE --print` prints a saved copy.
+Syncs save their pre-sync files in `.renium/editor-history/sync`. `rbx rev --sync latest` restores the last sync's files (a returned `historyId` selects another); it refuses newer edits and unconfirmed transactions. `rbx rev --path FILE --print` prints a saved copy (editor history or the newest sync entry; `--sync ID` picks one).
 
 Live Sync transfers restored files; otherwise add `--apply-studio`. `--details` lists every restored path.
 
 ## Packages owned by others
 
-Pushes into Roblox packages this account does not own are refused before Studio is touched. Revert to the package's content, or unlink it in Studio (right-click the root, Unlink from Package) for an editable copy; Renium never desyncs another creator's package.
+Pushes into Roblox packages this account does not own are refused. Revert to the package's content, or unlink it in Studio (right-click the root, Unlink from Package) for an editable copy.

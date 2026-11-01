@@ -2,10 +2,21 @@
 
 ## Unreleased
 
+### Bug fixes
+
+- `rbx wait` accepts a chunk with its own `return` (`local p = ...; return p ~= nil`) as well as an expression, and a timeout prints `{"ok":false,"timedOut":true,"value":...}` with the hint instead of a bare error. Before, a statement failed with a Luau parse error.
+- `rbx rev --path FILE [--print]` falls back to the newest sync-history entry that holds the file when the editor history has none, `rbx rev --sync ID --path FILE --print` reads one file at a given sync entry, and the error with both stores empty names them and `rbx rev --sync latest`. Before, a file with 81 sync entries got "No editor revert history found".
+- `rbx tr StarterGui.Main.HUD.Timer` (one dotted argument) takes the first segment as the service when it names one. Before, the argument split at the last dot and failed with "No synced Renium store for service 'StarterGui.Main.HUD'".
+- `rbx lon --wait N` waits for the first comparison and the watched file changes to settle, as `rbx lst --wait` does, and reports the settled daemon status; before, the flag was accepted and ignored.
+- `rbx lst --prefer`, `rbx lst --clear-pending` and the other `lon`-only flags are rejected on `lst`, `lof`, `rp` and `dp`, whose `--help` now lists only their own flags. Before, `lst --prefer studio` was silently ignored and `lst --clear-pending` discarded pending edits.
+- A command whose daemon response deadline passes reports the daemon as busy with the operation it is serving and how long that has run, and says that Studio operations run one at a time; a connection the daemon closed mid-request says so and asks for a retry. Before, both were raw socket errors ("Waiting for daemon response to operation 54 (43s limit) ... os error 10060"). `rbx status` already reported busy daemons; every command does now.
+- `rbx ck` names a file it cannot read and a source that starts with a byte order mark, instead of "os error 123" or "got Unicode character U+feff".
+
 ### Improvements
 
-- A command whose daemon response deadline passes now reports the daemon as busy with the operation it is serving and how long that has run, and says that Studio operations run one at a time, instead of the raw "Waiting for daemon response to operation N" socket error. `rbx status` already did this; every command does now.
-- `rbx status` in text mode lists a non-native operation as its name and fallback only; the reason and readings stay in `rbx native-probe` and json mode.
+- `rbx help CMD` prints a command's help (`rbx help oc key` works for nested commands), `rbx log` and `rbx loff` resolve to `co` and `lof`, and an unknown command names the closest commands plus `rbx --help`, `rbx docs <guide>` and `rbx plugin list`.
+- "Property not found" lists up to five nearest names from the instance's stored properties and its class, and names the listing command. "No matching instance" and the model export's "not found" name `rbx f`, `rbx tr` and `rbx pl`; a Studio that could not open its place names `rbx sx --terminate`; the play-client selector error names `rbx play --add-players`; the editor-transaction error names `rbx lst` and `rbx lof`; an unsupported key says which names work; `cfg` names `rbx cfg list`; Luau errors about `Source` or "is not a valid member" carry the commands that read scripts and list children.
+- Text-mode results drop fields agents never read: `status` loses `availableDataModels`, the per-client `teamCreate`, zero `gameId`/`placeId`, `selected` for a single Studio and the diagnosis details behind its verdict, and lists a non-native operation as its name and fallback only; `cs` drops the bridge build, launch and port plumbing; `lst` and `lon` drop `role`, default `onlyCodeMode` and `twoWaySyncEnabled`, and the daemon members at their quiet values (`paused:false`, `syncing:false`, `settled:true`, zero counts); `play -x` answers `stopped:true` without the engine flag blob, `method` and `attempts`; `co` drops `epoch` and, unless paging or following, `nextSeq`; `q` drops `searched`; `cmp` drops the echoed `services` and the instance totals; `inp` drops the request echo and a null click count. Json mode keeps every field.
 
 ## 0.5.6 - 2026-10-31
 

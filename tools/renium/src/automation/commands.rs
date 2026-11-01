@@ -303,11 +303,15 @@ fn studio_status_result(args: &StudioStatusArgs, project: Option<&Path>) -> Resu
             if let Some(map) = result.as_object_mut() {
                 map.remove("studios");
                 map.remove("studioState");
+                map.remove("availableDataModels");
                 // A runtime id only selects between several Studios.
                 let single = map
                     .get("clients")
                     .and_then(Value::as_array)
                     .is_some_and(|clients| clients.len() == 1);
+                if single {
+                    map.remove("selected");
+                }
                 for client in map
                     .get_mut("clients")
                     .and_then(Value::as_array_mut)
@@ -318,9 +322,24 @@ fn studio_status_result(args: &StudioStatusArgs, project: Option<&Path>) -> Resu
                     client.remove("bridgeBuildUnix");
                     client.remove("channels");
                     client.remove("ports");
+                    client.remove("teamCreate");
+                    for key in ["gameId", "placeId"] {
+                        if client.get(key).and_then(Value::as_i64) == Some(0) {
+                            client.remove(key);
+                        }
+                    }
                     if single {
                         client.remove("runtimeId");
                     }
+                }
+                // The verdict is the sentence a reader acts on; the process
+                // and plugin details behind it stay in json mode and `rbx dr`.
+                if let Some(verdict) = map
+                    .get("diagnosis")
+                    .and_then(|diagnosis| diagnosis.get("verdict"))
+                    .cloned()
+                {
+                    map.insert("diagnosis".to_string(), json!({ "verdict": verdict }));
                 }
             }
             app::output::strip_empty(&mut result);

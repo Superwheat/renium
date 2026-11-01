@@ -19,9 +19,10 @@ rbx ss DataStoreService UpdateAsync --limit 20
 rbx sg RemoteEvent --limit 100
 ```
 
-`f SERVICE text` searches text; `-n` matches an exact name, without wildcards; `--path` limits the search to one subtree.
+`f SERVICE text` searches text; `-n` matches an exact name, without wildcards; `--path` limits the search to one subtree. `tr`, `in` and `f` also take one dotted argument (`rbx tr StarterGui.Main.HUD.Timer`; the first segment is the service). A `Property not found` error lists the nearest stored and class property names; `rbx in SERVICE TARGET -F props` lists them all.
 `ss` finds scripts containing every keyword, case-insensitively. `sg` finds literal lines, case-sensitive by default. Limits cap returned results, not totals. Read known scripts directly; use `sr` for bounded reads when file access is unavailable.
 
+Several reads in one store are one `bb` batch, not a `bg` per value: `'{"ops":[{"type":"search","q":"Door","limit":5,"fields":"lookup,prop:Anchored"},{"type":"counts"}]}' | rbx bb Workspace -J -`; `in SERVICE TARGET -F attrs,props` reads every field of one instance.
 Use one lookup on the relevant state: `f` for saved data, `q` for a closed place, `l` for unsaved Studio state. Refine ambiguous results instead of repeating the query through different tools. Git comparisons are useful when the question concerns revisions, not as an extra existence check.
 
 ## Edit

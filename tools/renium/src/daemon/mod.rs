@@ -930,6 +930,18 @@ fn daemon_control_request_inner(
                 &format!("rbx {}", opcode.name),
                 started.elapsed(),
             )
+        } else if error.chain().any(|cause| {
+            cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                )
+            })
+        }) {
+            anyhow::anyhow!(
+                "The Renium daemon closed the connection before answering `rbx {}` (it restarted or crashed mid-request); run the command again, and `rbx report` collects the crash log",
+                opcode.name
+            )
         } else {
             error
         }

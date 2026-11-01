@@ -80,6 +80,9 @@ fn compact_console_entries(result: &mut Value) {
     if crate::app::output::global_json_output() {
         return;
     }
+    if let Some(map) = result.as_object_mut() {
+        map.remove("epoch");
+    }
     let Some(entries) = result.get_mut("entries").and_then(Value::as_array_mut) else {
         return;
     };
@@ -278,6 +281,10 @@ fn filtered_console_result(args: &PluginConsoleOutputArgs, mut result: Value) ->
     let count = entries.len();
     if let Some(object) = result.as_object_mut() {
         object.insert("count".to_string(), json!(count));
+        // The sequence cursor only matters to a caller that pages or follows.
+        if args.since_seq == 0 && !args.follow && !crate::app::output::global_json_output() {
+            object.remove("nextSeq");
+        }
         if matcher.active() {
             object.insert("scanned".to_string(), json!(scanned));
             object.insert("matched".to_string(), json!(matched));

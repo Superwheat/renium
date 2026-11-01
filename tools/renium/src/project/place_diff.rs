@@ -515,6 +515,13 @@ fn variant_value(
 /// Text mode prints one line per difference: kind, class and dotted path,
 /// then the changed property names and `@attribute` names.
 fn difference_lines(result: &mut Value) {
+    // The echoed scope and the instance totals repeat what the caller gave or
+    // what the counts already say.
+    if let Some(map) = result.as_object_mut() {
+        for key in ["services", "beforeInstances", "afterInstances", "direction"] {
+            map.remove(key);
+        }
+    }
     let Some(differences) = result.get_mut("differences").and_then(Value::as_array_mut) else {
         return;
     };

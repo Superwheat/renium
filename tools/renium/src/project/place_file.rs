@@ -399,6 +399,7 @@ pub(crate) fn query_place(args: QueryPlaceArgs) -> Result<()> {
 fn compact_query_text(result: &mut Value) {
     if let Some(map) = result.as_object_mut() {
         map.remove("input");
+        map.remove("searched");
     }
     let Some(matches) = result.get_mut("matches").and_then(Value::as_array_mut) else {
         return;

@@ -2052,9 +2052,9 @@ pub fn run_config(args: ConfigArgs) -> Result<()> {
         ConfigCommand::Get(args) => {
             let value = load_config_scope_with_defaults(args.scope, &args.root)?;
             let selected = match args.key.as_deref() {
-                Some(key) => get_dotted(&value, key)
-                    .cloned()
-                    .with_context(|| format!("Unknown setting '{key}'"))?,
+                Some(key) => get_dotted(&value, key).cloned().with_context(|| {
+                    format!("Unknown setting '{key}'; `rbx cfg list` prints every setting")
+                })?,
                 None => value,
             };
             crate::app::output::emit_global_output(&selected, &config_value_text(&selected)?)

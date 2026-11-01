@@ -111,6 +111,11 @@ pub(crate) fn execute_luau_command(mut args: ExecuteLuauArgs) -> Result<()> {
 }
 
 pub(crate) fn validate_luau_syntax(code: &str) -> Result<()> {
+    if code.starts_with('\u{feff}') {
+        bail!(
+            "The source starts with a UTF-8 byte order mark; strip it (the rest was not checked)"
+        );
+    }
     // Use Studio's actual language compiler, without loading or executing code.
     // Its recursion limit also rejects excessive nesting before AST traversal.
     mlua::Compiler::new()
@@ -498,7 +503,9 @@ fn wait_for_player_bridge(bridge: &BridgeServer, player: &str, wait_seconds: f64
         })
         .collect::<Vec<_>>()
         .join("; ");
-    bail!("No connected play client matches player selector '{player}'. Connected: {connected}")
+    bail!(
+        "No connected play client matches player selector '{player}'. Connected: {connected}; `rbx play --add-players 1` adds a client, `rbx play -s` starts a session"
+    )
 }
 
 pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
@@ -579,12 +586,20 @@ fn compact_play_result(result: &mut Value, named_players: bool) {
         };
         map.insert("clients".to_string(), value);
     }
+    // A stop answers with the fact; the engine flags and the attempt count
+    // behind it stay in json mode.
+    if map.get("action") == Some(&json!("stop")) {
+        map.remove("status");
+        map.insert("stopped".to_string(), Value::Bool(true));
+    }
     for key in [
         "action",
         "editPid",
         "editRuntimeId",
         "launchNonce",
         "deviceSimulation",
+        "method",
+        "attempts",
     ] {
         map.remove(key);
     }
@@ -895,13 +910,10 @@ pub(crate) fn compact_live_status(value: Value) -> Value {
     let mut result = Map::new();
     for key in [
         "busy",
-        "role",
         "runtimeId",
-        "twoWaySyncEnabled",
         "tracking",
         "trackedServices",
         "connectedInstances",
-        "onlyCodeMode",
         "seq",
         "snapshotSeq",
         "runtimeSettingsSeq",
@@ -912,6 +924,14 @@ pub(crate) fn compact_live_status(value: Value) -> Value {
         if let Some(value) = source.get(key) {
             result.insert(key.to_string(), value.clone());
         }
+    }
+    // The role is always the Edit window here; the two mode flags only matter
+    // away from their defaults.
+    if source.get("twoWaySyncEnabled") == Some(&Value::Bool(false)) {
+        result.insert("twoWaySyncEnabled".to_string(), Value::Bool(false));
+    }
+    if source.get("onlyCodeMode") == Some(&Value::Bool(true)) {
+        result.insert("onlyCodeMode".to_string(), Value::Bool(true));
     }
 
     let mut pending_changes = 0usize;
@@ -995,6 +1015,20 @@ fn compact_live_daemon_status(value: &Value) -> Value {
         && let Some(paths) = source.get("pendingPaths")
     {
         result.insert("pendingPaths".to_string(), paths.clone());
+    }
+    // Members at their quiet value say nothing; a reader looks for the others.
+    for (key, quiet) in [
+        ("paused", json!(false)),
+        ("syncing", json!(false)),
+        ("resolutionRequired", json!(false)),
+        ("pullChanges", json!(true)),
+        ("settled", json!(true)),
+        ("pushes", json!(0)),
+        ("pulls", json!(0)),
+    ] {
+        if result.get(key) == Some(&quiet) {
+            result.remove(key);
+        }
     }
     Value::Object(result)
 }
@@ -3262,6 +3296,16 @@ fn compact_input_result(operation: u16, result: &mut Value, requested_output: Op
             map.remove("condition");
             map.remove("action");
         }
+        op::INPUT => {
+            // The request echo adds nothing; a null click count means no click
+            // was sent.
+            map.remove("action");
+            map.remove("inputMethod");
+            map.remove("actions");
+            if map.get("verifiedClicks") == Some(&Value::Null) {
+                map.remove("verifiedClicks");
+            }
+        }
         _ => {}
     }
 }
@@ -3414,9 +3458,20 @@ pub(crate) fn list_clients_command(args: ListClientsArgs) -> Result<()> {
     // Ports and channels are daemon plumbing; a runtime id only selects
     // between several Studios.
     let single = clients.len() == 1;
+    let text = !crate::app::output::global_json_output();
     for client in clients.iter_mut().filter_map(Value::as_object_mut) {
         client.remove("channels");
         client.remove("ports");
+        if text {
+            for key in ["bridgeBuildUnix", "launchNonce", "launchEditRuntimeId"] {
+                client.remove(key);
+            }
+            for key in ["gameId", "placeId"] {
+                if client.get(key).and_then(Value::as_i64) == Some(0) {
+                    client.remove(key);
+                }
+            }
+        }
         if single {
             client.remove("runtimeId");
         }

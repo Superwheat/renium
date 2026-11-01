@@ -320,7 +320,11 @@ pub(crate) fn ensure_plugin_api_ok(result: &Value) -> Result<()> {
     Ok(())
 }
 
-const LUAU_ERROR_HINTS: [(&str, &str); 2] = [
+const LUAU_ERROR_HINTS: [(&str, &str); 4] = [
+    (
+        "cannot read 'Source'",
+        "a runner cannot read Script.Source; `rbx sr PATH` reads a script and `rbx sg TEXT` searches them",
+    ),
     (
         "lacking capability Plugin",
         "profiling inside runners is blocked; use `rbx perf start --player N` or `rbx perf micro-start`",
@@ -328,6 +332,10 @@ const LUAU_ERROR_HINTS: [(&str, &str); 2] = [
     (
         "Luau runner timed out after",
         "pass -t SECONDS, or use --detach NAME for samplers and read them with --collect NAME",
+    ),
+    (
+        "is not a valid member of",
+        "`rbx tr SERVICE.PATH` lists an instance's children and `rbx l \"return typeof(X)\"` its class",
     ),
 ];
 

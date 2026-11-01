@@ -222,7 +222,7 @@ fn editor_transaction_begin_result(
         if message.contains("Another editor transaction is already active")
             || message.contains("An earlier editor transaction has a failed rollback")
         {
-            error.context("Studio still has an active editor transaction; wait for it to finish. Failed rollback cleanup retries at two-minute idle intervals")
+            error.context("Studio still has an active editor transaction; wait for it to finish (`rbx lst` shows Live Sync's, `rbx lof` releases a stuck one). Failed rollback cleanup retries at two-minute idle intervals")
         } else {
             error
         }

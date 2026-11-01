@@ -150,13 +150,12 @@ fn check(files: &[PathBuf], stdin: &mut impl Read) -> Result<Value> {
                 stdin
                     .read_to_string(&mut source)
                     .map(|_| source.trim_start_matches('\u{feff}').to_string())
+                    .map_err(anyhow::Error::from)
             } else {
                 fs::read_to_string(file)
+                    .with_context(|| format!("Cannot read {} as UTF-8 text", file.display()))
             };
-            match source
-                .map_err(anyhow::Error::from)
-                .and_then(|source| validate_luau_syntax(&source))
-            {
+            match source.and_then(|source| validate_luau_syntax(&source)) {
                 Ok(()) => json!({"file": file, "ok": true}),
                 Err(error) => json!({"file": file, "ok": false, "error": format!("{error:#}")}),
             }

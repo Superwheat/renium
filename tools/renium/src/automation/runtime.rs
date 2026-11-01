@@ -4034,9 +4034,7 @@ mod tests {
             json!({
                 "ok": false,
                 "error": "timed out",
-                "role": "edit",
                 "runtimeId": "runtime",
-                "twoWaySyncEnabled": true,
                 "changeCount": 1,
                 "propertyChangeCount": 2,
                 "pendingChanges": 3,

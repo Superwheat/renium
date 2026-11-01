@@ -1176,14 +1176,18 @@ fn high_level_resolve_path_candidates(
             })
             .collect::<Vec<_>>();
         return match matched.len() {
-            0 => Err(anyhow::anyhow!("No matching instance path: {path_label}")),
+            0 => Err(anyhow::anyhow!(
+                "No matching instance path: {path_label}; `rbx f NAME` searches by name, `rbx tr SERVICE.PATH` lists children, `rbx pl` refreshes the store from Studio"
+            )),
             1 => Ok(HighLevelTargetResolution::Found(matched[0])),
             _ => Ok(HighLevelTargetResolution::Ambiguous(matched)),
         };
     }
 
     match candidates.len() {
-        0 => bail!("No matching instance path: {path_label}"),
+        0 => bail!(
+            "No matching instance path: {path_label}; `rbx f NAME` searches by name, `rbx tr SERVICE.PATH` lists children, `rbx pl` refreshes the store from Studio"
+        ),
         1 => Ok(HighLevelTargetResolution::Found(candidates[0])),
         _ => Ok(HighLevelTargetResolution::Ambiguous(candidates)),
     }
@@ -1203,7 +1207,9 @@ fn high_level_resolve_simple_target(
     let segments = high_level_path_segments(raw_target, &ctx.service)?;
     let direct_candidates = high_level_match_path_candidates(ctx, &segments);
     match direct_candidates.len() {
-        0 => bail!("No matching instance: {raw_target}"),
+        0 => bail!(
+            "No matching instance: {raw_target}; `rbx f NAME` searches by name, `rbx tr SERVICE.PATH` lists children, `rbx pl` refreshes the store from Studio"
+        ),
         1 => Ok(HighLevelTargetResolution::Found(direct_candidates[0])),
         _ => Ok(HighLevelTargetResolution::Ambiguous(direct_candidates)),
     }
