@@ -143,7 +143,10 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
         "sr",
         "Examples:\n  rbx sr src/ServerScriptService/Main.server.luau",
     ),
-    ("play", "Examples:\n  rbx play\n  rbx play -x"),
+    (
+        "play",
+        "Examples:\n  rbx play\n  rbx play -x\n  rbx play -s --until \"shared.RoundHandler.GameState == 'InRound'\" --result \"shared.RoundHandler:Snapshot()\"",
+    ),
     ("cs", "Examples:\n  rbx cs"),
     ("rv", "Examples:\n  rbx rv apply"),
     ("pr", "Examples:\n  rbx pr \"Shop.BuyButton\" -p 1"),
@@ -156,7 +159,7 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ),
     (
         "wait",
-        "Examples:\n  rbx wait \"workspace:GetAttribute('Ready') ~= nil\" -c -t 20",
+        "Examples:\n  rbx wait \"workspace:GetAttribute('Ready') ~= nil\" -c -t 20\n  rbx wait \"shared.RoundHandler.GameState == 'InRound'\" --result \"shared.RoundHandler:Snapshot()\"",
     ),
     ("go", "Examples:\n  rbx go \"Workspace.Shop.Door\" -p 1"),
     ("sc", "Examples:\n  rbx sc --studio -o studio.png"),

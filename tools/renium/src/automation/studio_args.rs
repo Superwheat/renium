@@ -188,6 +188,7 @@ pub(super) fn play(operation: u16, parameters: &Value) -> Result<StartStopPlayAr
         mode: string(object, "mode"),
         until: None,
         until_timeout: 120.0,
+        result: None,
         kill_orphans: false,
     })
 }
@@ -326,6 +327,7 @@ pub(super) fn wait(parameters: &Value) -> Result<WaitUntilArgs> {
         client: boolean(object, "client")?,
         timeout: number(object, "timeout", 60.0)?,
         interval: number(object, "interval", 0.25)?,
+        result: string(object, "result"),
     })
 }
 

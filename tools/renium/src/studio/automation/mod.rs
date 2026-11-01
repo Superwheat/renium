@@ -527,6 +527,12 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
         "bridgeWaitSeconds": args.bridge.wait_seconds,
         "bridgePorts": args.bridge.ports,
     });
+    if let Some(condition) = args.until.as_deref() {
+        wait_condition_body(condition)?;
+    }
+    if let Some(result) = args.result.as_deref() {
+        wait_result_body(result)?;
+    }
     let mut result = daemon_control_request(operation, None, parameters, false)?;
     if let Some(condition) = args.until.as_deref()
         && result.get("ok").and_then(Value::as_bool) != Some(false)
@@ -536,7 +542,9 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
             None,
             json!({
                 "condition": condition,
+                "result": args.result,
                 "timeout": args.until_timeout,
+                "editRuntimeId": result.get("editRuntimeId"),
                 "bridgeWaitSeconds": args.bridge.wait_seconds,
                 "bridgePorts": args.bridge.ports,
             }),
@@ -544,9 +552,7 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
         );
         match wait {
             Ok(wait) => {
-                let timed_out = wait.get("ok") == Some(&Value::Bool(false));
-                result["until"] = wait;
-                if timed_out {
+                if !attach_awaited_result(&mut result, wait) {
                     print_json_output(&result, false)?;
                     return Err(ReportedFailure.into());
                 }
@@ -561,6 +567,18 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
         compact_play_result(&mut result, args.players.is_some());
     }
     print_json_output(&result, false)
+}
+
+/// Adds the `--until` outcome to a Play start result: the wait record under
+/// `until`, and the typed `--result` observation under `result` so callers
+/// read it beside the launch fields. Returns whether the wait succeeded.
+fn attach_awaited_result(result: &mut Value, mut wait: Value) -> bool {
+    let succeeded = wait.get("ok") == Some(&Value::Bool(true));
+    if succeeded && let Some(observed) = wait.as_object_mut().and_then(|map| map.remove("result")) {
+        result["result"] = observed;
+    }
+    result["until"] = wait;
+    succeeded
 }
 
 /// Text mode answers a Play start with the decision fields: whether the
@@ -2732,17 +2750,90 @@ pub(crate) fn type_result(args: &TypeArgs, bridge: &BridgeServer) -> Result<Valu
 /// is returned from it, and a chunk (statements with their own `return`) runs
 /// as is.
 fn wait_condition_body(condition: &str) -> Result<String> {
-    let expression = format!("return ({condition}\n)");
+    returning_body(condition, "condition")
+}
+
+/// The body of the one-shot observation a wait evaluates once its condition
+/// holds; it takes the same expression or chunk forms as the condition.
+fn wait_result_body(result: &str) -> Result<String> {
+    returning_body(result, "result expression")
+}
+
+fn returning_body(source: &str, label: &str) -> Result<String> {
+    let expression = format!("return ({source}\n)");
     match validate_luau_syntax(&expression) {
         Ok(()) => Ok(expression),
         Err(expression_error) => {
-            if validate_luau_syntax(condition).is_ok() {
-                return Ok(condition.to_string());
+            if validate_luau_syntax(source).is_ok() {
+                return Ok(source.to_string());
             }
-            Err(expression_error
-                .context("The condition is neither a Luau expression nor a chunk that returns one"))
+            Err(expression_error.context(format!(
+                "The {label} is neither a Luau expression nor a chunk that returns one"
+            )))
         }
     }
+}
+
+/// One bounded runner slice of a wait: polls the condition until it holds or
+/// the slice ends. A met condition returns `true, tostring(value)`, and with a
+/// result body also whether that body ran cleanly plus its value or error, so
+/// the observation reaches the daemon through the runner's own serialization.
+fn wait_probe_code(body: &str, result_body: Option<&str>, slice: f64, interval: f64) -> String {
+    let met = match result_body {
+        Some(result_body) => format!(
+            "\t\t\tlocal resultOk, result = pcall(function()\n\
+             {result_body}\n\
+             \t\t\tend)\n\
+             \t\t\treturn true, tostring(value), resultOk, result"
+        ),
+        None => "\t\t\treturn true, tostring(value)".to_string(),
+    };
+    format!(
+        "local deadline = os.clock() + {slice}\n\
+         local detail = nil\n\
+         \twhile true do\n\
+         \t\tlocal ok, value = pcall(function()\n\
+         {body}\n\
+         \t\tend)\n\
+         \t\tdetail = value\n\
+         \t\tif ok and value then\n\
+         {met}\n\
+         \t\tend\n\
+         \t\tif os.clock() >= deadline then return false, tostring(detail) end\n\
+         \t\ttask.wait({interval})\n\
+         \tend",
+    )
+}
+
+/// The wait record for a met condition. With a result expression, a clean
+/// evaluation adds `result`; a failing one turns the record into a failure
+/// that still says the condition was met, so the caller does not wait again.
+fn met_condition_result(args: &WaitUntilArgs, outcome: &LuauTaskOutcome, elapsed: f64) -> Value {
+    let mut record = json!({
+        "ok": true,
+        "action": "wait",
+        "condition": args.condition,
+        "value": outcome.detail,
+        "elapsedSeconds": elapsed,
+    });
+    if args.result.is_none() {
+        return record;
+    }
+    let observed = outcome.results.get(3).cloned().unwrap_or(Value::Null);
+    if outcome.results.get(2).and_then(Value::as_bool) == Some(true) {
+        record["result"] = observed;
+    } else {
+        record["ok"] = json!(false);
+        record["conditionMet"] = json!(true);
+        let error = match &observed {
+            Value::String(message) => message.clone(),
+            other => other.to_string(),
+        };
+        record["error"] = json!(format!(
+            "The condition was met, but the result expression failed: {error}"
+        ));
+    }
+    record
 }
 
 pub(crate) fn wait_until_result(args: &WaitUntilArgs, bridge: &BridgeServer) -> Result<Value> {
@@ -2756,6 +2847,7 @@ pub(crate) fn wait_until_result(args: &WaitUntilArgs, bridge: &BridgeServer) -> 
         bail!("--timeout and --interval must be finite numbers");
     }
     let body = wait_condition_body(&args.condition)?;
+    let result_body = args.result.as_deref().map(wait_result_body).transpose()?;
     let timeout = args.timeout.clamp(0.1, 3600.0);
     let interval = args.interval.clamp(0.05, 10.0);
     let started = Instant::now();
@@ -2777,28 +2869,14 @@ pub(crate) fn wait_until_result(args: &WaitUntilArgs, bridge: &BridgeServer) -> 
             }));
         }
         let slice = remaining.min(WAIT_RUNNER_SLICE_SECONDS);
-        let code = format!(
-            "local deadline = os.clock() + {slice}\n\
-             local detail = nil\n\
-             \twhile true do\n\
-             \t\tlocal ok, value = pcall(function()\n\
-             {body}\n\
-             \t\tend)\n\
-             \t\tdetail = value\n\
-             \t\tif ok and value then return true, tostring(value) end\n\
-             \t\tif os.clock() >= deadline then return false, tostring(detail) end\n\
-             \t\ttask.wait({interval})\n\
-             \tend",
-        );
+        let code = wait_probe_code(&body, result_body.as_deref(), slice, interval);
         let outcome = run_luau_task(bridge, target, player, &code, slice + 5.0)?;
         if outcome.success {
-            return Ok(json!({
-                "ok": true,
-                "action": "wait",
-                "condition": args.condition,
-                "value": outcome.detail,
-                "elapsedSeconds": started.elapsed().as_secs_f64(),
-            }));
+            return Ok(met_condition_result(
+                args,
+                &outcome,
+                started.elapsed().as_secs_f64(),
+            ));
         }
         detail = outcome.detail;
     }
@@ -2811,6 +2889,7 @@ const WAIT_RUNNER_SLICE_SECONDS: f64 = 100.0;
 struct LuauTaskOutcome {
     success: bool,
     detail: Value,
+    results: Vec<Value>,
     elapsed: f64,
 }
 
@@ -2835,6 +2914,7 @@ fn run_luau_task(
     Ok(LuauTaskOutcome {
         success,
         detail: results.get(1).cloned().unwrap_or(Value::Null),
+        results: results.clone(),
         elapsed: started.elapsed().as_secs_f64(),
     })
 }
@@ -3382,6 +3462,7 @@ pub(crate) fn wait_until_command(args: WaitUntilArgs) -> Result<()> {
         op::WAIT,
         json!({
             "condition": args.condition,
+            "result": args.result,
             "player": args.player,
             "client": args.client,
             "timeout": args.timeout,
@@ -4417,6 +4498,51 @@ mod compact_result_tests {
     }
 
     #[test]
+    fn play_start_lifts_the_awaited_result_beside_the_launch_fields() {
+        let mut result =
+            json!({"ok": true, "action": "start", "editRuntimeId": "e", "clients": []});
+        let snapshot = json!({"hp": 100, "state": "InRound", "zones": ["A", "B"]});
+        let wait = json!({
+            "ok": true, "action": "wait", "condition": "ready", "value": "true",
+            "result": snapshot, "elapsedSeconds": 2.5
+        });
+        assert!(attach_awaited_result(&mut result, wait));
+        assert_eq!(result["result"], snapshot);
+        assert_eq!(
+            result["until"],
+            json!({"ok": true, "action": "wait", "condition": "ready", "value": "true", "elapsedSeconds": 2.5})
+        );
+        compact_play_result(&mut result, false);
+        assert_eq!(
+            result,
+            json!({"ok": true, "clients": 0, "until": "true", "result": snapshot})
+        );
+
+        let mut plain = json!({"ok": true, "action": "start"});
+        assert!(attach_awaited_result(
+            &mut plain,
+            json!({"ok": true, "action": "wait", "value": "true"})
+        ));
+        assert!(plain.get("result").is_none());
+
+        let mut failed = json!({"ok": true, "action": "start"});
+        let error = json!({
+            "ok": false, "action": "wait", "conditionMet": true, "value": "true",
+            "error": "The condition was met, but the result expression failed: attempt to index nil"
+        });
+        assert!(!attach_awaited_result(&mut failed, error.clone()));
+        assert_eq!(failed["until"], error);
+        assert!(failed.get("result").is_none());
+
+        let mut timed_out = json!({"ok": true, "action": "start"});
+        assert!(!attach_awaited_result(
+            &mut timed_out,
+            json!({"ok": false, "timedOut": true, "value": "false"})
+        ));
+        assert_eq!(timed_out["until"]["timedOut"], true);
+    }
+
+    #[test]
     fn capture_and_wait_results_drop_their_echoes() {
         let output = json!("C:/shots/a.png");
         let mut shot = json!({"ok": true, "path": output, "width": 10, "height": 5, "window": "Studio",
@@ -4440,7 +4566,119 @@ mod compact_result_tests {
 
 #[cfg(test)]
 mod wait_condition_tests {
-    use super::wait_condition_body;
+    use super::*;
+
+    fn wait_args(condition: &str, result: Option<&str>) -> WaitUntilArgs {
+        WaitUntilArgs {
+            bridge: BridgeConnectionArgs::local(3.0),
+            condition: condition.to_string(),
+            player: None,
+            client: false,
+            timeout: 60.0,
+            interval: 0.25,
+            result: result.map(str::to_string),
+        }
+    }
+
+    fn outcome(results: Vec<Value>) -> LuauTaskOutcome {
+        LuauTaskOutcome {
+            success: results.first() == Some(&json!(true)),
+            detail: results.get(1).cloned().unwrap_or(Value::Null),
+            results,
+            elapsed: 1.0,
+        }
+    }
+
+    #[test]
+    fn result_expressions_take_the_condition_forms() {
+        assert_eq!(
+            wait_result_body("shared.RoundHandler:Snapshot()").unwrap(),
+            "return (shared.RoundHandler:Snapshot()\n)"
+        );
+        assert_eq!(
+            wait_result_body("{hp = car.HP, state = shared.RoundHandler.GameState}").unwrap(),
+            "return ({hp = car.HP, state = shared.RoundHandler.GameState}\n)"
+        );
+        let chunk = "local car = workspace.Car; return {hp = car.HP}";
+        assert_eq!(wait_result_body(chunk).unwrap(), chunk);
+        let error = format!("{:#}", wait_result_body("{hp =").unwrap_err());
+        assert!(
+            error.starts_with("The result expression is neither a Luau expression nor a chunk"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn probe_code_returns_the_observation_only_after_the_condition_holds() {
+        let plain = wait_probe_code("return (ready\n)", None, 100.0, 0.25);
+        validate_luau_syntax(&plain).unwrap();
+        assert!(plain.contains("return true, tostring(value)"));
+        assert!(!plain.contains("resultOk"));
+
+        let typed = wait_probe_code(
+            "return (ready\n)",
+            Some("return (shared.RoundHandler:Snapshot()\n)"),
+            100.0,
+            0.25,
+        );
+        validate_luau_syntax(&typed).unwrap();
+        let condition = typed.find("return (ready").unwrap();
+        let observation = typed
+            .find("return (shared.RoundHandler:Snapshot()")
+            .unwrap();
+        assert!(condition < observation);
+        assert!(typed.contains("local resultOk, result = pcall(function()"));
+        assert!(typed.contains("return true, tostring(value), resultOk, result"));
+        assert!(
+            typed.contains("if os.clock() >= deadline then return false, tostring(detail) end")
+        );
+        assert!(typed.contains("task.wait(0.25)"));
+    }
+
+    #[test]
+    fn met_conditions_carry_the_typed_result_or_its_failure() {
+        let args = wait_args("ready", None);
+        let plain = met_condition_result(&args, &outcome(vec![json!(true), json!("true")]), 1.5);
+        assert_eq!(
+            plain,
+            json!({"ok": true, "action": "wait", "condition": "ready", "value": "true", "elapsedSeconds": 1.5})
+        );
+
+        let args = wait_args("ready", Some("shared.RoundHandler:Snapshot()"));
+        let snapshot = json!({"hp": 100, "state": "InRound", "zones": ["A", "B"]});
+        let typed = met_condition_result(
+            &args,
+            &outcome(vec![
+                json!(true),
+                json!("true"),
+                json!(true),
+                snapshot.clone(),
+            ]),
+            1.5,
+        );
+        assert_eq!(typed["ok"], true);
+        assert_eq!(typed["value"], "true");
+        assert_eq!(typed["result"], snapshot);
+
+        let failed = met_condition_result(
+            &args,
+            &outcome(vec![
+                json!(true),
+                json!("true"),
+                json!(false),
+                json!("attempt to index nil with 'Snapshot'"),
+            ]),
+            1.5,
+        );
+        assert_eq!(failed["ok"], false);
+        assert_eq!(failed["conditionMet"], true);
+        assert_eq!(failed["value"], "true");
+        assert!(failed.get("result").is_none());
+        assert_eq!(
+            failed["error"],
+            "The condition was met, but the result expression failed: attempt to index nil with 'Snapshot'"
+        );
+    }
 
     #[test]
     fn single_expressions_are_returned_and_chunks_run_as_written() {
