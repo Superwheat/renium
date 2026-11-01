@@ -3726,7 +3726,13 @@ local function mutationNeedsStructuralSnapshot(params: { [string]: any }, ctx: {
 end
 
 local function captureSnapshotRoots(groups: { any }): ({ [string]: Instance }, { Instance }, { Instance }, number)
-	local yieldForBudget = BridgeParallel.newWorkBudget()
+	local budget = BridgeParallel.newWorkBudget()
+	local pathSnapshot = BridgeIdentity.newPathSnapshot()
+	local function yieldForBudget()
+		if budget() then
+			pathSnapshot = BridgeIdentity.newPathSnapshot()
+		end
+	end
 	local originalByPath = {}
 	local originalRoots = {}
 	local nonArchivable = {}
@@ -3748,7 +3754,7 @@ local function captureSnapshotRoots(groups: { any }): ({ [string]: Instance }, {
 					if not instance.Archivable then
 						nonArchivable[#nonArchivable + 1] = instance
 					end
-					local pathSegments, pathOrdinals = BridgeIdentity.getRefPathParts(instance)
+					local pathSegments, pathOrdinals = BridgeIdentity.getRefPathParts(instance, pathSnapshot)
 					if pathSegments ~= nil then
 						originalByPath[pathCacheKey(pathSegments, pathOrdinals)] = instance
 					end
@@ -4317,12 +4323,13 @@ function TransactionState.appendJournalRecords(session: { [string]: any }, recor
 	if #records > 0 then
 		table.move(records, 1, #records, #journal + 1, journal)
 	end
+	local pathSnapshot = BridgeIdentity.newPathSnapshot()
 	for _, record in ipairs(records) do
 		local instance = resolveReplacement(record.instance, session.instanceReplacements) or record.instance
 		record.currentInstance = instance
 		record.parent = instance.Parent
 		if record.parent ~= nil then
-			record.parentPathSegments, record.parentPathOrdinals = BridgeIdentity.getRefPathParts(record.parent)
+			record.parentPathSegments, record.parentPathOrdinals = BridgeIdentity.getRefPathParts(record.parent, pathSnapshot)
 		end
 		if record.tagsChanged then
 			local okTags, tags = pcall(CollectionService.GetTags, CollectionService, instance)
