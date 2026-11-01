@@ -233,7 +233,7 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ),
     (
         "ba",
-        "Examples:\n  rbx ba Workspace -n Door -c Part -I editor:parent",
+        "Examples:\n  rbx ba Workspace -n Door -c Part -I editor:parent\n  '{\"ops\":[{\"parent\":\"ServerScriptService\",\"name\":\"Battle\",\"class\":\"Folder\",\"ref\":\"battle\"},{\"parent\":\"#battle\",\"name\":\"Rounds\",\"class\":\"ModuleScript\",\"source\":\"return {}\"}]}' | rbx ba --batch -\n  rbx ba --batch ops.json",
     ),
     (
         "bcl",

@@ -11,6 +11,7 @@ use rbx_reflection::DataType as RbxDataType;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
+pub(crate) mod add_batch;
 pub(crate) mod edit;
 pub(crate) mod explorer;
 pub(crate) mod query;

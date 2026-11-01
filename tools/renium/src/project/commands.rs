@@ -251,9 +251,10 @@ pub(crate) fn create_instance_command(
         return bytecode_add_instance(BytecodeAddInstanceArgs {
             input: BytecodeFileArgs::settings_file(settings_file),
             service_hint: Some(args.service),
-            name: args.name,
-            class_name: args.class_name,
+            name: Some(args.name),
+            class_name: Some(args.class_name),
             settings_id: None,
+            batch: None,
             parent: BytecodeParentArgs {
                 parent_settings_id,
                 ..Default::default()
@@ -277,9 +278,10 @@ pub(crate) fn create_instance_command(
     bytecode_add_instance(BytecodeAddInstanceArgs {
         input: BytecodeFileArgs::settings_file(settings_file),
         service_hint: Some(args.service),
-        name: args.name,
-        class_name: args.class_name,
+        name: Some(args.name),
+        class_name: Some(args.class_name),
         settings_id: None,
+        batch: None,
         parent: BytecodeParentArgs {
             parent_settings_id: args.parent_settings_id,
             ..Default::default()

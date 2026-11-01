@@ -3227,12 +3227,46 @@ pub(super) struct BytecodeAddInstanceArgs {
     pub(super) input: BytecodeFileArgs,
     #[arg(skip)]
     pub(super) service_hint: Option<String>,
-    #[arg(help = "Name of the new instance", short, long)]
-    pub(super) name: String,
-    #[arg(help = "Class name of the new instance", short, long, alias = "class")]
-    pub(super) class_name: String,
+    #[arg(
+        help = "Name of the new instance",
+        short,
+        long,
+        required_unless_present = "batch"
+    )]
+    pub(super) name: Option<String>,
+    #[arg(
+        help = "Class name of the new instance",
+        short,
+        long,
+        alias = "class",
+        required_unless_present = "batch"
+    )]
+    pub(super) class_name: Option<String>,
     #[arg(help = "Settings ID to assign", short = 'i', long, alias = "id")]
     pub(super) settings_id: Option<String>,
+    #[arg(
+        help = "Create several instances from JSON ops: a file, - for stdin, or inline JSON",
+        short = 'J',
+        long,
+        value_name = "PATH",
+        num_args = 0..=1,
+        default_missing_value = "-",
+        conflicts_with_all = [
+            "service_or_file",
+            "settings_file",
+            "name",
+            "class_name",
+            "settings_id",
+            "parent_index",
+            "parent_settings_id",
+            "parent_name",
+            "parent_class_name",
+            "no_parent",
+            "properties",
+            "attributes",
+        ]
+    )]
+    pub(super) batch: Option<PathBuf>,
     #[command(flatten)]
     pub(super) parent: BytecodeParentArgs,
     #[arg(help = "Property as NAME=JSON (repeatable)", short, long = "property")]
