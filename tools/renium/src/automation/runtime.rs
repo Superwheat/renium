@@ -1493,6 +1493,13 @@ fn automation_dispatch_operation(
         }
         op::WAIT => {
             let parsed = studio_args::wait(parameters)?;
+            if let Some(expected) = parameters.get("editRuntimeId").and_then(Value::as_str)
+                && context.runtime_id.as_deref() != Some(expected)
+            {
+                bail!(
+                    "The bound Studio changed after the Play launch (runtime {expected} is no longer selected); the condition was not evaluated"
+                );
+            }
             if parsed.player.is_none() {
                 let target = BridgeTarget::main_or_client(parsed.client);
                 bridge.wait_for_target(bridge_wait_seconds, target)?;

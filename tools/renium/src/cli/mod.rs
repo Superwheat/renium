@@ -1783,6 +1783,13 @@ pub(super) struct StartStopPlayArgs {
     )]
     pub(super) until_timeout: f64,
     #[arg(
+        help = "Once --until holds, evaluate this Luau expression (or chunk) once on the server and return it as result, tables included",
+        long,
+        value_name = "LUAU",
+        requires = "until"
+    )]
+    pub(super) result: Option<String>,
+    #[arg(
         help = "Close Studio test server/client windows whose Edit window has exited (with --place: that place's only)",
         long,
         conflicts_with_all = ["start", "stop", "restart", "players", "add_players", "leave", "mode", "until"]
@@ -2180,6 +2187,12 @@ pub(super) struct WaitUntilArgs {
     pub(super) timeout: f64,
     #[arg(help = "Seconds between checks", long, default_value_t = 0.25)]
     pub(super) interval: f64,
+    #[arg(
+        help = "Once the condition holds, evaluate this Luau expression (or chunk) once in the same runner and return it as result, tables included",
+        long,
+        value_name = "LUAU"
+    )]
+    pub(super) result: Option<String>,
 }
 
 #[derive(Parser)]
