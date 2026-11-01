@@ -882,7 +882,11 @@ fn closest_subcommands(parents: &[String], name: &str) -> Vec<String> {
         };
         parent = child.clone();
     }
-    let probe = clap::Command::new("rbx").subcommands(parent.get_subcommands().cloned());
+    // The parent already carries the `help` subcommand; clap's own would
+    // duplicate its name.
+    let probe = clap::Command::new("rbx")
+        .disable_help_subcommand(true)
+        .subcommands(parent.get_subcommands().cloned());
     let Err(error) = probe.try_get_matches_from(["rbx", name]) else {
         return Vec::new();
     };
