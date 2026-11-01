@@ -147,17 +147,17 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
             studio_change_state_operation_command(args, op::LIVE_START, project)
         }
         Commands::LiveStop(args) => {
-            studio_change_state_operation_command(args, op::LIVE_STOP, project)
+            studio_change_state_operation_command(args.into(), op::LIVE_STOP, project)
         }
         Commands::LiveStatus(args) => {
-            studio_change_state_operation_command(args, op::LIVE_STATUS, project)
+            studio_change_state_operation_command(args.into(), op::LIVE_STATUS, project)
         }
         Commands::Collab(args) => crate::collab::command::collab_command(args, project),
         Commands::RetryPending(args) => {
-            studio_change_state_operation_command(args, op::RETRY_PENDING, project)
+            studio_change_state_operation_command(args.into(), op::RETRY_PENDING, project)
         }
         Commands::DiscardPending(args) => {
-            studio_change_state_operation_command(args, op::DISCARD_PENDING, project)
+            studio_change_state_operation_command(args.into(), op::DISCARD_PENDING, project)
         }
         Commands::PushEditorChanges(args) => push_editor_changes(args),
         Commands::ApplyEditorProperty(args) => apply_editor_property(args),
@@ -196,5 +196,6 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::PlaceAdd(args) => commands::place_add(args, project),
         Commands::PlaceRename(args) => commands::place_rename(args, project),
         Commands::PlaceReorder(args) => commands::place_reorder(args, project),
+        Commands::Help(args) => crate::cli::run_help(args),
     }
 }

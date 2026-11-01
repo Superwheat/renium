@@ -15,6 +15,7 @@ pub(crate) fn apply_merged(cli: &mut Cli, matches: &clap::ArgMatches) -> Result<
             | Commands::UpdateHelper(_)
             | Commands::Plugin(_)
             | Commands::External(_)
+            | Commands::Help(_)
     ) {
         return Ok(());
     }
@@ -146,6 +147,32 @@ fn apply_default_services(
     apply_default(matches, "services", target, configured_services(object));
 }
 
+fn apply_live_sync_defaults(
+    matches: &clap::ArgMatches,
+    object: &Map<String, Value>,
+    initial_sync_priority: &mut Option<String>,
+    initial_conflict_preference: &mut Option<String>,
+) {
+    let live = object.get("liveSync").and_then(Value::as_object);
+    let configured = |key: &str| {
+        live.and_then(|live| live.get(key))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    apply_default(
+        matches,
+        "initial_sync_priority",
+        initial_sync_priority,
+        configured("initialSyncPriority").map(Some),
+    );
+    apply_default(
+        matches,
+        "initial_conflict_preference",
+        initial_conflict_preference,
+        configured("initialConflictPreference").map(Some),
+    );
+}
+
 fn apply_bridge(
     matches: &clap::ArgMatches,
     object: &Map<String, Value>,
@@ -186,29 +213,27 @@ fn apply_command(
             apply_bridge(matches, object, &mut args.bridge);
         }
         Commands::BridgeDaemon(args) => apply_bridge(matches, object, &mut args.bridge),
-        Commands::StudioChangeState(args)
-        | Commands::LiveStart(args)
-        | Commands::LiveStop(args)
-        | Commands::LiveStatus(args)
-        | Commands::RetryPending(args) => {
-            let live = object.get("liveSync").and_then(Value::as_object);
-            let configured = |key: &str| {
-                live.and_then(|live| live.get(key))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            };
-            apply_default(
+        Commands::StudioChangeState(args) | Commands::LiveStart(args) => {
+            apply_live_sync_defaults(
                 matches,
-                "initial_sync_priority",
+                object,
                 &mut args.initial_sync_priority,
-                configured("initialSyncPriority").map(Some),
-            );
-            apply_default(
-                matches,
-                "initial_conflict_preference",
                 &mut args.initial_conflict_preference,
-                configured("initialConflictPreference").map(Some),
             );
+            apply_bridge(matches, object, &mut args.bridge);
+        }
+        Commands::LiveStatus(args) => {
+            apply_live_sync_defaults(
+                matches,
+                object,
+                &mut args.initial_sync_priority,
+                &mut args.initial_conflict_preference,
+            );
+            apply_bridge(matches, object, &mut args.bridge);
+        }
+        Commands::LiveStop(args)
+        | Commands::RetryPending(args)
+        | Commands::DiscardPending(args) => {
             apply_bridge(matches, object, &mut args.bridge);
         }
         Commands::PushEditorChanges(args) => {

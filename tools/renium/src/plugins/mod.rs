@@ -293,7 +293,7 @@ pub(crate) fn run(args: Vec<OsString>, project: Option<&Path>) -> Result<()> {
         .context("Missing plugin command")?;
     let home = plugin_home()?;
     if !registration_path(&home, name)?.try_exists()? {
-        bail!("Unknown command '{name}'. Use rbx --help or rbx plugin list");
+        return Err(crate::cli::unknown_command_error(&[name.to_string()]));
     }
     let (registration, manifest) = installed(&home, name)?;
     let matches = match manifest::command(&manifest).try_get_matches_from(args) {

@@ -433,6 +433,7 @@ pub(super) enum Commands {
         name = "co",
         alias = "get-console-output",
         alias = "console",
+        alias = "log",
         about = "Read Studio or play console output"
     )]
     GetConsoleOutput(PluginConsoleOutputArgs),
@@ -630,10 +631,15 @@ pub(super) enum Commands {
     StudioChangeState(StudioChangeStateArgs),
     #[command(name = "lon", alias = "live-start", about = "Start Live Sync")]
     LiveStart(StudioChangeStateArgs),
-    #[command(name = "lof", alias = "live-stop", about = "Stop Live Sync")]
-    LiveStop(StudioChangeStateArgs),
+    #[command(
+        name = "lof",
+        alias = "live-stop",
+        alias = "loff",
+        about = "Stop Live Sync"
+    )]
+    LiveStop(LiveControlArgs),
     #[command(name = "lst", alias = "live-status", about = "Show Live Sync status")]
-    LiveStatus(StudioChangeStateArgs),
+    LiveStatus(LiveStatusArgs),
     #[command(
         name = "collab",
         alias = "collaborate",
@@ -645,13 +651,13 @@ pub(super) enum Commands {
         alias = "retry-pending",
         about = "Retry pending Live Sync edits"
     )]
-    RetryPending(StudioChangeStateArgs),
+    RetryPending(LiveControlArgs),
     #[command(
         name = "dp",
         alias = "discard-pending",
         about = "Discard pending Live Sync edits"
     )]
-    DiscardPending(StudioChangeStateArgs),
+    DiscardPending(LiveControlArgs),
     #[command(
         name = "ps",
         alias = "push",
@@ -837,6 +843,113 @@ pub(super) enum Commands {
     PlaceRename(PlaceRenameArgs),
     #[command(name = "po", alias = "place-reorder", about = "Reorder places")]
     PlaceReorder(PlaceReorderArgs),
+    #[command(name = "help", hide = true, about = "Print help for a command")]
+    Help(HelpArgs),
+}
+
+#[derive(Parser)]
+pub(super) struct HelpArgs {
+    #[arg(
+        help = "Command (and subcommand) whose help to print; none prints rbx --help",
+        value_name = "COMMAND"
+    )]
+    pub(super) command: Vec<String>,
+}
+
+/// `rbx help [COMMAND...]` prints the same text as `rbx COMMAND --help`.
+pub(crate) fn run_help(args: HelpArgs) -> anyhow::Result<()> {
+    let mut arguments = vec!["rbx".to_string()];
+    arguments.extend(args.command.iter().cloned());
+    arguments.push("--help".to_string());
+    match command().try_get_matches_from(&arguments) {
+        Err(error) if error.kind() == clap::error::ErrorKind::DisplayHelp => {
+            print!("{error}");
+            Ok(())
+        }
+        Ok(_) | Err(_) => Err(unknown_command_error(&args.command)),
+    }
+}
+
+/// Clap's own "did you mean" candidates for `name` among the subcommands of
+/// `rbx PARENTS...`, read from a copy of that command without the external
+/// subcommand catch-all, which otherwise swallows every unknown name. Only the
+/// candidates closest in edit distance are kept, nearest-first.
+fn closest_subcommands(parents: &[String], name: &str) -> Vec<String> {
+    let mut parent = command();
+    for segment in parents {
+        let Some(child) = parent.find_subcommand(segment) else {
+            return Vec::new();
+        };
+        parent = child.clone();
+    }
+    let probe = clap::Command::new("rbx").subcommands(parent.get_subcommands().cloned());
+    let Err(error) = probe.try_get_matches_from(["rbx", name]) else {
+        return Vec::new();
+    };
+    let candidates = match error.get(clap::error::ContextKind::SuggestedSubcommand) {
+        Some(clap::error::ContextValue::Strings(names)) => names.clone(),
+        _ => return Vec::new(),
+    };
+    let mut ranked = candidates
+        .into_iter()
+        .map(|candidate| (edit_distance(name, &candidate), candidate))
+        .collect::<Vec<_>>();
+    ranked.sort();
+    let Some(&(closest, _)) = ranked.first() else {
+        return Vec::new();
+    };
+    ranked
+        .into_iter()
+        .take_while(|(distance, _)| *distance == closest)
+        .map(|(_, candidate)| candidate)
+        .collect()
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b = b.chars().collect::<Vec<_>>();
+    let mut previous = (0..=b.len()).collect::<Vec<_>>();
+    for (i, ca) in a.chars().enumerate() {
+        let mut current = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let substitution = previous[j] + usize::from(ca != *cb);
+            current.push(substitution.min(previous[j + 1] + 1).min(current[j] + 1));
+        }
+        previous = current;
+    }
+    previous[b.len()]
+}
+
+/// The error for a command name Renium does not know, with clap's closest
+/// matches and where to look next.
+pub(crate) fn unknown_command_error(path: &[String]) -> anyhow::Error {
+    let (name, parents) = match path.split_last() {
+        Some((name, parents)) => (name.as_str(), parents),
+        None => return anyhow::anyhow!("Missing command. rbx --help lists commands"),
+    };
+    let listing = std::iter::once("rbx")
+        .chain(parents.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let suggestions = closest_subcommands(parents, name);
+    let did_you_mean = match suggestions.as_slice() {
+        [] => String::new(),
+        [one] => format!("; did you mean '{one}'?"),
+        many => format!(
+            "; did you mean one of {}?",
+            many.iter()
+                .map(|name| format!("'{name}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    let plugins = if parents.is_empty() {
+        "; rbx plugin list shows plugin commands"
+    } else {
+        ""
+    };
+    anyhow::anyhow!(
+        "Unknown command '{name}'{did_you_mean}. {listing} --help lists commands; rbx docs <guide> prints a guide{plugins}"
+    )
 }
 
 #[cfg(test)]
@@ -890,6 +1003,134 @@ mod tests {
             let error = client_luau(arguments).err().unwrap().to_string();
             assert!(error.ends_with(expected), "{arguments:?}: {error}");
             assert!(!error.contains('\n'), "{arguments:?}: {error}");
+        }
+    }
+
+    fn parse(arguments: &[&str]) -> Result<Commands, String> {
+        let matches = command()
+            .try_get_matches_from(["rbx"].iter().chain(arguments))
+            .map_err(|error| error.to_string())?;
+        <Cli as clap::FromArgMatches>::from_arg_matches(&matches)
+            .map(|cli| cli.command)
+            .map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn hidden_aliases_resolve_to_their_commands() {
+        assert!(matches!(
+            parse(&["log", "--player", "1"]).unwrap(),
+            Commands::GetConsoleOutput(_)
+        ));
+        assert!(matches!(parse(&["loff"]).unwrap(), Commands::LiveStop(_)));
+        let command = command();
+        for (alias, target) in [("log", "co"), ("loff", "lof")] {
+            let subcommand = command.find_subcommand(alias).unwrap();
+            assert_eq!(subcommand.get_name(), target);
+            assert!(subcommand.get_all_aliases().any(|name| name == alias));
+            assert!(!subcommand.get_visible_aliases().any(|name| name == alias));
+        }
+    }
+
+    #[test]
+    fn help_subcommand_takes_a_command_path() {
+        assert!(command().find_subcommand("help").unwrap().is_hide_set());
+        match parse(&["help"]).unwrap() {
+            Commands::Help(args) => assert!(args.command.is_empty()),
+            _ => unreachable!(),
+        }
+        match parse(&["help", "oc", "key"]).unwrap() {
+            Commands::Help(args) => assert_eq!(args.command, ["oc", "key"]),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn unknown_commands_get_a_suggestion_and_pointers() {
+        let error = unknown_command_error(&["lonn".to_string()]).to_string();
+        assert!(
+            error.starts_with("Unknown command 'lonn'; did you mean 'lon'?"),
+            "{error}"
+        );
+        assert!(
+            error.contains("rbx --help lists commands; rbx docs <guide> prints a guide"),
+            "{error}"
+        );
+        assert!(error.contains("rbx plugin list"), "{error}");
+        let nested = unknown_command_error(&["oc".to_string(), "keys".to_string()]).to_string();
+        assert!(
+            nested.starts_with("Unknown command 'keys'; did you mean 'key'?"),
+            "{nested}"
+        );
+        assert!(nested.contains("rbx oc --help lists commands"), "{nested}");
+        assert!(!nested.contains("plugin list"), "{nested}");
+        let distant = unknown_command_error(&["zzzzzzzz".to_string()]).to_string();
+        assert!(
+            distant.starts_with("Unknown command 'zzzzzzzz'. rbx --help"),
+            "{distant}"
+        );
+    }
+
+    #[test]
+    fn live_status_and_pending_commands_take_only_their_own_flags() {
+        match parse(&["lst", "--wait", "--details"]).unwrap() {
+            Commands::LiveStatus(args) => {
+                assert_eq!(args.settle_wait_seconds, Some(10.0));
+                assert!(args.details);
+            }
+            _ => unreachable!(),
+        }
+        match parse(&["lst", "--wait", "30"]).unwrap() {
+            Commands::LiveStatus(args) => assert_eq!(args.settle_wait_seconds, Some(30.0)),
+            _ => unreachable!(),
+        }
+        let status: StudioChangeStateArgs = match parse(&["lst"]).unwrap() {
+            Commands::LiveStatus(args) => args.into(),
+            _ => unreachable!(),
+        };
+        assert!(status.settle_wait_seconds.is_none());
+        assert!(!status.details && !status.clear_pending && status.prefer.is_none());
+        for arguments in [
+            &["lst", "--prefer", "studio"][..],
+            &["lst", "--clear-pending"],
+            &["lst", "--event-wait-seconds", "1"],
+            &["lof", "--prefer", "editor"],
+            &["lof", "--wait"],
+            &["rp", "--reset"],
+            &["dp", "--services", "Workspace"],
+        ] {
+            assert!(parse(arguments).is_err(), "{arguments:?}");
+        }
+        for arguments in [
+            &["lof", "--details"][..],
+            &["rp", "-w", "4"],
+            &["dp", "-P", "8781"],
+        ] {
+            assert!(parse(arguments).is_ok(), "{arguments:?}");
+        }
+        let help = command()
+            .find_subcommand_mut("lst")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("Wait up to SECONDS (default 10, at most 120) for watched file changes to finish syncing"), "{help}");
+        assert!(!help.contains("--prefer"), "{help}");
+    }
+
+    #[test]
+    fn live_start_keeps_its_wait_and_tracking_flags() {
+        match parse(&["lon", "--wait", "--prefer", "studio"]).unwrap() {
+            Commands::LiveStart(args) => {
+                assert_eq!(args.settle_wait_seconds, Some(10.0));
+                assert_eq!(args.prefer.as_deref(), Some("studio"));
+            }
+            _ => unreachable!(),
+        }
+        match parse(&["st", "--event-wait-seconds", "1", "--wait", "5"]).unwrap() {
+            Commands::StudioChangeState(args) => {
+                assert_eq!(args.event_wait_seconds, Some(1.0));
+                assert_eq!(args.settle_wait_seconds, Some(5.0));
+            }
+            _ => unreachable!(),
         }
     }
 
@@ -2200,7 +2441,7 @@ pub(super) struct StudioChangeStateArgs {
         value_name = "SECONDS",
         num_args = 0..=1,
         default_missing_value = "10",
-        help = "Wait up to SECONDS (at most 120) for watched file changes to finish syncing"
+        help = "After starting, wait up to SECONDS (default 10, at most 120) for the first comparison and watched file changes to finish syncing"
     )]
     pub(super) settle_wait_seconds: Option<f64>,
     #[arg(help = "Bind tracking to the current project context", long)]
@@ -2225,6 +2466,79 @@ pub(super) struct StudioChangeStateArgs {
         value_name = "none|studio|editor"
     )]
     pub(super) initial_conflict_preference: Option<String>,
+}
+
+impl StudioChangeStateArgs {
+    /// Arguments for one Live Sync operation that takes no tracking options.
+    pub(crate) fn plain(bridge: BridgeConnectionArgs, details: bool) -> Self {
+        Self {
+            bridge,
+            services: String::new(),
+            reset: false,
+            replace_services: false,
+            clear_pending: false,
+            no_start: false,
+            stop: false,
+            ack_seq: None,
+            ack_runtime_settings_seq: None,
+            ack_actions: Vec::new(),
+            ack_action_results: "{}".to_string(),
+            runtime_id: None,
+            suppress_seconds: None,
+            event_wait_seconds: None,
+            settle_wait_seconds: None,
+            context_bound: false,
+            details,
+            prefer: None,
+            initial_sync_priority: None,
+            initial_conflict_preference: None,
+        }
+    }
+}
+
+#[derive(Parser)]
+pub(crate) struct LiveStatusArgs {
+    #[command(flatten)]
+    pub(crate) bridge: BridgeConnectionArgs,
+    #[arg(help = "Include full change details", long)]
+    pub(crate) details: bool,
+    #[arg(
+        long = "wait",
+        value_name = "SECONDS",
+        num_args = 0..=1,
+        default_missing_value = "10",
+        help = "Wait up to SECONDS (default 10, at most 120) for watched file changes to finish syncing"
+    )]
+    pub(crate) settle_wait_seconds: Option<f64>,
+    #[arg(skip)]
+    pub(crate) initial_sync_priority: Option<String>,
+    #[arg(skip)]
+    pub(crate) initial_conflict_preference: Option<String>,
+}
+
+impl From<LiveStatusArgs> for StudioChangeStateArgs {
+    fn from(args: LiveStatusArgs) -> Self {
+        Self {
+            settle_wait_seconds: args.settle_wait_seconds,
+            initial_sync_priority: args.initial_sync_priority,
+            initial_conflict_preference: args.initial_conflict_preference,
+            ..Self::plain(args.bridge, args.details)
+        }
+    }
+}
+
+#[derive(Parser)]
+pub(crate) struct LiveControlArgs {
+    #[command(flatten)]
+    pub(crate) bridge: BridgeConnectionArgs,
+    #[arg(help = "Include full change details", long)]
+    pub(crate) details: bool,
+}
+
+impl From<LiveControlArgs> for StudioChangeStateArgs {
+    fn from(args: LiveControlArgs) -> Self {
+        Self::plain(args.bridge, args.details)
+    }
 }
 
 #[derive(Parser)]

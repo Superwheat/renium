@@ -224,6 +224,7 @@ fn resumes_global_audio(command: &Commands) -> bool {
             | Commands::Report(_)
             | Commands::Plugin(_)
             | Commands::External(_)
+            | Commands::Help(_)
     )
 }
 
@@ -234,6 +235,7 @@ fn checks_agent_update(command: &Commands) -> bool {
             | Commands::NativeProbe(_)
             | Commands::Plugin(_)
             | Commands::External(_)
+            | Commands::Help(_)
             | Commands::CheckLuau(_)
             | Commands::RecordEnd(_)
             | Commands::RecordReview(_)
@@ -289,6 +291,7 @@ fn checks_agent_instructions(command: &Commands) -> bool {
             | Commands::Report(_)
             | Commands::Plugin(_)
             | Commands::External(_)
+            | Commands::Help(_)
             | Commands::CheckLuau(_)
             | Commands::RecordEnd(_)
             | Commands::RecordReview(_)
