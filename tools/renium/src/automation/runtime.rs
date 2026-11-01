@@ -2912,6 +2912,40 @@ fn package_action_result(
     serde_json::to_value(result).context("Could not encode package result")
 }
 
+/// How long a request made to look at Studio waits for the Edit gate before
+/// it answers that Studio is busy; pushes, syncs and waits keep queuing.
+fn admission_limit(operation: u16) -> Option<Duration> {
+    matches!(operation, op::LUAU | op::CONSOLE | op::SHOT | op::UI)
+        .then_some(Duration::from_secs(5))
+}
+
+fn busy_failure(operation: u16, waited: Duration) -> automation::Failure {
+    let name = automation::opcode_by_id(operation).map_or("request", |opcode| opcode.name);
+    let active = crate::daemon::memory::active_requests();
+    let serving = active
+        .iter()
+        .filter(|(running, _)| *running != name)
+        .max_by_key(|(_, age)| *age);
+    let state = match serving {
+        Some((running, age)) => format!("`{running}` has run for {}s", age.as_secs()),
+        None => "another request holds the Edit window".to_string(),
+    };
+    automation::Failure::new(
+        "busy",
+        format!(
+            "Studio is busy: {state}, and `rbx {name}` waited {}s for it. Studio operations run one at a time: retry when it finishes; `rbx status` shows the state",
+            waited.as_secs()
+        ),
+        true,
+        "studios",
+    )
+    .detail(json!({
+        "operation": serving.map(|(running, _)| *running),
+        "elapsedSeconds": serving.map(|(_, age)| age.as_secs()),
+        "retryAfterMs": 1000,
+    }))
+}
+
 fn connected_runtime_wait_seconds(
     state: &automation::State,
     context_id: u64,
@@ -3400,11 +3434,14 @@ fn automation_response(
             })
         } else {
             Some(RequestGuard::Global {
-                _held: match request_lease.as_deref() {
-                    Some(lease) => bridge
+                _held: match (request_lease.as_deref(), admission_limit(request.op)) {
+                    (Some(lease), _) => bridge
                         .acquire_request_gate_for_lease(lease)
                         .map_err(cancelled)?,
-                    None => bridge.acquire_request_gate(),
+                    (None, Some(limit)) => bridge
+                        .acquire_request_gate_within(limit)
+                        .ok_or_else(|| busy_failure(request.op, limit))?,
+                    (None, None) => bridge.acquire_request_gate(),
                 },
             })
         };

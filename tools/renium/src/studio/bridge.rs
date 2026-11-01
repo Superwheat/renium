@@ -1094,6 +1094,23 @@ impl BridgeServer {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// The request gate, or None when another request keeps it past `limit`.
+    pub(crate) fn acquire_request_gate_within(
+        &self,
+        limit: Duration,
+    ) -> Option<MutexGuard<'_, ()>> {
+        let deadline = Instant::now() + limit;
+        loop {
+            if let Some(guard) = self.try_acquire_request_gate() {
+                return Some(guard);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     // Live Sync's loop thread must never block on the gate: a request holding
     // it may be waiting for that thread to refresh the watcher state.
     pub(crate) fn try_acquire_request_gate(&self) -> Option<MutexGuard<'_, ()>> {
