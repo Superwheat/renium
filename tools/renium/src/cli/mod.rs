@@ -1917,7 +1917,7 @@ pub(super) struct WaitUntilArgs {
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
     #[arg(
-        help = "Luau expression that must become true",
+        help = "Luau expression, or a chunk that returns one, that must become true",
         value_name = "LUAU_CONDITION"
     )]
     pub(super) condition: String,
@@ -2543,18 +2543,25 @@ pub(super) struct EditorRevertArgs {
     pub(super) settings_id: Option<String>,
     #[arg(help = "Restore this service's store", long)]
     pub(super) service: Option<String>,
-    /// Restore file-backed sync history (an ID returned by push, or latest).
-    #[arg(help = "Restore a sync history entry: latest or a historyId", long, value_name = "ID|latest", conflicts_with_all = ["path", "settings_id", "service"])]
+    /// Restore file-backed sync history (an ID returned by push, or latest);
+    /// with --path, only that file from the entry.
+    #[arg(help = "Restore a sync history entry (with --path, one file of it): latest or a historyId", long, value_name = "ID|latest", conflicts_with_all = ["settings_id", "service"])]
     pub(super) sync: Option<String>,
     /// Include every restored path in sync undo output.
-    #[arg(help = "List every restored path", long, requires = "sync")]
+    #[arg(
+        help = "List every restored path",
+        long,
+        requires = "sync",
+        conflicts_with = "path"
+    )]
     pub(super) details: bool,
     #[arg(help = "Also push the restored files to Studio", long)]
     pub(super) apply_studio: bool,
     #[arg(
         help = "Write the saved file content to stdout instead of restoring it",
         long,
-        conflicts_with_all = ["sync", "apply_studio", "settings_id"]
+        requires = "path",
+        conflicts_with_all = ["apply_studio", "settings_id"]
     )]
     pub(super) print: bool,
     #[command(flatten)]

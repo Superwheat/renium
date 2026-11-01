@@ -78,6 +78,10 @@ impl StoredSnapshot {
         })
     }
 
+    pub(super) fn contains(&self, path: &Path) -> bool {
+        self.entries.contains_key(path)
+    }
+
     pub(super) fn matches(&self, snapshot: &ProjectSnapshot) -> bool {
         self.entries.len() == snapshot.entries.len()
             && self.entries.iter().all(|(path, stored)| {
