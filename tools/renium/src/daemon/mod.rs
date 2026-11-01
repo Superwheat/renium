@@ -921,6 +921,19 @@ fn daemon_control_request_inner(
         .and_then(Value::as_u64)
         .context("Daemon bind response omitted the context ID")?;
     let requires_review = opcode.requires_review(&parameters, approved);
+    // A response deadline that passes is reported as the daemon being busy
+    // with the operation it is serving, not as a socket error.
+    let started = Instant::now();
+    let busy = |error: anyhow::Error| {
+        if crate::automation::client::is_response_timeout(&error) {
+            crate::automation::client::daemon_busy_error(
+                &format!("rbx {}", opcode.name),
+                started.elapsed(),
+            )
+        } else {
+            error
+        }
+    };
     let response = if requires_review {
         let prepare = send_request(&automation::Request {
             v: automation::PROTOCOL_VERSION,
@@ -928,7 +941,8 @@ fn daemon_control_request_inner(
             op: automation::op::REVIEW_PREPARE,
             cx: Some(context_id),
             p: json!({ "op": operation, "p": parameters }),
-        })?;
+        })
+        .map_err(busy)?;
         if prepare.ok == 0 {
             let error = prepare
                 .e
@@ -947,7 +961,8 @@ fn daemon_control_request_inner(
             op: automation::op::REVIEW_APPLY,
             cx: Some(context_id),
             p: json!({ "reviewId": review_id }),
-        })?
+        })
+        .map_err(busy)?
     } else {
         send_request(&automation::Request {
             v: automation::PROTOCOL_VERSION,
@@ -955,7 +970,8 @@ fn daemon_control_request_inner(
             op: operation,
             cx: Some(context_id),
             p: std::mem::take(&mut parameters),
-        })?
+        })
+        .map_err(busy)?
     };
     if response.ok == 0 {
         let error = response

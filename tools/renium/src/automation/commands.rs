@@ -277,8 +277,6 @@ fn summarize_native_operations(result: &mut Value) {
         if verdict != "native" {
             fallbacks.push(json!({
                 "operation": operation["operation"],
-                "verdict": verdict,
-                "reason": operation["reason"],
                 "fallback": operation["fallback"],
             }));
         }
@@ -676,7 +674,7 @@ mod native_summary_tests {
         assert_eq!(
             result["native"],
             json!({"native": 1, "degraded": 1, "fallbacks": [
-                {"operation": "upload", "verdict": "degraded", "reason": "layout moved", "fallback": "plugin upload"}
+                {"operation": "upload", "fallback": "plugin upload"}
             ]})
         );
     }

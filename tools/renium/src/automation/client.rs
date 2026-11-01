@@ -221,7 +221,7 @@ fn daemon_busy_message(
         Some(_) => format!("it is busy serving {}", serving.join(", ")),
     };
     format!(
-        "The Renium daemon did not answer `{command}` within {}s; {state}. `rbx dm status` shows whether it responds and `rbx report` collects a bug report",
+        "The Renium daemon did not answer `{command}` within {}s; {state}. Studio operations run one at a time: wait for the running one to finish and retry; `rbx dm status` shows whether the daemon responds and `rbx report` collects a bug report",
         waited.as_secs()
     )
 }

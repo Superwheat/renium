@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Improvements
+
+- A command whose daemon response deadline passes now reports the daemon as busy with the operation it is serving and how long that has run, and says that Studio operations run one at a time, instead of the raw "Waiting for daemon response to operation N" socket error. `rbx status` already did this; every command does now.
+- `rbx status` in text mode lists a non-native operation as its name and fallback only; the reason and readings stay in `rbx native-probe` and json mode.
+
 ## 0.5.6 - 2026-10-31
 
 ### Bug fixes
