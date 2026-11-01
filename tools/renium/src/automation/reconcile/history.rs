@@ -397,14 +397,6 @@ pub(crate) fn newest_sync_entry_holding(
     Ok(None)
 }
 
-/// Writes one file back from a sync entry without reverting the whole entry.
-pub(crate) fn restore_sync_entry_file(root: &Path, file: &SyncEntryFile) -> Result<PathBuf> {
-    validate_paths(root, std::slice::from_ref(&file.path))?;
-    let path = root.join(&file.path);
-    atomic_write_file(&path, &file.bytes)?;
-    Ok(path)
-}
-
 pub(crate) fn revert_sync(root: &Path, source: &Path, id: &str) -> Result<RevertedSync> {
     let directory = sync_entry_directory(root, source, id)?;
     let mut history = SyncHistory {
@@ -677,20 +669,6 @@ mod tests {
             .to_string();
         assert!(missing.contains("does not hold"), "{missing}");
 
-        let restored = restore_sync_entry_file(&root, &held).unwrap();
-        assert_eq!(restored, root.join(&path));
-        assert_eq!(fs::read(root.join(&path)).unwrap(), b"return 2");
-        assert!(
-            restore_sync_entry_file(
-                &root,
-                &SyncEntryFile {
-                    id: newer,
-                    path: PathBuf::from("../outside"),
-                    bytes: Vec::new(),
-                }
-            )
-            .is_err()
-        );
         fs::remove_dir_all(root).unwrap();
     }
 

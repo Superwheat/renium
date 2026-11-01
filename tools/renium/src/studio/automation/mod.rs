@@ -543,6 +543,7 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
             json!({
                 "condition": condition,
                 "result": args.result,
+                "server": true,
                 "timeout": args.until_timeout,
                 "editRuntimeId": result.get("editRuntimeId"),
                 "bridgeWaitSeconds": args.bridge.wait_seconds,
@@ -846,6 +847,7 @@ fn finish_studio_change_state_command(
         }
         crate::app::output::strip_empty(&mut result);
     }
+    trim_quiet_live_status(&mut result);
     print_json_output(&result, false)
 }
 
@@ -928,10 +930,13 @@ pub(crate) fn compact_live_status(value: Value) -> Value {
     let mut result = Map::new();
     for key in [
         "busy",
+        "role",
         "runtimeId",
+        "twoWaySyncEnabled",
         "tracking",
         "trackedServices",
         "connectedInstances",
+        "onlyCodeMode",
         "seq",
         "snapshotSeq",
         "runtimeSettingsSeq",
@@ -942,14 +947,6 @@ pub(crate) fn compact_live_status(value: Value) -> Value {
         if let Some(value) = source.get(key) {
             result.insert(key.to_string(), value.clone());
         }
-    }
-    // The role is always the Edit window here; the two mode flags only matter
-    // away from their defaults.
-    if source.get("twoWaySyncEnabled") == Some(&Value::Bool(false)) {
-        result.insert("twoWaySyncEnabled".to_string(), Value::Bool(false));
-    }
-    if source.get("onlyCodeMode") == Some(&Value::Bool(true)) {
-        result.insert("onlyCodeMode".to_string(), Value::Bool(true));
     }
 
     let mut pending_changes = 0usize;
@@ -1034,7 +1031,27 @@ fn compact_live_daemon_status(value: &Value) -> Value {
     {
         result.insert("pendingPaths".to_string(), paths.clone());
     }
-    // Members at their quiet value say nothing; a reader looks for the others.
+    Value::Object(result)
+}
+
+/// Text mode drops the Live Sync members at their quiet value: a reader
+/// looks for the others, and json mode keeps the full shape.
+pub(crate) fn trim_quiet_live_status(result: &mut Value) {
+    if crate::app::output::global_json_output() {
+        return;
+    }
+    if let Some(map) = result.as_object_mut() {
+        map.remove("role");
+        if map.get("twoWaySyncEnabled") == Some(&Value::Bool(true)) {
+            map.remove("twoWaySyncEnabled");
+        }
+        if map.get("onlyCodeMode") == Some(&Value::Bool(false)) {
+            map.remove("onlyCodeMode");
+        }
+    }
+    let Some(daemon) = result.get_mut("daemon").and_then(Value::as_object_mut) else {
+        return;
+    };
     for (key, quiet) in [
         ("paused", json!(false)),
         ("syncing", json!(false)),
@@ -1044,11 +1061,10 @@ fn compact_live_daemon_status(value: &Value) -> Value {
         ("pushes", json!(0)),
         ("pulls", json!(0)),
     ] {
-        if result.get(key) == Some(&quiet) {
-            result.remove(key);
+        if daemon.get(key) == Some(&quiet) {
+            daemon.remove(key);
         }
     }
-    Value::Object(result)
 }
 
 fn validate_play_args(args: &StartStopPlayArgs) -> Result<()> {
@@ -2839,7 +2855,11 @@ fn met_condition_result(args: &WaitUntilArgs, outcome: &LuauTaskOutcome, elapsed
 pub(crate) fn wait_until_result(args: &WaitUntilArgs, bridge: &BridgeServer) -> Result<Value> {
     let client = args.client || args.player.is_some();
     let player = args.player.as_deref();
-    let target = BridgeTarget::main_or_client(client);
+    let target = if args.server {
+        BridgeTarget::Server
+    } else {
+        BridgeTarget::main_or_client(client)
+    };
     if let Some(player) = player {
         wait_for_player_bridge(bridge, player, args.bridge.wait_seconds)?;
     }
@@ -3465,6 +3485,7 @@ pub(crate) fn wait_until_command(args: WaitUntilArgs) -> Result<()> {
             "result": args.result,
             "player": args.player,
             "client": args.client,
+            "server": args.server,
             "timeout": args.timeout,
             "interval": args.interval,
         }),
@@ -4574,6 +4595,7 @@ mod wait_condition_tests {
             condition: condition.to_string(),
             player: None,
             client: false,
+            server: false,
             timeout: 60.0,
             interval: 0.25,
             result: result.map(str::to_string),

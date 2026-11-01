@@ -1024,7 +1024,7 @@ pub(crate) fn bytecode_export_model(args: BytecodeExportModelArgs) -> Result<()>
         &document,
         &service,
         &args.selector,
-        "No instance matches the export selector in this store; `rbx f NAME` finds its path and `rbx pl` refreshes the store from Studio",
+        "No instance matches the export selector in this store; `rbx f SERVICE NAME` finds its path and `rbx pl` refreshes the store from Studio",
     )?
     .index;
     let format = match args.format.as_deref() {

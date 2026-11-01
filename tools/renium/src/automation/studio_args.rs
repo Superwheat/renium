@@ -325,6 +325,7 @@ pub(super) fn wait(parameters: &Value) -> Result<WaitUntilArgs> {
         condition: required_string(object, "condition")?,
         player: string(object, "player"),
         client: boolean(object, "client")?,
+        server: boolean(object, "server")?,
         timeout: number(object, "timeout", 60.0)?,
         interval: number(object, "interval", 0.25)?,
         result: string(object, "result"),

@@ -335,7 +335,7 @@ const LUAU_ERROR_HINTS: [(&str, &str); 4] = [
     ),
     (
         "is not a valid member of",
-        "`rbx tr SERVICE.PATH` lists an instance's children and `rbx l \"return typeof(X)\"` its class",
+        "`rbx tr SERVICE.PATH` lists an instance's children and `rbx l \"return X.ClassName\"` its class",
     ),
 ];
 

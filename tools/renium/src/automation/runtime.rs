@@ -1501,7 +1501,11 @@ fn automation_dispatch_operation(
                 );
             }
             if parsed.player.is_none() {
-                let target = BridgeTarget::main_or_client(parsed.client);
+                let target = if parsed.server {
+                    BridgeTarget::Server
+                } else {
+                    BridgeTarget::main_or_client(parsed.client)
+                };
                 bridge.wait_for_target(bridge_wait_seconds, target)?;
             }
             wait_until_result(&parsed, bridge)
@@ -2927,11 +2931,19 @@ fn admission_limit(operation: u16) -> Option<Duration> {
 }
 
 fn busy_failure(operation: u16, waited: Duration) -> automation::Failure {
-    let name = automation::opcode_by_id(operation).map_or("request", |opcode| opcode.name);
+    let name = match operation {
+        op::LUAU => "l",
+        op::CONSOLE => "co",
+        op::SHOT => "sc",
+        op::UI => "ui",
+        _ => automation::opcode_by_id(operation).map_or("request", |opcode| opcode.name),
+    };
+    // The blocker started before this request did; the request's own entry is
+    // the one that has run for about the waited time.
     let active = crate::daemon::memory::active_requests();
     let serving = active
         .iter()
-        .filter(|(running, _)| *running != name)
+        .filter(|(_, age)| *age > waited + Duration::from_millis(300))
         .max_by_key(|(_, age)| *age);
     let state = match serving {
         Some((running, age)) => format!("`{running}` has run for {}s", age.as_secs()),
@@ -3442,9 +3454,10 @@ fn automation_response(
         } else {
             Some(RequestGuard::Global {
                 _held: match (request_lease.as_deref(), admission_limit(request.op)) {
-                    (Some(lease), _) => bridge
-                        .acquire_request_gate_for_lease(lease)
-                        .map_err(cancelled)?,
+                    (Some(lease), limit) => bridge
+                        .acquire_request_gate_for_lease_within(lease, limit)
+                        .map_err(cancelled)?
+                        .ok_or_else(|| busy_failure(request.op, limit.unwrap_or_default()))?,
                     (None, Some(limit)) => bridge
                         .acquire_request_gate_within(limit)
                         .ok_or_else(|| busy_failure(request.op, limit))?,
@@ -4078,7 +4091,9 @@ mod tests {
             json!({
                 "ok": false,
                 "error": "timed out",
+                "role": "edit",
                 "runtimeId": "runtime",
+                "twoWaySyncEnabled": true,
                 "changeCount": 1,
                 "propertyChangeCount": 2,
                 "pendingChanges": 3,

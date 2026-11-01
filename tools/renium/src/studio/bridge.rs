@@ -1121,16 +1121,26 @@ impl BridgeServer {
         }
     }
 
-    pub(crate) fn acquire_request_gate_for_lease(
+    /// The request gate for a leased request, or Ok(None) when another
+    /// request keeps it past `limit` (no limit always yields the guard); a
+    /// cancelled lease is an error.
+    pub(crate) fn acquire_request_gate_for_lease_within(
         &self,
         lease: &BridgeRequestLease,
-    ) -> Result<MutexGuard<'_, ()>> {
+        limit: Option<Duration>,
+    ) -> Result<Option<MutexGuard<'_, ()>>> {
+        let deadline = limit.map(|limit| Instant::now() + limit);
         loop {
             lease.ensure_active()?;
             match self.request_gate.try_lock() {
-                Ok(guard) => return Ok(guard),
-                Err(TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
-                Err(TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(2)),
+                Ok(guard) => return Ok(Some(guard)),
+                Err(TryLockError::Poisoned(poisoned)) => return Ok(Some(poisoned.into_inner())),
+                Err(TryLockError::WouldBlock) => {
+                    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        return Ok(None);
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                }
             }
         }
     }

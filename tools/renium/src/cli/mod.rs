@@ -2183,6 +2183,12 @@ pub(super) struct WaitUntilArgs {
     #[arg(help = "Evaluate on a play client", short, long)]
     pub(super) client: bool,
     #[arg(
+        help = "Evaluate on the play server only (fails when no server runs)",
+        long,
+        conflicts_with_all = ["client", "player"]
+    )]
+    pub(super) server: bool,
+    #[arg(
         help = "Seconds before giving up (up to 3600)",
         short,
         long,

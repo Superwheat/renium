@@ -333,7 +333,7 @@ pub(crate) fn editor_revert(mut args: EditorRevertArgs) -> Result<()> {
         if let Some(path) = requested_path.as_deref() {
             let relative = project_relative_path(&project_root, path)?;
             let file = sync_history::sync_entry_file(&project_root, &src_root, id, &relative)?;
-            return revert_sync_entry_file(args, project_root, file);
+            return revert_sync_entry_file(args, file);
         }
         let restored = sync_history::revert_sync(&project_root, &src_root, id)?;
         let mut output = json!({
@@ -377,7 +377,7 @@ pub(crate) fn editor_revert(mut args: EditorRevertArgs) -> Result<()> {
         (Some(path), _) => path,
         (None, Some(path)) => {
             let file = newest_history_file(&project_root, path)?;
-            return revert_sync_entry_file(args, project_root, file);
+            return revert_sync_entry_file(args, file);
         }
         (None, None) => bail!("No editor revert history found for the requested item"),
     };
@@ -422,29 +422,22 @@ fn newest_history_file(project_root: &Path, path: &Path) -> Result<sync_history:
     })
 }
 
-fn revert_sync_entry_file(
-    args: EditorRevertArgs,
-    project_root: PathBuf,
-    file: sync_history::SyncEntryFile,
-) -> Result<()> {
+fn revert_sync_entry_file(args: EditorRevertArgs, file: sync_history::SyncEntryFile) -> Result<()> {
     if args.print {
         std::io::stdout()
             .write_all(&file.bytes)
             .context("Failed to write the saved file content")?;
         return Ok(());
     }
-    let restored = sync_history::restore_sync_entry_file(&project_root, &file)?;
-    let mut output = json!({
-        "ok": true,
-        "historyId": file.id,
-        "sync": true,
-        "sourcePath": path_to_sourcemap_relative(&project_root, &restored),
-        "changedPathCount": 1,
-    });
-    if let Some(studio) = apply_reverted_paths(args, project_root, vec![restored])? {
-        output["studio"] = studio;
-    }
-    print_json_output(&output, false)
+    // A sync entry guards whole-entry restores (newer edits, unconfirmed
+    // transactions); one file has no guard of its own, so it is read, not
+    // written back.
+    bail!(
+        "Sync history entry {} holds {}: `rbx rev --sync {} ` restores the whole entry with its guards, and `rbx rev --path FILE --print` prints this file's saved copy",
+        file.id,
+        file.path.display(),
+        file.id
+    );
 }
 
 /// The saved file content of a history entry, without restoring anything.

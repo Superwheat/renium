@@ -281,10 +281,6 @@ fn filtered_console_result(args: &PluginConsoleOutputArgs, mut result: Value) ->
     let count = entries.len();
     if let Some(object) = result.as_object_mut() {
         object.insert("count".to_string(), json!(count));
-        // The sequence cursor only matters to a caller that pages or follows.
-        if args.since_seq == 0 && !args.follow && !crate::app::output::global_json_output() {
-            object.remove("nextSeq");
-        }
         if matcher.active() {
             object.insert("scanned".to_string(), json!(scanned));
             object.insert("matched".to_string(), json!(matched));

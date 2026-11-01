@@ -219,11 +219,14 @@ fn add_batch_item(
     } else {
         let service = batch_item_service(&item)?;
         let store_position = load_batch_store(&service, stores, store_positions, resolve_store)?;
+        // A bare service name is the store root, never a search for an
+        // instance that happens to carry the service's name.
+        let parent_path = (item.parent != service).then_some(item.parent.as_str());
         let parent_index = bytecode_parent_index(
             &stores[store_position].document,
             false,
             None,
-            Some(&item.parent),
+            parent_path,
             None,
             None,
         )?;

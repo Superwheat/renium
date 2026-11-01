@@ -590,12 +590,15 @@ fn high_level_service_and_value(
     let value = second
         .filter(|value| !value.trim().is_empty())
         .map(ToString::to_string);
+    // The whole dotted string stays the target: the service becomes the
+    // root segment, so a child that carries the service's own name still
+    // resolves as a child.
     if value.is_none()
-        && let Some((service, path)) = split_leading_service(service, known_service)
+        && let Some((split_service, _)) = split_leading_service(service, known_service)
     {
         return Ok(HighLevelSelection {
-            service,
-            value: Some(path),
+            service: split_service,
+            value: Some(service.to_string()),
             path_from_service: true,
         });
     }
@@ -1178,7 +1181,7 @@ fn high_level_resolve_path_candidates(
             .collect::<Vec<_>>();
         return match matched.len() {
             0 => Err(anyhow::anyhow!(
-                "No matching instance path: {path_label}; `rbx f NAME` searches by name, `rbx tr SERVICE.PATH` lists children, `rbx pl` refreshes the store from Studio"
+                "No matching instance path: {path_label}; `rbx f SERVICE NAME` searches by name, `rbx tr SERVICE.PATH` lists children, `rbx pl` refreshes the store from Studio"
             )),
             1 => Ok(HighLevelTargetResolution::Found(matched[0])),
             _ => Ok(HighLevelTargetResolution::Ambiguous(matched)),
@@ -1187,7 +1190,7 @@ fn high_level_resolve_path_candidates(
 
     match candidates.len() {
         0 => bail!(
-            "No matching instance path: {path_label}; `rbx f NAME` searches by name, `rbx tr SERVICE.PATH` lists children, `rbx pl` refreshes the store from Studio"
+            "No matching instance path: {path_label}; `rbx f SERVICE NAME` searches by name, `rbx tr SERVICE.PATH` lists children, `rbx pl` refreshes the store from Studio"
         ),
         1 => Ok(HighLevelTargetResolution::Found(candidates[0])),
         _ => Ok(HighLevelTargetResolution::Ambiguous(candidates)),
@@ -1209,7 +1212,7 @@ fn high_level_resolve_simple_target(
     let direct_candidates = high_level_match_path_candidates(ctx, &segments);
     match direct_candidates.len() {
         0 => bail!(
-            "No matching instance: {raw_target}; `rbx f NAME` searches by name, `rbx tr SERVICE.PATH` lists children, `rbx pl` refreshes the store from Studio"
+            "No matching instance: {raw_target}; `rbx f SERVICE NAME` searches by name, `rbx tr SERVICE.PATH` lists children, `rbx pl` refreshes the store from Studio"
         ),
         1 => Ok(HighLevelTargetResolution::Found(direct_candidates[0])),
         _ => Ok(HighLevelTargetResolution::Ambiguous(direct_candidates)),
@@ -3385,7 +3388,10 @@ mod service_split_tests {
         )
         .unwrap();
         assert_eq!(selection.service, "StarterGui");
-        assert_eq!(selection.value.as_deref(), Some("Main.HUD.Timer"));
+        assert_eq!(
+            selection.value.as_deref(),
+            Some("StarterGui.Main.HUD.Timer")
+        );
         assert!(selection.path_from_service);
 
         let explicit = high_level_service_and_value(
