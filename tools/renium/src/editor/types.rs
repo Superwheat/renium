@@ -238,16 +238,12 @@ pub(crate) struct EditorPropertyFilter {
     /// size, so the same id names unrelated instances in other services.
     pub(crate) service_settings_ids: std::collections::HashMap<String, HashSet<String>>,
     pub(crate) property_names: HashSet<String>,
-    /// An upsert of a whole service sends values only for instances the
-    /// project created; pulled instances already carry theirs in Studio.
-    pub(crate) local_values_only: bool,
 }
 
 impl EditorPropertyFilter {
     pub(crate) fn from_args(args: &PushEditorChangesArgs) -> Result<Self> {
         let targets = expand_editor_target_settings_ids(args)?;
         Ok(Self {
-            local_values_only: args.upsert_instances_only && !targets.has_ids(),
             settings_ids: targets.any,
             service_settings_ids: targets.by_service,
             property_names: args
@@ -307,10 +303,6 @@ pub(crate) struct EditorTargetIds {
 }
 
 impl EditorTargetIds {
-    pub(crate) fn has_ids(&self) -> bool {
-        !self.any.is_empty() || !self.by_service.is_empty()
-    }
-
     /// `Service/ID` binds the id to one store; a bare id applies everywhere.
     fn insert(&mut self, entry: &str) {
         match entry.split_once('/') {

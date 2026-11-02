@@ -1,5 +1,6 @@
 use super::*;
 
+mod offline;
 pub(crate) mod support;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
@@ -38,6 +39,7 @@ use crate::editor::review::{
     is_user_facing_protected_write, normalize_editor_bridge_value, patch_place_protected_writes,
     protected_write_matches_previous, protected_write_rows_with_previous_values,
 };
+use crate::editor::sync::direct_editor_summary;
 use crate::editor::sync::{
     EditorSettingsTransaction, collect_direct_editor_delete_change, collect_editor_changes,
 };
@@ -1772,6 +1774,7 @@ fn ordinary_remove_rejects_package_bearing_instances_and_links() {
         value_bool: None,
         value_null: false,
         scope: "property".to_string(),
+        override_packages: false,
         pretty: false,
     })
     .unwrap_err();
@@ -1876,6 +1879,7 @@ fn store_writes_keep_composite_property_values_typed() {
             value_bool: None,
             value_null: false,
             scope: "auto".to_string(),
+            override_packages: false,
             pretty: false,
         })
     };
@@ -2572,6 +2576,41 @@ fn targeted_inline_source_changes_include_selected_package_scripts() {
 }
 
 #[test]
+fn direct_editor_summaries_carry_the_push_outcome_fields() {
+    let applied = serde_json::from_value::<serde_json::Map<String, Value>>(json!({
+        "ok": true,
+        "propertyUpdated": 1,
+        "persistence": "unsaved",
+        "filesPulled": true,
+        "noops": 0
+    }))
+    .unwrap();
+    let summary = direct_editor_summary(&applied);
+    assert_eq!(summary["changed"], json!(true));
+    assert_eq!(summary["persistence"], json!("unsaved"));
+    assert_eq!(summary["filesPulled"], json!(true));
+    assert!(summary.get("noops").is_none());
+
+    let saved_field = serde_json::from_value::<serde_json::Map<String, Value>>(json!({
+        "ok": true,
+        "propertyUpdated": 0,
+        "savedFieldsApplied": 1
+    }))
+    .unwrap();
+    assert_eq!(direct_editor_summary(&saved_field)["changed"], json!(true));
+
+    let held = serde_json::from_value::<serde_json::Map<String, Value>>(json!({
+        "ok": true,
+        "skippedByReview": true,
+        "instanceQueued": 1
+    }))
+    .unwrap();
+    let summary = direct_editor_summary(&held);
+    assert_eq!(summary["changed"], json!(false));
+    assert_eq!(summary["skippedByReview"], json!(true));
+}
+
+#[test]
 fn direct_editor_delete_change_does_not_require_existing_bytecode_match() {
     let root = temp_dir("direct-delete-missing-bytecode");
     fs::write(root.join("renium.project.jsonc"), r#"{"schemaVersion":1}"#).unwrap();
@@ -2589,6 +2628,8 @@ fn direct_editor_delete_change_does_not_require_existing_bytecode_match() {
             path_ordinals_json: serde_json::to_string(&vec![1_usize, 1_usize]).unwrap(),
             override_packages: false,
         },
+        no_review: false,
+        yes: false,
     })
     .unwrap();
 
@@ -3503,6 +3544,187 @@ fn starter_player_script_containers_keep_real_classes() {
         ensured.target.path_segments,
         vec!["StarterPlayer", "StarterCharacterScripts", "ArmsInVehicles"]
     );
+}
+
+#[test]
+fn the_projection_stage_keeps_a_packed_link_script() {
+    let project_root = temp_dir("packed-link-stage");
+    crate::tests::support::write_packed_link_project(&project_root);
+    let loaded = crate::project::config::load_project(
+        Some(&project_root.join("renium.project.jsonc")),
+        None,
+    )
+    .unwrap();
+    let stage = crate::project::config::stage_project(&loaded).unwrap();
+    let staged = SettingsBytecode::read_file(&service_settings_path(
+        &stage.root().join("ReplicatedStorage"),
+    ))
+    .unwrap();
+    assert!(
+        staged
+            .instances
+            .iter()
+            .any(|instance| instance.name == "Util" && instance.class_name == "ModuleScript"),
+        "stage_project dropped the packed script: {:?}",
+        staged
+            .instances
+            .iter()
+            .map(|instance| (instance.name.clone(), instance.class_name.clone()))
+            .collect::<Vec<_>>()
+    );
+    drop(stage);
+    fs::remove_dir_all(project_root).unwrap();
+}
+
+#[test]
+fn a_packed_link_script_survives_a_missing_file() {
+    use crate::editor::paths::merge_editor_source_files_into_document;
+    let project_root = temp_dir("packed-link-kept");
+    let service_dir = crate::tests::support::write_packed_link_project(&project_root);
+    let mut document =
+        SettingsBytecode::read_file(&project_root.join("instances/ReplicatedStorage.renium"))
+            .unwrap();
+    document.instances.push(SettingsBytecodeInstance {
+        settings_id: "editor:3".to_string(),
+        name: "Gone".to_string(),
+        class_name: "ModuleScript".to_string(),
+        parent_index: Some(0),
+        properties: Map::from_iter([("Source".to_string(), json!("return 3"))]),
+        attributes: Map::new(),
+    });
+    let (changed, paths) =
+        merge_editor_source_files_into_document(&mut document, "ReplicatedStorage", &service_dir)
+            .unwrap();
+    assert!(changed);
+    assert!(paths.is_empty());
+    let util = document
+        .instances
+        .iter()
+        .find(|instance| instance.name == "Util")
+        .unwrap();
+    assert_eq!(util.class_name, "ModuleScript");
+    assert_eq!(util.properties["Source"], json!("return { version = 1 }"));
+    let gone = document
+        .instances
+        .iter()
+        .find(|instance| instance.name == "Gone")
+        .unwrap();
+    assert_eq!(
+        gone.class_name, "Folder",
+        "an inline source outside a link is not a packed script"
+    );
+    fs::remove_dir_all(project_root).unwrap();
+}
+
+#[test]
+fn a_packed_link_script_is_not_demoted_when_its_package_cannot_be_read() {
+    use crate::editor::paths::merge_editor_source_files_into_document;
+    let project_root = temp_dir("packed-link-package-unreadable");
+    let service_dir = crate::tests::support::write_packed_link_project(&project_root);
+    fs::write(
+        project_root.join("links").join("shared.renium"),
+        b"not a settings store",
+    )
+    .unwrap();
+    let mut document =
+        SettingsBytecode::read_file(&project_root.join("instances/ReplicatedStorage.renium"))
+            .unwrap();
+    let error = format!(
+        "{:#}",
+        merge_editor_source_files_into_document(&mut document, "ReplicatedStorage", &service_dir)
+            .unwrap_err()
+    );
+    assert!(error.contains("shared.renium"), "{error}");
+    let util = document
+        .instances
+        .iter()
+        .find(|instance| instance.name == "Util")
+        .unwrap();
+    assert_eq!(util.class_name, "ModuleScript");
+    fs::remove_dir_all(project_root).unwrap();
+}
+
+#[test]
+fn an_operation_decodes_each_read_only_package_once_for_all_its_documents() {
+    use crate::editor::paths::{
+        merge_editor_source_files_into_document, merge_editor_source_files_into_document_with,
+        packed_link_enforcement,
+    };
+    use crate::project::package_links::READ_ONLY_PACKAGE_READS;
+    let project_root = temp_dir("packed-link-decode-count");
+    crate::tests::support::write_packed_link_project(&project_root);
+    let src_root = project_root.join("src");
+    let shared = fs::read(project_root.join("links").join("shared.renium")).unwrap();
+    let mut links = vec![
+        r#"{"id":"shared","readOnly":true,"source":{"type":"local","path":"links/shared.renium"},"targets":[{"service":"ReplicatedStorage","path":["ReplicatedStorage","Shared"]}]}"#.to_string(),
+    ];
+    let services = ["ReplicatedStorage", "ServerStorage", "Workspace"];
+    for (index, service) in services.iter().enumerate().skip(1) {
+        fs::write(
+            project_root
+                .join("links")
+                .join(format!("pack{index}.renium")),
+            &shared,
+        )
+        .unwrap();
+        fs::create_dir_all(src_root.join(service)).unwrap();
+        settings_document(vec![settings_instance("root", *service, *service, None)])
+            .write_file(
+                &project_root
+                    .join("instances")
+                    .join(format!("{service}.renium")),
+            )
+            .unwrap();
+        links.push(format!(
+            r#"{{"id":"pack{index}","readOnly":true,"source":{{"type":"local","path":"links/pack{index}.renium"}},"targets":[{{"service":"{service}","path":["{service}","Shared"]}}]}}"#
+        ));
+    }
+    fs::write(
+        project_root.join("renium-link.json"),
+        format!(
+            r#"{{"version":1,"links":[{}],"broken":[]}}"#,
+            links.join(",")
+        ),
+    )
+    .unwrap();
+    let document_of = |service: &str| {
+        SettingsBytecode::read_file(
+            &project_root
+                .join("instances")
+                .join(format!("{service}.renium")),
+        )
+        .unwrap()
+    };
+    let reads = || READ_ONLY_PACKAGE_READS.with(std::cell::Cell::get);
+
+    let before = reads();
+    for service in services {
+        merge_editor_source_files_into_document(
+            &mut document_of(service),
+            service,
+            &src_root.join(service),
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        reads() - before,
+        services.len() * links.len(),
+        "each document on its own decodes every package"
+    );
+
+    let before = reads();
+    let enforcement = packed_link_enforcement(&src_root).unwrap().unwrap();
+    for service in services {
+        merge_editor_source_files_into_document_with(
+            &mut document_of(service),
+            service,
+            &src_root.join(service),
+            Some(&enforcement),
+        )
+        .unwrap();
+    }
+    assert_eq!(reads() - before, links.len());
+    fs::remove_dir_all(project_root).unwrap();
 }
 
 #[test]
@@ -4610,6 +4832,43 @@ fn protected_review_only_keeps_user_facing_properties() {
         }),
         database
     ));
+    for (class, property) in [
+        ("Workspace", "ModelStreamingBehavior"),
+        ("Lighting", "LightingStyle"),
+        ("Terrain", "SmoothGrid"),
+        ("MeshPart", "UnscaledVolume"),
+        ("Model", "Scale"),
+    ] {
+        assert!(is_user_facing_protected_write(
+            &json!({"className": class, "name": property}),
+            database
+        ));
+    }
+}
+
+#[test]
+fn protected_snapshot_retains_native_service_field_values() {
+    let dir = temp_dir("protected-native-service-fields");
+    let path = dir.join("place.rbxl");
+    let dom = RbxWeakDom::new(
+        RbxInstanceBuilder::new("Workspace")
+            .with_name("Workspace")
+            .with_property("StreamingTargetRadius", RbxVariant::Int32(1024)),
+    );
+    rbx_binary::to_writer(
+        BufWriter::new(File::create(&path).unwrap()),
+        &dom,
+        &[dom.root_ref()],
+    )
+    .unwrap();
+    let rows = vec![json!({
+        "kind": "property", "pathSegments": ["Workspace"], "pathOrdinals": [1],
+        "name": "StreamingTargetRadius", "value": 256.0,
+    })];
+    assert_eq!(patch_place_protected_writes(&path, &rows).unwrap(), 1);
+    let readback = protected_write_rows_with_previous_values(&path, &rows).unwrap();
+    assert_eq!(readback[0]["oldValue"], json!(256));
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]

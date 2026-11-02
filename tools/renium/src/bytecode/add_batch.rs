@@ -89,7 +89,7 @@ pub(crate) fn bytecode_add_batch(input: &Path, pretty: bool) -> Result<()> {
     print_json_output(&result, pretty)
 }
 
-fn read_batch_input(input: &Path) -> Result<String> {
+pub(crate) fn read_batch_input(input: &Path) -> Result<String> {
     if input == Path::new("-") {
         let mut raw = String::new();
         io::stdin().read_to_string(&mut raw)?;

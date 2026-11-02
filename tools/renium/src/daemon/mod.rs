@@ -38,7 +38,7 @@ use crate::studio::bridge::{BridgeRequestLease, BridgeServer};
 use crate::studio::target::place_filter;
 use crate::system::files::{absolutize_for_daemon, sanitize_ascii_identifier};
 
-const SHARED_DAEMON_START_TIMEOUT: Duration = Duration::from_secs(5);
+const SHARED_DAEMON_START_TIMEOUT: Duration = Duration::from_secs(15);
 static NEXT_CONTROL_LEASE_ID: AtomicU64 = AtomicU64::new(1);
 static CONTROL_LEASE_BOOT_ID: LazyLock<String> =
     LazyLock::new(|| format!("{:x}-{:x}", current_millis(), std::process::id()));
@@ -100,6 +100,9 @@ pub(super) fn cursor_poll(_args: CursorPollArgs) -> Result<()> {
 }
 
 pub(super) fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
+    // The command that started this daemon may carry a place pin; requests
+    // bring their own, and threads outside a request must not inherit it.
+    crate::studio::target::set_place_filter(None);
     let name = args
         .name
         .clone()
@@ -275,6 +278,103 @@ fn spawn_daemon_control_server(
     Ok(())
 }
 
+thread_local! {
+    static REQUEST_NOTICE_SINK: std::cell::RefCell<Option<(crate::system::net::SharedTcpStream, u64)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Sends an interim notice line to the caller of the request this thread is
+/// serving, when that caller asked for notices (`p.notices`); a request
+/// served without one, or outside the daemon, gets nothing.
+pub(crate) fn emit_request_notice(text: &str) {
+    let sink = REQUEST_NOTICE_SINK.with(|sink| sink.borrow().clone());
+    let Some((mut stream, id)) = sink else {
+        return;
+    };
+    let Ok(line) = serde_json::to_string(&automation::Response::notice(id, text)) else {
+        return;
+    };
+    let _ = writeln!(stream, "{line}").and_then(|()| stream.flush());
+}
+
+#[derive(serde::Deserialize)]
+struct RequestEnvelope {
+    #[serde(default)]
+    id: u64,
+    #[serde(default)]
+    p: Value,
+}
+
+fn request_notice_sink(
+    line: &str,
+    stream: &crate::system::net::SharedTcpStream,
+) -> Option<(crate::system::net::SharedTcpStream, u64)> {
+    let envelope = serde_json::from_str::<RequestEnvelope>(line).ok()?;
+    (envelope.p.get("notices").and_then(Value::as_bool) == Some(true))
+        .then(|| (stream.clone(), envelope.id))
+}
+
+/// Every wire envelope asks for notices itself, at the top level the
+/// connection reader looks at; the operation's own parameters stay free of
+/// transport fields, since a review stores them and runs them later on the
+/// apply request's connection.
+fn request_with_notices(mut parameters: Value) -> Value {
+    if let Some(object) = parameters.as_object_mut() {
+        object.insert("notices".to_string(), Value::Bool(true));
+    }
+    parameters
+}
+
+fn review_prepare_parameters(operation: u16, parameters: Value) -> Value {
+    request_with_notices(json!({ "op": operation, "p": parameters }))
+}
+
+fn review_apply_parameters(review_id: &str) -> Value {
+    request_with_notices(json!({ "reviewId": review_id }))
+}
+
+/// A command's wire requests: a reviewed operation travels as a review-prepare
+/// carrying its parameters and a review-apply naming the receipt, any other
+/// operation as itself.
+fn send_operation_requests(
+    operation: u16,
+    context_id: u64,
+    parameters: Value,
+    requires_review: bool,
+    mut send: impl FnMut(automation::Request) -> Result<automation::Response>,
+) -> Result<automation::Response> {
+    let request = |op, p| automation::Request {
+        v: automation::PROTOCOL_VERSION,
+        id: current_millis().min(u128::from(u64::MAX)) as u64,
+        op,
+        cx: Some(context_id),
+        p,
+    };
+    if !requires_review {
+        return send(request(operation, request_with_notices(parameters)));
+    }
+    let prepare = send(request(
+        automation::op::REVIEW_PREPARE,
+        review_prepare_parameters(operation, parameters),
+    ))?;
+    if prepare.ok == 0 {
+        let error = prepare
+            .e
+            .context("Review preparation failed without an error")?;
+        return Err(automation::DaemonFailure::from(error).into());
+    }
+    let review_id = prepare
+        .r
+        .as_ref()
+        .and_then(|result| result.get("reviewId"))
+        .and_then(Value::as_str)
+        .context("Review preparation omitted reviewId")?;
+    send(request(
+        automation::op::REVIEW_APPLY,
+        review_apply_parameters(review_id),
+    ))
+}
+
 fn handle_daemon_control_connection(
     stream: TcpStream,
     bridge: &Arc<BridgeServer>,
@@ -288,6 +388,7 @@ fn handle_daemon_control_connection(
     let reader = control_reader::ControlReader::start(stream.clone(), move |lease| {
         let _ = monitor_bridge.cancel_request_lease(lease.id());
     })?;
+    let notice_stream = stream.clone();
     let mut writer = BufWriter::new(stream);
     while let Some(request) = reader.next() {
         let line = match request {
@@ -312,6 +413,9 @@ fn handle_daemon_control_connection(
         if !reader.activate(Arc::clone(&request_lease)) {
             break;
         }
+        REQUEST_NOTICE_SINK.with(|sink| {
+            *sink.borrow_mut() = request_notice_sink(trimmed, &notice_stream);
+        });
         let response = automation_parse_response_with_lease(
             trimmed,
             state,
@@ -319,6 +423,7 @@ fn handle_daemon_control_connection(
             bridge_wait_seconds,
             Some(Arc::clone(&request_lease)),
         );
+        REQUEST_NOTICE_SINK.with(|sink| sink.borrow_mut().take());
         let response = serde_json::to_string(&response)?;
         let write_result = (|| -> io::Result<()> {
             writeln!(writer, "{response}")?;
@@ -368,6 +473,33 @@ fn write_daemon_discovery_file(
         );
     }
     Ok(())
+}
+
+/// The bridge ports a named daemon published in its discovery file, for the
+/// launch ticket of a Studio the CLI opens on that daemon's behalf.
+pub(crate) fn named_daemon_bridge_ports(name: &str) -> Option<Vec<u16>> {
+    daemon_discovery_write_paths(name)
+        .into_iter()
+        .find_map(|path| {
+            let value: Value = serde_json::from_str(&fs::read_to_string(path).ok()?).ok()?;
+            let ports = value
+                .get("bridgePorts")?
+                .as_array()?
+                .iter()
+                .filter_map(|port| u16::try_from(port.as_u64()?).ok())
+                .collect::<Vec<_>>();
+            (ports.len() == 2).then_some(ports)
+        })
+}
+
+/// The control port a named daemon published in its discovery file.
+pub(crate) fn named_daemon_control_port(name: &str) -> Option<u16> {
+    daemon_discovery_write_paths(name)
+        .into_iter()
+        .find_map(|path| {
+            let value: Value = serde_json::from_str(&fs::read_to_string(path).ok()?).ok()?;
+            u16::try_from(value.get("controlPort")?.as_u64()?).ok()
+        })
 }
 
 fn daemon_discovery_write_paths(name: &str) -> Vec<PathBuf> {
@@ -527,11 +659,24 @@ pub(super) fn is_process_alive(pid: u32) -> bool {
     }
     #[cfg(not(windows))]
     {
-        unsafe {
+        let exists = unsafe {
             libc::kill(pid as libc::pid_t, 0) == 0
                 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-        }
+        };
+        exists && !unix_zombie(pid)
     }
+}
+
+/// A killed process stays listed until its parent reaps it; such a zombie
+/// answers signals but runs nothing.
+#[cfg(not(windows))]
+fn unix_zombie(pid: u32) -> bool {
+    std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .is_some_and(|state| state.trim_start().starts_with('Z'))
 }
 
 fn push_daemon_endpoint(
@@ -593,7 +738,7 @@ fn try_bind_daemon_context(
     };
     if bind.ok == 0 {
         let error = bind.e.context("Daemon bind failed without an error")?;
-        bail!("{}", error.m);
+        return Err(automation::DaemonFailure::from(error).into());
     }
     let response = bind.r.context("Daemon bind response omitted its context")?;
     crate::plugins::verify_lease_ack(resource_lease.is_some(), &response)?;
@@ -642,6 +787,7 @@ fn spawn_shared_daemon(
         .arg("--control-port")
         .arg(control_port.to_string())
         .env_remove("RENIUM_RESOURCE_LEASE")
+        .env_remove("RENIUM_PLACE")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -681,6 +827,7 @@ fn spawn_shared_daemon(
         .env("RENIUM_DAEMON_WAIT", wait_seconds.to_string())
         .env("RENIUM_DAEMON_CONTROL_PORT", control_port.to_string())
         .env_remove("RENIUM_RESOURCE_LEASE")
+        .env_remove("RENIUM_PLACE")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -694,12 +841,189 @@ fn spawn_shared_daemon(
 }
 
 pub(crate) fn ensure_shared_daemon(ports: &str, wait_seconds: f64) -> Result<()> {
-    let control_port = std::env::var("RENIUM_DAEMON_CONTROL_PORT")
+    let explicit_control_port = std::env::var("RENIUM_DAEMON_CONTROL_PORT")
         .ok()
         .and_then(|value| value.trim().parse::<u16>().ok())
-        .filter(|port| *port != 0)
-        .unwrap_or(DEFAULT_DAEMON_CONTROL_PORT);
-    ensure_shared_daemon_on(ports, wait_seconds, control_port)
+        .filter(|port| *port != 0);
+    if let Some(control_port) = explicit_control_port {
+        return ensure_shared_daemon_on(ports, wait_seconds, control_port);
+    }
+    if is_default_daemon() {
+        return ensure_shared_daemon_on(ports, wait_seconds, DEFAULT_DAEMON_CONTROL_PORT);
+    }
+    ensure_named_daemon(|ports, control_port| {
+        ensure_shared_daemon_on(ports, wait_seconds, control_port)
+    })
+}
+
+const NAMED_DAEMON_FIRST_CONTROL_PORT: u16 = 8790;
+
+/// Named daemons start one at a time on this machine: two starts probing the
+/// same free block in the same instant both spawned a daemon on it, the
+/// loser's daemon exited at its bind and the loser's command talked to the
+/// winner. The lock is held from the probe until the daemon answers.
+fn named_daemon_start_lock() -> Option<fs::File> {
+    let path = local_app_data_daemon_path()?.with_file_name("named-daemon-start.lock");
+    fs::create_dir_all(path.parent()?).ok()?;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .ok()?;
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while file.try_lock().is_err() {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Some(file)
+}
+const NAMED_DAEMON_START_ATTEMPTS: usize = 4;
+
+/// A named daemon started on demand takes the first free port block. Its
+/// probe listeners hold the block until the daemon is spawned, so a start
+/// running beside this one allocates past it; a start that spawned at the
+/// same moment can still win the child's bind, after which the child exits,
+/// so a daemon that did not become ready on a block someone else now holds
+/// is started again on the next free block.
+fn ensure_named_daemon(mut start: impl FnMut(&str, u16) -> Result<()>) -> Result<()> {
+    let _one_start_at_a_time = named_daemon_start_lock();
+    let mut first = NAMED_DAEMON_FIRST_CONTROL_PORT;
+    let mut attempt = 1;
+    loop {
+        let block = free_named_daemon_ports_from(first)?;
+        let control_port = block.control_port;
+        let ports = block.ports.clone();
+        drop(block);
+        let started = start(&ports, control_port);
+        if started.is_ok()
+            || attempt >= NAMED_DAEMON_START_ATTEMPTS
+            || !named_daemon_block_taken(control_port)
+        {
+            return started;
+        }
+        first = control_port.saturating_add(10);
+        attempt += 1;
+    }
+}
+
+struct NamedDaemonPorts {
+    control_port: u16,
+    ports: String,
+    _reserved: Vec<TcpListener>,
+}
+
+/// Ports for a named daemon started on demand: the first free block of a
+/// control port and two bridge ports from `first` up, in steps of ten, so it
+/// never fights the default daemon's 8780-8782 or another named daemon's.
+/// The block stays bound while the value lives.
+fn free_named_daemon_ports_from(first: u16) -> Result<NamedDaemonPorts> {
+    let mut control_port = first;
+    while control_port <= u16::MAX - 2 {
+        let reserved = (control_port..=control_port + 2)
+            .map(|port| TcpListener::bind(("127.0.0.1", port)))
+            .collect::<io::Result<Vec<_>>>();
+        if let Ok(reserved) = reserved {
+            return Ok(NamedDaemonPorts {
+                control_port,
+                ports: format!("{},{}", control_port + 1, control_port + 2),
+                _reserved: reserved,
+            });
+        }
+        control_port = control_port.saturating_add(10);
+    }
+    bail!(
+        "No free control port for a named daemon from {NAMED_DAEMON_FIRST_CONTROL_PORT} up; pass RENIUM_DAEMON_CONTROL_PORT"
+    )
+}
+
+fn named_daemon_block_taken(control_port: u16) -> bool {
+    (control_port..=control_port + 2).any(|port| TcpListener::bind(("127.0.0.1", port)).is_err())
+}
+
+#[cfg(test)]
+mod named_daemon_port_tests {
+    use super::*;
+    use crate::system::LockRecover;
+    use std::sync::Mutex;
+
+    /// The port blocks are process-wide; the tests that bind them take this
+    /// lock so one test's reservation is not another's collision.
+    static PORT_BLOCKS: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn named_daemons_take_a_free_block_from_8790_up() {
+        let _serial = PORT_BLOCKS.lock_recover();
+        let block = free_named_daemon_ports_from(NAMED_DAEMON_FIRST_CONTROL_PORT).unwrap();
+        let control_port = block.control_port;
+        assert!(control_port >= NAMED_DAEMON_FIRST_CONTROL_PORT);
+        assert_eq!(
+            (control_port - NAMED_DAEMON_FIRST_CONTROL_PORT) % 10,
+            0,
+            "{control_port}"
+        );
+        assert_eq!(
+            block.ports,
+            format!("{},{}", control_port + 1, control_port + 2)
+        );
+    }
+
+    #[test]
+    fn simultaneous_named_starts_allocate_different_blocks() {
+        let _serial = PORT_BLOCKS.lock_recover();
+        let first = free_named_daemon_ports_from(NAMED_DAEMON_FIRST_CONTROL_PORT).unwrap();
+        let second = free_named_daemon_ports_from(NAMED_DAEMON_FIRST_CONTROL_PORT).unwrap();
+        assert!(
+            second.control_port > first.control_port,
+            "{} then {}",
+            first.control_port,
+            second.control_port
+        );
+        assert_eq!((second.control_port - first.control_port) % 10, 0);
+        drop(first);
+        let third = free_named_daemon_ports_from(NAMED_DAEMON_FIRST_CONTROL_PORT).unwrap();
+        assert!(third.control_port < second.control_port);
+    }
+
+    #[test]
+    fn a_named_start_that_lost_its_block_moves_to_the_next_free_one() {
+        let _serial = PORT_BLOCKS.lock_recover();
+        let mut attempts = Vec::new();
+        let mut winner = None;
+        ensure_named_daemon(|ports, control_port| {
+            assert_eq!(ports, format!("{},{}", control_port + 1, control_port + 2));
+            attempts.push(control_port);
+            if attempts.len() > 1 {
+                return Ok(());
+            }
+            winner = Some(
+                (control_port..=control_port + 2)
+                    .map(|port| TcpListener::bind(("127.0.0.1", port)).unwrap())
+                    .collect::<Vec<_>>(),
+            );
+            bail!("Renium daemon did not become ready within 5s on control port {control_port}")
+        })
+        .unwrap();
+        assert_eq!(attempts.len(), 2, "{attempts:?}");
+        assert!(attempts[1] > attempts[0], "{attempts:?}");
+        drop(winner);
+    }
+
+    #[test]
+    fn a_named_start_that_failed_on_a_free_block_reports_its_error() {
+        let _serial = PORT_BLOCKS.lock_recover();
+        let mut attempts = 0;
+        let error = ensure_named_daemon(|_, control_port| {
+            attempts += 1;
+            bail!("Renium daemon did not become ready within 5s on control port {control_port}")
+        })
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        assert!(error.to_string().contains("did not become ready"));
+    }
 }
 
 fn start_shared_daemon_on(ports: &str, wait_seconds: f64, control_port: u16) -> bool {
@@ -710,17 +1034,34 @@ fn ensure_shared_daemon_on(ports: &str, wait_seconds: f64, control_port: u16) ->
     let executable = std::env::current_exe().context("Cannot locate the Renium executable")?;
     spawn_shared_daemon(&executable, ports, wait_seconds, control_port)
         .context("Could not start the Renium daemon")?;
+    // A named daemon is ready only once its own discovery record names this
+    // control port: another daemon that won the same block answers on it
+    // too, and that answer must not pass for this one.
+    let name = std::env::var("RENIUM_DAEMON_NAME")
+        .ok()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty() && name != "default");
+    let ready = || match &name {
+        None => shared_daemon_available(),
+        Some(name) => {
+            named_daemon_control_port(name) == Some(control_port)
+                && crate::automation::client::daemon_endpoint_available(
+                    std::net::SocketAddr::from(([127, 0, 0, 1], control_port)),
+                    Duration::from_millis(500),
+                )
+        }
+    };
     let deadline = Instant::now() + SHARED_DAEMON_START_TIMEOUT;
     while Instant::now() < deadline {
-        if shared_daemon_available() {
+        if ready() {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(25));
     }
-    if shared_daemon_available() {
+    if ready() {
         Ok(())
     } else {
-        bail!("Renium daemon did not become ready within 5s on control port {control_port}")
+        bail!("Renium daemon did not become ready within 15s on control port {control_port}")
     }
 }
 
@@ -811,7 +1152,7 @@ fn daemon_control_request_inner(
             id: current_millis().min(u128::from(u64::MAX)) as u64,
             op: operation,
             cx: None,
-            p: std::mem::take(&mut parameters),
+            p: request_with_notices(std::mem::take(&mut parameters)),
         };
         let mut response = try_send_request(&request)?;
         if response.is_none() && required {
@@ -825,7 +1166,7 @@ fn daemon_control_request_inner(
             let error = response
                 .e
                 .context("Daemon request failed without an error")?;
-            bail!("{}", error.m);
+            return Err(automation::DaemonFailure::from(error).into());
         }
         return Ok(Some(response.r.unwrap_or_else(|| json!({}))));
     }
@@ -946,52 +1287,274 @@ fn daemon_control_request_inner(
             error
         }
     };
-    let response = if requires_review {
-        let prepare = send_request(&automation::Request {
-            v: automation::PROTOCOL_VERSION,
-            id: current_millis().min(u128::from(u64::MAX)) as u64,
-            op: automation::op::REVIEW_PREPARE,
-            cx: Some(context_id),
-            p: json!({ "op": operation, "p": parameters }),
-        })
-        .map_err(busy)?;
-        if prepare.ok == 0 {
-            let error = prepare
-                .e
-                .context("Review preparation failed without an error")?;
-            bail!("{}", error.m);
-        }
-        let review_id = prepare
-            .r
-            .as_ref()
-            .and_then(|result| result.get("reviewId"))
-            .and_then(Value::as_str)
-            .context("Review preparation omitted reviewId")?;
-        send_request(&automation::Request {
-            v: automation::PROTOCOL_VERSION,
-            id: current_millis().min(u128::from(u64::MAX)) as u64,
-            op: automation::op::REVIEW_APPLY,
-            cx: Some(context_id),
-            p: json!({ "reviewId": review_id }),
-        })
-        .map_err(busy)?
-    } else {
-        send_request(&automation::Request {
-            v: automation::PROTOCOL_VERSION,
-            id: current_millis().min(u128::from(u64::MAX)) as u64,
-            op: operation,
-            cx: Some(context_id),
-            p: std::mem::take(&mut parameters),
-        })
-        .map_err(busy)?
-    };
+    let response = send_operation_requests(
+        operation,
+        context_id,
+        parameters,
+        requires_review,
+        |request| send_request(&request).map_err(busy),
+    )?;
     if response.ok == 0 {
         let error = response
             .e
             .context("Daemon request failed without an error")?;
-        bail!("{}", error.m);
+        return Err(automation::DaemonFailure::from(error).into());
     }
     Ok(Some(response.r.unwrap_or_else(|| json!({}))))
+}
+
+#[cfg(test)]
+mod notice_tests {
+    use std::io::{BufRead, BufReader};
+    use std::net::{TcpListener, TcpStream};
+
+    use super::*;
+
+    #[test]
+    fn review_receipt_requests_ask_for_notices_at_the_top_level() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let peer = crate::system::net::SharedTcpStream::from(listener.accept().unwrap().0);
+        let prepare =
+            review_prepare_parameters(automation::op::SET_PROPERTY, json!({ "editor": true }));
+        assert_eq!(prepare["p"], json!({ "editor": true }));
+        let apply = review_apply_parameters("review-7");
+        assert_eq!(apply["reviewId"], json!("review-7"));
+        for (id, parameters) in [(5, &prepare), (6, &apply)] {
+            let line =
+                serde_json::to_string(&json!({ "v": 1, "id": id, "op": 0, "p": parameters }))
+                    .unwrap();
+            assert_eq!(
+                request_notice_sink(&line, &peer).map(|(_, id)| id),
+                Some(id),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_wire_envelope_asks_for_notices_and_a_reviews_parameters_stay_clean() {
+        let parameters = json!({ "editor": true, "property": "Value" });
+        let mut sent = Vec::new();
+        let response = send_operation_requests(
+            automation::op::SET_PROPERTY,
+            4,
+            parameters.clone(),
+            true,
+            |request| {
+                let answer = if request.op == automation::op::REVIEW_PREPARE {
+                    json!({ "reviewId": "review-7" })
+                } else {
+                    json!({ "changed": true })
+                };
+                let id = request.id;
+                sent.push(request);
+                Ok(automation::Response::success(id, Instant::now(), answer))
+            },
+        )
+        .unwrap();
+        assert_eq!(response.r.unwrap()["changed"], json!(true));
+        let [prepare, apply] = sent.as_slice() else {
+            panic!("expected a prepare and an apply request")
+        };
+        assert_eq!(prepare.op, automation::op::REVIEW_PREPARE);
+        assert_eq!(prepare.cx, Some(4));
+        assert_eq!(prepare.p["notices"], json!(true));
+        assert_eq!(prepare.p["op"], json!(automation::op::SET_PROPERTY));
+        assert_eq!(prepare.p["p"], parameters);
+        assert_eq!(apply.op, automation::op::REVIEW_APPLY);
+        assert_eq!(apply.p, json!({ "reviewId": "review-7", "notices": true }));
+        let mut direct = Vec::new();
+        send_operation_requests(
+            automation::op::SET_PROPERTY,
+            4,
+            parameters.clone(),
+            false,
+            |request| {
+                direct.push(request);
+                Ok(automation::Response::success(0, Instant::now(), json!({})))
+            },
+        )
+        .unwrap();
+        let [request] = direct.as_slice() else {
+            panic!("expected one direct request")
+        };
+        assert_eq!(request.op, automation::op::SET_PROPERTY);
+        assert_eq!(
+            request.p,
+            json!({ "editor": true, "property": "Value", "notices": true })
+        );
+    }
+
+    #[test]
+    fn a_reviewed_edit_sends_its_hold_notice_to_the_caller() {
+        // Binding a context selects it process-wide; keep this wire test isolated.
+        if std::env::var_os("RENIUM_TEST_REVIEWED_NOTICE").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "daemon::notice_tests::a_reviewed_edit_sends_its_hold_notice_to_the_caller",
+                ])
+                .env("RENIUM_TEST_REVIEWED_NOTICE", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        use crate::automation::authorization::signed_fixture_request;
+        use crate::studio::bridge::routing_tests::{connect, edit_info, fixture};
+        use tungstenite::{Message, WebSocket, protocol::Role};
+        let root = crate::tests::support::temp_dir("reviewed-notice");
+        fs::write(
+            root.join("renium.project.jsonc"),
+            r#"{"schemaVersion":1,"sourceRoot":"src","tree":{}}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join(".renium")).unwrap();
+        fs::write(
+            root.join(".renium").join("config.json"),
+            r#"{"schemaVersion":1,"liveSync":{"changesThreshold":0}}"#,
+        )
+        .unwrap();
+        let bridge = Arc::new(fixture());
+        let stream = connect(&bridge, 0, edit_info("reviewed-notice", 20));
+        let methods = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&methods);
+        let plugin = thread::spawn(move || {
+            let mut socket = WebSocket::from_raw_socket(stream, Role::Client, None);
+            while let Ok(message) = socket.read() {
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                let request: Value = serde_json::from_str(&text).unwrap();
+                let method = request["method"].as_str().unwrap().to_string();
+                let result = match method.as_str() {
+                    "getEditorMutationPackages" => json!({ "packages": [] }),
+                    "requestEditorPushReview" => {
+                        json!({ "required": true, "reviewId": "studio-1" })
+                    }
+                    "getEditorPushReviewDecision" => {
+                        json!({ "decided": true, "decision": "skip" })
+                    }
+                    _ => json!({}),
+                };
+                seen.lock().unwrap().push(method);
+                let answer = json!({ "id": request["id"], "ok": true, "result": result });
+                if socket
+                    .send(Message::Text(answer.to_string().into()))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let state = automation::State::default();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (served, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let mut writer = client;
+        thread::scope(|scope| {
+            scope.spawn(|| handle_daemon_control_connection(served, &bridge, &state, 0.1));
+            let mut exchange = |value: Value| -> Vec<automation::Response> {
+                writeln!(writer, "{}", signed_fixture_request(&state, value)).unwrap();
+                writer.flush().unwrap();
+                let mut responses = Vec::new();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let response: automation::Response = serde_json::from_str(&line).unwrap();
+                    let interim = response.is_notice();
+                    responses.push(response);
+                    if !interim {
+                        break;
+                    }
+                }
+                responses
+            };
+            let bound = exchange(json!({
+                "v": 1, "id": 1, "op": automation::op::BIND,
+                "p": { "root": root, "place": "10:20" }
+            }));
+            let bound = bound.last().unwrap();
+            assert_eq!(bound.ok, 1, "{}", serde_json::to_string(bound).unwrap());
+            let context = bound.r.as_ref().unwrap()["id"].as_u64().unwrap();
+            let parameters = json!({
+                "editor": true, "service": "Workspace", "className": "StringValue",
+                "pathSegments": ["Props", "Sign"], "pathOrdinals": [],
+                "scope": "property", "property": "Value", "value": "held", "srcDir": "src"
+            });
+            let prepared = exchange(json!({
+                "v": 1, "id": 2, "op": automation::op::REVIEW_PREPARE, "cx": context,
+                "p": review_prepare_parameters(automation::op::SET_PROPERTY, parameters)
+            }));
+            let prepared = prepared.last().unwrap();
+            assert_eq!(
+                prepared.ok,
+                1,
+                "{}",
+                serde_json::to_string(prepared).unwrap()
+            );
+            let review_id = prepared.r.as_ref().unwrap()["reviewId"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let applied = exchange(json!({
+                "v": 1, "id": 3, "op": automation::op::REVIEW_APPLY, "cx": context,
+                "p": review_apply_parameters(&review_id)
+            }));
+            let [notice, result] = applied.as_slice() else {
+                panic!(
+                    "expected the hold notice and the result: {}",
+                    serde_json::to_string(&applied).unwrap()
+                )
+            };
+            assert_eq!(notice.id, 3);
+            assert!(
+                notice.notice_text().is_some_and(
+                    |text| text.contains("held for review in Studio (id=studio-1, changes=1)")
+                ),
+                "{}",
+                serde_json::to_string(notice).unwrap()
+            );
+            assert_eq!(result.ok, 1, "{}", serde_json::to_string(result).unwrap());
+            assert_eq!(result.r.as_ref().unwrap()["skippedByReview"], json!(true));
+            writer.shutdown(std::net::Shutdown::Both).unwrap();
+        });
+        assert!(
+            methods
+                .lock()
+                .unwrap()
+                .contains(&"requestEditorPushReview".to_string())
+        );
+        drop(bridge);
+        plugin.join().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_request_that_asks_for_notices_receives_them_on_its_own_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let peer = crate::system::net::SharedTcpStream::from(listener.accept().unwrap().0);
+        assert!(request_notice_sink(r#"{"v":1,"id":3,"op":0,"p":{}}"#, &peer).is_none());
+        let sink = request_notice_sink(r#"{"v":1,"id":3,"op":0,"p":{"notices":true}}"#, &peer);
+        assert_eq!(sink.as_ref().map(|(_, id)| *id), Some(3));
+        emit_request_notice("ignored without a sink");
+        REQUEST_NOTICE_SINK.with(|slot| *slot.borrow_mut() = sink);
+        emit_request_notice("held for review");
+        REQUEST_NOTICE_SINK.with(|slot| slot.borrow_mut().take());
+        emit_request_notice("ignored after the request");
+        drop(peer);
+        let mut lines = BufReader::new(client).lines();
+        let line = lines.next().unwrap().unwrap();
+        let response: automation::Response = serde_json::from_str(&line).unwrap();
+        assert!(response.is_notice());
+        assert_eq!(response.id, 3);
+        assert_eq!(response.notice_text(), Some("held for review"));
+        assert!(lines.next().is_none());
+    }
 }
 
 #[cfg(test)]

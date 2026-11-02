@@ -31,7 +31,7 @@ use crate::roblox::schema::{configure_bridge_property_candidates, load_rbx_dom_p
 use crate::settings::bytecode::{SettingsBytecode, encode_settings_bytecode};
 use crate::settings::equivalence::{SettingsAlignment, align_settings_bytes_to_reference};
 use crate::snapshot::import::{
-    DirectImportDispatcher, SourcemapWriter, build_service_state_from_instances,
+    DirectImportDispatcher, DirectImportRoots, SourcemapWriter, build_service_state_from_instances,
     direct_import_export_order, normalize_class_defaults, parse_services,
     resolve_direct_import_workers,
 };
@@ -184,6 +184,7 @@ pub(crate) struct ExportProjectStage {
     restored_links: Vec<Value>,
     studio_overrides: StudioOverrides,
     preserve_paths: Vec<PathBuf>,
+    holds_project_files: bool,
     active: bool,
 }
 
@@ -371,6 +372,7 @@ impl ExportProjectStage {
             restored_links: Vec::new(),
             studio_overrides: BTreeMap::new(),
             preserve_paths: Vec::new(),
+            holds_project_files: clone_project_data,
             active: true,
         };
         log_global(
@@ -382,6 +384,13 @@ impl ExportProjectStage {
         );
         log_timing_ms("export project stage copy", elapsed_ms(started));
         Ok(stage)
+    }
+
+    /// The project's source root a capture into this stage keeps the script
+    /// file layout of, when the stage carries no copy of the project's files.
+    pub(crate) fn layout_src_root(&self, project_root: &Path) -> Option<PathBuf> {
+        (!self.holds_project_files && self.import_project_root == self.project_root)
+            .then(|| project_root.join(&self.import_src_dir))
     }
 
     pub(crate) fn mark_settings_aligned(&mut self) {
@@ -883,6 +892,7 @@ impl ExportProjectStage {
             read_only_links_restored: std::mem::take(&mut self.restored_links),
             studio_overrides,
             preserved,
+            history_id: None,
             previous: Some(PublishBackups {
                 root: backup_root,
                 container: self.container.clone(),
@@ -1091,6 +1101,8 @@ pub(crate) struct PublishedProjectChanges {
     /// Project paths the publish left alone because their edits are unsynced.
     pub(crate) preserved: Vec<PathBuf>,
     pub(crate) previous: Option<PublishBackups>,
+    /// The sync history entry a pull recorded for its replaced files.
+    pub(crate) history_id: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -1694,6 +1706,7 @@ pub(crate) struct ExportExecutionSetup {
 pub(crate) fn prepare_export_execution(
     src_dir: &Path,
     project_root: &Path,
+    layout_src_root: Option<&Path>,
     services: &[String],
     total_started: Instant,
 ) -> Result<ExportExecutionSetup> {
@@ -1719,8 +1732,11 @@ pub(crate) fn prepare_export_execution(
     let workers = resolve_direct_import_workers();
     println!("[renium] direct import workers during export: {workers}");
     let direct_import_dispatcher = DirectImportDispatcher::start(
-        import_project_root.clone(),
-        import_src_dir,
+        DirectImportRoots {
+            project_root: import_project_root.clone(),
+            src_dir: import_src_dir,
+            layout_src_root: layout_src_root.map(Path::to_path_buf),
+        },
         workers,
         workers,
         Some(sourcemap_writer.sender()),
@@ -1832,7 +1848,13 @@ fn export_snapshots_core(
         sourcemap_writer,
         direct_import_dispatcher,
         export_services,
-    } = prepare_export_execution(&args.src_dir, &project_root, &services, total_started)?;
+    } = prepare_export_execution(
+        &args.src_dir,
+        &project_root,
+        args.layout_src_root.as_deref(),
+        &services,
+        total_started,
+    )?;
     if matches!(purpose, ExportPurpose::Pull) {
         project_stage.prepare_read_only_links(&project_root, &args.src_dir, &services)?;
         project_stage.preserve_project_paths(args.preserve_paths.clone());
@@ -1935,12 +1957,16 @@ fn record_pull_undo_history(
     source: &Path,
     published: &mut PublishedProjectChanges,
 ) {
-    let Err(error) = crate::automation::reconcile::history::record_published_files(
+    let error = match crate::automation::reconcile::history::record_published_files(
         project_root,
         source,
         published,
-    ) else {
-        return;
+    ) {
+        Ok(id) => {
+            published.history_id = id;
+            return;
+        }
+        Err(error) => error,
     };
     let retained = published.previous.take().map(PublishBackups::retain);
     log_global(
@@ -3204,6 +3230,7 @@ mod publication_tests {
         let setup = prepare_export_execution(
             &args.src_dir,
             &fixture.root,
+            None,
             &["ReplicatedStorage".into()],
             Instant::now(),
         )

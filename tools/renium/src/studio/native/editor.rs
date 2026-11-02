@@ -359,7 +359,7 @@ fn capture_native_service_root_properties(
     // whole-place export. The active export guard still fences outside edits.
     for group in groups {
         for &name in capture_properties(&group.service) {
-            let text = match serializer::read_property(
+            let text = match serializer::optional_native(serializer::read_property(
                 pid,
                 &title,
                 &group.target_path,
@@ -367,14 +367,16 @@ fn capture_native_service_root_properties(
                 &group.service,
                 name,
                 Duration::from_secs(2),
-            ) {
-                Ok(text) => text,
-                Err(error) => {
+            ))? {
+                Some(text) => text,
+                None => {
                     // Without the native read these saved fields stay as the
                     // files have them, as on a plugin-only capture.
                     crate::app::output::log_global(
                         3,
-                        format_args!("[renium] native service root capture skipped: {error:#}"),
+                        format_args!(
+                            "[renium] native service root capture unavailable; preserving saved fields"
+                        ),
                     );
                     return Ok(());
                 }
@@ -2850,7 +2852,8 @@ fn editor_binary_export_parts_once<'a>(
     thread::scope(|overlay_scope| {
         // Identity and binary reads share the existing export fence. Start both
         // before waiting so a queued native identity read does not idle all the
-        // binary/overlay workers. No output is published until identity succeeds.
+        // binary/overlay workers. Only a verified-unavailable native locator
+        // permits export with the plugin's validated identity carriers alone.
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         let identity_worker = overlay_scope.spawn(move || {
             let pid = studio_pid_for_bridge(bridge)?;
@@ -3202,20 +3205,22 @@ fn editor_binary_export_parts_once<'a>(
                     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                     let result = {
                         let mut result = result;
-                        for instance in &mut result.output.parts.instances {
-                            let id = instance
-                                .debug_id
-                                .as_deref()
-                                .and_then(|id| persistent_identities.get(id))
-                                .context(
-                                    "Exported instance is missing from native identity capture",
-                                )?;
-                            // Use the existing metadata codec. The final export guard
-                            // covers the whole interval from identity read to publication.
-                            instance.properties.insert(
-                                "UniqueId".into(),
-                                json!({"_type": "UniqueId", "value": id.to_string()}),
-                            );
+                        if let Some(persistent_identities) = &persistent_identities {
+                            for instance in &mut result.output.parts.instances {
+                                let id = instance
+                                    .debug_id
+                                    .as_deref()
+                                    .and_then(|id| persistent_identities.get(id))
+                                    .context(
+                                        "Exported instance is missing from native identity capture",
+                                    )?;
+                                // Use the existing metadata codec. The final export guard
+                                // covers the whole interval from identity read to publication.
+                                instance.properties.insert(
+                                    "UniqueId".into(),
+                                    json!({"_type": "UniqueId", "value": id.to_string()}),
+                                );
+                            }
                         }
                         result
                     };

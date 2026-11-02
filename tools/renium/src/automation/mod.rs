@@ -148,6 +148,31 @@ pub struct ProtocolError {
     pub d: Option<Value>,
 }
 
+/// A daemon failure as the command relays it: the message, with the
+/// structured detail the daemon attached for the command's JSON error.
+#[derive(Debug)]
+pub struct DaemonFailure {
+    pub message: String,
+    pub detail: Option<Value>,
+}
+
+impl std::fmt::Display for DaemonFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for DaemonFailure {}
+
+impl From<ProtocolError> for DaemonFailure {
+    fn from(error: ProtocolError) -> Self {
+        Self {
+            message: error.m,
+            detail: error.d,
+        }
+    }
+}
+
 pub struct Failure(pub ProtocolError);
 
 impl Failure {
@@ -211,6 +236,28 @@ impl Response {
         }
     }
 
+    /// An interim line a request may receive before its answer (`ok` 2):
+    /// the daemon tells the caller what the request is waiting for.
+    pub fn notice(id: u64, text: &str) -> Self {
+        Self {
+            v: PROTOCOL_VERSION,
+            id,
+            ok: 2,
+            ms: 0.0,
+            u: None,
+            r: Some(json!({ "notice": text })),
+            e: None,
+        }
+    }
+
+    pub fn is_notice(&self) -> bool {
+        self.ok == 2
+    }
+
+    pub fn notice_text(&self) -> Option<&str> {
+        self.r.as_ref()?.get("notice")?.as_str()
+    }
+
     pub fn with_update(mut self, version: Option<String>) -> Self {
         self.u = version;
         self
@@ -250,6 +297,34 @@ fn studio_target_path_for_root(root: &Path) -> PathBuf {
 pub(crate) fn studio_target_for_root(root: &Path) -> Option<StudioReopenTarget> {
     let bytes = std::fs::read(studio_target_path_for_root(root)).ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+/// Records the place a Studio command opened or closed for this project.
+pub(crate) fn write_studio_target_for_root(
+    root: &Path,
+    target: &StudioReopenTarget,
+) -> anyhow::Result<()> {
+    crate::project::version_control::ensure_renium_local_state_ignored(root)?;
+    let bytes = serde_json::to_vec_pretty(target)?;
+    crate::system::files::atomic_write_file(&studio_target_path_for_root(root), &bytes)
+}
+
+#[cfg(test)]
+mod studio_target_tests {
+    use super::*;
+
+    #[test]
+    fn the_recorded_target_reads_back_from_the_project() {
+        let root = crate::tests::support::temp_dir("studio-target");
+        assert!(studio_target_for_root(&root).is_none());
+        let target = StudioReopenTarget {
+            file: Some(root.join("B.rbxl")),
+            game_id: None,
+            place_id: None,
+        };
+        write_studio_target_for_root(&root, &target).unwrap();
+        assert_eq!(studio_target_for_root(&root), Some(target));
+    }
 }
 
 pub(crate) fn published_selector(selector: &str) -> Option<(i64, i64)> {
@@ -401,15 +476,7 @@ impl State {
 
     #[cfg(any(windows, target_os = "macos"))]
     pub fn remember_studio_target(&self, context: &BoundContext, target: StudioReopenTarget) {
-        let path = studio_target_path_for_root(Path::new(&context.root));
-        if crate::project::version_control::ensure_renium_local_state_ignored(std::path::Path::new(
-            &context.root,
-        ))
-        .is_ok()
-            && let Ok(bytes) = serde_json::to_vec_pretty(&target)
-        {
-            let _ = crate::system::files::atomic_write_file(&path, &bytes);
-        }
+        let _ = write_studio_target_for_root(Path::new(&context.root), &target);
         self.studio_reopen_targets
             .lock_recover()
             .insert(context.project.clone(), target);
@@ -592,6 +659,16 @@ mod tests {
                 &json!({"destructive": true, "verifySources": true, "dryRun": true}),
                 approved
             ));
+        }
+    }
+
+    #[test]
+    fn approved_direct_edits_go_through_the_review_receipt() {
+        for operation in [op::SET_PROPERTY, op::REMOVE] {
+            let opcode = opcode_by_id(operation).unwrap();
+            assert!(opcode.review, "{}", opcode.name);
+            assert!(opcode.requires_review(&json!({ "editor": true }), true));
+            assert!(!opcode.requires_review(&json!({ "editor": true }), false));
         }
     }
 

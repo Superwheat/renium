@@ -171,6 +171,8 @@ pub(crate) fn push_staged_project(
         .target_settings_ids
         .clone_from(&plan.target_settings_ids);
     push_args.exact_target_ids = true;
+    push_args.targets_extend_paths = true;
+    push_args.link_project_root = Some(PathBuf::from(&context.root));
     push_args.target_settings_id_files.clear();
     push_args.target_properties.clear();
     push_args.verify_sources = true;
@@ -206,7 +208,9 @@ pub(crate) fn push_staged_project(
         validate_project,
     )?;
     if summary.get("skippedByReview").and_then(Value::as_bool) == Some(true) {
-        bail!("Reconciled changes require review before Studio can be updated");
+        bail!(
+            "The push was skipped at the Studio review (rbx rv skip, or no answer within 90 s); nothing was applied. Run the push again and answer with rbx rv apply, or pass --yes"
+        );
     }
     for document in initial_documents.into_values() {
         if let Some(document) = Arc::into_inner(document) {
@@ -1233,4 +1237,165 @@ pub(crate) fn capture_snapshot(root: &Path, roots: &[PathBuf]) -> Result<Project
         .collect::<Result<Vec<_>>>()?;
     entries.extend(contents);
     Ok(ProjectSnapshot { entries })
+}
+
+#[cfg(test)]
+mod review_threshold_tests {
+    use super::*;
+    use crate::cli::{BridgeConnectionArgs, ProjectSourceArgs};
+    use crate::studio::bridge::routing_tests::{connect, edit_info, fixture};
+    use std::thread;
+    use tungstenite::{Message, WebSocket, protocol::Role};
+
+    #[test]
+    fn a_staged_push_reviews_against_the_authored_projects_threshold() {
+        // Pinning the staged context selects it process-wide; keep this isolated.
+        if std::env::var_os("RENIUM_TEST_STAGED_REVIEW").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "automation::reconcile::push_plan::review_threshold_tests::a_staged_push_reviews_against_the_authored_projects_threshold",
+                ])
+                .env("RENIUM_TEST_STAGED_REVIEW", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let root = crate::tests::support::temp_dir("staged-review-threshold");
+        fs::write(
+            root.join("renium.project.jsonc"),
+            r#"{"schemaVersion":1,"sourceRoot":"src","tree":{}}"#,
+        )
+        .unwrap();
+        let script = PathBuf::from("src/ServerScriptService/Main.server.luau");
+        fs::create_dir_all(root.join("src/ServerScriptService")).unwrap();
+        fs::write(root.join(&script), "return 1").unwrap();
+        fs::create_dir_all(root.join(".renium")).unwrap();
+        fs::write(
+            root.join(".renium").join("config.json"),
+            r#"{"schemaVersion":1,"liveSync":{"changesThreshold":0}}"#,
+        )
+        .unwrap();
+        let studio = capture_snapshot(&root, &[PathBuf::from("src")]).unwrap();
+        fs::write(root.join(&script), "return 2").unwrap();
+        let merged = capture_snapshot(&root, &[PathBuf::from("src")]).unwrap();
+        let plan = reconciliation_push_plan(&studio, &merged).unwrap();
+        assert_eq!(plan.changed_paths, std::slice::from_ref(&script));
+        let stage = ExportProjectStage::create(
+            &root,
+            &root.join("src"),
+            &["ServerScriptService".to_string()],
+        )
+        .unwrap();
+        apply_snapshot_paths(
+            &stage.project_root,
+            &plan.changed_paths.iter().cloned().collect(),
+            &merged,
+        )
+        .unwrap();
+        assert!(
+            !stage
+                .project_root
+                .join(".renium")
+                .join("config.json")
+                .exists(),
+            "the stage carries no place configuration"
+        );
+        let context = BoundContext {
+            id: 1,
+            initialized: true,
+            project: root.display().to_string(),
+            root: root.display().to_string(),
+            experience: root.display().to_string(),
+            source: root.join("src").display().to_string(),
+            resource_lease: None,
+            place_id: Some(20),
+            game_id: Some(10),
+            selector: String::new(),
+            runtime_id: Some("staged-review".into()),
+            plugin_build: None,
+            fingerprint: String::new(),
+        };
+        let bridge = fixture();
+        let stream = connect(&bridge, 0, edit_info("staged-review", 20));
+        let reviews = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&reviews);
+        let plugin = thread::spawn(move || {
+            let mut socket = WebSocket::from_raw_socket(stream, Role::Client, None);
+            while let Ok(message) = socket.read() {
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                let request: Value = serde_json::from_str(&text).unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "getLiveSourceBatch" => json!({
+                        "rows": [{ "index": 0, "source": "return 1", "className": "Script" }]
+                    }),
+                    "getEditorMutationPackages" => json!({ "packages": [] }),
+                    "requestEditorPushReview" => {
+                        seen.lock().unwrap().push(request["params"].clone());
+                        json!({ "required": true, "reviewId": "studio-1" })
+                    }
+                    "getEditorPushReviewDecision" => {
+                        json!({ "decided": true, "decision": "skip" })
+                    }
+                    _ => json!({}),
+                };
+                let answer = json!({ "id": request["id"], "ok": true, "result": result });
+                if socket
+                    .send(Message::Text(answer.to_string().into()))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let args = PushEditorChangesArgs::new(
+            ProjectSourceArgs {
+                project_root: root.clone(),
+                src_root: PathBuf::from("src"),
+            },
+            BridgeConnectionArgs::local(0.1),
+        );
+        let skipped = push_staged_project(
+            &context,
+            &stage,
+            &bridge,
+            StagedPushRequest {
+                plan,
+                prepared_documents: HashMap::new(),
+                guard: None,
+                args,
+                expected_project: None,
+                later_edits_follow: true,
+            },
+        );
+        let Err(skipped) = skipped else {
+            panic!("a skipped review must not apply the staged push")
+        };
+        assert!(
+            format!("{skipped:#}").contains("skipped at the Studio review"),
+            "{skipped:#}"
+        );
+        {
+            let reviews = reviews.lock().unwrap();
+            assert_eq!(reviews.len(), 1, "{reviews:?}");
+            assert!(
+                reviews[0]["changeCount"]
+                    .as_u64()
+                    .is_some_and(|count| count >= 1)
+            );
+            assert_eq!(
+                reviews[0]["changesThreshold"],
+                json!(0),
+                "the authored place configuration decides the review: {}",
+                reviews[0]
+            );
+        }
+        drop(stage);
+        drop(bridge);
+        plugin.join().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
 }

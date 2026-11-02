@@ -317,18 +317,21 @@ fn legacy_target_fingerprint(
     super::legacy_package_target_fingerprint(&inlined, service, segments, ordinals)
 }
 
+/// Compares a target with its package. With `stray_files` a file under the
+/// target's folder that no instance of the target owns (a script added to a
+/// read-only copy) is a difference too.
 fn compare_package_target(
     document: &SettingsBytecode,
     (service, segments, ordinals): &(String, Vec<String>, Vec<usize>),
     service_dir: &Path,
     (package, package_fingerprint): (&SettingsBytecode, &str),
-    shared: bool,
+    stray_files: bool,
 ) -> Result<(Option<String>, bool, Option<String>)> {
     if resolve_editor_instance_by_path_ordinals(document, service, segments, ordinals).is_none() {
         return Ok((None, false, None));
     }
     let inlined = inline_target_sources(document, service, service_dir, segments, ordinals)?;
-    let stray = if shared {
+    let stray = if stray_files {
         stray_target_files(document, service, service_dir, segments, ordinals)?
     } else {
         Vec::new()
@@ -526,7 +529,7 @@ impl PackageLinkApply<'_> {
             document_selector,
             &storage.source_root,
             (&package_doc, &package_fingerprint),
-            shared_replaced_dir.is_some(),
+            target.read_only || shared_replaced_dir.is_some(),
         )?;
         if !target_exists && lock_entry.files.contains_key(&lock_key) && !target_forced {
             changes.mark_deleted_target(manifest, target, args.check, true);
@@ -1710,11 +1713,12 @@ fn project_link_status(
                         ),
                         &storage.source_root,
                         (package, fingerprint),
-                        shared::experience_package_path(
-                            project_root,
-                            &package_path.to_string_lossy(),
-                        )
-                        .is_some(),
+                        target.read_only
+                            || shared::experience_package_path(
+                                project_root,
+                                &package_path.to_string_lossy(),
+                            )
+                            .is_some(),
                     )
                     .is_ok_and(|(_, matches, _)| matches)
                 });

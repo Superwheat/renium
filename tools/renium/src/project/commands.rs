@@ -206,6 +206,43 @@ fn projected_instance_store(
     Ok((settings_file, settings_id))
 }
 
+/// `upl` is refused inside a read-only link like any edit, except at the
+/// root of a link whose package has no PackageLink there (`lkp --share`
+/// strips it and asks the other places to unlink): removing a Roblox link
+/// there brings the copy back to its package. That refusal comes back
+/// deferred, to stand only when the unlink finds nothing to remove.
+fn projected_unlink_store(
+    project: Option<&Path>,
+    target: &ProjectInstanceArgs,
+    override_packages: bool,
+) -> Result<(PathBuf, Option<String>, Option<anyhow::Error>)> {
+    let loaded = load_structural_project(project, &target.project_root)?;
+    let stage = config::stage_project(&loaded)?;
+    let mut deferred = None;
+    if !override_packages {
+        let (path, ordinals, _) =
+            projected_structural_target(&stage, &target.service, Some(&target.settings_id))?;
+        let enforcement = build_loaded_project_link_enforcement(&loaded, false)?;
+        let refusal = enforcement.reject_read_only_package_path(&target.service, &path, &ordinals);
+        if enforcement.unlink_matches_package(&target.service, &path, &ordinals) {
+            deferred = refusal.err();
+        } else {
+            refusal?;
+        }
+    }
+    let (settings_file, _, settings_id) = projected_structural_store(
+        &loaded,
+        &stage,
+        &target.service,
+        Some(&target.settings_id),
+        true,
+        true,
+    )?;
+    Ok((settings_file, settings_id, deferred))
+}
+
+/// The projected caller has already applied the read-only link check, with
+/// its own `--override-packages`.
 fn metadata_property_change(
     settings_file: PathBuf,
     settings_id: Option<String>,
@@ -222,6 +259,7 @@ fn metadata_property_change(
         value_bool: None,
         value_null: false,
         scope: "metadata".to_string(),
+        override_packages: true,
         pretty: false,
     }
 }
@@ -360,6 +398,9 @@ pub(crate) fn move_instance_command(args: MoveInstanceArgs, project: Option<&Pat
             false,
             args.override_packages,
         )?;
+        if !target_file.is_file() {
+            bail!("Target service '{target_service}' has no Renium store");
+        }
         let parent_id = parent_id
             .map(Ok)
             .unwrap_or_else(|| service_root_settings_id(&target_file, &target_service))?;
@@ -476,13 +517,43 @@ pub(crate) fn desync_package_link_command(
     project: Option<&Path>,
 ) -> Result<()> {
     let target = args.target;
-    let (settings_file, settings_id) =
-        projected_instance_store(project, &target, args.override_packages)?;
+    let (settings_file, settings_id, read_only_refusal) =
+        projected_unlink_store(project, &target, args.override_packages)?;
     let segments =
         stored_instance_segments(&settings_file, &target.service, settings_id.as_deref())?;
-    let studio = unlink_package_in_studio(project, &target.service, &segments)?;
+    let linked_in_store = store_has_package_link(&settings_file, settings_id.as_deref())?;
+    let studio = match unlink_package_in_studio(project, &target.service, &segments) {
+        Ok(studio) => studio,
+        Err(error) => {
+            if let Some(refusal) = read_only_refusal
+                && !linked_in_store
+                && format!("{error:#}").contains("is missing")
+            {
+                return Err(refusal);
+            }
+            return Err(error);
+        }
+    };
+    if let Some(refusal) = read_only_refusal
+        && !linked_in_store
+        && studio
+            .as_deref()
+            .is_none_or(|studio| studio == "already unlinked")
+    {
+        return Err(refusal);
+    }
+    let live_sync = match &studio {
+        Some(_) => live_sync_state(&daemon_result(
+            op::STUDIO_STATUS,
+            project,
+            json!({ "all": false }),
+            false,
+            Some(&crate::cli::BridgeConnectionArgs::local(8.0)),
+        )?),
+        None => LiveSyncState::Off,
+    };
     if let Some(studio) = &studio
-        && live_sync_running(project)?
+        && live_sync == LiveSyncState::Writing
     {
         return crate::app::output::print_json_output(
             &json!({
@@ -493,24 +564,75 @@ pub(crate) fn desync_package_link_command(
             false,
         );
     }
+    let mut result = match &studio {
+        Some(studio) if !linked_in_store => {
+            json!({ "ok": true, "studio": studio, "files": "already unlinked" })
+        }
+        _ => crate::app::output::capture_json_output(|| {
+            bytecode_desync_package_link(BytecodeDesyncPackageLinkArgs {
+                input: BytecodeFileArgs::settings_file(settings_file),
+                service: target.service,
+                selector: BytecodeInstanceSelectorArgs::by_settings_id(settings_id),
+                pretty: false,
+            })
+        })?,
+    };
     if let Some(studio) = &studio {
         crate::app::output::log_global(
             3,
             format_args!("[renium] package unlinked in Studio: {studio}"),
         );
-        if !store_has_package_link(&settings_file, settings_id.as_deref())? {
-            return crate::app::output::print_json_output(
-                &json!({ "ok": true, "studio": studio, "files": "already unlinked" }),
-                false,
-            );
-        }
+        result["studio"] = json!(studio);
     }
-    bytecode_desync_package_link(BytecodeDesyncPackageLinkArgs {
-        input: BytecodeFileArgs::settings_file(settings_file),
-        service: target.service,
-        selector: BytecodeInstanceSelectorArgs::by_settings_id(settings_id),
-        pretty: false,
-    })
+    if live_sync == LiveSyncState::Reviewing {
+        result["liveSync"] = json!(compared_again_summary(
+            crate::studio::automation::compare_live_sync_again(project)
+        ));
+    }
+    crate::app::output::print_json_output(&result, false)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveSyncState {
+    Off,
+    Writing,
+    /// Waiting for a decision on differences it found; not writing.
+    Reviewing,
+    /// Verify-only for another reason; not writing either.
+    Holding,
+}
+
+fn live_sync_state(status: &Value) -> LiveSyncState {
+    let live = &status["liveSync"];
+    if live["running"].as_bool() != Some(true) {
+        LiveSyncState::Off
+    } else if live["resolutionRequired"].as_bool() == Some(true) {
+        LiveSyncState::Reviewing
+    } else if live["mode"].as_str() == Some("verify") {
+        LiveSyncState::Holding
+    } else {
+        LiveSyncState::Writing
+    }
+}
+
+/// What a second comparison made of the review the unlink answered.
+fn compared_again_summary(compared: Result<Value>) -> String {
+    match compared {
+        Ok(result) if result.pointer("/daemon/resolutionRequired") == Some(&Value::Bool(true)) => {
+            format!(
+                "still waiting for a decision: {}",
+                result["error"]
+                    .as_str()
+                    .unwrap_or("Studio and project files differ")
+            )
+        }
+        Ok(result) if result["ok"] == Value::Bool(false) => format!(
+            "compared again and stopped: {}",
+            result["error"].as_str().unwrap_or("unknown error")
+        ),
+        Ok(_) => "compared again; the review cleared and Live Sync resumed".to_string(),
+        Err(error) => format!("could not compare again: {error:#}; run rbx lon"),
+    }
 }
 
 fn store_has_package_link(settings_file: &Path, settings_id: Option<&str>) -> Result<bool> {
@@ -627,21 +749,6 @@ fn unlink_package_in_studio(
     bail!("Studio kept the PackageLink after Destroy: {outcome}")
 }
 
-fn live_sync_running(project: Option<&Path>) -> Result<bool> {
-    let bridge = crate::cli::BridgeConnectionArgs::local(8.0);
-    let status = daemon_result(
-        op::STUDIO_STATUS,
-        project,
-        json!({ "all": false }),
-        false,
-        Some(&bridge),
-    )?;
-    Ok(status
-        .pointer("/liveSync/running")
-        .and_then(Value::as_bool)
-        .unwrap_or(false))
-}
-
 pub(crate) fn import_model_command(
     args: ImportModelCommandArgs,
     project: Option<&Path>,
@@ -679,10 +786,12 @@ pub(crate) fn export_model_command(
     if !settings_file.is_file() {
         bail!("Projected service '{}' has no Renium store", target.service);
     }
+    let (_, _, settings_id) =
+        projected_structural_target(&stage, &target.service, Some(&target.settings_id))?;
     bytecode_export_model(BytecodeExportModelArgs {
         input: BytecodeFileArgs::settings_file(settings_file),
         service: target.service,
-        selector: BytecodeInstanceSelectorArgs::by_settings_id(Some(target.settings_id)),
+        selector: BytecodeInstanceSelectorArgs::by_settings_id(settings_id),
         output: args.output,
         format: args.format,
         pretty: false,
@@ -697,7 +806,7 @@ pub(crate) fn import_path_command(
     let mut loaded = explicit_project
         .map(|project| config::load_project(Some(project), None))
         .transpose()?;
-    let root = if let Some(loaded) = loaded.as_ref() {
+    let mut root = if let Some(loaded) = loaded.as_ref() {
         loaded.root.clone()
     } else if args.project_root.exists() {
         canonical_path(&args.project_root)?
@@ -707,7 +816,9 @@ pub(crate) fn import_path_command(
     let source = canonical_path(&args.source)
         .with_context(|| format!("Failed to resolve {}", args.source.display()))?;
     if args.path_json.is_some() && loaded.is_none() {
-        loaded = Some(config::load_project(None, Some(&root))?);
+        let project = config::load_project(None, Some(&root))?;
+        root = project.root.clone();
+        loaded = Some(project);
     }
     let configured_src_dir = loaded.as_ref().map_or_else(
         || PathBuf::from("src"),
@@ -1013,4 +1124,40 @@ fn collect_import_path_files(source: &Path, destination: &Path) -> Result<Vec<(P
         }
     }
     Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unlink_defers_only_to_a_live_sync_that_writes() {
+        let state = |live: Value| live_sync_state(&json!({ "liveSync": live }));
+        assert_eq!(state(Value::Null), LiveSyncState::Off);
+        assert_eq!(state(json!({"running": false})), LiveSyncState::Off);
+        assert_eq!(
+            state(json!({"running": true, "pending": 0})),
+            LiveSyncState::Writing
+        );
+        assert_eq!(
+            state(json!({"running": true, "resolutionRequired": true, "mode": "verify"})),
+            LiveSyncState::Reviewing
+        );
+        assert_eq!(
+            state(json!({"running": true, "mode": "verify", "pushesPaused": true})),
+            LiveSyncState::Holding
+        );
+        assert_eq!(
+            compared_again_summary(Ok(json!({"ok": true, "daemon": {"running": true}}))),
+            "compared again; the review cleared and Live Sync resumed"
+        );
+        assert_eq!(
+            compared_again_summary(Ok(json!({
+                "ok": false,
+                "error": "Sync needs review: x",
+                "daemon": {"resolutionRequired": true}
+            }))),
+            "still waiting for a decision: Sync needs review: x"
+        );
+    }
 }

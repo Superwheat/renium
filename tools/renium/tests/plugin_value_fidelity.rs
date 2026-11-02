@@ -1,6 +1,82 @@
 use mlua::Lua;
 
 #[test]
+fn unavailable_native_properties_use_checked_plugin_writes_or_protected_rows() -> mlua::Result<()> {
+    let lua = Lua::new();
+    lua.load(
+        r#"
+        Workspace = {}
+        decodePropertyValue = function(_, _, raw)
+            if raw == "malformed" then return false, "invalid value" end
+            return true, raw
+        end
+        readProperty = function(instance, name) return instance.readable, instance[name] end
+        propertyValuesEqual = function(_, _, a, b) return a == b end
+        exactValuesEqual = function(a, b) return a == b end
+        writePropertyForSync = function(instance, name, value)
+            if instance.failure then return false, instance.failure end
+            instance[name] = value
+            return true
+        end
+        markLiveMutation = function() end
+    "#,
+    )
+    .exec()?;
+    let source = include_str!("../../plugin_ws_bridge/BridgeEditorSync.module.luau");
+    let body = source
+        .split("local function recordProtectedWrite(")
+        .nth(1)
+        .unwrap()
+        .split("local function applyChangedProperty(")
+        .next()
+        .unwrap();
+    lua.load(format!(
+        "local function recordProtectedWrite({body}\nqueue = queueNativeRootWrite"
+    ))
+    .exec()?;
+    lua.load(r#"
+        local function state(available)
+            return {editorTransaction = {historyRecording = "recording", nativePropertiesAvailable = available}},
+                {noops = 0, propertyUpdated = 0, protectedWrites = {}}
+        end
+        local change = {service = "Workspace", className = "Workspace", pathSegments = {"Workspace"}, pathOrdinals = {1}}
+        local instance = {ClassName = "Workspace", readable = true, StreamingTargetRadius = 128,
+            GetFullName = function() return "Workspace" end}
+        local ctx, stats = state(false)
+        queue(instance, "StreamingTargetRadius", 256, change, ctx, stats)
+        assert(instance.StreamingTargetRadius == 256 and stats.propertyUpdated == 1)
+        assert(ctx.editorTransaction.nativeRootWrites == nil and #stats.protectedWrites == 0)
+        queue(instance, "StreamingTargetRadius", 256, change, ctx, stats)
+        assert(stats.noops == 1 and stats.propertyUpdated == 1)
+        instance.readable = false
+        instance.failure = "lacking capability RobloxScript"
+        queue(instance, "ModelStreamingBehavior", 1, change, ctx, stats)
+        assert(#stats.protectedWrites == 1 and stats.protectedWrites[1].name == "ModelStreamingBehavior")
+        assert(stats.protectedWrites[1].value == 1 and ctx.editorTransaction.nativeRootWrites == nil)
+        instance.failure = "setter changed target"
+        local ok, err = pcall(queue, instance, "ModelStreamingBehavior", 2, change, ctx, stats)
+        assert(not ok and string.find(err, "setter changed target", 1, true))
+        assert(#stats.protectedWrites == 1)
+        assert(not pcall(queue, instance, "ModelStreamingBehavior", "malformed", change, ctx, stats))
+        local nativeCtx, nativeStats = state(true)
+        queue(instance, "ModelStreamingBehavior", 2, change, nativeCtx, nativeStats)
+        assert(#nativeCtx.editorTransaction.nativeRootWrites == 1 and #nativeStats.protectedWrites == 0)
+        local terrain = {ClassName = "Terrain", readable = false}
+        queue(terrain, "SmoothGrid", {SmoothGrid = {_type = "BinaryString", base64 = "AA=="},
+            PhysicsGrid = {_type = "BinaryString", base64 = "AQ=="}}, change, ctx, stats)
+        assert(#stats.protectedWrites == 3 and ctx.editorTransaction.nativeRootWrites == nil)
+        local grids = {}
+        for _, row in ipairs(stats.protectedWrites) do grids[row.name] = row.value end
+        assert(grids.SmoothGrid.base64 == "AA==" and grids.PhysicsGrid.base64 == "AQ==")
+        local model = {ClassName = "Model", readable = true, Scale = 1}
+        ctx.editorTransaction.createdInstances = {[model] = true}
+        queue(model, "Scale", 0.95, change, ctx, stats)
+        assert(model.Scale == 1 and stats.protectedWrites[4].value == 0.95,
+            "fallback initialization must not resize descendants with ScaleTo")
+    "#).exec()
+}
+
+#[test]
 fn plugin_preserves_small_edits_and_rejects_missing_writes() -> mlua::Result<()> {
     let lua = Lua::new();
     // Only the engine value representation is stubbed; comparisons and the

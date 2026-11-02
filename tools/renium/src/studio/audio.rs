@@ -189,9 +189,22 @@ pub(crate) fn command(pid: u32, action: Action) -> Result<Value> {
         .read(true)
         .write(true)
         .open(dir.join("command.lock"))?;
-    command_lock
-        .try_lock()
-        .context("Another audio command is in progress for this Studio; retry when it finishes")?;
+    // The previous command's lock is released as its process exits; a
+    // command issued right behind it waits a moment instead of failing.
+    let lock_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        match command_lock.try_lock() {
+            Ok(()) => break,
+            Err(_) if std::time::Instant::now() < lock_deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(error) => {
+                return Err(error).context(
+                    "Another audio command is in progress for this Studio; retry when it finishes",
+                );
+            }
+        }
+    }
     let id = format!(
         "{}-{}",
         std::process::id(),

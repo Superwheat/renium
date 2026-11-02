@@ -184,9 +184,9 @@ function BridgePluginRuntime.start(context)
 	local CONNECT_SESSION_TIMEOUT_SECONDS = 2.0
 	local DEBUG_BRIDGE_CONNECTION = false
 	local PARALLEL_SOURCE_BATCH_MIN_ITEMS = 24
-	local BRIDGE_VERSION = "0.5.7"
+	local BRIDGE_VERSION = "0.5.8"
 	local BRIDGE_PROTOCOL_VERSION = "compact-v5"
-	local BRIDGE_BUILD_UNIX = 1793497496
+	local BRIDGE_BUILD_UNIX = 1793625860
 	local MAX_ACTIVE_DEMAND_SERIALIZERS = 4
 	local MAX_SOURCE_BATCH_PATHS = 1024
 	local COMPACT_TYPE_IDS = {
@@ -297,6 +297,26 @@ function BridgePluginRuntime.start(context)
 	Config.bridgePorts = DEFAULT_PORTS
 	Config.bridgeChannels = {}
 
+	-- A play session's DataModels are copies of the Edit window's, so the ports
+	-- the Edit window was on at the start of the test travel with them: a Studio
+	-- redirected to another daemon's ports keeps its play server and clients on
+	-- that daemon instead of the saved ports.
+	local function launchBridgePorts()
+		if not Config.startedInPlayMode then
+			return nil
+		end
+		local testArgs = (game:GetService("StudioTestService") :: any):GetTestArgs()
+		local launch = if type(testArgs) == "table" and type(testArgs.__renium) == "table" then testArgs.__renium else nil
+		if launch ~= nil and type(launch.bridgePorts) == "table" and #launch.bridgePorts > 0 then
+			return SettingsModule.parsePortsCsv(table.concat(launch.bridgePorts, ","))
+		end
+		local raw = game:GetAttribute("__ReniumBridgePorts")
+		if type(raw) ~= "string" then
+			return nil
+		end
+		return SettingsModule.parsePortsCsv(raw)
+	end
+
 	local ALLOWED_SERVICES = {
 		Workspace = true,
 		Players = true,
@@ -397,6 +417,9 @@ function BridgePluginRuntime.start(context)
 	local RuntimeApi = requireChildModule("BridgeRuntimeApi").create(plugin, {
 		runtimeId = Config.bridgeRuntimeId,
 		bridgeRole = Config.bridgeRole,
+		bridgePorts = function()
+			return Config.bridgePorts
+		end,
 		assertSessionOwnership = function(sessionGeneration)
 			-- Outside an exclusive request no generation is bound; the dispatcher
 			-- already validated the request, so only the lock itself is checked.
@@ -4038,6 +4061,20 @@ function BridgePluginRuntime.start(context)
 	Config.bridgeMethodHandlers.getBridgeInfo = function()
 		return Config.getBridgeInfo()
 	end
+
+	Config.bridgeMethodHandlers.redirectBridgePorts = function(params)
+		local list = {}
+		for _, value in ipairs(if type(params) == "table" then params.ports or {} else {}) do
+			list[#list + 1] = tostring(value)
+		end
+		if #list ~= 2 then
+			return { ok = false, error = "redirectBridgePorts needs exactly two ports" }
+		end
+		task.defer(function()
+			Config.redirectBridgePorts(list)
+		end)
+		return { ok = true, ports = list }
+	end
 	local function cancelRequestLeaseResources(leaseId: string)
 		Config.studioChanges.cancelWait(leaseId)
 		local editorResult = editorSync.cancelRequestLease(leaseId)
@@ -4098,12 +4135,16 @@ function BridgePluginRuntime.start(context)
 		local uploadId = tostring(p.uploadId or "")
 		local totalChunks = tonumber(p.totalChunks)
 		local changeCount = tonumber(p.changeCount)
+		local changesThreshold = tonumber(p.changesThreshold)
 		local rowCount = tonumber(p.rowCount)
 		if uploadId == "" or not totalChunks or totalChunks < 1 or totalChunks > 4096 or totalChunks % 1 ~= 0 then
 			error("Invalid editor review upload")
 		end
 		if not changeCount or changeCount < 0 or changeCount > MAX_EDITOR_REVIEW_CHANGES or changeCount % 1 ~= 0 then
 			error("Invalid editor review change count")
+		end
+		if changesThreshold and (changesThreshold < 0 or changesThreshold % 1 ~= 0) then
+			error("Invalid editor review change threshold")
 		end
 		if not rowCount or rowCount < 1 or rowCount > MAX_EDITOR_REVIEW_CHANGES or rowCount % 1 ~= 0 then
 			error("Invalid editor review row count")
@@ -4113,6 +4154,7 @@ function BridgePluginRuntime.start(context)
 		end
 		Config.editorReviewUploads[uploadId] = {
 			changeCount = changeCount,
+			changesThreshold = changesThreshold,
 			rowCount = rowCount,
 			totalChunks = totalChunks,
 			chunks = table.create(totalChunks),
@@ -4168,6 +4210,7 @@ function BridgePluginRuntime.start(context)
 		return ui.requestEditorPushReview(
 			{
 				changeCount = upload.changeCount,
+				changesThreshold = upload.changesThreshold,
 				rows = rows,
 			},
 			Config.getBridgeSettings(),
@@ -4612,6 +4655,7 @@ function BridgePluginRuntime.start(context)
 		runtimeSettings = initialRuntimeSettings,
 		defaultHost = DEFAULT_HOST,
 		defaultPorts = DEFAULT_PORTS,
+		launchPorts = launchBridgePorts(),
 		reconnectSeconds = RECONNECT_SECONDS,
 		fastReconnectSeconds = FAST_RECONNECT_SECONDS,
 		fastReconnectWindowSeconds = FAST_RECONNECT_WINDOW_SECONDS,

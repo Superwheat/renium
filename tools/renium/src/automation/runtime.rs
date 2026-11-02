@@ -43,9 +43,12 @@ use crate::studio::automation::{
     get_console_output_result, goto_result, input_result, key_result, kill_orphans_result,
     orphan_summaries, press_result, record_end_result, record_start_result, shot_result,
     start_stop_play_result, studio_change_state_result, studio_device_result, type_result,
-    ui_result, wait_until_result,
+    ui_result, wait_timed_out_result, wait_until_result,
 };
-use crate::studio::bridge::{BridgeRequestLease, BridgeServer, BridgeTarget, RuntimeGateGuard};
+use crate::studio::bridge::{
+    BridgeRequestLease, BridgeServer, BridgeTarget, RequestEditRuntime, RuntimeGateGuard,
+    bind_request_edit_runtime, request_edit_runtime,
+};
 #[cfg(any(windows, target_os = "macos"))]
 use crate::studio::input as input_inject;
 use crate::system::LockRecover;
@@ -121,6 +124,19 @@ pub(super) fn automation_failure(error: anyhow::Error) -> automation::Failure {
 }
 
 pub(super) fn automation_failure_ref(error: &anyhow::Error) -> automation::Failure {
+    let failure = classify_failure(error);
+    match error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::app::output::LuauRunFailure>())
+    {
+        Some(run) if !run.console_errors.is_empty() => {
+            failure.detail(json!({ "consoleErrors": run.console_errors }))
+        }
+        _ => failure,
+    }
+}
+
+fn classify_failure(error: &anyhow::Error) -> automation::Failure {
     if let Some(verification) =
         error.downcast_ref::<crate::editor::sync::EditorSourceVerificationError>()
     {
@@ -229,6 +245,7 @@ pub(super) fn automation_pull_args(
         export_all_properties: automation_bool(object, "exportAllProperties", false)?,
         quiet_timings: std::env::var_os("RENIUM_PROFILE_PULL").is_none(),
         preserve_paths: Vec::new(),
+        layout_src_root: None,
     })
 }
 
@@ -271,7 +288,10 @@ pub(super) fn automation_push_args(
         .map(PathBuf::from)
         .map(|path| bound_context::path(context, path));
     args.no_review = !reviewed || !automation_bool(object, "allowProtectedWrites", true)?;
-    args.yes = true;
+    // A reviewed request carried the caller's approval; an unreviewed push
+    // above the plugin's change threshold opens the Studio review unless the
+    // caller (the Live Sync worker, a startup reconcile) says yes itself.
+    args.yes = !reviewed || automation_bool(object, "yes", false)?;
     Ok(args)
 }
 
@@ -294,13 +314,14 @@ fn automation_editor_property_args(
         )?),
         source_file: None,
         no_review: !reviewed,
-        yes: reviewed,
+        yes: !reviewed || automation_bool(object, "yes", false)?,
     })
 }
 
 fn automation_editor_delete_args(
     context: &automation::BoundContext,
     parameters: &Value,
+    reviewed: bool,
 ) -> Result<ApplyEditorDeleteArgs> {
     let object = parameters.as_object().context("p must be an object")?;
     let source_dir = automation_string(object, "srcDir")
@@ -308,6 +329,8 @@ fn automation_editor_delete_args(
         .map_or_else(|| bound_context::source_dir(context), Ok)?;
     Ok(ApplyEditorDeleteArgs {
         target: automation_editor_mutation_args(context, source_dir, object, "remove")?,
+        no_review: !reviewed,
+        yes: !reviewed || automation_bool(object, "yes", false)?,
     })
 }
 
@@ -350,8 +373,8 @@ fn automation_editor_mutation_args(
             .and_then(Value::as_array)
             .and_then(|results| results.first())
             .with_context(|| format!("No project instance has settings ID {settings_id}"))?;
-        path_segments = serde_json::from_value(instance["path"].clone())?;
-        path_ordinals = serde_json::from_value(instance["ords"].clone())?;
+        (path_segments, path_ordinals) = resolved_instance_path(instance)
+            .with_context(|| format!("Settings ID {settings_id} resolved without a path"))?;
         if class_name.is_empty() {
             class_name = instance
                 .get("c")
@@ -376,6 +399,68 @@ fn automation_editor_mutation_args(
             .and_then(Value::as_bool)
             .unwrap_or(false),
     })
+}
+
+/// The path of a resolved batch `instance` row: the explorer prints it inline
+/// (`Workspace.Props.Sign[2]`) unless a segment carries a path character, when
+/// the segment and ordinal arrays stand on their own.
+fn resolved_instance_path(instance: &Value) -> Result<(Vec<String>, Vec<usize>)> {
+    match instance.get("path") {
+        Some(Value::String(path)) => {
+            let mut segments = Vec::new();
+            let mut ordinals = Vec::new();
+            for segment in path.split('.') {
+                let (name, ordinal) = match segment.strip_suffix(']').and_then(|rest| {
+                    rest.rsplit_once('[').and_then(|(name, ordinal)| {
+                        ordinal.parse::<usize>().ok().map(|ordinal| (name, ordinal))
+                    })
+                }) {
+                    Some((name, ordinal)) => (name, ordinal),
+                    None => (segment, 1),
+                };
+                segments.push(name.to_string());
+                ordinals.push(ordinal);
+            }
+            Ok((segments, ordinals))
+        }
+        Some(Value::Array(_)) => {
+            let segments = serde_json::from_value(instance["path"].clone())?;
+            let ordinals = match instance.get("ords") {
+                Some(ords @ Value::Array(_)) => serde_json::from_value(ords.clone())?,
+                _ => Vec::new(),
+            };
+            Ok((segments, ordinals))
+        }
+        _ => bail!("the resolved instance has no path"),
+    }
+}
+
+/// A play session of the Edit window a direct edit targets: the server runtime
+/// Studio launched from it.
+fn edit_runtime_in_play(bridge: &BridgeServer, edit_runtime_id: Option<&str>) -> bool {
+    bridge.list_bridge_clients().iter().any(|client| {
+        client.get("role").and_then(Value::as_str)
+            == Some(crate::studio::bridge::BRIDGE_ROLE_PLAY_SERVER)
+            && edit_runtime_id.is_none_or(|edit| {
+                client
+                    .get("launchEditRuntimeId")
+                    .and_then(Value::as_str)
+                    .is_none_or(|launched| launched.is_empty() || launched == edit)
+            })
+    })
+}
+
+fn refuse_direct_edit_during_play(
+    bridge: &BridgeServer,
+    context: &automation::BoundContext,
+    command: &str,
+) -> Result<()> {
+    if edit_runtime_in_play(bridge, context.runtime_id.as_deref()) {
+        bail!(
+            "Studio is in Play, so `rbx {command}` cannot change the Edit place now; stop the session (`rbx play -x`) and run it again, or edit the saved data (`rbx bs`, `rbx rm`) and push it afterwards"
+        );
+    }
+    Ok(())
 }
 
 fn automation_batch(context: &automation::BoundContext, parameters: &Value) -> Result<Value> {
@@ -556,11 +641,12 @@ fn compact_push_summary(
         return result;
     }
     result.extend(counts);
-    let verified = read_back
-        || summary.contains_key("sourceVerified")
-        || ["nativeVerifiedServices", "fieldVerifiedServices"]
-            .iter()
-            .any(|key| summary.get(*key).is_some_and(automation_value_is_non_empty));
+    let verified = changed
+        && (read_back
+            || summary.contains_key("sourceVerified")
+            || ["nativeVerifiedServices", "fieldVerifiedServices"]
+                .iter()
+                .any(|key| summary.get(*key).is_some_and(automation_value_is_non_empty)));
     result.insert("verified".to_string(), Value::Bool(verified));
     result
 }
@@ -600,11 +686,13 @@ fn automation_pull_operation(
     parameters: &Value,
     bridge: &BridgeServer,
     bridge_wait_seconds: f64,
+    preserve_paths: Vec<PathBuf>,
 ) -> Result<(Value, PublishedProjectChanges)> {
     let target = BridgeTarget::Main;
     bridge.wait_for_all_target(bridge_wait_seconds, target)?;
     let info = bridge.cached_bridge_info_for_target(target)?;
-    let args = automation_pull_args(context, parameters)?;
+    let mut args = automation_pull_args(context, parameters)?;
+    args.preserve_paths = preserve_paths;
     let services = args.services.clone();
     let parsed_services = parse_services(&services)?;
     let pending_ack = pending_change_ack(bridge, &parsed_services)?;
@@ -619,6 +707,9 @@ fn automation_pull_operation(
         "services": parsed_services.len(),
         "pendingChangesAcknowledged": acknowledged_pending,
     });
+    if let Some(id) = published.history_id.as_deref() {
+        result["historyId"] = json!(id);
+    }
     if !published.read_only_links_restored.is_empty() {
         result["readOnlyLinksRestored"] = json!(published.read_only_links_restored);
         result["note"] = json!(
@@ -970,7 +1061,7 @@ fn open_studio(
                 fs::canonicalize(file).unwrap_or_else(|_| file.clone()) == target_file
             })
         {
-            return Ok(json!({
+            let mut result = json!({
                 "ok": true,
                 "alreadyOpen": true,
                 "pid": pid,
@@ -979,7 +1070,11 @@ fn open_studio(
                     game_id: None,
                     place_id: None,
                 },
-            }));
+            });
+            if let Some(studio) = connected.iter().find(|studio| studio.pid == pid) {
+                result["runtimeId"] = json!(studio.runtime_id);
+            }
+            return Ok(result);
         }
     }
     if let Some(result) = state.recent_studio_launch(context, &target) {
@@ -1028,11 +1123,13 @@ fn live_sync_summary(status: &Value) -> Option<Value> {
 fn studio_status_result(
     context: &automation::BoundContext,
     parameters: &Value,
+    state: Option<&automation::State>,
     bridge: &BridgeServer,
     bridge_wait_seconds: f64,
 ) -> Value {
     let all = parameters.get("all").and_then(Value::as_bool) == Some(true);
-    let select_clients = || {
+    let mut context = context.clone();
+    let select_clients = |context: &automation::BoundContext| {
         let clients = bridge.list_bridge_clients();
         if all {
             clients
@@ -1041,7 +1138,7 @@ fn studio_status_result(
         }
     };
     let has_edit_client = |clients: &[Value]| clients.iter().any(|client| client["role"] == "edit");
-    let mut clients = select_clients();
+    let mut clients = select_clients(&context);
     let mut diagnosis = None;
     if !has_edit_client(&clients) {
         // A plugin reconnects within a second of the daemon starting; report it
@@ -1057,7 +1154,16 @@ fn studio_status_result(
         }
         let deadline = Instant::now() + Duration::from_secs_f64(bridge_wait_seconds.max(0.0));
         loop {
-            clients = select_clients();
+            // The context was bound before its Studio connected; a Studio
+            // that matches the project now is attached here, as the next
+            // command's bind would attach it.
+            if context.runtime_id.is_none()
+                && let Some(state) = state
+                && let Ok(resolved) = bound_context::resolve(state, bridge, context.id)
+            {
+                context = resolved;
+            }
+            clients = select_clients(&context);
             if has_edit_client(&clients) {
                 break;
             }
@@ -1065,13 +1171,18 @@ fn studio_status_result(
                 &bridge.list_bridge_clients(),
                 Some(Path::new(&context.root)),
             );
-            if !crate::studio::diagnosis::is_starting(&current) || Instant::now() >= deadline {
+            let waiting = !crate::studio::diagnosis::is_signed_out(&current)
+                && (crate::studio::diagnosis::is_starting(&current)
+                    || context.runtime_id.is_none()
+                        && crate::studio::diagnosis::may_still_connect(&current));
+            if !waiting || Instant::now() >= deadline {
                 diagnosis = Some(current);
                 break;
             }
             std::thread::sleep(Duration::from_millis(500));
         }
     }
+    let context = &context;
     let mut result = json!({
         "studios": bound_context::studio_candidates_from(&clients, ""),
         "clients": clients,
@@ -1229,13 +1340,19 @@ pub(crate) fn select_bridge_context(
 
 /// A request that works inside one play runtime holds only that runtime's
 /// gate, so it runs beside Live Sync and other play requests; clearing the
-/// shared pins from it would reroute their calls mid-flight.
+/// shared pins from it would reroute their calls mid-flight. A request bound
+/// to its Edit runtime runs beside requests of other Studios, so its
+/// selection stays on its own thread as well.
 pub(crate) fn select_bridge_context_for_request(
     context: &automation::BoundContext,
     bridge: &BridgeServer,
     keep_pins: bool,
 ) -> bound_context::Selection {
-    let selection = bound_context::select(context);
+    let selection = if request_edit_runtime().is_some() {
+        bound_context::select_for_thread(context)
+    } else {
+        bound_context::select(context)
+    };
     if !keep_pins {
         bridge.clear_runtime_pins();
         if let Some(runtime_id) = context.runtime_id.as_deref() {
@@ -1262,6 +1379,7 @@ fn automation_dispatch_operation(
         return Ok(studio_status_result(
             context,
             parameters,
+            None,
             bridge,
             bridge_wait_seconds,
         ));
@@ -1294,7 +1412,8 @@ fn automation_dispatch_operation(
             ),
         );
     }
-    let keep_pins = play_target_selector(operation, parameters).is_some();
+    let keep_pins =
+        play_target_selector(operation, parameters).is_some() || request_edit_runtime().is_some();
     let _selection = select_bridge_context_for_request(context, bridge, keep_pins);
     match operation {
         op::STUDIO_AUDIO => {
@@ -1314,8 +1433,10 @@ fn automation_dispatch_operation(
             )?;
             crate::studio::audio::command(pid, action)
         }
-        op::PULL => automation_pull_operation(context, parameters, bridge, bridge_wait_seconds)
-            .map(|(result, _)| result),
+        op::PULL => {
+            automation_pull_operation(context, parameters, bridge, bridge_wait_seconds, Vec::new())
+        }
+        .map(|(result, _)| result),
         op::PUSH => {
             bridge.wait_for_all_target(bridge_wait_seconds, BridgeTarget::Main)?;
             let args = automation_push_args(context, parameters, reviewed)?;
@@ -1344,16 +1465,18 @@ fn automation_dispatch_operation(
             )))
         }
         op::SET_PROPERTY if parameters.get("editor").and_then(Value::as_bool) == Some(true) => {
-            bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Main)?;
+            bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Edit)?;
+            refuse_direct_edit_during_play(bridge, context, "prop")?;
             Ok(Value::Object(apply_editor_property_with_warm_bridge(
                 automation_editor_property_args(context, parameters, reviewed)?,
                 bridge,
             )?))
         }
         op::REMOVE if parameters.get("editor").and_then(Value::as_bool) == Some(true) => {
-            bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Main)?;
+            bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Edit)?;
+            refuse_direct_edit_during_play(bridge, context, "del")?;
             Ok(Value::Object(apply_editor_delete_with_warm_bridge(
-                automation_editor_delete_args(context, parameters)?,
+                automation_editor_delete_args(context, parameters, reviewed)?,
                 bridge,
             )?))
         }
@@ -1676,7 +1799,13 @@ fn automation_dispatch_managed(
         return open_studio(context, parameters, state, bridge).map_err(automation_failure);
     }
     if operation == op::STUDIO_STATUS {
-        let mut result = studio_status_result(context, parameters, bridge, bridge_wait_seconds);
+        let mut result = studio_status_result(
+            context,
+            parameters,
+            Some(state),
+            bridge,
+            bridge_wait_seconds,
+        );
         if let Some(summary) = live_sync_summary(&state.live_sync().status(context.id)) {
             result["liveSync"] = summary;
         }
@@ -1737,6 +1866,11 @@ fn automation_dispatch_managed(
     let writes_studio_directly = matches!(operation, op::SET_PROPERTY | op::REMOVE)
         && parameters.get("editor").and_then(Value::as_bool) == Some(true);
     let pauses_file_watcher = writes_project || writes_studio_directly || operation == op::PUSH;
+    // A direct edit arrives on a context of its own; only a context attached
+    // to the running session can pause it and pull the edit into the files.
+    if writes_studio_directly {
+        let _ = state.live_sync().attach(context, bridge);
+    }
     if pauses_file_watcher {
         state.live_sync().pause(context.id);
     }
@@ -1777,8 +1911,9 @@ fn automation_dispatch_managed(
     let mut published = None;
     let _pull_selection = (operation == op::PULL).then(|| select_bridge_context(context, bridge));
     let result = if operation == op::PULL {
-        let first = automation_pull_operation(context, parameters, bridge, bridge_wait_seconds)
-            .map_err(automation_failure);
+        let first =
+            automation_pull_operation(context, parameters, bridge, bridge_wait_seconds, Vec::new())
+                .map_err(automation_failure);
         let pulled = match first {
             Err(failure) if failure.0.rt == 1 => {
                 log_global(
@@ -1788,8 +1923,14 @@ fn automation_dispatch_managed(
                         failure.0.c, failure.0.m
                     ),
                 );
-                automation_pull_operation(context, parameters, bridge, bridge_wait_seconds)
-                    .map_err(automation_failure)
+                automation_pull_operation(
+                    context,
+                    parameters,
+                    bridge,
+                    bridge_wait_seconds,
+                    Vec::new(),
+                )
+                .map_err(automation_failure)
             }
             result => result,
         };
@@ -1807,7 +1948,7 @@ fn automation_dispatch_managed(
             reviewed,
         )
     };
-    let result = match result {
+    let mut result = match result {
         Ok(result) => result,
         Err(error) => {
             if pauses_file_watcher {
@@ -1862,7 +2003,14 @@ fn automation_dispatch_managed(
                 state.live_sync().resume(context.id, std::iter::empty());
             }
         } else if writes_studio_directly {
-            state.live_sync().resume(context.id, std::iter::empty());
+            pull_direct_edit_into_files(
+                context,
+                parameters,
+                state,
+                bridge,
+                bridge_wait_seconds,
+                &mut result,
+            );
         } else if !paths.is_empty() {
             state.live_sync().settle(context.id, paths);
         }
@@ -1871,7 +2019,6 @@ fn automation_dispatch_managed(
             .live_sync()
             .resume(context.id, std::iter::empty::<PathBuf>());
     }
-    let mut result = result;
     if studio_edit_persists(operation, writes_studio_directly, &result) {
         attach_persistence(
             &mut result,
@@ -1879,6 +2026,71 @@ fn automation_dispatch_managed(
         );
     }
     Ok(result)
+}
+
+/// A `prop` or `del` changes Studio without touching the files, and the
+/// plugin's change journal is suppressed while the editor transaction runs, so
+/// Live Sync's own worker would never see the edit. A session that pulls
+/// Studio changes pulls the touched service here, leaving the file edits it
+/// has not pushed yet in place as the worker's pulls do.
+fn pull_direct_edit_into_files(
+    context: &automation::BoundContext,
+    parameters: &Value,
+    state: &automation::State,
+    bridge: &BridgeServer,
+    bridge_wait_seconds: f64,
+    result: &mut Value,
+) {
+    let service = parameters.get("service").and_then(Value::as_str);
+    let changed = result
+        .as_object()
+        .is_some_and(crate::editor::sync::direct_editor_summary_changed);
+    let Some(service) =
+        service.filter(|_| changed && state.live_sync().pulls_studio_changes(context.id))
+    else {
+        state.live_sync().resume(context.id, std::iter::empty());
+        return;
+    };
+    let mut pull_parameters = parameters.clone();
+    pull_parameters["services"] = json!([service]);
+    let preserved = state.live_sync().pending_relative_paths(context.id);
+    let pulled = match automation_pull_operation(
+        context,
+        &pull_parameters,
+        bridge,
+        bridge_wait_seconds,
+        preserved,
+    ) {
+        Ok((_, published)) => {
+            state.live_sync().note_pull(context.id);
+            state
+                .live_sync()
+                .reconcile_then_resume(context, published)
+                .map(|_| ())
+        }
+        Err(error) => {
+            state.live_sync().resume(context.id, std::iter::empty());
+            Err(error)
+        }
+    };
+    let Some(object) = result.as_object_mut() else {
+        return;
+    };
+    match pulled {
+        Ok(()) => {
+            object.insert("filesPulled".to_string(), Value::Bool(true));
+        }
+        Err(error) => {
+            log_global(
+                2,
+                format_args!(
+                    "[renium] warning: Studio applied the edit, but {service} could not be pulled into the files: {error:#}"
+                ),
+            );
+            object.insert("filesPulled".to_string(), Value::Bool(false));
+            object.insert("filesError".to_string(), json!(format!("{error:#}")));
+        }
+    }
 }
 
 /// Where an edit the command made in the Edit window now lives: `teamCreate`
@@ -2157,7 +2369,10 @@ fn start_managed_live_operation(
     start_parameters["replaceServices"] = json!(true);
     let phase = Instant::now();
     let initial_plugin = {
-        let _gate = bridge.acquire_request_gate();
+        let _gate = bridge.acquire_edit_gate(
+            context.runtime_id.as_deref(),
+            operation_name(op::LIVE_START),
+        );
         automation_dispatch_with_retry(
             op::LIVE_START,
             context,
@@ -2170,7 +2385,8 @@ fn start_managed_live_operation(
     automation::live::log_live_timing("startup Studio tracking", phase);
     let cleanup_failed_start = |mut failure: automation::Failure| {
         let cleanup = {
-            let _gate = bridge.acquire_request_gate();
+            let _gate = bridge
+                .acquire_edit_gate(context.runtime_id.as_deref(), operation_name(op::LIVE_STOP));
             automation_dispatch_with_retry(
                 op::LIVE_STOP,
                 context,
@@ -2279,7 +2495,8 @@ fn automation_live_operation_result(
     if options.manage_files && matches!(operation, op::RETRY_PENDING | op::DISCARD_PENDING) {
         state.live_sync().clear_restore_failure(context);
         let plugin = {
-            let _gate = bridge.acquire_request_gate();
+            let _gate =
+                bridge.acquire_edit_gate(context.runtime_id.as_deref(), operation_name(operation));
             automation_dispatch_with_retry(
                 operation,
                 context,
@@ -2294,7 +2511,7 @@ fn automation_live_operation_result(
         } else {
             state
                 .live_sync()
-                .discard(context)
+                .discard(context, bridge)
                 .map_err(automation_failure)?
         };
         return Ok(merge_live_status(plugin, daemon, options.compact));
@@ -2313,7 +2530,8 @@ fn automation_live_operation_result(
         let transition = state.live_sync().transition_lock();
         let _transition = transition.lock_recover();
         let plugin = {
-            let _gate = bridge.acquire_request_gate();
+            let _gate =
+                bridge.acquire_edit_gate(context.runtime_id.as_deref(), operation_name(operation));
             automation_dispatch_with_retry(
                 operation,
                 context,
@@ -2388,7 +2606,8 @@ fn automation_live_operation_result(
             false,
         )?
     } else {
-        let _gate = bridge.acquire_request_gate();
+        let _gate =
+            bridge.acquire_edit_gate(context.runtime_id.as_deref(), operation_name(operation));
         automation_dispatch_with_retry(
             operation,
             context,
@@ -2444,7 +2663,10 @@ fn automation_live_operation_result(
         let mut start_parameters = parameters.clone();
         start_parameters["reset"] = json!(true);
         start_parameters["replaceServices"] = json!(true);
-        let _gate = bridge.acquire_request_gate();
+        let _gate = bridge.acquire_edit_gate(
+            context.runtime_id.as_deref(),
+            operation_name(op::LIVE_START),
+        );
         plugin = automation_dispatch_with_retry(
             op::LIVE_START,
             context,
@@ -2640,7 +2862,10 @@ fn live_plugin_status(
     bridge: &BridgeServer,
     bridge_wait_seconds: f64,
 ) -> std::result::Result<Value, automation::Failure> {
-    let _gate = bridge.acquire_request_gate();
+    let _gate = bridge.acquire_edit_gate(
+        context.runtime_id.as_deref(),
+        operation_name(op::LIVE_STATUS),
+    );
     automation_dispatch_with_retry(
         op::LIVE_STATUS,
         context,
@@ -2930,7 +3155,14 @@ fn admission_limit(operation: u16) -> Option<Duration> {
         .then_some(Duration::from_secs(5))
 }
 
-fn busy_failure(operation: u16, waited: Duration) -> automation::Failure {
+/// The busy answer of a request that waited for a gate: the holder of its
+/// Edit runtime's gate when it waited for that one, else the longest-running
+/// request older than the wait on the process-wide gate.
+fn busy_failure(
+    operation: u16,
+    waited: Duration,
+    holder: Option<(&'static str, Duration)>,
+) -> automation::Failure {
     let name = match operation {
         op::LUAU => "l",
         op::CONSOLE => "co",
@@ -2941,10 +3173,13 @@ fn busy_failure(operation: u16, waited: Duration) -> automation::Failure {
     // The blocker started before this request did; the request's own entry is
     // the one that has run for about the waited time.
     let active = crate::daemon::memory::active_requests();
-    let serving = active
-        .iter()
-        .filter(|(_, age)| *age > waited + Duration::from_millis(300))
-        .max_by_key(|(_, age)| *age);
+    let serving = holder.or_else(|| {
+        active
+            .iter()
+            .filter(|(_, age)| *age > waited + Duration::from_millis(300))
+            .max_by_key(|(_, age)| *age)
+            .copied()
+    });
     let state = match serving {
         Some((running, age)) => format!("`{running}` has run for {}s", age.as_secs()),
         None => "another request holds the Edit window".to_string(),
@@ -2959,10 +3194,41 @@ fn busy_failure(operation: u16, waited: Duration) -> automation::Failure {
         "studios",
     )
     .detail(json!({
-        "operation": serving.map(|(running, _)| *running),
+        "operation": serving.map(|(running, _)| running),
         "elapsedSeconds": serving.map(|(_, age)| age.as_secs()),
         "retryAfterMs": 1000,
     }))
+}
+
+/// Whether a request of the kinds that look at Studio briefly (`l`, `co`,
+/// `sc`, `ui` and a `wait` slice) runs behind its Edit runtime's own gate
+/// alone, beside requests of other Studios. Every other Edit request also
+/// holds the process-wide request gate: it selects its context and pins its
+/// runtime for the whole process, and its worker threads read that selection.
+fn edit_runtime_gate_alone(operation: u16) -> bool {
+    admission_limit(operation).is_some() || operation == op::WAIT
+}
+
+/// The Edit runtime whose gate a request queues on, resolved before any gate
+/// is held so the request waits for its own Studio, not behind another's. A
+/// request that resolves no runtime queues on the process-wide gate alone.
+fn edit_gate_runtime(
+    request: &automation::Request,
+    state: &automation::State,
+    bridge: &BridgeServer,
+    bridge_wait_seconds: f64,
+) -> std::result::Result<Option<String>, automation::Failure> {
+    let Some(context_id) = request.cx else {
+        return Ok(None);
+    };
+    if automation_requires_runtime(request.op, &request.p) {
+        return Ok(
+            resolve_connected_context(state, bridge, context_id, bridge_wait_seconds)?.runtime_id,
+        );
+    }
+    Ok(bound_context::resolve(state, bridge, context_id)
+        .ok()
+        .and_then(|context| context.runtime_id))
 }
 
 fn connected_runtime_wait_seconds(
@@ -3053,6 +3319,13 @@ fn automation_execute_request_inner(
                     .filter(|(name, _)| *name != operation.name)
                     .map(|(name, elapsed)| json!({ "op": name, "seconds": elapsed.as_secs() }))
                     .collect();
+                capabilities["gates"] = bridge
+                    .runtime_gate_holders()
+                    .into_iter()
+                    .map(|(runtime_id, name, held)| {
+                        json!({ "runtimeId": runtime_id, "op": name, "seconds": held.as_secs() })
+                    })
+                    .collect();
                 capabilities
             })
             .map_err(automation_failure),
@@ -3109,6 +3382,9 @@ fn automation_execute_request_inner(
         op::UPDATE_STUDIOS => {
             prepare_studios_for_update(&request.p, bridge).map_err(automation_failure)
         }
+        // Ending a recording stops a capture thread and makes no Studio call,
+        // so it neither queues behind Studio work nor selects a context.
+        op::RECORD_END => record_end_result(&request.p).map_err(automation_failure),
         op::PERFORMANCE_PROFILE => bridge
             .performance_profile_command(&request.p)
             .map_err(automation_failure),
@@ -3416,14 +3692,16 @@ fn automation_response(
 ) -> automation::Response {
     let started = Instant::now();
     let operation = automation::opcode_by_id(request.op).ok();
-    let queued = operation.is_some_and(|operation| operation.queued)
-        && !(request.op == op::STUDIO_AUDIO
-            && request.p.get("global").and_then(Value::as_bool) == Some(true))
-        && !(request.op == op::PERFORMANCE_MONITOR
-            && crate::studio::automation::monitor::is_edit_request(&request.p));
-    let cancelled = |error: anyhow::Error| {
-        automation::Failure::new("cancelled", error.to_string(), false, "retry")
+    // A Studio review decision answers a push that holds the Edit gate while
+    // it waits; queuing the decision behind that push would deadlock until
+    // the review times out.
+    let unqueued_exception = match request.op {
+        op::REVIEW_APPLY => request.p.get("studioDecision").and_then(Value::as_bool) == Some(true),
+        op::STUDIO_AUDIO => request.p.get("global").and_then(Value::as_bool) == Some(true),
+        op::PERFORMANCE_MONITOR => crate::studio::automation::monitor::is_edit_request(&request.p),
+        _ => false,
     };
+    let queued = operation.is_some_and(|operation| operation.queued) && !unqueued_exception;
     let result = (|| {
         if automation::authorization::required(request.op) {
             state
@@ -3440,46 +3718,52 @@ fn automation_response(
                     )
                 })?;
         }
+        strip_request_notices(&mut request.p);
+        // A destructive request without a review receipt is refused here,
+        // before anything resolves or waits for a Studio window: the refusal
+        // is the same whether or not a Studio is connected.
+        if let Some(operation) = operation
+            && request.cx.is_some()
+            && operation.requires_review(&request.p, false)
+        {
+            return Err(automation::Failure::new(
+                "rejected",
+                "This operation requires a review receipt",
+                false,
+                "review-prepare",
+            ));
+        }
         {
             restore_persisted_live_sync_for_request(&request, state, bridge, bridge_wait_seconds)?;
         }
-        let _request_guard = if !queued {
-            None
-        } else if let Some(runtime_id) = play_target_runtime(bridge, request.op, &request.p) {
-            Some(RequestGuard::Runtime {
-                _held: bridge
-                    .acquire_runtime_gate(&runtime_id, request_lease.as_deref())
-                    .map_err(cancelled)?,
-            })
+        let play_gate = if queued {
+            play_request_gate(
+                state,
+                bridge,
+                &request,
+                bridge_wait_seconds,
+                request_lease.as_ref(),
+            )?
         } else {
-            Some(RequestGuard::Global {
-                _held: match (request_lease.as_deref(), admission_limit(request.op)) {
-                    (Some(lease), limit) => bridge
-                        .acquire_request_gate_for_lease_within(lease, limit)
-                        .map_err(cancelled)?
-                        .ok_or_else(|| busy_failure(request.op, limit.unwrap_or_default()))?,
-                    (None, Some(limit)) => bridge
-                        .acquire_request_gate_within(limit)
-                        .ok_or_else(|| busy_failure(request.op, limit))?,
-                    (None, None) => bridge.acquire_request_gate(),
-                },
-            })
+            None
         };
-        let _lease_guard = match request_lease.as_ref() {
-            Some(lease) => Some(
-                bridge
-                    .activate_request_lease(Arc::clone(lease))
-                    .map_err(cancelled)?,
-            ),
-            None => None,
-        };
-        let result = automation_execute_request(&request, state, bridge, bridge_wait_seconds);
-        if result.is_ok()
-            && let Some(lease) = request_lease.as_deref()
-        {
-            lease.ensure_active().map_err(cancelled)?;
+        if queued && request.op == op::WAIT && play_gate.is_none() {
+            return edit_wait_in_slices(
+                &request,
+                state,
+                bridge,
+                bridge_wait_seconds,
+                request_lease.as_ref(),
+            );
         }
-        result
+        execute_gated(
+            &request,
+            queued.then_some(play_gate),
+            state,
+            bridge,
+            bridge_wait_seconds,
+            request_lease.as_ref(),
+        )
     })();
     let response = match result {
         Ok(mut result) => {
@@ -3502,6 +3786,128 @@ fn automation_response(
         }
     };
     response.with_update(state.available_update())
+}
+
+/// Runs one request behind its gate: `None` runs unqueued, `Some(None)`
+/// behind the Edit gate and `Some(Some(gate))` behind that play gate.
+fn execute_gated(
+    request: &automation::Request,
+    gate: Option<Option<PlayGate>>,
+    state: &automation::State,
+    bridge: &Arc<BridgeServer>,
+    bridge_wait_seconds: f64,
+    request_lease: Option<&Arc<BridgeRequestLease>>,
+) -> std::result::Result<Value, automation::Failure> {
+    let cancelled = |error: anyhow::Error| {
+        automation::Failure::new("cancelled", error.to_string(), false, "retry")
+    };
+    let operation = operation_name(request.op);
+    let _request_guard = match gate {
+        None => None,
+        // A play request holds a runtime gate, not the request gate, so it runs
+        // beside requests of other Studios: its Edit window is bound to its
+        // thread, which keeps its selection and its play targets its own.
+        Some(Some(PlayGate::Selector { gate, owner })) => Some(RequestGuard::Runtime {
+            _held: bridge
+                .acquire_runtime_gate(&gate, operation, request_lease.map(Arc::as_ref))
+                .map_err(cancelled)?,
+            _bound: None,
+            _edit: owner.as_deref().map(bind_request_edit_runtime),
+        }),
+        Some(Some(PlayGate::Runtime {
+            target,
+            player,
+            runtime_id,
+            owner,
+        })) => Some(RequestGuard::Runtime {
+            _held: bridge
+                .acquire_runtime_gate(&runtime_id, operation, request_lease.map(Arc::as_ref))
+                .map_err(cancelled)?,
+            _bound: Some(crate::studio::bridge::bind_request_play_runtime(
+                target,
+                player.as_deref(),
+                &runtime_id,
+            )),
+            _edit: Some(bind_request_edit_runtime(&owner)),
+        }),
+        Some(None) => Some(edit_request_guard(
+            request,
+            state,
+            bridge,
+            bridge_wait_seconds,
+            request_lease.map(Arc::as_ref),
+        )?),
+    };
+    let _lease_guard = match request_lease {
+        Some(lease) => Some(
+            bridge
+                .activate_request_lease(Arc::clone(lease))
+                .map_err(cancelled)?,
+        ),
+        None => None,
+    };
+    let result = automation_execute_request(request, state, bridge, bridge_wait_seconds);
+    if result.is_ok()
+        && let Some(lease) = request_lease
+    {
+        lease.ensure_active().map_err(cancelled)?;
+    }
+    result
+}
+
+/// How long one Edit-window wait holds the Edit gate before letting queued
+/// requests through; the pause after a slice is what lets them in.
+const EDIT_WAIT_SLICE_SECONDS: f64 = 2.0;
+const EDIT_WAIT_SLICE_PAUSE: Duration = Duration::from_millis(50);
+
+/// An Edit-window wait runs as short slices that each take the Edit gate,
+/// so an `rbx l --edit` run between them can satisfy the condition; a play
+/// wait holds its own runtime's gate for the whole timeout instead.
+fn edit_wait_in_slices(
+    request: &automation::Request,
+    state: &automation::State,
+    bridge: &Arc<BridgeServer>,
+    bridge_wait_seconds: f64,
+    request_lease: Option<&Arc<BridgeRequestLease>>,
+) -> std::result::Result<Value, automation::Failure> {
+    let parsed = studio_args::wait(&request.p).map_err(automation_failure)?;
+    let timeout = parsed.timeout.clamp(0.1, 3600.0);
+    let started = Instant::now();
+    let mut detail = Value::Null;
+    loop {
+        let remaining = timeout - started.elapsed().as_secs_f64();
+        if remaining <= 0.0 {
+            return Ok(wait_timed_out_result(
+                &parsed.condition,
+                timeout,
+                &detail,
+                started.elapsed().as_secs_f64(),
+            ));
+        }
+        let mut parameters = request.p.clone();
+        parameters["timeout"] = json!(remaining.min(EDIT_WAIT_SLICE_SECONDS));
+        let slice = automation::Request {
+            v: request.v,
+            id: request.id,
+            op: request.op,
+            cx: request.cx,
+            p: parameters,
+        };
+        let mut result = execute_gated(
+            &slice,
+            Some(None),
+            state,
+            bridge,
+            bridge_wait_seconds,
+            request_lease,
+        )?;
+        if result.get("timedOut").and_then(Value::as_bool) != Some(true) {
+            result["elapsedSeconds"] = json!(started.elapsed().as_secs_f64());
+            return Ok(result);
+        }
+        detail = result.get("value").cloned().unwrap_or(Value::Null);
+        std::thread::sleep(EDIT_WAIT_SLICE_PAUSE);
+    }
 }
 
 const SYNC_REVIEW_NOTICE: &str = "Live Sync is waiting for a decision and is not writing; `rbx lst --details` lists the differences and `rbx lon --prefer studio|editor` resolves them";
@@ -3532,23 +3938,186 @@ fn sync_review_pending(operation: u16, live_status: &Value, result: &Value) -> b
 }
 
 enum RequestGuard<'a> {
-    Global {
-        _held: std::sync::MutexGuard<'a, ()>,
+    Edit {
+        _request: Option<std::sync::MutexGuard<'a, ()>>,
+        _runtime: Option<RuntimeGateGuard<'a>>,
+        _bound: Option<RequestEditRuntime>,
     },
     Runtime {
         _held: RuntimeGateGuard<'a>,
+        _bound: Option<crate::studio::bridge::RequestPlayRuntime>,
+        _edit: Option<RequestEditRuntime>,
     },
 }
 
-/// The play runtime a request works inside, when its operation touches only
-/// that runtime and the selector resolves to a play server or client.
-fn play_target_runtime(
+fn operation_name(operation: u16) -> &'static str {
+    automation::opcode_by_id(operation).map_or("request", |opcode| opcode.name)
+}
+
+/// The Edit gate of one request: the process-wide request gate first, then
+/// the gate of the Edit runtime the request resolved. A request that looks at
+/// Studio briefly holds the runtime's gate alone, with its Edit calls bound to
+/// that runtime, so it never waits behind another Studio's work and answers
+/// busy only when its own window is held past the admission limit.
+fn edit_request_guard<'a>(
+    request: &automation::Request,
+    state: &automation::State,
+    bridge: &'a BridgeServer,
+    bridge_wait_seconds: f64,
+    lease: Option<&BridgeRequestLease>,
+) -> std::result::Result<RequestGuard<'a>, automation::Failure> {
+    let cancelled = |error: anyhow::Error| {
+        automation::Failure::new("cancelled", error.to_string(), false, "retry")
+    };
+    let runtime_id = edit_gate_runtime(request, state, bridge, bridge_wait_seconds)?;
+    let limit = admission_limit(request.op);
+    let alone = runtime_id.is_some() && edit_runtime_gate_alone(request.op);
+    let request_gate = if alone {
+        None
+    } else {
+        Some(match (lease, limit) {
+            (Some(lease), limit) => bridge
+                .acquire_request_gate_for_lease_within(lease, limit)
+                .map_err(cancelled)?
+                .ok_or_else(|| busy_failure(request.op, limit.unwrap_or_default(), None))?,
+            (None, Some(limit)) => bridge
+                .acquire_request_gate_within(limit)
+                .ok_or_else(|| busy_failure(request.op, limit, None))?,
+            (None, None) => bridge.acquire_request_gate(),
+        })
+    };
+    let runtime_gate = match runtime_id.as_deref() {
+        Some(runtime_id) => Some(
+            bridge
+                .acquire_runtime_gate_within(
+                    runtime_id,
+                    operation_name(request.op),
+                    lease,
+                    alone.then_some(limit).flatten(),
+                )
+                .map_err(cancelled)?
+                .ok_or_else(|| {
+                    busy_failure(
+                        request.op,
+                        limit.unwrap_or_default(),
+                        bridge.runtime_gate_holder(runtime_id),
+                    )
+                })?,
+        ),
+        None => None,
+    };
+    Ok(RequestGuard::Edit {
+        _request: request_gate,
+        _runtime: runtime_gate,
+        _bound: alone.then(|| bind_request_edit_runtime(runtime_id.as_deref().unwrap_or_default())),
+    })
+}
+
+/// The gate a play request runs behind: the runtime its selector resolved
+/// to, carried into its dispatch, or a selector gate of its Edit window while
+/// nothing answers that selector.
+#[derive(Debug, PartialEq, Eq)]
+enum PlayGate {
+    Runtime {
+        target: BridgeTarget,
+        player: Option<String>,
+        runtime_id: String,
+        owner: String,
+    },
+    Selector {
+        gate: String,
+        owner: Option<String>,
+    },
+}
+
+/// How often an explicit server or client selector that resolves to nothing
+/// yet is resolved again while its connection wait runs.
+const PLAY_GATE_POLL: Duration = Duration::from_millis(50);
+
+/// The gate a request that works inside one play runtime queues on: that
+/// runtime's id, resolved among the runtimes the request's bound Edit window
+/// launched once that window is connected, so the request waits for its own
+/// Studio before any gate is held and never through the process-wide
+/// selection. An explicit server or client selector that resolves to nothing
+/// yet is given the connection wait, then queues on a selector gate of its
+/// Edit window, never on the Edit gate, so a play request can never hold up
+/// Edit requests or other Studios. A bare selector with no play server is an
+/// Edit request.
+fn play_request_gate(
+    state: &automation::State,
     bridge: &BridgeServer,
-    operation: u16,
-    parameters: &Value,
-) -> Option<String> {
-    let (target, player) = play_target_selector(operation, parameters)?;
-    bridge.play_runtime_for_selector(target, player.as_deref())
+    request: &automation::Request,
+    bridge_wait_seconds: f64,
+    request_lease: Option<&Arc<BridgeRequestLease>>,
+) -> std::result::Result<Option<PlayGate>, automation::Failure> {
+    let Some((target, player)) = play_target_selector(request.op, &request.p) else {
+        return Ok(None);
+    };
+    let owner = match request.cx {
+        Some(context_id) if automation_requires_runtime(request.op, &request.p) => {
+            resolve_connected_context(state, bridge, context_id, bridge_wait_seconds)?.runtime_id
+        }
+        Some(context_id) => bound_context::resolve(state, bridge, context_id)?.runtime_id,
+        None => None,
+    };
+    play_gate_for_owner(
+        bridge,
+        target,
+        player.as_deref(),
+        owner.as_deref(),
+        Instant::now() + Duration::from_secs_f64(bridge_wait_seconds),
+        request_lease,
+    )
+}
+
+fn play_gate_for_owner(
+    bridge: &BridgeServer,
+    target: BridgeTarget,
+    player: Option<&str>,
+    owner: Option<&str>,
+    deadline: Instant,
+    request_lease: Option<&Arc<BridgeRequestLease>>,
+) -> std::result::Result<Option<PlayGate>, automation::Failure> {
+    let Some(owner) = owner else {
+        return Ok(play_selector_gate(target, player, "unbound")
+            .map(|gate| PlayGate::Selector { gate, owner: None }));
+    };
+    loop {
+        if let Some(runtime_id) = bridge.play_runtime_for_request(target, player, owner) {
+            return Ok(Some(PlayGate::Runtime {
+                target,
+                player: player.map(str::to_string),
+                runtime_id,
+                owner: owner.to_string(),
+            }));
+        }
+        if matches!(target, BridgeTarget::Main | BridgeTarget::Edit) || Instant::now() >= deadline {
+            return Ok(
+                play_selector_gate(target, player, owner).map(|gate| PlayGate::Selector {
+                    gate,
+                    owner: Some(owner.to_string()),
+                }),
+            );
+        }
+        if let Some(lease) = request_lease {
+            lease.ensure_active().map_err(|error| {
+                automation::Failure::new("cancelled", error.to_string(), false, "retry")
+            })?;
+        }
+        std::thread::sleep(PLAY_GATE_POLL);
+    }
+}
+
+fn play_selector_gate(target: BridgeTarget, player: Option<&str>, owner: &str) -> Option<String> {
+    match (target, player) {
+        (BridgeTarget::Client, Some(player)) => Some(format!(
+            "{owner}/client/{}",
+            player.trim().to_ascii_lowercase()
+        )),
+        (BridgeTarget::Client, None) => Some(format!("{owner}/client")),
+        (BridgeTarget::Server, _) => Some(format!("{owner}/server")),
+        (BridgeTarget::Main | BridgeTarget::Edit, _) => None,
+    }
 }
 
 fn play_target_selector(
@@ -3615,6 +4184,14 @@ pub(crate) fn automation_parse_response_with_lease(
     }
 }
 
+/// The connection reader has already taken the `notices` flag; every
+/// operation's own parameter parser must not see it.
+fn strip_request_notices(parameters: &mut Value) {
+    if let Some(object) = parameters.as_object_mut() {
+        object.remove("notices");
+    }
+}
+
 pub(crate) fn oversized_automation_request_response() -> automation::Response {
     automation::Response::failure(
         0,
@@ -3631,6 +4208,38 @@ pub(crate) fn oversized_automation_request_response() -> automation::Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_notices_flag_never_reaches_an_operation_parser() {
+        let mut parameters = json!({ "notices": true, "mode": "read-only" });
+        strip_request_notices(&mut parameters);
+        assert_eq!(parameters, json!({ "mode": "read-only" }));
+        let mut scalar = json!(7);
+        strip_request_notices(&mut scalar);
+        assert_eq!(scalar, json!(7));
+    }
+
+    #[test]
+    fn resolved_instance_paths_come_inline_or_as_arrays() {
+        let inline = json!({ "path": "Workspace.Props[2].Sign", "c": "Part" });
+        assert_eq!(
+            resolved_instance_path(&inline).unwrap(),
+            (
+                vec![
+                    "Workspace".to_string(),
+                    "Props".to_string(),
+                    "Sign".to_string()
+                ],
+                vec![1, 2, 1]
+            )
+        );
+        let arrays = json!({ "path": ["Workspace", "A.B"], "ords": [1, 3] });
+        assert_eq!(
+            resolved_instance_path(&arrays).unwrap(),
+            (vec!["Workspace".to_string(), "A.B".to_string()], vec![1, 3])
+        );
+        assert!(resolved_instance_path(&json!({ "c": "Part" })).is_err());
+    }
 
     #[test]
     fn busy_connections_and_ended_runtimes_have_distinct_actionable_errors() {
@@ -3782,6 +4391,201 @@ mod tests {
             None
         );
         assert_eq!(play_target_selector(op::PLAY_START, &json!({})), None);
+    }
+
+    #[test]
+    fn unresolved_play_selectors_queue_on_their_edit_windows_selector_gate() {
+        assert_eq!(
+            play_selector_gate(BridgeTarget::Server, None, "edit-a").as_deref(),
+            Some("edit-a/server")
+        );
+        assert_eq!(
+            play_selector_gate(BridgeTarget::Client, Some(" Player2 "), "edit-a").as_deref(),
+            Some("edit-a/client/player2")
+        );
+        assert_eq!(
+            play_selector_gate(BridgeTarget::Client, None, "unbound").as_deref(),
+            Some("unbound/client")
+        );
+        assert_eq!(play_selector_gate(BridgeTarget::Main, None, "edit-a"), None);
+        assert_eq!(play_selector_gate(BridgeTarget::Edit, None, "edit-a"), None);
+    }
+
+    #[test]
+    fn a_context_without_a_runtime_never_queues_on_another_studios_play_runtime() {
+        use crate::studio::bridge::BRIDGE_ROLE_PLAY_CLIENT;
+        use crate::studio::bridge::routing_tests::{connect, edit_info, fixture, play_info};
+        let bridge = fixture();
+        let _edit_b = connect(&bridge, 0, edit_info("edit-b", 30));
+        let _client_b = connect(
+            &bridge,
+            0,
+            play_info(
+                "client-b1",
+                "edit-b",
+                BRIDGE_ROLE_PLAY_CLIENT,
+                "Player1",
+                30,
+            ),
+        );
+        let gate = |target, player| {
+            play_gate_for_owner(&bridge, target, player, None, Instant::now(), None)
+                .map_err(|failure| failure.0.m)
+                .unwrap()
+        };
+        assert_eq!(
+            gate(BridgeTarget::Client, None),
+            Some(PlayGate::Selector {
+                gate: "unbound/client".into(),
+                owner: None,
+            })
+        );
+        assert_eq!(
+            gate(BridgeTarget::Client, Some("1")),
+            Some(PlayGate::Selector {
+                gate: "unbound/client/1".into(),
+                owner: None,
+            })
+        );
+        assert_eq!(gate(BridgeTarget::Main, None), None);
+    }
+
+    #[test]
+    fn a_client_request_waits_for_its_client_and_takes_that_runtimes_gate() {
+        use crate::studio::bridge::BRIDGE_ROLE_PLAY_CLIENT;
+        use crate::studio::bridge::routing_tests::{connect, edit_info, fixture, play_info};
+        let bridge = fixture();
+        let _edit_a = connect(&bridge, 0, edit_info("edit-a", 20));
+        let client = || {
+            play_info(
+                "client-a1",
+                "edit-a",
+                BRIDGE_ROLE_PLAY_CLIENT,
+                "Player1",
+                20,
+            )
+        };
+        let expected = || {
+            Some(PlayGate::Runtime {
+                target: BridgeTarget::Client,
+                player: Some("1".into()),
+                runtime_id: "client-a1".into(),
+                owner: "edit-a".into(),
+            })
+        };
+        let (first, _peer) = std::thread::scope(|scope| {
+            let late = scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(200));
+                connect(&bridge, 1, client())
+            });
+            let first = play_gate_for_owner(
+                &bridge,
+                BridgeTarget::Client,
+                Some("1"),
+                Some("edit-a"),
+                Instant::now() + Duration::from_secs(5),
+                None,
+            )
+            .map_err(|failure| failure.0.m)
+            .unwrap();
+            (first, late.join().unwrap())
+        });
+        assert_eq!(first, expected(), "the request waited for its client");
+        let second = play_gate_for_owner(
+            &bridge,
+            BridgeTarget::Client,
+            Some("1"),
+            Some("edit-a"),
+            Instant::now(),
+            None,
+        )
+        .map_err(|failure| failure.0.m)
+        .unwrap();
+        assert_eq!(second, expected(), "a later request takes the same gate");
+
+        let started = Instant::now();
+        let unanswered = play_gate_for_owner(
+            &bridge,
+            BridgeTarget::Client,
+            Some("2"),
+            Some("edit-a"),
+            Instant::now() + Duration::from_millis(150),
+            None,
+        )
+        .map_err(|failure| failure.0.m)
+        .unwrap();
+        assert_eq!(
+            unanswered,
+            Some(PlayGate::Selector {
+                gate: "edit-a/client/2".into(),
+                owner: Some("edit-a".into()),
+            })
+        );
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        let started = Instant::now();
+        assert_eq!(
+            play_gate_for_owner(
+                &bridge,
+                BridgeTarget::Main,
+                None,
+                Some("edit-a"),
+                Instant::now() + Duration::from_secs(5),
+                None,
+            )
+            .map_err(|failure| failure.0.m)
+            .unwrap(),
+            None,
+            "a bare selector with no play server is an Edit request at once"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_bare_client_request_takes_the_gate_of_the_client_it_runs_on() {
+        use crate::studio::bridge::BRIDGE_ROLE_PLAY_CLIENT;
+        use crate::studio::bridge::routing_tests::{connect, edit_info, fixture, focus, play_info};
+        let bridge = fixture();
+        let _edit_a = connect(&bridge, 0, edit_info("edit-a", 20));
+        let _one = connect(
+            &bridge,
+            0,
+            play_info(
+                "client-a1",
+                "edit-a",
+                BRIDGE_ROLE_PLAY_CLIENT,
+                "Player1",
+                20,
+            ),
+        );
+        let _two = connect(
+            &bridge,
+            0,
+            play_info(
+                "client-a2",
+                "edit-a",
+                BRIDGE_ROLE_PLAY_CLIENT,
+                "Player2",
+                20,
+            ),
+        );
+        focus(&bridge, "client-a2");
+        let runtime_of = |player: Option<&str>| match play_gate_for_owner(
+            &bridge,
+            BridgeTarget::Client,
+            player,
+            Some("edit-a"),
+            Instant::now(),
+            None,
+        )
+        .map_err(|failure| failure.0.m)
+        .unwrap()
+        {
+            Some(PlayGate::Runtime { runtime_id, .. }) => runtime_id,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(runtime_of(None), "client-a2");
+        assert_eq!(runtime_of(Some("2")), "client-a2");
+        assert_eq!(runtime_of(Some("1")), "client-a1");
     }
 
     #[test]
@@ -3939,6 +4743,14 @@ mod tests {
                 false
             ),
             json!({ "ok": true, "scripts": {"updated": 1}, "verified": false })
+        );
+        assert_eq!(
+            compact(
+                json!({"ok": true, "instanceQueued": 3, "propertyQueued": 1, "propertyUpdated": 0}),
+                true
+            ),
+            json!({ "ok": true, "verified": false }),
+            "a push that applied nothing is not verified"
         );
         assert_eq!(
             compact(

@@ -971,6 +971,20 @@ mod tests {
     }
 
     #[test]
+    fn setup_keeps_the_earlier_repair_spelling() {
+        let matches = command()
+            .try_get_matches_from(["rbx", "setup", "--reinstall"])
+            .unwrap();
+        match <Cli as clap::FromArgMatches>::from_arg_matches(&matches)
+            .unwrap()
+            .command
+        {
+            Commands::Setup(args) => assert!(args.repair),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
     fn client_luau_reports_misplaced_positionals_with_a_corrected_command() {
         let detached = client_luau(&["-t", "30", "--detach", "probe", "print(1)", "1"]).unwrap();
         assert_eq!(detached.code.as_deref(), Some("print(1)"));
@@ -2139,7 +2153,11 @@ pub(super) struct SetupArgs {
     pub(super) dry_run: bool,
     #[arg(help = "Report the installation state", long)]
     pub(super) status: bool,
-    #[arg(help = "Reinstall the plugin and PATH entries", long)]
+    #[arg(
+        help = "Reinstall the Studio plugin and the agent hints (PATH is left as the installer set it)",
+        long,
+        alias = "reinstall"
+    )]
     pub(super) repair: bool,
     #[arg(help = "Remove the installation", long)]
     pub(super) uninstall: bool,
@@ -2665,6 +2683,10 @@ pub(super) struct PullArgs {
     /// Project paths whose unsynced edits the publish leaves in place.
     #[arg(skip)]
     pub(crate) preserve_paths: Vec<PathBuf>,
+    /// The source root whose existing script files decide the names and forms
+    /// of the imported scripts, when the import writes somewhere else.
+    #[arg(skip)]
+    pub(crate) layout_src_root: Option<PathBuf>,
 }
 
 #[derive(Clone, Parser)]
@@ -2710,6 +2732,17 @@ pub(super) struct PushEditorChangesArgs {
     /// `-i` names an instance whose subtree comes along.
     #[arg(skip)]
     pub(crate) exact_target_ids: bool,
+    /// A user's `-i` narrows the named paths to those instances; the delta
+    /// planner names changed paths and changed instances side by side, so
+    /// every listed script file is pushed as well.
+    #[arg(skip)]
+    pub(crate) targets_extend_paths: bool,
+    /// A staged push collects changes in a private copy that carries no link
+    /// manifest and no place configuration; the planner names the authored
+    /// project here so read-only link packages are still recognized and the
+    /// review policy is the authored project's.
+    #[arg(skip)]
+    pub(crate) link_project_root: Option<PathBuf>,
     #[arg(
         help = "Only push these properties",
         short,
@@ -2766,6 +2799,8 @@ impl PushEditorChangesArgs {
             target_settings_ids: Vec::new(),
             target_settings_id_files: Vec::new(),
             exact_target_ids: false,
+            targets_extend_paths: false,
+            link_project_root: None,
             target_properties: Vec::new(),
             upsert_instances_only: false,
             verify_sources: false,
@@ -2845,7 +2880,7 @@ pub(super) struct ApplyEditorPropertyArgs {
     )]
     pub(super) no_review: bool,
     #[arg(
-        help = "Apply without the Studio review (a push of more than 5 changes opens one)",
+        help = "Apply without the Studio review (an edit above the change threshold opens one; `cfg get liveSync.changesThreshold`)",
         long,
         alias = "apply"
     )]
@@ -2856,6 +2891,14 @@ pub(super) struct ApplyEditorPropertyArgs {
 pub(super) struct ApplyEditorDeleteArgs {
     #[command(flatten)]
     pub(super) target: EditorMutationArgs,
+    #[arg(help = "Skip the Studio review", long)]
+    pub(super) no_review: bool,
+    #[arg(
+        help = "Delete without the Studio review (an edit above the change threshold opens one; `cfg get liveSync.changesThreshold`)",
+        long,
+        alias = "apply"
+    )]
+    pub(super) yes: bool,
 }
 
 #[derive(Parser)]
@@ -3051,6 +3094,8 @@ pub(super) struct BytecodeSetPropertyArgs {
         default_value = "auto"
     )]
     pub(super) scope: String,
+    #[arg(help = "Allow edits inside linked packages", long)]
+    pub(super) override_packages: bool,
     #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }

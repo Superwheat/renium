@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use super::{client_viewport_size, input_delta, os_input_preferred, resolve_player_window};
 use super::{
     ensure_plugin_api_ok, note_system_ui, send_virtual_input, virtual_click_actions,
-    wait_for_player_bridge,
+    virtual_wait_actions, wait_for_player_bridge,
 };
 use crate::studio::bridge::{BridgeServer, BridgeTarget};
 use crate::studio::input as input_inject;
@@ -102,29 +102,42 @@ fn core_gui_command(action: &InputAction) -> Result<Value> {
     Ok(command)
 }
 
+/// A path under Workspace names a part, which the plugin resolves to a
+/// viewport point; only GUI paths take the plugin's verified click.
+fn is_world_path(path: &str) -> bool {
+    path == "Workspace"
+        || path == "game.Workspace"
+        || path.starts_with("Workspace.")
+        || path.starts_with("game.Workspace.")
+}
+
 fn semantic_click_batch(request: &InputRequest) -> Option<Vec<Value>> {
-    request
-        .actions
-        .iter()
-        .map(|action| match action.action {
+    let mut commands = Vec::new();
+    for action in &request.actions {
+        match action.action {
             InputActionKind::Click
-                if action.path.is_some()
+                if action
+                    .path
+                    .as_deref()
+                    .is_some_and(|path| !is_world_path(path))
                     && !matches!(action.button, Some(MouseButton::Right))
                     && action.x.is_none()
                     && action.y.is_none() =>
             {
-                Some(json!({
+                commands.push(json!({
                     "type": "click",
                     "path": action.path,
                     "holdMs": action.ms.unwrap_or(30).min(10_000),
-                }))
+                }));
             }
-            InputActionKind::Wait => {
-                Some(json!({ "type": "wait", "ms": action.ms.unwrap_or(0).min(10_000) }))
-            }
-            _ => None,
-        })
-        .collect()
+            InputActionKind::Wait => match action.ms.unwrap_or(0) {
+                0 => commands.push(json!({ "type": "wait", "ms": 0 })),
+                ms => commands.extend(virtual_wait_actions(ms)),
+            },
+            _ => return None,
+        }
+    }
+    Some(commands)
 }
 
 fn semantic_click_batch_result(
@@ -154,10 +167,7 @@ fn action_position(
     previous: Option<(i32, i32)>,
 ) -> Result<(i32, i32)> {
     if let Some(path) = action.path.as_deref() {
-        let world = path == "Workspace"
-            || path == "game.Workspace"
-            || path.starts_with("Workspace.")
-            || path.starts_with("game.Workspace.");
+        let world = is_world_path(path);
         let method = if world {
             "getWorldPoint"
         } else {
@@ -400,11 +410,11 @@ fn virtual_input_result(parameters: &Value, bridge: &BridgeServer) -> Result<Val
                     InputActionKind::KeyUp => {
                         commands.push(json!({ "type": "key", "key": key.name, "down": false }))
                     }
-                    InputActionKind::KeyPress => commands.extend([
-                        json!({ "type": "key", "key": key.name, "down": true }),
-                        json!({ "type": "wait", "ms": action.ms.unwrap_or(60).min(10_000) }),
-                        json!({ "type": "key", "key": key.name, "down": false }),
-                    ]),
+                    InputActionKind::KeyPress => {
+                        commands.push(json!({ "type": "key", "key": key.name, "down": true }));
+                        commands.extend(virtual_wait_actions(action.ms.unwrap_or(60)));
+                        commands.push(json!({ "type": "key", "key": key.name, "down": false }));
+                    }
                     _ => unreachable!(),
                 }
             }
@@ -463,9 +473,10 @@ fn virtual_input_result(parameters: &Value, bridge: &BridgeServer) -> Result<Val
                 }
                 position = Some((x, y));
             }
-            InputActionKind::Wait => {
-                commands.push(json!({ "type": "wait", "ms": action.ms.unwrap_or(0).min(10_000) }));
-            }
+            InputActionKind::Wait => match action.ms.unwrap_or(0) {
+                0 => commands.push(json!({ "type": "wait", "ms": 0 })),
+                ms => commands.extend(virtual_wait_actions(ms)),
+            },
             InputActionKind::Dismiss | InputActionKind::Press => {
                 commands.push(core_gui_command(action)?);
             }
@@ -493,6 +504,48 @@ mod tests {
 
     fn action(value: Value) -> InputAction {
         serde_json::from_value(value).unwrap()
+    }
+
+    fn request(actions: Value) -> InputRequest {
+        serde_json::from_value(json!({ "player": "1", "actions": actions })).unwrap()
+    }
+
+    #[test]
+    fn world_paths_leave_the_verified_gui_click_batch() {
+        let gui = request(json!([{ "action": "click", "path": "Shop.BuyButton" }]));
+        assert_eq!(
+            semantic_click_batch(&gui).unwrap(),
+            vec![json!({ "type": "click", "path": "Shop.BuyButton", "holdMs": 30 })]
+        );
+        for path in [
+            "Workspace.Props.Crate[1]",
+            "game.Workspace.Door",
+            "Workspace",
+        ] {
+            let world = request(json!([{ "action": "click", "path": path }]));
+            assert!(semantic_click_batch(&world).is_none(), "{path}");
+            assert!(is_world_path(path));
+        }
+        assert!(!is_world_path("WorkspaceHud.Button"));
+    }
+
+    #[test]
+    fn long_waits_and_holds_split_into_plugin_sized_waits() {
+        let batch = request(
+            json!([{ "action": "click", "path": "Shop.BuyButton" }, { "action": "wait", "ms": 15000 }]),
+        );
+        let commands = semantic_click_batch(&batch).unwrap();
+        assert_eq!(commands.len(), 3);
+        assert_eq!(commands[1]["ms"], 10000);
+        assert_eq!(commands[2]["ms"], 5000);
+        let zero = request(json!([{ "action": "wait", "ms": 0 }]));
+        assert_eq!(
+            semantic_click_batch(&zero).unwrap(),
+            vec![json!({ "type": "wait", "ms": 0 })]
+        );
+        let held = virtual_wait_actions(65_000);
+        assert_eq!(held.len(), 6);
+        assert!(held.iter().all(|wait| wait["ms"] == 10000));
     }
 
     #[test]

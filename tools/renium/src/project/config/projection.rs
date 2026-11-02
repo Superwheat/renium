@@ -2024,6 +2024,18 @@ fn stage_source_directory(
         }
         let target = destination.join(relative);
         if entry.file_type().is_dir() {
+            let folder = entry
+                .path()
+                .strip_prefix(&loaded.root)
+                .unwrap_or(entry.path())
+                .to_string_lossy()
+                .replace('\\', "/");
+            if path_is_ignored(
+                loaded,
+                Path::new(&format!("{}/", folder.trim_end_matches('/'))),
+            )? {
+                continue;
+            }
             fs::create_dir_all(&target)?;
             continue;
         }

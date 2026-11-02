@@ -113,6 +113,44 @@ impl Drop for Fixture {
     }
 }
 
+/// The filter byte that starts every scanline of a PNG, read from its raw
+/// IDAT stream (the decoder hides them).
+fn png_scanline_filters(path: &Path) -> Vec<u8> {
+    use std::io::Read;
+
+    let bytes = fs::read(path).unwrap();
+    let mut width = 0usize;
+    let mut channels = 0usize;
+    let mut idat = Vec::new();
+    let mut offset = 8;
+    while offset + 8 <= bytes.len() {
+        let length = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        let kind = &bytes[offset + 4..offset + 8];
+        let data = &bytes[offset + 8..offset + 8 + length];
+        match kind {
+            b"IHDR" => {
+                width = u32::from_be_bytes(data[0..4].try_into().unwrap()) as usize;
+                channels = match data[9] {
+                    0 => 1,
+                    2 => 3,
+                    4 => 2,
+                    6 => 4,
+                    other => panic!("unexpected color type {other}"),
+                };
+            }
+            b"IDAT" => idat.extend_from_slice(data),
+            _ => {}
+        }
+        offset += 12 + length;
+    }
+    let mut raw = Vec::new();
+    flate2::read::ZlibDecoder::new(idat.as_slice())
+        .read_to_end(&mut raw)
+        .unwrap();
+    let stride = 1 + width * channels;
+    raw.chunks(stride).map(|row| row[0]).collect()
+}
+
 fn png_pixels(path: &Path) -> (png::OutputInfo, Vec<u8>) {
     let mut reader = png::Decoder::new(File::open(path).unwrap())
         .read_info()
@@ -120,6 +158,19 @@ fn png_pixels(path: &Path) -> (png::OutputInfo, Vec<u8>) {
     let mut pixels = vec![0; reader.output_buffer_size()];
     let info = reader.next_frame(&mut pixels).unwrap();
     (info, pixels)
+}
+
+#[test]
+fn review_sheets_are_written_with_the_capture_scanline_filter() {
+    let fixture = Fixture::new();
+    let video = fixture.video(3);
+    let overview = review(&video, None, None, None).unwrap();
+    let filters = png_scanline_filters(Path::new(overview["path"].as_str().unwrap()));
+    assert!(!filters.is_empty());
+    assert!(
+        filters.iter().all(|filter| *filter == 4),
+        "every scanline carries the Paeth filter byte: {filters:?}"
+    );
 }
 
 #[test]

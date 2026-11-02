@@ -1554,7 +1554,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "renium"
-version = "0.5.7"
+version = "0.5.8"
 dependencies = [
  "ahash",
  "anyhow",
@@ -1562,6 +1562,7 @@ dependencies = [
  "cc",
  "clap",
  "ed25519-dalek",
+ "flate2",
  "full_moon",
  "getrandom 0.3.4",
  "globset",

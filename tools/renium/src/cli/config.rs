@@ -65,7 +65,9 @@ pub(crate) fn apply_merged(cli: &mut Cli, matches: &clap::ArgMatches) -> Result<
     {
         cli.backtrace = value;
     }
+    // An explicit pin (--place or RENIUM_PLACE) beats the stored one.
     if cli.place.is_none()
+        && std::env::var_os("RENIUM_PLACE").is_none_or(|value| value.is_empty())
         && let Some(value) = object.get("place").and_then(Value::as_str)
     {
         cli.place = Some(value.to_string());

@@ -81,6 +81,46 @@ fn invalid_manifests_never_reach_execution() {
 }
 
 #[test]
+fn check_and_install_refuse_a_guide_info_could_not_print() {
+    let root = crate::tests::support::temp_dir("plugin-big-guide");
+    let plugin = root.join("bigguide");
+    scaffold::create("bigguide", Some(&plugin)).unwrap();
+    let check = || {
+        manage(PluginArgs {
+            command: PluginCommand::Check {
+                path: plugin.clone(),
+            },
+        })
+    };
+    check().unwrap();
+    fs::write(plugin.join("AGENTS.md"), "x".repeat(64 * 1024)).unwrap();
+    check().unwrap();
+    assert_eq!(
+        read_guide(&plugin, Path::new("AGENTS.md")).unwrap().len(),
+        64 * 1024
+    );
+    fs::write(plugin.join("AGENTS.md"), "x".repeat(70 * 1024)).unwrap();
+    for error in [
+        check().unwrap_err(),
+        manage(PluginArgs {
+            command: PluginCommand::Install {
+                path: plugin.clone(),
+                dev: true,
+            },
+        })
+        .unwrap_err(),
+    ] {
+        assert_eq!(
+            format!("{error:#}"),
+            "The plugin guide AGENTS.md is 71680 bytes; a guide can be at most 65536 bytes (64 KiB)"
+        );
+    }
+    fs::write(plugin.join("AGENTS.md"), [0x67, 0xff, 0x0a]).unwrap();
+    assert!(format!("{:#}", check().unwrap_err()).contains("is not UTF-8 text"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn registration_and_resource_names_cannot_escape_the_registry() {
     for name in ["../one", "a/b", "C:\\one", "", "a.b"] {
         assert!(registration_path(Path::new("test"), name).is_err());

@@ -17,6 +17,236 @@ pub(crate) fn supporting_settings_scopes(
         .collect()
 }
 
+/// The link enforcement a comparison folds packed scripts with, built once
+/// per operation: None without an active manifest; a manifest whose package
+/// cannot be read or resolved is an error, never "nothing is packed".
+pub(crate) fn packing_link_enforcement(
+    root: &Path,
+    src_root: &Path,
+) -> Result<Option<crate::project::package_links::LinkEnforcement>> {
+    let enforcement = crate::project::package_links::build_link_enforcement(root, src_root, None)
+        .with_context(|| {
+        format!(
+            "Could not place the packed link scripts of {}",
+            root.display()
+        )
+    })?;
+    Ok(enforcement.is_active().then_some(enforcement))
+}
+
+/// `rbx lkp` leaves a packed script's text in its store and removes its file,
+/// while a Studio capture carries that text in a file and the external marker
+/// in the store. Folding the captured text into Studio's row lets the two
+/// stores compare, and the capture's file no longer reads as a script to
+/// pull. Which scripts count is decided by the link manifest, the signal the
+/// push side uses, not by the store carrying inline text.
+pub(crate) fn pack_read_only_link_scripts_with(
+    enforcement: &crate::project::package_links::LinkEnforcement,
+    root: &Path,
+    editor: &ProjectSnapshot,
+    studio: &mut ProjectSnapshot,
+) -> Result<()> {
+    let stores = editor
+        .entries
+        .keys()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_service_settings_file_name)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut removed = Vec::new();
+    for path in stores {
+        let (Some(SnapshotEntry::File(editor_bytes)), Some(SnapshotEntry::File(studio_bytes))) =
+            (editor.entries.get(&path), studio.entries.get(&path))
+        else {
+            continue;
+        };
+        let editor_doc = decode_settings_bytecode(editor_bytes)
+            .with_context(|| format!("Could not read the store {}", path.display()))?;
+        let service = settings_service_name(&path, &editor_doc, &editor_doc)?;
+        let editor_paths = crate::editor::paths::build_editor_instance_paths(&editor_doc, &service);
+        let packed = editor_doc
+            .instances
+            .iter()
+            .zip(&editor_paths)
+            .filter(|(instance, _)| is_lua_source_class(&instance.class_name))
+            .filter_map(|(instance, instance_path)| {
+                let text = instance.properties.get("Source")?.as_str()?;
+                if text == crate::settings::EXTERNAL_SOURCE_MARKER {
+                    return None;
+                }
+                let instance_path = instance_path.as_ref()?;
+                enforcement.read_only_package_for_path(
+                    &service,
+                    &instance_path.path_segments,
+                    &instance_path.path_ordinals,
+                )?;
+                Some((
+                    (
+                        instance_path.path_segments.clone(),
+                        instance_path.path_ordinals.clone(),
+                    ),
+                    text.to_string(),
+                ))
+            })
+            .collect::<HashMap<_, _>>();
+        if packed.is_empty() {
+            continue;
+        }
+        let mut studio_doc = decode_settings_bytecode(studio_bytes)
+            .with_context(|| format!("Could not read Studio's copy of {}", path.display()))?;
+        let studio_paths = crate::editor::paths::build_editor_instance_paths(&studio_doc, &service);
+        let service_dir = crate::project::storage::source_directory(&root.join(&path));
+        let source_paths = build_editor_source_paths_by_index(&studio_doc, &service, &service_dir);
+        let mut folded = false;
+        for (index, instance_path) in studio_paths.iter().enumerate() {
+            let Some(instance_path) = instance_path else {
+                continue;
+            };
+            let Some(inline) = packed.get(&(
+                instance_path.path_segments.clone(),
+                instance_path.path_ordinals.clone(),
+            )) else {
+                continue;
+            };
+            let Some(relative) = source_paths[index]
+                .as_ref()
+                .and_then(|source_path| source_path.strip_prefix(root).ok())
+            else {
+                continue;
+            };
+            let Some(SnapshotEntry::File(captured)) = studio.entries.get(relative) else {
+                continue;
+            };
+            let same = crate::system::text::normalized_source_bytes(captured).eq(
+                crate::system::text::normalized_source_bytes(inline.as_bytes()),
+            );
+            let text = if same {
+                inline.clone()
+            } else {
+                String::from_utf8_lossy(captured).into_owned()
+            };
+            studio_doc.instances[index]
+                .properties
+                .insert("Source".to_string(), Value::String(text));
+            let relative = relative.to_path_buf();
+            studio.entries.remove(&relative);
+            removed.push(relative);
+            folded = true;
+        }
+        if folded {
+            studio.entries.insert(
+                path,
+                SnapshotEntry::File(encode_settings_bytecode(&studio_doc)?),
+            );
+        }
+    }
+    drop_directories_emptied_by_folding(editor, studio, &removed);
+    drop_stripped_package_links(enforcement, editor, studio)
+}
+
+/// `lkp --share` strips the PackageLink at the root of a shared copy, so the
+/// consumer's store holds none there while Studio keeps its own. The link is
+/// Studio's to keep until `upl` removes it: it leaves the capture before the
+/// comparison, so neither a pull writes it into the store nor a push plans
+/// its removal.
+fn drop_stripped_package_links(
+    enforcement: &crate::project::package_links::LinkEnforcement,
+    editor: &ProjectSnapshot,
+    studio: &mut ProjectSnapshot,
+) -> Result<()> {
+    let stores = studio
+        .entries
+        .keys()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_service_settings_file_name)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for path in stores {
+        let Some(SnapshotEntry::File(studio_bytes)) = studio.entries.get(&path) else {
+            continue;
+        };
+        let mut studio_doc = decode_settings_bytecode(studio_bytes)
+            .with_context(|| format!("Could not read Studio's copy of {}", path.display()))?;
+        let service = settings_service_name(&path, &studio_doc, &studio_doc)?;
+        let editor_doc = match editor.entries.get(&path) {
+            Some(SnapshotEntry::File(bytes)) => Some(
+                decode_settings_bytecode(bytes)
+                    .with_context(|| format!("Could not read the store {}", path.display()))?,
+            ),
+            _ => None,
+        };
+        let editor_link_parents = editor_doc
+            .as_ref()
+            .map(|document| {
+                let paths = crate::editor::paths::build_editor_instance_paths(document, &service);
+                document
+                    .instances
+                    .iter()
+                    .filter(|instance| instance.class_name == "PackageLink")
+                    .filter_map(|instance| paths[instance.parent_index?].clone())
+                    .map(|parent| (parent.path_segments, parent.path_ordinals))
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+        let studio_paths = crate::editor::paths::build_editor_instance_paths(&studio_doc, &service);
+        let stripped = studio_doc
+            .instances
+            .iter()
+            .enumerate()
+            .filter(|(_, instance)| instance.class_name == "PackageLink")
+            .filter_map(|(index, instance)| {
+                let parent = studio_paths[instance.parent_index?].as_ref()?;
+                let key = (parent.path_segments.clone(), parent.path_ordinals.clone());
+                (enforcement.unlink_matches_package(&service, &key.0, &key.1)
+                    && !editor_link_parents.contains(&key))
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if stripped.is_empty() {
+            continue;
+        }
+        crate::settings::instance::remove_instances_at_indices(&mut studio_doc, &stripped, true)?;
+        studio.entries.insert(
+            path,
+            SnapshotEntry::File(encode_settings_bytecode(&studio_doc)?),
+        );
+    }
+    Ok(())
+}
+
+/// A folded script's directory existed in the capture only to hold its
+/// file; when nothing else is left in it and the files have no such
+/// directory, the capture's entry would read as a directory the push removed.
+fn drop_directories_emptied_by_folding(
+    editor: &ProjectSnapshot,
+    studio: &mut ProjectSnapshot,
+    removed: &[PathBuf],
+) {
+    for relative in removed {
+        for directory in relative.ancestors().skip(1) {
+            if directory.as_os_str().is_empty() || editor.entries.contains_key(directory) {
+                break;
+            }
+            let occupied = studio
+                .entries
+                .keys()
+                .any(|entry| entry != directory && entry.starts_with(directory));
+            if occupied {
+                break;
+            }
+            if studio.entries.remove(directory).is_none() {
+                break;
+            }
+        }
+    }
+}
+
 pub(crate) fn baseline_scopes(context: &BoundContext, paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let root = Path::new(&context.root);
     let source = Path::new(&context.source);
@@ -119,9 +349,17 @@ pub(crate) fn prepare_editor_settings_changes(
         .into_iter()
         .filter(|path| previous.entries.get(path) != current.entries.get(path))
         .map(|path| {
+            let previous_entry = previous.entries.get(&path);
+            let current_entry = current.entries.get(&path);
+            if previous_entry.is_some() && current_entry.is_none() {
+                bail!("{}", missing_store_message(&path));
+            }
             let (previous_document, current_document) = rayon::join(
-                || editor_settings_document(previous.entries.get(&path)),
-                || editor_settings_document(current.entries.get(&path)),
+                || editor_settings_document(previous_entry),
+                || {
+                    editor_settings_document(current_entry)
+                        .with_context(|| format!("Could not read the store {}", path.display()))
+                },
             );
             let mut change = PreparedEditorSettingsChange {
                 previous: previous_document?,

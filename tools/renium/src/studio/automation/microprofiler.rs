@@ -3,9 +3,11 @@
 use super::*;
 use mlua::{Lua, LuaSerdeExt};
 
-const LIBMP_SHA256: &str = "ab9579e592e8751386a01537152f2b739cc7942ce565d3c11337cddaa250d231";
-// An asset ID does not follow the mutable `latest` tag when Roblox updates it.
-const LIBMP_URL: &str = "https://api.github.com/repos/Roblox/libmp/releases/assets/456813947";
+const LIBMP_SHA256: &str = "236fea082f323facd08109f9fd6dab70350bd0cc69617e07cc194778415a0bb8";
+// Roblox replaces the assets under the `latest` release, so the parser is
+// found by name there; the pinned digest decides whether it is the known one.
+const LIBMP_RELEASE_URL: &str = "https://api.github.com/repos/Roblox/libmp/releases/latest";
+const LIBMP_ASSET_NAME: &str = "LibMP.luau";
 const MAX_CAPTURE_BYTES: u64 = 128 * 1024 * 1024;
 const DUMP_MAGIC: &[u8] = b"A0BF";
 /// Studio keeps a fixed log per thread; frames whose entries were overwritten
@@ -151,6 +153,20 @@ fn validate_output(capture: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The download URL of the parser bundle inside a GitHub release listing.
+fn libmp_asset_url(release: &Value) -> Result<&str> {
+    release
+        .get("assets")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|asset| asset.get("name").and_then(Value::as_str) == Some(LIBMP_ASSET_NAME))
+        .and_then(|asset| asset.get("url").and_then(Value::as_str))
+        .with_context(|| {
+            format!("Roblox's MicroProfiler parser release carries no {LIBMP_ASSET_NAME} asset")
+        })
+}
+
 fn parser_source() -> Result<Vec<u8>> {
     let path = crate::app::update::user_data_dir()?
         .join("cache/microprofiler")
@@ -170,10 +186,20 @@ fn parser_source() -> Result<Vec<u8>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("Could not open the MicroProfiler parser cache"),
     }
-    let response = ureq::AgentBuilder::new()
+    let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(15))
-        .build()
-        .get(LIBMP_URL)
+        .build();
+    let release: Value = agent
+        .get(LIBMP_RELEASE_URL)
+        .set("Accept", "application/vnd.github+json")
+        .set("User-Agent", "Renium/MicroProfiler")
+        .call()
+        .context("Could not look up Roblox's MicroProfiler parser release")?
+        .into_json()
+        .context("Roblox's MicroProfiler parser release listing is not JSON")?;
+    let asset_url = libmp_asset_url(&release)?;
+    let response = agent
+        .get(asset_url)
         .set("Accept", "application/octet-stream")
         .set("User-Agent", "Renium/MicroProfiler")
         .call()

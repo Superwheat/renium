@@ -784,6 +784,15 @@ end
 			end
 		end
 		task.wait()
+		if status == "error" and #runErrors == 0 then
+			-- The engine prints a failed require's own error a frame or two after
+			-- the runner reports; a loaded Studio takes longer. Those lines are the
+			-- consoleErrors the answer promises.
+			local errorsUntil = os.clock() + 0.5
+			while #runErrors == 0 and os.clock() < errorsUntil do
+				task.wait()
+			end
+		end
 		resultConnection:Disconnect()
 		logConnection:Disconnect()
 		local ownsOperation, ownershipError = pcall(assertOperationOwnership, operationGeneration)
@@ -1680,6 +1689,9 @@ updateMouse()
 		local heldKeys = sharedHeldKeys
 		local keysObserved = {}
 		local heldButtons = {}
+		local focusedTextBox = nil
+		local focusedTextBefore = nil
+		local textObserved = nil
 		local StarterGui = game:GetService("StarterGui")
 		local coreGuiStates = nil
 		-- Roblox refuses a virtual pointer event under one of its own overlays
@@ -2156,9 +2168,37 @@ updateMouse()
 					end
 					sendKey(action.down == true, keyCode, action.repeated == true)
 				elseif actionType == "text" then
-					local okSend, sendError = pcall(virtualInput.SendTextInput, virtualInput, tostring(action.text or ""))
-					if not okSend then
-						error(keyboardRefusal(sendError), 0)
+					local text = tostring(action.text or "")
+					local function sendText()
+						local okSend, sendError = pcall(virtualInput.SendTextInput, virtualInput, text)
+						if not okSend then
+							error(keyboardRefusal(sendError), 0)
+						end
+					end
+					sendText()
+					-- Text sent in the frame a box took focus can be dropped by the
+					-- engine; a box focused in this batch is checked, and the text
+					-- is sent once more after refocusing when it did not arrive.
+					if focusedTextBox ~= nil and text ~= "" then
+						local function textArrived()
+							return focusedTextBox.Text ~= focusedTextBefore
+						end
+						local function awaitText()
+							local deadline = os.clock() + 0.5
+							while not textArrived() and os.clock() < deadline do
+								RunService.Heartbeat:Wait()
+								assertOperationOwnership(operationGeneration)
+							end
+							return textArrived()
+						end
+						textObserved = awaitText()
+						if not textObserved then
+							focusedTextBox:CaptureFocus()
+							RunService.Heartbeat:Wait()
+							assertOperationOwnership(operationGeneration)
+							sendText()
+							textObserved = awaitText()
+						end
 					end
 				elseif actionType == "dismiss" or actionType == "press" then
 					local position = if action.x ~= nil and action.y ~= nil
@@ -2183,6 +2223,11 @@ updateMouse()
 					if UserInputService:GetFocusedTextBox() ~= target then
 						error("The requested TextBox did not receive focus", 0)
 					end
+					-- The focus lands this frame; text input reaches the box from the next.
+					RunService.Heartbeat:Wait()
+					assertOperationOwnership(operationGeneration)
+					focusedTextBox = target
+					focusedTextBefore = target.Text
 				elseif actionType == "click" then
 					sendVerifiedClick(action)
 				else
@@ -2231,6 +2276,7 @@ updateMouse()
 				ok = true,
 				actions = #actions,
 				verifiedClicks = verifiedClicks,
+				textObserved = textObserved,
 				activated = if activationId ~= "" then activationCount == 1 else nil,
 				clicked = if activationId ~= "" then clickCount == 1 else nil,
 				throughSystemUi = if #throughSystemUi > 0 then throughSystemUi else nil,
@@ -3180,6 +3226,7 @@ updateMouse()
 	local function releasePlayOwnership()
 		if playSession.launchNonce ~= nil and game:GetAttribute("__ReniumLaunchNonce") == playSession.launchNonce then
 			game:SetAttribute("__ReniumLaunchNonce", nil)
+			game:SetAttribute("__ReniumBridgePorts", nil)
 		end
 		if
 			playSession.ownerRuntimeId ~= nil
@@ -3450,6 +3497,10 @@ updateMouse()
 				playSession.ownerGeneration = operationGeneration
 				game:SetAttribute("__ReniumLaunchNonce", requestedLaunchNonce)
 				game:SetAttribute("__ReniumEditRuntimeId", playSession.ownerRuntimeId)
+				local bridgePorts = if runtimeContext.bridgePorts then runtimeContext.bridgePorts() else nil
+				if type(bridgePorts) == "table" and #bridgePorts > 0 then
+					game:SetAttribute("__ReniumBridgePorts", table.concat(bridgePorts, ","))
+				end
 				local token = playSession.token
 				local mode = playSession.mode
 				local testArgs = {
@@ -3457,6 +3508,7 @@ updateMouse()
 						nonce = requestedLaunchNonce,
 						editRuntimeId = playSession.ownerRuntimeId,
 						placeName = game.Name,
+						bridgePorts = bridgePorts,
 					},
 					value = params.args,
 				}

@@ -226,6 +226,56 @@ fn package_check_status_and_push_agree_on_external_sources_and_references() {
 }
 
 #[test]
+fn an_unowned_script_in_a_read_only_copy_is_drift_until_moved_out() {
+    let dir = temp_dir("link-unowned-drift");
+    let service_dir = dir.join("src").join("ReplicatedStorage");
+    write_link_test_service(&service_dir);
+    fs::create_dir_all(dir.join("links")).unwrap();
+    let mut script = settings_instance("script", "Code", "ModuleScript", Some(0));
+    script.properties.insert("Source".into(), json!("return 1"));
+    settings_document(vec![
+        settings_instance("pkg", "Pkg", "Folder", None),
+        script,
+    ])
+    .write_file(&dir.join("links/pkg.renium"))
+    .unwrap();
+    write_package_link_manifest(&dir, "ReplicatedStorage", true, &["Copy"]);
+    link_apply(test_link_apply_args(&dir)).unwrap();
+    let check = || {
+        let mut args = test_link_apply_args(&dir);
+        args.check = true;
+        capture_json_output(|| link_apply(args)).unwrap()
+    };
+    assert_eq!(check()["differenceCount"], json!(0));
+    let extra = service_dir.join("Copy").join("Extra.luau");
+    fs::create_dir_all(extra.parent().unwrap()).unwrap();
+    fs::write(&extra, "return 2").unwrap();
+    let checked = check();
+    assert_eq!(checked["differenceCount"], json!(1));
+    assert!(
+        checked["links"][0]["drift"]
+            .as_str()
+            .is_some_and(|drift| drift.starts_with("stray file") && drift.ends_with("Extra.luau")),
+        "{checked}"
+    );
+    assert_eq!(test_link_status(&dir)["driftedTargets"], json!(1));
+    let refused = link_apply(test_link_apply_args(&dir)).unwrap_err();
+    assert!(
+        format!("{refused:#}").contains("unowned file"),
+        "{refused:#}"
+    );
+    assert!(extra.is_file());
+    write_package_link_manifest(&dir, "ReplicatedStorage", false, &["Copy"]);
+    assert_eq!(check()["differenceCount"], json!(0));
+    assert_eq!(test_link_status(&dir)["driftedTargets"], json!(0));
+    write_package_link_manifest(&dir, "ReplicatedStorage", true, &["Copy"]);
+    fs::remove_file(&extra).unwrap();
+    assert_eq!(check()["differenceCount"], json!(0));
+    assert_eq!(test_link_status(&dir)["driftedTargets"], json!(0));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn link_rotations_are_read_as_proper_rotations() {
     let skewed = test_cframe([
         937.542,
@@ -2763,6 +2813,38 @@ fn shared_link_consumers_get_read_only_script_files_and_lose_stray_ones() {
         json!({ "race": "ok" })
     );
     let _ = fs::remove_dir_all(&fixture.root);
+}
+
+#[test]
+fn unlinking_matches_a_package_only_at_a_root_its_package_left_unlinked() {
+    let root = temp_dir("unlink-stripped-root");
+    crate::tests::support::write_packed_link_project(&root);
+    let enforcement = || build_link_enforcement(&root, &root.join("src"), None).unwrap();
+    let path = |segments: &[&str]| segments.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let shared = path(&["ReplicatedStorage", "Shared"]);
+    assert!(enforcement().unlink_matches_package("ReplicatedStorage", &shared, &[1, 1]));
+    assert!(enforcement().unlink_matches_package("ReplicatedStorage", &shared[1..], &[1]));
+    assert!(!enforcement().unlink_matches_package(
+        "ReplicatedStorage",
+        &path(&["ReplicatedStorage", "Shared", "Util"]),
+        &[1, 1, 1]
+    ));
+    assert!(!enforcement().unlink_matches_package(
+        "ReplicatedStorage",
+        &path(&["ReplicatedStorage", "Other"]),
+        &[1, 1]
+    ));
+    let package = root.join("links").join("shared.renium");
+    let mut linked = SettingsBytecode::read_file(&package).unwrap();
+    linked.instances.push(settings_instance(
+        "editor:link",
+        "PackageLink",
+        "PackageLink",
+        Some(0),
+    ));
+    linked.write_file(&package).unwrap();
+    assert!(!enforcement().unlink_matches_package("ReplicatedStorage", &shared, &[1, 1]));
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

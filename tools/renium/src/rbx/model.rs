@@ -26,9 +26,10 @@ use crate::bytecode::edit::{
 use crate::bytecode::explorer::explorer_daemon_services;
 use crate::bytecode::query::bytecode_parent_index;
 use crate::bytecode::{
-    acquire_settings_file_lock, apply_file_mutations, bytecode_input_looks_like_settings_file,
-    collect_source_path_updates, ensure_service_store_exists, file_mutation_paths,
-    resolve_bytecode_cli_settings_file, resolve_bytecode_selector,
+    acquire_settings_file_lock, adopt_single_positional_target, apply_file_mutations,
+    bytecode_input_looks_like_settings_file, collect_source_path_updates,
+    ensure_service_store_exists, file_mutation_paths, resolve_bytecode_cli_settings_file,
+    resolve_bytecode_selector,
 };
 use crate::cli::{
     BytecodeExportModelArgs, BytecodeExportPlaceArgs, BytecodeImportModelArgs, BytecodeRepackArgs,
@@ -36,7 +37,7 @@ use crate::cli::{
 use crate::editor::paths::{
     build_editor_instance_paths, build_editor_instance_paths_with_children,
     build_editor_source_paths_by_index, build_editor_source_paths_by_index_with_children,
-    editor_run_context_value, infer_source_script, merge_editor_source_files_into_document,
+    editor_run_context_value, infer_source_script, merge_editor_source_files_into_document_with,
 };
 use crate::project::config;
 use crate::project::layout::apply_configured_project_layout;
@@ -1012,7 +1013,12 @@ fn source_projection_settings_id(service: &str, path: &str, class_name: &str) ->
     format!("source:{:x}", digest.finalize())
 }
 
-pub(crate) fn bytecode_export_model(args: BytecodeExportModelArgs) -> Result<()> {
+pub(crate) fn bytecode_export_model(mut args: BytecodeExportModelArgs) -> Result<()> {
+    adopt_single_positional_target(
+        &mut args.input,
+        Some(args.service.as_str()),
+        &mut args.selector,
+    )?;
     let (settings_file, service_hint) = resolve_bytecode_cli_settings_file(
         args.input.settings_file.as_deref(),
         args.input.service_or_file.as_deref(),
@@ -1234,6 +1240,11 @@ pub(crate) fn build_rbx_place(
 ) -> Result<RbxPlaceBuild> {
     let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
     let phase_started = Instant::now();
+    let link_enforcement = if merge_source_files {
+        crate::editor::paths::packed_link_enforcement(src_root)?
+    } else {
+        None
+    };
     let export_inputs = services
         .into_par_iter()
         .map(|service| {
@@ -1256,13 +1267,17 @@ pub(crate) fn build_rbx_place(
                         .with_context(|| format!("Failed to read {}", settings_file.display()))?,
                 )
             };
-            let (source_structure_changed, actual_source_paths) = if merge_source_files
-                && settings_file.exists()
-            {
-                merge_editor_source_files_into_document(document.to_mut(), &service, &service_dir)?
-            } else {
-                (false, HashMap::new())
-            };
+            let (source_structure_changed, actual_source_paths) =
+                if merge_source_files && settings_file.exists() {
+                    merge_editor_source_files_into_document_with(
+                        document.to_mut(),
+                        &service,
+                        &service_dir,
+                        link_enforcement.as_ref(),
+                    )?
+                } else {
+                    (false, HashMap::new())
+                };
             let service_name = bytecode_service_name(&document, &settings_file, &service);
             let root_index = editor_service_root_index(&document, &service_name)
                 .or_else(|| settings_root_indices(&document).into_iter().next())
@@ -1566,7 +1581,9 @@ fn file_sha256(path: &Path) -> Result<String> {
 }
 
 pub(crate) fn record_import_base(root: &Path, place: &Path) -> Result<()> {
-    let place = place.canonicalize().unwrap_or_else(|_| place.to_path_buf());
+    let place = crate::system::files::canonical_path(place)
+        .map(crate::system::files::strip_extended_prefix)
+        .unwrap_or_else(|_| place.to_path_buf());
     let record = json!({
         "path": place,
         "sha256": file_sha256(&place)?,
@@ -1694,7 +1711,11 @@ pub(crate) fn bytecode_export_place(mut args: BytecodeExportPlaceArgs) -> Result
         Some(raw) => RbxPlaceFormat::parse(raw)?,
         None => RbxPlaceFormat::from_path(&args.output)?,
     };
-    let services = explorer_daemon_services(active_root, &args.services)?;
+    let services = if args.services.trim().is_empty() {
+        explorer_daemon_services(active_root, "")?
+    } else {
+        crate::snapshot::import::parse_services(&args.services)?
+    };
     let mut build = build_rbx_place(active_root, services, None, false, false, false)?;
     let mut top_level_refs = build
         .service_roots

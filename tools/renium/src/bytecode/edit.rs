@@ -9,9 +9,10 @@ use serde_json::{Map, Value, json};
 use crate::app::output::print_json_output;
 use crate::bytecode::query::{bytecode_parent_index, parse_property_assignments};
 use crate::bytecode::{
-    acquire_settings_file_lock, apply_file_mutations, collect_source_path_updates,
-    ensure_service_store_exists, file_mutation_paths, lock_existing_service_store,
-    preserve_source_path_extension, resolve_bytecode_cli_settings_file, resolve_bytecode_selector,
+    acquire_settings_file_lock, adopt_single_positional_target, apply_file_mutations,
+    collect_source_path_updates, ensure_service_store_exists, file_mutation_paths,
+    lock_existing_service_store, preserve_source_path_extension,
+    resolve_bytecode_cli_settings_file, resolve_bytecode_selector,
 };
 use crate::cli::{
     BytecodeAddInstanceArgs, BytecodeCloneInstanceArgs, BytecodeDesyncPackageLinkArgs,
@@ -31,6 +32,28 @@ use crate::settings::bytecode::{
 use crate::settings::instance::{self as instance_api, AddInstanceSpec};
 use crate::settings::tree::settings_children_by_parent;
 use crate::system::files::{ensure_existing_ancestor_inside, exact_path_key, path_key};
+
+/// Studio cannot instantiate a class tagged NotCreatable (Player, Terrain, a
+/// service); a store holding one makes every push of that service fail, and
+/// an imported Player leaves the Studio window unusable. Unknown class names
+/// stay allowed because the reflection database can lag behind Studio.
+fn ensure_creatable_class(class_name: &str) -> Result<()> {
+    let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
+    // The reflection database does not tag Player or Terrain; both are
+    // engine-owned and break the push that carries them.
+    let engine_owned = matches!(class_name, "Player" | "Terrain" | "DataModel");
+    if engine_owned
+        || database.classes.get(class_name).is_some_and(|class| {
+            class.tags.contains(&rbx_reflection::ClassTag::NotCreatable)
+                || class.tags.contains(&rbx_reflection::ClassTag::Service)
+        })
+    {
+        bail!(
+            "{class_name} cannot be created in Studio (the class is not creatable); choose a creatable class such as Folder or Part"
+        );
+    }
+    Ok(())
+}
 
 /// `-p NAME=JSON` names must be real properties of the class, stored under
 /// their canonical spelling, or every later consumer misses them.
@@ -252,6 +275,7 @@ pub(crate) fn prepare_new_instance_values(
     if class_name == "PackageLink" {
         bail!("PackageLink instances can only be created by Roblox package workflows");
     }
+    ensure_creatable_class(class_name)?;
     let mut properties = canonical_new_instance_properties(class_name, properties)?;
     let mut attributes = attributes;
     for map in [&mut properties, &mut attributes] {
@@ -402,7 +426,12 @@ pub(crate) fn new_script_source(
     }
 }
 
-pub(crate) fn bytecode_clone_instance(args: BytecodeCloneInstanceArgs) -> Result<()> {
+pub(crate) fn bytecode_clone_instance(mut args: BytecodeCloneInstanceArgs) -> Result<()> {
+    adopt_single_positional_target(
+        &mut args.input,
+        Some(args.service.as_str()),
+        &mut args.selector,
+    )?;
     let (settings_file, service_hint) = resolve_bytecode_cli_settings_file(
         args.input.settings_file.as_deref(),
         args.input.service_or_file.as_deref(),
@@ -1113,7 +1142,8 @@ pub(crate) fn plan_editor_source_file_removals(
     Ok(paths)
 }
 
-pub(crate) fn bytecode_remove_instance(args: BytecodeRemoveInstanceArgs) -> Result<()> {
+pub(crate) fn bytecode_remove_instance(mut args: BytecodeRemoveInstanceArgs) -> Result<()> {
+    adopt_single_positional_target(&mut args.input, None, &mut args.selector)?;
     let (settings_file, service_hint) = resolve_bytecode_cli_settings_file(
         args.input.settings_file.as_deref(),
         args.input.service_or_file.as_deref(),
@@ -1203,7 +1233,12 @@ pub(crate) fn bytecode_remove_instance(args: BytecodeRemoveInstanceArgs) -> Resu
     print_json_output(&result, args.pretty)
 }
 
-pub(crate) fn bytecode_desync_package_link(args: BytecodeDesyncPackageLinkArgs) -> Result<()> {
+pub(crate) fn bytecode_desync_package_link(mut args: BytecodeDesyncPackageLinkArgs) -> Result<()> {
+    adopt_single_positional_target(
+        &mut args.input,
+        Some(args.service.as_str()),
+        &mut args.selector,
+    )?;
     let explicit_service = (!args.service.trim().is_empty()).then_some(args.service.as_str());
     let (settings_file, service_hint) = resolve_bytecode_cli_settings_file(
         args.input.settings_file.as_deref(),
@@ -1348,6 +1383,17 @@ mod add_instance_tests {
 
     use super::*;
     use crate::cli::{BytecodeAddInstanceArgs, BytecodeFileArgs, BytecodeParentArgs};
+
+    #[test]
+    fn non_creatable_classes_are_refused_before_a_store_is_touched() {
+        for class_name in ["Player", "Terrain", "Workspace", "Players"] {
+            let error = ensure_creatable_class(class_name).unwrap_err().to_string();
+            assert!(error.contains("cannot be created"), "{class_name}: {error}");
+        }
+        for class_name in ["Folder", "Part", "Script", "NotAKnownClassYet"] {
+            ensure_creatable_class(class_name).unwrap();
+        }
+    }
 
     fn add(root: &Path, name: &str, properties: Vec<String>) -> Result<Value> {
         crate::app::output::capture_json_output(|| {

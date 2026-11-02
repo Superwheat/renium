@@ -66,6 +66,7 @@ local RuntimeApi = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeRuntimeAp
 })()
 local api = RuntimeApi.create({}, {
 	runtimeId = "test-runtime", bridgeRole = "edit",
+	bridgePorts = function() return { 8791, 8792 } end,
 	assertRequestLeaseActive = function() end,
 	assertSessionOwnership = function()
 		ownershipChecks += 1
@@ -91,12 +92,14 @@ authorized = false
 local checksBefore, writesBefore = ownershipChecks, writes
 status = api.startStopPlay({})
 assert(status.ok and status.running and status.launchNonce == "test-launch")
+assert(attributes.__ReniumBridgePorts == "8791,8792", "play DataModels learn the Edit window's bridge ports")
 assert(ownershipChecks == checksBefore and writes == writesBefore and stops == 0,
 	"observing active Play must preserve its ownership and attributes")
 authorized = true
 status = api.startStopPlay({ stop = true })
 assert(status.ok and not status.running and stops == 1)
 assert(attributes.__ReniumLaunchNonce == nil and attributes.__ReniumEditRuntimeId == nil)
+assert(attributes.__ReniumBridgePorts == nil, "the bridge ports leave the DataModel with the launch nonce")
 api.cleanup()
 
 -- Studio can return from a start while the previous test is still ending, without

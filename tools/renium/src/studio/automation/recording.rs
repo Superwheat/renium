@@ -28,7 +28,7 @@ use crate::system::files::{
     cleanup_stale_sibling_temps, replace_file_with_backup, sibling_temp_path,
 };
 
-static ACTIVE: Mutex<Option<ActiveRecording>> = Mutex::new(None);
+static ACTIVE: Mutex<Vec<ActiveRecording>> = Mutex::new(Vec::new());
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -39,6 +39,9 @@ struct StartRequest {
     #[serde(default)]
     client: bool,
     output: Option<PathBuf>,
+    /// Where a default-named recording goes: the directory the command ran
+    /// in, with the project root for callers that send none.
+    directory: Option<PathBuf>,
     #[serde(default = "default_fps")]
     fps: f64,
     #[serde(default = "default_max_seconds")]
@@ -449,9 +452,6 @@ pub(crate) fn start(
         bail!("Invalid record-start quality; expected a number from 0 through 100");
     }
     let mut active = ACTIVE.lock_recover();
-    if let Some(current) = active.as_ref() {
-        bail!("Recording conflict: {} is still active", current.id);
-    }
     let player = request.player.as_deref();
     if let Some(player) = player {
         wait_for_player_bridge(bridge, player, wait_seconds)?;
@@ -480,14 +480,21 @@ pub(crate) fn start(
     } else {
         (client_window(bridge, player)?, "play-client")
     };
+    if let Some(current) = active
+        .iter()
+        .find(|recording| recording.window == window.label)
+    {
+        bail!("Recording conflict: {} is still active", current.id);
+    }
     let id = automation_token("recording");
+    let base = request.directory.as_deref().unwrap_or(root);
     let output = request
         .output
         .unwrap_or_else(|| PathBuf::from(format!("{id}.mp4")));
     let output = if output.is_absolute() {
         output
     } else {
-        root.join(output)
+        base.join(output)
     };
     if !output
         .extension()
@@ -527,7 +534,7 @@ pub(crate) fn start(
             bail!("Recording worker stopped before it was ready");
         }
     }
-    *active = Some(ActiveRecording {
+    active.push(ActiveRecording {
         id: id.clone(),
         output: output.clone(),
         target,
@@ -551,24 +558,28 @@ pub(crate) fn end(parameters: &Value) -> Result<Value> {
         serde_json::from_value(parameters.clone()).context("Invalid record-end payload")?;
     let active = {
         let mut slot = ACTIVE.lock_recover();
-        let recording = slot
-            .take()
-            .context("Recording conflict: no recording is active")?;
-        if request
-            .recording_id
-            .as_ref()
-            .is_some_and(|id| recording.id != *id)
-        {
-            let current = recording.id.clone();
-            let requested = request.recording_id.as_deref().unwrap_or_default();
-            *slot = Some(recording);
-            bail!(
-                "Recording conflict: {} is active, not {}",
-                current,
-                requested
-            );
-        }
-        recording
+        let ids = || {
+            slot.iter()
+                .map(|recording| recording.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let index = match request.recording_id.as_deref() {
+            Some(requested) => match slot.iter().position(|recording| recording.id == requested) {
+                Some(index) => index,
+                None if slot.is_empty() => bail!("Recording conflict: no recording is active"),
+                None => bail!("Recording conflict: {} is active, not {}", ids(), requested),
+            },
+            None => match slot.len() {
+                0 => bail!("Recording conflict: no recording is active"),
+                1 => 0,
+                _ => bail!(
+                    "Recording conflict: several recordings are active ({}); pass the recording id",
+                    ids()
+                ),
+            },
+        };
+        slot.remove(index)
     };
     active.stop.store(true, Ordering::Relaxed);
     let finished = active
@@ -657,7 +668,7 @@ mod tests {
                 result
             });
             ready_rx.recv().unwrap().unwrap();
-            *ACTIVE.lock().unwrap() = Some(ActiveRecording {
+            ACTIVE.lock().unwrap().push(ActiveRecording {
                 id: name.into(),
                 output: output.clone(),
                 target: "test",

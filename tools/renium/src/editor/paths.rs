@@ -9,17 +9,76 @@ use crate::editor::document::ensure_editor_source_target_in_bytecode;
 use crate::editor::sync::is_lua_source_class;
 use crate::editor::types::{EditorInstancePath, EditorSourcePathSpec, EditorSourceTarget};
 use crate::project::config;
+use crate::project::package_links::LinkEnforcement;
 use crate::settings::bytecode::SettingsBytecode;
 use crate::settings::tree::{
     assign_editor_instance_paths, editor_child_stems, editor_service_root_index,
     settings_children_by_parent,
 };
-use crate::system::files::{path_key, sanitize_name, strip_extended_prefix};
+use crate::system::files::{
+    normalized_child_stem_key, path_key, sanitize_name, strip_extended_prefix,
+};
 
 pub(crate) fn script_file_names(class_name: &str) -> Option<(&'static str, &'static str)> {
     script_file_names_for_run_context(class_name, None)
 }
 
+/// The file names a script takes in the project: `init{suffix}.{ext}` inside
+/// a directory, or `{stem}{suffix}.{ext}` as a leaf file.
+pub(crate) struct ProjectScriptFileNames {
+    pub(crate) source_file_name: String,
+    pub(crate) leaf_suffix: String,
+    /// The script lives in a directory (`stem/init...`): it has children, or
+    /// the project already keeps it in that form.
+    pub(crate) directory: bool,
+}
+
+impl ProjectScriptFileNames {
+    fn new(suffix: &str, extension: &str, directory: bool) -> Self {
+        Self {
+            source_file_name: format!("init{suffix}.{extension}"),
+            leaf_suffix: format!("{suffix}.{extension}"),
+            directory,
+        }
+    }
+}
+
+fn project_script_suffix(
+    naming: config::ProjectScriptNaming,
+    class_name: &str,
+    properties: &Map<String, Value>,
+) -> Option<String> {
+    if !is_lua_source_class(class_name) {
+        return None;
+    }
+    let run_context = properties.get("RunContext").and_then(run_context_name);
+    if class_name == "Script"
+        && run_context.is_some_and(|value| value.eq_ignore_ascii_case("Client"))
+    {
+        Some(naming.client_run_context_suffix)
+    } else if class_name == "Script"
+        && run_context.is_some_and(|value| value.eq_ignore_ascii_case("Plugin"))
+    {
+        Some(naming.plugin_suffix)
+    } else {
+        match class_name {
+            "Script" => Some(naming.server_suffix),
+            "LocalScript" => Some(naming.client_suffix),
+            "ModuleScript" => Some(naming.module_suffix),
+            _ => None,
+        }
+    }
+}
+
+fn default_script_extension(policy: config::ScriptExtensionPolicy) -> &'static str {
+    match policy {
+        config::ScriptExtensionPolicy::Lua => "lua",
+        config::ScriptExtensionPolicy::Preserve | config::ScriptExtensionPolicy::Luau => "luau",
+    }
+}
+
+/// The `init` file name and leaf suffix of a script whose form (`stem/init`
+/// with children, a leaf file without) follows the document.
 pub(crate) fn project_script_file_names(
     parent_dir: &Path,
     fs_stem: &str,
@@ -27,48 +86,73 @@ pub(crate) fn project_script_file_names(
     class_name: &str,
     properties: &Map<String, Value>,
 ) -> Option<(String, String)> {
-    if !is_lua_source_class(class_name) {
-        return None;
-    }
-    let run_context = properties.get("RunContext").and_then(run_context_name);
     let naming = config::cached_script_naming(parent_dir);
-    let suffix = if class_name == "Script"
-        && run_context.is_some_and(|value| value.eq_ignore_ascii_case("Client"))
-    {
-        naming.client_run_context_suffix
-    } else if class_name == "Script"
-        && run_context.is_some_and(|value| value.eq_ignore_ascii_case("Plugin"))
-    {
-        naming.plugin_suffix
-    } else {
-        match class_name {
-            "Script" => naming.server_suffix,
-            "LocalScript" => naming.client_suffix,
-            "ModuleScript" => naming.module_suffix,
-            _ => return None,
-        }
-    };
-    if naming.extension == config::ScriptExtensionPolicy::Preserve {
+    let policy = naming.extension;
+    let suffix = project_script_suffix(naming, class_name, properties)?;
+    if policy == config::ScriptExtensionPolicy::Preserve {
         for extension in ["luau", "lua"] {
-            let source_file_name = format!("init{suffix}.{extension}");
-            let leaf_suffix = format!("{suffix}.{extension}");
+            let names = ProjectScriptFileNames::new(&suffix, extension, has_children);
             let path = if has_children {
-                parent_dir.join(fs_stem).join(&source_file_name)
+                parent_dir.join(fs_stem).join(&names.source_file_name)
             } else {
-                parent_dir.join(format!("{fs_stem}{leaf_suffix}"))
+                parent_dir.join(format!("{fs_stem}{}", names.leaf_suffix))
             };
             if path.is_file() {
-                return Some((source_file_name, leaf_suffix));
+                return Some((names.source_file_name, names.leaf_suffix));
             }
         }
     }
-    let extension = match naming.extension {
-        config::ScriptExtensionPolicy::Lua => "lua",
-        config::ScriptExtensionPolicy::Preserve | config::ScriptExtensionPolicy::Luau => "luau",
+    let names =
+        ProjectScriptFileNames::new(&suffix, default_script_extension(policy), has_children);
+    Some((names.source_file_name, names.leaf_suffix))
+}
+
+/// The names and form a captured script takes in the project: an existing
+/// file keeps its form (`stem/init...` or a leaf file) and its extension, and
+/// only a script without one gets the configured default naming. Existing
+/// files are looked for under `layout_dir`, the project's own directory when
+/// `parent_dir` is a stage that carries no copy of the project's files.
+pub(crate) fn project_script_file_names_in_layout(
+    parent_dir: &Path,
+    layout_dir: &Path,
+    fs_stem: &str,
+    has_children: bool,
+    class_name: &str,
+    properties: &Map<String, Value>,
+) -> Option<ProjectScriptFileNames> {
+    let naming = config::cached_script_naming(parent_dir);
+    let policy = naming.extension;
+    let suffix = project_script_suffix(naming, class_name, properties)?;
+    let extensions: &[&str] = match policy {
+        config::ScriptExtensionPolicy::Lua => &["lua"],
+        config::ScriptExtensionPolicy::Luau => &["luau"],
+        config::ScriptExtensionPolicy::Preserve => &["luau", "lua"],
     };
-    Some((
-        format!("init{suffix}.{extension}"),
-        format!("{suffix}.{extension}"),
+    if !has_children {
+        for extension in extensions {
+            if layout_dir
+                .join(format!("{fs_stem}{suffix}.{extension}"))
+                .is_file()
+            {
+                return Some(ProjectScriptFileNames::new(&suffix, extension, false));
+            }
+        }
+    }
+    let script_dir = layout_dir.join(fs_stem);
+    if script_dir.is_dir() {
+        for extension in extensions {
+            if script_dir
+                .join(format!("init{suffix}.{extension}"))
+                .is_file()
+            {
+                return Some(ProjectScriptFileNames::new(&suffix, extension, true));
+            }
+        }
+    }
+    Some(ProjectScriptFileNames::new(
+        &suffix,
+        default_script_extension(policy),
+        has_children,
     ))
 }
 
@@ -194,10 +278,10 @@ pub(crate) fn editor_source_target_with_cache(
                         .map_or(&[], Vec::as_slice),
                 )
                 .into_iter()
-                .map(|(index, stem, ordinal)| (stem, (index, ordinal)))
+                .map(|(index, stem, ordinal)| (normalized_child_stem_key(&stem), (index, ordinal)))
                 .collect()
             })
-            .get(component)
+            .get(&normalized_child_stem_key(component))
             .copied()?;
         parent_index = index;
         path_segments.push(document.instances[index].name.clone());
@@ -214,10 +298,10 @@ pub(crate) fn editor_source_target_with_cache(
                     .map_or(&[], Vec::as_slice),
             )
             .into_iter()
-            .map(|(index, stem, ordinal)| (stem, (index, ordinal)))
+            .map(|(index, stem, ordinal)| (normalized_child_stem_key(&stem), (index, ordinal)))
             .collect()
         })
-        .get(&spec.instance_stem)
+        .get(&normalized_child_stem_key(&spec.instance_stem))
         .copied()?;
     let instance = &document.instances[index];
     if instance.class_name != spec.class_name || !is_lua_source_class(&instance.class_name) {
@@ -294,6 +378,50 @@ pub(crate) fn merge_editor_source_files_into_document(
     service: &str,
     service_dir: &Path,
 ) -> Result<(bool, HashMap<String, PathBuf>)> {
+    let link_enforcement = service_dir
+        .parent()
+        .map(packed_link_enforcement)
+        .transpose()?
+        .flatten();
+    merge_editor_source_files_into_document_with(
+        document,
+        service,
+        service_dir,
+        link_enforcement.as_ref(),
+    )
+}
+
+/// The link enforcement of the project above `src_root`, built once for
+/// every document an operation merges: None without a project or an active
+/// manifest at its root; a package that cannot be read or resolved is an
+/// error, never "nothing is packed", so a fileless packed script is not
+/// demoted to a Folder. The lookup stops at the nearest project root, so a
+/// manifest of an enclosing folder never applies to a project inside it.
+pub(crate) fn packed_link_enforcement(src_root: &Path) -> Result<Option<LinkEnforcement>> {
+    let Some(project_root) = src_root
+        .ancestors()
+        .find(|ancestor| ancestor.join("renium.project.jsonc").is_file())
+        .filter(|project_root| project_root.join("renium-link.json").is_file())
+    else {
+        return Ok(None);
+    };
+    let enforcement =
+        crate::project::package_links::build_link_enforcement(project_root, src_root, None)
+            .with_context(|| {
+                format!(
+                    "Could not place the packed link scripts of {}",
+                    project_root.display()
+                )
+            })?;
+    Ok(enforcement.is_active().then_some(enforcement))
+}
+
+pub(crate) fn merge_editor_source_files_into_document_with(
+    document: &mut SettingsBytecode,
+    service: &str,
+    service_dir: &Path,
+    link_enforcement: Option<&LinkEnforcement>,
+) -> Result<(bool, HashMap<String, PathBuf>)> {
     let source_paths = build_editor_source_path_map(document, service, service_dir);
     let mut files = WalkDir::new(service_dir)
         .into_iter()
@@ -333,18 +461,61 @@ pub(crate) fn merge_editor_source_files_into_document(
         }
     }
 
-    for instance in &mut document.instances {
-        if !is_lua_source_class(&instance.class_name)
-            || actual_source_paths.contains_key(&instance.settings_id)
-        {
+    let fileless = document
+        .instances
+        .iter()
+        .enumerate()
+        .filter(|(_, instance)| {
+            is_lua_source_class(&instance.class_name)
+                && !actual_source_paths.contains_key(&instance.settings_id)
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let packed = packed_link_scripts(document, service, link_enforcement, &fileless);
+    for index in fileless {
+        if packed.contains(&index) {
             continue;
         }
+        let instance = &mut document.instances[index];
         instance.class_name = "Folder".to_string();
         instance.properties.remove("Source");
         instance.properties.remove("RunContext");
         changed = true;
     }
     Ok((changed, actual_source_paths))
+}
+
+/// Scripts inside a read-only link package keep their text in the store
+/// (`rbx lkp` inlines it and removes the file), so a missing file is not a
+/// deletion for them.
+fn packed_link_scripts(
+    document: &SettingsBytecode,
+    service: &str,
+    link_enforcement: Option<&LinkEnforcement>,
+    candidates: &[usize],
+) -> HashSet<usize> {
+    let Some(enforcement) = link_enforcement.filter(|_| !candidates.is_empty()) else {
+        return HashSet::new();
+    };
+    let paths = build_editor_instance_paths(document, service);
+    candidates
+        .iter()
+        .copied()
+        .filter(|index| {
+            paths
+                .get(*index)
+                .and_then(Option::as_ref)
+                .is_some_and(|path| {
+                    enforcement
+                        .read_only_package_for_path(
+                            service,
+                            &path.path_segments,
+                            &path.path_ordinals,
+                        )
+                        .is_some()
+                })
+        })
+        .collect()
 }
 
 pub(crate) fn build_editor_source_paths_by_index(

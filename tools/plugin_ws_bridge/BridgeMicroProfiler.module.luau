@@ -10,9 +10,18 @@ function BridgeMicroProfiler.create(getService, finishFrame)
 		local service = getService()
 		local response = buffer.create(4096)
 		local size = service:ProcessCommand(response, 0, 0, response, 0, 4096)
-		assert(size == 20 and buffer.readu32(response, 0) == 65536
-			and buffer.readu32(response, 4) == 65536 and buffer.readu32(response, 8) == 65536
-			and buffer.readu32(response, 12) == 65536, "MicroProfiler control protocol changed; update Renium")
+		-- The four words carry the LibMP major.minor versions; Studio bumps the
+		-- minor (0x00010000 became 0x00010001) without changing the commands.
+		local function major1(offset)
+			return bit32.rshift(buffer.readu32(response, offset), 16) == 1
+		end
+		if not (size == 20 and major1(0) and major1(4) and major1(8) and major1(12)) then
+			local words = {}
+			for offset = 0, math.min(math.max(size, 0), 32) - 4, 4 do
+				words[#words + 1] = string.format("0x%08x", buffer.readu32(response, offset))
+			end
+			error(`MicroProfiler control protocol changed; update Renium (the probe answered {size} bytes: {table.concat(words, " ")})`, 0)
+		end
 		serial = (serial + 1) % 4294967296
 		local width = if command == 40 then 4 else 1
 		local request = buffer.create(32 + width)

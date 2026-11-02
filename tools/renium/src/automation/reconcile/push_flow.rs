@@ -1,5 +1,84 @@
 use super::*;
 
+/// Hands the previous push's native attribute observer over to the fresh
+/// lease: the old one stops only once the proof check inside the lease has
+/// passed, and the new relay starts from the path the state names.
+#[cfg(windows)]
+fn arm_native_attribute_relay(
+    state: &Value,
+    bridge: &BridgeServer,
+    services: &[String],
+    previous: &mut Option<crate::studio::native::serializer::AttributeGuard>,
+    current: &mut Option<crate::studio::native::serializer::AttributeGuard>,
+) -> Result<()> {
+    if state["nativeRelayContinued"] == true {
+        return Ok(());
+    }
+    drop(previous.take());
+    let Some(path) = state
+        .get("nativeAttributeRelay")
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(());
+    };
+    let path = serde_json::from_value::<Vec<String>>(path.clone())?;
+    let pid = crate::editor::review::studio_pid_for_bridge(bridge)?;
+    let title = crate::editor::review::studio_title_for_bridge(bridge, pid)?;
+    match crate::studio::native::serializer::begin_attribute_relay(
+        pid,
+        &title,
+        services,
+        Duration::from_secs(120),
+        &path,
+    ) {
+        Ok(observation) => *current = Some(observation),
+        Err(error) => log_global(
+            5,
+            format_args!("[renium] native attribute relay unavailable: {error:#}"),
+        ),
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+enum VerifiedFullPushReuse {
+    Unchanged(Map<String, Value>),
+    Continue(Option<VerifiedFullPushCandidate>),
+}
+
+/// A full push whose files match the last verified one answers "unchanged"
+/// when Studio still carries that push's proof; otherwise the candidate is
+/// handed on so the new push can continue its native observers.
+#[cfg(any(windows, target_os = "macos"))]
+fn reuse_verified_full_push(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+    services: &[String],
+    push_args: &PushEditorChangesArgs,
+    eligible: bool,
+) -> Result<VerifiedFullPushReuse> {
+    let mut candidate = if eligible {
+        take_verified_full_push(context, bridge, services, push_args)?
+    } else {
+        None
+    };
+    if let Some(candidate) = candidate.take_if(|candidate| candidate.files_unchanged)
+        && verified_full_push_proof_matches(context, bridge, &candidate.cached.proof)?
+    {
+        if let Some(runtime) = context.runtime_id.as_deref() {
+            bridge
+                .verified_full_pushes
+                .lock_recover()
+                .insert(runtime.to_string(), candidate.cached);
+        }
+        return Ok(VerifiedFullPushReuse::Unchanged(Map::from_iter([
+            ("ok".into(), json!(true)),
+            ("unchanged".into(), json!(true)),
+        ])));
+    }
+    Ok(VerifiedFullPushReuse::Continue(candidate))
+}
+
 pub(crate) fn push_project(
     context: &BoundContext,
     bridge: &BridgeServer,
@@ -9,26 +88,18 @@ pub(crate) fn push_project(
     replace: bool,
 ) -> Result<Map<String, Value>> {
     #[cfg(any(windows, target_os = "macos"))]
-    let mut verified_candidate = if replace && guard.is_none() {
-        take_verified_full_push(context, bridge, services, &push_args)?
-    } else {
-        None
-    };
-    #[cfg(any(windows, target_os = "macos"))]
-    if let Some(candidate) = verified_candidate.take_if(|candidate| candidate.files_unchanged)
-        && verified_full_push_proof_matches(context, bridge, &candidate.cached.proof)?
-    {
-        if let Some(runtime) = context.runtime_id.as_deref() {
-            bridge
-                .verified_full_pushes
-                .lock_recover()
-                .insert(runtime.to_string(), candidate.cached);
+    let verified_candidate = {
+        match reuse_verified_full_push(
+            context,
+            bridge,
+            services,
+            &push_args,
+            replace && guard.is_none(),
+        )? {
+            VerifiedFullPushReuse::Unchanged(result) => return Ok(result),
+            VerifiedFullPushReuse::Continue(candidate) => candidate,
         }
-        return Ok(Map::from_iter([
-            ("ok".into(), json!(true)),
-            ("unchanged".into(), json!(true)),
-        ]));
-    }
+    };
     #[cfg(any(windows, target_os = "macos"))]
     let cache_input = if replace && guard.is_none() {
         Some(full_push_cache_input(&push_args, services)?)
@@ -74,33 +145,13 @@ pub(crate) fn push_project(
             candidate_proof.as_ref(),
             |state| {
                 #[cfg(windows)]
-                if state["nativeRelayContinued"] == true {
-                    return Ok(());
-                }
-                #[cfg(windows)]
-                drop(previous_attributes.take());
-                #[cfg(windows)]
-                if let Some(path) = state
-                    .get("nativeAttributeRelay")
-                    .filter(|value| !value.is_null())
-                {
-                    let path = serde_json::from_value::<Vec<String>>(path.clone())?;
-                    let pid = crate::editor::review::studio_pid_for_bridge(bridge)?;
-                    let title = crate::editor::review::studio_title_for_bridge(bridge, pid)?;
-                    match crate::studio::native::serializer::begin_attribute_relay(
-                        pid,
-                        &title,
-                        services,
-                        Duration::from_secs(120),
-                        &path,
-                    ) {
-                        Ok(observation) => _native_attributes = Some(observation),
-                        Err(error) => log_global(
-                            5,
-                            format_args!("[renium] native attribute relay unavailable: {error:#}"),
-                        ),
-                    }
-                }
+                arm_native_attribute_relay(
+                    state,
+                    bridge,
+                    services,
+                    &mut previous_attributes,
+                    &mut _native_attributes,
+                )?;
                 #[cfg(not(windows))]
                 let _ = state;
                 Ok(())
@@ -182,8 +233,20 @@ pub(crate) fn push_project(
             project.join().expect("Source capture worker panicked"),
         )
     });
-    let (stage, studio) = captured?;
+    let (stage, mut studio) = captured?;
     let project = project?;
+    let link_enforcement = super::staging::packing_link_enforcement(
+        Path::new(&context.root),
+        Path::new(&context.source),
+    )?;
+    if let Some(enforcement) = &link_enforcement {
+        super::staging::pack_read_only_link_scripts_with(
+            enforcement,
+            Path::new(&context.root),
+            &project,
+            &mut studio,
+        )?;
+    }
     log_reconcile_timing("full push capture", phase);
     let phase = Instant::now();
     let mut prepared_settings = HashMap::new();
@@ -252,6 +315,21 @@ pub(crate) fn push_project(
         },
         phase,
     );
+    if crate::app::output::global_log_enabled(5) {
+        let mut listed = differences
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>();
+        listed.sort();
+        log_global(
+            5,
+            format_args!(
+                "[renium] full push differences ({}): {}",
+                listed.len(),
+                listed.join(", ")
+            ),
+        );
+    }
     for path in &differences {
         if let Some(change) = prepared_settings.get(path) {
             super::verify::note_saved_field_differences(
@@ -293,6 +371,25 @@ pub(crate) fn push_project(
         &mut plan,
     )?;
     log_reconcile_timing("full push plan", phase);
+    if crate::app::output::global_log_enabled(5) {
+        log_global(
+            5,
+            format_args!(
+                "[renium] full push plan: paths=[{}] targets=[{}] native=[{}]",
+                plan.changed_paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                plan.target_settings_ids.join(", "),
+                plan.initial_native_services
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
+    }
     if plan.is_empty() {
         tracking_release.proof = capture_push_proof(bridge, &guard)?;
         acknowledge_verified_push(bridge, services, &guard, &mut tracking_release)?;
@@ -448,7 +545,7 @@ pub(crate) fn push_project(
     } else {
         ExportProjectStage::create_for_comparison(&root, &src_dir, &verification_services)?
     };
-    let readback = if !requires_stage
+    let mut readback = if !requires_stage
         && readback_stage
             .loaded
             .as_ref()
@@ -465,6 +562,14 @@ pub(crate) fn push_project(
         )?
         .1
     };
+    if let Some(enforcement) = &link_enforcement {
+        super::staging::pack_read_only_link_scripts_with(
+            enforcement,
+            Path::new(&context.root),
+            &current,
+            &mut readback,
+        )?;
+    }
     log_reconcile_timing("full push readback", phase);
     let phase = Instant::now();
     // These documents were already aligned to the exact requested file bytes.
@@ -611,6 +716,7 @@ pub(crate) fn import_studio_services_into_stage(
     let mut args = automation_pull_args(context, &json!({ "services": services }))?;
     args.project_root.clone_from(&stage.import_project_root);
     args.src_dir.clone_from(&stage.import_src_dir);
+    args.layout_src_root = stage.layout_src_root(Path::new(&context.root));
     let info = bridge.cached_bridge_info_for_target(BridgeTarget::Main)?;
     export_snapshots_with_warm_bridge(
         args,
@@ -637,8 +743,9 @@ pub(crate) fn capture_studio_services_in_memory(
     args.src_dir.clone_from(&stage.import_src_dir);
     let info = bridge.cached_bridge_info_for_target(BridgeTarget::Main)?;
     let src_root = stage.import_project_root.join(&stage.import_src_dir);
+    let layout_src_root = stage.layout_src_root(Path::new(&context.root));
     let projections = capture_exported_services(&args, bridge, &info, |service, state| {
-        service_projection_in_memory(&state, &src_root, service)
+        service_projection_in_memory(&state, &src_root, layout_src_root.as_deref(), service)
     })?;
     let mut entries = BTreeMap::new();
     for projection in projections {

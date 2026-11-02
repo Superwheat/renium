@@ -17,7 +17,7 @@ pub(crate) fn fixture() -> BridgeServer {
         next_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         preferred_index: Default::default(),
         request_gate: Mutex::new(()),
-        runtime_gates: Mutex::new(HashSet::new()),
+        runtime_gates: Mutex::new(HashMap::new()),
         active_request_leases: Mutex::new(HashMap::new()),
         runtime_pins: Mutex::new(HashMap::new()),
         routing: Default::default(),
@@ -929,6 +929,36 @@ pub(crate) fn edit_info(runtime: &str, place: i64) -> BridgeInfoPayload {
         protocol_version: "compact-v5".into(),
         codec_version: "compact-v5-schema-9".into(),
         ..Default::default()
+    }
+}
+
+/// A play runtime the Edit window `owner` launched.
+pub(crate) fn play_info(
+    runtime: &str,
+    owner: &str,
+    role: &str,
+    player: &str,
+    place: i64,
+) -> BridgeInfoPayload {
+    let mut info = edit_info(runtime, place);
+    info.bridge_role = role.into();
+    info.launch_edit_runtime_id = owner.into();
+    info.launch_nonce = format!("launch-{owner}");
+    info.player_name = player.into();
+    info
+}
+
+/// Marks `runtime_id` as the window focused last.
+pub(crate) fn focus(bridge: &BridgeServer, runtime_id: &str) {
+    let now = Instant::now() + Duration::from_secs(60);
+    for channel in &bridge.channels {
+        let mut sockets = channel.sockets.lock().unwrap();
+        for socket in sockets.values_mut() {
+            if socket.bridge_info.runtime_id == runtime_id {
+                socket.last_focused_at = now;
+            }
+        }
+        BridgeServer::refresh_channel_snapshots(channel, &sockets);
     }
 }
 
@@ -2067,4 +2097,443 @@ fn failed_package_notice_patch_still_admits_the_connection() {
     let _peer = handshake(&bridge, 0, &edit_info("unpatched", 1)).unwrap();
     assert_eq!(bridge.channels[0].sockets.lock().unwrap().len(), 1);
     bridge.alive.store(false, Ordering::Relaxed);
+}
+
+#[test]
+fn request_gates_resolve_play_runtimes_by_their_launching_edit_window() {
+    let bridge = fixture();
+    let play = |runtime: &str, owner: &str, role: &str, player: &str, place: i64| {
+        let mut info = edit_info(runtime, place);
+        info.bridge_role = role.into();
+        info.launch_edit_runtime_id = owner.into();
+        info.launch_nonce = format!("launch-{owner}");
+        info.player_name = player.into();
+        info
+    };
+    let _edit_a = connect(&bridge, 0, edit_info("edit-a", 20));
+    let _edit_b = connect(&bridge, 1, edit_info("edit-b", 30));
+    let _server_a = connect(
+        &bridge,
+        0,
+        play("server-a", "edit-a", BRIDGE_ROLE_PLAY_SERVER, "", 20),
+    );
+    let _server_b = connect(
+        &bridge,
+        1,
+        play("server-b", "edit-b", BRIDGE_ROLE_PLAY_SERVER, "", 30),
+    );
+    let _player_two = connect(
+        &bridge,
+        0,
+        play(
+            "client-a2",
+            "edit-a",
+            BRIDGE_ROLE_PLAY_CLIENT,
+            "Player2",
+            20,
+        ),
+    );
+    let _player_one = connect(
+        &bridge,
+        1,
+        play(
+            "client-a1",
+            "edit-a",
+            BRIDGE_ROLE_PLAY_CLIENT,
+            "Player1",
+            20,
+        ),
+    );
+    let _player_b = connect(
+        &bridge,
+        0,
+        play(
+            "client-b1",
+            "edit-b",
+            BRIDGE_ROLE_PLAY_CLIENT,
+            "Player1",
+            30,
+        ),
+    );
+
+    let resolve = |target, player: Option<&str>, owner| {
+        bridge.play_runtime_for_request(target, player, owner)
+    };
+    assert_eq!(
+        resolve(BridgeTarget::Server, None, "edit-a").as_deref(),
+        Some("server-a")
+    );
+    assert_eq!(
+        resolve(BridgeTarget::Server, None, "edit-b").as_deref(),
+        Some("server-b")
+    );
+    assert_eq!(
+        resolve(BridgeTarget::Main, None, "edit-a").as_deref(),
+        Some("server-a")
+    );
+    assert_eq!(
+        resolve(BridgeTarget::Client, Some("1"), "edit-a").as_deref(),
+        Some("client-a1")
+    );
+    assert_eq!(
+        resolve(BridgeTarget::Client, Some("2"), "edit-a").as_deref(),
+        Some("client-a2")
+    );
+    assert_eq!(
+        resolve(BridgeTarget::Client, Some("Player1"), "edit-b").as_deref(),
+        Some("client-b1")
+    );
+    assert_eq!(
+        resolve(BridgeTarget::Client, Some("1"), "edit-b").as_deref(),
+        Some("client-b1")
+    );
+    assert_eq!(resolve(BridgeTarget::Client, Some("3"), "edit-a"), None);
+    assert_eq!(
+        resolve(BridgeTarget::Client, None, "edit-b").as_deref(),
+        Some("client-b1")
+    );
+    focus(&bridge, "client-a2");
+    assert_eq!(
+        resolve(BridgeTarget::Client, None, "edit-a").as_deref(),
+        Some("client-a2"),
+        "a bare client selector takes the client focused last, as the dispatch does"
+    );
+    focus(&bridge, "client-a1");
+    assert_eq!(
+        resolve(BridgeTarget::Client, None, "edit-a").as_deref(),
+        Some("client-a1")
+    );
+    assert_eq!(resolve(BridgeTarget::Server, None, "edit-c"), None);
+    assert_eq!(resolve(BridgeTarget::Main, None, "edit-c"), None);
+
+    bridge.retire_runtime("server-a");
+    assert_eq!(resolve(BridgeTarget::Server, None, "edit-a"), None);
+}
+
+#[test]
+fn a_request_bound_play_runtime_is_what_its_selector_addresses() {
+    let bridge = fixture();
+    let _edit = connect(&bridge, 0, edit_info("edit-a", 20));
+    let _one = connect(
+        &bridge,
+        0,
+        play_info(
+            "client-a1",
+            "edit-a",
+            BRIDGE_ROLE_PLAY_CLIENT,
+            "Player1",
+            20,
+        ),
+    );
+    let _two = connect(
+        &bridge,
+        0,
+        play_info(
+            "client-a2",
+            "edit-a",
+            BRIDGE_ROLE_PLAY_CLIENT,
+            "Player2",
+            20,
+        ),
+    );
+    focus(&bridge, "client-a1");
+    {
+        let _bound = bind_request_play_runtime(BridgeTarget::Client, None, "client-a2");
+        assert_eq!(
+            bridge
+                .runtime_pin_for_selector(BridgeTarget::Client, None)
+                .unwrap()
+                .runtime_id,
+            "client-a2"
+        );
+        assert_eq!(
+            bridge
+                .runtime_pin_for_selector(BridgeTarget::Client, Some("1"))
+                .unwrap()
+                .runtime_id,
+            "client-a1",
+            "another selector of the same request is unaffected"
+        );
+    }
+    assert_eq!(
+        bridge
+            .runtime_pin_for_selector(BridgeTarget::Client, None)
+            .unwrap()
+            .runtime_id,
+        "client-a1",
+        "the binding ends with the request"
+    );
+}
+
+/// A plugin that answers `executeLuau` after `delay` and everything else at once.
+fn respond_to_luau_after(
+    mut peer: WebSocket<TcpStream>,
+    delay: Duration,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        while let Ok(message) = peer.read() {
+            if let Message::Text(text) = message {
+                let request: Value = serde_json::from_str(&text).unwrap();
+                if request["method"] == "executeLuau" {
+                    thread::sleep(delay);
+                }
+                let answer = json!({
+                    "id": request["id"], "ok": true, "result": {"ok": true, "results": [1]}
+                });
+                if peer.send(Message::Text(answer.to_string().into())).is_err() {
+                    break;
+                }
+            }
+        }
+    })
+}
+
+#[test]
+fn edit_requests_of_different_studios_run_at_the_same_time() {
+    use crate::automation::authorization::signed_fixture_request;
+    use crate::automation::{State, op, runtime::automation_parse_response_with_lease};
+    use crate::tests::support::temp_dir;
+    let root = temp_dir("edit-gates");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("renium.project.jsonc"),
+        r#"{"schemaVersion":1,"sourceRoot":"src","tree":{}}"#,
+    )
+    .unwrap();
+    let bridge = Arc::new(listening_fixture());
+    let state = State::default();
+    let mut responders = Vec::new();
+    let mut contexts = Vec::new();
+    for (place, runtime, delay) in [
+        (1, "edit-a", Duration::from_secs(7)),
+        (2, "edit-b", Duration::ZERO),
+    ] {
+        for port in 0..2 {
+            responders.push(respond_to_luau_after(
+                handshake(&bridge, port, &edit_info(runtime, place)).unwrap(),
+                delay,
+            ));
+        }
+        let response = automation_parse_response_with_lease(
+            &signed_fixture_request(
+                &state,
+                json!({
+                    "v": 1, "id": place, "op": op::BIND,
+                    "p": {"root": root, "place": format!("10:{place}")}
+                }),
+            ),
+            &state,
+            &bridge,
+            0.1,
+            None,
+        );
+        assert_eq!(
+            response.ok,
+            1,
+            "{}",
+            serde_json::to_string(&response).unwrap()
+        );
+        contexts.push(response.r.unwrap()["id"].as_u64().unwrap());
+    }
+    let luau = |id: u64, context: u64| {
+        automation_parse_response_with_lease(
+            &signed_fixture_request(
+                &state,
+                json!({
+                    "v": 1, "id": id, "op": op::LUAU, "cx": context,
+                    "p": {"code": "return 1", "edit": true}
+                }),
+            ),
+            &state,
+            &bridge,
+            0.1,
+            None,
+        )
+    };
+    thread::scope(|scope| {
+        let long = scope.spawn(|| luau(10, contexts[0]));
+        thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            bridge.runtime_gate_holder("edit-a").map(|(name, _)| name),
+            Some("luau"),
+            "the long request holds its own Studio's gate"
+        );
+        assert!(
+            bridge.try_acquire_request_gate().is_some(),
+            "and leaves the process-wide gate free"
+        );
+        let started = Instant::now();
+        let other = luau(11, contexts[1]);
+        assert_eq!(other.ok, 1, "{}", serde_json::to_string(&other).unwrap());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the other Studio's request waited {:?} behind the long one",
+            started.elapsed()
+        );
+        let started = Instant::now();
+        let same = luau(12, contexts[0]);
+        let error = same
+            .e
+            .expect("a second request to the held Studio answers busy");
+        assert_eq!(error.c, "busy", "{}", error.m);
+        assert!(
+            error.m.starts_with("Studio is busy: `luau` has run for")
+                && error.m.contains("`rbx l` waited 5s for it"),
+            "{}",
+            error.m
+        );
+        assert!(
+            (4.5..9.0).contains(&started.elapsed().as_secs_f64()),
+            "busy answer took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(long.join().unwrap().ok, 1);
+    });
+    assert!(bridge.runtime_gate_holders().is_empty());
+    drop(bridge);
+    for responder in responders {
+        responder.join().unwrap();
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_request_without_a_studio_queues_on_the_process_wide_gate() {
+    use crate::automation::authorization::signed_fixture_request;
+    use crate::automation::{State, op, runtime::automation_parse_response_with_lease};
+    use crate::tests::support::temp_dir;
+    let root = temp_dir("fallback-gate");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("renium.project.jsonc"),
+        r#"{"schemaVersion":1,"sourceRoot":"src","tree":{}}"#,
+    )
+    .unwrap();
+    let bridge = Arc::new(fixture());
+    let state = State::default();
+    let bound = automation_parse_response_with_lease(
+        &signed_fixture_request(
+            &state,
+            json!({"v": 1, "id": 1, "op": op::BIND, "p": {"root": root, "place": "10:9"}}),
+        ),
+        &state,
+        &bridge,
+        0.1,
+        None,
+    );
+    assert_eq!(bound.ok, 1, "{}", serde_json::to_string(&bound).unwrap());
+    let context = bound.r.unwrap()["id"].as_u64().unwrap();
+    let gate = bridge.acquire_request_gate();
+    thread::scope(|scope| {
+        let queued = scope.spawn(|| {
+            let started = Instant::now();
+            let response = automation_parse_response_with_lease(
+                &signed_fixture_request(
+                    &state,
+                    json!({
+                        "v": 1, "id": 2, "op": op::REVIEW_APPLY, "cx": context,
+                        "p": {"reviewId": "nope"}
+                    }),
+                ),
+                &state,
+                &bridge,
+                0.1,
+                None,
+            );
+            (started.elapsed(), response)
+        });
+        thread::sleep(Duration::from_millis(600));
+        drop(gate);
+        let (elapsed, response) = queued.join().unwrap();
+        assert!(
+            elapsed >= Duration::from_millis(600),
+            "the request ran after {elapsed:?} while the gate was held"
+        );
+        assert_eq!(response.ok, 0);
+    });
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn live_sync_takes_its_own_studios_edit_gate_beside_another_studios_request() {
+    let bridge = fixture();
+    let other = bridge.try_acquire_runtime_gate("edit-b", "luau").unwrap();
+    let sync = bridge
+        .try_acquire_edit_gate(Some("edit-a"), "live-sync")
+        .expect("a request bound to another Studio does not hold up Live Sync");
+    assert!(
+        bridge
+            .try_acquire_edit_gate(Some("edit-a"), "live-sync")
+            .is_none()
+    );
+    assert!(bridge.try_acquire_runtime_gate("edit-a", "luau").is_none());
+    assert_eq!(
+        bridge.runtime_gate_holder("edit-a").map(|(name, _)| name),
+        Some("live-sync")
+    );
+    drop(sync);
+    assert!(
+        bridge
+            .try_acquire_edit_gate(Some("edit-b"), "push")
+            .is_none()
+    );
+    assert!(
+        bridge.try_acquire_request_gate().is_some(),
+        "a refused Edit gate leaves the process-wide gate free"
+    );
+    drop(other);
+    let heavy = bridge.acquire_edit_gate(Some("edit-b"), "push");
+    assert!(
+        bridge
+            .try_acquire_edit_gate(Some("edit-a"), "live-sync")
+            .is_none(),
+        "a request holding the process-wide gate holds up every Live Sync pass"
+    );
+    assert!(
+        bridge.try_acquire_runtime_gate("edit-a", "luau").is_some(),
+        "but not a request bound to another Studio"
+    );
+    assert_eq!(
+        bridge
+            .runtime_gate_holders()
+            .iter()
+            .map(|(runtime, name, _)| (runtime.as_str(), *name))
+            .collect::<Vec<_>>(),
+        [("edit-b", "push")]
+    );
+    drop(heavy);
+    assert!(bridge.runtime_gate_holders().is_empty());
+}
+
+#[test]
+fn a_request_bound_edit_runtime_is_what_its_edit_calls_address() {
+    let bridge = fixture();
+    let _a = connect(&bridge, 0, edit_info("edit-a", 20));
+    let _b = connect(&bridge, 0, edit_info("edit-b", 30));
+    bridge.pin_runtime(BridgeTarget::Edit, "edit-b");
+    {
+        let _bound = bind_request_edit_runtime("edit-a");
+        assert_eq!(
+            bridge
+                .runtime_pin_for_selector(BridgeTarget::Edit, None)
+                .unwrap()
+                .runtime_id,
+            "edit-a"
+        );
+        assert_eq!(
+            bridge
+                .cached_bridge_info_for_target(BridgeTarget::Edit)
+                .unwrap()
+                .runtime_id,
+            "edit-a"
+        );
+    }
+    assert_eq!(
+        bridge
+            .runtime_pin_for_selector(BridgeTarget::Edit, None)
+            .unwrap()
+            .runtime_id,
+        "edit-b",
+        "the binding ends with the request"
+    );
 }

@@ -2,6 +2,27 @@ use super::*;
 
 /// A failed push can leave the pair record holding its conflicts; the next
 /// write names the ways out instead of stopping at the state.
+/// A recorded conflict names its project path first (`src/A.luau changed on
+/// both sides`, `instances/X.renium: path: detail`); a push of that path, or
+/// of a directory above it, resolves it.
+fn conflict_covered_by_paths(conflict: &str, paths: &[PathBuf]) -> bool {
+    let text = conflict.replace('\\', "/");
+    let text = text
+        .strip_prefix("push: ")
+        .or_else(|| text.strip_prefix("pull: "))
+        .unwrap_or(&text);
+    paths.iter().any(|path| {
+        let path = path.to_string_lossy().replace('\\', "/");
+        let path = path.trim_end_matches('/');
+        !path.is_empty()
+            && text.starts_with(path)
+            && text[path.len()..]
+                .chars()
+                .next()
+                .is_none_or(|next| matches!(next, ' ' | ':' | '/'))
+    })
+}
+
 const UNRESOLVED_CHANGES: &str = "Reconciliation state has unresolved changes. `rbx lst --details` lists them; `rbx lon --prefer studio|editor` resolves them and also pushes the other side's one-sided edits; `rbx lof` then a scoped push (`-p`/`-f` with `-u`) leaves the rest of Studio untouched";
 
 #[derive(Default)]
@@ -33,6 +54,75 @@ pub(crate) struct PairSetup {
 pub(crate) struct Coordinator {
     pub(crate) pairs: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     pub(crate) owners: Mutex<TargetOwners>,
+}
+
+/// Captures both sides for a comparison: only the services Studio changed
+/// since the stored checkpoint when the baseline allows it, else the whole
+/// project, with packed link scripts folded into Studio's side.
+struct ReconcileCapture {
+    stage: ExportProjectStage,
+    studio: ProjectSnapshot,
+    editor: ProjectSnapshot,
+    loaded_baseline: Option<ProjectSnapshot>,
+    link_enforcement: Option<crate::project::package_links::LinkEnforcement>,
+    publish_paths: Vec<PathBuf>,
+}
+
+fn capture_for_reconcile(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+    setup: &PairSetup,
+    record: &PairRecord,
+    studio_state: &Value,
+) -> Result<ReconcileCapture> {
+    let phase = Instant::now();
+    let selective_services = match (record.studio_checkpoint.as_ref(), record.baseline.as_ref()) {
+        (Some(checkpoint), Some(_)) => {
+            selective_studio_services(context, checkpoint, studio_state)?
+        }
+        _ => None,
+    };
+    let mut loaded_baseline = None;
+    let selective_capture = if let Some(services) = selective_services {
+        let baseline = record
+            .baseline
+            .as_ref()
+            .context("Reconciliation baseline disappeared")?
+            .load(Path::new(&context.root), &setup.key)?;
+        let captured =
+            capture_changed_studio_services(context, bridge, &services, &baseline, studio_state)?;
+        loaded_baseline = Some(baseline);
+        captured
+    } else {
+        None
+    };
+    let (stage, mut studio, editor) = if let Some(captured) = selective_capture {
+        captured
+    } else {
+        let (stage, studio) = capture_studio_project_for_comparison(context, bridge)?;
+        let editor = capture_snapshot(Path::new(&context.root), stage.publish_paths())?;
+        (stage, studio, editor)
+    };
+    let link_enforcement =
+        packing_link_enforcement(Path::new(&context.root), Path::new(&context.source))?;
+    if let Some(enforcement) = &link_enforcement {
+        pack_read_only_link_scripts_with(
+            enforcement,
+            Path::new(&context.root),
+            &editor,
+            &mut studio,
+        )?;
+    }
+    let publish_paths = stage.publish_paths().to_vec();
+    log_reconcile_timing("capture", phase);
+    Ok(ReconcileCapture {
+        stage,
+        studio,
+        editor,
+        loaded_baseline,
+        link_enforcement,
+        publish_paths,
+    })
 }
 
 impl Coordinator {
@@ -228,14 +318,69 @@ impl Coordinator {
         bridge: &BridgeServer,
         setup: &mut PairSetup,
     ) -> Result<()> {
-        let _gate = bridge.acquire_request_gate();
+        let _gate = bridge.acquire_edit_gate(context.runtime_id.as_deref(), "live-sync");
         self.reconcile_with_gate_held(context, bridge, setup)
     }
 
-    // Lock order everywhere: the bridge request gate first, then the Live Sync
-    // activity, then the pair lock. A request holding the gate may wait for
-    // the sync activity to clear, so a sync must never hold the activity
-    // while it waits for the gate.
+    /// A clean restart whose files match the stored baseline continues the
+    /// pair without a comparison, or pushes the file changes made meanwhile;
+    /// answers whether the setup was finished that way.
+    fn finish_clean_restart(
+        &self,
+        context: &BoundContext,
+        bridge: &BridgeServer,
+        setup: &mut PairSetup,
+        record: &mut PairRecord,
+        studio_guard: &StudioChangeGuard,
+        studio_state: &Value,
+    ) -> Result<bool> {
+        if !setup.requires_reconcile
+            && let (Some(checkpoint), Some(baseline)) =
+                (record.studio_checkpoint.as_ref(), record.baseline.as_ref())
+            && checkpoint.matches_state(context, studio_state)
+        {
+            let phase = Instant::now();
+            let stage = project_comparison_stage(context, &sync_services())?;
+            let editor = capture_snapshot(Path::new(&context.root), stage.publish_paths())?;
+            drop(stage);
+            log_reconcile_timing("clean restart comparison", phase);
+            let differences = if baseline.matches(&editor) {
+                HashSet::new()
+            } else {
+                let previous = baseline.load(Path::new(&context.root), &setup.key)?;
+                snapshot_differences(&previous, &editor)?
+            };
+            let confirmed = read_studio_change_state(context, bridge)?;
+            if checkpoint.matches_state(context, &confirmed) && differences.is_empty() {
+                continue_clean_verify(setup, record);
+                record.note_setup(setup);
+                write_record(context, &setup.key, record)?;
+                setup.resolution_required = false;
+                return Ok(true);
+            }
+            if checkpoint.matches_state(context, &confirmed) && setup.mode.writes() {
+                let mut paths = differences.into_iter().collect::<Vec<_>>();
+                paths.sort();
+                record.note_setup(setup);
+                self.push_editor_changes_locked(
+                    context,
+                    &setup.key,
+                    bridge,
+                    &paths,
+                    Some(studio_guard),
+                    record,
+                )?;
+                setup.resolution_required = false;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    // Lock order everywhere: the bridge request gate first (the process-wide
+    // gate, then this Edit runtime's), then the Live Sync activity, then the
+    // pair lock. A request holding the gate may wait for the sync activity to
+    // clear, so a sync must never hold the activity while it waits for the gate.
     pub(crate) fn reconcile_with_gate_held(
         &self,
         context: &BoundContext,
@@ -278,82 +423,24 @@ impl Coordinator {
                     .is_some_and(|checkpoint| checkpoint.matches_state(context, &studio_state))
             ),
         );
-        if !setup.requires_reconcile
-            && let (Some(checkpoint), Some(baseline)) =
-                (record.studio_checkpoint.as_ref(), record.baseline.as_ref())
-            && checkpoint.matches_state(context, &studio_state)
-        {
-            let phase = Instant::now();
-            let stage = project_comparison_stage(context, &sync_services())?;
-            let editor = capture_snapshot(Path::new(&context.root), stage.publish_paths())?;
-            drop(stage);
-            log_reconcile_timing("clean restart comparison", phase);
-            let differences = if baseline.matches(&editor) {
-                HashSet::new()
-            } else {
-                let previous = baseline.load(Path::new(&context.root), &setup.key)?;
-                snapshot_differences(&previous, &editor)?
-            };
-            let confirmed = read_studio_change_state(context, bridge)?;
-            if checkpoint.matches_state(context, &confirmed) && differences.is_empty() {
-                continue_clean_verify(setup, &mut record);
-                record.note_setup(setup);
-                write_record(context, &setup.key, &record)?;
-                setup.resolution_required = false;
-                return Ok(());
-            }
-            if checkpoint.matches_state(context, &confirmed) && setup.mode.writes() {
-                let mut paths = differences.into_iter().collect::<Vec<_>>();
-                paths.sort();
-                record.note_setup(setup);
-                self.push_editor_changes_locked(
-                    context,
-                    &setup.key,
-                    bridge,
-                    &paths,
-                    Some(&studio_guard),
-                    &mut record,
-                )?;
-                setup.resolution_required = false;
-                return Ok(());
-            }
+        if self.finish_clean_restart(
+            context,
+            bridge,
+            setup,
+            &mut record,
+            &studio_guard,
+            &studio_state,
+        )? {
+            return Ok(());
         }
-        let phase = Instant::now();
-        let selective_services = match (record.studio_checkpoint.as_ref(), record.baseline.as_ref())
-        {
-            (Some(checkpoint), Some(_)) => {
-                selective_studio_services(context, checkpoint, &studio_state)?
-            }
-            _ => None,
-        };
-        let mut loaded_baseline = None;
-        let selective_capture = if let Some(services) = selective_services {
-            let baseline = record
-                .baseline
-                .as_ref()
-                .context("Reconciliation baseline disappeared")?
-                .load(Path::new(&context.root), &setup.key)?;
-            let captured = capture_changed_studio_services(
-                context,
-                bridge,
-                &services,
-                &baseline,
-                &studio_state,
-            )?;
-            loaded_baseline = Some(baseline);
-            captured
-        } else {
-            None
-        };
-        let (stage, studio, editor) = if let Some(captured) = selective_capture {
-            captured
-        } else {
-            let (stage, studio) = capture_studio_project_for_comparison(context, bridge)?;
-            let editor = capture_snapshot(Path::new(&context.root), stage.publish_paths())?;
-            (stage, studio, editor)
-        };
-        let publish_paths = stage.publish_paths().to_vec();
-        log_reconcile_timing("capture", phase);
+        let ReconcileCapture {
+            stage,
+            studio,
+            editor,
+            loaded_baseline,
+            link_enforcement,
+            publish_paths,
+        } = capture_for_reconcile(context, bridge, setup, &record, &studio_state)?;
         let phase = Instant::now();
         let side_differences = snapshot_differences(&editor, &studio)?;
         let sides_match = side_differences.is_empty();
@@ -529,7 +616,7 @@ impl Coordinator {
                     plan: push_plan,
                     prepared_documents: HashMap::new(),
                     guard: Some(&studio_guard),
-                    args: automation_push_args(context, &json!({}), false)?,
+                    args: automation_push_args(context, &json!({ "yes": true }), false)?,
                     expected_project: Some(&editor),
                     later_edits_follow: true,
                 },
@@ -551,8 +638,16 @@ impl Coordinator {
             let phase = Instant::now();
             let (readback_stage, readback) = if changes.editor.is_empty() {
                 let services = services_for_snapshot_paths(context, &changes.studio);
-                let (readback_stage, captured) =
+                let (readback_stage, mut captured) =
                     capture_studio_services(context, bridge, &services, false)?;
+                if let Some(enforcement) = &link_enforcement {
+                    pack_read_only_link_scripts_with(
+                        enforcement,
+                        Path::new(&context.root),
+                        &merged,
+                        &mut captured,
+                    )?;
+                }
                 let mismatches = snapshot_path_differences(&captured, &merged, &changes.studio)?;
                 if !mismatches.is_empty() {
                     let details = snapshot_mismatch_details(&captured, &merged, &mismatches)?;
@@ -575,7 +670,16 @@ impl Coordinator {
                 }
                 (readback_stage, readback)
             } else {
-                capture_studio_project(context, bridge)?
+                let (readback_stage, mut readback) = capture_studio_project(context, bridge)?;
+                if let Some(enforcement) = &link_enforcement {
+                    pack_read_only_link_scripts_with(
+                        enforcement,
+                        Path::new(&context.root),
+                        &merged,
+                        &mut readback,
+                    )?;
+                }
+                (readback_stage, readback)
             };
             log_reconcile_timing("readback capture", phase);
             let phase = Instant::now();
@@ -731,18 +835,20 @@ impl Coordinator {
         if record.mode != PairMode::Reconcile {
             return Ok(());
         }
-        if !record.conflicts.is_empty() {
-            bail!("{UNRESOLVED_CHANGES}");
-        }
-        let baseline = record
-            .baseline
-            .as_mut()
-            .context("Reconciliation baseline is missing")?;
         let paths = paths
             .iter()
             .cloned()
             .chain(studio_overrides.keys().cloned())
             .collect::<Vec<_>>();
+        // The advanced paths now agree on both sides, so their recorded
+        // conflicts are resolved; the others stay for the next `lon`.
+        record
+            .conflicts
+            .retain(|conflict| !conflict_covered_by_paths(conflict, &paths));
+        let baseline = record
+            .baseline
+            .as_mut()
+            .context("Reconciliation baseline is missing")?;
         let scopes = baseline_scopes(context, &paths)?;
         if scopes.is_empty() {
             return Ok(());
@@ -835,9 +941,9 @@ impl Coordinator {
         if record.mode != PairMode::Reconcile {
             return Ok(());
         }
-        if !record.conflicts.is_empty() {
-            bail!("{UNRESOLVED_CHANGES}");
-        }
+        // A scoped push is the documented way to resolve recorded conflicts
+        // toward the files, so they do not block it; the baseline advance
+        // drops the ones the push covered.
         let baseline = record
             .baseline
             .as_ref()
@@ -994,7 +1100,7 @@ impl Coordinator {
                 plan,
                 prepared_documents,
                 guard,
-                args: automation_push_args(context, &json!({}), false)?,
+                args: automation_push_args(context, &json!({ "yes": true }), false)?,
                 expected_project: None,
                 later_edits_follow: false,
             },
@@ -1352,4 +1458,35 @@ fn prepared_studio_settings_changes(
             Ok((path, PreparedEditorSettingsChange { previous, current }))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod conflict_cover_tests {
+    use super::conflict_covered_by_paths;
+    use std::path::PathBuf;
+
+    #[test]
+    fn a_push_of_the_conflicting_path_or_its_directory_covers_the_conflict() {
+        let script = vec![PathBuf::from("src/ServerScriptService/Battle.luau")];
+        let folder = vec![PathBuf::from(r"src\ServerScriptService")];
+        let store = vec![PathBuf::from("instances/ServerStorage.renium")];
+        for conflict in [
+            "src/ServerScriptService/Battle.luau changed on both sides",
+            r"pull: src\ServerScriptService\Battle.luau",
+            "push: src/ServerScriptService/Battle.luau",
+        ] {
+            assert!(conflict_covered_by_paths(conflict, &script), "{conflict}");
+            assert!(conflict_covered_by_paths(conflict, &folder), "{conflict}");
+            assert!(!conflict_covered_by_paths(conflict, &store), "{conflict}");
+        }
+        let store_conflict =
+            r"instances\ServerStorage.renium: ServerStorage/Maps/A: property Value: absent vs 1";
+        assert!(conflict_covered_by_paths(store_conflict, &store));
+        assert!(!conflict_covered_by_paths(store_conflict, &script));
+        assert!(!conflict_covered_by_paths(
+            "src/ServerScriptService/Battle.luau.bak changed on both sides",
+            &script
+        ));
+        assert!(!conflict_covered_by_paths("3 more paths", &script));
+    }
 }

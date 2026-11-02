@@ -61,7 +61,8 @@ pub(super) fn start(
         let result = BufReader::new(stdout).read_line(&mut line).map(|_| line);
         let _ = sender.send(result);
     });
-    match receiver.recv_timeout(std::time::Duration::from_secs(1)) {
+    // The helper is tiny, but a loaded machine can take seconds to start it.
+    match receiver.recv_timeout(std::time::Duration::from_secs(5)) {
         Ok(Ok(line)) if line.trim() == "ready" => Ok(InputShield { child }),
         outcome => {
             let _ = child.kill();

@@ -1,5 +1,5 @@
 //! Capture persistent engine identities on the same DataModel queue used by
-//! protected properties. Debug IDs remain transport keys, never disk identity.
+//! protected properties when its structural locator is available.
 use super::*;
 use rbx_dom_weak::types::UniqueId;
 
@@ -129,11 +129,20 @@ pub(crate) fn capture_identities(
     title: &str,
     services: &[String],
     timeout: Duration,
-) -> Result<HashMap<String, UniqueId>> {
+) -> Result<Option<HashMap<String, UniqueId>>> {
     anyhow::ensure!(
         !services.is_empty() && services.len() <= 64,
         "Native identity capture needs 1–64 services"
     );
+    if super::super::super::optional_native(super::super::super::probes::run(
+        pid,
+        title,
+        NativeOperation::DescriptorBinding,
+    ))?
+    .is_none()
+    {
+        return Ok(None);
+    }
     // Operation 4 validates and retains the current service graph before reading
     // identities. It needs no preceding identity grant (which costs another
     // DataModel queue turn while Studio is busy processing a large insertion).
@@ -185,7 +194,7 @@ pub(crate) fn capture_identities(
     }
     put32(&mut prepared.parameters, 136, input.len() as u32);
     prepared.parameters[680..680 + input.len()].copy_from_slice(&input);
-    decode_identities(&prepared.invoke(4)?[16..])
+    decode_identities(&prepared.invoke(4)?[16..]).map(Some)
 }
 
 fn decode_identities(rows: &[u8]) -> Result<HashMap<String, UniqueId>> {

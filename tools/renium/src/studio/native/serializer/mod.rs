@@ -16,6 +16,54 @@ use std::time::Duration;
 use anyhow::Result;
 use serde::Serialize;
 
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug)]
+pub(crate) struct TaskContextUnavailable;
+
+#[cfg(any(target_os = "macos", test))]
+impl std::fmt::Display for TaskContextUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "macOS DataModel queue context has no verified structural locator; use the plugin path",
+        )
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl std::error::Error for TaskContextUnavailable {}
+
+/// Only a typed locator verdict permits the plugin path. Transport, identity,
+/// decoding and mutation failures must retain their original errors.
+pub(crate) fn optional_native<T>(result: Result<T>) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        #[cfg(any(target_os = "macos", test))]
+        Err(error) if error.is::<TaskContextUnavailable>() => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[test]
+fn plugin_fallback_requires_the_typed_locator_verdict() {
+    assert!(
+        optional_native::<()>(Err(
+            anyhow::Error::new(TaskContextUnavailable).context("descriptor probe")
+        ))
+        .unwrap()
+        .is_none()
+    );
+    assert_eq!(optional_native(Ok(7)).unwrap(), Some(7));
+    for message in [
+        "Studio reflection transport timed out",
+        "Native identity capture context changed",
+        "Native identity capture contains an invalid or duplicate identity",
+        "macOS DataModel queue context has no verified structural locator; use the plugin path",
+    ] {
+        let error = optional_native::<()>(Err(anyhow::anyhow!(message))).unwrap_err();
+        assert_eq!(error.to_string(), message);
+    }
+}
+
 #[test]
 fn terrain_observation_retains_one_subscription_and_validates_model_ownership() {
     let name = if cfg!(windows) {

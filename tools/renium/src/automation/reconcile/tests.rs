@@ -5818,3 +5818,379 @@ fn a_union_whose_geometry_changed_is_removed_and_imported_anew() {
             .contains(&("Workspace".to_string(), "u".to_string()))
     );
 }
+
+#[test]
+fn a_packed_script_with_an_inline_source_is_not_removed_by_a_store_push() {
+    let path = Path::new("src/ReplicatedStorage/__roblox_sync_settings.renium");
+    let root = SettingsBytecodeInstance::new(
+        "editor:0".into(),
+        "ReplicatedStorage".into(),
+        "ReplicatedStorage".into(),
+        None,
+    );
+    let shared =
+        SettingsBytecodeInstance::new("editor:1".into(), "Shared".into(), "Folder".into(), Some(0));
+    let mut util = SettingsBytecodeInstance::new(
+        "editor:2".into(),
+        "Util".into(),
+        "ModuleScript".into(),
+        Some(1),
+    );
+    util.properties
+        .insert("Source".into(), json!("return { version = 1 }"));
+    let desired = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: vec![root.clone(), shared.clone(), util.clone()],
+    };
+    let mut studio_util = util.clone();
+    studio_util.settings_id = "studio:util".into();
+    studio_util.properties.insert(
+        "Source".into(),
+        json!(crate::settings::EXTERNAL_SOURCE_MARKER),
+    );
+    let mut observed = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: vec![root, shared, studio_util],
+    };
+    assert!(crate::settings::equivalence::align_settings_ids_to_reference(&desired, &mut observed));
+    assert_eq!(observed.instances[2].settings_id, "editor:2");
+    let mut plan = ReconcilePushPlan::default();
+    append_aligned_settings_push_plan(path, &desired, &observed, &mut plan).unwrap();
+    assert!(
+        plan.instance_deletes.is_empty(),
+        "deletes: {:?} targets: {:?}",
+        plan.instance_deletes
+            .iter()
+            .flat_map(|change| change.instances.iter().map(|i| i.settings_id.clone()))
+            .collect::<Vec<_>>(),
+        plan.target_settings_ids
+    );
+}
+
+#[test]
+fn a_store_missing_from_the_files_is_a_conflict_not_a_deletion() {
+    let store = PathBuf::from("instances/Workspace.renium");
+    let mut document = twin_document();
+    twin_add(&mut document, 0, "Thing", "Folder", json!({}));
+    let studio = workspace_store_snapshot(document);
+    let baseline = studio.clone();
+    let editor = ProjectSnapshot::default();
+    for preference in [ConflictPreference::None, ConflictPreference::Editor] {
+        let (merged, conflicts) =
+            merge_snapshots(Some(&baseline), &editor, &studio, preference).unwrap();
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+        assert!(
+            conflicts[0].contains("instances/Workspace.renium is missing")
+                && conflicts[0].contains("`rbx pl`")
+                && conflicts[0].contains("`rbx ps instances/Workspace.renium -u`"),
+            "{}",
+            conflicts[0]
+        );
+        assert!(merged.entries.get(&store) == studio.entries.get(&store));
+    }
+    let (merged, conflicts) = merge_snapshots(
+        Some(&baseline),
+        &editor,
+        &studio,
+        ConflictPreference::Studio,
+    )
+    .unwrap();
+    assert!(conflicts.is_empty(), "{conflicts:?}");
+    assert!(merged.entries.get(&store) == studio.entries.get(&store));
+    let (merged, conflicts) =
+        merge_snapshots(None, &editor, &studio, ConflictPreference::None).unwrap();
+    assert!(
+        conflicts.is_empty(),
+        "a first pairing writes the store: {conflicts:?}"
+    );
+    assert!(merged.entries.get(&store) == studio.entries.get(&store));
+}
+
+#[test]
+fn the_worker_refuses_a_vanished_store_and_names_an_undecodable_one() {
+    let store = PathBuf::from("instances/Workspace.renium");
+    let mut document = twin_document();
+    twin_add(&mut document, 0, "Thing", "Folder", json!({}));
+    let previous = workspace_store_snapshot(document);
+    let scopes = [store.clone()];
+    let message =
+        match prepare_editor_settings_changes(&previous, &ProjectSnapshot::default(), &scopes) {
+            Ok(_) => panic!("a vanished store was accepted"),
+            Err(error) => format!("{error:#}"),
+        };
+    assert!(
+        message.contains("instances/Workspace.renium is missing") && message.contains("`rbx pl`"),
+        "{message}"
+    );
+    let garbage = file_snapshot(&[("instances/Workspace.renium", b"not a store")]);
+    let message = match prepare_editor_settings_changes(&previous, &garbage, &scopes) {
+        Ok(_) => panic!("an undecodable store was accepted"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(
+        message.contains("Could not read the store instances/Workspace.renium")
+            && message.contains("Invalid settings bytecode magic"),
+        "{message}"
+    );
+}
+
+#[test]
+fn a_kept_script_keeps_the_folder_a_capture_without_scripts_omitted() {
+    let folder = PathBuf::from("src/ReplicatedStorage/Shared");
+    let script = PathBuf::from("src/ReplicatedStorage/Shared/Util.luau");
+    let mut baseline = file_snapshot(&[("src/ReplicatedStorage/Shared/Util.luau", b"return 1")]);
+    baseline
+        .entries
+        .insert(folder.clone(), SnapshotEntry::Directory);
+    let mut editor = file_snapshot(&[("src/ReplicatedStorage/Shared/Util.luau", b"return 2")]);
+    editor
+        .entries
+        .insert(folder.clone(), SnapshotEntry::Directory);
+    let studio = ProjectSnapshot::default();
+    let (_, conflicts) =
+        merge_snapshots(Some(&baseline), &editor, &studio, ConflictPreference::None).unwrap();
+    assert_eq!(
+        conflicts,
+        vec![format!("{} changed on both sides", script.display())]
+    );
+    let (merged, conflicts, changes) = merge_snapshots_with_changes(
+        Some(&baseline),
+        &editor,
+        &studio,
+        ConflictPreference::Editor,
+        None,
+    )
+    .unwrap();
+    assert!(conflicts.is_empty(), "{conflicts:?}");
+    assert!(merged.entries.get(&folder) == Some(&SnapshotEntry::Directory));
+    assert!(merged.entries.get(&script) == editor.entries.get(&script));
+    assert!(changes.editor.is_empty(), "{:?}", changes.editor);
+    assert!(changes.studio.contains(&folder) && changes.studio.contains(&script));
+}
+
+/// The automation selection is process-wide; tests that select a project
+/// take this lock so a concurrent one does not restore a deleted selection.
+static PROJECT_SELECTION: Mutex<()> = Mutex::new(());
+
+/// The comparison's packing as one call: the enforcement built for the
+/// operation, then the fold.
+fn pack_read_only_link_scripts(
+    root: &Path,
+    src_root: &Path,
+    editor: &ProjectSnapshot,
+    studio: &mut ProjectSnapshot,
+) -> Result<()> {
+    match packing_link_enforcement(root, src_root)? {
+        Some(enforcement) => pack_read_only_link_scripts_with(&enforcement, root, editor, studio),
+        None => Ok(()),
+    }
+}
+
+#[test]
+fn a_packed_link_script_compares_by_its_inline_text_against_the_capture() {
+    let _serial = PROJECT_SELECTION.lock_recover();
+    let root = crate::tests::support::temp_dir("packed-link-comparison");
+    let _cleanup = OnDrop::new(|| {
+        crate::project::storage::forget(&root);
+        let _ = fs::remove_dir_all(&root);
+    });
+    crate::tests::support::write_packed_link_project(&root);
+    config::load_project(Some(&root.join("renium.project.jsonc")), None).unwrap();
+    let _selection = crate::app::context::select_automation_for_thread(
+        None,
+        root.join("renium.project.jsonc"),
+        None,
+    );
+    let scopes = [PathBuf::from("instances"), PathBuf::from("src")];
+    let editor = capture_snapshot(&root, &scopes).unwrap();
+    let store = PathBuf::from("instances/ReplicatedStorage.renium");
+    let script = PathBuf::from("src/ReplicatedStorage/Shared/Util.luau");
+    let mut captured = settings_document(editor.entries.get(&store)).unwrap();
+    captured.instances[2].settings_id = "studio:util".into();
+    captured.instances[2].properties.insert(
+        "Source".into(),
+        json!(crate::settings::EXTERNAL_SOURCE_MARKER),
+    );
+    let mut studio = ProjectSnapshot::default();
+    studio.entries.insert(
+        store.clone(),
+        SnapshotEntry::File(encode_settings_bytecode(&captured).unwrap()),
+    );
+    studio.entries.insert(
+        PathBuf::from("src/ReplicatedStorage/Shared"),
+        SnapshotEntry::Directory,
+    );
+    studio.entries.insert(
+        script.clone(),
+        SnapshotEntry::File(b"return { version = 1 }".to_vec()),
+    );
+    let (_, conflicts) = merge_snapshots(None, &editor, &studio, ConflictPreference::None).unwrap();
+    assert!(
+        conflicts
+            .iter()
+            .any(|conflict| conflict.contains("ReplicatedStorage.Shared.Util")),
+        "control: the raw capture conflicts on the packed script: {conflicts:?}"
+    );
+
+    pack_read_only_link_scripts(&root, &root.join("src"), &editor, &mut studio).unwrap();
+    assert!(!studio.entries.contains_key(&script));
+    let packed = settings_document(studio.entries.get(&store)).unwrap();
+    assert_eq!(
+        packed.instances[2].properties.get("Source"),
+        Some(&json!("return { version = 1 }"))
+    );
+    let (merged, conflicts) =
+        merge_snapshots(None, &editor, &studio, ConflictPreference::None).unwrap();
+    assert!(conflicts.is_empty(), "{conflicts:?}");
+    assert!(!merged.entries.contains_key(&script));
+
+    let mut drifted = studio.clone();
+    let mut drifted_doc = settings_document(drifted.entries.get(&store)).unwrap();
+    drifted_doc.instances[2]
+        .properties
+        .insert("Source".into(), json!("return { version = 2 }"));
+    drifted.entries.insert(
+        store.clone(),
+        SnapshotEntry::File(encode_settings_bytecode(&drifted_doc).unwrap()),
+    );
+    let (_, conflicts) =
+        merge_snapshots(None, &editor, &drifted, ConflictPreference::None).unwrap();
+    assert!(
+        conflicts
+            .iter()
+            .any(|conflict| conflict.contains("ReplicatedStorage.Shared.Util")),
+        "a Studio edit of the packed text is still a difference: {conflicts:?}"
+    );
+}
+
+#[test]
+fn a_stripped_package_link_stays_in_studio_on_the_first_comparison() {
+    let _serial = PROJECT_SELECTION.lock_recover();
+    let root = crate::tests::support::temp_dir("stripped-link-comparison");
+    let _cleanup = OnDrop::new(|| {
+        crate::project::storage::forget(&root);
+        let _ = fs::remove_dir_all(&root);
+    });
+    crate::tests::support::write_packed_link_project(&root);
+    config::load_project(Some(&root.join("renium.project.jsonc")), None).unwrap();
+    let _selection = crate::app::context::select_automation_for_thread(
+        None,
+        root.join("renium.project.jsonc"),
+        None,
+    );
+    let scopes = [PathBuf::from("instances"), PathBuf::from("src")];
+    let editor = capture_snapshot(&root, &scopes).unwrap();
+    let store = PathBuf::from("instances/ReplicatedStorage.renium");
+    let mut captured = settings_document(editor.entries.get(&store)).unwrap();
+    captured
+        .instances
+        .push(crate::tests::support::settings_instance(
+            "studio:link",
+            "PackageLink",
+            "PackageLink",
+            Some(1),
+        ));
+    let mut studio = ProjectSnapshot::default();
+    studio.entries.insert(
+        store.clone(),
+        SnapshotEntry::File(encode_settings_bytecode(&captured).unwrap()),
+    );
+    let links_in = |snapshot: &ProjectSnapshot| {
+        settings_document(snapshot.entries.get(&store))
+            .unwrap()
+            .instances
+            .iter()
+            .filter(|instance| instance.class_name == "PackageLink")
+            .count()
+    };
+    let (merged, _) = merge_snapshots(None, &editor, &studio, ConflictPreference::None).unwrap();
+    assert_eq!(
+        links_in(&merged),
+        1,
+        "control: the raw capture pulls the link into the store"
+    );
+
+    pack_read_only_link_scripts(&root, &root.join("src"), &editor, &mut studio).unwrap();
+    assert_eq!(links_in(&studio), 0);
+    let (merged, conflicts) =
+        merge_snapshots(None, &editor, &studio, ConflictPreference::None).unwrap();
+    assert!(conflicts.is_empty(), "{conflicts:?}");
+    assert_eq!(links_in(&merged), 0);
+
+    let package = root.join("links").join("shared.renium");
+    let mut linked = SettingsBytecode::read_file(&package).unwrap();
+    linked
+        .instances
+        .push(crate::tests::support::settings_instance(
+            "editor:link",
+            "PackageLink",
+            "PackageLink",
+            Some(0),
+        ));
+    linked.write_file(&package).unwrap();
+    let mut kept = ProjectSnapshot::default();
+    kept.entries.insert(
+        store.clone(),
+        SnapshotEntry::File(encode_settings_bytecode(&captured).unwrap()),
+    );
+    pack_read_only_link_scripts(&root, &root.join("src"), &editor, &mut kept).unwrap();
+    assert_eq!(
+        links_in(&kept),
+        1,
+        "a package that carries its own link keeps Studio's in the capture"
+    );
+}
+
+#[test]
+fn a_comparison_reports_a_link_package_it_cannot_enforce_instead_of_packing_nothing() {
+    let _serial = PROJECT_SELECTION.lock_recover();
+    let root = crate::tests::support::temp_dir("packed-link-package-error");
+    let _cleanup = OnDrop::new(|| {
+        crate::project::storage::forget(&root);
+        let _ = fs::remove_dir_all(&root);
+    });
+    crate::tests::support::write_packed_link_project(&root);
+    config::load_project(Some(&root.join("renium.project.jsonc")), None).unwrap();
+    let _selection = crate::app::context::select_automation_for_thread(
+        None,
+        root.join("renium.project.jsonc"),
+        None,
+    );
+    let scopes = [PathBuf::from("instances"), PathBuf::from("src")];
+    let editor = capture_snapshot(&root, &scopes).unwrap();
+    let package = root.join("links").join("shared.renium");
+    let intact = fs::read(&package).unwrap();
+    let pack = |studio: &mut ProjectSnapshot| {
+        pack_read_only_link_scripts(&root, &root.join("src"), &editor, studio)
+    };
+
+    fs::write(&package, b"not a settings store").unwrap();
+    let mut studio = editor.clone();
+    let error = format!("{:#}", pack(&mut studio).unwrap_err());
+    assert!(error.contains("shared.renium"), "{error}");
+    assert!(
+        studio.entries == editor.entries,
+        "a failed enforcement leaves the capture alone"
+    );
+
+    fs::remove_file(&package).unwrap();
+    let error = format!("{:#}", pack(&mut editor.clone()).unwrap_err());
+    assert!(error.contains("shared"), "{error}");
+
+    fs::write(&package, &intact).unwrap();
+    fs::write(
+        root.join("renium-link.json"),
+        br#"{"version":1,"links":[{"id":"shared","readOnly":true,"source":{"type":"local","path":"links/shared.renium"},"targets":[{"service":"ReplicatedStorage","path":["ReplicatedStorage","Shared"]}]},{"id":"other","readOnly":true,"source":{"type":"local","path":"links/missing.renium"},"targets":[{"service":"ReplicatedStorage","path":["ReplicatedStorage","Other"]}]}],"broken":[]}"#,
+    )
+    .unwrap();
+    let error = format!("{:#}", pack(&mut editor.clone()).unwrap_err());
+    assert!(error.contains("missing"), "{error}");
+
+    fs::remove_file(root.join("renium-link.json")).unwrap();
+    let mut studio = editor.clone();
+    pack(&mut studio).unwrap();
+    assert!(
+        studio.entries == editor.entries,
+        "no manifest is no packed script"
+    );
+}

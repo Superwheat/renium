@@ -25,7 +25,7 @@ local SUPERCLASS = {
 -- a menu is open, a CoreGui TextBox is focused or a rendered CoreGui object is
 -- selected. That a hidden selection stops counting is an assumption the
 -- maintainer verifies live.
-local engine = {}
+local engine = { frame = 0 }
 local coreGui
 local playerGui
 
@@ -142,6 +142,10 @@ function Fake:ReleaseFocus()
 	if engine.focusedTextBox == self then
 		engine.focusedTextBox = nil
 	end
+end
+function Fake:CaptureFocus()
+	engine.focusedTextBox = self
+	engine.focusFrame = engine.frame
 end
 local function rendered(object)
 	local current = object
@@ -307,11 +311,22 @@ function virtualInput:SendKey(down, keyCode, repeated)
 	end
 	table.insert(engine.delivered, `{keyCode.Name} {if down then "down" else "up"}`)
 end
+-- Text reaches a game TextBox only from the frame after its focus landed,
+-- and `dropTextSends` emulates the engine dropping that many sends outright.
 function virtualInput:SendTextInput(text)
 	if coreKeyboardFocus() then
 		error("VirtualInput::SendTextInput: CoreGUI has keyboard focus. VirtualInput cannot process this key.")
 	end
 	table.insert(engine.delivered, `text {text}`)
+	local box = engine.focusedTextBox
+	if box == nil or box:IsDescendantOf(coreGui) or engine.frame <= (engine.focusFrame or -1) then
+		return
+	end
+	if engine.dropTextSends > 0 then
+		engine.dropTextSends -= 1
+		return
+	end
+	box.Text = box.Text .. text
 end
 
 local players = new("Players", nil, { Name = "Players" })
@@ -347,7 +362,10 @@ local services = {
 		IsEdit = function() return false end,
 		IsRunning = function() return true end,
 		IsClient = function() return true end,
-		Heartbeat = { Wait = function() scheduler.wait() end },
+		Heartbeat = { Wait = function()
+			engine.frame += 1
+			scheduler.wait()
+		end },
 	},
 	StudioTestService = { EditModeActive = false, CanLeaveTest = function() return false end },
 	StarterGui = {
@@ -400,6 +418,8 @@ local function reset(options)
 	engine.menuOpen = false
 	engine.selectedCore = nil
 	engine.focusedTextBox = nil
+	engine.focusFrame = nil
+	engine.dropTextSends = 0
 	engine.refuseCoreMoves = options and options.refuseCoreMoves or false
 	engine.delivered = {}
 	engine.buttons = {}
@@ -543,5 +563,28 @@ message = failure({ { type = "press", label = "No" } })
 assert(string.find(message, "matches 2 Roblox buttons", 1, true), message)
 message = failure({ { type = "press", label = "Maybe" } })
 assert(string.find(message, "No visible Roblox button", 1, true), message)
+
+local function gameTextBox()
+	return new("TextBox", playerGui:FindFirstChildOfClass("ScreenGui"), { Name = "Box", Text = "" })
+end
+reset()
+local box = gameTextBox()
+result = send({ { type = "focus", id = box:GetDebugId() }, { type = "text", text = "hello" } })
+assert(box.Text == "hello" and result.textObserved == true, "text lands from the frame after the focus: " .. tostring(box.Text))
+assert(delivered() == "text hello", "one send when the text arrives: " .. delivered())
+reset()
+box = gameTextBox()
+engine.dropTextSends = 1
+result = send({ { type = "focus", id = box:GetDebugId() }, { type = "text", text = "hello" } })
+assert(box.Text == "hello" and result.textObserved == true, "a dropped send is repeated after refocusing: " .. tostring(box.Text))
+assert(delivered() == "text hello,text hello" and engine.focusedTextBox == box, delivered())
+reset()
+box = gameTextBox()
+engine.dropTextSends = 2
+result = send({ { type = "focus", id = box:GetDebugId() }, { type = "text", text = "hello" } })
+assert(box.Text == "" and result.textObserved == false, "a second drop is reported, not retried again")
+reset()
+result = send({ { type = "text", text = "free" } })
+assert(result.textObserved == nil and delivered() == "text free", "text without a focus action is sent once, unchecked")
 
 print("Renium CoreGui dismiss tests passed")

@@ -90,6 +90,25 @@ fn load(directory: &Path) -> Result<(Manifest, Vec<u8>)> {
     Ok((manifest, bytes))
 }
 
+const GUIDE_LIMIT: u64 = 64 * 1024;
+
+/// The guide `rbx plugin info` prints; check and install refuse a guide it
+/// could not print.
+fn read_guide(directory: &Path, guide: &Path) -> Result<String> {
+    let path = contained_file(directory, guide)?;
+    let size = fs::metadata(&path)
+        .with_context(|| format!("Cannot read the plugin guide {}", guide.display()))?
+        .len();
+    if size > GUIDE_LIMIT {
+        bail!(
+            "The plugin guide {} is {size} bytes; a guide can be at most {GUIDE_LIMIT} bytes (64 KiB)",
+            guide.display()
+        );
+    }
+    String::from_utf8(bounded_read(&path, GUIDE_LIMIT)?)
+        .with_context(|| format!("The plugin guide {} is not UTF-8 text", guide.display()))
+}
+
 fn bounded_read(path: &Path, limit: u64) -> Result<Vec<u8>> {
     use std::io::Read;
     let file = fs::File::open(path).with_context(|| format!("Cannot read {}", path.display()))?;
@@ -191,6 +210,9 @@ pub(crate) fn manage(args: PluginArgs) -> Result<()> {
         PluginCommand::New { name, path } => scaffold::create(&name, path.as_deref())?,
         PluginCommand::Check { path } => {
             let (manifest, _) = load(&path)?;
+            if let Some(guide) = &manifest.guide {
+                read_guide(&path, guide)?;
+            }
             json!({"valid":true,"name":manifest.name,"commands":manifest.commands,"compiled":false})
         }
         PluginCommand::Snapshot { destination } => snapshot::create(&destination)?,
@@ -217,6 +239,9 @@ pub(crate) fn manage(args: PluginArgs) -> Result<()> {
         PluginCommand::Install { path, dev } => {
             let directory = fs::canonicalize(path)?;
             let (manifest, bytes) = load(&directory)?;
+            if let Some(guide) = &manifest.guide {
+                read_guide(&directory, guide)?;
+            }
             let (exe, _) = executable(&directory, &manifest)?;
             let registration = Registration {
                 directory,
@@ -263,15 +288,11 @@ pub(crate) fn manage(args: PluginArgs) -> Result<()> {
             let guide = manifest
                 .guide
                 .as_ref()
-                .map(|path| {
-                    String::from_utf8(bounded_read(
-                        &contained_file(&registration.directory, path)?,
-                        65536,
-                    )?)
-                    .map_err(anyhow::Error::from)
-                })
+                .map(|path| read_guide(&registration.directory, path))
                 .transpose()?;
-            json!({"manifest":manifest,"guide":guide,"directory":registration.directory,"dev":registration.dev})
+            let directory =
+                crate::system::files::strip_extended_prefix(registration.directory.clone());
+            json!({"manifest":manifest,"guide":guide,"directory":directory,"dev":registration.dev})
         }
         PluginCommand::Remove { name } => {
             let path = registration_path(&plugin_home()?, &name)?;
@@ -428,6 +449,13 @@ fn process_report(pid: u32, terminate_studio: bool, started_unix: Option<u64>) -
             );
         }
         terminate_owned_studio(pid)?;
+        // macOS delivers the termination asynchronously; answer with the
+        // process state the caller can act on.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && renium_plugin_sdk::process::alive(pid)? {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        report["alive"] = json!(renium_plugin_sdk::process::alive(pid)?);
         report["terminated"] = json!(true);
     }
     Ok(report)

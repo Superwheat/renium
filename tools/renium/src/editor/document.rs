@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -9,7 +10,9 @@ use crate::editor::types::{EditorSourceEnsureResult, EditorSourcePathSpec, Edito
 use crate::settings::bytecode::{SettingsBytecode, SettingsBytecodeInstance};
 use crate::settings::instance::{self as instance_api, AddInstanceSpec};
 use crate::settings::tree::{editor_child_stems, editor_service_root_index};
-use crate::system::files::{service_settings_path, validate_filesystem_instance_name};
+use crate::system::files::{
+    normalized_child_stem_key, service_settings_path, validate_filesystem_instance_name,
+};
 
 pub(crate) fn read_editor_service_settings(
     src_root: &Path,
@@ -63,6 +66,17 @@ pub(crate) fn ensure_editor_source_target_in_bytecode(
     document: &mut SettingsBytecode,
     spec: &EditorSourcePathSpec,
 ) -> Result<EditorSourceEnsureResult> {
+    ensure_editor_source_target_in_bytecode_reserving(document, spec, &HashSet::new())
+}
+
+/// `reserved` names identities the same collection already removed from
+/// `document` (a renamed directory deletes its scripts before it creates the
+/// new ones); a created instance never takes one of them.
+pub(crate) fn ensure_editor_source_target_in_bytecode_reserving(
+    document: &mut SettingsBytecode,
+    spec: &EditorSourcePathSpec,
+    reserved: &HashSet<String>,
+) -> Result<EditorSourceEnsureResult> {
     let mut changed = false;
     let mut upsert_instance_paths = Vec::new();
     let mut replace_instance_paths = Vec::new();
@@ -104,7 +118,9 @@ pub(crate) fn ensure_editor_source_target_in_bytecode(
         let added = instance_api::add_instance(
             document,
             AddInstanceSpec::new(
-                None,
+                Some(instance_api::next_editor_settings_id_avoiding(
+                    document, reserved,
+                )),
                 component.clone(),
                 component_class.to_string(),
                 Some(current_index),
@@ -145,7 +161,9 @@ pub(crate) fn ensure_editor_source_target_in_bytecode(
         let added = instance_api::add_instance(
             document,
             AddInstanceSpec::new(
-                None,
+                Some(instance_api::next_editor_settings_id_avoiding(
+                    document, reserved,
+                )),
                 spec.instance_name.clone(),
                 spec.class_name.clone(),
                 Some(current_index),
@@ -286,9 +304,12 @@ pub(crate) fn editor_child_by_stem(
             (instance.parent_index == Some(parent_index)).then_some(index)
         })
         .collect::<Vec<_>>();
+    let wanted = normalized_child_stem_key(stem);
     editor_child_stems(document, &child_indices)
         .into_iter()
-        .find_map(|(index, child_stem, _)| (child_stem == stem).then_some(index))
+        .find_map(|(index, child_stem, _)| {
+            (normalized_child_stem_key(&child_stem) == wanted).then_some(index)
+        })
 }
 
 fn editor_child_name_ordinal(

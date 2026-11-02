@@ -1364,7 +1364,8 @@ local function resolveEntryInstance(
 ): Instance?
 	local previousClassName = tostring(entry.previousClassName or "")
 	local function classCompatible(candidate: Instance): boolean
-		return candidate.ClassName == entry.className
+		return entry.className == ""
+			or candidate.ClassName == entry.className
 			or (previousClassName ~= "" and candidate.ClassName == previousClassName)
 	end
 	if entry.recreate then
@@ -1986,11 +1987,18 @@ local function verifySourceWrite(instance: Instance, expectedSource: string)
 	if not okRead then
 		error(`Failed to verify Source for {instance:GetFullName()}: {appliedSource}`)
 	end
-	if normalizedSource(appliedSource) ~= normalizedSource(expectedSource) then
-		error(
-			`Source verification failed for {instance:GetFullName()}: expected {#expectedSource} bytes, got {#appliedSource} bytes`
-		)
+	if normalizedSource(appliedSource) == normalizedSource(expectedSource) then
+		return
 	end
+	-- An editor tab restored on reopen can lag behind the property it shows;
+	-- the property is what the write targeted and what the place saves.
+	local okProperty, propertySource = BridgeScriptDocuments.readPropertySource(instance)
+	if okProperty and normalizedSource(propertySource) == normalizedSource(expectedSource) then
+		return
+	end
+	error(
+		`Source verification failed for {instance:GetFullName()}: expected {#expectedSource} bytes, got {#appliedSource} bytes`
+	)
 end
 
 local function assertSourceContainer(instance: Instance, ctx: { [string]: any })
@@ -2762,6 +2770,28 @@ local function queueNativeRootWrite(instance, propertyName, rawValue, change, ct
 		stats.noops += 1
 		return
 	end
+	if session.nativePropertiesAvailable == false then
+		-- The host proved that its native locator is unavailable before starting
+		-- this transaction. Accessible fields still use the checked plugin setter;
+		-- blocked saved fields follow the existing protected snapshot workflow.
+		-- Initial Scale is saved metadata: ScaleTo would resize the new children.
+		if not isTerrain and propertyName ~= "Scale" then
+			local okWrite, err = writeDecodedProperty(instance, propertyName, value, ctx, stats, false)
+			if okWrite then return end
+			if not errorContains(err, PROTECTED_PROPERTY_WRITE_ERRORS) then
+				error(`Failed to write {propertyName} on {instance:GetFullName()}: {err}`)
+			end
+		end
+		if isTerrain then
+			for name, grid in pairs(rawValue) do
+				recordProtectedWrite(stats, change, "property", name, grid)
+			end
+		else
+			recordProtectedWrite(stats, change, "property", propertyName, rawValue)
+		end
+		stats.noops += 1
+		return
+	end
 	local writes = session.nativeRootWrites or {}
 	session.nativeRootWrites = writes
 	local index = #writes + 1
@@ -2818,6 +2848,11 @@ local function applyChangedProperty(instance, propertyName, rawValue, change, ct
 	if instance:IsA("MeshPart") and isMeshGeometryProperty(propertyName) then
 		if ctx.editorTransaction == nil then
 			error("Mesh geometry sync requires an active transaction")
+		end
+		if ctx.editorTransaction.nativePropertiesAvailable == false then
+			recordProtectedWrite(stats, change, "property", propertyName, rawValue)
+			stats.noops += 1
+			return
 		end
 		-- The native writer targets this part by path, and duplicate sibling
 		-- names can order differently in Studio than in the store, so the
@@ -3387,9 +3422,11 @@ local function validateInstanceChange(change, serviceName, ctx, classCache)
 		if entry.className == "PackageLink" and mode ~= "reconcileService" then
 			error("PackageLink instances cannot be created, replaced, or removed directly")
 		end
+		local deleteByPath = change.mode == "deleteInstances" and entry.className == ""
 		if
 			entry.anchorOnly ~= true
 			and entry.className ~= "PackageLink"
+			and not deleteByPath
 			and not isEngineManagedContainerEntry(serviceName, entry)
 		then
 			validateCreatableClass(entry.className, classCache, "Editor instance entry")
@@ -7114,6 +7151,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			changedSourceInstances = changedSourceInstances,
 			instanceReplacements = {},
 			createdInstances = {},
+			nativePropertiesAvailable = params.nativePropertiesAvailable ~= false,
 			snapshot = snapshot,
 			mutated = false,
 			nativeImport = nativeImport,

@@ -77,10 +77,57 @@ pub(crate) fn merge_snapshots_with_changes(
             merged.insert(path, value);
         }
     }
+    keep_directories_implied_by_files(&mut merged, &sides, &mut changes);
     remove_superseded_script_paths(baseline, editor, studio, &mut merged, &mut changes)?;
     conflicts.sort();
     conflicts.dedup();
     Ok((ProjectSnapshot { entries: merged }, conflicts, changes))
+}
+
+/// A directory stands as long as a file beneath it does. A capture of a
+/// service whose folder lost its last script carries no entry for the folder,
+/// so a merge that keeps that script (an edit preferred over Studio's
+/// deletion) would otherwise drop the folder the files hold it in and fail the
+/// readback against the folder Studio recreated around the script.
+fn keep_directories_implied_by_files(
+    merged: &mut BTreeMap<PathBuf, SnapshotEntry>,
+    sides: &SnapshotSides<'_>,
+    changes: &mut MergeChanges,
+) {
+    let files = merged
+        .iter()
+        .filter(|(_, entry)| matches!(entry, SnapshotEntry::File(_)))
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    let is_directory = |snapshot: &ProjectSnapshot, path: &Path| {
+        matches!(snapshot.entries.get(path), Some(SnapshotEntry::Directory))
+    };
+    for file in files {
+        for ancestor in file.ancestors().skip(1) {
+            if ancestor.as_os_str().is_empty() || merged.contains_key(ancestor) {
+                continue;
+            }
+            let known = is_directory(sides.editor, ancestor)
+                || is_directory(sides.studio, ancestor)
+                || sides
+                    .baseline
+                    .is_some_and(|baseline| is_directory(baseline, ancestor));
+            if !known {
+                continue;
+            }
+            merged.insert(ancestor.to_path_buf(), SnapshotEntry::Directory);
+            if is_directory(sides.editor, ancestor) {
+                changes.editor.remove(ancestor);
+            } else {
+                changes.editor.insert(ancestor.to_path_buf());
+            }
+            if is_directory(sides.studio, ancestor) {
+                changes.studio.remove(ancestor);
+            } else {
+                changes.studio.insert(ancestor.to_path_buf());
+            }
+        }
+    }
 }
 
 pub(crate) fn script_paths_by_settings_id(
@@ -367,6 +414,16 @@ pub(crate) fn settings_document(entry: Option<&SnapshotEntry>) -> Result<Setting
     Ok(document)
 }
 
+/// A store that the baseline knew and the files no longer hold says nothing
+/// about the service: Live Sync never reads it as "every instance deleted".
+pub(crate) fn missing_store_message(path: &Path) -> String {
+    format!(
+        "{} is missing; a deleted store never empties its service in Studio. Restore the file and push it with `rbx ps {} -u`, or write it from Studio with `rbx pl`",
+        path.display(),
+        path.display()
+    )
+}
+
 pub(crate) fn short_reconciliation_value(value: Option<&Value>) -> String {
     let text = value.map_or_else(|| "<absent>".to_string(), Value::to_string);
     if text.len() <= 96 {
@@ -519,8 +576,21 @@ pub(crate) fn merge_settings_entry(
             aligned_studio: None,
         });
     }
-    let mut editor_doc = settings_document(editor)?;
-    let mut studio_doc = settings_document(studio)?;
+    if !first_pairing && editor.is_none() && studio.is_some() {
+        if !matches!(preference, ConflictPreference::Studio) {
+            conflicts.push(missing_store_message(path));
+        }
+        return Ok(MergedEntry {
+            value: studio.cloned(),
+            editor_changed: true,
+            studio_changed: false,
+            aligned_studio: None,
+        });
+    }
+    let mut editor_doc = settings_document(editor)
+        .with_context(|| format!("Could not read the store {}", path.display()))?;
+    let mut studio_doc = settings_document(studio)
+        .with_context(|| format!("Could not read Studio's copy of {}", path.display()))?;
     if settings_documents_equivalent(&editor_doc, &studio_doc) {
         return Ok(MergedEntry {
             value: editor.cloned(),

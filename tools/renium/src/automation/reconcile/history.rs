@@ -399,8 +399,14 @@ pub(crate) fn newest_sync_entry_holding(
 
 pub(crate) fn revert_sync(root: &Path, source: &Path, id: &str) -> Result<RevertedSync> {
     let directory = sync_entry_directory(root, source, id)?;
+    let record_path = directory.join("sync.rmp");
+    if !record_path.is_file() {
+        bail!(
+            "No sync history entry {id}; pass the historyId a push printed, or `latest` for the most recent sync"
+        );
+    }
     let mut history = SyncHistory {
-        record: rmp_serde::from_slice(&fs::read(directory.join("sync.rmp"))?)?,
+        record: rmp_serde::from_slice(&fs::read(&record_path)?)?,
         directory,
     };
     if history.record.version != 1 || history.record.reverted {
@@ -515,6 +521,20 @@ pub(crate) fn revert_sync(root: &Path, source: &Path, id: &str) -> Result<Revert
 mod tests {
     use super::*;
     use crate::tests::support::temp_dir;
+
+    #[test]
+    fn an_unknown_sync_history_id_is_named_in_the_error() {
+        let root = temp_dir("unknown-sync-id");
+        fs::create_dir_all(&root).unwrap();
+        let error = revert_sync(&root, Path::new("src"), "bogus-id").unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.starts_with("No sync history entry bogus-id") && message.contains("`latest`"),
+            "{message}"
+        );
+        assert!(!message.contains("os error"), "{message}");
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn legacy_sync_undo_survives_store_migration_and_still_guards_newer_edits() -> Result<()> {

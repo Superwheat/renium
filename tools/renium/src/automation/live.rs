@@ -1325,10 +1325,20 @@ impl Manager {
         }))
     }
 
-    pub(crate) fn discard(&self, context: &BoundContext) -> Result<Value> {
+    pub(crate) fn discard(&self, context: &BoundContext, bridge: &BridgeServer) -> Result<Value> {
         if let Some(control) = self.control(context.id) {
+            // The discarded file edits become the shared baseline for their
+            // paths: the next comparison counts them as synchronized, so a
+            // Studio value that differs is Studio's own change and is pulled.
+            let discarded = control
+                .status
+                .lock_recover()
+                .pending_paths
+                .iter()
+                .map(|path| control.root.join(path))
+                .collect::<Vec<_>>();
             control.pause();
-            let captured = match self.capture(context, None) {
+            let captured = match self.capture(context, Some(&discarded)) {
                 Ok(Some(captured)) => captured,
                 Ok(None) => {
                     control.release_pause();
@@ -1339,7 +1349,16 @@ impl Manager {
                     return Err(error);
                 }
             };
-            control.rebase_then_resume(Rebase::Captured(captured))?;
+            if discarded.is_empty() {
+                control.rebase_then_resume(Rebase::Captured(captured))?;
+            } else {
+                return self.acknowledge_then_resume(
+                    context,
+                    bridge,
+                    captured,
+                    BaselineSide::Editor,
+                );
+            }
         }
         Ok(self.status(context.id))
     }
@@ -1485,6 +1504,37 @@ impl Manager {
             result?;
         }
         Ok(self.status(context.id))
+    }
+
+    /// Whether Live Sync writes Studio changes of this context into the
+    /// files: a running session in reconcile mode whose pulls are enabled.
+    pub(crate) fn pulls_studio_changes(&self, context_id: u64) -> bool {
+        self.control(context_id).is_some_and(|control| {
+            control.status.lock_recover().running
+                && control.writes_enabled.load(Ordering::Acquire)
+                && control.pull_changes.load(Ordering::Acquire)
+        })
+    }
+
+    /// Project-relative files with edits Live Sync has not pushed yet; a pull
+    /// leaves them in place.
+    pub(crate) fn pending_relative_paths(&self, context_id: u64) -> Vec<PathBuf> {
+        self.control(context_id).map_or_else(Vec::new, |control| {
+            control
+                .status
+                .lock_recover()
+                .pending_paths
+                .iter()
+                .map(PathBuf::from)
+                .collect()
+        })
+    }
+
+    pub(crate) fn note_pull(&self, context_id: u64) {
+        if let Some(control) = self.control(context_id) {
+            control.status.lock_recover().pulls += 1;
+            control.notify_sync_state();
+        }
     }
 
     pub(crate) fn pause(&self, context_id: u64) -> Value {
@@ -1809,6 +1859,52 @@ fn capture_pending(
     Ok(captured)
 }
 
+/// A directory that is renamed into place, created or removed raises one
+/// event for itself; the files it brought along or took away raise none of
+/// their own. A publish that swaps a staged directory over the project's copy
+/// (a sync-history restore, a pull of a new service) and a `mv` of a folder
+/// of scripts both arrive that way, so the directory's current files and the
+/// baseline entries beneath it are queued from a walk.
+fn directory_event_paths(
+    project: &WatchProject,
+    baseline: &BTreeMap<PathBuf, FileStamp>,
+    event: &notify::Event,
+) -> Vec<PathBuf> {
+    use notify::EventKind;
+    use notify::event::ModifyKind;
+    let structural = matches!(
+        event.kind,
+        EventKind::Any
+            | EventKind::Create(_)
+            | EventKind::Remove(_)
+            | EventKind::Modify(ModifyKind::Name(_))
+    );
+    let mut paths = BTreeSet::new();
+    for path in &event.paths {
+        let path = absolute(path.clone(), &project.root);
+        let directory = path.is_dir() || baseline.get(&path).is_some_and(|stamp| stamp.directory);
+        if structural && directory && relevant(project, &path) {
+            paths.extend(
+                baseline
+                    .keys()
+                    .filter(|candidate| candidate.starts_with(&path))
+                    .cloned(),
+            );
+            if path.is_dir() {
+                for entry in WalkDir::new(&path)
+                    .into_iter()
+                    .filter_entry(|entry| !ignored_under(entry.path(), &path))
+                    .flatten()
+                {
+                    paths.insert(entry.into_path());
+                }
+            }
+        }
+        paths.insert(path);
+    }
+    paths.into_iter().collect()
+}
+
 fn queue_changed(
     project: &WatchProject,
     baseline: &BTreeMap<PathBuf, FileStamp>,
@@ -1875,7 +1971,7 @@ fn push_full(
     bridge: &BridgeServer,
     guard: Option<&StudioChangeGuard>,
 ) -> Result<LivePushResult> {
-    let parameters = json!({ "verifySources": true });
+    let parameters = json!({ "verifySources": true, "yes": true });
     let _selection = bound_context::select(context);
     bridge.clear_runtime_pins();
     if let Some(runtime_id) = context.runtime_id.as_deref() {
@@ -2345,6 +2441,28 @@ struct Worker {
     pair_key: String,
 }
 
+const PRESERVED_PULL_RETRY_DELAY: Duration = Duration::from_secs(5);
+
+/// The services among `services` that own a preserved path, by store file
+/// stem (`instances/Workspace.renium`) or source directory (`src/Workspace`).
+fn preserved_services(preserved: &[PathBuf], services: &[String]) -> Vec<String> {
+    services
+        .iter()
+        .filter(|service| {
+            preserved.iter().any(|path| {
+                path.components().any(|part| {
+                    let part = part.as_os_str().to_string_lossy();
+                    part == service.as_str()
+                        || part
+                            .strip_suffix(".renium")
+                            .is_some_and(|stem| stem == service.as_str())
+                })
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 #[derive(Default)]
 struct ProjectEventOutcome {
     changed: bool,
@@ -2366,7 +2484,8 @@ fn receive_project_event(
         }
         Ok(Ok(event)) => {
             let had_blocked_changes = !blocked.is_empty();
-            match queue_changed(project, baseline, pending, blocked, event.paths) {
+            let paths = directory_event_paths(project, baseline, &event);
+            match queue_changed(project, baseline, pending, blocked, paths) {
                 Ok(changed) => {
                     outcome.changed = changed;
                     if changed {
@@ -2804,6 +2923,14 @@ impl LiveLoop {
         )? {
             self.push_ready = ready;
             self.push_retry_delay = Duration::ZERO;
+            // A pull that preserved a blocked file left Studio's own changes
+            // to that service unwritten. A rebase that drops the file edits
+            // (a discard, a CLI push) must bring those changes in now, or
+            // they stay unsynced until the next full comparison.
+            if !self.studio_conflicts.is_empty() {
+                self.studio_conflicts.clear();
+                let _guard = self.reconcile_concurrent_changes()?;
+            }
         }
         let file_control = apply_file_control_changes(
             &self.project,
@@ -2878,7 +3005,10 @@ impl LiveLoop {
             format_args!("[renium] reconcile reason: concurrent editor and Studio changes"),
         );
         let generation = self.control.generation.load(Ordering::Acquire);
-        let Some(_gate) = self.bridge.try_acquire_request_gate() else {
+        let Some(_gate) = self
+            .bridge
+            .try_acquire_edit_gate(self.context.runtime_id.as_deref(), "live-sync")
+        else {
             return Ok(None);
         };
         let Some(_activity) = self.control.begin_sync(generation) else {
@@ -3020,7 +3150,9 @@ impl LiveLoop {
 
     fn execute_push(&self, push: &PreparedPush) -> Option<Result<LivePushResult>> {
         let generation = self.control.generation.load(Ordering::Acquire);
-        let gate = self.bridge.try_acquire_request_gate()?;
+        let gate = self
+            .bridge
+            .try_acquire_edit_gate(self.context.runtime_id.as_deref(), "live-sync")?;
         let _activity = self.control.begin_sync(generation)?;
         if self.control.generation.load(Ordering::Acquire) != generation
             || self.control.file_pause_count.load(Ordering::Acquire) > 0
@@ -3314,9 +3446,20 @@ impl LiveLoop {
             ));
             return Ok(());
         }
+        // A service whose store stayed pending (its push is blocked) was not
+        // written; leaving it unacknowledged keeps the plugin's record of
+        // those Studio changes, so a later pull delivers them once the
+        // blocked edit is pushed or discarded.
+        let preserved = preserved_services(&pulled.published.preserved, &pulled.services);
+        let acknowledged = pulled
+            .services
+            .iter()
+            .filter(|service| !preserved.contains(service))
+            .cloned()
+            .collect::<Vec<_>>();
         match acknowledge_pulled_changes(
             &self.bridge,
-            &pulled.services,
+            &acknowledged,
             pulled.seq,
             &pulled.runtime_id,
         ) {
@@ -3386,9 +3529,20 @@ impl LiveLoop {
         drop(status);
         self.control.update_pending(&self.pending);
         self.push_ready = !self.pending.is_empty();
-        self.studio.retry_delay = Duration::ZERO;
+        let preserved_any = !pulled.published.preserved.is_empty();
+        self.studio.retry_delay = if preserved_any {
+            PRESERVED_PULL_RETRY_DELAY
+        } else {
+            Duration::ZERO
+        };
         self.acknowledge_pull(&pulled)?;
         self.finish_studio_wait();
+        if preserved_any {
+            // The unwritten Studio changes are still pending on the plugin
+            // side; look again after the delay instead of waiting for a new
+            // Studio edit to announce them.
+            self.studio.pull_ready = true;
+        }
         let pulled_paths = pulled
             .published
             .expected
@@ -3456,7 +3610,9 @@ impl LiveLoop {
         let generation = self.control.generation.load(Ordering::Acquire);
         let control = Arc::clone(&self.control);
         let bridge = Arc::clone(&self.bridge);
-        let Some(_gate) = bridge.try_acquire_request_gate() else {
+        let Some(_gate) =
+            bridge.try_acquire_edit_gate(self.context.runtime_id.as_deref(), "live-sync")
+        else {
             return Ok(true);
         };
         let Some(_activity) = control.begin_sync(generation) else {
@@ -3868,6 +4024,154 @@ mod tests {
 
         assert!(control.wait_settled(Duration::from_secs(1)));
         event.join().expect("event thread should finish");
+    }
+
+    #[test]
+    fn a_directory_swapped_into_place_queues_the_files_it_carries() {
+        let root = crate::tests::support::temp_dir("live-directory-swap");
+        let source_root = root.join("src");
+        let service = source_root.join("ServerScriptService");
+        fs::create_dir_all(&service).unwrap();
+        let main = service.join("Main.server.luau");
+        let kept = service.join("Kept.server.luau");
+        fs::write(
+            &main,
+            "return 1
+",
+        )
+        .unwrap();
+        fs::write(
+            &kept,
+            "return 0
+",
+        )
+        .unwrap();
+        let project = WatchProject {
+            watcher: FileWatcher::new(8).unwrap(),
+            root: root.clone(),
+            roots: BTreeSet::from([source_root.clone()]),
+            files: BTreeSet::new(),
+            full_push: BTreeSet::new(),
+        };
+        let mut baseline = scan(&project).unwrap();
+        let mut pending = BTreeSet::new();
+        let mut blocked = BTreeMap::new();
+
+        let staged = root.join("staged");
+        fs::create_dir_all(&staged).unwrap();
+        fs::write(
+            staged.join("Main.server.luau"),
+            "return 2
+",
+        )
+        .unwrap();
+        fs::write(
+            staged.join("Kept.server.luau"),
+            "return 0
+",
+        )
+        .unwrap();
+        fs::write(
+            staged.join("Added.server.luau"),
+            "return 3
+",
+        )
+        .unwrap();
+        let previous = root.join("previous");
+        fs::rename(&service, &previous).unwrap();
+        fs::rename(&staged, &service).unwrap();
+
+        let swap = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Name(
+            notify::event::RenameMode::To,
+        )))
+        .add_path(service.clone());
+        let paths = directory_event_paths(&project, &baseline, &swap);
+        assert!(paths.contains(&service));
+        assert!(paths.contains(&main));
+        assert!(paths.contains(&kept));
+        assert!(paths.contains(&service.join("Added.server.luau")));
+        assert!(queue_changed(&project, &baseline, &mut pending, &mut blocked, paths).unwrap());
+        assert_eq!(
+            pending,
+            BTreeSet::from([main.clone(), service.join("Added.server.luau")])
+        );
+
+        let touched = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Any))
+            .add_path(service.clone());
+        assert_eq!(
+            directory_event_paths(&project, &baseline, &touched),
+            vec![service.clone()]
+        );
+
+        fs::remove_dir_all(&service).unwrap();
+        let removed =
+            notify::Event::new(notify::EventKind::Remove(notify::event::RemoveKind::Folder))
+                .add_path(service.clone());
+        let paths = directory_event_paths(&project, &baseline, &removed);
+        assert!(paths.contains(&kept));
+        assert!(queue_changed(&project, &baseline, &mut pending, &mut blocked, paths).unwrap());
+        assert!(pending.contains(&kept));
+        baseline.clear();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_renamed_directory_queues_its_old_entries_and_its_new_files() {
+        let root = crate::tests::support::temp_dir("live-directory-rename");
+        let source_root = root.join("src");
+        let service = source_root.join("ReplicatedStorage");
+        let shared = service.join("Shared");
+        fs::create_dir_all(&shared).unwrap();
+        let util = shared.join("Util.luau");
+        fs::write(&util, "return 1\n").unwrap();
+        let project = WatchProject {
+            watcher: FileWatcher::new(8).unwrap(),
+            root: root.clone(),
+            roots: BTreeSet::from([source_root.clone()]),
+            files: BTreeSet::new(),
+            full_push: BTreeSet::new(),
+        };
+        let baseline = scan(&project).unwrap();
+        let renamed = service.join("Shared2");
+        let renamed_util = renamed.join("Util.luau");
+        fs::rename(&shared, &renamed).unwrap();
+
+        let rename_events = [
+            notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Name(
+                notify::event::RenameMode::From,
+            )))
+            .add_path(shared.clone()),
+            notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Name(
+                notify::event::RenameMode::To,
+            )))
+            .add_path(renamed.clone()),
+        ];
+        let create_remove_events = [
+            notify::Event::new(notify::EventKind::Remove(notify::event::RemoveKind::Folder))
+                .add_path(shared.clone()),
+            notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::Folder))
+                .add_path(renamed.clone()),
+        ];
+        for events in [rename_events, create_remove_events] {
+            let mut pending = BTreeSet::new();
+            let mut blocked = BTreeMap::new();
+            for event in events {
+                let paths = directory_event_paths(&project, &baseline, &event);
+                assert!(
+                    queue_changed(&project, &baseline, &mut pending, &mut blocked, paths).unwrap()
+                );
+            }
+            assert_eq!(
+                pending,
+                BTreeSet::from([
+                    shared.clone(),
+                    util.clone(),
+                    renamed.clone(),
+                    renamed_util.clone()
+                ])
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

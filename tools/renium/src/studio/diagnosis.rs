@@ -200,7 +200,8 @@ pub(crate) fn studio_log_directory() -> Option<PathBuf> {
 
 // Studio names its process near the top of each log, for example
 // "Constructing UIThreadNotifier for process '4700' ...".
-const LOG_HEAD_BYTES: u64 = 256 * 1024;
+/// The process marker sits in a Studio log's first lines.
+const LOG_HEAD_BYTES: u64 = 8 * 1024;
 
 pub(crate) fn studio_log_for_process(pid: u32, started_unix: Option<u64>) -> Option<PathBuf> {
     let marker = format!("for process '{pid}'");
@@ -219,8 +220,9 @@ pub(crate) fn studio_log_for_process(pid: u32, started_unix: Option<u64>) -> Opt
             .and_then(|metadata| metadata.created().ok())
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map_or(0, |time| time.as_secs());
-        // A reused PID must not match the log of an older Studio.
-        if started_unix.is_some_and(|started| created + 300 < started) {
+        // A reused PID must not match the log of an older Studio, and a log
+        // created long after this process started belongs to a later one.
+        if started_unix.is_some_and(|started| created + 300 < started || created > started + 120) {
             continue;
         }
         let Ok(file) = std::fs::File::open(&path) else {
@@ -241,9 +243,32 @@ pub(crate) fn studio_log_for_process(pid: u32, started_unix: Option<u64>) -> Opt
 
 /// Why the latest place open of this Studio failed, read from its log, or None
 /// when it opened a place or has not finished trying.
+/// The startup part of a Studio log: every state the diagnosis reads (place
+/// open, hang, sign-in) is logged in the first megabyte, and a long session's
+/// log runs to tens of megabytes.
+const LOG_STARTUP_BYTES: u64 = 1024 * 1024;
+
+fn studio_log_startup(pid: u32, started_unix: Option<u64>) -> Option<String> {
+    let file = std::fs::File::open(studio_log_for_process(pid, started_unix)?).ok()?;
+    let mut head = Vec::new();
+    file.take(LOG_STARTUP_BYTES).read_to_end(&mut head).ok()?;
+    Some(String::from_utf8_lossy(&head).into_owned())
+}
+
 pub(crate) fn studio_open_failure(pid: u32, started_unix: Option<u64>) -> Option<String> {
-    let bytes = std::fs::read(studio_log_for_process(pid, started_unix)?).ok()?;
-    open_failure_in_log(&String::from_utf8_lossy(&bytes))
+    open_failure_in_log(&studio_log_startup(pid, started_unix)?)
+}
+
+/// A Studio that opened the Roblox sign-in dialog instead of its place: the
+/// account's Studio session ended (Studio clears its cookies when a network
+/// failure interrupts the sign-in check), and only the user can sign in again.
+pub(crate) fn studio_signed_out(pid: u32, started_unix: Option<u64>) -> bool {
+    studio_log_startup(pid, started_unix).is_some_and(|text| signed_out_in_log(&text))
+}
+
+fn signed_out_in_log(text: &str) -> bool {
+    text.lines()
+        .any(|line| line.contains("[FLog::StudioKeyEvents] show login dialog"))
 }
 
 /// A Studio whose own hang monitor escalated a main-thread hang before it
@@ -257,8 +282,7 @@ pub(crate) struct StartupHang {
 }
 
 pub(crate) fn studio_startup_hang(pid: u32, started_unix: Option<u64>) -> Option<StartupHang> {
-    let bytes = std::fs::read(studio_log_for_process(pid, started_unix)?).ok()?;
-    startup_hang_in_log(&String::from_utf8_lossy(&bytes))
+    startup_hang_in_log(&studio_log_startup(pid, started_unix)?)
 }
 
 fn startup_hang_in_log(text: &str) -> Option<StartupHang> {
@@ -342,6 +366,7 @@ struct Observation<'a> {
     bound: Option<&'a str>,
     open_failures: &'a [(u32, String)],
     startup_hangs: &'a [(u32, StartupHang)],
+    signed_out: &'a [u32],
     starting: &'a [(u32, u64)],
 }
 
@@ -355,6 +380,7 @@ fn verdict_text(observation: &Observation<'_>) -> String {
         bound,
         open_failures,
         startup_hangs,
+        signed_out,
         starting,
     } = *observation;
     if !studio_running {
@@ -364,6 +390,11 @@ fn verdict_text(observation: &Observation<'_>) -> String {
         return format!(
             "Studio (pid {pid}) could not open its place: {}. It is left at its start page; `rbx sx --terminate` closes it, then check that the signed-in Studio account can edit the place and run `rbx so FILE` or `rbx ro` again.",
             reason.trim_end_matches('.')
+        );
+    }
+    if let Some(pid) = signed_out.first() {
+        return format!(
+            "Studio (pid {pid}) is signed out and shows the Roblox sign-in dialog instead of its place; sign in to Studio, then run the command again."
         );
     }
     if let Some((pid, hang)) = startup_hangs.first() {
@@ -448,6 +479,12 @@ pub(crate) fn diagnose(clients: &[Value], project_root: Option<&Path>) -> Value 
             studio_startup_hang(process.pid, process.started_unix).map(|hang| (process.pid, hang))
         })
         .collect::<Vec<_>>();
+    let signed_out = processes
+        .iter()
+        .filter(|process| !connected_pids.contains(&u64::from(process.pid)))
+        .filter(|process| studio_signed_out(process.pid, process.started_unix))
+        .map(|process| process.pid)
+        .collect::<Vec<_>>();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |value| value.as_secs());
@@ -456,6 +493,7 @@ pub(crate) fn diagnose(clients: &[Value], project_root: Option<&Path>) -> Value 
         .filter(|process| !connected_pids.contains(&u64::from(process.pid)))
         .filter(|process| !open_failures.iter().any(|(pid, _)| *pid == process.pid))
         .filter(|process| !startup_hangs.iter().any(|(pid, _)| *pid == process.pid))
+        .filter(|process| !signed_out.contains(&process.pid))
         .filter_map(|process| {
             let elapsed = now.saturating_sub(process.started_unix?);
             (elapsed < STARTING_GRACE_SECONDS).then_some((process.pid, elapsed))
@@ -470,6 +508,7 @@ pub(crate) fn diagnose(clients: &[Value], project_root: Option<&Path>) -> Value 
         bound: bound.as_deref(),
         open_failures: &open_failures,
         startup_hangs: &startup_hangs,
+        signed_out: &signed_out,
         starting: &starting,
     });
     json!({
@@ -482,6 +521,7 @@ pub(crate) fn diagnose(clients: &[Value], project_root: Option<&Path>) -> Value 
         "openPlaces": open_places,
         "openFailures": open_failures.iter().map(|(pid, reason)| json!({"pid": pid, "reason": reason})).collect::<Vec<_>>(),
         "startupHangs": startup_hangs.iter().map(|(pid, hang)| json!({"pid": pid, "instancesAtLaunch": hang.instances_at_launch, "signedIn": hang.signed_in})).collect::<Vec<_>>(),
+        "signedOut": signed_out,
         "starting": starting.iter().map(|(pid, elapsed)| json!({"pid": pid, "elapsedSeconds": elapsed})).collect::<Vec<_>>(),
         "boundTarget": bound,
         "verdict": verdict,
@@ -495,11 +535,61 @@ pub(crate) fn verdict(clients: &[Value], project_root: Option<&Path>) -> String 
         .to_string()
 }
 
+/// Whether a diagnosis reports a Studio at the Roblox sign-in dialog: waiting
+/// for it to connect is pointless until the user signs in.
+pub(crate) fn is_signed_out(diagnosis: &Value) -> bool {
+    diagnosis["signedOut"]
+        .as_array()
+        .is_some_and(|pids| !pids.is_empty())
+}
+
 /// Whether a diagnosis reports a Studio that is still opening its place.
 pub(crate) fn is_starting(diagnosis: &Value) -> bool {
     diagnosis["starting"]
         .as_array()
         .is_some_and(|starting| !starting.is_empty())
+}
+
+/// Whether a Studio process the project has not matched yet may still
+/// connect: one runs, none failed to open its place or hung at launch. A
+/// `status -w` keeps waiting for it (a daemon restart or a fresh launch
+/// connects its plugin a few seconds later).
+pub(crate) fn may_still_connect(diagnosis: &Value) -> bool {
+    let non_empty = |key: &str| {
+        diagnosis[key]
+            .as_array()
+            .is_some_and(|values| !values.is_empty())
+    };
+    non_empty("studioProcesses")
+        && !non_empty("openFailures")
+        && !non_empty("startupHangs")
+        && !non_empty("signedOut")
+}
+
+#[cfg(test)]
+mod wait_tests {
+    use serde_json::json;
+
+    use super::may_still_connect;
+
+    #[test]
+    fn a_running_studio_without_a_failure_may_still_connect() {
+        assert!(may_still_connect(&json!({
+            "studioProcesses": [{ "pid": 1 }],
+            "openFailures": [],
+            "startupHangs": [],
+        })));
+        assert!(!may_still_connect(&json!({
+            "studioProcesses": [],
+            "openFailures": [],
+            "startupHangs": [],
+        })));
+        assert!(!may_still_connect(&json!({
+            "studioProcesses": [{ "pid": 1 }],
+            "openFailures": [{ "pid": 1, "reason": "no access" }],
+            "startupHangs": [],
+        })));
+    }
 }
 
 #[cfg(test)]
@@ -535,6 +625,7 @@ mod tests {
             bound: None,
             open_failures: &[],
             startup_hangs: &[],
+            signed_out: &[],
             starting: &[],
         }
     }
@@ -570,6 +661,38 @@ mod tests {
             ..observation(Some(&plugin(Some(5))), false)
         });
         assert!(refused.contains("4700") && refused.contains("not authorized"));
+    }
+
+    #[test]
+    fn a_studio_at_the_sign_in_dialog_is_reported_signed_out_and_not_waited_for() {
+        let log = "2026-11-02T09:56:58.340Z,1.3,b63c,6 [FLog::StudioTimingLog] Authenticated : NO
+                   2026-11-02T09:56:58.401Z,1.4,b63c,6,Info [FLog::StudioKeyEvents] show login dialog [start]
+";
+        assert!(super::signed_out_in_log(log));
+        assert!(!super::signed_out_in_log(
+            "2026-11-02T09:56:58.340Z,1.3,b63c,6 [FLog::StudioTimingLog] Authenticated : NO
+"
+        ));
+        let verdict = verdict_text(&Observation {
+            studio_running: true,
+            plugin: None,
+            earliest_start: None,
+            clients_connected: false,
+            open_places: &[],
+            bound: None,
+            open_failures: &[],
+            startup_hangs: &[],
+            signed_out: &[4711],
+            starting: &[(4711, 3)],
+        });
+        assert!(
+            verdict.contains("4711") && verdict.contains("signed out"),
+            "{verdict}"
+        );
+        let diagnosis =
+            serde_json::json!({"signedOut": [4711], "studioProcesses": [{"pid": 4711}]});
+        assert!(super::is_signed_out(&diagnosis));
+        assert!(!super::may_still_connect(&diagnosis));
     }
 
     #[test]

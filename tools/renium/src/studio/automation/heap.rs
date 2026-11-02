@@ -45,8 +45,22 @@ fn summarize(report: &Value) -> Value {
         "graphTotalSize": heap["Graph"]["TotalSize"],
         "largestScripts": largest_scripts(&heap["Graph"]),
         "rootReferences": refs["Roots"].as_array().map_or(0, Vec::len),
-        "unparentedInstanceReferences": top_references(&refs["UnparentedReferences"]),
+        "unparentedInstanceReferences": top_references(unparented_references(refs)),
     })
+}
+
+/// Version 2 of Studio's reference report lists the Instances Luau holds
+/// outside the DataModel under `Roots` and leaves `UnparentedReferences`
+/// empty; version 1 filled the latter.
+fn unparented_references(refs: &Value) -> &Value {
+    let legacy = &refs["UnparentedReferences"];
+    if legacy.as_array().is_some_and(|entries| !entries.is_empty())
+        || refs["Version"].as_u64().is_some_and(|version| version < 2)
+    {
+        legacy
+    } else {
+        &refs["Roots"]
+    }
 }
 
 fn sorted_by<'a>(entries: &'a Value, key: &str) -> Vec<&'a Value> {
@@ -142,6 +156,31 @@ mod tests {
         assert_eq!(retained[0]["paths"][0], "Telemetry > sessions > Player2");
         assert_eq!(retained[1]["paths"][0], "RoundHandler > cars > 1");
         assert!(summary["userdata"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn version_two_reports_list_unparented_instances_under_roots() {
+        let report: Value = serde_json::from_str(
+            r#"{"Report":{"Version":1,"TagBreakdown":[],"MemcatBreakdown":[],"UserdataBreakdown":[],"Graph":{"TotalSize":1,"Children":[]}},
+            "Refs":{"Version":2,"UnparentedReferences":[],"Roots":[
+                {"Name":"Event (BindableEvent)","Count":1,"Instances":1,"Paths":[["from table field 'eDestroyed'"]]},
+                {"Name":"Leaked (Part)","Count":1,"Instances":1,"Paths":[["from table field 'keep'","from table field 'shared'"]]}]}}"#,
+        )
+        .unwrap();
+        let summary = summarize(&report);
+        assert_eq!(summary["rootReferences"], 2);
+        let retained = summary["unparentedInstanceReferences"].as_array().unwrap();
+        assert_eq!(retained.len(), 2);
+        assert!(retained.iter().any(|entry| entry["name"] == "Leaked (Part)"
+            && entry["paths"][0] == "from table field 'keep' > from table field 'shared'"));
+        let legacy: Value = serde_json::from_str(REPORT).unwrap();
+        assert_eq!(
+            unparented_references(&legacy["Refs"])
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]

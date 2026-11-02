@@ -296,10 +296,8 @@ pub(crate) fn run(args: ReportArgs, global_project: Option<&Path>) -> Result<()>
         "https://github.com/Superwheat/renium/issues/new?title={}",
         url_encode(&format!(
             "{id}: {}",
-            args.message
+            message
                 .as_deref()
-                .map(str::trim)
-                .filter(|message| !message.is_empty())
                 .map_or("Renium bug report".to_string(), |message| message
                     .chars()
                     .take(80)
@@ -969,11 +967,14 @@ fn tail_lines(path: &Path, count: usize) -> String {
     lines[start..].join("\n")
 }
 
-fn write_zip(path: &Path, files: &[(String, Vec<u8>)]) -> Result<()> {
+pub(crate) fn write_zip(path: &Path, files: &[(String, Vec<u8>)]) -> Result<()> {
     let file =
         fs::File::create(path).with_context(|| format!("Failed to create {}", path.display()))?;
     let mut writer = zip::ZipWriter::new(file);
     // A fixed entry time keeps two reports of the same files byte-identical.
+    // 1980-01-01 00:00:00 reads as "no timestamp" to several archive tools
+    // and to the zip crate's own default, so entries carry the next second
+    // the DOS format can represent.
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated)
         .last_modified_time(
@@ -1206,6 +1207,42 @@ mod tests {
         );
         assert!(refused.unwrap_err().to_string().contains("no report.json"));
         assert!(upload_receipt(b"<html>", "RNM-20261021-AB12CD").is_err());
+    }
+
+    #[test]
+    fn report_zip_entries_carry_the_fixed_timestamp() {
+        let dir = std::env::temp_dir().join(format!("renium-report-zip-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("report.zip");
+        write_zip(
+            &path,
+            &[
+                ("report.json".to_string(), b"{}".to_vec()),
+                ("logs\\daemon.log".to_string(), b"log".to_vec()),
+            ],
+        )
+        .unwrap();
+        let mut archive = zip::ZipArchive::new(fs::File::open(&path).unwrap()).unwrap();
+        assert_eq!(archive.len(), 2);
+        for index in 0..archive.len() {
+            let entry = archive.by_index(index).unwrap();
+            let time = entry.last_modified().unwrap();
+            assert_eq!(
+                (
+                    time.year(),
+                    time.month(),
+                    time.day(),
+                    time.hour(),
+                    time.minute(),
+                    time.second()
+                ),
+                (1980, 1, 1, 0, 0, 2),
+                "{}",
+                entry.name()
+            );
+            assert!(!entry.name().contains('\\'), "{}", entry.name());
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

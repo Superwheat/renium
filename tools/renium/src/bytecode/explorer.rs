@@ -747,10 +747,11 @@ pub(crate) fn bytecode_explorer_batch_result(mut args: BytecodeExplorerBatchArgs
                 continue;
             };
             let Ok(relative) = path.strip_prefix(stage.root()) else {
-                *settings_file = None;
                 continue;
             };
-            *settings_file = config::project_staged_path_to_source(loaded, relative).ok();
+            *settings_file = config::project_staged_path_to_source(loaded, relative)
+                .ok()
+                .map(|path| project_store_path(&path));
         }
         for (index, instance) in document.instances.iter().enumerate() {
             if let Some((settings_file, settings_id)) =
@@ -797,6 +798,21 @@ pub(crate) fn bytecode_explorer_batch_result(mut args: BytecodeExplorerBatchArgs
     insert_top_field(&mut response, top_mode, "service", Value::String(service));
     insert_top_field(&mut response, top_mode, "results", Value::Array(results));
     Ok(Value::Object(response))
+}
+
+/// A staged store maps back to the legacy in-source file name; the project's
+/// own store for that service lives where the store layout says.
+fn project_store_path(path: &Path) -> PathBuf {
+    match path.parent() {
+        Some(service_dir)
+            if path
+                .file_name()
+                .is_some_and(|name| name == crate::system::files::SERVICE_SETTINGS_FILE_NAME) =>
+        {
+            service_settings_path(service_dir)
+        }
+        _ => path.to_path_buf(),
+    }
 }
 
 fn bytecode_explorer_batch_op_json(
@@ -996,7 +1012,9 @@ fn bytecode_explorer_batch_op_json(
                 .filter_map(|index| ctx.document.instances.get(*index))
                 .map(|instance| Value::String(instance.settings_id.clone()))
                 .collect::<Vec<_>>();
-            let visible_ids = visible_indices
+            let mut visible_sorted = visible_indices.iter().copied().collect::<Vec<_>>();
+            visible_sorted.sort_unstable();
+            let visible_ids = visible_sorted
                 .iter()
                 .filter_map(|index| ctx.document.instances.get(*index))
                 .map(|instance| Value::String(instance.settings_id.clone()))

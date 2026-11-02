@@ -448,7 +448,7 @@ fn write_png(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) -> Re
     let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
-    encoder.set_filter(png::FilterType::Paeth);
+    encoder.set_filter(crate::studio::CAPTURE_PNG_FILTER);
     let _ = encoder.add_text_chunk(
         "Software".to_string(),
         "capture-rs 0.5.3+build.57".to_string(),
@@ -2300,6 +2300,7 @@ mod platform {
     unsafe extern "C" {
         fn AXIsProcessTrusted() -> bool;
         fn AXUIElementCreateApplication(pid: i32) -> AXUIElementRef;
+        fn AXUIElementSetMessagingTimeout(element: AXUIElementRef, timeout_seconds: f32) -> i32;
         fn AXUIElementCopyAttributeValue(
             element: AXUIElementRef,
             attribute: CFStringRef,
@@ -2474,6 +2475,11 @@ mod platform {
         if application.is_null() {
             bail!("Could not inspect the Studio accessibility tree");
         }
+        // A Studio that is starting or loading a place does not answer
+        // accessibility messages for seconds; without a timeout every status
+        // that lists windows waits that long per Studio.
+        // SAFETY: application is the owned element created above.
+        unsafe { AXUIElementSetMessagingTimeout(application, 1.0) };
         Ok(application)
     }
 

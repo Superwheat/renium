@@ -424,6 +424,23 @@ fn newest_history_file(project_root: &Path, path: &Path) -> Result<sync_history:
 
 fn revert_sync_entry_file(args: EditorRevertArgs, file: sync_history::SyncEntryFile) -> Result<()> {
     if args.print {
+        // A store is compressed bytecode; its text form is what a reader can
+        // grep, the same rendering git diff shows through vc-textconv.
+        if file
+            .path
+            .extension()
+            .is_some_and(|extension| extension == "renium")
+        {
+            let document = crate::settings::bytecode::decode_settings_bytecode(&file.bytes)
+                .with_context(|| {
+                    format!("Could not decode the saved store {}", file.path.display())
+                })?;
+            print!(
+                "{}",
+                crate::project::version_control::settings_doc_to_text(&document)
+            );
+            return Ok(());
+        }
         std::io::stdout()
             .write_all(&file.bytes)
             .context("Failed to write the saved file content")?;

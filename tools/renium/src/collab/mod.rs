@@ -375,6 +375,7 @@ impl Session {
         }
         let mut mirror = Mirror::open(
             &self.root,
+            &self.name,
             self.room.awareness().clone(),
             self.stats.clone(),
         )?;

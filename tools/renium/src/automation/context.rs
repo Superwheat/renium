@@ -209,20 +209,32 @@ fn client_local_file(bridge: &BridgeServer, entry: &Value) -> Option<PathBuf> {
     }
 }
 
+/// Keeps the Studios whose document sits in this project root. Without one,
+/// and when the command named no place itself, Studios whose document sits in
+/// another Renium project root belong to that project and drop out; a named
+/// place keeps them, since the name may mean one of them.
 fn prefer_project_local_file(
     candidates: Vec<Value>,
     root: &Path,
+    drop_foreign: bool,
     mut local_file: impl FnMut(&Value) -> Option<PathBuf>,
 ) -> Vec<Value> {
-    let own = candidates
-        .iter()
-        .filter(|entry| {
-            local_file(entry)
-                .is_some_and(|file| canonical_path(&file).unwrap_or(file).parent() == Some(root))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if own.is_empty() { candidates } else { own }
+    // Both sides canonical: on macOS a document path can resolve through the
+    // data volume (/System/Volumes/Data/Users/...) while the root does not.
+    let root = canonical_path(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut own = Vec::new();
+    let mut others = Vec::new();
+    for entry in candidates {
+        let folder = local_file(&entry)
+            .map(|file| canonical_path(&file).unwrap_or(file))
+            .and_then(|file| file.parent().map(Path::to_path_buf));
+        match folder {
+            Some(folder) if folder == root => own.push(entry),
+            Some(folder) if drop_foreign && folder.join(config::PROJECT_FILE_NAME).is_file() => {}
+            _ => others.push(entry),
+        }
+    }
+    if own.is_empty() { others } else { own }
 }
 
 pub(super) fn studio_candidates_from(clients: &[Value], selector: &str) -> Vec<Value> {
@@ -370,16 +382,47 @@ fn studio_candidates_with_titles(
         let Some(title) = entry["runtimeId"].as_str().and_then(&mut window_title) else {
             continue;
         };
-        let Some(name) = title.strip_suffix(" - Roblox Studio").map(str::trim) else {
-            continue;
+        let documents = studio_title_documents(&title);
+        let matches = |name: &str| {
+            let info = BridgeInfoPayload {
+                place_name: name.to_string(),
+                ..Default::default()
+            };
+            place_matches(&info, selector)
         };
-        let info = BridgeInfoPayload {
-            place_name: name.to_string(),
-            ..Default::default()
-        };
-        if place_matches(&info, selector) {
+        let matched = documents
+            .iter()
+            .find(|name| name.eq_ignore_ascii_case(selector.trim()))
+            .or_else(|| documents.iter().find(|name| matches(name)))
+            .copied();
+        if let Some(name) = matched {
             entry["studioName"] = json!(name);
             candidates.push(entry);
+        }
+    }
+    candidates
+}
+
+/// The document names a Studio window title can stand for. The title is
+/// "<document> - Roblox Studio"; an open script tab appends " - <Script>" to
+/// the document, so the whole remainder comes first and every shorter prefix
+/// at a " - " boundary follows.
+#[cfg(any(windows, target_os = "macos", test))]
+pub(crate) fn studio_title_documents(title: &str) -> Vec<&str> {
+    let Some(value) = title.strip_suffix(" - Roblox Studio") else {
+        return Vec::new();
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Vec::new();
+    }
+    let mut candidates = vec![value];
+    let mut end = value.len();
+    while let Some(index) = value[..end].rfind(" - ") {
+        end = index;
+        let prefix = value[..end].trim_end();
+        if !prefix.is_empty() {
+            candidates.push(prefix);
         }
     }
     candidates
@@ -629,15 +672,13 @@ pub(super) fn bind(
     }
     // Older sessions may predate the persisted `rbx so` target. An OS-reported
     // absolute document path in this root still identifies its local project.
-    if candidates.len() > 1
-        && requested_runtime.is_none()
-        && requested_place.is_none()
-        && manifest_place_id.is_none()
-        && saved_target.is_none()
-    {
-        candidates = prefer_project_local_file(candidates, &project_root, |entry| {
-            client_local_file(bridge, entry)
-        });
+    if candidates.len() > 1 && requested_runtime.is_none() {
+        candidates = prefer_project_local_file(
+            candidates,
+            &project_root,
+            requested_place.is_none(),
+            |entry| client_local_file(bridge, entry),
+        );
     }
     if candidates.len() > 1 {
         return Err(ambiguous_studios(&candidates));
@@ -766,7 +807,7 @@ pub(super) fn resolve(
                 ));
             }
         } else {
-            let candidates = studio_candidates(bridge, &context.selector)?;
+            let candidates = own_project_candidates(bridge, &context)?;
             if candidates.len() > 1 {
                 return Err(ambiguous_studios(&candidates));
             }
@@ -792,7 +833,7 @@ pub(super) fn resolve(
                 .unwrap_or(context);
         }
     } else {
-        let candidates = studio_candidates(bridge, &context.selector)?;
+        let candidates = own_project_candidates(bridge, &context)?;
         if candidates.len() > 1 {
             return Err(ambiguous_studios(&candidates));
         }
@@ -811,8 +852,37 @@ pub(super) fn resolve(
     Ok(context)
 }
 
+/// The Studios that can answer for a bound context whose runtime is not
+/// pinned: same-named windows whose documents belong to other projects fall
+/// away before the remaining ones count as ambiguous.
+fn own_project_candidates(
+    bridge: &BridgeServer,
+    context: &BoundContext,
+) -> std::result::Result<Vec<Value>, Failure> {
+    let mut candidates = studio_candidates(bridge, &context.selector)?;
+    if candidates.len() > 1 {
+        let root = canonical_path(Path::new(&context.root))
+            .unwrap_or_else(|_| PathBuf::from(&context.root));
+        candidates =
+            prefer_project_local_file(candidates, &root, context.selector.is_empty(), |entry| {
+                client_local_file(bridge, entry)
+            });
+    }
+    Ok(candidates)
+}
+
 pub(crate) fn select(context: &BoundContext) -> Selection {
     crate::app::context::select_automation(
+        context.runtime_id.clone(),
+        PathBuf::from(&context.project),
+        (!context.selector.is_empty()).then(|| context.selector.clone()),
+    )
+}
+
+/// The selection of a request that runs beside requests of other Studios,
+/// seen by its own thread only.
+pub(crate) fn select_for_thread(context: &BoundContext) -> Selection {
+    crate::app::context::select_automation_for_thread(
         context.runtime_id.clone(),
         PathBuf::from(&context.project),
         (!context.selector.is_empty()).then(|| context.selector.clone()),
@@ -851,7 +921,7 @@ mod tests {
         }
         let clients = vec![json!({"runtimeId":"one"}), json!({"runtimeId":"two"})];
         let project = canonical_path(&root.join("two")).unwrap();
-        let selected = prefer_project_local_file(clients.clone(), &project, |entry| {
+        let selected = prefer_project_local_file(clients.clone(), &project, true, |entry| {
             Some(
                 root.join(entry["runtimeId"].as_str().unwrap())
                     .join("place.rbxl"),
@@ -859,7 +929,26 @@ mod tests {
         });
         assert_eq!(selected, vec![clients[1].clone()]);
         assert_eq!(
-            prefer_project_local_file(clients.clone(), &project, |_| None),
+            prefer_project_local_file(clients.clone(), &project, true, |_| None),
+            clients
+        );
+        fs::write(root.join("one").join(config::PROJECT_FILE_NAME), "{}").unwrap();
+        fs::create_dir(root.join("elsewhere")).unwrap();
+        let elsewhere = canonical_path(&root.join("elsewhere")).unwrap();
+        let document = |entry: &Value| {
+            Some(
+                root.join(entry["runtimeId"].as_str().unwrap())
+                    .join("place.rbxl"),
+            )
+        };
+        assert_eq!(
+            prefer_project_local_file(clients.clone(), &elsewhere, true, document),
+            vec![clients[1].clone()]
+        );
+        fs::write(root.join("two").join(config::PROJECT_FILE_NAME), "{}").unwrap();
+        assert!(prefer_project_local_file(clients.clone(), &elsewhere, true, document).is_empty());
+        assert_eq!(
+            prefer_project_local_file(clients.clone(), &elsewhere, false, document),
             clients
         );
         let target = StudioReopenTarget {
@@ -1008,6 +1097,14 @@ mod tests {
         let candidates =
             studio_candidates_with_titles(&clients, "DTE", |_| Some("DTE - Roblox Studio".into()));
         assert_eq!(candidates.len(), 2);
+        let with_tab = studio_candidates_with_titles(&clients, "DTE", |runtime| {
+            Some(format!(
+                "{} - Main - Roblox Studio",
+                if runtime == "one" { "Baseplate" } else { "DTE" }
+            ))
+        });
+        assert_eq!(with_tab.len(), 1);
+        assert_eq!(with_tab[0]["studioName"], "DTE");
         assert_eq!(ambiguous_studios(&candidates).0.c, "ambiguous_place");
     }
 

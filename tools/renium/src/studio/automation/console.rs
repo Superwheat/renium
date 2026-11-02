@@ -121,6 +121,7 @@ fn console_daemon_parameters(
         "server": args.server,
         "player": args.player,
         "grep": args.grep,
+        "fixed": args.fixed,
         "level": args.level,
         "bridgeWaitSeconds": args.bridge.wait_seconds,
         "bridgePorts": args.bridge.ports,
@@ -355,8 +356,14 @@ impl ConsoleMatcher {
                 .or_else(|| entry.get("level"))
                 .and_then(Value::as_str)
                 .unwrap_or("output");
-            if !entry_level.eq_ignore_ascii_case(level)
-                && !short_console_level(entry_level).eq_ignore_ascii_case(level)
+            // `output` is the level word the help lists for ordinary prints.
+            let wanted = if level.eq_ignore_ascii_case("output") {
+                "print"
+            } else {
+                level
+            };
+            if !entry_level.eq_ignore_ascii_case(wanted)
+                && !short_console_level(entry_level).eq_ignore_ascii_case(wanted)
             {
                 return false;
             }

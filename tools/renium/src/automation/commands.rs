@@ -405,17 +405,93 @@ pub(crate) fn multi_edit(args: MultiEditArgs, project: Option<&Path>) -> Result<
             })
         })
         .collect::<Vec<_>>();
+    // The guide's form names the project file; Studio edits the instance it
+    // maps to, and the file gets the same replacements so both sides agree
+    // whether or not Live Sync is running.
+    let file = script_file_for_multi_edit(&args.file, project)?;
+    let target = match &file {
+        Some((_, instance_path)) => instance_path.clone(),
+        None => args.file.clone(),
+    };
     run_daemon(
         op::MULTI_EDIT,
         project,
         json!({
-            "filePath": args.file,
+            "filePath": target,
             "className": args.class,
             "edits": edits,
         }),
         false,
         Some(&args.bridge),
-    )
+    )?;
+    if let Some((path, _)) = file {
+        let mut source = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        for pair in pairs {
+            source = if args.all {
+                source.replace(&pair[0], &pair[1])
+            } else {
+                source.replacen(&pair[0], &pair[1], 1)
+            };
+        }
+        std::fs::write(&path, source)
+            .with_context(|| format!("Failed to write {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// A project script file named on the command line, with the Studio instance
+/// path the sourcemap maps it to; `None` when the argument is not an existing
+/// file (an instance path, or a new script to create).
+fn script_file_for_multi_edit(
+    argument: &str,
+    project: Option<&Path>,
+) -> Result<Option<(PathBuf, String)>> {
+    let candidate = PathBuf::from(argument);
+    if !candidate.is_file() {
+        return Ok(None);
+    }
+    let loaded = config::load_project(project, None)?;
+    let root = loaded.root.clone();
+    let absolute = std::fs::canonicalize(&candidate).unwrap_or(candidate.clone());
+    let relative =
+        crate::project::sourcemap::path_to_sourcemap_relative(&root, &absolute).to_lowercase();
+    let sourcemap = match crate::project::sourcemap::load_existing_sourcemap_root(&root)? {
+        Some(sourcemap) => sourcemap,
+        None => {
+            crate::project::sourcemap::generate_project_sourcemap(&root)?;
+            crate::project::sourcemap::load_existing_sourcemap_root(&root)?
+                .context("The sourcemap could not be generated")?
+        }
+    };
+    fn search(
+        node: &crate::project::sourcemap::SourcemapNode,
+        relative: &str,
+        trail: &mut Vec<String>,
+    ) -> Option<String> {
+        if node
+            .file_paths
+            .iter()
+            .any(|path| path.replace('\\', "/").to_lowercase() == relative)
+        {
+            return Some(trail.join("."));
+        }
+        for child in &node.children {
+            trail.push(child.name.clone());
+            if let Some(found) = search(child, relative, trail) {
+                return Some(found);
+            }
+            trail.pop();
+        }
+        None
+    }
+    let mut trail = Vec::new();
+    let Some(instance_path) = search(&sourcemap, &relative, &mut trail) else {
+        bail!(
+            "{argument} is not a script the project maps to an instance; pass the instance path (ServerScriptService.Main) or -c CLASS to create a new script"
+        );
+    };
+    Ok(Some((absolute, instance_path)))
 }
 
 fn target(value: &str) -> Result<Map<String, Value>> {

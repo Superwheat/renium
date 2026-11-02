@@ -14,12 +14,26 @@ const PLACE_PROJECT_PATHS: &[&str] = &[
     "renium.project.jsonc",
     "renium.project.json",
     ".renium",
+    "instances",
     "sourcemap.json",
     "renium-link.json",
     "wally.toml",
     "wally.lock",
     "Packages",
 ];
+
+/// A published id of the bound context; an unpublished place reports 0 and
+/// decides nothing.
+fn published_id(id: Option<i64>) -> Option<i64> {
+    id.filter(|id| *id > 0)
+}
+
+/// Whether the place being added is the current project itself: only a
+/// published current place can be the one named. An unpublished place keeps
+/// its own entry (place id 0) and the named place is added beside it.
+fn converts_current_place(bound_place_id: Option<i64>, place_id: i64) -> bool {
+    published_id(bound_place_id) == Some(place_id)
+}
 
 fn string(object: &Map<String, Value>, key: &str) -> Option<String> {
     object.get(key).and_then(|value| match value {
@@ -211,16 +225,17 @@ fn convert_single_place(
     name: String,
     alias: String,
 ) -> Result<Value> {
-    if let Some(current_game_id) = context.game_id
-        && current_game_id > 0
+    let bound_game_id = published_id(context.game_id);
+    let bound_place_id = published_id(context.place_id);
+    if let Some(current_game_id) = bound_game_id
         && game_id > 0
         && current_game_id != game_id
     {
         bail!("Place gameId {game_id} does not match project gameId {current_game_id}");
     }
     let experience = Path::new(&context.experience);
-    let same_place = context.place_id.is_none_or(|current| current == place_id);
-    let current_place_id = context.place_id.unwrap_or(place_id);
+    let same_place = converts_current_place(bound_place_id, place_id);
+    let current_place_id = bound_place_id.unwrap_or(0);
     let current_name = if same_place {
         name.clone()
     } else {
@@ -283,7 +298,7 @@ fn convert_single_place(
     }
     let manifest = json!({
         "version": 2,
-        "gameId": context.game_id.unwrap_or(game_id),
+        "gameId": bound_game_id.unwrap_or(game_id),
         "startPlace": current_alias,
         "placeOrder": order,
         "places": places,
@@ -313,7 +328,8 @@ pub(super) fn add(context: &BoundContext, parameters: &Value) -> Result<Value> {
     let game_id = object
         .get("gameId")
         .and_then(Value::as_i64)
-        .or(context.game_id)
+        .filter(|id| *id > 0)
+        .or(published_id(context.game_id))
         .unwrap_or(0);
     let name = string(object, "name").context("place-add requires p.name")?;
     let requested_alias = string(object, "alias").unwrap_or_else(|| name.clone());
@@ -492,4 +508,46 @@ pub(super) fn reorder(context: &BoundContext, parameters: &Value) -> Result<Valu
     manifest["placeOrder"] = serde_json::to_value(&order)?;
     write(&path, &manifest)?;
     Ok(json!({ "order": order, "rebind": true }))
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    #[test]
+    fn the_stores_move_into_the_place_root_with_the_project_files() {
+        let experience = crate::tests::support::temp_dir("place-migration");
+        for directory in ["instances", "src", ".renium"] {
+            fs::create_dir_all(experience.join(directory)).unwrap();
+        }
+        fs::write(experience.join("instances").join("Workspace.renium"), b"x").unwrap();
+        fs::write(experience.join("renium.project.jsonc"), b"{}").unwrap();
+        let root = experience.join("places").join("lobby");
+        let moves = migration_paths(&experience, &root, Path::new("src")).unwrap();
+        let moved = moves
+            .iter()
+            .map(|(source, _)| {
+                source
+                    .strip_prefix(&experience)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            moved,
+            vec![".renium", "instances", "renium.project.jsonc", "src"]
+        );
+        assert!(
+            moves
+                .iter()
+                .all(|(_, destination)| destination.starts_with(&root))
+        );
+        assert_eq!(published_id(Some(0)), None);
+        assert_eq!(published_id(Some(222)), Some(222));
+        assert!(converts_current_place(Some(222), 222));
+        assert!(!converts_current_place(Some(333), 222));
+        assert!(!converts_current_place(Some(0), 222));
+        assert!(!converts_current_place(None, 222));
+    }
 }

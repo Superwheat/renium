@@ -244,6 +244,11 @@ pub(crate) fn is_user_facing_protected_write(
     if has_protected_texture_pack(class_name) && name == TEXTURE_PACK_PROPERTY {
         return true;
     }
+    if super::native_roots::is_property(class_name, name)
+        || super::native_geometry::is_mesh_geometry_property(class_name, name)
+    {
+        return true;
+    }
     let Some(descriptor) = rbx_property_descriptor(database, class_name, name) else {
         return false;
     };
@@ -730,15 +735,40 @@ fn editor_review_chunks(rows: Vec<Value>, max_bytes: usize) -> Result<Vec<Vec<Va
     Ok(chunks)
 }
 
+/// The project's review threshold (`liveSync.changesThreshold`), when the
+/// configuration sets one; the plugin's own setting applies otherwise.
+fn configured_changes_threshold(project_root: Option<&Path>) -> Option<u64> {
+    let config = crate::project::config::load_merged_config(project_root?).ok()?;
+    config.get("liveSync")?.get("changesThreshold")?.as_u64()
+}
+
+pub(crate) fn editor_review_hold_notice(label: &str, review_id: &str, change_count: u64) -> String {
+    format!(
+        "[renium] {label} held for review in Studio (id={review_id}, changes={change_count}); `rbx rv apply` or `rbx rv skip` decides, an unanswered review is skipped after 90 s (a protected-write review applies), `--yes` skips the review"
+    )
+}
+
+fn notify_editor_review_hold(response: &Value, label: &str, change_count: u64) {
+    if response.get("required").and_then(Value::as_bool) != Some(true) {
+        return;
+    }
+    let Some(review_id) = response.get("reviewId").and_then(Value::as_str) else {
+        return;
+    };
+    crate::daemon::emit_request_notice(&editor_review_hold_notice(label, review_id, change_count));
+}
+
 pub(crate) fn request_editor_push_review(
     bridge: &BridgeServer,
     changes: &EditorChangeSet,
+    project_root: Option<&Path>,
 ) -> Result<bool> {
     let (change_count, rows) = editor_review_payload(changes);
     if change_count == 0 {
         return Ok(true);
     }
     let row_count = rows.len();
+    let changes_threshold = configured_changes_threshold(project_root);
     if global_log_enabled(5) {
         println!(
             "[renium] review rows: {}",
@@ -751,6 +781,7 @@ pub(crate) fn request_editor_push_review(
             "requestEditorPushReview",
             json!({
                 "changeCount": change_count,
+                "changesThreshold": changes_threshold,
                 "rows": chunks.into_iter().next().unwrap_or_default(),
             }),
         )
@@ -761,6 +792,7 @@ pub(crate) fn request_editor_push_review(
             json!({
                 "uploadId": &upload_id,
                 "changeCount": change_count,
+                "changesThreshold": changes_threshold,
                 "rowCount": row_count,
                 "totalChunks": chunks.len(),
             }),
@@ -803,6 +835,7 @@ pub(crate) fn request_editor_push_review(
             return Err(err.context("Editor push review is unavailable"));
         }
     };
+    notify_editor_review_hold(&response, "editor push", change_count);
     wait_for_editor_review_decision(bridge, response, change_count, "editor push")
 }
 
@@ -816,6 +849,7 @@ pub(crate) fn request_protected_write_review(
     let response = bridge
         .call("requestProtectedWriteReview", json!({ "rows": rows }))
         .context("Protected property review is unavailable")?;
+    notify_editor_review_hold(&response, "protected property fallback", rows.len() as u64);
     wait_for_editor_review_decision(
         bridge,
         response,
@@ -1067,12 +1101,60 @@ pub(crate) fn studio_title_for_bridge(bridge: &BridgeServer, _pid: u32) -> Resul
         .place_name)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn local_place_path_from_studio_title(title: &str) -> Option<PathBuf> {
-    let value = title.strip_suffix(" - Roblox Studio")?.trim();
-    let path = PathBuf::from(value);
-    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
-    (path.is_absolute() && matches!(extension.as_str(), "rbxl" | "rbxlx")).then_some(path)
+    // An open script tab appends " - <Script>" to the document in the title;
+    // the longest prefix that is an absolute place path is the document.
+    crate::automation::context::studio_title_documents(title)
+        .into_iter()
+        .find_map(|value| {
+            let path = PathBuf::from(value.trim_end_matches('*').trim_end());
+            let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+            (path.is_absolute() && matches!(extension.as_str(), "rbxl" | "rbxlx")).then_some(path)
+        })
+}
+
+#[cfg(test)]
+mod studio_title_tests {
+    use super::local_place_path_from_studio_title;
+    use std::path::PathBuf;
+
+    #[test]
+    fn an_open_script_tab_does_not_hide_the_place_path() {
+        let plain = if cfg!(windows) {
+            r"E:\work\Scenario.rbxl - Roblox Studio"
+        } else {
+            "/work/Scenario.rbxl - Roblox Studio"
+        };
+        let expected = PathBuf::from(plain.strip_suffix(" - Roblox Studio").unwrap());
+        assert_eq!(
+            local_place_path_from_studio_title(plain),
+            Some(expected.clone())
+        );
+        let with_tab = format!("{} - Main - Roblox Studio", expected.display());
+        assert_eq!(
+            local_place_path_from_studio_title(&with_tab),
+            Some(expected.clone())
+        );
+        let dashed = if cfg!(windows) {
+            r"E:\work\My Game - Copy.rbxl - Main - Roblox Studio"
+        } else {
+            "/work/My Game - Copy.rbxl - Main - Roblox Studio"
+        };
+        assert_eq!(
+            local_place_path_from_studio_title(dashed).map(|path| path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()),
+            Some("My Game - Copy.rbxl".to_string())
+        );
+        assert_eq!(
+            local_place_path_from_studio_title("DTE - Main - Roblox Studio"),
+            None
+        );
+        assert_eq!(local_place_path_from_studio_title("Roblox Studio"), None);
+    }
 }
 
 #[cfg(windows)]
@@ -1424,7 +1506,7 @@ pub(crate) fn apply_protected_writes_offline(
         bridge,
         &original_path,
         &previous_runtime_id,
-        args.bridge.wait_seconds.max(20.0),
+        args.bridge.wait_seconds.max(90.0),
     )?;
     if let Err(error) = fs::remove_file(&backup) {
         eprintln!(
@@ -1499,6 +1581,35 @@ mod root_write_evidence_tests {
         assert!(rows[0].get("oldValue").is_none());
         assert_eq!(rows[0]["oldValueMissing"], true);
         assert_eq!(&rows[1..], others);
+    }
+}
+
+#[cfg(test)]
+mod review_threshold_tests {
+    use std::fs;
+
+    use super::*;
+
+    #[test]
+    fn the_project_threshold_is_read_from_the_place_configuration() {
+        let root = crate::tests::support::temp_dir("review-threshold");
+        fs::write(root.join("renium.project.jsonc"), r#"{"schemaVersion":1}"#).unwrap();
+        assert_eq!(configured_changes_threshold(Some(&root)), None);
+        fs::create_dir_all(root.join(".renium")).unwrap();
+        fs::write(
+            root.join(".renium").join("config.json"),
+            r#"{"schemaVersion":1,"liveSync":{"changesThreshold":0}}"#,
+        )
+        .unwrap();
+        assert_eq!(configured_changes_threshold(Some(&root)), Some(0));
+        assert_eq!(configured_changes_threshold(None), None);
+    }
+
+    #[test]
+    fn the_hold_notice_names_the_review_and_its_decisions() {
+        let notice = editor_review_hold_notice("editor push", "r-1", 2);
+        assert!(notice.contains("held for review in Studio (id=r-1, changes=2)"));
+        assert!(notice.contains("rbx rv apply"));
     }
 }
 

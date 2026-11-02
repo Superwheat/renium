@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result, bail};
@@ -363,6 +363,38 @@ fn parse_link_manifest(raw: &str) -> Result<LinkManifest> {
     let manifest: LinkManifest = serde_json::from_str(raw)?;
     validate_link_manifest(&manifest)?;
     Ok(manifest)
+}
+
+/// The link manifest and the local link sources inside the project (package
+/// files, mirrored files and folders): what another copy of the project needs
+/// for its links to resolve. Global and out-of-project sources stay out. The
+/// manifest path is listed even before the file exists, so its creation is
+/// noticed.
+pub(crate) fn project_link_inputs(project_root: &Path) -> Vec<PathBuf> {
+    let manifest_path = link_manifest_path(project_root, Path::new("renium-link.json"));
+    let mut paths = vec![manifest_path.clone()];
+    if !manifest_path.is_file() {
+        return paths;
+    }
+    let Ok(manifest) = read_link_manifest(&manifest_path) else {
+        return paths;
+    };
+    for link in &manifest.links {
+        let LinkSource::Local { path } = &link.source else {
+            continue;
+        };
+        let relative = Path::new(path);
+        if is_global_link_path(path)
+            || relative.is_absolute()
+            || relative
+                .components()
+                .any(|part| !matches!(part, Component::Normal(_) | Component::CurDir))
+        {
+            continue;
+        }
+        paths.push(project_root.join(relative));
+    }
+    paths
 }
 
 pub(crate) fn local_project_package_paths(project_root: &Path) -> Result<Vec<PathBuf>> {
@@ -3731,6 +3763,12 @@ pub(crate) struct LinkEnforcement {
     active: bool,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Read-only package files decoded on this thread by `build_link_enforcement`.
+    pub(crate) static READ_ONLY_PACKAGE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) struct ReadOnlyPackageEnforcement {
     pub(crate) link_id: String,
     pub(crate) service: String,
@@ -3823,6 +3861,31 @@ impl LinkEnforcement {
         }
         Ok(())
     }
+
+    /// Whether `path` is the root of a read-only package whose package holds
+    /// no PackageLink at its root (`lkp --share` strips it): unlinking the
+    /// Roblox package there brings the copy back to its package.
+    pub(crate) fn unlink_matches_package(
+        &self,
+        service: &str,
+        path_segments: &[String],
+        path_ordinals: &[usize],
+    ) -> bool {
+        let Some(target) = self.read_only_package_for_path(service, path_segments, path_ordinals)
+        else {
+            return false;
+        };
+        let depth = path_segments.len()
+            - usize::from(path_segments.first().map(String::as_str) == Some(service));
+        depth == target.target_segments.len()
+            && target.package.as_deref().is_some_and(|package| {
+                settings_root_indices(package).first().is_some_and(|root| {
+                    !package.instances.iter().any(|instance| {
+                        instance.parent_index == Some(*root) && instance.class_name == "PackageLink"
+                    })
+                })
+            })
+    }
 }
 
 pub(crate) fn build_loaded_project_link_enforcement(
@@ -3890,6 +3953,8 @@ pub(crate) fn build_link_enforcement(
             let (package, fingerprint) = match packages.entry(package_path.clone()) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::hash_map::Entry::Vacant(entry) => {
+                    #[cfg(test)]
+                    READ_ONLY_PACKAGE_READS.with(|reads| reads.set(reads.get() + 1));
                     let package = SettingsBytecode::read_file(package_path).with_context(|| {
                         format!(
                             "Failed to read read-only link package {}",

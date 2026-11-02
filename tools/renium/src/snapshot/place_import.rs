@@ -48,7 +48,7 @@ pub(crate) fn import_place_file(mut args: ImportPlaceArgs) -> Result<()> {
         sourcemap_writer,
         direct_import_dispatcher,
         export_services,
-    } = prepare_export_execution(&args.src_dir, &project_root, &services, total_started)?;
+    } = prepare_export_execution(&args.src_dir, &project_root, None, &services, total_started)?;
     let mut filters = HashMap::new();
     let mut imported = 0usize;
     for service in &export_services {

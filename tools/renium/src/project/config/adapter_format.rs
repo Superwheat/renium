@@ -429,8 +429,10 @@ fn write_value_to_luau(output: &mut String, value: &Value, depth: usize) -> Resu
                 if index > 0 {
                     output.push_str(", ");
                 }
+                // A long-bracket key right after `[` would open a long string
+                // (`[[[k]]]`), so keys are quoted.
                 output.push('[');
-                write_luau_string(output, key);
+                write_luau_quoted_string(output, key);
                 output.push_str("] = ");
                 write_value_to_luau(output, value, depth + 1)?;
             }
@@ -438,6 +440,24 @@ fn write_value_to_luau(output: &mut String, value: &Value, depth: usize) -> Resu
         }
     }
     Ok(())
+}
+
+fn write_luau_quoted_string(output: &mut String, value: &str) {
+    output.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            control if control.is_control() => {
+                output.push_str(&format!("\\u{{{:x}}}", u32::from(control)));
+            }
+            other => output.push(other),
+        }
+    }
+    output.push('"');
 }
 
 fn value_contains_null(value: &Value) -> bool {
@@ -638,4 +658,30 @@ fn parse_csv(text: &str) -> Result<Vec<Vec<String>>> {
         rows.push(row);
     }
     Ok(rows)
+}
+
+#[cfg(test)]
+mod luau_writer_tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn rendered(value: Value) -> String {
+        let mut output = String::new();
+        write_value_to_luau(&mut output, &value, 0).unwrap();
+        output
+    }
+
+    #[test]
+    fn object_keys_are_quoted_so_a_key_never_opens_a_long_string() {
+        assert_eq!(rendered(json!({ "k": 1 })), r#"{["k"] = 1}"#);
+        assert_eq!(
+            rendered(json!({ "a b": [1, "x"], "n": { "q": true } })),
+            r#"{["a b"] = {1, [[x]]}, ["n"] = {["q"] = true}}"#
+        );
+        assert_eq!(
+            rendered(json!({ "he\"l\\lo\n": 2 })),
+            r#"{["he\"l\\lo\n"] = 2}"#
+        );
+    }
 }

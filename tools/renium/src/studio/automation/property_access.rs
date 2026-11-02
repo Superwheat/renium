@@ -258,6 +258,7 @@ pub(crate) fn saved_field_text(value: &Value, class_name: &str, property: &str) 
 pub(crate) fn write_saved_field(
     bridge: &BridgeServer,
     path: &[String],
+    ordinals: &[usize],
     property: &str,
     value: &Value,
 ) -> Result<bool> {
@@ -268,7 +269,7 @@ pub(crate) fn write_saved_field(
         pid,
         &title,
         path,
-        &[],
+        ordinals,
         property,
         Duration::from_secs(3),
     )?;
@@ -322,6 +323,7 @@ mod saved_field_text_tests {
 pub(crate) fn write_saved_field(
     _bridge: &BridgeServer,
     _path: &[String],
+    _ordinals: &[usize],
     _property: &str,
     _value: &Value,
 ) -> Result<bool> {

@@ -38,6 +38,13 @@ pub(crate) const BRIDGE_ROLE_PLAY_SERVER: &str = "play-server";
 pub(crate) const BRIDGE_ROLE_PLAY_CLIENT: &str = "play-client";
 const BRIDGE_ROLE_UNKNOWN: &str = "unknown";
 const BRIDGE_DUPLICATE_ROLE_KEY_SEPARATOR: char = '#';
+/// The bridge ports this daemon listens on, for the launch tickets of the
+/// Studios it opens; unset in a CLI process.
+static DAEMON_BRIDGE_PORTS: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
+
+pub(crate) fn daemon_bridge_ports() -> Option<Vec<u16>> {
+    DAEMON_BRIDGE_PORTS.get().cloned()
+}
 pub(crate) const MAX_BRIDGE_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BRIDGE_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_BRIDGE_UNRELATED_MESSAGES: usize = 64;
@@ -254,6 +261,7 @@ mod request_cancellation_tests {
             peer: String::new(),
             studio_pid: Some(pid),
             role_key: BRIDGE_ROLE_EDIT.into(),
+            last_focused_at: Instant::now(),
             bridge_info: BridgeInfoPayload {
                 runtime_id: runtime.into(),
                 bridge_role: BRIDGE_ROLE_EDIT.into(),
@@ -495,7 +503,7 @@ mod request_cancellation_tests {
             next_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             preferred_index: Default::default(),
             request_gate: Mutex::new(()),
-            runtime_gates: Mutex::new(HashSet::new()),
+            runtime_gates: Mutex::new(HashMap::new()),
             active_request_leases: Mutex::new(HashMap::new()),
             runtime_pins: Mutex::new(HashMap::new()),
             #[cfg(any(windows, target_os = "macos"))]
@@ -734,6 +742,7 @@ struct BridgeSocketSnapshot {
     peer: String,
     studio_pid: Option<u32>,
     role_key: String,
+    last_focused_at: Instant,
     bridge_info: BridgeInfoPayload,
 }
 
@@ -857,7 +866,7 @@ pub(crate) struct BridgeServer {
     pub(crate) preferred_index: std::sync::atomic::AtomicUsize,
 
     pub(crate) request_gate: Mutex<()>,
-    runtime_gates: Mutex<HashSet<String>>,
+    runtime_gates: Mutex<HashMap<String, GateHolder>>,
     active_request_leases: Mutex<HashMap<thread::ThreadId, Arc<BridgeRequestLease>>>,
 
     pub(crate) runtime_pins: Mutex<HashMap<RuntimePinKey, RuntimePin>>,
@@ -874,7 +883,14 @@ pub(crate) struct BridgeRequestLease {
     state: AtomicU8,
 }
 
-/// Holds one play runtime's request gate until dropped.
+/// The request holding one runtime's gate, for the busy answer and `rbx status`.
+pub(crate) struct GateHolder {
+    operation: &'static str,
+    since: Instant,
+}
+
+/// Holds one runtime's request gate until dropped: a play runtime's, or an
+/// Edit window's for the requests that run behind it alone.
 pub(crate) struct RuntimeGateGuard<'a> {
     bridge: &'a BridgeServer,
     runtime_id: String,
@@ -887,6 +903,78 @@ impl Drop for RuntimeGateGuard<'_> {
             .lock_recover()
             .remove(&self.runtime_id);
     }
+}
+
+/// The Edit gate of one request: the process-wide request gate, then the
+/// gate of the Edit runtime the request is bound to, when it has one.
+pub(crate) struct EditGateGuard<'a> {
+    _request: MutexGuard<'a, ()>,
+    _runtime: Option<RuntimeGateGuard<'a>>,
+}
+
+thread_local! {
+    static REQUEST_PLAY_RUNTIME: std::cell::RefCell<Option<(RuntimePinKey, String)>> =
+        const { std::cell::RefCell::new(None) };
+    static REQUEST_EDIT_RUNTIME: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The Edit runtime a request resolved before taking that runtime's gate,
+/// bound to the request's thread until dropped: its Edit calls address
+/// exactly that window, whatever the shared pins say meanwhile.
+#[must_use]
+pub(crate) struct RequestEditRuntime;
+
+impl Drop for RequestEditRuntime {
+    fn drop(&mut self) {
+        REQUEST_EDIT_RUNTIME.with(|bound| bound.borrow_mut().take());
+    }
+}
+
+pub(crate) fn bind_request_edit_runtime(runtime_id: &str) -> RequestEditRuntime {
+    REQUEST_EDIT_RUNTIME.with(|bound| *bound.borrow_mut() = Some(runtime_id.to_string()));
+    RequestEditRuntime
+}
+
+pub(crate) fn request_edit_runtime() -> Option<String> {
+    REQUEST_EDIT_RUNTIME.with(|bound| bound.borrow().clone())
+}
+
+/// The play runtime a request resolved before taking its gate, bound to the
+/// request's thread for its selector until dropped: the request's calls to
+/// that selector address exactly the runtime whose gate it holds, whatever
+/// the shared selection says meanwhile.
+#[must_use]
+pub(crate) struct RequestPlayRuntime;
+
+impl Drop for RequestPlayRuntime {
+    fn drop(&mut self) {
+        REQUEST_PLAY_RUNTIME.with(|bound| bound.borrow_mut().take());
+    }
+}
+
+pub(crate) fn bind_request_play_runtime(
+    target: BridgeTarget,
+    player: Option<&str>,
+    runtime_id: &str,
+) -> RequestPlayRuntime {
+    REQUEST_PLAY_RUNTIME.with(|bound| {
+        *bound.borrow_mut() = Some((
+            BridgeServer::runtime_pin_key(target, player),
+            runtime_id.to_string(),
+        ));
+    });
+    RequestPlayRuntime
+}
+
+fn request_play_runtime(key: &RuntimePinKey) -> Option<String> {
+    REQUEST_PLAY_RUNTIME.with(|bound| {
+        bound
+            .borrow()
+            .as_ref()
+            .filter(|(bound_key, _)| bound_key == key)
+            .map(|(_, runtime_id)| runtime_id.clone())
+    })
 }
 
 const REQUEST_LEASE_PENDING: u8 = 0;
@@ -1161,6 +1249,101 @@ impl BridgeServer {
         }
     }
 
+    /// The play runtime a request's selector addresses among the runtimes
+    /// the bound Edit window `owner` launched. Gate assignment runs before
+    /// the request selects its context, beside requests of other Studios, so
+    /// it must not read the process-wide selection those requests hold. A
+    /// bare client selector with several clients takes the one the dispatch
+    /// would choose: connected on the most channels, then focused last.
+    pub(crate) fn play_runtime_for_request(
+        &self,
+        target: BridgeTarget,
+        player: Option<&str>,
+        owner: &str,
+    ) -> Option<String> {
+        let mut runtimes: Vec<(String, String)> = Vec::new();
+        let mut presence: HashMap<String, (HashSet<u16>, Instant)> = HashMap::new();
+        for channel in &self.channels {
+            let snapshots = match channel.sockets.try_lock() {
+                Ok(sockets) => Self::refresh_channel_snapshots(channel, &sockets),
+                Err(TryLockError::Poisoned(poisoned)) => {
+                    Self::refresh_channel_snapshots(channel, &poisoned.into_inner())
+                }
+                Err(TryLockError::WouldBlock) => Self::cached_channel_snapshots(channel),
+            };
+            for snapshot in snapshots {
+                let info = &snapshot.bridge_info;
+                let runtime_id = info.runtime_id.trim();
+                let role = normalize_bridge_role(Self::bridge_role_key_base(&snapshot.role_key));
+                if runtime_id.is_empty()
+                    || !matches!(role, BRIDGE_ROLE_PLAY_SERVER | BRIDGE_ROLE_PLAY_CLIENT)
+                    || !Self::role_matches_target(&snapshot.role_key, target)
+                    || !self.runtime_is_routable(info)
+                    || runtime_id != owner
+                        && self
+                            .play_owner_runtime(info, snapshot.studio_pid)
+                            .as_deref()
+                            != Some(owner)
+                {
+                    continue;
+                }
+                let seen = presence
+                    .entry(runtime_id.to_string())
+                    .or_insert_with(|| (HashSet::new(), snapshot.last_focused_at));
+                seen.0.insert(snapshot.port);
+                seen.1 = seen.1.max(snapshot.last_focused_at);
+                if runtimes.iter().any(|(_, id)| id == runtime_id) {
+                    continue;
+                }
+                runtimes.push((
+                    info.player_name.to_ascii_lowercase(),
+                    runtime_id.to_string(),
+                ));
+            }
+        }
+        runtimes.sort_unstable();
+        match (target, player) {
+            (BridgeTarget::Client, Some(selector))
+                if selector.parse::<usize>().is_ok_and(|index| index > 0) =>
+            {
+                let index = selector.parse::<usize>().ok()?;
+                runtimes.get(index - 1).map(|(_, id)| id.clone())
+            }
+            (BridgeTarget::Client, Some(selector)) => {
+                let mut matched = runtimes.iter().filter(|(_, id)| {
+                    self.channels.iter().any(|channel| {
+                        Self::cached_channel_snapshots(channel)
+                            .iter()
+                            .any(|snapshot| {
+                                snapshot.bridge_info.runtime_id == *id
+                                    && Self::player_matches_selector(
+                                        &snapshot.bridge_info,
+                                        selector,
+                                    )
+                            })
+                    })
+                });
+                let first = matched.next()?;
+                matched.next().is_none().then(|| first.1.clone())
+            }
+            (BridgeTarget::Client, None) => runtimes
+                .iter()
+                .max_by(|(_, left), (_, right)| {
+                    let (left_ports, left_focus) = &presence[left];
+                    let (right_ports, right_focus) = &presence[right];
+                    left_ports
+                        .len()
+                        .cmp(&right_ports.len())
+                        .then_with(|| left_focus.cmp(right_focus))
+                })
+                .map(|(_, id)| id.clone()),
+            _ => match runtimes.as_slice() {
+                [(_, runtime)] => Some(runtime.clone()),
+                _ => None,
+            },
+        }
+    }
+
     fn edit_snapshots(&self, runtime_id: Option<&str>) -> Vec<BridgeSocketSnapshot> {
         self.channels
             .iter()
@@ -1222,29 +1405,121 @@ impl BridgeServer {
         None
     }
 
-    // Requests to one play runtime run one after another. Different runtimes,
-    // and the Edit window behind the request gate, proceed concurrently.
+    // Requests to one runtime run one after another. Different runtimes
+    // proceed concurrently.
     pub(crate) fn acquire_runtime_gate(
         &self,
         runtime_id: &str,
+        operation: &'static str,
         lease: Option<&BridgeRequestLease>,
     ) -> Result<RuntimeGateGuard<'_>> {
+        Ok(self
+            .acquire_runtime_gate_within(runtime_id, operation, lease, None)?
+            .expect("an unlimited gate wait yields the gate"))
+    }
+
+    /// One runtime's gate, or Ok(None) when another request keeps it past
+    /// `limit` (no limit always yields the guard); a cancelled lease is an error.
+    pub(crate) fn acquire_runtime_gate_within(
+        &self,
+        runtime_id: &str,
+        operation: &'static str,
+        lease: Option<&BridgeRequestLease>,
+        limit: Option<Duration>,
+    ) -> Result<Option<RuntimeGateGuard<'_>>> {
+        let deadline = limit.map(|limit| Instant::now() + limit);
         loop {
             if let Some(lease) = lease {
                 lease.ensure_active()?;
             }
-            {
-                let mut busy = self.runtime_gates.lock_recover();
-                if !busy.contains(runtime_id) {
-                    busy.insert(runtime_id.to_string());
-                    return Ok(RuntimeGateGuard {
-                        bridge: self,
-                        runtime_id: runtime_id.to_string(),
-                    });
-                }
+            if let Some(guard) = self.try_acquire_runtime_gate(runtime_id, operation) {
+                return Ok(Some(guard));
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Ok(None);
             }
             thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    pub(crate) fn try_acquire_runtime_gate(
+        &self,
+        runtime_id: &str,
+        operation: &'static str,
+    ) -> Option<RuntimeGateGuard<'_>> {
+        let mut busy = self.runtime_gates.lock_recover();
+        if busy.contains_key(runtime_id) {
+            return None;
+        }
+        busy.insert(
+            runtime_id.to_string(),
+            GateHolder {
+                operation,
+                since: Instant::now(),
+            },
+        );
+        Some(RuntimeGateGuard {
+            bridge: self,
+            runtime_id: runtime_id.to_string(),
+        })
+    }
+
+    /// The operation holding `runtime_id`'s gate and how long it has held it.
+    pub(crate) fn runtime_gate_holder(&self, runtime_id: &str) -> Option<(&'static str, Duration)> {
+        self.runtime_gates
+            .lock_recover()
+            .get(runtime_id)
+            .map(|holder| (holder.operation, holder.since.elapsed()))
+    }
+
+    /// Every held runtime gate, longest held first.
+    pub(crate) fn runtime_gate_holders(&self) -> Vec<(String, &'static str, Duration)> {
+        let mut holders = self
+            .runtime_gates
+            .lock_recover()
+            .iter()
+            .map(|(runtime_id, holder)| {
+                (runtime_id.clone(), holder.operation, holder.since.elapsed())
+            })
+            .collect::<Vec<_>>();
+        holders.sort_by_key(|holder| std::cmp::Reverse(holder.2));
+        holders
+    }
+
+    /// The Edit gate of a request that holds the process-wide request gate:
+    /// that gate, then the bound Edit runtime's own, in that order everywhere.
+    pub(crate) fn acquire_edit_gate(
+        &self,
+        runtime_id: Option<&str>,
+        operation: &'static str,
+    ) -> EditGateGuard<'_> {
+        let request = self.acquire_request_gate();
+        let runtime = runtime_id.map(|runtime_id| {
+            self.acquire_runtime_gate(runtime_id, operation, None)
+                .expect("a gate wait without a lease is never cancelled")
+        });
+        EditGateGuard {
+            _request: request,
+            _runtime: runtime,
+        }
+    }
+
+    /// The Edit gate when both of its gates are free now, else None with
+    /// neither held.
+    pub(crate) fn try_acquire_edit_gate(
+        &self,
+        runtime_id: Option<&str>,
+        operation: &'static str,
+    ) -> Option<EditGateGuard<'_>> {
+        let request = self.try_acquire_request_gate()?;
+        let runtime = match runtime_id {
+            Some(runtime_id) => Some(self.try_acquire_runtime_gate(runtime_id, operation)?),
+            None => None,
+        };
+        Some(EditGateGuard {
+            _request: request,
+            _runtime: runtime,
+        })
     }
 
     pub(crate) fn activate_request_lease(
@@ -1310,7 +1585,72 @@ impl BridgeServer {
         ports: &[u16],
         wait_seconds: f64,
     ) -> Result<(Self, BridgeListenMetrics)> {
+        let _ = DAEMON_BRIDGE_PORTS.set(ports.to_vec());
         Self::listen_configured(host, ports, wait_seconds, false, true)
+    }
+
+    /// Moves a Studio that another daemon launched (its launch ticket names
+    /// that daemon's ports) off this daemon: the plugin reconnects on those
+    /// ports for the session, and the ticket is consumed.
+    fn redirect_launched_studio(
+        studio_pid: u32,
+        runtime_id: String,
+        channel: Arc<BridgeChannel>,
+        next_id: Arc<std::sync::atomic::AtomicU64>,
+        own_ports: Vec<u16>,
+    ) {
+        let Some(ports) = crate::project::workflows::take_launch_ticket(studio_pid) else {
+            return;
+        };
+        if ports == own_ports {
+            return;
+        }
+        thread::spawn(move || {
+            let outcome = (|| -> Result<Value> {
+                let sockets = channel.sockets.lock_recover();
+                let socket = sockets
+                    .values()
+                    .find(|socket| {
+                        socket.role == BRIDGE_ROLE_EDIT
+                            && socket.bridge_info.runtime_id == runtime_id
+                    })
+                    .cloned()
+                    .context("Studio disconnected before its bridge ports could be redirected")?;
+                drop(sockets);
+                let mut socket = socket.io.lock_recover();
+                let id = next_id.fetch_add(1, Ordering::Relaxed);
+                Self::call_on_socket_with_timeout(
+                    &mut socket,
+                    id,
+                    "redirectBridgePorts",
+                    &json!({ "ports": ports }),
+                    Some(Duration::from_secs(5)),
+                    None,
+                )
+            })();
+            match outcome {
+                Ok(answer) if answer.get("ok").and_then(Value::as_bool) != Some(false) => {
+                    crate::app::output::log_global(
+                        3,
+                        format_args!(
+                            "[renium] Studio {studio_pid} launched by another daemon moves to its bridge ports {ports:?}"
+                        ),
+                    );
+                }
+                Ok(answer) => crate::app::output::log_global(
+                    2,
+                    format_args!(
+                        "[renium] Studio {studio_pid} refused the bridge port redirect to {ports:?}: {answer}"
+                    ),
+                ),
+                Err(error) => crate::app::output::log_global(
+                    2,
+                    format_args!(
+                        "[renium] Studio {studio_pid} could not be redirected to bridge ports {ports:?}: {error:#}"
+                    ),
+                ),
+            }
+        });
     }
 
     fn listen_configured(
@@ -1423,7 +1763,7 @@ impl BridgeServer {
             next_id,
             preferred_index: std::sync::atomic::AtomicUsize::new(0),
             request_gate: Mutex::new(()),
-            runtime_gates: Mutex::new(HashSet::new()),
+            runtime_gates: Mutex::new(HashMap::new()),
             active_request_leases: Mutex::new(HashMap::new()),
             runtime_pins: Mutex::new(HashMap::new()),
             #[cfg(any(windows, target_os = "macos"))]
@@ -1655,7 +1995,25 @@ impl BridgeServer {
                                             return;
                                         }
                                     }
+                                    let registered_runtime = socket.bridge_info.runtime_id.clone();
+                                    let registered_peer = socket.peer.clone();
                                     drop(socket);
+                                    if role == BRIDGE_ROLE_EDIT
+                                        && let Ok(pid) = Self::studio_pid_for_peer(&registered_peer)
+                                    {
+                                        let own_ports = all_channels
+                                            .lock_recover()
+                                            .iter()
+                                            .map(|channel| channel.port)
+                                            .collect::<Vec<_>>();
+                                        Self::redirect_launched_studio(
+                                            pid,
+                                            registered_runtime,
+                                            Arc::clone(&channel),
+                                            Arc::clone(&next_id),
+                                            own_ports,
+                                        );
+                                    }
                                     // Registration is visible and acknowledged; warm the exact
                                     // connection before housekeeping, without holding bridge locks.
                                     #[cfg(any(windows, target_os = "macos"))]
@@ -2588,6 +2946,21 @@ impl BridgeServer {
         player: Option<&str>,
     ) -> Result<RuntimePin> {
         let key = Self::runtime_pin_key(target, player);
+        if let Some(runtime_id) = request_play_runtime(&key) {
+            return Ok(RuntimePin {
+                runtime_id,
+                exact: true,
+            });
+        }
+        if target == BridgeTarget::Edit
+            && player.is_none()
+            && let Some(runtime_id) = request_edit_runtime()
+        {
+            return Ok(RuntimePin {
+                runtime_id,
+                exact: true,
+            });
+        }
         if target == BridgeTarget::Client
             && let Some(index) = player.and_then(|value| value.parse::<usize>().ok())
             && index > 0
@@ -2644,8 +3017,8 @@ impl BridgeServer {
         }
         self.runtime_pins.lock_recover().remove(&key);
         let pin = self.choose_runtime_pin(target, player)?;
-        let mut pins = self.runtime_pins.lock_recover();
-        Ok(pins.entry(key).or_insert(pin).clone())
+        self.runtime_pins.lock_recover().insert(key, pin.clone());
+        Ok(pin)
     }
 
     pub(crate) fn socket_matches_runtime_pin(socket: &BridgeConnection, pin: &RuntimePin) -> bool {
@@ -2921,6 +3294,7 @@ impl BridgeServer {
                         peer: socket.peer.clone(),
                         studio_pid: socket.studio_pid,
                         role_key: role_key.clone(),
+                        last_focused_at: socket.last_focused_at,
                         bridge_info: socket.bridge_info.clone(),
                     },
                 )

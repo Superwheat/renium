@@ -30,9 +30,9 @@ use crate::bytecode::query::{
     resolve_bytecode_instance_index,
 };
 use crate::cli::{
-    BytecodeApplyPropertyBatchArgs, BytecodeGetPropertyArgs, BytecodeInstanceSelectorArgs,
-    BytecodeSetPropertyArgs, BytecodeSetSourceArgs, FindArgs, HighLevelTargetArgs, InspectArgs,
-    TreeArgs,
+    BytecodeApplyPropertyBatchArgs, BytecodeFileArgs, BytecodeGetPropertyArgs,
+    BytecodeInstanceSelectorArgs, BytecodeSetPropertyArgs, BytecodeSetSourceArgs, FindArgs,
+    HighLevelTargetArgs, InspectArgs, TreeArgs,
 };
 use crate::daemon::is_process_alive;
 use crate::editor::document::is_protected_engine_container;
@@ -338,17 +338,20 @@ fn validate_auto_property_name(
     property: &str,
     scope: PropertyScope,
 ) -> Result<()> {
+    let instance = &document.instances[index];
+    let stored =
+        |names: &Map<String, Value>| names.keys().any(|name| name.eq_ignore_ascii_case(property));
     if scope != PropertyScope::Auto
         || matches!(property, "Name" | "Parent")
-        || document.instances[index].properties.contains_key(property)
-        || document.instances[index].attributes.contains_key(property)
+        || stored(&instance.properties)
+        || stored(&instance.attributes)
     {
         return Ok(());
     }
     let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
-    let class_name = document.instances[index].class_name.as_str();
+    let class_name = instance.class_name.as_str();
     if rbx_model_property_descriptor(database, class_name, property).is_some()
-        || rbx_property_descriptor(database, class_name, property).is_some()
+        || rbx_logical_property_name(database, class_name, property).is_some()
     {
         return Ok(());
     }
@@ -829,6 +832,40 @@ pub(super) fn resolve_bytecode_settings_file(
     }
 
     bail!("Provide a settings file or service")
+}
+
+/// With `-f STORE` or `-s SERVICE` the store is named, so the first
+/// positional is the target, not a service; clap still parses it into the
+/// service slot. Returns the positional the target displaced, if any.
+pub(super) fn adopt_positional_target(
+    input: &mut BytecodeFileArgs,
+    explicit_service: Option<&str>,
+    selector: &mut BytecodeInstanceSelectorArgs,
+) -> Option<String> {
+    let store_named = input.settings_file.is_some()
+        || explicit_service.is_some_and(|service| !service.trim().is_empty());
+    if !store_named
+        || input
+            .service_or_file
+            .as_deref()
+            .is_none_or(bytecode_input_looks_like_settings_file)
+    {
+        return None;
+    }
+    let target = input.service_or_file.take();
+    std::mem::replace(&mut selector.target, target)
+}
+
+/// Commands with one target refuse a second positional after it.
+pub(crate) fn adopt_single_positional_target(
+    input: &mut BytecodeFileArgs,
+    explicit_service: Option<&str>,
+    selector: &mut BytecodeInstanceSelectorArgs,
+) -> Result<()> {
+    if adopt_positional_target(input, explicit_service, selector).is_some() {
+        bail!("Give the target once: as the positional argument, --path or one selector option");
+    }
+    Ok(())
 }
 
 pub(super) fn resolve_bytecode_cli_settings_file(
@@ -1590,6 +1627,11 @@ pub(super) fn inspect_command(args: InspectArgs) -> Result<()> {
 }
 
 pub(super) fn bytecode_get_property(mut args: BytecodeGetPropertyArgs) -> Result<()> {
+    if let Some(property) = adopt_positional_target(&mut args.input, None, &mut args.selector)
+        && let Some(extra) = args.property_after_target.replace(property)
+    {
+        bail!("Unexpected argument {extra:?}; use rbx bg -f STORE TARGET PROPERTY");
+    }
     let property = get_property_name(&mut args)?;
     let projected_service = project_service_input(
         args.input.settings_file.as_deref(),
@@ -1873,10 +1915,60 @@ fn reflected_property_default(class_name: &str, name: &str) -> Option<(String, V
     Some((logical_name.to_string(), value))
 }
 
-pub(super) fn bytecode_set_property(args: BytecodeSetPropertyArgs) -> Result<()> {
+/// The Workspace's viewport camera belongs to Studio: every comparison and
+/// pull leaves it alone, so an edit stored on it would never reach Studio.
+fn reject_viewport_camera_edit(document: &SettingsBytecode, index: usize) -> Result<()> {
+    let instance = &document.instances[index];
+    if instance.class_name != "Camera" {
+        return Ok(());
+    }
+    let marked =
+        crate::settings::equivalence::is_reconciliation_protected_workspace_camera(document, index);
+    let unmarked_root_camera = instance.parent_index.is_some_and(|parent| {
+        let root = &document.instances[parent];
+        root.parent_index.is_none()
+            && root.class_name == "Workspace"
+            && !root.properties.contains_key("CurrentCamera")
+    });
+    if marked || unmarked_root_camera {
+        bail!(
+            "{} is the Workspace viewport camera, which Studio owns; Renium does not sync it, so its properties cannot be set in the store",
+            instance.name
+        );
+    }
+    Ok(())
+}
+
+/// Refuses a store edit inside a read-only link target of the store's
+/// project, as the projected commands and pushes do.
+fn reject_read_only_link_store_edit(
+    settings_file: &Path,
+    document: &SettingsBytecode,
+    service: &str,
+    index: usize,
+) -> Result<()> {
+    let Some(loaded) = config::try_load_project(None, settings_file.parent())? else {
+        return Ok(());
+    };
+    let enforcement = build_loaded_project_link_enforcement(&loaded, false)?;
+    if !enforcement.is_active() {
+        return Ok(());
+    }
+    match build_editor_instance_paths_for_indices(document, service, &[index]).get(&index) {
+        Some(path) => enforcement.reject_read_only_package_path(
+            service,
+            &path.path_segments,
+            &path.path_ordinals,
+        ),
+        None => Ok(()),
+    }
+}
+
+pub(super) fn bytecode_set_property(mut args: BytecodeSetPropertyArgs) -> Result<()> {
     if args.property.eq_ignore_ascii_case("classname") {
         bail!("ClassName is read-only");
     }
+    adopt_single_positional_target(&mut args.input, None, &mut args.selector)?;
     let (settings_file, service_hint) = resolve_bytecode_cli_settings_file(
         args.input.settings_file.as_deref(),
         args.input.service_or_file.as_deref(),
@@ -1937,6 +2029,10 @@ pub(super) fn bytecode_set_property(args: BytecodeSetPropertyArgs) -> Result<()>
     )?;
     let index = resolved.index;
     reject_package_link_instance_mutation(&document, index, "edited")?;
+    reject_viewport_camera_edit(&document, index)?;
+    if !args.override_packages {
+        reject_read_only_link_store_edit(&settings_file, &document, &service, index)?;
+    }
     validate_auto_property_name(&document, index, &args.property, scope)?;
     let canonical_property =
         canonical_stored_property_name(&document, index, &args.property, scope)?;
@@ -1980,7 +2076,7 @@ pub(super) fn bytecode_set_property(args: BytecodeSetPropertyArgs) -> Result<()>
         subtree.into_iter().collect::<HashSet<_>>()
     });
     if matches!(scope, PropertyScope::Auto | PropertyScope::Metadata)
-        && matches!(args.property.as_str(), "ClassName" | "Parent")
+        && matches!(args.property.as_str(), "Name" | "ClassName" | "Parent")
         && is_protected_engine_container(&document, index)
     {
         bail!("{} metadata is read-only", document.instances[index].name);
@@ -2709,7 +2805,8 @@ fn apply_property_batch_to_root(
     })
 }
 
-pub(super) fn bytecode_set_source(args: BytecodeSetSourceArgs) -> Result<()> {
+pub(super) fn bytecode_set_source(mut args: BytecodeSetSourceArgs) -> Result<()> {
+    adopt_single_positional_target(&mut args.input, args.service.as_deref(), &mut args.selector)?;
     let (settings_file, service_hint) = resolve_bytecode_cli_settings_file(
         args.input.settings_file.as_deref(),
         args.input.service_or_file.as_deref(),
@@ -3285,12 +3382,15 @@ pub(super) fn ensure_service_store_exists(settings_file: &Path, service_hint: &s
         version: SETTINGS_BINARY_VERSION,
         instances: Vec::new(),
     };
-    let service = service_hint.trim();
+    let service = Some(service_hint.trim().to_string())
+        .filter(|service| !service.is_empty())
+        .or_else(|| crate::project::storage::store_service_name(settings_file))
+        .unwrap_or_default();
     if !service.is_empty() {
         document.instances.push(SettingsBytecodeInstance::new(
             "editor:0".to_string(),
-            service.to_string(),
-            service.to_string(),
+            service.clone(),
+            service,
             None,
         ));
     }
@@ -3485,5 +3585,37 @@ mod inline_ordinal_tests {
         let (bare, ordinals) = split_inline_ordinals(segments(&["[4]", "Item[0]", "Item[x]"]));
         assert_eq!(bare, segments(&["[4]", "Item[0]", "Item[x]"]));
         assert!(ordinals.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod project_discovery_tests {
+    use super::*;
+
+    #[test]
+    fn store_commands_outside_any_project_say_so() {
+        let root = crate::tests::support::temp_dir("store-without-project");
+        fs::create_dir_all(root.join("src")).unwrap();
+        let message = match high_level_context(&root, Path::new("src"), "Workspace") {
+            Ok(_) => panic!("a directory without a project resolved a store"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            message.starts_with(&format!(
+                "No Renium project in {} or its parents",
+                root.display()
+            )),
+            "{message}"
+        );
+        let (settings_file, _) =
+            resolve_bytecode_settings_file(None, Some("Workspace"), None, &root, Path::new("src"))
+                .unwrap();
+        assert!(!settings_file.exists());
+        assert!(
+            missing_service_store_error(&settings_file)
+                .to_string()
+                .contains("No synced Renium store for service 'Workspace'")
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

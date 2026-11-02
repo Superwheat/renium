@@ -1,5 +1,6 @@
 //! macOS reflection discovery lives in the Rust host. The in-process helper
 //! performs bounded memory copies and owns only the engine's C++ ABI calls.
+use super::super::TaskContextUnavailable;
 use super::*;
 use crate::system::LockRecover;
 use std::collections::HashSet;
@@ -67,7 +68,7 @@ pub(super) fn probe_image_value(pid: u32, title: &str, rva: u64) -> Result<u8> {
 }
 
 fn probe_task_context() -> Result<()> {
-    bail!("macOS DataModel queue context has no verified structural locator; use the plugin path")
+    Err(TaskContextUnavailable.into())
 }
 
 pub(super) fn probe_operation(
@@ -1656,13 +1657,13 @@ fn prepare(
     read_class: Option<&str>,
     context: Option<&[u8]>,
 ) -> Result<(NativeProperty, String)> {
-    let mut prepared = discover_property(
-        pid, title, segments, ordinals, property, timeout, read_class, context,
-    )?;
     super::super::probes::run(
         pid,
         title,
         super::super::probes::NativeOperation::DescriptorBinding,
+    )?;
+    let mut prepared = discover_property(
+        pid, title, segments, ordinals, property, timeout, read_class, context,
     )?;
     let response = prepared.invoke(if read_class.is_some() { 3 } else { 0 })?;
     let identity = response

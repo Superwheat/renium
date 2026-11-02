@@ -146,6 +146,12 @@ fn run_external_tool_candidate(command: &str, args: &[String], cwd: &Path) -> io
     {
         let lower = command.to_ascii_lowercase();
         if lower.ends_with(".cmd") || lower.ends_with(".bat") {
+            if !batch_script_exists(command, cwd) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("Could not find {command}"),
+                ));
+            }
             return Command::new("cmd")
                 .arg("/C")
                 .arg(command)
@@ -155,6 +161,24 @@ fn run_external_tool_candidate(command: &str, args: &[String], cwd: &Path) -> io
         }
     }
     Command::new(command).args(args).current_dir(cwd).output()
+}
+
+/// Whether cmd would find the script: a path as given (relative to `cwd`),
+/// or a bare name on PATH, and in `cwd` unless
+/// `NoDefaultCurrentDirectoryInExePath` is set. `cmd /C` itself always
+/// starts, so a missing script would otherwise surface as a failed run.
+#[cfg(windows)]
+fn batch_script_exists(command: &str, cwd: &Path) -> bool {
+    if command.contains(['/', '\\', ':']) {
+        return cwd.join(command).is_file();
+    }
+    let search_cwd = std::env::var_os("NoDefaultCurrentDirectoryInExePath").is_none();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    search_cwd
+        .then(|| cwd.to_path_buf())
+        .into_iter()
+        .chain(std::env::split_paths(&path))
+        .any(|directory| directory.join(command).is_file())
 }
 
 fn tail_text(text: &str, max_chars: usize) -> String {
@@ -167,4 +191,50 @@ fn tail_text(text: &str, max_chars: usize) -> String {
         .chars()
         .skip(count.saturating_sub(max_chars))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_tool_is_reported_as_a_failed_launch() {
+        let cwd = crate::tests::support::temp_dir("missing-tool");
+        let error =
+            run_checked_external_tool("wally install", "nowally-xyz-renium", &["install"], &cwd)
+                .unwrap_err();
+        assert_eq!(
+            format!("{error}"),
+            "Failed to launch wally install using command \"nowally-xyz-renium\""
+        );
+        let _ = std::fs::remove_dir_all(cwd);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_batch_script_runs_where_cmd_finds_it() {
+        let cwd = crate::tests::support::temp_dir("batch-tool");
+        std::fs::write(cwd.join("faketool.cmd"), "@echo off\r\nexit /b 3\r\n").unwrap();
+        let full = cwd.join("faketool.cmd").to_string_lossy().into_owned();
+        let elsewhere = std::env::temp_dir();
+        let ran = |tool: &str, cwd: &Path| {
+            let error = format!(
+                "{}",
+                run_checked_external_tool("fake", tool, &[], cwd).unwrap_err()
+            );
+            assert!(
+                error.starts_with("fake failed with exit code 3.")
+                    || error == format!("Failed to launch fake using command {tool:?}"),
+                "{error}"
+            );
+            error.starts_with("fake failed")
+        };
+        assert!(ran(&full, &elsewhere));
+        assert!(ran(".\\faketool.cmd", &cwd));
+        assert!(!ran("faketool-missing", &cwd));
+        let cwd_searched = std::env::var_os("NoDefaultCurrentDirectoryInExePath").is_none();
+        assert_eq!(ran("faketool", &cwd), cwd_searched);
+        assert_eq!(ran("faketool.cmd", &cwd), cwd_searched);
+        let _ = std::fs::remove_dir_all(cwd);
+    }
 }

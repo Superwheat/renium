@@ -2195,7 +2195,7 @@ pub fn run_adapters(args: AdaptersArgs, global_project: Option<&Path>) -> Result
                         "project": loaded.path,
                         "operations": operations,
                     }),
-                    true,
+                    crate::app::output::global_pretty_output(false),
                 )?;
                 return Ok(());
             }
@@ -2441,10 +2441,7 @@ pub fn try_resolve_project_path(
         }
         return Ok(Some(path));
     }
-    let start = match start {
-        Some(path) => path.to_path_buf(),
-        None => env::current_dir().context("Failed to read the current directory")?,
-    };
+    let start = resolution_start(start)?;
     let mut current = if start.is_file() {
         start
             .parent()
@@ -2464,6 +2461,18 @@ pub fn try_resolve_project_path(
         }
     }
     Ok(None)
+}
+
+/// The upward search pops path components, so a relative start such as `.`
+/// is made absolute first; otherwise it runs out of components at once and
+/// never looks above the current directory.
+fn resolution_start(start: Option<&Path>) -> Result<PathBuf> {
+    match start {
+        Some(path) if path.is_absolute() => Ok(path.to_path_buf()),
+        Some(path) => std::path::absolute(path)
+            .with_context(|| format!("Failed to resolve {}", path.display())),
+        None => env::current_dir().context("Failed to read the current directory"),
+    }
 }
 
 fn project_file_in_directory(directory: &Path) -> Result<PathBuf> {
@@ -3596,6 +3605,25 @@ fn print_json(value: &Value, pretty: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_relative_start_resolves_against_the_current_directory() {
+        let cwd = env::current_dir().unwrap();
+        assert_eq!(resolution_start(Some(Path::new("."))).unwrap(), cwd);
+        assert_eq!(
+            resolution_start(Some(Path::new("src"))).unwrap(),
+            cwd.join("src")
+        );
+        assert!(resolution_start(Some(Path::new("."))).unwrap().pop());
+        let root = crate::tests::support::temp_dir("resolve-from-subdirectory");
+        fs::create_dir_all(root.join("src/ReplicatedStorage")).unwrap();
+        fs::write(root.join(PROJECT_FILE_NAME), b"{}").unwrap();
+        let found = try_resolve_project_path(None, Some(&root.join("src/ReplicatedStorage")))
+            .unwrap()
+            .unwrap();
+        assert_eq!(found, root.join(PROJECT_FILE_NAME));
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn rojo_conversion_names_starter_player_containers() -> Result<()> {

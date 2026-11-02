@@ -99,7 +99,7 @@ pub struct DoctorArgs {
     #[arg(help = "Print the checks as JSON", long)]
     pub json: bool,
     #[arg(
-        help = "Write a diagnostics zip to this path",
+        help = "Write a diagnostics bundle to this path (a .zip path gets an archive, any other path a folder)",
         long,
         value_name = "PATH"
     )]
@@ -141,12 +141,48 @@ pub enum DaemonCommand {
 
 #[derive(Args)]
 pub struct DaemonTargetArgs {
-    #[arg(default_value = "default")]
-    pub name: String,
+    #[arg(help = "Daemon name (default: the --daemon NAME in effect, else default)")]
+    pub name: Option<String>,
     #[arg(long)]
     pub all: bool,
     #[arg(long)]
     pub force: bool,
+}
+
+impl DaemonTargetArgs {
+    fn name(&self) -> String {
+        daemon_target_name(
+            self.name.as_deref(),
+            std::env::var("RENIUM_DAEMON_NAME").ok().as_deref(),
+        )
+    }
+}
+
+/// The daemon a `dm` command addresses: the positional name, else the
+/// `--daemon NAME` (or `RENIUM_DAEMON_NAME`) in effect, else the default.
+fn daemon_target_name(explicit: Option<&str>, selected: Option<&str>) -> String {
+    explicit
+        .or(selected)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("default")
+        .to_string()
+}
+
+#[cfg(test)]
+mod daemon_target_tests {
+    use super::daemon_target_name;
+
+    #[test]
+    fn dm_commands_follow_the_selected_daemon_unless_named() {
+        assert_eq!(daemon_target_name(None, None), "default");
+        assert_eq!(daemon_target_name(None, Some("other")), "other");
+        assert_eq!(
+            daemon_target_name(Some("scratch"), Some("other")),
+            "scratch"
+        );
+        assert_eq!(daemon_target_name(Some(" "), Some("")), "default");
+    }
 }
 
 #[derive(Args)]
@@ -838,13 +874,14 @@ pub fn run_daemon(args: DaemonArgs) -> Result<()> {
             crate::emit_global_output(&json!({ "daemons": values }), &text)
         }
         DaemonCommand::Status(target) => {
-            let values = daemon_status_values((!target.all).then_some(target.name.as_str()))?;
+            let name = target.name();
+            let values = daemon_status_values((!target.all).then_some(name.as_str()))?;
             if target.all {
                 let text = daemon_status_text(&values);
                 return crate::emit_global_output(&json!({ "daemons": values }), &text);
             }
             let Some(value) = values.into_iter().next() else {
-                bail!("No daemon named '{}' was found", target.name);
+                bail!("No daemon named '{name}' was found");
             };
             let text = daemon_status_text(std::slice::from_ref(&value));
             crate::emit_global_output(&value, &text)
@@ -853,11 +890,12 @@ pub fn run_daemon(args: DaemonArgs) -> Result<()> {
             if target.all {
                 stop_all_daemons(target.force)
             } else {
-                let detail = stop_named_daemon(&target.name, target.force)?;
+                let name = target.name();
+                let detail = stop_named_daemon(&name, target.force)?;
                 crate::emit_global_output(
                     &json!({
                         "ok": true,
-                        "stopped": [target.name],
+                        "stopped": [name],
                         "detail": detail,
                     }),
                     &detail,
@@ -917,8 +955,26 @@ fn daemon_status_text(values: &[Value]) -> String {
 pub fn run_studio(args: StudioArgs, global_project: Option<&Path>) -> Result<()> {
     let project = args.project.as_deref().or(global_project);
     if !args.check {
+        // A Studio opened for a named daemon connects to the default ports
+        // first, so both daemons run before the launch: the named one so its
+        // ports are known for the launch ticket, the default one to pass the
+        // window on.
+        let named_daemon_ports = named_daemon_launch_ports();
         let mut result = launch_studio(args.file.as_deref(), project)?;
         let already_open = result.get("alreadyOpen").and_then(Value::as_bool) == Some(true);
+        remember_launched_place(project, &result);
+        if !already_open
+            && let Some(pid) = result.get("pid").and_then(Value::as_u64)
+            && let Some(ports) = named_daemon_ports
+            && let Err(error) = record_launch_ticket(pid as u32, &ports)
+        {
+            crate::log_global(
+                2,
+                format_args!(
+                    "[renium] could not record the launch ticket for Studio {pid}: {error:#}"
+                ),
+            );
+        }
         if !args.no_wait {
             crate::automation::commands::wait_for_launched_studio(project, &mut result, 0.0)?;
         }
@@ -979,6 +1035,15 @@ pub fn launch_studio(file: Option<&Path>, project: Option<&Path>) -> Result<Valu
         set_aside_recovery_files(name);
     }
     let pid = spawn_studio(&executable, &[file.as_os_str()])?;
+    if let Some(ports) = crate::studio::bridge::daemon_bridge_ports()
+        && ports != DEFAULT_BRIDGE_PORTS
+        && let Err(error) = record_launch_ticket(pid, &ports)
+    {
+        crate::log_global(
+            2,
+            format_args!("[renium] could not record the launch ticket for Studio {pid}: {error:#}"),
+        );
+    }
     Ok(json!({
         "ok": true,
         "pid": pid,
@@ -986,6 +1051,84 @@ pub fn launch_studio(file: Option<&Path>, project: Option<&Path>) -> Result<Valu
         "file": file,
         "exists": file.is_file(),
     }))
+}
+
+/// The ports the Studio plugin connects to unless a setting or a redirect
+/// says otherwise.
+const DEFAULT_BRIDGE_PORTS: [u16; 2] = [8781, 8782];
+
+/// When `--daemon NAME` names a daemon other than the default, the bridge
+/// ports a Studio launched now should end up on. Both that daemon and the
+/// default daemon are started first, since the plugin connects to the
+/// default ports and the default daemon forwards the window.
+fn named_daemon_launch_ports() -> Option<Vec<u16>> {
+    let name = std::env::var("RENIUM_DAEMON_NAME").ok()?;
+    let name = name.trim().to_string();
+    if name.is_empty() || name == "default" {
+        return None;
+    }
+    let wake = |daemon: &str| {
+        unsafe { std::env::set_var("RENIUM_DAEMON_NAME", daemon) };
+        let _ = crate::daemon::daemon_control_request(
+            crate::automation::op::CAP,
+            None,
+            json!({}),
+            false,
+        );
+    };
+    wake(&name);
+    wake("default");
+    unsafe { std::env::set_var("RENIUM_DAEMON_NAME", &name) };
+    let ports = crate::daemon::named_daemon_bridge_ports(&name)?;
+    (ports != DEFAULT_BRIDGE_PORTS).then_some(ports)
+}
+
+fn launch_ticket_dir() -> Result<PathBuf> {
+    Ok(crate::app::update::user_data_dir()?.join("launches"))
+}
+
+/// A Studio launched by a daemon on other bridge ports than the plugin's
+/// default is noted by pid; the daemon on the default ports reads the note
+/// when that Studio's plugin connects there and sends it on.
+pub(crate) fn record_launch_ticket(pid: u32, ports: &[u16]) -> Result<()> {
+    let dir = launch_ticket_dir()?;
+    fs::create_dir_all(&dir)?;
+    fs::write(
+        dir.join(format!("{pid}.json")),
+        serde_json::to_vec(&json!({ "ports": ports }))?,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn take_launch_ticket(pid: u32) -> Option<Vec<u16>> {
+    let path = launch_ticket_dir().ok()?.join(format!("{pid}.json"));
+    let bytes = fs::read(&path).ok()?;
+    let _ = fs::remove_file(&path);
+    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    let ports = value
+        .get("ports")?
+        .as_array()?
+        .iter()
+        .filter_map(|port| u16::try_from(port.as_u64()?).ok())
+        .collect::<Vec<_>>();
+    (ports.len() == 2).then_some(ports)
+}
+
+/// The place `rbx so` opened becomes the project's remembered Studio target,
+/// so an unpinned command and `rbx ro` select that window among several.
+fn remember_launched_place(project: Option<&Path>, result: &Value) {
+    let Some(file) = result.get("file").and_then(Value::as_str) else {
+        return;
+    };
+    let Ok(Some(loaded)) = config::try_load_project(project, None) else {
+        return;
+    };
+    let target = crate::automation::StudioReopenTarget {
+        file: Some(PathBuf::from(file)),
+        game_id: None,
+        place_id: None,
+    };
+    let _ = crate::automation::write_studio_target_for_root(&loaded.root, &target);
 }
 
 /// The Studio process that already has this place file open, so a repeated
@@ -1039,7 +1182,78 @@ pub fn launch_exact_studio(
     }
 }
 
+/// Two Studio windows that start within the same seconds both refresh the
+/// shared Roblox session, one of them with the cookie the other just replaced;
+/// that window is answered 401 and Studio signs every window out. Launches
+/// wait for this gap after the previous one.
+const STUDIO_LAUNCH_GAP: Duration = Duration::from_secs(8);
+static LAST_STUDIO_LAUNCH: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+/// The gap holds across every Renium process on the machine (several daemons
+/// launch Studios independently): the last launch time is kept in a file
+/// under the launch ticket folder, guarded by a lock file.
+fn space_studio_launches() {
+    let mut last_launch = LAST_STUDIO_LAUNCH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(previous) = *last_launch {
+        let since = previous.elapsed();
+        if since < STUDIO_LAUNCH_GAP {
+            std::thread::sleep(STUDIO_LAUNCH_GAP - since);
+        }
+    }
+    if let Ok(dir) = launch_ticket_dir()
+        && fs::create_dir_all(&dir).is_ok()
+    {
+        let lock = dir.join("launch.lock");
+        let stamp = dir.join("launch.at");
+        let started = Instant::now();
+        let held = loop {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock)
+            {
+                Ok(_) => break true,
+                Err(_) => {
+                    let stale = fs::metadata(&lock)
+                        .and_then(|meta| meta.modified())
+                        .ok()
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age > Duration::from_secs(60));
+                    if stale {
+                        let _ = fs::remove_file(&lock);
+                    }
+                    if started.elapsed() > Duration::from_secs(120) {
+                        break false;
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+        };
+        let now_ms = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |value| value.as_millis() as u64)
+        };
+        if held {
+            let last = fs::read_to_string(&stamp)
+                .ok()
+                .and_then(|text| text.trim().parse::<u64>().ok())
+                .unwrap_or(0);
+            let since = Duration::from_millis(now_ms().saturating_sub(last));
+            if since < STUDIO_LAUNCH_GAP {
+                std::thread::sleep(STUDIO_LAUNCH_GAP - since);
+            }
+            let _ = fs::write(&stamp, now_ms().to_string());
+            let _ = fs::remove_file(&lock);
+        }
+    }
+    *last_launch = Some(Instant::now());
+}
+
 pub(crate) fn spawn_studio(executable: &Path, arguments: &[&OsStr]) -> Result<u32> {
+    space_studio_launches();
     #[cfg(windows)]
     {
         windows_launch::spawn(executable, arguments)
@@ -1789,24 +2003,21 @@ fn run_optional_toolchains(loaded: &LoadedProject, args: &BuildArgs) -> Result<(
     Ok(())
 }
 
-fn write_doctor_bundle(path: &Path, result: &Value, project_path: Option<&Path>) -> Result<()> {
-    let directory = if path.extension().is_some() {
-        path.with_extension("")
-    } else {
-        path.to_path_buf()
-    };
-    fs::create_dir_all(&directory)?;
-    atomic_write_file(
-        &directory.join("doctor.json"),
-        (serde_json::to_string_pretty(result)? + "\n").as_bytes(),
-    )?;
-    let bundled_project = directory.join(PROJECT_FILE_NAME);
+/// The files of a diagnostics bundle: a `.zip` path gets one archive, any
+/// other path a folder holding the same files.
+fn doctor_bundle_files(
+    result: &Value,
+    project_path: Option<&Path>,
+) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut files = vec![(
+        "doctor.json".to_string(),
+        (serde_json::to_string_pretty(result)? + "\n").into_bytes(),
+    )];
     if let Some(project_path) = project_path {
-        let text = fs::read_to_string(project_path)?;
-        atomic_write_file(&bundled_project, text.as_bytes())?;
-    } else if bundled_project.exists() {
-        fs::remove_file(&bundled_project)
-            .with_context(|| format!("Failed to remove {}", bundled_project.display()))?;
+        files.push((
+            PROJECT_FILE_NAME.to_string(),
+            fs::read_to_string(project_path)?.into_bytes(),
+        ));
     }
     let environment = json!({
         "os": env::consts::OS,
@@ -1814,11 +2025,74 @@ fn write_doctor_bundle(path: &Path, result: &Value, project_path: Option<&Path>)
         "version": crate::app::build::VERSION,
         "gitHash": crate::app::build::GIT_HASH,
     });
-    atomic_write_file(
-        &directory.join("environment.json"),
-        (serde_json::to_string_pretty(&environment)? + "\n").as_bytes(),
-    )?;
+    files.push((
+        "environment.json".to_string(),
+        (serde_json::to_string_pretty(&environment)? + "\n").into_bytes(),
+    ));
+    Ok(files)
+}
+
+fn write_doctor_bundle(path: &Path, result: &Value, project_path: Option<&Path>) -> Result<()> {
+    let files = doctor_bundle_files(result, project_path)?;
+    if path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
+    {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
+        return crate::app::report::write_zip(path, &files);
+    }
+    fs::create_dir_all(path)?;
+    let bundled_project = path.join(PROJECT_FILE_NAME);
+    if project_path.is_none() && bundled_project.exists() {
+        fs::remove_file(&bundled_project)
+            .with_context(|| format!("Failed to remove {}", bundled_project.display()))?;
+    }
+    for (name, bytes) in &files {
+        atomic_write_file(&path.join(name), bytes)?;
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod doctor_bundle_tests {
+    use super::*;
+
+    #[test]
+    fn a_zip_path_gets_an_archive_and_any_other_path_a_folder() {
+        let root = crate::tests::support::temp_dir("doctor-bundle");
+        let project = root.join(PROJECT_FILE_NAME);
+        fs::write(&project, "{\"schemaVersion\":1}").unwrap();
+        let result = json!({ "ok": true });
+
+        let zip_path = root.join("out.zip");
+        write_doctor_bundle(&zip_path, &result, Some(&project)).unwrap();
+        assert!(zip_path.is_file());
+        assert!(!root.join("out").exists());
+        let mut archive = zip::ZipArchive::new(fs::File::open(&zip_path).unwrap()).unwrap();
+        let mut names = (0..archive.len())
+            .map(|index| archive.by_index(index).unwrap().name().to_string())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "doctor.json".to_string(),
+                "environment.json".to_string(),
+                PROJECT_FILE_NAME.to_string()
+            ]
+        );
+
+        let folder = root.join("bundle");
+        write_doctor_bundle(&folder, &result, None).unwrap();
+        assert!(folder.join("doctor.json").is_file());
+        assert!(folder.join("environment.json").is_file());
+        assert!(!folder.join(PROJECT_FILE_NAME).exists());
+    }
 }
 
 fn docs_topic(topic: Option<&str>) -> Result<String> {
@@ -1920,12 +2194,14 @@ fn stop_named_daemon(name: &str, force: bool) -> Result<String> {
         }
     }
     terminate_recorded_daemon(daemon.pid)?;
-    let deadline = Instant::now() + Duration::from_secs(1);
+    // A daemon finishing a Studio request exits after that request; a busy
+    // studio-status alone can take a few seconds.
+    let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline && crate::daemon::is_process_alive(daemon.pid) {
         thread::sleep(Duration::from_millis(50));
     }
     if crate::daemon::is_process_alive(daemon.pid) {
-        bail!("Daemon '{name}' did not exit within one second");
+        bail!("Daemon '{name}' did not exit within five seconds");
     }
     if path.exists() {
         fs::remove_file(&path)?;

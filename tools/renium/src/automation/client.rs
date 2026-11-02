@@ -59,9 +59,25 @@ fn send_on_stream(stream: &TcpStream, request: &super::Request) -> Result<super:
             status_response_limit(request.p["bridgeWaitSeconds"].as_f64().unwrap_or(8.0))
         }
         op::LUAU => luau_response_limit(&request.p),
+        op::WAIT => wait_response_limit(&request.p),
         _ => DAEMON_CONTROL_RESPONSE_TIMEOUT,
     };
     send_on_stream_with_timeout(stream, request, timeout)
+}
+
+// A wait runs for up to an hour and answers `timedOut` itself, so the
+// client holds on for that timeout plus the connection wait and a margin
+// instead of the generic half-hour cap.
+fn wait_response_limit(parameters: &serde_json::Value) -> Duration {
+    let timeout = parameters["timeout"]
+        .as_f64()
+        .unwrap_or(60.0)
+        .clamp(0.1, 3600.0);
+    let bridge_wait = parameters["bridgeWaitSeconds"]
+        .as_f64()
+        .unwrap_or(8.0)
+        .clamp(1.0, 30.0);
+    Duration::from_secs_f64(timeout + bridge_wait) + LUAU_QUEUE_MARGIN
 }
 
 // Status waits for a Studio that is still launching for up to the Studio
@@ -121,21 +137,39 @@ fn send_on_stream_with_timeout(
     writeln!(stream, "{}", encoded)?;
     stream.flush()?;
     let mut reader = BufReader::new(DeadlineReader { stream, deadline });
-    let mut line = String::new();
-    match read_bounded_line(&mut reader, &mut line, MAX_DAEMON_LINE_BYTES).with_context(|| {
-        format!(
-            "Waiting for daemon response to operation {} ({}s limit)",
-            request.op,
-            timeout.as_secs_f64()
-        )
-    })? {
-        BoundedLineRead::Line => {}
-        BoundedLineRead::Eof => bail!("Renium daemon closed the connection before responding"),
-        BoundedLineRead::TooLong => bail!("Renium daemon response exceeded the protocol limit"),
+    loop {
+        let mut line = String::new();
+        match read_bounded_line(&mut reader, &mut line, MAX_DAEMON_LINE_BYTES).with_context(
+            || {
+                format!(
+                    "Waiting for daemon response to operation {} ({}s limit)",
+                    request.op,
+                    timeout.as_secs_f64()
+                )
+            },
+        )? {
+            BoundedLineRead::Line => {}
+            BoundedLineRead::Eof => {
+                bail!("Renium daemon closed the connection before responding")
+            }
+            BoundedLineRead::TooLong => {
+                bail!("Renium daemon response exceeded the protocol limit")
+            }
+        }
+        let response: super::Response =
+            serde_json::from_str(line.trim()).context("Invalid Renium daemon response")?;
+        // A notice tells the caller what the request waits for (a Studio
+        // review); the answer follows on its own line.
+        if response.is_notice() {
+            if let Some(text) = response.notice_text() {
+                eprintln!("{text}");
+                let _ = io::stderr().flush();
+            }
+            continue;
+        }
+        print_update_notice(&response);
+        return Ok(response);
     }
-    let response = serde_json::from_str(line.trim()).context("Invalid Renium daemon response")?;
-    print_update_notice(&response);
-    Ok(response)
 }
 
 fn print_update_notice(response: &super::Response) {
@@ -322,6 +356,40 @@ mod tests {
 }
 
 #[cfg(test)]
+mod notice_tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn notices_are_relayed_and_the_answer_that_follows_is_returned() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut peer = listener.accept().unwrap().0;
+        let request = super::super::Request {
+            v: super::super::PROTOCOL_VERSION,
+            id: 7,
+            op: op::CAP,
+            cx: None,
+            p: json!({}),
+        };
+        let notice = super::super::Response::notice(7, "[renium] editor push held for review");
+        let answer = super::super::Response::success(7, Instant::now(), json!({ "changed": true }));
+        writeln!(peer, "{}", serde_json::to_string(&notice).unwrap()).unwrap();
+        writeln!(peer, "{}", serde_json::to_string(&answer).unwrap()).unwrap();
+        let response =
+            send_on_stream_with_timeout(&client, &request, Duration::from_secs(5)).unwrap();
+        assert!(!response.is_notice());
+        assert_eq!(response.ok, 1);
+        assert_eq!(response.r.unwrap()["changed"], json!(true));
+        assert!(notice.is_notice());
+        assert_eq!(
+            notice.notice_text(),
+            Some("[renium] editor push held for review")
+        );
+    }
+}
+
+#[cfg(test)]
 mod luau_response_limit_tests {
     use super::*;
 
@@ -336,6 +404,22 @@ mod luau_response_limit_tests {
             Duration::from_secs(175)
         );
         assert_eq!(luau_response_limit(&json!({})), Duration::from_secs(43));
+    }
+
+    #[test]
+    fn waits_are_answered_for_their_whole_hour() {
+        assert_eq!(
+            wait_response_limit(&json!({ "timeout": 2400.0, "bridgeWaitSeconds": 8.0 })),
+            Duration::from_secs(2433)
+        );
+        assert_eq!(
+            wait_response_limit(&json!({ "timeout": 9000.0, "bridgeWaitSeconds": 8.0 })),
+            Duration::from_secs(3633)
+        );
+        assert_eq!(wait_response_limit(&json!({})), Duration::from_secs(93));
+        assert!(
+            wait_response_limit(&json!({ "timeout": 2400.0 })) > DAEMON_CONTROL_RESPONSE_TIMEOUT
+        );
     }
 
     #[test]

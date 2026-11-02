@@ -4,11 +4,13 @@ use std::sync::Arc;
 
 use similar::{DiffOp, TextDiff};
 use yrs::{
-    Any, Doc, GetString, In, Map, MapRef, Out, ReadTxn, Text, TextPrelim, Transact, TransactionMut,
+    Any, ClientID, Doc, GetString, In, Map, MapRef, Out, ReadTxn, Text, TextPrelim, Transact,
+    TransactionMut,
 };
 
 pub(crate) const FILES: &str = "files";
 pub(crate) const META: &str = "meta";
+pub(crate) const BASES: &str = "bases";
 pub(crate) const LOCAL_ORIGIN: &str = "local";
 
 const TEXT_EXTENSIONS: &[&str] = &[
@@ -74,6 +76,43 @@ pub(crate) fn files_map(doc: &Doc) -> MapRef {
 
 pub(crate) fn meta_map(doc: &Doc) -> MapRef {
     doc.get_or_insert_map(META)
+}
+
+/// Per participant and file, the hash of the shared text its last save was
+/// folded into: the common base a receiver needs to tell two saves made from
+/// one text apart from an edit made after the other arrived.
+pub(crate) fn bases_map(doc: &Doc) -> MapRef {
+    doc.get_or_insert_map(BASES)
+}
+
+fn base_key(client: ClientID, key: &str) -> String {
+    format!("{:x} {key}", client.get())
+}
+
+pub(crate) fn record_base(
+    txn: &mut TransactionMut,
+    bases: &MapRef,
+    client: ClientID,
+    key: &str,
+    hash: u64,
+) {
+    bases.insert(
+        txn,
+        base_key(client, key),
+        In::Any(Any::String(Arc::from(format!("{hash:016x}")))),
+    );
+}
+
+pub(crate) fn recorded_base<T: ReadTxn>(
+    txn: &T,
+    bases: &MapRef,
+    client: ClientID,
+    key: &str,
+) -> Option<u64> {
+    match bases.get(txn, &base_key(client, key))? {
+        Out::Any(Any::String(hash)) => u64::from_str_radix(&hash, 16).ok(),
+        _ => None,
+    }
 }
 
 pub(crate) fn read_entry<T: ReadTxn>(txn: &T, files: &MapRef, key: &str) -> Option<Content> {
@@ -179,6 +218,7 @@ fn apply_text_diff(txn: &mut TransactionMut, target: &yrs::TextRef, wanted: &str
 struct Hunk {
     old_index: usize,
     old_len: usize,
+    new_index: usize,
     lines: Vec<String>,
 }
 
@@ -196,10 +236,13 @@ fn hunks(base: &str, side: &str) -> Vec<Hunk> {
         .filter_map(|op| match *op {
             DiffOp::Equal { .. } => None,
             DiffOp::Delete {
-                old_index, old_len, ..
+                old_index,
+                old_len,
+                new_index,
             } => Some(Hunk {
                 old_index,
                 old_len,
+                new_index,
                 lines: Vec::new(),
             }),
             DiffOp::Insert {
@@ -209,6 +252,7 @@ fn hunks(base: &str, side: &str) -> Vec<Hunk> {
             } => Some(Hunk {
                 old_index,
                 old_len: 0,
+                new_index,
                 lines: replacement(new_index, new_len),
             }),
             DiffOp::Replace {
@@ -219,53 +263,245 @@ fn hunks(base: &str, side: &str) -> Vec<Hunk> {
             } => Some(Hunk {
                 old_index,
                 old_len,
+                new_index,
                 lines: replacement(new_index, new_len),
             }),
         })
         .collect()
 }
 
-fn overlaps(a: &Hunk, b: &Hunk) -> bool {
-    let (a_start, a_end) = (a.old_index, a.old_index + a.old_len);
-    let (b_start, b_end) = (b.old_index, b.old_index + b.old_len);
-    match (a.old_len, b.old_len) {
-        (0, 0) => false,
-        (0, _) => b_start < a_start && a_start < b_end,
-        (_, 0) => a_start < b_start && b_start < a_end,
-        _ => a_start < b_end && b_start < a_end,
+impl Hunk {
+    fn span(&self) -> Span {
+        Span {
+            start: self.old_index,
+            len: self.old_len,
+        }
+    }
+
+    // Insertions sort before changes at the same base line, so a line added
+    // above a changed line stays above it.
+    fn order(&self) -> (usize, bool) {
+        (self.old_index, self.old_len > 0)
     }
 }
 
+#[derive(Clone, Copy)]
+struct Span {
+    start: usize,
+    len: usize,
+}
+
+impl Span {
+    fn end(self) -> usize {
+        self.start + self.len
+    }
+
+    fn overlaps(self, other: Span) -> bool {
+        match (self.len, other.len) {
+            (0, 0) => self.start == other.start,
+            (0, _) => other.start < self.start && self.start < other.end(),
+            (_, 0) => self.start < other.start && other.start < self.end(),
+            _ => self.start < other.end() && other.start < self.end(),
+        }
+    }
+
+    fn union(self, other: Span) -> Span {
+        let start = self.start.min(other.start);
+        Span {
+            start,
+            len: self.end().max(other.end()) - start,
+        }
+    }
+}
+
+/// Names the two versions a conflict keeps between markers.
+pub(crate) struct MergeLabels<'a> {
+    pub(crate) local: &'a str,
+    pub(crate) remote: &'a str,
+}
+
 /// Three-way merge by line: every local and remote change since `base` is
-/// kept; where both changed the same lines the local change stands, since a
-/// pending local save is the user's own work and the remote side still holds
-/// its version.
-pub(crate) fn merge_lines(base: &str, local: &str, remote: &str) -> String {
+/// kept. Where both sides changed the same lines differently, both versions
+/// stay in the file between Git-style conflict markers.
+pub(crate) fn merge_lines(
+    base: &str,
+    local: &str,
+    remote: &str,
+    labels: &MergeLabels<'_>,
+) -> String {
     let base_lines = split_lines(base);
     let local_hunks = hunks(base, local);
-    let remote_hunks = hunks(base, remote)
-        .into_iter()
-        .filter(|remote| !local_hunks.iter().any(|local| overlaps(local, remote)))
-        .collect::<Vec<_>>();
-    let mut ordered = local_hunks
-        .iter()
-        .map(|hunk| (hunk, true))
-        .chain(remote_hunks.iter().map(|hunk| (hunk, false)))
-        .collect::<Vec<_>>();
-    ordered.sort_by_key(|(hunk, local)| (hunk.old_index, !local));
+    let remote_hunks = hunks(base, remote);
+    let (mut next_local, mut next_remote) = (0, 0);
     let mut merged = String::new();
     let mut cursor = 0;
-    for (hunk, _) in ordered {
-        if hunk.old_index > cursor {
-            merged.push_str(&base_lines[cursor..hunk.old_index].concat());
+    while next_local < local_hunks.len() || next_remote < remote_hunks.len() {
+        let (local_start, remote_start) = (next_local, next_remote);
+        let local_first = match (local_hunks.get(next_local), remote_hunks.get(next_remote)) {
+            (Some(local), Some(remote)) => local.order() <= remote.order(),
+            (local, _) => local.is_some(),
+        };
+        let mut span = if local_first {
+            next_local += 1;
+            local_hunks[local_start].span()
+        } else {
+            next_remote += 1;
+            remote_hunks[remote_start].span()
+        };
+        loop {
+            if let Some(hunk) = local_hunks
+                .get(next_local)
+                .filter(|hunk| span.overlaps(hunk.span()))
+            {
+                span = span.union(hunk.span());
+                next_local += 1;
+            } else if let Some(hunk) = remote_hunks
+                .get(next_remote)
+                .filter(|hunk| span.overlaps(hunk.span()))
+            {
+                span = span.union(hunk.span());
+                next_remote += 1;
+            } else {
+                break;
+            }
         }
-        for line in &hunk.lines {
-            merged.push_str(line);
+        if span.start > cursor {
+            merged.push_str(&base_lines[cursor..span.start].concat());
         }
-        cursor = cursor.max(hunk.old_index + hunk.old_len);
+        let mine = apply_hunks(&base_lines, span, &local_hunks[local_start..next_local]);
+        let theirs = apply_hunks(&base_lines, span, &remote_hunks[remote_start..next_remote]);
+        if local_start == next_local || mine == theirs {
+            merged.push_str(&theirs);
+        } else if remote_start == next_remote {
+            merged.push_str(&mine);
+        } else if span.len == 0 {
+            push_terminated(&mut merged, &mine);
+            merged.push_str(&theirs);
+        } else {
+            push_conflict(&mut merged, labels, &mine, &theirs);
+        }
+        cursor = cursor.max(span.end());
     }
-    merged.push_str(&base_lines[cursor..].concat());
+    if cursor < base_lines.len() {
+        merged.push_str(&base_lines[cursor..].concat());
+    }
     merged
+}
+
+fn apply_hunks(base_lines: &[&str], span: Span, hunks: &[Hunk]) -> String {
+    let mut text = String::new();
+    let mut at = span.start;
+    for hunk in hunks {
+        text.push_str(&base_lines[at..hunk.old_index].concat());
+        text.push_str(&hunk.lines.concat());
+        at = hunk.old_index + hunk.old_len;
+    }
+    text.push_str(&base_lines[at..span.end()].concat());
+    text
+}
+
+fn push_terminated(merged: &mut String, text: &str) {
+    merged.push_str(text);
+    if !text.is_empty() && !text.ends_with('\n') {
+        merged.push('\n');
+    }
+}
+
+fn push_conflict(merged: &mut String, labels: &MergeLabels<'_>, mine: &str, theirs: &str) {
+    merged.push_str(&format!("<<<<<<< {}\n", labels.local));
+    push_terminated(merged, mine);
+    merged.push_str("=======\n");
+    push_terminated(merged, theirs);
+    merged.push_str(&format!(">>>>>>> {}\n", labels.remote));
+}
+
+/// Marks the lines two saves made from the same text replaced differently
+/// after the room merged them side by side. `local` is what this side wrote
+/// from `base`; `merged` is the shared text once the other side's save from
+/// that same base arrived. Lines the other side inserted next to lines this
+/// side changed, replacing nothing of `local`, are its version of those lines:
+/// the side whose lines lead puts both versions between markers, and a copy
+/// identical to this side's lines collapses into one. None when the merged
+/// text stays as it is.
+pub(crate) fn mark_merged_conflicts(
+    base: &str,
+    local: &str,
+    merged: &str,
+    labels: &MergeLabels<'_>,
+) -> Option<String> {
+    let merged_lines = split_lines(merged);
+    let mine = hunks(base, local);
+    let mut text = String::new();
+    let mut cursor = 0;
+    let mut marked = false;
+    for theirs in hunks(local, merged) {
+        if theirs.old_len > 0 {
+            continue;
+        }
+        let Some(own) = mine.iter().find(|own| {
+            own.new_index + own.lines.len() == theirs.old_index
+                || own.new_index == theirs.old_index && own.lines == theirs.lines
+        }) else {
+            continue;
+        };
+        let (ours, others) = (own.lines.concat(), theirs.lines.concat());
+        if ours == others {
+            text.push_str(&merged_lines[cursor..theirs.new_index].concat());
+        } else {
+            let start = theirs.new_index.saturating_sub(own.lines.len()).max(cursor);
+            text.push_str(&merged_lines[cursor..start].concat());
+            push_conflict(&mut text, labels, &ours, &others);
+        }
+        cursor = theirs.new_index + theirs.lines.len();
+        marked = true;
+    }
+    text.push_str(&merged_lines[cursor..].concat());
+    marked.then_some(text)
+}
+
+/// Lines added plus lines removed between two texts.
+pub(crate) fn changed_lines(from: &str, to: &str) -> usize {
+    TextDiff::from_lines(from, to)
+        .ops()
+        .iter()
+        .map(|op| match *op {
+            DiffOp::Equal { .. } => 0,
+            DiffOp::Delete { old_len, .. } => old_len,
+            DiffOp::Insert { new_len, .. } => new_len,
+            DiffOp::Replace {
+                old_len, new_len, ..
+            } => old_len + new_len,
+        })
+        .sum()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineEndings {
+    None,
+    Lf,
+    Crlf,
+    Mixed,
+}
+
+fn line_endings(text: &str) -> LineEndings {
+    let crlf = text.matches("\r\n").count();
+    match (text.matches('\n').count() - crlf, crlf) {
+        (0, 0) => LineEndings::None,
+        (_, 0) => LineEndings::Lf,
+        (0, _) => LineEndings::Crlf,
+        _ => LineEndings::Mixed,
+    }
+}
+
+/// A save that switched a whole file between LF and CRLF takes the line
+/// endings of the shared copy again, so the switch does not count as a change
+/// to every line and does not collide with concurrent edits.
+pub(crate) fn with_line_endings_of(text: String, shared: &str) -> String {
+    match (line_endings(&text), line_endings(shared)) {
+        (LineEndings::Crlf, LineEndings::Lf) => text.replace("\r\n", "\n"),
+        (LineEndings::Lf, LineEndings::Crlf) => text.replace('\n', "\r\n"),
+        _ => text,
+    }
 }
 
 fn offset(start: usize, shift: i64) -> u32 {
@@ -321,6 +557,11 @@ pub(crate) fn transact_local(doc: &Doc) -> TransactionMut<'_> {
 }
 
 #[cfg(test)]
+pub(crate) fn new_doc_with_client(client: u64) -> Doc {
+    Doc::with_client_id(client)
+}
+
+#[cfg(test)]
 pub(crate) fn transact_remote(doc: &Doc) -> TransactionMut<'_> {
     doc.transact_mut_with("remote")
 }
@@ -359,92 +600,99 @@ mod tests {
     }
 
     #[test]
-    fn three_way_line_merge_keeps_both_sides_and_prefers_local_on_conflict() {
-        let base = "local=0
-remote=0
-";
-        assert_eq!(
-            merge_lines(
+    fn three_way_line_merge_keeps_both_sides_and_marks_conflicts() {
+        let labels = MergeLabels {
+            local: "host",
+            remote: "room",
+        };
+        let base = "local=0\nremote=0\n";
+        let cases = [
+            (
                 base,
-                "local=1
-remote=0
-",
-                "local=0
-remote=1
-"
+                "local=1\nremote=0\n",
+                "local=0\nremote=1\n",
+                "local=1\nremote=1\n",
             ),
-            "local=1
-remote=1
-"
+            (
+                base,
+                "local=1\nremote=0\n",
+                "local=2\nremote=0\n",
+                "<<<<<<< host\nlocal=1\n=======\nlocal=2\n>>>>>>> room\nremote=0\n",
+            ),
+            (
+                base,
+                "local=1\nremote=0\n",
+                "local=1\nremote=0\n",
+                "local=1\nremote=0\n",
+            ),
+            (base, base, "local=0\nremote=1\n", "local=0\nremote=1\n"),
+            (
+                base,
+                "top\nlocal=0\nremote=0\n",
+                "local=0\nremote=0\nbottom\n",
+                "top\nlocal=0\nremote=0\nbottom\n",
+            ),
+            (
+                base,
+                "remote=0\n",
+                "local=0\nremote=0\nend\n",
+                "remote=0\nend\n",
+            ),
+            ("", "a\n", "b\n", "a\nb\n"),
+            (
+                "a\nb\n",
+                "a\nb\nlocal",
+                "a\nb\nremote",
+                "a\nb\nlocal\nremote",
+            ),
+            ("a\nb\nc\n", "a\nB\nc\n", "a\nb\nnew\nc\n", "a\nB\nnew\nc\n"),
+            ("a\nb\nc\n", "x\nb\nc\n", "a\nb\ny", "x\nb\ny"),
+            (
+                "a\nb\nc\nd\n",
+                "a\nB\nc\nD\n",
+                "a\nb2\nc2\nd\n",
+                "a\n<<<<<<< host\nB\nc\n=======\nb2\nc2\n>>>>>>> room\nD\n",
+            ),
+            (
+                "a\nb",
+                "a\nlocal",
+                "a\nremote",
+                "a\n<<<<<<< host\nlocal\n=======\nremote\n>>>>>>> room\n",
+            ),
+        ];
+        for (base, local, remote, merged) in cases {
+            assert_eq!(
+                merge_lines(base, local, remote, &labels),
+                merged,
+                "{local:?} + {remote:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_line_ending_switch_does_not_collide_with_concurrent_edits() {
+        let labels = MergeLabels {
+            local: "guest",
+            remote: "room",
+        };
+        let base = "line 1\nline 2\nline 3\nline 4\nline 5\n";
+        let remote = "line 1 host\nline 2\nline 3\nline 4\nline 5\n";
+        let saved = "line 1\r\nline 2\r\nline 3\r\nline 4\r\nline 5 guest\r\n";
+        let local = with_line_endings_of(saved.to_string(), remote);
+        assert_eq!(local, "line 1\nline 2\nline 3\nline 4\nline 5 guest\n");
+        assert_eq!(
+            merge_lines(base, &local, remote, &labels),
+            "line 1 host\nline 2\nline 3\nline 4\nline 5 guest\n"
         );
         assert_eq!(
-            merge_lines(
-                base,
-                "local=1
-remote=0
-",
-                "local=2
-remote=0
-"
-            ),
-            "local=1
-remote=0
-"
+            with_line_endings_of("a\nb\n".to_string(), "x\r\n"),
+            "a\r\nb\r\n"
         );
         assert_eq!(
-            merge_lines(
-                base,
-                base,
-                "local=0
-remote=1
-"
-            ),
-            "local=0
-remote=1
-"
+            with_line_endings_of("a\r\nb\n".to_string(), "x\n"),
+            "a\r\nb\n"
         );
-        assert_eq!(
-            merge_lines(
-                base,
-                "top
-local=0
-remote=0
-",
-                "local=0
-remote=0
-bottom
-"
-            ),
-            "top
-local=0
-remote=0
-bottom
-"
-        );
-        assert_eq!(
-            merge_lines(
-                base,
-                "remote=0
-",
-                "local=0
-remote=0
-end
-"
-            ),
-            "remote=0
-end
-"
-        );
-        assert_eq!(
-            merge_lines(
-                "", "a
-", "b
-"
-            ),
-            "a
-b
-"
-        );
+        assert_eq!(with_line_endings_of("a\r\n".to_string(), "x"), "a\r\n");
     }
 
     #[test]

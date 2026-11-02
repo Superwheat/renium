@@ -1,4 +1,5 @@
 use crate::system::LockRecover;
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -18,24 +19,42 @@ static SELECTED: Mutex<SelectedContext> = Mutex::new(SelectedContext {
 });
 static AUTOMATION_STDIO: AtomicBool = AtomicBool::new(false);
 
+thread_local! {
+    static THREAD_SELECTED: RefCell<Option<SelectedContext>> = const { RefCell::new(None) };
+}
+
+/// The selection the calling thread works under: the one a request bound to
+/// this thread, else the process-wide one.
+fn selected<T>(read: impl Fn(&SelectedContext) -> T) -> T {
+    THREAD_SELECTED
+        .with(|selected| selected.borrow().as_ref().map(&read))
+        .unwrap_or_else(|| read(&SELECTED.lock_recover()))
+}
+
 pub(crate) fn set_cli_project(project: Option<PathBuf>) {
     let _ = CLI_PROJECT.set(project);
 }
 
 pub(crate) fn project_override() -> Option<PathBuf> {
-    SELECTED
-        .lock_recover()
-        .project
-        .clone()
-        .or_else(|| CLI_PROJECT.get().cloned().flatten())
+    selected(|selected| selected.project.clone()).or_else(|| CLI_PROJECT.get().cloned().flatten())
+}
+
+enum Restore {
+    Process(SelectedContext),
+    Thread(Option<SelectedContext>),
 }
 
 #[must_use]
-pub(crate) struct Selection(SelectedContext);
+pub(crate) struct Selection(Restore);
 
 impl Drop for Selection {
     fn drop(&mut self) {
-        *SELECTED.lock_recover() = std::mem::take(&mut self.0);
+        match &mut self.0 {
+            Restore::Process(previous) => *SELECTED.lock_recover() = std::mem::take(previous),
+            Restore::Thread(previous) => {
+                THREAD_SELECTED.with(|selected| *selected.borrow_mut() = previous.take());
+            }
+        }
     }
 }
 
@@ -46,18 +65,35 @@ pub(crate) fn select_automation(
     project: PathBuf,
     place: Option<String>,
 ) -> Selection {
-    Selection(std::mem::replace(
+    Selection(Restore::Process(std::mem::replace(
         &mut *SELECTED.lock_recover(),
         SelectedContext {
             runtime,
             project: Some(project),
             place,
         },
-    ))
+    )))
+}
+
+/// A selection that only the calling thread sees, for a request that runs
+/// beside requests of other Studios: it leaves the process-wide selection,
+/// and the threads that read it, untouched.
+pub(crate) fn select_automation_for_thread(
+    runtime: Option<String>,
+    project: PathBuf,
+    place: Option<String>,
+) -> Selection {
+    Selection(Restore::Thread(THREAD_SELECTED.with(|selected| {
+        selected.borrow_mut().replace(SelectedContext {
+            runtime,
+            project: Some(project),
+            place,
+        })
+    })))
 }
 
 pub(crate) fn automation_runtime() -> Option<String> {
-    SELECTED.lock_recover().runtime.clone()
+    selected(|selected| selected.runtime.clone())
 }
 
 pub(crate) fn set_place_selector(value: Option<String>) {
@@ -65,7 +101,7 @@ pub(crate) fn set_place_selector(value: Option<String>) {
 }
 
 pub(crate) fn place_selector() -> Option<String> {
-    SELECTED.lock_recover().place.clone()
+    selected(|selected| selected.place.clone())
 }
 
 pub(crate) fn set_automation_stdio(enabled: bool) {
@@ -74,4 +110,31 @@ pub(crate) fn set_automation_stdio(enabled: bool) {
 
 pub(crate) fn automation_stdio() -> bool {
     AUTOMATION_STDIO.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_thread_selection_is_seen_by_its_thread_only() {
+        let selection = select_automation_for_thread(
+            Some("thread-selection-a".into()),
+            "a/renium.project.jsonc".into(),
+            Some("10:1".into()),
+        );
+        assert_eq!(automation_runtime().as_deref(), Some("thread-selection-a"));
+        assert_eq!(
+            project_override(),
+            Some(PathBuf::from("a/renium.project.jsonc"))
+        );
+        assert_eq!(place_selector().as_deref(), Some("10:1"));
+        let other = std::thread::spawn(|| (automation_runtime(), project_override()))
+            .join()
+            .unwrap();
+        assert_ne!(other.0.as_deref(), Some("thread-selection-a"));
+        assert_ne!(other.1, Some(PathBuf::from("a/renium.project.jsonc")));
+        drop(selection);
+        assert_ne!(automation_runtime().as_deref(), Some("thread-selection-a"));
+    }
 }

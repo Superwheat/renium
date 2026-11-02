@@ -5,6 +5,25 @@ use std::collections::HashMap;
 
 use crate::studio::bridge::BridgeServer;
 
+#[cfg(target_os = "macos")]
+pub(crate) fn available(bridge: &BridgeServer) -> Result<bool> {
+    use crate::studio::{bridge::BridgeTarget, native::serializer};
+    let info = bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?;
+    let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, &info.runtime_id)?;
+    let title = serializer::target_name(pid, &info.place_name)?;
+    Ok(serializer::optional_native(serializer::probes::run(
+        pid,
+        &title,
+        serializer::probes::NativeOperation::DescriptorBinding,
+    ))?
+    .is_some())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn available(_bridge: &BridgeServer) -> Result<bool> {
+    Ok(true)
+}
+
 // Saved service fields unavailable to plugin property reads. Every listed
 // setter has also been checked for exact Studio history cancellation.
 pub(crate) fn capture_properties(class: &str) -> &'static [&'static str] {

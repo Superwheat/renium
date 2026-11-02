@@ -45,6 +45,6 @@ rbx collab invite
 rbx collab stop
 ```
 
-`start` shares the project's files as one live document and prints an invite; every participant's folder mirrors it. Without `--relay` the room runs on the host through a Cloudflare quick tunnel and dies with it; with `--relay` a relay keeps the room and its history, and its copy wins over a local folder on join. `relay deploy` publishes the relay to the user's free Cloudflare account once (needs Node.js; may open a browser sign-in) and makes it the default; `relay set URL` picks an existing one.
+`start` shares the project's files as one live document and prints an invite; every participant's folder mirrors it. Edits of different lines merge; lines both sides changed keep both versions between `<<<<<<<`/`>>>>>>>` markers. Without `--relay` the room runs on the host through a Cloudflare quick tunnel and dies with it; with `--relay` a relay keeps the room and its history, and its copy wins over a local folder on join. `relay deploy` publishes the relay to the user's free Cloudflare account once (needs Node.js; may open a browser sign-in) and makes it the default; `relay set URL` picks an existing one.
 `join` fills an empty folder from the room and overwrites an existing one. Only the host runs Live Sync; others edit files and see results through Team Create or the host.
 `status` lists participants, their open file and selection. Never start a second session for one folder; stop the first.

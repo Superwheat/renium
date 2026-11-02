@@ -32,6 +32,16 @@ macro_rules! eprintln {
     };
 }
 
+macro_rules! print {
+    ($($argument:tt)*) => {{
+        if $crate::app::context::automation_stdio() {
+            $crate::app::output::write_stderr(format_args!($($argument)*));
+        } else {
+            $crate::app::output::write_stdout_text(format_args!($($argument)*));
+        }
+    }};
+}
+
 macro_rules! println {
     ($format:literal $(, $argument:expr)* $(,)?) => {{
         if $format.starts_with("[renium]") {
@@ -96,11 +106,9 @@ fn main_result() -> ExitCode {
             if app::output::global_json_output() || !std::io::stderr().is_terminal() {
                 eprintln!(
                     "{}",
-                    serde_json::to_string(&json!({
-                        "ok": false,
-                        "error": format!("{error:#}"),
-                    }))
-                    .unwrap_or_else(|_| "{\"ok\":false,\"error\":\"Renium failed\"}".to_string())
+                    serde_json::to_string(&structured_error(&error)).unwrap_or_else(|_| {
+                        "{\"ok\":false,\"error\":\"Renium failed\"}".to_string()
+                    })
                 );
             } else {
                 eprintln!("Error: {error:#}");
@@ -110,13 +118,46 @@ fn main_result() -> ExitCode {
     }
 }
 
+/// The JSON a failed command prints: the message, plus the fields of the
+/// structured detail the daemon attached (`consoleErrors` for a Luau run
+/// whose module failed to load, `sourceVerifyErrors` for a push).
+fn structured_error(error: &anyhow::Error) -> serde_json::Value {
+    let mut body = json!({
+        "ok": false,
+        "error": format!("{error:#}"),
+    });
+    let detail = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<automation::DaemonFailure>())
+        .and_then(|failure| failure.detail.as_ref())
+        .and_then(serde_json::Value::as_object);
+    for (key, value) in detail.into_iter().flatten() {
+        if !matches!(key.as_str(), "ok" | "error") {
+            body[key] = value.clone();
+        }
+    }
+    body
+}
+
 fn arguments_after_leading_root() -> Result<Vec<std::ffi::OsString>> {
     let mut arguments: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    let Some(first) = arguments.get(1).and_then(|value| value.to_str()) else {
+    // A `--daemon NAME` ahead of the root keeps the root leading: a wrapper
+    // that pins the daemon must not change what `rbx -r NEW status` does.
+    let mut start = 1;
+    while let Some(argument) = arguments.get(start).and_then(|value| value.to_str()) {
+        if argument == "--daemon" && arguments.len() > start + 1 {
+            start += 2;
+        } else if argument.starts_with("--daemon=") {
+            start += 1;
+        } else {
+            break;
+        }
+    }
+    let Some(first) = arguments.get(start).and_then(|value| value.to_str()) else {
         return Ok(arguments);
     };
     let (root, consumed) = if matches!(first, "-r" | "--root" | "--project-root") {
-        match arguments.get(2) {
+        match arguments.get(start + 1) {
             Some(path) => (std::path::PathBuf::from(path), 2),
             None => return Ok(arguments),
         }
@@ -128,7 +169,7 @@ fn arguments_after_leading_root() -> Result<Vec<std::ffi::OsString>> {
     } else {
         return Ok(arguments);
     };
-    arguments.drain(1..=consumed);
+    arguments.drain(start..start + consumed);
     if arguments.len() > 1 {
         let mut with_flag = arguments.clone();
         with_flag.push("-r".into());
@@ -178,7 +219,7 @@ fn run_cli() -> Result<()> {
         cli.place
             .clone()
             .or_else(|| std::env::var("RENIUM_PLACE").ok())
-            .or_else(|| std::env::var("PLACE").ok()),
+            .filter(|value| !value.trim().is_empty()),
     );
     if let Some(name) = cli.daemon.as_deref() {
         unsafe {
@@ -335,6 +376,31 @@ fn command_projects_its_own_fields(matches: &clap::ArgMatches) -> bool {
 #[cfg(test)]
 mod startup_policy_tests {
     use super::*;
+
+    #[test]
+    fn a_daemon_failures_detail_fields_join_the_json_error() {
+        let failure = automation::DaemonFailure {
+            message: "Requested module experienced an error while loading".into(),
+            detail: Some(json!({
+                "consoleErrors": ["ReplicatedStorage.Bad:1: bad module"],
+                "ok": true,
+                "error": "ignored",
+            })),
+        };
+        let error = anyhow::Error::from(failure).context("rbx l failed");
+        let body = structured_error(&error);
+        assert_eq!(body["ok"], false);
+        assert_eq!(
+            body["error"],
+            "rbx l failed: Requested module experienced an error while loading"
+        );
+        assert_eq!(
+            body["consoleErrors"],
+            json!(["ReplicatedStorage.Bad:1: bad module"])
+        );
+        let plain = structured_error(&anyhow::anyhow!("no detail"));
+        assert_eq!(plain, json!({ "ok": false, "error": "no detail" }));
+    }
 
     #[test]
     fn a_command_with_its_own_fields_argument_keeps_the_global_projection_off() {

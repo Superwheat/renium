@@ -2,7 +2,7 @@
   "name": "renium",
   "displayName": "Renium",
   "description": "Roblox Studio sync for VS Code/Cursor using native executables",
-  "version": "0.5.7",
+  "version": "0.5.8",
   "publisher": "local",
   "license": "SEE LICENSE IN LICENSE",
   "repository": {
@@ -635,6 +635,12 @@
           "type": "boolean",
           "default": false,
           "description": "Allow editor pushes to write read-only Renium link-package mirrors. Disabled by default to preserve package protection."
+        },
+        "renium.liveSync.changesThreshold": {
+          "type": "integer",
+          "default": 5,
+          "minimum": 0,
+          "description": "A push or direct edit with more changes than this opens the Studio review; 0 reviews every change. Overrides the Studio plugin's own threshold for this project."
         },
         "renium.logLevel": {
           "type": "string",

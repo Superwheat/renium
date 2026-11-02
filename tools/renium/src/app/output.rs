@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::io::{self, Write};
 use std::sync::OnceLock;
@@ -121,8 +121,24 @@ static MODE: AtomicU8 = AtomicU8::new(0);
 static STREAM: AtomicBool = AtomicBool::new(false);
 static TOKEN_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+/// How captured output is shaped. `Structured` keeps the value as the
+/// extension's in-process calls expect; `Text` and `Json` reproduce what
+/// `--output-mode text` and `--output-mode json` print.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum CaptureMode {
+    Structured,
+    Text,
+    Json,
+}
+
 thread_local! {
     static CAPTURED_OUTPUT: RefCell<Result<Option<Value>, ()>> = const { RefCell::new(Err(())) };
+    static CAPTURE_MODE: Cell<CaptureMode> = const { Cell::new(CaptureMode::Structured) };
+    static CAPTURED_STDOUT: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+fn output_is_captured() -> bool {
+    CAPTURED_OUTPUT.with_borrow(Result::is_ok)
 }
 
 static FIELDS: OnceLock<Vec<String>> = OnceLock::new();
@@ -256,13 +272,38 @@ pub(crate) fn log_global(level: u8, message: std::fmt::Arguments<'_>) {
     if global_log_enabled(level) {
         write_stderr(message);
     }
-    if level <= LOG_FILE_LEVEL {
+    if level <= LOG_FILE_LEVEL || global_log_enabled(level) {
         append_log_file(message);
     }
 }
 
 pub(crate) fn write_stdout(message: fmt::Arguments<'_>) {
+    if CAPTURED_STDOUT.with_borrow_mut(|captured| {
+        captured.as_mut().is_some_and(|buffer| {
+            buffer.push_str(&fmt::format(message));
+            buffer.push('\n');
+            true
+        })
+    }) {
+        return;
+    }
     let _ = write_output_line(io::stdout().lock(), message);
+}
+
+/// Text written to stdout without a trailing newline (a rendered store, a
+/// sourcemap), captured like a printed line.
+pub(crate) fn write_stdout_text(message: fmt::Arguments<'_>) {
+    if CAPTURED_STDOUT.with_borrow_mut(|captured| {
+        captured.as_mut().is_some_and(|buffer| {
+            buffer.push_str(&fmt::format(message));
+            true
+        })
+    }) {
+        return;
+    }
+    let mut stdout = io::stdout().lock();
+    let _ = stdout.write_fmt(message);
+    let _ = stdout.flush();
 }
 
 pub(crate) fn write_stderr(message: fmt::Arguments<'_>) {
@@ -286,14 +327,19 @@ pub(crate) fn global_pretty_output(local: bool) -> bool {
 }
 
 pub(crate) fn global_json_output() -> bool {
-    MODE.load(Ordering::Relaxed) != 0
+    (output_is_captured() && CAPTURE_MODE.get() == CaptureMode::Json)
+        || MODE.load(Ordering::Relaxed) != 0
 }
 
 /// Text mode for a reader at a terminal or an agent: compact shapes apply.
 /// Captured output (tests, the extension's in-process calls) keeps the
-/// structured value, like `--output-mode json`.
+/// structured value, like `--output-mode json`, unless it is captured as
+/// text.
 pub(crate) fn compact_text_output() -> bool {
-    !CAPTURED_OUTPUT.with_borrow(Result::is_ok) && !global_json_output()
+    if output_is_captured() {
+        return CAPTURE_MODE.get() == CaptureMode::Text;
+    }
+    !global_json_output()
 }
 
 pub(crate) fn set_global_stream_output(enabled: bool) {
@@ -301,11 +347,11 @@ pub(crate) fn set_global_stream_output(enabled: bool) {
 }
 
 pub(crate) fn emit_global_output(value: &Value, text: &str) -> Result<()> {
-    if CAPTURED_OUTPUT.with_borrow(Result::is_ok) || global_json_output() {
-        print_json_output(value, false)
-    } else {
+    if compact_text_output() {
         println!("{text}");
         Ok(())
+    } else {
+        print_json_output(value, false)
     }
 }
 
@@ -346,6 +392,31 @@ fn luau_error_hint(text: &str) -> Option<&'static str> {
         .map(|(_, hint)| *hint)
 }
 
+/// A failed Luau run as the plugin reported it: the folded message, plus the
+/// console lines Studio logged during the run on their own.
+#[derive(Debug)]
+pub(crate) struct LuauRunFailure {
+    message: String,
+    pub(crate) console_errors: Vec<String>,
+}
+
+impl LuauRunFailure {
+    /// The same failure named after the runtime it came from, keeping the
+    /// console lines a JSON caller reads as `consoleErrors`.
+    pub(crate) fn in_context(mut self, label: &str) -> Self {
+        self.message = format!("[{label}] {}", self.message);
+        self
+    }
+}
+
+impl fmt::Display for LuauRunFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for LuauRunFailure {}
+
 pub(crate) fn ensure_luau_api_ok(result: &Value) -> Result<()> {
     if result.get("ok").and_then(Value::as_bool) == Some(false) {
         let message = result
@@ -367,17 +438,18 @@ pub(crate) fn ensure_luau_api_ok(result: &Value) -> Result<()> {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let console = result
+        let console_errors = result
             .get("consoleErrors")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
             .filter_map(Value::as_str)
-            .collect::<Vec<_>>()
-            .join(
-                "
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let console = console_errors.join(
+            "
 ",
-            );
+        );
         let mut text = message.to_string();
         if !captured.is_empty() {
             text.push_str(
@@ -402,7 +474,11 @@ Hint: ",
             );
             text.push_str(hint);
         }
-        bail!("{text}");
+        return Err(LuauRunFailure {
+            message: text,
+            console_errors,
+        }
+        .into());
     }
     Ok(())
 }
@@ -410,7 +486,13 @@ Hint: ",
 pub(crate) fn print_json_output(value: &Value, pretty: bool) -> Result<()> {
     let captured = CAPTURED_OUTPUT.with_borrow_mut(|output| match output {
         Ok(output) => {
-            *output = Some(value.clone());
+            *output = Some(if CAPTURE_MODE.get() == CaptureMode::Text {
+                let mut text = relativize_project_paths(value.clone());
+                shorten_single_precision_floats(&mut text);
+                text
+            } else {
+                value.clone()
+            });
             true
         }
         Err(()) => false,
@@ -559,12 +641,30 @@ pub(crate) fn drop_false(value: &mut Value, keys: &[&str]) {
 }
 
 pub(crate) fn capture_json_output(run: impl FnOnce() -> Result<()>) -> Result<Value> {
+    let (result, output, _) = capture_output(CaptureMode::Structured, run);
+    result?;
+    Ok(output.unwrap_or_else(|| serde_json::json!({})))
+}
+
+/// Runs a command with its printed result and stdout text captured instead
+/// of written, shaped as `mode` would print them.
+pub(crate) fn capture_output(
+    mode: CaptureMode,
+    run: impl FnOnce() -> Result<()>,
+) -> (Result<()>, Option<Value>, String) {
     CAPTURED_OUTPUT.with_borrow_mut(|output| *output = Ok(None));
+    CAPTURE_MODE.set(mode);
+    CAPTURED_STDOUT.with_borrow_mut(|captured| {
+        *captured = (mode != CaptureMode::Structured).then(String::new)
+    });
     let result = run();
     let output = CAPTURED_OUTPUT
         .with_borrow_mut(|output| std::mem::replace(output, Err(())).unwrap_or_default());
-    result?;
-    Ok(output.unwrap_or_else(|| serde_json::json!({})))
+    CAPTURE_MODE.set(CaptureMode::Structured);
+    let stdout = CAPTURED_STDOUT
+        .with_borrow_mut(Option::take)
+        .unwrap_or_default();
+    (result, output, stdout)
 }
 
 pub(crate) fn automation_token(prefix: &str) -> String {

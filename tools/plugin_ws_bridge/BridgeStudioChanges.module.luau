@@ -172,7 +172,9 @@ type State = {
 	propertyFingerprintByInstance: PropertyFingerprintMap,
 	parentBaselineByInstance: { [Instance]: any },
 	propertyBaselineByInstance: { [Instance]: PropertyBaselines },
-	ordinalCacheByParent: { [Instance]: { [Instance]: number } },
+	ordinalCacheByParent: { [Instance]: any },
+	ordinalFrame: number,
+	ordinalFrameConnection: RBXScriptConnection?,
 	lastParentByInstance: { [Instance]: Instance? },
 	watchedServices: { [string]: boolean },
 	serviceRoots: { [string]: Instance },
@@ -304,6 +306,8 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		parentBaselineByInstance = setmetatable({}, { __mode = "k" }) :: any,
 		propertyBaselineByInstance = setmetatable({}, { __mode = "k" }) :: any,
 		ordinalCacheByParent = setmetatable({}, { __mode = "k" }) :: any,
+		ordinalFrame = 0,
+		ordinalFrameConnection = nil,
 		lastParentByInstance = setmetatable({}, { __mode = "k" }) :: any,
 		watchedServices = {},
 		serviceRoots = {},
@@ -1576,25 +1580,64 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		return 64
 	end
 
-	local function invalidateSiblingOrdinals(parent: Instance?)
-		if parent ~= nil then
-			state.ordinalCacheByParent[parent] = nil
+	-- A removal burst under one parent (a 6000-part folder destroyed) used to
+	-- rebuild the parent's ordinals per removed child, walking every sibling
+	-- each time, which held Studio's main thread for seconds. Within the frame
+	-- of such a burst the ordinals captured before it stay: they are the
+	-- ordinals the daemon's last capture knows the removed instances by, and a
+	-- child inserted meanwhile, appended last among its name, takes the next
+	-- one. A move or rename still rebuilds at once, and any later frame
+	-- rebuilds on demand.
+	local function invalidateSiblingOrdinals(parent: Instance?, kind: string?)
+		if parent == nil then
+			return
+		end
+		local entry = state.ordinalCacheByParent[parent]
+		if entry == nil then
+			return
+		end
+		entry.dirtyFrame = state.ordinalFrame
+		if kind ~= "removal" or entry.dirtyKind == "change" then
+			entry.dirtyKind = "change"
+		else
+			entry.dirtyKind = "removal"
 		end
 	end
 
-	local function siblingOrdinal(instance: Instance, parent: Instance): number
-		local ordinals = state.ordinalCacheByParent[parent]
-		if ordinals == nil then
-			ordinals = setmetatable({}, { __mode = "k" }) :: any
-			local counts = {}
-			for _, child in ipairs(parent:GetChildren()) do
-				local ordinal = (counts[child.Name] or 0) + 1
-				counts[child.Name] = ordinal
-				ordinals[child] = ordinal
-			end
-			state.ordinalCacheByParent[parent] = ordinals
+	local function rebuildSiblingOrdinals(parent: Instance)
+		local ordinals = setmetatable({}, { __mode = "k" }) :: any
+		local counts = {}
+		for _, child in ipairs(parent:GetChildren()) do
+			local ordinal = (counts[child.Name] or 0) + 1
+			counts[child.Name] = ordinal
+			ordinals[child] = ordinal
 		end
-		return ordinals[instance] or 1
+		local entry = { ordinals = ordinals, counts = counts, dirtyFrame = nil, dirtyKind = nil }
+		state.ordinalCacheByParent[parent] = entry
+		return entry
+	end
+
+	local function siblingOrdinal(instance: Instance, parent: Instance): number
+		if state.ordinalFrameConnection == nil then
+			state.ordinalFrameConnection = game:GetService("RunService").Heartbeat:Connect(function()
+				state.ordinalFrame += 1
+			end)
+		end
+		local entry = state.ordinalCacheByParent[parent]
+		if entry == nil then
+			entry = rebuildSiblingOrdinals(parent)
+		elseif entry.dirtyFrame ~= nil then
+			local laterFrame = entry.dirtyFrame ~= state.ordinalFrame
+			local stillAChild = instance.Parent == parent
+			if laterFrame or (entry.dirtyKind == "change" and stillAChild) then
+				entry = rebuildSiblingOrdinals(parent)
+			elseif entry.ordinals[instance] == nil and stillAChild then
+				local ordinal = (entry.counts[instance.Name] or 0) + 1
+				entry.counts[instance.Name] = ordinal
+				entry.ordinals[instance] = ordinal
+			end
+		end
+		return entry.ordinals[instance] or 1
 	end
 
 	local function pathSegmentsAndOrdinalsForInstance(instance: Instance): ({ string }?, { number }?)
@@ -3479,7 +3522,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 					current = current.Parent
 				end
 			end
-			invalidateSiblingOrdinals(instance.Parent)
+			invalidateSiblingOrdinals(instance.Parent, "removal")
 			if not expected and not shouldIgnoreInstance(instance, serviceName) and wasCodeRelevant then
 				markDirty(
 					serviceName,
@@ -3490,7 +3533,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			-- Their local Parent signal still invalidates the old parent's ordinals.
 			if not (state.changeJournal and state.changeJournal.detachedInstances[instance]) then
 				task.defer(function()
-					invalidateSiblingOrdinals(removingParent)
+					invalidateSiblingOrdinals(removingParent, "removal")
 					if
 						state.connectionServiceByInstance[instance] == serviceName
 						and not instance:IsDescendantOf(service)
@@ -3618,6 +3661,10 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		table.clear(state.parentBaselineByInstance)
 		table.clear(state.propertyBaselineByInstance)
 		table.clear(state.ordinalCacheByParent)
+		if state.ordinalFrameConnection ~= nil then
+			state.ordinalFrameConnection:Disconnect()
+			state.ordinalFrameConnection = nil
+		end
 		table.clear(state.lastParentByInstance)
 		table.clear(state.expectedFreshInstances)
 		table.clear(state.watchedServices)

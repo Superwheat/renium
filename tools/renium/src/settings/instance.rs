@@ -394,6 +394,13 @@ pub(crate) fn set_instance_property(
     };
 
     let instance = &mut document.instances[index];
+    if matches!(scope, PropertyScope::Auto | PropertyScope::Metadata)
+        && property_name == "Name"
+        && instance.parent_index.is_none()
+        && instance.name == instance.class_name
+    {
+        bail!("The {} service root cannot be renamed", instance.name);
+    }
     match scope {
         PropertyScope::Metadata => {
             set_metadata_value(instance, property_name, value, resolved_parent_index)
@@ -588,10 +595,21 @@ fn has_tag(instance: &SettingsBytecodeInstance, tag: &str) -> bool {
 }
 
 fn next_editor_settings_id(document: &SettingsBytecode) -> String {
+    next_editor_settings_id_avoiding(document, &HashSet::new())
+}
+
+/// Fresh identities are numbered from the store's size, so a row removed
+/// earlier in the same edit would hand its identity to the next addition;
+/// `reserved` holds such identities and keeps them out of reach.
+pub(crate) fn next_editor_settings_id_avoiding(
+    document: &SettingsBytecode,
+    reserved: &HashSet<String>,
+) -> String {
     let existing = document
         .instances
         .iter()
         .map(|instance| instance.settings_id.as_str())
+        .chain(reserved.iter().map(String::as_str))
         .collect::<HashSet<_>>();
     for index in document.instances.len()..usize::MAX {
         let candidate = format!("editor:{index:x}");

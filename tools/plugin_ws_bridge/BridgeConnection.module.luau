@@ -84,7 +84,7 @@ function BridgeConnection.create(context)
 	local HttpService = context.httpService
 
 	local host = SettingsModule.loadHost(plugin, context.settingsPrefix, context.defaultHost)
-	local ports = SettingsModule.loadPorts(plugin, context.settingsPrefix, context.defaultPorts)
+	local ports = context.launchPorts or SettingsModule.loadPorts(plugin, context.settingsPrefix, context.defaultPorts)
 	local runtimeSettings = context.runtimeSettings or SettingsModule.loadRuntimeSettings(plugin, context.settingsPrefix)
 	local pendingRuntimeSettingsKey = context.settingsPrefix .. "pendingRuntimeSettingChanges"
 	local pendingRuntimeSettingChanges = {}
@@ -1234,6 +1234,21 @@ function BridgeConnection.create(context)
 			end
 		end)
 		updateStatusText()
+	end
+
+	-- A daemon other than the one on the saved ports launched this Studio and
+	-- asks for it: the channels move to that daemon's ports for this session
+	-- only; the saved setting stays what the user chose.
+	function Config.redirectBridgePorts(list)
+		local nextPorts = SettingsModule.parsePortsCsv(table.concat(list, ","))
+		if nextPorts == nil then
+			return false
+		end
+		ports = nextPorts
+		Config.resetChannels()
+		updateStatusText()
+		Config.connectAll()
+		return true
 	end
 
 	function Config.resetChannels()

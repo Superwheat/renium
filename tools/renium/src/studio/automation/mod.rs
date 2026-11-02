@@ -72,7 +72,7 @@ pub(crate) fn execute_luau_command(mut args: ExecuteLuauArgs) -> Result<()> {
     }
     let parameters = json!({
         "code": args.code,
-        "file": args.file,
+        "file": args.file.map(absolute_from_cwd),
         "client": args.client,
         "player": args.player,
         "server": args.server,
@@ -279,8 +279,13 @@ fn luau_context_label(result: &Value, player: Option<&str>) -> String {
 }
 
 fn ensure_luau_ok_in_context(result: &Value, player: Option<&str>) -> Result<()> {
-    ensure_luau_api_ok(result)
-        .map_err(|error| anyhow::anyhow!("[{}] {error:#}", luau_context_label(result, player)))
+    ensure_luau_api_ok(result).map_err(|error| {
+        let label = luau_context_label(result, player);
+        match error.downcast::<crate::app::output::LuauRunFailure>() {
+            Ok(run) => run.in_context(&label).into(),
+            Err(error) => anyhow::anyhow!("[{label}] {error:#}"),
+        }
+    })
 }
 
 pub(crate) fn execute_luau_result(args: ExecuteLuauArgs, bridge: &BridgeServer) -> Result<Value> {
@@ -714,6 +719,23 @@ pub(crate) fn studio_change_state_operation_command(
     finish_studio_change_state_command(operation, has_preference, result, details)
 }
 
+/// Runs Live Sync's comparison again, as a plain `rbx lon` does: a review
+/// whose differences are gone clears and Live Sync resumes.
+pub(crate) fn compare_live_sync_again(project: Option<&Path>) -> Result<Value> {
+    let args = StudioChangeStateArgs {
+        reset: true,
+        replace_services: true,
+        ..StudioChangeStateArgs::plain(crate::cli::BridgeConnectionArgs::local(8.0), false)
+    };
+    daemon_result(
+        op::LIVE_START,
+        project,
+        live_operation_parameters(&args),
+        false,
+        Some(&args.bridge),
+    )
+}
+
 fn live_operation_parameters(args: &StudioChangeStateArgs) -> Value {
     json!({
         "services": args.services,
@@ -869,8 +891,10 @@ pub(crate) fn studio_change_state_result(
             "services": services,
             "reset": args.reset,
             "replaceServices": args.replace_services,
-            "clearPending": args.clear_pending,
-            "start": !args.no_start && !args.clear_pending,
+            // Discarding pending file edits must not forget Studio's own
+            // pending changes: they are still pulled afterwards.
+            "clearPending": false,
+            "start": !args.no_start,
             "stop": args.stop,
             "ackSeq": args.ack_seq,
             "ackRuntimeSettingsSeq": args.ack_runtime_settings_seq,
@@ -1543,19 +1567,32 @@ fn close_orphans(
     (closed, failed)
 }
 
+/// An orphaned test process knows its place only by the file name its Edit
+/// window stamped on it, so a place path (`RENIUM_PLACE=<dir>\Scenario.rbxl`)
+/// matches it by that name, as the Edit window's own orphan sweep does.
 fn client_place_matches(client: &Value, selector: &str) -> bool {
+    let place_name = client
+        .get("placeName")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let wanted = selector.trim().replace('\\', "/");
+    let file_selector = wanted
+        .rsplit_once('/')
+        .map(|(_, name)| name)
+        .filter(|name| {
+            let lower = name.to_ascii_lowercase();
+            !place_name.contains(['/', '\\'])
+                && (lower.ends_with(".rbxl") || lower.ends_with(".rbxlx"))
+        });
     crate::studio::target::place_matches(
         &crate::studio::bridge::BridgeInfoPayload {
             place_id: client.get("placeId").and_then(Value::as_i64),
             game_id: client.get("gameId").and_then(Value::as_i64),
-            place_name: client
-                .get("placeName")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
+            place_name,
             ..Default::default()
         },
-        selector,
+        file_selector.unwrap_or(selector),
     )
 }
 
@@ -2263,14 +2300,84 @@ fn send_virtual_input(
         let window = input_inject::window_for_pid(pid, client_viewport_size(bridge, player))?;
         input_inject::input_shield(&window)?
     };
-    let mut params = json!({ "actions": actions });
-    if let Some(id) = expect_activated_id {
-        params["expectActivatedId"] = Value::String(id.to_string());
+    let batches = if expect_activated_id.is_some() {
+        vec![actions]
+    } else {
+        split_virtual_input(actions)
+    };
+    let mut merged = None;
+    for batch in batches {
+        let mut params = json!({ "actions": batch });
+        if let Some(id) = expect_activated_id {
+            params["expectActivatedId"] = Value::String(id.to_string());
+        }
+        let result =
+            bridge.call_for_selector("sendVirtualInput", params, BridgeTarget::Client, player)?;
+        ensure_plugin_api_ok(&result)?;
+        merged = Some(match merged {
+            None => result,
+            Some(previous) => merge_virtual_input_results(previous, result),
+        });
     }
-    let result =
-        bridge.call_for_selector("sendVirtualInput", params, BridgeTarget::Client, player)?;
-    ensure_plugin_api_ok(&result)?;
-    Ok(result)
+    merged.context("Virtual input needs at least one action")
+}
+
+/// One bridge call answers within thirty seconds, so a batch whose waits
+/// add up to more than this goes to the client as consecutive calls; keys
+/// and buttons held at the end of a call stay held into the next one.
+const MAX_VIRTUAL_CALL_WAIT_MS: u64 = 25_000;
+
+fn split_virtual_input(actions: Vec<Value>) -> Vec<Vec<Value>> {
+    let mut batches: Vec<Vec<Value>> = vec![Vec::new()];
+    let mut waited = 0;
+    for action in actions {
+        let wait = if action["type"] == "wait" {
+            action["ms"].as_u64().unwrap_or(0)
+        } else {
+            action["holdMs"].as_u64().unwrap_or(0)
+        };
+        if waited + wait > MAX_VIRTUAL_CALL_WAIT_MS && !batches.last().is_some_and(Vec::is_empty) {
+            batches.push(Vec::new());
+            waited = 0;
+        }
+        waited += wait;
+        if let Some(batch) = batches.last_mut() {
+            batch.push(action);
+        }
+    }
+    batches
+}
+
+/// The answer for a batch sent as several calls: counts add up, the observed
+/// keys accumulate and the last call reports what is still held.
+fn merge_virtual_input_results(previous: Value, last: Value) -> Value {
+    let mut merged = last;
+    let count = |value: &Value, key: &str| value.get(key).and_then(Value::as_u64);
+    merged["actions"] =
+        json!(count(&previous, "actions").unwrap_or(0) + count(&merged, "actions").unwrap_or(0));
+    if let Some(clicks) = count(&previous, "verifiedClicks") {
+        merged["verifiedClicks"] = json!(clicks + count(&merged, "verifiedClicks").unwrap_or(0));
+    }
+    if let Some(observed) = previous.get("keysObserved").and_then(Value::as_object) {
+        let current = merged["keysObserved"]
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        let mut all = observed.clone();
+        all.extend(current);
+        merged["keysObserved"] = Value::Object(all);
+    }
+    if let Some(through) = previous.get("throughSystemUi").and_then(Value::as_array) {
+        let mut all = through.clone();
+        all.extend(
+            merged["throughSystemUi"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
+        );
+        merged["throughSystemUi"] = Value::Array(all);
+    }
+    merged
 }
 
 fn virtual_click_actions(
@@ -2418,6 +2525,33 @@ fn gui_input_bounds(
     Ok((bounds, x, y))
 }
 
+/// How long a GUI path may stay unresolved on a client that just joined.
+const GUI_PATH_SETTLE: Duration = Duration::from_secs(8);
+
+/// `gui_input_bounds` for a client that may have just joined: it builds its
+/// PlayerGui a moment after it connects, so a path that matches nothing yet
+/// is retried for a short while.
+fn gui_input_bounds_settled(
+    bridge: &BridgeServer,
+    player: Option<&str>,
+    path: Option<&str>,
+    id: Option<&str>,
+    requested: &str,
+) -> Result<(Value, f64, f64)> {
+    let started = Instant::now();
+    loop {
+        match gui_input_bounds(bridge, player, path, id, requested) {
+            Err(error)
+                if error.to_string().contains("matched nothing under")
+                    && started.elapsed() < GUI_PATH_SETTLE =>
+            {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
 pub(crate) fn press_result(args: &PressArgs, bridge: &BridgeServer) -> Result<Value> {
     let player = args.player.as_deref();
     if let Some(player) = player {
@@ -2472,7 +2606,7 @@ pub(crate) fn press_result(args: &PressArgs, bridge: &BridgeServer) -> Result<Va
             .context("getWorldPoint returned no y")?;
         (bounds, x, y)
     } else {
-        gui_input_bounds(
+        gui_input_bounds_settled(
             bridge,
             player,
             args.path.as_deref(),
@@ -2534,18 +2668,20 @@ pub(crate) fn press_result(args: &PressArgs, bridge: &BridgeServer) -> Result<Va
         result["window"] = json!(window.label);
         return Ok(result);
     }
-    let response = send_virtual_input(
-        bridge,
-        player,
-        virtual_click_actions(
-            x.round() as i32,
-            y.round() as i32,
-            args.right,
-            args.hold,
-            true,
-        ),
-        None,
-    )?;
+    // A world part answers a click only once the pointer has hovered it for a
+    // frame or two; a GUI click lands on its element without that hover.
+    let mut actions = vec![
+        json!({ "type": "move", "x": x.round() as i32, "y": y.round() as i32 }),
+        json!({ "type": "wait", "ms": WORLD_HOVER_SETTLE_MS }),
+    ];
+    actions.extend(virtual_click_actions(
+        x.round() as i32,
+        y.round() as i32,
+        args.right,
+        args.hold,
+        false,
+    ));
+    let response = send_virtual_input(bridge, player, actions, None)?;
     result["inputMethod"] = json!("virtual");
     note_system_ui(&mut result, &response);
     Ok(result)
@@ -2619,12 +2755,7 @@ pub(crate) fn key_result(args: &KeyArgs, bridge: &BridgeServer) -> Result<Value>
     }
     let hold_ms = args.hold_ms.clamp(10, MAX_KEY_HOLD_MS);
     let mut actions = vec![json!({ "type": "key", "key": key.name, "down": true })];
-    let mut remaining = hold_ms;
-    while remaining > 0 {
-        let step = remaining.min(MAX_VIRTUAL_WAIT_MS);
-        actions.push(json!({ "type": "wait", "ms": step }));
-        remaining -= step;
-    }
+    actions.extend(virtual_wait_actions(hold_ms));
     actions.push(json!({ "type": "key", "key": key.name, "down": false }));
     send_virtual_input(bridge, player, actions, None)?;
     Ok(json!({
@@ -2639,6 +2770,19 @@ pub(crate) fn key_result(args: &KeyArgs, bridge: &BridgeServer) -> Result<Value>
 /// A key can be held for a minute; the plugin runs each wait for at most
 /// ten seconds, so longer holds are several waits.
 const MAX_KEY_HOLD_MS: u64 = 60_000;
+
+/// The wait actions that pause a client for `ms` (a minute at most), each
+/// within the plugin's ten-second wait.
+pub(super) fn virtual_wait_actions(ms: u64) -> Vec<Value> {
+    let mut actions = Vec::new();
+    let mut remaining = ms.min(MAX_KEY_HOLD_MS);
+    while remaining > 0 {
+        let step = remaining.min(MAX_VIRTUAL_WAIT_MS);
+        actions.push(json!({ "type": "wait", "ms": step }));
+        remaining -= step;
+    }
+    actions
+}
 const MAX_VIRTUAL_WAIT_MS: u64 = 10_000;
 
 pub(crate) fn ui_result(args: &UiArgs, bridge: &BridgeServer) -> Result<Value> {
@@ -2683,7 +2827,7 @@ pub(crate) fn type_result(args: &TypeArgs, bridge: &BridgeServer) -> Result<Valu
     #[cfg(windows)]
     if os_input_preferred() {
         let (pressed, click, viewport) = if let Some(path) = args.path.as_ref() {
-            let (bounds, x, y) = gui_input_bounds(bridge, player, Some(path), None, path)?;
+            let (bounds, x, y) = gui_input_bounds_settled(bridge, player, Some(path), None, path)?;
             if bounds.get("className").and_then(Value::as_str) != Some("TextBox") {
                 bail!("{path} is not a TextBox");
             }
@@ -2729,7 +2873,7 @@ pub(crate) fn type_result(args: &TypeArgs, bridge: &BridgeServer) -> Result<Valu
     let mut pressed = Value::Null;
     let mut actions = Vec::new();
     if let Some(path) = args.path.as_ref() {
-        let (bounds, _, _) = gui_input_bounds(bridge, player, Some(path), None, path)?;
+        let (bounds, _, _) = gui_input_bounds_settled(bridge, player, Some(path), None, path)?;
         if bounds.get("className").and_then(Value::as_str) != Some("TextBox") {
             bail!("{path} is not a TextBox");
         }
@@ -2751,15 +2895,19 @@ pub(crate) fn type_result(args: &TypeArgs, bridge: &BridgeServer) -> Result<Valu
             json!({ "type": "key", "key": "Return", "down": false }),
         ]);
     }
-    send_virtual_input(bridge, player, actions, None)?;
-    Ok(json!({
+    let response = send_virtual_input(bridge, player, actions, None)?;
+    let mut result = json!({
         "ok": true,
         "action": "type",
         "chars": args.text.chars().count(),
         "focused": pressed,
         "enter": args.enter,
         "inputMethod": "virtual",
-    }))
+    });
+    if let Some(observed) = response.get("textObserved").and_then(Value::as_bool) {
+        result["textObserved"] = json!(observed);
+    }
+    Ok(result)
 }
 
 /// The body of the probe function a wait runs each check: a single expression
@@ -2875,20 +3023,14 @@ pub(crate) fn wait_until_result(args: &WaitUntilArgs, bridge: &BridgeServer) -> 
     loop {
         let remaining = timeout - started.elapsed().as_secs_f64();
         if remaining <= 0.0 {
-            return Ok(json!({
-                "ok": false,
-                "action": "wait",
-                "condition": args.condition,
-                "timedOut": true,
-                "value": detail,
-                "elapsedSeconds": started.elapsed().as_secs_f64(),
-                "error": format!(
-                    "Timed out after {timeout}s waiting for condition (last value: {detail}); \
-                     raise -t, or use rbx l --detach for a sampler"
-                ),
-            }));
+            return Ok(wait_timed_out_result(
+                &args.condition,
+                timeout,
+                &detail,
+                started.elapsed().as_secs_f64(),
+            ));
         }
-        let slice = remaining.min(WAIT_RUNNER_SLICE_SECONDS);
+        let slice = remaining.min(WAIT_PROBE_SLICE_SECONDS);
         let code = wait_probe_code(&body, result_body.as_deref(), slice, interval);
         let outcome = run_luau_task(bridge, target, player, &code, slice + 5.0)?;
         if outcome.success {
@@ -2902,9 +3044,35 @@ pub(crate) fn wait_until_result(args: &WaitUntilArgs, bridge: &BridgeServer) -> 
     }
 }
 
+/// The answer a wait gives when its condition never held within `timeout`.
+pub(crate) fn wait_timed_out_result(
+    condition: &str,
+    timeout: f64,
+    detail: &Value,
+    elapsed: f64,
+) -> Value {
+    json!({
+        "ok": false,
+        "action": "wait",
+        "condition": condition,
+        "timedOut": true,
+        "value": detail,
+        "elapsedSeconds": elapsed,
+        "error": format!(
+            "Timed out after {timeout}s waiting for condition (last value: {detail}); \
+             raise -t, or use rbx l --detach for a sampler"
+        ),
+    })
+}
+
 // Studio stops a runner after 120 s; each slice stays under that so a long
 // wait keeps checking instead of dying with the runner.
 const WAIT_RUNNER_SLICE_SECONDS: f64 = 100.0;
+/// How long a world press lets the pointer rest on its part before the button.
+const WORLD_HOVER_SETTLE_MS: u64 = 120;
+/// A wait polls its condition in short runs so a `rbx play -x` issued
+/// meanwhile reaches the runtime between them instead of after the timeout.
+const WAIT_PROBE_SLICE_SECONDS: f64 = 5.0;
 
 struct LuauTaskOutcome {
     success: bool,
@@ -3004,15 +3172,16 @@ pub(crate) fn goto_result(args: &GotoArgs, bridge: &BridgeServer) -> Result<Valu
     }
     let timeout = args.timeout.clamp(1.0, 300.0);
     let speed_multiplier = args.speed_multiplier.clamp(0.1, 10.0);
-    let movement = if args.tp {
-        format!(
-            "\tch:PivotTo(CFrame.new(targetPos + Vector3.new(0, 4, 0)))\n\
+    let movement = |slice: f64| {
+        if args.tp {
+            format!(
+                "\tch:PivotTo(CFrame.new(targetPos + Vector3.new(0, 4, 0)))\n\
              \tlocal dist = (ch:GetPivot().Position - targetPos).Magnitude\n\
              \treturn dist < {ARRIVAL_RADIUS}, dist"
-        )
-    } else {
-        format!(
-            "\tlocal deadline = os.clock() + {timeout}\n\
+            )
+        } else {
+            format!(
+                "\tlocal deadline = os.clock() + {slice}\n\
              \tlocal function distance()\n\
              \t\treturn (ch:GetPivot().Position - targetPos).Magnitude\n\
              \tend\n\
@@ -3043,24 +3212,47 @@ pub(crate) fn goto_result(args: &GotoArgs, bridge: &BridgeServer) -> Result<Valu
              \tend\n\
              \tlocal dist = distance()\n\
              \treturn dist < {ARRIVAL_RADIUS}, dist"
+            )
+        }
+    };
+    let code = |slice: f64| {
+        format!(
+            "local targetPos = Vector3.new({x}, {y}, {z})\n\
+             \tlocal lp = game:GetService('Players').LocalPlayer\n\
+             \tlocal ch = lp.Character or lp.CharacterAdded:Wait()\n\
+             \tlocal hum = ch:FindFirstChildOfClass('Humanoid')\n\
+             \tlocal humanoidDeadline = os.clock() + 10\n\
+             \twhile hum == nil and os.clock() < humanoidDeadline do task.wait(0.1) hum = ch:FindFirstChildOfClass('Humanoid') end\n\
+             \tif hum == nil then return false, 'no humanoid' end\n\
+             \tlocal originalSpeed = hum.WalkSpeed\n\
+             \thum.WalkSpeed = originalSpeed * {speed_multiplier}\n\
+             \tlocal ok, reached, detail = pcall(function()\n\
+             {}\n\
+             \tend)\n\
+             \thum.WalkSpeed = originalSpeed\n\
+             \tif not ok then error(reached) end\n\
+             \treturn reached, detail",
+            movement(slice)
         )
     };
-    let code = format!(
-        "local targetPos = Vector3.new({x}, {y}, {z})\n\
-         \tlocal lp = game:GetService('Players').LocalPlayer\n\
-         \tlocal ch = lp.Character or lp.CharacterAdded:Wait()\n\
-         \tlocal hum = ch:FindFirstChildOfClass('Humanoid')\n\
-         \tif hum == nil then return false, 'no humanoid' end\n\
-         \tlocal originalSpeed = hum.WalkSpeed\n\
-         \thum.WalkSpeed = originalSpeed * {speed_multiplier}\n\
-         \tlocal ok, reached, detail = pcall(function()\n\
-         {movement}\n\
-         \tend)\n\
-         \thum.WalkSpeed = originalSpeed\n\
-         \tif not ok then error(reached) end\n\
-         \treturn reached, detail"
-    );
-    let outcome = run_luau_task(bridge, BridgeTarget::Client, player, &code, timeout + 5.0)?;
+    // Studio stops a runner after 120 s, so a long walk runs as slices that
+    // each resume from where the character stands.
+    let started = Instant::now();
+    let outcome = loop {
+        let remaining = timeout - started.elapsed().as_secs_f64();
+        let slice = remaining.min(WAIT_RUNNER_SLICE_SECONDS);
+        let outcome = run_luau_task(
+            bridge,
+            BridgeTarget::Client,
+            player,
+            &code(slice),
+            slice + 5.0,
+        )?;
+        let gave_up_early = outcome.elapsed + 1.0 < slice;
+        if outcome.success || args.tp || gave_up_early || remaining <= slice {
+            break outcome;
+        }
+    };
     if outcome.success {
         let final_distance = outcome
             .detail
@@ -3074,7 +3266,7 @@ pub(crate) fn goto_result(args: &GotoArgs, bridge: &BridgeServer) -> Result<Valu
             "arrivalRadius": ARRIVAL_RADIUS,
             "finalDistance": final_distance,
             "speedMultiplier": speed_multiplier,
-            "elapsedSeconds": outcome.elapsed,
+            "elapsedSeconds": started.elapsed().as_secs_f64(),
         }))
     } else {
         bail!(
@@ -3494,14 +3686,20 @@ pub(crate) fn wait_until_command(args: WaitUntilArgs) -> Result<()> {
     )
 }
 
-pub(crate) fn shot_command(args: ShotArgs) -> Result<()> {
-    let output = if args.output.is_absolute() {
-        args.output.clone()
+/// A path argument names a file relative to where the command runs, like
+/// every other path a command takes; the daemon has no cwd of its own.
+fn absolute_from_cwd(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
     } else {
         std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
-            .join(&args.output)
-    };
+            .join(path)
+    }
+}
+
+pub(crate) fn shot_command(args: ShotArgs) -> Result<()> {
+    let output = absolute_from_cwd(args.output.clone());
     run_input_command(
         op::SHOT,
         json!({
@@ -3522,7 +3720,8 @@ pub(crate) fn record_start_command(args: RecordStartArgs) -> Result<()> {
         op::RECORD_START,
         None,
         json!({
-            "output": args.output,
+            "output": args.output.map(absolute_from_cwd),
+            "directory": std::env::current_dir().ok(),
             "player": args.player,
             "studio": args.studio,
             "client": args.client,
@@ -3680,16 +3879,24 @@ fn runtime_stopped_state(
     target: BridgeTarget,
     runtime_id: &str,
 ) -> Option<bool> {
-    bridge
-        .call_for_runtime_with_timeout(
-            "startStopPlay",
-            json!({}),
-            target,
-            runtime_id,
-            Some(Duration::from_millis(500)),
-        )
-        .ok()
-        .map(|status| play_status_is_stopped(&status))
+    let status = bridge.call_for_runtime_with_timeout(
+        "startStopPlay",
+        json!({}),
+        target,
+        runtime_id,
+        Some(Duration::from_millis(500)),
+    );
+    log_global(
+        5,
+        format_args!(
+            "[renium] runtime {target:?} {runtime_id} status: {}",
+            match &status {
+                Ok(value) => serde_json::to_string(value).unwrap_or_default(),
+                Err(error) => format!("error {error:#}"),
+            }
+        ),
+    );
+    status.ok().map(|status| play_status_is_stopped(&status))
 }
 
 fn play_client_stopped_state(bridge: &BridgeServer, client: &Value) -> Option<bool> {
@@ -3784,12 +3991,22 @@ fn request_play_runtimes_to_stop(
         let Some(runtime_id) = client.get("runtimeId").and_then(Value::as_str) else {
             continue;
         };
-        let _ = bridge.call_for_runtime_with_timeout(
+        let answer = bridge.call_for_runtime_with_timeout(
             "startStopPlay",
             Value::Object(params.clone()),
             target,
             runtime_id,
             Some(Duration::from_millis(1_100)),
+        );
+        log_global(
+            5,
+            format_args!(
+                "[renium] play stop request to {target:?} {runtime_id}: {}",
+                match &answer {
+                    Ok(value) => serde_json::to_string(value).unwrap_or_default(),
+                    Err(error) => format!("error {error:#}"),
+                }
+            ),
         );
     }
 }
@@ -3988,10 +4205,31 @@ fn stop_studio_play_with_bridge_result(bridge: &BridgeServer) -> Result<Value> {
                 Ok(status) => {
                     last_status = status.clone();
                     active_clients = play_clients_by_state(bridge, &edit_runtime_id).0;
+                    log_global(
+                        5,
+                        format_args!(
+                            "[renium] play stop wait: edit stopped={} active={:?}",
+                            play_status_is_stopped(&status),
+                            active_clients
+                                .iter()
+                                .map(|client| {
+                                    format!(
+                                        "{}:{}",
+                                        client["role"].as_str().unwrap_or("?"),
+                                        client["runtimeId"].as_str().unwrap_or("?")
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        ),
+                    );
                     play_status_is_stopped(&status) && active_clients.is_empty()
                 }
                 Err(err) => {
                     last_status = json!({ "error": format!("{:#}", err) });
+                    log_global(
+                        5,
+                        format_args!("[renium] play stop wait: status error {err:#}"),
+                    );
                     false
                 }
             };
@@ -4087,6 +4325,33 @@ pub(crate) struct TestLaunch {
 #[cfg(test)]
 mod play_state_tests {
     use super::*;
+
+    #[test]
+    fn a_play_target_luau_failure_keeps_its_console_lines() {
+        let error = ensure_luau_ok_in_context(
+            &json!({
+                "ok": false,
+                "context": "server",
+                "error": "Requested module experienced an error while loading",
+                "consoleErrors": ["ReplicatedStorage.Bad:1: bad module"],
+            }),
+            None,
+        )
+        .unwrap_err();
+        let run = error
+            .downcast_ref::<crate::app::output::LuauRunFailure>()
+            .expect("the typed failure survives the context label");
+        assert_eq!(
+            run.console_errors,
+            vec!["ReplicatedStorage.Bad:1: bad module"]
+        );
+        assert!(
+            error
+                .to_string()
+                .starts_with("[play server] Requested module")
+        );
+        assert!(error.to_string().contains("Studio logged during the run:"));
+    }
 
     #[test]
     fn play_stop_completes_only_the_source_executor_and_still_stops_orphaned_servers() {
@@ -4261,6 +4526,39 @@ mod play_state_tests {
             "error": "DataModel stopped",
         })));
         assert!(play_status_is_running(&json!({ "running": true })));
+    }
+
+    #[test]
+    fn orphans_match_a_place_path_by_its_file_name() {
+        let orphan = json!({ "placeName": "Scenario.rbxl", "placeId": 0 });
+        assert!(client_place_matches(
+            &orphan,
+            r"E:\runs\small-1\Scenario.rbxl"
+        ));
+        assert!(client_place_matches(
+            &orphan,
+            "E:/runs/small-1/scenario.RBXL"
+        ));
+        assert!(client_place_matches(&orphan, "Scenario.rbxl"));
+        assert!(!client_place_matches(
+            &orphan,
+            r"E:\runs\small-1\Other.rbxl"
+        ));
+        let documented = json!({ "placeName": r"E:\runs\small-1\Scenario.rbxl", "placeId": 0 });
+        assert!(client_place_matches(
+            &documented,
+            r"E:\runs\small-1\Scenario.rbxl"
+        ));
+        assert!(!client_place_matches(
+            &documented,
+            r"E:\runs\small-2\Scenario.rbxl"
+        ));
+        let published = json!({ "placeName": "Scenario", "placeId": 20, "gameId": 10 });
+        assert!(client_place_matches(&published, "10:20"));
+        assert!(!client_place_matches(
+            &published,
+            r"E:\runs\small-1\Scenario.rbxl"
+        ));
     }
 
     #[test]
@@ -4723,5 +5021,56 @@ mod wait_condition_tests {
             error.starts_with("The condition is neither a Luau expression nor a chunk"),
             "{error}"
         );
+    }
+}
+
+#[cfg(test)]
+mod virtual_input_tests {
+    use super::*;
+
+    #[test]
+    fn long_holds_go_to_the_client_as_consecutive_calls() {
+        let mut actions = vec![json!({ "type": "key", "key": "W", "down": true })];
+        actions.extend(virtual_wait_actions(45_000));
+        actions.push(json!({ "type": "key", "key": "W", "down": false }));
+        let batches = split_virtual_input(actions);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].len(), 3, "key down plus two ten-second waits");
+        assert_eq!(batches[1].len(), 4, "the rest of the hold and the key up");
+        let waited =
+            |batch: &[Value]| -> u64 { batch.iter().filter_map(|a| a["ms"].as_u64()).sum() };
+        assert_eq!(waited(&batches[0]), 20_000);
+        assert_eq!(waited(&batches[1]), 25_000);
+
+        let short = split_virtual_input(virtual_click_actions(1, 2, false, 30, true));
+        assert_eq!(short.len(), 1);
+        let clicks = split_virtual_input(vec![
+            json!({ "type": "click", "path": "A", "holdMs": 10_000 }),
+            json!({ "type": "click", "path": "B", "holdMs": 10_000 }),
+            json!({ "type": "click", "path": "C", "holdMs": 10_000 }),
+        ]);
+        assert_eq!(clicks.len(), 2);
+    }
+
+    #[test]
+    fn consecutive_call_answers_add_up() {
+        let first = json!({
+            "ok": true, "actions": 3, "verifiedClicks": 1,
+            "keysObserved": { "W": true }, "throughSystemUi": ["chat"], "heldKeys": ["W"],
+        });
+        let last = json!({
+            "ok": true, "actions": 4, "verifiedClicks": 0,
+            "keysObserved": { "E": false }, "coreGui": { "pressed": true },
+        });
+        let merged = merge_virtual_input_results(first, last);
+        assert_eq!(merged["actions"], 7);
+        assert_eq!(merged["verifiedClicks"], 1);
+        assert_eq!(merged["keysObserved"], json!({ "W": true, "E": false }));
+        assert_eq!(merged["throughSystemUi"], json!(["chat"]));
+        assert!(
+            merged.get("heldKeys").is_none(),
+            "the last call reports what is still held"
+        );
+        assert_eq!(merged["coreGui"]["pressed"], true);
     }
 }

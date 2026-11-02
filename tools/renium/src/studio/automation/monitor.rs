@@ -404,6 +404,9 @@ pub(crate) fn result(
         result.as_object_mut().unwrap().remove("nextPage");
     }
     result["pid"] = json!(bridge.studio_pid_for_runtime(target, &runtime_id)?);
+    if heap && result.get("target").is_none_or(Value::is_null) {
+        result["target"] = json!(parameters.target.clone());
+    }
     match output_path {
         Some(path) if heap => super::heap::save_report(&path, &result),
         Some(path) => super::microprofiler::save_capture(&path, &result),

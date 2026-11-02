@@ -11,7 +11,7 @@ rbx lof
 ```
 
 `ps` pushes files or directories; for store edits pass the store file with `-i ID` per instance (the instance and its subtree), or `-u` to upsert without deleting; deletions need the store file without `-i`.
-A push of more than 5 changes (default threshold) opens a review panel in Studio and prints `held for review in Studio`: `rbx rv apply` or `rbx rv skip` decides, an unanswered review is skipped after 90 s, `ps --yes` skips it. `--no-review` also disables protected writes.
+A push, `prop` or `del` above `liveSync.changesThreshold` (default 5; 0 reviews all) opens a Studio review panel and prints `held for review in Studio`: `rbx rv apply` or `rbx rv skip` decides, an unanswered review is skipped after 90 s, `ps --yes` skips it. `--no-review` also disables protected writes.
 Work in the place folder or add `--place <alias|placeId>`.
 
 ## Live Sync

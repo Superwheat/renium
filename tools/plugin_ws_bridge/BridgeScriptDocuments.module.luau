@@ -35,6 +35,14 @@ function BridgeScriptDocuments.readSource(instance: Instance): (boolean, any)
 	end)
 end
 
+-- The Source property itself, bypassing an open editor document; a tab Studio
+-- restores on reopen can show text older than the property for a moment.
+function BridgeScriptDocuments.readPropertySource(instance: Instance): (boolean, any)
+	return pcall(function()
+		return (instance :: any).Source
+	end)
+end
+
 local function documentLineEndCharacter(document: any, line: number): number
 	local okLine, lineText = pcall(document.GetLine, document, line)
 	if okLine and type(lineText) == "string" then
@@ -281,7 +289,10 @@ function BridgeScriptDocuments.apply(
 			ctx.assertSessionOwnership()
 		end
 		local target = resolveEntryTarget(entry, replacements, resolveStagedPath)
-		if (target == nil or not target:IsA("LuaSourceContainer")) and allSourcesChanged then
+		local removed = BridgeIdentity.liveInstance(entry.instance) == nil
+		if (target == nil or not target:IsA("LuaSourceContainer")) and (allSourcesChanged or removed) then
+			-- The transaction removed the script this document showed; the
+			-- document closes with it instead of failing the commit.
 			closeDocument(entry.document, "Could not close removed script document")
 			continue
 		end

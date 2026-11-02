@@ -64,6 +64,44 @@ fn adapter_key(adapter: &AdapterSpec) -> String {
     )
 }
 
+/// The target half of a baseline key: the `(segments, ordinals)` pair
+/// `adapter_key` writes, or the project target text of an older baseline.
+fn baseline_key_target(text: &str) -> Result<Vec<String>> {
+    if let Ok((segments, _)) = serde_json::from_str::<(Vec<String>, Vec<usize>)>(text) {
+        return Ok(segments);
+    }
+    let target = serde_json::from_str::<ProjectTarget>(text)
+        .unwrap_or_else(|_| ProjectTarget::Shorthand(text.to_string()));
+    target_segments(&target)
+}
+
+#[cfg(test)]
+mod baseline_key_tests {
+    use super::*;
+
+    #[test]
+    fn baseline_keys_carry_segment_and_ordinal_arrays_or_a_target_text() {
+        let key = adapter_key(&AdapterSpec {
+            source: PathBuf::from("data/config.json"),
+            target: ProjectTarget::Shorthand("ReplicatedStorage.Config".to_string()),
+            output: None,
+            format: None,
+            direction: AdapterDirection::ToProject,
+            generated: false,
+        });
+        let (_, target) = key.split_once('\0').unwrap();
+        assert_eq!(target, r#"[["ReplicatedStorage","Config"],[1,1]]"#);
+        assert_eq!(
+            baseline_key_target(target).unwrap(),
+            vec!["ReplicatedStorage".to_string(), "Config".to_string()]
+        );
+        assert_eq!(
+            baseline_key_target("ReplicatedStorage.Note").unwrap(),
+            vec!["ReplicatedStorage".to_string(), "Note".to_string()]
+        );
+    }
+}
+
 fn adapter_target_bytes_from_root(
     loaded: &LoadedProject,
     root: &Path,
@@ -181,9 +219,7 @@ pub(super) fn build_adapters(loaded: &LoadedProject, check: bool) -> Result<()> 
         let Some((_, target)) = key.split_once('\0') else {
             continue;
         };
-        let target = serde_json::from_str::<ProjectTarget>(target)
-            .unwrap_or_else(|_| ProjectTarget::Shorthand(target.to_string()));
-        let target = target_segments(&target)?;
+        let target = baseline_key_target(target)?;
         if let Some(service) = target.first() {
             transaction_paths.push(service_settings_path(
                 &loaded.root.join(&loaded.project.source_root).join(service),
@@ -2654,6 +2690,20 @@ pub(super) fn plan_adapter_syncback(
             }
             let source = loaded.root.join(&adapter.source);
             let document = SettingsBytecode::read_file(&settings_path)?;
+            if find_document_target_optional(&document, target)?.is_none() {
+                // The projection creates a two-way target from its file;
+                // until a pull records Studio's copy in the store there is
+                // nothing to sync back.
+                if adapter.direction == AdapterDirection::TwoWay {
+                    return Ok(());
+                }
+                bail!(
+                    "Cannot sync back adapter {} because {} has no {} yet; rbx pl pulls it from Studio",
+                    adapter.target,
+                    settings_path.display(),
+                    target.join(".")
+                );
+            }
             let current = match fs::read(&source) {
                 Ok(bytes) => Some(bytes),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,

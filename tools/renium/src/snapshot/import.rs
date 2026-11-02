@@ -14,7 +14,7 @@ use serde_json::{Map, Value, json};
 
 use crate::app::timing::{elapsed_ms, log_timing, log_timing_ms, verbose_timing_logs};
 use crate::bytecode::acquire_settings_file_lock;
-use crate::editor::paths::{project_script_file_names, script_file_names};
+use crate::editor::paths::{project_script_file_names_in_layout, script_file_names};
 use crate::project::sourcemap::{
     SourcemapNode, build_service_sourcemap_from_state, finalize_project_sourcemap_temp,
     load_existing_sourcemap_root, sourcemap_root_is_current,
@@ -24,10 +24,14 @@ use crate::roblox::schema::{MATERIAL_SERVICE_CLASS, USE_2022_MATERIALS_PROPERTY}
 use crate::roblox::services::DEFAULT_SYNC_SERVICES;
 use crate::settings::EXTERNAL_SOURCE_MARKER;
 use crate::settings::bytecode::{
-    SettingsBytecode, child_indices_for_instance, encode_service_settings_binary,
+    SettingsBytecode, child_indices_for_instance, decode_settings_bytecode,
+    encode_service_settings_binary, encode_settings_bytecode,
     write_fresh_service_settings_binary_file,
 };
-use crate::settings::equivalence::{SettingsAlignment, align_settings_bytes_to_reference};
+use crate::settings::equivalence::{
+    SettingsAlignment, align_reconciliation_protected_workspace_cameras,
+    align_settings_bytes_to_reference, inherit_workspace_viewport_reference,
+};
 use crate::settings::tree::editor_service_root_index;
 use crate::snapshot::codec::parse_source_range_batch;
 use crate::snapshot::export::{
@@ -252,12 +256,21 @@ pub(crate) struct DirectImportDispatcher {
 /// `ExportProjectStage::copy_gate`.
 pub(crate) type ImportReadyGate = Arc<dyn Fn() -> Result<()> + Send + Sync>;
 
+/// Where a direct import writes, and whose existing script files decide the
+/// names and forms of the imported scripts (the written tree itself when
+/// `layout_src_root` is `None`).
+#[derive(Clone)]
+pub(crate) struct DirectImportRoots {
+    pub(crate) project_root: PathBuf,
+    pub(crate) src_dir: PathBuf,
+    pub(crate) layout_src_root: Option<PathBuf>,
+}
+
 #[derive(Clone)]
 struct DirectImportWorker {
     queue: Arc<DirectImportTaskQueue>,
     ready: Option<ImportReadyGate>,
-    project_root: PathBuf,
-    src_dir: PathBuf,
+    roots: DirectImportRoots,
     first_error: Arc<Mutex<Option<String>>>,
     service_nodes: Arc<Mutex<HashMap<String, SourcemapNode>>>,
     pending_tasks: Arc<AtomicUsize>,
@@ -288,7 +301,7 @@ impl DirectImportWorker {
     }
 
     fn import_service(&self, service: String, parts: ExportedSnapshotParts) -> Result<()> {
-        let src_root = self.project_root.join(&self.src_dir);
+        let src_root = self.roots.project_root.join(&self.roots.src_dir);
         let started = Instant::now();
         let started_ms = elapsed_ms(self.run_started);
         if verbose_timing_logs() {
@@ -308,7 +321,13 @@ impl DirectImportWorker {
                 if let Some(ready) = &self.ready {
                     ready()?;
                 }
-                import_service_state_with_sourcemap(&state, &self.project_root, &src_root, &service)
+                import_service_state_with_sourcemap(
+                    &state,
+                    &self.roots.project_root,
+                    &src_root,
+                    self.roots.layout_src_root.as_deref(),
+                    &service,
+                )
             });
         match result {
             Ok(node) => {
@@ -362,8 +381,7 @@ impl DirectImportWorker {
 
 impl DirectImportDispatcher {
     pub(crate) fn start(
-        project_root: PathBuf,
-        src_dir: PathBuf,
+        roots: DirectImportRoots,
         active_worker_count: usize,
         drain_worker_count: usize,
         sourcemap_sender: Option<mpsc::Sender<SourcemapWriterMessage>>,
@@ -380,8 +398,7 @@ impl DirectImportDispatcher {
         let worker = DirectImportWorker {
             queue: Arc::clone(&queue),
             ready,
-            project_root,
-            src_dir,
+            roots,
             first_error: Arc::clone(&first_error),
             service_nodes: Arc::clone(&service_nodes),
             pending_tasks: Arc::clone(&pending_tasks),
@@ -486,11 +503,12 @@ pub(crate) fn import_service_state_with_sourcemap(
     state: &ServiceState,
     project_root: &Path,
     src_root: &Path,
+    layout_src_root: Option<&Path>,
     service: &str,
 ) -> Result<SourcemapNode> {
     let import_started = Instant::now();
     let write_tree_started = Instant::now();
-    let node = import_service_tree(state, project_root, src_root, service)?;
+    let node = import_service_tree(state, project_root, src_root, layout_src_root, service)?;
     log_timing(&format!("{service}: write src tree"), write_tree_started);
     log_timing(&format!("{service}: import service total"), import_started);
     Ok(node)
@@ -1216,13 +1234,21 @@ fn name_child_indices(state: &ServiceState, child_indices: &[usize]) -> Vec<(usi
     named_children
 }
 
+/// Scripts keep the file names and forms the project already has. The files
+/// are looked for under `src_root`, or under `layout_src_root` when the import
+/// writes into a stage that carries no copy of them.
 fn import_service_tree(
     state: &ServiceState,
     project_root: &Path,
     src_root: &Path,
+    layout_src_root: Option<&Path>,
     service: &str,
 ) -> Result<SourcemapNode> {
     let service_dir = src_root.join(sanitize_name(service));
+    let layout_dir = layout_src_root.map_or_else(
+        || service_dir.clone(),
+        |root| root.join(sanitize_name(service)),
+    );
     let cleanup_required = ensure_import_service_dir(&service_dir)?;
     let fresh_service_dir = !cleanup_required;
     let expected_paths = Arc::new(ImportPathSets::default());
@@ -1248,6 +1274,7 @@ fn import_service_tree(
             state,
             root_children,
             &service_dir,
+            &layout_dir,
             &SourceOutput::Files {
                 fresh: fresh_service_dir,
             },
@@ -1425,7 +1452,9 @@ fn write_service_settings_file(
                 .with_context(|| format!("Failed to align {}", settings_path.display()))?
             {
                 SettingsAlignment::Equivalent => None,
-                SettingsAlignment::Changed(aligned) => Some(aligned),
+                SettingsAlignment::Changed(aligned) => {
+                    Some(keep_store_viewport_camera(&reference, aligned)?)
+                }
             },
             Err(error) if error.kind() == io::ErrorKind::NotFound => Some(observed),
             Err(error) => {
@@ -1448,6 +1477,24 @@ fn write_service_settings_file(
     }
     log_timing(&format!("{service}: write settings file"), started);
     Ok(())
+}
+
+/// The viewport camera is Studio's: the comparisons hide it and `rbx bs`
+/// refuses to edit it, so a pull keeps the store's row for the camera the
+/// root's `CurrentCamera` names instead of writing Studio's current values.
+/// A store written before `CurrentCamera` was saved names none; identity
+/// alignment has matched the live viewport to its row by then, so the store
+/// inherits the pulled reference for the comparison and keeps that row too.
+fn keep_store_viewport_camera(reference: &[u8], aligned: Vec<u8>) -> Result<Vec<u8>> {
+    let mut store = decode_settings_bytecode(reference)?;
+    let mut pulled = decode_settings_bytecode(&aligned)?;
+    let before = pulled.clone();
+    inherit_workspace_viewport_reference(&mut store, &pulled);
+    align_reconciliation_protected_workspace_cameras(&store, &mut pulled);
+    if pulled == before {
+        return Ok(aligned);
+    }
+    encode_settings_bytecode(&pulled)
 }
 
 pub(crate) fn state_with_preserved_material_service_settings(
@@ -1689,13 +1736,19 @@ impl SourceOutput {
 }
 
 /// Project the same settings, script names and directories as a fresh import,
-/// without touching disk or constructing the full editor sourcemap.
+/// without touching disk or constructing the full editor sourcemap. Existing
+/// script files are looked for under `layout_src_root` (or `src_root`).
 pub(crate) fn service_projection_in_memory(
     state: &ServiceState,
     src_root: &Path,
+    layout_src_root: Option<&Path>,
     service: &str,
 ) -> Result<BTreeMap<PathBuf, Option<Vec<u8>>>> {
     let service_dir = src_root.join(sanitize_name(service));
+    let layout_dir = layout_src_root.map_or_else(
+        || service_dir.clone(),
+        |root| root.join(sanitize_name(service)),
+    );
     let settings_path = service_settings_path(&service_dir);
     let output = SourceOutput::Memory(Mutex::new(BTreeMap::new()));
     output.directory(&service_dir)?;
@@ -1710,6 +1763,7 @@ pub(crate) fn service_projection_in_memory(
                 state,
                 child_indices_for_instance(state, state.service_root_index),
                 &service_dir,
+                &layout_dir,
                 &output,
                 &visited,
             )
@@ -1728,6 +1782,7 @@ fn emit_node_index(
     state: &ServiceState,
     index: usize,
     parent_dir: &Path,
+    layout_dir: &Path,
     fs_stem: &str,
     output: &SourceOutput,
     visited: &[AtomicBool],
@@ -1742,8 +1797,9 @@ fn emit_node_index(
     let class_name = instance.class_name.as_str();
     let mut expected = ExpectedPathBatch::default();
 
-    if let Some((source_file_name, leaf_suffix)) = project_script_file_names(
+    if let Some(names) = project_script_file_names_in_layout(
         parent_dir,
+        layout_dir,
         fs_stem,
         has_children,
         class_name,
@@ -1755,21 +1811,27 @@ fn emit_node_index(
             .and_then(Value::as_str)
             .unwrap_or("");
 
-        if has_children {
+        if names.directory {
             let dir_path = parent_dir.join(fs_stem);
             output.directory(&dir_path)?;
             expected.track_dir(&dir_path);
-            let source_path = dir_path.join(source_file_name);
+            let source_path = dir_path.join(names.source_file_name);
             output.source(&source_path, source)?;
             expected.track_file(&source_path);
 
-            let child_expected =
-                emit_children_indices(state, child_indices, &dir_path, output, visited)?;
+            let child_expected = emit_children_indices(
+                state,
+                child_indices,
+                &dir_path,
+                &layout_dir.join(fs_stem),
+                output,
+                visited,
+            )?;
             expected.extend(child_expected);
             return Ok(expected);
         }
 
-        let script_path = parent_dir.join(format!("{fs_stem}{leaf_suffix}"));
+        let script_path = parent_dir.join(format!("{fs_stem}{}", names.leaf_suffix));
         output.source(&script_path, source)?;
         expected.track_file(&script_path);
 
@@ -1784,7 +1846,14 @@ fn emit_node_index(
     output.directory(&dir_path)?;
     expected.track_dir(&dir_path);
 
-    let child_expected = emit_children_indices(state, child_indices, &dir_path, output, visited)?;
+    let child_expected = emit_children_indices(
+        state,
+        child_indices,
+        &dir_path,
+        &layout_dir.join(fs_stem),
+        output,
+        visited,
+    )?;
     expected.extend(child_expected);
 
     Ok(expected)
@@ -1794,6 +1863,7 @@ fn emit_children_indices(
     state: &ServiceState,
     child_indices: &[usize],
     dir_path: &Path,
+    layout_dir: &Path,
     output: &SourceOutput,
     visited: &[AtomicBool],
 ) -> Result<ExpectedPathBatch> {
@@ -1804,7 +1874,15 @@ fn emit_children_indices(
         let built = named_children
             .par_iter()
             .map(|(child_index, child_stem)| {
-                emit_node_index(state, *child_index, dir_path, child_stem, output, visited)
+                emit_node_index(
+                    state,
+                    *child_index,
+                    dir_path,
+                    layout_dir,
+                    child_stem,
+                    output,
+                    visited,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
         let mut expected = ExpectedPathBatch::default();
@@ -1815,8 +1893,15 @@ fn emit_children_indices(
     } else {
         let mut expected = ExpectedPathBatch::default();
         for (child_index, child_stem) in named_children {
-            let child_expected =
-                emit_node_index(state, child_index, dir_path, &child_stem, output, visited)?;
+            let child_expected = emit_node_index(
+                state,
+                child_index,
+                dir_path,
+                layout_dir,
+                &child_stem,
+                output,
+                visited,
+            )?;
             expected.extend(child_expected);
         }
         Ok(expected)
@@ -1864,6 +1949,128 @@ fn write_script_source_file(source_path: &Path, source: &str, fresh_stage: bool)
 #[cfg(test)]
 mod projection_tests {
     use super::*;
+
+    #[test]
+    fn a_pull_keeps_the_stores_viewport_camera_values() {
+        use crate::tests::support::{settings_document, settings_instance};
+
+        let mut root = settings_instance("ws", "Workspace", "Workspace", None);
+        root.properties.insert(
+            "CurrentCamera".into(),
+            json!({"_type": "Ref", "settingsId": "cam"}),
+        );
+        let mut camera = settings_instance("cam", "Camera", "Camera", Some(0));
+        camera.properties.insert("FieldOfView".into(), json!(70.0));
+        let mut part = settings_instance("part", "Baseplate", "Part", Some(0));
+        part.properties.insert("Anchored".into(), json!(true));
+        let store = settings_document(vec![root.clone(), camera.clone(), part.clone()]);
+
+        let mut pulled_camera = camera.clone();
+        pulled_camera
+            .properties
+            .insert("FieldOfView".into(), json!(60.0));
+        let mut pulled_part = part.clone();
+        pulled_part
+            .properties
+            .insert("Anchored".into(), json!(false));
+        let pulled = settings_document(vec![root, pulled_camera, pulled_part]);
+
+        let kept = keep_store_viewport_camera(
+            &encode_settings_bytecode(&store).unwrap(),
+            encode_settings_bytecode(&pulled).unwrap(),
+        )
+        .unwrap();
+        let kept = decode_settings_bytecode(&kept).unwrap();
+        assert_eq!(
+            kept.instances[1].properties.get("FieldOfView"),
+            Some(&json!(70.0))
+        );
+        assert_eq!(
+            kept.instances[2].properties.get("Anchored"),
+            Some(&json!(false))
+        );
+    }
+
+    #[test]
+    fn a_pull_keeps_the_viewport_camera_of_a_store_that_names_no_current_camera() {
+        use crate::tests::support::{settings_document, settings_instance};
+
+        let root = settings_instance("ws", "Workspace", "Workspace", None);
+        let mut viewport = settings_instance("cam", "Camera", "Camera", Some(0));
+        viewport
+            .properties
+            .insert("FieldOfView".into(), json!(70.0));
+        let mut other = settings_instance("cam2", "Camera", "Camera", Some(0));
+        other.properties.insert("FieldOfView".into(), json!(50.0));
+        let store = settings_document(vec![root.clone(), viewport.clone(), other.clone()]);
+
+        let mut pulled_root = root;
+        pulled_root.properties.insert(
+            "CurrentCamera".into(),
+            json!({"_type": "Ref", "settingsId": "cam"}),
+        );
+        let mut pulled_viewport = viewport;
+        pulled_viewport
+            .properties
+            .insert("FieldOfView".into(), json!(60.0));
+        let mut pulled_other = other;
+        pulled_other
+            .properties
+            .insert("FieldOfView".into(), json!(55.0));
+        let pulled = settings_document(vec![pulled_root, pulled_viewport, pulled_other]);
+
+        let kept = keep_store_viewport_camera(
+            &encode_settings_bytecode(&store).unwrap(),
+            encode_settings_bytecode(&pulled).unwrap(),
+        )
+        .unwrap();
+        let kept = decode_settings_bytecode(&kept).unwrap();
+        assert_eq!(
+            kept.instances[1].properties.get("FieldOfView"),
+            Some(&json!(70.0)),
+            "the matched viewport row keeps the store's values"
+        );
+        assert_eq!(
+            kept.instances[2].properties.get("FieldOfView"),
+            Some(&json!(55.0)),
+            "another Camera is pulled like any instance"
+        );
+        assert_eq!(
+            kept.instances[0].properties.get("CurrentCamera"),
+            Some(&json!({"_type": "Ref", "instanceIndex": 2})),
+            "the pulled store records the reference to the viewport row"
+        );
+    }
+
+    #[test]
+    fn a_viewport_camera_matched_by_name_alone_is_pulled() {
+        use crate::tests::support::{settings_document, settings_instance};
+
+        let root = settings_instance("ws", "Workspace", "Workspace", None);
+        let mut saved = settings_instance("old-cam", "Camera", "Camera", Some(0));
+        saved.properties.insert("FieldOfView".into(), json!(70.0));
+        let store = settings_document(vec![root.clone(), saved]);
+
+        let mut pulled_root = root;
+        pulled_root.properties.insert(
+            "CurrentCamera".into(),
+            json!({"_type": "Ref", "settingsId": "cam"}),
+        );
+        let mut live = settings_instance("cam", "Camera", "Camera", Some(0));
+        live.properties.insert("FieldOfView".into(), json!(60.0));
+        let pulled = settings_document(vec![pulled_root, live]);
+
+        let kept = keep_store_viewport_camera(
+            &encode_settings_bytecode(&store).unwrap(),
+            encode_settings_bytecode(&pulled).unwrap(),
+        )
+        .unwrap();
+        let kept = decode_settings_bytecode(&kept).unwrap();
+        assert_eq!(
+            kept.instances[1].properties.get("FieldOfView"),
+            Some(&json!(60.0))
+        );
+    }
 
     #[test]
     fn memory_projection_matches_fresh_import_bytes_and_paths() -> Result<()> {
@@ -1929,9 +2136,9 @@ mod projection_tests {
             }
         }
         state.native_properties_by_instance = Some(native);
-        let projected = service_projection_in_memory(&state, &source, "ReplicatedStorage")?;
+        let projected = service_projection_in_memory(&state, &source, None, "ReplicatedStorage")?;
         assert!(!source.exists(), "Memory projection wrote to disk");
-        import_service_tree(&state, &root, &source, "ReplicatedStorage")?;
+        import_service_tree(&state, &root, &source, None, "ReplicatedStorage")?;
         let observed = walkdir::WalkDir::new(source.join("ReplicatedStorage"))
             .into_iter()
             .map(|entry| {
@@ -1954,11 +2161,140 @@ mod projection_tests {
             .properties
             .insert("Source".into(), json!(EXTERNAL_SOURCE_MARKER));
         assert!(
-            service_projection_in_memory(&state, &source, "ReplicatedStorage")
+            service_projection_in_memory(&state, &source, None, "ReplicatedStorage")
                 .unwrap_err()
                 .to_string()
                 .contains("Missing fetched Source")
         );
+        Ok(())
+    }
+
+    fn packages_state() -> Result<ServiceState> {
+        let module = |id: usize, name: &str, parent: usize, source: &str| SnapshotInstance {
+            name: name.into(),
+            class_name: "ModuleScript".into(),
+            instance_index: Some(id),
+            parent_index: Some(parent),
+            properties: Map::from_iter([("Source".into(), json!(source))]),
+            ..Default::default()
+        };
+        let folder = |id: usize, name: &str, parent: usize| SnapshotInstance {
+            name: name.into(),
+            class_name: "Folder".into(),
+            instance_index: Some(id),
+            parent_index: Some(parent),
+            ..Default::default()
+        };
+        build_service_state_from_instances(
+            "ReplicatedStorage",
+            None,
+            vec![
+                SnapshotInstance {
+                    name: "ReplicatedStorage".into(),
+                    class_name: "ReplicatedStorage".into(),
+                    instance_index: Some(1),
+                    ..Default::default()
+                },
+                folder(2, "Packages", 1),
+                module(
+                    3,
+                    "Promise",
+                    2,
+                    "return require(script.Parent._Index[\"evaera_promise@4.0.0\"][\"promise\"])",
+                ),
+                folder(4, "_Index", 2),
+                folder(5, "evaera_promise@4.0.0", 4),
+                module(6, "promise", 5, "return {}"),
+                module(7, "Fresh", 2, "return 1"),
+            ],
+            HashMap::new(),
+            true,
+        )
+    }
+
+    fn write_packages_layout(service_dir: &Path) -> Result<(PathBuf, PathBuf)> {
+        let packages = service_dir.join("Packages");
+        let promise = packages.join("Promise.lua");
+        let init = packages
+            .join("_Index")
+            .join("evaera_promise@4.0.0")
+            .join("promise")
+            .join("init.lua");
+        fs::create_dir_all(init.parent().unwrap())?;
+        fs::write(&promise, "return nil")?;
+        fs::write(&init, "return nil")?;
+        Ok((promise, init))
+    }
+
+    #[test]
+    fn import_keeps_existing_script_files_and_forms() -> Result<()> {
+        let parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/projection-tests");
+        fs::create_dir_all(&parent)?;
+        let root = crate::system::files::create_unique_directory(&parent, "layout-")?;
+        let _cleanup = OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&root);
+        });
+        let source = root.join("src");
+        let service_dir = source.join("ReplicatedStorage");
+        let (promise, init) = write_packages_layout(&service_dir)?;
+        let state = packages_state()?;
+        import_service_tree(&state, &root, &source, None, "ReplicatedStorage")?;
+        assert_eq!(
+            fs::read_to_string(&promise)?,
+            "return require(script.Parent._Index[\"evaera_promise@4.0.0\"][\"promise\"])"
+        );
+        assert_eq!(fs::read_to_string(&init)?, "return {}");
+        assert!(!promise.with_extension("luau").exists());
+        assert!(!init.parent().unwrap().with_extension("luau").exists());
+        assert!(service_dir.join("Packages").join("Fresh.luau").is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn memory_projection_follows_the_layout_of_another_root() -> Result<()> {
+        let parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/projection-tests");
+        fs::create_dir_all(&parent)?;
+        let root = crate::system::files::create_unique_directory(&parent, "layout-memory-")?;
+        let _cleanup = OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&root);
+        });
+        let project_source = root.join("project").join("src");
+        write_packages_layout(&project_source.join("ReplicatedStorage"))?;
+        let stage_source = root.join("stage").join("src");
+        let state = packages_state()?;
+        let projected = service_projection_in_memory(
+            &state,
+            &stage_source,
+            Some(&project_source),
+            "ReplicatedStorage",
+        )?;
+        assert!(!stage_source.exists(), "Memory projection wrote to disk");
+        let packages = stage_source.join("ReplicatedStorage").join("Packages");
+        let promise_dir = packages
+            .join("_Index")
+            .join("evaera_promise@4.0.0")
+            .join("promise");
+        assert_eq!(
+            projected.get(&packages.join("Promise.lua")),
+            Some(&Some(
+                b"return require(script.Parent._Index[\"evaera_promise@4.0.0\"][\"promise\"])"
+                    .to_vec()
+            ))
+        );
+        assert_eq!(projected.get(&promise_dir), Some(&None));
+        assert_eq!(
+            projected.get(&promise_dir.join("init.lua")),
+            Some(&Some(b"return {}".to_vec()))
+        );
+        assert_eq!(
+            projected.get(&packages.join("Fresh.luau")),
+            Some(&Some(b"return 1".to_vec()))
+        );
+        assert!(!projected.contains_key(&promise_dir.with_extension("luau")));
+        let unaligned =
+            service_projection_in_memory(&state, &stage_source, None, "ReplicatedStorage")?;
+        assert!(unaligned.contains_key(&packages.join("Promise.luau")));
+        assert!(unaligned.contains_key(&promise_dir.with_extension("luau")));
         Ok(())
     }
 }

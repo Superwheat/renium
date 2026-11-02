@@ -2159,7 +2159,8 @@ function BridgeUi.create(plugin, bridgeInfo)
 
 	function ui.requestEditorPushReview(params, runtimeSettings, helpers)
 		local changeCount = tonumber(params.changeCount) or 0
-		local threshold = tonumber(runtimeSettings.changesThreshold) or 5
+		-- The project's `liveSync.changesThreshold` beats this Studio's own setting.
+		local threshold = tonumber(params.changesThreshold) or tonumber(runtimeSettings.changesThreshold) or 5
 		if
 			tostring(runtimeSettings.displayPrompts or "") == "never"
 			or changeCount <= threshold

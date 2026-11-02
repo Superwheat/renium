@@ -26,7 +26,7 @@ use crate::editor::diff::{
     append_editor_target_changes, editor_instance_descriptor_for_known_path,
 };
 use crate::editor::document::{
-    document_instance_index_by_settings_id, ensure_editor_source_target_in_bytecode,
+    document_instance_index_by_settings_id, ensure_editor_source_target_in_bytecode_reserving,
     read_editor_service_settings, read_editor_service_settings_cached,
 };
 use crate::editor::history::save_editor_history_entries;
@@ -1006,16 +1006,15 @@ impl<'a> EditorTransaction<'a> {
             fnv1a_hex(services.join("\0").as_bytes())
         );
         let upload_services = services.clone();
-        let parameters = Self::parameters(changes, binary_import, &id, services, guard);
+        let native_properties_available = super::native_roots::available(bridge)?;
+        let parameters = |services| {
+            let mut parameters = Self::parameters(changes, binary_import, &id, services, guard);
+            parameters["nativePropertiesAvailable"] = json!(native_properties_available);
+            parameters
+        };
         let result = editor_transaction_begin_result(
-            bridge.call("beginEditorTransaction", parameters),
-            || {
-                Self::upload(
-                    bridge,
-                    &id,
-                    Self::parameters(changes, binary_import, &id, upload_services, guard),
-                )
-            },
+            bridge.call("beginEditorTransaction", parameters(services)),
+            || Self::upload(bridge, &id, parameters(upload_services)),
         )?;
         if result.get("studioChanged").and_then(Value::as_bool) == Some(true) {
             return Err(StudioChangedBeforePush.into());
@@ -1115,9 +1114,13 @@ impl<'a> EditorTransaction<'a> {
                 pid,
                 &title,
                 token,
-                terrain_write,
+                terrain_write && native_properties_available,
             )?;
-            for change in &changes.property_changes {
+            for change in changes
+                .property_changes
+                .iter()
+                .filter(|_| native_properties_available)
+            {
                 if change.class_name == "Terrain"
                     && change
                         .properties
@@ -1662,12 +1665,16 @@ pub(crate) fn push_editor_changes_result(mut args: PushEditorChangesArgs) -> Res
         "verify": args.verify,
         "overridePackages": args.override_packages,
         "allowProtectedWrites": !args.no_review,
+        "yes": args.yes || global_yes(),
         "linkCacheDir": args.link_cache_dir,
         "bridgeWaitSeconds": args.bridge.wait_seconds,
         "bridgePorts": args.bridge.ports,
         "destructive": !incremental,
     });
-    let approved = !args.no_review && (args.yes || global_yes());
+    // Every push the user has not opted out of with --no-review goes through
+    // the daemon's review so protected writes stay allowed; `yes` alone
+    // decides whether Studio shows its review for a large push.
+    let approved = !args.no_review;
     daemon_control_request(
         op::PUSH,
         Some(&args.project.project_root),
@@ -1949,7 +1956,16 @@ fn collect_project_editor_changes_with_documents(
     };
     log_editor_collection_timing("project load", phase_started);
     let phase_started = Instant::now();
-    let link_enforcement = build_loaded_project_link_enforcement(&loaded, args.override_packages)?;
+    let authored = args
+        .link_project_root
+        .as_deref()
+        .map(|root| config::try_load_project(None, Some(root)))
+        .transpose()?
+        .flatten();
+    let link_enforcement = build_loaded_project_link_enforcement(
+        authored.as_ref().unwrap_or(&loaded),
+        args.override_packages,
+    )?;
     log_editor_collection_timing("link enforcement", phase_started);
     let mut changed_paths = expand_editor_changed_paths(args)?;
     let full_selection = changed_paths.is_empty();
@@ -2850,6 +2866,7 @@ fn apply_saved_field_differences(bridge: &BridgeServer, summary: &mut Map<String
         match crate::studio::automation::property_access::write_saved_field(
             bridge,
             &difference.path_segments,
+            &[],
             &difference.property,
             &difference.value,
         ) {
@@ -2919,6 +2936,7 @@ fn prepare_protected_writes(
         .cloned()
         .unwrap_or_default();
     let mut studio_pending = vec![true; reported.len()];
+    let mut live_checked = vec![false; reported.len()];
     let pre_routed_count = pre_routed.len();
     let pre_routed =
         protected_root_write_rows_with_live_values(bridge, pre_routed).unwrap_or_else(|rows| rows);
@@ -2927,6 +2945,7 @@ fn prepare_protected_writes(
             .iter()
             .map(|row| !protected_write_matches_previous(row)),
     );
+    live_checked.extend(vec![true; pre_routed.len()]);
     reported.extend(pre_routed);
     if pre_routed_count > 0 {
         summary.insert(
@@ -2943,14 +2962,14 @@ fn prepare_protected_writes(
             !is_externally_managed_protected_write(row)
                 && is_user_facing_protected_write(row, database)
         })
-        .map(|(index, row)| (studio_pending[index], row))
+        .map(|(index, row)| ((studio_pending[index], live_checked[index]), row))
         .collect::<Vec<_>>();
     let unavailable_count = reported_count - applicable.len();
     let applicable_rows = applicable
         .iter()
         .map(|(_, row)| row.clone())
         .collect::<Vec<_>>();
-    let enriched_rows = if args.no_review || applicable_rows.is_empty() {
+    let enriched_rows = if applicable_rows.is_empty() {
         applicable_rows
     } else {
         local_place_path_for_bridge(bridge)
@@ -2962,16 +2981,48 @@ fn prepare_protected_writes(
     let enriched = applicable
         .into_iter()
         .zip(enriched_rows)
-        .map(|((studio_pending, _), row)| (studio_pending, row))
+        .map(|((flags, _), row)| (flags, row))
         .collect::<Vec<_>>();
     let writes = enriched
         .iter()
-        .filter(|(studio_pending, row)| *studio_pending || !protected_write_matches_previous(row))
+        .filter(|((studio_pending, live_checked), row)| {
+            let differs = !protected_write_matches_previous(row);
+            if *live_checked {
+                *studio_pending || differs
+            } else {
+                differs
+            }
+        })
         .map(|(_, row)| row.clone())
         .collect::<Vec<_>>();
     if args.no_review && !writes.is_empty() {
+        let named = writes
+            .iter()
+            .take(5)
+            .map(|row| {
+                let path = row
+                    .get("pathSegments")
+                    .and_then(Value::as_array)
+                    .map(|segments| {
+                        segments
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(".")
+                    })
+                    .unwrap_or_default();
+                let name = row.get("name").and_then(Value::as_str).unwrap_or("?");
+                match (row.get("oldValue"), row.get("value")) {
+                    (Some(previous), Some(requested)) => {
+                        format!("{path}.{name} ({previous} -> {requested})")
+                    }
+                    _ => format!("{path}.{name}"),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         bail!(
-            "Studio could not apply {} protected write(s); all changes were rolled back and remain pending",
+            "Studio could not apply {} protected write(s) ({named}); all changes were rolled back and remain pending",
             writes.len()
         );
     }
@@ -3018,6 +3069,14 @@ struct CollectedPushOptions<'a> {
     finalize_settings: Option<&'a mut SettingsFinalizer<'a>>,
 }
 
+/// The project whose configuration decides the review: a staged push collects
+/// in a private copy that carries no place configuration.
+fn review_project_root(args: &PushEditorChangesArgs) -> &Path {
+    args.link_project_root
+        .as_deref()
+        .unwrap_or(&args.project.project_root)
+}
+
 fn push_editor_changes_with_collected(
     args: PushEditorChangesArgs,
     bridge: &BridgeServer,
@@ -3061,7 +3120,7 @@ fn push_editor_changes_with_collected(
         && (!changes.instance_changes.is_empty()
             || !changes.source_changes.is_empty()
             || !changes.property_changes.is_empty())
-        && !request_editor_push_review(bridge, &changes)?;
+        && !request_editor_push_review(bridge, &changes, Some(review_project_root(&args)))?;
     let binary_import = if review_skipped {
         None
     } else if prepared_binary_import.is_some() {
@@ -3083,8 +3142,15 @@ fn push_editor_changes_with_collected(
     if global_log_enabled(5) {
         log_change_set_composition(&changes, binary_import.as_ref());
     }
-    let pre_routed_protected_writes =
+    let mut pre_routed_protected_writes =
         take_pre_routed_protected_writes(&mut changes, binary_import.as_ref());
+    if !changes.deferred_native_rows.is_empty() && !super::native_roots::available(bridge)? {
+        // Plugin-only imports cannot run the native follow-up transaction. Keep
+        // its saved fields in the original transaction's protected snapshot.
+        pre_routed_protected_writes.extend(protected_write_rows(&std::mem::take(
+            &mut changes.deferred_native_rows,
+        )));
+    }
     let unstaged_replacements = changes
         .instance_changes
         .iter()
@@ -3426,12 +3492,15 @@ fn apply_deferred_native_rows(
 fn apply_editor_change_with_warm_bridge(
     bridge: &BridgeServer,
     label: &str,
+    review: Option<&Path>,
     collect: impl FnOnce() -> Result<EditorChangeSet>,
 ) -> Result<Map<String, Value>> {
     let started = Instant::now();
     let mut changes = collect()?;
     super::native_roots::normalize_resets(&mut changes)?;
-    if !request_editor_push_review(bridge, &changes)? {
+    if let Some(project_root) = review
+        && !request_editor_push_review(bridge, &changes, Some(project_root))?
+    {
         let summary = skipped_editor_summary(&changes);
         log_global(
             5,
@@ -3451,6 +3520,15 @@ fn apply_editor_change_with_warm_bridge(
         if summary.get("ok").and_then(Value::as_bool) == Some(false) || errors > 0.0 {
             bail!("Studio rejected or failed editor {label} apply");
         }
+        if summary
+            .get("protectedWrites")
+            .and_then(Value::as_array)
+            .is_some_and(|rows| !rows.is_empty())
+        {
+            bail!(
+                "Studio cannot write these saved fields through its plugin; changes were rolled back. Edit the store and use rbx ps STORE -u --yes for the protected snapshot fallback"
+            );
+        }
         if let Some(transaction) = transaction.as_mut() {
             let status = transaction.commit()?;
             add_editor_commit_status(&mut summary, status);
@@ -3468,8 +3546,12 @@ fn apply_editor_change_with_warm_bridge(
     EditorTransaction::finish(transaction.as_mut(), result)
 }
 
-fn print_direct_editor_summary(summary: &serde_json::Map<String, Value>) -> Result<()> {
-    let changed = [
+/// Whether a `prop` or `del` summary records a change Studio applied.
+pub(crate) fn direct_editor_summary_changed(summary: &Map<String, Value>) -> bool {
+    if summary.get("skippedByReview").and_then(Value::as_bool) == Some(true) {
+        return false;
+    }
+    [
         "attributeUpdated",
         "instanceCreated",
         "instanceDeleted",
@@ -3478,17 +3560,45 @@ fn print_direct_editor_summary(summary: &serde_json::Map<String, Value>) -> Resu
         "sourceCreated",
         "sourceDeleted",
         "sourceUpdated",
+        "protectedApplied",
+        "savedFieldsApplied",
     ]
     .into_iter()
-    .any(|key| summary.get(key).and_then(Value::as_f64).unwrap_or(0.0) > 0.0);
+    .any(|key| summary.get(key).and_then(Value::as_f64).unwrap_or(0.0) > 0.0)
+}
+
+/// The fields a direct edit answers with beside `ok` and `changed`: the same
+/// outcome fields a push prints, plus where the edit now lives.
+const DIRECT_EDITOR_SUMMARY_FIELDS: &[&str] = &[
+    "skippedByReview",
+    "persistence",
+    "filesPulled",
+    "filesError",
+    "savedFieldsApplied",
+    "protectedApplied",
+    "unsupportedProperties",
+    "packageModified",
+    "autoDesyncedPackages",
+];
+
+pub(crate) fn direct_editor_summary(summary: &Map<String, Value>) -> Map<String, Value> {
     let mut output = Map::from_iter([
         ("ok".to_string(), Value::Bool(true)),
-        ("changed".to_string(), Value::Bool(changed)),
+        (
+            "changed".to_string(),
+            Value::Bool(direct_editor_summary_changed(summary)),
+        ),
     ]);
-    if let Some(packages) = summary.get("autoDesyncedPackages") {
-        output.insert("autoDesyncedPackages".to_string(), packages.clone());
+    for key in DIRECT_EDITOR_SUMMARY_FIELDS {
+        if let Some(value) = summary.get(*key).filter(|value| !value.is_null()) {
+            output.insert((*key).to_string(), value.clone());
+        }
     }
-    print_json_output(&Value::Object(output), false)
+    output
+}
+
+fn print_direct_editor_summary(summary: &serde_json::Map<String, Value>) -> Result<()> {
+    print_json_output(&Value::Object(direct_editor_summary(summary)), false)
 }
 
 pub(crate) fn apply_editor_property(mut args: ApplyEditorPropertyArgs) -> Result<()> {
@@ -3510,12 +3620,15 @@ pub(crate) fn apply_editor_property(mut args: ApplyEditorPropertyArgs) -> Result
         )
         .context("Failed to parse --value-json")?,
     );
-    let approved = !args.no_review && (args.yes || global_yes());
+    parameters.insert("yes".to_string(), Value::Bool(args.yes || global_yes()));
+    // Every edit the user has not opted out of with --no-review goes through
+    // the daemon's review so protected writes stay allowed; `yes` alone
+    // decides whether Studio shows its review.
     let result = daemon_control_request(
         op::SET_PROPERTY,
         Some(&args.target.project.project_root),
         Value::Object(parameters),
-        approved,
+        !args.no_review,
     )?;
     print_direct_editor_summary(
         result
@@ -3531,6 +3644,9 @@ pub(crate) fn apply_editor_property_with_warm_bridge(
     resolve_editor_property_source_file(&mut args)?;
     let started = Instant::now();
     let changes = collect_direct_editor_property_change(&args)?;
+    if let Some(summary) = apply_direct_saved_field(&args, bridge, &changes)? {
+        return Ok(summary);
+    }
     let verify_sources = !changes.source_changes.is_empty();
     push_editor_changes_with_collected(
         PushEditorChangesArgs {
@@ -3564,6 +3680,61 @@ fn resolve_editor_property_source_file(args: &mut ApplyEditorPropertyArgs) -> Re
         .with_context(|| format!("Failed to read source file {}", path.display()))?;
     args.value_json = Some(serde_json::to_string(&source)?);
     Ok(())
+}
+
+/// A saved field with no plugin API (`Lighting.Technology`,
+/// `Workspace.StreamingMinRadius`) is written through the native property
+/// writer, as a push writes it; the plugin would only report it as a
+/// protected write it cannot apply.
+fn apply_direct_saved_field(
+    args: &ApplyEditorPropertyArgs,
+    bridge: &BridgeServer,
+    changes: &EditorChangeSet,
+) -> Result<Option<Map<String, Value>>> {
+    let [change] = changes.property_changes.as_slice() else {
+        return Ok(None);
+    };
+    let Some((name, value)) = change.properties.iter().next() else {
+        return Ok(None);
+    };
+    let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
+    if change.class_name.is_empty()
+        || !super::review::plugin_cannot_write_property(database, &change.class_name, name)
+    {
+        return Ok(None);
+    }
+    let label = format!("{}.{name}", change.path_segments.join("."));
+    if args.no_review {
+        bail!(
+            "{label} has no plugin API and is written natively; drop --no-review to write it, or set it in Studio's Properties window"
+        );
+    }
+    if !args.yes
+        && !global_yes()
+        && !request_editor_push_review(bridge, changes, Some(&args.target.project.project_root))?
+    {
+        return Ok(Some(skipped_editor_summary(changes)));
+    }
+    let written = crate::studio::automation::property_access::write_saved_field(
+        bridge,
+        &change.path_segments,
+        &change.path_ordinals,
+        name,
+        value,
+    )
+    .with_context(|| {
+        format!(
+            "{label} has no plugin API and the native property writer could not set it; set it in Studio's Properties window, or edit instances/{}.renium and push it with rbx ps instances/{}.renium -u --yes",
+            change.service, change.service
+        )
+    })?;
+    let mut summary = Map::new();
+    summary.insert("ok".to_string(), Value::Bool(true));
+    summary.insert("propertyUpdated".to_string(), json!(u64::from(written)));
+    if written {
+        summary.insert("savedFieldsApplied".to_string(), json!(1));
+    }
+    Ok(Some(summary))
 }
 
 fn collect_direct_editor_property_change(
@@ -3646,11 +3817,12 @@ fn collect_direct_editor_property_change(
 pub(crate) fn apply_editor_delete(args: ApplyEditorDeleteArgs) -> Result<()> {
     let mut parameters = editor_mutation_parameters(&args.target)?;
     parameters.insert("editor".to_string(), Value::Bool(true));
+    parameters.insert("yes".to_string(), Value::Bool(args.yes || global_yes()));
     let result = daemon_control_request(
         op::REMOVE,
         Some(&args.target.project.project_root),
         Value::Object(parameters),
-        false,
+        !args.no_review,
     )?;
     print_direct_editor_summary(
         result
@@ -3698,7 +3870,9 @@ pub(crate) fn apply_editor_delete_with_warm_bridge(
     args: ApplyEditorDeleteArgs,
     bridge: &BridgeServer,
 ) -> Result<Map<String, Value>> {
-    apply_editor_change_with_warm_bridge(bridge, "delete", || {
+    let project_root = args.target.project.project_root.clone();
+    let review = (!args.no_review && !args.yes && !global_yes()).then_some(project_root.as_path());
+    apply_editor_change_with_warm_bridge(bridge, "delete", review, || {
         collect_direct_editor_delete_change(args)
     })
 }
@@ -3991,6 +4165,19 @@ fn drop_unchanged_source_changes(
     if unchanged.is_empty() {
         return Ok(0);
     }
+    if global_log_enabled(5) {
+        for index in &unchanged {
+            let change = &changes.source_changes[*index];
+            log_global(
+                5,
+                format_args!(
+                    "[renium] source unchanged in Studio, not sent: {}.{}",
+                    change.service,
+                    change.path_segments.join(".")
+                ),
+            );
+        }
+    }
     // History keeps a script's previous Source only when the push changes it,
     // so these entries would fetch the same live sources again for nothing.
     let unchanged_keys = unchanged
@@ -4171,6 +4358,30 @@ pub(crate) fn expand_editor_changed_paths(args: &PushEditorChangesArgs) -> Resul
     expanded.sort();
     expanded.dedup();
     Ok(expanded)
+}
+
+fn is_init_source_file_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with("init.") && (lower.ends_with(".lua") || lower.ends_with(".luau"))
+}
+
+/// A directory's `init.*` file names the instance its sibling files live
+/// under, so it is collected before them. Collected after a sibling, the
+/// sibling has already created the directory's instance as a Folder and the
+/// init file then replaces an instance Studio does not hold yet.
+fn order_init_files_before_their_siblings(paths: &mut [PathBuf]) {
+    paths.sort_by_cached_key(|path| {
+        let mut key = path
+            .components()
+            .map(|component| (1u8, component.as_os_str().to_string_lossy().into_owned()))
+            .collect::<Vec<_>>();
+        if let Some(last) = key.last_mut()
+            && is_init_source_file_name(&last.1)
+        {
+            last.0 = 0;
+        }
+        key
+    });
 }
 
 fn collect_editor_full_paths(src_root: &Path) -> Result<Vec<PathBuf>> {
@@ -4957,14 +5168,16 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
     let mut source_stems: HashMap<String, EditorChildStemCache> = HashMap::new();
     let mut changed_services = EditorChangedServices::default();
     let mut seen_paths = HashSet::new();
+    let mut retired_ids: HashMap<String, HashSet<String>> = HashMap::new();
 
     let mut changed_paths = expand_editor_changed_paths(args)?;
     let full_reconcile = changed_paths.is_empty();
     if full_reconcile {
         changed_paths = collect_editor_full_paths(src_root)?;
     }
-    let enforced_changed_paths =
+    let mut enforced_changed_paths =
         apply_link_enforcement_to_changed_paths(project_root, link_enforcement, changed_paths)?;
+    order_init_files_before_their_siblings(&mut enforced_changed_paths);
     // Each path needs a canonical form, its metadata and, for scripts, its
     // contents. Those file system calls dominate a large push, so they run in
     // parallel before the ordered pass below.
@@ -5089,6 +5302,7 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
                     .map(|spec| (spec.path_segments.as_slice(), &[][..]))
             });
         if explicit_targets.has_target_ids()
+            && !args.targets_extend_paths
             && !protected_path.is_some_and(|(segments, ordinals)| {
                 source_path_within_filter(
                     source_scopes.get(&service).map_or(&[], Vec::as_slice),
@@ -5125,7 +5339,9 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
                     instances: Vec::new(),
                 })
             }));
-            let ensured = ensure_editor_source_target_in_bytecode(document, spec)?;
+            let reserved = retired_ids.get(&service).cloned().unwrap_or_default();
+            let ensured =
+                ensure_editor_source_target_in_bytecode_reserving(document, spec, &reserved)?;
             mapped_target = Some(ensured.target);
             if ensured.changed {
                 if let Some(target) = mapped_target.as_ref() {
@@ -5205,6 +5421,13 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
                 && let Some(document) = documents.get_mut(&service).and_then(Option::as_mut)
                 && let Some(index) =
                     document_instance_index_by_settings_id(document.as_ref(), settings_id)
+                && link_enforcement
+                    .read_only_package_for_path(
+                        &service,
+                        &target.path_segments,
+                        &target.path_ordinals,
+                    )
+                    .is_none()
             {
                 let document = Arc::make_mut(document);
                 let original_class = document.instances[index].class_name.clone();
@@ -5252,6 +5475,17 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
                             target.path_ordinals.clone(),
                         )
                         .context("Failed to describe the deleted source instance")?;
+                        let mut removed = Vec::new();
+                        crate::bytecode::edit::collect_settings_subtree_preorder(
+                            &settings_children_by_parent(document),
+                            index,
+                            &mut removed,
+                        );
+                        retired_ids.entry(service.clone()).or_default().extend(
+                            removed
+                                .iter()
+                                .map(|removed| document.instances[*removed].settings_id.clone()),
+                        );
                         remove_instances_at_indices(document, &[index], true)?;
                         append_editor_reference_repairs(
                             &mut changes,
@@ -6149,11 +6383,19 @@ mod sync_tests {
             r#"{"schemaVersion":1,"tree":{"ReplicatedStorage":{"$path":"src/shared"}}}"#,
         )
         .unwrap();
-        let document = crate::rbx::model::source_only_settings_document(
+        let mut document = crate::rbx::model::source_only_settings_document(
             &root.join("src/shared"),
             "ReplicatedStorage",
         )
         .unwrap();
+        for instance in &mut document.instances {
+            if is_lua_source_class(&instance.class_name) {
+                instance.properties.insert(
+                    "Source".to_string(),
+                    json!(crate::settings::EXTERNAL_SOURCE_MARKER),
+                );
+            }
+        }
         document
             .write_file(&root.join("instances/ReplicatedStorage.renium"))
             .unwrap();
@@ -6174,6 +6416,372 @@ mod sync_tests {
             ["ReplicatedStorage", "Removed"]
         );
         assert!(changes.source_changes.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_changed_script_beside_targeted_instances_is_pushed_by_the_planner() {
+        use crate::cli::ProjectSourceArgs;
+
+        let root = crate::tests::support::temp_dir("script-beside-targets");
+        fs::create_dir_all(root.join("src/shared")).unwrap();
+        let kept = root.join("src/shared/Keep.luau");
+        fs::write(&kept, "return 42\n").unwrap();
+        fs::write(root.join("src/shared/Other.luau"), "return 1\n").unwrap();
+        fs::write(
+            root.join("renium.project.jsonc"),
+            r#"{"schemaVersion":1,"tree":{"ReplicatedStorage":{"$path":"src/shared"}}}"#,
+        )
+        .unwrap();
+        let document = crate::rbx::model::source_only_settings_document(
+            &root.join("src/shared"),
+            "ReplicatedStorage",
+        )
+        .unwrap();
+        let other = document
+            .instances
+            .iter()
+            .find(|instance| instance.name == "Other")
+            .unwrap()
+            .settings_id
+            .clone();
+        document
+            .write_file(&root.join("instances/ReplicatedStorage.renium"))
+            .unwrap();
+        let mut args = PushEditorChangesArgs::new(
+            ProjectSourceArgs {
+                project_root: root.clone(),
+                src_root: PathBuf::from("src"),
+            },
+            BridgeConnectionArgs::local(0.1),
+        );
+        args.changed_paths.push(kept.clone());
+        args.target_settings_ids.push(other.clone());
+        args.exact_target_ids = true;
+        let (narrowed, _) = collect_project_editor_changes(&args).unwrap();
+        assert!(
+            narrowed.source_changes.is_empty(),
+            "a user's -i narrows the named file to the targeted instances"
+        );
+        args.targets_extend_paths = true;
+        let (planned, _) = collect_project_editor_changes(&args).unwrap();
+        assert_eq!(
+            planned
+                .source_changes
+                .iter()
+                .map(|change| change.path_segments.join("."))
+                .collect::<Vec<_>>(),
+            ["ReplicatedStorage.Keep"],
+            "the planner's listed script file is pushed beside its targeted instances"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_missing_file_keeps_a_packed_link_script() {
+        use crate::cli::ProjectSourceArgs;
+
+        let root = crate::tests::support::temp_dir("missing-file-packed-link");
+        let service_dir = crate::tests::support::write_packed_link_project(&root);
+        let mut args = PushEditorChangesArgs::new(
+            ProjectSourceArgs {
+                project_root: root.clone(),
+                src_root: PathBuf::from("src"),
+            },
+            BridgeConnectionArgs::local(0.1),
+        );
+        args.changed_paths
+            .push(service_dir.join("Shared").join("Util.luau"));
+        let (changes, _) = collect_project_editor_changes(&args).unwrap();
+        assert!(
+            changes.instance_changes.is_empty(),
+            "a packed script was deleted: {:?}",
+            changes
+                .instance_changes
+                .iter()
+                .map(|change| change.mode.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(changes.source_changes.is_empty());
+
+        let stage = crate::tests::support::temp_dir("missing-file-packed-link-stage");
+        fs::copy(
+            root.join("renium.project.jsonc"),
+            stage.join("renium.project.jsonc"),
+        )
+        .unwrap();
+        fs::create_dir_all(stage.join("instances")).unwrap();
+        fs::copy(
+            root.join("instances/ReplicatedStorage.renium"),
+            stage.join("instances/ReplicatedStorage.renium"),
+        )
+        .unwrap();
+        fs::create_dir_all(stage.join("src/ReplicatedStorage")).unwrap();
+        let mut staged = PushEditorChangesArgs::new(
+            ProjectSourceArgs {
+                project_root: stage.clone(),
+                src_root: PathBuf::from("src"),
+            },
+            BridgeConnectionArgs::local(0.1),
+        );
+        staged
+            .changed_paths
+            .push(stage.join("src/ReplicatedStorage/Shared/Util.luau"));
+        let (unaware, _) = collect_project_editor_changes(&staged).unwrap();
+        assert_eq!(
+            unaware.instance_changes.len(),
+            1,
+            "a private copy without the manifest cannot tell a packed script apart"
+        );
+        staged.link_project_root = Some(root.clone());
+        let (aware, _) = collect_project_editor_changes(&staged).unwrap();
+        assert!(
+            aware.instance_changes.is_empty(),
+            "the authored project's manifest keeps the packed script: {:?}",
+            aware
+                .instance_changes
+                .iter()
+                .map(|change| change.mode.clone())
+                .collect::<Vec<_>>()
+        );
+        fs::remove_dir_all(stage).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_case_only_renamed_script_file_maps_to_its_instance() {
+        use crate::cli::ProjectSourceArgs;
+
+        let root = crate::tests::support::temp_dir("case-only-rename");
+        fs::create_dir_all(root.join("src/server")).unwrap();
+        fs::write(
+            root.join("renium.project.jsonc"),
+            r#"{"schemaVersion":1,"tree":{"ServerScriptService":{"$path":"src/server"}}}"#,
+        )
+        .unwrap();
+        let original = root.join("src/server/Main.server.luau");
+        fs::write(&original, "print(\"main\")\n").unwrap();
+        crate::rbx::model::source_only_settings_document(
+            &root.join("src/server"),
+            "ServerScriptService",
+        )
+        .unwrap()
+        .write_file(&root.join("instances/ServerScriptService.renium"))
+        .unwrap();
+        let renamed = root.join("src/server/main.server.luau");
+        fs::rename(&original, &renamed).unwrap();
+        let mut args = PushEditorChangesArgs::new(
+            ProjectSourceArgs {
+                project_root: root.clone(),
+                src_root: PathBuf::from("src"),
+            },
+            BridgeConnectionArgs::local(0.1),
+        );
+        args.changed_paths.push(renamed);
+        let (changes, _) = collect_project_editor_changes(&args).unwrap();
+        assert!(
+            changes.instance_changes.is_empty(),
+            "the renamed file created an instance: {:?}",
+            changes
+                .instance_changes
+                .iter()
+                .flat_map(|change| change.instances.iter().map(|i| i.path_segments.join(".")))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            changes
+                .source_changes
+                .iter()
+                .map(|change| change.path_segments.join("."))
+                .collect::<Vec<_>>(),
+            ["ServerScriptService.Main"]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_new_init_module_and_its_child_are_created_in_one_push() {
+        use crate::cli::ProjectSourceArgs;
+
+        let root = crate::tests::support::temp_dir("init-module-with-child");
+        let service_dir = root.join("src/ReplicatedStorage");
+        fs::create_dir_all(service_dir.join("Shared")).unwrap();
+        fs::write(root.join("renium.project.jsonc"), br#"{"schemaVersion":1}"#).unwrap();
+        fs::write(service_dir.join("Shared/Util.luau"), "return 1\n").unwrap();
+        crate::rbx::model::source_only_settings_document(&service_dir, "ReplicatedStorage")
+            .unwrap()
+            .write_file(&root.join("instances/ReplicatedStorage.renium"))
+            .unwrap();
+        fs::create_dir_all(service_dir.join("Shared/Lib")).unwrap();
+        fs::write(
+            service_dir.join("Shared/Lib/init.luau"),
+            "return { lib = true }\n",
+        )
+        .unwrap();
+        fs::write(
+            service_dir.join("Shared/Lib/Child.luau"),
+            "return { child = true }\n",
+        )
+        .unwrap();
+        let mut args = PushEditorChangesArgs::new(
+            ProjectSourceArgs {
+                project_root: root.clone(),
+                src_root: PathBuf::from("src"),
+            },
+            BridgeConnectionArgs::local(0.1),
+        );
+        args.changed_paths.push(service_dir.clone());
+        let (changes, _) = collect_project_editor_changes(&args).unwrap();
+        let replaced = changes
+            .instance_changes
+            .iter()
+            .flat_map(|change| change.instances.iter())
+            .filter(|instance| {
+                instance.previous_class_name.is_some()
+                    || !instance.previous_path_segments.is_empty()
+            })
+            .map(|instance| instance.path_segments.join("."))
+            .collect::<Vec<_>>();
+        assert!(
+            changes
+                .instance_changes
+                .iter()
+                .all(|change| change.mode != "replaceInstances")
+                && replaced.is_empty(),
+            "the init file replaced an instance this push creates: {replaced:?}"
+        );
+        let created = changes
+            .instance_changes
+            .iter()
+            .flat_map(|change| change.instances.iter())
+            .map(|instance| {
+                format!(
+                    "{} {}",
+                    instance.path_segments.join("."),
+                    instance.class_name
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            created.contains(&"ReplicatedStorage.Shared.Lib ModuleScript".to_string())
+                && created.contains(&"ReplicatedStorage.Shared.Lib.Child ModuleScript".to_string())
+                && !created.contains(&"ReplicatedStorage.Shared.Lib Folder".to_string()),
+            "{created:?}"
+        );
+        let sources = changes
+            .source_changes
+            .iter()
+            .map(|change| change.path_segments.join("."))
+            .collect::<Vec<_>>();
+        assert!(
+            sources.contains(&"ReplicatedStorage.Shared.Lib".to_string())
+                && sources.contains(&"ReplicatedStorage.Shared.Lib.Child".to_string()),
+            "{sources:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_renamed_directory_deletes_the_old_scripts_and_creates_the_new_ones() {
+        use crate::cli::ProjectSourceArgs;
+        use crate::tests::support::{settings_document, settings_instance};
+
+        let root = crate::tests::support::temp_dir("directory-rename-collection");
+        let service_dir = root.join("src/ReplicatedStorage");
+        fs::create_dir_all(service_dir.join("Shared")).unwrap();
+        fs::write(root.join("renium.project.jsonc"), br#"{"schemaVersion":1}"#).unwrap();
+        fs::write(
+            service_dir.join("Shared/Util.luau"),
+            "return { version = 1 }\n",
+        )
+        .unwrap();
+        let mut util = settings_instance("editor:2", "Util", "ModuleScript", Some(1));
+        util.properties.insert(
+            "Source".into(),
+            json!(crate::settings::EXTERNAL_SOURCE_MARKER),
+        );
+        settings_document(vec![
+            settings_instance("editor:0", "ReplicatedStorage", "ReplicatedStorage", None),
+            settings_instance("editor:1", "Shared", "Folder", Some(0)),
+            util,
+        ])
+        .write_file(&root.join("instances/ReplicatedStorage.renium"))
+        .unwrap();
+        fs::rename(service_dir.join("Shared"), service_dir.join("Shared2")).unwrap();
+        let mut args = PushEditorChangesArgs::new(
+            ProjectSourceArgs {
+                project_root: root.clone(),
+                src_root: root.join("src"),
+            },
+            BridgeConnectionArgs::local(0.1),
+        );
+        args.changed_paths.extend([
+            PathBuf::from("src/ReplicatedStorage/Shared"),
+            PathBuf::from("src/ReplicatedStorage/Shared/Util.luau"),
+            PathBuf::from("src/ReplicatedStorage/Shared2/Util.luau"),
+        ]);
+        args.exact_target_ids = true;
+        args.targets_extend_paths = true;
+        args.verify_sources = true;
+        args.yes = true;
+        let (changes, _) = collect_project_editor_changes(&args).unwrap();
+        let described = changes
+            .instance_changes
+            .iter()
+            .flat_map(|change| {
+                change.instances.iter().map(move |instance| {
+                    format!(
+                        "{} {} {} {}",
+                        change.mode,
+                        instance.path_segments.join("."),
+                        instance.class_name,
+                        instance.settings_id
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let deleted = described
+            .iter()
+            .filter(|entry| entry.starts_with("deleteInstances "))
+            .collect::<Vec<_>>();
+        let created = described
+            .iter()
+            .filter(|entry| entry.starts_with("upsertInstances "))
+            .collect::<Vec<_>>();
+        assert!(
+            deleted.len() == 1
+                && deleted[0].contains(" ReplicatedStorage.Shared.Util ModuleScript "),
+            "{described:?}"
+        );
+        assert!(
+            created
+                .iter()
+                .any(|entry| entry.contains(" ReplicatedStorage.Shared2 Folder "))
+                && created
+                    .iter()
+                    .any(|entry| entry.contains(" ReplicatedStorage.Shared2.Util ModuleScript ")),
+            "{described:?}"
+        );
+        let ids = |entries: &[&String]| {
+            entries
+                .iter()
+                .map(|entry| entry.rsplit(' ').next().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        let deleted_ids = ids(&deleted);
+        let created_ids = ids(&created);
+        assert!(
+            !created_ids.iter().any(|id| deleted_ids.contains(id)),
+            "a created instance reuses a deleted identity: deleted {deleted_ids:?} created {created_ids:?}"
+        );
+        assert_eq!(
+            changes
+                .source_changes
+                .iter()
+                .map(|change| change.path_segments.join("."))
+                .collect::<Vec<_>>(),
+            ["ReplicatedStorage.Shared2.Util"]
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -6507,5 +7115,162 @@ mod package_ownership_tests {
         assert_eq!(legacy.owned, None);
         assert_eq!(legacy.creator, None);
         assert!(ensure_packages_owned(&[legacy]).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod saved_field_review_tests {
+    use super::*;
+    use crate::cli::{
+        ApplyEditorPropertyArgs, BridgeConnectionArgs, EditorMutationArgs, ProjectSourceArgs,
+    };
+    use crate::studio::bridge::routing_tests::{connect, edit_info, fixture};
+    use std::sync::Mutex;
+    use std::thread::{self, JoinHandle};
+    use tungstenite::{Message, WebSocket, protocol::Role};
+
+    fn reviewing_bridge(
+        decision: &'static str,
+    ) -> (BridgeServer, Arc<Mutex<Vec<Value>>>, JoinHandle<()>) {
+        let bridge = fixture();
+        let stream = connect(&bridge, 0, edit_info("saved-field-review", 21));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&calls);
+        let plugin = thread::spawn(move || {
+            let mut socket = WebSocket::from_raw_socket(stream, Role::Client, None);
+            while let Ok(message) = socket.read() {
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                let request: Value = serde_json::from_str(&text).unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "requestEditorPushReview" => {
+                        json!({ "required": true, "reviewId": "studio-1" })
+                    }
+                    "getEditorPushReviewDecision" => {
+                        json!({ "decided": true, "decision": decision })
+                    }
+                    _ => json!({}),
+                };
+                seen.lock().unwrap().push(request.clone());
+                let answer = json!({ "id": request["id"], "ok": true, "result": result });
+                if socket
+                    .send(Message::Text(answer.to_string().into()))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        (bridge, calls, plugin)
+    }
+
+    fn project_with_threshold_zero(tag: &str) -> PathBuf {
+        let root = crate::tests::support::temp_dir(tag);
+        fs::write(
+            root.join("renium.project.jsonc"),
+            r#"{"schemaVersion":1,"sourceRoot":"src","tree":{}}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join(".renium")).unwrap();
+        fs::write(
+            root.join(".renium").join("config.json"),
+            r#"{"schemaVersion":1,"liveSync":{"changesThreshold":0}}"#,
+        )
+        .unwrap();
+        root
+    }
+
+    fn saved_field_args(root: &Path, yes: bool) -> ApplyEditorPropertyArgs {
+        ApplyEditorPropertyArgs {
+            target: EditorMutationArgs {
+                project: ProjectSourceArgs {
+                    project_root: root.to_path_buf(),
+                    src_root: PathBuf::from("src"),
+                },
+                bridge: BridgeConnectionArgs::local(0.1),
+                service: "Workspace".into(),
+                settings_id: None,
+                class_name: "Workspace".into(),
+                path_segments_json: r#"["Workspace"]"#.into(),
+                path_ordinals_json: "[]".into(),
+                override_packages: false,
+            },
+            scope: "property".into(),
+            property: "StreamingMinRadius".into(),
+            value_json: Some("64".into()),
+            source_file: None,
+            no_review: false,
+            yes,
+        }
+    }
+
+    #[test]
+    fn a_saved_field_edit_is_reviewed_before_the_native_write() {
+        let root = project_with_threshold_zero("saved-field-review");
+        for (case, yes, decision) in [
+            ("default", false, "apply"),
+            ("yes", true, "apply"),
+            ("skip", false, "skip"),
+        ] {
+            let (bridge, calls, plugin) = reviewing_bridge(decision);
+            let result =
+                apply_editor_property_with_warm_bridge(saved_field_args(&root, yes), &bridge);
+            let calls = calls.lock().unwrap().clone();
+            let methods = calls
+                .iter()
+                .map(|call| call["method"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            if case == "skip" {
+                let summary = result.unwrap();
+                assert_eq!(summary["skippedByReview"], json!(true), "{case}");
+                assert_eq!(direct_editor_summary(&summary)["changed"], json!(false));
+            } else {
+                let error = format!("{:#}", result.unwrap_err());
+                assert!(
+                    error.contains("native property writer could not set it"),
+                    "{case}: {error}"
+                );
+            }
+            if case == "yes" {
+                assert!(!methods.contains(&"requestEditorPushReview"), "{methods:?}");
+            } else {
+                assert_eq!(
+                    methods.first(),
+                    Some(&"requestEditorPushReview"),
+                    "{case}: {methods:?}"
+                );
+                assert_eq!(calls[0]["params"]["changeCount"], json!(1), "{case}");
+                assert_eq!(calls[0]["params"]["changesThreshold"], json!(0), "{case}");
+            }
+            drop(bridge);
+            plugin.join().unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_duplicate_saved_field_target_keeps_its_ordinals_for_the_native_writer() {
+        let root = project_with_threshold_zero("saved-field-ordinals");
+        let mut args = saved_field_args(&root, true);
+        args.target.class_name = "VideoPlayer".into();
+        args.target.path_segments_json = r#"["Set","Player"]"#.into();
+        args.target.path_ordinals_json = "[2,2]".into();
+        args.property = "AutoPlayInStudio".into();
+        args.value_json = Some("true".into());
+        let changes = collect_direct_editor_property_change(&args).unwrap();
+        let [change] = changes.property_changes.as_slice() else {
+            panic!("expected one property change")
+        };
+        assert_eq!(change.path_segments, ["Workspace", "Set", "Player"]);
+        assert_eq!(change.path_ordinals, [1, 2, 2]);
+        let database = rbx_reflection_database::get().unwrap();
+        assert!(super::super::review::plugin_cannot_write_property(
+            database,
+            &change.class_name,
+            "AutoPlayInStudio"
+        ));
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -45,7 +45,9 @@ api.stop()
 assert(calls[4][1] == 20 and calls[4][2] == 0)
 assert(calls[5][1] == 10 and calls[5][2] == 0, "Stop must not leave instrumentation enabled")
 protocol = 2
-assert(not pcall(api.start, 128) and #calls == 5, "Unknown protocol must not perform any control writes")
+local okStart, startError = pcall(api.start, 128)
+assert(not okStart and #calls == 5, "Unknown protocol must not perform any control writes")
+assert(string.find(tostring(startError), "the probe answered 20 bytes: 0x00000002 0x00000002 0x00000002 0x00000002", 1, true), tostring(startError))
 protocol = 65536
 failAck = true
 assert(not pcall(api.start, 128) and #calls == 6, "Rejected limit must not continue enabling the capture")
