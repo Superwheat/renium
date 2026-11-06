@@ -752,13 +752,11 @@ fn handshake(
     info: &BridgeInfoPayload,
 ) -> Option<WebSocket<TcpStream>> {
     let address = format!("127.0.0.1:{}", bridge.channels[channel].port);
-    let stream = TcpStream::connect(&address).unwrap();
-    stream.set_nodelay(true).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
-    let (mut peer, _) = tungstenite::client(format!("ws://{address}"), stream).unwrap();
-    let request: Value = serde_json::from_str(&peer.read().unwrap().into_text().unwrap()).unwrap();
+    // A loaded machine (another test binary or a release build on the same
+    // runner) can reset the socket during the WebSocket upgrade or before the
+    // first frame; that is noise from the host, not from the bridge, so the
+    // opening handshake is retried a few times before the test gives up.
+    let (mut peer, request) = connect_until_registered(&address);
     peer.send(Message::Text(
         json!({"id": request["id"], "ok": true, "result": {
             "runtimeId": info.runtime_id, "bridgeRole": info.bridge_role,
@@ -790,6 +788,43 @@ fn handshake(
         BridgeServer::refresh_channel_snapshots(channel, &sockets);
     }
     Some(peer)
+}
+
+fn connect_until_registered(address: &str) -> (WebSocket<TcpStream>, Value) {
+    let mut last_error = String::new();
+    for attempt in 0..8 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(150 * attempt));
+        }
+        let stream = match TcpStream::connect(address) {
+            Ok(stream) => stream,
+            Err(error) => {
+                last_error = format!("connect: {error}");
+                continue;
+            }
+        };
+        stream.set_nodelay(true).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut peer = match tungstenite::client(format!("ws://{address}"), stream) {
+            Ok((peer, _)) => peer,
+            Err(error) => {
+                last_error = format!("upgrade: {error}");
+                continue;
+            }
+        };
+        match peer.read() {
+            Ok(message) => {
+                let request: Value = serde_json::from_str(&message.into_text().unwrap()).unwrap();
+                return (peer, request);
+            }
+            Err(error) => {
+                last_error = format!("first frame: {error}");
+            }
+        }
+    }
+    panic!("the test peer could not open a bridge channel on {address}: {last_error}");
 }
 
 fn wait_for_client_count(bridge: &BridgeServer, expected: usize) {
