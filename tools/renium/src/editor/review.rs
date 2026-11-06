@@ -111,6 +111,11 @@ pub(crate) fn is_engine_managed_editor_property(
     {
         return false;
     }
+    // Studio regenerates a rig's tables when it loads them, and no plugin API
+    // writes one (its rootMotion table is not even in the reflection database).
+    if class_name == "AnimationRigData" && property_name != "Archivable" {
+        return true;
+    }
     let Some(descriptor) = rbx_property_descriptor(database, class_name, property_name) else {
         return false;
     };

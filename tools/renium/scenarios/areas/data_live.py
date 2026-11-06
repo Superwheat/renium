@@ -148,8 +148,10 @@ def protected_field_without_yes(ctx: Context):
     current, value = _technology(ctx)
     applied = ctx.rbx("prop", *LIGHTING, "-j", value, ok=None, timeout=300)
     ctx.studio_open = True
-    if sys.platform == "darwin":
-        ctx.expect(not applied.ok and "native property writer could not set it" in applied.error and "rbx ps instances/Lighting.renium -u --yes" in applied.error, f"macOS has no saved-field writer; the refusal must name the store push: {applied.json}")
+    if sys.platform == "darwin" and not applied.ok:
+        # Without a native saved-field writer (older Studio layouts) the
+        # refusal names the store push; with one, macOS answers like Windows.
+        ctx.expect("native property writer could not set it" in applied.error and "rbx ps instances/Lighting.renium -u --yes" in applied.error, f"macOS saved-field refusal must name the store push: {applied.json}")
         return
     ctx.expect(applied.get("changed") is True and applied.get("savedFieldsApplied") == 1, f"a protected prop without --yes neither applied nor named the field (D2/D7): {applied.json}")
     ctx.expect(_pulled_technology(ctx) == json.loads(value)["name"] != current, "Technology changed in the saved place")
@@ -722,8 +724,8 @@ def saved_field_review_at_threshold_zero(ctx: Context):
         result = _finished(ctx, process, out, err)
         ctx.expect(held, f"no review appeared for the saved-field prop: {result}")
         answer = result["json"] or {}
-        if sys.platform == "darwin":
-            ctx.expect(result["code"] != 0 and "native property writer could not set it" in result["stderr"] + json.dumps(answer), f"macOS has no saved-field writer; the refusal must follow the review: {result}")
+        if sys.platform == "darwin" and result["code"] != 0:
+            ctx.expect("native property writer could not set it" in result["stderr"] + json.dumps(answer), f"macOS saved-field refusal must follow the review: {result}")
             return
         ctx.expect(answer.get("changed") is True and answer.get("savedFieldsApplied") == 1, f"saved-field prop after rv apply: {answer}")
         ctx.expect(_pulled_technology(ctx) == json.loads(value)["name"], "Technology written after rv apply")

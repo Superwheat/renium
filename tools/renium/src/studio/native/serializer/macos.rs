@@ -30,7 +30,9 @@ pub(super) fn probe_operation(
         | NativeOperation::History
         | NativeOperation::VoxelHistory
         | NativeOperation::Terrain
-        | NativeOperation::TerrainObservation => properties::probe_operation(pid, title, operation),
+        | NativeOperation::TerrainObservation => {
+            properties::probe_operation(pid, title, operation, Duration::from_secs(10))
+        }
         NativeOperation::Snapshot | NativeOperation::Capture => {
             let trace = trace_studio(&process_executable_path(pid)?)?;
             let result = properties::probe_image_code(
@@ -39,7 +41,12 @@ pub(super) fn probe_operation(
                 &[(trace.factory_rva, 64), (trace.execute_rva, 64)],
             )?;
             if operation == NativeOperation::Capture {
-                properties::probe_operation(pid, title, NativeOperation::DescriptorBinding)?;
+                properties::probe_operation(
+                    pid,
+                    title,
+                    NativeOperation::DescriptorBinding,
+                    Duration::from_secs(10),
+                )?;
             }
             Ok(result)
         }
@@ -94,7 +101,7 @@ const REQUEST_MAGIC: u32 = 0x4d4e4552;
 // Fence property-operation additions as well as the outer serializer header.
 // An already-open Studio can still have an older helper mapped after an update.
 const REQUEST_VERSION: u32 = 12;
-const PLAYTEST_REQUEST_VERSION: u32 = 20;
+const PLAYTEST_REQUEST_VERSION: u32 = 21;
 
 fn native_helper_error(error: &str) -> String {
     if error.contains("invalid serializer request")
@@ -725,12 +732,12 @@ fn trace_arm64_task_submitter(image: &MachImage<'_>) -> Result<u64> {
             && word(16) == Some(0x3940_a3e8)
             && word(17) == Some(0x7100_051f)
             && word(18).is_some_and(|value| value & 0xff00_001f == 0x5400_0001)
-            && word(19) == Some(0xf940_12a0)
+            && word(19).is_some_and(|value| value & 0xffc0_03ff == 0xf940_02a0)
             && word(20) == Some(0xf100_001f)
             && word(21) == Some(0x1a9f_07f5)
             && word(22).is_some_and(|value| value & 0xff00_001f == 0xb400_0000)
             && word(23) == Some(0xf940_0008)
-            && word(24) == Some(0xf940_2508)
+            && word(24).is_some_and(|value| value & 0xffc0_03ff == 0xf940_0108)
             && word(25) == Some(0xaa14_03e1)
             && word(26) == Some(0xaa13_03e2)
             && word(27) == Some(0xd63f_0100)
@@ -1710,6 +1717,62 @@ fn patch_is_current(studio: &Path, state: &StudioPatchState) -> bool {
             == Some(state.patched_engine_sha256.as_str())
 }
 
+// A different HOME (or a second Studio installation) may not own the rollback
+// baseline. That does not make a fully signed Renium bundle a partial patch.
+// Never capture such a launcher as an original executable or invent a backup.
+fn complete_owned_patch(studio: &Path) -> Result<bool> {
+    let Ok(marker) = fs::read_to_string(studio_patch_marker(studio)) else {
+        return Ok(false);
+    };
+    let fields: Vec<_> = marker.split(':').collect();
+    if fields.len() != 4
+        || fields[0].parse::<u32>().ok() != Some(PATCH_FORMAT)
+        || fields[1].parse::<u64>().ok() != Some(studio_bundle_version(studio)?)
+        || fields[2].len() != 64
+        || !fields[2].bytes().all(|b| b.is_ascii_hexdigit())
+        || fields[3] != sha256_hex(LAUNCHER_BYTES)
+        || !studio_patched_engine(studio).is_file()
+    {
+        return Ok(false);
+    }
+    let expected = super::macos_patch::launcher_payload(LAUNCHER_BYTES)
+        .context("The bundled Renium launcher has an invalid Mach-O signature layout")?;
+    if super::macos_patch::launcher_payload(&fs::read(studio_launcher(studio))?) != Some(expected) {
+        return Ok(false);
+    }
+    verify_unmodified_studio(studio)?; // verify the complete signed bundle, including .bin
+    Ok(true)
+}
+
+pub(crate) fn studio_patch_status() -> Result<Vec<serde_json::Value>> {
+    let baseline = read_patch_state()?;
+    let mut statuses = Vec::new();
+    for studio in installed_studio_paths()? {
+        if !patch_artifacts_present(&studio) {
+            continue;
+        }
+        let recorded = baseline.as_ref().filter(|state| state.studio == studio);
+        let complete = if let Some(state) = recorded {
+            patch_is_current(&studio, state)
+        } else {
+            complete_owned_patch(&studio)?
+        };
+        let rollback = recorded.is_some_and(|state| {
+            studio_original_backup()
+                .and_then(|path| sha256_file(&path))
+                .ok()
+                .as_deref()
+                == Some(state.original_sha256.as_str())
+        });
+        statuses.push(serde_json::json!({
+            "studio": studio,
+            "state": if complete { "complete" } else { "unrecognized" },
+            "rollbackAvailable": rollback,
+        }));
+    }
+    Ok(statuses)
+}
+
 fn ensure_studio_closed(studio: &Path) -> Result<()> {
     let output = command_output(
         Command::new("ps").args(["-axo", "command="]),
@@ -2072,6 +2135,16 @@ impl StudioPatchRemoval {
 pub fn begin_studio_patch_removal() -> Result<StudioPatchRemoval> {
     recover_studio_patch_install()?;
     let state = read_patch_state()?;
+    for studio in installed_studio_paths()? {
+        if patch_artifacts_present(&studio)
+            && state.as_ref().is_none_or(|state| state.studio != studio)
+        {
+            bail!(
+                "Cannot restore {}: its original rollback baseline is missing. Reinstall that Studio app before uninstalling the native helper",
+                studio.display()
+            );
+        }
+    }
     if let Some(state) = state.as_ref() {
         if remove_stale_patch_from_updated_studio(state)? {
             return Ok(StudioPatchRemoval { active: false });
@@ -2097,6 +2170,11 @@ pub fn setup_studio_patch(dry_run: bool) -> Result<PathBuf> {
     }
     recover_studio_patch_install()?;
     install_external_helper()?;
+    if read_patch_state()?.is_none_or(|state| state.studio != studio)
+        && complete_owned_patch(&studio)?
+    {
+        return Ok(studio);
+    }
     if let Some(state) = read_patch_state()? {
         if patch_is_current(&studio, &state) {
             return Ok(studio);

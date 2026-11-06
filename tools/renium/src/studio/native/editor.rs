@@ -90,7 +90,11 @@ use crate::system::LockRecover;
 
 #[cfg(windows)]
 use super::capture::CaptureUnavailable;
-use super::capture::{CaptureReport, export_with_fallback, record_report};
+#[cfg(any(windows, all(target_os = "macos", any(target_arch = "aarch64", test))))]
+use super::capture::capture_join_error;
+use super::capture::{
+    AmbiguousCaptureUniqueIds, CaptureReport, export_with_fallback, record_report,
+};
 
 const NATIVE_SERIALIZATION_SERVICE_LIMIT: usize = 4_096;
 const NATIVE_SERIALIZATION_BATCH_LIMIT: usize = 8_192;
@@ -357,6 +361,13 @@ fn capture_native_service_root_properties(
     // Service roots cannot enter SerializeInstancesAsync. Capture these blocked
     // saved settings through existing identity-checked reads, not a second
     // whole-place export. The active export guard still fences outside edits.
+    // macOS queues both the ownership probe and the read on the DataModel;
+    // give saved fields the same load budget as its standalone native probe.
+    let read_timeout = if cfg!(target_os = "macos") {
+        Duration::from_secs(10)
+    } else {
+        Duration::from_secs(2)
+    };
     for group in groups {
         for &name in capture_properties(&group.service) {
             let text = match serializer::optional_native(serializer::read_property(
@@ -366,7 +377,7 @@ fn capture_native_service_root_properties(
                 &[1],
                 &group.service,
                 name,
-                Duration::from_secs(2),
+                read_timeout,
             ))? {
                 Some(text) => text,
                 None => {
@@ -977,9 +988,14 @@ fn native_capture_debug_ids(
         rows.len(),
         instances.len()
     );
-    let mut row_by_id = AHashMap::with_capacity(instances.len());
+    let mut row_by_identity = AHashMap::with_capacity(instances.len());
+    let mut seen_ids = AHashSet::with_capacity(instances.len());
     let mut seen_debug_ids = AHashSet::with_capacity(instances.len());
     let mut captured = Vec::with_capacity(instances.len());
+    let mut ambiguous = AmbiguousCaptureUniqueIds {
+        nil: 0,
+        duplicates: 0,
+    };
     for (index, row) in rows.chunks_exact(72).enumerate() {
         let word = |offset| u32::from_le_bytes(row[offset..offset + 4].try_into().unwrap());
         // The getter's native struct stores four LE words in display order,
@@ -989,10 +1005,11 @@ fn native_capture_debug_ids(
             word(8),
             ((u64::from(word(0)) << 32) | u64::from(word(4))) as i64,
         );
-        anyhow::ensure!(
-            !id.is_nil() && row_by_id.insert(id, index).is_none(),
-            "Native identity capture contains a nil or duplicate UniqueId"
-        );
+        if id.is_nil() {
+            ambiguous.nil += 1;
+        } else if !seen_ids.insert(id) {
+            ambiguous.duplicates += 1;
+        }
         let text = &row[16..64];
         let length = text
             .iter()
@@ -1011,52 +1028,65 @@ fn native_capture_debug_ids(
             word(68) == 0 && (parent == u32::MAX || (parent as usize) < index),
             "Native identity capture has an invalid parent or reserved field"
         );
-        captured.push((debug_id, (parent != u32::MAX).then_some(parent as usize)));
+        let parent = (parent != u32::MAX).then_some(parent as usize);
+        match row_by_identity.entry((id, parent)) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Some(index));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.insert(None);
+            }
+        }
+        captured.push(debug_id);
     }
+    crate::app::output::log_global(
+        3,
+        format_args!(
+            "[renium] native identity join: {} captured, {} serialized, {} nil, {} duplicate instances beyond the first",
+            captured.len(),
+            instances.len(),
+            ambiguous.nil,
+            ambiguous.duplicates
+        ),
+    );
     let mut row_by_native_index = Vec::with_capacity(instances.len());
     let mut seen_rows = vec![false; captured.len()];
+    let mut debug_ids = Vec::with_capacity(instances.len());
     for instance in instances {
-        let id = instance
-            .properties
-            .iter()
-            .find_map(|(name, value)| {
-                if name.as_str() == "UniqueId"
-                    && let RbxVariant::UniqueId(id) = value
-                {
-                    return Some(id);
-                }
-                None
+        let id = instance.properties.iter().find_map(|(name, value)| {
+            if name.as_str() == "UniqueId"
+                && let RbxVariant::UniqueId(id) = value
+            {
+                return Some(*id);
+            }
+            None
+        });
+        // Flat decoding visits parents first. Qualify the ID by the parent's
+        // proven capture row, including nil (the omitted property default).
+        // This is exact only when the complete native child set has one such
+        // ID. Never break ties by names, class, or sibling/traversal order.
+        let parent = instance
+            .parent_index
+            .map(|parent| {
+                row_by_native_index
+                    .get(parent)
+                    .copied()
+                    .context("Native serialized parent is not before its child")
             })
-            .context("Native serialized instance omitted UniqueId")?;
-        let row = *row_by_id
-            .get(id)
-            .context("Serialized identity is absent from native capture")?;
+            .transpose()?;
+        let row = match row_by_identity.get(&(id.unwrap_or_else(UniqueId::nil), parent)) {
+            Some(Some(row)) => *row,
+            Some(None) => return Err(ambiguous.into()),
+            None => bail!("Serialized identity or parent is absent from native capture"),
+        };
         anyhow::ensure!(
             !std::mem::replace(&mut seen_rows[row], true),
             "Serialized snapshot repeats a captured identity"
         );
         row_by_native_index.push(row);
+        debug_ids.push(captured[row].to_string());
     }
-    instances
-        .iter()
-        .zip(&row_by_native_index)
-        .map(|(instance, row)| {
-            let parent = instance
-                .parent_index
-                .map(|parent| {
-                    row_by_native_index
-                        .get(parent)
-                        .copied()
-                        .context("Native serialized parent is out of range")
-                })
-                .transpose()?;
-            anyhow::ensure!(
-                parent == captured[*row].1,
-                "Native serialized parent disagrees with identity capture"
-            );
-            Ok(captured[*row].0.to_string())
-        })
-        .collect()
+    Ok(debug_ids)
 }
 
 fn native_identity_carrier_count(group: &EditorBinaryExportGroup) -> Result<usize> {
@@ -1343,6 +1373,142 @@ mod native_identity_tests {
     }
 
     #[test]
+    fn capture_qualifies_reused_and_nil_ids_by_the_proven_parent() {
+        let make = |referent, serial: Option<u32>, parent| {
+            let properties = serial
+                .map(|serial| {
+                    vec![(
+                        "UniqueId".into(),
+                        RbxVariant::UniqueId(rbx_dom_weak::types::UniqueId::new(
+                            serial,
+                            0x10203040,
+                            0x1234567890abcdef,
+                        )),
+                    )]
+                })
+                .unwrap_or_default();
+            flat_instance(referent, parent, "Same", "Folder", properties)
+        };
+        for nil in [false, true] {
+            let child = (!nil).then_some(7);
+            let instances = vec![
+                make(1, Some(1), None),
+                make(2, Some(2), Some(0)),
+                make(3, child, Some(1)),
+                make(4, Some(3), Some(0)),
+                make(5, child, Some(3)),
+            ];
+            let mut rows = [
+                capture_row(1, u32::MAX, "root"),
+                capture_row(3, 0, "right"),
+                capture_row(2, 0, "left"),
+                capture_row(7, 1, "right-child"),
+                capture_row(7, 2, "left-child"),
+            ];
+            if nil {
+                rows[3][..16].fill(0);
+                rows[4][..16].fill(0);
+            }
+            assert_eq!(
+                native_capture_debug_ids(&instances, &rows.concat()).unwrap(),
+                ["root", "left", "left-child", "right", "right-child"]
+            );
+            // Even an omitted native sibling makes that parent's ID ambiguous.
+            let mut extra = rows[4];
+            extra[16..64].fill(0);
+            extra[16..27].copy_from_slice(b"engine-only");
+            let mut ambiguous_rows = rows.concat();
+            ambiguous_rows.extend_from_slice(&extra);
+            assert!(
+                native_capture_debug_ids(&instances, &ambiguous_rows)
+                    .unwrap_err()
+                    .is::<AmbiguousCaptureUniqueIds>()
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(any(windows, target_os = "macos"))]
+    fn ambiguous_unique_ids_restart_with_plugin_identities_and_report_the_reason() {
+        for nil in [false, true] {
+            let instances = (0..3)
+                .map(|index| {
+                    let id = if nil && index > 0 {
+                        rbx_dom_weak::types::UniqueId::nil()
+                    } else {
+                        rbx_dom_weak::types::UniqueId::new(
+                            if index == 0 { 1 } else { 2 },
+                            0x10203040,
+                            0x1234567890abcdef,
+                        )
+                    };
+                    flat_instance(
+                        index + 1,
+                        (index > 0).then_some(0),
+                        "Same",
+                        "Folder",
+                        vec![("UniqueId".into(), RbxVariant::UniqueId(id))],
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut rows = [
+                capture_row(1, u32::MAX, "0_001"),
+                capture_row(2, 0, "0_002"),
+                capture_row(2, 0, "0_003"),
+            ];
+            if nil {
+                rows[1][..16].fill(0);
+                rows[2][..16].fill(0);
+            }
+            let rows = rows.concat();
+            let error = native_capture_debug_ids(&instances, &rows).unwrap_err();
+            let ambiguity = error.downcast_ref::<AmbiguousCaptureUniqueIds>().unwrap();
+            assert_eq!(ambiguity.nil, if nil { 2 } else { 0 });
+            assert_eq!(ambiguity.duplicates, if nil { 0 } else { 1 });
+
+            // Keep operation evidence separate from probes testing this process.
+            let pid = u32::MAX;
+            let mut modes = Vec::new();
+            let (ids, unavailable) = export_with_fallback(
+                |native| {
+                    modes.push(native);
+                    if native {
+                        native_capture_debug_ids(&instances, &rows)
+                            .map_err(|error| capture_join_error(pid, 2, error))
+                    } else {
+                        Ok(vec!["0_001".into(), "0_003".into(), "0_002".into()])
+                    }
+                },
+                |unavailable| assert_eq!(unavailable.attempts, 2),
+            )
+            .unwrap();
+            assert_eq!(modes, [true, false]);
+            assert_eq!(ids, ["0_001", "0_003", "0_002"]);
+            let unavailable = unavailable.unwrap();
+            let status = super::super::serializer::probes::cached(pid);
+            let capture = status["operations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["operation"] == "capture")
+                .unwrap();
+            assert_eq!(capture["verdict"], "degraded");
+            assert_eq!(capture["reason"], unavailable.reason);
+
+            // Ambiguity must not hide a malformed row or an invalid graph.
+            for (offset, byte) in [(72 + 16, 0), (144 + 64, 2), (144 + 68, 1)] {
+                let mut corrupt = rows.clone();
+                corrupt[offset] = byte;
+                let error = native_capture_debug_ids(&instances, &corrupt).unwrap_err();
+                assert!(
+                    !capture_join_error(pid, 2, error)
+                        .is::<super::super::capture::CaptureUnavailable>()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn native_capture_joins_by_identity_not_same_named_sibling_order() {
         let make = |serial, parent| {
             flat_instance(
@@ -1382,6 +1548,17 @@ mod native_identity_tests {
         .concat();
         assert_eq!(
             native_capture_debug_ids(&instances, &extra_rows).unwrap(),
+            ["0_001", "0_003", "0_002"]
+        );
+        // Omitted engine rows can repeat one another's IDs or have no ID.
+        // They must not disable an otherwise exact serialized join.
+        let mut nil_row = capture_row(0, 1, "engine-only-nil");
+        nil_row[..16].fill(0);
+        let mut ambiguous_extra_rows = extra_rows.clone();
+        ambiguous_extra_rows.extend_from_slice(&capture_row(4, 0, "engine-only-duplicate"));
+        ambiguous_extra_rows.extend_from_slice(&nil_row);
+        assert_eq!(
+            native_capture_debug_ids(&instances, &ambiguous_extra_rows).unwrap(),
             ["0_001", "0_003", "0_002"]
         );
         for (offset, bytes) in [
@@ -2852,13 +3029,18 @@ fn editor_binary_export_parts_once<'a>(
     thread::scope(|overlay_scope| {
         // Identity and binary reads share the existing export fence. Start both
         // before waiting so a queued native identity read does not idle all the
-        // binary/overlay workers. Only a verified-unavailable native locator
-        // permits export with the plugin's validated identity carriers alone.
+        // binary/overlay workers. A verified-unavailable locator or a validated
+        // capture with ambiguous UniqueIds, or a verified identity-read deadline,
+        // permits a fresh plugin export with its fallback reason recorded.
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         let identity_worker = overlay_scope.spawn(move || {
+            if mode == BinaryExportMode::PluginSerialization {
+                return Ok(None);
+            }
             let pid = studio_pid_for_bridge(bridge)?;
             let title = studio_title_for_bridge(bridge, pid)?;
             serializer::capture_identities(pid, &title, requested_services, Duration::from_secs(3))
+                .map_err(|error| capture_join_error(pid, 1, error))
         });
         if native_capture {
             for _ in 0..worker_count {
@@ -3292,14 +3474,16 @@ fn capture_native_export(
         id: "native-capture".into(),
         services,
     };
-    decode_native_serialization_batch(
+    let decoded = decode_native_serialization_batch(
         &captured.bytes,
         &batch,
         groups,
         filter,
         Some(&captured.identities),
-    )
-    .map(Mutex::new)
+    );
+    decoded
+        .map(Mutex::new)
+        .map_err(|error| capture_join_error(pid, captured.attempts, error))
 }
 
 pub(crate) fn run_workers_and_drain<T: Send, R>(

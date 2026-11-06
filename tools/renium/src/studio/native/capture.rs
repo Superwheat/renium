@@ -35,6 +35,24 @@ impl fmt::Display for CaptureResponseError {
 #[cfg(any(windows, test))]
 impl std::error::Error for CaptureResponseError {}
 
+#[derive(Debug)]
+pub(crate) struct AmbiguousCaptureUniqueIds {
+    pub(crate) nil: usize,
+    pub(crate) duplicates: usize,
+}
+
+impl fmt::Display for AmbiguousCaptureUniqueIds {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Native identity capture cannot join UniqueId: {} nil instances, {} duplicate instances beyond the first; use plugin identities",
+            self.nil, self.duplicates
+        )
+    }
+}
+
+impl std::error::Error for AmbiguousCaptureUniqueIds {}
+
 #[derive(Clone, Debug)]
 pub(crate) struct CaptureUnavailable {
     pub(crate) attempts: usize,
@@ -52,6 +70,25 @@ impl fmt::Display for CaptureUnavailable {
 }
 
 impl std::error::Error for CaptureUnavailable {}
+
+#[cfg(any(windows, all(target_os = "macos", any(target_arch = "aarch64", test))))]
+pub(crate) fn capture_join_error(pid: u32, attempts: usize, error: anyhow::Error) -> anyhow::Error {
+    if !error.is::<AmbiguousCaptureUniqueIds>() {
+        return error;
+    }
+    // Call before any service emits output. All workers and the export guard
+    // must finish before export_with_fallback starts a fresh plugin export.
+    super::serializer::probes::record(
+        pid,
+        super::serializer::probes::NativeOperation::Capture,
+        &Err(anyhow::anyhow!("{error:#}")),
+    );
+    CaptureUnavailable {
+        attempts,
+        reason: format!("{error:#}"),
+    }
+    .into()
+}
 
 #[cfg(any(windows, test))]
 fn retry_delay(error: &anyhow::Error, attempt: usize, remaining: Duration) -> Option<Duration> {
@@ -109,7 +146,9 @@ pub(crate) fn retry_capture<T>(
 
 /// The native refusal must occur before any service output is emitted. The
 /// caller joins workers and drops the old export guard before returning it.
-/// Decode, identity, overlay, publication and plugin errors are not fallbacks.
+/// A validated capture with ambiguous UniqueIds is also unavailable: its
+/// serialized instances cannot be joined safely. Other decode, identity,
+/// overlay, publication and plugin errors are not fallbacks.
 pub(crate) fn export_with_fallback<T>(
     mut export: impl FnMut(bool) -> Result<T>,
     on_fallback: impl FnOnce(&CaptureUnavailable),

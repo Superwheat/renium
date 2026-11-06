@@ -4,6 +4,14 @@ mod arm64_functions;
 mod functions;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(any(target_os = "macos", test))]
+mod macos_deadline;
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), test))]
+mod macos_identity_rows;
+#[cfg(any(target_os = "macos", test))]
+mod macos_patch;
+#[cfg(any(target_os = "macos", test))]
+mod macos_write;
 #[cfg(any(windows, target_os = "macos", test))]
 pub(crate) mod probes;
 #[cfg(windows)]
@@ -62,6 +70,36 @@ fn plugin_fallback_requires_the_typed_locator_verdict() {
         let error = optional_native::<()>(Err(anyhow::anyhow!(message))).unwrap_err();
         assert_eq!(error.to_string(), message);
     }
+}
+
+#[test]
+fn context_preparation_does_not_wait_for_the_property_queue() {
+    let name = if cfg!(windows) {
+        "renium-property-task-test.exe"
+    } else {
+        "renium-property-task-test"
+    };
+    assert!(
+        std::process::Command::new(std::path::Path::new(env!("OUT_DIR")).join(name))
+            .status()
+            .expect("run property dispatch regression")
+            .success()
+    );
+}
+
+#[test]
+fn macos_task_context_requires_the_owned_model_and_tagged_callback_contract() {
+    let name = if cfg!(windows) {
+        "renium-macos-task-context-test.exe"
+    } else {
+        "renium-macos-task-context-test"
+    };
+    assert!(
+        std::process::Command::new(std::path::Path::new(env!("OUT_DIR")).join(name))
+            .status()
+            .expect("run macOS queue ABI regression")
+            .success()
+    );
 }
 
 #[test]

@@ -43,10 +43,13 @@
 #include <vector>
 #include "renium_studio_history.h"
 #include "renium_studio_terrain.h"
+#include "renium_task_context_macos.h"
+#include "renium_tagged_callback.h"
 
 extern "C" bool ReniumArmLaunchGuard();
 void ReniumStudioWindow(const std::string&, std::vector<unsigned char>&);
 void ReniumStudioAction(const std::string&, std::vector<unsigned char>&);
+void ReniumStudioUiTask(void*, void (*)(void*));
 extern "C" void ReniumInitializeLaunchGuard();
 extern "C" bool ReniumStudioAudio(unsigned, unsigned*, unsigned*, unsigned*, bool*, char*, std::size_t);
 
@@ -118,7 +121,9 @@ struct DataModelScanStats
 };
 
 static constexpr std::uint32_t Magic = 0x4d4e4552;
-static constexpr std::uint32_t Version = 20;
+static constexpr std::uint32_t Version = 21;
+// Typed deadline verdict; keep in sync with serializer/macos_deadline.rs.
+static constexpr std::uint32_t PropertyDeadlineStatus = 21;
 // Command 3 does not use factoryRva as a function address. Its top bit opts in
 // to per-candidate clocks; older helpers ignore it and keep the same payloads.
 static constexpr std::uint64_t PropertyPhaseTimingFlag = std::uint64_t{1} << 63;
@@ -185,6 +190,7 @@ struct PropertyTiming
     std::atomic<std::uint64_t> lockUs{0}, scanUs{0}, cache{0}, modelCache{0};
     std::atomic<std::uint64_t> collectUs{0}, rttiUs{0}, rttiReads{0}, pointers{0};
     std::atomic<std::uint64_t> uiQueued{0}, uiBegin{0}, uiEnd{0}, submit{0}, runBegin{0}, runEnd{0};
+    std::atomic<std::uint64_t> captureBegin{0}, captureEnd{0}, identityRows{0}, identityUs{0}, debugUs{0};
     std::uint64_t now() const
     {
         return 1 + std::chrono::duration_cast<std::chrono::microseconds>(
@@ -195,10 +201,11 @@ struct PropertyTiming
         response.elapsedMicros = now() - 1;
         const auto length = strnlen(response.error, sizeof(response.error));
         std::snprintf(response.error + length, sizeof(response.error) - length,
-            "%spt1 lock=%llu scan=%llu cache=%llu model=%llu ui=%llu/%llu/%llu submit=%llu run=%llu/%llu collect=%llu rtti=%llu/%llu/%u ptrs=%llu",
+            "%spt1 lock=%llu scan=%llu cache=%llu model=%llu ui=%llu/%llu/%llu submit=%llu run=%llu/%llu collect=%llu rtti=%llu/%llu/%u ptrs=%llu capture=%llu/%llu rows=%llu getters=%llu format=%llu",
             length ? " | " : "", lockUs.load(), scanUs.load(), cache.load(), modelCache.load(),
             uiQueued.load(), uiBegin.load(), uiEnd.load(), submit.load(), runBegin.load(), runEnd.load(),
-            collectUs.load(), rttiUs.load(), rttiReads.load(), static_cast<unsigned>(detailed), pointers.load());
+            collectUs.load(), rttiUs.load(), rttiReads.load(), static_cast<unsigned>(detailed), pointers.load(),
+            captureBegin.load(), captureEnd.load(), identityRows.load(), identityUs.load(), debugUs.load());
     }
 };
 
@@ -886,14 +893,79 @@ static bool ResolveImageFunction(
     return true;
 }
 
-static bool ResolveDataModelTaskContext(
-    void*, const DataModelLayout&, const mach_header_64*, std::uintptr_t,
-    void*&, std::string& error)
+static bool CompleteObject(std::uintptr_t object, const char* type)
 {
-    // No engine call is permitted until a complete, image-verified ARM64
-    // context getter and its ownership contract can be demonstrated.
+    std::uintptr_t table = 0;
+    std::intptr_t top = -1;
+    return LikelyPointer(object) && ReadValue(object, table) && table >= 16 &&
+        ReadValue(table - 16, top) && top == 0 && IsRttiType(object, type);
+}
+
+static bool ImageCode(const mach_header_64* header, std::uintptr_t address, std::vector<std::uint32_t>& code)
+{
+    Dl_info info{};
+    if (!LikelyCodePointer(address) || !dladdr(reinterpret_cast<void*>(address), &info) || info.dli_fbase != header)
+        return false;
+    bool executable = false;
+    auto command = reinterpret_cast<const unsigned char*>(header) + sizeof(*header);
+    for (std::uint32_t i = 0; i < header->ncmds; ++i) {
+        const auto load = reinterpret_cast<const load_command*>(command);
+        if (load->cmdsize < sizeof(load_command)) return false;
+        if (load->cmd == LC_SEGMENT_64) {
+            const auto segment = reinterpret_cast<const segment_command_64*>(load);
+            if (std::strcmp(segment->segname, "__TEXT") == 0 && (segment->initprot & VM_PROT_EXECUTE)) {
+                const auto sections = reinterpret_cast<const section_64*>(segment + 1);
+                for (std::uint32_t n = 0; n < segment->nsects; ++n) {
+                    const auto& section = sections[n];
+                    const auto start = reinterpret_cast<std::uintptr_t>(header) + section.addr - segment->vmaddr;
+                    if ((section.flags & S_ATTR_PURE_INSTRUCTIONS) && section.size >= 512 &&
+                        address >= start && address - start <= section.size - 512) executable = true;
+                }
+            }
+        }
+        command += load->cmdsize;
+    }
+    if (!executable) return false;
+    // All analyzed methods are leaf/forwarding methods. The decoder terminates
+    // at RET and rejects paths outside this bounded window before any call.
+    code.resize(128);
+    return ReadMemory(address, code.data(), code.size() * sizeof(code[0]));
+}
+
+static bool ResolveDataModelTaskContext(
+    void* model, const DataModelLayout& layout, const mach_header_64* header, std::uintptr_t submit,
+    void*& context, std::string& error)
+{
     error = "macOS DataModel queue context has no verified structural locator; use the plugin path";
-    return false;
+    std::vector<std::uint32_t> code;
+    if (!ImageCode(header, submit, code)) return false;
+    // The host locates this EngineContext submitter at a Mach-O function start.
+    // Decode its receiver field and virtual slot; neither is an object offset
+    // guessed from a nearby allocation or a particular Studio release.
+    if ((code[19] & 0xffc003ff) != 0xf94002a0 || code[23] != 0xf9400008 ||
+        (code[24] & 0xffc003ff) != 0xf9400108 || code[25] != 0xaa1403e1 ||
+        code[26] != 0xaa1303e2 || code[27] != 0xd63f0100) return false;
+    const auto managerOffset = ((code[19] >> 10) & 4095) * 8;
+    const auto dispatchSlot = ((code[24] >> 10) & 4095) * 8;
+    const auto outer = reinterpret_cast<std::uintptr_t>(model);
+    const auto instance = outer + layout.instanceOffset;
+    std::uintptr_t owner = 0, instanceTable = 0, outerTable = 0, instanceType = 0, outerType = 0;
+    std::intptr_t top = 0;
+    if (!CompleteObject(outer, "N3RBX9DataModelE") || !ReadValue(instance + 16, owner) ||
+        !ReadValue(instance, instanceTable) || !ReadValue(outer, outerTable) ||
+        !ReadValue(instanceTable - 16, top) || top != -static_cast<std::intptr_t>(layout.instanceOffset) ||
+        !ReadValue(instanceTable - 8, instanceType) || !ReadValue(outerTable - 8, outerType) || instanceType != outerType) return false;
+    // The already-validated children member bounds a readable Instance prefix.
+    // A candidate must be a complete EngineContext, whose actual queue method
+    // dereferences this exact DataModel and its same shared owner.
+    const auto found = renium_task_context::ContextForModel(instance, outer, owner, layout.childrenOffset,
+        managerOffset, dispatchSlot,
+        [](std::uintptr_t at, std::uintptr_t& value) { return ReadValue(at, value); }, CompleteObject,
+        [header](std::uintptr_t at, std::vector<std::uint32_t>& words) { return ImageCode(header, at, words); });
+    if (!found) return false;
+    context = reinterpret_cast<void*>(*found);
+    error.clear();
+    return true;
 }
 
 static const mach_header_64* MainStudioImage(std::intptr_t& slide)
@@ -1153,6 +1225,9 @@ struct PropertyPermit
 struct PropertyModelContext;
 #include "renium_studio_functions.h"
 
+#include "renium_property_task.h"
+using PropertyDeadlineExceeded = renium_property_task::DeadlineExceeded;
+
 struct PropertyCallTask
 {
     // Released last, after both the waiter and every queued callback dispose
@@ -1168,6 +1243,7 @@ struct PropertyCallTask
     std::mutex mutex;
     std::condition_variable completed;
     bool done = false;
+    bool deadlineExceeded = false;
     std::string error;
     std::vector<unsigned char> output;
 };
@@ -1178,6 +1254,7 @@ struct PropertyCallTask
 struct PropertyModelContext
 {
     std::uintptr_t model, instance;
+    std::size_t childrenOffset = 0;
     void* owner = nullptr;
     void* context;
     std::string title;
@@ -1212,22 +1289,26 @@ static std::shared_ptr<void> RetainModelOwner(void* owner, const std::shared_ptr
                     std::memory_order_acq_rel, std::memory_order_acquire))
                 return; // Do not access the owner after dropping our reference.
         // Keep the last strong reference AND permit until UI-thread disposal.
-        dispatch_async_f(dispatch_get_main_queue(), receipt.release(), [](void* raw) {
+        ReniumStudioUiTask(receipt.release(), [](void* raw) {
             const auto release = std::unique_ptr<ModelOwnerRelease>(static_cast<ModelOwnerRelease*>(raw));
             ReleaseOwner(release->owner);
         });
     });
 }
 
-static void FinishPropertyError(const std::shared_ptr<PropertyCallTask>& task, const char* error)
+static void FinishPropertyError(const std::shared_ptr<PropertyCallTask>& task, const char* error,
+    bool deadlineExceeded = false)
 {
-    { std::lock_guard lock(task->mutex); task->error = error; task->done = true; }
+    { std::lock_guard lock(task->mutex); task->error = error; task->deadlineExceeded = deadlineExceeded; task->done = true; }
     task->completed.notify_all();
 }
 
 static void CapturePropertyIdentities(const std::shared_ptr<PropertyCallTask>& task,
     std::vector<unsigned char>& output)
 {
+    const auto timing = task->timing;
+    const bool detailed = timing && timing->detailed;
+    if (timing) timing->captureBegin = timing->now();
     const auto& p = task->params;
     std::uint64_t fields[8]{};
     if (p.inputSize < sizeof(fields))
@@ -1263,8 +1344,10 @@ static void CapturePropertyIdentities(const std::shared_ptr<PropertyCallTask>& t
     const auto initialSize = output.size();
     while (!pending.empty())
     {
-        if (seen.size() % 256 == 0 && std::chrono::steady_clock::now() >= task->deadline)
-            throw std::runtime_error("Native identity capture exceeded its deadline");
+        if (seen.size() % 256 == 0) {
+            if (timing) timing->identityRows = seen.size();
+            renium_property_task::CheckDeadline(task->deadline, "Native identity capture exceeded its deadline");
+        }
         const auto entry = pending.back();
         pending.pop_back();
         const auto instance = reinterpret_cast<std::uintptr_t>(entry.value.instance);
@@ -1281,9 +1364,15 @@ static void CapturePropertyIdentities(const std::shared_ptr<PropertyCallTask>& t
             throw std::runtime_error("Native identity graph ownership changed");
         // This task holds the DataModel on its write queue; these non-yielding
         // inherited getters cannot release the live hierarchy or run Lua.
+        const auto getterBegin = detailed ? timing->now() : 0;
         const auto identity = reinterpret_cast<PropertyIdentity (*)(void*, void*)>(p.identityGetter)(
             reinterpret_cast<void*>(p.identityBinding), entry.value.instance);
+        const auto debugBegin = detailed ? timing->now() : 0;
         const auto debug = reinterpret_cast<std::string (*)(void*, int)>(function)(entry.value.instance, 32);
+        if (detailed) {
+            timing->identityUs.fetch_add(debugBegin - getterBegin, std::memory_order_relaxed);
+            timing->debugUs.fetch_add(timing->now() - debugBegin, std::memory_order_relaxed);
+        }
         if (debug.empty() || debug.size() >= 48 || debug.find('\0') != std::string::npos)
             throw std::runtime_error("Native debug identity is invalid");
         const auto offset = output.size();
@@ -1306,6 +1395,10 @@ static void CapturePropertyIdentities(const std::shared_ptr<PropertyCallTask>& t
     }
     if (output.size() == initialSize)
         throw std::runtime_error("Native identity capture is empty");
+    if (timing) {
+        timing->identityRows = seen.size();
+        timing->captureEnd = timing->now();
+    }
 }
 
 static void ExecutePropertyCall(const std::shared_ptr<PropertyCallTask>& task)
@@ -1313,11 +1406,11 @@ static void ExecutePropertyCall(const std::shared_ptr<PropertyCallTask>& task)
     if (task->timing) task->timing->runBegin = task->timing->now();
     std::vector<unsigned char> output;
     std::string error;
+    bool deadlineExceeded = false;
     try
     {
         const auto& p = task->params;
-        if (std::chrono::steady_clock::now() >= task->deadline)
-            throw std::runtime_error("Protected property call expired before execution");
+        renium_property_task::CheckDeadline(task->deadline, "Protected property call expired before execution");
         const auto model = task->modelContext;
         const auto modelOwner = model ? RetainModelOwner(model->owner, task->permit) : std::shared_ptr<void>{};
         if (!modelOwner)
@@ -1439,11 +1532,13 @@ static void ExecutePropertyCall(const std::shared_ptr<PropertyCallTask>& task)
         }
         }
     }
+    catch (const PropertyDeadlineExceeded& exception) { error = exception.what(); deadlineExceeded = true; }
     catch (const std::exception& exception) { error = exception.what(); }
     catch (...) { error = "Studio raised an unknown protected-property exception"; }
     {
         std::lock_guard lock(task->mutex);
         task->error = std::move(error);
+        task->deadlineExceeded = deadlineExceeded;
         task->output = std::move(output);
         task->done = true;
         if (task->timing) task->timing->runEnd = task->timing->now();
@@ -1453,12 +1548,10 @@ static void ExecutePropertyCall(const std::shared_ptr<PropertyCallTask>& task)
 
 static void SubmitPropertyCall(void* context, std::uintptr_t submit, const std::shared_ptr<PropertyCallTask>& task)
 {
-    if (std::chrono::steady_clock::now() >= task->deadline)
-        throw std::runtime_error("Protected property expired before submission");
-    std::function<void()> callback{[task]() { ExecutePropertyCall(task); }};
-    if (task->timing) task->timing->submit = task->timing->now();
-    if (!reinterpret_cast<bool (*)(void*, std::function<void()>*, std::uint32_t)>(submit)(context, &callback, 1))
-        throw std::runtime_error("Studio rejected the protected-property task");
+    renium_property_task::Dispatch(task, ExecutePropertyCall, [&](renium_tagged::Callback* callback) {
+        if (task->timing) task->timing->submit = task->timing->now();
+        return reinterpret_cast<bool (*)(void*, renium_tagged::Callback*, std::uint32_t)>(submit)(context, callback, 1);
+    });
 }
 
 static bool RunPropertyCall(const std::string& payload, const std::string& title,
@@ -1492,7 +1585,7 @@ static bool RunPropertyCall(const std::string& payload, const std::string& title
     const auto& p = task->params;
     if (p.operation > 9 || p.inputSize > sizeof(p.input) || p.ancestorCount < 2 || p.ancestorCount > 65 ||
         (p.operation == 7 ? task->extraInput.empty() : !task->extraInput.empty()) ||
-        p.timeoutMs < 1 || p.timeoutMs > (p.operation == 9 ? 30000 : 3000) || p.ancestors[0] != p.instance)
+        p.timeoutMs < 1 || p.ancestors[0] != p.instance)
         throw std::runtime_error("Invalid protected-property request");
     task->deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(p.timeoutMs);
     struct Submission
@@ -1517,7 +1610,15 @@ static bool RunPropertyCall(const std::string& payload, const std::string& title
     {
         if (timing) timing->modelCache = 1;
         task->modelContext = cached;
-        try { SubmitPropertyCall(cached->context, submit, task); }
+        try {
+            void* context = nullptr;
+            std::string problem;
+            const DataModelLayout layout{static_cast<std::size_t>(cached->instance - cached->model), cached->childrenOffset};
+            if (!ResolveDataModelTaskContext(reinterpret_cast<void*>(cached->model), layout, header, submit, context, problem) ||
+                context != cached->context) throw std::runtime_error(problem.empty() ? "DataModel queue context changed" : problem);
+            SubmitPropertyCall(context, submit, task);
+        }
+        catch (const PropertyDeadlineExceeded& exception) { FinishPropertyError(task, exception.what(), true); }
         catch (const std::exception& exception) { FinishPropertyError(task, exception.what()); }
         catch (...) { FinishPropertyError(task, "Studio raised an unknown property submission exception"); }
     }
@@ -1531,7 +1632,7 @@ static bool RunPropertyCall(const std::string& payload, const std::string& title
     // Cold lookup retains on the UI thread, where place closure is serialized.
     // The queued DataModel callback does NOT own Submission/modelOwner: a
     // timed-out or closing DataModel must not be kept alive by its own queue.
-    dispatch_async_f(dispatch_get_main_queue(), new std::shared_ptr<Submission>(submission), [](void* raw) {
+    ReniumStudioUiTask(new std::shared_ptr<Submission>(submission), [](void* raw) {
         const auto boxed = std::unique_ptr<std::shared_ptr<Submission>>(static_cast<std::shared_ptr<Submission>*>(raw));
         const auto state = *boxed;
         const auto current = state->task;
@@ -1539,7 +1640,7 @@ static bool RunPropertyCall(const std::string& payload, const std::string& title
         try
         {
             if (std::chrono::steady_clock::now() >= current->deadline)
-                throw std::runtime_error("Protected property expired before submission");
+                throw PropertyDeadlineExceeded("Protected property expired before submission");
             void* model = nullptr;
             void* context = nullptr;
             std::string problem;
@@ -1558,6 +1659,7 @@ static bool RunPropertyCall(const std::string& payload, const std::string& title
             auto next = std::make_shared<PropertyModelContext>();
             next->model = params.model;
             next->instance = params.ancestors[params.ancestorCount - 1];
+            next->childrenOffset = layout.childrenOffset;
             next->context = context;
             next->title = state->title;
             reinterpret_cast<std::atomic<std::int64_t>*>(owner + 16)->fetch_add(1, std::memory_order_relaxed);
@@ -1566,6 +1668,10 @@ static bool RunPropertyCall(const std::string& payload, const std::string& title
             { std::lock_guard lock(PropertyModelMutex); CachedPropertyModel = std::move(next); }
             if (current->timing) current->timing->uiEnd = current->timing->now();
             SubmitPropertyCall(context, state->submit, current);
+        }
+        catch (const PropertyDeadlineExceeded& exception)
+        {
+            FinishPropertyError(current, exception.what(), true);
         }
         catch (const std::exception& exception)
         {
@@ -1576,10 +1682,9 @@ static bool RunPropertyCall(const std::string& payload, const std::string& title
     }
     std::unique_lock taskLock(task->mutex);
     if (!task->completed.wait_until(taskLock, task->deadline, [&]() { return task->done; }))
-    {
-        error = "Protected property task timed out; inspect the value before repeating a write";
-        return false;
-    }
+        throw PropertyDeadlineExceeded("Protected property task timed out; inspect the value before repeating a write");
+    if (task->deadlineExceeded)
+        throw PropertyDeadlineExceeded(task->error);
     error = task->error;
     output = std::move(task->output);
     if (error.empty() && p.operation == 9) {
@@ -1769,6 +1874,11 @@ static void RespondToClient(int client, const Request& request, const std::strin
             response = request.command == 1
                 ? Serialize(request, path, title)
                 : PackageAction(request, path, title);
+    }
+    catch (const PropertyDeadlineExceeded& exception)
+    {
+        response.status = PropertyDeadlineStatus;
+        SetError(response, exception.what());
     }
     catch (const std::exception& exception)
     {

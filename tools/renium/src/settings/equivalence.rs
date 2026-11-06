@@ -2314,6 +2314,10 @@ pub(crate) fn reconciliation_maps_equal_with_ids(
                     Some(left_ids),
                     Some(right_ids),
                 ) => {}
+            Some(other)
+                if studio_recomputed_values_match(class_name, name, value, other)
+                    || studio_rewritten_values_match(class_name, name, value, other)
+                    || cframes_match_when_rederived(value, other) => {}
             None if reconciliation_property_value_is_default(class_name, name, value) => {}
             _ => return false,
         }
@@ -2339,7 +2343,240 @@ pub(crate) fn hull_fidelity_code(value: &Value) -> Option<u8> {
     if version == 0 && bytes.ends_with(b"BLOCK") {
         return Some(2);
     }
-    (version >= 8 && bytes.len() >= 12).then(|| bytes[10])
+    // Studio 0.745 still cooks version 7 hulls for places saved by older
+    // builds; the fidelity byte sits where versions 8 and up keep it.
+    (version >= 7 && bytes.len() >= 12).then(|| bytes[10])
+}
+
+/// Values Studio issues itself and rewrites on every save or load: the
+/// packed texture asset of a SurfaceAppearance (a new `rbxassetid://` each
+/// time it repacks) and a union's triangle count (recounted when its mesh
+/// loads). Two issued values are one authored state; an empty pack is not.
+fn studio_recomputed_values_match(
+    class_name: &str,
+    name: &str,
+    left: &Value,
+    right: &Value,
+) -> bool {
+    match (class_name, name) {
+        ("SurfaceAppearance", "TexturePack") => [left, right].iter().all(|value| {
+            value
+                .as_str()
+                .is_some_and(|text| text.starts_with("rbxassetid://") && text.len() > 13)
+        }),
+        ("UnionOperation" | "NegateOperation" | "IntersectOperation", "TriangleCount") => {
+            left.is_number() && right.is_number()
+        }
+        _ => false,
+    }
+}
+
+/// Values Studio rewrites while loading a place, so that the saved form and
+/// Studio's are one value: no edit can be told apart from the rewrite.
+fn studio_rewritten_values_match(
+    class_name: &str,
+    name: &str,
+    left: &Value,
+    right: &Value,
+) -> bool {
+    match (class_name, name) {
+        // Studio states the clock within one day: a saved "-10:35:20" loads
+        // as 13:24:40.
+        ("Lighting", "TimeOfDay") => match (
+            left.as_str().and_then(time_of_day_seconds),
+            right.as_str().and_then(time_of_day_seconds),
+        ) {
+            (Some(left), Some(right)) => left == right,
+            _ => false,
+        },
+        ("AnimationRigData", _) => rig_tables_match(left, right),
+        ("HumanoidDescription", "EmotesDataInternal" | "EquippedEmotesDataInternal") => {
+            emote_tables_equal(left, right)
+        }
+        ("HumanoidDescription", name) if name.ends_with("Accessory") => {
+            accessory_lists_match(left, right)
+        }
+        _ => false,
+    }
+}
+
+/// The seconds past midnight a `TimeOfDay` text states: hours, minutes and
+/// seconds separated by colons, a leading minus counting back from midnight,
+/// and any overflow wrapping around the day as Studio wraps it.
+pub(crate) fn time_of_day_seconds(text: &str) -> Option<f64> {
+    let text = text.trim();
+    let (negative, body) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let mut parts = body.split(':').map(|part| part.trim().parse::<f64>().ok());
+    let hours = parts.next()??;
+    let minutes = parts.next().unwrap_or(Some(0.0))?;
+    let seconds = parts.next().unwrap_or(Some(0.0))?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let total = hours * 3600.0 + minutes * 60.0 + seconds;
+    let total = if negative { -total } else { total };
+    total.is_finite().then(|| total.rem_euclid(86_400.0))
+}
+
+/// A `TimeOfDay` text as Studio keeps it: `HH:MM:SS` within one day.
+pub(crate) fn canonical_time_of_day(text: &str) -> Option<String> {
+    let seconds = time_of_day_seconds(text)?.round() as i64 % 86_400;
+    Some(format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3600,
+        seconds % 3600 / 60,
+        seconds % 60
+    ))
+}
+
+/// Studio regenerates every AnimationRigData table when it loads a rig (the
+/// version word that leads each one and the transforms it recomputes), and no
+/// plugin API writes one, so two tables are the engine's single value.
+fn rig_tables_match(left: &Value, right: &Value) -> bool {
+    [left, right]
+        .iter()
+        .all(|value| value.get("_type").and_then(Value::as_str) == Some("BinaryString"))
+}
+
+/// A HumanoidDescription's accessory lists name the same asset ids in
+/// whichever order Studio last wrote them.
+fn accessory_lists_match(left: &Value, right: &Value) -> bool {
+    match (accessory_ids(left), accessory_ids(right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn accessory_ids(value: &Value) -> Option<Vec<&str>> {
+    let mut ids = value
+        .as_str()?
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    Some(ids)
+}
+
+/// A HumanoidDescription's emote tables name the same entries in whichever
+/// order Studio last wrote them.
+fn emote_tables_equal(left: &Value, right: &Value) -> bool {
+    match (emote_entries(left), emote_entries(right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn emote_entries(value: &Value) -> Option<Vec<&str>> {
+    let mut entries = value
+        .as_str()?
+        .split('\\')
+        .filter(|entry| !entry.is_empty())
+        .collect::<Vec<_>>();
+    entries.sort_unstable();
+    Some(entries)
+}
+
+/// Studio keeps a saved rotation's first two axes and re-derives the third
+/// from them, so a matrix saved with a mirrored or skewed third axis loads as
+/// the matrix those two axes span. A matrix whose third axis already is that
+/// one is compared as saved, so an edit of a few millionths still counts.
+fn cframes_match_when_rederived(left: &Value, right: &Value) -> bool {
+    let components = |value: &Value| -> Option<[f64; 12]> {
+        if value.get("_type").and_then(Value::as_str) != Some("CFrame") {
+            return None;
+        }
+        let values = value.get("components")?.as_array()?;
+        if values.len() != 12 {
+            return None;
+        }
+        let mut out = [0.0; 12];
+        for (slot, value) in out.iter_mut().zip(values) {
+            *slot = value.as_f64().filter(|value| value.is_finite())?;
+        }
+        Some(out)
+    };
+    let (Some(left), Some(right)) = (components(left), components(right)) else {
+        return false;
+    };
+    let (Some(left_rotation), Some(right_rotation)) =
+        (rederived_rotation(&left), rederived_rotation(&right))
+    else {
+        return false;
+    };
+    (third_axis_rewritten(&left, &left_rotation) || third_axis_rewritten(&right, &right_rotation))
+        && left[..3]
+            .iter()
+            .zip(&right[..3])
+            .all(|(a, b)| (a - b).abs() <= CFRAME_POSITION_NOISE)
+        && left_rotation
+            .iter()
+            .zip(&right_rotation)
+            .all(|(a, b)| (a - b).abs() <= CFRAME_ROTATION_NOISE)
+}
+
+/// Whether a saved matrix's third axis is far from the one its first two
+/// axes span: a mirrored axis is two units away, float drift and small edits
+/// stay within millionths.
+fn third_axis_rewritten(components: &[f64; 12], rederived: &[f64; 9]) -> bool {
+    const REWRITTEN_AXIS_DISTANCE: f64 = 1e-3;
+    [5, 8, 11].iter().zip([2, 5, 8]).any(|(saved, derived)| {
+        (components[*saved] - rederived[derived]).abs() > REWRITTEN_AXIS_DISTANCE
+    })
+}
+
+/// The rotation Studio builds from a saved matrix: the first axis
+/// normalized, the second made perpendicular to it, the third their cross
+/// product; row-major like the saved components.
+fn rederived_rotation(components: &[f64; 12]) -> Option<[f64; 9]> {
+    let column = |index: usize| {
+        [
+            components[3 + index],
+            components[6 + index],
+            components[9 + index],
+        ]
+    };
+    let normalize = |v: [f64; 3]| -> Option<[f64; 3]> {
+        let length = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        (length > 1e-9).then(|| [v[0] / length, v[1] / length, v[2] / length])
+    };
+    let x = normalize(column(0))?;
+    let up = column(1);
+    let along = x[0] * up[0] + x[1] * up[1] + x[2] * up[2];
+    let y = normalize([
+        up[0] - x[0] * along,
+        up[1] - x[1] * along,
+        up[2] - x[2] * along,
+    ])?;
+    let z = [
+        x[1] * y[2] - x[2] * y[1],
+        x[2] * y[0] - x[0] * y[2],
+        x[0] * y[1] - x[1] * y[0],
+    ];
+    Some([x[0], y[0], z[0], x[1], y[1], z[1], x[2], y[2], z[2]])
+}
+
+/// A font value, typed or spelled by its fields alone as stores keep it.
+fn is_font_value(value: &Map<String, Value>) -> bool {
+    match value.get("_type").and_then(Value::as_str) {
+        Some(type_name) => type_name == "Font",
+        None => {
+            value.len() <= 4
+                && ["family", "weight", "style"]
+                    .iter()
+                    .all(|field| value.get(*field).is_some_and(Value::is_string))
+        }
+    }
+}
+
+/// The fields of a font value that are the font: Studio's cached face file
+/// is its own lookup and changes from one build to the next.
+fn authored_font_fields(font: &Map<String, Value>) -> impl Iterator<Item = (&String, &Value)> {
+    font.iter()
+        .filter(|(name, _)| !matches!(name.as_str(), "cachedFaceId" | "_type"))
 }
 
 /// Hulls that say the same thing: both encode one fidelity, or one is the
@@ -2349,7 +2586,34 @@ fn hulls_match(name: &str, left: &Value, right: &Value) -> bool {
     name == crate::rbx::encode::COLLISION_HULL_PROPERTY
         && (hull_is_placeholder(left)
             || hull_is_placeholder(right)
-            || hull_fidelity_code(left).is_some_and(|code| Some(code) == hull_fidelity_code(right)))
+            || match (hull_fidelity(left), hull_fidelity(right)) {
+                (Some(left), Some(right)) => left == right,
+                // A hull in a format whose fidelity cannot be read (version 6
+                // from older saves) is still the engine's cook of the same
+                // mesh; nothing authored can differ between two of them.
+                _ => is_cooked_hull(left) && is_cooked_hull(right),
+            })
+}
+
+/// The fidelity a hull record states: a `CollisionHullFidelity` marker the
+/// first comparison stands in for a readable hull, or the hull's own byte.
+fn hull_fidelity(value: &Value) -> Option<u8> {
+    if value.get("_type").and_then(Value::as_str) == Some("CollisionHullFidelity") {
+        return value
+            .get("code")
+            .and_then(Value::as_u64)
+            .and_then(|code| u8::try_from(code).ok());
+    }
+    hull_fidelity_code(value)
+}
+
+fn is_cooked_hull(value: &Value) -> bool {
+    value.get("_type").and_then(Value::as_str) == Some("CollisionHullFidelity")
+        || value
+            .get("base64")
+            .and_then(Value::as_str)
+            .and_then(|text| base64::decode(text).ok())
+            .is_some_and(|bytes| bytes.starts_with(b"CSGPHS") && bytes.len() >= 10)
 }
 
 /// The engine reports a solid operation's fidelity as Box while its mesh is
@@ -2423,7 +2687,7 @@ fn tags_equal(left: &Value, right: &Value) -> bool {
 /// `http://www.roblox.com/asset/?id=N`, `https://...`); Studio hands back the
 /// long form for a short one it was given. Only a whole reference in one of
 /// those exact forms is rewritten; anything else compares as written.
-fn canonical_asset_text(text: &str) -> std::borrow::Cow<'_, str> {
+pub(crate) fn canonical_asset_text(text: &str) -> std::borrow::Cow<'_, str> {
     static FORMS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let forms = FORMS.get_or_init(|| {
         regex::Regex::new(
@@ -2445,7 +2709,7 @@ fn canonical_asset_text(text: &str) -> std::borrow::Cow<'_, str> {
 
 /// Properties whose string value names an asset, by reflection type or by
 /// the names Studio uses for the Content mirrors the database may not know.
-fn is_asset_reference_property(class_name: &str, name: &str) -> bool {
+pub(crate) fn is_asset_reference_property(class_name: &str, name: &str) -> bool {
     if let Ok(database) = rbx_reflection_database::get()
         && let Some(descriptor) =
             crate::rbx::encode::rbx_property_descriptor(database, class_name, name)
@@ -2701,6 +2965,20 @@ fn reconciliation_values_equal_with_ids(
                     _ => false,
                 };
                 return enum_types_match && (values_match || names_match);
+            }
+            if is_font_value(left) && is_font_value(right) {
+                return authored_font_fields(left).count() == authored_font_fields(right).count()
+                    && authored_font_fields(left).all(|(name, value)| {
+                        right.get(name).is_some_and(|other| {
+                            reconciliation_values_equal_with_ids(
+                                value,
+                                other,
+                                approximate,
+                                left_ids,
+                                right_ids,
+                            )
+                        })
+                    });
             }
             let approximate = approximate || type_name.is_some_and(reconciliation_value_uses_f32);
             left.len() == right.len()
@@ -2976,6 +3254,21 @@ pub(crate) fn reconciliation_property_is_unreadable(
 // filled in by Studio, and NotScriptable properties cannot be captured. Service
 // settings without a plugin API arrive only through a native capture, so they
 // compare when both records carry them and say nothing when one lacks them.
+/// Fields a Studio capture or a file may leave out without saying anything
+/// about them: Studio fills the Lighting fields in when a place saved before
+/// they existed loads, never captures Workspace's pivot, and reports a gui's
+/// InputSinkEnabled only on some builds. A push never resets them, and a
+/// missing capture value cannot verify them; explicit captured values still
+/// must match. The first pairing does not compare them one-sided.
+pub(crate) fn capture_may_omit(class_name: &str, name: &str) -> bool {
+    name == "InputSinkEnabled"
+        || matches!(
+            (class_name, name),
+            ("Lighting", "LightingStyle" | "PrioritizeLightingQuality")
+                | ("Workspace", "WorldPivot")
+        )
+}
+
 pub(crate) fn reconciliation_property_is_unknown_when_absent(
     database: Option<&rbx_reflection::ReflectionDatabase<'_>>,
     class_name: &str,
@@ -2995,6 +3288,8 @@ pub(crate) fn reconciliation_property_is_unknown_when_absent(
         name,
         "CollisionFidelity" | "ClockTime" | "MeshSize" | "PhysicalConfigData"
     )
+        || capture_may_omit(class_name, name)
+        || studio_recomputed_value_is_absent_elsewhere(class_name, name)
         // A native capture of Studio 744 carries no InputSink although the
         // saved place does, and reports ResetOnSpawn false for a gui that
         // lives in the world while the saved place carries nothing; neither
@@ -3090,20 +3385,41 @@ pub(crate) fn reconciliation_property_values_equal(
         (Some(left), Some(right)) if solid_fidelities_match(class_name, name, left, right) => true,
         (Some(left), Some(right)) if hulls_match(name, left, right) => true,
         (Some(left), Some(right))
+            if studio_recomputed_values_match(class_name, name, left, right)
+                || studio_rewritten_values_match(class_name, name, left, right) =>
+        {
+            true
+        }
+        (Some(left), Some(right))
             if is_asset_reference_property(class_name, name) && asset_texts_equal(left, right) =>
         {
             true
         }
-        (Some(left), Some(right)) => reconciliation_values_equal(
-            left,
-            right,
-            reconciliation_property_uses_f32(class_name, name, left, right),
-        ),
+        (Some(left), Some(right)) => {
+            reconciliation_values_equal(
+                left,
+                right,
+                reconciliation_property_uses_f32(class_name, name, left, right),
+            ) || cframes_match_when_rederived(left, right)
+        }
         (Some(value), None) | (None, Some(value)) => {
-            reconciliation_property_value_is_default(class_name, name, value)
+            studio_recomputed_value_is_absent_elsewhere(class_name, name)
+                || reconciliation_property_value_is_default(class_name, name, value)
         }
         (None, None) => true,
     }
+}
+
+/// A value Studio counts for itself and the files never carry (a union's
+/// triangle count): its presence on one side only is not a difference.
+fn studio_recomputed_value_is_absent_elsewhere(class_name: &str, name: &str) -> bool {
+    matches!(
+        (class_name, name),
+        (
+            "UnionOperation" | "NegateOperation" | "IntersectOperation",
+            "TriangleCount"
+        )
+    )
 }
 
 /// A saved field the files carry with a value the open place does not have
@@ -5619,6 +5935,288 @@ mod never_serialized_properties {
         assert!(equal(&cooked, &placeholder));
         assert!(equal(&cooked_hull, &other_cook));
         assert!(!equal(&cooked, &cooked_hull));
+    }
+
+    #[test]
+    fn a_version_seven_hull_reads_its_fidelity_like_later_versions() {
+        let hull = |version: u32, code: u8| {
+            let mut bytes = b"CSGPHS".to_vec();
+            bytes.extend_from_slice(&version.to_le_bytes());
+            bytes.push(code);
+            bytes.extend_from_slice(b"cooked data");
+            serde_json::json!({"_type": "SharedString", "base64": base64::encode(&bytes)})
+        };
+        assert_eq!(hull_fidelity_code(&hull(7, 2)), Some(2));
+        assert_eq!(hull_fidelity_code(&hull(8, 3)), Some(3));
+        assert_eq!(hull_fidelity_code(&hull(6, 2)), None);
+        assert!(reconciliation_property_values_equal(
+            "MeshPart",
+            "PhysicalConfigData",
+            Some(&hull(8, 2)),
+            Some(&hull(7, 2)),
+        ));
+        assert!(!reconciliation_property_values_equal(
+            "MeshPart",
+            "PhysicalConfigData",
+            Some(&hull(8, 2)),
+            Some(&hull(7, 3)),
+        ));
+    }
+
+    #[test]
+    fn values_studio_rewrites_while_loading_a_place_are_one_value() {
+        let equal = |class: &str, name: &str, left: serde_json::Value, right: serde_json::Value| {
+            reconciliation_property_values_equal(class, name, Some(&left), Some(&right))
+        };
+        let time = |text: &str| serde_json::json!(text);
+        assert!(equal(
+            "Lighting",
+            "TimeOfDay",
+            time("-10:35:20"),
+            time("13:24:40")
+        ));
+        assert!(equal(
+            "Lighting",
+            "TimeOfDay",
+            time("25:00"),
+            time("01:00:00")
+        ));
+        assert!(!equal(
+            "Lighting",
+            "TimeOfDay",
+            time("13:24:41"),
+            time("13:24:40")
+        ));
+        assert_eq!(
+            canonical_time_of_day("-10:35:20").as_deref(),
+            Some("13:24:40")
+        );
+        assert_eq!(
+            canonical_time_of_day("14:00:00").as_deref(),
+            Some("14:00:00")
+        );
+        assert_eq!(canonical_time_of_day("noon"), None);
+
+        let table = |base64: &str| serde_json::json!({"_type": "BinaryString", "base64": base64});
+        assert!(equal(
+            "AnimationRigData",
+            "transform",
+            table("AQAAABUAAAAAAAAAAgAAAAsAAAA="),
+            table("AgAAABUAAAAAAAAAAgAAAAwAAAA=")
+        ));
+        assert!(!equal(
+            "AnimationRigData",
+            "label",
+            table("AQAAABUAAAAAAAAAAgAAAAsAAAA="),
+            serde_json::json!("AgAAABUAAAAAAAAAAgAAAAwAAAA=")
+        ));
+        assert!(!equal(
+            "KeyframeSequence",
+            "GuidBinaryString",
+            table("AQAAABUAAAAAAAAAAgAAAAsAAAA="),
+            table("AgAAABUAAAAAAAAAAgAAAAwAAAA=")
+        ));
+
+        assert!(equal(
+            "HumanoidDescription",
+            "FrontAccessory",
+            serde_json::json!("10550727846,13600579295,14215737975"),
+            serde_json::json!("14215737975,13600579295,10550727846")
+        ));
+        assert!(!equal(
+            "HumanoidDescription",
+            "FrontAccessory",
+            serde_json::json!("10550727846,13600579295"),
+            serde_json::json!("14215737975,13600579295,10550727846")
+        ));
+
+        assert!(equal(
+            "HumanoidDescription",
+            "EmotesDataInternal",
+            serde_json::json!("Shrug^3576968026^\\Hello^3576686446^\\"),
+            serde_json::json!("Hello^3576686446^\\Shrug^3576968026^\\")
+        ));
+        assert!(!equal(
+            "HumanoidDescription",
+            "EquippedEmotesDataInternal",
+            serde_json::json!("1^Hello\\2^Stadium\\"),
+            serde_json::json!("1^Hello\\2^Shrug\\")
+        ));
+
+        let font = |face: &str, weight: &str| {
+            serde_json::json!({
+                "_type": "Font",
+                "family": "rbxasset://fonts/families/LegacyArial.json",
+                "weight": weight,
+                "style": "Normal",
+                "cachedFaceId": face,
+            })
+        };
+        assert!(equal(
+            "TextBox",
+            "FontFace",
+            font("rbxasset://fonts/arial.ttf", "Regular"),
+            font("rbxasset://fonts/Arimo-Regular.ttf", "Regular")
+        ));
+        assert!(!equal(
+            "TextBox",
+            "FontFace",
+            font("rbxasset://fonts/arial.ttf", "Regular"),
+            font("rbxasset://fonts/arial.ttf", "Bold")
+        ));
+        assert!(
+            reconciliation_property_values_equal(
+                "TextBox",
+                "FontFace",
+                Some(&font("rbxasset://fonts/arial.ttf", "Regular")),
+                None
+            ),
+            "the legacy face file of the default family is the default font"
+        );
+        let untyped = serde_json::json!({
+            "family": "rbxasset://fonts/families/GothamSSm.json",
+            "weight": "Medium",
+            "style": "Normal",
+            "cachedFaceId": "rbxasset://fonts/GothamSSm-Medium.otf",
+        });
+        let mut files = Map::new();
+        files.insert("FontFace".to_string(), untyped);
+        assert!(
+            reconciliation_maps_equal("BubbleChatConfiguration", &files, &Map::new()),
+            "a store spells a font by its fields; the default's cached face differs"
+        );
+        let mut studio = Map::new();
+        studio.insert(
+            "C0".to_string(),
+            serde_json::json!({"_type": "CFrame", "components": [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]}),
+        );
+        let mut saved = Map::new();
+        saved.insert(
+            "C0".to_string(),
+            serde_json::json!({"_type": "CFrame", "components": [0.0, 0.0, 0.0, 0.9999996423721313, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -0.9999996423721313]}),
+        );
+        assert!(
+            reconciliation_maps_equal("Weld", &saved, &studio),
+            "the first pairing and the reconciled-state check accept the re-derived axis"
+        );
+
+        let cframe = |rotation: [f64; 9]| {
+            let mut components = vec![
+                0.2833123803138733,
+                9.715829219203442e-05,
+                0.0003780018596444279,
+            ];
+            components.extend(rotation);
+            serde_json::json!({"_type": "CFrame", "components": components})
+        };
+        let identity = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        assert!(equal(
+            "Weld",
+            "C0",
+            cframe([
+                0.9999996423721313,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                -0.9999996423721313
+            ]),
+            cframe(identity)
+        ));
+        assert!(!equal(
+            "Weld",
+            "C0",
+            cframe([0.0, 0.0, 1.0, 0.0, 1.0, 0.0, -1.0, 0.0, 0.0]),
+            cframe(identity)
+        ));
+        assert!(
+            !equal(
+                "Weld",
+                "C0",
+                cframe([1.00001, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]),
+                cframe(identity)
+            ),
+            "a saved rotation Studio keeps is compared as saved"
+        );
+    }
+
+    #[test]
+    fn studio_issued_texture_packs_and_triangle_counts_are_one_value() {
+        let equal = |class: &str, name: &str, left: serde_json::Value, right: serde_json::Value| {
+            let property_equal =
+                reconciliation_property_values_equal(class, name, Some(&left), Some(&right));
+            let left = Map::from_iter([(name.to_string(), left)]);
+            let right = Map::from_iter([(name.to_string(), right)]);
+            assert_eq!(
+                reconciliation_maps_equal(class, &left, &right),
+                property_equal
+            );
+            assert_eq!(
+                reconciliation_maps_equal(class, &right, &left),
+                property_equal
+            );
+            property_equal
+        };
+        assert!(equal(
+            "SurfaceAppearance",
+            "TexturePack",
+            serde_json::json!("rbxassetid://78214130152845"),
+            serde_json::json!("rbxassetid://85495674897887")
+        ));
+        assert!(!equal(
+            "SurfaceAppearance",
+            "TexturePack",
+            serde_json::json!("rbxassetid://1"),
+            serde_json::json!("")
+        ));
+        assert!(!equal(
+            "Decal",
+            "TexturePack",
+            serde_json::json!("rbxassetid://1"),
+            serde_json::json!("rbxassetid://2")
+        ));
+        assert!(equal(
+            "UnionOperation",
+            "TriangleCount",
+            serde_json::json!(120),
+            serde_json::json!(124)
+        ));
+        assert!(!equal(
+            "MeshPart",
+            "TriangleCount",
+            serde_json::json!(120),
+            serde_json::json!(124)
+        ));
+    }
+
+    #[test]
+    fn an_unreadable_hull_format_matches_a_readable_hull_of_the_same_mesh() {
+        let hull = |version: u32, rest: &[u8]| {
+            let mut bytes = b"CSGPHS".to_vec();
+            bytes.extend_from_slice(&version.to_le_bytes());
+            bytes.extend_from_slice(rest);
+            serde_json::json!({"_type": "SharedString", "base64": base64::encode(&bytes)})
+        };
+        let marker = serde_json::json!({"_type": "CollisionHullFidelity", "code": 2});
+        let equal = |left: &Value, right: &Value| {
+            reconciliation_property_values_equal(
+                "MeshPart",
+                "PhysicalConfigData",
+                Some(left),
+                Some(right),
+            )
+        };
+        assert!(equal(&hull(6, b"@B old cook"), &hull(8, b" new cook")));
+        assert!(equal(&marker, &hull(6, b"@B old cook")));
+        assert!(equal(&marker, &hull(7, b" cook")));
+        assert!(!equal(&marker, &hull(7, b" cook")));
+        assert!(!equal(
+            &hull(6, b" old"),
+            &serde_json::json!({"_type": "SharedString", "base64": base64::encode(b"not a hull")})
+        ));
     }
 
     #[test]

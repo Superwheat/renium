@@ -2424,9 +2424,11 @@ fn a_request_without_a_studio_queues_on_the_process_wide_gate() {
     assert_eq!(bound.ok, 1, "{}", serde_json::to_string(&bound).unwrap());
     let context = bound.r.unwrap()["id"].as_u64().unwrap();
     let gate = bridge.acquire_request_gate();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
     thread::scope(|scope| {
         let queued = scope.spawn(|| {
-            let started = Instant::now();
+            ready_tx.send(()).unwrap();
             let response = automation_parse_response_with_lease(
                 &signed_fixture_request(
                     &state,
@@ -2440,14 +2442,18 @@ fn a_request_without_a_studio_queues_on_the_process_wide_gate() {
                 0.1,
                 None,
             );
-            (started.elapsed(), response)
+            done_tx.send(()).unwrap();
+            response
         });
-        thread::sleep(Duration::from_millis(600));
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let while_held = done_rx.recv_timeout(Duration::from_millis(600));
+        // Release before asserting so a failure can still join the worker.
         drop(gate);
-        let (elapsed, response) = queued.join().unwrap();
-        assert!(
-            elapsed >= Duration::from_millis(600),
-            "the request ran after {elapsed:?} while the gate was held"
+        let response = queued.join().unwrap();
+        assert_eq!(
+            while_held,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "the request completed while the process-wide gate was held"
         );
         assert_eq!(response.ok, 0);
     });

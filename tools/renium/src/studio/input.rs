@@ -256,11 +256,6 @@ pub fn frontmost_studio_pid() -> Option<u32> {
     platform::frontmost_studio_pid()
 }
 
-#[cfg(any(windows, target_os = "macos"))]
-pub fn studio_process_ids() -> Vec<u32> {
-    platform::studio_process_ids()
-}
-
 #[cfg(windows)]
 pub fn post_mouse_move(window: &StudioWindow, x: i32, y: i32) -> Result<()> {
     platform::post_mouse_move(&window.handle, x, y)
@@ -595,32 +590,6 @@ mod platform {
                     .is_some_and(|name| name.eq_ignore_ascii_case("RobloxStudioBeta.exe"))
             })
             .then_some(pid)
-    }
-
-    struct EnumStudioState {
-        pids: Vec<u32>,
-    }
-
-    unsafe extern "system" fn enum_studio_proc(hwnd: HWND, lparam: LPARAM) -> i32 {
-        let state = unsafe { &mut *(lparam as *mut EnumStudioState) };
-        if unsafe { IsWindowVisible(hwnd) } != 0
-            && let Some(pid) = studio_window_pid(hwnd)
-            && !state.pids.contains(&pid)
-        {
-            state.pids.push(pid);
-        }
-        1
-    }
-
-    pub fn studio_process_ids() -> Vec<u32> {
-        let mut state = EnumStudioState { pids: Vec::new() };
-        unsafe {
-            EnumWindows(
-                Some(enum_studio_proc),
-                &mut state as *mut EnumStudioState as LPARAM,
-            );
-        }
-        state.pids
     }
 
     fn startup_notice_window(hwnd: HWND) -> Option<(String, bool)> {
@@ -3083,18 +3052,6 @@ mod platform {
                     None
                 }
             })
-    }
-
-    pub fn studio_process_ids() -> Vec<u32> {
-        let mut pids = studio_window_records(false)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|record| record.pid > 0 && is_studio_owner(&record.owner))
-            .filter_map(|record| u32::try_from(record.pid).ok())
-            .collect::<Vec<_>>();
-        pids.sort_unstable();
-        pids.dedup();
-        pids
     }
 
     pub fn window_for_pid(pid: u32, viewport: Option<(i32, i32)>) -> Result<StudioWindow> {

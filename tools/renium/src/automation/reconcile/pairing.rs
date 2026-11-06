@@ -610,6 +610,92 @@ pub(crate) struct FirstPairingAlignment {
     pub(crate) studio_before: Option<SettingsBytecode>,
 }
 
+/// Studio 0.746 replaces an accessory's `AccessoryWeld` with an
+/// `AccessoryRigidConstraint` (and no-collision constraints) while it loads
+/// a place. A weld the files still hold under a handle where Studio holds the
+/// constraint and no weld is that migration, not an edit, so the first
+/// pairing does not put it back; a pull then writes Studio's constraints.
+pub(crate) fn drop_joints_studio_migrated(
+    editor: &mut SettingsBytecode,
+    studio: &SettingsBytecode,
+) {
+    const WELD: &str = "AccessoryWeld";
+    const CONSTRAINT: &str = "AccessoryRigidConstraint";
+    fn sibling_counts(document: &SettingsBytecode) -> HashMap<(Option<usize>, &str), usize> {
+        let mut counts = HashMap::new();
+        for instance in &document.instances {
+            *counts
+                .entry((instance.parent_index, instance.name.as_str()))
+                .or_default() += 1;
+        }
+        counts
+    }
+    fn name_path(
+        document: &SettingsBytecode,
+        mut index: usize,
+        counts: &HashMap<(Option<usize>, &str), usize>,
+    ) -> Option<Vec<String>> {
+        let mut path = Vec::new();
+        for _ in 0..document.instances.len() {
+            let instance = &document.instances[index];
+            // A constraint under a same-named accessory cannot prove which
+            // saved handle migrated. Leave ambiguity to ordinary pairing.
+            if counts.get(&(instance.parent_index, instance.name.as_str())) != Some(&1) {
+                return None;
+            }
+            path.push(instance.name.clone());
+            match instance.parent_index {
+                Some(parent) => index = parent,
+                None => break,
+            }
+        }
+        path.reverse();
+        Some(path)
+    }
+    // Per handle: whether Studio holds the constraint, and whether it still
+    // holds a weld.
+    let mut handles = HashMap::<Vec<String>, (bool, bool)>::new();
+    let studio_counts = sibling_counts(studio);
+    for instance in &studio.instances {
+        let Some(parent) = instance.parent_index else {
+            continue;
+        };
+        let (constraint, weld) = match (instance.class_name.as_str(), instance.name.as_str()) {
+            ("RigidConstraint", CONSTRAINT) => (true, false),
+            ("Weld", WELD) => (false, true),
+            _ => continue,
+        };
+        let Some(path) = name_path(studio, parent, &studio_counts) else {
+            continue;
+        };
+        let entry = handles.entry(path).or_default();
+        entry.0 |= constraint;
+        entry.1 |= weld;
+    }
+    if handles.is_empty() {
+        return;
+    }
+    let editor_counts = sibling_counts(editor);
+    let migrated = editor
+        .instances
+        .iter()
+        .enumerate()
+        .filter(|(_, instance)| {
+            instance.class_name == "Weld"
+                && instance.name == WELD
+                && instance.parent_index.is_some_and(|parent| {
+                    name_path(editor, parent, &editor_counts)
+                        .is_some_and(|path| handles.get(&path) == Some(&(true, false)))
+                })
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if migrated.is_empty() {
+        return;
+    }
+    let _ = crate::settings::instance::remove_instances_at_indices(editor, &migrated, true);
+}
+
 pub(crate) fn align_first_pairing(
     path: &Path,
     editor: &mut SettingsBytecode,
@@ -618,6 +704,7 @@ pub(crate) fn align_first_pairing(
     conflicts: &mut Vec<String>,
 ) -> FirstPairingAlignment {
     let mut alignment = FirstPairingAlignment::default();
+    drop_joints_studio_migrated(editor, studio);
     align_settings_ids_to_reference(editor, studio);
     let mut structural_interner = PathInterner::new();
     let editor_keys = structural_path_ids(editor, &mut structural_interner);

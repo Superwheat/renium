@@ -1,6 +1,7 @@
 //! macOS reflection discovery lives in the Rust host. The in-process helper
 //! performs bounded memory copies and owns only the engine's C++ ABI calls.
 use super::super::TaskContextUnavailable;
+use super::super::macos_deadline;
 use super::*;
 use crate::system::LockRecover;
 use std::collections::HashSet;
@@ -67,19 +68,27 @@ pub(super) fn probe_image_value(pid: u32, title: &str, rva: u64) -> Result<u8> {
     Ok(memory.read(memory.base + rva, 1)?[0])
 }
 
-fn probe_task_context() -> Result<()> {
-    Err(TaskContextUnavailable.into())
+fn probe_descriptor(pid: u32, title: &str, timeout: Duration) -> Result<serde_json::Value> {
+    let operation = NativeOperation::DescriptorBinding;
+    let result = probe_operation(pid, title, operation, timeout);
+    super::super::probes::record(pid, operation, &result);
+    result
 }
 
 pub(super) fn probe_operation(
     pid: u32,
     title: &str,
     operation: super::super::probes::NativeOperation,
+    timeout: Duration,
 ) -> Result<serde_json::Value> {
     use super::super::probes::NativeOperation;
     // Reflection addresses alone do not prove the helper's task-queue ABI.
-    // Keep this check independent from discover_property to avoid probe recursion.
-    probe_task_context()?;
+    // Validate the retained context without scheduling an empty engine task;
+    // each actual operation revalidates it before submitting its own callback.
+    let deadline = Instant::now() + timeout;
+    macos_deadline::prepare_context(pid, timeout, |budget| {
+        prepare_task_context(pid, title, budget)
+    })?;
     let path = match operation {
         NativeOperation::History | NativeOperation::VoxelHistory => {
             vec!["ChangeHistoryService".into()]
@@ -96,7 +105,7 @@ pub(super) fn probe_operation(
         &path,
         &[],
         "Name",
-        Duration::from_secs(10),
+        macos_deadline::remaining(deadline, Instant::now())?,
         None,
         None,
     )?;
@@ -125,7 +134,7 @@ pub(super) fn probe_operation(
                 &path,
                 &[],
                 "AcquisitionMethod",
-                Duration::from_secs(10),
+                macos_deadline::remaining(deadline, Instant::now())?,
                 None,
                 None,
             )?;
@@ -957,20 +966,20 @@ impl Memory {
     }
     fn request(&self, operation: u32, payload: &[u8], title: &str) -> Result<Vec<u8>> {
         let started = Instant::now();
-        let remaining = self
-            .deadline
-            .checked_duration_since(Instant::now())
+        let remaining = macos_deadline::remaining(self.deadline, started)
             .context("Protected property discovery exceeded its deadline")?;
         let mut stream = UnixStream::connect(format!("/tmp/renium-studio-{}.sock", self.pid))
             .context(
                 "Studio needs the matching Renium helper; restart the selected Studio window",
             )?;
+        // Establish the timeout while connected, before the helper can answer
+        // and close. Later refreshes may fail while response bytes remain.
         stream.set_read_timeout(Some(remaining))?;
         stream.set_write_timeout(Some(remaining))?;
         let mut request = Vec::with_capacity(56 + payload.len() + title.len());
         for value in [
             REQUEST_MAGIC,
-            if operation >= 7 {
+            if operation >= 7 || matches!(operation, 2 | 4) {
                 PLAYTEST_REQUEST_VERSION
             } else {
                 REQUEST_VERSION
@@ -995,18 +1004,27 @@ impl Memory {
         request.extend_from_slice(&self.trace.image_uuid);
         request.extend_from_slice(payload);
         request.extend_from_slice(title.as_bytes());
-        stream.write_all(&request)?;
+        stream.write_all(&request).map_err(|error| {
+            macos_deadline::io_error_until(error, self.deadline, Instant::now())
+        })?;
+        let stage = match (operation, read_u32(payload, 132)) {
+            (4, _) => "context preparation",
+            (2, Some(4)) => "identity capture task 4",
+            (2, _) => "property task",
+            _ => "discovery",
+        };
         let mut response = [0; RESPONSE_SIZE];
-        stream.read_exact(&mut response).with_context(|| {
+        self.read_response(&mut stream, &mut response).with_context(|| {
             let recovery = if operation == 2 && matches!(read_u32(payload, 132), Some(2 | 5)) {
                 "; a requested write may still finish, so read the property before retrying"
             } else {
                 ""
             };
             format!(
-                "Studio reflection operation {operation} (PID {}, {} ms remaining) did not return a response before the connection ended or timed out{recovery}",
+                "Studio reflection operation {operation} ({stage}, PID {}, {} ms elapsed, {} ms remaining) did not return a response before the connection ended or timed out{recovery}",
                 self.pid,
-                remaining.as_millis(),
+                started.elapsed().as_millis(),
+                self.deadline.saturating_duration_since(Instant::now()).as_millis(),
             )
         })?;
         if matches!(operation, 0 | 2 | 4) {
@@ -1027,13 +1045,27 @@ impl Memory {
                 ),
             );
         }
-        if read_u32(&response, 0) != Some(REQUEST_MAGIC) || read_u32(&response, 4) != Some(0) {
+        anyhow::ensure!(
+            read_u32(&response, 0) == Some(REQUEST_MAGIC),
+            "Invalid reflection response magic"
+        );
+        if read_u32(&response, 4) != Some(0) {
             let error = &response[24..];
             let end = error.iter().position(|b| *b == 0).unwrap_or(error.len());
-            bail!(
-                "Studio reflection transport: {}",
-                native_helper_error(&String::from_utf8_lossy(&error[..end]))
-            );
+            if matches!(operation, 2 | 4)
+                && error[..end].starts_with(
+                    b"macOS DataModel queue context has no verified structural locator;",
+                )
+            {
+                return Err(TaskContextUnavailable.into());
+            }
+            return Err(macos_deadline::task_error(
+                read_u32(&response, 4).unwrap(),
+                format!(
+                    "Studio reflection transport: {}",
+                    native_helper_error(&String::from_utf8_lossy(&error[..end]))
+                ),
+            ));
         }
         let limit = if operation == 2 && read_u32(payload, 132) == Some(4) {
             64 * 1024 * 1024
@@ -1044,10 +1076,18 @@ impl Memory {
             .filter(|length| *length <= limit)
             .context("Invalid reflection response length")? as usize;
         let mut data = vec![0; length];
-        stream
-            .read_exact(&mut data)
+        self.read_response(&mut stream, &mut data)
             .context("Studio reflection response was interrupted")?;
         Ok(data)
+    }
+
+    fn read_response(&self, stream: &mut UnixStream, buffer: &mut [u8]) -> Result<()> {
+        macos_deadline::read_exact_until(buffer, self.deadline, Instant::now, |buffer, timeout| {
+            macos_deadline::read_after_timeout_refresh(
+                stream.set_read_timeout(Some(timeout)),
+                || stream.read(buffer),
+            )
+        })
     }
 
     fn read(&self, address: u64, size: usize) -> Result<Vec<u8>> {
@@ -1351,7 +1391,7 @@ impl NativeProperty {
     /// Discovery, fencing and history registration spend the budget set at
     /// preparation; the engine calls that follow get their own.
     pub(crate) fn restart_deadline(&mut self, timeout: Duration) {
-        self.memory.deadline = Instant::now() + timeout.min(Duration::from_secs(30));
+        self.memory.deadline = Instant::now() + timeout;
     }
 
     pub(crate) fn call_function(&mut self, timeout: Duration) -> Result<String> {
@@ -1368,9 +1408,7 @@ impl NativeProperty {
         Ok(())
     }
     pub(crate) fn remaining(&self) -> Result<Duration> {
-        self.memory
-            .deadline
-            .checked_duration_since(Instant::now())
+        macos_deadline::remaining(self.memory.deadline, Instant::now())
             .context("Protected property operation exceeded its deadline")
     }
     fn invoke(&mut self, operation: u32) -> Result<Vec<u8>> {
@@ -1382,10 +1420,7 @@ impl NativeProperty {
                 self.memory.pid, self.class_name, self.property, self.title,
             ),
         );
-        let timeout = self
-            .remaining()?
-            .as_millis()
-            .clamp(1, if operation == 9 { 30000 } else { 3000 }) as u32;
+        let timeout = macos_deadline::task_timeout_ms(self.remaining()?);
         put32(&mut self.parameters, 132, operation);
         put32(&mut self.parameters, 140, timeout);
         let output = self
@@ -1423,26 +1458,33 @@ impl NativeProperty {
         anyhow::ensure!(text.len() <= 65536, "Property value exceeds 64 KiB");
         put32(&mut self.parameters, 136, text.len() as u32);
         self.parameters[680..680 + text.len()].copy_from_slice(text.as_bytes());
-        let mut actual = String::from_utf8(self.invoke(2)?[16..].to_vec())?;
-        let mut pause = 0;
-        while !crate::automation::property_access::property_text_matches(
-            &self.class_name,
-            &self.property,
+        self.invoke(2)?;
+        let deadline = self.memory.deadline;
+        let class = self.class_name.clone();
+        let property = self.property.clone();
+        let result = super::super::macos_write::verify_readback(
+            &class,
+            &property,
             text,
-            &actual,
-        ) {
-            if self.remaining()? <= Duration::from_millis(pause) {
-                bail!(
-                    "Studio accepted the write but readback did not complete; inspect its value before retrying because it may still finish"
-                );
-            }
-            if pause != 0 {
-                std::thread::sleep(Duration::from_millis(pause));
-            }
-            actual = self.read()?;
-            pause = (pause * 2).clamp(1, 8);
+            || self.read(),
+            |pause| {
+                if macos_deadline::remaining(deadline, Instant::now())? <= pause {
+                    return Err(macos_deadline::DeadlineExceeded.into());
+                }
+                if !pause.is_zero() {
+                    std::thread::sleep(pause);
+                }
+                Ok(())
+            },
+        );
+        if let Err(error) = &result {
+            super::super::probes::record(
+                self.memory.pid,
+                NativeOperation::DescriptorBinding,
+                &Err(anyhow::anyhow!("{error:#}")),
+            );
         }
-        Ok(actual)
+        result
     }
 }
 
@@ -1587,19 +1629,18 @@ fn identity_function(
 }
 
 pub(crate) fn prepare_context(pid: u32, title: &str) -> Result<()> {
-    super::super::probes::run(
-        pid,
-        title,
-        super::super::probes::NativeOperation::DescriptorBinding,
-    )?;
-    let memory = Memory::for_process(pid, Duration::from_secs(2))?;
+    probe_descriptor(pid, title, Duration::from_secs(10)).map(|_| ())
+}
+
+fn prepare_task_context(pid: u32, title: &str, timeout: Duration) -> Result<()> {
+    let memory = Memory::for_process(pid, timeout)?;
     let context = memory.request(0, &[0], title)?;
     anyhow::ensure!(context.len() == 64, "Unsupported Studio reflection context");
     let mut request = Vec::with_capacity(20);
     request.extend_from_slice(&context[56..64]);
     request.extend_from_slice(&context[8..16]);
-    let remaining = memory.deadline.saturating_duration_since(Instant::now());
-    request.extend_from_slice(&(remaining.as_millis().clamp(1, 3000) as u32).to_le_bytes());
+    let remaining = macos_deadline::remaining(memory.deadline, Instant::now())?;
+    request.extend_from_slice(&macos_deadline::task_timeout_ms(remaining).to_le_bytes());
     let response = memory.request(4, &request, title)?;
     anyhow::ensure!(
         response.is_empty(),
@@ -1657,13 +1698,17 @@ fn prepare(
     read_class: Option<&str>,
     context: Option<&[u8]>,
 ) -> Result<(NativeProperty, String)> {
-    super::super::probes::run(
+    let deadline = Instant::now() + timeout;
+    probe_descriptor(pid, title, timeout)?;
+    let mut prepared = discover_property(
         pid,
         title,
-        super::super::probes::NativeOperation::DescriptorBinding,
-    )?;
-    let mut prepared = discover_property(
-        pid, title, segments, ordinals, property, timeout, read_class, context,
+        segments,
+        ordinals,
+        property,
+        macos_deadline::remaining(deadline, Instant::now())?,
+        read_class,
+        context,
     )?;
     let response = prepared.invoke(if read_class.is_some() { 3 } else { 0 })?;
     let identity = response

@@ -702,8 +702,8 @@ mod heavy_delta_tests {
             .properties
             .insert("RenderFidelity".into(), precise);
         assert_eq!(delta_weight(&current, &previous).native_writes, 63);
-        // A changed texture pack on an existing surface is one native write; a
-        // capture without the field says nothing about it.
+        // Studio can reissue a texture pack without an edit; neither two
+        // issued IDs nor a capture without the field requires a write.
         let mut current = document(70, "SurfaceAppearance");
         let mut previous = document(70, "SurfaceAppearance");
         for instance in current.instances.iter_mut().skip(1) {
@@ -718,8 +718,8 @@ mod heavy_delta_tests {
                 .insert("TexturePack".into(), serde_json::json!("rbxassetid://2"));
         }
         let weight = delta_weight(&current, &previous);
-        assert_eq!(weight.native_writes, 70);
-        // A replacement would write the same 70 packs afterwards, so it buys nothing.
+        assert_eq!(weight.native_writes, 0);
+        // A replacement would still have to write all 70 packs afterwards.
         assert_eq!(weight.replacement_writes, 70);
         assert!(!weight.heavy());
         // The same asset in another spelling is no write.

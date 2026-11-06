@@ -487,12 +487,27 @@ pub(crate) fn expected_map_mismatch(
             return None;
         }
         let actual = verification_value(actual, name, properties);
+        if properties
+            && actual.is_none()
+            && crate::settings::equivalence::capture_may_omit(class_name, name)
+        {
+            return None;
+        }
         if properties && saved_field_without_plugin_api(class_name, name) {
             return None;
         }
         (!verification_values_equal(properties, class_name, name, Some(value), actual))
             .then(|| retention_mismatch(name, Some(value), actual))
     })
+}
+
+fn is_blank_scalar(value: &Value) -> bool {
+    match value {
+        Value::Bool(value) => !value,
+        Value::Number(value) => value.as_f64() == Some(0.0),
+        Value::String(value) => value.is_empty(),
+        _ => false,
+    }
 }
 
 pub(crate) fn retention_mismatch(
@@ -534,6 +549,12 @@ pub(crate) fn changed_map_mismatch(
             return None;
         }
         let actual = verification_value(observed, name, properties);
+        if properties
+            && actual.is_none()
+            && crate::settings::equivalence::capture_may_omit(class_name, name)
+        {
+            return None;
+        }
         if properties && saved_field_without_plugin_api(class_name, name) {
             return None;
         }
@@ -541,6 +562,33 @@ pub(crate) fn changed_map_mismatch(
             && expected.is_none()
             && rbx_reflection_database::get().is_ok_and(|database| {
                 crate::editor::review::is_engine_managed_editor_property(class_name, name, database)
+            })
+        {
+            return None;
+        }
+        // A record that leaves the field out says nothing about it: the files
+        // never state a field that does not serialize (HumanoidDescription's
+        // HeadColor), and a capture may omit a fidelity at its default.
+        if properties
+            && expected.is_none()
+            && crate::settings::equivalence::reconciliation_property_is_unknown_when_absent(
+                rbx_reflection_database::get().ok(),
+                class_name,
+                name,
+            )
+        {
+            return None;
+        }
+        // A field the reflection database does not know yet (a Sound's
+        // IsMutedForCapture on Studio 0.746) is enumerated by no capture, so
+        // when neither capture carried it and the files hold its blank value
+        // there is nothing to compare.
+        if properties
+            && previous.is_none()
+            && actual.is_none()
+            && expected.is_some_and(is_blank_scalar)
+            && rbx_reflection_database::get().is_ok_and(|database| {
+                crate::rbx::encode::rbx_property_descriptor(database, class_name, name).is_none()
             })
         {
             return None;

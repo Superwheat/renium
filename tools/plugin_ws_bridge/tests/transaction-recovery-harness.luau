@@ -132,7 +132,7 @@ local function harness(mutate, trackJournalOwnership, enumOverride)
 			defer = function(callback) table.insert(h.delayed, { at = h.now, run = callback }) end,
 		},
 	}
-	local modules = { RbxDom = {} }
+	local modules = { RbxDom = { findCanonicalPropertyDescriptor = function() return nil end } }
 	local function loadModule(name)
 		if modules[name] then return modules[name] end
 		local source = fs.readFile("tools/plugin_ws_bridge/" .. name .. ".module.luau"):gsub("\r\n", "\n")

@@ -1054,12 +1054,14 @@ fn open_studio(
     if let Some(target_file) = target.file.as_deref() {
         let target_file =
             fs::canonicalize(target_file).unwrap_or_else(|_| target_file.to_path_buf());
-        if let Some((pid, file)) = input_inject::studio_process_ids()
-            .into_iter()
-            .filter_map(|pid| local_place_path_for_pid(pid).map(|file| (pid, file)))
-            .find(|(_, file)| {
-                fs::canonicalize(file).unwrap_or_else(|_| file.clone()) == target_file
-            })
+        // Only Edit windows have a place open: the server and clients of an
+        // orphaned test show the same file and must not pass for it.
+        if let Some((pid, file)) = crate::studio::automation::test_processes::edit_window_pids(
+            &crate::studio::automation::test_processes::studio_process_table(),
+        )
+        .into_iter()
+        .filter_map(|pid| local_place_path_for_pid(pid).map(|file| (pid, file)))
+        .find(|(_, file)| fs::canonicalize(file).unwrap_or_else(|_| file.clone()) == target_file)
         {
             let mut result = json!({
                 "ok": true,
@@ -1080,8 +1082,36 @@ fn open_studio(
     if let Some(result) = state.recent_studio_launch(context, &target) {
         return Ok(result);
     }
-    let result =
+    // Studio on macOS opens a window launched beside a running test server as
+    // a client of that test, so the place's orphaned test windows go first.
+    #[cfg(target_os = "macos")]
+    let closed_orphans = target
+        .file
+        .as_deref()
+        .map(|file| {
+            let closed = crate::studio::automation::kill_orphans_result(
+                bridge,
+                Some(&file.to_string_lossy()),
+            )["closed"]
+                .as_array()
+                .map(|closed| {
+                    closed
+                        .iter()
+                        .filter_map(|pid| pid.as_u64().and_then(|pid| u32::try_from(pid).ok()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            workflows::wait_for_studio_processes_to_exit(&closed);
+            closed
+        })
+        .unwrap_or_default();
+    #[allow(unused_mut)]
+    let mut result =
         workflows::launch_exact_studio(target.file.as_deref(), target.game_id, target.place_id)?;
+    #[cfg(target_os = "macos")]
+    if !closed_orphans.is_empty() {
+        result["closedOrphans"] = json!(closed_orphans);
+    }
     state.remember_studio_launch(context, target, result.clone());
     Ok(result)
 }

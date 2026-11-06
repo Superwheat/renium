@@ -275,8 +275,12 @@ mod tests {
 
     #[test]
     fn installed_studio_resolves_two_restore_selection_branches() {
-        let path = Path::new("/Applications/RobloxStudio.app/Contents/MacOS/RobloxStudio");
-        let Ok(bytes) = fs::read(path) else {
+        // The newest installed bundle, and its engine rather than Renium's
+        // launcher stub once the native helper is installed.
+        let Ok(studio) = source_studio_path() else {
+            return;
+        };
+        let Ok(bytes) = fs::read(studio_engine_executable(&studio)) else {
             return;
         };
         let image = MachImage::parse(&bytes).unwrap();

@@ -439,10 +439,17 @@ pub(crate) fn process_start_identity(pid: u32) -> Option<String> {
         if !output.status.success() {
             return None;
         }
-        let value = String::from_utf8(output.stdout).ok()?;
-        let value = value.trim();
-        (!value.is_empty()).then(|| value.to_string())
+        normalized_start_identity(&String::from_utf8(output.stdout).ok()?)
     }
+}
+
+/// `ps -o lstart=` pads single-digit days with a second space ("Nov  6");
+/// the installer scripts collapse that spacing when they record their own
+/// identity, so the comparison uses the collapsed form on both sides.
+#[cfg_attr(not(all(unix, not(target_os = "linux"))), allow(dead_code))]
+fn normalized_start_identity(text: &str) -> Option<String> {
+    let value = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!value.is_empty()).then_some(value)
 }
 
 pub(crate) fn acquire_lifecycle_lock() -> Result<LifecycleLock> {
@@ -3324,6 +3331,29 @@ mod result_tests {
             .expect("cmd spawns");
         child.wait().expect("cmd exits");
         assert_eq!(process_start_identity(child.id()), None);
+    }
+
+    #[test]
+    fn start_identities_collapse_the_padding_ps_adds_to_single_digit_days() {
+        assert_eq!(
+            normalized_start_identity(
+                "Fri Nov  6 21:03:25 2026
+"
+            )
+            .as_deref(),
+            Some("Fri Nov 6 21:03:25 2026")
+        );
+        assert_eq!(
+            normalized_start_identity("Wed Nov 12 09:00:00 2026").as_deref(),
+            Some("Wed Nov 12 09:00:00 2026")
+        );
+        assert_eq!(
+            normalized_start_identity(
+                " 
+"
+            ),
+            None
+        );
     }
 
     #[test]

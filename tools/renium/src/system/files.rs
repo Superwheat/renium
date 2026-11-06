@@ -374,7 +374,7 @@ fn publish_sibling_temp_with_permissions(
     if was_readonly {
         set_path_readonly(path, false)?;
     }
-    let renamed = fs::rename(temp_path, path);
+    let renamed = rename_with_retries(temp_path, path);
     if was_readonly {
         let _ = set_path_readonly(path, true);
     }
@@ -383,6 +383,66 @@ fn publish_sibling_temp_with_permissions(
         return Err(error).with_context(|| format!("Failed to write {}", path.display()));
     }
     Ok(())
+}
+
+/// Windows refuses to replace a file another process holds open for a
+/// moment (an antivirus scan of the file just written, a reader that has not
+/// closed yet) with "Access is denied"; the replacement is retried briefly.
+fn rename_with_retries(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut attempt = 0;
+    loop {
+        match fs::rename(from, to) {
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied && attempt < 20 => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod replacement_tests {
+    use super::*;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn atomic_replacement_waits_for_a_sharing_lock_and_keeps_readonly() {
+        let root = crate::tests::support::temp_dir("replacement-sharing-lock");
+        let path = root.join("store");
+        fs::write(&path, b"old").unwrap();
+        set_path_readonly(&path, true).unwrap();
+        let _cleanup = OnDrop::new(|| {
+            let _ = set_path_readonly(&path, false);
+            let _ = fs::remove_dir_all(&root);
+        });
+        // Allow readers, but deny delete/replace until this handle closes.
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&path)
+            .unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                ready_tx.send(()).unwrap();
+                done_tx.send(write_bytes_if_changed(&path, b"new")).unwrap();
+            });
+            ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let while_held = done_rx.recv_timeout(Duration::from_millis(150));
+            drop(held);
+            assert!(matches!(while_held, Err(mpsc::RecvTimeoutError::Timeout)));
+            done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+        });
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        assert!(fs::metadata(&path).unwrap().permissions().readonly());
+    }
 }
 
 pub(crate) fn sibling_temp_path(path: &Path) -> PathBuf {

@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::io::{BufReader, Cursor};
+use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -96,17 +95,15 @@ pub(crate) fn import_place_file(mut args: ImportPlaceArgs) -> Result<()> {
 }
 
 fn read_place(path: &Path, services: &[String]) -> Result<FlatDom> {
-    let format = RbxPlaceFormat::from_path(path)?;
+    let raw = std::fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    // The content decides the format, as it does for Studio: an XML place
+    // saved under an .rbxl name imports like any other.
+    let format = RbxPlaceFormat::sniff(&raw).unwrap_or(RbxPlaceFormat::from_path(path)?);
     let (bytes, xml_hulls) = match format {
-        RbxPlaceFormat::Binary => (
-            std::fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?,
-            None,
-        ),
+        RbxPlaceFormat::Binary => (raw, None),
         RbxPlaceFormat::Xml => {
-            let file =
-                File::open(path).with_context(|| format!("Failed to read {}", path.display()))?;
             let dom = rbx_xml::from_reader(
-                BufReader::new(file),
+                Cursor::new(&raw),
                 rbx_xml::DecodeOptions::new()
                     .property_behavior(rbx_xml::DecodePropertyBehavior::ReadUnknown),
             )
@@ -232,15 +229,40 @@ fn service_subtrees(flat: &FlatDom) -> HashMap<String, Vec<usize>> {
 }
 
 fn clock_time_from_time_of_day(text: &str) -> Option<f64> {
-    let mut parts = text.split(':').map(|part| part.trim().parse::<f64>().ok());
-    let hours = parts.next()??;
-    let minutes = parts.next().flatten().unwrap_or(0.0);
-    let seconds = parts.next().flatten().unwrap_or(0.0);
-    if parts.next().is_some() {
-        return None;
+    crate::settings::equivalence::time_of_day_seconds(text)
+        .map(|seconds| f64::from((seconds / 3600.0) as f32))
+}
+
+fn normalize_lighting_clock(
+    native_properties: &mut [NativeSettingsProperty],
+    properties: &mut serde_json::Map<String, Value>,
+) {
+    // Scalar strings normally take the compact native path; JSON values are
+    // only the fallback. Normalize whichever representation carries the clock.
+    let text = native_properties
+        .iter_mut()
+        .find_map(|property| match (&*property.name, &mut property.value) {
+            ("TimeOfDay", NativeSettingsValue::String(text)) => Some(text),
+            _ => None,
+        })
+        .or_else(|| match properties.get_mut("TimeOfDay") {
+            Some(Value::String(text)) => Some(text),
+            _ => None,
+        });
+    let Some(text) = text else { return };
+    let Some(canonical) = crate::settings::equivalence::canonical_time_of_day(text) else {
+        return;
+    };
+    *text = canonical;
+    let clock_time = clock_time_from_time_of_day(text);
+    if !properties.contains_key("ClockTime")
+        && !native_properties
+            .iter()
+            .any(|property| property.name == "ClockTime")
+        && let Some(clock_time) = clock_time
+    {
+        properties.insert("ClockTime".to_string(), json!(clock_time));
     }
-    let clock = (hours + minutes / 60.0 + seconds / 3600.0) as f32;
-    clock.is_finite().then_some(f64::from(clock))
 }
 
 fn empty_service_parts(service: &str) -> ExportedSnapshotParts {
@@ -334,25 +356,24 @@ fn convert_service(
         if let Some(source) = source {
             properties.insert("Source".to_string(), Value::String(source));
         }
-        properties.retain(|name, _| {
+        properties.retain(|name, value| {
             name == "Capabilities"
                 || is_engine_data_property(database, class_name, name)
+                || is_binary_engine_value(value)
                 || !crate::editor::review::is_engine_managed_editor_property(
                     class_name, name, database,
                 )
         });
         if local == 0 {
+            // A saved root field the native writer handles (Lighting's
+            // PrioritizeLightingQuality, Workspace's physics settings) stays
+            // whether or not the reflection database knows it as saved.
             properties.retain(|name, _| {
-                !crate::rbx::decode::is_unsaved_service_property(database, class_name, name)
+                crate::editor::native_roots::is_property(class_name, name)
+                    || !crate::rbx::decode::is_unsaved_service_property(database, class_name, name)
             });
-            if class_name == "Lighting"
-                && !properties.contains_key("ClockTime")
-                && let Some(clock_time) = properties
-                    .get("TimeOfDay")
-                    .and_then(Value::as_str)
-                    .and_then(clock_time_from_time_of_day)
-            {
-                properties.insert("ClockTime".to_string(), json!(clock_time));
+            if class_name == "Lighting" {
+                normalize_lighting_clock(&mut native_properties, &mut properties);
             }
             native_properties.retain(|property| {
                 !crate::rbx::decode::is_unsaved_service_property(
@@ -394,6 +415,17 @@ fn convert_service(
 /// hulls, union meshes, trees and holders, aero meshes, terrain material
 /// tables) and the asset a part came from are part of the place even though
 /// Roblox hides them.
+/// A binary or shared string the reflection database does not describe
+/// (the `AnimationRigData` tables, `KeyframeSequence.GuidBinaryString`) is
+/// engine data the place needs back; it carries no editable meaning but a
+/// place built without it loses what the engine stored.
+fn is_binary_engine_value(value: &Value) -> bool {
+    matches!(
+        value.get("_type").and_then(Value::as_str),
+        Some("BinaryString" | "SharedString")
+    )
+}
+
 fn is_engine_data_property(
     database: &ReflectionDatabase<'_>,
     class_name: &str,
@@ -404,13 +436,18 @@ fn is_engine_data_property(
             .is_some_and(|descriptor| {
                 matches!(
                     descriptor.data_type,
-                    RbxDataType::Value(RbxVariantType::SharedString | RbxVariantType::NetAssetRef)
+                    RbxDataType::Value(
+                        RbxVariantType::SharedString
+                            | RbxVariantType::NetAssetRef
+                            | RbxVariantType::BinaryString
+                    )
                 )
             })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
     use std::path::PathBuf;
 
     use rbx_dom_weak::{InstanceBuilder, WeakDom};
@@ -433,6 +470,134 @@ mod tests {
     }
 
     #[test]
+    fn binary_and_misnamed_xml_imports_rebuild_binary_rig_data_and_saved_lighting() {
+        use rbx_dom_weak::types::{BinaryString, SharedString, Variant};
+        let binary = BinaryString::from(vec![0, 255, 1, 128, 0, 7]);
+        let shared = SharedString::new(vec![255, 0, 128, 3]);
+        for xml in [false, true] {
+            let root = crate::tests::support::temp_dir("import-engine-data");
+            let _cleanup = crate::system::files::OnDrop::new(|| {
+                let _ = std::fs::remove_dir_all(&root);
+            });
+            let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+            let workspace = dom.insert(dom.root_ref(), InstanceBuilder::new("Workspace"));
+            dom.insert(
+                workspace,
+                InstanceBuilder::new("KeyframeSequence")
+                    .with_property("GuidBinaryString", binary.clone()),
+            );
+            dom.insert(
+                workspace,
+                InstanceBuilder::new("AnimationRigData")
+                    .with_property("name", binary.clone())
+                    .with_property("parent", binary.clone())
+                    .with_property("rootMotion", binary.clone())
+                    .with_property("FutureSharedTable", shared.clone()),
+            );
+            dom.insert(
+                dom.root_ref(),
+                InstanceBuilder::new("Lighting")
+                    .with_property("TimeOfDay", "-10:35:20")
+                    .with_property("PrioritizeLightingQuality", true),
+            );
+            let mut bytes = Vec::new();
+            if xml {
+                rbx_xml::to_writer(
+                    &mut bytes,
+                    &dom,
+                    dom.root().children(),
+                    rbx_xml::EncodeOptions::new()
+                        .property_behavior(rbx_xml::EncodePropertyBehavior::WriteUnknown),
+                )
+                .unwrap();
+            } else {
+                rbx_binary::to_writer(&mut bytes, &dom, dom.root().children()).unwrap();
+            }
+            // Both formats deliberately use .rbxl: import must inspect content.
+            std::fs::write(root.join("place.rbxl"), bytes).unwrap();
+            std::fs::write(root.join("renium.project.jsonc"), r#"{"schemaVersion":1}"#).unwrap();
+            assert_eq!(run(&root)["ok"], true);
+            let stored =
+                SettingsBytecode::read_file(&root.join("instances/Workspace.renium")).unwrap();
+            let rig = stored
+                .instances
+                .iter()
+                .find(|node| node.class_name == "AnimationRigData")
+                .unwrap();
+            for name in ["name", "parent", "rootMotion"] {
+                assert_eq!(
+                    rig.properties[name],
+                    json!({"_type":"BinaryString", "base64":base64::encode(&binary)}),
+                    "{name}, xml={xml}"
+                );
+            }
+            let lighting =
+                SettingsBytecode::read_file(&root.join("instances/Lighting.renium")).unwrap();
+            assert_eq!(lighting.instances[0].properties["TimeOfDay"], "13:24:40");
+            assert_eq!(
+                lighting.instances[0].properties["PrioritizeLightingQuality"],
+                true
+            );
+            // Rebuild from the stores alone: the remembered input must not
+            // supply a field the import accidentally lost.
+            std::fs::remove_file(root.join(".renium/import-base.json")).unwrap();
+            let output = root.join("rebuilt.rbxl");
+            crate::rbx::model::bytecode_export_place(crate::cli::BytecodeExportPlaceArgs {
+                project: crate::cli::ProjectSourceArgs {
+                    project_root: root.clone(),
+                    src_root: "src".into(),
+                },
+                services: String::new(),
+                output: output.clone(),
+                format: None,
+                base: None,
+                pretty: false,
+            })
+            .unwrap();
+            let rebuilt = rbx_binary::from_reader(File::open(output).unwrap()).unwrap();
+            for (class, name, expected) in [
+                ("Lighting", "TimeOfDay", Variant::String("13:24:40".into())),
+                ("Lighting", "PrioritizeLightingQuality", Variant::Bool(true)),
+                (
+                    "KeyframeSequence",
+                    "GuidBinaryString",
+                    Variant::BinaryString(binary.clone()),
+                ),
+                (
+                    "AnimationRigData",
+                    "name",
+                    Variant::BinaryString(binary.clone()),
+                ),
+                (
+                    "AnimationRigData",
+                    "parent",
+                    Variant::BinaryString(binary.clone()),
+                ),
+                (
+                    "AnimationRigData",
+                    "rootMotion",
+                    Variant::BinaryString(binary.clone()),
+                ),
+                (
+                    "AnimationRigData",
+                    "FutureSharedTable",
+                    Variant::SharedString(shared.clone()),
+                ),
+            ] {
+                let node = rebuilt
+                    .descendants()
+                    .find(|node| node.class == class)
+                    .unwrap();
+                assert_eq!(
+                    node.properties.get(&name.into()),
+                    Some(&expected),
+                    "{class}.{name}, xml={xml}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn clock_time_derives_from_time_of_day() {
         assert_eq!(
             clock_time_from_time_of_day("10:36:00"),
@@ -440,6 +605,11 @@ mod tests {
         );
         assert_eq!(clock_time_from_time_of_day("14:00:00"), Some(14.0));
         assert_eq!(clock_time_from_time_of_day("00:30"), Some(0.5));
+        assert_eq!(
+            clock_time_from_time_of_day("-10:35:20"),
+            Some(f64::from(48_280.0f32 / 3600.0)),
+            "a negative time counts back from midnight, as Studio keeps it"
+        );
         assert_eq!(clock_time_from_time_of_day("noon"), None);
     }
 

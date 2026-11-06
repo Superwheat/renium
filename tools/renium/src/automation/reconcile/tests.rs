@@ -1884,6 +1884,211 @@ fn an_omitted_property_at_its_default_counts_as_retained() {
 }
 
 #[test]
+fn a_weld_studio_replaced_with_a_rigid_constraint_is_not_put_back() {
+    use super::pairing::drop_joints_studio_migrated;
+    let document = |joint: Option<(&str, &str)>| {
+        let mut instances = vec![
+            SettingsBytecodeInstance::new(
+                "ws".into(),
+                "Workspace".into(),
+                "Workspace".into(),
+                None,
+            ),
+            SettingsBytecodeInstance::new("hat".into(), "Hat".into(), "Accessory".into(), Some(0)),
+            SettingsBytecodeInstance::new("handle".into(), "Handle".into(), "Part".into(), Some(1)),
+            SettingsBytecodeInstance::new(
+                "mesh".into(),
+                "Mesh".into(),
+                "SpecialMesh".into(),
+                Some(2),
+            ),
+        ];
+        if let Some((class, name)) = joint {
+            instances.push(SettingsBytecodeInstance::new(
+                name.to_lowercase(),
+                name.into(),
+                class.into(),
+                Some(2),
+            ));
+        }
+        SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances,
+        }
+    };
+    let mut editor = document(Some(("Weld", "AccessoryWeld")));
+    drop_joints_studio_migrated(
+        &mut editor,
+        &document(Some(("RigidConstraint", "AccessoryRigidConstraint"))),
+    );
+    assert_eq!(
+        editor,
+        document(None),
+        "Studio replaced the weld while loading"
+    );
+
+    let mut editor = document(Some(("Weld", "AccessoryWeld")));
+    drop_joints_studio_migrated(&mut editor, &document(None));
+    assert_eq!(
+        editor,
+        document(Some(("Weld", "AccessoryWeld"))),
+        "a deleted weld is a Studio edit"
+    );
+
+    let mut editor = document(Some(("Weld", "AccessoryWeld")));
+    let mut both = document(Some(("RigidConstraint", "AccessoryRigidConstraint")));
+    both.instances.push(SettingsBytecodeInstance::new(
+        "weld".into(),
+        "AccessoryWeld".into(),
+        "Weld".into(),
+        Some(2),
+    ));
+    drop_joints_studio_migrated(&mut editor, &both);
+    assert_eq!(
+        editor,
+        document(Some(("Weld", "AccessoryWeld"))),
+        "Studio still holds the weld"
+    );
+
+    let mut editor = document(Some(("Weld", "Joint")));
+    drop_joints_studio_migrated(
+        &mut editor,
+        &document(Some(("RigidConstraint", "AccessoryRigidConstraint"))),
+    );
+    assert_eq!(
+        editor,
+        document(Some(("Weld", "Joint"))),
+        "only the accessory weld is migrated"
+    );
+
+    for (duplicate_editor, duplicate_studio) in [(true, false), (false, true), (true, true)] {
+        let mut editor = document(Some(("Weld", "AccessoryWeld")));
+        let mut studio = document(Some(("RigidConstraint", "AccessoryRigidConstraint")));
+        for (document, duplicate) in [
+            (&mut editor, duplicate_editor),
+            (&mut studio, duplicate_studio),
+        ] {
+            if duplicate {
+                let parent = document.instances.len();
+                document.instances.push(SettingsBytecodeInstance::new(
+                    "second-hat".into(),
+                    "Hat".into(),
+                    "Accessory".into(),
+                    Some(0),
+                ));
+                document.instances.push(SettingsBytecodeInstance::new(
+                    "second-handle".into(),
+                    "Handle".into(),
+                    "Part".into(),
+                    Some(parent),
+                ));
+            }
+        }
+        let before = editor.clone();
+        drop_joints_studio_migrated(&mut editor, &studio);
+        assert_eq!(
+            editor, before,
+            "a same-named accessory is not proof of migration"
+        );
+    }
+}
+
+#[test]
+fn captured_optional_properties_still_verify_explicit_writes() {
+    for (class, name, previous, desired) in [
+        (
+            "Lighting",
+            "PrioritizeLightingQuality",
+            json!(false),
+            json!(true),
+        ),
+        (
+            "Lighting",
+            "LightingStyle",
+            json!({"_type":"EnumItem", "name":"Soft"}),
+            json!({"_type":"EnumItem", "name":"Realistic"}),
+        ),
+        ("Frame", "InputSinkEnabled", json!(false), json!(true)),
+    ] {
+        let instance =
+            SettingsBytecodeInstance::new("target".into(), class.into(), class.into(), None);
+        let before = Map::from_iter([(name.to_string(), previous)]);
+        let desired = Map::from_iter([(name.to_string(), desired)]);
+        assert!(
+            expected_map_mismatch(&desired, &before, true, &instance).is_some(),
+            "{class}.{name}"
+        );
+        assert!(
+            changed_map_mismatch(&before, &desired, &before, true, &instance).is_some(),
+            "{class}.{name}"
+        );
+        assert_eq!(
+            expected_map_mismatch(&desired, &desired, true, &instance),
+            None
+        );
+        assert_eq!(
+            changed_map_mismatch(&before, &desired, &desired, true, &instance),
+            None
+        );
+        assert_eq!(
+            expected_map_mismatch(&desired, &Map::new(), true, &instance),
+            None
+        );
+        assert_eq!(
+            changed_map_mismatch(&before, &desired, &Map::new(), true, &instance),
+            None
+        );
+    }
+}
+
+#[test]
+fn a_field_the_files_never_carry_is_not_checked_for_retention() {
+    let description = SettingsBytecodeInstance::new(
+        "hd".into(),
+        "HumanoidDescription".into(),
+        "HumanoidDescription".into(),
+        Some(0),
+    );
+    let gray = Map::from_iter([(
+        "HeadColor".to_string(),
+        json!({"_type": "Color3", "r": 0.5, "g": 0.5, "b": 0.5}),
+    )]);
+    assert_eq!(
+        changed_map_mismatch(&gray, &Map::new(), &gray, true, &description),
+        None,
+        "HeadColor does not serialize, so the files never state it"
+    );
+    let tire =
+        SettingsBytecodeInstance::new("tire".into(), "Tire".into(), "MeshPart".into(), Some(0));
+    let fidelity = Map::from_iter([(
+        "CollisionFidelity".to_string(),
+        json!({"_type": "EnumItem", "name": "Default"}),
+    )]);
+    assert_eq!(
+        changed_map_mismatch(&fidelity, &Map::new(), &fidelity, true, &tire),
+        None,
+        "a capture may carry the fidelity the files leave out"
+    );
+    let sound = SettingsBytecodeInstance::new("sq".into(), "SQ".into(), "Sound".into(), Some(0));
+    let muted = Map::from_iter([("IsMutedForCapture".to_string(), json!(false))]);
+    assert_eq!(
+        changed_map_mismatch(&Map::new(), &muted, &Map::new(), true, &sound),
+        None,
+        "a capture may leave out a field the reflection database does not know"
+    );
+    let reflectance = Map::from_iter([("Reflectance".to_string(), json!(0.7))]);
+    assert!(
+        changed_map_mismatch(&Map::new(), &reflectance, &Map::new(), true, &tire).is_some(),
+        "a known saved field the capture lost is still a retention failure"
+    );
+    let unmuted = Map::from_iter([("IsMutedForCapture".to_string(), json!(true))]);
+    assert!(
+        changed_map_mismatch(&Map::new(), &unmuted, &Map::new(), true, &sound).is_some(),
+        "a set value of an unknown field the capture lost is still a retention failure"
+    );
+}
+
+#[test]
 fn retention_checks_distinguish_editor_state_and_authored_attributes() {
     for (class, name) in [
         ("Workspace", "InsertPoint"),

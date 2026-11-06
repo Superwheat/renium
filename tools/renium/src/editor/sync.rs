@@ -2870,7 +2870,8 @@ fn apply_saved_field_differences(bridge: &BridgeServer, summary: &mut Map<String
             &difference.property,
             &difference.value,
         ) {
-            Ok(_) => applied += 1,
+            Ok(true) => applied += 1,
+            Ok(false) => {}
             Err(error) => unsupported.push(format!("{} ({error:#})", difference.label())),
         }
     }

@@ -12,6 +12,16 @@
 #include <atomic>
 #include <dlfcn.h>
 
+// Qt's Cocoa event source can keep servicing render events without draining
+// libdispatch's main queue. Run-loop blocks run between those source batches,
+// on the same UI thread that serializes closing a DataModel. Waking the loop
+// neither activates a window nor injects input.
+void ReniumStudioUiTask(void* context, void (*task)(void*)) {
+    auto loop = CFRunLoopGetMain();
+    CFRunLoopPerformBlock(loop, kCFRunLoopCommonModes, ^{ task(context); });
+    CFRunLoopWakeUp(loop);
+}
+
 namespace {
 struct QtObjects {
     struct Data { std::atomic<int> refs; int allocated, begin, end; void* items[1]; };

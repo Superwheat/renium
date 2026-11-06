@@ -41,11 +41,45 @@ local function vectorsEqual(a: any, b: any, fields: { string }): boolean
 	return true
 end
 
+-- An asset named by a roblox.com URL or an rbxassetid URI is the same asset;
+-- Studio reads either back as rbxassetid.
+local function canonicalAssetText(text: string): string
+	local trimmed = string.match(text, "^%s*(.-)%s*$") :: string
+	local scheme, body = string.match(trimmed, "^([%a]+)://(.*)$")
+	if scheme == nil then
+		return text
+	end
+	scheme = string.lower(scheme)
+	if scheme == "http" or scheme == "https" then
+		local host, path = string.match(body, "^([^/]+)(/.*)$")
+		if host == nil or (string.lower(host) ~= "roblox.com" and string.lower(host) ~= "www.roblox.com") then
+			return text
+		end
+		local prefix = string.match(string.lower(path), "^/asset/?%?id=")
+		if prefix == nil then
+			return text
+		end
+		body = string.sub(path, #prefix + 1)
+	elseif scheme ~= "rbxassetid" then
+		return text
+	end
+	local id, suffix = string.match(body, "^(%d+)(.*)$")
+	if id ~= nil and (suffix == "" or string.match(suffix, "^[?&]") ~= nil) then
+		return `rbxassetid://{id}{suffix}`
+	end
+	return text
+end
+
+local function assetTextsEqual(a: string, b: string): boolean
+	return a == b or canonicalAssetText(a) == canonicalAssetText(b)
+end
+
 local function contentEqualsString(content: Content, text: string): boolean
 	if content.SourceType == Enum.ContentSourceType.None then
 		return text == ""
 	elseif content.SourceType == Enum.ContentSourceType.Uri then
-		return content.Uri == text
+		local uri = content.Uri
+		return assetTextsEqual(uri, text)
 	end
 	return false
 end
@@ -131,6 +165,11 @@ valuesEqual = function(a: any, b: any, seen: { [any]: any }?): boolean
 
 	if typeA == "number" then
 		return numbersEqual(a, b)
+	elseif typeA == "Content" then
+		if b.SourceType == Enum.ContentSourceType.Uri then
+			return contentEqualsString(a, b.Uri)
+		end
+		return a.SourceType == Enum.ContentSourceType.None and b.SourceType == Enum.ContentSourceType.None
 	elseif typeA == "table" then
 		return tablesEqual(a, b, seen or {})
 	elseif typeA == "Color3" then
@@ -207,5 +246,6 @@ end
 
 BridgeValueEquality.valuesEqual = valuesEqual
 BridgeValueEquality.exactValuesEqual = exactValuesEqual
+BridgeValueEquality.assetTextsEqual = assetTextsEqual
 
 return BridgeValueEquality

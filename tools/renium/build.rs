@@ -513,8 +513,7 @@ fn embed_windows_manifest(out_dir: &Path) {
     );
 }
 
-fn build_terrain_observation_test(out_dir: &Path) {
-    let source = Path::new("native/tests/terrain_observation.cpp");
+fn build_native_test(out_dir: &Path, name: &str, source: &Path) {
     let compiler = cc::Build::new().cpp(true).static_crt(true).get_compiler();
     let mut command = compiler.to_command();
     if compiler.is_like_msvc() {
@@ -524,9 +523,7 @@ fn build_terrain_observation_test(out_dir: &Path) {
             .arg(format!("/Fo{}\\", out_dir.display()));
         command.arg(format!(
             "/Fe{}",
-            out_dir
-                .join("renium-terrain-observation-test.exe")
-                .display()
+            out_dir.join(format!("renium-{name}-test.exe")).display()
         ));
         command.args(["/link", "/INCREMENTAL:NO"]);
     } else {
@@ -537,15 +534,19 @@ fn build_terrain_observation_test(out_dir: &Path) {
         command
             .arg(source)
             .arg("-o")
-            .arg(out_dir.join("renium-terrain-observation-test"));
+            .arg(out_dir.join(format!("renium-{name}-test")));
     }
-    run(&mut command, "Terrain observation regression build");
+    run(&mut command, "Native regression build");
     println!("cargo:rerun-if-changed={}", source.display());
     println!("cargo:rerun-if-changed=native/renium_terrain_observation.h");
 }
 
 fn main() {
     println!("cargo:rerun-if-changed=native/renium_studio_functions.h");
+    println!("cargo:rerun-if-changed=native/renium_task_context_macos.h");
+    println!("cargo:rerun-if-changed=native/renium_tagged_callback.h");
+    println!("cargo:rerun-if-changed=native/renium_property_task.h");
+    println!("cargo:rerun-if-changed=native/tests/macos-task-context-fixture.h");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
     emit_build_metadata();
@@ -557,7 +558,21 @@ fn main() {
     generate_config_settings(&out_dir);
     let target = env::var("TARGET").expect("TARGET is missing");
     if host == target || (target_os == "macos" && host.contains("apple-darwin")) {
-        build_terrain_observation_test(&out_dir);
+        build_native_test(
+            &out_dir,
+            "terrain-observation",
+            Path::new("native/tests/terrain_observation.cpp"),
+        );
+        build_native_test(
+            &out_dir,
+            "macos-task-context",
+            Path::new("native/tests/task_context_macos.cpp"),
+        );
+        build_native_test(
+            &out_dir,
+            "property-task",
+            Path::new("native/tests/property_task.cpp"),
+        );
     }
     match target_os.as_str() {
         "windows" => {

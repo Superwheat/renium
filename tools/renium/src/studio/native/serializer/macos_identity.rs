@@ -1,6 +1,7 @@
 //! Capture persistent engine identities on the same DataModel queue used by
 //! protected properties when its structural locator is available.
 use super::*;
+use crate::studio::native::serializer::macos_identity_rows::decode_identities;
 use rbx_dom_weak::types::UniqueId;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -130,22 +131,26 @@ pub(crate) fn capture_identities(
     services: &[String],
     timeout: Duration,
 ) -> Result<Option<HashMap<String, UniqueId>>> {
+    super::super::super::optional_native(
+        read_identities(pid, title, services, timeout)
+            .map_err(|error| macos_deadline::identity_capture_error(pid, error)),
+    )
+}
+
+fn read_identities(
+    pid: u32,
+    title: &str,
+    services: &[String],
+    timeout: Duration,
+) -> Result<HashMap<String, UniqueId>> {
+    let started = Instant::now();
     anyhow::ensure!(
         !services.is_empty() && services.len() <= 64,
         "Native identity capture needs 1–64 services"
     );
-    if super::super::super::optional_native(super::super::super::probes::run(
-        pid,
-        title,
-        NativeOperation::DescriptorBinding,
-    ))?
-    .is_none()
-    {
-        return Ok(None);
-    }
-    // Operation 4 validates and retains the current service graph before reading
-    // identities. It needs no preceding identity grant (which costs another
-    // DataModel queue turn while Studio is busy processing a large insertion).
+    // The capture task itself validates the queue ABI, retains the DataModel,
+    // and validates the service graph before reading identities. A separate
+    // descriptor probe duplicates discovery and used to queue an empty task.
     let mut prepared = discover_property(
         pid,
         title,
@@ -194,39 +199,22 @@ pub(crate) fn capture_identities(
     }
     put32(&mut prepared.parameters, 136, input.len() as u32);
     prepared.parameters[680..680 + input.len()].copy_from_slice(&input);
-    decode_identities(&prepared.invoke(4)?[16..]).map(Some)
-}
-
-fn decode_identities(rows: &[u8]) -> Result<HashMap<String, UniqueId>> {
-    anyhow::ensure!(
-        rows.len().is_multiple_of(64),
-        "Invalid native identity rows"
+    let discovered = Instant::now();
+    let rows = prepared.invoke(4)?;
+    let captured = Instant::now();
+    let identities = decode_identities(&rows[16..])?;
+    super::super::super::probes::record(
+        pid,
+        NativeOperation::Capture,
+        &Ok(serde_json::json!({
+            "instances": identities.len(),
+            "discoveryMs": discovered.duration_since(started).as_secs_f64() * 1000.0,
+            "captureMs": captured.duration_since(discovered).as_secs_f64() * 1000.0,
+            "decodeMs": captured.elapsed().as_secs_f64() * 1000.0,
+            "responseBytes": rows.len(),
+        })),
     );
-    let mut result = HashMap::with_capacity(rows.len() / 64);
-    let mut seen = HashSet::with_capacity(result.capacity());
-    for row in rows.chunks_exact(64) {
-        let word = |at| read_u32(row, at).unwrap();
-        let id = UniqueId::new(
-            word(12),
-            word(8),
-            ((u64::from(word(0)) << 32) | u64::from(word(4))) as i64,
-        );
-        let text = &row[16..];
-        let end = text
-            .iter()
-            .position(|b| *b == 0)
-            .context("Unterminated native debug ID")?;
-        let key = std::str::from_utf8(&text[..end])?;
-        anyhow::ensure!(
-            end > 0
-                && text[end..].iter().all(|b| *b == 0)
-                && !id.is_nil()
-                && seen.insert(id)
-                && result.insert(key.into(), id).is_none(),
-            "Native identity capture contains an invalid or duplicate identity"
-        );
-    }
-    Ok(result)
+    Ok(identities)
 }
 
 #[test]
@@ -250,18 +238,4 @@ fn debug_method_discovery_follows_descriptor_pair_through_argument_clobbers() {
     let mut wrong = words;
     wrong[35] = 0xaa0003e2; // The high member word no longer reaches x2.
     assert_eq!(method_call(&bytes(&wrong), 0x1000), None);
-}
-
-#[test]
-fn identity_rows_reject_collisions_and_preserve_native_word_order() {
-    let mut row = [0; 64];
-    for (offset, word) in [(0, 0x12345678u32), (4, 0x87654321), (8, 10), (12, 20)] {
-        row[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
-    }
-    row[16..20].copy_from_slice(b"0_42");
-    let parsed = decode_identities(&row).unwrap();
-    assert_eq!(parsed["0_42"], UniqueId::new(20, 10, 0x1234567887654321));
-    assert!(decode_identities(&[row, row].concat()).is_err());
-    row[63] = 1;
-    assert!(decode_identities(&row).is_err());
 }

@@ -1231,7 +1231,55 @@ end
 local valuesEqual = BridgeValueEquality.valuesEqual
 local exactValuesEqual = BridgeValueEquality.exactValuesEqual
 
+-- Studio keeps Lighting.TimeOfDay within one day: "-10:35:20" reads back as
+-- 13:24:40.
+local function timeOfDaySeconds(text: string): number?
+	local sign, hours, minutes, seconds = string.match(text, "^%s*(-?)(%d+):?(%d*):?(%d*)%s*$")
+	if hours == nil then
+		return nil
+	end
+	local total = tonumber(hours) * 3600 + (tonumber(minutes) or 0) * 60 + (tonumber(seconds) or 0)
+	if sign == "-" then
+		total = -total
+	end
+	return total % 86400
+end
+
+-- Studio keeps a HumanoidDescription's accessory lists in its own order.
+local function sortedIdList(text: string): string
+	local ids = {}
+	for _, entry in string.split(text, ",") do
+		local id = string.match(entry, "^%s*(.-)%s*$") :: string
+		if id ~= "" then
+			ids[#ids + 1] = id
+		end
+	end
+	table.sort(ids)
+	return table.concat(ids, ",")
+end
+
 local function propertyValuesEqual(instance: Instance, name: string, current: any, expected: any): boolean
+	if type(current) == "string" and type(expected) == "string" then
+		local descriptor = RbxDomModule.findCanonicalPropertyDescriptor(instance.ClassName, name)
+		if descriptor ~= nil and (descriptor.dataType == "Content" or descriptor.dataType == "ContentId") then
+			return BridgeValueEquality.assetTextsEqual(current, expected)
+		end
+	end
+	if name == "TimeOfDay" and type(current) == "string" and type(expected) == "string" then
+		local currentSeconds = timeOfDaySeconds(current)
+		if currentSeconds ~= nil and currentSeconds == timeOfDaySeconds(expected) then
+			return true
+		end
+	end
+	if
+		type(current) == "string"
+		and type(expected) == "string"
+		and string.sub(name, -9) == "Accessory"
+		and instance:IsA("HumanoidDescription")
+		and sortedIdList(current) == sortedIdList(expected)
+	then
+		return true
+	end
 	if type(current) == "number" and type(expected) == "number" then
 		local descriptor = RbxDomModule.findCanonicalPropertyDescriptor(instance.ClassName, name)
 		if descriptor == nil or descriptor.dataType ~= "Float32" then
@@ -5426,6 +5474,14 @@ function NativeSerialization.appendIdentityCarriers(
 	end
 	for carrierIndex = 1, carrierCount do
 		roots[#roots + 1] = pool.carriers[carrierIndex] :: Instance
+	end
+	-- Model serialization omits joints whose endpoints leave the selected
+	-- roots unless the joint itself is explicitly selected. Studio keeps the
+	-- original parent; the reference overlay restores external endpoints.
+	for _, instance in ipairs(instances) do
+		if instance:IsA("JointInstance") or instance:IsA("Constraint") or instance:IsA("WeldConstraint") then
+			roots[#roots + 1] = instance
+		end
 	end
 	group.identityCarrierClass = NATIVE_IDENTITY_CARRIER_CLASS
 	group.identityCarrierPrefix = prefix

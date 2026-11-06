@@ -271,7 +271,7 @@ pub(crate) fn write_saved_field(
         path,
         ordinals,
         property,
-        Duration::from_secs(3),
+        Duration::from_secs(10),
     )?;
     let text = saved_field_text(value, &native.class_name, property)?;
     let before = native.read()?;

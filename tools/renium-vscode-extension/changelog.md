@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.5.9 - 2026-11-06
+
+### New
+
+- On macOS, Studio's native queue serves live Terrain observation and saved-field edits without reopening the place. Saved-field writes require a fresh matching read before reporting success, and pulls refresh `Lighting.Technology` from the native getter.
+
+### Improvements
+
+- On macOS, native operations give a busy Studio queue the operation's remaining time instead of a fixed short budget.
+- Installing or removing a macOS plugin in an explicit folder leaves Studio installations alone. Setup recognizes complete Renium patches whose rollback backup belongs to another installation.
+- Errors for invalid mesh geometry values identify the instance and property that need correction.
+
+### Bug fixes
+
+- The macOS and Linux installer no longer stops with "The inherited Renium lifecycle lock owner is no longer running" on the first nine days of a month: the process start time it hands to the CLI is compared with the spacing `ps` adds to single-digit days collapsed on both sides.
+- On macOS, cold pushes no longer wait ten seconds for a busy Studio UI to prepare native access. Preparation uses the UI run loop and falls back to the plugin within one second if it cannot finish, with the reason shown in `rbx status`.
+- On macOS, push, pull and Live Sync no longer wait for an empty native task before checking saved fields or capturing identities. Identity captures also use plugin identities if Studio closes its response at the deadline, with the reason shown in `rbx status`.
+- On macOS, native reads keep the complete response when Studio closes the connection after sending it, avoiding "Invalid argument (os error 22)" during sync and saved-field edits.
+- Live Sync, push and pull can use plugin identities when Studio has nil or reused UniqueIds. On macOS, identity reads also fall back when their time budget expires. `rbx status` shows the reason.
+- `rbx so` and `rbx ro` open an Edit window when only orphaned test server or client windows have the place open. On macOS they close those orphaned windows first (`closedOrphans` in the result), because Studio there opens a new window beside a running test server as a client of that test, and the launch no longer mistakes an orphan for the Studio it just started.
+- `rbx pi` recognizes a place's format from its contents, including XML saved with an `.rbxl` extension. Imports and stores preserve binary engine data and animation rig tables, including the lowercase `name` and `parent` tables, so rebuilt places keep them.
+- `rbx pi` keeps supported saved service settings such as `Lighting.PrioritizeLightingQuality`, and stores `Lighting.TimeOfDay` within one day, as Studio does.
+- Live Sync's initial pairing and pushes recognize Studio's loading rewrites of lighting times, animation rig tables, emote and accessory ordering, font caches and reconstructed CFrames. Push verification also accepts equivalent asset URLs for both modern Content values and legacy asset properties.
+- Initial pairing keeps Studio's migration from `AccessoryWeld` to `AccessoryRigidConstraint`. Duplicate accessory names no longer cause the wrong saved weld to be removed.
+- Pushes leave omitted, default and engine-managed fields alone instead of attempting unsupported resets or reporting false retention failures. Optional fields that a capture does return must still match the requested value.
+- Initial pairing recognizes older collision hull formats and ignores reissued texture-pack IDs and recounted union triangles consistently when comparing individual fields or whole instances.
+- `rbx cmp` avoids differences caused by class defaults, equivalent asset URLs, generated rig tables and service state a project cannot carry. Authored text, attributes and rig tags still report real changes.
+- On Windows, saving retries a brief file-sharing lock instead of immediately failing with "Access is denied".
+
 ## 0.5.8 - 2026-11-02
 
 ### Bug fixes

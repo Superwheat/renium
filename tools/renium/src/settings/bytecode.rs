@@ -324,12 +324,13 @@ pub(crate) fn should_skip_binary_property(
     name: &str,
     raw_value: &Value,
 ) -> bool {
-    if name.eq_ignore_ascii_case("source")
-        || name.eq_ignore_ascii_case("classname")
-        || name.eq_ignore_ascii_case("parent")
-        || name.eq_ignore_ascii_case("name")
-        || name.eq_ignore_ascii_case("robloxlocked")
-    {
+    // The record's own fields, by their exact names: Roblox property names
+    // are case-sensitive, and `AnimationRigData` carries real `name` and
+    // `parent` tables beside the instance's Name and Parent.
+    if matches!(
+        name,
+        "Source" | "ClassName" | "Parent" | "Name" | "RobloxLocked"
+    ) {
         return true;
     }
     if name == "RunContext" && instance.class_name != "Script" {

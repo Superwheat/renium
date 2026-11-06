@@ -20,6 +20,7 @@ local Settings = require("../BridgeSettings.module")
 local TransactionUpload = require("../BridgeTransactionUpload.module")
 local Update = require("../BridgeUpdate.module")
 local ValueEquality = require("../BridgeValueEquality.module")
+require("./value-rewrite-workloads")
 require("./identity-workloads")
 require("./camera-policy-workloads")
 require("./transaction-source-workloads")
@@ -37,6 +38,7 @@ require("./mesh-content-workloads")
 require("./viewport-native-workloads")
 require("./connection-workloads")
 require("./play-status-workloads")
+require("./console-cursor-workloads")
 require("./play-clients-workloads")
 require("./corner-change-workloads")
 require("./expectation-lifetime-workloads")
@@ -362,7 +364,8 @@ do
 			return carrier
 		end },
 	} })()
-	local root, a, b, c, d = {}, {}, {}, {}, {}
+	local root = roblox.Instance.new("Folder")
+	local a, b, c, d = roblox.Instance.new("Part"), roblox.Instance.new("Part"), roblox.Instance.new("Part"), roblox.Instance.new("Part")
 	local function append(instances, generation)
 		local group, roots = { service = "Workspace" }, {}
 		native.appendIdentityCarriers(group, roots, instances, generation)
@@ -383,6 +386,19 @@ do
 	append({ root, d, b, a }, 4)
 	append({ root }, 5)
 	append({ root, c }, 6)
+	local weld = roblox.Instance.new("Weld")
+	local hinge = roblox.Instance.new("HingeConstraint")
+	local constraint = roblox.Instance.new("WeldConstraint")
+	weld.Part0, weld.Part1 = a, b
+	weld.Parent, hinge.Parent, constraint.Parent = root, root, root
+	local group, roots = { service = "Workspace" }, {}
+	native.appendIdentityCarriers(group, roots, {root, weld, hinge, constraint}, 7)
+	equal(#roots, group.identityCarrierCount + 3, "joints explicitly selected for model serialization")
+	for index, joint in {weld, hinge, constraint} do
+		equal(roots[group.identityCarrierCount + index], joint, "joint selection retains exact identity")
+		equal(joint.Parent, root, "joint selection keeps the original parent")
+	end
+	equal(weld.Part1, b, "external joint endpoint unchanged")
 end
 
 do

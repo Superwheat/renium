@@ -755,6 +755,24 @@ pub(crate) fn append_aligned_settings_push_plan(
                                         name,
                                     )
                                     && !reconciliation_property_is_derived(name)
+                                    // A field the files may leave out without saying
+                                    // anything (InputSinkEnabled, the newer Lighting
+                                    // fields) is never reset to a default.
+                                    && !crate::settings::equivalence::capture_may_omit(
+                                        &instance.class_name,
+                                        name,
+                                    )
+                                    // Lighting states its clock through TimeOfDay; a
+                                    // reset of ClockTime is answered with the same
+                                    // value and fails verification.
+                                    && !(instance.class_name == "Lighting"
+                                        && name.as_str() == "ClockTime")
+                                    // A union's triangle count is the engine's; Studio
+                                    // refuses the write.
+                                    && !(name.as_str() == "TriangleCount"
+                                        && crate::rbx::encode::is_solid_model_operation(
+                                            &instance.class_name
+                                        ))
                                     // Resets obey the same capability rules as writes.
                                     // Engine-derived fields (for example cooked mesh
                                     // data after switching to Box) still participate

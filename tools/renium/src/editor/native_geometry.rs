@@ -213,9 +213,14 @@ impl GeometryWrite {
             "Invalid mesh geometry path"
         );
         let number = |value: &Value| -> Result<f64> {
-            let number = value
-                .as_f64()
-                .context("Mesh geometry requires numeric values")?;
+            let number = value.as_f64().with_context(|| {
+                format!(
+                    "Mesh geometry requires numeric values: {}.{} holds {}",
+                    self.path_segments.join("."),
+                    self.name,
+                    value
+                )
+            })?;
             ensure!(
                 number.is_finite() && (number as f32).is_finite(),
                 "Mesh geometry value is outside the finite Float32 range"

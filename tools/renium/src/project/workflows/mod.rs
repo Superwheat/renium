@@ -1017,6 +1017,19 @@ pub fn run_studio(args: StudioArgs, global_project: Option<&Path>) -> Result<()>
 }
 
 pub fn launch_studio(file: Option<&Path>, project: Option<&Path>) -> Result<Value> {
+    launch_studio_inner(file, project, true)
+}
+
+/// `sweep_orphans` asks the daemon to close the place's orphaned test windows
+/// first (macOS); the daemon's own Studio-open handler does that itself and
+/// passes false, since it cannot send a request to itself.
+fn launch_studio_inner(
+    file: Option<&Path>,
+    project: Option<&Path>,
+    sweep_orphans: bool,
+) -> Result<Value> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = sweep_orphans;
     let executable = studio_executable()?;
     let file = resolve_studio_file(file, project, true)?
         .context("No Studio file exists and one could not be built")?;
@@ -1034,6 +1047,12 @@ pub fn launch_studio(file: Option<&Path>, project: Option<&Path>) -> Result<Valu
     if let Some(name) = file.file_stem().and_then(OsStr::to_str) {
         set_aside_recovery_files(name);
     }
+    #[cfg(target_os = "macos")]
+    let closed_orphans = if sweep_orphans {
+        close_orphaned_test_windows(&file)
+    } else {
+        Vec::new()
+    };
     let pid = spawn_studio(&executable, &[file.as_os_str()])?;
     if let Some(ports) = crate::studio::bridge::daemon_bridge_ports()
         && ports != DEFAULT_BRIDGE_PORTS
@@ -1044,13 +1063,71 @@ pub fn launch_studio(file: Option<&Path>, project: Option<&Path>) -> Result<Valu
             format_args!("[renium] could not record the launch ticket for Studio {pid}: {error:#}"),
         );
     }
-    Ok(json!({
+    #[allow(unused_mut)]
+    let mut result = json!({
         "ok": true,
         "pid": pid,
         "executable": executable,
         "file": file,
         "exists": file.is_file(),
-    }))
+    });
+    #[cfg(target_os = "macos")]
+    if !closed_orphans.is_empty() {
+        result["closedOrphans"] = json!(closed_orphans);
+    }
+    Ok(result)
+}
+
+/// Studio on macOS opens a window launched beside a running test server as a
+/// client of that test, so an Edit window cannot come up while the orphaned
+/// server and clients of this place are still running: the daemon closes them
+/// first, as `rbx play --kill-orphans` would, and the launch waits for their
+/// processes to exit.
+#[cfg(target_os = "macos")]
+fn close_orphaned_test_windows(file: &Path) -> Vec<u32> {
+    let Ok(result) = crate::daemon::daemon_control_request(
+        crate::automation::op::STUDIOS,
+        None,
+        json!({ "killOrphans": true, "place": file.to_string_lossy() }),
+        false,
+    ) else {
+        return Vec::new();
+    };
+    let closed = result["closed"]
+        .as_array()
+        .map(|closed| {
+            closed
+                .iter()
+                .filter_map(|pid| pid.as_u64().and_then(|pid| u32::try_from(pid).ok()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if closed.is_empty() {
+        return closed;
+    }
+    crate::log_global(
+        4,
+        format_args!(
+            "[renium] closed orphaned test windows before opening {}: {closed:?}",
+            file.display()
+        ),
+    );
+    wait_for_studio_processes_to_exit(&closed);
+    closed
+}
+
+/// Closed test windows take a moment to leave the process list; a launch that
+/// follows at once would otherwise still find them.
+#[cfg(target_os = "macos")]
+pub(crate) fn wait_for_studio_processes_to_exit(pids: &[u32]) {
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(10) {
+        let running = crate::studio::diagnosis::studio_process_ids();
+        if !pids.iter().any(|pid| running.contains(pid)) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// The ports the Studio plugin connects to unless a setting or a redirect
@@ -1136,12 +1213,17 @@ fn remember_launched_place(project: Option<&Path>, result: &Value) {
 #[cfg(any(windows, target_os = "macos"))]
 fn studio_pid_with_file_open(file: &Path) -> Option<u32> {
     let target = fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
-    crate::studio::diagnosis::studio_process_ids()
-        .into_iter()
-        .find(|pid| {
-            crate::editor::review::local_place_path_for_pid(*pid)
-                .is_some_and(|open| fs::canonicalize(&open).unwrap_or(open) == target)
-        })
+    // The server and clients of a running test show the same file; only an
+    // Edit window has it open, and a reopen beside orphaned test windows must
+    // not wait for one of them to become the Edit session.
+    crate::studio::automation::test_processes::edit_window_pids(
+        &crate::studio::automation::test_processes::studio_process_table(),
+    )
+    .into_iter()
+    .find(|pid| {
+        crate::editor::review::local_place_path_for_pid(*pid)
+            .is_some_and(|open| fs::canonicalize(&open).unwrap_or(open) == target)
+    })
 }
 
 pub fn launch_published_studio(game_id: i64, place_id: i64) -> Result<Value> {
@@ -1174,7 +1256,7 @@ pub fn launch_exact_studio(
     place_id: Option<i64>,
 ) -> Result<Value> {
     if let Some(file) = file {
-        return launch_studio(Some(file), None);
+        return launch_studio_inner(Some(file), None, false);
     }
     match (game_id, place_id) {
         (Some(game_id), Some(place_id)) => launch_published_studio(game_id, place_id),
@@ -1260,7 +1342,10 @@ pub(crate) fn spawn_studio(executable: &Path, arguments: &[&OsStr]) -> Result<u3
     }
     #[cfg(target_os = "macos")]
     {
-        let existing = crate::studio::input::studio_process_ids()
+        // Every Studio process counts, not only the ones that own a window:
+        // the server and clients of an orphaned test may show no window at
+        // one moment and one the next, and would pass for the new launch.
+        let existing = crate::studio::diagnosis::studio_process_ids()
             .into_iter()
             .collect::<std::collections::HashSet<_>>();
         let bundle = executable
@@ -1290,7 +1375,7 @@ pub(crate) fn spawn_studio(executable: &Path, arguments: &[&OsStr]) -> Result<u3
         }
         let started = Instant::now();
         while started.elapsed() < Duration::from_secs(5) {
-            if let Some(pid) = crate::studio::input::studio_process_ids()
+            if let Some(pid) = crate::studio::diagnosis::studio_process_ids()
                 .into_iter()
                 .find(|pid| !existing.contains(pid))
             {

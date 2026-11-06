@@ -24,9 +24,18 @@ pub(crate) fn available(_bridge: &BridgeServer) -> Result<bool> {
     Ok(true)
 }
 
-// Saved service fields unavailable to plugin property reads. Every listed
-// setter has also been checked for exact Studio history cancellation.
+// Saved service fields unavailable to plugin property reads. Technology must
+// also be captured when native identities fall back to a plugin export;
+// otherwise a successful native write is overwritten by the old saved base.
 pub(crate) fn capture_properties(class: &str) -> &'static [&'static str] {
+    match class {
+        "Lighting" => &["Technology"],
+        _ => history_capture_properties(class),
+    }
+}
+
+// These setters have also been checked for exact Studio history cancellation.
+fn history_capture_properties(class: &str) -> &'static [&'static str] {
     match class {
         "MaterialService" => &["Use2022Materials"],
         "Workspace" => &[
@@ -82,7 +91,7 @@ pub(crate) fn decode_service_property(class: &str, name: &str, text: &str) -> Re
 // Player limits are managed through Roblox Game Settings, not Studio sync.
 pub(crate) fn is_property(class: &str, name: &str) -> bool {
     name == "SourceAssetId"
-        || capture_properties(class).contains(&name)
+        || history_capture_properties(class).contains(&name)
         || matches!(
             (class, name),
             ("Lighting", "LightingStyle" | "PrioritizeLightingQuality")
@@ -891,6 +900,27 @@ mod tests {
             assert!(!is_property(class, name));
             assert!(decode_service_property(class, name, "Default").is_err());
         }
+    }
+
+    #[test]
+    fn saved_lighting_technology_is_captured_without_enabling_an_unverified_undo_setter() {
+        assert_eq!(capture_properties("Lighting"), ["Technology"]);
+        for name in ["Voxel", "Future"] {
+            let value = decode_service_property("Lighting", "Technology", name).unwrap();
+            assert_eq!(value["_type"], "EnumItem");
+            assert_eq!(value["name"], name);
+            assert_eq!(
+                crate::studio::automation::property_access::saved_field_text(
+                    &value,
+                    "Lighting",
+                    "Technology",
+                )
+                .unwrap(),
+                name,
+            );
+        }
+        assert!(!is_property("Lighting", "Technology"));
+        assert!(decode_service_property("Lighting", "Technology", "Invalid").is_err());
     }
 
     #[test]

@@ -542,7 +542,7 @@ pub(crate) fn compare_place(mut args: ComparePlaceArgs, project: Option<&Path>) 
             place_dom(path)
         }
     };
-    let (place_dom, mut project_dom, project_path, service_set) =
+    let (mut place_dom, mut project_dom, project_path, service_set) =
         if let Some(against) = &args.against {
             let (before, target) = rayon::join(|| read(&args.input), || read(against));
             let before = before?;
@@ -575,17 +575,21 @@ pub(crate) fn compare_place(mut args: ComparePlaceArgs, project: Option<&Path>) 
         ),
     );
     if args.full {
-        let (not_serialized, unsaved_instances) = if args.against.is_none() {
+        let (not_serialized, unsaved_instances, unsaved_service) = if args.against.is_none() {
             (
                 super::place_diff::omit_unsaved_project_properties(&mut project_dom)?,
                 super::place_diff::omit_unsaved_project_instances(&mut project_dom),
+                super::place_diff::omit_unsaved_service_properties(&mut place_dom)?,
             )
         } else {
-            (BTreeMap::new(), 0)
+            (BTreeMap::new(), 0, BTreeMap::new())
         };
         let mut result = super::place_diff::compare(&place_dom, &project_dom, &service_set, &args)?;
         if !not_serialized.is_empty() {
             result["notSerializedProjectProperties"] = json!(not_serialized);
+        }
+        if !unsaved_service.is_empty() {
+            result["unsavedServiceProperties"] = json!(unsaved_service);
         }
         if unsaved_instances > 0 {
             result["unsavedProjectInstances"] = json!(unsaved_instances);

@@ -773,6 +773,21 @@ mod tests {
     }
 
     #[test]
+    fn requests_written_with_the_earlier_field_names_still_parse() {
+        let request = serde_json::from_str::<Request>(
+            r#"{"v":1,"id":7,"op":0,"ctx":3,"args":{"path":"src"}}"#,
+        )
+        .unwrap();
+        assert_eq!(request.cx, Some(3));
+        assert_eq!(request.p, json!({"path": "src"}));
+        assert_eq!(
+            serde_json::to_string(&request).unwrap(),
+            r#"{"v":1,"id":7,"op":0,"cx":3,"p":{"path":"src"}}"#
+        );
+        assert!(serde_json::from_str::<Request>(r#"{"v":1,"id":7,"op":0,"params":{}}"#).is_err());
+    }
+
+    #[test]
     fn review_receipts_are_context_bound_and_single_use() {
         let state = State::default();
         let context = state.insert_context(BoundContext {

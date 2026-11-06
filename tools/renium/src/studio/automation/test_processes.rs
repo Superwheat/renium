@@ -187,6 +187,17 @@ pub(crate) fn test_descendants(processes: &[StudioProcess], root: u32) -> Vec<u3
         .collect()
 }
 
+/// The Edit windows among the Studio processes: the server and clients of a
+/// test show the same place but never count as having it open.
+#[cfg(any(windows, target_os = "macos", test))]
+pub(crate) fn edit_window_pids(processes: &[StudioProcess]) -> Vec<u32> {
+    processes
+        .iter()
+        .filter(|process| process.studio && process.test_role.is_none())
+        .map(|process| process.pid)
+        .collect()
+}
+
 pub(crate) fn studio_descendants(processes: &[StudioProcess], root: u32) -> Vec<&StudioProcess> {
     let mut children = HashMap::<u32, Vec<&StudioProcess>>::new();
     for process in processes {
@@ -391,6 +402,11 @@ mod tests {
                 other(503, 1),
                 other(504, 1),
             ]
+        );
+        assert_eq!(
+            edit_window_pids(&table),
+            vec![500],
+            "a test server or client showing the place is not a window with it open"
         );
     }
 

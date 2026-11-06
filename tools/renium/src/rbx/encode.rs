@@ -441,15 +441,13 @@ pub(crate) fn model_property_name_is_skipped(name: &str) -> bool {
     if name.eq_ignore_ascii_case(MESH_SIZE_TRANSPORT_PROPERTY) {
         return true;
     }
-    [
-        "name",
-        "classname",
-        "parent",
-        "attributes",
-        "attributesserialize",
-    ]
-    .iter()
-    .any(|candidate| name.eq_ignore_ascii_case(candidate))
+    // The record's own fields by their exact names: Roblox property names are
+    // case-sensitive, and `AnimationRigData` carries real `name` and `parent`
+    // tables beside the instance's Name and Parent.
+    matches!(
+        name,
+        "Name" | "ClassName" | "Parent" | "Attributes" | "AttributesSerialize"
+    )
 }
 
 pub(crate) fn rbx_model_property_descriptor<'db>(

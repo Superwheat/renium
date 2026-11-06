@@ -47,13 +47,15 @@ enum Skipped {
 
 /// Studio recomputes these from other saved data or from loaded assets, so two
 /// saves of one place can disagree on them without any edit in between.
-fn engine_managed_property(class_name: &str, name: &str) -> bool {
+fn engine_managed_property(class_name: &str, name: &str, value: &Value) -> bool {
     reconciliation_property_is_derived(name)
         || matches!(
             name,
             "PhysicalConfigData"
                 | "CollisionGroupId"
                 | "ClockTime"
+                | "TexturePack"
+                | "TriangleCount"
                 | "InitialSize"
                 | "MeshSize"
                 | "FluidFidelityInternal"
@@ -62,6 +64,11 @@ fn engine_managed_property(class_name: &str, name: &str) -> bool {
                 | "Part1Internal"
         )
         || class_name == "WeldConstraint" && name == "State"
+        // Studio regenerates a rig's tables whenever it loads them; a table it
+        // has not filled yet is saved as an empty string.
+        || class_name == "AnimationRigData"
+            && (value.get("_type").and_then(Value::as_str) == Some("BinaryString")
+                || value.as_str() == Some(""))
 }
 
 /// A `CSGPHS ... BLOCK` PhysicalConfigData is a placeholder for a collision
@@ -88,7 +95,7 @@ fn omit_engine_managed_properties(
         let class_name = &instance.class_name;
         instance.properties.retain(|name, value| {
             let managed = !keep.iter().any(|kept| kept == name)
-                && engine_managed_property(class_name, name)
+                && engine_managed_property(class_name, name, value)
                 && !(name == "PhysicalConfigData" && is_block_physics_placeholder_json(value));
             if managed {
                 *omitted.entry(name.clone()).or_default() += 1;
@@ -219,6 +226,37 @@ pub(super) fn omit_unsaved_project_properties(
                         }
                     )
                 });
+            if unsaved {
+                *omitted.entry(name.to_string()).or_default() += 1;
+            }
+            !unsaved
+        });
+    }
+    Ok(omitted)
+}
+
+/// Fields of a service root that `rbx pi` leaves out of a project: Studio's
+/// own saved state the reflection database does not describe (Workspace's
+/// CSGAsyncDynamicCollision, StarterPlayer's avatar settings) and the pivot
+/// override Studio always writes. A saved place carries them, so comparing a
+/// project with one drops them from the place first and reports the count.
+pub(super) fn omit_unsaved_service_properties(
+    dom: &mut WeakDom,
+) -> Result<BTreeMap<String, usize>> {
+    let database = rbx_reflection_database::get()?;
+    let mut omitted = BTreeMap::new();
+    let services = dom.root().children().to_vec();
+    for id in services {
+        let Some(node) = dom.get_by_ref_mut(id) else {
+            continue;
+        };
+        let class_name = node.class.to_string();
+        node.properties.retain(|name, _| {
+            let unsaved = crate::rbx::decode::is_unsaved_service_property(
+                database,
+                &class_name,
+                name.as_str(),
+            ) || class_name == "Workspace" && name.as_str() == "WorldPivotData";
             if unsaved {
                 *omitted.entry(name.to_string()).or_default() += 1;
             }
@@ -731,7 +769,8 @@ fn subtree_matches(
         if old.name != new.name
             || old.class_name != new.class_name
             || before_children[before_index].len() != after_children[after_index].len()
-            || !changed_fields(
+            || !changed_fields_of(
+                Some(&old.class_name),
                 &without_references(&old.properties),
                 &without_references(&new.properties),
                 false,
@@ -778,20 +817,48 @@ fn changed_fields(
     after: &Map<String, Value>,
     values: bool,
 ) -> Vec<Value> {
+    changed_fields_of(None, before, after, values)
+}
+
+/// The fields that differ; with the instance's class, a property one side
+/// leaves out at its reflection default is not one of them (a saved place
+/// spells every service field, a project only the ones it sets), nor is an
+/// asset named in two spellings.
+fn changed_fields_of(
+    class_name: Option<&str>,
+    before: &Map<String, Value>,
+    after: &Map<String, Value>,
+    values: bool,
+) -> Vec<Value> {
     if before == after {
         return Vec::new();
     }
+    let noise =
+        |name: &str, before: Option<&Value>, after: Option<&Value>| {
+            field_noise(before, after)
+                || class_name.is_some_and(|class_name| {
+                    crate::settings::equivalence::is_asset_reference_property(class_name, name)
+                        && asset_spelling_noise(before, after)
+                })
+                || class_name.is_some_and(|class_name| match (before, after) {
+                    (Some(value), None) | (None, Some(value)) => name != "PhysicalConfigData"
+                        && crate::settings::equivalence::reconciliation_property_value_is_default(
+                            class_name, name, value,
+                        ),
+                    _ => false,
+                })
+        };
     let mut names = before
         .iter()
         .filter_map(|(name, value)| {
             let other = after.get(name);
-            (other != Some(value) && !field_noise(Some(value), other)).then_some(name)
+            (other != Some(value) && !noise(name, Some(value), other)).then_some(name)
         })
         .collect::<Vec<_>>();
     names.extend(
         after
             .iter()
-            .filter(|(name, value)| !before.contains_key(*name) && !field_noise(None, Some(value)))
+            .filter(|(name, value)| !before.contains_key(*name) && !noise(name, None, Some(value)))
             .map(|(name, _)| name),
     );
     names.sort_unstable();
@@ -802,6 +869,17 @@ fn changed_fields(
             json!({"name":name})
         }
     }).collect()
+}
+
+/// The same asset named by a roblox.com URL on one side and an rbxassetid
+/// URI on the other; Studio reads either back as the latter.
+fn asset_spelling_noise(before: Option<&Value>, after: Option<&Value>) -> bool {
+    let (Some(Value::String(before)), Some(Value::String(after))) = (before, after) else {
+        return false;
+    };
+    let before = crate::settings::equivalence::canonical_asset_text(before);
+    let after = crate::settings::equivalence::canonical_asset_text(after);
+    before == after && before.starts_with("rbxassetid://")
 }
 
 /// Differences no edit produced: an empty blob against none, which Studio
@@ -926,8 +1004,12 @@ pub(super) fn compare(
             .map(|&previous| {
                 let old = &before.instances[previous];
                 let mut skipped = Vec::new();
-                let mut properties =
-                    changed_fields(&old.properties, &instance.properties, args.values);
+                let mut properties = changed_fields_of(
+                    Some(&instance.class_name),
+                    &old.properties,
+                    &instance.properties,
+                    args.values,
+                );
                 let mut attributes =
                     changed_fields(&old.attributes, &instance.attributes, args.values);
                 if !args.props.is_empty() {

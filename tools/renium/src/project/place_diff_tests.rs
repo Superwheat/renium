@@ -32,6 +32,153 @@ fn changed_field_scan_preserves_names_values_and_presence() {
 }
 
 #[test]
+fn asset_spellings_do_not_hide_authored_text_changes() {
+    let url = json!("http://www.roblox.com/asset/?id=13125202269");
+    let uri = json!("rbxassetid://13125202269");
+    for (class, name) in [
+        (None, "Image"),
+        (Some("StringValue"), "Value"),
+        (Some("TextLabel"), "Text"),
+    ] {
+        let before = Map::from_iter([(name.to_string(), url.clone())]);
+        let after = Map::from_iter([(name.to_string(), uri.clone())]);
+        assert_eq!(
+            changed_fields_of(class, &before, &after, true).len(),
+            1,
+            "{class:?}.{name}"
+        );
+        assert_eq!(
+            changed_fields_of(class, &after, &before, true).len(),
+            1,
+            "{class:?}.{name}"
+        );
+    }
+}
+
+#[test]
+fn rig_table_omissions_keep_authored_instance_properties() {
+    use crate::tests::support::{settings_document, settings_instance};
+    let mut rig = settings_instance("rig", "AnimationRigData", "AnimationRigData", None);
+    rig.properties = serde_json::from_value(json!({
+        "rootMotion": {"_type": "BinaryString", "base64": "AQI="},
+        "articulatedJoint": "",
+        "Tags": ["authored"],
+        "Archivable": false,
+    }))
+    .unwrap();
+    let mut document = settings_document(vec![rig]);
+    assert_eq!(
+        omit_engine_managed_properties(&mut document, &[]),
+        BTreeMap::from([("articulatedJoint".into(), 1), ("rootMotion".into(), 1)]),
+        "an unfilled table is saved as an empty string"
+    );
+    assert_eq!(
+        document.instances[0].properties["Tags"],
+        json!(["authored"])
+    );
+    assert_eq!(document.instances[0].properties["Archivable"], false);
+}
+
+#[test]
+fn changed_field_scan_knows_class_defaults_and_asset_spellings() {
+    let saved = serde_json::from_value::<Map<String, Value>>(json!({
+        "Gravity": 196.2,
+        "StreamingEnabled": false,
+        "FallenPartsDestroyHeight": -500.0,
+    }))
+    .unwrap();
+    let project =
+        serde_json::from_value::<Map<String, Value>>(json!({"FallenPartsDestroyHeight": -500.0}))
+            .unwrap();
+    assert!(
+        changed_fields_of(Some("Workspace"), &saved, &project, false).is_empty(),
+        "a saved place spells every field, a project only the ones off their default"
+    );
+    let mut lighter = saved.clone();
+    lighter["Gravity"] = json!(50.0);
+    assert_eq!(
+        changed_fields_of(Some("Workspace"), &lighter, &project, false),
+        json!([{"name":"Gravity"}]).as_array().unwrap().clone()
+    );
+    assert_eq!(
+        changed_fields(&saved, &project, false).len(),
+        2,
+        "without a class nothing is a default"
+    );
+
+    let mut place = WeakDom::new(InstanceBuilder::new("DataModel"));
+    place.insert(
+        place.root_ref(),
+        InstanceBuilder::new("Workspace")
+            .with_property("Gravity", 50.0f32)
+            .with_property(
+                "CSGAsyncDynamicCollision",
+                rbx_dom_weak::types::Enum::from_u32(0),
+            )
+            .with_property(
+                "WorldPivotData",
+                CFrame::new(Vector3::new(0.0, 0.0, 0.0), Matrix3::identity()),
+            ),
+    );
+    place.insert(
+        place.root_ref(),
+        InstanceBuilder::new("StarterPlayer")
+            .with_property("GameSettingsAssetIDFace", 0i64)
+            .with_property("CharacterWalkSpeed", 16.0f32),
+    );
+    let omitted = omit_unsaved_service_properties(&mut place).unwrap();
+    assert_eq!(
+        omitted,
+        BTreeMap::from([
+            ("CSGAsyncDynamicCollision".to_string(), 1),
+            ("GameSettingsAssetIDFace".to_string(), 1),
+            ("WorldPivotData".to_string(), 1),
+        ]),
+        "Studio's own service state the project never carries"
+    );
+    let workspace = place.get_by_ref(place.root().children()[0]).unwrap();
+    assert!(
+        workspace
+            .properties
+            .contains_key(&rbx_dom_weak::Ustr::from("Gravity"))
+    );
+    let attribute =
+        serde_json::from_value::<Map<String, Value>>(json!({"Anchored": false})).unwrap();
+    assert_eq!(
+        changed_fields(&attribute, &Map::new(), false),
+        json!([{"name":"Anchored"}]).as_array().unwrap().clone(),
+        "an attribute named like a property is still a deletion"
+    );
+    let placeholder = serde_json::from_value::<Map<String, Value>>(json!({
+        "PhysicalConfigData": {"_type": "BinaryString", "base64": "Q1NHUEhTAAAAAEJMT0NL"},
+    }))
+    .unwrap();
+    assert_eq!(
+        changed_fields_of(Some("MeshPart"), &placeholder, &Map::new(), false).len(),
+        1,
+        "a box placeholder is reported even if a default happened to match"
+    );
+
+    let url = serde_json::from_value::<Map<String, Value>>(
+        json!({"TextureContent": "http://www.roblox.com/asset/?id=13125202269"}),
+    )
+    .unwrap();
+    let uri = serde_json::from_value::<Map<String, Value>>(
+        json!({"TextureContent": "rbxassetid://13125202269"}),
+    )
+    .unwrap();
+    assert!(changed_fields_of(Some("Decal"), &url, &uri, false).is_empty());
+    let other = serde_json::from_value::<Map<String, Value>>(
+        json!({"TextureContent": "rbxassetid://13125202270"}),
+    )
+    .unwrap();
+    assert_eq!(
+        changed_fields_of(Some("Decal"), &url, &other, false).len(),
+        1
+    );
+}
+
+#[test]
 fn changed_field_scan_ignores_empty_blobs_and_float_noise() {
     let before = serde_json::from_value::<Map<String, Value>>(json!({
         "CFrame": {"_type": "CFrame", "components": [937.5429, 26.621252, 888.5725, -0.363981, 0.0, -0.9314095, 0.0, 0.99999624, 0.0, 0.9314095, 0.0, -0.363981]},

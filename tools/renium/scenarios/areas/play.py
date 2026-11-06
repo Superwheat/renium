@@ -24,8 +24,10 @@ from run import ScenarioSkip, RBX, Context, Scenario
 
 MAIN = "src/ServerScriptService/Main.server.luau"
 SAMPLER = (
-    "local U = game:GetService('UserInputService') state.down = 0 "
-    "while true do if U:IsKeyDown(Enum.KeyCode.W) then state.down += 0.05 end task.wait(0.05) end"
+    # Measured by the clock, not by counting waits: a client below 60 fps
+    # stretches task.wait(0.05) to whole frames and would undercount.
+    "local U = game:GetService('UserInputService') state.down = 0 local last = os.clock() "
+    "while true do local now = os.clock() if U:IsKeyDown(Enum.KeyCode.W) then state.down += now - last end last = now task.wait(0.05) end"
 )
 LOGGER = (
     "local m = game.ReplicatedStorage:FindFirstChild('Log') or Instance.new('ModuleScript') "
@@ -430,10 +432,16 @@ def orphans_of_a_closed_edit_window(ctx: Context):
         ctx.reopen_studio()
         pids = _orphaned_test(ctx)
         ctx.expect(_poll(ctx, lambda: _orphan_pids(ctx) == pids, 20, 1), f"second orphan set {_orphan_pids(ctx)} vs {pids}")
-        ctx.reopen_studio()
+        reopened = ctx.reopen_studio()
         started = ctx.rbx("play", "-s", "-p", "2", timeout=300)
         try:
-            ctx.expect(sorted(started.get("closedOrphans") or []) == pids, f"closedOrphans: {started.json}")
+            if sys.platform == "darwin":
+                # Studio on macOS opens a new window beside a running test server as
+                # a client of that test, so the reopen closes the orphans first.
+                ctx.expect(sorted(reopened.get("closedOrphans") or []) == pids, f"ro closedOrphans: {reopened.json}")
+                ctx.expect(not started.get("closedOrphans"), f"no orphans left for the start: {started.json}")
+            else:
+                ctx.expect(sorted(started.get("closedOrphans") or []) == pids, f"closedOrphans: {started.json}")
         finally:
             _stop(ctx)
     finally:
