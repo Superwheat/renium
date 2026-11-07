@@ -12,7 +12,8 @@ rbx f ServerScriptService -c Script --limit 5
 rbx f ReplicatedStorage --path Vehicles.Cars -c Model
 rbx tr Workspace Door --depth 2 --limit 100
 rbx in Workspace -i editor:id
-rbx bg Workspace Lobby.Door Anchored
+rbx in ReplicatedStorage Cars.Deltor.Engine Cars.Deltor.Wheels
+rbx bg Workspace Lobby.Door Anchored Transparency CanCollide
 rbx bg Workspace -i editor:id Name
 rbx bg Workspace -p Gravity
 rbx ss DataStoreService UpdateAsync --limit 20
@@ -23,7 +24,7 @@ rbx sg RemoteEvent --limit 100
 `ss` finds scripts containing every keyword, case-insensitively. `sg` finds literal lines, case-sensitive by default. Limits cap returned results, not totals. Read known scripts directly; use `sr` for bounded reads when file access is unavailable.
 
 Several new instances are one `rbx ba --batch -` run: pipe `{"ops":[{"parent":"ServerScriptService.Battle","name":"Abilities","class":"Folder","ref":"abilities"},{"parent":"#abilities","name":"CarMods","class":"ModuleScript","source":"return {}"}]}`; each store is written once; a validation failure writes nothing, and the error names any store already written.
-Several reads in one store are one `bb` batch, not a `bg` per value: `'{"ops":[{"type":"search","q":"Door","limit":5,"fields":"lookup,prop:Anchored"},{"type":"counts"}]}' | rbx bb Workspace -J -`; `in SERVICE TARGET -F attrs,props` reads every field of one instance.
+`bg` with several property names prints one object; `in` with several targets prints one array: one decode, one call. Several reads across instances are one `bb` batch, not a `bg` per value: `'{"ops":[{"type":"search","q":"Door","limit":5,"fields":"lookup,prop:Anchored"},{"type":"counts"}]}' | rbx bb Workspace -J -`; `in SERVICE TARGET -F attrs,props` reads every field of one instance.
 Use one lookup on the relevant state: `f` for saved data, `q` for a closed place, `l` for unsaved Studio state. Refine ambiguous results instead of repeating the query through different tools. Git comparisons are useful when the question concerns revisions, not as an extra existence check.
 
 ## Edit

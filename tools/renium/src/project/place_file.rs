@@ -321,13 +321,12 @@ pub(crate) fn query_place(args: QueryPlaceArgs) -> Result<()> {
         .map(str::trim)
         .filter(|query| !query.is_empty())
         .map(str::to_ascii_lowercase);
-    let name = args.name.as_deref().filter(|name| !name.is_empty());
-    let class_name = args
-        .class_name
-        .as_deref()
-        .filter(|class_name| !class_name.is_empty());
-    let source = args.source.as_deref().filter(|source| !source.is_empty());
-    if query.is_none() && name.is_none() && class_name.is_none() && source.is_none() {
+    // Repeated selectors of one kind match any of their values, so one decode
+    // of the place answers several lookups.
+    let names = non_empty(&args.name);
+    let class_names = non_empty(&args.class_name);
+    let sources = non_empty(&args.source);
+    if query.is_none() && names.is_empty() && class_names.is_empty() && sources.is_empty() {
         bail!("Provide a query, --name, --class, or --source");
     }
     let properties = PropertyRequest::parse(&args.props)?;
@@ -352,11 +351,15 @@ pub(crate) fn query_place(args: QueryPlaceArgs) -> Result<()> {
             continue;
         };
         searched += 1;
-        if name.is_some_and(|name| instance.name != name)
-            || class_name.is_some_and(|class_name| instance.class.as_str() != class_name)
-            || source.is_some_and(|source| {
-                script_source(&dom, referent).is_none_or(|candidate| !candidate.contains(source))
-            })
+        if !names.is_empty() && !names.iter().any(|name| instance.name == *name)
+            || !class_names.is_empty()
+                && !class_names
+                    .iter()
+                    .any(|class_name| instance.class.as_str() == *class_name)
+            || !sources.is_empty()
+                && script_source(&dom, referent).is_none_or(|candidate| {
+                    !sources.iter().any(|source| candidate.contains(source))
+                })
             || query.as_ref().is_some_and(|query| {
                 !instance.name.to_ascii_lowercase().contains(query)
                     && !instance.class.as_str().to_ascii_lowercase().contains(query)
@@ -382,7 +385,7 @@ pub(crate) fn query_place(args: QueryPlaceArgs) -> Result<()> {
         "searched": searched,
         "truncated": truncated,
     });
-    if result["matches"].as_array().is_some_and(Vec::is_empty) && source.is_none() {
+    if result["matches"].as_array().is_some_and(Vec::is_empty) && sources.is_empty() {
         result["hint"] = json!(
             "A query matches instance names and classes only; use -s TEXT to search script source"
         );
@@ -392,6 +395,15 @@ pub(crate) fn query_place(args: QueryPlaceArgs) -> Result<()> {
     }
     crate::app::output::drop_false(&mut result, &["truncated"]);
     print_json_output(&result, args.pretty)
+}
+
+fn non_empty(values: &[String]) -> Vec<&str> {
+    values
+        .iter()
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect()
 }
 
 /// Text mode prints each match as the dotted path every other command prints:
@@ -868,6 +880,29 @@ mod tests {
                 "{extension}: {result}"
             );
             assert_eq!(workspace["unknown"], json!(["Position", "Bogus"]));
+            let several = query(&[
+                "-n",
+                "Door",
+                "-n",
+                "Vote",
+                "-c",
+                "Part",
+                "-c",
+                "ImageButton",
+            ])
+            .unwrap();
+            let mut names = several["matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["path"].as_array().unwrap().last().unwrap().clone())
+                .collect::<Vec<_>>();
+            names.sort_by_key(|name| name.as_str().unwrap_or_default().to_string());
+            assert_eq!(
+                names,
+                json!(["Door", "Vote"]).as_array().unwrap().clone(),
+                "{extension}: several selectors match any of their values"
+            );
             let door = query(&[
                 "-n",
                 "Door",

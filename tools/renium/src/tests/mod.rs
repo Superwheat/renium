@@ -189,45 +189,136 @@ fn changed_directory_collects_every_external_script() {
 }
 
 #[test]
-fn get_property_accepts_the_property_after_the_target() {
-    let name = |arguments: &[&str]| {
+fn get_property_accepts_the_properties_after_the_target() {
+    let names = |arguments: &[&str]| {
         let mut args = BytecodeGetPropertyArgs::try_parse_from(
             std::iter::once("bg").chain(arguments.iter().copied()),
         )
         .unwrap();
-        let property =
-            crate::bytecode::get_property_name(&mut args).map_err(|error| error.to_string());
-        (property, args.selector.target)
+        let properties =
+            crate::bytecode::get_property_names(&mut args).map_err(|error| error.to_string());
+        (properties, args.selector.target)
     };
+    let one = |name: &str| Ok(vec![name.to_string()]);
     assert_eq!(
-        name(&["Workspace", "Lobby.Door", "Anchored"]),
-        (Ok("Anchored".into()), Some("Lobby.Door".into()))
+        names(&["Workspace", "Lobby.Door", "Anchored"]),
+        (one("Anchored"), Some("Lobby.Door".into()))
     );
     assert_eq!(
-        name(&["Workspace", "Lobby.Door", "-p", "Anchored"]),
-        (Ok("Anchored".into()), Some("Lobby.Door".into()))
+        names(&["Workspace", "Lobby.Door", "-p", "Anchored"]),
+        (one("Anchored"), Some("Lobby.Door".into()))
     );
     assert_eq!(
-        name(&["Workspace", "-p", "Gravity"]),
-        (Ok("Gravity".into()), None)
+        names(&["Workspace", "-p", "Gravity"]),
+        (one("Gravity"), None)
     );
     assert_eq!(
-        name(&["Workspace", "-i", "editor:door", "Anchored"]),
-        (Ok("Anchored".into()), None)
+        names(&["Workspace", "-i", "editor:door", "Anchored"]),
+        (one("Anchored"), None)
     );
-    let (missing, target) = name(&["Workspace", "Gravity"]);
+    // Several names, flagged or positional, read in one call without repeats.
+    assert_eq!(
+        names(&[
+            "Workspace",
+            "Lobby.Door",
+            "Anchored",
+            "Transparency",
+            "Anchored"
+        ]),
+        (
+            Ok(vec!["Anchored".to_string(), "Transparency".to_string()]),
+            Some("Lobby.Door".into())
+        )
+    );
+    assert_eq!(
+        names(&["Workspace", "Lobby.Door", "Anchored", "-p", "Name"]).0,
+        Ok(vec!["Name".to_string(), "Anchored".to_string()])
+    );
+    let (missing, target) = names(&["Workspace", "Gravity"]);
     assert!(
         missing
             .unwrap_err()
             .contains("rbx bg SERVICE TARGET PROPERTY")
     );
     assert_eq!(target, Some("Gravity".into()));
-    assert!(
-        name(&["Workspace", "Lobby.Door", "Anchored", "-p", "Name"])
-            .0
-            .unwrap_err()
-            .contains("twice")
+}
+
+#[test]
+fn inspect_prints_one_array_for_several_targets_and_get_one_object_for_several_properties() {
+    use clap::Parser;
+    let dir = temp_dir("inspect-several-targets");
+    let service_dir = dir.join("src").join("Workspace");
+    fs::create_dir_all(&service_dir).unwrap();
+    let settings_file = service_settings_path(&service_dir);
+    let mut door = settings_instance("editor:door", "Door", "Part", Some(0));
+    door.properties
+        .insert("Anchored".to_string(), serde_json::json!(true));
+    door.properties
+        .insert("Transparency".to_string(), serde_json::json!(0.5));
+    let gate = settings_instance("editor:gate", "Gate", "Part", Some(0));
+    settings_document(vec![
+        settings_instance("root", "Workspace", "Workspace", None),
+        door,
+        gate,
+    ])
+    .write_file(&settings_file)
+    .unwrap();
+    let root = dir.to_str().unwrap();
+    let several = crate::app::output::capture_json_output(|| {
+        crate::bytecode::inspect_command(
+            crate::cli::InspectArgs::try_parse_from([
+                "in",
+                "-r",
+                root,
+                "Workspace",
+                "Door",
+                "Gate",
+                "-F",
+                "n,c",
+            ])
+            .unwrap(),
+        )
+    })
+    .unwrap();
+    assert_eq!(
+        several,
+        serde_json::json!([{"n": "Door", "c": "Part"}, {"n": "Gate", "c": "Part"}])
     );
+    let one = crate::app::output::capture_json_output(|| {
+        crate::bytecode::inspect_command(
+            crate::cli::InspectArgs::try_parse_from([
+                "in",
+                "-r",
+                root,
+                "Workspace",
+                "Door",
+                "-F",
+                "n",
+            ])
+            .unwrap(),
+        )
+    })
+    .unwrap();
+    assert_eq!(one, serde_json::json!({"n": "Door"}));
+    let values = crate::app::output::capture_json_output(|| {
+        bytecode_get_property(
+            BytecodeGetPropertyArgs::try_parse_from([
+                "bg",
+                settings_file.to_str().unwrap(),
+                "-i",
+                "editor:door",
+                "Anchored",
+                "Transparency",
+            ])
+            .unwrap(),
+        )
+    })
+    .unwrap();
+    assert_eq!(
+        values,
+        serde_json::json!({"Anchored": true, "Transparency": 0.5})
+    );
+    fs::remove_dir_all(dir).unwrap();
 }
 
 fn get_source_property_args(settings_file: &Path) -> BytecodeGetPropertyArgs {

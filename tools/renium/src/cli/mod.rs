@@ -123,17 +123,22 @@ pub(super) struct QueryPlaceArgs {
     pub(super) input: PathBuf,
     #[arg(help = "Text to match in names", value_name = "QUERY")]
     pub(super) query: Option<String>,
-    #[arg(help = "Match exact name", short, long)]
-    pub(super) name: Option<String>,
-    #[arg(help = "Match class name", short, long, alias = "class")]
-    pub(super) class_name: Option<String>,
+    #[arg(help = "Match exact name (repeatable: any of them)", short, long)]
+    pub(super) name: Vec<String>,
     #[arg(
-        help = "Text to match in script sources",
+        help = "Match class name (repeatable: any of them)",
+        short,
+        long,
+        alias = "class"
+    )]
+    pub(super) class_name: Vec<String>,
+    #[arg(
+        help = "Text to match in script sources (repeatable: any of them)",
         short,
         long,
         value_name = "TEXT"
     )]
-    pub(super) source: Option<String>,
+    pub(super) source: Vec<String>,
     #[arg(
         help = "Print these saved property values for each match (comma separated, or all)",
         long,
@@ -1392,9 +1397,15 @@ pub(super) struct TreeArgs {
 }
 
 #[derive(Parser)]
-pub(super) struct InspectArgs {
+pub(crate) struct InspectArgs {
     #[command(flatten)]
     pub(super) target: HighLevelTargetArgs,
+    #[arg(
+        help = "More targets in the same service (names or dotted paths); several print one array",
+        value_name = "TARGET",
+        num_args = 0..
+    )]
+    pub(super) more_targets: Vec<String>,
     #[command(flatten)]
     pub(super) project: ProjectSourceArgs,
     #[arg(
@@ -1808,6 +1819,12 @@ pub(super) struct StartStopPlayArgs {
     )]
     pub(super) result: Option<String>,
     #[arg(
+        help = "Return as soon as the session runs, without waiting for its players to join (a start waits up to 60 s for them and reports playersReady)",
+        long,
+        conflicts_with_all = ["until", "stop", "kill_orphans"]
+    )]
+    pub(super) no_ready: bool,
+    #[arg(
         help = "Close Studio test server/client windows whose Edit window has exited (with --place: that place's only)",
         long,
         conflicts_with_all = ["start", "stop", "restart", "players", "add_players", "leave", "mode", "until"]
@@ -2022,6 +2039,12 @@ pub(super) struct ExportModelCommandArgs {
 pub(super) struct ListClientsArgs {
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
+    #[arg(
+        help = "Wait up to SECONDS for a connected Studio before listing (no shell loop needed)",
+        long,
+        value_name = "SECONDS"
+    )]
+    pub(super) wait: Option<f64>,
 }
 
 #[derive(Parser)]
@@ -3030,17 +3053,18 @@ pub(super) struct BytecodeGetPropertyArgs {
     #[command(flatten)]
     pub(super) selector: BytecodeInstanceSelectorArgs,
     #[arg(
-        help = "Property or attribute name; also accepted after the target",
+        help = "Property or attribute name (repeatable); also accepted after the target",
         short,
         long,
         alias = "prop"
     )]
-    pub(super) property: Option<String>,
+    pub(super) property: Vec<String>,
     #[arg(
-        help = "Property or attribute name, after the target",
-        value_name = "PROPERTY"
+        help = "Property or attribute names, after the target; several print one object",
+        value_name = "PROPERTY",
+        num_args = 0..
     )]
-    pub(super) property_after_target: Option<String>,
+    pub(super) property_after_target: Vec<String>,
     #[arg(
         help = "auto, property or attribute",
         short = 'S',

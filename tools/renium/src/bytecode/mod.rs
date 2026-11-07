@@ -1598,7 +1598,7 @@ pub(super) fn tree_command(args: TreeArgs) -> Result<()> {
     print_json_output(&Value::Object(response), args.pretty)
 }
 
-pub(super) fn inspect_command(args: InspectArgs) -> Result<()> {
+pub(crate) fn inspect_command(args: InspectArgs) -> Result<()> {
     let HighLevelSelection {
         service,
         value: positional,
@@ -1613,26 +1613,42 @@ pub(super) fn inspect_command(args: InspectArgs) -> Result<()> {
     let ctx = high_level_context(&args.project.project_root, &args.project.src_root, &service)?;
     let mode = OutputMode::parse(&args.output)?;
     let fields = parse_requested_fields(Some(args.fields.as_str()));
-    let index = match high_level_target_resolution(
-        &ctx,
-        high_level_target(&args.target, positional.as_deref()),
-    )? {
-        HighLevelTargetResolution::Found(index) => index,
-        HighLevelTargetResolution::Ambiguous(indices) => {
-            return high_level_print_ambiguity(&ctx, mode, &indices, args.pretty);
-        }
-    };
-    let node = ctx.projection(mode, fields.as_ref()).node(index, true);
-    print_json_output(&node, args.pretty)
+    let projection = ctx.projection(mode, fields.as_ref());
+    // The first target may carry flag selectors; the extra positionals are
+    // names or dotted paths in the same store, resolved on the same decode.
+    let mut nodes = Vec::new();
+    let mut targets = vec![high_level_target(&args.target, positional.as_deref())];
+    targets.extend(args.more_targets.iter().map(|target| HighLevelTarget {
+        index: None,
+        settings_id: None,
+        name: None,
+        class_name: None,
+        path: None,
+        ordinals: None,
+        positional: Some(target.as_str()),
+    }));
+    for target in targets {
+        let index = match high_level_target_resolution(&ctx, target)? {
+            HighLevelTargetResolution::Found(index) => index,
+            HighLevelTargetResolution::Ambiguous(indices) => {
+                return high_level_print_ambiguity(&ctx, mode, &indices, args.pretty);
+            }
+        };
+        nodes.push(projection.node(index, true));
+    }
+    if args.more_targets.is_empty() {
+        return print_json_output(&nodes.remove(0), args.pretty);
+    }
+    print_json_output(&Value::Array(nodes), args.pretty)
 }
 
 pub(super) fn bytecode_get_property(mut args: BytecodeGetPropertyArgs) -> Result<()> {
-    if let Some(property) = adopt_positional_target(&mut args.input, None, &mut args.selector)
-        && let Some(extra) = args.property_after_target.replace(property)
-    {
-        bail!("Unexpected argument {extra:?}; use rbx bg -f STORE TARGET PROPERTY");
+    if let Some(property) = adopt_positional_target(&mut args.input, None, &mut args.selector) {
+        // The store file took the first positional; the word that was parsed
+        // as the target is really the first property name.
+        args.property_after_target.insert(0, property);
     }
-    let property = get_property_name(&mut args)?;
+    let properties = get_property_names(&mut args)?;
     let projected_service = project_service_input(
         args.input.settings_file.as_deref(),
         args.input.service_or_file.as_deref(),
@@ -1676,17 +1692,58 @@ pub(super) fn bytecode_get_property(mut args: BytecodeGetPropertyArgs) -> Result
         "No matching instance",
     )?
     .index;
+    let (path_segments, path_ordinals) = build_editor_instance_path_parts(&document, &service);
+    let mut values = Map::new();
+    for property in &properties {
+        let value = stored_property_value(
+            &document,
+            &service,
+            &settings_file,
+            index,
+            property,
+            scope,
+            source_paths.as_deref(),
+            canonical_settings_ids.as_deref().unwrap_or(&[]),
+            (&path_segments, &path_ordinals),
+        )?;
+        values.insert(property.clone(), value);
+    }
+    // One property prints its value alone, as before; several print one object
+    // keyed by the names as given, so one call reads a whole set.
+    if let [property] = properties.as_slice() {
+        let value = values
+            .remove(property)
+            .context("Property output is missing")?;
+        return print_json_output(&value, args.pretty);
+    }
+    print_json_output(&Value::Object(values), args.pretty)
+}
+
+type EditorPathParts<'a> = (&'a [Option<Vec<String>>], &'a [Option<Vec<usize>>]);
+
+#[allow(clippy::too_many_arguments)]
+fn stored_property_value(
+    document: &SettingsBytecode,
+    service: &str,
+    settings_file: &Path,
+    index: usize,
+    property: &str,
+    scope: PropertyScope,
+    source_paths: Option<&[Option<PathBuf>]>,
+    canonical_settings_ids: &[Option<String>],
+    (path_segments, path_ordinals): EditorPathParts<'_>,
+) -> Result<Value> {
     if property.eq_ignore_ascii_case("source")
         && is_lua_source_class(&document.instances[index].class_name)
     {
         let direct_source_paths;
-        let source_paths = if let Some(source_paths) = source_paths.as_ref() {
+        let source_paths = if let Some(source_paths) = source_paths {
             source_paths
         } else {
-            let service_directory = crate::project::storage::source_directory(&settings_file);
+            let service_directory = crate::project::storage::source_directory(settings_file);
             let service_dir = service_directory.as_path();
             direct_source_paths =
-                build_editor_source_paths_by_index(&document, &service, service_dir);
+                build_editor_source_paths_by_index(document, service, service_dir);
             &direct_source_paths
         };
         if let Some(Some(path)) = source_paths.get(index)
@@ -1694,40 +1751,36 @@ pub(super) fn bytecode_get_property(mut args: BytecodeGetPropertyArgs) -> Result
         {
             let source = fs::read_to_string(path)
                 .with_context(|| format!("Failed to read source mirror {}", path.display()))?;
-            return print_json_output(&json!(source), args.pretty);
+            return Ok(json!(source));
         }
     }
-    let canonical_property = canonical_stored_property_name(&document, index, &property, scope)?;
+    let canonical_property = canonical_stored_property_name(document, index, property, scope)?;
     let value =
-        instance_api::get_instance_property(&document, index, &property, scope).or_else(|| {
+        instance_api::get_instance_property(document, index, property, scope).or_else(|| {
             canonical_property.as_deref().and_then(|property| {
-                instance_api::get_instance_property(&document, index, property, scope)
+                instance_api::get_instance_property(document, index, property, scope)
             })
         });
     if let Some(value) = value {
-        let (path_segments, path_ordinals) = build_editor_instance_path_parts(&document, &service);
         let mut record = Map::from_iter([("value".to_string(), value)]);
         stabilize_reference_output(
-            &document,
-            &path_segments,
-            &path_ordinals,
-            canonical_settings_ids.as_deref().unwrap_or(&[]),
+            document,
+            path_segments,
+            path_ordinals,
+            canonical_settings_ids,
             &mut record,
         );
-        let value = record
-            .remove("value")
-            .context("Property output is missing")?;
-        return print_json_output(&value, args.pretty);
+        return record.remove("value").context("Property output is missing");
     }
     if matches!(scope, PropertyScope::Auto | PropertyScope::Property)
         && let Some((_, value)) =
-            reflected_property_default(&document.instances[index].class_name, &property)
+            reflected_property_default(&document.instances[index].class_name, property)
     {
-        return print_json_output(&value, args.pretty);
+        return Ok(value);
     }
     bail!(
         "{}",
-        property_not_found_message(&document.instances[index], &service, &property, scope)
+        property_not_found_message(&document.instances[index], service, property, scope)
     )
 }
 
@@ -1859,25 +1912,38 @@ fn edit_distance(left: &str, right: &str) -> usize {
     previous[right.len()]
 }
 
-pub(crate) fn get_property_name(args: &mut BytecodeGetPropertyArgs) -> Result<String> {
-    match (args.property.take(), args.property_after_target.take()) {
-        (Some(flag), Some(word)) if flag != word => {
-            bail!("Property given twice: {flag} and {word}")
+/// The property names a `bg` call asks for, from `-p` flags and the words
+/// after the target, in the order given and without repeats.
+pub(crate) fn get_property_names(args: &mut BytecodeGetPropertyArgs) -> Result<Vec<String>> {
+    let mut properties = Vec::new();
+    for property in args
+        .property
+        .drain(..)
+        .chain(args.property_after_target.drain(..))
+    {
+        if !properties.contains(&property) {
+            properties.push(property);
         }
-        (Some(property), _) | (None, Some(property)) => return Ok(property),
-        (None, None) => {}
     }
+    // With a flag selector (-i, -x, -n, -c, --path) the first positional word
+    // is a property name, not a target.
     let selector = &mut args.selector;
     let flagged = selector.settings_id.is_some()
         || selector.index.is_some()
         || selector.name.is_some()
         || selector.class_name.is_some()
         || selector.path_segments_json.is_some();
-    if flagged && let Some(property) = selector.target.take() {
-        return Ok(property);
+    if flagged
+        && let Some(property) = selector.target.take()
+        && !properties.contains(&property)
+    {
+        properties.insert(0, property);
+    }
+    if !properties.is_empty() {
+        return Ok(properties);
     }
     bail!(
-        "Name the property: rbx bg SERVICE TARGET PROPERTY, or -p PROPERTY for the service itself"
+        "Name the property: rbx bg SERVICE TARGET PROPERTY [PROPERTY...], or -p PROPERTY for the service itself"
     )
 }
 

@@ -145,6 +145,18 @@ pub(crate) struct MultiEditArgs {
 pub(crate) struct InputArgs {
     #[arg(short = 'p', long)]
     player: Option<String>,
+    #[arg(
+        help = "After the actions, evaluate this Luau expression (or chunk) on the same client and return it as result",
+        long,
+        value_name = "LUAU"
+    )]
+    result: Option<String>,
+    #[arg(
+        help = "After the actions, screenshot the same client to this PNG path and return it as shot",
+        long,
+        value_name = "PATH"
+    )]
+    shot: Option<PathBuf>,
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     actions: Vec<String>,
     #[command(flatten)]
@@ -626,13 +638,56 @@ fn input_actions(tokens: &[String]) -> Result<Vec<Value>> {
 
 pub(crate) fn input(args: InputArgs, project: Option<&Path>) -> Result<()> {
     let actions = input_actions(&args.actions)?;
-    run_daemon(
+    let mut result = daemon_result(
         op::INPUT,
         project,
         json!({ "player": args.player, "actions": actions }),
         false,
         Some(&args.bridge),
-    )
+    )?;
+    // The follow-ups run on the same client once the actions are in, so one
+    // call covers "act, then look": a typed observation and a screenshot.
+    if result.get("ok") != Some(&Value::Bool(false)) {
+        if let Some(code) = args.result.as_deref() {
+            let observed = daemon_result(
+                op::LUAU,
+                project,
+                json!({
+                    "code": crate::studio::automation::returning_luau_body(code, "result expression")?,
+                    "client": true,
+                    "player": args.player,
+                    "timeout": 10,
+                    "bridgeWaitSeconds": args.bridge.wait_seconds,
+                    "bridgePorts": args.bridge.ports,
+                }),
+                false,
+                Some(&args.bridge),
+            )?;
+            result["result"] = observed
+                .get("results")
+                .and_then(Value::as_array)
+                .and_then(|values| values.first().cloned())
+                .unwrap_or(Value::Null);
+        }
+        if let Some(path) = args.shot.as_ref() {
+            let output = crate::studio::automation::absolute_from_cwd(path.clone());
+            let shot = daemon_result(
+                op::SHOT,
+                project,
+                json!({
+                    "output": output,
+                    "player": args.player,
+                    "client": true,
+                    "bridgeWaitSeconds": args.bridge.wait_seconds,
+                    "bridgePorts": args.bridge.ports,
+                }),
+                false,
+                Some(&args.bridge),
+            )?;
+            result["shot"] = shot.get("path").cloned().unwrap_or(json!(output));
+        }
+    }
+    app::output::print_json_output(&result, false)
 }
 
 pub(crate) fn place_add(args: PlaceAddArgs, project: Option<&Path>) -> Result<()> {

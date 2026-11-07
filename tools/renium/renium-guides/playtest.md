@@ -17,17 +17,18 @@ rbx status
 rbx play -s                         # ordinary Play: one window
 rbx play -s --players 2             # local server and two clients
 rbx play -s --players 2 --until 'shared.RoundHandler.GameState == "InRound"'
+rbx play -s --no-ready                 # return before the players have joined
 rbx play -r                         # restart after a code change (stops, then starts the same way)
 rbx play --add-players 2            # join churn: 2 more clients join the running test (8 max); returns their names
 rbx play --leave -p 2               # the server kicks client 2's player (PlayerRemoving fires) and closes its window
-rbx cs
+rbx cs --wait 30                    # block until a Studio is connected
 rbx play -x
 rbx play --kill-orphans             # close test windows whose Edit window was closed or restarted
 ```
 
 Across add/leave cycles the play server's `Stats.InstanceCount` grows by about 300 per cycle while `#game:GetDescendants()` and memory stay flat (measured over three cycles): those are engine-side objects outside the DataModel that Studio's test server keeps per client that ever connected, not a game leak. Judge leaks by DataModel counts and `rbx perf heap`, not by InstanceCount.
 
-Play keeps the scripts it started with; after editing server or client code, `rbx play -r` restarts the session with the mode and player count it was started with (`-p N` or `--mode` override them; a session started from Studio's own buttons restarts as ordinary Play and `restartNote` says so). `--until EXPR` returns once the server expression is true (`--until-timeout`, default 120 s), so no loop is needed before the first test step.
+A start waits up to 60 s until its players exist (`playersReady`, `readySeconds`); `--no-ready` skips that. Play keeps the scripts it started with; after editing server or client code, `rbx play -r` stops, lets Live Sync apply the edits it deferred during Play (`appliedPending`), and restarts the session with the mode and player count it was started with (`-p N` or `--mode` override them; a session started from Studio's own buttons restarts as ordinary Play and `restartNote` says so). `--until EXPR` returns once the server expression is true (`--until-timeout`, default 120 s), so no loop is needed before the first test step.
 
 `play -x` returns once the test's DataModels and windows are gone, so `play -s` can follow at once. A start Studio drops because the previous test is still ending or the place is still opening is requested again; the result then carries `retriedAfterMs`. `status` and `cs` list `orphans`: test windows whose Edit window has exited, which can block the next multi-client start. `play -s` closes the ones of its own place first (`closedOrphans`); `play --kill-orphans` closes them all.
 

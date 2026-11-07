@@ -538,7 +538,36 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
     if let Some(result) = args.result.as_deref() {
         wait_result_body(result)?;
     }
+    if args.restart {
+        // Edits saved during Play wait for Edit mode; stopping first and
+        // letting Live Sync settle makes the restarted session run them.
+        let stopped = daemon_control_request(op::PLAY_STOP, None, parameters.clone(), false)
+            .map(|stop| stop.get("ok") == Some(&Value::Bool(true)))
+            .unwrap_or(false);
+        let settled = settle_live_sync_before_restart(&args);
+        let mut result = daemon_control_request(operation, None, parameters, false)?;
+        if result.get("ok") != Some(&Value::Bool(false)) {
+            result["restarted"] = json!(stopped);
+            if let Some(settled) = settled {
+                result["appliedPending"] = settled;
+            }
+            attach_player_readiness(&mut result, &args);
+        }
+        if crate::app::output::compact_text_output() {
+            compact_play_result(&mut result, args.players.is_some());
+        }
+        return print_json_output(&result, false);
+    }
     let mut result = daemon_control_request(operation, None, parameters, false)?;
+    if args.until.is_none()
+        && !args.no_ready
+        && !args.stop
+        && args.add_players.is_none()
+        && !args.leave
+        && result.get("ok") != Some(&Value::Bool(false))
+    {
+        attach_player_readiness(&mut result, &args);
+    }
     if let Some(condition) = args.until.as_deref()
         && result.get("ok").and_then(Value::as_bool) != Some(false)
     {
@@ -575,6 +604,92 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
     print_json_output(&result, false)
 }
 
+/// The server-side condition a started session is ready for its first test
+/// step: every requested client has a Player, or the one player of ordinary
+/// Play. Run and server sessions have no players to wait for.
+fn player_readiness_condition(players: Option<u32>, mode: Option<&str>) -> Option<String> {
+    match (players, mode.unwrap_or("play")) {
+        (_, "run" | "server") => None,
+        (Some(count), _) => Some(format!("#game.Players:GetPlayers() >= {count}")),
+        (None, _) => Some("#game.Players:GetPlayers() >= 1".to_string()),
+    }
+}
+
+const PLAYER_READY_SECONDS: f64 = 60.0;
+
+/// Waits for the session's players and records `playersReady` (and how long
+/// it took) on the start result; a timeout is reported, not failed, so the
+/// start itself still counts.
+fn attach_player_readiness(result: &mut Value, args: &StartStopPlayArgs) {
+    let Some(condition) = player_readiness_condition(args.players, args.mode.as_deref()) else {
+        return;
+    };
+    let wait = daemon_control_request(
+        op::WAIT,
+        None,
+        json!({
+            "condition": condition,
+            "server": true,
+            "timeout": PLAYER_READY_SECONDS,
+            "editRuntimeId": result.get("editRuntimeId"),
+            "bridgeWaitSeconds": args.bridge.wait_seconds,
+            "bridgePorts": args.bridge.ports,
+        }),
+        false,
+    );
+    match wait {
+        Ok(wait) if wait.get("ok") == Some(&Value::Bool(true)) => {
+            result["playersReady"] = json!(true);
+            if let Some(elapsed) = wait.get("elapsedSeconds") {
+                result["readySeconds"] = elapsed.clone();
+            }
+        }
+        Ok(wait) => {
+            result["playersReady"] = json!(false);
+            result["readyError"] = wait
+                .get("error")
+                .cloned()
+                .unwrap_or_else(|| json!("the players did not join in time"));
+        }
+        Err(error) => {
+            result["playersReady"] = json!(false);
+            result["readyError"] = json!(format!("{error:#}"));
+        }
+    }
+}
+
+/// Before a restart, gives Live Sync up to 30 s to apply the file edits it
+/// deferred while Play ran; `None` when Live Sync is not running.
+fn settle_live_sync_before_restart(args: &StartStopPlayArgs) -> Option<Value> {
+    let status = daemon_control_request(
+        op::LIVE_STATUS,
+        None,
+        json!({
+            "settleWaitSeconds": 30.0,
+            "bridgeWaitSeconds": args.bridge.wait_seconds,
+            "bridgePorts": args.bridge.ports,
+        }),
+        false,
+    )
+    .ok()?;
+    let running = status
+        .get("daemon")
+        .and_then(|daemon| daemon.get("running"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !running {
+        return None;
+    }
+    Some(json!({
+        "pendingChanges": status.get("pendingChanges").cloned().unwrap_or(json!(0)),
+        "settled": status
+            .get("daemon")
+            .and_then(|daemon| daemon.get("settled"))
+            .cloned()
+            .unwrap_or(json!(true)),
+    }))
+}
+
 /// Adds the `--until` outcome to a Play start result: the wait record under
 /// `until`, and the typed `--result` observation under `result` so callers
 /// read it beside the launch fields. Returns whether the wait succeeded.
@@ -597,6 +712,7 @@ fn compact_play_result(result: &mut Value, named_players: bool) {
     if map.get("ok") != Some(&Value::Bool(true)) {
         return;
     }
+    map.remove("readySeconds");
     if let Some(clients) = map.get("clients").and_then(Value::as_array) {
         let value = if named_players {
             json!(
@@ -2917,6 +3033,12 @@ fn wait_condition_body(condition: &str) -> Result<String> {
     returning_body(condition, "condition")
 }
 
+/// A Luau expression or chunk made into a chunk that returns its value, for
+/// callers outside this module that compose a read after another operation.
+pub(crate) fn returning_luau_body(code: &str, what: &str) -> Result<String> {
+    returning_body(code, what)
+}
+
 /// The body of the one-shot observation a wait evaluates once its condition
 /// holds; it takes the same expression or chunk forms as the condition.
 fn wait_result_body(result: &str) -> Result<String> {
@@ -3688,7 +3810,7 @@ pub(crate) fn wait_until_command(args: WaitUntilArgs) -> Result<()> {
 
 /// A path argument names a file relative to where the command runs, like
 /// every other path a command takes; the daemon has no cwd of its own.
-fn absolute_from_cwd(path: PathBuf) -> PathBuf {
+pub(crate) fn absolute_from_cwd(path: PathBuf) -> PathBuf {
     if path.is_absolute() {
         path
     } else {
@@ -3750,7 +3872,22 @@ pub(crate) fn record_end_command(args: RecordEndArgs) -> Result<()> {
 }
 
 pub(crate) fn list_clients_command(args: ListClientsArgs) -> Result<()> {
-    let result = daemon_result(op::STUDIOS, None, json!({}), false, Some(&args.bridge))?;
+    let deadline = args
+        .wait
+        .map(|seconds| Instant::now() + Duration::from_secs_f64(seconds.clamp(0.0, 3600.0)));
+    let result = loop {
+        let result = daemon_result(op::STUDIOS, None, json!({}), false, Some(&args.bridge))?;
+        let connected = result
+            .get("clients")
+            .and_then(Value::as_array)
+            .is_some_and(|clients| !clients.is_empty());
+        match deadline {
+            Some(deadline) if !connected && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(500));
+            }
+            _ => break result,
+        }
+    };
     let mut clients = result
         .get("clients")
         .and_then(Value::as_array)
@@ -4794,6 +4931,20 @@ mod settled_start_tests {
 #[cfg(test)]
 mod compact_result_tests {
     use super::*;
+
+    #[test]
+    fn a_started_session_waits_for_its_players_unless_it_has_none() {
+        assert_eq!(
+            player_readiness_condition(Some(2), Some("play")).as_deref(),
+            Some("#game.Players:GetPlayers() >= 2")
+        );
+        assert_eq!(
+            player_readiness_condition(None, None).as_deref(),
+            Some("#game.Players:GetPlayers() >= 1")
+        );
+        assert_eq!(player_readiness_condition(None, Some("run")), None);
+        assert_eq!(player_readiness_condition(Some(3), Some("server")), None);
+    }
 
     #[test]
     fn play_start_keeps_the_decision_fields() {

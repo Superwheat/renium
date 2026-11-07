@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Improvements
+
+- One call reads several saved values: `rbx bg SERVICE TARGET A B C` prints one object, `rbx in SERVICE T1 T2` one array, and `rbx q FILE -n A -n B -c Class -s TEXT` matches any of the repeated selectors in one decode of the place file.
+- `rbx play -s` waits up to 60 s until the session's players exist and reports `playersReady`; `--no-ready` returns at once. `rbx play -r` stops, lets Live Sync apply the file edits it deferred during Play (`appliedPending`), then restarts.
+- `rbx inp ... --result LUAU` evaluates an expression on the same client after the actions and `--shot PATH` screenshots it, so acting and checking is one call.
+- `rbx cs --wait SECONDS` blocks until a Studio is connected instead of needing a shell loop.
+
 ## 0.5.9 - 2026-11-06
 
 ### New

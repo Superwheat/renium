@@ -783,9 +783,10 @@ fn get_property_reports_missing_names_targets_stores_and_bad_arguments() {
     assert_eq!(err(&["-i", "nope", "Anchored"]), "No matching instance");
     assert!(err(&["Door"]).contains("Name the property: rbx bg SERVICE TARGET PROPERTY"));
     assert!(err(&["-x", "1", "-n", "Door", "Name"]).contains("Provide only one selector"));
-    assert!(err(&["Door", "-i", "door", "Name"]).contains("Give the target once"));
-    assert!(err(&["Door", "Size", "Extra"]).contains("Unexpected argument \"Extra\""));
-    assert!(err(&["Door", "Anchored", "-p", "Name"]).contains("Property given twice"));
+    // With a flag selector every positional word is a property name.
+    assert!(err(&["Door", "-i", "door", "Name"]).starts_with("Property not found: Door"));
+    // Several property names read in one call; a missing one still names itself.
+    assert!(err(&["Door", "Size", "Extra"]).starts_with("Property not found: Extra"));
     let missing_store = fx.store_arg("StarterGui");
     let missing_store = fx.text(&["bg", "-f", &missing_store, "-p", "Name"]).err();
     assert!(
