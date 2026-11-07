@@ -21,7 +21,7 @@ rbx sg RemoteEvent --limit 100
 ```
 
 `f SERVICE text` searches text; `-n` matches an exact name; `--path` limits the search to one subtree. `tr`, `in` and `f` also take one dotted argument (`rbx tr StarterGui.Main.HUD.Timer`; the first segment is the service). A `Property not found` error lists the nearest stored and class property names; `rbx in SERVICE TARGET -F props` lists them all.
-`ss` finds scripts containing every keyword, case-insensitively. `sg` finds literal lines, case-sensitive by default. Limits cap returned results, not totals. Read known scripts directly; `sr` reads them when file access is unavailable.
+`ss` finds scripts containing every keyword, case-insensitively; `sg` finds literal lines, case-sensitive by default. Limits cap returned results, not totals. Read known scripts directly; `sr` reads them when file access is unavailable.
 
 Several new instances are one `rbx ba --batch -` run: pipe `{"ops":[{"parent":"ServerScriptService.Battle","name":"Abilities","class":"Folder","ref":"abilities"},{"parent":"#abilities","name":"CarMods","class":"ModuleScript","source":"return {}"}]}`; each store is written once; a validation failure writes nothing, and the error names any store already written.
 `bg` with several property names prints one object; `in` with several targets prints one array: one decode, one call. Several reads across instances are one `bb` batch, not a `bg` per value: `'{"ops":[{"type":"search","q":"Door","limit":5,"fields":"lookup,prop:Anchored"},{"type":"counts"}]}' | rbx bb Workspace -J -`; `in SERVICE TARGET -F attrs,props` reads every field of one instance.
@@ -39,7 +39,7 @@ rbx ba Workspace -I Lobby.Props -n NewPart -c Part -p 'Anchored=true' --push
 rbx bs Workspace Lobby.Door -p 'Transparency=0.5' -p 'CanCollide=false' --push
 rbx bss Workspace -i editor:script --str "return 1"
 rbx bcl Workspace -i editor:source -I editor:parent
-rbx mv Workspace -i editor:id -I editor:parent
+rbx mv Workspace -i editor:id -I editor:parent --push
 rbx mv StarterGui -i editor:id --to-service ReplicatedStorage -I editor:parent
 rbx br Workspace Lobby.OldPart
 ```
@@ -47,20 +47,17 @@ rbx br Workspace Lobby.OldPart
 Every store command takes the target the same way: a positional name or dotted path (`Lobby.Door`), `-i ID`, `-x INDEX`, `-n NAME` or `-c CLASS`. `bg` takes the property after the target or as `-p`; `bs` takes `-p`. `bg`/`bs` with no target address the service itself. Parent options (`-I`) take an ID or a dotted path. Duplicates take inline ordinals (`Borders.Border[4]`, the form compact output prints) or `--ords`.
 Use a service name or `-f STORE`, not both.
 
-Values: `--str`, `--num`, `--bool`, `--null`, or `-j JSON` (`-j -` reads stdin); several `-p NAME=JSON` set several properties at once. `--push` on `ba` and `bs` sends that one instance to Studio right away, with no review.
+Values: `--str`, `--num`, `--bool`, `--null`, or `-j JSON` (`-j -` reads stdin); several `-p NAME=JSON` set several properties at once. `--push` on `ba`, `bs`, `mv` and `rn` pushes that instance at once, no review; `ba --batch --push` pushes every created instance.
 `--null` removes an override; writing the default stores one.
 Unknown properties are rejected. `--scope property` explicitly selects a real property absent from the schema; `--scope attribute` selects an attribute.
 
-References use `-j '{"_type":"Ref","settingsId":"editor:target"}'`; clear with `--null`.
-Without an ID, use `pathSegments` and `pathOrdinals`.
+References use `-j '{"_type":"Ref","settingsId":"editor:target"}'`; clear with `--null`. Without an ID, use `pathSegments` and `pathOrdinals`.
 
-Edit existing script files directly; no follow-up `bss` is needed.
-For a new script, create its entry with `ba`, then edit the file. `bss --str` or `--source-file` writes source through the store.
+Edit existing script files directly. For a new script, write the file and create its entry with `ba` (it adopts the file); `bss --str` or `--source-file` writes source through the store.
 
 Check changed scripts together with `rbx ck`, which takes the `.luau`/`.lua` files git reports as changed in the project; name files or folders (`rbx ck src/ServerScriptService`) otherwise. It parses Luau offline without executing it; use `rbx ck -` for UTF-8 source on stdin. Errors include the file and syntax location, and return a failing exit code. This is not type checking, lint, or a behavior test.
 
-`changedPaths` lists actual file changes; empty means no-op. Live Sync sends them automatically.
-Without Live Sync, push returned paths with their settings IDs, not an entire service.
+`changedPaths` lists actual file changes; empty means no-op. Live Sync sends them automatically; without it, push returned paths with their settings IDs, not an entire service.
 
 ## Bulk and protected properties
 

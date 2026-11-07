@@ -1647,6 +1647,7 @@ fn move_command_defaults_to_the_target_service_root() {
             parent_settings_id: None,
             src_root: Some(PathBuf::from("src")),
             override_packages: false,
+            push: false,
         },
         None,
     )

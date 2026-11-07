@@ -248,6 +248,7 @@ fn metadata_property_change(
     settings_id: Option<String>,
     property: &str,
     value: Option<String>,
+    push: bool,
 ) -> BytecodeSetPropertyArgs {
     BytecodeSetPropertyArgs {
         input: BytecodeFileArgs::settings_file(settings_file),
@@ -260,7 +261,7 @@ fn metadata_property_change(
         value_null: false,
         scope: "metadata".to_string(),
         override_packages: true,
-        push: false,
+        push,
         pretty: false,
     }
 }
@@ -424,6 +425,7 @@ pub(crate) fn move_instance_command(args: MoveInstanceArgs, project: Option<&Pat
             source_id,
             "Parent",
             Some(parent_id),
+            args.push,
         ));
     } else {
         let src_root =
@@ -449,6 +451,7 @@ pub(crate) fn move_instance_command(args: MoveInstanceArgs, project: Option<&Pat
             Some(target.settings_id),
             "Parent",
             Some(parent_settings_id),
+            args.push,
         ));
     }
     move_instance_between_service_stores(
@@ -483,6 +486,7 @@ pub(crate) fn rename_instance_command(
             settings_id,
             "Name",
             Some(args.name),
+            args.push,
         ));
     } else {
         let src_root =
@@ -497,6 +501,7 @@ pub(crate) fn rename_instance_command(
         Some(target.settings_id),
         "Name",
         Some(args.name),
+        args.push,
     ))
 }
 

@@ -1762,6 +1762,43 @@ fn json_to_rbx_brick_color(value: &Value) -> Option<RbxBrickColor> {
 
 fn json_to_rbx_cframe(value: &Value) -> Option<RbxCFrame> {
     let value = json_wrapped_value(value, "CFrame");
+    if let Some(object) = json_object(value)
+        && object.get("components").is_none()
+        && let Some(position) = object.get("position").or_else(|| object.get("Position"))
+    {
+        // A CFrame given as a position with an optional 3x3 orientation (rows),
+        // the way agents and the Roblox API describe one.
+        let position = json_to_rbx_vector3(position)?;
+        let rows = object
+            .get("orientation")
+            .or_else(|| object.get("rotation"))
+            .map(|rows| {
+                let rows = rows.as_array()?;
+                if rows.len() != 3 {
+                    return None;
+                }
+                let mut out = [[0.0f32; 3]; 3];
+                for (row_out, row) in out.iter_mut().zip(rows) {
+                    let row = row.as_array()?;
+                    if row.len() != 3 {
+                        return None;
+                    }
+                    for (slot, item) in row_out.iter_mut().zip(row) {
+                        *slot = json_f32(item)?;
+                    }
+                }
+                Some(out)
+            })
+            .unwrap_or(Some([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]))?;
+        return Some(RbxCFrame::new(
+            position,
+            RbxMatrix3::new(
+                RbxVector3::new(rows[0][0], rows[0][1], rows[0][2]),
+                RbxVector3::new(rows[1][0], rows[1][1], rows[1][2]),
+                RbxVector3::new(rows[2][0], rows[2][1], rows[2][2]),
+            ),
+        ));
+    }
     let components = value
         .as_array()
         .or_else(|| json_object(value)?.get("components")?.as_array())?;

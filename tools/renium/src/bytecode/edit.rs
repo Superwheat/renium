@@ -160,7 +160,7 @@ pub(crate) struct StoreParentSelector {
 
 pub(crate) fn bytecode_add_instance(args: BytecodeAddInstanceArgs) -> Result<()> {
     if let Some(batch) = args.batch.as_deref() {
-        return crate::bytecode::add_batch::bytecode_add_batch(batch, args.pretty);
+        return crate::bytecode::add_batch::bytecode_add_batch(batch, args.pretty, args.push);
     }
     let (Some(name), Some(class_name)) = (args.name, args.class_name) else {
         bail!("Give -n NAME and -c CLASS, or --batch with JSON ops");
@@ -206,18 +206,26 @@ pub(crate) fn push_stored_instance(result: &mut Value) -> Result<()> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .context("The store edit did not name its instance; push the store file with `rbx ps`")?;
+    result["push"] = push_stored_instances(settings_file, vec![settings_id])?;
+    Ok(())
+}
+
+/// One scoped push of the given instances of one store, without a review;
+/// the summary is the push result.
+pub(crate) fn push_stored_instances(
+    settings_file: PathBuf,
+    settings_ids: Vec<String>,
+) -> Result<Value> {
     let mut args = crate::cli::PushEditorChangesArgs::new(
         crate::cli::ProjectSourceArgs::current(),
         crate::cli::BridgeConnectionArgs::default_connection(),
     );
     args.changed_paths = vec![settings_file];
-    args.target_settings_ids = vec![settings_id];
+    args.target_settings_ids = settings_ids;
     args.yes = true;
     args.verify_sources = true;
-    let summary = crate::editor::sync::push_editor_changes_result(args)
-        .context("The store was written but the push failed; push it with `rbx ps`")?;
-    result["push"] = summary;
-    Ok(())
+    crate::editor::sync::push_editor_changes_result(args)
+        .context("The store was written but the push failed; push it with `rbx ps`")
 }
 
 /// A script file imported with `--path-json` into a project whose service is

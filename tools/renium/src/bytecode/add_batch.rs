@@ -81,11 +81,42 @@ struct StorePlan {
 /// Resolves a service name to its store file and service hint.
 pub(crate) type StoreResolver<'a> = dyn Fn(&str) -> Result<(PathBuf, String)> + 'a;
 
-pub(crate) fn bytecode_add_batch(input: &Path, pretty: bool) -> Result<()> {
+pub(crate) fn bytecode_add_batch(input: &Path, pretty: bool, push: bool) -> Result<()> {
     let items = parse_batch_add_items(&read_batch_input(input)?)?;
-    let result = add_store_instances_batch(items, &|service| {
+    let mut result = add_store_instances_batch(items, &|service| {
         resolve_bytecode_cli_settings_file(None, Some(service), None)
     })?;
+    if push {
+        // Each store is pushed once, scoped to the instances it just gained.
+        let mut by_service: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for receipt in result
+            .get("created")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let (Some(service), Some(id)) = (
+                receipt.get("service").and_then(Value::as_str),
+                receipt.get("id").and_then(Value::as_str),
+            ) {
+                by_service
+                    .entry(service.to_string())
+                    .or_default()
+                    .push(id.to_string());
+            }
+        }
+        let mut pushes = serde_json::Map::new();
+        for (service, ids) in by_service {
+            let (settings_file, _) =
+                resolve_bytecode_cli_settings_file(None, Some(&service), None)?;
+            pushes.insert(
+                service,
+                crate::bytecode::edit::push_stored_instances(settings_file, ids)?,
+            );
+        }
+        result["push"] = Value::Object(pushes);
+    }
     print_json_output(&result, pretty)
 }
 

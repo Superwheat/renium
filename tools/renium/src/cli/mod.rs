@@ -1985,6 +1985,11 @@ pub(super) struct MoveInstanceArgs {
     pub(super) src_root: Option<PathBuf>,
     #[arg(help = "Allow edits inside linked packages", long)]
     pub(super) override_packages: bool,
+    #[arg(
+        help = "Push the moved instance to the open Studio place right away (scoped to it, no review)",
+        long
+    )]
+    pub(super) push: bool,
 }
 
 #[derive(Parser)]
@@ -1997,6 +2002,11 @@ pub(super) struct RenameInstanceArgs {
     pub(super) src_root: Option<PathBuf>,
     #[arg(help = "Allow edits inside linked packages", long)]
     pub(super) override_packages: bool,
+    #[arg(
+        help = "Push the renamed instance to the open Studio place right away (scoped to it, no review)",
+        long
+    )]
+    pub(super) push: bool,
 }
 
 #[derive(Parser)]
