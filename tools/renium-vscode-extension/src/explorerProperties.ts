@@ -199,7 +199,7 @@ function loadRbxDomDatabase(config: ExplorerConfig): RbxDomDatabase | undefined 
   const databasePath = [
     path.join(config.projectRoot, "API-Dump.json"),
     path.join(config.projectRoot, "Full-API-Dump.json"),
-    path.join(config.projectRoot, "tools", "plugin_ws_bridge", "rbx_dom_lua", "database.json"),
+    path.join(config.projectRoot, "tools", "vendor", "rbx-dom", "rbx_dom_lua", "src", "database.json"),
   ].find((candidate) => fs.existsSync(candidate));
   const sourceKey = metadataSourceKey(databasePath);
   const cacheKey = databasePath ?? "missing";
