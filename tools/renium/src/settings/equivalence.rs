@@ -21,8 +21,8 @@ use crate::app::output::log_global;
 use crate::app::timing::verbose_timing_logs;
 use crate::rbx::decode::{nonfinite_float_from_json, rbx_variant_to_settings_json};
 use crate::rbx::encode::{
-    json_to_rbx_property_variant, rbx_logical_property_name, rbx_model_property_descriptor,
-    rbx_property_descriptor,
+    json_to_rbx_color3, json_to_rbx_property_variant, rbx_logical_property_name,
+    rbx_model_property_descriptor, rbx_property_descriptor,
 };
 use crate::rbx::model::{BytecodeModelExportRefs, BytecodeModelImportRefs};
 use crate::snapshot::refs::{
@@ -3384,6 +3384,7 @@ pub(crate) fn reconciliation_property_values_equal(
         (Some(left), Some(right)) if name == "Tags" && tags_equal(left, right) => true,
         (Some(left), Some(right)) if solid_fidelities_match(class_name, name, left, right) => true,
         (Some(left), Some(right)) if hulls_match(name, left, right) => true,
+        (Some(left), Some(right)) if byte_colors_match(class_name, name, left, right) => true,
         (Some(left), Some(right))
             if studio_recomputed_values_match(class_name, name, left, right)
                 || studio_rewritten_values_match(class_name, name, left, right) =>
@@ -3408,6 +3409,31 @@ pub(crate) fn reconciliation_property_values_equal(
         }
         (None, None) => true,
     }
+}
+
+/// A color Studio keeps in bytes (a part's `Color` saves as `Color3uint8`):
+/// the files may say 0.3 while the open place reads 77/255, and both name
+/// the same byte, so they are one color.
+fn byte_colors_match(class_name: &str, name: &str, left: &Value, right: &Value) -> bool {
+    let stored_in_bytes = rbx_reflection_database::get()
+        .ok()
+        .and_then(|database| rbx_model_property_descriptor(database, class_name, name))
+        .is_some_and(|descriptor| {
+            matches!(
+                descriptor.data_type,
+                RbxDataType::Value(RbxVariantType::Color3uint8)
+            )
+        });
+    if !stored_in_bytes {
+        return false;
+    }
+    let (Some(left), Some(right)) = (json_to_rbx_color3(left), json_to_rbx_color3(right)) else {
+        return false;
+    };
+    let bytes = |color: rbx_dom_weak::types::Color3| {
+        [color.r, color.g, color.b].map(|channel| (channel.clamp(0.0, 1.0) * 255.0).round() as u8)
+    };
+    bytes(left) == bytes(right)
 }
 
 /// A value Studio counts for itself and the files never carry (a union's

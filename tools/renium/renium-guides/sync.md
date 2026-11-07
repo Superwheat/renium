@@ -10,7 +10,7 @@ rbx lst
 rbx lof
 ```
 
-`ps` pushes files or directories; for store edits pass the store file with `-i ID` per instance (the instance and its subtree), or `-u` to upsert without deleting; deletions need the store file without `-i`.
+`ps` pushes files or directories; for store edits pass the store file with `-i ID` per instance (with its subtree), or `-u` to upsert without deleting; deletions need the store file without `-i`.
 A push, `prop` or `del` above `liveSync.changesThreshold` (default 5; 0 reviews all) opens a Studio review panel and prints `held for review in Studio`: `rbx rv apply` or `rbx rv skip` decides, an unanswered review is skipped after 90 s, `ps --yes` skips it. `--no-review` also disables protected writes.
 Work in the place folder or add `--place <alias|placeId>`.
 
@@ -29,11 +29,11 @@ On failure, inspect `rbx lst --details`, fix the cause, then retry with `rbx rp`
 
 `no_studio` and `rbx status` carry `diagnosis.verdict`: Studio closed or another place open means `rbx ro`; relay other verdicts unchanged.
 
-Live Sync compares each side with their last common Renium state: one-sided changes transfer, independent edits merge, conflicts wait without overwriting either side. Something you added that is missing from both sides was deleted in Studio and synced; ask before restoring it.
+Live Sync compares each side with their last common Renium state: one-sided changes transfer, independent edits merge, conflicts wait without overwriting either side. Something you added that both sides now lack was deleted in Studio and synced; ask before restoring it.
 
-A place closed without saving can reopen older than the files: set `rbx cfg set liveSync.initialSyncPriority verify` before `rbx ro`, read `rbx lst --details`, and if versions differ ask which to keep.
+A place closed without saving can reopen older than the files: set `rbx cfg set liveSync.initialSyncPriority verify` before `rbx ro` and read `rbx lst --details`.
 
-The editor asks which version to keep. `rbx lst --details` shows both values and verify paths as `push:` (files differ) or `pull:` (Studio differs); `rbx lon --prefer studio|editor` overrides verify for that run. Choose only with user direction or a conflict preference.
+`rbx lst --details` shows both values and verify paths as `push:` (files differ) or `pull:` (Studio differs); `rbx lon --prefer studio|editor` overrides verify for that run. Keep the side you can account for: `studio` after merely opening the place, `editor` when the files carry your work; ask only when both sides hold edits you did not make.
 
 ```powershell
 rbx cfg get liveSync.initialSyncPriority
@@ -64,4 +64,4 @@ Live Sync transfers restored files; otherwise add `--apply-studio`. `--details` 
 
 ## Packages owned by others
 
-Pushes into Roblox packages this account does not own are refused. Revert to the package's content, or unlink it in Studio (right-click the root, Unlink from Package) for an editable copy.
+Pushes into Roblox packages this account does not own are refused. Revert to the package's content, or unlink it in Studio (right-click the root, Unlink from Package).

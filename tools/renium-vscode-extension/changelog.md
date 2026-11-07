@@ -9,6 +9,10 @@
 - `rbx inp ... --result LUAU` evaluates an expression on the same client after the actions and `--shot PATH` screenshots it, so acting and checking is one call.
 - `rbx cs --wait SECONDS` blocks until a Studio is connected instead of needing a shell loop.
 
+### Bug fixes
+
+- Live Sync no longer reports a conflict on a part color nobody changed: colors Studio keeps in bytes (a part's `Color`) compare by their byte values, so 0.3 in the files and 77/255 in the open place are one color.
+
 ## 0.5.9 - 2026-11-06
 
 ### New

@@ -1716,7 +1716,7 @@ fn json_to_rbx_udim2(value: &Value) -> Option<RbxUDim2> {
     ))
 }
 
-fn json_to_rbx_color3(value: &Value) -> Option<RbxColor3> {
+pub(crate) fn json_to_rbx_color3(value: &Value) -> Option<RbxColor3> {
     let value = json_wrapped_value(value, "Color3");
     if let Some(items) = value.as_array() {
         if items.len() < 3 {

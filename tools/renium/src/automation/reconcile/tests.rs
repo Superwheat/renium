@@ -1408,6 +1408,29 @@ fn in_place_edits_preserve_observed_paths_through_reordered_duplicate_ancestors(
 }
 
 #[test]
+fn part_colors_that_share_a_byte_are_equal() {
+    let files = json!({"_type": "Color3", "r": 0.2, "g": 1.0, "b": 0.3});
+    let studio = json!({"_type": "Color3", "r": 0.2, "g": 1.0, "b": 0.30196078431372547});
+    let other = json!({"_type": "Color3", "r": 0.2, "g": 1.0, "b": 0.31});
+    assert!(reconciliation_property_values_equal(
+        "Part",
+        "Color",
+        Some(&files),
+        Some(&studio)
+    ));
+    assert!(!reconciliation_property_values_equal(
+        "Part",
+        "Color",
+        Some(&files),
+        Some(&other)
+    ));
+    assert!(
+        !reconciliation_property_values_equal("Folder", "IconTint", Some(&files), Some(&studio)),
+        "a float color keeps its exact value"
+    );
+}
+
+#[test]
 fn folder_icon_tint_default_does_not_invent_full_push_changes() {
     let black = json!({"_type": "Color3", "r": 0.0, "g": 0.0, "b": 0.0});
     let red = json!({"_type": "Color3", "r": 1.0, "g": 0.0, "b": 0.0});
