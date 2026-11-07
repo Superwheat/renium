@@ -124,10 +124,7 @@
           "$path": "rbx_dom_lua/base64.module.luau"
         },
         "database": {
-          "$path": "rbx_dom_lua/database.json"
-        },
-        "allValues": {
-          "$path": "rbx_dom_lua/allValues.json"
+          "$path": "../vendor/rbx-dom/rbx_dom_lua/src/database.json"
         }
       }
     }

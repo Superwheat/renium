@@ -979,7 +979,7 @@ do
 	local gui = { ClassName = "ScreenGui", AttributeChanged = signal() }
 	function gui:GetFullName() return "StarterGui.ReniumFinalGui" end
 	function gui:IsDescendantOf(parent) return parent == service end
-	local database = require("@lune/serde").decode("json", fs.readFile("tools/plugin_ws_bridge/rbx_dom_lua/database.json"))
+	local database = require("@lune/serde").decode("json", fs.readFile("tools/vendor/rbx-dom/rbx_dom_lua/src/database.json"))
 	local descriptorSource = fs.readFile("tools/plugin_ws_bridge/rbx_dom_lua/PropertyDescriptor.module.luau")
 	local descriptorStart = assert(descriptorSource:find("function PropertyDescriptor.fromRaw(", 1, true))
 	local descriptorEnd = assert(descriptorSource:find("function PropertyDescriptor:read(", descriptorStart, true))
@@ -1230,7 +1230,7 @@ equal(opaqueOk, false, "opaque content rejection")
 
 do
 	local schema = require("../BridgePropertySchema.module")
-	local database = require("@lune/serde").decode("json", fs.readFile("tools/plugin_ws_bridge/rbx_dom_lua/database.json"))
+	local database = require("@lune/serde").decode("json", fs.readFile("tools/vendor/rbx-dom/rbx_dom_lua/src/database.json"))
 	local candidates = schema.buildCandidatesFromSchemas(schema.buildSchemasFromRbxDom(database, { Vector3 = 1 }))
 	local relevant = schema.makeExportPropertyFilter(database, candidates)
 	for _ = 1, 2 do

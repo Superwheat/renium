@@ -7,7 +7,7 @@ local rbxDomSource = fs.readFile("tools/plugin_ws_bridge/rbx_dom_lua/init.module
 local aliasStart = assert(rbxDomSource:find("local contentPropertyAliasesByClass =", 1, true))
 local aliasEnd = assert(rbxDomSource:find("local function getPropertyNames(", aliasStart, true))
 local contentAliases = luau.load(rbxDomSource:sub(aliasStart, aliasEnd - 1) .. "\nreturn getContentPropertyAliases", {
-	environment = { database = serde.decode("json", fs.readFile("tools/plugin_ws_bridge/rbx_dom_lua/database.json")) },
+	environment = { database = serde.decode("json", fs.readFile("tools/vendor/rbx-dom/rbx_dom_lua/src/database.json")) },
 })()
 assert(contentAliases("Beam").texture == "TextureContent")
 assert(contentAliases("MeshPart").meshid == "MeshContent")

@@ -335,7 +335,7 @@ function resolvePropertySource(repoRoot, refreshStudioApi = false) {
     path.join(repoRoot, "API-Dump.json"),
     path.join(repoRoot, "tools", "API-Dump.json"),
     path.join(repoRoot, "Full-API-Dump.json"),
-    path.join(repoRoot, "tools", "plugin_ws_bridge", "rbx_dom_lua", "database.json"),
+    path.join(repoRoot, "tools", "vendor", "rbx-dom", "rbx_dom_lua", "src", "database.json"),
   ].find((candidate) => candidate && fs.existsSync(candidate));
 }
 
@@ -1036,7 +1036,7 @@ function writeStudioApiSchemaModule(repoRoot, generatedClasses) {
   if (!fs.existsSync(pluginRoot)) {
     return undefined;
   }
-  const databasePath = path.join(pluginRoot, "rbx_dom_lua", "database.json");
+  const databasePath = path.join(repoRoot, "tools", "vendor", "rbx-dom", "rbx_dom_lua", "src", "database.json");
   const bundledProperties = rbxDomStudioSchemaNames(JSON.parse(fs.readFileSync(databasePath, "utf8")));
   const outputPath = path.join(pluginRoot, GENERATED_STUDIO_API_SCHEMA_FILE_NAME);
   const lines = [
@@ -1075,7 +1075,7 @@ export function generateRobloxPropertiesMetadata(options = {}) {
   const outputPath = options.outputPath ?? path.join(extensionRoot, "resources", GENERATED_FILE_NAME);
   const propertySourcePath = resolvePropertySource(repoRoot, options.refreshStudioApi === true);
   if (!propertySourcePath) {
-    throw new Error("Could not find API-Dump.json, Full-API-Dump.json, or plugin rbx_dom database.json.");
+    throw new Error("Could not find API-Dump.json, Full-API-Dump.json, or the vendored rbx_dom database.json.");
   }
 
   const { classes, enums, sourceKind } = normalizePropertySource(JSON.parse(fs.readFileSync(propertySourcePath, "utf8")));
