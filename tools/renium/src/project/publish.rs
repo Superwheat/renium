@@ -379,7 +379,7 @@ fn publish_as(args: &PublishArgs, project: Option<&Path>) -> Result<Value> {
         game_id: Some(game_id),
         place_id: Some(target),
     };
-    let key_env = args.key_env.as_deref().unwrap_or("ROBLOX_API_KEY");
+    let key_env = args.key_env.as_deref().unwrap_or(cloud::DEFAULT_KEY_ENV);
     if !args.dry_run {
         cloud::CloudAuth::from_env(false, key_env, None, "publish")
             .map_err(cloud::command::cloud_error)?;
@@ -617,25 +617,6 @@ fn humantime_parse(stamp: &str) -> Option<SystemTime> {
     Some(SystemTime::UNIX_EPOCH + Duration::from_secs_f64(total))
 }
 
-#[cfg(test)]
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
-    let days = days + 719_468;
-    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
-    let day_of_era = days - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_index = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
-    let month = if month_index < 10 {
-        month_index + 3
-    } else {
-        month_index - 9
-    };
-    (if month <= 2 { year + 1 } else { year }, month, day)
-}
-
 #[cfg(any(windows, target_os = "macos", test))]
 fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let year = if month <= 2 { year - 1 } else { year };
@@ -744,7 +725,7 @@ fn open_cloud(args: &PublishArgs, project: Option<&Path>) -> Result<Value> {
     if !args.dry_run {
         cloud::CloudAuth::from_env(
             false,
-            args.key_env.as_deref().unwrap_or("ROBLOX_API_KEY"),
+            args.key_env.as_deref().unwrap_or(cloud::DEFAULT_KEY_ENV),
             None,
             "publish",
         )
@@ -808,7 +789,7 @@ fn open_cloud(args: &PublishArgs, project: Option<&Path>) -> Result<Value> {
         });
         result["versionType"] = json!(if args.saved { "Saved" } else { "Published" });
         if !args.dry_run {
-            let key_env = args.key_env.as_deref().unwrap_or("ROBLOX_API_KEY");
+            let key_env = args.key_env.as_deref().unwrap_or(cloud::DEFAULT_KEY_ENV);
             let response = upload(
                 identity,
                 key_env,
@@ -820,7 +801,7 @@ fn open_cloud(args: &PublishArgs, project: Option<&Path>) -> Result<Value> {
             result["published"] = json!(!args.saved);
         }
         if !args.dry_run && !args.saved {
-            let key_env = args.key_env.as_deref().unwrap_or("ROBLOX_API_KEY");
+            let key_env = args.key_env.as_deref().unwrap_or(cloud::DEFAULT_KEY_ENV);
             let version = result["versionNumber"].as_u64().unwrap_or_default();
             cloud::report_live(
                 &mut result,
@@ -1019,7 +1000,7 @@ mod tests {
                 + offset;
             let days = seconds.div_euclid(86_400);
             let rest = seconds.rem_euclid(86_400);
-            let (year, month, day) = civil_from_days(days);
+            let (year, month, day) = crate::app::report::civil_from_days(days);
             format!(
                 "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.000Z",
                 rest / 3600,

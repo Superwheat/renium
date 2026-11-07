@@ -13,7 +13,7 @@ use crate::automation::Failure;
 use crate::system::files::atomic_write_file;
 
 pub(crate) const API_ROOT: &str = "https://apis.roblox.com";
-const DEFAULT_KEY_ENV: &str = "ROBLOX_API_KEY";
+pub(crate) const DEFAULT_KEY_ENV: &str = "ROBLOX_API_KEY";
 const MAX_BODY_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_MULTIPART_FILE_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_RAW_FILE_BYTES: u64 = 200 * 1024 * 1024;

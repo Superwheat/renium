@@ -44,6 +44,13 @@ impl<F: FnOnce()> Drop for OnDrop<F> {
     }
 }
 
+pub(crate) fn home_directory() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+        .filter(|home| home.is_dir())
+}
+
 pub(crate) fn service_settings_path(service_dir: &Path) -> PathBuf {
     crate::project::storage::settings_path(service_dir)
         .unwrap_or_else(|| service_dir.join(SERVICE_SETTINGS_FILE_NAME))

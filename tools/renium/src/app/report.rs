@@ -9,7 +9,7 @@ use clap::Args;
 use serde_json::{Value, json};
 
 use crate::project::config;
-use crate::system::files::atomic_write_file;
+use crate::system::files::{atomic_write_file, home_directory};
 
 const COMMAND_LIMIT: usize = 600;
 const OUTPUT_LIMIT: usize = 1500;
@@ -91,7 +91,7 @@ pub(crate) fn run(args: ReportArgs, global_project: Option<&Path>) -> Result<()>
     let root = project
         .as_ref()
         .map_or_else(|| current.clone(), |project| project.root.clone());
-    let home = home_directory();
+    let home = home_directory().map(|home| home.to_string_lossy().into_owned());
     let since = SystemTime::now() - Duration::from_secs(args.since.max(1) * 60);
     let custom_output = args.output.clone();
     let output_root = args.output.unwrap_or_else(|| {
@@ -1002,13 +1002,6 @@ fn report_id() -> Result<String> {
         .filter(|character| *character != '-')
         .collect::<String>();
     Ok(format!("RNM-{day}-{suffix}"))
-}
-
-fn home_directory() -> Option<String> {
-    std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(|home| home.to_string_lossy().into_owned())
-        .filter(|home| !home.is_empty())
 }
 
 fn app_data_directory() -> PathBuf {

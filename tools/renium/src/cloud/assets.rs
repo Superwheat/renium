@@ -66,7 +66,7 @@ fn default_store_scope() -> String {
 }
 
 fn default_key_env() -> String {
-    "ROBLOX_API_KEY".to_string()
+    crate::cloud::transport::DEFAULT_KEY_ENV.to_string()
 }
 
 fn default_upload_wait() -> f64 {

@@ -5,8 +5,8 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
+use super::command::cloud_error;
 use super::{CloudIdentity, execute_one};
-use crate::automation::Failure;
 use crate::system::files::absolutize_for_daemon as absolute_path;
 
 #[derive(Subcommand)]
@@ -241,8 +241,4 @@ fn request(
     request: Value,
 ) -> Result<Value> {
     execute_one(identity, key_env, oauth_env, false, request).map_err(cloud_error)
-}
-
-fn cloud_error(failure: Failure) -> anyhow::Error {
-    super::transport::cloud_failure_error(failure)
 }

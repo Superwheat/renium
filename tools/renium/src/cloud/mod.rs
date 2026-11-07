@@ -15,6 +15,6 @@ pub(crate) use discovery::{
     report_live, team_create_members,
 };
 pub(crate) use transport::{
-    API_ROOT, CloudAuth, CloudIdentity, agent, execute_one, execute_with_identity, introspect_key,
-    read_response,
+    API_ROOT, CloudAuth, CloudIdentity, DEFAULT_KEY_ENV, agent, execute_one, execute_with_identity,
+    introspect_key, read_response,
 };

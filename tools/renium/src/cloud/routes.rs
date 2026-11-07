@@ -5,13 +5,13 @@ use anyhow::{Context, Result, bail};
 use clap::Args;
 use serde_json::{Map, Value, json};
 
+use super::command::cloud_error;
 use super::paging::{PAGE_SIZE, Pager, Plan};
 use super::parameters::{
     absolutize_files, assignment, assignments, merge_assignments, parse_value,
 };
 use super::transport::{execute_authorized, placeholder_hint};
 use super::{CloudAuth, CloudIdentity};
-use crate::automation::Failure;
 use crate::system::files::{absolutize_for_daemon as absolute_path, atomic_write_file};
 
 #[derive(Args)]
@@ -2904,10 +2904,6 @@ fn insert_nested(map: &mut Map<String, Value>, path: &str, value: Value) -> Resu
             .with_context(|| format!("Field path '{path}' overlaps a scalar field"))?;
     }
     bail!("Field names cannot be empty")
-}
-
-fn cloud_error(failure: Failure) -> anyhow::Error {
-    super::transport::cloud_failure_error(failure)
 }
 
 #[cfg(test)]

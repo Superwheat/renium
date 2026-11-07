@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
+use crate::system::files::home_directory;
+
 const START: &str = "<!-- renium:start -->";
 const END: &str = "<!-- renium:end -->";
 
@@ -24,13 +26,6 @@ For an existing place file, run `rbx init` in its folder and then `rbx so FILE`.
 `rbx` reports \"No Renium project\" outside a project folder; it never creates one by itself.\n\
 {END}\n"
     )
-}
-
-fn home_directory() -> Option<PathBuf> {
-    std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)
-        .filter(|home| home.is_dir())
 }
 
 /// Instruction files of agents that are installed for this user. An agent is
