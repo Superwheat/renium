@@ -2170,6 +2170,15 @@ fn bytecode_set_property_result(mut args: BytecodeSetPropertyArgs) -> Result<Val
         "No matching instance",
     )?;
     let index = resolved.index;
+    if args.property.eq_ignore_ascii_case("position")
+        && crate::bytecode::edit::is_base_part(&document.instances[index].class_name)
+    {
+        value = crate::bytecode::edit::cframe_at_position(
+            document.instances[index].properties.get("CFrame"),
+            &value,
+        )?;
+        args.property = "CFrame".to_string();
+    }
     reject_package_link_instance_mutation(&document, index, "edited")?;
     reject_viewport_camera_edit(&document, index)?;
     if !args.override_packages {

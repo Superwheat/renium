@@ -66,9 +66,14 @@ fn canonical_new_instance_properties(
         return Ok(properties);
     }
     let mut out = Map::new();
+    let mut position = None;
     for (name, value) in properties {
         if name.eq_ignore_ascii_case("Source") {
             out.insert("Source".to_string(), value);
+            continue;
+        }
+        if name.eq_ignore_ascii_case("Position") && is_base_part(class_name) {
+            position = Some(value);
             continue;
         }
         let Some(logical) =
@@ -79,7 +84,57 @@ fn canonical_new_instance_properties(
         let value = crate::rbx::encode::typed_store_property_value(class_name, logical, value)?;
         out.insert(logical.to_string(), value);
     }
+    if let Some(position) = position {
+        let cframe = cframe_at_position(out.get("CFrame"), &position)?;
+        out.insert("CFrame".to_string(), cframe);
+    }
     Ok(out)
+}
+
+pub(crate) fn is_base_part(class_name: &str) -> bool {
+    rbx_reflection_database::get().is_ok_and(|database| {
+        crate::rbx::decode::rbx_reflection_class_is_a(database, class_name, "BasePart")
+    })
+}
+
+fn vector3_components(value: &Value) -> Option<[f64; 3]> {
+    if let Some(items) = value.as_array() {
+        let mut out = [0.0; 3];
+        for (slot, item) in out.iter_mut().zip(items.iter().take(3)) {
+            *slot = item.as_f64()?;
+        }
+        return (items.len() >= 3).then_some(out);
+    }
+    let object = value.as_object()?;
+    Some([
+        object.get("x").or_else(|| object.get("X"))?.as_f64()?,
+        object.get("y").or_else(|| object.get("Y"))?.as_f64()?,
+        object.get("z").or_else(|| object.get("Z"))?.as_f64()?,
+    ])
+}
+
+/// A part's Position is not stored: it is the translation of its CFrame. The
+/// CFrame with that translation keeps the rotation the part already has, or
+/// none for a new part.
+pub(crate) fn cframe_at_position(current: Option<&Value>, position: &Value) -> Result<Value> {
+    let [x, y, z] = vector3_components(position)
+        .context("Position needs x, y and z numbers, as {\"x\":..,\"y\":..,\"z\":..} or [x,y,z]")?;
+    let mut components = current
+        .and_then(|value| value.get("components"))
+        .and_then(Value::as_array)
+        .filter(|items| items.len() == 12)
+        .map(|items| {
+            let mut out = [0.0; 12];
+            for (slot, item) in out.iter_mut().zip(items) {
+                *slot = item.as_f64().unwrap_or(0.0);
+            }
+            out
+        })
+        .unwrap_or([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+    components[0] = x;
+    components[1] = y;
+    components[2] = z;
+    Ok(json!({ "_type": "CFrame", "components": components }))
 }
 
 /// What a new store instance needs; the CLI and script imports both build it.

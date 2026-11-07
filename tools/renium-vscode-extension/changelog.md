@@ -9,7 +9,8 @@
 - `rbx inp ... --result LUAU` evaluates an expression on the same client after the actions and `--shot PATH` screenshots it, so acting and checking is one call.
 - `rbx cs --wait SECONDS` blocks until a Studio is connected instead of needing a shell loop.
 - `rbx ba` and `rbx bs` take `--push`, which sends the edited instance to the open Studio place right after the file write, scoped to that instance and without a review; `rbx bs` sets several properties in one call with repeated `-p NAME=JSON`.
-- `rbx play -s --console N` returns the last N server console entries with the start result, after `--until` when given.
+- `rbx play -s --console N` returns the last N server console entries with the start result, after `--until` when given; `--stop-after` then stops the session, so one call runs a play check.
+- `rbx ba` and `rbx bs` accept `Position` on a part and store it as the part's CFrame (keeping an existing rotation), instead of writing a property Studio never applies.
 - A new instance pushed with its properties counts as one change toward the review threshold, in the daemon and in the Studio plugin, so a single new part no longer opens a review.
 - The root agent guide carries recipes for the common edits, so a task that adds or changes instances, writes a script or runs a play check needs no further guide.
 - `rbx ps`, `rbx prop` and `rbx del` above the review threshold no longer wait 90 s for a Studio review panel nobody answers: they apply nothing and return `heldForReview` with the change list (`review`: path, class and changed names per instance), so the caller reads it and reruns with `--yes`. Pushes from the editor extension and Live Sync keep the Studio panel.

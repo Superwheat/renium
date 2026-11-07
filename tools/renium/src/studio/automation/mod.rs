@@ -558,7 +558,7 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
         }
         return print_json_output(&result, false);
     }
-    let mut result = daemon_control_request(operation, None, parameters, false)?;
+    let mut result = daemon_control_request(operation, None, parameters.clone(), false)?;
     if args.until.is_none()
         && !args.no_ready
         && !args.stop
@@ -620,6 +620,12 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
                 console::compact_console_entries(&mut console);
                 console.get("entries").cloned().unwrap_or_else(|| json!([]))
             }
+            Err(error) => json!({ "error": format!("{error:#}") }),
+        };
+    }
+    if args.stop_after && result.get("ok").and_then(Value::as_bool) != Some(false) {
+        result["stopped"] = match daemon_control_request(op::PLAY_STOP, None, parameters, false) {
+            Ok(stop) => json!(stop.get("ok") == Some(&Value::Bool(true))),
             Err(error) => json!({ "error": format!("{error:#}") }),
         };
     }

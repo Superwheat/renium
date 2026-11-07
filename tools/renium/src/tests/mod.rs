@@ -2997,6 +2997,29 @@ fn reconcile_duplicate_matching_includes_implicit_sibling_defaults() {
 }
 
 #[test]
+fn a_part_position_becomes_the_translation_of_its_cframe() {
+    use crate::bytecode::edit::cframe_at_position;
+    let fresh = cframe_at_position(
+        None,
+        &json!({"_type": "Vector3", "x": 24, "y": 0.5, "z": -12}),
+    )
+    .unwrap();
+    assert_eq!(
+        fresh["components"],
+        json!([
+            24.0, 0.5, -12.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0
+        ])
+    );
+    let rotated = json!({"_type": "CFrame", "components": [0, 0, 0, 0, 0, 1, 0, 1, 0, -1, 0, 0]});
+    let moved = cframe_at_position(Some(&rotated), &json!([1, 2, 3])).unwrap();
+    assert_eq!(
+        moved["components"],
+        json!([1.0, 2.0, 3.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, -1.0, 0.0, 0.0])
+    );
+    assert!(cframe_at_position(None, &json!({"x": 1})).is_err());
+}
+
+#[test]
 fn editor_review_payload_counts_a_new_instance_with_its_properties_once() {
     let changes = EditorChangeSet {
         instance_changes: vec![EditorInstanceChange {

@@ -1852,6 +1852,12 @@ pub(super) struct StartStopPlayArgs {
     )]
     pub(super) console: Option<u64>,
     #[arg(
+        help = "Stop the session once the start, --until and --console are done; the result carries `stopped`",
+        long,
+        conflicts_with_all = ["stop", "kill_orphans"]
+    )]
+    pub(super) stop_after: bool,
+    #[arg(
         help = "Close Studio test server/client windows whose Edit window has exited (with --place: that place's only)",
         long,
         conflicts_with_all = ["start", "stop", "restart", "players", "add_players", "leave", "mode", "until"]
