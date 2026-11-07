@@ -2099,7 +2099,7 @@ pub(super) fn bytecode_set_property(mut args: BytecodeSetPropertyArgs) -> Result
     print_json_output(&result, args.pretty)
 }
 
-fn bytecode_set_property_result(mut args: BytecodeSetPropertyArgs) -> Result<Value> {
+pub(crate) fn bytecode_set_property_result(mut args: BytecodeSetPropertyArgs) -> Result<Value> {
     let property_name = args.property.remove(0);
     let args = SetPropertyCall {
         args,

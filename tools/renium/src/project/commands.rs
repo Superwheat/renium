@@ -420,13 +420,10 @@ pub(crate) fn move_instance_command(args: MoveInstanceArgs, project: Option<&Pat
                 &parent_id,
             );
         }
-        return bytecode_set_property(metadata_property_change(
-            source_file,
-            source_id,
-            "Parent",
-            Some(parent_id),
+        return move_within_store(
+            metadata_property_change(source_file, source_id, "Parent", Some(parent_id), false),
             args.push,
-        ));
+        );
     } else {
         let src_root =
             structural_source_root(project, &target.project_root, args.src_root.as_deref())?;
@@ -446,13 +443,16 @@ pub(crate) fn move_instance_command(args: MoveInstanceArgs, project: Option<&Pat
         .map(Ok)
         .unwrap_or_else(|| service_root_settings_id(&target_file, &target_service))?;
     if target_service == target.service {
-        return bytecode_set_property(metadata_property_change(
-            source_file,
-            Some(target.settings_id),
-            "Parent",
-            Some(parent_settings_id),
+        return move_within_store(
+            metadata_property_change(
+                source_file,
+                Some(target.settings_id),
+                "Parent",
+                Some(parent_settings_id),
+                false,
+            ),
             args.push,
-        ));
+        );
     }
     move_instance_between_service_stores(
         &source_file,
@@ -462,6 +462,95 @@ pub(crate) fn move_instance_command(args: MoveInstanceArgs, project: Option<&Pat
         &target_service,
         &parent_settings_id,
     )
+}
+
+/// Moves an instance inside one store and, with `--push`, reparents the
+/// same instance in the open place before a scoped push syncs it there; a
+/// scoped push alone would create a copy under the new parent and leave the
+/// original where it was.
+fn move_within_store(args: BytecodeSetPropertyArgs, push: bool) -> Result<()> {
+    let settings_file = args
+        .input
+        .settings_file
+        .clone()
+        .context("A move names its store file")?;
+    let settings_id = args.selector.settings_id.clone();
+    let before = push
+        .then(|| stored_path_segments(&settings_file, settings_id.as_deref()))
+        .transpose()?
+        .flatten();
+    let mut result = crate::bytecode::bytecode_set_property_result(args)?;
+    if push {
+        let after = stored_path_segments(&settings_file, settings_id.as_deref())?;
+        if let (Some(before), Some(after)) = (before, after) {
+            result["reparented"] = reparent_in_studio(&before, &after)?;
+        }
+        if result.get("settingsId").is_none() {
+            result["settingsId"] = json!(settings_id);
+        }
+        result["settingsFile"] = json!(settings_file);
+        crate::bytecode::edit::push_stored_instance(&mut result)?;
+    }
+    crate::app::output::print_json_output(&result, false)
+}
+
+/// The full path (service first) of a stored instance, by settings id.
+fn stored_path_segments(
+    settings_file: &Path,
+    settings_id: Option<&str>,
+) -> Result<Option<Vec<String>>> {
+    let Some(settings_id) = settings_id else {
+        return Ok(None);
+    };
+    let document = SettingsBytecode::read_file(settings_file)?;
+    let service = crate::bytecode::edit::bytecode_service_name(&document, settings_file, "");
+    let Some(index) = document
+        .instances
+        .iter()
+        .position(|instance| instance.settings_id == settings_id)
+    else {
+        return Ok(None);
+    };
+    let (segments, _) = crate::editor::paths::build_editor_instance_path_parts(&document, &service);
+    Ok(segments.get(index).cloned().flatten())
+}
+
+/// Sets the parent of the instance at `before` to the instance at the parent
+/// of `after` in the open place, as one undo step, and returns what happened.
+fn reparent_in_studio(before: &[String], after: &[String]) -> Result<Value> {
+    let Some((_, new_parent)) = after.split_last() else {
+        return Ok(json!("unchanged"));
+    };
+    if before.len() >= 2 && before[..before.len() - 1] == *new_parent {
+        return Ok(json!("unchanged"));
+    }
+    let code = format!(
+        "local function at(segments) local inst = game for _, name in segments do inst = inst:FindFirstChild(name) if not inst then return nil end end return inst end\n         local inst = at({}) local parent = at({})\n         if not inst then return 'missing' end if not parent then return 'parent missing' end\n         if inst.Parent == parent then return 'unchanged' end inst.Parent = parent return 'moved'",
+        luau_string_list(before),
+        luau_string_list(new_parent),
+    );
+    let result = crate::daemon::daemon_control_request(
+        crate::automation::op::LUAU,
+        None,
+        json!({ "code": code, "edit": true, "bridgeWaitSeconds": 8.0, "bridgePorts": "8781,8782" }),
+        false,
+    )
+    .context("The store was moved but Studio could not reparent the instance; push the store with `rbx ps`")?;
+    Ok(result
+        .get("results")
+        .and_then(Value::as_array)
+        .and_then(|results| results.first())
+        .cloned()
+        .unwrap_or(result))
+}
+
+fn luau_string_list(segments: &[String]) -> String {
+    let items = segments
+        .iter()
+        .map(|segment| format!("{:?}", segment))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{{{items}}}")
 }
 
 pub(crate) fn rename_instance_command(
