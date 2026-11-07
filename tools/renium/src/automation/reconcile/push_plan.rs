@@ -44,7 +44,7 @@ pub(crate) fn accepted_editor_entries(
 }
 
 #[test]
-pub(crate) fn editor_acknowledgment_uses_captured_and_generated_bytes_including_deletions() {
+fn editor_acknowledgment_uses_captured_and_generated_bytes_including_deletions() {
     let path = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
     let removed = PathBuf::from("src/removed.luau");
     let previous = ProjectSnapshot {
