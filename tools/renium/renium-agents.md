@@ -12,7 +12,7 @@ Use `rbx` from the place's project folder.
 
 Check Luau syntax offline with `rbx ck FILE...`, never Studio `loadstring` or `LoadStringEnabled`. Project checks cover types, lint and behavior.
 
-With healthy Live Sync, trust file edits. Do not push, poll, reread Studio or start Play after each save. Use one `lst --wait` after a reported problem or when the next operation needs synchronization. A `ps` of more than 5 changes (default threshold) waits for a Studio review, skipped after 90 s unanswered; pass `--yes`.
+With healthy Live Sync, trust file edits. Do not push, poll, reread Studio or start Play after each save. Use one `lst --wait` after a reported problem or when the next operation needs synchronization. A `ps` of more than 5 changes (default threshold) applies nothing and returns its change list; check it, then pass `--yes`.
 
 Reuse suitable Play sessions, batch related checks with the fewest clients, and do not stop a user's session. Wait with `rbx wait EXPR -t N`, never a shell loop of `l` calls.
 

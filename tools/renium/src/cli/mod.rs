@@ -2793,11 +2793,13 @@ pub(super) struct PushEditorChangesArgs {
     )]
     pub(super) no_review: bool,
     #[arg(
-        help = "Apply without the Studio review (a push of more than 5 changes opens one)",
+        help = "Apply a push of more than 5 changes at once instead of getting its change list back (`heldForReview`)",
         long,
         alias = "apply"
     )]
     pub(super) yes: bool,
+    #[arg(skip)]
+    pub(super) review_report: bool,
     #[arg(
         help = "Cache dir for renium-link git/wally sources, used when enforcing read-only link mirrors during a push. Overrides the manifest cacheDir",
         long,
@@ -2830,6 +2832,7 @@ impl PushEditorChangesArgs {
             verify: false,
             no_review: false,
             yes: false,
+            review_report: false,
             link_cache_dir: None,
             override_packages: false,
         }
@@ -2903,11 +2906,13 @@ pub(super) struct ApplyEditorPropertyArgs {
     )]
     pub(super) no_review: bool,
     #[arg(
-        help = "Apply without the Studio review (an edit above the change threshold opens one; `cfg get liveSync.changesThreshold`)",
+        help = "Apply an edit above the change threshold at once instead of getting its change list back (`cfg get liveSync.changesThreshold`)",
         long,
         alias = "apply"
     )]
     pub(super) yes: bool,
+    #[arg(skip)]
+    pub(super) review_report: bool,
 }
 
 #[derive(Parser)]
@@ -2917,11 +2922,13 @@ pub(super) struct ApplyEditorDeleteArgs {
     #[arg(help = "Skip the Studio review", long)]
     pub(super) no_review: bool,
     #[arg(
-        help = "Delete without the Studio review (an edit above the change threshold opens one; `cfg get liveSync.changesThreshold`)",
+        help = "Delete above the change threshold at once instead of getting the change list back (`cfg get liveSync.changesThreshold`)",
         long,
         alias = "apply"
     )]
     pub(super) yes: bool,
+    #[arg(skip)]
+    pub(super) review_report: bool,
 }
 
 #[derive(Parser)]

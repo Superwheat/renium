@@ -36,7 +36,7 @@ use crate::editor::paths::{
     infer_source_script, service_from_changed_path,
 };
 use crate::editor::review::{
-    apply_protected_writes_offline, is_externally_managed_editor_property,
+    EditorReviewOutcome, apply_protected_writes_offline, is_externally_managed_editor_property,
     is_externally_managed_protected_write, is_user_facing_protected_write,
     local_place_path_for_bridge, normalize_editor_bridge_value,
     protected_root_write_rows_with_live_values, protected_write_matches_previous,
@@ -1666,6 +1666,7 @@ pub(crate) fn push_editor_changes_result(mut args: PushEditorChangesArgs) -> Res
         "overridePackages": args.override_packages,
         "allowProtectedWrites": !args.no_review,
         "yes": args.yes || global_yes(),
+        "reviewReport": true,
         "linkCacheDir": args.link_cache_dir,
         "bridgeWaitSeconds": args.bridge.wait_seconds,
         "bridgePorts": args.bridge.ports,
@@ -3115,13 +3116,27 @@ fn push_editor_changes_with_collected(
         )?;
     }
     log_timing("native editor package ownership", phase_started);
-    let review_skipped = !args.no_review
+    let review = if !args.no_review
         && !args.yes
         && !global_yes()
         && (!changes.instance_changes.is_empty()
             || !changes.source_changes.is_empty()
             || !changes.property_changes.is_empty())
-        && !request_editor_push_review(bridge, &changes, Some(review_project_root(&args)))?;
+    {
+        request_editor_push_review(
+            bridge,
+            &changes,
+            Some(review_project_root(&args)),
+            args.review_report,
+        )?
+    } else {
+        EditorReviewOutcome::Proceed
+    };
+    let review_skipped = !review.proceeds();
+    let held_summary = match review {
+        EditorReviewOutcome::Held(summary) => Some(summary),
+        _ => None,
+    };
     let binary_import = if review_skipped {
         None
     } else if prepared_binary_import.is_some() {
@@ -3183,7 +3198,9 @@ fn push_editor_changes_with_collected(
     };
     let result = (|| {
         log_timing("native editor transaction begin", phase_started);
-        let mut summary = if review_skipped {
+        let mut summary = if let Some(held) = held_summary.clone() {
+            held
+        } else if review_skipped {
             skipped_editor_summary(&changes)
         } else {
             let transaction_id = transaction.as_ref().map(|value| value.id.as_str());
@@ -3493,16 +3510,20 @@ fn apply_deferred_native_rows(
 fn apply_editor_change_with_warm_bridge(
     bridge: &BridgeServer,
     label: &str,
-    review: Option<&Path>,
+    review: Option<(&Path, bool)>,
     collect: impl FnOnce() -> Result<EditorChangeSet>,
 ) -> Result<Map<String, Value>> {
     let started = Instant::now();
     let mut changes = collect()?;
     super::native_roots::normalize_resets(&mut changes)?;
-    if let Some(project_root) = review
-        && !request_editor_push_review(bridge, &changes, Some(project_root))?
+    if let Some((project_root, report)) = review
+        && let outcome = request_editor_push_review(bridge, &changes, Some(project_root), report)?
+        && !outcome.proceeds()
     {
-        let summary = skipped_editor_summary(&changes);
+        let summary = match outcome {
+            EditorReviewOutcome::Held(summary) => summary,
+            _ => skipped_editor_summary(&changes),
+        };
         log_global(
             5,
             format_args!(
@@ -3622,9 +3643,11 @@ pub(crate) fn apply_editor_property(mut args: ApplyEditorPropertyArgs) -> Result
         .context("Failed to parse --value-json")?,
     );
     parameters.insert("yes".to_string(), Value::Bool(args.yes || global_yes()));
+    parameters.insert("reviewReport".to_string(), Value::Bool(true));
     // Every edit the user has not opted out of with --no-review goes through
     // the daemon's review so protected writes stay allowed; `yes` alone
-    // decides whether Studio shows its review.
+    // decides whether an edit over the threshold applies or comes back as a
+    // change list.
     let result = daemon_control_request(
         op::SET_PROPERTY,
         Some(&args.target.project.project_root),
@@ -3653,6 +3676,7 @@ pub(crate) fn apply_editor_property_with_warm_bridge(
         PushEditorChangesArgs {
             no_review: args.no_review,
             yes: args.yes || global_yes(),
+            review_report: args.review_report,
             override_packages: args.target.override_packages,
             verify_sources,
             ..PushEditorChangesArgs::new(args.target.project, args.target.bridge)
@@ -3710,11 +3734,17 @@ fn apply_direct_saved_field(
             "{label} has no plugin API and is written natively; drop --no-review to write it, or set it in Studio's Properties window"
         );
     }
-    if !args.yes
-        && !global_yes()
-        && !request_editor_push_review(bridge, changes, Some(&args.target.project.project_root))?
-    {
-        return Ok(Some(skipped_editor_summary(changes)));
+    if !args.yes && !global_yes() {
+        match request_editor_push_review(
+            bridge,
+            changes,
+            Some(&args.target.project.project_root),
+            args.review_report,
+        )? {
+            EditorReviewOutcome::Proceed => {}
+            EditorReviewOutcome::Held(summary) => return Ok(Some(summary)),
+            EditorReviewOutcome::Skipped => return Ok(Some(skipped_editor_summary(changes))),
+        }
     }
     let written = crate::studio::automation::property_access::write_saved_field(
         bridge,
@@ -3819,6 +3849,7 @@ pub(crate) fn apply_editor_delete(args: ApplyEditorDeleteArgs) -> Result<()> {
     let mut parameters = editor_mutation_parameters(&args.target)?;
     parameters.insert("editor".to_string(), Value::Bool(true));
     parameters.insert("yes".to_string(), Value::Bool(args.yes || global_yes()));
+    parameters.insert("reviewReport".to_string(), Value::Bool(true));
     let result = daemon_control_request(
         op::REMOVE,
         Some(&args.target.project.project_root),
@@ -3872,7 +3903,8 @@ pub(crate) fn apply_editor_delete_with_warm_bridge(
     bridge: &BridgeServer,
 ) -> Result<Map<String, Value>> {
     let project_root = args.target.project.project_root.clone();
-    let review = (!args.no_review && !args.yes && !global_yes()).then_some(project_root.as_path());
+    let review = (!args.no_review && !args.yes && !global_yes())
+        .then_some((project_root.as_path(), args.review_report));
     apply_editor_change_with_warm_bridge(bridge, "delete", review, || {
         collect_direct_editor_delete_change(args)
     })
@@ -7185,6 +7217,7 @@ mod saved_field_review_tests {
 
     fn saved_field_args(root: &Path, yes: bool) -> ApplyEditorPropertyArgs {
         ApplyEditorPropertyArgs {
+            review_report: false,
             target: EditorMutationArgs {
                 project: ProjectSourceArgs {
                     project_root: root.to_path_buf(),

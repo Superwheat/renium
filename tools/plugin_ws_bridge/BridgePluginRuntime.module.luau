@@ -4155,6 +4155,7 @@ function BridgePluginRuntime.start(context)
 		Config.editorReviewUploads[uploadId] = {
 			changeCount = changeCount,
 			changesThreshold = changesThreshold,
+			report = p.report == true,
 			rowCount = rowCount,
 			totalChunks = totalChunks,
 			chunks = table.create(totalChunks),
@@ -4211,6 +4212,7 @@ function BridgePluginRuntime.start(context)
 			{
 				changeCount = upload.changeCount,
 				changesThreshold = upload.changesThreshold,
+				report = upload.report,
 				rows = rows,
 			},
 			Config.getBridgeSettings(),

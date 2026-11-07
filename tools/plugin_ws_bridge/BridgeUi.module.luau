@@ -2218,6 +2218,15 @@ function BridgeUi.create(plugin, bridgeInfo)
 		if tree.effectiveCount <= threshold then
 			return { required = false }
 		end
+		if params.report == true then
+			return {
+				required = true,
+				report = true,
+				effectiveCount = tree.effectiveCount,
+				instanceCount = tree.instanceCount,
+				threshold = threshold,
+			}
+		end
 		if reviewState and not reviewState.decision then
 			error("Another editor review is already pending")
 		elseif reviewState then

@@ -2706,6 +2706,7 @@ fn direct_editor_delete_change_does_not_require_existing_bytecode_match() {
     let root = temp_dir("direct-delete-missing-bytecode");
     fs::write(root.join("renium.project.jsonc"), r#"{"schemaVersion":1}"#).unwrap();
     let changes = collect_direct_editor_delete_change(ApplyEditorDeleteArgs {
+        review_report: false,
         target: EditorMutationArgs {
             project: ProjectSourceArgs {
                 project_root: root.clone(),

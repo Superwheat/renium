@@ -747,6 +747,104 @@ fn configured_changes_threshold(project_root: Option<&Path>) -> Option<u64> {
     config.get("liveSync")?.get("changesThreshold")?.as_u64()
 }
 
+/// What a push review decided: the push goes ahead, Studio's panel skipped
+/// it, or the caller asked for the change list instead of a panel and gets it
+/// back to read before pushing again with `--yes`.
+pub(crate) enum EditorReviewOutcome {
+    Proceed,
+    Skipped,
+    Held(Map<String, Value>),
+}
+
+impl EditorReviewOutcome {
+    pub(crate) fn proceeds(&self) -> bool {
+        matches!(self, Self::Proceed)
+    }
+}
+
+/// One line per changed instance for the caller to read: its path, class and
+/// the change kinds or property names, capped so a full-place push stays
+/// readable; the count of rows left out comes back with it.
+pub(crate) fn editor_review_digest(rows: &[Value], limit: usize) -> (Vec<Value>, usize) {
+    let mut digest = Vec::with_capacity(rows.len().min(limit));
+    for row in rows.iter().take(limit) {
+        let service = row.get("service").and_then(Value::as_str).unwrap_or("");
+        let mut path = vec![service.to_string()];
+        path.extend(
+            row.get("pathSegments")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string),
+        );
+        let changes = row
+            .get("entries")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|entry| {
+                let name = entry.get("name").and_then(Value::as_str).unwrap_or("");
+                let flag = |key: &str| entry.get(key).and_then(Value::as_bool) == Some(true);
+                match entry.get("kind").and_then(Value::as_str).unwrap_or("") {
+                    "instanceAdd" => "+instance".to_string(),
+                    "instanceRemove" => "-instance".to_string(),
+                    "instanceReplace" => "replace instance".to_string(),
+                    "instanceReconcile" if flag("allowDeletes") => {
+                        "reconcile subtree (deletes allowed)".to_string()
+                    }
+                    "instanceReconcile" => "reconcile subtree".to_string(),
+                    "source" if flag("deleted") => "-Source".to_string(),
+                    "source" => "Source".to_string(),
+                    "attribute" if flag("deleted") => format!("-@{name}"),
+                    "attribute" => format!("@{name}"),
+                    _ if flag("reset") => format!("{name} (reset)"),
+                    _ => name.to_string(),
+                }
+            })
+            .collect::<Vec<_>>();
+        digest.push(json!({
+            "path": path.join("."),
+            "class": row.get("className").and_then(Value::as_str).unwrap_or("Instance"),
+            "changes": changes,
+        }));
+    }
+    (digest, rows.len().saturating_sub(limit))
+}
+
+fn held_editor_summary(
+    change_count: u64,
+    digest: Vec<Value>,
+    more_rows: usize,
+    response: &Value,
+) -> Map<String, Value> {
+    let mut summary = Map::new();
+    summary.insert("ok".to_string(), Value::Bool(true));
+    summary.insert("heldForReview".to_string(), Value::Bool(true));
+    summary.insert("reviewChanges".to_string(), json!(change_count));
+    for (key, field) in [
+        ("effectiveChanges", "effectiveCount"),
+        ("reviewInstances", "instanceCount"),
+        ("reviewThreshold", "threshold"),
+    ] {
+        if let Some(value) = response.get(field).filter(|value| value.is_number()) {
+            summary.insert(key.to_string(), value.clone());
+        }
+    }
+    summary.insert("review".to_string(), Value::Array(digest));
+    if more_rows > 0 {
+        summary.insert("moreReviewRows".to_string(), json!(more_rows));
+    }
+    summary.insert(
+        "next".to_string(),
+        Value::String(
+            "nothing was applied; check `review`, then rerun with --yes to apply, or change the files"
+                .to_string(),
+        ),
+    );
+    summary
+}
+
 pub(crate) fn editor_review_hold_notice(label: &str, review_id: &str, change_count: u64) -> String {
     format!(
         "[renium] {label} held for review in Studio (id={review_id}, changes={change_count}); `rbx rv apply` or `rbx rv skip` decides, an unanswered review is skipped after 90 s (a protected-write review applies), `--yes` skips the review"
@@ -763,14 +861,18 @@ fn notify_editor_review_hold(response: &Value, label: &str, change_count: u64) {
     crate::daemon::emit_request_notice(&editor_review_hold_notice(label, review_id, change_count));
 }
 
+/// `report` asks Studio only whether the push is over the review threshold:
+/// instead of a panel, the caller gets the change list back and decides by
+/// pushing again with `--yes`.
 pub(crate) fn request_editor_push_review(
     bridge: &BridgeServer,
     changes: &EditorChangeSet,
     project_root: Option<&Path>,
-) -> Result<bool> {
+    report: bool,
+) -> Result<EditorReviewOutcome> {
     let (change_count, rows) = editor_review_payload(changes);
     if change_count == 0 {
-        return Ok(true);
+        return Ok(EditorReviewOutcome::Proceed);
     }
     let row_count = rows.len();
     let changes_threshold = configured_changes_threshold(project_root);
@@ -780,6 +882,7 @@ pub(crate) fn request_editor_push_review(
             serde_json::to_string(&rows).unwrap_or_default()
         );
     }
+    let digest = report.then(|| editor_review_digest(&rows, 60));
     let chunks = editor_review_chunks(rows, 1024 * 1024)?;
     let response = match if chunks.len() == 1 {
         bridge.call(
@@ -787,6 +890,7 @@ pub(crate) fn request_editor_push_review(
             json!({
                 "changeCount": change_count,
                 "changesThreshold": changes_threshold,
+                "report": report,
                 "rows": chunks.into_iter().next().unwrap_or_default(),
             }),
         )
@@ -798,6 +902,7 @@ pub(crate) fn request_editor_push_review(
                 "uploadId": &upload_id,
                 "changeCount": change_count,
                 "changesThreshold": changes_threshold,
+                "report": report,
                 "rowCount": row_count,
                 "totalChunks": chunks.len(),
             }),
@@ -840,8 +945,25 @@ pub(crate) fn request_editor_push_review(
             return Err(err.context("Editor push review is unavailable"));
         }
     };
+    if let Some((digest, more_rows)) = digest {
+        if response.get("required").and_then(Value::as_bool) != Some(true) {
+            return Ok(EditorReviewOutcome::Proceed);
+        }
+        return Ok(EditorReviewOutcome::Held(held_editor_summary(
+            change_count,
+            digest,
+            more_rows,
+            &response,
+        )));
+    }
     notify_editor_review_hold(&response, "editor push", change_count);
-    wait_for_editor_review_decision(bridge, response, change_count, "editor push")
+    Ok(
+        if wait_for_editor_review_decision(bridge, response, change_count, "editor push")? {
+            EditorReviewOutcome::Proceed
+        } else {
+            EditorReviewOutcome::Skipped
+        },
+    )
 }
 
 pub(crate) fn request_protected_write_review(
@@ -1608,6 +1730,53 @@ mod review_threshold_tests {
         .unwrap();
         assert_eq!(configured_changes_threshold(Some(&root)), Some(0));
         assert_eq!(configured_changes_threshold(None), None);
+    }
+
+    #[test]
+    fn a_review_digest_names_each_instance_and_its_changes() {
+        let rows = vec![
+            json!({
+                "service": "Workspace",
+                "pathSegments": ["Lobby", "CheckpointPad"],
+                "className": "Part",
+                "entries": [
+                    {"kind": "instanceAdd", "allowDeletes": false},
+                    {"kind": "property", "name": "Size", "value": {}},
+                    {"kind": "property", "name": "Reflectance", "reset": true},
+                    {"kind": "attribute", "name": "Owner", "deleted": true},
+                ],
+            }),
+            json!({
+                "service": "ServerScriptService",
+                "pathSegments": ["Main"],
+                "className": "Script",
+                "entries": [{"kind": "source", "deleted": false}],
+            }),
+        ];
+        let (digest, more) = editor_review_digest(&rows, 1);
+        assert_eq!(more, 1);
+        assert_eq!(digest.len(), 1);
+        assert_eq!(digest[0]["path"], json!("Workspace.Lobby.CheckpointPad"));
+        assert_eq!(digest[0]["class"], json!("Part"));
+        assert_eq!(
+            digest[0]["changes"],
+            json!(["+instance", "Size", "Reflectance (reset)", "-@Owner"])
+        );
+        let (digest, more) = editor_review_digest(&rows, 10);
+        assert_eq!(more, 0);
+        assert_eq!(digest[1]["changes"], json!(["Source"]));
+        let summary = held_editor_summary(
+            5,
+            digest,
+            0,
+            &json!({"required": true, "effectiveCount": 4, "instanceCount": 2, "threshold": 3}),
+        );
+        assert_eq!(summary["heldForReview"], json!(true));
+        assert_eq!(summary["reviewChanges"], json!(5));
+        assert_eq!(summary["effectiveChanges"], json!(4));
+        assert_eq!(summary["reviewThreshold"], json!(3));
+        assert!(summary.get("moreReviewRows").is_none());
+        assert!(summary["next"].as_str().unwrap().contains("--yes"));
     }
 
     #[test]

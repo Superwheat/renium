@@ -8,6 +8,7 @@
 - `rbx play -s` waits up to 60 s until the session's players exist and reports `playersReady`; `--no-ready` returns at once. `rbx play -r` stops, lets Live Sync apply the file edits it deferred during Play (`appliedPending`), then restarts.
 - `rbx inp ... --result LUAU` evaluates an expression on the same client after the actions and `--shot PATH` screenshots it, so acting and checking is one call.
 - `rbx cs --wait SECONDS` blocks until a Studio is connected instead of needing a shell loop.
+- `rbx ps`, `rbx prop` and `rbx del` above the review threshold no longer wait 90 s for a Studio review panel nobody answers: they apply nothing and return `heldForReview` with the change list (`review`: path, class and changed names per instance), so the caller reads it and reruns with `--yes`. Pushes from the editor extension and Live Sync keep the Studio panel.
 
 ### Bug fixes
 

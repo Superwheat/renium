@@ -292,6 +292,7 @@ pub(super) fn automation_push_args(
     // above the plugin's change threshold opens the Studio review unless the
     // caller (the Live Sync worker, a startup reconcile) says yes itself.
     args.yes = !reviewed || automation_bool(object, "yes", false)?;
+    args.review_report = automation_bool(object, "reviewReport", false)?;
     Ok(args)
 }
 
@@ -315,6 +316,7 @@ fn automation_editor_property_args(
         source_file: None,
         no_review: !reviewed,
         yes: !reviewed || automation_bool(object, "yes", false)?,
+        review_report: automation_bool(object, "reviewReport", false)?,
     })
 }
 
@@ -331,6 +333,7 @@ fn automation_editor_delete_args(
         target: automation_editor_mutation_args(context, source_dir, object, "remove")?,
         no_review: !reviewed,
         yes: !reviewed || automation_bool(object, "yes", false)?,
+        review_report: automation_bool(object, "reviewReport", false)?,
     })
 }
 
@@ -603,6 +606,14 @@ fn compact_push_summary(
     for key in [
         "historyId",
         "skippedByReview",
+        "heldForReview",
+        "reviewChanges",
+        "effectiveChanges",
+        "reviewInstances",
+        "reviewThreshold",
+        "review",
+        "moreReviewRows",
+        "next",
         "sourceVerified",
         "sourceVerifyFailed",
         "sourceVerifyErrors",
@@ -623,7 +634,7 @@ fn compact_push_summary(
     {
         result.insert("packageDialogAccepted".to_string(), value.clone());
     }
-    if result.contains_key("skippedByReview") {
+    if result.contains_key("skippedByReview") || result.contains_key("heldForReview") {
         return result;
     }
     let counts = push_counts(summary);
@@ -2171,6 +2182,7 @@ fn studio_edit_persists(operation: u16, writes_studio_directly: bool, result: &V
     };
     if object.get("ok").and_then(Value::as_bool) == Some(false)
         || object.contains_key("skippedByReview")
+        || object.contains_key("heldForReview")
     {
         return false;
     }
@@ -4332,7 +4344,12 @@ mod tests {
             false,
             &json!({ "ok": true, "instances": 2 })
         ));
-        for key in ["verifyOnly", "unchanged", "skippedByReview"] {
+        for key in [
+            "verifyOnly",
+            "unchanged",
+            "skippedByReview",
+            "heldForReview",
+        ] {
             assert!(!studio_edit_persists(
                 op::PUSH,
                 false,

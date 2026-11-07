@@ -11,13 +11,13 @@ rbx lof
 ```
 
 `ps` pushes files or directories; for store edits pass the store file with `-i ID` per instance (with its subtree), or `-u` to upsert without deleting; deletions need the store file without `-i`.
-A push, `prop` or `del` above `liveSync.changesThreshold` (default 5; 0 reviews all) opens a Studio review panel and prints `held for review in Studio`: `rbx rv apply` or `rbx rv skip` decides, an unanswered review is skipped after 90 s, `ps --yes` skips it. `--no-review` also disables protected writes.
+A push, `prop` or `del` above `liveSync.changesThreshold` (default 5; 0 = all) applies nothing and returns `heldForReview` with the change list in `review`: check it, then rerun with `--yes`. Editor and Live Sync pushes open a Studio panel instead (`rbx rv apply|skip`). `--no-review` also disables protected writes.
 Work in the place folder or add `--place <alias|placeId>`.
 
 ## Live Sync
 
 Start once for sustained editing. Saved files and Studio edits sync both ways. Unsaved buffers do not sync; file edits during Play wait for Edit mode.
-`lon` returns while the first comparison still runs (`daemon.settled: false`); `rbx lon --wait 120` returns once it has settled, or run `rbx lst --wait 120` later.
+`lon` returns while the first comparison still runs (`daemon.settled: false`); `rbx lon --wait 120` returns once it has settled, or `rbx lst --wait 120` later.
 
 Trust successful edits while Live Sync reports no problem. Don't poll, push, reread Studio, or launch Play after every save.
 Use `rbx lst --wait` (10 s, or a number up to 120) only when the next step needs completed sync, after a reported problem, or when asked.
@@ -46,11 +46,11 @@ Conflict preferences: `none`, `studio`, `editor` (project files). A preference r
 
 ## Manual sync
 
-Without Live Sync, pass the files or directories to `ps`; Renium batches them by service.
+Without Live Sync, pass files or directories to `ps`; Renium batches them by service.
 For store edits, use returned changed paths and settings IDs (`Service/ID`, since IDs repeat per store) to keep the push scoped.
 An unfiltered push reconciles the entire place and can remove Studio-only content.
 
-Pulls restore read-only `.renium` link mirrors from their saved packages (`readOnlyLinksRestored` lists them; a difference does not say which copy is newer). Push the link path to apply the package in Studio, or edit the source and run `lk`. Restores are not user edits in Live Sync. `ps --override-packages` bypasses push protection; a later pull restores the package again. See [links](links.md) for stray files.
+Pulls restore read-only `.renium` link mirrors from their saved packages (`readOnlyLinksRestored` lists them; a difference does not tell which copy is newer). Push the link path to apply the package in Studio, or edit the source and run `lk`. Restores are not user edits in Live Sync. `ps --override-packages` bypasses push protection; a later pull restores the package again. See [links](links.md) for stray files.
 
 `ps --verify` compares script sources and pushes nothing (`sourceVerifyErrors` lists mismatches; all scripts without paths); `ps --verify-sources` pushes, then checks. Reads of `Instance.Source` are no substitute: an open ScriptDocument can differ.
 
