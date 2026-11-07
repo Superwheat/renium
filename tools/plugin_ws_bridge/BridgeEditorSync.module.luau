@@ -1258,7 +1258,18 @@ local function sortedIdList(text: string): string
 	return table.concat(ids, ",")
 end
 
+local function colorBytesEqual(a: Color3, b: Color3): boolean
+	local function byte(channel: number): number
+		return math.round(math.clamp(channel, 0, 1) * 255)
+	end
+	return byte(a.R) == byte(b.R) and byte(a.G) == byte(b.G) and byte(a.B) == byte(b.B)
+end
+
 local function propertyValuesEqual(instance: Instance, name: string, current: any, expected: any): boolean
+	-- A part's color is kept in bytes: 0.667 written reads back as 170/255.
+	if typeof(current) == "Color3" and typeof(expected) == "Color3" and colorBytesEqual(current, expected) then
+		return true
+	end
 	if type(current) == "string" and type(expected) == "string" then
 		local descriptor = RbxDomModule.findCanonicalPropertyDescriptor(instance.ClassName, name)
 		if descriptor ~= nil and (descriptor.dataType == "Content" or descriptor.dataType == "ContentId") then

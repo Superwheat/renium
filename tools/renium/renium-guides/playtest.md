@@ -18,6 +18,7 @@ rbx play -s                         # ordinary Play: one window
 rbx play -s --players 2             # local server and two clients
 rbx play -s --players 2 --until 'shared.RoundHandler.GameState == "InRound"'
 rbx play -s --no-ready                 # return before the players have joined
+rbx play -s --until 'workspace.DistributedGameTime > 10' --console 40   # then return the server console
 rbx play -r                         # restart after a code change (stops, then starts the same way)
 rbx play --add-players 2            # join churn: 2 more clients join the running test (8 max); returns their names
 rbx play --leave -p 2               # the server kicks client 2's player (PlayerRemoving fires) and closes its window

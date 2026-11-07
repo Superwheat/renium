@@ -1858,7 +1858,8 @@ fn ordinary_remove_rejects_package_bearing_instances_and_links() {
     let error = bytecode_set_property(BytecodeSetPropertyArgs {
         input: BytecodeFileArgs::settings_file(settings_path.clone()),
         selector: BytecodeInstanceSelectorArgs::by_settings_id(Some("package-link".into())),
-        property: "AutoUpdate".to_string(),
+        property: vec!["AutoUpdate".to_string()],
+        push: false,
         value_json: Some("true".to_string()),
         value_str: None,
         value_num: None,
@@ -1963,7 +1964,8 @@ fn store_writes_keep_composite_property_values_typed() {
         bytecode_set_property(BytecodeSetPropertyArgs {
             input: BytecodeFileArgs::settings_file(settings_path.clone()),
             selector: BytecodeInstanceSelectorArgs::by_settings_id(Some("step".into())),
-            property: property.to_string(),
+            property: vec![property.to_string()],
+            push: false,
             value_json: Some(value.to_string()),
             value_str: None,
             value_num: None,
@@ -2992,6 +2994,57 @@ fn reconcile_duplicate_matching_includes_implicit_sibling_defaults() {
         .find(|entry| entry.settings_id == "right")
         .unwrap();
     assert_eq!(right.match_properties["Face"]["name"], "Right");
+}
+
+#[test]
+fn editor_review_payload_counts_a_new_instance_with_its_properties_once() {
+    let changes = EditorChangeSet {
+        instance_changes: vec![EditorInstanceChange {
+            mode: "upsertInstances".to_string(),
+            service: "Workspace".to_string(),
+            allow_deletes: false,
+            instances: vec![EditorInstanceDescriptor {
+                settings_id: "editor:24".to_string(),
+                path_segments: vec!["Lobby".to_string(), "Pad".to_string()],
+                path_ordinals: Vec::new(),
+                class_name: "Part".to_string(),
+                ..EditorInstanceDescriptor::default()
+            }],
+            preserve_instances: Vec::new(),
+        }],
+        property_changes: vec![
+            EditorPropertyChange {
+                service: "Workspace".to_string(),
+                settings_id: Some("editor:24".to_string()),
+                path_segments: vec!["Lobby".to_string(), "Pad".to_string()],
+                path_ordinals: Vec::new(),
+                class_name: "Part".to_string(),
+                properties: Map::from_iter([
+                    ("Anchored".to_string(), json!(true)),
+                    ("Transparency".to_string(), json!(0.5)),
+                ]),
+                ..EditorPropertyChange::default()
+            },
+            EditorPropertyChange {
+                service: "Workspace".to_string(),
+                settings_id: Some("editor:3".to_string()),
+                path_segments: vec!["Lobby".to_string(), "Door".to_string()],
+                path_ordinals: Vec::new(),
+                class_name: "Part".to_string(),
+                properties: Map::from_iter([("Anchored".to_string(), json!(false))]),
+                ..EditorPropertyChange::default()
+            },
+        ],
+        ..EditorChangeSet::default()
+    };
+
+    let (change_count, rows) = editor_review_payload(&changes);
+
+    assert_eq!(
+        change_count, 2,
+        "the new instance and the existing part's edit"
+    );
+    assert_eq!(rows.len(), 2);
 }
 
 #[test]

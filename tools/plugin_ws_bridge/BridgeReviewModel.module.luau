@@ -795,7 +795,10 @@ local function buildReviewTree(summaryRows, groups, helpers)
 		if not node.status and not node.instance and (#node.props > 0 or node.sourceEdited) then
 			node.status = "added"
 		end
-		node.ownChanges = #node.props + ((node.status or node.sourceEdited) and 1 or 0)
+		-- A new instance's properties belong to its one addition.
+		node.ownChanges = if node.status == "added"
+			then 1
+			else #node.props + ((node.status or node.sourceEdited) and 1 or 0)
 	end
 
 	local instanceCount = 0

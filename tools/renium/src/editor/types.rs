@@ -34,7 +34,7 @@ pub(crate) struct EditorSourceChange {
     pub(crate) deleted: bool,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct EditorPropertyChange {
     pub(crate) service: String,

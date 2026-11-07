@@ -20,12 +20,12 @@ rbx ss DataStoreService UpdateAsync --limit 20
 rbx sg RemoteEvent --limit 100
 ```
 
-`f SERVICE text` searches text; `-n` matches an exact name, without wildcards; `--path` limits the search to one subtree. `tr`, `in` and `f` also take one dotted argument (`rbx tr StarterGui.Main.HUD.Timer`; the first segment is the service). A `Property not found` error lists the nearest stored and class property names; `rbx in SERVICE TARGET -F props` lists them all.
-`ss` finds scripts containing every keyword, case-insensitively. `sg` finds literal lines, case-sensitive by default. Limits cap returned results, not totals. Read known scripts directly; use `sr` for bounded reads when file access is unavailable.
+`f SERVICE text` searches text; `-n` matches an exact name; `--path` limits the search to one subtree. `tr`, `in` and `f` also take one dotted argument (`rbx tr StarterGui.Main.HUD.Timer`; the first segment is the service). A `Property not found` error lists the nearest stored and class property names; `rbx in SERVICE TARGET -F props` lists them all.
+`ss` finds scripts containing every keyword, case-insensitively. `sg` finds literal lines, case-sensitive by default. Limits cap returned results, not totals. Read known scripts directly; `sr` reads them when file access is unavailable.
 
 Several new instances are one `rbx ba --batch -` run: pipe `{"ops":[{"parent":"ServerScriptService.Battle","name":"Abilities","class":"Folder","ref":"abilities"},{"parent":"#abilities","name":"CarMods","class":"ModuleScript","source":"return {}"}]}`; each store is written once; a validation failure writes nothing, and the error names any store already written.
 `bg` with several property names prints one object; `in` with several targets prints one array: one decode, one call. Several reads across instances are one `bb` batch, not a `bg` per value: `'{"ops":[{"type":"search","q":"Door","limit":5,"fields":"lookup,prop:Anchored"},{"type":"counts"}]}' | rbx bb Workspace -J -`; `in SERVICE TARGET -F attrs,props` reads every field of one instance.
-Use one lookup on the relevant state: `f` for saved data, `q` for a closed place, `l` for unsaved Studio state. Refine ambiguous results instead of repeating the query through different tools. Git comparisons are useful when the question concerns revisions, not as an extra existence check.
+Use one lookup on the relevant state: `f` for saved data, `q` for a closed place, `l` for unsaved Studio state. Refine ambiguous results instead of repeating the query through other tools.
 
 ## Edit
 
@@ -35,7 +35,8 @@ rbx bs Workspace Lobby.Door -p Transparency --num 0.5
 rbx bs Workspace -p Gravity --num 120
 rbx bs Workspace -i editor:id -p Reviewed --scope attribute --bool true
 rbx ba Workspace -n NewModel -c Model
-rbx ba Workspace -I Lobby.Props -n NewPart -c Part
+rbx ba Workspace -I Lobby.Props -n NewPart -c Part -p 'Anchored=true' --push
+rbx bs Workspace Lobby.Door -p 'Transparency=0.5' -p 'CanCollide=false' --push
 rbx bss Workspace -i editor:script --str "return 1"
 rbx bcl Workspace -i editor:source -I editor:parent
 rbx mv Workspace -i editor:id -I editor:parent
@@ -46,7 +47,7 @@ rbx br Workspace Lobby.OldPart
 Every store command takes the target the same way: a positional name or dotted path (`Lobby.Door`), `-i ID`, `-x INDEX`, `-n NAME` or `-c CLASS`. `bg` takes the property after the target or as `-p`; `bs` takes `-p`. `bg`/`bs` with no target address the service itself. Parent options (`-I`) take an ID or a dotted path. Duplicates take inline ordinals (`Borders.Border[4]`, the form compact output prints) or `--ords`.
 Use a service name or `-f STORE`, not both.
 
-Values: `--str`, `--num`, `--bool`, `--null`, or `-j JSON`. Use `-j -` to read JSON from stdin, including values too large for the OS command line.
+Values: `--str`, `--num`, `--bool`, `--null`, or `-j JSON` (`-j -` reads stdin); several `-p NAME=JSON` set several properties at once. `--push` on `ba` and `bs` sends that one instance to Studio right away, with no review.
 `--null` removes an override; writing the default stores one.
 Unknown properties are rejected. `--scope property` explicitly selects a real property absent from the schema; `--scope attribute` selects an attribute.
 

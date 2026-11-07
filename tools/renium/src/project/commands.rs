@@ -252,7 +252,7 @@ fn metadata_property_change(
     BytecodeSetPropertyArgs {
         input: BytecodeFileArgs::settings_file(settings_file),
         selector: BytecodeInstanceSelectorArgs::by_settings_id(settings_id),
-        property: property.to_string(),
+        property: vec![property.to_string()],
         value_json: None,
         value_str: value,
         value_num: None,
@@ -260,6 +260,7 @@ fn metadata_property_change(
         value_null: false,
         scope: "metadata".to_string(),
         override_packages: true,
+        push: false,
         pretty: false,
     }
 }
@@ -293,6 +294,7 @@ pub(crate) fn create_instance_command(
             class_name: Some(args.class_name),
             settings_id: None,
             batch: None,
+            push: false,
             parent: BytecodeParentArgs {
                 parent_settings_id,
                 ..Default::default()
@@ -320,6 +322,7 @@ pub(crate) fn create_instance_command(
         class_name: Some(args.class_name),
         settings_id: None,
         batch: None,
+        push: false,
         parent: BytecodeParentArgs {
             parent_settings_id: args.parent_settings_id,
             ..Default::default()

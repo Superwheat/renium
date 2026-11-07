@@ -2031,10 +2031,86 @@ fn reject_read_only_link_store_edit(
 }
 
 pub(super) fn bytecode_set_property(mut args: BytecodeSetPropertyArgs) -> Result<()> {
+    let names = std::mem::take(&mut args.property);
+    let inline_values = names.iter().any(|name| name.contains('='));
+    let mut result = if inline_values {
+        if args.value_json.is_some()
+            || args.value_str.is_some()
+            || args.value_num.is_some()
+            || args.value_bool.is_some()
+            || args.value_null
+        {
+            bail!("Give values as -p NAME=JSON or with one -p NAME and a value flag, not both");
+        }
+        let mut combined = json!({ "ok": true, "set": [], "changedPaths": [] });
+        for assignment in &names {
+            let (name, value) = assignment
+                .split_once('=')
+                .with_context(|| format!("-p {assignment} needs NAME=JSON"))?;
+            let mut one = args.clone();
+            one.property = vec![name.to_string()];
+            one.value_json = Some(value.to_string());
+            let outcome = bytecode_set_property_result(one)?;
+            combined["set"].as_array_mut().unwrap().push(json!(name));
+            for path in outcome
+                .get("changedPaths")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let paths = combined["changedPaths"].as_array_mut().unwrap();
+                if !paths.contains(path) {
+                    paths.push(path.clone());
+                }
+            }
+            for key in ["settingsFile", "settingsId", "pathSegments", "pathOrdinals"] {
+                if let Some(value) = outcome.get(key) {
+                    combined[key] = value.clone();
+                }
+            }
+        }
+        combined
+    } else {
+        if names.len() != 1 {
+            bail!("Give one -p NAME with a value flag, or -p NAME=JSON for each property");
+        }
+        args.property = names;
+        bytecode_set_property_result(args.clone())?
+    };
+    if args.push {
+        if result.get("settingsId").is_none() {
+            let (settings_file, service_hint) = resolve_bytecode_cli_settings_file(
+                args.input.settings_file.as_deref(),
+                args.input.service_or_file.as_deref(),
+                None,
+            )?;
+            let document = SettingsBytecode::read_file(&settings_file)?;
+            let service = bytecode_service_name(&document, &settings_file, &service_hint);
+            let resolved = resolve_bytecode_selector_or_service_root(
+                &document,
+                &service,
+                &args.selector,
+                "No matching instance",
+            )?;
+            result["settingsId"] = json!(document.instances[resolved.index].settings_id);
+        }
+        crate::bytecode::edit::push_stored_instance(&mut result)?;
+    }
+    print_json_output(&result, args.pretty)
+}
+
+fn bytecode_set_property_result(mut args: BytecodeSetPropertyArgs) -> Result<Value> {
+    let property_name = args.property.remove(0);
+    let args = SetPropertyCall {
+        args,
+        property: property_name,
+    };
     if args.property.eq_ignore_ascii_case("classname") {
         bail!("ClassName is read-only");
     }
-    adopt_single_positional_target(&mut args.input, None, &mut args.selector)?;
+    let mut args = args;
+    let inner = &mut args.args;
+    adopt_single_positional_target(&mut inner.input, None, &mut inner.selector)?;
     let (settings_file, service_hint) = resolve_bytecode_cli_settings_file(
         args.input.settings_file.as_deref(),
         args.input.service_or_file.as_deref(),
@@ -2159,16 +2235,13 @@ pub(super) fn bytecode_set_property(mut args: BytecodeSetPropertyArgs) -> Result
             .then(|| source_path.clone())
             .into_iter()
             .collect::<Vec<_>>();
-        return print_json_output(
-            &json!({
-                "ok": true,
-                "settingsFile": settings_file,
-                "property": args.property,
-                "sourcePath": source_path,
-                "changedPaths": changed_paths,
-            }),
-            args.pretty,
-        );
+        return Ok(json!({
+            "ok": true,
+            "settingsFile": settings_file,
+            "property": args.property,
+            "sourcePath": source_path,
+            "changedPaths": changed_paths,
+        }));
     }
     let affects_source_path = property_affects_source_path(scope, property);
     let before_document = affects_source_path.then(|| document.clone());
@@ -2239,7 +2312,28 @@ pub(super) fn bytecode_set_property(mut args: BytecodeSetPropertyArgs) -> Result
         result["pathSegments"] = json!(path_segments.get(index).and_then(Clone::clone));
         result["pathOrdinals"] = json!(path_ordinals.get(index).and_then(Clone::clone));
     }
-    print_json_output(&result, args.pretty)
+    Ok(result)
+}
+
+/// One property of a `bs` call: the parsed arguments plus the property name
+/// that call sets, so the setter reads `args.property` as before.
+struct SetPropertyCall {
+    args: BytecodeSetPropertyArgs,
+    property: String,
+}
+
+impl std::ops::Deref for SetPropertyCall {
+    type Target = BytecodeSetPropertyArgs;
+
+    fn deref(&self) -> &BytecodeSetPropertyArgs {
+        &self.args
+    }
+}
+
+impl std::ops::DerefMut for SetPropertyCall {
+    fn deref_mut(&mut self) -> &mut BytecodeSetPropertyArgs {
+        &mut self.args
+    }
 }
 
 pub(super) fn bytecode_apply_property_batch(args: BytecodeApplyPropertyBatchArgs) -> Result<()> {

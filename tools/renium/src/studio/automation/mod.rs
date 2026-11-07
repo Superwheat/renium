@@ -598,6 +598,31 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
             }
         }
     }
+    if let Some(limit) = args.console
+        && result.get("ok").and_then(Value::as_bool) != Some(false)
+    {
+        let console = daemon_control_request(
+            op::CONSOLE,
+            None,
+            json!({
+                "limit": limit,
+                "sinceSeq": 0,
+                "fromOldest": false,
+                "clear": false,
+                "server": true,
+                "bridgeWaitSeconds": args.bridge.wait_seconds,
+                "bridgePorts": args.bridge.ports,
+            }),
+            false,
+        );
+        result["console"] = match console {
+            Ok(mut console) => {
+                console::compact_console_entries(&mut console);
+                console.get("entries").cloned().unwrap_or_else(|| json!([]))
+            }
+            Err(error) => json!({ "error": format!("{error:#}") }),
+        };
+    }
     if crate::app::output::compact_text_output() {
         compact_play_result(&mut result, args.players.is_some());
     }

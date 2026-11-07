@@ -115,7 +115,7 @@ pub(crate) fn bytecode_add_instance(args: BytecodeAddInstanceArgs) -> Result<()>
         args.input.service_or_file.as_deref(),
         args.service_hint.as_deref(),
     )?;
-    let result = add_store_instance(StoreInstanceRequest {
+    let mut result = add_store_instance(StoreInstanceRequest {
         settings_file,
         service_hint,
         name,
@@ -131,7 +131,37 @@ pub(crate) fn bytecode_add_instance(args: BytecodeAddInstanceArgs) -> Result<()>
         properties: args.properties,
         attributes: args.attributes,
     })?;
+    if args.push {
+        push_stored_instance(&mut result)?;
+    }
     print_json_output(&result, args.pretty)
+}
+
+/// Pushes the instance a store edit just wrote (its `settingsFile` and
+/// `settingsId`) to the open place, scoped to that instance and without a
+/// review, and records the push summary under `push`.
+pub(crate) fn push_stored_instance(result: &mut Value) -> Result<()> {
+    let settings_file = result
+        .get("settingsFile")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .context("The store edit did not name its file")?;
+    let settings_id = result
+        .get("settingsId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .context("The store edit did not name its instance; push the store file with `rbx ps`")?;
+    let mut args = crate::cli::PushEditorChangesArgs::new(
+        crate::cli::ProjectSourceArgs::current(),
+        crate::cli::BridgeConnectionArgs::default_connection(),
+    );
+    args.changed_paths = vec![settings_file];
+    args.target_settings_ids = vec![settings_id];
+    args.yes = true;
+    let summary = crate::editor::sync::push_editor_changes_result(args)
+        .context("The store was written but the push failed; push it with `rbx ps`")?;
+    result["push"] = summary;
+    Ok(())
 }
 
 /// A script file imported with `--path-json` into a project whose service is
@@ -1407,6 +1437,7 @@ mod add_instance_tests {
                 class_name: Some("ModuleScript".into()),
                 settings_id: None,
                 batch: None,
+                push: false,
                 parent: BytecodeParentArgs {
                     parent_index: None,
                     parent_settings_id: None,

@@ -76,7 +76,7 @@ fn console_entry_line(entry: &Value) -> String {
 
 /// Studio's MessageType names and a wall-clock stamp repeat on every line;
 /// the level word is what a reader filters on and `time` already orders them.
-fn compact_console_entries(result: &mut Value) {
+pub(crate) fn compact_console_entries(result: &mut Value) {
     if crate::app::output::global_json_output() {
         return;
     }

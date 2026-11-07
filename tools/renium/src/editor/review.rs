@@ -624,6 +624,9 @@ pub(crate) fn editor_review_payload(changes: &EditorChangeSet) -> (u64, Vec<Valu
     let mut rows = Vec::new();
     let mut row_index_by_key = HashMap::new();
     let mut change_count: u64 = 0;
+    // A new instance arrives with its properties; they are part of the one
+    // addition, not separate changes to review.
+    let mut added_instances = std::collections::HashSet::new();
     for change in &changes.instance_changes {
         let kind = match change.mode.as_str() {
             "deleteInstances" => "instanceRemove",
@@ -632,6 +635,9 @@ pub(crate) fn editor_review_payload(changes: &EditorChangeSet) -> (u64, Vec<Valu
             _ => "instanceReconcile",
         };
         for instance in &change.instances {
+            if kind == "instanceAdd" {
+                added_instances.insert((change.service.clone(), instance.settings_id.clone()));
+            }
             change_count += 1;
             append_editor_review_entry(
                 &mut rows,
@@ -670,12 +676,16 @@ pub(crate) fn editor_review_payload(changes: &EditorChangeSet) -> (u64, Vec<Valu
             path_ordinals: &change.path_ordinals,
             class_name: &change.class_name,
         };
+        let counts = !change
+            .settings_id
+            .as_ref()
+            .is_some_and(|id| added_instances.contains(&(change.service.clone(), id.clone())));
         for (kind, values) in [
             ("property", &change.properties),
             ("attribute", &change.attributes),
         ] {
             for (name, value) in values {
-                change_count += 1;
+                change_count += u64::from(counts);
                 append_editor_review_entry(
                     &mut rows,
                     &mut row_index_by_key,
@@ -689,7 +699,7 @@ pub(crate) fn editor_review_payload(changes: &EditorChangeSet) -> (u64, Vec<Valu
             }
         }
         for name in &change.reset_properties {
-            change_count += 1;
+            change_count += u64::from(counts);
             append_editor_review_entry(
                 &mut rows,
                 &mut row_index_by_key,
@@ -702,7 +712,7 @@ pub(crate) fn editor_review_payload(changes: &EditorChangeSet) -> (u64, Vec<Valu
             );
         }
         for name in &change.deleted_attributes {
-            change_count += 1;
+            change_count += u64::from(counts);
             append_editor_review_entry(
                 &mut rows,
                 &mut row_index_by_key,

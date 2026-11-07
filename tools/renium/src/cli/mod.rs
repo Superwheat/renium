@@ -1267,6 +1267,26 @@ pub(super) struct ProjectSourceArgs {
     pub(super) src_root: PathBuf,
 }
 
+impl ProjectSourceArgs {
+    /// The project in the working directory with the default source folder,
+    /// as a command run without `-r`/`-d` sees it.
+    pub(crate) fn current() -> Self {
+        Self {
+            project_root: PathBuf::from("."),
+            src_root: PathBuf::from("src"),
+        }
+    }
+}
+
+impl BridgeConnectionArgs {
+    pub(crate) fn default_connection() -> Self {
+        Self {
+            wait_seconds: 8.0,
+            ports: "8781,8782".to_string(),
+        }
+    }
+}
+
 #[derive(Parser)]
 pub(super) struct FindArgs {
     #[arg(help = "Service to search, or text when --service is given")]
@@ -1824,6 +1844,13 @@ pub(super) struct StartStopPlayArgs {
         conflicts_with_all = ["until", "stop", "kill_orphans"]
     )]
     pub(super) no_ready: bool,
+    #[arg(
+        help = "After the start (and --until) return the last N server console entries as `console`",
+        long,
+        value_name = "N",
+        conflicts_with_all = ["stop", "kill_orphans"]
+    )]
+    pub(super) console: Option<u64>,
     #[arg(
         help = "Close Studio test server/client windows whose Edit window has exited (with --place: that place's only)",
         long,
@@ -2978,7 +3005,7 @@ pub(super) struct EditorRevertArgs {
     pub(super) bridge: BridgeConnectionArgs,
 }
 
-#[derive(Args, Default)]
+#[derive(Args, Default, Clone)]
 pub(super) struct BytecodeFileArgs {
     #[arg(help = "Service name or store file")]
     pub(super) service_or_file: Option<String>,
@@ -3001,7 +3028,7 @@ impl BytecodeFileArgs {
     }
 }
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 pub(super) struct BytecodeInstanceSelectorArgs {
     #[arg(help = "Target name or dotted path (Lobby.Door, Borders.Border[4])")]
     pub(super) target: Option<String>,
@@ -3083,14 +3110,25 @@ pub(super) struct BytecodeGetPropertyArgs {
     pub(super) pretty: bool,
 }
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 pub(super) struct BytecodeSetPropertyArgs {
     #[command(flatten)]
     pub(super) input: BytecodeFileArgs,
     #[command(flatten)]
     pub(super) selector: BytecodeInstanceSelectorArgs,
-    #[arg(help = "Property or attribute name", short, long, alias = "prop")]
-    pub(super) property: String,
+    #[arg(
+        help = "Property or attribute name, or NAME=JSON to set several in one call (repeatable)",
+        short,
+        long,
+        alias = "prop",
+        required = true
+    )]
+    pub(super) property: Vec<String>,
+    #[arg(
+        help = "Push the edited instance to the open Studio place right away (scoped to it, no review)",
+        long
+    )]
+    pub(super) push: bool,
     #[arg(
         short = 'j',
         long,
@@ -3357,6 +3395,11 @@ pub(super) struct BytecodeAddInstanceArgs {
     pub(super) parent: BytecodeParentArgs,
     #[arg(help = "Property as NAME=JSON (repeatable)", short, long = "property")]
     pub(super) properties: Vec<String>,
+    #[arg(
+        help = "Push the new instance to the open Studio place right away (scoped to it, no review)",
+        long
+    )]
+    pub(super) push: bool,
     #[arg(
         help = "Attribute as NAME=JSON (repeatable)",
         short,
