@@ -213,6 +213,7 @@ pub(crate) fn push_stored_instance(result: &mut Value) -> Result<()> {
     args.changed_paths = vec![settings_file];
     args.target_settings_ids = vec![settings_id];
     args.yes = true;
+    args.verify_sources = true;
     let summary = crate::editor::sync::push_editor_changes_result(args)
         .context("The store was written but the push failed; push it with `rbx ps`")?;
     result["push"] = summary;

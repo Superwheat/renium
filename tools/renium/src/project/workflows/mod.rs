@@ -34,6 +34,10 @@ use build_watch::{package_uses_roblox_ts, roblox_ts_command, should_run_tool, wa
 const CLI_DOCS: &str = include_str!("../../../README.md");
 const AGENT_POINTER: &str =
     include_str!("../../../../renium-vscode-extension/resources/RENIUM.pointer.md");
+/// Claude Code reads CLAUDE.md itself and inlines `@RENIUM.md`, so the guide
+/// is in context before the first command instead of costing a read.
+const CLAUDE_POINTER: &str =
+    include_str!("../../../../renium-vscode-extension/resources/CLAUDE.pointer.md");
 const PROJECT_INSTRUCTIONS_FILE: &str = "RENIUM.md";
 const PROJECT_GUIDES_DIRECTORY: &str = "RENIUM";
 const AGENT_VERSION_PREFIX: &str = "<!-- renium-version: ";
@@ -1663,6 +1667,9 @@ pub(crate) fn refresh_outdated_agent_instructions(project: Option<&Path>) -> Res
             ));
         }
     }
+    if claude_pointer_outdated(&root) {
+        changed.push("CLAUDE.md".to_string());
+    }
     if changed.is_empty() {
         return Ok(changed);
     }
@@ -1808,16 +1815,27 @@ fn agent_guides() -> Result<Vec<(PathBuf, Vec<u8>)>> {
 }
 
 fn merged_instruction_file(path: &Path) -> Result<Vec<u8>> {
+    let is_claude = path.file_name() == Some(OsStr::new("CLAUDE.md"));
+    let pointer = if is_claude {
+        CLAUDE_POINTER
+    } else {
+        AGENT_POINTER
+    };
     if !path.is_file() {
-        return Ok(AGENT_POINTER.as_bytes().to_vec());
+        return Ok(pointer.as_bytes().to_vec());
     }
     let mut current =
         fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
-    if path.file_name() == Some(OsStr::new("CLAUDE.md")) && mentions_agents_file(&current) {
+    if is_claude && mentions_agents_file(&current) {
         return Ok(current.into_bytes());
     }
-    if current.contains(AGENT_POINTER.trim_end()) {
+    if current.contains(pointer.trim_end()) {
         return Ok(current.into_bytes());
+    }
+    if is_claude && current.contains(AGENT_POINTER.trim_end()) {
+        return Ok(current
+            .replace(AGENT_POINTER.trim_end(), CLAUDE_POINTER.trim_end())
+            .into_bytes());
     }
     let old_generated = current
         .trim_end()
@@ -1825,7 +1843,7 @@ fn merged_instruction_file(path: &Path) -> Result<Vec<u8>> {
         .next_back()
         .is_some_and(is_old_agent_marker);
     if old_generated {
-        return Ok(AGENT_POINTER.as_bytes().to_vec());
+        return Ok(pointer.as_bytes().to_vec());
     }
     if !current.is_empty() && !current.ends_with('\n') {
         current.push('\n');
@@ -1833,8 +1851,17 @@ fn merged_instruction_file(path: &Path) -> Result<Vec<u8>> {
     if !current.is_empty() && !current.ends_with("\n\n") {
         current.push('\n');
     }
-    current.push_str(AGENT_POINTER);
+    current.push_str(pointer);
     Ok(current.into_bytes())
+}
+
+/// A CLAUDE.md that still carries the read-me pointer instead of the import.
+fn claude_pointer_outdated(root: &Path) -> bool {
+    fs::read_to_string(root.join("CLAUDE.md")).is_ok_and(|text| {
+        !mentions_agents_file(&text)
+            && text.contains(AGENT_POINTER.trim_end())
+            && !text.contains(CLAUDE_POINTER.trim_end())
+    })
 }
 
 fn mentions_agents_file(text: &str) -> bool {
@@ -2825,6 +2852,28 @@ mod tests {
             fs::read_to_string(&claude).unwrap(),
             "Read and follow AgEnTs.Md.\n"
         );
+        fs::write(&claude, format!("# Rules\n\n{AGENT_POINTER}")).unwrap();
+        assert_eq!(
+            String::from_utf8(merged_instruction_file(&claude).unwrap()).unwrap(),
+            format!("# Rules\n\n{CLAUDE_POINTER}"),
+            "the read-me pointer becomes the import"
+        );
+        assert!(claude_pointer_outdated(&root));
+        fs::write(&claude, CLAUDE_POINTER).unwrap();
+        assert!(!claude_pointer_outdated(&root));
+        assert_eq!(
+            merged_instruction_file(&claude).unwrap(),
+            CLAUDE_POINTER.as_bytes()
+        );
+        fs::remove_file(&claude).unwrap();
+        assert_eq!(
+            merged_instruction_file(&claude).unwrap(),
+            CLAUDE_POINTER.as_bytes()
+        );
+        assert_eq!(
+            merged_instruction_file(&root.join("missing-AGENTS.md")).unwrap(),
+            AGENT_POINTER.as_bytes()
+        );
         assert_eq!(
             fs::read(root.join(PROJECT_INSTRUCTIONS_FILE)).unwrap(),
             agent_instructions().unwrap()
@@ -2897,7 +2946,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(&claude).unwrap(),
-            format!("# Claude rules\n\n{AGENT_POINTER}")
+            format!("# Claude rules\n\n{CLAUDE_POINTER}")
         );
         let before = [fs::read(&agents).unwrap(), fs::read(&claude).unwrap()];
         run_init(InitArgs {

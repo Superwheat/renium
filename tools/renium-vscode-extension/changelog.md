@@ -13,6 +13,8 @@
 - `rbx ba` and `rbx bs` accept `Position` on a part and store it as the part's CFrame (keeping an existing rotation), instead of writing a property Studio never applies.
 - A new instance pushed with its properties counts as one change toward the review threshold, in the daemon and in the Studio plugin, so a single new part no longer opens a review.
 - The root agent guide carries recipes for the common edits, so a task that adds or changes instances, writes a script or runs a play check needs no further guide.
+- `rbx init` writes a CLAUDE.md that imports RENIUM.md (`@RENIUM.md`), so Claude Code has the guide in context before its first command instead of reading it each session; an existing CLAUDE.md with the read-me pointer is migrated on the next command, and the editor extension writes the same pointer.
+- `--push` on `rbx ba` and `rbx bs` verifies pushed script sources, so its `verified` field covers a script adopted from a written file.
 - `rbx ps`, `rbx prop` and `rbx del` above the review threshold no longer wait 90 s for a Studio review panel nobody answers: they apply nothing and return `heldForReview` with the change list (`review`: path, class and changed names per instance), so the caller reads it and reruns with `--yes`. Pushes from the editor extension and Live Sync keep the Studio panel.
 
 ### Bug fixes

@@ -1,7 +1,7 @@
 <!-- renium-version: 0.5.9 -->
 # Renium for agents
 
-Use `rbx` from the place's project folder. Act directly: commands report a missing Studio or a sync problem themselves, so skip `status`, `cs` and `lst` checks. Results: one JSON line on stdout, errors on stderr; skip `2>&1`.
+Use `rbx` from the place's project folder. Act directly: commands report a missing Studio or a sync problem themselves, so skip `status`, `cs` and `lst` checks. Results: one JSON line on stdout, errors on stderr.
 
 ## Recipes
 
@@ -11,7 +11,7 @@ Use `rbx` from the place's project folder. Act directly: commands report a missi
 - Many instances, or a Studio-only change: `rbx l --edit 'LUAU'` applies in Studio as one undo step and returns the chunk's value, so return what verifies it; Live Sync (when on) pulls it into the files.
 - New script: write `src/ServerScriptService/Name.server.luau`, then `rbx ck FILE && rbx ba ServerScriptService -n Name -c Script --push` adopts the file and pushes it.
 - Play check: `rbx play -s --until 'workspace.DistributedGameTime > 10' --console 40 --stop-after` starts, waits, returns the server console and stops; or keep it running for `rbx l --server 'LUAU'` and `rbx play -x`.
-- Verify with one read.
+- `verified: true` in a push result is the check; else one read.
 
 ## Choose the smallest sufficient check
 
@@ -19,7 +19,7 @@ Use `rbx` from the place's project folder. Act directly: commands report a missi
 - Runtime behavior: Play answers one specific question about input, replication, physics or errors; know the expected result first.
 - Visual behavior: capture the real client with real input (`rs`, `inp`, `re`), inspect `rf` frames; scripts cannot tell what the player sees.
 
-Check syntax offline with `rbx ck FILE`, never `loadstring`. With healthy Live Sync, trust file edits: no push, poll or Play after each save; one `lst --wait` after a reported problem. A `ps` over 5 changes (default threshold) applies nothing and returns its change list; check it, then pass `--yes`. Reuse Play sessions, batch checks, never stop a user's session; `rbx wait EXPR -t N`, not a shell loop.
+Check syntax offline with `rbx ck FILE`, not `loadstring`. With healthy Live Sync, trust file edits: no push, poll or Play after each save; one `lst --wait` after a reported problem. A `ps` over 5 changes (default threshold) applies nothing and returns its change list; check it, then pass `--yes`. Reuse Play sessions, batch checks, never stop a user's session; wait with `rbx wait EXPR -t N`.
 
 ## Read the relevant guide
 
@@ -53,14 +53,14 @@ When the recipes do not cover the task, read its guide once; reread after a repo
 
 Single-place projects use `src`; experiences `places/<alias>/src`. A place folder selects its target; at the experience root add `--place <alias|placeId>`. Two Studios on one project: `--place <placeId|window name>` first.
 
-Edit scripts as files; stores are compressed (no grep). `f`/`bg`/`bb` read saved data; `q` searches a closed place; `l` reads Studio. Reuse IDs. Run mutations one at a time, read each result, and after a failure check state before retrying. A usage error (unknown flag, missing selector): fix the call and rerun. `l` tables over 128 keys are cut.
+Edit scripts as files; stores are compressed (no grep). `f`/`bg`/`bb` read saved data; `q` searches a closed place; `l` reads Studio. Reuse IDs. Run mutations one at a time and read each result; after a failure check state before retrying. A usage error (unknown flag, missing selector): fix the call and rerun. `l` tables over 128 keys are cut.
 
-Fix and verify defects in requested work. Report `autoDesyncedPackages`. Publishing needs authorization. Say synced, not saved: `persistence: teamCreate` means Team Create saved it, `unsaved` means the user saves. Open Cloud uploads follow `RENIUM/publishing-validation.md`.
+Fix and verify defects in requested work. Report `autoDesyncedPackages`. Publishing needs authorizing. Say synced, not saved: `persistence: teamCreate` means Team Create saved it, `unsaved` means the user saves. Open Cloud uploads follow `RENIUM/publishing-validation.md`.
 
 ## Tools and boundaries
 
-- Pass arguments or pipe JSON/code; no payload files.
-- Open a place once with `rbx so FILE`; `rbx ro` reopens it. Never take focus or global input.
+- Pass arguments or pipe JSON/code, no payload files.
+- Open a place once with `rbx so FILE`; `rbx ro` reopens. Never take focus or global input.
 - No project backups: `rbx rev` restores files; Studio undo covers pushes.
-- `rbx upd` updates when asked or reported; then reread the guides.
+- `rbx upd` updates when asked or reported; reread the guides.
 - On a Renium failure follow `RENIUM/bug-reports.md`: write, scrub private data, upload, return the ID.

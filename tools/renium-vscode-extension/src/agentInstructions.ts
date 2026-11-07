@@ -88,13 +88,21 @@ export function ensureReniumAgentInstructions(
   }
 
   const pointer = fs.readFileSync(path.join(extensionRoot, "resources", "RENIUM.pointer.md"), "utf8");
+  // Claude Code inlines `@RENIUM.md` from CLAUDE.md, so the guide is in
+  // context before the first command instead of costing a read.
+  const claudePointerPath = path.join(extensionRoot, "resources", "CLAUDE.pointer.md");
+  const claudePointer = fs.existsSync(claudePointerPath) ? fs.readFileSync(claudePointerPath, "utf8") : pointer;
   for (const name of ["AGENTS.md", "CLAUDE.md"]) {
     const target = path.join(projectRoot, name);
-    const current = fs.existsSync(target) ? fs.readFileSync(target, "utf8") : "";
+    let current = fs.existsSync(target) ? fs.readFileSync(target, "utf8") : "";
     if (name === "CLAUDE.md" && current.toLowerCase().includes("agents.md")) {
       continue;
     }
-    write(target, agentInstructions(pointer, current));
+    const filePointer = name === "CLAUDE.md" ? claudePointer : pointer;
+    if (name === "CLAUDE.md" && filePointer !== pointer && current.includes(pointer.trimEnd())) {
+      current = current.replace(pointer.trimEnd(), claudePointer.trimEnd());
+    }
+    write(target, agentInstructions(filePointer, current));
   }
   return written;
 }

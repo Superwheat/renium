@@ -11,11 +11,13 @@ test("Renium guide uses one marked pointer in project instructions", () => {
   const extension = path.join(root, "extension");
   const project = path.join(root, "project");
   const pointer = "\u2063Read and follow RENIUM.md.\u2063\n";
+  const claudePointer = "\u2063Follow the Renium guide imported below.\u2063\n@RENIUM.md\n";
   fs.mkdirSync(path.join(extension, "resources"), { recursive: true });
   fs.mkdirSync(path.join(extension, "resources", "RENIUM"));
   fs.mkdirSync(project);
   fs.writeFileSync(path.join(project, "renium.project.jsonc"), "{\"schemaVersion\":1}\n");
   fs.writeFileSync(path.join(extension, "resources", "RENIUM.pointer.md"), pointer);
+  fs.writeFileSync(path.join(extension, "resources", "CLAUDE.pointer.md"), claudePointer);
   fs.writeFileSync(
     path.join(extension, "resources", "RENIUM.md"),
     "<!-- renium-version: 0.2.6 -->\n# Current guide\n",
@@ -54,7 +56,12 @@ test("Renium guide uses one marked pointer in project instructions", () => {
   fs.writeFileSync(claude, "# Claude rules\n");
   assert.deepEqual(ensureReniumAgentInstructions(extension, project), [agents, claude]);
   assert.equal(fs.readFileSync(agents, "utf8"), `# Project rules\n\n${pointer}`);
-  assert.equal(fs.readFileSync(claude, "utf8"), `# Claude rules\n\n${pointer}`);
+  assert.equal(fs.readFileSync(claude, "utf8"), `# Claude rules\n\n${claudePointer}`);
+  assert.deepEqual(ensureReniumAgentInstructions(extension, project), []);
+
+  fs.writeFileSync(claude, `# Claude rules\n\n${pointer}`);
+  assert.deepEqual(ensureReniumAgentInstructions(extension, project), [claude]);
+  assert.equal(fs.readFileSync(claude, "utf8"), `# Claude rules\n\n${claudePointer}`);
   assert.deepEqual(ensureReniumAgentInstructions(extension, project), []);
 
   const ordinary = path.join(root, "ordinary");
