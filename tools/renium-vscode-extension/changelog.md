@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### New
+
+- `rbx mcp` serves the everyday commands as Model Context Protocol tools on stdio (luau, tree, inspect, find, add, add_many, set, move, rename, remove, push, pull, check, play, console, and rbx for any other command), so an agent host such as Claude Code calls Renium in-process with typed arguments instead of through a shell. `rbx init` writes the `renium` server into the project's `.mcp.json` and allows project servers in `.claude/settings.json`; an existing project gets both on its next command.
+
 ### Improvements
 
 - One call reads several saved values: `rbx bg SERVICE TARGET A B C` prints one object, `rbx in SERVICE T1 T2` one array, and `rbx q FILE -n A -n B -c Class -s TEXT` matches any of the repeated selectors in one decode of the place file.
