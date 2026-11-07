@@ -787,7 +787,7 @@ pub(crate) fn editor_review_digest(rows: &[Value], limit: usize) -> (Vec<Value>,
                 let name = entry.get("name").and_then(Value::as_str).unwrap_or("");
                 let flag = |key: &str| entry.get(key).and_then(Value::as_bool) == Some(true);
                 match entry.get("kind").and_then(Value::as_str).unwrap_or("") {
-                    "instanceAdd" => "+instance".to_string(),
+                    "instanceAdd" => "+instance (upsert: existing ancestors stay)".to_string(),
                     "instanceRemove" => "-instance".to_string(),
                     "instanceReplace" => "replace instance".to_string(),
                     "instanceReconcile" if flag("allowDeletes") => {
@@ -1760,7 +1760,12 @@ mod review_threshold_tests {
         assert_eq!(digest[0]["class"], json!("Part"));
         assert_eq!(
             digest[0]["changes"],
-            json!(["+instance", "Size", "Reflectance (reset)", "-@Owner"])
+            json!([
+                "+instance (upsert: existing ancestors stay)",
+                "Size",
+                "Reflectance (reset)",
+                "-@Owner"
+            ])
         );
         let (digest, more) = editor_review_digest(&rows, 10);
         assert_eq!(more, 0);
