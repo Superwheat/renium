@@ -190,6 +190,7 @@ pub(super) fn play(operation: u16, parameters: &Value) -> Result<StartStopPlayAr
         until_console: None,
         until_timeout: 120.0,
         result: None,
+        client_result: None,
         console: None,
         at: None,
         stop_after: false,

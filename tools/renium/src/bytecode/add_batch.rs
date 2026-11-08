@@ -516,6 +516,60 @@ mod tests {
     }
 
     #[test]
+    fn lighting_clock_time_is_stored_as_time_of_day() {
+        let root = scratch("renium-clocktime-");
+        run(
+            &root,
+            r##"{"ops":[{"parent":"Lighting","name":"Haze","class":"Atmosphere"}]}"##,
+        )
+        .unwrap();
+        let store = root.join("instances").join("Lighting.renium");
+        let result =
+            crate::bytecode::bytecode_set_property_result(crate::cli::BytecodeSetPropertyArgs {
+                where_query: None,
+                input: crate::cli::BytecodeFileArgs::settings_file(store.clone()),
+                selector: crate::cli::BytecodeInstanceSelectorArgs::default(),
+                property: vec!["ClockTime".to_string()],
+                value_json: None,
+                value_str: None,
+                value_num: Some(18.25),
+                value_bool: None,
+                value_null: false,
+                scope: "auto".to_string(),
+                override_packages: false,
+                push: false,
+                pretty: false,
+            })
+            .unwrap();
+        assert_eq!(result["property"], "TimeOfDay");
+        let document = SettingsBytecode::read_file(&store).unwrap();
+        let lighting = document
+            .instances
+            .iter()
+            .find(|instance| instance.class_name == "Lighting")
+            .unwrap();
+        assert_eq!(lighting.properties["TimeOfDay"], "18:15:00");
+        assert!(!lighting.properties.contains_key("ClockTime"));
+        let database = rbx_reflection_database::get().unwrap();
+        assert!(crate::editor::review::is_engine_managed_editor_property(
+            "Lighting",
+            "ClockTime",
+            database
+        ));
+        assert!(!crate::editor::review::is_engine_managed_editor_property(
+            "Lighting",
+            "TimeOfDay",
+            database
+        ));
+        assert_eq!(
+            crate::bytecode::edit::time_of_day_from_hours(&json!(6.5)).unwrap(),
+            "06:30:00"
+        );
+        assert!(crate::bytecode::edit::time_of_day_from_hours(&json!(25)).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn rename_where_replaces_part_of_every_matching_name() {
         let root = scratch("renium-rn-where-");
         run(

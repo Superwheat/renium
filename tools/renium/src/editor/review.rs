@@ -97,6 +97,11 @@ pub(crate) fn is_engine_managed_editor_property(
     if is_editor_view_state(class_name, property_name) {
         return true;
     }
+    // Studio saves the time of day as TimeOfDay; ClockTime is the same value
+    // in hours, derived on load, so a stored copy only fights the string.
+    if class_name == "Lighting" && property_name == "ClockTime" {
+        return true;
+    }
     if property_name == "Tags"
         || class_name == "Workspace" && property_name == "CollisionGroupData"
         || class_name == "Terrain"

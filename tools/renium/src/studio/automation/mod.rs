@@ -538,6 +538,12 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
     if let Some(result) = args.result.as_deref() {
         wait_result_body(result)?;
     }
+    if (args.result.is_some() || args.client_result.is_some())
+        && args.until.is_none()
+        && args.until_console.is_none()
+    {
+        bail!("--result and --client-result need --until or --until-console");
+    }
     // A stop names no players, so a session started with -p N stops too.
     let stop_parameters = json!({
         "mode": args.mode,
@@ -674,6 +680,7 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
             thread::sleep(std::time::Duration::from_millis(400));
         }
         let seconds = (started.elapsed().as_secs_f64() * 10.0).round() / 10.0;
+        let hit = matched.is_some();
         result["untilConsole"] = match matched {
             Some((side, entry)) => json!({
                 "text": text,
@@ -684,6 +691,23 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
             }),
             None => json!({ "text": text, "matched": false, "timedOut": true, "seconds": seconds }),
         };
+        if hit
+            && args.until.is_none()
+            && let Some(code) = args.result.as_deref()
+        {
+            result["result"] = evaluate_after_wait(code, "server", &args);
+        }
+    }
+    if let Some(code) = args.client_result.as_deref()
+        && result.get("ok").and_then(Value::as_bool) != Some(false)
+        && result
+            .get("untilConsole")
+            .is_none_or(|until| until.get("matched") == Some(&Value::Bool(true)))
+        && result
+            .get("until")
+            .is_none_or(|until| until.get("ok") != Some(&Value::Bool(false)))
+    {
+        result["clientResult"] = evaluate_after_wait(code, "client", &args);
     }
     if let Some(limit) = args.console
         && result.get("ok").and_then(Value::as_bool) != Some(false)
@@ -704,6 +728,32 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
         compact_play_result(&mut result, args.players.is_some());
     }
     print_json_output(&result, false)
+}
+
+/// Evaluates `--result` or `--client-result` once the wait holds, on the
+/// server or on the first client; the value, or `{ "error" }`.
+fn evaluate_after_wait(code: &str, side: &str, args: &StartStopPlayArgs) -> Value {
+    let mut parameters = json!({
+        "code": code,
+        "timeout": 30.0,
+        "bridgeWaitSeconds": args.bridge.wait_seconds,
+        "bridgePorts": args.bridge.ports,
+    });
+    if side == "client" {
+        parameters["client"] = json!(true);
+        parameters["player"] = json!(1);
+    } else {
+        parameters["server"] = json!(true);
+    }
+    match daemon_control_request(op::LUAU, None, parameters, false) {
+        Ok(run) => run
+            .get("results")
+            .and_then(Value::as_array)
+            .and_then(|results| results.first())
+            .cloned()
+            .unwrap_or(Value::Null),
+        Err(error) => json!({ "error": format!("{error:#}") }),
+    }
 }
 
 /// Runs `--at` on the play server: the first player's character is stood on

@@ -116,6 +116,25 @@ fn vector3_components(value: &Value) -> Option<[f64; 3]> {
 /// A part's Position is not stored: it is the translation of its CFrame. The
 /// CFrame with that translation keeps the rotation the part already has, or
 /// none for a new part.
+/// Lighting keeps the time of day as the string `TimeOfDay`; `ClockTime` is
+/// the same value in hours and is never saved, so a stored ClockTime would
+/// fail every push. This turns hours (18.25) into the saved form (18:15:00).
+pub(crate) fn time_of_day_from_hours(value: &Value) -> Result<Value> {
+    let hours = value
+        .as_f64()
+        .with_context(|| format!("ClockTime needs a number of hours, got {value}"))?;
+    if !(0.0..=24.0).contains(&hours) {
+        bail!("ClockTime must be between 0 and 24 hours, got {hours}");
+    }
+    let total = (hours * 3600.0).round() as u64 % 86_400;
+    Ok(json!(format!(
+        "{:02}:{:02}:{:02}",
+        total / 3600,
+        total / 60 % 60,
+        total % 60
+    )))
+}
+
 pub(crate) fn cframe_at_position(current: Option<&Value>, position: &Value) -> Result<Value> {
     let [x, y, z] = vector3_components(position)
         .context("Position needs x, y and z numbers, as {\"x\":..,\"y\":..,\"z\":..} or [x,y,z]")?;
@@ -765,7 +784,15 @@ pub(crate) fn new_script_source(
     }
 }
 
-pub(crate) fn bytecode_clone_instance(mut args: BytecodeCloneInstanceArgs) -> Result<()> {
+pub(crate) fn bytecode_clone_instance(args: BytecodeCloneInstanceArgs) -> Result<()> {
+    let pretty = args.pretty;
+    let result = bytecode_clone_instance_result(args)?;
+    print_json_output(&result, pretty)
+}
+
+/// The clone as a result: `rootSettingsId` names the copy, `settingsIds`
+/// every copied instance.
+pub(crate) fn bytecode_clone_instance_result(mut args: BytecodeCloneInstanceArgs) -> Result<Value> {
     adopt_single_positional_target(
         &mut args.input,
         Some(args.service.as_str()),
@@ -955,22 +982,19 @@ pub(crate) fn bytecode_clone_instance(mut args: BytecodeCloneInstanceArgs) -> Re
     let (path_segments_by_index, path_ordinals_by_index) =
         build_editor_instance_path_parts(&document, &service);
 
-    print_json_output(
-        &json!({
-            "ok": true,
-            "settingsFile": settings_file,
-            "service": service,
-            "rootSettingsId": root_settings_id,
-            "name": root.name,
-            "className": root.class_name,
-            "pathSegments": path_segments_by_index.get(root_index).and_then(std::clone::Clone::clone),
-            "pathOrdinals": path_ordinals_by_index.get(root_index).and_then(std::clone::Clone::clone),
-            "settingsIds": cloned_settings_ids,
-            "sourceCopies": source_copies,
-            "changedPaths": changed_paths,
-        }),
-        args.pretty,
-    )
+    Ok(json!({
+        "ok": true,
+        "settingsFile": settings_file,
+        "service": service,
+        "rootSettingsId": root_settings_id,
+        "name": root.name,
+        "className": root.class_name,
+        "pathSegments": path_segments_by_index.get(root_index).and_then(std::clone::Clone::clone),
+        "pathOrdinals": path_ordinals_by_index.get(root_index).and_then(std::clone::Clone::clone),
+        "settingsIds": cloned_settings_ids,
+        "sourceCopies": source_copies,
+        "changedPaths": changed_paths,
+    }))
 }
 
 pub(crate) struct BytecodeCloneRefMap {

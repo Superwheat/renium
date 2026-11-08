@@ -1513,6 +1513,27 @@ pub(crate) fn typed_store_property_value(
     let RbxDataType::Value(value_type) = &descriptor.data_type else {
         return Ok(value);
     };
+    // An instance reference written as a path ("SoundService.SFX",
+    // "game.Workspace.Lobby.Pad") is stored as a path reference, which the
+    // push resolves by name; a raw referent id stays as it is.
+    if *value_type == RbxVariantType::Ref
+        && property_name != "Parent"
+        && let Some(path) = value.as_str()
+        && path.contains('.')
+        && path.parse::<RbxRef>().is_err()
+    {
+        let segments = path
+            .split('.')
+            .filter(|segment| !segment.is_empty())
+            .skip_while(|segment| *segment == "game")
+            .collect::<Vec<_>>();
+        if segments.len() < 2 {
+            bail!(
+                "{property_name} needs an instance path with its service, such as Workspace.Lobby.Pad, got {value}"
+            );
+        }
+        return Ok(json!({ "_type": "Ref", "pathSegments": segments }));
+    }
     let value_type = *value_type;
     if value.is_null() || !is_composite_value_type(value_type) {
         return Ok(value);
@@ -1551,6 +1572,7 @@ fn is_composite_value_type(value_type: RbxVariantType) -> bool {
             | RbxVariantType::NumberSequence
             | RbxVariantType::ColorSequence
             | RbxVariantType::PhysicalProperties
+            | RbxVariantType::BrickColor
             | RbxVariantType::Font
             | RbxVariantType::Axes
             | RbxVariantType::Faces
@@ -1821,8 +1843,16 @@ pub(crate) fn json_to_rbx_color3(value: &Value) -> Option<RbxColor3> {
     ))
 }
 
+/// `{"number": 21}`, a bare number, or a palette name such as "Bright red".
 fn json_to_rbx_brick_color(value: &Value) -> Option<RbxBrickColor> {
     let value = json_wrapped_value(value, "BrickColor");
+    if let Some(name) = value.as_str().or_else(|| {
+        json_object(value)
+            .and_then(|obj| obj.get("name"))
+            .and_then(Value::as_str)
+    }) {
+        return RbxBrickColor::from_name(name);
+    }
     let number = json_object(value)
         .and_then(|obj| obj.get("number"))
         .and_then(json_i64)
@@ -2439,6 +2469,47 @@ mod tests {
         );
         assert!(stored("Part", "Material", json!("Neon")).is_object());
         assert!(typed_store_property_value("Part", "Material", json!("NoSuchMaterial")).is_err());
+    }
+
+    #[test]
+    fn brick_colors_take_a_palette_name() {
+        let by_name = typed_store_property_value("Team", "TeamColor", json!("Bright red")).unwrap();
+        let by_number = typed_store_property_value(
+            "Team",
+            "TeamColor",
+            json!({"_type": "BrickColor", "number": 21}),
+        )
+        .unwrap();
+        assert_eq!(by_name, by_number);
+        assert!(typed_store_property_value("Team", "TeamColor", json!("No such color")).is_err());
+    }
+
+    #[test]
+    fn instance_references_take_a_path() {
+        assert_eq!(
+            typed_store_property_value("Sound", "SoundGroup", json!("SoundService.SFX")).unwrap(),
+            json!({"_type": "Ref", "pathSegments": ["SoundService", "SFX"]})
+        );
+        assert_eq!(
+            typed_store_property_value(
+                "Model",
+                "PrimaryPart",
+                json!("game.Workspace.Lobby.Kiosk.Counter")
+            )
+            .unwrap(),
+            json!({"_type": "Ref", "pathSegments": ["Workspace", "Lobby", "Kiosk", "Counter"]})
+        );
+        assert_eq!(
+            typed_store_property_value("Model", "PrimaryPart", json!("Counter")).unwrap(),
+            json!("Counter"),
+            "a bare id or name is left for the reference resolver"
+        );
+        let explicit =
+            json!({"_type": "Ref", "pathSegments": ["Workspace", "A"], "pathOrdinals": [1, 1]});
+        assert_eq!(
+            typed_store_property_value("HingeConstraint", "Attachment0", explicit.clone()).unwrap(),
+            explicit
+        );
     }
 
     #[test]

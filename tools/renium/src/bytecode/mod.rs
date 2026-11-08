@@ -2600,6 +2600,13 @@ pub(crate) fn bytecode_set_property_result(mut args: BytecodeSetPropertyArgs) ->
         )?;
         args.property = "CFrame".to_string();
     }
+    if args.property.eq_ignore_ascii_case("clocktime")
+        && document.instances[index].class_name == "Lighting"
+    {
+        value = crate::bytecode::edit::time_of_day_from_hours(&value)?;
+        args.property = "TimeOfDay".to_string();
+        document.instances[index].properties.remove("ClockTime");
+    }
     reject_package_link_instance_mutation(&document, index, "edited")?;
     reject_viewport_camera_edit(&document, index)?;
     if !args.override_packages {

@@ -11,8 +11,7 @@ use walkdir::WalkDir;
 
 use crate::app::output::print_json_output;
 use crate::bytecode::edit::{
-    bytecode_add_instance, bytecode_clone_instance, bytecode_desync_package_link,
-    bytecode_remove_instance,
+    bytecode_add_instance, bytecode_desync_package_link, bytecode_remove_instance,
 };
 use crate::bytecode::parse_bracket_path_segments;
 use crate::bytecode::{apply_file_mutations, bytecode_set_property};
@@ -365,16 +364,42 @@ pub(crate) fn clone_instance_command(
             parent_target.join(".")
         );
     }
-    bytecode_clone_instance(BytecodeCloneInstanceArgs {
-        input: BytecodeFileArgs::settings_file(source_file),
-        service: target.service,
-        selector: BytecodeInstanceSelectorArgs::by_settings_id(source_id),
-        parent_index: None,
-        parent_settings_id: parent_id,
-        parent_name: None,
-        parent_class_name: None,
-        pretty: false,
-    })
+    let mut result =
+        crate::bytecode::edit::bytecode_clone_instance_result(BytecodeCloneInstanceArgs {
+            input: BytecodeFileArgs::settings_file(source_file.clone()),
+            service: target.service,
+            selector: BytecodeInstanceSelectorArgs::by_settings_id(source_id),
+            parent_index: None,
+            parent_settings_id: parent_id,
+            parent_name: None,
+            parent_class_name: None,
+            pretty: false,
+        })?;
+    let root_id = result
+        .get("rootSettingsId")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if let Some(name) = args.name
+        && let Some(root_id) = root_id.clone()
+    {
+        let renamed = crate::bytecode::bytecode_set_property_result(metadata_property_change(
+            source_file.clone(),
+            Some(root_id),
+            "Name",
+            Some(name.clone()),
+            false,
+        ))?;
+        result["name"] = json!(name);
+        if let Some(segments) = renamed.get("pathSegments") {
+            result["pathSegments"] = segments.clone();
+        }
+    }
+    if args.push {
+        result["settingsId"] = json!(root_id);
+        result["settingsFile"] = json!(source_file);
+        crate::bytecode::edit::push_stored_instance_reading(&mut result, &[], &[])?;
+    }
+    crate::app::output::print_json_output(&result, false)
 }
 
 pub(crate) fn move_instance_command(args: MoveInstanceArgs, project: Option<&Path>) -> Result<()> {

@@ -1838,12 +1838,19 @@ pub(super) struct StartStopPlayArgs {
     )]
     pub(super) until_timeout: f64,
     #[arg(
-        help = "Once --until holds, evaluate this Luau expression (or chunk) once on the server and return it as result, tables included",
+        help = "Once --until or --until-console holds, evaluate this Luau expression (or chunk) once on the server and return it as `result`, tables included",
         long,
         value_name = "LUAU",
-        requires = "until"
+        conflicts_with = "stop"
     )]
     pub(super) result: Option<String>,
+    #[arg(
+        help = "Once --until or --until-console holds, evaluate this Luau expression (or chunk) once on the first client and return it as `clientResult`",
+        long,
+        value_name = "LUAU",
+        conflicts_with = "stop"
+    )]
+    pub(super) client_result: Option<String>,
     #[arg(
         help = "Return as soon as the session runs, without waiting for its players to join (a start waits up to 60 s for them and reports playersReady)",
         long,
@@ -1977,8 +1984,19 @@ pub(super) struct CloneInstanceCommandArgs {
         alias = "parent-id"
     )]
     pub(super) parent_settings_id: String,
+    #[arg(
+        help = "Name for the copy (the source name with a numeric suffix otherwise)",
+        short = 'n',
+        long
+    )]
+    pub(super) name: Option<String>,
     #[arg(help = "Allow edits inside linked packages", long)]
     pub(super) override_packages: bool,
+    #[arg(
+        help = "Push the copy to the open Studio place right away (scoped to it, no review); the result's `studio` and `verified` are its read-back",
+        long
+    )]
+    pub(super) push: bool,
 }
 
 #[derive(Parser)]
