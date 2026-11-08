@@ -476,12 +476,15 @@ fn move_within_store(args: BytecodeSetPropertyArgs, push: bool) -> Result<()> {
         .context("A move names its store file")?;
     let settings_id = args.selector.settings_id.clone();
     let before = push
-        .then(|| stored_path_segments(&settings_file, settings_id.as_deref()))
+        .then(|| {
+            crate::bytecode::edit::stored_path_segments(&settings_file, settings_id.as_deref())
+        })
         .transpose()?
         .flatten();
     let mut result = crate::bytecode::bytecode_set_property_result(args)?;
     if push {
-        let after = stored_path_segments(&settings_file, settings_id.as_deref())?;
+        let after =
+            crate::bytecode::edit::stored_path_segments(&settings_file, settings_id.as_deref())?;
         if let (Some(before), Some(after)) = (before, after) {
             result["reparented"] = reparent_in_studio(&before, &after)?;
         }
@@ -489,30 +492,13 @@ fn move_within_store(args: BytecodeSetPropertyArgs, push: bool) -> Result<()> {
             result["settingsId"] = json!(settings_id);
         }
         result["settingsFile"] = json!(settings_file);
-        crate::bytecode::edit::push_stored_instance(&mut result)?;
+        crate::bytecode::edit::push_stored_instance_reading(
+            &mut result,
+            &["Parent".to_string()],
+            &[],
+        )?;
     }
     crate::app::output::print_json_output(&result, false)
-}
-
-/// The full path (service first) of a stored instance, by settings id.
-fn stored_path_segments(
-    settings_file: &Path,
-    settings_id: Option<&str>,
-) -> Result<Option<Vec<String>>> {
-    let Some(settings_id) = settings_id else {
-        return Ok(None);
-    };
-    let document = SettingsBytecode::read_file(settings_file)?;
-    let service = crate::bytecode::edit::bytecode_service_name(&document, settings_file, "");
-    let Some(index) = document
-        .instances
-        .iter()
-        .position(|instance| instance.settings_id == settings_id)
-    else {
-        return Ok(None);
-    };
-    let (segments, _) = crate::editor::paths::build_editor_instance_path_parts(&document, &service);
-    Ok(segments.get(index).cloned().flatten())
 }
 
 /// Sets the parent of the instance at `before` to the instance at the parent

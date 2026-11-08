@@ -2094,7 +2094,30 @@ pub(super) fn bytecode_set_property(mut args: BytecodeSetPropertyArgs) -> Result
             )?;
             result["settingsId"] = json!(document.instances[resolved.index].settings_id);
         }
-        crate::bytecode::edit::push_stored_instance(&mut result)?;
+        let names = result
+            .get("set")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .or_else(|| {
+                result
+                    .get("property")
+                    .and_then(Value::as_str)
+                    .map(|name| vec![name.to_string()])
+            })
+            .unwrap_or_default();
+        let attribute_scope = args.scope.eq_ignore_ascii_case("attribute");
+        let (properties, attributes) = if attribute_scope {
+            (Vec::new(), names)
+        } else {
+            (names, Vec::new())
+        };
+        crate::bytecode::edit::push_stored_instance_reading(&mut result, &properties, &attributes)?;
     }
     print_json_output(&result, args.pretty)
 }

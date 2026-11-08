@@ -170,6 +170,18 @@ pub(crate) fn bytecode_add_instance(args: BytecodeAddInstanceArgs) -> Result<()>
         args.input.service_or_file.as_deref(),
         args.service_hint.as_deref(),
     )?;
+    let names = |items: &[String]| {
+        items
+            .iter()
+            .map(|item| {
+                item.split_once('=')
+                    .map_or(item.as_str(), |(name, _)| name)
+                    .trim()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+    };
+    let (property_names, attribute_names) = (names(&args.properties), names(&args.attributes));
     let mut result = add_store_instance(StoreInstanceRequest {
         settings_file,
         service_hint,
@@ -187,7 +199,7 @@ pub(crate) fn bytecode_add_instance(args: BytecodeAddInstanceArgs) -> Result<()>
         attributes: args.attributes,
     })?;
     if args.push {
-        push_stored_instance(&mut result)?;
+        push_stored_instance_reading(&mut result, &property_names, &attribute_names)?;
     }
     print_json_output(&result, args.pretty)
 }
@@ -195,7 +207,14 @@ pub(crate) fn bytecode_add_instance(args: BytecodeAddInstanceArgs) -> Result<()>
 /// Pushes the instance a store edit just wrote (its `settingsFile` and
 /// `settingsId`) to the open place, scoped to that instance and without a
 /// review, and records the push summary under `push`.
-pub(crate) fn push_stored_instance(result: &mut Value) -> Result<()> {
+/// Pushes the edited instance and then reads it back from the open place:
+/// `studio` carries its live path, class and the named properties and
+/// attributes, so the caller needs no separate read to confirm the edit.
+pub(crate) fn push_stored_instance_reading(
+    result: &mut Value,
+    properties: &[String],
+    attributes: &[String],
+) -> Result<()> {
     let settings_file = result
         .get("settingsFile")
         .and_then(Value::as_str)
@@ -206,8 +225,70 @@ pub(crate) fn push_stored_instance(result: &mut Value) -> Result<()> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .context("The store edit did not name its instance; push the store file with `rbx ps`")?;
-    result["push"] = push_stored_instances(settings_file, vec![settings_id])?;
+    result["push"] = push_stored_instances(settings_file.clone(), vec![settings_id.clone()])?;
+    if let Some(path) = stored_path_segments(&settings_file, Some(&settings_id))?
+        && let Ok(studio) = read_back_from_studio(&path, properties, attributes)
+    {
+        result["studio"] = studio;
+    }
     Ok(())
+}
+
+/// The full path (service first) of a stored instance, by settings id.
+pub(crate) fn stored_path_segments(
+    settings_file: &Path,
+    settings_id: Option<&str>,
+) -> Result<Option<Vec<String>>> {
+    let Some(settings_id) = settings_id else {
+        return Ok(None);
+    };
+    let document = SettingsBytecode::read_file(settings_file)?;
+    let service = bytecode_service_name(&document, settings_file, "");
+    let Some(index) = document
+        .instances
+        .iter()
+        .position(|instance| instance.settings_id == settings_id)
+    else {
+        return Ok(None);
+    };
+    let (segments, _) = build_editor_instance_path_parts(&document, &service);
+    Ok(segments.get(index).cloned().flatten())
+}
+
+fn luau_string_list(items: &[String]) -> String {
+    let items = items
+        .iter()
+        .map(|item| format!("{item:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{{{items}}}")
+}
+
+/// One live read of the instance at `path` in the Edit window: its full
+/// name, class, the given properties and the given attributes.
+fn read_back_from_studio(
+    path: &[String],
+    properties: &[String],
+    attributes: &[String],
+) -> Result<Value> {
+    let code = format!(
+        "local function at(segments) local inst = game for _, name in segments do inst = inst:FindFirstChild(name) if not inst then return nil end end return inst end\n         local inst = at({}) if not inst then return {{ missing = true }} end\n         local row = {{ path = inst:GetFullName(), class = inst.ClassName }}\n         for _, name in {} do local ok, value = pcall(function() return inst[name] end) if ok then row[name] = value end end\n         for _, name in {} do row['@' .. name] = inst:GetAttribute(name) end\n         return row",
+        luau_string_list(path),
+        luau_string_list(properties),
+        luau_string_list(attributes),
+    );
+    let result = crate::daemon::daemon_control_request(
+        crate::automation::op::LUAU,
+        None,
+        json!({ "code": code, "edit": true, "bridgeWaitSeconds": 8.0, "bridgePorts": "8781,8782" }),
+        false,
+    )?;
+    Ok(result
+        .get("results")
+        .and_then(Value::as_array)
+        .and_then(|results| results.first())
+        .cloned()
+        .unwrap_or(Value::Null))
 }
 
 /// One scoped push of the given instances of one store, without a review;

@@ -12,7 +12,7 @@ Use `rbx` from the place's project folder. Act directly: commands report a missi
 - Studio-only change, or tags and many edits at once: `rbx l --edit 'LUAU'` applies in Studio as one undo step and returns the chunk's value, so return what verifies it; `rbx pl -s SERVICE` afterwards copies the result into the files.
 - New script: write `src/ServerScriptService/Name.server.luau`, then `rbx ck FILE && rbx ba ServerScriptService -n Name -c Script --push`. Edited scripts: `rbx ck FILE && rbx ps FILE` (nothing with Live Sync on).
 - Play check: `rbx play -s --until 'workspace.DistributedGameTime > 10' --console 40 --stop-after` starts, waits, returns the server console and stops; or without `--stop-after`: `rbx l --server 'LUAU'`, `rbx co --server --level error`, `rbx play -x`.
-- `verified: true` in a push result is the check; else one read.
+- A push result's `studio` block is the read-back; no extra read.
 
 ## Choose the smallest sufficient check
 

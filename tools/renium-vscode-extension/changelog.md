@@ -15,6 +15,7 @@
 - The root agent guide carries recipes for the common edits, so a task that adds or changes instances, writes a script or runs a play check needs no further guide.
 - `rbx init` writes a CLAUDE.md that imports RENIUM.md (`@RENIUM.md`), so Claude Code has the guide in context before its first command instead of reading it each session; an existing CLAUDE.md with the read-me pointer is migrated on the next command, and the editor extension writes the same pointer.
 - `--push` on `rbx ba` and `rbx bs` verifies pushed script sources, so its `verified` field covers a script adopted from a written file.
+- A `--push` result carries `studio`: the live read-back of the edited instance (path, class, the properties and attributes just set), so an add, set, move or rename needs no separate read to confirm it.
 - `rbx mv` and `rbx rn` take `--push` too, and `rbx ba --batch --push` pushes every created instance once per store. A pushed move reparents the same instance in the open place (reported as `reparented`) before the scoped push, instead of leaving a copy under the old parent.
 - A CFrame value may be given as `{"_type":"CFrame","position":[x,y,z]}` with an optional 3x3 `orientation`, not only as twelve components.
 - The root agent guide carries recipes for moving and renaming, for editing existing scripts, for many instances at once and for the JSON value shapes, and routes the guides in a compact list.
