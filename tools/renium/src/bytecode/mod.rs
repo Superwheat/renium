@@ -2031,9 +2031,19 @@ fn reject_read_only_link_store_edit(
 }
 
 pub(super) fn bytecode_set_property(mut args: BytecodeSetPropertyArgs) -> Result<()> {
+    if let Some(query) = args.where_query.take() {
+        return bytecode_set_property_where(args, &query);
+    }
+    let result = set_properties_on_target(args.clone())?;
+    finish_set_property(args, result)
+}
+
+/// The store edit itself: one `-p NAME` with a value flag, or several
+/// `-p NAME=JSON`, applied to the selected instance.
+fn set_properties_on_target(mut args: BytecodeSetPropertyArgs) -> Result<Value> {
     let names = std::mem::take(&mut args.property);
     let inline_values = names.iter().any(|name| name.contains('='));
-    let mut result = if inline_values {
+    let result = if inline_values {
         if args.value_json.is_some()
             || args.value_str.is_some()
             || args.value_num.is_some()
@@ -2075,8 +2085,13 @@ pub(super) fn bytecode_set_property(mut args: BytecodeSetPropertyArgs) -> Result
             bail!("Give one -p NAME with a value flag, or -p NAME=JSON for each property");
         }
         args.property = names;
-        bytecode_set_property_result(args.clone())?
+        bytecode_set_property_result(args)?
     };
+    Ok(result)
+}
+
+/// Pushes the edited instance when asked, with its read-back, and prints.
+fn finish_set_property(args: BytecodeSetPropertyArgs, mut result: Value) -> Result<()> {
     if args.push {
         if result.get("settingsId").is_none() {
             let (settings_file, service_hint) = resolve_bytecode_cli_settings_file(
@@ -2120,6 +2135,160 @@ pub(super) fn bytecode_set_property(mut args: BytecodeSetPropertyArgs) -> Result
         crate::bytecode::edit::push_stored_instance_reading(&mut result, &properties, &attributes)?;
     }
     print_json_output(&result, args.pretty)
+}
+
+const WHERE_LIMIT: usize = 500;
+const WHERE_READ_BACK_LIMIT: usize = 64;
+
+/// `bs --where`: the assignments apply to every instance under the selected
+/// target (the whole service without one) that matches the query; `--push`
+/// sends the matches together and `studio` reads them back.
+fn bytecode_set_property_where(mut args: BytecodeSetPropertyArgs, query: &str) -> Result<()> {
+    adopt_single_positional_target(&mut args.input, None, &mut args.selector)?;
+    let (settings_file, service_hint) = resolve_bytecode_cli_settings_file(
+        args.input.settings_file.as_deref(),
+        args.input.service_or_file.as_deref(),
+        None,
+    )?;
+    let document = SettingsBytecode::read_file(&settings_file)?;
+    let service = bytecode_service_name(&document, &settings_file, &service_hint);
+    let scope = resolve_bytecode_selector_or_service_root(
+        &document,
+        &service,
+        &args.selector,
+        "No matching instance",
+    )?;
+    let matched = where_matches(&document, &service, scope.index, query)?;
+    let (segments, _) = crate::editor::paths::build_editor_instance_path_parts(&document, &service);
+    let path_of = |index: usize| {
+        segments
+            .get(index)
+            .cloned()
+            .flatten()
+            .map(|parts| parts.join("."))
+            .unwrap_or_else(|| document.instances[index].name.clone())
+    };
+    if matched.is_empty() {
+        bail!(
+            "No instance under {} matches '{query}'",
+            path_of(scope.index)
+        );
+    }
+    if matched.len() > WHERE_LIMIT {
+        bail!(
+            "{} instances under {} match '{query}'; narrow the query ({WHERE_LIMIT} at most per call)",
+            matched.len(),
+            path_of(scope.index)
+        );
+    }
+    let ids = matched
+        .iter()
+        .map(|&index| document.instances[index].settings_id.clone())
+        .collect::<Vec<_>>();
+    let push = args.push;
+    args.push = false;
+    let mut set_names: Vec<String> = Vec::new();
+    let mut changed_paths = Vec::new();
+    for id in &ids {
+        let mut one = args.clone();
+        one.selector = BytecodeInstanceSelectorArgs::by_settings_id(Some(id.clone()));
+        let outcome = set_properties_on_target(one)?;
+        if set_names.is_empty() {
+            set_names = outcome
+                .get("set")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .or_else(|| {
+                    outcome
+                        .get("property")
+                        .and_then(Value::as_str)
+                        .map(|name| vec![name.to_string()])
+                })
+                .unwrap_or_default();
+        }
+        for path in outcome
+            .get("changedPaths")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if !changed_paths.contains(path) {
+                changed_paths.push(path.clone());
+            }
+        }
+    }
+    let mut result = json!({
+        "ok": true,
+        "where": query,
+        "scope": path_of(scope.index),
+        "matched": ids.len(),
+        "instances": matched.iter().map(|&index| path_of(index)).collect::<Vec<_>>(),
+        "set": set_names,
+        "changedPaths": changed_paths,
+        "settingsFile": settings_file,
+    });
+    if push {
+        result["push"] = crate::bytecode::edit::push_stored_instances(settings_file.clone(), ids)?;
+        let (properties, attributes) = if args.scope.eq_ignore_ascii_case("attribute") {
+            (Vec::new(), set_names)
+        } else {
+            (set_names, Vec::new())
+        };
+        let paths = matched
+            .iter()
+            .filter_map(|&index| segments.get(index).cloned().flatten())
+            .collect::<Vec<_>>();
+        if paths.len() > WHERE_READ_BACK_LIMIT {
+            result["studioLimit"] = json!(WHERE_READ_BACK_LIMIT);
+        }
+        let read = &paths[..paths.len().min(WHERE_READ_BACK_LIMIT)];
+        if let Ok(studio) =
+            crate::bytecode::edit::read_back_many_from_studio(read, &properties, &attributes)
+        {
+            result["studio"] = studio;
+        }
+    }
+    print_json_output(&result, args.pretty)
+}
+
+/// The store indices under `scope_index` (every instance when the scope is
+/// the service root) that match a bulk-read query.
+pub(crate) fn where_matches(
+    document: &SettingsBytecode,
+    service: &str,
+    scope_index: usize,
+    query: &str,
+) -> Result<Vec<usize>> {
+    let groups = crate::bytecode::explorer::explorer_search_groups(query);
+    if groups.is_empty() {
+        bail!("--where needs a query: words match names, is:Class, tag:Name, Prop=value, Prop>0.5");
+    }
+    let (segments, _) = crate::editor::paths::build_editor_instance_path_parts(document, service);
+    let whole_service = editor_service_root_index(document, service) == Some(scope_index);
+    let under_scope = |index: usize| {
+        let mut cursor = document.instances[index].parent_index;
+        while let Some(parent) = cursor {
+            if parent == scope_index {
+                return true;
+            }
+            cursor = document.instances[parent].parent_index;
+        }
+        false
+    };
+    Ok((0..document.instances.len())
+        .filter(|&index| index != scope_index && (whole_service || under_scope(index)))
+        .filter(|&index| {
+            crate::bytecode::explorer::explorer_search_instance_matches(
+                document, &segments, index, &groups,
+            )
+        })
+        .collect())
 }
 
 pub(crate) fn bytecode_set_property_result(mut args: BytecodeSetPropertyArgs) -> Result<Value> {

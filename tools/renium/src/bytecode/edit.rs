@@ -271,9 +271,30 @@ fn read_back_from_studio(
     properties: &[String],
     attributes: &[String],
 ) -> Result<Value> {
+    let rows =
+        read_back_many_from_studio(std::slice::from_ref(&path.to_vec()), properties, attributes)?;
+    Ok(rows
+        .as_array()
+        .and_then(|rows| rows.first())
+        .cloned()
+        .unwrap_or(Value::Null))
+}
+
+/// One live read of several instances in the Edit window, as an array of rows
+/// in the order of `paths`: each row has the full name, class, the given
+/// properties and attributes, or `missing` with the path that was not found.
+pub(crate) fn read_back_many_from_studio(
+    paths: &[Vec<String>],
+    properties: &[String],
+    attributes: &[String],
+) -> Result<Value> {
+    let paths = paths
+        .iter()
+        .map(|path| luau_string_list(path))
+        .collect::<Vec<_>>()
+        .join(", ");
     let code = format!(
-        "local function at(segments) local inst = game for _, name in segments do inst = inst:FindFirstChild(name) if not inst then return nil end end return inst end\n         local inst = at({}) if not inst then return {{ missing = true }} end\n         local row = {{ path = inst:GetFullName(), class = inst.ClassName }}\n         for _, name in {} do local ok, value = pcall(function() return inst[name] end) if ok then row[name] = value end end\n         for _, name in {} do row['@' .. name] = inst:GetAttribute(name) end\n         return row",
-        luau_string_list(path),
+        "local function at(segments) local inst = game for _, name in segments do inst = inst:FindFirstChild(name) if not inst then return nil end end return inst end local rows = {{}} for _, segments in {{{paths}}} do local inst = at(segments) if not inst then table.insert(rows, {{ missing = true, path = table.concat(segments, '.') }}) else local row = {{ path = inst:GetFullName(), class = inst.ClassName }} for _, name in {} do local ok, value = pcall(function() return inst[name] end) if ok then row[name] = value end end for _, name in {} do row['@' .. name] = inst:GetAttribute(name) end table.insert(rows, row) end end return rows",
         luau_string_list(properties),
         luau_string_list(attributes),
     );
@@ -288,7 +309,7 @@ fn read_back_from_studio(
         .and_then(Value::as_array)
         .and_then(|results| results.first())
         .cloned()
-        .unwrap_or(Value::Null))
+        .unwrap_or_else(|| json!([])))
 }
 
 /// One scoped push of the given instances of one store, without a review;

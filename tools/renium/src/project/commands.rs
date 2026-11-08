@@ -251,6 +251,7 @@ fn metadata_property_change(
     push: bool,
 ) -> BytecodeSetPropertyArgs {
     BytecodeSetPropertyArgs {
+        where_query: None,
         input: BytecodeFileArgs::settings_file(settings_file),
         selector: BytecodeInstanceSelectorArgs::by_settings_id(settings_id),
         property: vec![property.to_string()],

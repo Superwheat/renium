@@ -623,7 +623,13 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
         result["console"] = match console {
             Ok(mut console) => {
                 console::compact_console_entries(&mut console);
-                console.get("entries").cloned().unwrap_or_else(|| json!([]))
+                let mut entries = console
+                    .get("entries")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                console::fold_play_console(&mut entries);
+                Value::Array(entries)
             }
             Err(error) => json!({ "error": format!("{error:#}") }),
         };
@@ -857,7 +863,14 @@ fn compact_play_result(result: &mut Value, named_players: bool) {
         && until.get("ok") == Some(&Value::Bool(true))
         && let Some(value) = until.get("value").cloned()
     {
+        let elapsed = until.get("elapsedSeconds").and_then(Value::as_f64);
         map.insert("until".to_string(), value);
+        if let Some(elapsed) = elapsed {
+            map.insert(
+                "untilSeconds".to_string(),
+                json!((elapsed * 10.0).round() / 10.0),
+            );
+        }
     }
     if let Some(status) = map.get_mut("status").and_then(Value::as_object_mut) {
         status.remove("lastResult");
@@ -5083,7 +5096,7 @@ mod compact_result_tests {
         compact_play_result(&mut result, false);
         assert_eq!(
             result,
-            json!({"ok": true, "mode": "play", "serverReady": true, "clients": 2, "until": "true"})
+            json!({"ok": true, "mode": "play", "serverReady": true, "clients": 2, "until": "true", "untilSeconds": 1.5})
         );
         let mut named = json!({"ok": true, "clients": [{"playerName": "A"}, {"playerName": "B"}]});
         compact_play_result(&mut named, true);
@@ -5111,7 +5124,7 @@ mod compact_result_tests {
         compact_play_result(&mut result, false);
         assert_eq!(
             result,
-            json!({"ok": true, "clients": 0, "until": "true", "result": snapshot})
+            json!({"ok": true, "clients": 0, "until": "true", "untilSeconds": 2.5, "result": snapshot})
         );
 
         let mut plain = json!({"ok": true, "action": "start"});

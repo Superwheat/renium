@@ -37,6 +37,7 @@ rbx bs Workspace -i editor:id -p Reviewed --scope attribute --bool true
 rbx ba Workspace -n NewModel -c Model
 rbx ba Workspace -I Lobby.Props -n NewPart -c Part -p 'Anchored=true' --push
 rbx bs Workspace Lobby.Door -p 'Transparency=0.5' -p 'CanCollide=false' --push
+rbx bs Workspace Lobby --where 'is:Part Transparency>0.5' -p 'CanCollide=false' --push   # every match under Lobby
 rbx bss Workspace -i editor:script --str "return 1"
 rbx bcl Workspace -i editor:source -I editor:parent
 rbx mv Workspace -i editor:id -I editor:parent --push
@@ -46,8 +47,11 @@ rbx br Workspace Lobby.OldPart
 
 Every store command takes the target the same way: a positional name or dotted path (`Lobby.Door`), `-i ID`, `-x INDEX`, `-n NAME` or `-c CLASS`. `bg` takes the property after the target or as `-p`; `bs` takes `-p`. `bg`/`bs` with no target address the service itself. Parent options (`-I`) take an ID or a dotted path. Duplicates take inline ordinals (`Borders.Border[4]`, the form compact output prints) or `--ords`.
 Use a service name or `-f STORE`, not both.
+Use a service name or `-f STORE`, not both.
 
 Values: `--str`, `--num`, `--bool`, `--null`, or `-j JSON` (`-j -` reads stdin); several `-p NAME=JSON` set several properties at once. `--push` on `ba`, `bs`, `mv` and `rn` pushes that instance at once, no review; `ba --batch --push` pushes every created instance.
+
+`bs --where QUERY` applies the assignments to every instance under the target (the whole service without one) that matches the bulk-read query language: words match names, `is:Class`, `tag:Name`, `Prop=value`, `Prop>0.5` (also `!=`, `<`, `<=`, `>=`), `or` between alternatives. 500 matches at most per call; `--push` pushes them together and `studio` reads each back (the first 64). The result lists `instances` and `matched`.
 `--null` removes an override; writing the default stores one.
 Unknown properties are rejected. `--scope property` explicitly selects a real property absent from the schema; `--scope attribute` selects an attribute.
 

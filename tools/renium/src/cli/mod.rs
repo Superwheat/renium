@@ -3140,6 +3140,12 @@ pub(super) struct BytecodeSetPropertyArgs {
     #[command(flatten)]
     pub(super) selector: BytecodeInstanceSelectorArgs,
     #[arg(
+        help = "Set the properties on every instance under the target (the whole service without one) that matches this query: words match names, is:Class, tag:Name, Prop=value, Prop>0.5 (also != < > <= >=), `or` separates alternatives; 500 matches at most",
+        long = "where",
+        value_name = "QUERY"
+    )]
+    pub(super) where_query: Option<String>,
+    #[arg(
         help = "Property or attribute name, or NAME=JSON to set several in one call (repeatable)",
         short,
         long,

@@ -1,17 +1,17 @@
 <!-- renium-version: 0.5.9 -->
 # Renium for agents
 
-Use `rbx` from the place's project folder. Act directly: commands report a missing Studio or a sync problem themselves, so skip `status`, `cs` and `lst` checks. Results: one JSON line on stdout, errors on stderr.
+Run `rbx` in the project folder. Act directly: commands report a missing Studio or a sync problem themselves, so skip `status`, `cs` and `lst`. Results: one JSON line on stdout, errors on stderr.
 
 ## Recipes
 
 - Saved data: `rbx tr Workspace Lobby --depth 2`, `rbx in Workspace Lobby.Door -F props,attrs`. Studio state: one bounded `rbx l 'return ...'`.
-- Add an instance: `rbx ba Workspace -I Lobby -n Pad -c Part -p 'Anchored=true' -p 'Size=[8,1,8]' -p 'Position=[24,0.5,-12]' -p 'Material={"_type":"EnumItem","name":"Neon"}' --push`; `--push` sends that instance to Studio at once (files first, no review). Many at once: `'{"ops":[{"parent":"Workspace.Grid","name":"Tile_1_1","class":"Part","props":{...}}]}' | rbx ba --batch - --push`.
-- Change properties: `rbx bs Workspace Lobby.Pad -p 'Transparency=0.5' -p 'CanCollide=false' --push`; attributes with `-a Health=50`. Move or rename: `rbx mv Workspace -i Lobby.Kiosk -I Shops --push`, `rbx rn Workspace -i Shops.Kiosk.Counter Register --push`.
+- Add an instance: `rbx ba Workspace -I Lobby -n Pad -c Part -p 'Anchored=true' -p 'Size=[4,1,4]' -p 'Position=[0,0.5,0]' -p 'Material={"_type":"EnumItem","name":"Neon"}' --push`; `--push` sends it to Studio at once (files first, no review). Many at once: `'{"ops":[{"parent":"Workspace.Grid","name":"Tile_1_1","class":"Part","props":{...}}]}' | rbx ba --batch - --push`.
+- Change properties: `rbx bs Workspace Lobby.Pad -p 'Transparency=0.5' -p 'CanCollide=false' --push`; attributes `-S attribute -p MaxSpeed=16`. Every match: `rbx bs Workspace Lobby --where 'is:Part Transparency>0.5' -p CanCollide=false --push` (`is:Class`, `tag:Name`, `Prop=v`, `<`/`>`, `or`). Move or rename: `rbx mv Workspace -i Lobby.Pad -I Props --push`, `rbx rn Workspace -i Props.Pad Goal --push`.
 - Values are JSON: `1`, `true`, `"text"`, `[x,y,z]` (Vector3), `{"_type":"Color3","r":1,"g":0.5,"b":0}`, `{"_type":"EnumItem","name":"Neon"}`, `{"_type":"UDim2","xScale":0,"xOffset":200,"yScale":0,"yOffset":50}`, `{"_type":"CFrame","position":[x,y,z]}`.
-- Studio-only change, or tags and many edits at once: `rbx l --edit 'LUAU'` applies in Studio as one undo step and returns the chunk's value, so return what verifies it; `rbx pl -s SERVICE` afterwards copies the result into the files.
+- Studio-only change, or tags: `rbx l --edit 'LUAU'` applies in Studio as one undo step and returns the chunk's value, so return what verifies it; `rbx pl -s SERVICE` afterwards copies the result into the files.
 - New script: write `src/ServerScriptService/Name.server.luau`, then `rbx ck FILE && rbx ba ServerScriptService -n Name -c Script --push`. Edited scripts: `rbx ck FILE && rbx ps FILE` (nothing with Live Sync on).
-- Play check, one call: `rbx play -s --at Workspace.Lobby.SpawnPad --until 'LUAU' --console 40 --stop-after` starts, stands the player on the instance (`--at` optional), waits for the server expression (`workspace.DistributedGameTime > 10` for a timed run), returns the console and stops. Longer checks: `rbx l --server 'LUAU'`, `rbx co --server --level error`, `rbx play -x`.
+- Play check, one call: `rbx play -s --at Workspace.Lobby.Pad --until 'LUAU' --console 40 --stop-after` stands the player on the instance (`--at` optional), waits for the server expression (`workspace.DistributedGameTime > 10` for a timed run; `untilSeconds` reports the wait), returns the console (stack traces folded into `where`) and stops. Longer: `rbx l --server`, `rbx co --server --level error`, `rbx play -x`.
 - A push result's `studio` block is the read-back; no extra read.
 
 ## Choose the smallest sufficient check
@@ -30,7 +30,7 @@ When the recipes do not cover the task, read the guide once; reread after a repo
 
 Single-place projects use `src`; experiences `places/<alias>/src`, and at the experience root add `--place <alias|placeId>`. Two Studios on one project: `--place <placeId|window name>` first.
 
-Edit scripts as files; stores are compressed (no grep). `f`/`bg`/`bb` read saved data, `q` a closed place, `l` Studio. Run mutations one at a time and read each result; after a failure check state first.
+Edit scripts as files; stores are compressed (no grep). `f`/`bg`/`bb` read saved data, `q` a closed place, `l` Studio (`l` tables over 128 keys are cut). After a failure check state first.
 
 Fix and verify defects in requested work. Report `autoDesyncedPackages`. Publishing needs authorization. Say synced, not saved: `persistence: teamCreate` means Team Create saved it, `unsaved` means the user saves. Open Cloud uploads follow `RENIUM/publishing-validation.md`.
 

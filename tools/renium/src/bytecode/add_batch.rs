@@ -471,6 +471,51 @@ mod tests {
     }
 
     #[test]
+    fn where_matches_filters_a_subtree_by_class_and_property() {
+        let root = scratch("renium-bs-where-");
+        run(
+            &root,
+            r##"{"ops":[
+                {"parent":"Workspace","name":"Lobby","class":"Folder","ref":"lobby"},
+                {"parent":"#lobby","name":"Glass1","class":"Part","props":{"Transparency":0.7}},
+                {"parent":"#lobby","name":"Wall","class":"Part","props":{"Transparency":0}},
+                {"parent":"#lobby","name":"Light","class":"PointLight"},
+                {"parent":"Workspace","name":"Glass9","class":"Part","props":{"Transparency":0.9}}
+            ]}"##,
+        )
+        .unwrap();
+        let document =
+            SettingsBytecode::read_file(&root.join("instances").join("Workspace.renium")).unwrap();
+        let lobby = document
+            .instances
+            .iter()
+            .position(|instance| instance.name == "Lobby")
+            .unwrap();
+        let names_of = |indices: Vec<usize>| {
+            indices
+                .into_iter()
+                .map(|index| document.instances[index].name.clone())
+                .collect::<Vec<_>>()
+        };
+        let matches = |scope: usize, query: &str| {
+            names_of(crate::bytecode::where_matches(&document, "Workspace", scope, query).unwrap())
+        };
+        assert_eq!(matches(lobby, "is:Part Transparency>0.5"), ["Glass1"]);
+        let service_root =
+            crate::settings::tree::editor_service_root_index(&document, "Workspace").unwrap();
+        assert_eq!(
+            matches(service_root, "is:Part Transparency>0.5"),
+            ["Glass1", "Glass9"]
+        );
+        assert_eq!(
+            matches(lobby, "Glass or is:PointLight"),
+            ["Glass1", "Light"]
+        );
+        assert!(matches(lobby, "is:Model").is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn batch_creates_across_two_services_with_ref_parents() {
         let root = scratch("renium-ba-batch-");
         let result = run(

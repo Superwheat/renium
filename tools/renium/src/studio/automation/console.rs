@@ -293,6 +293,46 @@ fn filtered_console_result(args: &PluginConsoleOutputArgs, mut result: Value) ->
     Ok(result)
 }
 
+/// The console a Play start returns: Studio's stack-trace framing (`Stack
+/// Begin`, `Script '...', Line N`, `Stack End`) folds into a `where` on the
+/// error or warning it follows, consecutive repeats collapse into `repeat`,
+/// and the sequence numbers go; `time` keeps the order.
+pub(crate) fn fold_play_console(entries: &mut Vec<Value>) {
+    let mut kept: Vec<Value> = Vec::with_capacity(entries.len());
+    for mut entry in entries.drain(..) {
+        let message = entry
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let info = entry.get("type").and_then(Value::as_str) == Some("info");
+        if info && (message == "Stack Begin" || message == "Stack End") {
+            continue;
+        }
+        if info
+            && message.starts_with("Script '")
+            && let Some(previous) = kept.last_mut()
+            && matches!(
+                previous.get("type").and_then(Value::as_str),
+                Some("error") | Some("warn")
+            )
+        {
+            if previous.get("where").is_none() {
+                previous["where"] = Value::String(message);
+            }
+            continue;
+        }
+        if let Some(map) = entry.as_object_mut() {
+            map.remove("seq");
+            map.remove("unix");
+        }
+        kept.push(entry);
+    }
+    fold_repeated_entries(&mut kept);
+    *entries = kept;
+}
+
 /// Consecutive identical messages collapse into one entry with `repeat`.
 fn fold_repeated_entries(entries: &mut Vec<Value>) -> usize {
     let mut folded = Vec::with_capacity(entries.len());
@@ -306,7 +346,9 @@ fn fold_repeated_entries(entries: &mut Vec<Value>) -> usize {
             let last = folded.last_mut().unwrap();
             let repeat = last.get("repeat").and_then(Value::as_u64).unwrap_or(1) + 1;
             last["repeat"] = json!(repeat);
-            last["seq"] = entry.get("seq").cloned().unwrap_or(Value::Null);
+            if let Some(seq) = entry.get("seq").cloned() {
+                last["seq"] = seq;
+            }
             removed += 1;
         } else {
             folded.push(entry);
@@ -496,6 +538,31 @@ mod filter_tests {
         assert_eq!(kept[0]["seq"], 3);
         assert_eq!(result["folded"], 2);
         assert!(result.get("scanned").is_none());
+    }
+
+    #[test]
+    fn a_play_console_folds_stack_framing_into_its_error() {
+        let mut entries = vec![
+            json!({"type": "print", "message": "ready", "seq": 1, "time": 1.0}),
+            json!({"type": "error", "message": "x is not a valid member", "seq": 2, "time": 1.5}),
+            json!({"type": "info", "message": "Stack Begin", "seq": 3, "time": 1.5}),
+            json!({"type": "info", "message": "Script 'ServerScriptService.Scoreboard', Line 7", "seq": 4, "time": 1.5}),
+            json!({"type": "info", "message": "Stack End", "seq": 5, "time": 1.5}),
+            json!({"type": "error", "message": "x is not a valid member", "seq": 6, "time": 1.6}),
+            json!({"type": "info", "message": "Stack Begin", "seq": 7, "time": 1.6}),
+            json!({"type": "info", "message": "Script 'ServerScriptService.Scoreboard', Line 7", "seq": 8, "time": 1.6}),
+            json!({"type": "info", "message": "Stack End", "seq": 9, "time": 1.6}),
+            json!({"type": "info", "message": "plain info", "seq": 10, "time": 2.0}),
+        ];
+        fold_play_console(&mut entries);
+        assert_eq!(
+            entries,
+            vec![
+                json!({"type": "print", "message": "ready", "time": 1.0}),
+                json!({"type": "error", "message": "x is not a valid member", "time": 1.5, "where": "Script 'ServerScriptService.Scoreboard', Line 7", "repeat": 2}),
+                json!({"type": "info", "message": "plain info", "time": 2.0}),
+            ]
+        );
     }
 }
 
