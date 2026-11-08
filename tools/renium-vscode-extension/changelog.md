@@ -11,6 +11,8 @@
 - `rbx ba` and `rbx bs` take `--push`, which sends the edited instance to the open Studio place right after the file write, scoped to that instance and without a review; `rbx bs` sets several properties in one call with repeated `-p NAME=JSON`.
 - `rbx play -s --console N` returns the last N server console entries with the start result, after `--until` when given; `--stop-after` then stops the session, so one call runs a play check.
 - `rbx play -s --at PATH` stands the first player's character on an instance (or at a position `x,y,z`) once it spawns, before `--until` runs, so a touch check needs no hand-written move.
+- `rbx play -s --console N` also returns the client's console as `clientConsole` in ordinary Play, so a client-side check needs no second session.
+- `rbx br --push` destroys the removed instances in the open place as one undo step, and `rbx br SERVICE [TARGET] --where QUERY` removes every instance under the target that matches a bulk-read query, up to 500 per call.
 - A `--push` on `ba`, `bs`, `mv` or `rn` sends the pushed scripts' files with the store, so a new script created under a folder or under StarterPlayerScripts arrives in Studio with its text instead of an empty Source.
 - `rbx ps` with up to 25 changed scripts reads their sources back after the push, so `verified: true` answers without a separate read; `--verify-sources` still forces it for larger pushes.
 - Property values take compact shapes by the property's type: `[scale,offset]` for a UDim, `[xScale,xOffset,yScale,yOffset]` for a UDim2, `[min,max]` for a NumberRange, `[r,g,b]` bytes for a Color3 when a channel is above 1, and a plain item name such as `"Neon"` for an enum, stored in the canonical form.

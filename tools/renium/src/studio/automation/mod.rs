@@ -606,33 +606,45 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
     if let Some(limit) = args.console
         && result.get("ok").and_then(Value::as_bool) != Some(false)
     {
-        let console = daemon_control_request(
-            op::CONSOLE,
-            None,
-            json!({
-                "limit": limit,
-                "sinceSeq": 0,
-                "fromOldest": false,
-                "clear": false,
-                "server": true,
-                "bridgeWaitSeconds": args.bridge.wait_seconds,
-                "bridgePorts": args.bridge.ports,
-            }),
-            false,
-        );
-        result["console"] = match console {
-            Ok(mut console) => {
-                console::compact_console_entries(&mut console);
-                let mut entries = console
-                    .get("entries")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                console::fold_play_console(&mut entries);
-                Value::Array(entries)
+        let fetch = |side: &str| {
+            let console = daemon_control_request(
+                op::CONSOLE,
+                None,
+                json!({
+                    "limit": limit,
+                    "sinceSeq": 0,
+                    "fromOldest": false,
+                    "clear": false,
+                    side: true,
+                    "bridgeWaitSeconds": args.bridge.wait_seconds,
+                    "bridgePorts": args.bridge.ports,
+                }),
+                false,
+            );
+            match console {
+                Ok(mut console) => {
+                    console::compact_console_entries(&mut console);
+                    let mut entries = console
+                        .get("entries")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    console::fold_play_console(&mut entries);
+                    Value::Array(entries)
+                }
+                Err(error) => json!({ "error": format!("{error:#}") }),
             }
-            Err(error) => json!({ "error": format!("{error:#}") }),
         };
+        result["console"] = fetch("server");
+        // Ordinary Play has one client; its console answers the client-side
+        // half of the same check without a second session.
+        let has_client = result
+            .get("clients")
+            .and_then(Value::as_array)
+            .is_some_and(|clients| !clients.is_empty());
+        if has_client && args.mode.as_deref().is_none_or(|mode| mode == "play") {
+            result["clientConsole"] = fetch("client");
+        }
     }
     if args.stop_after && result.get("ok").and_then(Value::as_bool) != Some(false) {
         result["stopped"] = match daemon_control_request(op::PLAY_STOP, None, parameters, false) {
