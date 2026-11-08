@@ -425,26 +425,31 @@ fn add_instance_seeds_an_unsynced_store_from_its_file_name() {
     );
 }
 
-fn batch_receipt(item: usize, id: &str, index: usize, service: &str, path: &str) -> Value {
-    json!({"id": id, "index": index, "item": item, "path": path, "service": service})
+fn added_receipt(id: &str, path: &str) -> Value {
+    json!({"id": id, "op": "add", "path": path})
 }
 
 /// `ba --batch` resolves services from the working directory, which a test
 /// cannot change; the batch runs against the fixture's stores directly.
+fn batch_outcome(
+    fx: &Fixture,
+    input: &str,
+    push: bool,
+) -> Result<crate::bytecode::add_batch::BatchOutcome, String> {
+    use crate::bytecode::add_batch::{apply_store_batch, parse_batch_ops, read_batch_input};
+    let run = || {
+        let ops = parse_batch_ops(&read_batch_input(Path::new(input))?)?;
+        apply_store_batch(
+            ops,
+            &|service| Ok((fx.store(service), service.to_string())),
+            push,
+        )
+    };
+    run().map_err(|error| normalize_text(&format!("{error:#}"), &fx.root))
+}
+
 fn run_batch(fx: &Fixture, input: &str) -> Result<Value, String> {
-    use crate::bytecode::add_batch::{
-        add_store_instances_batch, parse_batch_add_items, read_batch_input,
-    };
-    let run = || -> anyhow::Result<Value> {
-        let items = parse_batch_add_items(&read_batch_input(Path::new(input))?)?;
-        add_store_instances_batch(items, &|service| {
-            Ok((fx.store(service), service.to_string()))
-        })
-    };
-    match run() {
-        Ok(value) => Ok(super::normalize(value, &fx.root)),
-        Err(error) => Err(normalize_text(&format!("{error:#}"), &fx.root)),
-    }
+    batch_outcome(fx, input, false).map(|outcome| super::normalize(outcome.result, &fx.root))
 }
 
 #[test]
@@ -466,15 +471,15 @@ fn add_batch_creates_across_stores_with_references_and_sources() {
     .unwrap();
     let result = run_batch(&fx, &batch.to_string_lossy()).unwrap();
     assert_eq!(
-        result["created"],
+        result["ops"],
         json!([
-            {"id": "editor:1", "index": 1, "item": 0, "path": "ServerScriptService.Battle", "ref": "battle", "service": "ServerScriptService"},
-            {"id": "editor:2", "index": 2, "item": 1, "path": "ServerScriptService.Battle.Abilities", "ref": "abilities", "service": "ServerScriptService"},
-            {"id": "editor:3", "index": 3, "item": 2, "path": "ServerScriptService.Battle.Abilities.CarMods", "service": "ServerScriptService", "sourcePath": "<root>/src/ServerScriptService/Battle/Abilities/CarMods.luau"},
-            batch_receipt(3, "editor:4", 4, "ReplicatedStorage", "ReplicatedStorage.Shared.Mode"),
-            {"id": "editor:4", "index": 4, "item": 4, "path": "ServerScriptService.Battle.Main", "service": "ServerScriptService", "sourcePath": "<root>/src/ServerScriptService/Battle/Main.server.luau"},
-            batch_receipt(5, "custom:store", 9, "Workspace", "Workspace.Store"),
-            batch_receipt(6, "editor:a", 10, "Workspace", "Workspace.Lobby.Lamp"),
+            {"id": "editor:1", "op": "add", "path": "ServerScriptService.Battle", "ref": "battle"},
+            {"id": "editor:2", "op": "add", "path": "ServerScriptService.Battle.Abilities", "ref": "abilities"},
+            {"id": "editor:3", "op": "add", "path": "ServerScriptService.Battle.Abilities.CarMods", "sourcePath": "<root>/src/ServerScriptService/Battle/Abilities/CarMods.luau"},
+            added_receipt("editor:4", "ReplicatedStorage.Shared.Mode"),
+            {"id": "editor:4", "op": "add", "path": "ServerScriptService.Battle.Main", "sourcePath": "<root>/src/ServerScriptService/Battle/Main.server.luau"},
+            added_receipt("custom:store", "Workspace.Store"),
+            added_receipt("editor:a", "Workspace.Lobby.Lamp"),
         ])
     );
     assert_eq!(result["stores"], 3);
@@ -546,11 +551,11 @@ fn add_batch_reads_inline_json_adopts_files_and_seeds_new_stores() {
         result,
         json!({
             "changedPaths": ["<root>/instances/Workspace.renium", "<root>/instances/StarterGui.renium"],
-            "created": [
-                {"adoptedSource": true, "id": "editor:9", "index": 9, "item": 0, "path": "Workspace.Adopted", "service": "Workspace", "sourcePath": "<root>/src/Workspace/Adopted.luau"},
-                {"id": "editor:1", "index": 1, "item": 1, "path": "StarterGui.Menu", "service": "StarterGui"},
-            ],
             "ok": true,
+            "ops": [
+                {"adoptedSource": true, "id": "editor:9", "op": "add", "path": "Workspace.Adopted", "sourcePath": "<root>/src/Workspace/Adopted.luau"},
+                added_receipt("editor:1", "StarterGui.Menu"),
+            ],
             "stores": 2,
         })
     );
@@ -562,7 +567,7 @@ fn add_batch_reads_inline_json_adopts_files_and_seeds_new_stores() {
     )
     .unwrap();
     assert_eq!(
-        duplicate["created"][0]["path"],
+        duplicate["ops"][0]["path"],
         json!("Workspace.Lobby.Door[2]")
     );
     let bom = fx.root.join("bom.json");
@@ -572,7 +577,7 @@ fn add_batch_reads_inline_json_adopts_files_and_seeds_new_stores() {
     )
     .unwrap();
     assert_eq!(
-        run_batch(&fx, &bom.to_string_lossy()).unwrap()["created"][0]["path"],
+        run_batch(&fx, &bom.to_string_lossy()).unwrap()["ops"][0]["path"],
         json!("Workspace.FromFile")
     );
 }
@@ -582,13 +587,13 @@ fn add_batch_rejects_bad_items_without_writing_any_store() {
     let fx = Fixture::new("add-batch-errors");
     let before = fs::read(fx.store("Workspace")).unwrap();
     let err = |ops: &str| run_batch(&fx, ops).unwrap_err();
-    assert!(err(r##"[{"parent":"Workspace","name":"A","class":"Folder","ref":"a"},{"parent":"#b","name":"B","class":"Folder"}]"##).ends_with("Batch item 1: parent #b does not name an earlier item"));
-    assert!(err(r##"[{"parent":"Workspace","name":"A","class":"Folder","ref":"a"},{"parent":"Workspace","name":"B","class":"Folder","ref":"a"}]"##).ends_with("Batch item 1 (#a): ref #a is already used by an earlier item"));
+    assert!(err(r##"[{"parent":"Workspace","name":"A","class":"Folder","ref":"a"},{"parent":"#b","name":"B","class":"Folder"}]"##).ends_with("Batch op 1 (add): parent #b does not name an earlier op"));
+    assert!(err(r##"[{"parent":"Workspace","name":"A","class":"Folder","ref":"a"},{"parent":"Workspace","name":"B","class":"Folder","ref":"a"}]"##).ends_with("Batch op 1 (add #a): ref #a is already used by an earlier op"));
     assert!(
         err(r##"[{"parent":"Workspace","name":"A","class":"Folder","ref":"#a"}]"##)
             .ends_with("ref must be a non-empty name without a leading #")
     );
-    assert!(err(r##"[{"parent":"Workspace","name":"A","class":"Folder","ref":"a"},{"parent":"#a","service":"ReplicatedStorage","name":"B","class":"Folder"}]"##).ends_with("Batch item 1: parent #a lives in Workspace, not ReplicatedStorage"));
+    assert!(err(r##"[{"parent":"Workspace","name":"A","class":"Folder","ref":"a"},{"parent":"#a","service":"ReplicatedStorage","name":"B","class":"Folder"}]"##).ends_with("Batch op 1 (add): parent #a lives in Workspace, not ReplicatedStorage"));
     assert!(
         err(r#"[{"parent":"editor:1","name":"A","class":"Folder"}]"#).ends_with(
             "parent editor:1 is a settings id; add \"service\" to say which store it is in"
@@ -596,7 +601,7 @@ fn add_batch_rejects_bad_items_without_writing_any_store() {
     );
     assert!(
         err(r#"[{"parent":"Workspace.Nope","name":"A","class":"Folder"}]"#)
-            .ends_with("Batch item 0: No matching instance path: Workspace.Nope")
+            .ends_with("Batch op 0 (add): No matching instance path: Workspace.Nope")
     );
     assert!(
         err(r#"[{"parent":"Workspace.Lobby.Border","name":"A","class":"Folder"}]"#)
@@ -606,7 +611,7 @@ fn add_batch_rejects_bad_items_without_writing_any_store() {
         err(r#"[{"parent":"Workspace","name":"A","class":"Folder","source":"x"}]"#)
             .ends_with("source is only accepted for Script, LocalScript and ModuleScript")
     );
-    assert!(err(r#"[{"parent":"Workspace","name":"A","class":"ModuleScript","source":"x","props":{"Source":"y"}}]"#).ends_with("give source or props.Source, not both"));
+    assert!(err(r#"[{"parent":"Workspace","name":"A","class":"ModuleScript","source":"x","props":{"Source":"y"}}]"#).ends_with("give one of source, sourceFile or props.Source"));
     assert!(
         err(r#"[{"parent":"Workspace","name":"A","class":"Folder","bogus":1}]"#)
             .contains("unknown field `bogus`")
@@ -619,8 +624,8 @@ fn add_batch_rejects_bad_items_without_writing_any_store() {
         err(r#"[{"parent":"Workspace","name":"A","class":"PackageLink"}]"#)
             .ends_with("PackageLink instances can only be created by Roblox package workflows")
     );
-    assert_eq!(err(r#"{"ops":[]}"#), "Batch input has no items");
-    assert_eq!(err("[]"), "Batch input has no items");
+    assert_eq!(err(r#"{"ops":[]}"#), "Batch input has no ops");
+    assert_eq!(err("[]"), "Batch input has no ops");
     assert!(err("{bad").starts_with("Invalid batch input"));
     assert!(err("nope").starts_with("Failed to read nope"));
     assert!(err(r#"[{"parent":"","name":"A","class":"Folder"}]"#).contains("names no service"));
@@ -632,12 +637,429 @@ fn add_batch_rejects_bad_items_without_writing_any_store() {
     )
     .unwrap_err();
     assert!(
-        refused.contains("Batch item 1")
+        refused.contains("Batch op 1 (add)")
             && refused.contains("already exists with different contents"),
         "{refused}"
     );
     assert_eq!(fs::read(fx.store("Workspace")).unwrap(), before);
     assert!(!fx.exists("src/Workspace/Orphan.luau"));
+}
+
+#[test]
+fn batch_sets_clones_renames_moves_and_removes_in_order() {
+    let fx = Fixture::new("batch-ops-edit");
+    let result = run_batch(
+        &fx,
+        r##"{"ops":[
+            {"parent":"Workspace","name":"Props","class":"Folder","ref":"props"},
+            {"op":"set","path":"Workspace.Lobby.Door","props":{"Position":[0,10,0],"Transparency":0.25},"attrs":{"Owner":"Grace","Reviewed":null},"tags":["Door"]},
+            {"op":"set","path":"Workspace","props":{"Gravity":50}},
+            {"op":"clone","path":"Workspace.Lobby.Door","name":"Gate","parent":"#props","ref":"gate","props":{"Anchored":false}},
+            {"op":"rename","path":"Workspace.Lobby.Door","name":"FrontDoor"},
+            {"op":"move","path":"Workspace.Lobby.Border[2]","parent":"#props"},
+            {"op":"remove","path":"Workspace.Lobby.Border"},
+            {"op":"set","path":"#gate","attrs":{"Kind":"gate"}},
+            {"op":"move","path":"Workspace.Lobby.Helper","parent":"#props"}
+        ]}"##,
+    )
+    .unwrap();
+    assert_eq!(
+        result,
+        json!({
+            "changedPaths": [
+                STORE,
+                "<root>/src/Workspace/Lobby/Helper.client.luau",
+                "<root>/src/Workspace/Props/Helper.client.luau",
+                "<root>/instances/ReplicatedStorage.renium",
+            ],
+            "ok": true,
+            "ops": [
+                {"id": "editor:9", "op": "add", "path": "Workspace.Props", "ref": "props"},
+                {"attrs": ["Owner", "Reviewed"], "op": "set", "path": "Workspace.Lobby.FrontDoor", "props": ["CFrame", "Tags", "Transparency"]},
+                {"op": "set", "path": "Workspace", "props": ["Gravity"]},
+                {"from": "Workspace.Lobby.Door", "id": "editor:a", "op": "clone", "path": "Workspace.Props.Gate", "props": ["Anchored"], "ref": "gate"},
+                {"from": "Workspace.Lobby.Door", "op": "rename", "path": "Workspace.Lobby.FrontDoor"},
+                {"from": "Workspace.Lobby.Border[2]", "op": "move", "path": "Workspace.Props.Border"},
+                {"op": "remove", "path": "Workspace.Lobby.Border", "removed": 1},
+                {"attrs": ["Kind"], "op": "set", "path": "Workspace.Props.Gate"},
+                {"from": "Workspace.Lobby.Helper", "op": "move", "path": "Workspace.Props.Helper"},
+            ],
+            "stores": 2,
+        })
+    );
+    assert_eq!(
+        fx.names("Workspace"),
+        [
+            "Workspace",
+            "Lobby",
+            "FrontDoor",
+            "Border",
+            "Spawner",
+            "Target",
+            "Café ☕",
+            "Helper",
+            "Props",
+            "Gate"
+        ]
+    );
+    let workspace = fx.read_store("Workspace");
+    let door = &workspace.instances[2];
+    let position = door.properties["CFrame"]["components"].as_array().unwrap()[..3]
+        .iter()
+        .map(|component| component.as_f64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(position, [0.0, 10.0, 0.0]);
+    assert_eq!(door.properties["Transparency"], json!(0.25));
+    assert_eq!(door.properties["Tags"], json!(["Door"]));
+    assert_eq!(door.attributes["Owner"], json!("Grace"));
+    assert!(!door.attributes.contains_key("Reviewed"));
+    assert_eq!(workspace.instances[0].properties["Gravity"], json!(50));
+    let gate = &workspace.instances[9];
+    assert_eq!(
+        (gate.class_name.as_str(), gate.parent_index),
+        ("Part", Some(8))
+    );
+    assert_eq!(gate.properties["Anchored"], json!(false));
+    assert_eq!(gate.properties["Tags"], json!(["Door"]));
+    assert_eq!(gate.attributes["Kind"], json!("gate"));
+    assert_eq!(gate.attributes["Owner"], json!("Grace"));
+    assert_eq!(workspace.instances[3].parent_index, Some(8));
+    assert_eq!(
+        workspace.instances[3].properties["Transparency"],
+        json!(0.75)
+    );
+    assert_eq!(workspace.instances[7].parent_index, Some(8));
+    let moved_door = json!({"_type": "Ref", "pathOrdinals": [1, 1, 1], "pathSegments": ["Workspace", "Lobby", "FrontDoor"], "settingsId": "door"});
+    assert_eq!(
+        fx.both(&["bg", "-f", &fx.store_arg("Workspace"), "Target", "Value"]),
+        moved_door
+    );
+    assert_eq!(
+        fx.both(&[
+            "bg",
+            "-f",
+            &fx.store_arg("ReplicatedStorage"),
+            "Link",
+            "Value"
+        ]),
+        moved_door
+    );
+    assert_eq!(
+        fs::read_to_string(fx.root.join("src/Workspace/Props/Helper.client.luau")).unwrap(),
+        HELPER_SOURCE
+    );
+    assert!(!fx.exists("src/Workspace/Lobby"));
+}
+
+#[test]
+fn batch_ops_write_script_sources_from_text_files_and_copies() {
+    let fx = Fixture::new("batch-ops-sources");
+    let patch = fx.root.join("patch.luau");
+    fs::write(&patch, "print('from file')\n").unwrap();
+    let main = fx.root.join("main.luau");
+    fs::write(&main, "return 'main'\n").unwrap();
+    let batch = json!({"ops": [
+        {"op": "set", "path": "Workspace.Spawner", "source": "print('patched')\n"},
+        {"op": "clone", "path": "Workspace.Spawner", "name": "Spawner2", "ref": "copy"},
+        {"op": "set", "path": "Workspace.Spawner", "sourceFile": patch},
+        {"parent": "ServerScriptService", "name": "Main", "class": "Script", "sourceFile": main},
+        {"op": "remove", "path": "ReplicatedStorage.Shared.Config"},
+        {"op": "rename", "path": "Workspace.Lobby.Helper", "name": "Client"},
+    ]});
+    let spawner = "<root>/src/Workspace/Spawner.server.luau";
+    assert_eq!(
+        run_batch(&fx, &batch.to_string()).unwrap(),
+        json!({
+            "changedPaths": [
+                STORE,
+                "<root>/src/Workspace/Lobby/Client.client.luau",
+                "<root>/src/Workspace/Lobby/Helper.client.luau",
+                spawner,
+                "<root>/src/Workspace/Spawner2.server.luau",
+                "<root>/instances/ServerScriptService.renium",
+                "<root>/src/ServerScriptService/Main.server.luau",
+                "<root>/instances/ReplicatedStorage.renium",
+                "<root>/src/ReplicatedStorage/Shared/Config.luau",
+            ],
+            "ok": true,
+            "ops": [
+                {"op": "set", "path": "Workspace.Spawner", "sourcePath": spawner},
+                {"from": "Workspace.Spawner", "id": "editor:9", "op": "clone", "path": "Workspace.Spawner2", "ref": "copy", "sourcePath": "<root>/src/Workspace/Spawner2.server.luau"},
+                {"op": "set", "path": "Workspace.Spawner", "sourcePath": spawner},
+                {"id": "editor:1", "op": "add", "path": "ServerScriptService.Main", "sourcePath": "<root>/src/ServerScriptService/Main.server.luau"},
+                {"op": "remove", "path": "ReplicatedStorage.Shared.Config", "removed": 1},
+                {"from": "Workspace.Lobby.Helper", "op": "rename", "path": "Workspace.Lobby.Client"},
+            ],
+            "stores": 3,
+        })
+    );
+    let read = |relative: &str| fs::read_to_string(fx.root.join(relative)).unwrap();
+    assert_eq!(
+        read("src/Workspace/Spawner.server.luau"),
+        "print('from file')\n"
+    );
+    assert_eq!(
+        read("src/Workspace/Spawner2.server.luau"),
+        "print('patched')\n"
+    );
+    assert_eq!(
+        read("src/ServerScriptService/Main.server.luau"),
+        "return 'main'\n"
+    );
+    assert_eq!(
+        read("src/Workspace/Lobby/Client.client.luau"),
+        HELPER_SOURCE
+    );
+    assert!(!fx.exists("src/Workspace/Lobby/Helper.client.luau"));
+    assert!(!fx.exists("src/ReplicatedStorage/Shared"));
+    assert_eq!(
+        fx.names("ReplicatedStorage"),
+        ["ReplicatedStorage", "Shared", "Link"]
+    );
+    let broken = fx.root.join("broken.luau");
+    fs::write(&broken, "local x =").unwrap();
+    let before = fs::read(fx.store("Workspace")).unwrap();
+    let refused = run_batch(
+        &fx,
+        &json!({"ops": [{"op": "set", "path": "Workspace.Spawner", "sourceFile": broken}]})
+            .to_string(),
+    )
+    .unwrap_err();
+    assert!(
+        refused.starts_with("Batch op 0 (set): sourceFile <root>/broken.luau: Invalid Luau syntax"),
+        "{refused}"
+    );
+    assert_eq!(fs::read(fx.store("Workspace")).unwrap(), before);
+    assert_eq!(
+        read("src/Workspace/Spawner.server.luau"),
+        "print('from file')\n"
+    );
+}
+
+#[test]
+fn pushed_batch_finds_renamed_moved_and_removed_instances_by_their_old_paths() {
+    let fx = Fixture::new("batch-ops-push");
+    let outcome = batch_outcome(
+        &fx,
+        r##"{"ops":[
+            {"op":"rename","path":"Workspace.Lobby","name":"Hall"},
+            {"op":"move","path":"Workspace.Hall.Door","parent":"Workspace.Café ☕"},
+            {"op":"remove","path":"Workspace.Target"},
+            {"parent":"Workspace.Hall","name":"Fresh","class":"Folder","ref":"fresh"},
+            {"op":"remove","path":"#fresh"},
+            {"op":"set","path":"Workspace.Spawner","attrs":{"Mode":"fast"}}
+        ]}"##,
+        true,
+    )
+    .unwrap();
+    let studio = &outcome.studio;
+    assert_eq!(
+        studio.paths,
+        [
+            vec!["Workspace", "Lobby"],
+            vec!["Workspace", "Lobby", "Door"],
+            vec!["Workspace", "Café ☕"],
+            vec!["Workspace", "Target"],
+        ]
+    );
+    assert_eq!(studio.renames, [(0, "Hall".to_string())]);
+    assert_eq!(studio.moves, [(1, 2)]);
+    assert_eq!(studio.destroys, [3]);
+    let luau = studio.luau();
+    assert!(
+        luau.contains(r#"in {{"Workspace", "Lobby"}, {"Workspace", "Lobby", "Door"}, {"Workspace", "Café ☕"}, {"Workspace", "Target"}} do"#)
+            && luau.contains(r#"{ 1, "Hall" }"#)
+            && luau.contains("{ 2, 3 }")
+            && luau.contains("in {4} do"),
+        "{luau}"
+    );
+    crate::studio::automation::validate_luau_syntax(&luau).unwrap();
+    let pushes = outcome
+        .pushes
+        .iter()
+        .map(|push| (push.service.as_str(), push.settings_ids.clone()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        pushes,
+        [(
+            "Workspace",
+            vec![
+                "lobby".to_string(),
+                "door".to_string(),
+                "spawner".to_string()
+            ]
+        )]
+    );
+    assert_eq!(
+        fx.both(&[
+            "bg",
+            "-f",
+            &fx.store_arg("ReplicatedStorage"),
+            "Link",
+            "Value"
+        ]),
+        json!({"_type": "Ref", "pathOrdinals": [1, 1, 1], "pathSegments": ["Workspace", "Café ☕", "Door"], "settingsId": "door"})
+    );
+    let into_new = r##"[{"parent":"Workspace","name":"Props","class":"Folder","ref":"props"},{"op":"move","path":"Workspace.Spawner","parent":"#props"}]"##;
+    let before = fs::read(fx.store("Workspace")).unwrap();
+    let Err(refused) = batch_outcome(&fx, into_new, true) else {
+        panic!("a pushed move into a new folder was accepted");
+    };
+    assert_eq!(
+        refused,
+        "Batch op 1 (move): with --push, Workspace.Spawner cannot move into Workspace.Props, which this batch creates (Studio would get a copy); create it in an earlier batch"
+    );
+    assert_eq!(fs::read(fx.store("Workspace")).unwrap(), before);
+    assert!(
+        batch_outcome(&fx, into_new, false)
+            .unwrap()
+            .studio
+            .is_empty()
+    );
+}
+
+#[test]
+fn batch_ops_share_the_value_handling_and_refusals_of_single_edits() {
+    let fx = Fixture::new("batch-ops-values");
+    let result = run_batch(
+        &fx,
+        r##"{"ops":[
+            {"parent":"Workspace","name":"Team","class":"BrickColorValue","ref":"team"},
+            {"op":"set","path":"#team","props":{"Value":"Bright red"}},
+            {"op":"set","path":"Workspace.Target","props":{"Value":"Workspace.Café ☕"}},
+            {"parent":"Lighting","name":"Haze","class":"Atmosphere"},
+            {"op":"set","path":"Lighting","props":{"ClockTime":18.25}},
+            {"parent":"Workspace","name":"Tmp","class":"Folder","ref":"tmp"},
+            {"op":"remove","path":"#tmp"},
+            {"parent":"Workspace","name":"Next","class":"Folder"}
+        ]}"##,
+    )
+    .unwrap();
+    let ops = result["ops"].as_array().unwrap();
+    assert_eq!(ops[1]["props"], json!(["Value"]));
+    assert_eq!(ops[4]["props"], json!(["TimeOfDay"]));
+    assert_eq!(ops[5]["id"], json!("editor:a"));
+    assert_eq!(ops[6]["path"], json!("Workspace.Tmp"));
+    assert_eq!(ops[7]["id"], json!("editor:b"));
+    let store = fx.store_arg("Workspace");
+    let batch_color = fx.both(&["bg", "-f", &store, "Team", "Value"]);
+    fx.text(&[
+        "bs",
+        "-f",
+        &store,
+        "Team",
+        "-p",
+        "Value",
+        "-j",
+        r#"{"_type":"BrickColor","number":21}"#,
+    ])
+    .ok();
+    assert_eq!(fx.both(&["bg", "-f", &store, "Team", "Value"]), batch_color);
+    let batch_reference = fx.both(&["bg", "-f", &store, "Target", "Value"]);
+    assert_eq!(
+        batch_reference["pathSegments"],
+        json!(["Workspace", "Café ☕"])
+    );
+    fx.text(&[
+        "bs",
+        "-f",
+        &store,
+        "Target",
+        "-p",
+        "Value",
+        "-j",
+        "\"Workspace.Café ☕\"",
+    ])
+    .ok();
+    assert_eq!(
+        fx.both(&["bg", "-f", &store, "Target", "Value"]),
+        batch_reference
+    );
+    let lighting = &fx.read_store("Lighting").instances[0];
+    assert_eq!(lighting.properties["TimeOfDay"], json!("18:15:00"));
+    assert!(!lighting.properties.contains_key("ClockTime"));
+    let before = fs::read(fx.store("Workspace")).unwrap();
+    let err = |ops: &str| run_batch(&fx, ops).unwrap_err();
+    assert!(err(r##"[{"parent":"Workspace","name":"Label","class":"TextLabel","ref":"label"},{"op":"set","path":"#label","props":{"Font":"GothamBold"}}]"##).starts_with("Batch op 1 (set): TextLabel.Font is hidden or engine-managed"));
+    for (ops, refusal) in [
+        (
+            r#"[{"op":"set","path":"Workspace.Lobby.Door","props":{"Name":"Gate"}}]"#,
+            "Batch op 0 (set): Name changes through a rename op",
+        ),
+        (
+            r#"[{"op":"set","path":"Workspace.Lobby.Door","props":{"Parent":"Workspace"}}]"#,
+            "Batch op 0 (set): Parent changes through a move op",
+        ),
+        (
+            r#"[{"op":"set","path":"Workspace.Lobby.Door"}]"#,
+            "Batch op 0 (set): set needs props, attrs, tags, source or sourceFile",
+        ),
+        (
+            r#"[{"op":"set","path":"Workspace.Lobby.Door","source":"x"}]"#,
+            "Batch op 0 (set): Part is not a Lua source container",
+        ),
+        (
+            r#"[{"op":"set","path":"Workspace.Lobby.Door","tags":["A"],"props":{"Tags":["B"]}}]"#,
+            "Batch op 0 (set): give tags or props.Tags, not both",
+        ),
+        (
+            r#"[{"op":"move","path":"Workspace.Lobby.Door","parent":"ReplicatedStorage.Shared"}]"#,
+            "Batch op 0 (move): parent ReplicatedStorage.Shared is in ReplicatedStorage, not Workspace; moves between services go through `rbx mv`",
+        ),
+        (
+            r#"[{"op":"move","path":"Workspace.Lobby","parent":"Workspace.Lobby.Door"}]"#,
+            "Batch op 0 (move): Cannot set Parent to the instance itself or one of its descendants",
+        ),
+        (
+            r#"[{"op":"rename","path":"Workspace","name":"World"}]"#,
+            "Batch op 0 (rename): The Workspace service root cannot be renamed",
+        ),
+        (
+            r#"[{"op":"rename","path":"Workspace.Lobby","name":""}]"#,
+            "Batch op 0 (rename): Instance name cannot be empty",
+        ),
+        (
+            r#"[{"op":"remove","path":"Workspace"}]"#,
+            "Batch op 0 (remove): Refusing to remove root instance",
+        ),
+        (
+            r#"[{"op":"clone","path":"Workspace","name":"Copy"}]"#,
+            "Batch op 0 (clone): Service roots cannot be copied",
+        ),
+        (
+            r#"[{"op":"clone","path":"Workspace.Lobby","name":"Copy","parent":"ReplicatedStorage"}]"#,
+            "Batch op 0 (clone): parent ReplicatedStorage is in ReplicatedStorage, not Workspace; a copy stays in its store",
+        ),
+        (
+            r##"[{"parent":"Workspace","name":"A","class":"Folder","ref":"a"},{"op":"remove","path":"#a"},{"op":"rename","path":"#a","name":"B"}]"##,
+            "Batch op 2 (rename): path #a was removed by an earlier op",
+        ),
+        (
+            r#"[{"op":"remove","path":"Workspace.Target"},{"parent":"Workspace","name":"T2","class":"Folder","id":"target"}]"#,
+            "Batch op 1 (add): settingsId target belonged to an instance this batch removed",
+        ),
+        (
+            r#"[{"op":"delete","path":"Workspace.Lobby"}]"#,
+            "Batch op 0: unknown op \"delete\"; use add, set, clone, rename, move or remove",
+        ),
+        (r#"[{"op":3}]"#, "Batch op 0: op must be a string, got 3"),
+        ("[1]", "Batch op 0: an op must be a JSON object"),
+    ] {
+        assert_eq!(err(ops), refusal, "{ops}");
+    }
+    assert!(
+        err(r#"[{"op":"set","path":"Workspace.Lobby.Door","props":{"Size":"big"}}]"#)
+            .contains("Size needs a Vector3 value")
+    );
+    assert!(
+        err(r#"[{"op":"set","path":"Players","props":{"MaxPlayers":4}}]"#)
+            .contains("No synced Renium store for service 'Players'")
+    );
+    assert!(
+        err(r#"[{"op":"rename","path":"Workspace.Lobby","name":"Hall","class":"Folder"}]"#)
+            .starts_with("Batch op 0: unknown field `class`")
+    );
+    assert_eq!(fs::read(fx.store("Workspace")).unwrap(), before);
 }
 
 fn cloned(

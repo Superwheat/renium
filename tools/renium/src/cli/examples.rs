@@ -233,7 +233,7 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ),
     (
         "ba",
-        "Examples:\n  rbx ba Workspace -n Door -c Part -I editor:parent\n  '{\"ops\":[{\"parent\":\"ServerScriptService\",\"name\":\"Battle\",\"class\":\"Folder\",\"ref\":\"battle\"},{\"parent\":\"#battle\",\"name\":\"Rounds\",\"class\":\"ModuleScript\",\"source\":\"return {}\"}]}' | rbx ba --batch -\n  rbx ba --batch ops.json",
+        "Examples:\n  rbx ba Workspace -n Door -c Part -I editor:parent\n  '{\"ops\":[{\"parent\":\"ServerScriptService\",\"name\":\"Battle\",\"class\":\"Folder\",\"ref\":\"battle\"},{\"parent\":\"#battle\",\"name\":\"Rounds\",\"class\":\"ModuleScript\",\"sourceFile\":\"src/ServerScriptService/Battle/Rounds.luau\"},{\"op\":\"set\",\"path\":\"Workspace.Lobby.Door\",\"props\":{\"Anchored\":true}},{\"op\":\"rename\",\"path\":\"Workspace.Lobby.Sign\",\"name\":\"Board\"},{\"op\":\"remove\",\"path\":\"Workspace.Old\"}]}' | rbx ba --batch - --push\n  rbx ba --batch ops.json",
     ),
     (
         "bcl",

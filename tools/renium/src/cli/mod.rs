@@ -734,7 +734,7 @@ pub(super) enum Commands {
         name = "ba",
         alias = "bytecode-add-instance",
         alias = "add",
-        about = "Add an instance to a store"
+        about = "Add an instance to a store, or apply a batch of store edits"
     )]
     BytecodeAddInstance(BytecodeAddInstanceArgs),
     #[command(
@@ -3436,7 +3436,7 @@ pub(super) struct BytecodeAddInstanceArgs {
     #[arg(help = "Settings ID to assign", short = 'i', long, alias = "id")]
     pub(super) settings_id: Option<String>,
     #[arg(
-        help = "Create several instances from JSON ops: a file, - for stdin, or inline JSON",
+        help = "Apply JSON ops (add, set, clone, rename, move, remove) in one write: a file, - for stdin, or inline JSON",
         short = 'J',
         long,
         value_name = "PATH",
@@ -3463,7 +3463,7 @@ pub(super) struct BytecodeAddInstanceArgs {
     #[arg(help = "Property as NAME=JSON (repeatable)", short, long = "property")]
     pub(super) properties: Vec<String>,
     #[arg(
-        help = "Push the new instance to the open Studio place right away (scoped to it, no review)",
+        help = "Push the new instance (with --batch, every touched instance, one push per store) to the open Studio place right away, no review",
         long
     )]
     pub(super) push: bool,

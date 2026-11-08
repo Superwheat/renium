@@ -508,7 +508,7 @@ def same_named_siblings_push_and_pull(ctx: Context):
         for _ in range(item):
             ops.append({"parent": f"#item{item}", "name": "Part", "class": "Part"})
     created = ctx.rbx("ba", "--batch", "-", stdin=json.dumps({"ops": ops}), timeout=120)
-    ctx.expect(len(created.get("created") or []) == len(ops), f"batch created {len(created.get('created') or [])} of {len(ops)}")
+    ctx.expect(len(created.get("ops") or []) == len(ops), f"batch created {len(created.get('ops') or [])} of {len(ops)}")
     ctx.rbx("ps", WORKSPACE, "--yes", timeout=180)
     counts = ctx.luau("local t = {} for _, item in ipairs(workspace.Set:GetChildren()) do table.insert(t, #item:GetChildren()) end table.sort(t) return table.concat(t, ',')")
     ctx.expect(counts == ",".join(str(n) for n in range(1, 13)), f"Part counts per Item in Studio: {counts}")
@@ -766,7 +766,7 @@ def large_batch_under_live_sync(ctx: Context):
         for _ in range(100):
             ops.append({"parent": f"#i{item}", "name": "Part", "class": "Part"})
     created = ctx.rbx("ba", "--batch", "-", stdin=json.dumps({"ops": ops}), timeout=300)
-    ctx.expect(len(created.get("created") or []) == len(ops), f"batch created {len(created.get('created') or [])}")
+    ctx.expect(len(created.get("ops") or []) == len(ops), f"batch created {len(created.get('ops') or [])}")
     status = ctx.rbx("lst", "--wait", "120", timeout=300)
     ctx.expect(status.pointer("/daemon/pendingCount", 0) == 0 and not _error_of(status), f"after the batch: {status.json}")
     ctx.expect(ctx.luau("local n = 0 for _, m in ipairs(workspace.Big:GetChildren()) do n += #m:GetChildren() end return n") == 6000, "6,000 parts in Studio")
@@ -832,7 +832,7 @@ def chunked_review_honors_the_project_threshold(ctx: Context):
     ops += [{"parent": "#bulk", "name": f"Part{index:05d}" + "x" * 120, "class": "Part"} for index in range(count)]
     with _review_threshold_zero(ctx):
         created = ctx.rbx("ba", "--batch", "-", stdin=json.dumps({"ops": ops}), timeout=600)
-        ctx.expect(len(created.get("created") or []) == len(ops), f"batch created {len(created.get('created') or [])} of {len(ops)}")
+        ctx.expect(len(created.get("ops") or []) == len(ops), f"batch created {len(created.get('ops') or [])} of {len(ops)}")
         ctx.rbx("cfg", "set", "liveSync.changesThreshold", "100000", timeout=60)
         started = time.monotonic()
         pushed = ctx.rbx("ps", WORKSPACE, "-u", ok=None, timeout=600)

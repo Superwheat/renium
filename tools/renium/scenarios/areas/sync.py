@@ -435,7 +435,7 @@ def batch_creation_is_delivered(ctx: Context):
         {"parent": "#root", "name": "Marker", "class": "StringValue", "props": {"Value": "batch"}},
     ]}
     created = ctx.rbx("ba", "--batch", "-", stdin=json.dumps(batch), timeout=60)
-    ctx.expect(len(created.get("created") or []) == 3, f"created: {created.json}")
+    ctx.expect(len(created.get("ops") or []) == 3, f"created: {created.json}")
     _settled(ctx)
     ctx.expect(ctx.luau("return game.ServerStorage.Batch.Marker.Value") == "batch", "Studio has the batch")
 

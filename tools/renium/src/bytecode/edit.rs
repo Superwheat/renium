@@ -782,7 +782,7 @@ pub(crate) fn add_store_instance(request: StoreInstanceRequest) -> Result<Value>
     if is_lua_source_class(&document.instances[added.index].class_name)
         && let Some(Some(source_path)) = source_paths.get(added.index)
     {
-        match new_script_source(source_path, given_source.as_deref())? {
+        match new_script_source(source_path, given_source.as_deref().map(str::as_bytes))? {
             Some(bytes) => {
                 writes.insert(source_path.clone(), bytes);
             }
@@ -818,7 +818,7 @@ pub(crate) fn add_store_instance(request: StoreInstanceRequest) -> Result<Value>
 /// by an empty source, and a given source that differs from it is refused.
 pub(crate) fn new_script_source(
     source_path: &Path,
-    given: Option<&str>,
+    given: Option<&[u8]>,
 ) -> Result<Option<Vec<u8>>> {
     let existing = source_path
         .is_file()
@@ -826,9 +826,9 @@ pub(crate) fn new_script_source(
         .transpose()
         .with_context(|| format!("Failed to read {}", source_path.display()))?;
     match (existing, given) {
-        (None, given) => Ok(Some(given.unwrap_or_default().as_bytes().to_vec())),
+        (None, given) => Ok(Some(given.unwrap_or_default().to_vec())),
         (Some(_), None) => Ok(None),
-        (Some(existing), Some(given)) if existing == given.as_bytes() => Ok(None),
+        (Some(existing), Some(given)) if existing == given => Ok(None),
         (Some(_), Some(_)) => bail!(
             "{} already exists with different contents; omit the Source property to adopt the file, or change the file first",
             source_path.display()
@@ -899,92 +899,22 @@ pub(crate) fn bytecode_clone_instance_result(mut args: BytecodeCloneInstanceArgs
             .ok_or_else(|| anyhow::anyhow!("Source instance has no parent"))?
     };
 
-    let children_before = settings_children_by_parent(&document);
-    let mut source_subtree = Vec::new();
-    collect_settings_subtree_preorder(&children_before, source_index, &mut source_subtree);
-    reject_package_link_subtree_mutation(&document, &source_subtree, "copied")?;
-    let source_set = source_subtree.iter().copied().collect::<HashSet<_>>();
-    if source_set.contains(&target_parent_index) {
-        bail!("Cannot copy an instance into itself or one of its descendants");
-    }
-
     let service_dir = crate::project::storage::source_directory(&settings_file);
     let source_paths_before = build_editor_source_paths_by_index(&document, &service, &service_dir);
-    let (path_segments_before, path_ordinals_before) =
-        build_editor_instance_path_parts(&document, &service);
-    let root_name = unique_editor_child_name(
-        &document,
-        children_before
-            .get(target_parent_index)
-            .map_or(&[][..], Vec::as_slice),
-        &document.instances[source_index].name,
-    );
-
-    let mut existing_settings_ids = document
-        .instances
+    let cloned = clone_store_subtree(
+        &mut document,
+        &service,
+        source_index,
+        target_parent_index,
+        None,
+        &HashSet::new(),
+    )?;
+    let cloned_settings_ids = cloned
+        .copies
         .iter()
-        .map(|instance| instance.settings_id.clone())
-        .collect::<HashSet<_>>();
-    let mut next_settings_id_seed = document.instances.len();
-    let mut old_to_new_index = HashMap::<usize, usize>::with_capacity(source_subtree.len());
-    let mut cloned_settings_ids = Vec::with_capacity(source_subtree.len());
-    let mut root_settings_id = String::new();
-
-    for old_index in source_subtree.iter().copied() {
-        let old_instance = document.instances[old_index].clone();
-        let parent_index = if old_index == source_index {
-            Some(target_parent_index)
-        } else {
-            Some(
-                old_instance
-                    .parent_index
-                    .and_then(|parent_index| old_to_new_index.get(&parent_index).copied())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Clone source subtree is missing a parent mapping")
-                    })?,
-            )
-        };
-        let settings_id =
-            next_editor_settings_id_fast(&mut existing_settings_ids, &mut next_settings_id_seed);
-        let new_index = document.instances.len();
-        let name = if old_index == source_index {
-            root_name.clone()
-        } else {
-            old_instance.name
-        };
-        let mut properties = old_instance.properties;
-        properties.remove("Source");
-        properties.remove("LinkedSource");
-        document.instances.push(SettingsBytecodeInstance {
-            settings_id: settings_id.clone(),
-            name,
-            class_name: old_instance.class_name,
-            parent_index,
-            properties,
-            attributes: old_instance.attributes,
-        });
-        old_to_new_index.insert(old_index, new_index);
-        if old_index == source_index {
-            root_settings_id.clone_from(&settings_id);
-        }
-        cloned_settings_ids.push(settings_id);
-    }
-
-    let ref_map = build_clone_ref_map(
-        &document,
-        CloneRefMapInput {
-            source_subtree: &source_subtree,
-            old_to_new_index: &old_to_new_index,
-            path_segments_before: &path_segments_before,
-            path_ordinals_before: &path_ordinals_before,
-        },
-    );
-    for new_index in old_to_new_index.values().copied() {
-        if let Some(instance) = document.instances.get_mut(new_index) {
-            remap_internal_clone_refs_in_record(&mut instance.properties, &ref_map);
-            remap_internal_clone_refs_in_record(&mut instance.attributes, &ref_map);
-        }
-    }
+        .map(|&(_, new_index)| document.instances[new_index].settings_id.clone())
+        .collect::<Vec<_>>();
+    let root_settings_id = document.instances[cloned.root_index].settings_id.clone();
 
     let mut writes = BTreeMap::new();
     let mut removals = Vec::new();
@@ -998,10 +928,7 @@ pub(crate) fn bytecode_clone_instance_result(mut args: BytecodeCloneInstanceArgs
         &mut removals,
     )?;
     let mut source_copies = Vec::new();
-    for old_index in source_subtree.iter().copied() {
-        let Some(new_index) = old_to_new_index.get(&old_index).copied() else {
-            continue;
-        };
+    for &(old_index, new_index) in &cloned.copies {
         let Some(instance) = document.instances.get(old_index) else {
             continue;
         };
@@ -1029,7 +956,7 @@ pub(crate) fn bytecode_clone_instance_result(mut args: BytecodeCloneInstanceArgs
     writes.insert(settings_file.clone(), encode_settings_bytecode(&document)?);
     let changed_paths = file_mutation_paths(&writes, &removals);
     apply_file_mutations(&writes, &removals)?;
-    let root_index = old_to_new_index[&source_index];
+    let root_index = cloned.root_index;
     let root = &document.instances[root_index];
     let (path_segments_by_index, path_ordinals_by_index) =
         build_editor_instance_path_parts(&document, &service);
@@ -1047,6 +974,113 @@ pub(crate) fn bytecode_clone_instance_result(mut args: BytecodeCloneInstanceArgs
         "sourceCopies": source_copies,
         "changedPaths": changed_paths,
     }))
+}
+
+/// A subtree copied inside its store: the copy's root and, in subtree
+/// order, each original's index paired with its copy's.
+pub(crate) struct ClonedSubtree {
+    pub(crate) root_index: usize,
+    pub(crate) copies: Vec<(usize, usize)>,
+}
+
+/// Copies the subtree at `source_index` under `parent_index` in memory. The
+/// copy's root takes `name`, or a name unique among its new siblings; every
+/// copy gets a fresh id that is not in `reserved`, scripts drop their stored
+/// source, and references inside the subtree point at the copies.
+pub(crate) fn clone_store_subtree(
+    document: &mut SettingsBytecode,
+    service: &str,
+    source_index: usize,
+    parent_index: usize,
+    name: Option<&str>,
+    reserved: &HashSet<String>,
+) -> Result<ClonedSubtree> {
+    let children_before = settings_children_by_parent(document);
+    let mut source_subtree = Vec::new();
+    collect_settings_subtree_preorder(&children_before, source_index, &mut source_subtree);
+    reject_package_link_subtree_mutation(document, &source_subtree, "copied")?;
+    let source_set = source_subtree.iter().copied().collect::<HashSet<_>>();
+    if source_set.contains(&parent_index) {
+        bail!("Cannot copy an instance into itself or one of its descendants");
+    }
+    let (path_segments_before, path_ordinals_before) =
+        build_editor_instance_path_parts(document, service);
+    let root_name = name.map_or_else(
+        || {
+            unique_editor_child_name(
+                document,
+                children_before
+                    .get(parent_index)
+                    .map_or(&[][..], Vec::as_slice),
+                &document.instances[source_index].name,
+            )
+        },
+        str::to_string,
+    );
+    let mut existing_settings_ids = document
+        .instances
+        .iter()
+        .map(|instance| instance.settings_id.clone())
+        .chain(reserved.iter().cloned())
+        .collect::<HashSet<_>>();
+    let mut next_settings_id_seed = document.instances.len();
+    let mut old_to_new_index = HashMap::<usize, usize>::with_capacity(source_subtree.len());
+    let mut copies = Vec::with_capacity(source_subtree.len());
+    for old_index in source_subtree.iter().copied() {
+        let old_instance = document.instances[old_index].clone();
+        let new_parent_index = if old_index == source_index {
+            Some(parent_index)
+        } else {
+            Some(
+                old_instance
+                    .parent_index
+                    .and_then(|parent_index| old_to_new_index.get(&parent_index).copied())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Clone source subtree is missing a parent mapping")
+                    })?,
+            )
+        };
+        let settings_id =
+            next_editor_settings_id_fast(&mut existing_settings_ids, &mut next_settings_id_seed);
+        let new_index = document.instances.len();
+        let name = if old_index == source_index {
+            root_name.clone()
+        } else {
+            old_instance.name
+        };
+        let mut properties = old_instance.properties;
+        properties.remove("Source");
+        properties.remove("LinkedSource");
+        document.instances.push(SettingsBytecodeInstance {
+            settings_id,
+            name,
+            class_name: old_instance.class_name,
+            parent_index: new_parent_index,
+            properties,
+            attributes: old_instance.attributes,
+        });
+        old_to_new_index.insert(old_index, new_index);
+        copies.push((old_index, new_index));
+    }
+    let ref_map = build_clone_ref_map(
+        document,
+        CloneRefMapInput {
+            source_subtree: &source_subtree,
+            old_to_new_index: &old_to_new_index,
+            path_segments_before: &path_segments_before,
+            path_ordinals_before: &path_ordinals_before,
+        },
+    );
+    for new_index in old_to_new_index.values().copied() {
+        if let Some(instance) = document.instances.get_mut(new_index) {
+            remap_internal_clone_refs_in_record(&mut instance.properties, &ref_map);
+            remap_internal_clone_refs_in_record(&mut instance.attributes, &ref_map);
+        }
+    }
+    Ok(ClonedSubtree {
+        root_index: old_to_new_index[&source_index],
+        copies,
+    })
 }
 
 pub(crate) struct BytecodeCloneRefMap {

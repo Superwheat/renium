@@ -2030,6 +2030,69 @@ fn reject_read_only_link_store_edit(
     }
 }
 
+/// Refuses a store edit of an instance that Roblox or a package owns: a
+/// PackageLink, the Workspace viewport camera and, unless packages are
+/// overridden, anything inside a read-only link.
+fn reject_owned_instance_edit(
+    settings_file: &Path,
+    document: &SettingsBytecode,
+    service: &str,
+    index: usize,
+    override_packages: bool,
+) -> Result<()> {
+    reject_package_link_instance_mutation(document, index, "edited")?;
+    reject_viewport_camera_edit(document, index)?;
+    if !override_packages {
+        reject_read_only_link_store_edit(settings_file, document, service, index)?;
+    }
+    Ok(())
+}
+
+/// The name one property of the instance at `index` is stored under, with
+/// `value` turned into its stored form: a Roblox property takes its logical
+/// name and typed value, and one a push cannot set is refused. The flag says
+/// the stored name differs from the requested one.
+fn stored_property_edit(
+    document: &mut SettingsBytecode,
+    index: usize,
+    property: &str,
+    value: &mut Value,
+    scope: PropertyScope,
+) -> Result<(String, bool)> {
+    validate_auto_property_name(document, index, property, scope)?;
+    let canonical_property = canonical_stored_property_name(document, index, property, scope)?;
+    let logical_property = if matches!(scope, PropertyScope::Auto | PropertyScope::Property)
+        && !property.eq_ignore_ascii_case("source")
+        && !(scope == PropertyScope::Auto
+            && document.instances[index]
+                .attributes
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case(property)))
+    {
+        let database =
+            rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
+        rbx_logical_property_name(database, &document.instances[index].class_name, property)
+            .map(str::to_string)
+    } else {
+        None
+    };
+    if let Some(logical_property) = logical_property.as_deref() {
+        document.instances[index].properties.retain(|name, _| {
+            name == logical_property || !name.eq_ignore_ascii_case(logical_property)
+        });
+        *value = crate::rbx::encode::typed_store_property_value(
+            &document.instances[index].class_name,
+            logical_property,
+            std::mem::take(value),
+        )?;
+    }
+    let requested_differs = canonical_property.is_some();
+    let stored = logical_property
+        .or(canonical_property)
+        .unwrap_or_else(|| property.to_string());
+    Ok((stored, requested_differs))
+}
+
 pub(super) fn bytecode_set_property(mut args: BytecodeSetPropertyArgs) -> Result<()> {
     if let Some(query) = args.where_query.take() {
         return bytecode_set_property_where(args, &query);
@@ -2625,47 +2688,16 @@ pub(crate) fn bytecode_set_property_result(mut args: BytecodeSetPropertyArgs) ->
     )?;
     let index = resolved.index;
     fold_derived_property(&mut document, index, &mut args.property, &mut value)?;
-    reject_package_link_instance_mutation(&document, index, "edited")?;
-    reject_viewport_camera_edit(&document, index)?;
-    if !args.override_packages {
-        reject_read_only_link_store_edit(&settings_file, &document, &service, index)?;
-    }
-    validate_auto_property_name(&document, index, &args.property, scope)?;
-    let canonical_property =
-        canonical_stored_property_name(&document, index, &args.property, scope)?;
-    let logical_property = if matches!(scope, PropertyScope::Auto | PropertyScope::Property)
-        && !args.property.eq_ignore_ascii_case("source")
-        && !(scope == PropertyScope::Auto
-            && document.instances[index]
-                .attributes
-                .keys()
-                .any(|name| name.eq_ignore_ascii_case(&args.property)))
-    {
-        let database =
-            rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
-        rbx_logical_property_name(
-            database,
-            &document.instances[index].class_name,
-            &args.property,
-        )
-        .map(str::to_string)
-    } else {
-        None
-    };
-    let property = logical_property
-        .as_deref()
-        .or(canonical_property.as_deref())
-        .unwrap_or(&args.property);
-    if let Some(logical_property) = logical_property.as_deref() {
-        document.instances[index].properties.retain(|name, _| {
-            name == logical_property || !name.eq_ignore_ascii_case(logical_property)
-        });
-        value = crate::rbx::encode::typed_store_property_value(
-            &document.instances[index].class_name,
-            logical_property,
-            value,
-        )?;
-    }
+    reject_owned_instance_edit(
+        &settings_file,
+        &document,
+        &service,
+        index,
+        args.override_packages,
+    )?;
+    let (stored_property, requested_differs) =
+        stored_property_edit(&mut document, index, &args.property, &mut value, scope)?;
+    let property = stored_property.as_str();
     let moved_indices = structural_reference_update.then(|| {
         let children = settings_children_by_parent(&document);
         let mut subtree = Vec::new();
@@ -2755,7 +2787,7 @@ pub(crate) fn bytecode_set_property_result(mut args: BytecodeSetPropertyArgs) ->
         "property": property,
         "changedPaths": changed_paths,
     });
-    if canonical_property.is_some() {
+    if requested_differs {
         result["requestedProperty"] = json!(args.property);
     }
     if structural_reference_update {
