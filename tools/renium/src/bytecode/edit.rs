@@ -1528,10 +1528,23 @@ pub(crate) fn bytecode_remove_instance(mut args: BytecodeRemoveInstanceArgs) -> 
         }
         matched
     } else {
-        vec![
+        let mut indices = vec![
             resolve_bytecode_selector(&document, &service, &args.selector, "No matching instance")?
                 .index,
-        ]
+        ];
+        for target in &args.more_targets {
+            let selector = crate::cli::BytecodeInstanceSelectorArgs {
+                target: Some(target.clone()),
+                ..Default::default()
+            };
+            let index =
+                resolve_bytecode_selector(&document, &service, &selector, "No matching instance")?
+                    .index;
+            if !indices.contains(&index) {
+                indices.push(index);
+            }
+        }
+        indices
     };
     let children_by_parent = settings_children_by_parent(&document);
     for &index in &indices {
@@ -1613,10 +1626,44 @@ pub(crate) fn bytecode_remove_instance(mut args: BytecodeRemoveInstanceArgs) -> 
         result["matched"] = json!(removed_instance_paths.len());
     }
     if args.push {
-        result["studio"] = destroy_in_studio(&removed_instance_paths)?;
+        let studio = destroy_in_studio(&removed_instance_paths)?;
+        let destroyed = studio.get("destroyed").and_then(Value::as_u64).unwrap_or(0);
+        let missing = studio
+            .get("missing")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty);
+        result["verified"] = json!(destroyed as usize == removed_instance_paths.len() && missing);
+        result["studio"] = studio;
     }
     crate::app::output::drop_empty(&mut result, &["removedSourcePaths"]);
     print_json_output(&result, args.pretty)
+}
+
+/// Renames the instances at the given paths in the open place as one undo
+/// step, so the push that follows pairs them under their new names;
+/// `renamed` counts them and `missing` lists the paths Studio did not have.
+pub(crate) fn rename_in_studio(pairs: &[(Vec<String>, String)]) -> Result<Value> {
+    let pairs = pairs
+        .iter()
+        .map(|(path, name)| format!("{{ {}, {name:?} }}", luau_string_list(path)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let code = format!(
+        "local function at(segments) local inst = game for _, name in segments do inst = inst:FindFirstChild(name) if not inst then return nil end end return inst end local renamed, missing = 0, {{}} for _, pair in {{{pairs}}} do local inst = at(pair[1]) if inst then if inst.Name ~= pair[2] then inst.Name = pair[2] end renamed += 1 else table.insert(missing, table.concat(pair[1], '.')) end end return {{ renamed = renamed, missing = missing }}"
+    );
+    let result = crate::daemon::daemon_control_request(
+        crate::automation::op::LUAU,
+        None,
+        json!({ "code": code, "edit": true, "bridgeWaitSeconds": 8.0, "bridgePorts": "8781,8782" }),
+        false,
+    )
+    .context("The store was renamed but Studio could not rename the instance; push the store with `rbx ps`")?;
+    Ok(result
+        .get("results")
+        .and_then(Value::as_array)
+        .and_then(|results| results.first())
+        .cloned()
+        .unwrap_or(Value::Null))
 }
 
 /// Destroys the instances at `paths` in the open place as one undo step;

@@ -547,7 +547,7 @@ pub(crate) fn rename_instance_command(
     let target = args.target;
     let loaded_project =
         structural_project(project, &target.project_root, args.src_root.as_deref())?;
-    let settings_file = if let Some(loaded) = loaded_project.as_ref() {
+    let (settings_file, settings_id) = if let Some(loaded) = loaded_project.as_ref() {
         let stage = config::stage_project(loaded)?;
         let (settings_file, _, settings_id) = projected_structural_store(
             loaded,
@@ -557,26 +557,38 @@ pub(crate) fn rename_instance_command(
             true,
             args.override_packages,
         )?;
-        return bytecode_set_property(metadata_property_change(
-            settings_file,
-            settings_id,
-            "Name",
-            Some(args.name),
-            args.push,
-        ));
+        (settings_file, settings_id)
     } else {
         let src_root =
             structural_source_root(project, &target.project_root, args.src_root.as_deref())?;
-        service_settings_path(&src_root.join(&target.service))
+        let settings_file = service_settings_path(&src_root.join(&target.service));
+        if !settings_file.is_file() {
+            bail!("Service '{}' has no Renium store", target.service);
+        }
+        (settings_file, Some(target.settings_id))
     };
-    if !settings_file.is_file() {
-        bail!("Service '{}' has no Renium store", target.service);
+    if let Some(query) = args.where_query.as_deref() {
+        let replace = args.replace.as_deref().unwrap_or_default();
+        let (Some(from), Some(to)) = (replace.first(), replace.get(1)) else {
+            bail!("--where needs --replace FROM TO");
+        };
+        return crate::bytecode::bytecode_rename_where(
+            settings_file,
+            settings_id,
+            query,
+            from,
+            to,
+            args.push,
+        );
     }
+    let Some(name) = args.name else {
+        bail!("Give the new name, or --where QUERY --replace FROM TO");
+    };
     bytecode_set_property(metadata_property_change(
         settings_file,
-        Some(target.settings_id),
+        settings_id,
         "Name",
-        Some(args.name),
+        Some(name),
         args.push,
     ))
 }
@@ -591,6 +603,7 @@ pub(crate) fn remove_instance_command(
     bytecode_remove_instance(BytecodeRemoveInstanceArgs {
         where_query: None,
         push: false,
+        more_targets: Vec::new(),
         input: BytecodeFileArgs::settings_file(settings_file),
         selector: BytecodeInstanceSelectorArgs::by_settings_id(settings_id),
         no_recursive: args.no_recursive,

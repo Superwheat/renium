@@ -2003,8 +2003,22 @@ pub(super) struct MoveInstanceArgs {
 pub(super) struct RenameInstanceArgs {
     #[command(flatten)]
     pub(super) target: ProjectInstanceArgs,
-    #[arg(help = "New name")]
-    pub(super) name: String,
+    #[arg(help = "New name", required_unless_present = "where_query")]
+    pub(super) name: Option<String>,
+    #[arg(
+        help = "Rename every instance under the -i target that matches this query (words match names, is:Class, tag:Name, Prop=value, `or`); needs --replace",
+        long = "where",
+        value_name = "QUERY",
+        requires = "replace"
+    )]
+    pub(super) where_query: Option<String>,
+    #[arg(
+        help = "With --where: replace FROM with TO in each matching name (Glass Window_ turns Glass3 into Window_3)",
+        long,
+        num_args = 2,
+        value_names = ["FROM", "TO"]
+    )]
+    pub(super) replace: Option<Vec<String>>,
     #[arg(help = "Script source directory", short = 'd', long)]
     pub(super) src_root: Option<PathBuf>,
     #[arg(help = "Allow edits inside linked packages", long)]
@@ -3489,6 +3503,11 @@ pub(super) struct BytecodeRemoveInstanceArgs {
     pub(super) input: BytecodeFileArgs,
     #[command(flatten)]
     pub(super) selector: BytecodeInstanceSelectorArgs,
+    #[arg(
+        help = "More targets to remove in the same call (names or dotted paths)",
+        value_name = "TARGET"
+    )]
+    pub(super) more_targets: Vec<String>,
     #[arg(
         help = "Remove every instance under the target (the whole service without one) that matches this query: words match names, is:Class, tag:Name, Prop=value, Prop>0.5, `or` separates alternatives; 500 matches at most",
         long = "where",

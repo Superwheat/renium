@@ -516,6 +516,70 @@ mod tests {
     }
 
     #[test]
+    fn rename_where_replaces_part_of_every_matching_name() {
+        let root = scratch("renium-rn-where-");
+        run(
+            &root,
+            r##"{"ops":[
+                {"parent":"Workspace","name":"Lobby","class":"Folder","ref":"lobby"},
+                {"parent":"#lobby","name":"Glass1","class":"Part"},
+                {"parent":"#lobby","name":"Glass2","class":"Part"},
+                {"parent":"#lobby","name":"Wall","class":"Part"},
+                {"parent":"Workspace","name":"Glass9","class":"Part"}
+            ]}"##,
+        )
+        .unwrap();
+        let store = root.join("instances").join("Workspace.renium");
+        let lobby_id = {
+            let document = SettingsBytecode::read_file(&store).unwrap();
+            document
+                .instances
+                .iter()
+                .find(|instance| instance.name == "Lobby")
+                .unwrap()
+                .settings_id
+                .clone()
+        };
+        crate::bytecode::bytecode_rename_where(
+            store.clone(),
+            Some(lobby_id),
+            "is:Part",
+            "Glass",
+            "Window_",
+            false,
+        )
+        .unwrap();
+        let document = SettingsBytecode::read_file(&store).unwrap();
+        let mut names = document
+            .instances
+            .iter()
+            .map(|instance| instance.name.as_str())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        assert!(
+            names.contains(&"Window_1") && names.contains(&"Window_2"),
+            "{names:?}"
+        );
+        assert!(
+            names.contains(&"Wall") && names.contains(&"Glass9"),
+            "{names:?}"
+        );
+        assert!(!names.contains(&"Glass1"));
+        let error = crate::bytecode::bytecode_rename_where(
+            store.clone(),
+            None,
+            "is:Folder",
+            "Glass",
+            "Window_",
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("has 'Glass' in its name"), "{error}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn batch_creates_across_two_services_with_ref_parents() {
         let root = scratch("renium-ba-batch-");
         let result = run(

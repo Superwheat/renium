@@ -2034,8 +2034,58 @@ pub(super) fn bytecode_set_property(mut args: BytecodeSetPropertyArgs) -> Result
     if let Some(query) = args.where_query.take() {
         return bytecode_set_property_where(args, &query);
     }
-    let result = set_properties_on_target(args.clone())?;
+    // A push pairs the store with Studio by path, so a renamed instance is
+    // renamed in the place first; otherwise the push would create a copy
+    // under the new name beside the old one.
+    let renames = args.push
+        && args.property.iter().any(|name| {
+            name.eq_ignore_ascii_case("name") || name.to_ascii_lowercase().starts_with("name=")
+        });
+    let before = if renames {
+        selected_store_path(&args)?
+    } else {
+        None
+    };
+    let mut result = set_properties_on_target(args.clone())?;
+    let new_name = result
+        .get("name")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            result
+                .get("pathSegments")
+                .and_then(Value::as_array)
+                .and_then(|segments| segments.last())
+                .and_then(Value::as_str)
+        })
+        .map(str::to_string);
+    if let Some(before) = before
+        && let Some(new_name) = new_name
+    {
+        result["studioRenamed"] = crate::bytecode::edit::rename_in_studio(&[(before, new_name)])?;
+    }
     finish_set_property(args, result)
+}
+
+/// The full path of the instance a set-property call selects, before the
+/// edit; `None` when the selector names the service root.
+fn selected_store_path(args: &BytecodeSetPropertyArgs) -> Result<Option<Vec<String>>> {
+    let mut args = args.clone();
+    adopt_single_positional_target(&mut args.input, None, &mut args.selector)?;
+    let (settings_file, service_hint) = resolve_bytecode_cli_settings_file(
+        args.input.settings_file.as_deref(),
+        args.input.service_or_file.as_deref(),
+        None,
+    )?;
+    let document = SettingsBytecode::read_file(&settings_file)?;
+    let service = bytecode_service_name(&document, &settings_file, &service_hint);
+    let resolved = resolve_bytecode_selector_or_service_root(
+        &document,
+        &service,
+        &args.selector,
+        "No matching instance",
+    )?;
+    let (segments, _) = build_editor_instance_path_parts(&document, &service);
+    Ok(segments.get(resolved.index).cloned().flatten())
 }
 
 /// The store edit itself: one `-p NAME` with a value flag, or several
@@ -2280,6 +2330,160 @@ fn bytecode_set_property_where(mut args: BytecodeSetPropertyArgs, query: &str) -
         }
     }
     print_json_output(&result, args.pretty)
+}
+
+/// Renames every instance under the scope that matches `query` and whose name
+/// contains `from`, replacing `from` with `to`; one push covers them all and
+/// the read-back judges `verified`.
+pub(crate) fn bytecode_rename_where(
+    settings_file: PathBuf,
+    scope_settings_id: Option<String>,
+    query: &str,
+    from: &str,
+    to: &str,
+    push: bool,
+) -> Result<()> {
+    if from.is_empty() {
+        bail!("--replace FROM must not be empty");
+    }
+    let document = SettingsBytecode::read_file(&settings_file)?;
+    let service = bytecode_service_name(&document, &settings_file, "");
+    let selector = BytecodeInstanceSelectorArgs::by_settings_id(scope_settings_id);
+    let scope = resolve_bytecode_selector_or_service_root(
+        &document,
+        &service,
+        &selector,
+        "No matching instance",
+    )?;
+    let (segments, _) = build_editor_instance_path_parts(&document, &service);
+    let path_of = |index: usize| {
+        segments
+            .get(index)
+            .cloned()
+            .flatten()
+            .unwrap_or_else(|| vec![document.instances[index].name.clone()])
+            .join(".")
+    };
+    let matched = where_matches(&document, &service, scope.index, query)?;
+    let renames = matched
+        .iter()
+        .filter_map(|&index| {
+            let instance = &document.instances[index];
+            let name = instance.name.replace(from, to);
+            (name != instance.name).then(|| (instance.settings_id.clone(), path_of(index), name))
+        })
+        .collect::<Vec<_>>();
+    if renames.is_empty() {
+        bail!(
+            "No instance under {} matching '{query}' has '{from}' in its name",
+            path_of(scope.index)
+        );
+    }
+    if renames.len() > WHERE_LIMIT {
+        bail!(
+            "{} instances under {} match '{query}'; narrow the query ({WHERE_LIMIT} at most per call)",
+            renames.len(),
+            path_of(scope.index)
+        );
+    }
+    let mut changed_paths = BTreeSet::new();
+    for (settings_id, _, name) in &renames {
+        let result = bytecode_set_property_result(BytecodeSetPropertyArgs {
+            where_query: None,
+            input: BytecodeFileArgs::settings_file(settings_file.clone()),
+            selector: BytecodeInstanceSelectorArgs::by_settings_id(Some(settings_id.clone())),
+            property: vec!["Name".to_string()],
+            value_json: None,
+            value_str: Some(name.clone()),
+            value_num: None,
+            value_bool: None,
+            value_null: false,
+            scope: "metadata".to_string(),
+            override_packages: true,
+            push: false,
+            pretty: false,
+        })?;
+        if let Some(paths) = result.get("changedPaths").and_then(Value::as_array) {
+            changed_paths.extend(paths.iter().filter_map(Value::as_str).map(str::to_string));
+        }
+    }
+    let ids = renames
+        .iter()
+        .map(|(id, _, _)| id.clone())
+        .collect::<Vec<_>>();
+    let mut result = json!({
+        "ok": true,
+        "where": query,
+        "scope": path_of(scope.index),
+        "matched": matched.len(),
+        "renamed": renames.iter().map(|(_, path, name)| json!({ "from": path, "to": name })).collect::<Vec<_>>(),
+        "set": ["Name"],
+        "changedPaths": changed_paths,
+        "settingsFile": settings_file,
+    });
+    if push {
+        let pairs = renames
+            .iter()
+            .map(|(_, path, name)| {
+                (
+                    path.split('.').map(str::to_string).collect::<Vec<_>>(),
+                    name.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        result["studioRenamed"] = crate::bytecode::edit::rename_in_studio(&pairs)?;
+        result["push"] =
+            crate::bytecode::edit::push_stored_instances(settings_file.clone(), ids.clone())?;
+        let after = SettingsBytecode::read_file(&settings_file)?;
+        let (segments, _) = build_editor_instance_path_parts(&after, &service);
+        let indices = ids
+            .iter()
+            .filter_map(|id| {
+                after
+                    .instances
+                    .iter()
+                    .position(|instance| instance.settings_id == *id)
+            })
+            .collect::<Vec<_>>();
+        let paths = indices
+            .iter()
+            .filter_map(|&index| segments.get(index).cloned().flatten())
+            .collect::<Vec<_>>();
+        let read = &paths[..paths.len().min(WHERE_READ_BACK_LIMIT)];
+        if paths.len() > WHERE_READ_BACK_LIMIT {
+            result["studioLimit"] = json!(WHERE_READ_BACK_LIMIT);
+        }
+        let names = ["Name".to_string()];
+        if let Ok(studio) = crate::bytecode::edit::read_back_many_from_studio(read, &names, &[]) {
+            let rows = studio.as_array().cloned().unwrap_or_default();
+            let mut verified = Some(rows.len() == read.len());
+            for ((row, path), &index) in rows.iter().zip(read).zip(indices.iter()) {
+                match crate::bytecode::edit::read_back_verifies(
+                    row,
+                    path,
+                    &after.instances[index],
+                    &names,
+                    &[],
+                ) {
+                    Some(true) => {}
+                    Some(false) => verified = Some(false),
+                    None => {
+                        if verified == Some(true) {
+                            verified = None;
+                        }
+                    }
+                }
+            }
+            if let Some(verified) = verified {
+                result["verified"] = json!(verified);
+                if let Some(push) = result.get_mut("push").and_then(Value::as_object_mut) {
+                    push.remove("verified");
+                }
+            }
+            result["studio"] = studio;
+        }
+    }
+    print_json_output(&result, false)
 }
 
 /// The store indices under `scope_index` (every instance when the scope is
