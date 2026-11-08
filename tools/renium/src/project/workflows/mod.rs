@@ -1508,7 +1508,6 @@ fn init_files(
         (root.join("CLAUDE.md"), claude_instructions),
         (root.join(PROJECT_FILE_NAME), project),
     ];
-    files.extend(mcp_server_files(root)?);
     files.extend(
         agent_guides()?
             .into_iter()
@@ -1607,13 +1606,6 @@ pub(crate) fn refresh_agent_instructions(root: &Path) -> Result<()> {
     ] {
         write_bytes_if_changed(&path, &content)?;
     }
-    for (path, content) in mcp_server_files(root)? {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create {}", parent.display()))?;
-        }
-        write_bytes_if_changed(&path, &content)?;
-    }
     let destination = root.join(PROJECT_GUIDES_DIRECTORY);
     fs::create_dir_all(&destination)
         .with_context(|| format!("Failed to create {}", destination.display()))?;
@@ -1677,9 +1669,6 @@ pub(crate) fn refresh_outdated_agent_instructions(project: Option<&Path>) -> Res
     }
     if claude_pointer_outdated(&root) {
         changed.push("CLAUDE.md".to_string());
-    }
-    if mcp_server_files_outdated(&root) {
-        changed.push(".mcp.json".to_string());
     }
     if changed.is_empty() {
         return Ok(changed);
@@ -1864,69 +1853,6 @@ fn merged_instruction_file(path: &Path) -> Result<Vec<u8>> {
     }
     current.push_str(pointer);
     Ok(current.into_bytes())
-}
-
-/// The agent host configuration that serves Renium's commands as MCP tools:
-/// `.mcp.json` gains the `renium` server (`rbx mcp`) and the project's Claude
-/// Code settings allow project servers, so a session in the folder calls
-/// Renium in-process. Existing entries in either file are kept.
-fn mcp_server_files(root: &Path) -> Result<Vec<(PathBuf, Vec<u8>)>> {
-    let mut files = Vec::new();
-    let mcp_path = root.join(".mcp.json");
-    let mut mcp = read_json_object(&mcp_path)?;
-    let servers = mcp
-        .entry("mcpServers".to_string())
-        .or_insert_with(|| serde_json::Value::Object(Default::default()));
-    if !servers.is_object() {
-        *servers = serde_json::Value::Object(Default::default());
-    }
-    let servers = servers.as_object_mut().expect("object");
-    if !servers.contains_key("renium") {
-        servers.insert(
-            "renium".to_string(),
-            serde_json::json!({ "command": "rbx", "args": ["mcp"] }),
-        );
-        files.push((mcp_path, pretty_json(&serde_json::Value::Object(mcp))?));
-    }
-    let settings_path = root.join(".claude").join("settings.json");
-    let mut settings = read_json_object(&settings_path)?;
-    if settings.get("enableAllProjectMcpServers") != Some(&serde_json::Value::Bool(true)) {
-        settings.insert(
-            "enableAllProjectMcpServers".to_string(),
-            serde_json::Value::Bool(true),
-        );
-        files.push((
-            settings_path,
-            pretty_json(&serde_json::Value::Object(settings))?,
-        ));
-    }
-    Ok(files)
-}
-
-fn read_json_object(path: &Path) -> Result<serde_json::Map<String, serde_json::Value>> {
-    if !path.is_file() {
-        return Ok(Default::default());
-    }
-    let text =
-        fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
-    match serde_json::from_str::<serde_json::Value>(&text) {
-        Ok(serde_json::Value::Object(object)) => Ok(object),
-        _ => bail!(
-            "{} is not a JSON object; fix it before Renium adds its MCP server entry",
-            path.display()
-        ),
-    }
-}
-
-fn pretty_json(value: &serde_json::Value) -> Result<Vec<u8>> {
-    let mut text = serde_json::to_string_pretty(value)?;
-    text.push('\n');
-    Ok(text.into_bytes())
-}
-
-/// A project whose agent host configuration lacks the Renium MCP server.
-fn mcp_server_files_outdated(root: &Path) -> bool {
-    mcp_server_files(root).is_ok_and(|files| !files.is_empty())
 }
 
 /// A CLAUDE.md that still carries the read-me pointer instead of the import.

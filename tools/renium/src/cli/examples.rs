@@ -149,7 +149,6 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ),
     ("cs", "Examples:\n  rbx cs"),
     ("rv", "Examples:\n  rbx rv apply"),
-    ("mcp", "Examples:\n  rbx mcp"),
     ("pr", "Examples:\n  rbx pr \"Shop.BuyButton\" -p 1"),
     ("clk", "Examples:\n  rbx clk 450 320 -p 1"),
     ("ky", "Examples:\n  rbx ky E -p 1"),

@@ -2,7 +2,6 @@ pub(crate) mod agent_hints;
 pub(crate) mod build;
 pub(crate) mod context;
 pub(crate) mod crash;
-pub(crate) mod mcp;
 pub(crate) mod output;
 pub(crate) mod report;
 pub(crate) mod setup;

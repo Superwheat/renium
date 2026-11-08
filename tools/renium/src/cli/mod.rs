@@ -428,11 +428,6 @@ pub(super) enum Commands {
     )]
     BridgeDaemon(BridgeDaemonArgs),
     #[command(
-        name = "mcp",
-        about = "Serve the everyday commands as Model Context Protocol tools on stdio (for an agent host's .mcp.json)"
-    )]
-    Mcp,
-    #[command(
         name = "ed",
         alias = "explorer-daemon",
         about = "Run the explorer daemon for the editor",

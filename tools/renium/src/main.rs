@@ -261,7 +261,6 @@ fn resumes_global_audio(command: &Commands) -> bool {
             | Commands::UpdateHelper(_)
             | Commands::NativeProbe(_)
             | Commands::BridgeDaemon(_)
-            | Commands::Mcp
             | Commands::CheckLuau(_)
             | Commands::Report(_)
             | Commands::Plugin(_)
@@ -282,7 +281,6 @@ fn checks_agent_update(command: &Commands) -> bool {
             | Commands::RecordEnd(_)
             | Commands::RecordReview(_)
             | Commands::BridgeDaemon(_)
-            | Commands::Mcp
             | Commands::ExplorerDaemon(_)
             | Commands::PerformanceWorker
             | Commands::AudioWorker(_)

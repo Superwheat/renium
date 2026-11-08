@@ -101,7 +101,6 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::ExportModel(args) => export_model_command(args, project),
         Commands::Pull(args) => pull_from_studio(args),
         Commands::BridgeDaemon(args) => bridge_daemon(args),
-        Commands::Mcp => crate::app::mcp::mcp_server(),
         Commands::ExplorerDaemon(args) => explorer_daemon(args),
         Commands::GetConsoleOutput(args) => get_console_output_command(args),
         Commands::ExecuteLuau(args) => execute_luau_command(args),
