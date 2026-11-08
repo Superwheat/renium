@@ -3007,7 +3007,10 @@ fn reconcile_duplicate_matching_includes_implicit_sibling_defaults() {
 
 #[test]
 fn a_part_position_becomes_the_translation_of_its_cframe() {
-    use crate::bytecode::edit::cframe_at_position;
+    use crate::bytecode::edit::cframe_from_parts;
+    let cframe_at_position = |current: Option<&Value>, position: &Value| {
+        cframe_from_parts(current, Some(position), None)
+    };
     let fresh = cframe_at_position(
         None,
         &json!({"_type": "Vector3", "x": 24, "y": 0.5, "z": -12}),

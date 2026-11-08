@@ -2486,6 +2486,39 @@ pub(crate) fn bytecode_rename_where(
     print_json_output(&result, false)
 }
 
+/// Properties Studio derives rather than saves become the saved property:
+/// Position and Orientation fold into the CFrame of anything that has one,
+/// and Lighting's ClockTime becomes TimeOfDay.
+fn fold_derived_property(
+    document: &mut SettingsBytecode,
+    index: usize,
+    property: &mut String,
+    value: &mut Value,
+) -> Result<()> {
+    let instance = &mut document.instances[index];
+    let has_cframe = crate::bytecode::edit::has_cframe(&instance.class_name);
+    if has_cframe && property.eq_ignore_ascii_case("position") {
+        *value = crate::bytecode::edit::cframe_from_parts(
+            instance.properties.get("CFrame"),
+            Some(value),
+            None,
+        )?;
+        *property = "CFrame".to_string();
+    } else if has_cframe && property.eq_ignore_ascii_case("orientation") {
+        *value = crate::bytecode::edit::cframe_from_parts(
+            instance.properties.get("CFrame"),
+            None,
+            Some(value),
+        )?;
+        *property = "CFrame".to_string();
+    } else if instance.class_name == "Lighting" && property.eq_ignore_ascii_case("clocktime") {
+        *value = crate::bytecode::edit::time_of_day_from_hours(value)?;
+        *property = "TimeOfDay".to_string();
+        instance.properties.remove("ClockTime");
+    }
+    Ok(())
+}
+
 /// The store indices under `scope_index` (every instance when the scope is
 /// the service root) that match a bulk-read query.
 pub(crate) fn where_matches(
@@ -2591,22 +2624,7 @@ pub(crate) fn bytecode_set_property_result(mut args: BytecodeSetPropertyArgs) ->
         "No matching instance",
     )?;
     let index = resolved.index;
-    if args.property.eq_ignore_ascii_case("position")
-        && crate::bytecode::edit::is_base_part(&document.instances[index].class_name)
-    {
-        value = crate::bytecode::edit::cframe_at_position(
-            document.instances[index].properties.get("CFrame"),
-            &value,
-        )?;
-        args.property = "CFrame".to_string();
-    }
-    if args.property.eq_ignore_ascii_case("clocktime")
-        && document.instances[index].class_name == "Lighting"
-    {
-        value = crate::bytecode::edit::time_of_day_from_hours(&value)?;
-        args.property = "TimeOfDay".to_string();
-        document.instances[index].properties.remove("ClockTime");
-    }
+    fold_derived_property(&mut document, index, &mut args.property, &mut value)?;
     reject_package_link_instance_mutation(&document, index, "edited")?;
     reject_viewport_camera_edit(&document, index)?;
     if !args.override_packages {

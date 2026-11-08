@@ -12,6 +12,7 @@
 - `rbx play -s --console N` returns the last N server console entries with the start result, after `--until` when given; `--stop-after` then stops the session, so one call runs a play check.
 - `rbx play -s --at PATH` stands the first player's character on an instance (or at a position `x,y,z`) once it spawns, before `--until` runs, so a touch check needs no hand-written move.
 - `rbx play -s --console N` also returns the client's console as `clientConsole` in ordinary Play, so a client-side check needs no second session.
+- `Position` and `Orientation` fold into the CFrame of any instance that has one (parts, attachments, cameras), and a CFrame value takes `"orientation": [rx, ry, rz]` in degrees next to its position. Setting an attachment's Position used to be refused, and a rotation needed the nine matrix numbers.
 - `rbx play --result` works with `--until-console`, and `--client-result 'LUAU'` evaluates once on the first client after either wait holds (`clientResult`), so a play check that needs state after a console line is one call instead of a second session.
 - `rbx cp -n NAME --push` names the copy and pushes it in the same call, with `studio` and `verified` in the result; a copy used to need `cp`, then `rn`, then a push.
 - A BrickColor property takes a palette name such as `"Bright red"` in `rbx ba` and `rbx bs`, stored in the canonical numbered form.

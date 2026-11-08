@@ -67,13 +67,18 @@ fn canonical_new_instance_properties(
     }
     let mut out = Map::new();
     let mut position = None;
+    let mut orientation = None;
     for (name, value) in properties {
         if name.eq_ignore_ascii_case("Source") {
             out.insert("Source".to_string(), value);
             continue;
         }
-        if name.eq_ignore_ascii_case("Position") && is_base_part(class_name) {
+        if name.eq_ignore_ascii_case("Position") && has_cframe(class_name) {
             position = Some(value);
+            continue;
+        }
+        if name.eq_ignore_ascii_case("Orientation") && has_cframe(class_name) {
+            orientation = Some(value);
             continue;
         }
         let Some(logical) =
@@ -84,16 +89,18 @@ fn canonical_new_instance_properties(
         let value = crate::rbx::encode::typed_store_property_value(class_name, logical, value)?;
         out.insert(logical.to_string(), value);
     }
-    if let Some(position) = position {
-        let cframe = cframe_at_position(out.get("CFrame"), &position)?;
+    if position.is_some() || orientation.is_some() {
+        let cframe = cframe_from_parts(out.get("CFrame"), position.as_ref(), orientation.as_ref())?;
         out.insert("CFrame".to_string(), cframe);
     }
     Ok(out)
 }
 
-pub(crate) fn is_base_part(class_name: &str) -> bool {
+/// Whether instances of the class carry a CFrame, so Position and
+/// Orientation (which Studio never saves) fold into it.
+pub(crate) fn has_cframe(class_name: &str) -> bool {
     rbx_reflection_database::get().is_ok_and(|database| {
-        crate::rbx::decode::rbx_reflection_class_is_a(database, class_name, "BasePart")
+        crate::rbx::encode::rbx_property_descriptor(database, class_name, "CFrame").is_some()
     })
 }
 
@@ -135,9 +142,14 @@ pub(crate) fn time_of_day_from_hours(value: &Value) -> Result<Value> {
     )))
 }
 
-pub(crate) fn cframe_at_position(current: Option<&Value>, position: &Value) -> Result<Value> {
-    let [x, y, z] = vector3_components(position)
-        .context("Position needs x, y and z numbers, as {\"x\":..,\"y\":..,\"z\":..} or [x,y,z]")?;
+/// The stored CFrame with its position and/or rotation replaced: `position`
+/// is a Vector3, `orientation` the Roblox Orientation (degrees about X, Y
+/// and Z, applied as Studio does, Y then X then Z).
+pub(crate) fn cframe_from_parts(
+    current: Option<&Value>,
+    position: Option<&Value>,
+    orientation: Option<&Value>,
+) -> Result<Value> {
     let mut components = current
         .and_then(|value| value.get("components"))
         .and_then(Value::as_array)
@@ -150,10 +162,50 @@ pub(crate) fn cframe_at_position(current: Option<&Value>, position: &Value) -> R
             out
         })
         .unwrap_or([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
-    components[0] = x;
-    components[1] = y;
-    components[2] = z;
+    if let Some(position) = position {
+        let [x, y, z] = vector3_components(position).context(
+            "Position needs x, y and z numbers, as {\"x\":..,\"y\":..,\"z\":..} or [x,y,z]",
+        )?;
+        components[0] = x;
+        components[1] = y;
+        components[2] = z;
+    }
+    if let Some(orientation) = orientation {
+        let degrees = vector3_components(orientation)
+            .context("Orientation needs x, y and z degrees, as [rx,ry,rz]")?;
+        let rows = rotation_rows_from_orientation(degrees);
+        for (slot, value) in components[3..].iter_mut().zip(rows.iter().flatten()) {
+            *slot = *value;
+        }
+    }
     Ok(json!({ "_type": "CFrame", "components": components }))
+}
+
+/// Studio's Orientation is Euler angles in degrees applied Y, then X, then
+/// Z (`CFrame.fromOrientation`); the rows of the resulting rotation matrix.
+pub(crate) fn rotation_rows_from_orientation([rx, ry, rz]: [f64; 3]) -> [[f64; 3]; 3] {
+    let (sx, cx) = rx.to_radians().sin_cos();
+    let (sy, cy) = ry.to_radians().sin_cos();
+    let (sz, cz) = rz.to_radians().sin_cos();
+    let y = [[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]];
+    let x = [[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]];
+    let z = [[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]];
+    let multiply = |a: [[f64; 3]; 3], b: [[f64; 3]; 3]| {
+        let mut out = [[0.0; 3]; 3];
+        for (i, row) in out.iter_mut().enumerate() {
+            for (j, cell) in row.iter_mut().enumerate() {
+                *cell = (0..3).map(|k| a[i][k] * b[k][j]).sum();
+            }
+        }
+        out
+    };
+    let mut rows = multiply(multiply(y, x), z);
+    for cell in rows.iter_mut().flatten() {
+        if cell.abs() < 1e-9 {
+            *cell = 0.0;
+        }
+    }
+    rows
 }
 
 /// What a new store instance needs; the CLI and script imports both build it.

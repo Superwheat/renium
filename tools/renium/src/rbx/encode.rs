@@ -1878,6 +1878,27 @@ fn json_to_rbx_cframe(value: &Value) -> Option<RbxCFrame> {
                 if rows.len() != 3 {
                     return None;
                 }
+                // Three numbers are Studio's Orientation in degrees; three
+                // rows of three are the rotation matrix itself.
+                if rows.iter().all(Value::is_number) {
+                    let degrees = [
+                        json_f32(&rows[0])?,
+                        json_f32(&rows[1])?,
+                        json_f32(&rows[2])?,
+                    ];
+                    let rotation = crate::bytecode::edit::rotation_rows_from_orientation([
+                        f64::from(degrees[0]),
+                        f64::from(degrees[1]),
+                        f64::from(degrees[2]),
+                    ]);
+                    let mut out = [[0.0f32; 3]; 3];
+                    for (row_out, row) in out.iter_mut().zip(rotation) {
+                        for (slot, item) in row_out.iter_mut().zip(row) {
+                            *slot = item as f32;
+                        }
+                    }
+                    return Some(out);
+                }
                 let mut out = [[0.0f32; 3]; 3];
                 for (row_out, row) in out.iter_mut().zip(rows) {
                     let row = row.as_array()?;
@@ -2469,6 +2490,35 @@ mod tests {
         );
         assert!(stored("Part", "Material", json!("Neon")).is_object());
         assert!(typed_store_property_value("Part", "Material", json!("NoSuchMaterial")).is_err());
+    }
+
+    #[test]
+    fn orientation_degrees_turn_into_a_rotation() {
+        let rows = crate::bytecode::edit::rotation_rows_from_orientation([0.0, 90.0, 0.0]);
+        assert_eq!(rows, [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]]);
+        let rows = crate::bytecode::edit::rotation_rows_from_orientation([90.0, 0.0, 0.0]);
+        assert_eq!(rows, [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]]);
+        let cframe = crate::bytecode::edit::cframe_from_parts(
+            None,
+            Some(&json!([31, 5, 0])),
+            Some(&json!([0, 0, 90])),
+        )
+        .unwrap();
+        let components = cframe["components"].as_array().unwrap();
+        assert_eq!(components[0], 31.0);
+        assert_eq!(components[1], 5.0);
+        assert!(
+            (components[3].as_f64().unwrap()).abs() < 1e-9,
+            "{components:?}"
+        );
+        assert_eq!(components[4], -1.0);
+        let stored = typed_store_property_value(
+            "Part",
+            "CFrame",
+            json!({"position": [1, 2, 3], "orientation": [0, 90, 0]}),
+        )
+        .unwrap();
+        assert_eq!(stored["components"][5], 1.0, "{stored}");
     }
 
     #[test]
