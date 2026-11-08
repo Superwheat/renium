@@ -488,6 +488,20 @@ pub(crate) fn studio_device_result(
 }
 
 fn wait_for_player_bridge(bridge: &BridgeServer, player: &str, wait_seconds: f64) -> Result<()> {
+    // A client index above the number of clients the running session has can
+    // never match; say so now instead of after the whole wait.
+    if let Ok(index) = player.parse::<usize>() {
+        let clients = bridge
+            .list_bridge_clients()
+            .iter()
+            .filter(|entry| entry["role"].as_str() == Some("client"))
+            .count();
+        if clients > 0 && index > clients {
+            bail!(
+                "Player selector '{player}' asks for client {index}, but the session has {clients}; ordinary Play has one client, `rbx play --add-players N` adds more"
+            );
+        }
+    }
     if bridge.wait_for_ready_player(player, Duration::from_secs_f64(wait_seconds.max(1.0))) {
         return Ok(());
     }
@@ -948,7 +962,16 @@ fn compact_play_result(result: &mut Value, named_players: bool) {
                     .collect::<Vec<_>>()
             )
         } else {
-            json!(clients.len())
+            // Ordinary Play lists the server and the one client; the count
+            // that matters is the players.
+            let players = clients
+                .iter()
+                .filter(|client| {
+                    client.get("role").and_then(Value::as_str) != Some("server")
+                        && client.get("playerName").is_some()
+                })
+                .count();
+            json!(if players > 0 { players } else { clients.len() })
         };
         map.insert("clients".to_string(), value);
     }
@@ -3303,9 +3326,9 @@ fn wait_probe_code(body: &str, result_body: Option<&str>, slice: f64, interval: 
             "\t\t\tlocal resultOk, result = pcall(function()\n\
              {result_body}\n\
              \t\t\tend)\n\
-             \t\t\treturn true, tostring(value), resultOk, result"
+             \t\t\treturn true, (type(value) == 'table' and game:GetService('HttpService'):JSONEncode(value) or tostring(value)), resultOk, result"
         ),
-        None => "\t\t\treturn true, tostring(value)".to_string(),
+        None => "\t\t\treturn true, (type(value) == 'table' and game:GetService('HttpService'):JSONEncode(value) or tostring(value))".to_string(),
     };
     format!(
         "local deadline = os.clock() + {slice}\n\
@@ -4352,33 +4375,45 @@ fn request_play_runtimes_to_stop(
     let edit = inventory
         .iter()
         .find(|row| row["role"] == BRIDGE_ROLE_EDIT && row["runtimeId"] == edit_runtime_id);
-    for client in play_stop_runtimes(clients, edit) {
-        let target = match client.get("role").and_then(Value::as_str) {
-            Some(BRIDGE_ROLE_PLAY_SERVER) => BridgeTarget::Main,
-            Some(BRIDGE_ROLE_PLAY_CLIENT) => BridgeTarget::Client,
-            _ => continue,
-        };
-        let Some(runtime_id) = client.get("runtimeId").and_then(Value::as_str) else {
-            continue;
-        };
-        let answer = bridge.call_for_runtime_with_timeout(
-            "startStopPlay",
-            Value::Object(params.clone()),
-            target,
-            runtime_id,
-            Some(Duration::from_millis(1_100)),
-        );
-        log_global(
-            5,
-            format_args!(
-                "[renium] play stop request to {target:?} {runtime_id}: {}",
-                match &answer {
-                    Ok(value) => serde_json::to_string(value).unwrap_or_default(),
-                    Err(error) => format!("error {error:#}"),
-                }
-            ),
-        );
-    }
+    // The runtimes are told at the same time, with a short wait: a runtime
+    // that is already tearing down never answers, and the Edit window's own
+    // stop call is what ends the session.
+    let targets = play_stop_runtimes(clients, edit)
+        .into_iter()
+        .filter_map(|client| {
+            let target = match client.get("role").and_then(Value::as_str) {
+                Some(BRIDGE_ROLE_PLAY_SERVER) => BridgeTarget::Main,
+                Some(BRIDGE_ROLE_PLAY_CLIENT) => BridgeTarget::Client,
+                _ => return None,
+            };
+            let runtime_id = client.get("runtimeId").and_then(Value::as_str)?.to_string();
+            Some((target, runtime_id))
+        })
+        .collect::<Vec<_>>();
+    thread::scope(|scope| {
+        for (target, runtime_id) in &targets {
+            let params = params.clone();
+            scope.spawn(move || {
+                let answer = bridge.call_for_runtime_with_timeout(
+                    "startStopPlay",
+                    Value::Object(params),
+                    *target,
+                    runtime_id,
+                    Some(Duration::from_millis(600)),
+                );
+                log_global(
+                    5,
+                    format_args!(
+                        "[renium] play stop request to {target:?} {runtime_id}: {}",
+                        match &answer {
+                            Ok(value) => serde_json::to_string(value).unwrap_or_default(),
+                            Err(error) => format!("error {error:#}"),
+                        }
+                    ),
+                );
+            });
+        }
+    });
 }
 
 /// This Edit window's play runtimes, split into running ones and ones whose
@@ -5332,7 +5367,7 @@ mod wait_condition_tests {
     fn probe_code_returns_the_observation_only_after_the_condition_holds() {
         let plain = wait_probe_code("return (ready\n)", None, 100.0, 0.25);
         validate_luau_syntax(&plain).unwrap();
-        assert!(plain.contains("return true, tostring(value)"));
+        assert!(plain.contains("return true, (type(value) == 'table' and game:GetService('HttpService'):JSONEncode(value) or tostring(value))"));
         assert!(!plain.contains("resultOk"));
 
         let typed = wait_probe_code(
@@ -5348,7 +5383,7 @@ mod wait_condition_tests {
             .unwrap();
         assert!(condition < observation);
         assert!(typed.contains("local resultOk, result = pcall(function()"));
-        assert!(typed.contains("return true, tostring(value), resultOk, result"));
+        assert!(typed.contains("return true, (type(value) == 'table' and game:GetService('HttpService'):JSONEncode(value) or tostring(value)), resultOk, result"));
         assert!(
             typed.contains("if os.clock() >= deadline then return false, tostring(detail) end")
         );
