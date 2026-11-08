@@ -1255,12 +1255,72 @@ impl BridgeServer {
     /// it must not read the process-wide selection those requests hold. A
     /// bare client selector with several clients takes the one the dispatch
     /// would choose: connected on the most channels, then focused last.
+    /// How many Play runtimes of `target` the Edit window `owner` has connected.
+    pub(crate) fn play_runtime_count(&self, target: BridgeTarget, owner: &str) -> usize {
+        self.play_runtimes_for_owner(target, owner).0.len()
+    }
+
     pub(crate) fn play_runtime_for_request(
         &self,
         target: BridgeTarget,
         player: Option<&str>,
         owner: &str,
     ) -> Option<String> {
+        let (runtimes, presence) = self.play_runtimes_for_owner(target, owner);
+        match (target, player) {
+            (BridgeTarget::Client, Some(selector))
+                if selector.parse::<usize>().is_ok_and(|index| index > 0) =>
+            {
+                let index = selector.parse::<usize>().ok()?;
+                runtimes.get(index - 1).map(|(_, id)| id.clone())
+            }
+            (BridgeTarget::Client, Some(selector)) => {
+                let mut matched = runtimes.iter().filter(|(_, id)| {
+                    self.channels.iter().any(|channel| {
+                        Self::cached_channel_snapshots(channel)
+                            .iter()
+                            .any(|snapshot| {
+                                snapshot.bridge_info.runtime_id == *id
+                                    && Self::player_matches_selector(
+                                        &snapshot.bridge_info,
+                                        selector,
+                                    )
+                            })
+                    })
+                });
+                let first = matched.next()?;
+                matched.next().is_none().then(|| first.1.clone())
+            }
+            (BridgeTarget::Client, None) => runtimes
+                .iter()
+                .max_by(|(_, left), (_, right)| {
+                    let (left_ports, left_focus) = &presence[left];
+                    let (right_ports, right_focus) = &presence[right];
+                    left_ports
+                        .len()
+                        .cmp(&right_ports.len())
+                        .then_with(|| left_focus.cmp(right_focus))
+                })
+                .map(|(_, id)| id.clone()),
+            _ => match runtimes.as_slice() {
+                [(_, runtime)] => Some(runtime.clone()),
+                _ => None,
+            },
+        }
+    }
+
+    /// The owner's routable Play runtimes of `target`, as (lower-case player
+    /// name, runtime id) sorted by name, with each runtime's ports and last
+    /// focus time.
+    #[allow(clippy::type_complexity)]
+    fn play_runtimes_for_owner(
+        &self,
+        target: BridgeTarget,
+        owner: &str,
+    ) -> (
+        Vec<(String, String)>,
+        HashMap<String, (HashSet<u16>, Instant)>,
+    ) {
         let mut runtimes: Vec<(String, String)> = Vec::new();
         let mut presence: HashMap<String, (HashSet<u16>, Instant)> = HashMap::new();
         for channel in &self.channels {
@@ -1302,46 +1362,7 @@ impl BridgeServer {
             }
         }
         runtimes.sort_unstable();
-        match (target, player) {
-            (BridgeTarget::Client, Some(selector))
-                if selector.parse::<usize>().is_ok_and(|index| index > 0) =>
-            {
-                let index = selector.parse::<usize>().ok()?;
-                runtimes.get(index - 1).map(|(_, id)| id.clone())
-            }
-            (BridgeTarget::Client, Some(selector)) => {
-                let mut matched = runtimes.iter().filter(|(_, id)| {
-                    self.channels.iter().any(|channel| {
-                        Self::cached_channel_snapshots(channel)
-                            .iter()
-                            .any(|snapshot| {
-                                snapshot.bridge_info.runtime_id == *id
-                                    && Self::player_matches_selector(
-                                        &snapshot.bridge_info,
-                                        selector,
-                                    )
-                            })
-                    })
-                });
-                let first = matched.next()?;
-                matched.next().is_none().then(|| first.1.clone())
-            }
-            (BridgeTarget::Client, None) => runtimes
-                .iter()
-                .max_by(|(_, left), (_, right)| {
-                    let (left_ports, left_focus) = &presence[left];
-                    let (right_ports, right_focus) = &presence[right];
-                    left_ports
-                        .len()
-                        .cmp(&right_ports.len())
-                        .then_with(|| left_focus.cmp(right_focus))
-                })
-                .map(|(_, id)| id.clone()),
-            _ => match runtimes.as_slice() {
-                [(_, runtime)] => Some(runtime.clone()),
-                _ => None,
-            },
-        }
+        (runtimes, presence)
     }
 
     fn edit_snapshots(&self, runtime_id: Option<&str>) -> Vec<BridgeSocketSnapshot> {

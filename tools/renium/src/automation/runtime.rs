@@ -4133,7 +4133,10 @@ fn play_gate_for_owner(
                 owner: owner.to_string(),
             }));
         }
-        if matches!(target, BridgeTarget::Main | BridgeTarget::Edit) || Instant::now() >= deadline {
+        if matches!(target, BridgeTarget::Main | BridgeTarget::Edit)
+            || Instant::now() >= deadline
+            || play_selector_cannot_match(bridge, target, player, owner)
+        {
             return Ok(
                 play_selector_gate(target, player, owner).map(|gate| PlayGate::Selector {
                     gate,
@@ -4148,6 +4151,28 @@ fn play_gate_for_owner(
         }
         std::thread::sleep(PLAY_GATE_POLL);
     }
+}
+
+/// A Play selector that no wait can satisfy: the owner has no Play runtime at
+/// all (no session), or a client index above the clients the session has
+/// (a session whose clients are still joining has a server and none yet).
+/// The request then fails at once with the operation's own message instead
+/// of after the bridge wait.
+fn play_selector_cannot_match(
+    bridge: &BridgeServer,
+    target: BridgeTarget,
+    player: Option<&str>,
+    owner: &str,
+) -> bool {
+    let clients = bridge.play_runtime_count(BridgeTarget::Client, owner);
+    if clients == 0 && bridge.play_runtime_count(BridgeTarget::Server, owner) == 0 {
+        return true;
+    }
+    clients > 0
+        && matches!(target, BridgeTarget::Client)
+        && player
+            .and_then(|selector| selector.parse::<usize>().ok())
+            .is_some_and(|index| index > clients)
 }
 
 fn play_selector_gate(target: BridgeTarget, player: Option<&str>, owner: &str) -> Option<String> {
@@ -4500,9 +4525,34 @@ mod tests {
     #[test]
     fn a_client_request_waits_for_its_client_and_takes_that_runtimes_gate() {
         use crate::studio::bridge::BRIDGE_ROLE_PLAY_CLIENT;
+        use crate::studio::bridge::BRIDGE_ROLE_PLAY_SERVER;
         use crate::studio::bridge::routing_tests::{connect, edit_info, fixture, play_info};
         let bridge = fixture();
         let _edit_a = connect(&bridge, 0, edit_info("edit-a", 20));
+        let started = Instant::now();
+        assert_eq!(
+            play_gate_for_owner(
+                &bridge,
+                BridgeTarget::Client,
+                Some("1"),
+                Some("edit-a"),
+                Instant::now() + Duration::from_secs(5),
+                None,
+            )
+            .map_err(|failure| failure.0.m)
+            .unwrap(),
+            Some(PlayGate::Selector {
+                gate: "edit-a/client/1".into(),
+                owner: Some("edit-a".into()),
+            }),
+            "with no Play runtime at all the selector is unanswerable at once"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let _server_a = connect(
+            &bridge,
+            0,
+            play_info("server-a", "edit-a", BRIDGE_ROLE_PLAY_SERVER, "", 20),
+        );
         let client = || {
             play_info(
                 "client-a1",
@@ -4568,7 +4618,10 @@ mod tests {
                 owner: Some("edit-a".into()),
             })
         );
-        assert!(started.elapsed() >= Duration::from_millis(150));
+        assert!(
+            started.elapsed() < Duration::from_millis(150),
+            "an index above the session's client count does not wait"
+        );
         let started = Instant::now();
         assert_eq!(
             play_gate_for_owner(
@@ -4581,8 +4634,13 @@ mod tests {
             )
             .map_err(|failure| failure.0.m)
             .unwrap(),
-            None,
-            "a bare selector with no play server is an Edit request at once"
+            Some(PlayGate::Runtime {
+                target: BridgeTarget::Main,
+                player: None,
+                runtime_id: "server-a".into(),
+                owner: "edit-a".into(),
+            }),
+            "a bare selector runs on the play server at once"
         );
         assert!(started.elapsed() < Duration::from_secs(1));
     }

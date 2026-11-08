@@ -13,6 +13,8 @@
 - `rbx play -s --at PATH` stands the first player's character on an instance (or at a position `x,y,z`) once it spawns, before `--until` runs, so a touch check needs no hand-written move.
 - `rbx play -s --console N` also returns the client's console as `clientConsole` in ordinary Play, so a client-side check needs no second session.
 - Every `rbx` command refreshes `RENIUM/map.md`, a compact map of the project's stores (each service's instances two levels deep, sibling runs folded, the services without a store), and the agent guide points agents at it instead of an opening `rbx tr`.
+- A Play-targeted call (`rbx lc`, `-p N`, `--server`) fails at once when no Play session is running or the index is above the session's client count, instead of waiting out the bridge wait twice (16 s).
+- `rbx play -x` returns as soon as the test has ended instead of also waiting out the controller's 2 s restart settle; the next start still waits for the settle.
 - Stopping a Play session asks the server and client runtimes to stop at the same time with a short wait, instead of one after the other with 1.1 s each; a stop used to take a constant 2 s before Studio's own teardown was even checked.
 - `rbx play --until` returns a table value as JSON instead of `table: 0x...`; the compact start result's `clients` counts players, not bridges; and a client selector above the session's client count fails at once instead of after the connection wait.
 - `Position` and `Orientation` fold into the CFrame of any instance that has one (parts, attachments, cameras), and a CFrame value takes `"orientation": [rx, ry, rz]` in degrees next to its position. Setting an attachment's Position used to be refused, and a rotation needed the nine matrix numbers.

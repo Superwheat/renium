@@ -488,19 +488,30 @@ pub(crate) fn studio_device_result(
 }
 
 fn wait_for_player_bridge(bridge: &BridgeServer, player: &str, wait_seconds: f64) -> Result<()> {
-    // A client index above the number of clients the running session has can
-    // never match; say so now instead of after the whole wait.
-    if let Ok(index) = player.parse::<usize>() {
-        let clients = bridge
-            .list_bridge_clients()
-            .iter()
-            .filter(|entry| entry["role"].as_str() == Some("client"))
-            .count();
-        if clients > 0 && index > clients {
-            bail!(
-                "Player selector '{player}' asks for client {index}, but the session has {clients}; ordinary Play has one client, `rbx play --add-players N` adds more"
-            );
-        }
+    // Without a Play session nothing can join, and a client index above the
+    // number of clients the running session has can never match; say so now
+    // instead of after the whole wait.
+    let runtimes = bridge.list_bridge_clients();
+    let servers = runtimes
+        .iter()
+        .filter(|entry| entry["role"] == BRIDGE_ROLE_PLAY_SERVER)
+        .count();
+    let clients = runtimes
+        .iter()
+        .filter(|entry| entry["role"] == BRIDGE_ROLE_PLAY_CLIENT)
+        .count();
+    if servers == 0 && clients == 0 {
+        bail!(
+            "No Play session is running, so no client matches player selector '{player}'; `rbx play -s` starts one"
+        );
+    }
+    if let Ok(index) = player.parse::<usize>()
+        && clients > 0
+        && index > clients
+    {
+        bail!(
+            "Player selector '{player}' asks for client {index}, but the session has {clients}; ordinary Play has one client, `rbx play --add-players N` adds more"
+        );
     }
     if bridge.wait_for_ready_player(player, Duration::from_secs_f64(wait_seconds.max(1.0))) {
         return Ok(());
@@ -4314,10 +4325,14 @@ fn play_status_is_running(status: &Value) -> bool {
         || status.get("starting").and_then(Value::as_bool) == Some(true)
 }
 
+/// A session is stopped once the engine and the controller report no run and
+/// no pending execution. `readyForStart` stays false for the controller's
+/// restart settle after that; `wait_for_studio_play_ready` waits for it before
+/// the next start, so a stop does not.
 fn play_status_is_stopped(status: &Value) -> bool {
     !play_status_is_running(status)
         && status.get("running").and_then(Value::as_bool) == Some(false)
-        && status.get("readyForStart").and_then(Value::as_bool) == Some(true)
+        && status.get("executing").and_then(Value::as_bool) != Some(true)
 }
 
 fn retire_play_clients(bridge: &BridgeServer, clients: &[Value]) {
@@ -4923,12 +4938,18 @@ mod play_state_tests {
     }
 
     #[test]
-    fn only_a_ready_controller_counts_as_stopped() {
+    fn a_settling_controller_counts_as_stopped_but_a_pending_execution_does_not() {
         assert!(play_status_is_stopped(&json!({
             "running": false, "starting": false, "readyForStart": true
         })));
-        assert!(!play_status_is_stopped(&json!({
+        assert!(play_status_is_stopped(&json!({
             "running": false, "starting": false, "readyForStart": false
+        })));
+        assert!(!play_status_is_stopped(&json!({
+            "running": false, "starting": false, "readyForStart": false, "executing": true
+        })));
+        assert!(!play_status_is_stopped(&json!({
+            "running": false, "starting": true, "readyForStart": false
         })));
     }
 

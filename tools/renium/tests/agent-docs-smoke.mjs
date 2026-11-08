@@ -11,7 +11,11 @@ const agentsPath = path.join(repository, "tools", "renium", "renium-agents.md");
 const guidesPath = path.join(repository, "tools", "renium", "renium-guides");
 const rootGuide = fs.readFileSync(agentsPath, "utf8");
 const guideNames = fs.readdirSync(guidesPath).filter((name) => name.endsWith(".md")).sort();
-const routedGuideNames = [...rootGuide.matchAll(/`RENIUM\/([^`]+\.md)`/g)].map((match) => match[1]).sort();
+const generatedFiles = new Set(["map.md"]);
+const routedGuideNames = [...rootGuide.matchAll(/`RENIUM\/([^`]+\.md)`/g)]
+  .map((match) => match[1])
+  .filter((name) => !generatedFiles.has(name))
+  .sort();
 
 if (JSON.stringify(routedGuideNames) !== JSON.stringify(guideNames)) {
   throw new Error(`Root agent guide routes ${routedGuideNames.join(", ")}; expected ${guideNames.join(", ")}`);
