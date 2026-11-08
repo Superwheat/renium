@@ -12,6 +12,7 @@
 - `rbx play -s --console N` returns the last N server console entries with the start result, after `--until` when given; `--stop-after` then stops the session, so one call runs a play check.
 - `rbx play -s --at PATH` stands the first player's character on an instance (or at a position `x,y,z`) once it spawns, before `--until` runs, so a touch check needs no hand-written move.
 - `rbx play -s --console N` also returns the client's console as `clientConsole` in ordinary Play, so a client-side check needs no second session.
+- `rbx play -s --until-console TEXT` returns as soon as a server or client console line contains the text, instead of waiting a fixed game time; the result's `untilConsole` names the side, the seconds and the matching entry, or `timedOut`.
 - A push read-back reports `Tags` through `GetTags`, so `rbx bs -p 'Tags=[...]' --push` verifies like any property, and the agent guide sets tags with `bs` instead of a Luau edit.
 - A push no longer fails with "Roblox did not retain Color" on a part whose stored color is not an exact byte value: the engine keeps part colors as bytes and truncates (0.3 becomes 76/255), so the plugin's retention check now allows one byte per channel.
 - The agent guide says a `--where` edit lists every match it touched, so agents act directly instead of listing first.

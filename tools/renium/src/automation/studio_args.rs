@@ -187,6 +187,7 @@ pub(super) fn play(operation: u16, parameters: &Value) -> Result<StartStopPlayAr
         leave,
         mode: string(object, "mode"),
         until: None,
+        until_console: None,
         until_timeout: 120.0,
         result: None,
         console: None,

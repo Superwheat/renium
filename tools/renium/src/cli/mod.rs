@@ -1825,10 +1825,16 @@ pub(super) struct StartStopPlayArgs {
     )]
     pub(super) until: Option<String>,
     #[arg(
-        help = "Seconds to wait for --until",
+        help = "After starting (and --until), wait until a server or client console line contains this text; the result's `untilConsole` names the side and the seconds it took",
         long,
-        default_value_t = 120.0,
-        requires = "until"
+        value_name = "TEXT",
+        conflicts_with = "stop"
+    )]
+    pub(super) until_console: Option<String>,
+    #[arg(
+        help = "Seconds to wait for --until and --until-console",
+        long,
+        default_value_t = 120.0
     )]
     pub(super) until_timeout: f64,
     #[arg(

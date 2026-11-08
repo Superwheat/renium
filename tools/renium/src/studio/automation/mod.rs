@@ -609,47 +609,88 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
             }
         }
     }
+    // Ordinary Play has one client; its console answers the client-side
+    // half of the same check without a second session.
+    let has_client = result
+        .get("clients")
+        .and_then(Value::as_array)
+        .is_some_and(|clients| !clients.is_empty())
+        && args.mode.as_deref().is_none_or(|mode| mode == "play");
+    let fetch = |side: &str, limit: u64| {
+        let console = daemon_control_request(
+            op::CONSOLE,
+            None,
+            json!({
+                "limit": limit,
+                "sinceSeq": 0,
+                "fromOldest": false,
+                "clear": false,
+                side: true,
+                "bridgeWaitSeconds": args.bridge.wait_seconds,
+                "bridgePorts": args.bridge.ports,
+            }),
+            false,
+        );
+        match console {
+            Ok(mut console) => {
+                console::compact_console_entries(&mut console);
+                let mut entries = console
+                    .get("entries")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                console::fold_play_console(&mut entries);
+                Value::Array(entries)
+            }
+            Err(error) => json!({ "error": format!("{error:#}") }),
+        }
+    };
+    if let Some(text) = args.until_console.as_deref()
+        && result.get("ok").and_then(Value::as_bool) != Some(false)
+    {
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_secs_f64(args.until_timeout);
+        let mut matched = None;
+        loop {
+            for side in ["server", "client"] {
+                if side == "client" && !has_client {
+                    continue;
+                }
+                if let Some(entries) = fetch(side, 200).as_array()
+                    && let Some(entry) = entries.iter().find(|entry| {
+                        entry
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .is_some_and(|message| message.contains(text))
+                    })
+                {
+                    matched = Some((side, entry.clone()));
+                    break;
+                }
+            }
+            if matched.is_some() || std::time::Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(400));
+        }
+        let seconds = (started.elapsed().as_secs_f64() * 10.0).round() / 10.0;
+        result["untilConsole"] = match matched {
+            Some((side, entry)) => json!({
+                "text": text,
+                "matched": true,
+                "side": side,
+                "seconds": seconds,
+                "entry": entry,
+            }),
+            None => json!({ "text": text, "matched": false, "timedOut": true, "seconds": seconds }),
+        };
+    }
     if let Some(limit) = args.console
         && result.get("ok").and_then(Value::as_bool) != Some(false)
     {
-        let fetch = |side: &str| {
-            let console = daemon_control_request(
-                op::CONSOLE,
-                None,
-                json!({
-                    "limit": limit,
-                    "sinceSeq": 0,
-                    "fromOldest": false,
-                    "clear": false,
-                    side: true,
-                    "bridgeWaitSeconds": args.bridge.wait_seconds,
-                    "bridgePorts": args.bridge.ports,
-                }),
-                false,
-            );
-            match console {
-                Ok(mut console) => {
-                    console::compact_console_entries(&mut console);
-                    let mut entries = console
-                        .get("entries")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
-                    console::fold_play_console(&mut entries);
-                    Value::Array(entries)
-                }
-                Err(error) => json!({ "error": format!("{error:#}") }),
-            }
-        };
-        result["console"] = fetch("server");
-        // Ordinary Play has one client; its console answers the client-side
-        // half of the same check without a second session.
-        let has_client = result
-            .get("clients")
-            .and_then(Value::as_array)
-            .is_some_and(|clients| !clients.is_empty());
-        if has_client && args.mode.as_deref().is_none_or(|mode| mode == "play") {
-            result["clientConsole"] = fetch("client");
+        result["console"] = fetch("server", limit);
+        if has_client {
+            result["clientConsole"] = fetch("client", limit);
         }
     }
     if args.stop_after && result.get("ok").and_then(Value::as_bool) != Some(false) {
