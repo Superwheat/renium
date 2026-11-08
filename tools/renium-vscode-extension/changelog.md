@@ -12,6 +12,8 @@
 - `rbx play -s --console N` returns the last N server console entries with the start result, after `--until` when given; `--stop-after` then stops the session, so one call runs a play check.
 - `rbx play -s --at PATH` stands the first player's character on an instance (or at a position `x,y,z`) once it spawns, before `--until` runs, so a touch check needs no hand-written move.
 - `rbx play -s --console N` also returns the client's console as `clientConsole` in ordinary Play, so a client-side check needs no second session.
+- `rbx ba` and `rbx bs` refuse a property that a push skips (hidden or engine-managed in Studio's API, such as a TextLabel's `Font`) and name the replacement, instead of storing a value Studio never receives.
+- `rbx ba`, `rbx bs`, `rbx mv` and `rbx rn` with `--push` report `verified`: `true` when the live read-back in `studio` holds every pushed value at the instance's path and class, `false` when Studio kept a different value or has no such instance, and nothing when a value's live shape cannot be compared.
 - A Studio opened for a named daemon is passed to that daemon's bridge ports only while its launch ticket is under fifteen minutes old and a daemon still listens there; stale tickets are swept at the next launch. A Studio whose process id matched an old ticket used to be sent to ports nobody listened on and never connected.
 - `rbx play --stop-after` and `rbx play -r` stop a session started with `-p N`; the stop request used to be refused because it still named the players.
 - `rbx br --push` destroys the removed instances in the open place as one undo step, and `rbx br SERVICE [TARGET] --where QUERY` removes every instance under the target that matches a bulk-read query, up to 500 per call.

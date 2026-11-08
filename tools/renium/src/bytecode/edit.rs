@@ -226,12 +226,135 @@ pub(crate) fn push_stored_instance_reading(
         .map(str::to_string)
         .context("The store edit did not name its instance; push the store file with `rbx ps`")?;
     result["push"] = push_stored_instances(settings_file.clone(), vec![settings_id.clone()])?;
-    if let Some(path) = stored_path_segments(&settings_file, Some(&settings_id))?
+    let document = SettingsBytecode::read_file(&settings_file)?;
+    let Some(index) = document
+        .instances
+        .iter()
+        .position(|instance| instance.settings_id == settings_id)
+    else {
+        return Ok(());
+    };
+    let service = bytecode_service_name(&document, &settings_file, "");
+    let (segments, _) = build_editor_instance_path_parts(&document, &service);
+    if let Some(path) = segments.get(index).cloned().flatten()
         && let Ok(studio) = read_back_from_studio(&path, properties, attributes)
     {
+        if let Some(verified) = read_back_verifies(
+            &studio,
+            &path,
+            &document.instances[index],
+            properties,
+            attributes,
+        ) {
+            result["verified"] = json!(verified);
+            // One verdict: the read-back supersedes the push's own flag.
+            if let Some(push) = result.get_mut("push").and_then(Value::as_object_mut) {
+                push.remove("verified");
+            }
+        }
         result["studio"] = studio;
     }
     Ok(())
+}
+
+/// Whether a read-back row shows the pushed instance: `Some(true)` when the
+/// instance is at `path` with the stored class and every requested property
+/// and attribute equal to the store's value, `Some(false)` when it is missing
+/// or a value differs, `None` when a live value's shape cannot be compared.
+pub(crate) fn read_back_verifies(
+    row: &Value,
+    path: &[String],
+    stored: &SettingsBytecodeInstance,
+    properties: &[String],
+    attributes: &[String],
+) -> Option<bool> {
+    if row.get("missing").and_then(Value::as_bool) == Some(true)
+        || row.get("path").and_then(Value::as_str) != Some(path.join(".").as_str())
+        || row.get("class").and_then(Value::as_str) != Some(stored.class_name.as_str())
+    {
+        return Some(false);
+    }
+    let mut verified = Some(true);
+    let mut compare = |expected: Option<&Value>, live: Option<&Value>| {
+        let Some(expected) = expected else {
+            return;
+        };
+        match live.and_then(|live| live_value_agrees(expected, live)) {
+            Some(true) => {}
+            Some(false) => verified = Some(false),
+            None => {
+                if verified == Some(true) {
+                    verified = None;
+                }
+            }
+        }
+    };
+    for name in properties {
+        compare(stored.properties.get(name), row.get(name));
+    }
+    for name in attributes {
+        compare(
+            stored.attributes.get(name),
+            row.get(format!("@{name}").as_str()),
+        );
+    }
+    verified
+}
+
+/// Compares a stored value with the shape Studio returns for it: numbers
+/// within float tolerance, enum items by name whichever field names them,
+/// typed objects field by field; `None` when the shapes do not line up.
+fn live_value_agrees(expected: &Value, live: &Value) -> Option<bool> {
+    match (expected, live) {
+        (Value::Number(a), Value::Number(b)) => {
+            let (a, b) = (a.as_f64()?, b.as_f64()?);
+            Some((a - b).abs() <= 1e-3_f64.max(a.abs().max(b.abs()) * 1e-4))
+        }
+        (Value::Bool(a), Value::Bool(b)) => Some(a == b),
+        (Value::String(a), Value::String(b)) => Some(a == b),
+        (Value::Null, Value::Null) => Some(true),
+        (Value::Object(a), Value::Object(b)) => {
+            if a.get("_type") != b.get("_type") {
+                return None;
+            }
+            if a.get("_type").and_then(Value::as_str) == Some("EnumItem") {
+                let expected = a.get("name").and_then(Value::as_str)?;
+                let live = b.get("name").and_then(Value::as_str).or_else(|| {
+                    b.get("value")
+                        .and_then(Value::as_str)
+                        .and_then(|value| value.rsplit('.').next())
+                })?;
+                return Some(expected == live);
+            }
+            let mut agree = Some(true);
+            for (key, value) in a {
+                if key == "_type" || key == "enumType" {
+                    continue;
+                }
+                match live_value_agrees(value, b.get(key)?) {
+                    Some(true) => {}
+                    Some(false) => return Some(false),
+                    None => agree = None,
+                }
+            }
+            agree
+        }
+        (Value::Array(a), Value::Array(b)) => {
+            if a.len() != b.len() {
+                return Some(false);
+            }
+            let mut agree = Some(true);
+            for (value, other) in a.iter().zip(b) {
+                match live_value_agrees(value, other) {
+                    Some(true) => {}
+                    Some(false) => return Some(false),
+                    None => agree = None,
+                }
+            }
+            agree
+        }
+        _ => None,
+    }
 }
 
 /// The full path (service first) of a stored instance, by settings id.
@@ -1664,6 +1787,100 @@ fn path_segments_for_error(document: &SettingsBytecode, index: usize) -> String 
     }
     names.reverse();
     names.join(".")
+}
+
+#[cfg(test)]
+mod read_back_tests {
+    use super::*;
+
+    fn stored() -> SettingsBytecodeInstance {
+        let mut instance =
+            SettingsBytecodeInstance::new("id".into(), "Pad".into(), "Part".into(), None);
+        instance.properties.insert("Anchored".into(), json!(true));
+        instance
+            .properties
+            .insert("Transparency".into(), json!(0.5));
+        instance.properties.insert(
+            "Color".into(),
+            json!({"_type": "Color3", "r": 0.2, "g": 1.0, "b": 0.3}),
+        );
+        instance.properties.insert(
+            "Material".into(),
+            json!({"_type": "EnumItem", "enumType": "Material", "name": "Neon"}),
+        );
+        instance.properties.insert(
+            "CFrame".into(),
+            json!({"_type": "CFrame", "components": [30.0, 0.5, 0.0, 1, 0, 0, 0, 1, 0, 0, 0, 1]}),
+        );
+        instance.attributes.insert("MaxSpeed".into(), json!(16));
+        instance
+    }
+
+    fn row(material: &str, transparency: f64) -> Value {
+        json!({
+            "path": "Workspace.Lobby.Pad",
+            "class": "Part",
+            "Anchored": true,
+            "Transparency": transparency,
+            "Color": {"_type": "Color3", "r": 0.2, "g": 1, "b": 0.30000001},
+            "Material": {"_type": "EnumItem", "value": format!("Enum.Material.{material}")},
+            "CFrame": {"_type": "CFrame", "position": [30, 0.5, 0]},
+            "@MaxSpeed": 16,
+        })
+    }
+
+    #[test]
+    fn a_read_back_verifies_the_pushed_values_and_names_a_value_studio_did_not_take() {
+        let path = ["Workspace", "Lobby", "Pad"].map(String::from);
+        let names = ["Anchored", "Transparency", "Color", "Material"].map(String::from);
+        let attributes = ["MaxSpeed".to_string()];
+        let stored = stored();
+        assert_eq!(
+            read_back_verifies(&row("Neon", 0.5), &path, &stored, &names, &attributes),
+            Some(true)
+        );
+        assert_eq!(
+            read_back_verifies(&row("Plastic", 0.5), &path, &stored, &names, &attributes),
+            Some(false),
+            "an enum Studio kept at its old value is a mismatch"
+        );
+        assert_eq!(
+            read_back_verifies(&row("Neon", 0.0), &path, &stored, &names, &attributes),
+            Some(false)
+        );
+        assert_eq!(
+            read_back_verifies(
+                &row("Neon", 0.5),
+                &path,
+                &stored,
+                &["CFrame".to_string()],
+                &[]
+            ),
+            None,
+            "a live shape that does not line up with the stored one is not judged"
+        );
+        assert_eq!(
+            read_back_verifies(
+                &row("Neon", 0.5),
+                &path,
+                &stored,
+                &["Parent".to_string()],
+                &[]
+            ),
+            Some(true),
+            "a property the store does not hold is not compared"
+        );
+        let missing = json!({"missing": true, "path": "Workspace.Lobby.Pad"});
+        assert_eq!(
+            read_back_verifies(&missing, &path, &stored, &names, &attributes),
+            Some(false)
+        );
+        let moved = json!({"path": "Workspace.Props.Pad", "class": "Part"});
+        assert_eq!(
+            read_back_verifies(&moved, &path, &stored, &[], &[]),
+            Some(false)
+        );
+    }
 }
 
 #[cfg(test)]

@@ -2251,6 +2251,31 @@ fn bytecode_set_property_where(mut args: BytecodeSetPropertyArgs, query: &str) -
         if let Ok(studio) =
             crate::bytecode::edit::read_back_many_from_studio(read, &properties, &attributes)
         {
+            let rows = studio.as_array().cloned().unwrap_or_default();
+            let mut verified = Some(rows.len() == read.len());
+            for ((row, path), &index) in rows.iter().zip(read).zip(matched.iter()) {
+                match crate::bytecode::edit::read_back_verifies(
+                    row,
+                    path,
+                    &document.instances[index],
+                    &properties,
+                    &attributes,
+                ) {
+                    Some(true) => {}
+                    Some(false) => verified = Some(false),
+                    None => {
+                        if verified == Some(true) {
+                            verified = None;
+                        }
+                    }
+                }
+            }
+            if let Some(verified) = verified {
+                result["verified"] = json!(verified);
+                if let Some(push) = result.get_mut("push").and_then(Value::as_object_mut) {
+                    push.remove("verified");
+                }
+            }
             result["studio"] = studio;
         }
     }

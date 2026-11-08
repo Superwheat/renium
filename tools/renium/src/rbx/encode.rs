@@ -1469,6 +1469,29 @@ pub(crate) fn typed_store_property_value(
     let Some(descriptor) = rbx_property_descriptor(database, class_name, property_name) else {
         return Ok(value);
     };
+    // A property the push skips (hidden, deprecated, read-only or engine
+    // managed) would sit in the store and never reach Studio.
+    if crate::editor::review::is_engine_managed_editor_property(class_name, property_name, database)
+    {
+        let hint = match property_name {
+            "Font" => {
+                "; set FontFace (`rbx l 'return Font.fromEnum(Enum.Font.GothamBold)'` returns the value to store)"
+            }
+            "FontSize" => "; set TextSize",
+            "Transparency" => "; set BackgroundTransparency, TextTransparency or ImageTransparency",
+            "BackgroundColor" | "BorderColor" | "TextColor" => {
+                "; set the Color3 property of that name"
+            }
+            "Position" | "Orientation" | "Rotation" => "; set CFrame",
+            "Pitch" => "; set PlaybackSpeed",
+            "MaxDistance" | "MinDistance" => "; set RollOffMaxDistance or RollOffMinDistance",
+            "Tags" => "; tag with `rbx l --edit`",
+            _ => "",
+        };
+        bail!(
+            "{class_name}.{property_name} is hidden or engine-managed in Studio's API, so a push cannot set it{hint}"
+        );
+    }
     if let RbxDataType::Enum(enum_name) = &descriptor.data_type {
         // A plain item name, a number or a partial EnumItem object is stored
         // in the canonical EnumItem form, so the stores and Studio compare equal.
@@ -2417,6 +2440,22 @@ mod tests {
         );
         assert!(stored("Part", "Material", json!("Neon")).is_object());
         assert!(typed_store_property_value("Part", "Material", json!("NoSuchMaterial")).is_err());
+    }
+
+    #[test]
+    fn properties_a_push_skips_are_refused_with_their_replacement() {
+        let error = typed_store_property_value("TextLabel", "Font", json!("GothamBold"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("FontFace"), "{error}");
+        assert!(typed_store_property_value("TextLabel", "FontFace", json!({"family": "rbxasset://fonts/families/GothamSSm.json", "weight": 700, "style": 0})).is_ok());
+        let error = typed_store_property_value("Attachment", "Position", json!([0, 1, 0]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("CFrame"), "{error}");
+        assert!(
+            typed_store_property_value("Frame", "BackgroundColor3", json!([255, 0, 0])).is_ok()
+        );
     }
 
     #[test]
