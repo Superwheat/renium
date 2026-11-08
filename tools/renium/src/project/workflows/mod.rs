@@ -1168,24 +1168,93 @@ fn launch_ticket_dir() -> Result<PathBuf> {
     Ok(crate::app::update::user_data_dir()?.join("launches"))
 }
 
+/// A launched Studio's plugin connects within minutes; a ticket older than
+/// this belongs to a Studio that never connected, and since the system reuses
+/// pids it must not send an unrelated later Studio to its ports.
+const LAUNCH_TICKET_TTL: Duration = Duration::from_secs(15 * 60);
+
+fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |value| value.as_millis() as u64)
+}
+
 /// A Studio launched by a daemon on other bridge ports than the plugin's
 /// default is noted by pid; the daemon on the default ports reads the note
 /// when that Studio's plugin connects there and sends it on.
 pub(crate) fn record_launch_ticket(pid: u32, ports: &[u16]) -> Result<()> {
     let dir = launch_ticket_dir()?;
     fs::create_dir_all(&dir)?;
+    sweep_stale_launch_tickets(&dir);
+    write_launch_ticket(&dir, pid, ports, unix_ms_now())
+}
+
+fn write_launch_ticket(dir: &Path, pid: u32, ports: &[u16], now_ms: u64) -> Result<()> {
     fs::write(
         dir.join(format!("{pid}.json")),
-        serde_json::to_vec(&json!({ "ports": ports }))?,
+        serde_json::to_vec(&json!({ "ports": ports, "createdUnixMs": now_ms }))?,
     )?;
     Ok(())
 }
 
+fn sweep_stale_launch_tickets(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension() != Some(OsStr::new("json")) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_none_or(|age| age > LAUNCH_TICKET_TTL);
+        if stale {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+/// The ports a fresh ticket names for Studio `pid`, when a daemon still
+/// listens on them; the ticket is consumed either way.
 pub(crate) fn take_launch_ticket(pid: u32) -> Option<Vec<u16>> {
-    let path = launch_ticket_dir().ok()?.join(format!("{pid}.json"));
+    let dir = launch_ticket_dir().ok()?;
+    let ports = take_launch_ticket_in(&dir, pid, unix_ms_now())?;
+    if !daemon_listens_on(ports[0]) {
+        crate::log_global(
+            3,
+            format_args!(
+                "[renium] the daemon that launched Studio {pid} no longer listens on {ports:?}; the Studio stays on this daemon"
+            ),
+        );
+        return None;
+    }
+    Some(ports)
+}
+
+fn take_launch_ticket_in(dir: &Path, pid: u32, now_ms: u64) -> Option<Vec<u16>> {
+    let path = dir.join(format!("{pid}.json"));
+    let age = fs::metadata(&path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok());
     let bytes = fs::read(&path).ok()?;
     let _ = fs::remove_file(&path);
     let value: Value = serde_json::from_slice(&bytes).ok()?;
+    let fresh = match value.get("createdUnixMs").and_then(Value::as_u64) {
+        Some(created) => now_ms.saturating_sub(created) <= LAUNCH_TICKET_TTL.as_millis() as u64,
+        None => age.is_some_and(|age| age <= LAUNCH_TICKET_TTL),
+    };
+    if !fresh {
+        crate::log_global(
+            3,
+            format_args!("[renium] ignored a stale launch ticket for Studio {pid}"),
+        );
+        return None;
+    }
     let ports = value
         .get("ports")?
         .as_array()?
@@ -1193,6 +1262,14 @@ pub(crate) fn take_launch_ticket(pid: u32) -> Option<Vec<u16>> {
         .filter_map(|port| u16::try_from(port.as_u64()?).ok())
         .collect::<Vec<_>>();
     (ports.len() == 2).then_some(ports)
+}
+
+fn daemon_listens_on(port: u16) -> bool {
+    std::net::TcpStream::connect_timeout(
+        &SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_millis(500),
+    )
+    .is_ok()
 }
 
 /// The place `rbx so` opened becomes the project's remembered Studio target,
@@ -2741,6 +2818,43 @@ fn replace_file(source: &Path, target: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::tests::support::temp_dir;
+
+    #[test]
+    fn launch_tickets_expire_and_stale_ones_are_swept() {
+        let dir = temp_dir("launch-tickets");
+        let now = 1_800_000_000_000_u64;
+        let fifteen_minutes = LAUNCH_TICKET_TTL.as_millis() as u64;
+        write_launch_ticket(&dir, 9808, &[8801, 8802], now - fifteen_minutes - 1).unwrap();
+        assert_eq!(take_launch_ticket_in(&dir, 9808, now), None);
+        assert!(
+            !dir.join("9808.json").exists(),
+            "a stale ticket is consumed too"
+        );
+
+        write_launch_ticket(&dir, 9808, &[8801, 8802], now).unwrap();
+        assert_eq!(
+            take_launch_ticket_in(&dir, 9808, now + 1000),
+            Some(vec![8801, 8802])
+        );
+        assert!(!dir.join("9808.json").exists());
+
+        fs::write(dir.join("1234.json"), br#"{"ports":[8801,8802]}"#).unwrap();
+        assert_eq!(
+            take_launch_ticket_in(&dir, 1234, now),
+            Some(vec![8801, 8802]),
+            "a ticket without a timestamp counts by its file age"
+        );
+        assert_eq!(take_launch_ticket_in(&dir, 4321, now), None);
+    }
+
+    #[test]
+    fn a_launch_ticket_is_followed_only_while_its_daemon_listens() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let open = listener.local_addr().unwrap().port();
+        assert!(daemon_listens_on(open));
+        drop(listener);
+        assert!(!daemon_listens_on(open));
+    }
 
     #[test]
     fn doctor_flags_only_rbx_copies_of_a_different_renium_build() {

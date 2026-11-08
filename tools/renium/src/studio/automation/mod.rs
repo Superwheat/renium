@@ -538,10 +538,16 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
     if let Some(result) = args.result.as_deref() {
         wait_result_body(result)?;
     }
+    // A stop names no players, so a session started with -p N stops too.
+    let stop_parameters = json!({
+        "mode": args.mode,
+        "bridgeWaitSeconds": args.bridge.wait_seconds,
+        "bridgePorts": args.bridge.ports,
+    });
     if args.restart {
         // Edits saved during Play wait for Edit mode; stopping first and
         // letting Live Sync settle makes the restarted session run them.
-        let stopped = daemon_control_request(op::PLAY_STOP, None, parameters.clone(), false)
+        let stopped = daemon_control_request(op::PLAY_STOP, None, stop_parameters.clone(), false)
             .map(|stop| stop.get("ok") == Some(&Value::Bool(true)))
             .unwrap_or(false);
         let settled = settle_live_sync_before_restart(&args);
@@ -647,10 +653,11 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
         }
     }
     if args.stop_after && result.get("ok").and_then(Value::as_bool) != Some(false) {
-        result["stopped"] = match daemon_control_request(op::PLAY_STOP, None, parameters, false) {
-            Ok(stop) => json!(stop.get("ok") == Some(&Value::Bool(true))),
-            Err(error) => json!({ "error": format!("{error:#}") }),
-        };
+        result["stopped"] =
+            match daemon_control_request(op::PLAY_STOP, None, stop_parameters, false) {
+                Ok(stop) => json!(stop.get("ok") == Some(&Value::Bool(true))),
+                Err(error) => json!({ "error": format!("{error:#}") }),
+            };
     }
     if crate::app::output::compact_text_output() {
         compact_play_result(&mut result, args.players.is_some());
