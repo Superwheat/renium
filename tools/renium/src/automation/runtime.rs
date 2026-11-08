@@ -1561,7 +1561,7 @@ fn automation_dispatch_operation(
                 } else {
                     BridgeTarget::main_or_client(parsed.client)
                 };
-                let waited = bridge.wait_for_target(bridge_wait_seconds, target);
+                let waited = wait_for_play_target(bridge, bridge_wait_seconds, target);
                 if parsed.server && waited.is_err() {
                     bail!(
                         "No play server is connected: Play is stopped or still starting. Start it with rbx play -s, or drop --server to run in the Edit window"
@@ -1579,7 +1579,7 @@ fn automation_dispatch_operation(
                 } else {
                     BridgeTarget::main_or_client(parsed.client)
                 };
-                bridge.wait_for_target(bridge_wait_seconds, target)?;
+                wait_for_play_target(bridge, bridge_wait_seconds, target)?;
             }
             get_console_output_result(&parsed, bridge)
         }
@@ -1595,12 +1595,12 @@ fn automation_dispatch_operation(
                 } else {
                     BridgeTarget::main_or_client(parsed.client)
                 };
-                bridge.wait_for_target(bridge_wait_seconds, target)?;
+                wait_for_play_target(bridge, bridge_wait_seconds, target)?;
             }
             shot_result(&parsed, bridge)
         }
         op::DEVICE => {
-            bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Edit)?;
+            wait_for_play_target(bridge, bridge_wait_seconds, BridgeTarget::Edit)?;
             studio_device_result(&studio_args::device(parameters)?, bridge)
         }
         op::NETWORK_SIMULATION => {
@@ -1627,31 +1627,31 @@ fn automation_dispatch_operation(
         }
         op::UI => {
             if parameters.get("player").is_none() {
-                bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Client)?;
+                wait_for_play_target(bridge, bridge_wait_seconds, BridgeTarget::Client)?;
             }
             ui_result(&studio_args::ui(parameters)?, bridge)
         }
         op::PRESS => {
             if parameters.get("player").is_none() {
-                bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Client)?;
+                wait_for_play_target(bridge, bridge_wait_seconds, BridgeTarget::Client)?;
             }
             press_result(&studio_args::press(parameters)?, bridge)
         }
         op::CLICK => {
             if parameters.get("player").is_none() {
-                bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Client)?;
+                wait_for_play_target(bridge, bridge_wait_seconds, BridgeTarget::Client)?;
             }
             click_result(&studio_args::click(parameters)?, bridge)
         }
         op::KEY => {
             if parameters.get("player").is_none() {
-                bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Client)?;
+                wait_for_play_target(bridge, bridge_wait_seconds, BridgeTarget::Client)?;
             }
             key_result(&studio_args::key(parameters)?, bridge)
         }
         op::TYPE => {
             if parameters.get("player").is_none() {
-                bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Client)?;
+                wait_for_play_target(bridge, bridge_wait_seconds, BridgeTarget::Client)?;
             }
             type_result(&studio_args::type_text(parameters)?, bridge)
         }
@@ -1670,19 +1670,19 @@ fn automation_dispatch_operation(
                 } else {
                     BridgeTarget::main_or_client(parsed.client)
                 };
-                bridge.wait_for_target(bridge_wait_seconds, target)?;
+                wait_for_play_target(bridge, bridge_wait_seconds, target)?;
             }
             wait_until_result(&parsed, bridge)
         }
         op::GOTO => {
             if parameters.get("player").is_none() {
-                bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Client)?;
+                wait_for_play_target(bridge, bridge_wait_seconds, BridgeTarget::Client)?;
             }
             goto_result(&studio_args::goto(parameters)?, bridge)
         }
         op::INPUT => {
             if parameters.get("player").is_none() {
-                bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Client)?;
+                wait_for_play_target(bridge, bridge_wait_seconds, BridgeTarget::Client)?;
             }
             input_result(parameters, bridge)
         }
@@ -1696,7 +1696,7 @@ fn automation_dispatch_operation(
                 )
             };
             if parameters.get("player").is_none() {
-                bridge.wait_for_target(bridge_wait_seconds, target)?;
+                wait_for_play_target(bridge, bridge_wait_seconds, target)?;
             }
             record_start_result(
                 parameters,
@@ -4085,6 +4085,33 @@ const PLAY_GATE_POLL: Duration = Duration::from_millis(50);
 /// Edit window, never on the Edit gate, so a play request can never hold up
 /// Edit requests or other Studios. A bare selector with no play server is an
 /// Edit request.
+/// Waits for the plugin channel of a request's target. A Play target with no
+/// Play runtime connected at all fails at once: nothing is starting, so the
+/// wait could only end in the same error.
+fn wait_for_play_target(
+    bridge: &BridgeServer,
+    wait_seconds: f64,
+    target: BridgeTarget,
+) -> Result<()> {
+    if matches!(target, BridgeTarget::Server | BridgeTarget::Client) && !bridge.has_play_runtimes()
+    {
+        bail!(
+            "No play {} is connected: Play is stopped. Start it with rbx play -s{}",
+            if target == BridgeTarget::Server {
+                "server"
+            } else {
+                "client"
+            },
+            if target == BridgeTarget::Server {
+                ", or drop --server to run in the Edit window"
+            } else {
+                ""
+            }
+        );
+    }
+    bridge.wait_for_target(wait_seconds, target)
+}
+
 fn play_request_gate(
     state: &automation::State,
     bridge: &BridgeServer,

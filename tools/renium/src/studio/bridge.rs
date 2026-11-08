@@ -1255,6 +1255,16 @@ impl BridgeServer {
     /// it must not read the process-wide selection those requests hold. A
     /// bare client selector with several clients takes the one the dispatch
     /// would choose: connected on the most channels, then focused last.
+    /// Whether any Play server or client runtime is connected, whoever owns it.
+    pub(crate) fn has_play_runtimes(&self) -> bool {
+        self.list_bridge_clients().iter().any(|entry| {
+            matches!(
+                entry["role"].as_str(),
+                Some(BRIDGE_ROLE_PLAY_SERVER | BRIDGE_ROLE_PLAY_CLIENT)
+            )
+        })
+    }
+
     /// How many Play runtimes of `target` the Edit window `owner` has connected.
     pub(crate) fn play_runtime_count(&self, target: BridgeTarget, owner: &str) -> usize {
         self.play_runtimes_for_owner(target, owner).0.len()
