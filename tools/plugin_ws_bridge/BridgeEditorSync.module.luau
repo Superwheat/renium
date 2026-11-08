@@ -1259,10 +1259,14 @@ local function sortedIdList(text: string): string
 end
 
 local function colorBytesEqual(a: Color3, b: Color3): boolean
+	-- The engine keeps part colors as bytes and truncates: 0.3 becomes 76/255,
+	-- not 77/255, so a channel may land one byte off the rounded value.
 	local function byte(channel: number): number
 		return math.round(math.clamp(channel, 0, 1) * 255)
 	end
-	return byte(a.R) == byte(b.R) and byte(a.G) == byte(b.G) and byte(a.B) == byte(b.B)
+	return math.abs(byte(a.R) - byte(b.R)) <= 1
+		and math.abs(byte(a.G) - byte(b.G)) <= 1
+		and math.abs(byte(a.B) - byte(b.B)) <= 1
 end
 
 local function propertyValuesEqual(instance: Instance, name: string, current: any, expected: any): boolean
