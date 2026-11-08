@@ -589,6 +589,8 @@ pub(crate) fn remove_instance_command(
     let (settings_file, settings_id) =
         projected_instance_store(project, &target, args.override_packages)?;
     bytecode_remove_instance(BytecodeRemoveInstanceArgs {
+        where_query: None,
+        push: false,
         input: BytecodeFileArgs::settings_file(settings_file),
         selector: BytecodeInstanceSelectorArgs::by_settings_id(settings_id),
         no_recursive: args.no_recursive,

@@ -1880,6 +1880,8 @@ fn ordinary_remove_rejects_package_bearing_instances_and_links() {
     );
 
     let error = bytecode_remove_instance(BytecodeRemoveInstanceArgs {
+        where_query: None,
+        push: false,
         input: BytecodeFileArgs::settings_file(settings_path.clone()),
         selector: BytecodeInstanceSelectorArgs::by_settings_id(Some("garage".into())),
         no_recursive: false,
@@ -1892,6 +1894,8 @@ fn ordinary_remove_rejects_package_bearing_instances_and_links() {
     );
 
     let error = bytecode_remove_instance(BytecodeRemoveInstanceArgs {
+        where_query: None,
+        push: false,
         input: BytecodeFileArgs::settings_file(settings_path.clone()),
         selector: BytecodeInstanceSelectorArgs::by_settings_id(Some("package-link".into())),
         no_recursive: false,
@@ -4441,6 +4445,8 @@ fn bytecode_remove_instance_removes_source_files_and_keeps_service_store() {
     assert!(source_path.exists());
 
     bytecode_remove_instance(BytecodeRemoveInstanceArgs {
+        where_query: None,
+        push: false,
         input: BytecodeFileArgs::settings_file(settings_path.clone()),
         selector: BytecodeInstanceSelectorArgs::by_settings_id(Some("pkg".into())),
         no_recursive: false,

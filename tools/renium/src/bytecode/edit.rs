@@ -1374,18 +1374,57 @@ pub(crate) fn bytecode_remove_instance(mut args: BytecodeRemoveInstanceArgs) -> 
         &service,
         &crate::project::storage::source_directory(&settings_file),
     );
-    let index =
-        resolve_bytecode_selector(&document, &service, &args.selector, "No matching instance")?
-            .index;
+    let (segments_before, _) = build_editor_instance_path_parts(&document, &service);
+    let path_of = |index: usize| {
+        segments_before
+            .get(index)
+            .cloned()
+            .flatten()
+            .unwrap_or_else(|| vec![document.instances[index].name.clone()])
+    };
+    let indices = if let Some(query) = args.where_query.as_deref() {
+        let scope = super::resolve_bytecode_selector_or_service_root(
+            &document,
+            &service,
+            &args.selector,
+            "No matching instance",
+        )?;
+        let matched = super::where_matches(&document, &service, scope.index, query)?;
+        if matched.is_empty() {
+            bail!(
+                "No instance under {} matches '{query}'",
+                path_of(scope.index).join(".")
+            );
+        }
+        if matched.len() > 500 {
+            bail!(
+                "{} instances under {} match '{query}'; narrow the query (500 at most per call)",
+                matched.len(),
+                path_of(scope.index).join(".")
+            );
+        }
+        matched
+    } else {
+        vec![
+            resolve_bytecode_selector(&document, &service, &args.selector, "No matching instance")?
+                .index,
+        ]
+    };
     let children_by_parent = settings_children_by_parent(&document);
-    let mut subtree = Vec::new();
-    collect_settings_subtree_preorder(&children_by_parent, index, &mut subtree);
-    reject_package_link_subtree_mutation(&document, &subtree, "removed")?;
-    if is_protected_engine_container(&document, index) {
-        bail!("{} cannot be removed", document.instances[index].name);
+    for &index in &indices {
+        let mut subtree = Vec::new();
+        collect_settings_subtree_preorder(&children_by_parent, index, &mut subtree);
+        reject_package_link_subtree_mutation(&document, &subtree, "removed")?;
+        if is_protected_engine_container(&document, index) {
+            bail!("{} cannot be removed", document.instances[index].name);
+        }
     }
+    let removed_instance_paths = indices
+        .iter()
+        .map(|&index| path_of(index))
+        .collect::<Vec<_>>();
     let removed =
-        instance_api::remove_instances_at_indices(&mut document, &[index], !args.no_recursive)?;
+        instance_api::remove_instances_at_indices(&mut document, &indices, !args.no_recursive)?;
     let removed_settings_ids = removed
         .iter()
         .filter_map(|index| before_document.instances.get(*index))
@@ -1441,12 +1480,46 @@ pub(crate) fn bytecode_remove_instance(mut args: BytecodeRemoveInstanceArgs) -> 
         "ok": true,
         "settingsFile": settings_file,
         "storeRemoved": removed_settings_file,
+        "removed": removed_instance_paths.iter().map(|path| path.join(".")).collect::<Vec<_>>(),
         "removedSettingsIds": removed_settings_ids,
         "removedSourcePaths": removed_source_paths_json,
         "changedPaths": changed_paths,
     });
+    if let Some(query) = args.where_query.as_deref() {
+        result["where"] = json!(query);
+        result["matched"] = json!(removed_instance_paths.len());
+    }
+    if args.push {
+        result["studio"] = destroy_in_studio(&removed_instance_paths)?;
+    }
     crate::app::output::drop_empty(&mut result, &["removedSourcePaths"]);
     print_json_output(&result, args.pretty)
+}
+
+/// Destroys the instances at `paths` in the open place as one undo step;
+/// `destroyed` counts them and `missing` lists the paths Studio no longer had.
+fn destroy_in_studio(paths: &[Vec<String>]) -> Result<Value> {
+    let paths = paths
+        .iter()
+        .map(|path| luau_string_list(path))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let code = format!(
+        "local function at(segments) local inst = game for _, name in segments do inst = inst:FindFirstChild(name) if not inst then return nil end end return inst end local destroyed, missing = 0, {{}} for _, segments in {{{paths}}} do local inst = at(segments) if inst then inst:Destroy() destroyed += 1 else table.insert(missing, table.concat(segments, '.')) end end return {{ destroyed = destroyed, missing = missing }}"
+    );
+    let result = crate::daemon::daemon_control_request(
+        crate::automation::op::LUAU,
+        None,
+        json!({ "code": code, "edit": true, "bridgeWaitSeconds": 8.0, "bridgePorts": "8781,8782" }),
+        false,
+    )
+    .context("The store was updated but Studio could not remove the instances; push the store with `rbx ps`")?;
+    Ok(result
+        .get("results")
+        .and_then(Value::as_array)
+        .and_then(|results| results.first())
+        .cloned()
+        .unwrap_or(Value::Null))
 }
 
 pub(crate) fn bytecode_desync_package_link(mut args: BytecodeDesyncPackageLinkArgs) -> Result<()> {

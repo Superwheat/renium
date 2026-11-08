@@ -836,6 +836,7 @@ fn remove_instance_deletes_subtrees_sources_and_keeps_descendants_on_request() {
         json!({
             "changedPaths": [STORE],
             "ok": true,
+            "removed": ["Workspace.Lobby.Door"],
             "removedSettingsIds": ["door"],
             "settingsFile": STORE,
             "storeRemoved": false,
@@ -854,6 +855,7 @@ fn remove_instance_deletes_subtrees_sources_and_keeps_descendants_on_request() {
         json!({
             "changedPaths": [STORE, "<root>/src/Workspace/Helper.client.luau", "<root>/src/Workspace/Lobby/Helper.client.luau"],
             "ok": true,
+            "removed": ["Workspace.Lobby"],
             "removedSettingsIds": ["lobby"],
             "removedSourcePaths": ["<root>/src/Workspace/Lobby/Helper.client.luau"],
             "settingsFile": STORE,
@@ -882,6 +884,7 @@ fn remove_instance_deletes_subtrees_sources_and_keeps_descendants_on_request() {
         json!({
             "changedPaths": ["<root>/instances/ReplicatedStorage.renium", "<root>/src/ReplicatedStorage/Shared/Config.luau"],
             "ok": true,
+            "removed": ["ReplicatedStorage.Shared"],
             "removedSettingsIds": ["shared", "config"],
             "removedSourcePaths": ["<root>/src/ReplicatedStorage/Shared/Config.luau"],
             "settingsFile": "<root>/instances/ReplicatedStorage.renium",
@@ -1616,7 +1619,7 @@ fn rename_and_remove_commands_edit_the_project_store() {
     assert_eq!(
         fx.text(&["rm", "Workspace", "-i", "Gate", "-r", &root])
             .ok(),
-        json!({"changedPaths": [STORE], "ok": true, "removedSettingsIds": ["door"], "settingsFile": STORE, "storeRemoved": false})
+        json!({"changedPaths": [STORE], "ok": true, "removed": ["Workspace.Lobby.Gate"], "removedSettingsIds": ["door"], "settingsFile": STORE, "storeRemoved": false})
     );
     let kept = fx
         .json(&["rm", "Workspace", "-i", "lobby", "-R", "-r", &root])

@@ -3489,6 +3489,17 @@ pub(super) struct BytecodeRemoveInstanceArgs {
     pub(super) input: BytecodeFileArgs,
     #[command(flatten)]
     pub(super) selector: BytecodeInstanceSelectorArgs,
+    #[arg(
+        help = "Remove every instance under the target (the whole service without one) that matches this query: words match names, is:Class, tag:Name, Prop=value, Prop>0.5, `or` separates alternatives; 500 matches at most",
+        long = "where",
+        value_name = "QUERY"
+    )]
+    pub(super) where_query: Option<String>,
+    #[arg(
+        help = "Also destroy the removed instances in the open place at once (no review); the result's `studio` counts them",
+        long
+    )]
+    pub(super) push: bool,
     #[arg(help = "Keep descendants", short = 'R', long)]
     pub(super) no_recursive: bool,
     #[arg(help = "Pretty-print the JSON result", long)]
