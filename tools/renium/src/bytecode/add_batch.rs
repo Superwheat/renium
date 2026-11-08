@@ -722,6 +722,7 @@ impl BatchState<'_> {
         if let Some(position) = self.positions.get(&key) {
             return Ok(*position);
         }
+        crate::bytecode::pull_missing_service_store(&settings_file);
         if !create && !settings_file.exists() {
             return Err(missing_service_store_error(&settings_file));
         }

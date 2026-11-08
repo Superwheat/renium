@@ -1807,7 +1807,7 @@ fn project_map_markdown(source: &Path) -> Result<String> {
     .collect::<Vec<_>>();
     if !missing.is_empty() {
         out.push_str(&format!(
-            "- No store yet: {} (`rbx pl -s NAME` pulls one from Studio; `rbx ba NAME ...` creates one)\n",
+            "- No store yet (pulled from Studio on the first command that needs it): {}\n",
             missing.join(", ")
         ));
     }

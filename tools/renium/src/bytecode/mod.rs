@@ -454,6 +454,7 @@ fn high_level_context(
     let src_root = absolutize_under(&project_root, &src_root);
     let canonical_service_dir = src_root.join(service);
     let settings_file = service_settings_path(&canonical_service_dir);
+    pull_missing_service_store(&settings_file);
     let loaded = config::try_load_project(None, Some(&project_root))?
         .filter(|loaded| absolutize_under(&loaded.root, &loaded.project.source_root) == src_root);
     let projection = loaded.as_ref().map(config::stage_project).transpose()?;
@@ -889,6 +890,7 @@ pub(super) fn resolve_bytecode_read_input(
 ) -> Result<(PathBuf, SettingsBytecode, String)> {
     let (settings_file, service_hint) =
         resolve_bytecode_cli_settings_file(settings_file, service_or_file, explicit_service)?;
+    pull_missing_service_store(&settings_file);
     if !settings_file.exists() {
         return Err(missing_service_store_error(&settings_file));
     }
@@ -4004,6 +4006,49 @@ impl Drop for SettingsFileLock {
     }
 }
 
+/// Pulls a missing service store from Studio before a command reads or edits
+/// it, so the first `bs`, `tr`, `in` or batch op on a service goes on instead
+/// of stopping at "pull from Studio". Only a daemon that is already running is
+/// asked; any failure leaves the usual missing-store error to the caller.
+pub(crate) fn pull_missing_service_store(settings_file: &Path) {
+    if settings_file.exists() || !crate::automation::client::shared_daemon_available() {
+        return;
+    }
+    let Some(service) =
+        crate::project::storage::store_service_name(settings_file).filter(|name| !name.is_empty())
+    else {
+        return;
+    };
+    let mut project_root = PathBuf::from(".");
+    let mut src_dir = PathBuf::from("src");
+    if crate::project::layout::ensure_explicit_project_root(&project_root).is_err()
+        || crate::project::layout::apply_configured_project_layout(&mut project_root, &mut src_dir)
+            .is_err()
+    {
+        return;
+    }
+    let parameters = json!({
+        "srcDir": src_dir,
+        "services": service,
+        "bridgeWaitSeconds": 1.0,
+        "exportAllProperties": false,
+    });
+    match crate::daemon::daemon_control_request(
+        crate::automation::op::PULL,
+        Some(&project_root),
+        parameters,
+        false,
+    ) {
+        Ok(_) if settings_file.exists() => {
+            eprintln!("[renium] {service} had no store; pulled it from Studio first");
+        }
+        Ok(_) => {}
+        Err(error) => {
+            eprintln!("[renium] {service} has no store and the pull from Studio failed: {error:#}");
+        }
+    }
+}
+
 pub(super) fn missing_service_store_error(settings_file: &Path) -> anyhow::Error {
     let service =
         crate::project::storage::store_service_name(settings_file).filter(|name| !name.is_empty());
@@ -4022,6 +4067,7 @@ pub(super) fn missing_service_store_error(settings_file: &Path) -> anyhow::Error
 }
 
 pub(super) fn ensure_service_store_exists(settings_file: &Path, service_hint: &str) -> Result<()> {
+    pull_missing_service_store(settings_file);
     if settings_file.exists() {
         return Ok(());
     }
@@ -4047,6 +4093,7 @@ pub(super) fn ensure_service_store_exists(settings_file: &Path, service_hint: &s
 }
 
 pub(super) fn lock_existing_service_store(settings_file: &Path) -> Result<SettingsFileLock> {
+    pull_missing_service_store(settings_file);
     if !settings_file.exists() {
         return Err(missing_service_store_error(settings_file));
     }

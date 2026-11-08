@@ -4,6 +4,7 @@
 
 ### Improvements
 
+- A command on a service that has no store yet (`rbx bs Lighting`, `rbx tr Teams`, `rbx in`, a batch op) pulls that service from Studio first, when a daemon is running, instead of stopping at "pull from Studio".
 - `rbx ba --batch` carries every kind of store edit: besides adds, an op may be `set` (`path`, `props`, `attrs`, `tags`), `clone` (`path`, `name`, optional `parent`), `rename` (`path`, `name`), `move` (`path`, `parent`) or `remove` (`path`), and an add or set takes a script's text from `sourceFile`, syntax-checked as `rbx ck` does. Ops apply in order and may name instances earlier ops created by `#ref`, values behave as in `rbx bs`, every touched store and script file is written together, and a failing op names its index and writes nothing. The result lists one receipt per op under `ops` (formerly `created`); with `--push`, renames, moves and removals reach the open place first, each touched store is pushed once, and the result reports one `verified`.
 - One call reads several saved values: `rbx bg SERVICE TARGET A B C` prints one object, `rbx in SERVICE T1 T2` one array, and `rbx q FILE -n A -n B -c Class -s TEXT` matches any of the repeated selectors in one decode of the place file.
 - `rbx play -s` waits up to 60 s until the session's players exist and reports `playersReady`; `--no-ready` returns at once. `rbx play -r` stops, lets Live Sync apply the file edits it deferred during Play (`appliedPending`), then restarts.
