@@ -255,7 +255,7 @@ pub(crate) fn stored_path_segments(
     Ok(segments.get(index).cloned().flatten())
 }
 
-fn luau_string_list(items: &[String]) -> String {
+pub(crate) fn luau_string_list(items: &[String]) -> String {
     let items = items
         .iter()
         .map(|item| format!("{item:?}"))

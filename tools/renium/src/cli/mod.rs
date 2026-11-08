@@ -1845,6 +1845,13 @@ pub(super) struct StartStopPlayArgs {
     )]
     pub(super) no_ready: bool,
     #[arg(
+        help = "Once the first player's character exists, stand it on this instance (a path such as Workspace.Lobby.SpawnPad) or at a position x,y,z, before --until; the result carries `at`",
+        long,
+        value_name = "PATH|X,Y,Z",
+        conflicts_with_all = ["stop", "kill_orphans", "add_players", "leave"]
+    )]
+    pub(super) at: Option<String>,
+    #[arg(
         help = "After the start (and --until) return the last N server console entries as `console`",
         long,
         value_name = "N",

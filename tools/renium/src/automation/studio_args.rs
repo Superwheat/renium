@@ -190,6 +190,7 @@ pub(super) fn play(operation: u16, parameters: &Value) -> Result<StartStopPlayAr
         until_timeout: 120.0,
         result: None,
         console: None,
+        at: None,
         stop_after: false,
         // The CLI waits for the players; the daemon only starts the session.
         no_ready: true,

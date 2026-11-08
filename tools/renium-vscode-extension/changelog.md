@@ -10,6 +10,7 @@
 - `rbx cs --wait SECONDS` blocks until a Studio is connected instead of needing a shell loop.
 - `rbx ba` and `rbx bs` take `--push`, which sends the edited instance to the open Studio place right after the file write, scoped to that instance and without a review; `rbx bs` sets several properties in one call with repeated `-p NAME=JSON`.
 - `rbx play -s --console N` returns the last N server console entries with the start result, after `--until` when given; `--stop-after` then stops the session, so one call runs a play check.
+- `rbx play -s --at PATH` stands the first player's character on an instance (or at a position `x,y,z`) once it spawns, before `--until` runs, so a touch check needs no hand-written move.
 - `rbx ba` and `rbx bs` accept `Position` on a part and store it as the part's CFrame (keeping an existing rotation), instead of writing a property Studio never applies.
 - A new instance pushed with its properties counts as one change toward the review threshold, in the daemon and in the Studio plugin, so a single new part no longer opens a review.
 - The root agent guide carries recipes for the common edits, so a task that adds or changes instances, writes a script or runs a play check needs no further guide.

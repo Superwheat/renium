@@ -11,7 +11,7 @@ Use `rbx` from the place's project folder. Act directly: commands report a missi
 - Values are JSON: `1`, `true`, `"text"`, `[x,y,z]` (Vector3), `{"_type":"Color3","r":1,"g":0.5,"b":0}`, `{"_type":"EnumItem","name":"Neon"}`, `{"_type":"UDim2","xScale":0,"xOffset":200,"yScale":0,"yOffset":50}`, `{"_type":"CFrame","position":[x,y,z]}`.
 - Studio-only change, or tags and many edits at once: `rbx l --edit 'LUAU'` applies in Studio as one undo step and returns the chunk's value, so return what verifies it; `rbx pl -s SERVICE` afterwards copies the result into the files.
 - New script: write `src/ServerScriptService/Name.server.luau`, then `rbx ck FILE && rbx ba ServerScriptService -n Name -c Script --push`. Edited scripts: `rbx ck FILE && rbx ps FILE` (nothing with Live Sync on).
-- Play check: `rbx play -s --until 'workspace.DistributedGameTime > 10' --console 40 --stop-after` starts, waits, returns the server console and stops; or without `--stop-after`: `rbx l --server 'LUAU'`, `rbx co --server --level error`, `rbx play -x`.
+- Play check, one call: `rbx play -s --at Workspace.Lobby.SpawnPad --until 'LUAU' --console 40 --stop-after` starts, stands the player on the instance (`--at` optional), waits for the server expression (`workspace.DistributedGameTime > 10` for a timed run), returns the console and stops. Longer checks: `rbx l --server 'LUAU'`, `rbx co --server --level error`, `rbx play -x`.
 - A push result's `studio` block is the read-back; no extra read.
 
 ## Choose the smallest sufficient check
@@ -20,7 +20,7 @@ Use `rbx` from the place's project folder. Act directly: commands report a missi
 - Runtime behavior: Play answers one specific question (input, replication, physics, errors); know the expected result first.
 - Visual behavior: capture the real client with real input (`rs`, `inp`, `re`) and read `rf` frames; scripts cannot see it.
 
-Check syntax offline with `rbx ck FILE`, not `loadstring`. With Live Sync on, trust file edits: no push, poll or Play after each save; `lst --wait` only after a reported problem. A `ps` over 5 changes (default threshold) applies nothing and returns its change list; check it, then pass `--yes`. Reuse Play sessions, batch checks, never stop a user's session; wait with `rbx wait EXPR -t N`.
+Check syntax with `rbx ck FILE`, not `loadstring`. With Live Sync on, trust file edits: no push, poll or Play after each save; `lst --wait` only after a reported problem. A `ps` over 5 changes (default threshold) applies nothing and returns its change list; check it, then pass `--yes`. Reuse Play sessions, batch checks, never stop a user's session; wait with `rbx wait EXPR -t N`.
 
 ## Guides
 
@@ -30,7 +30,7 @@ When the recipes do not cover the task, read the guide once; reread after a repo
 
 Single-place projects use `src`; experiences `places/<alias>/src`, and at the experience root add `--place <alias|placeId>`. Two Studios on one project: `--place <placeId|window name>` first.
 
-Edit scripts as files; stores are compressed (no grep). `f`/`bg`/`bb` read saved data, `q` a closed place, `l` Studio. Reuse IDs. Run mutations one at a time and read each result; after a failure check state first. A usage error (unknown flag, missing selector): fix the call and rerun. `l` tables over 128 keys are cut.
+Edit scripts as files; stores are compressed (no grep). `f`/`bg`/`bb` read saved data, `q` a closed place, `l` Studio. Run mutations one at a time and read each result; after a failure check state first.
 
 Fix and verify defects in requested work. Report `autoDesyncedPackages`. Publishing needs authorization. Say synced, not saved: `persistence: teamCreate` means Team Create saved it, `unsaved` means the user saves. Open Cloud uploads follow `RENIUM/publishing-validation.md`.
 

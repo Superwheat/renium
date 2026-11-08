@@ -568,6 +568,11 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
     {
         attach_player_readiness(&mut result, &args);
     }
+    if let Some(target) = args.at.as_deref()
+        && result.get("ok").and_then(Value::as_bool) != Some(false)
+    {
+        result["at"] = stand_player_at(target, &result, &args);
+    }
     if let Some(condition) = args.until.as_deref()
         && result.get("ok").and_then(Value::as_bool) != Some(false)
     {
@@ -633,6 +638,80 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
         compact_play_result(&mut result, args.players.is_some());
     }
     print_json_output(&result, false)
+}
+
+/// Runs `--at` on the play server: the first player's character is stood on
+/// the target once it exists, and the outcome (`moved`, `player`, `position`
+/// or `error`) is the `at` field of the start result.
+fn stand_player_at(target: &str, result: &Value, args: &StartStopPlayArgs) -> Value {
+    let code = stand_player_code(target);
+    let run = daemon_control_request(
+        op::LUAU,
+        None,
+        json!({
+            "code": code,
+            "server": true,
+            "timeout": 45.0,
+            "editRuntimeId": result.get("editRuntimeId"),
+            "bridgeWaitSeconds": args.bridge.wait_seconds,
+            "bridgePorts": args.bridge.ports,
+        }),
+        false,
+    );
+    match run {
+        Ok(run) if run.get("ok") == Some(&Value::Bool(true)) => run
+            .get("results")
+            .and_then(Value::as_array)
+            .and_then(|results| results.first())
+            .cloned()
+            .unwrap_or_else(|| json!({ "moved": false, "error": "the move returned nothing" })),
+        Ok(run) => json!({
+            "moved": false,
+            "error": run.get("error").cloned().unwrap_or_else(|| json!("the move failed"))
+        }),
+        Err(error) => json!({ "moved": false, "error": format!("{error:#}") }),
+    }
+}
+
+/// Server Luau for `--at`: waits up to 30 s for the first player's character
+/// and HumanoidRootPart, pivots the character so its feet rest on the target
+/// (the top face of a part or model, or the given position), zeroes its
+/// velocity and gives the physics 1.5 s to register the contact.
+fn stand_player_code(target: &str) -> String {
+    let position = target
+        .split(',')
+        .map(|part| part.trim().parse::<f64>())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .ok()
+        .filter(|parts| parts.len() == 3);
+    let goal = match position {
+        Some(parts) => format!("CFrame.new({}, {}, {})", parts[0], parts[1], parts[2]),
+        None => {
+            let mut segments = target
+                .split('.')
+                .map(str::trim)
+                .filter(|segment| !segment.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if segments
+                .first()
+                .is_some_and(|first| first.eq_ignore_ascii_case("game"))
+            {
+                segments.remove(0);
+            }
+            if segments.first().is_some_and(|first| first == "workspace") {
+                segments[0] = "Workspace".to_string();
+            }
+            format!(
+                "(function() local inst = game for _, name in {} do inst = inst:FindFirstChild(name) if not inst then error('no instance {}') end end local size = if inst:IsA('BasePart') then inst.Size elseif inst:IsA('Model') then inst:GetExtentsSize() else Vector3.zero return inst:GetPivot() * CFrame.new(0, size.Y / 2, 0) end)()",
+                crate::bytecode::edit::luau_string_list(&segments),
+                target.replace(['\\', '\''], ""),
+            )
+        }
+    };
+    format!(
+        "local deadline = os.clock() + 30 local player, character, root repeat task.wait(0.1) player = game.Players:GetPlayers()[1] character = player and player.Character root = character and character:FindFirstChild('HumanoidRootPart') until root or os.clock() > deadline if not root then return {{ moved = false, error = 'no player character within 30 s' }} end local goal = {goal} character:PivotTo(goal * CFrame.new(0, 3, 0)) root.AssemblyLinearVelocity = Vector3.zero task.wait(1.5) return {{ moved = true, player = player.Name, position = {{ root.Position.X, root.Position.Y, root.Position.Z }} }}"
+    )
 }
 
 /// The server-side condition a started session is ready for its first test
@@ -4576,6 +4655,22 @@ mod play_state_tests {
             crate::cli::Commands::StartStopPlay(args) => Ok(args),
             _ => panic!("expected play"),
         }
+    }
+
+    #[test]
+    fn play_at_takes_a_path_or_a_position() {
+        let args = play_args(&["rbx", "play", "-s", "--at", "Workspace.Lobby.SpawnPad"]).unwrap();
+        assert_eq!(args.at.as_deref(), Some("Workspace.Lobby.SpawnPad"));
+        let code = stand_player_code("game.workspace.Lobby.SpawnPad");
+        assert!(
+            code.contains(r#"{"Workspace", "Lobby", "SpawnPad"}"#),
+            "{code}"
+        );
+        assert!(code.contains("inst:GetPivot() * CFrame.new(0, size.Y / 2, 0)"));
+        assert!(code.contains("character:PivotTo(goal * CFrame.new(0, 3, 0))"));
+        let code = stand_player_code("30, 4, 0");
+        assert!(code.contains("local goal = CFrame.new(30, 4, 0)"), "{code}");
+        assert!(play_args(&["rbx", "play", "-x", "--at", "Workspace.Pad"]).is_err());
     }
 
     #[test]
