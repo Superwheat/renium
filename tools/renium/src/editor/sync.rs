@@ -1745,6 +1745,15 @@ pub(crate) fn push_editor_changes_with_warm_bridge_guarded(
     }
     let (changes, projection) = collect_project_editor_changes(&args)?;
     validate_source_verification_selection(&args, &changes)?;
+    let mut args = args;
+    // A push of a few scripts reads them back so the result's `verified`
+    // answers the question an agent would otherwise ask Studio again.
+    if !args.verify_sources
+        && !changes.source_changes.is_empty()
+        && changes.source_changes.len() <= VERIFY_SOURCES_BY_DEFAULT_LIMIT
+    {
+        args.verify_sources = true;
+    }
     push_editor_changes_with_collected(
         args,
         bridge,
@@ -1759,6 +1768,10 @@ pub(crate) fn push_editor_changes_with_warm_bridge_guarded(
         },
     )
 }
+
+/// Pushes with at most this many changed scripts verify their sources without
+/// `--verify-sources`.
+const VERIFY_SOURCES_BY_DEFAULT_LIMIT: usize = 25;
 
 /// An unreviewed full push removes whatever Studio holds and the files do not,
 /// including newer Team Create work; say so before it happens.

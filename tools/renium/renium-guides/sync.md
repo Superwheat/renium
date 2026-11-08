@@ -4,7 +4,7 @@
 
 ```powershell
 rbx pl
-rbx ps src/ServerScriptService/Main.server.luau --verify-sources
+rbx ps src/ServerScriptService/Main.server.luau   # a push of up to 25 scripts reads them back: `verified: true`
 rbx lon
 rbx lst
 rbx lof
@@ -52,7 +52,7 @@ An unfiltered push reconciles the entire place and can remove Studio-only conten
 
 Pulls restore read-only `.renium` link mirrors from their saved packages (`readOnlyLinksRestored` lists them; a difference does not tell which copy is newer). Push the link path to apply the package in Studio, or edit the source and run `lk`. Restores are not user edits in Live Sync. `ps --override-packages` bypasses push protection; a later pull restores the package again. See [links](links.md) for stray files.
 
-`ps --verify` compares script sources and pushes nothing (`sourceVerifyErrors` lists mismatches; all scripts without paths); `ps --verify-sources` pushes, then checks. Reads of `Instance.Source` are no substitute: an open ScriptDocument can differ.
+`ps --verify` compares script sources and pushes nothing (`sourceVerifyErrors` lists mismatches; all scripts without paths). A push of up to 25 changed scripts reads them back on its own (`sourceVerified`, `verified: true`); `ps --verify-sources` forces that for larger pushes. Reads of `Instance.Source` are no substitute: an open ScriptDocument can differ.
 
 Player capacity (`Players.MaxPlayers`, `PreferredPlayers`) comes from Roblox Game Settings; exports and comparisons keep it.
 

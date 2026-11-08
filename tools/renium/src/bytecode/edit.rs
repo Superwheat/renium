@@ -322,7 +322,27 @@ pub(crate) fn push_stored_instances(
         crate::cli::ProjectSourceArgs::current(),
         crate::cli::BridgeConnectionArgs::default_connection(),
     );
-    args.changed_paths = vec![settings_file];
+    // A scoped push creates the instances from the store; a script's text
+    // travels as its file, so the files of the pushed scripts go along.
+    let mut changed_paths = vec![settings_file.clone()];
+    if let Ok(document) = SettingsBytecode::read_file(&settings_file) {
+        let service = bytecode_service_name(&document, &settings_file, "");
+        let service_dir = crate::project::storage::source_directory(&settings_file);
+        let source_paths = crate::editor::paths::build_editor_source_paths_by_index(
+            &document,
+            &service,
+            &service_dir,
+        );
+        for (index, instance) in document.instances.iter().enumerate() {
+            if settings_ids.contains(&instance.settings_id)
+                && let Some(Some(path)) = source_paths.get(index)
+                && path.is_file()
+            {
+                changed_paths.push(path.clone());
+            }
+        }
+    }
+    args.changed_paths = changed_paths;
     args.target_settings_ids = settings_ids;
     args.yes = true;
     args.verify_sources = true;

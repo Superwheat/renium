@@ -1469,6 +1469,25 @@ pub(crate) fn typed_store_property_value(
     let Some(descriptor) = rbx_property_descriptor(database, class_name, property_name) else {
         return Ok(value);
     };
+    if let RbxDataType::Enum(enum_name) = &descriptor.data_type {
+        // A plain item name, a number or a partial EnumItem object is stored
+        // in the canonical EnumItem form, so the stores and Studio compare equal.
+        if !value.is_null() {
+            return json_to_rbx_enum_variant(&value, Some(*enum_name), database)
+                .and_then(|variant| {
+                    rbx_variant_to_persisted_settings_json(
+                        &variant,
+                        Some(descriptor),
+                        database,
+                        &Default::default(),
+                    )
+                })
+                .with_context(|| {
+                    format!("{property_name} needs an Enum.{enum_name} item, got {value}")
+                });
+        }
+        return Ok(value);
+    }
     let RbxDataType::Value(value_type) = &descriptor.data_type else {
         return Ok(value);
     };
@@ -1694,7 +1713,14 @@ fn json_to_rbx_vector3int16(value: &Value) -> Option<RbxVector3int16> {
     ))
 }
 
+/// `{"scale", "offset"}` or the compact `[scale, offset]`.
 fn json_to_rbx_udim(value: &Value) -> Option<RbxUDim> {
+    let value = json_wrapped_value(value, "UDim");
+    if let Some(items) = value.as_array()
+        && items.len() == 2
+    {
+        return Some(RbxUDim::new(json_f32(&items[0])?, json_i32(&items[1])?));
+    }
     let obj = json_object(value)?;
     Some(RbxUDim::new(
         json_f32(obj.get("scale")?)?,
@@ -1702,7 +1728,18 @@ fn json_to_rbx_udim(value: &Value) -> Option<RbxUDim> {
     ))
 }
 
+/// `{"xScale", "xOffset", "yScale", "yOffset"}` or the compact
+/// `[xScale, xOffset, yScale, yOffset]`.
 fn json_to_rbx_udim2(value: &Value) -> Option<RbxUDim2> {
+    let value = json_wrapped_value(value, "UDim2");
+    if let Some(items) = value.as_array()
+        && items.len() == 4
+    {
+        return Some(RbxUDim2::new(
+            RbxUDim::new(json_f32(&items[0])?, json_i32(&items[1])?),
+            RbxUDim::new(json_f32(&items[2])?, json_i32(&items[3])?),
+        ));
+    }
     let obj = json_object(value)?;
     Some(RbxUDim2::new(
         RbxUDim::new(
@@ -1716,16 +1753,28 @@ fn json_to_rbx_udim2(value: &Value) -> Option<RbxUDim2> {
     ))
 }
 
+/// `[r, g, b]` arrays are 0-1 floats, or 0-255 bytes when any channel is
+/// above 1, so `[255, 170, 0]` and `[1, 0.667, 0]` name the same color.
 pub(crate) fn json_to_rbx_color3(value: &Value) -> Option<RbxColor3> {
     let value = json_wrapped_value(value, "Color3");
     if let Some(items) = value.as_array() {
         if items.len() < 3 {
             return None;
         }
-        return Some(RbxColor3::new(
+        let channels = [
             json_f32(&items[0])?,
             json_f32(&items[1])?,
             json_f32(&items[2])?,
+        ];
+        let scale = if channels.iter().any(|channel| *channel > 1.0) {
+            255.0
+        } else {
+            1.0
+        };
+        return Some(RbxColor3::new(
+            channels[0] / scale,
+            channels[1] / scale,
+            channels[2] / scale,
         ));
     }
     let obj = json_object(value)?;
@@ -1827,8 +1876,21 @@ fn json_to_rbx_rect(value: &Value) -> Option<RbxRect> {
     ))
 }
 
+/// `{"min", "max"}` or the compact `[min, max]`; one number is a fixed range.
 fn json_to_rbx_number_range(value: &Value) -> Option<RbxNumberRange> {
-    let obj = json_object(json_wrapped_value(value, "NumberRange"))?;
+    let value = json_wrapped_value(value, "NumberRange");
+    if let Some(items) = value.as_array()
+        && items.len() == 2
+    {
+        return Some(RbxNumberRange::new(
+            json_f32(&items[0])?,
+            json_f32(&items[1])?,
+        ));
+    }
+    if let Some(number) = json_f32(value) {
+        return Some(RbxNumberRange::new(number, number));
+    }
+    let obj = json_object(value)?;
     Some(RbxNumberRange::new(
         json_f32(obj.get("min")?)?,
         json_f32(obj.get("max")?)?,
@@ -2311,6 +2373,51 @@ pub(crate) fn settings_root_indices(document: &SettingsBytecode) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_value_shapes_store_like_their_canonical_forms() {
+        let stored = |class: &str, property: &str, value: Value| {
+            typed_store_property_value(class, property, value).unwrap()
+        };
+        assert_eq!(
+            stored("Frame", "Size", json!([0, 200, 0, 40])),
+            stored(
+                "Frame",
+                "Size",
+                json!({"_type": "UDim2", "xScale": 0, "xOffset": 200, "yScale": 0, "yOffset": 40})
+            )
+        );
+        assert_eq!(
+            stored("UIListLayout", "Padding", json!([0, 8])),
+            stored("UIListLayout", "Padding", json!({"scale": 0, "offset": 8}))
+        );
+        assert_eq!(
+            stored("Frame", "AnchorPoint", json!([0.5, 0.5])),
+            stored("Frame", "AnchorPoint", json!({"x": 0.5, "y": 0.5}))
+        );
+        assert_eq!(
+            stored("Part", "Color", json!([255, 0, 51])),
+            stored(
+                "Part",
+                "Color",
+                json!({"_type": "Color3", "r": 1, "g": 0, "b": 0.2})
+            )
+        );
+        assert_eq!(
+            stored("ParticleEmitter", "Lifetime", json!([1, 2])),
+            stored("ParticleEmitter", "Lifetime", json!({"min": 1, "max": 2}))
+        );
+        assert_eq!(
+            stored("Part", "Material", json!("Neon")),
+            stored(
+                "Part",
+                "Material",
+                json!({"_type": "EnumItem", "enumType": "Material", "name": "Neon"})
+            )
+        );
+        assert!(stored("Part", "Material", json!("Neon")).is_object());
+        assert!(typed_store_property_value("Part", "Material", json!("NoSuchMaterial")).is_err());
+    }
 
     #[test]
     fn export_fills_undefaulted_members_from_the_stores_and_drops_empty_blobs() {

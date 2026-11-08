@@ -258,7 +258,7 @@ fn add_instance_creates_scripts_adopts_files_and_refuses_conflicts() {
         fx.read_store("Workspace").instances
             [script_with_context["index"].as_u64().unwrap() as usize]
             .properties["RunContext"],
-        json!("Client")
+        json!({"_type": "EnumItem", "name": "Client"})
     );
 }
 

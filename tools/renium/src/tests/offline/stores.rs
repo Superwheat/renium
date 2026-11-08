@@ -901,7 +901,10 @@ fn set_property_writes_every_value_form() {
         set(&["Material", "--str", "Plastic"]),
         set_result("Material")
     );
-    assert_eq!(get("Material"), json!("Plastic"));
+    assert_eq!(
+        get("Material"),
+        json!({"_type": "EnumItem", "name": "Plastic"})
+    );
     assert_eq!(
         set(&[
             "Material",

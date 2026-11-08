@@ -49,7 +49,7 @@ Every store command takes the target the same way: a positional name or dotted p
 Use a service name or `-f STORE`, not both.
 Use a service name or `-f STORE`, not both.
 
-Values: `--str`, `--num`, `--bool`, `--null`, or `-j JSON` (`-j -` reads stdin); several `-p NAME=JSON` set several properties at once. `--push` on `ba`, `bs`, `mv` and `rn` pushes that instance at once, no review; `ba --batch --push` pushes every created instance.
+Values: `--str`, `--num`, `--bool`, `--null`, or `-j JSON` (`-j -` reads stdin); several `-p NAME=JSON` set several properties at once. Composite values take the property's type: `[x,y,z]` Vector3, `[x,y]` Vector2, `[r,g,b]` Color3 (bytes when any channel is above 1), `"Neon"` or `{"_type":"EnumItem","name":"Neon"}` for enums, `[scale,offset]` UDim, `[xScale,xOffset,yScale,yOffset]` UDim2, `[min,max]` NumberRange, `{"_type":"CFrame","position":[x,y,z]}`; the stores keep the canonical form `rbx bg` shows. `--push` on `ba`, `bs`, `mv` and `rn` pushes that instance at once, no review; `ba --batch --push` pushes every created instance.
 
 `bs --where QUERY` applies the assignments to every instance under the target (the whole service without one) that matches the bulk-read query language: words match names, `is:Class`, `tag:Name`, `Prop=value`, `Prop>0.5` (also `!=`, `<`, `<=`, `>=`), `or` between alternatives. 500 matches at most per call; `--push` pushes them together and `studio` reads each back (the first 64). The result lists `instances` and `matched`.
 `--null` removes an override; writing the default stores one.
