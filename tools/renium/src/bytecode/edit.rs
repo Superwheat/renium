@@ -417,7 +417,7 @@ pub(crate) fn read_back_many_from_studio(
         .collect::<Vec<_>>()
         .join(", ");
     let code = format!(
-        "local function at(segments) local inst = game for _, name in segments do inst = inst:FindFirstChild(name) if not inst then return nil end end return inst end local rows = {{}} for _, segments in {{{paths}}} do local inst = at(segments) if not inst then table.insert(rows, {{ missing = true, path = table.concat(segments, '.') }}) else local row = {{ path = inst:GetFullName(), class = inst.ClassName }} for _, name in {} do local ok, value = pcall(function() return inst[name] end) if ok then row[name] = value end end for _, name in {} do row['@' .. name] = inst:GetAttribute(name) end table.insert(rows, row) end end return rows",
+        "local function at(segments) local inst = game for _, name in segments do inst = inst:FindFirstChild(name) if not inst then return nil end end return inst end local rows = {{}} for _, segments in {{{paths}}} do local inst = at(segments) if not inst then table.insert(rows, {{ missing = true, path = table.concat(segments, '.') }}) else local row = {{ path = inst:GetFullName(), class = inst.ClassName }} for _, name in {} do if name == 'Tags' then row[name] = inst:GetTags() else local ok, value = pcall(function() return inst[name] end) if ok then row[name] = value end end end for _, name in {} do row['@' .. name] = inst:GetAttribute(name) end table.insert(rows, row) end end return rows",
         luau_string_list(properties),
         luau_string_list(attributes),
     );

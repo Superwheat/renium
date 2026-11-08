@@ -1485,7 +1485,6 @@ pub(crate) fn typed_store_property_value(
             "Position" | "Orientation" | "Rotation" => "; set CFrame",
             "Pitch" => "; set PlaybackSpeed",
             "MaxDistance" | "MinDistance" => "; set RollOffMaxDistance or RollOffMinDistance",
-            "Tags" => "; tag with `rbx l --edit`",
             _ => "",
         };
         bail!(
