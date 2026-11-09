@@ -434,10 +434,17 @@ pub(crate) fn studio_device_result(
         params.insert("details".to_string(), Value::Bool(true));
     }
     let requested_params = params.clone();
-    let result =
+    let action = args.action.to_ascii_lowercase();
+    let mut result =
         bridge.call_for_target("deviceSimulator", Value::Object(params), BridgeTarget::Edit)?;
+    if result.get("timedOut") == Some(&Value::Bool(true))
+        && matches!(action.as_str(), "set" | "select" | "apply")
+        && let Some(settled) = settled_device_status(bridge, &requested_params)
+    {
+        result = settled;
+    }
     ensure_plugin_api_ok(&result)?;
-    match args.action.to_ascii_lowercase().as_str() {
+    match action.as_str() {
         "stop" | "reset" => {
             #[cfg(any(windows, target_os = "macos"))]
             {
@@ -485,6 +492,53 @@ pub(crate) fn studio_device_result(
         _ => {}
     }
     Ok(result)
+}
+
+/// Studio's device setters can outlive the plugin's reply window and still
+/// finish; the status read afterwards says whether the requested device is
+/// now simulated, in which case that status stands in for the set's result.
+fn settled_device_status(bridge: &BridgeServer, requested: &Map<String, Value>) -> Option<Value> {
+    let wanted = requested
+        .get("device")
+        .and_then(Value::as_str)
+        .map(device_name_key);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = bridge
+            .call_for_target(
+                "deviceSimulator",
+                json!({ "action": "status" }),
+                BridgeTarget::Edit,
+            )
+            .ok()?;
+        let simulating = status.get("simulating") == Some(&Value::Bool(true));
+        let device_matches = wanted.as_deref().is_none_or(|wanted| {
+            ["name", "id"].iter().any(|key| {
+                status["device"][key]
+                    .as_str()
+                    .is_some_and(|value| device_name_key(value) == wanted)
+            })
+        });
+        if simulating && device_matches {
+            let mut settled = status;
+            settled["action"] = json!("set");
+            settled["settledAfterTimeout"] = json!(true);
+            return Some(settled);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// `iPhone 16 Pro` and `iphone_16_pro` name the same device.
+fn device_name_key(value: &str) -> String {
+    value
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect::<String>()
+        .to_ascii_lowercase()
 }
 
 fn wait_for_player_bridge(bridge: &BridgeServer, player: &str, wait_seconds: f64) -> Result<()> {

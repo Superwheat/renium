@@ -1644,7 +1644,42 @@ pub(crate) fn push_editor_changes(args: PushEditorChangesArgs) -> Result<()> {
     print_json_output(&result, global_pretty_output(false))
 }
 
+/// Script files named on the command line are the whole intent of the push,
+/// so their changes apply without the large-push hold; a store file can carry
+/// any number of instance changes and keeps it.
+fn named_script_files(paths: &[PathBuf]) -> bool {
+    !paths.is_empty()
+        && paths.iter().all(|path| {
+            matches!(
+                path.extension().and_then(|extension| extension.to_str()),
+                Some("lua" | "luau")
+            )
+        })
+}
+
+#[cfg(test)]
+mod named_script_tests {
+    use super::named_script_files;
+    use std::path::PathBuf;
+
+    #[test]
+    fn only_a_list_of_script_files_skips_the_hold() {
+        let paths = |items: &[&str]| items.iter().map(PathBuf::from).collect::<Vec<_>>();
+        assert!(named_script_files(&paths(&[
+            "src/A.server.luau",
+            "src/B.client.lua"
+        ])));
+        assert!(!named_script_files(&paths(&[])));
+        assert!(!named_script_files(&paths(&["src"])));
+        assert!(!named_script_files(&paths(&[
+            "src/A.luau",
+            "instances/Workspace.renium"
+        ])));
+    }
+}
+
 pub(crate) fn push_editor_changes_result(mut args: PushEditorChangesArgs) -> Result<Value> {
+    let named_scripts = named_script_files(&args.paths);
     args.changed_paths.append(&mut args.paths);
     resolve_cli_push_paths(&mut args, &std::env::current_dir()?)?;
     apply_configured_project_layout(&mut args.project.project_root, &mut args.project.src_root)?;
@@ -1665,7 +1700,7 @@ pub(crate) fn push_editor_changes_result(mut args: PushEditorChangesArgs) -> Res
         "verify": args.verify,
         "overridePackages": args.override_packages,
         "allowProtectedWrites": !args.no_review,
-        "yes": args.yes || global_yes(),
+        "yes": args.yes || global_yes() || named_scripts,
         "reviewReport": true,
         "linkCacheDir": args.link_cache_dir,
         "bridgeWaitSeconds": args.bridge.wait_seconds,

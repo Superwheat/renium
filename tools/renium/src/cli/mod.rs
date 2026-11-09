@@ -2886,7 +2886,7 @@ pub(super) struct PushEditorChangesArgs {
     )]
     pub(super) no_review: bool,
     #[arg(
-        help = "Apply a push of more than 5 changes at once instead of getting its change list back (`heldForReview`)",
+        help = "Apply a push of more than 5 changes at once instead of getting its change list back (`heldForReview`); script files named on the command line apply without it",
         long,
         alias = "apply"
     )]

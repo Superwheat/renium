@@ -1050,12 +1050,14 @@ fn high_level_match_path_candidates(
 }
 
 fn high_level_match_name_candidates(ctx: &HighLevelBytecodeContext, name: &str) -> Vec<usize> {
-    ctx.document
+    let named = ctx
+        .document
         .instances
         .iter()
         .enumerate()
         .filter_map(|(index, instance)| (instance.name == name).then_some(index))
-        .collect()
+        .collect::<Vec<_>>();
+    query::prefer_shallowest(&ctx.document, &named)
 }
 
 fn high_level_match_class_candidates(

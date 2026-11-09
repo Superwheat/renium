@@ -46,6 +46,7 @@ pub(crate) fn resolve_document_target(document: &SettingsBytecode, raw: &str) ->
             .enumerate()
             .filter_map(|(index, instance)| (instance.name == raw).then_some(index))
             .collect::<Vec<_>>();
+        let named = prefer_shallowest(document, &named);
         match named.len() {
             1 => return Ok(named[0]),
             0 => {}
@@ -64,6 +65,42 @@ pub(crate) fn resolve_document_target(document: &SettingsBytecode, raw: &str) ->
         document_root_service_name(document),
     );
     document_instance_index_by_path_unique(document, &segments, &ordinals)
+}
+
+/// Among instances sharing a name, the one nearest the service when it is
+/// alone at that depth: `Misc` means `ReplicatedStorage.Misc`, not a frame
+/// six levels down that happens to share the name. Several at the same
+/// smallest depth stay ambiguous.
+pub(crate) fn prefer_shallowest(document: &SettingsBytecode, indices: &[usize]) -> Vec<usize> {
+    if indices.len() < 2 {
+        return indices.to_vec();
+    }
+    let depth = |mut index: usize| {
+        let mut depth = 0;
+        while let Some(parent) = document.instances[index].parent_index
+            && depth < document.instances.len()
+        {
+            depth += 1;
+            index = parent;
+        }
+        depth
+    };
+    let depths = indices
+        .iter()
+        .map(|&index| depth(index))
+        .collect::<Vec<_>>();
+    let nearest = depths.iter().copied().min().unwrap_or(0);
+    let shallow = indices
+        .iter()
+        .zip(&depths)
+        .filter(|(_, depth)| **depth == nearest)
+        .map(|(index, _)| *index)
+        .collect::<Vec<_>>();
+    if shallow.len() == 1 {
+        shallow
+    } else {
+        indices.to_vec()
+    }
 }
 
 /// A settings ID (`editor:5b78`) or any target form `resolve_document_target` takes.
@@ -280,6 +317,33 @@ mod selector_tests {
     }
 
     #[test]
+    fn a_bare_name_picks_the_instance_nearest_the_service() {
+        let document = store(&[
+            ("1", "ReplicatedStorage", None),
+            ("2", "Misc", Some(0)),
+            ("3", "Touch", Some(0)),
+            ("4", "Gui", Some(2)),
+            ("5", "Misc", Some(3)),
+            ("6", "Border", Some(1)),
+            ("7", "Border", Some(1)),
+        ]);
+        assert_eq!(resolve_document_target(&document, "Misc").unwrap(), 1);
+        assert_eq!(
+            resolve_document_target(&document, "Touch.Gui.Misc").unwrap(),
+            4
+        );
+        let error = resolve_document_target(&document, "Border")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("2 instances are named \"Border\""),
+            "{error}"
+        );
+        assert_eq!(prefer_shallowest(&document, &[5, 6]), vec![5, 6]);
+        assert_eq!(prefer_shallowest(&document, &[4, 1]), vec![1]);
+    }
+
+    #[test]
     fn parent_ids_win_over_names_after_path_resolution() {
         let document = store(&[
             ("1", "ServerStorage", None),
@@ -343,7 +407,7 @@ mod selector_tests {
             resolve_document_id_or_target(&document, "Public.Cars").unwrap(),
             3
         );
-        assert!(resolve_document_id_or_target(&document, "Cars").is_err());
+        assert_eq!(resolve_document_id_or_target(&document, "Cars").unwrap(), 1);
         assert!(resolve_document_id_or_target(&document, "editor:9").is_err());
         assert!(resolve_document_id_or_target(&document, "ffff").is_err());
     }

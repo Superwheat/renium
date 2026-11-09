@@ -53,9 +53,13 @@
 - A CFrame value may be given as `{"_type":"CFrame","position":[x,y,z]}` with an optional 3x3 `orientation`, not only as twelve components.
 - The root agent guide carries recipes for moving and renaming, for editing existing scripts, for many instances at once and for the JSON value shapes, and routes the guides in a compact list.
 - `rbx ps`, `rbx prop` and `rbx del` above the review threshold no longer wait 90 s for a Studio review panel nobody answers: they apply nothing and return `heldForReview` with the change list (`review`: path, class and changed names per instance), so the caller reads it and reruns with `--yes`. Pushes from the editor extension and Live Sync keep the Studio panel.
+- A bare instance name resolves to the instance nearest the service when it is the only one of that name at that depth, so `rbx ba ReplicatedStorage -I Misc` and `rbx tr StarterGui Main` pick the top-level folder and screen even when a frame deep inside shares the name; several at the same depth stay ambiguous.
+- `rbx inp` takes `--result`, `--shot` and `-p` after the actions as well as before them.
+- `rbx ps` with script files named on the command line applies them at once; the large-push hold (`heldForReview`) stays for whole-project pushes and store files.
 
 ### Bug fixes
 
+- `rbx dev set` no longer reports a 1.5 s timeout for a device Studio did switch to: when the setters outlive the plugin's reply window, the status read afterwards stands in for the result and carries `settledAfterTimeout`.
 - Live Sync no longer reports a conflict on a part color nobody changed: colors Studio keeps in bytes (a part's `Color`) compare by their byte values, so 0.3 in the files and 77/255 in the open place are one color.
 
 ## 0.5.9 - 2026-11-06

@@ -48,7 +48,7 @@ rbx br Workspace Lobby --where 'Trim or is:PointLight' --push   # every match un
 rbx rn Workspace -i Lobby --where 'Glass' --replace Glass Window_ --push   # Glass3 becomes Window_3
 ```
 
-Every store command takes the target the same way: a positional name or dotted path (`Lobby.Door`), `-i ID`, `-x INDEX`, `-n NAME` or `-c CLASS`. `bg` takes the property after the target or as `-p`; `bs` takes `-p`. `bg`/`bs` with no target address the service itself. Parent options (`-I`) take an ID or a dotted path. Duplicates take inline ordinals (`Borders.Border[4]`, the form compact output prints) or `--ords`.
+Every store command takes the target the same way: a positional name (the instance nearest the service when it is the only one of that name at its depth) or dotted path (`Lobby.Door`), `-i ID`, `-x INDEX`, `-n NAME` or `-c CLASS`. `bg` takes the property after the target or as `-p`; `bs` takes `-p`. `bg`/`bs` with no target address the service itself. Parent options (`-I`) take an ID or a dotted path. Duplicates take inline ordinals (`Borders.Border[4]`, the form compact output prints) or `--ords`.
 Use a service name or `-f STORE`, not both.
 Use a service name or `-f STORE`, not both.
 

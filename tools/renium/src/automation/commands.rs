@@ -636,8 +636,42 @@ fn input_actions(tokens: &[String]) -> Result<Vec<Value>> {
     Ok(actions)
 }
 
-pub(crate) fn input(args: InputArgs, project: Option<&Path>) -> Result<()> {
-    let actions = input_actions(&args.actions)?;
+/// The `inp` options written after the actions, where clap keeps them as
+/// action tokens: `inp -p 1 click Close wait 600 --shot out.png --result 'return 1'`
+/// reads the same as the option-first order.
+#[derive(Default, PartialEq, Debug)]
+struct TrailingInputOptions {
+    actions: Vec<String>,
+    player: Option<String>,
+    result: Option<String>,
+    shot: Option<PathBuf>,
+}
+
+fn lift_trailing_input_options(tokens: &[String]) -> Result<TrailingInputOptions> {
+    let mut lifted = TrailingInputOptions::default();
+    let mut iter = tokens.iter();
+    while let Some(token) = iter.next() {
+        let mut value = || {
+            iter.next()
+                .cloned()
+                .with_context(|| format!("{token} needs a value"))
+        };
+        match token.as_str() {
+            "--result" => lifted.result = Some(value()?),
+            "--player" | "-p" => lifted.player = Some(value()?),
+            "--shot" => lifted.shot = Some(PathBuf::from(value()?)),
+            _ => lifted.actions.push(token.clone()),
+        }
+    }
+    Ok(lifted)
+}
+
+pub(crate) fn input(mut args: InputArgs, project: Option<&Path>) -> Result<()> {
+    let lifted = lift_trailing_input_options(&args.actions)?;
+    args.player = lifted.player.or(args.player);
+    args.result = lifted.result.or(args.result);
+    args.shot = lifted.shot.or(args.shot);
+    let actions = input_actions(&lifted.actions)?;
     let mut result = daemon_result(
         op::INPUT,
         project,
@@ -811,6 +845,42 @@ mod input_action_tests {
             vec![json!({ "action": "dismiss" })]
         );
         assert!(input_actions(&["press".into()]).is_err());
+    }
+
+    #[test]
+    fn options_after_the_actions_are_lifted_out() {
+        let tokens = [
+            "click",
+            "Main.Close",
+            "wait",
+            "600",
+            "--shot",
+            "out.png",
+            "--result",
+            "return 1",
+            "-p",
+            "2",
+        ]
+        .map(String::from);
+        assert_eq!(
+            lift_trailing_input_options(&tokens).unwrap(),
+            TrailingInputOptions {
+                actions: ["click", "Main.Close", "wait", "600"]
+                    .map(String::from)
+                    .to_vec(),
+                player: Some("2".into()),
+                result: Some("return 1".into()),
+                shot: Some(PathBuf::from("out.png")),
+            }
+        );
+        assert_eq!(
+            lift_trailing_input_options(&["key".into(), "E".into()]).unwrap(),
+            TrailingInputOptions {
+                actions: vec!["key".into(), "E".into()],
+                ..TrailingInputOptions::default()
+            }
+        );
+        assert!(lift_trailing_input_options(&["key".into(), "E".into(), "--shot".into()]).is_err());
     }
 }
 
