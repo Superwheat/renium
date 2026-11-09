@@ -22,7 +22,7 @@ When an `rbx` MCP tool is present, call it with the arguments as a list (`steps`
 - Runtime behavior: Play answers one specific question (input, replication, physics, errors); know the expected result first.
 - Visual behavior: capture the real client with real input (`rs`, `inp`, `re`) and read `rf` frames; scripts cannot see it.
 
-Check syntax with `rbx ck FILE`, not `loadstring`. With Live Sync on, trust file edits: no push, poll or Play after each save; `lst --wait` only after a reported problem. A `ps` over 5 changes (default threshold) applies nothing and returns its change list unless its script files are named on the command line; check it, then pass `--yes`. Reuse Play sessions, batch checks, never stop a user's session; wait with `rbx wait EXPR -t N`.
+Check syntax with `rbx ck FILE`, not `loadstring`. With Live Sync on, trust file edits: no push, poll or Play after each save; `lst --wait` only after a reported problem. A `ps` over 5 changes (default threshold) applies nothing and returns its change list unless its script files are named on the command line; check it, then pass `--yes`. Reuse Play sessions, batch checks, never stop a user's session; wait with `rbx wait EXPR -t N`, or `rbx wait 30s` for a fixed time.
 
 ## Guides
 

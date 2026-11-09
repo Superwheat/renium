@@ -2733,7 +2733,9 @@ local PROTECTED_ATTRIBUTE_WRITE_ERRORS = {
 	"read only",
 }
 
-local function changedPropertyNames(properties)
+-- The names in the order they are written. A read-back passes
+-- `forVerification` to also get the names a write leaves to the engine.
+local function changedPropertyNames(properties, forVerification)
 	local names = {}
 	if properties.MeshId ~= nil then
 		names[1] = "MeshId"
@@ -2753,12 +2755,15 @@ local function changedPropertyNames(properties)
 		propertyName = tostring(propertyName)
 		if propertyName ~= "MeshId" and propertyName ~= "MeshContent" and propertyName ~= "MeshSize"
 			and propertyName ~= "Anchored"
-			and (propertyName ~= "TextScaled" or properties.TextWrapped == nil) then
+			and (propertyName ~= "TextScaled" or properties.TextWrapped == nil)
+			and (propertyName ~= "TextWrapped" or properties.TextScaled ~= true or forVerification) then
 			names[#names + 1] = propertyName
 		end
 	end
 	-- TextScaled=true turns TextWrapped on and TextWrapped=false turns
-	-- TextScaled off, so the wrapping value is written first and scaling wins.
+	-- TextScaled off, so the wrapping value is written first and scaling wins;
+	-- next to TextScaled=true the wrapping value is Studio's own and is not
+	-- written at all, which keeps the engine's flips out of the change journal.
 	if properties.TextScaled ~= nil and properties.TextWrapped ~= nil then
 		names[#names + 1] = "TextScaled"
 	end
@@ -3096,6 +3101,12 @@ local function verifyChangedProperty(instance, propertyName, rawValue, change, c
 		end
 		return
 	end
+	-- TextScaled keeps TextWrapped on, so a wrapping value next to it reads
+	-- back as the engine's and counts as retained.
+	if propertyName == "TextWrapped" and select(2, readProperty(instance, "TextScaled")) == true then
+		stats.verified += 1
+		return
+	end
 	-- These fields retain their existing verified native setter path.
 	if isNativeRootProperty(instance, propertyName)
 		or instance:IsA("MeshPart") and isMeshGeometryProperty(propertyName)
@@ -3123,7 +3134,7 @@ local function verifyChangedProperty(instance, propertyName, rawValue, change, c
 end
 
 local function verifyPropertyChange(instance, change, ctx, stats, unreadableNames, serviceName)
-	for _, propertyName in ipairs(changedPropertyNames(change.properties or {})) do
+	for _, propertyName in ipairs(changedPropertyNames(change.properties or {}, true)) do
 		verifyChangedProperty(instance, propertyName, change.properties[propertyName], change, ctx, stats, unreadableNames, serviceName)
 	end
 	for attributeName, rawValue in pairs(change.attributes or {}) do

@@ -144,7 +144,11 @@ pub(super) fn luau(root: &Path, parameters: &Value) -> Result<ExecuteLuauArgs> {
         player: string(object, "player"),
         server: boolean(object, "server")?,
         edit: boolean(object, "edit")?,
-        timeout: number(object, "timeout", 10.0)?,
+        timeout: Some(number(
+            object,
+            "timeout",
+            crate::studio::automation::DEFAULT_LUAU_TIMEOUT_SECONDS,
+        )?),
         runner: crate::cli::LuauRunnerArgs {
             detach: string(object, "detach"),
             collect: string(object, "collect"),

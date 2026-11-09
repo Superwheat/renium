@@ -1657,6 +1657,18 @@ fn named_script_files(paths: &[PathBuf]) -> bool {
         })
 }
 
+/// The hold is skipped only when those script files are everything the push
+/// selects: a service store, a path list or instance ids named beside them
+/// can carry any number of changes.
+fn only_named_scripts(args: &PushEditorChangesArgs) -> bool {
+    named_script_files(&args.paths)
+        && args.services.is_empty()
+        && args.changed_paths.is_empty()
+        && args.changed_paths_files.is_empty()
+        && args.target_settings_ids.is_empty()
+        && args.target_settings_id_files.is_empty()
+}
+
 #[cfg(test)]
 mod named_script_tests {
     use super::named_script_files;
@@ -1676,13 +1688,37 @@ mod named_script_tests {
             "instances/Workspace.renium"
         ])));
     }
+
+    #[test]
+    fn scripts_named_beside_another_selection_keep_the_hold() {
+        let skips_hold = |arguments: &[&str]| {
+            let cli = <crate::cli::Cli as clap::Parser>::try_parse_from(
+                ["rbx", "ps"].iter().chain(arguments).copied(),
+            )
+            .unwrap();
+            match cli.command {
+                crate::cli::Commands::PushEditorChanges(args) => super::only_named_scripts(&args),
+                _ => unreachable!("ps parses as a push"),
+            }
+        };
+        assert!(skips_hold(&["src/A.server.luau", "src/B.luau"]));
+        assert!(!skips_hold(&["src/A.server.luau", "-s", "Workspace"]));
+        assert!(!skips_hold(&[
+            "src/A.server.luau",
+            "-p",
+            "instances/Workspace.renium"
+        ]));
+        assert!(!skips_hold(&["src/A.server.luau", "-i", "editor:4"]));
+        assert!(!skips_hold(&["-s", "Workspace"]));
+    }
 }
 
 pub(crate) fn push_editor_changes_result(mut args: PushEditorChangesArgs) -> Result<Value> {
-    let named_scripts = named_script_files(&args.paths);
+    let named_scripts = only_named_scripts(&args);
     args.changed_paths.append(&mut args.paths);
     resolve_cli_push_paths(&mut args, &std::env::current_dir()?)?;
     apply_configured_project_layout(&mut args.project.project_root, &mut args.project.src_root)?;
+    add_service_store_paths(&mut args)?;
     let incremental = !args.changed_paths.is_empty()
         || !args.changed_paths_files.is_empty()
         || !args.target_settings_ids.is_empty()
@@ -1717,6 +1753,24 @@ pub(crate) fn push_editor_changes_result(mut args: PushEditorChangesArgs) -> Res
         parameters,
         approved,
     )
+}
+
+/// `-s SERVICE` names a service's store file the way `rbx pl -s` does.
+fn add_service_store_paths(args: &mut PushEditorChangesArgs) -> Result<()> {
+    if args.services.is_empty() {
+        return Ok(());
+    }
+    let stores = crate::project::structural::service_store_paths(&args.project.src_root)?;
+    for service in std::mem::take(&mut args.services) {
+        let Some(path) = stores.get(&service) else {
+            bail!(
+                "No store file for {service} under {}; `rbx pl -s {service}` pulls it first",
+                args.project.src_root.display()
+            );
+        };
+        args.changed_paths.push(path.clone());
+    }
+    Ok(())
 }
 
 fn resolve_cli_push_paths(args: &mut PushEditorChangesArgs, invocation_root: &Path) -> Result<()> {

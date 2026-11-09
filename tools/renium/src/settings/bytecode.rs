@@ -846,6 +846,8 @@ fn encode_settings_bytecode_with_reference_lookup(
     validate_settings_hierarchy(&document.instances)?;
     let canonical = canonical_attribute_document(document);
     let document = canonical.as_ref().unwrap_or(document);
+    let settled = forced_properties_settled_document(document);
+    let document = settled.as_ref().unwrap_or(document);
     let payload =
         encode_settings_bytecode_payload_with_reference_lookup(document, build_reference_lookup)?;
     let encoded = wrap_settings_bytecode_payload(&payload)?;
@@ -3833,6 +3835,26 @@ pub(crate) fn canonical_attribute_value(value: &Value) -> Option<Value> {
         return Some(Value::Object(typed));
     }
     None
+}
+
+/// Studio keeps TextWrapped on while TextScaled is on, so a store that says
+/// otherwise would differ from the place after every push and make the next
+/// push rewrite it; every encoded store carries the value Studio keeps. None
+/// when every instance already does.
+fn forced_properties_settled_document(document: &SettingsBytecode) -> Option<SettingsBytecode> {
+    use crate::settings::equivalence::{forced_property_differs, settle_forced_properties};
+    if !document
+        .instances
+        .iter()
+        .any(|instance| forced_property_differs(&instance.properties))
+    {
+        return None;
+    }
+    let mut settled = document.clone();
+    for instance in &mut settled.instances {
+        settle_forced_properties(&mut instance.properties);
+    }
+    Some(settled)
 }
 
 fn canonical_attribute_document(document: &SettingsBytecode) -> Option<SettingsBytecode> {

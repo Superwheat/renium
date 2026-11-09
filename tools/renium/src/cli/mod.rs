@@ -999,7 +999,7 @@ mod tests {
         let detached = client_luau(&["-t", "30", "--detach", "probe", "print(1)", "1"]).unwrap();
         assert_eq!(detached.code.as_deref(), Some("print(1)"));
         assert_eq!(detached.player.as_deref(), Some("1"));
-        assert_eq!(detached.timeout, 30.0);
+        assert_eq!(detached.timeout, Some(30.0));
         let collected = client_luau(&["-t", "15", "--collect", "probe", "1", "--stop"]).unwrap();
         assert_eq!(collected.code, None);
         assert_eq!(collected.player.as_deref(), Some("1"));
@@ -1532,12 +1532,11 @@ pub(super) struct ExecuteLuauArgs {
     )]
     pub(super) edit: bool,
     #[arg(
-        help = "Seconds before the run is cancelled",
+        help = "Seconds before the run is cancelled [default: 10, more for code that sleeps or waits in a loop]",
         short,
-        long,
-        default_value_t = 10.0
+        long
     )]
-    pub(super) timeout: f64,
+    pub(super) timeout: Option<f64>,
     #[command(flatten)]
     pub(super) runner: LuauRunnerArgs,
 }
@@ -1553,12 +1552,11 @@ pub(super) struct ExecuteClientLuauArgs {
     #[arg(hide = true)]
     pub(super) unexpected: Vec<String>,
     #[arg(
-        help = "Seconds before the run is cancelled",
+        help = "Seconds before the run is cancelled [default: 10, more for code that sleeps or waits in a loop]",
         short,
-        long,
-        default_value_t = 10.0
+        long
     )]
-    pub(super) timeout: f64,
+    pub(super) timeout: Option<f64>,
     #[command(flatten)]
     pub(super) runner: LuauRunnerArgs,
 }
@@ -2303,7 +2301,7 @@ pub(super) struct WaitUntilArgs {
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
     #[arg(
-        help = "Luau expression, or a chunk that returns one, that must become true",
+        help = "Luau expression, or a chunk that returns one, that must become true; or a duration such as 30s, 500ms or 2m to wait that long",
         value_name = "LUAU_CONDITION"
     )]
     pub(super) condition: String,
@@ -2814,6 +2812,13 @@ pub(super) struct PushEditorChangesArgs {
     #[arg(help = "Files or directories to push", value_name = "PATH")]
     pub(super) paths: Vec<PathBuf>,
     #[arg(
+        help = "Push a service's store file (instances/NAME.renium), repeatable",
+        short = 's',
+        long = "service",
+        value_name = "SERVICE"
+    )]
+    pub(crate) services: Vec<String>,
+    #[arg(
         help = "Changed file path (repeatable)",
         short = 'p',
         long = "changed-path",
@@ -2912,6 +2917,7 @@ impl PushEditorChangesArgs {
             project,
             bridge,
             paths: Vec::new(),
+            services: Vec::new(),
             changed_paths: Vec::new(),
             changed_paths_files: Vec::new(),
             target_settings_ids: Vec::new(),

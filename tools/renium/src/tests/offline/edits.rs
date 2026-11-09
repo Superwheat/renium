@@ -919,6 +919,41 @@ fn pushed_batch_finds_renamed_moved_and_removed_instances_by_their_old_paths() {
 }
 
 #[test]
+fn a_scaled_label_stores_the_wrapping_studio_keeps() {
+    let fx = Fixture::new("scaled-label");
+    run_batch(
+        &fx,
+        r##"[{"parent":"Workspace","name":"Scaled","class":"TextLabel","props":{"TextScaled":true,"TextWrapped":false}},
+            {"parent":"Workspace","name":"Bare","class":"TextLabel","props":{"TextScaled":true}},
+            {"parent":"Workspace","name":"Plain","class":"TextLabel","props":{"TextScaled":false,"TextWrapped":false}}]"##,
+    )
+    .unwrap();
+    let store = fx.read_store("Workspace");
+    let label = |name: &str| {
+        store
+            .instances
+            .iter()
+            .find(|instance| instance.name == name)
+            .unwrap()
+    };
+    assert_eq!(label("Scaled").properties["TextWrapped"], json!(true));
+    assert_eq!(label("Bare").properties["TextWrapped"], json!(true));
+    assert_eq!(label("Plain").properties["TextWrapped"], json!(false));
+    let workspace = fx.store_arg("Workspace");
+    fx.text(&["bs", "-f", &workspace, "Plain", "-p", "TextScaled=true"])
+        .ok();
+    assert_eq!(
+        fx.read_store("Workspace")
+            .instances
+            .iter()
+            .find(|instance| instance.name == "Plain")
+            .unwrap()
+            .properties["TextWrapped"],
+        json!(true)
+    );
+}
+
+#[test]
 fn batch_ops_share_the_value_handling_and_refusals_of_single_edits() {
     let fx = Fixture::new("batch-ops-values");
     let result = run_batch(

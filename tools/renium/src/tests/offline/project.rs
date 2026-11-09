@@ -138,6 +138,20 @@ fn mapped_project(fx: &Fixture) -> String {
 }
 
 #[test]
+fn a_fixed_wait_sleeps_in_the_command_and_needs_no_studio() {
+    let fx = Fixture::new("fixed-wait");
+    let started = std::time::Instant::now();
+    let waited = fx.json(&["wait", "150ms"]).ok();
+    assert!(started.elapsed() >= std::time::Duration::from_millis(150));
+    assert_eq!(waited["ok"], json!(true));
+    assert_eq!(waited["action"], json!("wait"));
+    assert!(waited["waitedSeconds"].as_f64().unwrap() >= 0.15);
+    let text = fx.text(&["wait", "0.05"]).ok();
+    assert_eq!(text["ok"], json!(true));
+    assert!(text.get("action").is_none());
+}
+
+#[test]
 fn explain_path_describes_plain_mapped_mounted_ignored_and_rule_owned_paths() {
     let fx = Fixture::new("explain");
     let project = fx.path("renium.project.jsonc");

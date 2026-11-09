@@ -70,6 +70,14 @@ pub(crate) fn execute_luau_command(mut args: ExecuteLuauArgs) -> Result<()> {
         args.code = Some(code.trim_start_matches('\u{feff}').to_string());
         args.file = None;
     }
+    let timeout = args.timeout.unwrap_or_else(|| {
+        let code = args.code.clone().or_else(|| {
+            args.file
+                .as_deref()
+                .and_then(|path| fs::read_to_string(path).ok())
+        });
+        default_luau_run_timeout(code.as_deref().unwrap_or(""))
+    });
     let parameters = json!({
         "code": args.code,
         "file": args.file.map(absolute_from_cwd),
@@ -77,7 +85,7 @@ pub(crate) fn execute_luau_command(mut args: ExecuteLuauArgs) -> Result<()> {
         "player": args.player,
         "server": args.server,
         "edit": args.edit,
-        "timeout": args.timeout,
+        "timeout": timeout,
         "detach": args.runner.detach,
         "collect": args.runner.collect,
         "stop": args.runner.stop,
@@ -86,6 +94,12 @@ pub(crate) fn execute_luau_command(mut args: ExecuteLuauArgs) -> Result<()> {
         "bridgePorts": args.bridge.ports,
     });
     let mut result = daemon_result(op::LUAU, None, parameters, false, Some(&args.bridge))?;
+    if args.timeout.is_none()
+        && timeout > DEFAULT_LUAU_TIMEOUT_SECONDS
+        && let Some(map) = result.as_object_mut()
+    {
+        map.insert("timeoutSeconds".to_string(), json!(timeout));
+    }
     if let Some(map) = result.as_object_mut() {
         if map.get("background") == Some(&Value::Bool(false)) {
             map.remove("background");
@@ -288,6 +302,79 @@ fn ensure_luau_ok_in_context(result: &Value, player: Option<&str>) -> Result<()>
     })
 }
 
+/// The run limit `rbx l` and `rbx lc` use when `-t` is not given.
+pub(crate) const DEFAULT_LUAU_TIMEOUT_SECONDS: f64 = 10.0;
+
+/// The run limit when `-t` is not given: it grows to cover the sleeps written
+/// into the code, so a probe with `task.wait(25)` in it is not stopped at
+/// 10 s. Studio stops a runner at 120 s regardless.
+fn default_luau_run_timeout(code: &str) -> f64 {
+    let code = luau_without_strings_and_comments(code);
+    let code = code.as_str();
+    let sleeps = literal_sleep_seconds(code);
+    if waits_in_a_loop(code) {
+        return (sleeps + DEFAULT_LUAU_TIMEOUT_SECONDS).clamp(LUAU_LOOP_TIMEOUT_SECONDS, 120.0);
+    }
+    if sleeps + LUAU_SLEEP_MARGIN_SECONDS <= DEFAULT_LUAU_TIMEOUT_SECONDS {
+        return DEFAULT_LUAU_TIMEOUT_SECONDS;
+    }
+    (sleeps + DEFAULT_LUAU_TIMEOUT_SECONDS).min(120.0)
+}
+
+/// The code with every string and comment blanked, so a `wait(90)` quoted in
+/// a message or left in a comment is not read as a call. Text the tokenizer
+/// cannot read is scanned as it is.
+fn luau_without_strings_and_comments(code: &str) -> String {
+    use full_moon::tokenizer::{Lexer, LexerResult, TokenType};
+    let tokens = match Lexer::new(code, full_moon::LuaVersion::luau()).collect() {
+        LexerResult::Ok(tokens) | LexerResult::Recovered(tokens, _) => tokens,
+        LexerResult::Fatal(_) => return code.to_string(),
+    };
+    let mut text = String::with_capacity(code.len());
+    for token in &tokens {
+        match token.token_type() {
+            TokenType::StringLiteral { .. }
+            | TokenType::InterpolatedString { .. }
+            | TokenType::SingleLineComment { .. }
+            | TokenType::MultiLineComment { .. } => text.push(' '),
+            _ => text.push_str(&token.to_string()),
+        }
+    }
+    text
+}
+
+/// The default limit of code that waits inside a loop: a polling or
+/// step-by-step probe runs for the loop's count, which its literal sleeps
+/// do not show.
+const LUAU_LOOP_TIMEOUT_SECONDS: f64 = 30.0;
+
+fn waits_in_a_loop(code: &str) -> bool {
+    static LOOP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\b(?:for|while|repeat)\b").expect("valid loop pattern")
+    });
+    static WAIT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)\bwait\s*\(").expect("valid wait pattern")
+    });
+    LOOP.is_match(code) && WAIT.is_match(code)
+}
+
+/// Room the default limit leaves after the code's literal sleeps before it
+/// grows; shorter sleeps fit the limit as it is.
+const LUAU_SLEEP_MARGIN_SECONDS: f64 = 5.0;
+
+/// Seconds the code sleeps in `wait(N)` and `task.wait(N)` calls whose N is
+/// a number literal.
+fn literal_sleep_seconds(code: &str) -> f64 {
+    static SLEEP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\bwait\s*\(\s*((?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*\)")
+            .expect("valid sleep pattern")
+    });
+    SLEEP
+        .captures_iter(code)
+        .filter_map(|capture| capture[1].parse::<f64>().ok())
+        .sum()
+}
+
 pub(crate) fn execute_luau_result(args: ExecuteLuauArgs, bridge: &BridgeServer) -> Result<Value> {
     let client = args.client || args.player.is_some();
     let target = if args.server {
@@ -319,7 +406,10 @@ pub(crate) fn execute_luau_result(args: ExecuteLuauArgs, bridge: &BridgeServer) 
     } else {
         bail!("Missing Luau code. Use -e <code> or -f <file>.");
     };
-    let timeout = args.timeout.clamp(0.1, 120.0);
+    let timeout = args
+        .timeout
+        .unwrap_or(DEFAULT_LUAU_TIMEOUT_SECONDS)
+        .clamp(0.1, 120.0);
     let mut request = luau_request(&code, "Renium", target, timeout)?;
     let detached = args.runner.detach.as_deref().map(runner_name).transpose()?;
     if let Some(name) = detached {
@@ -3443,6 +3533,36 @@ fn met_condition_result(args: &WaitUntilArgs, outcome: &LuauTaskOutcome, elapsed
     record
 }
 
+/// A duration given in place of a condition: `30`, `30s`, `500ms` or `2m`.
+fn fixed_wait_seconds(condition: &str) -> Option<f64> {
+    let text = condition.trim();
+    let unit_start = text
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(text.len());
+    let (number, unit) = text.split_at(unit_start);
+    let value: f64 = number.parse().ok()?;
+    let seconds = match unit.trim() {
+        "" | "s" => value,
+        "ms" => value / 1000.0,
+        "m" => value * 60.0,
+        _ => return None,
+    };
+    (seconds.is_finite() && seconds > 0.0).then(|| seconds.min(3600.0))
+}
+
+/// `rbx wait 30s` waits that long and nothing else: a sampler's window, or
+/// time for the game to move on, without a condition that never holds.
+fn fixed_wait_result(condition: &str) -> Option<Value> {
+    let seconds = fixed_wait_seconds(condition)?;
+    let started = Instant::now();
+    thread::sleep(Duration::from_secs_f64(seconds));
+    Some(json!({
+        "ok": true,
+        "action": "wait",
+        "waitedSeconds": started.elapsed().as_secs_f64(),
+    }))
+}
+
 pub(crate) fn wait_until_result(args: &WaitUntilArgs, bridge: &BridgeServer) -> Result<Value> {
     let client = args.client || args.player.is_some();
     let player = args.player.as_deref();
@@ -3503,7 +3623,7 @@ pub(crate) fn wait_timed_out_result(
         "elapsedSeconds": elapsed,
         "error": format!(
             "Timed out after {timeout}s waiting for condition (last value: {detail}); \
-             raise -t, or use rbx l --detach for a sampler"
+             raise -t; rbx wait 30s waits a fixed time, rbx l --detach runs a sampler"
         ),
     })
 }
@@ -4113,6 +4233,15 @@ pub(crate) fn type_command(args: TypeArgs) -> Result<()> {
 }
 
 pub(crate) fn wait_until_command(args: WaitUntilArgs) -> Result<()> {
+    // A fixed wait is this process sleeping. Sent to the daemon it would hold
+    // its Studio's request gate, and every other command for that Studio
+    // would answer "Studio is busy" until the wait ended.
+    if let Some(mut result) = fixed_wait_result(&args.condition) {
+        if crate::app::output::compact_text_output() {
+            compact_input_result(op::WAIT, &mut result, None);
+        }
+        return print_json_output(&result, false);
+    }
     run_input_command(
         op::WAIT,
         json!({
@@ -5290,6 +5419,90 @@ mod settled_start_tests {
 #[cfg(test)]
 mod compact_result_tests {
     use super::*;
+
+    #[test]
+    fn a_duration_in_place_of_a_condition_is_a_fixed_wait() {
+        assert_eq!(fixed_wait_seconds("30s"), Some(30.0));
+        assert_eq!(fixed_wait_seconds("500ms"), Some(0.5));
+        assert_eq!(fixed_wait_seconds(" 2m "), Some(120.0));
+        assert_eq!(fixed_wait_seconds("45"), Some(45.0));
+        assert_eq!(fixed_wait_seconds("7200s"), Some(3600.0));
+        assert_eq!(fixed_wait_seconds("0"), None);
+        assert_eq!(fixed_wait_seconds("30x"), None);
+        assert_eq!(
+            fixed_wait_seconds("workspace.DistributedGameTime > 8"),
+            None
+        );
+        assert_eq!(fixed_wait_seconds("#game.Players:GetPlayers() >= 2"), None);
+        assert_eq!(fixed_wait_seconds(""), None);
+    }
+
+    #[test]
+    fn the_default_run_limit_covers_literal_sleeps() {
+        assert_eq!(default_luau_run_timeout("return 1"), 10.0);
+        assert_eq!(default_luau_run_timeout("task.wait(25) return 1"), 35.0);
+        assert_eq!(
+            default_luau_run_timeout("wait(4) task.wait(2.5) return 1"),
+            16.5
+        );
+        assert_eq!(default_luau_run_timeout("task.wait(500)"), 120.0);
+        assert_eq!(
+            default_luau_run_timeout("task.wait(dt) task.wait() await(9)"),
+            10.0
+        );
+        assert_eq!(default_luau_run_timeout("task.wait(4)"), 10.0);
+        assert_eq!(default_luau_run_timeout("task.wait(6)"), 16.0);
+        assert_eq!(default_luau_run_timeout("task.wait (25)"), 35.0);
+        assert_eq!(default_luau_run_timeout("task.wait(2e1)"), 30.0);
+        assert_eq!(default_luau_run_timeout("task.wait(.5) wait(19.)"), 29.5);
+        assert_eq!(
+            default_luau_run_timeout("repeat task.wait () until done"),
+            30.0
+        );
+    }
+
+    #[test]
+    fn sleeps_named_in_strings_and_comments_do_not_grow_the_run_limit() {
+        assert_eq!(
+            default_luau_run_timeout("return \"please wait(90) here\""),
+            10.0
+        );
+        assert_eq!(default_luau_run_timeout("-- task.wait(60)\nreturn 1"), 10.0);
+        assert_eq!(
+            default_luau_run_timeout("--[[ for i = 1, 3 do task.wait(1) end ]] return 1"),
+            10.0
+        );
+        assert_eq!(
+            default_luau_run_timeout("print(`while {n} wait(50)`) return [[repeat wait(70)]]"),
+            10.0
+        );
+        assert_eq!(
+            default_luau_run_timeout("print(\"wait(90)\") task.wait(25) -- wait(30)"),
+            35.0
+        );
+    }
+
+    #[test]
+    fn the_default_run_limit_gives_a_waiting_loop_more_time() {
+        let poll = "for _, part in parts do move(part) task.wait(0.6) end return out";
+        assert_eq!(default_luau_run_timeout(poll), 30.0);
+        assert_eq!(
+            default_luau_run_timeout("repeat task.wait() until done"),
+            30.0
+        );
+        assert_eq!(
+            default_luau_run_timeout("while busy do changed:Wait() end"),
+            30.0
+        );
+        assert_eq!(
+            default_luau_run_timeout("while true do task.wait(25) end"),
+            35.0
+        );
+        assert_eq!(
+            default_luau_run_timeout("for _, part in parts do move(part) end"),
+            10.0
+        );
+    }
 
     #[test]
     fn a_started_session_waits_for_its_players_unless_it_has_none() {

@@ -3125,6 +3125,21 @@ pub(crate) fn reconciliation_property_is_forced(
     name == "TextWrapped" && properties.get("TextScaled") == Some(&Value::Bool(true))
 }
 
+/// Whether the stored values carry a TextWrapped that Studio would override:
+/// off, or not stored at all, which reads as the class default, off.
+pub(crate) fn forced_property_differs(properties: &Map<String, Value>) -> bool {
+    properties.get("TextScaled") == Some(&Value::Bool(true))
+        && properties.get("TextWrapped") != Some(&Value::Bool(true))
+}
+
+/// Gives a forced property the value Studio keeps, so the store and the
+/// place agree after a push.
+pub(crate) fn settle_forced_properties(properties: &mut Map<String, Value>) {
+    if forced_property_differs(properties) {
+        properties.insert("TextWrapped".to_string(), Value::Bool(true));
+    }
+}
+
 // Reflection defaults are keyed by the logical name; a serialized alias such as
 // GuiObject.Sink only reaches its default through the logical InputSink.
 pub(crate) fn reflection_default_settings_value(
