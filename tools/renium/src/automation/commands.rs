@@ -264,15 +264,42 @@ pub(crate) fn studio_status(args: StudioStatusArgs, project: Option<&Path>) -> R
         Err(RecvTimeoutError::Timeout) => Err(client::daemon_busy_error("rbx status", deadline)),
         Err(RecvTimeoutError::Disconnected) => Err(anyhow!("rbx status stopped without a result")),
     }?;
+    if app::output::compact_text_output() {
+        // Only the listing of every Studio still carries `studios`.
+        if result.get("studios").is_some() {
+            result = crate::studio::automation::connected_clients_output(&result);
+        } else {
+            trim_status_text(&mut result);
+        }
+        summarize_native_operations(&mut result);
+    }
     if let Some(map) = result.as_object_mut()
         && let Some(version) = app::update::cached_available_update()
     {
         map.insert("updateAvailable".to_string(), json!(version));
     }
-    if app::output::compact_text_output() {
-        summarize_native_operations(&mut result);
-    }
     app::output::print_json_output(&result, false)
+}
+
+/// Text mode drops what a status repeats or leaves at zero: the top-level
+/// `teamCreate` that `persistence` and the Edit client's record state, the
+/// `placeVersion` of a place that was never published, and a Live Sync
+/// `pending` count of zero.
+fn trim_status_text(result: &mut Value) {
+    let Some(map) = result.as_object_mut() else {
+        return;
+    };
+    if map.contains_key("persistence") {
+        map.remove("teamCreate");
+    }
+    if map.get("placeVersion").and_then(Value::as_i64) == Some(0) {
+        map.remove("placeVersion");
+    }
+    if let Some(live) = map.get_mut("liveSync").and_then(Value::as_object_mut)
+        && live.get("pending").and_then(Value::as_u64) == Some(0)
+    {
+        live.remove("pending");
+    }
 }
 
 /// Text mode reports the native probe as verdict counts plus the operations
@@ -689,6 +716,7 @@ pub(crate) fn input(mut args: InputArgs, project: Option<&Path>) -> Result<()> {
         false,
         Some(&args.bridge),
     )?;
+    let mut requested_shot = None;
     // The follow-ups run on the same client once the actions are in, so one
     // call covers "act, then look": a typed observation and a screenshot.
     if result.get("ok") != Some(&Value::Bool(false)) {
@@ -729,7 +757,15 @@ pub(crate) fn input(mut args: InputArgs, project: Option<&Path>) -> Result<()> {
                 Some(&args.bridge),
             )?;
             result["shot"] = shot.get("path").cloned().unwrap_or(json!(output));
+            requested_shot = Some(json!(output));
         }
+    }
+    if app::output::compact_text_output() {
+        crate::studio::automation::compact_input_result(
+            op::INPUT,
+            &mut result,
+            requested_shot.as_ref(),
+        );
     }
     app::output::print_json_output(&result, false)
 }
@@ -945,6 +981,57 @@ mod native_summary_tests {
             json!({"native": 1, "degraded": 1, "fallbacks": [
                 {"operation": "upload", "fallback": "plugin upload"}
             ]})
+        );
+    }
+
+    #[test]
+    fn status_text_mode_drops_repeated_and_zero_fields() {
+        let mut local = json!({
+            "clients": [{"pid": 5, "placeName": "place.rbxl", "role": "edit", "teamCreate": false}],
+            "liveSync": {"pending": 0, "running": true},
+            "persistence": "unsaved", "placeVersion": 0, "playState": "stopped", "teamCreate": false
+        });
+        trim_status_text(&mut local);
+        assert_eq!(
+            local,
+            json!({
+                "clients": [{"pid": 5, "placeName": "place.rbxl", "role": "edit", "teamCreate": false}],
+                "liveSync": {"running": true},
+                "persistence": "unsaved", "playState": "stopped"
+            })
+        );
+        let mut published = json!({
+            "liveSync": {"pending": 2, "running": true, "see": "rbx lst --details"},
+            "placeVersion": 2924, "playState": "running", "teamCreate": true
+        });
+        let before = published.clone();
+        trim_status_text(&mut published);
+        assert_eq!(published, before);
+    }
+
+    #[test]
+    fn a_listing_of_every_studio_prints_as_cs_does() {
+        let listing = json!({
+            "selected": null,
+            "studios": [{"runtimeId": "a", "role": "edit"}, {"runtimeId": "b", "role": "edit"}],
+            "clients": [
+                {"runtimeId": "a", "role": "edit", "placeName": "One", "placeId": 0, "gameId": 0,
+                    "teamCreate": false, "pid": 1, "bridgeBuildUnix": 9, "channels": 2, "ports": [1, 2]},
+                {"runtimeId": "b", "role": "edit", "placeName": "Two", "placeId": 7, "gameId": 8,
+                    "teamCreate": true, "pid": 2, "bridgeBuildUnix": 9, "channels": 1, "ports": [3]}
+            ],
+            "orphans": [{"pid": 3}]
+        });
+        assert_eq!(
+            crate::studio::automation::connected_clients_output(&listing),
+            json!({
+                "clients": [
+                    {"runtimeId": "a", "role": "edit", "placeName": "One", "teamCreate": false, "pid": 1},
+                    {"runtimeId": "b", "role": "edit", "placeName": "Two", "placeId": 7, "gameId": 8,
+                        "teamCreate": true, "pid": 2}
+                ],
+                "orphans": [{"pid": 3}]
+            })
         );
     }
 }

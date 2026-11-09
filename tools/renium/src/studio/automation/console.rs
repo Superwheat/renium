@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::thread;
 use std::time::Duration;
@@ -34,18 +35,12 @@ pub(crate) fn get_console_output_command(args: PluginConsoleOutputArgs) -> Resul
     print_json_output(&result, false)
 }
 
-/// Text mode prints one header line (counts and `nextSeq`, which `--since-seq`
-/// continues from) and then each entry as `[level] message`, the shape
-/// `--follow` prints; json mode keeps the entry objects with `seq` and `time`.
+/// Text mode prints one header line (`nextSeq`, which `--since-seq` continues
+/// from, and the filter counts) and then each entry as `[level] message`, the
+/// shape `--follow` prints; json mode keeps the entry objects with `seq` and
+/// `time`.
 fn print_console_text(result: &Value, since_seq: u64) -> Result<()> {
-    let mut header = result.clone();
-    if let Some(map) = header.as_object_mut() {
-        map.remove("entries");
-        if since_seq == 0 {
-            map.remove("epoch");
-        }
-    }
-    print_json_output(&header, false)?;
+    print_json_output(&console_text_header(result, since_seq), false)?;
     for entry in result
         .get("entries")
         .and_then(Value::as_array)
@@ -58,9 +53,35 @@ fn print_console_text(result: &Value, since_seq: u64) -> Result<()> {
     Ok(())
 }
 
+/// The header of a text-mode read. `ok` is always true there and the lines
+/// carry their own repeat counts, so both go, as does an `epoch` the caller
+/// did not continue from.
+fn console_text_header(result: &Value, since_seq: u64) -> Value {
+    let mut header = result.clone();
+    if let Some(map) = header.as_object_mut() {
+        map.remove("entries");
+        map.remove("ok");
+        map.remove("folded");
+        if since_seq == 0 {
+            map.remove("epoch");
+        }
+    }
+    header
+}
+
 /// `[level] message`, with a repeat count when consecutive lines were folded
 /// and continuation lines indented so one entry stays one block.
-fn console_entry_line(entry: &Value) -> String {
+pub(super) fn console_entry_line(entry: &Value) -> String {
+    let mut line = console_line_start(entry);
+    if let Some(repeat) = entry.get("repeat").and_then(Value::as_u64)
+        && repeat > 1
+    {
+        line.push_str(&format!(" (x{repeat})"));
+    }
+    line
+}
+
+fn console_line_start(entry: &Value) -> String {
     let level = console_entry_level(entry);
     let message = entry
         .get("message")
@@ -68,10 +89,88 @@ fn console_entry_line(entry: &Value) -> String {
         .unwrap_or_default()
         .trim_end()
         .replace('\n', "\n  ");
-    match entry.get("repeat").and_then(Value::as_u64) {
-        Some(repeat) if repeat > 1 => format!("[{level}] {message} (x{repeat})"),
-        _ => format!("[{level}] {message}"),
+    format!("[{level}] {message}")
+}
+
+/// The text a Play start prints for one console: a line per distinct message
+/// in the `rbx co` shape, without times. Identical messages collapse into the
+/// first with ` (xN)`, messages that differ only in their digits (asset ids,
+/// counts, line numbers) into the first with ` (+N similar)`, and a folded
+/// stack frame follows its error as an indented line.
+pub(super) fn play_console_lines(entries: &[Value]) -> Vec<String> {
+    struct Group<'a> {
+        entry: &'a Value,
+        same: u64,
+        similar: u64,
     }
+    let mut groups: Vec<Group> = Vec::new();
+    let mut positions: HashMap<(&str, String), usize> = HashMap::new();
+    for entry in entries {
+        let message = entry
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let repeat = entry
+            .get("repeat")
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            .max(1);
+        let key = (console_entry_level(entry), digit_pattern(message));
+        match positions.get(&key) {
+            Some(&position) => {
+                let group = &mut groups[position];
+                if group.entry.get("message").and_then(Value::as_str) == Some(message) {
+                    group.same += repeat;
+                } else {
+                    group.similar += repeat;
+                }
+            }
+            None => {
+                positions.insert(key, groups.len());
+                groups.push(Group {
+                    entry,
+                    same: repeat,
+                    similar: 0,
+                });
+            }
+        }
+    }
+    groups
+        .iter()
+        .map(|group| {
+            let mut line = console_line_start(group.entry);
+            if group.same > 1 {
+                line.push_str(&format!(" (x{})", group.same));
+            }
+            if group.similar > 0 {
+                line.push_str(&format!(" (+{} similar)", group.similar));
+            }
+            if let Some(place) = group.entry.get("where").and_then(Value::as_str) {
+                line.push_str("\n  ");
+                line.push_str(place);
+            }
+            line
+        })
+        .collect()
+}
+
+/// A message with every run of digits replaced by one `0`, so two messages
+/// that differ only in numbers compare equal.
+fn digit_pattern(message: &str) -> String {
+    let mut pattern = String::with_capacity(message.len());
+    let mut in_digits = false;
+    for character in message.chars() {
+        if character.is_ascii_digit() {
+            if !in_digits {
+                pattern.push('0');
+            }
+            in_digits = true;
+        } else {
+            in_digits = false;
+            pattern.push(character);
+        }
+    }
+    pattern
 }
 
 /// Studio's MessageType names and a wall-clock stamp repeat on every line;
@@ -583,5 +682,66 @@ mod line_tests {
             console_entry_line(&json!({"message": "same", "type": "warn", "repeat": 4})),
             "[warn] same (x4)"
         );
+    }
+
+    #[test]
+    fn a_text_header_keeps_the_cursor_and_the_filter_counts() {
+        let result = json!({
+            "ok": true, "nextSeq": 40, "matched": 3, "scanned": 20, "folded": 2,
+            "hasMore": true, "epoch": "e1", "entries": [{"message": "a", "type": "print"}]
+        });
+        assert_eq!(
+            console_text_header(&result, 0),
+            json!({"nextSeq": 40, "matched": 3, "scanned": 20, "hasMore": true})
+        );
+        assert_eq!(console_text_header(&result, 12)["epoch"], "e1");
+        assert_eq!(
+            console_text_header(&json!({"ok": true, "nextSeq": 7, "entries": []}), 0),
+            json!({"nextSeq": 7})
+        );
+    }
+
+    #[test]
+    fn a_play_console_collapses_repeats_and_messages_that_differ_in_digits() {
+        let entries = vec![
+            json!({"message": "ContentId: rbxassetid://128 failed", "time": 1.0, "type": "warn"}),
+            json!({"message": "[Shop] ready", "time": 1.0, "type": "print"}),
+            json!({"message": "ContentId: rbxassetid://977 failed", "time": 1.1, "type": "warn"}),
+            json!({"message": "event fired.", "repeat": 4, "time": 1.2, "type": "info"}),
+            json!({"message": "ContentId: rbxassetid://128 failed", "time": 1.3, "type": "warn"}),
+            json!({"message": "ContentId: rbxassetid://5 failed", "repeat": 2, "time": 1.4, "type": "warn"}),
+            json!({"message": "event fired.", "repeat": 2, "time": 1.5, "type": "info"}),
+            json!({"message": "ContentId: rbxassetid://128 failed", "time": 1.6, "type": "error"}),
+            json!({"message": "x is not a valid member\nof Workspace", "time": 2.0, "type": "error",
+                "where": "Script 'ServerScriptService.Scoreboard', Line 7", "repeat": 2}),
+            json!({"message": "no digits here", "time": 2.1, "type": "print"}),
+            json!({"message": "no digits there", "time": 2.2, "type": "print"}),
+        ];
+        assert_eq!(
+            play_console_lines(&entries),
+            vec![
+                "[warn] ContentId: rbxassetid://128 failed (x2) (+3 similar)",
+                "[print] [Shop] ready",
+                "[info] event fired. (x6)",
+                "[error] ContentId: rbxassetid://128 failed",
+                "[error] x is not a valid member\n  of Workspace (x2)\n  Script 'ServerScriptService.Scoreboard', Line 7",
+                "[print] no digits here",
+                "[print] no digits there",
+            ]
+        );
+        assert!(play_console_lines(&[]).is_empty());
+    }
+
+    #[test]
+    fn digit_runs_of_any_length_compare_equal() {
+        assert_eq!(
+            digit_pattern("centered 104 of 7 (v3.15.0)"),
+            "centered 0 of 0 (v0.0.0)"
+        );
+        assert_eq!(
+            digit_pattern("centered 9 of 12 (v3.5.0)"),
+            digit_pattern("centered 104 of 7 (v3.15.0)")
+        );
+        assert_ne!(digit_pattern("slot a1"), digit_pattern("slot a"));
     }
 }

@@ -93,7 +93,16 @@ pub(crate) fn execute_luau_command(mut args: ExecuteLuauArgs) -> Result<()> {
         "bridgeWaitSeconds": args.bridge.wait_seconds,
         "bridgePorts": args.bridge.ports,
     });
-    let mut result = daemon_result(op::LUAU, None, parameters, false, Some(&args.bridge))?;
+    let text = args.runner.detach.is_none()
+        && args.runner.collect.is_none()
+        && crate::app::output::compact_text_output();
+    let mut result = match daemon_result(op::LUAU, None, parameters, false, Some(&args.bridge)) {
+        Err(error) if text => {
+            crate::app::output::write_stderr(format_args!("error: {error:#}"));
+            return Err(ReportedFailure.into());
+        }
+        result => result?,
+    };
     if args.timeout.is_none()
         && timeout > DEFAULT_LUAU_TIMEOUT_SECONDS
         && let Some(map) = result.as_object_mut()
@@ -121,7 +130,67 @@ pub(crate) fn execute_luau_command(mut args: ExecuteLuauArgs) -> Result<()> {
             }
         }
     }
+    if text {
+        crate::app::output::write_stdout(format_args!("{}", luau_text(&result)));
+        return Ok(());
+    }
     print_json_output(&result, false)
+}
+
+/// What a plain `rbx l` or `rbx lc` run prints in text mode: the lines the
+/// code printed as `[level] message`, then each returned value on a line of
+/// its own (a string as it is, `nil`, anything else as compact JSON), or `ok`
+/// when it returned nothing. Whatever else the result carries for the reader
+/// to act on (`timeoutSeconds`, `syncReview`) follows as one `note:` line;
+/// where the run landed and how it persists stay in json mode.
+fn luau_text(result: &Value) -> String {
+    let mut lines = result
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(console::console_entry_line)
+        .collect::<Vec<_>>();
+    let values = result
+        .get("results")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    lines.extend(values.iter().map(luau_value_text));
+    if values.is_empty() {
+        lines.push("ok".to_string());
+    }
+    let notes = result
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(key, _)| {
+            !matches!(
+                key.as_str(),
+                "ok" | "context" | "persistence" | "results" | "output"
+            )
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<Map<String, Value>>();
+    if !notes.is_empty() {
+        lines.push(format!("note: {}", Value::Object(notes)));
+    }
+    lines.join("\n")
+}
+
+fn luau_value_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Null => "nil".to_string(),
+        Value::Object(map) if map.len() == 1 && map.get("_type") == Some(&json!("Nil")) => {
+            "nil".to_string()
+        }
+        other => {
+            let mut shortened = other.clone();
+            crate::app::output::shorten_single_precision_floats(&mut shortened);
+            shortened.to_string()
+        }
+    }
 }
 
 pub(crate) fn validate_luau_syntax(code: &str) -> Result<()> {
@@ -743,10 +812,7 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
             }
             attach_player_readiness(&mut result, &args);
         }
-        if crate::app::output::compact_text_output() {
-            compact_play_result(&mut result, args.players.is_some());
-        }
-        return print_json_output(&result, false);
+        return print_play_result(result, args.players.is_some());
     }
     let mut result = daemon_control_request(operation, None, parameters.clone(), false)?;
     if args.until.is_none()
@@ -783,12 +849,12 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
         match wait {
             Ok(wait) => {
                 if !attach_awaited_result(&mut result, wait) {
-                    print_json_output(&result, false)?;
+                    print_play_result(result, args.players.is_some())?;
                     return Err(ReportedFailure.into());
                 }
             }
             Err(error) => {
-                print_json_output(&result, false)?;
+                print_play_result(result, args.players.is_some())?;
                 return Err(error);
             }
         }
@@ -902,10 +968,51 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
                 Err(error) => json!({ "error": format!("{error:#}") }),
             };
     }
-    if crate::app::output::compact_text_output() {
-        compact_play_result(&mut result, args.players.is_some());
+    print_play_result(result, args.players.is_some())
+}
+
+/// Prints a Play result. Text mode keeps the decision fields on one JSON line
+/// and prints the consoles the result carries as text after it.
+fn print_play_result(mut result: Value, named_players: bool) -> Result<()> {
+    if !crate::app::output::compact_text_output() {
+        return print_json_output(&result, false);
     }
-    print_json_output(&result, false)
+    compact_play_result(&mut result, named_players);
+    let consoles = take_play_consoles(&mut result);
+    print_json_output(&result, false)?;
+    if !consoles.is_empty() {
+        crate::app::output::write_stdout(format_args!("{}", consoles.join("\n")));
+    }
+    Ok(())
+}
+
+/// Moves the `console` and `clientConsole` entries out of a Play result and
+/// returns them as text: a `server console:` or `client console:` label, then
+/// one line per distinct message. A console that could not be read stays in
+/// the result with its error.
+fn take_play_consoles(result: &mut Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    let Some(map) = result.as_object_mut() else {
+        return lines;
+    };
+    for (key, label) in [
+        ("console", "server console:"),
+        ("clientConsole", "client console:"),
+    ] {
+        if !map.get(key).is_some_and(Value::is_array) {
+            continue;
+        }
+        let Some(Value::Array(entries)) = map.remove(key) else {
+            continue;
+        };
+        if entries.is_empty() {
+            lines.push(format!("{label} empty"));
+        } else {
+            lines.push(label.to_string());
+            lines.extend(console::play_console_lines(&entries));
+        }
+    }
+    lines
 }
 
 /// Evaluates `--result` or `--client-result` once the wait holds, on the
@@ -1168,6 +1275,8 @@ fn compact_play_result(result: &mut Value, named_players: bool) {
                 json!((elapsed * 10.0).round() / 10.0),
             );
         }
+    } else if let Some(until) = map.get_mut("until").and_then(Value::as_object_mut) {
+        compact_wait_record(until);
     }
     if let Some(status) = map.get_mut("status").and_then(Value::as_object_mut) {
         status.remove("lastResult");
@@ -4130,13 +4239,33 @@ fn run_input_command(
     Ok(())
 }
 
+/// A wait's record without the echo of its request, its seconds rounded to
+/// one decimal; a timed-out wait keeps its last value and error.
+fn compact_wait_record(record: &mut Map<String, Value>) {
+    record.remove("action");
+    record.remove("condition");
+    for key in ["elapsedSeconds", "waitedSeconds"] {
+        if let Some(seconds) = record.get(key).and_then(Value::as_f64) {
+            record.insert(key.to_string(), json!((seconds * 10.0).round() / 10.0));
+        }
+    }
+}
+
 /// Text mode keeps a capture's verdict (`moved`, a note when the camera did
-/// not hold) and a wait's value; the window, device and echoed arguments stay
-/// in json mode.
-fn compact_input_result(operation: u16, result: &mut Value, requested_output: Option<&Value>) {
+/// not hold), a wait's value and what an input sequence observed; the window,
+/// device and echoed arguments stay in json mode.
+pub(crate) fn compact_input_result(
+    operation: u16,
+    result: &mut Value,
+    requested_output: Option<&Value>,
+) {
     let Some(map) = result.as_object_mut() else {
         return;
     };
+    if operation == op::WAIT {
+        compact_wait_record(map);
+        return;
+    }
     if map.get("ok") == Some(&Value::Bool(false)) {
         return;
     }
@@ -4156,18 +4285,20 @@ fn compact_input_result(operation: u16, result: &mut Value, requested_output: Op
                 map.remove("path");
             }
         }
-        op::WAIT => {
-            map.remove("condition");
-            map.remove("action");
-        }
         op::INPUT => {
-            // The request echo adds nothing; a null click count means no click
-            // was sent.
+            // Virtual input is the default method; a null click count means
+            // no click was sent; a screenshot written where it was asked for
+            // is confirmed without repeating the path.
             map.remove("action");
-            map.remove("inputMethod");
-            map.remove("actions");
+            map.remove("ok");
+            if map.get("inputMethod") == Some(&json!("virtual")) {
+                map.remove("inputMethod");
+            }
             if map.get("verifiedClicks") == Some(&Value::Null) {
                 map.remove("verifiedClicks");
+            }
+            if requested_output.is_some_and(|output| map.get("shot") == Some(output)) {
+                map.insert("shot".to_string(), Value::Bool(true));
             }
         }
         _ => {}
@@ -4347,6 +4478,12 @@ pub(crate) fn list_clients_command(args: ListClientsArgs) -> Result<()> {
             _ => break result,
         }
     };
+    print_json_output(&connected_clients_output(&result), false)
+}
+
+/// The answer `rbx cs` prints for a daemon listing of connected runtimes:
+/// each client without its bridge plumbing, and the orphaned test windows.
+pub(crate) fn connected_clients_output(result: &Value) -> Value {
     let mut clients = result
         .get("clients")
         .and_then(Value::as_array)
@@ -4377,7 +4514,7 @@ pub(crate) fn list_clients_command(args: ListClientsArgs) -> Result<()> {
     if let Some(orphans) = result.get("orphans") {
         output["orphans"] = orphans.clone();
     }
-    print_json_output(&output, false)
+    output
 }
 
 pub(crate) fn editor_review_decision_result(
@@ -5622,11 +5759,145 @@ mod compact_result_tests {
         let mut elsewhere = json!({"ok": true, "path": "C:/other.png"});
         compact_input_result(op::SHOT, &mut elsewhere, Some(&output));
         assert_eq!(elsewhere["path"], json!("C:/other.png"));
-        let mut wait = json!({"ok": true, "action": "wait", "condition": "x", "value": "true", "elapsedSeconds": 0.2});
+        let mut wait = json!({"ok": true, "action": "wait", "condition": "x", "value": "true", "elapsedSeconds": 0.2518773});
         compact_input_result(op::WAIT, &mut wait, None);
         assert_eq!(
             wait,
-            json!({"ok": true, "value": "true", "elapsedSeconds": 0.2})
+            json!({"ok": true, "value": "true", "elapsedSeconds": 0.3})
+        );
+    }
+
+    #[test]
+    fn a_wait_drops_its_echo_and_rounds_its_seconds_when_it_fails_too() {
+        let mut timed_out =
+            wait_timed_out_result("workspace.Ready", 42.0, &json!("false"), 42.2518773);
+        let error = timed_out["error"].clone();
+        compact_input_result(op::WAIT, &mut timed_out, None);
+        assert_eq!(
+            timed_out,
+            json!({"ok": false, "timedOut": true, "value": "false", "elapsedSeconds": 42.3, "error": error})
+        );
+        let mut fixed = json!({"ok": true, "action": "wait", "waitedSeconds": 30.0004});
+        compact_input_result(op::WAIT, &mut fixed, None);
+        assert_eq!(
+            serde_json::to_string(&fixed).unwrap(),
+            r#"{"ok":true,"waitedSeconds":30.0}"#
+        );
+    }
+
+    #[test]
+    fn an_input_result_keeps_what_the_client_observed() {
+        let mut input = json!({
+            "ok": true, "action": "input", "actions": 7, "inputMethod": "virtual",
+            "keysObserved": {"Return": true}, "verifiedClicks": 2, "result": {"open": true}, "shot": "a.png"
+        });
+        let mut elsewhere = input.clone();
+        compact_input_result(op::INPUT, &mut input, Some(&json!("a.png")));
+        assert_eq!(
+            input,
+            json!({"actions": 7, "keysObserved": {"Return": true}, "verifiedClicks": 2, "result": {"open": true}, "shot": true})
+        );
+        compact_input_result(op::INPUT, &mut elsewhere, Some(&json!("b.png")));
+        assert_eq!(elsewhere["shot"], "a.png");
+        let mut mixed = json!({"ok": true, "action": "input", "actions": 2, "inputMethod": "mixed", "window": "Studio", "verifiedClicks": null});
+        compact_input_result(op::INPUT, &mut mixed, None);
+        assert_eq!(
+            mixed,
+            json!({"actions": 2, "inputMethod": "mixed", "window": "Studio"})
+        );
+        let failed = json!({"ok": false, "action": "input", "error": "no client"});
+        let mut kept = failed.clone();
+        compact_input_result(op::INPUT, &mut kept, None);
+        assert_eq!(kept, failed);
+    }
+
+    #[test]
+    fn a_plain_luau_run_prints_its_values_raw() {
+        assert_eq!(
+            luau_text(&json!({"ok": true, "context": "client", "results": ["Player1"]})),
+            "Player1"
+        );
+        assert_eq!(
+            luau_text(&json!({
+                "ok": true, "context": "edit", "persistence": "unsaved",
+                "results": ["say \"hi\"\nthen leave", 3, true, {"_type": "Nil"}, null,
+                    {"abs": 228.31427001953125, "list": [1, "a"]}, []]
+            })),
+            "say \"hi\"\nthen leave\n3\ntrue\nnil\nnil\n{\"abs\":228.31427,\"list\":[1,\"a\"]}\n[]"
+        );
+        assert_eq!(luau_text(&json!({"ok": true, "context": "server"})), "ok");
+    }
+
+    #[test]
+    fn a_plain_luau_run_prints_captured_lines_first_and_notes_last() {
+        assert_eq!(
+            luau_text(&json!({
+                "ok": true,
+                "output": [
+                    {"type": "print", "message": "step 1\nstep 2"},
+                    {"type": "warn", "message": "[Renium stopped capturing command output at its size limit.]"}
+                ],
+                "results": [{"a": 1, "_truncated": {"kept": 128, "total": 300}}],
+                "timeoutSeconds": 35.0,
+                "syncReview": "Live Sync is waiting"
+            })),
+            "[print] step 1\n  step 2\n[warn] [Renium stopped capturing command output at its size limit.]\n{\"_truncated\":{\"kept\":128,\"total\":300},\"a\":1}\nnote: {\"syncReview\":\"Live Sync is waiting\",\"timeoutSeconds\":35.0}"
+        );
+        assert_eq!(
+            luau_text(&json!({"ok": true, "output": [{"type": "print", "message": "done"}]})),
+            "[print] done\nok"
+        );
+    }
+
+    #[test]
+    fn a_play_result_hands_its_consoles_over_as_text() {
+        let mut result = json!({
+            "ok": true, "mode": "play", "clients": 1, "until": "true", "untilSeconds": 7.1,
+            "console": [
+                {"message": "Workspace.Pack:1: Expected identifier", "time": 62.5, "type": "error"},
+                {"message": "event fired.", "repeat": 3, "time": 62.5, "type": "info"},
+                {"message": "ContentId: rbxassetid://128 failed", "time": 62.5, "type": "warn"},
+                {"message": "event fired.", "repeat": 2, "time": 62.6, "type": "info"},
+                {"message": "ContentId: rbxassetid://977 failed", "time": 63.1, "type": "warn"}
+            ],
+            "clientConsole": []
+        });
+        assert_eq!(
+            take_play_consoles(&mut result),
+            vec![
+                "server console:",
+                "[error] Workspace.Pack:1: Expected identifier",
+                "[info] event fired. (x5)",
+                "[warn] ContentId: rbxassetid://128 failed (+1 similar)",
+                "client console: empty",
+            ]
+        );
+        assert_eq!(
+            result,
+            json!({"ok": true, "mode": "play", "clients": 1, "until": "true", "untilSeconds": 7.1})
+        );
+        let mut unread = json!({"ok": true, "console": {"error": "no play server"}});
+        assert!(take_play_consoles(&mut unread).is_empty());
+        assert_eq!(unread["console"]["error"], "no play server");
+    }
+
+    #[test]
+    fn a_play_start_whose_wait_failed_keeps_the_wait_without_its_echo() {
+        let mut result = json!({
+            "ok": true, "action": "start", "mode": "play", "serverReady": true, "editRuntimeId": "e",
+            "clients": [{"playerName": "A", "role": "client"}]
+        });
+        let wait =
+            wait_timed_out_result("shared.Ready == true", 120.0, &json!("false"), 120.2518773);
+        let error = wait["error"].clone();
+        assert!(!attach_awaited_result(&mut result, wait));
+        compact_play_result(&mut result, false);
+        assert_eq!(
+            result,
+            json!({
+                "ok": true, "mode": "play", "serverReady": true, "clients": 1,
+                "until": {"ok": false, "timedOut": true, "value": "false", "elapsedSeconds": 120.3, "error": error}
+            })
         );
     }
 }

@@ -63,6 +63,10 @@
 - `rbx sg` and `rbx ss` print each script's path once and then its hits as `LINE: text` without the indentation, a line over 240 characters cut short, and a last line when the limit left hits out.
 - A held push prints at most 20 review rows in text mode, one short line each: `+ PATH Class` for an added instance, `- PATH Class` for a removed one and `PATH: Property, Property` for changed values; `moreReviewRows` counts the rest.
 - Store edits that report `changedPaths` (`ba`, `bs`, `cp`, `mv`, `rn`, `br` and the rest) leave out of their text result what it repeats: the store file `changedPaths` already names, the store index and the split path (one dotted `path` instead), the push summary's own `ok` and `persistence`, and the read-back's path and class once `verified` is true.
+- `rbx l` and `rbx lc` print the returned values as text, one per line (a string as it is, `nil`, anything else as compact JSON, `ok` when nothing was returned), after any captured `print`/`warn` lines, and a failure prints `error: MESSAGE` with its traceback; `--output-mode json`, `--detach` and `--collect` keep their JSON.
+- `rbx play` prints the server and client consoles a result carries as `[level] message` lines after the result line, collapsing identical messages into ` (xN)` and messages that differ only in digits into ` (+N similar)`.
+- `rbx wait` prints its seconds with one decimal and leaves out the echoed condition, also when it times out; `rbx inp` leaves `action`, `ok: true`, a `virtual` `inputMethod` and the echoed screenshot path (`shot: true`) out of its text result; `rbx co` leaves `ok` and `folded` out of its header line.
+- `rbx status` leaves out the top-level `teamCreate`, a zero `placeVersion` and a zero Live Sync `pending` in text mode, and `rbx status --all` prints the same listing as `rbx cs`.
 
 ### Bug fixes
 
