@@ -14,7 +14,7 @@ Run `rbx` for the command list and `rbx COMMAND --help` for every option.
 Download from [Releases](https://github.com/Superwheat/renium/releases/latest):
 
 - **Windows:** run `Install-Renium.cmd`. It runs the PowerShell installer, which picks the x64 or ARM64 build and checks each download against the release's checksums.
-- **macOS:** extract the ZIP and open `Install Renium.command`, or run `./install.sh`. Use `~/Applications/Renium Studio.app` for protected properties; the original Studio app is unchanged. Capture and input may need Screen Recording or Accessibility permission.
+- **macOS:** extract the ZIP and open `Install Renium.command`, or run `./install.sh`. Protected properties and Terrain need Renium's native helper; on macOS Renium patches the installed Studio app for it the first time, keeping the original launcher and signature for `rbx setup --uninstall`. Capture and input may need Screen Recording or Accessibility permission.
 - **Linux:** extract the ZIP and run `./install.sh`. Studio does not run on Linux, so Linux gets the offline tools, Open Cloud and plugins, but nothing that needs Studio.
 
 The installer asks which editor should get the extension, puts `rbx` on PATH and

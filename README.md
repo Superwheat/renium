@@ -38,8 +38,11 @@ A plugin cannot set some saved data directly, such as Terrain's voxel data or
 reads and writes engine properties that scripts are blocked from (each such read
 or write waits for your approval by default), publishes packages without dialogs,
 and captures or sends input to play windows that are not in front. This works on
-Windows and macOS. On macOS the installer adds a separate `Renium Studio` app for
-it and leaves the original Studio app unchanged.
+Windows and macOS. On macOS, Renium patches the installed Studio app the first
+time a native operation needs it: its own launcher starts the engine with the
+helper, the original launcher and code signature are kept so `rbx setup
+--uninstall` restores them, and a Studio update clears the patch until Renium
+applies it again.
 
 ## What a project looks like
 
