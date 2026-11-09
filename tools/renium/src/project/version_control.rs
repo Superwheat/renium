@@ -17,7 +17,8 @@ use crate::project::package_links::RENIUM_DIR_GITIGNORE;
 use crate::rbx::model::read_settings_model_document;
 use crate::settings::EXTERNAL_SOURCE_MARKER;
 use crate::settings::bytecode::{
-    SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance, reindex_reference_indices,
+    SETTINGS_BINARY_VERSION, SETTINGS_REFERENCE_SELECTOR_KEYS, SettingsBytecode,
+    SettingsBytecodeInstance, is_reference_object, reindex_reference_indices,
 };
 use crate::settings::tree::settings_children_by_parent;
 use crate::snapshot::refs::{
@@ -803,14 +804,8 @@ fn reattach_orphans(
             continue;
         };
         if let Some(&parent_index) = preferred_ids.get(&parent) {
-            let mut restored = merged_instance_from(preferred, parent_index);
-            restored.parent_id = restored
-                .parent_id
-                .map(|id| id_remap.get(&id).cloned().unwrap_or(id));
-            remap_record_reference_ids(&mut restored.properties, id_remap);
-            remap_record_reference_ids(&mut restored.attributes, id_remap);
             present.insert(parent);
-            merged.push(restored);
+            merged.push(preferred_instance(preferred, parent_index, id_remap));
             index += 1;
         } else if let Some(&own_index) = preferred_ids.get(&merged[index].settings_id) {
             // The preferred side's parent of its own instance exists on that
@@ -818,6 +813,221 @@ fn reattach_orphans(
             merged[index].parent_id = settings_parent_id(preferred, own_index);
         } else {
             index += 1;
+        }
+    }
+}
+
+/// The preferred side's record of an instance, with that side's ids as the
+/// merge uses them.
+fn preferred_instance(
+    preferred: &SettingsBytecode,
+    index: usize,
+    id_remap: &HashMap<String, String>,
+) -> VcMergedInstance {
+    let mut record = merged_instance_from(preferred, index);
+    record.parent_id = record
+        .parent_id
+        .map(|id| id_remap.get(&id).cloned().unwrap_or(id));
+    remap_record_reference_ids(&mut record.properties, id_remap);
+    remap_record_reference_ids(&mut record.attributes, id_remap);
+    record
+}
+
+/// The id a reference object names when it points into the store being
+/// merged. A reference with a path into another service is that store's.
+fn same_store_reference_id<'a>(object: &'a Map<String, Value>, service: &str) -> Option<&'a str> {
+    let into_another_service = object
+        .get("pathSegments")
+        .and_then(Value::as_array)
+        .and_then(|segments| segments.first())
+        .and_then(Value::as_str)
+        .is_some_and(|first| first != service);
+    if into_another_service {
+        return None;
+    }
+    object
+        .get("settingsId")
+        .or_else(|| object.get("instanceId"))
+        .and_then(Value::as_str)
+}
+
+fn for_each_reference(value: &Value, visit: &mut impl FnMut(&Map<String, Value>)) {
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .for_each(|value| for_each_reference(value, visit)),
+        Value::Object(object) => {
+            if is_reference_object(object) {
+                visit(object);
+            }
+            object
+                .values()
+                .for_each(|value| for_each_reference(value, visit));
+        }
+        _ => {}
+    }
+}
+
+fn for_each_reference_mut(value: &mut Value, visit: &mut impl FnMut(&mut Map<String, Value>)) {
+    match value {
+        Value::Array(values) => values
+            .iter_mut()
+            .for_each(|value| for_each_reference_mut(value, visit)),
+        Value::Object(object) => {
+            if is_reference_object(object) {
+                visit(object);
+            }
+            object
+                .values_mut()
+                .for_each(|value| for_each_reference_mut(value, visit));
+        }
+        _ => {}
+    }
+}
+
+/// The references of the merged store that name an instance it does not
+/// hold, as (referring id, target id).
+fn dangling_references(merged: &[VcMergedInstance], service: &str) -> HashSet<(String, String)> {
+    let present = merged
+        .iter()
+        .map(|record| record.settings_id.as_str())
+        .collect::<HashSet<_>>();
+    let mut dangling = HashSet::new();
+    for record in merged {
+        for value in record.properties.values().chain(record.attributes.values()) {
+            for_each_reference(value, &mut |object| {
+                if let Some(target) = same_store_reference_id(object, service)
+                    && !present.contains(target)
+                {
+                    dangling.insert((record.settings_id.clone(), target.to_string()));
+                }
+            });
+        }
+    }
+    dangling
+}
+
+/// The references one side holds to instances it has, as (referring id,
+/// target id) under the ids the merge uses.
+fn valid_references(
+    side: &SettingsBytecode,
+    id_remap: &HashMap<String, String>,
+    service: &str,
+    valid: &mut HashSet<(String, String)>,
+) {
+    let ids = settings_ids_by_index(side);
+    let merged_id = |id: &str| id_remap.get(id).cloned().unwrap_or_else(|| id.to_string());
+    for instance in &side.instances {
+        for value in instance
+            .properties
+            .values()
+            .chain(instance.attributes.values())
+        {
+            for_each_reference(value, &mut |object| {
+                if let Some(target) = same_store_reference_id(object, service)
+                    && ids.contains_key(target)
+                {
+                    valid.insert((merged_id(&instance.settings_id), merged_id(target)));
+                }
+            });
+        }
+    }
+}
+
+/// What a merge needs to settle references to instances it removed.
+struct ReferenceSides<'a> {
+    ours: &'a SettingsBytecode,
+    theirs: &'a SettingsBytecode,
+    theirs_id_remap: &'a HashMap<String, String>,
+    /// The preferred side with the id remap its records need.
+    preferred: Option<(&'a SettingsBytecode, &'a HashMap<String, String>)>,
+}
+
+/// A merge can remove an instance one side still refers to: one side deletes
+/// it, the other adds a reference to it, and no field was changed on both
+/// sides. With a preference the instance comes back when the preferred side
+/// still has it, and the reference is cleared when that side removed it;
+/// without one it is a conflict. A reference that was already broken on the
+/// side it came from is not the merge's doing and stays as it is.
+fn settle_references_to_removed_instances(
+    merged: &mut Vec<VcMergedInstance>,
+    sides: &ReferenceSides<'_>,
+    conflicts: &mut Vec<VcMergeConflict>,
+) {
+    let Some(service) = merged
+        .iter()
+        .find(|record| record.parent_id.is_none())
+        .map(|record| record.name.clone())
+    else {
+        return;
+    };
+    let mut dangling = dangling_references(merged, &service);
+    if dangling.is_empty() {
+        return;
+    }
+    let mut broken_by_merge = HashSet::new();
+    valid_references(sides.ours, &HashMap::new(), &service, &mut broken_by_merge);
+    valid_references(
+        sides.theirs,
+        sides.theirs_id_remap,
+        &service,
+        &mut broken_by_merge,
+    );
+    if let Some((preferred, id_remap)) = sides.preferred {
+        let preferred_ids = settings_ids_by_index(preferred);
+        // A restored instance can itself refer to a removed one.
+        loop {
+            let mut present = merged
+                .iter()
+                .map(|record| record.settings_id.clone())
+                .collect::<HashSet<_>>();
+            let before = merged.len();
+            for (referring, target) in &dangling {
+                if broken_by_merge.contains(&(referring.clone(), target.clone()))
+                    && let Some(&index) = preferred_ids.get(target)
+                    && present.insert(target.clone())
+                {
+                    merged.push(preferred_instance(preferred, index, id_remap));
+                }
+            }
+            if merged.len() == before {
+                break;
+            }
+            reattach_orphans(merged, preferred, id_remap);
+            dangling = dangling_references(merged, &service);
+        }
+    }
+    for record in merged.iter_mut() {
+        let referring = record.settings_id.clone();
+        let name = record.name.clone();
+        for (field, value) in record
+            .properties
+            .iter_mut()
+            .chain(record.attributes.iter_mut())
+        {
+            for_each_reference_mut(value, &mut |object| {
+                let Some(target) = same_store_reference_id(object, &service).map(str::to_string)
+                else {
+                    return;
+                };
+                if !dangling.contains(&(referring.clone(), target.clone()))
+                    || !broken_by_merge.contains(&(referring.clone(), target.clone()))
+                {
+                    return;
+                }
+                if sides.preferred.is_some() {
+                    for selector in SETTINGS_REFERENCE_SELECTOR_KEYS {
+                        object.remove(selector);
+                    }
+                } else {
+                    conflicts.push(VcMergeConflict {
+                        path: name.clone(),
+                        detail: format!(
+                            "{field}: refers to an instance (id={target}) removed on the other side"
+                        ),
+                    });
+                }
+            });
         }
     }
 }
@@ -1257,16 +1467,40 @@ fn merge_prepared_settings_documents(
     }
 
     let preferred = structural_prefer.map(|prefer_ours| if prefer_ours { ours } else { theirs });
-    if let Some(preferred) = preferred {
-        let no_remap = HashMap::new();
-        let id_remap = if structural_prefer == Some(false) {
-            &theirs_id_remap
-        } else {
-            &no_remap
-        };
-        reattach_orphans(&mut merged, preferred, id_remap);
+    let no_remap = HashMap::new();
+    let preferred_remap = if structural_prefer == Some(false) {
+        &theirs_id_remap
+    } else {
+        &no_remap
+    };
+    match preferred {
+        Some(preferred) => {
+            reattach_orphans(&mut merged, preferred, preferred_remap);
+            // Breaking a cycle moves an instance to the preferred side's
+            // parent, which the merge may have removed, and restoring a
+            // removed parent can close a cycle; the two steps repeat until
+            // neither applies. Every round but the last restores an instance
+            // of the preferred side, which bounds the rounds.
+            for _ in 0..=preferred.instances.len() {
+                if parent_cycles(&merged).is_empty() {
+                    break;
+                }
+                resolve_parent_cycles(&mut merged, Some(preferred), &mut conflicts);
+                reattach_orphans(&mut merged, preferred, preferred_remap);
+            }
+        }
+        None => resolve_parent_cycles(&mut merged, None, &mut conflicts),
     }
-    resolve_parent_cycles(&mut merged, preferred, &mut conflicts);
+    settle_references_to_removed_instances(
+        &mut merged,
+        &ReferenceSides {
+            ours,
+            theirs,
+            theirs_id_remap: &theirs_id_remap,
+            preferred: preferred.map(|preferred| (preferred, preferred_remap)),
+        },
+        &mut conflicts,
+    );
 
     finish_settings_merge(merged, structural_prefer, version, conflicts)
 }

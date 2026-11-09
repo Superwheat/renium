@@ -1052,6 +1052,160 @@ fn a_preferred_merge_keeps_instances_whose_parent_the_other_side_removed() {
 }
 
 #[test]
+fn a_preferred_merge_keeps_a_parent_that_breaking_a_cycle_needs() {
+    let fx = Fixture::new("merge-cycle-orphans");
+    run_batch(
+        &fx,
+        r##"[{"parent":"Workspace","name":"P","class":"Folder","ref":"p"},
+            {"parent":"#p","name":"A","class":"Folder","ref":"a"},
+            {"parent":"#a","name":"Leaf","class":"Folder"},
+            {"parent":"Workspace","name":"B","class":"Folder"}]"##,
+    )
+    .unwrap();
+    let store = fx.store("Workspace");
+    let workspace = fx.store_arg("Workspace");
+    let snapshot = |name: &str| {
+        let path = fx.root.join(name);
+        fs::copy(&store, &path).unwrap();
+        path.to_string_lossy().into_owned()
+    };
+    let base = snapshot("base.renium");
+    // Ours moves A under B and removes P; theirs moves B under A.
+    run_batch(
+        &fx,
+        r##"[{"op":"move","path":"Workspace.P.A","parent":"Workspace.B"}]"##,
+    )
+    .unwrap();
+    fx.text(&["br", "-f", &workspace, "P"]).ok();
+    let ours = snapshot("ours.renium");
+    fs::copy(&base, &store).unwrap();
+    run_batch(
+        &fx,
+        r##"[{"op":"move","path":"Workspace.B","parent":"Workspace.P.A"}]"##,
+    )
+    .unwrap();
+    let theirs = snapshot("theirs.renium");
+    let merged = fx.path("merged.renium");
+    let placed = |pairs: &[(&str, &str)]| {
+        pairs
+            .iter()
+            .map(|(name, parent)| (name.to_string(), parent.to_string()))
+            .collect::<Vec<_>>()
+    };
+    // Theirs wins: the cycle breaks toward their tree, which still has P.
+    fx.text(&[
+        "vcm", &base, &ours, &theirs, "-o", &merged, "--prefer", "theirs",
+    ])
+    .ok();
+    assert_eq!(
+        merged_placements(&merged, &["P", "A", "Leaf", "B"]),
+        placed(&[("P", "Workspace"), ("A", "P"), ("Leaf", "A"), ("B", "A")])
+    );
+    // Ours wins: A sits under B and P stays removed.
+    fx.text(&[
+        "vcm", &base, &ours, &theirs, "-o", &merged, "--prefer", "ours",
+    ])
+    .ok();
+    assert_eq!(
+        merged_placements(&merged, &["P", "A", "Leaf", "B"]),
+        placed(&[("A", "B"), ("Leaf", "A"), ("B", "Workspace")])
+    );
+}
+
+#[test]
+fn a_merge_settles_a_reference_to_an_instance_the_other_side_removed() {
+    let fx = Fixture::new("merge-references");
+    run_batch(
+        &fx,
+        r##"[{"parent":"Workspace","name":"Props","class":"Folder","ref":"props"},
+            {"parent":"#props","name":"Sign","class":"StringValue","props":{"Value":"hello"}},
+            {"parent":"#props","name":"Lamp","class":"Folder"}]"##,
+    )
+    .unwrap();
+    let store = fx.store("Workspace");
+    let workspace = fx.store_arg("Workspace");
+    let snapshot = |name: &str| {
+        let path = fx.root.join(name);
+        fs::copy(&store, &path).unwrap();
+        path.to_string_lossy().into_owned()
+    };
+    let base = snapshot("base.renium");
+    fx.text(&["br", "-f", &workspace, "Props.Sign"]).ok();
+    let removed_sign = snapshot("removed-sign.renium");
+    fs::copy(&base, &store).unwrap();
+    run_batch(
+        &fx,
+        r##"[{"parent":"Workspace.Props","name":"Ptr","class":"ObjectValue","props":{"Value":"Workspace.Props.Sign"}}]"##,
+    )
+    .unwrap();
+    let added_pointer = snapshot("added-pointer.renium");
+    let merged = fx.path("merged.renium");
+    let pointer_target = || {
+        let document = SettingsBytecode::read_file(Path::new(&merged)).unwrap();
+        let pointer = document
+            .instances
+            .iter()
+            .find(|instance| instance.name == "Ptr")
+            .expect("the added pointer is kept");
+        let reference = &pointer.properties["Value"];
+        let by_id = reference
+            .get("settingsId")
+            .and_then(Value::as_str)
+            .and_then(|id| {
+                document
+                    .instances
+                    .iter()
+                    .find(|instance| instance.settings_id == id)
+            });
+        let by_index = reference
+            .get("instanceIndex")
+            .and_then(Value::as_u64)
+            .and_then(|index| document.instances.get(index as usize - 1));
+        let named =
+            reference.get("settingsId").is_some() || reference.get("instanceIndex").is_some();
+        let held = by_id
+            .or(by_index)
+            .is_some_and(|instance| instance.name == "Sign");
+        (named, held)
+    };
+
+    let conflict = fx
+        .text(&["vcm", &base, &removed_sign, &added_pointer, "-o", &merged])
+        .err();
+    assert!(conflict.contains("merge conflict"), "{conflict}");
+    // The side that removed Sign wins: the pointer stays and points at nothing.
+    fx.text(&[
+        "vcm",
+        &base,
+        &removed_sign,
+        &added_pointer,
+        "-o",
+        &merged,
+        "--prefer",
+        "ours",
+    ])
+    .ok();
+    assert_eq!(pointer_target(), (false, false));
+    // The side that points at Sign wins: Sign comes back.
+    fx.text(&[
+        "vcm",
+        &base,
+        &removed_sign,
+        &added_pointer,
+        "-o",
+        &merged,
+        "--prefer",
+        "theirs",
+    ])
+    .ok();
+    assert_eq!(pointer_target(), (true, true));
+    // The merged store builds into a place either way.
+    fs::copy(&merged, &store).unwrap();
+    fx.text(&["bep", "-r", &fx.path(""), "-o", &fx.path("merged.rbxl")])
+        .ok();
+}
+
+#[test]
 fn a_scaled_label_stores_the_wrapping_studio_keeps() {
     let fx = Fixture::new("scaled-label");
     run_batch(
