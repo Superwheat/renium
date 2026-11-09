@@ -183,9 +183,56 @@ fn script_roots(project: Option<&Path>) -> anyhow::Result<(PathBuf, PathBuf)> {
     Ok((loaded.root, source))
 }
 
-fn print_script_result(result: Result<Value, Failure>) -> anyhow::Result<()> {
+fn print_script_hits(result: Result<Value, Failure>) -> anyhow::Result<()> {
     let value = result.map_err(|failure| anyhow::anyhow!(failure.0.m))?;
-    print_json_output(&value, false)
+    let text = script_hits_text(&value);
+    crate::app::output::emit_global_output(&value, &text)
+}
+
+const HIT_TEXT_LIMIT: usize = 240;
+
+/// Search hits as text: each script's path on its own line, then its hits as
+/// `LINE: text` without the indentation and with a long line cut short, and
+/// a last line when the limit left hits out.
+fn script_hits_text(value: &Value) -> String {
+    let results = value["results"].as_array().map_or(&[][..], Vec::as_slice);
+    if results.is_empty() {
+        return "no matches".to_string();
+    }
+    let mut text = String::new();
+    let mut lines = 0u64;
+    for result in results {
+        text.push_str(result["path"].as_str().unwrap_or_default());
+        text.push('\n');
+        let hits = result.get("hits").or_else(|| result.get("matches"));
+        for hit in hits
+            .and_then(Value::as_array)
+            .map_or(&[][..], Vec::as_slice)
+        {
+            lines += 1;
+            let line = hit["text"].as_str().unwrap_or_default().trim();
+            text.push_str(&format!("{}: ", hit["line"]));
+            match line.char_indices().nth(HIT_TEXT_LIMIT) {
+                Some((cut, _)) => {
+                    text.push_str(&line[..cut]);
+                    text.push('\u{2026}');
+                }
+                None => text.push_str(line),
+            }
+            text.push('\n');
+        }
+    }
+    if value["truncated"] == json!(true) {
+        let (shown, total, unit) = match value.get("totalFiles") {
+            Some(total) => (results.len() as u64, total.as_u64().unwrap_or(0), "scripts"),
+            None => (lines, value["totalMatches"].as_u64().unwrap_or(0), "lines"),
+        };
+        text.push_str(&format!(
+            "{shown} of {total} {unit} shown; -l N shows more\n"
+        ));
+    }
+    text.truncate(text.trim_end().len());
+    text
 }
 
 pub(crate) fn script_search_command(
@@ -193,7 +240,7 @@ pub(crate) fn script_search_command(
     project: Option<&Path>,
 ) -> anyhow::Result<()> {
     let (root, source) = script_roots(project)?;
-    print_script_result(script_search_at(
+    print_script_hits(script_search_at(
         &root,
         &source,
         &json!({ "keywords": args.keywords(), "limit": args.limit }),
@@ -205,7 +252,7 @@ pub(crate) fn script_grep_command(
     project: Option<&Path>,
 ) -> anyhow::Result<()> {
     let (root, source) = script_roots(project)?;
-    print_script_result(script_grep_at(
+    print_script_hits(script_grep_at(
         &root,
         &source,
         &json!({
@@ -484,4 +531,68 @@ pub(crate) fn script_grep(context: &BoundContext, parameters: &Value) -> Result<
         Path::new(&context.source),
         parameters,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{HIT_TEXT_LIMIT, script_hits_text};
+
+    #[test]
+    fn grep_hits_print_one_path_per_script_and_unindented_lines() {
+        let value = json!({
+            "results": [
+                { "path": "src/A.server.luau", "hits": [
+                    { "line": 7, "text": "\t\tif api.Grant(player) then" },
+                    { "line": 12, "text": "    api.Grant(player, 2)  " },
+                ]},
+                { "path": "src/B.luau", "hits": [{ "line": 3, "text": "Grant = grant," }] },
+            ],
+            "totalMatches": 3,
+        });
+        assert_eq!(
+            script_hits_text(&value),
+            "src/A.server.luau\n7: if api.Grant(player) then\n12: api.Grant(player, 2)\nsrc/B.luau\n3: Grant = grant,"
+        );
+    }
+
+    #[test]
+    fn hits_the_limit_left_out_are_counted_in_a_last_line() {
+        let grep = json!({
+            "results": [{ "path": "src/A.luau", "hits": [{ "line": 1, "text": "x" }] }],
+            "totalMatches": 40,
+            "truncated": true,
+        });
+        assert_eq!(
+            script_hits_text(&grep),
+            "src/A.luau\n1: x\n1 of 40 lines shown; -l N shows more"
+        );
+        let search = json!({
+            "results": [{ "path": "src/A.luau", "matches": [{ "line": 1, "text": "x" }] }],
+            "totalFiles": 9,
+            "truncated": true,
+        });
+        assert_eq!(
+            script_hits_text(&search),
+            "src/A.luau\n1: x\n1 of 9 scripts shown; -l N shows more"
+        );
+    }
+
+    #[test]
+    fn a_long_line_is_cut_and_no_hits_say_so() {
+        let long = "\u{e9}".repeat(HIT_TEXT_LIMIT + 10);
+        let value = json!({
+            "results": [{ "path": "src/A.luau", "hits": [{ "line": 1, "text": long }] }],
+            "totalMatches": 1,
+        });
+        let text = script_hits_text(&value);
+        let line = text.lines().nth(1).unwrap();
+        assert_eq!(line.chars().count(), "1: ".len() + HIT_TEXT_LIMIT + 1);
+        assert!(line.ends_with('\u{2026}'));
+        assert_eq!(
+            script_hits_text(&json!({ "results": [], "totalMatches": 0 })),
+            "no matches"
+        );
+    }
 }

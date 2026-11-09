@@ -16,6 +16,7 @@ pub(crate) mod edit;
 pub(crate) mod explorer;
 pub(crate) mod query;
 pub(crate) mod references;
+mod tree_text;
 
 use crate::app::output::{OutputMode, ReportedFailure, print_json_output};
 use crate::app::timing::current_millis;
@@ -32,8 +33,8 @@ use crate::bytecode::query::{
 };
 use crate::cli::{
     BytecodeApplyPropertyBatchArgs, BytecodeFileArgs, BytecodeGetPropertyArgs,
-    BytecodeInstanceSelectorArgs, BytecodeSetPropertyArgs, BytecodeSetSourceArgs, FindArgs,
-    HighLevelTargetArgs, InspectArgs, TreeArgs,
+    BytecodeInstanceSelectorArgs, BytecodeSetPropertyArgs, BytecodeSetSourceArgs,
+    FIND_DEFAULT_FIELDS, FindArgs, HighLevelTargetArgs, InspectArgs, TREE_DEFAULT_FIELDS, TreeArgs,
 };
 use crate::daemon::is_process_alive;
 use crate::editor::document::is_protected_engine_container;
@@ -1408,6 +1409,20 @@ pub(super) fn find_command(args: FindArgs) -> Result<()> {
         }
     }
 
+    if mode.uses_short_keys()
+        && args.fields == FIND_DEFAULT_FIELDS
+        && crate::app::output::compact_text_output()
+        && let Some(text) = tree_text::match_lines(
+            &ctx.document,
+            &ctx.path_segments_by_index,
+            &ctx.path_ordinals_by_index,
+            &match_indices,
+            limit,
+        )
+    {
+        println!("{text}");
+        return Ok(());
+    }
     let projection = ctx.projection(mode, fields.as_ref());
     let matches = match_indices
         .into_iter()
@@ -1453,6 +1468,21 @@ pub(super) fn tree_command(args: TreeArgs) -> Result<()> {
         .take(args.limit.unwrap_or(usize::MAX))
         .collect::<Vec<_>>();
     let visible_indices = node_indices.iter().copied().collect::<HashSet<_>>();
+    if mode.uses_short_keys()
+        && args.fields == TREE_DEFAULT_FIELDS
+        && crate::app::output::compact_text_output()
+    {
+        println!(
+            "{}",
+            tree_text::text_tree(
+                &ctx.document,
+                &ctx.children_by_parent,
+                root_index,
+                &visible_indices
+            )
+        );
+        return Ok(());
+    }
     let projection = ctx.projection(mode, fields.as_ref());
     let nodes = node_indices
         .into_iter()

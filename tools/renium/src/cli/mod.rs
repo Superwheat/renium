@@ -1504,7 +1504,7 @@ pub(super) struct FindArgs {
         help = "Fields or preset to return",
         short = 'F',
         long,
-        default_value = "lookup,ords"
+        default_value = FIND_DEFAULT_FIELDS
     )]
     pub(super) fields: String,
     #[arg(help = "Pretty-print the JSON result", long)]
@@ -1544,6 +1544,12 @@ pub(super) struct HighLevelTargetArgs {
     pub(super) ords: Option<String>,
 }
 
+/// The fields `rbx f` shows when none are asked for.
+pub(crate) const FIND_DEFAULT_FIELDS: &str = "lookup,ords";
+
+/// The fields `rbx tr` shows when none are asked for.
+pub(crate) const TREE_DEFAULT_FIELDS: &str = "tree,ords";
+
 #[derive(Parser)]
 pub(super) struct TreeArgs {
     #[command(flatten)]
@@ -1565,7 +1571,7 @@ pub(super) struct TreeArgs {
         help = "Fields or preset to return",
         short = 'F',
         long,
-        default_value = "tree,ords"
+        default_value = TREE_DEFAULT_FIELDS
     )]
     pub(super) fields: String,
     #[arg(help = "Pretty-print the JSON result", long)]

@@ -59,6 +59,8 @@
 - `rbx wait 30s` (also `500ms`, `2m`) waits that long and nothing else, for a sampler's window, instead of a condition that never holds.
 - `rbx l` and `rbx lc` grow the default 10 s run limit to cover the `task.wait(N)` sleeps written into the code, and to 30 s for code that waits inside a loop, reporting `timeoutSeconds`; `-t` still sets it.
 - `rbx ps -s SERVICE` pushes a service's store file.
+- `rbx tr` prints an indented tree in text mode: one `Name Class` line per instance, one space of indent per level, ` +N` for children not shown, `Name[2]` for a later sibling of the same name and `Name[1-4]` for a run of alike siblings. `rbx f` prints `path Class` lines, a shared parent once as `path:`, and says when the limit cut the list. `--output-mode json`, or an explicit `-F` or `-o`, returns the records with their ids as before.
+- `rbx sg` and `rbx ss` print each script's path once and then its hits as `LINE: text` without the indentation, a line over 240 characters cut short, and a last line when the limit left hits out.
 
 ### Bug fixes
 
