@@ -90,6 +90,7 @@
 - `rbx mcp` answers a JSON-RPC batch with one array, as protocol 2025-03-26 requires.
 - `rbx mcp` exits when its client closes stdin even while a command runs, and on Windows a command no longer outlives a killed server.
 - When the daemon already has 16 open connections, the next command is told so and asked to retry, instead of failing with a socket error.
+- `rbx -r DIR COMMAND` no longer creates DIR for commands that work in an existing project; it reports that the folder does not exist, and only `rbx -r DIR init` creates it.
 
 ## 0.5.9 - 2026-11-06
 

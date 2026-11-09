@@ -180,11 +180,30 @@ fn arguments_after_leading_root() -> Result<Vec<std::ffi::OsString>> {
             return Ok(with_flag);
         }
     }
-    std::fs::create_dir_all(&root)
-        .with_context(|| format!("Could not create {}", root.display()))?;
+    ensure_leading_root(&root, &arguments)?;
     std::env::set_current_dir(&root)
         .with_context(|| format!("Could not enter {}", root.display()))?;
     Ok(arguments)
+}
+
+/// Makes sure the folder of a leading `-r` is there to enter. `init` makes a
+/// project out of a folder that does not exist yet, so it gets one; every
+/// other command that comes here works in an existing project, and a missing
+/// folder is reported instead of left behind empty.
+fn ensure_leading_root(root: &Path, arguments: &[std::ffi::OsString]) -> Result<()> {
+    if root.is_dir() {
+        return Ok(());
+    }
+    let creates_project = cli::command()
+        .try_get_matches_from(arguments)
+        .is_ok_and(|matches| matches.subcommand_name() == Some("init"));
+    if !creates_project {
+        anyhow::bail!(
+            "No Renium project in {0}: the folder does not exist; create a project there with `rbx init {0}`",
+            root.display()
+        );
+    }
+    std::fs::create_dir_all(root).with_context(|| format!("Could not create {}", root.display()))
 }
 
 fn run_cli() -> Result<()> {
@@ -427,6 +446,30 @@ mod startup_policy_tests {
             let matches = cli::command().try_get_matches_from(arguments).unwrap();
             assert!(!command_projects_its_own_fields(&matches));
         }
+    }
+
+    #[test]
+    fn a_leading_root_is_created_only_for_init() {
+        let base = tests::support::temp_dir("leading-root");
+        let missing = base.join("missing");
+        let arguments = |command: &[&str]| {
+            std::iter::once("rbx")
+                .chain(command.iter().copied())
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        };
+        for command in [&["status"][..], &["l", "return 1"], &["dm", "list"]] {
+            let error = ensure_leading_root(&missing, &arguments(command))
+                .expect_err("a command that reads must not create its folder")
+                .to_string();
+            assert!(error.starts_with("No Renium project in"), "{error}");
+            assert!(error.contains("does not exist"), "{error}");
+            assert!(!missing.exists(), "{command:?}");
+        }
+        ensure_leading_root(&base, &arguments(&["status"])).unwrap();
+        ensure_leading_root(&missing, &arguments(&["init"])).unwrap();
+        assert!(missing.is_dir());
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

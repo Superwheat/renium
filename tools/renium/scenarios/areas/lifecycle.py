@@ -833,13 +833,14 @@ def bare_place_file_flow(ctx: Context):
 
 
 def commands_never_create_a_project(ctx: Context):
-    """LIFE-041: status in an empty folder says there is no project; -r NEW creates only the folder."""
+    """LIFE-041: status in an empty folder says there is no project; -r NEW names the missing folder and creates nothing."""
     empty = _outside(ctx, "empty")
     status = ctx.rbx("status", cwd=empty, ok=False, timeout=60)
     ctx.expect_in(f"No Renium project in {empty} or its parents", status.error, "no project")
     leading = ctx.rbx("-r", "NEW", "--output-mode", "json", "status", json_mode=False, cwd=empty, ok=False, timeout=60)
     ctx.expect_in("No Renium project in", leading.error, "-r NEW status")
-    ctx.expect((empty / "NEW").is_dir(), "-r created the folder")
+    ctx.expect_in("does not exist", leading.error, "-r NEW names the missing folder")
+    ctx.expect(not (empty / "NEW").exists(), "-r created no folder")
     ctx.expect(not list(empty.rglob("renium.project.json*")), "no project file written")
     shutil.rmtree(empty, ignore_errors=True)
 
