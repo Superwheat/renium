@@ -3299,6 +3299,8 @@ pub(super) struct BytecodeSetSourceArgs {
         value_name = "PATH"
     )]
     pub(super) source_file: Option<PathBuf>,
+    #[arg(help = "Allow edits inside linked packages", long)]
+    pub(super) override_packages: bool,
     #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }
@@ -3484,6 +3486,8 @@ pub(super) struct BytecodeAddInstanceArgs {
         long = "attribute"
     )]
     pub(super) attributes: Vec<String>,
+    #[arg(help = "Allow edits inside linked packages", long)]
+    pub(super) override_packages: bool,
     #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }
@@ -3528,6 +3532,8 @@ pub(super) struct BytecodeCloneInstanceArgs {
     pub(super) parent_name: Option<String>,
     #[arg(help = "Parent class name", short = 'C', long, alias = "parent-class")]
     pub(super) parent_class_name: Option<String>,
+    #[arg(help = "Allow edits inside linked packages", long)]
+    pub(super) override_packages: bool,
     #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }
@@ -3556,6 +3562,8 @@ pub(super) struct BytecodeRemoveInstanceArgs {
     pub(super) push: bool,
     #[arg(help = "Keep descendants", short = 'R', long)]
     pub(super) no_recursive: bool,
+    #[arg(help = "Allow edits inside linked packages", long)]
+    pub(super) override_packages: bool,
     #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }

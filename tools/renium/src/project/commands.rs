@@ -241,7 +241,8 @@ fn projected_unlink_store(
 }
 
 /// The projected caller has already applied the read-only link check, with
-/// its own `--override-packages`.
+/// its own `--override-packages`; the store edits it runs pass
+/// `override_packages: true` for that reason.
 fn metadata_property_change(
     settings_file: PathBuf,
     settings_id: Option<String>,
@@ -302,6 +303,7 @@ pub(crate) fn create_instance_command(
             },
             properties: args.properties,
             attributes: args.attributes,
+            override_packages: true,
             pretty: false,
         });
     } else {
@@ -330,6 +332,7 @@ pub(crate) fn create_instance_command(
         },
         properties: args.properties,
         attributes: args.attributes,
+        override_packages: args.override_packages,
         pretty: false,
     })
 }
@@ -373,6 +376,7 @@ pub(crate) fn clone_instance_command(
             parent_settings_id: parent_id,
             parent_name: None,
             parent_class_name: None,
+            override_packages: true,
             pretty: false,
         })?;
     let root_id = result
@@ -632,6 +636,7 @@ pub(crate) fn remove_instance_command(
         input: BytecodeFileArgs::settings_file(settings_file),
         selector: BytecodeInstanceSelectorArgs::by_settings_id(settings_id),
         no_recursive: args.no_recursive,
+        override_packages: true,
         pretty: false,
     })
 }

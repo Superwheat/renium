@@ -1062,6 +1062,45 @@ fn set_property_reports_value_selector_and_store_errors() {
 }
 
 #[test]
+fn set_property_refuses_an_enum_number_that_is_no_item() {
+    let fx = Fixture::new("set-enum-number");
+    let store = fx.store_arg("Workspace");
+    let before = fs::read(fx.store("Workspace")).unwrap();
+    let set = |value: &str| fx.text(&["bs", "-f", &store, "Door", "-p", "Material", "-j", value]);
+    assert_eq!(
+        set("99999").err(),
+        "Material needs an Enum.Material item, got 99999"
+    );
+    assert_eq!(
+        set(r#"{"_type":"EnumItem","value":99999}"#).err(),
+        r#"Material needs an Enum.Material item, got {"_type":"EnumItem","value":99999}"#
+    );
+    let added = fx
+        .text(&[
+            "ba",
+            "-f",
+            &store,
+            "-n",
+            "Slab",
+            "-c",
+            "Part",
+            "-p",
+            "Material=99999",
+        ])
+        .err();
+    assert!(
+        added.contains("Material needs an Enum.Material item, got 99999"),
+        "{added}"
+    );
+    assert_eq!(fs::read(fx.store("Workspace")).unwrap(), before);
+    set("256").ok();
+    assert_eq!(
+        fx.both(&["bg", "-f", &store, "Door", "Material"]),
+        json!({"_type": "EnumItem", "name": "Plastic"})
+    );
+}
+
+#[test]
 fn set_property_edits_the_service_root_and_references() {
     let fx = Fixture::new("set-refs");
     let store = fx.store_arg("Workspace");
@@ -1262,6 +1301,104 @@ fn set_property_reparents_and_rewrites_cross_service_references() {
     assert_eq!(
         by_index["pathSegments"],
         json!(["Workspace", "Café ☕", "Lobby"])
+    );
+}
+
+#[test]
+fn set_property_applies_several_assignments_to_the_one_selected_instance() {
+    let fx = Fixture::new("set-several");
+    let store = fx.store_arg("Workspace");
+    let set = |args: &[&str]| fx.text(&[&["bs", "-f", &store], args].concat());
+    let first = [
+        "Lobby.Border[1]",
+        "-p",
+        "Name=\"First\"",
+        "-p",
+        "Transparency=0.5",
+    ];
+    assert_eq!(
+        set(&first).ok(),
+        json!({
+            "changedPaths": ["<root>/instances/Workspace.renium"],
+            "ok": true,
+            "pathOrdinals": [1, 1, 1],
+            "pathSegments": ["Workspace", "Lobby", "First"],
+            "set": ["Name", "Transparency"],
+            "settingsFile": "<root>/instances/Workspace.renium",
+            "settingsId": "border1",
+        })
+    );
+    let instances = fx.read_store("Workspace").instances;
+    assert_eq!(instances[3].name, "First");
+    assert_eq!(instances[3].properties["Transparency"], json!(0.5));
+    assert_eq!(instances[4].name, "Border");
+    assert_eq!(instances[4].properties["Transparency"], json!(0.75));
+    let launcher = [
+        "Spawner",
+        "-p",
+        "Name=\"Launcher\"",
+        "-p",
+        "Source=\"print('launch')\"",
+    ];
+    assert_eq!(
+        set(&launcher).ok()["changedPaths"],
+        json!([
+            "<root>/instances/Workspace.renium",
+            "<root>/src/Workspace/Launcher.server.luau",
+            "<root>/src/Workspace/Spawner.server.luau"
+        ])
+    );
+    assert!(!fx.exists("src/Workspace/Spawner.server.luau"));
+    assert_eq!(
+        fs::read_to_string(fx.root.join("src/Workspace/Launcher.server.luau")).unwrap(),
+        "print('launch')"
+    );
+    let before = fs::read(fx.store("Workspace")).unwrap();
+    let unknown = set(&["Door", "-p", "Anchored=false", "-p", "Bogus=1"]).err();
+    assert!(
+        unknown.contains("Property \"Bogus\" does not exist on Part"),
+        "{unknown}"
+    );
+    assert_eq!(fs::read(fx.store("Workspace")).unwrap(), before);
+}
+
+#[test]
+fn set_property_where_writes_every_match_or_none() {
+    let fx = Fixture::new("set-where");
+    let store = fx.store_arg("Workspace");
+    let set = |args: &[&str]| fx.text(&[&["bs", "-f", &store, "--where"], args].concat());
+    let before = fs::read(fx.store("Workspace")).unwrap();
+    let mixed = set(&["Border or Target", "-p", "Anchored=false"]).err();
+    assert!(
+        mixed.contains("Property \"Anchored\" does not exist on ObjectValue"),
+        "{mixed}"
+    );
+    assert_eq!(fs::read(fx.store("Workspace")).unwrap(), before);
+    assert_eq!(
+        set(&["Border", "-p", "Anchored=true", "-p", "Transparency=0.1"]).ok(),
+        json!({
+            "changedPaths": ["<root>/instances/Workspace.renium"],
+            "instances": ["Workspace.Lobby.Border", "Workspace.Lobby.Border"],
+            "matched": 2,
+            "ok": true,
+            "scope": "Workspace",
+            "set": ["Anchored", "Transparency"],
+            "settingsFile": "<root>/instances/Workspace.renium",
+            "where": "Border",
+        })
+    );
+    let instances = fx.read_store("Workspace").instances;
+    for border in [&instances[3], &instances[4]] {
+        assert_eq!(border.properties["Anchored"], json!(true));
+        assert_eq!(border.properties["Transparency"], json!(0.1));
+    }
+    assert_eq!(
+        set(&["Border", "-p", "Transparency", "--num", "0.2"]).ok()["set"],
+        json!(["Transparency"])
+    );
+    assert_eq!(
+        fx.read_store("Workspace").instances[4].properties["Transparency"],
+        json!(0.2)
     );
 }
 

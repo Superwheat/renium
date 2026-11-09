@@ -539,6 +539,7 @@ fn cloning_a_script_refuses_to_overwrite_an_untracked_destination() {
         parent_settings_id: None,
         parent_name: None,
         parent_class_name: None,
+        override_packages: false,
         pretty: false,
     });
     assert!(result.unwrap_err().to_string().contains("already exists"));
@@ -1886,6 +1887,7 @@ fn ordinary_remove_rejects_package_bearing_instances_and_links() {
         input: BytecodeFileArgs::settings_file(settings_path.clone()),
         selector: BytecodeInstanceSelectorArgs::by_settings_id(Some("garage".into())),
         no_recursive: false,
+        override_packages: false,
         pretty: false,
     })
     .unwrap_err();
@@ -1901,6 +1903,7 @@ fn ordinary_remove_rejects_package_bearing_instances_and_links() {
         input: BytecodeFileArgs::settings_file(settings_path.clone()),
         selector: BytecodeInstanceSelectorArgs::by_settings_id(Some("package-link".into())),
         no_recursive: false,
+        override_packages: false,
         pretty: false,
     })
     .unwrap_err();
@@ -2808,6 +2811,7 @@ fn clone_instance_rebinds_internal_ref_properties() {
         parent_settings_id: None,
         parent_name: None,
         parent_class_name: None,
+        override_packages: false,
         pretty: false,
     })
     .unwrap();
@@ -4456,6 +4460,7 @@ fn bytecode_remove_instance_removes_source_files_and_keeps_service_store() {
         input: BytecodeFileArgs::settings_file(settings_path.clone()),
         selector: BytecodeInstanceSelectorArgs::by_settings_id(Some("pkg".into())),
         no_recursive: false,
+        override_packages: false,
         pretty: false,
     })
     .unwrap();

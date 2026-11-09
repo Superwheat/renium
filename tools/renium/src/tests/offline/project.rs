@@ -313,6 +313,27 @@ fn validate_project_prints_a_line_in_text_mode_and_counts_in_json_mode() {
     );
 }
 
+#[test]
+fn fmt_keeps_comments_and_the_values_after_them_at_their_depth() {
+    let fx = Fixture::new("fmt-comments");
+    let project = fx.path("renium.project.jsonc");
+    let formatted = "// lead\n{\n  /* block */\n  \"schemaVersion\": 1 // inline\n}\n";
+    fs::write(&project, formatted).unwrap();
+    fx.text(&["fmt", &project, "--check"]).ok();
+    for unformatted in [
+        " // lead\n{\n  /* block */\n   \"schemaVersion\": 1 // inline\n}\n",
+        "// lead\n{ /* block */ \"schemaVersion\": 1// inline\n}",
+    ] {
+        fs::write(&project, unformatted).unwrap();
+        assert_eq!(
+            fx.text(&["fmt", &project, "--check"]).err(),
+            "<root>/renium.project.jsonc is not formatted"
+        );
+        fx.text(&["fmt", &project]).ok();
+        assert_eq!(fs::read_to_string(&project).unwrap(), formatted);
+    }
+}
+
 fn fixture_sourcemap(root_name: &str, absolute: bool) -> Value {
     let file = |relative: &str| {
         if absolute {

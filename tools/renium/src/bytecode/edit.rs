@@ -218,6 +218,7 @@ pub(crate) struct StoreInstanceRequest {
     pub(crate) parent: StoreParentSelector,
     pub(crate) properties: Vec<String>,
     pub(crate) attributes: Vec<String>,
+    pub(crate) override_packages: bool,
 }
 
 #[derive(Default)]
@@ -231,7 +232,12 @@ pub(crate) struct StoreParentSelector {
 
 pub(crate) fn bytecode_add_instance(args: BytecodeAddInstanceArgs) -> Result<()> {
     if let Some(batch) = args.batch.as_deref() {
-        return crate::bytecode::add_batch::bytecode_add_batch(batch, args.pretty, args.push);
+        return crate::bytecode::add_batch::bytecode_add_batch(
+            batch,
+            args.pretty,
+            args.push,
+            args.override_packages,
+        );
     }
     let (Some(name), Some(class_name)) = (args.name, args.class_name) else {
         bail!("Give -n NAME and -c CLASS, or --batch with JSON ops");
@@ -268,6 +274,7 @@ pub(crate) fn bytecode_add_instance(args: BytecodeAddInstanceArgs) -> Result<()>
         },
         properties: args.properties,
         attributes: args.attributes,
+        override_packages: args.override_packages,
     })?;
     if args.push {
         push_stored_instance_reading(&mut result, &property_names, &attribute_names)?;
@@ -627,6 +634,9 @@ pub(crate) fn register_imported_script(
         },
         properties,
         attributes: Vec::new(),
+        // The import has written the script file by now; read-only links do
+        // not guard `ip`.
+        override_packages: true,
     })
     .map(Some)
 }
@@ -727,6 +737,7 @@ pub(crate) fn add_store_instance(request: StoreInstanceRequest) -> Result<Value>
         parent,
         properties: raw_properties,
         attributes: raw_attributes,
+        override_packages,
     } = request;
     ensure_service_store_exists(&settings_file, &service_hint)?;
     let _lock = acquire_settings_file_lock(&settings_file)?;
@@ -744,6 +755,10 @@ pub(crate) fn add_store_instance(request: StoreInstanceRequest) -> Result<Value>
         parent.parent_name.as_deref(),
         parent.parent_class_name.as_deref(),
     )?;
+    if let Some(parent_index) = parent_index {
+        let links = super::store_link_enforcement(&settings_file, override_packages)?;
+        super::reject_read_only_link_edit(&links, &document, &service, parent_index)?;
+    }
     let NewInstanceValues {
         properties,
         attributes,
@@ -898,6 +913,8 @@ pub(crate) fn bytecode_clone_instance_result(mut args: BytecodeCloneInstanceArgs
             .parent_index
             .ok_or_else(|| anyhow::anyhow!("Source instance has no parent"))?
     };
+    let links = super::store_link_enforcement(&settings_file, args.override_packages)?;
+    super::reject_read_only_link_edit(&links, &document, &service, target_parent_index)?;
 
     let service_dir = crate::project::storage::source_directory(&settings_file);
     let source_paths_before = build_editor_source_paths_by_index(&document, &service, &service_dir);
@@ -1656,8 +1673,10 @@ pub(crate) fn bytecode_remove_instance(mut args: BytecodeRemoveInstanceArgs) -> 
         }
         indices
     };
+    let links = super::store_link_enforcement(&settings_file, args.override_packages)?;
     let children_by_parent = settings_children_by_parent(&document);
     for &index in &indices {
+        super::reject_read_only_link_edit(&links, &document, &service, index)?;
         let mut subtree = Vec::new();
         collect_settings_subtree_preorder(&children_by_parent, index, &mut subtree);
         reject_package_link_subtree_mutation(&document, &subtree, "removed")?;
@@ -2080,6 +2099,7 @@ mod add_instance_tests {
                 },
                 properties,
                 attributes: Vec::new(),
+                override_packages: false,
                 pretty: false,
             })
         })

@@ -70,6 +70,10 @@
 - The extension no longer damages non-ASCII names and text: it decoded each chunk of a command's output on its own, so a multi-byte character split between two chunks turned into replacement characters in the Explorer, in command results and in git output.
 - Extension packages built by the Release and Verify workflows carry the class icons committed to the repository; packaging replaced them with the icons of the Studio installed on the build machine.
 - `tools/build-release.ps1` accepts macOS binaries; its Mach-O check compared an unsigned magic number with a negative literal and refused every one.
+- `rbx bs` with several `-p NAME=JSON` (and `--where`) could set later properties on a different instance or leave a half-applied edit when one assignment failed; it now applies every assignment to the instances selected at the start and writes nothing unless all of them succeed.
+- Setting an enum property to a number that is no item of the enum (`-p Material=99999`) was stored and built into the place; it is now refused like an unknown item name.
+- `rbx bss`, `rbx br`, `rbx ba`, `rbx bcl` and batch add, clone, remove and move ops could change a read-only link package and leave it drifted; they are now refused like `rbx bs`, and `--override-packages` allows them on purpose.
+- `rbx fmt` put a stray space before a leading comment and before the value after a block comment, and `fmt --check` accepted that; both now use the plain indent.
 
 ## 0.5.9 - 2026-11-06
 

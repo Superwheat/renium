@@ -2009,47 +2009,53 @@ fn reject_viewport_camera_edit(document: &SettingsBytecode, index: usize) -> Res
     Ok(())
 }
 
-/// Refuses a store edit inside a read-only link target of the store's
-/// project, as the projected commands and pushes do.
-fn reject_read_only_link_store_edit(
+/// The read-only link targets of the project a store belongs to. Nothing is
+/// enforced without a project, without links or when packages are overridden.
+pub(crate) fn store_link_enforcement(
     settings_file: &Path,
+    override_packages: bool,
+) -> Result<LinkEnforcement> {
+    if override_packages {
+        return Ok(LinkEnforcement::default());
+    }
+    match config::try_load_project(None, settings_file.parent())? {
+        Some(loaded) => build_loaded_project_link_enforcement(&loaded, false),
+        None => Ok(LinkEnforcement::default()),
+    }
+}
+
+/// Refuses a store edit at or inside a read-only link target, as the
+/// projected commands and pushes do. An edit that puts an instance under a
+/// parent (an add, a copy, a move) passes that parent.
+pub(crate) fn reject_read_only_link_edit(
+    links: &LinkEnforcement,
     document: &SettingsBytecode,
     service: &str,
     index: usize,
 ) -> Result<()> {
-    let Some(loaded) = config::try_load_project(None, settings_file.parent())? else {
-        return Ok(());
-    };
-    let enforcement = build_loaded_project_link_enforcement(&loaded, false)?;
-    if !enforcement.is_active() {
+    if !links.is_active() {
         return Ok(());
     }
     match build_editor_instance_paths_for_indices(document, service, &[index]).get(&index) {
-        Some(path) => enforcement.reject_read_only_package_path(
-            service,
-            &path.path_segments,
-            &path.path_ordinals,
-        ),
+        Some(path) => {
+            links.reject_read_only_package_path(service, &path.path_segments, &path.path_ordinals)
+        }
         None => Ok(()),
     }
 }
 
 /// Refuses a store edit of an instance that Roblox or a package owns: a
-/// PackageLink, the Workspace viewport camera and, unless packages are
-/// overridden, anything inside a read-only link.
+/// PackageLink, the Workspace viewport camera and anything inside a
+/// read-only link.
 fn reject_owned_instance_edit(
-    settings_file: &Path,
     document: &SettingsBytecode,
     service: &str,
     index: usize,
-    override_packages: bool,
+    links: &LinkEnforcement,
 ) -> Result<()> {
     reject_package_link_instance_mutation(document, index, "edited")?;
     reject_viewport_camera_edit(document, index)?;
-    if !override_packages {
-        reject_read_only_link_store_edit(settings_file, document, service, index)?;
-    }
-    Ok(())
+    reject_read_only_link_edit(links, document, service, index)
 }
 
 /// The name one property of the instance at `index` is stored under, with
@@ -2113,7 +2119,7 @@ pub(super) fn bytecode_set_property(mut args: BytecodeSetPropertyArgs) -> Result
     } else {
         None
     };
-    let mut result = set_properties_on_target(args.clone())?;
+    let mut result = bytecode_set_property_result(args.clone())?;
     let new_name = result
         .get("name")
         .and_then(Value::as_str)
@@ -2155,56 +2161,79 @@ fn selected_store_path(args: &BytecodeSetPropertyArgs) -> Result<Option<Vec<Stri
     Ok(segments.get(resolved.index).cloned().flatten())
 }
 
-/// The store edit itself: one `-p NAME` with a value flag, or several
-/// `-p NAME=JSON`, applied to the selected instance.
-fn set_properties_on_target(mut args: BytecodeSetPropertyArgs) -> Result<Value> {
-    let names = std::mem::take(&mut args.property);
-    let inline_values = names.iter().any(|name| name.contains('='));
-    let result = if inline_values {
-        if args.value_json.is_some()
-            || args.value_str.is_some()
-            || args.value_num.is_some()
-            || args.value_bool.is_some()
-            || args.value_null
-        {
-            bail!("Give values as -p NAME=JSON or with one -p NAME and a value flag, not both");
-        }
-        let mut combined = json!({ "ok": true, "set": [], "changedPaths": [] });
-        for assignment in &names {
+/// The assignments of a `bs` call, each a property name and its value: one
+/// `-p NAME` with a value flag, or `-p NAME=JSON` for each property. The flag
+/// says the values came inline.
+fn parse_set_assignments(args: &BytecodeSetPropertyArgs) -> Result<(Vec<(String, Value)>, bool)> {
+    if !args.property.iter().any(|name| name.contains('=')) {
+        let [name] = args.property.as_slice() else {
+            bail!("Give one -p NAME with a value flag, or -p NAME=JSON for each property");
+        };
+        let value = parse_cli_value(
+            args.value_json.as_deref(),
+            args.value_str.as_deref(),
+            args.value_num,
+            args.value_bool,
+            args.value_null,
+        )?;
+        return Ok((vec![(name.clone(), value)], false));
+    }
+    if args.value_json.is_some()
+        || args.value_str.is_some()
+        || args.value_num.is_some()
+        || args.value_bool.is_some()
+        || args.value_null
+    {
+        bail!("Give values as -p NAME=JSON or with one -p NAME and a value flag, not both");
+    }
+    let assignments = args
+        .property
+        .iter()
+        .map(|assignment| {
             let (name, value) = assignment
                 .split_once('=')
                 .with_context(|| format!("-p {assignment} needs NAME=JSON"))?;
-            let mut one = args.clone();
-            one.property = vec![name.to_string()];
-            one.value_json = Some(value.to_string());
-            let outcome = bytecode_set_property_result(one)?;
-            combined["set"].as_array_mut().unwrap().push(json!(name));
-            for path in outcome
-                .get("changedPaths")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                let paths = combined["changedPaths"].as_array_mut().unwrap();
-                if !paths.contains(path) {
-                    paths.push(path.clone());
-                }
-            }
-            for key in ["settingsFile", "settingsId", "pathSegments", "pathOrdinals"] {
-                if let Some(value) = outcome.get(key) {
-                    combined[key] = value.clone();
-                }
+            let value = parse_cli_value(Some(value), None, None, None, false)?;
+            Ok((name.to_string(), value))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((assignments, true))
+}
+
+/// What the assignments to one instance print as: the one outcome of
+/// `-p NAME` with a value flag, or for `-p NAME=JSON` the names set, the
+/// changed paths and where the instance is.
+fn assignments_result(
+    mut outcomes: Vec<Value>,
+    assignments: &[String],
+    inline_values: bool,
+) -> Value {
+    if !inline_values {
+        return outcomes.swap_remove(0);
+    }
+    let names = assignments
+        .iter()
+        .map(|assignment| {
+            assignment
+                .split_once('=')
+                .map_or(assignment.as_str(), |(name, _)| name)
+        })
+        .collect::<Vec<_>>();
+    let mut combined = json!({ "ok": true, "set": names });
+    for outcome in &outcomes {
+        for key in [
+            "changedPaths",
+            "settingsFile",
+            "settingsId",
+            "pathSegments",
+            "pathOrdinals",
+        ] {
+            if let Some(value) = outcome.get(key) {
+                combined[key] = value.clone();
             }
         }
-        combined
-    } else {
-        if names.len() != 1 {
-            bail!("Give one -p NAME with a value flag, or -p NAME=JSON for each property");
-        }
-        args.property = names;
-        bytecode_set_property_result(args)?
-    };
-    Ok(result)
+    }
+    combined
 }
 
 /// Pushes the edited instance when asked, with its read-back, and prints.
@@ -2303,43 +2332,36 @@ fn bytecode_set_property_where(mut args: BytecodeSetPropertyArgs, query: &str) -
         .map(|&index| document.instances[index].settings_id.clone())
         .collect::<Vec<_>>();
     let push = args.push;
-    args.push = false;
-    let mut set_names: Vec<String> = Vec::new();
-    let mut changed_paths = Vec::new();
-    for id in &ids {
-        let mut one = args.clone();
-        one.selector = BytecodeInstanceSelectorArgs::by_settings_id(Some(id.clone()));
-        let outcome = set_properties_on_target(one)?;
-        if set_names.is_empty() {
-            set_names = outcome
-                .get("set")
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect()
-                })
-                .or_else(|| {
-                    outcome
-                        .get("property")
-                        .and_then(Value::as_str)
-                        .map(|name| vec![name.to_string()])
-                })
-                .unwrap_or_default();
-        }
-        for path in outcome
-            .get("changedPaths")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            if !changed_paths.contains(path) {
-                changed_paths.push(path.clone());
-            }
-        }
-    }
+    let selectors = ids
+        .iter()
+        .map(|id| BytecodeInstanceSelectorArgs::by_settings_id(Some(id.clone())))
+        .collect::<Vec<_>>();
+    let (assignments, inline_values) = parse_set_assignments(&args)?;
+    // One write covers every match, so the first match's outcome names the
+    // properties set and every changed path.
+    let outcome = assignments_result(
+        set_store_properties(&args, &selectors, assignments)?.swap_remove(0),
+        &args.property,
+        inline_values,
+    );
+    let set_names = outcome
+        .get("set")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .or_else(|| {
+            outcome
+                .get("property")
+                .and_then(Value::as_str)
+                .map(|name| vec![name.to_string()])
+        })
+        .unwrap_or_default();
+    let changed_paths = outcome.get("changedPaths").cloned().unwrap_or_default();
     let mut result = json!({
         "ok": true,
         "where": query,
@@ -2620,210 +2642,331 @@ pub(crate) fn where_matches(
         .collect())
 }
 
+/// A `bs` edit as its result: one `-p NAME` with a value flag, or several
+/// `-p NAME=JSON`, applied to the selected instance.
 pub(crate) fn bytecode_set_property_result(mut args: BytecodeSetPropertyArgs) -> Result<Value> {
-    let property_name = args.property.remove(0);
-    let args = SetPropertyCall {
-        args,
-        property: property_name,
-    };
-    if args.property.eq_ignore_ascii_case("classname") {
+    adopt_single_positional_target(&mut args.input, None, &mut args.selector)?;
+    let (assignments, inline_values) = parse_set_assignments(&args)?;
+    let outcomes = set_store_properties(&args, std::slice::from_ref(&args.selector), assignments)?
+        .swap_remove(0);
+    Ok(assignments_result(outcomes, &args.property, inline_values))
+}
+
+/// A rename or a move: references to the instance and its descendants carry
+/// their paths, so every store of the project is rewritten with them.
+fn is_structural_property(property: &str, scope: PropertyScope) -> bool {
+    matches!(scope, PropertyScope::Auto | PropertyScope::Metadata)
+        && (property.eq_ignore_ascii_case("name") || property.eq_ignore_ascii_case("parent"))
+}
+
+/// Every locked store by service name, with `document` as the content of
+/// `settings_file`.
+fn read_locked_stores(
+    locked_stores: &BTreeSet<PathBuf>,
+    settings_file: &Path,
+    document: &SettingsBytecode,
+) -> Result<BTreeMap<String, SettingsBytecode>> {
+    let mut documents = BTreeMap::new();
+    for path in locked_stores {
+        let service_name = crate::project::storage::store_service_name(path)
+            .context("Service settings path has no service name")?;
+        let candidate = if path == settings_file {
+            document.clone()
+        } else {
+            SettingsBytecode::read_file(path)?
+        };
+        documents.insert(service_name, candidate);
+    }
+    Ok(documents)
+}
+
+/// Applies every assignment to every selected instance of one store and
+/// returns one result per instance and assignment. The instances are
+/// resolved before anything changes and the files are written once, after
+/// the last assignment was accepted, so a failing one leaves them untouched.
+fn set_store_properties(
+    args: &BytecodeSetPropertyArgs,
+    selectors: &[BytecodeInstanceSelectorArgs],
+    mut assignments: Vec<(String, Value)>,
+) -> Result<Vec<Vec<Value>>> {
+    if assignments
+        .iter()
+        .any(|(property, _)| property.eq_ignore_ascii_case("classname"))
+    {
         bail!("ClassName is read-only");
     }
-    let mut args = args;
-    let inner = &mut args.args;
-    adopt_single_positional_target(&mut inner.input, None, &mut inner.selector)?;
     let (settings_file, service_hint) = resolve_bytecode_cli_settings_file(
         args.input.settings_file.as_deref(),
         args.input.service_or_file.as_deref(),
         None,
     )?;
     let scope = parse_property_scope(&args.scope)?;
-    let structural_reference_update =
-        matches!(
-            args.property.to_ascii_lowercase().as_str(),
-            "name" | "parent"
-        ) && matches!(scope, PropertyScope::Auto | PropertyScope::Metadata);
-    let mut value = parse_cli_value(
-        args.value_json.as_deref(),
-        args.value_str.as_deref(),
-        args.value_num,
-        args.value_bool,
-        args.value_null,
-    )?;
+    let structural = assignments
+        .iter()
+        .any(|(property, _)| is_structural_property(property, scope));
     let mut unqualified_settings_ids = BTreeSet::new();
-    unqualified_reference_ids(&value, &mut unqualified_settings_ids);
+    for (_, value) in &assignments {
+        unqualified_reference_ids(value, &mut unqualified_settings_ids);
+    }
     let qualify_references = !unqualified_settings_ids.is_empty();
-    let mut settings_files_to_lock = BTreeSet::from([settings_file.clone()]);
-    if (structural_reference_update || qualify_references)
+    let mut locked_stores = BTreeSet::from([settings_file.clone()]);
+    if (structural || qualify_references)
         && let Some(src_root) = crate::project::storage::source_directory(&settings_file).parent()
     {
         for service_dir in crate::project::storage::service_directories(src_root)? {
             let path = service_settings_path(&service_dir);
             if path.is_file() {
-                settings_files_to_lock.insert(path);
+                locked_stores.insert(path);
             }
         }
     }
-    let _locks = settings_files_to_lock
+    let _locks = locked_stores
         .iter()
         .map(|path| lock_existing_service_store(path))
         .collect::<Result<Vec<_>>>()?;
-    let mut document = SettingsBytecode::read_file(&settings_file)?;
+    let document = SettingsBytecode::read_file(&settings_file)?;
     let service = bytecode_service_name(&document, &settings_file, &service_hint);
     if qualify_references {
-        let mut documents = BTreeMap::new();
-        for path in &settings_files_to_lock {
-            let service_name = crate::project::storage::store_service_name(path)
-                .context("Service settings path has no service name")?;
-            let candidate = if *path == settings_file {
-                document.clone()
-            } else {
-                SettingsBytecode::read_file(path)?
-            };
-            documents.insert(service_name, candidate);
+        let documents = read_locked_stores(&locked_stores, &settings_file, &document)?;
+        for (_, value) in &mut assignments {
+            qualify_reference_targets(value, &documents, &unqualified_settings_ids)?;
         }
-        qualify_reference_targets(&mut value, &documents, &unqualified_settings_ids)?;
     }
-    let resolved = resolve_bytecode_selector_or_service_root(
-        &document,
-        &service,
-        &args.selector,
-        "No matching instance",
-    )?;
-    let index = resolved.index;
-    fold_derived_property(&mut document, index, &mut args.property, &mut value)?;
-    reject_owned_instance_edit(
-        &settings_file,
-        &document,
-        &service,
-        index,
-        args.override_packages,
-    )?;
-    let (stored_property, requested_differs) =
-        stored_property_edit(&mut document, index, &args.property, &mut value, scope)?;
-    let property = stored_property.as_str();
-    let moved_indices = structural_reference_update.then(|| {
-        let children = settings_children_by_parent(&document);
-        let mut subtree = Vec::new();
-        collect_settings_subtree_preorder(&children, index, &mut subtree);
-        subtree.into_iter().collect::<HashSet<_>>()
-    });
-    if matches!(scope, PropertyScope::Auto | PropertyScope::Metadata)
-        && matches!(args.property.as_str(), "Name" | "ClassName" | "Parent")
-        && is_protected_engine_container(&document, index)
-    {
-        bail!("{} metadata is read-only", document.instances[index].name);
+    let indices = selectors
+        .iter()
+        .map(|selector| {
+            resolve_bytecode_selector_or_service_root(
+                &document,
+                &service,
+                selector,
+                "No matching instance",
+            )
+            .map(|resolved| resolved.index)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let links = store_link_enforcement(&settings_file, args.override_packages)?;
+    let mut edit = StorePropertyEdit {
+        settings_file: &settings_file,
+        service: &service,
+        service_dir: crate::project::storage::source_directory(&settings_file),
+        scope,
+        links: &links,
+        document,
+        before: None,
+        moved: HashSet::new(),
+        sources: Vec::new(),
+        store_edited: false,
+    };
+    let mut applied = Vec::with_capacity(indices.len());
+    for index in indices {
+        reject_owned_instance_edit(&edit.document, &service, index, &links)?;
+        let outcomes = assignments
+            .iter()
+            .map(|(property, value)| edit.apply(index, property.clone(), value.clone()))
+            .collect::<Result<Vec<_>>>()?;
+        applied.push(outcomes);
     }
-    let service_directory = crate::project::storage::source_directory(&settings_file);
-    let service_dir = service_directory.as_path();
-    if args.property.eq_ignore_ascii_case("source")
-        && matches!(scope, PropertyScope::Auto | PropertyScope::Property)
-    {
-        let source = value.as_str().context("Source must be a string")?;
-        let (source_path, changed) =
-            write_bytecode_source_file(&settings_file, &document, &service, index, source)?;
-        let changed_paths = changed
-            .then(|| source_path.clone())
-            .into_iter()
-            .collect::<Vec<_>>();
-        return Ok(json!({
-            "ok": true,
-            "settingsFile": settings_file,
-            "property": args.property,
-            "sourcePath": source_path,
-            "changedPaths": changed_paths,
-        }));
-    }
-    let affects_source_path = property_affects_source_path(scope, property);
-    let before_document = affects_source_path.then(|| document.clone());
-    let source_paths_before = before_document
-        .as_ref()
-        .map(|document| build_editor_source_paths_by_index(document, &service, service_dir));
-    instance_api::set_instance_property(&mut document, index, property, value, scope)?;
-    let mut writes = BTreeMap::new();
-    let mut removals = Vec::new();
-    if let (Some(before_document), Some(source_paths_before)) =
-        (before_document.as_ref(), source_paths_before.as_ref())
-    {
-        collect_source_path_updates(
-            before_document,
-            source_paths_before,
-            &document,
-            &service,
-            service_dir,
-            &mut writes,
-            &mut removals,
-        )?;
-    }
-    writes.insert(settings_file.clone(), encode_settings_bytecode(&document)?);
-    if let Some(moved_indices) = moved_indices.as_ref() {
-        let mut reference_documents = BTreeMap::new();
-        let mut reference_files = BTreeMap::new();
-        for path in &settings_files_to_lock {
-            let service_name = crate::project::storage::store_service_name(path)
-                .context("Service settings path has no service name")?;
-            let value = if *path == settings_file {
-                document.clone()
-            } else {
-                SettingsBytecode::read_file(path)?
-            };
-            reference_files.insert(service_name.clone(), path.clone());
-            reference_documents.insert(service_name, value);
-        }
-        let changed_services = canonicalize_settings_references_for_move(
-            &mut reference_documents,
-            &service,
-            moved_indices,
-        );
-        for changed_service in changed_services {
-            let path = &reference_files[&changed_service];
-            writes.insert(
-                path.clone(),
-                encode_settings_bytecode(&reference_documents[&changed_service])?,
+    edit.finish(&locked_stores, applied)
+}
+
+/// One store's document while a `bs` call edits it in memory.
+struct StorePropertyEdit<'a> {
+    settings_file: &'a Path,
+    service: &'a str,
+    service_dir: PathBuf,
+    scope: PropertyScope,
+    links: &'a LinkEnforcement,
+    document: SettingsBytecode,
+    /// The document and its script paths before the first assignment that
+    /// changes a script path.
+    before: Option<(SettingsBytecode, Vec<Option<PathBuf>>)>,
+    /// The renamed and moved instances with their descendants.
+    moved: HashSet<usize>,
+    /// The script sources to write, by instance index.
+    sources: Vec<(usize, String)>,
+    store_edited: bool,
+}
+
+/// One accepted assignment, kept for its result.
+struct AppliedAssignment {
+    index: usize,
+    /// The requested name, after a derived property was folded.
+    requested: String,
+    /// The name the value is stored under; a script source goes to its file
+    /// and has none.
+    stored: Option<String>,
+    requested_differs: bool,
+    structural: bool,
+}
+
+impl StorePropertyEdit<'_> {
+    fn apply(
+        &mut self,
+        index: usize,
+        mut property: String,
+        mut value: Value,
+    ) -> Result<AppliedAssignment> {
+        let structural = is_structural_property(&property, self.scope);
+        fold_derived_property(&mut self.document, index, &mut property, &mut value)?;
+        let (stored, requested_differs) =
+            stored_property_edit(&mut self.document, index, &property, &mut value, self.scope)?;
+        if matches!(self.scope, PropertyScope::Auto | PropertyScope::Metadata)
+            && matches!(property.as_str(), "Name" | "ClassName" | "Parent")
+            && is_protected_engine_container(&self.document, index)
+        {
+            bail!(
+                "{} metadata is read-only",
+                self.document.instances[index].name
             );
         }
+        if property.eq_ignore_ascii_case("source")
+            && matches!(self.scope, PropertyScope::Auto | PropertyScope::Property)
+        {
+            let source = value.as_str().context("Source must be a string")?;
+            let class_name = &self.document.instances[index].class_name;
+            if script_file_names(class_name).is_none() {
+                bail!("{class_name} is not a Lua source container");
+            }
+            self.sources.push((index, source.to_string()));
+            return Ok(AppliedAssignment {
+                index,
+                requested: property,
+                stored: None,
+                requested_differs: false,
+                structural: false,
+            });
+        }
+        if structural {
+            let children = settings_children_by_parent(&self.document);
+            let mut subtree = Vec::new();
+            collect_settings_subtree_preorder(&children, index, &mut subtree);
+            self.moved.extend(subtree);
+        }
+        if self.before.is_none() && property_affects_source_path(self.scope, &stored) {
+            let source_paths =
+                build_editor_source_paths_by_index(&self.document, self.service, &self.service_dir);
+            self.before = Some((self.document.clone(), source_paths));
+        }
+        instance_api::set_instance_property(&mut self.document, index, &stored, value, self.scope)?;
+        if structural
+            && stored == "Parent"
+            && let Some(parent) = self.document.instances[index].parent_index
+        {
+            reject_read_only_link_edit(self.links, &self.document, self.service, parent)?;
+        }
+        self.store_edited = true;
+        Ok(AppliedAssignment {
+            index,
+            requested: property,
+            stored: Some(stored),
+            requested_differs,
+            structural,
+        })
     }
-    let changed_paths = file_mutation_paths(&writes, &removals);
-    apply_file_mutations(&writes, &removals)?;
-    let mut result = json!({
-        "ok": true,
-        "settingsFile": settings_file,
-        "property": property,
-        "changedPaths": changed_paths,
-    });
-    if requested_differs {
-        result["requestedProperty"] = json!(args.property);
-    }
-    if structural_reference_update {
-        let instance = &document.instances[index];
-        let (path_segments, path_ordinals) = build_editor_instance_path_parts(&document, &service);
-        result["settingsId"] = json!(instance.settings_id);
-        result["name"] = json!(instance.name);
-        result["className"] = json!(instance.class_name);
-        result["pathSegments"] = json!(path_segments.get(index).and_then(Clone::clone));
-        result["pathOrdinals"] = json!(path_ordinals.get(index).and_then(Clone::clone));
-    }
-    Ok(result)
-}
 
-/// One property of a `bs` call: the parsed arguments plus the property name
-/// that call sets, so the setter reads `args.property` as before.
-struct SetPropertyCall {
-    args: BytecodeSetPropertyArgs,
-    property: String,
-}
-
-impl std::ops::Deref for SetPropertyCall {
-    type Target = BytecodeSetPropertyArgs;
-
-    fn deref(&self) -> &BytecodeSetPropertyArgs {
-        &self.args
-    }
-}
-
-impl std::ops::DerefMut for SetPropertyCall {
-    fn deref_mut(&mut self) -> &mut BytecodeSetPropertyArgs {
-        &mut self.args
+    /// Writes the store, the script files and the references to renamed and
+    /// moved instances in one step, then gives each assignment its result.
+    fn finish(
+        self,
+        locked_stores: &BTreeSet<PathBuf>,
+        applied: Vec<Vec<AppliedAssignment>>,
+    ) -> Result<Vec<Vec<Value>>> {
+        let mut writes = BTreeMap::new();
+        let mut removals = Vec::new();
+        let source_paths = match &self.before {
+            Some((before_document, source_paths_before)) => collect_source_path_updates(
+                before_document,
+                source_paths_before,
+                &self.document,
+                self.service,
+                &self.service_dir,
+                &mut writes,
+                &mut removals,
+            )?,
+            None if self.sources.is_empty() => Vec::new(),
+            None => {
+                build_editor_source_paths_by_index(&self.document, self.service, &self.service_dir)
+            }
+        };
+        let mut written_sources = HashMap::new();
+        for (index, source) in &self.sources {
+            let source_path = source_paths
+                .get(*index)
+                .and_then(Clone::clone)
+                .with_context(|| {
+                    format!(
+                        "Could not resolve source file path for {}",
+                        self.document.instances[*index].name
+                    )
+                })?;
+            writes.insert(source_path.clone(), source.clone().into_bytes());
+            written_sources.insert(*index, source_path);
+        }
+        if self.store_edited {
+            writes.insert(
+                self.settings_file.to_path_buf(),
+                encode_settings_bytecode(&self.document)?,
+            );
+        }
+        if !self.moved.is_empty() {
+            let mut documents =
+                read_locked_stores(locked_stores, self.settings_file, &self.document)?;
+            let files = locked_stores
+                .iter()
+                .filter_map(|path| Some((crate::project::storage::store_service_name(path)?, path)))
+                .collect::<BTreeMap<_, _>>();
+            for changed_service in
+                canonicalize_settings_references_for_move(&mut documents, self.service, &self.moved)
+            {
+                writes.insert(
+                    files[&changed_service].clone(),
+                    encode_settings_bytecode(&documents[&changed_service])?,
+                );
+            }
+        }
+        let changed_paths = file_mutation_paths(&writes, &removals);
+        apply_file_mutations(&writes, &removals)?;
+        let path_parts = applied
+            .iter()
+            .flatten()
+            .any(|assignment| assignment.structural)
+            .then(|| build_editor_instance_path_parts(&self.document, self.service));
+        Ok(applied
+            .iter()
+            .map(|outcomes| {
+                outcomes
+                    .iter()
+                    .map(|assignment| {
+                        let mut result = json!({
+                            "ok": true,
+                            "settingsFile": self.settings_file,
+                            "property": assignment.stored.as_ref().unwrap_or(&assignment.requested),
+                            "changedPaths": changed_paths,
+                        });
+                        if assignment.stored.is_none() {
+                            result["sourcePath"] = json!(written_sources.get(&assignment.index));
+                        }
+                        if assignment.requested_differs {
+                            result["requestedProperty"] = json!(assignment.requested);
+                        }
+                        if let Some((path_segments, path_ordinals)) = &path_parts
+                            && assignment.structural
+                        {
+                            let index = assignment.index;
+                            let instance = &self.document.instances[index];
+                            result["settingsId"] = json!(instance.settings_id);
+                            result["name"] = json!(instance.name);
+                            result["className"] = json!(instance.class_name);
+                            result["pathSegments"] =
+                                json!(path_segments.get(index).and_then(Clone::clone));
+                            result["pathOrdinals"] =
+                                json!(path_ordinals.get(index).and_then(Clone::clone));
+                        }
+                        result
+                    })
+                    .collect()
+            })
+            .collect())
     }
 }
 
@@ -3519,6 +3662,8 @@ pub(super) fn bytecode_set_source(mut args: BytecodeSetSourceArgs) -> Result<()>
     } else {
         inferred_service
     };
+    let links = store_link_enforcement(&settings_file, args.override_packages)?;
+    reject_read_only_link_edit(&links, &document, &service, index)?;
     let (source_path, changed) = if let Some(source_paths) = source_paths {
         let path_segments = path_segments
             .as_ref()

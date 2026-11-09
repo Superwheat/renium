@@ -443,6 +443,7 @@ fn batch_outcome(
             ops,
             &|service| Ok((fx.store(service), service.to_string())),
             push,
+            false,
         )
     };
     run().map_err(|error| normalize_text(&format!("{error:#}"), &fx.root))
@@ -951,6 +952,27 @@ fn a_scaled_label_stores_the_wrapping_studio_keeps() {
             .properties["TextWrapped"],
         json!(true)
     );
+    // Both values of one call reach the store together: settled between the
+    // two assignments, the wrapping would be back on before scaling went off.
+    fx.text(&[
+        "bs",
+        "-f",
+        &workspace,
+        "Scaled",
+        "-p",
+        "TextWrapped=false",
+        "-p",
+        "TextScaled=false",
+    ])
+    .ok();
+    let store = fx.read_store("Workspace");
+    let scaled = store
+        .instances
+        .iter()
+        .find(|instance| instance.name == "Scaled")
+        .unwrap();
+    assert_eq!(scaled.properties["TextScaled"], json!(false));
+    assert_eq!(scaled.properties["TextWrapped"], json!(false));
 }
 
 #[test]
@@ -2155,6 +2177,78 @@ fn set_property_refuses_an_edit_inside_a_read_only_link() {
     fx.text(&[&rename[..], &["--override-packages"]].concat())
         .ok();
     assert_eq!(fx.names("ReplicatedStorage")[1], "Other");
+}
+
+#[test]
+fn store_edits_refuse_changes_inside_a_read_only_link() {
+    let fx = Fixture::new("store-read-only-link");
+    crate::tests::support::write_packed_link_project(&fx.root);
+    let store = fx.store_arg("ReplicatedStorage");
+    fx.text(&["ba", "-f", &store, "-n", "Other", "-c", "Folder"])
+        .ok();
+    let before = fs::read(fx.store("ReplicatedStorage")).unwrap();
+    let refusal = "Cannot edit read-only link \"shared\" at ReplicatedStorage.Shared. Use --override-packages to replace it intentionally.";
+    let edits: [&[&str]; 5] = [
+        &["bss", "-f", &store, "Shared.Util", "--str", "return 2"],
+        &[
+            "ba", "-f", &store, "-n", "Extra", "-c", "Folder", "-I", "Shared",
+        ],
+        &["bcl", "-f", &store, "Shared.Util"],
+        &["br", "-f", &store, "Shared.Util"],
+        &[
+            "bs", "-f", &store, "Other", "-p", "Parent", "--str", "editor:1",
+        ],
+    ];
+    for edit in edits {
+        assert_eq!(fx.text(edit).err(), refusal, "{edit:?}");
+    }
+    for (label, op) in [
+        (
+            "add",
+            r#"{"parent":"ReplicatedStorage.Shared","name":"Extra","class":"Folder"}"#,
+        ),
+        (
+            "clone",
+            r#"{"op":"clone","path":"ReplicatedStorage.Shared.Util","name":"Copy"}"#,
+        ),
+        (
+            "remove",
+            r#"{"op":"remove","path":"ReplicatedStorage.Shared.Util"}"#,
+        ),
+        (
+            "move",
+            r#"{"op":"move","path":"ReplicatedStorage.Other","parent":"ReplicatedStorage.Shared"}"#,
+        ),
+    ] {
+        assert_eq!(
+            run_batch(&fx, &format!("[{op}]")).unwrap_err(),
+            format!("Batch op 0 ({label}): {refusal}")
+        );
+    }
+    assert_eq!(fs::read(fx.store("ReplicatedStorage")).unwrap(), before);
+    assert!(!fx.exists("src/ReplicatedStorage/Shared/Util.luau"));
+    for edit in edits {
+        fx.text(&[edit, &["--override-packages"]].concat()).ok();
+    }
+    assert_eq!(
+        fx.names("ReplicatedStorage"),
+        ["ReplicatedStorage", "Shared", "Other", "Extra", "Util Copy"]
+    );
+    let ops = crate::bytecode::add_batch::parse_batch_ops(
+        r#"[{"op":"remove","path":"ReplicatedStorage.Shared.Other"}]"#,
+    )
+    .unwrap();
+    crate::bytecode::add_batch::apply_store_batch(
+        ops,
+        &|service| Ok((fx.store(service), service.to_string())),
+        false,
+        true,
+    )
+    .unwrap();
+    assert_eq!(
+        fx.names("ReplicatedStorage"),
+        ["ReplicatedStorage", "Shared", "Extra", "Util Copy"]
+    );
 }
 
 #[test]

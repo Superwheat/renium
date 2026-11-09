@@ -1494,8 +1494,11 @@ pub(crate) fn typed_store_property_value(
     if let RbxDataType::Enum(enum_name) = &descriptor.data_type {
         // A plain item name, a number or a partial EnumItem object is stored
         // in the canonical EnumItem form, so the stores and Studio compare equal.
+        // A number that is no item of the enum would be written to the place
+        // as it is, so it is refused like an unknown name.
         if !value.is_null() {
             return json_to_rbx_enum_variant(&value, Some(*enum_name), database)
+                .filter(|variant| is_listed_enum_item(variant, database))
                 .and_then(|variant| {
                     rbx_variant_to_persisted_settings_json(
                         &variant,
@@ -2377,6 +2380,17 @@ fn json_to_rbx_enum_variant(
     } else {
         Some(RbxVariant::Enum(RbxEnum::from_u32(value)))
     }
+}
+
+/// Whether the item's number belongs to an item of its enum.
+fn is_listed_enum_item(variant: &RbxVariant, database: &ReflectionDatabase<'_>) -> bool {
+    let RbxVariant::EnumItem(item) = variant else {
+        return false;
+    };
+    database
+        .enums
+        .get(item.ty.as_str())
+        .is_some_and(|descriptor| descriptor.items.values().any(|value| *value == item.value))
 }
 
 pub(crate) fn strip_enum_prefix(value: &str) -> &str {

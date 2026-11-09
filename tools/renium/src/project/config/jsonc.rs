@@ -54,26 +54,20 @@ pub(super) fn format_jsonc(text: &str) -> Result<String> {
                 line_start = false;
             }
             TokenKind::Value => {
-                write_indent(&mut output, depth, &mut line_start);
-                if matches!(previous, Some(TokenKind::Value | TokenKind::BlockComment)) {
-                    output.push(' ');
-                }
+                let separate = previous == Some(TokenKind::Value);
+                write_indent_or_space(&mut output, depth, &mut line_start, separate);
                 output.push_str(&token.text);
             }
             TokenKind::LineComment => {
-                write_indent(&mut output, depth, &mut line_start);
-                if !output.ends_with([' ', '\n']) {
-                    output.push(' ');
-                }
+                let separate = !output.ends_with(' ');
+                write_indent_or_space(&mut output, depth, &mut line_start, separate);
                 output.push_str(token.text.trim_end());
                 output.push('\n');
                 line_start = true;
             }
             TokenKind::BlockComment => {
-                write_indent(&mut output, depth, &mut line_start);
-                if !output.ends_with([' ', '\n']) {
-                    output.push(' ');
-                }
+                let separate = !output.ends_with(' ');
+                write_indent_or_space(&mut output, depth, &mut line_start, separate);
                 output.push_str(token.text.trim());
                 if matches!(
                     next,
@@ -127,6 +121,16 @@ fn write_indent(output: &mut String, depth: usize, line_start: &mut bool) {
     if *line_start {
         output.push_str(&"  ".repeat(depth));
         *line_start = false;
+    }
+}
+
+/// A token that starts a line takes the indent alone; the separating space
+/// is only for one that follows another token on its line.
+fn write_indent_or_space(output: &mut String, depth: usize, line_start: &mut bool, separate: bool) {
+    if *line_start {
+        write_indent(output, depth, line_start);
+    } else if separate {
+        output.push(' ');
     }
 }
 

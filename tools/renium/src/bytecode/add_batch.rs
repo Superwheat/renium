@@ -20,7 +20,8 @@ use crate::bytecode::{
     SettingsFileLock, acquire_settings_file_lock, apply_file_mutations, check_new_source_file,
     collect_source_path_updates, file_mutation_paths, fold_derived_property, high_level_split_path,
     missing_service_store_error, preserve_source_path_extension, qualify_value_references,
-    reject_owned_instance_edit, resolve_bytecode_cli_settings_file, stored_property_edit,
+    reject_owned_instance_edit, reject_read_only_link_edit, resolve_bytecode_cli_settings_file,
+    store_link_enforcement, stored_property_edit,
 };
 use crate::editor::document::is_protected_engine_container;
 use crate::editor::paths::{
@@ -29,6 +30,7 @@ use crate::editor::paths::{
 };
 use crate::editor::sync::is_lua_source_class;
 use crate::editor::types::EditorInstancePath;
+use crate::project::package_links::LinkEnforcement;
 use crate::rbx::model::canonicalize_settings_references_for_moves;
 use crate::settings::bytecode::{
     SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance, encode_settings_bytecode,
@@ -205,7 +207,12 @@ pub(crate) struct StudioPrep {
     pub(crate) destroys: Vec<usize>,
 }
 
-pub(crate) fn bytecode_add_batch(input: &Path, pretty: bool, push: bool) -> Result<()> {
+pub(crate) fn bytecode_add_batch(
+    input: &Path,
+    pretty: bool,
+    push: bool,
+    override_packages: bool,
+) -> Result<()> {
     let ops = parse_batch_ops(&read_batch_input(input)?)?;
     let BatchOutcome {
         mut result,
@@ -215,6 +222,7 @@ pub(crate) fn bytecode_add_batch(input: &Path, pretty: bool, push: bool) -> Resu
         ops,
         &|service| resolve_bytecode_cli_settings_file(None, Some(service), None),
         push,
+        override_packages,
     )?;
     if push {
         let mut verified = true;
@@ -281,14 +289,17 @@ pub(crate) fn parse_batch_ops(raw: &str) -> Result<Vec<BatchOp>> {
 
 /// Applies every op in memory first, in order, then writes each touched
 /// store and its script files in one step. A failing op leaves every store
-/// untouched; `push` also refuses what a push could not take in one pass.
+/// untouched; `push` also refuses what a push could not take in one pass,
+/// and `override_packages` allows edits inside read-only links.
 pub(crate) fn apply_store_batch(
     ops: Vec<BatchOp>,
     resolve_store: &StoreResolver<'_>,
     push: bool,
+    override_packages: bool,
 ) -> Result<BatchOutcome> {
     let mut batch = BatchState {
         resolve_store,
+        override_packages,
         stores: Vec::new(),
         positions: HashMap::new(),
         refs: HashMap::new(),
@@ -311,6 +322,8 @@ struct StoreState {
     service: String,
     service_dir: PathBuf,
     _lock: SettingsFileLock,
+    override_packages: bool,
+    links: std::cell::OnceCell<LinkEnforcement>,
     before: SettingsBytecode,
     before_ids: HashSet<String>,
     reserved_ids: HashSet<String>,
@@ -342,6 +355,7 @@ struct RefTarget {
 
 struct BatchState<'a> {
     resolve_store: &'a StoreResolver<'a>,
+    override_packages: bool,
     stores: Vec<StoreState>,
     positions: HashMap<String, usize>,
     refs: HashMap<String, RefTarget>,
@@ -377,6 +391,7 @@ impl BatchState<'_> {
         }
         let script = is_lua_source_class(&item.class);
         let state = &mut self.stores[store];
+        state.reject_read_only_link_edit(parent_index)?;
         let NewInstanceValues {
             properties,
             attributes,
@@ -476,6 +491,7 @@ impl BatchState<'_> {
         let mut props = op.props;
         let source = given_source(None, None, &mut props)?;
         let state = &mut self.stores[store];
+        state.reject_read_only_link_edit(parent_index)?;
         let from = state.path_of(source_index);
         let cloned = clone_store_subtree(
             &mut state.document,
@@ -545,6 +561,7 @@ impl BatchState<'_> {
             );
         }
         let state = &mut self.stores[store];
+        state.reject_read_only_link_edit(parent_index)?;
         let from = state.path_of(index);
         let parent_id = state.id(parent_index);
         state.change_metadata(index, "Parent", Value::String(parent_id))?;
@@ -560,6 +577,7 @@ impl BatchState<'_> {
         if state.document.instances[index].parent_index.is_none() {
             bail!("Refusing to remove root instance");
         }
+        state.reject_read_only_link_edit(index)?;
         let children = settings_children_by_parent(&state.document);
         let mut subtree = Vec::new();
         collect_settings_subtree_preorder(&children, index, &mut subtree);
@@ -746,6 +764,8 @@ impl BatchState<'_> {
             service,
             service_dir,
             _lock: lock,
+            override_packages: self.override_packages,
+            links: std::cell::OnceCell::new(),
             before: document.clone(),
             reserved_ids: before_ids.clone(),
             before_ids,
@@ -1042,6 +1062,22 @@ impl StoreState {
             .map_or_else(|| json!(self.document.instances[index].name), compact_path)
     }
 
+    /// The read-only links of the store's project, read at the first op
+    /// that needs them.
+    fn links(&self) -> Result<&LinkEnforcement> {
+        if let Some(links) = self.links.get() {
+            return Ok(links);
+        }
+        let links = store_link_enforcement(&self.settings_file, self.override_packages)?;
+        Ok(self.links.get_or_init(|| links))
+    }
+
+    /// Refuses an op on the instance at `index`, or one that puts an
+    /// instance under it, inside a read-only link.
+    fn reject_read_only_link_edit(&self, index: usize) -> Result<()> {
+        reject_read_only_link_edit(self.links()?, &self.document, &self.service, index)
+    }
+
     fn touch(&mut self, index: usize) {
         self.push_ids.push(self.id(index));
         self.touched = true;
@@ -1056,13 +1092,7 @@ impl StoreState {
         props: Map<String, Value>,
         attrs: Map<String, Value>,
     ) -> Result<Map<String, Value>> {
-        reject_owned_instance_edit(
-            &self.settings_file,
-            &self.document,
-            &self.service,
-            index,
-            false,
-        )?;
+        reject_owned_instance_edit(&self.document, &self.service, index, self.links()?)?;
         let mut properties = Vec::with_capacity(props.len());
         for (mut name, mut value) in props {
             if name.eq_ignore_ascii_case("name") {
@@ -1125,13 +1155,7 @@ impl StoreState {
 
     /// Renames or reparents the instance as `rbx bs -S metadata` does.
     fn change_metadata(&mut self, index: usize, property: &str, value: Value) -> Result<()> {
-        reject_owned_instance_edit(
-            &self.settings_file,
-            &self.document,
-            &self.service,
-            index,
-            false,
-        )?;
+        reject_owned_instance_edit(&self.document, &self.service, index, self.links()?)?;
         if is_protected_engine_container(&self.document, index) {
             bail!(
                 "{} metadata is read-only",
@@ -1416,7 +1440,7 @@ mod tests {
     }
 
     fn run(root: &Path, raw: &str) -> Result<Value> {
-        apply_store_batch(parse_batch_ops(raw)?, &resolver(root), false)
+        apply_store_batch(parse_batch_ops(raw)?, &resolver(root), false, false)
             .map(|outcome| outcome.result)
     }
 
