@@ -16,13 +16,16 @@ use crate::bytecode::edit::{
 };
 use crate::bytecode::explorer::compact_path_string;
 use crate::bytecode::query::resolve_document_id_or_target;
+use crate::bytecode::references::{
+    WrittenReferences, follow_edited_references, qualify_reference_targets,
+};
 use crate::bytecode::{
     SettingsFileLock, acquire_settings_file_lock, apply_file_mutations, check_new_source_file,
     collect_source_path_updates, ensure_settable_attribute_name, file_mutation_paths,
     fold_derived_property, high_level_split_path, missing_service_store_error,
-    preserve_source_path_extension, qualify_value_references, reject_owned_instance_edit,
-    reject_read_only_link_edit, reject_read_only_link_subtree_edit,
-    resolve_bytecode_cli_settings_file, store_link_enforcement, stored_property_edit,
+    preserve_source_path_extension, reject_owned_instance_edit, reject_read_only_link_edit,
+    reject_read_only_link_subtree_edit, resolve_bytecode_cli_settings_file, store_link_enforcement,
+    stored_property_edit,
 };
 use crate::editor::document::is_protected_engine_container;
 use crate::editor::paths::{
@@ -38,7 +41,7 @@ use crate::settings::bytecode::{
 };
 use crate::settings::instance::{self as instance_api, AddInstanceSpec, PropertyScope};
 use crate::settings::tree::{editor_service_root_index, settings_children_by_parent};
-use crate::system::files::{path_key, service_settings_path};
+use crate::system::files::{path_key, service_settings_path, validate_filesystem_instance_name};
 
 /// An add op of a `ba --batch` request; an op without `op` adds.
 #[derive(Deserialize)]
@@ -335,7 +338,10 @@ struct StoreState {
     copied_from: HashMap<String, Option<PathBuf>>,
     created_by: HashMap<String, usize>,
     push_ids: Vec<String>,
+    /// The renamed and moved instances with their descendants.
     moved: HashSet<String>,
+    /// An op renamed, moved or removed an instance of the store.
+    restructured: bool,
     touched: bool,
 }
 
@@ -391,19 +397,16 @@ impl BatchState<'_> {
             properties.insert("Source".to_string(), Value::String(source));
         }
         let script = is_lua_source_class(&item.class);
-        let state = &mut self.stores[store];
-        state.reject_read_only_link_edit(parent_index)?;
+        self.stores[store].reject_read_only_link_edit(parent_index)?;
         let NewInstanceValues {
-            properties,
-            attributes,
+            mut properties,
+            mut attributes,
             given_source,
-        } = prepare_new_instance_values(
-            &state.document,
-            &state.settings_file,
-            &item.class,
-            properties,
-            item.attrs,
-        )?;
+        } = prepare_new_instance_values(&item.class, properties, item.attrs)?;
+        for value in properties.values_mut().chain(attributes.values_mut()) {
+            self.qualify(store, value)?;
+        }
+        let state = &mut self.stores[store];
         let settings_id = match item.id.filter(|id| !id.is_empty()) {
             Some(id) if state.reserved_ids.contains(&id) && state.index_of(&id).is_none() => {
                 bail!("settingsId {id} belonged to an instance this batch removed")
@@ -453,8 +456,8 @@ impl BatchState<'_> {
         if props.is_empty() && op.attrs.is_empty() && source.is_none() {
             bail!("set needs props, attrs, tags, source or sourceFile");
         }
+        let fields = self.set_values(store, index, props, op.attrs)?;
         let state = &mut self.stores[store];
-        let fields = state.set_values(index, props, op.attrs)?;
         let script = source.is_some();
         if let Some(source) = source {
             state.set_source(index, source)?;
@@ -524,8 +527,9 @@ impl BatchState<'_> {
         let mut fields = if props.is_empty() && op.attrs.is_empty() {
             Map::new()
         } else {
-            state.set_values(root_index, props, op.attrs)?
+            self.set_values(store, root_index, props, op.attrs)?
         };
+        let state = &mut self.stores[store];
         if let Some(source) = source {
             state.set_source(root_index, source)?;
         }
@@ -618,6 +622,7 @@ impl BatchState<'_> {
         let path = path_at(index);
         let state = &mut self.stores[store];
         instance_api::remove_instances_at_indices(&mut state.document, &[index], true)?;
+        state.restructured = true;
         state.touched = true;
         self.receipts.push(Receipt {
             op: "remove",
@@ -778,30 +783,182 @@ impl BatchState<'_> {
             created_by: HashMap::new(),
             push_ids: Vec::new(),
             moved: HashSet::new(),
+            restructured: false,
             touched: false,
         });
         self.positions.insert(key, self.stores.len() - 1);
         Ok(self.stores.len() - 1)
     }
 
-    /// References to a renamed or moved instance carry its path, wherever
-    /// they are, so every store of the project is rewritten with it.
-    fn rewrite_moved_references(&mut self) -> Result<()> {
+    /// Loads the stores of the project that keeps its script files under
+    /// `source_root`: every store, or with `holding` only those that hold
+    /// every name of one of these paths.
+    fn load_project_stores(
+        &mut self,
+        source_root: &Path,
+        holding: Option<&[Vec<String>]>,
+    ) -> Result<()> {
+        for service_dir in crate::project::storage::service_directories(source_root)? {
+            let path = service_settings_path(&service_dir);
+            if !path.is_file() {
+                continue;
+            }
+            if let Some(paths) = holding
+                && !self.positions.contains_key(&path_key(&path))
+                && (paths.is_empty()
+                    || SettingsBytecode::read_file_if_contains_any_string_set(&path, paths)?
+                        .is_none())
+            {
+                continue;
+            }
+            let hint = crate::project::storage::store_service_name(&path).unwrap_or_default();
+            self.load(path, &hint, false)?;
+        }
+        Ok(())
+    }
+
+    /// The paths the removed instances had before the batch, one for each
+    /// removed subtree.
+    fn removed_paths(&self) -> Vec<Vec<String>> {
+        let mut paths = Vec::new();
+        for store in self.stores.iter().filter(|store| store.restructured) {
+            let kept = store
+                .document
+                .instances
+                .iter()
+                .map(|instance| instance.settings_id.as_str())
+                .collect::<HashSet<_>>();
+            let before = &store.before.instances;
+            let gone = |index: usize| !kept.contains(before[index].settings_id.as_str());
+            let roots = (0..before.len())
+                .filter(|&index| {
+                    gone(index)
+                        && before[index]
+                            .parent_index
+                            .is_none_or(|parent| !gone(parent))
+                })
+                .collect::<Vec<_>>();
+            paths.extend(
+                build_editor_instance_paths_for_indices(&store.before, &store.service, &roots)
+                    .into_values()
+                    .map(|path| path.path_segments),
+            );
+        }
+        paths
+    }
+
+    /// Completes the references in a value an op writes to `store`, against
+    /// the stores as the batch has them so far: a path may name an instance
+    /// an earlier op created, and not one an earlier op removed.
+    fn qualify(&mut self, store: usize, value: &mut Value) -> Result<()> {
+        let written = WrittenReferences::of(value);
+        if written.is_empty() {
+            return Ok(());
+        }
+        if let Some(source_root) = self.stores[store]
+            .service_dir
+            .parent()
+            .map(Path::to_path_buf)
+        {
+            if written.needs_every_store() {
+                self.load_project_stores(&source_root, None)?;
+            }
+            for service in written.path_services() {
+                let path = service_settings_path(&source_root.join(service));
+                if validate_filesystem_instance_name(service, "service").is_ok() && path.is_file() {
+                    self.load(path, service, false)?;
+                }
+            }
+        }
+        let documents = self
+            .stores
+            .iter()
+            .map(|store| (store.service.as_str(), &store.document))
+            .collect::<BTreeMap<_, _>>();
+        qualify_reference_targets(value, &documents, &written)
+    }
+
+    /// Sets `props` as `rbx bs` does (Position and Orientation fold into the
+    /// CFrame, names and values take their stored form) and `attrs` as
+    /// attributes; Name and Parent change only through rename and move ops.
+    fn set_values(
+        &mut self,
+        store: usize,
+        index: usize,
+        props: Map<String, Value>,
+        attrs: Map<String, Value>,
+    ) -> Result<Map<String, Value>> {
+        let state = &self.stores[store];
+        reject_owned_instance_edit(&state.document, &state.service, index, state.links()?)?;
+        let mut properties = Vec::with_capacity(props.len());
+        for (mut name, mut value) in props {
+            if name.eq_ignore_ascii_case("name") {
+                bail!("Name changes through a rename op");
+            }
+            if name.eq_ignore_ascii_case("parent") {
+                bail!("Parent changes through a move op");
+            }
+            if name.eq_ignore_ascii_case("classname") {
+                bail!("ClassName is read-only");
+            }
+            let document = &mut self.stores[store].document;
+            fold_derived_property(document, index, &mut name, &mut value)?;
+            let (property, _) =
+                stored_property_edit(document, index, &name, &mut value, PropertyScope::Auto)?;
+            self.qualify(store, &mut value)?;
+            instance_api::set_instance_property(
+                &mut self.stores[store].document,
+                index,
+                &property,
+                value,
+                PropertyScope::Auto,
+            )?;
+            properties.push(property);
+        }
+        let mut attributes = Vec::with_capacity(attrs.len());
+        for (name, mut value) in attrs {
+            if !value.is_null() {
+                ensure_settable_attribute_name(&name)?;
+            }
+            self.qualify(store, &mut value)?;
+            instance_api::set_instance_property(
+                &mut self.stores[store].document,
+                index,
+                &name,
+                value,
+                PropertyScope::Attribute,
+            )?;
+            attributes.push(name);
+        }
+        let mut fields = Map::new();
+        if !properties.is_empty() {
+            fields.insert("props".to_string(), json!(properties));
+        }
+        if !attributes.is_empty() {
+            fields.insert("attrs".to_string(), json!(attributes));
+        }
+        Ok(fields)
+    }
+
+    /// References to a renamed, moved or removed instance carry its path,
+    /// wherever they are, so the stores of the project are brought up to
+    /// date with what the batch did. A rename or a move can change any path
+    /// below it, so every store is read; removals alone concern only the
+    /// stores that hold a removed path.
+    fn update_references(&mut self) -> Result<()> {
         let source_roots = self
             .stores
             .iter()
-            .filter(|store| !store.moved.is_empty())
+            .filter(|store| store.restructured)
             .filter_map(|store| store.service_dir.parent().map(Path::to_path_buf))
             .collect::<BTreeSet<_>>();
+        let removed_paths = self
+            .stores
+            .iter()
+            .all(|store| store.moved.is_empty())
+            .then(|| self.removed_paths());
         for source_root in source_roots {
-            for service_dir in crate::project::storage::service_directories(&source_root)? {
-                let path = service_settings_path(&service_dir);
-                if path.is_file() {
-                    let hint =
-                        crate::project::storage::store_service_name(&path).unwrap_or_default();
-                    self.load(path, &hint, false)?;
-                }
-            }
+            self.load_project_stores(&source_root, removed_paths.as_deref())?;
         }
         let mut documents = BTreeMap::new();
         let mut moved = HashMap::new();
@@ -820,7 +977,17 @@ impl BatchState<'_> {
             let document = std::mem::replace(&mut store.document, new_service_document(""));
             documents.insert(store.service.clone(), document);
         }
-        let changed = canonicalize_settings_references_for_moves(&mut documents, &moved);
+        let edited = self
+            .stores
+            .iter()
+            .filter(|store| store.restructured)
+            .map(|store| (store.service.clone(), &store.before))
+            .collect::<BTreeMap<_, _>>();
+        let mut changed = follow_edited_references(&edited, &mut documents);
+        changed.extend(canonicalize_settings_references_for_moves(
+            &mut documents,
+            &moved,
+        ));
         for store in &mut self.stores {
             if let Some(document) = documents.remove(&store.service) {
                 store.document = document;
@@ -831,8 +998,8 @@ impl BatchState<'_> {
     }
 
     fn finish(mut self, push: bool) -> Result<BatchOutcome> {
-        if self.stores.iter().any(|store| !store.moved.is_empty()) {
-            self.rewrite_moved_references()?;
+        if self.stores.iter().any(|store| store.restructured) {
+            self.update_references()?;
         }
         let studio = if push {
             self.studio_prep()?
@@ -1084,70 +1251,6 @@ impl StoreState {
         self.touched = true;
     }
 
-    /// Sets `props` as `rbx bs` does (Position and Orientation fold into the
-    /// CFrame, names and values take their stored form) and `attrs` as
-    /// attributes; Name and Parent change only through rename and move ops.
-    fn set_values(
-        &mut self,
-        index: usize,
-        props: Map<String, Value>,
-        attrs: Map<String, Value>,
-    ) -> Result<Map<String, Value>> {
-        reject_owned_instance_edit(&self.document, &self.service, index, self.links()?)?;
-        let mut properties = Vec::with_capacity(props.len());
-        for (mut name, mut value) in props {
-            if name.eq_ignore_ascii_case("name") {
-                bail!("Name changes through a rename op");
-            }
-            if name.eq_ignore_ascii_case("parent") {
-                bail!("Parent changes through a move op");
-            }
-            if name.eq_ignore_ascii_case("classname") {
-                bail!("ClassName is read-only");
-            }
-            qualify_value_references(&mut value, &self.settings_file, &self.document)?;
-            fold_derived_property(&mut self.document, index, &mut name, &mut value)?;
-            let (property, _) = stored_property_edit(
-                &mut self.document,
-                index,
-                &name,
-                &mut value,
-                PropertyScope::Auto,
-            )?;
-            instance_api::set_instance_property(
-                &mut self.document,
-                index,
-                &property,
-                value,
-                PropertyScope::Auto,
-            )?;
-            properties.push(property);
-        }
-        let mut attributes = Vec::with_capacity(attrs.len());
-        for (name, mut value) in attrs {
-            if !value.is_null() {
-                ensure_settable_attribute_name(&name)?;
-            }
-            qualify_value_references(&mut value, &self.settings_file, &self.document)?;
-            instance_api::set_instance_property(
-                &mut self.document,
-                index,
-                &name,
-                value,
-                PropertyScope::Attribute,
-            )?;
-            attributes.push(name);
-        }
-        let mut fields = Map::new();
-        if !properties.is_empty() {
-            fields.insert("props".to_string(), json!(properties));
-        }
-        if !attributes.is_empty() {
-            fields.insert("attrs".to_string(), json!(attributes));
-        }
-        Ok(fields)
-    }
-
     fn set_source(&mut self, index: usize, source: String) -> Result<()> {
         let class_name = &self.document.instances[index].class_name;
         if script_file_names(class_name).is_none() {
@@ -1181,6 +1284,7 @@ impl StoreState {
         for moved in subtree {
             self.moved.insert(self.id(moved));
         }
+        self.restructured = true;
         self.touch(index);
         Ok(())
     }

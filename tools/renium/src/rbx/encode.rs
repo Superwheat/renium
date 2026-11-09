@@ -184,22 +184,23 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
                 }
                 continue;
             }
-            let unresolved_reference = validate_model_export_reference_value(value, self.refs)
+            let unresolved_reference = unresolved_model_export_reference(value, self.refs)
                 .with_context(|| {
                     format!(
                         "{} ({}) property {name} contains an invalid reference",
                         instance.name, instance.class_name
                     )
                 })?;
-            if unresolved_reference {
+            if let Some(reference) = unresolved_reference {
                 if let Some(properties) = options.unresolved_reference_properties.as_deref_mut() {
                     properties.insert(rbx_dom_weak::Ustr::from(name.as_str()));
                     continue;
                 }
                 bail!(
-                    "{} ({}) property {name} contains a reference outside the model",
-                    instance.name,
-                    instance.class_name
+                    "{} ({}) property {name} refers to {}, which is not among the exported instances",
+                    document_instance_path(self.document, index),
+                    instance.class_name,
+                    reference_target_label(self.document, reference)
                 );
             }
             let property = property_metadata.property;
@@ -1520,25 +1521,32 @@ pub(crate) fn typed_store_property_value(
         return Ok(value);
     };
     // An instance reference written as a path ("SoundService.SFX",
-    // "game.Workspace.Lobby.Pad") is stored as a path reference, which the
-    // push resolves by name; a raw referent id stays as it is.
+    // "game.Workspace.Lobby.Pad", "Workspace.Lobby.Pad[2]" for the second
+    // of two pads) becomes a path reference, which the store command then
+    // completes with its target; a raw referent id stays as it is.
     if *value_type == RbxVariantType::Ref
         && property_name != "Parent"
         && let Some(path) = value.as_str()
         && path.contains('.')
         && path.parse::<RbxRef>().is_err()
     {
-        let segments = path
-            .split('.')
-            .filter(|segment| !segment.is_empty())
-            .skip_while(|segment| *segment == "game")
-            .collect::<Vec<_>>();
+        let (segments, ordinals) = crate::bytecode::split_inline_ordinals(
+            path.split('.')
+                .filter(|segment| !segment.is_empty())
+                .skip_while(|segment| *segment == "game")
+                .map(str::to_string)
+                .collect(),
+        );
         if segments.len() < 2 {
             bail!(
                 "{property_name} needs an instance path with its service, such as Workspace.Lobby.Pad, got {value}"
             );
         }
-        return Ok(json!({ "_type": "Ref", "pathSegments": segments }));
+        let mut reference = json!({ "_type": "Ref", "pathSegments": segments });
+        if !ordinals.is_empty() {
+            reference["pathOrdinals"] = json!(ordinals);
+        }
+        return Ok(reference);
     }
     let value_type = *value_type;
     if value.is_null() {
@@ -1693,8 +1701,9 @@ fn json_attributes_to_rbx(
 ) -> Result<RbxAttributes> {
     let mut out = RbxAttributes::new();
     for (name, value) in attributes {
-        if validate_model_export_reference_value(value, refs)
+        if unresolved_model_export_reference(value, refs)
             .with_context(|| format!("Attribute {name} contains an invalid reference"))?
+            .is_some()
         {
             bail!("Attribute {name} contains a reference outside the model");
         }
@@ -2254,15 +2263,34 @@ fn json_to_rbx_content(value: &Value, refs: &BytecodeModelExportRefs) -> Option<
     Some(RbxContent::from_referent(json_to_rbx_ref(value, refs)))
 }
 
+/// Whether a reference's path leads into another service than the one being
+/// encoded. Settings ids are unique within a store only, so an id or index
+/// of this store that happens to match says nothing about such a target.
+fn names_another_service(object: &Map<String, Value>, refs: &BytecodeModelExportRefs) -> bool {
+    refs.service.is_some_and(|own| {
+        object
+            .get("pathSegments")
+            .and_then(Value::as_array)
+            .and_then(|segments| segments.first())
+            .and_then(Value::as_str)
+            .is_some_and(|service| service != own)
+    })
+}
+
 fn model_export_ref_by_settings_id(
     refs: &BytecodeModelExportRefs,
     settings_id: &str,
+    another_service: bool,
 ) -> Option<RbxRef> {
-    refs.by_settings_id.get(settings_id).copied().or_else(|| {
-        refs.global_by_settings_id
-            .as_ref()
-            .and_then(|global| global.get(settings_id).copied())
-    })
+    refs.by_settings_id
+        .get(settings_id)
+        .copied()
+        .filter(|_| !another_service)
+        .or_else(|| {
+            refs.global_by_settings_id
+                .as_ref()
+                .and_then(|global| global.get(settings_id).copied())
+        })
 }
 
 fn model_export_ref_by_path_key(refs: &BytecodeModelExportRefs, path_key: &str) -> Option<RbxRef> {
@@ -2292,6 +2320,7 @@ fn strict_model_export_ref(
     object: &Map<String, Value>,
     refs: &BytecodeModelExportRefs,
 ) -> Result<Option<RbxRef>> {
+    let another_service = names_another_service(object, refs);
     let mut has_stable_selector = false;
     if let Some((selector, value)) = object
         .get("settingsId")
@@ -2303,7 +2332,7 @@ fn strict_model_export_ref(
             .as_str()
             .filter(|value| !value.is_empty())
             .with_context(|| format!("Ref {selector} must be a non-empty string"))?;
-        if let Some(referent) = model_export_ref_by_settings_id(refs, id) {
+        if let Some(referent) = model_export_ref_by_settings_id(refs, id, another_service) {
             return Ok(Some(referent));
         }
     }
@@ -2321,7 +2350,9 @@ fn strict_model_export_ref(
     if let Some(value) = object.get("instanceIndex") {
         has_stable_selector = true;
         let index = settings_reference_index(value).context("Ref instanceIndex must be 1-based")?;
-        if let Some(referent) = refs.by_index.get(&index).copied() {
+        if let Some(referent) = refs.by_index.get(&index).copied()
+            && !another_service
+        {
             return Ok(Some(referent));
         }
     }
@@ -2344,38 +2375,85 @@ fn strict_model_export_ref(
     }
 }
 
-fn validate_model_export_reference_value(
-    value: &Value,
+/// What a reference names, for a message: its path, the path of the
+/// instance of `document` it points at by index, or else its settings id.
+fn reference_target_label(document: &SettingsBytecode, reference: &Map<String, Value>) -> String {
+    if let Ok(Some((segments, ordinals))) = strict_reference_path(reference) {
+        return crate::bytecode::explorer::compact_path_string(&segments, ordinals.as_deref())
+            .unwrap_or_else(|| segments.join("."));
+    }
+    if let Some(index) = reference
+        .get("instanceIndex")
+        .and_then(settings_reference_index)
+        .filter(|index| *index < document.instances.len())
+    {
+        return document_instance_path(document, index);
+    }
+    reference
+        .get("settingsId")
+        .or_else(|| reference.get("instanceId"))
+        .and_then(Value::as_str)
+        .map_or_else(
+            || "an instance".to_string(),
+            |settings_id| format!("the instance with id {settings_id}"),
+        )
+}
+
+/// The dotted path of an instance from its store's root.
+fn document_instance_path(document: &SettingsBytecode, index: usize) -> String {
+    let mut names = Vec::new();
+    let mut cursor = Some(index);
+    while let Some(index) = cursor
+        && names.len() <= document.instances.len()
+    {
+        names.push(document.instances[index].name.as_str());
+        cursor = document.instances[index].parent_index;
+    }
+    names.reverse();
+    names.join(".")
+}
+
+/// Checks every reference in a value and returns the first one that names
+/// no exported instance, if any.
+fn unresolved_model_export_reference<'a>(
+    value: &'a Value,
     refs: &BytecodeModelExportRefs,
-) -> Result<bool> {
+) -> Result<Option<&'a Map<String, Value>>> {
     match value {
         Value::Array(values) => {
-            let mut unresolved = false;
+            let mut unresolved = None;
             for value in values {
                 if matches!(value, Value::Array(_) | Value::Object(_)) {
-                    unresolved = validate_model_export_reference_value(value, refs)? || unresolved;
+                    let nested = unresolved_model_export_reference(value, refs)?;
+                    unresolved = unresolved.or(nested);
                 }
             }
             Ok(unresolved)
         }
         Value::Object(object) => {
-            if object.get("_type").and_then(Value::as_str) == Some("Ref") {
-                return Ok(strict_model_export_ref(object, refs)?.is_none());
-            }
-            if let Some(reference) = object.get("Ref").and_then(Value::as_object)
+            let reference = if object.get("_type").and_then(Value::as_str) == Some("Ref") {
+                Some(object)
+            } else {
+                object.get("Ref").and_then(Value::as_object)
+            };
+            if let Some(reference) = reference
                 && strict_model_export_ref(reference, refs)?.is_none()
             {
-                return Ok(true);
+                return Ok(Some(reference));
             }
-            let mut unresolved = false;
+            if object.get("_type").and_then(Value::as_str) == Some("Ref") {
+                return Ok(None);
+            }
+            let mut unresolved = None;
             for (name, value) in object {
                 if name != "Ref" && matches!(value, Value::Array(_) | Value::Object(_)) {
-                    unresolved = validate_model_export_reference_value(value, refs)? || unresolved;
+                    let nested = unresolved_model_export_reference(value, refs)?;
+                    unresolved = unresolved.or(nested);
                 }
             }
             Ok(unresolved)
         }
-        _ => Ok(false),
+        _ => Ok(None),
     }
 }
 
@@ -2388,17 +2466,26 @@ fn model_reference_validation_preserves_nested_targets_and_errors() {
             "Ref": {"settingsId": "kept"}
         }}]
     });
-    assert!(!validate_model_export_reference_value(&resolved, &refs).unwrap());
+    assert!(
+        unresolved_model_export_reference(&resolved, &refs)
+            .unwrap()
+            .is_none()
+    );
     let unresolved = serde_json::json!([
         {"_type": "Vector3", "x": 1, "y": 2, "z": 3},
         {"nested": [{"_type": "Ref", "settingsId": "missing"}]}
     ]);
-    assert!(validate_model_export_reference_value(&unresolved, &refs).unwrap());
+    assert_eq!(
+        unresolved_model_export_reference(&unresolved, &refs)
+            .unwrap()
+            .and_then(|reference| reference.get("settingsId")),
+        Some(&serde_json::json!("missing"))
+    );
     let invalid_after_unresolved = serde_json::json!([
         unresolved,
         {"nested": {"_type": "Ref", "instanceIndex": 0}}
     ]);
-    assert!(validate_model_export_reference_value(&invalid_after_unresolved, &refs).is_err());
+    assert!(unresolved_model_export_reference(&invalid_after_unresolved, &refs).is_err());
 }
 
 fn json_to_rbx_ref(value: &Value, refs: &BytecodeModelExportRefs) -> RbxRef {
@@ -2415,11 +2502,12 @@ fn json_to_rbx_ref(value: &Value, refs: &BytecodeModelExportRefs) -> RbxRef {
             .unwrap_or_else(RbxRef::none);
     };
 
+    let another_service = names_another_service(object, refs);
     object
         .get("settingsId")
         .or_else(|| object.get("instanceId"))
         .and_then(Value::as_str)
-        .and_then(|settings_id| model_export_ref_by_settings_id(refs, settings_id))
+        .and_then(|settings_id| model_export_ref_by_settings_id(refs, settings_id, another_service))
         .or_else(|| {
             let segments = object
                 .get("pathSegments")
@@ -2438,6 +2526,7 @@ fn json_to_rbx_ref(value: &Value, refs: &BytecodeModelExportRefs) -> RbxRef {
             object
                 .get("instanceIndex")
                 .and_then(settings_reference_index)
+                .filter(|_| !another_service)
                 .and_then(|index| refs.by_index.get(&index).copied())
         })
         .or_else(|| {

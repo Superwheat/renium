@@ -3191,6 +3191,33 @@ fn editor_ref_transport_preserves_duplicate_path_ordinals() {
 }
 
 #[test]
+fn editor_ref_transport_keeps_a_reference_into_another_service() {
+    let paths = vec![
+        Some(EditorInstancePath {
+            path_segments: vec!["Workspace".to_string()],
+            path_ordinals: vec![1],
+        }),
+        Some(EditorInstancePath {
+            path_segments: vec!["Workspace".to_string(), "Ads".to_string()],
+            path_ordinals: vec![1, 1],
+        }),
+    ];
+    // ReplicatedStorage.Shared has the settings id that Workspace.Ads has in
+    // its own store.
+    let outside = json!({
+        "_type": "Ref",
+        "settingsId": "ads",
+        "pathSegments": ["ReplicatedStorage", "Shared"],
+        "pathOrdinals": [1, 1],
+    });
+    let ids = crate::editor::review::EditorReferenceIds::new(["root", "ads"]);
+    assert_eq!(
+        normalize_editor_bridge_value(&outside, None, &paths, &ids.in_service("Workspace")),
+        outside
+    );
+}
+
+#[test]
 fn editor_material_colors_transport_decodes_the_saved_binary_palette() {
     let mut colors = rbx_dom_weak::types::MaterialColors::new();
     colors.set_color(

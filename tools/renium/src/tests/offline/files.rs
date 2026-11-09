@@ -118,6 +118,10 @@ fn export_model_writes_both_formats_and_views_read_them_back() {
     };
     assert!(err(&["Nope"]).contains("No matching instance path: Workspace.Nope"));
     assert!(err(&["Border"]).contains("2 instances are named \"Border\""));
+    assert_eq!(
+        err(&["Target"]),
+        "Workspace.Target (ObjectValue) property Value refers to Workspace.Lobby.Door, which is not among the exported instances"
+    );
     assert!(err(&["-i", "nope"]).contains("No instance matches the export selector in this store"));
     assert_eq!(
         err(&["Lobby", "-i", "lobby"]),

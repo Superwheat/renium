@@ -1465,6 +1465,298 @@ fn set_property_reparents_and_rewrites_cross_service_references() {
 }
 
 #[test]
+fn set_property_resolves_a_path_reference_against_the_project_stores() {
+    let fx = outside_reference_fixture("set-path-ref");
+    let store = fx.store_arg("Workspace");
+    let before = fs::read(fx.store("Workspace")).unwrap();
+    let set = |path: &str| fx.text(&["bs", "-f", &store, "Target", "-p", "Value", "--str", path]);
+    let value = || fx.both(&["bg", "-f", &store, "Target", "Value"]);
+    assert_eq!(
+        set("ServerScriptService.Tools.Nope").err(),
+        "Reference target was not found: ServerScriptService.Tools.Nope is not in the ServerScriptService store; `rbx f ServerScriptService NAME` finds a path and `rbx pl` refreshes the store from Studio"
+    );
+    assert_eq!(
+        set("Workspace.Lobby.Border").err(),
+        "Reference target is ambiguous: 2 instances are at Workspace.Lobby.Border; give the ordinal, as in Workspace.Lobby.Border[2]"
+    );
+    assert_eq!(fs::read(fx.store("Workspace")).unwrap(), before);
+    set("game.ServerScriptService.Tools.Util").ok();
+    assert_eq!(
+        value(),
+        outside_reference(
+            &["ServerScriptService", "Tools", "Util"],
+            &[1, 1, 1],
+            "editor:2"
+        )
+    );
+    assert_eq!(
+        built_reference_target(&fx, "Workspace.Target").as_deref(),
+        Some("ServerScriptService.Tools.Util")
+    );
+    set("Workspace.Lobby.Border[2]").ok();
+    assert_eq!(
+        value(),
+        outside_reference(&["Workspace", "Lobby", "Border"], &[1, 1, 2], "border2")
+    );
+    // StarterGui has no store, so a path into it cannot be checked.
+    set("StarterGui.Menu.Frame").ok();
+    assert_eq!(
+        value(),
+        json!({"_type": "Ref", "pathSegments": ["StarterGui", "Menu", "Frame"]})
+    );
+    let add = |name: &str, path: &str| {
+        fx.text(&[
+            "ba",
+            "-f",
+            &store,
+            "-n",
+            name,
+            "-c",
+            "ObjectValue",
+            "-p",
+            &format!("Value=\"{path}\""),
+        ])
+    };
+    assert_eq!(
+        add("Broken", "ReplicatedStorage.Shared.Nope").err(),
+        "Reference target was not found: ReplicatedStorage.Shared.Nope is not in the ReplicatedStorage store; `rbx f ReplicatedStorage NAME` finds a path and `rbx pl` refreshes the store from Studio"
+    );
+    add("Pointer", "ReplicatedStorage.Shared.Config").ok();
+    assert_eq!(
+        fx.both(&["bg", "-f", &store, "Pointer", "Value"]),
+        outside_reference(
+            &["ReplicatedStorage", "Shared", "Config"],
+            &[1, 1, 1],
+            "config"
+        )
+    );
+}
+
+#[test]
+fn references_into_another_service_follow_renames_and_moves_and_clear_on_removal() {
+    let fx = outside_reference_fixture("outside-refs");
+    let workspace = fx.store_arg("Workspace");
+    let server = fx.store_arg("ServerScriptService");
+    let both_stores = json!([
+        "<root>/instances/ServerScriptService.renium",
+        "<root>/instances/Workspace.renium"
+    ]);
+    let value = || fx.both(&["bg", "-f", &workspace, "Target", "Value"]);
+    let edit = |target: &str, property: &str, text: &str| {
+        fx.text(&["bs", "-f", &server, target, "-p", property, "--str", text])
+            .ok()
+    };
+    fx.text(&[
+        "bs",
+        "-f",
+        &workspace,
+        "Target",
+        "-p",
+        "Value",
+        "--str",
+        "ServerScriptService.Tools.Util",
+    ])
+    .ok();
+    assert_eq!(edit("Util", "Name", "Helper")["changedPaths"], both_stores);
+    assert_eq!(
+        value(),
+        outside_reference(
+            &["ServerScriptService", "Tools", "Helper"],
+            &[1, 1, 1],
+            "editor:2"
+        )
+    );
+    edit("Tools", "Name", "Kit");
+    assert_eq!(
+        value(),
+        outside_reference(
+            &["ServerScriptService", "Kit", "Helper"],
+            &[1, 1, 1],
+            "editor:2"
+        )
+    );
+    edit("Helper", "Parent", "sss");
+    assert_eq!(
+        value(),
+        outside_reference(&["ServerScriptService", "Helper"], &[1, 1], "editor:2")
+    );
+    assert_eq!(
+        built_reference_target(&fx, "Workspace.Target").as_deref(),
+        Some("ServerScriptService.Helper")
+    );
+    let compared = fx
+        .text(&[
+            "cmp",
+            &fx.path("references.rbxl"),
+            "--full",
+            "--project",
+            &fx.path("renium.project.jsonc"),
+        ])
+        .ok();
+    assert_eq!(compared["matches"], json!(true), "{compared}");
+    // Renaming the Workspace instance that shares the target's id leaves the
+    // reference alone, and so it does one that names nothing in its service.
+    let dangling = outside_reference(
+        &["ReplicatedStorage", "Shared", "Gone"],
+        &[1, 1, 1],
+        "editor:2",
+    );
+    let mut with_dangling = fx.read_store("Workspace");
+    with_dangling.instances.push(with_values(
+        settings_instance("stale", "Stale", "ObjectValue", Some(0)),
+        &[("Value", dangling.clone())],
+        &[],
+    ));
+    fx.write_store("Workspace", &with_dangling);
+    fx.text(&[
+        "bs", "-f", &workspace, "Clash", "-p", "Name", "--str", "Other",
+    ])
+    .ok();
+    assert_eq!(
+        value(),
+        outside_reference(&["ServerScriptService", "Helper"], &[1, 1], "editor:2")
+    );
+    assert_eq!(
+        fx.both(&["bg", "-f", &workspace, "Stale", "Value"]),
+        dangling
+    );
+    fx.text(&["br", "-f", &workspace, "Stale"]).ok();
+    edit("Helper", "Parent", "editor:1");
+    let removed = fx.text(&["br", "-f", &server, "Kit"]).ok();
+    assert_eq!(removed["changedPaths"], both_stores);
+    assert_eq!(value(), json!({"_type": "Ref"}));
+    assert_eq!(built_reference_target(&fx, "Workspace.Target"), None);
+}
+
+#[test]
+fn a_path_only_reference_on_disk_builds_and_follows_its_target() {
+    let fx = Fixture::new("stored-path-ref");
+    let path_only =
+        |name: &str| json!({"_type": "Ref", "pathSegments": ["ReplicatedStorage", "Shared", name]});
+    let mut workspace = workspace_document();
+    workspace.instances[6]
+        .properties
+        .insert("Value".to_string(), path_only("Config"));
+    fx.write_store("Workspace", &workspace);
+    let stored =
+        |index: usize| fx.read_store("Workspace").instances[index].properties["Value"].clone();
+    assert_eq!(stored(6), path_only("Config"));
+    assert_eq!(
+        built_reference_target(&fx, "Workspace.Target").as_deref(),
+        Some("ReplicatedStorage.Shared.Config")
+    );
+    workspace.instances.push(with_values(
+        settings_instance("stale", "Stale", "ObjectValue", Some(0)),
+        &[("Value", path_only("Gone"))],
+        &[],
+    ));
+    fx.write_store("Workspace", &workspace);
+    assert_eq!(
+        fx.text(&["bep", "-r", &fx.path(""), "-o", &fx.path("stale.rbxl")])
+            .err(),
+        "Workspace.Stale (ObjectValue) property Value refers to ReplicatedStorage.Shared.Gone, which is not among the exported instances"
+    );
+    let replicated = fx.store_arg("ReplicatedStorage");
+    fx.text(&[
+        "bs",
+        "-f",
+        &replicated,
+        "Config",
+        "-p",
+        "Name",
+        "--str",
+        "Settings",
+    ])
+    .ok();
+    assert_eq!(
+        stored(6),
+        outside_reference(
+            &["ReplicatedStorage", "Shared", "Settings"],
+            &[1, 1, 1],
+            "config"
+        )
+    );
+    // A path that names nothing stays as it was written.
+    assert_eq!(stored(9), path_only("Gone"));
+    fx.text(&["br", "-f", &fx.store_arg("Workspace"), "Stale"])
+        .ok();
+    assert_eq!(
+        built_reference_target(&fx, "Workspace.Target").as_deref(),
+        Some("ReplicatedStorage.Shared.Settings")
+    );
+    workspace.instances.pop();
+    workspace.instances[6]
+        .properties
+        .insert("Value".to_string(), path_only("Settings"));
+    fx.write_store("Workspace", &workspace);
+    fx.text(&[
+        "mv",
+        "ReplicatedStorage",
+        "-i",
+        "config",
+        "--to-service",
+        "ServerScriptService",
+        "-r",
+        &fx.path(""),
+    ])
+    .ok();
+    assert_eq!(
+        stored(6),
+        outside_reference(&["ServerScriptService", "Settings"], &[1, 1], "config")
+    );
+    workspace.instances[6].properties.insert(
+        "Value".to_string(),
+        json!({"_type": "Ref", "pathSegments": ["ServerScriptService", "Settings"]}),
+    );
+    fx.write_store("Workspace", &workspace);
+    fx.text(&["br", "-f", &fx.store_arg("ServerScriptService"), "Settings"])
+        .ok();
+    assert_eq!(stored(6), json!({"_type": "Ref"}));
+}
+
+#[test]
+fn property_batch_renames_carry_references_from_other_services() {
+    let fx = outside_reference_fixture("property-batch-refs");
+    let workspace = fx.store_arg("Workspace");
+    let mut holders = fx.read_store("Workspace");
+    holders.instances[6].properties.insert(
+        "Value".to_string(),
+        json!({"_type": "Ref", "pathSegments": ["ServerScriptService", "Tools", "Util"]}),
+    );
+    fx.write_store("Workspace", &holders);
+    let batch = fx.root.join("properties.json");
+    fs::write(
+        &batch,
+        json!([{
+            "service": "ServerScriptService",
+            "settingsId": "editor:1",
+            "pathSegments": ["ServerScriptService", "Tools"],
+            "scope": "metadata",
+            "property": "Name",
+            "value": "Kit",
+        }])
+        .to_string(),
+    )
+    .unwrap();
+    fx.text(&[
+        "bytecode-apply-property-batch",
+        "--project-root",
+        &fx.path(""),
+        "--input",
+        &batch.to_string_lossy(),
+    ])
+    .ok();
+    assert_eq!(
+        fx.both(&["bg", "-f", &workspace, "Target", "Value"]),
+        outside_reference(
+            &["ServerScriptService", "Kit", "Util"],
+            &[1, 1, 1],
+            "editor:2"
+        )
+    );
+}
+
+#[test]
 fn set_property_applies_several_assignments_to_the_one_selected_instance() {
     let fx = Fixture::new("set-several");
     let store = fx.store_arg("Workspace");

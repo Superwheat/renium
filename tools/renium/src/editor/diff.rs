@@ -546,7 +546,7 @@ pub(crate) fn append_editor_property_changes(
     database: &ReflectionDatabase<'_>,
 ) {
     let paths_by_index = build_editor_instance_paths(document, service);
-    let settings_ids_by_index = editor_settings_ids(document);
+    let settings_ids_by_index = editor_settings_ids(document, service);
     append_editor_property_changes_with_paths(
         changes,
         document,
@@ -840,7 +840,7 @@ pub(crate) fn append_editor_target_changes(
     filter: &EditorPropertyFilter,
     options: EditorTargetChangeOptions<'_, '_>,
 ) {
-    let settings_ids_by_index = editor_settings_ids(document);
+    let settings_ids_by_index = editor_settings_ids(document, service);
     let native_indices =
         native_target_path_indices(document, service, filter, &options, &settings_ids_by_index);
     if filter.has_target_ids() && native_indices.is_none() {
@@ -972,13 +972,17 @@ pub(crate) fn append_editor_target_changes(
     }
 }
 
-fn editor_settings_ids(document: &SettingsBytecode) -> EditorReferenceIds<'_> {
+fn editor_settings_ids<'a>(
+    document: &'a SettingsBytecode,
+    service: &'a str,
+) -> EditorReferenceIds<'a> {
     EditorReferenceIds::new(
         document
             .instances
             .iter()
             .map(|instance| instance.settings_id.as_str()),
     )
+    .in_service(service)
 }
 
 fn normalized_editor_attributes(
@@ -1079,7 +1083,7 @@ mod native_property_tests {
                 options.database,
                 EditorPropertyPaths {
                     paths_by_index: &paths,
-                    settings_ids_by_index: &editor_settings_ids(document),
+                    settings_ids_by_index: &editor_settings_ids(document, service),
                     scope: options.property_scope,
                 },
             );
@@ -1344,7 +1348,7 @@ mod native_property_tests {
                     "Workspace",
                     &filter,
                     &options,
-                    &editor_settings_ids(&document),
+                    &editor_settings_ids(&document, "Workspace"),
                 )
                 .unwrap();
                 assert!(

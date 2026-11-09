@@ -208,6 +208,40 @@ pub(super) fn server_document() -> SettingsBytecode {
     )])
 }
 
+/// A project whose ServerScriptService holds Tools.Util and whose Workspace
+/// holds an instance with Util's settings id: stores built offline number
+/// their instances alike, so the same id names different instances in them.
+pub(super) fn outside_reference_fixture(tag: &str) -> Fixture {
+    let fx = Fixture::new(tag);
+    fx.write_store(
+        "ServerScriptService",
+        &settings_document(vec![
+            settings_instance("sss", "ServerScriptService", "ServerScriptService", None),
+            settings_instance("editor:1", "Tools", "Folder", Some(0)),
+            settings_instance("editor:2", "Util", "Folder", Some(1)),
+        ]),
+    );
+    let mut workspace = workspace_document();
+    workspace
+        .instances
+        .push(settings_instance("editor:2", "Clash", "Folder", Some(0)));
+    fx.write_store("Workspace", &workspace);
+    fx
+}
+
+pub(super) fn outside_reference(path: &[&str], ordinals: &[usize], settings_id: &str) -> Value {
+    json!({"_type": "Ref", "pathOrdinals": ordinals, "pathSegments": path, "settingsId": settings_id})
+}
+
+/// Builds the fixture's place and returns the path the reference property
+/// of `holder` points at in it.
+pub(super) fn built_reference_target(fx: &Fixture, holder: &str) -> Option<String> {
+    let place = fx.root.join("references.rbxl");
+    fx.text(&["bep", "-r", &fx.path(""), "-o", &place.to_string_lossy()])
+        .ok();
+    place_reference_target(&place, holder, "Value")
+}
+
 pub(super) const SPAWNER_SOURCE: &str = "print('spawn')\n";
 pub(super) const HELPER_SOURCE: &str = "local a = 1\r\nreturn a\r\n";
 pub(super) const CONFIG_SOURCE: &str = "return { rounds = 3 }\n";
@@ -481,6 +515,33 @@ pub(super) fn sample_place_dom() -> rbx_dom_weak::WeakDom {
     );
     dom.insert(dom.root_ref(), InstanceBuilder::new("ServerScriptService"));
     dom
+}
+
+/// The dotted path of the instance a reference property of `holder` points
+/// at in a binary place file; None for an empty reference.
+pub(super) fn place_reference_target(place: &Path, holder: &str, property: &str) -> Option<String> {
+    let dom = rbx_binary::from_reader(fs::File::open(place).unwrap()).unwrap();
+    let mut current = dom.root();
+    for name in holder.split('.') {
+        current = current
+            .children()
+            .iter()
+            .filter_map(|referent| dom.get_by_ref(*referent))
+            .find(|instance| instance.name == name)
+            .unwrap_or_else(|| panic!("{holder} is not in the place"));
+    }
+    let Some(rbx_dom_weak::types::Variant::Ref(target)) = current.properties.get(&property.into())
+    else {
+        panic!("{holder}.{property} is not a reference in the place");
+    };
+    let mut names = Vec::new();
+    let mut cursor = dom.get_by_ref(*target)?;
+    while cursor.referent() != dom.root_ref() {
+        names.push(cursor.name.clone());
+        cursor = dom.get_by_ref(cursor.parent())?;
+    }
+    names.reverse();
+    Some(names.join("."))
 }
 
 pub(super) fn write_place_file(path: &Path, dom: &rbx_dom_weak::WeakDom) {

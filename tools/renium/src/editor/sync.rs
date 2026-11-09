@@ -4924,7 +4924,8 @@ fn append_editor_reference_repairs(
             .instances
             .iter()
             .map(|instance| instance.settings_id.as_str()),
-    );
+    )
+    .in_service(service);
     let after_indices = after
         .instances
         .iter()

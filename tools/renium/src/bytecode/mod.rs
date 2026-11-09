@@ -15,6 +15,7 @@ pub(crate) mod add_batch;
 pub(crate) mod edit;
 pub(crate) mod explorer;
 pub(crate) mod query;
+pub(crate) mod references;
 
 use crate::app::output::{OutputMode, ReportedFailure, print_json_output};
 use crate::app::timing::current_millis;
@@ -160,164 +161,6 @@ fn parse_cli_value(
         return Ok(Value::Bool(value_bool));
     }
     Ok(Value::Null)
-}
-
-fn unqualified_reference_ids(value: &Value, settings_ids: &mut BTreeSet<String>) {
-    match value {
-        Value::Array(values) => {
-            for value in values {
-                unqualified_reference_ids(value, settings_ids);
-            }
-        }
-        Value::Object(object) => {
-            let is_reference = object.get("_type").and_then(Value::as_str) == Some("Ref")
-                || object.contains_key("settingsId")
-                || object.contains_key("instanceId");
-            let has_path = object
-                .get("pathSegments")
-                .and_then(Value::as_array)
-                .is_some_and(|segments| !segments.is_empty());
-            if is_reference
-                && !has_path
-                && let Some(settings_id) = object
-                    .get("settingsId")
-                    .or_else(|| object.get("instanceId"))
-                    .and_then(Value::as_str)
-            {
-                settings_ids.insert(settings_id.to_string());
-            }
-            for nested in object.values() {
-                unqualified_reference_ids(nested, settings_ids);
-            }
-        }
-        _ => {}
-    }
-}
-
-#[derive(Clone)]
-struct ReferenceTargetPath {
-    service: String,
-    path_segments: Vec<String>,
-    path_ordinals: Vec<usize>,
-}
-
-/// Cross-service references written by hand carry only a settings id; a pull
-/// stores the target path. Attach the path so both sides compare equal.
-pub(crate) fn qualify_value_references(
-    value: &mut Value,
-    settings_file: &Path,
-    own_document: &SettingsBytecode,
-) -> Result<()> {
-    let mut unqualified = BTreeSet::new();
-    unqualified_reference_ids(value, &mut unqualified);
-    if unqualified.is_empty() {
-        return Ok(());
-    }
-    let mut documents = BTreeMap::new();
-    let own_service = crate::project::storage::store_service_name(settings_file)
-        .context("Service settings path has no service name")?;
-    documents.insert(own_service, own_document.clone());
-    if let Some(src_root) = crate::project::storage::source_directory(settings_file).parent() {
-        for service_dir in crate::project::storage::service_directories(src_root)? {
-            let path = service_settings_path(&service_dir);
-            if path == settings_file || !path.is_file() {
-                continue;
-            }
-            let service_name = crate::project::storage::store_service_name(&path)
-                .context("Service settings path has no service name")?;
-            documents.insert(service_name, SettingsBytecode::read_file(&path)?);
-        }
-    }
-    qualify_reference_targets(value, &documents, &unqualified)
-}
-
-fn qualify_reference_targets(
-    value: &mut Value,
-    documents: &BTreeMap<String, SettingsBytecode>,
-    requested_settings_ids: &BTreeSet<String>,
-) -> Result<()> {
-    let mut targets_by_settings_id = HashMap::<String, Vec<ReferenceTargetPath>>::new();
-    for (service, document) in documents {
-        let matches = document
-            .instances
-            .iter()
-            .enumerate()
-            .filter(|(_, instance)| requested_settings_ids.contains(&instance.settings_id))
-            .collect::<Vec<_>>();
-        let indices = matches.iter().map(|(index, _)| *index).collect::<Vec<_>>();
-        let paths = build_editor_instance_paths_for_indices(document, service, &indices);
-        for (index, instance) in matches {
-            let Some(path) = paths.get(&index) else {
-                continue;
-            };
-            targets_by_settings_id
-                .entry(instance.settings_id.clone())
-                .or_default()
-                .push(ReferenceTargetPath {
-                    service: service.clone(),
-                    path_segments: path.path_segments.clone(),
-                    path_ordinals: path.path_ordinals.clone(),
-                });
-        }
-    }
-
-    fn qualify(
-        value: &mut Value,
-        targets_by_settings_id: &HashMap<String, Vec<ReferenceTargetPath>>,
-    ) -> Result<()> {
-        match value {
-            Value::Array(values) => {
-                for value in values {
-                    qualify(value, targets_by_settings_id)?;
-                }
-            }
-            Value::Object(object) => {
-                let is_reference = object.get("_type").and_then(Value::as_str) == Some("Ref")
-                    || object.contains_key("settingsId")
-                    || object.contains_key("instanceId");
-                let has_path = object
-                    .get("pathSegments")
-                    .and_then(Value::as_array)
-                    .is_some_and(|segments| !segments.is_empty());
-                if is_reference && !has_path {
-                    let settings_id = object
-                        .get("settingsId")
-                        .or_else(|| object.get("instanceId"))
-                        .and_then(Value::as_str);
-                    if let Some(settings_id) = settings_id {
-                        let targets = targets_by_settings_id
-                            .get(settings_id)
-                            .map(Vec::as_slice)
-                            .unwrap_or_default();
-                        let [target] = targets else {
-                            if targets.is_empty() {
-                                bail!("Reference target was not found: {settings_id}");
-                            }
-                            let services = targets
-                                .iter()
-                                .map(|target| target.service.as_str())
-                                .collect::<BTreeSet<_>>()
-                                .into_iter()
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            bail!(
-                                "Reference target is ambiguous: {settings_id} exists in {services}; include pathSegments and pathOrdinals"
-                            );
-                        };
-                        object.insert("pathSegments".to_string(), json!(target.path_segments));
-                        object.insert("pathOrdinals".to_string(), json!(target.path_ordinals));
-                    }
-                }
-                for nested in object.values_mut() {
-                    qualify(nested, targets_by_settings_id)?;
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    qualify(value, &targets_by_settings_id)
 }
 
 fn parse_cli_source_text(value_json: Option<&str>, value_str: Option<&str>) -> Result<String> {
@@ -2727,6 +2570,22 @@ fn is_structural_property(property: &str, scope: PropertyScope) -> bool {
         && (property.eq_ignore_ascii_case("name") || property.eq_ignore_ascii_case("parent"))
 }
 
+/// The store at `settings_file` and the project's other stores. An edit
+/// that renames, moves or removes instances locks them all, in this order,
+/// since any of them may hold a reference it has to update.
+pub(crate) fn project_store_files(settings_file: &Path) -> Result<BTreeSet<PathBuf>> {
+    let mut files = BTreeSet::from([settings_file.to_path_buf()]);
+    if let Some(src_root) = crate::project::storage::source_directory(settings_file).parent() {
+        for service_dir in crate::project::storage::service_directories(src_root)? {
+            let path = service_settings_path(&service_dir);
+            if path.is_file() {
+                files.insert(path);
+            }
+        }
+    }
+    Ok(files)
+}
+
 /// Every locked store by service name, with `document` as the content of
 /// `settings_file`.
 fn read_locked_stores(
@@ -2755,7 +2614,7 @@ fn read_locked_stores(
 fn set_store_properties(
     args: &BytecodeSetPropertyArgs,
     selectors: &[BytecodeInstanceSelectorArgs],
-    mut assignments: Vec<(String, Value)>,
+    assignments: Vec<(String, Value)>,
 ) -> Result<Vec<Vec<Value>>> {
     if assignments
         .iter()
@@ -2772,34 +2631,17 @@ fn set_store_properties(
     let structural = assignments
         .iter()
         .any(|(property, _)| is_structural_property(property, scope));
-    let mut unqualified_settings_ids = BTreeSet::new();
-    for (_, value) in &assignments {
-        unqualified_reference_ids(value, &mut unqualified_settings_ids);
-    }
-    let qualify_references = !unqualified_settings_ids.is_empty();
-    let mut locked_stores = BTreeSet::from([settings_file.clone()]);
-    if (structural || qualify_references)
-        && let Some(src_root) = crate::project::storage::source_directory(&settings_file).parent()
-    {
-        for service_dir in crate::project::storage::service_directories(src_root)? {
-            let path = service_settings_path(&service_dir);
-            if path.is_file() {
-                locked_stores.insert(path);
-            }
-        }
-    }
+    let locked_stores = if structural {
+        project_store_files(&settings_file)?
+    } else {
+        BTreeSet::from([settings_file.clone()])
+    };
     let _locks = locked_stores
         .iter()
         .map(|path| lock_existing_service_store(path))
         .collect::<Result<Vec<_>>>()?;
     let document = SettingsBytecode::read_file(&settings_file)?;
     let service = bytecode_service_name(&document, &settings_file, &service_hint);
-    if qualify_references {
-        let documents = read_locked_stores(&locked_stores, &settings_file, &document)?;
-        for (_, value) in &mut assignments {
-            qualify_reference_targets(value, &documents, &unqualified_settings_ids)?;
-        }
-    }
     let indices = selectors
         .iter()
         .map(|selector| {
@@ -2820,6 +2662,7 @@ fn set_store_properties(
         scope,
         links: &links,
         document,
+        references: references::ReferencedStores::default(),
         before: None,
         moved: HashSet::new(),
         sources: Vec::new(),
@@ -2845,6 +2688,8 @@ struct StorePropertyEdit<'a> {
     scope: PropertyScope,
     links: &'a LinkEnforcement,
     document: SettingsBytecode,
+    /// The stores the written references point into.
+    references: references::ReferencedStores,
     /// The document and its script paths before the first assignment that
     /// changes a script path.
     before: Option<(SettingsBytecode, Vec<Option<PathBuf>>)>,
@@ -2878,6 +2723,8 @@ impl StorePropertyEdit<'_> {
         fold_derived_property(&mut self.document, index, &mut property, &mut value)?;
         let (stored, requested_differs) =
             stored_property_edit(&mut self.document, index, &property, &mut value, self.scope)?;
+        self.references
+            .qualify(&mut value, self.settings_file, &self.document)?;
         if matches!(self.scope, PropertyScope::Auto | PropertyScope::Metadata)
             && matches!(property.as_str(), "Name" | "ClassName" | "Parent")
             && is_protected_engine_container(&self.document, index)
@@ -2984,9 +2831,21 @@ impl StorePropertyEdit<'_> {
                 .iter()
                 .filter_map(|path| Some((crate::project::storage::store_service_name(path)?, path)))
                 .collect::<BTreeMap<_, _>>();
-            for changed_service in
-                canonicalize_settings_references_for_move(&mut documents, self.service, &self.moved)
-            {
+            let own_service = crate::project::storage::store_service_name(self.settings_file)
+                .context("Service settings path has no service name")?;
+            let edited = self
+                .before
+                .iter()
+                .map(|(before_document, _)| (own_service.clone(), before_document))
+                .collect();
+            let mut changed_services =
+                references::follow_edited_references(&edited, &mut documents);
+            changed_services.extend(canonicalize_settings_references_for_move(
+                &mut documents,
+                self.service,
+                &self.moved,
+            ));
+            for changed_service in changed_services {
                 writes.insert(
                     files[&changed_service].clone(),
                     encode_settings_bytecode(&documents[&changed_service])?,
@@ -3494,10 +3353,10 @@ fn apply_property_batch_entries(
     Ok(())
 }
 
-fn canonicalize_property_batch_references(
-    documents: &mut BTreeMap<String, BytecodePropertyBatchDocument>,
+/// The instances a property batch renames or moves, by service.
+fn property_batch_structural_roots(
     entries: &[ResolvedBytecodePropertyBatchEntry],
-) -> Result<()> {
+) -> HashMap<String, HashSet<usize>> {
     let mut roots_by_service = HashMap::<String, HashSet<usize>>::new();
     for entry in entries {
         if matches!(
@@ -3511,6 +3370,17 @@ fn canonicalize_property_batch_references(
                 .insert(entry.instance_index);
         }
     }
+    roots_by_service
+}
+
+/// Brings the references to the renamed and moved instances up to date in
+/// every loaded store. `before` holds the stores of `roots_by_service` as
+/// they were before the entries were applied.
+fn canonicalize_property_batch_references(
+    documents: &mut BTreeMap<String, BytecodePropertyBatchDocument>,
+    roots_by_service: HashMap<String, HashSet<usize>>,
+    before: &BTreeMap<String, SettingsBytecode>,
+) -> Result<()> {
     if roots_by_service.is_empty() {
         return Ok(());
     }
@@ -3532,9 +3402,17 @@ fn canonicalize_property_batch_references(
         .iter()
         .map(|(service, state)| (service.clone(), state.document.clone()))
         .collect::<BTreeMap<_, _>>();
-    for service in
-        canonicalize_settings_references_for_moves(&mut reference_documents, &moved_indices)
-    {
+    let edited = before
+        .iter()
+        .map(|(service, document)| (service.clone(), document))
+        .collect();
+    let mut changed_services =
+        references::follow_edited_references(&edited, &mut reference_documents);
+    changed_services.extend(canonicalize_settings_references_for_moves(
+        &mut reference_documents,
+        &moved_indices,
+    ));
+    for service in changed_services {
         let state = documents
             .get_mut(&service)
             .context("Reference owner service disappeared")?;
@@ -3657,8 +3535,13 @@ fn apply_property_batch_to_root(
     let (allowed_entries, filtered) =
         filter_property_batch_entries(loaded, &documents, resolved, filter_direction)?;
     reject_read_only_package_changes(&documents, &allowed_entries, link_enforcement)?;
+    let structural_roots = property_batch_structural_roots(&allowed_entries);
+    let before = structural_roots
+        .keys()
+        .filter_map(|service| Some((service.clone(), documents.get(service)?.document.clone())))
+        .collect::<BTreeMap<_, _>>();
     apply_property_batch_entries(&mut documents, &allowed_entries)?;
-    canonicalize_property_batch_references(&mut documents, &allowed_entries)?;
+    canonicalize_property_batch_references(&mut documents, structural_roots, &before)?;
     let (writes, removals, source_paths) =
         property_batch_file_mutations(&documents, &allowed_entries)?;
     apply_file_mutations(&writes, &removals)?;

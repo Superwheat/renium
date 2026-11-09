@@ -684,10 +684,9 @@ pub(crate) struct NewInstanceValues {
 
 /// Validates and canonicalizes the values a new instance is created with.
 /// A script stores the external-source marker and keeps the given source for
-/// its file.
+/// its file. References are left as written; the caller completes them
+/// against the stores it works on.
 pub(crate) fn prepare_new_instance_values(
-    document: &SettingsBytecode,
-    settings_file: &Path,
     class_name: &str,
     properties: Map<String, Value>,
     attributes: Map<String, Value>,
@@ -699,14 +698,6 @@ pub(crate) fn prepare_new_instance_values(
     let mut properties = canonical_new_instance_properties(class_name, properties)?;
     for name in attributes.keys() {
         super::ensure_settable_attribute_name(name)?;
-    }
-    let mut attributes = attributes;
-    for map in [&mut properties, &mut attributes] {
-        let mut value = Value::Object(std::mem::take(map));
-        crate::bytecode::qualify_value_references(&mut value, settings_file, document)?;
-        if let Value::Object(qualified) = value {
-            *map = qualified;
-        }
     }
     let given_source = if is_lua_source_class(class_name) {
         match properties.get("Source") {
@@ -763,16 +754,18 @@ pub(crate) fn add_store_instance(request: StoreInstanceRequest) -> Result<Value>
         super::reject_read_only_link_edit(&links, &document, &service, parent_index)?;
     }
     let NewInstanceValues {
-        properties,
-        attributes,
+        mut properties,
+        mut attributes,
         given_source,
     } = prepare_new_instance_values(
-        &document,
-        &settings_file,
         &class_name,
         parse_property_assignments(&raw_properties)?,
         parse_property_assignments(&raw_attributes)?,
     )?;
+    let mut referenced = super::references::ReferencedStores::default();
+    for value in properties.values_mut().chain(attributes.values_mut()) {
+        referenced.qualify(value, &settings_file, &document)?;
+    }
     let added = instance_api::add_instance(
         &mut document,
         AddInstanceSpec {
@@ -1082,7 +1075,7 @@ pub(crate) fn clone_store_subtree(
         old_to_new_index.insert(old_index, new_index);
         copies.push((old_index, new_index));
     }
-    let ref_map = build_clone_ref_map(
+    let mut ref_map = build_clone_ref_map(
         document,
         CloneRefMapInput {
             source_subtree: &source_subtree,
@@ -1091,6 +1084,7 @@ pub(crate) fn clone_store_subtree(
             path_ordinals_before: &path_ordinals_before,
         },
     );
+    ref_map.store_service = Some(service.to_string());
     for new_index in old_to_new_index.values().copied() {
         if let Some(instance) = document.instances.get_mut(new_index) {
             remap_internal_clone_refs_in_record(&mut instance.properties, &ref_map);
@@ -1104,6 +1098,11 @@ pub(crate) fn clone_store_subtree(
 }
 
 pub(crate) struct BytecodeCloneRefMap {
+    /// The service of the store the instances are copied in. With it, a
+    /// reference whose path leads into another service is not one to a
+    /// copied instance, even when its settings id matches one: ids are
+    /// unique within a store only.
+    pub(crate) store_service: Option<String>,
     pub(crate) new_index_by_old: HashMap<usize, usize>,
     pub(crate) old_index_by_settings_id: HashMap<String, usize>,
     pub(crate) old_index_by_debug_id: HashMap<String, usize>,
@@ -1257,6 +1256,7 @@ pub(crate) fn build_clone_ref_map(
         }
     }
     BytecodeCloneRefMap {
+        store_service: None,
         new_index_by_old: input.old_to_new_index.clone(),
         old_index_by_settings_id,
         old_index_by_debug_id,
@@ -1318,6 +1318,16 @@ pub(crate) fn ref_old_index(
     object: &Map<String, Value>,
     refs: &BytecodeCloneRefMap,
 ) -> Option<usize> {
+    let path_service = object
+        .get("pathSegments")
+        .and_then(Value::as_array)
+        .and_then(|segments| segments.first())
+        .and_then(Value::as_str);
+    if let (Some(path_service), Some(store_service)) = (path_service, &refs.store_service)
+        && path_service != store_service
+    {
+        return None;
+    }
     object
         .get("settingsId")
         .or_else(|| object.get("instanceId"))
@@ -1618,7 +1628,11 @@ pub(crate) fn bytecode_remove_instance(mut args: BytecodeRemoveInstanceArgs) -> 
         args.input.service_or_file.as_deref(),
         None,
     )?;
-    let lock = lock_existing_service_store(&settings_file)?;
+    let store_files = super::project_store_files(&settings_file)?;
+    let locks = store_files
+        .iter()
+        .map(|path| lock_existing_service_store(path))
+        .collect::<Result<Vec<_>>>()?;
     let mut document = SettingsBytecode::read_file(&settings_file)?;
     let before_document = document.clone();
     let service = bytecode_service_name(&document, &settings_file, &service_hint);
@@ -1708,6 +1722,19 @@ pub(crate) fn bytecode_remove_instance(mut args: BytecodeRemoveInstanceArgs) -> 
     let service_dir = service_directory.as_path();
     let mut writes = BTreeMap::new();
     let mut removals = Vec::new();
+    let other_stores = store_files
+        .iter()
+        .filter(|path| **path != settings_file)
+        .cloned()
+        .collect::<Vec<_>>();
+    document = clear_references_to_removed(
+        &settings_file,
+        &before_document,
+        document,
+        &other_stores,
+        &removed_instance_paths,
+        &mut writes,
+    )?;
     collect_source_path_updates(
         &before_document,
         &source_paths_by_index,
@@ -1730,7 +1757,7 @@ pub(crate) fn bytecode_remove_instance(mut args: BytecodeRemoveInstanceArgs) -> 
     }
     let changed_paths = file_mutation_paths(&writes, &removals);
     apply_file_mutations(&writes, &removals)?;
-    drop(lock);
+    drop(locks);
     let removed_source_paths_json = removed_source_paths
         .iter()
         .map(|path| path.to_string_lossy().into_owned())
@@ -1769,6 +1796,56 @@ pub(crate) fn bytecode_remove_instance(mut args: BytecodeRemoveInstanceArgs) -> 
     }
     crate::app::output::drop_empty(&mut result, &["removedSourcePaths"]);
     print_json_output(&result, args.pretty)
+}
+
+/// After instances were removed from the store at `settings_file`, clears the
+/// references the project's other stores hold to them and renumbers those to
+/// same-named siblings whose ordinal the removal shifted. `before` and
+/// `after` are the store's document around the removal; `after` is returned
+/// with its own references brought up to date. A reference carries its
+/// target's path, so only the stores that hold every name of a removed path
+/// are read, and those that change are added to `writes`.
+fn clear_references_to_removed(
+    settings_file: &Path,
+    before: &SettingsBytecode,
+    after: SettingsBytecode,
+    other_stores: &[PathBuf],
+    removed_paths: &[Vec<String>],
+    writes: &mut BTreeMap<PathBuf, Vec<u8>>,
+) -> Result<SettingsBytecode> {
+    let mut files = BTreeMap::new();
+    let mut documents = BTreeMap::new();
+    for path in other_stores {
+        if let Some(document) =
+            SettingsBytecode::read_file_if_contains_any_string_set(path, removed_paths)?
+        {
+            let service = crate::project::storage::store_service_name(path)
+                .context("Service settings path has no service name")?;
+            files.insert(service.clone(), path);
+            documents.insert(service, document);
+        }
+    }
+    if documents.is_empty() {
+        return Ok(after);
+    }
+    let own_service = crate::project::storage::store_service_name(settings_file)
+        .context("Service settings path has no service name")?;
+    documents.insert(own_service.clone(), after);
+    let changed = super::references::follow_edited_references(
+        &BTreeMap::from([(own_service.clone(), before)]),
+        &mut documents,
+    );
+    for service in changed {
+        if let Some(path) = files.get(&service) {
+            writes.insert(
+                (*path).clone(),
+                encode_settings_bytecode(&documents[&service])?,
+            );
+        }
+    }
+    documents
+        .remove(&own_service)
+        .context("The edited store left the reference update")
 }
 
 /// Renames the instances at the given paths in the open place as one undo

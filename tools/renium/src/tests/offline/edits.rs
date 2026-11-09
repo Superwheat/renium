@@ -776,6 +776,79 @@ fn batch_sets_clones_renames_moves_and_removes_in_order() {
 }
 
 #[test]
+fn batch_ops_resolve_and_carry_references_into_other_services() {
+    let fx = outside_reference_fixture("batch-outside-refs");
+    let mut workspace = fx.read_store("Workspace");
+    workspace.instances.push(with_values(
+        settings_instance("old", "Old", "ObjectValue", Some(0)),
+        &[(
+            "Value",
+            json!({"_type": "Ref", "pathSegments": ["ServerScriptService", "Tools", "Util"]}),
+        )],
+        &[],
+    ));
+    fx.write_store("Workspace", &workspace);
+    let store = fx.store_arg("Workspace");
+    let value = |holder: &str| fx.both(&["bg", "-f", &store, holder, "Value"]);
+    let result = run_batch(
+        &fx,
+        r##"[
+            {"parent":"ServerScriptService.Tools","name":"Fresh","class":"Folder","ref":"fresh"},
+            {"parent":"Workspace","name":"ToFresh","class":"ObjectValue","props":{"Value":"ServerScriptService.Tools.Fresh"}},
+            {"op":"set","path":"Workspace.Target","props":{"Value":"ServerScriptService.Tools.Util"}},
+            {"op":"rename","path":"ServerScriptService.Tools.Util","name":"Helper"},
+            {"op":"rename","path":"#fresh","name":"Newer"},
+            {"op":"clone","path":"Workspace.Target","name":"Twin"},
+            {"op":"move","path":"ServerScriptService.Tools.Helper","parent":"ServerScriptService"},
+            {"op":"rename","path":"ServerScriptService.Tools","name":"Kit"}
+        ]"##,
+    )
+    .unwrap();
+    assert_eq!(result["stores"], 2);
+    let helper = outside_reference(&["ServerScriptService", "Helper"], &[1, 1], "editor:2");
+    for holder in ["Target", "Twin", "Old"] {
+        assert_eq!(value(holder), helper, "{holder}");
+    }
+    assert_eq!(
+        value("ToFresh"),
+        outside_reference(
+            &["ServerScriptService", "Kit", "Newer"],
+            &[1, 1, 1],
+            "editor:3"
+        )
+    );
+    let before = fs::read(fx.store("Workspace")).unwrap();
+    let missing = run_batch(
+        &fx,
+        r#"[
+            {"parent":"Workspace","name":"Unwritten","class":"Folder"},
+            {"op":"remove","path":"ServerScriptService.Kit.Newer"},
+            {"op":"set","path":"Workspace.Target","props":{"Value":"ServerScriptService.Kit.Newer"}}
+        ]"#,
+    )
+    .unwrap_err();
+    assert!(
+        missing.ends_with(
+            "Batch op 2 (set): Reference target was not found: ServerScriptService.Kit.Newer is not in the ServerScriptService store; `rbx f ServerScriptService NAME` finds a path and `rbx pl` refreshes the store from Studio"
+        ),
+        "{missing}"
+    );
+    assert_eq!(fs::read(fx.store("Workspace")).unwrap(), before);
+    run_batch(
+        &fx,
+        r#"[
+            {"op":"remove","path":"ServerScriptService.Kit"},
+            {"op":"remove","path":"ServerScriptService.Helper"},
+            {"parent":"ServerScriptService","name":"Helper","class":"Folder"}
+        ]"#,
+    )
+    .unwrap();
+    for holder in ["Target", "Twin", "Old", "ToFresh"] {
+        assert_eq!(value(holder), json!({"_type": "Ref"}), "{holder}");
+    }
+}
+
+#[test]
 fn batch_ops_write_script_sources_from_text_files_and_copies() {
     let fx = Fixture::new("batch-ops-sources");
     let patch = fx.root.join("patch.luau");
@@ -1648,7 +1721,7 @@ fn remove_instance_deletes_subtrees_sources_and_keeps_descendants_on_request() {
     assert_eq!(
         fx.text(&["br", "-f", &store, "Lobby.Door"]).ok(),
         json!({
-            "changedPaths": [STORE],
+            "changedPaths": ["<root>/instances/ReplicatedStorage.renium", STORE],
             "ok": true,
             "removed": ["Workspace.Lobby.Door"],
             "removedSettingsIds": ["door"],
@@ -1662,7 +1735,7 @@ fn remove_instance_deletes_subtrees_sources_and_keeps_descendants_on_request() {
     );
     assert_eq!(
         fx.both(&["bg", "-f", &replicated, "Link", "Value"]),
-        json!({"_type": "Ref", "pathOrdinals": [1, 1, 1], "pathSegments": ["Workspace", "Lobby", "Door"], "settingsId": "door"})
+        json!({"_type": "Ref"})
     );
     assert_eq!(
         fx.json(&["br", "-f", &store, "Lobby", "-R"]).ok(),
@@ -2433,7 +2506,7 @@ fn rename_and_remove_commands_edit_the_project_store() {
     assert_eq!(
         fx.text(&["rm", "Workspace", "-i", "Gate", "-r", &root])
             .ok(),
-        json!({"changedPaths": [STORE], "ok": true, "removed": ["Workspace.Lobby.Gate"], "removedSettingsIds": ["door"], "settingsFile": STORE, "storeRemoved": false})
+        json!({"changedPaths": ["<root>/instances/ReplicatedStorage.renium", STORE], "ok": true, "removed": ["Workspace.Lobby.Gate"], "removedSettingsIds": ["door"], "settingsFile": STORE, "storeRemoved": false})
     );
     let kept = fx
         .json(&["rm", "Workspace", "-i", "lobby", "-R", "-r", &root])
@@ -2466,6 +2539,98 @@ fn rename_and_remove_commands_edit_the_project_store() {
             .err()
             .contains("Projected service 'StarterGui' has no Renium store")
     );
+}
+
+#[test]
+fn project_commands_keep_references_from_other_services_current() {
+    let fx = outside_reference_fixture("command-refs");
+    let root = fx.path("");
+    let workspace = fx.store_arg("Workspace");
+    let replicated = fx.store_arg("ReplicatedStorage");
+    for (store, holder) in [(&workspace, "Target"), (&replicated, "Link")] {
+        fx.text(&[
+            "bs",
+            "-f",
+            store,
+            holder,
+            "-p",
+            "Value",
+            "--str",
+            "ServerScriptService.Tools.Util",
+        ])
+        .ok();
+    }
+    let run = |args: &[&str]| {
+        fx.text(&[args, &["-r", &root]].concat()).ok();
+    };
+    // The holder goes into the Workspace folder that shares the target's
+    // id; a copy of that folder must not take the reference for one to the
+    // copied folder.
+    run(&["mv", "Workspace", "-i", "target", "-I", "editor:2"]);
+    run(&["cp", "Workspace", "-i", "editor:2", "-I", "lobby"]);
+    let held = || {
+        [
+            fx.both(&["bg", "-f", &workspace, "Clash.Target", "Value"]),
+            fx.both(&["bg", "-f", &workspace, "Lobby.Clash.Target", "Value"]),
+            fx.both(&["bg", "-f", &replicated, "Link", "Value"]),
+        ]
+    };
+    let all = |reference: Value| [reference.clone(), reference.clone(), reference];
+    assert_eq!(
+        held(),
+        all(outside_reference(
+            &["ServerScriptService", "Tools", "Util"],
+            &[1, 1, 1],
+            "editor:2"
+        ))
+    );
+    run(&["rn", "ServerScriptService", "-i", "Tools.Util", "Helper"]);
+    assert_eq!(
+        held(),
+        all(outside_reference(
+            &["ServerScriptService", "Tools", "Helper"],
+            &[1, 1, 1],
+            "editor:2"
+        ))
+    );
+    run(&["mv", "ServerScriptService", "-i", "Tools.Helper"]);
+    assert_eq!(
+        held(),
+        all(outside_reference(
+            &["ServerScriptService", "Helper"],
+            &[1, 1],
+            "editor:2"
+        ))
+    );
+    // Workspace has an instance with the id editor:2, so the moved instance
+    // takes a new one there.
+    run(&[
+        "mv",
+        "ServerScriptService",
+        "-i",
+        "Helper",
+        "--to-service",
+        "Workspace",
+        "-I",
+        "lobby",
+    ]);
+    let moved = fx.read_store("Workspace");
+    let helper = moved
+        .instances
+        .iter()
+        .find(|instance| instance.name == "Helper" && instance.class_name == "Folder")
+        .unwrap();
+    assert_ne!(helper.settings_id, "editor:2");
+    assert_eq!(
+        held(),
+        all(outside_reference(
+            &["Workspace", "Lobby", "Helper"],
+            &[1, 1, 2],
+            &helper.settings_id
+        ))
+    );
+    run(&["rm", "Workspace", "-i", &helper.settings_id]);
+    assert_eq!(held(), all(json!({"_type": "Ref"})));
 }
 
 #[test]

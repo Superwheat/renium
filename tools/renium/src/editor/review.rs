@@ -289,6 +289,7 @@ pub(crate) fn property_schema_entry<'a>(
 
 #[derive(Default)]
 pub(crate) struct EditorReferenceIds<'a> {
+    service: Option<&'a str>,
     by_index: Vec<&'a str>,
     by_id: HashMap<&'a str, usize>,
 }
@@ -301,10 +302,32 @@ impl<'a> EditorReferenceIds<'a> {
             .enumerate()
             .map(|(index, id)| (*id, index))
             .collect();
-        Self { by_index, by_id }
+        Self {
+            service: None,
+            by_index,
+            by_id,
+        }
+    }
+
+    /// Names the service whose store the ids are from. Settings ids are
+    /// unique within one store only, so a reference whose path leads into
+    /// another service is then not taken for one of these instances.
+    pub(crate) fn in_service(mut self, service: &'a str) -> Self {
+        self.service = Some(service);
+        self
     }
 
     pub(crate) fn resolve(&self, object: &Map<String, Value>) -> Option<usize> {
+        if let Some(service) = self.service
+            && object
+                .get("pathSegments")
+                .and_then(Value::as_array)
+                .and_then(|segments| segments.first())
+                .and_then(Value::as_str)
+                .is_some_and(|target| target != service)
+        {
+            return None;
+        }
         // Reconciled documents use stable IDs; serialized documents may instead
         // use positions. Never reinterpret a stale position when an ID is given.
         if let Some(id) = object
