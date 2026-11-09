@@ -283,12 +283,18 @@ pub(crate) fn studio_status(args: StudioStatusArgs, project: Option<&Path>) -> R
 
 /// Text mode drops what a status repeats or leaves at zero: the top-level
 /// `teamCreate` that `persistence` and the Edit client's record state, the
-/// `placeVersion` of a place that was never published, and a Live Sync
-/// `pending` count of zero.
+/// `placeVersion` of a place that was never published, a Live Sync `pending`
+/// count of zero, and for one Studio the ids of its runtimes with the
+/// `selected` one.
 fn trim_status_text(result: &mut Value) {
     let Some(map) = result.as_object_mut() else {
         return;
     };
+    if let Some(clients) = map.get_mut("clients").and_then(Value::as_array_mut)
+        && crate::studio::automation::compact_one_studio_clients(clients)
+    {
+        map.remove("selected");
+    }
     if map.contains_key("persistence") {
         map.remove("teamCreate");
     }
@@ -302,9 +308,9 @@ fn trim_status_text(result: &mut Value) {
     }
 }
 
-/// Text mode reports the native probe as verdict counts plus the operations
-/// that are not native; the per-operation readings (addresses, RVAs) stay in
-/// json mode and `rbx native-probe`.
+/// Text mode reports the native probe as verdict counts; which operations
+/// fall back and the per-operation readings (addresses, RVAs) stay in json
+/// mode and `rbx native-probe`.
 fn summarize_native_operations(result: &mut Value) {
     let Some(report) = result
         .as_object_mut()
@@ -316,23 +322,12 @@ fn summarize_native_operations(result: &mut Value) {
         return;
     };
     let mut counts = serde_json::Map::new();
-    let mut fallbacks = Vec::new();
     for operation in operations {
         let verdict = operation["verdict"].as_str().unwrap_or("unknown");
         let count = counts.entry(verdict.to_string()).or_insert(json!(0));
         *count = json!(count.as_u64().unwrap_or(0) + 1);
-        if verdict != "native" {
-            fallbacks.push(json!({
-                "operation": operation["operation"],
-                "fallback": operation["fallback"],
-            }));
-        }
     }
-    let mut native = Value::Object(counts);
-    if !fallbacks.is_empty() {
-        native["fallbacks"] = Value::Array(fallbacks);
-    }
-    result["native"] = native;
+    result["native"] = Value::Object(counts);
 }
 
 fn studio_status_result(args: &StudioStatusArgs, project: Option<&Path>) -> Result<Value> {
@@ -462,7 +457,7 @@ pub(crate) fn multi_edit(args: MultiEditArgs, project: Option<&Path>) -> Result<
         Some((_, instance_path)) => instance_path.clone(),
         None => args.file.clone(),
     };
-    run_daemon(
+    let mut result = daemon_result(
         op::MULTI_EDIT,
         project,
         json!({
@@ -473,6 +468,16 @@ pub(crate) fn multi_edit(args: MultiEditArgs, project: Option<&Path>) -> Result<
         false,
         Some(&args.bridge),
     )?;
+    // The path, name and class of an existing script repeat the request.
+    if args.class.is_none()
+        && app::output::compact_text_output()
+        && let Some(map) = result.as_object_mut()
+    {
+        for key in ["className", "name", "path"] {
+            map.remove(key);
+        }
+    }
+    app::output::print_json_output(&result, false)?;
     if let Some((path, _)) = file {
         let mut source = std::fs::read_to_string(&path)
             .with_context(|| format!("Failed to read {}", path.display()))?;
@@ -969,19 +974,50 @@ mod native_summary_tests {
     use super::*;
 
     #[test]
-    fn status_text_mode_keeps_verdict_counts_and_fallbacks_only() {
+    fn status_text_mode_keeps_verdict_counts_only() {
         let mut result = json!({"ok": true, "nativeOperations": {"pid": 5, "readOnly": true, "operations": [
             {"operation": "snapshot", "verdict": "native", "reason": "ok", "fallback": "plugin", "readings": {"base": 1}},
             {"operation": "upload", "verdict": "degraded", "reason": "layout moved", "fallback": "plugin upload", "readings": {"base": 2}}
         ]}});
         summarize_native_operations(&mut result);
         assert!(result.get("nativeOperations").is_none());
+        assert_eq!(result["native"], json!({"native": 1, "degraded": 1}));
+    }
+
+    #[test]
+    fn status_text_mode_lists_one_studio_without_runtime_ids() {
+        let mut playing = json!({
+            "clients": [
+                {"pid": 5, "placeName": "place.rbxl", "role": "edit", "runtimeId": "a", "teamCreate": false},
+                {"launchEditRuntimeId": "a", "launchNonce": "n", "pid": 5, "placeName": "place.rbxl",
+                    "playerName": "Builder", "playerUserId": 7, "role": "play-client", "runtimeId": "b"},
+                {"launchEditRuntimeId": "a", "launchNonce": "n", "pid": 5, "placeName": "place.rbxl",
+                    "role": "play-server", "runtimeId": "c"}
+            ],
+            "persistence": "unsaved", "playState": "running", "selected": "a"
+        });
+        trim_status_text(&mut playing);
         assert_eq!(
-            result["native"],
-            json!({"native": 1, "degraded": 1, "fallbacks": [
-                {"operation": "upload", "fallback": "plugin upload"}
-            ]})
+            playing,
+            json!({
+                "clients": [
+                    {"pid": 5, "placeName": "place.rbxl", "role": "edit", "teamCreate": false},
+                    {"playerName": "Builder", "role": "play-client"},
+                    {"role": "play-server"}
+                ],
+                "persistence": "unsaved", "playState": "running"
+            })
         );
+        let mut two = json!({
+            "clients": [
+                {"pid": 5, "placeName": "One", "role": "edit", "runtimeId": "a"},
+                {"pid": 6, "placeName": "Two", "role": "edit", "runtimeId": "b"}
+            ],
+            "selected": "a"
+        });
+        let before = two.clone();
+        trim_status_text(&mut two);
+        assert_eq!(two, before);
     }
 
     #[test]

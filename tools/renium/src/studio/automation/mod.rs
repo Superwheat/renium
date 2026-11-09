@@ -1246,11 +1246,19 @@ fn compact_play_result(result: &mut Value, named_players: bool) {
         };
         map.insert("clients".to_string(), value);
     }
-    // A stop answers with the fact; the engine flags and the attempt count
-    // behind it stay in json mode.
+    // A stop answers with the fact; the engine flags, the attempt count and
+    // the teardown wait behind it stay in json mode.
     if map.get("action") == Some(&json!("stop")) {
         map.remove("status");
+        map.remove("waitedForTeardownMs");
         map.insert("stopped".to_string(), Value::Bool(true));
+    }
+    // Ready players imply a ready server, and Play is the mode unless asked.
+    if map.get("playersReady") == Some(&Value::Bool(true)) {
+        map.remove("serverReady");
+    }
+    if map.get("mode") == Some(&json!("play")) {
+        map.remove("mode");
     }
     for key in [
         "action",
@@ -4481,6 +4489,46 @@ pub(crate) fn list_clients_command(args: ListClientsArgs) -> Result<()> {
     print_json_output(&connected_clients_output(&result), false)
 }
 
+/// Text mode lists the runtimes of one Studio without what they share or
+/// only the daemon uses: the runtime and launch ids, the user id, a
+/// `localFile` that is the place's own name, and the pid and place of the
+/// play runtimes, which are the Edit window's. Returns whether the listing is
+/// one Studio's; several Studios keep their records whole.
+pub(crate) fn compact_one_studio_clients(clients: &mut [Value]) -> bool {
+    let mut pids = clients.iter().map(|client| client.get("pid").cloned());
+    let Some(first) = pids.next().flatten() else {
+        return false;
+    };
+    if pids.any(|pid| pid.as_ref() != Some(&first)) {
+        return false;
+    }
+    for client in clients.iter_mut().filter_map(Value::as_object_mut) {
+        for key in [
+            "runtimeId",
+            "launchEditRuntimeId",
+            "launchNonce",
+            "playerUserId",
+        ] {
+            client.remove(key);
+        }
+        let named_like_the_place = client
+            .get("localFile")
+            .and_then(Value::as_str)
+            .and_then(|file| Path::new(file).file_name())
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| client.get("placeName").and_then(Value::as_str) == Some(name));
+        if named_like_the_place {
+            client.remove("localFile");
+        }
+        if client.get("role").and_then(Value::as_str) != Some("edit") {
+            for key in ["pid", "placeName", "localFile"] {
+                client.remove(key);
+            }
+        }
+    }
+    true
+}
+
 /// The answer `rbx cs` prints for a daemon listing of connected runtimes:
 /// each client without its bridge plumbing, and the orphaned test windows.
 pub(crate) fn connected_clients_output(result: &Value) -> Value {
@@ -4509,6 +4557,9 @@ pub(crate) fn connected_clients_output(result: &Value) -> Value {
         if single {
             client.remove("runtimeId");
         }
+    }
+    if text {
+        compact_one_studio_clients(&mut clients);
     }
     let mut output = json!({ "clients": clients });
     if let Some(orphans) = result.get("orphans") {
@@ -5691,7 +5742,7 @@ mod compact_result_tests {
         compact_play_result(&mut result, false);
         assert_eq!(
             result,
-            json!({"ok": true, "mode": "play", "serverReady": true, "clients": 2, "until": "true", "untilSeconds": 1.5})
+            json!({"ok": true, "serverReady": true, "clients": 2, "until": "true", "untilSeconds": 1.5})
         );
         let mut named = json!({"ok": true, "clients": [{"playerName": "A"}, {"playerName": "B"}]});
         compact_play_result(&mut named, true);
@@ -5895,7 +5946,7 @@ mod compact_result_tests {
         assert_eq!(
             result,
             json!({
-                "ok": true, "mode": "play", "serverReady": true, "clients": 1,
+                "ok": true, "serverReady": true, "clients": 1,
                 "until": {"ok": false, "timedOut": true, "value": "false", "elapsedSeconds": 120.3, "error": error}
             })
         );

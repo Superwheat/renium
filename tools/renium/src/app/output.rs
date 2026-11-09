@@ -342,6 +342,12 @@ pub(crate) fn compact_text_output() -> bool {
     !global_json_output()
 }
 
+/// Text mode with nothing capturing the output: a command may print a form
+/// that is not JSON, which a capturing caller could not take as a value.
+pub(crate) fn prints_text() -> bool {
+    !output_is_captured() && !global_json_output()
+}
+
 pub(crate) fn set_global_stream_output(enabled: bool) {
     STREAM.store(enabled, Ordering::Relaxed);
 }
@@ -489,7 +495,6 @@ pub(crate) fn print_json_output(value: &Value, pretty: bool) -> Result<()> {
             *output = Some(if CAPTURE_MODE.get() == CaptureMode::Text {
                 let mut text = relativize_project_paths(value.clone());
                 shorten_single_precision_floats(&mut text);
-                trim_store_edit_result(&mut text);
                 text
             } else {
                 value.clone()
@@ -530,7 +535,8 @@ pub(crate) fn print_json_output(value: &Value, pretty: bool) -> Result<()> {
 /// the store file that `changedPaths` already names, the store index and the
 /// split path (printed as one dotted `path`), the push summary's own `ok`
 /// and its `persistence`, and the read-back's path and class once `verified`
-/// is true. A result without `changedPaths` is not a store edit and stays.
+/// is true. A result without `changedPaths` is not a store edit and stays,
+/// and so does a captured result, which keeps every field for its reader.
 fn trim_store_edit_result(value: &mut Value) {
     let Some(result) = value.as_object_mut() else {
         return;

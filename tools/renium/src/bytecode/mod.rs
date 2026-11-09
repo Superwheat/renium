@@ -1432,7 +1432,7 @@ pub(super) fn find_command(args: FindArgs) -> Result<()> {
 
     if mode.uses_short_keys()
         && args.fields == FIND_DEFAULT_FIELDS
-        && crate::app::output::compact_text_output()
+        && crate::app::output::prints_text()
         && let Some(text) = tree_text::match_lines(
             &ctx.document,
             &ctx.path_segments_by_index,
@@ -1491,7 +1491,7 @@ pub(super) fn tree_command(args: TreeArgs) -> Result<()> {
     let visible_indices = node_indices.iter().copied().collect::<HashSet<_>>();
     if mode.uses_short_keys()
         && args.fields == TREE_DEFAULT_FIELDS
-        && crate::app::output::compact_text_output()
+        && crate::app::output::prints_text()
     {
         println!(
             "{}",

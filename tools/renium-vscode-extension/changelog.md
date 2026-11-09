@@ -67,6 +67,7 @@
 - `rbx play` prints the server and client consoles a result carries as `[level] message` lines after the result line, collapsing identical messages into ` (xN)` and messages that differ only in digits into ` (+N similar)`.
 - `rbx wait` prints its seconds with one decimal and leaves out the echoed condition, also when it times out; `rbx inp` leaves `action`, `ok: true`, a `virtual` `inputMethod` and the echoed screenshot path (`shot: true`) out of its text result; `rbx co` leaves `ok` and `folded` out of its header line.
 - `rbx status` leaves out the top-level `teamCreate`, a zero `placeVersion` and a zero Live Sync `pending` in text mode, and `rbx status --all` prints the same listing as `rbx cs`.
+- `rbx status` and `rbx cs` list the runtimes of one Studio without their runtime and launch ids in text mode, and `status` prints the native verdict counts only; a play start leaves out `mode: play` and a `serverReady` that `playersReady` implies, a stop its teardown wait, and `rbx me` on an existing script answers with the edit count.
 
 ### Bug fixes
 
