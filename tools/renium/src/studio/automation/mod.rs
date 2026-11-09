@@ -375,6 +375,15 @@ fn literal_sleep_seconds(code: &str) -> f64 {
         .sum()
 }
 
+/// The text of a Luau file to run. A file saved with a UTF-8 byte order mark
+/// loses it, as code read from stdin does; Luau takes the mark for a syntax
+/// error.
+fn read_luau_file(path: &Path) -> Result<String> {
+    let code =
+        fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    Ok(code.trim_start_matches('\u{feff}').to_string())
+}
+
 pub(crate) fn execute_luau_result(args: ExecuteLuauArgs, bridge: &BridgeServer) -> Result<Value> {
     let client = args.client || args.player.is_some();
     let target = if args.server {
@@ -402,7 +411,7 @@ pub(crate) fn execute_luau_result(args: ExecuteLuauArgs, bridge: &BridgeServer) 
     let code = if let Some(code) = args.code.or(args.inline_code) {
         code
     } else if let Some(path) = args.file {
-        fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?
+        read_luau_file(&path)?
     } else {
         bail!("Missing Luau code. Use -e <code> or -f <file>.");
     };
@@ -5413,6 +5422,22 @@ mod settled_start_tests {
         assert_eq!(parameters["bridgeWaitSeconds"], 3.0);
         assert_eq!(parameters["reset"], false);
         assert!(parameters["resolveConflictPreference"].is_null());
+    }
+}
+
+#[cfg(test)]
+mod luau_code_tests {
+    use super::*;
+
+    #[test]
+    fn a_luau_file_loses_its_byte_order_mark() {
+        let root = crate::tests::support::temp_dir("luau-file-bom");
+        let path = root.join("probe.luau");
+        fs::write(&path, "\u{feff}return 1\n").unwrap();
+        let code = read_luau_file(&path).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+        assert_eq!(code, "return 1\n");
+        validate_luau_syntax(&code).unwrap();
     }
 }
 

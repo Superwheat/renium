@@ -11,7 +11,8 @@ const RENIUM: &str = env!("CARGO_BIN_EXE_renium");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// A scratch folder that is also the home of every process started in it,
-/// so the agent configs of the real home are never touched.
+/// so the agent configs of the real home are never touched, the user's
+/// Renium settings are not read, and no Studio audio helper starts.
 struct Scratch(PathBuf);
 
 impl Scratch {
@@ -34,7 +35,10 @@ impl Scratch {
             .env("HOME", &self.0)
             .env("USERPROFILE", &self.0)
             .env("LOCALAPPDATA", &self.0)
+            .env("APPDATA", &self.0)
             .env_remove("XDG_DATA_HOME")
+            .env_remove("XDG_CONFIG_HOME")
+            .env("RENIUM_NO_AUDIO_HELPERS", "1")
             .env_remove("RENIUM_AGENT_CLI");
         command
     }
@@ -88,14 +92,18 @@ impl Server {
         self.id += 1;
         let id = self.id;
         self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
+        let response = self.receive();
+        assert_eq!(response["jsonrpc"], "2.0", "{response}");
+        assert_eq!(response["id"], id, "{response}");
+        response
+    }
+
+    fn receive(&self) -> Value {
         let line = self
             .lines
             .recv_timeout(Duration::from_secs(60))
             .expect("the server answers every request");
-        let response: Value = serde_json::from_str(&line).expect("one JSON message per line");
-        assert_eq!(response["jsonrpc"], "2.0", "{response}");
-        assert_eq!(response["id"], id, "{response}");
-        response
+        serde_json::from_str(&line).expect("one JSON message per line")
     }
 
     fn call(&mut self, arguments: Value) -> Value {
@@ -179,6 +187,98 @@ fn steps_stop_at_the_first_failure() {
     assert!(!scratch.0.join("RENIUM.md").exists());
     let broken = server.call(json!({"args": ["ck", "-"], "stdin": "local = 1\n"}));
     assert_eq!(broken["isError"], true, "{broken}");
+}
+
+#[test]
+fn a_batch_is_answered_with_one_array() {
+    let scratch = Scratch::new("batch");
+    let mut server = Server::start(&scratch);
+    let call = json!({"name": "rbx", "arguments": {"args": ["--version"]}});
+    server.send(json!([
+        {"jsonrpc": "2.0", "id": 1, "method": "ping"},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": call},
+        {"jsonrpc": "2.0", "id": 3, "method": "resources/list"},
+    ]));
+    let answer = server.receive();
+    let mut responses = answer
+        .as_array()
+        .unwrap_or_else(|| panic!("a batch is answered with an array: {answer}"))
+        .clone();
+    responses.sort_by_key(|response| response["id"].as_u64());
+    assert_eq!(responses.len(), 3, "{answer}");
+    assert_eq!(
+        responses[0],
+        json!({"jsonrpc": "2.0", "id": 1, "result": {}})
+    );
+    assert_eq!(
+        responses[1]["result"]["content"][0]["text"],
+        format!("renium {VERSION}")
+    );
+    assert_eq!(responses[2]["error"]["code"], -32601);
+
+    // Notifications alone get no answer, so the next line answers the empty batch.
+    server.send(json!([{"jsonrpc": "2.0", "method": "notifications/initialized"}]));
+    server.send(json!([]));
+    let invalid = server.receive();
+    assert_eq!(invalid["error"]["code"], -32600, "{invalid}");
+    assert_eq!(invalid["id"], Value::Null, "{invalid}");
+}
+
+/// Whether something accepts connections on this local port.
+#[cfg(windows)]
+fn listening(port: u16) -> bool {
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_millis(500),
+    )
+    .is_ok()
+}
+
+#[cfg(windows)]
+fn wait_until(what: &str, mut holds: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !holds() {
+        assert!(std::time::Instant::now() < deadline, "{what}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// `docs --serve` never ends by itself and is reachable on its port for as
+/// long as it runs.
+#[cfg(windows)]
+#[test]
+fn a_running_command_ends_when_the_server_is_killed() {
+    let scratch = Scratch::new("killed");
+    // A fresh update check on record keeps the command from starting one.
+    let checked = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    fs::create_dir_all(scratch.0.join("Renium")).unwrap();
+    fs::write(
+        scratch.0.join("Renium").join("update-check.json"),
+        json!({"schemaVersion": 2, "checkedAtUnixMs": checked, "error": "not checked in tests"})
+            .to_string(),
+    )
+    .unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut server = Server::start(&scratch);
+    let arguments = json!({"args": ["docs", "--serve", "--port", port.to_string()]});
+    server.send(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "rbx", "arguments": arguments},
+    }));
+    wait_until("the command serves its port", || listening(port));
+    server.child.kill().unwrap();
+    server.child.wait().unwrap();
+    wait_until("the command ended with the server", || !listening(port));
 }
 
 #[test]

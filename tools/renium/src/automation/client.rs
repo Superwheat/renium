@@ -107,9 +107,9 @@ fn luau_response_limit(parameters: &serde_json::Value) -> Duration {
     Duration::from_secs_f64(timeout + bridge_wait) + LUAU_QUEUE_MARGIN
 }
 
-struct DeadlineReader<'a> {
-    stream: &'a TcpStream,
-    deadline: Instant,
+pub(crate) struct DeadlineReader<'a> {
+    pub(crate) stream: &'a TcpStream,
+    pub(crate) deadline: Instant,
 }
 
 impl Read for DeadlineReader<'_> {

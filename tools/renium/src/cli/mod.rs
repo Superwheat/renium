@@ -121,7 +121,11 @@ pub(super) struct Cli {
 pub(super) struct QueryPlaceArgs {
     #[arg(help = "Place file to search", value_name = "PLACE.rbxl|PLACE.rbxlx")]
     pub(super) input: PathBuf,
-    #[arg(help = "Text to match in names", value_name = "QUERY")]
+    #[arg(
+        help = "Text to match in names",
+        value_name = "QUERY",
+        allow_hyphen_values = true
+    )]
     pub(super) query: Option<String>,
     #[arg(help = "Match exact name (repeatable: any of them)", short, long)]
     pub(super) name: Vec<String>,
@@ -136,7 +140,8 @@ pub(super) struct QueryPlaceArgs {
         help = "Text to match in script sources (repeatable: any of them)",
         short,
         long,
-        value_name = "TEXT"
+        value_name = "TEXT",
+        allow_hyphen_values = true
     )]
     pub(super) source: Vec<String>,
     #[arg(
@@ -1162,6 +1167,152 @@ mod tests {
         }
     }
 
+    fn parsed(arguments: &[&str]) -> Commands {
+        Cli::try_parse_from(["rbx"].iter().chain(arguments))
+            .unwrap_or_else(|error| panic!("{arguments:?}: {error}"))
+            .command
+    }
+
+    #[test]
+    fn luau_code_may_start_with_a_hyphen() {
+        let comment = "-- count\nreturn 1";
+        match parsed(&["l", comment, "--edit"]) {
+            Commands::ExecuteLuau(args) => {
+                assert_eq!(args.inline_code.as_deref(), Some(comment));
+                assert!(args.edit);
+            }
+            _ => unreachable!(),
+        }
+        match parsed(&["l", "-e", "--!strict\nreturn 1", "--server"]) {
+            Commands::ExecuteLuau(args) => {
+                assert_eq!(args.code.as_deref(), Some("--!strict\nreturn 1"));
+                assert!(args.server);
+            }
+            _ => unreachable!(),
+        }
+        let client = client_luau(&[comment, "2", "--detach", "probe"]).unwrap();
+        assert_eq!(client.code.as_deref(), Some(comment));
+        assert_eq!(client.player.as_deref(), Some("2"));
+        assert_eq!(client.runner.detach.as_deref(), Some("probe"));
+        match parsed(&["wait", "-x == 1", "--result", "-x", "--client"]) {
+            Commands::WaitUntil(args) => {
+                assert_eq!(args.condition, "-x == 1");
+                assert_eq!(args.result.as_deref(), Some("-x"));
+                assert!(args.client);
+            }
+            _ => unreachable!(),
+        }
+        match parsed(&[
+            "play",
+            "--until",
+            "-x == 1",
+            "--until-console",
+            "-- ready",
+            "--result",
+            "-x",
+            "--client-result",
+            "-y",
+            "--until-timeout",
+            "5",
+        ]) {
+            Commands::StartStopPlay(args) => {
+                assert_eq!(args.until.as_deref(), Some("-x == 1"));
+                assert_eq!(args.until_console.as_deref(), Some("-- ready"));
+                assert_eq!(args.result.as_deref(), Some("-x"));
+                assert_eq!(args.client_result.as_deref(), Some("-y"));
+                assert_eq!(args.until_timeout, 5.0);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn search_text_may_start_with_a_hyphen() {
+        match parsed(&["sg", "-- TODO", "-i"]) {
+            Commands::ScriptGrep(args) => {
+                assert_eq!(args.query, "-- TODO");
+                assert!(args.case_insensitive);
+            }
+            _ => unreachable!(),
+        }
+        match parsed(&["ss", "--!strict", "Door", "-l", "3"]) {
+            Commands::ScriptSearch(args) => {
+                assert_eq!(args.keywords(), ["--!strict", "Door"]);
+                assert_eq!(args.limit, 3);
+            }
+            _ => unreachable!(),
+        }
+        match parsed(&["co", "--grep", "-- ready", "-F"]) {
+            Commands::GetConsoleOutput(args) => {
+                assert_eq!(args.grep.as_deref(), Some("-- ready"));
+                assert!(args.fixed);
+            }
+            _ => unreachable!(),
+        }
+        match parsed(&["q", "place.rbxl", "-Door", "-s", "--!strict", "-a"]) {
+            Commands::QueryPlace(args) => {
+                assert_eq!(args.query.as_deref(), Some("-Door"));
+                assert_eq!(args.source, ["--!strict"]);
+                assert!(args.all);
+            }
+            _ => unreachable!(),
+        }
+        parsed(&[
+            "oc",
+            "server",
+            "logs",
+            "7",
+            "job",
+            "--grep",
+            "-- boot",
+            "--severity",
+            "error",
+        ]);
+    }
+
+    #[test]
+    fn typed_text_and_values_may_start_with_a_hyphen() {
+        match parsed(&["ty", "-5", "--enter"]) {
+            Commands::Type(args) => {
+                assert_eq!(args.text, "-5");
+                assert!(args.enter);
+            }
+            _ => unreachable!(),
+        }
+        match parsed(&[
+            "prop",
+            "-s",
+            "Workspace",
+            "-p",
+            "[\"Workspace\",\"Part\"]",
+            "-n",
+            "Transparency",
+            "-j",
+            "-0.5",
+        ]) {
+            Commands::ApplyEditorProperty(args) => {
+                assert_eq!(args.value_json.as_deref(), Some("-0.5"));
+            }
+            _ => unreachable!(),
+        }
+        match parsed(&["report", "-m", "- push hung", "--no-transcript"]) {
+            Commands::Report(args) => {
+                assert_eq!(args.message.as_deref(), Some("- push hung"));
+                assert!(args.no_transcript);
+            }
+            _ => unreachable!(),
+        }
+        // A flag-shaped value is still an option when it is one.
+        match parsed(&["ty", "--enter", "text"]) {
+            Commands::Type(args) => {
+                assert_eq!(args.text, "text");
+                assert!(args.enter);
+            }
+            _ => unreachable!(),
+        }
+        assert!(Cli::try_parse_from(["rbx", "ty", "text", "--no-such-flag"]).is_err());
+    }
+
     #[test]
     fn every_visible_command_has_a_short_example() {
         command().debug_assert();
@@ -1485,7 +1636,8 @@ pub(super) struct PluginConsoleOutputArgs {
     #[arg(
         help = "Only entries matching this case-insensitive regex (plain text when -F)",
         long,
-        value_name = "PATTERN"
+        value_name = "PATTERN",
+        allow_hyphen_values = true
     )]
     pub(super) grep: Option<String>,
     #[arg(help = "Treat --grep as plain text", short = 'F', long)]
@@ -1504,9 +1656,14 @@ pub(super) struct PluginConsoleOutputArgs {
 pub(super) struct ExecuteLuauArgs {
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
-    #[arg(help = "Luau code (- for stdin)", short = 'e', long)]
+    #[arg(
+        help = "Luau code (- for stdin)",
+        short = 'e',
+        long,
+        allow_hyphen_values = true
+    )]
     pub(super) code: Option<String>,
-    #[arg(help = "Luau code (- for stdin)", value_name = "LUAU", conflicts_with_all = ["code", "file"])]
+    #[arg(help = "Luau code (- for stdin)", value_name = "LUAU", allow_hyphen_values = true, conflicts_with_all = ["code", "file"])]
     pub(super) inline_code: Option<String>,
     #[arg(help = "Luau file to run", short, long, value_name = "PATH")]
     pub(super) file: Option<PathBuf>,
@@ -1545,7 +1702,11 @@ pub(super) struct ExecuteLuauArgs {
 pub(super) struct ExecuteClientLuauArgs {
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
-    #[arg(help = "Luau code (- for stdin)", required_unless_present = "collect")]
+    #[arg(
+        help = "Luau code (- for stdin)",
+        required_unless_present = "collect",
+        allow_hyphen_values = true
+    )]
     pub(super) code: Option<String>,
     #[arg(help = "Play client by name, index or runtimeId")]
     pub(super) player: Option<String>,
@@ -1754,15 +1915,33 @@ pub(super) struct JobStatusArgs {
 
 #[derive(Parser)]
 pub(super) struct ScriptSearchArgs {
-    #[arg(help = "Keywords every script must contain", required = true, num_args = 1..)]
-    pub(super) keywords: Vec<String>,
+    // The first keyword is a value of its own: clap lets a single value start
+    // with a hyphen and still reads the options after it, which it cannot do
+    // for a value list.
+    #[arg(
+        help = "Keyword every script must contain",
+        value_name = "KEYWORD",
+        allow_hyphen_values = true
+    )]
+    pub(super) keyword: String,
+    #[arg(help = "More keywords", value_name = "KEYWORD")]
+    pub(super) more_keywords: Vec<String>,
     #[arg(help = "Maximum scripts", short, long, default_value_t = 25)]
     pub(super) limit: usize,
 }
 
+impl ScriptSearchArgs {
+    pub(super) fn keywords(&self) -> Vec<&str> {
+        std::iter::once(&self.keyword)
+            .chain(&self.more_keywords)
+            .map(String::as_str)
+            .collect()
+    }
+}
+
 #[derive(Parser)]
 pub(super) struct ScriptGrepArgs {
-    #[arg(help = "Text to find")]
+    #[arg(help = "Text to find", allow_hyphen_values = true)]
     pub(super) query: String,
     #[arg(help = "Ignore case", short = 'i', long)]
     pub(super) case_insensitive: bool,
@@ -1824,6 +2003,7 @@ pub(super) struct StartStopPlayArgs {
         help = "After starting, wait until this Luau expression is true on the server",
         long,
         value_name = "LUAU",
+        allow_hyphen_values = true,
         conflicts_with = "stop"
     )]
     pub(super) until: Option<String>,
@@ -1831,6 +2011,7 @@ pub(super) struct StartStopPlayArgs {
         help = "After starting (and --until), wait until a server or client console line contains this text; the result's `untilConsole` names the side and the seconds it took",
         long,
         value_name = "TEXT",
+        allow_hyphen_values = true,
         conflicts_with = "stop"
     )]
     pub(super) until_console: Option<String>,
@@ -1844,6 +2025,7 @@ pub(super) struct StartStopPlayArgs {
         help = "Once --until or --until-console holds, evaluate this Luau expression (or chunk) once on the server and return it as `result`, tables included",
         long,
         value_name = "LUAU",
+        allow_hyphen_values = true,
         conflicts_with = "stop"
     )]
     pub(super) result: Option<String>,
@@ -1851,6 +2033,7 @@ pub(super) struct StartStopPlayArgs {
         help = "Once --until or --until-console holds, evaluate this Luau expression (or chunk) once on the first client and return it as `clientResult`",
         long,
         value_name = "LUAU",
+        allow_hyphen_values = true,
         conflicts_with = "stop"
     )]
     pub(super) client_result: Option<String>,
@@ -2281,7 +2464,7 @@ pub(super) struct SetupArgs {
 pub(super) struct TypeArgs {
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
-    #[arg(help = "Text to type")]
+    #[arg(help = "Text to type", allow_hyphen_values = true)]
     pub(super) text: String,
     #[arg(help = "Text box path from ui", long, value_name = "GUI_PATH")]
     pub(super) path: Option<String>,
@@ -2302,7 +2485,8 @@ pub(super) struct WaitUntilArgs {
     pub(super) bridge: BridgeConnectionArgs,
     #[arg(
         help = "Luau expression, or a chunk that returns one, that must become true; or a duration such as 30s, 500ms or 2m to wait that long",
-        value_name = "LUAU_CONDITION"
+        value_name = "LUAU_CONDITION",
+        allow_hyphen_values = true
     )]
     pub(super) condition: String,
     #[arg(
@@ -2332,7 +2516,8 @@ pub(super) struct WaitUntilArgs {
     #[arg(
         help = "Once the condition holds, evaluate this Luau expression (or chunk) once in the same runner and return it as result, tables included",
         long,
-        value_name = "LUAU"
+        value_name = "LUAU",
+        allow_hyphen_values = true
     )]
     pub(super) result: Option<String>,
 }
@@ -2993,6 +3178,7 @@ pub(super) struct ApplyEditorPropertyArgs {
         short = 'j',
         long,
         alias = "value",
+        allow_hyphen_values = true,
         required_unless_present = "source_file",
         conflicts_with = "source_file"
     )]

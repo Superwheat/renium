@@ -236,6 +236,19 @@ struct DaemonDiscovery {
     #[serde(default)]
     bridge_ports: Vec<u16>,
     pid: u32,
+    #[serde(default)]
+    process_start_identity: Option<String>,
+}
+
+impl DaemonDiscovery {
+    /// Whether the daemon that wrote this record still runs. Its PID alone
+    /// does not say so: once the daemon exits, the system hands the number to
+    /// any later process.
+    fn is_running(&self) -> bool {
+        self.process_start_identity
+            .as_deref()
+            .is_some_and(|identity| crate::daemon::is_recorded_process(self.pid, identity))
+    }
 }
 
 fn default_daemon_name() -> String {
@@ -709,7 +722,7 @@ pub(crate) fn doctor_result(
     let daemons = read_daemon_discoveries()?;
     let live_count = daemons
         .iter()
-        .filter(|(_, daemon)| crate::daemon::is_process_alive(daemon.pid))
+        .filter(|(_, daemon)| daemon.is_running())
         .count();
     checks.push(DoctorCheck {
         name: "daemon".to_string(),
@@ -909,7 +922,7 @@ pub fn run_daemon(args: DaemonArgs) -> Result<()> {
         DaemonCommand::Clean => {
             let mut removed = Vec::new();
             for (path, daemon) in read_daemon_discoveries()? {
-                if !crate::daemon::is_process_alive(daemon.pid) {
+                if !daemon.is_running() {
                     fs::remove_file(&path)
                         .with_context(|| format!("Failed to remove {}", path.display()))?;
                     removed.push(path);
@@ -2501,7 +2514,7 @@ fn daemon_status_values(name: Option<&str>) -> Result<Vec<Value>> {
         if name.is_some_and(|name| daemon.name != name) {
             continue;
         }
-        let alive = crate::daemon::is_process_alive(daemon.pid);
+        let alive = daemon.is_running();
         let endpoint = daemon_endpoint(&daemon).ok();
         let responsive = endpoint.is_some_and(|endpoint| {
             crate::automation::client::daemon_endpoint_available(
@@ -2530,12 +2543,21 @@ fn stop_named_daemon(name: &str, force: bool) -> Result<String> {
     else {
         bail!("No daemon named '{name}' was found");
     };
-    if !crate::daemon::is_process_alive(daemon.pid) {
-        fs::remove_file(&path)?;
+    stop_recorded_daemon(name, &path, &daemon, force)
+}
+
+fn stop_recorded_daemon(
+    name: &str,
+    path: &Path,
+    daemon: &DaemonDiscovery,
+    force: bool,
+) -> Result<String> {
+    if !daemon.is_running() {
+        fs::remove_file(path)?;
         return Ok(format!("Removed stale daemon discovery {}", path.display()));
     }
     if !force {
-        let endpoint = daemon_endpoint(&daemon).with_context(|| {
+        let endpoint = daemon_endpoint(daemon).with_context(|| {
             format!("Daemon '{name}' has no valid control endpoint; use --force to stop it")
         })?;
         if !crate::automation::client::daemon_endpoint_available(
@@ -2549,26 +2571,89 @@ fn stop_named_daemon(name: &str, force: bool) -> Result<String> {
     // A daemon finishing a Studio request exits after that request; a busy
     // studio-status alone can take a few seconds.
     let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline && crate::daemon::is_process_alive(daemon.pid) {
+    while Instant::now() < deadline && daemon.is_running() {
         thread::sleep(Duration::from_millis(50));
     }
-    if crate::daemon::is_process_alive(daemon.pid) {
+    if daemon.is_running() {
         bail!("Daemon '{name}' did not exit within five seconds");
     }
     if path.exists() {
-        fs::remove_file(&path)?;
+        fs::remove_file(path)?;
     }
     Ok(format!("Stopped daemon '{name}'"))
 }
 
+#[cfg(test)]
+mod daemon_record_tests {
+    use super::*;
+
+    /// A process that outlives the test unless something stops it.
+    fn sleeper() -> std::process::Child {
+        let mut command = if cfg!(windows) {
+            let mut command = Command::new("ping");
+            command.args(["-n", "60", "127.0.0.1"]);
+            command
+        } else {
+            let mut command = Command::new("sleep");
+            command.arg("60");
+            command
+        };
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_record_whose_pid_belongs_to_another_process_is_stale() {
+        let mut other = sleeper();
+        let pid = other.id();
+        let record = |identity: Option<String>| DaemonDiscovery {
+            name: "stale".to_string(),
+            host: "127.0.0.1".to_string(),
+            control_port: 1,
+            bridge_ports: Vec::new(),
+            pid,
+            process_start_identity: identity,
+        };
+        let root = crate::tests::support::temp_dir("stale-daemon-record");
+        let path = root.join("daemon-stale.json");
+        fs::write(&path, "{}").unwrap();
+        let reused = record(Some("the start of the daemon that exited".to_string()));
+        let detail = stop_recorded_daemon("stale", &path, &reused, true).unwrap();
+        let survived = other.try_wait().unwrap().is_none();
+        let own = record(crate::app::update::process_start_identity(pid)).is_running();
+        other.kill().unwrap();
+        other.wait().unwrap();
+        fs::remove_dir_all(&root).unwrap();
+        assert!(survived, "the unrelated process was stopped: {detail}");
+        assert!(
+            detail.starts_with("Removed stale daemon discovery"),
+            "{detail}"
+        );
+        assert!(!reused.is_running());
+        assert!(!record(None).is_running());
+        assert!(own);
+    }
+}
+
 #[cfg(windows)]
 fn terminate_recorded_daemon(pid: u32) -> Result<()> {
-    let status = Command::new("taskkill")
+    // taskkill reports on its own stdout and stderr; captured, its lines stay
+    // out of this command's output and its error joins the failure.
+    let output = Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/F"])
-        .status()
+        .stdin(Stdio::null())
+        .output()
         .context("Failed to run taskkill")?;
-    if !status.success() {
-        bail!("taskkill failed with {status}");
+    if !output.status.success() {
+        bail!(
+            "taskkill failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
     Ok(())
 }

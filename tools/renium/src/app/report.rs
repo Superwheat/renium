@@ -39,6 +39,7 @@ pub(crate) struct ReportArgs {
     #[arg(
         short,
         long,
+        allow_hyphen_values = true,
         help = "What went wrong, in your words; goes at the top of the report"
     )]
     pub(crate) message: Option<String>,

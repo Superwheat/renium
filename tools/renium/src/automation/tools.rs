@@ -196,7 +196,7 @@ pub(crate) fn script_search_command(
     print_script_result(script_search_at(
         &root,
         &source,
-        &json!({ "keywords": args.keywords, "limit": args.limit }),
+        &json!({ "keywords": args.keywords(), "limit": args.limit }),
     ))
 }
 

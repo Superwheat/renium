@@ -81,6 +81,15 @@
 - `rbx build` ignored `Position` and `Orientation` set in a project tree node or `.meta.json` and left the part at the origin; both now place the part.
 - `rbx cmp PLACE --full` reported changes on a place just built from the project for properties Roblox renamed (SoundId/AudioContent, BrickColor/Color, Image/ImageContent); they now compare equal.
 - A merge with a preference (`rbx vcm --prefer ours|theirs`, and the same merge when a sync resolves toward one side) silently dropped an instance and everything under it when the other side had removed its parent. The instance now follows the preferred side: the parent comes back when that side still has it, and otherwise the instance stays where that side has it.
+- Luau code and text that start with `-` or `--`, such as a comment, `--!strict` or `-5`, are taken as values by `l`, `lc`, `wait`, `play`, `inp`, `sg`, `ss`, `ty`, `me`, `co --grep`, `q`, `prop -j` and `report -m` instead of being rejected as unknown options.
+- `rbx dm list`, `dm clean` and `dm stop` no longer treat a leftover daemon record as running when its process ID now belongs to another program, and `dm stop --force` removes the record instead of ending that program.
+- `rbx dm stop` no longer prints taskkill's "SUCCESS" line, so its JSON output is valid.
+- `RENIUM_DAEMON_NAME` takes precedence over a stored `daemon` setting, as `--daemon` already did.
+- `rbx l -f FILE` runs a file saved with a UTF-8 byte order mark instead of rejecting it.
+- A named daemon that has run for more than seven days is still found; commands used to start a second daemon beside it.
+- `rbx mcp` answers a JSON-RPC batch with one array, as protocol 2025-03-26 requires.
+- `rbx mcp` exits when its client closes stdin even while a command runs, and on Windows a command no longer outlives a killed server.
+- When the daemon already has 16 open connections, the next command is told so and asked to retry, instead of failing with a socket error.
 
 ## 0.5.9 - 2026-11-06
 

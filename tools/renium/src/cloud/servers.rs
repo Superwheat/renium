@@ -30,6 +30,7 @@ pub(super) struct ServerArgs {
     #[arg(
         long,
         value_name = "TEXT",
+        allow_hyphen_values = true,
         help = "Keep log lines whose message or stack contains TEXT, ignoring case (logs)"
     )]
     grep: Option<String>,

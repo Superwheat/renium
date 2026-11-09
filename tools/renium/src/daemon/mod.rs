@@ -20,7 +20,7 @@ use crate::app::timing::current_millis;
 use crate::app::update;
 use crate::automation;
 use crate::automation::client::{
-    run_stdio_proxy, send_request, shared_daemon_available, try_send_request,
+    DeadlineReader, run_stdio_proxy, send_request, shared_daemon_available, try_send_request,
 };
 use crate::automation::runtime::{
     automation_parse_response_with_lease, oversized_automation_request_response,
@@ -29,9 +29,8 @@ use crate::bytecode::explorer::watch_parent_and_exit;
 use crate::cli::BridgeDaemonArgs;
 use crate::cli::args::CursorPollArgs;
 use crate::daemon::transport::{
-    DAEMON_CONTROL_IDLE_TIMEOUT, DAEMON_DISCOVERY_MAX_AGE_MS, DAEMON_DISCOVERY_MAX_FUTURE_SKEW_MS,
-    DEFAULT_DAEMON_CONTROL_PORT, MAX_DAEMON_CONTROL_CONNECTIONS, host_port, is_loopback_endpoint,
-    normalize_loopback_host,
+    DAEMON_CONTROL_IDLE_TIMEOUT, DAEMON_DISCOVERY_MAX_FUTURE_SKEW_MS, DEFAULT_DAEMON_CONTROL_PORT,
+    MAX_DAEMON_CONTROL_CONNECTIONS, host_port, is_loopback_endpoint, normalize_loopback_host,
 };
 use crate::snapshot::export::parse_bridge_ports;
 use crate::studio::bridge::{BridgeRequestLease, BridgeServer};
@@ -241,14 +240,9 @@ fn spawn_daemon_control_server(
         while bridge.alive.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((stream, _addr)) => {
-                    let previous = active_connections.fetch_add(1, Ordering::Relaxed);
-                    if previous >= MAX_DAEMON_CONTROL_CONNECTIONS {
-                        active_connections.fetch_sub(1, Ordering::Relaxed);
-                        eprintln!(
-                            "[renium] warning: rejecting daemon control connection; {MAX_DAEMON_CONTROL_CONNECTIONS} connection limit reached"
-                        );
+                    let Some(stream) = admit_control_connection(stream, &active_connections) else {
                         continue;
-                    }
+                    };
                     let _ = stream.set_nonblocking(false);
                     let bridge = Arc::clone(&bridge);
                     let state = Arc::clone(&state);
@@ -276,6 +270,59 @@ fn spawn_daemon_control_server(
         }
     });
     Ok(())
+}
+
+/// Counts a new control connection in, or answers it `busy` at the limit.
+fn admit_control_connection(stream: TcpStream, active: &AtomicUsize) -> Option<TcpStream> {
+    if active.fetch_add(1, Ordering::Relaxed) < MAX_DAEMON_CONTROL_CONNECTIONS {
+        return Some(stream);
+    }
+    active.fetch_sub(1, Ordering::Relaxed);
+    eprintln!(
+        "[renium] warning: rejecting daemon control connection; {MAX_DAEMON_CONTROL_CONNECTIONS} connection limit reached"
+    );
+    refuse_control_connection(&stream);
+    None
+}
+
+/// A connection over the limit gets this long to deliver its request; the
+/// accept loop waits on it, and a caller writes its request as it connects.
+const REFUSED_REQUEST_WAIT: Duration = Duration::from_millis(500);
+
+/// Answers the request of a connection over the limit with a `busy` failure.
+/// The request is read first: closing a socket that still holds unread data
+/// resets the connection, and the caller would get a socket error in place
+/// of the answer.
+fn refuse_control_connection(stream: &TcpStream) {
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_write_timeout(Some(REFUSED_REQUEST_WAIT));
+    let mut request = String::new();
+    let _ = transport::read_bounded_line(
+        &mut io::BufReader::new(DeadlineReader {
+            stream,
+            deadline: Instant::now() + REFUSED_REQUEST_WAIT,
+        }),
+        &mut request,
+        transport::MAX_DAEMON_LINE_BYTES,
+    );
+    let id =
+        serde_json::from_str::<RequestEnvelope>(request.trim()).map_or(0, |request| request.id);
+    let response = automation::Response::failure(
+        id,
+        Instant::now(),
+        automation::Failure::new(
+            "busy",
+            format!(
+                "The Renium daemon has {MAX_DAEMON_CONTROL_CONNECTIONS} open connections, its limit; retry when a running command finishes"
+            ),
+            true,
+            "retry",
+        ),
+    );
+    if let Ok(line) = serde_json::to_string(&response) {
+        let mut stream = stream;
+        let _ = writeln!(stream, "{line}");
+    }
 }
 
 thread_local! {
@@ -623,12 +670,11 @@ fn daemon_discovery_endpoint(value: &Value) -> Option<std::net::SocketAddr> {
         .and_then(Value::as_u64)
         .and_then(|value| u32::try_from(value).ok())?;
     let process_start_identity = value.get("processStartIdentity")?.as_str()?;
+    // The record is written once, when the daemon starts, and holds for as
+    // long as that process runs, so its age says nothing about it.
     let updated_ms = value.get("updatedUnixMs").and_then(Value::as_u64)? as u128;
-    let now = current_millis();
-    if updated_ms > now.saturating_add(DAEMON_DISCOVERY_MAX_FUTURE_SKEW_MS)
-        || now.saturating_sub(updated_ms) > DAEMON_DISCOVERY_MAX_AGE_MS
-        || !is_process_alive(pid)
-        || update::process_start_identity(pid).as_deref() != Some(process_start_identity)
+    if updated_ms > current_millis().saturating_add(DAEMON_DISCOVERY_MAX_FUTURE_SKEW_MS)
+        || !is_recorded_process(pid, process_start_identity)
     {
         return None;
     }
@@ -636,6 +682,12 @@ fn daemon_discovery_endpoint(value: &Value) -> Option<std::net::SocketAddr> {
         .to_socket_addrs()
         .ok()?
         .find(is_loopback_endpoint)
+}
+
+/// Whether `pid` is still the process that recorded `start_identity` for
+/// itself, not a later process the system gave the same number.
+pub(crate) fn is_recorded_process(pid: u32, start_identity: &str) -> bool {
+    is_process_alive(pid) && update::process_start_identity(pid).as_deref() == Some(start_identity)
 }
 
 pub(super) fn is_process_alive(pid: u32) -> bool {
@@ -1554,6 +1606,75 @@ mod notice_tests {
         assert_eq!(response.id, 3);
         assert_eq!(response.notice_text(), Some("held for review"));
         assert!(lines.next().is_none());
+    }
+}
+
+#[cfg(test)]
+mod discovery_record_tests {
+    use super::*;
+
+    #[test]
+    fn a_record_stays_valid_for_as_long_as_its_daemon_runs() {
+        let pid = std::process::id();
+        let record = |identity: &str, updated: u128| {
+            json!({
+                "schemaVersion": 2,
+                "name": "long",
+                "host": "127.0.0.1",
+                "controlPort": 8790,
+                "bridgePorts": [8791, 8792],
+                "pid": pid,
+                "processStartIdentity": identity,
+                "updatedUnixMs": updated as u64,
+            })
+        };
+        let identity = update::process_start_identity(pid).unwrap();
+        let a_month_ago = current_millis() - 30 * 24 * 60 * 60 * 1000;
+        assert_eq!(
+            daemon_discovery_endpoint(&record(&identity, a_month_ago)),
+            Some("127.0.0.1:8790".parse().unwrap())
+        );
+        assert_eq!(
+            daemon_discovery_endpoint(&record("another start", current_millis())),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod connection_limit_tests {
+    use std::io::{BufRead, BufReader};
+
+    use super::*;
+
+    #[test]
+    fn a_connection_over_the_limit_is_told_the_daemon_is_busy() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(address).unwrap();
+        writeln!(client, "{}", json!({"v": 1, "id": 7, "op": 0, "p": {}})).unwrap();
+        let active = AtomicUsize::new(MAX_DAEMON_CONTROL_CONNECTIONS);
+        assert!(admit_control_connection(listener.accept().unwrap().0, &active).is_none());
+        assert_eq!(
+            active.load(Ordering::Relaxed),
+            MAX_DAEMON_CONTROL_CONNECTIONS
+        );
+        let mut line = String::new();
+        let read = BufReader::new(&client).read_line(&mut line);
+        assert!(read.is_ok(), "{read:?}");
+        let response: automation::Response = serde_json::from_str(&line).expect(&line);
+        assert_eq!((response.id, response.ok), (7, 0));
+        let error = response.e.unwrap();
+        assert_eq!((error.c.as_str(), error.rt), ("busy", 1));
+        assert!(error.m.contains("16 open connections"), "{}", error.m);
+
+        let _admitted = TcpStream::connect(address).unwrap();
+        let active = AtomicUsize::new(MAX_DAEMON_CONTROL_CONNECTIONS - 1);
+        assert!(admit_control_connection(listener.accept().unwrap().0, &active).is_some());
+        assert_eq!(
+            active.load(Ordering::Relaxed),
+            MAX_DAEMON_CONTROL_CONNECTIONS
+        );
     }
 }
 

@@ -131,8 +131,15 @@ pub(crate) struct StudioCloseArgs {
 #[derive(Args)]
 pub(crate) struct MultiEditArgs {
     file: String,
-    #[arg(required = true, num_args = 2.., value_names = ["OLD", "NEW"])]
-    edits: Vec<String>,
+    // The first pair is two values of their own: clap lets a single value
+    // start with a hyphen (a Luau comment) and still reads the options after
+    // it, which it cannot do for a value list.
+    #[arg(value_name = "OLD", allow_hyphen_values = true)]
+    old: String,
+    #[arg(value_name = "NEW", allow_hyphen_values = true)]
+    new: String,
+    #[arg(help = "More replacements", value_names = ["OLD", "NEW"], num_args = 0..)]
+    more: Vec<String>,
     #[arg(short, long)]
     all: bool,
     #[arg(short, long)]
@@ -148,7 +155,8 @@ pub(crate) struct InputArgs {
     #[arg(
         help = "After the actions, evaluate this Luau expression (or chunk) on the same client and return it as result",
         long,
-        value_name = "LUAU"
+        value_name = "LUAU",
+        allow_hyphen_values = true
     )]
     result: Option<String>,
     #[arg(
@@ -403,10 +411,12 @@ pub(crate) fn studio_close(args: StudioCloseArgs, project: Option<&Path>) -> Res
 }
 
 pub(crate) fn multi_edit(args: MultiEditArgs, project: Option<&Path>) -> Result<()> {
-    let (pairs, remainder) = args.edits.as_chunks::<2>();
+    let (more, remainder) = args.more.as_chunks::<2>();
     if !remainder.is_empty() {
         bail!("Each OLD value needs a following NEW value");
     }
+    let first = [args.old, args.new];
+    let pairs: Vec<&[String; 2]> = std::iter::once(&first).chain(more).collect();
     let edits = pairs
         .iter()
         .map(|pair| {
@@ -881,6 +891,40 @@ mod input_action_tests {
             }
         );
         assert!(lift_trailing_input_options(&["key".into(), "E".into(), "--shot".into()]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod hyphen_value_tests {
+    use clap::Parser;
+
+    use crate::cli::{Cli, Commands};
+
+    #[test]
+    fn me_and_inp_take_values_that_start_with_a_hyphen() {
+        match Cli::try_parse_from(["rbx", "me", "a.luau", "-- old", "-- new", "x", "y", "-a"])
+            .unwrap()
+            .command
+        {
+            Commands::MultiEdit(args) => {
+                assert_eq!(args.old, "-- old");
+                assert_eq!(args.new, "-- new");
+                assert_eq!(args.more, ["x", "y"]);
+                assert!(args.all);
+            }
+            _ => unreachable!(),
+        }
+        match Cli::try_parse_from(["rbx", "inp", "--result", "-x", "-p", "2", "key", "E"])
+            .unwrap()
+            .command
+        {
+            Commands::Input(args) => {
+                assert_eq!(args.result.as_deref(), Some("-x"));
+                assert_eq!(args.player.as_deref(), Some("2"));
+                assert_eq!(args.actions, ["key", "E"]);
+            }
+            _ => unreachable!(),
+        }
     }
 }
 

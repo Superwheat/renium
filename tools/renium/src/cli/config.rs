@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -65,19 +66,36 @@ pub(crate) fn apply_merged(cli: &mut Cli, matches: &clap::ArgMatches) -> Result<
     {
         cli.backtrace = value;
     }
-    // An explicit pin (--place or RENIUM_PLACE) beats the stored one.
-    if cli.place.is_none()
-        && std::env::var_os("RENIUM_PLACE").is_none_or(|value| value.is_empty())
-        && let Some(value) = object.get("place").and_then(Value::as_str)
-    {
-        cli.place = Some(value.to_string());
+    if let Some(place) = stored_unless_explicit(
+        cli.place.as_deref(),
+        std::env::var_os("RENIUM_PLACE"),
+        object.get("place"),
+    ) {
+        cli.place = Some(place);
     }
-    if cli.daemon.is_none()
-        && let Some(value) = object.get("daemon").and_then(Value::as_str)
-    {
-        cli.daemon = Some(value.to_string());
+    if let Some(daemon) = stored_unless_explicit(
+        cli.daemon.as_deref(),
+        std::env::var_os("RENIUM_DAEMON_NAME"),
+        object.get("daemon"),
+    ) {
+        cli.daemon = Some(daemon);
     }
     apply_command(&mut cli.command, matches, object)
+}
+
+/// The stored value of a setting that a flag or an environment variable can
+/// also give (`--place` and RENIUM_PLACE, `--daemon` and RENIUM_DAEMON_NAME).
+/// Either of those is the choice for this run, so the stored value applies
+/// only when both are absent.
+fn stored_unless_explicit(
+    flag: Option<&str>,
+    variable: Option<OsString>,
+    stored: Option<&Value>,
+) -> Option<String> {
+    if flag.is_some() || variable.is_some_and(|value| !value.is_empty()) {
+        return None;
+    }
+    stored.and_then(Value::as_str).map(str::to_string)
 }
 
 fn active_command_path(matches: &clap::ArgMatches, id: &str) -> Option<PathBuf> {
@@ -279,4 +297,24 @@ fn apply_command(
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn a_flag_or_an_environment_variable_beats_the_stored_setting() {
+        let stored = json!("stored");
+        let resolve = |flag: Option<&str>, variable: Option<&str>| {
+            stored_unless_explicit(flag, variable.map(OsString::from), Some(&stored))
+        };
+        assert_eq!(resolve(None, None).as_deref(), Some("stored"));
+        assert_eq!(resolve(None, Some("")).as_deref(), Some("stored"));
+        assert_eq!(resolve(None, Some("fromenv")), None);
+        assert_eq!(resolve(Some("flag"), None), None);
+        assert_eq!(stored_unless_explicit(None, None, None), None);
+    }
 }

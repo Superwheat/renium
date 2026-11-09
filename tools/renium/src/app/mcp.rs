@@ -45,11 +45,10 @@ pub(crate) fn run(args: McpArgs) -> Result<()> {
     if args.install || args.uninstall {
         return register::command(args.uninstall);
     }
-    let server = Server {
-        program: std::env::current_exe().context("Cannot locate the Renium executable")?,
-        base: std::env::current_dir().context("Cannot read the working directory")?,
-        calls: Mutex::new(HashMap::new()),
-    };
+    let server = Server::new(
+        std::env::current_exe().context("Cannot locate the Renium executable")?,
+        std::env::current_dir().context("Cannot read the working directory")?,
+    )?;
     if io::stdin().is_terminal() {
         eprintln!(
             "rbx mcp speaks MCP on stdin and stdout for an agent; `rbx mcp --install` registers it"
@@ -95,6 +94,111 @@ struct Server {
     program: PathBuf,
     base: PathBuf,
     calls: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    #[cfg(windows)]
+    job: CommandJob,
+}
+
+/// Where the answer to a message goes: to stdout as a line of its own, or
+/// into the one array that answers a JSON-RPC batch.
+#[derive(Clone)]
+enum Outlet {
+    Single,
+    Batch(Arc<Batch>),
+}
+
+impl Outlet {
+    fn send(&self, message: Value) {
+        match self {
+            Self::Single => send(&message),
+            Self::Batch(batch) => batch.answers.lock_recover().push(message),
+        }
+    }
+}
+
+/// The answers to one batch. Every message of the batch holds on to it until
+/// it is answered, so the array goes out when the last of them lets go: after
+/// the slowest tool call, and not at all for a batch of notifications.
+#[derive(Default)]
+struct Batch {
+    answers: Mutex<Vec<Value>>,
+}
+
+impl Drop for Batch {
+    fn drop(&mut self) {
+        let answers = std::mem::take(&mut *self.answers.lock_recover());
+        if !answers.is_empty() {
+            send(&Value::Array(answers));
+        }
+    }
+}
+
+/// Ends the running commands with the server when the server is killed and
+/// cannot stop them itself: each command joins a job object that only this
+/// process holds, and Windows terminates what is in such a job when its last
+/// handle closes.
+#[cfg(windows)]
+struct CommandJob(windows_sys::Win32::Foundation::HANDLE);
+
+// SAFETY: a job handle may be used from any thread.
+#[cfg(windows)]
+unsafe impl Send for CommandJob {}
+// SAFETY: as above; the calls made on it take no exclusive access.
+#[cfg(windows)]
+unsafe impl Sync for CommandJob {}
+
+#[cfg(windows)]
+impl CommandJob {
+    fn new() -> io::Result<Self> {
+        use windows_sys::Win32::System::JobObjects::{
+            CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JobObjectExtendedLimitInformation, SetInformationJobObject,
+        };
+
+        // SAFETY: both arguments are optional; null asks for an unnamed job
+        // with default security.
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if job.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let job = Self(job);
+        // SAFETY: the structure is plain data for which all zeroes means no limits.
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        // Only the command itself stays in the job: the daemon or the Studio
+        // it starts must outlive the server.
+        limits.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
+        // SAFETY: the pointer and the size describe `limits`, which outlives the call.
+        let set = unsafe {
+            SetInformationJobObject(
+                job.0,
+                JobObjectExtendedLimitInformation,
+                (&raw const limits).cast(),
+                size_of_val(&limits) as u32,
+            )
+        };
+        if set == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(job)
+    }
+
+    /// A command that has already ended cannot join, and needs no one to end it.
+    fn adopt(&self, child: &Child) {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+
+        // SAFETY: both handles are open for the duration of the call.
+        unsafe { AssignProcessToJobObject(self.0, child.as_raw_handle()) };
+    }
+}
+
+#[cfg(windows)]
+impl Drop for CommandJob {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from CreateJobObjectW and is closed once.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
 }
 
 #[derive(Deserialize)]
@@ -118,6 +222,16 @@ enum Ending {
 }
 
 impl Server {
+    fn new(program: PathBuf, base: PathBuf) -> Result<Self> {
+        Ok(Self {
+            program,
+            base,
+            calls: Mutex::new(HashMap::new()),
+            #[cfg(windows)]
+            job: CommandJob::new().context("Could not create the job for the commands")?,
+        })
+    }
+
     fn serve(self, mut input: impl BufRead) -> Result<()> {
         let server = Arc::new(self);
         let mut calls: Vec<JoinHandle<()>> = Vec::new();
@@ -134,32 +248,48 @@ impl Server {
             calls.retain(|call| !call.is_finished());
             calls.extend(server.receive(line.trim_ascii()));
         }
+        // The end of stdin is the client leaving: nobody reads an answer any
+        // more, so the running commands are stopped instead of waited for.
+        for cancelled in server.calls.lock_recover().values() {
+            cancelled.store(true, Ordering::Relaxed);
+        }
         for call in calls {
             let _ = call.join();
         }
         Ok(())
     }
 
-    /// Answers one message; a tool call runs on its own thread, which is
+    /// Answers one line: a message, or a batch of them, which protocol
+    /// 2025-03-26 allows. Tool calls run on their own threads, which are
     /// returned, so a slow command never holds up pings or other calls.
-    fn receive(self: &Arc<Self>, line: &[u8]) -> Option<JoinHandle<()>> {
+    fn receive(self: &Arc<Self>, line: &[u8]) -> Vec<JoinHandle<()>> {
         if line.is_empty() {
-            return None;
+            return Vec::new();
         }
-        let message: Value = match serde_json::from_slice(line) {
-            Ok(message) => message,
+        match serde_json::from_slice(line) {
+            Ok(Value::Array(messages)) if !messages.is_empty() => {
+                let outlet = Outlet::Batch(Arc::default());
+                messages
+                    .iter()
+                    .filter_map(|message| self.answer(message, outlet.clone()))
+                    .collect()
+            }
+            Ok(message) => self.answer(&message, Outlet::Single).into_iter().collect(),
             Err(error) => {
                 send(&reply(
                     &Value::Null,
                     Err((-32700, format!("Parse error: {error}"))),
                 ));
-                return None;
+                Vec::new()
             }
-        };
+        }
+    }
+
+    fn answer(self: &Arc<Self>, message: &Value, outlet: Outlet) -> Option<JoinHandle<()>> {
         let Some(method) = message.get("method").and_then(Value::as_str) else {
             if message.get("result").is_none() && message.get("error").is_none() {
                 let id = message.get("id").unwrap_or(&Value::Null);
-                send(&reply(id, Err((-32600, "Invalid request".to_string()))));
+                outlet.send(reply(id, Err((-32600, "Invalid request".to_string()))));
             }
             return None;
         };
@@ -172,10 +302,10 @@ impl Server {
             "initialize" => Ok(initialize_result(&params)),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({"tools": [tool()]})),
-            "tools/call" => return Some(self.spawn_call(id, params)),
+            "tools/call" => return Some(self.spawn_call(id, params, outlet)),
             _ => Err((-32601, format!("Method not found: {method}"))),
         };
-        send(&reply(&id, result));
+        outlet.send(reply(&id, result));
         None
     }
 
@@ -188,7 +318,7 @@ impl Server {
         }
     }
 
-    fn spawn_call(self: &Arc<Self>, id: Value, params: Value) -> JoinHandle<()> {
+    fn spawn_call(self: &Arc<Self>, id: Value, params: Value, outlet: Outlet) -> JoinHandle<()> {
         let key = id.to_string();
         let cancelled = Arc::new(AtomicBool::new(false));
         self.calls
@@ -199,7 +329,7 @@ impl Server {
             let result = server.call(&params, &cancelled);
             server.calls.lock_recover().remove(&key);
             if !cancelled.load(Ordering::Relaxed) {
-                send(&reply(&id, result));
+                outlet.send(reply(&id, result));
             }
         })
     }
@@ -281,6 +411,8 @@ impl Server {
                 };
             }
         };
+        #[cfg(windows)]
+        self.job.adopt(&child);
         if let (Some(input), Some(mut pipe)) = (input, child.stdin.take()) {
             let input = input.to_owned();
             thread::spawn(move || {
@@ -420,4 +552,33 @@ fn send(message: &Value) {
     let _ = stdout
         .write_all(line.as_bytes())
         .and_then(|()| stdout.flush());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_server_stops_its_commands_when_stdin_ends() {
+        let (program, args) = if cfg!(windows) {
+            ("ping", json!(["-n", "60", "127.0.0.1"]))
+        } else {
+            ("sleep", json!(["60"]))
+        };
+        let server = Server::new(PathBuf::from(program), std::env::current_dir().unwrap()).unwrap();
+        let call = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "rbx", "arguments": {"args": args}},
+        });
+        let (done, served) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = done.send(server.serve(io::Cursor::new(format!("{call}\n"))));
+        });
+        served
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the server returns once its input has ended")
+            .unwrap();
+    }
 }
