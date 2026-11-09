@@ -266,6 +266,7 @@ fn resumes_global_audio(command: &Commands) -> bool {
             | Commands::Plugin(_)
             | Commands::External(_)
             | Commands::Help(_)
+            | Commands::Mcp(_)
     )
 }
 
@@ -274,6 +275,7 @@ fn checks_agent_update(command: &Commands) -> bool {
         command,
         Commands::UpdateHelper(_)
             | Commands::NativeProbe(_)
+            | Commands::Mcp(_)
             | Commands::Plugin(_)
             | Commands::External(_)
             | Commands::Help(_)
@@ -339,6 +341,7 @@ fn checks_agent_instructions(command: &Commands) -> bool {
             | Commands::Update(_)
             | Commands::UpdateHelper(_)
             | Commands::Setup(_)
+            | Commands::Mcp(_)
             | Commands::Daemon(_)
             | Commands::BridgeDaemon(_)
             | Commands::ExplorerDaemon(_)
@@ -428,6 +431,15 @@ mod startup_policy_tests {
     fn native_probe_has_no_background_startup_work() {
         let args = ["rbx", "native-probe", "--pid", "123"];
         let matches = cli::command().try_get_matches_from(args).unwrap();
+        let cli = Cli::from_arg_matches(&matches).unwrap();
+        assert!(!resumes_global_audio(&cli.command));
+        assert!(!checks_agent_update(&cli.command));
+        assert!(!checks_agent_instructions(&cli.command));
+    }
+
+    #[test]
+    fn the_mcp_server_leaves_startup_work_to_the_commands_it_runs() {
+        let matches = cli::command().try_get_matches_from(["rbx", "mcp"]).unwrap();
         let cli = Cli::from_arg_matches(&matches).unwrap();
         assert!(!resumes_global_audio(&cli.command));
         assert!(!checks_agent_update(&cli.command));

@@ -2008,7 +2008,7 @@ fn recover_core_install(target_root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn installer_core_root() -> Option<PathBuf> {
+pub(crate) fn installer_core_root() -> Option<PathBuf> {
     #[cfg(windows)]
     {
         env::var_os("LOCALAPPDATA")

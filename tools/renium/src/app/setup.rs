@@ -7,6 +7,7 @@ use serde_json::Value;
 use serde_json::json;
 
 use crate::app::build::VERSION as BUILD_VERSION;
+use crate::app::mcp::register;
 use crate::app::output::emit_global_output;
 use crate::app::update;
 use crate::cli::SetupArgs;
@@ -263,17 +264,23 @@ pub(crate) fn setup_command(args: SetupArgs) -> Result<()> {
             removal.commit()?;
         }
         let agent_hints = crate::app::agent_hints::remove()?;
-        let response = json!({
+        let mcp = register::remove();
+        let mut response = json!({
             "ok": true,
             "action": "uninstall",
             "removed": target,
             "removedVersion": installed_version,
             "agentHintsRemoved": agent_hints,
+            "mcpRemoved": mcp.changed,
         });
-        return emit_global_output(
-            &response,
-            &format!("Removed the Studio plugin from {}", target.display()),
-        );
+        if !mcp.failed.is_empty() {
+            response["mcpFailed"] = mcp.failures();
+        }
+        let mut text = format!("Removed the Studio plugin from {}", target.display());
+        if let Some(note) = mcp.describe("removed from") {
+            text = format!("{text}; {note}");
+        }
+        return emit_global_output(&response, &text);
     }
     let staging_download =
         std::env::temp_dir().join(format!("renium-plugin-{}.rbxm", std::process::id()));
@@ -366,7 +373,8 @@ pub(crate) fn setup_command(args: SetupArgs) -> Result<()> {
         }
     };
     let agent_hints = crate::app::agent_hints::install(BUILD_VERSION)?;
-    let response = json!({
+    let mcp = register::install(&register::setup_executable()?);
+    let mut response = json!({
         "ok": true,
         "action": if args.repair { "repair" } else { "setup" },
         "source": source_label,
@@ -374,8 +382,12 @@ pub(crate) fn setup_command(args: SetupArgs) -> Result<()> {
         "bytes": bytes.len(),
         "agentHints": crate::app::agent_hints::status(),
         "agentHintsWritten": agent_hints,
+        "mcpRegistered": mcp.changed,
         "note": "Restart Roblox Studio (or toggle the plugin) to load the new version",
     });
+    if !mcp.failed.is_empty() {
+        response["mcpFailed"] = mcp.failures();
+    }
     #[cfg(target_os = "macos")]
     let response = if let Some(studio) = studio {
         response_with(
@@ -386,12 +398,13 @@ pub(crate) fn setup_command(args: SetupArgs) -> Result<()> {
     } else {
         response
     };
-    emit_global_output(
-        &response,
-        &format!(
-            "Installed the Studio plugin from {source_label} to {}; {}",
-            target.display(),
-            crate::app::agent_hints::describe(&agent_hints)
-        ),
-    )
+    let mut text = format!(
+        "Installed the Studio plugin from {source_label} to {}; {}",
+        target.display(),
+        crate::app::agent_hints::describe(&agent_hints)
+    );
+    if let Some(note) = mcp.describe("added to") {
+        text = format!("{text}; {note}");
+    }
+    emit_global_output(&response, &text)
 }

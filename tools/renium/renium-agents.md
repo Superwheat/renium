@@ -3,6 +3,8 @@
 
 Run `rbx` in the project folder. Act directly: commands report a missing Studio or a sync problem themselves, so skip `status`, `cs` and `lst`. Results: one JSON line on stdout, errors on stderr.
 
+When an `rbx` MCP tool is present, call it with the arguments as a list (`steps` for a chain); otherwise run `rbx` in the shell.
+
 ## Recipes
 
 - Layout: `RENIUM/map.md` (every store's instances two levels deep, refreshed by each `rbx` command) is the orientation; act from the prompt and the map. Deeper detail only when it matters: `rbx tr Workspace Lobby --depth 2`, `rbx in Workspace Lobby.Door -F props,attrs`; a service with no store yet (the map lists them) is pulled from Studio by the first command that needs it. Studio state: one bounded `rbx l 'return ...'`. A `--where` edit lists every match it touched (`instances`, `removed`, `renamed`), so act directly and check that list; no listing pass first.

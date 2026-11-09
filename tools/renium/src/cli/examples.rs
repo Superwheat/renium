@@ -174,6 +174,10 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
         "Examples:\n  rbx rf clip.mp4\n  rbx rf clip.mp4 --page 2\n  rbx rf clip.mp4 --frame 15",
     ),
     ("setup", "Examples:\n  rbx setup"),
+    (
+        "mcp",
+        "Examples:\n  rbx mcp\n  rbx mcp --install\n  rbx mcp --uninstall",
+    ),
     ("st", "Examples:\n  rbx st --event-wait-seconds 1"),
     (
         "lon",

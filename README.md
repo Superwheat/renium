@@ -80,9 +80,13 @@ Renium is updated.
 project, and adds short pointers to them in `AGENTS.md` and `CLAUDE.md` without
 removing what is already there. An agent such as Claude Code or Codex reads
 `RENIUM.md` (about 1,200 tokens), opens a topic guide only when a task needs it,
-and runs `rbx` in its terminal. It needs no MCP server and loads no tool schemas.
-The installer also adds a short note about `rbx` to the global instructions of
-Claude Code, Codex, Gemini CLI, OpenCode and Windsurf when it finds them.
+and runs `rbx` in its terminal or calls it as one MCP tool, `rbx`, whose input is
+the argument list. Either way it loads no tool schemas. The installer adds a short
+note about `rbx` to the global instructions of Claude Code, Codex, Gemini CLI,
+OpenCode and Windsurf when it finds them, and registers `rbx mcp` as the `renium`
+MCP server in the configs of Claude Code, Codex, Cursor, Windsurf, Gemini CLI and
+OpenCode, keeping a `.renium.bak` copy of each file it changes. `rbx mcp --install`
+and `rbx mcp --uninstall` do the same by hand.
 
 Each command prints compact JSON, and `print` output comes back to the command
 instead of Studio's Output window. These are the ones agents use most:

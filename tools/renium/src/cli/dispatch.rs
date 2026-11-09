@@ -142,6 +142,7 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::RecordEnd(args) => record_end_command(args),
         Commands::RecordReview(args) => crate::studio::automation::record_review_command(args),
         Commands::Setup(args) => setup_command(args),
+        Commands::Mcp(args) => crate::app::mcp::run(args),
         Commands::StudioChangeState(args) => studio_change_state_command(args, project),
         Commands::LiveStart(args) => {
             studio_change_state_operation_command(args, op::LIVE_START, project)

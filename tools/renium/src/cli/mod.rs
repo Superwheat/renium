@@ -629,6 +629,11 @@ pub(super) enum Commands {
     )]
     Setup(SetupArgs),
     #[command(
+        name = "mcp",
+        about = "Serve rbx to agents as one MCP tool over stdio, or register that server"
+    )]
+    Mcp(crate::app::mcp::McpArgs),
+    #[command(
         name = "st",
         alias = "studio-change-state",
         about = "Control Studio change tracking (low level)"

@@ -112,8 +112,11 @@ fn state_dir(pid: u32, identity: &str) -> Result<PathBuf> {
         .join(format!("{pid}-{key}")))
 }
 
+/// Every process spawned after this inherits none of our standard handles,
+/// so a worker or command left running cannot hold the caller's pipes open
+/// after we exit.
 #[cfg(windows)]
-fn keep_standard_handles_private() {
+pub(crate) fn keep_standard_handles_private() {
     use windows_sys::Win32::Foundation::{
         HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
     };

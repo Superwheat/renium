@@ -22,7 +22,7 @@ fn hint_block(version: &str) -> String {
         "{START}\n\
 Renium {version} is installed. `rbx` is a terminal tool for Roblox Studio: two-way sync between a project folder and the open place, live Luau, saved-data queries, playtests and captures. \
 In a Roblox project folder run `rbx init` once, then read the RENIUM.md it creates and follow it. \
-For an existing place file, run `rbx init` in its folder and then `rbx so FILE`. `rbx --help` lists commands. \
+For an existing place file, run `rbx init` in its folder and then `rbx so FILE`. `rbx --help` lists commands; the `rbx` MCP tool takes the same arguments as a list. \
 `rbx` reports \"No Renium project\" outside a project folder; it never creates one by itself.\n\
 {END}\n"
     )
