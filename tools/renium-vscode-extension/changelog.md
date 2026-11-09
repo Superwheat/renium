@@ -93,6 +93,8 @@
 - `rbx -r DIR COMMAND` no longer creates DIR for commands that work in an existing project; it reports that the folder does not exist, and only `rbx -r DIR init` creates it.
 - A merge no longer keeps a reference to an instance the other side removed, which left a store that failed to build into a place. Without a preference `rbx vcm` reports it as a conflict; with one the instance comes back when the preferred side still has it, and the reference is cleared otherwise.
 - `rbx prop` and `rbx del` above the review threshold say so: the result carries `heldForReview`, the change list in `review` and the `--yes` next step, as `rbx ps` does. They used to print only `{"ok":true,"changed":false}`.
+- Store edits (`rbx bs`, `rbx ba`, batch props) check bool, number and string values against the property's type: a number given to a string property is stored as text, a numeric string given to a number property as the number, and anything else is refused with an example instead of failing later in `rbx bep` or a push.
+- Setting or adding an attribute whose name Roblox refuses (empty, over 100 characters, starting with `RBX`, or with characters other than letters, digits, `_`, `.`, `-`, `/`) is refused.
 
 ## 0.5.9 - 2026-11-06
 

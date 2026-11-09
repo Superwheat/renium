@@ -332,6 +332,36 @@ fn parse_cli_source_text(value_json: Option<&str>, value_str: Option<&str>) -> R
     Ok(value_str.unwrap_or_default().to_string())
 }
 
+/// Roblox takes an attribute name of 1 to 100 letters, digits, `_`, `.`, `-`
+/// and `/` that does not start with `RBX`, which it keeps for its own
+/// attributes. No push can set a value under another name, so an edit does
+/// not store one. The attributes a store already holds are not checked.
+pub(crate) fn ensure_settable_attribute_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("An attribute name cannot be empty");
+    }
+    if let Some(character) = name
+        .chars()
+        .find(|character| !character.is_ascii_alphanumeric() && !"_.-/".contains(*character))
+    {
+        bail!(
+            "Attribute name {name:?} holds {character:?}; Roblox takes letters, digits, `_`, `.`, `-` and `/`"
+        );
+    }
+    if name.starts_with("RBX") {
+        bail!(
+            "Attribute name {name:?} starts with RBX, which Roblox reserves for its own attributes"
+        );
+    }
+    if name.len() > 100 {
+        bail!(
+            "An attribute name holds at most 100 characters, got {}",
+            name.len()
+        );
+    }
+    Ok(())
+}
+
 fn validate_auto_property_name(
     document: &SettingsBytecode,
     index: usize,
@@ -2060,8 +2090,9 @@ fn reject_owned_instance_edit(
 
 /// The name one property of the instance at `index` is stored under, with
 /// `value` turned into its stored form: a Roblox property takes its logical
-/// name and typed value, and one a push cannot set is refused. The flag says
-/// the stored name differs from the requested one.
+/// name and typed value, and a property or an attribute name a push cannot
+/// set is refused. The flag says the stored name differs from the requested
+/// one.
 fn stored_property_edit(
     document: &mut SettingsBytecode,
     index: usize,
@@ -2100,6 +2131,15 @@ fn stored_property_edit(
     let stored = logical_property
         .or(canonical_property)
         .unwrap_or_else(|| property.to_string());
+    // A null removes the attribute, which no name rules out.
+    let sets_attribute = match scope {
+        PropertyScope::Attribute => true,
+        PropertyScope::Auto => document.instances[index].attributes.contains_key(&stored),
+        PropertyScope::Metadata | PropertyScope::Property => false,
+    };
+    if sets_attribute && !value.is_null() {
+        ensure_settable_attribute_name(&stored)?;
+    }
     Ok((stored, requested_differs))
 }
 
@@ -3086,6 +3126,9 @@ fn resolve_property_batch_entries(
             bail!("ClassName is read-only");
         }
         let scope = parse_property_scope(&entry.scope)?;
+        if scope == PropertyScope::Attribute && !entry.value.is_null() {
+            ensure_settable_attribute_name(&entry.property)?;
+        }
         let settings_id = entry
             .settings_id
             .as_deref()

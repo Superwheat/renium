@@ -294,6 +294,14 @@ fn add_instance_validates_names_classes_properties_ids_and_references() {
             .contains("Size needs a Vector3 value")
     );
     assert_eq!(
+        add(&["-n", "X", "-c", "Part", "-p", "Anchored=\"yes\""]).err(),
+        "Anchored needs true or false, got \"yes\"; for example `-p Anchored=true`"
+    );
+    assert_eq!(
+        add(&["-n", "X", "-c", "Part", "-a", "has space=1"]).err(),
+        "Attribute name \"has space\" holds ' '; Roblox takes letters, digits, `_`, `.`, `-` and `/`"
+    );
+    assert_eq!(
         add(&["-n", "", "-c", "Folder"]).err(),
         "Instance name cannot be empty"
     );
@@ -322,6 +330,21 @@ fn add_instance_validates_names_classes_properties_ids_and_references() {
     );
     assert_eq!(instance.properties["Transparency"], json!(0.5));
     assert_eq!(instance.attributes["Note"], json!("n"));
+    let sign = add(&[
+        "-n",
+        "Sign",
+        "-c",
+        "StringValue",
+        "-p",
+        "Value=5",
+        "-a",
+        "Stage.Boss-1/hp=1",
+    ])
+    .ok();
+    let instance =
+        fx.read_store("Workspace").instances[sign["index"].as_u64().unwrap() as usize].clone();
+    assert_eq!(instance.properties["Value"], json!("5"));
+    assert_eq!(instance.attributes["Stage.Boss-1/hp"], json!(1));
     assert_eq!(
         add(&["-n", "Custom", "-c", "Folder", "-i", "custom:1"]).ok()["settingsId"],
         json!("custom:1")
@@ -1321,6 +1344,20 @@ fn batch_ops_share_the_value_handling_and_refusals_of_single_edits() {
     let lighting = &fx.read_store("Lighting").instances[0];
     assert_eq!(lighting.properties["TimeOfDay"], json!("18:15:00"));
     assert!(!lighting.properties.contains_key("ClockTime"));
+    run_batch(
+        &fx,
+        r#"[
+            {"op":"set","path":"Workspace.Lobby.Door","props":{"Transparency":"0.25"},"attrs":{"Stage.Boss-1/hp":1}},
+            {"parent":"Workspace","name":"Sign","class":"StringValue","props":{"Value":5}}
+        ]"#,
+    )
+    .unwrap();
+    let typed = fx.read_store("Workspace");
+    assert_eq!(typed.instances[2].properties["Transparency"], json!(0.25));
+    assert_eq!(
+        typed.instances.last().unwrap().properties["Value"],
+        json!("5")
+    );
     let before = fs::read(fx.store("Workspace")).unwrap();
     let err = |ops: &str| run_batch(&fx, ops).unwrap_err();
     assert!(err(r##"[{"parent":"Workspace","name":"Label","class":"TextLabel","ref":"label"},{"op":"set","path":"#label","props":{"Font":"GothamBold"}}]"##).starts_with("Batch op 1 (set): TextLabel.Font is hidden or engine-managed"));
@@ -1344,6 +1381,18 @@ fn batch_ops_share_the_value_handling_and_refusals_of_single_edits() {
         (
             r#"[{"op":"set","path":"Workspace.Lobby.Door","tags":["A"],"props":{"Tags":["B"]}}]"#,
             "Batch op 0 (set): give tags or props.Tags, not both",
+        ),
+        (
+            r#"[{"op":"set","path":"Workspace.Lobby.Door","props":{"Anchored":"yes"}}]"#,
+            "Batch op 0 (set): Anchored needs true or false, got \"yes\"; for example `-p Anchored=true`",
+        ),
+        (
+            r#"[{"op":"set","path":"Workspace.Lobby.Door","attrs":{"has space":1}}]"#,
+            "Batch op 0 (set): Attribute name \"has space\" holds ' '; Roblox takes letters, digits, `_`, `.`, `-` and `/`",
+        ),
+        (
+            r#"[{"parent":"Workspace","name":"A","class":"Folder","attrs":{"":1}}]"#,
+            "Batch op 0 (add): An attribute name cannot be empty",
         ),
         (
             r#"[{"op":"move","path":"Workspace.Lobby.Door","parent":"ReplicatedStorage.Shared"}]"#,

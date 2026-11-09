@@ -18,10 +18,11 @@ use crate::bytecode::explorer::compact_path_string;
 use crate::bytecode::query::resolve_document_id_or_target;
 use crate::bytecode::{
     SettingsFileLock, acquire_settings_file_lock, apply_file_mutations, check_new_source_file,
-    collect_source_path_updates, file_mutation_paths, fold_derived_property, high_level_split_path,
-    missing_service_store_error, preserve_source_path_extension, qualify_value_references,
-    reject_owned_instance_edit, reject_read_only_link_edit, resolve_bytecode_cli_settings_file,
-    store_link_enforcement, stored_property_edit,
+    collect_source_path_updates, ensure_settable_attribute_name, file_mutation_paths,
+    fold_derived_property, high_level_split_path, missing_service_store_error,
+    preserve_source_path_extension, qualify_value_references, reject_owned_instance_edit,
+    reject_read_only_link_edit, resolve_bytecode_cli_settings_file, store_link_enforcement,
+    stored_property_edit,
 };
 use crate::editor::document::is_protected_engine_container;
 use crate::editor::paths::{
@@ -1124,6 +1125,9 @@ impl StoreState {
         }
         let mut attributes = Vec::with_capacity(attrs.len());
         for (name, mut value) in attrs {
+            if !value.is_null() {
+                ensure_settable_attribute_name(&name)?;
+            }
             qualify_value_references(&mut value, &self.settings_file, &self.document)?;
             instance_api::set_instance_property(
                 &mut self.document,

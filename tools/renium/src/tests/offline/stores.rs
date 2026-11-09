@@ -1101,6 +1101,143 @@ fn set_property_refuses_an_enum_number_that_is_no_item() {
 }
 
 #[test]
+fn set_property_stores_a_scalar_in_the_property_type_or_refuses_it() {
+    let fx = Fixture::new("set-scalars");
+    let store = fx.store_arg("Workspace");
+    for (name, class) in [("Sign", "StringValue"), ("Count", "IntValue")] {
+        fx.text(&["ba", "-f", &store, "-n", name, "-c", class]).ok();
+    }
+    let set = |target: &str, args: &[&str]| {
+        fx.text(&[&["bs", "-f", &store, target, "-p"], args].concat())
+    };
+    let stored = |name: &str, property: &str| {
+        let document = fx.read_store("Workspace");
+        let instance = document.instances.iter().find(|i| i.name == name).unwrap();
+        instance.properties[property].clone()
+    };
+    set("Door", &["Transparency", "--str", "0.25"]).ok();
+    assert_eq!(stored("Door", "Transparency"), json!(0.25));
+    set("Sign", &["Value=5"]).ok();
+    assert_eq!(stored("Sign", "Value"), json!("5"));
+    set("Sign", &["Value", "--num", "0.5"]).ok();
+    assert_eq!(stored("Sign", "Value"), json!("0.5"));
+    set("Count", &["Value", "--num", "3"]).ok();
+    assert_eq!(stored("Count", "Value"), json!(3));
+
+    let before = fs::read(fx.store("Workspace")).unwrap();
+    assert_eq!(
+        set("Door", &["Anchored", "--str", "yes"]).err(),
+        "Anchored needs true or false, got \"yes\"; for example `-p Anchored=true`"
+    );
+    assert_eq!(
+        set("Door", &["Transparency", "--str", "half"]).err(),
+        "Transparency needs a number, got \"half\"; for example `-p Transparency=0.5`"
+    );
+    assert_eq!(
+        set("Count", &["Value", "--num", "2.5"]).err(),
+        "Value needs a whole number, got 2.5; for example `-p Value=5`"
+    );
+    assert_eq!(
+        set("Sign", &["Value", "--bool", "true"]).err(),
+        "Value needs a string, got true; for example `-p 'Value=\"text\"'`"
+    );
+    assert_eq!(fs::read(fx.store("Workspace")).unwrap(), before);
+
+    let place = fx.path("typed.rbxl");
+    fx.text(&["bep", "-r", &fx.path(""), "-o", &place]).ok();
+    let project = fx.path("renium.project.jsonc");
+    assert_eq!(
+        fx.text(&["cmp", &place, "--full", "--all", "--project", &project])
+            .ok()["differences"],
+        json!([])
+    );
+}
+
+#[test]
+fn edits_refuse_an_attribute_name_roblox_refuses() {
+    let fx = Fixture::new("set-attribute-names");
+    let store = fx.store_arg("Workspace");
+    let mut document = fx.read_store("Workspace");
+    for name in ["has space", "RBX_Seen"] {
+        document.instances[2]
+            .attributes
+            .insert(name.to_string(), json!(1));
+    }
+    fx.write_store("Workspace", &document);
+    let before = fs::read(fx.store("Workspace")).unwrap();
+    let set = |scope: &str, name: &str, value: &[&str]| {
+        fx.text(
+            &[
+                &["bs", "-f", &store, "Door", "-S", scope, "-p", name],
+                value,
+            ]
+            .concat(),
+        )
+    };
+    let spaced = "Attribute name \"has space\" holds ' '; Roblox takes letters, digits, `_`, `.`, `-` and `/`";
+    let too_long = "a".repeat(101);
+    for (name, refusal) in [
+        ("has space", spaced),
+        ("", "An attribute name cannot be empty"),
+        (
+            "Café",
+            "Attribute name \"Café\" holds 'é'; Roblox takes letters, digits, `_`, `.`, `-` and `/`",
+        ),
+        (
+            "RBX_Seen",
+            "Attribute name \"RBX_Seen\" starts with RBX, which Roblox reserves for its own attributes",
+        ),
+        (
+            too_long.as_str(),
+            "An attribute name holds at most 100 characters, got 101",
+        ),
+    ] {
+        assert_eq!(set("attribute", name, &["--num", "2"]).err(), refusal);
+    }
+    assert_eq!(set("auto", "has space", &["--num", "2"]).err(), spaced);
+    let batch = fx.root.join("panel-edit.json");
+    let panel_edit = |name: &str| {
+        fs::write(
+            &batch,
+            json!([{
+                "service": "Workspace",
+                "settingsId": "door",
+                "className": "Part",
+                "pathSegments": ["Workspace", "Lobby", "Door"],
+                "pathOrdinals": [1, 1, 1],
+                "scope": "attribute",
+                "property": name,
+                "value": 2,
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        fx.text(&[
+            "bytecode-apply-property-batch",
+            "--project-root",
+            &fx.path(""),
+            "--input",
+            &batch.to_string_lossy(),
+            "--direction",
+            "files-to-studio",
+        ])
+    };
+    assert_eq!(panel_edit("has space").err(), spaced);
+    assert_eq!(fs::read(fx.store("Workspace")).unwrap(), before);
+
+    let longest = "a".repeat(100);
+    set("attribute", "Stage.Boss-1/hp_max", &["--num", "2"]).ok();
+    set("attribute", &longest, &["--num", "2"]).ok();
+    assert_eq!(panel_edit("Kind").ok()["applied"], json!(1));
+    set("attribute", "has space", &["--null"]).ok();
+    let attributes = fx.read_store("Workspace").instances[2].attributes.clone();
+    for name in ["Stage.Boss-1/hp_max", longest.as_str(), "Kind", "RBX_Seen"] {
+        assert!(attributes.contains_key(name), "{name}");
+    }
+    assert!(!attributes.contains_key("has space"));
+}
+
+#[test]
 fn set_property_edits_the_service_root_and_references() {
     let fx = Fixture::new("set-refs");
     let store = fx.store_arg("Workspace");

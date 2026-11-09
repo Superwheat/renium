@@ -35,7 +35,8 @@ use crate::bytecode::edit::{
 };
 use crate::editor::sync::is_lua_source_class;
 use crate::rbx::decode::{
-    nonfinite_float_from_json, rbx_reflection_class_is_a, rbx_variant_to_persisted_settings_json,
+    json_number_f64, nonfinite_float_from_json, rbx_reflection_class_is_a,
+    rbx_variant_to_persisted_settings_json,
 };
 use crate::rbx::model::{
     BytecodeExportClassMetadata, BytecodeExportMetadata, BytecodeExportPropertyMetadata,
@@ -1457,8 +1458,9 @@ pub(crate) fn normalize_project_typed_value(
         .context("Roblox property literal isn't supported by Renium")
 }
 
-/// Store writes keep composite property values in their typed form. A bare
-/// `{x,y,z}` for a Vector3 would reach Studio as a table and fail every push.
+/// Store writes keep property values in the form of the property's type. A
+/// bare `{x,y,z}` for a Vector3 would reach Studio as a table and fail every
+/// push, and a string in a number property would fail the place build.
 pub(crate) fn typed_store_property_value(
     class_name: &str,
     property_name: &str,
@@ -1538,7 +1540,22 @@ pub(crate) fn typed_store_property_value(
         return Ok(json!({ "_type": "Ref", "pathSegments": segments }));
     }
     let value_type = *value_type;
-    if value.is_null() || !is_composite_value_type(value_type) {
+    if value.is_null() {
+        return Ok(value);
+    }
+    // Name is the record's own field, which a rename checks.
+    if property_name != "Name"
+        && let Some(scalar) = ScalarType::of(value_type)
+    {
+        return scalar.stored(&value).with_context(|| {
+            format!(
+                "{property_name} needs {}, got {value}; for example `-p {}`",
+                scalar.needs(),
+                scalar.example(property_name)
+            )
+        });
+    }
+    if !is_composite_value_type(value_type) {
         return Ok(value);
     }
     json_to_rbx_variant_for_type(&value, value_type, database, &Default::default())
@@ -1555,6 +1572,91 @@ pub(crate) fn typed_store_property_value(
                 "{property_name} needs a {value_type:?} value, got {value}; `rbx bg` shows the stored form"
             )
         })
+}
+
+/// The property types a plain JSON bool, number or string is stored as.
+#[derive(Clone, Copy)]
+enum ScalarType {
+    Bool,
+    Int32,
+    Int64,
+    Float,
+    String,
+}
+
+impl ScalarType {
+    fn of(value_type: RbxVariantType) -> Option<Self> {
+        match value_type {
+            RbxVariantType::Bool => Some(Self::Bool),
+            RbxVariantType::Int32 => Some(Self::Int32),
+            RbxVariantType::Int64 => Some(Self::Int64),
+            RbxVariantType::Float32 | RbxVariantType::Float64 => Some(Self::Float),
+            RbxVariantType::String => Some(Self::String),
+            _ => None,
+        }
+    }
+
+    /// The value as the store keeps it for a property of this type, or None
+    /// when the property cannot take it: a mistyped value in a store fails
+    /// the place build and every push. The two conversions are the ones
+    /// Studio's own setters make: a number becomes the text of a string
+    /// property, and a string that is one finite number becomes the number
+    /// of a number property.
+    fn stored(self, value: &Value) -> Option<Value> {
+        let number = || match value {
+            Value::Number(_) => Some(value.clone()),
+            Value::String(text) => number_from_text(text),
+            _ => None,
+        };
+        match self {
+            Self::Bool => value.is_boolean().then(|| value.clone()),
+            Self::Int32 => json_i32(&number()?).map(Value::from),
+            Self::Int64 => json_i64(&number()?).map(Value::from),
+            // The stores keep a non-finite number as a typed object.
+            Self::Float => {
+                number().or_else(|| nonfinite_float_from_json(value).map(json_number_f64))
+            }
+            Self::String => match value {
+                Value::String(_) => Some(value.clone()),
+                Value::Number(number) => Some(Value::String(match number.as_f64() {
+                    Some(float) if number.is_f64() => float.to_string(),
+                    _ => number.to_string(),
+                })),
+                _ => None,
+            },
+        }
+    }
+
+    fn needs(self) -> &'static str {
+        match self {
+            Self::Bool => "true or false",
+            Self::Int32 => "a whole number that fits 32 bits",
+            Self::Int64 => "a whole number",
+            Self::Float => "a number",
+            Self::String => "a string",
+        }
+    }
+
+    /// A `-p` assignment that sets the property to a value of this type.
+    fn example(self, property_name: &str) -> String {
+        match self {
+            Self::Bool => format!("{property_name}=true"),
+            Self::Int32 | Self::Int64 => format!("{property_name}=5"),
+            Self::Float => format!("{property_name}=0.5"),
+            Self::String => format!("'{property_name}=\"text\"'"),
+        }
+    }
+}
+
+/// The number a string holds when the whole string is one finite number.
+fn number_from_text(text: &str) -> Option<Value> {
+    if let Ok(integer) = text.parse::<i64>() {
+        return Some(Value::from(integer));
+    }
+    text.parse::<f64>()
+        .ok()
+        .and_then(serde_json::Number::from_f64)
+        .map(Value::Number)
 }
 
 fn is_composite_value_type(value_type: RbxVariantType) -> bool {
@@ -2546,6 +2648,77 @@ mod tests {
         .unwrap();
         assert_eq!(by_name, by_number);
         assert!(typed_store_property_value("Team", "TeamColor", json!("No such color")).is_err());
+    }
+
+    #[test]
+    fn scalar_properties_store_a_value_of_their_own_type() {
+        let stored = |class: &str, value: Value| {
+            typed_store_property_value(class, "Value", value).map_err(|error| error.to_string())
+        };
+        assert_eq!(stored("StringValue", json!("5")), Ok(json!("5")));
+        assert_eq!(stored("StringValue", json!(5)), Ok(json!("5")));
+        assert_eq!(stored("StringValue", json!(5.0)), Ok(json!("5")));
+        assert_eq!(stored("StringValue", json!(0.5)), Ok(json!("0.5")));
+        assert_eq!(
+            stored("StringValue", json!(true)),
+            Err("Value needs a string, got true; for example `-p 'Value=\"text\"'`".to_string())
+        );
+        assert!(stored("StringValue", json!(["a"])).is_err());
+
+        assert_eq!(stored("NumberValue", json!(0.5)), Ok(json!(0.5)));
+        assert_eq!(stored("NumberValue", json!("0.5")), Ok(json!(0.5)));
+        assert_eq!(stored("NumberValue", json!("-2e3")), Ok(json!(-2000.0)));
+        let infinite = json!({"_type": "Float", "value": "inf"});
+        assert_eq!(stored("NumberValue", infinite.clone()), Ok(infinite));
+        for refused in [
+            json!("half"),
+            json!("0.5 studs"),
+            json!(""),
+            json!("inf"),
+            json!("nan"),
+            json!(true),
+            json!({"x": 1}),
+        ] {
+            assert_eq!(
+                stored("NumberValue", refused.clone()),
+                Err(format!(
+                    "Value needs a number, got {refused}; for example `-p Value=0.5`"
+                ))
+            );
+        }
+
+        let whole = stored("IntValue", json!(5.0)).unwrap();
+        assert!(whole.is_i64() && whole == json!(5), "{whole}");
+        assert_eq!(stored("IntValue", json!("7")), Ok(json!(7)));
+        assert_eq!(
+            stored("IntValue", json!(9_007_199_254_740_993_i64)),
+            Ok(json!(9_007_199_254_740_993_i64))
+        );
+        for refused in [json!(2.5), json!("2.5"), json!("seven"), json!(false)] {
+            assert_eq!(
+                stored("IntValue", refused.clone()),
+                Err(format!(
+                    "Value needs a whole number, got {refused}; for example `-p Value=5`"
+                ))
+            );
+        }
+        assert_eq!(
+            typed_store_property_value("TextLabel", "ZIndex", json!(3_000_000_000_i64))
+                .unwrap_err()
+                .to_string(),
+            "ZIndex needs a whole number that fits 32 bits, got 3000000000; for example `-p ZIndex=5`"
+        );
+
+        assert_eq!(stored("BoolValue", json!(false)), Ok(json!(false)));
+        for refused in [json!("yes"), json!("true"), json!(1)] {
+            assert_eq!(
+                stored("BoolValue", refused.clone()),
+                Err(format!(
+                    "Value needs true or false, got {refused}; for example `-p Value=true`"
+                ))
+            );
+        }
+        assert_eq!(stored("NumberValue", Value::Null), Ok(Value::Null));
     }
 
     #[test]

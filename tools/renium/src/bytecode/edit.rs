@@ -697,6 +697,9 @@ pub(crate) fn prepare_new_instance_values(
     }
     ensure_creatable_class(class_name)?;
     let mut properties = canonical_new_instance_properties(class_name, properties)?;
+    for name in attributes.keys() {
+        super::ensure_settable_attribute_name(name)?;
+    }
     let mut attributes = attributes;
     for map in [&mut properties, &mut attributes] {
         let mut value = Value::Object(std::mem::take(map));
