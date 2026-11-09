@@ -2939,7 +2939,7 @@ pub(crate) fn convert_rojo_project(path: &Path) -> Result<ReniumProject> {
     if let Some(source_root) = tree_value.get("$path").and_then(Value::as_str) {
         project.source_root = PathBuf::from(source_root);
     }
-    project.root = convert_rojo_node_fields(tree_value, None)?;
+    project.root = convert_rojo_node_fields(tree_value, None, None)?;
     for (name, node) in tree_value {
         if name.starts_with('$') {
             continue;
@@ -2986,9 +2986,12 @@ fn normalize_rojo_node_value(
     }
 }
 
+/// `implied_class` is the class a node without `$className` has by its place
+/// in the tree; its `$properties` are typed by it.
 fn convert_rojo_node_fields(
     node: &Map<String, Value>,
     target: Option<&str>,
+    implied_class: Option<&str>,
 ) -> Result<ProjectNode> {
     let mut converted = ProjectNode {
         id: node.get("$id").and_then(Value::as_str).map(str::to_string),
@@ -3000,7 +3003,7 @@ fn convert_rojo_node_fields(
         ignore_unknown_instances: node.get("$ignoreUnknownInstances").and_then(Value::as_bool),
         ..ProjectNode::default()
     };
-    let class_name = converted.class_name.as_deref();
+    let class_name = converted.class_name.as_deref().or(implied_class);
     if let Some(properties) = node.get("$properties").and_then(Value::as_object) {
         for (name, value) in properties {
             if name == "Attributes"
@@ -3041,9 +3044,12 @@ fn convert_rojo_node(
     let node = value
         .as_object()
         .with_context(|| format!("Rojo tree node '{target}' must be an object"))?;
-    let mut converted = convert_rojo_node_fields(node, Some(target))?;
+    // A top-level node is the service of its name, as the projection reads it.
+    let container_class = engine_container_class(target);
+    let implied_class = container_class.or((!target.contains('.')).then_some(target));
+    let mut converted = convert_rojo_node_fields(node, Some(target), implied_class)?;
     if converted.class_name.is_none()
-        && let Some(class_name) = engine_container_class(target)
+        && let Some(class_name) = container_class
     {
         converted.class_name = Some(class_name.to_string());
     }

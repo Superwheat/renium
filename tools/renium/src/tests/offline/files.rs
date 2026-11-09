@@ -720,6 +720,57 @@ fn compare_place_reports_script_and_full_differences_against_the_project() {
     );
 }
 
+/// A place file holds SoundId as AudioContent, BrickColor as Color and so
+/// on; the store keeps the name the edit used.
+#[test]
+fn compare_place_matches_a_project_that_sets_properties_a_place_file_renames() {
+    let fx = Fixture::new("compare-renamed");
+    let root = fx.path("");
+    let project = fx.path("renium.project.jsonc");
+    let store = fx.store_arg("Workspace");
+    for (name, class, property) in [
+        ("Snd", "Sound", r#"SoundId="rbxassetid://5""#),
+        ("Wedge", "WedgePart", r#"BrickColor="Bright red""#),
+        ("Label", "ImageLabel", r#"Image="rbxassetid://6""#),
+        ("Sticker", "Decal", r#"Texture="rbxassetid://7""#),
+        ("Gui", "ScreenGui", "IgnoreGuiInset=true"),
+    ] {
+        fx.text(&["ba", "-f", &store, "-n", name, "-c", class, "-p", property])
+            .ok();
+    }
+    for file in ["build.rbxl", "build.rbxlx"] {
+        let place = fx.path(file);
+        fx.text(&["bep", "-r", &root, "-o", &place]).ok();
+        let compared = fx
+            .text(&["cmp", &place, "--full", "--all", "--project", &project])
+            .ok();
+        assert_eq!(compared["differences"], json!([]), "{file}");
+        assert_eq!(compared["unchanged"], json!(19), "{file}");
+    }
+    fx.text(&[
+        "bs",
+        "-f",
+        &store,
+        "Snd",
+        "-p",
+        "SoundId",
+        "--str",
+        "rbxassetid://9",
+    ])
+    .ok();
+    assert_eq!(
+        fx.text(&[
+            "cmp",
+            &fx.path("build.rbxl"),
+            "--full",
+            "--project",
+            &project
+        ])
+        .ok()["differences"],
+        json!(["changed Sound Workspace.Snd: AudioContent"])
+    );
+}
+
 #[test]
 fn compare_place_compares_two_files_in_either_format() {
     let fx = Fixture::new("compare-files");
@@ -1192,6 +1243,27 @@ fn import_place_into_an_existing_project_keeps_matching_identities() {
         fx.text(&["pi", &saved.to_string_lossy(), "-r", &root]).ok()["changedPaths"],
         json!([])
     );
+}
+
+#[test]
+fn import_place_leaves_no_discarded_stage_beside_the_project() {
+    let fx = Fixture::new("import-discard");
+    let saved = fx.root.join("saved.rbxl");
+    write_place_file(&saved, &sample_place_dom());
+    let saved_text = saved.to_string_lossy().into_owned();
+    // The stage is made beside the project, so the project gets a parent
+    // folder no other test writes to.
+    let project = fx.path("alone/project");
+    for _ in 0..2 {
+        fx.text(&["pi", &saved_text, "-r", &project]).ok();
+    }
+    // What the process does before it exits.
+    crate::system::files::wait_for_discards();
+    let beside = fs::read_dir(fx.root.join("alone"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(beside, ["project"]);
 }
 
 #[test]

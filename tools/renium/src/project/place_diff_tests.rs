@@ -721,7 +721,7 @@ fn project_diff_reports_nonserialized_properties_without_hiding_saved_physics() 
     )
     .unwrap();
     assert_eq!(diff(&saved, &saved_xml, &[])["matches"], true);
-    let omitted = omit_unsaved_project_properties(&mut project).unwrap();
+    let omitted = project_properties_as_saved(&mut project).unwrap();
     assert_eq!(
         omitted,
         BTreeMap::from([("CollisionFidelity".to_string(), 1)])

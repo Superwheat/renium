@@ -890,6 +890,21 @@ fn stage_module_data(
     )
 }
 
+/// The class and properties of a node made on the way to a deeper target.
+/// The service's document can predate the files staged since it was written,
+/// so a directory staged with an init script is that script here, as it is in
+/// a document read from the staged files.
+fn staged_directory_instance(directory: &Path) -> Result<(String, Map<String, Value>)> {
+    if !directory.is_dir() {
+        return Ok(("Folder".to_string(), Map::new()));
+    }
+    crate::rbx::model::source_directory_instance(
+        directory,
+        &super::cached_script_naming(directory),
+        true,
+    )
+}
+
 fn update_stage_instance(
     stage: &Path,
     target: &[String],
@@ -983,12 +998,18 @@ fn update_stage_instance(
                 projection_settings_id("folder", &identity)
             };
             let index = document.instances.len();
-            document.instances.push(SettingsBytecodeInstance::new(
+            let mut created = SettingsBytecodeInstance::new(
                 settings_id,
                 name.clone(),
                 expected_class.to_string(),
                 Some(parent_index),
-            ));
+            );
+            // The directory named after the target is the first sibling's.
+            if !final_node && selected == 1 {
+                (created.class_name, created.properties) =
+                    staged_directory_instance(&target_fs_path(stage, &target[..=position]))?;
+            }
+            document.instances.push(created);
             children_by_parent.push(Vec::new());
             children_by_parent[parent_index].push(index);
             index
@@ -1006,6 +1027,21 @@ fn update_stage_instance(
         );
     }
     instance.properties.extend(properties.clone());
+    // A place file saves neither Position nor Orientation: both are read
+    // from the CFrame, so a node that gives them sets the CFrame.
+    if (properties.contains_key("Position") || properties.contains_key("Orientation"))
+        && crate::bytecode::edit::has_cframe(&instance.class_name)
+    {
+        let position = instance.properties.remove("Position");
+        let orientation = instance.properties.remove("Orientation");
+        let cframe = crate::bytecode::edit::cframe_from_parts(
+            instance.properties.get("CFrame"),
+            position.as_ref(),
+            orientation.as_ref(),
+        )
+        .with_context(|| format!("Invalid placement of '{}'", target.join(".")))?;
+        instance.properties.insert("CFrame".to_string(), cframe);
+    }
     instance.attributes.extend(attributes.clone());
     if let Some(tags) = tags {
         if tags.is_empty() {

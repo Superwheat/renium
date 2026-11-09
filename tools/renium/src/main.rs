@@ -90,7 +90,9 @@ use cli::{Cli, Commands};
 use studio::target::set_place_filter;
 
 fn main() -> ExitCode {
-    main_result()
+    let code = main_result();
+    system::files::wait_for_discards();
+    code
 }
 
 fn main_result() -> ExitCode {

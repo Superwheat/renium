@@ -203,11 +203,14 @@ use crate::system::text::normalized_source_bytes;
 #[path = "place_diff_tests.rs"]
 mod tests;
 
-/// The project DOM also carries native-setter properties that have no RBXL
-/// representation. Report that boundary instead of treating them as deletions.
-pub(super) fn omit_unsaved_project_properties(
-    dom: &mut WeakDom,
-) -> Result<BTreeMap<String, usize>> {
+/// Leaves the project DOM with the properties a place file written from it
+/// holds. Native-setter properties with no RBXL representation go, and are
+/// counted so the report names that boundary instead of calling them
+/// deletions. A property Roblox replaced moves to its successor as the
+/// writer moves it (a Sound's SoundId to AudioContent, BrickColor to Color);
+/// a successor the instance already carries wins.
+pub(super) fn project_properties_as_saved(dom: &mut WeakDom) -> Result<BTreeMap<String, usize>> {
+    use rbx_reflection::{PropertyKind, PropertySerialization};
     let database = rbx_reflection_database::get()?;
     let mut omitted = BTreeMap::new();
     let refs = dom
@@ -216,21 +219,37 @@ pub(super) fn omit_unsaved_project_properties(
         .collect::<Vec<_>>();
     for id in refs {
         let node = dom.get_by_ref_mut(id).unwrap();
-        node.properties.retain(|name, _| {
-            let unsaved = rbx_property_descriptor(database, node.class.as_str(), name.as_str())
-                .is_some_and(|property| {
-                    matches!(
-                        property.kind,
-                        rbx_reflection::PropertyKind::Canonical {
-                            serialization: rbx_reflection::PropertySerialization::DoesNotSerialize
-                        }
-                    )
-                });
-            if unsaved {
-                *omitted.entry(name.to_string()).or_default() += 1;
+        let mut migrated = Vec::new();
+        node.properties.retain(|name, value| {
+            let Some(PropertyKind::Canonical { serialization }) =
+                rbx_property_descriptor(database, node.class.as_str(), name.as_str())
+                    .map(|property| &property.kind)
+            else {
+                return true;
+            };
+            match serialization {
+                PropertySerialization::DoesNotSerialize => {
+                    *omitted.entry(name.to_string()).or_default() += 1;
+                    false
+                }
+                PropertySerialization::Migrate(migration) => match migration.perform(value) {
+                    Ok(value) => {
+                        migrated.push((migration.new_property_names(), value));
+                        false
+                    }
+                    // A value the migration rejects stays under its own name.
+                    Err(_) => true,
+                },
+                _ => true,
             }
-            !unsaved
         });
+        for (names, value) in migrated {
+            for name in names {
+                node.properties
+                    .entry(rbx_dom_weak::Ustr::from(name))
+                    .or_insert_with(|| value.clone());
+            }
+        }
     }
     Ok(omitted)
 }

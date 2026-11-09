@@ -135,6 +135,9 @@ fn write_indent_or_space(output: &mut String, depth: usize, line_start: &mut boo
 }
 
 fn tokenize(text: &str) -> Result<Vec<Token>> {
+    // A leading byte order mark (Windows PowerShell 5.1 writes one with
+    // `-Encoding utf8`) marks the file's encoding and is not part of its JSON.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let chars = text.chars().collect::<Vec<_>>();
     let mut tokens = Vec::new();
     let mut index = 0usize;

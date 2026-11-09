@@ -334,6 +334,234 @@ fn fmt_keeps_comments_and_the_values_after_them_at_their_depth() {
     }
 }
 
+/// Windows PowerShell 5.1 writes a byte order mark with
+/// `Set-Content -Encoding utf8`.
+#[test]
+fn project_file_with_a_byte_order_mark_loads_and_formats_without_it() {
+    let fx = Fixture::new("project-bom");
+    let project = fx.path("renium.project.jsonc");
+    fs::write(
+        &project,
+        "\u{feff}{\n  // rules\n  \"schemaVersion\": 1\n}\n",
+    )
+    .unwrap();
+    let validated = fx.text(&["pv", "--project", &project]);
+    assert_eq!(validated.error, None);
+    assert_eq!(validated.stdout, "Validated <root>/renium.project.jsonc\n");
+    assert_eq!(
+        fx.both(&["tr", "Workspace", "--depth", "1", "-r", &fx.path("")])[0]["id"],
+        json!("ws")
+    );
+    assert_eq!(
+        fx.text(&["fmt", "--check", &project]).err(),
+        "<root>/renium.project.jsonc is not formatted"
+    );
+    assert_eq!(fx.text(&["fmt", &project]).error, None);
+    assert_eq!(
+        fs::read_to_string(&project).unwrap(),
+        "{\n  // rules\n  \"schemaVersion\": 1\n}\n"
+    );
+    fs::write(&project, "\u{feff}{\"schemaVersion\":1}").unwrap();
+    assert_eq!(fx.text(&["fmt", &project]).error, None);
+    assert_eq!(
+        fs::read_to_string(&project).unwrap(),
+        "{\n  \"schemaVersion\": 1\n}\n"
+    );
+}
+
+/// An empty project folder, for projects a test writes itself.
+fn empty_folder(tag: &str) -> Fixture {
+    Fixture {
+        root: temp_dir(&format!("offline-{tag}")),
+    }
+}
+
+fn write_files(fx: &Fixture, files: &[(&str, &str)]) {
+    for (relative, content) in files {
+        let path = fx.root.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+}
+
+/// Builds the project into a place and returns the one instance named `name`
+/// with the properties asked for.
+fn built_instance(fx: &Fixture, name: &str, props: &str) -> Value {
+    let place = fx.path("built.rbxl");
+    fx.text(&[
+        "build",
+        "--project",
+        &fx.path("renium.project.jsonc"),
+        "-o",
+        &place,
+    ])
+    .ok();
+    let found = fx.json(&["q", &place, "-n", name, "--props", props]).ok();
+    let matches = found["matches"].as_array().unwrap();
+    assert_eq!(matches.len(), 1, "{found}");
+    matches[0].clone()
+}
+
+/// The place project `rojo init` writes.
+const ROJO_PLACE_PROJECT: &str = r#"{
+  "name": "stock",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "Shared": { "$path": "src/shared" }
+    },
+    "ServerScriptService": {
+      "Server": { "$path": "src/server" }
+    },
+    "StarterPlayer": {
+      "StarterPlayerScripts": {
+        "Client": { "$path": "src/client" }
+      }
+    },
+    "Workspace": {
+      "$properties": { "FilteringEnabled": true },
+      "Baseplate": {
+        "$className": "Part",
+        "$properties": {
+          "Anchored": true,
+          "Color": [0.38823, 0.37254, 0.38823],
+          "Locked": true,
+          "Position": [0, -10, 0],
+          "Size": [512, 20, 512]
+        }
+      }
+    },
+    "Lighting": {
+      "$properties": {
+        "Ambient": [0, 0, 0],
+        "Brightness": 2,
+        "GlobalShadows": true,
+        "Outlines": false,
+        "Technology": "Voxel"
+      }
+    },
+    "SoundService": {
+      "$properties": { "RespectFilteringEnabled": true }
+    }
+  }
+}
+"#;
+
+#[test]
+fn import_rojo_and_init_convert_the_stock_rojo_place_project() {
+    let fx = empty_folder("rojo-stock");
+    write_files(
+        &fx,
+        &[
+            ("default.project.json", ROJO_PLACE_PROJECT),
+            ("src/server/init.server.luau", "print('server')\n"),
+            ("src/client/init.client.luau", "print('client')\n"),
+            ("src/shared/Hello.luau", "return {}\n"),
+        ],
+    );
+    let preview = fx.text(&["ir", &fx.path(""), "--preview"]);
+    assert_eq!(preview.error, None);
+    let converted: Value = serde_json::from_str(&preview.stdout).unwrap();
+    assert_eq!(
+        converted["tree"]["Lighting"]["$properties"],
+        json!({
+            "Ambient": {"_type": "Color3", "r": 0.0, "g": 0.0, "b": 0.0},
+            "Brightness": 2.0,
+            "GlobalShadows": true,
+            "Outlines": false,
+            "Technology": {"_type": "EnumItem", "enumType": "Enum.Technology", "name": "Voxel", "value": 1},
+        })
+    );
+    assert_eq!(converted["tree"]["Lighting"].get("$className"), None);
+    fx.text(&["init", &fx.path("")]).ok();
+    assert_eq!(
+        built_instance(&fx, "Baseplate", "Anchored,CFrame,Size")["props"],
+        json!({
+            "Anchored": true,
+            "CFrame": {"_type": "CFrame", "components": [0.0, -10.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]},
+            "Size": {"_type": "Vector3", "x": 512.0, "y": 20.0, "z": 512.0},
+        })
+    );
+    assert_eq!(
+        built_instance(&fx, "Lighting", "Ambient,Technology")["props"],
+        json!({
+            "Ambient": {"_type": "Color3", "r": 0.0, "g": 0.0, "b": 0.0},
+            "Technology": "Enum.Technology.Voxel",
+        })
+    );
+    let server = built_instance(&fx, "Server", "Source");
+    assert_eq!(server["className"], json!("Script"));
+    assert_eq!(server["props"], json!({"Source": "print('server')\n"}));
+}
+
+#[test]
+fn build_keeps_an_init_script_folder_that_also_holds_an_adapter_file() {
+    let fx = empty_folder("build-init-adapter");
+    write_files(
+        &fx,
+        &[
+            (
+                "default.project.json",
+                r#"{"name": "p", "tree": {"$className": "DataModel", "ReplicatedStorage": {
+                    "Config": {"$className": "Folder"},
+                    "Shared": {"$path": "src/shared"}
+                }}}"#,
+            ),
+            ("src/shared/init.luau", "return {}\n"),
+            ("src/shared/Note.txt", "hello"),
+        ],
+    );
+    fx.text(&["ir", &fx.path(""), "--apply"]).ok();
+    let shared = built_instance(&fx, "Shared", "Source");
+    assert_eq!(shared["className"], json!("ModuleScript"));
+    assert_eq!(shared["props"], json!({"Source": "return {}\n"}));
+    let note = built_instance(&fx, "Note", "Value");
+    assert_eq!(note["className"], json!("StringValue"));
+    assert_eq!(note["path"], json!(["ReplicatedStorage", "Shared", "Note"]));
+    assert_eq!(note["props"], json!({"Value": "hello"}));
+}
+
+#[test]
+fn build_places_a_part_by_the_position_and_orientation_of_its_tree_node_or_sidecar() {
+    let fx = empty_folder("build-position");
+    write_files(
+        &fx,
+        &[
+            (
+                "renium.project.jsonc",
+                r#"{"schemaVersion": 1, "tree": {"Workspace": {
+                    "Pad": {"$className": "Part", "$properties": {
+                        "Anchored": true, "Position": [0, 5, 0], "Orientation": [0, 90, 0]
+                    }},
+                    "Sign": {"$className": "Part", "$properties": {
+                        "CFrame": {"position": [1, 2, 3], "orientation": [0, 90, 0]},
+                        "Position": [4, 5, 6]
+                    }}
+                }}}"#,
+            ),
+            (
+                "src/Workspace/Block.meta.json",
+                r#"{"className": "Part", "properties": {"Position": [7, 8, 9]}}"#,
+            ),
+        ],
+    );
+    let placed =
+        |name: &str| built_instance(&fx, name, "CFrame")["props"]["CFrame"]["components"].clone();
+    // A quarter turn about Y after the position.
+    assert_eq!(
+        placed("Pad"),
+        json!([0.0, 5.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, -1.0, 0.0, 0.0])
+    );
+    assert_eq!(
+        placed("Sign"),
+        json!([4.0, 5.0, 6.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, -1.0, 0.0, 0.0])
+    );
+    assert_eq!(
+        placed("Block"),
+        json!([7.0, 8.0, 9.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0])
+    );
+}
+
 fn fixture_sourcemap(root_name: &str, absolute: bool) -> Value {
     let file = |relative: &str| {
         if absolute {

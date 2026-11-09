@@ -589,7 +589,7 @@ pub(crate) fn compare_place(mut args: ComparePlaceArgs, project: Option<&Path>) 
     if args.full {
         let (not_serialized, unsaved_instances, unsaved_service) = if args.against.is_none() {
             (
-                super::place_diff::omit_unsaved_project_properties(&mut project_dom)?,
+                super::place_diff::project_properties_as_saved(&mut project_dom)?,
                 super::place_diff::omit_unsaved_project_instances(&mut project_dom),
                 super::place_diff::omit_unsaved_service_properties(&mut place_dom)?,
             )

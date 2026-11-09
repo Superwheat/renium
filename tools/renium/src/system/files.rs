@@ -2,7 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread::JoinHandle;
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -12,6 +14,7 @@ use sha2::{Digest, Sha256};
 
 use crate::app::timing::current_millis;
 use crate::daemon::is_process_alive;
+use crate::system::LockRecover;
 
 pub(crate) const SERVICE_SETTINGS_FILE_NAME: &str = "__roblox_sync_settings.renium";
 
@@ -118,10 +121,13 @@ pub(crate) fn create_unique_directory(parent: &Path, prefix: &str) -> Result<Pat
 
 const TRASH_PREFIX: &str = ".renium-trash-";
 
+/// The deletions `discard_directory` started that may still be running.
+static PENDING_DISCARDS: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
+
 /// Removes a directory tree without making the caller wait for it. The tree is
 /// renamed aside, which is instant on one volume, and deleted on a background
 /// thread: with antivirus scanning, deleting a staged copy of a large project
-/// takes seconds on Windows. Trees left by processes that exited before their
+/// takes seconds on Windows. Trees left by processes that died before their
 /// deletion finished are swept here too.
 pub(crate) fn discard_directory(path: &Path) {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -147,8 +153,25 @@ pub(crate) fn discard_directory(path: &Path) {
             let _ = fs::remove_dir_all(&background_target);
             sweep_abandoned_trash(&parent);
         });
-    if spawned.is_err() {
-        let _ = fs::remove_dir_all(&target);
+    match spawned {
+        Ok(handle) => {
+            let mut pending = PENDING_DISCARDS.lock_recover();
+            pending.retain(|running| !running.is_finished());
+            pending.push(handle);
+        }
+        Err(_) => {
+            let _ = fs::remove_dir_all(&target);
+        }
+    }
+}
+
+/// Waits for the deletions `discard_directory` started. The process calls
+/// this before it exits: exiting stops the background threads, and a tree
+/// they had not finished deleting would stay on disk.
+pub(crate) fn wait_for_discards() {
+    let pending = std::mem::take(&mut *PENDING_DISCARDS.lock_recover());
+    for handle in pending {
+        let _ = handle.join();
     }
 }
 

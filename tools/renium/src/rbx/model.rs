@@ -858,6 +858,60 @@ struct SourceSettingsOptions<'a> {
     include_source: bool,
 }
 
+/// The class and properties a source directory has as an instance: those of
+/// the script in its init file (with the file's text when `include_source`),
+/// or a Folder's.
+pub(crate) fn source_directory_instance(
+    directory: &Path,
+    naming: &config::ProjectScriptNaming,
+    include_source: bool,
+) -> Result<(String, Map<String, Value>)> {
+    let mut init_sources = Vec::new();
+    for child in fs::read_dir(directory)? {
+        let child = child?;
+        let child_type = child.file_type()?;
+        if child_type.is_symlink() {
+            bail!(
+                "Source-only projects cannot contain symlinks: {}",
+                child.path().display()
+            );
+        }
+        if !child_type.is_file() {
+            continue;
+        }
+        let name = child.file_name().to_string_lossy().into_owned();
+        if let Some((class_name, None, run_context)) = infer_source_script(&name, naming) {
+            init_sources.push((child.path(), class_name, run_context));
+        }
+    }
+    let [(source_path, class_name, run_context)] = init_sources.as_slice() else {
+        if init_sources.is_empty() {
+            return Ok(("Folder".to_string(), Map::new()));
+        }
+        bail!(
+            "{} contains more than one init source file",
+            directory.display()
+        );
+    };
+    let mut properties = Map::new();
+    if include_source {
+        properties.insert(
+            "Source".to_string(),
+            Value::String(
+                fs::read_to_string(source_path)
+                    .with_context(|| format!("{} is not valid UTF-8", source_path.display()))?,
+            ),
+        );
+    }
+    if let Some(run_context) = run_context {
+        properties.insert(
+            "RunContext".to_string(),
+            editor_run_context_value(run_context),
+        );
+    }
+    Ok(((*class_name).to_string(), properties))
+}
+
 fn append_source_only_children(
     document: &mut SettingsBytecode,
     directory: &Path,
@@ -903,54 +957,9 @@ fn append_source_only_children(
             );
         }
         if file_type.is_dir() {
-            let mut init_sources = Vec::new();
-            for child in fs::read_dir(&path)? {
-                let child = child?;
-                let child_type = child.file_type()?;
-                if child_type.is_symlink() {
-                    bail!(
-                        "Source-only projects cannot contain symlinks: {}",
-                        child.path().display()
-                    );
-                }
-                if !child_type.is_file() {
-                    continue;
-                }
-                let name = child.file_name().to_string_lossy().into_owned();
-                if let Some((class_name, None, run_context)) =
-                    infer_source_script(&name, &resolved_naming)
-                {
-                    init_sources.push((child.path(), name, class_name, run_context));
-                }
-            }
-            init_sources.sort_by(|left, right| left.1.cmp(&right.1));
-            if init_sources.len() > 1 {
-                bail!("{} contains more than one init source file", path.display());
-            }
             let child_path_key = format!("{path_key}/{file_name}");
             let (class_name, properties) =
-                if let Some((source_path, _source_name, class_name, run_context)) =
-                    init_sources.first()
-                {
-                    let mut properties = Map::new();
-                    if options.include_source {
-                        properties.insert(
-                            "Source".to_string(),
-                            Value::String(fs::read_to_string(source_path).with_context(|| {
-                                format!("{} is not valid UTF-8", source_path.display())
-                            })?),
-                        );
-                    }
-                    if let Some(run_context) = run_context {
-                        properties.insert(
-                            "RunContext".to_string(),
-                            editor_run_context_value(run_context),
-                        );
-                    }
-                    ((*class_name).to_string(), properties)
-                } else {
-                    ("Folder".to_string(), Map::new())
-                };
+                source_directory_instance(&path, &resolved_naming, options.include_source)?;
             let index = document.instances.len();
             document.instances.push(SettingsBytecodeInstance {
                 settings_id: source_projection_settings_id(service, &child_path_key, &class_name),

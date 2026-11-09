@@ -215,7 +215,9 @@ function readObject(filePath: string): SharedConfig {
   if (!fs.existsSync(filePath)) {
     return {};
   }
-  const text = fs.readFileSync(filePath, "utf8");
+  // Windows PowerShell's `Set-Content -Encoding utf8` starts the file with a
+  // byte order mark, which JSON.parse refuses.
+  const text = fs.readFileSync(filePath, "utf8").replace(/^\uFEFF/, "");
   const parsed = JSON.parse(stripJsonc(text)) as unknown;
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error(`${filePath} must contain a JSON object`);

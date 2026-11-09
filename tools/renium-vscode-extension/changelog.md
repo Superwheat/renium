@@ -74,6 +74,12 @@
 - Setting an enum property to a number that is no item of the enum (`-p Material=99999`) was stored and built into the place; it is now refused like an unknown item name.
 - `rbx bss`, `rbx br`, `rbx ba`, `rbx bcl` and batch add, clone, remove and move ops could change a read-only link package and leave it drifted; they are now refused like `rbx bs`, and `--override-packages` allows them on purpose.
 - `rbx fmt` put a stray space before a leading comment and before the value after a block comment, and `fmt --check` accepted that; both now use the plain indent.
+- A `renium.project.jsonc` saved with a UTF-8 byte order mark, as Windows PowerShell's `Set-Content -Encoding utf8` writes it, failed in the CLI with "Invalid JSONC ... expected value at line 1 column 1" and in the extension; both read it now, and `rbx fmt` removes the mark.
+- `rbx pi` and `rbx rev --sync` left `.renium-trash-...` copies of the project beside it; the command now finishes deleting them before it exits.
+- `rbx ir` and `rbx init` refused the project `rojo init` creates ("Invalid property 'Ambient' ..."); service properties without `$className` are now converted.
+- `rbx build` turned a folder with `init.luau` into a plain Folder and dropped its source when the folder also held a `.txt` or `.json` file and an earlier tree node came first; it is now built as the script.
+- `rbx build` ignored `Position` and `Orientation` set in a project tree node or `.meta.json` and left the part at the origin; both now place the part.
+- `rbx cmp PLACE --full` reported changes on a place just built from the project for properties Roblox renamed (SoundId/AudioContent, BrickColor/Color, Image/ImageContent); they now compare equal.
 
 ## 0.5.9 - 2026-11-06
 

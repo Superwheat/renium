@@ -54,6 +54,16 @@ test("shared config accepts comments and trailing commas without changing string
   }
 });
 
+test("shared config reads a project file that starts with a byte order mark", () => {
+  const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "renium-jsonc-bom-"));
+  fs.writeFileSync(path.join(projectRoot, "renium.project.jsonc"), "\uFEFF{\"sourceRoot\": \"game\"}\n", "utf8");
+  try {
+    assert.equal(loadProjectSourceRoot(projectRoot), "game");
+  } finally {
+    fs.rmSync(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test("shared config reports unterminated strings and block comments consistently", () => {
   for (const text of [
     "{\"sourceRoot\": \"src}",
