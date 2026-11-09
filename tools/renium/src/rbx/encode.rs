@@ -1610,12 +1610,15 @@ impl ScalarType {
     /// the place build and every push. The two conversions are the ones
     /// Studio's own setters make: a number becomes the text of a string
     /// property, and a string that is one finite number becomes the number
-    /// of a number property.
+    /// of a number property. A typed number (`{"_type":"Int64","value":5}`)
+    /// and a wrapped string (`{"String":"text"}`), which a place build reads
+    /// as well, are stored as the number or the string they hold.
     fn stored(self, value: &Value) -> Option<Value> {
         let number = || match value {
-            Value::Number(_) => Some(value.clone()),
             Value::String(text) => number_from_text(text),
-            _ => None,
+            _ => Some(typed_number(value))
+                .filter(|number| number.is_number())
+                .cloned(),
         };
         match self {
             Self::Bool => value.is_boolean().then(|| value.clone()),
@@ -1626,12 +1629,11 @@ impl ScalarType {
                 number().or_else(|| nonfinite_float_from_json(value).map(json_number_f64))
             }
             Self::String => match value {
-                Value::String(_) => Some(value.clone()),
                 Value::Number(number) => Some(Value::String(match number.as_f64() {
                     Some(float) if number.is_f64() => float.to_string(),
                     _ => number.to_string(),
                 })),
-                _ => None,
+                _ => json_string_or_wrapped(value, "String").map(Value::from),
             },
         }
     }
@@ -2815,6 +2817,92 @@ mod tests {
             );
         }
         assert_eq!(stored("NumberValue", Value::Null), Ok(Value::Null));
+    }
+
+    #[test]
+    fn typed_scalar_forms_store_the_value_they_hold() {
+        let stored = |class: &str, property: &str, value: Value| {
+            typed_store_property_value(class, property, value).map_err(|error| error.to_string())
+        };
+        let whole = stored("IntValue", "Value", json!({"_type": "Int64", "value": 5})).unwrap();
+        assert!(whole.is_i64() && whole == json!(5), "{whole}");
+        assert_eq!(
+            stored(
+                "IntValue",
+                "Value",
+                json!({"_type": "Int64", "value": 9_007_199_254_740_993_i64})
+            ),
+            Ok(json!(9_007_199_254_740_993_i64))
+        );
+        assert_eq!(
+            stored("TextLabel", "ZIndex", json!({"_type": "Int32", "value": 3})),
+            Ok(json!(3))
+        );
+        for fraction in [0.5, 0.1] {
+            assert_eq!(
+                stored(
+                    "Part",
+                    "Transparency",
+                    json!({"_type": "Float32", "value": fraction})
+                ),
+                Ok(json!(fraction))
+            );
+            assert_eq!(
+                stored(
+                    "NumberValue",
+                    "Value",
+                    json!({"_type": "Float64", "value": fraction})
+                ),
+                Ok(json!(fraction))
+            );
+        }
+        for wrapped in [
+            json!({"String": "text"}),
+            json!({"_type": "String", "value": "text"}),
+        ] {
+            assert_eq!(stored("StringValue", "Value", wrapped), Ok(json!("text")));
+        }
+
+        for (class, property, refused, needs) in [
+            (
+                "IntValue",
+                "Value",
+                json!({"_type": "Float32", "value": 2.5}),
+                "a whole number, got {}; for example `-p Value=5`",
+            ),
+            (
+                "TextLabel",
+                "ZIndex",
+                json!({"_type": "Int64", "value": 3_000_000_000_i64}),
+                "a whole number that fits 32 bits, got {}; for example `-p ZIndex=5`",
+            ),
+            (
+                "NumberValue",
+                "Value",
+                json!({"_type": "Float32", "value": "0.5"}),
+                "a number, got {}; for example `-p Value=0.5`",
+            ),
+            (
+                "StringValue",
+                "Value",
+                json!({"String": true}),
+                "a string, got {}; for example `-p 'Value=\"text\"'`",
+            ),
+            (
+                "BoolValue",
+                "Value",
+                json!({"_type": "Bool", "value": true}),
+                "true or false, got {}; for example `-p Value=true`",
+            ),
+        ] {
+            assert_eq!(
+                stored(class, property, refused.clone()),
+                Err(format!(
+                    "{property} needs {}",
+                    needs.replace("{}", &refused.to_string())
+                ))
+            );
+        }
     }
 
     #[test]
