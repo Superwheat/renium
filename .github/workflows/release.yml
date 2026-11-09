@@ -234,6 +234,22 @@ jobs:
           }
           "RENIUM_ARCHIVE=$archive" >> $env:GITHUB_ENV
 
+      # Only the Linux x64 build runs the tests, so the other builds this
+      # machine can execute are at least started once, from the file that
+      # went into the archive. Cross-compiled builds have no machine here to
+      # run on.
+      - name: Start the packaged CLI
+        if: ${{ !matrix.target }}
+        shell: pwsh
+        run: |
+          $version = "${{ needs.verify-tag.outputs.version }}"
+          $stage = Join-Path $env:RUNNER_TEMP "renium-$version-${{ matrix.platform }}"
+          $binary = Join-Path $stage $(if ("${{ runner.os }}" -eq "Windows") { "renium.exe" } else { "renium" })
+          $reported = (& $binary --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "The packaged CLI exited with $LASTEXITCODE" }
+          if ($reported -ne "renium $version") { throw "The packaged CLI reports '$reported', not 'renium $version'" }
+          "The packaged CLI starts and reports $reported"
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
@@ -430,9 +446,16 @@ jobs:
         with:
           subject-path: ${{ env.RENIUM_EXTENSIONS_DIR }}/*.vsix
 
+  # The live matrix runs last, once everything else is built and green, so
+  # it has the maintainer's machine to itself; nothing publishes without it.
+  scenarios:
+    name: Scenario matrix
+    needs: [verify-tag, quality, cli, integration, extensions]
+    uses: ./.github/workflows/scenarios.yml
+
   publish:
     name: Publish GitHub release
-    needs: [verify-tag, quality, cli, integration, extensions]
+    needs: [verify-tag, quality, cli, integration, extensions, scenarios]
     runs-on: ["self-hosted", "Linux", "X64"]
     env:
       VSCE_PAT: ${{ secrets.VSCE_PAT }}

@@ -1,0 +1,115 @@
+name: Scenario matrix
+
+# The live scenario matrix: every row drives the Renium installed on the
+# maintainer's runner against scratch copies of the fixture places in real
+# Studios, several Studios at once. The Release workflow calls it before it
+# publishes, and it can be started by hand for any commit or selection.
+on:
+  workflow_call:
+    inputs:
+      only:
+        type: string
+        default: ""
+      area:
+        type: string
+        default: ""
+      shards:
+        type: string
+        default: "4"
+  workflow_dispatch:
+    inputs:
+      only:
+        description: Comma-separated scenario ids; empty runs every row
+        type: string
+        default: ""
+      area:
+        description: One area (sync, sync_live, play, lifecycle, links, plugins, ...); empty runs all
+        type: string
+        default: ""
+      shards:
+        description: Studios to run at once
+        type: string
+        default: "4"
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Live scenarios (Windows)
+    # The fixtures, the signed-in Studio and the installed Renium live on the
+    # maintainer's Windows machine.
+    runs-on: ["self-hosted", "Windows", "X64"]
+    timeout-minutes: 150
+    # The Studios of two matrix runs would take each other's slots.
+    concurrency:
+      group: scenario-matrix-windows
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          clean: false
+
+      # The rows drive the Renium installed on this machine, so a green run
+      # only speaks for this commit when the installed build is this commit:
+      # the CLI by the commit it was built from, the Studio plugin by its
+      # bytes (a plugin build is reproducible).
+      - name: Check that the installed Renium is this commit
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $rbx = Join-Path $env:LOCALAPPDATA "Renium\bin\rbx.exe"
+          if (-not (Test-Path -LiteralPath $rbx -PathType Leaf)) { throw "Renium is not installed on this runner" }
+          $head = git rev-parse --short=12 HEAD
+          $doctor = & $rbx dr --json --root $env:RUNNER_TEMP | ConvertFrom-Json
+          if ($doctor.gitHash -ne $head) {
+            throw "The installed Renium was built from $($doctor.gitHash), not from $head. Build and install this commit on the runner, then run this job again."
+          }
+          $built = Join-Path $env:RUNNER_TEMP "Renium-scenarios.rbxm"
+          rojo build tools/plugin_ws_bridge/Renium.project.json --output $built
+          $expected = (Get-FileHash -LiteralPath $built -Algorithm SHA256).Hash.ToLowerInvariant()
+          $status = & $rbx --output-mode json setup --status | ConvertFrom-Json
+          if ($status.installedSha256 -ne $expected) {
+            throw "The Studio plugin installed on this runner is not the plugin of $head. Install this commit's plugin (rbx setup --repair --file Renium.rbxm), then run this job again."
+          }
+          "Installed Renium $($doctor.version) is commit $head, CLI and Studio plugin"
+
+      # Jobs run with a home and a temp folder of the runner's own. The rows
+      # are written against the profile a user has, the one Studio itself
+      # reads, so this step runs in it. --brief keeps the logs, the failure
+      # reasons and every path in them in the reports folder on the runner;
+      # the job log carries row ids and outcomes only.
+      - name: Run the matrix
+        env:
+          SCENARIO_ONLY: ${{ inputs.only }}
+          SCENARIO_AREA: ${{ inputs.area }}
+          SCENARIO_SHARDS: ${{ inputs.shards }}
+        run: |
+          $userProfile = [Environment]::GetFolderPath("UserProfile")
+          $env:USERPROFILE = $userProfile
+          $env:HOME = $userProfile
+          $env:HOMEDRIVE = $userProfile.Substring(0, 2)
+          $env:HOMEPATH = $userProfile.Substring(2)
+          $env:TEMP = Join-Path $env:LOCALAPPDATA "Temp"
+          $env:TMP = $env:TEMP
+          $bin = Join-Path $env:LOCALAPPDATA "Renium\bin"
+          $env:PATH = "$bin;$env:PATH"
+          $env:RENIUM_SCENARIO_RBX = Join-Path $bin "rbx.exe"
+          $arguments = @("--parallel", $env:SCENARIO_SHARDS, "--rerun-failed", "--brief")
+          if ($env:SCENARIO_ONLY) { $arguments += @("--only", $env:SCENARIO_ONLY) }
+          if ($env:SCENARIO_AREA) { $arguments += @("--area", $env:SCENARIO_AREA) }
+          python -I tools/renium/scenarios/run.py @arguments
+          if ($LASTEXITCODE -ne 0) {
+            throw "The scenario matrix did not pass. The report named above, in the scenario-reports folder on the runner, has the reason for every row."
+          }
+
+      # A run that timed out or was canceled leaves its Studios and shard
+      # daemons running; only Studios on scratch places are closed.
+      - name: Close what a cut-short run left open
+        if: always()
+        run: |
+          $bin = Join-Path $env:LOCALAPPDATA "Renium\bin"
+          $env:RENIUM_SCENARIO_RBX = Join-Path $bin "rbx.exe"
+          python -I tools/renium/scenarios/run.py --cleanup
