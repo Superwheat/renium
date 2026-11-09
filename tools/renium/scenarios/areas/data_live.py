@@ -626,46 +626,51 @@ def _await_review(ctx: Context, decision: str, seconds: float) -> bool:
     return False
 
 
+def _expect_held(ctx: Context, answer, what: str):
+    """The result of an edit over the threshold: nothing applied, the change list and the next step."""
+    ctx.expect(answer.get("heldForReview") is True and answer.get("changed") is False, f"{what} over the threshold: {answer.json}")
+    ctx.expect(isinstance(answer.get("review"), list) and len(answer.get("review")) >= 1, f"{what} carries its change list: {answer.json}")
+    ctx.expect("--yes" in str(answer.get("next")), f"{what} names the next step: {answer.json}")
+
+
 def held_del_applied_by_rv(ctx: Context):
-    """DATA-040, DATA-048 (D4): an unapproved del above the threshold is held for review; rv apply lets it through and
-    the caller's stderr carries the hold notice."""
+    """DATA-040, DATA-048: a del over the threshold applies nothing and answers heldForReview with its change list;
+    the same del with --yes removes the instance."""
     with _review_threshold_zero(ctx):
-        process, out, err = _detached(ctx, "del", "del", *SIGN)
-        held = _await_review(ctx, "apply", 60)
-        result = _finished(ctx, process, out, err)
-        ctx.expect(held, f"no review appeared for del: {result}")
-        ctx.expect((result["json"] or {}).get("changed") is True, f"del after rv apply: {result['json']}")
+        held = ctx.rbx("del", *SIGN, timeout=60)
+        _expect_held(ctx, held, "del")
+        ctx.expect(_sign(ctx) is not None, "Sign kept while the del is held")
+        applied = ctx.rbx("del", *SIGN, "--yes", timeout=60)
+        ctx.expect(applied.get("changed") is True, f"del --yes: {applied.json}")
         ctx.expect(ctx.luau("return workspace.Props:FindFirstChild('Sign') == nil") is True, "Sign gone")
-        ctx.expect("held for review in Studio" in result["stderr"], f"the hold notice never reached the caller (D4): stderr {result['stderr'][:300]!r}")
 
 
 def held_del_skipped_by_rv(ctx: Context):
-    """DATA-041 (D2): rv skip keeps the instance and del says the review skipped it."""
+    """DATA-041: a held del names the instance it would remove and leaves no review open in Studio."""
     with _review_threshold_zero(ctx):
-        process, out, err = _detached(ctx, "del", "del", *SIGN)
-        held = _await_review(ctx, "skip", 60)
-        result = _finished(ctx, process, out, err)
-        ctx.expect(held, f"no review appeared for del: {result}")
+        held = ctx.rbx("del", *SIGN, timeout=60)
+        _expect_held(ctx, held, "del")
+        ctx.expect("Sign" in json.dumps(held.get("review")), f"the change list names Sign: {held.json}")
+        ctx.expect(held.get("reviewThreshold") == 0, f"the result carries the threshold: {held.json}")
+        answer = ctx.rbx("rv", "skip", ok=False, timeout=60)
+        ctx.expect_in("No review is awaiting a decision", answer.error, "rv after a held del")
         ctx.expect(_sign(ctx) is not None, "Sign kept")
-        answer = result["json"] or {}
-        ctx.expect(answer.get("ok") is True and answer.get("changed") is False, f"del after rv skip: {answer}")
-        ctx.expect(any("skip" in key.lower() for key in answer), f"a skipped review reads as a no-op (D2): {answer}")
 
 
 def unanswered_review(ctx: Context):
-    """DATA-042: an unanswered review is skipped after about 90 s and the instance stays."""
+    """DATA-042: a held del returns at once instead of waiting for a decision nobody gives."""
     with _review_threshold_zero(ctx):
         started = time.monotonic()
-        process, out, err = _detached(ctx, "del", "del", *SIGN)
-        result = _finished(ctx, process, out, err, timeout=180)
+        held = ctx.rbx("del", *SIGN, timeout=60)
         waited = time.monotonic() - started
-        ctx.expect(80 <= waited <= 130, f"del returned after {waited:.0f}s: {result['json']}")
+        _expect_held(ctx, held, "del")
+        ctx.expect(waited < 15, f"del returned after {waited:.0f}s")
         ctx.expect(_sign(ctx) is not None, "Sign kept")
 
 
 def prop_review_above_threshold(ctx: Context):
-    """DATA-043 (D1), DATA-044, LIFE-075 (yes part): prop --yes and cfg yes:true apply without a review; prop without
-    --yes above the threshold opens the review its help describes."""
+    """DATA-043, DATA-044, LIFE-075 (yes part): prop --yes and cfg yes:true apply at once; prop without --yes above
+    the threshold applies nothing and answers heldForReview."""
     with _review_threshold_zero(ctx):
         approved = ctx.rbx("prop", *SIGN, "-n", "Value", "-j", '"yes"', "--yes", timeout=60)
         ctx.expect(approved.get("changed") is True and _sign(ctx) == "yes", f"prop --yes: {approved.json}")
@@ -674,10 +679,9 @@ def prop_review_above_threshold(ctx: Context):
         ctx.expect(configured.get("changed") is True and _sign(ctx) == "cfg", f"prop with cfg yes: {configured.json}")
         (ctx.root / ".renium" / "config.json").unlink()
         ctx.rbx("cfg", "set", "liveSync.changesThreshold", "0", timeout=60)
-        process, out, err = _detached(ctx, "prop", "prop", *SIGN, "-n", "Value", "-j", '"held"')
-        held = _await_review(ctx, "apply", 20)
-        result = _finished(ctx, process, out, err)
-        ctx.expect(held, f"prop without --yes above the threshold opened no review (D1): {result['json']}")
+        held = ctx.rbx("prop", *SIGN, "-n", "Value", "-j", '"held"', timeout=60)
+        _expect_held(ctx, held, "prop")
+        ctx.expect(_sign(ctx) == "cfg", "Value unchanged while the prop is held")
 
 
 def del_yes_skips_the_review(ctx: Context):
@@ -708,27 +712,19 @@ def display_prompts_never(ctx: Context):
 
 
 def saved_field_review_at_threshold_zero(ctx: Context):
-    """DATA-051: prop of a field without a plugin API and without --yes at threshold 0 is held for the Studio review;
-    rv skip answers skippedByReview and leaves the field, rv apply writes it natively."""
+    """DATA-051: prop of a field without a plugin API and without --yes at threshold 0 applies nothing and answers
+    heldForReview; with --yes the native writer sets it."""
     with _review_threshold_zero(ctx):
         current, value = _technology(ctx)
-        process, out, err = _detached(ctx, "prop-saved-skip", "prop", *LIGHTING, "-j", value)
-        held = _await_review(ctx, "skip", 60)
-        result = _finished(ctx, process, out, err)
-        ctx.expect(held, f"no review appeared for the saved-field prop: {result}")
-        answer = result["json"] or {}
-        ctx.expect(answer.get("skippedByReview") is True and answer.get("changed") is False, f"saved-field prop after rv skip: {answer}")
-        ctx.expect(_pulled_technology(ctx) == current, "Technology unchanged after rv skip")
-        process, out, err = _detached(ctx, "prop-saved-apply", "prop", *LIGHTING, "-j", value)
-        held = _await_review(ctx, "apply", 60)
-        result = _finished(ctx, process, out, err)
-        ctx.expect(held, f"no review appeared for the saved-field prop: {result}")
-        answer = result["json"] or {}
-        if sys.platform == "darwin" and result["code"] != 0:
-            ctx.expect("native property writer could not set it" in result["stderr"] + json.dumps(answer), f"macOS saved-field refusal must follow the review: {result}")
+        held = ctx.rbx("prop", *LIGHTING, "-j", value, timeout=120)
+        _expect_held(ctx, held, "saved-field prop")
+        ctx.expect(_pulled_technology(ctx) == current, "Technology unchanged while the prop is held")
+        applied = ctx.rbx("prop", *LIGHTING, "-j", value, "--yes", ok=None, timeout=180)
+        if sys.platform == "darwin" and not applied.ok:
+            ctx.expect("native property writer could not set it" in applied.error + json.dumps(applied.json), f"macOS saved-field refusal: {applied.error[:300]}")
             return
-        ctx.expect(answer.get("changed") is True and answer.get("savedFieldsApplied") == 1, f"saved-field prop after rv apply: {answer}")
-        ctx.expect(_pulled_technology(ctx) == json.loads(value)["name"], "Technology written after rv apply")
+        ctx.expect(applied.get("changed") is True and applied.get("savedFieldsApplied") == 1, f"saved-field prop --yes: {applied.json}")
+        ctx.expect(_pulled_technology(ctx) == json.loads(value)["name"], "Technology written with --yes")
 
 
 def saved_field_on_duplicate_sibling(ctx: Context):
@@ -748,17 +744,12 @@ def saved_field_on_duplicate_sibling(ctx: Context):
 
 
 def prop_hold_notice_reaches_the_caller(ctx: Context):
-    """DATA-053: a prop held for the Studio review prints the hold notice on the caller's own stderr, and the reviewed
-    request carries no transport flag a parser could read as an option."""
+    """DATA-053: a held prop tells its caller in the result itself, and no transport flag reaches a parser."""
     with _review_threshold_zero(ctx):
-        process, out, err = _detached(ctx, "prop-notice", "prop", *SIGN, "-n", "Value", "-j", '"noticed"')
-        held = _await_review(ctx, "skip", 60)
-        result = _finished(ctx, process, out, err)
-        ctx.expect(held, f"no review appeared for prop: {result}")
-        ctx.expect("held for review in Studio" in result["stderr"], f"the hold notice never reached the caller: stderr {result['stderr'][:300]!r}")
-        answer = result["json"] or {}
-        ctx.expect(answer.get("skippedByReview") is True and _sign(ctx) != "noticed", f"prop after rv skip: {answer}")
-        ctx.expect("--notices" not in result["stdout"] + result["stderr"], f"a transport flag reached a parser: {result['stderr'][:300]!r}")
+        held = ctx.rbx("prop", *SIGN, "-n", "Value", "-j", '"noticed"', timeout=60)
+        _expect_held(ctx, held, "prop")
+        ctx.expect(_sign(ctx) != "noticed", "Value unchanged while the prop is held")
+        ctx.expect("--notices" not in held.stdout + held.stderr, f"a transport flag reached a parser: {held.stderr[:300]!r}")
 
 
 def me_has_no_review(ctx: Context):
@@ -825,16 +816,16 @@ SCENARIOS = [
     Scenario("DATA-037", "import under Live Sync", "small", slotted(import_under_live_sync)),
     Scenario("DATA-038", "bpack on current stores", "small", bpack_on_current_stores, needs_studio=False),
     Scenario("DATA-039", "bpack under Live Sync", "small", slotted(bpack_under_live_sync)),
-    Scenario("DATA-040", "held del applied by rv", "small", slotted(held_del_applied_by_rv)),
-    Scenario("DATA-041", "held del skipped by rv", "small", slotted(held_del_skipped_by_rv)),
-    Scenario("DATA-042", "unanswered review", "small", slotted(unanswered_review)),
-    Scenario("DATA-043", "prop review above the threshold", "small", slotted(prop_review_above_threshold)),
+    Scenario("DATA-040", "held del applies with --yes", "small", slotted(held_del_applied_by_rv)),
+    Scenario("DATA-041", "held del names its change", "small", slotted(held_del_skipped_by_rv)),
+    Scenario("DATA-042", "held del returns at once", "small", slotted(unanswered_review)),
+    Scenario("DATA-043", "prop held above the threshold", "small", slotted(prop_review_above_threshold)),
     Scenario("DATA-045", "--yes del skips the review", "small", slotted(del_yes_skips_the_review)),
     Scenario("DATA-046", "rv with nothing held", "small", slotted(review_with_nothing_held)),
     Scenario("DATA-047", "displayPrompts never", "small", slotted(display_prompts_never), exclusive=True),
     Scenario("DATA-049", "me has no review", "small", slotted(me_has_no_review)),
     Scenario("DATA-050", "no review during Play", "small", slotted(no_review_during_play)),
-    Scenario("DATA-051", "saved field reviewed at threshold 0", "small", slotted(saved_field_review_at_threshold_zero)),
+    Scenario("DATA-051", "saved field held at threshold 0", "small", slotted(saved_field_review_at_threshold_zero)),
     Scenario("DATA-052", "saved field on a same-named sibling", "small", slotted(saved_field_on_duplicate_sibling)),
-    Scenario("DATA-053", "reviewed prop hold notice", "small", slotted(prop_hold_notice_reaches_the_caller)),
+    Scenario("DATA-053", "held prop result reaches the caller", "small", slotted(prop_hold_notice_reaches_the_caller)),
 ]

@@ -2713,6 +2713,25 @@ fn direct_editor_summaries_carry_the_push_outcome_fields() {
     let summary = direct_editor_summary(&held);
     assert_eq!(summary["changed"], json!(false));
     assert_eq!(summary["skippedByReview"], json!(true));
+
+    // A `prop` or `del` over the review threshold applies nothing; its result
+    // says so and carries the change list and the next step.
+    let over_threshold = serde_json::from_value::<serde_json::Map<String, Value>>(json!({
+        "ok": true,
+        "heldForReview": true,
+        "reviewChanges": 1,
+        "effectiveChanges": 1,
+        "reviewThreshold": 0,
+        "review": [{"path": "Workspace.Props.Sign", "class": "StringValue", "changes": ["-instance"]}],
+        "next": "nothing was applied; check `review`, then rerun with --yes to apply, or change the files"
+    }))
+    .unwrap();
+    let summary = direct_editor_summary(&over_threshold);
+    assert_eq!(summary["changed"], json!(false));
+    assert_eq!(summary["heldForReview"], json!(true));
+    assert_eq!(summary["review"][0]["path"], json!("Workspace.Props.Sign"));
+    assert_eq!(summary["reviewThreshold"], json!(0));
+    assert!(summary["next"].as_str().unwrap().contains("--yes"));
 }
 
 #[test]

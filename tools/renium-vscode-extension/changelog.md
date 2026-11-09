@@ -92,6 +92,7 @@
 - When the daemon already has 16 open connections, the next command is told so and asked to retry, instead of failing with a socket error.
 - `rbx -r DIR COMMAND` no longer creates DIR for commands that work in an existing project; it reports that the folder does not exist, and only `rbx -r DIR init` creates it.
 - A merge no longer keeps a reference to an instance the other side removed, which left a store that failed to build into a place. Without a preference `rbx vcm` reports it as a conflict; with one the instance comes back when the preferred side still has it, and the reference is cleared otherwise.
+- `rbx prop` and `rbx del` above the review threshold say so: the result carries `heldForReview`, the change list in `review` and the `--yes` next step, as `rbx ps` does. They used to print only `{"ok":true,"changed":false}`.
 
 ## 0.5.9 - 2026-11-06
 

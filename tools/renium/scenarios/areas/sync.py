@@ -317,34 +317,17 @@ def _edit_six_store_values(ctx: Context):
 
 
 def push_above_threshold_opens_the_review(ctx: Context):
-    """SYNC-030 (documented): a push of more than 5 changes without --yes is held for the Studio review;
-    rv skip leaves Studio unchanged and the result says skippedByReview."""
+    """SYNC-030 (documented): a push of more than 5 changes without --yes applies nothing and answers heldForReview
+    with the change list; the same push with --yes applies."""
     ctx.open_studio()
     _edit_six_store_values(ctx)
-    env = dict(os.environ, RENIUM_PLACE=str(ctx.root / ctx.place))
-    held = subprocess.Popen([RBX, "--output-mode", "json", "ps", WORKSPACE], cwd=ctx.root, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
-    decided = False
-    deadline = time.monotonic() + 25
-    while time.monotonic() < deadline and held.poll() is None:
-        time.sleep(1)
-        skip = ctx.rbx("rv", "skip", ok=None, timeout=30)
-        if skip.ok:
-            decided = True
-            break
-    out, err = held.communicate(timeout=120)
-    result = {}
-    for stream in (out, err):
-        for line in reversed(stream.strip().splitlines()):
-            try:
-                result = json.loads(line.strip())
-                break
-            except Exception:
-                continue
-        if result:
-            break
-    ctx.expect(decided, f"the push was never held for review (D1): out={out[:300]!r} err={err[:300]!r}")
-    ctx.expect(result.get("skippedByReview") is True or "skipped at the Studio review" in str(result.get("error")), f"skipped push result: {result} out={out[-300:]!r} err={err[-300:]!r}")
-    ctx.expect(ctx.luau('return workspace.Props:FindFirstChild("Mark0") == nil') is True, "Studio unchanged after rv skip")
+    held = ctx.rbx("ps", WORKSPACE, timeout=120)
+    ctx.expect(held.get("heldForReview") is True and held.get("effectiveChanges") == 6, f"push over the threshold: {held.json}")
+    ctx.expect(len(held.get("review") or []) >= 1 and "--yes" in str(held.get("next")), f"held push carries its change list: {held.json}")
+    ctx.expect(ctx.luau('return workspace.Props:FindFirstChild("Mark0") == nil') is True, "Studio unchanged while the push is held")
+    applied = ctx.rbx("ps", WORKSPACE, "--yes", timeout=120)
+    ctx.expect(applied.ok and not applied.get("heldForReview"), f"push --yes: {applied.json}")
+    ctx.expect(ctx.luau('return workspace.Props:FindFirstChild("Mark5") ~= nil') is True, "the six instances arrived with --yes")
 
 
 def yes_skips_the_review(ctx: Context):
@@ -504,7 +487,7 @@ SCENARIOS = [
     Scenario("SYNC-025", "--verify-sources counts unchanged scripts", "small", verify_sources_counts_unchanged_scripts),
     Scenario("SYNC-026", "push with an open editor tab", "small", push_with_an_open_editor_tab),
     Scenario("SYNC-027", "push right after reopen with a restored tab", "small", push_right_after_reopen_with_a_restored_tab),
-    Scenario("SYNC-030", "push above the threshold opens the review", "small", push_above_threshold_opens_the_review),
+    Scenario("SYNC-030", "push above the threshold is held", "small", push_above_threshold_opens_the_review),
     Scenario("SYNC-031", "--yes skips the review", "small", yes_skips_the_review),
     Scenario("SYNC-053", "heavy import is one native push", "heavy", heavy_import_is_one_native_push),
     Scenario("SYNC-070", "lon --wait returns settled", "small", lon_wait_settles),

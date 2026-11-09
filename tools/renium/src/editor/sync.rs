@@ -3695,6 +3695,12 @@ pub(crate) fn direct_editor_summary_changed(summary: &Map<String, Value>) -> boo
 /// outcome fields a push prints, plus where the edit now lives.
 const DIRECT_EDITOR_SUMMARY_FIELDS: &[&str] = &[
     "skippedByReview",
+    "heldForReview",
+    "effectiveChanges",
+    "reviewThreshold",
+    "review",
+    "moreReviewRows",
+    "next",
     "persistence",
     "filesPulled",
     "filesError",
