@@ -2074,6 +2074,28 @@ pub(crate) fn reject_read_only_link_edit(
     }
 }
 
+/// Refuses removing, renaming or moving the instance at `index` when it is
+/// at or inside a read-only link target or holds one: each of them changes
+/// what the link's path leads to.
+pub(crate) fn reject_read_only_link_subtree_edit(
+    links: &LinkEnforcement,
+    document: &SettingsBytecode,
+    service: &str,
+    index: usize,
+) -> Result<()> {
+    if !links.is_active() {
+        return Ok(());
+    }
+    match build_editor_instance_paths_for_indices(document, service, &[index]).get(&index) {
+        Some(path) => links.reject_read_only_package_subtree(
+            service,
+            &path.path_segments,
+            &path.path_ordinals,
+        ),
+        None => Ok(()),
+    }
+}
+
 /// Refuses a store edit of an instance that Roblox or a package owns: a
 /// PackageLink, the Workspace viewport camera and anything inside a
 /// read-only link.
@@ -2463,7 +2485,9 @@ fn bytecode_set_property_where(mut args: BytecodeSetPropertyArgs, query: &str) -
 
 /// Renames every instance under the scope that matches `query` and whose name
 /// contains `from`, replacing `from` with `to`; one push covers them all and
-/// the read-back judges `verified`.
+/// the read-back judges `verified`. A rename that would change a read-only
+/// link refuses the call before anything is written, unless packages are
+/// overridden.
 pub(crate) fn bytecode_rename_where(
     settings_file: PathBuf,
     scope_settings_id: Option<String>,
@@ -2471,6 +2495,7 @@ pub(crate) fn bytecode_rename_where(
     from: &str,
     to: &str,
     push: bool,
+    override_packages: bool,
 ) -> Result<()> {
     if from.is_empty() {
         bail!("--replace FROM must not be empty");
@@ -2494,14 +2519,16 @@ pub(crate) fn bytecode_rename_where(
             .join(".")
     };
     let matched = where_matches(&document, &service, scope.index, query)?;
-    let renames = matched
-        .iter()
-        .filter_map(|&index| {
-            let instance = &document.instances[index];
-            let name = instance.name.replace(from, to);
-            (name != instance.name).then(|| (instance.settings_id.clone(), path_of(index), name))
-        })
-        .collect::<Vec<_>>();
+    let links = store_link_enforcement(&settings_file, override_packages)?;
+    let mut renames = Vec::new();
+    for &index in &matched {
+        let instance = &document.instances[index];
+        let name = instance.name.replace(from, to);
+        if name != instance.name {
+            reject_read_only_link_subtree_edit(&links, &document, &service, index)?;
+            renames.push((instance.settings_id.clone(), path_of(index), name));
+        }
+    }
     if renames.is_empty() {
         bail!(
             "No instance under {} matching '{query}' has '{from}' in its name",
@@ -2528,6 +2555,7 @@ pub(crate) fn bytecode_rename_where(
             value_bool: None,
             value_null: false,
             scope: "metadata".to_string(),
+            // Every rename was checked against the read-only links above.
             override_packages: true,
             push: false,
             pretty: false,
@@ -2877,6 +2905,7 @@ impl StorePropertyEdit<'_> {
             });
         }
         if structural {
+            reject_read_only_link_subtree_edit(self.links, &self.document, self.service, index)?;
             let children = settings_children_by_parent(&self.document);
             let mut subtree = Vec::new();
             collect_settings_subtree_preorder(&children, index, &mut subtree);

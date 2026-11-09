@@ -1679,7 +1679,7 @@ pub(crate) fn bytecode_remove_instance(mut args: BytecodeRemoveInstanceArgs) -> 
     let links = super::store_link_enforcement(&settings_file, args.override_packages)?;
     let children_by_parent = settings_children_by_parent(&document);
     for &index in &indices {
-        super::reject_read_only_link_edit(&links, &document, &service, index)?;
+        super::reject_read_only_link_subtree_edit(&links, &document, &service, index)?;
         let mut subtree = Vec::new();
         collect_settings_subtree_preorder(&children_by_parent, index, &mut subtree);
         reject_package_link_subtree_mutation(&document, &subtree, "removed")?;

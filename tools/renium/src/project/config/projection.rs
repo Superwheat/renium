@@ -680,18 +680,8 @@ fn stage_tree_node(
         } else if target.len() == 1 {
             target[0].as_str()
         } else {
-            let service = target
-                .first()
-                .context("Project tree target must include a service")?;
-            let settings = service_settings_path(&stage.join(service));
-            inferred_class = if settings.is_file() {
-                let document = SettingsBytecode::read_file(&settings)?;
-                find_document_target_optional(&document, target)?
-                    .map(|index| document.instances[index].class_name.clone())
-            } else {
-                None
-            };
-            inferred_class.as_deref().unwrap_or("Folder")
+            inferred_class = implied_stage_class(stage, target)?;
+            inferred_class.as_str()
         };
         let properties = normalize_property_map(Some(class_name), &node.properties)
             .with_context(|| format!("Invalid properties on '{}'", target.join(".")))?;
@@ -759,7 +749,7 @@ fn stage_mount_target(
             update_stage_instance(
                 stage,
                 target,
-                "Folder",
+                &staged_directory_class(stage, target)?,
                 None,
                 &Map::new(),
                 &Map::new(),
@@ -890,19 +880,58 @@ fn stage_module_data(
     )
 }
 
-/// The class and properties of a node made on the way to a deeper target.
-/// The service's document can predate the files staged since it was written,
-/// so a directory staged with an init script is that script here, as it is in
-/// a document read from the staged files.
-fn staged_directory_instance(directory: &Path) -> Result<(String, Map<String, Value>)> {
-    if !directory.is_dir() {
+/// What the staged directory of the node at `target` makes it: the script of
+/// an init file, with its text, or a Folder. The service's document can
+/// predate the files staged since it was written, so the directory is asked,
+/// and the node is what a document read from the staged files would hold.
+/// A directory holds only the first sibling of its name.
+fn staged_directory_instance(
+    stage: &Path,
+    target: &[String],
+    ordinals: &[usize],
+) -> Result<(String, Map<String, Value>)> {
+    let directory = target_fs_path(stage, target);
+    if ordinals
+        .iter()
+        .take(target.len())
+        .any(|ordinal| *ordinal != 1)
+        || !directory.is_dir()
+    {
         return Ok(("Folder".to_string(), Map::new()));
     }
     crate::rbx::model::source_directory_instance(
-        directory,
-        &super::cached_script_naming(directory),
+        &directory,
+        &super::cached_script_naming(&directory),
         true,
     )
+}
+
+/// Gives a node of the class its staged directory makes it the directory's
+/// properties (the init script's text) where the node has none of that name.
+fn adopt_directory_properties(
+    instance: &mut SettingsBytecodeInstance,
+    (class_name, properties): (String, Map<String, Value>),
+) {
+    if instance.class_name == class_name {
+        for (name, value) in properties {
+            instance.properties.entry(name).or_insert(value);
+        }
+    }
+}
+
+/// The class the staged directory of the node at `target` makes it.
+fn staged_directory_class(stage: &Path, target: &[String]) -> Result<String> {
+    Ok(staged_directory_instance(stage, target, &active_target_ordinals(target))?.0)
+}
+
+/// The class of the node at `target` when the project names none: the class
+/// the stage already gives it, or, for a node the stage does not hold yet,
+/// the class its staged directory makes it.
+fn implied_stage_class(stage: &Path, target: &[String]) -> Result<String> {
+    match stage_target_class(stage, target)? {
+        Some(class_name) => Ok(class_name),
+        None => staged_directory_class(stage, target),
+    }
 }
 
 fn update_stage_instance(
@@ -969,6 +998,10 @@ fn update_stage_instance(
                     )
                 {
                     document.instances[index].class_name = expected_class.to_string();
+                    adopt_directory_properties(
+                        &mut document.instances[index],
+                        staged_directory_instance(stage, target, &ordinals)?,
+                    );
                 } else {
                     bail!(
                         "Projection target '{}' already exists as {}, expected {}",
@@ -1004,11 +1037,12 @@ fn update_stage_instance(
                 expected_class.to_string(),
                 Some(parent_index),
             );
-            // The directory named after the target is the first sibling's.
-            if !final_node && selected == 1 {
-                (created.class_name, created.properties) =
-                    staged_directory_instance(&target_fs_path(stage, &target[..=position]))?;
+            let directory = staged_directory_instance(stage, &target[..=position], &ordinals)?;
+            // A node on the way to the target has no class of its own.
+            if !final_node {
+                created.class_name.clone_from(&directory.0);
             }
+            adopt_directory_properties(&mut created, directory);
             document.instances.push(created);
             children_by_parent.push(Vec::new());
             children_by_parent[parent_index].push(index);
@@ -1058,14 +1092,15 @@ fn update_stage_instance(
 
 fn ensure_stage_parent<'a>(stage: &Path, target: &'a [String]) -> Result<&'a [String]> {
     let parent = &target[..target.len() - 1];
+    let parent_class = if parent.len() == 1 {
+        parent[0].clone()
+    } else {
+        staged_directory_class(stage, parent)?
+    };
     update_stage_instance(
         stage,
         parent,
-        if parent.len() == 1 {
-            parent[0].as_str()
-        } else {
-            "Folder"
-        },
+        &parent_class,
         None,
         &Map::new(),
         &Map::new(),
@@ -1580,6 +1615,20 @@ fn stage_nested_project_at_target(
             let settings = service_settings_path(&source);
             if settings.is_file() {
                 merge_settings_document_at_target(stage, target, &settings)?;
+            } else if nested.project.root.class_name.is_none() {
+                // The root was made a Folder before its files were staged.
+                let directory_class = staged_directory_class(stage, target)?;
+                if directory_class != "Folder" {
+                    update_stage_instance(
+                        stage,
+                        target,
+                        &directory_class,
+                        None,
+                        &Map::new(),
+                        &Map::new(),
+                        None,
+                    )?;
+                }
             }
         }
         if !flattened

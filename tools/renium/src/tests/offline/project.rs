@@ -521,6 +521,165 @@ fn build_keeps_an_init_script_folder_that_also_holds_an_adapter_file() {
     assert_eq!(note["props"], json!({"Value": "hello"}));
 }
 
+/// A Rojo project whose ReplicatedStorage node is `children`.
+fn rojo_replicated_storage(children: &str) -> String {
+    format!(
+        r#"{{"name": "p", "tree": {{"$className": "DataModel", "ReplicatedStorage": {children}}}}}"#
+    )
+}
+
+/// Builds the project, converting `default.project.json` first when the
+/// folder holds one, and returns ReplicatedStorage.Shared as `rbx v` shows
+/// it in the built place.
+fn built_shared(fx: &Fixture) -> Value {
+    if fx.exists("default.project.json") {
+        fx.text(&["ir", &fx.path(""), "--apply"]).ok();
+    }
+    let place = fx.path("built.rbxl");
+    fx.text(&[
+        "build",
+        "--project",
+        &fx.path("renium.project.jsonc"),
+        "-o",
+        &place,
+    ])
+    .ok();
+    let view = fx.json(&["v", &place, "--json"]).ok();
+    let named = |nodes: &Value, name: &str| {
+        nodes
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["name"] == name)
+            .cloned()
+            .unwrap_or_else(|| panic!("no {name} in {nodes}"))
+    };
+    named(
+        &named(&view["roots"], "ReplicatedStorage")["children"],
+        "Shared",
+    )
+}
+
+const INIT_SOURCE: &str = "return {}\n";
+const EARLIER_NODE: &str = r#""Config": {"$className": "Folder"}, "#;
+
+/// Each shape runs alone and after an earlier tree node, which writes the
+/// service's document before the directory is staged.
+#[test]
+fn build_keeps_the_init_script_of_a_directory_however_the_project_reaches_it() {
+    let shapes = [
+        (
+            "tree node with fields",
+            r#""Shared": {"$path": "src/shared", "$attributes": {"X": 1}}"#,
+            "src/shared/init.luau",
+        ),
+        (
+            "tree node with fields and an adapter file",
+            r#""Shared": {"$path": "src/shared", "$attributes": {"X": 1}}"#,
+            "src/shared/init.luau",
+        ),
+        (
+            "model file in the directory",
+            r#""Shared": {"$path": "src/shared"}"#,
+            "src/shared/init.luau",
+        ),
+        (
+            "nested project",
+            r#""Shared": {"$path": "lib/default.project.json"}"#,
+            "lib/src/init.luau",
+        ),
+    ];
+    for (shape, node, init) in shapes {
+        for earlier in ["", EARLIER_NODE] {
+            let fx = empty_folder("build-init-shapes");
+            let project = rojo_replicated_storage(&format!("{{{earlier}{node}}}"));
+            write_files(
+                &fx,
+                &[
+                    ("default.project.json", project.as_str()),
+                    (init, INIT_SOURCE),
+                ],
+            );
+            match shape {
+                "tree node with fields and an adapter file" => {
+                    write_files(&fx, &[("src/shared/Note.txt", "hello")]);
+                }
+                "model file in the directory" => {
+                    write_model_file(&fx.root.join("src/shared/Kit.rbxm"), &sample_model_dom());
+                }
+                "nested project" => write_files(
+                    &fx,
+                    &[(
+                        "lib/default.project.json",
+                        r#"{"name": "lib", "tree": {"$path": "src"}}"#,
+                    )],
+                ),
+                _ => {}
+            }
+            let shared = built_shared(&fx);
+            let case = format!("{shape}, earlier node: {}", !earlier.is_empty());
+            assert_eq!(shared["className"], json!("ModuleScript"), "{case}");
+            assert_eq!(shared["source"], json!(INIT_SOURCE), "{case}");
+            match shape {
+                "tree node with fields" => {
+                    assert_eq!(shared["attributes"], json!({"X": 1.0}), "{case}");
+                }
+                "tree node with fields and an adapter file" => {
+                    assert_eq!(shared["attributes"], json!({"X": 1.0}), "{case}");
+                    assert_eq!(shared["children"][0]["name"], json!("Note"), "{case}");
+                }
+                "model file in the directory" => {
+                    assert_eq!(shared["children"][0]["name"], json!("Kit"), "{case}");
+                    assert_eq!(shared["children"][0]["className"], json!("Model"), "{case}");
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+#[test]
+fn build_keeps_the_init_script_of_a_mounted_directory() {
+    let mount = r#"{"source": "src/shared", "target": "ReplicatedStorage.Shared"}"#;
+    let earlier = r#"{"source": "other", "target": "ReplicatedStorage.Other"}, "#;
+    for earlier in ["", earlier] {
+        let fx = empty_folder("build-init-mount");
+        let project = format!(r#"{{"schemaVersion": 1, "mounts": [{earlier}{mount}]}}"#);
+        write_files(
+            &fx,
+            &[
+                ("renium.project.jsonc", project.as_str()),
+                ("src/shared/init.luau", INIT_SOURCE),
+                ("other/A.luau", "return 1\n"),
+            ],
+        );
+        let shared = built_shared(&fx);
+        let case = format!("earlier mount: {}", !earlier.is_empty());
+        assert_eq!(shared["className"], json!("ModuleScript"), "{case}");
+        assert_eq!(shared["source"], json!(INIT_SOURCE), "{case}");
+    }
+}
+
+#[test]
+fn build_keeps_a_folder_class_the_tree_node_names_over_an_init_script() {
+    for earlier in ["", EARLIER_NODE] {
+        let fx = empty_folder("build-init-explicit");
+        let project = rojo_replicated_storage(&format!(
+            r#"{{{earlier}"Shared": {{"$path": "src/shared", "$className": "Folder"}}}}"#
+        ));
+        write_files(
+            &fx,
+            &[
+                ("default.project.json", project.as_str()),
+                ("src/shared/init.luau", INIT_SOURCE),
+            ],
+        );
+        let shared = built_shared(&fx);
+        assert_eq!(shared["className"], json!("Folder"), "{earlier}");
+        assert_eq!(shared.get("source"), None, "{earlier}");
+    }
+}
+
 #[test]
 fn build_places_a_part_by_the_position_and_orientation_of_its_tree_node_or_sidecar() {
     let fx = empty_folder("build-position");

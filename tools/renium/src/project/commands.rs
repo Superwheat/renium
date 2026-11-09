@@ -116,19 +116,35 @@ fn projected_structural_target(
     ))
 }
 
+/// What a structural command does with the instance it resolves.
+#[derive(Clone, Copy, PartialEq)]
+enum TargetUse {
+    /// A new, copied or moved instance goes under it.
+    Parent,
+    /// It is copied, unlinked or searched under and stays where it is.
+    Source,
+    /// It is renamed, moved or removed, which also changes a read-only link
+    /// it holds.
+    Changed,
+}
+
 fn projected_structural_store(
     loaded: &config::LoadedProject,
     stage: &config::ProjectionStage,
     service: &str,
     settings_id: Option<&str>,
-    reject_declarative_target: bool,
+    target_use: TargetUse,
     override_packages: bool,
 ) -> Result<(PathBuf, Vec<String>, Option<String>)> {
     let (target, target_ordinals, resolved_id) =
         projected_structural_target(stage, service, settings_id)?;
     let settings_id = resolved_id.as_deref();
-    build_loaded_project_link_enforcement(loaded, override_packages)?
-        .reject_read_only_package_path(service, &target, &target_ordinals)?;
+    let links = build_loaded_project_link_enforcement(loaded, override_packages)?;
+    if target_use == TargetUse::Changed {
+        links.reject_read_only_package_subtree(service, &target, &target_ordinals)?;
+    } else {
+        links.reject_read_only_package_path(service, &target, &target_ordinals)?;
+    }
     if settings_id.is_none() && target_ordinals.iter().any(|ordinal| *ordinal > 1) {
         bail!(
             "Projected path '{}' selects a duplicate sibling that cannot map to one filesystem owner",
@@ -141,7 +157,7 @@ fn projected_structural_store(
             target.join(".")
         );
     }
-    if reject_declarative_target && config::project_target_is_declarative(loaded, &target)? {
+    if target_use != TargetUse::Parent && config::project_target_is_declarative(loaded, &target)? {
         bail!(
             "Projected path '{}' is named by project configuration; edit the project or metadata sidecar instead",
             target.join(".")
@@ -199,7 +215,7 @@ fn projected_instance_store(
         &stage,
         &target.service,
         Some(&target.settings_id),
-        true,
+        TargetUse::Changed,
         override_packages,
     )?;
     Ok((settings_file, settings_id))
@@ -234,7 +250,7 @@ fn projected_unlink_store(
         &stage,
         &target.service,
         Some(&target.settings_id),
-        true,
+        TargetUse::Source,
         true,
     )?;
     Ok((settings_file, settings_id, deferred))
@@ -286,7 +302,7 @@ pub(crate) fn create_instance_command(
             &stage,
             &args.service,
             args.parent_settings_id.as_deref(),
-            false,
+            TargetUse::Parent,
             args.override_packages,
         )?;
         return bytecode_add_instance(BytecodeAddInstanceArgs {
@@ -349,7 +365,7 @@ pub(crate) fn clone_instance_command(
         &stage,
         &target.service,
         Some(&target.settings_id),
-        true,
+        TargetUse::Source,
         args.override_packages,
     )?;
     let (parent_file, parent_target, parent_id) = projected_structural_store(
@@ -357,7 +373,7 @@ pub(crate) fn clone_instance_command(
         &stage,
         &target.service,
         Some(&args.parent_settings_id),
-        false,
+        TargetUse::Parent,
         args.override_packages,
     )?;
     if source_file != parent_file {
@@ -421,7 +437,7 @@ pub(crate) fn move_instance_command(args: MoveInstanceArgs, project: Option<&Pat
             &stage,
             &target.service,
             Some(&target.settings_id),
-            true,
+            TargetUse::Changed,
             args.override_packages,
         )?;
         let (target_file, _, parent_id) = projected_structural_store(
@@ -429,7 +445,7 @@ pub(crate) fn move_instance_command(args: MoveInstanceArgs, project: Option<&Pat
             &stage,
             &target_service,
             args.parent_settings_id.as_deref(),
-            false,
+            TargetUse::Parent,
             args.override_packages,
         )?;
         if !target_file.is_file() {
@@ -578,12 +594,19 @@ pub(crate) fn rename_instance_command(
         structural_project(project, &target.project_root, args.src_root.as_deref())?;
     let (settings_file, settings_id) = if let Some(loaded) = loaded_project.as_ref() {
         let stage = config::stage_project(loaded)?;
+        // With --where the target is the scope searched under; each match is
+        // checked when it is renamed.
+        let target_use = if args.where_query.is_some() {
+            TargetUse::Source
+        } else {
+            TargetUse::Changed
+        };
         let (settings_file, _, settings_id) = projected_structural_store(
             loaded,
             &stage,
             &target.service,
             Some(&target.settings_id),
-            true,
+            target_use,
             args.override_packages,
         )?;
         (settings_file, settings_id)
@@ -608,6 +631,7 @@ pub(crate) fn rename_instance_command(
             from,
             to,
             args.push,
+            args.override_packages,
         );
     }
     let Some(name) = args.name else {
@@ -889,7 +913,7 @@ pub(crate) fn import_model_command(
         &stage,
         &args.service,
         Some(&args.parent_settings_id),
-        false,
+        TargetUse::Parent,
         args.override_packages,
     )?;
     bytecode_import_model(BytecodeImportModelArgs {

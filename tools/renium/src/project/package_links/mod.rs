@@ -3814,6 +3814,38 @@ pub(crate) fn read_only_target_current(
     Ok(current.as_deref() == Some(expected_fingerprint))
 }
 
+impl ReadOnlyPackageEnforcement {
+    fn edit_refusal(&self) -> anyhow::Error {
+        anyhow::anyhow!(
+            "Cannot edit read-only link \"{}\" at {}.{}. Use --override-packages to replace it intentionally.",
+            self.link_id,
+            self.service,
+            self.target_segments.join(".")
+        )
+    }
+}
+
+/// A path and its ordinals below the service, whether or not they start
+/// with the service itself.
+fn service_relative_path<'a>(
+    service: &str,
+    path_segments: &'a [String],
+    path_ordinals: &'a [usize],
+) -> (&'a [String], &'a [usize]) {
+    let service_prefixed = path_segments.first().map(String::as_str) == Some(service);
+    let relative = if service_prefixed {
+        &path_segments[1..]
+    } else {
+        path_segments
+    };
+    let ordinal_offset =
+        usize::from(service_prefixed && path_ordinals.len() == path_segments.len());
+    (
+        relative,
+        &path_ordinals[ordinal_offset.min(path_ordinals.len())..],
+    )
+}
+
 impl LinkEnforcement {
     pub(crate) fn is_active(&self) -> bool {
         self.active
@@ -3825,19 +3857,12 @@ impl LinkEnforcement {
         path_segments: &[String],
         path_ordinals: &[usize],
     ) -> Option<&ReadOnlyPackageEnforcement> {
-        let service_prefixed = path_segments.first().map(String::as_str) == Some(service);
-        let relative = if service_prefixed {
-            &path_segments[1..]
-        } else {
-            path_segments
-        };
-        let ordinal_offset =
-            usize::from(service_prefixed && path_ordinals.len() == path_segments.len());
+        let (relative, ordinals) = service_relative_path(service, path_segments, path_ordinals);
         self.read_only_packages.iter().find(|target| {
             target.service == service
                 && selector_starts_with(
                     relative,
-                    &path_ordinals[ordinal_offset.min(path_ordinals.len())..],
+                    ordinals,
                     &target.target_segments,
                     &target.target_ordinals,
                 )
@@ -3850,16 +3875,36 @@ impl LinkEnforcement {
         path_segments: &[String],
         path_ordinals: &[usize],
     ) -> Result<()> {
-        if let Some(target) = self.read_only_package_for_path(service, path_segments, path_ordinals)
-        {
-            bail!(
-                "Cannot edit read-only link \"{}\" at {}.{}. Use --override-packages to replace it intentionally.",
-                target.link_id,
-                target.service,
-                target.target_segments.join(".")
-            );
+        match self.read_only_package_for_path(service, path_segments, path_ordinals) {
+            Some(target) => Err(target.edit_refusal()),
+            None => Ok(()),
         }
-        Ok(())
+    }
+
+    /// Refuses removing, renaming or moving the instance at the path when it
+    /// is at or inside a read-only package, or holds one: the package's path
+    /// would no longer lead to it.
+    pub(crate) fn reject_read_only_package_subtree(
+        &self,
+        service: &str,
+        path_segments: &[String],
+        path_ordinals: &[usize],
+    ) -> Result<()> {
+        self.reject_read_only_package_path(service, path_segments, path_ordinals)?;
+        let (relative, ordinals) = service_relative_path(service, path_segments, path_ordinals);
+        let held = self.read_only_packages.iter().find(|target| {
+            target.service == service
+                && selector_starts_with(
+                    &target.target_segments,
+                    &target.target_ordinals,
+                    relative,
+                    ordinals,
+                )
+        });
+        match held {
+            Some(target) => Err(target.edit_refusal()),
+            None => Ok(()),
+        }
     }
 
     /// Whether `path` is the root of a read-only package whose package holds

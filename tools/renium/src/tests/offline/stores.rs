@@ -1238,6 +1238,29 @@ fn edits_refuse_an_attribute_name_roblox_refuses() {
 }
 
 #[test]
+fn set_property_refuses_an_item_of_another_enum() {
+    let fx = Fixture::new("set-enum-other");
+    let store = fx.store_arg("Workspace");
+    let before = fs::read(fx.store("Workspace")).unwrap();
+    let set = |value: &str| fx.text(&["bs", "-f", &store, "Door", "-p", "Material", "-j", value]);
+    for value in [
+        r#"{"_type":"EnumItem","enumType":"Enum.Axis","value":0}"#,
+        r#"{"_type":"EnumItem","enumType":"Axis","name":"X"}"#,
+    ] {
+        assert_eq!(
+            set(value).err(),
+            format!("Material needs an Enum.Material item, got {value}")
+        );
+    }
+    assert_eq!(fs::read(fx.store("Workspace")).unwrap(), before);
+    set(r#"{"_type":"EnumItem","enumType":"Enum.Material","value":256}"#).ok();
+    assert_eq!(
+        fx.both(&["bg", "-f", &store, "Door", "Material"]),
+        json!({"_type": "EnumItem", "name": "Plastic"})
+    );
+}
+
+#[test]
 fn set_property_edits_the_service_root_and_references() {
     let fx = Fixture::new("set-refs");
     let store = fx.store_arg("Workspace");

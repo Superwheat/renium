@@ -71,7 +71,7 @@
 - Extension packages built by the Release and Verify workflows carry the class icons committed to the repository; packaging replaced them with the icons of the Studio installed on the build machine.
 - `tools/build-release.ps1` accepts macOS binaries; its Mach-O check compared an unsigned magic number with a negative literal and refused every one.
 - `rbx bs` with several `-p NAME=JSON` (and `--where`) could set later properties on a different instance or leave a half-applied edit when one assignment failed; it now applies every assignment to the instances selected at the start and writes nothing unless all of them succeed.
-- Setting an enum property to a number that is no item of the enum (`-p Material=99999`) was stored and built into the place; it is now refused like an unknown item name.
+- Setting an enum property to a number that is no item of the enum (`-p Material=99999`), or to an item of another enum, was stored and built into the place; both are now refused like an unknown item name.
 - `rbx bss`, `rbx br`, `rbx ba`, `rbx bcl` and batch add, clone, remove and move ops could change a read-only link package and leave it drifted; they are now refused like `rbx bs`, and `--override-packages` allows them on purpose.
 - `rbx fmt` put a stray space before a leading comment and before the value after a block comment, and `fmt --check` accepted that; both now use the plain indent.
 - A `renium.project.jsonc` saved with a UTF-8 byte order mark, as Windows PowerShell's `Set-Content -Encoding utf8` writes it, failed in the CLI with "Invalid JSONC ... expected value at line 1 column 1" and in the extension; both read it now, and `rbx fmt` removes the mark.
@@ -81,7 +81,7 @@
 - `rbx build` ignored `Position` and `Orientation` set in a project tree node or `.meta.json` and left the part at the origin; both now place the part.
 - `rbx cmp PLACE --full` reported changes on a place just built from the project for properties Roblox renamed (SoundId/AudioContent, BrickColor/Color, Image/ImageContent); they now compare equal.
 - A merge with a preference (`rbx vcm --prefer ours|theirs`, and the same merge when a sync resolves toward one side) silently dropped an instance and everything under it when the other side had removed its parent. The instance now follows the preferred side: the parent comes back when that side still has it, and otherwise the instance stays where that side has it.
-- Luau code and text that start with `-` or `--`, such as a comment, `--!strict` or `-5`, are taken as values by `l`, `lc`, `wait`, `play`, `inp`, `sg`, `ss`, `ty`, `me`, `co --grep`, `q`, `prop -j` and `report -m` instead of being rejected as unknown options.
+- Luau code and text that start with `-` or `--`, such as a comment, `--!strict` or `-5`, are taken as values by `l`, `lc`, `wait`, `play`, `inp`, `sg`, `ty`, `co --grep`, `q`, `prop -j` and `report -m`, and as the first keyword of `ss` and the first OLD/NEW pair of `me`, instead of being rejected as unknown options; later `ss` keywords and `me` pairs still need `--` before such a value.
 - `rbx dm list`, `dm clean` and `dm stop` no longer treat a leftover daemon record as running when its process ID now belongs to another program, and `dm stop --force` removes the record instead of ending that program.
 - `rbx dm stop` no longer prints taskkill's "SUCCESS" line, so its JSON output is valid.
 - `RENIUM_DAEMON_NAME` takes precedence over a stored `daemon` setting, as `--daemon` already did.
@@ -95,6 +95,8 @@
 - `rbx prop` and `rbx del` above the review threshold say so: the result carries `heldForReview`, the change list in `review` and the `--yes` next step, as `rbx ps` does. They used to print only `{"ok":true,"changed":false}`.
 - Store edits (`rbx bs`, `rbx ba`, batch props) check bool, number and string values against the property's type: a number given to a string property is stored as text, a numeric string given to a number property as the number, and anything else is refused with an example instead of failing later in `rbx bep` or a push.
 - Setting or adding an attribute whose name Roblox refuses (empty, over 100 characters, starting with `RBX`, or with characters other than letters, digits, `_`, `.`, `-`, `/`) is refused.
+- Removing, renaming or moving an instance that holds a read-only link package (`rbx br`, `rbx bs -p Name` or `-p Parent`, batch ops, `rbx rm`, `rbx rn`, `rbx mv`) went through and left the link drifted; it is refused unless `--override-packages` is given.
+- `rbx rn --where` could rename instances inside a read-only link package; a call with such a match is refused as a whole unless `--override-packages` is given.
 
 ## 0.5.9 - 2026-11-06
 

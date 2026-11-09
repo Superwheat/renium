@@ -2586,6 +2586,152 @@ fn store_edits_refuse_changes_inside_a_read_only_link() {
     );
 }
 
+/// A project whose read-only link "shared" sits at
+/// ReplicatedStorage.Outer.Shared, after an unlinked Spare folder.
+fn nested_link_fixture(tag: &str) -> Fixture {
+    let fx = Fixture::new(tag);
+    crate::tests::support::write_packed_link_project(&fx.root);
+    let mut util = settings_instance("editor:2", "Util", "ModuleScript", Some(3));
+    util.properties
+        .insert("Source".to_string(), json!("return { version = 1 }"));
+    fx.write_store(
+        "ReplicatedStorage",
+        &settings_document(vec![
+            settings_instance("editor:0", "ReplicatedStorage", "ReplicatedStorage", None),
+            settings_instance("editor:3", "Outer", "Folder", Some(0)),
+            settings_instance("editor:4", "Spare", "Folder", Some(1)),
+            settings_instance("editor:1", "Shared", "Folder", Some(1)),
+            util,
+        ]),
+    );
+    fs::write(
+        fx.root.join("renium-link.json"),
+        br#"{"version":1,"links":[{"id":"shared","readOnly":true,"source":{"type":"local","path":"links/shared.renium"},"targets":[{"service":"ReplicatedStorage","path":["ReplicatedStorage","Outer","Shared"]}]}],"broken":[]}"#,
+    )
+    .unwrap();
+    fx
+}
+
+const NESTED_LINK_REFUSAL: &str = "Cannot edit read-only link \"shared\" at ReplicatedStorage.Outer.Shared. Use --override-packages to replace it intentionally.";
+
+#[test]
+fn edits_refuse_removing_renaming_and_moving_what_holds_a_read_only_link() {
+    let fx = nested_link_fixture("link-holder");
+    let store = fx.store_arg("ReplicatedStorage");
+    let root = fx.path("");
+    let other = fx
+        .text(&["ba", "-f", &store, "-n", "Other", "-c", "Folder"])
+        .ok()["settingsId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let before = fs::read(fx.store("ReplicatedStorage")).unwrap();
+    let rename = [
+        "rn",
+        "ReplicatedStorage",
+        "Renamed",
+        "-i",
+        "editor:3",
+        "-r",
+        &root,
+    ];
+    let edits: [&[&str]; 7] = [
+        &["br", "-f", &store, "Outer"],
+        &["br", "-f", &store, "Outer", "-R"],
+        &[
+            "bs", "-f", &store, "Outer", "-p", "Name", "--str", "Renamed",
+        ],
+        &["bs", "-f", &store, "Outer", "-p", "Parent", "--str", &other],
+        &["rm", "ReplicatedStorage", "-i", "editor:3", "-r", &root],
+        &rename,
+        &[
+            "mv",
+            "ReplicatedStorage",
+            "-i",
+            "editor:3",
+            "-I",
+            &other,
+            "-r",
+            &root,
+        ],
+    ];
+    for edit in edits {
+        assert_eq!(fx.text(edit).err(), NESTED_LINK_REFUSAL, "{edit:?}");
+    }
+    for (label, op) in [
+        (
+            "remove",
+            r#"{"op":"remove","path":"ReplicatedStorage.Outer"}"#,
+        ),
+        (
+            "rename",
+            r#"{"op":"rename","path":"ReplicatedStorage.Outer","name":"Renamed"}"#,
+        ),
+        (
+            "move",
+            r#"{"op":"move","path":"ReplicatedStorage.Outer","parent":"ReplicatedStorage.Other"}"#,
+        ),
+    ] {
+        assert_eq!(
+            run_batch(&fx, &format!("[{op}]")).unwrap_err(),
+            format!("Batch op 0 ({label}): {NESTED_LINK_REFUSAL}")
+        );
+    }
+    assert_eq!(fs::read(fx.store("ReplicatedStorage")).unwrap(), before);
+    let mark = [
+        "bs",
+        "-f",
+        &store,
+        "Outer",
+        "-p",
+        "Mark",
+        "-S",
+        "attribute",
+        "--str",
+        "x",
+    ];
+    fx.text(&mark).ok();
+    fx.text(&[&rename[..], &["--override-packages"]].concat())
+        .ok();
+    assert_eq!(fx.names("ReplicatedStorage")[1], "Renamed");
+    fx.text(&["br", "-f", &store, "Renamed", "--override-packages"])
+        .ok();
+    assert_eq!(
+        fx.names("ReplicatedStorage"),
+        ["ReplicatedStorage", "Other"]
+    );
+}
+
+#[test]
+fn rename_where_refuses_a_match_that_changes_a_read_only_link() {
+    let fx = nested_link_fixture("link-rename-where");
+    let root = fx.path("");
+    let before = fs::read(fx.store("ReplicatedStorage")).unwrap();
+    let rename = |from: &str, to: &str, extra: &[&str]| {
+        let args = [
+            "rn",
+            "ReplicatedStorage",
+            "-i",
+            "editor:3",
+            "--where",
+            "is:Folder",
+            "--replace",
+            from,
+            to,
+            "-r",
+            &root,
+        ];
+        fx.text(&[&args[..], extra].concat())
+    };
+    assert_eq!(rename("Shared", "Changed", &[]).err(), NESTED_LINK_REFUSAL);
+    assert_eq!(rename("S", "Z", &[]).err(), NESTED_LINK_REFUSAL);
+    assert_eq!(fs::read(fx.store("ReplicatedStorage")).unwrap(), before);
+    rename("Spare", "Free", &[]).ok();
+    assert_eq!(fx.names("ReplicatedStorage")[2], "Free");
+    rename("Shared", "Changed", &["--override-packages"]).ok();
+    assert_eq!(fx.names("ReplicatedStorage")[3], "Changed");
+}
+
 #[test]
 fn model_import_and_export_commands_use_project_targets() {
     let fx = Fixture::new("model-commands");

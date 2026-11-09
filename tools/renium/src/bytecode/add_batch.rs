@@ -21,8 +21,8 @@ use crate::bytecode::{
     collect_source_path_updates, ensure_settable_attribute_name, file_mutation_paths,
     fold_derived_property, high_level_split_path, missing_service_store_error,
     preserve_source_path_extension, qualify_value_references, reject_owned_instance_edit,
-    reject_read_only_link_edit, resolve_bytecode_cli_settings_file, store_link_enforcement,
-    stored_property_edit,
+    reject_read_only_link_edit, reject_read_only_link_subtree_edit,
+    resolve_bytecode_cli_settings_file, store_link_enforcement, stored_property_edit,
 };
 use crate::editor::document::is_protected_engine_container;
 use crate::editor::paths::{
@@ -578,7 +578,7 @@ impl BatchState<'_> {
         if state.document.instances[index].parent_index.is_none() {
             bail!("Refusing to remove root instance");
         }
-        state.reject_read_only_link_edit(index)?;
+        reject_read_only_link_subtree_edit(state.links()?, &state.document, &state.service, index)?;
         let children = settings_children_by_parent(&state.document);
         let mut subtree = Vec::new();
         collect_settings_subtree_preorder(&children, index, &mut subtree);
@@ -1073,8 +1073,8 @@ impl StoreState {
         Ok(self.links.get_or_init(|| links))
     }
 
-    /// Refuses an op on the instance at `index`, or one that puts an
-    /// instance under it, inside a read-only link.
+    /// Refuses an op that puts an instance under the one at `index` inside
+    /// a read-only link.
     fn reject_read_only_link_edit(&self, index: usize) -> Result<()> {
         reject_read_only_link_edit(self.links()?, &self.document, &self.service, index)
     }
@@ -1159,7 +1159,9 @@ impl StoreState {
 
     /// Renames or reparents the instance as `rbx bs -S metadata` does.
     fn change_metadata(&mut self, index: usize, property: &str, value: Value) -> Result<()> {
-        reject_owned_instance_edit(&self.document, &self.service, index, self.links()?)?;
+        let links = self.links()?;
+        reject_owned_instance_edit(&self.document, &self.service, index, links)?;
+        reject_read_only_link_subtree_edit(links, &self.document, &self.service, index)?;
         if is_protected_engine_container(&self.document, index) {
             bail!(
                 "{} metadata is read-only",
@@ -1587,6 +1589,7 @@ mod tests {
             "Glass",
             "Window_",
             false,
+            false,
         )
         .unwrap();
         let document = SettingsBytecode::read_file(&store).unwrap();
@@ -1611,6 +1614,7 @@ mod tests {
             "is:Folder",
             "Glass",
             "Window_",
+            false,
             false,
         )
         .unwrap_err()
