@@ -489,6 +489,7 @@ pub(crate) fn print_json_output(value: &Value, pretty: bool) -> Result<()> {
             *output = Some(if CAPTURE_MODE.get() == CaptureMode::Text {
                 let mut text = relativize_project_paths(value.clone());
                 shorten_single_precision_floats(&mut text);
+                trim_store_edit_result(&mut text);
                 text
             } else {
                 value.clone()
@@ -504,6 +505,7 @@ pub(crate) fn print_json_output(value: &Value, pretty: bool) -> Result<()> {
     let value = if MODE.load(Ordering::Relaxed) == 0 {
         let mut text = relativize_project_paths(value.clone());
         shorten_single_precision_floats(&mut text);
+        trim_store_edit_result(&mut text);
         relative = text;
         &relative
     } else {
@@ -522,6 +524,72 @@ pub(crate) fn print_json_output(value: &Value, pretty: bool) -> Result<()> {
         println!("{}", serde_json::to_string(value)?);
     }
     Ok(())
+}
+
+/// What the result of a store edit repeats, which its text form leaves out:
+/// the store file that `changedPaths` already names, the store index and the
+/// split path (printed as one dotted `path`), the push summary's own `ok`
+/// and its `persistence`, and the read-back's path and class once `verified`
+/// is true. A result without `changedPaths` is not a store edit and stays.
+fn trim_store_edit_result(value: &mut Value) {
+    let Some(result) = value.as_object_mut() else {
+        return;
+    };
+    let Some(changed) = result.get("changedPaths").and_then(Value::as_array) else {
+        return;
+    };
+    if result
+        .get("settingsFile")
+        .is_some_and(|file| changed.contains(file))
+    {
+        result.remove("settingsFile");
+    }
+    let segments = result
+        .get("pathSegments")
+        .and_then(Value::as_array)
+        .and_then(|segments| {
+            segments
+                .iter()
+                .map(|segment| segment.as_str().map(str::to_string))
+                .collect::<Option<Vec<_>>>()
+        });
+    let ordinals = result
+        .get("pathOrdinals")
+        .and_then(Value::as_array)
+        .and_then(|ordinals| {
+            ordinals
+                .iter()
+                .map(|ordinal| ordinal.as_u64().map(|ordinal| ordinal as usize))
+                .collect::<Option<Vec<_>>>()
+        });
+    if !result.contains_key("path")
+        && let Some(segments) = segments
+        && let Some(path) =
+            crate::bytecode::explorer::compact_path_string(&segments, ordinals.as_deref())
+    {
+        for key in ["pathSegments", "pathOrdinals", "index"] {
+            result.remove(key);
+        }
+        result.insert("path".to_string(), Value::String(path));
+    }
+    if let Some(push) = result.get_mut("push").and_then(Value::as_object_mut) {
+        if push.get("ok") == Some(&Value::Bool(true)) {
+            push.remove("ok");
+        }
+        push.remove("persistence");
+        if push.is_empty() {
+            result.remove("push");
+        }
+    }
+    if result.get("verified") == Some(&Value::Bool(true))
+        && let Some(studio) = result.get_mut("studio").and_then(Value::as_object_mut)
+    {
+        studio.remove("path");
+        studio.remove("class");
+        if studio.is_empty() {
+            result.remove("studio");
+        }
+    }
 }
 
 static PROJECT_PREFIXES: OnceLock<Vec<String>> = OnceLock::new();
@@ -747,6 +815,86 @@ mod luau_hint_tests {
         );
         assert!(!edit.contains("Hint:"));
         assert!(ensure_luau_api_ok(&json!({"ok": true})).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod store_edit_result_tests {
+    use super::trim_store_edit_result;
+    use serde_json::json;
+
+    #[test]
+    fn a_pushed_edit_keeps_its_verdict_and_values_without_the_repeats() {
+        let mut set = json!({
+            "changedPaths": ["instances/StarterGui.renium"],
+            "ok": true,
+            "push": {"ok": true, "persistence": "unsaved", "properties": 2},
+            "set": ["Text"],
+            "settingsFile": "instances/StarterGui.renium",
+            "settingsId": "editor:88d",
+            "studio": {"Text": "Redeem", "class": "TextLabel", "path": "StarterGui.Main.Title"},
+            "verified": true,
+        });
+        trim_store_edit_result(&mut set);
+        assert_eq!(
+            set,
+            json!({
+                "changedPaths": ["instances/StarterGui.renium"],
+                "ok": true,
+                "push": {"properties": 2},
+                "set": ["Text"],
+                "settingsId": "editor:88d",
+                "studio": {"Text": "Redeem"},
+                "verified": true,
+            })
+        );
+    }
+
+    #[test]
+    fn an_added_instance_prints_one_dotted_path() {
+        let mut added = json!({
+            "changedPaths": ["instances/Workspace.renium"],
+            "index": 41,
+            "ok": true,
+            "pathOrdinals": [1, 1, 2],
+            "pathSegments": ["Workspace", "Lobby", "Pad"],
+            "push": {"ok": true, "persistence": "unsaved"},
+            "settingsFile": "instances/Workspace.renium",
+            "settingsId": "editor:6c71",
+            "studio": {"class": "Part", "path": "Workspace.Lobby.Pad[2]"},
+            "verified": true,
+        });
+        trim_store_edit_result(&mut added);
+        assert_eq!(
+            added,
+            json!({
+                "changedPaths": ["instances/Workspace.renium"],
+                "ok": true,
+                "path": "Workspace.Lobby.Pad[2]",
+                "settingsId": "editor:6c71",
+                "verified": true,
+            })
+        );
+    }
+
+    #[test]
+    fn a_failed_read_back_and_other_results_stay_whole() {
+        let mut unverified = json!({
+            "changedPaths": ["instances/Workspace.renium"],
+            "ok": true,
+            "pathSegments": ["Workspace", "a.b"],
+            "settingsFile": "instances/Other.renium",
+            "studio": {"class": "Part", "path": "Workspace.Pad"},
+            "verified": false,
+        });
+        let before = unverified.clone();
+        trim_store_edit_result(&mut unverified);
+        assert_eq!(unverified, before);
+        let mut other =
+            json!({"ok": true, "settingsFile": "instances/Workspace.renium", "index": 3});
+        let before = other.clone();
+        trim_store_edit_result(&mut other);
+        assert_eq!(other, before);
     }
 }
 

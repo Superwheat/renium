@@ -61,6 +61,8 @@
 - `rbx ps -s SERVICE` pushes a service's store file.
 - `rbx tr` prints an indented tree in text mode: one `Name Class` line per instance, one space of indent per level, ` +N` for children not shown, `Name[2]` for a later sibling of the same name and `Name[1-4]` for a run of alike siblings. `rbx f` prints `path Class` lines, a shared parent once as `path:`, and says when the limit cut the list. `--output-mode json`, or an explicit `-F` or `-o`, returns the records with their ids as before.
 - `rbx sg` and `rbx ss` print each script's path once and then its hits as `LINE: text` without the indentation, a line over 240 characters cut short, and a last line when the limit left hits out.
+- A held push prints at most 20 review rows in text mode, one short line each: `+ PATH Class` for an added instance, `- PATH Class` for a removed one and `PATH: Property, Property` for changed values; `moreReviewRows` counts the rest.
+- Store edits that report `changedPaths` (`ba`, `bs`, `cp`, `mv`, `rn`, `br` and the rest) leave out of their text result what it repeats: the store file `changedPaths` already names, the store index and the split path (one dotted `path` instead), the push summary's own `ok` and `persistence`, and the read-back's path and class once `verified` is true.
 
 ### Bug fixes
 

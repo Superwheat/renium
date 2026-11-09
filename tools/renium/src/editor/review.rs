@@ -850,12 +850,65 @@ pub(crate) fn editor_review_digest(rows: &[Value], limit: usize) -> (Vec<Value>,
     (digest, rows.len().saturating_sub(limit))
 }
 
+/// How many review rows a text-mode result prints.
+const COMPACT_REVIEW_ROWS: usize = 20;
+
+/// A digest row as one line: `+ PATH Class` for an added instance,
+/// `- PATH Class` for a removed one, the kind before the path for a replaced
+/// or reconciled one, and `PATH: Name, Name` for changed values. An added
+/// instance brings everything it holds, so its value names are left out.
+fn review_row_text(row: &Value) -> String {
+    let path = row.get("path").and_then(Value::as_str).unwrap_or("");
+    let class = row.get("class").and_then(Value::as_str).unwrap_or("");
+    let changes = row
+        .get("changes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    let whole = changes.iter().find_map(|change| {
+        if change.starts_with("+instance") {
+            Some("+")
+        } else if *change == "-instance" {
+            Some("-")
+        } else if *change == "replace instance" {
+            Some("replace")
+        } else if change.starts_with("reconcile subtree") {
+            Some(*change)
+        } else {
+            None
+        }
+    });
+    match whole {
+        Some(kind) => format!("{kind} {path} {class}"),
+        None => format!("{path}: {}", changes.join(", ")),
+    }
+}
+
+/// The digest as a text-mode result prints it: the first rows, one line
+/// each, and the count of rows left out.
+fn compact_review_digest(digest: &[Value], more_rows: usize) -> (Vec<Value>, usize) {
+    let rows = digest
+        .iter()
+        .take(COMPACT_REVIEW_ROWS)
+        .map(|row| Value::String(review_row_text(row)))
+        .collect::<Vec<_>>();
+    let cut = digest.len().saturating_sub(COMPACT_REVIEW_ROWS);
+    (rows, more_rows + cut)
+}
+
 fn held_editor_summary(
     change_count: u64,
     digest: Vec<Value>,
     more_rows: usize,
     response: &Value,
 ) -> Map<String, Value> {
+    let (digest, more_rows) = if crate::app::output::compact_text_output() {
+        compact_review_digest(&digest, more_rows)
+    } else {
+        (digest, more_rows)
+    };
     let mut summary = Map::new();
     summary.insert("ok".to_string(), Value::Bool(true));
     summary.insert("heldForReview".to_string(), Value::Bool(true));
@@ -1820,6 +1873,52 @@ mod review_threshold_tests {
         assert_eq!(summary["reviewThreshold"], json!(3));
         assert!(summary.get("moreReviewRows").is_none());
         assert!(summary["next"].as_str().unwrap().contains("--yes"));
+    }
+
+    #[test]
+    fn a_text_review_prints_one_short_line_per_instance() {
+        let row = |path: &str, class: &str, changes: Value| json!({ "path": path, "class": class, "changes": changes });
+        let mut digest = vec![
+            row(
+                "Workspace.Lobby.Pad",
+                "Part",
+                json!([
+                    "+instance (upsert: existing ancestors stay)",
+                    "Size",
+                    "@Owner"
+                ]),
+            ),
+            row("Workspace.Old", "Model", json!(["-instance"])),
+            row(
+                "Workspace.Map",
+                "Folder",
+                json!(["reconcile subtree (deletes allowed)"]),
+            ),
+            row(
+                "Workspace.Door",
+                "Part",
+                json!(["Size", "Reflectance (reset)", "-@Owner"]),
+            ),
+            row("ServerScriptService.Main", "Script", json!(["Source"])),
+        ];
+        let (rows, more) = compact_review_digest(&digest, 0);
+        assert_eq!(more, 0);
+        assert_eq!(
+            Value::Array(rows),
+            json!([
+                "+ Workspace.Lobby.Pad Part",
+                "- Workspace.Old Model",
+                "reconcile subtree (deletes allowed) Workspace.Map Folder",
+                "Workspace.Door: Size, Reflectance (reset), -@Owner",
+                "ServerScriptService.Main: Source",
+            ])
+        );
+        digest.extend(
+            (0..30).map(|index| row(&format!("Workspace.P{index}"), "Part", json!(["Size"]))),
+        );
+        let (rows, more) = compact_review_digest(&digest, 7);
+        assert_eq!(rows.len(), COMPACT_REVIEW_ROWS);
+        assert_eq!(more, 7 + 35 - COMPACT_REVIEW_ROWS);
     }
 
     #[test]
