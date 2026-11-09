@@ -107,6 +107,7 @@
 - `rbx rn --where` could rename instances inside a read-only link package; a call with such a match is refused as a whole unless `--override-packages` is given.
 - A reference property written as a path into another service (`-p 'Value="ReplicatedStorage.Shared.Util"'`) stays on its target: it follows renames and moves (`rbx rn`, `rbx mv`, `rbx bs -p Name`, batch ops), is cleared when the target is removed, and `rbx bep` no longer fails on it or points it at a same-numbered instance of another service.
 - A reference path that names no instance in the stores is refused, `Pad[2]` picks the second of two same-named instances, and a build that cannot resolve a reference names the instance, the property and the path.
+- A Live Sync merge that keeps or brings back a script one side removed (for a reference or a child the preferred side added, or for its changed properties) also brings back its source file from the side that still has the script.
 
 ## 0.5.9 - 2026-11-06
 

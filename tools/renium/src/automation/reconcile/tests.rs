@@ -3763,6 +3763,178 @@ fn source_edit_conflicts_with_script_deletion_before_source_enters_baseline() {
 }
 
 #[test]
+fn a_script_the_merge_brings_back_keeps_its_source_file() {
+    let settings_path = PathBuf::from("src/ReplicatedStorage/__roblox_sync_settings.renium");
+    let source_path = PathBuf::from("src/ReplicatedStorage/Logic.luau");
+    let instance = |id: &str, name: &str, class_name: &str, parent_index: Option<usize>| {
+        SettingsBytecodeInstance {
+            settings_id: id.to_string(),
+            name: name.to_string(),
+            class_name: class_name.to_string(),
+            parent_index,
+            properties: Map::new(),
+            attributes: Map::new(),
+        }
+    };
+    let root = || instance("root", "ReplicatedStorage", "ReplicatedStorage", None);
+    let logic = || instance("script", "Logic", "ModuleScript", Some(0));
+    let snapshot = |instances: Vec<SettingsBytecodeInstance>, source: Option<&[u8]>| {
+        let mut snapshot = ProjectSnapshot::default();
+        snapshot.entries.insert(
+            settings_path.clone(),
+            SnapshotEntry::File(
+                encode_settings_bytecode(&SettingsBytecode {
+                    version: SETTINGS_BINARY_VERSION,
+                    instances,
+                })
+                .unwrap(),
+            ),
+        );
+        if let Some(source) = source {
+            snapshot
+                .entries
+                .insert(source_path.clone(), SnapshotEntry::File(source.to_vec()));
+        }
+        snapshot
+    };
+    let names = |merged: &ProjectSnapshot| {
+        settings_document(merged.entries.get(&settings_path))
+            .unwrap()
+            .instances
+            .into_iter()
+            .map(|instance| instance.name)
+            .collect::<Vec<_>>()
+    };
+    let source = b"return 'base'".as_slice();
+    let baseline = snapshot(
+        vec![
+            root(),
+            logic(),
+            instance("ptr", "Pointer", "ObjectValue", Some(0)),
+        ],
+        Some(source),
+    );
+    let removed = snapshot(
+        vec![root(), instance("ptr", "Pointer", "ObjectValue", Some(0))],
+        None,
+    );
+    let mut pointer = instance("ptr", "Pointer", "ObjectValue", Some(0));
+    pointer.properties.insert(
+        "Value".to_string(),
+        json!({"_type": "Ref", "settingsId": "script"}),
+    );
+    let referred = snapshot(vec![root(), logic(), pointer], Some(source));
+
+    // The files removed the script, Studio points at it and wins: the script
+    // comes back with the source Studio has, which the files now lack.
+    let (merged, conflicts, changes) = merge_snapshots_with_changes(
+        Some(&baseline),
+        &removed,
+        &referred,
+        ConflictPreference::Studio,
+        None,
+    )
+    .unwrap();
+    assert!(conflicts.is_empty(), "{conflicts:?}");
+    assert_eq!(names(&merged), ["ReplicatedStorage", "Pointer", "Logic"]);
+    assert!(merged.entries.get(&source_path) == referred.entries.get(&source_path));
+    assert!(changes.editor.contains(&source_path));
+    assert!(!changes.studio.contains(&source_path));
+
+    // The same with the sides swapped.
+    let (merged, conflicts, changes) = merge_snapshots_with_changes(
+        Some(&baseline),
+        &referred,
+        &removed,
+        ConflictPreference::Editor,
+        None,
+    )
+    .unwrap();
+    assert!(conflicts.is_empty(), "{conflicts:?}");
+    assert_eq!(names(&merged), ["ReplicatedStorage", "Pointer", "Logic"]);
+    assert!(merged.entries.get(&source_path) == referred.entries.get(&source_path));
+    assert!(changes.studio.contains(&source_path));
+    assert!(!changes.editor.contains(&source_path));
+
+    // The removal wins: the script and its source stay removed.
+    let (merged, conflicts) = merge_snapshots(
+        Some(&baseline),
+        &removed,
+        &referred,
+        ConflictPreference::Editor,
+    )
+    .unwrap();
+    assert!(conflicts.is_empty(), "{conflicts:?}");
+    assert_eq!(names(&merged), ["ReplicatedStorage", "Pointer"]);
+    assert!(!merged.entries.contains_key(&source_path));
+
+    // A script kept for an attribute Studio gave it keeps its source too.
+    let mut marked = logic();
+    marked.attributes.insert("Mark".to_string(), json!(1));
+    let changed = snapshot(
+        vec![
+            root(),
+            marked,
+            instance("ptr", "Pointer", "ObjectValue", Some(0)),
+        ],
+        Some(source),
+    );
+    let (merged, conflicts, changes) = merge_snapshots_with_changes(
+        Some(&baseline),
+        &removed,
+        &changed,
+        ConflictPreference::Studio,
+        None,
+    )
+    .unwrap();
+    assert!(conflicts.is_empty(), "{conflicts:?}");
+    assert_eq!(names(&merged), ["ReplicatedStorage", "Logic", "Pointer"]);
+    assert!(merged.entries.get(&source_path) == changed.entries.get(&source_path));
+    assert!(changes.editor.contains(&source_path));
+
+    // A script that comes back as the parent of an added instance keeps its
+    // source as well.
+    let folder_path = PathBuf::from("src/ReplicatedStorage/Logic");
+    let init_path = folder_path.join("init.luau");
+    let nested = |mut snapshot: ProjectSnapshot| {
+        if let Some(source) = snapshot.entries.remove(&source_path) {
+            snapshot
+                .entries
+                .insert(folder_path.clone(), SnapshotEntry::Directory);
+            snapshot.entries.insert(init_path.clone(), source);
+        }
+        snapshot
+    };
+    let old = || instance("old", "Old", "Folder", Some(1));
+    let baseline = nested(snapshot(vec![root(), logic(), old()], Some(source)));
+    let removed = snapshot(vec![root()], None);
+    let added = nested(snapshot(
+        vec![
+            root(),
+            logic(),
+            old(),
+            instance("new", "New", "Folder", Some(1)),
+        ],
+        Some(source),
+    ));
+    let (merged, conflicts, changes) = merge_snapshots_with_changes(
+        Some(&baseline),
+        &removed,
+        &added,
+        ConflictPreference::Studio,
+        None,
+    )
+    .unwrap();
+    assert!(conflicts.is_empty(), "{conflicts:?}");
+    assert_eq!(names(&merged), ["ReplicatedStorage", "Logic", "New"]);
+    assert!(merged.entries.get(&init_path) == added.entries.get(&init_path));
+    assert!(merged.entries.get(&folder_path) == Some(&SnapshotEntry::Directory));
+    assert!(changes.editor.contains(&init_path));
+    assert!(changes.editor.contains(&folder_path));
+    assert!(!changes.studio.contains(&init_path));
+}
+
+#[test]
 fn three_way_settings_merge_keeps_concurrent_additions() {
     let instance = |id: &str, name: &str, parent_index: Option<usize>| SettingsBytecodeInstance {
         settings_id: id.to_string(),

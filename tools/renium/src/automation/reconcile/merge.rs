@@ -78,7 +78,7 @@ pub(crate) fn merge_snapshots_with_changes(
         }
     }
     keep_directories_implied_by_files(&mut merged, &sides, &mut changes);
-    remove_superseded_script_paths(baseline, editor, studio, &mut merged, &mut changes)?;
+    settle_script_paths(&sides, &mut merged, &mut changes)?;
     conflicts.sort();
     conflicts.dedup();
     Ok((ProjectSnapshot { entries: merged }, conflicts, changes))
@@ -99,33 +99,42 @@ fn keep_directories_implied_by_files(
         .filter(|(_, entry)| matches!(entry, SnapshotEntry::File(_)))
         .map(|(path, _)| path.clone())
         .collect::<Vec<_>>();
+    for file in files {
+        keep_directories_implied_by_file(&file, merged, sides, changes);
+    }
+}
+
+fn keep_directories_implied_by_file(
+    file: &Path,
+    merged: &mut BTreeMap<PathBuf, SnapshotEntry>,
+    sides: &SnapshotSides<'_>,
+    changes: &mut MergeChanges,
+) {
     let is_directory = |snapshot: &ProjectSnapshot, path: &Path| {
         matches!(snapshot.entries.get(path), Some(SnapshotEntry::Directory))
     };
-    for file in files {
-        for ancestor in file.ancestors().skip(1) {
-            if ancestor.as_os_str().is_empty() || merged.contains_key(ancestor) {
-                continue;
-            }
-            let known = is_directory(sides.editor, ancestor)
-                || is_directory(sides.studio, ancestor)
-                || sides
-                    .baseline
-                    .is_some_and(|baseline| is_directory(baseline, ancestor));
-            if !known {
-                continue;
-            }
-            merged.insert(ancestor.to_path_buf(), SnapshotEntry::Directory);
-            if is_directory(sides.editor, ancestor) {
-                changes.editor.remove(ancestor);
-            } else {
-                changes.editor.insert(ancestor.to_path_buf());
-            }
-            if is_directory(sides.studio, ancestor) {
-                changes.studio.remove(ancestor);
-            } else {
-                changes.studio.insert(ancestor.to_path_buf());
-            }
+    for ancestor in file.ancestors().skip(1) {
+        if ancestor.as_os_str().is_empty() || merged.contains_key(ancestor) {
+            continue;
+        }
+        let known = is_directory(sides.editor, ancestor)
+            || is_directory(sides.studio, ancestor)
+            || sides
+                .baseline
+                .is_some_and(|baseline| is_directory(baseline, ancestor));
+        if !known {
+            continue;
+        }
+        merged.insert(ancestor.to_path_buf(), SnapshotEntry::Directory);
+        if is_directory(sides.editor, ancestor) {
+            changes.editor.remove(ancestor);
+        } else {
+            changes.editor.insert(ancestor.to_path_buf());
+        }
+        if is_directory(sides.studio, ancestor) {
+            changes.studio.remove(ancestor);
+        } else {
+            changes.studio.insert(ancestor.to_path_buf());
         }
     }
 }
@@ -232,13 +241,45 @@ pub(crate) fn changed_script_source_ids(
         .collect())
 }
 
-pub(crate) fn remove_superseded_script_paths(
-    baseline: Option<&ProjectSnapshot>,
-    editor: &ProjectSnapshot,
-    studio: &ProjectSnapshot,
+/// The source files of the scripts the merged store holds although one side
+/// no longer has them: a preference brought the script back for a reference
+/// or a child that side knows nothing of, or kept its changed record. The
+/// files merge on their own and follow that side's removal, so each comes
+/// back with the content of the side that has the script, at the path the
+/// merged store gives it.
+fn sources_of_scripts_one_side_removed(
+    merged: &BTreeMap<PathBuf, SnapshotEntry>,
+    merged_paths: &HashMap<String, PathBuf>,
+    editor: (&ProjectSnapshot, &HashMap<String, PathBuf>),
+    studio: (&ProjectSnapshot, &HashMap<String, PathBuf>),
+) -> Vec<(PathBuf, SnapshotEntry)> {
+    let mut sources = Vec::new();
+    for (id, path) in merged_paths {
+        if matches!(merged.get(path), Some(SnapshotEntry::File(_))) {
+            continue;
+        }
+        let source = match (editor.1.get(id), studio.1.get(id)) {
+            (Some(kept), None) => editor.0.entries.get(kept),
+            (None, Some(kept)) => studio.0.entries.get(kept),
+            _ => None,
+        };
+        if let Some(source @ SnapshotEntry::File(_)) = source {
+            sources.push((path.clone(), source.clone()));
+        }
+    }
+    sources
+}
+
+/// Brings the script files of every store the merge changed in line with
+/// the merged store: a script that came back against one side's removal
+/// gets its source file back, and a file at a path no script of the merged
+/// store has is removed.
+pub(crate) fn settle_script_paths(
+    sides: &SnapshotSides<'_>,
     merged: &mut BTreeMap<PathBuf, SnapshotEntry>,
     changes: &mut MergeChanges,
 ) -> Result<()> {
+    let (baseline, editor, studio) = (sides.baseline, sides.editor, sides.studio);
     let settings_paths = changes
         .editor
         .iter()
@@ -251,6 +292,7 @@ pub(crate) fn remove_superseded_script_paths(
         .cloned()
         .collect::<BTreeSet<_>>();
     let mut touched = BTreeSet::new();
+    let mut restored = Vec::new();
     for settings_path in settings_paths {
         let baseline_paths = baseline
             .map(|snapshot| script_paths_by_settings_id(&snapshot.entries, &settings_path))
@@ -259,6 +301,16 @@ pub(crate) fn remove_superseded_script_paths(
         let editor_paths = script_paths_by_settings_id(&editor.entries, &settings_path)?;
         let studio_paths = script_paths_by_settings_id(&studio.entries, &settings_path)?;
         let merged_paths = script_paths_by_settings_id(merged, &settings_path)?;
+        for (path, source) in sources_of_scripts_one_side_removed(
+            merged,
+            &merged_paths,
+            (editor, &editor_paths),
+            (studio, &studio_paths),
+        ) {
+            merged.insert(path.clone(), source);
+            touched.insert(path.clone());
+            restored.push(path);
+        }
         let desired_paths = merged_paths.values().collect::<HashSet<_>>();
         let ids = baseline_paths
             .keys()
@@ -296,6 +348,9 @@ pub(crate) fn remove_superseded_script_paths(
         } else {
             changes.studio.insert(path);
         }
+    }
+    for path in restored {
+        keep_directories_implied_by_file(&path, merged, sides, changes);
     }
     Ok(())
 }
