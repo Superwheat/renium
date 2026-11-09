@@ -59,6 +59,7 @@
 
 ### Bug fixes
 
+- A store-file push the review held (`rbx ps instances/SERVICE.renium` with more than the threshold's changes) returns the hold and its `--yes` hint again; it used to go on to read Studio back and report "did not retain pushed project changes" for instances nothing had created yet.
 - `rbx dev set` no longer reports a 1.5 s timeout for a device Studio did switch to: when the setters outlive the plugin's reply window, the status read afterwards stands in for the result and carries `settledAfterTimeout`.
 - Live Sync no longer reports a conflict on a part color nobody changed: colors Studio keeps in bytes (a part's `Color`) compare by their byte values, so 0.3 in the files and 77/255 in the open place are one color.
 

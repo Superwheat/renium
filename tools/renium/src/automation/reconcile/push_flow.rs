@@ -1,5 +1,13 @@
 use super::*;
 
+/// A push the Studio review held (`heldForReview`) or skipped applied no
+/// change, however many it listed.
+fn push_applied_nothing(summary: &Map<String, Value>) -> bool {
+    ["heldForReview", "skippedByReview"]
+        .iter()
+        .any(|key| summary.get(*key) == Some(&Value::Bool(true)))
+}
+
 /// Hands the previous push's native attribute observer over to the fresh
 /// lease: the old one stops only once the proof check inside the lease has
 /// passed, and the new relay starts from the path the state names.
@@ -441,6 +449,11 @@ pub(crate) fn push_project(
             later_edits_follow: false,
         },
     )?;
+    if push_applied_nothing(&pushed.summary) {
+        // Studio holds or skipped the whole push, so there is nothing to
+        // record or read back; the summary carries the hold and its next step.
+        return Ok(pushed.summary);
+    }
     pushed.summary.insert(
         "historyId".into(),
         Value::String(history.commit(&project, &pushed.generated)?),
@@ -867,4 +880,30 @@ pub(crate) fn project_relative_source_root(
             )
         })
         .map(Path::to_path_buf)
+}
+
+#[cfg(test)]
+mod review_hold_tests {
+    use super::push_applied_nothing;
+    use serde_json::{Map, Value, json};
+
+    fn summary(value: Value) -> Map<String, Value> {
+        value.as_object().cloned().unwrap()
+    }
+
+    #[test]
+    fn a_held_or_skipped_push_applied_nothing() {
+        assert!(push_applied_nothing(&summary(
+            json!({ "ok": true, "heldForReview": true, "effectiveChanges": 8 })
+        )));
+        assert!(push_applied_nothing(&summary(
+            json!({ "ok": true, "skippedByReview": true })
+        )));
+        assert!(!push_applied_nothing(&summary(
+            json!({ "ok": true, "instances": { "created": 8 } })
+        )));
+        assert!(!push_applied_nothing(&summary(
+            json!({ "ok": true, "heldForReview": false })
+        )));
+    }
 }
