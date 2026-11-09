@@ -919,6 +919,138 @@ fn pushed_batch_finds_renamed_moved_and_removed_instances_by_their_old_paths() {
     );
 }
 
+/// Names with their parent's name, for the instances a merge test cares about.
+fn merged_placements(path: &str, names: &[&str]) -> Vec<(String, String)> {
+    let document = SettingsBytecode::read_file(Path::new(path)).unwrap();
+    names
+        .iter()
+        .filter_map(|name| {
+            let instance = document
+                .instances
+                .iter()
+                .find(|instance| instance.name == *name)?;
+            let parent = instance
+                .parent_index
+                .map(|index| document.instances[index].name.clone())
+                .unwrap_or_default();
+            Some((name.to_string(), parent))
+        })
+        .collect()
+}
+
+#[test]
+fn a_preferred_merge_keeps_instances_whose_parent_the_other_side_removed() {
+    let fx = Fixture::new("merge-orphans");
+    run_batch(
+        &fx,
+        r##"[{"parent":"Workspace","name":"Props","class":"Folder","ref":"props"},
+            {"parent":"#props","name":"A","class":"Folder","ref":"a"},
+            {"parent":"#a","name":"Leaf","class":"Folder"},
+            {"parent":"#props","name":"B","class":"Folder"},
+            {"parent":"#props","name":"Sign","class":"StringValue","props":{"Value":"hello"}}]"##,
+    )
+    .unwrap();
+    let store = fx.store("Workspace");
+    let workspace = fx.store_arg("Workspace");
+    let snapshot = |name: &str| {
+        let path = fx.root.join(name);
+        fs::copy(&store, &path).unwrap();
+        path.to_string_lossy().into_owned()
+    };
+    let base = snapshot("base.renium");
+    let merged = fx.path("merged.renium");
+    let merge = |ours: &str, theirs: &str, prefer: &str, names: &[&str]| {
+        fx.text(&[
+            "vcm", &base, ours, theirs, "-o", &merged, "--prefer", prefer,
+        ])
+        .ok();
+        merged_placements(&merged, names)
+    };
+    let placed = |pairs: &[(&str, &str)]| {
+        pairs
+            .iter()
+            .map(|(name, parent)| (name.to_string(), parent.to_string()))
+            .collect::<Vec<_>>()
+    };
+
+    // One side removes B, the other moves A (with Leaf) into B.
+    fx.text(&["br", "-f", &workspace, "Props.B"]).ok();
+    let removed_b = snapshot("removed-b.renium");
+    fs::copy(&base, &store).unwrap();
+    run_batch(
+        &fx,
+        r##"[{"op":"move","path":"Workspace.Props.A","parent":"Workspace.Props.B"}]"##,
+    )
+    .unwrap();
+    let moved_a = snapshot("moved-a.renium");
+    assert!(
+        fx.text(&["vcm", &base, &removed_b, &moved_a, "-o", &merged])
+            .err()
+            .contains("merge conflict"),
+        "without a preference the move into a removed parent is a conflict"
+    );
+    // The side that removed B wins: A stays where that side has it.
+    assert_eq!(
+        merge(&removed_b, &moved_a, "ours", &["A", "Leaf", "B"]),
+        placed(&[("A", "Props"), ("Leaf", "A")])
+    );
+    // The side that moved A wins: B comes back to hold it.
+    assert_eq!(
+        merge(&removed_b, &moved_a, "theirs", &["A", "Leaf", "B"]),
+        placed(&[("A", "B"), ("Leaf", "A"), ("B", "Props")])
+    );
+    assert_eq!(
+        merge(&moved_a, &removed_b, "ours", &["A", "Leaf", "B"]),
+        placed(&[("A", "B"), ("Leaf", "A"), ("B", "Props")])
+    );
+
+    // One side removes Props, the other edits Sign inside it.
+    fs::copy(&base, &store).unwrap();
+    fx.text(&["br", "-f", &workspace, "Props"]).ok();
+    let removed_props = snapshot("removed-props.renium");
+    fs::copy(&base, &store).unwrap();
+    fx.text(&[
+        "bs",
+        "-f",
+        &workspace,
+        "Props.Sign",
+        "-p",
+        "Value=\"edited\"",
+    ])
+    .ok();
+    let edited_sign = snapshot("edited-sign.renium");
+    // The edit wins: Props comes back for it; what nobody touched stays removed.
+    assert_eq!(
+        merge(
+            &removed_props,
+            &edited_sign,
+            "theirs",
+            &["Props", "Sign", "A", "B"]
+        ),
+        placed(&[("Props", "Workspace"), ("Sign", "Props")])
+    );
+    assert_eq!(
+        SettingsBytecode::read_file(Path::new(&merged))
+            .unwrap()
+            .instances
+            .iter()
+            .find(|instance| instance.name == "Sign")
+            .unwrap()
+            .properties["Value"],
+        json!("edited")
+    );
+    // The removal wins: nothing of Props is left.
+    assert_eq!(
+        merge(
+            &removed_props,
+            &edited_sign,
+            "ours",
+            &["Props", "Sign", "A", "B"]
+        ),
+        placed(&[])
+    );
+}
+
 #[test]
 fn a_scaled_label_stores_the_wrapping_studio_keeps() {
     let fx = Fixture::new("scaled-label");

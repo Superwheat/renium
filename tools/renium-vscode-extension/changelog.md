@@ -80,6 +80,7 @@
 - `rbx build` turned a folder with `init.luau` into a plain Folder and dropped its source when the folder also held a `.txt` or `.json` file and an earlier tree node came first; it is now built as the script.
 - `rbx build` ignored `Position` and `Orientation` set in a project tree node or `.meta.json` and left the part at the origin; both now place the part.
 - `rbx cmp PLACE --full` reported changes on a place just built from the project for properties Roblox renamed (SoundId/AudioContent, BrickColor/Color, Image/ImageContent); they now compare equal.
+- A merge with a preference (`rbx vcm --prefer ours|theirs`, and the same merge when a sync resolves toward one side) silently dropped an instance and everything under it when the other side had removed its parent. The instance now follows the preferred side: the parent comes back when that side still has it, and otherwise the instance stays where that side has it.
 
 ## 0.5.9 - 2026-11-06
 

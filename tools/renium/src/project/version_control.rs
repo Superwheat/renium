@@ -774,6 +774,54 @@ fn merged_instance_from(document: &SettingsBytecode, index: usize) -> VcMergedIn
     }
 }
 
+/// With a preference, an instance whose parent the merge left out follows
+/// the preferred side instead of vanishing with that parent. Where the
+/// preferred side still has the parent, the parent comes back: the other
+/// side's removal loses to the preferred side's use of it. Where the
+/// preferred side removed the parent, the instance stays where that side has
+/// it. Only an instance the preferred side does not have goes with its parent.
+fn reattach_orphans(
+    merged: &mut Vec<VcMergedInstance>,
+    preferred: &SettingsBytecode,
+    id_remap: &HashMap<String, String>,
+) {
+    let preferred_ids = settings_ids_by_index(preferred);
+    let mut present = merged
+        .iter()
+        .map(|record| record.settings_id.clone())
+        .collect::<HashSet<_>>();
+    let mut index = 0;
+    // A restored parent is appended and visited in turn, so a chain of
+    // removed ancestors comes back link by link.
+    while index < merged.len() {
+        let Some(parent) = merged[index]
+            .parent_id
+            .clone()
+            .filter(|parent| !present.contains(parent))
+        else {
+            index += 1;
+            continue;
+        };
+        if let Some(&parent_index) = preferred_ids.get(&parent) {
+            let mut restored = merged_instance_from(preferred, parent_index);
+            restored.parent_id = restored
+                .parent_id
+                .map(|id| id_remap.get(&id).cloned().unwrap_or(id));
+            remap_record_reference_ids(&mut restored.properties, id_remap);
+            remap_record_reference_ids(&mut restored.attributes, id_remap);
+            present.insert(parent);
+            merged.push(restored);
+            index += 1;
+        } else if let Some(&own_index) = preferred_ids.get(&merged[index].settings_id) {
+            // The preferred side's parent of its own instance exists on that
+            // side, so the next pass finds it present or restores it.
+            merged[index].parent_id = settings_parent_id(preferred, own_index);
+        } else {
+            index += 1;
+        }
+    }
+}
+
 fn parent_cycles(instances: &[VcMergedInstance]) -> Vec<Vec<usize>> {
     let index_by_id = instances
         .iter()
@@ -896,6 +944,8 @@ fn finish_settings_merge(
                     record.parent_id.as_deref().unwrap_or_default()
                 ),
             }),
+            // With a preference only the other side's additions under a
+            // parent the preferred side removed are still orphans here.
             None => {}
         }
     }
@@ -1207,6 +1257,15 @@ fn merge_prepared_settings_documents(
     }
 
     let preferred = structural_prefer.map(|prefer_ours| if prefer_ours { ours } else { theirs });
+    if let Some(preferred) = preferred {
+        let no_remap = HashMap::new();
+        let id_remap = if structural_prefer == Some(false) {
+            &theirs_id_remap
+        } else {
+            &no_remap
+        };
+        reattach_orphans(&mut merged, preferred, id_remap);
+    }
     resolve_parent_cycles(&mut merged, preferred, &mut conflicts);
 
     finish_settings_merge(merged, structural_prefer, version, conflicts)
