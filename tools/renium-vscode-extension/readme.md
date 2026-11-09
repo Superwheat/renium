@@ -1,100 +1,48 @@
 # Renium for VS Code and Cursor
 
-Edit scripts and instances in your editor while Studio and project files stay in sync.
-[Installation and CLI guide](../renium/README.md).
+This extension keeps Roblox Studio and your project files in sync while you edit
+scripts and instances in your editor. It bundles the matching CLI and puts `rbx`
+and `renium` on PATH in new terminals. The [main README](../../README.md) covers
+installing, and the [CLI guide](../renium/README.md) covers the CLI.
 
 ## Start
 
-1. Open the intended place in Studio and a dedicated project folder in your editor.
-2. For a new project, run **Renium: Pull Studio to Files**.
-3. Enable **Renium: Start Live Sync**. For an existing project, start Live Sync
-   without first pulling over your files.
-
-Saves flow to Studio; Studio edits flow to files. File edits during Play wait
-for Edit mode. Healthy Live Sync needs no push or playtest after each save.
-Conflicts ask which version to keep.
-
-Use **Renium: Open Menu** for sync, places, packages, Git, settings, and diagnostics.
-The Output panel reports errors and pending work.
+Open the place in Studio and a folder for the project in your editor. For a new
+project, run **Renium: Pull from Studio**, then **Renium: Start Live Sync**. For a
+project that already has files, start Live Sync without pulling, so your files are
+not replaced. Edits made during Play wait for Edit mode, and a conflict asks which
+version to keep. **Renium: Open Menu** has sync, places, packages, Git, settings
+and diagnostics.
 
 ## Explorer and Inspector
 
-Browse the project hierarchy, search instances, and edit properties/attributes
-without opening Studio. Drag a `.renium` store onto **Inspector**, or double-click
-it, to inspect instances, source, references, and IDs.
+The Explorer shows the project hierarchy and lets you search instances and edit
+properties and attributes without opening Studio. Drag a `.renium` store onto the
+Inspector, or double-click it, to see its instances, sources, references and IDs.
 
-## Multiple places
+## Places, packages and Git
 
-Use **Manage Places → Add Current Studio Place** for each published place.
-Renium checks the GameId and creates separate project folders:
+**Renium: Manage Places** adds the connected Studio place to the experience as its
+own project folder, and switches, renames or reorders places.
+**Renium: Sync Wally Packages** installs the dependencies from `wally.toml`. The
+Git tab shows the branch and project changes and pulls fast-forward only. A Git
+push never publishes anything to Roblox.
 
-```text
-renium.experience.json
-places/
-  main/
-    renium.project.jsonc
-    src/
-    sourcemap.json
-  lobby/
-    renium.project.jsonc
-    src/
-    sourcemap.json
-```
+## Settings and updates
 
-**Switch Active Place** chooses the sync target. **Rename Active Place** moves
-its folder, not its Roblox name. **Reorder Places** changes display order.
+Search **Renium** in the editor's Settings to see every option. The extension
+checks for signed updates when the editor opens, unless
+`renium.automaticUpdateChecks` is off; after an update, reload the editor and
+restart Studio. On macOS, protected properties and Terrain need the Studio patch
+described in the [main README](../../README.md#the-native-helper).
 
-Aliases derive from published names. Place configs default to
-`{ "schemaVersion": 1 }`; `sourceRoot` overrides `src`.
-The workspace remembers the active place; the experience file stores order.
-Without an experience file, the project stays single-place.
-
-## Packages and Git
-
-**Sync Wally Packages** installs/imports dependencies from `wally.toml`.
-Renium can create a missing manifest. Shared packages default to
-`<sourceRoot>/ReplicatedStorage/Packages`; server/dev targets are configurable.
-Applying packages to Studio is a separate choice.
-
-The **Git** tab shows branch, remote, ahead/behind, and project changes.
-It uses fast-forward-only pull, pauses mirroring during pull/checkout, rejects
-unexpected staged files, and excludes untracked files by default. Credentials
-are redacted from remote URLs. Applying pulled files to Studio is optional.
-Git push does not publish a Roblox place or package.
-
-## Requirements and settings
-
-The extension bundles the matching CLI and exposes `rbx`/`renium` in new terminals.
-No executable copies belong in projects. Studio operations need the Renium plugin;
-Git and Wally workflows need their project-configured tools.
-
-Search **Renium** in editor Settings for descriptions, defaults, and allowed values.
-Common groups:
-
-| Setting | Purpose |
-|---|---|
-| `renium.cliPath` | Optional CLI override; blank uses the bundle |
-| `renium.projectRoot` | Project folder; defaults to the workspace |
-| `renium.autoSyncOnSave` / `autoSyncDebounceMs` | Manual-sync save behavior |
-| `renium.editorLiveSyncEnabled` / `studioLiveSyncEnabled` | Sync directions |
-| `renium.studioLiveSyncPollMs` | Studio polling interval |
-| `renium.gitSync.*` | Git tool, scope, staging, confirmations, and Studio application |
-| `renium.wallySync.*` | Wally tool, package folders, realm targets, and install behavior |
-
-On macOS, use installed `~/Applications/Renium Studio.app` for protected-property
-sync; the original Studio app stays unchanged.
-
-Signed update checks run when the editor opens. **Install Update** installs
-matching components; reload the editor and restart Studio afterward.
-`renium.automaticUpdateChecks` controls these checks.
-
-## Help
-
-Questions and help: the [Discord server](https://discord.gg/wwTFHSSNn3). Bugs: [GitHub issues](https://github.com/Superwheat/renium/issues), with the Renium version, your OS, the action and the exact error.
+Questions go to the [Discord server](https://discord.gg/wwTFHSSNn3). Report bugs as
+[GitHub issues](https://github.com/Superwheat/renium/issues) with the Renium
+version, your OS, the action and the exact error.
 
 ## Development
 
-From this extension folder:
+From this folder (use `npm` instead of `npm.cmd` on macOS and Linux):
 
 ```powershell
 npm.cmd ci
@@ -102,20 +50,9 @@ npm.cmd run verify
 npm.cmd run package
 ```
 
-Use `npm` on macOS/Linux. Press F5 in VS Code for an Extension Development Host.
-Edit `src/`, not generated `out/`.
-
-Build the backend from the repository root:
-
-```powershell
-cargo build --locked --release --manifest-path tools/renium/Cargo.toml
-./tools/build-release.ps1 -LocalBuild
-```
-
-The bundle goes under `dist/`; `recompile.bat` is a shortcut.
-Public releases omit `-LocalBuild` and require a clean checkout, license,
-and registered publisher; publisher `local` is for private VSIX installs.
-
-Builds use checked-in metadata/icons, not a running Studio.
-`npm run sync-assets` syncs local assets; `npm run refresh-studio-assets`
-also invokes Studio's headless API export. Review generated diffs.
+Press F5 in VS Code for an Extension Development Host, and edit `src/`, not the
+generated `out/`. [Build from source](../renium/README.md#build-from-source) in the
+CLI guide bundles the CLI, extension and plugin under `dist/`. Public releases omit
+`-LocalBuild` and need a clean checkout, the license and a registered publisher.
+Builds use checked-in Studio metadata and icons; `npm run refresh-studio-assets`
+refreshes them from Studio's headless API export, so review the diff it produces.
