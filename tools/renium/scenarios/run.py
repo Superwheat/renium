@@ -628,7 +628,9 @@ def space_studio_launch():
     while time.monotonic() < deadline:
         try:
             handle = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
+        except (FileExistsError, PermissionError):
+            # Windows answers "permission denied" while another runner's
+            # unlink of the lock is still pending; it is the same wait.
             try:
                 if time.time() - lock.stat().st_mtime > 60:
                     lock.unlink(missing_ok=True)
