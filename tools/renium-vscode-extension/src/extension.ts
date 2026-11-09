@@ -4603,6 +4603,10 @@ class RobloxSyncController {
     onChunk?: (text: string) => void,
     options: { quietLog?: boolean } = {},
   ): void {
+    // A chunk can end inside a multi-byte character; the stream decodes
+    // across chunk borders, where a toString per chunk would damage it.
+    child.stdout?.setEncoding("utf8");
+    child.stderr?.setEncoding("utf8");
     child.stdout?.on("data", (data: Buffer | string) => {
       onActivity?.();
       onChunk?.(data.toString());

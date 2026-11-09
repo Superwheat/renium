@@ -649,6 +649,10 @@ function runCli(command: string, args: string[], cwd: string): Promise<CommandRu
         }
       });
     }, 60_000);
+    // A chunk can end inside a multi-byte character; the stream decodes
+    // across chunk borders, where a toString per chunk would damage it.
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
     child.stdout.on("data", (data: Buffer | string) => {
       stdout = appendBounded(stdout, data.toString());
     });

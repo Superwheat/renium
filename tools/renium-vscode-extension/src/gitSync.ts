@@ -1,4 +1,5 @@
 import * as childProcess from "child_process";
+import { StringDecoder } from "string_decoder";
 
 import {
   projectProcessOwner,
@@ -104,6 +105,10 @@ export function runGit(args: string[], options: GitRunOptions): Promise<GitRunRe
     let outputBytes = 0;
     let settled = false;
     let timer: NodeJS.Timeout | undefined;
+    // The output limit counts bytes, so chunks stay buffers; a decoder per
+    // stream keeps a multi-byte character that spans two chunks whole.
+    const stdoutDecoder = new StringDecoder("utf8");
+    const stderrDecoder = new StringDecoder("utf8");
 
     const child = childProcess.spawn(gitPath, args, {
       cwd: options.cwd,
@@ -142,7 +147,7 @@ export function runGit(args: string[], options: GitRunOptions): Promise<GitRunRe
     child.stdout?.on("data", (chunk: Buffer | string) => {
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       const remaining = Math.max(0, outputLimit - outputBytes);
-      const text = buffer.subarray(0, remaining).toString();
+      const text = stdoutDecoder.write(buffer.subarray(0, remaining));
       outputBytes += buffer.length;
       stdout += text;
       options.onOutput?.("stdout", text);
@@ -155,7 +160,7 @@ export function runGit(args: string[], options: GitRunOptions): Promise<GitRunRe
     child.stderr?.on("data", (chunk: Buffer | string) => {
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       const remaining = Math.max(0, outputLimit - outputBytes);
-      const text = buffer.subarray(0, remaining).toString();
+      const text = stderrDecoder.write(buffer.subarray(0, remaining));
       outputBytes += buffer.length;
       stderr += text;
       options.onOutput?.("stderr", text);

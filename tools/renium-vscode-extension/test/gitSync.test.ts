@@ -10,9 +10,20 @@ import {
   redactRemoteUrl,
   remoteUrlToWebUrl,
   renderGitArgs,
+  runGit,
   shouldPullFromStudioBeforePush,
   summarizeStatus,
 } from "../src/gitSync";
+
+test("runGit keeps a multi-byte character whole when it arrives in two chunks", async () => {
+  // Node stands in for git: it writes the three bytes of one character in two
+  // writes far enough apart to arrive as two chunks.
+  const script = "process.stdout.write(Buffer.from([0xe6, 0x97]));"
+    + "setTimeout(() => process.stdout.write(Buffer.from([0xa5, 0x0a])), 200);";
+  const result = await runGit(["-e", script], { cwd: process.cwd(), gitPath: process.execPath });
+  assert.equal(result.code, 0);
+  assert.equal(result.stdout, "\u65e5\n");
+});
 
 test("parsePorcelainV1Z classifies tracked, untracked, renamed, deleted, and conflicted entries", () => {
   const entries = parsePorcelainV1Z([

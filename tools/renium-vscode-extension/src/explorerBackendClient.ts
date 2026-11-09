@@ -402,6 +402,10 @@ export class ExplorerBackendClient implements vscode.Disposable {
     ], config.projectRoot);
     this.process = child;
     this.buffer = "";
+    // A chunk can end inside a multi-byte character; the stream decodes
+    // across chunk borders, where a toString per chunk would damage it.
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
     child.stdout.on("data", (data: Buffer | string) => {
       if (this.process === child) {
         this.handleStdout(data.toString());
