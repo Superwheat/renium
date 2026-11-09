@@ -3,6 +3,7 @@ project in a real Studio, one scenario at a time, and reports pass/fail.
 
     python -I tools/renium/scenarios/run.py --area sync            # one area
     python -I tools/renium/scenarios/run.py --only SYNC-003,SYNC-010
+    python -I tools/renium/scenarios/run.py --parallel 4 --rerun-failed   # every row, four Studios
     python -I tools/renium/scenarios/run.py --list
 
 Each scenario module under scenarios/<area>.py exposes SCENARIOS: a list of
@@ -266,7 +267,11 @@ def fresh_scratch(size: str, scenario_id: str) -> tuple[Path, str]:
     return target, places[0]
 
 
-def scratch_studio_pids() -> list[int]:
+def path_prefixes(roots: tuple) -> tuple:
+    return tuple(str(root.resolve()).lower() + os.sep for root in roots)
+
+
+def scratch_studio_pids(roots: tuple = (SCRATCH_ROOT,)) -> list[int]:
     """Every Studio process whose window title names a place under the scratch
     root: the runner opened it, so the runner may close it."""
     try:
@@ -275,15 +280,15 @@ def scratch_studio_pids() -> list[int]:
         status = json.loads(line)
     except Exception:
         return []
-    root = str(SCRATCH_ROOT.resolve()).lower() + os.sep
+    prefixes = path_prefixes(roots)
     pids = []
     for process in (status.get("diagnosis") or {}).get("studioProcesses") or []:
         title = str(process.get("title") or "").lower()
-        if title.startswith(root) and process.get("pid"):
+        if title.startswith(prefixes) and process.get("pid"):
             pids.append(int(process["pid"]))
     for client in (status.get("studios") or []) + (status.get("clients") or []):
         file = str(client.get("localFile") or "").lower()
-        if file.startswith(root) and client.get("pid"):
+        if file.startswith(prefixes) and client.get("pid"):
             pids.append(int(client["pid"]))
     if os.name != "nt":
         try:
@@ -292,7 +297,7 @@ def scratch_studio_pids() -> list[int]:
             listing = ""
         for line in listing.splitlines():
             parts = line.strip().split(None, 1)
-            if len(parts) == 2 and "RobloxStudio" in parts[1] and root in parts[1].lower() and "CrashHandler" not in parts[1]:
+            if len(parts) == 2 and "RobloxStudio" in parts[1] and any(prefix in parts[1].lower() for prefix in prefixes) and "CrashHandler" not in parts[1]:
                 pids.append(int(parts[0]))
     return sorted(set(pids))
 
@@ -317,7 +322,9 @@ def orphan_play_server_pids() -> list[int]:
         pid = int(orphan["pid"])
         try:
             if os.name == "nt":
-                query = subprocess.run(["powershell", "-NoProfile", "-Command", f"$p = Get-Process -Id {pid} -ErrorAction SilentlyContinue; if ($p) {{ '{{0}}|{{1}}' -f $p.MainWindowTitle, [int][double]::Parse((Get-Date $p.StartTime -UFormat %s)) }}"], capture_output=True, text=True, timeout=30).stdout.strip()
+                # Windows PowerShell's `Get-Date -UFormat %s` counts from the epoch in
+                # local time, which is off by the UTC offset next to time.time().
+                query = subprocess.run(["powershell", "-NoProfile", "-Command", f"$p = Get-Process -Id {pid} -ErrorAction SilentlyContinue; if ($p) {{ '{{0}}|{{1}}' -f $p.MainWindowTitle, [DateTimeOffset]::new($p.StartTime).ToUnixTimeSeconds() }}"], capture_output=True, text=True, timeout=30).stdout.strip()
             else:
                 query = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, timeout=30).stdout.strip()
                 query = "|" + str(int(time.mktime(time.strptime(query)))) if query else ""
@@ -331,7 +338,7 @@ def orphan_play_server_pids() -> list[int]:
     return pids
 
 
-def close_scratch_studios_gracefully():
+def close_scratch_studios_gracefully(roots: tuple = (SCRATCH_ROOT,)):
     """Asks every connected scratch Studio to close without saving through the
     plugin first: a force-killed Studio leaves recovery files and its next
     launch may wait on a dialog instead of connecting."""
@@ -341,10 +348,10 @@ def close_scratch_studios_gracefully():
         clients = json.loads(line).get("clients") or []
     except Exception:
         return
-    root = str(SCRATCH_ROOT.resolve()).lower() + os.sep
+    prefixes = path_prefixes(roots)
     for client in clients:
         file = str(client.get("localFile") or "")
-        if file.lower().startswith(root):
+        if file.lower().startswith(prefixes):
             try:
                 run_captured([RBX, "--place", file, "sx", "--terminate"], timeout=60)
             except subprocess.TimeoutExpired:
@@ -605,6 +612,8 @@ def request_abort(reason: str) -> None:
 
 
 STUDIO_LAUNCH_GAP_SECONDS = 8.0
+# Shards start this far apart so their first daemon calls do not pile up.
+SHARD_START_GAP_SECONDS = 5
 
 
 def space_studio_launch():
@@ -956,7 +965,7 @@ class Session:
             shutil.rmtree(self.root, ignore_errors=True)
 
 
-def run_session(scenarios: list[Scenario], size: str, label: str, keep: bool, order_seed: int, progress: Path | None = None) -> list[dict]:
+def run_session(scenarios: list[Scenario], size: str, label: str, keep: bool, order_seed: int, progress: Path | None = None, earlier: list[dict] | None = None) -> list[dict]:
     outcomes = []
     session = Session(size, label)
     ctx = session.context(scenarios[0])
@@ -1045,7 +1054,7 @@ def run_session(scenarios: list[Scenario], size: str, label: str, keep: bool, or
                 request_abort(f"{ABORT_STREAK} rows in a row never reached a connected Studio (last: {scenario.id}); check that Studio is logged in and the plugin is installed")
             if progress is not None:
                 progress.parent.mkdir(parents=True, exist_ok=True)
-                progress.write_text(json.dumps(outcomes, indent=1), encoding="utf-8")
+                progress.write_text(json.dumps([*(earlier or []), *outcomes], indent=1), encoding="utf-8")
     finally:
         session.finish(ctx, keep or failed_any)
         row_lock.close()
@@ -1053,18 +1062,58 @@ def run_session(scenarios: list[Scenario], size: str, label: str, keep: bool, or
     return outcomes
 
 
-def run_parallel(argv: list[str], parallel: int, seed: int) -> int:
+def reported_rows(prefix: str) -> list[dict]:
+    """The rows a run wrote down: its report, or what it had finished when it
+    ended without one."""
+    for name in (f"{prefix}.json", f"{prefix}.partial.json"):
+        try:
+            return json.loads((REPORTS / name).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+    return []
+
+
+def wait_for_shards(processes: list, stamp: str, total: int, brief: bool) -> None:
+    """Waits for every shard; a brief run prints how far each shard is every
+    two minutes, since its logs stay in the reports folder."""
+    printed = time.monotonic()
+    while any(process.poll() is None for _, process, _ in processes):
+        time.sleep(2)
+        if brief and time.monotonic() - printed >= 120:
+            printed = time.monotonic()
+            done = [len(reported_rows(f"{stamp}-shard{shard}")) for shard, _, _ in processes]
+            print(f"  {' + '.join(str(count) for count in done)} of {total} rows done", flush=True)
+    for _, _, handle in processes:
+        handle.close()
+
+
+def run_serial_phase(argv: list[str], ids: list[str], seed: int, prefix: str, brief: bool) -> dict:
+    """Runs the named rows alone, one Studio, after every shard finished;
+    returns their outcomes by id."""
+    log = REPORTS / f"{prefix}.log"
+    with open(log, "w", encoding="utf-8") as handle:
+        subprocess.run([sys.executable, "-I", str(HERE / "run.py"), *argv, "--only", ",".join(ids), "--seed", str(seed), "--child", "--report-prefix", prefix], cwd=HERE, stdout=handle, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+    if not brief:
+        print(log.read_text(encoding="utf-8", errors="replace"))
+    return {o["id"]: o for o in reported_rows(prefix)}
+
+
+def run_parallel(argv: list[str], parallel: int, seed: int, selected: list[Scenario], rerun_failed: bool, brief: bool) -> int:
     """Runs the selection as N shards, each its own process, session and
     Studio; the shards' reports are merged into one."""
     processes = []
-    logs = []
     REPORTS.mkdir(parents=True, exist_ok=True)
-    ABORT_FILE.unlink(missing_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
+    # The rows are split here, once: shards start seconds apart, and a split
+    # each shard worked out for itself could differ when the recorded
+    # durations changed in between, running one row twice and another never.
+    assigned = assign_shards(selected, parallel, seed)
     for shard in range(parallel):
+        if not assigned[shard]:
+            continue
         log = REPORTS / f"{stamp}-shard{shard}.log"
         handle = open(log, "w", encoding="utf-8")
-        command = [sys.executable, "-I", str(HERE / "run.py"), *argv, "--seed", str(seed), "--shard", f"{shard}/{parallel}", "--report-prefix", f"{stamp}-shard{shard}"]
+        command = [sys.executable, "-I", str(HERE / "run.py"), *argv, "--seed", str(seed), "--shard", f"{shard}/{parallel}", "--only", ",".join(s.id for s in assigned[shard]), "--child", "--report-prefix", f"{stamp}-shard{shard}"]
         env = dict(os.environ)
         if shard > 0:
             # Each shard beyond the first drives a daemon of its own: every rbx
@@ -1072,43 +1121,82 @@ def run_parallel(argv: list[str], parallel: int, seed: int) -> int:
             # forwards the Studios that daemon opens to its ports (launch
             # tickets). Rows that need the default daemon sit on shard 0.
             env["RENIUM_DAEMON_NAME"] = f"shard{shard}"
-        processes.append((subprocess.Popen(command, cwd=HERE, env=env, stdout=handle, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL), handle))
-        logs.append(log)
-        time.sleep(5)
-    for process, handle in processes:
-        process.wait()
-        handle.close()
+        processes.append((shard, subprocess.Popen(command, cwd=HERE, env=env, stdout=handle, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL), handle))
+        time.sleep(SHARD_START_GAP_SECONDS)
+    wait_for_shards(processes, stamp, len(selected), brief)
     for shard in range(1, parallel):
         subprocess.run([RBX, "dm", "stop", f"shard{shard}"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
     outcomes = []
-    for shard in range(parallel):
-        report = REPORTS / f"{stamp}-shard{shard}.json"
-        if report.is_file():
-            outcomes.extend(json.loads(report.read_text(encoding="utf-8")))
-        print((REPORTS / f"{stamp}-shard{shard}.log").read_text(encoding="utf-8", errors="replace"))
+    for shard, _, _ in processes:
+        outcomes.extend(reported_rows(f"{stamp}-shard{shard}"))
+        if not brief:
+            print((REPORTS / f"{stamp}-shard{shard}.log").read_text(encoding="utf-8", errors="replace"))
+    # A shard that died took its remaining rows with it; they count as not
+    # passed instead of dropping out of the total.
+    reported = {o["id"] for o in outcomes}
+    for scenario in selected:
+        if scenario.id not in reported:
+            outcomes.append({"id": scenario.id, "title": scenario.title, "size": scenario.size, "status": "error", "reason": "the shard that held this row ended without reporting it", "seconds": 0, "log": []})
     retry = [o["id"] for o in outcomes if o["status"] == "skip" and any(reason in o.get("reason", "") for reason in FINAL_PASS_REASONS)]
     if retry and not abort_requested():
         # Rows that need a lone Studio or a second slot ran into the other
         # shards; they run again alone now that those shards are done.
         print("\nfinal serial phase for " + str(len(retry)) + " row(s) (exclusive rows and rows that need a lone Studio)", flush=True)
-        log = REPORTS / f"{stamp}-final.log"
-        with open(log, "w", encoding="utf-8") as handle:
-            subprocess.run([sys.executable, "-I", str(HERE / "run.py"), *argv, "--only", ",".join(retry), "--seed", str(seed), "--report-prefix", f"{stamp}-final"], cwd=HERE, stdout=handle, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
-        print(log.read_text(encoding="utf-8", errors="replace"))
-        final = REPORTS / f"{stamp}-final.json"
-        if final.is_file():
-            replaced = {o["id"]: o for o in json.loads(final.read_text(encoding="utf-8"))}
-            outcomes = [replaced.get(o["id"], o) for o in outcomes]
+        replaced = run_serial_phase(argv, retry, seed, f"{stamp}-final", brief)
+        outcomes = [replaced.get(o["id"], o) for o in outcomes]
+    failed = [o["id"] for o in outcomes if o["status"] in ("fail", "error")]
+    if rerun_failed and failed and not abort_requested():
+        # One more attempt, alone, tells a row that fails from one that lost
+        # a race with the other shards; the report keeps the first outcome.
+        print(f"\nsecond run for {len(failed)} row(s) that did not pass", flush=True)
+        second = run_serial_phase(argv, failed, seed, f"{stamp}-rerun", brief)
+        for index, first in enumerate(outcomes):
+            again = second.get(first["id"])
+            if again is None:
+                continue
+            if again["status"] == "pass":
+                again["firstRun"] = {"status": first["status"], "reason": first.get("reason", "")}
+                outcomes[index] = again
+            else:
+                first["secondRun"] = {"status": again["status"], "reason": again.get("reason", "")}
+    for outcome in outcomes:
+        # A row still waiting for a Studio of its own after the serial phase
+        # never ran: another Studio stayed connected the whole time.
+        if outcome["status"] == "skip" and any(reason in outcome.get("reason", "") for reason in FINAL_PASS_REASONS):
+            outcome["status"] = "fail"
+            outcome["reason"] = "could not run, even alone after the shards: " + outcome.get("reason", "")
     report = REPORTS / f"{stamp}.json"
     report.write_text(json.dumps(outcomes, indent=1), encoding="utf-8")
     save_durations(outcomes)
     passed = sum(1 for o in outcomes if o["status"] == "pass")
     skipped = sum(1 for o in outcomes if o["status"] == "skip")
+    if brief:
+        # The reasons and the paths in them stay in the report on this machine.
+        for outcome in outcomes:
+            if outcome["status"] not in ("pass", "skip"):
+                print(f"[{outcome['id']}] {outcome['status'].upper()} in {outcome['seconds']}s: {outcome['title']}")
+    second_run_passes = [o["id"] for o in outcomes if o["status"] == "pass" and "firstRun" in o]
+    if second_run_passes:
+        print(f"\npassed on the second run only: {', '.join(second_run_passes)}")
     aborted = abort_requested()
     if aborted:
         print(f"\nRUN ABORTED: {aborted}")
-    print(f"\n{passed}/{len(outcomes) - skipped} passed; {skipped} skipped; seed {seed}; report {report}")
+    print(f"\n{passed}/{len(outcomes) - skipped} passed; {skipped} skipped; seed {seed}; report {report.name if brief else report}")
     return 0 if passed + skipped == len(outcomes) else 1
+
+
+def clean_up() -> int:
+    """Closes the scratch Studios and stops the shard daemons that a run cut
+    short by a timeout or a cancel left behind."""
+    owned = (SCRATCH_ROOT, SESSION_ROOT)
+    close_scratch_studios_gracefully(owned)
+    terminate_pids(scratch_studio_pids(owned))
+    listing = subprocess.run([RBX, "dm", "list"], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60).stdout
+    for line in listing.splitlines():
+        name = line.split(" ", 1)[0]
+        if name.startswith("shard") and name[5:].isdigit():
+            subprocess.run([RBX, "dm", "stop", name], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+    return 0
 
 
 def run_scenario_locked(scenario: Scenario, keep: bool) -> dict:
@@ -1169,8 +1257,19 @@ def main() -> int:
     parser.add_argument("--shard", default="", help="i/n: run the i-th of n interleaved slices of the shuffled rows")
     parser.add_argument("--parallel", type=int, default=1, help="run n sessions at once, each with its own Studio")
     parser.add_argument("--report-prefix", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--long", action="store_true", help="include rows that wait for many minutes on purpose (PLAY-036)")
+    parser.add_argument("--rerun-failed", action="store_true", help="run the rows that did not pass once more, alone, after the shards")
+    parser.add_argument("--brief", action="store_true", help="print row ids and outcomes only; logs and failure reasons stay in the reports folder")
+    parser.add_argument("--cleanup", action="store_true", help="close the scratch Studios and shard daemons of a run that was cut short, then exit")
     args = parser.parse_args()
+    if args.cleanup:
+        return clean_up()
+    if (args.rerun_failed or args.brief) and (args.shard or args.isolated):
+        parser.error("--rerun-failed and --brief belong to a whole run; they do not combine with --shard or --isolated")
+    if not args.child:
+        # An abort recorded by an earlier run would stop this one at its first row.
+        ABORT_FILE.unlink(missing_ok=True)
     global LONG_ENABLED
     LONG_ENABLED = args.long
     areas = args.area or sorted(p.stem for p in (HERE / "areas").glob("*.py") if not p.stem.startswith("_"))
@@ -1186,7 +1285,7 @@ def main() -> int:
         return 0
     REPORTS.mkdir(parents=True, exist_ok=True)
     seed = args.seed if args.seed is not None else random.randrange(1, 10**9)
-    if args.parallel > 1 and not args.isolated:
+    if (args.parallel > 1 or args.rerun_failed or args.brief) and not args.isolated and not args.child:
         passthrough = []
         skip = False
         for a in sys.argv[1:]:
@@ -1196,10 +1295,10 @@ def main() -> int:
             if a == "--parallel":
                 skip = True
                 continue
-            if a.startswith("--parallel"):
+            if a.startswith("--parallel") or a in ("--rerun-failed", "--brief"):
                 continue
             passthrough.append(a)
-        return run_parallel(passthrough, args.parallel, seed)
+        return run_parallel(passthrough, max(args.parallel, 1), seed, scenarios, args.rerun_failed, args.brief)
     ensure_daemon()
     stamp = args.report_prefix or time.strftime("%Y%m%d-%H%M%S")
     outcomes = []
@@ -1208,7 +1307,7 @@ def main() -> int:
             index, count = (int(v) for v in args.shard.split("/"))
             global SHARD_COUNT
             SHARD_COUNT = count
-            ordered = order_within_shard(assign_shards(scenarios, count, seed)[index], seed + index)
+            ordered = order_within_shard(scenarios if args.child else assign_shards(scenarios, count, seed)[index], seed + index)
             global DEFER_EXCLUSIVE
             DEFER_EXCLUSIVE = True
         else:
@@ -1217,7 +1316,7 @@ def main() -> int:
         for size in ("small", "heavy"):
             rows = [s for s in ordered if s.size == size]
             if rows:
-                outcomes.extend(run_session(rows, size, f"{size}-{seed}" + (f"-{args.shard.replace('/', 'of')}" if args.shard else ""), args.keep, seed, REPORTS / f"{stamp}.partial.json"))
+                outcomes.extend(run_session(rows, size, f"{size}-{seed}" + (f"-{args.shard.replace('/', 'of')}" if args.shard else ""), args.keep, seed, REPORTS / f"{stamp}.partial.json", list(outcomes)))
         report = REPORTS / f"{stamp}.json"
         report.write_text(json.dumps(outcomes, indent=1), encoding="utf-8")
         passed = sum(1 for o in outcomes if o["status"] == "pass")

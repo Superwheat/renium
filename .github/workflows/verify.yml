@@ -42,6 +42,12 @@ jobs:
         run: |
           cargo clippy --locked --manifest-path tools/renium/Cargo.toml --all-targets -- -D warnings -D clippy::cognitive_complexity -D clippy::too_many_arguments
 
+      # A release waits on the exit code of the live scenario runner; this
+      # checks how it splits rows and merges shard reports, with stand-in
+      # shards and no Studio.
+      - name: Check the scenario runner
+        run: python3 -I tools/renium/scenarios/selftest.py
+
   rust-cross-platform:
     name: Rust tests (${{ matrix.os }})
     strategy:
