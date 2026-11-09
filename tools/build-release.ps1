@@ -158,8 +158,11 @@ function Get-BinaryArchitecture {
         return $architecture
     }
     $magic = [BitConverter]::ToUInt32($bytes, 0)
-    if ($magic -in @(0xFEEDFACF, 0xCFFAEDFE)) {
-        $cpu = if ($magic -eq 0xFEEDFACF) {
+    # Written as longs: a bare 0xFEEDFACF is a negative Int32 and never equals
+    # the unsigned value read from the file.
+    $machO = [uint32]0xFEEDFACFL
+    if ($magic -in @($machO, [uint32]0xCFFAEDFEL)) {
+        $cpu = if ($magic -eq $machO) {
             [BitConverter]::ToUInt32($bytes, 4)
         }
         else {

@@ -383,6 +383,12 @@ jobs:
           Copy-Item -LiteralPath $plugin.FullName -Destination tools/renium-vscode-extension/assets/Renium.rbxm -Force
           $env:RENIUM_PLUGIN_BUNDLE = $plugin.FullName
           $env:RENIUM_CLI_VERSION = $version
+          # Packaging copies the class icons of the newest Studio install it
+          # finds over the ones in the repository and rewrites the plugin's
+          # API schema; a release carries the committed files, whatever
+          # Studio this runner has, so the icon source points at nothing.
+          $env:RENIUM_INSERTABLE_OBJECTS_ICON_PATH = Join-Path $env:RUNNER_TEMP "no-studio-icons"
+          $env:RENIUM_SKIP_PLUGIN_SCHEMA_WRITE = "1"
           $output = Join-Path $env:RUNNER_TEMP "renium-extensions"
           New-Item -ItemType Directory -Path $output | Out-Null
           npm ci --prefix tools/renium-vscode-extension

@@ -68,6 +68,8 @@
 - Live Sync no longer reports a conflict on a part color nobody changed: colors Studio keeps in bytes (a part's `Color`) compare by their byte values, so 0.3 in the files and 77/255 in the open place are one color.
 - A build from source reports the commit it was built from in `rbx dr`, bug reports and the daemon log; the hash stayed on an earlier commit until one of a few watched files changed.
 - The extension no longer damages non-ASCII names and text: it decoded each chunk of a command's output on its own, so a multi-byte character split between two chunks turned into replacement characters in the Explorer, in command results and in git output.
+- Extension packages built by the Release and Verify workflows carry the class icons committed to the repository; packaging replaced them with the icons of the Studio installed on the build machine.
+- `tools/build-release.ps1` accepts macOS binaries; its Mach-O check compared an unsigned magic number with a negative literal and refused every one.
 
 ## 0.5.9 - 2026-11-06
 

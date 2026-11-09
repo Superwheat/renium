@@ -258,6 +258,10 @@ jobs:
           npm.cmd --prefix tools/renium-vscode-extension run verify
           $vsix = Join-Path $env:RUNNER_TEMP "renium-ci.vsix"
           $env:RENIUM_PLUGIN_BUNDLE = Join-Path $env:RUNNER_TEMP "Renium.rbxm"
+          # Packaging would copy the class icons of this runner's Studio over
+          # the committed ones and rewrite the plugin's API schema.
+          $env:RENIUM_INSERTABLE_OBJECTS_ICON_PATH = Join-Path $env:RUNNER_TEMP "no-studio-icons"
+          $env:RENIUM_SKIP_PLUGIN_SCHEMA_WRITE = "1"
           Push-Location tools/renium-vscode-extension
           try {
             npx.cmd --no-install vsce package --out $vsix

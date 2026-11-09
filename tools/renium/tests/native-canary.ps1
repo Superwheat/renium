@@ -64,6 +64,8 @@ $runRoot = [IO.Path]::GetFullPath((Join-Path $ScratchRoot $runName))
 [IO.Directory]::CreateDirectory($runRoot) | Out-Null
 $reportPath = Join-Path $runRoot 'probes.json'
 $report = $null
+$scratchPlace = $null
+$callerStudio = if ($Studio) { [IO.Path]::GetFullPath($Studio) } else { $null }
 $previousDaemon = $env:RENIUM_DAEMON_NAME
 $env:RENIUM_DAEMON_NAME = 'astra'
 try {
@@ -122,7 +124,19 @@ try {
     $owned = @(Get-Process RobloxStudioBeta -ErrorAction SilentlyContinue | Where-Object {
         $_.MainWindowTitle.Contains($runName) -and $_.Path -eq $Studio
     })
-    foreach ($process in $owned) { Stop-Process -Id $process.Id -Force }
+    foreach ($process in $owned) { Stop-Process -Id $process.Id -Force; $process.WaitForExit(15000) | Out-Null }
     $env:RENIUM_DAEMON_NAME = $previousDaemon
+    # A deployment is over a gigabyte and a run happens every day. The
+    # evidence files stay; the Studio copy and the place go, for this run and
+    # for earlier runs that left theirs behind. A Studio the caller passed in
+    # is kept, also when it is an earlier run's copy.
+    Get-ChildItem -LiteralPath $ScratchRoot -Directory -Filter 'renium-native-canary-*' -ErrorAction SilentlyContinue | ForEach-Object {
+        $deployment = Join-Path $_.FullName 'studio'
+        $inUse = $callerStudio -and $callerStudio.StartsWith($deployment + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)
+        if (-not $inUse -and (Test-Path -LiteralPath $deployment)) {
+            Remove-Item -LiteralPath $deployment -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if ($scratchPlace) { Remove-Item -LiteralPath $scratchPlace -Force -ErrorAction SilentlyContinue }
     Write-Output "Canary artifacts: $runRoot"
 }
