@@ -1238,6 +1238,76 @@ fn edits_refuse_an_attribute_name_roblox_refuses() {
 }
 
 #[test]
+fn property_batches_store_values_in_the_form_of_the_property() {
+    let fx = Fixture::new("property-batch-values");
+    let root = fx.path("");
+    let batch = fx.path("panel-edit.json");
+    let panel_edit = |entries: Value| {
+        fs::write(&batch, entries.to_string()).unwrap();
+        fx.text(&[
+            "bytecode-apply-property-batch",
+            "--project-root",
+            &root,
+            "--input",
+            &batch,
+            "--direction",
+            "files-to-studio",
+        ])
+    };
+    let door = |property: &str, value: Value| {
+        json!({
+            "service": "Workspace",
+            "settingsId": "door",
+            "className": "Part",
+            "pathSegments": ["Workspace", "Lobby", "Door"],
+            "pathOrdinals": [1, 1, 1],
+            "scope": "property",
+            "property": property,
+            "value": value,
+        })
+    };
+    let before = fs::read(fx.store("Workspace")).unwrap();
+    assert_eq!(
+        panel_edit(json!([
+            door("Anchored", json!(false)),
+            door("Transparency", json!("half")),
+        ]))
+        .err(),
+        "Transparency needs a number, got \"half\"; for example `-p Transparency=0.5`"
+    );
+    assert_eq!(
+        panel_edit(json!([door("Material", json!("NoSuchMaterial"))])).err(),
+        "Material needs an Enum.Material item, got \"NoSuchMaterial\""
+    );
+    assert_eq!(fs::read(fx.store("Workspace")).unwrap(), before);
+
+    assert_eq!(
+        panel_edit(json!([
+            door("Transparency", json!("0.25")),
+            door("Material", json!("Neon")),
+            door("Size", json!({"x": 1, "y": 2, "z": 3})),
+            door("anchored", json!(false)),
+        ]))
+        .ok()["applied"],
+        json!(4)
+    );
+    let stored = fx.read_store("Workspace").instances[2].properties.clone();
+    assert_eq!(stored["Transparency"], json!(0.25));
+    assert_eq!(
+        stored["Material"],
+        json!({"_type": "EnumItem", "name": "Neon"})
+    );
+    assert_eq!(
+        stored["Size"],
+        json!({"_type": "Vector3", "x": 1.0, "y": 2.0, "z": 3.0})
+    );
+    assert_eq!(stored["Anchored"], json!(false));
+    assert!(!stored.contains_key("anchored"));
+    fx.text(&["bep", "-r", &root, "-o", &fx.path("panel.rbxl")])
+        .ok();
+}
+
+#[test]
 fn set_property_refuses_an_item_of_another_enum() {
     let fx = Fixture::new("set-enum-other");
     let store = fx.store_arg("Workspace");

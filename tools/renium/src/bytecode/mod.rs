@@ -85,13 +85,34 @@ struct BytecodePropertyBatchEntry {
     value: Value,
 }
 
+/// One batch entry with its instance found and its property and value in
+/// the form the store keeps them.
 struct ResolvedBytecodePropertyBatchEntry {
     entry_index: usize,
     service: String,
     instance_index: usize,
     scope: PropertyScope,
     property: String,
+    /// The property is a Roblox property under its logical name.
+    logical: bool,
     value: Value,
+}
+
+impl ResolvedBytecodePropertyBatchEntry {
+    fn apply(&self, document: &mut SettingsBytecode) -> Result<()> {
+        if self.logical
+            && let Some(instance) = document.instances.get_mut(self.instance_index)
+        {
+            drop_other_property_spellings(instance, &self.property);
+        }
+        instance_api::set_instance_property(
+            document,
+            self.instance_index,
+            &self.property,
+            self.value.clone(),
+            self.scope,
+        )
+    }
 }
 
 struct BytecodePropertyBatchDocument {
@@ -1983,6 +2004,24 @@ fn reject_owned_instance_edit(
     reject_read_only_link_edit(links, document, service, index)
 }
 
+/// How a store edit keeps one property of an instance.
+struct StoredPropertyForm {
+    /// The name the value is stored under.
+    name: String,
+    /// The name is the logical name of a Roblox property, which replaces
+    /// every other spelling of it in the store.
+    logical: bool,
+    /// The store already held the property under another name than the
+    /// requested one.
+    requested_differs: bool,
+}
+
+fn drop_other_property_spellings(instance: &mut SettingsBytecodeInstance, logical_name: &str) {
+    instance
+        .properties
+        .retain(|name, _| name == logical_name || !name.eq_ignore_ascii_case(logical_name));
+}
+
 /// The name one property of the instance at `index` is stored under, with
 /// `value` turned into its stored form: a Roblox property takes its logical
 /// name and typed value, and a property or an attribute name a push cannot
@@ -1995,6 +2034,22 @@ fn stored_property_edit(
     value: &mut Value,
     scope: PropertyScope,
 ) -> Result<(String, bool)> {
+    let form = stored_property_form(document, index, property, value, scope)?;
+    if form.logical {
+        drop_other_property_spellings(&mut document.instances[index], &form.name);
+    }
+    Ok((form.name, form.requested_differs))
+}
+
+/// The form `stored_property_edit` gives a property and its value, for an
+/// edit that is checked before the store changes.
+fn stored_property_form(
+    document: &SettingsBytecode,
+    index: usize,
+    property: &str,
+    value: &mut Value,
+    scope: PropertyScope,
+) -> Result<StoredPropertyForm> {
     validate_auto_property_name(document, index, property, scope)?;
     let canonical_property = canonical_stored_property_name(document, index, property, scope)?;
     let logical_property = if matches!(scope, PropertyScope::Auto | PropertyScope::Property)
@@ -2013,9 +2068,6 @@ fn stored_property_edit(
         None
     };
     if let Some(logical_property) = logical_property.as_deref() {
-        document.instances[index].properties.retain(|name, _| {
-            name == logical_property || !name.eq_ignore_ascii_case(logical_property)
-        });
         *value = crate::rbx::encode::typed_store_property_value(
             &document.instances[index].class_name,
             logical_property,
@@ -2023,19 +2075,24 @@ fn stored_property_edit(
         )?;
     }
     let requested_differs = canonical_property.is_some();
-    let stored = logical_property
+    let logical = logical_property.is_some();
+    let name = logical_property
         .or(canonical_property)
         .unwrap_or_else(|| property.to_string());
     // A null removes the attribute, which no name rules out.
     let sets_attribute = match scope {
         PropertyScope::Attribute => true,
-        PropertyScope::Auto => document.instances[index].attributes.contains_key(&stored),
+        PropertyScope::Auto => document.instances[index].attributes.contains_key(&name),
         PropertyScope::Metadata | PropertyScope::Property => false,
     };
     if sets_attribute && !value.is_null() {
-        ensure_settable_attribute_name(&stored)?;
+        ensure_settable_attribute_name(&name)?;
     }
-    Ok((stored, requested_differs))
+    Ok(StoredPropertyForm {
+        name,
+        logical,
+        requested_differs,
+    })
 }
 
 pub(super) fn bytecode_set_property(mut args: BytecodeSetPropertyArgs) -> Result<()> {
@@ -3044,9 +3101,6 @@ fn resolve_property_batch_entries(
             bail!("ClassName is read-only");
         }
         let scope = parse_property_scope(&entry.scope)?;
-        if scope == PropertyScope::Attribute && !entry.value.is_null() {
-            ensure_settable_attribute_name(&entry.property)?;
-        }
         let settings_id = entry
             .settings_id
             .as_deref()
@@ -3087,13 +3141,22 @@ fn resolve_property_batch_entries(
         {
             bail!("{} metadata is read-only", instance.name);
         }
+        let mut value = entry.value;
+        let form = stored_property_form(
+            &state.document,
+            instance_index,
+            &entry.property,
+            &mut value,
+            scope,
+        )?;
         resolved.push(ResolvedBytecodePropertyBatchEntry {
             entry_index,
             service,
             instance_index,
             scope,
-            property: entry.property,
-            value: entry.value,
+            property: form.name,
+            logical: form.logical,
+            value,
         });
     }
     Ok(resolved)
@@ -3110,13 +3173,7 @@ fn apply_non_source_batch_entries(
         let document = documents
             .get_mut(&entry.service)
             .context("Property batch service disappeared")?;
-        instance_api::set_instance_property(
-            document,
-            entry.instance_index,
-            &entry.property,
-            entry.value.clone(),
-            entry.scope,
-        )?;
+        entry.apply(document)?;
     }
     Ok(())
 }
@@ -3195,13 +3252,7 @@ fn apply_permitted_entries(
 ) -> Result<()> {
     for (entry, allowed) in entries.iter().zip(permitted) {
         if *allowed && entry.property != "Source" {
-            instance_api::set_instance_property(
-                document,
-                entry.instance_index,
-                &entry.property,
-                entry.value.clone(),
-                entry.scope,
-            )?;
+            entry.apply(document)?;
         }
     }
     Ok(())
@@ -3297,9 +3348,14 @@ fn filter_property_batch_entries(
     Ok((allowed_entries, filtered))
 }
 
+/// Refuses a batch that edits an instance at or inside a read-only link
+/// target, before or after the batch, and one that renames or moves an
+/// instance holding such a target, which would change what the link's path
+/// leads to. `structural_roots` holds the renamed and moved instances.
 fn reject_read_only_package_changes(
     documents: &BTreeMap<String, BytecodePropertyBatchDocument>,
     entries: &[ResolvedBytecodePropertyBatchEntry],
+    structural_roots: &HashMap<String, HashSet<usize>>,
     link_enforcement: &LinkEnforcement,
 ) -> Result<()> {
     if link_enforcement.read_only_packages.is_empty() {
@@ -3333,17 +3389,28 @@ fn reject_read_only_package_changes(
         if !checked.insert((entry.service.clone(), entry.instance_index)) {
             continue;
         }
-        for paths in [&original_paths, &final_paths] {
+        let renamed_or_moved = structural_roots
+            .get(&entry.service)
+            .is_some_and(|roots| roots.contains(&entry.instance_index));
+        for (paths, holds_checked) in [(&original_paths, renamed_or_moved), (&final_paths, false)] {
             let path = paths
                 .get(&entry.service)
                 .and_then(|paths| paths.get(entry.instance_index))
                 .and_then(Option::as_ref)
                 .context("Could not resolve package-protected instance path")?;
-            link_enforcement.reject_read_only_package_path(
-                &entry.service,
-                &path.path_segments,
-                &path.path_ordinals,
-            )?;
+            if holds_checked {
+                link_enforcement.reject_read_only_package_subtree(
+                    &entry.service,
+                    &path.path_segments,
+                    &path.path_ordinals,
+                )?;
+            } else {
+                link_enforcement.reject_read_only_package_path(
+                    &entry.service,
+                    &path.path_segments,
+                    &path.path_ordinals,
+                )?;
+            }
         }
     }
     Ok(())
@@ -3371,13 +3438,7 @@ fn apply_property_batch_entries(
                 service_dir,
             ));
         }
-        instance_api::set_instance_property(
-            &mut state.document,
-            entry.instance_index,
-            &entry.property,
-            entry.value.clone(),
-            entry.scope,
-        )?;
+        entry.apply(&mut state.document)?;
         state.settings_changed = true;
     }
     Ok(())
@@ -3564,8 +3625,13 @@ fn apply_property_batch_to_root(
     validate_property_batch_entries(&documents, &resolved)?;
     let (allowed_entries, filtered) =
         filter_property_batch_entries(loaded, &documents, resolved, filter_direction)?;
-    reject_read_only_package_changes(&documents, &allowed_entries, link_enforcement)?;
     let structural_roots = property_batch_structural_roots(&allowed_entries);
+    reject_read_only_package_changes(
+        &documents,
+        &allowed_entries,
+        &structural_roots,
+        link_enforcement,
+    )?;
     let before = structural_roots
         .keys()
         .filter_map(|service| Some((service.clone(), documents.get(service)?.document.clone())))

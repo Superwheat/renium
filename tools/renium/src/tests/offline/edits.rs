@@ -2898,6 +2898,66 @@ fn rename_where_refuses_a_match_that_changes_a_read_only_link() {
 }
 
 #[test]
+fn property_batches_refuse_renaming_and_moving_what_holds_a_read_only_link() {
+    let fx = nested_link_fixture("link-property-batch");
+    let store = fx.store_arg("ReplicatedStorage");
+    let root = fx.path("");
+    let other = fx
+        .text(&["ba", "-f", &store, "-n", "Other", "-c", "Folder"])
+        .ok()["settingsId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let before = fs::read(fx.store("ReplicatedStorage")).unwrap();
+    let batch = fx.path("panel-edit.json");
+    let panel_edit = |scope: &str, property: &str, value: &str, extra: &[&str]| {
+        fs::write(
+            &batch,
+            json!([{
+                "service": "ReplicatedStorage",
+                "settingsId": "editor:3",
+                "className": "Folder",
+                "pathSegments": ["ReplicatedStorage", "Outer"],
+                "pathOrdinals": [1, 1],
+                "scope": scope,
+                "property": property,
+                "value": value,
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        let args = [
+            "bytecode-apply-property-batch",
+            "--project-root",
+            &root,
+            "--input",
+            &batch,
+            "--direction",
+            "files-to-studio",
+        ];
+        fx.text(&[&args[..], extra].concat())
+    };
+    for (scope, property, value) in [
+        ("metadata", "Name", "Renamed"),
+        ("auto", "Name", "Renamed"),
+        ("metadata", "Parent", other.as_str()),
+    ] {
+        assert_eq!(
+            panel_edit(scope, property, value, &[]).err(),
+            NESTED_LINK_REFUSAL,
+            "{scope} {property}"
+        );
+    }
+    assert_eq!(fs::read(fx.store("ReplicatedStorage")).unwrap(), before);
+    assert_eq!(
+        panel_edit("attribute", "Mark", "x", &[]).ok()["applied"],
+        json!(1)
+    );
+    panel_edit("metadata", "Name", "Renamed", &["--override-packages"]).ok();
+    assert_eq!(fx.names("ReplicatedStorage")[1], "Renamed");
+}
+
+#[test]
 fn model_import_and_export_commands_use_project_targets() {
     let fx = Fixture::new("model-commands");
     let root = fx.path("");
