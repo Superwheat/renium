@@ -316,6 +316,22 @@ fn emit_build_metadata() {
     });
     println!("cargo:rustc-env=BUILD_GIT_HASH={git_hash}");
     println!("cargo:rustc-env=BUILD_TIMESTAMP_UNIX={build_timestamp}");
+    // A commit changes the hash without touching any file watched above, and
+    // the build would keep reporting the commit it last ran on; git appends
+    // to this log on every commit, checkout and reset.
+    if let Some(reflog) = head_reflog() {
+        println!("cargo:rerun-if-changed={}", reflog.display());
+    }
+}
+
+fn head_reflog() -> Option<PathBuf> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--git-path", "logs/HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let path = PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
+    path.is_file().then_some(path)
 }
 
 fn emit_instruction_revision() {

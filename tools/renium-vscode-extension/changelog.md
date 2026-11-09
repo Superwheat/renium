@@ -66,6 +66,7 @@
 - `rbx dev set` no longer reports a 1.5 s timeout for a device Studio did switch to: when the setters outlive the plugin's reply window, the status read afterwards stands in for the result and carries `settledAfterTimeout`.
 - A push that creates a text object with `TextScaled` on no longer fails its read-back on `TextWrapped`, which Studio keeps on with scaling; the push had applied nothing and reported "did not retain native supplemental properties". A store written with `TextWrapped` off next to `TextScaled` on now carries the value Studio keeps, so the next push of that store no longer rewrites the label and trips the transaction's change check.
 - Live Sync no longer reports a conflict on a part color nobody changed: colors Studio keeps in bytes (a part's `Color`) compare by their byte values, so 0.3 in the files and 77/255 in the open place are one color.
+- A build from source reports the commit it was built from in `rbx dr`, bug reports and the daemon log; the hash stayed on an earlier commit until one of a few watched files changed.
 
 ## 0.5.9 - 2026-11-06
 
