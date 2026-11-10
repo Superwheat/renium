@@ -14,6 +14,144 @@ use rbx_binary::InstanceBindingMode;
 
 const NATIVE_IMPORT_BATCH_INSTANCES: usize = 512;
 
+// Fixed-width tree rows avoid repeating full paths for every descendant.
+// Each row is (parent row, sibling/root ordinal, name, class, settings id).
+// Parent rows and ordinals are one-based; strings are zero-based. Parent zero
+// selects a root through incomingByPayloadIndex. Retained stubs carry no tree.
+pub(super) fn instance_identities(
+    dom: &RbxWeakDom,
+    roots: &[RbxRef],
+    ids: &HashMap<RbxRef, String>,
+    omitted: &HashSet<usize>,
+) -> Result<Option<crate::editor::types::EditorBinaryStructure>> {
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    let mut strings = Vec::new();
+    let mut indices = AHashMap::new();
+    let mut nodes = Vec::new();
+    let mut pending = roots
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !omitted.contains(&(index + 1)))
+        .rev()
+        .map(|(index, root)| (*root, 0u32, index + 1))
+        .collect::<Vec<_>>();
+    while let Some((referent, parent, ordinal)) = pending.pop() {
+        let instance = dom
+            .get_by_ref(referent)
+            .context("Import identity lost an instance")?;
+        let row = u32::try_from(nodes.len() / 20 + 1)?;
+        nodes.extend_from_slice(&parent.to_le_bytes());
+        nodes.extend_from_slice(&u32::try_from(ordinal)?.to_le_bytes());
+        for value in [
+            instance.name.as_str(),
+            instance.class.as_str(),
+            ids.get(&referent).map_or("", String::as_str),
+        ] {
+            let index = *indices.entry(value).or_insert_with(|| {
+                let index = strings.len() as u32;
+                strings.push(value.to_owned());
+                index
+            });
+            nodes.extend_from_slice(&index.to_le_bytes());
+        }
+        let mut ordinals = AHashMap::new();
+        let mut children = Vec::with_capacity(instance.children().len());
+        for child in instance.children() {
+            let node = dom
+                .get_by_ref(*child)
+                .context("Import identity lost a child")?;
+            let ordinal = ordinals.entry(node.name.as_str()).or_insert(0usize);
+            *ordinal += 1;
+            children.push((*child, row, *ordinal));
+        }
+        pending.extend(children.into_iter().rev());
+    }
+    Ok(
+        (!nodes.is_empty()).then(|| crate::editor::types::EditorBinaryStructure {
+            strings,
+            nodes: base64::encode(nodes),
+        }),
+    )
+}
+
+#[test]
+fn import_identity_tree_preserves_duplicate_ordinals_and_omits_retained_payloads() -> Result<()> {
+    let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+    let retained = dom.insert(
+        dom.root_ref(),
+        RbxInstanceBuilder::new("Folder").with_name("Retained"),
+    );
+    let root = dom.insert(
+        dom.root_ref(),
+        RbxInstanceBuilder::new("Folder").with_name("TreeRoot"),
+    );
+    let child = dom.insert(
+        root,
+        RbxInstanceBuilder::new("Folder").with_name("TreeChild"),
+    );
+    let duplicate = dom.insert(root, RbxInstanceBuilder::new("Part").with_name("TreeChild"));
+    let leaf = dom.insert(
+        child,
+        RbxInstanceBuilder::new("ObjectValue").with_name("Leaf"),
+    );
+    let ids = [
+        (root, "editor:6c72"),
+        (child, "editor:6c73"),
+        (duplicate, "editor:6c74"),
+        (leaf, "editor:6c75"),
+    ]
+    .into_iter()
+    .map(|(node, id)| (node, id.to_owned()))
+    .collect();
+    let receipt = instance_identities(&dom, &[retained, root], &ids, &HashSet::from([1]))?.unwrap();
+    let rows = base64::decode(&receipt.nodes)?;
+    let values = rows
+        .chunks_exact(20)
+        .map(|row| {
+            let word =
+                |offset| u32::from_le_bytes(row[offset..offset + 4].try_into().unwrap()) as usize;
+            (
+                word(0),
+                word(4),
+                receipt.strings[word(8)].as_str(),
+                receipt.strings[word(12)].as_str(),
+                receipt.strings[word(16)].as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        values,
+        vec![
+            (0, 2, "TreeRoot", "Folder", "editor:6c72"),
+            (1, 1, "TreeChild", "Folder", "editor:6c73"),
+            (2, 1, "Leaf", "ObjectValue", "editor:6c75"),
+            (1, 2, "TreeChild", "Part", "editor:6c74"),
+        ]
+    );
+    assert!(instance_identities(&dom, &[root], &HashMap::new(), &HashSet::new())?.is_none());
+    Ok(())
+}
+
+#[test]
+fn import_identity_metadata_is_linear_for_deep_place_sized_trees() -> Result<()> {
+    let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("Folder").with_name("Node"));
+    let mut ids = HashMap::new();
+    let mut parent = dom.root_ref();
+    for index in 0..20_000 {
+        ids.insert(parent, format!("editor:{index:x}"));
+        if index != 19_999 {
+            parent = dom.insert(parent, RbxInstanceBuilder::new("Folder").with_name("Node"));
+        }
+    }
+    let receipt = instance_identities(&dom, &[dom.root_ref()], &ids, &HashSet::new())?.unwrap();
+    assert_eq!(base64::decode(&receipt.nodes)?.len(), 20 * 20_000);
+    assert_eq!(receipt.strings.len(), 20_002);
+    assert!(serde_json::to_vec(&receipt)?.len() < 900_000);
+    Ok(())
+}
+
 pub(super) fn expected_structure(
     dom: &RbxWeakDom,
     root: RbxRef,
@@ -102,6 +240,7 @@ fn ordinary_payload_receipt_preserves_complete_preorder_and_keeps_special_classe
 pub(super) fn encode_services(
     dom: &mut RbxWeakDom,
     service_roots: &[(String, RbxRef)],
+    settings_ids: &HashMap<RbxRef, String>,
     groups: Vec<PendingEditorBinaryGroup>,
     package_plans: Vec<EditorPackageGroupPlan>,
     post_apply: &mut HashMap<String, HashSet<String>>,
@@ -434,6 +573,12 @@ pub(super) fn encode_services(
                 })
                 .collect();
             Ok(EditorBinaryImportGroup {
+                instance_identities: instance_identities(
+                    dom,
+                    &group.roots,
+                    settings_ids,
+                    &HashSet::new(),
+                )?,
                 service: group.service,
                 additive: group.additive,
                 target_path: group.target_path,

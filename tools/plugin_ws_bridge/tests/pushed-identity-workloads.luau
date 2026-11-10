@@ -26,7 +26,8 @@ local services = { ReplicatedStorage = replicated, ServerStorage = server }
 -- The shipped identity registry, the shipped preparation of a deserialized
 -- import and the shipped rows a capture carries.
 local identity = luau.load(slice(source, "local function settingsIdText(", "local function getStateForService(")
-	.. "\nreturn { rememberRoots = rememberImportedRootIdentities, captured = capturedSettingsId }", { environment = {
+	.. "\nreturn { rememberRoots = rememberImportedIdentities, captured = capturedSettingsId }", { environment = {
+	BridgeParallel = { newWorkBudget = function() return function() end end },
 	BridgeIdentity = { liveInstance = function(value)
 		return if value ~= nil and value.Parent ~= nil and value:IsDescendantOf(place) then value else nil
 	end },

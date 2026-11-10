@@ -3950,6 +3950,7 @@ fn write_editor_place_snapshot(
     }
     let mut build = RbxPlaceBuild {
         dom,
+        settings_ids_by_ref: HashMap::new(),
         service_roots,
         total_instances,
         has_package_links,

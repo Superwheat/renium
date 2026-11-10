@@ -823,6 +823,7 @@ pub(crate) struct BytecodeModelImportOutcome {
 
 pub(crate) struct RbxPlaceBuild {
     pub(crate) dom: RbxWeakDom,
+    pub(crate) settings_ids_by_ref: HashMap<RbxRef, String>,
     pub(crate) service_roots: Vec<(String, RbxRef)>,
     pub(crate) total_instances: usize,
     pub(crate) has_package_links: bool,
@@ -1630,8 +1631,22 @@ pub(crate) fn build_rbx_place(
         });
     crate::rbx::encode::normalize_export_dom(&mut dom, database);
     log_timing("native editor place DOM assembly", phase_started);
+    // Reimports need the source identities as well as logical properties.
+    // Reuse the already prepared index; ordinary file builds need no copy.
+    let settings_ids_by_ref = if capture_logical_properties {
+        settings_ids_by_service
+            .values()
+            .flat_map(|ids| {
+                ids.iter()
+                    .map(|(id, referent)| (*referent, (*id).to_owned()))
+            })
+            .collect()
+    } else {
+        HashMap::new()
+    };
     Ok(RbxPlaceBuild {
         dom,
+        settings_ids_by_ref,
         service_roots,
         total_instances,
         has_package_links,

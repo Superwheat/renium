@@ -5719,6 +5719,7 @@ mod sync_tests {
                 expected_structure: None,
                 root_paths: Vec::new(),
                 root_settings_ids: Vec::new(),
+                instance_identities: None,
                 viewport_camera: None,
                 retained_roots: Vec::new(),
                 package_roots: Vec::new(),

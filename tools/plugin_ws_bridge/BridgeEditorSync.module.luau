@@ -599,15 +599,99 @@ local function rememberMatchedSettingsInstance(
 	end
 end
 
--- The roots an import brought into a service keep the store identity the push
--- gave them, so a later capture reports them under it after Studio renames or
--- moves them. Called once the roots are in the place.
-local function rememberImportedRootIdentities(prepared: { any }, ctx: { [string]: any })
+-- Parent indices keep identity metadata linear even for deeply nested imports.
+-- Validate before importing; resolving it later never accepts an approximate path.
+local function validatedImportIdentities(raw: any, rootCount: number): any
+	if raw == nil then return nil end
+	if type(raw) ~= "table" or type(raw.nodes) ~= "string" then
+		error("Invalid imported instance identities")
+	end
+	local isArray, stringCount = denseArrayLength(raw.strings)
+	if not isArray then error("Imported identity strings must be an array") end
+	local budget = BridgeParallel.newWorkBudget()
+	for _, value in ipairs(raw.strings) do
+		budget()
+		if type(value) ~= "string" then error("Imported identity strings must be strings") end
+	end
+	local nodes = EncodingService:Base64Decode(buffer.fromstring(raw.nodes))
+	local bytes = buffer.len(nodes)
+	if bytes == 0 or bytes % 20 ~= 0 then error("Imported identity tree is truncated") end
+	local ids = {}
+	for offset = 0, bytes - 20, 20 do
+		budget()
+		local parent, ordinal = buffer.readu32(nodes, offset), buffer.readu32(nodes, offset + 4)
+		if parent >= offset / 20 + 1 or ordinal == 0 or (parent == 0 and ordinal > rootCount) then
+			error("Invalid imported identity parent or ordinal")
+		end
+		for field = 8, 16, 4 do
+			if buffer.readu32(nodes, offset + field) >= stringCount then
+				error("Imported identity string index is out of range")
+			end
+		end
+		local id = raw.strings[buffer.readu32(nodes, offset + 16) + 1]
+		if id ~= "" then
+			if ids[id] then error("Duplicate imported settings id") end
+			ids[id] = true
+		end
+	end
+	return { strings = raw.strings, nodes = nodes }
+end
+
+local function prepareImportedIdentities(group: any)
+	local identities = group.instanceIdentities
+	if identities == nil then return end
+	local nodes, strings = identities.nodes, identities.strings
+	local instances, childrenByParent, seen = {}, {}, {}
+	local budget = BridgeParallel.newWorkBudget()
+	for offset = 0, buffer.len(nodes) - 20, 20 do
+		budget()
+		local parent, ordinal = buffer.readu32(nodes, offset), buffer.readu32(nodes, offset + 4)
+		local name, class = strings[buffer.readu32(nodes, offset + 8) + 1], strings[buffer.readu32(nodes, offset + 12) + 1]
+		local instance
+		if parent == 0 then
+			instance = group.incomingByPayloadIndex[ordinal]
+		else
+			local byName = childrenByParent[parent]
+			if byName == nil then
+				byName = {}
+				for _, child in ipairs(instances[parent]:GetChildren()) do
+					budget()
+					local siblings = byName[child.Name] or {}
+					byName[child.Name] = siblings
+					siblings[#siblings + 1] = child
+				end
+				childrenByParent[parent] = byName
+			end
+			instance = byName[name] and byName[name][ordinal]
+		end
+		if instance == nil or instance.Name ~= name or instance.ClassName ~= class or seen[instance]
+			or (parent ~= 0 and instance.Parent ~= instances[parent]) then
+			error("Imported instance identity does not match the payload")
+		end
+		seen[instance] = true
+		instances[#instances + 1] = instance
+	end
+	group.importedSettingsInstances = instances
+end
+
+-- Bind actual imported objects before any later rename/reparent can change a
+-- path. Retention may substitute a live package object for a staged duplicate.
+local function rememberImportedIdentities(prepared: { any }, ctx: { [string]: any }, aliases: { [Instance]: Instance }?)
+	local budget = BridgeParallel.newWorkBudget()
 	for _, group in ipairs(prepared) do
 		for index, settingsId in ipairs(group.rootSettingsIds or {}) do
+			budget()
 			local instance = group.incomingByPayloadIndex[index]
 			if settingsId ~= "" and instance ~= nil then
-				rememberMatchedSettingsInstance(group.serviceName, settingsId, instance, ctx)
+				rememberMatchedSettingsInstance(group.serviceName, settingsId, if aliases then aliases[instance] or instance else instance, ctx)
+			end
+		end
+		local identities = group.instanceIdentities
+		for index, instance in ipairs(group.importedSettingsInstances or {}) do
+			budget()
+			local settingsId = identities.strings[buffer.readu32(identities.nodes, (index - 1) * 20 + 16) + 1]
+			if settingsId ~= "" then
+				rememberMatchedSettingsInstance(group.serviceName, settingsId, if aliases then aliases[instance] or instance else instance, ctx)
 			end
 		end
 	end
@@ -7421,7 +7505,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				and next(session.nativeRootWrites or {}) == nil
 			ReferenceOverlay.commitNative(session.nativeUndo, ctx)
 			assertCommitActive()
-			rememberImportedRootIdentities(session.nativeUndo.prepared, ctx)
+			rememberImportedIdentities(session.nativeUndo.prepared, ctx, session.nativeUndo.packageAliases)
 			for original, replacement in pairs(session.nativeUndo.replacements) do
 				session.instanceReplacements[original] = replacement
 			end
@@ -8559,6 +8643,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		end
 		local rootPaths = validatedNativeImportRootPaths(rawGroup, serviceName, targetPath, targetPathLength, count)
 		local rootSettingsIds = rawGroup.rootSettingsIds
+		local instanceIdentities = validatedImportIdentities(rawGroup.instanceIdentities, count)
 		if rootSettingsIds ~= nil then
 			local isArray, idCount = denseArrayLength(rootSettingsIds)
 			if not isArray or idCount ~= #rootPaths then
@@ -8645,6 +8730,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			payloadRootName = payloadRootName,
 			rootPaths = rootPaths,
 			rootSettingsIds = rootSettingsIds,
+			instanceIdentities = instanceIdentities,
 			viewportCamera = viewportCamera,
 			retainedRoots = retainedRoots,
 			packageRoots = packageRoots,
@@ -9210,17 +9296,15 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				end
 				group.incomingByPayloadIndex[index] = instance
 				group.incomingRootsByPath[key] = instance
-				-- Natively inserted roots keep their project identity so a later
-				-- rename or move by settings id finds them.
-				if group.rootSettingsIds ~= nil and group.rootSettingsIds[index] ~= "" then
-					rememberMatchedSettingsInstance(group.serviceName, group.rootSettingsIds[index], instance, ctx)
-				end
 			end
 			if #ordered ~= #group.incoming then
 				error("Native insertion returned unexpected roots")
 			end
 			group.incoming = ordered
+			prepareImportedIdentities(group)
 		end
+		transaction.assertOwnership()
+		rememberImportedIdentities(undo.prepared, ctx, undo.packageAliases)
 		runWithStudioChangeSuppression(ctx, function()
 			ReferenceOverlay.apply(native.referenceOverlay, undo.replacements, ctx)
 		end)
@@ -9429,6 +9513,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					targetPath = group.targetPath,
 					rootPaths = group.rootPaths,
 					rootSettingsIds = group.rootSettingsIds,
+					instanceIdentities = group.instanceIdentities,
 					viewportCamera = group.viewportCamera,
 					incoming = incoming,
 					incomingByPayloadIndex = incomingByPayloadIndex,
@@ -9438,6 +9523,11 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				}
 			end
 			setTrackedOperationPhase(operation, "prepareRetention")
+			for _, group in ipairs(prepared) do
+				prepareImportedIdentities(group)
+			end
+			assertImportActive()
+			ReferenceOverlay.assertNativeGuard(transaction.nativeGuard)
 			local retention = ReferenceOverlay.prepareRetained(
 				prepared, ctx, session.externalReferencesPostApplied, session.viewportReferencesPostApplied
 			)

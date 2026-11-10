@@ -481,7 +481,7 @@ local commit = extract("local function commitTransactionUnsafe(", "function api.
 		chainReplacements = function() end,
 		commitNative = function() attached += 1 end,
 	},
-	rememberImportedRootIdentities = function(prepared, ctx)
+	rememberImportedIdentities = function(prepared, ctx)
 		assert(attached == identified + 1, "Imported roots are identified once they are in the place")
 		assert(prepared == pendingSessions.snapshot.nativeUndo.prepared and ctx == commitContext)
 		identified += 1

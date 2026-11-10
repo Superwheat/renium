@@ -3160,6 +3160,7 @@ fn build_editor_binary_import_for_services(
         let (bytes, groups, native_replacement) = payload::encode_services(
             &mut build.dom,
             &build.service_roots,
+            &build.settings_ids_by_ref,
             pending_groups,
             package_plans,
             &mut post_apply_properties_by_path,
@@ -3216,6 +3217,12 @@ fn build_editor_binary_import_for_services(
             .filter(|root| root.payload_omitted)
             .map(|root| root.payload_index)
             .collect::<HashSet<_>>();
+        let instance_identities = payload::instance_identities(
+            &build.dom,
+            &pending.roots,
+            &build.settings_ids_by_ref,
+            &omitted_payloads,
+        )?;
         for (index, referent) in pending.roots.iter().enumerate() {
             let mut subtree = Vec::new();
             collect_rbx_subtree_preorder(&build.dom, *referent, &mut subtree);
@@ -3261,6 +3268,7 @@ fn build_editor_binary_import_for_services(
             expected_structure,
             root_paths,
             root_settings_ids: pending.root_settings_ids,
+            instance_identities,
             viewport_camera: pending.viewport_camera,
             retained_roots: package_plan.retained_roots,
             package_roots: package_plan.package_roots,
