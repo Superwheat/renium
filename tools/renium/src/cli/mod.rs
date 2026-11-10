@@ -1650,17 +1650,25 @@ pub(super) struct ScriptGrepArgs {
     #[arg(help = "Read the query as a regular expression", short = 'E', long)]
     pub(super) regex: bool,
     #[arg(
-        help = "Search only this script file or folder, a path under the project",
+        help = "Search only this script file or folder, a path under the project; repeat for several",
         long = "in",
         value_name = "PATH"
     )]
-    pub(super) scope: Option<String>,
+    pub(super) scope: Vec<String>,
     #[arg(
         help = "Print each script's number of matching lines instead of the lines",
         short = 'c',
         long
     )]
     pub(super) count: bool,
+    #[arg(
+        help = "Also print N lines before and after each matching line, as `LINE- text`",
+        short = 'C',
+        long,
+        value_name = "N",
+        conflicts_with_all = ["count", "functions"]
+    )]
+    pub(super) context: Option<usize>,
     #[arg(
         help = "Print each function that holds a match once, whole, instead of its matching lines",
         long = "fn",
@@ -1760,6 +1768,7 @@ pub(super) struct StartStopPlayArgs {
     pub(super) until_console: Option<String>,
     #[arg(
         help = "Seconds to wait for --until and --until-console",
+        short = 't',
         long,
         default_value_t = 120.0
     )]

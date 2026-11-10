@@ -57,10 +57,29 @@ struct ScriptGrep {
     regex: bool,
     #[serde(default)]
     count: bool,
-    scope: Option<String>,
+    context: Option<usize>,
+    #[serde(default, deserialize_with = "one_or_several")]
+    scope: Vec<String>,
     limit: Option<usize>,
     #[serde(default, rename = "fn")]
     functions: bool,
+}
+
+/// A search scope given as one path or as a list of them.
+fn one_or_several<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Scope {
+        One(String),
+        Several(Vec<String>),
+    }
+    Ok(match Option::<Scope>::deserialize(deserializer)? {
+        Some(Scope::One(path)) => vec![path],
+        Some(Scope::Several(paths)) => paths,
+        None => Vec::new(),
+    })
 }
 
 pub(crate) fn asset_search_command(args: AssetSearchArgs) -> anyhow::Result<()> {
@@ -214,11 +233,19 @@ fn items<'a>(value: &'a Value, key: &str) -> &'a [Value] {
         .map_or(&[][..], Vec::as_slice)
 }
 
-/// One hit as a `LINE: text` line, without the indentation and with a long
-/// line cut short.
+/// The most lines `--context` prints on each side of a hit.
+const MAX_CONTEXT_LINES: usize = 20;
+
+/// One hit as a `LINE: text` line, or a context line around a hit as
+/// `LINE- text`, without the indentation and with a long line cut short.
 fn push_hit_line(text: &mut String, hit: &Value) {
     let line = hit["text"].as_str().unwrap_or_default().trim();
-    text.push_str(&format!("{}: ", hit["line"]));
+    let mark = if hit["context"] == json!(true) {
+        '-'
+    } else {
+        ':'
+    };
+    text.push_str(&format!("{}{mark} ", hit["line"]));
     match line.char_indices().nth(HIT_TEXT_LIMIT) {
         Some((cut, _)) => {
             text.push_str(&line[..cut]);
@@ -266,7 +293,7 @@ fn push_script_lines(text: &mut String, result: &Value) -> u64 {
             lines += push_function(text, function);
         }
         push_hit_line(text, hit);
-        lines += 1;
+        lines += u64::from(hit["context"] != json!(true));
     }
     for function in functions {
         lines += push_function(text, function);
@@ -336,6 +363,7 @@ pub(crate) fn script_grep_command(
             "caseInsensitive": args.case_insensitive,
             "regex": args.regex,
             "count": args.count,
+            "context": args.context,
             "scope": args.scope,
             "limit": args.limit,
             "fn": args.functions,
@@ -885,11 +913,14 @@ fn script_grep_at(root: &Path, source: &Path, parameters: &Value) -> Result<Valu
         ));
     }
     let matches = line_matcher(&request)?;
-    let scope = request.scope.as_deref().map(scope_prefix);
+    let scopes = request
+        .scope
+        .iter()
+        .map(|scope| scope_prefix(scope))
+        .collect::<Vec<_>>();
     let files = script_files(source).into_iter().filter(|path| {
-        scope
-            .as_deref()
-            .is_none_or(|scope| in_scope(&relative(root, path), scope))
+        let relative = relative(root, path);
+        scopes.is_empty() || scopes.iter().any(|scope| in_scope(&relative, scope))
     });
     if request.functions {
         if request.count {
@@ -902,6 +933,7 @@ fn script_grep_at(root: &Path, source: &Path, parameters: &Value) -> Result<Valu
         return script_grep_functions(root, files, &matches, limit);
     }
     let limit = request.limit.unwrap_or(50).clamp(1, 1000);
+    let context = request.context.unwrap_or(0).min(MAX_CONTEXT_LINES);
     // Matches are grouped by file: one path per script instead of one per line.
     let mut results: Vec<Value> = Vec::new();
     let mut returned = 0;
@@ -920,14 +952,24 @@ fn script_grep_at(root: &Path, source: &Path, parameters: &Value) -> Result<Valu
             }
             continue;
         }
+        let lines = source.lines().collect::<Vec<_>>();
+        let around =
+            |line: usize| json!({ "line": line, "text": lines[line - 1], "context": true });
         let mut hits = Vec::new();
-        for (index, line) in source.lines().enumerate() {
+        let (mut listed, mut after) = (0, 0);
+        for (index, line) in lines.iter().enumerate() {
             if matches(line) {
                 total_matches += 1;
                 if returned < limit {
                     returned += 1;
+                    let before = (index + 1).saturating_sub(context).max(listed + 1);
+                    hits.extend((before..=index).map(around));
                     hits.push(json!({ "line": index + 1, "text": line }));
+                    (listed, after) = (index + 1, context);
                 }
+            } else if after > 0 {
+                hits.push(around(index + 1));
+                (listed, after) = (index + 1, after - 1);
             }
         }
         if !hits.is_empty() {
@@ -1379,6 +1421,22 @@ end
             hits(&one_file),
             vec![("src/ServerOther/Wheel.luau".to_string(), 1)]
         );
+        let around =
+            grep(json!({ "query": "Grant", "scope": "src/Server", "context": 1 })).unwrap();
+        let listed = around["results"][0]["hits"].as_array().unwrap();
+        assert!(listed.len() > 1, "{around}");
+        assert_eq!(
+            listed.iter().filter(|hit| hit["context"] != true).count(),
+            1,
+            "{around}"
+        );
+        assert!(script_hits_text(&around).contains("- "), "{around}");
+        let both = grep(json!({
+            "query": "Grant",
+            "scope": ["src/Server", "src/ServerOther/Wheel.luau"],
+        }))
+        .unwrap();
+        assert_eq!(hits(&both).len(), 2);
         let broken = grep(json!({ "query": "(", "regex": true })).err().unwrap();
         assert!(broken.contains("Invalid regular expression"));
         let counted =
