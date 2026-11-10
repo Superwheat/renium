@@ -683,8 +683,9 @@ mod tests {
             script_hits_text(&counted),
             "src/Server/Shop.server.luau 2\nsrc/ServerOther/Wheel.luau 1"
         );
-        let first = grep(json!({ "query": "grant", "caseInsensitive": true, "count": true, "limit": 1 }))
-            .unwrap();
+        let first =
+            grep(json!({ "query": "grant", "caseInsensitive": true, "count": true, "limit": 1 }))
+                .unwrap();
         assert_eq!(
             script_hits_text(&first),
             "src/Server/Shop.server.luau 2\n1 of 2 scripts shown; -l N shows more"
