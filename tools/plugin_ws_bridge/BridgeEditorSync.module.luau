@@ -599,6 +599,42 @@ local function rememberMatchedSettingsInstance(
 	end
 end
 
+-- The roots an import brought into a service keep the store identity the push
+-- gave them, so a later capture reports them under it after Studio renames or
+-- moves them. Called once the roots are in the place.
+local function rememberImportedRootIdentities(prepared: { any }, ctx: { [string]: any })
+	for _, group in ipairs(prepared) do
+		for index, settingsId in ipairs(group.rootSettingsIds or {}) do
+			local instance = group.incomingByPayloadIndex[index]
+			if settingsId ~= "" and instance ~= nil then
+				rememberMatchedSettingsInstance(group.serviceName, settingsId, instance, ctx)
+			end
+		end
+	end
+end
+
+-- The store identity a capture reports for an instance a push identified. The
+-- identity is one of a single service's store, so it is reported only while
+-- the instance is inside that service: moved to another service it is a new
+-- instance of that store, where the same id may name something else.
+local function capturedSettingsId(instance: Instance, ctx: { [string]: any }): string?
+	local byInstance = ctx.matchedSettingsIdByInstance
+	local settingsId = if type(byInstance) == "table" then settingsIdText(byInstance[instance]) else nil
+	if
+		settingsId == nil
+		or liveInstance(instance) == nil
+		or type(ctx.matchedSettingsInstancesByService) ~= "table"
+	then
+		return nil
+	end
+	for serviceName, serviceMatches in pairs(ctx.matchedSettingsInstancesByService) do
+		if serviceMatches[settingsId] == instance and instance:IsDescendantOf(game:GetService(serviceName)) then
+			return settingsId
+		end
+	end
+	return nil
+end
+
 local function clearMatchedSettingsInstances(serviceName: string, ctx: { [string]: any })
 	if type(ctx.matchedSettingsInstancesByService) == "table" then
 		local serviceMatches = ctx.matchedSettingsInstancesByService[serviceName]
@@ -6449,11 +6485,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 	end
 
 	function api.matchedSettingsId(instance: Instance): string?
-		local byInstance = ctx.matchedSettingsIdByInstance
-		if type(byInstance) ~= "table" or liveInstance(instance) == nil then
-			return nil
-		end
-		return settingsIdText(byInstance[instance])
+		return capturedSettingsId(instance, ctx)
 	end
 
 	function api.matchedSettingsIdVersion(): number
@@ -7389,6 +7421,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				and next(session.nativeRootWrites or {}) == nil
 			ReferenceOverlay.commitNative(session.nativeUndo, ctx)
 			assertCommitActive()
+			rememberImportedRootIdentities(session.nativeUndo.prepared, ctx)
 			for original, replacement in pairs(session.nativeUndo.replacements) do
 				session.instanceReplacements[original] = replacement
 			end
@@ -9395,6 +9428,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					target = group.target,
 					targetPath = group.targetPath,
 					rootPaths = group.rootPaths,
+					rootSettingsIds = group.rootSettingsIds,
 					viewportCamera = group.viewportCamera,
 					incoming = incoming,
 					incomingByPayloadIndex = incomingByPayloadIndex,

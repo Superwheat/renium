@@ -306,3 +306,163 @@ fn a_batch_checks_the_unresolved_references_its_copies_carry() {
         Some("Workspace.Late")
     );
 }
+
+/// `ba ReplicatedStorage -n RefTarget -c Folder` and an ObjectValue in
+/// ServerScriptService that refers to it; returns the folder's store id.
+fn add_target_and_probe(fx: &Fixture) -> String {
+    let target = fx
+        .text(&[
+            "ba",
+            "-f",
+            &fx.store_arg("ReplicatedStorage"),
+            "-n",
+            "RefTarget",
+            "-c",
+            "Folder",
+        ])
+        .ok();
+    let id = target["settingsId"].as_str().unwrap().to_string();
+    add_holder(
+        fx,
+        "ServerScriptService",
+        "RefProbe",
+        "ReplicatedStorage.RefTarget",
+    )
+    .ok();
+    assert_eq!(
+        stored_reference(fx, "ServerScriptService", "RefProbe"),
+        outside_reference(&["ReplicatedStorage", "RefTarget"], &[1, 1], &id)
+    );
+    id
+}
+
+/// A pull of ReplicatedStorage alone after Studio changed the folder a push
+/// created there; `edit` receives the capture and the folder's index in it.
+/// A capture names an instance by its Studio debug id. The pushed folder
+/// arrives under its store id when `identified`: Studio's plugin reports that
+/// id for an instance a push created or matched, for as long as its session
+/// with the pushing daemon lasts.
+fn pull_replicated_storage(
+    fx: &Fixture,
+    pushed_id: &str,
+    identified: bool,
+    edit: impl FnOnce(&mut SettingsBytecode, usize),
+) {
+    use crate::settings::bytecode::encode_settings_bytecode;
+    use crate::settings::equivalence::{SettingsAlignment, align_settings_bytes_to_reference};
+
+    let mut captured = fx.read_store("ReplicatedStorage");
+    let pushed = captured
+        .instances
+        .iter()
+        .position(|instance| instance.settings_id == pushed_id)
+        .unwrap();
+    for (index, instance) in captured.instances.iter_mut().enumerate() {
+        if index == 0 {
+            instance.settings_id = "1".to_string();
+        } else if index != pushed || !identified {
+            instance.settings_id = format!("debug:0_{}", index + 20);
+        }
+    }
+    edit(&mut captured, pushed);
+    let SettingsAlignment::Changed(aligned) = align_settings_bytes_to_reference(
+        &fs::read(fx.store("ReplicatedStorage")).unwrap(),
+        &encode_settings_bytecode(&captured).unwrap(),
+    )
+    .unwrap() else {
+        panic!("Studio's edit must change the store");
+    };
+    fs::write(fx.store("ReplicatedStorage"), aligned).unwrap();
+}
+
+/// `Parent.Name=id` for the pushed folder and for whatever took its name, in
+/// store order.
+fn target_rows(fx: &Fixture) -> Vec<String> {
+    let store = fx.read_store("ReplicatedStorage");
+    store
+        .instances
+        .iter()
+        .filter(|instance| instance.name.starts_with("RefTarget"))
+        .map(|instance| {
+            let parent = &store.instances[instance.parent_index.unwrap()].name;
+            format!("{parent}.{}={}", instance.name, instance.settings_id)
+        })
+        .collect()
+}
+
+fn newcomer() -> SettingsBytecodeInstance {
+    settings_instance("debug:0_99", "RefTarget", "Folder", Some(0))
+}
+
+#[test]
+fn a_pull_keeps_a_reference_on_the_pushed_instance_studio_renamed() {
+    let fx = Fixture::new("pull-renamed-target");
+    let id = add_target_and_probe(&fx);
+    // Studio renamed RefTarget and a new folder took its name.
+    pull_replicated_storage(&fx, &id, true, |captured, pushed| {
+        captured.instances[pushed].name = "RefTargetMoved".to_string();
+        captured.instances.push(newcomer());
+    });
+    assert_eq!(
+        target_rows(&fx),
+        [
+            format!("ReplicatedStorage.RefTargetMoved={id}"),
+            "ReplicatedStorage.RefTarget=debug:0_99".to_string(),
+        ]
+    );
+    // The holder's store was not pulled and still carries the old path.
+    assert_eq!(
+        stored_reference(&fx, "ServerScriptService", "RefProbe"),
+        outside_reference(&["ReplicatedStorage", "RefTarget"], &[1, 1], &id)
+    );
+    assert_eq!(
+        built_reference_target(&fx, "ServerScriptService.RefProbe").as_deref(),
+        Some("ReplicatedStorage.RefTargetMoved")
+    );
+}
+
+#[test]
+fn a_pull_keeps_a_reference_on_the_pushed_instance_studio_moved() {
+    let fx = Fixture::new("pull-moved-target");
+    let id = add_target_and_probe(&fx);
+    // Studio moved RefTarget into Shared and a new folder took its place.
+    pull_replicated_storage(&fx, &id, true, |captured, pushed| {
+        captured.instances[pushed].parent_index = Some(1);
+        captured.instances.push(newcomer());
+    });
+    assert_eq!(
+        target_rows(&fx),
+        [
+            format!("Shared.RefTarget={id}"),
+            "ReplicatedStorage.RefTarget=debug:0_99".to_string(),
+        ]
+    );
+    assert_eq!(
+        built_reference_target(&fx, "ServerScriptService.RefProbe").as_deref(),
+        Some("ReplicatedStorage.Shared.RefTarget")
+    );
+}
+
+#[test]
+fn a_pull_without_a_pushed_identity_pairs_the_store_by_path() {
+    let fx = Fixture::new("pull-unidentified-target");
+    let id = add_target_and_probe(&fx);
+    // The same Studio edit, captured by a Studio that knows no pushed
+    // identity (one restarted since the push): the capture carries debug
+    // ids alone, so the store id stays on the path it was stored at.
+    pull_replicated_storage(&fx, &id, false, |captured, pushed| {
+        captured.instances[pushed].name = "RefTargetMoved".to_string();
+        captured.instances.push(newcomer());
+    });
+    assert_eq!(
+        target_rows(&fx),
+        [
+            "ReplicatedStorage.RefTargetMoved=debug:0_24".to_string(),
+            format!("ReplicatedStorage.RefTarget={id}"),
+        ]
+    );
+    assert_eq!(
+        built_reference_target(&fx, "ServerScriptService.RefProbe").as_deref(),
+        Some("ReplicatedStorage.RefTarget")
+    );
+}

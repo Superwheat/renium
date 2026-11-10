@@ -59,6 +59,7 @@ require("./coregui-dismiss-workloads")
 require("./sibling-order-workloads")
 require("./path-snapshot-workloads")
 require("./reference-resolution-workloads")
+require("./pushed-identity-workloads")
 
 local function equal(actual, expected, label)
 	if actual ~= expected then

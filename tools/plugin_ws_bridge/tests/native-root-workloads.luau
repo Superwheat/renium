@@ -462,6 +462,7 @@ end
 -- Exercise the production commit, not a second model of its phase ordering.
 local pendingSessions = {}
 local attached, documents, finished, generation = 0, 0, 0, 0
+local identified = 0
 local commitContext = { studioChangeGeneration = function() return generation end }
 local onFinish = nil
 local commit = extract("local function commitTransactionUnsafe(", "function api.commitTransaction(", {
@@ -480,6 +481,11 @@ local commit = extract("local function commitTransactionUnsafe(", "function api.
 		chainReplacements = function() end,
 		commitNative = function() attached += 1 end,
 	},
+	rememberImportedRootIdentities = function(prepared, ctx)
+		assert(attached == identified + 1, "Imported roots are identified once they are in the place")
+		assert(prepared == pendingSessions.snapshot.nativeUndo.prepared and ctx == commitContext)
+		identified += 1
+	end,
 	ScriptDocumentState = { apply = function() documents += 1 end },
 	ctx = commitContext,
 	cancelExpectedEvent = function() end,
@@ -506,6 +512,7 @@ end
 assert(attached == 1 and documents == 1 and finished == 0, "Snapshot sees staged contents without closing undo")
 assert(commit({ transactionId = "snapshot" }, {}).state == "committed")
 assert(attached == 1 and documents == 1 and finished == 1, "Finalization must not attach twice")
+assert(identified == 1, "Imported roots are identified with the commit that attaches them")
 prepared = pending()
 commit({ transactionId = "snapshot", prepareOnly = true }, {})
 generation = 1
