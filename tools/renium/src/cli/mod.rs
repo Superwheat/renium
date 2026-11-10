@@ -1677,11 +1677,15 @@ pub(super) struct ScriptGrepArgs {
 
 #[derive(Parser)]
 pub(super) struct ScriptReadArgs {
-    #[arg(help = "Script file path")]
-    pub(super) path: PathBuf,
-    #[arg(help = "First line to read", long, default_value_t = 1)]
-    pub(super) start_line: usize,
-    #[arg(help = "Last line to read", long)]
+    #[arg(
+        help = "Script file or instance path (ServerScriptService.Main), with lines as FILE:A-B, FILE:A- or FILE:A; several are read in one call",
+        value_name = "TARGET",
+        required = true
+    )]
+    pub(super) targets: Vec<String>,
+    #[arg(help = "First line to read of a target without lines", long)]
+    pub(super) start_line: Option<usize>,
+    #[arg(help = "Last line to read of a target without lines", long)]
     pub(super) end_line: Option<usize>,
     #[arg(
         help = "List the functions instead of the source: one `FIRST-LAST name(params)` line each, nested ones indented",

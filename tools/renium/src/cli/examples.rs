@@ -144,7 +144,7 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ),
     (
         "sr",
-        "Examples:\n  rbx sr src/ServerScriptService/Main.server.luau\n  rbx sr src/ServerScriptService/Main.server.luau --outline\n  rbx sr src/ServerScriptService/Main.server.luau --fn onPlayerAdded",
+        "Examples:\n  rbx sr src/ServerScriptService/Main.server.luau\n  rbx sr src/ServerScriptService/Main.server.luau --outline\n  rbx sr src/ServerScriptService/Main.server.luau --fn onPlayerAdded\n  rbx sr ServerScriptService.Main:1-40 src/ReplicatedStorage/Config.luau:120-",
     ),
     (
         "play",

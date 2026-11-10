@@ -883,6 +883,194 @@ fn sourcemap_writes_prints_filters_and_reads_the_cache() {
     );
 }
 
+const SHOP_SOURCE: &str = "\
+local Shop = {}
+function Shop.buy(player, id)
+\treturn id
+end
+function Shop.sell(player)
+end
+return Shop
+";
+const SHOP_FILE: &str = "src/ReplicatedStorage/Shared/Config.luau";
+
+fn shop_fixture(tag: &str) -> (Fixture, String) {
+    let fx = Fixture::new(tag);
+    fx.write_source("ReplicatedStorage", 2, SHOP_SOURCE);
+    let project = fx.path("renium.project.jsonc");
+    (fx, project)
+}
+
+#[test]
+fn script_read_takes_line_ranges_on_the_target_and_several_targets() {
+    let (fx, project) = shop_fixture("script-read-targets");
+    let read = |args: &[&str]| fx.text(&[&["sr", "--project", &project], args].concat());
+    assert_eq!(read(&[SHOP_FILE]).stdout, format!("1-7/7\n{SHOP_SOURCE}"));
+    let buy = "function Shop.buy(player, id)\n\treturn id\nend\n";
+    assert_eq!(
+        read(&[&format!("{SHOP_FILE}:2-4")]).stdout,
+        format!("2-4/7\n{buy}")
+    );
+    assert_eq!(
+        read(&[&format!("{SHOP_FILE}:6-")]).stdout,
+        "6-7/7\nend\nreturn Shop\n"
+    );
+    assert_eq!(
+        read(&[&format!("{SHOP_FILE}:3")]).stdout,
+        "3-3/7\n\treturn id\n"
+    );
+    assert_eq!(
+        read(&[SHOP_FILE, "--start-line", "6"]).stdout,
+        "6-7/7\nend\nreturn Shop\n"
+    );
+    assert_eq!(
+        read(&[SHOP_FILE, "--start-line", "2", "--end-line", "4"]).stdout,
+        format!("2-4/7\n{buy}")
+    );
+    let absolute = fx.path(SHOP_FILE);
+    assert_eq!(read(&[&absolute]).stdout, format!("1-7/7\n{SHOP_SOURCE}"));
+    assert_eq!(
+        read(&[&format!("{absolute}:7")]).stdout,
+        "7-7/7\nreturn Shop\n"
+    );
+    assert_eq!(
+        read(&[SHOP_FILE, "--fn", "sell"]).stdout,
+        "5-6/7 Shop.sell\nfunction Shop.sell(player)\nend\n"
+    );
+
+    let spawner = "src/Workspace/Spawner.server.luau";
+    assert_eq!(
+        read(&[&format!("{SHOP_FILE}:1,5-6"), spawner]).stdout,
+        format!(
+            "== {SHOP_FILE} 1-1\nlocal Shop = {{}}\n== {SHOP_FILE} 5-6\nfunction Shop.sell(player)\nend\n== {spawner} 1-1\n{SPAWNER_SOURCE}"
+        )
+    );
+    assert_eq!(
+        read(&[SHOP_FILE, spawner, "--end-line", "1"]).stdout,
+        format!("== {SHOP_FILE} 1-1\nlocal Shop = {{}}\n== {spawner} 1-1\n{SPAWNER_SOURCE}")
+    );
+    assert_eq!(
+        read(&[SHOP_FILE, spawner, "--outline"]).stdout,
+        format!(
+            "== {SHOP_FILE}\n7 lines\n2-4 Shop.buy(player, id)\n5-6 Shop.sell(player)\n== {spawner}\n1 lines\n"
+        )
+    );
+    assert_eq!(
+        read(&[SHOP_FILE, SHOP_FILE, "--fn", "buy"]).stdout,
+        format!("== {SHOP_FILE}\n2-4/7 Shop.buy\n{buy}== {SHOP_FILE}\n2-4/7 Shop.buy\n{buy}")
+    );
+    let one = json!({"path": SHOP_FILE, "startLine": 3, "endLine": 3, "totalLines": 7, "source": "\treturn id"});
+    let target = format!("{SHOP_FILE}:3");
+    assert_eq!(fx.json(&["sr", "--project", &project, &target]).ok(), one);
+    assert_eq!(
+        fx.json(&["sr", "--project", &project, &target, spawner])
+            .ok(),
+        json!({"scripts": [one, {"path": spawner, "startLine": 1, "endLine": 1, "totalLines": 1, "source": "print('spawn')"}]})
+    );
+
+    assert_eq!(
+        read(&[&format!("{SHOP_FILE}:9-12")]).err(),
+        format!("Requested lines 9 through 12, but {SHOP_FILE} has 7 lines")
+    );
+    assert_eq!(
+        read(&[spawner, &format!("{SHOP_FILE}:4-2")]).err(),
+        format!("Requested lines 4 through 2, but {SHOP_FILE} has 7 lines")
+    );
+    assert_eq!(
+        read(&[&format!("{SHOP_FILE}:2-4"), "--start-line", "1"]).err(),
+        format!(
+            "{SHOP_FILE}:2-4 names its lines; give them there or with --start-line/--end-line, not both"
+        )
+    );
+    assert_eq!(
+        read(&[&format!("{SHOP_FILE}:2-4"), "--outline"]).err(),
+        "script-read takes one of a line range, outline and fn"
+    );
+    assert!(
+        read(&[&format!("{SHOP_FILE}:2-x")])
+            .err()
+            .starts_with("Failed to resolve <root>/src/ReplicatedStorage/Shared/Config.luau:2-x")
+    );
+    assert!(
+        read(&["src/Nowhere.luau"])
+            .err()
+            .starts_with("Failed to resolve <root>/src/Nowhere.luau")
+    );
+    assert!(read(&[]).err().contains("<TARGET>..."));
+}
+
+#[test]
+fn script_read_resolves_an_instance_path_through_the_script_mapping() {
+    let (fx, project) = shop_fixture("script-read-instances");
+    let read = |args: &[&str]| fx.text(&[&["sr", "--project", &project], args].concat());
+    assert_eq!(
+        read(&["ReplicatedStorage.Shared.Config"]).stdout,
+        format!("1-7/7\n{SHOP_SOURCE}")
+    );
+    assert_eq!(
+        read(&["game.Workspace.Lobby.Helper:2", "Workspace.Spawner"]).stdout,
+        format!(
+            "== src/Workspace/Lobby/Helper.client.luau 2-2\nreturn a\n== src/Workspace/Spawner.server.luau 1-1\n{SPAWNER_SOURCE}"
+        )
+    );
+    assert_eq!(
+        read(&["ReplicatedStorage.Shared.Config", "--fn", "sell"]).stdout,
+        "5-6/7 Shop.sell\nfunction Shop.sell(player)\nend\n"
+    );
+    assert!(!fx.exists("sourcemap.json"));
+    assert_eq!(
+        read(&["Workspace.Lobby"]).err(),
+        "Workspace.Lobby has no script file in the project"
+    );
+    assert_eq!(
+        read(&["Workspace.Lobby.Halper"]).err(),
+        "No script at Workspace.Lobby.Halper: it is not a file, and the project has no instance at that path; rbx ss NAME finds scripts"
+    );
+
+    fx.write_store(
+        "ServerScriptService",
+        &settings_document(vec![
+            settings_instance("sss", "ServerScriptService", "ServerScriptService", None),
+            script("twin1", "Twin", "Script", 0),
+            script("twin2", "Twin", "Script", 0),
+        ]),
+    );
+    fx.write_source("ServerScriptService", 1, "print(1)\n");
+    fx.write_source("ServerScriptService", 2, "print(2)\n");
+    let twins = read(&["ServerScriptService.Twin"]).err();
+    assert!(
+        twins.starts_with(
+            "ServerScriptService.Twin names 2 script files: src/ServerScriptService/Twin"
+        ),
+        "{twins}"
+    );
+    assert!(twins.ends_with("; pass one of them"), "{twins}");
+
+    fs::write(
+        fx.path("sourcemap.json"),
+        json!({"name": "game", "className": "DataModel", "children": [
+            {"name": "ServerScriptService", "className": "ServerScriptService", "children": [
+                {"name": "Shop.Config", "className": "ModuleScript", "filePaths": [SHOP_FILE]},
+            ]},
+            {"name": "Workspace", "className": "Workspace", "children": [
+                {"name": "Spawner", "className": "Script", "filePaths": ["src/Workspace/Moved.server.luau"]},
+            ]},
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        read(&["ServerScriptService.Shop.Config:1"]).stdout,
+        "1-1/7\nlocal Shop = {}\n"
+    );
+    assert_eq!(
+        read(&["Workspace.Spawner", "Workspace.Lobby.Helper:1"]).stdout,
+        format!(
+            "== src/Workspace/Spawner.server.luau 1-1\n{SPAWNER_SOURCE}== src/Workspace/Lobby/Helper.client.luau 1-1\nlocal a = 1\n"
+        )
+    );
+}
+
 fn import_result(
     destination: &str,
     action: &str,

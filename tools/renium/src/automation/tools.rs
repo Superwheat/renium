@@ -1,3 +1,4 @@
+use std::cell::OnceCell;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -13,6 +14,9 @@ use crate::cli::{
     ScriptGrepArgs, ScriptReadArgs, ScriptSearchArgs,
 };
 use crate::project::config;
+use crate::project::sourcemap::{
+    SourcemapNode, build_project_sourcemap_with_loaded, load_existing_sourcemap_root,
+};
 use crate::system::files::canonical_path;
 
 use super::commands::run_daemon;
@@ -382,27 +386,105 @@ fn script_read_text(value: &Value) -> String {
     text
 }
 
+/// One read of several as text: a `== path FIRST-LAST` line and the source,
+/// or a `== path` line and the outline or the functions read by name.
+fn script_block_text(value: &Value) -> String {
+    let path = value["path"].as_str().unwrap_or_default();
+    match value.get("source").and_then(Value::as_str) {
+        Some(source) => format!(
+            "== {path} {}-{}\n{source}",
+            value["startLine"], value["endLine"]
+        ),
+        None => format!("== {path}\n{}", script_read_text(value)),
+    }
+}
+
+/// One line range of a read target: `A-B`, `A-` (through the last line) or
+/// `A` (that line alone).
+fn line_range(text: &str) -> Option<(usize, Option<usize>)> {
+    Some(match text.split_once('-') {
+        Some((first, "")) => (first.parse().ok()?, None),
+        Some((first, last)) => (first.parse().ok()?, Some(last.parse().ok()?)),
+        None => {
+            let line = text.parse().ok()?;
+            (line, Some(line))
+        }
+    })
+}
+
+/// A read target split into its path and the line ranges after its last `:`,
+/// separated by commas. A suffix that is not line ranges stays in the path,
+/// so `C:/x/y.luau` is all path.
+fn split_target(target: &str) -> (&str, Vec<(usize, Option<usize>)>) {
+    let ranged = target.rsplit_once(':').and_then(|(path, suffix)| {
+        let ranges = suffix.split(',').map(line_range).collect::<Option<_>>()?;
+        (!path.is_empty()).then_some((path, ranges))
+    });
+    ranged.unwrap_or((target, Vec::new()))
+}
+
+/// The reads a command line asks for, in order: one per line range of each
+/// target, and one for a target without lines, which takes `--start-line` and
+/// `--end-line`.
+fn read_requests(args: &ScriptReadArgs) -> anyhow::Result<Vec<Value>> {
+    let mut requests = Vec::new();
+    for target in &args.targets {
+        let (path, ranges) = split_target(target);
+        let ranges = if ranges.is_empty() {
+            vec![(args.start_line, args.end_line)]
+        } else if args.start_line.is_some() || args.end_line.is_some() {
+            anyhow::bail!(
+                "{target} names its lines; give them there or with --start-line/--end-line, not both"
+            );
+        } else {
+            ranges
+                .into_iter()
+                .map(|(first, last)| (Some(first), last))
+                .collect()
+        };
+        for (first, last) in ranges {
+            requests.push(json!({
+                "path": path,
+                "startLine": first,
+                "endLine": last,
+                "outline": args.outline,
+                "fn": args.functions,
+            }));
+        }
+    }
+    Ok(requests)
+}
+
 pub(crate) fn script_read_command(
     args: ScriptReadArgs,
     project: Option<&Path>,
 ) -> anyhow::Result<()> {
     let (root, _) = script_roots(project)?;
-    let parameters = if args.outline || !args.functions.is_empty() {
-        json!({ "path": args.path, "outline": args.outline, "fn": args.functions })
-    } else {
-        json!({
-            "path": args.path,
-            "startLine": args.start_line,
-            "endLine": args.end_line,
-        })
-    };
-    let value =
-        script_read_at(&root, &parameters).map_err(|failure| anyhow::anyhow!(failure.0.m))?;
-    crate::app::output::emit_global_output(&value, &script_read_text(&value))
+    let mapping = ScriptMapping::new(&root);
+    let values = read_requests(&args)?
+        .iter()
+        .map(|request| script_read_with(&mapping, request))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|failure| anyhow::anyhow!(failure.0.m))?;
+    if let [value] = values.as_slice() {
+        return crate::app::output::emit_global_output(value, &script_read_text(value));
+    }
+    let text = values
+        .iter()
+        .map(script_block_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    crate::app::output::emit_global_output(&json!({ "scripts": values }), &text)
 }
 
 fn failure(message: impl Into<String>, next: &str) -> Failure {
     Failure::new("bad_req", message.into(), false, next)
+}
+
+fn has_script_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| matches!(extension, "lua" | "luau"))
 }
 
 fn script_files(source: &Path) -> Vec<PathBuf> {
@@ -412,11 +494,7 @@ fn script_files(source: &Path) -> Vec<PathBuf> {
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_file())
         .map(walkdir::DirEntry::into_path)
-        .filter(|path| {
-            path.extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| matches!(extension, "lua" | "luau"))
-        })
+        .filter(|path| has_script_extension(path))
         .collect::<Vec<_>>();
     paths.sort();
     paths
@@ -537,12 +615,7 @@ fn resolve_script(root: &Path, requested: &str, next: &str) -> Result<PathBuf, F
     })?;
     let root = canonical_path(root)
         .map_err(|error| failure(format!("Failed to resolve project root: {error}"), "bind"))?;
-    if !path.starts_with(root)
-        || !path
-            .extension()
-            .and_then(|value| value.to_str())
-            .is_some_and(|value| matches!(value, "lua" | "luau"))
-    {
+    if !path.starts_with(root) || !has_script_extension(&path) {
         return Err(failure(
             "Script path must be a .lua or .luau file inside the bound project",
             next,
@@ -551,14 +624,127 @@ fn resolve_script(root: &Path, requested: &str, next: &str) -> Result<PathBuf, F
     Ok(path)
 }
 
+/// Adds the files of every instance at the dotted path `rest` below `node` to
+/// `files` and returns the number of those instances. A name may hold dots,
+/// so every child whose name starts the rest of the path is followed.
+fn mapped_files<'a>(node: &'a SourcemapNode, rest: &str, files: &mut Vec<&'a str>) -> usize {
+    let mut instances = 0;
+    for child in &node.children {
+        match rest.strip_prefix(child.name.as_str()) {
+            Some("") => {
+                instances += 1;
+                files.extend(child.file_paths.iter().map(String::as_str));
+            }
+            Some(tail) => {
+                if let Some(tail) = tail.strip_prefix('.') {
+                    instances += mapped_files(child, tail, files);
+                }
+            }
+            None => {}
+        }
+    }
+    instances
+}
+
+/// The file the sourcemap maps the script at an instance path to. A path
+/// that names no instance, an instance without a script file, or several
+/// script files is an error.
+fn mapped_script<'a>(sourcemap: &'a SourcemapNode, requested: &str) -> Result<&'a str, Failure> {
+    let mut files = Vec::new();
+    let path = requested.strip_prefix("game.").unwrap_or(requested);
+    let instances = mapped_files(sourcemap, path, &mut files);
+    let message = match files.as_slice() {
+        [file] => return Ok(*file),
+        [] if instances == 0 => format!(
+            "No script at {requested}: it is not a file, and the project has no instance at that path; rbx ss NAME finds scripts"
+        ),
+        [] => format!("{requested} has no script file in the project"),
+        _ => format!(
+            "{requested} names {} script files: {}; pass one of them",
+            files.len(),
+            files.join(", ")
+        ),
+    };
+    Err(failure(message, "script-read"))
+}
+
+/// The project's script mapping for one command: the sourcemap on disk, and
+/// the one built from the stores and source files, which answers when the one
+/// on disk is missing or does not lead to a script file.
+struct ScriptMapping<'a> {
+    root: &'a Path,
+    saved: OnceCell<Option<SourcemapNode>>,
+    built: OnceCell<SourcemapNode>,
+}
+
+fn loaded_once<T>(
+    cell: &OnceCell<T>,
+    load: impl FnOnce() -> anyhow::Result<T>,
+) -> Result<&T, Failure> {
+    if let Some(value) = cell.get() {
+        return Ok(value);
+    }
+    let value = load().map_err(|error| {
+        failure(
+            format!("Failed to load the project's sourcemap: {error:#}"),
+            "script-read",
+        )
+    })?;
+    Ok(cell.get_or_init(|| value))
+}
+
+impl<'a> ScriptMapping<'a> {
+    fn new(root: &'a Path) -> Self {
+        Self {
+            root,
+            saved: OnceCell::new(),
+            built: OnceCell::new(),
+        }
+    }
+
+    /// The file of the script at an instance path.
+    fn file(&self, requested: &str) -> Result<&str, Failure> {
+        let saved = loaded_once(&self.saved, || load_existing_sourcemap_root(self.root))?;
+        if let Some(saved) = saved
+            && let Ok(file) = mapped_script(saved, requested)
+            && self.root.join(file).is_file()
+        {
+            return Ok(file);
+        }
+        let built = loaded_once(&self.built, || {
+            let loaded = config::try_load_project(None, Some(self.root))?
+                .filter(|loaded| loaded.root == self.root);
+            build_project_sourcemap_with_loaded(self.root, loaded.as_ref())
+        })?;
+        mapped_script(built, requested)
+    }
+}
+
+/// The script file a read names: a file path, or an instance path
+/// (`ServerScriptService.Main`) that the project's script mapping leads to a
+/// file.
+fn resolve_read_target(mapping: &ScriptMapping, requested: &str) -> Result<PathBuf, Failure> {
+    let root = mapping.root;
+    let names_file = requested.contains(['/', '\\']) || has_script_extension(Path::new(requested));
+    if names_file || root.join(requested).is_file() {
+        return resolve_script(root, requested, "script-read");
+    }
+    resolve_script(root, mapping.file(requested)?, "script-read")
+}
+
 fn script_read_at(root: &Path, parameters: &Value) -> Result<Value, Failure> {
+    script_read_with(&ScriptMapping::new(root), parameters)
+}
+
+fn script_read_with(mapping: &ScriptMapping, parameters: &Value) -> Result<Value, Failure> {
+    let root = mapping.root;
     let request: ScriptRead = serde_json::from_value(parameters.clone()).map_err(|error| {
         failure(
             format!("Invalid script-read payload: {error}"),
             "script-read",
         )
     })?;
-    let path = resolve_script(root, &request.path, "script-read")?;
+    let path = resolve_read_target(mapping, &request.path)?;
     let source = read_script(&path, "script-read")?;
     let lines = source.lines().collect::<Vec<_>>();
     if request.outline || !request.functions.is_empty() {
@@ -569,7 +755,8 @@ fn script_read_at(root: &Path, parameters: &Value) -> Result<Value, Failure> {
     if start == 0 || requested_end < start || start > lines.len() {
         return Err(failure(
             format!(
-                "Requested lines {start} through {requested_end}, but the script has {} lines",
+                "Requested lines {start} through {requested_end}, but {} has {} lines",
+                relative(root, &path),
                 lines.len()
             ),
             "script-read",
