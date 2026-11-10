@@ -3094,10 +3094,10 @@ function BridgePluginRuntime.start(context)
 		classNames[1] = serviceClassName
 		classIdByName[serviceClassName] = 0
 		local stateRoot = instances[1]
-		local pathByInstance = if nativeSnapshot then nativeSnapshot.pathByInstance else { [stateRoot] = service.Name }
+		local pathByInstance = if nativeSnapshot then nativeSnapshot.pathByInstance else { [stateRoot] = serviceName }
 		local pathSegmentsByInstance = if nativeSnapshot
 			then nativeSnapshot.pathSegmentsByInstance
-			else { [stateRoot] = { service.Name } }
+			else { [stateRoot] = { serviceName } }
 		local pathOrdinalsByInstance = if nativeSnapshot
 			then nativeSnapshot.pathOrdinalsByInstance
 			else { [stateRoot] = { 1 } }
@@ -3124,7 +3124,7 @@ function BridgePluginRuntime.start(context)
 			elseif nativeExport then table.create(expectedCount)
 			else nil
 		instanceIdByInstance[stateRoot] = 1
-		nameByIndex[1] = service.Name
+		nameByIndex[1] = serviceName
 		classNameByIndex[1] = serviceClassName
 		classValueByIndex[1] = 0
 		parentIndexByIndex[1] = false

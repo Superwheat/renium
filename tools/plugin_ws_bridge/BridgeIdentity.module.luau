@@ -167,6 +167,16 @@ local function siblingOrdinal(instance, ordinalsByParent)
 	return 1
 end
 
+-- A path names its service by class: `resolvePathSegments` finds the root with
+-- GetService, and a service can carry any Name.
+function BridgeIdentity.rootSegment(instance)
+	local className = instance.ClassName
+	local found, service = pcall(function()
+		return game:FindService(className)
+	end)
+	return if found and service == instance then className else instance.Name
+end
+
 -- Scope to one hierarchy snapshot; discard before changing names or parents.
 function BridgeIdentity.newPathSnapshot()
 	return { pathSegmentsByInstance = {}, pathOrdinalsByInstance = {}, siblingOrdinalsByParent = {} }
@@ -187,9 +197,10 @@ function BridgeIdentity.getRefPathParts(instance, snapshot)
 	local ordinals = {}
 	local current = instance
 	while current ~= nil and current ~= game do
-		segments[#segments + 1] = current.Name
+		local parent = current.Parent
+		segments[#segments + 1] = if parent == game then BridgeIdentity.rootSegment(current) else current.Name
 		ordinals[#ordinals + 1] = siblingOrdinal(current)
-		current = current.Parent
+		current = parent
 	end
 	for left = 1, math.floor(#segments / 2) do
 		local right = #segments - left + 1
@@ -225,7 +236,7 @@ function BridgeIdentity.getCachedRefPathParts(state, instance)
 			ordinals[i] = parentOrdinals[i]
 		end
 	end
-	segments[#segments + 1] = instance.Name
+	segments[#segments + 1] = if parent == game then BridgeIdentity.rootSegment(instance) else instance.Name
 	ordinals[#ordinals + 1] = siblingOrdinal(instance, state.siblingOrdinalsByParent)
 	state.pathSegmentsByInstance[instance] = segments
 	state.pathOrdinalsByInstance[instance] = ordinals
@@ -303,8 +314,9 @@ function BridgeIdentity.getCachedInstancePath(state, instance)
 		return cached
 	end
 	local parent = instance.Parent
-	local path = if parent == nil or parent == game
+	local path = if parent == nil
 		then instance.Name
+		elseif parent == game then BridgeIdentity.rootSegment(instance)
 		else BridgeIdentity.getCachedInstancePath(state, parent) .. "." .. instance.Name
 	state.pathByInstance[instance] = path
 	return path

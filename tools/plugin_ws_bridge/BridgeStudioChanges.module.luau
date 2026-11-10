@@ -1650,10 +1650,10 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		while current ~= nil and current ~= game do
 			local ordinal = 1
 			local parent = current.Parent
-			if parent ~= nil then
+			if parent ~= nil and parent ~= game then
 				ordinal = siblingOrdinal(current, parent)
 			end
-			segments[#segments + 1] = current.Name
+			segments[#segments + 1] = if parent == game then BridgeIdentity.rootSegment(current) else current.Name
 			ordinals[#ordinals + 1] = ordinal
 			current = parent
 		end

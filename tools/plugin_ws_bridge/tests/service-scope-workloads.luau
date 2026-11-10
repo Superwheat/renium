@@ -136,3 +136,60 @@ do
 	end
 end
 print("Structural receipts: 100 class/name/parent/presence checks reject incomplete upserts; skipped containers remain unverified")
+
+do
+	local Identity = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeIdentity.module.luau"), {
+		environment = { game = {} },
+	})()
+	local cloneArray = extract("local function cloneArray(", "local function denseArrayLength(", {}, "cloneArray")
+	local sortedInstanceEntries = extract("local function entryApplyOrder(", "local function syncDesiredEntry(", {
+		cloneArray = cloneArray, pathKey = Identity.pathKey, pathCacheKey = Identity.pathCacheKey,
+		settingsIdText = function(raw) return if type(raw) == "string" then raw else nil end,
+	}, "sortedInstanceEntries")
+	local renamed = node("ServerStorage")
+	renamed.Name = "Vault"
+	local seen = {}
+	local function record(name)
+		return function(_, serviceName) seen[name] = serviceName end
+	end
+	local shared = {
+		validatedChangeService = function() return "ServerStorage", renamed end,
+		sortedInstanceEntries = sortedInstanceEntries,
+		resolveEntryInstance = function(_, serviceName) seen.resolve = serviceName return nil end,
+		rememberEntryResolution = function() end,
+	}
+	local function with(extra)
+		local environment = table.clone(shared)
+		for key, value in extra do environment[key] = value end
+		return environment
+	end
+	local change = { service = "ServerStorage", instances = { {
+		className = "Folder", pathSegments = { "ServerStorage", "Pushed" }, pathOrdinals = { 1, 1 },
+	} } }
+	local function stats()
+		return { instanceCreated = 0, instanceReplaced = 0, instanceDeleted = 0, propertyUpdated = 0, noops = 0 }
+	end
+	extract("local function applyInstanceUpserts(", "local function applyInstanceDeletes(", with({
+		liveHydrateEnabled = function() return true end,
+		syncDesiredEntry = record("upsert"),
+		resolveEntryParent = function() return renamed end,
+	}), "applyInstanceUpserts")(change, {}, stats(), {})
+	extract("local function applyInstanceDeletes(", "local function applyInstanceChange(", with({
+		isEngineManagedContainerEntry = function() return false end,
+	}), "applyInstanceDeletes")(change, {}, stats(), {})
+	local reconcile = table.clone(change)
+	reconcile.allowDeletes = true
+	extract("local function applyInstanceReconcile(", "local function reconcileSessionKey(", with({
+		clearMatchedSettingsInstances = function(serviceName) seen.clear = serviceName end,
+		appendPreserveKeys = function(_, _, serviceName) seen.preserve = serviceName end,
+		syncDesiredEntry = function(_, serviceName) seen.reconcile = serviceName return renamed end,
+		recordDesiredStableEntry = record("stable"),
+		keepUnknownsEnabled = function() return false end,
+		removeUnknownInstances = function(serviceName, service) seen.prune, seen.pruned = serviceName, service end,
+	}), "applyInstanceReconcile")(reconcile, {}, stats(), {})
+	for _, name in { "upsert", "resolve", "clear", "preserve", "reconcile", "stable", "prune" } do
+		assert(seen[name] == "ServerStorage", `A renamed service must keep its class name as the {name} path root`)
+	end
+	assert(seen.pruned == renamed)
+end
+print("Renamed service: upsert, delete and reconcile address the service by class name")

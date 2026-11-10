@@ -147,8 +147,7 @@ end
 local createdRelays = {}
 local trackerSource = fs.readFile("tools/plugin_ws_bridge/BridgeStudioChanges.module.luau"):gsub("\r\n", "\n")
 trackerSource = trackerSource:gsub("\n\treturn api\nend", "\n\tapi.reviewState = state\n\tapi.reviewRetiring = retiringJournals\n\treturn api\nend")
-local trackerModule = luau.load(trackerSource, {
-	environment = {
+local trackerEnvironment = {
 		game = testGame,
 		typeof = function(value) return if type(value) == "table" and value.__type then value.__type
 			else if type(value) == "table" and value.ClassName then "Instance" else typeof(value) end,
@@ -171,8 +170,8 @@ local trackerModule = luau.load(trackerSource, {
 		end, spawn = function() end, defer = function(callback)
 			if deferred then table.insert(deferred, callback) else callback() end
 		end },
-	},
-})()
+}
+local trackerModule = luau.load(trackerSource, { environment = trackerEnvironment })()
 local trackerConfig = {
 	bridgeRole = "edit", bridgeRuntimeId = "test", LUA_SOURCE_CLASS = {},
 	loadPendingStudioChanges = function() end, savePendingStudioChanges = function() end,
@@ -2184,3 +2183,39 @@ do
 	workspace.Terrain = nil
 end
 print("Terrain relay: lost relays are replaced, stop/restart renews identity, and old listeners are disconnected")
+do
+	local renamedGame = instance("DataModel", "game")
+	local vault = instance("ServerStorage", "Vault", renamedGame)
+	local namesake = instance("Folder", "ServerStorage", renamedGame)
+	local part = instance("Part", "Item", vault)
+	local stray = instance("Part", "Item", namesake)
+	part.Transparency = 0
+	local renamedServices = table.clone(services)
+	renamedServices.ServerStorage = vault
+	function renamedGame:GetService(name) return assert(renamedServices[name], name) end
+	function renamedGame:FindService(name) return renamedServices[name] end
+	local renamedDependencies = table.clone(dependencies)
+	renamedDependencies.BridgeIdentity = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeIdentity.module.luau"), {
+		environment = { game = renamedGame },
+	})()
+	local environment = table.clone(trackerEnvironment)
+	environment.game = renamedGame
+	environment.script = { Parent = renamedDependencies }
+	local observer = luau.load(trackerSource, { environment = environment })().create(trackerConfig, { ServerStorage = true })
+	observer.configurePropertyCandidates({ Part = { "Transparency" } })
+	observer.getState({ services = { "ServerStorage" } })
+	observer.getState({ reset = true })
+	part.Transparency = 0.5
+	part.Changed:Fire("Transparency")
+	stray.Transparency = 0.5
+	stray.Changed:Fire("Transparency")
+	local state = observer.getState({})
+	assert(state.propertyChangeCount == 1 and state.changeCount == 1,
+		`A lone edit in a renamed service must stay pending, got {state.propertyChangeCount} of {state.changeCount}`)
+	for _, change in state.changes do
+		assert(change.service == "ServerStorage" and change.pathSegments[1] == "ServerStorage" and change.pathSegments[2] == "Item"
+			and change.pathOrdinals[1] == 1, "A change in a renamed service is addressed by class name")
+	end
+	observer.stop()
+end
+print("Renamed service: a lone property edit stays pending under the service's class name")

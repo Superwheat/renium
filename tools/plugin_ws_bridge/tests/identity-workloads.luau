@@ -74,4 +74,42 @@ do
 	assert(calls == 1, `Expected one child scan with an index, got {calls}`)
 	mockGame.GetService = nil
 end
+do
+	local function alive() return true end
+	local service = { Name = "Vault", ClassName = "ServerStorage", Parent = mockGame, IsDescendantOf = alive }
+	local namesake = { Name = "ServerStorage", ClassName = "Folder", Parent = mockGame, IsDescendantOf = alive }
+	local child = { Name = "Item", ClassName = "Part", Parent = service, IsDescendantOf = alive }
+	local stray = { Name = "Item", ClassName = "Part", Parent = namesake, IsDescendantOf = alive }
+	function service:GetChildren() return { child } end
+	function service:FindFirstChild(name) return if name == child.Name then child else nil end
+	function namesake:GetChildren() return { stray } end
+	mockGame.FindService = function(_, className)
+		if className == "ServerStorage" then
+			return service
+		end
+		error(`'{className}' is not a valid Service name`)
+	end
+	mockGame.GetService = function(_, name)
+		assert(name == "ServerStorage", `A path root must be a service class name, got {name}`)
+		return service
+	end
+	for _, snapshot in { false, Identity.newPathSnapshot() } do
+		local segments, ordinals = Identity.getRefPathParts(child, snapshot or nil)
+		assert(segments[1] == "ServerStorage" and segments[2] == "Item", "A renamed service is addressed by class name")
+		assert(Identity.resolvePathSegments(segments, nil, ordinals) == child, "The path of a renamed service's child resolves back")
+		local rootSegments = Identity.getRefPathParts(service, snapshot or nil)
+		assert(#rootSegments == 1 and rootSegments[1] == "ServerStorage", "A renamed service's own path is its class name")
+		local straySegments = Identity.getRefPathParts(namesake, snapshot or nil)
+		assert(straySegments[1] == "ServerStorage", "A root that is no service keeps its Name")
+	end
+	local reference = Identity.serializeRefValue({
+		instanceIdByInstance = {}, pathSegmentsByInstance = {}, pathOrdinalsByInstance = {}, debugIdByInstance = { [child] = false },
+	}, child)
+	assert(reference.pathSegments[1] == "ServerStorage", "A reference into a renamed service starts with its class name")
+	local keyed = { pathByInstance = {} }
+	assert(Identity.getCachedInstancePath(keyed, child) == "ServerStorage.Item", "A dotted path into a renamed service starts with its class name")
+	assert(Identity.getCachedInstancePath(keyed, stray) == "ServerStorage.Item" and keyed.pathByInstance[namesake] == "ServerStorage")
+	mockGame.FindService = nil
+	mockGame.GetService = nil
+end
 print("Identity workload and duplicate ordinal tests passed")

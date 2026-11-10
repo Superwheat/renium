@@ -2519,12 +2519,12 @@ local function applyInstanceReconcile(
 	local desiredStableKeys = {}
 	local desiredEntries = sortedInstanceEntries(
 		change,
-		service.Name,
+		serviceName,
 		tonumber(ctx.maxInstanceEntriesPerChange) or 5000,
 		"Editor instance reconcile has too many entries"
 	)
 	local preserveKeys = {}
-	appendPreserveKeys(preserveKeys, change, service.Name)
+	appendPreserveKeys(preserveKeys, change, serviceName)
 
 	local resolvedEntries = {}
 	local claimedInstances = {}
@@ -2533,15 +2533,15 @@ local function applyInstanceReconcile(
 			ctx.yieldForBudget()
 		end
 		desiredKeys[entry.key] = true
-		local instance = syncDesiredEntry(entry, service.Name, ctx, stats, resolvedEntries, claimedInstances, true)
+		local instance = syncDesiredEntry(entry, serviceName, ctx, stats, resolvedEntries, claimedInstances, true)
 		if instance ~= nil then
-			recordDesiredStableEntry(entry, service.Name, instance, ctx, desiredSettingsIds, desiredStableKeys)
+			recordDesiredStableEntry(entry, serviceName, instance, ctx, desiredSettingsIds, desiredStableKeys)
 		end
 	end
 
 	if change.allowDeletes == true and not keepUnknownsEnabled(ctx) then
 		removeUnknownInstances(
-			service.Name,
+			serviceName,
 			service,
 			ctx,
 			stats,
@@ -2617,7 +2617,7 @@ local function applyInstanceReconcileChunk(
 		error("Editor reconcile session was not found or expired; restart the reconcile")
 	end
 	local session = reconcileSessions[sessionKey]
-	appendPreserveKeys(session.preserveKeys, change, service.Name)
+	appendPreserveKeys(session.preserveKeys, change, serviceName)
 	armSessionExpiry(reconcileSessions, sessionKey, session)
 	if session.failed then
 		if mode == "finishReconcileService" then
@@ -2630,7 +2630,7 @@ local function applyInstanceReconcileChunk(
 	local beforeDeleted = stats.instanceDeleted
 	local beforeReplaced = stats.instanceReplaced
 	local beforePropertyUpdated = stats.propertyUpdated
-	local entries = sortedInstanceEntries(change, service.Name)
+	local entries = sortedInstanceEntries(change, serviceName)
 	local newEntries = 0
 	for _, entry in ipairs(entries) do
 		if ctx.yieldForBudget then
@@ -2652,7 +2652,7 @@ local function applyInstanceReconcileChunk(
 		session.desiredKeys[entry.key] = true
 		local instance = syncDesiredEntry(
 			entry,
-			service.Name,
+			serviceName,
 			ctx,
 			stats,
 			session.resolvedEntries,
@@ -2662,7 +2662,7 @@ local function applyInstanceReconcileChunk(
 		if instance ~= nil then
 			recordDesiredStableEntry(
 				entry,
-				service.Name,
+				serviceName,
 				instance,
 				ctx,
 				session.desiredSettingsIds,
@@ -2674,7 +2674,7 @@ local function applyInstanceReconcileChunk(
 	if mode == "finishReconcileService" then
 		if not keepUnknownsEnabled(ctx) then
 			removeUnknownInstances(
-				service.Name,
+				serviceName,
 				service,
 				ctx,
 				stats,
@@ -2703,13 +2703,13 @@ local function applyInstanceUpserts(
 	stats: { [string]: any },
 	touchedServices: { [string]: boolean }
 )
-	local serviceName, service = validatedChangeService(change, ctx)
+	local serviceName = validatedChangeService(change, ctx)
 	touchedServices[serviceName] = true
 
 	local beforeCreated = stats.instanceCreated
 	local beforeReplaced = stats.instanceReplaced
 	local beforePropertyUpdated = stats.propertyUpdated
-	local entries = sortedInstanceEntries(change, service.Name)
+	local entries = sortedInstanceEntries(change, serviceName)
 	local resolvedEntries = {}
 	local claimedInstances = {}
 	local createMissing = liveHydrateEnabled(ctx)
@@ -2719,21 +2719,21 @@ local function applyInstanceUpserts(
 			ctx.yieldForBudget()
 		end
 		if #entry.previousPathSegments > 0 then
-			local instance = resolveEntryInstance(entry, service.Name, ctx, resolvedEntries, claimedInstances)
+			local instance = resolveEntryInstance(entry, serviceName, ctx, resolvedEntries, claimedInstances)
 			if instance == nil then
 				error(
 					`Could not identify the previous instance at {entry.key} ({describeUnresolvedPrevious(entry, claimedInstances)}); Studio was not changed`
 				)
 			end
 			resolvedEntries[entry.key] = instance
-			rememberEntryResolution(entry, service.Name, instance, claimedInstances, ctx)
+			rememberEntryResolution(entry, serviceName, instance, claimedInstances, ctx)
 		end
 	end
 	for _, entry in ipairs(entries) do
 		if ctx.yieldForBudget then
 			ctx.yieldForBudget()
 		end
-		local instance = syncDesiredEntry(entry, service.Name, ctx, stats, resolvedEntries, claimedInstances, createMissing)
+		local instance = syncDesiredEntry(entry, serviceName, ctx, stats, resolvedEntries, claimedInstances, createMissing)
 		if instance ~= nil and instance.ClassName == entry.className
 			and instance.Name == entry.pathSegments[#entry.pathSegments]
 			and instance.Parent == resolveEntryParent(entry, resolvedEntries) then
@@ -2758,7 +2758,7 @@ local function applyInstanceDeletes(
 	stats: { [string]: any },
 	touchedServices: { [string]: boolean }
 )
-	local serviceName, service = validatedChangeService(change, ctx)
+	local serviceName = validatedChangeService(change, ctx)
 	touchedServices[serviceName] = true
 
 	local beforeDeleted = stats.instanceDeleted
@@ -2767,14 +2767,14 @@ local function applyInstanceDeletes(
 	local seenTargets = {}
 	local resolvedEntries = {}
 	local claimedInstances = {}
-	for _, entry in ipairs(sortedInstanceEntries(change, service.Name)) do
+	for _, entry in ipairs(sortedInstanceEntries(change, serviceName)) do
 		if ctx.yieldForBudget then
 			ctx.yieldForBudget()
 		end
 		if #entry.pathSegments <= 1 then
 			error("Refusing to delete service root: " .. entry.key)
 		end
-		local instance = resolveEntryInstance(entry, service.Name, ctx, resolvedEntries, claimedInstances)
+		local instance = resolveEntryInstance(entry, serviceName, ctx, resolvedEntries, claimedInstances)
 		if instance == nil then
 			stats.noops += 1
 			verified += 1
@@ -2788,7 +2788,7 @@ local function applyInstanceDeletes(
 		elseif instance:IsA("PackageLink") then
 			error(`PackageLink instances cannot be removed directly: {instance:GetFullName()}`)
 		else
-			rememberEntryResolution(entry, service.Name, instance, claimedInstances, ctx)
+			rememberEntryResolution(entry, serviceName, instance, claimedInstances, ctx)
 			seenTargets[instance] = true
 			targets[#targets + 1] = instance
 		end
