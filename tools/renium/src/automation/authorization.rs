@@ -78,6 +78,10 @@ pub(crate) fn encode_request(request: &Request, port: u16) -> Result<String> {
     if !required(request.op) {
         return Ok(serde_json::to_string(request)?);
     }
+    // The proof travels inside `p`; the daemon refuses any other shape too.
+    if !request.p.is_object() {
+        bail!("p must be an object");
+    }
     if request.p.get(PROOF_FIELD).is_some() {
         bail!("Authorization is supplied by the local Renium CLI, not request parameters");
     }
@@ -306,6 +310,22 @@ mod tests {
         authority
             .verify(&mut serde_json::from_str(&wire).unwrap())
             .unwrap();
+    }
+
+    #[test]
+    fn parameters_that_are_no_object_are_refused_before_signing() {
+        for parameters in [
+            json!(null),
+            json!([1]),
+            json!("text"),
+            json!(5),
+            json!(true),
+        ] {
+            let mut request = request();
+            request.p = parameters;
+            let error = encode_request(&request, 1).unwrap_err().to_string();
+            assert_eq!(error, "p must be an object");
+        }
     }
 
     #[test]
