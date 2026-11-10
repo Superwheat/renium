@@ -4117,27 +4117,48 @@ pub(crate) fn visit_reference_objects_mut(
     record: &mut Map<String, Value>,
     mut visitor: impl FnMut(&mut Map<String, Value>),
 ) {
-    fn visit(value: &mut Value, visitor: &mut impl FnMut(&mut Map<String, Value>)) {
-        match value {
-            Value::Array(values) => {
-                for value in values {
-                    visit(value, visitor);
-                }
-            }
-            Value::Object(object) => {
-                if is_reference_object(object) {
-                    visitor(object);
-                }
-                for value in object.values_mut() {
-                    visit(value, visitor);
-                }
-            }
-            _ => {}
-        }
-    }
-
     for value in record.values_mut() {
-        visit(value, &mut visitor);
+        for_each_reference_mut(value, &mut visitor);
+    }
+}
+
+/// Calls `visit` for every reference object inside `value`, an outer one
+/// before the ones it holds.
+pub(crate) fn for_each_reference(value: &Value, visit: &mut impl FnMut(&Map<String, Value>)) {
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .for_each(|value| for_each_reference(value, visit)),
+        Value::Object(object) => {
+            if is_reference_object(object) {
+                visit(object);
+            }
+            object
+                .values()
+                .for_each(|value| for_each_reference(value, visit));
+        }
+        _ => {}
+    }
+}
+
+/// `for_each_reference` over a value the visitor may change.
+pub(crate) fn for_each_reference_mut(
+    value: &mut Value,
+    visit: &mut impl FnMut(&mut Map<String, Value>),
+) {
+    match value {
+        Value::Array(values) => values
+            .iter_mut()
+            .for_each(|value| for_each_reference_mut(value, visit)),
+        Value::Object(object) => {
+            if is_reference_object(object) {
+                visit(object);
+            }
+            object
+                .values_mut()
+                .for_each(|value| for_each_reference_mut(value, visit));
+        }
+        _ => {}
     }
 }
 

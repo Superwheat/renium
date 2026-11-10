@@ -1539,7 +1539,7 @@ fn set_property_reparents_and_rewrites_cross_service_references() {
         "Parent must be null, an index, or a settings id"
     );
     let by_index = fx
-        .text(&["bs", "-f", &store, "Lobby", "-p", "Parent", "-j", "7"])
+        .text(&["bs", "-f", &store, "Lobby", "-p", "Parent", "-j", "6"])
         .ok();
     assert_eq!(
         by_index["pathSegments"],

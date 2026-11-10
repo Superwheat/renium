@@ -12,8 +12,8 @@ use crate::app::output::{log_global, print_json_output};
 use crate::app::timing::current_millis;
 use crate::automation::reconcile::history as sync_history;
 use crate::bytecode::{
-    acquire_settings_file_lock, apply_file_mutations, collect_source_path_updates,
-    file_mutation_paths,
+    SourcePathsBefore, acquire_settings_file_lock, apply_file_mutations,
+    collect_source_path_updates, file_mutation_paths,
 };
 use crate::cli::{EditorRevertArgs, ProjectSourceArgs, PushEditorChangesArgs};
 use crate::editor::document::document_instance_index_by_settings_id;
@@ -636,8 +636,7 @@ pub(crate) fn revert_history_manifest(
         let service_dir = crate::project::storage::source_directory(&store_path);
         let before = build_editor_source_paths_by_index(&current, &manifest.service, &service_dir);
         let after = collect_source_path_updates(
-            &current,
-            &before,
+            &SourcePathsBefore::capture(&current, &before),
             &next,
             &manifest.service,
             &service_dir,

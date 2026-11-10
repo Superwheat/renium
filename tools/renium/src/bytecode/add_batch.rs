@@ -9,8 +9,8 @@ use serde_json::{Map, Value, json};
 
 use crate::app::output::print_json_output;
 use crate::bytecode::edit::{
-    NewInstanceValues, bytecode_service_name, clone_store_subtree,
-    collect_settings_subtree_preorder, luau_string_list, new_script_source,
+    LUAU_AT, NewInstanceValues, bytecode_service_name, clone_store_subtree,
+    collect_settings_subtree_preorder, luau_target, new_script_source,
     next_editor_settings_id_fast, prepare_new_instance_values, prune_removed_source_dirs,
     reject_package_link_subtree_mutation,
 };
@@ -21,9 +21,9 @@ use crate::bytecode::references::{
     qualify_reference_targets,
 };
 use crate::bytecode::{
-    SettingsFileLock, acquire_settings_file_locks, apply_file_mutations, check_new_source_file,
-    collect_source_path_updates, ensure_settable_attribute_name, file_mutation_paths,
-    fold_derived_property, high_level_split_path, missing_service_store_error,
+    SettingsFileLock, SourcePathsBefore, acquire_settings_file_locks, apply_file_mutations,
+    check_new_source_file, collect_source_path_updates, ensure_settable_attribute_name,
+    file_mutation_paths, fold_derived_property, high_level_split_path, missing_service_store_error,
     preserve_source_path_extension, reject_owned_instance_edit, reject_read_only_link_edit,
     reject_read_only_link_subtree_edit, resolve_bytecode_cli_settings_file,
     settings_lock_order_key, store_link_enforcement, stored_property_edit,
@@ -243,7 +243,7 @@ pub(crate) struct StorePush {
 /// index `paths`.
 #[derive(Default)]
 pub(crate) struct StudioPrep {
-    pub(crate) paths: Vec<Vec<String>>,
+    pub(crate) paths: Vec<EditorInstancePath>,
     pub(crate) renames: Vec<(usize, String)>,
     pub(crate) moves: Vec<(usize, usize)>,
     pub(crate) destroys: Vec<usize>,
@@ -748,6 +748,9 @@ impl BatchState<'_> {
         let from = state.path_of(index);
         let parent_id = state.id(parent_index);
         state.change_metadata(index, "Parent", Value::String(parent_id))?;
+        let index =
+            instance_api::order_reparented_instances_last(&mut state.document, &state.before)
+                .map_or(index, |moved| moved[index]);
         self.last_moves.insert((store, state.id(index)), position);
         let fields = Map::from_iter([("from".to_string(), from)]);
         self.record("move", store, index, None, fields, false);
@@ -923,6 +926,17 @@ impl BatchState<'_> {
     }
 
     fn load(&mut self, settings_file: PathBuf, service_hint: &str, create: bool) -> Result<usize> {
+        self.load_decoded(settings_file, service_hint, create, None)
+    }
+
+    /// `load` for a store whose file the caller may have decoded already.
+    fn load_decoded(
+        &mut self,
+        settings_file: PathBuf,
+        service_hint: &str,
+        create: bool,
+        decoded: Option<SettingsBytecode>,
+    ) -> Result<usize> {
         let key = settings_lock_order_key(&settings_file);
         if let Some(position) = self.positions.get(&key) {
             return Ok(*position);
@@ -936,10 +950,10 @@ impl BatchState<'_> {
                 settings_file.display()
             );
         }
-        let document = if settings_file.exists() {
-            SettingsBytecode::read_file(&settings_file)?
-        } else {
-            new_service_document(service_hint)
+        let document = match decoded {
+            Some(document) => document,
+            None if settings_file.exists() => SettingsBytecode::read_file(&settings_file)?,
+            None => new_service_document(service_hint),
         };
         let service = bytecode_service_name(&document, &settings_file, service_hint);
         let service_dir = crate::project::storage::source_directory(&settings_file);
@@ -988,16 +1002,19 @@ impl BatchState<'_> {
             if !path.is_file() {
                 continue;
             }
+            let mut decoded = None;
             if let Some(paths) = holding
                 && !self.positions.contains_key(&settings_lock_order_key(&path))
-                && (paths.is_empty()
-                    || SettingsBytecode::read_file_if_contains_any_string_set(&path, paths)?
-                        .is_none())
             {
-                continue;
+                if !paths.is_empty() {
+                    decoded = SettingsBytecode::read_file_if_contains_any_string_set(&path, paths)?;
+                }
+                if decoded.is_none() {
+                    continue;
+                }
             }
             let hint = crate::project::storage::store_service_name(&path).unwrap_or_default();
-            self.load(path, &hint, false)?;
+            self.load_decoded(path, &hint, false, decoded)?;
         }
         Ok(())
     }
@@ -1251,6 +1268,9 @@ impl BatchState<'_> {
 
     fn finish(mut self, push: bool) -> Result<BatchOutcome> {
         self.resolve_pending_references()?;
+        for store in self.stores.iter_mut().filter(|store| store.restructured) {
+            instance_api::order_reparented_instances_last(&mut store.document, &store.before);
+        }
         if self.stores.iter().any(|store| store.restructured) {
             self.update_references()?;
         }
@@ -1372,94 +1392,19 @@ impl BatchState<'_> {
                 continue;
             }
             let before = &store.before;
-            let now_by_id = store
-                .document
-                .instances
-                .iter()
-                .enumerate()
-                .map(|(index, instance)| (instance.settings_id.as_str(), index))
-                .collect::<HashMap<_, _>>();
-            let before_by_id = before
-                .instances
-                .iter()
-                .enumerate()
-                .map(|(index, instance)| (instance.settings_id.as_str(), index))
-                .collect::<HashMap<_, _>>();
-            let gone = before
-                .instances
-                .iter()
-                .map(|instance| !now_by_id.contains_key(instance.settings_id.as_str()))
-                .collect::<Vec<_>>();
-            let mut renames = Vec::new();
-            let mut moves = Vec::new();
-            let mut destroys = Vec::new();
-            for (index, instance) in before.instances.iter().enumerate() {
-                let Some(&now) = now_by_id.get(instance.settings_id.as_str()) else {
-                    if instance.parent_index.is_some_and(|parent| !gone[parent]) {
-                        destroys.push(index);
-                    }
-                    continue;
-                };
-                let current = &store.document.instances[now];
-                if current.name != instance.name {
-                    renames.push((index, current.name.clone()));
-                }
-                let (Some(old_parent), Some(new_parent)) =
-                    (instance.parent_index, current.parent_index)
-                else {
-                    continue;
-                };
-                let new_parent_id = store.document.instances[new_parent].settings_id.as_str();
-                if before.instances[old_parent].settings_id == new_parent_id {
-                    continue;
-                }
-                let Some(&parent) = before_by_id.get(new_parent_id) else {
-                    let label = self
-                        .last_moves
-                        .get(&(position, instance.settings_id.clone()))
-                        .map_or_else(|| "Batch".to_string(), |op| format!("Batch op {op} (move)"));
-                    bail!(
-                        "{label}: with --push, {} cannot move into {}, which this batch creates (Studio would get a copy); create it in an earlier batch",
-                        path_text(before, &store.service, index),
-                        path_text(&store.document, &store.service, new_parent)
-                    );
-                };
-                moves.push((index, parent));
+            if let Err((index, new_parent)) =
+                prep.add_store(before, &store.document, &store.service)
+            {
+                let label = self
+                    .last_moves
+                    .get(&(position, before.instances[index].settings_id.clone()))
+                    .map_or_else(|| "Batch".to_string(), |op| format!("Batch op {op} (move)"));
+                bail!(
+                    "{label}: with --push, {} cannot move into {}, which this batch creates (Studio would get a copy); create it in an earlier batch",
+                    path_text(before, &store.service, index),
+                    path_text(&store.document, &store.service, new_parent)
+                );
             }
-            let indices = renames
-                .iter()
-                .map(|(index, _)| *index)
-                .chain(moves.iter().flat_map(|&(index, parent)| [index, parent]))
-                .chain(destroys.iter().copied())
-                .collect::<Vec<_>>();
-            if indices.is_empty() {
-                continue;
-            }
-            let paths = build_editor_instance_paths_for_indices(before, &store.service, &indices);
-            let mut slots = HashMap::new();
-            for index in indices {
-                if let Some(path) = paths.get(&index)
-                    && !slots.contains_key(&index)
-                {
-                    slots.insert(index, prep.paths.len());
-                    prep.paths.push(path.path_segments.clone());
-                }
-            }
-            prep.renames.extend(
-                renames
-                    .into_iter()
-                    .filter_map(|(index, name)| Some((*slots.get(&index)?, name))),
-            );
-            prep.moves.extend(
-                moves.into_iter().filter_map(|(index, parent)| {
-                    Some((*slots.get(&index)?, *slots.get(&parent)?))
-                }),
-            );
-            prep.destroys.extend(
-                destroys
-                    .into_iter()
-                    .filter_map(|index| slots.get(&index).copied()),
-            );
         }
         Ok(prep)
     }
@@ -1581,8 +1526,7 @@ impl StoreState {
         let mut writes = BTreeMap::new();
         let mut removals = Vec::new();
         let after = collect_source_path_updates(
-            &self.before,
-            &self.source_paths_before,
+            &SourcePathsBefore::capture(&self.before, &self.source_paths_before),
             &self.document,
             &self.service,
             &self.service_dir,
@@ -1661,17 +1605,119 @@ impl StudioPrep {
         self.renames.is_empty() && self.moves.is_empty() && self.destroys.is_empty()
     }
 
+    /// Adds the renames, moves and removals that turn one store from `before`
+    /// into `after`, as paths of `before` and in the order `before` holds the
+    /// instances. A move under a parent `before` does not hold is refused
+    /// with the moved index of `before` and the parent index of `after`.
+    pub(crate) fn add_store(
+        &mut self,
+        before: &SettingsBytecode,
+        after: &SettingsBytecode,
+        service: &str,
+    ) -> std::result::Result<(), (usize, usize)> {
+        let by_id = |document: &'_ SettingsBytecode| {
+            document
+                .instances
+                .iter()
+                .enumerate()
+                .map(|(index, instance)| (instance.settings_id.clone(), index))
+                .collect::<HashMap<_, _>>()
+        };
+        let (now_by_id, before_by_id) = (by_id(after), by_id(before));
+        let gone = before
+            .instances
+            .iter()
+            .map(|instance| !now_by_id.contains_key(&instance.settings_id))
+            .collect::<Vec<_>>();
+        let mut renames = Vec::new();
+        let mut moves = Vec::new();
+        let mut destroys = Vec::new();
+        for (index, instance) in before.instances.iter().enumerate() {
+            let Some(&now) = now_by_id.get(&instance.settings_id) else {
+                if instance.parent_index.is_some_and(|parent| !gone[parent]) {
+                    destroys.push(index);
+                }
+                continue;
+            };
+            let current = &after.instances[now];
+            if current.name != instance.name {
+                renames.push((index, current.name.clone()));
+            }
+            let (Some(old_parent), Some(new_parent)) =
+                (instance.parent_index, current.parent_index)
+            else {
+                continue;
+            };
+            let new_parent_id = &after.instances[new_parent].settings_id;
+            if before.instances[old_parent].settings_id == *new_parent_id {
+                continue;
+            }
+            let &parent = before_by_id.get(new_parent_id).ok_or((index, new_parent))?;
+            moves.push((index, parent));
+        }
+        let indices = renames
+            .iter()
+            .map(|(index, _)| *index)
+            .chain(moves.iter().flat_map(|&(index, parent)| [index, parent]))
+            .chain(destroys.iter().copied())
+            .collect::<Vec<_>>();
+        let paths = build_editor_instance_paths_for_indices(before, service, &indices);
+        let mut slots = HashMap::new();
+        for index in indices {
+            if let Some(path) = paths.get(&index)
+                && !slots.contains_key(&index)
+            {
+                slots.insert(index, self.paths.len());
+                self.paths.push(path.clone());
+            }
+        }
+        self.renames.extend(
+            renames
+                .into_iter()
+                .filter_map(|(index, name)| Some((*slots.get(&index)?, name))),
+        );
+        self.moves.extend(
+            moves
+                .into_iter()
+                .filter_map(|(index, parent)| Some((*slots.get(&index)?, *slots.get(&parent)?))),
+        );
+        self.destroys.extend(
+            destroys
+                .into_iter()
+                .filter_map(|index| slots.get(&index).copied()),
+        );
+        Ok(())
+    }
+
+    /// Applies to the open place what turned the store at `settings_file`
+    /// from `before` into what it holds now, so the scoped push that follows
+    /// pairs each instance where the store has it; a push alone would create
+    /// a copy and leave the original. `None` when nothing was renamed, moved
+    /// or removed.
+    pub(crate) fn apply_store_edit(
+        settings_file: &Path,
+        before: &SettingsBytecode,
+    ) -> Result<Option<Value>> {
+        let after = SettingsBytecode::read_file(settings_file)?;
+        let service = crate::bytecode::edit::bytecode_service_name(&after, settings_file, "");
+        let mut prep = Self::default();
+        if prep.add_store(before, &after, &service).is_err() {
+            bail!(
+                "An instance moved under one this edit created, which Studio does not have yet; push the store with `rbx ps`"
+            );
+        }
+        if prep.is_empty() {
+            return Ok(None);
+        }
+        prep.apply_in_studio().map(Some)
+    }
+
     /// One Luau chunk for the Edit window: every instance is found before
     /// anything changes, and moved instances are detached first so a swap of
     /// parent and child never forms a cycle.
     pub(crate) fn luau(&self) -> String {
         let join = |items: Vec<String>| items.join(", ");
-        let paths = join(
-            self.paths
-                .iter()
-                .map(|path| luau_string_list(path))
-                .collect(),
-        );
+        let paths = join(self.paths.iter().map(luau_target).collect());
         let renames = join(
             self.renames
                 .iter()
@@ -1691,9 +1737,8 @@ impl StudioPrep {
                 .collect(),
         );
         format!(
-            "local function at(segments) local inst = game for _, name in segments do inst = inst:FindFirstChild(name) if not inst then return nil end end return inst end \
-             local found, missing = {{}}, {{}} \
-             for i, segments in {{{paths}}} do found[i] = at(segments) if not found[i] then table.insert(missing, table.concat(segments, '.')) end end \
+            "{LUAU_AT}local found, missing = {{}}, {{}} \
+             for i, target in {{{paths}}} do found[i] = at(target) if not found[i] then table.insert(missing, label(target)) end end \
              local renamed, moved, destroyed = 0, 0, 0 \
              for _, edit in {{{renames}}} do local inst = found[edit[1]] if inst then inst.Name = edit[2] renamed += 1 end end \
              local moves = {{{moves}}} \
@@ -1711,7 +1756,7 @@ impl StudioPrep {
             json!({ "code": self.luau(), "edit": true, "bridgeWaitSeconds": 8.0, "bridgePorts": "8781,8782" }),
             false,
         )
-        .context("The batch was written but Studio could not apply its renames, moves and removals; push the stores with `rbx ps`")?;
+        .context("The store was written but Studio could not apply its renames, moves and removals; push the stores with `rbx ps`")?;
         Ok(result
             .get("results")
             .and_then(Value::as_array)

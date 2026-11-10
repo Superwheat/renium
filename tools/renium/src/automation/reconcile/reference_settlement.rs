@@ -16,7 +16,8 @@ use crate::bytecode::explorer::compact_path_string;
 use crate::editor::paths::build_editor_instance_paths;
 use crate::project::version_control::restore_removed_instances;
 use crate::settings::bytecode::{
-    SETTINGS_REFERENCE_SELECTOR_KEYS, is_reference_object, strict_reference_path,
+    SETTINGS_REFERENCE_SELECTOR_KEYS, for_each_reference, for_each_reference_mut,
+    strict_reference_path,
 };
 
 fn is_store_path(path: &Path) -> bool {
@@ -68,40 +69,6 @@ fn classes_by_exact_path(document: &SettingsBytecode, service: &str) -> HashMap<
             ))
         })
         .collect()
-}
-
-fn for_each_reference(value: &Value, visit: &mut impl FnMut(&Map<String, Value>)) {
-    match value {
-        Value::Array(values) => values
-            .iter()
-            .for_each(|value| for_each_reference(value, visit)),
-        Value::Object(object) => {
-            if is_reference_object(object) {
-                visit(object);
-            }
-            object
-                .values()
-                .for_each(|value| for_each_reference(value, visit));
-        }
-        _ => {}
-    }
-}
-
-fn for_each_reference_mut(value: &mut Value, visit: &mut impl FnMut(&mut Map<String, Value>)) {
-    match value {
-        Value::Array(values) => values
-            .iter_mut()
-            .for_each(|value| for_each_reference_mut(value, visit)),
-        Value::Object(object) => {
-            if is_reference_object(object) {
-                visit(object);
-            }
-            object
-                .values_mut()
-                .for_each(|value| for_each_reference_mut(value, visit));
-        }
-        _ => {}
-    }
 }
 
 /// The instances of one store that the merge's base had and the merged

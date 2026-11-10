@@ -717,12 +717,12 @@ fn batch_sets_clones_renames_moves_and_removes_in_order() {
             "Workspace",
             "Lobby",
             "FrontDoor",
-            "Border",
             "Spawner",
             "Target",
             "Café ☕",
-            "Helper",
             "Props",
+            "Border",
+            "Helper",
             "Gate"
         ]
     );
@@ -741,18 +741,18 @@ fn batch_sets_clones_renames_moves_and_removes_in_order() {
     let gate = &workspace.instances[9];
     assert_eq!(
         (gate.class_name.as_str(), gate.parent_index),
-        ("Part", Some(8))
+        ("Part", Some(6))
     );
     assert_eq!(gate.properties["Anchored"], json!(false));
     assert_eq!(gate.properties["Tags"], json!(["Door"]));
     assert_eq!(gate.attributes["Kind"], json!("gate"));
     assert_eq!(gate.attributes["Owner"], json!("Grace"));
-    assert_eq!(workspace.instances[3].parent_index, Some(8));
+    assert_eq!(workspace.instances[7].parent_index, Some(6));
     assert_eq!(
-        workspace.instances[3].properties["Transparency"],
+        workspace.instances[7].properties["Transparency"],
         json!(0.75)
     );
-    assert_eq!(workspace.instances[7].parent_index, Some(8));
+    assert_eq!(workspace.instances[8].parent_index, Some(6));
     let moved_door = json!({"_type": "Ref", "pathOrdinals": [1, 1, 1], "pathSegments": ["Workspace", "Lobby", "FrontDoor"], "settingsId": "door"});
     assert_eq!(
         fx.both(&["bg", "-f", &fx.store_arg("Workspace"), "Target", "Value"]),
@@ -950,13 +950,18 @@ fn pushed_batch_finds_renamed_moved_and_removed_instances_by_their_old_paths() {
     )
     .unwrap();
     let studio = &outcome.studio;
+    let paths = studio
+        .paths
+        .iter()
+        .map(|path| (path.path_segments.join("/"), path.path_ordinals.clone()))
+        .collect::<Vec<_>>();
     assert_eq!(
-        studio.paths,
+        paths,
         [
-            vec!["Workspace", "Lobby"],
-            vec!["Workspace", "Lobby", "Door"],
-            vec!["Workspace", "Café ☕"],
-            vec!["Workspace", "Target"],
+            ("Workspace/Lobby".to_string(), vec![1, 1]),
+            ("Workspace/Lobby/Door".to_string(), vec![1, 1, 1]),
+            ("Workspace/Café ☕".to_string(), vec![1, 1]),
+            ("Workspace/Target".to_string(), vec![1, 1]),
         ]
     );
     assert_eq!(studio.renames, [(0, "Hall".to_string())]);
@@ -964,7 +969,7 @@ fn pushed_batch_finds_renamed_moved_and_removed_instances_by_their_old_paths() {
     assert_eq!(studio.destroys, [3]);
     let luau = studio.luau();
     assert!(
-        luau.contains(r#"in {{"Workspace", "Lobby"}, {"Workspace", "Lobby", "Door"}, {"Workspace", "Café ☕"}, {"Workspace", "Target"}} do"#)
+        luau.contains(r#"in {{ {"Workspace", "Lobby"}, {1, 1} }, { {"Workspace", "Lobby", "Door"}, {1, 1, 1} }, { {"Workspace", "Café ☕"}, {1, 1} }, { {"Workspace", "Target"}, {1, 1} }} do"#)
             && luau.contains(r#"{ 1, "Hall" }"#)
             && luau.contains("{ 2, 3 }")
             && luau.contains("in {4} do"),
@@ -1752,11 +1757,11 @@ fn remove_instance_deletes_subtrees_sources_and_keeps_descendants_on_request() {
         fx.names("Workspace"),
         [
             "Workspace",
-            "Border",
-            "Border",
             "Spawner",
             "Target",
             "Café ☕",
+            "Border",
+            "Border",
             "Helper"
         ]
     );
@@ -1784,7 +1789,7 @@ fn remove_instance_deletes_subtrees_sources_and_keeps_descendants_on_request() {
         json!(["border2"])
     );
     assert_eq!(
-        fx.text(&["br", "-f", &store, "-x", "1"]).ok()["removedSettingsIds"],
+        fx.text(&["br", "-f", &store, "-x", "4"]).ok()["removedSettingsIds"],
         json!(["border1"])
     );
     assert_eq!(
@@ -2442,13 +2447,13 @@ fn rename_and_remove_commands_edit_the_project_store() {
         fx.names("Workspace"),
         [
             "Workspace",
-            "Border",
-            "Edge",
             "Boot",
             "Target",
             "a/b",
-            "Helper",
-            "Inside"
+            "Inside",
+            "Border",
+            "Edge",
+            "Helper"
         ]
     );
     assert!(
@@ -2668,7 +2673,7 @@ fn store_edits_refuse_changes_inside_a_read_only_link() {
     }
     assert_eq!(
         fx.names("ReplicatedStorage"),
-        ["ReplicatedStorage", "Shared", "Other", "Extra", "Util Copy"]
+        ["ReplicatedStorage", "Shared", "Extra", "Util Copy", "Other"]
     );
     let ops = crate::bytecode::add_batch::parse_batch_ops(
         r#"[{"op":"remove","path":"ReplicatedStorage.Shared.Other"}]"#,
@@ -3122,5 +3127,427 @@ fn model_import_and_export_commands_use_project_targets() {
         ])
         .ok()["rootSettingsIds"],
         json!(["editor:2"])
+    );
+}
+
+/// A place the pushed-edit chunks can run against: `Workspace.Borders` holds
+/// three folders named `Border` whose `Which` attribute tells them apart,
+/// `Workspace.Spare` is empty, and the ServerStorage service was renamed to
+/// `Vault` while a plain folder carries its old name.
+const MOCK_PLACE: &str = r#"
+local kids, services = {}, {}
+function new(name, parent, which)
+    local state = { Name = name, ClassName = 'Folder' }
+    local methods = {
+        GetChildren = function(self) return table.clone(kids[self]) end,
+        FindFirstChild = function(self, wanted)
+            for _, child in kids[self] do if child.Name == wanted then return child end end
+            return nil
+        end,
+        FindService = function(_, wanted) return services[wanted] end,
+        Destroy = function(self)
+            for _, child in table.clone(kids[self]) do child:Destroy() end
+            self.Parent = nil
+        end,
+        GetAttribute = function(_, key) return if key == 'Which' then which else nil end,
+        GetTags = function() return {} end,
+        GetFullName = function()
+            local above = state.Parent
+            return if above and above ~= game then above:GetFullName() .. '.' .. state.Name else state.Name
+        end,
+    }
+    local inst = setmetatable({}, {
+        __index = function(_, key) return methods[key] or state[key] end,
+        __newindex = function(self, key, value)
+            if key ~= 'Parent' then state[key] = value return end
+            if state.Parent then table.remove(kids[state.Parent], table.find(kids[state.Parent], self)) end
+            state.Parent = value
+            if value then table.insert(kids[value], self) end
+        end,
+    })
+    kids[inst] = {}
+    inst.Parent = parent
+    return inst
+end
+game = new('Place')
+local workspace = new('Workspace', game)
+local borders = new('Borders', workspace)
+for _, which in { 'first', 'second', 'third' } do new('Border', borders, which) end
+new('Spare', workspace)
+services.ServerStorage = new('Vault', game)
+new('Item', services.ServerStorage, 'stored')
+new('ServerStorage', game)
+function children(path)
+    local inst = game
+    for name in string.gmatch(path, '[^.]+') do inst = inst:FindFirstChild(name) end
+    local out = {}
+    for _, child in kids[inst] do table.insert(out, child.Name .. ':' .. (child:GetAttribute('Which') or '-')) end
+    return table.concat(out, ',')
+end
+"#;
+
+fn mock_place() -> mlua::Lua {
+    let lua = mlua::Lua::new();
+    lua.load(MOCK_PLACE).exec().unwrap();
+    lua
+}
+
+fn run_in(place: &mlua::Lua, code: &str) -> Value {
+    use mlua::LuaSerdeExt;
+    let value: mlua::Value = place.load(code).eval().unwrap();
+    place.from_value(value).unwrap()
+}
+
+fn children_in(place: &mlua::Lua, path: &str) -> String {
+    place
+        .load(format!("return children({path:?})"))
+        .eval()
+        .unwrap()
+}
+
+fn store_path(segments: &[&str], ordinals: &[usize]) -> crate::editor::types::EditorInstancePath {
+    crate::editor::types::EditorInstancePath {
+        path_segments: segments.iter().map(|segment| segment.to_string()).collect(),
+        path_ordinals: ordinals.to_vec(),
+    }
+}
+
+fn border(ordinal: usize) -> crate::editor::types::EditorInstancePath {
+    store_path(&["Workspace", "Borders", "Border"], &[1, 1, ordinal])
+}
+
+#[test]
+fn pushed_edits_reach_the_same_named_sibling_the_store_names() {
+    use crate::bytecode::edit::{destroy_luau, read_back_luau, read_back_verifies};
+
+    let place = mock_place();
+    let removed = run_in(&place, &destroy_luau(&[border(2)], None));
+    assert_eq!(removed["destroyed"].as_f64(), Some(1.0), "{removed}");
+    assert_eq!(
+        children_in(&place, "Workspace.Borders"),
+        "Border:first,Border:third"
+    );
+
+    let place = mock_place();
+    run_in(&place, &destroy_luau(&[border(1), border(2)], None));
+    assert_eq!(children_in(&place, "Workspace.Borders"), "Border:third");
+
+    let place = mock_place();
+    let renames = crate::bytecode::add_batch::StudioPrep {
+        paths: vec![border(1), border(2)],
+        renames: vec![(0, "Edge".to_string()), (1, "Mid".to_string())],
+        ..Default::default()
+    };
+    let renamed = run_in(&place, &renames.luau());
+    assert_eq!(renamed["renamed"].as_f64(), Some(2.0), "{renamed}");
+    assert_eq!(
+        children_in(&place, "Workspace.Borders"),
+        "Edge:first,Mid:second,Border:third"
+    );
+    let absent = run_in(&place, &destroy_luau(&[border(2)], None));
+    assert_eq!(absent["destroyed"].as_f64(), Some(0.0), "{absent}");
+    assert_eq!(absent["missing"], json!(["Workspace.Borders.Border[2]"]));
+    assert_eq!(
+        children_in(&place, "Workspace.Borders"),
+        "Edge:first,Mid:second,Border:third"
+    );
+
+    let place = mock_place();
+    let rows = run_in(
+        &place,
+        &read_back_luau(&[border(3), border(4)], &[], &["Which".to_string()]),
+    );
+    assert_eq!(rows[0]["@Which"], json!("third"), "{rows}");
+    assert_eq!(rows[0]["path"], json!("Workspace.Borders.Border"));
+    assert_eq!(
+        rows[1],
+        json!({"missing": true, "path": "Workspace.Borders.Border[4]"})
+    );
+
+    let stored = store_path(&["ServerStorage", "Item"], &[1, 1]);
+    let which = ["Which".to_string()];
+    let rows = run_in(
+        &place,
+        &read_back_luau(std::slice::from_ref(&stored), &[], &which),
+    );
+    assert_eq!(rows[0]["path"], json!("ServerStorage.Item"), "{rows}");
+    let mut item = settings_instance("item", "Item", "Folder", Some(0));
+    item.attributes.insert("Which".into(), json!("stored"));
+    assert_eq!(
+        read_back_verifies(&rows[0], &stored.path_segments, &item, &[], &which),
+        Some(true)
+    );
+    let removed = run_in(&place, &destroy_luau(&[stored], None));
+    assert_eq!(removed["destroyed"].as_f64(), Some(1.0), "{removed}");
+    assert_eq!(children_in(&place, "Vault"), "");
+
+    let place = mock_place();
+    let borders = store_path(&["Workspace", "Borders"], &[1, 1]);
+    let removed = run_in(&place, &destroy_luau(&[borders], Some(&[])));
+    assert_eq!(removed["destroyed"].as_f64(), Some(1.0), "{removed}");
+    assert_eq!(
+        children_in(&place, "Workspace"),
+        "Spare:-,Border:first,Border:second,Border:third"
+    );
+}
+
+/// Removes `targets` without their descendants from a store whose Workspace
+/// holds `tree`, runs the destroy chunk in a place that holds the same tree,
+/// and returns the same-named children the store and the place end up with
+/// under Workspace.
+fn removal_keeps(
+    tree: &[(&str, &str, usize)],
+    setup: &str,
+    targets: &[usize],
+) -> (Vec<String>, String) {
+    use crate::bytecode::edit::{destroy_luau, kept_instance_moves};
+    use crate::editor::paths::build_editor_instance_paths;
+    use crate::settings::instance::{order_reparented_instances_last, remove_instances_at_indices};
+
+    let mut instances = vec![settings_instance("ws", "Workspace", "Workspace", None)];
+    for (id, name, parent) in tree {
+        instances.push(settings_instance(*id, *name, "Folder", Some(*parent)));
+    }
+    let before = settings_document(instances);
+    let mut after = before.clone();
+    remove_instances_at_indices(&mut after, targets, false).unwrap();
+    order_reparented_instances_last(&mut after, &before);
+    let paths = build_editor_instance_paths(&before, "Workspace");
+    let removed = targets
+        .iter()
+        .map(|&index| paths[index].clone().unwrap())
+        .collect::<Vec<_>>();
+    let kept = kept_instance_moves(&before, &after, "Workspace");
+    let place = mock_place();
+    place.load(setup).exec().unwrap();
+    let outcome = run_in(&place, &destroy_luau(&removed, Some(&kept)));
+    assert_eq!(
+        outcome["destroyed"].as_f64(),
+        Some(targets.len() as f64),
+        "{outcome}"
+    );
+    let stored = after
+        .instances
+        .iter()
+        .filter(|instance| instance.parent_index == Some(0))
+        .map(|instance| instance.settings_id.clone())
+        .collect();
+    (stored, children_in(&place, "Workspace"))
+}
+
+#[test]
+fn a_pushed_removal_keeps_descendants_in_the_store_order() {
+    let (stored, live) = removal_keeps(
+        &[
+            ("a", "A", 0),
+            ("in-a", "Border", 1),
+            ("b", "B", 0),
+            ("in-b", "Border", 3),
+        ],
+        "local ws = game:FindFirstChild('Workspace') local a = new('A', ws) new('Border', a, 'in-a') local b = new('B', ws) new('Border', b, 'in-b')",
+        &[3, 1],
+    );
+    assert_eq!(stored, ["in-a", "in-b"]);
+    assert_eq!(live, "Borders:-,Spare:-,Border:in-a,Border:in-b");
+
+    let (stored, live) = removal_keeps(
+        &[
+            ("p", "P", 0),
+            ("c", "C", 1),
+            ("deep", "Border", 2),
+            ("shallow", "Border", 1),
+        ],
+        "local p = new('P', game:FindFirstChild('Workspace')) local c = new('C', p) new('Border', c, 'deep') new('Border', p, 'shallow') new('Extra', c, 'unknown')",
+        &[1, 2],
+    );
+    assert_eq!(stored, ["deep", "shallow"]);
+    assert_eq!(
+        live,
+        "Borders:-,Spare:-,Border:deep,Border:shallow,Extra:unknown"
+    );
+}
+
+fn child_ids(fx: &Fixture, parent: &str) -> Vec<String> {
+    let document = fx.read_store("Workspace");
+    let parent = document
+        .instances
+        .iter()
+        .position(|instance| instance.settings_id == parent);
+    assert!(parent.is_some());
+    document
+        .instances
+        .iter()
+        .enumerate()
+        .filter(|(_, instance)| instance.parent_index == parent)
+        .map(|(index, instance)| {
+            assert!(instance.parent_index < Some(index));
+            instance.settings_id.clone()
+        })
+        .collect()
+}
+
+#[test]
+fn a_store_move_puts_the_instance_last_under_its_new_parent() {
+    let fx = Fixture::new("move-order");
+    let root = fx.path("");
+    let mv = |id: &str, parent: &str| {
+        fx.text(&["mv", "Workspace", "-i", id, "-I", parent, "-r", &root])
+            .ok()
+    };
+    mv("border1", "cafe");
+    assert_eq!(child_ids(&fx, "lobby"), ["door", "border2", "helper"]);
+    assert_eq!(mv("border1", "lobby")["pathOrdinals"], json!([1, 1, 2]));
+    assert_eq!(
+        child_ids(&fx, "lobby"),
+        ["door", "border2", "helper", "border1"]
+    );
+    mv("lobby", "cafe");
+    assert_eq!(child_ids(&fx, "ws"), ["spawner", "target", "cafe"]);
+    assert_eq!(child_ids(&fx, "cafe"), ["lobby"]);
+    assert_eq!(
+        child_ids(&fx, "lobby"),
+        ["door", "border2", "helper", "border1"]
+    );
+
+    let fx = Fixture::new("move-order-batch");
+    run_batch(
+        &fx,
+        r##"[
+            {"op":"move","path":"Workspace.Lobby.Helper","parent":"Workspace.Café ☕"},
+            {"op":"move","path":"Workspace.Lobby.Border[1]","parent":"Workspace.Café ☕"},
+            {"op":"move","path":"Workspace.Lobby.Door","parent":"Workspace"},
+            {"op":"move","path":"Workspace.Door","parent":"Workspace.Lobby"},
+            {"parent":"Workspace.Café ☕","name":"Menu","class":"Folder","ref":"menu"},
+            {"op":"move","path":"Workspace.Spawner","parent":"#menu"}
+        ]"##,
+    )
+    .unwrap();
+    assert_eq!(child_ids(&fx, "lobby"), ["door", "border2"]);
+    assert_eq!(child_ids(&fx, "cafe"), ["border1", "helper", "editor:9"]);
+    assert_eq!(child_ids(&fx, "editor:9"), ["spawner"]);
+    assert_eq!(child_ids(&fx, "ws"), ["lobby", "target", "cafe"]);
+
+    let fx = Fixture::new("move-order-batch-selector");
+    run_batch(
+        &fx,
+        r##"[{"op":"move","path":"Workspace.Lobby.Border[2]","parent":"Workspace.Café ☕"}]"##,
+    )
+    .unwrap();
+    run_batch(
+        &fx,
+        r##"[
+            {"op":"move","path":"Workspace.Lobby.Border","parent":"Workspace.Café ☕"},
+            {"op":"set","path":"Workspace.Café ☕.Border[1]","attrs":{"Resident":true}},
+            {"op":"set","path":"Workspace.Café ☕.Border[2]","props":{"Transparency":0.5}}
+        ]"##,
+    )
+    .unwrap();
+    assert_eq!(child_ids(&fx, "cafe"), ["border2", "border1"]);
+    let document = fx.read_store("Workspace");
+    let stored = |id: &str| {
+        document
+            .instances
+            .iter()
+            .find(|instance| instance.settings_id == id)
+            .unwrap()
+    };
+    assert_eq!(
+        stored("border2").attributes.get("Resident"),
+        Some(&json!(true))
+    );
+    assert_eq!(stored("border1").attributes.get("Resident"), None);
+    assert_eq!(stored("border1").properties["Transparency"], json!(0.5));
+    assert_eq!(stored("border2").properties["Transparency"], json!(0.75));
+}
+
+#[test]
+fn pushed_moves_take_the_same_named_sibling_the_store_names() {
+    use crate::bytecode::add_batch::StudioPrep;
+    use crate::project::commands::reparent_luau;
+
+    let spare = store_path(&["Workspace", "Spare"], &[1, 1]);
+    let place = mock_place();
+    assert_eq!(
+        run_in(&place, &reparent_luau(&border(2), &spare)),
+        json!("moved")
+    );
+    assert_eq!(
+        children_in(&place, "Workspace.Borders"),
+        "Border:first,Border:third"
+    );
+    assert_eq!(children_in(&place, "Workspace.Spare"), "Border:second");
+    let borders = store_path(&["Workspace", "Borders"], &[1, 1]);
+    assert_eq!(
+        run_in(&place, &reparent_luau(&border(1), &borders)),
+        json!("unchanged")
+    );
+    assert_eq!(
+        run_in(&place, &reparent_luau(&border(3), &spare)),
+        json!("missing")
+    );
+
+    let place = mock_place();
+    let prep = StudioPrep {
+        paths: vec![border(1), border(2), border(3), spare],
+        renames: vec![(2, "Last".to_string())],
+        moves: vec![(0, 3)],
+        destroys: vec![1],
+    };
+    let outcome = run_in(&place, &prep.luau());
+    assert_eq!(outcome["renamed"].as_f64(), Some(1.0), "{outcome}");
+    assert_eq!(outcome["moved"].as_f64(), Some(1.0), "{outcome}");
+    assert_eq!(outcome["destroyed"].as_f64(), Some(1.0), "{outcome}");
+    assert_eq!(children_in(&place, "Workspace.Borders"), "Last:third");
+    assert_eq!(children_in(&place, "Workspace.Spare"), "Border:first");
+
+    let mut instances = vec![
+        settings_instance("ws", "Workspace", "Workspace", None),
+        settings_instance("borders", "Borders", "Folder", Some(0)),
+    ];
+    for id in ["first", "second", "third"] {
+        instances.push(settings_instance(id, "Border", "Folder", Some(1)));
+    }
+    instances.push(settings_instance("spare", "Spare", "Folder", Some(0)));
+    let before = settings_document(instances);
+    let edited = |edit: &dyn Fn(&mut SettingsBytecode)| {
+        let mut after = before.clone();
+        edit(&mut after);
+        crate::settings::instance::order_reparented_instances_last(&mut after, &before);
+        let mut prep = StudioPrep::default();
+        prep.add_store(&before, &after, "Workspace").unwrap();
+        let place = mock_place();
+        (run_in(&place, &prep.luau()), place, after)
+    };
+
+    let (outcome, place, after) = edited(&|after| {
+        after.instances[4].parent_index = Some(5);
+        after.instances[2].parent_index = Some(5);
+        after.instances[3].name = "Mid".to_string();
+    });
+    assert_eq!(outcome["moved"].as_f64(), Some(2.0), "{outcome}");
+    assert_eq!(outcome["renamed"].as_f64(), Some(1.0), "{outcome}");
+    assert_eq!(children_in(&place, "Workspace.Borders"), "Mid:second");
+    assert_eq!(
+        children_in(&place, "Workspace.Spare"),
+        "Border:first,Border:third"
+    );
+    let under_spare = after
+        .instances
+        .iter()
+        .filter(|instance| {
+            instance
+                .parent_index
+                .is_some_and(|parent| after.instances[parent].settings_id == "spare")
+        })
+        .map(|instance| instance.settings_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(under_spare, ["first", "third"]);
+
+    let (outcome, place, _) = edited(&|after| after.instances[1].parent_index = Some(5));
+    assert_eq!(outcome["moved"].as_f64(), Some(1.0), "{outcome}");
+    assert_eq!(children_in(&place, "Workspace"), "Spare:-");
+    assert_eq!(
+        children_in(&place, "Workspace.Spare.Borders"),
+        "Border:first,Border:second,Border:third"
     );
 }

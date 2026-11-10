@@ -2114,58 +2114,37 @@ pub(super) fn bytecode_set_property(mut args: BytecodeSetPropertyArgs) -> Result
     if let Some(query) = args.where_query.take() {
         return bytecode_set_property_where(args, &query);
     }
-    // A push pairs the store with Studio by path, so a renamed instance is
-    // renamed in the place first; otherwise the push would create a copy
-    // under the new name beside the old one.
-    let renames = args.push
-        && args.property.iter().any(|name| {
-            name.eq_ignore_ascii_case("name") || name.to_ascii_lowercase().starts_with("name=")
-        });
-    let before = if renames {
-        selected_store_path(&args)?
+    // A push pairs the store with Studio by path, so a renamed or moved
+    // instance is renamed or moved in the place first; otherwise the push
+    // would create a copy at the new path and leave the original.
+    let before = if args.push && sets_name_or_parent(&args.property) {
+        let mut selected = args.clone();
+        adopt_single_positional_target(&mut selected.input, None, &mut selected.selector)?;
+        let (settings_file, _) = resolve_bytecode_cli_settings_file(
+            selected.input.settings_file.as_deref(),
+            selected.input.service_or_file.as_deref(),
+            None,
+        )?;
+        let document = SettingsBytecode::read_file(&settings_file)?;
+        Some((settings_file, document))
     } else {
         None
     };
     let mut result = bytecode_set_property_result(args.clone())?;
-    let new_name = result
-        .get("name")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            result
-                .get("pathSegments")
-                .and_then(Value::as_array)
-                .and_then(|segments| segments.last())
-                .and_then(Value::as_str)
-        })
-        .map(str::to_string);
-    if let Some(before) = before
-        && let Some(new_name) = new_name
+    if let Some((settings_file, before)) = &before
+        && let Some(applied) = add_batch::StudioPrep::apply_store_edit(settings_file, before)?
     {
-        result["studioRenamed"] = crate::bytecode::edit::rename_in_studio(&[(before, new_name)])?;
+        result["studioApplied"] = applied;
     }
     finish_set_property(args, result)
 }
 
-/// The full path of the instance a set-property call selects, before the
-/// edit; `None` when the selector names the service root.
-fn selected_store_path(args: &BytecodeSetPropertyArgs) -> Result<Option<Vec<String>>> {
-    let mut args = args.clone();
-    adopt_single_positional_target(&mut args.input, None, &mut args.selector)?;
-    let (settings_file, service_hint) = resolve_bytecode_cli_settings_file(
-        args.input.settings_file.as_deref(),
-        args.input.service_or_file.as_deref(),
-        None,
-    )?;
-    let document = SettingsBytecode::read_file(&settings_file)?;
-    let service = bytecode_service_name(&document, &settings_file, &service_hint);
-    let resolved = resolve_bytecode_selector_or_service_root(
-        &document,
-        &service,
-        &args.selector,
-        "No matching instance",
-    )?;
-    let (segments, _) = build_editor_instance_path_parts(&document, &service);
-    Ok(segments.get(resolved.index).cloned().flatten())
+/// Whether `-p` names Name or Parent, alone or as `NAME=JSON`.
+fn sets_name_or_parent(properties: &[String]) -> bool {
+    properties.iter().any(|property| {
+        let name = property.split('=').next().unwrap_or(property);
+        name.eq_ignore_ascii_case("name") || name.eq_ignore_ascii_case("parent")
+    })
 }
 
 /// The assignments of a `bs` call, each a property name and its value: one
@@ -2317,13 +2296,12 @@ fn bytecode_set_property_where(mut args: BytecodeSetPropertyArgs, query: &str) -
         "No matching instance",
     )?;
     let matched = where_matches(&document, &service, scope.index, query)?;
-    let (segments, _) = crate::editor::paths::build_editor_instance_path_parts(&document, &service);
+    let store_paths = build_editor_instance_paths(&document, &service);
     let path_of = |index: usize| {
-        segments
+        store_paths
             .get(index)
-            .cloned()
-            .flatten()
-            .map(|parts| parts.join("."))
+            .and_then(Option::as_ref)
+            .map(|path| path.path_segments.join("."))
             .unwrap_or_else(|| document.instances[index].name.clone())
     };
     if matched.is_empty() {
@@ -2385,9 +2363,15 @@ fn bytecode_set_property_where(mut args: BytecodeSetPropertyArgs, query: &str) -
         "settingsFile": settings_file,
     });
     if push {
+        if sets_name_or_parent(&args.property)
+            && let Some(applied) =
+                add_batch::StudioPrep::apply_store_edit(&settings_file, &document)?
+        {
+            result["studioApplied"] = applied;
+        }
         result["push"] = crate::bytecode::edit::push_stored_instances(
             settings_file.clone(),
-            ids,
+            ids.clone(),
             crate::bytecode::edit::PushedScope::Instance,
         )?;
         let (properties, attributes) = if args.scope.eq_ignore_ascii_case("attribute") {
@@ -2395,10 +2379,21 @@ fn bytecode_set_property_where(mut args: BytecodeSetPropertyArgs, query: &str) -
         } else {
             (set_names, Vec::new())
         };
-        let paths = matched
+        let stored = SettingsBytecode::read_file(&settings_file)?;
+        let stored_paths = build_editor_instance_paths(&stored, &service);
+        let stored_by_id = stored
+            .instances
             .iter()
-            .filter_map(|&index| segments.get(index).cloned().flatten())
-            .collect::<Vec<_>>();
+            .enumerate()
+            .map(|(index, instance)| (instance.settings_id.as_str(), index))
+            .collect::<HashMap<_, _>>();
+        let (instances, paths): (Vec<_>, Vec<_>) = ids
+            .iter()
+            .filter_map(|id| {
+                let index = *stored_by_id.get(id.as_str())?;
+                Some((&stored.instances[index], stored_paths.get(index)?.clone()?))
+            })
+            .unzip();
         if paths.len() > WHERE_READ_BACK_LIMIT {
             result["studioLimit"] = json!(WHERE_READ_BACK_LIMIT);
         }
@@ -2408,11 +2403,11 @@ fn bytecode_set_property_where(mut args: BytecodeSetPropertyArgs, query: &str) -
         {
             let rows = studio.as_array().cloned().unwrap_or_default();
             let mut verified = Some(rows.len() == read.len());
-            for ((row, path), &index) in rows.iter().zip(read).zip(matched.iter()) {
+            for ((row, path), instance) in rows.iter().zip(read).zip(instances) {
                 match crate::bytecode::edit::read_back_verifies(
                     row,
-                    path,
-                    &document.instances[index],
+                    &path.path_segments,
+                    instance,
                     &properties,
                     &attributes,
                 ) {
@@ -2463,14 +2458,13 @@ pub(crate) fn bytecode_rename_where(
         &selector,
         "No matching instance",
     )?;
-    let (segments, _) = build_editor_instance_path_parts(&document, &service);
+    let store_paths = build_editor_instance_paths(&document, &service);
     let path_of = |index: usize| {
-        segments
+        store_paths
             .get(index)
-            .cloned()
-            .flatten()
-            .unwrap_or_else(|| vec![document.instances[index].name.clone()])
-            .join(".")
+            .and_then(Option::as_ref)
+            .map(|path| path.path_segments.join("."))
+            .unwrap_or_else(|| document.instances[index].name.clone())
     };
     let matched = where_matches(&document, &service, scope.index, query)?;
     let links = store_link_enforcement(&settings_file, override_packages)?;
@@ -2533,23 +2527,16 @@ pub(crate) fn bytecode_rename_where(
         "settingsFile": settings_file,
     });
     if push {
-        let pairs = renames
-            .iter()
-            .map(|(_, path, name)| {
-                (
-                    path.split('.').map(str::to_string).collect::<Vec<_>>(),
-                    name.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-        result["studioRenamed"] = crate::bytecode::edit::rename_in_studio(&pairs)?;
+        if let Some(applied) = add_batch::StudioPrep::apply_store_edit(&settings_file, &document)? {
+            result["studioApplied"] = applied;
+        }
         result["push"] = crate::bytecode::edit::push_stored_instances(
             settings_file.clone(),
             ids.clone(),
             crate::bytecode::edit::PushedScope::Subtree,
         )?;
         let after = SettingsBytecode::read_file(&settings_file)?;
-        let (segments, _) = build_editor_instance_path_parts(&after, &service);
+        let after_paths = build_editor_instance_paths(&after, &service);
         let indices = ids
             .iter()
             .filter_map(|id| {
@@ -2561,7 +2548,7 @@ pub(crate) fn bytecode_rename_where(
             .collect::<Vec<_>>();
         let paths = indices
             .iter()
-            .filter_map(|&index| segments.get(index).cloned().flatten())
+            .filter_map(|&index| after_paths.get(index).cloned().flatten())
             .collect::<Vec<_>>();
         let read = &paths[..paths.len().min(WHERE_READ_BACK_LIMIT)];
         if paths.len() > WHERE_READ_BACK_LIMIT {
@@ -2574,7 +2561,7 @@ pub(crate) fn bytecode_rename_where(
             for ((row, path), &index) in rows.iter().zip(read).zip(indices.iter()) {
                 match crate::bytecode::edit::read_back_verifies(
                     row,
-                    path,
+                    &path.path_segments,
                     &after.instances[index],
                     &names,
                     &[],
@@ -2898,16 +2885,27 @@ impl StorePropertyEdit<'_> {
     /// Writes the store, the script files and the references to renamed and
     /// moved instances in one step, then gives each assignment its result.
     fn finish(
-        self,
+        mut self,
         locked_stores: &BTreeSet<PathBuf>,
-        applied: Vec<Vec<AppliedAssignment>>,
+        mut applied: Vec<Vec<AppliedAssignment>>,
     ) -> Result<Vec<Vec<Value>>> {
+        if let Some((before_document, _)) = &self.before
+            && let Some(moved_to) =
+                instance_api::order_reparented_instances_last(&mut self.document, before_document)
+        {
+            self.moved = self.moved.iter().map(|index| moved_to[*index]).collect();
+            for (index, _) in &mut self.sources {
+                *index = moved_to[*index];
+            }
+            for assignment in applied.iter_mut().flatten() {
+                assignment.index = moved_to[assignment.index];
+            }
+        }
         let mut writes = BTreeMap::new();
         let mut removals = Vec::new();
         let source_paths = match &self.before {
             Some((before_document, source_paths_before)) => collect_source_path_updates(
-                before_document,
-                source_paths_before,
+                &SourcePathsBefore::capture(before_document, source_paths_before),
                 &self.document,
                 self.service,
                 &self.service_dir,
@@ -3913,42 +3911,28 @@ fn preserve_source_extensions_by_index(before: &[Option<PathBuf>], after: &mut [
     }
 }
 
-fn source_paths_by_settings_id<'a>(
-    document: &'a SettingsBytecode,
-    paths: &'a [Option<PathBuf>],
-) -> HashMap<&'a str, &'a Path> {
-    document
-        .instances
-        .iter()
-        .zip(paths)
-        .filter_map(|(instance, path)| {
-            path.as_deref()
-                .map(|path| (instance.settings_id.as_str(), path))
-        })
-        .collect()
-}
+/// The script file each instance of a store had before an edit, by settings
+/// id.
+pub(crate) struct SourcePathsBefore(HashMap<String, PathBuf>);
 
-pub(super) fn preserve_source_extensions(
-    before_document: &SettingsBytecode,
-    before: &[Option<PathBuf>],
-    after_document: &SettingsBytecode,
-    after: &mut [Option<PathBuf>],
-) {
-    let before_by_id = source_paths_by_settings_id(before_document, before);
-    for (instance, path) in after_document.instances.iter().zip(after) {
-        let (Some(from), Some(to)) = (
-            before_by_id.get(instance.settings_id.as_str()).copied(),
-            path,
-        ) else {
-            continue;
-        };
-        preserve_source_path_extension(from, to);
+impl SourcePathsBefore {
+    /// `paths` holds one entry for each instance of `document`.
+    pub(crate) fn capture(document: &SettingsBytecode, paths: &[Option<PathBuf>]) -> Self {
+        Self(
+            document
+                .instances
+                .iter()
+                .zip(paths)
+                .filter_map(|(instance, path)| Some((instance.settings_id.clone(), path.clone()?)))
+                .collect(),
+        )
     }
 }
 
+/// Plans the script file moves an edit caused and returns the script paths
+/// after it, each keeping the extension its file had before.
 pub(super) fn collect_source_path_updates(
-    before_document: &SettingsBytecode,
-    before: &[Option<PathBuf>],
+    before: &SourcePathsBefore,
     after_document: &SettingsBytecode,
     service: &str,
     service_dir: &Path,
@@ -3956,41 +3940,26 @@ pub(super) fn collect_source_path_updates(
     removals: &mut Vec<PathBuf>,
 ) -> Result<Vec<Option<PathBuf>>> {
     let mut after = build_editor_source_paths_by_index(after_document, service, service_dir);
-    preserve_source_extensions(before_document, before, after_document, &mut after);
-    collect_source_path_moves_by_settings_id(
-        before_document,
-        before,
-        after_document,
-        &after,
-        writes,
-        removals,
-    )?;
-    Ok(after)
-}
-
-pub(super) fn collect_source_path_moves_by_settings_id(
-    before_document: &SettingsBytecode,
-    before: &[Option<PathBuf>],
-    after_document: &SettingsBytecode,
-    after: &[Option<PathBuf>],
-    writes: &mut BTreeMap<PathBuf, Vec<u8>>,
-    removals: &mut Vec<PathBuf>,
-) -> Result<()> {
-    let before_by_id = source_paths_by_settings_id(before_document, before);
+    for (instance, to) in after_document.instances.iter().zip(&mut after) {
+        if let (Some(from), Some(to)) = (before.0.get(&instance.settings_id), to) {
+            preserve_source_path_extension(from, to);
+        }
+    }
     collect_source_path_move_pairs(
         after_document
             .instances
             .iter()
-            .zip(after)
+            .zip(&after)
             .filter_map(|(instance, to)| {
                 Some((
-                    before_by_id.get(instance.settings_id.as_str()).copied()?,
+                    before.0.get(&instance.settings_id)?.as_path(),
                     to.as_deref()?,
                 ))
             }),
         writes,
         removals,
-    )
+    )?;
+    Ok(after)
 }
 
 pub(super) fn apply_file_mutations(

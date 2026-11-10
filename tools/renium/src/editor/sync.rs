@@ -5369,38 +5369,26 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
             let reserved = retired_ids.get(&service).cloned().unwrap_or_default();
             let ensured =
                 ensure_editor_source_target_in_bytecode_reserving(document, spec, &reserved)?;
-            mapped_target = Some(ensured.target);
+            let target = ensured.target;
             if ensured.changed {
-                if let Some(target) = mapped_target.as_ref() {
-                    changes.history_entries.push(EditorHistoryEntry {
+                if let Some(run_context) = spec.run_context.as_ref() {
+                    let mut properties = Map::new();
+                    properties.insert(
+                        "RunContext".to_string(),
+                        editor_run_context_value(run_context),
+                    );
+                    changes.property_changes.push(EditorPropertyChange {
                         service: service.clone(),
-                        source_path: Some(absolute_path.clone()),
                         settings_id: target.settings_id.clone(),
                         path_segments: target.path_segments.clone(),
                         path_ordinals: target.path_ordinals.clone(),
                         class_name: target.class_name.clone(),
-                        source_key: Some(editor_source_key_from_target(target)),
-                        settings_before: settings_before.clone(),
+                        properties,
+                        reset_properties: Vec::new(),
+                        attributes: Map::new(),
+                        deleted_attributes: Vec::new(),
+                        attributes_complete: false,
                     });
-                    if let Some(run_context) = spec.run_context.as_ref() {
-                        let mut properties = Map::new();
-                        properties.insert(
-                            "RunContext".to_string(),
-                            editor_run_context_value(run_context),
-                        );
-                        changes.property_changes.push(EditorPropertyChange {
-                            service: service.clone(),
-                            settings_id: target.settings_id.clone(),
-                            path_segments: target.path_segments.clone(),
-                            path_ordinals: target.path_ordinals.clone(),
-                            class_name: target.class_name.clone(),
-                            properties,
-                            reset_properties: Vec::new(),
-                            attributes: Map::new(),
-                            deleted_attributes: Vec::new(),
-                            attributes_complete: false,
-                        });
-                    }
                 }
                 changed_services.dirty.insert(service.clone());
                 if !ensured.upsert_instances.is_empty() {
@@ -5413,12 +5401,9 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
                     });
                 }
                 if !ensured.replace_instances.is_empty() {
-                    if let (Some(before), Some(target_settings_id)) = (
-                        settings_before.as_ref(),
-                        mapped_target
-                            .as_ref()
-                            .and_then(|target| target.settings_id.as_deref()),
-                    ) {
+                    if let (Some(before), Some(target_settings_id)) =
+                        (settings_before.as_ref(), target.settings_id.as_deref())
+                    {
                         append_editor_reference_repairs(
                             &mut changes,
                             before,
@@ -5435,9 +5420,20 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
                         preserve_instances: Vec::new(),
                     });
                 }
+                changes.history_entries.push(EditorHistoryEntry {
+                    service: service.clone(),
+                    source_path: Some(absolute_path.clone()),
+                    settings_id: target.settings_id.clone(),
+                    path_segments: target.path_segments.clone(),
+                    path_ordinals: target.path_ordinals.clone(),
+                    class_name: target.class_name.clone(),
+                    source_key: Some(editor_source_key_from_target(&target)),
+                    settings_before,
+                });
                 source_children.remove(&service);
                 source_stems.remove(&service);
             }
+            mapped_target = Some(target);
         }
 
         if !exists_as_file
@@ -5460,16 +5456,6 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
                 let original_class = document.instances[index].class_name.clone();
                 if is_lua_source_class(&original_class) {
                     let settings_before = document.clone();
-                    changes.history_entries.push(EditorHistoryEntry {
-                        service: service.clone(),
-                        source_path: Some(absolute_path.clone()),
-                        settings_id: Some(settings_id.to_string()),
-                        path_segments: target.path_segments.clone(),
-                        path_ordinals: target.path_ordinals.clone(),
-                        class_name: original_class,
-                        source_key: Some(editor_source_key_from_target(target)),
-                        settings_before: Some(settings_before.clone()),
-                    });
                     changed_services.dirty.insert(service.clone());
                     if inferred_spec.as_ref().is_some_and(|spec| spec.is_init) {
                         document.instances[index].class_name = "Folder".to_string();
@@ -5529,6 +5515,16 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
                             preserve_instances: Vec::new(),
                         });
                     }
+                    changes.history_entries.push(EditorHistoryEntry {
+                        service: service.clone(),
+                        source_path: Some(absolute_path.clone()),
+                        settings_id: Some(settings_id.to_string()),
+                        path_segments: target.path_segments.clone(),
+                        path_ordinals: target.path_ordinals.clone(),
+                        class_name: original_class,
+                        source_key: Some(editor_source_key_from_target(target)),
+                        settings_before: Some(settings_before),
+                    });
                     source_children.remove(&service);
                     source_stems.remove(&service);
                 }

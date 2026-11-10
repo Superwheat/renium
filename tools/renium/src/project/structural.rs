@@ -7,7 +7,6 @@ use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 use serde_json::{Map, Value, json};
 
-use crate::app::output::print_json_output;
 use crate::app::timing::log_timing;
 use crate::bytecode::edit::{
     collect_settings_subtree_preorder, instance_path_parts_key, next_editor_settings_id_fast,
@@ -15,7 +14,7 @@ use crate::bytecode::edit::{
     reject_package_link_subtree_mutation,
 };
 use crate::bytecode::{
-    apply_file_mutations, collect_source_path_updates, file_mutation_paths,
+    SourcePathsBefore, apply_file_mutations, collect_source_path_updates, file_mutation_paths,
     lock_existing_service_stores, preserve_source_path_extension,
 };
 use crate::editor::document::is_protected_engine_container;
@@ -305,7 +304,7 @@ pub(crate) fn move_instance_between_service_stores(
     target_file: &Path,
     target_service: &str,
     target_parent_settings_id: &str,
-) -> Result<()> {
+) -> Result<Value> {
     let move_started = Instant::now();
     let src_root = source_root_for_stores(source_file, target_file)?;
     let files = service_store_paths(&src_root)?;
@@ -458,8 +457,7 @@ pub(crate) fn move_instance_between_service_stores(
     let mut writes = BTreeMap::new();
     let mut removals = Vec::new();
     collect_source_path_updates(
-        &source_before,
-        &source_paths_before,
+        &SourcePathsBefore::capture(&source_before, &source_paths_before),
         source_after,
         source_service,
         &super::storage::source_directory(source_file),
@@ -518,24 +516,21 @@ pub(crate) fn move_instance_between_service_stores(
     let root_new_index = new_index_by_old[&source_index];
     let root = &target_after.instances[root_new_index];
     let root_path = target_paths[root_new_index].as_ref();
-    print_json_output(
-        &json!({
-            "ok": true,
-            "sourceService": source_service,
-            "targetService": target_service,
-            "sourceSettingsFile": source_file,
-            "targetSettingsFile": target_file,
-            "settingsId": root.settings_id,
-            "name": root.name,
-            "className": root.class_name,
-            "pathSegments": root_path.map(|path| &path.path_segments),
-            "pathOrdinals": root_path.map(|path| &path.path_ordinals),
-            "movedInstances": subtree.len(),
-            "sourceStoreRemoved": source_store_removed,
-            "changedPaths": changed_paths,
-        }),
-        false,
-    )?;
+    let result = json!({
+        "ok": true,
+        "sourceService": source_service,
+        "targetService": target_service,
+        "sourceSettingsFile": source_file,
+        "targetSettingsFile": target_file,
+        "settingsId": root.settings_id,
+        "name": root.name,
+        "className": root.class_name,
+        "pathSegments": root_path.map(|path| &path.path_segments),
+        "pathOrdinals": root_path.map(|path| &path.path_ordinals),
+        "movedInstances": subtree.len(),
+        "sourceStoreRemoved": source_store_removed,
+        "changedPaths": changed_paths,
+    });
     log_timing("cross-service move total", move_started);
-    Ok(())
+    Ok(result)
 }

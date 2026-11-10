@@ -11,7 +11,8 @@ use walkdir::WalkDir;
 
 use crate::app::output::print_json_output;
 use crate::bytecode::edit::{
-    bytecode_add_instance, bytecode_desync_package_link, bytecode_remove_instance,
+    LUAU_AT, bytecode_add_instance, bytecode_desync_package_link, bytecode_remove_instance,
+    luau_target, stored_instance_path,
 };
 use crate::bytecode::parse_bracket_path_segments;
 use crate::bytecode::{apply_file_mutations, bytecode_set_property};
@@ -26,6 +27,7 @@ use crate::cli::{
 };
 use crate::editor::paths::{build_editor_instance_paths, infer_source_script};
 use crate::editor::sync::push_editor_changes;
+use crate::editor::types::EditorInstancePath;
 use crate::project::config;
 use crate::project::layout::configured_project_layout;
 use crate::project::package_links::build_loaded_project_link_enforcement;
@@ -458,15 +460,14 @@ pub(crate) fn move_instance_command(args: MoveInstanceArgs, project: Option<&Pat
             .map(Ok)
             .unwrap_or_else(|| service_root_settings_id(&target_file, &target_service))?;
         if source_file != target_file {
-            return move_instance_between_service_stores(
-                &source_file,
-                &target.service,
+            return move_between_stores(
+                (&source_file, &target.service),
                 source_id
                     .as_deref()
                     .context("Source instance has no canonical id")?,
-                &target_file,
-                &target_service,
+                (&target_file, &target_service),
                 &parent_id,
+                args.push,
             );
         }
         return move_within_store(
@@ -503,14 +504,56 @@ pub(crate) fn move_instance_command(args: MoveInstanceArgs, project: Option<&Pat
             args.push,
         );
     }
-    move_instance_between_service_stores(
-        &source_file,
-        &target.service,
+    move_between_stores(
+        (&source_file, &target.service),
         &target.settings_id,
-        &target_file,
-        &target_service,
+        (&target_file, &target_service),
         &parent_settings_id,
+        args.push,
     )
+}
+
+/// Moves an instance from one service store, `(file, service)`, to another
+/// and, with `--push`, reparents the same instance in the open place before a
+/// scoped push syncs it under its new parent.
+fn move_between_stores(
+    source: (&Path, &str),
+    settings_id: &str,
+    target: (&Path, &str),
+    parent_settings_id: &str,
+    push: bool,
+) -> Result<()> {
+    let live = if push {
+        let stored_path = |(file, _): (&Path, &str), id: &str| -> Result<_> {
+            let document = SettingsBytecode::read_file(file)?;
+            let service = crate::bytecode::edit::bytecode_service_name(&document, file, "");
+            Ok(stored_instance_path(&document, &service, id))
+        };
+        stored_path(source, settings_id)?.zip(stored_path(target, parent_settings_id)?)
+    } else {
+        None
+    };
+    let mut result = move_instance_between_service_stores(
+        source.0,
+        source.1,
+        settings_id,
+        target.0,
+        target.1,
+        parent_settings_id,
+    )?;
+    if push {
+        if let Some((instance, parent)) = live {
+            result["reparented"] = reparent_live(&instance, &parent)?;
+        }
+        result["settingsFile"] = result["targetSettingsFile"].clone();
+        crate::bytecode::edit::push_stored_instance_reading(
+            &mut result,
+            &[],
+            &[],
+            crate::bytecode::edit::PushedScope::Subtree,
+        )?;
+    }
+    crate::app::output::print_json_output(&result, false)
 }
 
 /// Moves an instance inside one store and, with `--push`, reparents the
@@ -525,17 +568,17 @@ fn move_within_store(args: BytecodeSetPropertyArgs, push: bool) -> Result<()> {
         .context("A move names its store file")?;
     let settings_id = args.selector.settings_id.clone();
     let before = push
-        .then(|| {
-            crate::bytecode::edit::stored_path_segments(&settings_file, settings_id.as_deref())
-        })
-        .transpose()?
-        .flatten();
+        .then(|| SettingsBytecode::read_file(&settings_file))
+        .transpose()?;
     let mut result = crate::bytecode::bytecode_set_property_result(args)?;
     if push {
-        let after =
-            crate::bytecode::edit::stored_path_segments(&settings_file, settings_id.as_deref())?;
-        if let (Some(before), Some(after)) = (before, after) {
-            result["reparented"] = reparent_in_studio(&before, &after)?;
+        if let (Some(before), Some(settings_id)) = (&before, settings_id.as_deref()) {
+            let after = SettingsBytecode::read_file(&settings_file)?;
+            if let Some(reparented) =
+                reparent_in_studio(&settings_file, before, &after, settings_id)?
+            {
+                result["reparented"] = reparented;
+            }
         }
         if result.get("settingsId").is_none() {
             result["settingsId"] = json!(settings_id);
@@ -543,7 +586,7 @@ fn move_within_store(args: BytecodeSetPropertyArgs, push: bool) -> Result<()> {
         result["settingsFile"] = json!(settings_file);
         crate::bytecode::edit::push_stored_instance_reading(
             &mut result,
-            &["Parent".to_string()],
+            &[],
             &[],
             crate::bytecode::edit::PushedScope::Subtree,
         )?;
@@ -551,20 +594,59 @@ fn move_within_store(args: BytecodeSetPropertyArgs, push: bool) -> Result<()> {
     crate::app::output::print_json_output(&result, false)
 }
 
-/// Sets the parent of the instance at `before` to the instance at the parent
-/// of `after` in the open place, as one undo step, and returns what happened.
-fn reparent_in_studio(before: &[String], after: &[String]) -> Result<Value> {
-    let Some((_, new_parent)) = after.split_last() else {
-        return Ok(json!("unchanged"));
+/// The Edit window chunk that moves `instance` under `parent`; both are found
+/// before the move.
+pub(crate) fn reparent_luau(instance: &EditorInstancePath, parent: &EditorInstancePath) -> String {
+    format!(
+        "{LUAU_AT}local inst, parent = at({}), at({}) if not inst then return 'missing' end if not parent then return 'parent missing' end if inst.Parent == parent then return 'unchanged' end inst.Parent = parent return 'moved'",
+        luau_target(instance),
+        luau_target(parent),
+    )
+}
+
+/// Sets the parent of a moved instance in the open place to its new parent,
+/// as one undo step, and returns what happened; `None` when the store does
+/// not place both. `before` and `after` are the store around the move. Both
+/// instances are found by their paths before the move, the tree the place
+/// still has: the move itself can shift the ordinals of same-named siblings.
+fn reparent_in_studio(
+    settings_file: &Path,
+    before: &SettingsBytecode,
+    after: &SettingsBytecode,
+    settings_id: &str,
+) -> Result<Option<Value>> {
+    let parent_id = |document: &SettingsBytecode| {
+        let instance = document
+            .instances
+            .iter()
+            .find(|instance| instance.settings_id == settings_id)?;
+        Some(
+            document
+                .instances
+                .get(instance.parent_index?)?
+                .settings_id
+                .clone(),
+        )
     };
-    if before.len() >= 2 && before[..before.len() - 1] == *new_parent {
-        return Ok(json!("unchanged"));
+    let (Some(old_parent), Some(new_parent)) = (parent_id(before), parent_id(after)) else {
+        return Ok(None);
+    };
+    if old_parent == new_parent {
+        return Ok(Some(json!("unchanged")));
     }
-    let code = format!(
-        "local function at(segments) local inst = game for _, name in segments do inst = inst:FindFirstChild(name) if not inst then return nil end end return inst end\n         local inst = at({}) local parent = at({})\n         if not inst then return 'missing' end if not parent then return 'parent missing' end\n         if inst.Parent == parent then return 'unchanged' end inst.Parent = parent return 'moved'",
-        luau_string_list(before),
-        luau_string_list(new_parent),
-    );
+    let service = crate::bytecode::edit::bytecode_service_name(before, settings_file, "");
+    let (Some(instance), Some(parent)) = (
+        stored_instance_path(before, &service, settings_id),
+        stored_instance_path(before, &service, &new_parent),
+    ) else {
+        return Ok(None);
+    };
+    reparent_live(&instance, &parent).map(Some)
+}
+
+/// Runs the reparent chunk in the open place and returns what it reports.
+fn reparent_live(instance: &EditorInstancePath, parent: &EditorInstancePath) -> Result<Value> {
+    let code = reparent_luau(instance, parent);
     let result = crate::daemon::daemon_control_request(
         crate::automation::op::LUAU,
         None,
@@ -578,15 +660,6 @@ fn reparent_in_studio(before: &[String], after: &[String]) -> Result<Value> {
         .and_then(|results| results.first())
         .cloned()
         .unwrap_or(result))
-}
-
-fn luau_string_list(segments: &[String]) -> String {
-    let items = segments
-        .iter()
-        .map(|segment| format!("{:?}", segment))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("{{{items}}}")
 }
 
 pub(crate) fn rename_instance_command(
@@ -676,10 +749,9 @@ pub(crate) fn desync_package_link_command(
     let target = args.target;
     let (settings_file, settings_id, read_only_refusal) =
         projected_unlink_store(project, &target, args.override_packages)?;
-    let segments =
-        stored_instance_segments(&settings_file, &target.service, settings_id.as_deref())?;
+    let store_path = stored_service_path(&settings_file, &target.service, settings_id.as_deref())?;
     let linked_in_store = store_has_package_link(&settings_file, settings_id.as_deref())?;
-    let studio = match unlink_package_in_studio(project, &target.service, &segments) {
+    let studio = match unlink_package_in_studio(project, &store_path) {
         Ok(studio) => studio,
         Err(error) => {
             if let Some(refusal) = read_only_refusal
@@ -809,30 +881,31 @@ fn store_has_package_link(settings_file: &Path, settings_id: Option<&str>) -> Re
     }))
 }
 
-fn stored_instance_segments(
+/// The path of a stored instance from its service, which stands first under
+/// its own name; the service alone without a settings id.
+fn stored_service_path(
     settings_file: &Path,
     service: &str,
     settings_id: Option<&str>,
-) -> Result<Vec<String>> {
-    let document = SettingsBytecode::read_file(settings_file)?;
-    let Some(settings_id) = settings_id else {
-        return Ok(Vec::new());
+) -> Result<EditorInstancePath> {
+    let service_root = EditorInstancePath {
+        path_segments: vec![service.to_string()],
+        path_ordinals: vec![1],
     };
-    let index = document
+    let Some(settings_id) = settings_id else {
+        return Ok(service_root);
+    };
+    let document = SettingsBytecode::read_file(settings_file)?;
+    if !document
         .instances
         .iter()
-        .position(|instance| instance.settings_id == settings_id)
-        .with_context(|| format!("{settings_id} is not in the {service} store"))?;
-    let paths = build_editor_instance_paths(&document, service);
-    let mut segments = paths
-        .get(index)
-        .and_then(Option::as_ref)
-        .map(|path| path.path_segments.clone())
-        .unwrap_or_default();
-    if segments.first().is_some_and(|first| first == service) {
-        segments.remove(0);
+        .any(|instance| instance.settings_id == settings_id)
+    {
+        bail!("{settings_id} is not in the {service} store");
     }
-    Ok(segments)
+    let mut path = stored_instance_path(&document, service, settings_id).unwrap_or(service_root);
+    path.path_segments[0] = service.to_string();
+    Ok(path)
 }
 
 /// Destroys the PackageLink under the target in the connected edit Studio;
@@ -840,17 +913,11 @@ fn stored_instance_segments(
 /// how Unlink from Package works. None when no Studio holds the place.
 fn unlink_package_in_studio(
     project: Option<&Path>,
-    service: &str,
-    segments: &[String],
+    store_path: &EditorInstancePath,
 ) -> Result<Option<String>> {
-    let lua_strings = segments
-        .iter()
-        .map(serde_json::to_string)
-        .collect::<std::result::Result<Vec<_>, _>>()?
-        .join(", ");
     let code = format!(
-        "local inst = game:GetService({service}) for _, name in ipairs({{{lua_strings}}}) do inst = inst:FindFirstChild(name) if not inst then return {{ found = false, missing = name }} end end local link = inst:FindFirstChildOfClass('PackageLink') if not link then return {{ found = true, link = false }} end link:Destroy() return {{ found = true, link = true, removed = inst:FindFirstChildOfClass('PackageLink') == nil, path = inst:GetFullName() }}",
-        service = serde_json::to_string(service)?,
+        "{LUAU_AT}local target = {target} local inst = at(target) if not inst then return {{ found = false, missing = label(target) }} end local link = inst:FindFirstChildOfClass('PackageLink') if not link then return {{ found = true, link = false }} end link:Destroy() return {{ found = true, link = true, removed = inst:FindFirstChildOfClass('PackageLink') == nil, path = inst:GetFullName() }}",
+        target = luau_target(store_path),
     );
     let bridge = crate::cli::BridgeConnectionArgs::local(8.0);
     let result = match daemon_result(
@@ -883,12 +950,11 @@ fn unlink_package_in_studio(
         .unwrap_or(Value::Null);
     if outcome.get("found") == Some(&Value::Bool(false)) {
         bail!(
-            "Studio has no {service}.{} ({} is missing); the files and Studio differ, run `rbx lst --details`",
-            segments.join("."),
+            "{} is missing in Studio; the files and Studio differ, run `rbx lst --details`",
             outcome
                 .get("missing")
                 .and_then(Value::as_str)
-                .unwrap_or("a segment")
+                .unwrap_or("The instance")
         );
     }
     if outcome.get("link") == Some(&Value::Bool(false)) {

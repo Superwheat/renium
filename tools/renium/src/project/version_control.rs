@@ -18,7 +18,7 @@ use crate::rbx::model::read_settings_model_document;
 use crate::settings::EXTERNAL_SOURCE_MARKER;
 use crate::settings::bytecode::{
     SETTINGS_BINARY_VERSION, SETTINGS_REFERENCE_SELECTOR_KEYS, SettingsBytecode,
-    SettingsBytecodeInstance, is_reference_object, reference_leads_out_of,
+    SettingsBytecodeInstance, for_each_reference, for_each_reference_mut, reference_leads_out_of,
     reindex_store_reference_indices,
 };
 use crate::settings::tree::settings_children_by_parent;
@@ -869,40 +869,6 @@ fn same_store_reference_id<'a>(object: &'a Map<String, Value>, service: &str) ->
         .get("settingsId")
         .or_else(|| object.get("instanceId"))
         .and_then(Value::as_str)
-}
-
-fn for_each_reference(value: &Value, visit: &mut impl FnMut(&Map<String, Value>)) {
-    match value {
-        Value::Array(values) => values
-            .iter()
-            .for_each(|value| for_each_reference(value, visit)),
-        Value::Object(object) => {
-            if is_reference_object(object) {
-                visit(object);
-            }
-            object
-                .values()
-                .for_each(|value| for_each_reference(value, visit));
-        }
-        _ => {}
-    }
-}
-
-fn for_each_reference_mut(value: &mut Value, visit: &mut impl FnMut(&mut Map<String, Value>)) {
-    match value {
-        Value::Array(values) => values
-            .iter_mut()
-            .for_each(|value| for_each_reference_mut(value, visit)),
-        Value::Object(object) => {
-            if is_reference_object(object) {
-                visit(object);
-            }
-            object
-                .values_mut()
-                .for_each(|value| for_each_reference_mut(value, visit));
-        }
-        _ => {}
-    }
 }
 
 /// The references of the merged store that name an instance it does not

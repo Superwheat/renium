@@ -10,9 +10,9 @@ use crate::app::output::print_json_output;
 use crate::bytecode::query::{bytecode_parent_index, parse_property_assignments};
 use crate::bytecode::references::{MissingTarget, ReferencedStores};
 use crate::bytecode::{
-    acquire_settings_file_lock, adopt_single_positional_target, apply_file_mutations,
-    collect_source_path_updates, ensure_service_store_exists, file_mutation_paths,
-    lock_existing_service_store, preserve_source_path_extension,
+    SourcePathsBefore, acquire_settings_file_lock, adopt_single_positional_target,
+    apply_file_mutations, collect_source_path_updates, ensure_service_store_exists,
+    file_mutation_paths, lock_existing_service_store, preserve_source_path_extension,
     resolve_bytecode_cli_settings_file, resolve_bytecode_selector,
 };
 use crate::cli::{
@@ -21,9 +21,10 @@ use crate::cli::{
 use crate::editor::document::is_protected_engine_container;
 use crate::editor::paths::{
     build_editor_instance_path_parts, build_editor_instance_paths,
-    build_editor_source_paths_by_index, script_file_names,
+    build_editor_instance_paths_for_indices, build_editor_source_paths_by_index, script_file_names,
 };
 use crate::editor::sync::is_lua_source_class;
+use crate::editor::types::EditorInstancePath;
 use crate::settings::EXTERNAL_SOURCE_MARKER;
 use crate::settings::bytecode::{
     SETTINGS_REFERENCE_SELECTOR_KEYS, SettingsBytecode, SettingsBytecodeInstance,
@@ -341,13 +342,12 @@ pub(crate) fn push_stored_instance_reading(
         return Ok(());
     };
     let service = bytecode_service_name(&document, &settings_file, "");
-    let (segments, _) = build_editor_instance_path_parts(&document, &service);
-    if let Some(path) = segments.get(index).cloned().flatten()
+    if let Some(path) = stored_instance_path(&document, &service, &settings_id)
         && let Ok(studio) = read_back_from_studio(&path, properties, attributes)
     {
         if let Some(verified) = read_back_verifies(
             &studio,
-            &path,
+            &path.path_segments,
             &document.instances[index],
             properties,
             attributes,
@@ -464,24 +464,44 @@ fn live_value_agrees(expected: &Value, live: &Value) -> Option<bool> {
 }
 
 /// The full path (service first) of a stored instance, by settings id.
-pub(crate) fn stored_path_segments(
-    settings_file: &Path,
-    settings_id: Option<&str>,
-) -> Result<Option<Vec<String>>> {
-    let Some(settings_id) = settings_id else {
-        return Ok(None);
-    };
-    let document = SettingsBytecode::read_file(settings_file)?;
-    let service = bytecode_service_name(&document, settings_file, "");
-    let Some(index) = document
+pub(crate) fn stored_instance_path(
+    document: &SettingsBytecode,
+    service: &str,
+    settings_id: &str,
+) -> Option<EditorInstancePath> {
+    let index = document
         .instances
         .iter()
-        .position(|instance| instance.settings_id == settings_id)
-    else {
-        return Ok(None);
-    };
-    let (segments, _) = build_editor_instance_path_parts(&document, &service);
-    Ok(segments.get(index).cloned().flatten())
+        .position(|instance| instance.settings_id == settings_id)?;
+    build_editor_instance_paths_for_indices(document, service, &[index]).remove(&index)
+}
+
+/// Luau that defines `at(target)`, the live instance a store path names, and
+/// `label(target)`, that path as text. A target is `{ names, ordinals }` with
+/// the service first, found as a service before a child of that name; an
+/// ordinal above 1 picks that one of the children that share the name, in the
+/// place's current child order. The store counts its siblings in the order
+/// the last pull or store edit left them, so the ordinal is a position, not
+/// an identity: it names the same instance only while the place keeps that
+/// order.
+pub(crate) const LUAU_AT: &str = "local function at(target) local names, ordinals = target[1], target[2] local ok, inst = pcall(game.FindService, game, names[1]) if not ok or not inst then inst = game:FindFirstChild(names[1]) end for i = 2, #names do if not inst then return nil end local want = ordinals[i] or 1 if want <= 1 then inst = inst:FindFirstChild(names[i]) else local seen, found = 0, nil for _, child in inst:GetChildren() do if child.Name == names[i] then seen += 1 if seen == want then found = child break end end end inst = found end end return inst end local function label(target) local parts = {} for i, name in target[1] do local ordinal = target[2][i] or 1 parts[i] = if ordinal > 1 then name .. '[' .. ordinal .. ']' else name end return table.concat(parts, '.') end ";
+
+/// The Luau literal of the target `at` resolves for a store path.
+pub(crate) fn luau_target(path: &EditorInstancePath) -> String {
+    let ordinals = path
+        .path_ordinals
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{{ {}, {{{ordinals}}} }}",
+        luau_string_list(&path.path_segments)
+    )
+}
+
+fn luau_targets(paths: &[EditorInstancePath]) -> String {
+    paths.iter().map(luau_target).collect::<Vec<_>>().join(", ")
 }
 
 pub(crate) fn luau_string_list(items: &[String]) -> String {
@@ -496,12 +516,11 @@ pub(crate) fn luau_string_list(items: &[String]) -> String {
 /// One live read of the instance at `path` in the Edit window: its full
 /// name, class, the given properties and the given attributes.
 fn read_back_from_studio(
-    path: &[String],
+    path: &EditorInstancePath,
     properties: &[String],
     attributes: &[String],
 ) -> Result<Value> {
-    let rows =
-        read_back_many_from_studio(std::slice::from_ref(&path.to_vec()), properties, attributes)?;
+    let rows = read_back_many_from_studio(std::slice::from_ref(path), properties, attributes)?;
     Ok(rows
         .as_array()
         .and_then(|rows| rows.first())
@@ -509,24 +528,29 @@ fn read_back_from_studio(
         .unwrap_or(Value::Null))
 }
 
+/// The Edit window chunk behind `read_back_many_from_studio`.
+pub(crate) fn read_back_luau(
+    paths: &[EditorInstancePath],
+    properties: &[String],
+    attributes: &[String],
+) -> String {
+    let targets = luau_targets(paths);
+    format!(
+        "{LUAU_AT}local rows = {{}} for _, target in {{{targets}}} do local inst = at(target) if not inst then table.insert(rows, {{ missing = true, path = label(target) }}) else local full = inst:GetFullName() local ok, service = pcall(game.FindService, game, target[1][1]) if ok and service then full = target[1][1] .. string.sub(full, #service.Name + 1) end local row = {{ path = full, class = inst.ClassName }} for _, name in {} do if name == 'Tags' then row[name] = inst:GetTags() else local ok, value = pcall(function() return inst[name] end) if ok then row[name] = value end end end for _, name in {} do row['@' .. name] = inst:GetAttribute(name) end table.insert(rows, row) end end return rows",
+        luau_string_list(properties),
+        luau_string_list(attributes),
+    )
+}
+
 /// One live read of several instances in the Edit window, as an array of rows
 /// in the order of `paths`: each row has the full name, class, the given
 /// properties and attributes, or `missing` with the path that was not found.
 pub(crate) fn read_back_many_from_studio(
-    paths: &[Vec<String>],
+    paths: &[EditorInstancePath],
     properties: &[String],
     attributes: &[String],
 ) -> Result<Value> {
-    let paths = paths
-        .iter()
-        .map(|path| luau_string_list(path))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let code = format!(
-        "local function at(segments) local inst = game for _, name in segments do inst = inst:FindFirstChild(name) if not inst then return nil end end return inst end local rows = {{}} for _, segments in {{{paths}}} do local inst = at(segments) if not inst then table.insert(rows, {{ missing = true, path = table.concat(segments, '.') }}) else local row = {{ path = inst:GetFullName(), class = inst.ClassName }} for _, name in {} do if name == 'Tags' then row[name] = inst:GetTags() else local ok, value = pcall(function() return inst[name] end) if ok then row[name] = value end end end for _, name in {} do row['@' .. name] = inst:GetAttribute(name) end table.insert(rows, row) end end return rows",
-        luau_string_list(properties),
-        luau_string_list(attributes),
-    );
+    let code = read_back_luau(paths, properties, attributes);
     let result = crate::daemon::daemon_control_request(
         crate::automation::op::LUAU,
         None,
@@ -766,11 +790,13 @@ pub(crate) fn add_store_instance(request: StoreInstanceRequest) -> Result<Value>
     ensure_service_store_exists(&settings_file, &service_hint)?;
     let _lock = acquire_settings_file_lock(&settings_file)?;
     let mut document = SettingsBytecode::read_file(&settings_file)?;
-    let before_document = document.clone();
     let service = bytecode_service_name(&document, &settings_file, &service_hint);
     let service_directory = crate::project::storage::source_directory(&settings_file);
     let service_dir = service_directory.as_path();
-    let source_paths_before = build_editor_source_paths_by_index(&document, &service, service_dir);
+    let sources_before = SourcePathsBefore::capture(
+        &document,
+        &build_editor_source_paths_by_index(&document, &service, service_dir),
+    );
     let parent_index = bytecode_parent_index(
         &document,
         parent.no_parent,
@@ -830,8 +856,7 @@ pub(crate) fn add_store_instance(request: StoreInstanceRequest) -> Result<Value>
     let mut writes = BTreeMap::new();
     let mut removals = Vec::new();
     let source_paths = collect_source_path_updates(
-        &before_document,
-        &source_paths_before,
+        &sources_before,
         &document,
         &service,
         service_dir,
@@ -911,7 +936,6 @@ pub(crate) fn clone_stored_instance(
         resolve_bytecode_cli_settings_file(Some(settings_file), None, Some(service))?;
     let _lock = lock_existing_service_store(&settings_file)?;
     let mut document = SettingsBytecode::read_file(&settings_file)?;
-    let before_document = document.clone();
     let service = bytecode_service_name(&document, &settings_file, &service_hint);
     let index_of = |settings_id: &str| {
         document
@@ -927,6 +951,7 @@ pub(crate) fn clone_stored_instance(
 
     let service_dir = crate::project::storage::source_directory(&settings_file);
     let source_paths_before = build_editor_source_paths_by_index(&document, &service, &service_dir);
+    let sources_before = SourcePathsBefore::capture(&document, &source_paths_before);
     let cloned = clone_store_subtree(
         &mut document,
         &service,
@@ -945,8 +970,7 @@ pub(crate) fn clone_stored_instance(
     let mut writes = BTreeMap::new();
     let mut removals = Vec::new();
     let mut source_paths_after = collect_source_path_updates(
-        &before_document,
-        &source_paths_before,
+        &sources_before,
         &document,
         &service,
         &service_dir,
@@ -1651,12 +1675,12 @@ pub(crate) fn bytecode_remove_instance(mut args: BytecodeRemoveInstanceArgs) -> 
         &service,
         &crate::project::storage::source_directory(&settings_file),
     );
-    let (segments_before, _) = build_editor_instance_path_parts(&document, &service);
+    let paths_before = build_editor_instance_paths(&document, &service);
     let path_of = |index: usize| {
-        segments_before
+        paths_before
             .get(index)
-            .cloned()
-            .flatten()
+            .and_then(Option::as_ref)
+            .map(|path| path.path_segments.clone())
             .unwrap_or_else(|| vec![document.instances[index].name.clone()])
     };
     let indices = if let Some(query) = args.where_query.as_deref() {
@@ -1715,8 +1739,17 @@ pub(crate) fn bytecode_remove_instance(mut args: BytecodeRemoveInstanceArgs) -> 
         .iter()
         .map(|&index| path_of(index))
         .collect::<Vec<_>>();
+    let removed_targets = indices
+        .iter()
+        .filter_map(|&index| paths_before.get(index).cloned().flatten())
+        .collect::<Vec<_>>();
     let removed =
         instance_api::remove_instances_at_indices(&mut document, &indices, !args.no_recursive)?;
+    if args.no_recursive {
+        instance_api::order_reparented_instances_last(&mut document, &before_document);
+    }
+    let kept_moves = (args.no_recursive && args.push)
+        .then(|| kept_instance_moves(&before_document, &document, &service));
     let removed_settings_ids = removed
         .iter()
         .filter_map(|index| before_document.instances.get(*index))
@@ -1746,8 +1779,7 @@ pub(crate) fn bytecode_remove_instance(mut args: BytecodeRemoveInstanceArgs) -> 
         &mut writes,
     )?;
     collect_source_path_updates(
-        &before_document,
-        &source_paths_by_index,
+        &SourcePathsBefore::capture(&before_document, &source_paths_by_index),
         &document,
         &service,
         service_dir,
@@ -1795,7 +1827,7 @@ pub(crate) fn bytecode_remove_instance(mut args: BytecodeRemoveInstanceArgs) -> 
         result["matched"] = json!(removed_instance_paths.len());
     }
     if args.push {
-        let studio = destroy_in_studio(&removed_instance_paths)?;
+        let studio = destroy_in_studio(&removed_targets, kept_moves.as_deref())?;
         let destroyed = studio.get("destroyed").and_then(Value::as_u64).unwrap_or(0);
         let missing = studio
             .get("missing")
@@ -1858,44 +1890,84 @@ fn clear_references_to_removed(
         .context("The edited store left the reference update")
 }
 
-/// Renames the instances at the given paths in the open place as one undo
-/// step, so the push that follows pairs them under their new names;
-/// `renamed` counts them and `missing` lists the paths Studio did not have.
-pub(crate) fn rename_in_studio(pairs: &[(Vec<String>, String)]) -> Result<Value> {
-    let pairs = pairs
-        .iter()
-        .map(|(path, name)| format!("{{ {}, {name:?} }}", luau_string_list(path)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let code = format!(
-        "local function at(segments) local inst = game for _, name in segments do inst = inst:FindFirstChild(name) if not inst then return nil end end return inst end local renamed, missing = 0, {{}} for _, pair in {{{pairs}}} do local inst = at(pair[1]) if inst then if inst.Name ~= pair[2] then inst.Name = pair[2] end renamed += 1 else table.insert(missing, table.concat(pair[1], '.')) end end return {{ renamed = renamed, missing = missing }}"
-    );
-    let result = crate::daemon::daemon_control_request(
-        crate::automation::op::LUAU,
-        None,
-        json!({ "code": code, "edit": true, "bridgeWaitSeconds": 8.0, "bridgePorts": "8781,8782" }),
-        false,
+/// The Edit window chunk that destroys the instances at `paths`. Every path
+/// is found before the first removal: a removal shifts the ordinals of the
+/// same-named siblings after it. `kept` is given for a removal without
+/// descendants: each kept instance with the parent it moves up to, in the
+/// order the store appends them, so the place ends with the store's sibling
+/// order; a child the store does not hold moves to its parent's parent.
+pub(crate) fn destroy_luau(
+    paths: &[EditorInstancePath],
+    kept: Option<&[(EditorInstancePath, EditorInstancePath)]>,
+) -> String {
+    let targets = luau_targets(paths);
+    let (moves, keep) = match kept {
+        Some(kept) => (
+            kept.iter()
+                .map(|(child, parent)| {
+                    format!("{{ {}, {} }}", luau_target(child), luau_target(parent))
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+            "for _, child in inst:GetChildren() do child.Parent = inst.Parent end ",
+        ),
+        None => (String::new(), ""),
+    };
+    format!(
+        "{LUAU_AT}local targets, found = {{{targets}}}, {{}} for i, target in targets do found[i] = at(target) end local kept = {{{moves}}} for _, move in kept do move[1], move[2] = at(move[1]), at(move[2]) end for _, move in kept do if move[1] and move[2] then move[1].Parent = move[2] end end local destroyed, missing = 0, {{}} for i, target in targets do local inst = found[i] if inst then {keep}inst:Destroy() destroyed += 1 else table.insert(missing, label(target)) end end return {{ destroyed = destroyed, missing = missing }}"
     )
-    .context("The store was renamed but Studio could not rename the instance; push the store with `rbx ps`")?;
-    Ok(result
-        .get("results")
-        .and_then(Value::as_array)
-        .and_then(|results| results.first())
-        .cloned()
-        .unwrap_or(Value::Null))
+}
+
+/// The instances a removal without descendants moved up, each with its new
+/// parent, as paths of `before` in the order `before` holds them.
+pub(crate) fn kept_instance_moves(
+    before: &SettingsBytecode,
+    after: &SettingsBytecode,
+    service: &str,
+) -> Vec<(EditorInstancePath, EditorInstancePath)> {
+    let parent_id = |document: &SettingsBytecode, index: usize| {
+        let parent = document.instances[index].parent_index?;
+        Some(document.instances.get(parent)?.settings_id.clone())
+    };
+    let before_by_id = before
+        .instances
+        .iter()
+        .enumerate()
+        .map(|(index, instance)| (instance.settings_id.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let mut moves = Vec::new();
+    for (now, instance) in after.instances.iter().enumerate() {
+        let Some(&index) = before_by_id.get(instance.settings_id.as_str()) else {
+            continue;
+        };
+        let parent = parent_id(after, now);
+        if parent != parent_id(before, index)
+            && let Some(&parent) = parent.as_deref().and_then(|id| before_by_id.get(id))
+        {
+            moves.push((index, parent));
+        }
+    }
+    moves.sort_unstable();
+    let indices = moves
+        .iter()
+        .flat_map(|&(index, parent)| [index, parent])
+        .collect::<Vec<_>>();
+    let paths = build_editor_instance_paths_for_indices(before, service, &indices);
+    moves
+        .into_iter()
+        .filter_map(|(index, parent)| {
+            Some((paths.get(&index)?.clone(), paths.get(&parent)?.clone()))
+        })
+        .collect()
 }
 
 /// Destroys the instances at `paths` in the open place as one undo step;
 /// `destroyed` counts them and `missing` lists the paths Studio no longer had.
-fn destroy_in_studio(paths: &[Vec<String>]) -> Result<Value> {
-    let paths = paths
-        .iter()
-        .map(|path| luau_string_list(path))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let code = format!(
-        "local function at(segments) local inst = game for _, name in segments do inst = inst:FindFirstChild(name) if not inst then return nil end end return inst end local destroyed, missing = 0, {{}} for _, segments in {{{paths}}} do local inst = at(segments) if inst then inst:Destroy() destroyed += 1 else table.insert(missing, table.concat(segments, '.')) end end return {{ destroyed = destroyed, missing = missing }}"
-    );
+fn destroy_in_studio(
+    paths: &[EditorInstancePath],
+    kept: Option<&[(EditorInstancePath, EditorInstancePath)]>,
+) -> Result<Value> {
+    let code = destroy_luau(paths, kept);
     let result = crate::daemon::daemon_control_request(
         crate::automation::op::LUAU,
         None,
@@ -1925,11 +1997,13 @@ pub(crate) fn bytecode_desync_package_link(mut args: BytecodeDesyncPackageLinkAr
     )?;
     let _lock = lock_existing_service_store(&settings_file)?;
     let mut document = SettingsBytecode::read_file(&settings_file)?;
-    let before_document = document.clone();
     let service = bytecode_service_name(&document, &settings_file, &service_hint);
     let service_directory = crate::project::storage::source_directory(&settings_file);
     let service_dir = service_directory.as_path();
-    let source_paths_before = build_editor_source_paths_by_index(&document, &service, service_dir);
+    let sources_before = SourcePathsBefore::capture(
+        &document,
+        &build_editor_source_paths_by_index(&document, &service, service_dir),
+    );
     let target_index =
         resolve_bytecode_selector(&document, &service, &args.selector, "No matching instance")?
             .index;
@@ -1961,8 +2035,7 @@ pub(crate) fn bytecode_desync_package_link(mut args: BytecodeDesyncPackageLinkAr
     let mut writes = BTreeMap::new();
     let mut removals = Vec::new();
     collect_source_path_updates(
-        &before_document,
-        &source_paths_before,
+        &sources_before,
         &document,
         &service,
         service_dir,

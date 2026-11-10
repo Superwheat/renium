@@ -26,8 +26,8 @@ use crate::bytecode::edit::{
 use crate::bytecode::explorer::explorer_daemon_services;
 use crate::bytecode::query::bytecode_parent_index;
 use crate::bytecode::{
-    acquire_settings_file_lock, adopt_single_positional_target, apply_file_mutations,
-    bytecode_input_looks_like_settings_file, collect_source_path_updates,
+    SourcePathsBefore, acquire_settings_file_lock, adopt_single_positional_target,
+    apply_file_mutations, bytecode_input_looks_like_settings_file, collect_source_path_updates,
     ensure_service_store_exists, file_mutation_paths, resolve_bytecode_cli_settings_file,
     resolve_bytecode_selector,
 };
@@ -1915,10 +1915,13 @@ pub(crate) fn bytecode_import_model(args: BytecodeImportModelArgs) -> Result<()>
     ensure_service_store_exists(&settings_file, &service_hint)?;
     let _lock = acquire_settings_file_lock(&settings_file)?;
     let mut document = SettingsBytecode::read_file(&settings_file)?;
-    let before_document = document.clone();
+    let instances_before = document.instances.len();
     let service = bytecode_service_name(&document, &settings_file, &service_hint);
     let service_dir = crate::project::storage::source_directory(&settings_file);
-    let source_paths_before = build_editor_source_paths_by_index(&document, &service, &service_dir);
+    let sources_before = SourcePathsBefore::capture(
+        &document,
+        &build_editor_source_paths_by_index(&document, &service, &service_dir),
+    );
     let target_parent_index = bytecode_parent_index(
         &document,
         args.parent.no_parent,
@@ -1934,7 +1937,7 @@ pub(crate) fn bytecode_import_model(args: BytecodeImportModelArgs) -> Result<()>
         &args.model,
         target_parent_index,
     )?;
-    if document.instances[before_document.instances.len()..]
+    if document.instances[instances_before..]
         .iter()
         .any(|instance| instance.class_name == "PackageLink")
     {
@@ -1949,8 +1952,7 @@ pub(crate) fn bytecode_import_model(args: BytecodeImportModelArgs) -> Result<()>
     }
     let mut removals = Vec::new();
     collect_source_path_updates(
-        &before_document,
-        &source_paths_before,
+        &sources_before,
         &document,
         &service,
         &service_dir,

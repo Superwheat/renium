@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value, json};
 
@@ -237,6 +237,98 @@ pub(crate) fn remove_instances_at_indices(
     let mut removed = remove_set.into_iter().collect::<Vec<_>>();
     removed.sort_unstable();
     Ok(removed)
+}
+
+/// Studio puts an instance that gets a new parent after the children that
+/// parent already has, and a store counts same-named siblings in document
+/// order. This gives `document` the order Studio ends up with: the instances
+/// that have the parent they have in `before` come first and the ones whose
+/// parent changed follow, both in the order `before` holds them, and the
+/// ones `before` does not hold come last. An instance that would then sit
+/// before its parent follows the parent instead, ahead of the parent's later
+/// children. Returns the new index of every old index when the order changed.
+pub(crate) fn order_reparented_instances_last(
+    document: &mut SettingsBytecode,
+    before: &SettingsBytecode,
+) -> Option<Vec<usize>> {
+    fn parent_id(document: &SettingsBytecode, parent: Option<usize>) -> Option<&str> {
+        parent
+            .and_then(|parent| document.instances.get(parent))
+            .map(|parent| parent.settings_id.as_str())
+    }
+    let before_by_id = before
+        .instances
+        .iter()
+        .enumerate()
+        .map(|(index, instance)| {
+            (
+                instance.settings_id.as_str(),
+                (index, parent_id(before, instance.parent_index)),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut order = document
+        .instances
+        .iter()
+        .enumerate()
+        .map(|(index, instance)| {
+            let key = match before_by_id.get(instance.settings_id.as_str()) {
+                Some((before_index, parent)) => (
+                    usize::from(*parent != parent_id(document, instance.parent_index)),
+                    *before_index,
+                ),
+                None => (2, index),
+            };
+            (key, index)
+        })
+        .collect::<Vec<_>>();
+    order.sort_unstable();
+    let count = order.len();
+    let mut placed = vec![false; count];
+    let mut waiting = vec![Vec::new(); count];
+    let mut arranged = Vec::with_capacity(count);
+    for (_, index) in order {
+        match document.instances[index].parent_index {
+            Some(parent) if parent < count && !placed[parent] => waiting[parent].push(index),
+            _ => {
+                let mut next = vec![index];
+                while let Some(index) = next.pop() {
+                    placed[index] = true;
+                    arranged.push(index);
+                    next.extend(std::mem::take(&mut waiting[index]).into_iter().rev());
+                }
+            }
+        }
+    }
+    if arranged.len() != count
+        || arranged
+            .iter()
+            .enumerate()
+            .all(|(new_index, old_index)| new_index == *old_index)
+    {
+        return None;
+    }
+    let mut old_to_new = vec![0usize; count];
+    for (new_index, old_index) in arranged.iter().enumerate() {
+        old_to_new[*old_index] = new_index;
+    }
+    let mut instances = std::mem::take(&mut document.instances)
+        .into_iter()
+        .enumerate()
+        .collect::<Vec<_>>();
+    instances.sort_unstable_by_key(|(old_index, _)| old_to_new[*old_index]);
+    document.instances = instances
+        .into_iter()
+        .map(|(_, mut instance)| {
+            instance.parent_index = instance
+                .parent_index
+                .and_then(|parent| old_to_new.get(parent).copied());
+            instance
+        })
+        .collect();
+    let mapped = old_to_new.iter().copied().map(Some).collect::<Vec<_>>();
+    remap_ref_indices(document, &mapped);
+    Some(old_to_new)
 }
 
 fn remap_ref_indices(document: &mut SettingsBytecode, old_to_new: &[Option<usize>]) {
