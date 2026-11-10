@@ -89,6 +89,41 @@ fn layout_for_source(source: &Path) -> Option<StoreLayout> {
         .cloned()
 }
 
+/// The root of every project this process has loaded.
+pub(crate) fn project_roots() -> Vec<PathBuf> {
+    LAYOUTS.get().map_or_else(Vec::new, |layouts| {
+        layouts
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .map(|layout| layout.project.clone())
+            .collect()
+    })
+}
+
+/// Every store under a project root, service stores and mapped ones, in
+/// path order.
+pub(crate) fn store_files(project: &Path) -> Result<Vec<PathBuf>> {
+    let mut stores = Vec::new();
+    let mut pending = vec![project.join("instances")];
+    while let Some(directory) = pending.pop() {
+        if !directory.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(&directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "renium") {
+                stores.push(path);
+            }
+        }
+    }
+    stores.sort();
+    Ok(stores)
+}
+
 pub(crate) fn instances_root(source: &Path) -> Option<PathBuf> {
     layout_for_source(source).map(|layout| layout.project.join("instances"))
 }

@@ -17,7 +17,7 @@ use walkdir::WalkDir;
 
 use crate::cli::{ProjectSourceArgs, SyncWallyPackagesArgs};
 use crate::project::config::{self, LoadedProject, PROJECT_FILE_NAME};
-use crate::project::experience::resolve_experience_place;
+use crate::project::experience::{find_experience_root, load_experience, resolve_experience_place};
 use crate::system::files::{
     absolutize_for_daemon as absolute_path, atomic_write_file, ends_with_ignore_ascii_case,
     exact_path_key as path_text, write_bytes_if_changed,
@@ -1745,117 +1745,232 @@ pub(crate) fn refresh_agent_instructions(root: &Path) -> Result<()> {
 }
 
 const PROJECT_MAP_FILE: &str = "map.md";
+const PROJECT_MAP_CACHE_FILE: &str = "map-cache.json";
 const PROJECT_MAP_MAX_CHARS: usize = 6000;
 
 /// Writes `RENIUM/map.md`, a compact picture of every store: each service's
 /// instances two levels deep with sibling runs folded (Wall1-8 Part), the
 /// deeper counts, and the common services that have no store yet. Agents read
-/// it instead of spending their first call on `rbx tr`.
+/// it instead of spending their first call on `rbx tr`. The map of a
+/// multi-place project sits at its root and has a section per place.
+///
+/// Each store's line is kept in `.renium/map-cache.json` beside the size and
+/// modification time of the store it came from, so only a store that changed
+/// is decoded again. A line read from a store modified in the moments before
+/// the read is not trusted the next time: a coarse file clock can give a
+/// second write of the same size the same stamp.
 pub(crate) fn refresh_project_map(root: &Path) -> Result<()> {
-    let source = root.join("src");
-    if !source.is_dir() {
-        return Ok(());
+    const CLOCK_GRAIN_NANOS: u128 = 2_500_000_000;
+    let (root, places) = match load_experience(root)? {
+        Some(layout) => (
+            layout.root,
+            layout
+                .places
+                .into_iter()
+                .map(|place| (Some(place.alias), place.root))
+                .collect(),
+        ),
+        None => (root.to_path_buf(), vec![(None, root.to_path_buf())]),
+    };
+    let cache_path = root.join(".renium").join(PROJECT_MAP_CACHE_FILE);
+    let cached = fs::read(&cache_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    let nanos = |time: std::time::SystemTime| {
+        time.duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos())
+    };
+    let mut stores = Map::new();
+    let mut sections = Vec::new();
+    for (alias, place) in places {
+        let mut lines = Vec::new();
+        for store in crate::project::storage::store_files(&place)? {
+            let Ok(metadata) = fs::metadata(&store) else {
+                continue;
+            };
+            let label = store
+                .strip_prefix(place.join("instances"))
+                .unwrap_or(&store)
+                .with_extension("")
+                .iter()
+                .map(|part| part.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(".");
+            let key = store
+                .strip_prefix(&root)
+                .unwrap_or(&store)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let modified = metadata.modified().map_or(0, nanos);
+            let stamp = format!("{}:{modified}", metadata.len());
+            let kept = cached
+                .as_ref()
+                .and_then(|cache| cache.get("stores")?.get(&key))
+                .filter(|entry| {
+                    entry.get("stamp").and_then(Value::as_str) == Some(&stamp)
+                        && entry.get("settled").and_then(Value::as_bool) == Some(true)
+                });
+            let (line, settled) = match kept {
+                Some(entry) => (
+                    entry.get("line").and_then(Value::as_str).map(str::to_owned),
+                    true,
+                ),
+                None => {
+                    let read = nanos(std::time::SystemTime::now());
+                    (
+                        project_map_store_line(&store, &label)?,
+                        read.saturating_sub(modified) > CLOCK_GRAIN_NANOS,
+                    )
+                }
+            };
+            stores.insert(
+                key,
+                json!({ "stamp": stamp, "line": line, "settled": settled }),
+            );
+            if let Some(line) = line {
+                lines.push((label, line));
+            }
+        }
+        sections.push(MapSection {
+            place: alias,
+            lines,
+        });
     }
-    let map = project_map_markdown(&source)?;
     write_bytes_if_changed(
         &root.join(PROJECT_GUIDES_DIRECTORY).join(PROJECT_MAP_FILE),
-        map.as_bytes(),
-    )
+        project_map_markdown(&sections).as_bytes(),
+    )?;
+    let cache = json!({ "stores": stores });
+    if cached.as_ref() != Some(&cache) {
+        write_bytes_if_changed(&cache_path, &serde_json::to_vec(&cache)?)?;
+    }
+    Ok(())
 }
 
-fn project_map_markdown(source: &Path) -> Result<String> {
+/// Refreshes the map of every project this command loaded and of the project
+/// `project` or the current directory belongs to, where the project keeps its
+/// guide copies.
+pub(crate) fn refresh_project_maps(project: Option<&Path>) -> Result<()> {
+    let mut homes = BTreeSet::new();
+    homes.extend(agent_files_root(project).ok().flatten());
+    for root in crate::project::storage::project_roots() {
+        homes.insert(find_experience_root(&root).ok().flatten().unwrap_or(root));
+    }
+    let mut outcome = Ok(());
+    for home in homes {
+        if home.join(PROJECT_GUIDES_DIRECTORY).is_dir() {
+            outcome = outcome.and(refresh_project_map(&home));
+        }
+    }
+    outcome
+}
+
+/// One store's line of the map, cut to the length the whole map is cut to;
+/// `None` when the store has no service root.
+fn project_map_store_line(store: &Path, service: &str) -> Result<Option<String>> {
     use crate::settings::bytecode::SettingsBytecode;
     use crate::settings::tree::{editor_service_root_index, settings_children_by_parent};
-    let mut out = String::from(
-        "# Project map\n\nGenerated by rbx from the stores on every command; names with a shared prefix fold into ranges (Wall1-8). `rbx tr SERVICE PATH --depth N` and `rbx in` show more.\n\n",
+    let document = SettingsBytecode::read_structure_file(store)?;
+    let Some(root_index) = editor_service_root_index(&document, service) else {
+        return Ok(None);
+    };
+    let children = settings_children_by_parent(&document);
+    fn describe_rec(
+        document: &SettingsBytecode,
+        children: &[Vec<usize>],
+        index: usize,
+        depth: usize,
+    ) -> String {
+        let instance = &document.instances[index];
+        let kids = children.get(index).map_or(&[][..], Vec::as_slice);
+        let mut text = format!("{} {}", instance.name, instance.class_name);
+        if kids.is_empty() {
+            return text;
+        }
+        if depth >= 2 {
+            text.push_str(&format!("{{+{}}}", kids.len()));
+            return text;
+        }
+        let folded = fold_sibling_runs(
+            &kids
+                .iter()
+                .map(|&child| describe_rec(document, children, child, depth + 1))
+                .collect::<Vec<_>>(),
+        );
+        text.push_str(&format!("{{{}}}", folded.join(", ")));
+        text
+    }
+    let top = children
+        .get(root_index)
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .map(|&child| describe_rec(&document, &children, child, 1))
+        .collect::<Vec<_>>();
+    let mut line = format!(
+        "- **{service}** ({} instances): {}",
+        document.instances.len().saturating_sub(1),
+        if top.is_empty() {
+            "empty".to_string()
+        } else {
+            fold_sibling_runs(&top).join(", ")
+        }
     );
-    let mut with_store = BTreeSet::new();
-    for service_dir in crate::project::storage::service_directories(source)? {
-        let store = crate::system::files::service_settings_path(&service_dir);
-        if !store.is_file() {
-            continue;
-        }
-        let Some(service) = crate::project::storage::store_service_name(&store) else {
-            continue;
-        };
-        let document = SettingsBytecode::read_file(&store)?;
-        let Some(root_index) = editor_service_root_index(&document, &service) else {
-            continue;
-        };
-        with_store.insert(service.clone());
-        let children = settings_children_by_parent(&document);
-        fn describe_rec(
-            document: &SettingsBytecode,
-            children: &[Vec<usize>],
-            index: usize,
-            depth: usize,
-        ) -> String {
-            let instance = &document.instances[index];
-            let kids = children.get(index).map_or(&[][..], Vec::as_slice);
-            let mut text = format!("{} {}", instance.name, instance.class_name);
-            if kids.is_empty() {
-                return text;
-            }
-            if depth >= 2 {
-                text.push_str(&format!("{{+{}}}", kids.len()));
-                return text;
-            }
-            let folded = fold_sibling_runs(
-                &kids
-                    .iter()
-                    .map(|&child| describe_rec(document, children, child, depth + 1))
-                    .collect::<Vec<_>>(),
-            );
-            text.push_str(&format!("{{{}}}", folded.join(", ")));
-            text
-        }
-        let top = children
-            .get(root_index)
-            .map_or(&[][..], Vec::as_slice)
-            .iter()
-            .map(|&child| describe_rec(&document, &children, child, 1))
-            .collect::<Vec<_>>();
-        out.push_str(&format!(
-            "- **{service}** ({} instances): {}\n",
-            document.instances.len().saturating_sub(1),
-            if top.is_empty() {
-                "empty".to_string()
-            } else {
-                fold_sibling_runs(&top).join(", ")
-            }
-        ));
+    if let Some((cut, _)) = line.char_indices().nth(PROJECT_MAP_MAX_CHARS) {
+        line.truncate(cut);
     }
-    let missing = [
-        "Workspace",
-        "ReplicatedStorage",
-        "ServerScriptService",
-        "ServerStorage",
-        "StarterGui",
-        "StarterPlayer",
-        "StarterPack",
-        "Lighting",
-        "SoundService",
-        "Teams",
-        "ReplicatedFirst",
-    ]
-    .into_iter()
-    .filter(|service| !with_store.contains(*service))
-    .collect::<Vec<_>>();
-    if !missing.is_empty() {
-        out.push_str(&format!(
-            "- No store yet (pulled from Studio on the first command that needs it): {}\n",
-            missing.join(", ")
-        ));
+    Ok(Some(line))
+}
+
+/// One place's part of the map: its alias in an experience, and each
+/// store's label with its line.
+struct MapSection {
+    place: Option<String>,
+    lines: Vec<(String, String)>,
+}
+
+fn project_map_markdown(sections: &[MapSection]) -> String {
+    let mut out = String::from(
+        "# Project map\n\nGenerated by rbx from the stores and refreshed after its commands; names with a shared prefix fold into ranges (Wall1-8). `rbx tr SERVICE PATH --depth N` and `rbx in` show more.\n\n",
+    );
+    for MapSection { place, lines } in sections {
+        if let Some(place) = place {
+            out.push_str(&format!("## {place}\n\n"));
+        }
+        for (_, line) in lines {
+            out.push_str(line);
+            out.push('\n');
+        }
+        let missing = [
+            "Workspace",
+            "ReplicatedStorage",
+            "ServerScriptService",
+            "ServerStorage",
+            "StarterGui",
+            "StarterPlayer",
+            "StarterPack",
+            "Lighting",
+            "SoundService",
+            "Teams",
+            "ReplicatedFirst",
+        ]
+        .into_iter()
+        .filter(|service| !lines.iter().any(|(with_store, _)| with_store == service))
+        .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            out.push_str(&format!(
+                "- No store yet (pulled from Studio on the first command that needs it): {}\n",
+                missing.join(", ")
+            ));
+        }
+        if place.is_some() {
+            out.push('\n');
+        }
     }
-    if out.chars().count() > PROJECT_MAP_MAX_CHARS {
-        let cut = out
-            .char_indices()
-            .nth(PROJECT_MAP_MAX_CHARS)
-            .map_or(out.len(), |(index, _)| index);
+    if let Some((cut, _)) = out.char_indices().nth(PROJECT_MAP_MAX_CHARS) {
         out.truncate(cut);
         out.push_str("\n... (map cut; `rbx tr` shows the rest)\n");
     }
-    Ok(out)
+    out
 }
 
 /// `Wall1 Part, Wall2 Part, Wall3 Part` becomes `Wall1-3 Part` when the
@@ -1916,12 +2031,9 @@ pub(crate) fn ensure_agent_instructions(root: &Path) -> Result<()> {
 /// build's and returns the names of the files whose text changed; a copy
 /// that differs only in line endings (a CRLF checkout) counts as current.
 pub(crate) fn refresh_outdated_agent_instructions(project: Option<&Path>) -> Result<Vec<String>> {
-    let current = env::current_dir().context("Failed to locate the current directory")?;
-    let Some(loaded) = config::try_load_project(project, Some(&current))? else {
+    let Some(root) = agent_files_root(project)? else {
         return Ok(Vec::new());
     };
-    let root = resolve_experience_place(&loaded.root, None)?
-        .map_or(loaded.root, |place| place.experience_root);
     let same_text = |path: &Path, expected: &[u8]| {
         fs::read(path).is_ok_and(|contents| without_carriage_returns(&contents) == expected)
     };
@@ -1951,6 +2063,19 @@ pub(crate) fn refresh_outdated_agent_instructions(project: Option<&Path>) -> Res
     }
     refresh_agent_instructions(&root)?;
     Ok(changed)
+}
+
+/// The folder that holds the guide copies and the map of the project
+/// `project` or the current directory belongs to.
+fn agent_files_root(project: Option<&Path>) -> Result<Option<PathBuf>> {
+    let current = env::current_dir().context("Failed to locate the current directory")?;
+    let Some(loaded) = config::try_load_project(project, Some(&current))? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        resolve_experience_place(&loaded.root, None)?
+            .map_or(loaded.root, |place| place.experience_root),
+    ))
 }
 
 fn without_carriage_returns(bytes: &[u8]) -> Vec<u8> {

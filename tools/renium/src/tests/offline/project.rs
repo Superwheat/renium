@@ -1254,3 +1254,167 @@ fn import_path_reports_store_conflicts_bad_inputs_and_mapped_destinations() {
     );
     let _ = fs::remove_dir_all(outside);
 }
+
+#[test]
+fn the_project_map_follows_the_stores_and_decodes_only_a_changed_store() {
+    let fx = Fixture::new("project-map");
+    let map_path = fx.root.join("RENIUM").join("map.md");
+    let cache_path = fx.root.join(".renium").join("map-cache.json");
+    let refresh = || crate::project::workflows::refresh_project_map(&fx.root).unwrap();
+    let map = || fs::read_to_string(&map_path).unwrap();
+    let add = |service: &str, name: &str| {
+        fx.text(&[
+            "ba",
+            "-f",
+            &fx.store_arg(service),
+            "-n",
+            name,
+            "-c",
+            "Folder",
+        ])
+        .ok();
+    };
+
+    refresh();
+    let first = map();
+    for service in ["Workspace", "ReplicatedStorage", "ServerScriptService"] {
+        assert!(first.contains(&format!("- **{service}** (")), "{first}");
+    }
+    assert!(first.contains("StarterGui"), "{first}");
+    assert!(!first.contains("MapProbe"), "{first}");
+
+    add("Workspace", "MapProbe");
+    refresh();
+    assert!(map().contains("MapProbe"), "{}", map());
+
+    let key = "instances/ReplicatedStorage.renium";
+    let stamp_store = |seconds_from_now: i64| {
+        let now = std::time::SystemTime::now();
+        let offset = std::time::Duration::from_secs(seconds_from_now.unsigned_abs());
+        fs::File::options()
+            .write(true)
+            .open(fx.store("ReplicatedStorage"))
+            .unwrap()
+            .set_modified(if seconds_from_now < 0 {
+                now - offset
+            } else {
+                now + offset
+            })
+            .unwrap();
+    };
+    let replace_cached_line = || {
+        let mut cache: Value = serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+        cache["stores"][key]["line"] = json!("- **ReplicatedStorage** kept line");
+        fs::write(&cache_path, serde_json::to_vec(&cache).unwrap()).unwrap();
+        cache["stores"][key]["settled"].clone()
+    };
+
+    stamp_store(60);
+    refresh();
+    assert_eq!(replace_cached_line(), json!(false));
+    refresh();
+    assert!(!map().contains("kept line"), "{}", map());
+
+    stamp_store(-60);
+    refresh();
+    assert_eq!(replace_cached_line(), json!(true));
+    refresh();
+    assert!(map().contains("kept line"), "{}", map());
+
+    add("ReplicatedStorage", "MapChanged");
+    refresh();
+    let changed = map();
+    assert!(!changed.contains("kept line"), "{changed}");
+    assert!(changed.contains("MapChanged"), "{changed}");
+
+    fs::remove_file(&map_path).unwrap();
+    refresh();
+    assert_eq!(map(), changed);
+
+    fs::write(&cache_path, b"not json").unwrap();
+    fs::write(&map_path, "edited by hand").unwrap();
+    refresh();
+    assert_eq!(map(), changed);
+}
+
+#[test]
+fn the_project_map_of_an_experience_has_a_section_per_place_and_lists_mapped_stores() {
+    let root = temp_dir("offline-project-map-experience");
+    fs::write(
+        root.join("renium.experience.json"),
+        r#"{"gameId": 1, "places": {"arena": {"placeId": 2, "root": "arena"}, "lobby": {"placeId": 3, "root": "lobby"}}}"#,
+    )
+    .unwrap();
+    let write = |relative: &str, document: &SettingsBytecode| {
+        let store = root.join(relative);
+        fs::create_dir_all(store.parent().unwrap()).unwrap();
+        document.write_file(&store).unwrap();
+    };
+    write("arena/instances/Workspace.renium", &workspace_document());
+    write(
+        "arena/instances/ReplicatedStorage/Shared.renium",
+        &replicated_document(),
+    );
+    write(
+        "lobby/instances/ServerScriptService.renium",
+        &server_document(),
+    );
+
+    crate::project::workflows::refresh_project_map(&root.join("lobby")).unwrap();
+    let map = fs::read_to_string(root.join("RENIUM").join("map.md")).unwrap();
+    let position = |needle: &str| {
+        map.find(needle)
+            .unwrap_or_else(|| panic!("{needle}: {map}"))
+    };
+    let arena = position("## arena");
+    let lobby = position("## lobby");
+    assert!(arena < position("- **ReplicatedStorage.Shared** ("));
+    assert!(position("- **ReplicatedStorage.Shared** (") < position("- **Workspace** ("));
+    assert!(position("- **Workspace** (") < lobby);
+    assert!(lobby < position("- **ServerScriptService** ("));
+    assert!(!root.join("lobby").join("RENIUM").exists());
+
+    let cache: Value =
+        serde_json::from_slice(&fs::read(root.join(".renium").join("map-cache.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        cache["stores"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        [
+            "arena/instances/ReplicatedStorage/Shared.renium",
+            "arena/instances/Workspace.renium",
+            "lobby/instances/ServerScriptService.renium",
+        ]
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn every_project_a_command_loads_is_known_to_the_map_refresh() {
+    let fx = Fixture::new("project-map-roots");
+    let other = temp_dir("offline-project-map-other");
+    fs::write(
+        other.join("renium.project.jsonc"),
+        "{\n  \"schemaVersion\": 1,\n  \"sourceRoot\": \"scripts\"\n}\n",
+    )
+    .unwrap();
+    fs::create_dir_all(other.join("instances")).unwrap();
+    workspace_document()
+        .write_file(&other.join("instances").join("Workspace.renium"))
+        .unwrap();
+    run_at(
+        &fx.root,
+        CaptureMode::Text,
+        &["tr", "Workspace", "-r", &other.to_string_lossy()],
+    )
+    .ok();
+    let roots = crate::project::storage::project_roots();
+    for root in [&fx.root, &other] {
+        let root = crate::system::files::absolutize_for_daemon(root);
+        assert!(roots.contains(&root), "{root:?} not in {roots:?}");
+    }
+    let _ = fs::remove_dir_all(other);
+}

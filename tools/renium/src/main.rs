@@ -254,7 +254,8 @@ fn run_cli() -> Result<()> {
     if is_agent_launcher() && checks_agent_update(&cli.command) {
         update::check_agent_update();
     }
-    if !is_plugin_child() && checks_agent_instructions(&cli.command) {
+    let keeps_agent_files = !is_plugin_child() && checks_agent_instructions(&cli.command);
+    if keeps_agent_files {
         refresh_agent_instructions(cli.project.as_deref());
     }
 
@@ -269,7 +270,17 @@ fn run_cli() -> Result<()> {
             format_args!("[renium] Global Studio audio could not resume: {error:#}"),
         );
     }
-    cli::dispatch::dispatch(cli.command, cli.project.as_deref())
+    let project = cli.project.clone();
+    let result = cli::dispatch::dispatch(cli.command, project.as_deref());
+    if keeps_agent_files
+        && let Err(error) = project::workflows::refresh_project_maps(project.as_deref())
+    {
+        log_global(
+            4,
+            format_args!("[renium] the project map was not refreshed: {error:#}"),
+        );
+    }
+    result
 }
 
 /// Offline commands never touch Studio audio: a syntax check, a bug report
