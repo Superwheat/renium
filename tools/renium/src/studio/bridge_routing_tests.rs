@@ -323,7 +323,13 @@ fn a_failed_bind_leaves_the_ports_bound_before_it_free() {
         .unwrap();
     let ports = [free.port(), taken.local_addr().unwrap().port()];
     assert!(BridgeServer::listen_configured("127.0.0.1", &ports, 0.0, false, false).is_err());
-    TcpListener::bind(free).unwrap();
+    // A process another test is spawning holds a copy of the closed listener
+    // until it execs; an accept loop would hold the port for good.
+    let started = Instant::now();
+    while let Err(error) = TcpListener::bind(free) {
+        assert!(started.elapsed() < Duration::from_secs(5), "{error}");
+        thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn listening_fixture() -> BridgeServer {
