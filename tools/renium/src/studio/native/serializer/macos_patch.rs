@@ -1,5 +1,13 @@
 //! Signing changes the launcher's signature and __LINKEDIT sizes. Compare all
 //! remaining Mach-O bytes, including code, constants, UUID and load commands.
+pub(super) fn is_studio_engine(path: &std::path::Path) -> bool {
+    // The installed launcher execs the renamed engine in the same bundle.
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("RobloxStudio" | "RobloxStudio.bin")
+    )
+}
+
 pub(super) fn launcher_payload(bytes: &[u8]) -> Option<Vec<u8>> {
     let u32_at = |at: usize| Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?));
     if bytes.len() > 4 * 1024 * 1024 || u32_at(0)? != 0xfeed_facf {
@@ -47,6 +55,23 @@ pub(super) fn launcher_payload(bytes: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn studio_identity_accepts_the_engine_behind_the_launcher() {
+        for name in ["RobloxStudio", "RobloxStudio.bin"] {
+            assert!(is_studio_engine(
+                &std::path::Path::new("/Users/test/Applications/RobloxStudio.app/Contents/MacOS")
+                    .join(name)
+            ));
+        }
+        for name in [
+            "RobloxStudioInstaller",
+            "RobloxStudio.bin.backup",
+            "RobloxPlayer",
+        ] {
+            assert!(!is_studio_engine(std::path::Path::new(name)));
+        }
+    }
+
     fn image(signature_len: u32) -> Vec<u8> {
         let mut bytes = vec![0; 160 + signature_len as usize];
         for (at, value) in [

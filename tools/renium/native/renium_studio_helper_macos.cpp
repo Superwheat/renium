@@ -79,13 +79,6 @@ struct Response
     char error[512];
 };
 
-struct StudioShared
-{
-    void* value;
-    void* owner;
-    ~StudioShared() {}
-};
-
 struct StudioQString
 {
     void* data;
@@ -1007,24 +1000,6 @@ static void ReleaseQString(StudioQString& value)
     value.data = nullptr;
 }
 
-static void ReleaseShared(StudioShared& value)
-{
-    if (!value.owner)
-        return;
-    auto bytes = reinterpret_cast<unsigned char*>(value.owner);
-    auto strong = reinterpret_cast<std::atomic<std::int64_t>*>(bytes + 8);
-    if (strong->fetch_sub(1, std::memory_order_acq_rel) == 0)
-    {
-        const auto vtable = *reinterpret_cast<void***>(value.owner);
-        reinterpret_cast<void (*)(void*)>(vtable[2])(value.owner);
-        auto weak = reinterpret_cast<std::atomic<std::int64_t>*>(bytes + 16);
-        if (weak->fetch_sub(1, std::memory_order_acq_rel) == 0)
-            reinterpret_cast<void (*)(void*)>(vtable[3])(value.owner);
-    }
-    value.value = nullptr;
-    value.owner = nullptr;
-}
-
 static std::string UuidText(const unsigned char* uuid)
 {
     char output[33]{};
@@ -1115,7 +1090,10 @@ static Response Serialize(
         return response;
     }
     using FromUtf8 = StudioQString (*)(const char*, int);
-    using Factory = StudioShared (*)(void*, const StudioQString*, void**, const bool*);
+    // The locator proves libc++'s std::allocator shared_ptr factory. Let the
+    // same system C++ runtime release it, including weak references, instead
+    // of guessing a control-block destructor slot.
+    using Factory = std::shared_ptr<void> (*)(void*, const StudioQString*, void**, const bool*);
     using Execute = void (*)(void*);
     const auto fromUtf8 = reinterpret_cast<FromUtf8>(
         dlsym(RTLD_DEFAULT, "_ZN7QString15fromUtf8_helperEPKci"));
@@ -1132,15 +1110,15 @@ static Response Serialize(
         &output,
         &dataModel,
         &direct);
-    if (!state.value || !state.owner)
+    if (!state || state.use_count() <= 0)
     {
         ReleaseQString(output);
         response.status = 5;
         SetError(response, "Studio serializer state creation failed");
         return response;
     }
-    reinterpret_cast<Execute>(executeAddress)(state.value);
-    ReleaseShared(state);
+    reinterpret_cast<Execute>(executeAddress)(state.get());
+    state.reset();
     ReleaseQString(output);
     struct stat metadata{};
     if (stat(path.c_str(), &metadata) != 0 || metadata.st_size <= 0)

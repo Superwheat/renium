@@ -290,6 +290,11 @@ pub fn capture_window_rgba(window: &StudioWindow) -> Result<(u32, u32, Vec<u8>)>
     platform::capture_window_rgba(&window.handle)
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn preflight_capture_access() -> Result<()> {
+    platform::preflight_capture_access()
+}
+
 #[cfg(windows)]
 pub fn post_mouse_click(
     window: &StudioWindow,
@@ -2052,6 +2057,7 @@ mod platform {
     const K_CG_BITMAP_BYTE_ORDER_32_BIG: u32 = 4 << 12;
     #[link(name = "CoreGraphics", kind = "framework")]
     unsafe extern "C" {
+        fn CGPreflightScreenCaptureAccess() -> bool;
         fn CGWindowListCopyWindowInfo(option: u32, relative_to: u32) -> CFArrayRef;
         fn CGRectMakeWithDictionaryRepresentation(dict: CFDictionaryRef, rect: *mut CGRect)
         -> bool;
@@ -2949,7 +2955,17 @@ mod platform {
         })
     }
 
+    pub fn preflight_capture_access() -> Result<()> {
+        // Never open a TCC prompt from a compatibility probe or an unattended capture.
+        anyhow::ensure!(
+            unsafe { CGPreflightScreenCaptureAccess() },
+            "macOS Screen Recording permission is not granted to this Renium process; only the owner can allow it"
+        );
+        Ok(())
+    }
+
     pub fn capture_window_png(handle: &WindowHandle, path: &std::path::Path) -> Result<(u32, u32)> {
+        preflight_capture_access()?;
         const K_CG_WINDOW_LIST_OPTION_INCLUDING_WINDOW: u32 = 1 << 3;
         const K_CG_WINDOW_IMAGE_BOUNDS_IGNORE_FRAMING: u32 = 1 << 0;
         let null_rect = CGRect {
@@ -3006,6 +3022,7 @@ mod platform {
     }
 
     pub fn capture_window_rgba(handle: &WindowHandle) -> Result<(u32, u32, Vec<u8>)> {
+        preflight_capture_access()?;
         const K_CG_WINDOW_LIST_OPTION_INCLUDING_WINDOW: u32 = 1 << 3;
         const K_CG_WINDOW_IMAGE_BOUNDS_IGNORE_FRAMING: u32 = 1 << 0;
         let null_rect = CGRect {

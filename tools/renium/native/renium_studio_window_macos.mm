@@ -117,7 +117,10 @@ void ReniumStudioAction(const std::string& payload, std::vector<unsigned char>& 
     if (payload.size() != sizeof(Action)) throw std::runtime_error("Truncated Mac Studio action");
     __block Action r{};
     std::memcpy(&r, payload.data(), sizeof(r));
-    if (r.version != 1 || r.size != sizeof(r) || !r.window || !r.name[0] || r.name[95])
+    // Version 2 is a read-only lookup. Older helpers reject it before looking
+    // up or activating an action, so a compatibility probe cannot start Play.
+    const bool probe = r.version == 2;
+    if ((!probe && r.version != 1) || r.size != sizeof(r) || !r.window || !r.name[0] || r.name[95])
         throw std::runtime_error("Invalid Mac Studio action");
     __block std::string error;
     dispatch_sync(dispatch_get_main_queue(), ^{
@@ -138,8 +141,10 @@ void ReniumStudioAction(const std::string& payload, std::vector<unsigned char>& 
             r.found = static_cast<std::uint32_t>(data->end - data->begin);
             if (r.found != 1) throw std::runtime_error("Studio action does not have one window owner");
             auto action = data->items[data->begin];
-            if (!enabled(action)) throw std::runtime_error("Studio action is disabled right now");
-            activate(action, 0); // QAction::Trigger
+            if (!probe) {
+                if (!enabled(action)) throw std::runtime_error("Studio action is disabled right now");
+                activate(action, 0); // QAction::Trigger
+            }
         } catch (const std::exception& failure) { error = failure.what(); }
     });
     if (!error.empty()) throw std::runtime_error(error);

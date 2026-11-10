@@ -6,6 +6,28 @@ pub(crate) struct NativeMacStudioAction {
 }
 
 impl NativeMacStudioAction {
+    pub(crate) fn probe(pid: u32) -> Result<serde_json::Value> {
+        let (window, window_title) = Self::window(pid)?;
+        let memory = Memory::for_process(pid, Duration::from_secs(5))?;
+        let mut request = vec![0; 112];
+        // Version 1 always triggers; never use it in the read-only probe.
+        put32(&mut request, 0, 2);
+        put32(&mut request, 4, 112);
+        put32(&mut request, 8, u32::try_from(window)?);
+        let name = b"simulationPlayAction";
+        request[16..16 + name.len()].copy_from_slice(name);
+        let response = memory.request(15, &request, "")?;
+        anyhow::ensure!(
+            response.len() == 112
+                && read_u32(&response, 0) == Some(2)
+                && read_u32(&response, 8) == u32::try_from(window).ok()
+                && read_u32(&response, 12) == Some(1),
+            "Invalid read-only Studio action receipt"
+        );
+        Ok(serde_json::json!({"window":window,"title":window_title,
+            "action":"simulationPlayAction","found":1,"activated":false}))
+    }
+
     pub(crate) fn trigger_action(
         pid: u32,
         action: &str,

@@ -1,5 +1,7 @@
 #[cfg(any(target_os = "macos", test))]
 mod arm64_functions;
+#[cfg(any(target_os = "macos", test))]
+mod arm64_serializer;
 #[cfg(any(windows, target_os = "macos", test))]
 mod functions;
 #[cfg(target_os = "macos")]

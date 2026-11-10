@@ -63,23 +63,34 @@ pub(super) fn probe_operation(
             }
             Ok(json!({"contract":"process-local Core Audio interface","sessions":status.sessions}))
         }
-        NativeOperation::Input | NativeOperation::ViewportCapture => {
+        NativeOperation::Input => {
+            bail!("Native PID-scoped input is not implemented on macOS; use Studio bridge input")
+        }
+        NativeOperation::ViewportCapture => {
             let executable = process_executable_path(pid)?;
             anyhow::ensure!(
-                executable.file_name().and_then(|name| name.to_str()) == Some("RobloxStudio"),
+                super::macos_patch::is_studio_engine(&executable),
                 "Target is not Roblox Studio"
             );
-            Ok(json!({"executable":executable,"contract":"PID-scoped macOS window APIs"}))
+            let window = crate::studio::input::window_for_pid(pid, None)?;
+            crate::studio::input::preflight_capture_access()?;
+            Ok(
+                json!({"executable":executable,"window":window.label,"contract":"PID-scoped macOS window APIs"}),
+            )
         }
         NativeOperation::StudioActions => {
-            bail!("Native Studio menu actions are unavailable on macOS")
+            properties::studio_action::NativeMacStudioAction::probe(pid)
         }
         NativeOperation::UndoSelection => undo_selection::probe(pid, title),
-        NativeOperation::ServiceReader
-        | NativeOperation::AttributeObservation
-        | NativeOperation::PackageActions => {
-            bail!("This macOS operation has no complete read-only compatibility probe")
-        }
+        NativeOperation::ServiceReader => bail!(
+            "Native service deserialization is not implemented on macOS; use plugin binary import"
+        ),
+        NativeOperation::AttributeObservation => bail!(
+            "Native attribute observation is not implemented on macOS; use plugin observation"
+        ),
+        NativeOperation::PackageActions => bail!(
+            "Native macOS package actions have no verified structural bindings; use the plugin package path"
+        ),
     }
 }
 
@@ -538,60 +549,8 @@ fn find_pattern_in_address_range(
         .context("Studio serializer pattern address is invalid")
 }
 
-fn trace_arm64(image: &MachImage<'_>, log_xref: u64) -> Result<SerializerTrace> {
-    let execute_pattern = [
-        0xf4, 0x4f, 0xbe, 0xa9, 0xfd, 0x7b, 0x01, 0xa9, 0xfd, 0x43, 0x00, 0x91, 0xf3, 0x03, 0x00,
-        0xaa, 0x00, 0xe0, 0x05, 0x91,
-    ];
-    let execute = find_pattern_in_address_range(
-        image,
-        log_xref.saturating_sub(0x3000),
-        log_xref,
-        &execute_pattern,
-        "execution entry",
-    )?;
-    let allocation_pattern = [0x00, 0x3b, 0x80, 0x52];
-    let allocation = find_pattern_in_address_range(
-        image,
-        execute + 0x1000,
-        execute + 0x4000,
-        &allocation_pattern,
-        "state allocation",
-    )?;
-    let factory_pattern = [
-        0xf8, 0x5f, 0xbc, 0xa9, 0xf6, 0x57, 0x01, 0xa9, 0xf4, 0x4f, 0x02, 0xa9, 0xfd, 0x7b, 0x03,
-        0xa9,
-    ];
-    let factory = find_pattern_in_address_range(
-        image,
-        allocation.saturating_sub(0x80),
-        allocation + 0x20,
-        &factory_pattern,
-        "state factory",
-    )?;
-    let factory_offset = image
-        .text_offset_for_address(factory)
-        .context("Studio serializer state factory is outside __text")?;
-    let factory_bytes = image
-        .bytes
-        .get(factory_offset..factory_offset + 128)
-        .context("Studio serializer state factory is truncated")?;
-    if !factory_bytes
-        .windows(8)
-        .any(|window| window == [0x81, 0x62, 0x00, 0x91, 0x61, 0x52, 0x00, 0xa9])
-    {
-        bail!("Studio serializer state factory result shape changed");
-    }
-    Ok(SerializerTrace {
-        factory_rva: factory
-            .checked_sub(image.image_base)
-            .context("Studio serializer state factory precedes __TEXT")?,
-        execute_rva: execute
-            .checked_sub(image.image_base)
-            .context("Studio serializer execution entry precedes __TEXT")?,
-        image_uuid: image.image_uuid,
-    })
-}
+#[path = "macos_serializer.rs"]
+mod serializer_trace;
 
 fn trace_x86(image: &MachImage<'_>, log_xref: u64) -> Result<SerializerTrace> {
     let execute_pattern = [
@@ -687,7 +646,7 @@ fn trace_studio(path: &Path) -> Result<SerializerTrace> {
         .address_for_offset(log_offset)
         .context("Studio local serializer log marker has no virtual address")?;
     let trace = match image.cpu {
-        CPU_TYPE_ARM64 => trace_arm64(&image, arm64_string_xref(&image, log_address)?)?,
+        CPU_TYPE_ARM64 => serializer_trace::trace(&image, arm64_string_xref(&image, log_address)?)?,
         CPU_TYPE_X86_64 => trace_x86(&image, x86_string_xref(&image, log_address)?)?,
         _ => unreachable!(),
     };
