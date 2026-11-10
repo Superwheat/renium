@@ -19,7 +19,7 @@ renium-plugin-sdk = { path = "../renium-plugin-sdk" }
 full_moon = { version = "2.2.0", features = ["luau"] }
 mlua = { version = "0.11.6", features = ["luau", "vendored", "serialize", "error-send"] }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.145"
+serde_json = { version = "1.0.145", features = ["float_roundtrip"] }
 ureq = { version = "=2.10.1", features = ["json", "proxy-from-env"] }
 url = "=2.4.1"
 rayon = "1.11.0"

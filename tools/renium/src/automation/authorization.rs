@@ -287,6 +287,18 @@ mod tests {
     }
 
     #[test]
+    fn a_float_parameter_with_seventeen_digits_survives_the_wire() {
+        let key = SigningKey::from_bytes(&[17; 32]);
+        let authority = Authority::new(key.verifying_key());
+        let mut request = request();
+        request.p = json!({ "timeout": 15.200000000000001_f64, "wait": 0.1_f64 + 0.2_f64 });
+        let wire = serde_json::to_string(&sign(&request, &key).unwrap()).unwrap();
+        authority
+            .verify(&mut serde_json::from_str(&wire).unwrap())
+            .unwrap();
+    }
+
+    #[test]
     fn authorization_binds_all_parameters_and_rejects_unsigned_forged_and_replayed_requests() {
         let key = SigningKey::from_bytes(&[17; 32]);
         let authority = Authority::new(key.verifying_key());
