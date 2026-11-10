@@ -52,30 +52,23 @@ fn message(request: &Request, proof: &Proof) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// The request as the daemon reads it back from the wire. A float that needs
+/// The request as the daemon reads it from the wire. A float that needs
 /// seventeen digits can come back one digit off, and the daemon verifies the
-/// signature over what it read, so that form is what is signed and sent.
+/// signature over what it read, so that reading is what is signed while the
+/// request itself is sent unchanged. Some floats never settle under repeated
+/// readings, so the one reading the daemon makes is the only one that counts.
 fn as_read_back(request: &Request) -> Result<Request> {
-    let mut text = serde_json::to_string(request)?;
-    for _ in 0..4 {
-        let read: Request = serde_json::from_str(&text)?;
-        let again = serde_json::to_string(&read)?;
-        if again == text {
-            return Ok(read);
-        }
-        text = again;
-    }
-    Ok(serde_json::from_str(&text)?)
+    Ok(serde_json::from_str(&serde_json::to_string(request)?)?)
 }
 
 fn sign(request: &Request, key: &SigningKey) -> Result<serde_json::Value> {
-    let request = &as_read_back(request)?;
     let mut proof = Proof {
         time: crate::app::timing::current_millis(),
         nonce: random_id()?,
         signature: String::new(),
     };
-    proof.signature = base64::encode(key.sign(&message(request, &proof)?).to_bytes());
+    let read = as_read_back(request)?;
+    proof.signature = base64::encode(key.sign(&message(&read, &proof)?).to_bytes());
     let mut wire = serde_json::to_value(request)?;
     wire["p"][PROOF_FIELD] = serde_json::to_value(proof)?;
     Ok(wire)
@@ -313,6 +306,25 @@ mod tests {
         authority
             .verify(&mut serde_json::from_str(&wire).unwrap())
             .unwrap();
+    }
+
+    #[test]
+    fn a_float_that_never_settles_under_rereading_survives_the_wire() {
+        let key = SigningKey::from_bytes(&[17; 32]);
+        let authority = Authority::new(key.verifying_key());
+        for value in [1.140216799210364e-11_f64, 4.3449509095265914e216_f64] {
+            let text = serde_json::to_string(&value).unwrap();
+            let once: f64 = serde_json::from_str(&text).unwrap();
+            let twice: f64 = serde_json::from_str(&serde_json::to_string(&once).unwrap()).unwrap();
+            assert!(once != value && twice == value, "{value} is no two-cycle");
+            for sent in [value, once] {
+                let mut request = request();
+                request.p = json!({ "inDelay": sent });
+                let wire = serde_json::to_string(&sign(&request, &key).unwrap()).unwrap();
+                let mut received: Request = serde_json::from_str(&wire).unwrap();
+                authority.verify(&mut received).unwrap();
+            }
+        }
     }
 
     #[test]
