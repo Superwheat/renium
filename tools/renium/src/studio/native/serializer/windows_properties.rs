@@ -1706,13 +1706,18 @@ pub(super) fn resolve_path(
     let mut children = model.roots.clone();
     let mut ancestors = Vec::with_capacity(segments.len());
     for (index, name) in segments.iter().enumerate() {
-        let matches = children
-            .iter()
-            .copied()
-            .filter(|entry| {
-                read_instance_name(memory, entry.instance, model.layout).as_deref() == Some(name)
-            })
-            .collect::<Vec<_>>();
+        let matches = if index == 0 {
+            matching_roots(memory, model, name)?
+        } else {
+            children
+                .iter()
+                .copied()
+                .filter(|entry| {
+                    read_instance_name(memory, entry.instance, model.layout).as_deref()
+                        == Some(name)
+                })
+                .collect::<Vec<_>>()
+        };
         let entry = match ordinals.get(index) {
             Some(ordinal) => matches.get(ordinal - 1).copied(),
             None if matches.len() == 1 => Some(matches[0]),

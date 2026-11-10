@@ -1,5 +1,149 @@
 use super::*;
 
+// Real ReadProcessMemory calls against owned instance-layout fixtures. No
+// Studio process or native write authorization is needed for path resolution.
+#[derive(Default)]
+struct PathFixture(Vec<Box<[u8]>>);
+
+impl PathFixture {
+    fn bytes(&mut self, bytes: Vec<u8>) -> usize {
+        let bytes = bytes.into_boxed_slice();
+        let pointer = bytes.as_ptr() as usize;
+        self.0.push(bytes);
+        pointer
+    }
+
+    fn words(&mut self, words: &[usize]) -> usize {
+        self.bytes(words.iter().flat_map(|word| word.to_le_bytes()).collect())
+    }
+
+    fn string(&mut self, value: &str) -> usize {
+        let data = self.bytes(value.as_bytes().to_vec());
+        self.words(&[data, 0, value.len(), value.len().max(16)])
+    }
+
+    fn instance(&mut self, name: &str, class: &str, children: &[SharedEntry]) -> SharedEntry {
+        let name = self.string(name);
+        let class = self.string(class);
+        let descriptor = self.words(&[0, class]);
+        let children = if children.is_empty() {
+            0
+        } else {
+            let entries = children
+                .iter()
+                .flat_map(|child| [child.instance, child.owner])
+                .collect::<Vec<_>>();
+            let start = self.words(&entries);
+            let end = start + entries.len() * 8;
+            self.words(&[start, end, end])
+        };
+        let instance = self.words(&[descriptor, name, children]);
+        SharedEntry {
+            instance,
+            owner: instance,
+        }
+    }
+
+    fn model(roots: &[SharedEntry]) -> ActiveDataModel {
+        ActiveDataModel {
+            outer: 0,
+            owner: 0,
+            roots: roots.to_vec(),
+            layout: InstanceLayout {
+                data_model_instance: 0,
+                self_pointer: 0,
+                class_descriptor: 0,
+                name: 8,
+                children: 16,
+            },
+        }
+    }
+}
+
+#[test]
+fn property_paths_use_service_class_before_display_name() -> Result<()> {
+    let memory = ProcessMemory::open_read_only(std::process::id())?;
+    let mut fixture = PathFixture::default();
+    let shadow = fixture.instance("ServerStorage", "Folder", &[]);
+    for name in ["Vault", "ServerStorage"] {
+        let service = fixture.instance(name, "ServerStorage", &[]);
+        let model = PathFixture::model(&[shadow, service]);
+        let path = ["ServerStorage".into()];
+        for ordinals in [&[][..], &[1][..]] {
+            let resolved = properties::resolve_path(&memory, &model, &path, ordinals)?;
+            assert_eq!(
+                resolved[0].instance, service.instance,
+                "display name {name}"
+            );
+        }
+        assert!(properties::resolve_path(&memory, &model, &path, &[2]).is_err());
+    }
+    let shadow_only = PathFixture::model(&[shadow]);
+    assert!(
+        properties::resolve_path(&memory, &shadow_only, &["ServerStorage".into()], &[]).is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn service_capture_does_not_select_a_namesake_folder() -> Result<()> {
+    let memory = ProcessMemory::open_read_only(std::process::id())?;
+    let mut fixture = PathFixture::default();
+    let shadow = fixture.instance("Workspace", "Folder", &[]);
+    for name in ["World", "Workspace"] {
+        let service = fixture.instance(name, "Workspace", &[]);
+        let mut model = PathFixture::model(&[shadow, service]);
+        select_service_root(&memory, &mut model, "Workspace")?;
+        assert_eq!(model.roots[0].instance, service.instance);
+    }
+    assert!(select_service_root(&memory, &mut PathFixture::model(&[shadow]), "Workspace").is_err());
+    Ok(())
+}
+
+#[test]
+fn package_paths_use_service_class_and_keep_descendant_ordinals() -> Result<()> {
+    let memory = ProcessMemory::open_read_only(std::process::id())?;
+    let mut fixture = PathFixture::default();
+    let link = fixture.instance("PackageLink", "PackageLink", &[]);
+    let first = fixture.instance("Kit", "Model", &[link]);
+    let second = fixture.instance("Kit", "Model", &[link]);
+    let shadow = fixture.instance("ServerStorage", "Folder", &[first]);
+    let service = fixture.instance("Vault", "ServerStorage", &[first, second]);
+    let model = PathFixture::model(&[shadow, service]);
+    let mut target = super::super::PackageTarget {
+        path_segments: vec!["ServerStorage".into(), "Kit".into()],
+        path_ordinals: vec![1, 2],
+        expected_version: 0,
+    };
+    let resolved = resolve_package_target(&memory, &model, &target)?;
+    assert_eq!(resolved.root.instance, second.instance);
+    assert_eq!(resolved.link.instance, link.instance);
+    for ordinals in [vec![], vec![1, 0], vec![1, 3], vec![0, 1], vec![2, 1]] {
+        target.path_ordinals = ordinals;
+        assert!(resolve_package_target(&memory, &model, &target).is_err());
+    }
+    target.path_ordinals = vec![1, 1];
+    assert!(resolve_package_target(&memory, &PathFixture::model(&[shadow]), &target).is_err());
+    Ok(())
+}
+
+#[test]
+fn ordinary_native_paths_keep_names_and_positive_ordinals() -> Result<()> {
+    let memory = ProcessMemory::open_read_only(std::process::id())?;
+    let mut fixture = PathFixture::default();
+    let first = fixture.instance("Workspace", "Folder", &[]);
+    let second = fixture.instance("Workspace", "Folder", &[]);
+    let root = fixture.instance("Loose", "Folder", &[first, second]);
+    let model = PathFixture::model(&[root]);
+    let path = ["Loose".into(), "Workspace".into()];
+    let resolved = properties::resolve_path(&memory, &model, &path, &[1, 2])?;
+    assert_eq!(resolved[1].instance, second.instance);
+    for ordinals in [&[][..], &[1, 0], &[1, 3], &[1]] {
+        assert!(properties::resolve_path(&memory, &model, &path, ordinals).is_err());
+    }
+    Ok(())
+}
+
 #[test]
 fn native_gate_rejects_writes_allocations_and_both_thread_ownership_modes() {
     // Invalid handles/addresses must never reach a Windows mutation API.

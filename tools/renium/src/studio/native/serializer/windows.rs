@@ -1764,32 +1764,45 @@ fn active_data_model_for_path(
     Ok(data_model)
 }
 
+/// Service paths name a class, even when Studio displays a different Name.
+/// Other root paths name ordinary instances, as descendant paths do.
+fn matching_roots(
+    memory: &ProcessMemory,
+    data_model: &ActiveDataModel,
+    name: &str,
+) -> Result<Vec<SharedEntry>> {
+    let service = rbx_reflection_database::get()?
+        .classes
+        .get(name)
+        .is_some_and(|class| class.tags.contains(&rbx_reflection::ClassTag::Service));
+    Ok(data_model
+        .roots
+        .iter()
+        .copied()
+        .filter(|root| {
+            let identity = if service {
+                read_instance_class(memory, root.instance, data_model.layout)
+            } else {
+                read_instance_name(memory, root.instance, data_model.layout)
+            };
+            identity.as_deref() == Some(name)
+        })
+        .collect())
+}
+
 fn select_service_root(
     memory: &ProcessMemory,
     data_model: &mut ActiveDataModel,
     service: &str,
 ) -> Result<()> {
-    let mut selected = None;
-    let mut count = 0;
-    for root in data_model.roots.iter().copied() {
-        if read_instance_class(memory, root.instance, data_model.layout).as_deref() == Some(service)
-            || read_instance_name(memory, root.instance, data_model.layout).as_deref()
-                == Some(service)
-        {
-            selected = selected.or(Some(root));
-            count += 1;
-        }
-    }
-    if count != 1 {
+    let selected = matching_roots(memory, data_model, service)?;
+    if selected.len() != 1 {
         bail!(
             "Studio DataModel contains {} roots matching {service}",
-            count
+            selected.len()
         );
     }
-    data_model.roots.clear();
-    data_model
-        .roots
-        .push(selected.expect("service root count was validated"));
+    data_model.roots = selected;
     Ok(())
 }
 
@@ -2124,18 +2137,15 @@ fn resolve_package_target(
     {
         bail!("Package path ordinals must match the number of path segments");
     }
+    if target
+        .path_ordinals
+        .first()
+        .is_some_and(|ordinal| *ordinal != 1)
+    {
+        bail!("Package service root ordinal must be 1");
+    }
     let service = &target.path_segments[0];
-    let roots = data_model
-        .roots
-        .iter()
-        .copied()
-        .filter(|entry| {
-            read_instance_name(memory, entry.instance, data_model.layout).as_deref()
-                == Some(service)
-                || read_instance_class(memory, entry.instance, data_model.layout).as_deref()
-                    == Some(service)
-        })
-        .collect::<Vec<_>>();
+    let roots = matching_roots(memory, data_model, service)?;
     if roots.len() != 1 {
         bail!(
             "Studio DataModel contains {} roots matching {service}",
