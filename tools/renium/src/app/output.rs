@@ -511,6 +511,7 @@ pub(crate) fn print_json_output(value: &Value, pretty: bool) -> Result<()> {
         let mut text = relativize_project_paths(value.clone());
         shorten_single_precision_floats(&mut text);
         trim_store_edit_result(&mut text);
+        crate::editor::review::compact_held_review(&mut text);
         relative = text;
         &relative
     } else {

@@ -1612,7 +1612,7 @@ pub(crate) struct InspectArgs {
 pub(super) struct PluginConsoleOutputArgs {
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
-    #[arg(help = "Maximum entries", short = 'n', long, default_value_t = 200)]
+    #[arg(help = "Maximum entries", short = 'n', long, default_value_t = 50)]
     pub(super) limit: usize,
     #[arg(
         help = "Only entries after this sequence number",

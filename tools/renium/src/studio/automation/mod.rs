@@ -194,8 +194,30 @@ fn cap_luau_text(text: String) -> String {
     )
 }
 
+/// Whether a returned string, printed as it is, would read as something
+/// else: another value (`nil`, `true`, a number, a JSON value), the `ok` of a
+/// run that returned nothing, or one of the lines a run prints around its
+/// values.
+fn reads_as_another_value(text: &str) -> bool {
+    text.is_empty()
+        || matches!(text, "nil" | "ok")
+        || serde_json::from_str::<Value>(text).is_ok()
+        || [
+            "[print] ",
+            "[warn] ",
+            "[error] ",
+            "[info] ",
+            "note: ",
+            "error: ",
+            "... (cut: ",
+        ]
+        .iter()
+        .any(|prefix| text.starts_with(prefix))
+}
+
 fn luau_value_text(value: &Value) -> String {
     match value {
+        Value::String(text) if reads_as_another_value(text) => value.to_string(),
         Value::String(text) => text.clone(),
         Value::Null => "nil".to_string(),
         Value::Object(map) if map.len() == 1 && map.get("_type") == Some(&json!("Nil")) => {
@@ -5893,6 +5915,12 @@ mod compact_result_tests {
             "say \"hi\"\nthen leave\n3\ntrue\nnil\nnil\n{\"abs\":228.31427,\"list\":[1,\"a\"]}\n[]"
         );
         assert_eq!(luau_text(&json!({"ok": true, "context": "server"})), "ok");
+        assert_eq!(
+            luau_text(
+                &json!({"ok": true, "results": ["nil", null, "12", 12, "", "ok", "[print] done", "[Shop] ready", "plain text"]})
+            ),
+            "\"nil\"\nnil\n\"12\"\n12\n\"\"\n\"ok\"\n\"[print] done\"\n[Shop] ready\nplain text"
+        );
     }
 
     #[test]
@@ -5934,9 +5962,9 @@ mod compact_result_tests {
             "console": [
                 {"message": "Workspace.Pack:1: Expected identifier", "time": 62.5, "type": "error"},
                 {"message": "event fired.", "repeat": 3, "time": 62.5, "type": "info"},
-                {"message": "ContentId: rbxassetid://128 failed", "time": 62.5, "type": "warn"},
+                {"message": "ContentId: rbxassetid://128044540936968 failed", "time": 62.5, "type": "warn"},
                 {"message": "event fired.", "repeat": 2, "time": 62.6, "type": "info"},
-                {"message": "ContentId: rbxassetid://977 failed", "time": 63.1, "type": "warn"}
+                {"message": "ContentId: rbxassetid://977129176443663 failed", "time": 63.1, "type": "warn"}
             ],
             "clientConsole": []
         });
@@ -5946,7 +5974,7 @@ mod compact_result_tests {
                 "server console:",
                 "[error] Workspace.Pack:1: Expected identifier",
                 "[info] event fired. (x5)",
-                "[warn] ContentId: rbxassetid://128 failed (+1 similar)",
+                "[warn] ContentId: rbxassetid://128044540936968 failed (+1 similar)",
                 "client console: empty",
             ]
         );

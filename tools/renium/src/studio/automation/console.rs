@@ -36,18 +36,18 @@ pub(crate) fn get_console_output_command(args: PluginConsoleOutputArgs) -> Resul
 }
 
 /// Text mode prints one header line (`nextSeq`, which `--since-seq` continues
-/// from, and the filter counts) and then each entry as `[level] message`, the
-/// shape `--follow` prints; json mode keeps the entry objects with `seq` and
-/// `time`.
+/// from, and the filter counts) and then a line per distinct message as
+/// `[level] message`, repeats collapsed as a Play start prints them; json
+/// mode keeps the entry objects with `seq` and `time`.
 fn print_console_text(result: &Value, since_seq: u64) -> Result<()> {
     print_json_output(&console_text_header(result, since_seq), false)?;
-    for entry in result
+    let entries = result
         .get("entries")
         .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        println!("{}", console_entry_line(entry));
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    for line in play_console_lines(entries) {
+        println!("{line}");
     }
     io::stdout().flush()?;
     Ok(())
@@ -94,9 +94,11 @@ fn console_line_start(entry: &Value) -> String {
 
 /// The text a Play start prints for one console: a line per distinct message
 /// in the `rbx co` shape, without times. Identical messages collapse into the
-/// first with ` (xN)`, messages that differ only in their digits (asset ids,
-/// counts, line numbers) into the first with ` (+N similar)`, and a folded
-/// stack frame follows its error as an indented line.
+/// first with ` (xN)`, messages that differ only in a long number (an asset
+/// or user id) into the first with ` (+N similar)`, and a folded stack frame
+/// follows its error as an indented line; the same message from another
+/// location keeps its own line. Counts, coordinates and line
+/// numbers are short and keep their lines apart.
 pub(super) fn play_console_lines(entries: &[Value]) -> Vec<String> {
     struct Group<'a> {
         entry: &'a Value,
@@ -104,7 +106,7 @@ pub(super) fn play_console_lines(entries: &[Value]) -> Vec<String> {
         similar: u64,
     }
     let mut groups: Vec<Group> = Vec::new();
-    let mut positions: HashMap<(&str, String), usize> = HashMap::new();
+    let mut positions: HashMap<(&str, String, &str), usize> = HashMap::new();
     for entry in entries {
         let message = entry
             .get("message")
@@ -115,7 +117,11 @@ pub(super) fn play_console_lines(entries: &[Value]) -> Vec<String> {
             .and_then(Value::as_u64)
             .unwrap_or(1)
             .max(1);
-        let key = (console_entry_level(entry), digit_pattern(message));
+        let place = entry
+            .get("where")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let key = (console_entry_level(entry), digit_pattern(message), place);
         match positions.get(&key) {
             Some(&position) => {
                 let group = &mut groups[position];
@@ -154,22 +160,32 @@ pub(super) fn play_console_lines(entries: &[Value]) -> Vec<String> {
         .collect()
 }
 
-/// A message with every run of digits replaced by one `0`, so two messages
-/// that differ only in numbers compare equal.
+/// The shortest run of digits that reads as an id rather than a value.
+const ID_DIGITS: usize = 6;
+
+/// A message with every run of `ID_DIGITS` or more digits replaced by one
+/// `0`, so two messages that differ only in an id compare equal while a
+/// counter or a coordinate keeps them apart.
 fn digit_pattern(message: &str) -> String {
     let mut pattern = String::with_capacity(message.len());
-    let mut in_digits = false;
+    let mut run = String::new();
+    let flush = |run: &mut String, pattern: &mut String| {
+        if run.len() >= ID_DIGITS {
+            pattern.push('0');
+        } else {
+            pattern.push_str(run);
+        }
+        run.clear();
+    };
     for character in message.chars() {
         if character.is_ascii_digit() {
-            if !in_digits {
-                pattern.push('0');
-            }
-            in_digits = true;
+            run.push(character);
         } else {
-            in_digits = false;
+            flush(&mut run, &mut pattern);
             pattern.push(character);
         }
     }
+    flush(&mut run, &mut pattern);
     pattern
 }
 
@@ -702,46 +718,51 @@ mod line_tests {
     }
 
     #[test]
-    fn a_play_console_collapses_repeats_and_messages_that_differ_in_digits() {
+    fn a_play_console_collapses_repeats_and_messages_that_differ_in_an_id() {
         let entries = vec![
-            json!({"message": "ContentId: rbxassetid://128 failed", "time": 1.0, "type": "warn"}),
+            json!({"message": "ContentId: rbxassetid://128044540936968 failed", "time": 1.0, "type": "warn"}),
             json!({"message": "[Shop] ready", "time": 1.0, "type": "print"}),
-            json!({"message": "ContentId: rbxassetid://977 failed", "time": 1.1, "type": "warn"}),
+            json!({"message": "ContentId: rbxassetid://977129176443663 failed", "time": 1.1, "type": "warn"}),
             json!({"message": "event fired.", "repeat": 4, "time": 1.2, "type": "info"}),
-            json!({"message": "ContentId: rbxassetid://128 failed", "time": 1.3, "type": "warn"}),
-            json!({"message": "ContentId: rbxassetid://5 failed", "repeat": 2, "time": 1.4, "type": "warn"}),
+            json!({"message": "ContentId: rbxassetid://128044540936968 failed", "time": 1.3, "type": "warn"}),
+            json!({"message": "ContentId: rbxassetid://500112822177229 failed", "repeat": 2, "time": 1.4, "type": "warn"}),
             json!({"message": "event fired.", "repeat": 2, "time": 1.5, "type": "info"}),
-            json!({"message": "ContentId: rbxassetid://128 failed", "time": 1.6, "type": "error"}),
+            json!({"message": "ContentId: rbxassetid://128044540936968 failed", "time": 1.6, "type": "error"}),
             json!({"message": "x is not a valid member\nof Workspace", "time": 2.0, "type": "error",
                 "where": "Script 'ServerScriptService.Scoreboard', Line 7", "repeat": 2}),
-            json!({"message": "no digits here", "time": 2.1, "type": "print"}),
-            json!({"message": "no digits there", "time": 2.2, "type": "print"}),
+            json!({"message": "t+1: 5 of 12", "time": 2.1, "type": "print"}),
+            json!({"message": "t+2: 7 of 12", "time": 2.2, "type": "print"}),
+            json!({"message": "x is not a valid member\nof Workspace", "time": 2.3, "type": "error",
+                "where": "Script 'ServerScriptService.Shop', Line 41"}),
         ];
         assert_eq!(
             play_console_lines(&entries),
             vec![
-                "[warn] ContentId: rbxassetid://128 failed (x2) (+3 similar)",
+                "[warn] ContentId: rbxassetid://128044540936968 failed (x2) (+3 similar)",
                 "[print] [Shop] ready",
                 "[info] event fired. (x6)",
-                "[error] ContentId: rbxassetid://128 failed",
+                "[error] ContentId: rbxassetid://128044540936968 failed",
                 "[error] x is not a valid member\n  of Workspace (x2)\n  Script 'ServerScriptService.Scoreboard', Line 7",
-                "[print] no digits here",
-                "[print] no digits there",
+                "[print] t+1: 5 of 12",
+                "[print] t+2: 7 of 12",
+                "[error] x is not a valid member\n  of Workspace\n  Script 'ServerScriptService.Shop', Line 41",
             ]
         );
         assert!(play_console_lines(&[]).is_empty());
     }
 
     #[test]
-    fn digit_runs_of_any_length_compare_equal() {
+    fn only_a_long_run_of_digits_compares_as_an_id() {
+        assert_eq!(
+            digit_pattern("asset 128044540936968 of user 4953300458 failed"),
+            "asset 0 of user 0 failed"
+        );
+        assert_eq!(digit_pattern("id 123456"), digit_pattern("id 9876543210"));
         assert_eq!(
             digit_pattern("centered 104 of 7 (v3.15.0)"),
-            "centered 0 of 0 (v0.0.0)"
+            "centered 104 of 7 (v3.15.0)"
         );
-        assert_eq!(
-            digit_pattern("centered 9 of 12 (v3.5.0)"),
-            digit_pattern("centered 104 of 7 (v3.15.0)")
-        );
-        assert_ne!(digit_pattern("slot a1"), digit_pattern("slot a"));
+        assert_ne!(digit_pattern("t+1: 5"), digit_pattern("t+2: 7"));
+        assert_ne!(digit_pattern("line 12345"), digit_pattern("line 12346"));
     }
 }

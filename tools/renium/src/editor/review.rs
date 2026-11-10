@@ -1009,17 +1009,43 @@ fn compact_review_digest(digest: &[Value], more_rows: usize) -> (Vec<Value>, usi
     (rows, more_rows + cut)
 }
 
+/// Shortens the review rows of a held result where it is printed as text.
+/// The daemon builds the rows and does not know its caller's output mode, so
+/// the result travels with the full rows and json mode prints them as they
+/// are. A held push nested under `push` is shortened the same way.
+pub(crate) fn compact_held_review(result: &mut Value) {
+    let Some(map) = result.as_object_mut() else {
+        return;
+    };
+    if let Some(push) = map.get_mut("push") {
+        compact_held_review(push);
+    }
+    if map.get("heldForReview") != Some(&Value::Bool(true)) {
+        return;
+    }
+    let Some(digest) = map.get("review").and_then(Value::as_array) else {
+        return;
+    };
+    if !digest.iter().all(Value::is_object) {
+        return;
+    }
+    let more = map
+        .get("moreReviewRows")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let (rows, more) = compact_review_digest(digest, more);
+    map.insert("review".to_string(), Value::Array(rows));
+    if more > 0 {
+        map.insert("moreReviewRows".to_string(), json!(more));
+    }
+}
+
 fn held_editor_summary(
     change_count: u64,
     digest: Vec<Value>,
     more_rows: usize,
     response: &Value,
 ) -> Map<String, Value> {
-    let (digest, more_rows) = if crate::app::output::compact_text_output() {
-        compact_review_digest(&digest, more_rows)
-    } else {
-        (digest, more_rows)
-    };
     let mut summary = Map::new();
     summary.insert("ok".to_string(), Value::Bool(true));
     summary.insert("heldForReview".to_string(), Value::Bool(true));
@@ -2030,6 +2056,22 @@ mod review_threshold_tests {
         let (rows, more) = compact_review_digest(&digest, 7);
         assert_eq!(rows.len(), COMPACT_REVIEW_ROWS);
         assert_eq!(more, 7 + 35 - COMPACT_REVIEW_ROWS);
+        let mut held = json!({
+            "ok": true, "heldForReview": true, "moreReviewRows": 7, "review": digest,
+            "push": {"heldForReview": true, "review": [row("Workspace.Door", "Part", json!(["Size"]))]}
+        });
+        compact_held_review(&mut held);
+        assert_eq!(
+            held["review"].as_array().unwrap().len(),
+            COMPACT_REVIEW_ROWS
+        );
+        assert_eq!(held["review"][0], json!("+ Workspace.Lobby.Pad Part"));
+        assert_eq!(held["moreReviewRows"], json!(7 + 35 - COMPACT_REVIEW_ROWS));
+        assert_eq!(held["push"]["review"], json!(["Workspace.Door: Size"]));
+        let mut applied = json!({"ok": true, "review": [{"path": "Workspace.Door", "class": "Part", "changes": ["Size"]}]});
+        let before = applied.clone();
+        compact_held_review(&mut applied);
+        assert_eq!(applied, before);
     }
 
     #[test]

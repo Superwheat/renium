@@ -242,9 +242,10 @@ fn write_line(
     text.push('\n');
 }
 
-/// A name that reads unambiguously without quotes at the start of a line.
+/// A name that reads unambiguously without quotes at the start of a line: a
+/// bracket in a name would read as the ordinal a line adds.
 fn plain_name(name: &str) -> bool {
-    !name.is_empty() && name.trim() == name && !name.contains(['\n', '\r', '"', ':'])
+    !name.is_empty() && name.trim() == name && !name.contains(['\n', '\r', '"', ':', '[', ']'])
 }
 
 #[cfg(test)]
@@ -403,10 +404,13 @@ mod tests {
             (" padded", "Part", Some(0)),
             ("two\nlines", "Part", Some(0)),
             ("Wood Crate", "Model", Some(0)),
+            ("Box", "Part", Some(0)),
+            ("Box[2]", "Part", Some(0)),
+            ("Box", "Part", Some(0)),
         ]);
         assert_eq!(
-            tree(&document, &[0, 1, 2, 3]),
-            "Root Folder\n \" padded\" Part\n \"two\\nlines\" Part\n Wood Crate Model"
+            tree(&document, &[0, 1, 2, 3, 4, 5, 6]),
+            "Root Folder\n \" padded\" Part\n \"two\\nlines\" Part\n Wood Crate Model\n Box Part\n \"Box[2]\" Part\n Box[2] Part"
         );
     }
 }
