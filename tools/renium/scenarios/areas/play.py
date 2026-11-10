@@ -362,8 +362,8 @@ def client_selectors(ctx: Context):
         ctx.expect(ctx.rbx("lc", "return game.Players.LocalPlayer.Name", "2", timeout=60).get("results") == ["Player2"], "lc by index")
         ctx.expect(ctx.rbx("lc", "return game.Players.LocalPlayer.Name", "Player1", timeout=60).get("results") == ["Player1"], "lc by name")
         missing = ctx.rbx("lc", "return 1", "5", ok=False, timeout=60)
-        ctx.expect_in("No connected play client matches player selector", missing.error, "lc on client 5")
-        ctx.expect_in("rbx play --add-players 1", missing.error, "lc on client 5 names add-players")
+        ctx.expect_in("asks for client 5, but the session has 2", missing.error, "lc on client 5")
+        ctx.expect_in("rbx play --add-players", missing.error, "lc on client 5 names add-players")
         nobody = ctx.rbx("inp", "-p", "Nobody", "key", "E", ok=False, timeout=60)
         ctx.expect_in("No connected play client matches player selector", nobody.error, "inp -p Nobody")
     finally:
