@@ -52,7 +52,24 @@ fn message(request: &Request, proof: &Proof) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// The request as the daemon reads it back from the wire. A float that needs
+/// seventeen digits can come back one digit off, and the daemon verifies the
+/// signature over what it read, so that form is what is signed and sent.
+fn as_read_back(request: &Request) -> Result<Request> {
+    let mut text = serde_json::to_string(request)?;
+    for _ in 0..4 {
+        let read: Request = serde_json::from_str(&text)?;
+        let again = serde_json::to_string(&read)?;
+        if again == text {
+            return Ok(read);
+        }
+        text = again;
+    }
+    Ok(serde_json::from_str(&text)?)
+}
+
 fn sign(request: &Request, key: &SigningKey) -> Result<serde_json::Value> {
+    let request = &as_read_back(request)?;
     let mut proof = Proof {
         time: crate::app::timing::current_millis(),
         nonce: random_id()?,
