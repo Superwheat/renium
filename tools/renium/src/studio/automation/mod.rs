@@ -825,7 +825,10 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
     if let Some(condition) = args.until.as_deref() {
         wait_condition_body(condition)?;
     }
-    if let Some(result) = args.result.as_deref() {
+    for result in [args.result.as_deref(), args.client_result.as_deref()]
+        .into_iter()
+        .flatten()
+    {
         wait_result_body(result)?;
     }
     if (args.result.is_some() || args.client_result.is_some())
@@ -840,7 +843,7 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
         "bridgeWaitSeconds": args.bridge.wait_seconds,
         "bridgePorts": args.bridge.ports,
     });
-    if args.restart {
+    let mut result = if args.restart {
         // Edits saved during Play wait for Edit mode; stopping first and
         // letting Live Sync settle makes the restarted session run them.
         let stopped = daemon_control_request(op::PLAY_STOP, None, stop_parameters.clone(), false)
@@ -853,11 +856,11 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
             if let Some(settled) = settled {
                 result["appliedPending"] = settled;
             }
-            attach_player_readiness(&mut result, &args);
         }
-        return print_play_result(result, args.players.is_some());
-    }
-    let mut result = daemon_control_request(operation, None, parameters.clone(), false)?;
+        result
+    } else {
+        daemon_control_request(operation, None, parameters, false)?
+    };
     if args.until.is_none()
         && !args.no_ready
         && !args.stop
@@ -1061,6 +1064,10 @@ fn take_play_consoles(result: &mut Value) -> Vec<String> {
 /// Evaluates `--result` or `--client-result` once the wait holds, on the
 /// server or on the first client; the value, or `{ "error" }`.
 fn evaluate_after_wait(code: &str, side: &str, args: &StartStopPlayArgs) -> Value {
+    let code = match wait_result_body(code) {
+        Ok(code) => code,
+        Err(error) => return json!({ "error": format!("{error:#}") }),
+    };
     let mut parameters = json!({
         "code": code,
         "timeout": 30.0,
