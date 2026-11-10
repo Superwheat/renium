@@ -16,8 +16,7 @@ use crate::bytecode::{
     resolve_bytecode_cli_settings_file, resolve_bytecode_selector,
 };
 use crate::cli::{
-    BytecodeAddInstanceArgs, BytecodeCloneInstanceArgs, BytecodeDesyncPackageLinkArgs,
-    BytecodeRemoveInstanceArgs,
+    BytecodeAddInstanceArgs, BytecodeDesyncPackageLinkArgs, BytecodeRemoveInstanceArgs,
 };
 use crate::editor::document::is_protected_engine_container;
 use crate::editor::paths::{
@@ -898,70 +897,33 @@ pub(crate) fn new_script_source(
     }
 }
 
-pub(crate) fn bytecode_clone_instance(args: BytecodeCloneInstanceArgs) -> Result<()> {
-    let pretty = args.pretty;
-    let result = bytecode_clone_instance_result(args)?;
-    print_json_output(&result, pretty)
-}
-
-/// The clone as a result: `rootSettingsId` names the copy, `settingsIds`
-/// every copied instance.
-pub(crate) fn bytecode_clone_instance_result(mut args: BytecodeCloneInstanceArgs) -> Result<Value> {
-    adopt_single_positional_target(
-        &mut args.input,
-        Some(args.service.as_str()),
-        &mut args.selector,
-    )?;
-    let (settings_file, service_hint) = resolve_bytecode_cli_settings_file(
-        args.input.settings_file.as_deref(),
-        args.input.service_or_file.as_deref(),
-        Some(args.service.as_str()),
-    )?;
+/// Copies the instance `source_id` of a store, with its subtree and script
+/// files, under `parent_id` in the same store. In the result
+/// `rootSettingsId` names the copy and `settingsIds` every copied instance.
+/// The caller applies the read-only link check.
+pub(crate) fn clone_stored_instance(
+    settings_file: &Path,
+    service: &str,
+    source_id: &str,
+    parent_id: &str,
+) -> Result<Value> {
+    let (settings_file, service_hint) =
+        resolve_bytecode_cli_settings_file(Some(settings_file), None, Some(service))?;
     let _lock = lock_existing_service_store(&settings_file)?;
     let mut document = SettingsBytecode::read_file(&settings_file)?;
     let before_document = document.clone();
     let service = bytecode_service_name(&document, &settings_file, &service_hint);
-    let source_index = resolve_bytecode_selector(
-        &document,
-        &service,
-        &args.selector,
-        "Source instance was not found",
-    )?
-    .index;
+    let index_of = |settings_id: &str| {
+        document
+            .instances
+            .iter()
+            .position(|instance| instance.settings_id == settings_id)
+    };
+    let source_index = index_of(source_id).context("Source instance was not found")?;
     if document.instances[source_index].parent_index.is_none() {
         bail!("Service roots cannot be copied");
     }
-
-    let parent_selector_specified = args.parent_index.is_some()
-        || args
-            .parent_settings_id
-            .as_deref()
-            .is_some_and(|value| !value.is_empty())
-        || args
-            .parent_name
-            .as_deref()
-            .is_some_and(|value| !value.is_empty())
-        || args
-            .parent_class_name
-            .as_deref()
-            .is_some_and(|value| !value.is_empty());
-    let target_parent_index = if parent_selector_specified {
-        bytecode_parent_index(
-            &document,
-            false,
-            args.parent_index,
-            args.parent_settings_id.as_deref(),
-            args.parent_name.as_deref(),
-            args.parent_class_name.as_deref(),
-        )?
-        .ok_or_else(|| anyhow::anyhow!("Parent instance was not found"))?
-    } else {
-        document.instances[source_index]
-            .parent_index
-            .ok_or_else(|| anyhow::anyhow!("Source instance has no parent"))?
-    };
-    let links = super::store_link_enforcement(&settings_file, args.override_packages)?;
-    super::reject_read_only_link_edit(&links, &document, &service, target_parent_index)?;
+    let target_parent_index = index_of(parent_id).context("Parent instance was not found")?;
 
     let service_dir = crate::project::storage::source_directory(&settings_file);
     let source_paths_before = build_editor_source_paths_by_index(&document, &service, &service_dir);

@@ -44,8 +44,6 @@
     { "id": 59, "name": "device", "runtime": true },
     { "id": 60, "name": "ui", "runtime": true },
     { "id": 61, "name": "press", "runtime": true },
-    { "id": 62, "name": "click", "runtime": true },
-    { "id": 63, "name": "key", "runtime": true },
     { "id": 64, "name": "type", "runtime": true },
     { "id": 65, "name": "wait", "runtime": true },
     { "id": 66, "name": "goto", "runtime": true },

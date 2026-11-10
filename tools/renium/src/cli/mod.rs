@@ -567,14 +567,6 @@ pub(super) enum Commands {
     )]
     Press(PressArgs),
     #[command(
-        name = "clk",
-        alias = "click",
-        about = "Click viewport coordinates in a play client"
-    )]
-    Click(ClickArgs),
-    #[command(name = "ky", alias = "key", about = "Press a key in a play client")]
-    Key(KeyArgs),
-    #[command(
         name = "ui",
         alias = "user-interface",
         about = "List visible GUI elements in a play client"
@@ -747,12 +739,6 @@ pub(super) enum Commands {
         about = "Add an instance to a store, or apply a batch of store edits"
     )]
     BytecodeAddInstance(BytecodeAddInstanceArgs),
-    #[command(
-        name = "bcl",
-        alias = "bytecode-clone-instance",
-        about = "Clone an instance in a store"
-    )]
-    BytecodeCloneInstance(BytecodeCloneInstanceArgs),
     #[command(
         name = "br",
         alias = "bytecode-remove-instance",
@@ -2118,55 +2104,6 @@ pub(super) struct PressArgs {
 }
 
 #[derive(Parser)]
-pub(super) struct ClickArgs {
-    #[command(flatten)]
-    pub(super) bridge: BridgeConnectionArgs,
-    #[arg(help = "Viewport X coordinate")]
-    pub(super) x: i32,
-    #[arg(help = "Viewport Y coordinate")]
-    pub(super) y: i32,
-    #[arg(
-        help = "Play client by name, index or runtimeId",
-        short,
-        long,
-        value_name = "NAME|N"
-    )]
-    pub(super) player: Option<String>,
-    #[arg(help = "Right-click", long)]
-    pub(super) right: bool,
-    #[arg(
-        help = "Milliseconds to hold the button",
-        long,
-        alias = "hold-ms",
-        value_name = "MS",
-        default_value_t = 30
-    )]
-    pub(super) hold: u64,
-}
-
-#[derive(Parser)]
-pub(super) struct KeyArgs {
-    #[command(flatten)]
-    pub(super) bridge: BridgeConnectionArgs,
-    #[arg(help = "Key code name, such as E or Space")]
-    pub(super) key: String,
-    #[arg(
-        help = "Play client by name, index or runtimeId",
-        short,
-        long,
-        value_name = "NAME|N"
-    )]
-    pub(super) player: Option<String>,
-    #[arg(
-        help = "Milliseconds to hold the key, up to 60000",
-        long,
-        value_name = "MS",
-        default_value_t = 60
-    )]
-    pub(super) hold_ms: u64,
-}
-
-#[derive(Parser)]
 pub(super) struct UiArgs {
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
@@ -3448,33 +3385,6 @@ pub(super) struct BytecodeParentArgs {
     pub(super) parent_class_name: Option<String>,
     #[arg(help = "Place at the service root", long, alias = "root")]
     pub(super) no_parent: bool,
-}
-
-#[derive(Parser)]
-pub(super) struct BytecodeCloneInstanceArgs {
-    #[command(flatten)]
-    pub(super) input: BytecodeFileArgs,
-    #[arg(help = "Service that owns the source", short, long, default_value = "")]
-    pub(super) service: String,
-    #[command(flatten)]
-    pub(super) selector: BytecodeInstanceSelectorArgs,
-    #[arg(help = "Parent store index", short = 'X', long)]
-    pub(super) parent_index: Option<usize>,
-    #[arg(
-        help = "Parent settings ID or dotted path",
-        short = 'I',
-        long,
-        alias = "parent-id"
-    )]
-    pub(super) parent_settings_id: Option<String>,
-    #[arg(help = "Parent exact name", short = 'N', long)]
-    pub(super) parent_name: Option<String>,
-    #[arg(help = "Parent class name", short = 'C', long, alias = "parent-class")]
-    pub(super) parent_class_name: Option<String>,
-    #[arg(help = "Allow edits inside linked packages", long)]
-    pub(super) override_packages: bool,
-    #[arg(help = "Pretty-print the JSON result", long)]
-    pub(super) pretty: bool,
 }
 
 #[derive(Parser)]

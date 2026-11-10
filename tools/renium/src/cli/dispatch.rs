@@ -10,9 +10,7 @@ use crate::automation::tools::{
     asset_insert_command, asset_search_command, generate_model_command, job_status_command,
     script_grep_command, script_read_command, script_search_command,
 };
-use crate::bytecode::edit::{
-    bytecode_add_instance, bytecode_clone_instance, bytecode_remove_instance,
-};
+use crate::bytecode::edit::{bytecode_add_instance, bytecode_remove_instance};
 use crate::bytecode::explorer::{bytecode_explorer_batch, explorer_daemon};
 use crate::bytecode::{
     bytecode_apply_property_batch, bytecode_get_property, bytecode_set_property,
@@ -40,11 +38,11 @@ use crate::rbx::model::{
 };
 use crate::snapshot::export::pull_from_studio;
 use crate::studio::automation::{
-    click_command, editor_review_decision_command, execute_luau_command,
-    get_console_output_command, goto_command, key_command, list_clients_command,
-    package_action_command, press_command, record_end_command, record_start_command, shot_command,
-    start_stop_play_command, studio_change_state_command, studio_change_state_operation_command,
-    studio_device_command, type_command, ui_command, wait_until_command,
+    editor_review_decision_command, execute_luau_command, get_console_output_command, goto_command,
+    list_clients_command, package_action_command, press_command, record_end_command,
+    record_start_command, shot_command, start_stop_play_command, studio_change_state_command,
+    studio_change_state_operation_command, studio_device_command, type_command, ui_command,
+    wait_until_command,
 };
 
 pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> {
@@ -130,8 +128,6 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::ListClients(args) => list_clients_command(args),
         Commands::EditorReviewDecision(args) => editor_review_decision_command(args),
         Commands::Press(args) => press_command(args),
-        Commands::Click(args) => click_command(args),
-        Commands::Key(args) => key_command(args),
         Commands::Ui(args) => ui_command(args),
         Commands::Type(args) => type_command(args),
         Commands::WaitUntil(args) => wait_until_command(args),
@@ -174,7 +170,6 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::BytecodeSetSource(args) => bytecode_set_source(args),
         Commands::BytecodeExplorerBatch(args) => bytecode_explorer_batch(args),
         Commands::BytecodeAddInstance(args) => bytecode_add_instance(args),
-        Commands::BytecodeCloneInstance(args) => bytecode_clone_instance(args),
         Commands::BytecodeRemoveInstance(args) => bytecode_remove_instance(args),
         Commands::BytecodeExportModel(args) => bytecode_export_model(args),
         Commands::BytecodeExportPlace(args) => bytecode_export_place(args),

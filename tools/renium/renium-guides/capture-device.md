@@ -37,7 +37,7 @@ For an already running client:
 
 ```powershell
 rbx rs -p 1 -o clips/movement.mp4
-rbx ky W --hold-ms 700 -p 1
+rbx inp -p 1 hold W 700
 rbx re
 ```
 

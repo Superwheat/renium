@@ -41,7 +41,6 @@ rbx ba Workspace -I Lobby.Props -n NewPart -c Part -p 'Anchored=true' --push
 rbx bs Workspace Lobby.Door -p 'Transparency=0.5' -p 'CanCollide=false' --push
 rbx bs Workspace Lobby --where 'is:Part Transparency>0.5' -p 'CanCollide=false' --push   # every match under Lobby
 rbx bss Workspace -i editor:script --str "return 1"
-rbx bcl Workspace -i editor:source -I editor:parent
 rbx mv Workspace -i editor:id -I editor:parent --push
 rbx mv StarterGui -i editor:id --to-service ReplicatedStorage -I editor:parent
 rbx cp Workspace -i Lobby.Pad -I Props -n Pad2 --push           # copy, name the copy, push it

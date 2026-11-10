@@ -1551,11 +1551,16 @@ fn cloned(
 }
 
 #[test]
-fn clone_instance_copies_subtrees_with_unique_names_scripts_and_references() {
+fn clone_command_copies_subtrees_with_unique_names_scripts_and_references() {
     let fx = Fixture::new("clone");
     let store = fx.store_arg("Workspace");
+    let root = fx.path("");
+    let copy = |source: &str, parent: &str| {
+        fx.text(&["cp", "Workspace", "-i", source, "-I", parent, "-r", &root])
+            .ok()
+    };
     assert_eq!(
-        fx.text(&["bcl", "-f", &store, "Lobby.Door"]).ok(),
+        copy("Lobby.Door", "Lobby"),
         cloned(
             "editor:9",
             "Door Copy",
@@ -1566,7 +1571,8 @@ fn clone_instance_copies_subtrees_with_unique_names_scripts_and_references() {
         )
     );
     assert_eq!(
-        fx.json(&["bcl", "-f", &store, "-i", "door"]).ok(),
+        fx.json(&["cp", "Workspace", "-i", "door", "-I", "lobby", "-r", &root])
+            .ok(),
         cloned(
             "editor:a",
             "Door Copy 2",
@@ -1577,8 +1583,7 @@ fn clone_instance_copies_subtrees_with_unique_names_scripts_and_references() {
         )
     );
     assert_eq!(
-        fx.text(&["bcl", "-f", &store, "-i", "door", "-I", "cafe"])
-            .ok(),
+        copy("door", "cafe"),
         cloned(
             "editor:b",
             "Door",
@@ -1588,33 +1593,21 @@ fn clone_instance_copies_subtrees_with_unique_names_scripts_and_references() {
             &["editor:b"]
         )
     );
+    assert_eq!(copy("door", "Café ☕")["name"], json!("Door Copy"));
     assert_eq!(
-        fx.text(&["bcl", "-f", &store, "-i", "door", "-N", "Café ☕"])
-            .ok()["name"],
-        json!("Door Copy")
-    );
-    assert_eq!(
-        fx.text(&["bcl", "-f", &store, "-i", "door", "-X", "7"])
-            .ok()["name"],
-        json!("Door Copy 2")
-    );
-    assert_eq!(
-        fx.text(&["bcl", "-f", &store, "-i", "door", "-C", "Workspace"])
-            .ok()["pathSegments"],
+        copy("door", "Workspace")["pathSegments"],
         json!(["Workspace", "Door"])
     );
     assert_eq!(
-        fx.text(&["bcl", "-f", &store, "-i", "door", "-I", "Lobby.Border[2]"])
-            .ok()["pathOrdinals"],
+        copy("door", "Lobby.Border[2]")["pathOrdinals"],
         json!([1, 1, 2, 1])
     );
     assert_eq!(
         fx.read_store("Workspace").instances[9].properties,
         fx.read_store("Workspace").instances[2].properties
     );
-    let script = fx.text(&["bcl", "-f", &store, "Spawner"]).ok();
     assert_eq!(
-        script,
+        copy("Spawner", "Workspace"),
         json!({
             "changedPaths": [STORE, "<root>/src/Workspace/Spawner Copy.server.luau"],
             "className": "Script",
@@ -1622,10 +1615,10 @@ fn clone_instance_copies_subtrees_with_unique_names_scripts_and_references() {
             "ok": true,
             "pathOrdinals": [1, 1],
             "pathSegments": ["Workspace", "Spawner Copy"],
-            "rootSettingsId": "editor:10",
+            "rootSettingsId": "editor:f",
             "service": "Workspace",
             "settingsFile": STORE,
-            "settingsIds": ["editor:10"],
+            "settingsIds": ["editor:f"],
             "sourceCopies": [{"from": "<root>/src/Workspace/Spawner.server.luau", "to": "<root>/src/Workspace/Spawner Copy.server.luau"}],
         })
     );
@@ -1633,7 +1626,7 @@ fn clone_instance_copies_subtrees_with_unique_names_scripts_and_references() {
         fs::read_to_string(fx.root.join("src/Workspace/Spawner Copy.server.luau")).unwrap(),
         SPAWNER_SOURCE
     );
-    let lobby = fx.text(&["bcl", "-f", &store, "Lobby"]).ok();
+    let lobby = copy("Lobby", "Workspace");
     assert_eq!(lobby["name"], json!("Lobby Copy"));
     assert_eq!(lobby["settingsIds"].as_array().unwrap().len(), 8);
     assert_eq!(
@@ -1644,7 +1637,7 @@ fn clone_instance_copies_subtrees_with_unique_names_scripts_and_references() {
         fs::read_to_string(fx.root.join("src/Workspace/Lobby Copy/Helper.client.luau")).unwrap(),
         HELPER_SOURCE
     );
-    let target = fx.text(&["bcl", "-f", &store, "Target"]).ok();
+    let target = copy("Target", "Workspace");
     assert_eq!(
         fx.both(&["bg", "-f", &store, "Target Copy", "Value"]),
         json!({"_type": "Ref", "pathOrdinals": [1, 1, 1], "pathSegments": ["Workspace", "Lobby", "Door"], "settingsId": "door"})
@@ -1666,7 +1659,7 @@ fn clone_instance_copies_subtrees_with_unique_names_scripts_and_references() {
         ])
         .ok();
     assert_eq!(with_holder["ok"], true);
-    let cafe_copy = fx.text(&["bcl", "-f", &store, "Café ☕"]).ok();
+    let cafe_copy = copy("Café ☕", "Workspace");
     let copied_holder = fx.both(&["bg", "-f", &store, "Café ☕ Copy.Holder", "Value"]);
     assert_eq!(
         copied_holder["pathSegments"],
@@ -1676,40 +1669,46 @@ fn clone_instance_copies_subtrees_with_unique_names_scripts_and_references() {
 }
 
 #[test]
-fn clone_instance_refuses_roots_cycles_duplicates_and_missing_targets() {
+fn clone_command_refuses_roots_cycles_duplicates_and_missing_targets() {
     let fx = Fixture::new("clone-errors");
-    let store = fx.store_arg("Workspace");
+    let root = fx.path("");
     let before = fs::read(fx.store("Workspace")).unwrap();
-    let err = |args: &[&str]| fx.text(&[&["bcl", "-f", &store], args].concat()).err();
-    assert_eq!(err(&["-i", "ws"]), "Service roots cannot be copied");
+    let err = |args: &[&str]| {
+        fx.text(&[&["cp", "Workspace"], args, &["-r", &root]].concat())
+            .err()
+    };
     assert_eq!(
-        err(&["Lobby", "-I", "door"]),
+        err(&["-i", "ws", "-I", "cafe"]),
+        "Service roots cannot be copied"
+    );
+    assert_eq!(
+        err(&["-i", "lobby", "-I", "door"]),
         "Cannot copy an instance into itself or one of its descendants"
     );
     assert_eq!(
-        err(&["Lobby", "-I", "lobby"]),
+        err(&["-i", "lobby", "-I", "lobby"]),
         "Cannot copy an instance into itself or one of its descendants"
     );
-    assert!(err(&["Nope"]).contains("No matching instance path: Workspace.Nope"));
-    assert!(err(&["Border"]).contains("2 instances are named \"Border\""));
+    assert!(err(&["-i", "Border", "-I", "cafe"]).contains(
+        "Projected service 'Workspace' has no instance 'Border': 2 instances are named \"Border\""
+    ));
     assert!(
-        err(&["-i", "door", "-I", "nope"]).contains("No matching instance path: Workspace.nope")
+        err(&["-i", "nope", "-I", "cafe"])
+            .contains("Projected service 'Workspace' has no instance 'nope'")
     );
-    assert_eq!(err(&["-i", "nope"]), "Source instance was not found");
-    assert_eq!(
-        err(&["Door", "-i", "door"]),
-        "Give the target once: as the positional argument, --path or one selector option"
+    assert!(
+        err(&["-i", "door", "-I", "nope"])
+            .contains("Projected service 'Workspace' has no instance 'nope'")
     );
     let collision = fx.service_dir("Workspace").join("Spawner Copy.server.luau");
     fs::write(&collision, "return 2").unwrap();
-    assert!(err(&["Spawner"]).contains("already exists with different contents"));
+    assert!(err(&["-i", "Spawner", "-I", "ws"]).contains("already exists with different contents"));
     assert_eq!(fs::read_to_string(&collision).unwrap(), "return 2");
     assert_eq!(fs::read(fx.store("Workspace")).unwrap(), before);
-    let missing = fx.store_arg("StarterGui");
     assert!(
-        fx.text(&["bcl", "-f", &missing, "-n", "X"])
+        fx.text(&["cp", "StarterGui", "-i", "x", "-I", "y", "-r", &root])
             .err()
-            .contains("No synced Renium store for service 'StarterGui'")
+            .contains("Projected service 'StarterGui' has no Renium store")
     );
 }
 
@@ -1884,7 +1883,8 @@ fn protected_containers_and_package_links_refuse_structural_edits() {
         "Package-bearing instances cannot be removed; use upl on the package root first"
     );
     assert_eq!(
-        fx.text(&["bcl", "-f", &store, "Pkg"]).err(),
+        fx.text(&["cp", "Workspace", "-i", "Pkg", "-I", "ws", "-r", &root])
+            .err(),
         "Package-bearing instances cannot be copied; use upl on the package root first"
     );
     assert_eq!(
@@ -2150,80 +2150,6 @@ fn create_resolves_project_stores_parents_and_unsynced_services() {
             .is_file()
     );
     let _ = fs::remove_dir_all(outside);
-}
-
-#[test]
-fn clone_command_copies_within_the_project_by_id_or_path() {
-    let fx = Fixture::new("clone-command");
-    let root = fx.path("");
-    assert_eq!(
-        fx.text(&["cp", "Workspace", "-i", "door", "-I", "cafe", "-r", &root])
-            .ok(),
-        cloned(
-            "editor:9",
-            "Door",
-            "Part",
-            &["Workspace", "Café ☕", "Door"],
-            &[1, 1, 1],
-            &["editor:9"]
-        )
-    );
-    assert_eq!(
-        fx.json(&[
-            "cp",
-            "Workspace",
-            "-i",
-            "Lobby.Door",
-            "-I",
-            "Café ☕",
-            "-r",
-            &root
-        ])
-        .ok()["name"],
-        json!("Door Copy")
-    );
-    assert_eq!(
-        fx.text(&[
-            "cp",
-            "Workspace",
-            "-i",
-            "door",
-            "-I",
-            "Lobby.Border[2]",
-            "-r",
-            &root
-        ])
-        .ok()["pathOrdinals"],
-        json!([1, 1, 2, 1])
-    );
-    let err = |args: &[&str]| {
-        fx.text(&[&["cp", "Workspace"], args, &["-r", &root]].concat())
-            .err()
-    };
-    assert!(err(&["-i", "Border", "-I", "cafe"]).contains(
-        "Projected service 'Workspace' has no instance 'Border': 2 instances are named \"Border\""
-    ));
-    assert!(
-        err(&["-i", "nope", "-I", "cafe"])
-            .contains("Projected service 'Workspace' has no instance 'nope'")
-    );
-    assert!(
-        err(&["-i", "door", "-I", "nope"])
-            .contains("Projected service 'Workspace' has no instance 'nope'")
-    );
-    assert_eq!(
-        err(&["-i", "ws", "-I", "cafe"]),
-        "Service roots cannot be copied"
-    );
-    assert_eq!(
-        err(&["-i", "lobby", "-I", "door"]),
-        "Cannot copy an instance into itself or one of its descendants"
-    );
-    assert!(
-        fx.text(&["cp", "StarterGui", "-i", "x", "-I", "y", "-r", &root])
-            .err()
-            .contains("Projected service 'StarterGui' has no Renium store")
-    );
 }
 
 #[test]
@@ -2684,6 +2610,7 @@ fn store_edits_refuse_changes_inside_a_read_only_link() {
     let fx = Fixture::new("store-read-only-link");
     crate::tests::support::write_packed_link_project(&fx.root);
     let store = fx.store_arg("ReplicatedStorage");
+    let root = fx.path("");
     fx.text(&["ba", "-f", &store, "-n", "Other", "-c", "Folder"])
         .ok();
     let before = fs::read(fx.store("ReplicatedStorage")).unwrap();
@@ -2693,7 +2620,16 @@ fn store_edits_refuse_changes_inside_a_read_only_link() {
         &[
             "ba", "-f", &store, "-n", "Extra", "-c", "Folder", "-I", "Shared",
         ],
-        &["bcl", "-f", &store, "Shared.Util"],
+        &[
+            "cp",
+            "ReplicatedStorage",
+            "-i",
+            "Shared.Util",
+            "-I",
+            "Shared",
+            "-r",
+            &root,
+        ],
         &["br", "-f", &store, "Shared.Util"],
         &[
             "bs", "-f", &store, "Other", "-p", "Parent", "--str", "editor:1",

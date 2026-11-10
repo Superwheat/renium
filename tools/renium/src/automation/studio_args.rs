@@ -5,7 +5,7 @@ use serde_json::{Map, Value};
 
 use super::op;
 use crate::cli::{
-    BridgeConnectionArgs, ClickArgs, EditorReviewDecisionArgs, ExecuteLuauArgs, GotoArgs, KeyArgs,
+    BridgeConnectionArgs, EditorReviewDecisionArgs, ExecuteLuauArgs, GotoArgs,
     PluginConsoleOutputArgs, PressArgs, ShotArgs, StartStopPlayArgs, StudioChangeStateArgs,
     StudioDeviceArgs, TypeArgs, UiArgs, WaitUntilArgs,
 };
@@ -59,14 +59,6 @@ where
                 .map_err(|error| anyhow::anyhow!("p.{key} has an invalid numeric value: {error}"))
         })
         .transpose()
-}
-
-fn required_number<T>(object: &Map<String, Value>, key: &str) -> Result<T>
-where
-    T: std::str::FromStr,
-    T::Err: std::fmt::Display,
-{
-    optional_number(object, key)?.with_context(|| format!("p.{key} is required"))
 }
 
 fn strings(object: &Map<String, Value>, key: &str) -> Result<Vec<String>> {
@@ -293,28 +285,6 @@ pub(super) fn press(parameters: &Value) -> Result<PressArgs> {
         right: boolean(object, "right")?,
         world: boolean(object, "world")?,
         hold: number(object, "hold", 30)?,
-    })
-}
-
-pub(super) fn click(parameters: &Value) -> Result<ClickArgs> {
-    let object = object(parameters)?;
-    Ok(ClickArgs {
-        bridge: bridge(object)?,
-        x: required_number(object, "x")?,
-        y: required_number(object, "y")?,
-        player: string(object, "player"),
-        right: boolean(object, "right")?,
-        hold: number(object, "hold", 30)?,
-    })
-}
-
-pub(super) fn key(parameters: &Value) -> Result<KeyArgs> {
-    let object = object(parameters)?;
-    Ok(KeyArgs {
-        bridge: bridge(object)?,
-        key: required_string(object, "key")?,
-        player: string(object, "player"),
-        hold_ms: number(object, "holdMs", 60)?,
     })
 }
 

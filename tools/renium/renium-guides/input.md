@@ -6,9 +6,9 @@ Use runtime input only when the requested check needs interaction. For a saved U
 rbx ui -p 1
 rbx pr "Shop.BuyButton" -p 1
 rbx ty "hello" --path "Chat.Box" --enter -p 1
-rbx clk 450 323 -p 1
-rbx ky E -p 1
-rbx ky W --hold-ms 700 -p 1        # holds up to 60 s
+rbx inp -p 1 click 450,323
+rbx inp -p 1 key E
+rbx inp -p 1 hold W 700            # holds up to 60 s
 rbx go "Workspace.Shop.Door" -p 1
 rbx go --pos "745,40,510" -p 1
 rbx wait "workspace:GetAttribute('Ready') ~= nil" -c -t 20

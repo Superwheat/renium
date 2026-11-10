@@ -17,9 +17,9 @@ use crate::app::output::{
 use crate::app::timing::current_millis;
 use crate::automation::{commands::daemon_result, op};
 use crate::cli::{
-    BridgeConnectionArgs, ClickArgs, EditorReviewDecisionArgs, ExecuteLuauArgs, GotoArgs, KeyArgs,
-    ListClientsArgs, PackageActionArgs, PressArgs, RecordEndArgs, RecordStartArgs, ShotArgs,
-    StartStopPlayArgs, StudioChangeStateArgs, StudioDeviceArgs, TypeArgs, UiArgs, WaitUntilArgs,
+    BridgeConnectionArgs, EditorReviewDecisionArgs, ExecuteLuauArgs, GotoArgs, ListClientsArgs,
+    PackageActionArgs, PressArgs, RecordEndArgs, RecordStartArgs, ShotArgs, StartStopPlayArgs,
+    StudioChangeStateArgs, StudioDeviceArgs, TypeArgs, UiArgs, WaitUntilArgs,
 };
 use crate::daemon::{daemon_control_request, try_daemon_control_request};
 use crate::snapshot::import::parse_services;
@@ -3383,86 +3383,6 @@ pub(crate) fn press_result(args: &PressArgs, bridge: &BridgeServer) -> Result<Va
     Ok(result)
 }
 
-pub(crate) fn click_result(args: &ClickArgs, bridge: &BridgeServer) -> Result<Value> {
-    let player = args.player.as_deref();
-    if let Some(player) = player {
-        wait_for_player_bridge(bridge, player, args.bridge.wait_seconds)?;
-    }
-    let mut result = json!({
-        "ok": true,
-        "action": "click",
-        "viewportX": args.x,
-        "viewportY": args.y,
-    });
-    #[cfg(windows)]
-    if os_input_preferred() {
-        let (window, offset_x, offset_y) =
-            resolve_player_window(bridge, player, client_viewport_size(bridge, player))?;
-        let _shield = input_inject::input_shield(&window)?;
-        let (delta_x, delta_y) = input_delta(bridge, player, &window, args.x, args.y);
-        input_inject::post_mouse_click(
-            &window,
-            args.x + offset_x + delta_x,
-            args.y + offset_y + delta_y,
-            args.right,
-            args.hold,
-        )?;
-        result["inputMethod"] = json!("os");
-        result["window"] = json!(window.label);
-        return Ok(result);
-    }
-    let response = send_virtual_input(
-        bridge,
-        player,
-        virtual_click_actions(args.x, args.y, args.right, args.hold, true),
-        None,
-    )?;
-    result["inputMethod"] = json!("virtual");
-    note_system_ui(&mut result, &response);
-    Ok(result)
-}
-
-pub(crate) fn key_result(args: &KeyArgs, bridge: &BridgeServer) -> Result<Value> {
-    let player = args.player.as_deref();
-    if let Some(player) = player {
-        wait_for_player_bridge(bridge, player, args.bridge.wait_seconds)?;
-    }
-    let key = input_inject::resolve_key(&args.key)?;
-    if key.name == "Escape" {
-        bail!(
-            "Escape is reserved by Roblox CoreGui and cannot be injected; use the game's on-screen control or an alternate key, and `rbx inp dismiss` to close a Roblox prompt"
-        );
-    }
-    #[cfg(windows)]
-    if os_input_preferred() {
-        let hold_ms = args.hold_ms.clamp(10, 2000);
-        let (window, _, _) =
-            resolve_player_window(bridge, player, client_viewport_size(bridge, player))?;
-        let _shield = input_inject::input_shield(&window)?;
-        input_inject::post_key(&window, &key, hold_ms)?;
-        return Ok(json!({
-            "ok": true,
-            "action": "key",
-            "key": key.name,
-            "holdMs": hold_ms,
-            "inputMethod": "os",
-            "window": window.label,
-        }));
-    }
-    let hold_ms = args.hold_ms.clamp(10, MAX_KEY_HOLD_MS);
-    let mut actions = vec![json!({ "type": "key", "key": key.name, "down": true })];
-    actions.extend(virtual_wait_actions(hold_ms));
-    actions.push(json!({ "type": "key", "key": key.name, "down": false }));
-    send_virtual_input(bridge, player, actions, None)?;
-    Ok(json!({
-        "ok": true,
-        "action": "key",
-        "key": key.name,
-        "holdMs": hold_ms,
-        "inputMethod": "virtual",
-    }))
-}
-
 /// A key can be held for a minute; the plugin runs each wait for at most
 /// ten seconds, so longer holds are several waits.
 const MAX_KEY_HOLD_MS: u64 = 60_000;
@@ -4367,30 +4287,6 @@ pub(crate) fn press_command(args: PressArgs) -> Result<()> {
             "world": args.world,
             "hold": args.hold,
         }),
-        &args.bridge,
-        true,
-    )
-}
-
-pub(crate) fn click_command(args: ClickArgs) -> Result<()> {
-    run_input_command(
-        op::CLICK,
-        json!({
-            "x": args.x,
-            "y": args.y,
-            "player": args.player,
-            "right": args.right,
-            "hold": args.hold,
-        }),
-        &args.bridge,
-        true,
-    )
-}
-
-pub(crate) fn key_command(args: KeyArgs) -> Result<()> {
-    run_input_command(
-        op::KEY,
-        json!({ "key": args.key, "player": args.player, "holdMs": args.hold_ms }),
         &args.bridge,
         true,
     )

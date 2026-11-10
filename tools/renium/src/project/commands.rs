@@ -16,13 +16,13 @@ use crate::bytecode::edit::{
 use crate::bytecode::parse_bracket_path_segments;
 use crate::bytecode::{apply_file_mutations, bytecode_set_property};
 use crate::cli::{
-    BridgeConnectionArgs, BytecodeAddInstanceArgs, BytecodeCloneInstanceArgs,
-    BytecodeDesyncPackageLinkArgs, BytecodeExportModelArgs, BytecodeFileArgs,
-    BytecodeImportModelArgs, BytecodeInstanceSelectorArgs, BytecodeParentArgs,
-    BytecodeRemoveInstanceArgs, BytecodeSetPropertyArgs, CloneInstanceCommandArgs,
-    CreateInstanceArgs, DesyncPackageLinkCommandArgs, ExportModelCommandArgs,
-    ImportModelCommandArgs, ImportPathArgs, MoveInstanceArgs, ProjectInstanceArgs,
-    ProjectSourceArgs, PushEditorChangesArgs, RemoveInstanceCommandArgs, RenameInstanceArgs,
+    BridgeConnectionArgs, BytecodeAddInstanceArgs, BytecodeDesyncPackageLinkArgs,
+    BytecodeExportModelArgs, BytecodeFileArgs, BytecodeImportModelArgs,
+    BytecodeInstanceSelectorArgs, BytecodeParentArgs, BytecodeRemoveInstanceArgs,
+    BytecodeSetPropertyArgs, CloneInstanceCommandArgs, CreateInstanceArgs,
+    DesyncPackageLinkCommandArgs, ExportModelCommandArgs, ImportModelCommandArgs, ImportPathArgs,
+    MoveInstanceArgs, ProjectInstanceArgs, ProjectSourceArgs, PushEditorChangesArgs,
+    RemoveInstanceCommandArgs, RenameInstanceArgs,
 };
 use crate::editor::paths::{build_editor_instance_paths, infer_source_script};
 use crate::editor::sync::push_editor_changes;
@@ -383,18 +383,16 @@ pub(crate) fn clone_instance_command(
             parent_target.join(".")
         );
     }
-    let mut result =
-        crate::bytecode::edit::bytecode_clone_instance_result(BytecodeCloneInstanceArgs {
-            input: BytecodeFileArgs::settings_file(source_file.clone()),
-            service: target.service,
-            selector: BytecodeInstanceSelectorArgs::by_settings_id(source_id),
-            parent_index: None,
-            parent_settings_id: parent_id,
-            parent_name: None,
-            parent_class_name: None,
-            override_packages: true,
-            pretty: false,
-        })?;
+    let mut result = crate::bytecode::edit::clone_stored_instance(
+        &source_file,
+        &target.service,
+        source_id
+            .as_deref()
+            .context("Source instance has no canonical id")?,
+        parent_id
+            .as_deref()
+            .context("Parent instance has no canonical id")?,
+    )?;
     let root_id = result
         .get("rootSettingsId")
         .and_then(Value::as_str)

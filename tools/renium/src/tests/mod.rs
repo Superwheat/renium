@@ -8,13 +8,13 @@ use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 
 use crate::bytecode::edit::{
-    bytecode_clone_instance, bytecode_desync_package_link, bytecode_remove_instance,
+    bytecode_desync_package_link, bytecode_remove_instance, clone_stored_instance,
 };
 use crate::bytecode::{bytecode_get_property, bytecode_set_property};
 use crate::cli::args::VcInitArgs;
 use crate::cli::{
-    BridgeConnectionArgs, BytecodeCloneInstanceArgs, BytecodeDesyncPackageLinkArgs,
-    BytecodeExportModelArgs, BytecodeExportPlaceArgs, BytecodeFileArgs, BytecodeGetPropertyArgs,
+    BridgeConnectionArgs, BytecodeDesyncPackageLinkArgs, BytecodeExportModelArgs,
+    BytecodeExportPlaceArgs, BytecodeFileArgs, BytecodeGetPropertyArgs,
     BytecodeInstanceSelectorArgs, BytecodeRemoveInstanceArgs, BytecodeSetPropertyArgs,
     MoveInstanceArgs, ProjectInstanceArgs, ProjectSourceArgs, PushEditorChangesArgs,
 };
@@ -446,17 +446,7 @@ fn cloning_a_script_refuses_to_overwrite_an_untracked_destination() {
     let destination = dir.join("Script Copy.luau");
     fs::write(&destination, "return 2").unwrap();
     let before = fs::read(&store).unwrap();
-    let result = bytecode_clone_instance(BytecodeCloneInstanceArgs {
-        input: BytecodeFileArgs::settings_file(store.clone()),
-        service: "Workspace".into(),
-        selector: BytecodeInstanceSelectorArgs::by_settings_id(Some("script".into())),
-        parent_index: None,
-        parent_settings_id: None,
-        parent_name: None,
-        parent_class_name: None,
-        override_packages: false,
-        pretty: false,
-    });
+    let result = clone_stored_instance(&store, "Workspace", "script", "root");
     assert!(result.unwrap_err().to_string().contains("already exists"));
     assert_eq!(fs::read(&store).unwrap(), before);
     assert_eq!(fs::read_to_string(destination).unwrap(), "return 2");
@@ -2304,18 +2294,7 @@ fn clone_instance_rebinds_internal_ref_properties() {
     ]);
     document.write_file(&settings_path).unwrap();
 
-    bytecode_clone_instance(BytecodeCloneInstanceArgs {
-        input: BytecodeFileArgs::settings_file(settings_path.clone()),
-        service: "Workspace".to_string(),
-        selector: BytecodeInstanceSelectorArgs::by_settings_id(Some("model".to_string())),
-        parent_index: Some(0),
-        parent_settings_id: None,
-        parent_name: None,
-        parent_class_name: None,
-        override_packages: false,
-        pretty: false,
-    })
-    .unwrap();
+    clone_stored_instance(&settings_path, "Workspace", "model", "root").unwrap();
 
     let cloned = SettingsBytecode::read_file(&settings_path).unwrap();
     let cloned_model_index = cloned

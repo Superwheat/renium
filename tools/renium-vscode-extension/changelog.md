@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Removed
+
+- `rbx bcl` (`bytecode-clone-instance`) is removed: `rbx cp SERVICE -i SOURCE -I PARENT` makes the same copy, with `-n NAME` and `--push`.
+- `rbx clk` (`click`) is removed: `rbx inp -p N click X,Y` clicks a viewport point, `right X,Y` uses the right button and `down X,Y wait MS up X,Y` holds it.
+- `rbx ky` (`key`) is removed: `rbx inp -p N key KEY` presses a key and `rbx inp -p N hold KEY MS` holds it.
+
 ### Improvements
 
 - Scripts read by function: `rbx sr FILE --outline` lists a script's functions as `FIRST-LAST name(params)` lines, `rbx sr FILE --fn NAME` prints only the named functions, and `rbx sg TEXT --fn` prints each function that holds a match once instead of single lines, so understanding one function no longer means printing its whole script.

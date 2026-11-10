@@ -364,8 +364,8 @@ def client_selectors(ctx: Context):
         missing = ctx.rbx("lc", "return 1", "5", ok=False, timeout=60)
         ctx.expect_in("No connected play client matches player selector", missing.error, "lc on client 5")
         ctx.expect_in("rbx play --add-players 1", missing.error, "lc on client 5 names add-players")
-        nobody = ctx.rbx("ky", "E", "-p", "Nobody", ok=False, timeout=60)
-        ctx.expect_in("No connected play client matches player selector", nobody.error, "ky -p Nobody")
+        nobody = ctx.rbx("inp", "-p", "Nobody", "key", "E", ok=False, timeout=60)
+        ctx.expect_in("No connected play client matches player selector", nobody.error, "inp -p Nobody")
     finally:
         _stop(ctx)
 
@@ -1073,47 +1073,46 @@ def press_a_world_part(ctx: Context):
 
 
 def viewport_clicks(ctx: Context):
-    """PLAY-084: clk clicks viewport points through the game's input with the right button and a hold;
-    the Roblox menu corner is refused. The throughSystemUi case is not scripted: no probed point of
-    the fixture's viewport lies under Roblox UI that the engine reports (see the matrix row)."""
+    """PLAY-084: inp click clicks viewport points through the game's input, and right-down, wait,
+    right-up hold the right button; the Roblox menu corner is refused. The throughSystemUi case is
+    not scripted: no probed point of the fixture's viewport lies under Roblox UI that the engine
+    reports (see the matrix row)."""
     _play(ctx)
     try:
-        clicked = ctx.rbx("clk", "450", "323", "-p", "1", timeout=60)
-        ctx.expect(clicked.get("action") == "click" and clicked.get("viewportX") == 450 and clicked.get("inputMethod") == "virtual", f"clk: {clicked.json}")
-        right = ctx.rbx("clk", "450", "323", "--right", "--hold", "200", "-p", "1", timeout=60)
-        ctx.expect(right.get("action") == "click", f"clk --right --hold 200: {right.json}")
-        ctx.expect_in("The engine reserves this point (the Roblox menu button)", ctx.rbx("clk", "30", "30", "-p", "1", ok=False, timeout=60).error, "menu corner")
+        clicked = ctx.rbx("inp", "-p", "1", "click", "450,323", timeout=60)
+        ctx.expect(clicked.get("actions") == 1 and clicked.get("inputMethod") == "virtual", f"inp click: {clicked.json}")
+        right = ctx.rbx("inp", "-p", "1", "right-down", "450,323", "wait", "200", "right-up", "450,323", timeout=60)
+        ctx.expect(right.get("actions") == 3, f"inp right-down wait 200 right-up: {right.json}")
+        ctx.expect_in("The engine reserves this point (the Roblox menu button)", ctx.rbx("inp", "-p", "1", "click", "30,30", ok=False, timeout=60).error, "menu corner")
     finally:
         _stop(ctx)
 
 
 def key_presses(ctx: Context):
-    """PLAY-085: ky presses a key for 60 ms by default and clamps short holds to 10 ms; Escape and
-    non-keyboard key codes are refused."""
+    """PLAY-085: inp key presses a key; Roblox refuses Escape and the CLI refuses non-keyboard key
+    codes."""
     _play(ctx)
     try:
-        key = ctx.rbx("ky", "Space", "-p", "1", timeout=60)
-        ctx.expect(key.get("action") == "key" and key.get("key") == "Space" and key.get("holdMs") == 60, f"ky Space: {key.json}")
-        ctx.expect_in("Escape is reserved by Roblox CoreGui", ctx.rbx("ky", "Escape", "-p", "1", ok=False, timeout=60).error, "ky Escape")
-        ctx.expect_in("Unsupported keyboard key", ctx.rbx("ky", "Gamepad1", "-p", "1", ok=False, timeout=60).error, "ky Gamepad1")
-        short = ctx.rbx("ky", "W", "--hold-ms", "1", "-p", "1", timeout=60)
-        ctx.expect(short.get("holdMs") == 10, f"ky --hold-ms 1: {short.json}")
+        key = ctx.rbx("inp", "-p", "1", "key", "Space", timeout=60)
+        ctx.expect(key.get("actions") == 1 and key.get("inputMethod") == "virtual", f"inp key Space: {key.json}")
+        ctx.expect_in("Roblox keeps this key", ctx.rbx("inp", "-p", "1", "key", "Escape", ok=False, timeout=60).error, "inp key Escape")
+        ctx.expect_in("Unsupported keyboard key", ctx.rbx("inp", "-p", "1", "key", "Gamepad1", ok=False, timeout=60).error, "inp key Gamepad1")
     finally:
         _stop(ctx)
 
 
 def long_key_holds(ctx: Context):
-    """PLAY-086 (D3): ky --hold-ms 45000 holds W for 45 s as the help promises (up to 60 s), and 70000 is
-    clamped to 60000; while D3 stands the call fails at the 30 s bridge timeout."""
+    """PLAY-086 (D3): inp hold W 45000 holds W for 45 s as the guide promises (up to 60 s), and 70000
+    ends after 60 s; while D3 stands the call fails at the 30 s bridge timeout."""
     _play(ctx)
     try:
         ctx.rbx("lc", "--detach", "keys", SAMPLER, "1", timeout=60)
-        held = ctx.rbx("ky", "W", "--hold-ms", "45000", "-p", "1", ok=None, timeout=180)
+        held = ctx.rbx("inp", "-p", "1", "hold", "W", "45000", ok=None, timeout=180)
         sampled = ctx.rbx("lc", "--collect", "keys", "1", timeout=60).pointer("/state/down") or 0
-        ctx.expect(held.ok and held.get("holdMs") == 45000 and held.seconds >= 44, f"ky --hold-ms 45000 ({held.seconds:.1f}s): {held.json} {held.error[:300]}")
+        ctx.expect(held.ok and held.seconds >= 44, f"inp hold W 45000 ({held.seconds:.1f}s): {held.json} {held.error[:300]}")
         ctx.expect(40 <= sampled <= 50, f"sampler saw W down for {sampled}s")
-        clamped = ctx.rbx("ky", "W", "--hold-ms", "70000", "-p", "1", ok=None, timeout=180)
-        ctx.expect(clamped.ok and clamped.get("holdMs") == 60000, f"ky --hold-ms 70000 ({clamped.seconds:.1f}s): {clamped.json} {clamped.error[:300]}")
+        clamped = ctx.rbx("inp", "-p", "1", "hold", "W", "70000", ok=None, timeout=180)
+        ctx.expect(clamped.ok and 59 <= clamped.seconds < 69, f"inp hold W 70000 ({clamped.seconds:.1f}s): {clamped.json} {clamped.error[:300]}")
     finally:
         _stop(ctx)
 
@@ -1301,7 +1300,7 @@ def recording_round_trip(ctx: Context):
     try:
         client = ctx.rbx("rs", "-p", "1", "-o", str(ctx.root / "c.mp4"), "--max-seconds", "5", timeout=120)
         ctx.expect(client.get("target") == "play-client", f"rs -p 1: {client.json}")
-        ctx.rbx("ky", "W", "-p", "1", timeout=60)
+        ctx.rbx("inp", "-p", "1", "key", "W", timeout=60)
         done = ctx.rbx("re", "--no-review", timeout=120)
         ctx.expect("review" not in done.json and (ctx.root / "c.mp4").is_file(), f"re --no-review: {done.json}")
     finally:

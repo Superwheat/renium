@@ -39,11 +39,11 @@ use crate::snapshot::export::{
 };
 use crate::snapshot::import::parse_services;
 use crate::studio::automation::{
-    click_result, compact_live_status, editor_review_decision_result, execute_luau_result,
-    get_console_output_result, goto_result, input_result, key_result, kill_orphans_result,
-    orphan_summaries, press_result, record_end_result, record_start_result, shot_result,
-    start_stop_play_result, studio_change_state_result, studio_device_result, type_result,
-    ui_result, wait_timed_out_result, wait_until_result,
+    compact_live_status, editor_review_decision_result, execute_luau_result,
+    get_console_output_result, goto_result, input_result, kill_orphans_result, orphan_summaries,
+    press_result, record_end_result, record_start_result, shot_result, start_stop_play_result,
+    studio_change_state_result, studio_device_result, type_result, ui_result,
+    wait_timed_out_result, wait_until_result,
 };
 use crate::studio::bridge::{
     BridgeRequestLease, BridgeServer, BridgeTarget, RequestEditRuntime, RuntimeGateGuard,
@@ -1637,18 +1637,6 @@ fn automation_dispatch_operation(
                 wait_for_play_target(bridge, bridge_wait_seconds, BridgeTarget::Client)?;
             }
             press_result(&studio_args::press(parameters)?, bridge)
-        }
-        op::CLICK => {
-            if parameters.get("player").is_none() {
-                wait_for_play_target(bridge, bridge_wait_seconds, BridgeTarget::Client)?;
-            }
-            click_result(&studio_args::click(parameters)?, bridge)
-        }
-        op::KEY => {
-            if parameters.get("player").is_none() {
-                wait_for_play_target(bridge, bridge_wait_seconds, BridgeTarget::Client)?;
-            }
-            key_result(&studio_args::key(parameters)?, bridge)
         }
         op::TYPE => {
             if parameters.get("player").is_none() {
@@ -4226,8 +4214,6 @@ fn play_target_selector(
             | op::SHOT
             | op::UI
             | op::PRESS
-            | op::CLICK
-            | op::KEY
             | op::TYPE
             | op::WAIT
             | op::GOTO
