@@ -353,23 +353,6 @@ pub(crate) fn append_editor_instance_reconcile(
     push_editor_instance_change(changes, "reconcileService", service, true, instances);
 }
 
-#[cfg(test)]
-pub(crate) fn append_editor_target_instance_upserts(
-    changes: &mut EditorChangeSet,
-    document: &SettingsBytecode,
-    service: &str,
-    filter: &EditorPropertyFilter,
-) {
-    let paths_by_index = build_editor_instance_paths(document, service);
-    append_editor_target_instance_upserts_with_paths(
-        changes,
-        document,
-        service,
-        filter,
-        &paths_by_index,
-    );
-}
-
 fn append_editor_target_instance_upserts_with_paths(
     changes: &mut EditorChangeSet,
     document: &SettingsBytecode,
@@ -480,23 +463,6 @@ fn append_editor_target_instance_upserts_for_indices(
         })
         .collect::<Vec<_>>();
     push_editor_instance_change(changes, "upsertInstances", service, false, instances);
-}
-
-#[cfg(test)]
-pub(crate) fn append_editor_target_inline_source_changes(
-    changes: &mut EditorChangeSet,
-    document: &SettingsBytecode,
-    service: &str,
-    filter: &EditorPropertyFilter,
-) {
-    let paths_by_index = build_editor_instance_paths(document, service);
-    append_editor_target_inline_source_changes_with_paths(
-        changes,
-        document,
-        service,
-        filter,
-        &paths_by_index,
-    );
 }
 
 fn append_editor_target_inline_source_changes_with_paths(

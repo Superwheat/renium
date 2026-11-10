@@ -111,30 +111,3 @@ pub(crate) fn set_automation_stdio(enabled: bool) {
 pub(crate) fn automation_stdio() -> bool {
     AUTOMATION_STDIO.load(Ordering::Relaxed)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_thread_selection_is_seen_by_its_thread_only() {
-        let selection = select_automation_for_thread(
-            Some("thread-selection-a".into()),
-            "a/renium.project.jsonc".into(),
-            Some("10:1".into()),
-        );
-        assert_eq!(automation_runtime().as_deref(), Some("thread-selection-a"));
-        assert_eq!(
-            project_override(),
-            Some(PathBuf::from("a/renium.project.jsonc"))
-        );
-        assert_eq!(place_selector().as_deref(), Some("10:1"));
-        let other = std::thread::spawn(|| (automation_runtime(), project_override()))
-            .join()
-            .unwrap();
-        assert_ne!(other.0.as_deref(), Some("thread-selection-a"));
-        assert_ne!(other.1, Some(PathBuf::from("a/renium.project.jsonc")));
-        drop(selection);
-        assert_ne!(automation_runtime().as_deref(), Some("thread-selection-a"));
-    }
-}

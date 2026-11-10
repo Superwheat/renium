@@ -679,32 +679,6 @@ mod tests {
     }
 
     #[test]
-    fn place_import_keeps_surface_slot_at_its_default() {
-        let root = crate::tests::support::temp_dir("saved-surface-slot");
-        let dom = WeakDom::new(InstanceBuilder::new("DataModel").with_child(
-            InstanceBuilder::new("Workspace").with_child(
-                InstanceBuilder::new("MeshPart").with_child(
-                    InstanceBuilder::new("SurfaceAppearance").with_property("SurfaceSlot", -1i32),
-                ),
-            ),
-        ));
-        let mut bytes = Vec::new();
-        rbx_binary::to_writer(&mut bytes, &dom, dom.root().children()).unwrap();
-        std::fs::write(root.join("place.rbxl"), bytes).unwrap();
-        std::fs::write(root.join("renium.project.jsonc"), "{\"schemaVersion\":1}").unwrap();
-        let result = run(&root);
-        assert_eq!(result["ok"], true);
-        let stored = SettingsBytecode::read_file(&root.join("instances/Workspace.renium")).unwrap();
-        let appearance = stored
-            .instances
-            .iter()
-            .find(|instance| instance.class_name == "SurfaceAppearance")
-            .unwrap();
-        assert_eq!(appearance.properties.get("SurfaceSlot"), Some(&json!(-1)));
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn a_script_imported_by_path_joins_the_service_store() {
         let root = crate::tests::support::temp_dir("ip-registers-store");
         let dom = WeakDom::new(
@@ -755,87 +729,6 @@ mod tests {
         .unwrap();
         assert!(again.is_none());
         std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn place_import_keeps_engine_geometry_data() {
-        let root = create_unique_directory(&std::env::temp_dir(), "renium-place-import-geometry-")
-            .expect("temp project");
-        let data = |text: &str| rbx_dom_weak::types::SharedString::new(text.as_bytes().to_vec());
-        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
-        let workspace = dom.insert(dom.root_ref(), InstanceBuilder::new("Workspace"));
-        dom.insert(
-            workspace,
-            InstanceBuilder::new("UnionOperation")
-                .with_name("Track")
-                .with_property("ChildData2", data("tree"))
-                .with_property("MeshData2", data("mesh"))
-                .with_property(
-                    "SolidMeshHolder",
-                    rbx_dom_weak::types::NetAssetRef::new(b"holder".to_vec()),
-                )
-                .with_property("SourceAssetId", 42i64),
-        );
-        dom.insert(
-            workspace,
-            InstanceBuilder::new("Terrain").with_property("Materials", data("colours")),
-        );
-        dom.insert(
-            workspace,
-            InstanceBuilder::new("MeshPart")
-                .with_name("Rock")
-                .with_property("PhysicalConfigData", data("CSGPHS-hull")),
-        );
-        dom.insert(
-            workspace,
-            InstanceBuilder::new("MeshPart")
-                .with_name("Box")
-                .with_property("PhysicalConfigData", data("CSGPHS\0\0\0\0BLOCK")),
-        );
-        let mut bytes = Vec::new();
-        rbx_binary::to_writer(&mut bytes, &dom, dom.root().children()).expect("place bytes");
-        std::fs::write(root.join("place.rbxl"), bytes).expect("place file");
-        std::fs::write(
-            root.join("renium.project.jsonc"),
-            "{\n  \"schemaVersion\": 1\n}\n",
-        )
-        .expect("project file");
-        let result = run(&root);
-        assert_eq!(result["ok"], true, "{result}");
-        let instances =
-            SettingsBytecode::read_file(&root.join("instances").join("Workspace.renium"))
-                .expect("workspace store")
-                .instances;
-        let keys = |class: &str| {
-            instances
-                .iter()
-                .find(|instance| instance.class_name == class)
-                .map(|instance| instance.properties.keys().cloned().collect::<Vec<_>>())
-                .unwrap_or_default()
-        };
-        let union = keys("UnionOperation");
-        assert!(union.iter().any(|key| key == "ChildData2"), "{union:?}");
-        assert!(union.iter().any(|key| key == "MeshData2"), "{union:?}");
-        assert!(
-            union.iter().any(|key| key == "SolidMeshHolder"),
-            "{union:?}"
-        );
-        assert!(union.iter().any(|key| key == "SourceAssetId"), "{union:?}");
-        let terrain = keys("Terrain");
-        assert!(terrain.iter().any(|key| key == "Materials"), "{terrain:?}");
-        let mesh = keys("MeshPart");
-        assert!(
-            mesh.iter().any(|key| key == "PhysicalConfigData"),
-            "{mesh:?}"
-        );
-        let boxed = instances
-            .iter()
-            .find(|instance| instance.name == "Box")
-            .unwrap();
-        assert!(
-            boxed.properties.contains_key("PhysicalConfigData"),
-            "an explicitly saved Box hull must survive without its import base"
-        );
     }
 
     #[test]

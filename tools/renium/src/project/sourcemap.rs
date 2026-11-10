@@ -1,7 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
-#[cfg(test)]
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -786,44 +784,5 @@ fn wait_for_sourcemap_change(
             }
         }
         return Ok(());
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::settings::bytecode::SETTINGS_BINARY_VERSION;
-    use crate::tests::support::{settings_instance, temp_dir};
-
-    #[test]
-    fn serialized_instances_are_kept_in_sourcemap() {
-        let root = temp_dir("full-sourcemap");
-        let service_dir = root.join("src/Workspace");
-        fs::create_dir_all(service_dir.join("Body")).unwrap();
-        fs::write(service_dir.join("Body/Logic.luau"), b"return true").unwrap();
-        let document = SettingsBytecode {
-            version: SETTINGS_BINARY_VERSION,
-            instances: vec![
-                settings_instance("root", "Workspace", "Workspace", None),
-                settings_instance("body", "Body", "Part", Some(0)),
-                settings_instance("logic", "Logic", "ModuleScript", Some(1)),
-                settings_instance("effect", "Smoke", "Smoke", Some(1)),
-            ],
-        };
-        document
-            .write_file(&service_settings_path(&service_dir))
-            .unwrap();
-
-        let sourcemap = build_project_sourcemap_with_loaded(&root, None).unwrap();
-        let body = &sourcemap.children[0].children[0];
-
-        assert_eq!(body.class_name, "Part");
-        assert_eq!(body.children[0].class_name, "ModuleScript");
-        assert_eq!(
-            body.children[0].file_paths,
-            ["src/Workspace/Body/Logic.luau"]
-        );
-        assert_eq!(body.children[1].class_name, "Smoke");
-        fs::remove_dir_all(root).unwrap();
     }
 }

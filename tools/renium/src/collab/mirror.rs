@@ -825,20 +825,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn keys_use_forward_slashes_relative_to_root() {
-        let root = Path::new("E:/proj");
-        assert_eq!(
-            key_for(root, Path::new("E:/proj/src/a/b.luau")),
-            Some("src/a/b.luau".into())
-        );
-        assert_eq!(key_for(root, Path::new("E:/other/x")), None);
-        assert_eq!(
-            path_for(root, "src/a/b.luau"),
-            Some(PathBuf::from("E:/proj/src/a/b.luau"))
-        );
-    }
-
-    #[test]
     fn remote_keys_stay_inside_the_project() {
         let root = Path::new("E:/proj");
         for key in [

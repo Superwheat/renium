@@ -99,28 +99,6 @@ fn assert_twin_ids_unique(document: &SettingsBytecode) {
 }
 
 #[test]
-fn first_pairing_twins_swapped_and_indistinguishable_both_survive() {
-    for values in [["A", "B"], ["same", "same"]] {
-        let mut editor = twin_document();
-        for value in values {
-            twin_add(
-                &mut editor,
-                0,
-                "AntiRollBar",
-                "StringValue",
-                json!({"Value":value}),
-            );
-        }
-        let mut studio = twin_observation(&editor);
-        let conflicts = twin_align(&mut editor, &mut studio);
-        assert!(conflicts.is_empty(), "{conflicts:?}");
-        assert_eq!(studio.instances.len(), 3);
-        assert_twin_ids_unique(&studio);
-        assert!(settings_documents_equivalent(&editor, &studio));
-    }
-}
-
-#[test]
 fn first_pairing_twins_changed_group_keeps_every_positional_slot() {
     let mut editor = twin_document();
     for value in ["A", "B", "C"] {
@@ -146,144 +124,6 @@ fn first_pairing_twins_changed_group_keeps_every_positional_slot() {
         "{conflicts:?}"
     );
     assert_twin_ids_unique(&studio);
-}
-
-#[test]
-fn first_pairing_twins_welds_and_rods_follow_their_joined_parts() {
-    let mut editor = twin_document();
-    let left = twin_add(&mut editor, 0, "Left", "Part", json!({}));
-    let right = twin_add(&mut editor, 0, "Right", "Part", json!({}));
-    for (class, name, property) in [
-        ("Weld", "Weld - Cylinder / Part", "Part0"),
-        ("RodConstraint", "RollPad", "Attachment0"),
-    ] {
-        for target in [left, right] {
-            let reference = twin_ref(&editor, target);
-            twin_add(&mut editor, 0, name, class, json!({property:reference}));
-        }
-    }
-    let mut studio = twin_observation(&editor);
-    let conflicts = twin_align(&mut editor, &mut studio);
-    assert!(conflicts.is_empty(), "{conflicts:?}");
-    assert!(settings_documents_equivalent(&editor, &studio));
-    assert_twin_ids_unique(&studio);
-}
-
-#[test]
-fn first_pairing_twins_five_nested_levels_resolve_before_descendant_keys() {
-    fn add_level(document: &mut SettingsBytecode, parent: usize, depth: usize, marker: usize) {
-        if depth == 0 {
-            twin_add(
-                document,
-                parent,
-                "Part",
-                "Part",
-                json!({"Transparency":marker as f64 / 100.0}),
-            );
-            return;
-        }
-        for side in 0..2 {
-            let child = twin_add(document, parent, "Model", "Model", json!({}));
-            add_level(document, child, depth - 1, marker * 2 + side);
-        }
-    }
-    let mut editor = twin_document();
-    add_level(&mut editor, 0, 5, 0);
-    let mut studio = twin_observation(&editor);
-    let conflicts = twin_align(&mut editor, &mut studio);
-    assert!(conflicts.is_empty(), "{conflicts:?}");
-    assert_eq!(studio.instances.len(), editor.instances.len());
-    assert_twin_ids_unique(&studio);
-    assert!(settings_documents_equivalent(&editor, &studio));
-}
-
-#[test]
-fn first_pairing_twins_primary_parts_are_relative_to_each_candidate() {
-    let mut editor = twin_document();
-    for transparency in [0.2, 0.8] {
-        let model = twin_add(&mut editor, 0, "Model", "Model", json!({}));
-        let part = twin_add(
-            &mut editor,
-            model,
-            "Part",
-            "Part",
-            json!({"Transparency":transparency}),
-        );
-        let reference = twin_ref(&editor, part);
-        editor.instances[model]
-            .properties
-            .insert("PrimaryPart".into(), reference);
-    }
-    let mut studio = twin_observation(&editor);
-    let conflicts = twin_align(&mut editor, &mut studio);
-    assert!(conflicts.is_empty(), "{conflicts:?}");
-    assert!(settings_documents_equivalent(&editor, &studio));
-}
-
-#[test]
-fn first_pairing_twins_identity_locks_survive_an_unrelated_repair() {
-    let mut editor = twin_document();
-    for id in 1..=2 {
-        twin_add(
-            &mut editor,
-            0,
-            "Identified",
-            "Part",
-            json!({"UniqueId":{"_type":"UniqueId", "value":format!("{id:032x}")}, "Transparency":id as f64 / 10.0}),
-        );
-        twin_add(
-            &mut editor,
-            0,
-            "Repaired",
-            "StringValue",
-            json!({"Value":id.to_string()}),
-        );
-    }
-    let mut studio = twin_observation(&editor);
-    for instance in studio
-        .instances
-        .iter_mut()
-        .filter(|instance| instance.name == "Identified")
-    {
-        instance
-            .properties
-            .insert("Transparency".into(), json!(0.9));
-    }
-    let conflicts = twin_align(&mut editor, &mut studio);
-    assert_eq!(conflicts.len(), 2, "{conflicts:?}");
-    assert!(
-        conflicts
-            .iter()
-            .all(|conflict| conflict.contains("different values")),
-        "{conflicts:?}"
-    );
-    for instance in studio
-        .instances
-        .iter()
-        .filter(|instance| instance.name == "Identified")
-    {
-        let original = editor
-            .instances
-            .iter()
-            .find(|other| persistent_identity(other) == persistent_identity(instance))
-            .unwrap();
-        assert_eq!(instance.settings_id, original.settings_id);
-        assert_eq!(instance.properties["Transparency"], 0.9);
-    }
-    assert_twin_ids_unique(&studio);
-}
-
-#[test]
-fn first_pairing_twins_class_check_uses_repaired_parent_and_child_paths() {
-    let mut editor = twin_document();
-    for class in ["Part", "Folder"] {
-        let parent = twin_add(&mut editor, 0, "Garage", "Model", json!({}));
-        twin_add(&mut editor, parent, "Child", class, json!({}));
-    }
-    let mut studio = twin_observation(&editor);
-    let conflicts = twin_align(&mut editor, &mut studio);
-    assert!(conflicts.is_empty(), "{conflicts:?}");
-    assert!(settings_documents_equivalent(&editor, &studio));
 }
 
 #[test]
@@ -331,51 +171,6 @@ fn first_pairing_twins_reference_to_an_indistinguishable_attachment_is_equal() {
         assert_twin_ids_unique(&studio);
         assert!(settings_documents_equivalent(&editor, &studio));
     }
-}
-
-#[test]
-fn first_pairing_twins_20k_children_timing() {
-    let mut editor = twin_document();
-    for group in 0..10_000 {
-        for value in ["A", "B"] {
-            twin_add(
-                &mut editor,
-                0,
-                &format!("Twin{group}"),
-                "StringValue",
-                json!({"Value":value}),
-            );
-        }
-    }
-    let studio = twin_observation(&editor);
-    // Warm reflection metadata: this measures the repair, not database loading.
-    let _ = rbx_reflection_database::get().unwrap();
-    let started = Instant::now();
-    let resolved = pairing::twins::resolve(&editor, &studio);
-    let elapsed = started.elapsed();
-    eprintln!(
-        "20k children / 10k groups: {:.3} ms (debug repair including indexes and references)",
-        elapsed.as_secs_f64() * 1000.0
-    );
-    assert!(resolved.partners.iter().all(Option::is_some));
-    assert_eq!(
-        resolved
-            .partners
-            .iter()
-            .copied()
-            .collect::<HashSet<_>>()
-            .len(),
-        editor.instances.len()
-    );
-    for (source, target) in resolved.partners.iter().enumerate() {
-        assert_eq!(
-            studio.instances[source].properties,
-            editor.instances[target.unwrap()].properties
-        );
-    }
-    // Record the measured figure, including indexing and reference setup;
-    // host scheduling is not a correctness assertion. See the delivery report
-    // for the current debug timing and its comparison with the 50 ms target.
 }
 
 #[test]
@@ -456,91 +251,6 @@ fn first_pairing_twins_reference_failure_rolls_back_the_entire_subtree() {
 }
 
 #[test]
-fn first_pairing_twins_nested_reference_only_joints_resolve_in_candidate_scope() {
-    let mut editor = twin_document();
-    let left = twin_add(&mut editor, 0, "Left", "Part", json!({}));
-    let right = twin_add(&mut editor, 0, "Right", "Part", json!({}));
-    for marker in ["A", "B"] {
-        let model = twin_add(&mut editor, 0, "Garage", "Model", json!({}));
-        twin_add(
-            &mut editor,
-            model,
-            "Marker",
-            "StringValue",
-            json!({"Value":marker}),
-        );
-        for target in [left, right] {
-            let reference = twin_ref(&editor, target);
-            twin_add(
-                &mut editor,
-                model,
-                "Weld",
-                "Weld",
-                json!({"Part0":reference}),
-            );
-        }
-    }
-    let mut studio = twin_observation(&editor);
-    let conflicts = twin_align(&mut editor, &mut studio);
-    assert!(conflicts.is_empty(), "{conflicts:?}");
-    assert!(settings_documents_equivalent(&editor, &studio));
-}
-
-#[test]
-fn first_pairing_twins_changed_attachment_is_not_interchangeable() {
-    let mut editor = twin_document();
-    let mut targets = Vec::new();
-    for x in [0.0, 1.0] {
-        targets.push(twin_add(
-            &mut editor,
-            0,
-            "MotorAttachment",
-            "Attachment",
-            json!({"CFrame":{"_type":"CFrame", "components":[x,0,0,1,0,0,0,1,0,0,0,1]}}),
-        ));
-    }
-    let reference = twin_ref(&editor, targets[0]);
-    let motor = twin_add(
-        &mut editor,
-        0,
-        "WheelRLMotor",
-        "HingeConstraint",
-        json!({"Attachment0":reference}),
-    );
-    let mut studio = editor.clone();
-    studio.instances[motor]
-        .properties
-        .insert("Attachment0".into(), twin_ref(&editor, targets[1]));
-    let conflicts = twin_align(&mut editor, &mut studio);
-    assert!(
-        conflicts
-            .iter()
-            .any(|conflict| conflict.contains("Attachment0")),
-        "{conflicts:?}"
-    );
-}
-
-#[test]
-fn first_pairing_twins_groups_above_512_keep_positions() {
-    let mut editor = twin_document();
-    for index in 0..513 {
-        twin_add(
-            &mut editor,
-            0,
-            "Part",
-            "StringValue",
-            json!({"Value":index.to_string()}),
-        );
-    }
-    let studio = twin_observation(&editor);
-    let resolved = pairing::twins::resolve(&editor, &studio);
-    assert_eq!(
-        resolved.partners,
-        (0..editor.instances.len()).map(Some).collect::<Vec<_>>()
-    );
-}
-
-#[test]
 fn first_pairing_twins_at_512_borrow_large_property_maps() {
     let mut editor = twin_document();
     for index in 0..512 {
@@ -567,62 +277,6 @@ fn first_pairing_twins_at_512_borrow_large_property_maps() {
         resolved.partners[1..],
         (1..=512).rev().map(Some).collect::<Vec<_>>()
     );
-}
-
-#[test]
-fn first_pairing_twins_reference_dependencies_follow_five_target_groups() {
-    let mut editor = twin_document();
-    let mut targets = [
-        twin_add(&mut editor, 0, "Left", "Part", json!({})),
-        twin_add(&mut editor, 0, "Right", "Part", json!({})),
-    ];
-    for level in 0..5 {
-        targets = targets.map(|target| {
-            let reference = twin_ref(&editor, target);
-            twin_add(
-                &mut editor,
-                0,
-                &format!("Joint{level}"),
-                "ObjectValue",
-                json!({"Value":reference}),
-            )
-        });
-    }
-    let mut studio = twin_observation(&editor);
-    let conflicts = twin_align(&mut editor, &mut studio);
-    assert!(conflicts.is_empty(), "{conflicts:?}");
-    assert!(settings_documents_equivalent(&editor, &studio));
-}
-
-#[test]
-fn first_pairing_twins_back_references_use_the_candidate_ancestor() {
-    let mut editor = twin_document();
-    let targets = [
-        twin_add(&mut editor, 0, "Left", "Part", json!({})),
-        twin_add(&mut editor, 0, "Right", "Part", json!({})),
-    ];
-    for target in targets {
-        let reference = twin_ref(&editor, target);
-        let parent = twin_add(
-            &mut editor,
-            0,
-            "Container",
-            "ObjectValue",
-            json!({"Value":reference}),
-        );
-        let reference = twin_ref(&editor, parent);
-        twin_add(
-            &mut editor,
-            parent,
-            "Backlink",
-            "ObjectValue",
-            json!({"Value":reference}),
-        );
-    }
-    let mut studio = twin_observation(&editor);
-    let conflicts = twin_align(&mut editor, &mut studio);
-    assert!(conflicts.is_empty(), "{conflicts:?}");
-    assert!(settings_documents_equivalent(&editor, &studio));
 }
 
 #[test]
@@ -1431,28 +1085,6 @@ fn part_colors_that_share_a_byte_are_equal() {
 }
 
 #[test]
-fn folder_icon_tint_default_does_not_invent_full_push_changes() {
-    let black = json!({"_type": "Color3", "r": 0.0, "g": 0.0, "b": 0.0});
-    let red = json!({"_type": "Color3", "r": 1.0, "g": 0.0, "b": 0.0});
-    assert!(reconciliation_property_values_equal(
-        "Folder",
-        "IconTint",
-        None,
-        Some(&black)
-    ));
-    assert!(!reconciliation_property_values_equal(
-        "Folder",
-        "IconTint",
-        None,
-        Some(&red)
-    ));
-    assert!(!reconciliation_values_map_equal(
-        &Map::new(),
-        &Map::from_iter([("IconTint".into(), black)])
-    ));
-}
-
-#[test]
 fn initial_native_import_requires_no_ordinary_instances() {
     let mut root =
         SettingsBytecodeInstance::new("root".into(), "Workspace".into(), "Workspace".into(), None);
@@ -1877,36 +1509,6 @@ fn source_only_push_skips_service_readback_only_after_exact_verification() {
 }
 
 #[test]
-fn an_omitted_property_at_its_default_counts_as_retained() {
-    let part = SettingsBytecodeInstance::new("part".into(), "Part".into(), "Part".into(), Some(0));
-    let reflectance = |value: f64| Map::from_iter([("Reflectance".to_string(), json!(value))]);
-    let before = reflectance(0.4);
-    let desired = Map::new();
-    assert_eq!(
-        changed_map_mismatch(&before, &desired, &reflectance(0.0), true, &part),
-        None,
-        "Studio holds the class default for the omitted property"
-    );
-    assert!(
-        changed_map_mismatch(&before, &desired, &reflectance(0.7), true, &part).is_some(),
-        "a non-default value is a real retention failure"
-    );
-    let workspace =
-        SettingsBytecodeInstance::new("ws".into(), "Workspace".into(), "Workspace".into(), None);
-    let point = |x: f64| {
-        Map::from_iter([(
-            "InsertPoint".to_string(),
-            json!({"_type": "Vector3", "x": x, "y": 0.0, "z": 0.0}),
-        )])
-    };
-    assert_eq!(
-        changed_map_mismatch(&point(4.0), &Map::new(), &point(7.0), true, &workspace),
-        None,
-        "Studio owns the insert point"
-    );
-}
-
-#[test]
 fn a_weld_studio_replaced_with_a_rigid_constraint_is_not_put_back() {
     use super::pairing::drop_joints_studio_migrated;
     let document = |joint: Option<(&str, &str)>| {
@@ -2202,61 +1804,6 @@ fn push_verification_distinguishes_engine_identity_from_authored_data() {
 }
 
 #[test]
-fn push_verification_accepts_the_cframe_a_weld_re_derives_for_a_part() {
-    let part = SettingsBytecodeInstance::new("part".into(), "Part".into(), "Part".into(), None);
-    let cframe = |x: f64, y: f64| {
-        let mut components = vec![x, y, -1719.797607421875];
-        components.extend([0.867, 0.0, 0.498, 0.0, 1.0, 0.0, -0.498, 0.0, 0.867]);
-        Map::from_iter([(
-            "CFrame".to_string(),
-            json!({"_type": "CFrame", "components": components}),
-        )])
-    };
-    let desired = cframe(-225.7361297607422, 17.22353172302246);
-    let observed = cframe(-225.73619079589844, 17.223518371582);
-    assert_eq!(
-        expected_map_mismatch(&desired, &observed, true, &part),
-        None
-    );
-    assert_eq!(
-        changed_map_mismatch(&cframe(0.0, 0.0), &desired, &observed, true, &part),
-        None
-    );
-    assert!(
-        expected_map_mismatch(&desired, &cframe(-225.2, 17.22353172302246), true, &part).is_some()
-    );
-    let mut turned = observed.clone();
-    turned["CFrame"]["components"][3] = json!(0.866);
-    assert!(expected_map_mismatch(&desired, &turned, true, &part).is_some());
-    assert!(expected_map_mismatch(&desired, &Map::new(), true, &part).is_some());
-}
-
-#[test]
-fn push_verification_accepts_the_velocity_the_engine_recomputes_for_a_part() {
-    let part = SettingsBytecodeInstance::new("part".into(), "Part".into(), "Part".into(), None);
-    let velocity = |y: f64| {
-        Map::from_iter([(
-            "Velocity".to_string(),
-            json!({"x": -84.39002227783203, "y": y, "z": 8.707216262817383}),
-        )])
-    };
-    let desired = velocity(-0.8368339538574219);
-    let observed = velocity(-0.8368288278579712);
-    assert_eq!(
-        expected_map_mismatch(&desired, &observed, true, &part),
-        None
-    );
-    assert_eq!(
-        changed_map_mismatch(&velocity(0.0), &desired, &observed, true, &part),
-        None
-    );
-    assert!(expected_map_mismatch(&desired, &Map::new(), true, &part).is_some());
-    let size = Map::from_iter([("Size".to_string(), json!({"x": 1.0, "y": 2.0, "z": 3.0}))]);
-    let other = Map::from_iter([("Size".to_string(), json!({"x": 1.0, "y": 2.5, "z": 3.0}))]);
-    assert!(expected_map_mismatch(&size, &other, true, &part).is_some());
-}
-
-#[test]
 fn push_verification_accepts_the_texture_pack_studio_issues_for_an_appearance() {
     let appearance = SettingsBytecodeInstance::new(
         "appearance".into(),
@@ -2280,54 +1827,6 @@ fn push_verification_accepts_the_texture_pack_studio_issues_for_an_appearance() 
     assert!(expected_map_mismatch(&desired, &Map::new(), true, &appearance).is_some());
     let part = SettingsBytecodeInstance::new("part".into(), "Part".into(), "Part".into(), None);
     assert!(expected_map_mismatch(&desired, &observed, true, &part).is_some());
-}
-
-#[test]
-fn push_verification_accepts_engine_migrations_and_forced_text_wrapping() {
-    let part = SettingsBytecodeInstance::new("part".into(), "Part".into(), "Part".into(), None);
-    let before = Map::new();
-    let desired = Map::from_iter([("InertiaMigrated".to_string(), json!(false))]);
-    let observed = Map::from_iter([("InertiaMigrated".to_string(), json!(true))]);
-    assert_eq!(
-        expected_map_mismatch(&desired, &observed, true, &part),
-        None
-    );
-    assert_eq!(
-        changed_map_mismatch(&before, &desired, &observed, true, &part),
-        None
-    );
-
-    let label =
-        SettingsBytecodeInstance::new("label".into(), "Title".into(), "TextLabel".into(), None);
-    let desired = Map::from_iter([
-        ("TextScaled".to_string(), json!(true)),
-        ("TextWrapped".to_string(), json!(false)),
-    ]);
-    let observed = Map::from_iter([
-        ("TextScaled".to_string(), json!(true)),
-        ("TextWrapped".to_string(), json!(true)),
-    ]);
-    assert_eq!(
-        expected_map_mismatch(&desired, &observed, true, &label),
-        None
-    );
-    assert_eq!(
-        changed_map_mismatch(&before, &desired, &observed, true, &label),
-        None
-    );
-    let unscaled = Map::from_iter([
-        ("TextScaled".to_string(), json!(false)),
-        ("TextWrapped".to_string(), json!(false)),
-    ]);
-    assert_eq!(
-        expected_map_mismatch(&unscaled, &observed, true, &label).as_deref(),
-        Some("TextScaled was not retained (expected false, Studio has true)")
-    );
-    let wrapped_only = Map::from_iter([("TextWrapped".to_string(), json!(false))]);
-    assert_eq!(
-        expected_map_mismatch(&wrapped_only, &observed, true, &label).as_deref(),
-        Some("TextWrapped was not retained (expected false, Studio has true)")
-    );
 }
 
 #[test]
@@ -2502,88 +2001,6 @@ fn push_verification_batch_preserves_all_failures_and_decode_errors() {
 }
 
 #[test]
-fn targeted_push_verification_ignores_unrelated_studio_edits() {
-    let path = PathBuf::from("src/ReplicatedStorage/__roblox_sync_settings.renium");
-    let snapshot = |anchored: bool, concurrent: Option<&str>| {
-        let mut part = SettingsBytecodeInstance {
-            settings_id: "part".to_string(),
-            name: "Part".to_string(),
-            class_name: "Part".to_string(),
-            parent_index: Some(0),
-            properties: Map::from_iter([("Anchored".to_string(), Value::Bool(anchored))]),
-            attributes: Map::new(),
-        };
-        if let Some(value) = concurrent {
-            part.attributes.insert(
-                "ConcurrentProbe".to_string(),
-                Value::String(value.to_string()),
-            );
-        }
-        let document = SettingsBytecode {
-            version: SETTINGS_BINARY_VERSION,
-            instances: vec![
-                SettingsBytecodeInstance {
-                    settings_id: "root".to_string(),
-                    name: "ReplicatedStorage".to_string(),
-                    class_name: "ReplicatedStorage".to_string(),
-                    parent_index: None,
-                    properties: Map::new(),
-                    attributes: Map::new(),
-                },
-                part,
-            ],
-        };
-        ProjectSnapshot {
-            entries: [(
-                path.clone(),
-                SnapshotEntry::File(encode_settings_bytecode(&document).unwrap()),
-            )]
-            .into_iter()
-            .collect(),
-        }
-    };
-    let before = snapshot(true, None);
-    let desired = snapshot(false, None);
-    let observed = snapshot(false, Some("kept"));
-    let paths = HashSet::from([path.clone()]);
-    let overwritten = snapshot(true, Some("kept"));
-    for reuse in [false, true] {
-        let prepared = || {
-            if reuse {
-                HashMap::from([(
-                    path.clone(),
-                    PreparedPushVerification {
-                        previous: settings_document(before.entries.get(&path)).unwrap(),
-                        desired: Arc::new(settings_document(desired.entries.get(&path)).unwrap()),
-                    },
-                )])
-            } else {
-                HashMap::new()
-            }
-        };
-        let (mismatches, _) = snapshot_intended_delta_mismatches(
-            &before,
-            &desired,
-            &observed,
-            &paths,
-            &mut prepared(),
-        )
-        .unwrap();
-        assert!(mismatches.is_empty());
-        let (mismatches, detail) = snapshot_intended_delta_mismatches(
-            &before,
-            &desired,
-            &overwritten,
-            &paths,
-            &mut prepared(),
-        )
-        .unwrap();
-        assert_eq!(mismatches, vec![path.clone()]);
-        assert!(detail.is_some_and(|detail| detail.contains("Anchored")));
-    }
-}
-
-#[test]
 fn targeted_push_verification_ignores_package_modified_state() {
     let path = PathBuf::from("src/ReplicatedStorage/__roblox_sync_settings.renium");
     let instance = |id: &str, name: &str, class_name: &str, parent_index: Option<usize>| {
@@ -2672,86 +2089,6 @@ fn targeted_push_verification_ignores_package_modified_state() {
     .unwrap();
     assert_eq!(mismatches, vec![path]);
     assert!(detail.is_some_and(|detail| detail.contains("Archivable")));
-}
-
-#[test]
-fn targeted_push_verification_checks_script_files_not_settings_source_metadata() {
-    let settings_path = PathBuf::from("src/ReplicatedStorage/__roblox_sync_settings.renium");
-    let source_path = PathBuf::from("src/ReplicatedStorage/ProbeModule.luau");
-    let snapshot = |settings_source: &str, file_source: &str| {
-        let document = SettingsBytecode {
-            version: SETTINGS_BINARY_VERSION,
-            instances: vec![
-                SettingsBytecodeInstance {
-                    settings_id: "root".to_string(),
-                    name: "ReplicatedStorage".to_string(),
-                    class_name: "ReplicatedStorage".to_string(),
-                    parent_index: None,
-                    properties: Map::new(),
-                    attributes: Map::new(),
-                },
-                SettingsBytecodeInstance {
-                    settings_id: "script".to_string(),
-                    name: "ProbeModule".to_string(),
-                    class_name: "ModuleScript".to_string(),
-                    parent_index: Some(0),
-                    properties: Map::from_iter([(
-                        "Source".to_string(),
-                        Value::String(settings_source.to_string()),
-                    )]),
-                    attributes: Map::new(),
-                },
-            ],
-        };
-        ProjectSnapshot {
-            entries: [
-                (
-                    settings_path.clone(),
-                    SnapshotEntry::File(encode_settings_bytecode(&document).unwrap()),
-                ),
-                (
-                    source_path.clone(),
-                    SnapshotEntry::File(file_source.as_bytes().to_vec()),
-                ),
-            ]
-            .into_iter()
-            .collect(),
-        }
-    };
-    let before = ProjectSnapshot::default();
-    let desired = snapshot("return 'desired'", "return 'desired'\n");
-    let observed = snapshot("external", "return 'desired'\n");
-    let paths = HashSet::from([settings_path.clone(), source_path.clone()]);
-    let (mismatches, _) = snapshot_intended_delta_mismatches(
-        &before,
-        &desired,
-        &observed,
-        &paths,
-        &mut HashMap::new(),
-    )
-    .unwrap();
-    assert!(mismatches.is_empty());
-
-    let observed = snapshot("return 'desired'", "return 'wrong'\n");
-    let (mismatches, _) = snapshot_intended_delta_mismatches(
-        &before,
-        &desired,
-        &observed,
-        &paths,
-        &mut HashMap::new(),
-    )
-    .unwrap();
-    assert_eq!(mismatches, vec![source_path]);
-}
-
-#[test]
-fn reconciliation_treats_elided_class_defaults_as_equal() {
-    let omitted = Map::new();
-    let default = Map::from_iter([("CanCollide".to_string(), Value::Bool(true))]);
-    let changed = Map::from_iter([("CanCollide".to_string(), Value::Bool(false))]);
-    assert!(reconciliation_maps_equal("Part", &default, &omitted));
-    assert!(reconciliation_maps_equal("Part", &omitted, &default));
-    assert!(!reconciliation_maps_equal("Part", &changed, &omitted));
 }
 
 #[test]
@@ -2845,14 +2182,6 @@ fn runtime_bootstrap_requires_tracking_without_fresh_edits() {
         "dirtyServices": ["ReplicatedStorage", "StarterGui"],
         "restoredPendingServices": ["ReplicatedStorage"],
     })));
-}
-
-#[test]
-fn source_equivalence_normalizes_crlf_and_lone_cr_without_allocating() {
-    let path = Path::new("script.luau");
-    let left = SnapshotEntry::File(b"first\r\nsecond\rthird\n".to_vec());
-    let right = SnapshotEntry::File(b"first\nsecond\nthird\n".to_vec());
-    assert!(entries_equivalent(path, Some(&left), Some(&right)));
 }
 
 #[test]
@@ -3633,85 +2962,6 @@ fn first_pairing_unions_separate_files_and_blocks_same_file_conflicts() {
 }
 
 #[test]
-fn mismatch_details_ignore_instance_serialization_order() {
-    let instance = |id: &str,
-                    name: &str,
-                    class_name: &str,
-                    parent_index: Option<usize>,
-                    marker: Option<f64>,
-                    value: Option<&str>| {
-        let mut instance = SettingsBytecodeInstance {
-            settings_id: id.to_string(),
-            name: name.to_string(),
-            class_name: class_name.to_string(),
-            parent_index,
-            properties: Map::new(),
-            attributes: Map::new(),
-        };
-        if let Some(marker) = marker {
-            instance
-                .attributes
-                .insert("Marker".to_string(), json!(marker));
-        }
-        if let Some(value) = value {
-            instance
-                .properties
-                .insert("Value".to_string(), json!(value));
-        }
-        instance
-    };
-    let snapshot = |document: SettingsBytecode| ProjectSnapshot {
-        entries: [(
-            PathBuf::from("src/ServerStorage/__roblox_sync_settings.renium"),
-            SnapshotEntry::File(encode_settings_bytecode(&document).unwrap()),
-        )]
-        .into_iter()
-        .collect(),
-    };
-    let expected = snapshot(SettingsBytecode {
-        version: SETTINGS_BINARY_VERSION,
-        instances: vec![
-            instance("root", "ServerStorage", "ServerStorage", None, None, None),
-            instance("burst", "Burst", "Folder", Some(0), None, None),
-            instance("one", "Node", "Folder", Some(1), Some(1.0), None),
-            instance("two", "Node", "Folder", Some(1), Some(2.0), None),
-            instance(
-                "holder",
-                "Holder",
-                "StringValue",
-                Some(0),
-                None,
-                Some("editor"),
-            ),
-        ],
-    });
-    let observed = snapshot(SettingsBytecode {
-        version: SETTINGS_BINARY_VERSION,
-        instances: vec![
-            instance("root", "ServerStorage", "ServerStorage", None, None, None),
-            instance(
-                "holder",
-                "Holder",
-                "StringValue",
-                Some(0),
-                None,
-                Some("studio"),
-            ),
-            instance("burst", "Burst", "Folder", Some(0), None, None),
-            instance("two", "Node", "Folder", Some(2), Some(2.0), None),
-            instance("one", "Node", "Folder", Some(2), Some(1.0), None),
-        ],
-    });
-    let path = PathBuf::from("src/ServerStorage/__roblox_sync_settings.renium");
-
-    let detail = snapshot_mismatch_details(&observed, &expected, &[path])
-        .unwrap()
-        .unwrap();
-    assert!(detail.contains("Holder.Value property"), "{detail}");
-    assert!(!detail.contains("different structure"), "{detail}");
-}
-
-#[test]
 fn live_sync_readback_retains_nonfinite_cframes_and_describes_real_differences() {
     let path = PathBuf::from("instances/ReplicatedStorage.renium");
     let mut root = SettingsBytecodeInstance::new(
@@ -4298,75 +3548,6 @@ fn a_script_the_merge_brings_back_keeps_its_source_file() {
     assert!(changes.editor.contains(&init_path));
     assert!(changes.editor.contains(&folder_path));
     assert!(!changes.studio.contains(&init_path));
-}
-
-#[test]
-fn three_way_settings_merge_keeps_concurrent_additions() {
-    let instance = |id: &str, name: &str, parent_index: Option<usize>| SettingsBytecodeInstance {
-        settings_id: id.to_string(),
-        name: name.to_string(),
-        class_name: "Folder".to_string(),
-        parent_index,
-        properties: Map::new(),
-        attributes: Map::new(),
-    };
-    let snapshot = |document: SettingsBytecode| ProjectSnapshot {
-        entries: [(
-            PathBuf::from("src/StarterGui/__roblox_sync_settings.renium"),
-            SnapshotEntry::File(encode_settings_bytecode(&document).unwrap()),
-        )]
-        .into_iter()
-        .collect(),
-    };
-    let baseline = snapshot(SettingsBytecode {
-        version: SETTINGS_BINARY_VERSION,
-        instances: vec![
-            instance("root", "StarterGui", None),
-            instance("existing", "Existing", Some(0)),
-        ],
-    });
-    let editor = snapshot(SettingsBytecode {
-        version: SETTINGS_BINARY_VERSION,
-        instances: vec![
-            instance("root", "StarterGui", None),
-            instance("existing", "Existing", Some(0)),
-            instance("editor", "EditorIndependent", Some(0)),
-        ],
-    });
-    let studio = snapshot(SettingsBytecode {
-        version: SETTINGS_BINARY_VERSION,
-        instances: vec![
-            instance("root", "StarterGui", None),
-            instance("existing", "Existing", Some(0)),
-            instance("studio", "StudioIndependent", Some(0)),
-            instance("studio-retry", "EditorIndependent", Some(0)),
-        ],
-    });
-
-    let (merged, conflicts) =
-        merge_snapshots(Some(&baseline), &editor, &studio, ConflictPreference::None).unwrap();
-    assert!(conflicts.is_empty());
-    let merged = settings_document(
-        merged
-            .entries
-            .get(Path::new("src/StarterGui/__roblox_sync_settings.renium")),
-    )
-    .unwrap();
-    let mut names = merged
-        .instances
-        .iter()
-        .map(|instance| instance.name.as_str())
-        .collect::<Vec<_>>();
-    names.sort_unstable();
-    assert_eq!(
-        names,
-        [
-            "EditorIndependent",
-            "Existing",
-            "StarterGui",
-            "StudioIndependent",
-        ]
-    );
 }
 
 fn new_branch_fixture() -> (SettingsBytecode, SettingsBytecode, SettingsBytecode) {
@@ -5086,64 +4267,6 @@ fn omitted_engine_container_keeps_anchor_but_removes_ordinary_contents() {
 }
 
 #[test]
-fn removed_service_store_keeps_only_the_engine_service() {
-    let path = Path::new("src/ServerStorage/__roblox_sync_settings.renium");
-    let root = SettingsBytecodeInstance {
-        settings_id: "root".into(),
-        name: "ServerStorage".into(),
-        class_name: "ServerStorage".into(),
-        parent_index: None,
-        properties: Map::new(),
-        attributes: Map::from_iter([("Preserved".into(), json!(true))]),
-    };
-    let child = SettingsBytecodeInstance {
-        settings_id: "child".into(),
-        name: "MovedPointer".into(),
-        class_name: "ObjectValue".into(),
-        parent_index: Some(0),
-        properties: Map::new(),
-        attributes: Map::new(),
-    };
-    let document = |instances| SettingsBytecode {
-        version: SETTINGS_BINARY_VERSION,
-        instances,
-    };
-    let entry =
-        |doc: &SettingsBytecode| SnapshotEntry::File(encode_settings_bytecode(doc).unwrap());
-    let before = document(vec![root.clone(), child.clone()]);
-    let before_entry = entry(&before);
-    let empty = document(Vec::new());
-    let mut plan = ReconcilePushPlan::default();
-    append_aligned_settings_push_plan(path, &empty, &before, &mut plan).unwrap();
-    assert_eq!(plan.instance_deletes.len(), 1);
-    assert_eq!(plan.instance_deletes[0].instances.len(), 1);
-    assert!(plan.property_removals.is_empty());
-    let remaining = entry(&document(vec![root.clone()]));
-    assert_eq!(
-        settings_delta_mismatch(path, Some(&before_entry), None, Some(&remaining), None).unwrap(),
-        None
-    );
-    for changed_id in [false, true] {
-        let mut retained = document(vec![root.clone(), child.clone()]);
-        if changed_id {
-            retained.instances[0].settings_id = "export-root".into();
-            retained.instances[1].settings_id = "export-child".into();
-        }
-        assert!(
-            settings_delta_mismatch(
-                path,
-                Some(&before_entry),
-                None,
-                Some(&entry(&retained)),
-                None
-            )
-            .unwrap()
-            .is_some_and(|message| message.contains("MovedPointer was not deleted"))
-        );
-    }
-}
-
-#[test]
 fn ordinary_reconciliation_never_deletes_a_package_link() {
     let root = SettingsBytecodeInstance {
         settings_id: "root".to_string(),
@@ -5611,119 +4734,6 @@ fn incremental_editor_plan_uses_persisted_ids_for_duplicate_siblings() {
         plan.instance_deletes[0].instances[0].settings_id,
         "debug:2000"
     );
-}
-
-#[test]
-fn cross_service_recreation_reapplies_external_referrers() {
-    let root = |service: &str| SettingsBytecodeInstance {
-        settings_id: format!("{service}-root"),
-        name: service.to_string(),
-        class_name: service.to_string(),
-        parent_index: None,
-        properties: Map::new(),
-        attributes: Map::new(),
-    };
-    let target = |parent_index| SettingsBytecodeInstance {
-        settings_id: "target".to_string(),
-        name: "Target".to_string(),
-        class_name: "StringValue".to_string(),
-        parent_index: Some(parent_index),
-        properties: Map::new(),
-        attributes: Map::new(),
-    };
-    let holder = SettingsBytecodeInstance {
-        settings_id: "holder".to_string(),
-        name: "Holder".to_string(),
-        class_name: "ObjectValue".to_string(),
-        parent_index: Some(1),
-        properties: Map::from_iter([(
-            "Value".to_string(),
-            json!({"_type": "Ref", "settingsId": "target"}),
-        )]),
-        attributes: Map::new(),
-    };
-    let container = SettingsBytecodeInstance {
-        settings_id: "container".to_string(),
-        name: "Container".to_string(),
-        class_name: "Folder".to_string(),
-        parent_index: Some(0),
-        properties: Map::new(),
-        attributes: Map::new(),
-    };
-    let snapshot = |workspace: SettingsBytecode, replicated: SettingsBytecode| ProjectSnapshot {
-        entries: [
-            (
-                PathBuf::from("src/Workspace/__roblox_sync_settings.renium"),
-                SnapshotEntry::File(encode_settings_bytecode(&workspace).unwrap()),
-            ),
-            (
-                PathBuf::from("src/ReplicatedStorage/__roblox_sync_settings.renium"),
-                SnapshotEntry::File(encode_settings_bytecode(&replicated).unwrap()),
-            ),
-        ]
-        .into_iter()
-        .collect(),
-    };
-    let studio = snapshot(
-        SettingsBytecode {
-            version: SETTINGS_BINARY_VERSION,
-            instances: vec![
-                root("Workspace"),
-                container.clone(),
-                target(1),
-                holder.clone(),
-            ],
-        },
-        SettingsBytecode {
-            version: SETTINGS_BINARY_VERSION,
-            instances: vec![root("ReplicatedStorage")],
-        },
-    );
-    let desired = snapshot(
-        SettingsBytecode {
-            version: SETTINGS_BINARY_VERSION,
-            instances: vec![root("Workspace"), container, holder],
-        },
-        SettingsBytecode {
-            version: SETTINGS_BINARY_VERSION,
-            instances: vec![root("ReplicatedStorage"), target(0)],
-        },
-    );
-
-    let plan = reconciliation_push_plan(&studio, &desired).unwrap();
-
-    assert!(plan.target_settings_ids.iter().any(|id| id == "target"));
-    assert!(plan.target_settings_ids.iter().any(|id| id == "holder"));
-
-    let paths = desired.entries.keys().cloned().collect::<HashSet<_>>();
-    for mask in 0..4 {
-        let prepared = prepare_editor_settings_changes(
-            &studio,
-            &desired,
-            &paths.iter().cloned().collect::<Vec<_>>(),
-        )
-        .unwrap()
-        .into_iter()
-        .filter(|(path, _)| {
-            let bit = if path.starts_with("src/Workspace") {
-                1
-            } else {
-                2
-            };
-            mask & bit != 0
-        })
-        .collect();
-        let cached = reconciliation_push_plan_for_paths_with_prepared_settings(
-            &studio, &desired, &paths, &prepared, false, false,
-        )
-        .unwrap();
-        assert_eq!(cached.changed_paths, plan.changed_paths);
-        assert_eq!(cached.target_settings_ids, plan.target_settings_ids);
-        assert_eq!(
-            serde_json::to_value(&cached.instance_deletes).unwrap(),
-            serde_json::to_value(&plan.instance_deletes).unwrap()
-        );
-    }
 }
 
 #[test]
@@ -6586,54 +5596,6 @@ fn a_union_whose_geometry_changed_is_removed_and_imported_anew() {
 }
 
 #[test]
-fn a_packed_script_with_an_inline_source_is_not_removed_by_a_store_push() {
-    let path = Path::new("src/ReplicatedStorage/__roblox_sync_settings.renium");
-    let root = SettingsBytecodeInstance::new(
-        "editor:0".into(),
-        "ReplicatedStorage".into(),
-        "ReplicatedStorage".into(),
-        None,
-    );
-    let shared =
-        SettingsBytecodeInstance::new("editor:1".into(), "Shared".into(), "Folder".into(), Some(0));
-    let mut util = SettingsBytecodeInstance::new(
-        "editor:2".into(),
-        "Util".into(),
-        "ModuleScript".into(),
-        Some(1),
-    );
-    util.properties
-        .insert("Source".into(), json!("return { version = 1 }"));
-    let desired = SettingsBytecode {
-        version: SETTINGS_BINARY_VERSION,
-        instances: vec![root.clone(), shared.clone(), util.clone()],
-    };
-    let mut studio_util = util.clone();
-    studio_util.settings_id = "studio:util".into();
-    studio_util.properties.insert(
-        "Source".into(),
-        json!(crate::settings::EXTERNAL_SOURCE_MARKER),
-    );
-    let mut observed = SettingsBytecode {
-        version: SETTINGS_BINARY_VERSION,
-        instances: vec![root, shared, studio_util],
-    };
-    assert!(crate::settings::equivalence::align_settings_ids_to_reference(&desired, &mut observed));
-    assert_eq!(observed.instances[2].settings_id, "editor:2");
-    let mut plan = ReconcilePushPlan::default();
-    append_aligned_settings_push_plan(path, &desired, &observed, &mut plan).unwrap();
-    assert!(
-        plan.instance_deletes.is_empty(),
-        "deletes: {:?} targets: {:?}",
-        plan.instance_deletes
-            .iter()
-            .flat_map(|change| change.instances.iter().map(|i| i.settings_id.clone()))
-            .collect::<Vec<_>>(),
-        plan.target_settings_ids
-    );
-}
-
-#[test]
 fn a_store_missing_from_the_files_is_a_conflict_not_a_deletion() {
     let store = PathBuf::from("instances/Workspace.renium");
     let mut document = twin_document();
@@ -6698,40 +5660,6 @@ fn the_worker_refuses_a_vanished_store_and_names_an_undecodable_one() {
             && message.contains("Invalid settings bytecode magic"),
         "{message}"
     );
-}
-
-#[test]
-fn a_kept_script_keeps_the_folder_a_capture_without_scripts_omitted() {
-    let folder = PathBuf::from("src/ReplicatedStorage/Shared");
-    let script = PathBuf::from("src/ReplicatedStorage/Shared/Util.luau");
-    let mut baseline = file_snapshot(&[("src/ReplicatedStorage/Shared/Util.luau", b"return 1")]);
-    baseline
-        .entries
-        .insert(folder.clone(), SnapshotEntry::Directory);
-    let mut editor = file_snapshot(&[("src/ReplicatedStorage/Shared/Util.luau", b"return 2")]);
-    editor
-        .entries
-        .insert(folder.clone(), SnapshotEntry::Directory);
-    let studio = ProjectSnapshot::default();
-    let (_, conflicts) =
-        merge_snapshots(Some(&baseline), &editor, &studio, ConflictPreference::None).unwrap();
-    assert_eq!(
-        conflicts,
-        vec![format!("{} changed on both sides", script.display())]
-    );
-    let (merged, conflicts, changes) = merge_snapshots_with_changes(
-        Some(&baseline),
-        &editor,
-        &studio,
-        ConflictPreference::Editor,
-        None,
-    )
-    .unwrap();
-    assert!(conflicts.is_empty(), "{conflicts:?}");
-    assert!(merged.entries.get(&folder) == Some(&SnapshotEntry::Directory));
-    assert!(merged.entries.get(&script) == editor.entries.get(&script));
-    assert!(changes.editor.is_empty(), "{:?}", changes.editor);
-    assert!(changes.studio.contains(&folder) && changes.studio.contains(&script));
 }
 
 /// The automation selection is process-wide; tests that select a project

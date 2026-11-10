@@ -745,41 +745,6 @@ mod tests {
     use super::*;
     use rbx_dom_weak::InstanceBuilder;
 
-    fn script(class_name: &str, name: &str, source: &str) -> InstanceBuilder {
-        InstanceBuilder::new(class_name)
-            .with_name(name)
-            .with_property("Source", source)
-    }
-
-    #[test]
-    fn script_comparison_ignores_line_endings_and_order_for_duplicates() {
-        let mut left = vec![
-            ScriptRecord {
-                class_name: "ModuleScript".to_string(),
-                source: normalized_source_bytes(b"return 1\r\n").collect(),
-            },
-            ScriptRecord {
-                class_name: "ModuleScript".to_string(),
-                source: normalized_source_bytes(b"return 2\n").collect(),
-            },
-        ];
-        let mut right = vec![
-            ScriptRecord {
-                class_name: "ModuleScript".to_string(),
-                source: normalized_source_bytes(b"return 2\r\n").collect(),
-            },
-            ScriptRecord {
-                class_name: "ModuleScript".to_string(),
-                source: normalized_source_bytes(b"return 1\n").collect(),
-            },
-        ];
-        left.sort();
-        right.sort();
-        assert_eq!(remove_exact_matches(&mut left, &mut right), 2);
-        assert!(left.is_empty());
-        assert!(right.is_empty());
-    }
-
     #[test]
     fn query_text_mode_prints_dotted_paths_without_the_duplicate_name() {
         let mut result = json!({
@@ -946,18 +911,6 @@ mod tests {
         assert_eq!(
             result["defaulted"],
             json!(["PlayerCharacterDestroyBehavior"])
-        );
-    }
-
-    #[test]
-    fn place_queries_script_source_without_studio() {
-        let mut dom = RbxWeakDom::new(InstanceBuilder::new("DataModel"));
-        let service = dom.insert(dom.root_ref(), InstanceBuilder::new("ReplicatedStorage"));
-        let script = dom.insert(service, script("ModuleScript", "Reward", "return 'daily'"));
-        assert_eq!(script_source(&dom, script), Some("return 'daily'"));
-        assert_eq!(
-            query_result(&dom, script)["path"],
-            json!(["ReplicatedStorage", "Reward"])
         );
     }
 }

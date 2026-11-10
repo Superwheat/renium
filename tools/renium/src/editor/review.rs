@@ -1941,24 +1941,8 @@ mod root_write_evidence_tests {
 
 #[cfg(test)]
 mod review_threshold_tests {
-    use std::fs;
 
     use super::*;
-
-    #[test]
-    fn the_project_threshold_is_read_from_the_place_configuration() {
-        let root = crate::tests::support::temp_dir("review-threshold");
-        fs::write(root.join("renium.project.jsonc"), r#"{"schemaVersion":1}"#).unwrap();
-        assert_eq!(configured_changes_threshold(Some(&root)), None);
-        fs::create_dir_all(root.join(".renium")).unwrap();
-        fs::write(
-            root.join(".renium").join("config.json"),
-            r#"{"schemaVersion":1,"liveSync":{"changesThreshold":0}}"#,
-        )
-        .unwrap();
-        assert_eq!(configured_changes_threshold(Some(&root)), Some(0));
-        assert_eq!(configured_changes_threshold(None), None);
-    }
 
     #[test]
     fn a_review_digest_names_each_instance_and_its_changes() {

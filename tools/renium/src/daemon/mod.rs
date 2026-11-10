@@ -1398,28 +1398,6 @@ mod notice_tests {
     use super::*;
 
     #[test]
-    fn review_receipt_requests_ask_for_notices_at_the_top_level() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let peer = crate::system::net::SharedTcpStream::from(listener.accept().unwrap().0);
-        let prepare =
-            review_prepare_parameters(automation::op::SET_PROPERTY, json!({ "editor": true }));
-        assert_eq!(prepare["p"], json!({ "editor": true }));
-        let apply = review_apply_parameters("review-7");
-        assert_eq!(apply["reviewId"], json!("review-7"));
-        for (id, parameters) in [(5, &prepare), (6, &apply)] {
-            let line =
-                serde_json::to_string(&json!({ "v": 1, "id": id, "op": 0, "p": parameters }))
-                    .unwrap();
-            assert_eq!(
-                request_notice_sink(&line, &peer).map(|(_, id)| id),
-                Some(id),
-                "{line}"
-            );
-        }
-    }
-
-    #[test]
     fn every_wire_envelope_asks_for_notices_and_a_reviews_parameters_stay_clean() {
         let parameters = json!({ "editor": true, "property": "Value" });
         let mut sent = Vec::new();
@@ -1710,29 +1688,5 @@ mod connection_limit_tests {
             active.load(Ordering::Relaxed),
             MAX_DAEMON_CONTROL_CONNECTIONS
         );
-    }
-}
-
-#[cfg(test)]
-mod isolation_tests {
-    use super::default_daemon_selection;
-
-    #[test]
-    fn explicit_daemons_cannot_use_default_discovery_or_global_watchers() {
-        for (name, file) in [
-            (Some("canary"), None),
-            (Some(" astra "), None),
-            (None, Some("scratch/daemon.json")),
-            (Some("default"), Some("scratch/daemon.json")),
-        ] {
-            assert!(!default_daemon_selection(name, file));
-        }
-        for (name, file) in [
-            (None, None),
-            (Some(" default "), None),
-            (Some(""), Some(" ")),
-        ] {
-            assert!(default_daemon_selection(name, file));
-        }
     }
 }

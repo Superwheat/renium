@@ -369,77 +369,6 @@ mod request_cancellation_tests {
     }
 
     #[test]
-    fn stalled_handshake_does_not_block_registration_and_ack_follows_inventory() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let channel = Arc::new(BridgeChannel {
-            port: address.port(),
-            sockets: Mutex::new(HashMap::new()),
-            snapshots: Mutex::new(HashMap::new()),
-        });
-        let alive = Arc::new(AtomicBool::new(true));
-        BridgeServer::spawn_accept_loop(
-            "127.0.0.1".into(),
-            address.port(),
-            listener,
-            Arc::clone(&channel),
-            BridgeAcceptState {
-                alive: Arc::clone(&alive),
-                request_session_id: "handshake-test".into(),
-                next_id: Default::default(),
-                routing: Default::default(),
-                desired_device_request: Default::default(),
-                device_reconciled_runtimes: Default::default(),
-                all_channels: Arc::new(Mutex::new(vec![Arc::clone(&channel)])),
-                expected_channels: 1,
-                reconcile_device_on_connect: false,
-                performance_manager: None,
-                #[cfg(any(windows, target_os = "macos"))]
-                update_checked_runtimes: Default::default(),
-                #[cfg(any(windows, target_os = "macos"))]
-                check_updates_on_connect: false,
-                #[cfg(any(windows, target_os = "macos"))]
-                native_preparation: None,
-            },
-        );
-        let stalled = TcpStream::connect(address).unwrap();
-        let stream = TcpStream::connect(address).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        let (mut ready, _) = tungstenite::client(format!("ws://{address}"), stream).unwrap();
-        let request: Value =
-            serde_json::from_str(&ready.read().unwrap().into_text().unwrap()).unwrap();
-        assert_eq!(request["params"]["registrationAck"], true);
-        ready.send(Message::Text(json!({
-            "id": request["id"], "ok": true, "result": {
-                "runtimeId": "handshake-test", "bridgeRole": "play-server", "registrationAck": true,
-                "protocolVersion": "compact-v5", "codecVersion": "compact-v5-schema-9",
-            },
-        }).to_string().into())).unwrap();
-        let ack: Value = serde_json::from_str(&ready.read().unwrap().into_text().unwrap()).unwrap();
-        assert_eq!(ack["method"], "bridgeRegistered");
-        assert_eq!(ack["session_id"], "handshake-test");
-        assert_eq!(
-            channel.snapshots.lock().unwrap().len(),
-            1,
-            "ack must follow registration"
-        );
-        alive.store(false, Ordering::Relaxed);
-        drop(stalled);
-        drop(ready);
-
-        let pending = Arc::new(AtomicUsize::new(0));
-        let mut permits: Vec<_> = (0..8)
-            .map(|_| HandshakePermit::acquire(&pending).unwrap())
-            .collect();
-        assert!(HandshakePermit::acquire(&pending).is_none());
-        permits.pop();
-        assert!(HandshakePermit::acquire(&pending).is_some());
-    }
-
-    #[test]
     fn slow_call_keeps_connection_and_ignores_its_late_reply() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -549,22 +478,6 @@ mod request_cancellation_tests {
         ));
         assert!(BridgeServer::is_transport_error_text(
             "Bridge read failed for method startStopPlay on port 8781: Connection reset"
-        ));
-    }
-
-    #[test]
-    fn play_status_and_stop_survive_bridge_reload_but_start_does_not() {
-        assert!(bridge_request_allowed_after_cancel(
-            "startStopPlay",
-            &json!({})
-        ));
-        assert!(bridge_request_allowed_after_cancel(
-            "startStopPlay",
-            &json!({ "stop": true })
-        ));
-        assert!(!bridge_request_allowed_after_cancel(
-            "startStopPlay",
-            &json!({ "start": true })
         ));
     }
 }

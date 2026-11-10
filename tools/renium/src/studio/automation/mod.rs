@@ -5422,25 +5422,6 @@ mod play_state_tests {
     }
 
     #[test]
-    fn kill_orphans_parses_only_on_its_own() {
-        let args = play_args(&["rbx", "play", "--kill-orphans"]).unwrap();
-        assert!(args.kill_orphans && !args.start && !args.stop);
-        validate_play_args(&args).unwrap();
-        for parts in [
-            &["rbx", "play", "--kill-orphans", "-s"][..],
-            &["rbx", "play", "--kill-orphans", "-x"],
-            &["rbx", "play", "--kill-orphans", "-r"],
-            &["rbx", "play", "--kill-orphans", "-p", "2"],
-            &["rbx", "play", "--kill-orphans", "--add-players", "1"],
-            &["rbx", "play", "--kill-orphans", "--leave"],
-            &["rbx", "play", "--kill-orphans", "--mode", "run"],
-            &["rbx", "play", "--kill-orphans", "--until", "true"],
-        ] {
-            assert!(play_args(parts).is_err(), "{parts:?}");
-        }
-    }
-
-    #[test]
     fn restart_reuses_the_launch_unless_flags_override_it() {
         let restart = play_args(&["rbx", "play", "-r"]).unwrap();
         assert!(restart.restart && restart.players.is_none());

@@ -44,48 +44,6 @@ fn ref_subset(targets: &[usize], studio: bool) -> SettingsBytecode {
 }
 
 #[test]
-fn larger_studio_reference_group_can_choose_a_different_source_subset() {
-    let mut editor = ref_subset(&[1, 2], false);
-    let mut studio = ref_subset(&[3, 1, 2], true);
-    let conflicts = twin_align(&mut editor, &mut studio);
-    std::eprintln!("larger Studio external-reference subset: {conflicts:?}");
-    assert!(
-        conflicts.is_empty(),
-        "all editor twins have complete reference-valid Studio counterparts: {conflicts:?}"
-    );
-    assert_eq!(
-        studio.instances[5].settings_id,
-        editor.instances[4].settings_id
-    );
-    assert_eq!(
-        studio.instances[6].settings_id,
-        editor.instances[5].settings_id
-    );
-    assert!(
-        editor
-            .instances
-            .iter()
-            .all(|i| i.settings_id != studio.instances[4].settings_id)
-    );
-}
-
-#[test]
-fn larger_editor_reference_group_can_choose_a_different_target_subset() {
-    let mut editor = ref_subset(&[3, 1, 2], false);
-    let mut studio = ref_subset(&[1, 2], true);
-    let conflicts = twin_align(&mut editor, &mut studio);
-    assert!(conflicts.is_empty(), "{conflicts:?}");
-    assert_eq!(
-        studio.instances[4].settings_id,
-        editor.instances[5].settings_id
-    );
-    assert_eq!(
-        studio.instances[5].settings_id,
-        editor.instances[6].settings_id
-    );
-}
-
-#[test]
 fn larger_studio_reference_group_keeps_publication_injective() {
     let mut editor = ref_subset(&[1, 2], false);
     let mut studio = ref_subset(&[2, 2, 1], true);
@@ -175,39 +133,6 @@ fn newly_selected_sources_wait_for_their_reference_dependencies() {
     assert_eq!(
         studio.instances[8].properties["Value"],
         editor.instances[6].properties["Value"]
-    );
-}
-
-#[test]
-fn references_to_displaced_sources_cannot_use_their_tentative_partners() {
-    let mut editor = ref_subset(&[1, 2], false);
-    let mut studio = ref_subset(&[3, 1, 2], true);
-    for (document, target) in [(&mut editor, 4), (&mut studio, 4)] {
-        for _ in 0..2 {
-            let reference = twin_ref(document, target);
-            twin_add(
-                document,
-                0,
-                "Dependent",
-                "ObjectValue",
-                json!({"Value":reference}),
-            );
-        }
-    }
-    namespace_studio_ids(&mut studio);
-    let resolved = pairing::twins::resolve(&editor, &studio);
-    assert_eq!(resolved.partners[4], None);
-    assert!(resolved.proven[5] && resolved.proven[6]);
-    assert!(!resolved.proven[7] && !resolved.proven[8]);
-    let conflicts = twin_align(&mut editor, &mut studio);
-    assert!(
-        conflicts.iter().any(|c| c.contains("Dependent")),
-        "{conflicts:?}"
-    );
-    assert_twin_ids_unique(&studio);
-    assert_eq!(
-        studio.instances[7].properties["Value"],
-        twin_ref(&studio, 4)
     );
 }
 

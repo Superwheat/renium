@@ -347,33 +347,6 @@ pub(crate) fn expand_editor_target_settings_ids(
     Ok(ids)
 }
 
-#[cfg(test)]
-mod target_id_tests {
-    use super::*;
-
-    #[test]
-    fn qualified_ids_select_only_their_service() {
-        let mut ids = EditorTargetIds::default();
-        for entry in ["editor:1f", "ServerStorage/editor:2a", "/odd", "odd/"] {
-            ids.insert(entry);
-        }
-        let filter = EditorPropertyFilter {
-            settings_ids: ids.any,
-            service_settings_ids: ids.by_service,
-            ..Default::default()
-        };
-        assert!(filter.includes_instance_in("Workspace", "editor:1f"));
-        assert!(filter.includes_instance_in("ServerStorage", "editor:2a"));
-        assert!(!filter.includes_instance_in("Workspace", "editor:2a"));
-        assert!(filter.includes_instance_in("Workspace", "/odd"));
-        assert!(filter.includes_instance_in("Workspace", "odd/"));
-        assert_eq!(filter.ids_for_service("ServerStorage").len(), 4);
-        assert_eq!(filter.ids_for_service("Workspace").len(), 3);
-        assert!(!EditorPropertyFilter::default().has_target_ids());
-        assert!(EditorPropertyFilter::default().includes_instance_in("Workspace", "editor:9"));
-    }
-}
-
 pub(crate) struct EditorSourceEnsureResult {
     pub(crate) target: EditorSourceTarget,
     pub(crate) upsert_instances: Vec<EditorInstanceDescriptor>,

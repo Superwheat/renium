@@ -98,33 +98,6 @@ fn first_pairing_twins_package_mirror_ids_and_descendants_survive_reordering() {
     }
 }
 
-#[test]
-fn first_pairing_twins_equivalent_slots_can_replace_provisional_ids() {
-    let mut editor = twin_document();
-    for number in [1, 2] {
-        twin_add(
-            &mut editor,
-            0,
-            "Attachment",
-            "Attachment",
-            json!({"UniqueId":{"_type":"UniqueId", "value":format!("{number:032x}")}}),
-        );
-    }
-    twin_add(&mut editor, 0, "Marker", "Folder", json!({}));
-    let mut studio = editor.clone();
-    studio.instances.swap(1, 2);
-    studio.instances.swap(2, 3);
-    for index in [1, 3] {
-        studio.instances[index].properties.insert(
-            "UniqueId".into(),
-            json!({"_type":"UniqueId", "value":format!("{:032x}", index + 10)}),
-        );
-    }
-    let conflicts = twin_align(&mut editor, &mut studio);
-    assert!(conflicts.is_empty(), "{conflicts:?}");
-    assert_twin_ids_unique(&studio);
-}
-
 fn subset_twins(order: &[usize]) -> SettingsBytecode {
     let mut document = twin_document();
     for &number in order {

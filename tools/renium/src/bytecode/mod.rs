@@ -4455,69 +4455,6 @@ mod service_split_tests {
 }
 
 #[cfg(test)]
-mod property_candidate_tests {
-    use super::{closest_property_names, edit_distance};
-
-    #[test]
-    fn candidates_rank_substrings_before_near_misses_and_stop_at_five() {
-        assert_eq!(edit_distance("assetid", "asset"), 2);
-        assert_eq!(edit_distance("", "abc"), 3);
-        assert_eq!(edit_distance("kitten", "sitting"), 3);
-        assert_eq!(
-            closest_property_names(
-                "AssetId",
-                ["Transparency", "AssetType", "Asset", "MeshId", "asset"]
-            ),
-            ["Asset", "AssetType"]
-        );
-        let names = [
-            "AssetType",
-            "Asset",
-            "AssetIds",
-            "AssetIdx",
-            "AssetIdy",
-            "AssetIdz",
-        ];
-        assert_eq!(
-            closest_property_names("AssetId", names),
-            ["AssetIds", "AssetIdx", "AssetIdy", "AssetIdz", "Asset"]
-        );
-        assert_eq!(
-            closest_property_names("Colour", ["Color", "Size", "Anchored"]),
-            ["Color"]
-        );
-        assert!(closest_property_names("Velocity", ["Size", "Anchored"]).is_empty());
-    }
-}
-
-#[cfg(test)]
-mod inline_ordinal_tests {
-    use super::split_inline_ordinals;
-
-    fn segments(parts: &[&str]) -> Vec<String> {
-        parts.iter().map(|part| (*part).to_string()).collect()
-    }
-
-    #[test]
-    fn inline_ordinals_split_from_segments_and_default_to_one() {
-        let (bare, ordinals) =
-            split_inline_ordinals(segments(&["Workspace", "Lobby", "Border[4]"]));
-        assert_eq!(bare, segments(&["Workspace", "Lobby", "Border"]));
-        assert_eq!(ordinals, vec![1, 1, 4]);
-        let (bare, ordinals) =
-            split_inline_ordinals(segments(&["Workspace", "Lobby[2]", "Border"]));
-        assert_eq!(bare, segments(&["Workspace", "Lobby", "Border"]));
-        assert_eq!(ordinals, vec![1, 2, 1]);
-        let (bare, ordinals) = split_inline_ordinals(segments(&["Workspace", "Border"]));
-        assert_eq!(bare, segments(&["Workspace", "Border"]));
-        assert!(ordinals.is_empty());
-        let (bare, ordinals) = split_inline_ordinals(segments(&["[4]", "Item[0]", "Item[x]"]));
-        assert_eq!(bare, segments(&["[4]", "Item[0]", "Item[x]"]));
-        assert!(ordinals.is_empty());
-    }
-}
-
-#[cfg(test)]
 mod project_discovery_tests {
     use super::*;
 

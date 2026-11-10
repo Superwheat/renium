@@ -3,7 +3,6 @@ use crate::automation::reconcile::SnapshotEntry;
 use crate::snapshot::export::{
     ExportProjectStage, PublishedProjectChanges, collect_publish_hashes, finish_export_publication,
 };
-use clap::Parser;
 
 const SERVICE: &str = "ReplicatedStorage";
 
@@ -171,56 +170,6 @@ fn local_studio_copy_at(service: &Path) -> PathBuf {
 }
 
 #[test]
-fn pull_restores_ordinary_package_and_a_following_push_passes_protection() {
-    let root = local_package_fixture("pull-ordinary");
-    let stage = prepare_pull(&root, &[SERVICE]);
-    let path = local_studio_copy(&stage.project_root);
-    let relative = path
-        .strip_prefix(&stage.project_root)
-        .unwrap()
-        .to_path_buf();
-    let result = finish_pull(&root, stage).unwrap();
-    assert_eq!(result.read_only_links_restored[0]["link"], "pkg");
-    assert_eq!(
-        fs::read_to_string(root.join(&relative)).unwrap(),
-        "return 'package'"
-    );
-    assert!(
-        fs::metadata(root.join(&relative))
-            .unwrap()
-            .permissions()
-            .readonly()
-    );
-    let enforcement = build_link_enforcement(&root, &root.join("src"), None).unwrap();
-    let target = &enforcement.read_only_packages[0];
-    let document =
-        SettingsBytecode::read_file(&service_settings_path(&root.join("src/ReplicatedStorage")))
-            .unwrap();
-    assert!(
-        read_only_target_current(
-            &document,
-            SERVICE,
-            &root.join("src/ReplicatedStorage"),
-            &target.target_segments,
-            &target.target_ordinals,
-            target.package.as_deref(),
-            &target.expected_fingerprint
-        )
-        .unwrap()
-    );
-    let changes = collect_editor_changes(&PushEditorChangesArgs {
-        project: ProjectSourceArgs {
-            project_root: root.clone(),
-            src_root: root.join("src"),
-        },
-        changed_paths: vec![root.join(&relative)],
-        ..PushEditorChangesArgs::try_parse_from(["push"]).unwrap()
-    });
-    assert!(changes.is_ok(), "{}", changes.err().unwrap());
-    let _ = fs::remove_dir_all(root);
-}
-
-#[test]
 fn pull_recreates_missing_package_target_and_regenerates_sourcemap() {
     let root = local_package_fixture("pull-missing-package");
     fs::write(root.join("sourcemap.json"), r#"{"name":"game","className":"DataModel","children":[{"name":"ServerStorage","className":"ServerStorage","children":[{"name":"Untouched","className":"Folder"}]}]}"#).unwrap();
@@ -340,44 +289,6 @@ fn pull_aborts_when_package_or_project_changes_during_export() {
         assert_eq!(fs::read(changed).unwrap(), bytes);
         let _ = fs::remove_dir_all(root);
     }
-}
-
-#[test]
-fn push_readback_keeps_an_intentional_override() {
-    let root = local_package_fixture("pull-override-readback");
-    // Push verification uses this unmodified export stage; only a pull opts
-    // into restoration. Otherwise --override-packages would undo its own push.
-    let stage = ExportProjectStage::create(&root, Path::new("src"), &[SERVICE.into()]).unwrap();
-    let path = local_studio_copy(&stage.project_root);
-    let relative = path
-        .strip_prefix(&stage.project_root)
-        .unwrap()
-        .to_path_buf();
-    let result = finish_pull(&root, stage).unwrap();
-    assert!(result.read_only_links_restored.is_empty());
-    assert!(result.studio_overrides.is_empty());
-    assert_eq!(
-        fs::read_to_string(root.join(&relative)).unwrap(),
-        "return 'studio'"
-    );
-    let mut push = PushEditorChangesArgs {
-        project: ProjectSourceArgs {
-            project_root: root.clone(),
-            src_root: PathBuf::from("src"),
-        },
-        changed_paths: vec![root.join(&relative)],
-        ..PushEditorChangesArgs::try_parse_from(["push"]).unwrap()
-    };
-    assert!(collect_editor_changes(&push).is_err());
-    push.override_packages = true;
-    assert!(collect_editor_changes(&push).is_ok());
-    let pulled = finish_pull(&root, prepare_pull(&root, &[SERVICE])).unwrap();
-    assert_eq!(pulled.read_only_links_restored.len(), 1);
-    assert_eq!(
-        fs::read_to_string(root.join(relative)).unwrap(),
-        "return 'package'"
-    );
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]

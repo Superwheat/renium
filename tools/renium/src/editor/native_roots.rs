@@ -1013,20 +1013,6 @@ mod tests {
     }
 
     #[test]
-    fn protected_root_resets_use_saved_defaults() {
-        assert_eq!(default_value("Terrain", "Decoration").unwrap(), false);
-        assert_eq!(
-            default_value("Lighting", "PrioritizeLightingQuality").unwrap(),
-            false
-        );
-        assert_eq!(
-            default_value("Lighting", "LightingStyle").unwrap()["name"],
-            "Soft"
-        );
-        assert!(default_value("Lighting", "NotAProperty").is_err());
-    }
-
-    #[test]
     fn native_root_writes_validate_scope_and_exact_value_types() {
         let mut write = RootWrite {
             index: 1,

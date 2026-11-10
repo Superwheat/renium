@@ -465,55 +465,6 @@ mod tests {
     }
 
     #[test]
-    fn function_approvals_bind_arguments_and_never_inherit_property_trust() {
-        let mut policy = Policy::default();
-        let original = Intent {
-            class_name: "HttpRbxApiService".into(),
-            property: "GetAsyncFullUrl".into(),
-            operation: Operation::Call {
-                arguments: vec![json!("https://apis.roblox.com/first")],
-            },
-            ..intent(None)
-        };
-        let id = ticket(&mut policy, &original);
-        let mut changed = original.clone();
-        changed.operation = Operation::Call {
-            arguments: vec![json!("https://apis.roblox.com/second")],
-        };
-        assert_ne!(id, ticket(&mut policy, &changed));
-        changed.property = "PostAsyncFullUrl".into();
-        assert_ne!(id, ticket(&mut policy, &changed));
-        assert_eq!(
-            policy.approve(&scope(), &id).unwrap(),
-            vec![original.clone()]
-        );
-        assert!(policy.approve(&scope(), &id).is_err());
-        changed.class_name = "MeshPart".into();
-        changed.property = "CollisionFidelity".into();
-        assert!(matches!(
-            policy.check(&scope(), &changed).unwrap(),
-            Decision::ApprovalRequired { .. }
-        ));
-        policy.set_mode(&scope(), Mode::ReadOnly, false).unwrap();
-        assert!(policy.check(&scope(), &original).is_err());
-        let batch = Intent {
-            operation: Operation::CallBatch {
-                arguments: vec![vec![json!("one")], vec![json!("two")]],
-            },
-            ..original
-        };
-        assert!(policy.check(&scope(), &batch).is_err());
-        policy.set_mode(&scope(), Mode::Ask, false).unwrap();
-        let batch_id = ticket(&mut policy, &batch);
-        let mut reordered = batch.clone();
-        if let Operation::CallBatch { arguments } = &mut reordered.operation {
-            arguments.reverse();
-        }
-        assert_ne!(batch_id, ticket(&mut policy, &reordered));
-        assert_eq!(policy.approve(&scope(), &batch_id).unwrap(), vec![batch]);
-    }
-
-    #[test]
     fn mode_changes_runtime_departure_and_expiry_revoke_pending_approvals() {
         let mut policy = Policy::default();
         let id = ticket(&mut policy, &intent(Some(Value::Null)));

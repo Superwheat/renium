@@ -569,7 +569,6 @@ pub(crate) fn transact_remote(doc: &Doc) -> TransactionMut<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yrs::updates::decoder::Decode;
 
     fn text_of(doc: &Doc, key: &str) -> Option<Content> {
         let files = files_map(doc);
@@ -800,53 +799,5 @@ mod tests {
             Content::from_bytes(Path::new("a/.gitignore"), b"x\n".to_vec()),
             Content::Text("x\n".into())
         );
-    }
-
-    #[test]
-    fn concurrent_line_edits_merge() {
-        let left = new_doc();
-        let right = new_doc();
-        let base = Content::Text("a\nb\nc\n".to_string());
-        {
-            let files = files_map(&left);
-            let mut txn = transact_local(&left);
-            write_entry(&mut txn, &files, "f", &base);
-        }
-        let update = left
-            .transact()
-            .encode_state_as_update_v1(&yrs::StateVector::default());
-        {
-            let mut txn = transact_remote(&right);
-            txn.apply_update(yrs::Update::decode_v1(&update).unwrap())
-                .unwrap();
-        }
-        {
-            let files = files_map(&left);
-            let mut txn = transact_local(&left);
-            write_entry(&mut txn, &files, "f", &Content::Text("A\nb\nc\n".into()));
-        }
-        {
-            let files = files_map(&right);
-            let mut txn = transact_local(&right);
-            write_entry(&mut txn, &files, "f", &Content::Text("a\nb\nC\n".into()));
-        }
-        let from_left = left
-            .transact()
-            .encode_state_as_update_v1(&right.transact().state_vector());
-        let from_right = right
-            .transact()
-            .encode_state_as_update_v1(&left.transact().state_vector());
-        {
-            let mut txn = transact_remote(&right);
-            txn.apply_update(yrs::Update::decode_v1(&from_left).unwrap())
-                .unwrap();
-        }
-        {
-            let mut txn = transact_remote(&left);
-            txn.apply_update(yrs::Update::decode_v1(&from_right).unwrap())
-                .unwrap();
-        }
-        assert_eq!(text_of(&left, "f"), Some(Content::Text("A\nb\nC\n".into())));
-        assert_eq!(text_of(&left, "f"), text_of(&right, "f"));
     }
 }

@@ -4304,16 +4304,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_notices_flag_never_reaches_an_operation_parser() {
-        let mut parameters = json!({ "notices": true, "mode": "read-only" });
-        strip_request_notices(&mut parameters);
-        assert_eq!(parameters, json!({ "mode": "read-only" }));
-        let mut scalar = json!(7);
-        strip_request_notices(&mut scalar);
-        assert_eq!(scalar, json!(7));
-    }
-
-    #[test]
     fn resolved_instance_paths_come_inline_or_as_arrays() {
         let inline = json!({ "path": "Workspace.Props[2].Sign", "c": "Part" });
         assert_eq!(

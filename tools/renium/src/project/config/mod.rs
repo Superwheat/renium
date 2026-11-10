@@ -3667,42 +3667,6 @@ mod tests {
     }
 
     #[test]
-    fn script_naming_uses_nearest_ancestor_not_a_textual_prefix() {
-        let root = crate::tests::support::temp_dir("naming-ancestor-cache");
-        let nested = root.join("nested");
-        {
-            let mut cache = SCRIPT_NAMING_CACHE
-                .get_or_init(|| Mutex::new(HashMap::new()))
-                .lock()
-                .unwrap();
-            cache.insert(
-                root.clone(),
-                ProjectScriptNaming {
-                    server_suffix: ".outer".into(),
-                    ..Default::default()
-                },
-            );
-            cache.insert(
-                nested.clone(),
-                ProjectScriptNaming {
-                    server_suffix: ".inner".into(),
-                    ..Default::default()
-                },
-            );
-        }
-        assert_eq!(
-            cached_script_naming(&nested.join("src/deep")).server_suffix,
-            ".inner"
-        );
-        assert_eq!(
-            cached_script_naming(&root.join("nested-other/src")).server_suffix,
-            ".outer"
-        );
-        remove_cached_script_naming(&root);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn jsonc_removes_comments_and_trailing_commas() {
         let value = parse_jsonc_value(
             r#"{

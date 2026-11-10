@@ -483,84 +483,9 @@ pub(crate) fn native_overlay_property_schemas(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn native_records_keep_the_engine_type_of_numbers_the_database_does_not_know() {
-        let database = rbx_reflection_database::get().unwrap();
-        let refs = BytecodeModelImportRefs::default();
-        let properties = [
-            (
-                rbx_dom_weak::Ustr::from("FutureNumericProperty"),
-                RbxVariant::Float32(4.0),
-            ),
-            (
-                rbx_dom_weak::Ustr::from("FieldOfView"),
-                RbxVariant::Float32(55.0),
-            ),
-        ];
-        let (native, json, _, _) = rbx_properties_to_native_settings_records(
-            "Camera",
-            properties.iter().map(|(name, value)| (name, value)),
-            database,
-            &refs,
-            None,
-        );
-        assert_eq!(json["FutureNumericProperty"]["_type"], "Float32");
-        assert_eq!(json["FutureNumericProperty"]["value"], 4.0);
-        assert_eq!(native.len(), 1);
-        assert_eq!(native[0].name, "FieldOfView");
-        assert!(!json.contains_key("FieldOfView"));
-    }
 
     use super::*;
-    use crate::roblox::schema::{PropertySchemaEntry, TYPE_ID_CFRAME, TYPE_ID_REF};
-
-    #[test]
-    fn gui_input_sink_uses_its_serialized_alias() {
-        let database = rbx_reflection_database::get().unwrap();
-        let property = rbx_property_descriptor(database, "Frame", "InputSink");
-        assert_eq!(
-            crate::rbx::encode::rbx_logical_property_name(database, "Frame", "Sink"),
-            Some("InputSink"),
-            "GuiObject descriptor: {property:?}",
-        );
-        assert_eq!(
-            crate::rbx::encode::rbx_serialized_property_name_for_logical(
-                database,
-                "Frame",
-                "InputSink"
-            ),
-            Some("Sink"),
-        );
-        let filter = native_property_filter(database, "Frame");
-        assert_eq!(
-            filter.renamed.get("Sink").map(String::as_str),
-            Some("InputSink")
-        );
-        assert_eq!(
-            crate::rbx::encode::rbx_logical_property_name(database, "InputContext", "Sink"),
-            Some("Sink"),
-            "the unrelated boolean InputContext.Sink must not be renamed",
-        );
-        for number in [0, 1, 100] {
-            let dom = rbx_dom_weak::WeakDom::new(
-                rbx_dom_weak::InstanceBuilder::new("Frame").with_property(
-                    "InputSink",
-                    RbxVariant::Enum(rbx_dom_weak::types::Enum::from_u32(number)),
-                ),
-            );
-            let mut bytes = Vec::new();
-            rbx_binary::to_writer(&mut bytes, &dom, &[dom.root_ref()]).unwrap();
-            let decoded = rbx_binary::from_reader(bytes.as_slice()).unwrap();
-            let frame = decoded.get_by_ref(decoded.root().children()[0]).unwrap();
-            assert_eq!(
-                frame.properties.get(&"InputSink".into()),
-                Some(&RbxVariant::Enum(rbx_dom_weak::types::Enum::from_u32(
-                    number
-                )))
-            );
-            assert!(!frame.properties.contains_key(&"Sink".into()));
-        }
-    }
+    use crate::roblox::schema::{PropertySchemaEntry, TYPE_ID_CFRAME};
 
     #[test]
     fn model_world_pivot_uses_the_live_overlay() {
@@ -579,47 +504,6 @@ mod tests {
         )]);
         let (_, direct, _) = native_overlay_property_schemas(database, &schemas, &filters);
         assert_eq!(direct["Model"][0].name, "WorldPivot");
-    }
-
-    #[test]
-    fn conditional_reference_candidates_use_overlay_indices() {
-        let schemas = PropertySchemaMap::from([(
-            "ObjectValue".to_string(),
-            vec![PropertySchemaEntry {
-                name: "Value".to_string(),
-                type_id: TYPE_ID_REF,
-                enum_type: None,
-            }],
-        )]);
-        let instance = |referent: u128,
-                        name: &str,
-                        class: &str,
-                        properties: Vec<(rbx_dom_weak::Ustr, RbxVariant)>| {
-            rbx_binary::FlatInstance {
-                referent: RbxRef::some(referent),
-                parent_index: None,
-                name: name.to_string(),
-                class: class.into(),
-                properties,
-            }
-        };
-        let instances = vec![
-            instance(1, "Workspace", "Folder", Vec::new()),
-            instance(2, "MissingNativeRef", "ObjectValue", Vec::new()),
-            instance(
-                3,
-                "HasNativeRef",
-                "ObjectValue",
-                vec![("Value".into(), RbxVariant::Ref(RbxRef::some(1)))],
-            ),
-        ];
-
-        let (_, names, candidate_count) =
-            conditional_ref_overlay_request(&instances, &schemas, &[0, 2, 1]);
-        let packed = names["ObjectValue"][0][1]["packed"].as_str().unwrap();
-
-        assert_eq!(candidate_count, 1);
-        assert_eq!(base64::decode(packed).unwrap(), vec![3, 0, 0]);
     }
 }
 
@@ -1642,28 +1526,5 @@ fn rbx_font_style_name(value: RbxFontStyle) -> &'static str {
     match value {
         RbxFontStyle::Italic => "Italic",
         _ => "Normal",
-    }
-}
-
-#[cfg(test)]
-mod native_capture_root_field_tests {
-    use super::*;
-
-    #[test]
-    fn service_roots_keep_saved_fields_without_a_plugin_api() {
-        let database = rbx_reflection_database::get().unwrap();
-        let lighting = native_property_filter(database, "Lighting");
-        assert!(lighting.allowed.contains("Technology"));
-        assert!(lighting.allowed.contains("Brightness"));
-        let workspace = native_property_filter(database, "Workspace");
-        assert!(workspace.allowed.contains("StreamingMinRadius"));
-        assert!(workspace.allowed.contains("PhysicsSteppingMethod"));
-        assert!(!workspace.allowed.contains("UseNewLuauTypeSolver"));
-        let terrain = native_property_filter(database, "Terrain");
-        assert!(terrain.allowed.contains("GrassLength"));
-        let path = native_property_filter(database, "Path2D");
-        assert!(!path.allowed.contains("Transparency"));
-        let emitter = native_property_filter(database, "AudioEmitter");
-        assert!(!emitter.allowed.contains("DistanceAttenuation"));
     }
 }

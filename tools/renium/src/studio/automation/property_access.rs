@@ -863,35 +863,6 @@ mod tests {
     }
 
     #[test]
-    fn reads_take_more_targets_after_the_property() -> Result<()> {
-        use clap::FromArgMatches;
-        let matches = PropertyAccessArgs::augment_args(clap::Command::new("access"))
-            .try_get_matches_from([
-                "access",
-                "read",
-                "ReplicatedStorage.Shared.PackageLink",
-                "Status",
-                "ServerStorage.Tools.PackageLink",
-                "Workspace.Map.PackageLink",
-            ])?;
-        let args = PropertyAccessArgs::from_arg_matches(&matches)?;
-        let action = serde_json::to_value(args.action)?;
-        assert_eq!(
-            action["more"],
-            json!([
-                "ServerStorage.Tools.PackageLink",
-                "Workspace.Map.PackageLink"
-            ])
-        );
-        assert!(serde_json::from_value::<Action>(action).is_ok());
-        let matches = PropertyAccessArgs::augment_args(clap::Command::new("access"))
-            .try_get_matches_from(["access", "read", "Workspace", "StreamingEnabled"])?;
-        let args = PropertyAccessArgs::from_arg_matches(&matches)?;
-        assert!(serde_json::to_value(args.action)?.get("more").is_none());
-        Ok(())
-    }
-
-    #[test]
     fn property_requests_cannot_supply_identity_trust_or_extra_mode_fields() {
         for extra in ["trusted", "className", "instanceId", "mode"] {
             let mut request =

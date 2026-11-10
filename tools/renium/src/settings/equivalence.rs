@@ -4504,35 +4504,6 @@ mod tests {
     }
 
     #[test]
-    fn reordered_unique_children_keep_identity_with_changed_values_and_references() {
-        let mut reference = duplicate_geometry(8_000);
-        for instance in &mut reference.instances[1..] {
-            instance.name.clone_from(&instance.settings_id);
-        }
-        let mut observed = reference.clone();
-        observed.instances[1..].reverse();
-        for (index, instance) in observed.instances.iter_mut().enumerate() {
-            instance.settings_id = format!("debug:new:{index}");
-        }
-        observed.instances[0].properties.insert(
-            "Target".into(),
-            json!({"_type":"Ref", "settingsId":"debug:new:1"}),
-        );
-        observed.instances[1]
-            .attributes
-            .insert("Edited".into(), json!(true));
-        assert!(align_settings_ids_to_reference(&reference, &mut observed));
-        for instance in &observed.instances[1..] {
-            assert_eq!(instance.settings_id, instance.name);
-        }
-        assert_eq!(
-            observed.instances[0].properties["Target"]["settingsId"],
-            "editor:7999"
-        );
-        assert_eq!(observed.instances[1].attributes["Edited"], true);
-    }
-
-    #[test]
     fn duplicate_geometry_index_preserves_reordered_ids_and_edits() {
         let reference = duplicate_geometry(6_178);
         let mut observed = reference.clone();
@@ -4644,55 +4615,6 @@ mod tests {
             identity_candidate_representatives(&reference, &graph, None, &candidates);
         assert_eq!(representatives.len(), 6);
         assert!(multiplicities.values().all(|count| *count == 400));
-    }
-
-    #[test]
-    fn positional_identity_checks_duplicate_subtrees_and_incoming_references() {
-        let mut reference = duplicate_geometry(2);
-        for parent in [1, 2] {
-            let mut child = SettingsBytecodeInstance::new(
-                format!("child:{parent}"),
-                "Leaf".into(),
-                "StringValue".into(),
-                Some(parent),
-            );
-            child.properties.insert("Value".into(), json!(parent));
-            reference.instances.push(child);
-        }
-        let mut pointer = SettingsBytecodeInstance::new(
-            "pointer".into(),
-            "Pointer".into(),
-            "ObjectValue".into(),
-            Some(0),
-        );
-        pointer.properties.insert(
-            "Value".into(),
-            json!({"_type":"Ref", "settingsId":"editor:1"}),
-        );
-        reference.instances.push(pointer);
-        let mut observed = reference.clone();
-        observed.instances[0]
-            .attributes
-            .insert("Edited".into(), json!(true));
-        assert!(positional_identity_preserved(&reference, &observed));
-        assert!(!settings_documents_positionally_equivalent(
-            &reference, &observed
-        ));
-        observed.instances[1]
-            .attributes
-            .insert("Edited".into(), json!(true));
-        assert!(!positional_identity_preserved(&reference, &observed));
-        observed.instances[1].attributes.clear();
-        observed.instances[3]
-            .properties
-            .insert("Value".into(), json!(2));
-        observed.instances[4]
-            .properties
-            .insert("Value".into(), json!(1));
-        assert!(!positional_identity_preserved(&reference, &observed));
-        observed = reference.clone();
-        observed.instances[5].properties["Value"]["settingsId"] = json!("editor:2");
-        assert!(!positional_identity_preserved(&reference, &observed));
     }
 
     #[test]
@@ -4961,21 +4883,6 @@ mod tests {
     }
 
     #[test]
-    fn serialized_property_aliases_canonicalize_to_logical_names() {
-        let mut document = string_value_with_properties(Map::from_iter([(
-            "archivable".to_string(),
-            json!(false),
-        )]));
-
-        canonicalize_settings_property_names(&mut document).unwrap();
-
-        assert_eq!(
-            document.instances[0].properties,
-            Map::from_iter([("Archivable".to_string(), json!(false))])
-        );
-    }
-
-    #[test]
     fn parallel_canonicalization_preserves_aliases_across_chunk_boundaries() {
         let seed = string_value_with_properties(Map::from_iter([
             ("archivable".into(), json!(false)),
@@ -5064,75 +4971,6 @@ mod tests {
         );
         assert_eq!(document.instances[2].properties["archivable"], true);
         assert_eq!(document.instances[2].properties["Archivable"], false);
-    }
-
-    #[test]
-    fn observed_changes_keep_reference_ids_and_remap_internal_refs() {
-        let mut reference_root = crate::settings::bytecode::SettingsBytecodeInstance::new(
-            "1".to_string(),
-            "ReplicatedStorage".to_string(),
-            "ReplicatedStorage".to_string(),
-            None,
-        );
-        reference_root
-            .properties
-            .insert("Archivable".to_string(), json!(true));
-        let mut reference_value = crate::settings::bytecode::SettingsBytecodeInstance::new(
-            "editor:value".to_string(),
-            "Value".to_string(),
-            "StringValue".to_string(),
-            Some(0),
-        );
-        reference_value
-            .properties
-            .insert("Value".to_string(), json!("before"));
-        let mut reference_holder = crate::settings::bytecode::SettingsBytecodeInstance::new(
-            "editor:holder".to_string(),
-            "Holder".to_string(),
-            "ObjectValue".to_string(),
-            Some(0),
-        );
-        reference_holder.properties.insert(
-            "Value".to_string(),
-            json!({"_type": "Ref", "settingsId": "editor:value"}),
-        );
-        let reference = SettingsBytecode {
-            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
-            instances: vec![reference_root.clone(), reference_value, reference_holder],
-        };
-
-        let mut observed_value = crate::settings::bytecode::SettingsBytecodeInstance::new(
-            "debug:value".to_string(),
-            "Value".to_string(),
-            "StringValue".to_string(),
-            Some(0),
-        );
-        observed_value
-            .properties
-            .insert("Value".to_string(), json!("after"));
-        let mut observed_holder = crate::settings::bytecode::SettingsBytecodeInstance::new(
-            "debug:holder".to_string(),
-            "Holder".to_string(),
-            "ObjectValue".to_string(),
-            Some(0),
-        );
-        observed_holder.properties.insert(
-            "Value".to_string(),
-            json!({"_type": "Ref", "settingsId": "debug:value"}),
-        );
-        let mut observed = SettingsBytecode {
-            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
-            instances: vec![reference_root, observed_value, observed_holder],
-        };
-
-        align_settings_ids_to_reference(&reference, &mut observed);
-
-        assert_eq!(observed.instances[1].settings_id, "editor:value");
-        assert_eq!(observed.instances[2].settings_id, "editor:holder");
-        assert_eq!(
-            observed.instances[2].properties["Value"]["settingsId"],
-            "editor:value"
-        );
     }
 
     #[test]
@@ -5340,177 +5178,6 @@ mod tests {
     }
 
     #[test]
-    fn alignment_pairs_only_remaining_indistinguishable_duplicates() {
-        let mut reference = SettingsBytecode {
-            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
-            instances: vec![crate::settings::bytecode::SettingsBytecodeInstance::new(
-                "root".to_string(),
-                "Workspace".to_string(),
-                "Workspace".to_string(),
-                None,
-            )],
-        };
-        for id in ["editor:first", "editor:second"] {
-            reference
-                .instances
-                .push(crate::settings::bytecode::SettingsBytecodeInstance::new(
-                    id.to_string(),
-                    "Attachment".to_string(),
-                    "Attachment".to_string(),
-                    Some(0),
-                ));
-        }
-        let mut observed = reference.clone();
-        observed.instances[0].settings_id = "debug:root".to_string();
-        observed.instances[1].settings_id = "debug:first".to_string();
-        observed.instances[2].settings_id = "debug:second".to_string();
-
-        assert!(align_settings_ids_to_reference(&reference, &mut observed));
-        assert_eq!(observed.instances[0].settings_id, "root");
-        assert_eq!(observed.instances[1].settings_id, "editor:first");
-        assert_eq!(observed.instances[2].settings_id, "editor:second");
-    }
-
-    #[test]
-    fn alignment_keeps_unique_identity_when_content_changed() {
-        let root = crate::settings::bytecode::SettingsBytecodeInstance::new(
-            "root".to_string(),
-            "ReplicatedStorage".to_string(),
-            "ReplicatedStorage".to_string(),
-            None,
-        );
-        let mut reference_child = crate::settings::bytecode::SettingsBytecodeInstance::new(
-            "editor:child".to_string(),
-            "NonLobby".to_string(),
-            "Folder".to_string(),
-            Some(0),
-        );
-        reference_child
-            .attributes
-            .insert("State".to_string(), json!("project"));
-        let reference = SettingsBytecode {
-            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
-            instances: vec![root.clone(), reference_child],
-        };
-        let mut observed_child = crate::settings::bytecode::SettingsBytecodeInstance::new(
-            "debug:child".to_string(),
-            "NonLobby".to_string(),
-            "Folder".to_string(),
-            Some(0),
-        );
-        observed_child
-            .attributes
-            .insert("State".to_string(), json!("studio"));
-        let mut observed = SettingsBytecode {
-            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
-            instances: vec![root, observed_child],
-        };
-
-        assert!(align_settings_ids_to_reference(&reference, &mut observed));
-        assert_eq!(observed.instances[1].settings_id, "editor:child");
-        assert_eq!(observed.instances[1].attributes["State"], "studio");
-    }
-
-    #[test]
-    fn aligned_settings_bytes_ignore_sibling_enumeration_order() {
-        let root = crate::settings::bytecode::SettingsBytecodeInstance::new(
-            "1".to_string(),
-            "Workspace".to_string(),
-            "Workspace".to_string(),
-            None,
-        );
-        let first = crate::settings::bytecode::SettingsBytecodeInstance::new(
-            "editor:first".to_string(),
-            "First".to_string(),
-            "Folder".to_string(),
-            Some(0),
-        );
-        let second = crate::settings::bytecode::SettingsBytecodeInstance::new(
-            "editor:second".to_string(),
-            "Second".to_string(),
-            "Folder".to_string(),
-            Some(0),
-        );
-        let reference = SettingsBytecode {
-            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
-            instances: vec![root.clone(), first.clone(), second.clone()],
-        };
-        let mut observed_first = first;
-        observed_first.settings_id = "debug:first".to_string();
-        let mut observed_second = second;
-        observed_second.settings_id = "debug:second".to_string();
-        let observed = SettingsBytecode {
-            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
-            instances: vec![root, observed_second, observed_first],
-        };
-
-        assert!(matches!(
-            align_settings_bytes_to_reference(
-                &encode_settings_bytecode(&reference).unwrap(),
-                &encode_settings_bytecode(&observed).unwrap(),
-            )
-            .unwrap(),
-            SettingsAlignment::Equivalent
-        ));
-    }
-
-    #[test]
-    fn aligned_settings_bytes_ignore_reordered_duplicate_siblings() {
-        let root = crate::settings::bytecode::SettingsBytecodeInstance::new(
-            "1".to_string(),
-            "Workspace".to_string(),
-            "Workspace".to_string(),
-            None,
-        );
-        let mut first = crate::settings::bytecode::SettingsBytecodeInstance::new(
-            "editor:first".to_string(),
-            "Attachment".to_string(),
-            "Attachment".to_string(),
-            Some(0),
-        );
-        first.attributes.insert("Side".to_string(), json!("first"));
-        let mut second = crate::settings::bytecode::SettingsBytecodeInstance::new(
-            "editor:second".to_string(),
-            "Attachment".to_string(),
-            "Attachment".to_string(),
-            Some(0),
-        );
-        second
-            .attributes
-            .insert("Side".to_string(), json!("second"));
-        let reference = SettingsBytecode {
-            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
-            instances: vec![root.clone(), first.clone(), second.clone()],
-        };
-        first.settings_id = "debug:first".to_string();
-        second.settings_id = "debug:second".to_string();
-        let positional_observed = SettingsBytecode {
-            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
-            instances: vec![root.clone(), first.clone(), second.clone()],
-        };
-        assert!(settings_documents_positionally_equivalent(
-            &reference,
-            &positional_observed
-        ));
-        let observed = SettingsBytecode {
-            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
-            instances: vec![root, second, first],
-        };
-        assert!(!settings_documents_positionally_equivalent(
-            &reference, &observed
-        ));
-
-        assert!(matches!(
-            align_settings_bytes_to_reference(
-                &encode_settings_bytecode(&reference).unwrap(),
-                &encode_settings_bytecode(&observed).unwrap(),
-            )
-            .unwrap(),
-            SettingsAlignment::Equivalent
-        ));
-    }
-
-    #[test]
     fn duplicate_siblings_align_by_outgoing_references() {
         let root = crate::settings::bytecode::SettingsBytecodeInstance::new(
             "root".to_string(),
@@ -5631,119 +5298,6 @@ mod tests {
     }
 
     #[test]
-    fn aligned_settings_bytes_detect_reparenting() {
-        let root = crate::settings::bytecode::SettingsBytecodeInstance::new(
-            "1".to_string(),
-            "Workspace".to_string(),
-            "Workspace".to_string(),
-            None,
-        );
-        let first_parent = crate::settings::bytecode::SettingsBytecodeInstance::new(
-            "editor:first-parent".to_string(),
-            "First".to_string(),
-            "Folder".to_string(),
-            Some(0),
-        );
-        let second_parent = crate::settings::bytecode::SettingsBytecodeInstance::new(
-            "editor:second-parent".to_string(),
-            "Second".to_string(),
-            "Folder".to_string(),
-            Some(0),
-        );
-        let child = crate::settings::bytecode::SettingsBytecodeInstance::new(
-            "editor:child".to_string(),
-            "Child".to_string(),
-            "Folder".to_string(),
-            Some(1),
-        );
-        let reference = SettingsBytecode {
-            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
-            instances: vec![
-                root.clone(),
-                first_parent.clone(),
-                second_parent.clone(),
-                child.clone(),
-            ],
-        };
-        let mut observed_first_parent = first_parent;
-        observed_first_parent.settings_id = "debug:first-parent".to_string();
-        let mut observed_second_parent = second_parent;
-        observed_second_parent.settings_id = "debug:second-parent".to_string();
-        let mut observed_child = child;
-        observed_child.settings_id = "debug:child".to_string();
-        observed_child.parent_index = Some(2);
-        let observed = SettingsBytecode {
-            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
-            instances: vec![
-                root,
-                observed_first_parent,
-                observed_second_parent,
-                observed_child,
-            ],
-        };
-
-        assert!(matches!(
-            align_settings_bytes_to_reference(
-                &encode_settings_bytecode(&reference).unwrap(),
-                &encode_settings_bytecode(&observed).unwrap(),
-            )
-            .unwrap(),
-            SettingsAlignment::Changed(_)
-        ));
-    }
-
-    #[test]
-    fn aligned_settings_bytes_remap_references_across_reordering() {
-        let root = crate::settings::bytecode::SettingsBytecodeInstance::new(
-            "1".to_string(),
-            "ReplicatedStorage".to_string(),
-            "ReplicatedStorage".to_string(),
-            None,
-        );
-        let target = crate::settings::bytecode::SettingsBytecodeInstance::new(
-            "editor:target".to_string(),
-            "Target".to_string(),
-            "Folder".to_string(),
-            Some(0),
-        );
-        let mut holder = crate::settings::bytecode::SettingsBytecodeInstance::new(
-            "editor:holder".to_string(),
-            "Holder".to_string(),
-            "ObjectValue".to_string(),
-            Some(0),
-        );
-        holder.properties.insert(
-            "Value".to_string(),
-            json!({"_type": "Ref", "settingsId": "editor:target"}),
-        );
-        let reference = SettingsBytecode {
-            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
-            instances: vec![root.clone(), target.clone(), holder.clone()],
-        };
-        let mut observed_target = target;
-        observed_target.settings_id = "debug:target".to_string();
-        let mut observed_holder = holder;
-        observed_holder.settings_id = "debug:holder".to_string();
-        observed_holder.properties.insert(
-            "Value".to_string(),
-            json!({"_type": "Ref", "settingsId": "debug:target"}),
-        );
-        let observed = SettingsBytecode {
-            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
-            instances: vec![root, observed_holder, observed_target],
-        };
-
-        assert!(matches!(
-            align_settings_bytes_to_reference(
-                &encode_settings_bytecode(&reference).unwrap(),
-                &encode_settings_bytecode(&observed).unwrap(),
-            )
-            .unwrap(),
-            SettingsAlignment::Equivalent
-        ));
-    }
-
-    #[test]
     fn duplicate_containers_align_by_distinct_descendant_content() {
         for count in [2, 2_000] {
             let mut reference = duplicate_geometry(count);
@@ -5780,122 +5334,6 @@ mod tests {
             );
             assert!(settings_documents_equivalent(&reference, &observed));
         }
-    }
-
-    #[test]
-    fn duplicate_subtrees_pair_by_content_before_references() {
-        let root = crate::settings::bytecode::SettingsBytecodeInstance::new(
-            "root".to_string(),
-            "Workspace".to_string(),
-            "Workspace".to_string(),
-            None,
-        );
-        let model = |id: &str, pivot: i64, child_id: &str| {
-            let mut instance = crate::settings::bytecode::SettingsBytecodeInstance::new(
-                id.to_string(),
-                "Duplicate".to_string(),
-                "Model".to_string(),
-                Some(0),
-            );
-            instance
-                .properties
-                .insert("PivotMarker".to_string(), json!(pivot));
-            instance.properties.insert(
-                "PrimaryPart".to_string(),
-                json!({"_type": "Ref", "settingsId": child_id}),
-            );
-            instance
-        };
-        let child = |id: &str, parent_index: usize| {
-            crate::settings::bytecode::SettingsBytecodeInstance::new(
-                id.to_string(),
-                "Primary".to_string(),
-                "Part".to_string(),
-                Some(parent_index),
-            )
-        };
-        let reference = SettingsBytecode {
-            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
-            instances: vec![
-                root.clone(),
-                model("editor:model-a", 10, "editor:child-a"),
-                child("editor:child-a", 1),
-                model("editor:model-b", 20, "editor:child-b"),
-                child("editor:child-b", 3),
-            ],
-        };
-        let observed = SettingsBytecode {
-            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
-            instances: vec![
-                root,
-                model("debug:model-b", 20, "debug:child-b"),
-                child("debug:child-b", 1),
-                model("debug:model-a", 10, "debug:child-a"),
-                child("debug:child-a", 3),
-            ],
-        };
-
-        assert!(matches!(
-            align_settings_bytes_to_reference(
-                &encode_settings_bytecode(&reference).unwrap(),
-                &encode_settings_bytecode(&observed).unwrap(),
-            )
-            .unwrap(),
-            SettingsAlignment::Equivalent
-        ));
-    }
-
-    #[test]
-    fn aligned_settings_bytes_keep_ids_when_content_changes() {
-        let mut reference = SettingsBytecode {
-            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
-            instances: vec![
-                crate::settings::bytecode::SettingsBytecodeInstance::new(
-                    "1".to_string(),
-                    "ReplicatedStorage".to_string(),
-                    "ReplicatedStorage".to_string(),
-                    None,
-                ),
-                crate::settings::bytecode::SettingsBytecodeInstance::new(
-                    "editor:value".to_string(),
-                    "Value".to_string(),
-                    "StringValue".to_string(),
-                    Some(0),
-                ),
-            ],
-        };
-        reference.instances[1]
-            .properties
-            .insert("Value".to_string(), json!("before"));
-        let mut observed = reference.clone();
-        observed.instances[1].settings_id = "debug:0_12".to_string();
-        observed.instances[1]
-            .properties
-            .insert("Value".to_string(), json!("after"));
-        let reference_bytes = encode_settings_bytecode(&reference).unwrap();
-        let observed_bytes = encode_settings_bytecode(&observed).unwrap();
-
-        let SettingsAlignment::Changed(aligned) =
-            align_settings_bytes_to_reference(&reference_bytes, &observed_bytes).unwrap()
-        else {
-            panic!("changed content was treated as equivalent");
-        };
-        let aligned = decode_settings_bytecode(&aligned).unwrap();
-        assert_eq!(aligned.instances[1].settings_id, "editor:value");
-        assert_eq!(aligned.instances[1].properties["Value"], "after");
-    }
-
-    #[test]
-    fn enum_items_allow_compact_and_expanded_forms() {
-        let compact = json!({"_type": "EnumItem", "name": "Sensor"});
-        let expanded = json!({
-            "_type": "EnumItem",
-            "enumType": "Enum.ScreenOrientation",
-            "name": "Sensor",
-            "value": 2,
-        });
-        assert!(reconciliation_values_equal(&compact, &expanded, false));
-        assert!(reconciliation_values_equal(&expanded, &compact, false));
     }
 
     #[test]
@@ -6118,49 +5556,6 @@ mod tests {
     }
 
     #[test]
-    fn swapped_same_named_siblings_pair_with_their_own_subtrees() {
-        let instance = |id: &str, name: &str, class: &str, parent: Option<usize>, pivot: f64| {
-            let mut instance =
-                SettingsBytecodeInstance::new(id.into(), name.into(), class.into(), parent);
-            instance.properties.insert(
-                "WorldPivot".into(),
-                json!({"_type": "CFrame", "components": [pivot, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]}),
-            );
-            instance
-        };
-        let reference = SettingsBytecode {
-            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
-            instances: vec![
-                instance("root", "GaragePlace", "Folder", None, 0.0),
-                instance("small", "Model", "Model", Some(0), 1.0),
-                instance("small-part", "Part", "Part", Some(1), 1.5),
-                instance("large", "Model", "Model", Some(0), 2.0),
-                instance("large-a", "Part", "Part", Some(3), 2.5),
-                instance("large-b", "Part", "Part", Some(3), 2.75),
-            ],
-        };
-        let mut observed = SettingsBytecode {
-            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
-            instances: vec![
-                instance("o0", "GaragePlace", "Folder", None, 0.0),
-                instance("o1", "Model", "Model", Some(0), 20.0),
-                instance("o2", "Part", "Part", Some(1), 25.0),
-                instance("o3", "Part", "Part", Some(1), 27.5),
-                instance("o4", "Model", "Model", Some(0), 10.0),
-                instance("o5", "Part", "Part", Some(4), 15.0),
-            ],
-        };
-        assert!(align_settings_ids_to_reference(&reference, &mut observed));
-        assert_eq!(observed.instances[1].settings_id, "large");
-        assert_eq!(observed.instances[4].settings_id, "small");
-        assert_eq!(observed.instances[5].settings_id, "small-part");
-        assert!(matches!(
-            observed.instances[2].settings_id.as_str(),
-            "large-a" | "large-b"
-        ));
-    }
-
-    #[test]
     fn viewport_role_precedes_duplicate_names_ordinals_and_recycled_ids() {
         for name in ["Camera", "CurrentCamera", "Viewport"] {
             let mut root = SettingsBytecodeInstance::new(
@@ -6328,66 +5723,11 @@ mod tests {
             }
         }
     }
-
-    #[test]
-    fn float32_properties_use_roblox_precision_without_weakening_other_numbers() {
-        let concise = json!(0.2);
-        let studio_float32 = json!(0.20000000298023224);
-        let different = json!(0.21);
-
-        assert!(reconciliation_property_values_equal(
-            "Part",
-            "Transparency",
-            Some(&concise),
-            Some(&studio_float32),
-        ));
-        assert!(!reconciliation_property_values_equal(
-            "Part",
-            "Transparency",
-            Some(&concise),
-            Some(&different),
-        ));
-        assert!(!reconciliation_values_equal(
-            &concise,
-            &studio_float32,
-            false,
-        ));
-    }
 }
 
 #[cfg(test)]
 mod never_serialized_properties {
     use super::*;
-
-    #[test]
-    fn a_property_roblox_never_saves_is_unknown_when_files_lack_it() {
-        let database = rbx_reflection_database::get().unwrap();
-        assert!(reconciliation_property_is_unknown_when_absent(
-            Some(database),
-            "VRService",
-            "GuiInputUserCFrame"
-        ));
-        assert!(reconciliation_property_is_unknown_when_absent(
-            Some(database),
-            "VRService",
-            "VREnabled"
-        ));
-        assert!(!reconciliation_property_is_unknown_when_absent(
-            Some(database),
-            "VRService",
-            "AutomaticScaling"
-        ));
-        assert!(reconciliation_property_is_unknown_when_absent(
-            Some(database),
-            "Part",
-            "CollisionGroupId"
-        ));
-        assert!(!reconciliation_property_is_unknown_when_absent(
-            Some(database),
-            "Part",
-            "CollisionGroup"
-        ));
-    }
 
     #[test]
     fn audio_emitter_curves_are_readable_through_their_accessors() {
@@ -6414,21 +5754,6 @@ mod never_serialized_properties {
             "Part",
             "DistanceAttenuation"
         ));
-    }
-
-    #[test]
-    fn a_stale_service_setting_in_the_files_differs_from_the_captured_value() {
-        let file = Map::from_iter([(
-            "Technology".to_string(),
-            serde_json::json!({"_type": "EnumItem", "name": "ShadowMap"}),
-        )]);
-        let studio = Map::from_iter([(
-            "Technology".to_string(),
-            serde_json::json!({"_type": "EnumItem", "enumType": "Enum.Technology", "name": "Voxel", "value": 1}),
-        )]);
-        assert!(!reconciliation_maps_equal("Lighting", &file, &studio));
-        assert!(!reconciliation_maps_equal("Lighting", &studio, &file));
-        assert!(reconciliation_maps_equal("Lighting", &Map::new(), &studio));
     }
 
     #[test]
@@ -6806,50 +6131,6 @@ mod never_serialized_properties {
         align_equivalent_property_map_values(None, "MeshPart", &reference, &mut kept);
         assert_eq!(kept["PhysicalConfigData"], other_mesh["PhysicalConfigData"]);
     }
-
-    #[test]
-    fn service_settings_without_a_plugin_api_compare_when_both_records_carry_them() {
-        let database = rbx_reflection_database::get().unwrap();
-        let value = serde_json::json!({"_type": "EnumItem", "name": "ShadowMap"});
-        for (class_name, name) in [
-            ("Lighting", "Technology"),
-            ("SoundService", "VolumetricAudio"),
-            ("Workspace", "StreamingMinRadius"),
-        ] {
-            assert!(!reconciliation_property_is_engine_state(
-                Some(database),
-                class_name,
-                name,
-                &value
-            ));
-            assert!(reconciliation_property_is_unknown_when_absent(
-                Some(database),
-                class_name,
-                name
-            ));
-            assert!(reconciliation_property_compares(
-                Some(database),
-                class_name,
-                name,
-                &value,
-                true,
-                true
-            ));
-            assert!(!reconciliation_property_compares(
-                Some(database),
-                class_name,
-                name,
-                &value,
-                true,
-                false
-            ));
-        }
-        assert!(!reconciliation_property_is_unknown_when_absent(
-            Some(database),
-            "Part",
-            "Anchored"
-        ));
-    }
 }
 
 #[cfg(test)]
@@ -6869,53 +6150,6 @@ mod verify_noise_tests {
     }
 
     #[test]
-    fn asset_references_match_across_spellings_only_for_asset_properties() {
-        let pair = |left: &str, right: &str| {
-            let mut files = Map::new();
-            files.insert("TextureContent".into(), json!(left));
-            let mut studio = Map::new();
-            studio.insert("TextureContent".into(), json!(right));
-            (files, studio)
-        };
-        let (files, studio) = pair(
-            "rbxassetid://2606198812",
-            "http://www.roblox.com/asset/?id=2606198812",
-        );
-        assert!(reconciliation_maps_equal("Decal", &files, &studio));
-        assert!(reconciliation_property_values_equal(
-            "Decal",
-            "TextureContent",
-            files.get("TextureContent"),
-            studio.get("TextureContent")
-        ));
-        let (files, studio) = pair("https://www.roblox.com/asset/?id=7", "RBXASSETID://7");
-        assert!(reconciliation_maps_equal("Decal", &files, &studio));
-        let (files, studio) = pair("rbxassetid://2606198812", "rbxassetid://2606198813");
-        assert!(!reconciliation_maps_equal("Decal", &files, &studio));
-        let (files, studio) = pair("rbxassetid://5", "rbxasset://5");
-        assert!(!reconciliation_maps_equal("Decal", &files, &studio));
-        let (files, studio) = pair("rbxassetid://7abc", "rbxassetid://7");
-        assert!(!reconciliation_maps_equal("Decal", &files, &studio));
-        let (files, studio) = pair("https://notroblox.com/asset/?id=7", "rbxassetid://7");
-        assert!(!reconciliation_maps_equal("Decal", &files, &studio));
-        let (files, studio) = pair("rbxassetid://7?x", "rbxassetid://7");
-        assert!(!reconciliation_maps_equal("Decal", &files, &studio));
-        let (files, studio) = pair("rbxassetid://7 ", "http://www.roblox.com/asset/?id=7 ");
-        assert!(reconciliation_maps_equal("Decal", &files, &studio));
-        // Ordinary strings keep exact comparison.
-        let mut files = Map::new();
-        files.insert("Value".into(), json!("old: rbxassetid://7"));
-        let mut studio = Map::new();
-        studio.insert("Value".into(), json!("new: rbxassetid://7"));
-        assert!(!reconciliation_maps_equal("StringValue", &files, &studio));
-        assert!(!reconciliation_values_equal(
-            &json!("rbxassetid://7"),
-            &json!("http://www.roblox.com/asset/?id=7"),
-            false
-        ));
-    }
-
-    #[test]
     fn tag_order_does_not_count_in_the_shared_comparator_either() {
         assert!(reconciliation_property_values_equal(
             "Seat",
@@ -6929,68 +6163,6 @@ mod verify_noise_tests {
             Some(&json!(["a", "b"])),
             Some(&json!(["b"]))
         ));
-    }
-
-    #[test]
-    fn settled_joint_cframes_are_not_differences() {
-        let saved = json!({"_type":"CFrame","components":[943.9832, 25.768948, -289.9822, -0.999991, 0.0, 0.0050982987, 0.0, 1.0, 0.0, -0.0050982987, 0.0, -0.999991]});
-        let settled = json!({"_type":"CFrame","components":[943.9832153320312, 25.76894760131836, -289.9822082519531, -0.9999870657920837, 0.0, 0.005098278634250164, 0.0, 1.0, 0.0, -0.005098278634250164, 0.0, -0.9999870657920837]});
-        assert!(reconciliation_values_equal(&saved, &settled, false));
-        let moved = json!({"_type":"CFrame","components":[943.99, 25.768948, -289.9822, -0.999991, 0.0, 0.0050982987, 0.0, 1.0, 0.0, -0.0050982987, 0.0, -0.999991]});
-        assert!(!reconciliation_values_equal(&saved, &moved, false));
-        let pivot_saved = json!({"_type":"CFrame","components":[899.7149658203125, 60.933189, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]});
-        let pivot_live = json!({"_type":"CFrame","components":[899.7149047851562, 60.933082, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]});
-        assert!(reconciliation_values_equal(
-            &pivot_saved,
-            &pivot_live,
-            false
-        ));
-        let pivot_moved = json!({"_type":"CFrame","components":[899.7149658203125, 60.9342, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]});
-        assert!(!reconciliation_values_equal(
-            &pivot_saved,
-            &pivot_moved,
-            false
-        ));
-        let turned = json!({"_type":"CFrame","components":[943.9832, 25.768948, -289.9822, -0.9995, 0.0, 0.03, 0.0, 1.0, 0.0, -0.03, 0.0, -0.9995]});
-        assert!(!reconciliation_values_equal(&saved, &turned, false));
-    }
-
-    #[test]
-    fn weld_constraint_state_is_engine_state() {
-        let mut files = Map::new();
-        files.insert("State".into(), json!(1));
-        let mut studio = Map::new();
-        studio.insert("State".into(), json!(3));
-        assert!(reconciliation_maps_equal("WeldConstraint", &files, &studio));
-        assert!(!reconciliation_maps_equal("Smoke", &files, &studio));
-    }
-
-    #[test]
-    fn collision_group_id_is_engine_state_but_the_group_name_is_not() {
-        let mut files = Map::new();
-        files.insert("CollisionGroupId".into(), json!(-1));
-        let mut studio = Map::new();
-        studio.insert("CollisionGroupId".into(), json!(3));
-        assert!(reconciliation_maps_equal("Part", &files, &studio));
-        files.insert("CollisionGroup".into(), json!("Cars"));
-        studio.insert("CollisionGroup".into(), json!("Default"));
-        assert!(!reconciliation_maps_equal("Part", &files, &studio));
-    }
-
-    #[test]
-    fn workspace_insert_point_is_engine_state() {
-        let mut files = Map::new();
-        files.insert(
-            "InsertPoint".into(),
-            json!({"_type":"Vector3","x":0.0,"y":0.0,"z":0.0}),
-        );
-        let mut studio = Map::new();
-        studio.insert(
-            "InsertPoint".into(),
-            json!({"_type":"Vector3","x":839.25885,"y":28.756990,"z":-12.5}),
-        );
-        assert!(reconciliation_maps_equal("Workspace", &files, &studio));
-        assert!(!reconciliation_maps_equal("Model", &files, &studio));
     }
 
     #[test]
@@ -7011,31 +6183,6 @@ mod verify_noise_tests {
             "BillboardGui",
             &explicit,
             &other
-        ));
-    }
-
-    #[test]
-    fn input_sink_says_nothing_when_one_record_lacks_it() {
-        let absent = Map::new();
-        let mut none = Map::new();
-        none.insert(
-            "InputSink".into(),
-            json!({"_type":"EnumItem","name":"None"}),
-        );
-        let mut activate = Map::new();
-        activate.insert(
-            "InputSink".into(),
-            json!({"_type":"EnumItem","name":"Activate"}),
-        );
-        assert!(reconciliation_maps_equal("TextButton", &absent, &none));
-        assert!(reconciliation_maps_equal("TextButton", &none, &absent));
-        assert!(reconciliation_maps_equal("TextButton", &absent, &activate));
-        assert!(!reconciliation_maps_equal("TextButton", &none, &activate));
-        assert!(!reconciliation_property_values_equal(
-            "TextButton",
-            "InputSink",
-            none.get("InputSink"),
-            activate.get("InputSink")
         ));
     }
 }

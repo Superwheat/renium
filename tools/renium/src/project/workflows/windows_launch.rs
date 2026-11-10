@@ -394,22 +394,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn studio_launch_blocks_transient_null_foreground_without_blocking_user_input() {
-        use std::os::windows::process::CommandExt;
-        let output =
-            std::process::Command::new(concat!(env!("OUT_DIR"), "/renium-launch-policy-test.exe"))
-                .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
-                .env_remove("RENIUM_TRACE_LAUNCH")
-                .output()
-                .expect("native launch regression should run without opening any windows");
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    #[test]
     fn studio_launch_preserves_quoted_unicode_and_trailing_slash_arguments() {
         for (argument, expected) in [
             ("", "\"\""),

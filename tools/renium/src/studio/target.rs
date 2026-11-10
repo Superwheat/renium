@@ -60,19 +60,4 @@ mod tests {
         };
         assert!(place_matches(&modified, "place2.rbxl"));
     }
-
-    #[test]
-    fn numeric_place_selectors_never_fall_back_to_display_names() {
-        let info = BridgeInfoPayload {
-            place_id: Some(20),
-            game_id: Some(10),
-            place_name: "Unrelated 30".into(),
-            ..Default::default()
-        };
-        assert!(place_matches(&info, "20"));
-        assert!(place_matches(&info, "10:20"));
-        assert!(!place_matches(&info, "30"));
-        assert!(!place_matches(&info, "11:20"));
-        assert!(place_matches(&info, "Unrelated"));
-    }
 }

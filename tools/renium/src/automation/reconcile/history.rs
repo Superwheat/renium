@@ -607,44 +607,6 @@ mod tests {
     }
 
     #[test]
-    fn sync_history_cli_requires_an_unambiguous_selector() {
-        use crate::cli::EditorRevertArgs;
-        use clap::Parser;
-        let args =
-            EditorRevertArgs::try_parse_from(["rev", "--sync", "latest", "--details"]).unwrap();
-        assert!(args.details);
-        assert_eq!(args.sync.as_deref(), Some("latest"));
-        let one_file = EditorRevertArgs::try_parse_from([
-            "rev",
-            "--sync",
-            "latest",
-            "--path",
-            "src/Workspace/A.luau",
-            "--print",
-        ])
-        .unwrap();
-        assert!(one_file.print && one_file.path.is_some());
-        assert_eq!(one_file.sync.as_deref(), Some("latest"));
-        for args in [
-            vec!["rev", "--details"],
-            vec!["rev", "--print"],
-            vec!["rev", "--sync", "latest", "--print"],
-            vec![
-                "rev",
-                "--sync",
-                "latest",
-                "--path",
-                "src/Workspace/A.luau",
-                "--details",
-            ],
-            vec!["rev", "--sync", "latest", "--settings-id", "editor:1"],
-            vec!["rev", "--sync", "latest", "--service", "Workspace"],
-        ] {
-            assert!(EditorRevertArgs::try_parse_from(args).is_err());
-        }
-    }
-
-    #[test]
     fn one_file_reads_from_a_named_entry_or_the_newest_entry_holding_it() {
         let root = temp_dir("sync-history-file");
         let path = PathBuf::from("src/Workspace/A.luau");

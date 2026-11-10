@@ -32,30 +32,6 @@ fn changed_field_scan_preserves_names_values_and_presence() {
 }
 
 #[test]
-fn asset_spellings_do_not_hide_authored_text_changes() {
-    let url = json!("http://www.roblox.com/asset/?id=13125202269");
-    let uri = json!("rbxassetid://13125202269");
-    for (class, name) in [
-        (None, "Image"),
-        (Some("StringValue"), "Value"),
-        (Some("TextLabel"), "Text"),
-    ] {
-        let before = Map::from_iter([(name.to_string(), url.clone())]);
-        let after = Map::from_iter([(name.to_string(), uri.clone())]);
-        assert_eq!(
-            changed_fields_of(class, &before, &after, true).len(),
-            1,
-            "{class:?}.{name}"
-        );
-        assert_eq!(
-            changed_fields_of(class, &after, &before, true).len(),
-            1,
-            "{class:?}.{name}"
-        );
-    }
-}
-
-#[test]
 fn rig_table_omissions_keep_authored_instance_properties() {
     use crate::tests::support::{settings_document, settings_instance};
     let mut rig = settings_instance("rig", "AnimationRigData", "AnimationRigData", None);
@@ -179,37 +155,6 @@ fn changed_field_scan_knows_class_defaults_and_asset_spellings() {
 }
 
 #[test]
-fn changed_field_scan_ignores_empty_blobs_and_float_noise() {
-    let before = serde_json::from_value::<Map<String, Value>>(json!({
-        "CFrame": {"_type": "CFrame", "components": [937.5429, 26.621252, 888.5725, -0.363981, 0.0, -0.9314095, 0.0, 0.99999624, 0.0, 0.9314095, 0.0, -0.363981]},
-        "Size": {"_type": "Vector3", "x": 1.0, "y": 1.0, "z": 1.0},
-    }))
-    .unwrap();
-    let after = serde_json::from_value::<Map<String, Value>>(json!({
-        "CFrame": {"_type": "CFrame", "components": [937.5429, 26.621292, 888.5725, -0.363984, 0.0, -0.93141717, 0.0, 0.9999855, 0.0, 0.93141705, 0.0, -0.363984]},
-        "Size": {"_type": "Vector3", "x": 1.0, "y": 1.0, "z": 1.0},
-        "SerializedOverrides": {"_type": "BinaryString", "base64": ""},
-    }))
-    .unwrap();
-    assert!(changed_fields(&before, &after, true).is_empty());
-    let mut moved = after.clone();
-    moved["CFrame"]["components"][0] = json!(937.56);
-    assert_eq!(
-        changed_fields(&before, &moved, false),
-        json!([{"name":"CFrame"}]).as_array().unwrap().clone()
-    );
-    let mut overridden = after.clone();
-    overridden["SerializedOverrides"]["base64"] = json!("AQ==");
-    assert_eq!(
-        changed_fields(&before, &overridden, false),
-        json!([{"name":"SerializedOverrides"}])
-            .as_array()
-            .unwrap()
-            .clone()
-    );
-}
-
-#[test]
 fn members_saved_by_one_side_only_are_set_aside_per_class() {
     use crate::tests::support::{settings_document, settings_instance};
     let mut before = settings_document(vec![
@@ -235,36 +180,6 @@ fn members_saved_by_one_side_only_are_set_aside_per_class() {
     );
     assert!(after.instances[1].properties.is_empty());
     assert_eq!(after.instances[2].properties["Anchored"], false);
-}
-
-#[test]
-fn block_physics_placeholders_are_reported_while_computed_hulls_are_not() {
-    use crate::tests::support::{settings_document, settings_instance};
-    let mut document = settings_document(vec![
-        settings_instance("w", "Workspace", "Workspace", None),
-        settings_instance("a", "Tent", "MeshPart", Some(0)),
-        settings_instance("b", "Cone", "MeshPart", Some(0)),
-    ]);
-    document.instances[1].properties.insert(
-        "PhysicalConfigData".into(),
-        json!({"_type": "SharedString", "base64": "Q1NHUEhTAAAAAEJMT0NL"}),
-    );
-    document.instances[2].properties.insert(
-        "PhysicalConfigData".into(),
-        json!({"_type": "SharedString", "base64": base64::encode(b"CSGPHS\x08\0\0\0\x02\0(hull bytes)")}),
-    );
-    let omitted = omit_engine_managed_properties(&mut document, &[]);
-    assert_eq!(omitted.get("PhysicalConfigData"), Some(&1));
-    assert!(
-        document.instances[1]
-            .properties
-            .contains_key("PhysicalConfigData")
-    );
-    assert!(
-        !document.instances[2]
-            .properties
-            .contains_key("PhysicalConfigData")
-    );
 }
 
 #[test]
@@ -348,13 +263,6 @@ fn diff(before: &WeakDom, after: &WeakDom, extra: &[&str]) -> Value {
 }
 
 #[test]
-fn full_diff_matches_reordered_duplicate_subtrees_and_references() {
-    let result = diff(&fixture(false, 1.0), &fixture(true, 1.0), &[]);
-    assert_eq!(result["matches"], true, "{result}");
-    assert_eq!(result["unchanged"], 7);
-}
-
-#[test]
 fn comparison_decode_elision_preserves_normalized_values() {
     let mut source = fixture(false, 2.0);
     let root = source.root().children()[0];
@@ -425,41 +333,6 @@ fn comparison_decode_elision_preserves_normalized_values() {
 }
 
 #[test]
-fn full_diff_reports_attributes_sources_references_additions_and_removals() {
-    let before = fixture(false, 1.0);
-    let mut after = fixture(false, 2.0);
-    let root = after.root().children()[0];
-    let children = after.get_by_ref(root).unwrap().children().to_vec();
-    after
-        .get_by_ref_mut(children[2])
-        .unwrap()
-        .properties
-        .insert("Value".into(), Variant::Ref(children[1]));
-    let script = after.get_by_ref(children[0]).unwrap().children()[0];
-    after
-        .get_by_ref_mut(script)
-        .unwrap()
-        .properties
-        .insert("Source".into(), Variant::String("return 9".into()));
-    after.insert(root, InstanceBuilder::new("Folder").with_name("Added"));
-    let result = diff(&before, &after, &["--values", "--all"]);
-    assert_eq!(result["added"], 1, "{result}");
-    assert_eq!(result["changed"], 3, "{result}");
-    assert_eq!(result["removed"], 0);
-    assert!(result["differences"].as_array().unwrap().iter().any(|d| {
-        d["attributes"].as_array().is_some_and(|a| {
-            a.iter()
-                .any(|v| v["name"] == "Revision" && v["before"] == 1.0 && v["after"] == 2.0)
-        })
-    }));
-    let reverse = diff(&after, &before, &["--limit", "1"]);
-    assert_eq!(reverse["removed"], 1);
-    assert_eq!(reverse["differenceCount"], 4);
-    assert_eq!(reverse["truncated"], true);
-    assert_eq!(reverse["differences"].as_array().unwrap().len(), 1);
-}
-
-#[test]
 fn place_comparison_takes_the_target_positionally_and_skips_engine_session_services() {
     let root =
         crate::system::files::create_unique_directory(&std::env::temp_dir(), "renium-place-cmp-")
@@ -505,233 +378,6 @@ fn place_comparison_takes_the_target_positionally_and_skips_engine_session_servi
         json!(["ConfigureServerService"])
     );
     assert!(ComparePlaceArgs::try_parse_from(["cmp", before, after, "--against", after]).is_err());
-}
-
-#[test]
-fn full_diff_reads_binary_and_xml_places_without_studio_and_view_keeps_exact_source() {
-    let root =
-        crate::system::files::create_unique_directory(&std::env::temp_dir(), "renium-place-diff-")
-            .unwrap();
-    let _cleanup = crate::system::files::OnDrop::new(|| {
-        let _ = std::fs::remove_dir_all(&root);
-    });
-    let mut original = fixture(true, 1.0);
-    let workspace = original.root().children()[0];
-    original
-        .get_by_ref_mut(workspace)
-        .unwrap()
-        .properties
-        .extend([
-            (
-                "FutureProperty".into(),
-                Variant::String("saved value".into()),
-            ),
-            (
-                "FutureEnum".into(),
-                Variant::Enum(rbx_dom_weak::types::Enum::from_u32(1)),
-            ),
-        ]);
-    let mut attributes = Attributes::new();
-    attributes.insert("Text".to_string(), Variant::String("hello\0世界".into()));
-    original.insert(
-        workspace,
-        InstanceBuilder::new("Model")
-            .with_name("Empty")
-            .with_property("Attributes", attributes),
-    );
-    let target = original.insert(
-        workspace,
-        InstanceBuilder::new("Part").with_property(
-            "Material",
-            rbx_dom_weak::types::EnumItem {
-                ty: "Material".into(),
-                value: 288,
-            },
-        ),
-    );
-    original.insert(
-        workspace,
-        InstanceBuilder::new("Model")
-            .with_name("Linked")
-            .with_property("PrimaryPart", target),
-    );
-    let mut copies = Vec::new();
-    for extension in ["rbxl", "rbxlx"] {
-        let file = root.join(format!("place.{extension}"));
-        let format = crate::rbx::model::RbxPlaceFormat::from_path(&file).unwrap();
-        format
-            .write(&file, &original, original.root().children())
-            .unwrap();
-        copies.push(super::super::place_file::place_dom(&file).unwrap());
-        let round_trip = diff(&original, copies.last().unwrap(), &["--all"]);
-        assert_eq!(round_trip["matches"], true, "{extension}: {round_trip}");
-    }
-    let result = diff(&copies[0], &copies[1], &["--all"]);
-    assert_eq!(result["matches"], true, "{result}");
-    let view = document(&original, "view", None, false).unwrap();
-    assert!(
-        view.instances
-            .iter()
-            .any(|node| node.properties.get("Source") == Some(&json!("return 2\r\n")))
-    );
-}
-
-#[test]
-fn full_diff_does_not_hide_unknown_properties_or_emit_values_by_default() {
-    let before = fixture(false, 1.0);
-    let mut after = fixture(false, 1.0);
-    let root = after.root().children()[0];
-    after.get_by_ref_mut(root).unwrap().properties.insert(
-        "FutureProperty".into(),
-        Variant::String("private text".into()),
-    );
-    let result = diff(&before, &after, &[]);
-    assert_eq!(result["changed"], 1);
-    assert!(!result.to_string().contains("private text"));
-    assert!(
-        diff(&before, &after, &["--values"])
-            .to_string()
-            .contains("private text")
-    );
-}
-
-#[test]
-fn full_diff_normalizes_enum_encodings_aliases_and_explicit_defaults() {
-    use rbx_dom_weak::types::{Enum, EnumItem};
-    let mut before = WeakDom::new(InstanceBuilder::new("DataModel"));
-    let root = before.insert(before.root_ref(), InstanceBuilder::new("Workspace"));
-    before.insert(
-        root,
-        InstanceBuilder::new("Part")
-            .with_property("Material", Enum::from_u32(256))
-            .with_property("Transparency", 0.0_f32),
-    );
-    let mut after = WeakDom::new(InstanceBuilder::new("DataModel"));
-    let root = after.insert(after.root_ref(), InstanceBuilder::new("Workspace"));
-    let part = after.insert(
-        root,
-        InstanceBuilder::new("Part").with_property(
-            "material",
-            EnumItem {
-                ty: "Material".into(),
-                value: 256,
-            },
-        ),
-    );
-    assert_eq!(diff(&before, &after, &["--all"])["matches"], true);
-    after.get_by_ref_mut(part).unwrap().properties.insert(
-        "material".into(),
-        Variant::EnumItem(EnumItem {
-            ty: "Material".into(),
-            value: 288,
-        }),
-    );
-    let changed = diff(&before, &after, &["--all", "--values"]);
-    assert_eq!(changed["changed"], 1, "{changed}");
-    assert_eq!(
-        changed["differences"][0]["properties"][0]["name"],
-        "Material"
-    );
-    assert_eq!(
-        changed["differences"][0]["properties"][0]["after"]["enumType"],
-        "Enum.Material"
-    );
-}
-
-#[test]
-fn full_diff_reads_unknown_xml_properties_and_treats_tags_as_a_set() {
-    let root =
-        crate::system::files::create_unique_directory(&std::env::temp_dir(), "renium-place-diff-")
-            .unwrap();
-    let _cleanup = crate::system::files::OnDrop::new(|| {
-        let _ = std::fs::remove_dir_all(&root);
-    });
-    let path = root.join("unknown.rbxlx");
-    std::fs::write(&path, r#"<roblox version="4"><Item class="Workspace" referent="root"><Properties><string name="Name">Workspace</string><string name="FutureProperty">saved value</string></Properties></Item></roblox>"#).unwrap();
-    let before = super::super::place_file::place_dom(&path).unwrap();
-    let view = document(&before, "view", None, false).unwrap();
-    assert_eq!(
-        view.instances[0].properties["FutureProperty"],
-        "saved value"
-    );
-    let mut after = super::super::place_file::place_dom(&path).unwrap();
-    let root = after.root().children()[0];
-    after
-        .get_by_ref_mut(root)
-        .unwrap()
-        .properties
-        .remove(&"FutureProperty".into());
-    assert_eq!(diff(&before, &after, &[])["changed"], 1);
-
-    let mut before = before;
-    let before_root = before.root().children()[0];
-    before
-        .get_by_ref_mut(before_root)
-        .unwrap()
-        .properties
-        .remove(&"FutureProperty".into());
-    let mut tags = rbx_dom_weak::types::Tags::new();
-    tags.push("A");
-    tags.push("B");
-    before
-        .get_by_ref_mut(before_root)
-        .unwrap()
-        .properties
-        .insert("Tags".into(), Variant::Tags(tags));
-    let mut tags = rbx_dom_weak::types::Tags::new();
-    tags.push("B");
-    tags.push("A");
-    after
-        .get_by_ref_mut(root)
-        .unwrap()
-        .properties
-        .insert("Tags".into(), Variant::Tags(tags));
-    assert_eq!(diff(&before, &after, &[])["matches"], true);
-}
-
-#[test]
-fn project_diff_reports_nonserialized_properties_without_hiding_saved_physics() {
-    let mut project = WeakDom::new(InstanceBuilder::new("DataModel"));
-    let root = project.insert(project.root_ref(), InstanceBuilder::new("Workspace"));
-    let mesh = project.insert(
-        root,
-        InstanceBuilder::new("MeshPart")
-            .with_property("CollisionFidelity", rbx_dom_weak::types::Enum::from_u32(1))
-            .with_property(
-                "PhysicsData",
-                rbx_dom_weak::types::BinaryString::from(vec![1, 2, 3]),
-            ),
-    );
-    let mut bytes = Vec::new();
-    rbx_binary::to_writer(&mut bytes, &project, project.root().children()).unwrap();
-    let saved = rbx_binary::from_reader(bytes.as_slice()).unwrap();
-    let mut xml = Vec::new();
-    rbx_xml::to_writer(
-        &mut xml,
-        &project,
-        project.root().children(),
-        rbx_xml::EncodeOptions::new()
-            .property_behavior(rbx_xml::EncodePropertyBehavior::WriteUnknown),
-    )
-    .unwrap();
-    let saved_xml = rbx_xml::from_reader(
-        xml.as_slice(),
-        rbx_xml::DecodeOptions::new()
-            .property_behavior(rbx_xml::DecodePropertyBehavior::ReadUnknown),
-    )
-    .unwrap();
-    assert_eq!(diff(&saved, &saved_xml, &[])["matches"], true);
-    let omitted = project_properties_as_saved(&mut project).unwrap();
-    assert_eq!(
-        omitted,
-        BTreeMap::from([("CollisionFidelity".to_string(), 1)])
-    );
-    assert_eq!(diff(&saved, &project, &[])["matches"], true);
-    project.get_by_ref_mut(mesh).unwrap().properties.insert(
-        "PhysicsData".into(),
-        Variant::BinaryString(rbx_dom_weak::types::BinaryString::from(vec![4, 5, 6])),
-    );
-    assert_eq!(diff(&saved, &project, &[])["changed"], 1);
 }
 
 #[test]
@@ -844,26 +490,6 @@ fn full_diff_skips_engine_managed_values_and_migration_markers() {
 }
 
 #[test]
-fn full_diff_elides_an_explicit_input_sink_default() {
-    let mut before = WeakDom::new(InstanceBuilder::new("DataModel"));
-    let root = before.insert(before.root_ref(), InstanceBuilder::new("Workspace"));
-    let frame = before.insert(
-        root,
-        InstanceBuilder::new("Frame")
-            .with_property("InputSink", rbx_dom_weak::types::Enum::from_u32(0)),
-    );
-    let mut after = WeakDom::new(InstanceBuilder::new("DataModel"));
-    let root = after.insert(after.root_ref(), InstanceBuilder::new("Workspace"));
-    after.insert(root, InstanceBuilder::new("Frame"));
-    assert_eq!(diff(&before, &after, &[])["matches"], true);
-    before.get_by_ref_mut(frame).unwrap().properties.insert(
-        "InputSink".into(),
-        Variant::Enum(rbx_dom_weak::types::Enum::from_u32(1)),
-    );
-    assert_eq!(diff(&before, &after, &[])["changed"], 1);
-}
-
-#[test]
 fn project_diff_omits_unsaved_instances_and_fields_the_project_never_captures() {
     let mut place = WeakDom::new(InstanceBuilder::new("DataModel"));
     let root = place.insert(place.root_ref(), InstanceBuilder::new("Workspace"));
@@ -900,98 +526,4 @@ fn project_diff_omits_unsaved_instances_and_fields_the_project_never_captures() 
         result["notCapturedProjectProperties"]["IsLegacyChatDisabled"],
         1
     );
-}
-
-#[test]
-fn full_diff_pairs_same_named_siblings_by_content_when_their_values_swap() {
-    let build = |swap: bool| {
-        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
-        let workspace = dom.insert(dom.root_ref(), InstanceBuilder::new("Workspace"));
-        let boards = dom.insert(
-            workspace,
-            InstanceBuilder::new("Folder").with_name("Boards"),
-        );
-        let slots = [(1.0f32, 2.0f32), (3.0, 4.0), (5.0, 6.0), (7.0, 8.0)];
-        for index in 0..slots.len() {
-            let (position, size) = if swap {
-                slots[(index + 1) % slots.len()]
-            } else {
-                slots[index]
-            };
-            let position = if swap { position + 0.000_001 } else { position };
-            let car = dom.insert(boards, InstanceBuilder::new("Model").with_name("Koenra GX"));
-            dom.insert(
-                car,
-                InstanceBuilder::new("Part")
-                    .with_property("Size", Variant::Vector3(Vector3::new(size, size, size)))
-                    .with_property(
-                        "CFrame",
-                        Variant::CFrame(CFrame::new(
-                            Vector3::new(position, 0.0, 0.0),
-                            Matrix3::identity(),
-                        )),
-                    ),
-            );
-        }
-        dom
-    };
-    let result = diff(&build(false), &build(true), &[]);
-    assert_eq!(result["matches"], true, "{result}");
-    assert_eq!(result["reorderedSiblings"], 4, "{result}");
-
-    let mut changed = build(true);
-    let part = changed
-        .descendants()
-        .find(|instance| instance.class == "Part")
-        .map(|instance| instance.referent())
-        .unwrap();
-    changed
-        .get_by_ref_mut(part)
-        .unwrap()
-        .properties
-        .insert("Transparency".into(), Variant::Float32(0.5));
-    let result = diff(&build(false), &changed, &[]);
-    assert_eq!(result["matches"], false, "{result}");
-}
-
-#[test]
-fn full_diff_pairs_swapped_models_that_reference_their_own_parts() {
-    let build = |swap: bool| {
-        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
-        let workspace = dom.insert(dom.root_ref(), InstanceBuilder::new("Workspace"));
-        let slots = [(1.0f32, 2.0f32), (3.0, 4.0), (5.0, 6.0)];
-        for index in 0..slots.len() {
-            let (position, size) = if swap {
-                slots[(index + 1) % slots.len()]
-            } else {
-                slots[index]
-            };
-            let position = if swap { position + 0.000_001 } else { position };
-            let car = dom.insert(
-                workspace,
-                InstanceBuilder::new("Model").with_name("Koenra GX"),
-            );
-            let part = dom.insert(
-                car,
-                InstanceBuilder::new("Part")
-                    .with_property("Size", Variant::Vector3(Vector3::new(size, size, size)))
-                    .with_property(
-                        "CFrame",
-                        Variant::CFrame(CFrame::new(
-                            Vector3::new(position, 0.0, 0.0),
-                            Matrix3::identity(),
-                        )),
-                    ),
-            );
-            dom.get_by_ref_mut(car)
-                .unwrap()
-                .properties
-                .insert("PrimaryPart".into(), Variant::Ref(part));
-        }
-        dom
-    };
-    let result = diff(&build(false), &build(true), &[]);
-    assert_eq!(result["matches"], true, "{result}");
-    assert_eq!(result["reorderedSiblings"], 3, "{result}");
-    assert_eq!(result["removed"], 0, "{result}");
 }

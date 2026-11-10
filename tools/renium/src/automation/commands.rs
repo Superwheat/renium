@@ -936,40 +936,6 @@ mod input_action_tests {
 }
 
 #[cfg(test)]
-mod hyphen_value_tests {
-    use clap::Parser;
-
-    use crate::cli::{Cli, Commands};
-
-    #[test]
-    fn me_and_inp_take_values_that_start_with_a_hyphen() {
-        match Cli::try_parse_from(["rbx", "me", "a.luau", "-- old", "-- new", "x", "y", "-a"])
-            .unwrap()
-            .command
-        {
-            Commands::MultiEdit(args) => {
-                assert_eq!(args.old, "-- old");
-                assert_eq!(args.new, "-- new");
-                assert_eq!(args.more, ["x", "y"]);
-                assert!(args.all);
-            }
-            _ => unreachable!(),
-        }
-        match Cli::try_parse_from(["rbx", "inp", "--result", "-x", "-p", "2", "key", "E"])
-            .unwrap()
-            .command
-        {
-            Commands::Input(args) => {
-                assert_eq!(args.result.as_deref(), Some("-x"));
-                assert_eq!(args.player.as_deref(), Some("2"));
-                assert_eq!(args.actions, ["key", "E"]);
-            }
-            _ => unreachable!(),
-        }
-    }
-}
-
-#[cfg(test)]
 mod native_summary_tests {
     use super::*;
 

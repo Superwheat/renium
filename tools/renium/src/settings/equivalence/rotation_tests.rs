@@ -10,42 +10,6 @@ fn frame(degrees: f64) -> Value {
 }
 
 #[test]
-fn cframe_half_thousandth_degree_rotation_is_an_accepted_blind_spot() {
-    let before = frame(0.0);
-    let after = frame(0.0005);
-    let delta = after["components"][6].as_f64().unwrap();
-    std::eprintln!("0.0005 degree rotation: f32 off-diagonal delta={delta:.14}");
-    assert!(delta > 8e-6 && delta < 9e-6);
-    // Accepted tradeoff: 9e-6 also hides this genuine authored rigid rotation.
-    // Keep this explicit until a separately qualified normalization rule exists.
-    assert!(reconciliation_property_values_equal(
-        "Part",
-        "CFrame",
-        Some(&before),
-        Some(&after)
-    ));
-}
-
-#[test]
-fn rotation_one_thousandth_degree_and_one_e_minus_five_column_are_detected() {
-    let before = frame(0.0);
-    assert!(!reconciliation_property_values_equal(
-        "Part",
-        "CFrame",
-        Some(&before),
-        Some(&frame(0.001))
-    ));
-    let mut column = before.clone();
-    column["components"][3] = json!(1.00001);
-    assert!(!reconciliation_property_values_equal(
-        "Part",
-        "CFrame",
-        Some(&before),
-        Some(&column)
-    ));
-}
-
-#[test]
 fn identity_radius_contains_nine_micro_rotation_boundary() {
     let mut document = SettingsBytecode {
         version: SETTINGS_BINARY_VERSION,

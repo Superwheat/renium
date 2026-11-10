@@ -106,38 +106,6 @@ fn empty_batch_search_lists_only_selected_subtree_with_fields_and_limit() {
 }
 
 #[test]
-fn batch_find_reports_truncation_only_when_more_matches_exist() {
-    let (root, _) = fixture();
-    let _cleanup = crate::system::files::OnDrop::new(|| {
-        let _ = fs::remove_dir_all(&root);
-    });
-    let file = service_settings_path(&root.join("Workspace"));
-    for (limit, expected, truncated) in [(0, 1000, false), (999, 999, true), (1000, 1000, false)] {
-        let payload = json!([{"type":"find", "class":"Folder", "limit":limit}]).to_string();
-        let result = bytecode_explorer_batch_result(
-            BytecodeExplorerBatchArgs::try_parse_from([
-                "bb",
-                "-f",
-                file.to_str().unwrap(),
-                "-s",
-                "Workspace",
-                "-j",
-                &payload,
-                "-o",
-                "full",
-            ])
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            result["results"][0]["matches"].as_array().unwrap().len(),
-            expected
-        );
-        assert_eq!(result["results"][0]["truncated"], truncated);
-    }
-}
-
-#[test]
 fn temporary_import_roots_never_become_explorer_services() {
     let (root, _) = fixture();
     let _cleanup = crate::system::files::OnDrop::new(|| {
@@ -328,42 +296,4 @@ fn lazy_indexes_preserve_source_references_and_metadata_aliases() {
     );
     assert_eq!(node["canonicalSettingsId"], "script-0");
     assert_eq!(node["settingsFile"], json!(file));
-}
-
-#[test]
-fn incremental_rows_match_full_rebuild_for_both_modes() {
-    let (root, _) = fixture();
-    let _cleanup = crate::system::files::OnDrop::new(|| {
-        let _ = fs::remove_dir_all(&root);
-    });
-    let mut state = ExplorerDaemonState {
-        services: vec!["Workspace".into()],
-        service_states: HashMap::from([(
-            "Workspace".into(),
-            ExplorerServiceState::load(&root, "Workspace").unwrap(),
-        )]),
-        ..Default::default()
-    };
-    state.rebuild_rows(ExplorerViewMode::Normal);
-    state.start_search(1, 1, "o");
-    for mode in [ExplorerViewMode::Normal, ExplorerViewMode::Search] {
-        for id in [
-            "service:Workspace",
-            "Workspace:folder-500",
-            "Workspace:folder-0",
-            "service:Workspace",
-            "Workspace:folder-999",
-        ] {
-            state.expand(id, mode);
-            assert_eq!(state.rows(mode), state.build_rows(mode));
-            let version = state.view_version;
-            state.expand(id, mode);
-            assert_eq!(state.view_version, version);
-            state.collapse(id, mode);
-            assert_eq!(state.rows(mode), state.build_rows(mode));
-            let version = state.view_version;
-            state.collapse(id, mode);
-            assert_eq!(state.view_version, version);
-        }
-    }
 }

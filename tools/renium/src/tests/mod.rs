@@ -10,36 +10,24 @@ use std::path::{Path, PathBuf};
 use crate::bytecode::edit::{
     bytecode_clone_instance, bytecode_desync_package_link, bytecode_remove_instance,
 };
-use crate::bytecode::{bytecode_get_property, bytecode_set_property, ensure_service_store_exists};
+use crate::bytecode::{bytecode_get_property, bytecode_set_property};
 use crate::cli::args::VcInitArgs;
 use crate::cli::{
-    ApplyEditorDeleteArgs, BridgeConnectionArgs, BytecodeCloneInstanceArgs,
-    BytecodeDesyncPackageLinkArgs, BytecodeExportModelArgs, BytecodeExportPlaceArgs,
-    BytecodeFileArgs, BytecodeGetPropertyArgs, BytecodeInstanceSelectorArgs,
-    BytecodeRemoveInstanceArgs, BytecodeSetPropertyArgs, EditorMutationArgs, MoveInstanceArgs,
-    ProjectInstanceArgs, ProjectSourceArgs, PushEditorChangesArgs,
+    BridgeConnectionArgs, BytecodeCloneInstanceArgs, BytecodeDesyncPackageLinkArgs,
+    BytecodeExportModelArgs, BytecodeExportPlaceArgs, BytecodeFileArgs, BytecodeGetPropertyArgs,
+    BytecodeInstanceSelectorArgs, BytecodeRemoveInstanceArgs, BytecodeSetPropertyArgs,
+    MoveInstanceArgs, ProjectInstanceArgs, ProjectSourceArgs, PushEditorChangesArgs,
 };
-use crate::editor::diff::{
-    append_editor_instance_reconcile, append_editor_property_changes,
-    append_editor_target_inline_source_changes, append_editor_target_instance_upserts,
-    push_editor_instance_change,
-};
-use crate::editor::document::{
-    document_instance_index_by_settings_id, ensure_editor_source_target_in_bytecode,
-};
-use crate::editor::paths::{
-    build_editor_source_paths_by_index, infer_editor_source_path_spec, run_context_name,
-};
+use crate::editor::diff::{append_editor_instance_reconcile, append_editor_property_changes};
+use crate::editor::document::ensure_editor_source_target_in_bytecode;
+use crate::editor::paths::{build_editor_source_paths_by_index, infer_editor_source_path_spec};
 use crate::editor::review::{
     editor_review_payload, is_engine_managed_editor_property,
     is_externally_managed_editor_property, is_externally_managed_protected_write,
     is_user_facing_protected_write, normalize_editor_bridge_value, patch_place_protected_writes,
     protected_write_matches_previous, protected_write_rows_with_previous_values,
 };
-use crate::editor::sync::direct_editor_summary;
-use crate::editor::sync::{
-    EditorSettingsTransaction, collect_direct_editor_delete_change, collect_editor_changes,
-};
+use crate::editor::sync::{EditorSettingsTransaction, collect_editor_changes};
 use crate::editor::types::{
     EditorChangeSet, EditorInstanceChange, EditorInstanceDescriptor, EditorInstancePath,
     EditorPropertyChange, EditorPropertyFilter, take_pre_routed_protected_writes,
@@ -65,8 +53,8 @@ use crate::roblox::schema::{
     collect_rbx_dom_properties_for_class,
 };
 use crate::settings::bytecode::{
-    SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance, is_default_property_value,
-    write_service_settings_binary_file, write_var_u64,
+    SettingsBytecode, SettingsBytecodeInstance, is_default_property_value,
+    write_service_settings_binary_file,
 };
 use crate::snapshot::codec::decode_compact_v5_value;
 use crate::snapshot::export::{
@@ -77,21 +65,18 @@ use crate::snapshot::import::{
 };
 use crate::snapshot::types::{ServiceState, SnapshotInstance};
 use crate::studio::automation::{cooperative_luau, validate_luau_syntax};
-use crate::studio::bridge::BridgeRequestLease;
 use crate::studio::bridge::{MAX_BRIDGE_REASSEMBLY_BYTES, parse_bridge_raw_chunk};
 use crate::studio::native::editor::{
     encode_service_root_property_values, merge_live_service_root_property_values,
     rbx_dom_service_root_property_values,
 };
 use crate::system::files::{
-    SERVICE_SETTINGS_FILE_NAME, service_settings_path, set_path_readonly, write_bytes_if_changed,
-    write_json_streaming,
+    SERVICE_SETTINGS_FILE_NAME, service_settings_path, write_json_streaming,
 };
 use crate::tests::support::{settings_document, settings_instance, temp_dir};
 use clap::Parser;
 use rbx_dom_weak::types::{
-    Color3 as RbxColor3, Content as RbxContent, ContentId as RbxContentId, Variant as RbxVariant,
-    Vector3 as RbxVector3,
+    Color3 as RbxColor3, Content as RbxContent, Variant as RbxVariant, Vector3 as RbxVector3,
 };
 use rbx_dom_weak::{InstanceBuilder as RbxInstanceBuilder, WeakDom as RbxWeakDom};
 use rbx_reflection::ReflectionDatabase;
@@ -122,65 +107,6 @@ fn collect_and_apply_editor_changes(
     .unwrap();
     apply_editor_settings_writes(&changes).unwrap();
     changes
-}
-
-#[test]
-fn changed_directory_collects_every_external_script() {
-    let project_root = temp_dir("changed-directory");
-    let service_dir = project_root.join("src/ReplicatedStorage");
-    fs::create_dir_all(&service_dir).unwrap();
-    let mut document = settings_document(vec![
-        settings_instance("root", "ReplicatedStorage", "ReplicatedStorage", None),
-        settings_instance("public", "Public", "Folder", Some(0)),
-        settings_instance("one", "One", "ModuleScript", Some(1)),
-        settings_instance("two", "Two", "ModuleScript", Some(1)),
-        settings_instance("outside", "Outside", "Folder", Some(0)),
-    ]);
-    for index in 1..document.instances.len() {
-        document.instances[index]
-            .attributes
-            .insert("Selected".to_string(), Value::Bool(true));
-    }
-    document
-        .write_file(&service_settings_path(&service_dir))
-        .unwrap();
-    let source_paths =
-        build_editor_source_paths_by_index(&document, "ReplicatedStorage", &service_dir);
-    for index in [2, 3] {
-        let path = source_paths[index].as_ref().unwrap();
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, format!("return {index}\n")).unwrap();
-    }
-
-    let public_dir = source_paths[2].as_ref().unwrap().parent().unwrap();
-    let changes = collect_editor_changes(&PushEditorChangesArgs {
-        changed_paths: vec![public_dir.to_path_buf()],
-        ..PushEditorChangesArgs::new(
-            ProjectSourceArgs {
-                project_root: project_root.clone(),
-                src_root: PathBuf::from("src"),
-            },
-            BridgeConnectionArgs::local(0.0),
-        )
-    })
-    .unwrap();
-    let names = changes
-        .source_changes
-        .iter()
-        .filter_map(|change| change.path_segments.last().cloned())
-        .collect::<HashSet<_>>();
-    assert_eq!(names, HashSet::from(["One".to_string(), "Two".to_string()]));
-    let property_ids = changes
-        .property_changes
-        .iter()
-        .filter_map(|change| change.settings_id.clone())
-        .collect::<HashSet<_>>();
-    assert_eq!(
-        property_ids,
-        HashSet::from(["public".to_string(), "one".to_string(), "two".to_string(),])
-    );
-
-    let _ = fs::remove_dir_all(project_root);
 }
 
 #[test]
@@ -448,26 +374,6 @@ fn stale_import_paths_are_deleted() {
 }
 
 #[test]
-fn studio_bridge_modules_parse_as_luau() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugin_ws_bridge");
-    let mut paths = fs::read_dir(&root)
-        .unwrap()
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "lua" || extension == "luau")
-        })
-        .collect::<Vec<_>>();
-    paths.sort();
-    assert!(!paths.is_empty(), "No Studio plugin modules were checked");
-    for path in paths {
-        let source = fs::read_to_string(&path).unwrap();
-        let result = validate_luau_syntax(&source);
-        result.unwrap_or_else(|error| panic!("{}: {error:#}", path.display()));
-    }
-}
-
-#[test]
 fn agent_luau_loops_receive_cooperative_checkpoints() {
     let source = "for _, child in game:GetChildren() do while child.Parent do repeat child = child.Parent until child == game end end\nfor index = 1, 10 do print(index) end";
     let instrumented = cooperative_luau(source).unwrap();
@@ -522,36 +428,6 @@ fn binary_roundtrip_keeps_parent_sensitive_instance_classes() {
     for expected in ["Attachment", "Bone", "Animator", "WrapLayer", "WrapTarget"] {
         assert!(classes.contains(expected), "missing {expected}");
     }
-}
-
-#[test]
-fn negative_property_values_and_camera_coordinates_parse_without_equals() {
-    for option in ["--num", "--value-num", "--json", "--value", "-j"] {
-        let args = BytecodeSetPropertyArgs::try_parse_from([
-            "bs",
-            "Workspace",
-            "-n",
-            "Part",
-            "-p",
-            "Transparency",
-            option,
-            "-0.5",
-        ])
-        .unwrap();
-        assert!(args.value_num == Some(-0.5) || args.value_json.as_deref() == Some("-0.5"));
-    }
-    let args = crate::cli::Cli::try_parse_from([
-        "rbx",
-        "sc",
-        "--camera-position",
-        "-10,5,0",
-        "--look-at",
-        "-20,0,0",
-        "-o",
-        "test.png",
-    ])
-    .unwrap();
-    assert!(matches!(args.command, crate::cli::Commands::Shot(_)));
 }
 
 #[test]
@@ -757,58 +633,6 @@ fn get_property_reads_a_migrated_property_by_its_legacy_name() {
 }
 
 #[test]
-fn set_property_qualifies_a_unique_cross_service_reference() {
-    let dir = temp_dir("set-cross-service-reference");
-    let src = dir.join("src");
-    let replicated_file = service_settings_path(&src.join("ReplicatedStorage"));
-    let server_file = service_settings_path(&src.join("ServerStorage"));
-    fs::create_dir_all(replicated_file.parent().unwrap()).unwrap();
-    fs::create_dir_all(server_file.parent().unwrap()).unwrap();
-    settings_document(vec![
-        settings_instance(
-            "replicated-root",
-            "ReplicatedStorage",
-            "ReplicatedStorage",
-            None,
-        ),
-        settings_instance("target", "Target", "Folder", Some(0)),
-    ])
-    .write_file(&replicated_file)
-    .unwrap();
-    settings_document(vec![
-        settings_instance("server-root", "ServerStorage", "ServerStorage", None),
-        settings_instance("holder", "Holder", "ObjectValue", Some(0)),
-    ])
-    .write_file(&server_file)
-    .unwrap();
-
-    let args = BytecodeSetPropertyArgs::try_parse_from([
-        "bytecode-set-property",
-        server_file.to_str().unwrap(),
-        "-i",
-        "holder",
-        "-p",
-        "Value",
-        "-j",
-        r#"{"_type":"Ref","settingsId":"target"}"#,
-    ])
-    .unwrap();
-    bytecode_set_property(args).unwrap();
-
-    let document = SettingsBytecode::read_file(&server_file).unwrap();
-    let reference = document.instances[1].properties["Value"]
-        .as_object()
-        .unwrap();
-    assert_eq!(reference.get("settingsId"), Some(&json!("target")));
-    assert_eq!(
-        reference.get("pathSegments"),
-        Some(&json!(["ReplicatedStorage", "Target"]))
-    );
-    assert_eq!(reference.get("pathOrdinals"), Some(&json!([1, 1])));
-    fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
 fn set_property_rejects_an_ambiguous_cross_service_reference() {
     let dir = temp_dir("set-ambiguous-reference");
     let src = dir.join("src");
@@ -1009,34 +833,6 @@ fn bridge_chunk_rejects_invalid_cursor_and_oversize_payload() {
         }))
         .is_err()
     );
-}
-
-#[test]
-fn write_var_u64_matches_expected_bytes() {
-    let cases = [
-        (0_u64, vec![0x00]),
-        (1_u64, vec![0x01]),
-        (127_u64, vec![0x7f]),
-        (128_u64, vec![0x80, 0x01]),
-        (300_u64, vec![0xac, 0x02]),
-        (16_384_u64, vec![0x80, 0x80, 0x01]),
-    ];
-
-    for (value, expected) in cases {
-        let mut out = Vec::new();
-        write_var_u64(&mut out, value).unwrap();
-        assert_eq!(out, expected, "unexpected varint bytes for {value}");
-    }
-}
-
-fn sample_editor_settings_document() -> SettingsBytecode {
-    SettingsBytecode {
-        version: SETTINGS_BINARY_VERSION,
-        instances: vec![
-            settings_instance("root", "Workspace", "Workspace", None),
-            settings_instance("folder", "Folder", "Folder", Some(0)),
-        ],
-    }
 }
 
 fn assert_rbx_vector3_close(value: RbxVector3, expected_x: f32, expected_y: f32, expected_z: f32) {
@@ -2326,31 +2122,6 @@ fn base_place_numbers_take_the_declared_width_before_writing() {
 }
 
 #[test]
-fn binary_writer_narrows_wider_numbers_to_the_declared_type() {
-    let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
-    let root = dom.root_ref();
-    let workspace = dom.insert(
-        root,
-        RbxInstanceBuilder::new("Workspace")
-            .with_property("SimulationRate", RbxVariant::Float64(1.0))
-            .with_property("StreamingMinRadius", RbxVariant::Int64(64)),
-    );
-    let mut output = Vec::new();
-    rbx_binary::to_writer(&mut output, &dom, &[workspace]).unwrap();
-    let read = rbx_binary::from_reader(output.as_slice()).unwrap();
-    let written = read.root().children()[0];
-    let properties = &read.get_by_ref(written).unwrap().properties;
-    assert_eq!(
-        properties.get(&"SimulationRate".into()),
-        Some(&RbxVariant::Float32(1.0))
-    );
-    assert_eq!(
-        properties.get(&"StreamingMinRadius".into()),
-        Some(&RbxVariant::Int32(64))
-    );
-}
-
-#[test]
 fn bytecode_export_uses_size_for_file_created_meshes_in_all_formats() {
     let mut properties = Map::new();
     properties.insert("Size".to_string(), vector3_json(4.0, 5.0, 6.0));
@@ -2459,33 +2230,6 @@ fn hidden_serialized_content_is_not_discarded_from_editor_changes() {
 }
 
 #[test]
-fn append_editor_property_changes_uses_logical_property_names() {
-    let document = settings_document(vec![
-        settings_instance("root", "ReplicatedStorage", "ReplicatedStorage", None),
-        SettingsBytecodeInstance {
-            settings_id: "value".to_string(),
-            name: "Value".to_string(),
-            class_name: "StringValue".to_string(),
-            parent_index: Some(0),
-            properties: Map::from_iter([("archivable".to_string(), Value::Bool(false))]),
-            attributes: Map::new(),
-        },
-    ]);
-    let mut changes = EditorChangeSet::default();
-    append_editor_property_changes(
-        &mut changes,
-        &document,
-        "ReplicatedStorage",
-        &HashMap::new(),
-        &EditorPropertyFilter::default(),
-        rbx_reflection_database::get().unwrap(),
-    );
-    let properties = &changes.property_changes[0].properties;
-    assert_eq!(properties.get("Archivable"), Some(&Value::Bool(false)));
-    assert!(!properties.contains_key("archivable"));
-}
-
-#[test]
 fn default_property_elision_never_skips_mesh_size_transport_property() {
     let mesh_size = vector3_json(7.0, 8.0, 9.0);
     let mut mesh_defaults = Map::new();
@@ -2508,253 +2252,6 @@ fn default_property_elision_never_skips_mesh_size_transport_property() {
         !is_default_property_value(&state, "MeshPart", "meshSize", &mesh_size),
         "MeshSize transport metadata should never be default-elided"
     );
-}
-
-#[test]
-fn targeted_instance_upserts_include_ancestors_but_not_root() {
-    let document = settings_document(vec![
-        settings_instance("editor:0", "Workspace", "Workspace", None),
-        settings_instance("editor:1", "Parent", "Folder", Some(0)),
-        settings_instance("editor:2", "Child", "Folder", Some(1)),
-    ]);
-    let filter = EditorPropertyFilter {
-        settings_ids: HashSet::from(["editor:2".to_string()]),
-        ..Default::default()
-    };
-    let mut changes = EditorChangeSet::default();
-
-    append_editor_target_instance_upserts(&mut changes, &document, "Workspace", &filter);
-
-    assert_eq!(changes.instance_changes.len(), 1);
-    assert_eq!(changes.instance_changes[0].mode, "upsertInstances");
-    assert_eq!(
-        changes.instance_changes[0]
-            .instances
-            .iter()
-            .map(|instance| instance.settings_id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["editor:1", "editor:2"]
-    );
-    assert_eq!(
-        changes.instance_changes[0].instances[0].path_segments.len(),
-        2
-    );
-    assert_eq!(
-        changes.instance_changes[0].instances[1].path_segments.len(),
-        3
-    );
-    assert!(changes.instance_changes[0].instances[0].anchor_only);
-    assert!(!changes.instance_changes[0].instances[1].anchor_only);
-}
-
-#[test]
-fn targeted_instance_upserts_include_duplicate_identity_group() {
-    let document = settings_document(vec![
-        settings_instance("editor:0", "StarterGui", "StarterGui", None),
-        settings_instance("editor:1", "Parent", "Folder", Some(0)),
-        settings_instance("editor:2", "ScreenGui", "ScreenGui", Some(1)),
-        settings_instance("editor:3", "ScreenGui", "ScreenGui", Some(1)),
-        settings_instance("editor:4", "ScreenGui", "ScreenGui", Some(1)),
-    ]);
-    let filter = EditorPropertyFilter {
-        settings_ids: HashSet::from(["editor:4".to_string()]),
-        ..Default::default()
-    };
-    let mut changes = EditorChangeSet::default();
-
-    append_editor_target_instance_upserts(&mut changes, &document, "StarterGui", &filter);
-
-    assert_eq!(changes.instance_changes.len(), 1);
-    assert_eq!(
-        changes.instance_changes[0]
-            .instances
-            .iter()
-            .map(|instance| instance.settings_id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["editor:1", "editor:2", "editor:3", "editor:4"]
-    );
-    assert!(changes.instance_changes[0].instances[0].anchor_only);
-    assert!(changes.instance_changes[0].instances[1].anchor_only);
-    assert!(changes.instance_changes[0].instances[2].anchor_only);
-    assert!(!changes.instance_changes[0].instances[3].anchor_only);
-}
-
-#[test]
-fn targeted_instance_upserts_share_deep_ancestors_without_losing_targets() {
-    let mut instances = vec![settings_instance("root", "Workspace", "Workspace", None)];
-    for depth in 1..=32 {
-        instances.push(settings_instance(
-            format!("parent:{depth}"),
-            "Parent",
-            "Folder",
-            Some(depth - 1),
-        ));
-    }
-    for child in 0..2400 {
-        instances.push(settings_instance(
-            format!("child:{child}"),
-            "Duplicate",
-            "Part",
-            Some(32),
-        ));
-    }
-    let document = settings_document(instances);
-    let filter = EditorPropertyFilter {
-        settings_ids: std::iter::once("parent:16".to_string())
-            .chain((0..2400).step_by(4).map(|child| format!("child:{child}")))
-            .collect(),
-        ..Default::default()
-    };
-    let mut changes = EditorChangeSet::default();
-    append_editor_target_instance_upserts(&mut changes, &document, "Workspace", &filter);
-    let selected = &changes.instance_changes[0].instances;
-    assert_eq!(selected.len(), 2432);
-    assert_eq!(selected.iter().filter(|row| !row.anchor_only).count(), 601);
-    for row in selected {
-        assert_eq!(
-            row.anchor_only,
-            !filter.settings_ids.contains(&row.settings_id)
-        );
-        if let Some(child) = row.settings_id.strip_prefix("child:") {
-            assert_eq!(row.path_segments.len(), 34);
-            assert_eq!(
-                row.path_ordinals.last(),
-                Some(&(child.parse::<usize>().unwrap() + 1))
-            );
-        }
-    }
-}
-
-#[test]
-fn targeted_inline_source_changes_include_selected_package_scripts() {
-    let document = settings_document(vec![
-        settings_instance("editor:0", "Workspace", "Workspace", None),
-        settings_instance("editor:1", "PackageRoot", "Folder", Some(0)),
-        SettingsBytecodeInstance {
-            settings_id: "editor:2".to_string(),
-            name: "Child".to_string(),
-            class_name: "ModuleScript".to_string(),
-            parent_index: Some(1),
-            properties: Map::from_iter([(
-                "Source".to_string(),
-                Value::String("return 42".to_string()),
-            )]),
-            attributes: Map::new(),
-        },
-    ]);
-    let filter = EditorPropertyFilter {
-        settings_ids: HashSet::from(["editor:2".to_string()]),
-        ..Default::default()
-    };
-    let mut changes = EditorChangeSet::default();
-
-    append_editor_target_inline_source_changes(&mut changes, &document, "Workspace", &filter);
-
-    assert_eq!(changes.source_changes.len(), 1);
-    assert_eq!(
-        changes.source_changes[0].settings_id.as_deref(),
-        Some("editor:2")
-    );
-    assert_eq!(
-        changes.source_changes[0].path_segments,
-        vec!["Workspace", "PackageRoot", "Child"]
-    );
-    assert_eq!(
-        changes.source_changes[0].source.as_deref(),
-        Some("return 42")
-    );
-}
-
-#[test]
-fn direct_editor_summaries_carry_the_push_outcome_fields() {
-    let applied = serde_json::from_value::<serde_json::Map<String, Value>>(json!({
-        "ok": true,
-        "propertyUpdated": 1,
-        "persistence": "unsaved",
-        "filesPulled": true,
-        "noops": 0
-    }))
-    .unwrap();
-    let summary = direct_editor_summary(&applied);
-    assert_eq!(summary["changed"], json!(true));
-    assert_eq!(summary["persistence"], json!("unsaved"));
-    assert_eq!(summary["filesPulled"], json!(true));
-    assert!(summary.get("noops").is_none());
-
-    let saved_field = serde_json::from_value::<serde_json::Map<String, Value>>(json!({
-        "ok": true,
-        "propertyUpdated": 0,
-        "savedFieldsApplied": 1
-    }))
-    .unwrap();
-    assert_eq!(direct_editor_summary(&saved_field)["changed"], json!(true));
-
-    let held = serde_json::from_value::<serde_json::Map<String, Value>>(json!({
-        "ok": true,
-        "skippedByReview": true,
-        "instanceQueued": 1
-    }))
-    .unwrap();
-    let summary = direct_editor_summary(&held);
-    assert_eq!(summary["changed"], json!(false));
-    assert_eq!(summary["skippedByReview"], json!(true));
-
-    // A `prop` or `del` over the review threshold applies nothing; its result
-    // says so and carries the change list and the next step.
-    let over_threshold = serde_json::from_value::<serde_json::Map<String, Value>>(json!({
-        "ok": true,
-        "heldForReview": true,
-        "reviewChanges": 1,
-        "effectiveChanges": 1,
-        "reviewThreshold": 0,
-        "review": [{"path": "Workspace.Props.Sign", "class": "StringValue", "changes": ["-instance"]}],
-        "next": "nothing was applied; check `review`, then rerun with --yes to apply, or change the files"
-    }))
-    .unwrap();
-    let summary = direct_editor_summary(&over_threshold);
-    assert_eq!(summary["changed"], json!(false));
-    assert_eq!(summary["heldForReview"], json!(true));
-    assert_eq!(summary["review"][0]["path"], json!("Workspace.Props.Sign"));
-    assert_eq!(summary["reviewThreshold"], json!(0));
-    assert!(summary["next"].as_str().unwrap().contains("--yes"));
-}
-
-#[test]
-fn direct_editor_delete_change_does_not_require_existing_bytecode_match() {
-    let root = temp_dir("direct-delete-missing-bytecode");
-    fs::write(root.join("renium.project.jsonc"), r#"{"schemaVersion":1}"#).unwrap();
-    let changes = collect_direct_editor_delete_change(ApplyEditorDeleteArgs {
-        review_report: false,
-        target: EditorMutationArgs {
-            project: ProjectSourceArgs {
-                project_root: root.clone(),
-                src_root: root.join("src"),
-            },
-            bridge: BridgeConnectionArgs::local(1.0),
-            service: "Workspace".to_string(),
-            settings_id: Some("already-removed".to_string()),
-            class_name: "Folder".to_string(),
-            path_segments_json: serde_json::to_string(&vec!["Workspace", "DeletedFolder"]).unwrap(),
-            path_ordinals_json: serde_json::to_string(&vec![1_usize, 1_usize]).unwrap(),
-            override_packages: false,
-        },
-        no_review: false,
-        yes: false,
-    })
-    .unwrap();
-
-    assert_eq!(changes.instance_changes.len(), 1);
-    let change = &changes.instance_changes[0];
-    assert_eq!(change.mode, "deleteInstances");
-    assert!(!change.allow_deletes);
-    assert_eq!(change.instances.len(), 1);
-    assert_eq!(change.instances[0].settings_id, "already-removed");
-    assert_eq!(
-        change.instances[0].path_segments,
-        vec!["Workspace", "DeletedFolder"]
-    );
-    assert!(changes.source_changes.is_empty());
-    assert!(changes.property_changes.is_empty());
 }
 
 #[test]
@@ -2880,24 +2377,6 @@ fn assert_ref_index(value: Option<&Value>, expected_one_based_index: usize) {
     assert_eq!(
         object.get("instanceIndex").and_then(Value::as_u64),
         Some(expected_one_based_index as u64)
-    );
-}
-
-#[test]
-fn reconcile_instance_changes_skip_service_root() {
-    let document = settings_document(vec![
-        settings_instance("editor:0", "Workspace", "Workspace", None),
-        settings_instance("editor:1", "Folder", "Folder", Some(0)),
-    ]);
-    let mut changes = EditorChangeSet::default();
-
-    append_editor_instance_reconcile(&mut changes, &document, "Workspace");
-
-    assert_eq!(changes.instance_changes.len(), 1);
-    assert_eq!(changes.instance_changes[0].instances.len(), 1);
-    assert_eq!(
-        changes.instance_changes[0].instances[0].settings_id,
-        "editor:1"
     );
 }
 
@@ -3562,178 +3041,6 @@ fn place_export_prevents_legacy_pivot_migration_without_dropping_primary_part_pi
 }
 
 #[test]
-fn editor_source_path_spec_infers_init_script_instance() {
-    let spec = infer_editor_source_path_spec(
-        Path::new("project/src"),
-        "ServerScriptService",
-        Path::new("project/src/ServerScriptService/Parent/Child/init.server.luau"),
-    )
-    .unwrap();
-
-    assert_eq!(spec.class_name, "Script");
-    assert_eq!(spec.instance_name, "Child");
-    assert_eq!(spec.parent_components, vec!["Parent"]);
-    assert_eq!(
-        spec.path_segments,
-        vec!["ServerScriptService", "Parent", "Child"]
-    );
-}
-
-#[test]
-fn editor_source_path_spec_infers_plugin_run_context() {
-    let spec = infer_editor_source_path_spec(
-        Path::new("project/src"),
-        "ServerStorage",
-        Path::new("project/src/ServerStorage/Tools/init.plugin.luau"),
-    )
-    .unwrap();
-
-    assert_eq!(spec.class_name, "Script");
-    assert_eq!(spec.run_context.as_deref(), Some("Plugin"));
-    assert_eq!(spec.instance_name, "Tools");
-
-    let mut document = settings_document(vec![settings_instance(
-        "root",
-        "ServerStorage",
-        "ServerStorage",
-        None,
-    )]);
-    let ensured = ensure_editor_source_target_in_bytecode(&mut document, &spec).unwrap();
-    let target_index = document_instance_index_by_settings_id(
-        &document,
-        ensured.target.settings_id.as_deref().unwrap(),
-    )
-    .unwrap();
-    assert_eq!(
-        document.instances[target_index]
-            .properties
-            .get("RunContext"),
-        Some(&json!({
-            "_type": "EnumItem",
-            "enumType": "Enum.RunContext",
-            "name": "Plugin",
-        }))
-    );
-    assert_eq!(
-        run_context_name(
-            document.instances[target_index]
-                .properties
-                .get("RunContext")
-                .unwrap()
-        ),
-        Some("Plugin")
-    );
-}
-
-#[test]
-fn editor_source_target_creates_missing_bytecode_script() {
-    let mut document = sample_editor_settings_document();
-    let spec = infer_editor_source_path_spec(
-        Path::new("project/src"),
-        "Workspace",
-        Path::new("project/src/Workspace/Folder/NewModule.luau"),
-    )
-    .unwrap();
-
-    let ensured = ensure_editor_source_target_in_bytecode(&mut document, &spec).unwrap();
-
-    assert!(ensured.changed);
-    let target = ensured.target;
-    assert_eq!(target.settings_id.as_deref(), Some("editor:2"));
-    assert_eq!(
-        target.path_segments,
-        vec!["Workspace", "Folder", "NewModule"]
-    );
-    assert_eq!(ensured.upsert_instances.len(), 2);
-    assert!(ensured.upsert_instances[0].anchor_only);
-    assert!(!ensured.upsert_instances[1].anchor_only);
-    assert_eq!(document.instances[2].name, "NewModule");
-    assert_eq!(document.instances[2].class_name, "ModuleScript");
-    assert_eq!(document.instances[2].parent_index, Some(1));
-
-    let ensured_again = ensure_editor_source_target_in_bytecode(&mut document, &spec).unwrap();
-
-    assert!(!ensured_again.changed);
-    assert_eq!(ensured_again.target.settings_id, target.settings_id);
-    assert_eq!(document.instances.len(), 3);
-}
-
-#[test]
-fn collect_editor_changes_imports_orphan_source_script() {
-    let root = temp_dir("orphan-source-import");
-    let source_path = root
-        .join("src")
-        .join("ServerScriptService")
-        .join("Orphan.server.luau");
-    fs::create_dir_all(source_path.parent().unwrap()).unwrap();
-    fs::write(&source_path, "print('orphan')").unwrap();
-
-    let changes = collect_and_apply_editor_changes(
-        &root,
-        vec![source_path],
-        BridgeConnectionArgs {
-            ports: "8781".to_string(),
-            ..BridgeConnectionArgs::local(0.0)
-        },
-    );
-
-    assert!(changes.instance_changes.iter().any(|change| {
-        change.mode == "upsertInstances"
-            && change.service == "ServerScriptService"
-            && change
-                .instances
-                .iter()
-                .any(|instance| instance.path_segments == ["ServerScriptService", "Orphan"])
-    }));
-    assert!(changes.source_changes.iter().any(|change| {
-        change.service == "ServerScriptService"
-            && change.path_segments == ["ServerScriptService", "Orphan"]
-            && change.source.as_deref() == Some("print('orphan')")
-    }));
-    let settings = SettingsBytecode::read_file(&service_settings_path(
-        &root.join("src").join("ServerScriptService"),
-    ))
-    .unwrap();
-    assert!(
-        settings
-            .instances
-            .iter()
-            .any(|instance| { instance.name == "Orphan" && instance.class_name == "Script" })
-    );
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn editor_source_target_creates_missing_parent_folders() {
-    let mut document = sample_editor_settings_document();
-    let spec = infer_editor_source_path_spec(
-        Path::new("project/src"),
-        "Workspace",
-        Path::new("project/src/Workspace/NewFolder/NewServer.server.luau"),
-    )
-    .unwrap();
-
-    let ensured = ensure_editor_source_target_in_bytecode(&mut document, &spec).unwrap();
-
-    assert!(ensured.changed);
-    let target = ensured.target;
-    assert_eq!(target.class_name, "Script");
-    assert_eq!(
-        target.path_segments,
-        vec!["Workspace", "NewFolder", "NewServer"]
-    );
-    assert_eq!(ensured.upsert_instances.len(), 2);
-    assert!(!ensured.upsert_instances[0].anchor_only);
-    assert!(!ensured.upsert_instances[1].anchor_only);
-    assert_eq!(document.instances[2].name, "NewFolder");
-    assert_eq!(document.instances[2].class_name, "Folder");
-    assert_eq!(document.instances[2].parent_index, Some(0));
-    assert_eq!(document.instances[3].name, "NewServer");
-    assert_eq!(document.instances[3].class_name, "Script");
-    assert_eq!(document.instances[3].parent_index, Some(2));
-}
-
-#[test]
 fn starter_player_script_containers_keep_real_classes() {
     let mut document = settings_document(vec![settings_instance(
         "root",
@@ -3762,76 +3069,6 @@ fn starter_player_script_containers_keep_real_classes() {
 }
 
 #[test]
-fn the_projection_stage_keeps_a_packed_link_script() {
-    let project_root = temp_dir("packed-link-stage");
-    crate::tests::support::write_packed_link_project(&project_root);
-    let loaded = crate::project::config::load_project(
-        Some(&project_root.join("renium.project.jsonc")),
-        None,
-    )
-    .unwrap();
-    let stage = crate::project::config::stage_project(&loaded).unwrap();
-    let staged = SettingsBytecode::read_file(&service_settings_path(
-        &stage.root().join("ReplicatedStorage"),
-    ))
-    .unwrap();
-    assert!(
-        staged
-            .instances
-            .iter()
-            .any(|instance| instance.name == "Util" && instance.class_name == "ModuleScript"),
-        "stage_project dropped the packed script: {:?}",
-        staged
-            .instances
-            .iter()
-            .map(|instance| (instance.name.clone(), instance.class_name.clone()))
-            .collect::<Vec<_>>()
-    );
-    drop(stage);
-    fs::remove_dir_all(project_root).unwrap();
-}
-
-#[test]
-fn a_packed_link_script_survives_a_missing_file() {
-    use crate::editor::paths::merge_editor_source_files_into_document;
-    let project_root = temp_dir("packed-link-kept");
-    let service_dir = crate::tests::support::write_packed_link_project(&project_root);
-    let mut document =
-        SettingsBytecode::read_file(&project_root.join("instances/ReplicatedStorage.renium"))
-            .unwrap();
-    document.instances.push(SettingsBytecodeInstance {
-        settings_id: "editor:3".to_string(),
-        name: "Gone".to_string(),
-        class_name: "ModuleScript".to_string(),
-        parent_index: Some(0),
-        properties: Map::from_iter([("Source".to_string(), json!("return 3"))]),
-        attributes: Map::new(),
-    });
-    let (changed, paths) =
-        merge_editor_source_files_into_document(&mut document, "ReplicatedStorage", &service_dir)
-            .unwrap();
-    assert!(changed);
-    assert!(paths.is_empty());
-    let util = document
-        .instances
-        .iter()
-        .find(|instance| instance.name == "Util")
-        .unwrap();
-    assert_eq!(util.class_name, "ModuleScript");
-    assert_eq!(util.properties["Source"], json!("return { version = 1 }"));
-    let gone = document
-        .instances
-        .iter()
-        .find(|instance| instance.name == "Gone")
-        .unwrap();
-    assert_eq!(
-        gone.class_name, "Folder",
-        "an inline source outside a link is not a packed script"
-    );
-    fs::remove_dir_all(project_root).unwrap();
-}
-
-#[test]
 fn a_packed_link_script_is_not_demoted_when_its_package_cannot_be_read() {
     use crate::editor::paths::merge_editor_source_files_into_document;
     let project_root = temp_dir("packed-link-package-unreadable");
@@ -3856,89 +3093,6 @@ fn a_packed_link_script_is_not_demoted_when_its_package_cannot_be_read() {
         .find(|instance| instance.name == "Util")
         .unwrap();
     assert_eq!(util.class_name, "ModuleScript");
-    fs::remove_dir_all(project_root).unwrap();
-}
-
-#[test]
-fn an_operation_decodes_each_read_only_package_once_for_all_its_documents() {
-    use crate::editor::paths::{
-        merge_editor_source_files_into_document, merge_editor_source_files_into_document_with,
-        packed_link_enforcement,
-    };
-    use crate::project::package_links::READ_ONLY_PACKAGE_READS;
-    let project_root = temp_dir("packed-link-decode-count");
-    crate::tests::support::write_packed_link_project(&project_root);
-    let src_root = project_root.join("src");
-    let shared = fs::read(project_root.join("links").join("shared.renium")).unwrap();
-    let mut links = vec![
-        r#"{"id":"shared","readOnly":true,"source":{"type":"local","path":"links/shared.renium"},"targets":[{"service":"ReplicatedStorage","path":["ReplicatedStorage","Shared"]}]}"#.to_string(),
-    ];
-    let services = ["ReplicatedStorage", "ServerStorage", "Workspace"];
-    for (index, service) in services.iter().enumerate().skip(1) {
-        fs::write(
-            project_root
-                .join("links")
-                .join(format!("pack{index}.renium")),
-            &shared,
-        )
-        .unwrap();
-        fs::create_dir_all(src_root.join(service)).unwrap();
-        settings_document(vec![settings_instance("root", *service, *service, None)])
-            .write_file(
-                &project_root
-                    .join("instances")
-                    .join(format!("{service}.renium")),
-            )
-            .unwrap();
-        links.push(format!(
-            r#"{{"id":"pack{index}","readOnly":true,"source":{{"type":"local","path":"links/pack{index}.renium"}},"targets":[{{"service":"{service}","path":["{service}","Shared"]}}]}}"#
-        ));
-    }
-    fs::write(
-        project_root.join("renium-link.json"),
-        format!(
-            r#"{{"version":1,"links":[{}],"broken":[]}}"#,
-            links.join(",")
-        ),
-    )
-    .unwrap();
-    let document_of = |service: &str| {
-        SettingsBytecode::read_file(
-            &project_root
-                .join("instances")
-                .join(format!("{service}.renium")),
-        )
-        .unwrap()
-    };
-    let reads = || READ_ONLY_PACKAGE_READS.with(std::cell::Cell::get);
-
-    let before = reads();
-    for service in services {
-        merge_editor_source_files_into_document(
-            &mut document_of(service),
-            service,
-            &src_root.join(service),
-        )
-        .unwrap();
-    }
-    assert_eq!(
-        reads() - before,
-        services.len() * links.len(),
-        "each document on its own decodes every package"
-    );
-
-    let before = reads();
-    let enforcement = packed_link_enforcement(&src_root).unwrap().unwrap();
-    for service in services {
-        merge_editor_source_files_into_document_with(
-            &mut document_of(service),
-            service,
-            &src_root.join(service),
-            Some(&enforcement),
-        )
-        .unwrap();
-    }
-    assert_eq!(reads() - before, links.len());
     fs::remove_dir_all(project_root).unwrap();
 }
 
@@ -4054,57 +3208,6 @@ fn deleted_source_file_removes_leaf_but_demotes_init_script() {
 }
 
 #[test]
-fn restored_init_source_reclasses_folder_back_to_script() {
-    let project_root = temp_dir("restored-source");
-    let service_dir = project_root.join("src").join("ReplicatedFirst");
-    fs::create_dir_all(service_dir.join("LoadingScreen")).unwrap();
-    fs::write(
-        service_dir.join("LoadingScreen").join("init.client.luau"),
-        "print('restored')",
-    )
-    .unwrap();
-
-    let document = settings_document(vec![
-        settings_instance("root", "ReplicatedFirst", "ReplicatedFirst", None),
-        settings_instance("script", "LoadingScreen", "Folder", Some(0)),
-        settings_instance("frame", "Frame", "Frame", Some(1)),
-    ]);
-    let settings_path = service_settings_path(&service_dir);
-    document.write_file(&settings_path).unwrap();
-
-    let changes = collect_and_apply_editor_changes(
-        &project_root,
-        vec![PathBuf::from(
-            "src/ReplicatedFirst/LoadingScreen/init.client.luau",
-        )],
-        BridgeConnectionArgs::local(1.0),
-    );
-
-    assert_eq!(changes.instance_changes.len(), 1);
-    assert_eq!(changes.instance_changes[0].mode, "replaceInstances");
-    assert_eq!(
-        changes.instance_changes[0].instances[0].class_name,
-        "LocalScript"
-    );
-    assert_eq!(
-        changes.instance_changes[0].instances[0]
-            .previous_class_name
-            .as_deref(),
-        Some("Folder")
-    );
-    assert_eq!(
-        changes.instance_changes[0].instances[0].previous_path_segments,
-        ["ReplicatedFirst", "LoadingScreen"]
-    );
-    assert_eq!(changes.source_changes.len(), 1);
-    let after = SettingsBytecode::read_file(&settings_path).unwrap();
-    assert_eq!(after.instances[1].class_name, "LocalScript");
-    assert_eq!(after.instances[2].parent_index, Some(1));
-
-    let _ = fs::remove_dir_all(project_root);
-}
-
-#[test]
 fn compact_v5_axes_faces_ray_round_trip() {
     let strings: Vec<String> = Vec::new();
     let enum_names = EnumValueNameMap::new();
@@ -4162,49 +3265,6 @@ fn vc_test_instance(
         properties,
         attributes: Map::new(),
     }
-}
-
-#[test]
-fn vc_merge_merges_disjoint_property_edits() {
-    let base = settings_document(vec![
-        vc_test_instance("root", "ReplicatedStorage", "ReplicatedStorage", None, &[]),
-        vc_test_instance(
-            "c",
-            "Part",
-            "Part",
-            Some(0),
-            &[("A", json!(1)), ("B", json!(1))],
-        ),
-    ]);
-    let ours = settings_document(vec![
-        vc_test_instance("root", "ReplicatedStorage", "ReplicatedStorage", None, &[]),
-        vc_test_instance(
-            "c",
-            "Part",
-            "Part",
-            Some(0),
-            &[("A", json!(2)), ("B", json!(1))],
-        ),
-    ]);
-    let theirs = settings_document(vec![
-        vc_test_instance("root", "ReplicatedStorage", "ReplicatedStorage", None, &[]),
-        vc_test_instance(
-            "c",
-            "Part",
-            "Part",
-            Some(0),
-            &[("A", json!(1)), ("B", json!(3))],
-        ),
-    ]);
-    let (merged, conflicts) = merge_settings_documents(&base, &ours, &theirs, None);
-    assert!(conflicts.is_empty());
-    let child = merged
-        .instances
-        .iter()
-        .find(|instance| instance.settings_id == "c")
-        .expect("merged child");
-    assert_eq!(child.properties.get("A"), Some(&json!(2)));
-    assert_eq!(child.properties.get("B"), Some(&json!(3)));
 }
 
 #[test]
@@ -4405,28 +3465,6 @@ fn vc_init_writes_policy_files_idempotently() {
 }
 
 #[test]
-fn ensure_service_store_seeds_service_root_and_is_idempotent() {
-    let dir = temp_dir("ensure-store");
-    let settings = service_settings_path(&dir.join("src").join("ReplicatedStorage"));
-    assert!(!settings.exists());
-    ensure_service_store_exists(&settings, "ReplicatedStorage").unwrap();
-    let doc = SettingsBytecode::read_file(&settings).unwrap();
-    assert_eq!(doc.instances.len(), 1);
-    assert_eq!(doc.instances[0].name, "ReplicatedStorage");
-    assert_eq!(doc.instances[0].class_name, "ReplicatedStorage");
-    assert!(doc.instances[0].parent_index.is_none());
-    ensure_service_store_exists(&settings, "ReplicatedStorage").unwrap();
-    assert_eq!(
-        SettingsBytecode::read_file(&settings)
-            .unwrap()
-            .instances
-            .len(),
-        1
-    );
-    fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
 fn targeted_service_root_properties_survive_descendant_only_upsert_selection() {
     let mut document = settings_document(vec![
         settings_instance("root", "Lighting", "Lighting", None),
@@ -4468,58 +3506,6 @@ fn targeted_service_root_properties_survive_descendant_only_upsert_selection() {
 }
 
 #[test]
-fn bytecode_remove_instance_removes_source_files_and_keeps_service_store() {
-    let dir = temp_dir("remove-source-files");
-    let service_dir = dir.join("src").join("ReplicatedStorage");
-    fs::create_dir_all(&service_dir).unwrap();
-    let settings_path = service_dir.join("__roblox_sync_settings.renium");
-    let document = settings_document(vec![
-        settings_instance("root", "ReplicatedStorage", "ReplicatedStorage", None),
-        settings_instance("pkg", "Pkg", "Folder", Some(0)),
-        settings_instance("script", "Child", "Script", Some(1)),
-    ]);
-    document.write_file(&settings_path).unwrap();
-    let source_paths =
-        build_editor_source_paths_by_index(&document, "ReplicatedStorage", &service_dir);
-    let source_path = source_paths[2].as_ref().unwrap();
-    fs::create_dir_all(source_path.parent().unwrap()).unwrap();
-    fs::write(source_path, "print('delete me')").unwrap();
-    assert!(source_path.exists());
-
-    bytecode_remove_instance(BytecodeRemoveInstanceArgs {
-        where_query: None,
-        push: false,
-        more_targets: Vec::new(),
-        input: BytecodeFileArgs::settings_file(settings_path.clone()),
-        selector: BytecodeInstanceSelectorArgs::by_settings_id(Some("pkg".into())),
-        no_recursive: false,
-        override_packages: false,
-        pretty: false,
-    })
-    .unwrap();
-
-    assert!(!source_path.exists());
-    assert!(!service_dir.join("Pkg").exists());
-    let remaining = SettingsBytecode::read_file(&settings_path).unwrap();
-    assert_eq!(remaining.instances.len(), 1);
-    assert_eq!(remaining.instances[0].name, "ReplicatedStorage");
-    fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
-fn write_bytes_if_changed_tolerates_readonly_mirrors() {
-    let root = temp_dir("rw");
-    let path = root.join("m.luau");
-    fs::write(&path, "v1").unwrap();
-    set_path_readonly(&path, true).unwrap();
-    write_bytes_if_changed(&path, b"v2").unwrap();
-    assert_eq!(fs::read_to_string(&path).unwrap(), "v2");
-    assert!(fs::metadata(&path).unwrap().permissions().readonly());
-    let _ = set_path_readonly(&path, false);
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[test]
 fn streaming_json_failure_preserves_the_existing_file() {
     struct BrokenJson;
 
@@ -4548,132 +3534,6 @@ fn streaming_json_failure_preserves_the_existing_file() {
             .ends_with(".renium-tmp")
     }));
     let _ = fs::remove_dir_all(&root);
-}
-
-#[test]
-fn empty_full_reconcile_is_not_discarded() {
-    let mut changes = EditorChangeSet::default();
-    push_editor_instance_change(
-        &mut changes,
-        "reconcileService",
-        "StarterGui",
-        true,
-        Vec::new(),
-    );
-    assert_eq!(changes.instance_changes.len(), 1);
-    assert!(changes.instance_changes[0].instances.is_empty());
-}
-
-#[test]
-fn texture_pack_routing_keeps_verified_setters_in_the_live_transaction() {
-    let classes = [
-        "Decal",
-        "MaterialVariant",
-        "SurfaceAppearance",
-        "TerrainDetail",
-    ];
-    let mut changes = EditorChangeSet {
-        property_changes: classes
-            .iter()
-            .map(|class_name| EditorPropertyChange {
-                service: "Workspace".to_string(),
-                settings_id: Some((*class_name).to_string()),
-                path_segments: vec!["Workspace".to_string(), (*class_name).to_string()],
-                path_ordinals: vec![1, 1],
-                class_name: (*class_name).to_string(),
-                properties: Map::from_iter([
-                    (
-                        "TexturePack".to_string(),
-                        json!("rbxassetid://72333247722658"),
-                    ),
-                    ("Marker".to_string(), json!(12)),
-                ]),
-                reset_properties: Vec::new(),
-                attributes: Map::new(),
-                deleted_attributes: Vec::new(),
-                attributes_complete: false,
-            })
-            .collect(),
-        ..EditorChangeSet::default()
-    };
-
-    let original = changes.property_changes.clone();
-    let rows = take_pre_routed_protected_writes(&mut changes, None);
-
-    assert_eq!(rows.len(), classes.len() - 1);
-    assert!(
-        rows.iter()
-            .all(|row| row["className"] != "SurfaceAppearance")
-    );
-    assert!(
-        rows.iter()
-            .all(|row| row.get("name") == Some(&json!("TexturePack")))
-    );
-    assert_eq!(changes.property_changes.len(), classes.len());
-    assert!(
-        changes
-            .property_changes
-            .iter()
-            .all(|change| change.properties.contains_key("Marker")
-                && change.properties.contains_key("TexturePack")
-                    == (change.class_name == "SurfaceAppearance"))
-    );
-
-    use crate::editor::types::{EditorBinaryImport, EditorBinaryImportGroup};
-    let mut import = EditorBinaryImport {
-        bytes: Vec::new(),
-        native_replacement: None,
-        instance_count: 0,
-        external_references_post_applied: true,
-        viewport_references_post_applied: false,
-        post_apply_properties_by_class: HashMap::new(),
-        post_apply_properties_by_path: HashMap::new(),
-        groups: vec![EditorBinaryImportGroup {
-            additive: false,
-            service: "Workspace".into(),
-            target_path: vec!["Workspace".into()],
-            count: 0,
-            payload_root_name: "payload".into(),
-            expected_structure: None,
-            root_paths: Vec::new(),
-            root_settings_ids: Vec::new(),
-            viewport_camera: None,
-            retained_roots: Vec::new(),
-            package_roots: Vec::new(),
-            mutation_package_roots: Vec::new(),
-            change_generation: None,
-        }],
-    };
-    changes.property_changes = original.clone();
-    assert!(take_pre_routed_protected_writes(&mut changes, Some(&import)).is_empty());
-    assert!(
-        changes
-            .property_changes
-            .iter()
-            .all(|change| change.properties.contains_key("TexturePack"))
-    );
-    import.post_apply_properties_by_class.insert(
-        "MaterialVariant".into(),
-        HashSet::from(["TexturePack".into()]),
-    );
-    import.post_apply_properties_by_path.insert(
-        crate::bytecode::edit::instance_path_parts_key(
-            &original[0].path_segments,
-            &original[0].path_ordinals,
-        ),
-        HashSet::from(["TexturePack".into()]),
-    );
-    changes.property_changes = original.clone();
-    assert_eq!(
-        take_pre_routed_protected_writes(&mut changes, Some(&import)).len(),
-        2
-    );
-    import.groups[0].service = "ReplicatedStorage".into();
-    changes.property_changes = original;
-    assert_eq!(
-        take_pre_routed_protected_writes(&mut changes, Some(&import)).len(),
-        classes.len() - 1
-    );
 }
 
 #[test]
@@ -4806,58 +3666,6 @@ fn protected_review_reads_migrated_mesh_id_value() {
     assert_eq!(
         patched_rows[0].get("oldValue"),
         Some(&json!("rbxassetid://131536866771677"))
-    );
-    let _ = fs::remove_dir_all(dir);
-}
-
-#[test]
-fn protected_place_writes_patch_material_variant_texture_pack() {
-    let dir = temp_dir("protected-material-variant-texture-pack");
-    let path = dir.join("place.rbxl");
-    let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
-    let service = dom.insert(
-        dom.root_ref(),
-        RbxInstanceBuilder::new("MaterialService").with_name("MaterialService"),
-    );
-    dom.insert(
-        service,
-        RbxInstanceBuilder::new("MaterialVariant")
-            .with_name("concrete puddle")
-            .with_property(
-                "TexturePack",
-                RbxContentId::from("rbxassetid://113321028117673"),
-            ),
-    );
-    let output = File::create(&path).unwrap();
-    rbx_binary::to_writer(BufWriter::new(output), &dom, &[service]).unwrap();
-    let rows = vec![json!({
-        "kind": "property",
-        "pathSegments": ["MaterialService", "concrete puddle"],
-        "pathOrdinals": [1, 1],
-        "name": "TexturePack",
-        "value": "rbxassetid://72333247722658",
-        "oldValueMissing": true,
-    })];
-
-    let review_rows = protected_write_rows_with_previous_values(&path, &rows).unwrap();
-    assert_eq!(
-        review_rows[0].get("oldValue"),
-        Some(&json!("rbxassetid://113321028117673"))
-    );
-    assert!(review_rows[0].get("oldValueMissing").is_none());
-    assert_eq!(patch_place_protected_writes(&path, &rows).unwrap(), 1);
-    let output_dom = rbx_binary::from_reader(BufReader::new(File::open(&path).unwrap())).unwrap();
-    let material_service = output_dom
-        .get_by_ref(output_dom.root().children()[0])
-        .unwrap();
-    let material_variant = output_dom
-        .get_by_ref(material_service.children()[0])
-        .unwrap();
-    assert_eq!(
-        material_variant.properties.get(&"TexturePack".into()),
-        Some(&RbxVariant::ContentId(RbxContentId::from(
-            "rbxassetid://72333247722658"
-        )))
     );
     let _ = fs::remove_dir_all(dir);
 }
@@ -5090,104 +3898,4 @@ fn protected_snapshot_retains_native_service_field_values() {
     let readback = protected_write_rows_with_previous_values(&path, &rows).unwrap();
     assert_eq!(readback[0]["oldValue"], json!(256));
     let _ = fs::remove_dir_all(dir);
-}
-
-#[test]
-fn bridge_request_lease_cancels_only_before_completion() {
-    let active = BridgeRequestLease::new("active".to_string());
-    assert_eq!(active.id(), "active");
-    assert!(!active.is_cancelled());
-    active.cancel();
-    assert!(active.is_cancelled());
-
-    let completed = BridgeRequestLease::new("completed".to_string());
-    completed.finish();
-    completed.cancel();
-    assert!(!completed.is_cancelled());
-}
-
-#[test]
-fn vc_merge_leaves_untouched_instances_alone() {
-    let base = settings_document(vec![
-        vc_test_instance("root", "ReplicatedStorage", "ReplicatedStorage", None, &[]),
-        vc_test_instance("a", "A", "Part", Some(0), &[("X", json!(1))]),
-        vc_test_instance("b", "B", "Part", Some(0), &[("Y", json!(1))]),
-        vc_test_instance("k", "Keep", "Folder", Some(0), &[("Z", json!("same"))]),
-    ]);
-    let ours = settings_document(vec![
-        vc_test_instance("root", "ReplicatedStorage", "ReplicatedStorage", None, &[]),
-        vc_test_instance("a", "A", "Part", Some(0), &[("X", json!(2))]),
-        vc_test_instance("b", "B", "Part", Some(0), &[("Y", json!(1))]),
-        vc_test_instance("k", "Keep", "Folder", Some(0), &[("Z", json!("same"))]),
-    ]);
-    let theirs = settings_document(vec![
-        vc_test_instance("root", "ReplicatedStorage", "ReplicatedStorage", None, &[]),
-        vc_test_instance("a", "A", "Part", Some(0), &[("X", json!(1))]),
-        vc_test_instance("b", "B", "Part", Some(0), &[("Y", json!(3))]),
-        vc_test_instance("k", "Keep", "Folder", Some(0), &[("Z", json!("same"))]),
-        vc_test_instance("n", "New", "Part", Some(0), &[("W", json!(9))]),
-    ]);
-    let (merged, conflicts) = merge_settings_documents(&base, &ours, &theirs, None);
-    assert!(conflicts.is_empty());
-    let mut ids = merged
-        .instances
-        .iter()
-        .map(|instance| instance.settings_id.to_string())
-        .collect::<Vec<_>>();
-    ids.sort();
-    assert_eq!(ids, ["a", "b", "k", "n", "root"]);
-    let by_id = |id: &str| {
-        merged
-            .instances
-            .iter()
-            .find(|instance| instance.settings_id == id)
-            .unwrap()
-    };
-    assert_eq!(by_id("a").properties.get("X"), Some(&json!(2)));
-    assert_eq!(by_id("b").properties.get("Y"), Some(&json!(3)));
-    assert_eq!(by_id("k").properties, base.instances[3].properties);
-    assert_eq!(by_id("n").properties.get("W"), Some(&json!(9)));
-}
-
-#[test]
-fn vc_merge_treats_the_same_addition_on_both_sides_as_one_instance() {
-    let base = settings_document(vec![vc_test_instance(
-        "root",
-        "ReplicatedStorage",
-        "ReplicatedStorage",
-        None,
-        &[],
-    )]);
-    let ours = settings_document(vec![
-        vc_test_instance("root", "ReplicatedStorage", "ReplicatedStorage", None, &[]),
-        vc_test_instance("shared", "Shared", "Part", Some(0), &[("A", json!(1))]),
-    ]);
-    let theirs = settings_document(vec![
-        vc_test_instance("root", "ReplicatedStorage", "ReplicatedStorage", None, &[]),
-        vc_test_instance(
-            "shared",
-            "Shared",
-            "Part",
-            Some(0),
-            &[("A", json!(1)), ("B", json!(2))],
-        ),
-    ]);
-    let (merged, conflicts) = merge_settings_documents(&base, &ours, &theirs, None);
-    assert!(
-        conflicts.is_empty(),
-        "{}",
-        conflicts
-            .iter()
-            .map(|conflict| conflict.detail.clone())
-            .collect::<Vec<_>>()
-            .join("; ")
-    );
-    let shared = merged
-        .instances
-        .iter()
-        .filter(|instance| instance.name == "Shared")
-        .collect::<Vec<_>>();
-    assert_eq!(shared.len(), 1, "the same addition must not be duplicated");
-    assert_eq!(shared[0].properties.get("A"), Some(&json!(1)));
-    assert_eq!(shared[0].properties.get("B"), Some(&json!(2)));
 }

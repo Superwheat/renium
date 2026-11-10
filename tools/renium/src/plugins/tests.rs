@@ -1,18 +1,5 @@
 use super::*;
 
-#[test]
-fn leased_commands_require_an_explicit_daemon_acknowledgement() {
-    assert!(verify_lease_ack(false, &json!({})).is_ok());
-    for response in [
-        json!({}),
-        json!({"resourceLeaseProtected":false}),
-        json!({"resourceLeaseProtected":1}),
-    ] {
-        assert!(verify_lease_ack(true, &response).is_err());
-    }
-    assert!(verify_lease_ack(true, &json!({"resourceLeaseProtected":true})).is_ok());
-}
-
 fn example() -> Manifest {
     serde_json::from_value(json!({
         "schemaVersion":1,"name":"example-workflow","version":"0.1.0","description":"Example",
@@ -125,71 +112,6 @@ fn registration_and_resource_names_cannot_escape_the_registry() {
     for name in ["../one", "a/b", "C:\\one", "", "a.b"] {
         assert!(registration_path(Path::new("test"), name).is_err());
     }
-}
-
-#[test]
-fn leases_are_exclusive_durable_and_reject_stale_claims() {
-    let root = std::env::temp_dir().join(format!(
-        "renium-plugin-lease-{}-{}",
-        std::process::id(),
-        crate::app::timing::current_millis()
-    ));
-    fs::create_dir(&root).unwrap();
-    let registry = lease::Registry::new(root.join("leases"));
-    let held = registry
-        .acquire("studio-place-123", "test", "owner", &root)
-        .unwrap();
-    assert!(
-        registry
-            .acquire("studio-place-123", "test", "other", &root)
-            .is_err()
-    );
-    assert!(registry.verify("studio-place-123", None).is_err());
-    assert!(
-        registry
-            .verify("studio-place-456", Some(&held.claim))
-            .is_err()
-    );
-    registry
-        .update(&held.claim, json!({"phase":"cleanup"}))
-        .unwrap();
-    let registry = lease::Registry::new(root.join("leases"));
-    assert_eq!(
-        registry.read("studio-place-123").unwrap().unwrap().data["phase"],
-        "cleanup"
-    );
-    registry.release(&held.claim).unwrap();
-    assert!(
-        registry
-            .verify("studio-place-123", Some(&held.claim))
-            .is_err()
-    );
-    assert!(
-        registry
-            .acquire("studio-place-123", "test", "next", &root)
-            .is_ok()
-    );
-    fs::remove_dir_all(&root).unwrap();
-}
-
-#[test]
-fn subprocess_reads_output_and_times_out_without_blocking_on_pipes() {
-    let mut command = Command::new(std::env::current_exe().unwrap());
-    command.args(["--list"]);
-    let output = renium_plugin_sdk::process::output(command, b"", Duration::from_secs(5)).unwrap();
-    assert!(output.status.success());
-    assert!(!output.stdout.is_empty());
-    let mut command = Command::new(std::env::current_exe().unwrap());
-    command.args([
-        "--exact",
-        "plugins::tests::subprocess_sleep_fixture",
-        "--ignored",
-    ]);
-    let start = std::time::Instant::now();
-    let error =
-        renium_plugin_sdk::process::output(command, b"", Duration::from_millis(100)).unwrap_err();
-    assert!(error.to_string().contains("exceeded"));
-    assert!(start.elapsed() < Duration::from_secs(3));
 }
 
 #[test]

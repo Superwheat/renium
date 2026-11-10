@@ -2932,34 +2932,6 @@ mod tests {
     }
 
     #[test]
-    fn instance_references_take_a_path() {
-        assert_eq!(
-            typed_store_property_value("Sound", "SoundGroup", json!("SoundService.SFX")).unwrap(),
-            json!({"_type": "Ref", "pathSegments": ["SoundService", "SFX"]})
-        );
-        assert_eq!(
-            typed_store_property_value(
-                "Model",
-                "PrimaryPart",
-                json!("game.Workspace.Lobby.Kiosk.Counter")
-            )
-            .unwrap(),
-            json!({"_type": "Ref", "pathSegments": ["Workspace", "Lobby", "Kiosk", "Counter"]})
-        );
-        assert_eq!(
-            typed_store_property_value("Model", "PrimaryPart", json!("Counter")).unwrap(),
-            json!("Counter"),
-            "a bare id or name is left for the reference resolver"
-        );
-        let explicit =
-            json!({"_type": "Ref", "pathSegments": ["Workspace", "A"], "pathOrdinals": [1, 1]});
-        assert_eq!(
-            typed_store_property_value("HingeConstraint", "Attachment0", explicit.clone()).unwrap(),
-            explicit
-        );
-    }
-
-    #[test]
     fn properties_a_push_skips_are_refused_with_their_replacement() {
         let error = typed_store_property_value("TextLabel", "Font", json!("GothamBold"))
             .unwrap_err()

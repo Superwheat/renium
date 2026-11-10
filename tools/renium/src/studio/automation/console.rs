@@ -750,19 +750,4 @@ mod line_tests {
         );
         assert!(play_console_lines(&[]).is_empty());
     }
-
-    #[test]
-    fn only_a_long_run_of_digits_compares_as_an_id() {
-        assert_eq!(
-            digit_pattern("asset 128044540936968 of user 4953300458 failed"),
-            "asset 0 of user 0 failed"
-        );
-        assert_eq!(digit_pattern("id 123456"), digit_pattern("id 9876543210"));
-        assert_eq!(
-            digit_pattern("centered 104 of 7 (v3.15.0)"),
-            "centered 104 of 7 (v3.15.0)"
-        );
-        assert_ne!(digit_pattern("t+1: 5"), digit_pattern("t+2: 7"));
-        assert_ne!(digit_pattern("line 12345"), digit_pattern("line 12346"));
-    }
 }

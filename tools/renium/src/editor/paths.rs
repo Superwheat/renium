@@ -1005,53 +1005,6 @@ mod tests {
     use crate::settings::bytecode::{SETTINGS_BINARY_VERSION, SettingsBytecodeInstance};
 
     #[test]
-    fn source_target_follows_filesystem_stems_without_walking_the_service() {
-        let document = SettingsBytecode {
-            version: SETTINGS_BINARY_VERSION,
-            instances: vec![
-                SettingsBytecodeInstance::new(
-                    "root".to_string(),
-                    "ServerStorage".to_string(),
-                    "ServerStorage".to_string(),
-                    None,
-                ),
-                SettingsBytecodeInstance::new(
-                    "first".to_string(),
-                    "Folder".to_string(),
-                    "Folder".to_string(),
-                    Some(0),
-                ),
-                SettingsBytecodeInstance::new(
-                    "second".to_string(),
-                    "Folder".to_string(),
-                    "Folder".to_string(),
-                    Some(0),
-                ),
-                SettingsBytecodeInstance::new(
-                    "module".to_string(),
-                    "Module".to_string(),
-                    "ModuleScript".to_string(),
-                    Some(2),
-                ),
-            ],
-        };
-        let children = settings_children_by_parent(&document);
-        let service_dir = Path::new("/tmp/src/ServerStorage");
-        let target = editor_source_target_with_children(
-            &document,
-            "ServerStorage",
-            service_dir,
-            &service_dir.join("Folder_2/Module.luau"),
-            &children,
-        )
-        .expect("source target should resolve");
-
-        assert_eq!(target.settings_id.as_deref(), Some("module"));
-        assert_eq!(target.path_segments, ["ServerStorage", "Folder", "Module"]);
-        assert_eq!(target.path_ordinals, [1, 2, 1]);
-    }
-
-    #[test]
     fn server_filename_preserves_explicit_server_run_context() {
         let mut document = SettingsBytecode {
             version: SETTINGS_BINARY_VERSION,

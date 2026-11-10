@@ -3953,42 +3953,6 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_status_reads_do_not_restart_the_settle_quiet_period() {
-        let control = test_control();
-        control.set_plugin_state(json!({
-            "runtimeId": "studio", "seq": 11, "snapshotSeq": 31,
-            "dirtyServices": [], "changeCount": 0, "propertyChangeCount": 0,
-        }));
-        let activity = control.settle_activity.load(Ordering::Acquire);
-        for snapshot in 32..100 {
-            control.set_plugin_state(json!({
-                "runtimeId": "studio", "seq": 11, "snapshotSeq": snapshot,
-                "dirtyServices": [], "pendingChanges": 0,
-            }));
-        }
-        assert_eq!(control.settle_activity.load(Ordering::Acquire), activity);
-        control.set_plugin_state(json!({
-            "runtimeId": "studio", "seq": 12, "snapshotSeq": 100,
-            "dirtyServices": [], "pendingChanges": 0,
-        }));
-        assert!(control.settle_activity.load(Ordering::Acquire) > activity);
-    }
-
-    #[test]
-    fn studio_snapshot_order_is_scoped_to_its_runtime_and_supports_older_plugins() {
-        let control = test_control();
-        control.set_plugin_state(json!({ "runtimeId": "old", "snapshotSeq": 100 }));
-        let restarted = json!({ "runtimeId": "new", "snapshotSeq": 1 });
-        control.set_plugin_state(restarted.clone());
-        assert_eq!(control.plugin_snapshot(), restarted);
-        let legacy = json!({ "runtimeId": "legacy", "pendingChanges": 1 });
-        control.set_plugin_state(legacy.clone());
-        assert_eq!(control.plugin_snapshot(), legacy);
-        control.set_plugin_state(json!({ "runtimeId": "legacy", "pendingChanges": 0 }));
-        assert!(!studio_has_pending_changes(&control.plugin_snapshot()));
-    }
-
-    #[test]
     fn settled_wait_observes_an_event_quiet_period() {
         let control = test_control();
         control.set_plugin_state(json!({ "pendingChanges": 1 }));

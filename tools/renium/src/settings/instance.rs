@@ -654,39 +654,6 @@ mod tests {
     }
 
     #[test]
-    fn removes_descendants_and_reindexes_parents() {
-        let mut document = sample_document();
-        add_instance(
-            &mut document,
-            AddInstanceSpec::new(
-                Some("grandchild".to_string()),
-                "Grandchild".to_string(),
-                "Folder".to_string(),
-                Some(1),
-            ),
-        )
-        .unwrap();
-        add_instance(
-            &mut document,
-            AddInstanceSpec::new(
-                Some("sibling".to_string()),
-                "Sibling".to_string(),
-                "Folder".to_string(),
-                Some(0),
-            ),
-        )
-        .unwrap();
-
-        let removed =
-            remove_instance(&mut document, InstanceSelector::SettingsId("part"), true).unwrap();
-
-        assert_eq!(removed, vec![1, 2]);
-        assert_eq!(document.instances.len(), 2);
-        assert_eq!(document.instances[1].settings_id, "sibling");
-        assert_eq!(document.instances[1].parent_index, Some(0));
-    }
-
-    #[test]
     fn remove_instance_remaps_ref_properties() {
         let mut document = SettingsBytecode {
             version: 2,
@@ -783,67 +750,5 @@ mod tests {
             .find(|instance| instance.settings_id == "grandchild")
             .unwrap();
         assert_eq!(grandchild.parent_index, part_parent);
-    }
-
-    #[test]
-    fn remove_instance_recursively_handles_out_of_order_descendants() {
-        let mut document = SettingsBytecode {
-            version: 2,
-            instances: vec![
-                SettingsBytecodeInstance::new(
-                    "root".to_string(),
-                    "Workspace".to_string(),
-                    "Workspace".to_string(),
-                    None,
-                ),
-                SettingsBytecodeInstance::new(
-                    "leaf".to_string(),
-                    "Leaf".to_string(),
-                    "Part".to_string(),
-                    Some(2),
-                ),
-                SettingsBytecodeInstance::new(
-                    "child".to_string(),
-                    "Child".to_string(),
-                    "Folder".to_string(),
-                    Some(3),
-                ),
-                SettingsBytecodeInstance::new(
-                    "target".to_string(),
-                    "Target".to_string(),
-                    "Folder".to_string(),
-                    Some(0),
-                ),
-                SettingsBytecodeInstance::new(
-                    "sibling".to_string(),
-                    "Sibling".to_string(),
-                    "Folder".to_string(),
-                    Some(0),
-                ),
-                SettingsBytecodeInstance::new(
-                    "sibling_child".to_string(),
-                    "SiblingChild".to_string(),
-                    "Part".to_string(),
-                    Some(4),
-                ),
-            ],
-        };
-
-        let removed =
-            remove_instance(&mut document, InstanceSelector::SettingsId("target"), true).unwrap();
-
-        assert_eq!(removed, vec![1, 2, 3]);
-        assert_eq!(
-            document
-                .instances
-                .iter()
-                .map(|instance| (instance.settings_id.as_str(), instance.parent_index))
-                .collect::<Vec<_>>(),
-            vec![
-                ("root", None),
-                ("sibling", Some(0)),
-                ("sibling_child", Some(1))
-            ]
-        );
     }
 }

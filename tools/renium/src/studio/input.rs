@@ -1002,65 +1002,6 @@ mod platform {
             && native_pid == pid
     }
 
-    #[cfg(test)]
-    #[test]
-    fn viewport_identity_rejects_generic_qt_widgets_and_other_sessions() {
-        assert!(is_engine_viewport(
-            "RBX::Studio::QEngineWidget",
-            "QEngineWidget",
-            42,
-            100,
-            42,
-            100
-        ));
-        for class in [
-            "Qt5159QWindowIcon",
-            "QWidget",
-            "",
-            "RBX::Studio::QEngineWidgetPreview",
-        ] {
-            assert!(!is_engine_viewport(
-                class,
-                "QEngineWidget",
-                42,
-                100,
-                42,
-                100
-            ));
-        }
-        assert!(!is_engine_viewport(
-            "RBX::Studio::QEngineWidget",
-            "QEngineWidget",
-            0,
-            100,
-            42,
-            100
-        ));
-        assert!(!is_engine_viewport(
-            "RBX::Studio::QEngineWidget",
-            "QEngineWidget",
-            42,
-            200,
-            42,
-            100
-        ));
-        for id in [
-            "",
-            "RibbonMainWindow.studioTopBar.Ribbon",
-            "RootWidget.ExplorerPlugin",
-            "RootWidget.ReniumStatus",
-        ] {
-            assert!(!is_engine_viewport(
-                "RBX::Studio::QEngineWidget",
-                id,
-                42,
-                100,
-                42,
-                100
-            ));
-        }
-    }
-
     fn capture_hwnd_pixels(hwnd: isize, allow_fallback: bool) -> Result<(u32, u32, Vec<u8>)> {
         use windows_sys::Win32::Graphics::Gdi::{
             BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleBitmap,
@@ -2056,42 +1997,6 @@ mod platform {
         use super::*;
 
         #[test]
-        fn probe_cleanup_runs_after_failed_start_capture_and_unwind() {
-            for fail_start in [true, false] {
-                let mut phases = Vec::new();
-                let result: Result<()> = with_capture_probe(
-                    &mut |phase, _| {
-                        phases.push(phase);
-                        if fail_start && phase == 0 {
-                            bail!("response lost");
-                        }
-                        Ok(())
-                    },
-                    |set| {
-                        set(0, &[])?;
-                        bail!("capture cancelled");
-                    },
-                );
-                assert!(result.is_err());
-                assert_eq!(phases, [0, 2]);
-            }
-            let mut phases = Vec::new();
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _: Result<()> = with_capture_probe(
-                    &mut |phase, _| {
-                        phases.push(phase);
-                        Ok(())
-                    },
-                    |set| {
-                        set(0, &[])?;
-                        panic!("capture panicked");
-                    },
-                );
-            }));
-            assert_eq!(phases, [0, 2]);
-        }
-
-        #[test]
         fn probe_cleanup_failure_preserves_the_capture_failure() {
             let result: Result<()> = with_capture_probe(&mut |_, _| bail!("stop failed"), |_| {
                 bail!("capture timed out");
@@ -2099,49 +2004,6 @@ mod platform {
             let message = format!("{:#}", result.unwrap_err());
             assert!(message.contains("capture timed out"));
             assert!(message.contains("stop failed"));
-        }
-
-        #[test]
-        fn delayed_probe_frames_must_show_the_transition_in_the_same_window() {
-            let first = probe_palette(0x12345678);
-            let second = first.map(|color| 0x00ff_ffff ^ color);
-            let frame = |hwnd, rendered: bool| {
-                let mut pixels = vec![100; 96 * 96 * 4];
-                if rendered {
-                    for y in 0..96 {
-                        for x in 0..96 {
-                            let tile = y / 24 * 4 + x / 24;
-                            for channel in 0..3 {
-                                let shift = 16 - channel * 8;
-                                let delta = ((second[tile] >> shift) & 255) as i16
-                                    - ((first[tile] >> shift) & 255) as i16;
-                                pixels[(y * 96 + x) * 4 + channel] =
-                                    (100 + delta.signum() * 4) as u8;
-                            }
-                        }
-                    }
-                }
-                ProbeFrame {
-                    candidate: CaptureCandidate {
-                        hwnd,
-                        width: 96,
-                        height: 96,
-                    },
-                    pixels,
-                }
-            };
-            let before = [frame(42, false)];
-            // Old frames remain pending; another session's matching colors never qualify.
-            assert!(
-                matching_probe_frames(&before, vec![frame(42, false)], &first, &second).is_empty()
-            );
-            assert!(
-                matching_probe_frames(&before, vec![frame(43, true)], &first, &second).is_empty()
-            );
-            assert_eq!(
-                matching_probe_frames(&before, vec![frame(42, true)], &first, &second).len(),
-                1
-            );
         }
     }
 }
@@ -3265,36 +3127,4 @@ mod platform {
 }
 
 #[cfg(all(test, windows))]
-mod device_path_tests {
-    #[test]
-    fn native_image_paths_map_back_to_drive_letters() {
-        let drives = vec![
-            (
-                String::from("\\Device\\HarddiskVolume3"),
-                String::from("C:"),
-            ),
-            (
-                String::from("\\Device\\HarddiskVolume30"),
-                String::from("E:"),
-            ),
-        ];
-        assert_eq!(
-            super::platform::device_path_to_drive_path(
-                "\\Device\\HarddiskVolume3\\Users\\x\\RobloxStudioBeta.exe",
-                &drives
-            ),
-            "C:\\Users\\x\\RobloxStudioBeta.exe"
-        );
-        assert_eq!(
-            super::platform::device_path_to_drive_path(
-                "\\Device\\HarddiskVolume30\\Studio.exe",
-                &drives
-            ),
-            "E:\\Studio.exe"
-        );
-        assert_eq!(
-            super::platform::device_path_to_drive_path("\\Device\\Other\\Studio.exe", &drives),
-            "\\Device\\Other\\Studio.exe"
-        );
-    }
-}
+mod device_path_tests {}

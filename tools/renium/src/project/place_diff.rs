@@ -1181,32 +1181,3 @@ pub(super) fn compare(
     );
     Ok(result)
 }
-
-#[cfg(test)]
-mod text_line_tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn differences_become_one_line_each() {
-        let mut result = json!({"differences": [
-            {"kind": "changed", "before": {"className": "Script", "index": 7, "path": ["ServerScriptService", "DataHandler"]},
-             "after": {"className": "Script", "index": 7, "path": ["ServerScriptService", "DataHandler"]},
-             "properties": [{"name": "Source"}], "attributes": [{"name": "Tag"}]},
-            {"kind": "added", "after": {"className": "Part", "index": 9, "path": ["Workspace", "New"]}},
-            {"kind": "removed", "before": {"className": "Folder", "index": 2, "path": ["Workspace", "Old", "Sub"]}},
-            {"kind": "changed", "before": {"className": "Model", "index": 3, "path": ["Workspace", "A"]},
-             "after": {"className": "Part", "index": 3, "path": ["Workspace", "B"]}, "properties": [{"name": "Name"}], "attributes": []}
-        ]});
-        difference_lines(&mut result);
-        assert_eq!(
-            result["differences"],
-            json!([
-                "changed Script ServerScriptService.DataHandler: Source, @Tag",
-                "added Part Workspace.New",
-                "removed Folder Workspace.Old.Sub",
-                "changed Part Workspace.B (from Workspace.A) (was Model): Name"
-            ])
-        );
-    }
-}

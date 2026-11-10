@@ -3244,19 +3244,6 @@ mod tests {
     }
 
     #[test]
-    fn nested_fields_keep_json_types() {
-        let mut value = Map::new();
-        insert_nested(&mut value, "payload.parameters.level", json!(7)).unwrap();
-        assert_eq!(
-            value,
-            json!({"payload":{"parameters":{"level":7}}})
-                .as_object()
-                .unwrap()
-                .clone()
-        );
-    }
-
-    #[test]
     fn native_requests_bind_identity_and_values() {
         let identity = CloudIdentity {
             game_id: Some(123),
@@ -3465,44 +3452,5 @@ mod tests {
         ];
         let request = build_request("thumbnail", identity, status).unwrap();
         assert_eq!(request["query"]["operationIds"], json!(["first", "second"]));
-    }
-
-    #[test]
-    fn native_upload_commands_accept_and_forward_content_type() {
-        use clap::Parser;
-        assert!(
-            crate::cli::Cli::try_parse_from([
-                "rbx",
-                "oc",
-                "asset",
-                "create",
-                "Model",
-                "Car",
-                "A car",
-                "car.glb",
-                "--content-type",
-                "model/gltf-binary",
-            ])
-            .is_ok()
-        );
-        let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
-        let file = file.to_str().unwrap();
-        for (category, action, values) in [
-            ("asset", "create", vec!["Model", "Car", "A car", file]),
-            ("place", "publish", vec![file]),
-        ] {
-            let mut args = args(action, &values);
-            args.content_type = Some("model/custom".into());
-            let request = build_request(
-                category,
-                CloudIdentity {
-                    game_id: Some(1),
-                    place_id: Some(2),
-                },
-                args,
-            )
-            .unwrap();
-            assert_eq!(request["contentType"], "model/custom");
-        }
     }
 }

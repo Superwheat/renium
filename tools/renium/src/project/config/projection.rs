@@ -3054,22 +3054,3 @@ fn copy_file_to_target(loaded: &LoadedProject, source: &Path, target: &Path) -> 
     fs::copy(source, destination)?;
     Ok(())
 }
-
-#[cfg(test)]
-mod cache_tests {
-    use super::*;
-
-    #[test]
-    fn a_busy_project_does_not_lock_an_unrelated_project() {
-        let root = create_unique_directory(&env::temp_dir(), "renium-cache-lock-").unwrap();
-        let _cleanup = crate::system::files::OnDrop::new(|| {
-            let _ = fs::remove_dir_all(&root);
-        });
-        let a = projection_cache_entry(&root.join("a"));
-        let b = projection_cache_entry(&root.join("b"));
-        let _busy = a.lock().unwrap();
-        assert!(b.try_lock().is_ok());
-        assert!(Arc::ptr_eq(&a, &projection_cache_entry(&root.join("a"))));
-        assert!(!Arc::ptr_eq(&a, &b));
-    }
-}

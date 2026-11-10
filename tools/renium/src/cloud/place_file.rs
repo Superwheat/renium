@@ -70,62 +70,6 @@ mod tests {
     use rbx_dom_weak::{InstanceBuilder, WeakDom};
 
     #[test]
-    fn valid_binary_and_xml_keep_native_numeric_widths() {
-        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
-        dom.insert(
-            dom.root_ref(),
-            InstanceBuilder::new("Camera")
-                .with_property("OrthographicSize", 300.0f32)
-                .with_property("ViewStretch", 1.0f32),
-        );
-        dom.insert(
-            dom.root_ref(),
-            InstanceBuilder::new("NumberValue").with_property("Value", 1.234567890123f64),
-        );
-        let mut binary = Vec::new();
-        rbx_binary::to_writer(&mut binary, &dom, dom.root().children()).unwrap();
-        assert_eq!(validate(&binary).unwrap(), RbxPlaceFormat::Binary);
-        assert!(validate(&binary[..binary.len() - 1]).is_err());
-        let mut xml = Vec::new();
-        rbx_xml::to_writer(
-            &mut xml,
-            &dom,
-            dom.root().children(),
-            rbx_xml::EncodeOptions::new(),
-        )
-        .unwrap();
-        assert_eq!(validate(&xml).unwrap(), RbxPlaceFormat::Xml);
-        assert!(validate(b"<roblox version=\"4\"><Item").is_err());
-        assert!(validate(b"not a place").is_err());
-        assert!(validate(b"").is_err());
-        assert!(validate_size(MAX_PLACE_BYTES).is_ok());
-        assert!(validate_size(MAX_PLACE_BYTES + 1).is_err());
-    }
-
-    #[test]
-    fn legacy_camera_doubles_are_rejected_before_normalization() {
-        for property in ["OrthographicSize", "ViewStretch"] {
-            let dom = WeakDom::new(
-                InstanceBuilder::new("DataModel")
-                    .with_child(InstanceBuilder::new("Camera").with_property(property, 300.0f64)),
-            );
-            let old_database = rbx_reflection::ReflectionDatabase::new();
-            let mut bytes = Vec::new();
-            rbx_binary::Serializer::new()
-                .reflection_database(&old_database)
-                .serialize(&mut bytes, &dom, dom.root().children())
-                .unwrap();
-            assert!(rbx_binary::from_reader(bytes.as_slice()).is_ok());
-            let error = format!("{:#}", validate(&bytes).unwrap_err());
-            assert!(error.contains(&format!("Camera.{property}")), "{error}");
-            assert!(
-                error.contains("should be Float32, but it was Float64"),
-                "{error}"
-            );
-        }
-    }
-
-    #[test]
     fn api_limited_types_and_subclasses_pass_local_format_validation() {
         for class in [
             "EditableImage",

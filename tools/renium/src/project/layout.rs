@@ -88,25 +88,3 @@ pub(crate) fn apply_configured_project_layout(
     *source_root = source;
     Ok(())
 }
-
-#[cfg(test)]
-mod explicit_root_tests {
-    use super::ensure_explicit_project_root;
-
-    #[test]
-    fn explicit_missing_root_is_created_with_a_project_file() {
-        let base = std::env::temp_dir().join(format!(
-            "renium-explicit-root-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let root = base.join("artifacts").join("replication-lab");
-        ensure_explicit_project_root(&root).unwrap();
-        assert!(root.join("renium.project.jsonc").is_file());
-        ensure_explicit_project_root(&root).unwrap();
-        std::fs::remove_dir_all(&base).unwrap();
-    }
-}

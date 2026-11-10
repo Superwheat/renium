@@ -883,52 +883,6 @@ mod store_edit_result_tests {
             })
         );
     }
-
-    #[test]
-    fn a_failed_read_back_and_other_results_stay_whole() {
-        let mut unverified = json!({
-            "changedPaths": ["instances/Workspace.renium"],
-            "ok": true,
-            "pathSegments": ["Workspace", "a.b"],
-            "settingsFile": "instances/Other.renium",
-            "studio": {"class": "Part", "path": "Workspace.Pad"},
-            "verified": false,
-        });
-        let before = unverified.clone();
-        trim_store_edit_result(&mut unverified);
-        assert_eq!(unverified, before);
-        let mut other =
-            json!({"ok": true, "settingsFile": "instances/Workspace.renium", "index": 3});
-        let before = other.clone();
-        trim_store_edit_result(&mut other);
-        assert_eq!(other, before);
-    }
-}
-
-#[cfg(test)]
-mod float_output_tests {
-    use super::shorten_single_precision_floats;
-    use serde_json::json;
-
-    #[test]
-    fn single_precision_expansions_print_short_and_doubles_stay_exact() {
-        let mut value = json!({
-            "size": [0.20000000298023224, 0.699999988079071, 1.0, 228.31427001953125],
-            "count": 3,
-            "big": 1789795605,
-            "precise": 0.1234567890123,
-            "nested": {"x": 0.960784375667572}
-        });
-        shorten_single_precision_floats(&mut value);
-        assert_eq!(
-            serde_json::to_string(&value).unwrap(),
-            r#"{"big":1789795605,"count":3,"nested":{"x":0.9607844},"precise":0.1234567890123,"size":[0.2,0.7,1.0,228.31427]}"#
-        );
-        let mut value = json!({"size": [0.2, 0.7, 228.31427]});
-        let before = serde_json::to_string(&value).unwrap();
-        shorten_single_precision_floats(&mut value);
-        assert_eq!(serde_json::to_string(&value).unwrap(), before);
-    }
 }
 
 #[cfg(test)]

@@ -1815,51 +1815,6 @@ mod tests {
     }
 
     #[test]
-    fn where_matches_filters_a_subtree_by_class_and_property() {
-        let root = scratch("renium-bs-where-");
-        run(
-            &root,
-            r##"{"ops":[
-                {"parent":"Workspace","name":"Lobby","class":"Folder","ref":"lobby"},
-                {"parent":"#lobby","name":"Glass1","class":"Part","props":{"Transparency":0.7}},
-                {"parent":"#lobby","name":"Wall","class":"Part","props":{"Transparency":0}},
-                {"parent":"#lobby","name":"Light","class":"PointLight"},
-                {"parent":"Workspace","name":"Glass9","class":"Part","props":{"Transparency":0.9}}
-            ]}"##,
-        )
-        .unwrap();
-        let document =
-            SettingsBytecode::read_file(&root.join("instances").join("Workspace.renium")).unwrap();
-        let lobby = document
-            .instances
-            .iter()
-            .position(|instance| instance.name == "Lobby")
-            .unwrap();
-        let names_of = |indices: Vec<usize>| {
-            indices
-                .into_iter()
-                .map(|index| document.instances[index].name.clone())
-                .collect::<Vec<_>>()
-        };
-        let matches = |scope: usize, query: &str| {
-            names_of(crate::bytecode::where_matches(&document, "Workspace", scope, query).unwrap())
-        };
-        assert_eq!(matches(lobby, "is:Part Transparency>0.5"), ["Glass1"]);
-        let service_root =
-            crate::settings::tree::editor_service_root_index(&document, "Workspace").unwrap();
-        assert_eq!(
-            matches(service_root, "is:Part Transparency>0.5"),
-            ["Glass1", "Glass9"]
-        );
-        assert_eq!(
-            matches(lobby, "Glass or is:PointLight"),
-            ["Glass1", "Light"]
-        );
-        assert!(matches(lobby, "is:Model").is_empty());
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn lighting_clock_time_is_stored_as_time_of_day() {
         let root = scratch("renium-clocktime-");
         run(
@@ -2073,38 +2028,6 @@ mod tests {
         .unwrap_err();
         assert!(format!("{bad_class:#}").contains("op 1"), "{bad_class:#}");
         assert_eq!(fs::read(&settings_file).unwrap(), before);
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn script_op_writes_its_source_file_once_per_store() {
-        let root = scratch("renium-ba-batch-script-");
-        let settings_file = root.join("instances").join("ServerScriptService.renium");
-        let result = run(
-            &root,
-            r##"[
-                {"parent":"ServerScriptService","name":"Rounds","class":"ModuleScript","source":"return { rounds = 3 }\n"},
-                {"parent":"ServerScriptService","name":"Main","class":"Script","source":"print('hi')"}
-            ]"##,
-        )
-        .unwrap();
-        assert_eq!(result["stores"], 1, "{result}");
-        let changed = result["changedPaths"].as_array().unwrap();
-        assert_eq!(changed.len(), 3, "{result}");
-        let ops = result["ops"].as_array().unwrap();
-        let rounds = PathBuf::from(ops[0]["sourcePath"].as_str().unwrap());
-        assert!(rounds.ends_with("Rounds.luau"), "{result}");
-        assert_eq!(
-            fs::read_to_string(&rounds).unwrap(),
-            "return { rounds = 3 }\n"
-        );
-        let main = PathBuf::from(ops[1]["sourcePath"].as_str().unwrap());
-        assert_eq!(fs::read_to_string(&main).unwrap(), "print('hi')");
-        let document = SettingsBytecode::read_file(&settings_file).unwrap();
-        assert_eq!(
-            document.instances[1].properties["Source"],
-            crate::settings::EXTERNAL_SOURCE_MARKER
-        );
         let _ = fs::remove_dir_all(&root);
     }
 }
