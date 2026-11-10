@@ -291,21 +291,35 @@ pub(crate) fn bytecode_add_instance(args: BytecodeAddInstanceArgs) -> Result<()>
         override_packages: args.override_packages,
     })?;
     if args.push {
-        push_stored_instance_reading(&mut result, &property_names, &attribute_names)?;
+        push_stored_instance_reading(
+            &mut result,
+            &property_names,
+            &attribute_names,
+            PushedScope::Subtree,
+        )?;
     }
     print_json_output(&result, args.pretty)
 }
 
+/// What a scoped push of a stored instance carries: the instance with its
+/// subtree, for one that was added, copied or moved, or the instance alone,
+/// for an edit of its own values.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PushedScope {
+    Subtree,
+    Instance,
+}
+
 /// Pushes the instance a store edit just wrote (its `settingsFile` and
-/// `settingsId`) to the open place, scoped to that instance and without a
-/// review, and records the push summary under `push`.
-/// Pushes the edited instance and then reads it back from the open place:
-/// `studio` carries its live path, class and the named properties and
+/// `settingsId`) to the open place without a review, records the push
+/// summary under `push`, and then reads the instance back from the open
+/// place: `studio` carries its live path, class and the named properties and
 /// attributes, so the caller needs no separate read to confirm the edit.
 pub(crate) fn push_stored_instance_reading(
     result: &mut Value,
     properties: &[String],
     attributes: &[String],
+    scope: PushedScope,
 ) -> Result<()> {
     let settings_file = result
         .get("settingsFile")
@@ -317,7 +331,8 @@ pub(crate) fn push_stored_instance_reading(
         .and_then(Value::as_str)
         .map(str::to_string)
         .context("The store edit did not name its instance; push the store file with `rbx ps`")?;
-    result["push"] = push_stored_instances(settings_file.clone(), vec![settings_id.clone()])?;
+    result["push"] =
+        push_stored_instances(settings_file.clone(), vec![settings_id.clone()], scope)?;
     let document = SettingsBytecode::read_file(&settings_file)?;
     let Some(index) = document
         .instances
@@ -532,6 +547,7 @@ pub(crate) fn read_back_many_from_studio(
 pub(crate) fn push_stored_instances(
     settings_file: PathBuf,
     settings_ids: Vec<String>,
+    scope: PushedScope,
 ) -> Result<Value> {
     let mut args = crate::cli::PushEditorChangesArgs::new(
         crate::cli::ProjectSourceArgs::current(),
@@ -559,6 +575,7 @@ pub(crate) fn push_stored_instances(
     }
     args.changed_paths = changed_paths;
     args.target_settings_ids = settings_ids;
+    args.exact_target_ids = scope == PushedScope::Instance;
     args.yes = true;
     args.verify_sources = true;
     crate::editor::sync::push_editor_changes_result(args)

@@ -279,6 +279,7 @@ pub(crate) fn bytecode_add_batch(
             let summary = crate::bytecode::edit::push_stored_instances(
                 store.settings_file,
                 store.settings_ids,
+                crate::bytecode::edit::PushedScope::Subtree,
             )?;
             verified &= ["verified", "unchanged"]
                 .iter()

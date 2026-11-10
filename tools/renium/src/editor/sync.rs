@@ -1581,6 +1581,7 @@ pub(crate) fn push_editor_changes_result(mut args: PushEditorChangesArgs) -> Res
         "changedPaths": args.changed_paths,
         "changedPathsFiles": args.changed_paths_files,
         "targetSettingsIds": args.target_settings_ids,
+        "exactTargetIds": args.exact_target_ids,
         "targetSettingsIdFiles": args.target_settings_id_files,
         "targetProperties": args.target_properties,
         "upsertInstancesOnly": args.upsert_instances_only,

@@ -75,6 +75,7 @@
 
 ### Bug fixes
 
+- `rbx bs --push` pushes the edited instance alone. It used to push the instance's whole subtree again, so one attribute set on a large folder or model took many seconds and could make Studio ask whether to stop the plugin.
 - A store-file push the review held (`rbx ps instances/SERVICE.renium` with more than the threshold's changes) returns the hold and its `--yes` hint again; it used to go on to read Studio back and report "did not retain pushed project changes" for instances nothing had created yet.
 - `rbx dev set` no longer reports a 1.5 s timeout for a device Studio did switch to: when the setters outlive the plugin's reply window, the status read afterwards stands in for the result and carries `settledAfterTimeout`.
 - A push that creates a text object with `TextScaled` on no longer fails its read-back on `TextWrapped`, which Studio keeps on with scaling; the push had applied nothing and reported "did not retain native supplemental properties". A store written with `TextWrapped` off next to `TextScaled` on now carries the value Studio keeps, so the next push of that store no longer rewrites the label and trips the transaction's change check.

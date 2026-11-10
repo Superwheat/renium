@@ -417,7 +417,12 @@ pub(crate) fn clone_instance_command(
     if args.push {
         result["settingsId"] = json!(root_id);
         result["settingsFile"] = json!(source_file);
-        crate::bytecode::edit::push_stored_instance_reading(&mut result, &[], &[])?;
+        crate::bytecode::edit::push_stored_instance_reading(
+            &mut result,
+            &[],
+            &[],
+            crate::bytecode::edit::PushedScope::Subtree,
+        )?;
     }
     crate::app::output::print_json_output(&result, false)
 }
@@ -542,6 +547,7 @@ fn move_within_store(args: BytecodeSetPropertyArgs, push: bool) -> Result<()> {
             &mut result,
             &["Parent".to_string()],
             &[],
+            crate::bytecode::edit::PushedScope::Subtree,
         )?;
     }
     crate::app::output::print_json_output(&result, false)

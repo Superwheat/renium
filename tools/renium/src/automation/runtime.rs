@@ -274,6 +274,7 @@ pub(super) fn automation_push_args(
         .map(|path| bound_context::path(context, path))
         .collect();
     args.target_settings_ids = automation_strings(object, "targetSettingsIds");
+    args.exact_target_ids = automation_bool(object, "exactTargetIds", false)?;
     args.target_settings_id_files = automation_strings(object, "targetSettingsIdFiles")
         .into_iter()
         .map(PathBuf::from)

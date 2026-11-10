@@ -2285,7 +2285,12 @@ fn finish_set_property(args: BytecodeSetPropertyArgs, mut result: Value) -> Resu
         } else {
             (names, Vec::new())
         };
-        crate::bytecode::edit::push_stored_instance_reading(&mut result, &properties, &attributes)?;
+        crate::bytecode::edit::push_stored_instance_reading(
+            &mut result,
+            &properties,
+            &attributes,
+            crate::bytecode::edit::PushedScope::Instance,
+        )?;
     }
     print_json_output(&result, args.pretty)
 }
@@ -2380,7 +2385,11 @@ fn bytecode_set_property_where(mut args: BytecodeSetPropertyArgs, query: &str) -
         "settingsFile": settings_file,
     });
     if push {
-        result["push"] = crate::bytecode::edit::push_stored_instances(settings_file.clone(), ids)?;
+        result["push"] = crate::bytecode::edit::push_stored_instances(
+            settings_file.clone(),
+            ids,
+            crate::bytecode::edit::PushedScope::Instance,
+        )?;
         let (properties, attributes) = if args.scope.eq_ignore_ascii_case("attribute") {
             (Vec::new(), set_names)
         } else {
@@ -2534,8 +2543,11 @@ pub(crate) fn bytecode_rename_where(
             })
             .collect::<Vec<_>>();
         result["studioRenamed"] = crate::bytecode::edit::rename_in_studio(&pairs)?;
-        result["push"] =
-            crate::bytecode::edit::push_stored_instances(settings_file.clone(), ids.clone())?;
+        result["push"] = crate::bytecode::edit::push_stored_instances(
+            settings_file.clone(),
+            ids.clone(),
+            crate::bytecode::edit::PushedScope::Subtree,
+        )?;
         let after = SettingsBytecode::read_file(&settings_file)?;
         let (segments, _) = build_editor_instance_path_parts(&after, &service);
         let indices = ids
