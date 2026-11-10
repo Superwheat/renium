@@ -665,6 +665,9 @@ pub(crate) struct BridgeServer {
     #[cfg(any(windows, target_os = "macos"))]
     pub(crate) verified_full_pushes: crate::automation::reconcile::VerifiedFullPushCache,
     pub(crate) channels: Vec<Arc<BridgeChannel>>,
+    /// Where each accept loop listens; the drop connects here after clearing
+    /// `alive` to wake the loop from its blocking accept.
+    pub(crate) listening: Vec<std::net::SocketAddr>,
     pub(crate) alive: Arc<AtomicBool>,
     pub(crate) next_id: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) preferred_index: std::sync::atomic::AtomicUsize,
@@ -1553,15 +1556,22 @@ impl BridgeServer {
             })),
         };
 
+        // Every port is bound before any accept loop starts: a loop blocks in
+        // accept until a server is dropped, and a failed bind returns no server.
+        let mut listening = Vec::new();
+        let mut listeners = Vec::with_capacity(ports.len());
         for port in ports {
             let listener = launch_forward::bind_bridge_port(&bind_host, *port).with_context(|| {
                 format!(
                     "Failed to bind bridge server on {bind_host}:{port}; close the Renium process using that port or run `rbx daemon list` and `rbx daemon stop --all`"
                 )
             })?;
-            listener.set_nonblocking(true).with_context(|| {
-                format!("Failed to set nonblocking listener {bind_host}:{port}")
-            })?;
+            listening.push(listener.local_addr().with_context(|| {
+                format!("Failed to read the bridge listener address on {bind_host}:{port}")
+            })?);
+            listeners.push(listener);
+        }
+        for (port, listener) in ports.iter().zip(listeners) {
             crate::app::output::log_global(
                 4,
                 format_args!("[renium] bridge listening on {bind_host}:{port}"),
@@ -1594,6 +1604,7 @@ impl BridgeServer {
         let wait_started = Instant::now();
         let server = Self {
             channels,
+            listening,
             alive,
             next_id,
             preferred_index: std::sync::atomic::AtomicUsize::new(0),
@@ -1670,6 +1681,9 @@ impl BridgeServer {
         ))
     }
 
+    /// Accepts plugin connections on a blocking listener while `alive` is set.
+    /// Dropping the server clears `alive` and connects once to wake the
+    /// accept; a loop that connection does not reach ends with the process.
     fn spawn_accept_loop(
         bind_host: String,
         port: u16,
@@ -1682,6 +1696,9 @@ impl BridgeServer {
             while state.alive.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, addr)) => {
+                        if !state.alive.load(Ordering::Relaxed) {
+                            break;
+                        }
                         let Some(permit) = HandshakePermit::acquire(&pending) else {
                             continue;
                         };
@@ -1920,9 +1937,6 @@ impl BridgeServer {
                                 }
                             }
                         });
-                    }
-                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(2));
                     }
                     Err(err) => {
                         if state.alive.load(Ordering::Relaxed) {
@@ -4408,6 +4422,9 @@ impl BridgeServer {
 impl Drop for BridgeServer {
     fn drop(&mut self) {
         self.alive.store(false, Ordering::Relaxed);
+        for address in &self.listening {
+            let _ = TcpStream::connect_timeout(address, Duration::from_millis(250));
+        }
         #[cfg(any(windows, target_os = "macos"))]
         {
             let cached = std::mem::take(&mut *self.verified_full_pushes.lock_recover());

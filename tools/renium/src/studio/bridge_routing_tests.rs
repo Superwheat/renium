@@ -13,6 +13,7 @@ pub(crate) fn fixture() -> BridgeServer {
                 })
             })
             .collect(),
+        listening: Vec::new(),
         alive: Arc::new(AtomicBool::new(true)),
         next_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         preferred_index: Default::default(),
@@ -295,6 +296,36 @@ fn verify_push_dispatch_reads_sources_without_replacement_or_review() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn dropping_the_server_ends_its_accept_loops() {
+    let bridge = listening_fixture();
+    let listening = bridge.listening.clone();
+    assert_eq!(listening.len(), 2);
+    drop(bridge);
+    for address in listening {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while let Err(error) = TcpListener::bind(address) {
+            assert!(
+                Instant::now() < deadline,
+                "the accept loop still holds {address}: {error}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+#[test]
+fn a_failed_bind_leaves_the_ports_bound_before_it_free() {
+    let taken = TcpListener::bind("127.0.0.1:0").unwrap();
+    let free = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let ports = [free.port(), taken.local_addr().unwrap().port()];
+    assert!(BridgeServer::listen_configured("127.0.0.1", &ports, 0.0, false, false).is_err());
+    TcpListener::bind(free).unwrap();
+}
+
 fn listening_fixture() -> BridgeServer {
     listening_fixture_with_preparation(
         #[cfg(any(windows, target_os = "macos"))]
@@ -312,7 +343,7 @@ fn listening_fixture_with_preparation(
     bridge.channels = (0..2)
         .map(|_| {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.set_nonblocking(true).unwrap();
+            bridge.listening.push(listener.local_addr().unwrap());
             let channel = Arc::new(BridgeChannel {
                 port: listener.local_addr().unwrap().port(),
                 sockets: Mutex::new(HashMap::new()),
