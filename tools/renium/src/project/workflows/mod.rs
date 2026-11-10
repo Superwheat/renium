@@ -2226,18 +2226,36 @@ fn merged_instruction_file(path: &Path) -> Result<Vec<u8>> {
     if !path.is_file() {
         return Ok(pointer.as_bytes().to_vec());
     }
-    let mut current =
+    let saved =
         fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
-    if is_claude && mentions_agents_file(&current) {
-        return Ok(current.into_bytes());
+    if is_claude && mentions_agents_file(&saved) {
+        return Ok(saved.into_bytes());
     }
+    // The pointer has more than one line, so a file saved with CRLF holds it
+    // with CRLF inside: it is matched on LF text and written back in the
+    // file's own line endings.
+    let current = saved.replace("\r\n", "\n");
+    let merged = merged_instruction_text(&current, pointer, is_claude);
+    if merged == current {
+        return Ok(saved.into_bytes());
+    }
+    Ok(if saved.contains("\r\n") {
+        merged.replace('\n', "\r\n")
+    } else {
+        merged
+    }
+    .into_bytes())
+}
+
+fn merged_instruction_text(current: &str, pointer: &str, is_claude: bool) -> String {
     if current.contains(pointer.trim_end()) {
-        return Ok(current.into_bytes());
+        return current.to_string();
+    }
+    if is_claude && current.contains(claude_pointer_without_map()) {
+        return current.replace(claude_pointer_without_map(), CLAUDE_POINTER.trim_end());
     }
     if is_claude && current.contains(AGENT_POINTER.trim_end()) {
-        return Ok(current
-            .replace(AGENT_POINTER.trim_end(), CLAUDE_POINTER.trim_end())
-            .into_bytes());
+        return current.replace(AGENT_POINTER.trim_end(), CLAUDE_POINTER.trim_end());
     }
     let old_generated = current
         .trim_end()
@@ -2245,24 +2263,37 @@ fn merged_instruction_file(path: &Path) -> Result<Vec<u8>> {
         .next_back()
         .is_some_and(is_old_agent_marker);
     if old_generated {
-        return Ok(pointer.as_bytes().to_vec());
+        return pointer.to_string();
     }
-    if !current.is_empty() && !current.ends_with('\n') {
-        current.push('\n');
+    let mut merged = current.to_string();
+    if !merged.is_empty() && !merged.ends_with('\n') {
+        merged.push('\n');
     }
-    if !current.is_empty() && !current.ends_with("\n\n") {
-        current.push('\n');
+    if !merged.is_empty() && !merged.ends_with("\n\n") {
+        merged.push('\n');
     }
-    current.push_str(pointer);
-    Ok(current.into_bytes())
+    merged.push_str(pointer);
+    merged
 }
 
-/// A CLAUDE.md that still carries the read-me pointer instead of the import.
+/// The import pointer as earlier versions wrote it: the guide alone, before
+/// the project map joined it as the pointer's last line.
+fn claude_pointer_without_map() -> &'static str {
+    let pointer = CLAUDE_POINTER.trim_end();
+    pointer
+        .rsplit_once('\n')
+        .map_or(pointer, |(guide, _)| guide)
+}
+
+/// A CLAUDE.md that still carries the read-me pointer instead of the import,
+/// or the import without the project map.
 fn claude_pointer_outdated(root: &Path) -> bool {
     fs::read_to_string(root.join("CLAUDE.md")).is_ok_and(|text| {
+        let text = text.replace("\r\n", "\n");
         !mentions_agents_file(&text)
-            && text.contains(AGENT_POINTER.trim_end())
             && !text.contains(CLAUDE_POINTER.trim_end())
+            && (text.contains(AGENT_POINTER.trim_end())
+                || text.contains(claude_pointer_without_map()))
     })
 }
 
@@ -3268,6 +3299,45 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&root);
         Ok(())
+    }
+
+    #[test]
+    fn a_guide_import_without_the_project_map_gains_it() {
+        let root = temp_dir("agent-instructions-map");
+        let claude = root.join("CLAUDE.md");
+        fs::write(
+            &claude,
+            format!("# Rules\n\n{}\n", claude_pointer_without_map()),
+        )
+        .unwrap();
+        assert!(claude_pointer_outdated(&root));
+        assert_eq!(
+            String::from_utf8(merged_instruction_file(&claude).unwrap()).unwrap(),
+            format!("# Rules\n\n{CLAUDE_POINTER}")
+        );
+        fs::write(&claude, CLAUDE_POINTER).unwrap();
+        assert!(!claude_pointer_outdated(&root));
+
+        let windows = |text: &str| text.replace('\n', "\r\n");
+        fs::write(
+            &claude,
+            windows(&format!("# Rules\n\n{}\n", claude_pointer_without_map())),
+        )
+        .unwrap();
+        assert!(claude_pointer_outdated(&root));
+        let upgraded = windows(&format!("# Rules\n\n{CLAUDE_POINTER}"));
+        assert_eq!(
+            String::from_utf8(merged_instruction_file(&claude).unwrap()).unwrap(),
+            upgraded,
+            "a CRLF file keeps its line endings and gets no second import"
+        );
+        fs::write(&claude, &upgraded).unwrap();
+        assert!(!claude_pointer_outdated(&root));
+        assert_eq!(
+            String::from_utf8(merged_instruction_file(&claude).unwrap()).unwrap(),
+            upgraded
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

@@ -94,15 +94,30 @@ export function ensureReniumAgentInstructions(
   const claudePointer = fs.existsSync(claudePointerPath) ? fs.readFileSync(claudePointerPath, "utf8") : pointer;
   for (const name of ["AGENTS.md", "CLAUDE.md"]) {
     const target = path.join(projectRoot, name);
-    let current = fs.existsSync(target) ? fs.readFileSync(target, "utf8") : "";
-    if (name === "CLAUDE.md" && current.toLowerCase().includes("agents.md")) {
+    const saved = fs.existsSync(target) ? fs.readFileSync(target, "utf8") : "";
+    if (name === "CLAUDE.md" && saved.toLowerCase().includes("agents.md")) {
       continue;
     }
+    // The Claude pointer has more than one line, so a file saved with CRLF
+    // holds it with CRLF inside: it is matched on LF text and written back in
+    // the file's own line endings.
+    const unchanged = saved.replace(/\r\n/g, "\n");
+    let current = unchanged;
     const filePointer = name === "CLAUDE.md" ? claudePointer : pointer;
     if (name === "CLAUDE.md" && filePointer !== pointer && current.includes(pointer.trimEnd())) {
       current = current.replace(pointer.trimEnd(), claudePointer.trimEnd());
     }
-    write(target, agentInstructions(filePointer, current));
+    // Earlier versions imported the guide alone; the project map is the
+    // pointer's last line.
+    const guideImport = claudePointer.trimEnd().split("\n").slice(0, -1).join("\n");
+    if (name === "CLAUDE.md" && guideImport
+      && !current.includes(claudePointer.trimEnd()) && current.includes(guideImport)) {
+      current = current.replace(guideImport, claudePointer.trimEnd());
+    }
+    const merged = agentInstructions(filePointer, current);
+    if (merged !== unchanged) {
+      write(target, saved.includes("\r\n") ? merged.replace(/\n/g, "\r\n") : merged);
+    }
   }
   return written;
 }
