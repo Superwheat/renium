@@ -1,4 +1,4 @@
-<!-- renium-version: 0.5.9 -->
+<!-- renium-version: 0.6.0 -->
 # Renium for agents
 
 Run `rbx` in the project folder. Act directly: commands report a missing Studio or a sync problem themselves, so skip `status`, `cs` and `lst`. Results: one JSON line on stdout (`l`/`lc`: the returned values as text), errors on stderr.
