@@ -2083,7 +2083,7 @@ fn stored_property_form(
         None
     };
     if let Some(logical_property) = logical_property.as_deref() {
-        *value = crate::rbx::encode::typed_store_property_value(
+        *value = crate::rbx::encode::typed_store_property_edit(
             &document.instances[index].class_name,
             logical_property,
             std::mem::take(value),

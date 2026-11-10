@@ -1459,6 +1459,28 @@ pub(crate) fn normalize_project_typed_value(
         .context("Roblox property literal isn't supported by Renium")
 }
 
+/// The stored form of a value an edit gives an existing instance. A null
+/// removes the value the store holds, also for a property a push cannot set,
+/// which no other value is taken for.
+pub(crate) fn typed_store_property_edit(
+    class_name: &str,
+    property_name: &str,
+    value: Value,
+) -> Result<Value> {
+    if value.is_null() {
+        let database =
+            rbx_reflection_database::get().context("Roblox reflection database is unavailable")?;
+        if crate::editor::review::is_engine_managed_editor_property(
+            class_name,
+            property_name,
+            database,
+        ) {
+            return Ok(value);
+        }
+    }
+    typed_store_property_value(class_name, property_name, value)
+}
+
 /// Store writes keep property values in the form of the property's type. A
 /// bare `{x,y,z}` for a Vector3 would reach Studio as a table and fail every
 /// push, and a string in a number property would fail the place build.
@@ -2945,6 +2967,14 @@ mod tests {
         assert!(
             typed_store_property_value("Frame", "BackgroundColor3", json!([255, 0, 0])).is_ok()
         );
+        assert!(typed_store_property_value("TextLabel", "Font", Value::Null).is_err());
+        assert!(typed_store_property_edit("TextLabel", "Font", json!("GothamBold")).is_err());
+        for (class, property) in [("TextLabel", "Font"), ("Workspace", "CurrentCamera")] {
+            assert_eq!(
+                typed_store_property_edit(class, property, Value::Null).unwrap(),
+                Value::Null
+            );
+        }
     }
 
     #[test]

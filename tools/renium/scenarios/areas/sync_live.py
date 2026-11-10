@@ -862,13 +862,12 @@ def _names_viewport_camera(ctx: Context) -> bool:
 def legacy_store_keeps_the_viewport_camera_on_a_pull(ctx: Context):
     """SYNC-260: a store that names no Workspace.CurrentCamera still keeps its viewport camera row on a
     Live Sync pull: a Studio edit of the camera's FieldOfView is not pulled while an unrelated Studio edit
-    is, and the pulled store then names the camera. bs refuses every edit of CurrentCamera, so the store
-    comes from an import of the saved place, which leaves the engine-managed reference out and keeps the
-    identities of the store it replaces."""
+    is, and the pulled store then names the camera. bs refuses a value for CurrentCamera, which a push
+    cannot set; --null removes the one the store holds."""
     ctx.open_studio()
     if _names_viewport_camera(ctx):
-        ctx.rbx("pi", ctx.place, "-s", "Workspace", timeout=120)
-        ctx.expect(not _names_viewport_camera(ctx), f"precondition: the store names no CurrentCamera (the place import kept it: {ctx.rbx('bg', 'Workspace', '-p', 'CurrentCamera', ok=None).json})")
+        ctx.rbx("bs", "Workspace", "-p", "CurrentCamera", "--null", timeout=60)
+        ctx.expect(not _names_viewport_camera(ctx), f"precondition: the store names no CurrentCamera (--null kept it: {ctx.rbx('bg', 'Workspace', '-p', 'CurrentCamera', ok=None).json})")
     before = ctx.rbx("bg", "Workspace", "Camera", "FieldOfView").json
     ctx.rbx("lon", "--wait", "60", timeout=200)
     _studio_edit(ctx, "workspace.CurrentCamera.FieldOfView = 60 workspace.Props.Crate.Anchored = false")
