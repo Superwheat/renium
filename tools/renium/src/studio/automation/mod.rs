@@ -846,8 +846,13 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
     let mut result = if args.restart {
         // Edits saved during Play wait for Edit mode; stopping first and
         // letting Live Sync settle makes the restarted session run them.
+        // A stop with nothing running answers with the Edit window's status;
+        // only a session that was stopped counts as restarted.
         let stopped = daemon_control_request(op::PLAY_STOP, None, stop_parameters.clone(), false)
-            .map(|stop| stop.get("ok") == Some(&Value::Bool(true)))
+            .map(|stop| {
+                stop.get("ok") == Some(&Value::Bool(true))
+                    && stop.get("action") == Some(&json!("stop"))
+            })
             .unwrap_or(false);
         let settled = settle_live_sync_before_restart(&args);
         let mut result = daemon_control_request(operation, None, parameters, false)?;
