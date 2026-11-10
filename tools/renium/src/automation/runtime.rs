@@ -46,8 +46,8 @@ use crate::studio::automation::{
     wait_timed_out_result, wait_until_result,
 };
 use crate::studio::bridge::{
-    BridgeRequestLease, BridgeServer, BridgeTarget, RequestEditRuntime, RuntimeGateGuard,
-    bind_request_edit_runtime, request_edit_runtime,
+    BridgeRequestLease, BridgeServer, BridgeTarget, RequestEditRuntime, RequestGateGuard,
+    RuntimeGateGuard, bind_request_edit_runtime, request_edit_runtime,
 };
 #[cfg(any(windows, target_os = "macos"))]
 use crate::studio::input as input_inject;
@@ -1404,6 +1404,51 @@ pub(crate) fn select_bridge_context_for_request(
     selection
 }
 
+/// The selection of a play start request, given up with the process-wide
+/// request gate while the start waits for Studio.
+struct PlayStartWait<'a> {
+    context: &'a automation::BoundContext,
+    bridge: &'a BridgeServer,
+    keep_pins: bool,
+    selection: std::cell::RefCell<Option<bound_context::Selection>>,
+}
+
+impl<'a> PlayStartWait<'a> {
+    fn new(
+        context: &'a automation::BoundContext,
+        bridge: &'a BridgeServer,
+        keep_pins: bool,
+        selection: bound_context::Selection,
+    ) -> Self {
+        Self {
+            context,
+            bridge,
+            keep_pins,
+            selection: std::cell::RefCell::new(Some(selection)),
+        }
+    }
+
+    /// Sleeps between two polls of a play start. A request that holds the
+    /// process-wide request gate restores the selection it replaced, hands
+    /// the gate back for the sleep, takes it again and selects its context
+    /// again: requests of other Studios run meanwhile, and none of them sees
+    /// this request's selection. The gate of the request's own Edit runtime
+    /// stays held, so nothing else reaches that Edit window during the start.
+    fn sleep(&self, duration: Duration) {
+        if !self.bridge.holds_request_gate() {
+            std::thread::sleep(duration);
+            return;
+        }
+        drop(self.selection.borrow_mut().take());
+        self.bridge.sleep_outside_request_gate(duration);
+        *self.selection.borrow_mut() = Some(select_bridge_context_for_request(
+            self.context,
+            self.bridge,
+            self.keep_pins,
+        ));
+    }
+}
+
 fn automation_dispatch_operation(
     operation: u16,
     context: &automation::BoundContext,
@@ -1456,7 +1501,7 @@ fn automation_dispatch_operation(
     }
     let keep_pins =
         play_target_selector(operation, parameters).is_some() || request_edit_runtime().is_some();
-    let _selection = select_bridge_context_for_request(context, bridge, keep_pins);
+    let selection = select_bridge_context_for_request(context, bridge, keep_pins);
     match operation {
         op::STUDIO_AUDIO => {
             let player = match parameters.get("player") {
@@ -1586,7 +1631,8 @@ fn automation_dispatch_operation(
         }
         op::PLAY_START | op::PLAY_STOP => {
             let parsed = studio_args::play(operation, parameters)?;
-            start_stop_play_result(parsed, bridge)
+            let wait = PlayStartWait::new(context, bridge, keep_pins, selection);
+            start_stop_play_result(parsed, bridge, &|duration| wait.sleep(duration))
         }
         op::SHOT => {
             let parsed = studio_args::shot(Path::new(&context.root), parameters)?;
@@ -3978,7 +4024,7 @@ fn sync_review_pending(operation: u16, live_status: &Value, result: &Value) -> b
 
 enum RequestGuard<'a> {
     Edit {
-        _request: Option<std::sync::MutexGuard<'a, ()>>,
+        _request: Option<RequestGateGuard<'a>>,
         _runtime: Option<RuntimeGateGuard<'a>>,
         _bound: Option<RequestEditRuntime>,
     },
@@ -3993,11 +4039,14 @@ fn operation_name(operation: u16) -> &'static str {
     automation::opcode_by_id(operation).map_or("request", |opcode| opcode.name)
 }
 
-/// The Edit gate of one request: the process-wide request gate first, then
-/// the gate of the Edit runtime the request resolved. A request that looks at
-/// Studio briefly holds the runtime's gate alone, with its Edit calls bound to
-/// that runtime, so it never waits behind another Studio's work and answers
-/// busy only when its own window is held past the admission limit.
+/// The Edit gate of one request: the gate of the Edit runtime the request
+/// resolved first, then the process-wide request gate, so a request waiting
+/// for its own Studio holds nothing another Studio needs, and one waiting for
+/// the process-wide gate holds nothing at all between its tries. A request that
+/// looks at Studio briefly holds the runtime's gate alone, with its Edit
+/// calls bound to that runtime, so it never waits behind another Studio's
+/// work and answers busy only when its own window is held past the admission
+/// limit.
 fn edit_request_guard<'a>(
     request: &automation::Request,
     state: &automation::State,
@@ -4011,29 +4060,10 @@ fn edit_request_guard<'a>(
     let runtime_id = edit_gate_runtime(request, state, bridge, bridge_wait_seconds)?;
     let limit = admission_limit(request.op);
     let alone = runtime_id.is_some() && edit_runtime_gate_alone(request.op);
-    let request_gate = if alone {
-        None
-    } else {
-        Some(match (lease, limit) {
-            (Some(lease), limit) => bridge
-                .acquire_request_gate_for_lease_within(lease, limit)
-                .map_err(cancelled)?
-                .ok_or_else(|| busy_failure(request.op, limit.unwrap_or_default(), None))?,
-            (None, Some(limit)) => bridge
-                .acquire_request_gate_within(limit)
-                .ok_or_else(|| busy_failure(request.op, limit, None))?,
-            (None, None) => bridge.acquire_request_gate(),
-        })
-    };
-    let runtime_gate = match runtime_id.as_deref() {
-        Some(runtime_id) => Some(
-            bridge
-                .acquire_runtime_gate_within(
-                    runtime_id,
-                    operation_name(request.op),
-                    lease,
-                    alone.then_some(limit).flatten(),
-                )
+    let (runtime_gate, request_gate) = match runtime_id.as_deref() {
+        Some(runtime_id) if alone => {
+            let runtime = bridge
+                .acquire_runtime_gate_within(runtime_id, operation_name(request.op), lease, limit)
                 .map_err(cancelled)?
                 .ok_or_else(|| {
                     busy_failure(
@@ -4041,9 +4071,28 @@ fn edit_request_guard<'a>(
                         limit.unwrap_or_default(),
                         bridge.runtime_gate_holder(runtime_id),
                     )
-                })?,
-        ),
-        None => None,
+                })?;
+            (Some(runtime), None)
+        }
+        Some(runtime_id) => {
+            let (runtime, request) = bridge
+                .acquire_edit_gates(runtime_id, operation_name(request.op), lease)
+                .map_err(cancelled)?;
+            (Some(runtime), Some(request))
+        }
+        None => {
+            let request = match (lease, limit) {
+                (Some(lease), limit) => bridge
+                    .acquire_request_gate_for_lease_within(lease, limit)
+                    .map_err(cancelled)?
+                    .ok_or_else(|| busy_failure(request.op, limit.unwrap_or_default(), None))?,
+                (None, Some(limit)) => bridge
+                    .acquire_request_gate_within(limit)
+                    .ok_or_else(|| busy_failure(request.op, limit, None))?,
+                (None, None) => bridge.acquire_request_gate(),
+            };
+            (None, Some(request))
+        }
     };
     Ok(RequestGuard::Edit {
         _request: request_gate,
@@ -4297,6 +4346,7 @@ pub(crate) fn oversized_automation_request_response() -> automation::Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     #[test]
     fn resolved_instance_paths_come_inline_or_as_arrays() {
@@ -4580,6 +4630,476 @@ mod tests {
         assert_eq!(runtime_of(None), "client-a2");
         assert_eq!(runtime_of(Some("2")), "client-a2");
         assert_eq!(runtime_of(Some("1")), "client-a1");
+    }
+
+    const GATE_TEST_WAIT: Duration = Duration::from_secs(10);
+    const PLAY_START_ENDED: &str = "play start ended";
+
+    type Answer = std::sync::mpsc::Receiver<std::result::Result<Value, String>>;
+
+    /// Runs the calling test alone in a child process: its requests select
+    /// their contexts for the whole process, which every other test shares.
+    fn runs_in_its_own_process(test: &str) -> bool {
+        const MARK: &str = "RENIUM_TEST_PLAY_START_GATES";
+        if std::env::var_os(MARK).is_some() {
+            return true;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("automation::runtime::tests::{test}")])
+            .env(MARK, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        false
+    }
+
+    /// A fixture Studio window: it answers every plugin call, reports a test
+    /// as begun once it was asked to start one, and records each call as
+    /// (window, method, the window the request named).
+    fn fixture_window(
+        peer: std::net::TcpStream,
+        window: &'static str,
+        calls: Arc<Mutex<Vec<(String, String, String)>>>,
+        start_requested: std::sync::mpsc::Sender<()>,
+    ) {
+        use tungstenite::{Message, WebSocket};
+        std::thread::spawn(move || {
+            let mut peer =
+                WebSocket::from_raw_socket(peer, tungstenite::protocol::Role::Client, None);
+            let mut nonce = Value::Null;
+            while let Ok(message) = peer.read() {
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                let request: Value = serde_json::from_str(&text).unwrap();
+                let params = &request["params"];
+                calls.lock_recover().push((
+                    window.to_string(),
+                    request["method"].as_str().unwrap_or_default().to_string(),
+                    params["window"].as_str().unwrap_or(window).to_string(),
+                ));
+                if params["start"] == true {
+                    nonce = params["launchNonce"].clone();
+                    let _ = start_requested.send(());
+                }
+                let result = json!({
+                    "ok": true,
+                    "window": window,
+                    "running": false,
+                    "starting": false,
+                    "readyForStart": true,
+                    "executing": !nonce.is_null(),
+                    "engineStarted": !nonce.is_null(),
+                    "launchNonce": nonce,
+                });
+                let answer = json!({ "id": request["id"], "ok": true, "result": result });
+                if peer.send(Message::Text(answer.to_string().into())).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    /// Two fixture Edit windows, `gate-a` and `gate-b`, each with a bound
+    /// context of its own.
+    struct TwoStudios {
+        root: PathBuf,
+        bridge: Arc<BridgeServer>,
+        state: automation::State,
+        a: u64,
+        b: u64,
+        calls: Arc<Mutex<Vec<(String, String, String)>>>,
+        start_requested: Mutex<std::sync::mpsc::Receiver<()>>,
+        next_request: std::sync::atomic::AtomicU64,
+    }
+
+    impl TwoStudios {
+        fn open() -> Arc<Self> {
+            use crate::automation::authorization::signed_fixture_request;
+            use crate::studio::bridge::routing_tests::{connect, edit_info, fixture};
+            let root = crate::tests::support::temp_dir("play-start-gates");
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            std::fs::write(
+                root.join("renium.project.jsonc"),
+                r#"{"schemaVersion":1,"sourceRoot":"src","tree":{}}"#,
+            )
+            .unwrap();
+            let bridge = Arc::new(fixture());
+            let state = automation::State::default();
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let (start_request, start_requested) = std::sync::mpsc::channel();
+            let mut contexts = Vec::new();
+            for (window, place) in [("gate-a", 21), ("gate-b", 22)] {
+                fixture_window(
+                    connect(&bridge, 0, edit_info(window, place)),
+                    window,
+                    Arc::clone(&calls),
+                    start_request.clone(),
+                );
+                let bound = automation_parse_response_with_lease(
+                    &signed_fixture_request(
+                        &state,
+                        json!({
+                            "v": 1, "id": place, "op": op::BIND,
+                            "p": { "root": root, "place": format!("10:{place}") }
+                        }),
+                    ),
+                    &state,
+                    &bridge,
+                    0.1,
+                    None,
+                );
+                assert_eq!(bound.ok, 1, "{}", serde_json::to_string(&bound).unwrap());
+                contexts.push(bound.r.unwrap()["id"].as_u64().unwrap());
+            }
+            Arc::new(Self {
+                root,
+                bridge,
+                state,
+                a: contexts[0],
+                b: contexts[1],
+                calls,
+                start_requested: Mutex::new(start_requested),
+                next_request: std::sync::atomic::AtomicU64::new(100),
+            })
+        }
+
+        /// Begins a play start of `gate-a` and returns once the window was
+        /// asked to start the test: the start then waits, poll after poll,
+        /// for the test server to connect.
+        fn begin_play_start(self: &Arc<Self>) -> Answer {
+            let (done, ended) = std::sync::mpsc::channel();
+            let studios = Arc::clone(self);
+            std::thread::spawn(move || {
+                let _ = done.send(studios.play_start());
+            });
+            self.start_requested
+                .lock_recover()
+                .recv_timeout(GATE_TEST_WAIT)
+                .expect("gate-a was not asked to start a test");
+            ended
+        }
+
+        /// One start attempt of `gate-a` behind the gates, the selection and
+        /// the wait of a play-start request.
+        fn play_start(&self) -> std::result::Result<Value, String> {
+            let request: automation::Request = serde_json::from_value(json!({
+                "v": 1, "id": 90, "op": op::PLAY_START, "cx": self.a, "p": {}
+            }))
+            .unwrap();
+            let _gates = edit_request_guard(&request, &self.state, &self.bridge, 0.1, None)
+                .map_err(|failure| failure.0.m)?;
+            let context = resolve_connected_context(&self.state, &self.bridge, self.a, 0.1)
+                .map_err(|failure| failure.0.m)?;
+            let selection = select_bridge_context_for_request(&context, &self.bridge, false);
+            let wait = PlayStartWait::new(&context, &self.bridge, false, selection);
+            let launch = crate::studio::automation::TestLaunch {
+                nonce: "gate-launch".into(),
+                edit_runtime_id: "gate-a".into(),
+            };
+            let result = crate::studio::automation::start_fixture_launch(
+                &self.bridge,
+                &launch,
+                &|duration| wait.sleep(duration),
+            );
+            let selected = crate::app::context::automation_runtime();
+            let pinned = self
+                .bridge
+                .runtime_pin_for_selector(BridgeTarget::Edit, None)
+                .map(|pin| pin.runtime_id);
+            self.calls.lock_recover().push((
+                "gate-a".into(),
+                PLAY_START_ENDED.into(),
+                "gate-a".into(),
+            ));
+            if selected.as_deref() != Some("gate-a") || pinned.as_deref().ok() != Some("gate-a") {
+                return Err(format!(
+                    "after its waits the play start had selected {selected:?} and pinned {pinned:?}"
+                ));
+            }
+            result.map_err(|error| format!("{error:#}"))
+        }
+
+        /// Connects the test server of `gate-a`'s launch, which is what the
+        /// play start waits for.
+        fn connect_test_server(&self) {
+            use crate::studio::bridge::BRIDGE_ROLE_PLAY_SERVER;
+            use crate::studio::bridge::routing_tests::{connect, play_info};
+            let mut info = play_info("gate-a-server", "gate-a", BRIDGE_ROLE_PLAY_SERVER, "", 21);
+            info.launch_nonce = "gate-launch".into();
+            fixture_window(
+                connect(&self.bridge, 0, info),
+                "gate-a-server",
+                Arc::clone(&self.calls),
+                std::sync::mpsc::channel().0,
+            );
+        }
+
+        /// A gated Edit request of `context` that names the window it is for.
+        fn edit_request(
+            &self,
+            context: u64,
+            window: &'static str,
+        ) -> std::result::Result<Value, String> {
+            use crate::automation::authorization::signed_fixture_request;
+            let id = self
+                .next_request
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let response = automation_parse_response_with_lease(
+                &signed_fixture_request(
+                    &self.state,
+                    json!({
+                        "v": 1, "id": id, "op": op::MULTI_EDIT, "cx": context,
+                        "p": { "window": window }
+                    }),
+                ),
+                &self.state,
+                &self.bridge,
+                0.1,
+                None,
+            );
+            if response.ok == 1 {
+                Ok(response.r.unwrap_or_default())
+            } else {
+                Err(serde_json::to_string(&response).unwrap())
+            }
+        }
+
+        fn send_edit_request(self: &Arc<Self>, context: u64, window: &'static str) -> Answer {
+            let (done, answer) = std::sync::mpsc::channel();
+            let studios = Arc::clone(self);
+            std::thread::spawn(move || {
+                let _ = done.send(studios.edit_request(context, window));
+            });
+            answer
+        }
+
+        fn play_start_ended(&self) -> bool {
+            self.calls
+                .lock_recover()
+                .iter()
+                .any(|(_, method, _)| method == PLAY_START_ENDED)
+        }
+
+        /// Every request reached the window it named, and `gate-b` was never
+        /// asked about the test `gate-a` started.
+        fn assert_calls_stayed_in_their_studios(&self) {
+            for (window, method, named) in self.calls.lock_recover().iter() {
+                assert_eq!(window, named, "{method} reached another Studio's window");
+                assert!(
+                    window != "gate-b"
+                        || !matches!(method.as_str(), "startStopPlay" | "deviceSimulator"),
+                    "gate-b was asked {method}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn another_studios_edit_request_runs_while_a_play_start_waits() {
+        if !runs_in_its_own_process("another_studios_edit_request_runs_while_a_play_start_waits") {
+            return;
+        }
+        let studios = TwoStudios::open();
+        let play = studios.begin_play_start();
+        let answer = studios
+            .send_edit_request(studios.b, "gate-b")
+            .recv_timeout(GATE_TEST_WAIT)
+            .expect("gate-b's request waited for gate-a's play start")
+            .unwrap();
+        assert_eq!(answer["window"], "gate-b");
+        let deadline = Instant::now() + GATE_TEST_WAIT;
+        while studios
+            .bridge
+            .try_acquire_edit_gate(Some("gate-b"), "live-sync")
+            .is_none()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "gate-b's Live Sync never got its Edit gate during gate-a's play start"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            !studios.play_start_ended(),
+            "the play start ended before its test server connected"
+        );
+        studios.connect_test_server();
+        let started = play
+            .recv_timeout(GATE_TEST_WAIT)
+            .expect("the play start did not end")
+            .unwrap();
+        assert_eq!(started["editRuntimeId"], "gate-a");
+        studios.assert_calls_stayed_in_their_studios();
+        let _ = std::fs::remove_dir_all(&studios.root);
+    }
+
+    #[test]
+    fn an_edit_request_of_the_same_studio_waits_for_its_play_start_to_end() {
+        if !runs_in_its_own_process(
+            "an_edit_request_of_the_same_studio_waits_for_its_play_start_to_end",
+        ) {
+            return;
+        }
+        let studios = TwoStudios::open();
+        let play = studios.begin_play_start();
+        let queued = studios.send_edit_request(studios.a, "gate-a");
+        assert!(
+            queued.recv_timeout(Duration::from_millis(600)).is_err(),
+            "gate-a's request ran during gate-a's play start"
+        );
+        assert!(
+            studios
+                .bridge
+                .try_acquire_edit_gate(Some("gate-a"), "live-sync")
+                .is_none(),
+            "gate-a's Live Sync got its Edit gate during gate-a's play start"
+        );
+        studios.connect_test_server();
+        play.recv_timeout(GATE_TEST_WAIT)
+            .expect("the play start did not end")
+            .unwrap();
+        let answer = queued
+            .recv_timeout(GATE_TEST_WAIT)
+            .expect("gate-a's request stayed queued after the play start ended")
+            .unwrap();
+        assert_eq!(answer["window"], "gate-a");
+        let calls = studios.calls.lock_recover().clone();
+        let position = |wanted: &str| {
+            calls
+                .iter()
+                .position(|(_, method, _)| method == wanted)
+                .unwrap_or_else(|| panic!("no {wanted} in {calls:?}"))
+        };
+        assert!(
+            position(PLAY_START_ENDED) < position("multiEdit"),
+            "{calls:?}"
+        );
+        studios.assert_calls_stayed_in_their_studios();
+        let _ = std::fs::remove_dir_all(&studios.root);
+    }
+
+    #[test]
+    fn a_play_start_its_queued_request_and_another_studio_never_deadlock() {
+        if !runs_in_its_own_process(
+            "a_play_start_its_queued_request_and_another_studio_never_deadlock",
+        ) {
+            return;
+        }
+        let studios = TwoStudios::open();
+        let play = studios.begin_play_start();
+        let queued = [
+            studios.send_edit_request(studios.a, "gate-a"),
+            studios.send_edit_request(studios.a, "gate-a"),
+        ];
+        let (done, answers) = std::sync::mpsc::channel();
+        for _ in 0..2 {
+            let studios = Arc::clone(&studios);
+            let done = done.clone();
+            std::thread::spawn(move || {
+                for _ in 0..20 {
+                    let _ = done.send(studios.edit_request(studios.b, "gate-b"));
+                }
+            });
+        }
+        let live_sync = {
+            let studios = Arc::clone(&studios);
+            std::thread::spawn(move || {
+                while !studios.play_start_ended() {
+                    let taken = studios
+                        .bridge
+                        .try_acquire_edit_gate(Some("gate-a"), "live-sync");
+                    assert!(
+                        taken.is_none() || studios.play_start_ended(),
+                        "gate-a's Live Sync got its Edit gate during gate-a's play start"
+                    );
+                    drop(taken);
+                    drop(
+                        studios
+                            .bridge
+                            .try_acquire_edit_gate(Some("gate-b"), "live-sync"),
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            })
+        };
+        let mut answered = 0;
+        let mut next_answer = |waiting_for: &str| {
+            let answer = answers
+                .recv_timeout(GATE_TEST_WAIT)
+                .unwrap_or_else(|_| panic!("gate-b's requests stopped {waiting_for}"))
+                .unwrap();
+            assert_eq!(answer["window"], "gate-b");
+            answered += 1;
+        };
+        for _ in 0..5 {
+            next_answer("during gate-a's play start");
+        }
+        studios.connect_test_server();
+        play.recv_timeout(GATE_TEST_WAIT)
+            .expect("the play start did not end")
+            .unwrap();
+        for answer in queued {
+            let answer = answer
+                .recv_timeout(GATE_TEST_WAIT)
+                .expect("gate-a's queued request never ran")
+                .unwrap();
+            assert_eq!(answer["window"], "gate-a");
+        }
+        for _ in 5..40 {
+            next_answer("after gate-a's play start");
+        }
+        assert_eq!(answered, 40);
+        live_sync.join().unwrap();
+        studios.assert_calls_stayed_in_their_studios();
+        assert_eq!(
+            crate::app::context::automation_runtime(),
+            None,
+            "a request left its selection behind"
+        );
+        let _ = std::fs::remove_dir_all(&studios.root);
+    }
+
+    #[test]
+    fn a_lease_is_cancelled_in_the_studio_that_works_under_it() {
+        if !runs_in_its_own_process("a_lease_is_cancelled_in_the_studio_that_works_under_it") {
+            return;
+        }
+        let studios = TwoStudios::open();
+        let lease = Arc::new(BridgeRequestLease::new("lease-of-gate-a".into()));
+        {
+            let _active = studios
+                .bridge
+                .activate_request_lease(Arc::clone(&lease))
+                .unwrap();
+            studios
+                .bridge
+                .call_for_selector_runtime_with_timeout(
+                    "applyEditorTransaction",
+                    json!({ "window": "gate-a" }),
+                    BridgeTarget::Edit,
+                    None,
+                    Some("gate-a"),
+                    None,
+                )
+                .unwrap();
+        }
+        studios.bridge.clear_runtime_pins();
+        studios.bridge.pin_runtime(BridgeTarget::Edit, "gate-b");
+        studios.bridge.cancel_request_lease(&lease).unwrap();
+        let cancelled_in = studios
+            .calls
+            .lock_recover()
+            .iter()
+            .filter(|(_, method, _)| method == "cancelRequestLease")
+            .map(|(window, _, _)| window.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cancelled_in,
+            ["gate-a"],
+            "the shared pin named gate-b when the lease was cancelled"
+        );
+        let _ = std::fs::remove_dir_all(&studios.root);
     }
 
     #[test]

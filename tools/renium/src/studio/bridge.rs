@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -676,8 +676,12 @@ pub(crate) struct BridgeServer {
     pub(crate) next_id: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) preferred_index: std::sync::atomic::AtomicUsize,
 
-    pub(crate) request_gate: Mutex<()>,
+    request_gate: RequestGate,
     runtime_gates: Mutex<HashMap<String, GateHolder>>,
+    /// Edit runtimes whose gate only the claiming thread may take: a request
+    /// that needs both gates and lost a free process-wide gate to its own
+    /// Studio's brief requests (`acquire_edit_gates`).
+    runtime_claims: Mutex<HashMap<String, thread::ThreadId>>,
     active_request_leases: Mutex<HashMap<thread::ThreadId, Arc<BridgeRequestLease>>>,
 
     pub(crate) runtime_pins: Mutex<HashMap<RuntimePinKey, RuntimePin>>,
@@ -692,6 +696,9 @@ pub(crate) struct BridgeServer {
 pub(crate) struct BridgeRequestLease {
     id: String,
     state: AtomicU8,
+    /// The Edit runtime that last took a call under this lease: where the
+    /// lease's cancellation goes, whatever the shared pins say by then.
+    edit_runtime: Mutex<Option<String>>,
 }
 
 /// The request holding one runtime's gate, for the busy answer and `rbx status`.
@@ -716,10 +723,104 @@ impl Drop for RuntimeGateGuard<'_> {
     }
 }
 
-/// The Edit gate of one request: the process-wide request gate, then the
-/// gate of the Edit runtime the request is bound to, when it has one.
+/// Keeps one Edit runtime's gate for the claiming thread until dropped: no
+/// other request takes that gate meanwhile, and the one that holds it
+/// finishes.
+struct RuntimeClaim<'a> {
+    bridge: &'a BridgeServer,
+    runtime_id: String,
+}
+
+impl Drop for RuntimeClaim<'_> {
+    fn drop(&mut self) {
+        self.bridge
+            .runtime_claims
+            .lock_recover()
+            .remove(&self.runtime_id);
+    }
+}
+
+/// The process-wide request gate: one thread holds it at a time. The holder
+/// may hand it back for a wait inside its request and take it again
+/// (`BridgeServer::sleep_outside_request_gate`).
+#[derive(Default)]
+struct RequestGate {
+    holder: Mutex<Option<thread::ThreadId>>,
+    freed: Condvar,
+}
+
+impl RequestGate {
+    fn lock(&self) -> RequestGateGuard<'_> {
+        self.hold();
+        self.guard()
+    }
+
+    fn try_lock(&self) -> Option<RequestGateGuard<'_>> {
+        let mut holder = self.holder.lock_recover();
+        if holder.is_some() {
+            return None;
+        }
+        *holder = Some(thread::current().id());
+        Some(self.guard())
+    }
+
+    fn guard(&self) -> RequestGateGuard<'_> {
+        RequestGateGuard {
+            gate: self,
+            _thread: std::marker::PhantomData,
+        }
+    }
+
+    fn held_by_this_thread(&self) -> bool {
+        *self.holder.lock_recover() == Some(thread::current().id())
+    }
+
+    fn is_free(&self) -> bool {
+        self.holder.lock_recover().is_none()
+    }
+
+    /// Makes the calling thread the holder once the gate is free.
+    fn hold(&self) {
+        let mut holder = self.holder.lock_recover();
+        while holder.is_some() {
+            holder = self
+                .freed
+                .wait(holder)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        *holder = Some(thread::current().id());
+    }
+
+    /// Frees the gate when the calling thread holds it; answers whether it did.
+    fn release(&self) -> bool {
+        let mut holder = self.holder.lock_recover();
+        if *holder != Some(thread::current().id()) {
+            return false;
+        }
+        *holder = None;
+        drop(holder);
+        self.freed.notify_one();
+        true
+    }
+}
+
+/// Holds the process-wide request gate until dropped, on the thread that took
+/// it.
+pub(crate) struct RequestGateGuard<'a> {
+    gate: &'a RequestGate,
+    _thread: std::marker::PhantomData<MutexGuard<'a, ()>>,
+}
+
+impl Drop for RequestGateGuard<'_> {
+    fn drop(&mut self) {
+        self.gate.release();
+    }
+}
+
+/// The Edit gate of one request: the gate of the Edit runtime the request is
+/// bound to, when it has one, then the process-wide request gate.
 pub(crate) struct EditGateGuard<'a> {
-    _request: MutexGuard<'a, ()>,
+    _request: RequestGateGuard<'a>,
     _runtime: Option<RuntimeGateGuard<'a>>,
 }
 
@@ -799,11 +900,23 @@ impl BridgeRequestLease {
         Self {
             id,
             state: AtomicU8::new(REQUEST_LEASE_PENDING),
+            edit_runtime: Mutex::new(None),
         }
     }
 
     pub(crate) fn id(&self) -> &str {
         &self.id
+    }
+
+    fn sent_to_edit_runtime(&self, runtime_id: &str) {
+        let mut bound = self.edit_runtime.lock_recover();
+        if bound.as_deref() != Some(runtime_id) {
+            *bound = Some(runtime_id.to_string());
+        }
+    }
+
+    fn edit_runtime(&self) -> Option<String> {
+        self.edit_runtime.lock_recover().clone()
     }
 
     pub(crate) fn cancel(&self) -> bool {
@@ -987,17 +1100,15 @@ fn normalize_bridge_role(role: &str) -> &'static str {
 }
 
 impl BridgeServer {
-    pub(crate) fn acquire_request_gate(&self) -> MutexGuard<'_, ()> {
-        self.request_gate
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    pub(crate) fn acquire_request_gate(&self) -> RequestGateGuard<'_> {
+        self.request_gate.lock()
     }
 
     /// The request gate, or None when another request keeps it past `limit`.
     pub(crate) fn acquire_request_gate_within(
         &self,
         limit: Duration,
-    ) -> Option<MutexGuard<'_, ()>> {
+    ) -> Option<RequestGateGuard<'_>> {
         let deadline = Instant::now() + limit;
         loop {
             if let Some(guard) = self.try_acquire_request_gate() {
@@ -1012,12 +1123,8 @@ impl BridgeServer {
 
     // Live Sync's loop thread must never block on the gate: a request holding
     // it may be waiting for that thread to refresh the watcher state.
-    pub(crate) fn try_acquire_request_gate(&self) -> Option<MutexGuard<'_, ()>> {
-        match self.request_gate.try_lock() {
-            Ok(guard) => Some(guard),
-            Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
-            Err(TryLockError::WouldBlock) => None,
-        }
+    pub(crate) fn try_acquire_request_gate(&self) -> Option<RequestGateGuard<'_>> {
+        self.request_gate.try_lock()
     }
 
     /// The request gate for a leased request, or Ok(None) when another
@@ -1027,20 +1134,37 @@ impl BridgeServer {
         &self,
         lease: &BridgeRequestLease,
         limit: Option<Duration>,
-    ) -> Result<Option<MutexGuard<'_, ()>>> {
+    ) -> Result<Option<RequestGateGuard<'_>>> {
         let deadline = limit.map(|limit| Instant::now() + limit);
         loop {
             lease.ensure_active()?;
-            match self.request_gate.try_lock() {
-                Ok(guard) => return Ok(Some(guard)),
-                Err(TryLockError::Poisoned(poisoned)) => return Ok(Some(poisoned.into_inner())),
-                Err(TryLockError::WouldBlock) => {
-                    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                        return Ok(None);
-                    }
-                    thread::sleep(Duration::from_millis(2));
-                }
+            if let Some(guard) = self.try_acquire_request_gate() {
+                return Ok(Some(guard));
             }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Ok(None);
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Whether the calling thread's request holds the process-wide request
+    /// gate.
+    pub(crate) fn holds_request_gate(&self) -> bool {
+        self.request_gate.held_by_this_thread()
+    }
+
+    /// Sleeps for `duration` with the process-wide request gate handed back
+    /// when the calling thread holds it, and holds it again on return. Every
+    /// runtime gate the thread holds stays held. Requests of other Studios
+    /// run meanwhile: they select their own context and clear and re-pin the
+    /// shared runtime pins, so the caller selects its context again before
+    /// its next bridge call that does not name its runtime.
+    pub(crate) fn sleep_outside_request_gate(&self, duration: Duration) {
+        let released = self.request_gate.release();
+        thread::sleep(duration);
+        if released {
+            self.request_gate.hold();
         }
     }
 
@@ -1289,6 +1413,14 @@ impl BridgeServer {
         runtime_id: &str,
         operation: &'static str,
     ) -> Option<RuntimeGateGuard<'_>> {
+        if self
+            .runtime_claims
+            .lock_recover()
+            .get(runtime_id)
+            .is_some_and(|claimant| *claimant != thread::current().id())
+        {
+            return None;
+        }
         let mut busy = self.runtime_gates.lock_recover();
         if busy.contains_key(runtime_id) {
             return None;
@@ -1328,21 +1460,77 @@ impl BridgeServer {
         holders
     }
 
-    /// The Edit gate of a request that holds the process-wide request gate:
-    /// that gate, then the bound Edit runtime's own, in that order everywhere.
+    /// Both gates of an Edit request: its Edit runtime's own, then the
+    /// process-wide one, in that order everywhere. While the process-wide
+    /// gate is busy the runtime's gate is handed back between tries, so a
+    /// request queued behind another Studio's work holds nothing: its own
+    /// Studio's brief requests keep running, and no other Studio waits for it.
+    ///
+    /// Those brief requests cannot keep it out for good. Once the request
+    /// finds the process-wide gate free while its own runtime's gate is taken,
+    /// it claims the runtime: the request that holds the gate finishes, no
+    /// later one starts, and the request takes both gates the next time the
+    /// process-wide gate is free.
+    pub(crate) fn acquire_edit_gates(
+        &self,
+        runtime_id: &str,
+        operation: &'static str,
+        lease: Option<&BridgeRequestLease>,
+    ) -> Result<(RuntimeGateGuard<'_>, RequestGateGuard<'_>)> {
+        let mut claim = None;
+        loop {
+            if let Some(lease) = lease {
+                lease.ensure_active()?;
+            }
+            match self.try_acquire_runtime_gate(runtime_id, operation) {
+                Some(runtime) => {
+                    if let Some(request) = self.try_acquire_request_gate() {
+                        return Ok((runtime, request));
+                    }
+                }
+                None if claim.is_none() && self.request_gate.is_free() => {
+                    claim = self.claim_runtime(runtime_id);
+                }
+                None => {}
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Claims `runtime_id`'s gate for the calling thread, or None while
+    /// another thread's claim stands.
+    fn claim_runtime(&self, runtime_id: &str) -> Option<RuntimeClaim<'_>> {
+        let mut claims = self.runtime_claims.lock_recover();
+        if claims.contains_key(runtime_id) {
+            return None;
+        }
+        claims.insert(runtime_id.to_string(), thread::current().id());
+        Some(RuntimeClaim {
+            bridge: self,
+            runtime_id: runtime_id.to_string(),
+        })
+    }
+
+    /// The Edit gate of a request that holds the process-wide request gate
+    /// (`acquire_edit_gates`), or that gate alone for a request bound to no
+    /// Edit runtime.
     pub(crate) fn acquire_edit_gate(
         &self,
         runtime_id: Option<&str>,
         operation: &'static str,
     ) -> EditGateGuard<'_> {
-        let request = self.acquire_request_gate();
-        let runtime = runtime_id.map(|runtime_id| {
-            self.acquire_runtime_gate(runtime_id, operation, None)
-                .expect("a gate wait without a lease is never cancelled")
-        });
+        let Some(runtime_id) = runtime_id else {
+            return EditGateGuard {
+                _request: self.acquire_request_gate(),
+                _runtime: None,
+            };
+        };
+        let (runtime, request) = self
+            .acquire_edit_gates(runtime_id, operation, None)
+            .expect("a gate wait without a lease is never cancelled");
         EditGateGuard {
             _request: request,
-            _runtime: runtime,
+            _runtime: Some(runtime),
         }
     }
 
@@ -1353,13 +1541,12 @@ impl BridgeServer {
         runtime_id: Option<&str>,
         operation: &'static str,
     ) -> Option<EditGateGuard<'_>> {
-        let request = self.try_acquire_request_gate()?;
         let runtime = match runtime_id {
             Some(runtime_id) => Some(self.try_acquire_runtime_gate(runtime_id, operation)?),
             None => None,
         };
         Some(EditGateGuard {
-            _request: request,
+            _request: self.try_acquire_request_gate()?,
             _runtime: runtime,
         })
     }
@@ -1612,8 +1799,9 @@ impl BridgeServer {
             alive,
             next_id,
             preferred_index: std::sync::atomic::AtomicUsize::new(0),
-            request_gate: Mutex::new(()),
+            request_gate: RequestGate::default(),
             runtime_gates: Mutex::new(HashMap::new()),
+            runtime_claims: Mutex::new(HashMap::new()),
             active_request_leases: Mutex::new(HashMap::new()),
             runtime_pins: Mutex::new(HashMap::new()),
             #[cfg(any(windows, target_os = "macos"))]
@@ -3257,6 +3445,12 @@ impl BridgeServer {
                     context.method
                 );
             }
+            if context.lease_id.is_some()
+                && role == BRIDGE_ROLE_EDIT
+                && let Some(lease) = self.active_request_lease()
+            {
+                lease.sent_to_edit_runtime(&socket.bridge_info.runtime_id);
+            }
             socket.active_request_lease = context.request_lease.clone();
             socket.cancel_request_id = context.cancel_request_id;
             let attempt_timeout = remaining_timeout.map(|remaining| {
@@ -3353,10 +3547,19 @@ impl BridgeServer {
         self.call_for_target(method, params, default_method_target(method))
     }
 
-    pub(crate) fn cancel_request_lease(&self, lease_id: &str) -> Result<Value> {
-        let runtime_pin = self.runtime_pin_for_selector(BridgeTarget::Edit, None)?;
+    /// Tells the Edit window that works under `lease` to cancel it: the
+    /// window that last took a call under the lease, or the selected one
+    /// when none did.
+    pub(crate) fn cancel_request_lease(&self, lease: &BridgeRequestLease) -> Result<Value> {
+        let runtime_pin = match lease.edit_runtime() {
+            Some(runtime_id) => RuntimePin {
+                runtime_id,
+                exact: true,
+            },
+            None => self.runtime_pin_for_selector(BridgeTarget::Edit, None)?,
+        };
         let (id, start) = self.next_call()?;
-        let params = json!({ "leaseId": lease_id });
+        let params = json!({ "leaseId": lease.id() });
         let call_context = BridgeCallContext {
             id,
             method: "cancelRequestLease",

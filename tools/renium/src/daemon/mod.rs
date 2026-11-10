@@ -433,7 +433,7 @@ fn handle_daemon_control_connection(
     let stream = crate::system::net::SharedTcpStream::from(stream);
     let monitor_bridge = Arc::clone(bridge);
     let reader = control_reader::ControlReader::start(stream.clone(), move |lease| {
-        let _ = monitor_bridge.cancel_request_lease(lease.id());
+        let _ = monitor_bridge.cancel_request_lease(lease);
     })?;
     let notice_stream = stream.clone();
     let mut writer = BufWriter::new(stream);

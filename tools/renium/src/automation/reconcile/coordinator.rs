@@ -377,10 +377,11 @@ impl Coordinator {
         Ok(false)
     }
 
-    // Lock order everywhere: the bridge request gate first (the process-wide
-    // gate, then this Edit runtime's), then the Live Sync activity, then the
-    // pair lock. A request holding the gate may wait for the sync activity to
-    // clear, so a sync must never hold the activity while it waits for the gate.
+    // Lock order everywhere: the bridge request gate first (this Edit
+    // runtime's gate, then the process-wide one), then the Live Sync activity,
+    // then the pair lock. A request holding the gate may wait for the sync
+    // activity to clear, so a sync must never hold the activity while it waits
+    // for the gate.
     pub(crate) fn reconcile_with_gate_held(
         &self,
         context: &BoundContext,

@@ -17,8 +17,9 @@ pub(crate) fn fixture() -> BridgeServer {
         alive: Arc::new(AtomicBool::new(true)),
         next_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         preferred_index: Default::default(),
-        request_gate: Mutex::new(()),
+        request_gate: Default::default(),
         runtime_gates: Mutex::new(HashMap::new()),
+        runtime_claims: Mutex::new(HashMap::new()),
         active_request_leases: Mutex::new(HashMap::new()),
         runtime_pins: Mutex::new(HashMap::new()),
         routing: Default::default(),
@@ -918,4 +919,54 @@ fn launch_filter_preserves_other_places_manual_play_and_reordered_observations()
     bridge.retire_runtime(&manual.runtime_id);
     assert!(!bridge.runtime_is_routable(&manual));
     assert!(bridge.runtime_is_routable(&current));
+}
+
+#[test]
+fn a_request_for_both_gates_is_not_kept_out_by_its_studios_brief_requests() {
+    let bridge = Arc::new(fixture());
+    let stop = Arc::new(AtomicBool::new(false));
+    let brief_requests = {
+        let (bridge, stop) = (Arc::clone(&bridge), Arc::clone(&stop));
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                match bridge.try_acquire_runtime_gate("fair-a", "luau") {
+                    Some(_gate) => thread::sleep(Duration::from_millis(40)),
+                    None => thread::sleep(Duration::from_millis(1)),
+                }
+            }
+        })
+    };
+    let another_studio = {
+        let (bridge, stop) = (Arc::clone(&bridge), Arc::clone(&stop));
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let gate = bridge.acquire_request_gate();
+                thread::sleep(Duration::from_millis(40));
+                drop(gate);
+                thread::sleep(Duration::from_millis(40));
+            }
+        })
+    };
+    thread::sleep(Duration::from_millis(60));
+    let (entered, waited) = std::sync::mpsc::channel();
+    let queued = {
+        let bridge = Arc::clone(&bridge);
+        thread::spawn(move || {
+            let started = Instant::now();
+            let gates = bridge.acquire_edit_gates("fair-a", "push", None).unwrap();
+            let _ = entered.send(started.elapsed());
+            drop(gates);
+        })
+    };
+    let waited = waited.recv_timeout(Duration::from_secs(5));
+    stop.store(true, Ordering::Relaxed);
+    brief_requests.join().unwrap();
+    another_studio.join().unwrap();
+    let waited = waited.expect("the queued request never got both gates");
+    queued.join().unwrap();
+    assert!(waited < Duration::from_secs(1), "waited {waited:?}");
+    assert!(
+        bridge.try_acquire_runtime_gate("fair-a", "luau").is_some(),
+        "the claim outlived the request"
+    );
 }

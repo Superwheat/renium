@@ -1827,9 +1827,17 @@ fn validate_play_args(args: &StartStopPlayArgs) -> Result<()> {
     Ok(())
 }
 
+/// How a play start waits for Studio between two polls. The daemon's wait
+/// hands the process-wide request gate back for the duration and selects the
+/// request's context again before it returns, so requests of other Studios
+/// run meanwhile and re-pin the shared runtime pins. Every bridge call after
+/// a wait therefore names its runtime, or runs on that fresh selection.
+pub(crate) type PollWait<'a> = &'a dyn Fn(Duration);
+
 pub(crate) fn start_stop_play_result(
     args: StartStopPlayArgs,
     bridge: &BridgeServer,
+    wait: PollWait<'_>,
 ) -> Result<Value> {
     validate_play_args(&args)?;
     let mode = args.mode.as_deref().unwrap_or("play");
@@ -1837,7 +1845,7 @@ pub(crate) fn start_stop_play_result(
         return stop_studio_play_with_bridge_result(bridge);
     }
     if args.restart {
-        return restart_play_result(args, bridge);
+        return restart_play_result(args, bridge, wait);
     }
     if let Some(count) = args.add_players {
         return add_test_players_result(bridge, count, args.bridge.wait_seconds);
@@ -1851,8 +1859,8 @@ pub(crate) fn start_stop_play_result(
             None if matches!(mode, "run" | "server") => PlayLaunchPlan::Run,
             None => PlayLaunchPlan::Play,
         };
-        let mut result = start_play_with_retries(bridge, plan)?;
-        result["serverReady"] = json!(server_answers_luau(bridge));
+        let mut result = start_play_with_retries(bridge, plan, wait)?;
+        result["serverReady"] = json!(server_answers_luau(bridge, wait));
         return Ok(result);
     }
     let result = bridge.call_for_target("startStopPlay", json!({}), BridgeTarget::Edit)?;
@@ -2093,7 +2101,7 @@ fn wait_for_channel_to_close(bridge: &BridgeServer, runtime_id: &str) -> bool {
 
 // A freshly launched server bridge connects before its scripts can run; the
 // first Luau call would otherwise be the one that discovers that.
-fn server_answers_luau(bridge: &BridgeServer) -> bool {
+fn server_answers_luau(bridge: &BridgeServer, wait: PollWait<'_>) -> bool {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let ready = call_execute_luau(
@@ -2112,20 +2120,22 @@ fn server_answers_luau(bridge: &BridgeServer) -> bool {
         if Instant::now() >= deadline {
             return false;
         }
-        thread::sleep(Duration::from_millis(500));
+        wait(Duration::from_millis(500));
     }
 }
 
-fn new_play_launch(bridge: &BridgeServer, label: &str) -> Result<TestLaunch> {
-    let edit_pin = bridge.runtime_pin_for_selector(BridgeTarget::Edit, None)?;
-    let edit_runtime_id = edit_pin.runtime_id;
+fn new_play_launch(
+    bridge: &BridgeServer,
+    label: &str,
+    edit_runtime_id: &str,
+) -> Result<TestLaunch> {
     #[cfg(windows)]
     crate::project::workflows::windows_launch::protect_process(
-        bridge.studio_pid_for_runtime(BridgeTarget::Edit, &edit_runtime_id)?,
+        bridge.studio_pid_for_runtime(BridgeTarget::Edit, edit_runtime_id)?,
     )?;
     #[cfg(target_os = "macos")]
     crate::studio::native::serializer::protect_studio_launch(
-        bridge.studio_pid_for_runtime(BridgeTarget::Edit, &edit_runtime_id)?,
+        bridge.studio_pid_for_runtime(BridgeTarget::Edit, edit_runtime_id)?,
     )?;
     let sequence = bridge
         .next_id
@@ -2136,11 +2146,11 @@ fn new_play_launch(bridge: &BridgeServer, label: &str) -> Result<TestLaunch> {
             std::process::id(),
             current_millis()
         ),
-        edit_runtime_id,
+        edit_runtime_id: edit_runtime_id.to_string(),
     })
 }
 
-fn cancel_test_launch_best_effort(bridge: &BridgeServer, launch: &TestLaunch) {
+fn cancel_test_launch_best_effort(bridge: &BridgeServer, launch: &TestLaunch, wait: PollWait<'_>) {
     request_play_runtimes_to_stop(
         bridge,
         &launch.edit_runtime_id,
@@ -2158,7 +2168,12 @@ fn cancel_test_launch_best_effort(bridge: &BridgeServer, launch: &TestLaunch) {
         &launch.edit_runtime_id,
         Some(Duration::from_secs(2)),
     );
-    close_leftover_test_processes(bridge, &launch.edit_runtime_id, Duration::from_secs(15));
+    close_leftover_test_processes(
+        bridge,
+        &launch.edit_runtime_id,
+        Duration::from_secs(15),
+        wait,
+    );
 }
 
 fn multiplayer_start_deadline(started: Instant, last_progress: Instant) -> Instant {
@@ -2185,6 +2200,7 @@ fn close_leftover_test_processes(
     bridge: &BridgeServer,
     edit_runtime_id: &str,
     grace: Duration,
+    wait: PollWait<'_>,
 ) -> Vec<u32> {
     let Ok(edit_pid) = bridge.studio_pid_for_runtime(BridgeTarget::Edit, edit_runtime_id) else {
         return Vec::new();
@@ -2192,7 +2208,7 @@ fn close_leftover_test_processes(
     let deadline = Instant::now() + grace;
     let mut leftover = leftover_test_processes(edit_pid);
     while !leftover.is_empty() && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(250));
+        wait(Duration::from_millis(250));
         leftover = leftover_test_processes(edit_pid);
     }
     let mut closed = Vec::new();
@@ -2454,7 +2470,14 @@ fn remembered_launch(edit_runtime_id: &str) -> Option<PlayLaunchPlan> {
     LAUNCHED_PLANS.lock_recover().get(edit_runtime_id).copied()
 }
 
-fn start_play_with_retries(bridge: &BridgeServer, plan: PlayLaunchPlan) -> Result<Value> {
+/// Starts a test in the Edit window the request selected. That window is
+/// resolved once, before the first wait; everything after it addresses the
+/// window by that runtime id.
+fn start_play_with_retries(
+    bridge: &BridgeServer,
+    plan: PlayLaunchPlan,
+    wait: PollWait<'_>,
+) -> Result<Value> {
     if plan
         .players()
         .is_some_and(|players| !(1..=8).contains(&players))
@@ -2473,10 +2496,11 @@ fn start_play_with_retries(bridge: &BridgeServer, plan: PlayLaunchPlan) -> Resul
     {
         attempts += 1;
         if attempts > 1 {
-            thread::sleep(Duration::from_secs(u64::from(attempts - 1)));
+            wait(Duration::from_secs(u64::from(attempts - 1)));
         }
-        let outcome =
-            start_attempt(bridge, plan).map_err(|error| with_orphan_hint(bridge, error))?;
+        let outcome = new_play_launch(bridge, plan.label(), &edit_runtime_id)
+            .and_then(|launch| start_attempt(bridge, &launch, plan, wait))
+            .map_err(|error| with_orphan_hint(bridge, error))?;
         let mut result = match outcome {
             AttemptOutcome::AlreadyRunning(existing) => existing,
             AttemptOutcome::Started {
@@ -2533,14 +2557,20 @@ fn with_orphan_hint(bridge: &BridgeServer, error: anyhow::Error) -> anyhow::Erro
     )
 }
 
-fn start_attempt(bridge: &BridgeServer, plan: PlayLaunchPlan) -> Result<AttemptOutcome> {
-    let launch = new_play_launch(bridge, plan.label())?;
+/// One start of `launch` in its Edit window, addressed by the launch's
+/// runtime id throughout.
+fn start_attempt(
+    bridge: &BridgeServer,
+    launch: &TestLaunch,
+    plan: PlayLaunchPlan,
+    wait: PollWait<'_>,
+) -> Result<AttemptOutcome> {
     // Device status decorates the result; a stalled device service must not
     // stop Play from starting.
-    let mut device_simulation = studio_device_status(bridge)
+    let mut device_simulation = studio_device_status(bridge, Some(&launch.edit_runtime_id))
         .unwrap_or_else(|error| json!({ "error": format!("{error:#}") }));
     let waited = Instant::now();
-    let mut existing = wait_for_studio_play_ready(bridge, &launch.edit_runtime_id)?;
+    let mut existing = wait_for_studio_play_ready(bridge, &launch.edit_runtime_id, wait)?;
     if play_status_is_running(&existing) {
         if plan.players().is_some() {
             bail!("A Studio play session is already active in the selected window");
@@ -2548,10 +2578,11 @@ fn start_attempt(bridge: &BridgeServer, plan: PlayLaunchPlan) -> Result<AttemptO
         existing["deviceSimulation"] = device_simulation;
         return Ok(AttemptOutcome::AlreadyRunning(existing));
     }
-    let closed = close_leftover_test_processes(bridge, &launch.edit_runtime_id, LEFTOVER_GRACE);
+    let closed =
+        close_leftover_test_processes(bridge, &launch.edit_runtime_id, LEFTOVER_GRACE, wait);
     let waited_ms = waited.elapsed().as_millis();
     let requested = Instant::now();
-    match launch_play_session(bridge, &launch, plan) {
+    match launch_play_session(bridge, launch, plan, wait) {
         Ok(LaunchOutcome::Started(mut result)) => {
             remember_launch(&launch.edit_runtime_id, plan);
             device_simulation["playRunning"] = Value::Bool(true);
@@ -2565,13 +2596,28 @@ fn start_attempt(bridge: &BridgeServer, plan: PlayLaunchPlan) -> Result<AttemptO
             Ok(AttemptOutcome::Started { result, requested })
         }
         Ok(LaunchOutcome::Ignored(reason)) => {
-            cancel_test_launch_best_effort(bridge, &launch);
+            cancel_test_launch_best_effort(bridge, launch, wait);
             Ok(AttemptOutcome::Ignored { reason, requested })
         }
         Err(error) => {
-            cancel_test_launch_best_effort(bridge, &launch);
+            cancel_test_launch_best_effort(bridge, launch, wait);
             Err(error)
         }
+    }
+}
+
+/// One run-mode start attempt against fixture bridges, which have no Studio
+/// process whose launch could be protected.
+#[cfg(test)]
+pub(crate) fn start_fixture_launch(
+    bridge: &BridgeServer,
+    launch: &TestLaunch,
+    wait: PollWait<'_>,
+) -> Result<Value> {
+    match start_attempt(bridge, launch, PlayLaunchPlan::Run, wait)? {
+        AttemptOutcome::Started { result, .. } => Ok(result),
+        AttemptOutcome::AlreadyRunning(status) => bail!("a session already runs: {status}"),
+        AttemptOutcome::Ignored { reason, .. } => bail!("{reason}"),
     }
 }
 
@@ -2702,6 +2748,7 @@ fn launch_play_session(
     bridge: &BridgeServer,
     launch: &TestLaunch,
     plan: PlayLaunchPlan,
+    wait: PollWait<'_>,
 ) -> Result<LaunchOutcome> {
     let mut watch = LaunchWatch::new(bridge, launch);
     let start_result = bridge.call_for_runtime_with_timeout(
@@ -2776,7 +2823,7 @@ fn launch_play_session(
                 &clients,
             ));
         }
-        thread::sleep(Duration::from_millis(250));
+        wait(Duration::from_millis(250));
     }
 }
 
@@ -2837,7 +2884,11 @@ fn restart_plan(
     }
 }
 
-fn restart_play_result(args: StartStopPlayArgs, bridge: &BridgeServer) -> Result<Value> {
+fn restart_play_result(
+    args: StartStopPlayArgs,
+    bridge: &BridgeServer,
+    wait: PollWait<'_>,
+) -> Result<Value> {
     let edit_runtime_id = bridge
         .runtime_pin_for_selector(BridgeTarget::Edit, None)?
         .runtime_id;
@@ -2856,8 +2907,8 @@ fn restart_play_result(args: StartStopPlayArgs, bridge: &BridgeServer) -> Result
             .get("ok")
             .and_then(Value::as_bool)
             == Some(true);
-    let mut result = start_play_with_retries(bridge, plan)?;
-    result["serverReady"] = json!(server_answers_luau(bridge));
+    let mut result = start_play_with_retries(bridge, plan, wait)?;
+    result["serverReady"] = json!(server_answers_luau(bridge, wait));
     result["restarted"] = json!(restarted);
     if let Some(note) = note {
         result["restartNote"] = json!(note);
@@ -3100,18 +3151,23 @@ fn virtual_click_actions(
     actions
 }
 
-fn studio_device_status(bridge: &BridgeServer) -> Result<Value> {
-    let result = bridge.call_for_target(
+/// The device simulation state of `edit_runtime_id`'s Edit window, or of the
+/// selected one when none is named.
+fn studio_device_status(bridge: &BridgeServer, edit_runtime_id: Option<&str>) -> Result<Value> {
+    let result = bridge.call_for_selector_runtime_with_timeout(
         "deviceSimulator",
         json!({ "action": "capture-status", "details": true, "includeSettle": true }),
         BridgeTarget::Edit,
+        None,
+        edit_runtime_id,
+        None,
     )?;
     ensure_plugin_api_ok(&result)?;
     Ok(result)
 }
 
 fn studio_capture_status(bridge: &BridgeServer) -> Option<Value> {
-    studio_device_status(bridge).ok()
+    studio_device_status(bridge, None).ok()
 }
 
 #[cfg(windows)]
@@ -4865,7 +4921,12 @@ fn finish_stop(
     process_exit::wait(processes, shutdown_deadline)?;
     #[cfg(not(any(windows, target_os = "macos")))]
     let _ = processes;
-    let closed = close_leftover_test_processes(bridge, edit_runtime_id, Duration::from_secs(5));
+    let closed = close_leftover_test_processes(
+        bridge,
+        edit_runtime_id,
+        Duration::from_secs(5),
+        &thread::sleep,
+    );
     retire_play_clients(bridge, &studio_play_clients(bridge, edit_runtime_id));
     bridge.clear_runtime_pins();
     if teardown >= Duration::from_millis(250) {
@@ -5027,7 +5088,11 @@ fn studio_play_status_for_runtime(bridge: &BridgeServer, runtime_id: &str) -> Re
 /// Waits until the Edit window can start a test: its controller is ready and
 /// the previous test's DataModels are gone. Returns the status, which reports
 /// a running session when one is still active.
-fn wait_for_studio_play_ready(bridge: &BridgeServer, runtime_id: &str) -> Result<Value> {
+fn wait_for_studio_play_ready(
+    bridge: &BridgeServer,
+    runtime_id: &str,
+    wait: PollWait<'_>,
+) -> Result<Value> {
     let deadline = Instant::now() + BRIDGE_DEFAULT_RESPONSE_TIMEOUT;
     loop {
         let mut status = studio_play_status_for_runtime(bridge, runtime_id)?;
@@ -5059,7 +5124,7 @@ fn wait_for_studio_play_ready(bridge: &BridgeServer, runtime_id: &str) -> Result
             }
             bail!("Studio did not finish the previous play session before the next start");
         }
-        thread::sleep(Duration::from_millis(100));
+        wait(Duration::from_millis(100));
     }
 }
 
