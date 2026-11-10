@@ -46,6 +46,7 @@ use crate::settings::equivalence::{
     drop_settings_documents, is_reconciliation_protected_workspace_camera, persistent_identity,
     persistent_identity_index, reconciliation_maps_equal, reconciliation_property_is_derived,
     reconciliation_property_value, reconciliation_property_values_equal,
+    reconciliation_store_maps_equal, reconciliation_store_values_map_equal,
     reconciliation_values_equal, reconciliation_values_map_equal,
     remove_reconciliation_derived_properties, settings_documents_equivalent,
     settings_documents_positionally_equivalent, stabilize_settings_reference_ids,
@@ -55,7 +56,7 @@ use crate::snapshot::export::{
     export_snapshots_with_warm_bridge,
 };
 use crate::snapshot::import::service_projection_in_memory;
-use crate::snapshot::refs::remap_record_reference_ids;
+use crate::snapshot::refs::{remap_record_reference_ids, store_service};
 use crate::studio::bridge::{BridgeServer, BridgeTarget};
 use crate::system::files::{
     OnDrop, absolutize_under, atomic_write_file, canonical_path, create_unique_directory, fnv1a,

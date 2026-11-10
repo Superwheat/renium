@@ -734,7 +734,7 @@ fn added_twin_subtrees_and_references_survive_every_insertion_slot() {
             .collect::<HashMap<_, _>>();
         for instance in &mut studio.instances {
             instance.settings_id = ids[&instance.settings_id].clone();
-            remap_record_reference_ids(&mut instance.properties, &ids);
+            remap_record_reference_ids(&mut instance.properties, &ids, None);
         }
         let (merged, conflicts) = merge_snapshots(
             None,

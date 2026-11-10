@@ -27,32 +27,65 @@ pub(crate) fn stabilize_record_references(record: &mut Map<String, Value>, ids: 
     rewrite_record_reference_ids(record, Some(ids), None, false, None);
 }
 
+/// The service a document is the store of: the name of its root, when it
+/// has one root and that root is a service. A model or a whole place is no
+/// service's store, and every id in it is its own.
+pub(crate) fn store_service(document: &SettingsBytecode) -> Option<&str> {
+    let mut roots = document
+        .instances
+        .iter()
+        .filter(|instance| instance.parent_index.is_none());
+    let root = roots.next()?;
+    if roots.next().is_some() {
+        return None;
+    }
+    rbx_reflection_database::get()
+        .ok()?
+        .classes
+        .get(root.class_name.as_str())?
+        .tags
+        .contains(&rbx_reflection::ClassTag::Service)
+        .then_some(root.name.as_str())
+}
+
+/// Renames settings ids in the references of a record of one document.
+/// `service` is the service the document is the store of, as `store_service`
+/// gives it. Settings ids are unique within one store only: a reference
+/// whose path leads into another service names an instance of that service's
+/// store and keeps its id. Without a service every id is the document's own.
 pub(crate) fn remap_record_reference_ids(
     record: &mut Map<String, Value>,
     ids: &HashMap<String, String>,
+    service: Option<&str>,
 ) {
-    rewrite_record_reference_ids(record, None, Some(ids), false, None);
+    rewrite_record_reference_ids(record, None, Some(ids), false, service);
 }
 
-/// Renames the settings ids of one store, the store of `service`, in the
-/// references of a record of that store. Settings ids are unique within one
-/// store only: a reference whose path leads into another service names an
-/// instance of that service's store and keeps its id.
+/// `remap_record_reference_ids` for a record of the store of `service`.
 pub(crate) fn remap_store_reference_ids(
     record: &mut Map<String, Value>,
     ids: &HashMap<String, String>,
     service: &str,
 ) {
-    rewrite_record_reference_ids(record, None, Some(ids), false, Some(service));
+    remap_record_reference_ids(record, ids, Some(service));
 }
 
+/// `stabilize_record_references` and `remap_record_reference_ids` in one
+/// pass over a record of the document `service` is the store of.
 pub(crate) fn remap_and_stabilize_record_references(
     record: &mut Map<String, Value>,
     ids: &[String],
     remap: &HashMap<String, String>,
     keep_instance_indices: bool,
+    service: Option<&str>,
 ) {
-    rewrite_record_reference_ids(record, Some(ids), Some(remap), keep_instance_indices, None);
+    rewrite_record_reference_ids(
+        record,
+        Some(ids),
+        Some(remap),
+        keep_instance_indices,
+        service,
+    );
 }
 
 fn rewrite_record_reference_ids(
@@ -63,13 +96,12 @@ fn rewrite_record_reference_ids(
     store_service: Option<&str>,
 ) {
     visit_reference_objects_mut(record, |object| {
-        if store_service.is_some_and(|service| reference_leads_out_of(object, service)) {
-            return;
-        }
         let has_text_id = ["settingsId", "instanceId"]
             .into_iter()
             .any(|key| object.get(key).and_then(Value::as_str).is_some());
-        if let Some(remap) = remap {
+        if let Some(remap) = remap
+            && !store_service.is_some_and(|service| reference_leads_out_of(object, service))
+        {
             for key in ["settingsId", "instanceId"] {
                 if let Some(current) = object.get(key).and_then(Value::as_str)
                     && let Some(next) = remap.get(current)

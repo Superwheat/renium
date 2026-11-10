@@ -9,8 +9,8 @@ fn namespace_studio_ids(document: &mut SettingsBytecode) {
         .collect::<HashMap<_, _>>();
     for instance in &mut document.instances {
         instance.settings_id = ids[&instance.settings_id].clone();
-        remap_record_reference_ids(&mut instance.properties, &ids);
-        remap_record_reference_ids(&mut instance.attributes, &ids);
+        remap_record_reference_ids(&mut instance.properties, &ids, None);
+        remap_record_reference_ids(&mut instance.attributes, &ids, None);
     }
 }
 
@@ -37,7 +37,7 @@ fn ref_subset(targets: &[usize], studio: bool) -> SettingsBytecode {
             .collect::<HashMap<_, _>>();
         for instance in &mut document.instances {
             instance.settings_id = ids[&instance.settings_id].clone();
-            remap_record_reference_ids(&mut instance.properties, &ids);
+            remap_record_reference_ids(&mut instance.properties, &ids, None);
         }
     }
     document

@@ -8,7 +8,7 @@ use serde_json::{Map, Value, json};
 use crate::settings::bytecode::{
     SettingsBytecode, SettingsBytecodeInstance, is_reference_object, reindex_reference_indices,
 };
-use crate::snapshot::refs::remap_record_reference_ids;
+use crate::snapshot::refs::remap_store_reference_ids;
 use crate::system::files::service_settings_path;
 
 use super::parse_jsonc_value;
@@ -134,8 +134,8 @@ pub(super) fn stage_model_json(stage: &Path, target: &[String], source: &Path) -
         if previous != root_id {
             let remap = HashMap::from([(previous, root_id.to_string())]);
             for instance in &mut document.instances {
-                remap_record_reference_ids(&mut instance.properties, &remap);
-                remap_record_reference_ids(&mut instance.attributes, &remap);
+                remap_store_reference_ids(&mut instance.properties, &remap, service);
+                remap_store_reference_ids(&mut instance.attributes, &remap, service);
             }
         }
     }
@@ -471,5 +471,78 @@ pub(super) fn contains_reference_value(value: &Value) -> bool {
             is_reference_object(object) || object.values().any(contains_reference_value)
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::bytecode::SETTINGS_BINARY_VERSION;
+
+    #[test]
+    fn a_model_root_id_leaves_references_into_other_services_alone() {
+        let stage = crate::system::files::create_unique_directory(
+            &std::env::temp_dir(),
+            "renium-model-json-references-",
+        )
+        .unwrap();
+        let instance = |id: &str, name: &str, class_name: &str, value: Option<Value>| {
+            let mut instance = SettingsBytecodeInstance::new(
+                id.to_string(),
+                name.to_string(),
+                class_name.to_string(),
+                (class_name != "Workspace").then_some(0),
+            );
+            if let Some(value) = value {
+                instance.properties.insert("Value".to_string(), value);
+            }
+            instance
+        };
+        let reference = |service: &str, name: &str| {
+            json!({
+                "_type": "Ref",
+                "settingsId": "2",
+                "pathSegments": [service, name],
+                "pathOrdinals": [1, 1],
+            })
+        };
+        // Workspace.Kit and ReplicatedStorage.Target are both `2`, each in
+        // its own store.
+        let outside = reference("ReplicatedStorage", "Target");
+        let settings_path = service_settings_path(&stage.join("Workspace"));
+        fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                instance("ws", "Workspace", "Workspace", None),
+                instance("2", "Kit", "Folder", None),
+                instance("out", "Outside", "ObjectValue", Some(outside.clone())),
+                instance(
+                    "in",
+                    "Inside",
+                    "ObjectValue",
+                    Some(reference("Workspace", "Kit")),
+                ),
+            ],
+        }
+        .write_file(&settings_path)
+        .unwrap();
+        let source = stage.join("kit.model.json");
+        fs::write(&source, r#"{"id": "kit-root", "className": "Folder"}"#).unwrap();
+        stage_model_json(
+            &stage,
+            &["Workspace".to_string(), "Kit".to_string()],
+            &source,
+        )
+        .unwrap();
+        let mut document = SettingsBytecode::read_file(&settings_path).unwrap();
+        crate::settings::equivalence::stabilize_settings_reference_ids(&mut document);
+        let _ = fs::remove_dir_all(&stage);
+        assert_eq!(document.instances[1].settings_id, "kit-root");
+        assert_eq!(document.instances[2].properties["Value"], outside);
+        assert_eq!(
+            document.instances[3].properties["Value"]["settingsId"],
+            "kit-root"
+        );
     }
 }

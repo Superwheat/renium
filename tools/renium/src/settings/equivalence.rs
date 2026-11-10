@@ -27,6 +27,7 @@ use crate::rbx::encode::{
 use crate::rbx::model::{BytecodeModelExportRefs, BytecodeModelImportRefs};
 use crate::snapshot::refs::{
     remap_and_stabilize_record_references, remap_record_reference_ids, stabilize_record_references,
+    store_service,
 };
 use crate::system::LockRecover;
 
@@ -225,6 +226,9 @@ fn stabilize_settings_reference_ids_with_remap(
         .map(|instance| instance.settings_id.clone())
         .collect::<Vec<_>>();
     let empty_remap = HashMap::new();
+    let service = remap
+        .and_then(|_| store_service(document))
+        .map(str::to_string);
     let stabilize = |instance: &mut SettingsBytecodeInstance| {
         if keep_instance_indices || remap.is_some() {
             let remap = remap.unwrap_or(&empty_remap);
@@ -233,12 +237,14 @@ fn stabilize_settings_reference_ids_with_remap(
                 &ids,
                 remap,
                 keep_instance_indices,
+                service.as_deref(),
             );
             remap_and_stabilize_record_references(
                 &mut instance.attributes,
                 &ids,
                 remap,
                 keep_instance_indices,
+                service.as_deref(),
             );
         } else {
             stabilize_record_references(&mut instance.properties, &ids);
@@ -724,6 +730,50 @@ fn persistent_identities_follow_mapping(
             || is_reconciliation_protected_workspace_camera(reference, reference_index)
                 && is_reconciliation_protected_workspace_camera(observed, observed_index)
     })
+}
+
+/// Whether the id an observed instance arrives with is one a store gave it:
+/// Studio's plugin hands the store id of an instance a push created or
+/// matched back with a capture. A debug id is Studio's own and recycled
+/// between sessions, and a bare number is the position an import numbers an
+/// instance by; neither says which stored instance it is.
+fn is_store_identity(id: &str) -> bool {
+    !id.starts_with("debug:") && !id.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Whether a mapping of observed positions onto reference positions keeps
+/// every store identity the observed document arrives with on the reference
+/// instance of that identity. A mapping by position or by path that moves
+/// such an identity to another instance would hand it to whatever stands
+/// where its instance was before a rename or a move.
+fn store_identities_follow_mapping(
+    reference: &SettingsBytecode,
+    observed: &SettingsBytecode,
+    reference_position: impl Fn(usize) -> Option<usize>,
+) -> bool {
+    let mut reference_ids = None;
+    observed
+        .instances
+        .iter()
+        .enumerate()
+        .all(|(index, instance)| {
+            let id = instance.settings_id.as_str();
+            if !is_store_identity(id)
+                || reference_position(index)
+                    .is_some_and(|position| reference.instances[position].settings_id == id)
+            {
+                return true;
+            }
+            !reference_ids
+                .get_or_insert_with(|| {
+                    reference
+                        .instances
+                        .iter()
+                        .map(|instance| instance.settings_id.as_str())
+                        .collect::<AHashSet<_>>()
+                })
+                .contains(id)
+        })
 }
 
 type IdentityGroupKey<'a> = (Option<usize>, &'a str, &'a str);
@@ -1476,10 +1526,11 @@ pub(crate) fn align_settings_ids_to_reference(
         .into_iter()
         .zip(assigned.iter().cloned())
         .collect::<HashMap<_, _>>();
+    let service = store_service(observed).map(str::to_string);
     for (instance, id) in observed.instances.iter_mut().zip(assigned) {
         instance.settings_id = id;
-        remap_record_reference_ids(&mut instance.properties, &remap);
-        remap_record_reference_ids(&mut instance.attributes, &remap);
+        remap_record_reference_ids(&mut instance.properties, &remap, service.as_deref());
+        remap_record_reference_ids(&mut instance.attributes, &remap, service.as_deref());
     }
     log_global(
         4,
@@ -1498,10 +1549,11 @@ fn remap_positional_ids(reference: &SettingsBytecode, observed: &mut SettingsByt
         .zip(&reference.instances)
         .map(|(observed, reference)| (observed.settings_id.clone(), reference.settings_id.clone()))
         .collect::<HashMap<_, _>>();
+    let service = store_service(observed).map(str::to_string);
     for (observed, reference) in observed.instances.iter_mut().zip(&reference.instances) {
         observed.settings_id.clone_from(&reference.settings_id);
-        remap_record_reference_ids(&mut observed.properties, &remap);
-        remap_record_reference_ids(&mut observed.attributes, &remap);
+        remap_record_reference_ids(&mut observed.properties, &remap, service.as_deref());
+        remap_record_reference_ids(&mut observed.attributes, &remap, service.as_deref());
     }
 }
 
@@ -1527,7 +1579,9 @@ fn positional_identity_preserved(
     reference: &SettingsBytecode,
     observed: &SettingsBytecode,
 ) -> bool {
-    if !persistent_identities_follow_mapping(reference, observed, Some) {
+    if !persistent_identities_follow_mapping(reference, observed, Some)
+        || !store_identities_follow_mapping(reference, observed, Some)
+    {
         return false;
     }
     let mut first_by_key = AHashMap::with_capacity(reference.instances.len());
@@ -1799,6 +1853,8 @@ fn align_settings_ids_for_contiguous_structural_change(
         return ContiguousStructuralAlignment::NotApplicable;
     }
     if !persistent_identities_follow_mapping(reference, observed, |index| {
+        index_map.observed_to_reference(index)
+    }) || !store_identities_follow_mapping(reference, observed, |index| {
         index_map.observed_to_reference(index)
     }) {
         return ContiguousStructuralAlignment::NotApplicable;
@@ -2143,6 +2199,12 @@ fn settings_documents_match(
     if left_ids.len() != left.instances.len() || right_by_id.len() != right.instances.len() {
         return false;
     }
+    let no_ids = AHashMap::new();
+    let ids = PairedStoreIds {
+        service: store_service(left),
+        left: &no_ids,
+        right: &no_ids,
+    };
     left.instances
         .iter()
         .enumerate()
@@ -2164,13 +2226,15 @@ fn settings_documents_match(
                     || preserve_viewport
                         && is_reconciliation_protected_workspace_camera(left, left_index)
                         && is_reconciliation_protected_workspace_camera(right, right_index)
-                    || reconciliation_maps_equal(
+                    || reconciliation_maps_equal_with_ids(
                         &left_instance.class_name,
                         &left_instance.properties,
                         &right_instance.properties,
-                    ) && reconciliation_values_map_equal(
+                        ids,
+                    ) && reconciliation_values_map_equal_with_ids(
                         &left_instance.attributes,
                         &right_instance.attributes,
+                        ids,
                     ))
         })
 }
@@ -2276,6 +2340,8 @@ pub(crate) fn inherit_workspace_viewport_reference(
 /// The settings ids of two copies of one store, by position, with the
 /// service the store is of. A reference into the store is the same in both
 /// copies when it names the same position, whatever id each copy gives it.
+/// Without positions the ids themselves compare, and the service still says
+/// which store a reference without a path is of.
 #[derive(Clone, Copy)]
 struct PairedStoreIds<'a> {
     service: Option<&'a str>,
@@ -2295,15 +2361,6 @@ impl PairedStoreIds<'_> {
     }
 }
 
-/// The service a store is of: the name of its root.
-fn store_service(document: &SettingsBytecode) -> Option<&str> {
-    document
-        .instances
-        .iter()
-        .find(|instance| instance.parent_index.is_none())
-        .map(|instance| instance.name.as_str())
-}
-
 /// The service a reference's path leads into, when it has a path.
 fn reference_path_service(reference: &Map<String, Value>) -> Option<&str> {
     reference
@@ -2318,9 +2375,22 @@ pub(crate) fn reconciliation_maps_equal(
     left: &Map<String, Value>,
     right: &Map<String, Value>,
 ) -> bool {
+    reconciliation_store_maps_equal(None, class_name, left, right)
+}
+
+/// `reconciliation_maps_equal` for two records of the store of `service`. A
+/// reference without a path names an instance of that store, so it is not
+/// the one a reference into another service names, also when both carry one
+/// id.
+pub(crate) fn reconciliation_store_maps_equal(
+    service: Option<&str>,
+    class_name: &str,
+    left: &Map<String, Value>,
+    right: &Map<String, Value>,
+) -> bool {
     let no_ids = AHashMap::new();
     let ids = PairedStoreIds {
-        service: None,
+        service,
         left: &no_ids,
         right: &no_ids,
     };
@@ -2786,9 +2856,19 @@ pub(crate) fn reconciliation_values_map_equal(
     left: &Map<String, Value>,
     right: &Map<String, Value>,
 ) -> bool {
+    reconciliation_store_values_map_equal(None, left, right)
+}
+
+/// `reconciliation_values_map_equal` for two records of the store of
+/// `service`, as `reconciliation_store_maps_equal` compares properties.
+pub(crate) fn reconciliation_store_values_map_equal(
+    service: Option<&str>,
+    left: &Map<String, Value>,
+    right: &Map<String, Value>,
+) -> bool {
     let no_ids = AHashMap::new();
     let ids = PairedStoreIds {
-        service: None,
+        service,
         left: &no_ids,
         right: &no_ids,
     };
@@ -2861,6 +2941,23 @@ fn reconciliation_value_contains_reference(value: &Value) -> bool {
 
 pub(crate) fn reconciliation_values_equal(left: &Value, right: &Value, approximate: bool) -> bool {
     reconciliation_values_equal_with_ids(left, right, approximate, None)
+}
+
+/// `reconciliation_values_equal` for two values an instance of the store of
+/// `service` holds.
+fn reconciliation_store_values_equal(
+    service: Option<&str>,
+    left: &Value,
+    right: &Value,
+    approximate: bool,
+) -> bool {
+    let no_ids = AHashMap::new();
+    let ids = service.map(|service| PairedStoreIds {
+        service: Some(service),
+        left: &no_ids,
+        right: &no_ids,
+    });
+    reconciliation_values_equal_with_ids(left, right, approximate, ids)
 }
 
 /// Stores written by older model imports keep scalars typed, as
@@ -2963,9 +3060,11 @@ fn reconciliation_values_equal_with_ids(
                 if let (Some(left_id), Some(right_id)) = (left_id, right_id) {
                     // Settings ids are unique within one store only, and the
                     // path's service says which store an id is of: the same
-                    // id under two services names two instances.
-                    let left_service = reference_path_service(left);
-                    let right_service = reference_path_service(right);
+                    // id under two services names two instances. A reference
+                    // without a path is one of the store that holds it.
+                    let own_service = ids.and_then(|ids| ids.service);
+                    let left_service = reference_path_service(left).or(own_service);
+                    let right_service = reference_path_service(right).or(own_service);
                     if let (Some(left_service), Some(right_service)) = (left_service, right_service)
                         && left_service != right_service
                     {
@@ -3433,6 +3532,19 @@ pub(crate) fn reconciliation_property_values_equal(
     left: Option<&Value>,
     right: Option<&Value>,
 ) -> bool {
+    reconciliation_store_property_values_equal(None, class_name, name, left, right)
+}
+
+/// `reconciliation_property_values_equal` for two values of one property of
+/// an instance of the store of `service`, as
+/// `reconciliation_store_maps_equal` compares records.
+fn reconciliation_store_property_values_equal(
+    service: Option<&str>,
+    class_name: &str,
+    name: &str,
+    left: Option<&Value>,
+    right: Option<&Value>,
+) -> bool {
     let left = left.filter(|value| !reconciliation_property_is_metadata(name, value));
     let right = right.filter(|value| !reconciliation_property_is_metadata(name, value));
     match (left, right) {
@@ -3452,7 +3564,8 @@ pub(crate) fn reconciliation_property_values_equal(
             true
         }
         (Some(left), Some(right)) => {
-            reconciliation_values_equal(
+            reconciliation_store_values_equal(
+                service,
                 left,
                 right,
                 reconciliation_property_uses_f32(class_name, name, left, right),
@@ -3609,6 +3722,7 @@ pub(crate) fn align_equivalent_values(
         .enumerate()
         .map(|(index, instance)| (instance.settings_id.clone(), index))
         .collect::<HashMap<_, _>>();
+    let service = store_service(reference);
     for reference_instance in &reference.instances {
         let Some(observed_index) = observed_by_id
             .get(reference_instance.settings_id.as_str())
@@ -3618,11 +3732,13 @@ pub(crate) fn align_equivalent_values(
         };
         let observed_instance = &mut observed.instances[observed_index];
         align_equivalent_property_map_values(
+            service,
             &reference_instance.class_name,
             &reference_instance.properties,
             &mut observed_instance.properties,
         );
         align_equivalent_map_values(
+            service,
             &reference_instance.attributes,
             &mut observed_instance.attributes,
         );
@@ -3630,6 +3746,7 @@ pub(crate) fn align_equivalent_values(
 }
 
 fn align_equivalent_property_map_values(
+    service: Option<&str>,
     class_name: &str,
     reference: &Map<String, Value>,
     observed: &mut Map<String, Value>,
@@ -3643,7 +3760,8 @@ fn align_equivalent_property_map_values(
             continue;
         }
         if reference_value != observed_value
-            && reconciliation_property_values_equal(
+            && reconciliation_store_property_values_equal(
+                service,
                 class_name,
                 name,
                 Some(reference_value),
@@ -3727,13 +3845,17 @@ fn reference_loses_enum_types(reference: &Value, observed: &Value) -> bool {
     }
 }
 
-fn align_equivalent_map_values(reference: &Map<String, Value>, observed: &mut Map<String, Value>) {
+fn align_equivalent_map_values(
+    service: Option<&str>,
+    reference: &Map<String, Value>,
+    observed: &mut Map<String, Value>,
+) {
     for (name, reference_value) in reference {
         let Some(observed_value) = observed.get_mut(name) else {
             continue;
         };
         if reference_value != observed_value
-            && reconciliation_values_equal(reference_value, observed_value, false)
+            && reconciliation_store_values_equal(service, reference_value, observed_value, false)
             && !reference_loses_enum_types(reference_value, observed_value)
         {
             observed_value.clone_from(reference_value);
@@ -3836,6 +3958,263 @@ mod tests {
         ));
     }
 
+    fn reference_test_document(target_id: &str, value: &Value) -> SettingsBytecode {
+        let instance = |id: &str, name: &str, class_name: &str, parent| {
+            SettingsBytecodeInstance::new(
+                id.to_string(),
+                name.to_string(),
+                class_name.to_string(),
+                parent,
+            )
+        };
+        let mut holder = instance("holder", "Holder", "ObjectValue", Some(0));
+        holder.properties.insert("Value".to_string(), value.clone());
+        SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                instance("ws", "Workspace", "Workspace", None),
+                instance(target_id, "A", "Folder", Some(0)),
+                holder,
+            ],
+        }
+    }
+
+    fn path_reference(service: &str, name: &str, id: &str) -> Value {
+        json!({
+            "_type": "Ref",
+            "settingsId": id,
+            "pathSegments": [service, name],
+            "pathOrdinals": [1, 1],
+        })
+    }
+
+    #[test]
+    fn a_reference_without_a_path_is_one_of_the_store_that_holds_it() {
+        let document = reference_test_document;
+        let local = json!({"_type": "Ref", "settingsId": "2"});
+        let inside = path_reference("Workspace", "A", "2");
+        let outside = path_reference("ReplicatedStorage", "Target", "2");
+        let baseline = document("2", &local);
+
+        // Workspace's `2` and ReplicatedStorage's `2` are two instances: a
+        // holder retargeted from one to the other changed.
+        let retargeted = document("2", &outside);
+        assert!(!settings_documents_equivalent(&baseline, &retargeted));
+        assert!(!settings_documents_positionally_equivalent(
+            &baseline,
+            &retargeted
+        ));
+        let mut observed = retargeted.clone();
+        align_equivalent_values(&baseline, &mut observed);
+        assert_eq!(observed.instances[2].properties["Value"], outside);
+        assert!(matches!(
+            align_settings_bytes_to_reference(
+                &encode_settings_bytecode(&baseline).unwrap(),
+                &encode_settings_bytecode(&retargeted).unwrap(),
+            )
+            .unwrap(),
+            SettingsAlignment::Changed(_)
+        ));
+
+        // The same instance named with and without its path is one value.
+        let spelled = document("2", &inside);
+        assert!(settings_documents_equivalent(&baseline, &spelled));
+        assert!(settings_documents_positionally_equivalent(
+            &baseline, &spelled
+        ));
+        let mut observed = spelled;
+        align_equivalent_values(&baseline, &mut observed);
+        assert_eq!(observed.instances[2].properties["Value"], local);
+    }
+
+    fn held_value(document: &SettingsBytecode, holder: &str) -> Value {
+        document
+            .instances
+            .iter()
+            .find(|instance| instance.name == holder)
+            .unwrap()
+            .properties["Value"]
+            .clone()
+    }
+
+    fn with_inside_holder(mut document: SettingsBytecode, target_id: &str) -> SettingsBytecode {
+        let mut second = SettingsBytecodeInstance::new(
+            "second".to_string(),
+            "Second".to_string(),
+            "ObjectValue".to_string(),
+            Some(0),
+        );
+        second.properties.insert(
+            "Value".to_string(),
+            path_reference("Workspace", "A", target_id),
+        );
+        document.instances.push(second);
+        document
+    }
+
+    fn decoded_test_document(bytes: &[u8]) -> SettingsBytecode {
+        let mut document = decode_settings_bytecode(bytes).unwrap();
+        stabilize_settings_reference_ids(&mut document);
+        document
+    }
+
+    // In the three tests below the store knows Workspace.A as `kept` and
+    // the observed copy numbers it `2`, the id ReplicatedStorage.Target has
+    // in its own store and Holder refers to.
+
+    #[test]
+    fn positional_id_alignment_keeps_the_ids_of_references_into_other_services() {
+        let outside = path_reference("ReplicatedStorage", "Target", "2");
+        let reference = reference_test_document("kept", &outside);
+        let mut observed = reference_test_document("2", &outside);
+        assert!(align_settings_ids_to_reference(&reference, &mut observed));
+        assert_eq!(observed.instances[1].settings_id, "kept");
+        assert_eq!(held_value(&observed, "Holder"), outside);
+    }
+
+    #[test]
+    fn id_alignment_keeps_the_ids_of_references_into_other_services() {
+        let outside = path_reference("ReplicatedStorage", "Target", "2");
+        let reference = with_inside_holder(reference_test_document("kept", &outside), "kept");
+        let mut observed = with_inside_holder(reference_test_document("2", &outside), "2");
+        observed.instances.swap(2, 3);
+        assert!(align_settings_ids_to_reference(&reference, &mut observed));
+        assert_eq!(held_value(&observed, "Holder"), outside);
+        assert_eq!(held_value(&observed, "Second")["settingsId"], "kept");
+    }
+
+    #[test]
+    fn contiguous_id_alignment_keeps_the_ids_of_references_into_other_services() {
+        let outside = path_reference("ReplicatedStorage", "Target", "2");
+        let reference = reference_test_document("kept", &outside);
+        let observed = with_inside_holder(reference_test_document("2", &outside), "2");
+        let SettingsAlignment::Changed(aligned) = align_settings_bytes_to_reference(
+            &encode_settings_bytecode(&reference).unwrap(),
+            &encode_settings_bytecode(&observed).unwrap(),
+        )
+        .unwrap() else {
+            panic!("an added instance must change the store");
+        };
+        let aligned = decoded_test_document(&aligned);
+        assert_eq!(aligned.instances[1].settings_id, "kept");
+        assert_eq!(held_value(&aligned, "Holder"), outside);
+        assert_eq!(held_value(&aligned, "Second")["settingsId"], "kept");
+    }
+
+    /// The ids a pull of ReplicatedStorage leaves, by name. The store is as
+    /// `ba --push` left it: RefTarget is the editor's `editor:6c71`, and no
+    /// pull has recorded Studio's identity for it. `captured` are the
+    /// children Studio has now, as (id, name).
+    fn pulled_ids_after_a_push(captured: &[(&str, &str)]) -> Vec<(String, String)> {
+        let instance = |id: &str, name: &str, unique_id: Option<usize>| {
+            let mut instance = SettingsBytecodeInstance::new(
+                id.to_string(),
+                name.to_string(),
+                if id == "1" { name } else { "Folder" }.to_string(),
+                (id != "1").then_some(0),
+            );
+            if let Some(unique_id) = unique_id {
+                instance.properties.insert(
+                    "UniqueId".to_string(),
+                    json!({"_type": "UniqueId", "value": format!("{unique_id:032x}")}),
+                );
+            }
+            instance
+        };
+        let document = |children: Vec<SettingsBytecodeInstance>| SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: std::iter::once(instance("1", "ReplicatedStorage", None))
+                .chain(children)
+                .collect(),
+        };
+        let store = document(vec![
+            instance("debug:0_10", "Shared", Some(1)),
+            instance("editor:6c71", "RefTarget", None),
+        ]);
+        let captured = document(
+            captured
+                .iter()
+                .enumerate()
+                .map(|(index, (id, name))| {
+                    let unique_id = if *name == "Shared" { 1 } else { index + 2 };
+                    instance(id, name, Some(unique_id))
+                })
+                .collect(),
+        );
+        let SettingsAlignment::Changed(aligned) = align_settings_bytes_to_reference(
+            &encode_settings_bytecode(&store).unwrap(),
+            &encode_settings_bytecode(&captured).unwrap(),
+        )
+        .unwrap() else {
+            panic!("a renamed or an added instance must change the store");
+        };
+        decoded_test_document(&aligned)
+            .instances
+            .into_iter()
+            .skip(1)
+            .map(|instance| (instance.name, instance.settings_id))
+            .collect()
+    }
+
+    fn named_ids(ids: &[(&str, &str)]) -> Vec<(String, String)> {
+        ids.iter()
+            .map(|(name, id)| (name.to_string(), id.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_pull_keeps_a_pushed_identity_on_the_instance_studio_renamed() {
+        // Studio renamed the pushed folder and a new folder took its name.
+        // The capture names the pushed instance by its store id.
+        assert_eq!(
+            pulled_ids_after_a_push(&[
+                ("debug:0_10", "Shared"),
+                ("editor:6c71", "RefTargetMoved"),
+                ("debug:0_31", "RefTarget"),
+            ]),
+            named_ids(&[
+                ("Shared", "debug:0_10"),
+                ("RefTargetMoved", "editor:6c71"),
+                ("RefTarget", "debug:0_31"),
+            ])
+        );
+        // A rename alone, and a new folder beside the pushed one.
+        assert_eq!(
+            pulled_ids_after_a_push(
+                &[("debug:0_10", "Shared"), ("editor:6c71", "RefTargetMoved"),]
+            ),
+            named_ids(&[("Shared", "debug:0_10"), ("RefTargetMoved", "editor:6c71")])
+        );
+        assert_eq!(
+            pulled_ids_after_a_push(&[
+                ("debug:0_10", "Shared"),
+                ("editor:6c71", "RefTarget"),
+                ("debug:0_31", "Other"),
+            ]),
+            named_ids(&[
+                ("Shared", "debug:0_10"),
+                ("RefTarget", "editor:6c71"),
+                ("Other", "debug:0_31"),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_pull_keeps_a_pushed_identity_when_the_new_instance_comes_first() {
+        assert_eq!(
+            pulled_ids_after_a_push(&[
+                ("debug:0_10", "Shared"),
+                ("debug:0_31", "RefTarget"),
+                ("editor:6c71", "RefTargetMoved"),
+            ]),
+            named_ids(&[
+                ("Shared", "debug:0_10"),
+                ("RefTarget", "debug:0_31"),
+                ("RefTargetMoved", "editor:6c71"),
+            ])
+        );
+    }
+
     #[test]
     fn equivalent_store_is_rewritten_when_nested_enum_types_arrive() {
         let mut rule = SettingsBytecodeInstance::new(
@@ -3900,7 +4279,7 @@ mod tests {
         observed.insert("Properties".to_string(), typed.clone());
         let mut reference_map = Map::new();
         reference_map.insert("Properties".to_string(), reference);
-        align_equivalent_property_map_values("StyleRule", &reference_map, &mut observed);
+        align_equivalent_property_map_values(None, "StyleRule", &reference_map, &mut observed);
         assert_eq!(observed["Properties"], typed);
     }
 
@@ -4416,7 +4795,7 @@ mod tests {
                 instance.settings_id = next_id;
             }
             for instance in &mut observed.instances {
-                remap_record_reference_ids(&mut instance.properties, &remap);
+                remap_record_reference_ids(&mut instance.properties, &remap, None);
             }
             if referenced {
                 observed.instances.swap(1, 2);
@@ -6373,7 +6752,7 @@ mod never_serialized_properties {
         assert!(reconciliation_maps_equal("UnionOperation", &union, &recook));
         assert!(!reconciliation_maps_equal("UnionOperation", &union, &recut));
         let mut kept = recut.clone();
-        align_equivalent_property_map_values("UnionOperation", &union, &mut kept);
+        align_equivalent_property_map_values(None, "UnionOperation", &union, &mut kept);
         assert_eq!(kept["PhysicalConfigData"], recut["PhysicalConfigData"]);
     }
 
@@ -6418,13 +6797,13 @@ mod never_serialized_properties {
             &other_mesh
         ));
         let mut aligned = same_mesh.clone();
-        align_equivalent_property_map_values("MeshPart", &reference, &mut aligned);
+        align_equivalent_property_map_values(None, "MeshPart", &reference, &mut aligned);
         assert_eq!(
             aligned["PhysicalConfigData"],
             reference["PhysicalConfigData"]
         );
         let mut kept = other_mesh.clone();
-        align_equivalent_property_map_values("MeshPart", &reference, &mut kept);
+        align_equivalent_property_map_values(None, "MeshPart", &reference, &mut kept);
         assert_eq!(kept["PhysicalConfigData"], other_mesh["PhysicalConfigData"]);
     }
 

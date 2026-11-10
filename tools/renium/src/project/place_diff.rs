@@ -766,9 +766,11 @@ fn pair_duplicate_siblings_by_content(
                 .clone_from(&before.instances[*before_index].settings_id);
         }
     }
+    // The document holds the compared services together under ids of its
+    // own, so an id names its instance whatever service a path leads into.
     for instance in &mut after.instances {
-        remap_record_reference_ids(&mut instance.properties, &id_map);
-        remap_record_reference_ids(&mut instance.attributes, &id_map);
+        remap_record_reference_ids(&mut instance.properties, &id_map, None);
+        remap_record_reference_ids(&mut instance.attributes, &id_map, None);
     }
     reordered
 }

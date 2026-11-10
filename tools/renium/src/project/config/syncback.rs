@@ -17,10 +17,11 @@ use crate::editor::paths::{
     infer_source_script, merge_editor_source_files_into_document, run_context_name,
 };
 use crate::settings::bytecode::{
-    SettingsBytecode, SettingsBytecodeInstance, encode_settings_bytecode, reindex_reference_indices,
+    SettingsBytecode, SettingsBytecodeInstance, encode_settings_bytecode,
+    reindex_reference_indices, reindex_store_reference_indices,
 };
 use crate::settings::tree::settings_children_by_parent;
-use crate::snapshot::refs::remap_record_reference_ids;
+use crate::snapshot::refs::{remap_record_reference_ids, store_service};
 use crate::system::files::{
     atomic_write_file, is_service_settings_file_name, path_extension_is, read_file_if_present,
     service_settings_path, sha256_hex,
@@ -2297,10 +2298,11 @@ fn restore_project_owned_fields(
             }
         }
     }
+    let service = store_service(output).map(str::to_string);
     if !id_remap.is_empty() {
         for instance in &mut output.instances {
-            remap_record_reference_ids(&mut instance.properties, &id_remap);
-            remap_record_reference_ids(&mut instance.attributes, &id_remap);
+            remap_record_reference_ids(&mut instance.properties, &id_remap, service.as_deref());
+            remap_record_reference_ids(&mut instance.attributes, &id_remap, service.as_deref());
         }
     }
     let indices_by_id = output
@@ -2310,8 +2312,12 @@ fn restore_project_owned_fields(
         .map(|(index, instance)| (instance.settings_id.clone(), index))
         .collect::<HashMap<_, _>>();
     for instance in &mut output.instances {
-        reindex_reference_indices(&mut instance.properties, &indices_by_id);
-        reindex_reference_indices(&mut instance.attributes, &indices_by_id);
+        for record in [&mut instance.properties, &mut instance.attributes] {
+            match service.as_deref() {
+                Some(service) => reindex_store_reference_indices(record, &indices_by_id, service),
+                None => reindex_reference_indices(record, &indices_by_id),
+            }
+        }
     }
     Ok(())
 }

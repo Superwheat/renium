@@ -63,8 +63,8 @@ fn twin_observation(editor: &SettingsBytecode) -> SettingsBytecode {
             let mut instance = editor.instances[index].clone();
             instance.parent_index = instance.parent_index.map(|parent| positions[parent]);
             instance.settings_id = ids[&instance.settings_id].clone();
-            remap_record_reference_ids(&mut instance.properties, &ids);
-            remap_record_reference_ids(&mut instance.attributes, &ids);
+            remap_record_reference_ids(&mut instance.properties, &ids, None);
+            remap_record_reference_ids(&mut instance.attributes, &ids, None);
             instance
         })
         .collect();
@@ -3067,6 +3067,280 @@ fn a_merge_settles_a_reference_to_an_instance_the_other_side_removed_from_anothe
     assert_eq!(names, ["Workspace"]);
     assert_eq!(value, Some(json!({"_type": "Ref"})));
     assert!(changes.editor.contains(&replicated_path));
+}
+
+fn reference_merge_instance(
+    id: &str,
+    name: &str,
+    class_name: &str,
+    parent: Option<usize>,
+    value: Option<&Value>,
+) -> SettingsBytecodeInstance {
+    let mut instance = SettingsBytecodeInstance::new(
+        id.to_string(),
+        name.to_string(),
+        class_name.to_string(),
+        parent,
+    );
+    if let Some(value) = value {
+        instance
+            .properties
+            .insert("Value".to_string(), value.clone());
+    }
+    instance
+}
+
+fn reference_merge_store(instances: Vec<SettingsBytecodeInstance>) -> SnapshotEntry {
+    SnapshotEntry::File(
+        encode_settings_bytecode(&SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances,
+        })
+        .unwrap(),
+    )
+}
+
+/// A reference to ReplicatedStorage.Target, which is `2` in its store, as
+/// some instance of Workspace is in the tests below: stores number their
+/// instances alike.
+fn outside_reference_to_id_2() -> Value {
+    json!({
+        "_type": "Ref",
+        "settingsId": "2",
+        "pathSegments": ["ReplicatedStorage", "Target"],
+        "pathOrdinals": [1, 1],
+    })
+}
+
+/// A Workspace store of `children`, by (id, name, class), with a Holder
+/// that refers to ReplicatedStorage.Target when `holder` gives its id.
+fn workspace_with_outside_holder(
+    children: &[(&str, &str, &str)],
+    holder: Option<&str>,
+) -> SettingsBytecode {
+    let instance = reference_merge_instance;
+    let outside = outside_reference_to_id_2();
+    let mut instances = vec![instance("ws", "Workspace", "Workspace", None, None)];
+    instances.extend(
+        children
+            .iter()
+            .map(|(id, name, class_name)| instance(id, name, class_name, Some(0), None)),
+    );
+    instances
+        .extend(holder.map(|id| instance(id, "Holder", "ObjectValue", Some(0), Some(&outside))));
+    SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances,
+    }
+}
+
+fn held_reference(document: &SettingsBytecode) -> &Value {
+    &document
+        .instances
+        .iter()
+        .find(|instance| instance.name == "Holder")
+        .unwrap()
+        .properties["Value"]
+}
+
+#[test]
+fn releasing_a_reused_id_keeps_the_ids_of_references_into_other_services() {
+    // The files reuse the id of a removed folder for a part, which gets a
+    // fresh one.
+    let baseline = workspace_with_outside_holder(&[("2", "Old", "Folder")], None);
+    let mut editor = workspace_with_outside_holder(&[("2", "New", "Part")], Some("holder"));
+    release_reassigned_editor_ids(&baseline, &mut editor, &baseline, &HashSet::new());
+    assert_ne!(editor.instances[1].settings_id, "2");
+    assert_eq!(*held_reference(&editor), outside_reference_to_id_2());
+}
+
+#[test]
+fn aligning_new_instances_keeps_the_ids_of_references_into_other_services() {
+    // Studio numbers a folder `2` that the files added as `fresh`.
+    let baseline = workspace_with_outside_holder(&[], None);
+    let editor = workspace_with_outside_holder(&[("fresh", "A", "Folder")], None);
+    let mut studio = workspace_with_outside_holder(&[("2", "A", "Folder")], Some("holder"));
+    align_new_instance_ids(&baseline, &editor, &mut studio).unwrap();
+    assert_eq!(studio.instances[1].settings_id, "fresh");
+    assert_eq!(*held_reference(&studio), outside_reference_to_id_2());
+}
+
+#[test]
+fn a_first_pairing_keeps_the_ids_of_references_into_other_services() {
+    let mut editor = workspace_with_outside_holder(&[("fresh", "A", "Folder")], Some("holder"));
+    let mut studio = workspace_with_outside_holder(&[("2", "A", "Folder")], Some("studio-holder"));
+    let mut conflicts = Vec::new();
+    align_first_pairing(
+        Path::new("instances/Workspace.renium"),
+        &mut editor,
+        &mut studio,
+        ConflictPreference::None,
+        &mut conflicts,
+    );
+    assert!(conflicts.is_empty(), "{conflicts:?}");
+    assert_eq!(studio.instances[1].settings_id, "fresh");
+    assert_eq!(*held_reference(&studio), outside_reference_to_id_2());
+}
+
+#[test]
+fn a_merge_settles_a_reference_whose_target_the_other_side_replaced_at_its_path() {
+    let instance = reference_merge_instance;
+    let reference = json!({
+        "_type": "Ref",
+        "settingsId": "target",
+        "pathSegments": ["Workspace", "Kit", "Target"],
+        "pathOrdinals": [1, 1, 1],
+    });
+    let workspace_path = PathBuf::from("instances/Workspace.renium");
+    let replicated_path = PathBuf::from("instances/ReplicatedStorage.renium");
+    let snapshot = |replaced: bool, value: Option<&Value>| {
+        let target = if replaced {
+            instance("replacement", "Target", "Part", Some(1), None)
+        } else {
+            instance("target", "Target", "Folder", Some(1), None)
+        };
+        ProjectSnapshot {
+            entries: BTreeMap::from([
+                (
+                    workspace_path.clone(),
+                    reference_merge_store(vec![
+                        instance("ws", "Workspace", "Workspace", None, None),
+                        instance("kit", "Kit", "Folder", Some(0), None),
+                        target,
+                    ]),
+                ),
+                (
+                    replicated_path.clone(),
+                    reference_merge_store(vec![
+                        instance("rs", "ReplicatedStorage", "ReplicatedStorage", None, None),
+                        instance("pointer", "Pointer", "ObjectValue", Some(0), value),
+                    ]),
+                ),
+            ]),
+        }
+    };
+    // The files point ReplicatedStorage.Pointer at Workspace.Kit.Target
+    // while Studio removes that folder and puts a part at its path.
+    let baseline = snapshot(false, None);
+    let editor = snapshot(false, Some(&reference));
+    let studio = snapshot(true, None);
+    let merge = |preference| {
+        let (merged, conflicts, _) =
+            merge_snapshots_with_changes(Some(&baseline), &editor, &studio, preference, None)
+                .unwrap();
+        let targets = settings_document(merged.entries.get(&workspace_path))
+            .unwrap()
+            .instances
+            .iter()
+            .filter(|instance| instance.name == "Target")
+            .map(|instance| instance.settings_id.clone())
+            .collect::<BTreeSet<_>>();
+        let value = settings_document(merged.entries.get(&replicated_path))
+            .unwrap()
+            .instances[1]
+            .properties
+            .get("Value")
+            .cloned();
+        (targets, value, conflicts)
+    };
+    let ids = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<BTreeSet<_>>();
+    let (_, _, conflicts) = merge(ConflictPreference::None);
+    assert_eq!(
+        conflicts,
+        [format!(
+            "{}: Pointer: Value: refers to Workspace.Kit.Target (id=target), which the other side removed",
+            replicated_path.display()
+        )]
+    );
+    let (targets, value, conflicts) = merge(ConflictPreference::Editor);
+    assert!(conflicts.is_empty(), "{conflicts:?}");
+    assert_eq!(targets, ids(&["replacement", "target"]));
+    assert_eq!(value.unwrap()["settingsId"], "target");
+    let (targets, value, conflicts) = merge(ConflictPreference::Studio);
+    assert!(conflicts.is_empty(), "{conflicts:?}");
+    assert_eq!(targets, ids(&["replacement"]));
+    assert_eq!(value, Some(json!({"_type": "Ref"})));
+}
+
+#[test]
+fn a_restored_reference_target_brings_back_what_it_refers_to() {
+    let instance = reference_merge_instance;
+    let reference = |service: &str, name: &str, id: &str| {
+        json!({
+            "_type": "Ref",
+            "settingsId": id,
+            "pathSegments": [service, name],
+            "pathOrdinals": [1, 1],
+        })
+    };
+    let workspace_path = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
+    let replicated_path = PathBuf::from("src/ReplicatedStorage/__roblox_sync_settings.renium");
+    let server_path = PathBuf::from("src/ServerStorage/__roblox_sync_settings.renium");
+    let source_path = PathBuf::from("src/ServerStorage/C.luau");
+    let source = b"return 'c'".as_slice();
+    // Workspace.A refers to Workspace.B, B to the script ServerStorage.C.
+    let snapshot = |with_targets: bool, value: Option<&Value>| {
+        let mut workspace = vec![instance("ws", "Workspace", "Workspace", None, None)];
+        let mut server = vec![instance("ss", "ServerStorage", "ServerStorage", None, None)];
+        let mut entries = BTreeMap::new();
+        if with_targets {
+            workspace.push(instance(
+                "a",
+                "A",
+                "ObjectValue",
+                Some(0),
+                Some(&reference("Workspace", "B", "b")),
+            ));
+            workspace.push(instance(
+                "b",
+                "B",
+                "ObjectValue",
+                Some(0),
+                Some(&reference("ServerStorage", "C", "c")),
+            ));
+            server.push(instance("c", "C", "ModuleScript", Some(0), None));
+            entries.insert(source_path.clone(), SnapshotEntry::File(source.to_vec()));
+        }
+        entries.insert(workspace_path.clone(), reference_merge_store(workspace));
+        entries.insert(server_path.clone(), reference_merge_store(server));
+        entries.insert(
+            replicated_path.clone(),
+            reference_merge_store(vec![
+                instance("rs", "ReplicatedStorage", "ReplicatedStorage", None, None),
+                instance("pointer", "Pointer", "ObjectValue", Some(0), value),
+            ]),
+        );
+        ProjectSnapshot { entries }
+    };
+    // The files point ReplicatedStorage.Pointer at A while Studio removes
+    // A, B and C.
+    let baseline = snapshot(true, None);
+    let editor = snapshot(true, Some(&reference("Workspace", "A", "a")));
+    let studio = snapshot(false, None);
+    let (merged, conflicts, changes) = merge_snapshots_with_changes(
+        Some(&baseline),
+        &editor,
+        &studio,
+        ConflictPreference::Editor,
+        None,
+    )
+    .unwrap();
+    assert!(conflicts.is_empty(), "{conflicts:?}");
+    let names = |path: &PathBuf| {
+        settings_document(merged.entries.get(path))
+            .unwrap()
+            .instances
+            .into_iter()
+            .map(|instance| instance.name)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(&workspace_path), ["Workspace", "A", "B"]);
+    assert_eq!(names(&server_path), ["ServerStorage", "C"]);
+    assert!(merged.entries.get(&source_path) == editor.entries.get(&source_path));
+    for path in [&workspace_path, &server_path, &source_path] {
+        assert!(changes.studio.contains(path), "{}", path.display());
+        assert!(!changes.editor.contains(path), "{}", path.display());
+    }
 }
 
 #[test]

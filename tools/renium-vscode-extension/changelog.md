@@ -118,6 +118,9 @@
 - In Live Sync, a reference in one service to an instance the other side removed from another service is a conflict; a preference restores the instance or clears the reference.
 - `rbx ba` accepts a reference to the instance being added, and one `rbx ba --batch` accepts a reference to an instance a later op adds; a path that names nothing says to create the target first or add both in one batch.
 - On macOS and Linux the reservation of an update check could outlive the check while another thread was starting a child process, so the next check skipped its refresh; the reservation is now released when the check ends.
+- Aligning a store's ids in a pull, merge, first pairing, model JSON adapter or service projection no longer rewrites the id of a reference into another service that shares it, and a reference retargeted from an instance of its own store to one of another service with the same id is seen as a change.
+- A merge no longer lets a reference bind to an instance the other side put at its removed target's path: it is a conflict without a preference, and restored or cleared with one; when a merge restores an instance for a reference, it also restores what that instance refers to, with script sources.
+- A pull keeps an instance's store id on the instance Studio reports it for after a rename, instead of giving it to a new instance that took the old name.
 
 ## 0.5.9 - 2026-11-06
 

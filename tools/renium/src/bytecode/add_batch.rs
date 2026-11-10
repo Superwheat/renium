@@ -679,14 +679,16 @@ impl BatchState<'_> {
             Some(&op.name),
             &state.reserved_ids,
         )?;
+        let mut copy_ids = HashMap::with_capacity(cloned.copies.len());
         for &(old_index, new_index) in &cloned.copies {
             let new_id = state.id(new_index);
+            let old_id = state.id(old_index);
             state.reserved_ids.insert(new_id.clone());
             state.touch(new_index);
+            copy_ids.insert(old_id.clone(), new_id.clone());
             if script_file_names(&state.document.instances[old_index].class_name).is_none() {
                 continue;
             }
-            let old_id = state.id(old_index);
             if let Some(source) = state.current_source(&old_id)? {
                 state.sources.insert(new_id.clone(), source);
             }
@@ -697,6 +699,7 @@ impl BatchState<'_> {
             state.copied_from.insert(new_id.clone(), origin);
             state.created_by.insert(new_id, position);
         }
+        self.defer_copied_references(store, &copy_ids);
         let root_index = cloned.root_index;
         let mut fields = if props.is_empty() && op.attrs.is_empty() {
             Map::new()
@@ -1070,6 +1073,27 @@ impl BatchState<'_> {
             property,
             op: self.running,
         });
+    }
+
+    /// A copy holds the values of its original, so a path that named nothing
+    /// when the original got it is looked up again for the copy too, under
+    /// the running op that made the copy. `copies` maps the settings ids of
+    /// the originals to those of their copies.
+    fn defer_copied_references(&mut self, store: usize, copies: &HashMap<String, String>) {
+        let copied = self
+            .pending
+            .iter()
+            .filter(|pending| pending.store == store)
+            .filter_map(|pending| {
+                Some(PendingReference {
+                    store,
+                    settings_id: copies.get(&pending.settings_id)?.clone(),
+                    property: pending.property.clone(),
+                    op: self.running,
+                })
+            })
+            .collect::<Vec<_>>();
+        self.pending.extend(copied);
     }
 
     /// Completes the references that named nothing when their op ran,

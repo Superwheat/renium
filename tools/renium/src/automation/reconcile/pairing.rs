@@ -313,12 +313,13 @@ pub(crate) fn release_reassigned_editor_ids(
             (id, fresh)
         })
         .collect::<HashMap<_, _>>();
+    let service = store_service(editor).map(str::to_string);
     for instance in &mut editor.instances {
         if let Some(id) = remap.get(&instance.settings_id) {
             instance.settings_id.clone_from(id);
         }
-        remap_record_reference_ids(&mut instance.properties, &remap);
-        remap_record_reference_ids(&mut instance.attributes, &remap);
+        remap_record_reference_ids(&mut instance.properties, &remap, service.as_deref());
+        remap_record_reference_ids(&mut instance.attributes, &remap, service.as_deref());
     }
 }
 
@@ -389,18 +390,27 @@ pub(crate) fn align_new_instance_ids(
                 .then(|| (studio_id.to_string(), editor_id.to_string()))
         })
         .collect::<HashMap<_, _>>();
+    let service = store_service(studio).map(str::to_string);
     let observed_record = |studio_index: usize| {
         let observed = &studio.instances[studio_index];
         let mut properties = observed.properties.clone();
         let mut attributes = observed.attributes.clone();
-        remap_record_reference_ids(&mut properties, &provisional);
-        remap_record_reference_ids(&mut attributes, &provisional);
+        remap_record_reference_ids(&mut properties, &provisional, service.as_deref());
+        remap_record_reference_ids(&mut attributes, &provisional, service.as_deref());
         (properties, attributes)
     };
     let records_equal = |editor_index: usize, record: &(Map<String, Value>, Map<String, Value>)| {
         let desired = &editor.instances[editor_index];
-        reconciliation_maps_equal(&desired.class_name, &desired.properties, &record.0)
-            && reconciliation_values_map_equal(&desired.attributes, &record.1)
+        reconciliation_store_maps_equal(
+            service.as_deref(),
+            &desired.class_name,
+            &desired.properties,
+            &record.0,
+        ) && reconciliation_store_values_map_equal(
+            service.as_deref(),
+            &desired.attributes,
+            &record.1,
+        )
     };
     fn slot_available(
         editor: &SettingsBytecode,
@@ -594,8 +604,8 @@ pub(crate) fn align_new_instance_ids(
         if let Some(id) = remap.get(&instance.settings_id) {
             instance.settings_id.clone_from(id);
         }
-        remap_record_reference_ids(&mut instance.properties, &remap);
-        remap_record_reference_ids(&mut instance.attributes, &remap);
+        remap_record_reference_ids(&mut instance.properties, &remap, service.as_deref());
+        remap_record_reference_ids(&mut instance.attributes, &remap, service.as_deref());
     }
     Ok(())
 }
@@ -805,12 +815,13 @@ pub(crate) fn align_first_pairing(
     }
 
     let id_remap = first_pairing_id_remap(editor, studio, &resolved.partners);
+    let service = store_service(studio).map(str::to_string);
     for instance in &mut studio.instances {
         if let Some(id) = id_remap.get(&instance.settings_id) {
             instance.settings_id.clone_from(id);
         }
-        remap_record_reference_ids(&mut instance.properties, &id_remap);
-        remap_record_reference_ids(&mut instance.attributes, &id_remap);
+        remap_record_reference_ids(&mut instance.properties, &id_remap, service.as_deref());
+        remap_record_reference_ids(&mut instance.attributes, &id_remap, service.as_deref());
     }
     resolved.align_references(studio);
     crate::settings::equivalence::inherit_workspace_viewport_reference(editor, studio);
@@ -822,7 +833,13 @@ pub(crate) fn align_first_pairing(
         let Some(studio_index) = studio_by_key.get(key).copied() else {
             continue;
         };
-        if settings_instances_equal(editor, *editor_index, studio, studio_index) {
+        if store_instances_equal(
+            service.as_deref(),
+            editor,
+            *editor_index,
+            studio,
+            studio_index,
+        ) {
             continue;
         }
         let node = structural_interner.node(*key);
@@ -986,17 +1003,34 @@ pub(crate) fn settings_instances_equal(
     right: &SettingsBytecode,
     right_index: usize,
 ) -> bool {
+    store_instances_equal(None, left, left_index, right, right_index)
+}
+
+/// `settings_instances_equal` for two copies of the store of `service`, where
+/// a reference without a path names an instance of that store.
+fn store_instances_equal(
+    service: Option<&str>,
+    left: &SettingsBytecode,
+    left_index: usize,
+    right: &SettingsBytecode,
+    right_index: usize,
+) -> bool {
     let left_instance = &left.instances[left_index];
     let right_instance = &right.instances[right_index];
     left_instance.name == right_instance.name
         && left_instance.class_name == right_instance.class_name
         && settings_parent_id(left, left_index) == settings_parent_id(right, right_index)
-        && reconciliation_maps_equal(
+        && reconciliation_store_maps_equal(
+            service,
             &left_instance.class_name,
             &comparison_properties(left_instance),
             &comparison_properties(right_instance),
         )
-        && reconciliation_values_map_equal(&left_instance.attributes, &right_instance.attributes)
+        && reconciliation_store_values_map_equal(
+            service,
+            &left_instance.attributes,
+            &right_instance.attributes,
+        )
 }
 
 /// The properties the first comparison judges: a collision hull whose

@@ -250,6 +250,66 @@ fn a_batch_clears_references_to_an_instance_it_added_and_removed() {
 }
 
 #[test]
+fn a_batch_checks_the_unresolved_references_its_copies_carry() {
+    let fx = Fixture::new("batch-copy-pending");
+    let stores =
+        || ["Workspace", "ReplicatedStorage"].map(|service| fs::read(fx.store(service)).unwrap());
+    let before = stores();
+    // The copy keeps the path its original wrote, and outlives the original.
+    for (batch, op) in [
+        (
+            r#"[
+                {"parent":"Workspace","name":"Deferred","class":"ObjectValue","props":{"Value":"Workspace.Never"}},
+                {"op":"clone","path":"Workspace.Deferred","name":"DeferredCopy"},
+                {"op":"remove","path":"Workspace.Deferred"}
+            ]"#,
+            "Batch op 1 (clone)",
+        ),
+        (
+            r#"[
+                {"parent":"Workspace","name":"Kit","class":"Folder"},
+                {"parent":"Workspace.Kit","name":"Deferred","class":"ObjectValue","props":{"Value":"Workspace.Never"}},
+                {"op":"clone","path":"Workspace.Kit","name":"KitCopy","ref":"copy"},
+                {"op":"remove","path":"Workspace.Kit"}
+            ]"#,
+            "Batch op 2 (clone #copy)",
+        ),
+    ] {
+        assert_eq!(
+            run_batch(&fx, batch).unwrap_err(),
+            format!(
+                "{op}: Reference target was not found: Workspace.Never is not in the Workspace store when the batch ends; add it in this batch or before it (`rbx f Workspace NAME` finds a path, `rbx pl` refreshes the store from Studio)"
+            )
+        );
+        assert_eq!(stores(), before);
+    }
+    let result = run_batch(
+        &fx,
+        r#"[
+            {"parent":"Workspace","name":"Deferred","class":"ObjectValue","props":{"Value":"Workspace.Late"}},
+            {"op":"clone","path":"Workspace.Deferred","name":"DeferredCopy"},
+            {"op":"clone","path":"Workspace.Deferred","name":"Retargeted","props":{"Value":"Workspace.Lobby"}},
+            {"op":"remove","path":"Workspace.Deferred"},
+            {"parent":"Workspace","name":"Late","class":"Folder"}
+        ]"#,
+    )
+    .unwrap();
+    let late = result["ops"][4]["id"].as_str().unwrap();
+    assert_eq!(
+        stored_reference(&fx, "Workspace", "DeferredCopy"),
+        outside_reference(&["Workspace", "Late"], &[1, 1], late)
+    );
+    assert_eq!(
+        stored_reference(&fx, "Workspace", "Retargeted")["pathSegments"],
+        json!(["Workspace", "Lobby"])
+    );
+    assert_eq!(
+        built_reference_target(&fx, "Workspace.DeferredCopy").as_deref(),
+        Some("Workspace.Late")
+    );
+}
+
+#[test]
 fn a_batch_locks_its_stores_in_the_order_other_commands_do() {
     let fx = Fixture::new("batch-lock-order");
     let workspace_lock = PathBuf::from(format!("{}.lock", fx.store("Workspace").display()));

@@ -7,7 +7,8 @@
 //! together and settles such a reference the way one store's merge settles
 //! its own: a conflict without a preference; with one, the instance comes
 //! back when the preferred side still has it, and the reference is cleared
-//! when that side removed it.
+//! when that side removed it. An instance that comes back is settled in
+//! turn, with the references it holds into its own store.
 
 use super::*;
 use crate::bytecode::edit::{instance_path_key, instance_path_parts_key};
@@ -39,11 +40,33 @@ fn reference_id(reference: &Map<String, Value>) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
+fn reference_service(reference: &Map<String, Value>) -> Option<&str> {
+    reference
+        .get("pathSegments")
+        .and_then(Value::as_array)
+        .and_then(|segments| segments.first())
+        .and_then(Value::as_str)
+}
+
 fn exact_path_keys(document: &SettingsBytecode, service: &str) -> HashSet<String> {
     build_editor_instance_paths(document, service)
         .into_iter()
         .flatten()
         .map(|path| instance_path_parts_key(&path.path_segments, &path.path_ordinals))
+        .collect()
+}
+
+fn classes_by_exact_path(document: &SettingsBytecode, service: &str) -> HashMap<String, String> {
+    build_editor_instance_paths(document, service)
+        .into_iter()
+        .zip(&document.instances)
+        .filter_map(|(path, instance)| {
+            let path = path?;
+            Some((
+                instance_path_parts_key(&path.path_segments, &path.path_ordinals),
+                instance.class_name.clone(),
+            ))
+        })
         .collect()
 }
 
@@ -162,33 +185,31 @@ impl LostTargets {
         )))
     }
 
-    /// The lost instance a reference names: the one with its id, or without
-    /// an id of the store the one at its path. A reference whose path the
+    /// The lost instance a reference names. An id of the store decides: the
+    /// instance with it is the target, lost or kept, whatever stands at the
+    /// reference's path now. Without one the path does, and a path the
     /// merged store still resolves keeps a target, as the place build takes
     /// the path when the id names nothing.
     fn named(&self, reference: &Map<String, Value>) -> Option<usize> {
-        let (segments, ordinals) = strict_reference_path(reference).ok().flatten()?;
-        let exact = ordinals
-            .as_ref()
-            .map(|ordinals| instance_path_parts_key(&segments, ordinals));
-        if exact
-            .as_ref()
-            .is_some_and(|exact| self.merged_paths.contains(exact))
-        {
-            return None;
+        if let Some(index) = reference_id(reference).and_then(|id| self.by_id.get(id).copied()) {
+            return self.lost.contains(&index).then_some(index);
         }
-        let by_id = reference_id(reference).and_then(|id| self.by_id.get(id).copied());
-        let by_path = || match &exact {
-            Some(exact) => self.by_exact_path.get(exact).copied(),
+        let (segments, ordinals) = strict_reference_path(reference).ok().flatten()?;
+        let by_path = match ordinals {
+            Some(ordinals) => {
+                let exact = instance_path_parts_key(&segments, &ordinals);
+                if self.merged_paths.contains(&exact) {
+                    return None;
+                }
+                self.by_exact_path.get(&exact).copied()
+            }
             None => self
                 .by_segments
                 .get(&instance_path_key(&segments))
                 .copied()
                 .flatten(),
         };
-        by_id
-            .or_else(by_path)
-            .filter(|index| self.lost.contains(index))
+        by_path.filter(|index| self.lost.contains(index))
     }
 
     fn exact_path(&self, index: usize) -> Option<String> {
@@ -211,7 +232,7 @@ impl LostTargets {
 /// One side of the merge, read store by store as the settlement asks.
 struct Side<'a> {
     snapshot: &'a ProjectSnapshot,
-    instances: HashMap<PathBuf, (HashSet<String>, HashSet<String>)>,
+    instances: HashMap<PathBuf, (HashSet<String>, HashMap<String, String>)>,
     documents: HashMap<PathBuf, Option<SettingsBytecode>>,
 }
 
@@ -225,7 +246,8 @@ impl<'a> Side<'a> {
     }
 
     /// Whether the side still has the instance: under its id, or at its
-    /// path when the side numbers its instances differently.
+    /// path when the side numbers its instances differently. An instance of
+    /// another class at that path is one that took its place.
     fn has_target(&mut self, lost: &LostTargets, service: &str, index: usize) -> Result<bool> {
         if !self.instances.contains_key(&lost.store) {
             let held = match self.snapshot.entries.get(&lost.store) {
@@ -237,25 +259,26 @@ impl<'a> Side<'a> {
                             .iter()
                             .map(|instance| instance.settings_id.clone())
                             .collect(),
-                        exact_path_keys(&document, service),
+                        classes_by_exact_path(&document, service),
                     )
                 }
                 _ => Default::default(),
             };
             self.instances.insert(lost.store.clone(), held);
         }
-        let (ids, paths) = &self.instances[&lost.store];
-        Ok(ids.contains(&lost.base.instances[index].settings_id)
+        let (ids, classes) = &self.instances[&lost.store];
+        let target = &lost.base.instances[index];
+        Ok(ids.contains(&target.settings_id)
             || lost
                 .exact_path(index)
-                .is_some_and(|path| paths.contains(&path)))
+                .is_some_and(|path| classes.get(&path) == Some(&target.class_name)))
     }
 
     /// Whether the side's copy of a store holds this reference.
     fn has_reference(&mut self, store: &Path, reference: &Map<String, Value>) -> Result<bool> {
         if !self.documents.contains_key(store) {
             let document = match self.snapshot.entries.get(store) {
-                Some(SnapshotEntry::File(bytes)) => Some(decode_settings_bytecode(bytes)?),
+                entry @ Some(SnapshotEntry::File(_)) => Some(decoded_settings_document(entry)?),
                 _ => None,
             };
             self.documents.insert(store.to_path_buf(), document);
@@ -280,7 +303,7 @@ impl<'a> Side<'a> {
     }
 }
 
-/// A reference of a merged store to an instance another store lost.
+/// A reference of a merged store to an instance a store lost.
 struct BrokenReference {
     store: PathBuf,
     instance: usize,
@@ -291,9 +314,13 @@ struct BrokenReference {
     target: usize,
 }
 
+/// The references to lost instances: every one that leads into another
+/// store, and those the instances in `restored` (put back by the settlement,
+/// by store) hold into their own store, which no store's merge has seen.
 fn broken_references(
     merged: &BTreeMap<PathBuf, SnapshotEntry>,
     lost: &BTreeMap<String, LostTargets>,
+    restored: &BTreeMap<PathBuf, HashSet<String>>,
     holders: &mut BTreeMap<PathBuf, SettingsBytecode>,
 ) -> Result<Vec<BrokenReference>> {
     let needles = lost
@@ -316,18 +343,16 @@ fn broken_references(
             continue;
         };
         let found = broken.len();
+        let restored = restored.get(path);
         for (instance, holder) in document.instances.iter().enumerate() {
+            let restored = restored.is_some_and(|ids| ids.contains(&holder.settings_id));
             for (attribute, record) in [(false, &holder.properties), (true, &holder.attributes)] {
                 for (field, value) in record {
                     for_each_reference(value, &mut |reference| {
-                        let Some(service) = reference
-                            .get("pathSegments")
-                            .and_then(Value::as_array)
-                            .and_then(|segments| segments.first())
-                            .and_then(Value::as_str)
-                            .filter(|service| *service != holder_service)
-                        else {
-                            return;
+                        let service = match reference_service(reference) {
+                            Some(service) if service != holder_service => service,
+                            _ if restored => holder_service.as_str(),
+                            _ => return,
                         };
                         if let Some(target) =
                             lost.get(service).and_then(|lost| lost.named(reference))
@@ -459,13 +484,14 @@ impl MergeOutcome<'_> {
     }
 
     /// Puts lost instances of one store back, as the merge's base had them.
+    /// Returns the ids of the instances the store gained.
     fn restore_targets(
         &mut self,
         store: &Path,
         settings_ids: &HashSet<String>,
         baseline: &ProjectSnapshot,
         preferred: &ProjectSnapshot,
-    ) -> Result<()> {
+    ) -> Result<HashSet<String>> {
         let before = settings_document(self.merged.get(store))?;
         let mut source = settings_document(baseline.entries.get(store))?;
         remove_reconciliation_derived_properties(&mut source);
@@ -482,7 +508,8 @@ impl MergeOutcome<'_> {
             .map(|instance| instance.settings_id.clone())
             .collect::<HashSet<_>>();
         self.rewrite_store(store, before, &restored)?;
-        self.restore_script_sources(store, &restored_ids, preferred)
+        self.restore_script_sources(store, &restored_ids, preferred)?;
+        Ok(restored_ids)
     }
 }
 
@@ -579,6 +606,10 @@ fn decide(
     Ok(settlement)
 }
 
+/// Settles the references the per-store merges left without a target. An
+/// instance that comes back brings its own references along, into its store
+/// and into others, and their targets can be lost as well, so the settlement
+/// runs again until a round restores nothing.
 pub(super) fn settle_references_between_stores(
     sides: &SnapshotSides<'_>,
     preference: ConflictPreference,
@@ -589,34 +620,43 @@ pub(super) fn settle_references_between_stores(
     let Some(baseline) = sides.baseline else {
         return Ok(());
     };
-    let lost = lost_targets(baseline, merged, changes)?;
-    if lost.is_empty() {
-        return Ok(());
-    }
-    let mut holders = BTreeMap::new();
-    let broken = broken_references(merged, &lost, &mut holders)?;
-    if broken.is_empty() {
-        return Ok(());
-    }
     let prefer_editor = preference_bool(preference);
-    let settlement = decide(broken, &lost, &holders, sides, prefer_editor, conflicts)?;
     let preferred = if prefer_editor == Some(true) {
         sides.editor
     } else {
         sides.studio
     };
-    let mut outcome = MergeOutcome {
-        sides,
-        merged,
-        changes,
-    };
-    for (store, cleared) in settlement.clears {
-        if let Some(document) = holders.remove(&store) {
-            outcome.clear_references(&store, document, cleared)?;
+    let mut restored = BTreeMap::<PathBuf, HashSet<String>>::new();
+    loop {
+        let lost = lost_targets(baseline, merged, changes)?;
+        if lost.is_empty() {
+            return Ok(());
+        }
+        let mut holders = BTreeMap::new();
+        let broken = broken_references(merged, &lost, &restored, &mut holders)?;
+        if broken.is_empty() {
+            return Ok(());
+        }
+        let settlement = decide(broken, &lost, &holders, sides, prefer_editor, conflicts)?;
+        let mut outcome = MergeOutcome {
+            sides,
+            merged,
+            changes,
+        };
+        for (store, cleared) in settlement.clears {
+            if let Some(document) = holders.remove(&store) {
+                outcome.clear_references(&store, document, cleared)?;
+            }
+        }
+        let mut gained = false;
+        for (service, settings_ids) in settlement.restores {
+            let store = &lost[&service].store;
+            let added = outcome.restore_targets(store, &settings_ids, baseline, preferred)?;
+            gained |= !added.is_empty();
+            restored.entry(store.clone()).or_default().extend(added);
+        }
+        if !gained {
+            return Ok(());
         }
     }
-    for (service, settings_ids) in settlement.restores {
-        outcome.restore_targets(&lost[&service].store, &settings_ids, baseline, preferred)?;
-    }
-    Ok(())
 }
