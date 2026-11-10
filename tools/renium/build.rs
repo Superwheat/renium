@@ -152,6 +152,22 @@ fn build_windows(out_dir: &Path) {
         "Windows function ABI regression build",
     );
     println!("cargo:rerun-if-changed={}", function_test.display());
+    let signal_test = PathBuf::from("native/tests/signal_append_windows.cpp");
+    let mut signal_command = compiler.to_command();
+    signal_command.args(["/nologo", "/O2", "/EHsc", "/std:c++20", "/MT"]);
+    signal_command.arg(&signal_test);
+    signal_command.arg(format!("/Fo{}\\", out_dir.display()));
+    signal_command.arg(format!(
+        "/Fe{}",
+        out_dir.join("renium-signal-append-test.exe").display()
+    ));
+    signal_command.args(["/link", "/INCREMENTAL:NO"]);
+    run(
+        &mut signal_command,
+        "Windows signal append ownership regression build",
+    );
+    println!("cargo:rerun-if-changed={}", signal_test.display());
+    println!("cargo:rerun-if-changed=native/renium_signal_append.h");
     let allocator_engine = PathBuf::from("native/tests/allocator_engine_windows.cpp");
     let allocator_test = PathBuf::from("native/tests/allocator_windows.cpp");
     // A private fixture directory prevents the test allocator DLL from ever

@@ -26,7 +26,7 @@ struct CachedLayout {
 }
 static LAYOUTS: OnceLock<Mutex<HashMap<PathBuf, CachedLayout>>> = OnceLock::new();
 
-fn descriptor_vtable(image: &PeImage<'_>, name_prefix: &[u8]) -> Result<usize> {
+pub(super) fn descriptor_vtable(image: &PeImage<'_>, name_prefix: &[u8]) -> Result<usize> {
     let names = memmem::find_iter(image.bytes, name_prefix).collect::<Vec<_>>();
     anyhow::ensure!(
         names.len() == 1,

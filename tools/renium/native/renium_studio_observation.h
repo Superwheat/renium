@@ -2,6 +2,7 @@
 // subscriptions during a full export or transient native push. It observes;
 // it never suppresses Studio's events or other subscribers.
 #include <unordered_map>
+#include "renium_signal_append.h"
 namespace renium_observation {
 // Frame progress belongs to the same DataModel/observation lease as the relay.
 // A reader holds the counter independently; cancellation wakes it before the
@@ -23,7 +24,8 @@ static std::shared_ptr<FrameProgress> FindFrames(std::uintptr_t model) {
 
 struct Params {
     ReniumSerializerParams base;
-    std::uintptr_t signalOffset, ensure, allocate, append, disconnect, assign;
+    std::uint32_t signalOffset, appendAbi;
+    std::uintptr_t ensure, allocate, append, disconnect, assign;
     void* descriptor;
     HANDLE stop, ready;
     SharedInstance relay;
@@ -32,6 +34,7 @@ struct Params {
 };
 static_assert(sizeof(Params) == 6048);
 static_assert(offsetof(Params, signalOffset) == sizeof(ReniumSerializerParams));
+static_assert(offsetof(Params, appendAbi) == sizeof(ReniumSerializerParams) + 4);
 
 struct Task {
     Params params{};
@@ -155,9 +158,7 @@ static void Begin(const std::shared_ptr<Task>& task) {
     *reinterpret_cast<void**>(node + 0x20) = *signal;
     *reinterpret_cast<Task**>(node + 0x28) = task.get();
     InterlockedIncrement(reinterpret_cast<LONG*>(static_cast<unsigned char*>(*signal) + 4));
-    reinterpret_cast<void(__fastcall*)(void*, void*)>(p.append)(*signal, node);
-    InterlockedIncrement(reinterpret_cast<LONG*>(node + 4));
-    task->connection = node;
+    AppendSignal(p.appendAbi, p.append, *signal, node, &task->connection);
     task->installed = task;
     if (p.relay.instance) {
         task->relayArmed = true;
@@ -198,7 +199,7 @@ static DWORD Run(Params* input) {
     auto task = std::make_shared<Task>();
     task->params = *input;
     auto p = *input;
-    if (!p.stop || !p.ready || !p.host || !p.base.count || p.base.count > 256
+    if (p.appendAbi > 1 || !p.stop || !p.ready || !p.host || !p.base.count || p.base.count > 256
         || !p.base.timeoutMs || p.base.timeoutMs > 120000
         || !p.base.submitTask || !p.base.taskContext || !p.base.dataModelOwner)
         throw std::runtime_error("Invalid attribute observation context");

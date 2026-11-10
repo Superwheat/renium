@@ -78,6 +78,7 @@ impl Drop for ImageView {
 #[derive(Clone)]
 struct Prepared {
     trace: signal::ObservationTrace,
+    relay: signal::RelayTrace,
     code: Arc<Vec<(usize, Vec<u8>)>>,
 }
 struct Cached {
@@ -139,9 +140,11 @@ fn prepared(
             "Studio attribute signal layout is unrecognized; Renium's detector needs updating"
         );
         let trace = candidates.remove(0);
+        let relay = signal::relay_binding(&image)?;
         let code = trace
             .functions
             .iter()
+            .chain([&relay.invoker, &relay.fire])
             .map(|&rva| {
                 let offset = image.rva_to_offset(rva)?;
                 let (_, end) = image.function_bounds(offset)?;
@@ -150,6 +153,7 @@ fn prepared(
             .collect::<Result<Vec<_>>>()?;
         Ok(Prepared {
             trace,
+            relay,
             code: Arc::new(code),
         })
     })()
@@ -177,7 +181,10 @@ pub(super) fn probe(
         );
     }
     Ok(
-        serde_json::json!({"validatedFunctions": binding.code.iter().map(|(rva, _)| *rva).collect::<Vec<_>>()}),
+        serde_json::json!({"validatedFunctions": binding.code.iter().map(|(rva, _)| *rva).collect::<Vec<_>>(),
+            "signalOffset": binding.trace.signal_offset, "appendAbi": binding.trace.append_abi as u32,
+            "relay": {"invokerRva": binding.relay.invoker, "slot": binding.relay.slot,
+                "memberField": binding.relay.member_field, "fireRva": binding.relay.fire}}),
     )
 }
 
@@ -369,35 +376,46 @@ fn begin_observation(
             ))
         })
         .collect::<Result<Vec<_>>>()?;
-    let relay = relay_path.map(|path| -> Result<_> {
-        anyhow::ensure!(path.len() == 2 && path[0] == "CoreGui"
-            && path[1].starts_with("ReniumAttributeJournal_"), "Invalid native attribute relay path");
-        let ancestors = properties::resolve_path(&memory, &model, path, &[1, 1])?;
-        let target = *ancestors.last().context("Native attribute relay is missing")?;
-        anyhow::ensure!(read_instance_class(&memory, target.instance, model.layout).as_deref()
-            == Some("ObjectValue"), "Native attribute relay changed class");
-        let changed = find_class_member_descriptor(&memory, target.instance, model.layout, "Changed")?;
-        anyhow::ensure!(read_rtti_type(&memory, changed, studio.base, studio.size).as_deref() == Some(
-            ".?AV?$EventDesc@VObjectValue@RBX@@$$A6AXV?$shared_ptr@VInstance@RBX@@@std@@@ZV?$signal@$$A6AXV?$shared_ptr@VInstance@RBX@@@std@@@Z@rbx@@PEQ12@V56@@Reflection@RBX@@"
-        ), "Native attribute relay signature changed");
-        let vtable = memory.read_u64(changed)? as usize;
-        let invoker = (memory.read_u64(vtable + 0x30)? as usize).checked_sub(studio.base)
-            .context("Native attribute relay invoker is outside Studio")?;
-        let offset = memory.read_u32(changed + 0x78)? as usize;
-        anyhow::ensure!((8..0x1000).contains(&offset) && offset.is_multiple_of(8),
-            "Native attribute relay member changed");
-        let mapped = ImageView::open(&studio.path)?;
-        let bytes = mapped.bytes();
-        let image = PeImage::parse(bytes)?;
-        let fire = signal::relay_dispatch(&image, invoker)?;
-        for rva in [invoker, fire] {
-            let offset = image.rva_to_offset(rva)?;
-            let (start, end) = image.function_bounds(offset)?;
-            anyhow::ensure!(start == offset && memory.read_vec(studio.base + rva, end - start)? == bytes[start..end],
-                "Loaded native attribute relay code changed");
-        }
-        Ok((target, offset, studio.base + fire))
-    }).transpose()?;
+    let relay = relay_path
+        .map(|path| -> Result<_> {
+            anyhow::ensure!(
+                path.len() == 2
+                    && path[0] == "CoreGui"
+                    && path[1].starts_with("ReniumAttributeJournal_"),
+                "Invalid native attribute relay path"
+            );
+            let ancestors = properties::resolve_path(&memory, &model, path, &[1, 1])?;
+            let target = *ancestors
+                .last()
+                .context("Native attribute relay is missing")?;
+            anyhow::ensure!(
+                read_instance_class(&memory, target.instance, model.layout).as_deref()
+                    == Some("ObjectValue"),
+                "Native attribute relay changed class"
+            );
+            let changed =
+                find_class_member_descriptor(&memory, target.instance, model.layout, "Changed")?;
+            anyhow::ensure!(
+                read_rtti_type(&memory, changed, studio.base, studio.size).as_deref()
+                    == Some(signal::RELAY_DESCRIPTOR),
+                "Native attribute relay signature changed"
+            );
+            let relay = prepared.relay;
+            let vtable = memory.read_u64(changed)? as usize;
+            anyhow::ensure!(
+                vtable == studio.base + relay.vtable
+                    && memory.read_u64(vtable + relay.slot * 8)? as usize
+                        == studio.base + relay.invoker,
+                "Loaded native attribute relay invoker changed"
+            );
+            let offset = memory.read_u32(changed + relay.member_field)? as usize;
+            anyhow::ensure!(
+                (8..0x1000).contains(&offset) && offset.is_multiple_of(8),
+                "Native attribute relay member changed"
+            );
+            Ok((target, offset, studio.base + relay.fire))
+        })
+        .transpose()?;
     model.roots = select_capture_roots(&roots, services)?;
     let (_, serializer, _) = studio_layout(&studio.path)?;
     let helper = ensure_helper_loaded(pid, &memory, &modules)?;
@@ -433,6 +451,18 @@ fn begin_observation(
     };
     let mut params = build_parameters(studio.base, serializer, &model, &path, true)?;
     params.resize(PARAM_SIZE + 112, 0);
+    // The bounded field offset occupies the low word of the original slot;
+    // its former zero high word now identifies the structurally proven ABI.
+    put_u32(
+        &mut params,
+        PARAM_SIZE,
+        u32::try_from(prepared.trace.signal_offset)?,
+    );
+    put_u32(
+        &mut params,
+        PARAM_SIZE + 4,
+        prepared.trace.append_abi as u32,
+    );
     if let Some((target, offset, fire)) = relay {
         for (field, value) in [
             (PARAM_SIZE + 72, target.instance),
@@ -447,7 +477,6 @@ fn begin_observation(
         (PARAM_TASK_CONTEXT, context),
         (PARAM_SUBMIT_TASK, studio.base + layout.submit_task),
         (PARAM_WINDOW, window.0),
-        (PARAM_SIZE, prepared.trace.signal_offset),
         (PARAM_SIZE + 8, studio.base + prepared.trace.ensure),
         (PARAM_SIZE + 16, studio.base + prepared.trace.allocate),
         (PARAM_SIZE + 24, studio.base + prepared.trace.append),

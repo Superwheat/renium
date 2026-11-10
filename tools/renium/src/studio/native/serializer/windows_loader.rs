@@ -333,30 +333,41 @@ fn reader_call(bytes: &[u8], rva: usize) -> Option<usize> {
                 }
                 registers.insert(destination, value);
             }
-            Mnemonic::Mov if i.op0_kind() == OpKind::Memory => {
+            Mnemonic::Mov | Mnemonic::Movdqu | Mnemonic::Movdqa
+                if i.op0_kind() == OpKind::Memory && i.op1_kind() == OpKind::Register =>
+            {
                 let offset = address(&i, &registers)?;
-                let value = *registers.get(&i.op1_register().full_register())?;
+                let value = registers.get(&i.op1_register().full_register()).copied();
                 let size = i.memory_size().size();
-                // Partial overwrites invalidate previous stack provenance.
-                stack.retain(|at, (_, prior_size)| {
-                    *at + *prior_size as i64 <= offset || *at >= offset + size as i64
-                });
-                stack.insert(offset, (value, size));
+                reader_stack_write(&mut stack, offset, value, size);
             }
-            Mnemonic::Xor
+            Mnemonic::Xor | Mnemonic::Xorps | Mnemonic::Pxor
                 if i.op0_kind() == OpKind::Register
                     && i.op1_kind() == OpKind::Register
-                    && i.op0_register() == i.op1_register() =>
+                    && i.op0_register() == i.op1_register()
+                    && i.op0_register().size() >= 4 =>
             {
                 registers.insert(destination, Zero);
             }
+            Mnemonic::Push if i.op0_kind() == OpKind::Register && i.op0_register().size() == 8 => {
+                let Stack(offset) = *registers.get(&Register::RSP)? else {
+                    return None;
+                };
+                let next = offset.checked_sub(8)?;
+                registers.insert(Register::RSP, Stack(next));
+                reader_stack_write(&mut stack, next, registers.get(&destination).copied(), 8);
+            }
             Mnemonic::Sub
-                if i.op0_register() == Register::RSP && i.op1_kind() == OpKind::Immediate32to64 =>
+                if i.op0_register() == Register::RSP
+                    && matches!(
+                        i.op1_kind(),
+                        OpKind::Immediate32to64 | OpKind::Immediate8to64
+                    ) =>
             {
                 let Stack(offset) = *registers.get(&Register::RSP)? else {
                     return None;
                 };
-                let next = offset.checked_sub(i.immediate32to64())?;
+                let next = offset.checked_sub(i.immediate(1) as i64)?;
                 if !(-4096..0).contains(&next) {
                     return None;
                 }
@@ -415,6 +426,28 @@ fn reader_call(bytes: &[u8], rva: usize) -> Option<usize> {
         }
     }
     None
+}
+
+fn reader_stack_write(
+    stack: &mut HashMap<i64, (Input, usize)>,
+    offset: i64,
+    value: Option<Input>,
+    size: usize,
+) {
+    // Callee-saved registers need no input provenance, but even an unknown or
+    // partial write must invalidate any argument it overlaps. Normalize SIMD
+    // zero stores to words so both initialization forms prove the same range.
+    stack.retain(|at, (_, prior_size)| {
+        *at + *prior_size as i64 <= offset || *at >= offset + size as i64
+    });
+    if let Some(value) = value {
+        if value == Input::Zero && size == 16 {
+            stack.insert(offset, (value, 8));
+            stack.insert(offset + 8, (value, 8));
+        } else {
+            stack.insert(offset, (value, size));
+        }
+    }
 }
 
 pub(super) fn trace_loader(bytes: &[u8]) -> Result<LoaderTrace> {
@@ -528,6 +561,82 @@ pub(super) fn trace_loader(bytes: &[u8]) -> Result<LoaderTrace> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reader_tracks_saved_registers_and_vector_zero_initialization() -> Result<()> {
+        let original = "4C8BDC49895B08574881ECC00000000F57C0F30F7F442460488B8424F800000049894390498D4398498943884533D2458953804C89542440488B8424F0000000488944243844894C24304C895424284C895424204D8BC84C8BC2488BD1498D4BC0E81AD1FFFF9080BC24B0000000007421";
+        let code = hex(original)?;
+        assert_eq!(reader_call(&code, 0x10000), Some(0xd180));
+        // Equivalent stack allocation with signed, compact immediates.
+        let compact = hex(&original.replace("4881ECC0000000", "4883EC604883EC60"))?;
+        assert_eq!(reader_call(&compact, 0x10000), Some(0xd181));
+        assert!(
+            reader_call(
+                &hex(&original.replace("4881ECC0000000", "4883ECC0"))?,
+                0x10000
+            )
+            .is_none()
+        );
+        // Relocate the local frame, use a different saved register and XMM
+        // register, and keep the incoming arguments/result relationships.
+        let relocated = original
+            .replace("49895B0857", "4989730853")
+            .replace("ECC0000000", "ECD0000000")
+            .replace("0F57C0F30F7F442460", "660FEFC9660F7F4C2470")
+            .replace("24F8000000", "2408010000")
+            .replace("24F0000000", "2400010000")
+            .replace("24B0000000", "24C0000000")
+            .replace("49894390", "49894380")
+            .replace("49894388", "49898378FFFFFF")
+            .replace("45895380", "45899370FFFFFF");
+        // Instruction lengths may change; relocate the relative call as well.
+        let mut moved = hex(&relocated)?;
+        let call = moved.len() - 16;
+        assert_eq!(moved[call], 0xe8);
+        let target = 0x23456usize;
+        moved[call + 1..call + 5]
+            .copy_from_slice(&((target as i64 - (0x20000 + call + 5) as i64) as i32).to_le_bytes());
+        assert_eq!(reader_call(&moved, 0x20000), Some(target));
+        for (from, to) in [
+            ("0F57C0", "0F57C1"),         // vector is not zero
+            ("7F442460", "7F4C2460"),     // different vector source
+            ("7F442460", "7F442468"),     // incomplete limits range
+            ("57", "90"),                 // missing stack adjustment
+            ("498D4398", "498D4390"),     // wrong limits address
+            ("44894C2430", "44895C2430"), // unknown saved register as flags
+            ("4533D2", "4532D2"),         // byte clear cannot prove a pointer
+            ("4D8BC8", "49895B984D8BC8"), // unknown overwrite of limits
+            ("4D8BC8", "4589539C4D8BC8"), // partial overwrite of limits
+            ("80BC24B000000000", "80BC24A800000000"),
+        ] {
+            assert!(original.contains(from));
+            assert!(
+                reader_call(&hex(&original.replacen(from, to, 1))?, 0x10000).is_none(),
+                "accepted {from} -> {to}"
+            );
+        }
+        for end in 0..code.len() {
+            assert!(
+                reader_call(&code[..end], 0x10000).is_none(),
+                "accepted truncated reader at {end}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Opt-in, file-only check: no running Studio or helper is needed.
+    #[test]
+    #[ignore]
+    fn installed_studio_builds_expose_the_reader_contract() -> Result<()> {
+        for path in std::env::var("RENIUM_STUDIO_EXES")?.split(';') {
+            let prepared = prepared(Path::new(path))?;
+            println!(
+                "{path}: {:?}; history {:?}",
+                prepared.trace, prepared.history
+            );
+        }
+        Ok(())
+    }
     #[test]
     fn reader_requires_complete_stack_and_result_provenance() -> Result<()> {
         let original = "4C8BDC4881ECB80000004533D24D8953A84D8953B0488B8424E8000000498943A0498D43A849894398458953904D895388488B8424E00000004989438044894C24304C895424284C895424204D8BC84C8BC2488BD1498D4BC8E842D0FFFF9080BC24A8000000007421";

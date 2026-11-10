@@ -9,9 +9,128 @@ pub(crate) struct ObservationTrace {
     pub ensure: usize,
     pub allocate: usize,
     pub append: usize,
+    pub append_abi: AppendAbi,
     pub disconnect: usize,
     pub assign: usize,
     pub functions: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub(crate) enum AppendAbi {
+    Node = 0,
+    Connection = 1,
+}
+
+fn append_abi(
+    prefix: &[Instruction],
+    model: Register,
+    field: usize,
+    node: Register,
+) -> Result<AppendAbi> {
+    let args = prefix
+        .get(prefix.len().saturating_sub(2)..)
+        .filter(|w| w.len() == 2)
+        .context("Signal append has no arguments")?;
+    anyhow::ensure!(
+        args[1].mnemonic() == Mnemonic::Mov
+            && args[1].op0_register() == Register::RCX
+            && args[1].op1_kind() == OpKind::Memory
+            && mem(&args[1], model, field),
+        "Signal append receiver changed"
+    );
+    if args[0].mnemonic() == Mnemonic::Mov
+        && args[0].op0_register() == Register::RDX
+        && args[0].op1_register() == node
+    {
+        return Ok(AppendAbi::Node);
+    }
+    anyhow::ensure!(
+        node == Register::R8
+            && lea(&args[0], Register::RDX)
+            && matches!(args[0].memory_base(), Register::RSP | Register::RBP)
+            && args[0].memory_index() == Register::None,
+        "Signal append arguments changed"
+    );
+    Ok(AppendAbi::Connection)
+}
+
+// The connection-returning overload owns the extra weak reference which the
+// two-argument append leaves to its caller. Prove both the output and ownership
+// before selecting the helper's call signature; never infer it from a version.
+fn connection_append_contract(instructions: &[Instruction]) -> bool {
+    let saved = |source| {
+        instructions
+            .iter()
+            .take(12)
+            .find(|i| {
+                i.mnemonic() == Mnemonic::Mov
+                    && i.op1_register() == source
+                    && matches!(
+                        i.op0_register(),
+                        Register::RBX
+                            | Register::RBP
+                            | Register::RSI
+                            | Register::RDI
+                            | Register::R12
+                            | Register::R13
+                            | Register::R14
+                            | Register::R15
+                    )
+            })
+            .map(|i| i.op0_register())
+    };
+    let (Some(signal), Some(output), Some(node)) = (
+        saved(Register::RCX),
+        saved(Register::RDX),
+        saved(Register::R8),
+    ) else {
+        return false;
+    };
+    if signal == output || signal == node || output == node {
+        return false;
+    }
+    let writes = instructions
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| {
+            i.mnemonic() == Mnemonic::Mov && i.op0_kind() == OpKind::Memory && mem(i, output, 0)
+        })
+        .collect::<Vec<_>>();
+    !writes.is_empty()
+        && writes.iter().all(|(at, i)| {
+            i.memory_size().size() == 8
+                && i.op1_register() == node
+                && instructions
+                    .iter()
+                    .skip(at + 1)
+                    .take(4)
+                    .filter(|i| {
+                        i.mnemonic() == Mnemonic::Inc
+                            && i.has_lock_prefix()
+                            && i.memory_size().size() == 4
+                            && mem(i, node, 4)
+                    })
+                    .count()
+                    == 1
+        })
+        && instructions.iter().any(|i| {
+            i.mnemonic() == Mnemonic::Mov
+                && i.op0_kind() == OpKind::Memory
+                && mem(i, signal, 8)
+                && i.op1_register() == node
+        })
+        && instructions.iter().any(|i| {
+            i.mnemonic() == Mnemonic::Inc
+                && i.has_lock_prefix()
+                && i.memory_size().size() == 4
+                && mem(i, node, 0)
+        })
+        && instructions.iter().any(|i| {
+            i.mnemonic() == Mnemonic::Mov
+                && i.op0_register() == Register::RAX
+                && i.op1_register() == output
+        })
 }
 
 fn code(image: &PeImage<'_>, rva: usize) -> Result<Vec<Instruction>> {
@@ -49,22 +168,38 @@ fn lea(i: &Instruction, to: Register) -> bool {
     i.mnemonic() == Mnemonic::Lea && i.op0_register() == to && i.op1_kind() == OpKind::Memory
 }
 
-/// Find the typed ObjectValue signal call in its verified reflection invoker.
-/// The descriptor supplies a member offset, and the invoker passes a two-word
-/// shared Instance by address. No Studio-version-specific address is used.
-pub(super) fn relay_dispatch(image: &PeImage<'_>, invoker: usize) -> Result<usize> {
-    let instructions = code(image, invoker)?;
+pub(super) const RELAY_DESCRIPTOR: &str = ".?AV?$EventDesc@VObjectValue@RBX@@$$A6AXV?$shared_ptr@VInstance@RBX@@@std@@@ZV?$signal@$$A6AXV?$shared_ptr@VInstance@RBX@@@std@@@Z@rbx@@PEQ12@V56@@Reflection@RBX@@";
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct RelayTrace {
+    pub vtable: usize,
+    pub slot: usize,
+    pub invoker: usize,
+    pub member_field: usize,
+    pub fire: usize,
+}
+
+// Find the typed ObjectValue signal call, including the shared Instance pair
+// passed by address. Both the vtable slot and descriptor member field move.
+fn relay_call(instructions: &[Instruction]) -> Result<(usize, usize)> {
     let calls = instructions
         .windows(4)
         .filter(|w| {
             w[0].mnemonic() == Mnemonic::Movsxd
                 && w[0].op0_register() == Register::RCX
-                && mem(&w[0], Register::RBP, 0x78)
+                && w[0].op1_kind() == OpKind::Memory
+                && w[0].memory_base() == Register::RBP
+                && w[0].memory_index() == Register::None
+                && (0x20..0x400).contains(&w[0].memory_displacement64())
+                && w[0].memory_displacement64().is_multiple_of(4)
                 && w[1].mnemonic() == Mnemonic::Add
                 && w[1].op0_register() == Register::RCX
                 && w[1].op1_register() == Register::RSI
                 && lea(&w[2], Register::RDX)
-                && mem(&w[2], Register::RSP, 0x20)
+                && w[2].memory_base() == Register::RSP
+                && w[2].memory_index() == Register::None
+                && (0x20..0x400).contains(&w[2].memory_displacement64())
+                && w[2].memory_displacement64().is_multiple_of(8)
                 && call(&w[3]).is_some()
         })
         .collect::<Vec<_>>();
@@ -86,9 +221,69 @@ pub(super) fn relay_dispatch(image: &PeImage<'_>, invoker: usize) -> Result<usiz
             "Native attribute relay argument mapping changed"
         );
     }
-    let target = call(&calls[0][3]).unwrap();
-    code(image, target)?;
-    Ok(target)
+    let dispatch = calls[0];
+    let stack = dispatch[2].memory_displacement64() as usize;
+    anyhow::ensure!(
+        instructions.windows(4).any(|w| {
+            w[3].ip() < dispatch[0].ip()
+                && w[0].mnemonic() == Mnemonic::Mov
+                && w[0].op0_register() == Register::RAX
+                && w[0].op1_kind() == OpKind::Memory
+                && mem(&w[0], Register::RCX, 0)
+                && w[1].mnemonic() == Mnemonic::Mov
+                && w[1].op0_kind() == OpKind::Memory
+                && mem(&w[1], Register::RSP, stack)
+                && w[1].op1_register() == Register::RAX
+                && w[2].mnemonic() == Mnemonic::Mov
+                && w[2].op0_register() == Register::RAX
+                && w[2].op1_kind() == OpKind::Memory
+                && mem(&w[2], Register::RCX, 8)
+                && w[3].mnemonic() == Mnemonic::Mov
+                && w[3].op0_kind() == OpKind::Memory
+                && mem(&w[3], Register::RSP, stack + 8)
+                && w[3].op1_register() == Register::RAX
+        }),
+        "Native attribute relay shared Instance argument changed"
+    );
+    Ok((
+        dispatch[0].memory_displacement64() as usize,
+        call(&dispatch[3]).unwrap(),
+    ))
+}
+
+pub(super) fn relay_binding(image: &PeImage<'_>) -> Result<RelayTrace> {
+    let vtable = undo_selection::descriptor_vtable(image, RELAY_DESCRIPTOR.as_bytes())?;
+    let table = image.rva_to_offset(vtable)?;
+    let mut candidates = Vec::new();
+    for slot in 0..256 {
+        let Some(invoker) =
+            (read_u64(image.bytes, table + slot * 8)? as usize).checked_sub(image.image_base)
+        else {
+            break;
+        };
+        if image.require_executable_rva(invoker).is_err() {
+            break;
+        }
+        let Ok(instructions) = code(image, invoker) else {
+            continue;
+        };
+        let Ok((member_field, fire)) = relay_call(&instructions) else {
+            continue;
+        };
+        code(image, fire)?;
+        candidates.push(RelayTrace {
+            vtable,
+            slot,
+            invoker,
+            member_field,
+            fire,
+        });
+    }
+    anyhow::ensure!(
+        candidates.len() == 1,
+        "Native attribute relay invoker is missing or ambiguous"
+    );
+    Ok(candidates[0])
 }
 
 pub(crate) fn discover(image: &PeImage<'_>, set_enabled: usize) -> Result<ObservationTrace> {
@@ -184,18 +379,14 @@ pub(crate) fn discover(image: &PeImage<'_>, set_enabled: usize) -> Result<Observ
             && i.immediate(1) == 0xffff_ffff_ffff_fffb),
         "Signal payload destructor contract changed"
     );
-    anyhow::ensure!(
-        prefix.last().is_some_and(|i| i.mnemonic() == Mnemonic::Mov
-            && i.op0_register() == Register::RCX
-            && mem(i, model, signal_offset))
-            && prefix
-                .get(prefix.len() - 2)
-                .is_some_and(|i| i.mnemonic() == Mnemonic::Mov
-                    && i.op0_register() == Register::RDX
-                    && i.op1_register() == node),
-        "Signal append arguments changed"
-    );
+    let append_abi = append_abi(prefix, model, signal_offset, node)?;
     let append = call(&registration[append_at]).unwrap();
+    if append_abi == AppendAbi::Connection {
+        anyhow::ensure!(
+            connection_append_contract(&code(image, append)?),
+            "Signal append connection ownership changed"
+        );
+    }
     let tail = &registration[append_at + 1..];
     let cleanup = tail
         .windows(7)
@@ -210,6 +401,17 @@ pub(crate) fn discover(image: &PeImage<'_>, set_enabled: usize) -> Result<Observ
         })
         .collect::<Vec<_>>();
     anyhow::ensure!(cleanup.len() == 1, "Signal connection cleanup changed");
+    if append_abi == AppendAbi::Connection {
+        let output = &prefix[prefix.len() - 2];
+        anyhow::ensure!(
+            mem(
+                &cleanup[0][2],
+                output.memory_base(),
+                output.memory_displacement64() as usize
+            ),
+            "Signal append result is not the assigned connection"
+        );
+    }
     let disconnect = call(&cleanup[0][1]).unwrap();
     let assign = call(&cleanup[0][4]).unwrap();
     let connection_offset = cleanup[0][0].memory_displacement64();
@@ -254,8 +456,152 @@ pub(crate) fn discover(image: &PeImage<'_>, set_enabled: usize) -> Result<Observ
         ensure,
         allocate,
         append,
+        append_abi,
         disconnect,
         assign,
         functions,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn instructions(hexadecimal: &str) -> Vec<Instruction> {
+        Decoder::with_ip(64, &hex(hexadecimal).unwrap(), 0x1000, DecoderOptions::NONE)
+            .into_iter()
+            .collect()
+    }
+
+    #[test]
+    fn signal_append_distinguishes_node_and_connection_arguments() -> Result<()> {
+        assert_eq!(
+            append_abi(
+                &instructions("488BD7498B8E00070000"),
+                Register::R14,
+                0x700,
+                Register::RDI
+            )?,
+            AppendAbi::Node
+        );
+        for (code, field) in [
+            ("488D542440498B8E30070000", 0x730),
+            ("488D55D0498B8E98090000", 0x998),
+        ] {
+            assert_eq!(
+                append_abi(&instructions(code), Register::R14, field, Register::R8)?,
+                AppendAbi::Connection
+            );
+            assert!(append_abi(&instructions(code), Register::R15, field, Register::R8).is_err());
+            assert!(
+                append_abi(&instructions(code), Register::R14, field + 8, Register::R8).is_err()
+            );
+            assert!(append_abi(&instructions(code), Register::R14, field, Register::R9).is_err());
+        }
+        for code in [
+            "",
+            "488B542440498B8E30070000",
+            "488D542440498B9630070000",
+            "488D543840498B8E30070000",
+        ] {
+            assert!(append_abi(&instructions(code), Register::R14, 0x730, Register::R8).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn relay_discovers_member_field_and_shared_instance_argument() -> Result<()> {
+        let original = "488BF2488BE9488B014889442420488B4108488944242848638D900000004803CE488D542420E800010000";
+        let (field, target) = relay_call(&instructions(original))?;
+        assert_eq!(field, 0x90);
+        assert_eq!(target, 0x112b);
+        let moved = original
+            .replace("8D90000000", "8DB0000000")
+            .replace("442420", "442440")
+            .replace("442428", "442448")
+            .replace("542420", "542440");
+        assert_eq!(relay_call(&instructions(&moved))?, (0xb0, target));
+        for (from, to) in [
+            ("488BF2", "488BF1"),         // instance no longer comes from RDX
+            ("488BE9", "488BEA"),         // descriptor no longer comes from RCX
+            ("8D90000000", "8D91000000"), // unaligned descriptor member
+            ("488B4108", "488B4110"),     // not the shared owner's second word
+            ("4889442428", "4889442430"), // incomplete shared pair
+            ("488D542420", "488D542428"), // dispatch points at the owner
+            ("4803CE", "4803CF"),         // wrong signal receiver
+        ] {
+            assert!(
+                relay_call(&instructions(&original.replace(from, to))).is_err(),
+                "accepted {from}"
+            );
+        }
+        assert!(relay_call(&instructions(&format!("{original}{original}"))).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn connection_append_requires_output_and_both_owner_references() {
+        let original = "498BF84C8BF2488BF1F0FF0748897E0849893EF0FF4704498BC6C3";
+        assert!(connection_append_contract(&instructions(original)));
+        // Relocate the three nonvolatile captures together with every use.
+        assert!(connection_append_contract(&instructions(
+            "498BD84C8BE2488BE9F0FF0348895D0849891C24F0FF4304498BC4C3"
+        )));
+        // Both branch outputs must retain exactly once, including the path
+        // that delegates linking to the two-argument overload.
+        let two_paths = original.replace(
+            "498BC6",
+            "EB11488BD7E80000000049893E4885FF7404F0FF4704498BC6",
+        );
+        assert!(connection_append_contract(&instructions(&two_paths)));
+        assert!(!connection_append_contract(&instructions(
+            &two_paths.replacen("4885FF7404F0FF4704", "4885FF740490909090", 1)
+        )));
+        for (from, to) in [
+            ("4C8BF2", "4C8BF1"),             // output no longer comes from RDX
+            ("498BF8", "498BF9"),             // node no longer comes from R8
+            ("49893E", "498936"),             // returns the signal instead of the node
+            ("F0FF4704", "F0FF4708"),         // wrong weak owner field
+            ("F0FF4704", "90FF4704"),         // non-atomic retain
+            ("F0FF07", "F0FF4704"),           // no signal-owned strong reference
+            ("48897E08", "48897E10"),         // not the signal's node list
+            ("498BC6", "488BC7"),             // wrong result pointer
+            ("F0FF4704", "F0FF4704F0FF4704"), // double-retained connection
+        ] {
+            assert!(
+                !connection_append_contract(&instructions(&original.replace(from, to))),
+                "accepted {from}"
+            );
+        }
+    }
+
+    /// Use a reflected SetEnabled RVA with an executable; this never opens Studio.
+    #[test]
+    #[ignore]
+    fn installed_studio_exposes_the_attribute_signal_contract() -> Result<()> {
+        let path = std::env::var("RENIUM_STUDIO_EXE")?;
+        let rva = usize::from_str_radix(
+            std::env::var("RENIUM_SET_ENABLED_RVA")?.trim_start_matches("0x"),
+            16,
+        )?;
+        let bytes = fs::read(&path)?;
+        let image = PeImage::parse(&bytes)?;
+        let trace = discover(&image, rva)?;
+        let relay = relay_binding(&image)?;
+        println!("{path}: {trace:?}; relay {relay:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn native_signal_append_preserves_connection_ownership() -> Result<()> {
+        let status = std::process::Command::new(
+            Path::new(env!("OUT_DIR")).join("renium-signal-append-test.exe"),
+        )
+        .status()?;
+        assert!(
+            status.success(),
+            "signal append ownership test failed: {status}"
+        );
+        Ok(())
+    }
 }
