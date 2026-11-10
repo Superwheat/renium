@@ -233,9 +233,6 @@ fn items<'a>(value: &'a Value, key: &str) -> &'a [Value] {
         .map_or(&[][..], Vec::as_slice)
 }
 
-/// The most lines `--context` prints on each side of a hit.
-const MAX_CONTEXT_LINES: usize = 20;
-
 /// One hit as a `LINE: text` line, or a context line around a hit as
 /// `LINE- text`, without the indentation and with a long line cut short.
 fn push_hit_line(text: &mut String, hit: &Value) {
@@ -933,7 +930,7 @@ fn script_grep_at(root: &Path, source: &Path, parameters: &Value) -> Result<Valu
         return script_grep_functions(root, files, &matches, limit);
     }
     let limit = request.limit.unwrap_or(50).clamp(1, 1000);
-    let context = request.context.unwrap_or(0).min(MAX_CONTEXT_LINES);
+    let context = request.context.unwrap_or(0);
     // Matches are grouped by file: one path per script instead of one per line.
     let mut results: Vec<Value> = Vec::new();
     let mut returned = 0;
@@ -958,15 +955,14 @@ fn script_grep_at(root: &Path, source: &Path, parameters: &Value) -> Result<Valu
         let mut hits = Vec::new();
         let (mut listed, mut after) = (0, 0);
         for (index, line) in lines.iter().enumerate() {
-            if matches(line) {
-                total_matches += 1;
-                if returned < limit {
-                    returned += 1;
-                    let before = (index + 1).saturating_sub(context).max(listed + 1);
-                    hits.extend((before..=index).map(around));
-                    hits.push(json!({ "line": index + 1, "text": line }));
-                    (listed, after) = (index + 1, context);
-                }
+            let matched = matches(line);
+            total_matches += usize::from(matched);
+            if matched && returned < limit {
+                returned += 1;
+                let before = (index + 1).saturating_sub(context).max(listed + 1);
+                hits.extend((before..=index).map(around));
+                hits.push(json!({ "line": index + 1, "text": line }));
+                (listed, after) = (index + 1, context);
             } else if after > 0 {
                 hits.push(around(index + 1));
                 (listed, after) = (index + 1, after - 1);
@@ -1431,6 +1427,15 @@ end
             "{around}"
         );
         assert!(script_hits_text(&around).contains("- "), "{around}");
+        let cut = grep(json!({ "query": "rant", "scope": "src/Server", "context": 2, "limit": 1 }))
+            .unwrap();
+        let lines = cut["results"][0]["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| (hit["line"].as_u64().unwrap(), hit["context"] == true))
+            .collect::<Vec<_>>();
+        assert_eq!(lines, [(1, false), (2, true), (3, true)], "{cut}");
         let both = grep(json!({
             "query": "Grant",
             "scope": ["src/Server", "src/ServerOther/Wheel.luau"],
