@@ -1337,7 +1337,7 @@ fn collect_import_path_files(source: &Path, destination: &Path) -> Result<Vec<(P
         );
     }
     let mut files = Vec::new();
-    for entry in WalkDir::new(source) {
+    for entry in WalkDir::new(source).sort_by_file_name() {
         let entry = entry?;
         if entry.file_type().is_file() {
             files.push((
