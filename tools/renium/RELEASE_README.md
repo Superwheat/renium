@@ -7,4 +7,4 @@
 Choose an editor when asked. Installation adds Renium to PATH and installs the
 Studio plugin on Windows/macOS. Restart the editor and Studio.
 
-[Documentation](https://github.com/Superwheat/renium/tree/v{{VERSION}}/tools/renium)
+[Documentation](https://github.com/renium-rbx/renium/tree/v{{VERSION}}/tools/renium)

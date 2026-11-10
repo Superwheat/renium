@@ -17,7 +17,7 @@ use crate::studio::native::serializer;
 use crate::system::files::{resolved_current_executable, sha256_hex};
 use crate::system::tools::download_to_file;
 
-const GITHUB_REPO: &str = "Superwheat/renium";
+const GITHUB_REPO: &str = "renium-rbx/renium";
 pub(crate) const PLUGIN_ASSET_NAME: &str = "Renium.rbxm";
 
 #[cfg(target_os = "macos")]

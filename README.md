@@ -9,7 +9,7 @@ coding agent can build and test a game without someone clicking for it.
 ## Install
 
 Download the package for your system from
-[Releases](https://github.com/Superwheat/renium/releases/latest).
+[Releases](https://github.com/renium-rbx/renium/releases/latest).
 
 On Windows (x64 or ARM64), run `Install-Renium.cmd`. It picks the right build, checks
 each download against the release's checksums and puts `rbx` on PATH. On macOS
@@ -108,7 +108,7 @@ instead of Studio's Output window. These are the ones agents use most:
 
 Ask questions in the [Discord server](https://discord.gg/wwTFHSSNn3), where every
 release is announced. Report bugs as
-[GitHub issues](https://github.com/Superwheat/renium/issues);
+[GitHub issues](https://github.com/renium-rbx/renium/issues);
 `rbx report -m "what went wrong"` writes a diagnostics zip to attach. The
 [CLI guide](tools/renium/README.md) covers the project layout, Live Sync, saved
 data, playtests, publishing, troubleshooting and building from source, and the

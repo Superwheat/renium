@@ -21,7 +21,7 @@ use crate::app::timing::current_millis;
 use crate::system::files::{read_file_if_present, resolved_current_executable};
 
 const DEFAULT_UPDATE_MANIFEST: &str =
-    "https://github.com/Superwheat/renium/releases/latest/download/update-manifest.json";
+    "https://github.com/renium-rbx/renium/releases/latest/download/update-manifest.json";
 const UPDATE_PUBLIC_KEY: &str = "rgtfzbsFaGc3ZiDXdBcZ4KMLhaKcuv1BSD7b8D1lt7I=";
 const SHARED_CORE_LAUNCHERS: [&str; 2] = ["rbx", "rbx.cmd"];
 const AGENT_INSTRUCTIONS_FILE: &str = "renium-agents.md";

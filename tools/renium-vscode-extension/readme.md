@@ -37,7 +37,7 @@ restart Studio. On macOS, protected properties and Terrain need the Studio patch
 described in the [main README](../../README.md#the-native-helper).
 
 Questions go to the [Discord server](https://discord.gg/wwTFHSSNn3). Report bugs as
-[GitHub issues](https://github.com/Superwheat/renium/issues) with the Renium
+[GitHub issues](https://github.com/renium-rbx/renium/issues) with the Renium
 version, your OS, the action and the exact error.
 
 ## Development

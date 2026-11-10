@@ -162,7 +162,7 @@ place open. With several Studios or places open, `rbx cs` lists the runtimes and
 When something in Renium itself breaks, run `rbx report -m "what went wrong"`. It
 writes a zip with the diagnostics, the daemon log and the recent `rbx` commands
 from your agent's transcript, with keys and home paths masked. Review it, then
-attach it to the [GitHub issue](https://github.com/Superwheat/renium/issues) link it
+attach it to the [GitHub issue](https://github.com/renium-rbx/renium/issues) link it
 prints. Questions go to the [Discord server](https://discord.gg/wwTFHSSNn3).
 
 ## Build from source

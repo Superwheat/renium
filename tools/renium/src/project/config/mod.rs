@@ -59,7 +59,7 @@ pub(crate) use validation::validate_project;
 pub const PROJECT_FILE_NAME: &str = "renium.project.jsonc";
 pub const PROJECT_JSON_FILE_NAME: &str = "renium.project.json";
 pub const PROJECT_SCHEMA_VERSION: u32 = 1;
-pub const PROJECT_SCHEMA_URL: &str = "https://raw.githubusercontent.com/Superwheat/renium/main/tools/renium/schemas/renium.project.schema.json";
+pub const PROJECT_SCHEMA_URL: &str = "https://raw.githubusercontent.com/renium-rbx/renium/main/tools/renium/schemas/renium.project.schema.json";
 static SCRIPT_NAMING_CACHE: OnceLock<Mutex<HashMap<PathBuf, ProjectScriptNaming>>> =
     OnceLock::new();
 static GLOB_MATCHER_CACHE: OnceLock<Mutex<HashMap<String, GlobMatcher>>> = OnceLock::new();

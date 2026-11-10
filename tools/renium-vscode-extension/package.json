@@ -7,12 +7,12 @@
   "license": "SEE LICENSE IN LICENSE",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Superwheat/renium.git"
+    "url": "https://github.com/renium-rbx/renium.git"
   },
   "bugs": {
-    "url": "https://github.com/Superwheat/renium/issues"
+    "url": "https://github.com/renium-rbx/renium/issues"
   },
-  "homepage": "https://github.com/Superwheat/renium#readme",
+  "homepage": "https://github.com/renium-rbx/renium#readme",
   "icon": "assets/logo-white.png",
   "engines": {
     "vscode": "^1.84.0"

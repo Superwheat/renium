@@ -294,7 +294,7 @@ pub(crate) fn run(args: ReportArgs, global_project: Option<&Path>) -> Result<()>
     write_zip(&zip_path, &files)?;
 
     let issue_url = format!(
-        "https://github.com/Superwheat/renium/issues/new?title={}",
+        "https://github.com/renium-rbx/renium/issues/new?title={}",
         url_encode(&format!(
             "{id}: {}",
             message

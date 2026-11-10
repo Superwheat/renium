@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-repository="Superwheat/renium"
+repository="renium-rbx/renium"
 install_root="${XDG_DATA_HOME:-$HOME/.local/share}/renium"
 bin_root="$HOME/.local/bin"
 stable_bin_root="$HOME/.renium/bin"

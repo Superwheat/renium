@@ -4,7 +4,7 @@ version = "0.5.9"
 edition = "2024"
 rust-version = "1.95"
 license-file = "../../LICENSE"
-repository = "https://github.com/Superwheat/renium"
+repository = "https://github.com/renium-rbx/renium"
 build = "build.rs"
 
 [dependencies]
