@@ -76,6 +76,12 @@ jobs:
           }
           "Installed Renium $($doctor.version) is commit $head, CLI and Studio plugin"
 
+      # The collaboration relay row runs the relay Worker under wrangler from
+      # the repository's own packages.
+      - name: Install the relay's packages
+        working-directory: tools/renium-relay
+        run: npm ci --no-audit --no-fund
+
       # Jobs run with a home and a temp folder of the runner's own. The rows
       # are written against the profile a user has, the one Studio itself
       # reads, so this step runs in it. --brief keeps the logs, the failure
