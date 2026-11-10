@@ -9301,6 +9301,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					indices[name] = nextIndex
 					instance = byName[name] and byName[name][nextIndex]
 					if instance == nil then
+						if #name > 100 then
+							error(`Instance name has {#name} bytes and Studio keeps 100: {string.sub(name, 1, 40)}...`)
+						end
 						error(`Native insertion is missing an expected root: Studio did not create "{name}" under {group.target:GetFullName()}; a class Studio reserves for its own code (such as Noise) cannot be inserted into an open place`)
 					end
 					ordered[#ordered + 1] = instance
