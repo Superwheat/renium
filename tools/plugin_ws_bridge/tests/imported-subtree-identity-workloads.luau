@@ -52,21 +52,32 @@ local rows = {
 	{ 2, 1, "Leaf", "Folder", "editor:6c74" },
 	{ 1, 2, "TreeChild", "Part", "editor:6c75" },
 }
-local function group()
+local function partName(index)
+	return string.format("Part%05d", index) .. string.rep("x", 91)
+end
+local function group(extraCount)
+	local importedRows = table.clone(rows)
+	for index = 1, extraCount or 0 do
+		importedRows[#importedRows + 1] = { 1, 1, partName(index), "Part", `editor:wide{index}` }
+	end
 	return {
 		serviceName = "ReplicatedStorage", service = service, target = service, targetPath = { "ReplicatedStorage" },
 		rootPaths = { { pathSegments = { "ReplicatedStorage", "TreeRoot" }, pathOrdinals = { 1, 1 } } },
-		rootSettingsIds = { "editor:6c72" }, instanceIdentities = identity.validate(metadata(rows), 1),
+		rootSettingsIds = { "editor:6c72" }, instanceIdentities = identity.validate(metadata(importedRows), 1),
 		incoming = {}, incomingByPayloadIndex = {}, incomingRootsByPath = {}, count = 1,
 		payloadRootName = "payload", additive = true, retainedRoots = {}, packageRoots = {},
 	}
 end
-local function tree(parent, name)
+local function tree(parent, name, extraCount)
 	local root = folder(name or "TreeRoot", parent)
 	local child = folder("TreeChild", root)
 	local leaf = folder("Leaf", child)
 	local sibling = roblox.Instance.new("Part")
 	sibling.Name, sibling.Parent = "TreeChild", root
+	for index = 1, extraCount or 0 do
+		local part = roblox.Instance.new("Part")
+		part.Name, part.Parent = partName(index), root
+	end
 	return root, child, leaf, sibling
 end
 local _, finishStart = slice("\tfunction api.finishBinaryImport(", "\tfunction api.cancelBinaryImport(")
@@ -79,21 +90,24 @@ local deserializeGroups = luau.load(
 	} })()
 local function key(segments, ordinals) return table.concat(segments, "/") .. table.concat(ordinals, ",") end
 
-for _, path in { "deserialize", "native" } do
-	local ctx, prepared = {}, group()
+-- Native completion runs once after every 512-instance reader batch has
+-- finished. Both transports must register the complete tree at that point.
+for _, case in { { "deserialize", 0 }, { "native", 0 }, { "deserialize", 6000 }, { "native", 6000 } } do
+	local path, count = case[1], case[2]
+	local ctx, prepared = {}, group(count)
 	local root, child, leaf, sibling
 	if path == "deserialize" then
 		local payload = folder("payload")
-		root, child, leaf, sibling = tree(payload, "__ReniumImportRoot_1")
+		root, child, leaf, sibling = tree(payload, "__ReniumImportRoot_1", count)
 		prepared = deserializeGroups({ groups = { prepared } }, { payload = payload }, { {} }, ctx)[1]
 		identity.prepare(prepared)
-		root, child, leaf, sibling = table.unpack(prepared.importedSettingsInstances)
+		root, child, leaf, sibling = table.unpack(prepared.importedSettingsInstances, 1, 4)
 		identity.remember({ prepared }, ctx)
 		assert(identity.captured(child, ctx) == nil, "Staged descendants must not be reported as live")
 		root.Parent = service
 		identity.remember({ prepared }, ctx)
 	else
-		root, child, leaf, sibling = tree(service)
+		root, child, leaf, sibling = tree(service, nil, count)
 		-- Lune creates new userdata wrappers in GetChildren; Studio returns
 		-- the same Instance keys used by its native creation receipt.
 		prepared.target = { GetChildren = function() return { root } end,
@@ -109,13 +123,18 @@ for _, path in { "deserialize", "native" } do
 				runWithStudioChangeSuppression = function(_, callback) callback() end,
 				ReferenceOverlay = { apply = function() end },
 			} })()
-		local native = { readerArmed = true, invocationAuthorized = true, receivedCreated = 4, expectedCreated = 4,
+		local native = { readerArmed = true, invocationAuthorized = true, receivedCreated = count + 4, expectedCreated = count + 4,
 			createdById = {}, boundPaths = {}, started = os.clock() }
 		local result = complete({ nativeHeld = native, totalBytes = 100 }, {
 			assertOwnership = function() end, nativeUndo = { prepared = { prepared }, replacements = {} },
-		}, { nativePhase = "complete", nativeStatus = 4, nativeState = 14, nativeCreated = 4 })
+		}, { nativePhase = "complete", nativeStatus = 4, nativeState = 14, nativeCreated = count + 4 })
 		assert(result.nativeInserted)
-		root, child, leaf, sibling = table.unpack(prepared.importedSettingsInstances)
+		root, child, leaf, sibling = table.unpack(prepared.importedSettingsInstances, 1, 4)
+	end
+	assert(#prepared.importedSettingsInstances == count + 4)
+	for index = 1, count do
+		assert(identity.captured(prepared.importedSettingsInstances[index + 4], ctx) == `editor:wide{index}`,
+			`{path}: every imported descendant must keep its store id across batches`)
 	end
 	assert(identity.captured(child, ctx) == "editor:6c73" and identity.captured(leaf, ctx) == "editor:6c74",
 		`{path}: child={identity.captured(child, ctx)}, leaf={identity.captured(leaf, ctx)}, prepared={#(prepared.importedSettingsInstances or {})}`)
@@ -174,10 +193,17 @@ for _, mutate in {
 end
 do
 	local prepared = group()
-	local root, child = tree()
+	local root, child, leaf = tree()
 	prepared.incomingByPayloadIndex[1] = root
 	child.Name = "Wrong"
 	assert(not pcall(identity.prepare, prepared), "Missing payload identities must not be guessed")
+	child.Name = "TreeChild"
+	local oversized = table.clone(rows)
+	oversized[3] = { 2, 1, string.rep("x", 129), "Folder", "editor:6c74" }
+	prepared.instanceIdentities = identity.validate(metadata(oversized), 1)
+	-- Lune does not enforce Studio's Name limit; model the engine's result.
+	leaf.Name = string.rep("x", 100)
+	assert(not pcall(identity.prepare, prepared), "Truncated names must not be accepted as the requested identity")
 	root:Destroy()
 end
 
@@ -202,4 +228,4 @@ do
 	root:Destroy()
 end
 place:Destroy()
-print("Imported subtree identities: native and deserialize paths, nested/duplicate nodes, rename/newcomer, scope, refusal and 20k-node work budget")
+print("Imported subtree identities: native and deserialize 6k-node trees, nested/duplicate nodes, rename/newcomer, scope, truncation refusal and 20k-node work budget")

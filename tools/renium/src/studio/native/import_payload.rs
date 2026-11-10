@@ -152,6 +152,100 @@ fn import_identity_metadata_is_linear_for_deep_place_sized_trees() -> Result<()>
     Ok(())
 }
 
+#[test]
+fn import_identity_tree_covers_a_subtree_across_native_batches() -> Result<()> {
+    let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+    let service = dom.insert(dom.root_ref(), RbxInstanceBuilder::new("Workspace"));
+    let root = dom.insert(service, RbxInstanceBuilder::new("Folder").with_name("Bulk"));
+    let count = 6000;
+    assert!(count > NATIVE_IMPORT_BATCH_INSTANCES);
+    let names = (0..count)
+        .map(|index| format!("Part{index:05}{}", "x".repeat(91)))
+        .collect::<Vec<_>>();
+    let mut ids = HashMap::from([(root, "editor:bulk".to_string())]);
+    for (index, name) in names.iter().enumerate() {
+        let part = dom.insert(root, RbxInstanceBuilder::new("Part").with_name(name));
+        ids.insert(part, format!("editor:part{index}"));
+    }
+    let services = vec![("Workspace".to_string(), service)];
+    let groups = pending_editor_binary_groups(&dom, &services)?;
+    let plans = vec![EditorPackageGroupPlan {
+        retained_roots: Vec::new(),
+        package_roots: Vec::new(),
+        mutation_package_roots: Vec::new(),
+        change_generation: None,
+    }];
+    let (bytes, groups, replacement) = encode_services(
+        &mut dom,
+        &services,
+        &ids,
+        groups,
+        plans,
+        &mut HashMap::new(),
+    )?;
+    assert!(replacement.batches.len() > 1);
+    assert_eq!(
+        replacement.plan.aliases.len(),
+        replacement.batches.len() - 1
+    );
+    for alias in &replacement.plan.aliases {
+        assert_eq!(
+            replacement.plan.classes[alias.class_index as usize].name,
+            "Folder"
+        );
+        assert_eq!(alias.source_ordinal, 0);
+    }
+    let serialized_count = replacement
+        .batches
+        .iter()
+        .map(|batch| {
+            u32::from_le_bytes(
+                bytes[batch.bytes.start + 20..batch.bytes.start + 24]
+                    .try_into()
+                    .unwrap(),
+            ) as usize
+        })
+        .sum::<usize>();
+    // Each batch references Workspace and (after the first) the same Bulk.
+    assert_eq!(
+        serialized_count,
+        ids.len() + replacement.batches.len() * 2 - 1
+    );
+    assert_eq!(
+        replacement
+            .plan
+            .classes
+            .iter()
+            .find(|class| class.name == "Part")
+            .unwrap()
+            .count as usize,
+        count
+    );
+    assert_eq!(groups.len(), 1);
+    let identities = groups[0].instance_identities.as_ref().unwrap();
+    let rows = base64::decode(&identities.nodes)?;
+    assert_eq!(rows.len(), ids.len() * 20);
+    for (index, row) in rows.chunks_exact(20).enumerate() {
+        let word =
+            |offset| u32::from_le_bytes(row[offset..offset + 4].try_into().unwrap()) as usize;
+        let (name, class, id) = if index == 0 {
+            ("Bulk", "Folder", "editor:bulk".to_string())
+        } else {
+            (
+                names[index - 1].as_str(),
+                "Part",
+                format!("editor:part{}", index - 1),
+            )
+        };
+        assert_eq!(word(0), usize::from(index != 0));
+        assert_eq!(word(4), 1);
+        assert_eq!(identities.strings[word(8)], name);
+        assert_eq!(identities.strings[word(12)], class);
+        assert_eq!(identities.strings[word(16)], id);
+    }
+    Ok(())
+}
+
 pub(super) fn expected_structure(
     dom: &RbxWeakDom,
     root: RbxRef,

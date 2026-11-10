@@ -1945,6 +1945,40 @@ mod review_threshold_tests {
     use super::*;
 
     #[test]
+    fn six_thousand_parts_with_studio_sized_names_still_chunk_the_review() -> Result<()> {
+        use crate::editor::types::{EditorInstanceChange, EditorInstanceDescriptor};
+
+        let changes = EditorChangeSet {
+            instance_changes: vec![EditorInstanceChange {
+                service: "Workspace".into(),
+                mode: "upsertInstances".into(),
+                instances: (0..6000)
+                    .map(|index| EditorInstanceDescriptor {
+                        settings_id: format!("editor:{index:x}"),
+                        path_segments: vec![
+                            "Workspace".into(),
+                            "Bulk".into(),
+                            format!("Part{index:05}{}", "x".repeat(91)),
+                        ],
+                        class_name: "Part".into(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                allow_deletes: false,
+                preserve_instances: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        let (count, rows) = editor_review_payload(&changes);
+        assert_eq!(count, 6000);
+        assert!(serde_json::to_vec(&rows)?.len() > 1024 * 1024);
+        let chunks = editor_review_chunks(rows, 1024 * 1024)?;
+        assert!(chunks.len() > 1);
+        assert_eq!(chunks.iter().map(Vec::len).sum::<usize>(), 6000);
+        Ok(())
+    }
+
+    #[test]
     fn a_review_digest_names_each_instance_and_its_changes() {
         let rows = vec![
             json!({

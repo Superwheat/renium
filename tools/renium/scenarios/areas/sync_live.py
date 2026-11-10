@@ -805,13 +805,17 @@ def staged_push_reviews_against_the_project_threshold(ctx: Context):
 
 def chunked_review_honors_the_project_threshold(ctx: Context):
     """SYNC-259: a review payload over 1 MiB reaches the plugin in chunks and still applies the project's
-    liveSync.changesThreshold: with the project at 100000 and the plugin's own threshold at 0 (H4) the push
-    applies without a hold; with the project at 0 it applies nothing and answers heldForReview."""
+    liveSync.changesThreshold: with the project at 100000 the push applies without a hold;
+    with the project at 0 the CLI returns a held review and leaves Studio unchanged. A subsequent
+    rename and pull keeps every imported instance's store identity."""
     from areas.data_live import _review_threshold_zero
 
     count = 6000
+    # Studio truncates Name to 100 bytes. Keep these unique ASCII names within
+    # that limit so the identity receipt can verify the actual imported tree.
+    names = [f"Part{index:05d}".ljust(100, "x") for index in range(count)]
     ops = [{"parent": "Workspace", "name": "Bulk", "class": "Folder", "ref": "bulk"}]
-    ops += [{"parent": "#bulk", "name": f"Part{index:05d}" + "x" * 120, "class": "Part"} for index in range(count)]
+    ops += [{"parent": "#bulk", "name": name, "class": "Part"} for name in names]
     with _review_threshold_zero(ctx):
         created = ctx.rbx("ba", "--batch", "-", stdin=json.dumps({"ops": ops}), timeout=600)
         ctx.expect(len(created.get("ops") or []) == len(ops), f"batch created {len(created.get('ops') or [])} of {len(ops)}")
@@ -830,9 +834,22 @@ def chunked_review_honors_the_project_threshold(ctx: Context):
         ctx.expect(counted.ok and (counted.get("results") or [None])[0] == count, f"every Part reached Studio: {counted.json or counted.error[:200]}")
         ctx.rbx("l", "workspace.Bulk:Destroy() return true", "-t", "60", timeout=120)
         ctx.rbx("cfg", "set", "liveSync.changesThreshold", "0", timeout=60)
-        held = ctx.rbx("ps", WORKSPACE, "-u", ok=None, timeout=600)
-        ctx.expect(held.get("heldForReview") is True, f"a chunked review with the project threshold at 0 was not held: {held.json} stderr={held.stderr[-300:]!r}")
-        ctx.expect(ctx.luau("return workspace:FindFirstChild('Bulk') == nil") is True, "Studio unchanged while the push is held")
+        held = ctx.rbx("ps", WORKSPACE, "-u", timeout=600)
+        ctx.expect(held.get("heldForReview") is True and held.get("reviewInstances", 0) >= count,
+                   f"a chunked review with the project threshold at 0 was not held: {held.json}")
+        ctx.expect(ctx.luau("return workspace:FindFirstChild('Bulk') == nil") is True, "Studio unchanged by the held review")
+        # Check the import identity round trip after the review checks: a pull
+        # also captures engine defaults, which would change their payload.
+        ctx.rbx("cfg", "set", "liveSync.changesThreshold", "100000", timeout=60)
+        ctx.rbx("ps", WORKSPACE, "-u", timeout=600)
+        renamed = count // 2
+        ctx.luau(f'workspace.Bulk[{json.dumps(names[renamed])}].Name = "RenamedPart" return true')
+        ctx.rbx("pl", "-s", "Workspace", timeout=600)
+        expected_ids = {op["id"]: op["path"].rsplit(".", 1)[-1] for op in created["ops"]}
+        expected_ids[created["ops"][renamed + 1]["id"]] = "RenamedPart"
+        pulled = ctx.rbx("f", "Workspace", "--path", "Bulk", "--all", timeout=60).json
+        ctx.expect(len(pulled) == len(expected_ids) and {row["id"]: row["n"] for row in pulled} == expected_ids,
+                   "every imported instance keeps its store id after a Studio rename and pull")
 
 
 def _names_viewport_camera(ctx: Context) -> bool:
