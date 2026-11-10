@@ -16,6 +16,7 @@ jobs:
     runs-on: ["self-hosted", "Windows", "X64"]
     outputs:
       version: ${{ steps.version.outputs.version }}
+      scenarios: ${{ steps.scenarios.outputs.only }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -44,6 +45,23 @@ jobs:
             throw "Studio plugin version does not match $version"
           }
           "version=$version" >> $env:GITHUB_OUTPUT
+
+      # A tag cut again for the same version, after the whole matrix ran on
+      # an earlier cut, may name the rows its matrix runs: a line
+      # `Scenarios: SYNC-001,PLAY-002` in the signed tag's message. Without
+      # that line every row runs.
+      - id: scenarios
+        shell: pwsh
+        run: |
+          $lines = @(git tag -l --format='%(contents:body)' "${{ github.ref_name }}" | Where-Object { $_ -match '^\s*Scenarios:' })
+          if ($lines.Count -gt 1) { throw "The tag message names its scenarios more than once" }
+          $only = ""
+          if ($lines.Count -eq 1) {
+            $only = ($lines[0] -replace '^\s*Scenarios:', '') -replace '\s', ''
+            if ($only -notmatch '^[A-Z]+-\d+(,[A-Z]+-\d+)*$') { throw "The tag's Scenarios line is not a list of row ids: $only" }
+          }
+          "only=$only" >> $env:GITHUB_OUTPUT
+          if ($only) { "The matrix runs: $only" } else { "The matrix runs every row" }
 
   quality:
     name: Rust format and lints
@@ -458,6 +476,8 @@ jobs:
     name: Scenario matrix
     needs: [verify-tag, quality, cli, integration, extensions]
     uses: ./.github/workflows/scenarios.yml
+    with:
+      only: ${{ needs.verify-tag.outputs.scenarios }}
 
   publish:
     name: Publish GitHub release
