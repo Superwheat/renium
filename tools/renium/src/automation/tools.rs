@@ -44,6 +44,9 @@ struct ScriptGrep {
     query: String,
     #[serde(default)]
     case_insensitive: bool,
+    #[serde(default)]
+    regex: bool,
+    scope: Option<String>,
     limit: Option<usize>,
 }
 
@@ -191,9 +194,10 @@ fn print_script_hits(result: Result<Value, Failure>) -> anyhow::Result<()> {
 
 const HIT_TEXT_LIMIT: usize = 240;
 
-/// Search hits as text: each script's path on its own line, then its hits as
-/// `LINE: text` without the indentation and with a long line cut short, and
-/// a last line when the limit left hits out.
+/// Search hits as text: each script's path on its own line, for a grep
+/// followed by its hits as `LINE: text` without the indentation and with a
+/// long line cut short, and a last line when the limit left hits out. A
+/// script search names the scripts only; `rbx sg` shows the lines.
 fn script_hits_text(value: &Value) -> String {
     let results = value["results"].as_array().map_or(&[][..], Vec::as_slice);
     if results.is_empty() {
@@ -204,8 +208,8 @@ fn script_hits_text(value: &Value) -> String {
     for result in results {
         text.push_str(result["path"].as_str().unwrap_or_default());
         text.push('\n');
-        let hits = result.get("hits").or_else(|| result.get("matches"));
-        for hit in hits
+        for hit in result
+            .get("hits")
             .and_then(Value::as_array)
             .map_or(&[][..], Vec::as_slice)
         {
@@ -258,6 +262,8 @@ pub(crate) fn script_grep_command(
         &json!({
             "query": args.query,
             "caseInsensitive": args.case_insensitive,
+            "regex": args.regex,
+            "scope": args.scope,
             "limit": args.limit,
         }),
     ))
@@ -278,8 +284,7 @@ pub(crate) fn script_read_command(
     )
     .map_err(|failure| anyhow::anyhow!(failure.0.m))?;
     let text = format!(
-        "{}:{}-{}/{}\n{}",
-        value["path"].as_str().unwrap_or_default(),
+        "{}-{}/{}\n{}",
         value["startLine"],
         value["endLine"],
         value["totalLines"],
@@ -486,26 +491,23 @@ fn script_grep_at(root: &Path, source: &Path, parameters: &Value) -> Result<Valu
             "script-grep",
         ));
     }
-    let needle = if request.case_insensitive {
-        request.query.to_ascii_lowercase()
-    } else {
-        request.query
-    };
-    let limit = request.limit.unwrap_or(100).clamp(1, 1000);
+    let matches = line_matcher(&request)?;
+    let scope = request.scope.as_deref().map(scope_prefix);
+    let limit = request.limit.unwrap_or(50).clamp(1, 1000);
     // Matches are grouped by file: one path per script instead of one per line.
     let mut results: Vec<Value> = Vec::new();
     let mut returned = 0;
     let mut total_matches = 0;
     for path in script_files(source) {
+        if let Some(scope) = scope.as_deref()
+            && !in_scope(&relative(root, &path), scope)
+        {
+            continue;
+        }
         let source = read_script(&path, "script-grep")?;
         let mut hits = Vec::new();
         for (index, line) in source.lines().enumerate() {
-            let matches = if request.case_insensitive {
-                line.to_ascii_lowercase().contains(&needle)
-            } else {
-                line.contains(&needle)
-            };
-            if matches {
+            if matches(line) {
                 total_matches += 1;
                 if returned < limit {
                     returned += 1;
@@ -525,6 +527,50 @@ fn script_grep_at(root: &Path, source: &Path, parameters: &Value) -> Result<Valu
     Ok(result)
 }
 
+type LineMatcher = Box<dyn Fn(&str) -> bool>;
+
+/// The test a grep applies to each line: the query as literal text, or as a
+/// regular expression when asked, with or without regard to case.
+fn line_matcher(request: &ScriptGrep) -> Result<LineMatcher, Failure> {
+    if request.regex {
+        let pattern = regex::RegexBuilder::new(&request.query)
+            .case_insensitive(request.case_insensitive)
+            .build()
+            .map_err(|error| {
+                failure(
+                    format!("Invalid regular expression: {error}"),
+                    "script-grep",
+                )
+            })?;
+        return Ok(Box::new(move |line| pattern.is_match(line)));
+    }
+    if request.case_insensitive {
+        let needle = request.query.to_ascii_lowercase();
+        return Ok(Box::new(move |line| {
+            line.to_ascii_lowercase().contains(&needle)
+        }));
+    }
+    let needle = request.query.clone();
+    Ok(Box::new(move |line| line.contains(&needle)))
+}
+
+/// A `--in` path as the prefix a script's project-relative path is tested
+/// against: forward slashes, no leading `./` and no trailing slash.
+fn scope_prefix(scope: &str) -> String {
+    let scope = scope.replace('\\', "/");
+    scope
+        .trim_start_matches("./")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn in_scope(relative: &str, scope: &str) -> bool {
+    relative == scope
+        || relative
+            .strip_prefix(scope)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 pub(crate) fn script_grep(context: &BoundContext, parameters: &Value) -> Result<Value, Failure> {
     script_grep_at(
         Path::new(&context.root),
@@ -537,7 +583,77 @@ pub(crate) fn script_grep(context: &BoundContext, parameters: &Value) -> Result<
 mod tests {
     use serde_json::json;
 
-    use super::{HIT_TEXT_LIMIT, script_hits_text};
+    use super::{HIT_TEXT_LIMIT, script_grep_at, script_hits_text};
+
+    #[test]
+    fn a_grep_takes_a_regular_expression_and_a_path_scope() {
+        let root = crate::system::files::create_unique_directory(
+            &std::env::temp_dir(),
+            "renium-script-grep-",
+        )
+        .unwrap();
+        let _cleanup = crate::system::files::OnDrop::new(|| {
+            let _ = std::fs::remove_dir_all(&root);
+        });
+        let source = root.join("src");
+        std::fs::create_dir_all(source.join("Server")).unwrap();
+        std::fs::create_dir_all(source.join("ServerOther")).unwrap();
+        std::fs::write(
+            source.join("Server/Shop.server.luau"),
+            "local function grantSpins()\nend\nGrantSpins = grantSpins\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("ServerOther/Wheel.luau"),
+            "api.GrantRevive(player)\n",
+        )
+        .unwrap();
+        let grep = |parameters: serde_json::Value| {
+            script_grep_at(&root, &source, &parameters).map_err(|failure| failure.0.m)
+        };
+        let hits = |value: &serde_json::Value| {
+            value["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|result| {
+                    (
+                        result["path"].as_str().unwrap().to_string(),
+                        result["hits"].as_array().unwrap().len(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let either = grep(json!({ "query": "GrantSpins|GrantRevive", "regex": true })).unwrap();
+        assert_eq!(
+            hits(&either),
+            vec![
+                ("src/Server/Shop.server.luau".to_string(), 1),
+                ("src/ServerOther/Wheel.luau".to_string(), 1)
+            ]
+        );
+        let literal = grep(json!({ "query": "GrantSpins|GrantRevive" })).unwrap();
+        assert_eq!(literal["totalMatches"], json!(0));
+        let folded =
+            grep(json!({ "query": "^grant", "regex": true, "caseInsensitive": true })).unwrap();
+        assert_eq!(
+            hits(&folded),
+            vec![("src/Server/Shop.server.luau".to_string(), 1)]
+        );
+        let scoped = grep(json!({ "query": "Grant", "scope": "src\\Server/" })).unwrap();
+        assert_eq!(
+            hits(&scoped),
+            vec![("src/Server/Shop.server.luau".to_string(), 1)]
+        );
+        let one_file =
+            grep(json!({ "query": "Grant", "scope": "./src/ServerOther/Wheel.luau" })).unwrap();
+        assert_eq!(
+            hits(&one_file),
+            vec![("src/ServerOther/Wheel.luau".to_string(), 1)]
+        );
+        let broken = grep(json!({ "query": "(", "regex": true })).err().unwrap();
+        assert!(broken.contains("Invalid regular expression"));
+    }
 
     #[test]
     fn grep_hits_print_one_path_per_script_and_unindented_lines() {
@@ -575,7 +691,7 @@ mod tests {
         });
         assert_eq!(
             script_hits_text(&search),
-            "src/A.luau\n1: x\n1 of 9 scripts shown; -l N shows more"
+            "src/A.luau\n1 of 9 scripts shown; -l N shows more"
         );
     }
 

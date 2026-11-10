@@ -1951,7 +1951,15 @@ pub(super) struct ScriptGrepArgs {
     pub(super) query: String,
     #[arg(help = "Ignore case", short = 'i', long)]
     pub(super) case_insensitive: bool,
-    #[arg(help = "Maximum matching lines", short, long, default_value_t = 100)]
+    #[arg(help = "Read the query as a regular expression", short = 'E', long)]
+    pub(super) regex: bool,
+    #[arg(
+        help = "Search only this script file or folder, a path under the project",
+        long = "in",
+        value_name = "PATH"
+    )]
+    pub(super) scope: Option<String>,
+    #[arg(help = "Maximum matching lines", short, long, default_value_t = 50)]
     pub(super) limit: usize,
 }
 

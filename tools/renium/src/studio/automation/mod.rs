@@ -167,7 +167,7 @@ fn luau_text(result: &Value) -> String {
         .filter(|(key, _)| {
             !matches!(
                 key.as_str(),
-                "ok" | "context" | "persistence" | "results" | "output"
+                "ok" | "context" | "persistence" | "results" | "output" | "timeoutSeconds"
             )
         })
         .map(|(key, value)| (key.clone(), value.clone()))
@@ -175,7 +175,23 @@ fn luau_text(result: &Value) -> String {
     if !notes.is_empty() {
         lines.push(format!("note: {}", Value::Object(notes)));
     }
-    lines.join("\n")
+    cap_luau_text(lines.join("\n"))
+}
+
+/// The most characters a plain Luau run prints in text mode.
+const LUAU_TEXT_LIMIT: usize = 100_000;
+
+/// A run's text, cut at the limit with a last line that says how much was
+/// left out, so one oversized return does not fill a reader's context.
+fn cap_luau_text(text: String) -> String {
+    let Some((cut, _)) = text.char_indices().nth(LUAU_TEXT_LIMIT) else {
+        return text;
+    };
+    let total = text.chars().count();
+    format!(
+        "{}\n... (cut: {LUAU_TEXT_LIMIT} of {total} characters shown; return less, or read it with --output-mode json)",
+        &text[..cut]
+    )
 }
 
 fn luau_value_text(value: &Value) -> String {
@@ -5892,7 +5908,18 @@ mod compact_result_tests {
                 "timeoutSeconds": 35.0,
                 "syncReview": "Live Sync is waiting"
             })),
-            "[print] step 1\n  step 2\n[warn] [Renium stopped capturing command output at its size limit.]\n{\"_truncated\":{\"kept\":128,\"total\":300},\"a\":1}\nnote: {\"syncReview\":\"Live Sync is waiting\",\"timeoutSeconds\":35.0}"
+            "[print] step 1\n  step 2\n[warn] [Renium stopped capturing command output at its size limit.]\n{\"_truncated\":{\"kept\":128,\"total\":300},\"a\":1}\nnote: {\"syncReview\":\"Live Sync is waiting\"}"
+        );
+        let long =
+            luau_text(&json!({"ok": true, "results": ["\u{e9}".repeat(LUAU_TEXT_LIMIT + 7)]}));
+        let (shown, note) = long.split_once('\n').unwrap();
+        assert_eq!(shown.chars().count(), LUAU_TEXT_LIMIT);
+        assert_eq!(
+            note,
+            format!(
+                "... (cut: {LUAU_TEXT_LIMIT} of {} characters shown; return less, or read it with --output-mode json)",
+                LUAU_TEXT_LIMIT + 7
+            )
         );
         assert_eq!(
             luau_text(&json!({"ok": true, "output": [{"type": "print", "message": "done"}]})),

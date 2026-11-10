@@ -32,7 +32,7 @@ When the recipes do not cover the task, read the guide once; reread after a repo
 
 Single-place projects use `src`; experiences `places/<alias>/src`, and at the experience root add `--place <alias|placeId>`. Two Studios on one project: `--place <placeId|window name>` first.
 
-Edit scripts as files; stores are compressed (no grep). `f`/`bg`/`bb` read saved data, `q` a closed place, `l` Studio (`l` tables over 128 keys are cut). After a failure check state first.
+Edit scripts as files; stores are compressed (no grep). `rbx sg TEXT` (`-E` regex, `--in src/Folder`) greps scripts with one path per script, not per line. `f`/`bg`/`bb` read saved data, `q` a closed place, `l` Studio (`l` tables over 128 keys are cut). After a failure check state first.
 
 Fix and verify defects in requested work. Report `autoDesyncedPackages`. Publishing needs authorization. Say synced, not saved: `persistence: teamCreate` means Team Create saved it, `unsaved` means the user saves. Open Cloud uploads follow `RENIUM/publishing-validation.md`.
 
