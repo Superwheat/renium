@@ -2387,16 +2387,16 @@ fn edit_requests_of_different_studios_run_at_the_same_time() {
     };
     thread::scope(|scope| {
         let long = scope.spawn(|| luau(10, contexts[0]));
-        thread::sleep(Duration::from_millis(500));
-        assert_eq!(
-            bridge.runtime_gate_holder("edit-a").map(|(name, _)| name),
-            Some("luau"),
-            "the long request holds its own Studio's gate"
-        );
-        assert!(
-            bridge.try_acquire_request_gate().is_some(),
-            "and leaves the process-wide gate free"
-        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while bridge.runtime_gate_holder("edit-a").map(|(name, _)| name) != Some("luau")
+            || bridge.try_acquire_request_gate().is_none()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the long request holds its own Studio's gate and leaves the process-wide gate free"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
         let started = Instant::now();
         let other = luau(11, contexts[1]);
         assert_eq!(other.ok, 1, "{}", serde_json::to_string(&other).unwrap());

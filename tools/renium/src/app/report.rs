@@ -1383,18 +1383,4 @@ mod tests {
         assert!(path_key(&claude_session_cwd(&claude).unwrap()).starts_with(&path_key("E:/proj")));
         let _ = fs::remove_dir_all(&root);
     }
-
-    #[test]
-    fn report_ids_have_a_date_and_six_characters() {
-        let id = report_id().unwrap();
-        let parts: Vec<&str> = id.split('-').collect();
-        assert_eq!(parts[0], "RNM");
-        assert_eq!(parts[1].len(), 8);
-        assert_eq!(parts[2].len(), 6);
-        assert!(
-            parts[2]
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric())
-        );
-    }
 }

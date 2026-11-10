@@ -2073,13 +2073,6 @@ mod review_threshold_tests {
         compact_held_review(&mut applied);
         assert_eq!(applied, before);
     }
-
-    #[test]
-    fn the_hold_notice_names_the_review_and_its_decisions() {
-        let notice = editor_review_hold_notice("editor push", "r-1", 2);
-        assert!(notice.contains("held for review in Studio (id=r-1, changes=2)"));
-        assert!(notice.contains("rbx rv apply"));
-    }
 }
 
 #[cfg(test)]

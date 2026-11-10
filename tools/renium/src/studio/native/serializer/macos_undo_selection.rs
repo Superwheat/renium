@@ -274,6 +274,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "reads whichever Studio is installed; run it by hand against a new Studio build"]
     fn installed_studio_resolves_two_restore_selection_branches() {
         // The newest installed bundle, and its engine rather than Renium's
         // launcher stub once the native helper is installed.

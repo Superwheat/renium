@@ -941,19 +941,27 @@ const NAMED_DAEMON_START_ATTEMPTS: usize = 4;
 /// same moment can still win the child's bind, after which the child exits,
 /// so a daemon that did not become ready on a block someone else now holds
 /// is started again on the next free block.
-fn ensure_named_daemon(mut start: impl FnMut(&str, u16) -> Result<()>) -> Result<()> {
+fn ensure_named_daemon(start: impl FnMut(&str, u16) -> Result<()>) -> Result<()> {
     let _one_start_at_a_time = named_daemon_start_lock();
+    start_on_free_block(|port| TcpListener::bind(("127.0.0.1", port)), start)
+}
+
+/// `bind` holds one local port for as long as its value lives.
+fn start_on_free_block<Bound>(
+    bind: impl Fn(u16) -> io::Result<Bound>,
+    mut start: impl FnMut(&str, u16) -> Result<()>,
+) -> Result<()> {
     let mut first = NAMED_DAEMON_FIRST_CONTROL_PORT;
     let mut attempt = 1;
     loop {
-        let block = free_named_daemon_ports_from(first)?;
+        let block = free_named_daemon_ports_from(first, &bind)?;
         let control_port = block.control_port;
         let ports = block.ports.clone();
         drop(block);
         let started = start(&ports, control_port);
         if started.is_ok()
             || attempt >= NAMED_DAEMON_START_ATTEMPTS
-            || !named_daemon_block_taken(control_port)
+            || !named_daemon_block_taken(control_port, &bind)
         {
             return started;
         }
@@ -962,21 +970,24 @@ fn ensure_named_daemon(mut start: impl FnMut(&str, u16) -> Result<()>) -> Result
     }
 }
 
-struct NamedDaemonPorts {
+struct NamedDaemonPorts<Bound> {
     control_port: u16,
     ports: String,
-    _reserved: Vec<TcpListener>,
+    _reserved: Vec<Bound>,
 }
 
 /// Ports for a named daemon started on demand: the first free block of a
 /// control port and two bridge ports from `first` up, in steps of ten, so it
 /// never fights the default daemon's 8780-8782 or another named daemon's.
 /// The block stays bound while the value lives.
-fn free_named_daemon_ports_from(first: u16) -> Result<NamedDaemonPorts> {
+fn free_named_daemon_ports_from<Bound>(
+    first: u16,
+    bind: &impl Fn(u16) -> io::Result<Bound>,
+) -> Result<NamedDaemonPorts<Bound>> {
     let mut control_port = first;
     while control_port <= u16::MAX - 2 {
         let reserved = (control_port..=control_port + 2)
-            .map(|port| TcpListener::bind(("127.0.0.1", port)))
+            .map(bind)
             .collect::<io::Result<Vec<_>>>();
         if let Ok(reserved) = reserved {
             return Ok(NamedDaemonPorts {
@@ -992,86 +1003,110 @@ fn free_named_daemon_ports_from(first: u16) -> Result<NamedDaemonPorts> {
     )
 }
 
-fn named_daemon_block_taken(control_port: u16) -> bool {
-    (control_port..=control_port + 2).any(|port| TcpListener::bind(("127.0.0.1", port)).is_err())
+fn named_daemon_block_taken<Bound>(
+    control_port: u16,
+    bind: &impl Fn(u16) -> io::Result<Bound>,
+) -> bool {
+    (control_port..=control_port + 2).any(|port| bind(port).is_err())
 }
 
 #[cfg(test)]
 mod named_daemon_port_tests {
     use super::*;
-    use crate::system::LockRecover;
-    use std::sync::Mutex;
+    use std::cell::RefCell;
+    use std::collections::BTreeSet;
 
-    /// The port blocks are process-wide; the tests that bind them take this
-    /// lock so one test's reservation is not another's collision.
-    static PORT_BLOCKS: Mutex<()> = Mutex::new(());
+    /// The ports in use, in place of this machine's: a real port is also held
+    /// by other processes and by a child another test forks.
+    #[derive(Default)]
+    struct Ports(RefCell<BTreeSet<u16>>);
+
+    struct Held<'a>(&'a Ports, u16);
+
+    impl Ports {
+        fn bind(&self, port: u16) -> io::Result<Held<'_>> {
+            if self.0.borrow_mut().insert(port) {
+                Ok(Held(self, port))
+            } else {
+                Err(io::ErrorKind::AddrInUse.into())
+            }
+        }
+    }
+
+    impl Drop for Held<'_> {
+        fn drop(&mut self) {
+            self.0.0.borrow_mut().remove(&self.1);
+        }
+    }
+
+    const FIRST: u16 = NAMED_DAEMON_FIRST_CONTROL_PORT;
 
     #[test]
     fn named_daemons_take_a_free_block_from_8790_up() {
-        let _serial = PORT_BLOCKS.lock_recover();
-        let block = free_named_daemon_ports_from(NAMED_DAEMON_FIRST_CONTROL_PORT).unwrap();
-        let control_port = block.control_port;
-        assert!(control_port >= NAMED_DAEMON_FIRST_CONTROL_PORT);
+        let ports = Ports::default();
+        let bind = |port| ports.bind(port);
+        let block = free_named_daemon_ports_from(FIRST, &bind).unwrap();
         assert_eq!(
-            (control_port - NAMED_DAEMON_FIRST_CONTROL_PORT) % 10,
-            0,
-            "{control_port}"
+            (block.control_port, block.ports.as_str()),
+            (8790, "8791,8792")
         );
+        drop(block);
+        let _bridge_of_another_daemon = ports.bind(8791).unwrap();
+        let block = free_named_daemon_ports_from(FIRST, &bind).unwrap();
         assert_eq!(
-            block.ports,
-            format!("{},{}", control_port + 1, control_port + 2)
+            (block.control_port, block.ports.as_str()),
+            (8800, "8801,8802")
         );
+        assert!(ports.bind(8790).is_ok(), "a refused block keeps no port");
     }
 
     #[test]
     fn simultaneous_named_starts_allocate_different_blocks() {
-        let _serial = PORT_BLOCKS.lock_recover();
-        let first = free_named_daemon_ports_from(NAMED_DAEMON_FIRST_CONTROL_PORT).unwrap();
-        let second = free_named_daemon_ports_from(NAMED_DAEMON_FIRST_CONTROL_PORT).unwrap();
-        assert!(
-            second.control_port > first.control_port,
-            "{} then {}",
-            first.control_port,
-            second.control_port
-        );
-        assert_eq!((second.control_port - first.control_port) % 10, 0);
+        let ports = Ports::default();
+        let bind = |port| ports.bind(port);
+        let first = free_named_daemon_ports_from(FIRST, &bind).unwrap();
+        let second = free_named_daemon_ports_from(FIRST, &bind).unwrap();
+        assert_eq!((first.control_port, second.control_port), (8790, 8800));
         drop(first);
-        let third = free_named_daemon_ports_from(NAMED_DAEMON_FIRST_CONTROL_PORT).unwrap();
-        assert!(third.control_port < second.control_port);
+        let third = free_named_daemon_ports_from(FIRST, &bind).unwrap();
+        assert_eq!(third.control_port, 8790);
     }
 
     #[test]
     fn a_named_start_that_lost_its_block_moves_to_the_next_free_one() {
-        let _serial = PORT_BLOCKS.lock_recover();
+        let ports = Ports::default();
         let mut attempts = Vec::new();
-        let mut winner = None;
-        ensure_named_daemon(|ports, control_port| {
-            assert_eq!(ports, format!("{},{}", control_port + 1, control_port + 2));
-            attempts.push(control_port);
-            if attempts.len() > 1 {
-                return Ok(());
-            }
-            winner = Some(
-                (control_port..=control_port + 2)
-                    .map(|port| TcpListener::bind(("127.0.0.1", port)).unwrap())
-                    .collect::<Vec<_>>(),
-            );
-            bail!("Renium daemon did not become ready within 5s on control port {control_port}")
-        })
+        let mut winner = Vec::new();
+        start_on_free_block(
+            |port| ports.bind(port),
+            |block, control_port| {
+                assert_eq!(block, format!("{},{}", control_port + 1, control_port + 2));
+                attempts.push(control_port);
+                if attempts.len() > 1 {
+                    return Ok(());
+                }
+                winner = (control_port..=control_port + 2)
+                    .map(|port| ports.bind(port).unwrap())
+                    .collect();
+                bail!("Renium daemon did not become ready within 5s on control port {control_port}")
+            },
+        )
         .unwrap();
-        assert_eq!(attempts.len(), 2, "{attempts:?}");
-        assert!(attempts[1] > attempts[0], "{attempts:?}");
+        assert_eq!(attempts, [8790, 8800]);
         drop(winner);
     }
 
     #[test]
     fn a_named_start_that_failed_on_a_free_block_reports_its_error() {
-        let _serial = PORT_BLOCKS.lock_recover();
+        let ports = Ports::default();
         let mut attempts = 0;
-        let error = ensure_named_daemon(|_, control_port| {
-            attempts += 1;
-            bail!("Renium daemon did not become ready within 5s on control port {control_port}")
-        })
+        let error = start_on_free_block(
+            |port| ports.bind(port),
+            |_, control_port| {
+                attempts += 1;
+                bail!("Renium daemon did not become ready within 5s on control port {control_port}")
+            },
+        )
         .unwrap_err();
         assert_eq!(attempts, 1);
         assert!(error.to_string().contains("did not become ready"));

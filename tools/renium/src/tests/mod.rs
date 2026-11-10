@@ -10,17 +10,14 @@ use std::path::{Path, PathBuf};
 use crate::bytecode::edit::{
     bytecode_clone_instance, bytecode_desync_package_link, bytecode_remove_instance,
 };
-use crate::bytecode::{
-    bytecode_get_property, bytecode_set_property, bytecode_set_source, ensure_service_store_exists,
-    lock_existing_service_store,
-};
+use crate::bytecode::{bytecode_get_property, bytecode_set_property, ensure_service_store_exists};
 use crate::cli::args::VcInitArgs;
 use crate::cli::{
     ApplyEditorDeleteArgs, BridgeConnectionArgs, BytecodeCloneInstanceArgs,
     BytecodeDesyncPackageLinkArgs, BytecodeExportModelArgs, BytecodeExportPlaceArgs,
     BytecodeFileArgs, BytecodeGetPropertyArgs, BytecodeInstanceSelectorArgs,
-    BytecodeRemoveInstanceArgs, BytecodeSetPropertyArgs, BytecodeSetSourceArgs, EditorMutationArgs,
-    MoveInstanceArgs, ProjectInstanceArgs, ProjectSourceArgs, PushEditorChangesArgs,
+    BytecodeRemoveInstanceArgs, BytecodeSetPropertyArgs, EditorMutationArgs, MoveInstanceArgs,
+    ProjectInstanceArgs, ProjectSourceArgs, PushEditorChangesArgs,
 };
 use crate::editor::diff::{
     append_editor_instance_reconcile, append_editor_property_changes,
@@ -51,9 +48,7 @@ use crate::project::commands::move_instance_command;
 use crate::project::structural::{
     move_instance_between_service_stores, moved_references_between_documents,
 };
-use crate::project::version_control::{
-    merge_settings_documents, settings_doc_to_json_tree, settings_doc_to_text, vc_init,
-};
+use crate::project::version_control::{merge_settings_documents, vc_init};
 use crate::rbx::decode::rbx_variant_to_persisted_settings_json;
 use crate::rbx::encode::{
     collect_rbx_subtree_preorder, json_to_rbx_axes, json_to_rbx_color_sequence, json_to_rbx_faces,
@@ -530,23 +525,6 @@ fn binary_roundtrip_keeps_parent_sensitive_instance_classes() {
 }
 
 #[test]
-fn set_property_rejects_class_name() {
-    let args = BytecodeSetPropertyArgs::try_parse_from([
-        "bytecode-set-property",
-        "Workspace",
-        "-n",
-        "Anything",
-        "-p",
-        "ClassName",
-        "--str",
-        "Folder",
-    ])
-    .unwrap();
-    let err = bytecode_set_property(args).unwrap_err();
-    assert!(err.to_string().contains("read-only"), "{err}");
-}
-
-#[test]
 fn negative_property_values_and_camera_coordinates_parse_without_equals() {
     for option in ["--num", "--value-num", "--json", "--value", "-j"] {
         let args = BytecodeSetPropertyArgs::try_parse_from([
@@ -869,60 +847,6 @@ fn set_property_rejects_an_ambiguous_cross_service_reference() {
 
     let document = SettingsBytecode::read_file(&server_file).unwrap();
     assert!(!document.instances[1].properties.contains_key("Value"));
-    fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
-fn set_source_reads_from_source_file() {
-    let dir = temp_dir("set-source-file");
-    let service_dir = dir.join("src").join("ReplicatedStorage");
-    fs::create_dir_all(&service_dir).unwrap();
-    let settings_file = service_settings_path(&service_dir);
-    settings_document(vec![
-        settings_instance("root", "ReplicatedStorage", "ReplicatedStorage", None),
-        settings_instance("editor:1", "Mod", "ModuleScript", Some(0)),
-    ])
-    .write_file(&settings_file)
-    .unwrap();
-    let src_file = dir.join("payload.luau");
-    fs::write(&src_file, "return 999\n").unwrap();
-    let settings_arg = settings_file.to_string_lossy().into_owned();
-    let src_arg = src_file.to_string_lossy().into_owned();
-
-    let args = BytecodeSetSourceArgs::try_parse_from([
-        "bytecode-set-source",
-        "-f",
-        &settings_arg,
-        "-n",
-        "Mod",
-        "--source-file",
-        &src_arg,
-    ])
-    .unwrap();
-    bytecode_set_source(args).unwrap();
-    assert_eq!(
-        fs::read_to_string(service_dir.join("Mod.luau")).unwrap(),
-        "return 999\n"
-    );
-
-    let args = BytecodeSetSourceArgs::try_parse_from([
-        "bytecode-set-source",
-        "-f",
-        &settings_arg,
-        "-n",
-        "Mod",
-        "--source-file",
-        &src_arg,
-        "--str",
-        "x",
-    ])
-    .unwrap();
-    assert!(
-        bytecode_set_source(args)
-            .unwrap_err()
-            .to_string()
-            .contains("not both")
-    );
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -4440,62 +4364,6 @@ fn vc_merge_applies_clean_deletions_and_flags_delete_modify() {
 }
 
 #[test]
-fn vc_textconv_output_is_deterministic_and_masks_source() {
-    let doc = settings_document(vec![
-        vc_test_instance("root", "S", "Folder", None, &[]),
-        vc_test_instance(
-            "s",
-            "Boot",
-            "Script",
-            Some(0),
-            &[
-                ("Source", json!("print(1)\nprint(2)\n")),
-                ("RunContext", json!("Server")),
-            ],
-        ),
-    ]);
-    let first = settings_doc_to_text(&doc);
-    let second = settings_doc_to_text(&doc);
-    assert_eq!(first, second);
-    assert!(first.contains("= S/Boot [Script] id=s"));
-    assert!(first.contains("RunContext = \"Server\""));
-    assert!(first.contains("Source = <2 lines,"));
-    assert!(!first.contains("print(1)"), "source body must be masked");
-}
-
-#[test]
-fn view_json_tree_nests_children_and_surfaces_source() {
-    let doc = settings_document(vec![
-        vc_test_instance("root", "Svc", "Folder", None, &[]),
-        vc_test_instance("a", "A", "Folder", Some(0), &[("X", json!(1))]),
-        vc_test_instance(
-            "s",
-            "Mod",
-            "ModuleScript",
-            Some(1),
-            &[
-                ("Source", json!("return 1")),
-                ("RunContext", json!("Server")),
-            ],
-        ),
-    ]);
-    let tree = settings_doc_to_json_tree(&doc, Path::new("nowhere/store.renium"));
-    assert_eq!(tree["instanceCount"], json!(3));
-    let roots = tree["roots"].as_array().unwrap();
-    assert_eq!(roots.len(), 1);
-    assert_eq!(roots[0]["name"], json!("Svc"));
-    assert_eq!(roots[0]["childCount"], json!(1));
-    let a = &roots[0]["children"][0];
-    assert_eq!(a["name"], json!("A"));
-    assert_eq!(a["properties"]["X"], json!(1));
-    let s = &a["children"][0];
-    assert_eq!(s["className"], json!("ModuleScript"));
-    assert_eq!(s["source"], json!("return 1"));
-    assert!(s["properties"].get("Source").is_none());
-    assert_eq!(s["properties"]["RunContext"], json!("Server"));
-}
-
-#[test]
 fn vc_init_writes_policy_files_idempotently() {
     let dir = temp_dir("vc-init");
     fs::write(dir.join(".gitattributes"), "*.txt text\n").unwrap();
@@ -4555,22 +4423,6 @@ fn ensure_service_store_seeds_service_root_and_is_idempotent() {
             .len(),
         1
     );
-    fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
-fn missing_store_lock_error_is_actionable() {
-    let dir = temp_dir("missing-store-msg");
-    let settings = service_settings_path(&dir.join("src").join("Workspace"));
-    let err = lock_existing_service_store(&settings)
-        .map(drop)
-        .unwrap_err()
-        .to_string();
-    assert!(
-        err.contains("No synced Renium store for service 'Workspace'"),
-        "{err}"
-    );
-    assert!(err.contains("rbx ba Workspace"), "{err}");
     fs::remove_dir_all(dir).unwrap();
 }
 

@@ -274,6 +274,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "reads whichever Studio is installed; run it by hand against a new Studio build"]
     fn installed_studio_resolves_two_restore_selection_calls() {
         let Some(path) = std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)

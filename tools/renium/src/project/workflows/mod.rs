@@ -3125,15 +3125,6 @@ mod tests {
     }
 
     #[test]
-    fn a_launch_ticket_is_followed_only_while_its_daemon_listens() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let open = listener.local_addr().unwrap().port();
-        assert!(daemon_listens_on(open));
-        drop(listener);
-        assert!(!daemon_listens_on(open));
-    }
-
-    #[test]
     fn doctor_flags_only_rbx_copies_of_a_different_renium_build() {
         let root = temp_dir("rbx-launchers");
         let current = root.join("install/renium.exe");

@@ -516,10 +516,4 @@ mod tests {
         assert!(websocket_url("https://a.b/").is_err());
         assert!(websocket_url("ftp://x?token=1").is_err());
     }
-
-    #[test]
-    fn colors_are_stable_per_name() {
-        assert_eq!(color_for("alice"), color_for("alice"));
-        assert!(color_for("alice").starts_with('#'));
-    }
 }

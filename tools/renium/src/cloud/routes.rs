@@ -3157,16 +3157,14 @@ mod tests {
             game_id: Some(123),
             place_id: Some(456),
         };
-        let file = std::env::temp_dir().join("renium-publish-route-test.rbxl");
-        std::fs::write(&file, b"<roblox!").unwrap();
-        let path = file.to_string_lossy().into_owned();
+        let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let path = file.display().to_string();
         let request = build_request("place", identity, args("publish", &[&path])).unwrap();
         assert_eq!(request["query"], json!({"versionType": "Published"}));
         let mut saved = args("publish", &[&path]);
         saved.query = vec!["versionType=Saved".to_string()];
         let request = build_request("place", identity, saved).unwrap();
         assert_eq!(request["query"], json!({"versionType": "Saved"}));
-        let _ = std::fs::remove_file(file);
     }
 
     #[test]

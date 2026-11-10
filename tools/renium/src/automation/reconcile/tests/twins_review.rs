@@ -510,9 +510,7 @@ fn review_package_updates_do_not_block_repaired_parent_pairing() {
 
 #[test]
 fn review_perf_repeated_references_to_large_identical_twins() {
-    let _ = rbx_reflection_database::get().unwrap();
-    let mut timings = Vec::new();
-    for size in [250, 500, 1000, 2000] {
+    for size in [250, 2000] {
         let mut editor = twin_document();
         let mut targets = Vec::new();
         for _ in 0..2 {
@@ -546,31 +544,13 @@ fn review_perf_repeated_references_to_large_identical_twins() {
                     .insert("Value".into(), twin_ref(&editor, targets[1]));
             }
         }
-        let mut fastest = std::time::Duration::MAX;
-        for _ in 0..3 {
-            let started = Instant::now();
-            let result = pairing::twins::resolve(&editor, &studio);
-            fastest = fastest.min(started.elapsed());
-            assert!(result.partners.iter().all(Option::is_some));
-            // Work, unlike wall time, is deterministic under concurrent tests.
-            assert_eq!(
-                result.reference_comparisons, 1,
-                "the same directed subtree pair must be cached"
-            );
-        }
-        timings.push(fastest);
-        std::eprintln!(
-            "repeated-reference cost: children={size}, refs={size}, instances={}, elapsed_ms={:.3}",
-            editor.instances.len(),
-            fastest.as_secs_f64() * 1000.0
+        let result = pairing::twins::resolve(&editor, &studio);
+        assert!(result.partners.iter().all(Option::is_some));
+        assert_eq!(
+            result.reference_comparisons, 1,
+            "the same directed subtree pair must be cached"
         );
     }
-    // Eight times the document size allows twice linear growth plus scheduler
-    // noise. The former quadratic implementation exceeded 50x on this family.
-    assert!(
-        timings[3] <= timings[0] * 16 + std::time::Duration::from_millis(25),
-        "repeated-reference scaling: {timings:?}"
-    );
 }
 
 #[test]

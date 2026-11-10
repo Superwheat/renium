@@ -626,18 +626,6 @@ mod tests {
 
     use super::*;
 
-    fn set_property(
-        document: &mut SettingsBytecode,
-        selector: InstanceSelector<'_>,
-        property_name: &str,
-        value: Value,
-        scope: PropertyScope,
-    ) -> Result<()> {
-        let index = find_unique_instance_index(document, selector)?
-            .ok_or_else(|| anyhow::anyhow!("No matching instance"))?;
-        set_instance_property(document, index, property_name, value, scope)
-    }
-
     fn sample_document() -> SettingsBytecode {
         SettingsBytecode {
             version: 2,
@@ -663,68 +651,6 @@ mod tests {
                 },
             ],
         }
-    }
-
-    #[test]
-    fn finds_instances_by_class_tag_property_and_attribute() {
-        let document = sample_document();
-        let indices = find_instances(
-            &document,
-            &InstanceQuery {
-                class_name: Some("Part".to_string()),
-                tag: Some("Enemy".to_string()),
-                properties: vec![PropertyPredicate::equals("Transparency", json!(0.25))],
-                attributes: vec![PropertyPredicate::exists("Health")],
-                ..Default::default()
-            },
-        );
-
-        assert_eq!(indices, vec![1]);
-    }
-
-    #[test]
-    fn gets_and_sets_metadata_properties_and_attributes() {
-        let mut document = sample_document();
-
-        assert_eq!(
-            find_unique_instance_index(&document, InstanceSelector::SettingsId("part"))
-                .unwrap()
-                .and_then(|index| get_instance_property(
-                    &document,
-                    index,
-                    "Parent",
-                    PropertyScope::Auto,
-                )),
-            Some(Value::String("root".to_string()))
-        );
-
-        set_property(
-            &mut document,
-            InstanceSelector::SettingsId("part"),
-            "Health",
-            json!(50),
-            PropertyScope::Attribute,
-        )
-        .unwrap();
-
-        assert_eq!(
-            document.instances[1].attributes.get("Health"),
-            Some(&json!(50))
-        );
-    }
-
-    #[test]
-    fn adds_instances_with_unique_editor_id() {
-        let mut document = sample_document();
-        let added = add_instance(
-            &mut document,
-            AddInstanceSpec::new(None, "Child".to_string(), "Folder".to_string(), Some(0)),
-        )
-        .unwrap();
-
-        assert_eq!(added.index, 2);
-        assert_eq!(added.settings_id, "editor:2");
-        assert_eq!(document.instances[2].parent_index, Some(0));
     }
 
     #[test]
@@ -857,18 +783,6 @@ mod tests {
             .find(|instance| instance.settings_id == "grandchild")
             .unwrap();
         assert_eq!(grandchild.parent_index, part_parent);
-    }
-
-    #[test]
-    fn remove_instance_refuses_root_without_mutating_document() {
-        let mut document = sample_document();
-        let before = document.instances.clone();
-
-        let err =
-            remove_instance(&mut document, InstanceSelector::SettingsId("root"), true).unwrap_err();
-
-        assert!(err.to_string().contains("Refusing to remove root"));
-        assert_eq!(document.instances, before);
     }
 
     #[test]

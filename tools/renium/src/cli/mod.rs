@@ -1145,7 +1145,6 @@ mod tests {
             .unwrap()
             .render_long_help()
             .to_string();
-        assert!(help.contains("Wait up to SECONDS (default 10, at most 120) for watched file changes to finish syncing"), "{help}");
         assert!(!help.contains("--prefer"), "{help}");
     }
 

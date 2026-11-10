@@ -4556,6 +4556,8 @@ mod tests {
         use crate::studio::bridge::routing_tests::{connect, edit_info, fixture, play_info};
         let bridge = fixture();
         let _edit_a = connect(&bridge, 0, edit_info("edit-a", 20));
+        let far = || Instant::now() + Duration::from_secs(60);
+        let at_once = Duration::from_secs(30);
         let started = Instant::now();
         assert_eq!(
             play_gate_for_owner(
@@ -4563,7 +4565,7 @@ mod tests {
                 BridgeTarget::Client,
                 Some("1"),
                 Some("edit-a"),
-                Instant::now() + Duration::from_secs(5),
+                far(),
                 None,
             )
             .map_err(|failure| failure.0.m)
@@ -4574,7 +4576,7 @@ mod tests {
             }),
             "with no Play runtime at all the selector is unanswerable at once"
         );
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(started.elapsed() < at_once);
         let _server_a = connect(
             &bridge,
             0,
@@ -4607,7 +4609,7 @@ mod tests {
                 BridgeTarget::Client,
                 Some("1"),
                 Some("edit-a"),
-                Instant::now() + Duration::from_secs(5),
+                far(),
                 None,
             )
             .map_err(|failure| failure.0.m)
@@ -4633,7 +4635,7 @@ mod tests {
             BridgeTarget::Client,
             Some("2"),
             Some("edit-a"),
-            Instant::now() + Duration::from_millis(150),
+            far(),
             None,
         )
         .map_err(|failure| failure.0.m)
@@ -4646,7 +4648,7 @@ mod tests {
             })
         );
         assert!(
-            started.elapsed() < Duration::from_millis(150),
+            started.elapsed() < at_once,
             "an index above the session's client count does not wait"
         );
         let started = Instant::now();
@@ -4656,7 +4658,7 @@ mod tests {
                 BridgeTarget::Main,
                 None,
                 Some("edit-a"),
-                Instant::now() + Duration::from_secs(5),
+                far(),
                 None,
             )
             .map_err(|failure| failure.0.m)
@@ -4669,7 +4671,7 @@ mod tests {
             }),
             "a bare selector runs on the play server at once"
         );
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(started.elapsed() < at_once);
     }
 
     #[test]

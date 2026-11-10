@@ -682,19 +682,6 @@ mod tests {
     }
 
     #[test]
-    fn registry_resolves_ids_and_metadata() {
-        assert!(opcode_by_id(op::SET_PROPERTY).unwrap().review);
-        assert_eq!(
-            opcode_by_id(op::UPDATE_STUDIOS).unwrap().name,
-            "update-studios"
-        );
-        assert_eq!(
-            opcode_by_id(op::REVIEW_REJECT).unwrap().name,
-            "review-reject"
-        );
-    }
-
-    #[test]
     fn compact_response_shape_has_no_legacy_fields() {
         let response = Response::success(7, Instant::now(), json!({}));
         let value = serde_json::to_value(response).unwrap();

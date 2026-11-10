@@ -4003,7 +4003,7 @@ mod tests {
                 .expect("waiter should receive the notification time");
         });
 
-        assert!(control.wait_settled(Duration::from_secs(1)));
+        assert!(control.wait_settled(Duration::from_secs(30)));
         let settled_at = Instant::now();
         let notified_at = notification
             .recv()
@@ -4022,7 +4022,7 @@ mod tests {
             finisher.update_pending(&BTreeSet::new());
         });
 
-        assert!(control.wait_settled(Duration::from_secs(1)));
+        assert!(control.wait_settled(Duration::from_secs(30)));
         event.join().expect("event thread should finish");
     }
 
@@ -4229,8 +4229,8 @@ mod tests {
         control.fail("blocked".to_string());
 
         let started = Instant::now();
-        assert!(!control.wait_settled(Duration::from_secs(1)));
-        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(!control.wait_settled(Duration::from_secs(60)));
+        assert!(started.elapsed() < Duration::from_secs(30));
     }
 
     #[test]

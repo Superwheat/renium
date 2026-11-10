@@ -44,11 +44,13 @@ impl Drop for RequestGuard {
 
 /// The operations the daemon is serving, longest-running first.
 pub(crate) fn active_requests() -> Vec<(&'static str, Duration)> {
-    let mut active = ACTIVE_REQUESTS
-        .lock_recover()
+    let requests = ACTIVE_REQUESTS.lock_recover();
+    let now = Instant::now();
+    let mut active = requests
         .iter()
-        .map(|(_, operation, started)| (*operation, started.elapsed()))
+        .map(|(_, operation, started)| (*operation, now.saturating_duration_since(*started)))
         .collect::<Vec<_>>();
+    drop(requests);
     active.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     active
 }
@@ -126,7 +128,6 @@ mod tests {
     #[test]
     fn active_requests_list_running_operations_until_they_finish() {
         let outer = begin_request("memory-test-outer");
-        std::thread::sleep(Duration::from_millis(5));
         let inner = begin_request("memory-test-inner");
         let names = || {
             active_requests()
